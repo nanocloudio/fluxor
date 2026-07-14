@@ -63,6 +63,13 @@ fn linux_wake_scheduler() {
 fn linux_now_millis() -> u64 {
     elapsed_micros() / 1000
 }
+
+fn linux_now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 fn linux_now_micros() -> u64 {
     elapsed_micros()
 }
@@ -209,6 +216,7 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     restore_interrupts: linux_restore_interrupts,
     wake_scheduler: linux_wake_scheduler,
     now_millis: linux_now_millis,
+    now_unix_millis: linux_now_unix_millis,
     now_micros: linux_now_micros,
     tick_count: linux_tick_count,
     flash_base: linux_flash_base,

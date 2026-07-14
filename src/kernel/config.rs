@@ -316,7 +316,7 @@ pub fn read_layout() -> Option<FlashLayout> {
 /// hashing, called at most twice per boot from slot selection).
 #[cfg(feature = "rp")]
 pub fn kernel_abi_surface_digest() -> [u8; 32] {
-    use sha2::{Digest, Sha256};
+    use crate::kernel::crypto::sha256::Sha256;
     let mut h = Sha256::new();
     crate::abi::abi_surface::write_surface(&mut |bytes| h.update(bytes));
     let mut out = [0u8; 32];

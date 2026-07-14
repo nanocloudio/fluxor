@@ -142,6 +142,12 @@ impl OwnerTable {
     /// `None` when every workload slot is occupied. The lowest-free-slot rule
     /// is required by the deterministic-composition contract (rfc_k8s.md §11).
     pub fn alloc(&mut self, pod_uid: [u8; 16]) -> Option<OwnerHandle> {
+        // `1..MAX_OWNERS` is empty on single-tenant (MAX_OWNERS == 1) builds —
+        // no workload slots exist, so alloc correctly returns None.
+        #[allow(
+            clippy::reversed_empty_ranges,
+            reason = "empty by design when MAX_OWNERS == 1 (single-tenant)"
+        )]
         for slot in 1..MAX_OWNERS {
             if matches!(self.entries[slot].state, OwnerState::Free) {
                 let generation = self.entries[slot].generation.wrapping_add(1);

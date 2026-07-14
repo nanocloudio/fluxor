@@ -10,7 +10,9 @@
 //!
 //! Binding fields (from `[observe.https_load]` in the rig profile):
 //!
-//!   target_ip       (str, required)    DUT IP, e.g. "192.168.1.9".
+//!   target_ip       (str, required)    DUT IP, e.g. "192.168.2.1" (example
+//!                                      address; documentation IPs follow the
+//!                                      RFC 5737 TEST-NET-1 convention).
 //!   port            (int, optional)    TLS port. Default 443.
 //!   path            (str, optional)    GET path. Default "/".
 //!   pre_boot_wait_s (int, optional)    Sleep this long after attach

@@ -12,4 +12,5 @@
 
 pub mod ed25519;
 pub mod p256;
+pub mod sha256;
 pub mod sha512;

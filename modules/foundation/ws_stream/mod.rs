@@ -271,6 +271,39 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if WS_FRAME_HDR + payload_len > n {
                 break;
             }
+            if s.has_conn && conn_id != s.active_conn_id {
+                // Latch replacement: a new connection takes over the adapter.
+                // Anything still queued outbound belongs to the dead session —
+                // the documented contract is that the previous connection's
+                // queue starves. Without this, the outbound drain below stamps
+                // the old session's bytes with the NEW conn_id, leaking one
+                // session's data into another (observed live: a stale reply
+                // delivered as the first frame of a fresh surface connection).
+                s.tx_pending_len = 0;
+                s.rx_pending_len = 0;
+                if s.tx_in >= 0 {
+                    // Drain tx_in dry into the (now idle) tx_pending buffer and
+                    // discard: bytes the app wrote before seeing any input from
+                    // the new session are addressed to the old one. `scratch`
+                    // still holds the new connection's in-flight frame, so it
+                    // must not be used as the bit-bucket here.
+                    loop {
+                        // SAFETY: `channel_read` into the owned tx_pending
+                        // buffer; `tx_pending_len` is 0 so its contents are
+                        // dead and the next outbound read rewrites them.
+                        let d = unsafe {
+                            (sys.channel_read)(
+                                s.tx_in,
+                                s.tx_pending.as_mut_ptr(),
+                                s.tx_pending.len(),
+                            )
+                        };
+                        if d <= 0 {
+                            break;
+                        }
+                    }
+                }
+            }
             s.active_conn_id = conn_id;
             s.has_conn = true;
             let is_data = matches!(opcode, 0x0 | 0x1 | WS_OPCODE_BINARY);

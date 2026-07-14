@@ -273,6 +273,10 @@ pub mod channel {
 pub mod timer {
     pub const MILLIS: u32 = 0x0602;
     pub const MICROS: u32 = 0x0603;
+    /// Wall-clock milliseconds since the Unix epoch (0 if the platform has no RTC).
+    /// Distinct from MILLIS (monotonic uptime); for absolute-time checks (cert validity,
+    /// JWT `exp`). handle=-1, arg=[u64 LE].
+    pub const UNIX_MILLIS: u32 = 0x0608;
     /// Create a timer fd. handle=-1. Returns tagged timer fd.
     pub const CREATE: u32 = 0x0604;
     /// Start/restart timer. handle=timer_fd, arg[0..4]=delay_ms (LE).

@@ -445,9 +445,8 @@ runtime in `fluxor ci`, so neither file is committed nor gates the
 published CI.
 
 **Status — `storage.namespace` enumeration tier (landed).** The browser
-has no POSIX `readdir`, so directory-style discovery (truffle's
-`truffle_scanner`, any `requires_contract = "storage.namespace"`
-consumer) had nothing to talk to on wasm. The wasm `storage.namespace`
+has no POSIX `readdir`, so directory-style discovery (any
+`requires_contract = "storage.namespace"` consumer) had nothing to talk to on wasm. The wasm `storage.namespace`
 provider (`src/platform/wasm/namespace.rs`, bindings `host_ns_stat` /
 `host_ns_list`) closes that gap by deriving a directory tree from the
 **same flat key space** the object tier writes:

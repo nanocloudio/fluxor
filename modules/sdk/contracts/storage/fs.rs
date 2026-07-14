@@ -109,8 +109,10 @@ pub const OPEN_CREATE: u32 = 0x0909;
 /// [`caps::UNLINK`] clear.
 pub const UNLINK: u32 = 0x090A;
 
-/// Create a directory by path (like `mkdir -p` — intermediate components are
-/// created, and an existing directory is not an error).
+/// Create a single directory by path. The parent must already exist (this is
+/// `mkdir`, not `mkdir -p`); a missing parent returns `ENOENT`. An existing
+/// directory at the path is success, so callers that create each level
+/// top-down (e.g. `scp -r`, which sends one `D` per level) can re-issue safely.
 ///
 /// `handle = -1`; `arg` points at the UTF-8 path without a NUL terminator and
 /// `arg_len` is its byte length. Returns `0` on success or a negative errno.

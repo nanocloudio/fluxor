@@ -46,15 +46,16 @@ pub fn install_slot(slot: usize, uid: [u8; 16], generation: u32) {
     if slot >= MAX_OWNERS {
         return;
     }
-    // SAFETY: scheduler-thread single-writer access to the static tables.
+    // SAFETY: scheduler-thread single-writer access to the static tables;
+    // element access goes through raw pointers, never forming a `&mut STATIC`.
     unsafe {
-        let installed = &mut *(&raw mut INSTALLED);
-        if installed[slot] == (uid, generation) {
+        let installed = &raw mut INSTALLED;
+        if (*installed)[slot] == (uid, generation) {
             return;
         }
-        installed[slot] = (uid, generation);
-        let rings = &mut *(&raw mut RINGS);
-        rings[slot] = RingState::new(CAP);
+        (*installed)[slot] = (uid, generation);
+        let rings = &raw mut RINGS;
+        (*rings)[slot] = RingState::new(CAP);
         // The backing bytes need no zeroing: a fresh RingState reports `used` 0,
         // so stale bytes are never read.
     }
@@ -67,7 +68,10 @@ pub fn install_slot(slot: usize, uid: [u8; 16], generation: u32) {
 /// only caller in Phase 1) that is acceptable; an allocation-free
 /// frame-in-place path is a documented follow-up (§4.3 "no allocation on the
 /// log hot path") and does not change this signature.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "attributed log record fields are passed positionally across the ABI boundary"
+)]
 pub fn push_on_slot(
     slot: usize,
     uid: [u8; 16],
@@ -81,11 +85,11 @@ pub fn push_on_slot(
         return;
     }
     // SAFETY: scheduler-thread single-writer access; RINGS[slot] and BUFS[slot]
-    // are distinct statics borrowed once each.
+    // are distinct statics, reached through raw pointers (never a `&mut STATIC`).
     unsafe {
-        let rings = &mut *(&raw mut RINGS);
-        let bufs = &mut *(&raw mut BUFS);
-        let seq = rings[slot].next_seq();
+        let rings = &raw mut RINGS;
+        let bufs = &raw mut BUFS;
+        let seq = (*rings)[slot].next_seq();
         let record = LogRecord {
             owner_uid: uid,
             owner_generation: generation,
@@ -96,7 +100,7 @@ pub fn push_on_slot(
             message: message.to_vec(),
         };
         let frame = record.encode();
-        rings[slot].push(&mut bufs[slot], &frame);
+        (*rings)[slot].push(&mut (*bufs)[slot], &frame);
     }
 }
 
@@ -107,11 +111,14 @@ pub fn snapshot_slot(slot: usize) -> Option<(RingHeader, Vec<LogRecord>)> {
     if slot >= MAX_OWNERS {
         return None;
     }
-    // SAFETY: scheduler-thread read of the static tables.
+    // SAFETY: scheduler-thread read of the static tables, through raw pointers.
     unsafe {
-        let rings = &*(&raw const RINGS);
-        let bufs = &*(&raw const BUFS);
-        Some((rings[slot].header(), rings[slot].frames(&bufs[slot])))
+        let rings = &raw const RINGS;
+        let bufs = &raw const BUFS;
+        Some((
+            (*rings)[slot].header(),
+            (*rings)[slot].frames(&(*bufs)[slot]),
+        ))
     }
 }
 
@@ -123,11 +130,11 @@ pub fn snapshot_slot_bytes(slot: usize) -> Option<(RingHeader, Vec<u8>)> {
     if slot >= MAX_OWNERS {
         return None;
     }
-    // SAFETY: scheduler-thread read of the static tables.
+    // SAFETY: scheduler-thread read of the static tables, through raw pointers.
     unsafe {
-        let rings = &*(&raw const RINGS);
-        let bufs = &*(&raw const BUFS);
-        Some((rings[slot].header(), bufs[slot].to_vec()))
+        let rings = &raw const RINGS;
+        let bufs = &raw const BUFS;
+        Some(((*rings)[slot].header(), (*bufs)[slot].to_vec()))
     }
 }
 
@@ -138,10 +145,10 @@ pub fn installed_identity(slot: usize) -> ([u8; 16], u32) {
     if slot >= MAX_OWNERS {
         return ([0u8; 16], 0);
     }
-    // SAFETY: scheduler-thread read.
+    // SAFETY: scheduler-thread read, through a raw pointer.
     unsafe {
-        let installed = &*(&raw const INSTALLED);
-        installed[slot]
+        let installed = &raw const INSTALLED;
+        (*installed)[slot]
     }
 }
 
@@ -151,10 +158,10 @@ pub fn next_seq(slot: usize) -> u64 {
     if slot >= MAX_OWNERS {
         return 0;
     }
-    // SAFETY: scheduler-thread read.
+    // SAFETY: scheduler-thread read, through a raw pointer.
     unsafe {
-        let rings = &*(&raw const RINGS);
-        rings[slot].next_seq()
+        let rings = &raw const RINGS;
+        (*rings)[slot].next_seq()
     }
 }
 

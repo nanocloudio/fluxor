@@ -684,9 +684,7 @@ path-mount pattern as `wire.rs` / `genstore_wire.rs`):
   blocks after unsafe recovery, refill-ahead double-buffering). This
   is the ANCHOR side; the granting authority — the durable
   single-writer session directory of §8.3/§13.7 — is implemented in
-  the clustor sibling repo (`clustor/modules/app/session_directory/`
-  over `clustor/modules/common/session_registry.rs`, documented at
-  `clustor/docs/architecture/session_directory.md`): single-writer
+  a downstream substrate repo (out of scope here): single-writer
   bindings, monotone never-re-handed counter grants, R4 rx floors,
   R1 wrapped-key custody with quorum wipe, R3 fence ordering, and R2
   unsafe-recovery voiding, with replies emitted only after quorum

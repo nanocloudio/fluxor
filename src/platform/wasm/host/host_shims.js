@@ -779,7 +779,7 @@ registerProcessor('pcm-ring', PcmRing);
     // Key index for hydration. Directory ENUMERATION (`entries()`) is not
     // trustworthy across realms — Chromium's worker-side enumeration has
     // been observed returning `$`-mangled segment names for entries created
-    // in the same realm (`truffle/x` enumerates as `$truffle/$x`), so a
+    // in the same realm (`foo/x` enumerates as `$foo/$x`), so a
     // hydrate that reconstructs keys from enumerated names silently stores
     // them under the wrong key and every later lookup misses. Name
     // RESOLUTION (`get{Directory,File}Handle(name)`) round-trips reliably,
@@ -878,8 +878,7 @@ registerProcessor('pcm-ring', PcmRing);
               etag: typeof e.etag === 'string' ? e.etag : '',
             });
             // ObjectId alias: consumers that carry a 16-byte etag-packed
-            // ObjectId (Truffle's catalog records / TAL1 item_handles —
-            // etag bytes truncated or zero-padded to 16) resolve it as a
+            // ObjectId (etag bytes truncated or zero-padded to 16) resolve it as a
             // storage.object KEY. Alias that exact 16-char form (including
             // NUL padding, which kstr preserves) back to the manifest path
             // so a dispatched handle loads the right bytes in-browser.

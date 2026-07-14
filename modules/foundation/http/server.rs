@@ -105,6 +105,17 @@ pub(crate) const HANDLER_FS_FILE: u8 = 7;
 /// the asset bank without bespoke handler code.
 pub(crate) const HANDLER_FS_LIST: u8 = 8;
 
+/// WebSocket fan-out for SESSION protocols: identical wiring to
+/// `HANDLER_WEBSOCKET_FANOUT` (Upgrade accepted, inbound → `ws_out`,
+/// outbound ← `ws_in`) but retention replay is suppressed — a new
+/// connection must NEVER receive envelopes produced for a previous
+/// session. Fan-out retention exists for idempotent presentation
+/// state (rasters, telemetry snapshots); replaying a session
+/// protocol's frames (e.g. an auth gate's AUTH_OK) to a fresh,
+/// unauthenticated subscriber is wrong and surfaced live as one
+/// session's replies delivered into the next.
+pub(crate) const HANDLER_WEBSOCKET_SESSION: u8 = 9;
+
 const CACHE_VALID: u8 = 0x01;
 const CACHE_COMPLETE: u8 = 0x02;
 
@@ -2787,6 +2798,20 @@ unsafe fn retain_capture_envelope(
     if payload_len > u16::MAX as usize {
         return;
     }
+    // Retention feeds ONLY `HANDLER_WEBSOCKET_FANOUT` replay. If no
+    // configured route replays (session-mode fan-out or none at all),
+    // capturing would retain one session's frames for no consumer —
+    // and stale session data must not outlive its connection.
+    let mut any_replay_route = false;
+    for i in 0..s.server.route_count as usize {
+        if s.server.routes[i].handler == HANDLER_WEBSOCKET_FANOUT {
+            any_replay_route = true;
+            break;
+        }
+    }
+    if !any_replay_route {
+        return;
+    }
     let needed = RETAINED_ENVELOPE_HDR + payload_len;
     if s.server.retained_idle_ticks > RETAIN_RESET_TICKS {
         s.server.retained_used = 0;
@@ -4755,18 +4780,29 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                         cur.phase = Phase::DrainSend;
                     }
                 }
-                HANDLER_WEBSOCKET | HANDLER_WEBSOCKET_FANOUT => {
+                HANDLER_WEBSOCKET | HANDLER_WEBSOCKET_FANOUT | HANDLER_WEBSOCKET_SESSION => {
                     if begin_ws_upgrade(s) {
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.phase = Phase::WsHandshake;
                         }
-                        let fan = if handler == HANDLER_WEBSOCKET_FANOUT {
+                        let fan = if handler == HANDLER_WEBSOCKET_FANOUT
+                            || handler == HANDLER_WEBSOCKET_SESSION
+                        {
                             1
                         } else {
                             0
                         };
+                        let session = handler == HANDLER_WEBSOCKET_SESSION;
                         if let Some(cur) = cur_slot_mut(s) {
                             cur.ws_fan_out = fan;
+                            if session {
+                                // Session-mode: skip retention replay for this
+                                // slot entirely — mark the replay already done
+                                // so the WsActive path falls straight through
+                                // to the live stream.
+                                cur.retained_replay_started = 1;
+                                cur.retained_replay_done = 1;
+                            }
                         }
                     }
                     // begin_ws_upgrade has already populated send_buf

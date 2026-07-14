@@ -942,6 +942,17 @@ unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// Wall-clock milliseconds since the Unix epoch (TIMER::UNIX_MILLIS 0x0608), or 0 on a
+/// platform with no real-time clock. Distinct from `dev_millis` (monotonic uptime); use for
+/// absolute-time checks (certificate validity, JWT `exp`). See docs/surface-auth.md.
+#[allow(dead_code, reason = "used by absolute-time consumers (surface auth); not every module reads it")]
+#[inline(always)]
+unsafe fn dev_unix_millis(sys: &SyscallTable) -> u64 {
+    let mut buf = [0u8; 8];
+    (sys.provider_call)(-1, 0x0608, buf.as_mut_ptr(), 8);
+    u64::from_le_bytes(buf)
+}
+
 /// Per-step flow-budget grant for one of this module's output ports
 /// (MODULE_FLOW_BUDGET 0x0C46). Returns 0 when the wired edge
 /// carries no streaming rate class; callers keep their own
@@ -1915,6 +1926,10 @@ unsafe fn dev_mon_session(
 /// `declared_cc` / `achieved_cc` are `CC_*` wire constants from
 /// `contracts/net/session_ctrl.rs`.
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "MON_SESSION_CLASS line-format: signature mirrors the documented monitor-protocol fields"
+)]
 unsafe fn dev_mon_session_class(
     sys: &SyscallTable,
     self_idx: u8,

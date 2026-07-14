@@ -1004,10 +1004,11 @@ static mut LINUX_NET_REGISTRY: Vec<*mut LinuxNetState> = Vec::new();
 
 /// Register a freshly-instantiated linux_net state. Platform thread only.
 fn linux_net_register_state(ptr: *mut LinuxNetState) {
-    // SAFETY: single-threaded platform instantiation path.
+    // SAFETY: single-threaded platform instantiation path; the registry is
+    // reached through a raw pointer, never forming a `&mut STATIC`.
     unsafe {
-        let reg = &mut *(&raw mut LINUX_NET_REGISTRY);
-        reg.push(ptr);
+        let reg = &raw mut LINUX_NET_REGISTRY;
+        (*reg).push(ptr);
     }
 }
 
@@ -1020,8 +1021,8 @@ fn linux_net_close_all_and_clear_registry() {
     // SAFETY: single-threaded; pointers registered this graph generation are
     // still valid until prepare_graph tears the old graph down (called after).
     unsafe {
-        let reg = &mut *(&raw mut LINUX_NET_REGISTRY);
-        for &st_ptr in reg.iter() {
+        let reg = &raw mut LINUX_NET_REGISTRY;
+        for &st_ptr in (*reg).iter() {
             let st = &mut *st_ptr;
             for conn in st.conns.iter_mut() {
                 if conn.fd >= 0 {
@@ -1030,7 +1031,7 @@ fn linux_net_close_all_and_clear_registry() {
                 *conn = LinuxNetConn::EMPTY;
             }
         }
-        reg.clear();
+        (*reg).clear();
     }
 }
 
@@ -1039,10 +1040,11 @@ fn linux_net_close_all_and_clear_registry() {
 /// the owner's terminal record while its port is still accepting
 /// (rfc_endpoint_lease.md §4.4). Platform thread only.
 fn linux_net_close_owner_conns(owner: fluxor::kernel::owner::OwnerHandle) {
-    // SAFETY: single-threaded platform access to registered live instances.
+    // SAFETY: single-threaded platform access to registered live instances,
+    // reached through a raw pointer.
     unsafe {
-        let reg = &*(&raw const LINUX_NET_REGISTRY);
-        for &st_ptr in reg.iter() {
+        let reg = &raw const LINUX_NET_REGISTRY;
+        for &st_ptr in (*reg).iter() {
             let st = &mut *st_ptr;
             for (i, conn) in st.conns.iter_mut().enumerate() {
                 if conn.state != 0 && conn.owner == owner {
@@ -1066,10 +1068,11 @@ fn linux_net_close_owner_conns(owner: fluxor::kernel::owner::OwnerHandle) {
 /// are the agent's business (rfc_endpoint_lease.md §4.3). Platform thread only.
 fn linux_net_bound_endpoints() -> Vec<(fluxor::kernel::owner::OwnerHandle, u8, u16)> {
     let mut out = Vec::new();
-    // SAFETY: single-threaded platform access to registered live instances.
+    // SAFETY: single-threaded platform access to registered live instances,
+    // reached through a raw pointer.
     unsafe {
-        let reg = &*(&raw const LINUX_NET_REGISTRY);
-        for &st_ptr in reg.iter() {
+        let reg = &raw const LINUX_NET_REGISTRY;
+        for &st_ptr in (*reg).iter() {
             let st = &*st_ptr;
             for conn in st.conns.iter() {
                 if conn.state == 3 && conn.fd >= 0 && conn.port != 0 {

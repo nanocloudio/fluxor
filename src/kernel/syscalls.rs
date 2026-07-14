@@ -734,10 +734,9 @@ unsafe fn key_vault_provider_dispatch(
 // backend (e.g. an emulator asset bank, RFC 0009) resolve an object
 // handle via `storage.object`/`storage.namespace` without being
 // mis-typed as a CAP_FULL `Protocol` module just to get the grant.
-// STORAGE_NAMESPACE = 0x13, STORAGE_OBJECT = 0x14.
+// STORAGE_NAMESPACE = 0x13, STORAGE_OBJECT = 0x14 — both read-only.
 const STORAGE_FAMILY: u32 = (1u32 << crate::kernel::provider::contract::STORAGE_NAMESPACE as u32)
-    | (1u32 << crate::kernel::provider::contract::STORAGE_OBJECT as u32)
-    | (1u32 << crate::kernel::provider::contract::KEYSPACE as u32);
+    | (1u32 << crate::kernel::provider::contract::STORAGE_OBJECT as u32);
 
 /// Per-cap-class contract ceiling. Indexed by
 /// `scheduler::current_module_cap_class()`. Bits 7 / 8 / 17 / 18 / 21
@@ -757,11 +756,18 @@ const STORAGE_FAMILY: u32 = (1u32 << crate::kernel::provider::contract::STORAGE_
 /// ceilings so an app/Source/Transformer module (e.g. sector's `do`) CAN declare it; this
 /// is a ceiling only, the manifest `[[resources]]` gate still grants per-module.
 const PROC_CONTRACT: u32 = 1u32 << 0x16;
+/// KEYSPACE (0x17, bit 23) — the mutating control-plane keyspace store. A
+/// distinct ceiling entry rather than part of `STORAGE_FAMILY` (which is the
+/// read-only namespace/object surfaces): a service-tier reconciler CAN declare
+/// it, but folding a writable store into the read-only family would silently
+/// widen what the storage grant reaches. Ceiling only — the manifest
+/// `[[resources]]` gate still grants per-module.
+const KEYSPACE_CONTRACT: u32 = 1u32 << 0x17;
 pub const CAP_CONTRACT_MASK: [u32; 4] = [
-    0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC
-    0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
-    0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
-    0xFFFF_FFFF,                                  // CAP_FULL: any contract
+    0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT | KEYSPACE_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + KEYSPACE
+    0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT | KEYSPACE_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
+    0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT | KEYSPACE_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
+    0xFFFF_FFFF,                                                      // CAP_FULL: any contract
 ];
 
 unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
@@ -1113,6 +1119,13 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             core::ptr::write_unaligned(arg as *mut u64, us);
             0
         }
+        dev_timer::UNIX_MILLIS => {
+            if arg.is_null() || arg_len < 8 {
+                return E_INVAL;
+            }
+            core::ptr::write_unaligned(arg as *mut u64, hal::now_unix_millis());
+            0
+        }
         dev_timer::CREATE => fd::timer_create(),
         dev_timer::SET => {
             if arg.is_null() || arg_len < 4 {
@@ -1401,7 +1414,9 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             // SAFETY: non-null, len >= 1 checked above.
             let port_index = unsafe { *arg };
-            let input = arg_len >= 2 && unsafe { *arg.add(1) } == 1;
+            let input = arg_len >= 2
+                // SAFETY: arg non-null (checked above); arg_len >= 2 gates this read.
+                && unsafe { *arg.add(1) } == 1;
             if input {
                 let channel = if arg_len >= 6 {
                     // SAFETY: non-null and arg_len >= 6 checked above.

@@ -1961,6 +1961,7 @@ pub fn syscall_input_flow_budget(port_index: u8, channel: i32) -> i32 {
     if idx >= MAX_MODULES {
         return 0;
     }
+    // SAFETY: scheduler-thread single accessor of SCHED, read through a raw pointer.
     let (class, domain) = unsafe {
         let p = &raw const SCHED;
         let sched = &*p;
@@ -2522,6 +2523,8 @@ pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
                 // boundary, making hot-start a normal high-frequency event.
                 // Keep the monitor observable without turning log transport
                 // into work on every hot-path transition.
+                // SAFETY: mon_throttle takes raw pointers to the monitor throttle
+                // statics; scheduler-thread only.
                 if let Some(sup) = unsafe {
                     mon_throttle(
                         core::ptr::addr_of_mut!(MON_HOTSTART_LAST),
@@ -8320,6 +8323,7 @@ fn step_domain_pipeline_refill(
         }
 
         set_current_module(module_idx);
+        // SAFETY: debug-only volatile write to a scalar static; scheduler-thread only.
         unsafe {
             core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
         }
@@ -8390,6 +8394,7 @@ fn step_domain_post_tick_flush(
         }
 
         set_current_module(module_idx);
+        // SAFETY: debug-only volatile write to a scalar static; scheduler-thread only.
         unsafe {
             core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
         }
@@ -8420,13 +8425,10 @@ fn step_domain_post_tick_flush(
 
         let used = crate::kernel::hal::now_micros().wrapping_sub(flush_t0);
         if used > MAX_PRE_TICK_BUDGET_US as u64 {
+            // SAFETY: debug-only read of a scalar static; scheduler-thread only.
+            let dbg_tick = unsafe { DBG_TICK };
             log::warn!(
-                "MON_POST_TICK_FLUSH_OVERRUN domain={} elapsed_us={} budget_us={} last_mod={} tick={}",
-                domain_id,
-                used,
-                MAX_PRE_TICK_BUDGET_US,
-                module_idx,
-                unsafe { DBG_TICK },
+                "MON_POST_TICK_FLUSH_OVERRUN domain={domain_id} elapsed_us={used} budget_us={MAX_PRE_TICK_BUDGET_US} last_mod={module_idx} tick={dbg_tick}"
             );
             break;
         }
@@ -9365,6 +9367,11 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
         &*p
     };
     let mut count = 0usize;
+    // Empty range on single-tenant (MAX_OWNERS == 1) builds — returns 0, per the doc above.
+    #[allow(
+        clippy::reversed_empty_ranges,
+        reason = "empty by design when MAX_OWNERS == 1 (single-tenant)"
+    )]
     for slot in 1..MAX_OWNERS {
         let Some(e) = sched.owners.entry_at(slot) else {
             continue;

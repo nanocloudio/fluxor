@@ -869,9 +869,7 @@ early-ack echo, snapshot callbacks for apply-derived state, and the
 reset signal have no equivalent in the `storage.namespace` + `event.log`
 pattern (see `storage_capability_surface.md` §4), which correctly stays
 at the storage layer. The full seven-primitive contract lives with its
-single current provider, clustor, at
-`../clustor/docs/architecture/substrate_capability_surface.md`; only the
-surface name is canonicalized here. A consumer requires it by name
+substrate provider's repo; only the surface name is canonicalized here. A consumer requires it by name
 through the same string-matched capability resolution as any other
 service capability (the resolver wires it to whichever module provides
 it) — not through the `[requires]` table, which carries typed CPU/board

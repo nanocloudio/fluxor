@@ -89,8 +89,21 @@ static TEE: TeeLogger = TeeLogger;
 /// Install the tee as the global logger, replacing the direct env_logger init.
 /// Must run before the first `log!` call (`log::set_logger` is once-per-process).
 fn install_owner_log_tee() {
+    // Own the timestamp (unix ms, matching the ring records) so env_logger's
+    // `humantime`/jiff timestamp backend isn't needed. Level + module filtering
+    // still comes from `env_filter` via `RUST_LOG`.
     let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(
+                buf,
+                "[{} {:<5} {}] {}",
+                now_unix_ms(),
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
         .build();
     log::set_max_level(logger.filter());
     let _ = INNER.set(logger);
@@ -117,10 +130,7 @@ fn enable_owner_log_attribution() {
 /// module is system-owned. Valid only on the scheduler thread.
 fn on_step_attribution() -> ([u8; 16], u16, u32) {
     let idx = fluxor::kernel::scheduler::current_module_index();
-    match fluxor::kernel::scheduler::module_owner_attribution(idx) {
-        Some(attr) => attr,
-        None => ([0u8; 16], 0, 0),
-    }
+    fluxor::kernel::scheduler::module_owner_attribution(idx).unwrap_or_default()
 }
 
 fn now_unix_ms() -> u64 {
@@ -179,10 +189,11 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
         // slot dirty so the next tick retries — not wait for another record
         // to arrive.
         if write_ring_file(&path, &header, &buffer) {
-            // SAFETY: scheduler-thread-only access to the flush high-water table.
+            // SAFETY: scheduler-thread-only access to the flush high-water table,
+            // reached through a raw pointer.
             unsafe {
-                let hw = &mut *(&raw mut LAST_FLUSHED);
-                hw[slot] = (uid, generation, next);
+                let hw = &raw mut LAST_FLUSHED;
+                (*hw)[slot] = (uid, generation, next);
             }
         }
     }

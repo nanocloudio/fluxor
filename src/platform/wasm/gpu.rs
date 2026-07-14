@@ -104,6 +104,10 @@
 //!   Draws a vertexless pipeline (positions from @builtin(vertex_index);
 //!   vertex_count 3 = fullscreen triangle) sampling its bound targets.
 //! - FRAME_END [0xFF]  Ends the open pass and submits the whole encoder.
+#![allow(
+    clippy::doc_overindented_list_items,
+    reason = "the command-stream reference above uses intentional field-alignment indentation"
+)]
 
 use crate::kernel::{channel, scheduler, syscalls};
 
@@ -131,7 +135,10 @@ const GPU_INIT_NOT_STARTED: i32 = 2;
 
 // Not every host_gpu_raster_* import is called yet (resize / get_size are part of the
 // host ABI surface the JS driver implements but the module does not drive today).
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "resize/get_size are part of the host ABI surface but not yet driven"
+)]
 extern "C" {
     /// Initialize the GPU backend. Returns 0=ready, 1=pending, <0=error
     fn host_gpu_raster_init() -> i32;
@@ -258,6 +265,7 @@ unsafe fn alloc_state(in_chan: i32, width: u16, height: u16) -> *mut GpuState {
 }
 
 fn read_u32(buf: *const u8, offset: usize) -> u32 {
+    // SAFETY: caller guarantees `offset + 4` is within `buf`'s allocation; the read is unaligned.
     unsafe {
         let ptr = buf.add(offset) as *const u32;
         core::ptr::read_unaligned(ptr)
@@ -265,6 +273,7 @@ fn read_u32(buf: *const u8, offset: usize) -> u32 {
 }
 
 fn read_f32(buf: *const u8, offset: usize) -> f32 {
+    // SAFETY: caller guarantees `offset + 4` is within `buf`'s allocation; the read is unaligned.
     unsafe {
         let ptr = buf.add(offset) as *const f32;
         core::ptr::read_unaligned(ptr)
@@ -276,12 +285,15 @@ extern "C" {
 }
 
 fn log_msg(msg: &[u8]) {
+    // SAFETY: msg is a valid slice; the host reads exactly `len` bytes from the pointer.
     unsafe {
         host_log(2, msg.as_ptr(), msg.len());
     }
 }
 
 fn gpu_step(state: *mut u8) -> i32 {
+    // SAFETY: `state` is the kernel-provided opaque state pointer written by build(),
+    // holding a valid `*mut GpuState`.
     unsafe {
         let st_ptr = core::ptr::read(state as *const *mut GpuState);
         if st_ptr.is_null() {

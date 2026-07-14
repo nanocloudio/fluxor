@@ -2664,6 +2664,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     restore_interrupts: bcm_restore_interrupts,
     wake_scheduler: bcm_wake_scheduler,
     now_millis: bcm_now_millis,
+    now_unix_millis: || 0, // no RTC on this platform
     now_micros: bcm_now_micros,
     tick_count: bcm_tick_count,
     flash_base: bcm_flash_base,

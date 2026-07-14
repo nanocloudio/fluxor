@@ -1021,7 +1021,21 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             // WebSocket handler with external fan-out — accepts the
             // Upgrade then routes inbound frames to the http module's
             // ws_out port and reads outbound frames from ws_in.
-            handler = 5;
+            // `retain_replay: false` selects the session variant
+            // (handler 9): same wiring, but a new connection never
+            // receives retained envelopes from a previous session —
+            // required for session protocols (e.g. the sector surface
+            // auth gate), where replaying one connection's frames to
+            // the next is a correctness/security failure.
+            handler = if obj
+                .get("retain_replay")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true)
+            {
+                5
+            } else {
+                9
+            };
         } else if obj
             .get("websocket")
             .and_then(|v| v.as_bool())

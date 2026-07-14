@@ -76,49 +76,15 @@ impl WriteError {
     }
 }
 
+/// One parsed WAL record: `(rev, op, key, value)`.
+type WalRecord = (u64, u8, String, Vec<u8>);
+
 /// The append-only log projected onto the volume directory.
-struct Wal {
-    file: File,
-}
-
-impl Wal {
-    fn open(dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(dir.join(WAL_FILE))?;
-        Ok(Self { file })
-    }
-
-    /// Append one record and `fsync` — the op is durable when this returns Ok.
-    fn append(&mut self, rev: u64, op: u8, key: &str, value: &[u8]) -> std::io::Result<()> {
-        let kb = key.as_bytes();
-        let mut buf = Vec::with_capacity(WAL_HDR + kb.len() + value.len());
-        buf.extend_from_slice(&rev.to_le_bytes());
-        buf.push(op);
-        buf.extend_from_slice(&(kb.len() as u16).to_le_bytes());
-        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        buf.extend_from_slice(kb);
-        buf.extend_from_slice(value);
-        self.file.write_all(&buf)?;
-        self.file.sync_data()
-    }
-}
-
-/// Replay every intact record from a WAL directory, in order. A missing log is
-/// an empty history; a torn trailing record halts replay (records before it
-/// are valid — the crash-consistency rule).
-fn replay_wal(dir: &Path) -> Vec<(u64, u8, String, Vec<u8>)> {
+/// Parse every intact record from `data`, returning the records and the byte
+/// count consumed. A torn trailing record (crash mid-append) halts parsing —
+/// records before it stand; `consumed` stops before the torn bytes.
+fn parse_wal_records(data: &[u8]) -> (Vec<WalRecord>, usize) {
     let mut out = Vec::new();
-    let Ok(mut f) = File::open(dir.join(WAL_FILE)) else {
-        return out;
-    };
-    let mut data = Vec::new();
-    if f.read_to_end(&mut data).is_err() {
-        return out;
-    }
     let mut p = 0usize;
     while p + WAL_HDR <= data.len() {
         let rev = u64::from_le_bytes(data[p..p + 8].try_into().unwrap());
@@ -137,7 +103,112 @@ fn replay_wal(dir: &Path) -> Vec<(u64, u8, String, Vec<u8>)> {
         out.push((rev, op, key, value));
         p = end;
     }
-    out
+    (out, p)
+}
+
+/// The append-only log on the shared volume directory — **multi-process**.
+///
+/// This is the store-sharing seam: the WAL is the ONE cluster store, and more
+/// than one process appends to it (nanocloud projects services/pods in; the
+/// reconciler fmod writes endpoints out). Two mechanisms make that safe:
+///
+/// * **flock** around every append (`LOCK_EX`) and every tail-read
+///   (`LOCK_SH`): appends are atomic units, and a shared-locked reader never
+///   observes a half-written record from a live writer. A torn tail can only
+///   come from a crashed writer; the next exclusive appender truncates it
+///   (safe — it holds the lock, and recovery already treats those bytes as
+///   dead).
+/// * **offset tracking + tailing**: each process remembers how much of the
+///   log it has consumed and, before any read or write, tails the remainder —
+///   records appended by *other* processes — and applies them to its
+///   in-memory view (fanning them into watch rings, so a subscriber sees
+///   external writes as ordinary events). Revisions stay globally monotone
+///   because an appender assigns `rev = max_seen + 1` only after tailing to
+///   the end under the exclusive lock.
+struct Wal {
+    file: File,
+    /// Bytes of the log this process has consumed (parsed into memory).
+    offset: u64,
+}
+
+impl Wal {
+    fn open(dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(dir.join(WAL_FILE))?;
+        Ok(Self { file, offset: 0 })
+    }
+
+    fn lock(&self, exclusive: bool) {
+        use std::os::unix::io::AsRawFd;
+        let op = if exclusive {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_SH
+        };
+        // SAFETY: flock on our own open fd; blocking until granted.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), op);
+        }
+    }
+
+    fn unlock(&self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: releasing the lock we hold on our own fd.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+
+    /// Read every complete record appended since `offset` (by anyone),
+    /// advancing `offset` past what parsed. Caller holds the lock.
+    fn tail_locked(&mut self) -> Vec<(u64, u8, String, Vec<u8>)> {
+        use std::io::{Seek, SeekFrom};
+        let len = match self.file.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => return Vec::new(),
+        };
+        if len <= self.offset {
+            return Vec::new();
+        }
+        if self.file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut data = Vec::with_capacity((len - self.offset) as usize);
+        if self.file.read_to_end(&mut data).is_err() {
+            return Vec::new();
+        }
+        let (records, consumed) = parse_wal_records(&data);
+        self.offset += consumed as u64;
+        records
+    }
+
+    /// Append one record and `fsync` — durable when this returns Ok. Caller
+    /// holds the EXCLUSIVE lock and has tailed to the end (so `offset` is the
+    /// true end of intact records). Any bytes past `offset` are a crashed
+    /// writer's torn tail — truncate them before appending over them.
+    fn append_locked(&mut self, rev: u64, op: u8, key: &str, value: &[u8]) -> std::io::Result<()> {
+        if let Ok(m) = self.file.metadata() {
+            if m.len() > self.offset {
+                self.file.set_len(self.offset)?;
+            }
+        }
+        let kb = key.as_bytes();
+        let mut buf = Vec::with_capacity(WAL_HDR + kb.len() + value.len());
+        buf.extend_from_slice(&rev.to_le_bytes());
+        buf.push(op);
+        buf.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(kb);
+        buf.extend_from_slice(value);
+        self.file.write_all(&buf)?;
+        self.file.sync_data()?;
+        self.offset += buf.len() as u64;
+        Ok(())
+    }
 }
 
 /// A single namespace change, revision-ordered on the store's monotone clock.
@@ -243,47 +314,75 @@ impl KeyspaceStore {
     /// across a restart). The log stays open for subsequent appends.
     pub fn recover(dir: &Path, history_cap: usize, ring_cap: usize) -> std::io::Result<Self> {
         let mut store = Self::with_limits(history_cap, ring_cap);
-        for (rev, op, key, value) in replay_wal(dir) {
-            // Revisions come from the log, not the live clock — set, don't bump.
-            store.revision = store.revision.max(rev);
-            let existed = store.entries.contains_key(&key);
-            let change = match op {
-                WAL_OP_DELETE => {
-                    store.entries.remove(&key);
-                    KeyspaceChange {
-                        revision: rev,
-                        key,
-                        kind: ChangeKind::Deleted,
-                        value: None,
-                    }
-                }
-                _ => {
-                    store.entries.insert(
-                        key.clone(),
-                        Entry {
-                            value: value.clone(),
-                            revision: rev,
-                        },
-                    );
-                    KeyspaceChange {
-                        revision: rev,
-                        key,
-                        kind: if existed {
-                            ChangeKind::Modified
-                        } else {
-                            ChangeKind::Added
-                        },
-                        value: Some(value),
-                    }
-                }
-            };
-            store.history.push_back(change);
-            while store.history.len() > store.history_cap {
-                store.history.pop_front();
-            }
+        let mut wal = Wal::open(dir)?;
+        wal.lock(false);
+        let records = wal.tail_locked();
+        wal.unlock();
+        store.wal = Some(wal);
+        for (rev, op, key, value) in records {
+            store.apply_external(rev, op, key, value);
         }
-        store.wal = Some(Wal::open(dir)?);
         Ok(store)
+    }
+
+    /// Apply one WAL record that is already durable in the log — a recover
+    /// replay or another process's append discovered by tailing. Updates the
+    /// map and revision clock (set-to-max, not bump: the revision came off the
+    /// log) and routes the change through `record`, so live watches see
+    /// external writes as ordinary events and bounded history retains them.
+    fn apply_external(&mut self, rev: u64, op: u8, key: String, value: Vec<u8>) {
+        self.revision = self.revision.max(rev);
+        let existed = self.entries.contains_key(&key);
+        let change = match op {
+            WAL_OP_DELETE => {
+                self.entries.remove(&key);
+                KeyspaceChange {
+                    revision: rev,
+                    key,
+                    kind: ChangeKind::Deleted,
+                    value: None,
+                }
+            }
+            _ => {
+                self.entries.insert(
+                    key.clone(),
+                    Entry {
+                        value: value.clone(),
+                        revision: rev,
+                    },
+                );
+                KeyspaceChange {
+                    revision: rev,
+                    key,
+                    kind: if existed {
+                        ChangeKind::Modified
+                    } else {
+                        ChangeKind::Added
+                    },
+                    value: Some(value),
+                }
+            }
+        };
+        self.record(change);
+    }
+
+    /// Consume records other processes appended to the shared WAL since we
+    /// last looked, folding them into the in-memory view (and into watch
+    /// rings). Called at the top of every read and inside every write — the
+    /// store is always current-as-of-the-last-op. No-op for in-memory stores.
+    fn catch_up(&mut self) {
+        let records = match self.wal.as_mut() {
+            Some(wal) => {
+                wal.lock(false);
+                let recs = wal.tail_locked();
+                wal.unlock();
+                recs
+            }
+            None => return,
+        };
+        for (rev, op, key, value) in records {
+            self.apply_external(rev, op, key, value);
+        }
     }
 
     /// The current store revision — the watermark a LIST advertises and a
@@ -293,21 +392,94 @@ impl KeyspaceStore {
     }
 
     /// Current value + its per-key revision (the CAS token / etag source).
-    pub fn get(&self, key: &str) -> Option<(&[u8], u64)> {
+    /// `&mut` because a shared-WAL store first folds in other processes'
+    /// appends (`catch_up`).
+    pub fn get(&mut self, key: &str) -> Option<(&[u8], u64)> {
+        self.catch_up();
         self.entries
             .get(key)
             .map(|e| (e.value.as_slice(), e.revision))
     }
 
+    /// Apply a locally-authored, already-durable change to the in-memory view.
+    fn apply_local(&mut self, rev: u64, op: u8, key: &str, value: Vec<u8>) {
+        self.revision = rev;
+        let change = if op == WAL_OP_DELETE {
+            self.entries.remove(key);
+            KeyspaceChange {
+                revision: rev,
+                key: key.to_string(),
+                kind: ChangeKind::Deleted,
+                value: None,
+            }
+        } else {
+            let existed = self.entries.contains_key(key);
+            self.entries.insert(
+                key.to_string(),
+                Entry {
+                    value: value.clone(),
+                    revision: rev,
+                },
+            );
+            KeyspaceChange {
+                revision: rev,
+                key: key.to_string(),
+                kind: if existed {
+                    ChangeKind::Modified
+                } else {
+                    ChangeKind::Added
+                },
+                value: Some(value),
+            }
+        };
+        self.record(change);
+    }
+
     /// Insert or update. `if_match`: `None` = unconditional; `Some(0)` = must
     /// not exist; `Some(r)` = current per-key revision must equal `r`. Returns
     /// the new store revision the write was stamped with.
+    ///
+    /// Shared-WAL stores settle everything that must be atomic — tailing other
+    /// processes' appends, the CAS check, revision assignment, the append
+    /// itself — under the WAL's exclusive lock, so concurrent writers in other
+    /// processes cannot invalidate the precondition or collide on a revision.
     pub fn put(
         &mut self,
         key: &str,
         value: Vec<u8>,
         if_match: Option<u64>,
     ) -> Result<u64, WriteError> {
+        if self.wal.is_some() {
+            // Lock, then fold in everything appended before us.
+            let records = {
+                let wal = self.wal.as_mut().expect("checked above");
+                wal.lock(true);
+                wal.tail_locked()
+            };
+            for (rev, op, k, v) in records {
+                self.apply_external(rev, op, k, v);
+            }
+            // CAS under the lock — the check is against the true current state.
+            if let Some(expect) = if_match {
+                let current = self.entries.get(key).map(|e| e.revision).unwrap_or(0);
+                if current != expect {
+                    self.wal.as_ref().expect("checked above").unlock();
+                    return Err(WriteError::Conflict(CasConflict { current }));
+                }
+            }
+            let rev = self.revision + 1;
+            let res = self
+                .wal
+                .as_mut()
+                .expect("checked above")
+                .append_locked(rev, WAL_OP_PUT, key, &value);
+            self.wal.as_ref().expect("checked above").unlock();
+            res.map_err(WriteError::Io)?;
+            self.apply_local(rev, WAL_OP_PUT, key, value);
+            return Ok(rev);
+        }
+
+        // In-memory path (tests / callers that persist elsewhere).
         let existing_rev = self.entries.get(key).map(|e| e.revision);
         if let Some(expect) = if_match {
             let current = existing_rev.unwrap_or(0);
@@ -316,75 +488,87 @@ impl KeyspaceStore {
             }
         }
         let rev = self.revision + 1;
-        // Durability first: persist + fsync BEFORE the write is observable, so
-        // a returned revision is always recoverable (no phantom revision a
-        // watcher could resume past). A WAL failure leaves the store unchanged.
-        if let Some(wal) = self.wal.as_mut() {
-            wal.append(rev, WAL_OP_PUT, key, &value)
-                .map_err(WriteError::Io)?;
-        }
-        self.revision = rev;
-        let kind = if existing_rev.is_some() {
-            ChangeKind::Modified
-        } else {
-            ChangeKind::Added
-        };
-        self.entries.insert(
-            key.to_string(),
-            Entry {
-                value: value.clone(),
-                revision: rev,
-            },
-        );
-        self.record(KeyspaceChange {
-            revision: rev,
-            key: key.to_string(),
-            kind,
-            value: Some(value),
-        });
+        self.apply_local(rev, WAL_OP_PUT, key, value);
         Ok(rev)
     }
 
     /// Remove a key. `if_match` as in `put` (`Some(0)` is meaningless for
     /// delete and always conflicts unless the key is absent). Returns the new
     /// store revision, or `Ok(None)` if the key was absent (no-op, no
-    /// revision spent) under an unconditional delete.
+    /// revision spent) under an unconditional delete. Same locking discipline
+    /// as `put`.
     pub fn delete(&mut self, key: &str, if_match: Option<u64>) -> Result<Option<u64>, WriteError> {
+        if self.wal.is_some() {
+            let records = {
+                let wal = self.wal.as_mut().expect("checked above");
+                wal.lock(true);
+                wal.tail_locked()
+            };
+            for (rev, op, k, v) in records {
+                self.apply_external(rev, op, k, v);
+            }
+            let existing_rev = self.entries.get(key).map(|e| e.revision);
+            let precheck = Self::delete_precheck(if_match, existing_rev);
+            match precheck {
+                Err(conflict) => {
+                    self.wal.as_ref().expect("checked above").unlock();
+                    return Err(WriteError::Conflict(conflict));
+                }
+                Ok(false) => {
+                    self.wal.as_ref().expect("checked above").unlock();
+                    return Ok(None); // absent-key no-op
+                }
+                Ok(true) => {}
+            }
+            let rev = self.revision + 1;
+            let res = self.wal.as_mut().expect("checked above").append_locked(
+                rev,
+                WAL_OP_DELETE,
+                key,
+                &[],
+            );
+            self.wal.as_ref().expect("checked above").unlock();
+            res.map_err(WriteError::Io)?;
+            self.apply_local(rev, WAL_OP_DELETE, key, Vec::new());
+            return Ok(Some(rev));
+        }
+
         let existing_rev = self.entries.get(key).map(|e| e.revision);
+        match Self::delete_precheck(if_match, existing_rev) {
+            Err(conflict) => return Err(WriteError::Conflict(conflict)),
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+        }
+        let rev = self.revision + 1;
+        self.apply_local(rev, WAL_OP_DELETE, key, Vec::new());
+        Ok(Some(rev))
+    }
+
+    /// The delete precondition: `Err` = CAS conflict; `Ok(false)` = valid
+    /// no-op (key absent); `Ok(true)` = proceed to delete.
+    fn delete_precheck(
+        if_match: Option<u64>,
+        existing_rev: Option<u64>,
+    ) -> Result<bool, CasConflict> {
         match (if_match, existing_rev) {
             (Some(expect), current) => {
                 let cur = current.unwrap_or(0);
                 if cur != expect {
-                    return Err(WriteError::Conflict(CasConflict { current: cur }));
+                    return Err(CasConflict { current: cur });
                 }
+                Ok(current.is_some())
             }
-            (None, None) => return Ok(None), // unconditional delete of absent key: no-op
-            (None, Some(_)) => {}
+            (None, None) => Ok(false), // unconditional delete of absent key: no-op
+            (None, Some(_)) => Ok(true),
         }
-        if existing_rev.is_none() {
-            // Conditional delete matched "absent" (expect==0): no-op success.
-            return Ok(None);
-        }
-        let rev = self.revision + 1;
-        if let Some(wal) = self.wal.as_mut() {
-            wal.append(rev, WAL_OP_DELETE, key, &[])
-                .map_err(WriteError::Io)?;
-        }
-        self.revision = rev;
-        self.entries.remove(key);
-        self.record(KeyspaceChange {
-            revision: rev,
-            key: key.to_string(),
-            kind: ChangeKind::Deleted,
-            value: None,
-        });
-        Ok(Some(rev))
     }
 
     /// Key-ordered snapshot of entries under `prefix`, plus the store revision
     /// the snapshot is consistent at — the anchor a subsequent `subscribe`
-    /// resumes from with no gap (the list→watch watermark).
-    pub fn list(&self, prefix: &str) -> (Vec<(String, u64)>, u64) {
+    /// resumes from with no gap (the list→watch watermark). `&mut` for
+    /// `catch_up`, as in `get`.
+    pub fn list(&mut self, prefix: &str) -> (Vec<(String, u64)>, u64) {
+        self.catch_up();
         let items = self
             .entries
             .range(prefix.to_string()..)
@@ -399,6 +583,10 @@ impl KeyspaceStore {
     /// precedes retained history, the watch opens already `Lost` (the consumer
     /// must relist) — never a silent gap.
     pub fn subscribe(&mut self, prefix: &str, since_revision: u64) -> WatchId {
+        // Fold in other processes' appends first, so `since` is judged against
+        // the true current revision (and their changes land in history, not in
+        // this watch's ring twice).
+        self.catch_up();
         let id = WatchId(self.next_watch);
         self.next_watch += 1;
         let cap = self.default_ring_cap;
@@ -417,7 +605,9 @@ impl KeyspaceStore {
             None => since_revision <= self.revision,
             // Reachable iff the caller's cursor is at or after (oldest-1),
             // i.e. the first change we retain (oldest) is the next one it needs.
-            Some(o) => since_revision + 1 >= o,
+            // `since` comes off the wire, so saturate rather than overflow on
+            // `u64::MAX`.
+            Some(o) => since_revision.saturating_add(1) >= o,
         };
         if !reachable {
             watch.lost = true;
@@ -437,6 +627,9 @@ impl KeyspaceStore {
     /// sticky until drained: a lost watch returns `Drain::Lost` once, then
     /// resumes buffering live changes from `resume_revision`.
     pub fn drain(&mut self, id: WatchId, max: usize) -> Option<Drain> {
+        // The poll path: tailing here is what makes another process's appends
+        // arrive in this subscriber's ring as ordinary events.
+        self.catch_up();
         let watch = self.watches.get_mut(&id)?;
         if watch.lost {
             watch.lost = false;
@@ -453,6 +646,19 @@ impl KeyspaceStore {
         };
         let events = watch.ring.drain(..take).collect();
         Some(Drain::Events(events))
+    }
+
+    /// Return events a `drain` took off a watch's ring back to its front, in
+    /// original order. Used when a caller's out buffer could not hold the whole
+    /// drained batch, so the remainder is redelivered next drain rather than
+    /// lost. The count returned never exceeds what was just removed, so this
+    /// cannot overflow the ring or trip its `Lost` guard.
+    fn requeue_front(&mut self, id: WatchId, events: Vec<KeyspaceChange>) {
+        if let Some(watch) = self.watches.get_mut(&id) {
+            for ev in events.into_iter().rev() {
+                watch.ring.push_front(ev);
+            }
+        }
     }
 
     pub fn unsubscribe(&mut self, id: WatchId) -> bool {
@@ -796,17 +1002,19 @@ impl KeyspaceStore {
             }
             Drain::Events(events) => {
                 if out.len() < 5 {
+                    // Not even room for the header — nothing was consumed, so
+                    // return the whole batch (already off the ring) to it.
+                    self.requeue_front(WatchId(id), events);
                     return wire::E_NOSPC;
                 }
-                out[0] = wire::DRAIN_EVENTS;
                 let mut w = 5;
-                let mut count = 0u32;
+                let mut encoded = 0usize;
                 for ev in &events {
                     let kb = ev.key.as_bytes();
                     let vb = ev.value.as_deref().unwrap_or(&[]);
                     let need = 8 + 1 + 2 + 4 + kb.len() + vb.len();
                     if w + need > out.len() {
-                        break; // partial drain: unreturned events stay buffered
+                        break;
                     }
                     put_u64(out, w, ev.revision);
                     out[w + 8] = match ev.kind {
@@ -819,9 +1027,23 @@ impl KeyspaceStore {
                     out[w + 15..w + 15 + kb.len()].copy_from_slice(kb);
                     out[w + 15 + kb.len()..w + 15 + kb.len() + vb.len()].copy_from_slice(vb);
                     w += need;
-                    count += 1;
+                    encoded += 1;
                 }
-                put_u32(out, 1, count);
+                // `drain` already removed these from the ring; put the tail that
+                // did not fit back at the front so the next drain delivers it
+                // rather than dropping it silently.
+                if encoded < events.len() {
+                    let mut events = events;
+                    let tail = events.split_off(encoded);
+                    self.requeue_front(WatchId(id), tail);
+                    if encoded == 0 {
+                        // Buffer too small for even one event — signal short
+                        // rather than a spurious empty (nothing was consumed).
+                        return wire::E_NOSPC;
+                    }
+                }
+                out[0] = wire::DRAIN_EVENTS;
+                put_u32(out, 1, encoded as u32);
                 w as i32
             }
         }
@@ -1070,9 +1292,103 @@ mod keyspace_store_tests {
             f.write_all(&[0xFF, 0xFF, 0xFF]).unwrap();
         }
         // Replay stops at the torn record; the intact prefix stands.
-        let ks2 = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+        let mut ks2 = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
         assert_eq!(ks2.revision(), 1);
         assert_eq!(ks2.get("/k"), Some((v("ok").as_slice(), 1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- multi-process store sharing (two stores, one WAL directory) ----
+    //
+    // Two KeyspaceStore instances on the same directory are exactly the two
+    // processes of the endpoints migration: nanocloud (projects services/pods
+    // in) and the fluxor runtime hosting the reconciler fmod (writes
+    // endpoints out). One store, no bridging.
+
+    #[test]
+    fn external_writes_are_visible_across_store_instances() {
+        let dir = temp_dir("xproc-vis");
+        let mut a = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+        let mut b = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+
+        // A writes; B sees it (value + revision) without reopening.
+        assert_eq!(a.put("/svc/a", v("1"), None).unwrap(), 1);
+        assert_eq!(b.get("/svc/a"), Some((v("1").as_slice(), 1)));
+        assert_eq!(b.revision(), 1);
+
+        // And the reverse: B writes at the NEXT global revision; A sees it.
+        assert_eq!(b.put("/svc/b", v("2"), None).unwrap(), 2);
+        assert_eq!(a.get("/svc/b"), Some((v("2").as_slice(), 2)));
+        // A's list is the union, key-ordered, at the shared watermark.
+        let (items, watermark) = a.list("/svc/");
+        let keys: Vec<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["/svc/a", "/svc/b"]);
+        assert_eq!(watermark, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_receives_another_processes_writes_as_events() {
+        let dir = temp_dir("xproc-watch");
+        let mut writer = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+        let mut watcher = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+
+        // The reconciler-fmod shape: subscribe, then the OTHER process writes.
+        let w = watcher.subscribe("/pods/", 0);
+        writer.put("/pods/web-1", v("10.0.0.1"), None).unwrap();
+        writer.put("/svc/other", v("x"), None).unwrap(); // outside the prefix
+
+        let Drain::Events(evs) = watcher.drain(w, 0).unwrap() else {
+            panic!("expected events");
+        };
+        assert_eq!(evs.len(), 1, "only the matching prefix is delivered");
+        assert_eq!(evs[0].key, "/pods/web-1");
+        assert_eq!(evs[0].kind, ChangeKind::Added);
+        assert_eq!(evs[0].value.as_deref(), Some(v("10.0.0.1").as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cas_is_settled_against_other_processes_writes() {
+        let dir = temp_dir("xproc-cas");
+        let mut a = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+        let mut b = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+
+        a.put("/k", v("a1"), None).unwrap(); // rev 1
+        assert_eq!(b.get("/k").map(|(_, r)| r), Some(1));
+        // B updates at rev 1 → rev 2. A's stale if_match=1 must now conflict,
+        // even though A hasn't read since — the lock-and-tail settles it.
+        assert_eq!(b.put("/k", v("b2"), Some(1)).unwrap(), 2);
+        let err = a.put("/k", v("stale"), Some(1)).unwrap_err();
+        assert_eq!(err.conflict(), Some(CasConflict { current: 2 }));
+        // A's retry against the true revision succeeds at rev 3.
+        assert_eq!(a.put("/k", v("a3"), Some(2)).unwrap(), 3);
+        assert_eq!(b.get("/k"), Some((v("a3").as_slice(), 3)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_by_the_next_appender() {
+        let dir = temp_dir("xproc-torn");
+        {
+            let mut ks = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+            ks.put("/k", v("ok"), None).unwrap(); // rev 1, intact
+        }
+        // A crashed writer left a torn tail.
+        {
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(dir.join(WAL_FILE))
+                .unwrap();
+            f.write_all(&[0xAB, 0xCD]).unwrap();
+        }
+        // The next appender truncates the torn bytes under its exclusive lock
+        // and appends cleanly; a fresh reader sees both intact records.
+        let mut ks = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+        assert_eq!(ks.put("/k2", v("new"), None).unwrap(), 2);
+        let mut fresh = KeyspaceStore::recover(&dir, 1024, 256).unwrap();
+        assert_eq!(fresh.get("/k"), Some((v("ok").as_slice(), 1)));
+        assert_eq!(fresh.get("/k2"), Some((v("new").as_slice(), 2)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1184,5 +1500,68 @@ mod keyspace_store_tests {
                                                                           // event: [rev:u64][kind:u8]...
         assert_eq!(u64::from_le_bytes(out[5..13].try_into().unwrap()), 1); // rev 1
         assert_eq!(out[13], 1); // Added
+    }
+
+    #[test]
+    fn dispatch_drain_requeues_events_that_do_not_fit() {
+        let mut ks = KeyspaceStore::new();
+        let mut fence = [0u8; ks_fence::WIRE_MAX_LEN];
+        let mut big = [0u8; 256];
+        // Subscribe, then produce three matching events.
+        let mut sarg = 0u64.to_le_bytes().to_vec();
+        sarg.extend_from_slice(&3u16.to_le_bytes());
+        sarg.extend_from_slice(b"/k/");
+        assert_eq!(
+            ks.dispatch(wire::KS_SUBSCRIBE, &sarg, &mut big, &mut fence),
+            8
+        );
+        let wid = u64::from_le_bytes(big[..8].try_into().unwrap());
+        for k in ["/k/a", "/k/b", "/k/c"] {
+            ks.dispatch(
+                wire::KS_PUT,
+                &put_arg(k, u64::MAX, b"1"),
+                &mut big,
+                &mut fence,
+            );
+        }
+
+        // A DRAIN whose out buffer holds the 5-byte header + exactly one event
+        // (each event = 15 header + 4 key + 1 val = 20 bytes). The other two
+        // must be redelivered, not dropped.
+        let one_event = 5 + 20;
+        let mut small = vec![0u8; one_event];
+        let mut darg = wid.to_le_bytes().to_vec();
+        darg.extend_from_slice(&0u16.to_le_bytes()); // max = 0 → all
+        let n = ks.dispatch(wire::KS_DRAIN, &darg, &mut small, &mut fence);
+        assert_eq!(n, one_event as i32);
+        assert_eq!(small[0], wire::DRAIN_EVENTS);
+        assert_eq!(u32::from_le_bytes(small[1..5].try_into().unwrap()), 1); // only one fit
+        assert_eq!(u64::from_le_bytes(small[5..13].try_into().unwrap()), 1); // rev 1 (/k/a)
+
+        // Drain the remainder into a large buffer: the two that did not fit are
+        // still there, in order — no silent loss.
+        let n = ks.dispatch(wire::KS_DRAIN, &darg, &mut big, &mut fence);
+        assert!(n > 0);
+        assert_eq!(u32::from_le_bytes(big[1..5].try_into().unwrap()), 2);
+        assert_eq!(u64::from_le_bytes(big[5..13].try_into().unwrap()), 2); // rev 2 (/k/b) next
+
+        // A buffer too small for even the first event consumes nothing and
+        // reports short — the events remain for a later, larger drain.
+        assert_eq!(
+            ks.dispatch(
+                wire::KS_PUT,
+                &put_arg("/k/d", u64::MAX, b"1"),
+                &mut big,
+                &mut fence
+            ),
+            8
+        );
+        let mut tiny = [0u8; 10];
+        assert_eq!(
+            ks.dispatch(wire::KS_DRAIN, &darg, &mut tiny, &mut fence),
+            wire::E_NOSPC
+        );
+        ks.dispatch(wire::KS_DRAIN, &darg, &mut big, &mut fence);
+        assert_eq!(u32::from_le_bytes(big[1..5].try_into().unwrap()), 1); // /k/d survived
     }
 }

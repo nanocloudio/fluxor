@@ -3,9 +3,8 @@
 //! `fluxor up <template> --replicas N` is the developer-facing
 //! shortcut for "render this template N times and spawn N
 //! `fluxor run` processes side-by-side, tailing their stderr until
-//! Ctrl+C". Designed for local Raft-style cluster bring-up; the
-//! same flow lives behind `make up-3` in clustor and will be the
-//! pattern Lattice / Loam adopt.
+//! Ctrl+C". Designed for local Raft-style cluster bring-up; a common
+//! pattern for downstream multi-replica deployments.
 //!
 //! The conventional placeholder set:
 //!
@@ -29,9 +28,8 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-// Default `http_offset` value (10 000, matching the clustor
-// diagnostic-surface convention) is declared on the clap arg in
-// `main.rs`; no in-module constant.
+// Default `http_offset` value (10 000, a conventional diagnostic-surface
+// offset) is declared on the clap arg in `main.rs`; no in-module constant.
 
 /// Spawn N replicas from one template. Returns once every child has
 /// exited (Ctrl+C → SIGTERM → wait).

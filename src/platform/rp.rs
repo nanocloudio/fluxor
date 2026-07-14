@@ -660,6 +660,7 @@ static RP_HAL_OPS: HalOps = HalOps {
     restore_interrupts: rp_restore_interrupts,
     wake_scheduler: rp_wake_scheduler,
     now_millis: rp_now_millis,
+    now_unix_millis: || 0, // no RTC on this platform
     now_micros: rp_now_micros,
     tick_count: rp_tick_count,
     flash_base: rp_flash_base,

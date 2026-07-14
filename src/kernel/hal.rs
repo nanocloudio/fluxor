@@ -32,6 +32,10 @@ pub struct HalOps {
     pub now_millis: fn() -> u64,
     /// Current time in microseconds since boot.
     pub now_micros: fn() -> u64,
+    /// Wall-clock time in milliseconds since the Unix epoch, or 0 if the platform has no
+    /// real-time clock. Distinct from `now_millis` (monotonic uptime); needed for absolute-
+    /// time checks like certificate validity and JWT `exp` (see docs/surface-auth.md).
+    pub now_unix_millis: fn() -> u64,
     /// Monotonic tick count (wrapping).
     pub tick_count: fn() -> u32,
 
@@ -179,6 +183,12 @@ pub fn now_millis() -> u64 {
 #[inline(always)]
 pub fn now_micros() -> u64 {
     (ops().now_micros)()
+}
+
+/// Wall-clock milliseconds since the Unix epoch (0 = no RTC on this platform).
+#[inline(always)]
+pub fn now_unix_millis() -> u64 {
+    (ops().now_unix_millis)()
 }
 
 #[inline(always)]

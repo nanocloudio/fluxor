@@ -157,6 +157,7 @@ struct ChunkSink {
 
 impl MkvSink for ChunkSink {
     fn on_video_track(&mut self, info: &VideoTrackInfo<'_>) {
+        // SAFETY: self.s is the codec state pointer, valid and uniquely held for the sink's lifetime.
         let s = unsafe { &mut *self.s };
         let kind = match info.codec {
             VideoCodec::H264 => 1u32,
@@ -167,6 +168,7 @@ impl MkvSink for ChunkSink {
             }
         };
         s.ts_scale_ns = info.timestamp_scale;
+        // SAFETY: codec_private is a valid slice; the host reads `len` bytes from the pointer.
         let rv = unsafe {
             host_video_config(
                 kind,
@@ -184,6 +186,7 @@ impl MkvSink for ChunkSink {
     }
 
     fn on_frame_begin(&mut self, timestamp_ticks: i64, keyframe: bool) {
+        // SAFETY: self.s is the codec state pointer, valid and uniquely held for the sink's lifetime.
         let s = unsafe { &mut *self.s };
         s.frame_len = 0;
         s.frame_key = keyframe as u32;
@@ -203,6 +206,7 @@ impl MkvSink for ChunkSink {
     }
 
     fn on_frame_data(&mut self, data: &[u8]) {
+        // SAFETY: self.s is the codec state pointer, valid and uniquely held for the sink's lifetime.
         let s = unsafe { &mut *self.s };
         if s.phase != Phase::Streaming as u8 {
             return;
@@ -213,6 +217,8 @@ impl MkvSink for ChunkSink {
             s.phase = Phase::Error as u8;
             return;
         }
+        // SAFETY: bounds checked above (frame_len + data.len() <= frame_cap); src and
+        // dst are distinct, non-overlapping regions.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 data.as_ptr(),
@@ -224,10 +230,12 @@ impl MkvSink for ChunkSink {
     }
 
     fn on_frame_end(&mut self) {
+        // SAFETY: self.s is the codec state pointer, valid and uniquely held for the sink's lifetime.
         let s = unsafe { &mut *self.s };
         if s.phase != Phase::Streaming as u8 || s.configured == 0 || s.frame_len == 0 {
             return;
         }
+        // SAFETY: frame_ptr is valid for frame_len bytes (accumulated above via bounds-checked copies).
         let rv = unsafe {
             host_video_chunk(
                 s.frame_ts_ms,
@@ -243,6 +251,7 @@ impl MkvSink for ChunkSink {
     }
 
     fn on_error(&mut self, _err: MkvError) {
+        // SAFETY: self.s is the codec state pointer, valid and uniquely held for the sink's lifetime.
         let s = unsafe { &mut *self.s };
         s.phase = Phase::Error as u8;
     }

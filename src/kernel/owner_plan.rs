@@ -14,7 +14,7 @@
 //! accounting hold for a composed multi-Pod graph. Every module is the system
 //! owner until a plan is applied.
 
-use sha2::{Digest, Sha256};
+use crate::kernel::crypto::sha256::Sha256;
 
 use crate::kernel::owner::MAX_OWNERS;
 
@@ -571,7 +571,8 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
     let Ok(plan) = decode(bytes) else {
         return None; // rebuild path surfaces the decode error
     };
-    let last = unsafe { *(&raw const LAST_APPLIED_GENERATION) };
+    // SAFETY: scheduler-thread single accessor; scalar read by value.
+    let last = unsafe { LAST_APPLIED_GENERATION };
     if plan.generation < last {
         return None; // rebuild path surfaces the rollback rejection
     }
@@ -616,9 +617,10 @@ pub fn try_apply_drain_delta() -> Option<DrainDelta> {
 
     let generation = plan.generation;
     // SAFETY: scheduler-thread single accessor; retain for rebuild re-apply.
+    // Direct static assignment forms no reference.
     unsafe {
-        *(&raw mut LAST_APPLIED_GENERATION) = generation;
-        *(&raw mut RETAINED_PLAN) = Some(plan);
+        LAST_APPLIED_GENERATION = generation;
+        RETAINED_PLAN = Some(plan);
     }
     log::info!(
         "[owner] drain delta applied: {} drains armed (gen {generation})",
@@ -669,8 +671,8 @@ pub fn arm_staged_revocation_drains() -> DrainDelta {
         count: 0,
         arms: [DrainArm::EMPTY; MAX_PLAN_ASSIGNMENTS],
     };
-    // SAFETY: scheduler-thread single accessor.
-    let Some((ptr, len)) = (unsafe { *(&raw const STAGED_PLAN) }) else {
+    // SAFETY: scheduler-thread single accessor; scalar read by value.
+    let Some((ptr, len)) = (unsafe { STAGED_PLAN }) else {
         return empty;
     };
     // SAFETY: `set_staged_plan`'s caller upheld the validity contract.
@@ -680,7 +682,8 @@ pub fn arm_staged_revocation_drains() -> DrainDelta {
     };
     // A rollback is rejected by the rebuild's `apply_staged`; do not arm drains
     // for a plan that will not be applied.
-    let last = unsafe { *(&raw const LAST_APPLIED_GENERATION) };
+    // SAFETY: scheduler-thread single accessor; scalar read by value.
+    let last = unsafe { LAST_APPLIED_GENERATION };
     if plan.generation < last {
         return empty;
     }

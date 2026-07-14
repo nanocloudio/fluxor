@@ -167,13 +167,8 @@ fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
                     Ok(n) => {
                         // Block policy: the pump (never module_step) waits out
                         // a full ring — real backpressure to the terminal/pipe.
-                        loop {
-                            match pump.push_frame(&buf[..n]) {
-                                PushOutcome::Rejected => {
-                                    std::thread::sleep(Duration::from_millis(1));
-                                }
-                                _ => break,
-                            }
+                        while let PushOutcome::Rejected = pump.push_frame(&buf[..n]) {
+                            std::thread::sleep(Duration::from_millis(1));
                         }
                     }
                 }

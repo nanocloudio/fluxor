@@ -346,8 +346,7 @@ unsafe fn fs_close_current(s: &mut BankState) {
     if s.fs_fd >= 0 {
         // storage.object consumers free BOTH the provider-side slot
         // (OBJ_CLOSE) and the kernel routing entry (provider_close) —
-        // a per-track GET leaks a slot otherwise (see the truffle
-        // scanner's provider-close handling).
+        // a per-track GET leaks a slot otherwise.
         (s.sys().provider_call)(s.fs_fd, OBJ_CLOSE, core::ptr::null_mut(), 0);
         (s.sys().provider_close)(s.fs_fd);
         s.fs_fd = -1;

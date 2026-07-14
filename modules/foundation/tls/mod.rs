@@ -433,7 +433,7 @@ struct TlsState {
     cipher_out: i32, // to IP: ciphertext net_proto frames
     clear_in: i32,   // from HTTP: cleartext net_proto frames (commands)
     clear_out: i32,  // to HTTP: cleartext net_proto frames (events)
-    /// Optional peer-identity output (clustor phase-3 RFC §5.1).
+    /// Optional peer-identity output.
     /// Emits `MSG_PEER_IDENTITY` (msg_type 0x5A) per accepted
     /// TLS session after Finished. Wired only when a downstream
     /// consumer needs it; -1 when the port is unwired makes the
@@ -2944,7 +2944,7 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
 /// envelope is a fluxor-graph primitive (foundation/tls emits it,
 /// any consumer module — peer_router, RBAC, log, audit — can read
 /// it); the format is documented here, not in any downstream
-/// consumer's repo. clustor's `peer_router` mirrors these
+/// consumer's repo. A downstream `peer_router` may mirror these
 /// constants but is one valid consumer among many.
 ///
 /// Wire format: `[msg_type:1][payload_len:2 LE]

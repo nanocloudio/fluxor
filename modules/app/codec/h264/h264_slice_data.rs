@@ -13,7 +13,8 @@
     dead_code,
     unused_assignments,
     unused_mut,
-    clippy::all
+    clippy::all,
+    reason = "mechanical port of h264bsd keeps C names verbatim for stage-by-stage parity diffing against the reference decoder"
 )]
 
 use super::*;

@@ -19,8 +19,9 @@
 #   fluxor combine -o kernel_2712.img target/cm5/firmware.bin \
 #     examples/test_harness/cm5/echo_edge_split.yaml
 #
-# Probe from the host (before and after the rebuild window):
-#   printf 'ping' | nc -w2 192.168.1.9 9000
+# Probe from the host (before and after the rebuild window). 192.168.2.1 is an
+# example DUT IP (documentation addresses follow the RFC 5737 TEST-NET-1 convention):
+#   printf 'ping' | nc -w2 192.168.2.1 9000
 
 target: cm5
 tick_us: 100

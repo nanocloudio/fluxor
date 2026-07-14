@@ -1687,7 +1687,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         return Err(LoaderError::IntegrityMismatch);
                     }
                     let stored_hash = &manifest_data[hash_offset..hash_offset + 32];
-                    use sha2::{Digest, Sha256};
+                    use crate::kernel::crypto::sha256::Sha256;
                     let mut hasher = Sha256::new();
                     // The stored integrity hash covers code||data — a corruption
                     // check (recomputable by anyone, so no authenticity on its
@@ -1756,7 +1756,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     //     [0..hash_offset] bytes that differ unsigned vs signed.
                     let hash = {
                         let hash_offset = 16 + var_size;
-                        use sha2::{Digest, Sha256};
+                        use crate::kernel::crypto::sha256::Sha256;
                         let mut eh = Sha256::new();
                         // SAFETY: [module.base, +manifest_offset) is the
                         // header+code+data+exports+schema region, inside the
@@ -1766,7 +1766,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         eh.update(&pre[0..64]);
                         eh.update(&pre[66..manifest_offset]);
                         eh.update(&manifest_data[0..14]);
-                        eh.update([manifest_data[14] & 0xFC]);
+                        eh.update(&[manifest_data[14] & 0xFC]);
                         eh.update(&manifest_data[15..hash_offset]);
                         // ABI-surface attestation: at its CANONICAL offset —
                         // integrity hash (32) then signature block (96) then
@@ -1886,6 +1886,8 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
     let pipeline_refill_fn = match module.get_export_addr(export_hashes::MODULE_PIPELINE_REFILL) {
         Ok(addr) => {
             validate_fn_addr(addr, "module_pipeline_refill")?;
+            // SAFETY: addr validated above to lie within the module code region;
+            // the ModuleExports ABI shape matches the fn signature.
             Some(unsafe { fn_ptr_from_addr::<ModulePipelineRefillFn>(addr) })
         }
         Err(_) => None,
@@ -1893,6 +1895,8 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
     let post_tick_flush_fn = match module.get_export_addr(export_hashes::MODULE_POST_TICK_FLUSH) {
         Ok(addr) => {
             validate_fn_addr(addr, "module_post_tick_flush")?;
+            // SAFETY: addr validated above to lie within the module code region;
+            // the ModuleExports ABI shape matches the fn signature.
             Some(unsafe { fn_ptr_from_addr::<ModulePostTickFlushFn>(addr) })
         }
         Err(_) => None,
@@ -2525,13 +2529,19 @@ impl Module for DynamicModule {
         let result = if self.isolated {
             #[cfg(feature = "chip-bcm2712")]
             {
+                // SAFETY: flush_fn is a validated module export; protected_step
+                // runs it under the module's MPU region with its own state arena.
                 unsafe { crate::kernel::mmu::protected_step(flush_fn, self.state_ptr) }
             }
             #[cfg(not(feature = "chip-bcm2712"))]
             {
+                // SAFETY: flush_fn is a validated module export; state_ptr is the
+                // module's own state arena.
                 unsafe { call_post_tick_flush(flush_fn, self.state_ptr) }
             }
         } else {
+            // SAFETY: flush_fn is a validated module export; state_ptr is the
+            // module's own state arena.
             unsafe { call_post_tick_flush(flush_fn, self.state_ptr) }
         };
         if result < 0 {
@@ -2548,13 +2558,19 @@ impl Module for DynamicModule {
         let result = if self.isolated {
             #[cfg(feature = "chip-bcm2712")]
             {
+                // SAFETY: refill_fn is a validated module export; protected_step
+                // runs it under the module's MPU region with its own state arena.
                 unsafe { crate::kernel::mmu::protected_step(refill_fn, self.state_ptr) }
             }
             #[cfg(not(feature = "chip-bcm2712"))]
             {
+                // SAFETY: refill_fn is a validated module export; state_ptr is the
+                // module's own state arena.
                 unsafe { call_pipeline_refill(refill_fn, self.state_ptr) }
             }
         } else {
+            // SAFETY: refill_fn is a validated module export; state_ptr is the
+            // module's own state arena.
             unsafe { call_pipeline_refill(refill_fn, self.state_ptr) }
         };
         if result < 0 {

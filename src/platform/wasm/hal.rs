@@ -179,6 +179,7 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     restore_interrupts: wasm_restore_interrupts,
     wake_scheduler: wasm_wake_scheduler,
     now_millis: wasm_now_millis,
+    now_unix_millis: || 0, // no RTC on this platform
     now_micros: wasm_now_micros,
     tick_count: wasm_tick_count,
     flash_base: wasm_flash_base,

@@ -1,0 +1,2064 @@
+/// Shared test helpers for env-mutating tests.
+///
+/// Multiple test modules in this file (`scheduler_validation_tests`
+/// and `module_discovery_tests`) mutate `FLUXOR_PROJECT_ROOT` /
+/// `FLUXOR_INSTALL_ROOT`. Cargo runs tests inside one binary in
+/// parallel by default, and `project::root()` reads the env
+/// dynamically — so without a shared lock, parallel tests see each
+/// other's mid-test state.
+///
+/// The lock + guard live here, sibling to both test modules; each
+/// uses them via `super::test_env::*`.
+#[cfg(test)]
+pub(crate) mod test_env {
+    /// Process-global env-mutating tests serialise through a single
+    /// mutex. The mutex itself lives in `project::tests` (which is
+    /// reachable from both lib and bin test targets) so independent
+    /// test modules can't accidentally race against each other.
+    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
+        match crate::project::tests::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// RAII guard: takes the file-scope env lock, snapshots a set of
+    /// env vars, applies overrides, and restores the originals on
+    /// drop — so a panic inside a test does not leak mutated state
+    /// to subsequent tests.
+    pub struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        /// Acquire the lock, save current values of `vars`, then set
+        /// each to its override.
+        pub fn set(vars: &[(&'static str, &std::path::Path)]) -> Self {
+            let _lock = lock();
+            let mut saved = Vec::with_capacity(vars.len());
+            for (k, _) in vars {
+                saved.push((*k, std::env::var(k).ok()));
+            }
+            for (k, v) in vars {
+                // SAFETY: process-global env mutation serialised by
+                // the file-scope `ENV_LOCK` held in `_lock` for the
+                // lifetime of this guard.
+                unsafe {
+                    std::env::set_var(k, v);
+                }
+            }
+            Self { _lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                // SAFETY: same lock as `set`; runs on drop (incl.
+                // panic unwind) so callers never leak overrides.
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_validation_tests {
+    use super::*;
+
+    // ---- resolve_domain_id: hard-fail on unknown domain ----
+
+    #[test]
+    fn unknown_domain_name_is_a_hard_error() {
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "audio", "tick_us": 1000},
+                    {"name": "control", "tick_us": 10000}
+                ]
+            }
+        });
+        let module = json!({"name": "synth", "type": "x", "domain": "audoi"});
+        let err = resolve_domain_id(&module, &cfg).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("audoi") && msg.contains("audio") && msg.contains("control"),
+            "expected error to name typo and known domains, got: {msg}"
+        );
+    }
+
+    // ---- F2: D9/D10 must read params from top-level OR nested `params:` ----
+
+    #[test]
+    fn module_param_u64_reads_top_level_and_nested() {
+        // Top-level style `voter_count: 3` (the normal/packed form).
+        let top = json!({"name": "r", "type": "raft_engine", "voter_count": 3});
+        assert_eq!(module_param_u64(&top, "voter_count"), Some(3));
+        // Nested `params: { voter_count: 3 }`.
+        let nested = json!({"name": "r", "params": {"voter_count": 3}});
+        assert_eq!(module_param_u64(&nested, "voter_count"), Some(3));
+        // Absent → None (callers default appropriately).
+        assert_eq!(module_param_u64(&json!({"name": "r"}), "voter_count"), None);
+        // Top-level wins when both are present.
+        let both = json!({"name": "r", "voter_count": 5, "params": {"voter_count": 9}});
+        assert_eq!(module_param_u64(&both, "voter_count"), Some(5));
+    }
+
+    #[test]
+    fn d10_catches_top_level_voter_count_on_adaptive_raft() {
+        // raft_engine on an adaptive domain with TOP-LEVEL voter_count > 1 must
+        // be rejected (D10) — the bypass the nested-only read used to miss.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}
+        ]}});
+        let modules = vec![json!({"name": "raft", "type": "raft_engine", "voter_count": 3})];
+        let manifests = std::collections::HashMap::new();
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("D10 must reject multi-node raft on an adaptive domain");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("multi-node") && msg.contains("D10"),
+            "expected D10 multi-node rejection, got: {msg}"
+        );
+    }
+
+    // ---- F3: malformed manifest must FAIL CLOSED on an adaptive domain ----
+
+    #[test]
+    fn malformed_manifest_fails_closed_on_adaptive_domain() {
+        // `load_module_manifests_with_extra` only warns and OMITS a manifest that
+        // fails to parse, so a typo in `timer_class` would downgrade to "no
+        // manifest" and fail OPEN through the gate's `Some(man)` check. A
+        // malformed manifest on an adaptive domain must instead fail CLOSED — we
+        // cannot verify its timer_class.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("typo_mod");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        // Otherwise-valid manifest with an INVALID timer_class value → from_toml
+        // errors → the loader would warn + omit it from the parsed map.
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"cm5\"]\ntimer_class = \"tikc_counted\"\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}
+        ]}});
+        let modules = vec![json!({"name": "typo_mod", "type": "typo_mod"})];
+        // Empty parsed map simulates the loader's warn-and-omit of the bad file.
+        let manifests = std::collections::HashMap::new();
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_adaptive_tick(
+            &cfg, &modules, 100, &names, &ticks, &manifests, &extras, None,
+        )
+        .expect_err("a malformed manifest on an adaptive domain must fail closed");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("failed to parse") && msg.contains("typo_mod"),
+            "expected fail-closed parse diagnostic naming the module, got: {msg}"
+        );
+    }
+
+    // ---- High-1: timer-class admission is fail-closed for mechanism (b) ----
+
+    #[test]
+    fn manifestless_module_passes_on_idle_a_domain_but_blocks_on_cadence_b() {
+        // (a)-only domain (flags=1): a genuinely manifest-less module is ADMITTED
+        // — the lenient gate, since idle-relax alone doesn't warp a running module
+        // (the §7.2/§7.3 type-specific gates cover (a)'s hazards). (b) domain
+        // (flags=3): the SAME module is BLOCKED — unattested defaults to
+        // step_counted (RFC adaptive_tick §8 rule 2, fail closed).
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A resolvable module DIRECTORY with NO manifest.toml — the realistic
+        // "genuinely manifest-less" case.
+        std::fs::create_dir_all(dir.path().join("no_manifest_mod")).expect("mkdir");
+        let modules = vec![json!({"name": "no_manifest_mod", "type": "no_manifest_mod"})];
+        let manifests = std::collections::HashMap::new();
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+
+        let cfg_a = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        validate_adaptive_tick(
+            &cfg_a, &modules, 100, &names, &ticks, &manifests, &extras, None,
+        )
+        .expect("manifest-less module must pass on a mechanism-(a)-only domain");
+
+        let cfg_b = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let err = validate_adaptive_tick(
+            &cfg_b, &modules, 100, &names, &ticks, &manifests, &extras, None,
+        )
+        .expect_err("manifest-less (unattested) module must be blocked on a (b) domain");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("no manifest") && msg.contains("no_manifest_mod"),
+            "expected unattested-block diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unattested_manifest_blocked_on_cadence_b_domain() {
+        // A module WITH a manifest but NO timer_class field defaults to Unattested
+        // → blocked on a (b) domain. The map carries the parsed (Unattested) manifest.
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("plain".to_string(), Manifest::default()); // timer_class=Unattested
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let modules = vec![json!({"name": "plain", "type": "plain"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("an unattested manifest must be blocked on a (b) domain");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("positively attest") && msg.contains("plain"),
+            "expected positive-attestation diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn adaptive_burst_floor_honours_explicit_deadline_override() {
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 1750, "tick_max_us": 3500}
+        ]}});
+        // The implicit burst (12_000 * 8) exceeds 16 * tick_min, while the
+        // explicitly bounded 28 ms burst fits exactly. The adaptive validator
+        // must use the same effective deadline as config packing/runtime.
+        let modules = vec![json!({
+            "name": "wal", "type": "wal", "step_deadline_us": 12_000,
+            "step_deadline_burst_us": 28_000
+        })];
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert(
+            "wal".to_string(),
+            Manifest {
+                timer_class: TimerClass::WallClock,
+                ..Manifest::default()
+            },
+        );
+        let names = vec!["main".to_string()];
+        let ticks = vec![3500u16];
+        validate_adaptive_tick(&cfg, &modules, 3500, &names, &ticks, &manifests, &[], None)
+            .expect("explicit burst deadline should govern adaptive floor admission");
+    }
+
+    #[test]
+    fn attested_module_passes_on_cadence_b_domain() {
+        // wall_clock and explicit agnostic both positively attest → admitted on (b).
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let modules = vec![json!({"name": "ok", "type": "ok"})];
+        for tc in [TimerClass::WallClock, TimerClass::Agnostic] {
+            let man = Manifest {
+                timer_class: tc,
+                ..Manifest::default()
+            };
+            let mut manifests = std::collections::HashMap::new();
+            manifests.insert("ok".to_string(), man);
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .unwrap_or_else(|e| {
+                    panic!("{} must pass on a (b) domain, got: {e:?}", tc.as_str())
+                });
+        }
+    }
+
+    #[test]
+    fn step_period_ticks_blocked_on_cadence_b_unless_wallclock() {
+        // RFC §8 rule 1: a non-zero step_period_ticks is tick-counted → blocked on
+        // a (b) domain unless wall_clock (agnostic does NOT override it).
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 3,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let modules = vec![json!({"name": "periodic", "type": "periodic"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+
+        // agnostic + step_period_ticks=5 → blocked.
+        let blocked = Manifest {
+            timer_class: TimerClass::Agnostic,
+            step_period_ticks: 5,
+            ..Manifest::default()
+        };
+        let mut m_blocked = std::collections::HashMap::new();
+        m_blocked.insert("periodic".to_string(), blocked);
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_blocked, &[], None)
+                .expect_err("step_period_ticks!=0 on (b) must be blocked unless wall_clock");
+        assert!(
+            format!("{err:?}").contains("step_period_ticks"),
+            "expected step_period_ticks diagnostic, got: {err:?}"
+        );
+
+        // wall_clock + step_period_ticks=5 → passes (re-derives from real time).
+        let ok = Manifest {
+            timer_class: TimerClass::WallClock,
+            step_period_ticks: 5,
+            ..Manifest::default()
+        };
+        let mut m_ok = std::collections::HashMap::new();
+        m_ok.insert("periodic".to_string(), ok);
+        validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &m_ok, &[], None)
+            .expect("a wall_clock step-period module must pass on a (b) domain");
+    }
+
+    #[test]
+    fn replicated_clock_blocked_on_cadence_b_without_replica_agreement() {
+        // D8 rule 4 (§7.3): a replicated_clock module self-reads wall-clock time
+        // (so it passes the rule-2 attestation gate), but mechanism (b) changing
+        // the emission cadence shifts replicated expiry. Blocked on (b) unless the
+        // domain asserts replica-agreed emission cadence.
+        let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::ReplicatedClock,
+            ..Manifest::default()
+        };
+
+        // Without the assertion → blocked.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ttl".to_string(), man.clone());
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("replicated_clock on (b) must be blocked without replica agreement");
+        assert!(
+            format!("{err:?}").contains("replica") && format!("{err:?}").contains("rule 4"),
+            "expected replicated-clock rule-4 diagnostic, got: {err:?}"
+        );
+
+        // With replica_agreed_cadence: true → passes (single node).
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 100, "tick_max_us": 8000, "replica_agreed_cadence": true}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("replicated_clock on (b) must pass once replica agreement is asserted");
+    }
+
+    #[test]
+    fn replicated_clock_multi_node_blocked_even_with_assertion() {
+        // D8 rule 4: a multi-node cluster cannot agree on emission rate under
+        // independent per-node pacing — blocked on (b) regardless of the assertion.
+        let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler", "voter_count": 3})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::ReplicatedClock,
+            ..Manifest::default()
+        };
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 100, "tick_max_us": 8000, "replica_agreed_cadence": true}]}});
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ttl".to_string(), man);
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("replicated_clock on (b) multi-node must be blocked");
+        assert!(
+            format!("{err:?}").contains("multi-node"),
+            "expected multi-node diagnostic, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn multi_graph_pods_exceeding_pacer_table_rejected() {
+        // RFC adaptive_tick_extra §7.5/§13: resident graphs (base + `pods:`) ×
+        // domains must fit the kernel's static GRAPH_PACERS table (16). A base
+        // graph (1 domain) plus 16 single-domain pods = 17 instances → reject.
+        let modules = vec![json!({"name": "m", "type": "passthrough"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let manifests = std::collections::HashMap::new();
+        let domain = json!({
+            "name": "main", "cores": [0], "adaptive_flags": 1,
+            "tick_min_us": 100, "tick_max_us": 8000
+        });
+        let pods_over: Vec<_> = (0..16)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "pods": pods_over});
+        // resolved_target None ⇒ event-driven (Linux); skips the bcm wake-policy
+        // gate so this isolates the pacer-table gate.
+        let err = validate_adaptive_tick(
+            &cfg_over,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect_err("17 (graph,domain) pacer instances must exceed the 16-slot table");
+        assert!(
+            format!("{err:?}").contains("pacer table")
+                && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
+            "expected the §7.5 pacer-table overflow diagnostic, got: {err:?}"
+        );
+
+        // 3 pods → 1 (base) + 3 = 4 instances → fits.
+        let pods_ok: Vec<_> = (0..3)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_ok = json!({"execution": {"domains": [domain]}, "pods": pods_ok});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("4 (graph,domain) pacer instances must fit the 16-slot table");
+    }
+
+    #[test]
+    fn multi_graph_pods_overflow_rejected_without_adaptive_flags() {
+        // The pacer-table gate must run even when NO domain sets adaptive_flags:
+        // the runtime keys/steps the resident-graph table for any multi-graph
+        // config (fixed-tick too), so an overflowing `pods:` set with no adaptive
+        // flags must still be rejected, not silently dropped at runtime.
+        let modules = vec![json!({"name": "m", "type": "passthrough"})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let manifests = std::collections::HashMap::new();
+        // domain with NO adaptive_flags (fixed-tick).
+        let domain = json!({"name": "main", "cores": [0]});
+        let pods_over: Vec<_> = (0..16)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_over = json!({"execution": {"domains": [domain.clone()]}, "pods": pods_over});
+        let err = validate_adaptive_tick(
+            &cfg_over,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect_err("17 fixed-tick pacer instances must still exceed the 16-slot table");
+        assert!(
+            format!("{err:?}").contains("pacer table")
+                && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
+            "expected the §7.5 overflow diagnostic even with no adaptive flags, got: {err:?}"
+        );
+
+        // 2 fixed-tick pods → 1 + 2 = 3 instances → fits.
+        let pods_ok: Vec<_> = (0..2)
+            .map(|i| json!({"modules": [{"name": format!("p{i}"), "type": "passthrough", "domain": 0}]}))
+            .collect();
+        let cfg_ok = json!({"execution": {"domains": [domain]}, "pods": pods_ok});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("3 fixed-tick pacer instances must fit the 16-slot table");
+    }
+
+    #[test]
+    fn multi_graph_isr_tier_pod_rejected() {
+        // A pod module placed in an ISR-tier domain (tier 1b/2) must be rejected
+        // at emit time — the FLXA codec carries no ISR metadata and pod admission
+        // runs after ISR registration, so it would never execute.
+        let tmp = std::env::temp_dir();
+        // Domain 1 is tier 1b (isr_timer, exec_mode 2); domain 0 cooperative.
+        let cfg_isr = json!({
+            "execution": {"domains": [
+                {"name": "coop", "cores": [0]},
+                {"name": "isrd", "cores": [1], "tier": "1b"}
+            ]},
+            "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "isrd"}]}]
+        });
+        let err = build_pod_section(&cfg_isr, &tmp, &[])
+            .expect_err("an ISR-tier pod placement must be rejected");
+        assert!(
+            format!("{err:?}").contains("ISR-tier"),
+            "expected the ISR-tier pod rejection diagnostic, got: {err:?}"
+        );
+
+        // Same module in the cooperative domain is accepted (reaches schema/emit).
+        let cfg_ok = json!({
+            "execution": {"domains": [
+                {"name": "coop", "cores": [0]},
+                {"name": "isrd", "cores": [1], "tier": "1b"}
+            ]},
+            "pods": [{"modules": [{"name": "p", "type": "pod_pic_mod", "domain": "coop"}]}]
+        });
+        build_pod_section(&cfg_ok, &tmp, &[])
+            .expect("a cooperative-domain pod placement must be accepted");
+    }
+
+    #[test]
+    fn multi_graph_duplicate_pod_local_name_rejected() {
+        // Two modules sharing a pod-local name would silently overwrite the
+        // wiring map (`name_to_local`) and mis-route edges. Must be rejected.
+        let tmp = std::env::temp_dir();
+        let cfg = json!({
+            "execution": {"domains": [{"name": "coop", "cores": [0]}]},
+            "pods": [{"modules": [
+                {"name": "dup", "type": "pod_pic_mod", "domain": "coop"},
+                {"name": "dup", "type": "pod_pic_mod2", "domain": "coop"}
+            ]}]
+        });
+        let err = build_pod_section(&cfg, &tmp, &[])
+            .expect_err("duplicate pod-local module names must be rejected");
+        assert!(
+            format!("{err:?}").contains("duplicate module name"),
+            "expected the duplicate-name diagnostic, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn replicated_clock_idle_clamp_enforced() {
+        // D8 rule 4 (a): demand-driven idle must not widen tick_max_us past the
+        // tick emission interval, else committed expiry stalls.
+        let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler", "tick_interval_ms": 50})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::ReplicatedClock,
+            ..Manifest::default()
+        };
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ttl".to_string(), man);
+
+        // idle-only (bit 0), tick_max_us=50000 ≥ 50 ms (=50000 us) interval → blocked.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 50000}]}});
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("idle widen past the emission interval must be blocked");
+        assert!(
+            format!("{err:?}").contains("emission interval"),
+            "expected emission-interval clamp diagnostic, got: {err:?}"
+        );
+
+        // tick_max_us=8000 < 50 ms → passes.
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 1,
+             "tick_min_us": 100, "tick_max_us": 8000}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("idle within the emission interval must pass");
+    }
+
+    #[test]
+    fn guaranteed_blocked_on_cadence_b_unless_revalidated() {
+        // D8 rule 6 (§11): a guaranteed-WCET module's budget shrinks when (b)
+        // lowers the tick — blocked unless the domain asserts WCET re-validation
+        // at tick_min_us.
+        let modules = vec![json!({"name": "ctl", "type": "ctl", "step_deadline_us": 50})];
+        let names = vec!["main".to_string()];
+        let ticks = vec![100u16];
+        let man = Manifest {
+            timer_class: TimerClass::Guaranteed,
+            ..Manifest::default()
+        };
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert("ctl".to_string(), man);
+
+        // Without the assertion → blocked.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 1000, "tick_max_us": 8000}]}});
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("guaranteed on (b) must be blocked without WCET re-validation");
+        assert!(
+            format!("{err:?}").contains("guaranteed_wcet_revalidated"),
+            "expected rule-6 re-validation diagnostic, got: {err:?}"
+        );
+
+        // With the assertion → passes (burst-at-floor still enforced: 50×8=400 ≤ 16×1000).
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2, "tick_min_us": 1000,
+             "tick_max_us": 8000, "guaranteed_wcet_revalidated": true}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("guaranteed on (b) must pass once WCET re-validation is asserted");
+    }
+
+    #[test]
+    fn domain0_unbounded_tick_max_blocked_in_multi_domain() {
+        // D8 rule 7 (§7.1): domain 0 alone advances the shared DBG_TICK; in a
+        // multi-domain config on a DBG_TICK-backed target, an unbounded
+        // (tick_max_us=0) adaptive domain 0 stalls sibling-domain tick reads.
+        let modules = vec![json!({"name": "m", "type": "m"})];
+        let names = vec!["d0".to_string(), "d1".to_string()];
+        let ticks = vec![100u16, 100u16];
+        let manifests = std::collections::HashMap::new();
+
+        // Two domains, domain 0 adaptive with NO tick_max_us → blocked on bcm2712.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "d0", "cores": [0], "adaptive_flags": 1, "tick_min_us": 100},
+            {"name": "d1", "cores": [1]}]}});
+        let err = validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            Some("bcm2712"),
+        )
+        .expect_err("unbounded domain-0 adaptive in a multi-domain bcm2712 config must be blocked");
+        assert!(
+            format!("{err:?}").contains("rule 7") && format!("{err:?}").contains("tick_max_us"),
+            "expected rule-7 domain-0 diagnostic, got: {err:?}"
+        );
+
+        // Bounded tick_max_us on domain 0 → passes.
+        // bcm idle requires the §10 wake-policy declaration (execution-level).
+        let cfg_ok = json!({"execution": {
+            "bcm_wake_policy": "clamp",
+            "domains": [
+                {"name": "d0", "cores": [0], "adaptive_flags": 1, "tick_min_us": 100,
+                 "tick_max_us": 8000},
+                {"name": "d1", "cores": [1]}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            Some("bcm2712"),
+        )
+        .expect("bounded domain-0 adaptive must pass");
+
+        // rp2350 is exempt (wall-clock HAL) — unbounded passes there.
+        validate_adaptive_tick(
+            &cfg,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            Some("rp2350"),
+        )
+        .expect("rp2350 is exempt from the DBG_TICK domain-0 gate");
+    }
+
+    #[test]
+    fn adaptive_domain_sharing_runner_with_strict_domain_is_rejected() {
+        // §9.2/§9.4: an adaptive domain sharing a core with a timing-strict
+        // domain (here raft liveness) is rejected reject-by-default.
+        let names = vec!["main".to_string(), "rt".to_string()];
+        let ticks = vec![100u16, 100u16];
+        let manifests = std::collections::HashMap::new();
+        let modules = vec![json!({"name": "raft_engine", "type": "raft_engine", "domain": "rt"})];
+
+        // Both on core 0 → shared runner → reject.
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2, "tick_min_us": 100, "tick_max_us": 8000},
+            {"name": "rt", "cores": [0]}]}});
+        let err =
+            validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
+                .expect_err("adaptive + strict on the same core must be rejected");
+        assert!(
+            format!("{err:?}").contains("shares a runner"),
+            "expected shared-runner diagnostic, got: {err:?}"
+        );
+
+        // Strict domain on its own core (1) → no overlap → passes.
+        let cfg_ok = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2, "tick_min_us": 100, "tick_max_us": 8000},
+            {"name": "rt", "cores": [1]}]}});
+        validate_adaptive_tick(
+            &cfg_ok,
+            &modules,
+            100,
+            &names,
+            &ticks,
+            &manifests,
+            &[],
+            None,
+        )
+        .expect("strict domain on its own core must pass");
+    }
+
+    #[test]
+    fn module_without_domain_resolves_to_default_zero() {
+        let cfg = json!({
+            "execution": {
+                "domains": [{"name": "audio", "tick_us": 1000}]
+            }
+        });
+        let module = json!({"name": "m", "type": "x"});
+        assert_eq!(resolve_domain_id(&module, &cfg).unwrap(), 0);
+    }
+
+    #[test]
+    fn known_domain_resolves_to_its_index() {
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "audio", "tick_us": 1000},
+                    {"name": "control", "tick_us": 10000}
+                ]
+            }
+        });
+        let module = json!({"name": "m", "type": "x", "domain": "control"});
+        assert_eq!(resolve_domain_id(&module, &cfg).unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_rejects_module_targeting_fifth_or_later_domain() {
+        // Defense-in-depth: even if a caller bypasses the
+        // `generate_config_impl` top-level rejection of >4
+        // domains, `resolve_domain_id` must refuse to return an
+        // out-of-range domain id. A `domain_id >= MAX_DOMAINS`
+        // can't be encoded in the 4-slot domain metadata + the
+        // kernel's `domain_count` clamp would make the runtime
+        // behaviour undefined.
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "d0"},
+                    {"name": "d1"},
+                    {"name": "d2"},
+                    {"name": "d3"},
+                    {"name": "d4"}   // 5th domain — index 4
+                ]
+            }
+        });
+        let module = json!({"name": "m", "type": "x", "domain": "d4"});
+        let err = resolve_domain_id(&module, &cfg).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("at most 4") || msg.contains("index 4"),
+            "expected out-of-range domain diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_module_targeting_fourth_domain() {
+        // Boundary: index 3 (the 4th domain) IS valid — the cap
+        // is `MAX_DOMAINS = 4` total, so indices 0..=3 are legal.
+        // Catches an off-by-one regression where the bound
+        // accidentally goes `> MAX_DOMAINS` instead of `>=`.
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "d0"},
+                    {"name": "d1"},
+                    {"name": "d2"},
+                    {"name": "d3"}
+                ]
+            }
+        });
+        let module = json!({"name": "m", "type": "x", "domain": "d3"});
+        assert_eq!(resolve_domain_id(&module, &cfg).unwrap(), 3);
+    }
+
+    #[test]
+    fn domain_named_without_any_execution_domains_section_errors() {
+        // Catches the case where a module asks for a domain but the
+        // YAML forgot to declare `execution.domains` at all.
+        let cfg = json!({});
+        let module = json!({"name": "m", "type": "x", "domain": "audio"});
+        let err = resolve_domain_id(&module, &cfg).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("execution.domains is missing"),
+            "expected missing-section error, got: {msg}"
+        );
+    }
+
+    // ---- validate_scheduler_budgets ----
+
+    #[test]
+    fn declared_burst_over_100ms_hard_caps() {
+        // step_deadline_us=20_000 × BURST_MULTIPLIER(8) = 160 ms > 100 ms hard cap.
+        let cfg = json!({"execution": {"domains": []}});
+        let modules = vec![json!({
+            "name": "heavy",
+            "type": "x",
+            "step_deadline_us": 20_000
+        })];
+        let err = validate_scheduler_budgets(&cfg, &modules, 1000, &[], &[]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("absolute cap") && msg.contains("heavy"),
+            "expected absolute-cap error naming the module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn declared_burst_over_16x_tick_hard_caps() {
+        // step_deadline_us=3000 × 8 = 24_000 us. With tick_us=1000,
+        // domain budget × 16 = 16_000 us < 24_000 us → hard fail.
+        let cfg = json!({"execution": {"domains": []}});
+        let modules = vec![json!({
+            "name": "spikey",
+            "type": "x",
+            "step_deadline_us": 3000
+        })];
+        let err = validate_scheduler_budgets(&cfg, &modules, 1000, &[], &[]).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("16 \u{00d7} domain tick_us") || msg.contains("16 × domain tick_us"),
+            "expected 16×-tick error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn undeclared_deadlines_skip_budget_validation() {
+        // Three modules all using the kernel default deadline should
+        // not trip the validator — the default is a fault threshold,
+        // not a budget claim.
+        let cfg = json!({"execution": {"domains": []}});
+        let modules = vec![
+            json!({"name": "a", "type": "x"}),
+            json!({"name": "b", "type": "x"}),
+            json!({"name": "c", "type": "x"}),
+        ];
+        validate_scheduler_budgets(&cfg, &modules, 1000, &[], &[]).unwrap();
+    }
+
+    // ---- parse_domain_tier_to_exec_mode ----
+
+    #[test]
+    fn tier_friendly_strings_map_to_exec_mode_bytes() {
+        // The byte mapping is wire-stable — adding tiers must preserve
+        // existing values. This test pins the {0,1,2,3,4} table from
+        // .context/rfc_isr_tier_surface.md §D5.
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "cooperative"})),
+            Some(0)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "1a"})),
+            Some(1)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "1b"})),
+            Some(2),
+            "Tier 1b → exec_mode 2 (the new admission target)"
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "3"})),
+            Some(3)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"tier": "2"})),
+            Some(4),
+            "Tier 2 → exec_mode 4 (asymmetric because the byte was \
+             allocated after 1a/3)"
+        );
+    }
+
+    #[test]
+    fn legacy_exec_mode_field_still_parses() {
+        // Pre-RFC configs use `exec_mode: tier1a`. The parser must
+        // keep accepting these so `examples/cm5/*` and other live
+        // configs build unchanged.
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "tier1a"})),
+            Some(1)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "high_rate"})),
+            Some(1)
+        );
+        assert_eq!(
+            parse_domain_tier_to_exec_mode(&json!({"exec_mode": "poll"})),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn unknown_tier_string_returns_none() {
+        // Caller is responsible for hard-failing on a None when the
+        // YAML actually had a `tier` / `exec_mode` field — silent
+        // fall-through to Tier 0 would mask typos.
+        assert!(parse_domain_tier_to_exec_mode(&json!({"tier": "1c"})).is_none());
+        assert!(parse_domain_tier_to_exec_mode(&json!({"exec_mode": "real-time"})).is_none());
+    }
+
+    #[test]
+    fn no_tier_field_returns_none_for_default() {
+        assert!(parse_domain_tier_to_exec_mode(&json!({"name": "d"})).is_none());
+    }
+
+    #[test]
+    fn exec_mode_wire_bytes_locked_against_rfc_d5_table() {
+        // FULL `(string → byte)` mapping pinned verbatim against the
+        // §D5 table in `.context/rfc_isr_tier_surface.md`. Any change
+        // here is a wire-format break (older `.cfg.bin` blobs with
+        // the previous mapping would silently mis-route domains).
+        // Failing this test means either the table changed or a
+        // synonym was renamed — both require coordinated kernel +
+        // tools + docs updates.
+        let pairs: &[(&str, u8)] = &[
+            ("cooperative", 0),
+            ("0", 0),
+            ("1a", 1),
+            ("high_rate", 1),
+            ("tier1a", 1),
+            ("1b", 2),
+            ("isr_timer", 2),
+            ("tier1b", 2),
+            ("3", 3),
+            ("poll", 3),
+            ("tier3", 3),
+            ("2", 4),
+            ("isr_owned", 4),
+            ("tier2", 4),
+        ];
+        for (s, expected) in pairs {
+            assert_eq!(
+                parse_domain_tier_to_exec_mode(&json!({"tier": s})),
+                Some(*expected),
+                "WIRE-FORMAT BREAK: tier `{s}` no longer maps to byte \
+                 {expected}. Update `.context/rfc_isr_tier_surface.md` \
+                 §D5 + the kernel-side `scheduler::exec_mode::*` \
+                 constants together."
+            );
+        }
+    }
+
+    #[test]
+    fn exec_mode_bare_numeric_only_accepts_zero() {
+        // Numeric form is intentionally narrow (YAML can't
+        // distinguish `tier: 1` from a 1a vs 1b string). Only `0`
+        // resolves; everything else must return None so the operator
+        // sees a hard error instead of a silent fall-through.
+        assert_eq!(parse_domain_tier_to_exec_mode(&json!({"tier": 0})), Some(0));
+        for n in [1u64, 2, 3, 4, 5, 7, 100] {
+            assert_eq!(
+                parse_domain_tier_to_exec_mode(&json!({"tier": n})),
+                None,
+                "bare numeric tier {n} must NOT silently parse — \
+                 only the friendly-string form is allowed for non-zero \
+                 tiers."
+            );
+        }
+    }
+
+    // ---- validate_isr_tier_admission ----
+    //
+    // These tests exercise the validator directly with synthetic
+    // manifests. Going through the full `fluxor build` path would
+    // require a populated modules tree; the validator's contract is
+    // narrow enough to test in isolation.
+
+    fn run_admission(config: serde_json::Value, modules: Vec<serde_json::Value>) -> Result<()> {
+        // Use a path that surely doesn't exist so `load_module_
+        // manifests_with_extra` finds nothing. The validator handles
+        // the missing-manifest case by skipping the isr_safe check
+        // (the wiring/manifest validator surfaces missing-manifest
+        // errors separately), so for the unknown-tier-and-typed-edge
+        // tests we don't need a real manifest. The cases that DO
+        // need a manifest plant fake ones via an `extra_module_dirs`
+        // tempdir — see the dedicated tests below.
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = Vec::new();
+        validate_isr_tier_admission(&config, &modules, modules_dir, &extras, None)
+    }
+
+    #[test]
+    fn admission_passes_when_no_isr_tier_domains_present() {
+        let cfg = json!({
+            "execution": {"domains": [{"name": "main", "tier": "1a"}]}
+        });
+        let modules = vec![json!({"name": "m", "type": "x", "domain": "main"})];
+        run_admission(cfg, modules).expect("cooperative graph admits");
+    }
+
+    #[test]
+    fn admission_rejects_unknown_tier_string() {
+        let cfg = json!({
+            "execution": {"domains": [{"name": "main", "tier": "1c"}]}
+        });
+        let modules = vec![json!({"name": "m", "type": "x", "domain": "main"})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown tier") && msg.contains("1a/high_rate"),
+            "expected unknown-tier diagnostic naming valid values, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tier2_irq_beyond_gic_intid_range() {
+        // GIC-400 INTIDs are 0..=1019; an `irq:` past that would index the
+        // distributor's enable/priority/target banks out of range on silicon.
+        let cfg = json!({
+            "target": "cm5",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("0..=1019") && msg.contains("GIC-400"),
+            "expected a GIC INTID-range diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_allows_tier2_sgi_irq_on_gic() {
+        // SGI 15 is a legitimate Tier-2 owner (the `tier2_probe` SGI path); the
+        // range check must NOT reject it. Any other error (missing manifest,
+        // etc.) is fine here — just not the range diagnostic.
+        let cfg = json!({
+            "target": "cm5",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 15})];
+        if let Err(e) = run_admission(cfg, modules) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("0..=1019"),
+                "SGI 15 must not trip the GIC range check, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_rejects_tier2_irq_beyond_rp2350_nvic_range() {
+        // RP2350 NVIC tops out at SWI_IRQ_5 = 52 (0..=52); a far-larger value
+        // would unmask a non-existent line and index NVIC registers out of
+        // bounds. (Tests pass no resolved_target, so Rule 0 falls back to
+        // config.target.)
+        let cfg = json!({
+            "target": "rp2350b",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
+        let err = run_admission(cfg, modules).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("0..=52") && msg.contains("RP2350"),
+            "expected an RP2350 NVIC range diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_allows_valid_rp2350_edge_irq() {
+        // SWI_IRQ_5 = 52 is the highest valid RP2350 line and must NOT trip the
+        // range check; any other error (missing manifest, etc.) is fine — just
+        // not the range.
+        let cfg = json!({
+            "target": "rp2350b",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 52})];
+        if let Err(e) = run_admission(cfg, modules) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("only has interrupt lines"),
+                "valid RP2350 edge IRQ 52 must not trip the range check, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_allows_valid_rp2040_swi_irq() {
+        // SWI_IRQ_5 = 31 is the highest valid RP2040 line and must pass the
+        // range check.
+        let cfg = json!({
+            "target": "rp2040",
+            "execution": {"domains": [{"name": "isr", "tier": "2"}]}
+        });
+        let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 31})];
+        if let Err(e) = run_admission(cfg, modules) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("only has interrupt lines"),
+                "valid RP2040 SWI IRQ 31 must not trip the range check, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_rejects_tier_1b_module_without_isr_safe_manifest() {
+        // Tier 1b is admitted as of 2026-05-26 — but only for modules
+        // that declare `isr_safe = true` in their manifest. A module
+        // without the attestation must be rejected with a precise
+        // diagnostic pointing at the offending manifest path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("unflagged");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules =
+            vec![json!({"name": "unflagged", "type": "unflagged", "domain": "audio_isr"})];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("unflagged module in Tier 1b domain must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("isr_safe = true") && msg.contains("unflagged"),
+            "diagnostic must name the missing attestation + the module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tier_1b_module_with_no_resolvable_manifest() {
+        // Regression: an ISR-tier module that does not resolve to a
+        // manifest (typo in `type:`, missing module dir, build-tree
+        // not on the search path, etc.) used to be skipped silently
+        // in `validate_isr_tier_admission` on the assumption that
+        // `validate_wiring_types` would catch it. That assumption
+        // is wrong — `validate_wiring_types` only enforces content
+        // types when **both** endpoints have manifests, so a Tier 1b
+        // module with no edges (or bare/default ports) can land in
+        // the graph without ever running through the `isr_safe`
+        // check or the NEON-import lint.
+        //
+        // Hard-error here so the operator gets a single, focused
+        // diagnostic naming the unresolved module rather than a
+        // silent admission followed by a runtime trap.
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "ghost_module",
+            "type": "definitely_not_a_real_module_type_xyz",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = Vec::new();
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("Tier 1b module with no resolvable manifest must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ghost_module") && msg.contains("manifest"),
+            "diagnostic must name the unresolved module + the missing manifest, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_priority_module_search_paths_extra_dir_shadows_standard_tree() {
+        // Regression: `extract_module_search_paths` documents the
+        // returned list as *priority-ordered*, with explicit YAML
+        // `module_search_paths:` entries first. But the manifest
+        // loader (`load_module_manifests_with_extra`) and the
+        // ISR NEON-lint used to search `standard_module_dirs()`
+        // *first*, then extras. If a config-declared override
+        // collided with a bundled module of the same `type:`,
+        // ISR admission would read `isr_safe` and scan source
+        // from the bundled copy — silently admitting a module the
+        // operator had explicitly redirected to a vetted vendor
+        // tree.
+        //
+        // This test plants the *same* type name twice:
+        //   - standard tree (`<project>/modules/foundation/coll/`)
+        //     declares `isr_safe = true` and a NEON-free src tree.
+        //   - extra dir (`<override>/coll/`) declares
+        //     `isr_safe = true` but imports NEON in its src.
+        //
+        // If standard wins, admission passes (wrong). If the
+        // extra dir wins, the NEON lint fires.
+        let project = tempfile::tempdir().expect("tempdir-project");
+        let extra = tempfile::tempdir().expect("tempdir-extra");
+        let _env = super::test_env::EnvGuard::set(&[("FLUXOR_PROJECT_ROOT", project.path())]);
+
+        let std_dir = project.path().join("modules/foundation/coll");
+        let std_src = std_dir.join("src");
+        std::fs::create_dir_all(&std_src).expect("mkdir std");
+        std::fs::write(
+            std_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write std manifest");
+        std::fs::write(std_src.join("lib.rs"), "fn unused() {}\n").expect("write std src");
+
+        let ovr_dir = extra.path().join("coll");
+        let ovr_src = ovr_dir.join("src");
+        std::fs::create_dir_all(&ovr_src).expect("mkdir override");
+        std::fs::write(
+            ovr_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write override manifest");
+        std::fs::write(
+            ovr_src.join("lib.rs"),
+            "use core::arch::aarch64::*;\nfn unused() {}\n",
+        )
+        .expect("write override src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "coll",
+            "type": "coll",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![extra.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("extras-first lookup must surface the NEON-importing override");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("NEON") && msg.contains("coll"),
+            "extras must shadow the standard tree — NEON lint should fire on the override, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_accepts_tier_2_module_with_isr_entry_export() {
+        // A Tier 2 (`tier: 2` / `isr_owned`) module declaring
+        // `isr_safe = true`, an `irq:`, and a real `module_isr_entry`
+        // export is admitted.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("irq_driver");
+        let src = mod_dir.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+        });
+        let modules = vec![json!({
+            "name": "irq_driver",
+            "type": "irq_driver",
+            "domain": "irq_owner",
+            "irq": 42,
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect("Tier 2 module exporting module_isr_entry must be admitted");
+    }
+
+    #[test]
+    fn admission_rejects_tier_2_module_without_isr_entry_export() {
+        // A Tier 2 module that declares `isr_safe = true` + `irq:` but
+        // whose source exports no `module_isr_entry` is rejected: the
+        // kernel would refuse to dispatch its cooperative `module_step`
+        // from IRQ context, so surface the gap loudly at build time.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("irq_driver");
+        let src = mod_dir.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        // Source has no `fn module_isr_entry` definition.
+        std::fs::write(
+            src.join("lib.rs"),
+            "fn module_step(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+        });
+        let modules = vec![json!({
+            "name": "irq_driver",
+            "type": "irq_driver",
+            "domain": "irq_owner",
+            "irq": 42,
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("Tier 2 module without module_isr_entry must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("module_isr_entry") && msg.contains("irq_driver"),
+            "diagnostic must name the missing export + the offending module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tier_2_module_without_irq() {
+        // A Tier 2 module that has the ISR entry but no `irq:` field is
+        // rejected by Rule 3 — the kernel has no IRQ vector to bind.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("irq_driver");
+        let src = mod_dir.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[no_mangle]\npub extern \"C\" fn module_isr_entry(_s: *mut u8) -> i32 { 0 }\n",
+        )
+        .expect("write src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "irq_owner", "tier": "2"}]}
+        });
+        let modules = vec![json!({
+            "name": "irq_driver",
+            "type": "irq_driver",
+            "domain": "irq_owner",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("Tier 2 module without irq: must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("irq") && msg.contains("irq_driver"),
+            "diagnostic must name the missing irq field + the module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_neon_lint_finds_standard_tree_modules_too() {
+        // Regression: the NEON-import lint used to search only
+        // `modules_dir + extra_module_dirs` for the module's src
+        // root. A module under `modules/drivers/<name>` (resolved
+        // via `standard_module_dirs()` for the manifest) would
+        // pass admission silently without ever running
+        // `check_isr_safe_no_neon`. This test plants an
+        // `isr_safe = true` module with a NEON import in a fake
+        // project root and asserts the lint catches it.
+        let project = tempfile::tempdir().expect("tempdir");
+        // `standard_module_dirs()` reads `$FLUXOR_PROJECT_ROOT`
+        // dynamically. Use the shared file-scope env lock + Drop
+        // guard so this test (a) does not race the sibling
+        // `module_discovery_tests` (which also mutates this var)
+        // and (b) restores the original value even on panic.
+        let _env = super::test_env::EnvGuard::set(&[("FLUXOR_PROJECT_ROOT", project.path())]);
+        // Plant a driver under modules/drivers/<name>/ with both a
+        // manifest and a NEON-importing src tree.
+        let drivers = project.path().join("modules/drivers/neon_isr_module");
+        let src = drivers.join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            drivers.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            src.join("lib.rs"),
+            // The lint scans .rs files for marker substrings.
+            "use core::arch::aarch64::*;\nfn unused() {}\n",
+        )
+        .expect("write src");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "neon_isr_module",
+            "type": "neon_isr_module",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = Vec::new();
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("standard-tree NEON-importing ISR module must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("NEON")
+                && (msg.contains("neon_isr_module") || msg.contains("core::arch::aarch64")),
+            "diagnostic must name NEON + the offending module/source, got: {msg}"
+        );
+        // `_env` drops here, restoring `FLUXOR_PROJECT_ROOT` and
+        // releasing the file-scope env lock.
+    }
+
+    #[test]
+    fn build_module_entry_emits_pre_tick_bit_from_extra_dir_manifest() {
+        // Regression: an earlier version of `build_module_entry`
+        // called `Manifest::from_source_tree`, which searches a
+        // hard-coded `SOURCE_DIRS` list relative to the process
+        // cwd. A manifest living in `extra_module_dirs` (e.g. an
+        // installed driver) could pass validation but emit a
+        // config blob with byte-9 bit 4 clear — silently demoting
+        // the module out of `domain_pre_tick_order`.
+        //
+        // This test plants a `pre_tick_drain = true` manifest in a
+        // tempdir, feeds the dir as an extra, and asserts the bit
+        // lands in the emitted module entry.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("ext_drainer");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\
+             pre_tick_drain = true\n",
+        )
+        .expect("write manifest");
+
+        let modules_value = json!([{
+            "name": "ext_drainer",
+            "type": "ext_drainer",
+        }]);
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let manifests = load_module_manifests_with_extra(&modules_value, &extras);
+        assert!(
+            manifests
+                .get("ext_drainer")
+                .is_some_and(|m| m.pre_tick_drain),
+            "loader must find the extra-dir manifest with pre_tick_drain = true"
+        );
+
+        let config = json!({});
+        let module = json!({"name": "ext_drainer", "type": "ext_drainer"});
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let entry = build_module_entry(
+            "ext_drainer",
+            &module,
+            0,
+            None,
+            &config,
+            modules_dir,
+            &manifests,
+            "",
+        )
+        .expect("emit module entry");
+        // Entry layout (see `parse_module_entry`): bytes 0-3 =
+        // length, bytes 4-7 = name_hash, byte 8 = id, byte 9 = the
+        // multiplexed domain/pre-tick byte (bits 0-2 = domain_id,
+        // bit 4 = pre_tick_drain).
+        let byte9 = entry[9];
+        assert_eq!(
+            byte9 & 0x10,
+            0x10,
+            "byte-9 bit 4 (pre_tick_drain) must be SET when the resolved \
+             manifest has pre_tick_drain = true (got byte9 = 0x{byte9:02x})"
+        );
+        assert_eq!(
+            byte9 & 0x07,
+            0,
+            "byte-9 bits 0-2 (domain_id) should be 0 (no domain assigned in YAML)"
+        );
+    }
+
+    #[test]
+    fn target_aware_manifest_loader_resolves_silicon_capacity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("sized_stream");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n\
+             [[ports]]\nname = \"stream_out\"\ndirection = \"output\"\n\
+             content_type = \"OctetStream\"\n\
+             buffer_size = { default = 2048, bcm2712 = 8192 }\n",
+        )
+        .expect("write manifest");
+
+        let modules = json!([{"name": "sized_stream", "type": "sized_stream"}]);
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let default_manifest = load_module_manifests_with_extra(&modules, &extras);
+        let bcm_manifest =
+            load_module_manifests_with_extra_for_target(&modules, &extras, Some("bcm2712"));
+
+        assert_eq!(default_manifest["sized_stream"].ports[0].buffer_size, 2048);
+        assert_eq!(bcm_manifest["sized_stream"].ports[0].buffer_size, 8192);
+    }
+
+    #[test]
+    fn admission_accepts_tier_1b_module_with_isr_safe_manifest() {
+        // Mirror of the rejection case: when the manifest declares
+        // `isr_safe = true`, the Tier 1b admission path lets the module
+        // through. This pins the lift that happened on 2026-05-26.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("attested_isr");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "audio_isr", "tier": "1b"}]}
+        });
+        let modules = vec![json!({
+            "name": "attested_isr",
+            "type": "attested_isr",
+            "domain": "audio_isr",
+        })];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect("isr_safe = true module in Tier 1b domain must be admitted");
+    }
+
+    #[test]
+    fn admission_rejects_any_edge_touching_isr_tier_module() {
+        // v1 reality (2026-05-26): ANY edge with an ISR-tier
+        // endpoint is rejected at validation. The kernel-side
+        // bridge mechanism is wired (and tested via direct test
+        // fixtures), but PIC modules in v1 have no documented way
+        // to read/write their own bridge slots from inside
+        // `module_step`. Admitting an edge that the ISR module
+        // can't consume is silently broken; surface it loudly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("attested_isr");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        let producer_dir = dir.path().join("plain_producer");
+        std::fs::create_dir_all(&producer_dir).expect("mkdir");
+        std::fs::write(
+            producer_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
+        // Even an untagged (`local`) edge into a Tier 1b module is
+        // rejected — the bridge ABI gap is independent of edge_class.
+        let cfg = json!({
+            "execution": {
+                "domains": [
+                    {"name": "main", "tier": "0"},
+                    {"name": "audio_isr", "tier": "1b"},
+                ]
+            },
+            "wiring": [
+                {
+                    "from": "plain_producer.out",
+                    "to": "attested_isr.in",
+                    // No edge_class tag = local; still rejected.
+                }
+            ]
+        });
+        let modules = vec![
+            json!({"name": "plain_producer", "type": "plain_producer", "domain": "main"}),
+            json!({
+                "name": "attested_isr",
+                "type": "attested_isr",
+                "domain": "audio_isr",
+            }),
+        ];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("untagged edge into Tier 1b module must still be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("ISR-tier endpoint")
+                && msg.contains("module-facing API")
+                && msg.contains("attested_isr"),
+            "diagnostic must name the gap + the offending module, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_dma_owned_edge_into_isr_tier_module_too() {
+        // The catch-all rejection above subsumes the previous
+        // edge_class-specific check; pin the diagnostic still
+        // surfaces clearly when the operator added an explicit
+        // `dma_owned` tag.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let isr_dir = dir.path().join("attested_isr");
+        std::fs::create_dir_all(&isr_dir).expect("mkdir");
+        std::fs::write(
+            isr_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = true\n",
+        )
+        .expect("write manifest");
+        let prod_dir = dir.path().join("plain_producer");
+        std::fs::create_dir_all(&prod_dir).expect("mkdir");
+        std::fs::write(
+            prod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "execution": {"domains": [
+                {"name": "main", "tier": "0"},
+                {"name": "audio_isr", "tier": "1b"},
+            ]},
+            "wiring": [{
+                "from": "plain_producer.out",
+                "to": "attested_isr.in",
+                "edge_class": "dma_owned",
+            }]
+        });
+        let modules = vec![
+            json!({"name": "plain_producer", "type": "plain_producer", "domain": "main"}),
+            json!({"name": "attested_isr", "type": "attested_isr", "domain": "audio_isr"}),
+        ];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect_err("dma_owned edge into Tier 1b module rejected (subsumed by ISR-edge rule)");
+    }
+
+    #[test]
+    fn admission_accepts_tier_1a_cooperative_with_isr_safe_field_present() {
+        // Cooperative tiers (0/1a/3) are unaffected by the
+        // Tier 1b/2 admission gate — the `isr_safe` manifest flag is
+        // simply ignored for non-ISR-tier domains. Catches a
+        // regression where the gate goes too broad.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mod_dir = dir.path().join("plain_mod");
+        std::fs::create_dir_all(&mod_dir).expect("mkdir");
+        std::fs::write(
+            mod_dir.join("manifest.toml"),
+            "version = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = false\n",
+        )
+        .expect("write manifest");
+
+        let cfg = json!({
+            "execution": {"domains": [{"name": "main", "tier": "1a"}]}
+        });
+        let modules = vec![json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})];
+        let modules_dir = std::path::Path::new("/nonexistent/modules");
+        let extras: Vec<&std::path::Path> = vec![dir.path()];
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+            .expect("cooperative tier with isr_safe=false on its modules is fine");
+    }
+
+    #[test]
+    fn declared_deadlines_within_budget_pass() {
+        // Two modules in domain 0 with declared deadlines summing to
+        // 1500 us, tick_us 1000 → declared sum < 4×tick = 4000 → ok.
+        let cfg = json!({"execution": {"domains": [{"name": "d0", "tick_us": 1000}]}});
+        let modules = vec![
+            json!({"name": "a", "type": "x", "step_deadline_us": 800}),
+            json!({"name": "b", "type": "x", "step_deadline_us": 700}),
+        ];
+        validate_scheduler_budgets(&cfg, &modules, 1000, &["d0".to_string()], &[1000]).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::undocumented_unsafe_blocks,
+    reason = "test scaffolding wraps std::env::{set_var, remove_var} which became `unsafe fn` in Rust 2024; safety is identical at every call site — the tests serialise on the module-level mutex"
+)]
+mod module_discovery_tests {
+    //! Tests for the dual-root module manifest discovery added on
+    //! top of the project/install root resolver. Verifies that
+    //! `load_module_manifests_with_extra` finds modules under the
+    //! install root when the project root lacks them (the
+    //! "external user project pulls bundled modules" path), and
+    //! that the project root wins on duplicate names (the "user
+    //! overrides bundled" path).
+
+    use super::*;
+
+    /// Shared env-var lock — the project resolver reads
+    /// `$FLUXOR_PROJECT_ROOT` / `$FLUXOR_INSTALL_ROOT` and these
+    /// tests mutate both. The lock itself lives at file scope (see
+    /// `super::test_env`) so the sibling `scheduler_validation_tests`
+    /// module — which also mutates `$FLUXOR_PROJECT_ROOT` — shares
+    /// the same mutex and we do not race across modules.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::test_env::lock()
+    }
+
+    /// Set up a tree under `root` with a manifest at
+    /// `root/modules/foundation/<name>/manifest.toml`. Used to
+    /// synthesise both project and install roots for these tests
+    /// without depending on the real source tree.
+    fn plant_manifest(root: &std::path::Path, name: &str, isr_safe: bool) {
+        let dir = root.join("modules/foundation").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!(
+            "name = \"{name}\"\nversion = \"0.1.0\"\nhardware_targets = [\"rp2350\"]\nisr_safe = {isr_safe}\n",
+        );
+        std::fs::write(dir.join("manifest.toml"), body).unwrap();
+    }
+
+    /// Install the `.fluxor` marker + a stub `targets/` + `stacks/`
+    /// so `discover()` and `install_root()` accept the path.
+    fn mark_project(root: &std::path::Path) {
+        std::fs::write(root.join(".fluxor"), b"").unwrap();
+    }
+
+    fn mark_install(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("stacks")).unwrap();
+        std::fs::create_dir_all(root.join("targets")).unwrap();
+    }
+
+    #[test]
+    fn finds_module_in_install_root_when_project_lacks_it() {
+        let _g = env_lock();
+        let project = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        mark_project(project.path());
+        mark_install(install.path());
+        // Only the install root has the manifest.
+        plant_manifest(install.path(), "bundled_mod", true);
+
+        unsafe {
+            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
+            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
+        }
+        let modules = json!([{"name": "bundled_mod", "type": "bundled_mod"}]);
+        let manifests = load_module_manifests_with_extra(&modules, &[]);
+        unsafe {
+            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
+            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
+        }
+        let m = manifests
+            .get("bundled_mod")
+            .expect("install-root manifest must be discoverable");
+        assert!(m.isr_safe, "manifest content round-trips");
+    }
+
+    #[test]
+    fn project_root_module_shadows_install_root_module() {
+        // Both roots carry the manifest under the same name. The
+        // project root's version must win — `isr_safe = true` in
+        // project, `false` in install. After loading, the result
+        // must reflect the project version.
+        let _g = env_lock();
+        let project = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        mark_project(project.path());
+        mark_install(install.path());
+        plant_manifest(project.path(), "shared_mod", true);
+        plant_manifest(install.path(), "shared_mod", false);
+
+        unsafe {
+            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
+            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
+        }
+        let modules = json!([{"name": "shared_mod", "type": "shared_mod"}]);
+        let manifests = load_module_manifests_with_extra(&modules, &[]);
+        unsafe {
+            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
+            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
+        }
+        let m = manifests.get("shared_mod").expect("must find shared_mod");
+        assert!(
+            m.isr_safe,
+            "expected project-root manifest (isr_safe=true) to shadow install-root manifest, got isr_safe=false"
+        );
+    }
+
+    #[test]
+    fn extract_module_search_paths_includes_install_root_modules() {
+        let _g = env_lock();
+        let project = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        mark_project(project.path());
+        mark_install(install.path());
+        // Create a `modules/` dir in install so the returned path
+        // canonicalises to an existing location.
+        std::fs::create_dir_all(install.path().join("modules")).unwrap();
+
+        unsafe {
+            std::env::set_var(crate::project::ENV_PROJECT_ROOT, project.path());
+            std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
+        }
+        // Place the config inside the project tree so the
+        // <config-parent>/../modules default doesn't accidentally
+        // land at a path that masks the install/modules entry.
+        let cfg_path = project.path().join("cfg/dummy.yaml");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        let cfg = json!({});
+        let paths = extract_module_search_paths(&cfg, &cfg_path);
+        unsafe {
+            std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
+            std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
+        }
+
+        let install_modules = install.path().join("modules").canonicalize().unwrap();
+        assert!(
+            paths.contains(&install_modules),
+            "install-root modules dir must appear in the search-paths surface; got {paths:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    //! Tests for the `continuity` block validator (rfc_protocols.md
+    //! §7.3): continuity classes as a validated graph property.
+
+    use super::*;
+
+    fn man(caps: &[&str]) -> Manifest {
+        Manifest {
+            capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            ..Manifest::default()
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Well-formed edge_anchored graph: anchor + one worker.
+    fn edge_graph() -> (Vec<String>, HashMap<String, Manifest>) {
+        let mut manifests = HashMap::new();
+        manifests.insert("anc".to_string(), man(&["transport.anchor.stream"]));
+        manifests.insert(
+            "wkr".to_string(),
+            man(&["session.worker", "session.handoff"]),
+        );
+        (names(&["anc", "wkr"]), manifests)
+    }
+
+    #[test]
+    fn continuity_absent_block_is_fine() {
+        let (n, m) = edge_graph();
+        validate_continuity(&json!({}), &n, &m).unwrap();
+    }
+
+    #[test]
+    fn continuity_rejects_unknown_class_and_duplicate_id() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [{"id": "x", "class": "bogus"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("invalid"), "got: {e:?}");
+
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "drain_only"},
+            {"id": "x", "class": "drain_only"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("duplicate"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_edge_anchored_requires_anchor_capability() {
+        let (n, m) = edge_graph();
+        // Worker posing as anchor → rejected.
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "wkr", "workers": ["wkr"]}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("transport.anchor"), "got: {e:?}");
+        // Proper anchor passes.
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "anc", "workers": ["wkr"]}]});
+        validate_continuity(&cfg, &n, &m).unwrap();
+    }
+
+    #[test]
+    fn continuity_edge_anchored_multi_worker_requires_handoff() {
+        let mut manifests = HashMap::new();
+        manifests.insert("anc".to_string(), man(&["transport.anchor.stream"]));
+        manifests.insert(
+            "w1".to_string(),
+            man(&["session.worker", "session.handoff"]),
+        );
+        manifests.insert("w2".to_string(), man(&["session.worker"])); // no handoff
+        let n = names(&["anc", "w1", "w2"]);
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "anc",
+             "workers": ["w1", "w2"]}]});
+        let e = validate_continuity(&cfg, &n, &manifests).unwrap_err();
+        assert!(format!("{e:?}").contains("session.handoff"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_resumable_needs_resume_provider() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "resumable", "workers": ["wkr"]}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("session.resume"), "got: {e:?}");
+
+        let mut m2 = HashMap::new();
+        m2.insert(
+            "wkr".to_string(),
+            man(&["session.worker", "session.resume"]),
+        );
+        validate_continuity(&cfg, &names(&["wkr"]), &m2).unwrap();
+    }
+
+    #[test]
+    fn continuity_mechanism_only_on_transport_migratable() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "edge_anchored", "anchor": "anc",
+             "workers": ["wkr"], "mechanism": "native_primitive"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("only valid"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_native_primitive_needs_mux_transport() {
+        let (n, m) = edge_graph();
+        let cfg = json!({"continuity": [
+            {"id": "x", "class": "transport_migratable",
+             "mechanism": "native_primitive"}]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("transport.mux"), "got: {e:?}");
+
+        let mut m2 = HashMap::new();
+        m2.insert("quic".to_string(), man(&["transport.mux.quic"]));
+        validate_continuity(&cfg, &names(&["quic"]), &m2).unwrap();
+    }
+
+    /// Full platform-replicated-state graph with every R1–R5 provider.
+    fn prs_graph() -> (Vec<String>, HashMap<String, Manifest>) {
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "anc".to_string(),
+            man(&["transport.anchor.datagram", "session.reservation"]),
+        );
+        manifests.insert(
+            "wkr".to_string(),
+            man(&["session.worker", "session.handoff"]),
+        );
+        manifests.insert(
+            "dir".to_string(),
+            man(&["session.directory", "security.key_wrap", "durable.rpo_zero"]),
+        );
+        manifests.insert("pdu".to_string(), man(&["fence.enforceable"]));
+        (names(&["anc", "wkr", "dir", "pdu"]), manifests)
+    }
+
+    fn prs_entry() -> serde_json::Value {
+        json!({"id": "game", "class": "transport_migratable",
+               "mechanism": "platform_replicated_state",
+               "aead": "on_wire_sequence",
+               "anchor": "anc", "workers": ["wkr"], "directory": "dir",
+               "failover_budget_ms": 8000, "client_keepalive_ms": 20000})
+    }
+
+    #[test]
+    fn continuity_platform_replicated_state_full_graph_passes() {
+        let (n, m) = prs_graph();
+        let cfg = json!({"continuity": [prs_entry()]});
+        validate_continuity(&cfg, &n, &m).unwrap();
+    }
+
+    #[test]
+    fn continuity_prs_rejects_implicit_counter_aead() {
+        // §13.7.2: an implicit-contiguous AEAD counter cannot reach
+        // transport_migratable — honest ceiling is resumable.
+        let (n, m) = prs_graph();
+        let mut entry = prs_entry();
+        entry["aead"] = json!("implicit_counter");
+        let cfg = json!({"continuity": [entry]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("resumable"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_requires_every_r_capability() {
+        // Dropping the fence provider (R3) must fail with the missing
+        // capability named.
+        let (n, mut m) = prs_graph();
+        m.remove("pdu");
+        let n: Vec<String> = n.into_iter().filter(|x| x != "pdu").collect();
+        let cfg = json!({"continuity": [prs_entry()]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("fence.enforceable"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_requires_directory_role() {
+        let (n, mut m) = prs_graph();
+        // Directory module present but without the capability.
+        m.insert(
+            "dir".to_string(),
+            man(&["security.key_wrap", "durable.rpo_zero"]),
+        );
+        let cfg = json!({"continuity": [prs_entry()]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("session.directory"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_budget_must_fit_under_keepalive() {
+        let (n, m) = prs_graph();
+        let mut entry = prs_entry();
+        entry["failover_budget_ms"] = json!(20000);
+        let cfg = json!({"continuity": [entry]});
+        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        assert!(format!("{e:?}").contains("strictly below"), "got: {e:?}");
+    }
+
+    #[test]
+    fn cap_satisfies_parent_matches_child_not_reverse() {
+        assert!(cap_satisfies("transport.anchor.stream", "transport.anchor"));
+        assert!(cap_satisfies("transport.anchor", "transport.anchor"));
+        assert!(!cap_satisfies(
+            "transport.anchor",
+            "transport.anchor.stream"
+        ));
+        // Prefix without a dot boundary must not match.
+        assert!(!cap_satisfies("transport.anchorx", "transport.anchor"));
+    }
+}

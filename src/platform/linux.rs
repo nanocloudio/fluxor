@@ -123,7 +123,10 @@ include!("linux/namespace.rs");
 // namespace providers (rfc_keyspace_provider.md §0). A real scoped submodule
 // (not `include!`) so its `use`s don't collide with this file's flat provider
 // namespace. `dead_code`-allowed until the provider dispatch wrapper wires it.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "keyspace provider submodule staged ahead of its dispatch wrapper"
+)]
 #[path = "linux/keyspace.rs"]
 mod keyspace;
 // The unsafe FFI adapter wrapping keyspace::KeyspaceStore::dispatch at the

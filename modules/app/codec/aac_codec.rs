@@ -1691,7 +1691,10 @@ fn read_individual_channel(
     let _ = sys;
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "filterbank DSP signature mirrors the reference AAC decoder's per-window parameters"
+)]
 fn run_filterbank(
     info: &IcsInfo, spec: &[f32], time_out: &mut [f32], overlap: &mut [f32],
     buf: &mut [f32], fre: &mut [f32], fim: &mut [f32], prev_shape: u8,

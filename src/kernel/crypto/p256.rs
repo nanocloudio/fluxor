@@ -15,7 +15,7 @@
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 
-use sha2::{Digest, Sha256};
+use super::sha256::Sha256;
 
 // ============================================================================
 // HMAC-SHA256 (RFC 2104) — backs RFC 6979 nonce derivation.
@@ -43,13 +43,13 @@ fn hmac_sha256(key: &[u8], msg: &[u8], out: &mut [u8; HMAC_OUT]) {
     }
 
     let mut inner = Sha256::new();
-    inner.update(ipad);
+    inner.update(&ipad);
     inner.update(msg);
     let inner_digest = inner.finalize();
 
     let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_digest);
+    outer.update(&opad);
+    outer.update(&inner_digest);
     let d = outer.finalize();
     out.copy_from_slice(&d);
 }
