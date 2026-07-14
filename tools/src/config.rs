@@ -2097,7 +2097,16 @@ fn validate_adaptive_tick(
         // SMALLEST cadence the domain can reach (tick_min).
         if flags[d] & ADAPTIVE_FLAG_CADENCE as u64 != 0 {
             if let Some(dl) = m.get("step_deadline_us").and_then(|v| v.as_u64()) {
-                let burst = dl.saturating_mul(BURST_DEADLINE_MULTIPLIER as u64);
+                // Match validate_module_step_deadlines and the runtime: an
+                // explicit burst ceiling overrides the multiplier-derived
+                // default. Ignoring it here made an otherwise valid adaptive
+                // graph impossible to express (and produced contradictory
+                // verdicts from the two validators).
+                let burst = m
+                    .get("step_deadline_burst_us")
+                    .and_then(|v| v.as_u64())
+                    .filter(|v| *v > 0)
+                    .unwrap_or_else(|| dl.saturating_mul(BURST_DEADLINE_MULTIPLIER as u64));
                 let floor_tick = if tmin[d] > 0 { tmin[d] } else { eff(d) as u64 };
                 if burst > floor_tick.saturating_mul(16) {
                     return Err(Error::Config(format!(
@@ -7499,6 +7508,33 @@ mod scheduler_validation_tests {
             msg.contains("positively attest") && msg.contains("plain"),
             "expected positive-attestation diagnostic, got: {msg}"
         );
+    }
+
+    #[test]
+    fn adaptive_burst_floor_honours_explicit_deadline_override() {
+        let cfg = json!({"execution": {"domains": [
+            {"name": "main", "cores": [0], "adaptive_flags": 2,
+             "tick_min_us": 1750, "tick_max_us": 3500}
+        ]}});
+        // The implicit burst (12_000 * 8) exceeds 16 * tick_min, while the
+        // explicitly bounded 28 ms burst fits exactly. The adaptive validator
+        // must use the same effective deadline as config packing/runtime.
+        let modules = vec![json!({
+            "name": "wal", "type": "wal", "step_deadline_us": 12_000,
+            "step_deadline_burst_us": 28_000
+        })];
+        let mut manifests = std::collections::HashMap::new();
+        manifests.insert(
+            "wal".to_string(),
+            Manifest {
+                timer_class: TimerClass::WallClock,
+                ..Manifest::default()
+            },
+        );
+        let names = vec!["main".to_string()];
+        let ticks = vec![3500u16];
+        validate_adaptive_tick(&cfg, &modules, 3500, &names, &ticks, &manifests, &[], None)
+            .expect("explicit burst deadline should govern adaptive floor admission");
     }
 
     #[test]

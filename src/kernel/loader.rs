@@ -23,6 +23,8 @@ pub mod export_hashes {
     pub const MODULE_INIT: u32 = 0xfb8dc9bc; // "module_init"
     pub const MODULE_NEW: u32 = 0xe6d4ac90; // "module_new"
     pub const MODULE_STEP: u32 = 0xc7ea2db4; // "module_step"
+    pub const MODULE_PIPELINE_REFILL: u32 = 0xc9c83859; // "module_pipeline_refill"
+    pub const MODULE_POST_TICK_FLUSH: u32 = 0x85d25b69; // "module_post_tick_flush"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
     pub const MODULE_DRAIN: u32 = 0xc4c5636c; // "module_drain"
     pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03; // "module_isr_init"
@@ -212,6 +214,10 @@ pub type ModuleNewFn = unsafe extern "C" fn(
 ) -> i32;
 /// Function pointer type for module_step export
 pub type ModuleStepFn = unsafe extern "C" fn(*mut u8) -> i32;
+/// Function pointer type for the optional bounded input-refill hook.
+pub type ModulePipelineRefillFn = unsafe extern "C" fn(*mut u8) -> i32;
+/// Function pointer type for the optional TX-only post-pass flush hook.
+pub type ModulePostTickFlushFn = unsafe extern "C" fn(*mut u8) -> i32;
 /// Convert a raw address (with Thumb bit set) directly to a typed function pointer.
 ///
 /// This uses transmute_copy to go directly from u32 -> fn ptr without an
@@ -341,6 +347,20 @@ unsafe fn call_new(f: ModuleNewFn, args: &ModuleInitArgs, syscalls: *const Sysca
 /// Call module_step export.
 #[inline]
 unsafe fn call_step(f: ModuleStepFn, state: *mut u8) -> i32 {
+    let r = f(state);
+    pic_barrier();
+    r
+}
+/// Call an optional module_pipeline_refill export.
+#[inline]
+unsafe fn call_pipeline_refill(f: ModulePipelineRefillFn, state: *mut u8) -> i32 {
+    let r = f(state);
+    pic_barrier();
+    r
+}
+/// Call an optional module_post_tick_flush export.
+#[inline]
+unsafe fn call_post_tick_flush(f: ModulePostTickFlushFn, state: *mut u8) -> i32 {
     let r = f(state);
     pic_barrier();
     r
@@ -1837,6 +1857,10 @@ pub struct ModuleExports {
     pub state_size_fn: ModuleStateSizeFn,
     pub new_fn: ModuleNewFn,
     pub step_fn: ModuleStepFn,
+    /// Optional input-refill hook called between bounded graph passes.
+    pub pipeline_refill_fn: Option<ModulePipelineRefillFn>,
+    /// Optional output-only hook called once after graph execution.
+    pub post_tick_flush_fn: Option<ModulePostTickFlushFn>,
     /// Optional `module_isr_entry` export — present only for Tier 2
     /// (IRQ-owned) modules. `None` for ordinary cooperative modules.
     /// The ISR dispatcher calls this from IRQ context instead of
@@ -1859,6 +1883,20 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
     let nw_fn = unsafe { fn_ptr_from_addr(new_addr) };
     // SAFETY: as above.
     let st_fn = unsafe { fn_ptr_from_addr(step_addr) };
+    let pipeline_refill_fn = match module.get_export_addr(export_hashes::MODULE_PIPELINE_REFILL) {
+        Ok(addr) => {
+            validate_fn_addr(addr, "module_pipeline_refill")?;
+            Some(unsafe { fn_ptr_from_addr::<ModulePipelineRefillFn>(addr) })
+        }
+        Err(_) => None,
+    };
+    let post_tick_flush_fn = match module.get_export_addr(export_hashes::MODULE_POST_TICK_FLUSH) {
+        Ok(addr) => {
+            validate_fn_addr(addr, "module_post_tick_flush")?;
+            Some(unsafe { fn_ptr_from_addr::<ModulePostTickFlushFn>(addr) })
+        }
+        Err(_) => None,
+    };
     // Optional ISR entry — present only when the module exported
     // `module_isr_entry` (the packer sets the isr_module header bit and
     // emits the export). Validate it the same way as the mandatory
@@ -1877,6 +1915,8 @@ pub fn lookup_exports(module: &LoadedModule, _name: &str) -> Result<ModuleExport
         state_size_fn: ss_fn,
         new_fn: nw_fn,
         step_fn: st_fn,
+        pipeline_refill_fn,
+        post_tick_flush_fn,
         isr_entry_fn,
     })
 }
@@ -1944,6 +1984,8 @@ pub unsafe fn invoke_new(
 /// - `module_step(state)` - Advances module state
 pub struct DynamicModule {
     step_fn: ModuleStepFn,
+    pipeline_refill_fn: Option<ModulePipelineRefillFn>,
+    post_tick_flush_fn: Option<ModulePostTickFlushFn>,
     state_ptr: *mut u8,
     /// Size of the state buffer `state_ptr` points into. Needed so the
     /// pool can reclaim the region on module teardown.
@@ -1977,6 +2019,8 @@ pub struct DynamicModule {
 ///   before overwriting `PARAM_BUFFER` for the next module
 pub struct DynamicModulePending {
     step_fn: ModuleStepFn,
+    pipeline_refill_fn: Option<ModulePipelineRefillFn>,
+    post_tick_flush_fn: Option<ModulePostTickFlushFn>,
     new_fn: ModuleNewFn,
     state_ptr: *mut u8,
     state_size: usize,
@@ -2019,6 +2063,8 @@ impl DynamicModulePending {
     ) -> Self {
         Self {
             step_fn,
+            pipeline_refill_fn: None,
+            post_tick_flush_fn: None,
             new_fn,
             state_ptr: args.state_ptr,
             state_size: args.state_size,
@@ -2065,6 +2111,8 @@ impl DynamicModulePending {
                 }
                 Ok(Some(DynamicModule {
                     step_fn: self.step_fn,
+                    pipeline_refill_fn: self.pipeline_refill_fn,
+                    post_tick_flush_fn: self.post_tick_flush_fn,
                     state_ptr: self.state_ptr,
                     state_size: self.state_size as u32,
                     drain_fn: self.drain_fn,
@@ -2122,6 +2170,8 @@ impl DynamicModule {
     pub fn from_parts(step_fn: ModuleStepFn, state_ptr: *mut u8, state_size: u32) -> Self {
         Self {
             step_fn,
+            pipeline_refill_fn: None,
+            post_tick_flush_fn: None,
             state_ptr,
             state_size,
             drain_fn: None,
@@ -2142,6 +2192,8 @@ impl DynamicModule {
     ) -> Self {
         Self {
             step_fn,
+            pipeline_refill_fn: None,
+            post_tick_flush_fn: None,
             state_ptr,
             state_size,
             drain_fn: None,
@@ -2395,6 +2447,8 @@ impl DynamicModule {
                 }
                 Ok(StartNewResult::Ready(DynamicModule {
                     step_fn: exports.step_fn,
+                    pipeline_refill_fn: exports.pipeline_refill_fn,
+                    post_tick_flush_fn: exports.post_tick_flush_fn,
                     state_ptr,
                     state_size: required_size as u32,
                     drain_fn,
@@ -2407,6 +2461,8 @@ impl DynamicModule {
                 // PARAM_BUFFER which remains valid through the pending loop
                 let pending = DynamicModulePending {
                     step_fn: exports.step_fn,
+                    pipeline_refill_fn: exports.pipeline_refill_fn,
+                    post_tick_flush_fn: exports.post_tick_flush_fn,
                     new_fn: exports.new_fn,
                     state_ptr,
                     state_size: required_size,
@@ -2459,6 +2515,52 @@ impl Module for DynamicModule {
             2 => Ok(StepOutcome::Burst),
             3 => Ok(StepOutcome::Ready),
             _ => Err(result),
+        }
+    }
+
+    fn post_tick_flush(&mut self) -> Result<(), i32> {
+        let Some(flush_fn) = self.post_tick_flush_fn else {
+            return Ok(());
+        };
+        let result = if self.isolated {
+            #[cfg(feature = "chip-bcm2712")]
+            {
+                unsafe { crate::kernel::mmu::protected_step(flush_fn, self.state_ptr) }
+            }
+            #[cfg(not(feature = "chip-bcm2712"))]
+            {
+                unsafe { call_post_tick_flush(flush_fn, self.state_ptr) }
+            }
+        } else {
+            unsafe { call_post_tick_flush(flush_fn, self.state_ptr) }
+        };
+        if result < 0 {
+            Err(result)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn pipeline_refill(&mut self) -> Result<bool, i32> {
+        let Some(refill_fn) = self.pipeline_refill_fn else {
+            return Ok(false);
+        };
+        let result = if self.isolated {
+            #[cfg(feature = "chip-bcm2712")]
+            {
+                unsafe { crate::kernel::mmu::protected_step(refill_fn, self.state_ptr) }
+            }
+            #[cfg(not(feature = "chip-bcm2712"))]
+            {
+                unsafe { call_pipeline_refill(refill_fn, self.state_ptr) }
+            }
+        } else {
+            unsafe { call_pipeline_refill(refill_fn, self.state_ptr) }
+        };
+        if result < 0 {
+            Err(result)
+        } else {
+            Ok(result > 0)
         }
     }
     fn name(&self) -> &'static str {

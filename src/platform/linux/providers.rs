@@ -167,7 +167,8 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             | dev_fs::caps::OPEN_CREATE
             | dev_fs::caps::WRITE
             | dev_fs::caps::FSYNC
-            | dev_fs::caps::UNLINK;
+            | dev_fs::caps::UNLINK
+            | dev_fs::caps::PREALLOCATE;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -266,6 +267,47 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             } else {
                 errno::OK
             }
+        }
+        dev_fs::PREALLOCATE => {
+            let slot_idx = handle as usize;
+            let files = &*core::ptr::addr_of!(LINUX_FILES);
+            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+                return errno::EINVAL;
+            }
+            if arg.is_null() || arg_len < 4 {
+                return errno::EINVAL;
+            }
+            let capacity = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            if capacity == 0 {
+                return errno::EINVAL;
+            }
+            let fd = files[slot_idx].fd;
+            let rc = libc::posix_fallocate(fd, 0, capacity as libc::off_t);
+            if rc != 0 {
+                return -rc;
+            }
+            if libc::ftruncate(fd, capacity as libc::off_t) != 0 {
+                return -*libc::__errno_location();
+            }
+            if libc::lseek(fd, 0, libc::SEEK_SET) < 0 {
+                return -*libc::__errno_location();
+            }
+            // PREALLOCATE promises the capacity is physically backed and
+            // crash-visible on success (see the contract in
+            // `sdk::contracts::storage::fs`). fallocate + ftruncate reserve the
+            // blocks and set the size, but neither is durable until the inode
+            // metadata is flushed — fsync it so the fence matches fat32's
+            // durable PREALLOCATE rather than reporting a false `Volatile`.
+            if libc::fsync(fd) < 0 {
+                return -*libc::__errno_location();
+            }
+            record_slot_fence(
+                slot_idx,
+                Fence::LocalDurable {
+                    device_id: LINUX_FS_DEVICE_ID,
+                },
+            );
+            errno::OK
         }
         dev_fs::READ => {
             let slot_idx = handle as usize;

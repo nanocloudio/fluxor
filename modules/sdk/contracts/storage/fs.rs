@@ -109,6 +109,20 @@ pub const OPEN_CREATE: u32 = 0x0909;
 /// [`caps::UNLINK`] clear.
 pub const UNLINK: u32 = 0x090A;
 
+/// Reserve a fixed-capacity file through an existing writable FD.
+///
+/// `arg` is `[capacity: u32 LE]`. Providers allocate enough physical storage
+/// for `capacity`, persist the file's directory/inode size once, and leave the
+/// descriptor positioned at offset 0. Subsequent writes within that capacity
+/// do not change file size, allowing append logs to use an in-band terminator
+/// without rewriting size metadata at every durability fence.
+///
+/// Returns `0` on success or a negative errno. The operation is deliberately
+/// distinct from sparse truncate: success promises that the capacity is
+/// physically backed and crash-visible. Providers without that guarantee
+/// return `ENOSYS` and leave [`caps::PREALLOCATE`] clear.
+pub const PREALLOCATE: u32 = 0x090E;
+
 /// FS provider capability bitmap. `provider_call(handle, CAPS,
 /// out, out_len)` writes a `u32` (little-endian, 4 bytes) into
 /// `out`.
@@ -198,4 +212,7 @@ pub mod caps {
     pub const MKDIR:          u32 = 1 << 7;
     /// Reserved for `RENAME` (planned 0x090D).
     pub const RENAME:         u32 = 1 << 8;
+    /// [`PREALLOCATE`] (0x090E) — physically reserve fixed file capacity and
+    /// leave its descriptor positioned at byte zero.
+    pub const PREALLOCATE:    u32 = 1 << 9;
 }

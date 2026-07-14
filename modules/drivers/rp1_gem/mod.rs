@@ -666,8 +666,8 @@ unsafe fn init_tx_descriptors(s: &GemState) {
 // RX/TX poll
 // ============================================================================
 
-unsafe fn poll_rx(s: &mut GemState) {
-    if s.out_chan < 0 || s.rx_desc_count == 0 { return; }
+unsafe fn poll_rx(s: &mut GemState) -> u32 {
+    if s.out_chan < 0 || s.rx_desc_count == 0 { return 0; }
     let sys = &*s.syscalls;
 
     let mut processed = 0u32;
@@ -721,6 +721,7 @@ unsafe fn poll_rx(s: &mut GemState) {
         s.rx_tail = s.rx_tail.wrapping_add(1);
         processed += 1;
     }
+    processed
 }
 
 unsafe fn poll_tx(s: &mut GemState) {
@@ -927,7 +928,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
         _ => {
             // Phase 2: Running — poll RX and TX
-            poll_rx(s);
+            let _ = poll_rx(s);
             poll_tx(s);
 
             // Heartbeat cadence = 50_000 ticks. At tick_us=100
@@ -940,6 +941,31 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             0
         }
     }
+}
+
+/// Admit frames that arrived while the graph was running so another bounded
+/// pipeline pass can process them without waiting for the next outer tick.
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_pipeline_refill"]
+pub unsafe extern "C" fn module_pipeline_refill(state: *mut c_void) -> i32 {
+    let s = &mut *(state as *mut GemState);
+    if s.phase == 2 {
+        poll_rx(s) as i32
+    } else {
+        0
+    }
+}
+
+/// Flush frames produced by the graph pass without polling RX a second time.
+/// The scheduler calls this optional hook once after cooperative execution.
+#[unsafe(no_mangle)]
+#[link_section = ".text.module_post_tick_flush"]
+pub unsafe extern "C" fn module_post_tick_flush(state: *mut c_void) -> i32 {
+    let s = &mut *(state as *mut GemState);
+    if s.phase == 2 {
+        poll_tx(s);
+    }
+    0
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

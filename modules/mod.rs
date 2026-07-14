@@ -39,6 +39,19 @@ pub trait Module {
     /// - `Err(rc)` - Error occurred (rc is the negative return code from module_step)
     fn step(&mut self) -> Result<StepOutcome, i32>;
 
+    /// Refill a pipeline input between bounded graph passes. Returns true only
+    /// when new work was admitted and another pass can make progress.
+    fn pipeline_refill(&mut self) -> Result<bool, i32> {
+        Ok(false)
+    }
+
+    /// Ship output produced by the completed graph pass without re-running
+    /// the module's input/RX path. Modules opt in by exporting the matching
+    /// ABI hook; the default is a no-op.
+    fn post_tick_flush(&mut self) -> Result<(), i32> {
+        Ok(())
+    }
+
     /// Return the module's name for debugging/logging.
     fn name(&self) -> &'static str {
         "unknown"

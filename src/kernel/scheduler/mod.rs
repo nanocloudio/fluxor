@@ -1976,7 +1976,8 @@ pub fn syscall_input_flow_budget(port_index: u8, channel: i32) -> i32 {
             let owns_channel = channel >= 0
                 && e.to_module == idx
                 && (e.channel == channel || e.consumer_channel == channel);
-            if (owns_port || owns_channel) && rate_class_rank(e.rate_class) > rate_class_rank(class) {
+            if (owns_port || owns_channel) && rate_class_rank(e.rate_class) > rate_class_rank(class)
+            {
                 class = e.rate_class;
             }
         }
@@ -2254,10 +2255,10 @@ pub fn pacer_current_period_us(domain_id: usize) -> u32 {
     }
 }
 
-/// Hot-start window length in passes (§6.6). Matched to `MAX_PIPELINE_PASSES`
-/// (4) — the hop budget a single request-response round-trip can need — so the
-/// first request after idle converges at the floor rather than the relaxed tick.
-const PACER_HOTSTART_PASSES: u8 = 4;
+/// Hot-start window length in passes (§6.6). Matched to the bounded pipeline
+/// hop budget so the first request after idle converges at the floor rather
+/// than the relaxed tick.
+const PACER_HOTSTART_PASSES: u8 = MAX_PIPELINE_PASSES as u8;
 
 /// Compute the §5.3 per-domain floor (µs): never below `tick_min_us`, raised by
 /// the live decaying worst-step so a shortened tick can't shrink the budget
@@ -2517,11 +2518,22 @@ pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
             PACER_HOTSTART[hs_di].store(hot - 1, Ordering::Relaxed);
             let floor = pacer_floor_us(domain_id, tick_max);
             if hot == PACER_HOTSTART_PASSES {
-                // SAFETY: DBG_TICK aligned u32 read.
-                let tick = unsafe { DBG_TICK };
-                log::info!(
-                    "MON_PACER_HOTSTART domain={hs_di} deadline_us={floor} passes={PACER_HOTSTART_PASSES} tick={tick}"
-                );
+                // A cooperative pipeline can alternate idle/work at every
+                // boundary, making hot-start a normal high-frequency event.
+                // Keep the monitor observable without turning log transport
+                // into work on every hot-path transition.
+                if let Some(sup) = unsafe {
+                    mon_throttle(
+                        core::ptr::addr_of_mut!(MON_HOTSTART_LAST),
+                        core::ptr::addr_of_mut!(MON_HOTSTART_SUP),
+                    )
+                } {
+                    // SAFETY: DBG_TICK aligned u32 read.
+                    let tick = unsafe { DBG_TICK };
+                    log::info!(
+                        "MON_PACER_HOTSTART domain={hs_di} deadline_us={floor} passes={PACER_HOTSTART_PASSES} tick={tick} suppressed={sup}"
+                    );
+                }
             }
             // Drive (b)'s ladder toward the floor so cadence stays tight when
             // the window ends.
@@ -3279,10 +3291,15 @@ fn step_graph_owner(
         if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
             break;
         }
-        if !BURST_SEEN_THIS_PASS[domain].load(Ordering::Relaxed) {
+        if domain_budget_exhausted(sched, domain) {
             break;
         }
-        if domain_budget_exhausted(sched, domain) {
+        // Device input may have arrived while this graph pass ran. Refill only
+        // for the system owner; other resident owners consume the resulting
+        // system-graph output through their normal scheduled pass.
+        let refilled =
+            slot == 0 && step_domain_pipeline_refill(modules, sched, domain, active_count);
+        if !BURST_SEEN_THIS_PASS[domain].load(Ordering::Relaxed) && !refilled {
             break;
         }
     }
@@ -3572,6 +3589,9 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
                 min_runnable.min(eff_backstop.saturating_sub(now).min(tmax as u64) as u32);
         }
     }
+
+    // Output-only flush — domain-global, once after all resident graphs.
+    step_domain_post_tick_flush(modules, sched, domain, &mut active_count);
 
     // ISR-bridge drain — domain-global, once per tick.
     pump_isr_bridges();
@@ -6686,6 +6706,8 @@ static mut MON_OVERRUN_LAST: u32 = 0;
 static mut MON_OVERRUN_SUP: u32 = 0;
 static mut MON_BURST_LAST: u32 = 0;
 static mut MON_BURST_SUP: u32 = 0;
+static mut MON_HOTSTART_LAST: u32 = 0;
+static mut MON_HOTSTART_SUP: u32 = 0;
 
 /// Returns `Some(suppressed_since_last)` when the throttle window has
 /// elapsed (and opens a new window); else `None`, bumping the suppressed
@@ -7709,25 +7731,35 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
             break;
         }
-        // Pipeline drained (no pending work in any domain) → nothing to re-pass.
-        if !BURST_SEEN_THIS_PASS
-            .iter()
-            .any(|b| b.load(Ordering::Relaxed))
-        {
-            break;
-        }
         // Domain 0 (the only domain on single-domain targets) out of budget.
         if domain_budget_exhausted(sched, 0) {
             break;
         }
+        let mut refilled = false;
+        for d in 0..MAX_DOMAINS {
+            if sched.domain_pre_tick_count[d] > 0 {
+                refilled |= step_domain_pipeline_refill(modules, sched, d, &mut active_count);
+            }
+        }
+        // Pipeline drained (no module backlog and no newly-admitted device
+        // input) → nothing to re-pass.
+        if !BURST_SEEN_THIS_PASS
+            .iter()
+            .any(|b| b.load(Ordering::Relaxed))
+            && !refilled
+        {
+            break;
+        }
     }
 
-    // NB: no post-exec re-run of the pre-tick (Tier 1c) drain here. Re-running
-    // `step_domain_pre_tick` would step every Tier 1c module a second time —
-    // including RX-draining ones, not just a NIC TX flush — double-executing
-    // side-effecting modules (pinned by `scheduler_pre_tick_slot`). Same-tick
-    // TX shipping would need a dedicated post-exec flush tier; the multi-pass
-    // loop above is the dominant latency win and stands on its own.
+    // Output-only post-pass hook. Unlike re-running Tier 1c module_step, this
+    // cannot drain RX or repeat other input side effects: modules must opt in
+    // with a dedicated module_post_tick_flush export.
+    for d in 0..MAX_DOMAINS {
+        if sched.domain_pre_tick_count[d] > 0 {
+            step_domain_post_tick_flush(modules, sched, d, &mut active_count);
+        }
+    }
 
     // Drain any cooperative⇄ISR-tier bridge edges so messages
     // pending in either direction flow before the next tick. Runs
@@ -7902,7 +7934,7 @@ const BUDGET_HARD_BREAK_MULTIPLIER: u64 = 10;
 /// burst nothing → exactly one pass, so the low-load cost is unchanged; the
 /// per-domain budget caps the busy case. Bounded so a perpetually-bursting
 /// module can't spin the tick.
-const MAX_PIPELINE_PASSES: u32 = 4;
+const MAX_PIPELINE_PASSES: u32 = 12;
 
 #[inline]
 fn domain_budget_hard_overrun(sched: &SchedulerState, domain_id: usize) -> bool {
@@ -8173,20 +8205,19 @@ pub fn step_domain_modules(
         if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
             break;
         }
-        // No module had pending work → pipeline drained, nothing to re-pass.
-        if !BURST_SEEN_THIS_PASS[domain_id].load(Ordering::Relaxed) {
-            break;
-        }
         // Out of tick budget → let the next tick continue draining.
         if domain_budget_exhausted(sched, domain_id) {
             break;
         }
+        let refilled = step_domain_pipeline_refill(modules, sched, domain_id, &mut active_count);
+        // No module backlog and no newly-admitted device input → drained.
+        if !BURST_SEEN_THIS_PASS[domain_id].load(Ordering::Relaxed) && !refilled {
+            break;
+        }
     }
 
-    // NB: no post-exec re-run of the pre-tick (Tier 1c) drain here — see the
-    // matching note in `step_modules`. Re-running it double-executes every
-    // Tier 1c module (RX drains, not just a NIC TX flush) and breaks the
-    // run-exactly-once contract pinned by `scheduler_pre_tick_slot`.
+    // Ship output produced by this graph pass without re-running RX/input.
+    step_domain_post_tick_flush(modules, sched, domain_id, &mut active_count);
 
     // Drain cooperative⇄ISR bridges after the domain finishes its
     // exec_order rotation. Mirrors the pump call in `step_modules`.
@@ -8255,6 +8286,151 @@ fn step_domain_pre_tick(
     // Subtract pre-tick costs back out so the regular exec_order
     // accounting starts at `baseline` for the rest of the pass.
     sched.domain_budget_us_consumed[domain_id] = baseline;
+}
+
+/// Run optional device-input refill hooks between bounded graph passes.
+/// A positive hook result means it admitted new work and another pass can make
+/// progress. The hook is separate from `module_step`, so input refill cannot
+/// repeat link maintenance, TX, timers, or other pre-tick side effects.
+#[inline]
+fn step_domain_pipeline_refill(
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    sched: &mut SchedulerState,
+    domain_id: usize,
+    active_count: &mut usize,
+) -> bool {
+    if domain_id >= MAX_DOMAINS {
+        return false;
+    }
+    let n = sched.domain_pre_tick_count[domain_id] as usize;
+    if n == 0 {
+        return false;
+    }
+    let active_module_count = sched.active_module_count;
+    let refill_t0 = crate::kernel::hal::now_micros();
+    let mut admitted = false;
+    for pos in 0..n.min(MAX_PRE_TICK_PER_DOMAIN) {
+        let module_idx = sched.domain_pre_tick_order[domain_id][pos] as usize;
+        if module_idx >= active_module_count
+            || sched.finished[module_idx]
+            || !sched.ready[module_idx]
+            || sched.fault_info[module_idx].state != FaultState::Running
+        {
+            continue;
+        }
+
+        set_current_module(module_idx);
+        unsafe {
+            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
+        }
+        let deadline = sched.fault_info[module_idx].effective_deadline_us();
+        step_guard::arm(deadline);
+        let result = match modules[module_idx].as_module_mut() {
+            Some(m) => m.pipeline_refill(),
+            None => Ok(false),
+        };
+        step_guard::post_step_check();
+        let timed_out = step_guard::check_and_clear_timeout();
+        let mpu = step_guard::check_and_clear_mpu_fault();
+        if timed_out {
+            handle_step_timeout(sched, modules, module_idx, active_count);
+        } else if mpu {
+            handle_mpu_fault(sched, modules, module_idx, active_count);
+        } else {
+            match result {
+                Ok(work) => admitted |= work,
+                Err(rc) => handle_step_error(
+                    sched,
+                    modules,
+                    module_idx,
+                    rc,
+                    active_count,
+                    " (pipeline-refill)",
+                ),
+            }
+        }
+        set_current_module(MAX_MODULES);
+
+        if crate::kernel::hal::now_micros().wrapping_sub(refill_t0) > MAX_PRE_TICK_BUDGET_US as u64
+        {
+            break;
+        }
+    }
+    admitted
+}
+
+/// Run the optional output-only hook on Tier 1c modules after graph execution.
+/// This is deliberately a distinct ABI entrypoint from `module_step`: the
+/// scheduler must never repeat an RX drain merely to make newly-produced TX
+/// visible in the same outer tick.
+#[inline]
+fn step_domain_post_tick_flush(
+    modules: &mut [ModuleSlot; MAX_MODULES],
+    sched: &mut SchedulerState,
+    domain_id: usize,
+    active_count: &mut usize,
+) {
+    if domain_id >= MAX_DOMAINS {
+        return;
+    }
+    let n = sched.domain_pre_tick_count[domain_id] as usize;
+    if n == 0 {
+        return;
+    }
+    let active_module_count = sched.active_module_count;
+    let flush_t0 = crate::kernel::hal::now_micros();
+    for pos in 0..n.min(MAX_PRE_TICK_PER_DOMAIN) {
+        let module_idx = sched.domain_pre_tick_order[domain_id][pos] as usize;
+        if module_idx >= active_module_count
+            || sched.finished[module_idx]
+            || !sched.ready[module_idx]
+            || sched.fault_info[module_idx].state != FaultState::Running
+        {
+            continue;
+        }
+
+        set_current_module(module_idx);
+        unsafe {
+            core::ptr::write_volatile(&raw mut DBG_STEP_MODULE, module_idx as u8);
+        }
+        let deadline = sched.fault_info[module_idx].effective_deadline_us();
+        step_guard::arm(deadline);
+        let result = match modules[module_idx].as_module_mut() {
+            Some(m) => m.post_tick_flush(),
+            None => Ok(()),
+        };
+        step_guard::post_step_check();
+        let timed_out = step_guard::check_and_clear_timeout();
+        let mpu = step_guard::check_and_clear_mpu_fault();
+        if timed_out {
+            handle_step_timeout(sched, modules, module_idx, active_count);
+        } else if mpu {
+            handle_mpu_fault(sched, modules, module_idx, active_count);
+        } else if let Err(rc) = result {
+            handle_step_error(
+                sched,
+                modules,
+                module_idx,
+                rc,
+                active_count,
+                " (post-tick-flush)",
+            );
+        }
+        set_current_module(MAX_MODULES);
+
+        let used = crate::kernel::hal::now_micros().wrapping_sub(flush_t0);
+        if used > MAX_PRE_TICK_BUDGET_US as u64 {
+            log::warn!(
+                "MON_POST_TICK_FLUSH_OVERRUN domain={} elapsed_us={} budget_us={} last_mod={} tick={}",
+                domain_id,
+                used,
+                MAX_PRE_TICK_BUDGET_US,
+                module_idx,
+                unsafe { DBG_TICK },
+            );
+            break;
+        }
+    }
 }
 
 /// Per-module step body shared between `step_modules` (flat,

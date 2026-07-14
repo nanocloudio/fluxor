@@ -846,6 +846,8 @@ pub fn pack_fmod(
         "module_init",
         "module_new",
         "module_step",
+        "module_pipeline_refill",
+        "module_post_tick_flush",
         // format: conversion helpers
         "process_audio_16",
         "process_audio_bytes",

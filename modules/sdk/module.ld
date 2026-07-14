@@ -24,6 +24,8 @@ SECTIONS
         KEEP(*(.text.module_init*))
         KEEP(*(.text.module_new*))
         KEEP(*(.text.module_step*))
+        KEEP(*(.text.module_pipeline_refill*))
+        KEEP(*(.text.module_post_tick_flush*))
         KEEP(*(.text.module_channel_hints*))
         KEEP(*(.text.module_in_place_safe*))
         KEEP(*(.text.module_mailbox_safe*))
