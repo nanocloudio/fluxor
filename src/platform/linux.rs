@@ -119,6 +119,18 @@ fn parse_args() -> CliArgs {
 include!("linux/providers.rs");
 include!("linux/object.rs");
 include!("linux/namespace.rs");
+// Versioned keyspace store — the control-plane peer of the read-only object /
+// namespace providers (rfc_keyspace_provider.md §0). A real scoped submodule
+// (not `include!`) so its `use`s don't collide with this file's flat provider
+// namespace. `dead_code`-allowed until the provider dispatch wrapper wires it.
+#[allow(dead_code)]
+#[path = "linux/keyspace.rs"]
+mod keyspace;
+// The unsafe FFI adapter wrapping keyspace::KeyspaceStore::dispatch at the
+// provider ABI boundary (contract class 0x17). include!'d (flat namespace) so
+// `linux_keyspace_dispatch` sits beside the other provider dispatchers and
+// linux_init_providers can register it.
+include!("linux/keyspace_provider.rs");
 include!("linux/builtin_params.rs");
 include!("linux/cli_io.rs");
 include!("linux/host_asset_source.rs");

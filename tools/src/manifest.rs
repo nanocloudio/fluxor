@@ -124,6 +124,10 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // Host process executor (the impure boundary). Host-linux only; a node
         // without the `proc` grant ENOSYS-denies. See sector architecture §5.
         "proc" => Ok(0x16),
+        // Versioned/watchable control-plane keyspace store (the fluxor-native
+        // etcd stand-in). Host-linux; class byte matches
+        // `provider::contract::KEYSPACE`. See rfc_keyspace_provider.md §0.
+        "keyspace" => Ok(0x17),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -176,6 +180,7 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
         0x14 => "storage.object",
         0x15 => "usb_host",
         0x16 => "proc",
+        0x17 => "keyspace",
         _ => "unknown",
     }
 }

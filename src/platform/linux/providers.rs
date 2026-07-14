@@ -153,11 +153,10 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
     }
 
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
-    // Linux implements the full read-tier + the write-tier ops
-    // that already have opcode assignments (WRITE 0x0906, FSYNC
-    // 0x0905, and UNLINK 0x090A). The remaining reserved bits
-    // (TRUNCATE / MKDIR / RENAME) stay 0 — those opcodes aren't
-    // assigned yet.
+    // Linux implements the full read-tier + the write-tier ops with
+    // opcode assignments: WRITE 0x0906, FSYNC 0x0905, UNLINK 0x090A,
+    // MKDIR 0x090B. The remaining reserved bits (TRUNCATE / RENAME)
+    // stay 0 — those opcodes aren't assigned yet.
     if opcode == dev_fs::CAPS {
         if arg.is_null() || arg_len < 4 {
             return errno::EINVAL;
@@ -168,6 +167,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             | dev_fs::caps::WRITE
             | dev_fs::caps::FSYNC
             | dev_fs::caps::UNLINK
+            | dev_fs::caps::MKDIR
             | dev_fs::caps::PREALLOCATE;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
@@ -264,6 +264,25 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             let rc = libc::unlink(path_buf.as_ptr() as *const libc::c_char);
             if rc < 0 {
                 -*libc::__errno_location()
+            } else {
+                errno::OK
+            }
+        }
+        dev_fs::MKDIR => {
+            let mut path_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+                return e;
+            }
+            // Idempotent: an existing directory is success (scp -r sends a `D` per
+            // level and may re-create; callers can `mkdir` the same path twice).
+            let rc = libc::mkdir(path_buf.as_ptr() as *const libc::c_char, 0o755);
+            if rc < 0 {
+                let raw = *libc::__errno_location();
+                if raw == libc::EEXIST {
+                    errno::OK
+                } else {
+                    -raw
+                }
             } else {
                 errno::OK
             }

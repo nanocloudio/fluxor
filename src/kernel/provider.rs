@@ -131,6 +131,16 @@ pub mod contract {
     /// ENOSYS-denies. See sector `.context/architecture.md` §5.
     pub const PROC: u16 = 0x0016;
 
+    /// Versioned, watchable keyspace store — opcode class 0x17xx. A
+    /// control-plane KV surface (put/get/delete with `if_match` CAS, list with
+    /// a revision watermark, subscribe/drain change streams) advertising the
+    /// `fence` contract's `RevisionMonotone`/`ViewConsistent`. An honest
+    /// sibling of the read-only `STORAGE_NAMESPACE`/`STORAGE_OBJECT` surfaces —
+    /// a durable versioned store (the fluxor-native etcd stand-in), not a
+    /// filesystem or HTTP view. Host-linux only; the store core lives in
+    /// `src/platform/linux/keyspace.rs`.
+    pub const KEYSPACE: u16 = 0x0017;
+
     // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
     // constants — the alias just drops the prefix for callsite brevity.

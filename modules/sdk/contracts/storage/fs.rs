@@ -109,6 +109,15 @@ pub const OPEN_CREATE: u32 = 0x0909;
 /// [`caps::UNLINK`] clear.
 pub const UNLINK: u32 = 0x090A;
 
+/// Create a directory by path (like `mkdir -p` — intermediate components are
+/// created, and an existing directory is not an error).
+///
+/// `handle = -1`; `arg` points at the UTF-8 path without a NUL terminator and
+/// `arg_len` is its byte length. Returns `0` on success or a negative errno.
+/// Providers that do not support mutation return `ENOSYS` and leave
+/// [`caps::MKDIR`] clear.
+pub const MKDIR: u32 = 0x090B;
+
 /// Reserve a fixed-capacity file through an existing writable FD.
 ///
 /// `arg` is `[capacity: u32 LE]`. Providers allocate enough physical storage

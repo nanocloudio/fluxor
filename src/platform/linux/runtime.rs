@@ -173,6 +173,10 @@ fn linux_init_providers() {
     // `requires_contract="proc"`; only registered on host-linux (a PIC module
     // can't fork/exec, so a "worker" is by definition a Linux node).
     provider::register(dev_class::PROC, linux_proc_dispatch);
+    // Versioned/watchable control-plane keyspace store (the fluxor-native etcd
+    // stand-in). Ambient like the other storage providers; the store is lazily
+    // recovered from the projected volume dir in `FLUXOR_KEYSPACE_DIR`.
+    provider::register(dev_class::KEYSPACE, linux_keyspace_dispatch);
 }
 /// Platform-specific per-module cleanup for Linux host.
 ///

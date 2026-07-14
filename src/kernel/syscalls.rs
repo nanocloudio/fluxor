@@ -736,7 +736,8 @@ unsafe fn key_vault_provider_dispatch(
 // mis-typed as a CAP_FULL `Protocol` module just to get the grant.
 // STORAGE_NAMESPACE = 0x13, STORAGE_OBJECT = 0x14.
 const STORAGE_FAMILY: u32 = (1u32 << crate::kernel::provider::contract::STORAGE_NAMESPACE as u32)
-    | (1u32 << crate::kernel::provider::contract::STORAGE_OBJECT as u32);
+    | (1u32 << crate::kernel::provider::contract::STORAGE_OBJECT as u32)
+    | (1u32 << crate::kernel::provider::contract::KEYSPACE as u32);
 
 /// Per-cap-class contract ceiling. Indexed by
 /// `scheduler::current_module_cap_class()`. Bits 7 / 8 / 17 / 18 / 21

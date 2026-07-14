@@ -1,0 +1,7 @@
+target: linux
+tick_us: 1000
+
+modules:
+  - name: kv_reconcile
+
+wiring: []

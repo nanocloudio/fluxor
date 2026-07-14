@@ -153,6 +153,19 @@ mod params_def {
                     ptr_copy(s.publish_topic.as_mut_ptr(), d, n);
                 }
             };
+
+        // Optional second subscribe filter, sent in the same SUBSCRIBE packet
+        // (MQTT allows many (filter, qos) pairs). Lets one node subscribe to a
+        // per-node inbox AND a shared broadcast topic (e.g. sector/presence)
+        // without a wildcard that would over-deliver other nodes' traffic.
+        7, subscribe_topic2, str, 0
+            => |s, d, len| {
+                let n = if len > MAX_TOPIC_LEN { MAX_TOPIC_LEN } else { len };
+                s.subscribe_topic2_len = n as u8;
+                if n > 0 {
+                    ptr_copy(s.subscribe_topic2.as_mut_ptr(), d, n);
+                }
+            };
     }
 }
 
@@ -197,6 +210,7 @@ struct MqttState {
     keepalive_s: u8,
     client_id_len: u8,
     subscribe_topic_len: u8,
+    subscribe_topic2_len: u8,
     publish_topic_len: u8,
     conn_id: u8,
     /// 1 once `MSG_CONNECTED` established the TCP connection — connection
@@ -232,6 +246,7 @@ struct MqttState {
     // Strings
     client_id: [u8; MAX_CLIENT_ID_LEN],
     subscribe_topic: [u8; MAX_TOPIC_LEN],
+    subscribe_topic2: [u8; MAX_TOPIC_LEN],
     publish_topic: [u8; MAX_TOPIC_LEN],
 
     // Buffers
@@ -368,9 +383,13 @@ unsafe fn build_subscribe(s: &mut MqttState) -> usize {
     let buf = s.tx_buf.as_mut_ptr();
 
     // Variable header: packet_id (2 bytes)
-    // Payload: topic string + QoS byte
+    // Payload: one or two (topic string + QoS byte) filter entries.
     let topic_len = s.subscribe_topic_len as usize;
-    let remaining = 2 + 2 + topic_len + 1; // packet_id + string + qos
+    let topic2_len = s.subscribe_topic2_len as usize;
+    let mut remaining = 2 + 2 + topic_len + 1; // packet_id + filter1 (string + qos)
+    if topic2_len > 0 {
+        remaining += 2 + topic2_len + 1; // filter2 (string + qos)
+    }
 
     let mut offset = 0;
     // Fixed header
@@ -385,7 +404,7 @@ unsafe fn build_subscribe(s: &mut MqttState) -> usize {
     *buf.add(offset + 1) = (s.packet_id & 0xFF) as u8;
     offset += 2;
 
-    // Payload: topic filter + QoS 0
+    // Payload: filter 1 (topic + QoS 0)
     offset += write_mqtt_string(
         buf.add(offset),
         s.subscribe_topic.as_ptr(),
@@ -393,6 +412,17 @@ unsafe fn build_subscribe(s: &mut MqttState) -> usize {
     );
     *buf.add(offset) = 0; // QoS 0
     offset += 1;
+
+    // Payload: filter 2 (optional broadcast/presence topic)
+    if topic2_len > 0 {
+        offset += write_mqtt_string(
+            buf.add(offset),
+            s.subscribe_topic2.as_ptr(),
+            topic2_len,
+        );
+        *buf.add(offset) = 0; // QoS 0
+        offset += 1;
+    }
 
     offset
 }

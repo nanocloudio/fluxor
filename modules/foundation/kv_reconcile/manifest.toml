@@ -1,0 +1,27 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Keyspace reconcile probe (fmod-migration Phase D): a control-plane reconciler
+# as a PIC module that drives the versioned keyspace provider (contract 0x17)
+# through the watch -> recompute -> conditional-write loop via provider_call.
+# Host-linux only in practice — the keyspace provider is registered there; a
+# bcm2712 .fmod runs in the fluxor-linux runtime and reaches it by class-byte
+# routing.
+
+# Cadence-independent: it does no tick-based timekeeping, just polls its watch.
+timer_class = "agnostic"
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16
+
+[[resources]]
+requires_contract = "keyspace"
+access = "write"
+
+# Module-scope observability — exempt: it emits no sustained byte stream; its
+# observable is the reconcile count and the keys it writes.
+[observability]
+exempt = "Control-plane reconciler — provider-driven, emits no telemetry stream"
