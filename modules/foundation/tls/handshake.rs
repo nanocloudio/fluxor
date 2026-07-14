@@ -25,6 +25,7 @@ const HT_FINISHED: u8 = 20;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const EXT_KEY_SHARE: u16 = 51;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
+const EXT_SUPPORTED_GROUPS: u16 = 10;
 const EXT_COOKIE: u16 = 44;
 const EXT_ALPN: u16 = 16;
 /// QUIC transport_parameters extension (RFC 9001 §8.2). Carried in
@@ -207,6 +208,7 @@ pub fn build_client_hello_ext(
     let ext_len_pos = pos; pos += 2;
     let ext_start = pos;
     pos = write_ext_supported_versions(out, pos);
+    pos = write_ext_supported_groups(out, pos);
     pos = write_ext_key_share_client(out, pos, pub_key);
     pos = write_ext_signature_algorithms(out, pos);
     pos = write_ext_alpn_client(out, pos, alpn);
@@ -1151,6 +1153,18 @@ fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
     pos
 }
 
+/// supported_groups (RFC 8446 §4.2.7). A client offering a `key_share` MUST
+/// also advertise the named group here — OpenSSL/mosquitto strictly reject a
+/// ClientHello that omits it ("missing supported groups extension"). We offer
+/// the single group we key-share on (secp256r1 / P-256).
+fn write_ext_supported_groups(out: &mut [u8], mut pos: usize) -> usize {
+    put_u16(out, pos, EXT_SUPPORTED_GROUPS); pos += 2;
+    put_u16(out, pos, 4); pos += 2; // ext data length
+    put_u16(out, pos, 2); pos += 2; // named_group_list length
+    put_u16(out, pos, GROUP_SECP256R1); pos += 2;
+    pos
+}
+
 /// Offer ALPN protocols (RFC 7301). When `alpn` is empty, defaults to
 /// `h2`,`http/1.1` (the http module's consumer set). Otherwise `alpn` is
 /// a comma-separated list of raw protocol tokens (e.g. `mqtt,h3`) and
@@ -1464,6 +1478,7 @@ pub fn build_client_hello_psk(
     pos += 2;
     let ext_start = pos;
     pos = write_ext_supported_versions(out, pos);
+    pos = write_ext_supported_groups(out, pos);
     pos = write_ext_key_share_client(out, pos, pub_key);
     pos = write_ext_signature_algorithms(out, pos);
     pos = write_ext_alpn_client(out, pos, alpn);

@@ -1047,12 +1047,19 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let tag = if pl >= 2 { payload[1] } else { 0 };
                         let me = dev_requester_tag(sys);
                         tag == 0 || tag == me
+                    } else if s.mode == 0 {
+                        // Client-mode TLS never listens (it only active-opens),
+                        // so an inbound accept on the shared net adapter belongs
+                        // to another consumer — e.g. an ssh server bound on the
+                        // same linux_net. Never claim it, or we'd start a TLS
+                        // handshake on that peer's plaintext stream and kill it.
+                        false
                     } else {
-                        // Inbound accept. Multi-anchor demux: when the
-                        // frame carries a listener port (pl >= 3) and we've
-                        // learned our bound port, claim only our port's
-                        // accepts. A port-less frame (legacy) or unknown
-                        // bound port → claim (sole-consumer behaviour).
+                        // Server-mode inbound accept. Multi-anchor demux: when
+                        // the frame carries a listener port (pl >= 3) and we've
+                        // learned our bound port, claim only our port's accepts.
+                        // A port-less frame (legacy) or unknown bound port →
+                        // claim (sole-consumer behaviour).
                         if pl >= 3 && s.accept_port != 0 {
                             let port = (payload[1] as u16) | ((payload[2] as u16) << 8);
                             port == s.accept_port
@@ -2140,6 +2147,16 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
     }
 
     if recv_level_is_initial(sess) {
+        // A peer that coalesces its ServerHello and its encrypted flight into
+        // one TCP segment (OpenSSL does; a fluxor server does not) leaves the
+        // next record — CT_APPLICATION_DATA — already buffered before the pump
+        // has run ClientDeriveHandshakeKeys to install read_keys. We cannot
+        // decrypt it yet, so STALL (yield to the pump) rather than treating it
+        // as a plaintext protocol violation. Once keys derive,
+        // recv_level_is_initial() is false and the next drain decrypts it.
+        if rec_type == CT_APPLICATION_DATA {
+            return false;
+        }
         if rec_type != CT_HANDSHAKE {
             sess.state = SessionState::Error;
             return false;
@@ -2693,7 +2710,13 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
                 return true;
             }
         };
-        let context = b"TLS 1.3, server CertificateVerify";
+        // Client and server sign under distinct context strings (RFC 8446
+        // §4.4.3). Same length, so the buffer math is unchanged.
+        let context: &[u8; 33] = if sess.driver.is_server {
+            b"TLS 1.3, server CertificateVerify"
+        } else {
+            b"TLS 1.3, client CertificateVerify"
+        };
         let mut verify_content = [0u8; 200];
         let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
         let vc_hash = sha256(&verify_content[..vc_len]);
@@ -2793,7 +2816,13 @@ unsafe fn finalise_certificate_verify(s: &mut TlsState, idx: usize, raw_sig: &[u
     // Reset the per-handshake stage flag so a future renegotiation
     // / session reuse starts fresh.
     s.sessions[idx].driver.cert_verify_hash_ready = 0;
-    s.sessions[idx].driver.hs_state = HandshakeState::SendFinished;
+    // Server: CertVerify → its own Finished. Client (mTLS auth): CertVerify →
+    // our Finished (SendClientFinished → ClientDeriveAppKeys → Complete).
+    s.sessions[idx].driver.hs_state = if s.sessions[idx].driver.is_server {
+        HandshakeState::SendFinished
+    } else {
+        HandshakeState::SendClientFinished
+    };
     true
 }
 
@@ -3115,6 +3144,17 @@ unsafe fn pump_recv_encrypted(
 unsafe fn pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
     match recv_encrypted_handshake(s, idx) {
         Some((data, len, msg_type)) => {
+            // mTLS: the server may send a CertificateRequest (13) between
+            // EncryptedExtensions and its Certificate. Note it (so we present
+            // our own cert after the server's Finished), fold it into the
+            // transcript, and stay in RecvCertificate to read the Certificate.
+            if msg_type == HT_CERTIFICATE_REQUEST {
+                if let Some(ref mut t) = s.sessions[idx].driver.transcript {
+                    t.update(&data[..len]);
+                }
+                s.sessions[idx].driver.client_cert_requested = true;
+                return true;
+            }
             if msg_type != 11 {
                 s.sessions[idx].state = SessionState::Error;
                 return true;

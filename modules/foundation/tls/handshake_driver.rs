@@ -41,6 +41,10 @@ pub struct HandshakeDriver {
     pub suite: CipherSuite,
     pub is_server: bool,
     pub hrr_sent: bool,
+    /// Client side: set when the server sent a CertificateRequest, so after the
+    /// server's Finished we present our own Certificate + CertificateVerify
+    /// (mTLS client auth) before our Finished.
+    pub client_cert_requested: bool,
 
     pub key_schedule: Option<KeySchedule>,
     pub transcript: Option<Transcript>,
@@ -103,6 +107,7 @@ impl HandshakeDriver {
             suite: CipherSuite::ChaCha20Poly1305,
             is_server: false,
             hrr_sent: false,
+            client_cert_requested: false,
             key_schedule: None,
             transcript: None,
             ecdh_private: [0; 32],
@@ -143,6 +148,7 @@ impl HandshakeDriver {
             }
         }
         self.hrr_sent = false;
+        self.client_cert_requested = false;
         self.hs_accum_len = 0;
         self.peer_key_share_len = 0;
         self.peer_cert_pubkey_len = 0;

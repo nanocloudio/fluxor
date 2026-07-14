@@ -322,7 +322,17 @@ unsafe fn pump_recv_server_finished_core(driver: &mut HandshakeDriver) -> bool {
     if let Some(ref t) = driver.transcript {
         driver.server_finished_hash = t.current_hash();
     }
-    driver.hs_state = HandshakeState::SendClientFinished;
+    // mTLS: if the server sent a CertificateRequest, present our Certificate +
+    // CertificateVerify before our Finished. `SendCertificate` →
+    // `SendCertificateVerify` are shared with the server flow; `is_server`
+    // (false here) selects the client CertificateVerify context and routes the
+    // finalise transition to SendClientFinished. App keys already latched from
+    // `server_finished_hash`, so the client auth messages don't perturb them.
+    driver.hs_state = if driver.client_cert_requested {
+        HandshakeState::SendCertificate
+    } else {
+        HandshakeState::SendClientFinished
+    };
     true
 }
 
