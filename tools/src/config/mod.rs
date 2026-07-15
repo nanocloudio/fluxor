@@ -1179,7 +1179,6 @@ impl ConfigBuilder {
     }
 }
 
-
 // ── Split for navigability ──────────────────────────────────────────────────
 // The wiring-config module was one 9.3k-line file. It is split into sibling
 // files pulled in via `include!` (the repo's SDK-file convention), which keeps
