@@ -277,20 +277,13 @@ fn cli_out_step(state: *mut u8) -> i32 {
         return 0;
     }
 
-    // Completion: an explicit exit, or every producer upstream of us is
-    // finished with nothing left in flight. Bridges must be empty so the
-    // worker threads have actually written the tail to the host fds.
-    let upstream_done = {
-        let mask = scheduler::module_upstream_mask(st.module_idx);
-        let mut done = true;
-        for i in 0..64usize {
-            if mask & (1u64 << i) != 0 && !scheduler::module_is_finished(i) {
-                done = false;
-                break;
-            }
-        }
-        done
-    };
+    // Completion: an explicit exit, or every producer that can still feed us is
+    // finished with nothing left in flight. This uses the completion-predecessor
+    // set (ALL edges, including feedback-cycle back-edges) rather than the
+    // forward-only upstream mask — otherwise a sink downstream of the
+    // tcp_client/linux_net cycle would retire before its async reply is decoded.
+    // Bridges must be empty so the worker threads have written the tail to the fds.
+    let upstream_done = scheduler::module_completion_predecessors_finished(st.module_idx);
     let flushed = st.stdout_bridge.as_ref().is_none_or(|b| b.is_empty())
         && st.stderr_bridge.as_ref().is_none_or(|b| b.is_empty());
     if flushed && (st.exited || upstream_done) {

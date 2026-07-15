@@ -116,25 +116,32 @@ fn parse_args() -> CliArgs {
     }
 }
 
-include!("linux/providers.rs");
+// The platform providers (FS/proc/net registry), the per-owner status writer,
+// and the owner-drain driver compile into the fluxor library at
+// `fluxor::platform::linux::{providers, owner_status, owner_drain}` so the host
+// test harness can exercise them directly. Bring the binary-facing entry points
+// into scope so the flat registration (`runtime.rs`) and boot/watch sites
+// (`linux.rs` body) resolve them by name.
+use fluxor::platform::linux::owner_drain::{arm_drains, drain_tick, synthesize_restart_terminals};
+use fluxor::platform::linux::owner_status::OwnerStatusWriter;
+use fluxor::platform::linux::providers::{
+    linux_fs_dispatch, linux_net_close_all_and_clear_registry, linux_net_register_state,
+    linux_net_step, linux_proc_dispatch, LinuxNetState, LINUX_NET_HASH, LINUX_NET_MAX_INBOUND,
+};
 include!("linux/object.rs");
 include!("linux/namespace.rs");
-// Versioned keyspace store — the control-plane peer of the read-only object /
-// namespace providers (rfc_keyspace_provider.md §0). A real scoped submodule
-// (not `include!`) so its `use`s don't collide with this file's flat provider
-// namespace. `dead_code`-allowed until the provider dispatch wrapper wires it.
-#[allow(
-    dead_code,
-    reason = "keyspace provider submodule staged ahead of its dispatch wrapper"
-)]
-#[path = "linux/keyspace.rs"]
-mod keyspace;
-// The unsafe FFI adapter wrapping keyspace::KeyspaceStore::dispatch at the
-// provider ABI boundary (contract class 0x17). include!'d (flat namespace) so
-// `linux_keyspace_dispatch` sits beside the other provider dispatchers and
-// linux_init_providers can register it.
-include!("linux/keyspace_provider.rs");
-include!("linux/builtin_params.rs");
+// The `workload` provider (class 0x1A) and its host-process backend (the oci
+// namespace/cgroup mechanism) compile into the fluxor library at
+// `fluxor::platform::linux::{workload, oci}` so the host test harness can
+// exercise them directly. Bring the binary-facing entry points into scope so
+// the flat provider-registration (`runtime.rs`) and owner-drain
+// (`owner_drain.rs`) sites resolve them by name. See
+// `.context/fluxor_nanocloud.md`.
+use fluxor::platform::linux::workload::linux_workload_dispatch;
+// TLV param walkers + per-instance state helpers, in the library so the
+// library provider modules can reach them; glob-imported so the flat
+// built-in modules here resolve them by bare name.
+use fluxor::platform::linux::builtin_params::*;
 include!("linux/cli_io.rs");
 include!("linux/host_asset_source.rs");
 include!("linux/host_asset_index.rs");
@@ -146,9 +153,7 @@ include!("linux/linux_surface_traits_scan.rs");
 include!("linux/linux_surface_traits.rs");
 include!("linux/linux_surface_traits_probe.rs");
 include!("linux/linux_pointer.rs");
-include!("linux/owner_status.rs");
 include!("linux/owner_log_tee.rs");
-include!("linux/owner_drain.rs");
 
 // ============================================================================
 // Graph construction (shared by boot and live rebuild)
@@ -815,113 +820,5 @@ fn main() {
                 last_oversleep_log_tick = tick;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Exercise the same syscall-table entry a PIC module calls, through the
-    /// contract gate, provider router, FS vtable, and real libc dispatcher.
-    /// The separate `fs_write_smoke` fixture covers the final mmap'd PIC jump;
-    /// this test keeps the provider behavior in the ordinary automated suite.
-    #[test]
-    fn pic_syscall_fs_create_write_fsync_close_unlink() {
-        use fluxor::abi::contracts::storage::fs as fs_contract;
-        use fluxor::kernel::config::{Config, ConfigHeader, ModuleEntry};
-
-        // SAFETY: this binary has one test; kernel/provider globals are
-        // initialized once and remain scheduler-thread-owned throughout it.
-        unsafe {
-            BOOT_INSTANT = Some(Instant::now());
-        }
-        fluxor::kernel::boot(&LINUX_HAL_OPS);
-
-        let mut cfg = Config::empty();
-        cfg.header = ConfigHeader {
-            magic: 0,
-            version: 1,
-            checksum: 0,
-            module_count: 1,
-            edge_count: 0,
-            tick_us: 1000,
-            graph_sample_rate: 0,
-        };
-        cfg.modules[0] = Some(ModuleEntry {
-            name_hash: 0xF51E_2E2E,
-            id: 0,
-            domain_id: 0,
-            pre_tick_drain: false,
-            frame_kind: 0,
-            params_ptr: core::ptr::null(),
-            params_len: 0,
-        });
-        cfg.module_count = 1;
-        loader::reset_state_arena();
-        // SAFETY: test owns the scheduler globals.
-        unsafe { scheduler::install_static_config(cfg) };
-        let _ = scheduler::prepare_graph().expect("prepare test graph");
-        scheduler::store_builtin_module(
-            0,
-            scheduler::BuiltInModule::new("linux_fs_pic_gate", |_| 0),
-        );
-        scheduler::set_module_caps(0, 0, 1u32 << fluxor::kernel::provider::contract::FS, 0);
-        scheduler::set_current_module(0);
-
-        let path = format!("/tmp/fluxor-linux-pic-fs-{}.txt", std::process::id());
-        let mut path_bytes = path.as_bytes().to_vec();
-        let payload = b"fluxor PIC filesystem e2e\n";
-        let sys = fluxor::kernel::syscalls::get_syscall_table();
-
-        // Clean up a stale path from an interrupted prior run.
-        unsafe {
-            (sys.provider_call)(
-                -1,
-                fs_contract::UNLINK,
-                path_bytes.as_mut_ptr(),
-                path_bytes.len(),
-            )
-        };
-
-        let fd = unsafe {
-            (sys.provider_call)(
-                -1,
-                fs_contract::OPEN_CREATE,
-                path_bytes.as_mut_ptr(),
-                path_bytes.len(),
-            )
-        };
-        assert!(fd >= 0, "OPEN_CREATE failed: {fd}");
-
-        let mut bytes = payload.to_vec();
-        let written =
-            unsafe { (sys.provider_call)(fd, fs_contract::WRITE, bytes.as_mut_ptr(), bytes.len()) };
-        assert_eq!(written, payload.len() as i32, "WRITE failed: {written}");
-        assert_eq!(
-            unsafe { (sys.provider_call)(fd, fs_contract::FSYNC, core::ptr::null_mut(), 0) },
-            0,
-            "FSYNC failed"
-        );
-        assert_eq!(
-            unsafe { (sys.provider_call)(fd, fs_contract::CLOSE, core::ptr::null_mut(), 0) },
-            0,
-            "CLOSE failed"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), payload);
-
-        assert_eq!(
-            unsafe {
-                (sys.provider_call)(
-                    -1,
-                    fs_contract::UNLINK,
-                    path_bytes.as_mut_ptr(),
-                    path_bytes.len(),
-                )
-            },
-            0,
-            "UNLINK failed"
-        );
-        assert!(!std::path::Path::new(&path).exists());
     }
 }

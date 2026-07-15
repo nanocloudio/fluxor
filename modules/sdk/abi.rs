@@ -147,6 +147,11 @@ pub mod contracts {
     pub mod key_vault {
         include!("contracts/key_vault.rs");
     }
+    /// Platform-neutral isolated-workload surface (contract class `0x1A`);
+    /// see `.context/fluxor_nanocloud.md`.
+    pub mod workload {
+        include!("contracts/workload.rs");
+    }
     pub mod input {
         pub mod gamepad {
             include!("contracts/input/gamepad.rs");

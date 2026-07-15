@@ -28,8 +28,8 @@ no separate fast path needed.
 ## Run
 
 ```sh
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/led_patterns/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/led_patterns/pico2w.yaml
 # tap BOOTSEL to cycle patterns
 ```
 

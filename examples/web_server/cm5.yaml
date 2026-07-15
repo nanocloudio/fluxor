@@ -15,7 +15,7 @@
 #   openssl ec  -in /tmp/server_key.pem  -outform DER -out /tmp/server_key.der
 #
 # Build:
-#   make firmware TARGET=cm5 && make modules TARGET=bcm2712
+#   make firmware TARGET=cm5 && fluxor modules build --target bcm2712
 #   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/web_server/cm5.yaml
 #
 # Probe:

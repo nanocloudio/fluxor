@@ -300,7 +300,7 @@ The Makefile gains one target row plus the corresponding cargo target
 entries; otherwise the user-visible commands are unchanged:
 
 ```sh
-make modules    TARGET=wasm    # → target/wasm/modules/*.fmod
+fluxor modules build --target wasm    # → target/wasm/modules/*.fmod
 make firmware   TARGET=wasm    # → target/wasm/firmware.wasm
 fluxor build    config.yaml    # → target/wasm/<config>.wasm  (with target: wasm)
 ```
@@ -308,7 +308,7 @@ fluxor build    config.yaml    # → target/wasm/<config>.wasm  (with target: wa
 Symmetrical with:
 
 ```sh
-make modules    TARGET=rp2350
+fluxor modules build --target rp2350
 make firmware   TARGET=rp2350
 fluxor build    config.yaml    # → target/rp2350/uf2/<config>.uf2
 ```

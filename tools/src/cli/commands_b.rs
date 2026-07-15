@@ -213,6 +213,34 @@ fn cmd_target_info(target_name: &str, field: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `fluxor abi-regen [--check]` — the single writer of the ABI-surface pin.
+/// Recomputes the SDK source hash + surface digest and rewrites all checked-in
+/// sites together (so they cannot drift). The shared computation lives in
+/// `crate::abi_pin`, so `fluxor ci`'s read-only gate uses the exact same logic.
+fn cmd_abi_regen(check: bool) -> Result<()> {
+    let repo = crate::abi_pin::repo_root_from(&std::env::current_dir()?)?;
+    let plan = crate::abi_pin::compute(&repo)?;
+    if check {
+        let stale = plan.stale_sites()?;
+        if stale.is_empty() {
+            println!("ABI-surface pin current (digest {}).", plan.digest_hex);
+            Ok(())
+        } else {
+            let names: Vec<String> = stale.iter().map(|p| p.display().to_string()).collect();
+            Err(Error::Config(format!(
+                "ABI-surface pin STALE — run `fluxor abi-regen`. Out-of-date: {}",
+                names.join(", ")
+            )))
+        }
+    } else {
+        plan.write()?;
+        println!("ABI-surface pin regenerated ({} sites):", plan.edits.len());
+        println!("  digest   {}", plan.digest_hex);
+        println!("Rebuild the tools so callers pick up the new const.");
+        Ok(())
+    }
+}
+
 fn cmd_targets() -> Result<()> {
     let root = crate::project::root();
     let names = target::list_targets(&root);
@@ -1349,7 +1377,7 @@ fn build_one(
                         .join(&modules_dir)
                 });
                 return Err(Error::Config(format!(
-                    "Modules not found at {} (resolved to {}). Run 'make modules TARGET={}' from the \
+                    "Modules not found at {} (resolved to {}). Run 'fluxor modules build --target {}' from the \
                      project root (`fluxor inspect` shows where that is) to produce them.",
                     modules_dir.display(),
                     abs.display(),
@@ -1392,7 +1420,7 @@ fn build_one(
             }
             if fmod_dirs.is_empty() {
                 return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'make modules TARGET=bcm2712' from the project \
+                    "Modules not found at {}. Run 'fluxor modules build --target bcm2712' from the project \
                      root (`fluxor inspect` shows where that is) first.",
                     modules_dir.display()
                 )));
@@ -1426,7 +1454,7 @@ fn build_one(
             }
             if !modules_dir.exists() {
                 return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'make modules TARGET=wasm' first.",
+                    "Modules not found at {}. Run 'fluxor modules build --target wasm' first.",
                     modules_dir.display()
                 )));
             }

@@ -34,15 +34,27 @@
 //!
 //! Outbound frames are always opcode = 0x2 (binary) with fin = 1.
 //!
+//! ## Same-tick coalescing
+//!
+//! `rx_in` is a byte-FIFO: a single `channel_read` can return several
+//! whole WsFrames concatenated (e.g. two requests written back-to-back
+//! within one graph tick). The inbound loop walks a cursor over the
+//! whole read buffer and emits every complete frame, so no sibling
+//! frame is dropped. (WsFrame writes upstream are atomic, so the buffer
+//! contains whole frames; a partial trailing frame is not expected.)
+//!
 //! ## Backpressure (lossless under steady-state)
 //!
 //! Both directions own a per-instance retry buffer. The inbound
 //! retry holds an in-flight WsFrame's payload that didn't fit in
 //! `rx_out`; the outbound retry holds a framed message that
 //! didn't fit in `tx_out`. Drained first on the next step before
-//! pulling new input. No bytes are dropped under back-pressure;
-//! upstream channel back-pressure applies normally if the retry
-//! buffer is held full for a sustained period.
+//! pulling new input. When `rx_out` back-pressures mid-buffer, the
+//! remaining whole frames from that read are carried at the front of
+//! `scratch` (`rx_scratch_len`) until the retry buffer drains. No bytes
+//! are dropped under back-pressure; upstream channel back-pressure
+//! applies normally if the retry buffer is held full for a sustained
+//! period.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -95,10 +107,17 @@ struct State {
     /// written to `rx_out`. Same drain-first semantics.
     rx_pending: [u8; FRAME_BUF_BYTES],
     rx_pending_len: usize,
-    /// Inbound parse scratch: holds the raw WsFrame as read from
-    /// `rx_in` while we extract the payload. Reused per frame; not
-    /// retained across steps.
+    /// Inbound parse scratch: holds the raw WsFrame bytes as read from
+    /// `rx_in`. A single `channel_read` on a byte-FIFO can return
+    /// several whole WsFrames concatenated, so the inbound loop parses
+    /// every complete frame in the buffer (not just the first).
     scratch: [u8; FRAME_BUF_BYTES],
+    /// Count of unparsed whole-frame bytes retained at the FRONT of
+    /// `scratch` across steps. Non-zero only when `rx_out` back-pressured
+    /// mid-buffer: the current frame's payload tail parks in `rx_pending`
+    /// and the following whole frames stay here until `rx_pending` drains.
+    /// Always whole frames (frame writes are atomic), never a split tail.
+    rx_scratch_len: usize,
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -161,6 +180,7 @@ pub extern "C" fn module_new(
     s.rx_pending = [0u8; FRAME_BUF_BYTES];
     s.rx_pending_len = 0;
     s.scratch = [0u8; FRAME_BUF_BYTES];
+    s.rx_scratch_len = 0;
     0
 }
 
@@ -254,95 +274,153 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     unsafe { shift_consume(s.rx_pending.as_mut_ptr(), s.rx_pending_len, w) };
             }
         }
-        // Pull new frames only when retry buffer drained.
+        // Pull new frames only when the retry buffer is drained. Each
+        // `channel_read` may return several whole WsFrames concatenated
+        // (byte-FIFO transport), so a cursor walks `scratch[..n]` and
+        // emits every complete frame — parsing only the first would drop
+        // any same-read siblings.
         while s.rx_pending_len == 0 {
-            // SAFETY: `channel_read` takes (chan, *mut u8, max_len); the
-            // scratch buffer is owned by `s` and sized to its array length.
-            let n = unsafe { (sys.channel_read)(s.rx_in, s.scratch.as_mut_ptr(), s.scratch.len()) };
-            if n < WS_FRAME_HDR as i32 {
-                break;
-            }
-            let n = n as usize;
-            let conn_id =
-                u32::from_le_bytes([s.scratch[0], s.scratch[1], s.scratch[2], s.scratch[3]]);
-            let opcode = s.scratch[4];
-            let _fin = s.scratch[5];
-            let payload_len = u16::from_le_bytes([s.scratch[6], s.scratch[7]]) as usize;
-            if WS_FRAME_HDR + payload_len > n {
-                break;
-            }
-            if s.has_conn && conn_id != s.active_conn_id {
-                // Latch replacement: a new connection takes over the adapter.
-                // Anything still queued outbound belongs to the dead session —
-                // the documented contract is that the previous connection's
-                // queue starves. Without this, the outbound drain below stamps
-                // the old session's bytes with the NEW conn_id, leaking one
-                // session's data into another (observed live: a stale reply
-                // delivered as the first frame of a fresh surface connection).
-                s.tx_pending_len = 0;
-                s.rx_pending_len = 0;
-                if s.tx_in >= 0 {
-                    // Drain tx_in dry into the (now idle) tx_pending buffer and
-                    // discard: bytes the app wrote before seeing any input from
-                    // the new session are addressed to the old one. `scratch`
-                    // still holds the new connection's in-flight frame, so it
-                    // must not be used as the bit-bucket here.
-                    loop {
-                        // SAFETY: `channel_read` into the owned tx_pending
-                        // buffer; `tx_pending_len` is 0 so its contents are
-                        // dead and the next outbound read rewrites them.
-                        let d = unsafe {
-                            (sys.channel_read)(
-                                s.tx_in,
-                                s.tx_pending.as_mut_ptr(),
-                                s.tx_pending.len(),
-                            )
-                        };
-                        if d <= 0 {
-                            break;
+            // Reuse whole frames carried over from a prior back-pressured
+            // step (already at the front of `scratch`), else read fresh.
+            let n = if s.rx_scratch_len > 0 {
+                let carried = s.rx_scratch_len;
+                s.rx_scratch_len = 0;
+                carried
+            } else {
+                // SAFETY: `channel_read` takes (chan, *mut u8, max_len); the
+                // scratch buffer is owned by `s` and sized to its array length.
+                let read =
+                    unsafe { (sys.channel_read)(s.rx_in, s.scratch.as_mut_ptr(), s.scratch.len()) };
+                if read < WS_FRAME_HDR as i32 {
+                    break;
+                }
+                read as usize
+            };
+
+            let mut off = 0usize;
+            // `true` once back-pressure parked a frame; stops the outer
+            // read loop so `rx_pending` (and any carried siblings) drain
+            // on following steps before more bytes are pulled from `rx_in`.
+            let mut parked = false;
+            while off + WS_FRAME_HDR <= n {
+                let conn_id = u32::from_le_bytes([
+                    s.scratch[off],
+                    s.scratch[off + 1],
+                    s.scratch[off + 2],
+                    s.scratch[off + 3],
+                ]);
+                let opcode = s.scratch[off + 4];
+                let _fin = s.scratch[off + 5];
+                let payload_len =
+                    u16::from_le_bytes([s.scratch[off + 6], s.scratch[off + 7]]) as usize;
+                if off + WS_FRAME_HDR + payload_len > n {
+                    // Incomplete trailing frame. Frame writes upstream are
+                    // atomic and the read buffer spans the whole channel,
+                    // so this is not expected; drop the tail rather than
+                    // carry a split frame.
+                    break;
+                }
+                if s.has_conn && conn_id != s.active_conn_id {
+                    // Latch replacement: a new connection takes over the
+                    // adapter. Anything still queued outbound belongs to the
+                    // dead session — the documented contract is that the
+                    // previous connection's queue starves. Without this, the
+                    // outbound drain below stamps the old session's bytes with
+                    // the NEW conn_id, leaking one session's data into another
+                    // (observed live: a stale reply delivered as the first
+                    // frame of a fresh surface connection).
+                    s.tx_pending_len = 0;
+                    s.rx_pending_len = 0;
+                    s.rx_scratch_len = 0;
+                    if s.tx_in >= 0 {
+                        // Drain tx_in dry into the (now idle) tx_pending buffer
+                        // and discard: bytes the app wrote before seeing any
+                        // input from the new session are addressed to the old
+                        // one. `scratch` still holds the new connection's
+                        // frames, so it must not be used as the bit-bucket here.
+                        loop {
+                            // SAFETY: `channel_read` into the owned tx_pending
+                            // buffer; `tx_pending_len` is 0 so its contents are
+                            // dead and the next outbound read rewrites them.
+                            let d = unsafe {
+                                (sys.channel_read)(
+                                    s.tx_in,
+                                    s.tx_pending.as_mut_ptr(),
+                                    s.tx_pending.len(),
+                                )
+                            };
+                            if d <= 0 {
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            s.active_conn_id = conn_id;
-            s.has_conn = true;
-            let is_data = matches!(opcode, 0x0 | 0x1 | WS_OPCODE_BINARY);
-            if !is_data || payload_len == 0 {
-                continue;
-            }
-            // Try to write directly first.
-            // SAFETY: `WS_FRAME_HDR + payload_len <= n <= s.scratch.len()`
-            // checked above; pointer offset stays in-bounds.
-            let written = unsafe {
-                (sys.channel_write)(s.rx_out, s.scratch.as_ptr().add(WS_FRAME_HDR), payload_len)
-            };
-            // CHAN_EAGAIN (negative return) is back-pressure, not
-            // an error. The payload was already pulled from rx_in,
-            // so treat any non-positive return as a 0-byte partial
-            // write and stash the tail in `rx_pending` for the
-            // next step rather than dropping bytes.
-            let w = if written > 0 {
-                (written as usize).min(payload_len)
-            } else {
-                0
-            };
-            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(w as u32);
-            if w < payload_len {
-                // Stash unwritten tail in retry buffer.
-                let tail = payload_len - w;
-                let cap = s.rx_pending.len();
-                let take = tail.min(cap);
-                // SAFETY: `take <= cap` and `WS_FRAME_HDR + w + take <= n`
-                // (since `take <= tail = payload_len - w` and `WS_FRAME_HDR
-                // + payload_len <= n`); src/dst are disjoint buffers in `s`.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        s.scratch.as_ptr().add(WS_FRAME_HDR + w),
-                        s.rx_pending.as_mut_ptr(),
-                        take,
-                    );
+                s.active_conn_id = conn_id;
+                s.has_conn = true;
+
+                let is_data = matches!(opcode, 0x0 | 0x1 | WS_OPCODE_BINARY);
+                if !is_data || payload_len == 0 {
+                    off += WS_FRAME_HDR + payload_len;
+                    continue;
                 }
-                s.rx_pending_len = take;
+                // Try to write this frame's payload directly.
+                // SAFETY: `off + WS_FRAME_HDR + payload_len <= n <=
+                // s.scratch.len()` checked above; pointer offset stays in-bounds.
+                let written = unsafe {
+                    (sys.channel_write)(
+                        s.rx_out,
+                        s.scratch.as_ptr().add(off + WS_FRAME_HDR),
+                        payload_len,
+                    )
+                };
+                // CHAN_EAGAIN (negative return) is back-pressure, not an error.
+                // The payload was already pulled from rx_in, so treat any
+                // non-positive return as a 0-byte partial write and stash the
+                // tail in `rx_pending` rather than dropping bytes.
+                let w = if written > 0 {
+                    (written as usize).min(payload_len)
+                } else {
+                    0
+                };
+                s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(w as u32);
+                if w < payload_len {
+                    // Stash this frame's unwritten payload tail for the next
+                    // step's drain.
+                    let tail = payload_len - w;
+                    let take = tail.min(s.rx_pending.len());
+                    // SAFETY: `take <= rx_pending.len()` and `off + WS_FRAME_HDR
+                    // + w + take <= n`; src/dst are disjoint buffers in `s`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            s.scratch.as_ptr().add(off + WS_FRAME_HDR + w),
+                            s.rx_pending.as_mut_ptr(),
+                            take,
+                        );
+                    }
+                    s.rx_pending_len = take;
+                    // Carry the following whole frames (if any) to the front of
+                    // `scratch` so they survive while `rx_pending` drains.
+                    let next_off = off + WS_FRAME_HDR + payload_len;
+                    if next_off < n {
+                        let carry = n - next_off;
+                        // SAFETY: overlapping move within `scratch`; `copy`
+                        // (memmove) handles overlap. Ranges are in-bounds:
+                        // `next_off + carry == n <= scratch.len()`.
+                        unsafe {
+                            core::ptr::copy(
+                                s.scratch.as_ptr().add(next_off),
+                                s.scratch.as_mut_ptr(),
+                                carry,
+                            );
+                        }
+                        s.rx_scratch_len = carry;
+                    }
+                    parked = true;
+                    break;
+                }
+                off += WS_FRAME_HDR + payload_len;
+            }
+            if parked {
                 break;
             }
         }

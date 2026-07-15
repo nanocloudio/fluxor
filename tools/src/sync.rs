@@ -9,11 +9,12 @@
 //! where the existing build / flash / run tooling expects to find
 //! foundation fmods.
 //!
-//! Hash verification is mandatory: every destination file's
-//! SHA-256 must match the lockfile's recorded `hash` field. This
-//! catches registry tampering, partial publishes, and the case
-//! where `fluxor.lock` was committed against one registry state but
-//! the developer's machine has a different one.
+//! Hash verification is mandatory for registry-sourced artefacts:
+//! every destination file's SHA-256 must match the lockfile's
+//! recorded `hash` field. This catches registry tampering, partial
+//! publishes, and the case where `fluxor.lock` was committed against
+//! one registry state but the developer's machine has a different
+//! one.
 //!
 //! Workspace mode is detected and surfaced via advisory: when the
 //! upstream lives as a live workspace member, sync *prefers* the
@@ -24,6 +25,26 @@
 //! available; the live build is an optional iteration override, not
 //! a prerequisite. A summary advisory names every workspace member
 //! that fell back so developers know which local builds are missing.
+//!
+//! **Live-sourced destinations are symlinks, not copies** — for all
+//! three artefact kinds (fmods, runtime binaries, and `[[crate]]`
+//! source-crate directories). A copy, however freshly taken, is only
+//! ever accurate as of the moment sync ran, which quietly defeats the
+//! point of a *live* workspace member: every subsequent upstream
+//! rebuild would need another `fluxor sync` to be seen downstream.
+//! A symlink needs no further sync, ever — the live artefact's next
+//! rebuild (or, for `[[crate]]`, the live source's next edit) is
+//! visible immediately. Registry-sourced destinations are still
+//! plain copies, hash-verified against the lockfile, since a
+//! registry artefact is an immutable pinned version, not something
+//! that changes out from under the copy.
+//!
+//! `[[crate]]` entries need one extra step because `LockedCrate`
+//! carries no `project` field (unlike `[[fmod]]`/`[[runtime]]`): the
+//! owning workspace member is inferred from the `<project>-*`
+//! crate-naming rule (standards/dependencies.md §9), and the symlink
+//! points directly at that member's crate source directory rather
+//! than at a build output.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -48,8 +69,80 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
         ))
     })?;
 
+    run_sync(&pr, &lock, dry_run, false)
+}
+
+/// Re-create every lockfile-recorded destination that is missing —
+/// the implicit half of `fluxor sync`, run by build/run pre-flights
+/// so `cargo clean` (which wipes the staged `target/` tree) doesn't
+/// demand a manual re-sync the lockfile + workspace config already
+/// fully determine. Strictly re-executes the recorded
+/// materialization: never resolves versions, never touches
+/// `fluxor.lock`, and fails exactly where `fluxor sync` would
+/// (missing registry artefact, hash mismatch). No-op when the
+/// project has no lockfile or every destination is present.
+pub fn ensure_materialized(project_root: &Path) -> Result<()> {
+    let Some(lock) = lockfile::read(project_root)? else {
+        return Ok(());
+    };
     if lock.fmods.is_empty() && lock.runtimes.is_empty() && lock.crates.is_empty() {
-        println!("lockfile records no artefacts; nothing to sync.");
+        return Ok(());
+    }
+    if all_destinations_present(project_root, &lock) {
+        return Ok(());
+    }
+    eprintln!(
+        "note: staged artefacts missing from target/ — re-materializing from fluxor.lock \
+         (run `fluxor sync` for the full report)"
+    );
+    run_sync(project_root, &lock, false, true)
+}
+
+/// True when every lockfile-recorded destination exists (a broken
+/// symlink counts as missing). Content staleness is deliberately not
+/// checked — refreshing a stale registry copy is `fluxor sync`'s
+/// job; the implicit path only fills holes.
+fn all_destinations_present(pr: &Path, lock: &lockfile::LockFile) -> bool {
+    for entry in &lock.fmods {
+        let dest = pr
+            .join("target")
+            .join("fluxor")
+            .join(&entry.target)
+            .join("modules")
+            .join(format!("{}.fmod", entry.name));
+        if fs::metadata(&dest).is_err() {
+            return false;
+        }
+    }
+    for entry in &lock.crates {
+        if entry.source.starts_with("path:") || entry.source.starts_with("git:") {
+            continue;
+        }
+        if fs::metadata(pr.join("target").join("fluxor").join(&entry.name)).is_err() {
+            return false;
+        }
+    }
+    for entry in &lock.runtimes {
+        let dest = pr
+            .join("target")
+            .join(&entry.host_target)
+            .join("release")
+            .join(&entry.name);
+        if fs::metadata(&dest).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The materialization body shared by `cmd_sync` (verbose) and
+/// `ensure_materialized` (quiet). `quiet` suppresses the advisory /
+/// fallback / summary chatter; errors always surface either way.
+fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) -> Result<()> {
+    if lock.fmods.is_empty() && lock.runtimes.is_empty() && lock.crates.is_empty() {
+        if !quiet {
+            println!("lockfile records no artefacts; nothing to sync.");
+        }
         return Ok(());
     }
 
@@ -59,13 +152,15 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
     // of the registry. Lockfile hashes don't apply because the live
     // source is authoritative.
     let workspace_members = workspace_member_map();
-    if let Ok(Some(ws)) = workspace::load_workspace() {
-        if let Some(msg) = workspace::advisory(&ws, &pr) {
-            println!("note: {msg}");
-            println!(
-                "      live workspace members will source fmods from their own target/ trees, bypassing the registry."
-            );
-            println!();
+    if !quiet {
+        if let Ok(Some(ws)) = workspace::load_workspace() {
+            if let Some(msg) = workspace::advisory(&ws, pr) {
+                println!("note: {msg}");
+                println!(
+                    "      live workspace members will source fmods from their own target/ trees, bypassing the registry."
+                );
+                println!();
+            }
         }
     }
 
@@ -103,8 +198,8 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
         // all-or-nothing.
         //
         // Live layouts: `fluxor modules build` (no --out) writes to
-        // `target/fluxor/<silicon>/modules/`; `make modules-all`
-        // (`--out target`) writes to `target/<silicon>/modules/`.
+        // `target/fluxor/<silicon>/modules/`; `fluxor modules build
+        // --all --out target` writes to `target/<silicon>/modules/`.
         // Sync accepts either; the registry-shaped layout wins when
         // both exist.
         let live_src_opt = workspace_members
@@ -193,20 +288,31 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
             }
         }
 
-        // Idempotency: if the destination already matches what
-        // we're about to copy, nothing to do.
-        if dest.exists() {
-            let dest_hash = file_sha256_prefixed(&dest)?;
-            if dest_hash == actual_hash {
-                skipped_same += 1;
-                written_fmods.insert(dest.clone(), (entry.project.clone(), actual_hash.clone()));
-                continue;
-            }
+        // Idempotency:
+        // - live: dest is already a symlink pointing at `src` — done,
+        //   permanently. This is what makes live mode actually live:
+        //   an upstream rebuild needs no re-sync, ever, because the
+        //   destination was never a snapshot to begin with.
+        // - registry: dest's content already matches what we'd copy.
+        let already_current = if mode_label == "live" {
+            fs::read_link(&dest).map(|t| t == src).unwrap_or(false)
+        } else {
+            dest.exists() && file_sha256_prefixed(&dest)? == actual_hash
+        };
+        if already_current {
+            skipped_same += 1;
+            written_fmods.insert(dest.clone(), (entry.project.clone(), actual_hash.clone()));
+            continue;
         }
 
         if dry_run {
             println!(
-                "would copy [{}] {} → {} ({} bytes)",
+                "would {} [{}] {} → {} ({} bytes)",
+                if mode_label == "live" {
+                    "symlink"
+                } else {
+                    "copy"
+                },
                 mode_label,
                 src.display(),
                 dest.display(),
@@ -217,7 +323,38 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
         }
 
         fs::create_dir_all(&dest_dir)?;
-        fs::copy(&src, &dest)?;
+        if mode_label == "live" {
+            // Clear whatever's at `dest` (a stale registry copy, or a
+            // symlink pointing at a since-moved live artefact) before
+            // relinking. `dest` is always a plain file or symlink
+            // here, never a directory.
+            match fs::symlink_metadata(&dest) {
+                Ok(_) => fs::remove_file(&dest)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    errors.push(format!(
+                        "could not inspect {} before relinking: {e}",
+                        dest.display()
+                    ));
+                    continue;
+                }
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&src, &dest)?;
+            }
+            #[cfg(not(unix))]
+            {
+                errors.push(format!(
+                    "live-fmod symlinking isn't implemented on this platform (needed {} → {})",
+                    dest.display(),
+                    src.display(),
+                ));
+                continue;
+            }
+        } else {
+            fs::copy(&src, &dest)?;
+        }
         written_fmods.insert(dest.clone(), (entry.project.clone(), actual_hash.clone()));
         match mode_label {
             "live" => copied_live += 1,
@@ -230,10 +367,52 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
     // downstream projects reach into this stable path via
     // `#[path]` to consume the bundled `sdk/` subtree (which the
     // upstream crate ships via symlink-deref at package time).
+    //
+    // Live-override: unlike `[[fmod]]`/`[[runtime]]`, `LockedCrate`
+    // carries no `project` field (a crate is identified by
+    // name+version+hash alone), so the owning workspace member is
+    // inferred from the `<project>-*` naming rule
+    // (standards/dependencies.md §9) — the longest workspace-member
+    // project name `entry.name` starts with, followed by a hyphen.
+    //
+    // When a live member owns the crate, the destination is a
+    // SYMLINK straight to that member's own crate source directory —
+    // not a copy. A copy (even a freshly-repackaged one) is only ever
+    // accurate as of the moment sync ran — a "sync again after every
+    // upstream edit" requirement that quietly defeats the point of a
+    // *live* workspace member. A symlink, once created, needs no further
+    // sync ever — the live checkout's own edits are visible
+    // downstream immediately, the same instant `#[path]`-including
+    // module source is compiled. This intentionally skips the
+    // publish-time `include = [...]` curation (see e.g.
+    // `crates/clustor-common/Cargo.toml`'s comment on that allowlist)
+    // — consistent with the existing live-mode trust boundary for
+    // fmods/runtimes ("hash verification is skipped — the live
+    // source is authoritative"), just applied one layer earlier.
     for entry in &lock.crates {
         // Skip path / git overrides — those don't go through the
         // registry-extract path.
         if entry.source.starts_with("path:") || entry.source.starts_with("git:") {
+            continue;
+        }
+
+        let live_owner = workspace_members
+            .keys()
+            .filter(|project| entry.name.starts_with(&format!("{project}-")))
+            .max_by_key(|project| project.len());
+
+        if let Some(project) = live_owner {
+            let member_path = workspace_members[project].clone();
+            sync_live_crate(
+                pr,
+                &member_path,
+                project,
+                entry,
+                dry_run,
+                &mut skipped_same,
+                &mut copied_live,
+                &mut errors,
+            )?;
             continue;
         }
 
@@ -414,17 +593,26 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
         let dest_dir = pr.join("target").join(&entry.host_target).join("release");
         let dest = dest_dir.join(&entry.name);
 
-        if dest.exists() {
-            let dest_hash = file_sha256_prefixed(&dest)?;
-            if dest_hash == actual_hash {
-                skipped_same += 1;
-                continue;
-            }
+        // Idempotency — same live-symlink-vs-registry-hash split as
+        // the fmod loop above; see its comment for the rationale.
+        let already_current = if mode_label == "live" {
+            fs::read_link(&dest).map(|t| t == src).unwrap_or(false)
+        } else {
+            dest.exists() && file_sha256_prefixed(&dest)? == actual_hash
+        };
+        if already_current {
+            skipped_same += 1;
+            continue;
         }
 
         if dry_run {
             println!(
-                "would copy [{}] {} → {} ({} bytes)",
+                "would {} [{}] {} → {} ({} bytes)",
+                if mode_label == "live" {
+                    "symlink"
+                } else {
+                    "copy"
+                },
                 mode_label,
                 src.display(),
                 dest.display(),
@@ -434,13 +622,44 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
         }
 
         fs::create_dir_all(&dest_dir)?;
-        fs::copy(&src, &dest)?;
-        // Ensure executable bit on the destination — the .crate / fs::copy
-        // chain *should* preserve mode but cheap defence-in-depth.
-        let mut perms = fs::metadata(&dest)?.permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-        fs::set_permissions(&dest, perms)?;
+        if mode_label == "live" {
+            match fs::symlink_metadata(&dest) {
+                Ok(_) => fs::remove_file(&dest)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    errors.push(format!(
+                        "could not inspect {} before relinking: {e}",
+                        dest.display()
+                    ));
+                    continue;
+                }
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&src, &dest)?;
+            }
+            #[cfg(not(unix))]
+            {
+                errors.push(format!(
+                    "live-runtime symlinking isn't implemented on this platform (needed {} → {})",
+                    dest.display(),
+                    src.display(),
+                ));
+                continue;
+            }
+            // No chmod: the live binary already has its correct
+            // executable bit from whatever built it (`cargo build`),
+            // and a symlink's own mode is meaningless on Linux — the
+            // target's permissions are what a caller actually sees.
+        } else {
+            fs::copy(&src, &dest)?;
+            // Ensure executable bit on the destination — the .crate / fs::copy
+            // chain *should* preserve mode but cheap defence-in-depth.
+            let mut perms = fs::metadata(&dest)?.permissions();
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            fs::set_permissions(&dest, perms)?;
+        }
         match mode_label {
             "live" => copied_live += 1,
             _ => copied += 1,
@@ -455,10 +674,12 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
     // local builds. Aggregated so a freshly-cloned upstream doesn't
     // produce dozens of noisy lines — most of the time the developer
     // just hasn't built anything yet, and that's fine.
-    for ((project, target), count) in &fallback_counts {
-        println!(
-            "note: workspace member `{project}` had no local build for {count} artefact(s) ({target}); used registry copies (lockfile-pinned)"
-        );
+    if !quiet {
+        for ((project, target), count) in &fallback_counts {
+            println!(
+                "note: workspace member `{project}` had no local build for {count} artefact(s) ({target}); used registry copies (lockfile-pinned)"
+            );
+        }
     }
 
     let total_entries = lock.fmods.len() + lock.runtimes.len() + lock.crates.len();
@@ -470,7 +691,7 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
             skipped_same,
             errors.len(),
         );
-    } else {
+    } else if !quiet {
         println!(
             "sync: copied {copied} (registry) + {copied_live} (live), {skipped_same} already in place, {} errors.",
             errors.len()
@@ -483,6 +704,111 @@ pub fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
             errors.len()
         )));
     }
+    Ok(())
+}
+
+/// Resolve `target/fluxor/<entry.name>` to a symlink at the live
+/// workspace member's own crate source directory, creating or
+/// repairing it as needed. This is the live-mode counterpart to the
+/// registry tar-extraction below it — see the crate loop's doc
+/// comment for why a symlink (not a copy, not even a freshly
+/// re-packaged one) is what actually delivers on "live": once
+/// created, it never goes stale, so this function only does real
+/// work the first time or when something has changed the target.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the counters/errors threaded through every loop in this file; a struct would be one-call overhead for no reuse"
+)]
+fn sync_live_crate(
+    pr: &Path,
+    member_path: &Path,
+    project: &str,
+    entry: &crate::lockfile::LockedCrate,
+    dry_run: bool,
+    skipped_same: &mut usize,
+    copied_live: &mut usize,
+    errors: &mut Vec<String>,
+) -> Result<()> {
+    let live_src_dir = match crate::publish::locate_member_manifest(member_path, &entry.name) {
+        Ok(manifest_path) => manifest_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "workspace member `{project}` manifest {} has no parent directory",
+                    manifest_path.display()
+                ))
+            }),
+        Err(e) => Err(e),
+    };
+    let live_src_dir = match live_src_dir {
+        Ok(dir) => dir,
+        Err(e) => {
+            errors.push(format!(
+                "could not locate live source for crate `{}` in workspace member `{project}`: {e}",
+                entry.name,
+            ));
+            return Ok(());
+        }
+    };
+
+    let crate_root_dir = pr.join("target").join("fluxor");
+    let dest_dir = crate_root_dir.join(&entry.name);
+
+    // Idempotency: already a symlink pointing at the right place?
+    // Nothing to do — this is the common case on every sync after
+    // the first.
+    if let Ok(existing_target) = fs::read_link(&dest_dir) {
+        if existing_target == live_src_dir {
+            *skipped_same += 1;
+            return Ok(());
+        }
+    }
+
+    if dry_run {
+        println!(
+            "would symlink [live] {} → {}",
+            dest_dir.display(),
+            live_src_dir.display(),
+        );
+        return Ok(());
+    }
+
+    // Clear whatever's there: a stale symlink (wrong target), a
+    // stale directory (a registry-extracted copy from before this
+    // member was live), or nothing at all.
+    match fs::symlink_metadata(&dest_dir) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            fs::remove_dir_all(&dest_dir)?;
+        }
+        Ok(_) => fs::remove_file(&dest_dir)?, // existing symlink, wrong target
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            errors.push(format!(
+                "could not inspect {} before relinking: {e}",
+                dest_dir.display()
+            ));
+            return Ok(());
+        }
+    }
+
+    fs::create_dir_all(&crate_root_dir)?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&live_src_dir, &dest_dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        errors.push(format!(
+            "live-crate symlinking isn't implemented on this platform \
+             (needed {} → {})",
+            dest_dir.display(),
+            live_src_dir.display(),
+        ));
+        return Ok(());
+    }
+
+    *copied_live += 1;
     Ok(())
 }
 

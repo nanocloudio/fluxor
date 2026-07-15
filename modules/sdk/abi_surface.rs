@@ -87,7 +87,13 @@ use self::surface_src::kernel_abi as ka;
 
 /// The embeddable full-digest const (generated; see
 /// `abi_surface_srcpin.rs`), surfaced here so modules and the kernel reach
-/// it as `abi::abi_surface::ABI_SURFACE_DIGEST`.
+/// it as `abi::abi_surface::ABI_SURFACE_DIGEST`. The host-tools mount only
+/// reads it under `#[cfg(test)]` (it computes the digest fresh at runtime),
+/// so allow dead_code for the non-test tools build.
+#[allow(
+    dead_code,
+    reason = "embedded by kernel/modules; tools use it only in tests"
+)]
 pub const ABI_SURFACE_DIGEST: [u8; 32] = self::surface_src::srcpin::ABI_SURFACE_DIGEST;
 
 /// Manually-bumped semantic epoch. The digest covers ABI *declarations*

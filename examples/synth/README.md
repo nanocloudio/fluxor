@@ -29,8 +29,8 @@ Melody presets in the `data:` section: `c_major`, `c_minor`,
 ## Run
 
 ```sh
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/synth/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/synth/pico2w.yaml
 # tap BOOTSEL to cycle voices; sequencer auto-advances melodies
 ```
 

@@ -422,7 +422,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
                 edge.from_port_index,
             );
             {
-                const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+                const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
                 if buf_size > MAX_CHAN_BYTES {
                     // A request above the channel ceiling used to be
                     // silently clamped — the producer then believed it
@@ -440,7 +440,7 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             }
             if max_record > 0 {
                 const MIN_CHAN_BYTES: u32 = 64;
-                const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+                const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
                 // Model the grant the open below will actually make:
                 // sized requests are normalised (clamp + pow2); an
                 // unsized edge (buf_size == 0) takes the kernel's
@@ -481,9 +481,11 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             const MIN_CHAN_BYTES: u32 = 64;
             // 256 KiB silently clamped large producers: app GPU/video frames run
             // past 1 MiB, so they could not transit in one ring fill and the
-            // display gated/froze. The wasm buffer arena is 8 MiB, so 2 MiB
-            // headroom is safe (only channels that REQUEST more grow).
-            const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+            // display gated/froze. The wasm buffer arena is 8 MiB, so a single
+            // 4 MiB channel is safe (only channels that REQUEST more grow, and the
+            // other channels together stay well under the remaining 4 MiB) — chunk's
+            // GPU command ring wants a chunk mesh + far-terrain LOD ring in one step.
+            const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
             let normalised = buf_size
                 .clamp(MIN_CHAN_BYTES, MAX_CHAN_BYTES)
                 .next_power_of_two();
@@ -1079,8 +1081,16 @@ pub struct SchedulerState {
     isolated: [bool; MAX_MODULES],
     /// Per-module ready flag (true = outputs meaningful, false = still initializing)
     ready: [bool; MAX_MODULES],
-    /// Per-module upstream dependency bitmask (precomputed from edges)
+    /// Per-module upstream dependency bitmask (precomputed from edges).
+    /// FORWARD edges only — used for the readiness gate, where counting a
+    /// cycle back-edge would deadlock the feedback pair.
     upstream_mask: [ModuleMask; MAX_MODULES],
+    /// Per-module predecessor bitmask over ALL edges — forward AND cycle
+    /// back-edges. Used ONLY for sink-completion (`cli_out`): a sink must not
+    /// declare itself done while a producer that can still feed it — including
+    /// one reached through a feedback cycle — is alive. Separate from
+    /// `upstream_mask` because the readiness gate needs the forward-only set.
+    completion_mask: [ModuleMask; MAX_MODULES],
     /// Per-module step period in scheduler ticks (0 = every tick, N =
     /// step every N ticks). Wall-clock period is
     /// `step_period * domain_tick_us` — units are ticks, NOT
@@ -1330,6 +1340,7 @@ impl SchedulerState {
             isolated: [false; MAX_MODULES],
             ready: [true; MAX_MODULES],
             upstream_mask: [ModuleMask::EMPTY; MAX_MODULES],
+            completion_mask: [ModuleMask::EMPTY; MAX_MODULES],
             step_period: [0; MAX_MODULES],
             step_counter: [0; MAX_MODULES],
             module_next_due_us: [0; MAX_MODULES],
@@ -1402,6 +1413,7 @@ impl SchedulerState {
             self.isolated[i] = false;
             self.ready[i] = true;
             self.upstream_mask[i] = ModuleMask::EMPTY;
+            self.completion_mask[i] = ModuleMask::EMPTY;
             // Clear the per-module owner stamp; workload owner lifecycle in the
             // owner table is managed by the transition path, not here.
             #[cfg(feature = "multitenant")]
@@ -6272,6 +6284,9 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
     for slot in sched.upstream_mask.iter_mut() {
         *slot = ModuleMask::EMPTY;
     }
+    for slot in sched.completion_mask.iter_mut() {
+        *slot = ModuleMask::EMPTY;
+    }
 
     // Build a module→position map from the topological execution order.
     // `NO_POS` marks a module absent from exec_order; we can't prove an edge
@@ -6297,6 +6312,9 @@ fn compute_upstream_mask(edges: &[Edge], edge_count: usize) {
         if from >= MAX_MODULES || to >= MAX_MODULES {
             continue;
         }
+        // Completion tracks EVERY real edge — a sink downstream of a feedback
+        // cycle must wait on producers reachable through a back-edge too.
+        sched.completion_mask[to].set(from);
         let (pf, pt) = (pos[from], pos[to]);
         // Forward edge only: both endpoints ordered and source strictly
         // precedes destination. `pf >= pt` (including either unordered) is a
@@ -9202,6 +9220,27 @@ pub fn module_upstream_mask(module_idx: usize) -> u64 {
     // The reconfigure syscall ABI surfaces a u64; it observes the low-64
     // upstream bits. Widening that opcode is tracked with the reconfigure ABI.
     unsafe { SCHED.upstream_mask[module_idx].as_u64() }
+}
+
+/// Whether every producer that can still feed `module_idx` — over any edge,
+/// including a feedback-cycle back-edge — has finished. A sink (`cli_out`) uses
+/// this instead of the forward-only `upstream_mask`: with the forward mask a sink
+/// placed downstream of the `tcp_client`/`linux_net` cycle sees an EMPTY upstream
+/// set (its only feeder arrives via a back-edge) and would declare itself done
+/// before the async reply is produced. `true` when no live producer remains
+/// (also `true` for a genuine source with no predecessors at all).
+pub fn module_completion_predecessors_finished(module_idx: usize) -> bool {
+    if module_idx >= MAX_MODULES {
+        return true;
+    }
+    // SAFETY: scheduler-thread read; module_idx bounded.
+    let mask = unsafe { &SCHED.completion_mask[module_idx] };
+    for producer in mask.iter_set() {
+        if !module_is_finished(producer) {
+            return false;
+        }
+    }
+    true
 }
 
 // ============================================================================

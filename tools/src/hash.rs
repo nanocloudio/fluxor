@@ -35,15 +35,14 @@ pub fn abi_surface_digest() -> [u8; 32] {
     crate::abi_surface::write_surface(&mut |bytes| h.update(bytes));
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
-    // The SDK embeds `ABI_SURFACE_DIGEST` — a checked-in copy of this digest
-    // — into every module. Assert the copy still equals the freshly computed
-    // surface, so a stale const is caught in any debug build of the tools,
-    // not only under `cargo test`.
-    debug_assert_eq!(
-        out,
-        crate::abi_surface::ABI_SURFACE_DIGEST,
-        "checked-in ABI_SURFACE_DIGEST is stale vs the computed surface — regenerate it"
-    );
+    // NB: this returns the freshly COMPUTED digest and deliberately does not
+    // assert it against the checked-in `ABI_SURFACE_DIGEST` const. A stale
+    // const is caught by the `abi_surface_digest_is_locked` /
+    // `contracts_platform_srcpin_is_current` tests and by pack-time
+    // attestation (`verify_module_abi_surface`), and is *fixed* by
+    // `fluxor abi-regen`. A `debug_assert` here would panic the whole tool —
+    // including the regen command — whenever the pin is stale, i.e. it would
+    // block its own fix path.
     out
 }
 
@@ -63,15 +62,17 @@ pub fn file_sha256_short(path: &Path) -> Result<String> {
 /// layers, contracts, platform. Only the generated pin file itself is
 /// excluded (self-reference).
 ///
-/// Canonicalization is intentionally light: it drops blank lines and
-/// whole-line `//` comments (so pure doc churn on `///` lines is
-/// digest-neutral) and trims trailing whitespace. It does NOT strip
-/// block comments, inline trailing comments, or indentation, and it
-/// includes the relative path — so a rename, a reformat, or an inline
-/// comment DOES move the digest. That is the deliberate, safe direction
-/// (a false-positive rebuild self-heals; a false-negative acceptance is
-/// a field failure), but it means the pin tracks more than strictly the
-/// wire-bearing tokens.
+/// Canonicalization is **token-based** (`canonicalize_source`): each file is
+/// tokenized and the token stream is hashed structurally. Comments and
+/// formatting are not tokens, so a doc/inline/block comment edit or a `cargo
+/// fmt` is digest-neutral, without introducing a false negative:
+/// every identifier, punctuation, and literal —
+/// including a string literal's exact spelling and internal whitespace — is a
+/// token, so any change to an opcode number, const value, struct field, or
+/// signature still moves the digest. The relative path is still folded in, so a
+/// rename moves it. A file that fails to tokenize (should not happen for valid
+/// Rust) falls back to line-canonicalization (drop blank + whole-line comments)
+/// — the safe over-approximation.
 ///
 /// Used by the drift test; the checked-in const is what ships (no
 /// build.rs in no_std consumers).
@@ -117,25 +118,115 @@ pub fn compute_contracts_platform_src_hash(repo_root: &Path) -> Result<[u8; 32]>
         h.update(rel.as_bytes());
         h.update([0u8]);
         let text = fs::read_to_string(&path)?;
-        let mut canon = String::new();
-        let mut first = true;
-        for line in text.split('\n') {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with("//") {
-                continue;
-            }
-            if !first {
-                canon.push('\n');
-            }
-            first = false;
-            canon.push_str(line.trim_end());
-        }
-        h.update(canon.as_bytes());
+        h.update(canonicalize_source(&text).as_bytes());
         h.update([0u8]);
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&h.finalize());
     Ok(out)
+}
+
+/// Canonicalize one Rust source file to its wire-relevant essence for the pin.
+/// Tokenizes and renders the token stream structurally — dropping comments and
+/// formatting (not tokens) while preserving every identifier, punct, and
+/// literal (so literal values, including string contents, are exact). Falls
+/// back to line-canonicalization if the file does not tokenize.
+fn canonicalize_source(text: &str) -> String {
+    use std::str::FromStr;
+    match proc_macro2::TokenStream::from_str(text) {
+        Ok(ts) => {
+            let mut out = String::new();
+            render_tokens(ts, &mut out);
+            out
+        }
+        Err(_) => {
+            let mut canon = String::new();
+            for line in text.split('\n') {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with("//") {
+                    continue;
+                }
+                canon.push_str(line.trim_end());
+                canon.push('\n');
+            }
+            canon
+        }
+    }
+}
+
+/// Render a token stream to a stable, delimiter-separated string. Each token is
+/// tagged by kind so distinct token sequences can never collide (`0x1f` = unit
+/// separator). Does not use `TokenStream::to_string` (its inter-token spacing
+/// is not guaranteed stable across proc-macro2 versions).
+///
+/// Doc comments (`///`, `//!`, `/** */`) are lexed into `#[doc = "…"]` /
+/// `#![doc = "…"]` attribute tokens; those are DROPPED here (documentation
+/// carries no wire meaning). Real attributes — `#[repr(C)]`, `#[cfg(...)]` —
+/// are kept, since they DO affect the surface.
+fn render_tokens(ts: proc_macro2::TokenStream, out: &mut String) {
+    use proc_macro2::{Delimiter, TokenTree};
+    let toks: Vec<TokenTree> = ts.into_iter().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        // Attribute shape: `#` `!`? `[ … ]`. Skip the whole thing iff it is a
+        // `doc` attribute.
+        if matches!(&toks[i], TokenTree::Punct(p) if p.as_char() == '#') {
+            let mut j = i + 1;
+            if matches!(toks.get(j), Some(TokenTree::Punct(q)) if q.as_char() == '!') {
+                j += 1;
+            }
+            if let Some(TokenTree::Group(g)) = toks.get(j) {
+                if g.delimiter() == Delimiter::Bracket && group_is_doc(g) {
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        render_one(&toks[i], out);
+        i += 1;
+    }
+}
+
+/// True if a bracket group is a `doc = "…"` attribute body.
+fn group_is_doc(g: &proc_macro2::Group) -> bool {
+    matches!(
+        g.stream().into_iter().next(),
+        Some(proc_macro2::TokenTree::Ident(id)) if id == "doc"
+    )
+}
+
+fn render_one(tt: &proc_macro2::TokenTree, out: &mut String) {
+    use proc_macro2::{Delimiter, TokenTree};
+    match tt {
+        TokenTree::Group(g) => {
+            out.push('g');
+            out.push(match g.delimiter() {
+                Delimiter::Parenthesis => '(',
+                Delimiter::Brace => '{',
+                Delimiter::Bracket => '[',
+                Delimiter::None => 'N',
+            });
+            out.push('\x1f');
+            render_tokens(g.stream(), out);
+            out.push('G');
+            out.push('\x1f');
+        }
+        TokenTree::Ident(i) => {
+            out.push('i');
+            out.push_str(&i.to_string());
+            out.push('\x1f');
+        }
+        TokenTree::Punct(p) => {
+            out.push('p');
+            out.push(p.as_char());
+            out.push('\x1f');
+        }
+        TokenTree::Literal(l) => {
+            out.push('l');
+            out.push_str(&l.to_string());
+            out.push('\x1f');
+        }
+    }
 }
 
 #[cfg(test)]
@@ -163,8 +254,47 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "df05320cf0a9b39d6255cd9fb2ba0669fcd728fab5e05f308427e5d094fa7bf6",
+            hex, "996e3af7e712c2e3945f8cd58be70d7f4e36db12cbe509a99d0e2fee5b32a14e",
             "ABI wire-surface changed — see this test's doc comment"
+        );
+    }
+
+    /// The source-pin canonicalizer must be neutral to comments and formatting
+    /// (false-positive churn) yet sensitive to every wire token — including a
+    /// string literal's internal whitespace, the exact case a naive text strip
+    /// would silently miss (a false negative in a compatibility guard).
+    #[test]
+    fn source_canon_drops_noise_keeps_wire_tokens() {
+        let base = "pub const OP: u32 = 0x1A00; // opcode\n";
+        // Comment edits, block comments, reformatting, blank lines: all neutral.
+        let comment = "pub const OP: u32 = 0x1A00; // a completely different note\n";
+        let block = "/* banner */\npub const OP: u32 = 0x1A00;\n";
+        let reformat = "pub  const OP:u32   =0x1A00;\n\n\n";
+        // `///` doc comments lex to `#[doc=...]` attrs — must be dropped too.
+        let docced = "/// This opcode does a thing.\npub const OP: u32 = 0x1A00;\n";
+        assert_eq!(canonicalize_source(base), canonicalize_source(comment));
+        assert_eq!(canonicalize_source(base), canonicalize_source(block));
+        assert_eq!(canonicalize_source(base), canonicalize_source(reformat));
+        assert_eq!(
+            canonicalize_source(base),
+            canonicalize_source(docced),
+            "/// doc comments must be digest-neutral"
+        );
+        // But a REAL attribute is wire-relevant and must be kept.
+        assert_ne!(
+            canonicalize_source("pub struct W { a: u32 }\n"),
+            canonicalize_source("#[repr(C)]\npub struct W { a: u32 }\n"),
+            "#[repr(C)] changes layout — must move the digest"
+        );
+
+        // Any wire change moves it: opcode value, and — critically — whitespace
+        // INSIDE a string literal (no false-negative).
+        let value = "pub const OP: u32 = 0x1A01;\n";
+        assert_ne!(canonicalize_source(base), canonicalize_source(value));
+        assert_ne!(
+            canonicalize_source("pub const S: &str = \"a  b\";\n"),
+            canonicalize_source("pub const S: &str = \"a b\";\n"),
+            "string-literal internal whitespace must be preserved"
         );
     }
 
@@ -190,8 +320,11 @@ mod tests {
         if computed != stored {
             let arr: Vec<String> = computed.iter().map(|b| format!("0x{b:02x}")).collect();
             panic!(
-                "contracts/platform source pin is stale.\nReplace the const in \
-                 modules/sdk/abi_surface_srcpin.rs with:\n[{}]",
+                "contracts/platform source pin is stale (a modules/sdk source \
+                 changed).\nRun `fluxor abi-regen` to rewrite all pin sites, \
+                 then `fluxor modules build --all` so .fmods re-attest.\n(Manual fallback — \
+                 replace the const in modules/sdk/abi_surface_srcpin.rs \
+                 with:\n[{}])",
                 arr.join(", ")
             );
         }

@@ -1,0 +1,18 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Result sink. Forwards decoded bytes (the qr_scan token) on the input port to the
+# host page via the `host_scan_result` import (stashed as window.__fluxor_scan_result
+# and delivered to an optional window.onScanResult callback). The page then enrolls
+# + authenticates with the token.
+
+[[ports]]
+name = "result"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; carries a decoded token, not a measurable on-device byte stream"

@@ -25,8 +25,8 @@ ports).
 ## Run
 
 ```sh
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/voip_call/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/voip_call/pico2w.yaml
 # Microphone on mic_pio inputs; speaker on I²S DAC outputs.
 # Flash both devices, then press BOOTSEL on one to ring the other.
 ```

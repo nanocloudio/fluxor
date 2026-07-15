@@ -6,7 +6,7 @@
 # dev default.
 [project]
 name     = "fluxor"
-version  = "0.1.1"
+version  = "0.0.1"
 # Host runtime binaries this project owns. Bare `fluxor publish`
 # republishes only the binaries named here; this keeps a downstream
 # consumer that has synced `fluxor-linux` into its own target tree

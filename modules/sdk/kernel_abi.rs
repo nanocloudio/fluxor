@@ -503,6 +503,11 @@ pub mod fd {
     /// `PROC_SPAWN` tags the returned slot with this; `PROC_READ`/`STATUS`/
     /// `CLOSE` carry it back and the dispatcher strips it with `slot_of`.
     pub const FD_TAG_PROC: i32 = 25;
+    // 26 unused (reserved; do not reuse).
+    /// Isolated-workload handle (`provider::contract::WORKLOAD`, 0x001A):
+    /// `workload::CREATE` tags the returned slot with this; the lifecycle ops
+    /// (START/WAIT/SIGNAL/DESTROY/READ) carry it back, stripped via `slot_of`.
+    pub const FD_TAG_WORKLOAD: i32 = 27;
 
     pub const TAG_SHIFT: u32 = 26;
     pub const SLOT_MASK: i32 = 0x03FF_FFFF;

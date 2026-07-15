@@ -2062,3 +2062,188 @@ mod continuity_tests {
         assert!(!cap_satisfies("transport.anchorx", "transport.anchor"));
     }
 }
+
+/// Coverage for `resolve_edge_rate_class`'s priority order
+/// (`rfc_flow_budgets.md` §3.2): per-edge `rate:` override, else
+/// consumer's `rate_class_default`, else producer's
+/// `rate_class_default`, else consumer's content-type default, else
+/// producer's, else `control`.
+#[cfg(test)]
+mod rate_class_resolution_tests {
+    use super::*;
+
+    fn content_type_index(name: &str) -> u8 {
+        fluxor_contracts::CONTENT_TYPES
+            .iter()
+            .position(|s| *s == name)
+            .unwrap_or_else(|| panic!("unknown content type '{name}'")) as u8
+    }
+
+    fn port(content_type: &str) -> manifest::PortSpec {
+        manifest::PortSpec {
+            direction: 0,
+            content_type: content_type_index(content_type),
+            flags: 0,
+            name: None,
+            index: 0,
+            buffer_size: 0,
+            max_record: 0,
+            rate_class_max: None,
+            rate_class_default: None,
+        }
+    }
+
+    fn with_default(mut p: manifest::PortSpec, class: fluxor_contracts::RateClass) -> manifest::PortSpec {
+        p.rate_class_default = Some(class);
+        p
+    }
+
+    #[test]
+    fn per_edge_override_wins_over_everything() {
+        let from = with_default(port("NetProto"), fluxor_contracts::RateClass::Bulk);
+        let to = with_default(port("NetProto"), fluxor_contracts::RateClass::Bulk);
+        let entry = json!({"rate": "control"});
+        let class = resolve_edge_rate_class(Some(&entry), Some(&from), Some(&to)).unwrap();
+        assert_eq!(class, fluxor_contracts::RateClass::Control);
+    }
+
+    #[test]
+    fn unknown_rate_override_is_a_config_error() {
+        let entry = json!({"rate": "ludicrous"});
+        let err = resolve_edge_rate_class(Some(&entry), None, None).unwrap_err();
+        assert!(format!("{err:?}").contains("unknown rate class"), "got: {err:?}");
+    }
+
+    #[test]
+    fn consumer_rate_class_default_wins_over_content_type_default() {
+        // NetProto's content-type default is `audio`; a consumer that
+        // declares `transaction` overrides that default without
+        // needing a per-edge `rate:` line.
+        let from = port("NetProto");
+        let to = with_default(port("NetProto"), fluxor_contracts::RateClass::Transaction);
+        let class = resolve_edge_rate_class(None, Some(&from), Some(&to)).unwrap();
+        assert_eq!(class, fluxor_contracts::RateClass::Transaction);
+    }
+
+    #[test]
+    fn producer_rate_class_default_used_when_consumer_declares_none() {
+        // Mirrors Clustor's `http_ingress.net_out → linux_net.net_in`:
+        // the consumer (a fluxor builtin) declares no default, so the
+        // producer's own `rate_class_default` is what applies.
+        let from = with_default(port("NetProto"), fluxor_contracts::RateClass::Transaction);
+        let to = port("NetProto"); // no rate_class_default — e.g. linux_net.net_in
+        let class = resolve_edge_rate_class(None, Some(&from), Some(&to)).unwrap();
+        assert_eq!(class, fluxor_contracts::RateClass::Transaction);
+    }
+
+    #[test]
+    fn falls_back_to_consumer_content_type_default_when_neither_port_declares_one() {
+        let from = port("OctetStream"); // Control by content type
+        let to = port("NetProto"); // Audio by content type
+        let class = resolve_edge_rate_class(None, Some(&from), Some(&to)).unwrap();
+        assert_eq!(class, fluxor_contracts::RateClass::Audio);
+    }
+
+    #[test]
+    fn falls_back_to_producer_content_type_default_when_consumer_spec_is_absent() {
+        let from = port("VideoRaster"); // Audio by content type (see contracts note)
+        let class = resolve_edge_rate_class(None, Some(&from), None).unwrap();
+        assert_eq!(class, fluxor_contracts::RateClass::Audio);
+    }
+
+    #[test]
+    fn falls_back_to_control_when_nothing_resolves() {
+        let class = resolve_edge_rate_class(None, None, None).unwrap();
+        assert_eq!(class, fluxor_contracts::RateClass::Control);
+    }
+
+    /// `http_ingress.net_out` declares `rate_class_max = transaction`;
+    /// without a `rate_class_default` the edge resolves to `audio`
+    /// (NetProto's content-type default) via the consumer
+    /// (`linux_net.net_in`), which exceeds the cap and fails
+    /// `fluxor validate`. Declaring `rate_class_default = transaction`
+    /// on the producer satisfies the cap without touching every
+    /// consuming config's wiring.
+    #[test]
+    fn http_ingress_style_producer_cap_is_satisfied_by_its_own_default() {
+        let mut from = with_default(port("OctetStream"), fluxor_contracts::RateClass::Transaction);
+        from.rate_class_max = Some(fluxor_contracts::RateClass::Transaction);
+        let to = port("NetProto"); // linux_net.net_in / ip.net_in — no default of its own
+        let class = resolve_edge_rate_class(None, Some(&from), Some(&to)).unwrap();
+        assert_eq!(class, fluxor_contracts::RateClass::Transaction);
+        assert!(!class.exceeds(from.rate_class_max.unwrap()));
+
+        // Without the producer's default, the same edge resolves to
+        // `audio` and DOES exceed the cap.
+        let mut from_no_default = port("OctetStream");
+        from_no_default.rate_class_max = Some(fluxor_contracts::RateClass::Transaction);
+        let class_no_default =
+            resolve_edge_rate_class(None, Some(&from_no_default), Some(&to)).unwrap();
+        assert_eq!(class_no_default, fluxor_contracts::RateClass::Audio);
+        assert!(class_no_default.exceeds(from_no_default.rate_class_max.unwrap()));
+    }
+}
+
+/// `RateClass::severity()` / `exceeds()`. `RateClass` deliberately
+/// does not derive `Ord`; these tests pin the intended severity order
+/// directly so a regression (e.g. someone adding `#[derive(Ord)]`) is
+/// caught here rather than rediscovered via a config validation
+/// failure.
+#[cfg(test)]
+mod rate_class_severity_tests {
+    use fluxor_contracts::RateClass;
+
+    #[test]
+    fn severity_order_is_control_transaction_audio_video_bulk() {
+        let ordered = [
+            RateClass::Control,
+            RateClass::Transaction,
+            RateClass::Audio,
+            RateClass::Video,
+            RateClass::Bulk,
+        ];
+        for pair in ordered.windows(2) {
+            assert!(
+                pair[0].severity() < pair[1].severity(),
+                "{:?} should be less severe than {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_does_not_exceed_itself_or_anything_above_it() {
+        assert!(!RateClass::Transaction.exceeds(RateClass::Transaction));
+        assert!(!RateClass::Transaction.exceeds(RateClass::Audio));
+        assert!(!RateClass::Transaction.exceeds(RateClass::Video));
+        assert!(!RateClass::Transaction.exceeds(RateClass::Bulk));
+    }
+
+    #[test]
+    fn transaction_exceeds_only_control() {
+        assert!(RateClass::Transaction.exceeds(RateClass::Control));
+    }
+
+    #[test]
+    fn audio_exceeds_transaction_despite_declaration_order() {
+        // Exactly the case a derived `Ord` would get wrong: `Audio`
+        // is declared before `Transaction` in the enum, but is the
+        // more demanding class.
+        assert!(RateClass::Audio.exceeds(RateClass::Transaction));
+        assert!(!RateClass::Transaction.exceeds(RateClass::Audio));
+    }
+
+    #[test]
+    fn bulk_exceeds_every_other_class() {
+        for other in [
+            RateClass::Control,
+            RateClass::Transaction,
+            RateClass::Audio,
+            RateClass::Video,
+        ] {
+            assert!(RateClass::Bulk.exceeds(other));
+        }
+        assert!(!RateClass::Bulk.exceeds(RateClass::Bulk));
+    }
+}

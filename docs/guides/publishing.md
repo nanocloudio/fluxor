@@ -19,7 +19,7 @@ make publish
 In fluxor's checkout. That builds modules + the linux runtime
 binary, then publishes four tiers (ABI source crate, SDK source crate,
 fmod palette, runtime binary) into `~/.fluxor/registry/`. Consumers
-then run `make update && make sync` in their own checkout and pick up
+then run `fluxor update && fluxor sync` in their own checkout and pick up
 the new state.
 
 **Version source-of-truth rule:** every workspace member crate's
@@ -42,7 +42,7 @@ miss.
 ## First-time setup (per developer machine)
 
 ```sh
-make setup                  # cargo install --locked --path tools
+make install                          # put the fluxor CLI on PATH
 fluxor registry init        # bootstrap ~/.fluxor/registry/ + cargo git index
 fluxor registry setup-cargo # add [registries.fluxor] to ~/.cargo/config.toml
 ```
@@ -78,14 +78,14 @@ crate's resolved `[package].version` doesn't match `[project].
 version` — the error names the offending crate, so you'll see
 immediately if anything's out of sync.
 
-`make publish` chains:
+`make publish` runs `make build` (CLI, kernels, fmods for every
+silicon target, `fluxor-linux`) and then `fluxor publish`, which
+publishes every tier:
 
-1. `make modules-all` — builds every silicon target's fmods
-2. `make linux-bin` — builds `fluxor-linux`
-3. `fluxor publish abi` — packages + indexes `fluxor-abi`
-4. `fluxor publish sdk` — packages + indexes `fluxor-sdk`
-5. `fluxor publish fmod` — copies all foundation fmods into the registry
-6. `fluxor publish runtime --binary fluxor-linux` — copies the runtime binary
+1. `fluxor publish abi` — packages + indexes `fluxor-abi`
+2. `fluxor publish sdk` — packages + indexes `fluxor-sdk`
+3. `fluxor publish fmod` — copies all foundation fmods into the registry
+4. `fluxor publish runtime` — copies each binary in `fluxor.toml::[project].runtimes`
 
 Per artefact, this also:
 
@@ -94,27 +94,27 @@ Per artefact, this also:
 - Refuses to overwrite an existing `(name, version)` — bump if you forgot
 - Refuses if `[project].version = "0.0.0-dev"` — set a real version
 
-Consumers pick up the new version with `make update && make sync`
+Consumers pick up the new version with `fluxor update && fluxor sync`
 in their own checkout.
 
 ### Mode B — live workspace iteration (no version bumps)
 
 Use when iterating fast between fluxor and a colocated consumer. No
 version bumps, no canonical publish required for fmods and runtime
-binaries — the consumer's `make sync` sources those tiers directly
+binaries — the consumer's `fluxor sync` sources those tiers directly
 from each workspace member's `target/` tree.
 
 **What live mode covers today:**
 
 | Tier | Live source? | How updates flow |
 |---|---|---|
-| fmods | Yes | Build with `make modules-all` upstream; consumer's `make sync` reads from your `target/<silicon>/modules/` |
-| Runtime binary (`fluxor-linux`) | Yes | Build with `make linux-bin` upstream; consumer's `make sync` reads from your `target/<host-target>/release/` |
-| Source crates (`fluxor-abi`, `fluxor-sdk`) | No — still registry | Consumer's `make sync` still extracts from `~/.fluxor/registry/cargo/`. To refresh: bump versions and run **canonical** `make publish` upstream, then `make update && make sync` in the consumer. |
+| fmods | Yes | Build with `fluxor modules build --all` upstream; consumer's `fluxor sync` reads from your `target/<silicon>/modules/` |
+| Runtime binary (`fluxor-linux`) | Yes | Build with `make build` upstream; consumer's `fluxor sync` reads from your `target/<host-target>/release/` |
+| Source crates (`fluxor-abi`, `fluxor-sdk`) | No — still registry | Consumer's `fluxor sync` still extracts from `~/.fluxor/registry/cargo/`. To refresh: bump versions and run **canonical** `make publish` upstream, then `fluxor update && fluxor sync` in the consumer. |
 
 **Source-crate refresh requires canonical publish, not local.** The
 lockfile resolver only considers canonical artefacts — `-local.<sha>`
-snapshots are invisible to `make update` and `make sync` in normal
+snapshots are invisible to `fluxor update` and `fluxor sync` in normal
 (registry-resolved) consumption. They exist for the narrow case of a
 downstream that declares `[dependencies] X = { path = "..." }` and
 wants the path-overridden source to come from the registry directory
@@ -124,7 +124,7 @@ out of scope.
 The source-crate gap is the one hand-off that isn't fully live: when
 you edit fluxor's SDK source (e.g. `modules/sdk/abi.rs`), the
 consumer doesn't see the change automatically — you have to bump
-versions, canonical-publish, and have the consumer `make sync`. Live
+versions, canonical-publish, and have the consumer `fluxor sync`. Live
 source-crate resolution across workspace members (so SDK edits flow
 without a publish) is not yet supported.
 
@@ -145,7 +145,7 @@ members = [
 EOF
 
 # then in fluxor/, edit anything
-# in the consumer's checkout, `make modules` / `make test` picks up live state
+# in the consumer's checkout, `fluxor modules build` / `make test` picks up live state
 ```
 
 List every colocated checkout that should resolve to live source —
@@ -168,9 +168,9 @@ workspace-listed checkout, that's an env-hygiene bug.
 
 ## Local snapshots (`publish --local`)
 
-`make publish-local` writes each artefact with a `-local.<sha>`
+`fluxor publish --local` writes each artefact with a `-local.<sha>`
 suffix. Useful only for path/git override workflows in a
-downstream's `fluxor.toml`. `make update` / `make sync` in downstream
+downstream's `fluxor.toml`. `fluxor update` / `fluxor sync` in downstream
 projects **never** consume `-local` artefacts — they're invisible to
 canonical-mode resolution.
 
@@ -201,10 +201,10 @@ no longer matches and consumers explicitly opt in.
 ## Inspecting registry state
 
 ```sh
-make registry-list           # everything in ~/.fluxor/registry/
-make registry-gc-dry         # preview garbage-collection (locals/lives only)
-make registry-gc             # actually collect — keeps newest 3 per group, min-age 24h
-make workspace-status        # show workspace.toml state
+fluxor registry list           # everything in ~/.fluxor/registry/
+fluxor registry gc --dry-run         # preview garbage-collection (locals/lives only)
+fluxor registry gc             # actually collect — keeps newest 3 per group, min-age 24h
+fluxor workspace status        # show workspace.toml state
 fluxor inspect <config.yaml> # full discovery: project root, search paths, target stack
 ```
 
@@ -226,10 +226,10 @@ through it with normal Unix tools if needed.
 - **"refuses to publish 0.0.0-dev"** — `[project].version` was never
   set. Add `version = "0.1.0"` (or whatever) to fluxor.toml's
   `[project]` block.
-- **A consumer's `make sync` reports `hash mismatch`** — the local
+- **A consumer's `fluxor sync` reports `hash mismatch`** — the local
   registry was tampered with or got out of sync with the consumer's
   `fluxor.lock`. Republish from fluxor (`make publish`) and have the
-  consumer re-run `make update` to pick up the new hashes.
+  consumer re-run `fluxor update` to pick up the new hashes.
 - **A consumer can't find the `fluxor` registry** — they haven't run
   `fluxor registry setup-cargo` on their machine. Each developer
   needs this once.

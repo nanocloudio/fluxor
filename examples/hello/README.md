@@ -15,7 +15,7 @@ every environment that lets the kernel run at all.
 ## Run
 
 ```sh
-make firmware TARGET=cm5 && make modules TARGET=bcm2712
+make firmware TARGET=cm5 && fluxor modules build --target bcm2712
 fluxor combine -o kernel8.img target/cm5/firmware.bin examples/hello/cm5.yaml
 # netboot or copy kernel8.img to /boot/firmware/
 tio /dev/ttyUSB0 -b 115200

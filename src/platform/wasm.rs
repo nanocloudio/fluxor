@@ -19,6 +19,12 @@ use crate::kernel::{channel, scheduler};
 #[path = "wasm/canvas.rs"]
 mod canvas;
 
+#[path = "wasm/camera.rs"]
+mod camera;
+
+#[path = "wasm/scan_out.rs"]
+mod scan_out;
+
 #[path = "wasm/ws_source.rs"]
 mod ws_source;
 
@@ -350,6 +356,8 @@ const FLAG_WASM_PAYLOAD: u8 = 0x20;
 use crate::abi::wire::fnv1a32;
 
 const WASM_BROWSER_CANVAS_HASH: u32 = fnv1a32(b"wasm_browser_canvas");
+const WASM_BROWSER_CAMERA_HASH: u32 = fnv1a32(b"wasm_browser_camera");
+const WASM_BROWSER_SCAN_OUT_HASH: u32 = fnv1a32(b"wasm_browser_scan_out");
 const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
 const WASM_BROWSER_KEYBOARD_HASH: u32 = fnv1a32(b"wasm_browser_keyboard");
 const WASM_BROWSER_POINTER_HASH: u32 = fnv1a32(b"wasm_browser_pointer");
@@ -561,6 +569,59 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_dom_input (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // Camera-frame source: getUserMedia luma frames into the graph (for
+        // qr_scan). Needs a heap for its frame buffer, like canvas.
+        if entry.name_hash == WASM_BROWSER_CAMERA_HASH {
+            if !init_builtin_heap_sized(module_idx, camera::heap_size_for()) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_camera: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = camera::build(out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_camera (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // Result sink: hand a decoded byte result (qr_scan token) to the page.
+        if entry.name_hash == WASM_BROWSER_SCAN_OUT_HASH {
+            if !init_builtin_heap::<scan_out::ScanOutState>(module_idx) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_scan_out: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let m = scan_out::build(in_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_scan_out (built-in)",
                 0,
             );
             continue;

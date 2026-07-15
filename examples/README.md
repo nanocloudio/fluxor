@@ -75,7 +75,7 @@ fluxor run examples/<capability>/<platform>.yaml
 
 # For embedded targets (pico2w, cm5, etc.) build + flash
 make firmware TARGET=<platform>
-make modules  TARGET=<silicon>
+fluxor modules build --target <silicon>
 fluxor combine -o kernel8.img target/<platform>/firmware.bin examples/<capability>/<platform>.yaml
 ```
 

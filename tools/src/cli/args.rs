@@ -120,6 +120,16 @@ enum Commands {
     },
     /// List available targets
     Targets,
+    /// Recompute and rewrite the ABI-surface pin in all checked-in sites
+    /// (`abi_surface_srcpin.rs` src-hash + digest, the `tools/src/hash.rs`
+    /// lock, and the harness lock). Run after any `modules/sdk` edit — it is
+    /// the single writer, so the sites can never drift. `--check` verifies
+    /// they are current (CI) and writes nothing.
+    AbiRegen {
+        /// Verify the pins are current and exit non-zero if stale; do not write.
+        #[arg(long)]
+        check: bool,
+    },
     /// Build module table blob from .fmod files
     Mktable {
         /// Directory containing .fmod files

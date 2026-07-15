@@ -416,8 +416,10 @@ fn publish_workspace_crate(package: &str, local: bool, project_root: Option<&Pat
 
 /// Locate the workspace member's source Cargo.toml for the given
 /// package. Reused by `publish_workspace_crate` to feed dep
-/// extraction into the cargo-index writer.
-fn locate_member_manifest(project_root: &Path, package: &str) -> Result<PathBuf> {
+/// extraction into the cargo-index writer, and by `sync`'s
+/// live-crate symlink resolution (`locate_member_manifest(..)
+/// .parent()` is the crate's own source directory).
+pub(crate) fn locate_member_manifest(project_root: &Path, package: &str) -> Result<PathBuf> {
     for member in enumerate_workspace_members(project_root)? {
         if member.name == package {
             return Ok(member.path);
@@ -435,6 +437,10 @@ pub(crate) struct OwnedModule {
     pub(crate) version: String,
     /// Path of the module's `manifest.toml` (metadata carried alongside
     /// the `.fmod` when publishing into the OCI store).
+    #[allow(
+        dead_code,
+        reason = "read by the bin-only `store_cli` publisher; the lib build doesn't include it"
+    )]
     pub(crate) manifest_path: PathBuf,
 }
 
@@ -543,7 +549,7 @@ pub fn cmd_publish_fmod(
 
     if targets_to_walk.is_empty() {
         return Err(Error::Config(
-            "no built fmods under target/fluxor/* or target/* — run `make modules-all` first"
+            "no built fmods under target/fluxor/* or target/* — run `fluxor modules build --all` first"
                 .to_string(),
         ));
     }
@@ -576,7 +582,7 @@ pub fn cmd_publish_fmod(
                 // Silent skip — not every owned module targets
                 // every silicon (e.g. a host-only app module skipped
                 // for rp2040), and the operator already controls the
-                // build set via `make modules` / `make modules-all`.
+                // build set via `fluxor modules build [--all]`.
                 continue;
             };
 
@@ -628,7 +634,7 @@ pub fn cmd_publish_fmod(
         // Likely the operator hasn't built owned modules for any of
         // the discovered targets yet.
         return Err(Error::Config(
-            "no fmods were published — run `make modules-all` first".into(),
+            "no fmods were published — run `fluxor modules build --all` first".into(),
         ));
     }
     if real_failure {

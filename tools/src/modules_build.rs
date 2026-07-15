@@ -158,6 +158,9 @@ struct Candidate {
     /// 1 (Source) / 2 (Transformer) / 3 (Sink) / 4 (EventHandler) /
     /// 5 (Protocol). Pulled from `manifest.toml::type` when present.
     type_id: u8,
+    /// Rust edition passed to `rustc --edition`. Defaults to "2021";
+    /// 2024 is blocked on the SDK adopting `#[unsafe(no_mangle)]`.
+    edition: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -174,7 +177,13 @@ struct ManifestRaw {
     type_str: Option<String>,
     #[serde(default)]
     entry: Option<String>,
+    #[serde(default)]
+    edition: Option<String>,
 }
+
+/// Editions `rustc` accepts today. Kept explicit so a manifest typo
+/// fails discovery loudly instead of surfacing as an opaque rustc error.
+const SUPPORTED_EDITIONS: &[&str] = &["2015", "2018", "2021", "2024"];
 
 const MODULE_DIRS: &[&str] = &["modules/drivers", "modules/foundation", "modules/app"];
 
@@ -211,11 +220,18 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
             let entry = dir.join(&entry_rel);
             if !entry.exists() {
                 // A manifest pointing at a missing entry — skip with a
-                // diagnostic. The `make modules` glob would have hit
+                // diagnostic. The module-discovery glob would have hit
                 // the same gap.
                 continue;
             }
             let type_id = resolve_type_id(&name, raw.type_str.as_deref());
+            let edition = raw.edition.unwrap_or_else(|| "2021".to_string());
+            if !SUPPORTED_EDITIONS.contains(&edition.as_str()) {
+                return Err(Error::Module(format!(
+                    "{}: unsupported edition {edition:?} (expected one of {SUPPORTED_EDITIONS:?})",
+                    manifest.display()
+                )));
+            }
             out.push(Candidate {
                 name,
                 dir: dir.clone(),
@@ -223,6 +239,7 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
                 manifest,
                 hardware_targets: raw.hardware_targets.unwrap_or_default(),
                 type_id,
+                edition,
             });
         }
     }
@@ -279,6 +296,11 @@ fn matches_target(c: &Candidate, target: &str, silicon: &str) -> bool {
 
 /// Public entry point. Drives discovery, per-target compile, and pack.
 pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
+    // Staged consumption state (SDK crates under `target/fluxor/<crate>/`,
+    // reached by module `#[path]` includes) is lockfile-recorded but lives in
+    // `target/`, so `cargo clean` wipes it; refill anything missing before
+    // building rather than demanding a manual re-sync.
+    crate::sync::ensure_materialized(&opts.project_root)?;
     let targets = match &opts.selector {
         TargetSelector::One(t) => vec![t.clone()],
         TargetSelector::All => resolve_all_targets(&opts.project_root)?,
@@ -465,6 +487,8 @@ fn compile_module_pic(
     let mut rustc = Command::new("rustc");
     rustc
         .arg("--crate-type=lib")
+        .arg("--edition")
+        .arg(&cand.edition)
         .arg("--target")
         .arg(spec.module_target)
         .arg("-O")
@@ -536,6 +560,8 @@ fn compile_module_wasm(
     let mut rustc = Command::new("rustc");
     rustc
         .arg("--crate-type=cdylib")
+        .arg("--edition")
+        .arg(&cand.edition)
         .arg("--target")
         .arg(spec.module_target)
         .arg("-C")
@@ -789,6 +815,7 @@ mod tests {
             manifest: PathBuf::new(),
             hardware_targets: vec![],
             type_id: 2,
+            edition: "2021".into(),
         };
         assert!(matches_target(&c, "rp2350", "rp2350"));
         assert!(matches_target(&c, "cm5", "bcm2712"));
@@ -803,6 +830,7 @@ mod tests {
             manifest: PathBuf::new(),
             hardware_targets: vec!["bcm2712".into()],
             type_id: 2,
+            edition: "2021".into(),
         };
         // Board target "cm5" matches via its silicon mapping to bcm2712.
         assert!(matches_target(&c, "cm5", "bcm2712"));
@@ -819,6 +847,7 @@ mod tests {
             manifest: PathBuf::new(),
             hardware_targets: vec!["cm5".into()],
             type_id: 2,
+            edition: "2021".into(),
         };
         // Manifest pinned to the board name (cm5) — silicon-keyed
         // match should still let it through when the user invokes

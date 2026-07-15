@@ -405,7 +405,7 @@ fn spawn_scenario(
         .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
     if !linux_bin.exists() {
         return Err(Error::Config(format!(
-            "fluxor-linux binary not found at {}. Run `make linux` first.",
+            "fluxor-linux binary not found at {}. Run `make build` first.",
             linux_bin.display()
         )));
     }
@@ -1011,6 +1011,10 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
     const QEMU_CONFIG_BLOB_ADDR: u64 = 0x4100_0000;
     const QEMU_MODULES_BLOB_ADDR: u64 = 0x4200_0000;
 
+    // Synced fmods and the runtime binary live under `target/`, which
+    // `cargo clean` wipes; refill lockfile-recorded holes before running.
+    crate::sync::ensure_materialized(&crate::project::root_for_config(config_path))?;
+
     let result = build_one(config_path, None, verbose)?;
 
     match result.family.as_str() {
@@ -1025,7 +1029,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
 
             if !linux_bin.exists() {
                 return Err(Error::Config(format!(
-                    "Linux binary not found at {}. Run 'make linux' first.",
+                    "Linux binary not found at {}. Run 'make build' first.",
                     linux_bin.display()
                 )));
             }
@@ -1076,7 +1080,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                     PathBuf::from(format!("target/fluxor/{}/modules", target_desc.id));
                 if !modules_dir.exists() {
                     return Err(Error::Config(format!(
-                        "Modules not found at {}. Run 'make modules TARGET={}' first.",
+                        "Modules not found at {}. Run 'fluxor modules build --target {}' first.",
                         modules_dir.display(),
                         target_desc.id
                     )));

@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "fluxor"
-version = "0.1.1"
+version = "0.0.1"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -1354,11 +1354,11 @@ dependencies = [
 
 [[package]]
 name = "fluxor-abi"
-version = "0.1.1"
+version = "0.0.1"
 
 [[package]]
 name = "fluxor-contracts"
-version = "0.1.1"
+version = "0.0.1"
 dependencies = [
  "serde",
 ]
@@ -1393,11 +1393,11 @@ dependencies = [
 
 [[package]]
 name = "fluxor-sdk"
-version = "0.1.1"
+version = "0.0.1"
 
 [[package]]
 name = "fluxor-tools"
-version = "0.1.1"
+version = "0.0.1"
 dependencies = [
  "base64",
  "clap",

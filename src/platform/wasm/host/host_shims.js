@@ -1860,6 +1860,54 @@ registerProcessor('pcm-ring', PcmRing);
       },
     };
 
+    // ── Camera source bridge (wasm_browser_camera) ───────────────────
+    // getUserMedia is the browser's only camera API, so capture is JS; the
+    // decode is the qr_scan module in the graph. We start the stream lazily
+    // on the first pull, draw each frame to a small offscreen canvas, and hand
+    // the wasm side a luma frame framed as [w:u16 LE][h:u16 LE][luma w*h].
+    const CAM_DIM = 160; // square capture; resolves a low-version token QR
+    let camState = null; // { video, canvas, ctx, ready }
+    function startCamera() {
+      const video = document.createElement('video');
+      video.autoplay = true; video.playsInline = true; video.muted = true;
+      const canvas = document.createElement('canvas');
+      canvas.width = CAM_DIM; canvas.height = CAM_DIM;
+      const st = { video, canvas, ctx: canvas.getContext('2d', { willReadFrequently: true }), ready: false };
+      camState = st;
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+        .then((stream) => { video.srcObject = stream; return video.play(); })
+        .then(() => { st.ready = true; })
+        .catch((err) => { console.error('[camera] getUserMedia:', err && err.message); });
+    }
+    const cameraShim = {
+      host_camera_frame: (bufPtr, bufLen) => {
+        if (!camState) { startCamera(); return 0; }
+        const st = camState;
+        if (!st.ready || !st.video.videoWidth) return 0;
+        const need = 4 + CAM_DIM * CAM_DIM;
+        if (bufLen < need) return 0;
+        st.ctx.drawImage(st.video, 0, 0, CAM_DIM, CAM_DIM);
+        const px = st.ctx.getImageData(0, 0, CAM_DIM, CAM_DIM).data;
+        const out = kview(bufPtr, need);
+        out[0] = CAM_DIM & 0xFF; out[1] = (CAM_DIM >> 8) & 0xFF;
+        out[2] = CAM_DIM & 0xFF; out[3] = (CAM_DIM >> 8) & 0xFF;
+        for (let i = 0; i < CAM_DIM * CAM_DIM; i++) {
+          out[4 + i] = (px[i * 4] * 0.30 + px[i * 4 + 1] * 0.59 + px[i * 4 + 2] * 0.11) | 0;
+        }
+        return need;
+      },
+    };
+
+    // Result sink (wasm_browser_scan_out): stash the decoded token for the page.
+    const scanOutShim = {
+      host_scan_result: (ptr, len) => {
+        const bytes = kview(ptr, len).slice();
+        const text = new TextDecoder().decode(bytes);
+        window.__fluxor_scan_result = text;
+        if (typeof window.onScanResult === 'function') { try { window.onScanResult(text); } catch (e) {} }
+      },
+    };
+
     // ── Image decode bridge (wasm_browser_image_codec) ───────────────
     const imageDecodes = new Map();
     let nextImageHandle = 1;
@@ -3160,6 +3208,8 @@ registerProcessor('pcm-ring', PcmRing);
         wsShim,
         audioShim,
         canvasShim,
+        cameraShim,
+        scanOutShim,
         terminalShim,
         imageShim,
         videoShim,

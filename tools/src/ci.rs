@@ -177,6 +177,19 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         check_lockfile_consistency(project_root)
     }));
 
+    // ───── Phase 1.8: ABI-surface pin ───────────────────────────────
+    //
+    // The checked-in ABI-surface pin (source hash + digest, mirrored in
+    // three files) must match what the current `modules/sdk` sources
+    // produce. A stale pin means built modules embed a wrong surface digest
+    // and generations pin to a surface that no longer exists. Only the
+    // fluxor kernel tree carries these sources; downstream projects skip.
+    if crate::abi_pin::has_abi_surface(project_root) {
+        results.push(run_step("abi-surface-pin", verbose, || {
+            check_abi_pin(project_root)
+        }));
+    }
+
     // ───── Phase 2: cargo unit + library tests ──────────────────────
     //
     // For fluxor itself, run from `tools/` rather than workspace
@@ -1107,6 +1120,23 @@ fn extract_missing_key_from_err(msg: &str) -> Option<String> {
     Some(after[..close].to_string())
 }
 
+/// Gate: the checked-in ABI-surface pin must match the current sources. Uses
+/// the same computation as `fluxor abi-regen` (read-only here); a mismatch is
+/// fixed by running that command.
+fn check_abi_pin(project_root: &Path) -> std::result::Result<(), String> {
+    let plan = crate::abi_pin::compute(project_root).map_err(|e| e.to_string())?;
+    let stale = plan.stale_sites().map_err(|e| e.to_string())?;
+    if stale.is_empty() {
+        Ok(())
+    } else {
+        let names: Vec<String> = stale.iter().map(|p| p.display().to_string()).collect();
+        Err(format!(
+            "ABI-surface pin stale — run `fluxor abi-regen`. Out-of-date: {}",
+            names.join(", ")
+        ))
+    }
+}
+
 /// Lockfile-consistency phase. Skips cleanly when:
 ///
 /// - the project has no `[dependencies]` table (no lockfile expected); or
@@ -1128,7 +1158,7 @@ fn check_lockfile_consistency(project_root: &Path) -> std::result::Result<(), St
         if crate::workspace::current_member(&ws, project_root).is_some() {
             eprintln!(
                 "note: live workspace mode active for this project root — \
-                 lockfile-consistency check skipped. Run `make update` after \
+                 lockfile-consistency check skipped. Run `fluxor update` after \
                  leaving workspace mode to refresh fluxor.lock against the registry."
             );
             return Ok(());
@@ -1208,7 +1238,8 @@ fn check_version_skew(project_root: &Path) -> std::result::Result<(), String> {
     }
     Err(format!(
         "fluxor.toml [required].fluxor.rev = {required_rev:?} but {source_label} HEAD is {current_rev:?}; \
-         bump the pin (or update {source_label}) so they match, then run `make setup` to refresh the installed CLI. \
+         bump the pin (or update {source_label}) so they match, then run \
+         `cargo install --locked --path tools` to refresh the installed CLI. \
          Consider switching to the preferred `abi = N` form — it only changes when the wire ABI breaks."
     ))
 }

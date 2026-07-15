@@ -158,7 +158,15 @@ pub const CONTENT_TYPES: &[&str] = &[
 /// config compiler validates each edge's granted ring against its
 /// class floor at build time; the kernel derives per-step pump
 /// budgets from it (`MODULE_FLOW_BUDGET`).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+///
+/// Deliberately does **not** derive `PartialOrd`/`Ord`: declaration
+/// order here is wire-stable (see the on-wire byte mapping in
+/// `kernel/config.rs`) and does not match the "how demanding is this
+/// edge" severity order the config validator actually needs — notably
+/// `Transaction` is declared last but ranks least-demanding after
+/// `Control`. Use [`RateClass::severity`] for any comparison; a derived
+/// `Ord` here would silently compare the wrong thing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum RateClass {
     Control = 0,
@@ -175,26 +183,43 @@ pub enum RateClass {
 impl RateClass {
     pub fn from_str_opt(s: &str) -> Option<RateClass> {
         match s {
-            "control" => Some(RateClass::Control),
-            "audio" => Some(RateClass::Audio),
-            "video" => Some(RateClass::Video),
-            "bulk" => Some(RateClass::Bulk),
-            "transaction" => Some(RateClass::Transaction),
+            "control" => Some(Control),
+            "audio" => Some(Audio),
+            "video" => Some(Video),
+            "bulk" => Some(Bulk),
+            "transaction" => Some(Transaction),
             _ => None,
         }
     }
     pub fn as_str(&self) -> &'static str {
         match self {
-            RateClass::Control => "control",
-            RateClass::Audio => "audio",
-            RateClass::Video => "video",
-            RateClass::Bulk => "bulk",
-            RateClass::Transaction => "transaction",
+            Control => "control",
+            Audio => "audio",
+            Video => "video",
+            Bulk => "bulk",
+            Transaction => "transaction",
         }
+    }
+    /// How demanding this class is to provision for, least to most:
+    /// `Control < Transaction < Audio < Video < Bulk`. The single
+    /// source of truth for "does edge class A exceed cap B" — never
+    /// compare `RateClass` values any other way.
+    pub fn severity(&self) -> u8 {
+        match self {
+            Control => 0,
+            Transaction => 1,
+            Audio => 2,
+            Video => 3,
+            Bulk => 4,
+        }
+    }
+    /// True if `self` demands more than `cap` allows.
+    pub fn exceeds(&self, cap: RateClass) -> bool {
+        self.severity() > cap.severity()
     }
 }
 
-use RateClass::{Audio, Control, Video};
+use RateClass::{Audio, Bulk, Control, Transaction, Video};
 
 /// Default rate class per content type — POSITION-PARALLEL with
 /// `CONTENT_TYPES` (compile-time length guard below). These are
@@ -255,15 +280,15 @@ const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
 /// validation error, not a per-edge arithmetic failure.
 pub fn rate_class_floor(class: RateClass, embedded: bool) -> Option<u32> {
     match (class, embedded) {
-        (RateClass::Control, false) => Some(64 * 1024),
-        (RateClass::Audio, false) => Some(1024 * 1024),
-        (RateClass::Video, false) => Some(16 * 1024 * 1024),
-        (RateClass::Bulk, false) => Some(64 * 1024 * 1024),
-        (RateClass::Transaction, false) => Some(1024 * 1024),
-        (RateClass::Control, true) => Some(8 * 1024),
-        (RateClass::Audio, true) => Some(256 * 1024),
-        (RateClass::Transaction, true) => Some(256 * 1024),
-        (RateClass::Video, true) | (RateClass::Bulk, true) => None,
+        (Control, false) => Some(64 * 1024),
+        (Audio, false) => Some(1024 * 1024),
+        (Video, false) => Some(16 * 1024 * 1024),
+        (Bulk, false) => Some(64 * 1024 * 1024),
+        (Transaction, false) => Some(1024 * 1024),
+        (Control, true) => Some(8 * 1024),
+        (Audio, true) => Some(256 * 1024),
+        (Transaction, true) => Some(256 * 1024),
+        (Video, true) | (Bulk, true) => None,
     }
 }
 

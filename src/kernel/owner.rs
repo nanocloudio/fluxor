@@ -242,6 +242,31 @@ impl OwnerTable {
         }
     }
 
+    /// Resolve the live owner handle for a durable `pod_uid` — the bridge from
+    /// the persistent identity (the Pod UID, rfc_k8s.md §6.5) to the runtime
+    /// capability. A provider admitting owner-scoped work (e.g. the `workload`
+    /// host-process backend spawning a Pod's container) references the
+    /// plan-allocated owner this way rather than allocating one itself. Returns
+    /// `None` if no non-`Free` slot carries that uid. The caller still gates on
+    /// [`authorize_admit`](Self::authorize_admit) — a `Draining`/`Revoked`
+    /// owner resolves but must not admit new work.
+    pub fn find_by_uid(&self, pod_uid: [u8; 16]) -> Option<OwnerHandle> {
+        #[allow(
+            clippy::reversed_empty_ranges,
+            reason = "empty by design when MAX_OWNERS == 1 (single-tenant)"
+        )]
+        for slot in 1..MAX_OWNERS {
+            let e = &self.entries[slot];
+            if !matches!(e.state, OwnerState::Free) && e.pod_uid == pod_uid {
+                return Some(OwnerHandle {
+                    slot: slot as u16,
+                    generation: e.generation,
+                });
+            }
+        }
+        None
+    }
+
     /// True when `h` may keep USING resources it already holds — established
     /// connections, held provider handles, committed queue slots. Both `Active`
     /// and `Draining` qualify: a draining owner keeps serving until revoked

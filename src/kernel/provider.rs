@@ -131,15 +131,23 @@ pub mod contract {
     /// ENOSYS-denies. See sector `.context/architecture.md` §5.
     pub const PROC: u16 = 0x0016;
 
-    /// Versioned, watchable keyspace store — opcode class 0x17xx. A
-    /// control-plane KV surface (put/get/delete with `if_match` CAS, list with
-    /// a revision watermark, subscribe/drain change streams) advertising the
-    /// `fence` contract's `RevisionMonotone`/`ViewConsistent`. An honest
-    /// sibling of the read-only `STORAGE_NAMESPACE`/`STORAGE_OBJECT` surfaces —
-    /// a durable versioned store (the fluxor-native etcd stand-in), not a
-    /// filesystem or HTTP view. Host-linux only; the store core lives in
-    /// `src/platform/linux/keyspace.rs`.
-    pub const KEYSPACE: u16 = 0x0017;
+    // 0x0017 unused (reserved — do not reassign): a versioned watchable KV is
+    // distributed-state logic, not a fluxor primitive; it lives in lattice, and
+    // nanocloud consumes it there. See `.context/fluxor_nanocloud.md` §3.
+
+    // 0x0018 and 0x0019 unused (reserved — do not reassign): host isolation is
+    // expressed through WORKLOAD (0x1A). The oci namespace/cgroup mechanism is
+    // WORKLOAD's Linux host-process backend (`oci_spawn` in
+    // `src/platform/linux/oci.rs`). See `.context/fluxor_nanocloud.md`.
+
+    /// Platform-neutral isolated-workload surface — opcode class 0x1Axx. One
+    /// contract for "run an isolated workload with a declared capability
+    /// envelope," realized by two placement-resolved backends: an fmod-graph
+    /// backend (MPU/EL0 + owner/lease, bare metal) and a host-process backend
+    /// (namespaces/cgroups/veth, Linux). The consumer never names a platform.
+    /// Gated by `requires_contract = "workload"` AND `platform_raw`; handles are
+    /// `FD_TAG_WORKLOAD`-tagged. See `.context/fluxor_nanocloud.md`.
+    pub const WORKLOAD: u16 = 0x001A;
 
     // Short-name aliases used by kernel-side dispatchers (`GPIO`, `SPI`,
     // `PIO`, `UART`, `ADC`, `PWM`). Same numeric values as the `HAL_*`
@@ -371,6 +379,7 @@ fn fd_tag_contract(handle: i32) -> Option<ContractId> {
         _t if _t == fd::FD_TAG_STORAGE_OBJECT => Some(contract::STORAGE_OBJECT),
         _t if _t == fd::FD_TAG_HAL_PIO => Some(contract::HAL_PIO),
         _t if _t == fd::FD_TAG_PROC => Some(contract::PROC),
+        _t if _t == fd::FD_TAG_WORKLOAD => Some(contract::WORKLOAD),
         // USB host (scaffold). No live producer yet — the kernel-side
         // USB host stack is unimplemented, so `provider_open(USB_HOST,
         // ...)` never returns a tagged handle today. The lookup is
@@ -442,6 +451,7 @@ fn contract_to_tag(contract: ContractId) -> Option<i32> {
         c if c == contract::HAL_ADC => Some(fd::FD_TAG_HAL_ADC),
         c if c == contract::HAL_PWM => Some(fd::FD_TAG_HAL_PWM),
         c if c == contract::HAL_PIO => Some(fd::FD_TAG_HAL_PIO),
+        c if c == contract::WORKLOAD => Some(fd::FD_TAG_WORKLOAD),
         c if c == contract::STORAGE_NAMESPACE => Some(fd::FD_TAG_STORAGE_NAMESPACE),
         c if c == contract::STORAGE_OBJECT => Some(fd::FD_TAG_STORAGE_OBJECT),
         c if c == contract::USB_HOST => Some(fd::FD_TAG_USB_HOST),

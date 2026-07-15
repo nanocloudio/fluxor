@@ -927,12 +927,13 @@ fn resolve_edge_classes(
 /// telemetry edge from the same producer.
 fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
     // Must match the kernel's channel/scheduler cap (src/kernel/channel.rs +
-    // scheduler/mod.rs = 2 MiB). This is the config-build clamp: it was stale at
+    // scheduler/mod.rs = 4 MiB). This is the config-build clamp: it was stale at
     // 256 KiB while the kernel allowed 2 MiB, so a wiring asking for 2 MiB (a
     // GPU-offload frame channel — dense frames near 1 MiB) was silently clamped
     // to 256 KiB, and a frame larger than the channel gated across ticks and
-    // FROZE the display.
-    const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+    // FROZE the display. Raised to 4 MiB to match the kernel (chunk's GPU command
+    // ring carries a chunk mesh + far-terrain LOD ring in one step).
+    const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
     let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
         Some(w) => w,
         None => return Vec::new(),

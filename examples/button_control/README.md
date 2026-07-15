@@ -29,8 +29,8 @@ BOOTSEL variant driving an LED instead of audio.
 ## Run
 
 ```sh
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/button_control/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/button_control/pico2w.yaml
 # wire a button to GPIO21 → GND; tap to play
 ```
 

@@ -34,8 +34,8 @@ fluxor run examples/audio_player/wasm.yaml
 # open http://localhost:9876/, tap to play
 
 # pico2w with SD card
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/audio_player/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/audio_player/pico2w.yaml
 # drop audio files into /audio/ on the SD card, press BOOTSEL
 ```
 

@@ -1,0 +1,19 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser camera source. Starts getUserMedia lazily and emits grayscale frames,
+# framed as `[w:u16 LE][h:u16 LE][luma w*h]`, on the output port — the format the
+# qr_scan module reassembles. getUserMedia is the browser's only camera API, so
+# capture is JS (the host shim's `host_camera_frame` import); the QR decode is the
+# qr_scan module in the graph, not JS.
+
+[[ports]]
+name = "frames"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; carries media samples, not a measurable on-device byte stream"

@@ -18,7 +18,7 @@ consumes that stream and renders a live dashboard.
 ## Run
 
 ```sh
-make firmware TARGET=cm5 && make modules TARGET=bcm2712
+make firmware TARGET=cm5 && fluxor modules build --target bcm2712
 fluxor combine -o kernel8.img target/cm5/firmware.bin examples/log_net/cm5.yaml
 
 # Capture (any host on the same L2 segment)

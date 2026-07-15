@@ -756,17 +756,16 @@ const STORAGE_FAMILY: u32 = (1u32 << crate::kernel::provider::contract::STORAGE_
 /// ceilings so an app/Source/Transformer module (e.g. sector's `do`) CAN declare it; this
 /// is a ceiling only, the manifest `[[resources]]` gate still grants per-module.
 const PROC_CONTRACT: u32 = 1u32 << 0x16;
-/// KEYSPACE (0x17, bit 23) — the mutating control-plane keyspace store. A
-/// distinct ceiling entry rather than part of `STORAGE_FAMILY` (which is the
-/// read-only namespace/object surfaces): a service-tier reconciler CAN declare
-/// it, but folding a writable store into the read-only family would silently
-/// widen what the storage grant reaches. Ceiling only — the manifest
-/// `[[resources]]` gate still grants per-module.
-const KEYSPACE_CONTRACT: u32 = 1u32 << 0x17;
+/// WORKLOAD (0x1A, bit 26) — the platform-neutral isolated-workload surface,
+/// the sole host-isolation contract. Service-tier ceiling so a node module (the kubelet) CAN declare
+/// it; the manifest `[[resources]]` gate still grants per-module, AND every
+/// 0x1Axx op additionally requires the `platform_raw` permission (spawning
+/// isolated workloads is privileged). Ceiling only.
+const WORKLOAD_CONTRACT: u32 = 1u32 << 0x1A;
 pub const CAP_CONTRACT_MASK: [u32; 4] = [
-    0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT | KEYSPACE_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + KEYSPACE
-    0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT | KEYSPACE_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
-    0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT | KEYSPACE_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
+    0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD
+    0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
+    0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
     0xFFFF_FFFF,                                                      // CAP_FULL: any contract
 ];
 
@@ -866,6 +865,12 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
     // opcode for a non-privileged op (none planned) would need to add
     // a fine-grained match arm here.
     if (0x1500..=0x15FF).contains(&op) {
+        return Some(PLATFORM_RAW);
+    }
+    // Isolated-workload surface (workload, 0x1Axx) — spawning owner-bound
+    // isolated workloads (namespaces/cgroups) is privileged; gated by the same
+    // platform_raw bit as raw DMA/MMIO/PCIe.
+    if (0x1A00..=0x1AFF).contains(&op) {
         return Some(PLATFORM_RAW);
     }
     if !(0x0C00..=0x0CFF).contains(&op) {

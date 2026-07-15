@@ -31,8 +31,8 @@ resolver configured in the `dns` module's `upstream:` field.
 ## Run
 
 ```sh
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/dns_server/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/dns_server/pico2w.yaml
 # Note the IP the pico reports over UART, then:
 dig @<pico-ip> pico.lan         # local A record (configured table)
 dig @<pico-ip> example.com      # forwarded upstream

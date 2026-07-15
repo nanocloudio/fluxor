@@ -26,7 +26,10 @@
 /// One pod's tracked lifecycle latches, keyed by Pod UID. The kernel
 /// snapshot is instantaneous; phase transitions (activation time, terminal
 /// reason, restart count) are latched here across snapshots.
-struct PodTrack {
+use super::owner_drain::{drain_overlay_for_status, drain_terminal_pods_json};
+use super::providers::linux_net_bound_endpoints;
+
+pub struct PodTrack {
     restart_count: u32,
     /// Present once the aggregate has been observed Running.
     started_at_unix: Option<u64>,
@@ -38,7 +41,7 @@ struct PodTrack {
 
 /// Writes `owner_status.json` next to the published plan. Created only in
 /// node-agent mode; `tick()` is cheap when nothing changed (string compare).
-struct OwnerStatusWriter {
+pub struct OwnerStatusWriter {
     path: std::path::PathBuf,
     tracks: std::collections::HashMap<[u8; 16], PodTrack>,
     /// Per-pod carryover recovered from a previous runtime process's status
@@ -46,7 +49,7 @@ struct OwnerStatusWriter {
     /// A pod that STARTED under the previous process re-activates under this
     /// one — that first activation is a restart. One that never got past
     /// Activating (e.g. ActivationBackOff) hasn't restarted anything.
-    seeded: std::collections::HashMap<String, SeededPod>,
+    pub seeded: std::collections::HashMap<String, SeededPod>,
     /// This process's start time (clock ticks since boot), written into the
     /// file so the reader can tell this writer from a recycled PID.
     pid_start_ticks: u64,
@@ -59,7 +62,7 @@ struct OwnerStatusWriter {
 
 impl OwnerStatusWriter {
     /// `plan_path` is the FLUXOR_PLAN file; the status file lives beside it.
-    fn new(plan_path: &std::path::Path) -> Self {
+    pub fn new(plan_path: &std::path::Path) -> Self {
         let dir = plan_path.parent().unwrap_or(std::path::Path::new("."));
         let path = dir.join("owner_status.json");
         let seeded = read_seed_restarts(&path);
@@ -75,7 +78,7 @@ impl OwnerStatusWriter {
     /// Pods whose previous-process status file already carried a TERMINAL
     /// state (lowercase-hex UIDs). The boot-time drain-forfeit synthesis skips
     /// these — a persisted `Completed` is never rewritten as by-restart.
-    fn seeded_terminated_uids(&self) -> std::collections::HashSet<String> {
+    pub fn seeded_terminated_uids(&self) -> std::collections::HashSet<String> {
         self.seeded
             .iter()
             .filter(|(_, seed)| seed.terminated)
@@ -86,10 +89,10 @@ impl OwnerStatusWriter {
     /// Snapshot the kernel's per-owner aggregates, roll the lifecycle
     /// latches forward, and atomically replace the status file if the
     /// derived state changed.
-    fn tick(&mut self) {
+    pub fn tick(&mut self) {
         let mut recs =
-            [fluxor::kernel::scheduler::OwnerLiveStatus::EMPTY; fluxor::kernel::owner::MAX_OWNERS];
-        let n = fluxor::kernel::scheduler::owner_live_snapshot(&mut recs);
+            [crate::kernel::scheduler::OwnerLiveStatus::EMPTY; crate::kernel::owner::MAX_OWNERS];
+        let n = crate::kernel::scheduler::owner_live_snapshot(&mut recs);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -116,7 +119,7 @@ impl OwnerStatusWriter {
             pods_json.push_str("\n    ");
             pods_json.push_str(&entry);
         }
-        let plan_generation = fluxor::kernel::owner_plan::last_applied_generation();
+        let plan_generation = crate::kernel::owner_plan::last_applied_generation();
         if self
             .last_emit
             .as_ref()
@@ -140,7 +143,10 @@ impl OwnerStatusWriter {
             Err(e) => {
                 // Non-fatal: the runtime must keep stepping even when the
                 // status volume misbehaves; retry on the next change.
-                log::warn!("[owner] status write to {} failed: {e}", self.path.display());
+                log::warn!(
+                    "[owner] status write to {} failed: {e}",
+                    self.path.display()
+                );
             }
         }
     }
@@ -154,7 +160,7 @@ impl OwnerStatusWriter {
 /// (`ExternalProcessExited`, `Evicted`, `FluxorReservationInvalid`) are not
 /// emitted here — the reader enforces the full §7.2 set.
 fn terminated_reason_for_fault(kind: u8) -> &'static str {
-    use fluxor::kernel::step_guard::fault_type;
+    use crate::kernel::step_guard::fault_type;
     match kind {
         fault_type::TIMEOUT => "LivenessFailure",
         _ => "GraphNodeFault",
@@ -164,8 +170,12 @@ fn terminated_reason_for_fault(kind: u8) -> &'static str {
 /// Roll the per-pod latches forward against the instantaneous kernel
 /// snapshot and render the `pods` array body. Pure of I/O and clock —
 /// unit-testable.
-fn derive_pods_json(
-    recs: &[fluxor::kernel::scheduler::OwnerLiveStatus],
+#[allow(
+    clippy::implicit_hasher,
+    reason = "internal platform surface; callers only ever pass std's default hasher"
+)]
+pub fn derive_pods_json(
+    recs: &[crate::kernel::scheduler::OwnerLiveStatus],
     tracks: &mut std::collections::HashMap<[u8; 16], PodTrack>,
     seeded: &std::collections::HashMap<String, SeededPod>,
     now_unix: u64,
@@ -229,7 +239,11 @@ fn derive_pods_json(
             } else {
                 rec.last_fault_kind as i32
             };
-            track.terminated = Some((terminated_reason_for_fault(rec.last_fault_kind), code, now_unix));
+            track.terminated = Some((
+                terminated_reason_for_fault(rec.last_fault_kind),
+                code,
+                now_unix,
+            ));
         }
         if !any_terminated && all_finished && track.terminated.is_none() {
             track.terminated = Some(("Completed", 0, now_unix));
@@ -252,8 +266,7 @@ fn derive_pods_json(
         // A draining owner stops reporting ready while it is still serving
         // (rfc_owner_drain_and_logs.md §3.1) — no new phase value, just the
         // readiness withdrawal the terminating window needs.
-        let draining =
-            rec.owner_state == fluxor::kernel::scheduler::OWNER_STATE_DRAINING;
+        let draining = rec.owner_state == crate::kernel::scheduler::OWNER_STATE_DRAINING;
         let ready = ready && !draining;
         let mut e = String::new();
         let _ = write!(
@@ -323,17 +336,17 @@ fn derive_pods_json(
 }
 
 /// One pod's carryover from a previous runtime process's status file.
-struct SeededPod {
-    restart_count: u32,
+pub struct SeededPod {
+    pub restart_count: u32,
     /// The pod had actually started there: its entry carried a
     /// `started_at` stamp, or a terminal state (which counts as prior
     /// activity — a re-run after termination is a restart even in-process).
-    started: bool,
+    pub started: bool,
     /// The previous process persisted a TERMINAL state for this pod. Suppresses
     /// the boot-time drain-timeout-by-restart synthesis: a clean `Completed`
     /// from before the restart is never rewritten
     /// (rfc_owner_drain_and_logs.md §3.6/§3.7 writer seeding).
-    terminated: bool,
+    pub terminated: bool,
 }
 
 /// Recover per-pod carryover from a previous runtime process's status file.
@@ -342,7 +355,7 @@ struct SeededPod {
 /// opens with `"pod_uid_hex":"…"` and its runtime carries
 /// `"restart_count":N` plus optional `started_at`/`terminated` — is
 /// reliable without a JSON parser dependency.
-fn read_seed_restarts(path: &std::path::Path) -> std::collections::HashMap<String, SeededPod> {
+pub fn read_seed_restarts(path: &std::path::Path) -> std::collections::HashMap<String, SeededPod> {
     const UID_KEY: &str = "\"pod_uid_hex\":\"";
     let mut seeds = std::collections::HashMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -411,358 +424,10 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod owner_status_tests {
-    use super::*;
-    use fluxor::kernel::scheduler::OwnerLiveStatus;
-    use fluxor::kernel::step_guard::fault_type;
-
-    fn uid(n: u8) -> [u8; 16] {
-        let mut u = [0u8; 16];
-        u[0] = n;
-        u
-    }
-
-    fn rec(n: u8, slot: u16, generation: u32) -> OwnerLiveStatus {
-        OwnerLiveStatus {
-            pod_uid: uid(n),
-            slot,
-            generation,
-            modules_total: 2,
-            modules_loaded: 2,
-            ..OwnerLiveStatus::EMPTY
-        }
-    }
-
-    #[test]
-    fn rfc3339_matches_known_instants() {
-        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
-        // date -u -d @1783275045 → 2026-07-05T18:10:45Z
-        assert_eq!(rfc3339_utc(1_783_275_045), "2026-07-05T18:10:45Z");
-        assert_eq!(rfc3339_utc(951_827_696), "2000-02-29T12:34:56Z");
-    }
-
-    #[test]
-    fn seed_distinguishes_terminated_pods_for_by_restart_suppression() {
-        // Exactly the writer's own emission shape (read_seed_restarts scans it
-        // by substring): pod AA terminated (its outcome is persisted and must
-        // not be rewritten as by-restart after a restart), pod BB still running.
-        let dir = std::env::temp_dir().join(format!(
-            "fluxor-seed-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        let plan = dir.join("current.plan");
-        let body = concat!(
-            "{\n  \"version\": 1,\n  \"pid\": 1,\n  \"pid_start_ticks\": 2,\n",
-            "  \"plan_generation\": 3,\n  \"written_at\": \"x\",\n  \"pods\": [\n",
-            "    {\"pod_uid_hex\":\"aa000000000000000000000000000000\",\"slot\":1,",
-            "\"owner_generation\":1,\"runtime\":{\"phase\":\"Terminated\",",
-            "\"ready\":false,\"started\":false,\"restart_count\":0,",
-            "\"terminated\":{\"reason\":\"Completed\",\"exit_code\":0,",
-            "\"signal\":null,\"finished_at\":\"x\"}}},\n",
-            "    {\"pod_uid_hex\":\"bb000000000000000000000000000000\",\"slot\":2,",
-            "\"owner_generation\":1,\"runtime\":{\"phase\":\"Running\",",
-            "\"ready\":true,\"started\":true,\"restart_count\":0,",
-            "\"started_at\":\"x\"}}\n  ]\n}\n",
-        );
-        std::fs::write(dir.join("owner_status.json"), body).expect("write");
-
-        let writer = OwnerStatusWriter::new(&plan);
-        let terminated = writer.seeded_terminated_uids();
-        assert!(terminated.contains("aa000000000000000000000000000000"));
-        assert!(!terminated.contains("bb000000000000000000000000000000"));
-        // The started/restart seed semantics are unchanged by the new flag.
-        assert!(writer.seeded["aa000000000000000000000000000000"].started);
-        assert!(writer.seeded["bb000000000000000000000000000000"].started);
-        assert!(!writer.seeded["bb000000000000000000000000000000"].terminated);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bound_endpoints_are_attributed_to_the_owning_pod_only() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        // Pod A (slot 1 gen 7) has a tcp listener + a udp socket; pod B none.
-        let bound = [(1u16, 7u32, 1u8, 8080u16), (1, 7, 2, 5353)];
-        let j = derive_pods_json(
-            &[rec(0xaa, 1, 7), rec(0xbb, 2, 3)],
-            &mut tracks,
-            &seeds,
-            100,
-            &bound,
-        );
-        let (a, b) = j.split_at(j.find("bb000000").unwrap());
-        assert!(a.contains(
-            "\"bound_endpoints\":[{\"protocol\":\"tcp\",\"port\":8080},{\"protocol\":\"udp\",\"port\":5353}]"
-        ));
-        assert!(
-            !b.contains("bound_endpoints"),
-            "port-less pod's output is unchanged"
-        );
-        // A stale-generation entry (slot reused) never attributes.
-        let mut tracks2 = std::collections::HashMap::new();
-        let j = derive_pods_json(
-            &[rec(0xcc, 1, 8)],
-            &mut tracks2,
-            &seeds,
-            100,
-            &[(1, 7, 1, 8080)],
-        );
-        assert!(!j.contains("bound_endpoints"));
-    }
-
-    #[test]
-    fn draining_owner_emits_owner_state_and_withdraws_readiness() {
-        use fluxor::kernel::scheduler::OWNER_STATE_DRAINING;
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-
-        // A healthy owner that is NOT draining emits no owner_state field and is
-        // ready — output stays byte-identical to before this change.
-        let healthy = [rec(0xaa, 1, 7)];
-        let j = derive_pods_json(&healthy, &mut tracks, &seeds, 100, &[]);
-        assert!(!j.contains("owner_state"));
-        assert!(j.contains("\"ready\":true"));
-
-        // Flip the same owner to Draining with a deadline: owner_state appears,
-        // readiness withdraws (still serving), drain fields present.
-        let mut draining = rec(0xbb, 2, 3);
-        draining.owner_state = OWNER_STATE_DRAINING;
-        draining.drain_deadline_unix = 1_783_275_045;
-        draining.drain_remaining_secs = 12;
-        let j = derive_pods_json(&[draining], &mut tracks, &seeds, 100, &[]);
-        assert!(j.contains("\"owner_state\":\"Draining\""));
-        assert!(j.contains("\"drain_deadline_unix\":1783275045"));
-        assert!(j.contains("\"drain_remaining_secs\":12"));
-        assert!(j.contains("\"ready\":false"));
-        // Phase itself stays in the frozen vocabulary.
-        assert!(j.contains("\"phase\":\"Running\""));
-    }
-
-    #[test]
-    fn co_resident_fault_terminates_only_the_owning_pod() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        let healthy = [rec(0xaa, 1, 7), rec(0xbb, 2, 3)];
-        let j = derive_pods_json(&healthy, &mut tracks, &seeds, 100, &[]);
-        assert_eq!(j.matches("\"phase\":\"Running\"").count(), 2);
-        assert!(j.contains("\"ready\":true"));
-
-        // Pod A's module terminates (STEP_ERROR); pod B untouched.
-        let mut faulted = healthy;
-        faulted[0].modules_terminated = 1;
-        faulted[0].last_fault_kind = fault_type::STEP_ERROR;
-        let j = derive_pods_json(&faulted, &mut tracks, &seeds, 200, &[]);
-        let (a, b) = j.split_at(j.find("bb000000").unwrap());
-        assert!(a.contains("\"phase\":\"Terminated\""));
-        assert!(a.contains("\"reason\":\"GraphNodeFault\""));
-        assert!(a.contains("\"exit_code\":2"));
-        assert!(a.contains("\"finished_at\":\"1970-01-01T00:03:20Z\""));
-        assert!(b.contains("\"phase\":\"Running\"") && b.contains("\"ready\":true"));
-    }
-
-    #[test]
-    fn internal_retry_is_unready_not_a_restart() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-
-        // Module mid-retry: aggregate stays Running, unready, restart_count 0.
-        r[0].modules_recovering = 1;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"phase\":\"Running\""));
-        assert!(j.contains("\"ready\":false"));
-        assert!(j.contains("\"restart_count\":0"));
-
-        // Retry succeeded: ready again, still no restart counted.
-        r[0].modules_recovering = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 300, &[]);
-        assert!(j.contains("\"ready\":true"));
-        assert!(j.contains("\"restart_count\":0"));
-    }
-
-    #[test]
-    fn aggregate_reactivation_increments_restart_count() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        let mut r = [rec(0xaa, 1, 7)];
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        assert!(j.contains("\"restart_count\":0"));
-        assert!(j.contains("\"started_at\":\"1970-01-01T00:01:40Z\""));
-
-        // Terminal fault…
-        r[0].modules_terminated = 1;
-        r[0].last_fault_kind = fault_type::TIMEOUT;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"phase\":\"Terminated\""));
-        assert!(j.contains("\"restart_count\":0"), "termination isn't a restart yet");
-
-        // …graph rebuilt, owner re-activated → ONE aggregate restart.
-        r[0].modules_terminated = 0;
-        r[0].last_fault_kind = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 300, &[]);
-        assert!(j.contains("\"phase\":\"Running\""));
-        assert!(j.contains("\"restart_count\":1"));
-        assert!(j.contains("\"started_at\":\"1970-01-01T00:05:00Z\""), "re-stamped");
-    }
-
-    #[test]
-    fn generation_bump_is_a_reactivation() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        derive_pods_json(&[rec(0xaa, 1, 7)], &mut tracks, &seeds, 100, &[]);
-        let j = derive_pods_json(&[rec(0xaa, 1, 9)], &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"owner_generation\":9"));
-        assert!(j.contains("\"restart_count\":1"));
-    }
-
-    #[test]
-    fn clean_completion_is_completed_exit_zero() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        r[0].modules_finished = 2;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"reason\":\"Completed\""));
-        assert!(j.contains("\"exit_code\":0"));
-    }
-
-    #[test]
-    fn fault_kind_maps_to_the_specific_terminated_reason() {
-        let seeds = std::collections::HashMap::new();
-
-        // A step-deadline timeout is the runtime's liveness enforcement.
-        let mut tracks = std::collections::HashMap::new();
-        let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        r[0].modules_terminated = 1;
-        r[0].last_fault_kind = fault_type::TIMEOUT;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"reason\":\"LivenessFailure\""), "{j}");
-
-        // A step error (module returned Err) is a graph-node fault.
-        let mut tracks = std::collections::HashMap::new();
-        let mut r = [rec(0xbb, 2, 3)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        r[0].modules_terminated = 1;
-        r[0].last_fault_kind = fault_type::STEP_ERROR;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"reason\":\"GraphNodeFault\""), "{j}");
-
-        // A hard fault is likewise a graph-node fault.
-        let mut tracks = std::collections::HashMap::new();
-        let mut r = [rec(0xcc, 3, 1)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        r[0].modules_terminated = 1;
-        r[0].last_fault_kind = fault_type::HARD_FAULT;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"reason\":\"GraphNodeFault\""), "{j}");
-    }
-
-    #[test]
-    fn seed_roundtrip_survives_runtime_restart() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        let mut r = [rec(0xaa, 1, 7)];
-        derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        r[0].modules_terminated = 1;
-        derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        r[0].modules_terminated = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 300, &[]);
-        assert!(j.contains("\"restart_count\":1"));
-
-        // Write what the runtime would write, re-seed as a fresh process.
-        let dir = std::env::temp_dir().join(format!("fluxor-ostat-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("owner_status.json");
-        std::fs::write(&path, format!("{{\"pods\": [{j}]}}")).unwrap();
-        let seeds2 = read_seed_restarts(&path);
-        let seed = &seeds2["aa000000000000000000000000000000"];
-        assert_eq!(seed.restart_count, 1);
-        assert!(seed.started);
-
-        // First activation under the new process = one more restart.
-        let mut tracks2 = std::collections::HashMap::new();
-        let j2 = derive_pods_json(&[rec(0xaa, 1, 7)], &mut tracks2, &seeds2, 400, &[]);
-        assert!(j2.contains("\"restart_count\":2"));
-        // A pod unknown to the previous process starts at zero.
-        let j3 = derive_pods_json(&[rec(0xbb, 2, 1)], &mut tracks2, &seeds2, 500, &[]);
-        assert!(j3.contains("\"restart_count\":0"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn never_started_pod_does_not_restart_across_runtime_restart() {
-        // Previous process: the pod was stuck in ActivationBackOff (one of
-        // two modules failed to instantiate) — never started.
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        let mut r = [rec(0xaa, 1, 7)];
-        r[0].modules_loaded = 1;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        assert!(j.contains("\"waiting_reason\":\"ActivationBackOff\""));
-
-        let dir = std::env::temp_dir().join(format!("fluxor-ostat-ns-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("owner_status.json");
-        std::fs::write(&path, format!("{{\"pods\": [{j}]}}")).unwrap();
-        let seeds2 = read_seed_restarts(&path);
-        assert!(!seeds2["aa000000000000000000000000000000"].started);
-
-        // New process: the pod finally loads fully. That is its FIRST
-        // activation, not a restart.
-        let mut tracks2 = std::collections::HashMap::new();
-        r[0].modules_loaded = 2;
-        let j2 = derive_pods_json(&r, &mut tracks2, &seeds2, 200, &[]);
-        assert!(j2.contains("\"phase\":\"Running\""));
-        assert!(j2.contains("\"restart_count\":0"), "{j2}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn uninstantiated_owner_is_activating() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        let mut r = [rec(0xaa, 1, 7)];
-        r[0].modules_total = 0;
-        r[0].modules_loaded = 0;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        assert!(j.contains("\"phase\":\"Activating\""));
-        assert!(j.contains("\"started\":false"));
-        assert!(!j.contains("started_at"), "not started yet");
-        assert!(!j.contains("waiting_reason"), "nothing failed — plain Activating");
-    }
-
-    #[test]
-    fn partial_instantiation_is_activation_backoff_not_running() {
-        let mut tracks = std::collections::HashMap::new();
-        let seeds = std::collections::HashMap::new();
-        // One of two planned modules failed to instantiate.
-        let mut r = [rec(0xaa, 1, 7)];
-        r[0].modules_loaded = 1;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 100, &[]);
-        assert!(j.contains("\"phase\":\"Activating\""), "{j}");
-        assert!(j.contains("\"ready\":false"));
-        assert!(j.contains("\"waiting_reason\":\"ActivationBackOff\""));
-        assert!(!j.contains("started_at"), "never activated");
-
-        // The missing module loads (e.g. rebuild succeeds): Running, ready.
-        r[0].modules_loaded = 2;
-        let j = derive_pods_json(&r, &mut tracks, &seeds, 200, &[]);
-        assert!(j.contains("\"phase\":\"Running\""));
-        assert!(j.contains("\"ready\":true"));
-        assert!(!j.contains("waiting_reason"));
-        assert!(j.contains("\"restart_count\":0"), "activation, not a restart");
-    }
-}
-
 /// RFC 3339 UTC timestamp from unix seconds (Howard Hinnant's
 /// civil-from-days), so the status file carries orchestrator-consumable
 /// times without a date-time dependency.
-fn rfc3339_utc(unix_secs: u64) -> String {
+pub fn rfc3339_utc(unix_secs: u64) -> String {
     let days = (unix_secs / 86_400) as i64;
     let rem = unix_secs % 86_400;
     let z = days + 719_468;

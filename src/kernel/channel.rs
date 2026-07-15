@@ -404,11 +404,12 @@ pub fn channel_open_for_module(
     // power-of-two capacity) is a wiring bug and gets a deterministic
     // rejection.
     const MIN_CHAN_BYTES: usize = 64;
-    // Matches the scheduler's normalisation cap. Raised 256 KiB -> 2 MiB so a
-    // whole app video/GPU frame (emulator command streams run past 1 MiB) fits
+    // Matches the scheduler's normalisation cap. Raised 256 KiB -> 2 MiB -> 4 MiB
+    // so a whole app video/GPU frame (emulator command streams run past 1 MiB, and
+    // chunk's GPU ring carries a chunk mesh + far-terrain LOD ring in one step) fits
     // one ring; the 8 MiB wasm buffer arena has ample room (only channels that
     // request more allocate more).
-    const MAX_CHAN_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_CHAN_BYTES: usize = 4 * 1024 * 1024;
     let buf_capacity = if config.is_null() {
         if config_len != 0 {
             return CHAN_EINVAL;

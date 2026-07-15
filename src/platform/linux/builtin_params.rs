@@ -12,6 +12,8 @@
 // starting at 10. Tags 0xF0..0xFF are reserved for protection / fault
 // policy and are silently ignored here.
 
+use crate::kernel::scheduler;
+
 const TLV_MAGIC: u8 = 0xFE;
 const TLV_VERSION: u8 = 0x01;
 const TLV_END: u8 = 0xFF;
@@ -19,7 +21,7 @@ const TLV_END: u8 = 0xFF;
 /// Iterate the TLV payload of a module entry, calling `f(tag, value)`
 /// for each entry. No-op on a blob that lacks the magic+version
 /// header (treated as "no params for this module").
-pub(crate) fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
+pub fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
     if blob.len() < 4 || blob[0] != TLV_MAGIC || blob[1] != TLV_VERSION {
         return;
     }
@@ -47,7 +49,7 @@ pub(crate) fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
 
 /// Read a u32 TLV value (zero-extends shorter lengths so an upstream
 /// u8/u16 default still decodes safely).
-pub(crate) fn tlv_u32(value: &[u8]) -> u32 {
+pub fn tlv_u32(value: &[u8]) -> u32 {
     let mut buf = [0u8; 4];
     let n = value.len().min(4);
     buf[..n].copy_from_slice(&value[..n]);
@@ -55,13 +57,13 @@ pub(crate) fn tlv_u32(value: &[u8]) -> u32 {
 }
 
 /// Read a u8 TLV value (zero if empty).
-pub(crate) fn tlv_u8(value: &[u8]) -> u8 {
+pub fn tlv_u8(value: &[u8]) -> u8 {
     value.first().copied().unwrap_or(0)
 }
 
 /// Decode a TLV string value as UTF-8; falls back to an empty `&str` on
 /// invalid bytes so the caller can apply its own default.
-pub(crate) fn tlv_str(value: &[u8]) -> &str {
+pub fn tlv_str(value: &[u8]) -> &str {
     core::str::from_utf8(value).unwrap_or("")
 }
 
@@ -74,7 +76,7 @@ pub(crate) fn tlv_str(value: &[u8]) -> &str {
 ///
 /// Pair with `instance_state<T>` in the step function to read the
 /// pointer back.
-pub(crate) fn install_state<T>(m: &mut scheduler::BuiltInModule, state: Box<T>) {
+pub fn install_state<T>(m: &mut scheduler::BuiltInModule, state: Box<T>) {
     let raw = Box::into_raw(state);
     // pointer fits — even 16-byte Box pointers leave plenty of slack
     // in the 64-byte buffer.
@@ -95,7 +97,7 @@ pub(crate) fn install_state<T>(m: &mut scheduler::BuiltInModule, state: Box<T>) 
 /// [`install_state`] of matching `T`. Built-in dispatch in
 /// `src/platform/linux.rs` matches by `name_hash`, which encodes the
 /// type uniquely.
-pub(crate) unsafe fn instance_state<T>(state: *mut u8) -> &'static mut T {
+pub unsafe fn instance_state<T>(state: *mut u8) -> &'static mut T {
     // SAFETY: caller upholds the `# Safety` invariant above — `state`
     // was previously initialised by `install_state::<T>`.
     let ptr = unsafe { core::ptr::read(state as *const *mut T) };

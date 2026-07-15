@@ -128,7 +128,8 @@ pub fn cmd_modules_publish(
     };
     if targets.is_empty() {
         return Err(Error::Config(
-            "no built fmods under target/fluxor/* or target/* — run `make modules` first".into(),
+            "no built fmods under target/fluxor/* or target/* — run `fluxor modules build` first"
+                .into(),
         ));
     }
 
@@ -150,7 +151,7 @@ pub fn cmd_modules_publish(
         .collect();
     if selected.is_empty() {
         return Err(Error::Config(
-            "no built .fmod matched the selection — run `make modules` first".into(),
+            "no built .fmod matched the selection — run `fluxor modules build` first".into(),
         ));
     }
     if tag.is_some() && selected.len() > 1 {

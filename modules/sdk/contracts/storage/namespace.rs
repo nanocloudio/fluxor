@@ -194,6 +194,42 @@ pub const SUBSCRIBE: u32 = 0x1305;
 /// Close a LOOKUP or SUBSCRIBE handle.
 pub const CLOSE: u32 = 0x1306;
 
+/// Synchronous windowed change-read — the request/response dual of the
+/// push-based `SUBSCRIBE`. Where `SUBSCRIBE` streams live events onto a channel,
+/// `CHANGES` answers "what changed under `prefix` since revision `since`?" in one
+/// call, into a caller buffer. This is the primitive a long-poll watch server
+/// (k8s `?watch`/resourceVersion) is a direct projection of: LIST-at-a-fence
+/// then the changes since it, both synchronous.
+///
+/// `handle = -1`; `arg` is:
+///
+/// ```text
+///   [prefix_len: u16 LE]
+///   [prefix: prefix_len bytes]
+///   [since: u64 LE]               — 0 = full current snapshot; N = changes after rev N
+///   [out_buf: ptr u64 LE]
+///   [out_cap: u32 LE]
+///   [fence_out_ptr: u64 LE]       — receives Fence::encode bytes
+///   [fence_out_cap: u16 LE]       — must be >= `fence::WIRE_MAX_LEN`
+/// ```
+///
+/// On success the provider writes into `out_buf`:
+///
+/// ```text
+///   [status: u8]                  — 0 = events follow; 1 = LOST (window preceded
+///                                   retained history — the client must relist)
+///   [count: u32 LE]               — number of event records (0 when status=LOST)
+///   count × event:
+///     [rev: u64 LE][kind: u8][key_len: u16 LE][val_len: u32 LE][key][val]
+/// ```
+///
+/// `kind` is `0=Added`, `1=Modified`, `2=Deleted` (value absent for Deleted).
+/// `since = 0` returns every current entry as `Added` at its revision (the
+/// snapshot a client relists into). The return value is the byte count written
+/// to `out_buf`; the encoded fence (`ViewConsistent { revision }`, the highest
+/// revision covered — the client's next `since`) is written to `fence_out_ptr`.
+pub const CHANGES: u32 = 0x1307;
+
 // ── Entry kind tags returned in STAT / LIST ─────────────────────────
 
 pub const KIND_OBJECT: u8 = 0;

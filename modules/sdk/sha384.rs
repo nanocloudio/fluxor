@@ -219,3 +219,152 @@ pub fn sha384(data: &[u8]) -> [u8; 48] {
     h.update(data);
     h.finalize()
 }
+
+// ============================================================================
+// SHA-512 (FIPS 180-4) — same compression function as SHA-384, different
+// IV and full 64-byte output. Exposed from this file so consumers that
+// `include!()` sha384.rs (e.g. ed25519.rs, which needs SHA-512 per
+// RFC 8032) get it without a second copy of `compress512`/`K512`.
+// ============================================================================
+
+#[derive(Clone)]
+pub struct Sha512 {
+    state: [u64; 8],
+    buf: [u8; 128],
+    buf_len: usize,
+    total_len: u64,
+}
+
+impl Sha512 {
+    pub const DIGEST_LEN: usize = 64;
+    pub const BLOCK_LEN: usize = 128;
+
+    pub const fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667f3bcc908, 0xbb67ae8584caa73b,
+                0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+                0x510e527fade682d1, 0x9b05688c2b3e6c1f,
+                0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+            ],
+            buf: [0u8; 128],
+            buf_len: 0,
+            total_len: 0,
+        }
+    }
+}
+
+impl Default for Sha512 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha512 {
+    pub fn update(&mut self, data: &[u8]) {
+        let mut offset = 0;
+        self.total_len += data.len() as u64;
+
+        if self.buf_len > 0 {
+            let space = 128 - self.buf_len;
+            let take = if data.len() < space { data.len() } else { space };
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf.as_mut_ptr().add(self.buf_len), take);
+            }
+            self.buf_len += take;
+            offset = take;
+
+            if self.buf_len == 128 {
+                let block = self.buf;
+                compress512(&mut self.state, &block);
+                self.buf_len = 0;
+            }
+        }
+
+        while offset + 128 <= data.len() {
+            let mut block = [0u8; 128];
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), 128);
+            }
+            compress512(&mut self.state, &block);
+            offset += 128;
+        }
+
+        let remain = data.len() - offset;
+        if remain > 0 {
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), self.buf.as_mut_ptr(), remain);
+            }
+            self.buf_len = remain;
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; 64] {
+        let bit_len = (self.total_len as u128) * 8;
+
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+
+        if self.buf_len > 112 {
+            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+            // loop invariant keeps offsets in range.
+            unsafe {
+                let p = self.buf.as_mut_ptr().add(self.buf_len);
+                for i in 0..(128 - self.buf_len) { core::ptr::write_volatile(p.add(i), 0); }
+            }
+            let block = self.buf;
+            compress512(&mut self.state, &block);
+            self.buf_len = 0;
+        }
+
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant keeps offsets in range.
+        unsafe {
+            let p = self.buf.as_mut_ptr().add(self.buf_len);
+            for i in 0..(112 - self.buf_len) { core::ptr::write_volatile(p.add(i), 0); }
+        }
+
+        // Append 128-bit length (big-endian) — high 64 bits are 0 for our sizes
+        let len_hi = (bit_len >> 64) as u64;
+        let len_lo = bit_len as u64;
+        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
+        // loop invariant keeps offsets in range.
+        unsafe {
+            core::ptr::copy_nonoverlapping(len_hi.to_be_bytes().as_ptr(), self.buf.as_mut_ptr().add(112), 8);
+            core::ptr::copy_nonoverlapping(len_lo.to_be_bytes().as_ptr(), self.buf.as_mut_ptr().add(120), 8);
+        }
+        let block = self.buf;
+        compress512(&mut self.state, &block);
+
+        // SHA-512 = all 64 bytes (8 words) of the final state
+        let mut out = [0u8; 64];
+        let mut i = 0;
+        while i < 8 {
+            let bytes = self.state[i].to_be_bytes();
+            let base = i * 8;
+            out[base] = bytes[0]; out[base + 1] = bytes[1];
+            out[base + 2] = bytes[2]; out[base + 3] = bytes[3];
+            out[base + 4] = bytes[4]; out[base + 5] = bytes[5];
+            out[base + 6] = bytes[6]; out[base + 7] = bytes[7];
+            i += 1;
+        }
+        out
+    }
+
+    pub fn finalize_into(self, out: &mut [u8; 64]) {
+        *out = self.finalize();
+    }
+}
+
+#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+pub fn sha512(data: &[u8]) -> [u8; 64] {
+    let mut h = Sha512::new();
+    h.update(data);
+    h.finalize()
+}

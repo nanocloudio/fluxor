@@ -124,10 +124,16 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // Host process executor (the impure boundary). Host-linux only; a node
         // without the `proc` grant ENOSYS-denies. See sector architecture §5.
         "proc" => Ok(0x16),
-        // Versioned/watchable control-plane keyspace store (the fluxor-native
-        // etcd stand-in). Host-linux; class byte matches
-        // `provider::contract::KEYSPACE`. See rfc_keyspace_provider.md §0.
-        "keyspace" => Ok(0x17),
+        // "keyspace" (0x17) is not accepted here — the keyspace surface
+        // lives in lattice (see .context/fluxor_nanocloud.md §3); the ID
+        // stays reserved.
+        // "oci" (0x18) / "netfilter" (0x19) are not accepted — host
+        // isolation is declared as "workload" (0x1A); their mechanism is
+        // that contract's Linux backend. The IDs stay reserved.
+        // Platform-neutral isolated-workload surface (workload). Host-linux;
+        // class byte matches provider::contract::WORKLOAD. Also requires the
+        // platform_raw permission. See .context/fluxor_nanocloud.md.
+        "workload" => Ok(0x1A),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -180,7 +186,7 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
         0x14 => "storage.object",
         0x15 => "usb_host",
         0x16 => "proc",
-        0x17 => "keyspace",
+        0x1A => "workload",
         _ => "unknown",
     }
 }
@@ -359,6 +365,17 @@ pub struct PortSpec {
     /// into the port fails `fluxor build` instead of stalling at
     /// runtime. `None` = undeclared = unchecked.
     pub rate_class_max: Option<fluxor_contracts::RateClass>,
+    /// This port's own default rate class, taking priority over the
+    /// generic `CONTENT_RATE_CLASS` default for its `content_type`
+    /// when resolving an unwired edge's class. Tools-side only (not
+    /// serialized). A content type like `NetProto` spans wildly
+    /// different real traffic shapes across modules (RTP media vs.
+    /// DNS lookups vs. HTTP admin loopback) — a module whose default
+    /// diverges from the generic content-type default declares it
+    /// here once, instead of every consuming config repeating a
+    /// per-edge `rate:` override. `None` = fall back to the
+    /// content-type default (§ `resolve_edge_rate_class`).
+    pub rate_class_default: Option<fluxor_contracts::RateClass>,
 }
 
 #[derive(Debug, Clone)]
@@ -1132,6 +1149,17 @@ impl Manifest {
                     }
                     None => None,
                 },
+                rate_class_default: match &p.rate_class_default {
+                    Some(r) => {
+                        Some(fluxor_contracts::RateClass::from_str_opt(r).ok_or_else(|| {
+                            Error::Module(format!(
+                                "unknown rate_class_default '{r}' \
+                                 (control | transaction | audio | video | bulk)"
+                            ))
+                        })?)
+                    }
+                    None => None,
+                },
             });
         }
 
@@ -1615,6 +1643,7 @@ impl Manifest {
                 buffer_size: 0,
                 max_record: 0,
                 rate_class_max: None,
+                rate_class_default: None,
             });
             offset += 4;
         }
@@ -2110,6 +2139,7 @@ struct TomlPort {
     buffer_size: Option<CapacityValue>,
     max_record: Option<CapacityValue>,
     rate_class_max: Option<String>,
+    rate_class_default: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2160,6 +2190,7 @@ mod tests {
             buffer_size: 65536,
             max_record: 0,
             rate_class_max: None,
+            rate_class_default: None,
         });
         m.ports.push(PortSpec {
             direction: 1,
@@ -2170,6 +2201,7 @@ mod tests {
             buffer_size: 1048576,
             max_record: 16384,
             rate_class_max: None,
+            rate_class_default: None,
         });
         let bytes = m.to_bytes();
         assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
@@ -2194,6 +2226,7 @@ mod tests {
             buffer_size: 0,
             max_record: 0,
             rate_class_max: None,
+            rate_class_default: None,
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
@@ -2309,6 +2342,7 @@ mod tests {
             buffer_size: 0,
             max_record: 0,
             rate_class_max: None,
+            rate_class_default: None,
         });
         m.resources.push(ResourceClaim {
             device_class: 0x04,

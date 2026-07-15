@@ -2,7 +2,9 @@
 // Linux FS Provider — real file I/O via libc
 // ============================================================================
 
-use fluxor::abi::contracts::fence::{DeviceId, Fence};
+use super::builtin_params::instance_state;
+use crate::abi::contracts::fence::{DeviceId, Fence};
+use crate::kernel::channel;
 
 /// Stable device id for the Linux host's local filesystem. One
 /// logical backing store from Fluxor's point of view, so a single
@@ -96,8 +98,12 @@ const LINUX_FS_PATH_MAX: usize = 255;
 /// path validation — previously each arm rolled its own
 /// `arg_len.min(255)` and OPENDIR silently truncated where the
 /// other two now reject overlong paths.
-unsafe fn validate_fs_path(arg: *const u8, arg_len: usize, out: &mut [u8; 256]) -> Result<usize, i32> {
-    use fluxor::kernel::errno;
+unsafe fn validate_fs_path(
+    arg: *const u8,
+    arg_len: usize,
+    out: &mut [u8; 256],
+) -> Result<usize, i32> {
+    use crate::kernel::errno;
     if arg.is_null() || arg_len == 0 {
         return Err(errno::EINVAL);
     }
@@ -127,11 +133,15 @@ unsafe fn validate_fs_path(arg: *const u8, arg_len: usize, out: &mut [u8; 256]) 
 /// the kernel resolves the contract from the handle via
 /// `fd_tag_contract`. Inbound ops arrive with the tag stripped by
 /// the FS vtable wrapper, so `handle` here is the raw slot index.
-unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use fluxor::abi::contracts::fence as dev_fence;
-    use fluxor::abi::contracts::storage::fs as dev_fs;
-    use fluxor::kernel::errno;
-    use fluxor::kernel::fd::{tag_fd, FD_TAG_FS};
+/// # Safety
+/// Single-threaded platform dispatch only: touches `static mut` provider
+/// state without synchronization. `arg` must be null or valid for reads
+/// and writes of `arg_len` bytes for the duration of the call.
+pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::abi::contracts::fence as dev_fence;
+    use crate::abi::contracts::storage::fs as dev_fs;
+    use crate::kernel::errno;
+    use crate::kernel::fd::{tag_fd, FD_TAG_FS};
 
     // Cross-cutting fence-introspection opcode. Public surface:
     // `provider_query(handle, query_key::LAST_FENCE, …)`. The
@@ -203,11 +213,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
             // emits 404 cleanly. Future write-side callers can use
             // a new `FS_OPEN_CREATE` opcode or pass flags in the
             // path-extension slot once the ABI grows that knob.
-            let fd_raw = libc::open(
-                path_buf.as_ptr() as *const libc::c_char,
-                libc::O_RDWR,
-                0,
-            );
+            let fd_raw = libc::open(path_buf.as_ptr() as *const libc::c_char, libc::O_RDWR, 0);
             if fd_raw < 0 {
                 // Fall back to read-only (covers files we can read
                 // but not write, e.g. read-only-mounted assets).
@@ -484,9 +490,7 @@ unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usi
         dev_fs::READDIR => {
             let slot_idx = handle as usize;
             let files = &*core::ptr::addr_of!(LINUX_FILES);
-            if slot_idx >= MAX_OPEN_FILES
-                || !files[slot_idx].in_use
-                || files[slot_idx].dir_ptr == 0
+            if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use || files[slot_idx].dir_ptr == 0
             {
                 return errno::EINVAL;
             }
@@ -601,19 +605,18 @@ const PROC_CLOSE: u32 = 0x1603;
 const MAX_PROCS: usize = 8;
 
 struct LinuxProcSlot {
-    exec: Option<fluxor::platform::proc_executor::ProcExecutor>,
+    exec: Option<crate::platform::proc_executor::ProcExecutor>,
     in_use: bool,
     deadline: Option<std::time::Instant>,
 }
 
-static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] =
-    [const {
-        LinuxProcSlot {
-            exec: None,
-            in_use: false,
-            deadline: None,
-        }
-    }; MAX_PROCS];
+static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] = [const {
+    LinuxProcSlot {
+        exec: None,
+        in_use: false,
+        deadline: None,
+    }
+}; MAX_PROCS];
 
 /// The node's `proc` grant — WHAT `do` may run and how, sourced from the environment
 /// so the operator declares it at launch (`SECTOR_PROC_ALLOW`, `_ROOT`, `_ENV`,
@@ -647,7 +650,14 @@ fn proc_grant() -> &'static ProcGrant {
         };
         let default_env = || {
             [
-                "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "CARGO_HOME", "RUSTUP_HOME",
+                "PATH",
+                "HOME",
+                "USER",
+                "LANG",
+                "LC_ALL",
+                "TERM",
+                "CARGO_HOME",
+                "RUSTUP_HOME",
                 "SSH_AUTH_SOCK",
             ]
             .iter()
@@ -674,12 +684,18 @@ fn proc_grant() -> &'static ProcGrant {
     })
 }
 
-unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use fluxor::platform::proc_executor::{ProcExecutor, SpawnPolicy};
-    use fluxor::kernel::errno;
-    use fluxor::kernel::extbridge::OverloadPolicy;
-    use fluxor::kernel::fd::{slot_of, tag_fd, FD_TAG_PROC};
-    use fluxor::kernel::owner::OWNER_SYSTEM;
+/// Process-executor provider dispatch.
+///
+/// # Safety
+/// Single-threaded platform dispatch only: touches `static mut` provider
+/// state without synchronization. `arg` must be null or valid for reads
+/// and writes of `arg_len` bytes for the duration of the call.
+pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::kernel::errno;
+    use crate::kernel::extbridge::OverloadPolicy;
+    use crate::kernel::fd::{slot_of, tag_fd, FD_TAG_PROC};
+    use crate::kernel::owner::OWNER_SYSTEM;
+    use crate::platform::proc_executor::{ProcExecutor, SpawnPolicy};
 
     let procs = &mut *core::ptr::addr_of_mut!(LINUX_PROCS);
     match opcode {
@@ -782,7 +798,7 @@ unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
 // ============================================================================
 
 /// FNV-1a hash of "linux_net"
-const LINUX_NET_HASH: u32 = 0xFBCC7DC9;
+pub const LINUX_NET_HASH: u32 = 0xFBCC7DC9;
 
 // Net protocol message types (downstream: linux_net → consumer)
 const MSG_ACCEPTED: u8 = 0x01;
@@ -812,7 +828,10 @@ const DG_CMD_CLOSE: u8 = 0x22;
 const DG_MSG_BOUND: u8 = 0x40;
 const DG_MSG_RX_FROM: u8 = 0x41;
 const DG_MSG_CLOSED: u8 = 0x42;
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 const DG_MSG_ERROR: u8 = 0x43;
 const DG_AF_INET: u8 = 4;
 
@@ -830,7 +849,7 @@ const CONN_TYPE_UDP_BOUND: u8 = 2;
 /// struct.
 const LINUX_NET_MAX_CONNS: usize = 128;
 /// Max distinct inbound command channels (priority lanes).
-const LINUX_NET_MAX_INBOUND: usize = 8;
+pub const LINUX_NET_MAX_INBOUND: usize = 8;
 /// Per-connection write backlog. Sized to hold a full Spectrum video
 /// frame's worth of WS fragments (~98 KB) so a slow peer can absorb one
 /// frame's transmission pause without the producer overflowing the
@@ -842,7 +861,10 @@ const LINUX_NET_WRITE_BUF: usize = 128 * 1024;
 // Intentionally NOT Copy: this struct holds a 128 KiB inline buffer.
 // Implicit copies (`let conn = st.conns[idx];`) would push that whole
 // buffer onto the stack on every read. References / field-access only.
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 struct LinuxNetConn {
     fd: i32,
     conn_type: u8,
@@ -862,7 +884,7 @@ struct LinuxNetConn {
     /// bind/connect that created this slot (rfc_endpoint_lease.md §4.1:
     /// attribution is carried via the lane, never inferred from the executing
     /// module, which may be system-owned). Immutable for the life of the slot.
-    owner: fluxor::kernel::owner::OwnerHandle,
+    owner: crate::kernel::owner::OwnerHandle,
     write_buf: [u8; LINUX_NET_WRITE_BUF],
 }
 
@@ -875,7 +897,7 @@ impl LinuxNetConn {
         write_offset: 0,
         write_len: 0,
         connect_tag: 0,
-        owner: fluxor::kernel::owner::OWNER_SYSTEM,
+        owner: crate::kernel::owner::OWNER_SYSTEM,
         write_buf: [0u8; LINUX_NET_WRITE_BUF],
     };
 }
@@ -887,7 +909,7 @@ impl LinuxNetConn {
 /// a config-time concern (don't bind two listeners on port 9000), not
 /// a state-aliasing one. Per-instance ownership matches the rest of
 /// the host built-in family and makes the dispatch path uniform.
-struct LinuxNetState {
+pub struct LinuxNetState {
     /// Inbound command channels, drained in INDEX ORDER each step —
     /// index = the edge's position among `to: linux_net.net_in` lines
     /// in the graph wiring, so earlier edges are higher priority.
@@ -901,7 +923,7 @@ struct LinuxNetState {
     /// the wired edge (`channel_producer_owner`) and refreshed on every
     /// rebuild — the carried-attribution source for bind stamps
     /// (rfc_endpoint_lease.md §4.1).
-    lane_owners: [fluxor::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
+    lane_owners: [crate::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
     net_out: i32,
     conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
     /// Sized to absorb a full multi-MSS `CMD_SEND` payload. The
@@ -936,9 +958,9 @@ impl LinuxNetState {
     /// `Box::new_uninit` and initialising fields in place never puts the
     /// full struct on the stack (each `LinuxNetConn::EMPTY` write is one
     /// slot at a time).
-    fn new(
+    pub fn new(
         net_ins: [i32; LINUX_NET_MAX_INBOUND],
-        lane_owners: [fluxor::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
+        lane_owners: [crate::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
         net_out: i32,
     ) -> Box<Self> {
         let mut b: Box<core::mem::MaybeUninit<Self>> = Box::new_uninit();
@@ -1003,7 +1025,7 @@ unsafe fn set_nonblocking(fd: i32) {
 static mut LINUX_NET_REGISTRY: Vec<*mut LinuxNetState> = Vec::new();
 
 /// Register a freshly-instantiated linux_net state. Platform thread only.
-fn linux_net_register_state(ptr: *mut LinuxNetState) {
+pub fn linux_net_register_state(ptr: *mut LinuxNetState) {
     // SAFETY: single-threaded platform instantiation path; the registry is
     // reached through a raw pointer, never forming a `&mut STATIC`.
     unsafe {
@@ -1017,7 +1039,7 @@ fn linux_net_register_state(ptr: *mut LinuxNetState) {
 /// reset drops the old module state — otherwise the old listener fds leak,
 /// still holding their ports, and the re-issued CMD_BINDs after the rebuild
 /// die on EADDRINUSE (rfc_endpoint_lease.md §4.5).
-fn linux_net_close_all_and_clear_registry() {
+pub fn linux_net_close_all_and_clear_registry() {
     // SAFETY: single-threaded; pointers registered this graph generation are
     // still valid until prepare_graph tears the old graph down (called after).
     unsafe {
@@ -1039,7 +1061,7 @@ fn linux_net_close_all_and_clear_registry() {
 /// The drain driver calls this BEFORE `free_owner`, so an observer never sees
 /// the owner's terminal record while its port is still accepting
 /// (rfc_endpoint_lease.md §4.4). Platform thread only.
-fn linux_net_close_owner_conns(owner: fluxor::kernel::owner::OwnerHandle) {
+pub fn linux_net_close_owner_conns(owner: crate::kernel::owner::OwnerHandle) {
     // SAFETY: single-threaded platform access to registered live instances,
     // reached through a raw pointer.
     unsafe {
@@ -1066,7 +1088,7 @@ fn linux_net_close_owner_conns(owner: fluxor::kernel::owner::OwnerHandle) {
 /// live listener / UDP socket. Protocol: 1 = tcp, 2 = udp (matching
 /// CONN_TYPE_UDP_BOUND mnemonically). The runtime's raw report — declarations
 /// are the agent's business (rfc_endpoint_lease.md §4.3). Platform thread only.
-fn linux_net_bound_endpoints() -> Vec<(fluxor::kernel::owner::OwnerHandle, u8, u16)> {
+pub fn linux_net_bound_endpoints() -> Vec<(crate::kernel::owner::OwnerHandle, u8, u16)> {
     let mut out = Vec::new();
     // SAFETY: single-threaded platform access to registered live instances,
     // reached through a raw pointer.
@@ -1077,9 +1099,9 @@ fn linux_net_bound_endpoints() -> Vec<(fluxor::kernel::owner::OwnerHandle, u8, u
             for conn in st.conns.iter() {
                 if conn.state == 3 && conn.fd >= 0 && conn.port != 0 {
                     let proto = match conn.conn_type {
-                        1 => 1u8,                              // tcp listener
-                        CONN_TYPE_UDP_BOUND => 2u8,            // udp socket
-                        _ => continue,                         // data conns: not endpoints
+                        1 => 1u8,                   // tcp listener
+                        CONN_TYPE_UDP_BOUND => 2u8, // udp socket
+                        _ => continue,              // data conns: not endpoints
                     };
                     out.push((conn.owner, proto, conn.port));
                 }
@@ -1131,9 +1153,7 @@ unsafe fn linux_net_send_msg(st: &mut LinuxNetState, data: &[u8]) {
     // Small control frames (≤8 B) fit the queue slot; larger frames (datagram
     // RX) fall back to best-effort (they're not terminal results).
     let queued_empty = st.flush_pending_ctrl();
-    if queued_empty
-        && channel::channel_write(st.net_out, frame.as_ptr(), total) == total as i32
-    {
+    if queued_empty && channel::channel_write(st.net_out, frame.as_ptr(), total) == total as i32 {
         return;
     }
     if total <= 8 {
@@ -1174,27 +1194,27 @@ unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, errno: u8) {
 /// must be granted. System-owned commanders are ungated, as everywhere.
 /// Returns the refusal errno, or None to proceed.
 fn linux_net_new_bind_refusal(
-    commander: fluxor::kernel::owner::OwnerHandle,
+    commander: crate::kernel::owner::OwnerHandle,
     protocol: u8,
     port: u16,
 ) -> Option<u8> {
     if commander.is_system() {
         return None;
     }
-    if !fluxor::kernel::scheduler::owners_mut().authorize_admit(commander) {
+    if !crate::kernel::scheduler::owners_mut().authorize_admit(commander) {
         log::warn!(
             "[linux_net] bind port {port} refused: owner slot {} draining/revoked",
             commander.slot
         );
         return Some(1); // EPERM
     }
-    match fluxor::kernel::owner_plan::lease_gate(
+    match crate::kernel::owner_plan::lease_gate(
         commander.slot,
         commander.generation,
         protocol,
         port,
     ) {
-        fluxor::kernel::owner_plan::LeaseGate::Refused => {
+        crate::kernel::owner_plan::LeaseGate::Refused => {
             log::warn!(
                 "[linux_net] bind port {port} refused: no lease granted to owner slot {}",
                 commander.slot
@@ -1450,8 +1470,7 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
             && st.conns[i].fd >= 0
         {
             let mut from: libc::sockaddr_in = core::mem::zeroed();
-            let mut from_len: libc::socklen_t =
-                core::mem::size_of::<libc::sockaddr_in>() as u32;
+            let mut from_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
             let n = libc::recvfrom(
                 st.conns[i].fd,
                 st.recv_buf.as_mut_ptr() as *mut libc::c_void,
@@ -1688,12 +1707,7 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
         }
         let to_send = (c.write_len - c.write_offset) as usize;
         let p = c.write_buf.as_ptr().add(c.write_offset as usize);
-        let n = libc::send(
-            c.fd,
-            p as *const libc::c_void,
-            to_send,
-            libc::MSG_NOSIGNAL,
-        );
+        let n = libc::send(c.fd, p as *const libc::c_void, to_send, libc::MSG_NOSIGNAL);
         if n > 0 {
             c.write_offset = c.write_offset.saturating_add(n as u32);
         } else if n < 0 {
@@ -1761,8 +1775,7 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
         let mut accepted_on_this_listener: u32 = 0;
         while accepted_on_this_listener < PER_TICK_ACCEPT_BUDGET {
             let mut addr: libc::sockaddr_in = core::mem::zeroed();
-            let mut addr_len: libc::socklen_t =
-                core::mem::size_of::<libc::sockaddr_in>() as u32;
+            let mut addr_len: libc::socklen_t = core::mem::size_of::<libc::sockaddr_in>() as u32;
 
             let client_fd = libc::accept4(
                 listener_fd,
@@ -1794,7 +1807,7 @@ unsafe fn accept_one_client(
     st: &mut LinuxNetState,
     client_fd: i32,
     listener_port: u16,
-    owner: fluxor::kernel::owner::OwnerHandle,
+    owner: crate::kernel::owner::OwnerHandle,
 ) {
     // Enable application-friendly TCP keepalive so a silently-dead
     // peer (laptop suspended, NAT timeout without RST) is detected
@@ -2012,7 +2025,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
     had_work
 }
 
-fn linux_net_step(state: *mut u8) -> i32 {
+pub fn linux_net_step(state: *mut u8) -> i32 {
     // SAFETY: `state` is the kernel-owned per-instance arena sized
     // for `LinuxNetState` by the loader.
     unsafe {
@@ -2069,7 +2082,8 @@ fn linux_net_step(state: *mut u8) -> i32 {
                         continue;
                     }
                     if payload_len > 0 {
-                        let n2 = channel::channel_read(lane_ch, st.cmd_buf.as_mut_ptr(), payload_len);
+                        let n2 =
+                            channel::channel_read(lane_ch, st.cmd_buf.as_mut_ptr(), payload_len);
                         if n2 < payload_len as i32 {
                             break;
                         }
@@ -2120,18 +2134,11 @@ fn linux_net_step(state: *mut u8) -> i32 {
                             // IPv4 payload (datagram contract):
                             //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...].
                             let ep = st.cmd_buf[0] as i16;
-                            let ip = [
-                                st.cmd_buf[2],
-                                st.cmd_buf[3],
-                                st.cmd_buf[4],
-                                st.cmd_buf[5],
-                            ];
+                            let ip = [st.cmd_buf[2], st.cmd_buf[3], st.cmd_buf[4], st.cmd_buf[5]];
                             let port = u16::from_le_bytes([st.cmd_buf[6], st.cmd_buf[7]]);
                             let data_len = payload_len - 8;
-                            let data = core::slice::from_raw_parts(
-                                st.cmd_buf.as_ptr().add(8),
-                                data_len,
-                            );
+                            let data =
+                                core::slice::from_raw_parts(st.cmd_buf.as_ptr().add(8), data_len);
                             linux_net_dg_cmd_send_to(st, ep, ip, port, data);
                             had_work = true;
                         }
@@ -2142,9 +2149,7 @@ fn linux_net_step(state: *mut u8) -> i32 {
                             had_work = true;
                         }
                         _ => {
-                            log::warn!(
-                                "[linux_net] unknown cmd 0x{msg_type:02x} pl={payload_len}"
-                            );
+                            log::warn!("[linux_net] unknown cmd 0x{msg_type:02x} pl={payload_len}");
                         }
                     }
                 }

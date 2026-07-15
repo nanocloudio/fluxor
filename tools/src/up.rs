@@ -50,6 +50,10 @@ pub fn cmd_up(
         )));
     }
 
+    // Synced fmods / runtime binaries live under `target/`, which
+    // `cargo clean` wipes; refill lockfile-recorded holes before bring-up.
+    crate::sync::ensure_materialized(&crate::project::root())?;
+
     let fluxor = resolve_fluxor_bin(fluxor_bin)?;
     let extra = parse_vars(extra_vars)?;
 

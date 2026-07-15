@@ -219,10 +219,17 @@ mod profile_wasm {
         // PLUS the small audio/input/command channels (~24 KiB). At 2 MiB the arena
         // couldn't fit the 2 MiB channel alongside the others ("[buf] arena full
         // need=2097152 used=24576") -> channel open failed -> the emulator would not
-        // start. 4 MiB holds the 2 MiB channel + the rest with full headroom (lazily
-        // paged by memory.grow, so it costs nothing until used).
-        pub const BUFFER_ARENA_SIZE: usize = 4 * 1024 * 1024;
-        pub const MAX_MODULES: usize = 32;
+        // start. Then 4 MiB for a 2 MiB channel + rest. Now 8 MiB: chunk's GPU
+        // command ring wants a 4 MiB channel (a chunk mesh + the far-terrain LOD ring
+        // in one step; channel sizes are powers of two, so 4 MiB is the next step
+        // above 2 MiB), which alone fills a 4 MiB arena — 8 MiB holds it + the rest.
+        // Lazily paged by memory.grow, so it costs nothing until used.
+        pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
+        // 48: a multi-emulator browser graph (music + Game Boy +
+        // Spectrum chains) declares ~22 modules and the kernel inserts
+        // an internal tee/merge per fan — 32 left "No room for
+        // internal module" at prepare_graph.
+        pub const MAX_MODULES: usize = 48;
         pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
         pub const CONFIG_ARENA_SIZE: usize = 32 * 1024;
         pub const LOG_RING_CAPACITY: usize = 16384;

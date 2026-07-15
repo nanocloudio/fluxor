@@ -25,6 +25,7 @@ pub mod export_hashes {
     pub const MODULE_STEP: u32 = 0xc7ea2db4; // "module_step"
     pub const MODULE_PIPELINE_REFILL: u32 = 0xc9c83859; // "module_pipeline_refill"
     pub const MODULE_POST_TICK_FLUSH: u32 = 0x85d25b69; // "module_post_tick_flush"
+    pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
     pub const MODULE_DRAIN: u32 = 0xc4c5636c; // "module_drain"
     pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03; // "module_isr_init"

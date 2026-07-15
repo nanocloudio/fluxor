@@ -1,7 +1,7 @@
 [package]
 name = "fluxor"
 description = "Fluxor"
-version = "0.1.1"
+version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/nanocloudio/fluxor"
@@ -228,7 +228,7 @@ exclude = ["tests", "modules/foundation/dns", "modules/foundation/quic", "module
 [workspace.package]
 # Shared by every publishable crate via `version.workspace = true`.
 # Mirrors `fluxor.toml::[project].version`; publish enforces equality.
-version = "0.1.1"
+version = "0.0.1"
 
 # Workspace-wide lint configuration. Each member inherits this via
 # `[lints] workspace = true` and relaxes specific lints per-crate

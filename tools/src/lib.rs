@@ -17,6 +17,7 @@
     reason = "CLI is the user-facing product surface; `println!`/`eprintln!` is intentional output, not log misuse"
 )]
 
+pub mod abi_pin;
 pub mod add_subgraph;
 pub mod agent_logs;
 pub mod asset_bank;
@@ -51,8 +52,10 @@ pub mod presentation_resolver;
 pub mod presentation_shell;
 pub mod project;
 pub mod project_meta;
+pub mod publish;
 pub mod registry;
 pub mod render_template;
+pub mod sync;
 pub mod text_distance;
 pub mod trust;
 pub mod workload;

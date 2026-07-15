@@ -22,8 +22,8 @@ Pattern (16th notes at 120 BPM): K H H H S H H H K H K H S H H H
 ## Run
 
 ```sh
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/drums/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/drums/pico2w.yaml
 # I²S DAC output: data=28, bclk=26, lrclk=27
 ```
 

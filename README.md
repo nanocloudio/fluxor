@@ -150,38 +150,29 @@ rustup target add aarch64-unknown-none        # BCM2712 / CM5
 rustup target add aarch64-unknown-linux-gnu   # host tools
 ```
 
-### 2. Build the host tools
+### 2. Build everything
 
 ```bash
 make build
 ```
 
-This builds the host CLI and its tests from `tools/`. The release CLI used by the Makefile is built with:
+This builds the `fluxor` CLI, the kernel for every target, every
+module palette, and the `fluxor-linux` runtime binary. It is the
+default goal, so a bare `make` does the same.
+
+### 3. Build one piece at a time
+
+A single kernel target (the Makefile selector is `TARGET`):
 
 ```bash
-make tools
+make firmware TARGET=rp2040    # also: rp2350 | bcm2712 | cm5 | wasm
 ```
 
-### 3. Build firmware and modules
-
-The Makefile target selector is `TARGET`:
-
-To target a different silicon:
+PIC modules, in the target layout consumed by `fluxor build`, `combine`, and `run`:
 
 ```bash
-make firmware TARGET=rp2040
-make firmware TARGET=rp2350
-make firmware TARGET=bcm2712
-make firmware TARGET=cm5
-make firmware-all
-```
-
-Build PIC modules for the target layout consumed by `fluxor build`, `combine`, and `run`:
-
-```bash
-make modules TARGET=rp2350
-make modules TARGET=bcm2712
-make modules-all
+fluxor modules build --target rp2350
+fluxor modules build --all
 ```
 
 ### 4. Build or run an example
@@ -189,14 +180,14 @@ make modules-all
 Linux-hosted examples run directly:
 
 ```bash
-make run CONFIG=examples/hello/linux.yaml
+fluxor run examples/hello/linux.yaml
 ```
 
 Hardware targets build an artifact and then flash:
 
 ```bash
-make flash CONFIG=examples/static_server/pico2w.yaml
-make flash CONFIG=examples/hello/cm5.yaml
+fluxor flash examples/static_server/pico2w.yaml
+fluxor flash examples/hello/cm5.yaml
 ```
 
 You can also build a single packaged artifact without flashing:

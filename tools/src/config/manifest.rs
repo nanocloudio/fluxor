@@ -449,10 +449,20 @@ fn validate_required_inputs_wired(
     Ok(())
 }
 
-/// Resolve one edge's rate class: per-edge `rate:` override, else
-/// the consumer port's content-type default, else the producer's,
-/// else control. Shared by the wiring-capacity validator and the
-/// binary edge emitter.
+/// Resolve one edge's rate class: per-edge `rate:` override, else the
+/// consumer port's own declared `rate_class_default`, else the
+/// producer's, else the consumer's content-type default, else the
+/// producer's, else control. Shared by the wiring-capacity validator
+/// and the binary edge emitter.
+///
+/// A port's own `rate_class_default` takes priority over the generic
+/// content-type table: a content type like `NetProto` is shared by
+/// modules with wildly different real traffic (RTP media vs. DNS
+/// lookups vs. HTTP admin loopback), so the content-type default can
+/// only ever be a reasonable-for-nobody-in-particular fallback. A
+/// module that knows its own edges' true shape declares it once, in
+/// its own manifest, instead of every consuming config repeating a
+/// per-edge `rate:` override.
 fn resolve_edge_rate_class(
     wiring_entry: Option<&Value>,
     from_port: Option<&crate::manifest::PortSpec>,
@@ -468,6 +478,12 @@ fn resolve_edge_rate_class(
                 "unknown rate class '{r}' (control | transaction | audio | video | bulk)"
             ))
         });
+    }
+    if let Some(class) = to_port_spec
+        .and_then(|p| p.rate_class_default)
+        .or_else(|| from_port.and_then(|p| p.rate_class_default))
+    {
+        return Ok(class);
     }
     let ct_class = |spec: Option<&crate::manifest::PortSpec>| {
         spec.and_then(|p| CONTENT_RATE_CLASS.get(p.content_type as usize))
@@ -507,7 +523,7 @@ fn validate_wiring_capacity(
     use fluxor_contracts::{rate_class_floor, RateClass};
 
     const MIN_CHAN_BYTES: u32 = 64;
-    const MAX_CHAN_BYTES: u32 = 2 * 1024 * 1024;
+    const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
     const DEFAULT_RING: u32 = 8192; // kernel default (abi CHANNEL_BUFFER_SIZE)
 
     let tick_us = config
@@ -557,16 +573,12 @@ fn validate_wiring_capacity(
         })?;
 
         // A producer port may cap the class its step logic is
-        // engineered for; a faster edge fails at build.
+        // engineered for; a faster edge fails at build. `severity()`
+        // is the single source of truth for this comparison — see
+        // `RateClass`'s doc comment for why it deliberately isn't
+        // `Ord`.
         if let Some(cap) = from_port.and_then(|p| p.rate_class_max) {
-            let rank = |value: RateClass| match value {
-                RateClass::Control => 0,
-                RateClass::Transaction => 1,
-                RateClass::Audio => 2,
-                RateClass::Video => 3,
-                RateClass::Bulk => 4,
-            };
-            if rank(class) > rank(cap) {
+            if class.exceeds(cap) {
                 return Err(Error::Config(format!(
                     "wiring[{i}] ({} → {}): edge rate class '{}' exceeds the \
                      producer port's declared rate_class_max '{}'.",

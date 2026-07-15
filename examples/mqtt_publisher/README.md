@@ -41,8 +41,8 @@ crossings; touch the pico to trigger one.
 
 ```sh
 # Configure broker IP + WiFi credentials in the YAML
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/mqtt_publisher/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/mqtt_publisher/pico2w.yaml
 
 # Watch from any host on the same broker
 mosquitto_sub -h <broker> -t 'fluxor/temp/+'

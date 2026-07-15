@@ -305,20 +305,20 @@ fn resolve_fmod(
 /// it would produce an image the device rejects at load; a module carrying
 /// no attestation cannot be shown compatible at all. Both are hard errors,
 /// resolved by rebuilding the module against the current tree
-/// (`make modules`).
+/// (`fluxor modules build`).
 fn verify_module_abi_surface(info: &ModuleInfo, path: &Path) -> Result<()> {
     let current = crate::hash::abi_surface_digest();
     match info.manifest.abi_surface {
         Some(packed) if packed == current => Ok(()),
         Some(packed) => Err(Error::Module(format!(
             "{}: built against a different ABI surface (module attests \
-             {}, current is {}) — rebuild it with `make modules`",
+             {}, current is {}) — rebuild it with `fluxor modules build`",
             path.display(),
             hex12(&packed),
             hex12(&current),
         ))),
         None => Err(Error::Module(format!(
-            "{}: carries no ABI-surface attestation — rebuild it with `make modules`",
+            "{}: carries no ABI-surface attestation — rebuild it with `fluxor modules build`",
             path.display(),
         ))),
     }
@@ -379,7 +379,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'make modules' to build modules, or pin it with 'fluxor store pin'.",
+                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.",
                         module_name,
                         module_type,
                         searched.join(", "),
@@ -420,7 +420,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'make modules' to build modules, or pin it with 'fluxor store pin'.",
+                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.",
                         instance_name,
                         module_type,
                         searched.join(", "),
@@ -463,7 +463,7 @@ pub fn parse_modules_from_config_multi(
                             .map(|d| d.display().to_string())
                             .collect();
                         Error::Module(format!(
-                            "pod module type '{}' not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'make modules' to build modules, or pin it with 'fluxor store pin'.",
+                            "pod module type '{}' not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.",
                             module_type,
                             searched.join(", "),
                         ))
@@ -979,7 +979,7 @@ pub fn pack_fmod(
         Some(embedded) => {
             return Err(Error::Module(format!(
                 "{}: compiled against a different ABI surface (module embeds {}, \
-                 current is {}) — rebuild it from source with `make modules`",
+                 current is {}) — rebuild it from source with `fluxor modules build`",
                 input.display(),
                 hex12(&embedded),
                 hex12(&current_surface),
@@ -988,7 +988,7 @@ pub fn pack_fmod(
         None => {
             return Err(Error::Module(format!(
                 "{}: no embedded ABI-surface attestation — rebuild it from source \
-                 with `make modules`",
+                 with `fluxor modules build`",
                 input.display(),
             )));
         }
@@ -1215,7 +1215,7 @@ pub fn pack_fmod_wasm(
     {
         return Err(Error::Module(format!(
             "{}: wasm module does not embed the current ABI surface ({}) — \
-             built against a different SDK; rebuild from source with `make modules`",
+             built against a different SDK; rebuild from source with `fluxor modules build`",
             input.display(),
             hex12(&current_surface),
         )));

@@ -492,7 +492,7 @@ pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> 
         .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
     if !linux_bin.exists() {
         return Err(Error::Config(format!(
-            "Linux binary not found at {}. Run 'make linux' first.",
+            "Linux binary not found at {}. Run 'make build' first.",
             linux_bin.display()
         )));
     }

@@ -33,11 +33,11 @@ sudo umount /mnt/nvme
 
 ```sh
 # pico2w
-make firmware TARGET=pico2w && make modules TARGET=rp2350
-make flash CONFIG=examples/static_server/pico2w.yaml
+make firmware TARGET=pico2w && fluxor modules build --target rp2350
+fluxor flash examples/static_server/pico2w.yaml
 
 # cm5
-make firmware TARGET=cm5 && make modules TARGET=bcm2712
+make firmware TARGET=cm5 && fluxor modules build --target bcm2712
 fluxor combine -o kernel8.img target/cm5/firmware.bin examples/static_server/cm5.yaml
 
 # either: files served at http://<device-ip>/<filename>

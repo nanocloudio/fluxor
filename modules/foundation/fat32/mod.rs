@@ -713,6 +713,14 @@ struct Fat32State {
     /// bloated root dir. Bench/clean-slate only.
     clean_root: u32,
 
+    /// Chain heads queued by `FS_UNLINK` for lazy freeing, drained by
+    /// `fs_step_free_chains` one FAT-sector batch per step. Each slot is
+    /// the next cluster to free in that chain (the cursor advances across
+    /// steps for chains spanning FAT sectors); 0 = slot empty. A full ring
+    /// orphans the chain instead (logged) — the same safe posture as
+    /// create-truncate, namespace removal always wins over reclaim.
+    unlink_free: [u32; UNLINK_FREE_SLOTS],
+
     /// Hot-path counters emitted as `[fat32] tlm dt=… rx=… tx=… idle=… bp=…`
     /// every `FAT32_TLM_PERIOD` steps. `rx` is bytes consumed from
     /// the upstream blocks channel (init walks + write-path FAT/dir
@@ -724,6 +732,11 @@ struct Fat32State {
 
 /// Shared wall-clock cadence for native telemetry, heartbeat, and the TLM line.
 const FAT32_OBSERVE_INTERVAL_MS: u64 = 5_000;
+
+/// Concurrent unlinked-chain frees in flight (see `Fat32State::unlink_free`).
+/// Sized for the expected caller (WAL segment compaction retires a handful of
+/// segments per snapshot); overflow degrades to orphaning, never to blocking.
+const UNLINK_FREE_SLOTS: usize = 8;
 
 impl Fat32State {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -742,6 +755,7 @@ impl Fat32State {
         self.fsinfo_sector = 0;
         self.init_phase = Fat32InitPhase::Idle;
         self.next_free_hint = 2;
+        self.unlink_free = [0; UNLINK_FREE_SLOTS];
         self.file_count = 0;
         self.dir_cluster = 0;
         self.dir_sector_in_cluster = 0;
@@ -1197,6 +1211,18 @@ const FS_READDIR: u32 = 0x0908;
 /// emit. We explicitly return ENOSYS rather than fall through to
 /// the catch-all so the gap is obvious to readers of this file.
 const FS_OPEN_CREATE: u32 = 0x0909;
+/// `UNLINK` (0x090A) — remove a file by path. The synchronous part is
+/// O(1): mark the 8.3 directory entry deleted (`0xE5`) and durably write
+/// that one sector. The cluster chain is NOT walked inline — freeing an
+/// N-cluster chain is O(N) device round-trips, which would blow the
+/// cooperative step guard inside a single `provider_call` (the same
+/// reason `fs_op_create` orphans on truncate). Instead the chain head is
+/// queued on `unlink_free` and `step_inner` frees it one FAT-sector
+/// batch per step (`fs_step_free_chains`). Crash ordering: entry first,
+/// chain second — an interruption leaks clusters (safe, matches the
+/// truncate posture) but can never leave a live entry pointing at freed
+/// clusters.
+const FS_UNLINK: u32 = 0x090A;
 const FS_PREALLOCATE: u32 = 0x090E;
 
 /// `CAPS` (0x09FF) — capability-discovery opcode. Returns a u32
@@ -1212,6 +1238,7 @@ const FS_CAP_OPENDIR:     u32 = 1 << 1;
 const FS_CAP_OPEN_CREATE: u32 = 1 << 2;
 const FS_CAP_WRITE:       u32 = 1 << 3;
 const FS_CAP_FSYNC:       u32 = 1 << 4;
+const FS_CAP_UNLINK:      u32 = 1 << 5;
 const FS_CAP_PREALLOCATE: u32 = 1 << 9;
 
 /// `Fence::LocalDurable` device id reported by fat32 handles once their
@@ -2124,6 +2151,121 @@ unsafe fn fs_free_chain(s: &mut Fat32State, start: u32) {
     }
 }
 
+/// FS_UNLINK: remove `path`'s directory entry and queue its cluster chain
+/// for lazy reclamation. See the `FS_UNLINK` opcode doc for the split
+/// between the O(1) synchronous part and the per-step chain free.
+///
+/// Refuses (`EBUSY`) while any open FD references the entry — writable
+/// FDs are matched by their directory-entry location, read FDs by start
+/// cluster — because the read path walks the FAT chain the drain would
+/// be zeroing underneath it.
+unsafe fn fs_op_unlink(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len == 0 { return E_INVAL; }
+    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    if s.root_cluster < 2 { return E_AGAIN; }
+    let path = core::slice::from_raw_parts(arg, arg_len);
+    let (parent, want) = match fs_split_parent(s, path) {
+        Some(p) => p,
+        None => return -2, // ENOENT
+    };
+    let loc = match fs_scan_dir(s, parent, &want) {
+        Some(l) if l.exists => l,
+        _ => return -2, // ENOENT (free slot / full dir both mean "no such file")
+    };
+    if loc.is_dir { return -21; } // EISDIR — directory removal is not in the UNLINK surface
+    let mut k = 0usize;
+    while k < MAX_OPEN_FILES {
+        let of = &s.open_files[k];
+        if of.in_use != 0
+            && ((of.writable != 0 && of.dir_lba == loc.lba && of.dir_off == loc.off)
+                || (loc.start_cluster >= 2 && of.start_cluster == loc.start_cluster))
+        {
+            return -16; // EBUSY
+        }
+        k += 1;
+    }
+    // Namespace removal first: durably mark the entry deleted. After this
+    // sector lands, OPEN/OPEN_CREATE no longer resolve the name; a crash
+    // before the chain drain merely leaks clusters.
+    if fs_read_blockbuf(s, loc.lba) != 0 { return -5; } // EIO
+    s.block_buf[loc.off as usize] = 0xE5;
+    if fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr()) != 0 { return -5; }
+    if loc.start_cluster >= 2 {
+        let mut q = 0usize;
+        loop {
+            if q >= UNLINK_FREE_SLOTS {
+                // Ring full: orphan (same posture as create-truncate).
+                dev_log(s.sys(), 4, b"[fat32] unlink orphan".as_ptr(), 21);
+                break;
+            }
+            if s.unlink_free[q] == 0 {
+                s.unlink_free[q] = loc.start_cluster;
+                break;
+            }
+            q += 1;
+        }
+    }
+    0
+}
+
+/// Drain one queued unlinked chain by at most ONE FAT-sector batch: load
+/// the FAT sector holding the cursor, zero every chain entry that lives in
+/// that same sector (a sequential chain is up to 128 entries/sector), and
+/// write the sector back through every FAT copy. Cost per step is bounded
+/// at ~1 read + `num_fats` writes regardless of chain length; a chain
+/// spanning S FAT sectors completes after S steps. Rewinds
+/// `next_free_hint` so the allocator's forward scan can actually reuse the
+/// reclaimed span within this mount.
+unsafe fn fs_step_free_chains(s: &mut Fat32State) {
+    let mut slot = 0usize;
+    while slot < UNLINK_FREE_SLOTS && s.unlink_free[slot] < 2 {
+        slot += 1;
+    }
+    if slot >= UNLINK_FREE_SLOTS { return; }
+    let bps = s.bytes_per_sector as u32;
+    if bps == 0 { return; }
+    let eps = bps / 4; // FAT entries per sector
+    if eps == 0 { return; }
+    let max_clst = cluster_count_ceiling(s);
+
+    let mut c = s.unlink_free[slot];
+    let fat_sec = fat_sector_for_cluster(s, c);
+    if fs_read_blockbuf(s, fat_sec) != 0 { return; } // retry next step
+    let first_in_sec = (fat_sec - s.fat_start_sector).wrapping_mul(eps);
+    let mut freed_low: u32 = u32::MAX;
+    let mut guard: u32 = 0;
+    // Zero every chain link that lives in the loaded sector. `guard`
+    // bounds a corrupt/cyclic chain at one sector's entry count.
+    while c >= 2 && c < FAT32_EOC && c < max_clst && guard <= eps {
+        if fat_sector_for_cluster(s, c) != fat_sec { break; }
+        let off = ((c - first_in_sec) * 4) as usize;
+        if off + 4 > BLOCK_SIZE { break; }
+        let next = read_u32_le(&s.block_buf, off) & FAT32_MASK;
+        s.block_buf[off] = 0;
+        s.block_buf[off + 1] = 0;
+        s.block_buf[off + 2] = 0;
+        s.block_buf[off + 3] = 0;
+        if c < freed_low { freed_low = c; }
+        c = next;
+        guard += 1;
+    }
+    // Mirror the batch into every FAT copy (same pattern as
+    // `fs_alloc_extent`'s allocation writeback).
+    let rel = fat_sec - s.fat_start_sector;
+    let mut fi: u32 = 0;
+    while fi < s.num_fats as u32 {
+        let sec = s.fat_start_sector + fi * s.fat_size_32 + rel;
+        if fs_sync_write_sector(s, sec, s.block_buf.as_ptr()) != 0 { return; }
+        fi += 1;
+    }
+    // Chain continues in another FAT sector → park the cursor there;
+    // otherwise the chain is fully freed and the slot opens up.
+    s.unlink_free[slot] = if c >= 2 && c < FAT32_EOC && c < max_clst { c } else { 0 };
+    if freed_low != u32::MAX && freed_low < s.next_free_hint {
+        s.next_free_hint = freed_low;
+    }
+}
+
 /// Read the FAT32 FSINFO "next free cluster" hint (offset 0x1EC) from the
 /// volume's FSINFO sector. Returns the hint if the sector is present and the
 /// value is plausible (>= 2), else 0. Lets the synchronous write path resume
@@ -2769,7 +2911,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         }
         let caps: u32 = FS_CAP_OPEN | FS_CAP_OPENDIR
             | FS_CAP_OPEN_CREATE | FS_CAP_WRITE | FS_CAP_FSYNC
-            | FS_CAP_PREALLOCATE;
+            | FS_CAP_UNLINK | FS_CAP_PREALLOCATE;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -2786,6 +2928,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         // driven through the producer's synchronous block ioctls — see the
         // FS_CONTRACT write-path section above.
         FS_OPEN_CREATE => fs_op_create(s, arg as *const u8, arg_len),
+        FS_UNLINK      => fs_op_unlink(s, arg as *const u8, arg_len),
         FS_PREALLOCATE => fs_op_preallocate(s, handle, arg as *const u8, arg_len),
         FS_WRITE       => fs_op_write(s, handle, arg as *const u8, arg_len),
         FS_FSYNC       => fs_op_fsync(s, handle),
@@ -2975,6 +3118,10 @@ unsafe fn step_inner(s: &mut Fat32State) -> i32 {
         }
         return write_step(s);
     }
+
+    // Lazy reclamation of unlinked cluster chains — one bounded
+    // FAT-sector batch per step (see `fs_step_free_chains`).
+    fs_step_free_chains(s);
 
     // Reads are served entirely by the FS_CONTRACT dispatch
     // (`fat32_fs_dispatch` exported below); the per-step path is idle
@@ -4308,7 +4455,10 @@ pub mod test_ops {
     pub const FS_WRITE: u32 = super::FS_WRITE;
     pub const FS_SEEK: u32 = super::FS_SEEK;
     pub const FS_OPEN_CREATE: u32 = super::FS_OPEN_CREATE;
+    pub const FS_UNLINK: u32 = super::FS_UNLINK;
     pub const FS_PREALLOCATE: u32 = super::FS_PREALLOCATE;
+    pub const FS_CAPS: u32 = super::FS_CAPS;
+    pub const FS_CAP_UNLINK: u32 = super::FS_CAP_UNLINK;
     /// FAT end-of-chain marker; the harness writes it into FAT[root] so the
     /// allocator never hands out the root-directory cluster.
     pub const FAT32_TAIL: u32 = super::FAT32_TAIL;

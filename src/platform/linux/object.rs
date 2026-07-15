@@ -70,6 +70,12 @@ unsafe fn linux_object_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
+    // Control-plane store mode (FLUXOR_STORE_DIR set): the versioned store backs
+    // storage.object here (PUT/GET/HEAD/DELETE/CAS + revision fence). Otherwise
+    // this provider is the HTTP-backed object surface below.
+    if fluxor::platform::linux::store::store_active() {
+        return fluxor::platform::linux::store::dispatch_object(handle, opcode, arg, arg_len);
+    }
     // Per-handle fence: HTTP fetches are volatile (no durability tier).
     if opcode == obj_dev_fence::QUERY_OP {
         if arg.is_null() || arg_len < obj_dev_fence::WIRE_MAX_LEN {

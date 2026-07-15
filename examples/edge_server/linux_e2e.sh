@@ -11,7 +11,7 @@
 #   6. `agent remove` frees the port; the host can rebind it
 #
 # Usage: examples/edge_server/linux_e2e.sh   (from anywhere; builds no code —
-# expects `make tools linux-bin` and `fluxor modules build --target bcm2712`
+# expects `make build` and `fluxor modules build --target bcm2712`
 # to have produced their artifacts already)
 set -euo pipefail
 

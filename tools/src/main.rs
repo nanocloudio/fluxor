@@ -20,6 +20,7 @@
 //!     fluxor example blinky                # Show example config
 //!     fluxor pack module.o -o module.fmod # Pack ELF into .fmod module
 
+mod abi_pin;
 mod add_subgraph;
 mod agent_cli;
 mod asset_bank;
@@ -159,6 +160,7 @@ fn main() {
         Commands::Validate { config, target } => cmd_validate(&config, target.as_deref()),
         Commands::TargetInfo { target, field } => cmd_target_info(&target, field.as_deref()),
         Commands::Targets => cmd_targets(),
+        Commands::AbiRegen { check } => cmd_abi_regen(check),
         Commands::Mktable { dir, output } => cmd_mktable(&dir, &output),
         Commands::MktableConfig {
             config,

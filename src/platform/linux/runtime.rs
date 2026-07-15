@@ -176,14 +176,21 @@ fn linux_init_providers() {
     // `src/platform/wasm/namespace.rs`. Lets a scanner walk a host library on
     // Linux exactly as it walks the manifest-backed index in the browser.
     provider::register(dev_class::STORAGE_NAMESPACE, linux_namespace_dispatch);
+    // Control-plane store: if FLUXOR_STORE_DIR is set, the two storage providers
+    // above route to an in-runtime versioned watchable store instead of
+    // HTTP/filesystem. A no-op when the env is unset.
+    // SAFETY: single-threaded startup, before any provider dispatch — the
+    // store singleton is initialised exactly once with no concurrent access.
+    let _ = unsafe { fluxor::platform::linux::store::store_init_from_env() };
     // The impure boundary: host process executor (sector `do`). Gated by
     // `requires_contract="proc"`; only registered on host-linux (a PIC module
     // can't fork/exec, so a "worker" is by definition a Linux node).
     provider::register(dev_class::PROC, linux_proc_dispatch);
-    // Versioned/watchable control-plane keyspace store (the fluxor-native etcd
-    // stand-in). Ambient like the other storage providers; the store is lazily
-    // recovered from the projected volume dir in `FLUXOR_KEYSPACE_DIR`.
-    provider::register(dev_class::KEYSPACE, linux_keyspace_dispatch);
+    // Platform-neutral isolated-workload surface: parses the Tier-1 spec, binds
+    // to a plan-allocated owner + lease, enforces the Tier-2 options envelope
+    // fail-closed, and delegates to the owner-bound host-process backend.
+    // Host-linux; gated by requires_contract = "workload" + platform_raw.
+    provider::register(dev_class::WORKLOAD, linux_workload_dispatch);
 }
 /// Platform-specific per-module cleanup for Linux host.
 ///

@@ -19,6 +19,10 @@
 // window lapses. All single-threaded on the scheduler/main thread.
 
 /// One armed drain.
+use super::owner_status::rfc3339_utc;
+use super::providers::linux_net_close_owner_conns;
+use super::workload::linux_workload_close_owner;
+
 struct DrainEntry {
     pod_uid: [u8; 16],
     slot: u16,
@@ -66,7 +70,7 @@ const TERMINAL_RETAIN_SECS: u64 = 30;
 /// Arm the drains a delta apply produced. Re-arming an already-armed
 /// `(slot, generation)` keeps the ORIGINAL deadline: a replayed revocation
 /// record never resets the clock (§3.4).
-fn arm_drains(delta: &fluxor::kernel::owner_plan::DrainDelta) {
+pub fn arm_drains(delta: &crate::kernel::owner_plan::DrainDelta) {
     let d = drain_driver();
     for arm in &delta.arms[..delta.count] {
         let already = d
@@ -93,7 +97,7 @@ fn arm_drains(delta: &fluxor::kernel::owner_plan::DrainDelta) {
 
 /// Drive every armed drain: free the owner at quiescence or deadline and record
 /// the terminal outcome. Called on the ~100 ms platform tick.
-fn drain_tick(now_unix: u64) {
+pub fn drain_tick(now_unix: u64) {
     let d = drain_driver();
     if d.entries.is_empty() && d.terminals.is_empty() {
         return;
@@ -101,16 +105,17 @@ fn drain_tick(now_unix: u64) {
     let mut i = 0;
     while i < d.entries.len() {
         let e = &d.entries[i];
-        let handle = fluxor::kernel::owner::OwnerHandle {
+        let handle = crate::kernel::owner::OwnerHandle {
             slot: e.slot,
             generation: e.generation,
         };
         // An owner that vanished under us (a structural rebuild mid-drain
         // reset the table — v1 forfeits the remainder) gets its terminal
         // record now; nothing is left to free.
-        let gone = fluxor::kernel::scheduler::owners_mut().lookup(handle).is_none();
-        let quiescent =
-            !gone && fluxor::kernel::scheduler::owner_modules_quiescent(handle);
+        let gone = crate::kernel::scheduler::owners_mut()
+            .lookup(handle)
+            .is_none();
+        let quiescent = !gone && crate::kernel::scheduler::owner_modules_quiescent(handle);
         let expired = now_unix >= e.deadline_unix;
         if !gone && !quiescent && !expired {
             i += 1;
@@ -122,7 +127,10 @@ fn drain_tick(now_unix: u64) {
             // observer never sees the terminal record while a port is still
             // accepting (rfc_endpoint_lease.md §4.4).
             linux_net_close_owner_conns(handle);
-            match fluxor::kernel::scheduler::free_owner(handle) {
+            // Tear down the owner's isolated workloads (containers) too, so a
+            // revoked owner's host processes do not outlive its lease.
+            linux_workload_close_owner(handle);
+            match crate::kernel::scheduler::free_owner(handle) {
                 Ok(()) => {}
                 Err(err) => log::warn!(
                     "[drain] free_owner slot {} gen {}: {err:?}",
@@ -164,30 +172,38 @@ fn drain_tick(now_unix: u64) {
 /// previous process already persisted a terminal state for that pod
 /// (`seeded_terminated`, from the status writer's seed of the old file): a
 /// clean `Completed` from before the restart is never rewritten (§3.7).
-fn synthesize_restart_terminals(
+#[allow(
+    clippy::implicit_hasher,
+    reason = "internal platform surface; callers only ever pass std's default hasher"
+)]
+pub fn synthesize_restart_terminals(
     now_unix: u64,
     seeded_terminated: &std::collections::HashSet<String>,
 ) {
-    let mut revs = [fluxor::kernel::owner_plan::PlanRevocation::EMPTY;
-        fluxor::kernel::owner_plan::MAX_PLAN_ASSIGNMENTS];
-    let n = fluxor::kernel::owner_plan::retained_revocations(&mut revs);
+    let mut revs = [crate::kernel::owner_plan::PlanRevocation::EMPTY;
+        crate::kernel::owner_plan::MAX_PLAN_ASSIGNMENTS];
+    let n = crate::kernel::owner_plan::retained_revocations(&mut revs);
     let d = drain_driver();
     for rev in &revs[..n] {
-        let handle = fluxor::kernel::owner::OwnerHandle {
+        let handle = crate::kernel::owner::OwnerHandle {
             slot: rev.assignment.slot,
             generation: rev.assignment.generation,
         };
-        if fluxor::kernel::scheduler::owners_mut().lookup(handle).is_some() {
+        if crate::kernel::scheduler::owners_mut()
+            .lookup(handle)
+            .is_some()
+        {
             continue; // installed → a live drain, not a forfeit
         }
-        let uid_hex: String = rev.assignment.pod_uid.iter().fold(
-            String::with_capacity(32),
-            |mut s, b| {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-                s
-            },
-        );
+        let uid_hex: String =
+            rev.assignment
+                .pod_uid
+                .iter()
+                .fold(String::with_capacity(32), |mut s, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
+                    s
+                });
         if seeded_terminated.contains(&uid_hex) {
             continue; // the previous process already recorded its outcome
         }
@@ -213,8 +229,8 @@ fn synthesize_restart_terminals(
 /// Overlay live drain deadlines onto the kernel status snapshot (the kernel
 /// carries `owner_state`; the deadline lives here). Called by the status
 /// writer's tick before deriving the pods JSON.
-fn drain_overlay_for_status(
-    recs: &mut [fluxor::kernel::scheduler::OwnerLiveStatus],
+pub fn drain_overlay_for_status(
+    recs: &mut [crate::kernel::scheduler::OwnerLiveStatus],
     now_unix: u64,
 ) {
     let d = drain_driver();
@@ -236,7 +252,7 @@ fn drain_overlay_for_status(
 /// Render the retained terminal records as status-file pod entries (same shape
 /// as the live pods array; §7.2 vocabulary + the additive `drain{}` detail).
 /// Returns entries WITHOUT leading separators; empty when nothing is retained.
-fn drain_terminal_pods_json() -> Vec<String> {
+pub fn drain_terminal_pods_json() -> Vec<String> {
     use std::fmt::Write as _;
     let d = drain_driver();
     let mut out = Vec::with_capacity(d.terminals.len());
@@ -248,7 +264,7 @@ fn drain_terminal_pods_json() -> Vec<String> {
         let (reason, exit_code) = if t.timed_out {
             (
                 "GraphNodeFault",
-                fluxor::kernel::step_guard::fault_type::DRAIN_TIMEOUT as i32,
+                crate::kernel::step_guard::fault_type::DRAIN_TIMEOUT as i32,
             )
         } else {
             ("Completed", 0)
