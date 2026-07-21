@@ -12,6 +12,13 @@
 //!   (RFC 8441) + `:protocol = websocket`. Once the server replies 200
 //!   HEADERS the stream tunnels RFC 6455 frames inside DATA frames in
 //!   both directions.
+//! - gRPC unary (`grpc = 1`): a POST that sends `content-type:
+//!   application/grpc` + `te: trailers` instead of a plain body. The
+//!   caller supplies the gRPC Length-Prefixed-Message
+//!   (`[compressed:1][len:4 BE][message]`) as `request_body`; the
+//!   response DATA (the reply LPM) is forwarded like any body, and the
+//!   trailing HEADERS' `grpc-status` is surfaced — a non-zero (non-OK)
+//!   status fails the transfer even though the HTTP `:status` is 200.
 //!
 //! Response body is forwarded to the module's data output channel
 //! until END_STREAM. Connection-level recv flow control honours
@@ -22,7 +29,8 @@
 //!
 //! - HPACK encodes literal-without-indexing entries.
 //! - Stream id is hardcoded to 1.
-//! - No Huffman; no PUSH; no CONTINUATION.
+//! - No Huffman on send (inbound Huffman strings are decoded); no
+//!   PUSH; no CONTINUATION.
 //! - h2c only on this surface; h2-over-TLS arrives via the `tls`
 //!   module wrapping the cleartext channel.
 
@@ -115,6 +123,20 @@ unsafe fn log_done(s: &HttpState) {
     }
     let n = super::fmt_u32_raw(buf.as_mut_ptr().add(o), s.client.bytes_received);
     o += n;
+    dev_log(&*s.syscalls, 3, buf.as_ptr(), o);
+}
+
+/// Emit `[http] grpc-status=N` when a gRPC call closes with a `grpc-status`
+/// trailer (RFC: the definitive per-call status; 0 = OK, non-zero = failure).
+unsafe fn log_grpc_status(s: &HttpState, status: u32) {
+    let mut buf = [0u8; 32];
+    let prefix = b"[http] grpc-status=";
+    let mut o = 0usize;
+    while o < prefix.len() {
+        buf[o] = prefix[o];
+        o += 1;
+    }
+    o += super::fmt_u32_raw(buf.as_mut_ptr().add(o), status);
     dev_log(&*s.syscalls, 3, buf.as_ptr(), o);
 }
 
@@ -506,6 +528,11 @@ unsafe fn process_one_frame(s: &mut HttpState) -> FrameAction {
             let blk = block_ptr.add(block_off);
             let mut status: u16 = 0;
             let st_ptr = &mut status as *mut u16;
+            // gRPC per-call status: -1 = absent (defaults to 0/OK per spec),
+            // >= 0 = the `grpc-status` trailer value. Carried in trailing
+            // HEADERS, or (Trailers-Only response) in the first HEADERS.
+            let mut grpc_status: i32 = -1;
+            let gs_ptr = &mut grpc_status as *mut i32;
             let dec = super::hpack::decode_block(blk, block_len, |name, value| {
                 if name == b":status" && value.len() <= 4 {
                     let mut v: u16 = 0;
@@ -516,20 +543,45 @@ unsafe fn process_one_frame(s: &mut HttpState) -> FrameAction {
                         v = v.saturating_mul(10) + (c - b'0') as u16;
                     }
                     *st_ptr = v;
+                } else if name == b"grpc-status" && !value.is_empty() && value.len() <= 4 {
+                    let mut v: i32 = 0;
+                    for &c in value {
+                        if !c.is_ascii_digit() {
+                            return;
+                        }
+                        v = v.saturating_mul(10) + (c - b'0') as i32;
+                    }
+                    *gs_ptr = v;
                 }
             });
             if dec.is_err() {
                 return FrameAction::Error;
             }
-            if status == 0 {
-                return FrameAction::Error;
+            // A HEADERS frame after the initial response headers is a
+            // trailing header block (HTTP trailers / gRPC grpc-status).
+            // Trailers carry no `:status`, so only the FIRST HEADERS is
+            // required to have one; trailers just close the stream.
+            let is_trailers = s.client.headers_done != 0;
+            if !is_trailers {
+                if status == 0 {
+                    return FrameAction::Error;
+                }
+                log(s, b"[http] headers done (h2c)");
+                s.client.headers_done = 1;
+                s.client.content_length = status as u32;
             }
-            log(s, b"[http] headers done (h2c)");
-            s.client.headers_done = 1;
-            s.client.content_length = status as u32;
 
             let end_stream = (hdr.flags & h2w::FLAG_END_STREAM) != 0;
             shift_consume(s, total);
+            // In gRPC mode the definitive per-call outcome is `grpc-status`,
+            // NOT the HTTP `:status` (a failed RPC is still HTTP 200). Surface
+            // it and fail the transfer on any non-zero (non-OK) status.
+            if s.client.grpc != 0 && grpc_status >= 0 {
+                log_grpc_status(s, grpc_status as u32);
+                if grpc_status != 0 {
+                    return FrameAction::Error;
+                }
+            }
             if end_stream {
                 return FrameAction::Done;
             }
@@ -539,24 +591,62 @@ unsafe fn process_one_frame(s: &mut HttpState) -> FrameAction {
         h2w::FRAME_DATA => {
             // Account for received bytes against connection-level
             // recv window first, regardless of WS or non-WS handling.
+            // Padding counts against flow control in full (§6.1).
             consume_recv_window(s, hdr.length);
+
+            // Strip DATA padding (§6.1) in place: drop the pad-length
+            // octet and the trailing pad, shrink the frame header, and
+            // close the gap so later frames stay contiguous. Both the
+            // WS parser and the Writing forward path (which re-parses
+            // the header) must see real payload bytes only.
+            let mut total = total;
+            let mut flags = hdr.flags;
+            let mut dlen = hdr.length as usize;
+            if (flags & h2w::FLAG_PADDED) != 0 {
+                let p = s.client.recv_buf.as_mut_ptr();
+                if dlen == 0 {
+                    return FrameAction::Error; // pad-length octet missing
+                }
+                let pad = *p.add(h2w::FRAME_HEADER_LEN) as usize;
+                if pad + 1 > dlen {
+                    // §6.1: padding >= remaining payload → PROTOCOL_ERROR.
+                    return FrameAction::Error;
+                }
+                let new_len = dlen - 1 - pad;
+                let mut i = 0;
+                while i < new_len {
+                    *p.add(h2w::FRAME_HEADER_LEN + i) = *p.add(h2w::FRAME_HEADER_LEN + 1 + i);
+                    i += 1;
+                }
+                let new_total = h2w::FRAME_HEADER_LEN + new_len;
+                let tail = len - total;
+                let mut j = 0;
+                while j < tail {
+                    *p.add(new_total + j) = *p.add(total + j);
+                    j += 1;
+                }
+                flags &= !h2w::FLAG_PADDED;
+                h2w::write_header(p, new_len as u32, h2w::FRAME_DATA, flags, hdr.stream_id);
+                s.client.recv_len -= (1 + pad) as u16;
+                total = new_total;
+                dlen = new_len;
+            }
 
             // WS-over-h2: DATA payload is a stream of RFC 6455 frames.
             // Parse and process inline; never go through the Writing
             // body-forward path.
             if s.client.websocket != 0 {
                 let payload_ptr = s.client.recv_buf.as_ptr().add(h2w::FRAME_HEADER_LEN);
-                let plen = hdr.length as usize;
-                process_ws_data(s, payload_ptr, plen);
-                let end_stream = (hdr.flags & h2w::FLAG_END_STREAM) != 0;
+                process_ws_data(s, payload_ptr, dlen);
+                let end_stream = (flags & h2w::FLAG_END_STREAM) != 0;
                 shift_consume(s, total);
                 if end_stream {
                     return FrameAction::Done;
                 }
                 return FrameAction::Continue;
             }
-            if hdr.length == 0 {
-                let end_stream = (hdr.flags & h2w::FLAG_END_STREAM) != 0;
+            if dlen == 0 {
+                let end_stream = (flags & h2w::FLAG_END_STREAM) != 0;
                 shift_consume(s, total);
                 if end_stream {
                     return FrameAction::Done;
@@ -707,20 +797,34 @@ unsafe fn build_request(s: &mut HttpState) {
     }
 
     if has_body {
+        let is_grpc = s.client.grpc != 0;
         bo += super::hpack::encode_header(
             buf.add(bo),
             REQUEST_BUF_SIZE - bo,
             b"content-type",
-            b"application/octet-stream",
+            if is_grpc {
+                b"application/grpc" as &[u8]
+            } else {
+                b"application/octet-stream"
+            },
         );
-        let mut clen = [0u8; 11];
-        let n = super::fmt_u32_raw(clen.as_mut_ptr(), s.client.request_body_len as u32);
-        bo += super::hpack::encode_header(
-            buf.add(bo),
-            REQUEST_BUF_SIZE - bo,
-            b"content-length",
-            core::slice::from_raw_parts(clen.as_ptr(), n),
-        );
+        if is_grpc {
+            // gRPC-over-HTTP/2 (§ gRPC spec) requires `te: trailers` so the
+            // server may send grpc-status/grpc-message in trailing HEADERS.
+            // No content-length: gRPC bodies are DATA-framed and END_STREAM
+            // delimited, and the framed body may exceed the initial buffer.
+            bo +=
+                super::hpack::encode_header(buf.add(bo), REQUEST_BUF_SIZE - bo, b"te", b"trailers");
+        } else {
+            let mut clen = [0u8; 11];
+            let n = super::fmt_u32_raw(clen.as_mut_ptr(), s.client.request_body_len as u32);
+            bo += super::hpack::encode_header(
+                buf.add(bo),
+                REQUEST_BUF_SIZE - bo,
+                b"content-length",
+                core::slice::from_raw_parts(clen.as_ptr(), n),
+            );
+        }
     }
 
     let block_len = bo - block_start;

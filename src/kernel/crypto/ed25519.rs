@@ -1,14 +1,18 @@
-//! Ed25519 signature verification (RFC 8032 §5.1.7).
+//! Ed25519 signatures (RFC 8032 §5.1): verify, sign, public-key derivation.
 //!
 //! Ported from TweetNaCl (public domain, Bernstein/Janssen/Lange/Schwabe/others),
 //! which is the reference small-footprint implementation. Pure Rust, no_std,
-//! no external dependencies. Used by the loader to verify per-module
-//! signatures before PIC code is admitted.
+//! no external dependencies. `verify` is used by the loader to check
+//! per-module signatures before PIC code is admitted; `sign` /
+//! `public_key` back the key_vault Ed25519 `key_type` (software backend).
 //!
 //! Field arithmetic is over GF(2^255 - 19) using a 16-limb signed
 //! radix-2^16 representation (`gf`). Edwards group operations use extended
-//! coordinates. Verification is *not* required to be constant-time; this
-//! implementation is not constant-time and must not be reused for signing.
+//! coordinates. The scalar ladder (`scalarmult` via branchless
+//! `sel25519`/`cswap`) is the TweetNaCl constant-time ladder, so the
+//! secret-scalar work in `sign`/`public_key` matches the reference's
+//! timing profile; `verify`'s decompression (`unpack_neg`) is
+//! variable-time, which is fine — its inputs are public.
 use super::sha512::Sha512;
 // ============================================================================
 // Field GF(2^255 - 19): gf = [i64; 16] in radix-2^16
@@ -335,8 +339,116 @@ fn reduce(r: &mut [u8; 64]) -> [u8; 32] {
     }
     let mut out = [0u8; 32];
     mod_l(&mut out, &mut x);
+    // `x` carries secret nonce limbs when called from `sign`.
+    wipe_i64(&mut x);
     out
 }
+// ============================================================================
+// Public sign API (RFC 8032 §5.1.5 / §5.1.6)
+// ============================================================================
+
+/// Volatile wipe so the compiler can't optimise the zeroisation away.
+fn wipe(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid &mut u8 within the slice.
+        unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
+    }
+}
+
+/// Volatile wipe for i64 limb accumulators (mod-L scratch).
+fn wipe_i64(limbs: &mut [i64]) {
+    for l in limbs.iter_mut() {
+        // SAFETY: `l` is a valid &mut i64 within the slice.
+        unsafe { core::ptr::write_volatile(l as *mut i64, 0) };
+    }
+}
+
+/// Expand a 32-byte seed into the clamped secret scalar and the 32-byte
+/// nonce prefix (RFC 8032 §5.1.5 steps 1-2). Caller must wipe both.
+fn expand_seed(seed: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let mut hasher = Sha512::new();
+    hasher.update(seed);
+    let mut h = hasher.finalize();
+    let mut a = [0u8; 32];
+    let mut prefix = [0u8; 32];
+    a.copy_from_slice(&h[0..32]);
+    prefix.copy_from_slice(&h[32..64]);
+    a[0] &= 248;
+    a[31] &= 127;
+    a[31] |= 64;
+    wipe(&mut h);
+    (a, prefix)
+}
+
+/// Derive the 32-byte Ed25519 public key from a 32-byte seed
+/// (RFC 8032 §5.1.5).
+pub fn public_key(seed: &[u8; 32]) -> [u8; 32] {
+    let (mut a, mut prefix) = expand_seed(seed);
+    let mut p: Point = [GF0; 4];
+    scalarbase(&mut p, &a);
+    let mut pk = [0u8; 32];
+    pack_point(&mut pk, &p);
+    wipe(&mut a);
+    wipe(&mut prefix);
+    pk
+}
+
+/// Sign `msg` with the 32-byte seed (RFC 8032 §5.1.6). Deterministic:
+/// the nonce is r = SHA-512(prefix ‖ M) mod L — no runtime randomness.
+/// Returns the 64-byte signature `R ‖ S`. Secret intermediates are
+/// wiped before returning.
+pub fn sign(seed: &[u8; 32], msg: &[u8]) -> [u8; 64] {
+    let (mut a, mut prefix) = expand_seed(seed);
+
+    // Public key A = [a]B (needed inside the challenge hash).
+    let mut p: Point = [GF0; 4];
+    scalarbase(&mut p, &a);
+    let mut a_enc = [0u8; 32];
+    pack_point(&mut a_enc, &p);
+
+    // r = SHA-512(prefix ‖ M) mod L; R = [r]B.
+    let mut hasher = Sha512::new();
+    hasher.update(&prefix);
+    hasher.update(msg);
+    let mut r_hash = hasher.finalize();
+    let mut r = reduce(&mut r_hash);
+    wipe(&mut r_hash);
+    let mut rp: Point = [GF0; 4];
+    scalarbase(&mut rp, &r);
+    let mut r_enc = [0u8; 32];
+    pack_point(&mut r_enc, &rp);
+
+    // k = SHA-512(R ‖ A ‖ M) mod L; S = (r + k·a) mod L.
+    let mut hasher = Sha512::new();
+    hasher.update(&r_enc);
+    hasher.update(&a_enc);
+    hasher.update(msg);
+    let mut k_hash = hasher.finalize();
+    let k = reduce(&mut k_hash);
+
+    let mut x: [i64; 64] = [0; 64];
+    for i in 0..32 {
+        x[i] = r[i] as i64;
+    }
+    for i in 0..32 {
+        for j in 0..32 {
+            x[i + j] += (k[i] as i64) * (a[j] as i64);
+        }
+    }
+    let mut s = [0u8; 32];
+    mod_l(&mut s, &mut x);
+
+    wipe(&mut a);
+    wipe(&mut prefix);
+    wipe(&mut r);
+    wipe_i64(&mut x);
+
+    let mut sig = [0u8; 64];
+    sig[0..32].copy_from_slice(&r_enc);
+    sig[32..64].copy_from_slice(&s);
+    sig
+}
+
 // ============================================================================
 // Public verify API
 // ============================================================================

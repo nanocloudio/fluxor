@@ -191,6 +191,13 @@ fn linux_init_providers() {
     // fail-closed, and delegates to the owner-bound host-process backend.
     // Host-linux; gated by requires_contract = "workload" + platform_raw.
     provider::register(dev_class::WORKLOAD, linux_workload_dispatch);
+    // KEY_VAULT hardware override (rfc_crypto_extensions §4.1/§4.3):
+    // when a PKCS#11 token is configured, re-register both KEY_VAULT
+    // dispatch paths over the kernel software default. Runs after the
+    // kernel-core registrations, so the override wins; unconfigured or
+    // failed, the software backend stays live and reports TIER=SOFTWARE.
+    #[cfg(feature = "host-hsm")]
+    fluxor::platform::linux::hsm_key_vault::try_register_from_env();
 }
 /// Platform-specific per-module cleanup for Linux host.
 ///
@@ -255,19 +262,11 @@ static LINUX_HAL_OPS: HalOps = HalOps {
 };
 
 fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {
-    // Use `libc::syscall(SYS_getrandom, …)` instead of a handwritten
-    // `svc 0` + hardcoded per-arch syscall number. The previous
-    // implementation:
-    //   - had aarch64-only inline asm but an x86_64 `cfg` branch (the
-    //     branch would have compiled but the asm used `x0..x8`
-    //     registers, so on x86_64 the symbol set was wrong);
-    //   - hardcoded `SYS_GETRANDOM = 278` for aarch64 (correct today)
-    //     and `318` for x86_64 (also correct, but type-fragile);
-    //   - didn't compile-fail when invoked on an architecture the
-    //     match didn't cover.
-    // `libc::SYS_getrandom` is the canonical per-arch constant and
-    // `libc::syscall` handles the platform-specific calling
-    // convention. See.
+    // `libc::SYS_getrandom` is the canonical per-arch syscall selector
+    // and `libc::syscall` handles the platform-specific calling
+    // convention, so this compiles correctly (or fails loudly) on any
+    // architecture libc supports — no hand-rolled `svc`/asm or
+    // hardcoded syscall numbers.
     // SAFETY: `libc::syscall` invoked with the per-arch SYS_getrandom
     // selector and `(buf, len, flags=0)` matches `getrandom(2)`. The
     // caller supplies `buf`/`len` from a Rust slice, so the pointer

@@ -1,7 +1,6 @@
 //! `fluxor modules build` — orchestrate the PIC / wasm module build.
 //!
-//! In-process discovery + compile + pack pipeline; replaces the
-//! ~50-line Makefile shell loop earlier projects carried.
+//! In-process discovery + compile + pack pipeline.
 //!
 //! Output layout:
 //!
@@ -219,9 +218,13 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
             let entry_rel = raw.entry.unwrap_or_else(|| "mod.rs".to_string());
             let entry = dir.join(&entry_rel);
             if !entry.exists() {
-                // A manifest pointing at a missing entry — skip with a
-                // diagnostic. The module-discovery glob would have hit
-                // the same gap.
+                // A manifest pointing at a missing entry is a broken
+                // module, not an absent one — diagnose the skip so the
+                // module doesn't silently vanish from the build set.
+                eprintln!(
+                    "warning: {}: entry `{entry_rel}` not found; module skipped",
+                    manifest.display()
+                );
                 continue;
             }
             let type_id = resolve_type_id(&name, raw.type_str.as_deref());
@@ -311,6 +314,167 @@ pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
         report
             .per_target
             .push(build_one_target(&target, &candidates, opts)?);
+    }
+    Ok(report)
+}
+
+/// Outcome of a module-source lint sweep (fmt or clippy).
+#[derive(Debug, Default)]
+pub struct ModuleLintReport {
+    /// Number of module sources checked.
+    pub checked: usize,
+    /// `(source, first-diagnostic)` for each source that failed.
+    pub failed: Vec<(String, String)>,
+}
+
+impl ModuleLintReport {
+    pub fn ok(&self) -> bool {
+        self.failed.is_empty()
+    }
+
+    /// Comma-joined list of the sources that failed, for a phase message.
+    pub fn failed_summary(&self) -> String {
+        self.failed
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// `rustfmt --check` every `.rs` source under the project's `modules/`
+/// tree. Formatting is target-independent, so each file is checked once.
+///
+/// This is the fmod-only counterpart to `cargo fmt --check`: a project
+/// that is all PIC modules with no host cargo workspace still gets its
+/// module sources format-gated in `fluxor ci`. Covers both module entry
+/// files and shared `include!`d fragments (which compile only inside a
+/// module but are still standalone-formattable item lists).
+///
+/// Each file is parsed under its owning module's declared edition
+/// (`manifest.toml::edition`); files outside any module dir (shared
+/// fragments) use the "2021" default the manifest parser applies.
+pub fn fmt_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLintReport> {
+    let mut report = ModuleLintReport::default();
+    let modules_root = project_root.join("modules");
+    if !modules_root.exists() {
+        return Ok(report);
+    }
+    // Best-effort: a malformed manifest is the clippy/build phases'
+    // diagnostic to raise, not a reason to abandon the format sweep.
+    let candidates = discover(project_root).unwrap_or_default();
+    for entry in walkdir::WalkDir::new(&modules_root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        report.checked += 1;
+        let rel = path
+            .strip_prefix(project_root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        if verbose {
+            eprintln!("[modules] rustfmt --check {rel}");
+        }
+        let edition = candidates
+            .iter()
+            .find(|c| path.starts_with(&c.dir))
+            .map_or("2021", |c| c.edition.as_str());
+        let out = Command::new("rustfmt")
+            .arg("--check")
+            .arg("--edition")
+            .arg(edition)
+            .arg(path)
+            .output()
+            .map_err(|e| Error::Module(format!("rustfmt: {e} (is rustfmt installed?)")))?;
+        if !out.status.success() {
+            report.failed.push((rel, "formatting differs".to_string()));
+        }
+    }
+    Ok(report)
+}
+
+/// Run `clippy-driver` over every module source using the same target,
+/// edition, and PIC flags the strict build uses. This is the fmod-only
+/// counterpart to `cargo clippy`: a project with no host crate still gets
+/// a real clippy gate on its PIC modules.
+///
+/// Each module is linted once, against the first configured target it
+/// builds for — clippy diagnostics are effectively target-invariant.
+/// `clippy::empty_loop` is allowed: the SDK's bare-metal park loops
+/// (`loop {}`) are idiomatic in `no_std` and would otherwise fire on
+/// every module through the `include!`d runtime.
+pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLintReport> {
+    crate::sync::ensure_materialized(project_root)?;
+    let targets = resolve_all_targets(project_root)?;
+    let candidates = discover(project_root)?;
+    let scratch = project_root.join("target/fluxor/clippy");
+    std::fs::create_dir_all(&scratch)?;
+    let mut report = ModuleLintReport::default();
+    for cand in &candidates {
+        // Lint against the first configured target this module builds for.
+        let Some((target, spec)) = targets.iter().find_map(|t| {
+            let silicon = target_to_silicon(t).to_string();
+            let spec = silicon_spec(&silicon)?;
+            // wasm builds as a cdylib and has no PIC lint surface here.
+            if spec.linker.is_none() || !matches_target(cand, t, &silicon) {
+                None
+            } else {
+                Some((t.clone(), spec))
+            }
+        }) else {
+            // wasm-only (or no configured target matches): nothing to lint
+            // here, but say so rather than dropping the module silently.
+            if verbose {
+                eprintln!(
+                    "[modules] clippy skip {} (no configured PIC target builds it)",
+                    cand.name
+                );
+            }
+            continue;
+        };
+        report.checked += 1;
+        if verbose {
+            eprintln!("[modules] clippy-driver {} ({target})", cand.name);
+        }
+        let rmeta = scratch.join(format!("{}.rmeta", cand.name));
+        let out = Command::new("clippy-driver")
+            .arg("--crate-type=lib")
+            .arg("--edition")
+            .arg(&cand.edition)
+            .arg("--target")
+            .arg(spec.module_target)
+            .arg("-O")
+            .arg("-C")
+            .arg("relocation-model=pic")
+            .args(spec.extra_rustflags)
+            .arg("-A")
+            .arg("clippy::empty_loop")
+            .arg("-D")
+            .arg("warnings")
+            .arg("--emit=metadata")
+            .arg("-o")
+            .arg(&rmeta)
+            .arg(&cand.entry)
+            .output()
+            .map_err(|e| {
+                Error::Module(format!(
+                    "clippy-driver: {e} (install the clippy component: `rustup component add clippy`)"
+                ))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr
+                .lines()
+                .find(|l| l.starts_with("error") || l.starts_with("warning"))
+                .unwrap_or("clippy reported errors")
+                .to_string();
+            report.failed.push((cand.name.clone(), first));
+        }
     }
     Ok(report)
 }

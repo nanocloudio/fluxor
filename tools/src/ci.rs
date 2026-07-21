@@ -81,9 +81,24 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     }
     let mut results = Vec::new();
 
+    // A fmod-only project (all PIC modules, no host crate) has no `Cargo.toml`,
+    // so `cargo fmt` / `cargo clippy` have nothing to drive. Rather than skip
+    // the lint gate there, fmt-check and clippy run directly on the PIC module
+    // sources (rustfmt + clippy-driver with the strict-build target flags).
+    let has_cargo = project_root.join("Cargo.toml").is_file();
+    let has_modules = project_root.join("modules").is_dir();
+
     // ───── Phase 1.1: fmt-check ─────────────────────────────────────
     results.push(if skip.lint {
         skipped("fmt-check")
+    } else if !has_cargo {
+        if has_modules {
+            run_step("fmt-check (modules)", verbose, || {
+                modules_fmt_check(project_root, verbose)
+            })
+        } else {
+            skipped("fmt-check")
+        }
     } else {
         run_step("fmt-check", verbose, || {
             cargo_in(project_root, &["fmt", "--all", "--", "--check"])
@@ -95,7 +110,9 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // crates that don't compile under the workspace's default-feature
     // path, so clippy runs per-target like the kernel build matrix.
     // Downstream consumers (whose `Cargo.toml` doesn't declare the
-    // kernel features) run the single-invocation form instead.
+    // kernel features) run the single-invocation form instead. A
+    // fmod-only project (no host crate) clippies its PIC sources
+    // directly via clippy-driver.
     let kernel_workspace = is_fluxor_kernel_workspace(project_root);
     let clippy_label = if kernel_workspace {
         "clippy (kernel matrix + tools)"
@@ -104,6 +121,14 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     };
     results.push(if skip.lint {
         skipped(clippy_label)
+    } else if !has_cargo {
+        if has_modules {
+            run_step("clippy (modules)", verbose, || {
+                modules_clippy_check(project_root, verbose)
+            })
+        } else {
+            skipped(clippy_label)
+        }
     } else {
         run_step(clippy_label, verbose, || {
             if kernel_workspace {
@@ -115,13 +140,18 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     });
 
     // ───── Phase 1.3: workspace [lints] opt-in audit ────────────────
-    results.push(if skip.lint {
-        skipped("workspace-lint-opt-in")
-    } else {
-        run_step("workspace-lint-opt-in", verbose, || {
-            check_workspace_lint_optin(project_root)
-        })
-    });
+    // Audits the workspace `Cargo.toml` for `[lints] workspace = true`;
+    // a crate-less fmod-only project has no such manifest, so the phase
+    // is not part of its pipeline (omitted rather than listed skipped).
+    if has_cargo {
+        results.push(if skip.lint {
+            skipped("workspace-lint-opt-in")
+        } else {
+            run_step("workspace-lint-opt-in", verbose, || {
+                check_workspace_lint_optin(project_root)
+            })
+        });
+    }
 
     // ───── Phase 1.4: hygiene ───────────────────────────────────────
     results.push(if skip.hygiene {
@@ -200,30 +230,38 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // sub-crate via `[ci.cargo] host_tools_crate = "tools"`; absent
     // that, this phase is skipped with a clear reason rather than
     // failing on a missing directory.
+    // `cargo test` needs a cargo project. A crate-less fmod-only project
+    // (no root `Cargo.toml`) with no host-tools crate has nothing here, so
+    // the phase is omitted rather than perpetually listed as skipped.
     let host_tools_crate = load_host_tools_crate(project_root);
     let tools_path = host_tools_crate.as_ref().map(|c| project_root.join(c));
-    results.push(if skip.cargo {
-        skipped("cargo-test (tools)")
-    } else {
-        match tools_path.as_ref() {
-            Some(p) if p.is_dir() => run_step("cargo-test (tools)", verbose, || {
-                cargo_in(p, &["test", "--all-targets", "--all-features"])
-            }),
-            Some(p) => PhaseResult {
-                name: "cargo-test (tools)",
-                status: PhaseStatus::Skipped,
-                elapsed_ms: 0,
-                message: format!("no host-tools crate at {}", p.display()),
-            },
-            None => PhaseResult {
-                name: "cargo-test (tools)",
-                status: PhaseStatus::Skipped,
-                elapsed_ms: 0,
-                message: "no host-tools crate (set `[ci.cargo] host_tools_crate` to enable)"
-                    .to_string(),
-            },
-        }
-    });
+    // A configured-but-missing crate still gets a phase entry so the
+    // misconfiguration surfaces as a skip message, never a silent omission.
+    let tools_applicable = has_cargo || tools_path.is_some();
+    if tools_applicable {
+        results.push(if skip.cargo {
+            skipped("cargo-test (tools)")
+        } else {
+            match tools_path.as_ref() {
+                Some(p) if p.is_dir() => run_step("cargo-test (tools)", verbose, || {
+                    cargo_in(p, &["test", "--all-targets", "--all-features"])
+                }),
+                Some(p) => PhaseResult {
+                    name: "cargo-test (tools)",
+                    status: PhaseStatus::Skipped,
+                    elapsed_ms: 0,
+                    message: format!("no host-tools crate at {}", p.display()),
+                },
+                None => PhaseResult {
+                    name: "cargo-test (tools)",
+                    status: PhaseStatus::Skipped,
+                    elapsed_ms: 0,
+                    message: "no host-tools crate (set `[ci.cargo] host_tools_crate` to enable)"
+                        .to_string(),
+                },
+            }
+        });
+    }
 
     // ───── Phase 3: modules build ───────────────────────────────────
     results.push(if skip.modules {
@@ -240,59 +278,63 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // projects that vendor fluxor without the harness see this phase
     // marked skipped rather than failed.
     let harness_path = project_root.join("tests/harness");
-    results.push(if skip.cargo {
-        skipped("cargo-test (harness)")
-    } else if !harness_path.exists() {
-        PhaseResult {
-            name: "cargo-test (harness)",
-            status: PhaseStatus::Skipped,
-            elapsed_ms: 0,
-            message: "tests/harness not present".to_string(),
-        }
-    } else {
-        run_step("cargo-test (harness)", verbose, || {
-            cargo_in(
-                &harness_path,
-                &[
-                    "test",
-                    "--target",
-                    "aarch64-unknown-linux-gnu",
-                    "--no-fail-fast",
-                ],
-            )
-        })
-    });
+    if has_cargo || harness_path.exists() {
+        results.push(if skip.cargo {
+            skipped("cargo-test (harness)")
+        } else if !harness_path.exists() {
+            PhaseResult {
+                name: "cargo-test (harness)",
+                status: PhaseStatus::Skipped,
+                elapsed_ms: 0,
+                message: "tests/harness not present".to_string(),
+            }
+        } else {
+            run_step("cargo-test (harness)", verbose, || {
+                cargo_in(
+                    &harness_path,
+                    &[
+                        "test",
+                        "--target",
+                        "aarch64-unknown-linux-gnu",
+                        "--no-fail-fast",
+                    ],
+                )
+            })
+        });
+    }
 
     // tls crypto KATs live in the modules/foundation/tls crate which
     // defaults to `#![no_std]` / `#![no_main]`. `cargo test -p` from
     // workspace root with `--features host-test` toggles those off.
     let tls_path = project_root.join("modules/foundation/tls");
-    results.push(if skip.cargo {
-        skipped("cargo-test (tls KATs)")
-    } else if !tls_path.exists() {
-        PhaseResult {
-            name: "cargo-test (tls KATs)",
-            status: PhaseStatus::Skipped,
-            elapsed_ms: 0,
-            message: "tls module not present".to_string(),
-        }
-    } else {
-        run_step("cargo-test (tls KATs)", verbose, || {
-            cargo_in(
-                project_root,
-                &[
-                    "test",
-                    "-p",
-                    "fluxor-mod-tls",
-                    "--features",
-                    "host-test",
-                    "--target",
-                    "aarch64-unknown-linux-gnu",
-                    "--no-fail-fast",
-                ],
-            )
-        })
-    });
+    if has_cargo || tls_path.exists() {
+        results.push(if skip.cargo {
+            skipped("cargo-test (tls KATs)")
+        } else if !tls_path.exists() {
+            PhaseResult {
+                name: "cargo-test (tls KATs)",
+                status: PhaseStatus::Skipped,
+                elapsed_ms: 0,
+                message: "tls module not present".to_string(),
+            }
+        } else {
+            run_step("cargo-test (tls KATs)", verbose, || {
+                cargo_in(
+                    project_root,
+                    &[
+                        "test",
+                        "-p",
+                        "fluxor-mod-tls",
+                        "--features",
+                        "host-test",
+                        "--target",
+                        "aarch64-unknown-linux-gnu",
+                        "--no-fail-fast",
+                    ],
+                )
+            })
+        });
+    }
 
     Ok(results)
 }
@@ -1256,6 +1298,40 @@ fn git_short_sha(dir: &Path) -> Option<String> {
     }
     let s = String::from_utf8(output.stdout).ok()?;
     Some(s.trim().to_string())
+}
+
+/// fmt-check phase for fmod-only projects: `rustfmt --check` every module
+/// source (there's no host crate for `cargo fmt`).
+fn modules_fmt_check(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
+    let report =
+        modules_build::fmt_check_modules(project_root, verbose).map_err(|e| e.to_string())?;
+    if report.ok() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} module sources need formatting (run `rustfmt` on them): {}",
+            report.failed.len(),
+            report.checked,
+            report.failed_summary()
+        ))
+    }
+}
+
+/// clippy phase for fmod-only projects: run `clippy-driver` over every
+/// module source with the strict-build target flags.
+fn modules_clippy_check(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
+    let report =
+        modules_build::clippy_check_modules(project_root, verbose).map_err(|e| e.to_string())?;
+    if report.ok() {
+        Ok(())
+    } else {
+        Err(format!(
+            "clippy failed on {} of {} modules: {}",
+            report.failed.len(),
+            report.checked,
+            report.failed_summary()
+        ))
+    }
 }
 
 fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {

@@ -88,6 +88,13 @@ pub(crate) struct ClientState {
     /// WS phase: 0 = haven't sent CLOSE, 1 = CLOSE queued, 2 = peer
     /// CLOSE echo observed → exit on next tick.
     pub(crate) ws_done: u8,
+    /// 1 = issue a gRPC unary POST instead of a plain POST: the request
+    /// carries `content-type: application/grpc` and `te: trailers`
+    /// (RFC-required for gRPC-over-HTTP/2). Only honored when
+    /// `protocol == 1` and a `request_body` (the length-prefixed message)
+    /// is set. The body itself is passed through unframed — the caller
+    /// supplies the gRPC `[compressed-flag:1][len:4 BE][message]` LPM.
+    pub(crate) grpc: u8,
     /// 1 = a connection-level WINDOW_UPDATE should be queued in
     /// `request_buf` once it's free, refilling our recv flow-control
     /// window. Tracked per client (h2 only).

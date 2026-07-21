@@ -408,6 +408,17 @@ pub fn init_providers() {
     // itself. If nothing is registered, `provider::dispatch(FS, …)`
     // returns ENOSYS naturally; no stub needed.
     provider::register(dev_class::BUFFER, buffer_provider_dispatch);
+    // KEY_VAULT: the kernel software backend is the *default* a platform
+    // may override (rfc_crypto_extensions §4.1). Unlike FS, KEY_VAULT is
+    // registered here in kernel core on BOTH paths — this class-byte
+    // dispatch and the KEY_VAULT_VTABLE below — so a hardware platform
+    // (e.g. the Linux PKCS#11 backend) must re-register BOTH at platform
+    // boot: `register` and `register_vtable` overwrite, and
+    // `hal::init_providers()` runs after these defaults, so a platform
+    // override wins. Overriding only one path would split custody
+    // between two backends. When no hardware is present the software
+    // backend stays live; consumers never name a platform — they read
+    // PROBE/CAPS/TIER.
     provider::register(dev_class::KEY_VAULT, key_vault_provider_dispatch);
 
     // Handle-scoped vtables for the kernel-owned contracts. Tracked
@@ -484,6 +495,10 @@ static BUFFER_VTABLE: crate::kernel::provider::ProviderVTable =
         default_close_op: 0, // buffers released by explicit RELEASE opcodes
     };
 
+// Default (software-backend) KEY_VAULT vtable. A hardware platform
+// overriding KEY_VAULT registers its own vtable with the same
+// `default_close_op` alongside its class dispatch — see the note at
+// the class registration in `init_providers`.
 static KEY_VAULT_VTABLE: crate::kernel::provider::ProviderVTable =
     crate::kernel::provider::ProviderVTable {
         contract: crate::kernel::provider::contract::KEY_VAULT,

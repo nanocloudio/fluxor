@@ -94,7 +94,7 @@ fn load_gy() -> U256 {
 #[inline(never)]
 fn load_n_half() -> U256 {
     pic_u256([
-        0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737556, 0xFFFFFFFF, 0xFFFFFFFF, 0x80000000,
+        0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737D56, 0xFFFFFFFF, 0x7FFFFFFF, 0x80000000,
         0x7FFFFFFF,
     ])
 }

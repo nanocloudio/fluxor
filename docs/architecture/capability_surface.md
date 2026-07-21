@@ -295,19 +295,21 @@ content_type = "AudioSample"
 direction = "input"
 content_type = "AudioSample"
 
-# fat32/manifest.toml
+# fat32/manifest.toml — the *semantic surfaces* here are storage.block
+# (consumed) and file.data (provided), declared via requires/provides;
+# on the wire both ride the OctetStream content type.
 [[ports]]
 direction = "input"
-content_type = "storage.block"
+content_type = "OctetStream"
 
 [[ports]]
 direction = "output"
-content_type = "file.data"
+content_type = "OctetStream"
 
 # sd/manifest.toml
 [[ports]]
 direction = "output"
-content_type = "storage.block"
+content_type = "OctetStream"
 
 # epaper/manifest.toml
 [[ports]]
@@ -317,13 +319,16 @@ content_type = "VideoDraw"
 
 ### Content Type Registry
 
-Content types describe the data format flowing through channels. They use
-a hierarchical naming scheme matching the capability taxonomy.
+Content types describe the data format flowing through channels.
 
 Content-type identifiers are `UpperCamelCase` and resolve to a positional
-wire byte (`contracts/src/lib.rs::CONTENT_TYPES`). The four storage surfaces
-are the deliberate exception: they keep their dotted lowercase spelling, which
-doubles as their semantic-surface and provider-contract name.
+wire byte (`contracts/src/lib.rs::CONTENT_TYPES`); tooling writes the byte
+index into the compiled manifest and the kernel routes by byte, never by
+name. The dotted lowercase storage names (`storage.block`, `file.data`,
+`storage.namespace`, `storage.object`) are *not* content types — they are
+semantic surfaces (and, for the latter two, provider-contract names, the
+deliberate dotted exception among contracts). Their byte streams ride
+`OctetStream` on the wire.
 
 | Content Type | Description | Example Providers |
 |-------------|-------------|-------------------|
@@ -332,10 +337,7 @@ doubles as their semantic-surface and provider-contract name.
 | `AudioMp3` | Specifically MP3 | file reader with MP3 files |
 | `VideoDraw` | Drawing commands or framebuffer | photo viewer, UI renderer |
 | `PointerEvents` | Pointer / touch coordinates and gestures | xpt2046, ft6236 |
-| `storage.block` | Raw block I/O (512-byte sectors) | sd, flash |
-| `file.data` | File byte stream | fat32, littlefs, http, nfs |
-| `storage.namespace` | Directory-like name-keyed addressing (lookup, list, rename, delete, subscribe) | fat32, linux_fs, replicated namespace adapters |
-| `storage.object` | Whole-blob byte-addressed put / get / range_get / head | content-addressed stores, replicated object stores, HTTP-backed adapters |
+| `OctetStream` | Untyped byte stream (block I/O, file data, project-local protocols) | sd, fat32, littlefs, http |
 | `EthernetFrame` | Raw ethernet frames | cyw43, enc28j60, ip |
 | `FmpMessage` | FMP messages (next/prev/toggle) | button, gesture, bank |
 | `NetProto` | Unified TCP/UDP framing (`[msg_type][len][payload]`) | ip, tls, ch9120 |
@@ -455,7 +457,7 @@ To keep behavior predictable and debuggable:
    the auto-wirer doesn't also try to wire `synth.out -> i2s.in`.
 
 5. **Validate all connections**: even explicit wiring is checked against
-   content types. Connecting `synth.out(AudioSample)` to `fat32.in(storage.block)`
+   content types. Connecting `synth.out(AudioSample)` to `fat32.in(OctetStream)`
    produces a type mismatch warning.
 
 ### What Gets Auto-Wired vs What Stays Explicit

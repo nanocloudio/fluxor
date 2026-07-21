@@ -233,6 +233,9 @@ mod params_def {
         8, host_tcp, u8, 0
             => |s, d, len| { s.host_tcp = p_u8(d, len, 0, 0); };
 
+        9, grpc, u8, 0
+            => |s, d, len| { s.client.grpc = p_u8(d, len, 0, 0); };
+
         10, route_0_path, str, 0
             => |s, d, len| { server::parse_route_path(s, 0, d, len); };
         11, route_0_body, str, 0
