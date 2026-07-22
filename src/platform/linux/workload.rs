@@ -15,11 +15,30 @@
 // Composes the host-process backend in the sibling `oci` module.
 
 use super::oci::{
-    oci_destroy, oci_read, oci_signal, oci_spawn, oci_start, oci_wait, ResourceEnvelope,
-    MAX_SANDBOXES,
+    oci_destroy, oci_exec, oci_read, oci_signal, oci_spawn, oci_start, oci_tty_close, oci_tty_open,
+    oci_tty_resize, oci_tty_step, oci_wait, ResourceEnvelope, MAX_SANDBOXES,
 };
 use crate::abi::contracts::workload as wl;
 use crate::kernel::owner::OwnerHandle;
+
+// Backend-local workload opcodes — not part of the hashed `workload` SDK
+// contract, so they need no ABI-surface re-pin; an opcode the runtime handles
+// beyond the contract set is ABI-compatible.
+//
+/// `EXEC` (0x1A06) — one-shot: run a command inside a workload and capture its
+/// output (`kubectl exec pod -- cmd`). `arg` in = command line; out =
+/// `[out_len:u32][output…]`; return = exit code.
+const WL_EXEC: u32 = 0x1A06;
+/// `TTY_OPEN` (0x1A07) — start an interactive PTY session (`kubectl exec -it`).
+/// `arg` = `[rows:u16][cols:u16][cmd…]`; return = session id.
+const WL_TTY_OPEN: u32 = 0x1A07;
+/// `TTY_STEP` (0x1A08) — pump a session: write stdin, drain output, poll exit.
+/// `arg` in = `[sid:u32][wlen:u32][stdin…]`; out = `[rlen:u32][state:u8][code:i32][out…]`.
+const WL_TTY_STEP: u32 = 0x1A08;
+/// `TTY_RESIZE` (0x1A09) — `arg` = `[sid:u32][rows:u16][cols:u16]`.
+const WL_TTY_RESIZE: u32 = 0x1A09;
+/// `TTY_CLOSE` (0x1A0A) — kill+reap+free a session. `arg` = `[sid:u32]`; return = exit code.
+const WL_TTY_CLOSE: u32 = 0x1A0A;
 
 const MAX_WORKLOADS: usize = MAX_SANDBOXES;
 
@@ -251,6 +270,17 @@ pub unsafe fn linux_workload_dispatch(
     if opcode == wl::CAPS {
         return workload_caps(arg, arg_len);
     }
+    // Interactive-session pump ops carry the session id in `arg`, not the
+    // workload handle, so they resolve independently of the sandbox slot.
+    if opcode == WL_TTY_STEP {
+        return oci_tty_step(arg, arg_len);
+    }
+    if opcode == WL_TTY_RESIZE {
+        return oci_tty_resize(arg as *const u8, arg_len);
+    }
+    if opcode == WL_TTY_CLOSE {
+        return oci_tty_close(arg as *const u8, arg_len);
+    }
 
     let raw = slot_of(handle);
     let Some(bidx) = workload_backend_idx(raw) else {
@@ -259,6 +289,8 @@ pub unsafe fn linux_workload_dispatch(
     match opcode {
         wl::START => oci_start(bidx),
         wl::READ => oci_read(bidx, arg, arg_len),
+        WL_EXEC => oci_exec(bidx, arg, arg_len),
+        WL_TTY_OPEN => oci_tty_open(bidx, arg as *const u8, arg_len),
         wl::WAIT => oci_wait(bidx, arg, arg_len),
         wl::SIGNAL => {
             if arg.is_null() || arg_len < 4 {

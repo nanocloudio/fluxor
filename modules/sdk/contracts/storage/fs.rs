@@ -134,6 +134,31 @@ pub const MKDIR: u32 = 0x090B;
 /// return `ENOSYS` and leave [`caps::PREALLOCATE`] clear.
 pub const PREALLOCATE: u32 = 0x090E;
 
+/// Write data through an FD **without** the synchronous durability the
+/// plain [`WRITE`] path implies — the provider submits the sectors to
+/// the block source's async ring (multiple in flight) and returns. The
+/// caller establishes durability with [`FSYNC_SUBMIT`] / [`FSYNC_POLL`].
+/// Same arg shape as [`WRITE`] (`handle=file`, `arg=data`,
+/// `arg_len=len`). Lets a durable append log (the WAL) pipeline its
+/// writes instead of spin-polling each, the single biggest write-
+/// throughput lever. Providers without the async tier return `ENOSYS`
+/// and leave [`caps::FSYNC_ASYNC`] clear; callers fall back to `WRITE`.
+pub const WRITE_ASYNC: u32 = 0x090F;
+
+/// Open a non-blocking durability fence over every async write issued on
+/// this FD so far. `handle=file`; `arg` is a ≥8-byte output buffer that
+/// receives a `u64` LE ticket. Returns 0. The caller polls the ticket
+/// with [`FSYNC_POLL`] until it reports durable. Flushes any pending
+/// deferred sector into the async ring first so the fence covers it.
+pub const FSYNC_SUBMIT: u32 = 0x0910;
+
+/// Non-blocking poll of a fence ticket from [`FSYNC_SUBMIT`].
+/// `handle=file`; `arg` holds the `u64` LE ticket. Returns 0 = durable
+/// (all fenced writes are on non-volatile media), 1 = pending, or a
+/// negative errno if a fenced write failed. The caller (WAL) must
+/// withhold its durable acknowledgement until this returns 0.
+pub const FSYNC_POLL: u32 = 0x0911;
+
 /// FS provider capability bitmap. `provider_call(handle, CAPS,
 /// out, out_len)` writes a `u32` (little-endian, 4 bytes) into
 /// `out`.
@@ -226,4 +251,10 @@ pub mod caps {
     /// [`PREALLOCATE`] (0x090E) — physically reserve fixed file capacity and
     /// leave its descriptor positioned at byte zero.
     pub const PREALLOCATE:    u32 = 1 << 9;
+    /// [`WRITE_ASYNC`] (0x090F) + [`FSYNC_SUBMIT`]/[`FSYNC_POLL`]
+    /// (0x0910/0x0911) — the pipelined async durable-write tier. Set iff
+    /// the provider (and its block source) implement submit-now /
+    /// fence-later durability; callers fall back to `WRITE`+`FSYNC` when
+    /// clear.
+    pub const FSYNC_ASYNC:    u32 = 1 << 10;
 }

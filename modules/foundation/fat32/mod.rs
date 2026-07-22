@@ -493,6 +493,13 @@ struct OpenFile {
     /// are not durable, so deferring their device write loses nothing a crash
     /// wouldn't already lose — FS_FSYNC flushes the pending sector first.
     scratch_dirty: u8,
+    /// 1 when this FD uses the async durable-write path (`WRITE_ASYNC` +
+    /// `FSYNC_SUBMIT`/`FSYNC_POLL`): deferred-sector flushes are submitted
+    /// to the block source's async ring instead of spin-polled, and the
+    /// durability fence is a non-blocking submit/poll. Set by `WRITE_ASYNC`;
+    /// a plain `WRITE`/`FS_FSYNC` FD leaves it 0 and takes the sync
+    /// spin-polled path throughout.
+    async_mode: u8,
 }
 
 impl OpenFile {
@@ -524,6 +531,7 @@ impl OpenFile {
             _pad_of: 0,
             scratch_lba: 0,
             scratch_dirty: 0,
+            async_mode: 0,
         }
     }
 }
@@ -1202,6 +1210,9 @@ const FS_CLOSE:   u32 = 0x0903;
 const FS_STAT:    u32 = 0x0904;
 const FS_FSYNC:   u32 = 0x0905;
 const FS_WRITE:   u32 = 0x0906;
+const FS_WRITE_ASYNC:  u32 = 0x090F;
+const FS_FSYNC_SUBMIT: u32 = 0x0910;
+const FS_FSYNC_POLL:   u32 = 0x0911;
 const FS_OPENDIR: u32 = 0x0907;
 const FS_READDIR: u32 = 0x0908;
 /// `OPEN_CREATE` (0x0909) is documented in
@@ -1240,6 +1251,7 @@ const FS_CAP_WRITE:       u32 = 1 << 3;
 const FS_CAP_FSYNC:       u32 = 1 << 4;
 const FS_CAP_UNLINK:      u32 = 1 << 5;
 const FS_CAP_PREALLOCATE: u32 = 1 << 9;
+const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
 
 /// `Fence::LocalDurable` device id reported by fat32 handles once their
 /// data has been fsync'd. Opaque per `contracts::fence::DeviceId` (u64);
@@ -1976,6 +1988,46 @@ unsafe fn fs_sync_flush(s: &Fat32State) -> i32 {
     dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_FLUSH_SYNC, core::ptr::null_mut(), 0)
 }
 
+/// Submit one 512-byte sector write WITHOUT waiting (async durable-write
+/// path). The block source copies the data into its own in-flight DMA
+/// slot before returning, so `buf` (an FD's `scratch_block`) is free to
+/// reuse immediately. Returns 0 on submit, `E_AGAIN` when the ring is
+/// full (callers surface this as backpressure — a short write count or
+/// a retried fence — never a silent sync downgrade), or a negative
+/// errno.
+unsafe fn fs_async_write_sector(s: &Fat32State, lba: u32, buf: *const u8) -> i32 {
+    let mut arg = [0u8; 16];
+    let lba_b = lba.to_le_bytes();
+    arg[0] = lba_b[0]; arg[1] = lba_b[1]; arg[2] = lba_b[2]; arg[3] = lba_b[3];
+    arg[4] = 1; arg[5] = 0; // nlb = 1
+    let buf_b = (buf as u64).to_le_bytes();
+    let mut i = 0usize;
+    while i < 8 { arg[8 + i] = buf_b[i]; i += 1; }
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_WRITE_LBAS_ASYNC, arg.as_mut_ptr(), 16)
+}
+
+/// Open a durability fence over every async write submitted so far,
+/// writing its ticket (`u64`) into `ticket`. Pairs with
+/// [`fs_fence_poll`]. Returns the ioctl rc; on failure `ticket` is left
+/// untouched — a failed fence MUST NOT alias ticket 0, which polls as
+/// already-durable.
+unsafe fn fs_fence_submit(s: &Fat32State, ticket: &mut u64) -> i32 {
+    let mut arg = [0u8; 8];
+    let rc = dev_channel_ioctl(
+        s.sys(), s.in_chan, IOCTL_BLOCKS_FENCE_SUBMIT, arg.as_mut_ptr(), 8,
+    );
+    if rc != 0 { return rc; }
+    *ticket = u64::from_le_bytes(arg);
+    0
+}
+
+/// Non-blocking poll of a fence ticket. Returns 0 = durable, 1 = pending,
+/// or a negative errno if a harvested write failed.
+unsafe fn fs_fence_poll(s: &Fat32State, ticket: u64) -> i32 {
+    let mut arg = ticket.to_le_bytes();
+    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_FENCE_POLL, arg.as_mut_ptr(), 8)
+}
+
 /// Synchronously read one sector at `lba` into `block_buf`. Hoists the
 /// buffer pointer into a local first so the raw `*mut` doesn't collide
 /// with the immutable `&Fat32State` borrow the read takes (matches the
@@ -2695,12 +2747,19 @@ unsafe fn fs_op_preallocate(
 /// Sector-at-a-time
 /// read-modify-write. The directory-entry size is updated lazily at
 /// FS_FSYNC / FS_CLOSE. Returns bytes written.
-unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
+unsafe fn fs_op_write(
+    s: &mut Fat32State,
+    handle: i32,
+    arg: *const u8,
+    arg_len: usize,
+    async_flush: bool,
+) -> i32 {
     if arg.is_null() { return E_INVAL; }
     if arg_len == 0 { return 0; }
     let slot = handle as usize;
     if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
     if s.open_files[slot].writable == 0 { return E_INVAL; }
+    if async_flush { s.open_files[slot].async_mode = 1; }
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
     if bps == 0 || spc == 0 { return E_AGAIN; }
@@ -2710,6 +2769,57 @@ unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: 
     let mut done = 0usize;
     while done < total {
         let pos = s.open_files[slot].offset;
+        // Fixed-capacity overrun aborts FIRST — before the flush and the
+        // cluster-cursor work below — so an ENOSPC return leaves the FD
+        // exactly as this iteration found it (same re-entrancy rule as the
+        // flush ordering: a caller that continues after ENOSPC must not
+        // find the chain cursor advanced past its bytes).
+        if s.open_files[slot].fixed_capacity != 0 {
+            let n = core::cmp::min(bps as usize - (pos % bps) as usize, total - done);
+            if pos.saturating_add(n as u32) > s.open_files[slot].size {
+                return -28; // ENOSPC within fixed capacity
+            }
+        }
+        // Flush the previously-cached sector BEFORE any cluster-cursor
+        // advancement below, and only when this iteration's write leaves it
+        // (a cluster boundary always starts a new sector; mid-cluster the
+        // target sector is computable without advancing). Ordering matters:
+        // the async path can return early on ring-full (E_AGAIN), and a
+        // retry re-enters this iteration from the top — if the cursor had
+        // already advanced (or an extent had been allocated and linked),
+        // the retry would advance the chain a second time and corrupt it.
+        if s.open_files[slot].scratch_dirty != 0 {
+            let leaving = if pos % cpb == 0 {
+                true
+            } else {
+                let cur = s.open_files[slot].current_cluster;
+                let sec = cluster_to_sector(s, cur) + (pos / bps) % spc;
+                sec != s.open_files[slot].scratch_lba
+            };
+            if leaving {
+                let prev = s.open_files[slot].scratch_lba;
+                let wp = s.open_files[slot].scratch_block.as_ptr();
+                // Async mode submits the completed sector to the block ring
+                // (copied into a device DMA slot, so `scratch_block` is free
+                // to reuse on return) and pipelines; durability is proven by
+                // the FSYNC_SUBMIT/POLL fence, not this submit.
+                if async_flush {
+                    let wr = fs_async_write_sector(s, prev, wp);
+                    if wr == E_AGAIN {
+                        // Ring full — real backpressure, NOT a silent sync
+                        // downgrade. Leave the sector in scratch (dirty) and
+                        // return the bytes accepted so far; the caller rewinds
+                        // and retries once a slot frees (in-flight writes drain
+                        // within a step or two). No error, no data loss.
+                        return done as i32;
+                    }
+                    if wr != 0 { return -5; }
+                } else if fs_sync_write_sector(s, prev, wp) != 0 {
+                    return -5;
+                }
+                s.open_files[slot].scratch_dirty = 0;
+            }
+        }
         // At a cluster boundary, select or allocate the cluster containing
         // byte `pos`.
         if pos % cpb == 0 {
@@ -2756,20 +2866,6 @@ unsafe fn fs_op_write(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: 
         let sector = cluster_to_sector(s, cur) + sec_in_clu;
         let off_in_sec = (pos % bps) as usize;
         let n = core::cmp::min(bps as usize - off_in_sec, total - done);
-        if s.open_files[slot].fixed_capacity != 0
-            && pos.saturating_add(n as u32) > s.open_files[slot].size
-        {
-            return -28; // ENOSPC within fixed capacity
-        }
-        // Moving to a different sector: the previously-cached sector is now
-        // complete (this write starts a new one). If it carried un-flushed
-        // appends, write it out once, now, before `scratch_block` is reused.
-        if s.open_files[slot].scratch_lba != sector && s.open_files[slot].scratch_dirty != 0 {
-            let prev = s.open_files[slot].scratch_lba;
-            let wp = s.open_files[slot].scratch_block.as_ptr();
-            if fs_sync_write_sector(s, prev, wp) != 0 { return -5; }
-            s.open_files[slot].scratch_dirty = 0;
-        }
         // Read-modify-write only when starting mid-sector (preserve the
         // existing prefix). A fresh sector written from offset 0 needs no
         // read — bytes past `size` are never read (size-capped). And when
@@ -2857,6 +2953,72 @@ unsafe fn fs_op_fsync(s: &mut Fat32State, handle: i32) -> i32 {
     rc
 }
 
+/// FSYNC_SUBMIT: open a non-blocking durability fence over this FD's
+/// writes, returning its ticket (`u64` LE) in `arg` (≥8 bytes). Flushes
+/// the pending scratch sector — async when the FD is in async mode — so
+/// the fence covers it, then snapshots the block source's submit
+/// high-water. A dirty directory entry is NOT written here: the entry
+/// (size metadata pointing at the data) goes to the device only once
+/// the fence proves the data durable, in `fs_op_fsync_poll` — the same
+/// data-before-metadata order the sync `fs_op_fsync` path establishes.
+/// Does NOT block on durability; the caller polls with
+/// `fs_op_fsync_poll`.
+unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+    let slot = handle as usize;
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
+    if arg.is_null() || arg_len < 8 { return E_INVAL; }
+    if s.open_files[slot].writable == 0 {
+        let mut i = 0usize; while i < 8 { *arg.add(i) = 0; i += 1; }
+        return 0;
+    }
+    if s.open_files[slot].scratch_dirty != 0 {
+        let lba = s.open_files[slot].scratch_lba;
+        let wp = s.open_files[slot].scratch_block.as_ptr();
+        // Async: submit the final partial sector to the ring. On ring-full
+        // return E_AGAIN so the caller retries the fence next step (real
+        // backpressure — no sync downgrade). The fence opened below then
+        // covers it.
+        let rc = if s.open_files[slot].async_mode != 0 {
+            fs_async_write_sector(s, lba, wp)
+        } else {
+            fs_sync_write_sector(s, lba, wp)
+        };
+        if rc != 0 { return rc; }
+        s.open_files[slot].scratch_dirty = 0;
+    }
+    let mut ticket = 0u64;
+    let rc = fs_fence_submit(s, &mut ticket);
+    if rc != 0 { return rc; }
+    let tb = ticket.to_le_bytes();
+    let mut i = 0usize; while i < 8 { *arg.add(i) = tb[i]; i += 1; }
+    0
+}
+
+/// FSYNC_POLL: non-blocking poll of a fence ticket (`u64` LE in `arg`).
+/// Returns 0 = durable (promotes the FD's fence to LocalDurable), 1 =
+/// pending, or a negative errno if a fenced write failed. On the durable
+/// transition, a dirty directory entry is written back first — sync,
+/// durable on completion — so the size metadata never lands on media
+/// ahead of the data it points at (see `fs_op_fsync_submit`).
+unsafe fn fs_op_fsync_poll(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
+    let slot = handle as usize;
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
+    if arg.is_null() || arg_len < 8 { return E_INVAL; }
+    let ticket = u64::from_le_bytes([
+        *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+        *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+    ]);
+    let rc = fs_fence_poll(s, ticket);
+    if rc == 0 {
+        if s.open_files[slot].dirty != 0 {
+            let wb = fs_writeback_dir_entry(s, slot);
+            if wb != 0 { return wb; }
+        }
+        s.open_files[slot].durable = 1;
+    }
+    rc
+}
+
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_dispatch")]
 #[cfg_attr(not(feature = "host-test"), export_name = "module_provider_dispatch")]
 pub unsafe extern "C" fn fat32_fs_dispatch(
@@ -2911,7 +3073,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         }
         let caps: u32 = FS_CAP_OPEN | FS_CAP_OPENDIR
             | FS_CAP_OPEN_CREATE | FS_CAP_WRITE | FS_CAP_FSYNC
-            | FS_CAP_UNLINK | FS_CAP_PREALLOCATE;
+            | FS_CAP_UNLINK | FS_CAP_PREALLOCATE | FS_CAP_FSYNC_ASYNC;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -2930,8 +3092,11 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         FS_OPEN_CREATE => fs_op_create(s, arg as *const u8, arg_len),
         FS_UNLINK      => fs_op_unlink(s, arg as *const u8, arg_len),
         FS_PREALLOCATE => fs_op_preallocate(s, handle, arg as *const u8, arg_len),
-        FS_WRITE       => fs_op_write(s, handle, arg as *const u8, arg_len),
+        FS_WRITE       => fs_op_write(s, handle, arg as *const u8, arg_len, false),
+        FS_WRITE_ASYNC => fs_op_write(s, handle, arg as *const u8, arg_len, true),
         FS_FSYNC       => fs_op_fsync(s, handle),
+        FS_FSYNC_SUBMIT => fs_op_fsync_submit(s, handle, arg, arg_len),
+        FS_FSYNC_POLL  => fs_op_fsync_poll(s, handle, arg as *const u8, arg_len),
         _ => -38, // ENOSYS
     }
 }

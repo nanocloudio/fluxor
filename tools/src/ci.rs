@@ -272,6 +272,28 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         })
     });
 
+    // ───── Phase 3.5: project test scripts (E2E gate) ───────────────
+    //
+    // A fmod-only project has no cargo tests — its behaviour is proven by
+    // graph E2Es that boot the built `.fmod` artefacts. `[ci.test] scripts
+    // = [...]` (globs) declares them; each runs here, after the strict
+    // module build that produces the artefacts they load. This is the
+    // in-`ci` home for a project's runtime gate, so `make ci` proves
+    // behaviour and not just lint/build. Omitted when unconfigured; a
+    // failing script names itself (and dumps a log tail) in the phase
+    // message. `--skip cargo` (the test skip) bypasses it.
+    match load_test_scripts(project_root) {
+        Ok(test_scripts) if test_scripts.is_empty() => {}
+        Ok(test_scripts) => results.push(if skip.cargo {
+            skipped("project-e2e")
+        } else {
+            run_step("project-e2e", verbose, || {
+                run_test_scripts(project_root, &test_scripts, verbose)
+            })
+        }),
+        Err(e) => results.push(run_step("project-e2e", verbose, move || Err(e))),
+    }
+
     // ───── Phase 4: cargo integration / harness tests ───────────────
     //
     // The harness is a sub-workspace at `tests/harness/`. Downstream
@@ -1330,6 +1352,146 @@ fn modules_clippy_check(project_root: &Path, verbose: bool) -> std::result::Resu
             report.failed.len(),
             report.checked,
             report.failed_summary()
+        ))
+    }
+}
+
+/// Read `[ci.test] scripts` from `fluxor.toml` — the globs of shell
+/// scripts that make up a project's runtime (E2E) test gate. Empty when
+/// unconfigured, which omits the phase entirely. A fluxor.toml that
+/// exists but can't be read or parsed is an error — a broken config must
+/// fail the phase, never silently omit it.
+fn load_test_scripts(project_root: &Path) -> std::result::Result<Vec<String>, String> {
+    let fp = project_root.join("fluxor.toml");
+    if !fp.exists() {
+        return Ok(Vec::new());
+    }
+    #[derive(serde::Deserialize)]
+    struct Top {
+        ci: Option<Ci>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Ci {
+        test: Option<Test>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Test {
+        scripts: Option<Vec<String>>,
+    }
+    let raw = std::fs::read_to_string(&fp).map_err(|e| format!("{}: {e}", fp.display()))?;
+    let top: Top = toml::from_str(&raw).map_err(|e| format!("parsing fluxor.toml: {e}"))?;
+    Ok(top
+        .ci
+        .and_then(|c| c.test)
+        .and_then(|t| t.scripts)
+        .unwrap_or_default())
+}
+
+/// Expand a `dir/pattern` glob (single `*` wildcard in the filename
+/// component) relative to `project_root`, appending matches to `out`.
+/// Dependency-free — covers the `scripts/*-e2e.sh` shape without pulling
+/// in a glob crate.
+fn expand_glob(project_root: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
+    let (dir_part, file_pat) = match pattern.rsplit_once('/') {
+        Some((d, f)) => (d, f),
+        None => (".", pattern),
+    };
+    let dir = project_root.join(dir_part);
+    match file_pat.split_once('*') {
+        None => {
+            // No wildcard — a literal path.
+            let p = dir.join(file_pat);
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+        Some((prefix, suffix)) => {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.filter_map(std::result::Result::ok) {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.len() >= prefix.len() + suffix.len()
+                    && name.starts_with(prefix)
+                    && name.ends_with(suffix)
+                    && entry.path().is_file()
+                {
+                    out.push(entry.path());
+                }
+            }
+        }
+    }
+}
+
+/// Run each configured test script (via `bash`, cwd = project root) as
+/// the project's runtime gate. Aggregates: fails if any script exits
+/// non-zero, naming the failures and dumping a tail of each one's output
+/// so a CI log shows what broke without a re-run.
+fn run_test_scripts(
+    project_root: &Path,
+    globs: &[String],
+    verbose: bool,
+) -> std::result::Result<(), String> {
+    let mut scripts = Vec::new();
+    let mut unmatched = Vec::new();
+    for g in globs {
+        let before = scripts.len();
+        expand_glob(project_root, g, &mut scripts);
+        if scripts.len() == before {
+            unmatched.push(g.as_str());
+        }
+    }
+    if !unmatched.is_empty() {
+        // Every configured glob must resolve — a pattern that matches
+        // nothing means a moved/renamed script would silently drop out of
+        // the gate.
+        return Err(format!(
+            "[ci.test] scripts matched no files: {}",
+            unmatched.join(", ")
+        ));
+    }
+    scripts.sort();
+    scripts.dedup();
+    let mut failed = Vec::new();
+    for script in &scripts {
+        let name = script
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?")
+            .to_string();
+        if verbose {
+            eprintln!("[ci] project-e2e: {name}");
+        }
+        match Command::new("bash")
+            .arg(script)
+            .current_dir(project_root)
+            .output()
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                failed.push(name.clone());
+                // Dump a tail so the failure is diagnosable from the CI log.
+                let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
+                combined.push_str(&String::from_utf8_lossy(&o.stderr));
+                let tail: Vec<&str> = combined.lines().rev().take(20).collect();
+                eprintln!("== project-e2e FAIL: {name} ==");
+                for line in tail.into_iter().rev() {
+                    eprintln!("  {line}");
+                }
+            }
+            Err(e) => failed.push(format!("{name} ({e})")),
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} e2e scripts failed: {}",
+            failed.len(),
+            scripts.len(),
+            failed.join(", ")
         ))
     }
 }

@@ -156,10 +156,19 @@ mod cm5_impl {
                 let l2_idx = dma_addr >> 21;
                 l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
             }
+            // The PCIe1 arena's size is a tunable in net.rs and may span
+            // more than one 2 MB L2 block, so flip EVERY block it covers
+            // — a block left cacheable would silently corrupt DMA.
             let pcie1_dma = fluxor::kernel::nic_ring::pcie1_dma_arena_base();
+            let pcie1_size = fluxor::kernel::nic_ring::pcie1_dma_arena_size();
             if pcie1_dma != 0 && pcie1_dma < 0x4000_0000 {
-                let l2_idx = pcie1_dma >> 21;
-                l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
+                let first = pcie1_dma >> 21;
+                let last = (pcie1_dma + pcie1_size - 1) >> 21;
+                let mut idx = first;
+                while idx <= last && idx < 512 {
+                    l2[idx] = dma_block((idx as u64) * 0x20_0000);
+                    idx += 1;
+                }
             }
             // Point L1[0] to our L2 table
             table[0] = table_desc(&raw const L2_TABLE_0 as u64);

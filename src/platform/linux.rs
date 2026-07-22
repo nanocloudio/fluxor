@@ -721,6 +721,8 @@ fn main() {
             // never reaches here (rfc_cli_execution.md §6).
             let code = CLI_EXIT_CODE.load(Ordering::Acquire);
             log::info!("[sched] all modules complete, exiting (code {code})");
+            // Restore the terminal if an interactive applet put it in raw mode.
+            restore_terminal();
             process::exit(code);
         }
 

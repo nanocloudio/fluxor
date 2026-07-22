@@ -1359,13 +1359,20 @@ fn run_domain_loop(domain_id: usize) -> ! {
                     let far1 = exception::CORE_FAULT_FAR[1].load(Ordering::Relaxed);
                     let sp1 = exception::CORE_FAULT_SPSR[1].load(Ordering::Relaxed);
                     let fe1 = exception::CORE_FAULT_ELR[1].load(Ordering::Relaxed);
+                    // Cross-domain flow into/out of the consensus core (d2),
+                    // reported on the periodic [xdom] line. p = frames pushed
+                    // to the SPSC ring, c = frames delivered to the consumer
+                    // channel.
+                    let xp = |a: usize, b: usize| XPUMP_PROD[a * 4 + b].load(Ordering::Relaxed);
+                    let xc = |a: usize, b: usize| XPUMP_CONS[a * 4 + b].load(Ordering::Relaxed);
                     log::info!(
-                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d1=[t{} ct{} dl{} mod{} elr{:#x} fc{} esr{:#x} far{:#x} spsr{:#x} felr{:#x}] d2=[t{}]",
+                        "[xdom] drops={} bp={} depth=[{},{},{},{}] d2t={} xf 1>2:{}/{} 3>2:{}/{} 2>1:{}/{} 2>3:{}/{} 2>0:{}/{}",
                         drops, bp,
-                        depth[0], depth[1], depth[2], depth[3],
-                        d1t, ct1, dl1, m1, elr1, f1, e1, far1, sp1, fe1, d2t
+                        depth[0], depth[1], depth[2], depth[3], d2t,
+                        xp(1,2), xc(1,2), xp(3,2), xc(3,2),
+                        xp(2,1), xc(2,1), xp(2,3), xc(2,3), xp(2,0), xc(2,0),
                     );
-                    let _ = (d1p, d2p, f2, e2);
+                    let _ = (d1p, d2p, f2, e2, d1t, ct1, dl1, m1, elr1, f1, e1, far1, sp1, fe1);
                     // If any core latched a panic, broadcast the site over UDP.
                     let pc = PANIC_CORE.load(Ordering::Relaxed);
                     if pc != 0xFFFF_FFFF {
@@ -1610,6 +1617,15 @@ fn domain_step_all(domain_id: usize) {
 /// under load.
 const CROSS_PUMP_BURST: u32 = multicore::RING_SLOTS as u32;
 
+// Diagnostic per-domain-pair cross-domain flow matrix (from*4+to). PROD counts
+// frames the producer arm pushed into the SPSC ring; CONS counts frames the
+// consumer arm delivered into the local consumer channel. A pair where
+// PROD>0 but CONS≈0 localises where cross-core delivery stalls.
+static XPUMP_PROD: [core::sync::atomic::AtomicU32; 16] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 16];
+static XPUMP_CONS: [core::sync::atomic::AtomicU32; 16] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 16];
+
 fn pump_cross_domain(domain_id: usize) {
     let n_cross = multicore::cross_edge_count();
     let mut ei = 0;
@@ -1664,6 +1680,8 @@ fn pump_cross_domain(domain_id: usize) {
                     multicore::CROSS_DOMAIN_DROPS.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
+                let mi = ((edge.from_domain as usize) * 4 + edge.to_domain as usize) & 15;
+                XPUMP_PROD[mi].fetch_add(1, Ordering::Relaxed);
                 moved += 1;
             }
             let aux = edge.pending_aux.swap(u32::MAX, Ordering::AcqRel);
@@ -1712,6 +1730,8 @@ fn pump_cross_domain(domain_id: usize) {
                 unsafe {
                     fluxor::kernel::channel::channel_write(edge.local_in_handle, buf.as_ptr(), len);
                 }
+                let mi = ((edge.from_domain as usize) * 4 + edge.to_domain as usize) & 15;
+                XPUMP_CONS[mi].fetch_add(1, Ordering::Relaxed);
                 moved += 1;
             }
             let mut val: u32 = 0;

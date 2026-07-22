@@ -223,29 +223,53 @@ pub fn pcie1_dma_arena_base() -> usize {
     0
 }
 
+/// Byte size of the PCIe1 DMA arena. Consumed by boot_mmu to flip EVERY
+/// 2 MB L2 block the arena spans to Normal Non-Cacheable (the size is a
+/// tunable and not bound to a single 2 MB block).
+#[cfg(feature = "chip-bcm2712")]
+pub fn pcie1_dma_arena_size() -> usize {
+    PCIE1_DMA_ARENA_SIZE
+}
+
+#[cfg(not(feature = "chip-bcm2712"))]
+pub fn pcie1_dma_arena_size() -> usize {
+    0
+}
+
 /// Allocate physically contiguous memory from the PCIe1 DMA arena.
 /// Returns the physical address (identity-mapped = CPU virt = PCI bus
 /// addr under the VPU-default inbound window) or 0 on failure.
 /// `align` must be a power of 2, minimum 16.
+///
+/// Lock-free bump allocator: the reservation is a CAS on the arena
+/// offset, retried on contention. The retry matters on the multi-domain
+/// bcm2712 path: the NIC (net domain) and NVMe (storage domain) boot
+/// and allocate concurrently, so a single-attempt CAS would report a
+/// spurious "out of memory" to whichever core loses the race. Only a
+/// genuinely exhausted arena returns 0.
 #[cfg(feature = "chip-bcm2712")]
 pub fn pcie1_dma_alloc_contig(size: usize, align: usize) -> usize {
     let a = if align < 16 { 16 } else { align };
-    let cur = PCIE1_DMA_OFFSET.load(Ordering::Relaxed) as usize;
-    let aligned_start = (cur + a - 1) & !(a - 1);
     let aligned_size = (size + 15) & !15;
-    let new_end = aligned_start + aligned_size;
-    if new_end > PCIE1_DMA_ARENA_SIZE {
-        return 0;
-    }
-    let prev = PCIE1_DMA_OFFSET.compare_exchange(
-        cur as u32,
-        new_end as u32,
-        Ordering::AcqRel,
-        Ordering::Relaxed,
-    );
-    match prev {
-        Ok(_) => pcie1_dma_arena_base() + aligned_start,
-        Err(_) => 0,
+    loop {
+        let cur = PCIE1_DMA_OFFSET.load(Ordering::Relaxed) as usize;
+        let aligned_start = (cur + a - 1) & !(a - 1);
+        let new_end = aligned_start + aligned_size;
+        if new_end > PCIE1_DMA_ARENA_SIZE {
+            return 0;
+        }
+        if PCIE1_DMA_OFFSET
+            .compare_exchange(
+                cur as u32,
+                new_end as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return pcie1_dma_arena_base() + aligned_start;
+        }
+        // Lost the race to a sibling core — reload and retry.
     }
 }
 
@@ -304,22 +328,26 @@ pub fn pcie1_stream_arena_base() -> usize {
 #[cfg(feature = "chip-bcm2712")]
 pub fn pcie1_dma_alloc_streaming(size: usize, align: usize) -> usize {
     let a = if align < 16 { 16 } else { align };
-    let cur = PCIE1_STREAM_OFFSET.load(Ordering::Relaxed) as usize;
-    let aligned_start = (cur + a - 1) & !(a - 1);
     let aligned_size = (size + 15) & !15;
-    let new_end = aligned_start + aligned_size;
-    if new_end > PCIE1_STREAM_ARENA_SIZE {
-        return 0;
-    }
-    let prev = PCIE1_STREAM_OFFSET.compare_exchange(
-        cur as u32,
-        new_end as u32,
-        Ordering::AcqRel,
-        Ordering::Relaxed,
-    );
-    match prev {
-        Ok(_) => pcie1_stream_arena_base() + aligned_start,
-        Err(_) => 0,
+    loop {
+        let cur = PCIE1_STREAM_OFFSET.load(Ordering::Relaxed) as usize;
+        let aligned_start = (cur + a - 1) & !(a - 1);
+        let new_end = aligned_start + aligned_size;
+        if new_end > PCIE1_STREAM_ARENA_SIZE {
+            return 0;
+        }
+        if PCIE1_STREAM_OFFSET
+            .compare_exchange(
+                cur as u32,
+                new_end as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return pcie1_stream_arena_base() + aligned_start;
+        }
+        // Lost the race to a sibling core — reload and retry.
     }
 }
 
@@ -370,24 +398,29 @@ fn dma_arena_phys(offset: usize) -> u64 {
 #[cfg(feature = "chip-bcm2712")]
 pub fn dma_alloc_contig(size: usize, align: usize) -> usize {
     let a = if align < 16 { 16 } else { align };
-    // Round current offset up to alignment
-    let cur = DMA_ARENA_OFFSET.load(Ordering::Relaxed) as usize;
-    let aligned_start = (cur + a - 1) & !(a - 1);
     let aligned_size = (size + 15) & !15;
-    let new_end = aligned_start + aligned_size;
-    if new_end > DMA_ARENA_SIZE {
-        return 0;
-    }
-    // Try to claim this range
-    let prev = DMA_ARENA_OFFSET.compare_exchange(
-        cur as u32,
-        new_end as u32,
-        Ordering::AcqRel,
-        Ordering::Relaxed,
-    );
-    match prev {
-        Ok(_) => dma_arena_ptr(aligned_start) as usize,
-        Err(_) => 0, // concurrent allocation, caller retries
+    // Lock-free bump with in-place CAS retry so a sibling core's
+    // concurrent reservation can't spuriously fail this one (see
+    // `pcie1_dma_alloc_contig` for the multi-domain rationale).
+    loop {
+        let cur = DMA_ARENA_OFFSET.load(Ordering::Relaxed) as usize;
+        let aligned_start = (cur + a - 1) & !(a - 1);
+        let new_end = aligned_start + aligned_size;
+        if new_end > DMA_ARENA_SIZE {
+            return 0;
+        }
+        if DMA_ARENA_OFFSET
+            .compare_exchange(
+                cur as u32,
+                new_end as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return dma_arena_ptr(aligned_start) as usize;
+        }
+        // Lost the race to a sibling core — reload and retry.
     }
 }
 

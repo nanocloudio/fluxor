@@ -39,6 +39,78 @@ const CLI_CHUNK: usize = 1024;
 /// cli_out's `exit_in`. Node-agent mode never reads it.
 pub(crate) static CLI_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
+/// Set once the applet latches its exit code (via cli_out's `exit_in`). cli_in
+/// keys off this to stop pumping stdin — otherwise a live-TTY stdin (no EOF)
+/// would keep the graph from ever completing after the applet is done.
+pub(crate) static CLI_EXIT_LATCHED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+// ── Interactive terminal (raw stdin) ────────────────────────────────────────
+//
+// When cli_in owns a TTY stdin, disable canonical mode + local echo so an
+// interactive applet (`nanocloud exec -it`) gets char-at-a-time input with no
+// double echo. We deliberately do NOT touch OPOST/ISIG: output `\n`→`\r\n`
+// stays intact (so non-interactive commands print correctly even though stdin
+// is always wired), and Ctrl-C still signals. The original termios is saved in
+// a signal-safe static and restored on the exit path (and via SIGINT/SIGTERM).
+static TERM_RAW_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static mut TERM_ORIG: core::mem::MaybeUninit<libc::termios> = core::mem::MaybeUninit::uninit();
+
+/// Restore the terminal saved by `enter_raw_stdin` (idempotent; signal-safe —
+/// only a static read + `tcsetattr`, both async-signal-safe).
+pub(crate) fn restore_terminal() {
+    use core::sync::atomic::Ordering;
+    if TERM_RAW_ACTIVE.swap(false, Ordering::AcqRel) {
+        // SAFETY: the AcqRel swap on TERM_RAW_ACTIVE proves `enter_raw_stdin`
+        // Release-published TERM_ORIG before setting the flag, so the static
+        // is initialised; tcsetattr only reads it.
+        unsafe {
+            let t = core::ptr::addr_of!(TERM_ORIG);
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, (*t).as_ptr());
+        }
+    }
+}
+
+extern "C" fn term_signal_handler(sig: i32) {
+    restore_terminal();
+    // Re-raise with the default disposition so the process dies normally.
+    // SAFETY: signal + raise are async-signal-safe libc calls with constant
+    // arguments; nothing here touches Rust-managed state.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Put a TTY stdin into interactive mode (ICANON + ECHO off). No-op if stdin is
+/// not a terminal. Installs SIGINT/SIGTERM handlers to restore on interruption.
+fn enter_raw_stdin() {
+    use core::sync::atomic::Ordering;
+    // SAFETY: single-threaded platform init is the only caller, so the
+    // TERM_ORIG write cannot race; termios calls operate on a zeroed local
+    // filled by tcgetattr before use, and the handler pointers are valid
+    // for the process lifetime.
+    unsafe {
+        if libc::isatty(libc::STDIN_FILENO) != 1 {
+            return;
+        }
+        let mut t: libc::termios = core::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut t) != 0 {
+            return;
+        }
+        core::ptr::addr_of_mut!(TERM_ORIG).write(core::mem::MaybeUninit::new(t));
+        TERM_RAW_ACTIVE.store(true, Ordering::Release);
+        let mut raw = t;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
+        libc::signal(libc::SIGINT, term_signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, term_signal_handler as libc::sighandler_t);
+    }
+}
+
 /// The process argv after the first `--`, NUL-joined (empty when no `--` or
 /// nothing follows it). Host code reads the real env::args — no config baking.
 fn argv_record() -> Vec<u8> {
@@ -102,6 +174,12 @@ fn cli_in_step(state: *mut u8) -> i32 {
         return if st.args_sent { 1 } else { 0 };
     };
 
+    // The applet finished (latched its exit) — stop pumping stdin so the graph
+    // can complete even when stdin is a live TTY that never sends EOF.
+    if st.args_sent && CLI_EXIT_LATCHED.load(Ordering::Acquire) {
+        return 1;
+    }
+
     // Flush pending before popping more — byte order under backpressure.
     while st.pending_pos < st.pending.len() {
         // SAFETY: offset/length stay within the owned Vec.
@@ -154,6 +232,9 @@ fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
 
     let eof = Arc::new(portable_atomic::AtomicBool::new(false));
     let bridge = if stdin_out >= 0 {
+        // An applet may consume stdin interactively (`exec -it`); put a TTY into
+        // char-at-a-time, no-echo mode (restored on exit / interrupt).
+        enter_raw_stdin();
         let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));
         let pump = Arc::clone(&b);
         let pump_eof = Arc::clone(&eof);
@@ -268,6 +349,7 @@ fn cli_out_step(state: *mut u8) -> i32 {
         if n >= 4 {
             let code = i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
             CLI_EXIT_CODE.store(code, Ordering::Release);
+            CLI_EXIT_LATCHED.store(true, Ordering::Release);
             st.exited = true;
             log::info!("[cli] exit code latched: {code}");
         }

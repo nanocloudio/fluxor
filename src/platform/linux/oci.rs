@@ -521,6 +521,15 @@ pub unsafe fn oci_spawn(bundle: &str, env: &ResourceEnvelope) -> i32 {
     libc::close(out_w);
     libc::close(start_r);
     libc::close(pid_w);
+    // out_r/start_w live in the slot table across calls — mark them CLOEXEC so
+    // later fork+exec children (other containers, exec probes, TTY sessions)
+    // don't inherit copies that would hold the out pipe open past this
+    // container's exit (no EOF on out_r) or defeat the closed-start_w abort
+    // signal. Safe for THIS container: it uses its own ends pre-exec only
+    // (barrier read, pid relay) or dup2'd onto stdio, and these parent copies
+    // are closed in its fork branch above.
+    libc::fcntl(out_r, libc::F_SETFD, libc::FD_CLOEXEC);
+    libc::fcntl(start_w, libc::F_SETFD, libc::FD_CLOEXEC);
     let fl = libc::fcntl(out_r, libc::F_GETFL);
     libc::fcntl(out_r, libc::F_SETFL, fl | libc::O_NONBLOCK);
 
@@ -603,6 +612,502 @@ pub unsafe fn oci_read(raw: i32, out: *mut u8, out_len: usize) -> i32 {
         return 0; // nothing ready this step
     }
     errno::ERROR
+}
+
+// ─── Interactive PTY exec sessions (kubectl exec -it) ─────────────────────
+//
+// A one-shot `oci_exec` captures output and returns; an interactive session
+// keeps a pseudo-terminal open across scheduler steps so a shell can be driven
+// bidirectionally. The master fd + child pid live in a process-global session
+// table; `oci_tty_step` pumps one step of it (write stdin, drain output, poll
+// liveness) and the provider relays those bytes over the store seam.
+
+pub const MAX_TTY_SESSIONS: usize = 8;
+
+struct TtySession {
+    in_use: bool,
+    /// PTY master (host side); the child holds the slave as its controlling tty.
+    master: i32,
+    pid: i32,
+    reaped: bool,
+    exit_code: i32,
+}
+
+const TTY_EMPTY: TtySession = TtySession {
+    in_use: false,
+    master: -1,
+    pid: -1,
+    reaped: false,
+    exit_code: 0,
+};
+
+static mut LINUX_TTYS: [TtySession; MAX_TTY_SESSIONS] = [TTY_EMPTY; MAX_TTY_SESSIONS];
+
+/// OCI_TTY_OPEN: start an interactive PTY session running `argv` inside the
+/// sandbox. Allocates a pseudo-terminal, sets its window size, forks a session
+/// leader whose controlling tty is the PTY slave (setns-joining the container's
+/// namespaces when isolated), and execs. Returns a session id (>= 0) for the
+/// step/resize/close ops, or a negative errno.
+///
+/// `arg` = `[rows:u16 LE][cols:u16 LE][command line…]`.
+///
+/// # Safety
+/// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
+pub unsafe fn oci_tty_open(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
+    use crate::kernel::errno;
+    if arg.is_null() || arg_len < 4 {
+        return errno::EINVAL;
+    }
+    let a = core::slice::from_raw_parts(arg, arg_len);
+    let rows = u16::from_le_bytes([a[0], a[1]]);
+    let cols = u16::from_le_bytes([a[2], a[3]]);
+    let cmd_end = a[4..]
+        .iter()
+        .position(|&b| b == 0)
+        .map(|i| 4 + i)
+        .unwrap_or(arg_len);
+    let cmdline = match core::str::from_utf8(&a[4..cmd_end]) {
+        Ok(s) => s.trim(),
+        Err(_) => return errno::EINVAL,
+    };
+    if cmdline.is_empty() {
+        return errno::EINVAL;
+    }
+    let mut cargs: Vec<CString> = Vec::new();
+    for tok in cmdline.split_whitespace() {
+        match CString::new(tok) {
+            Ok(c) => cargs.push(c),
+            Err(_) => return errno::EINVAL,
+        }
+    }
+    let mut argv_ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
+    argv_ptrs.push(core::ptr::null());
+
+    let (container_pid, isolated, started) = {
+        let Some(slot) = slot_for(raw) else {
+            return errno::EINVAL;
+        };
+        (slot.container_pid, slot.isolated, slot.started)
+    };
+    if !started {
+        return errno::EINVAL;
+    }
+
+    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
+    let sid = match sessions.iter().position(|s| !s.in_use) {
+        Some(i) => i,
+        None => return errno::ENOMEM,
+    };
+
+    // Allocate the PTY (host side) and open the slave.
+    let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+    if master < 0 {
+        return errno::ERROR;
+    }
+    // The master outlives this call (session table) — mark it CLOEXEC so later
+    // fork+exec children (other sessions, OCI_EXEC, sandbox spawns) don't
+    // inherit a copy that would keep this PTY from ever hanging up.
+    libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+    if libc::grantpt(master) != 0 || libc::unlockpt(master) != 0 {
+        libc::close(master);
+        return errno::ERROR;
+    }
+    let mut pts = [0 as libc::c_char; 128];
+    if libc::ptsname_r(master, pts.as_mut_ptr(), pts.len()) != 0 {
+        libc::close(master);
+        return errno::ERROR;
+    }
+    let slave = libc::open(pts.as_ptr(), libc::O_RDWR);
+    if slave < 0 {
+        libc::close(master);
+        return errno::ERROR;
+    }
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    libc::ioctl(master, libc::TIOCSWINSZ, &ws);
+
+    // Pre-open the container's namespace fds (parent side; no post-fork malloc).
+    let mut ns_fds = [-1i32; 5];
+    if isolated {
+        for (i, ns) in ["ipc", "uts", "net", "pid", "mnt"].iter().enumerate() {
+            if let Ok(p) = CString::new(format!("/proc/{container_pid}/ns/{ns}")) {
+                ns_fds[i] = libc::open(p.as_ptr(), libc::O_RDONLY);
+            }
+        }
+    }
+
+    let pid = libc::fork();
+    if pid < 0 {
+        libc::close(master);
+        libc::close(slave);
+        for &fd in &ns_fds {
+            if fd >= 0 {
+                libc::close(fd);
+            }
+        }
+        return errno::ERROR;
+    }
+    if pid == 0 {
+        // Child: join namespaces, become a session leader on the PTY slave, exec.
+        libc::close(master);
+        for &fd in &ns_fds {
+            if fd >= 0 {
+                libc::setns(fd, 0);
+                libc::close(fd);
+            }
+        }
+        if isolated {
+            libc::chdir(c"/".as_ptr());
+        }
+        libc::setsid();
+        libc::ioctl(slave, libc::TIOCSCTTY, 0);
+        libc::dup2(slave, libc::STDIN_FILENO);
+        libc::dup2(slave, libc::STDOUT_FILENO);
+        libc::dup2(slave, libc::STDERR_FILENO);
+        if slave > 2 {
+            libc::close(slave);
+        }
+        libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
+        libc::_exit(127);
+    }
+    // Parent: keep the master (non-blocking), drop the slave + ns fds.
+    libc::close(slave);
+    for &fd in &ns_fds {
+        if fd >= 0 {
+            libc::close(fd);
+        }
+    }
+    let fl = libc::fcntl(master, libc::F_GETFL);
+    libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    sessions[sid] = TtySession {
+        in_use: true,
+        master,
+        pid,
+        reaped: false,
+        exit_code: 0,
+    };
+    sid as i32
+}
+
+/// OCI_TTY_STEP: one pump step of a session — write pending stdin to the PTY,
+/// drain its output, and poll the child's liveness. `arg` in =
+/// `[sid:u32 LE][wlen:u32 LE][stdin bytes: wlen]`; `arg` out =
+/// `[rlen:u32 LE][state:u8][code:i32 LE][output: rlen]` (state 0 = running,
+/// 1 = exited). Returns 0, or a negative errno for a bad session id.
+///
+/// # Safety
+/// Single-threaded platform dispatch only. `arg` valid for `arg_len` r/w.
+pub unsafe fn oci_tty_step(arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::kernel::errno;
+    if arg.is_null() || arg_len < 9 {
+        return errno::EINVAL;
+    }
+    let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+    let wlen = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as usize;
+
+    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
+    if sid >= MAX_TTY_SESSIONS || !sessions[sid].in_use {
+        return errno::EINVAL;
+    }
+    let master = sessions[sid].master;
+    // Write the stdin bytes straight from `arg` — the output drain below only
+    // touches `arg` after this. Partial writes and EINTR are retried; a full
+    // PTY buffer (EAGAIN on the non-blocking master) drops the remainder: the
+    // wire format carries no consumed-count, and interactive input stays far
+    // below the kernel's PTY buffer.
+    let wn = wlen.min(arg_len - 8);
+    let mut woff = 0usize;
+    while woff < wn {
+        let w = libc::write(master, arg.add(8 + woff) as *const libc::c_void, wn - woff);
+        if w > 0 {
+            woff += w as usize;
+        } else if w < 0 && *libc::__errno_location() == libc::EINTR {
+            continue;
+        } else {
+            break;
+        }
+    }
+    // Drain the PTY output into arg[9..].
+    let hdr = 9usize;
+    let cap = arg_len - hdr;
+    let mut rn = 0usize;
+    if cap > 0 {
+        loop {
+            let n = libc::read(master, arg.add(hdr) as *mut libc::c_void, cap);
+            if n > 0 {
+                rn = n as usize;
+            } else if n < 0 && *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+    }
+    // Poll liveness (non-blocking reap).
+    let (state, code) = if sessions[sid].reaped {
+        (1u8, sessions[sid].exit_code)
+    } else {
+        let mut st: libc::c_int = 0;
+        let r = libc::waitpid(sessions[sid].pid, &mut st, libc::WNOHANG);
+        if r == sessions[sid].pid {
+            let code = if libc::WIFEXITED(st) {
+                libc::WEXITSTATUS(st)
+            } else if libc::WIFSIGNALED(st) {
+                128 + libc::WTERMSIG(st)
+            } else {
+                0
+            };
+            sessions[sid].reaped = true;
+            sessions[sid].exit_code = code;
+            (1u8, code)
+        } else {
+            (0u8, 0)
+        }
+    };
+    core::ptr::copy_nonoverlapping((rn as u32).to_le_bytes().as_ptr(), arg, 4);
+    *arg.add(4) = state;
+    core::ptr::copy_nonoverlapping(code.to_le_bytes().as_ptr(), arg.add(5), 4);
+    0
+}
+
+/// OCI_TTY_RESIZE: set a session's window size. `arg` =
+/// `[sid:u32 LE][rows:u16 LE][cols:u16 LE]`.
+/// # Safety
+/// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
+pub unsafe fn oci_tty_resize(arg: *const u8, arg_len: usize) -> i32 {
+    use crate::kernel::errno;
+    if arg.is_null() || arg_len < 8 {
+        return errno::EINVAL;
+    }
+    let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+    let rows = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
+    let cols = u16::from_le_bytes([*arg.add(6), *arg.add(7)]);
+    let sessions = &*core::ptr::addr_of!(LINUX_TTYS);
+    if sid >= MAX_TTY_SESSIONS || !sessions[sid].in_use {
+        return errno::EINVAL;
+    }
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    libc::ioctl(sessions[sid].master, libc::TIOCSWINSZ, &ws);
+    0
+}
+
+/// OCI_TTY_CLOSE: kill (if still running) + reap the session, close the master,
+/// free the slot. `arg` = `[sid:u32 LE]`. Returns the child's exit code.
+/// # Safety
+/// Single-threaded platform dispatch only. `arg` valid for `arg_len` reads.
+pub unsafe fn oci_tty_close(arg: *const u8, arg_len: usize) -> i32 {
+    use crate::kernel::errno;
+    if arg.is_null() || arg_len < 4 {
+        return errno::EINVAL;
+    }
+    let sid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+    let sessions = &mut *core::ptr::addr_of_mut!(LINUX_TTYS);
+    if sid >= MAX_TTY_SESSIONS || !sessions[sid].in_use {
+        return errno::EINVAL;
+    }
+    if !sessions[sid].reaped {
+        libc::kill(sessions[sid].pid, libc::SIGKILL);
+        let mut st: libc::c_int = 0;
+        let mut code = 128 + libc::SIGKILL;
+        loop {
+            let r = libc::waitpid(sessions[sid].pid, &mut st, 0);
+            if r == sessions[sid].pid {
+                if libc::WIFEXITED(st) {
+                    code = libc::WEXITSTATUS(st);
+                } else if libc::WIFSIGNALED(st) {
+                    code = 128 + libc::WTERMSIG(st);
+                }
+                break;
+            }
+            if r < 0 && *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+        sessions[sid].reaped = true;
+        sessions[sid].exit_code = code;
+    }
+    let code = sessions[sid].exit_code;
+    if sessions[sid].master >= 0 {
+        libc::close(sessions[sid].master);
+    }
+    sessions[sid] = TTY_EMPTY;
+    code
+}
+
+/// OCI_EXEC: run a one-shot command *inside* an existing sandbox and capture its
+/// merged stdout/stderr — the `kubectl exec pod -- cmd` primitive. For an
+/// isolated sandbox the child setns-joins the container's namespaces (nsenter);
+/// a null sandbox shares the host's, so it execs directly. Synchronous: forks,
+/// drains the child's output to EOF, and reaps it — so it briefly blocks the
+/// scheduler step (fine for probes; interactive/streaming exec is the PTY
+/// session ops above).
+///
+/// `arg` on input holds the whitespace-split command line (NUL- or length-
+/// bounded). On return `arg` holds `[out_len:u32 LE][output…]` with the captured
+/// bytes truncated to fit `arg_len`; the return value is the child's exit code
+/// (0–255), `128+signo` if signalled, or a negative errno on a setup failure.
+///
+/// # Safety
+/// Single-threaded platform dispatch only (process-global slot table). `arg`
+/// must be valid for reads and writes of `arg_len` bytes.
+pub unsafe fn oci_exec(raw: i32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::kernel::errno;
+    if arg.is_null() || arg_len < 4 {
+        return errno::EINVAL;
+    }
+    // Read the command line out of `arg` before we reuse it for the output.
+    let cmd_bytes = core::slice::from_raw_parts(arg, arg_len);
+    let cmd_end = cmd_bytes.iter().position(|&b| b == 0).unwrap_or(arg_len);
+    let cmdline = match core::str::from_utf8(&cmd_bytes[..cmd_end]) {
+        Ok(s) => s.trim(),
+        Err(_) => return errno::EINVAL,
+    };
+    if cmdline.is_empty() {
+        return errno::EINVAL;
+    }
+    let mut cargs: Vec<CString> = Vec::new();
+    for tok in cmdline.split_whitespace() {
+        match CString::new(tok) {
+            Ok(c) => cargs.push(c),
+            Err(_) => return errno::EINVAL,
+        }
+    }
+    let mut argv_ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
+    argv_ptrs.push(core::ptr::null());
+
+    let (container_pid, isolated, started) = {
+        let Some(slot) = slot_for(raw) else {
+            return errno::EINVAL;
+        };
+        (slot.container_pid, slot.isolated, slot.started)
+    };
+    if !started {
+        return errno::EINVAL; // nothing to exec into until the container runs
+    }
+
+    // Pre-open the container's namespace fds on the PARENT side — malloc is safe
+    // here, but the post-fork child must not allocate. setns order: ipc, uts,
+    // net, pid, mnt (mnt last, as it changes /proc/<pid>/ns visibility). pid
+    // takes effect for children only; without a re-fork the exec'd process keeps
+    // the host pid view — acceptable for a filesystem/exec probe.
+    let mut ns_fds = [-1i32; 5];
+    if isolated {
+        for (i, ns) in ["ipc", "uts", "net", "pid", "mnt"].iter().enumerate() {
+            if let Ok(p) = CString::new(format!("/proc/{container_pid}/ns/{ns}")) {
+                ns_fds[i] = libc::open(p.as_ptr(), libc::O_RDONLY);
+            }
+        }
+    }
+
+    let mut fds = [0i32; 2];
+    if libc::pipe(fds.as_mut_ptr()) != 0 {
+        for &fd in &ns_fds {
+            if fd >= 0 {
+                libc::close(fd);
+            }
+        }
+        return errno::ERROR;
+    }
+    let (r, w) = (fds[0], fds[1]);
+    let pid = libc::fork();
+    if pid < 0 {
+        libc::close(r);
+        libc::close(w);
+        for &fd in &ns_fds {
+            if fd >= 0 {
+                libc::close(fd);
+            }
+        }
+        return errno::ERROR;
+    }
+    if pid == 0 {
+        // Child: join namespaces (best-effort), wire stdio to the pipe, exec.
+        // No allocation past this point.
+        libc::close(r);
+        for &fd in &ns_fds {
+            if fd >= 0 {
+                libc::setns(fd, 0);
+                libc::close(fd);
+            }
+        }
+        if isolated {
+            libc::chdir(c"/".as_ptr());
+        }
+        libc::dup2(w, libc::STDOUT_FILENO);
+        libc::dup2(w, libc::STDERR_FILENO);
+        let nfd = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        if nfd >= 0 {
+            libc::dup2(nfd, libc::STDIN_FILENO);
+            if nfd > 2 {
+                libc::close(nfd);
+            }
+        }
+        if w > 2 {
+            libc::close(w);
+        }
+        libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
+        libc::_exit(127); // execvp only returns on failure
+    }
+
+    // Parent: close the write end + the ns fds, drain the pipe into arg[4..]
+    // (truncating on overflow but still draining so the child never blocks),
+    // then reap.
+    libc::close(w);
+    for &fd in &ns_fds {
+        if fd >= 0 {
+            libc::close(fd);
+        }
+    }
+    let cap = arg_len - 4;
+    let mut written = 0usize;
+    let mut scratch = [0u8; 4096];
+    loop {
+        let n = libc::read(r, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len());
+        if n > 0 {
+            let n = n as usize;
+            if written < cap {
+                let take = n.min(cap - written);
+                core::ptr::copy_nonoverlapping(scratch.as_ptr(), arg.add(4 + written), take);
+                written += take;
+            }
+        } else if n == 0 {
+            break;
+        } else if *libc::__errno_location() == libc::EINTR {
+            continue;
+        } else {
+            break;
+        }
+    }
+    libc::close(r);
+    let mut status: libc::c_int = 0;
+    loop {
+        let rc = libc::waitpid(pid, &mut status, 0);
+        if rc == pid {
+            break;
+        }
+        if rc < 0 && *libc::__errno_location() == libc::EINTR {
+            continue;
+        }
+        break;
+    }
+    let out_len = (written as u32).to_le_bytes();
+    core::ptr::copy_nonoverlapping(out_len.as_ptr(), arg, 4);
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        126
+    }
 }
 
 /// OCI_SIGNAL: deliver a signal to the container process.

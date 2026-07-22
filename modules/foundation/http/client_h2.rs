@@ -21,9 +21,13 @@
 //!   status fails the transfer even though the HTTP `:status` is 200.
 //!
 //! Response body is forwarded to the module's data output channel
-//! until END_STREAM. Connection-level recv flow control honours
-//! `RECV_WINDOW_THRESHOLD` — a WINDOW_UPDATE goes out automatically
-//! when the window depletes so the server keeps streaming.
+//! until END_STREAM — for a server-streaming method that is every DATA
+//! frame's payload concatenated (N gRPC messages), closed by the
+//! trailers. Connection-level recv flow control honours
+//! `RECV_WINDOW_THRESHOLD` — a WINDOW_UPDATE goes out automatically when
+//! the window depletes so the server keeps streaming. Peer PING frames
+//! are answered with a PING ACK (§6.7); gRPC servers withhold a stream's
+//! closing trailers until their keepalive/BDP PING is acknowledged.
 //!
 //! # Scope
 //!
@@ -312,9 +316,13 @@ pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
             }
 
             H2Phase::WaitResponse => {
-                // If we owe a WINDOW_UPDATE, get it onto the wire
-                // before pulling more inbound bytes.
-                if maybe_queue_window_update(s) && !drain_request_buf(s) {
+                // Flush any queued control frame — a WINDOW_UPDATE we owe, or a
+                // PING/SETTINGS ACK queued by process_one_frame — before pulling
+                // more inbound bytes. Draining every pass gets a PING ACK onto
+                // the wire; a gRPC server-stream withholds its trailers until
+                // its PING is acknowledged.
+                maybe_queue_window_update(s);
+                if !drain_request_buf(s) {
                     return 0;
                 }
                 // Always try to make progress on inbound bytes first.
@@ -678,10 +686,31 @@ unsafe fn process_one_frame(s: &mut HttpState) -> FrameAction {
             FrameAction::Done
         }
 
-        h2w::FRAME_PING
-        | h2w::FRAME_WINDOW_UPDATE
-        | h2w::FRAME_PRIORITY
-        | h2w::FRAME_RST_STREAM => {
+        h2w::FRAME_PING => {
+            // Reply to a peer PING with a PING ACK echoing the 8 opaque bytes
+            // (RFC 7540 §6.7). gRPC servers send BDP-estimation / keepalive
+            // PINGs and withhold stream completion (the closing trailers) until
+            // the ACK — so a server-stream stalls after the data frames without
+            // it. Queue the ACK into request_buf (drained by the response loop);
+            // if request_buf is busy, drop it (the peer re-pings).
+            if hdr.stream_id != 0 || hdr.length != 8 {
+                // §6.7: PING is connection-scoped with a fixed 8-byte
+                // payload; anything else is a connection error. The check
+                // also guarantees the 8-byte echo below stays inside the
+                // received frame.
+                return FrameAction::Error;
+            }
+            if (hdr.flags & h2w::FLAG_ACK) == 0 && s.client.request_len == s.client.request_sent {
+                let opaque = s.client.recv_buf.as_ptr().add(h2w::FRAME_HEADER_LEN);
+                let n = h2w::write_ping_ack(s.client.request_buf.as_mut_ptr(), opaque);
+                s.client.request_len = n as u16;
+                s.client.request_sent = 0;
+            }
+            shift_consume(s, total);
+            FrameAction::Continue
+        }
+
+        h2w::FRAME_WINDOW_UPDATE | h2w::FRAME_PRIORITY | h2w::FRAME_RST_STREAM => {
             shift_consume(s, total);
             FrameAction::Continue
         }

@@ -558,6 +558,23 @@ struct NvmeState {
     /// original async submit has already returned 0 by the time the
     /// CQE arrives, so propagating sync is the only option.
     bulk_err:            i32,
+    /// Async-durability fence accounting (async WAL fsync path). Every
+    /// bulk write increments `write_submit_seq` at submit and
+    /// `write_complete_seq` when its CQE is retired. A fence ticket is a
+    /// snapshot of `write_submit_seq`; it is durable once
+    /// `write_complete_seq >= ticket`. Both count the SAME set (all bulk
+    /// writes — pager + async-LBA), so a fence conservatively also waits
+    /// on any concurrent pager writes, which is safe. Monotonic; wrap is
+    /// a non-issue at realistic rates within a fence's lifetime.
+    write_submit_seq:    u64,
+    write_complete_seq:  u64,
+    /// Submit-seq of the FIRST async write whose CQE reported failure
+    /// (1-based; 0 = none yet). A durability fence whose ticket is
+    /// `>= first_fail_seq` MUST report error forever — a failed write is
+    /// a permanent durability gap, and a fence covering it can never be
+    /// honestly reported durable (even though `write_complete_seq` still
+    /// advances past it for counter consistency). Monotonic latch.
+    first_fail_seq:      u64,
     /// 1 once `BACKING_PROVIDER_ENABLE` has succeeded, so S_READY
     /// entry only registers once.
     pager_registered: u8,
@@ -2678,6 +2695,41 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
             ]);
             sync_blk_write(s, lba as u64, nlb, buf_u64 as *const u8)
         }
+        IOCTL_BLOCKS_WRITE_LBAS_ASYNC => {
+            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
+            if nlb_raw == 0 { return E_INVAL; }
+            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
+            let buf_u64 = u64::from_le_bytes([
+                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
+                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+            ]);
+            async_blk_write(s, lba as u64, nlb, buf_u64 as *const u8)
+        }
+        IOCTL_BLOCKS_FENCE_SUBMIT => {
+            // Harvest first so the ticket reflects completions that already
+            // landed, then hand back the current submit high-water.
+            harvest_writes(s);
+            let seq = s.write_submit_seq.to_le_bytes();
+            let mut i = 0usize;
+            while i < 8 { *arg.add(i) = seq[i]; i += 1; }
+            0
+        }
+        IOCTL_BLOCKS_FENCE_POLL => {
+            harvest_writes(s);
+            let ticket = u64::from_le_bytes([
+                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
+                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+            ]);
+            // A fence covering a failed write reports error permanently —
+            // the caller must withhold its durable ack and recover (fall
+            // back to the sync write+flush path). This is the safety
+            // interlock: a failed durable write must never surface durable.
+            if s.first_fail_seq != 0 && ticket >= s.first_fail_seq {
+                return E_INVAL;
+            }
+            if s.write_complete_seq >= ticket { 0 } else { 1 }
+        }
         // FLUSH handled above (no arg buffer).
         _ => E_NOSYS,
     }
@@ -2745,14 +2797,7 @@ unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
                     // already returned 0 to its consumer; we just
                     // advance the ring head and latch any error so
                     // the next FLUSH (or submit) can surface it.
-                    if s.bulk_count > 0 {
-                        s.bulk_count -= 1;
-                        s.bulk_head =
-                            (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
-                    }
-                    if sc != 0 && s.bulk_err == 0 {
-                        s.bulk_err = E_INVAL;
-                    }
+                    retire_bulk_write_cqe(s, sc);
                     continue;
                 }
 
@@ -2787,7 +2832,13 @@ pub fn is_bulk_read_cid(cid: u16) -> bool {
 
 /// Acquire the next free async bulk-write slot. If the ring is full,
 /// spin-polls CQEs until at least one in-flight slot retires. Returns
-/// the slot index, or a negative errno on timeout.
+/// the slot index, or a negative errno on timeout. Consumes only the
+/// write-family CQEs it owns — a foreign CQE (e.g. an in-flight
+/// `BLK_PHASE_READING` batch read) is left for its owner and stops the
+/// scan of that queue (same rule as `poll_io_cqe`/`harvest_writes`); if
+/// that starves the acquisition, the budget expires with `E_AGAIN`, the
+/// dispatch returns, the owner's step-loop poll consumes its CQE, and
+/// the caller's retry progresses.
 unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
     if (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
         let start = now_ms(s);
@@ -2796,18 +2847,13 @@ unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
             let n = s.io_q_count as usize;
             for q in 0..n {
                 while let Some((cid, sc)) = peek_io_cqe(s, q) {
-                    consume_io_cqe(s, q);
-                    progress = true;
                     if is_bulk_write_cid(cid) {
-                        if s.bulk_count > 0 {
-                            s.bulk_count -= 1;
-                            s.bulk_head =
-                                (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
-                        }
-                        if sc != 0 && s.bulk_err == 0 {
-                            s.bulk_err = E_INVAL;
-                        }
+                        consume_io_cqe(s, q);
+                        progress = true;
+                        retire_bulk_write_cqe(s, sc);
                     } else if is_write_cid(cid) {
+                        consume_io_cqe(s, q);
+                        progress = true;
                         let cnt = *s.inflight_count.as_ptr().add(q);
                         if cnt > 0 {
                             let head = *s.inflight_head.as_ptr().add(q) as usize;
@@ -2815,6 +2861,8 @@ unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
                             *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
                             *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
                         }
+                    } else {
+                        break;
                     }
                 }
             }
@@ -2826,6 +2874,65 @@ unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
         }
     }
     Ok(s.bulk_tail as usize)
+}
+
+/// Retire one async bulk-write CQE: advance the ring head, count the
+/// completion toward the durability fence, and latch any device error.
+/// This is the single accounting point for `write_complete_seq` — every
+/// site that consumes a bulk-write CQE MUST route through here so a
+/// fence never under-counts (which would falsely report durable) nor
+/// over-counts (which would stall a fence forever).
+#[inline]
+unsafe fn retire_bulk_write_cqe(s: &mut NvmeState, sc: u16) {
+    if s.bulk_count > 0 {
+        s.bulk_count -= 1;
+        s.bulk_head = (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
+    }
+    s.write_complete_seq = s.write_complete_seq.wrapping_add(1);
+    if sc != 0 {
+        if s.bulk_err == 0 {
+            s.bulk_err = E_INVAL;
+        }
+        // Latch the seq of the first failed write so every fence covering
+        // it reports error permanently (see `first_fail_seq`).
+        if s.first_fail_seq == 0 {
+            s.first_fail_seq = s.write_complete_seq;
+        }
+    }
+}
+
+/// Non-blocking single pass over every I/O completion queue: harvest
+/// whatever write CQEs are ready (retiring bulk-write and sync-write
+/// completions) and return. The async counterpart of
+/// `bulk_drain_writes`' inner loop with no wait — it advances
+/// `write_complete_seq` so a fence poll can observe durability without
+/// blocking the caller's step. A CQE that belongs to neither write
+/// family (e.g. an in-flight `BLK_PHASE_READING` batch read on
+/// `CID_READ_LBA0`) is left un-consumed for its owner — same rule as
+/// `poll_io_cqe` — and stops the harvest of that queue; write CQEs
+/// queued behind it are picked up on a later pass, which only delays
+/// (never falsifies) a fence.
+unsafe fn harvest_writes(s: &mut NvmeState) {
+    let n = s.io_q_count as usize;
+    for q in 0..n {
+        while let Some((cid, sc)) = peek_io_cqe(s, q) {
+            if is_bulk_write_cid(cid) {
+                consume_io_cqe(s, q);
+                retire_bulk_write_cqe(s, sc);
+            } else if is_write_cid(cid) {
+                consume_io_cqe(s, q);
+                let cnt = *s.inflight_count.as_ptr().add(q);
+                if cnt > 0 {
+                    let head = *s.inflight_head.as_ptr().add(q) as usize;
+                    let new_head = (head + 1) % MAX_INFLIGHT;
+                    *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
+                    *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
+                }
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// Drain every in-flight async bulk-write slot. Used by PAGER_OP_FLUSH
@@ -2843,18 +2950,13 @@ unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
         let n = s.io_q_count as usize;
         for q in 0..n {
             while let Some((cid, sc)) = peek_io_cqe(s, q) {
-                consume_io_cqe(s, q);
-                progress = true;
                 if is_bulk_write_cid(cid) {
-                    if s.bulk_count > 0 {
-                        s.bulk_count -= 1;
-                        s.bulk_head =
-                            (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
-                    }
-                    if sc != 0 && s.bulk_err == 0 {
-                        s.bulk_err = E_INVAL;
-                    }
+                    consume_io_cqe(s, q);
+                    progress = true;
+                    retire_bulk_write_cqe(s, sc);
                 } else if is_write_cid(cid) {
+                    consume_io_cqe(s, q);
+                    progress = true;
                     let cnt = *s.inflight_count.as_ptr().add(q);
                     if cnt > 0 {
                         let head = *s.inflight_head.as_ptr().add(q) as usize;
@@ -2862,6 +2964,13 @@ unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
                         *s.inflight_head.as_mut_ptr().add(q) = new_head as u8;
                         *s.inflight_count.as_mut_ptr().add(q) = cnt - 1;
                     }
+                } else {
+                    // Foreign CQE (e.g. an in-flight batch read) — leave it
+                    // for its owner and stop scanning this queue. If nothing
+                    // else progresses, the budget below returns E_AGAIN; the
+                    // owner's step-loop poll consumes its CQE and the
+                    // caller's retried flush drains the rest.
+                    break;
                 }
             }
         }
@@ -3035,6 +3144,50 @@ unsafe fn sync_blk_write(
     pager_spin_poll_cqe(s, CID_PAGER_WRITE)
 }
 
+/// Async counterpart of `sync_blk_write` (`IOCTL_BLOCKS_WRITE_LBAS_ASYNC`):
+/// stage a ≤`MAX_NLB` (≤4 KiB, single-PRP) write into a free async bulk
+/// slot's DMA page, submit it, and return WITHOUT polling. The
+/// completion is harvested later and counted toward the durability fence
+/// (`write_submit_seq` / `write_complete_seq`). Durability is established
+/// by the caller via `FENCE_SUBMIT`/`FENCE_POLL`, never by this return.
+///
+/// Returns 0 on submit, `E_AGAIN` when all `ASYNC_BULK_SLOTS` are in
+/// flight (caller retries next step — this is the backpressure signal),
+/// or a negative errno. Reuses the bulk ring's slots/DMA pages and the
+/// same `CID_BULK_WRITE_BASE + slot` completion identity the pager uses,
+/// so `harvest_writes` retires both uniformly.
+unsafe fn async_blk_write(s: &mut NvmeState, lba: u64, nlb: u16, in_buf: *const u8) -> i32 {
+    if s.state != S_READY { return E_AGAIN; }
+    if nlb == 0 || nlb > MAX_NLB { return E_INVAL; }
+    if in_buf.is_null() { return E_INVAL; }
+    // Ring full: one non-blocking harvest to free a slot, then give up
+    // for this step (backpressure) rather than spin-drain.
+    if (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
+        harvest_writes(s);
+        if (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
+            return E_AGAIN;
+        }
+    }
+    let slot = s.bulk_tail as usize;
+    if !pager_ensure_slot_bufs(s, slot) { return E_INVAL; }
+    let base = slot * (MAX_BULK_PAGES as usize);
+    let dst = s.pager_write_bufs[base];
+    if dst == 0 { return E_INVAL; }
+    let bytes = (nlb as usize) * (BLOCK_SIZE as usize);
+    let mut i = 0usize;
+    while i < bytes {
+        write_volatile((dst as *mut u8).add(i), read_volatile(in_buf.add(i)));
+        i += 1;
+    }
+    let cid = CID_BULK_WRITE_BASE + (slot as u16);
+    submit_io_write(s, 0, lba, nlb, cid, s.namespace, dst);
+    s.bulk_tail = (s.bulk_tail + 1) % (ASYNC_BULK_SLOTS as u8);
+    s.bulk_count += 1;
+    s.write_submit_seq = s.write_submit_seq.wrapping_add(1);
+    if s.bulk_count > s.bulk_depth_peak { s.bulk_depth_peak = s.bulk_count; }
+    0
+}
+
 /// Ensure the PRP-list page for async bulk slot `slot` is allocated.
 /// One per slot — the slot's outstanding command points at it while
 /// in flight, so they cannot share.
@@ -3176,6 +3329,7 @@ unsafe fn handle_pager_bulk(
         // slot as in-flight even before the CQE arrives.
         s.bulk_tail = (s.bulk_tail + 1) % (ASYNC_BULK_SLOTS as u8);
         s.bulk_count += 1;
+        s.write_submit_seq = s.write_submit_seq.wrapping_add(1);
         if s.bulk_count > s.bulk_depth_peak {
             s.bulk_depth_peak = s.bulk_count;
         }
@@ -3415,14 +3569,7 @@ unsafe fn pager_read_pipelined(
                     // Stale write CQE absorbed (drain-before-read
                     // should have already retired these — log and
                     // continue rather than wedge).
-                    if s.bulk_count > 0 {
-                        s.bulk_count -= 1;
-                        s.bulk_head =
-                            (s.bulk_head + 1) % (ASYNC_BULK_SLOTS as u8);
-                    }
-                    if sc != 0 && s.bulk_err == 0 {
-                        s.bulk_err = E_INVAL;
-                    }
+                    retire_bulk_write_cqe(s, sc);
                     continue;
                 }
 
