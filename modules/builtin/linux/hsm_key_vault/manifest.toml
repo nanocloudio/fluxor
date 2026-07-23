@@ -1,0 +1,30 @@
+# PKCS#11 (HSM/token) KEY_VAULT backend — descriptor only.
+#
+# NOT graph-placeable. This entry exists so the kernel-resident backend is
+# visible in the builtin inventory alongside the other Linux-host shims; do
+# not reference `type: hsm_key_vault` in a graph YAML. The implementation
+# (`src/platform/linux/hsm_key_vault.rs`) registers as the KEY_VAULT
+# (0x0010) provider at platform boot — overriding the kernel software
+# backend — when `FLUXOR_HSM_PKCS11_MODULE` is set; there is no module
+# instance, no ports, and no channel wiring.
+#
+# Configuration is environment-driven at platform boot, not `[[params]]`
+# (params are graph-YAML TLV; this backend is selected before any graph
+# loads):
+#   FLUXOR_HSM_PKCS11_MODULE  — path to the PKCS#11 shared object
+#   FLUXOR_HSM_TOKEN_LABEL    — token CKA_LABEL (or FLUXOR_HSM_SLOT_ID)
+#   FLUXOR_HSM_USER_PIN       — CKU_USER PIN
+#
+# Advertised surface (via the KEY_VAULT CAPS/TIER opcodes, discoverable by
+# any consumer): TIER = PROCESS_HW; CAPS = GENERATE | PUBLIC |
+# NON_EXTRACTABLE | ALG_P256. STORE is ENOSYS (non-extractable token);
+# VERIFY delegates to the kernel software implementation; ALG_ED25519
+# reads 0 — consumers see the bit clear and fall back per their policy.
+
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "Boot-time KEY_VAULT contract backend, not a graph data path; observed via the contract's TIER/CAPS opcodes and host tooling"

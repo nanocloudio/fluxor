@@ -91,6 +91,7 @@ const STANDARD_MODULE_SUBDIRS: &[&str] = &[
     "modules/drivers",
     "modules/foundation",
     "modules/app",
+    "modules/fixtures",
     "modules/builtin/linux",
     "modules/builtin/host",
     "modules/builtin/wasm",

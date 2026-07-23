@@ -67,7 +67,32 @@ can reach them without declaring anything in its manifest.
 | `TIMER` | `0x0006` | `millis`, `micros`, `create`, `set`, `cancel`, `destroy` |
 | `BUFFER` | `0x000A` | Zero-copy slot acquisition for in-place writers |
 | `EVENT` | `0x000B` | Signalable/pollable flags + IRQ binding |
-| `KEY_VAULT` | `0x0010` | P-256 slots — ECDH, sign, verify; raw material stays kernel-side |
+| `KEY_VAULT` | `0x0010` | P-256 + Ed25519 slots — ECDH, sign, verify; raw material stays kernel-side. Backend is platform-overridable (see below). |
+
+#### Kernel service backends — platform-overridable
+
+A kernel service contract has one *default* implementation in
+`src/kernel/`, and a platform may re-register the class dispatch and
+vtable at platform boot with an alternate backend. The consumer-visible
+surface never changes; backends differ only in what the contract's own
+discovery opcodes report (`TIER`, `CAPS`).
+
+Current backends of `KEY_VAULT`:
+
+| Backend | Source | TIER | Selection |
+|---------|--------|------|-----------|
+| Software (default) | `src/kernel/key_vault.rs` | `SOFTWARE` | Always available |
+| PKCS#11 HSM (Linux) | `src/platform/linux/hsm_key_vault.rs` | `PROCESS_HW` | `FLUXOR_HSM_PKCS11_MODULE` env at platform boot |
+
+Rules for adding a backend: it must sit behind an **existing** kernel
+service contract (a backend never introduces opcodes consumers must
+know about), it must advertise its honest `TIER`/`CAPS` so consumers
+can adapt, and it must be visible — a row in this table plus a
+descriptor under `modules/builtin/<platform>/<name>/` (manifest-only,
+not graph-placeable) so the inventory of kernel-resident code stays
+complete. A hardware token reached over a fluxor bus (e.g. a secure
+element on I2C/SPI) is **not** a kernel backend — that is a PIC driver
+module providing the contract.
 
 ### Stable module contracts — portable, module-provided
 
@@ -400,11 +425,11 @@ explicitly rather than inherited by default.
 
 ## Module categories
 
-Modules live in one of four trees. The tree enforces where they are
+Modules live in one of five trees. The tree enforces where they are
 *allowed* to reach, not what they *happen* to touch. `drivers/`,
-`foundation/`, and `app/` hold PIC modules loaded at runtime as
-`.fmod` artefacts; `builtin/<platform>/` holds platform-bound
-built-ins compiled directly into the kernel binary.
+`foundation/`, `app/`, and `fixtures/` hold PIC modules loaded at
+runtime as `.fmod` artefacts; `builtin/<platform>/` holds
+platform-bound built-ins compiled directly into the kernel binary.
 
 ### Drivers — `modules/drivers/`
 
@@ -421,7 +446,7 @@ Providers for HAL contracts also live here (`spi_pl022`, `i2c_dw`,
 Touch stable module contracts (FS, net_proto channels), kernel
 primitives, and timers/events. No direct hardware.
 
-Examples: `ip`, `tls`, `http`, `mqtt`, `dns`, `fat32`, `wifi`.
+Examples: `ip`, `tls`, `http`, `mqtt`, `dns`, `fat32`, `wifi`, `rtp`.
 
 A small set of **first-party orchestrator modules** under this tree
 (`reconfigure`, `graph_slot`, `ota_ingest`, `monitor`) also import
@@ -437,7 +462,20 @@ modules must not take this shape.
 
 Domain-specific compositions. Free to consume any foundation or
 driver output over channels. Examples: `codec`, `drum`, `effects`,
-`mixer`, `rtp`, `sequencer`, `synth`, `voip`.
+`mixer`, `sequencer`, `synth`, `voip`.
+
+### Fixtures — `modules/fixtures/`
+
+Test scaffolds, probes, and protocol-surface demonstration modules —
+built and loaded exactly like foundation/app PIC modules, but not
+part of the stable module vocabulary and never shipped in a product
+graph. Examples: `load_gen`, `test_fault`, `tier2_probe`, the
+`iso_*` EL0-isolation probes, the `nvme_*_probe` bring-up probes,
+`synth_source`, and the `echo_anchor`/`echo_worker` continuity-role
+demonstration pair. Keeping them out of `foundation/`/`app/`
+preserves those trees' stable-vocabulary property (shadowing a
+foundation name is a build error; a fixture name carries no such
+weight). Fixtures are not publishable via `fluxor publish`.
 
 ### Built-in — `modules/builtin/<platform>/<name>/`
 
@@ -477,3 +515,23 @@ The kernel moves bytes, touches registers, and wakes ISRs. It does
 not know what TCP is, what TLS is, what MQTT is, what HTTP is, or
 what audio looks like. Every protocol, every domain, every piece of
 application logic lives in a module.
+
+### What may live in the kernel binary
+
+Exactly three kinds of device- or service-shaped code are allowed to
+compile into the kernel binary; everything else is a PIC module:
+
+1. **Raw register/boot bridges** behind platform contracts —
+   PCIe binding, DMA, NIC rings, GPIO, MMU/GIC/boot code in
+   `src/platform/<chip>/`.
+2. **Kernel service contract implementations** and their
+   platform-overridable backends (CHANNEL, TIMER, BUFFER, EVENT,
+   KEY_VAULT) — each backend documented in the backends table above
+   with a descriptor under `modules/builtin/<platform>/`.
+3. **Built-in modules** — host-API drivers that are manifest-declared
+   under `modules/builtin/<platform>/<name>/` and therefore visible to
+   the config tool and inventory.
+
+Anything device-shaped in the binary that is not manifest-visible or
+listed in the backends table is drift by construction — it bypasses
+the mechanism that keeps kernel-resident drivers accountable.

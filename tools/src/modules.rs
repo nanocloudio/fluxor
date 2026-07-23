@@ -744,6 +744,25 @@ fn find_section<'a>(sections: &'a [ElfSection], name: &str) -> Option<&'a ElfSec
     sections.iter().find(|s| s.name == name)
 }
 
+/// Write a fully-formed artifact to `output` atomically: write a sibling
+/// temp file, then `rename` it over the target. `rename(2)` is atomic within a
+/// filesystem, so an interrupted or killed build (Ctrl-C, OOM, kill) can never
+/// leave a truncated or 0-byte `.fmod` behind — the previous complete file
+/// survives, or nothing is written. This matters because downstream workspace
+/// members *symlink* to these artifacts (`fluxor sync`), so a partially-written
+/// file would be observed as a corrupt/empty module across every consumer. (A
+/// plain `std::fs::write` truncates the target to 0 bytes before writing —
+/// exactly the window this closes.)
+fn write_atomic(output: &Path, data: &[u8]) -> std::io::Result<()> {
+    // Same-directory temp keeps the rename on one filesystem (a cross-fs rename
+    // is not atomic). The `.tmp` sibling is never matched by `*.fmod` scans.
+    let mut tmp = output.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, output)
+}
+
 /// Pack ELF object into .fmod format (ABI v2 with manifest)
 pub fn pack_fmod(
     input: &Path,
@@ -1121,7 +1140,7 @@ pub fn pack_fmod(
     output_data.extend_from_slice(schema_data);
     output_data.extend_from_slice(&manifest_bytes);
 
-    std::fs::write(output, &output_data)?;
+    write_atomic(output, &output_data)?;
 
     Ok(PackResult {
         name: name.to_string(),
@@ -1275,7 +1294,7 @@ pub fn pack_fmod_wasm(
     output_data.extend_from_slice(schema_data);
     output_data.extend_from_slice(&manifest_bytes);
 
-    std::fs::write(output, &output_data)?;
+    write_atomic(output, &output_data)?;
 
     Ok(PackResult {
         name: name.to_string(),

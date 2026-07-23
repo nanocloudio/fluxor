@@ -18,6 +18,12 @@
 // not applied yet, which is why the provider advertises SHARED/ISOLATED but not
 // HARDENED (fail-closed).
 //
+// Network: when the workload spec asks for its own network domain
+// (`NET_ISO_OWN` on any endpoint), NEWNET joins the unshare set (orthogonal to
+// `isolate` — a null sandbox can still get its own netns), and the sibling
+// `net_identity` module realizes the Tier-1 network fields (lo up; veth +
+// identity address when one is assigned) before START releases the barrier.
+//
 // Bundle layout (provider-prepared):
 //   {bundle}/cmd        argv, whitespace-split (required)
 //   {bundle}/rootfs     container root to pivot into (optional)
@@ -97,6 +103,11 @@ pub struct SpawnPlan {
     argv_ptrs: Vec<*const libc::c_char>,
     rootfs: Option<CString>,
     isolate: bool,
+    /// Unshare NEWNET so the workload gets its own network domain
+    /// (`workload` Tier-1 `NET_ISO_OWN`). Set by the caller from the spec —
+    /// never a bundle file; network isolation is contract intent, not bundle
+    /// mechanism.
+    own_netns: bool,
     /// cgroup.v2 resource limits (bundle files), applied best-effort by the
     /// parent after the container pid is known. Verbatim interface-file values:
     /// bytes for `memory.max`, a count for `pids.max`, `"quota period"` for
@@ -133,6 +144,7 @@ pub fn prepare_plan(bundle: &str) -> Result<SpawnPlan, i32> {
         argv_ptrs,
         rootfs,
         isolate,
+        own_netns: false,
         mem_max: nonempty("memory_max"),
         pids_max: nonempty("pids_max"),
         cpu_max: nonempty("cpu_max"),
@@ -267,18 +279,26 @@ fn oci_remove_cgroup(idx: usize) {
 unsafe fn oci_child(plan: &SpawnPlan, start_r: i32, out_w: i32, pid_w: i32) -> ! {
     if !plan.isolate {
         // Null sandbox: this process is the container. No pid relay needed —
-        // the provider already knows this pid.
+        // the provider already knows this pid. Own-netns is orthogonal to
+        // isolate: unshare just the network domain when the spec asks.
         libc::close(pid_w);
+        if plan.own_netns && libc::unshare(libc::CLONE_NEWNET) != 0 {
+            libc::_exit(121);
+        }
         oci_container_body(plan, start_r, out_w);
     }
 
-    // Isolated sandbox (privileged). Unshare PID + MOUNT|UTS|IPC. NEWPID takes
-    // effect for our children, so the grandchild we fork becomes PID 1 in the
-    // new pid namespace; MOUNT|UTS|IPC apply to us and are inherited by it.
-    if libc::unshare(
-        libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC,
-    ) != 0
-    {
+    // Isolated sandbox (privileged). Unshare PID + MOUNT|UTS|IPC (+ NET when
+    // the spec asks for an own network domain). NEWPID takes effect for our
+    // children, so the grandchild we fork becomes PID 1 in the new pid
+    // namespace; MOUNT|UTS|IPC (and the netns) apply to us and are inherited
+    // by it.
+    let mut ns_mask =
+        libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+    if plan.own_netns {
+        ns_mask |= libc::CLONE_NEWNET;
+    }
+    if libc::unshare(ns_mask) != 0 {
         libc::_exit(125);
     }
     let init = libc::fork();
@@ -447,23 +467,33 @@ unsafe fn oci_pivot_into(new_root: *const libc::c_char) -> i32 {
 }
 
 /// Spawn a sandbox from a prepared `bundle` directory: fork the container onto
-/// the start barrier, apply cgroup limits, and record the slot. Returns the
-/// slot index (>= 0) or a negative errno. The core of the `workload`
-/// host-process backend; owner-binding is the caller's concern (the `workload`
-/// provider records it). `env` carries the portable resource intents from a
-/// `workload` spec — where a field is set it overrides the bundle-file cgroup
-/// value; unset falls back to the bundle.
+/// the start barrier, apply cgroup limits, realize the network domain, and
+/// record the slot. Returns the slot index (>= 0) or a negative errno. The
+/// core of the `workload` host-process backend; owner-binding is the caller's
+/// concern (the `workload` provider records it). `env` carries the portable
+/// resource intents from a `workload` spec — where a field is set it overrides
+/// the bundle-file cgroup value; unset falls back to the bundle. `own_netns` +
+/// `ident` carry the Tier-1 network fields: with `own_netns` the container
+/// gets its own netns (lo up); with `ident` also a veth pair carrying the
+/// identity address (see `net_identity`). A network-realization failure fails
+/// the spawn — Tier-1 fields are never silently dropped.
 /// # Safety
 /// Single-threaded platform dispatch only: mutates the process-global
 /// sandbox slot table without synchronization, and forks — no other
 /// thread may touch the table (or hold locks the child would inherit).
-pub unsafe fn oci_spawn(bundle: &str, env: &ResourceEnvelope) -> i32 {
+pub unsafe fn oci_spawn(
+    bundle: &str,
+    env: &ResourceEnvelope,
+    own_netns: bool,
+    ident: Option<&super::net_identity::NetIdentity>,
+) -> i32 {
     use crate::kernel::errno;
 
     let mut plan = match prepare_plan(bundle) {
         Ok(p) => p,
         Err(e) => return e,
     };
+    plan.own_netns = own_netns;
     // The workload envelope takes precedence over bundle-file cgroup values.
     let (mem, pids, cpu) = envelope_cgroup_values(env);
     if mem.is_some() {
@@ -559,6 +589,16 @@ pub unsafe fn oci_spawn(bundle: &str, env: &ResourceEnvelope) -> i32 {
     slot.exit_code = 0;
     // Apply resource limits before START releases the container (best-effort).
     slot.cgrouped = oci_apply_cgroup(idx, container_pid, &plan);
+    // Realize the network domain before START releases the container. Unlike
+    // cgroups this is NOT best-effort: the network fields are Tier-1 spec, so
+    // a failure fails the spawn rather than running with weaker networking.
+    if own_netns {
+        let rc = super::net_identity::realize(idx, container_pid, ident);
+        if rc != 0 {
+            oci_destroy(idx as i32);
+            return rc;
+        }
+    }
     idx as i32
 }
 

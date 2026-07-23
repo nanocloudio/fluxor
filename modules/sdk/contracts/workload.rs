@@ -59,11 +59,12 @@ pub const DESTROY: u32 = 0x1A04;
 pub const READ: u32 = 0x1A05;
 
 /// `CAPS` (`0x1AFF`) — backend capability discovery. Writes the fixed prefix
-/// `[postures:u8][source_kinds:u8][ops:u16 LE]` then a namespace-directory the
-/// caller consults *before* flagging a Tier-2 entry required (§5.2 rule 3):
+/// `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]` then a
+/// namespace-directory the caller consults *before* flagging a Tier-2 entry
+/// required (§5.2 rule 3):
 ///   `[ns_count:u16] then ns_count × ([ns_len:u8][ns bytes][key_count:u16] then
 ///    key_count × ([key_len:u8][key bytes]))`.
-/// `postures`/`source_kinds`/`ops` are bitmaps over the constants below.
+/// `postures`/`source_kinds`/`ops`/`net` are bitmaps over the constants below.
 pub const CAPS: u32 = 0x1AFF;
 
 // ---- posture ladder (RFC §6) — Tier-1 `posture` field values ----
@@ -104,7 +105,11 @@ pub const SIG_KILL: u32 = 2;
 ///   0    16  identity        pod_uid → owner alloc/reuse
 ///  16     1  posture         POSTURE_*
 ///  17     1  source_kind     SOURCE_*
-///  18     2  _reserved
+///  18     1  net_iso         NET_ISO_* — workload-level network isolation (RFC §7);
+///                            OWN here or on any endpoint puts the workload in its
+///                            own network domain (a workload can have an identity
+///                            and no declared endpoints)
+///  19     1  _reserved
 ///  20     4  compute_milli   milli core-equivalents (0 = unlimited)
 ///  24     8  memory_bytes    memory quota           (0 = unlimited)
 ///  32     4  max_tasks       max concurrent tasks   (0 = unlimited)
@@ -113,10 +118,26 @@ pub const SIG_KILL: u32 = 2;
 ///  40     2  source_ref_len  bytes of source-ref section that follows
 ///  42     2  endpoint_count  number of NetEndpoint entries after source-ref
 ///  44     4  options_len     bytes of the Tier-2 TLV envelope (last section)
+///  48     1  net_family      NET_FAM_* — network identity (RFC §7); NONE = unassigned
+///  49     1  net_prefix_len  address prefix length in bits (family-scoped)
+///  50     2  net_segment     segment/lane id the identity belongs to (0 = default)
+///  52    16  net_addr        address bytes (IPv4 in bytes 0..4, rest zero)
 /// ```
 /// Then: `source_ref[source_ref_len]`, `endpoints[endpoint_count]` (each
 /// [`NET_ENDPOINT_SIZE`] bytes), `options[options_len]` (TLV, §5.2).
-pub const CREATE_HEADER_SIZE: usize = 48;
+///
+/// The network identity is a Tier-1 *input*: the orchestrator's address
+/// policy (IPAM on Linux, lane addressing on metal) computes it upstream and
+/// the backend realizes it — the field never names a mechanism (no CNI, no
+/// veth, no netns vocabulary). `NET_FAM_NONE` means no identity was assigned;
+/// combined with every endpoint at [`NET_ISO_SHARED`] the workload shares the
+/// host/system network domain.
+pub const CREATE_HEADER_SIZE: usize = 68;
+
+/// Network-identity family values (`net_family`).
+pub const NET_FAM_NONE: u8 = 0;
+pub const NET_FAM_IPV4: u8 = 4;
+pub const NET_FAM_IPV6: u8 = 6;
 
 /// One Tier-1 network endpoint the workload exports (RFC §7): `[proto:u8]
 /// [net_iso:u8][port:u16 LE]`. `proto` is a `NET_PROTO_*`; `net_iso` selects
@@ -162,4 +183,12 @@ pub mod caps {
     // `ops` bitmap — optional opcodes beyond the mandatory create/start/wait/
     // signal/destroy set.
     pub const READ: u16 = 1 << 0;
+
+    // `net` bitmap — which Tier-1 network fields the backend realizes. A
+    // CREATE that asks for an unadvertised bit fails admission (`ENOSYS`),
+    // never runs with silently-weaker network isolation.
+    /// Backend realizes `NET_ISO_OWN` (own network domain per workload).
+    pub const NET_ISO_OWN: u8 = 1 << 0;
+    /// Backend realizes a `NET_FAM_*` network identity (address/segment).
+    pub const NET_IDENTITY: u8 = 1 << 1;
 }

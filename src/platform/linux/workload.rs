@@ -81,6 +81,13 @@ fn host_backend_honors_posture(posture: u8) -> bool {
 fn host_backend_honors_option(_ns: &[u8], _key: &[u8]) -> bool {
     false // no hardening options implemented yet
 }
+/// Network fields the backend realizes (`net_identity.rs`): own netns and an
+/// IPv4 identity. IPv6 identity is not implemented yet, so it fails admission
+/// (`ENOSYS`) per the same fail-closed rule — never a silently-unaddressed
+/// workload.
+fn host_backend_net_caps() -> u8 {
+    wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY
+}
 
 /// Validate the Tier-2 TLV options envelope. Advisory entries a backend does not
 /// understand are ignored; a REQUIRED entry it does not advertise fails
@@ -139,6 +146,10 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     identity.copy_from_slice(&buf[0..16]);
     let posture = buf[16];
     let source_kind = buf[17];
+    let net_iso = buf[18];
+    if net_iso > wl::NET_ISO_OWN {
+        return errno::EINVAL;
+    }
     let envelope = ResourceEnvelope {
         compute_milli: rd_u32(buf, 20),
         memory_bytes: u64::from_le_bytes([
@@ -149,6 +160,19 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     let source_ref_len = rd_u16(buf, 40) as usize;
     let endpoint_count = rd_u16(buf, 42) as usize;
     let options_len = rd_u32(buf, 44) as usize;
+    // Tier-1 network identity (RFC §7): an input computed by the
+    // orchestrator's address policy; the backend realizes it.
+    let net_family = buf[48];
+    let net_prefix_len = buf[49];
+    let net_segment = rd_u16(buf, 50);
+    let mut net_addr = [0u8; 16];
+    net_addr.copy_from_slice(&buf[52..68]);
+    // This backend has no segment/lane mechanism (that is metal lane
+    // addressing); a non-default segment must refuse admission, never run on
+    // the default segment as if it were the requested one.
+    if net_segment != 0 {
+        return errno::ENOSYS;
+    }
 
     // Section bounds.
     let src_start = wl::CREATE_HEADER_SIZE;
@@ -188,15 +212,61 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     }
 
     // Lease-gate each declared endpoint against the owner's lease before any
-    // mechanism runs (rfc_endpoint_lease). A refusal blocks admission.
+    // mechanism runs (rfc_endpoint_lease). A refusal blocks admission. The
+    // workload-level net_iso field — or any endpoint asking for its own
+    // network domain — puts the whole workload in its own netns.
+    let mut own_netns = net_iso == wl::NET_ISO_OWN;
     for i in 0..endpoint_count {
         let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
         let proto = buf[e];
+        // Unknown net_iso values must not degrade to SHARED — same rule as
+        // the workload-level field above.
+        if buf[e + 1] > wl::NET_ISO_OWN {
+            return errno::EINVAL;
+        }
+        if buf[e + 1] == wl::NET_ISO_OWN {
+            own_netns = true;
+        }
         let port = rd_u16(buf, e + 2);
         let gate = crate::kernel::owner_plan::lease_gate(owner.slot, owner.generation, proto, port);
         if matches!(gate, crate::kernel::owner_plan::LeaseGate::Refused) {
             return errno::EACCES;
         }
+    }
+
+    // Network identity: fail-closed validation against the backend's honest
+    // net capabilities (never silently weaker networking). An identity only
+    // makes sense in an own network domain — assigning a workload address in
+    // the shared host domain is routing policy, not workload mechanism.
+    let net_ident = match net_family {
+        wl::NET_FAM_NONE => None,
+        wl::NET_FAM_IPV4 => {
+            if (host_backend_net_caps() & wl::caps::NET_IDENTITY) == 0 {
+                return errno::ENOSYS;
+            }
+            if !own_netns || net_prefix_len == 0 || net_prefix_len > 32 {
+                return errno::EINVAL;
+            }
+            // Contract: IPv4 lives in bytes 0..4, rest zero. Trailing garbage
+            // means a malformed header (or a v6 address under a v4 family) —
+            // refuse rather than guess.
+            if net_addr[4..].iter().any(|&b| b != 0) {
+                return errno::EINVAL;
+            }
+            let mut v4 = [0u8; 4];
+            v4.copy_from_slice(&net_addr[..4]);
+            Some(super::net_identity::NetIdentity {
+                addr_v4: v4,
+                prefix_len: net_prefix_len,
+            })
+        }
+        // IPv6 identity is not realized by this backend yet (net_identity.rs
+        // is ioctl/IPv4; v6 needs the netlink addr path).
+        wl::NET_FAM_IPV6 => return errno::ENOSYS,
+        _ => return errno::EINVAL,
+    };
+    if own_netns && (host_backend_net_caps() & wl::caps::NET_ISO_OWN) == 0 {
+        return errno::ENOSYS;
     }
 
     // Tier-2 options: fail-closed against the backend's advertised capabilities.
@@ -209,7 +279,7 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
         Ok(s) => s.trim(),
         Err(_) => return errno::EINVAL,
     };
-    let backend_idx = oci_spawn(bundle, &envelope);
+    let backend_idx = oci_spawn(bundle, &envelope, own_netns, net_ident.as_ref());
     if backend_idx < 0 {
         return backend_idx;
     }
@@ -314,19 +384,21 @@ pub unsafe fn linux_workload_dispatch(
 }
 
 /// WORKLOAD_CAPS: write the backend discovery structure (see the contract's
-/// `CAPS` doc). Prefix `[postures:u8][source_kinds:u8][ops:u16 LE]` then an
-/// empty namespace directory `[ns_count:u16 = 0]` (no `linux.*` keys defined).
+/// `CAPS` doc). Prefix `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]`
+/// then an empty namespace directory `[ns_count:u16 = 0]` (no `linux.*` keys
+/// defined).
 unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::errno;
-    if arg.is_null() || arg_len < 6 {
+    if arg.is_null() || arg_len < 7 {
         return errno::EINVAL;
     }
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
     out[0] = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
     out[1] = wl::caps::SOURCE_BUNDLE;
     out[2..4].copy_from_slice(&wl::caps::READ.to_le_bytes());
-    out[4..6].copy_from_slice(&0u16.to_le_bytes()); // ns_count
-    6
+    out[4] = host_backend_net_caps();
+    out[5..7].copy_from_slice(&0u16.to_le_bytes()); // ns_count
+    7
 }
 
 /// Drain/revocation hook: destroy every workload belonging to a revoked owner.

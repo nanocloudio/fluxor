@@ -228,8 +228,8 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // follows the same pattern (cd tools && cargo test --all-targets
     // --all-features). Downstreams may declare their own host-tools
     // sub-crate via `[ci.cargo] host_tools_crate = "tools"`; absent
-    // that, this phase is skipped with a clear reason rather than
-    // failing on a missing directory.
+    // that, a host-buildable workspace runs the standard's phase-2
+    // command at the workspace root instead (see below).
     // `cargo test` needs a cargo project. A crate-less fmod-only project
     // (no root `Cargo.toml`) with no host-tools crate has nothing here, so
     // the phase is omitted rather than perpetually listed as skipped.
@@ -237,10 +237,19 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     let tools_path = host_tools_crate.as_ref().map(|c| project_root.join(c));
     // A configured-but-missing crate still gets a phase entry so the
     // misconfiguration surfaces as a skip message, never a silent omission.
+    // With no host-tools crate at all, a host-buildable root workspace runs
+    // the standard's phase-2 command directly (ci.md: `cargo test
+    // --workspace --lib --bins`) — the host-tools indirection exists only
+    // for kernel-rooted workspaces whose default features can't build on
+    // the host.
     let tools_applicable = has_cargo || tools_path.is_some();
     if tools_applicable {
         results.push(if skip.cargo {
-            skipped("cargo-test (tools)")
+            skipped(if tools_path.is_some() {
+                "cargo-test (tools)"
+            } else {
+                "cargo-test (unit)"
+            })
         } else {
             match tools_path.as_ref() {
                 Some(p) if p.is_dir() => run_step("cargo-test (tools)", verbose, || {
@@ -252,13 +261,9 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
                     elapsed_ms: 0,
                     message: format!("no host-tools crate at {}", p.display()),
                 },
-                None => PhaseResult {
-                    name: "cargo-test (tools)",
-                    status: PhaseStatus::Skipped,
-                    elapsed_ms: 0,
-                    message: "no host-tools crate (set `[ci.cargo] host_tools_crate` to enable)"
-                        .to_string(),
-                },
+                None => run_step("cargo-test (unit)", verbose, || {
+                    cargo_in(project_root, &["test", "--workspace", "--lib", "--bins"])
+                }),
             }
         });
     }
@@ -296,20 +301,14 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── Phase 4: cargo integration / harness tests ───────────────
     //
-    // The harness is a sub-workspace at `tests/harness/`. Downstream
-    // projects that vendor fluxor without the harness see this phase
-    // marked skipped rather than failed.
+    // The harness is a sub-workspace at `tests/harness/` — a fluxor-repo
+    // layout. Projects without one omit the phase entirely (their runtime
+    // gate is `[ci.test] scripts`, phase 3.5) rather than carrying a
+    // perpetual skip line that reads as an unmet obligation.
     let harness_path = project_root.join("tests/harness");
-    if has_cargo || harness_path.exists() {
+    if harness_path.exists() {
         results.push(if skip.cargo {
             skipped("cargo-test (harness)")
-        } else if !harness_path.exists() {
-            PhaseResult {
-                name: "cargo-test (harness)",
-                status: PhaseStatus::Skipped,
-                elapsed_ms: 0,
-                message: "tests/harness not present".to_string(),
-            }
         } else {
             run_step("cargo-test (harness)", verbose, || {
                 cargo_in(
@@ -329,16 +328,9 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // defaults to `#![no_std]` / `#![no_main]`. `cargo test -p` from
     // workspace root with `--features host-test` toggles those off.
     let tls_path = project_root.join("modules/foundation/tls");
-    if has_cargo || tls_path.exists() {
+    if tls_path.exists() {
         results.push(if skip.cargo {
             skipped("cargo-test (tls KATs)")
-        } else if !tls_path.exists() {
-            PhaseResult {
-                name: "cargo-test (tls KATs)",
-                status: PhaseStatus::Skipped,
-                elapsed_ms: 0,
-                message: "tls module not present".to_string(),
-            }
         } else {
             run_step("cargo-test (tls KATs)", verbose, || {
                 cargo_in(

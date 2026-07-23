@@ -717,11 +717,11 @@ and larger clustered deployments.
 A minimal end-to-end demonstration of the anchor / worker split lives
 in the tree:
 
-- `modules/app/echo_anchor/` — transport anchor. Binds a TCP port via
+- `modules/fixtures/echo_anchor/` — transport anchor. Binds a TCP port via
   Stream Surface v1, accepts one client at a time, mints a
   `session_id`, and attaches the worker via
   `CMD_SC_ATTACH` (continuity class `edge_anchored`).
-- `modules/app/echo_worker/` — session worker. Handles
+- `modules/fixtures/echo_worker/` — session worker. Handles
   `CMD_SC_ATTACH` / `CMD_SC_DRAIN` / `CMD_SC_DETACH`, uppercases each
   byte in the data plane, returns `MSG_SC_ATTACHED` / `MSG_SC_DRAINED`
   / `MSG_SC_DETACHED` back to the anchor.

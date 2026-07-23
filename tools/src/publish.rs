@@ -457,6 +457,9 @@ pub(crate) fn list_owned_modules(project_root: &Path) -> Result<Vec<OwnedModule>
     struct ModuleManifest {
         version: Option<String>,
     }
+    // Deliberately excludes `modules/fixtures/` — fixtures are test
+    // scaffolds outside the stable module vocabulary and are not
+    // publishable (docs/architecture/abi_layers.md, "Fixtures").
     let tiers = ["foundation", "app", "drivers"];
     let mut out = Vec::new();
     for tier in tiers {
@@ -524,6 +527,19 @@ pub fn cmd_publish_fmod(
     if let Some(m) = module {
         owned.retain(|o| o.name == m);
         if owned.is_empty() {
+            // Name the fixtures policy explicitly when that's what the
+            // operator hit — "no manifest" would be misleading there.
+            if pr
+                .join("modules/fixtures")
+                .join(m)
+                .join("manifest.toml")
+                .exists()
+            {
+                return Err(Error::Config(format!(
+                    "`{m}` is a fixture (modules/fixtures/) — fixtures are test \
+                     scaffolds and are not publishable"
+                )));
+            }
             return Err(Error::Config(format!(
                 "no module manifest at modules/{{foundation,app,drivers}}/{m}/manifest.toml"
             )));

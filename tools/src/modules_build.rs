@@ -184,7 +184,12 @@ struct ManifestRaw {
 /// fails discovery loudly instead of surfacing as an opaque rustc error.
 const SUPPORTED_EDITIONS: &[&str] = &["2015", "2018", "2021", "2024"];
 
-const MODULE_DIRS: &[&str] = &["modules/drivers", "modules/foundation", "modules/app"];
+const MODULE_DIRS: &[&str] = &[
+    "modules/drivers",
+    "modules/foundation",
+    "modules/app",
+    "modules/fixtures",
+];
 
 fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
     let mut out = Vec::new();
