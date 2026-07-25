@@ -401,6 +401,31 @@ pub struct CommandVocabulary {
     pub emits: Vec<String>,
 }
 
+/// A named feature-set variant declared by a `[[variant]]` table in the
+/// source `manifest.toml` (RFC module_variants). Tools-side only — never
+/// serialized to the binary manifest. Each variant drives one rustc
+/// invocation (`--cfg feature="…"` per entry in `features`) producing one
+/// prebuilt `.fmod`; the default variant emits the unsuffixed
+/// `<module>.fmod`, non-default variants emit `<module>-<name>.fmod`.
+/// The variant suffix exists only in the filename — the embedded fmod
+/// name (and therefore the FXMT `name_hash` graphs bind against) stays
+/// the base module type.
+#[derive(Debug, Clone)]
+pub struct VariantDecl {
+    pub name: String,
+    /// Cargo-style feature names mapped 1:1 to `--cfg feature="<name>"`.
+    pub features: Vec<String>,
+    /// Exactly one variant per module must set this; it names which
+    /// feature set the plain `<module>.fmod` filename carries.
+    pub default: bool,
+    /// Ports absent from this variant. Applied by `apply_variant` to the
+    /// manifest that gets EMBEDDED in the variant's fmod: omitted ports
+    /// are removed from the port table, retained ports keep their
+    /// already-resolved indices (omission leaves holes, never shifts —
+    /// module code addresses ports positionally).
+    pub omit_ports: Vec<String>,
+}
+
 /// Fine-grained module permissions. Each category gates a specific
 /// subset of 0x0Cxx orchestration / platform opcodes; a module that
 /// needs only one surface does not implicitly get the others.
@@ -637,6 +662,11 @@ pub struct Manifest {
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
     pub builtin: bool,
+    /// `[[variant]]` feature-set variants (RFC module_variants). Parsed
+    /// from TOML, tools-side only, never serialized to binary — the
+    /// binary manifest a variant fmod embeds is the already-filtered
+    /// port table, not the variant declaration.
+    pub variants: Vec<VariantDecl>,
     /// Module attests that its `module_step` / `module_isr_init` /
     /// `module_isr_entry` exports are safe to invoke from an ISR
     /// context: no heap allocation, no `provider_call`, no
@@ -707,6 +737,7 @@ impl Default for Manifest {
             capabilities: Vec::new(),
             observability: Observability::default(),
             builtin: false,
+            variants: Vec::new(),
             isr_safe: false,
             pre_tick_drain: false,
             requires: TomlRequires::default(),
@@ -1068,6 +1099,36 @@ impl Manifest {
         Self::from_toml_for_target(path, None)
     }
 
+    /// Specialize this manifest to a named `[[variant]]` (RFC
+    /// module_variants): ports listed in the variant's `omit_ports` are
+    /// removed from the port table. Retained ports keep their
+    /// already-resolved indices — omission leaves holes, never shifts,
+    /// because module code addresses ports positionally. The filtered
+    /// manifest is what gets embedded in the variant's fmod, making the
+    /// artifact's advertised port surface honest.
+    pub fn apply_variant(&mut self, variant: &str) -> Result<()> {
+        let Some(decl) = self.variants.iter().find(|v| v.name == variant) else {
+            let known: Vec<&str> = self.variants.iter().map(|v| v.name.as_str()).collect();
+            return Err(Error::Module(if known.is_empty() {
+                format!(
+                    "variant '{variant}' requested but the manifest declares no [[variant]] table"
+                )
+            } else {
+                format!(
+                    "unknown variant '{variant}' — declared: {}",
+                    known.join(", ")
+                )
+            }));
+        };
+        let omit = decl.omit_ports.clone();
+        self.ports.retain(|p| {
+            p.name
+                .as_deref()
+                .is_none_or(|n| !omit.iter().any(|o| o == n))
+        });
+        Ok(())
+    }
+
     /// Target-aware TOML load: per-target capacity tables resolve
     /// against `silicon` (falling back to their `default` key). A
     /// `None` silicon resolves `default` only.
@@ -1399,6 +1460,72 @@ impl Manifest {
             }
         };
 
+        // `[[variant]]` table (RFC module_variants). Validated here so a
+        // malformed table fails the build loudly rather than surfacing as
+        // a missing artifact at packaging.
+        let mut variants: Vec<VariantDecl> = Vec::new();
+        if let Some(raw_variants) = toml_val.variant {
+            let port_names: std::collections::BTreeSet<&str> =
+                ports.iter().filter_map(|p| p.name.as_deref()).collect();
+            let mut default_count = 0usize;
+            let mut seen = std::collections::BTreeSet::new();
+            for v in &raw_variants {
+                if v.name.is_empty()
+                    || !v
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    return Err(Error::Module(format!(
+                        "variant name '{}' invalid — ascii alphanumeric/underscore only \
+                         (it becomes part of the artifact filename)",
+                        v.name
+                    )));
+                }
+                if !seen.insert(v.name.as_str()) {
+                    return Err(Error::Module(format!(
+                        "duplicate variant name '{}'",
+                        v.name
+                    )));
+                }
+                if v.features.is_empty() {
+                    return Err(Error::Module(format!(
+                        "variant '{}' declares no features — a variant is a feature set",
+                        v.name
+                    )));
+                }
+                if v.default {
+                    default_count += 1;
+                }
+                for op in &v.omit_ports {
+                    if !port_names.contains(op.as_str()) {
+                        return Err(Error::Module(format!(
+                            "variant '{}' omits unknown port '{}' — declared ports: {}",
+                            v.name,
+                            op,
+                            port_names.iter().copied().collect::<Vec<_>>().join(", ")
+                        )));
+                    }
+                }
+            }
+            if default_count != 1 {
+                return Err(Error::Module(format!(
+                    "a [[variant]] table needs exactly one `default = true` entry \
+                     (found {default_count}) — the default names which feature set \
+                     the unsuffixed <module>.fmod carries"
+                )));
+            }
+            variants = raw_variants
+                .into_iter()
+                .map(|v| VariantDecl {
+                    name: v.name,
+                    features: v.features,
+                    default: v.default,
+                    omit_ports: v.omit_ports,
+                })
+                .collect();
+        }
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -1416,6 +1543,7 @@ impl Manifest {
             capabilities,
             observability,
             builtin,
+            variants,
             isr_safe: toml_val.isr_safe,
             pre_tick_drain: toml_val.pre_tick_drain,
             requires: toml_val.requires,
@@ -1742,6 +1870,7 @@ impl Manifest {
             capabilities: Vec::new(), // not serialized in binary format
             observability: Observability::default(), // not serialized in binary format
             builtin: false,
+            variants: Vec::new(), // toml-only, not serialized
             isr_safe,
             pre_tick_drain,
             // `requires` is a TOML-only field — modules carry their
@@ -1861,6 +1990,21 @@ pub fn compute_integrity(code: &[u8], data: &[u8]) -> [u8; 32] {
 
 // ── TOML deserialization structs ────────────────────────────────────────────
 
+// deny_unknown_fields: a typo'd key in a [[variant]] row (`omit_port`,
+// `feature`) silently ignored would ship a variant with the wrong port
+// surface or feature set — reject loudly instead.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlVariant {
+    name: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    omit_ports: Vec<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct TomlObservability {
     #[serde(default)]
@@ -1891,6 +2035,8 @@ struct TomlManifest {
     observability: Option<TomlObservability>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,
+    /// `[[variant]]` feature-set variants (RFC module_variants).
+    variant: Option<Vec<TomlVariant>>,
     /// Author attests ISR-safety. Required for Tier 1b/2 admission.
     /// See `Manifest::isr_safe` for the contract.
     #[serde(default)]
@@ -2394,6 +2540,140 @@ mod tests {
         let path = tmp.path().join("manifest.toml");
         std::fs::write(&path, src).unwrap();
         Manifest::from_toml(&path)
+    }
+
+    // ── [[variant]] table (RFC module_variants) ─────────────────────
+
+    const VARIANT_MANIFEST: &str = r#"
+version = "1.0.0"
+
+[[ports]]
+name = "encoded"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "audio"
+direction = "output"
+content_type = "AudioSample"
+
+[[ports]]
+name = "pixels"
+direction = "output"
+content_type = "VideoRaster"
+
+[[variant]]
+name = "audio"
+features = ["wav", "mp3"]
+omit_ports = ["pixels"]
+
+[[variant]]
+name = "full"
+features = ["wav", "mp3", "image"]
+default = true
+"#;
+
+    /// apply_variant filters omitted ports from the embedded manifest
+    /// while retained ports keep their already-resolved indices —
+    /// omission leaves holes, never shifts (module code addresses
+    /// ports positionally).
+    #[test]
+    fn variant_apply_filters_ports_and_keeps_indices() {
+        let mut m = parse_toml(VARIANT_MANIFEST).expect("parse");
+        assert_eq!(m.variants.len(), 2);
+        assert_eq!(m.ports.len(), 3);
+
+        m.apply_variant("audio").expect("apply");
+        assert_eq!(m.ports.len(), 2);
+        assert!(m.ports.iter().all(|p| p.name.as_deref() != Some("pixels")));
+        // audio output keeps out[0]; the omitted pixels out[1] leaves a hole.
+        let audio = m
+            .ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("audio"))
+            .expect("audio port");
+        assert_eq!(audio.index, 0);
+
+        // The default variant omits nothing.
+        let mut full = parse_toml(VARIANT_MANIFEST).expect("parse");
+        full.apply_variant("full").expect("apply full");
+        assert_eq!(full.ports.len(), 3);
+    }
+
+    /// Index stability across a hole: omitting an EARLIER output port
+    /// must not renumber a later one.
+    #[test]
+    fn variant_omission_leaves_index_holes() {
+        let src = r#"
+version = "1.0.0"
+
+[[ports]]
+name = "first_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "second_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[variant]]
+name = "trimmed"
+features = ["a"]
+omit_ports = ["first_out"]
+
+[[variant]]
+name = "full"
+features = ["a", "b"]
+default = true
+"#;
+        let mut m = parse_toml(src).expect("parse");
+        m.apply_variant("trimmed").expect("apply");
+        assert_eq!(m.ports.len(), 1);
+        // second_out keeps out[1] even though out[0] is gone.
+        assert_eq!(m.ports[0].name.as_deref(), Some("second_out"));
+        assert_eq!(m.ports[0].index, 1);
+    }
+
+    #[test]
+    fn variant_unknown_name_is_an_error() {
+        let mut m = parse_toml(VARIANT_MANIFEST).expect("parse");
+        let err = m.apply_variant("nope").unwrap_err().to_string();
+        assert!(err.contains("unknown variant"), "got: {err}");
+        assert!(err.contains("audio"), "should list declared names: {err}");
+    }
+
+    #[test]
+    fn variant_table_needs_exactly_one_default() {
+        let src = VARIANT_MANIFEST.replace("default = true", "");
+        let err = parse_toml(&src).unwrap_err().to_string();
+        assert!(err.contains("exactly one `default = true`"), "got: {err}");
+    }
+
+    #[test]
+    fn variant_omit_unknown_port_is_an_error() {
+        let src = VARIANT_MANIFEST.replace("omit_ports = [\"pixels\"]", "omit_ports = [\"nope\"]");
+        let err = parse_toml(&src).unwrap_err().to_string();
+        assert!(err.contains("omits unknown port"), "got: {err}");
+    }
+
+    #[test]
+    fn variant_empty_features_is_an_error() {
+        let src = VARIANT_MANIFEST.replace("features = [\"wav\", \"mp3\"]\n", "");
+        let err = parse_toml(&src).unwrap_err().to_string();
+        assert!(err.contains("declares no features"), "got: {err}");
+    }
+
+    /// A typo'd key in a [[variant]] row must fail parsing, not be
+    /// silently ignored (a dropped `omit_ports` would ship a variant
+    /// advertising ports it doesn't carry).
+    #[test]
+    fn variant_unknown_key_is_an_error() {
+        let src = VARIANT_MANIFEST.replace("omit_ports = [\"pixels\"]", "omit_port = [\"pixels\"]");
+        assert!(
+            parse_toml(&src).is_err(),
+            "unknown [[variant]] key must fail parsing"
+        );
     }
 
     #[test]

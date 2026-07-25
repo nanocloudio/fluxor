@@ -16,9 +16,15 @@ description = "HTTP server / client module — host-test build"
 path = "mod.rs"
 crate-type = ["rlib"]
 
+# Mirrors the manifest's [[variant]] features (RFC module_variants).
+# Host builds enable the full set so the harness sees every layer.
 [features]
-default = []
+default = ["h1", "h2", "ws", "h3"]
 host-test = []
+h1 = []
+h2 = []
+h3 = []
+ws = []
 
 [dependencies]
 fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }

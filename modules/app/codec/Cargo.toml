@@ -17,9 +17,18 @@ description = "Unified audio + image decoder — host-test build"
 path = "mod.rs"
 crate-type = ["rlib"]
 
+# Feature set mirrors the manifest's [[variant]] features (RFC
+# module_variants). PIC builds get these as raw `--cfg feature="…"`
+# flags from `fluxor modules build`; Cargo host builds enable the full
+# set by default so the host-test harness sees every sub-codec.
 [features]
-default = []
+default = ["wav", "mp3", "aac", "image", "h264"]
 host-test = []
+wav = []
+mp3 = []
+aac = []
+image = []
+h264 = []
 
 [dependencies]
 fluxor = { path = "../../..", default-features = false, features = ["host-linux"], optional = true }

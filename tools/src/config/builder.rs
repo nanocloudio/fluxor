@@ -1704,6 +1704,10 @@ fn load_builtin_param_schema(
 const NON_PARAM_KEYS: &[&str] = &[
     "name",
     "type",
+    // `[[variant]]` selection (RFC module_variants) — consumed by fmod
+    // resolution (`parse_modules_from_config_multi`) and the manifest
+    // loader, never a wire param.
+    "variant",
     "wiring",
     "preset",
     "presets",

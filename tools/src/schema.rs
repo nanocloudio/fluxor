@@ -231,6 +231,9 @@ impl ParamSchema {
 pub(crate) const SKIP_KEYS: &[&str] = &[
     "name",
     "type",
+    // `[[variant]]` selection (RFC module_variants) — resolution input,
+    // never a wire param.
+    "variant",
     "wiring",
     "preset",
     "presets",

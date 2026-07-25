@@ -175,7 +175,7 @@ fn resolve_module_root(
 /// times for a single broken manifest. The cache survives for the
 /// process lifetime, which is the natural scope — a fresh
 /// invocation re-emits the warnings.
-fn warn_manifest_parse_error_once(path: &std::path::Path, err: &Error) {
+fn warn_manifest_once(path: &std::path::Path, message: &str) {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<std::collections::BTreeSet<std::path::PathBuf>>> = OnceLock::new();
     let lock = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
@@ -184,12 +184,15 @@ fn warn_manifest_parse_error_once(path: &std::path::Path, err: &Error) {
         Err(p) => p.into_inner(),
     };
     if seen.insert(path.to_path_buf()) {
-        eprintln!(
-            "warning: manifest at {} failed to parse: {}",
-            path.display(),
-            err
-        );
+        eprintln!("warning: {message}");
     }
+}
+
+fn warn_manifest_parse_error_once(path: &std::path::Path, err: &Error) {
+    warn_manifest_once(
+        path,
+        &format!("manifest at {} failed to parse: {}", path.display(), err),
+    );
 }
 
 pub fn load_module_manifests_with_extra(
@@ -234,7 +237,30 @@ pub fn load_module_manifests_with_extra_for_target(
             continue;
         }
         match Manifest::from_toml_for_target(&manifest_path, target_silicon) {
-            Ok(m) => {
+            Ok(mut m) => {
+                // Variant-selected node (RFC module_variants): the
+                // manifest wiring validates against is the VARIANT's —
+                // omitted ports absent, so a YAML that wires a dropped
+                // port fails loudly at config build (`resolve_port_spec`
+                // finds no such port) instead of at runtime. An unknown
+                // variant name only WARNS here (this loader is
+                // infallible by design — see the NOTE below on
+                // omission); the hard failure comes at fmod resolution
+                // (`parse_modules_from_config_multi`), which names the
+                // missing `<type>-<variant>.fmod` artifact.
+                if let Some(variant) = module["variant"].as_str() {
+                    if let Err(e) = m.apply_variant(variant) {
+                        warn_manifest_once(
+                            &manifest_path,
+                            &format!(
+                                "module '{name}' (manifest {}): {e}; its manifest is \
+                                 omitted from wiring validation",
+                                manifest_path.display()
+                            ),
+                        );
+                        continue;
+                    }
+                }
                 manifests.insert(name.to_string(), m);
             }
             Err(e) => {

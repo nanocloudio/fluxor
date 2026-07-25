@@ -1,6 +1,25 @@
 version = "1.0.0"
 hardware_targets = ["rp2350", "bcm2712", "wasm"]
 
+# Feature-set variants (RFC module_variants). Build emits one prebuilt
+# fmod per variant: the default (`full`) carries the unsuffixed
+# `codec.fmod` filename so existing YAMLs resolve unchanged;
+# `codec-audio.fmod` is the constrained-target build — no image/video
+# code, state union shrinks to the largest audio codec, and
+# `module_arena_size` drops from 16 MiB to 64 KiB (the RP2350 win).
+# A YAML selects with `variant: audio` on the module entry; wiring
+# `codec.pixels` against the audio variant fails at config build
+# because the embedded manifest omits the port.
+[[variant]]
+name = "audio"
+features = ["wav", "mp3", "aac"]
+omit_ports = ["pixels"]
+
+[[variant]]
+name = "full"
+features = ["wav", "mp3", "aac", "image", "h264"]
+default = true
+
 [[ports]]
 name = "encoded"
 direction = "input"

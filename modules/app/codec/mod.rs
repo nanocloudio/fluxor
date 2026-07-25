@@ -40,6 +40,23 @@ pub unsafe fn __aeabi_memclr(dest: *mut u8, n: usize) {
     core::ptr::write_bytes(dest, 0, n);
 }
 
+// Guard against building with NO codec features — that produces a
+// decoder that detects nothing and dispatches nothing. The only way it
+// happens in practice is a pre-variant `fluxor` CLI building this
+// variant-declaring source without emitting `--cfg feature="…"` flags;
+// fail the build loudly instead of shipping a silently-empty codec.
+#[cfg(not(any(
+    feature = "wav",
+    feature = "mp3",
+    feature = "aac",
+    feature = "image",
+    feature = "h264"
+)))]
+compile_error!(
+    "codec built with no codec features — stale `fluxor` CLI without [[variant]] support? \
+     Rebuild the CLI, or pass --cfg feature=\"...\" flags"
+);
+
 #[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -49,30 +66,38 @@ include!("../../sdk/params.rs");
 
 // Sub-codecs. PIC builds keep these private; host-test builds expose
 // them so the harness can drive each sub-codec directly.
-#[cfg(feature = "host-test")] pub mod wav_codec;
-#[cfg(not(feature = "host-test"))] mod wav_codec;
+//
+// Feature gates (RFC module_variants): each sub-codec family compiles
+// only when its feature is enabled. The manifest's [[variant]] table
+// drives which features each prebuilt fmod carries — `codec.fmod`
+// (default = full) has everything; `codec-audio.fmod` has wav+mp3+aac
+// only, dropping the image/video code, their state-union terms, and
+// the 16 MiB arena request. Cargo host builds enable all features by
+// default (see Cargo.toml).
+#[cfg(all(feature = "wav", feature = "host-test"))] pub mod wav_codec;
+#[cfg(all(feature = "wav", not(feature = "host-test")))] mod wav_codec;
 
-#[cfg(feature = "host-test")] pub mod mp3_codec;
-#[cfg(not(feature = "host-test"))] mod mp3_codec;
+#[cfg(all(feature = "mp3", feature = "host-test"))] pub mod mp3_codec;
+#[cfg(all(feature = "mp3", not(feature = "host-test")))] mod mp3_codec;
 
-#[cfg(feature = "host-test")] pub mod aac_codec;
-#[cfg(not(feature = "host-test"))] mod aac_codec;
+#[cfg(all(feature = "aac", feature = "host-test"))] pub mod aac_codec;
+#[cfg(all(feature = "aac", not(feature = "host-test")))] mod aac_codec;
 
-mod image_codec;
-mod image_deflate;
-mod image_gif;
-mod image_jpeg;
-mod image_png;
+#[cfg(feature = "image")] mod image_codec;
+#[cfg(feature = "image")] mod image_deflate;
+#[cfg(feature = "image")] mod image_gif;
+#[cfg(feature = "image")] mod image_jpeg;
+#[cfg(feature = "image")] mod image_png;
 
 // Video essence: Matroska container + H.264 baseline decoder (h264bsd
 // Rust port). Host-test exposes them so the harness can drive the
 // demux/decode pipeline directly.
-#[cfg(feature = "host-test")] pub mod mkv_demux;
-#[cfg(not(feature = "host-test"))] mod mkv_demux;
-#[cfg(feature = "host-test")] pub mod h264;
-#[cfg(not(feature = "host-test"))] mod h264;
-#[cfg(feature = "host-test")] pub mod mkv_h264;
-#[cfg(not(feature = "host-test"))] mod mkv_h264;
+#[cfg(all(feature = "h264", feature = "host-test"))] pub mod mkv_demux;
+#[cfg(all(feature = "h264", not(feature = "host-test")))] mod mkv_demux;
+#[cfg(all(feature = "h264", feature = "host-test"))] pub mod h264;
+#[cfg(all(feature = "h264", not(feature = "host-test")))] mod h264;
+#[cfg(all(feature = "h264", feature = "host-test"))] pub mod mkv_h264;
+#[cfg(all(feature = "h264", not(feature = "host-test")))] mod mkv_h264;
 
 // ============================================================================
 // Constants
@@ -116,20 +141,45 @@ const DETECT_IO_SIZE: usize = 256;
 /// in the current AAC IO_BUF_SIZE) plus a small safety margin.
 const HUP_QUIESCE_TICKS: u8 = 64;
 
-/// Codec state buffer size — must be >= largest codec state
+// Per-feature state-union terms. A disabled feature contributes 0, so
+// the union — and therefore every instance's state footprint — shrinks
+// to the largest codec actually compiled in (audio-only ≈ 32 KB vs the
+// ~multi-MB video term).
+#[cfg(feature = "wav")]
+const WAV_STATE_SIZE: usize = core::mem::size_of::<wav_codec::WavState>();
+#[cfg(not(feature = "wav"))]
+const WAV_STATE_SIZE: usize = 0;
+
+#[cfg(feature = "mp3")]
+const MP3_STATE_SIZE: usize = core::mem::size_of::<mp3_codec::Mp3State>();
+#[cfg(not(feature = "mp3"))]
+const MP3_STATE_SIZE: usize = 0;
+
+#[cfg(feature = "aac")]
+const AAC_STATE_SIZE: usize = core::mem::size_of::<aac_codec::AacState>();
+#[cfg(not(feature = "aac"))]
+const AAC_STATE_SIZE: usize = 0;
+
+#[cfg(feature = "image")]
+const IMG_STATE_SIZE: usize = core::mem::size_of::<image_codec::ImageState>();
+#[cfg(not(feature = "image"))]
+const IMG_STATE_SIZE: usize = 0;
+
+#[cfg(feature = "h264")]
+const MKV_STATE_SIZE: usize = core::mem::size_of::<mkv_h264::MkvH264State>();
+#[cfg(not(feature = "h264"))]
+const MKV_STATE_SIZE: usize = 0;
+
+/// Codec state buffer size — must be >= largest ENABLED codec state
 const CODEC_STATE_SIZE: usize = {
-    let wav_size = core::mem::size_of::<wav_codec::WavState>();
-    let mp3_size = core::mem::size_of::<mp3_codec::Mp3State>();
-    let aac_size = core::mem::size_of::<aac_codec::AacState>();
-    let img_size = core::mem::size_of::<image_codec::ImageState>();
-    let mkv_size = core::mem::size_of::<mkv_h264::MkvH264State>();
     // Manual max of five values (const context)
-    let mut max = wav_size;
-    if mp3_size > max { max = mp3_size; }
-    if aac_size > max { max = aac_size; }
-    if img_size > max { max = img_size; }
-    if mkv_size > max { max = mkv_size; }
-    // Align up to 4 bytes
+    let mut max = WAV_STATE_SIZE;
+    if MP3_STATE_SIZE > max { max = MP3_STATE_SIZE; }
+    if AAC_STATE_SIZE > max { max = AAC_STATE_SIZE; }
+    if IMG_STATE_SIZE > max { max = IMG_STATE_SIZE; }
+    if MKV_STATE_SIZE > max { max = MKV_STATE_SIZE; }
+    // Align up to 4 bytes (and never 0, so CodecBuf stays a real field)
+    if max == 0 { max = 4; }
     (max + 3) & !3
 };
 
@@ -212,26 +262,31 @@ impl DecoderState {
         &*self.syscalls
     }
 
+    #[cfg(feature = "wav")]
     #[inline(always)]
     unsafe fn wav(&mut self) -> &mut wav_codec::WavState {
         &mut *(self.codec.0.as_mut_ptr() as *mut wav_codec::WavState)
     }
 
+    #[cfg(feature = "mp3")]
     #[inline(always)]
     unsafe fn mp3(&mut self) -> &mut mp3_codec::Mp3State {
         &mut *(self.codec.0.as_mut_ptr() as *mut mp3_codec::Mp3State)
     }
 
+    #[cfg(feature = "aac")]
     #[inline(always)]
     unsafe fn aac(&mut self) -> &mut aac_codec::AacState {
         &mut *(self.codec.0.as_mut_ptr() as *mut aac_codec::AacState)
     }
 
+    #[cfg(feature = "image")]
     #[inline(always)]
     unsafe fn img(&mut self) -> &mut image_codec::ImageState {
         &mut *(self.codec.0.as_mut_ptr() as *mut image_codec::ImageState)
     }
 
+    #[cfg(feature = "h264")]
     #[inline(always)]
     unsafe fn mkv(&mut self) -> &mut mkv_h264::MkvH264State {
         &mut *(self.codec.0.as_mut_ptr() as *mut mkv_h264::MkvH264State)
@@ -280,21 +335,25 @@ fn detect_format(buf: &[u8; DETECT_BUF_SIZE], len: u8) -> u8 {
     }
 
     // Matroska/WebM — EBML magic `1A 45 DF A3`.
+    #[cfg(feature = "h264")]
     if n >= 4 && buf[..4] == mkv_demux::MKV_MAGIC {
         return FMT_MKV;
     }
 
     // BMP — `BM` magic at offset 0. Two bytes is enough to commit.
+    #[cfg(feature = "image")]
     if buf[0] == image_codec::BMP_MAGIC[0] && buf[1] == image_codec::BMP_MAGIC[1] {
         return FMT_BMP;
     }
 
     // GIF — `GIF8` is shared by both GIF87a and GIF89a.
+    #[cfg(feature = "image")]
     if n >= 4 && buf[..4] == *image_codec::GIF_MAGIC {
         return FMT_GIF;
     }
 
     // PNG — 8-byte signature `89 50 4E 47 0D 0A 1A 0A`.
+    #[cfg(feature = "image")]
     if n >= 8 && buf[..8] == *image_codec::PNG_MAGIC {
         return FMT_PNG;
     }
@@ -302,6 +361,7 @@ fn detect_format(buf: &[u8; DETECT_BUF_SIZE], len: u8) -> u8 {
     // JPEG — SOI (FF D8) followed by another marker byte (FF xx);
     // the first segment is always FF E0 (APP0/JFIF) or similar, so
     // three bytes are enough to commit.
+    #[cfg(feature = "image")]
     if n >= 3 && buf[..3] == *image_codec::JPEG_MAGIC {
         return FMT_JPEG;
     }
@@ -373,24 +433,28 @@ unsafe fn init_codec(s: &mut DecoderState) {
     let codec_ptr = s.codec.0.as_mut_ptr();
 
     match s.format {
+        #[cfg(feature = "wav")]
         FMT_WAV => {
             let ws = &mut *(codec_ptr as *mut wav_codec::WavState);
             wav_codec::wav_init(ws, syscalls, in_chan, out_chan);
             wav_codec::wav_feed_detect(ws, detect_ptr, detect_len);
             dev_log(&*syscalls, 3, b"[dec] wav".as_ptr(), 9);
         }
+        #[cfg(feature = "mp3")]
         FMT_MP3 => {
             let ms = &mut *(codec_ptr as *mut mp3_codec::Mp3State);
             mp3_codec::mp3_init(ms, syscalls, in_chan, out_chan);
             mp3_codec::mp3_feed_detect(ms, detect_ptr, detect_len);
             dev_log(&*syscalls, 3, b"[dec] mp3".as_ptr(), 9);
         }
+        #[cfg(feature = "aac")]
         FMT_AAC => {
             let a = &mut *(codec_ptr as *mut aac_codec::AacState);
             aac_codec::aac_init(a, syscalls, in_chan, out_chan);
             aac_codec::aac_feed_detect(a, detect_ptr, detect_len);
             dev_log(&*syscalls, 3, b"[dec] aac".as_ptr(), 9);
         }
+        #[cfg(feature = "image")]
         FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG => {
             // Image path emits on `pixels` (output port 1), not the
             // audio `out_chan` (output port 0). The parent looks
@@ -425,6 +489,7 @@ unsafe fn init_codec(s: &mut DecoderState) {
             };
             dev_log(&*syscalls, 3, tag.as_ptr(), tag.len());
         }
+        #[cfg(feature = "h264")]
         FMT_MKV => {
             // Video emits on `pixels` (output port 1), like the image
             // path. Params are shared with the image path's staging.
@@ -463,16 +528,27 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<DecoderState>() as u32
 }
 
-/// Per-module heap budget. Sized for the worst single-format case:
-/// image path = 8 MiB encoded BMP accumulator + 2 MiB RGB565 slack;
-/// video path = 2 MiB Annex B accumulator + DPB frames + RGB565
-/// staging (≈ 12.5 MiB at 1080p). Audio uses ~32 KB. Only one format
-/// is active at a time per module instance; the arena is paged in
-/// lazily on both linux and wasm hosts.
+/// Per-module heap budget, derived from the ENABLED feature set (RFC
+/// module_variants — this is the primary constrained-target win):
+/// - video (`h264`): 2 MiB Annex B accumulator + DPB frames + RGB565
+///   staging ≈ 12.5 MiB at 1080p → 16 MiB.
+/// - image (no video): 8 MiB encoded BMP accumulator + 2 MiB RGB565
+///   slack → 10 MiB.
+/// - audio only: sub-codecs run out of the state union with no heap
+///   use; 64 KiB covers incidental allocation with margin.
+/// Only one format is active at a time per module instance; on hosts
+/// the arena is paged in lazily, on rp2350 the request must fit the
+/// 256 KB shared state arena — which only the audio variant does.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_arena_size"]
 pub extern "C" fn module_arena_size() -> u32 {
-    16 * 1024 * 1024
+    if cfg!(feature = "h264") {
+        16 * 1024 * 1024
+    } else if cfg!(feature = "image") {
+        10 * 1024 * 1024
+    } else {
+        64 * 1024
+    }
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -550,13 +626,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // / `st=` heartbeats so a viewer connecting mid-run still
         // sees the proof line.
         s.tick_count = s.tick_count.wrapping_add(1);
+        // Liveness heartbeat, unconditional on format: the image/video
+        // heartbeats below only speak once a format is committed, so a
+        // codec stuck in DETECTING — or one whose one-shot "[dec] xxx"
+        // line was lost in the pre-net boot window — is indistinguishable
+        // from a dead module in UDP telemetry. One log line per ~5000
+        // ticks names the detected format byte.
+        if s.tick_count % 5000 == 0 {
+            let mut msg = *b"[dec] hb fmt=0";
+            msg[13] = b'0' + (s.format % 10);
+            dev_log(s.sys(), 3, msg.as_ptr(), msg.len());
+        }
         // Video-path heartbeat: frames out + ES fill + phase, so a
         // wedged hop is identifiable from one log line without
         // instrumenting the peer modules.
+        #[cfg(feature = "h264")]
         if s.tick_count % 5000 == 0 && s.format == FMT_MKV {
             let mkv = &*(s.codec.0.as_ptr() as *const mkv_h264::MkvH264State);
             mkv_h264::mkv_heartbeat(mkv, s.sys());
         }
+        #[cfg(feature = "image")]
         if s.tick_count % 5000 == 0 && is_image_format(s.format) {
             let img = &*(s.codec.0.as_ptr() as *const image_codec::ImageState);
             let ph = img.phase as u32;
@@ -656,6 +745,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // MKV: sub-codec signals Done (HUP + decoder flushed + all
         // frames drained) — flush the boundary and re-arm detection
         // so the next file can start.
+        #[cfg(feature = "h264")]
         if s.format == FMT_MKV {
             let mkv = &*(s.codec.0.as_ptr() as *const mkv_h264::MkvH264State);
             if mkv_h264::mkv_is_done(mkv) {
@@ -688,6 +778,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // can resume. MP3 / AAC don't expose a `sub_done`
             // predicate and fall through to the quiesce path.
             let sub_done = match s.format {
+                #[cfg(feature = "wav")]
                 FMT_WAV => wav_codec::wav_is_done(s.wav()),
                 _ => false,
             };
@@ -719,10 +810,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Dispatch to detected codec's step function
         match s.format {
+            #[cfg(feature = "wav")]
             FMT_WAV => wav_codec::wav_step(s.wav()),
+            #[cfg(feature = "mp3")]
             FMT_MP3 => mp3_codec::mp3_step(s.mp3()),
+            #[cfg(feature = "aac")]
             FMT_AAC => aac_codec::aac_step(s.aac()),
+            #[cfg(feature = "image")]
             FMT_BMP | FMT_GIF | FMT_PNG | FMT_JPEG => image_codec::image_step(s.img()),
+            #[cfg(feature = "h264")]
             FMT_MKV => mkv_h264::mkv_step(s.mkv()),
             _ => 0,
         }

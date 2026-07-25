@@ -149,7 +149,14 @@ pub struct TargetReport {
 /// Discovered module candidate.
 #[derive(Debug)]
 struct Candidate {
+    /// Artifact name — the `.fmod`/`.o`/`.elf` filename stem. For a
+    /// variant candidate this carries the `-<variant>` suffix (default
+    /// variant stays unsuffixed); the suffix exists ONLY here.
     name: String,
+    /// Name embedded in the fmod header — always the base module type.
+    /// Graphs bind by `fnv1a(type_name)`, so this must never carry a
+    /// variant suffix (RFC module_variants §4.2).
+    embed_name: String,
     dir: PathBuf,
     entry: PathBuf,
     manifest: PathBuf,
@@ -160,6 +167,18 @@ struct Candidate {
     /// Rust edition passed to `rustc --edition`. Defaults to "2021";
     /// 2024 is blocked on the SDK adopting `#[unsafe(no_mangle)]`.
     edition: String,
+    /// `[[variant]]` name this candidate builds, if any. Drives the
+    /// embedded-manifest port filtering in `pack_fmod`.
+    variant: Option<String>,
+    /// `--cfg feature="…"` flags for this candidate (the variant's
+    /// feature set). Empty for non-variant modules — they get no
+    /// feature cfg arguments at all.
+    features: Vec<String>,
+    /// Accepted values for `--check-cfg=cfg(feature, values(…))`: the
+    /// union of every variant's features plus the pre-existing
+    /// `host-test` cfg. Only populated (and only emitted) for variant
+    /// candidates.
+    check_cfg_features: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -178,6 +197,27 @@ struct ManifestRaw {
     entry: Option<String>,
     #[serde(default)]
     edition: Option<String>,
+    #[serde(default)]
+    variant: Option<Vec<VariantRaw>>,
+}
+
+/// Raw `[[variant]]` row as discovery sees it. Full validation
+/// (omit_ports vs declared ports, name syntax) lives in
+/// `Manifest::from_toml_for_target`; discovery checks only what it
+/// needs to expand candidates correctly. Unknown keys are rejected
+/// here too (matching `TomlVariant`) so a typo'd row fails at
+/// discovery instead of after the compile, at pack.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VariantRaw {
+    name: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    #[allow(dead_code, reason = "consumed by Manifest::apply_variant at pack time")]
+    omit_ports: Vec<String>,
 }
 
 /// Editions `rustc` accepts today. Kept explicit so a manifest typo
@@ -240,19 +280,107 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
                     manifest.display()
                 )));
             }
-            out.push(Candidate {
-                name,
-                dir: dir.clone(),
-                entry,
-                manifest,
-                hardware_targets: raw.hardware_targets.unwrap_or_default(),
-                type_id,
-                edition,
-            });
+            let hardware_targets = raw.hardware_targets.unwrap_or_default();
+            match raw.variant {
+                None => out.push(Candidate {
+                    name: name.clone(),
+                    embed_name: name,
+                    dir: dir.clone(),
+                    entry,
+                    manifest,
+                    hardware_targets,
+                    type_id,
+                    edition,
+                    variant: None,
+                    features: Vec::new(),
+                    check_cfg_features: Vec::new(),
+                }),
+                Some(variants) => {
+                    // Expansion-level validation only; the full table
+                    // check (omit_ports, name syntax) runs in
+                    // `Manifest::from_toml_for_target` at pack time.
+                    let defaults = variants.iter().filter(|v| v.default).count();
+                    if defaults != 1 {
+                        return Err(Error::Module(format!(
+                            "{}: [[variant]] table needs exactly one `default = true` \
+                             entry (found {defaults})",
+                            manifest.display()
+                        )));
+                    }
+                    // `--check-cfg` accepted values: union of every
+                    // variant's features + the pre-existing `host-test`
+                    // cfg the SDK dual-build uses.
+                    let mut all: Vec<String> = variants
+                        .iter()
+                        .flat_map(|v| v.features.iter().cloned())
+                        .collect();
+                    all.push("host-test".to_string());
+                    all.sort();
+                    all.dedup();
+                    for v in &variants {
+                        let artifact = if v.default {
+                            name.clone()
+                        } else {
+                            format!("{name}-{}", v.name)
+                        };
+                        out.push(Candidate {
+                            name: artifact,
+                            embed_name: name.clone(),
+                            dir: dir.clone(),
+                            entry: entry.clone(),
+                            manifest: manifest.clone(),
+                            hardware_targets: hardware_targets.clone(),
+                            type_id,
+                            edition: edition.clone(),
+                            variant: Some(v.name.clone()),
+                            features: v.features.clone(),
+                            check_cfg_features: all.clone(),
+                        });
+                    }
+                }
+            }
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    // Artifact names must be unique across the whole set: a variant
+    // suffix (`<module>-<variant>`) can collide with another module
+    // DIRECTORY of that literal name, and both would race for the same
+    // `<name>.fmod` in out_dir — whichever built last would win.
+    for pair in out.windows(2) {
+        if pair[0].name == pair[1].name {
+            return Err(Error::Module(format!(
+                "artifact name collision: '{}.fmod' is produced by both {} and {} — \
+                 rename the variant or the module",
+                pair[0].name,
+                pair[0].manifest.display(),
+                pair[1].manifest.display()
+            )));
+        }
+    }
     Ok(out)
+}
+
+/// `--cfg feature="…"` + `--check-cfg` arguments for a variant
+/// candidate. Empty for non-variant modules — their rustc /
+/// clippy-driver invocations carry no feature cfgs at all.
+fn cfg_feature_args(cand: &Candidate) -> Vec<String> {
+    if cand.features.is_empty() {
+        return Vec::new();
+    }
+    let mut args = Vec::new();
+    for f in &cand.features {
+        args.push("--cfg".to_string());
+        args.push(format!("feature=\"{f}\""));
+    }
+    let values = cand
+        .check_cfg_features
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    args.push("--check-cfg".to_string());
+    args.push(format!("cfg(feature, values({values}))"));
+    args
 }
 
 /// Resolve the module-type byte (1–5) used by `pack_fmod`.
@@ -457,6 +585,7 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
             .arg("-C")
             .arg("relocation-model=pic")
             .args(spec.extra_rustflags)
+            .args(cfg_feature_args(cand))
             .arg("-A")
             .arg("clippy::empty_loop")
             .arg("-D")
@@ -663,7 +792,8 @@ fn compile_module_pic(
         .arg("-O")
         .arg("-C")
         .arg("relocation-model=pic")
-        .args(spec.extra_rustflags);
+        .args(spec.extra_rustflags)
+        .args(cfg_feature_args(cand));
     if opts.strict {
         // `-D warnings` upgrades unfulfilled `#[expect(...)]` and
         // every other warning into a hard error, matching the
@@ -705,14 +835,17 @@ fn compile_module_pic(
     }
     run_step(ld, "linker")?;
 
-    // 3) Pack ELF → .fmod (in-process, no subshell).
+    // 3) Pack ELF → .fmod (in-process, no subshell). Header name is the
+    // BASE module type (`embed_name`), never the variant-suffixed
+    // filename — graphs bind by fnv1a(type_name).
     pack_fmod(
         &elf_path,
         &out_path,
-        &cand.name,
+        &cand.embed_name,
         cand.type_id,
         Some(&cand.manifest),
         Some(spec.silicon_id),
+        cand.variant.as_deref(),
     )?;
     Ok(BuildOutcome::Built)
 }
@@ -737,6 +870,7 @@ fn compile_module_wasm(
         .arg("opt-level=z")
         .arg("-C")
         .arg("strip=symbols");
+    rustc.args(cfg_feature_args(cand));
     if opts.strict {
         rustc.arg("-D").arg("warnings");
     } else {
@@ -783,10 +917,11 @@ fn compile_module_wasm(
     pack_fmod_wasm(
         &wasm_path,
         &out_path,
-        &cand.name,
+        &cand.embed_name,
         cand.type_id,
         Some(&cand.manifest),
         Some(spec.silicon_id),
+        cand.variant.as_deref(),
     )?;
     Ok(BuildOutcome::Built)
 }
@@ -985,6 +1120,10 @@ mod tests {
             hardware_targets: vec![],
             type_id: 2,
             edition: "2021".into(),
+            embed_name: "x".into(),
+            variant: None,
+            features: Vec::new(),
+            check_cfg_features: Vec::new(),
         };
         assert!(matches_target(&c, "rp2350", "rp2350"));
         assert!(matches_target(&c, "cm5", "bcm2712"));
@@ -1000,6 +1139,10 @@ mod tests {
             hardware_targets: vec!["bcm2712".into()],
             type_id: 2,
             edition: "2021".into(),
+            embed_name: "x".into(),
+            variant: None,
+            features: Vec::new(),
+            check_cfg_features: Vec::new(),
         };
         // Board target "cm5" matches via its silicon mapping to bcm2712.
         assert!(matches_target(&c, "cm5", "bcm2712"));
@@ -1017,6 +1160,10 @@ mod tests {
             hardware_targets: vec!["cm5".into()],
             type_id: 2,
             edition: "2021".into(),
+            embed_name: "x".into(),
+            variant: None,
+            features: Vec::new(),
+            check_cfg_features: Vec::new(),
         };
         // Manifest pinned to the board name (cm5) — silicon-keyed
         // match should still let it through when the user invokes

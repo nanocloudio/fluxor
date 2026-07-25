@@ -1192,6 +1192,7 @@ fn cmd_pack(
             module_type,
             manifest_path,
             None,
+            None,
         )?
     } else {
         pack_fmod(
@@ -1200,6 +1201,7 @@ fn cmd_pack(
             &module_name,
             module_type,
             manifest_path,
+            None,
             None,
         )?
     };

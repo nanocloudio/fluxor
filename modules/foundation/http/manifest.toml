@@ -1,6 +1,23 @@
 version = "2.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
+# Feature-set variants (RFC module_variants). `full` (default) emits
+# the unsuffixed http.fmod with every protocol generation;
+# `http-web.fmod` drops HTTP/2 + HTTP/3 (h2/hpack/wire_h2/client_h2 +
+# h3/qpack/wire_h3, ≈4.65k LOC of flash) for embedded targets that
+# serve single-connection HTTP/1 (+WebSocket). `h1` and `ws` are
+# declared markers — always compiled today; a future `min` variant
+# arrives when the ws seams are gated (rfc_module_variants.md §9 O1:
+# ws scatter is ~10x h2's, deferred until a workload needs it).
+[[variant]]
+name = "web"
+features = ["h1", "ws"]
+
+[[variant]]
+name = "full"
+features = ["h1", "h2", "ws", "h3"]
+default = true
+
 [[ports]]
 name = "net_in"
 direction = "input"

@@ -11,8 +11,10 @@ use super::connection::{
     NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND,
     NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
 };
+#[cfg(feature = "h2")]
 use super::h2;
 use super::wire_h1 as h1;
+#[cfg(feature = "h2")]
 use super::wire_h2;
 use super::wire_ws as ws;
 use super::HttpState;
@@ -360,6 +362,7 @@ pub(crate) struct ConnSlot {
     /// h1 mode or idle. Sized at ~3 KB on aarch64 (4 streams + WS
     /// reassembly buffer), so making it lazy saves ~3 MB on a
     /// 1024-slot table for h1-only workloads.
+    #[cfg(feature = "h2")]
     pub(crate) h2: *mut super::h2::H2State,
 
     // ── WebSocket fan-out fragmentation state ──────────────────────
@@ -494,6 +497,7 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
         slot.send_buf = core::ptr::null_mut();
         slot.send_cap = 0;
     }
+    #[cfg(feature = "h2")]
     if !slot.h2.is_null() {
         heap_free(&*sys, slot.h2 as *mut u8);
         slot.h2 = core::ptr::null_mut();
@@ -877,6 +881,7 @@ pub(crate) unsafe fn set_cur_phase(s: &mut HttpState, p: Phase) {
 /// only reads h2 state after `enter()` (which calls
 /// `ensure_h2_state`) and before the slot transitions to
 /// `CloseConn` (which clears the pointer).
+#[cfg(feature = "h2")]
 #[inline(always)]
 pub(crate) unsafe fn cur_h2(s: &HttpState) -> &super::h2::H2State {
     &*cur_slot(s).unwrap_unchecked().h2
@@ -884,6 +889,7 @@ pub(crate) unsafe fn cur_h2(s: &HttpState) -> &super::h2::H2State {
 
 /// Active slot's `H2State` mut ref. Same precondition as
 /// [`cur_h2`].
+#[cfg(feature = "h2")]
 #[inline(always)]
 pub(crate) unsafe fn cur_h2_mut(s: &mut HttpState) -> &mut super::h2::H2State {
     &mut *cur_slot_mut(s).unwrap_unchecked().h2
@@ -893,6 +899,7 @@ pub(crate) unsafe fn cur_h2_mut(s: &mut HttpState) -> &mut super::h2::H2State {
 /// Called from `h2::enter()` before the slot runs its first h2
 /// tick. Returns `false` on heap exhaustion — the caller must
 /// transition to `CloseConn` rather than enter `H2Active`.
+#[cfg(feature = "h2")]
 pub(crate) unsafe fn ensure_h2_state(s: &mut HttpState) -> bool {
     let idx = match current_slot_index(s) {
         Some(i) => i,
@@ -1279,6 +1286,7 @@ unsafe fn release_file_chan(s: &mut HttpState) {
 /// Public wrapper for `try_acquire_file_chan` so h2 paths
 /// (`begin_file_response`) can claim cross-slot ownership without
 /// duplicating the helper.
+#[cfg(feature = "h2")]
 #[inline]
 pub(crate) unsafe fn try_acquire_file_chan_external(s: &mut HttpState) -> bool {
     try_acquire_file_chan(s)
@@ -1286,6 +1294,7 @@ pub(crate) unsafe fn try_acquire_file_chan_external(s: &mut HttpState) -> bool {
 
 /// Public wrapper for `release_file_chan` so h2 error paths can
 /// release on aborted fetch.
+#[cfg(feature = "h2")]
 #[inline]
 pub(crate) unsafe fn release_file_chan_external(s: &mut HttpState) {
     release_file_chan(s);
@@ -3886,8 +3895,12 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             // beginning with `PRI`. We check before the h1 request
             // parse so a misdirected h1 client doesn't accidentally
             // hit the same path. The preface is a fixed string; first
-            // few bytes are sufficient to disambiguate.
+            // few bytes are sufficient to disambiguate. Without the
+            // h2 feature the whole detect is compiled out and a `PRI`
+            // request falls through to h1 parsing (which 400s it) —
+            // fail-visible rather than silently half-speaking h2.
             let recv_parsed = cur_slot(s).map(|c| c.recv_parsed).unwrap_or(0);
+            #[cfg(feature = "h2")]
             if recv_parsed == 0 && len >= 1 && *cur_recv_buf_ptr(s) == b'P' {
                 if len < wire_h2::PREFACE.len() {
                     return 0; // wait for the rest of the preface
@@ -5599,6 +5612,18 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
         }
 
+        #[cfg(not(feature = "h2"))]
+        Phase::H2Active => {
+            // Unreachable without h2 (nothing constructs H2Active —
+            // the preface detect is compiled out), but the enum
+            // variant is kept so phase numbering and the phase-walk
+            // arms stay identical across variants. Fail closed.
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::CloseConn;
+            }
+            return 0;
+        }
+        #[cfg(feature = "h2")]
         Phase::H2Active => {
             let r = h2::step(s);
             if r == 1 {

@@ -85,35 +85,47 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/params.rs");
 
 mod client;
-mod client_h2;
 mod connection;
-mod h2;
-mod h3;
 mod server;
+
+// Feature gates (RFC module_variants): HTTP/2 (h2 + hpack + wire_h2 +
+// client_h2) and HTTP/3 (h3 + qpack + wire_h3) compile only when their
+// feature is enabled. `[[variant]]` in manifest.toml drives which
+// prebuilt fmod carries them — `http.fmod` (default = full) has both;
+// `http-web.fmod` is h1+ws only, dropping ~4.65k LOC of flash the
+// embedded single-connection targets never exercise. h1 and ws are
+// always compiled (ws gating is deferred — its seams are ~10x wider;
+// see rfc_module_variants.md §9 O1).
+#[cfg(feature = "h2")]
+mod client_h2;
+#[cfg(feature = "h2")]
+mod h2;
+#[cfg(feature = "h3")]
+mod h3;
 
 // Wire codecs are pure-byte and useful for host tests of the
 // h1 / h2 / h3 / ws / hpack / qpack layers. Stay private outside
 // the host-test feature so the firmware's symbol surface is
 // unchanged.
-#[cfg(not(feature = "host-test"))]
+#[cfg(all(feature = "h2", not(feature = "host-test")))]
 mod hpack;
-#[cfg(feature = "host-test")]
+#[cfg(all(feature = "h2", feature = "host-test"))]
 pub mod hpack;
-#[cfg(not(feature = "host-test"))]
+#[cfg(all(feature = "h3", not(feature = "host-test")))]
 mod qpack;
-#[cfg(feature = "host-test")]
+#[cfg(all(feature = "h3", feature = "host-test"))]
 pub mod qpack;
 #[cfg(not(feature = "host-test"))]
 mod wire_h1;
 #[cfg(feature = "host-test")]
 pub mod wire_h1;
-#[cfg(not(feature = "host-test"))]
+#[cfg(all(feature = "h2", not(feature = "host-test")))]
 mod wire_h2;
-#[cfg(feature = "host-test")]
+#[cfg(all(feature = "h2", feature = "host-test"))]
 pub mod wire_h2;
-#[cfg(not(feature = "host-test"))]
+#[cfg(all(feature = "h3", not(feature = "host-test")))]
 mod wire_h3;
-#[cfg(feature = "host-test")]
+#[cfg(all(feature = "h3", feature = "host-test"))]
 pub mod wire_h3;
 #[cfg(not(feature = "host-test"))]
 mod wire_ws;
@@ -442,7 +454,13 @@ pub extern "C" fn module_arena_size() -> u32 {
     let per_slot_buffers = (server::RECV_BUF_SIZE + server::SEND_BUF_SIZE) as u32;
     let working_set = server::ARENA_WORKING_SET_CONNS as u32;
     let conns_buffers = per_slot_buffers.saturating_mul(working_set);
+    // h2's per-connection state joins the arena budget only when the
+    // feature is compiled in — the web variant's request shrinks by
+    // ~3 KB × working set.
+    #[cfg(feature = "h2")]
     let h2_state_size = core::mem::size_of::<h2::H2State>() as u32;
+    #[cfg(not(feature = "h2"))]
+    let h2_state_size = 0u32;
     let h2_buffers = h2_state_size.saturating_mul(working_set);
     // 16 bytes of allocator overhead per heap_alloc call (8-byte
     // header + alignment padding). Up to 3 allocs per active conn
@@ -560,11 +578,22 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         let rc = if s.mode == MODE_CLIENT {
-            if s.client.protocol == 1 {
+            #[cfg(feature = "h2")]
+            let r = if s.client.protocol == 1 {
                 client_h2::step(s)
             } else {
                 client::step(s)
-            }
+            };
+            // Without h2, `protocol: 1` (h2c client) cannot be served;
+            // config validation should have rejected it, but fail
+            // closed rather than silently speaking h1 on an h2 wire.
+            #[cfg(not(feature = "h2"))]
+            let r = if s.client.protocol == 1 {
+                -1
+            } else {
+                client::step(s)
+            };
+            r
         } else {
             server::step(s)
         };

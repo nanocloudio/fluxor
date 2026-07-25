@@ -263,6 +263,21 @@ pub enum StorePin {
 /// `store_cli::lock_store_resolver`.
 pub type StoreFallback<'a> = &'a dyn Fn(&str) -> StorePin;
 
+/// Trailer for "artifact not found" errors when a variant was
+/// requested. The build emits the DEFAULT variant unsuffixed
+/// (`<type>.fmod`), so naming the default variant explicitly in YAML
+/// resolves an artifact that never exists — the hint points at the
+/// only fix the tools can't apply themselves.
+fn default_variant_hint(module_type: &str, variant: Option<&str>) -> String {
+    match variant {
+        Some(v) => format!(
+            "\nIf '{v}' is this module's default [[variant]], omit `variant:` — the \
+             default variant builds unsuffixed as '{module_type}.fmod'."
+        ),
+        None => String::new(),
+    }
+}
+
 fn resolve_fmod(
     module_type: &str,
     primary_dir: &Path,
@@ -342,9 +357,45 @@ pub fn parse_modules_from_config_multi(
 ) -> Result<Vec<ModuleInfo>> {
     let mut modules = Vec::new();
 
-    if let Some(modules_array) = config["modules"].as_array() {
-        let mut loaded_types = std::collections::HashSet::new();
+    // Dedup by module TYPE (one FXMT entry per name_hash) while
+    // remembering which VARIANT was selected: two nodes of one type
+    // naming different variants cannot share the single table entry, so
+    // that's a hard config error rather than a silent first-wins
+    // (RFC module_variants §4.3).
+    let mut loaded_variants: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut check_dedup = |module_type: &str, variant: Option<&str>| -> Result<bool> {
+        match loaded_variants.entry(module_type.to_string()) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if e.get().as_deref() != variant {
+                    return Err(Error::Module(format!(
+                        "module type '{}' is used with conflicting variants \
+                         ('{}' vs '{}') — one image carries one build of a \
+                         module type; align the graph on a single variant",
+                        module_type,
+                        e.get().as_deref().unwrap_or("<default>"),
+                        variant.unwrap_or("<default>"),
+                    )));
+                }
+                Ok(false) // already loaded, same variant — skip
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(variant.map(str::to_string));
+                Ok(true)
+            }
+        }
+    };
+    // Artifact name: `<type>` for the default variant, `<type>-<variant>`
+    // otherwise. The suffix exists only in filenames and pin keys — the
+    // fmod's embedded name (and FXMT hash) is the base type.
+    let artifact_name = |module_type: &str, variant: Option<&str>| -> String {
+        match variant {
+            Some(v) => format!("{module_type}-{v}"),
+            None => module_type.to_string(),
+        }
+    };
 
+    if let Some(modules_array) = config["modules"].as_array() {
         for module_entry in modules_array {
             let module_name = if let Some(name) = module_entry.as_str() {
                 name.to_string()
@@ -357,13 +408,15 @@ pub fn parse_modules_from_config_multi(
             };
 
             let module_type = module_entry["type"].as_str().unwrap_or(&module_name);
+            let variant = module_entry["variant"].as_str();
 
-            if !loaded_types.insert(module_type.to_string()) {
+            if !check_dedup(module_type, variant)? {
                 continue;
             }
 
+            let artifact = artifact_name(module_type, variant);
             let module_path = match resolve_fmod(
-                module_type,
+                &artifact,
                 modules_dir,
                 extra_dirs,
                 store_fallback,
@@ -372,6 +425,13 @@ pub fn parse_modules_from_config_multi(
                 None => {
                     // Check if this is a built-in module (no .fmod needed)
                     if is_builtin_module(module_type) {
+                        if let Some(v) = variant {
+                            return Err(Error::Module(format!(
+                                "module '{module_name}' (type '{module_type}') requests \
+                                 variant '{v}', but the type is built into the kernel — \
+                                 built-ins have no variant artifacts; drop `variant:`"
+                            )));
+                        }
                         continue;
                     }
                     let searched: Vec<String> = std::iter::once(modules_dir)
@@ -379,10 +439,12 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.",
+                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                         module_name,
                         module_type,
+                        artifact,
                         searched.join(", "),
+                        default_variant_hint(module_type, variant),
                     )));
                 }
             };
@@ -392,19 +454,19 @@ pub fn parse_modules_from_config_multi(
             modules.push(module_info);
         }
     } else if let Some(modules_map) = config["modules"].as_object() {
-        let mut loaded_types = std::collections::HashSet::new();
-
         for (instance_name, module_def) in modules_map {
             let module_type = module_def["type"]
                 .as_str()
                 .unwrap_or(instance_name.as_str());
+            let variant = module_def["variant"].as_str();
 
-            if !loaded_types.insert(module_type.to_string()) {
+            if !check_dedup(module_type, variant)? {
                 continue;
             }
 
+            let artifact = artifact_name(module_type, variant);
             let module_path = match resolve_fmod(
-                module_type,
+                &artifact,
                 modules_dir,
                 extra_dirs,
                 store_fallback,
@@ -413,6 +475,13 @@ pub fn parse_modules_from_config_multi(
                 None => {
                     // Check if this is a built-in module (no .fmod needed)
                     if is_builtin_module(module_type) {
+                        if let Some(v) = variant {
+                            return Err(Error::Module(format!(
+                                "module '{instance_name}' (type '{module_type}') requests \
+                                 variant '{v}', but the type is built into the kernel — \
+                                 built-ins have no variant artifacts; drop `variant:`"
+                            )));
+                        }
                         continue;
                     }
                     let searched: Vec<String> = std::iter::once(modules_dir)
@@ -420,10 +489,12 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.",
+                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                         instance_name,
                         module_type,
+                        artifact,
                         searched.join(", "),
+                        default_variant_hint(module_type, variant),
                     )));
                 }
             };
@@ -450,22 +521,55 @@ pub fn parse_modules_from_config_multi(
                     Some(t) => t,
                     None => continue,
                 };
+                let pod_variant = m["variant"].as_str();
+                // Variant conflict check BEFORE the dedup skip: a pod
+                // naming a different variant than the base graph (or an
+                // earlier pod) loaded must fail, not silently ride on
+                // whichever build got there first — same rule as the
+                // base graph (RFC module_variants §4.3).
+                match loaded_variants.entry(module_type.to_string()) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        if e.get().as_deref() != pod_variant {
+                            return Err(Error::Module(format!(
+                                "pod module type '{}' requests variant '{}' but the image \
+                                 already carries '{}' — one image carries one build of a \
+                                 module type; align pods and base graph on a single variant",
+                                module_type,
+                                pod_variant.unwrap_or("<default>"),
+                                e.get().as_deref().unwrap_or("<default>"),
+                            )));
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(pod_variant.map(str::to_string));
+                    }
+                }
                 if !loaded_types.insert(module_type.to_string()) {
                     continue;
                 }
                 if is_builtin_module(module_type) {
+                    if let Some(v) = pod_variant {
+                        return Err(Error::Module(format!(
+                            "pod module type '{module_type}' requests variant '{v}', but \
+                             the type is built into the kernel — built-ins have no \
+                             variant artifacts; drop `variant:`"
+                        )));
+                    }
                     continue;
                 }
-                let module_path = resolve_fmod(module_type, modules_dir, extra_dirs, store_fallback)?.ok_or_else(
+                let pod_artifact = artifact_name(module_type, pod_variant);
+                let module_path = resolve_fmod(&pod_artifact, modules_dir, extra_dirs, store_fallback)?.ok_or_else(
                     || {
                         let searched: Vec<String> = std::iter::once(modules_dir)
                             .chain(extra_dirs.iter().copied())
                             .map(|d| d.display().to_string())
                             .collect();
                         Error::Module(format!(
-                            "pod module type '{}' not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.",
+                            "pod module type '{}' (artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                             module_type,
+                            pod_artifact,
                             searched.join(", "),
+                            default_variant_hint(module_type, pod_variant),
                         ))
                     },
                 )?;
@@ -771,6 +875,7 @@ pub fn pack_fmod(
     module_type: u8,
     manifest_path: Option<&Path>,
     target_silicon: Option<&str>,
+    variant: Option<&str>,
 ) -> Result<PackResult> {
     let elf_data = std::fs::read(input)?;
     let (sections, symbols) = parse_elf(&elf_data)?;
@@ -983,6 +1088,14 @@ pub fn pack_fmod(
         }
     };
 
+    // Variant specialization (RFC module_variants): the manifest this
+    // fmod embeds is the VARIANT's manifest — omitted ports filtered
+    // out, retained ports keeping their indices — so the artifact's
+    // advertised port surface matches what was actually compiled in.
+    if let Some(v) = variant {
+        module_manifest.apply_variant(v)?;
+    }
+
     // Compute integrity hash over code + data sections (use code_data which preserves layout)
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&code_data, data_data));
     // ABI-surface attestation: take the digest the compiler embedded in the
@@ -1184,6 +1297,7 @@ pub fn pack_fmod_wasm(
     module_type: u8,
     manifest_path: Option<&Path>,
     target_silicon: Option<&str>,
+    variant: Option<&str>,
 ) -> Result<PackResult> {
     let wasm_data = std::fs::read(input)?;
 
@@ -1217,6 +1331,12 @@ pub fn pack_fmod_wasm(
             Manifest::default()
         }
     };
+
+    // Variant specialization — same contract as the PIC path: the
+    // embedded manifest is the variant's filtered port table.
+    if let Some(v) = variant {
+        module_manifest.apply_variant(v)?;
+    }
 
     // Integrity hash over the wasm code payload. Empty data section.
     module_manifest.integrity_hash = Some(manifest::compute_integrity(&wasm_data, &[]));
@@ -1403,6 +1523,102 @@ fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC module_variants §4.3: two module entries of one type naming
+    /// different variants is a hard config error — the image carries
+    /// one FXMT entry per name_hash, so silent first-wins would ship
+    /// whichever variant parsed first. Uses a builtin type so the
+    /// first entry needs no .fmod on disk.
+    #[test]
+    fn same_type_conflicting_variants_is_hard_error() {
+        let config = serde_json::json!({
+            "modules": [
+                { "name": "net_a", "type": "linux_net" },
+                { "name": "net_b", "type": "linux_net", "variant": "slim" },
+            ]
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect_err("conflicting variants must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("conflicting variants"), "got: {msg}");
+        assert!(msg.contains("slim"), "should name the variant: {msg}");
+    }
+
+    /// A variant request never falls back to the bare-type artifact:
+    /// `type + variant` resolves `<type>-<variant>.fmod` and a miss
+    /// names that artifact in the error, plus the default-variant hint
+    /// (the default builds unsuffixed, so naming it explicitly can
+    /// never resolve).
+    #[test]
+    fn variant_miss_names_the_artifact() {
+        let config = serde_json::json!({
+            "modules": [
+                { "name": "dec", "type": "no_such_module", "variant": "slim" },
+            ]
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect_err("missing variant artifact must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no_such_module-slim.fmod"), "got: {msg}");
+        assert!(msg.contains("default [[variant]]"), "got: {msg}");
+    }
+
+    /// A built-in module type takes no `variant:` — built-ins ship
+    /// inside the kernel, there is no variant artifact to resolve. The
+    /// error must say so instead of suggesting a build/pin that can
+    /// never produce the artifact.
+    #[test]
+    fn variant_on_builtin_type_is_an_error() {
+        let config = serde_json::json!({
+            "modules": [
+                { "name": "net", "type": "linux_net", "variant": "slim" },
+            ]
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect_err("variant on builtin must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("built into the kernel"), "got: {msg}");
+    }
+
+    /// Pod-vs-pod variant conflict must fail, not first-wins: the
+    /// variant conflict check runs BEFORE the pod dedup skip and
+    /// before the builtin bypass, so even a builtin type (which never
+    /// resolves an artifact) surfaces the disagreement.
+    #[test]
+    fn pod_conflicting_variants_is_hard_error() {
+        let config = serde_json::json!({
+            "modules": [],
+            "pods": [
+                { "modules": [ { "type": "linux_net" } ] },
+                { "modules": [ { "type": "linux_net", "variant": "slim" } ] },
+            ]
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let err = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect_err("conflicting pod variants must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("'slim'"), "got: {msg}");
+        assert!(msg.contains("'<default>'"), "got: {msg}");
+    }
+
+    /// Same type + same variant twice is the normal dedup: second entry
+    /// skipped, no error, one table entry.
+    #[test]
+    fn same_type_same_variant_dedups_silently() {
+        let config = serde_json::json!({
+            "modules": [
+                { "name": "net_a", "type": "linux_net" },
+                { "name": "net_b", "type": "linux_net" },
+            ]
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let mods = parse_modules_from_config_multi(&config, tmp.path(), &[], None)
+            .expect("builtin dedup should succeed");
+        assert!(mods.is_empty(), "builtins carry no fmod entries");
+    }
 
     #[test]
     fn test_fnv1a_hash() {
