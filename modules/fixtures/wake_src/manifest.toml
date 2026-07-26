@@ -1,0 +1,20 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Emits a 12-byte timestamped probe every `emit_every` (default 997) of
+# its own steps on `probe_out`. Paired with wake_snk to measure
+# wake-on-write latency on silicon (RFC idle_skip_wake,
+# tests/hardware/cm5_wake_probe*.toml).
+
+[[ports]]
+name = "probe_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "wake-on-write measurement fixture; its '[wksrc] emit' log lines are the observable, consumed by the rig scenario's pass rules"

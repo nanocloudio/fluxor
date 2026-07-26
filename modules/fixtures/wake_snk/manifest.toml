@@ -1,0 +1,27 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Period-gated consumer for the wake-on-write latency probe (RFC
+# idle_skip_wake): steps only every
+# 200 scheduler ticks (~800 ms at tick_us=4000) UNLESS event-woken. With
+# `wake: true` on the inbound edge, a write latches its event-wake bit
+# and the runner steps it on the next pass (event_wake bypasses the
+# period gate) — delivery latency collapses from the period to the pass
+# cadence. Logs `[wksnk] dt_ms=<n> fast=<0|1>` per delivery
+# (fast = dt < 50 ms).
+
+step_period_ticks = 200
+timer_class = "wall_clock"
+
+[[ports]]
+name = "probe_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "wake-latency measurement fixture; its '[wksnk] dt' log lines are the observable, consumed by the rig scenario's pass rules"

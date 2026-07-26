@@ -742,8 +742,15 @@ pub struct GraphEdge {
     /// of two. Encoded as a u32 LE in bytes 4-7 of the edge record.
     pub buffer_bytes: u32,
     /// Rate class of this edge: 0=control, 1=audio, 2=video,
-    /// 3=bulk. Feeds MODULE_FLOW_BUDGET grants.
+    /// 3=bulk, 4=transaction (contracts `RateClass`). Feeds
+    /// MODULE_FLOW_BUDGET grants and the wake-on-write class gate.
     pub rate_class: u8,
+    /// `wake: true` on the wiring entry (RFC idle_skip_wake §4
+    /// wake-on-write): a successful `channel_write` on this edge
+    /// latches the consumer's event-wake bit and rings the scheduler
+    /// doorbell so an idle sleep is cut short. Byte 9 bit 0 of the
+    /// edge record.
+    pub wake_on_write: bool,
 }
 
 // ============================================================================
@@ -1411,7 +1418,10 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 ///   resolved by the config compiler from the per-edge `rate:`
 ///   override / port content-type defaults. Consumed by the
 ///   MODULE_FLOW_BUDGET provider query.
-/// - bytes 9-11: reserved (0)
+/// - byte 9:    bit 0 = wake_on_write (RFC idle_skip_wake §4 — a
+///   `channel_write` on this edge latches the consumer's event-wake
+///   bit and rings the scheduler doorbell); bits 1-7 reserved
+/// - bytes 10-11: reserved (0)
 ///
 /// Both port indices are 4 bits; the runtime caps both at
 /// `MAX_PORTS = 16` (scheduler.rs). `buffer_group` is 5 bits — group 0
@@ -1432,6 +1442,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
         let to_port_index = port_byte & 0x0F;
         let buffer_bytes = u32::from_le_bytes([*ptr.add(4), *ptr.add(5), *ptr.add(6), *ptr.add(7)]);
         let rate_class = *ptr.add(8);
+        let wake_on_write = (*ptr.add(9) & 0x01) != 0;
         let edge_class = match edge_class_raw {
             1 => EdgeClass::DmaOwned,
             2 => EdgeClass::CrossCore,
@@ -1448,6 +1459,7 @@ fn parse_graph_edge(ptr: *const u8) -> GraphEdge {
             edge_class,
             buffer_bytes,
             rate_class,
+            wake_on_write,
         }
     }
 }

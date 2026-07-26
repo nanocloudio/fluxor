@@ -534,6 +534,47 @@ fn generate_config_impl(
     // Parallel array; entries default to 0 ("use module hints").
     let edge_buffer_bytes = resolve_edge_buffer_bytes(config);
 
+    // Per-edge wake-on-write (`wake: true`, RFC idle_skip_wake):
+    // channel_write on the flagged edge latches the consumer's
+    // event-wake bit and rings the scheduler doorbell, cutting the idle
+    // sleep short. Restricted to control/transaction rate classes as
+    // the intent gate — a bulk or media stream waking the scheduler per
+    // write would defeat demand-driven idle (the ENFORCED bound is the
+    // woken-path domain budget; this gate keeps the intent visible at
+    // config time).
+    let edge_wake_flags: Vec<u8> = {
+        let wiring_arr = config
+            .get("wiring")
+            .and_then(|w| w.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut flags = Vec::with_capacity(edges.len());
+        for (i, _) in edges.iter().enumerate() {
+            let wake = match wiring_arr.get(i).and_then(|e| e.get("wake")) {
+                None => false,
+                Some(v) => v.as_bool().ok_or_else(|| {
+                    crate::error::Error::Config(format!(
+                        "wiring[{i}]: `wake:` must be a boolean, got `{v}`"
+                    ))
+                })?,
+            };
+            if wake {
+                let rc = edge_rate_classes.get(i).copied().unwrap_or(0);
+                // 0 = control, 4 = transaction (byte-8 encoding above).
+                if rc != 0 && rc != 4 {
+                    return Err(crate::error::Error::Config(format!(
+                        "wiring[{i}]: `wake: true` is only valid on control/transaction-class \
+                         edges (resolved rate class {rc}) — a bulk/media stream waking the \
+                         scheduler per write defeats demand-driven idle. Reclassify the edge \
+                         (`rate:`) or drop the flag."
+                    )));
+                }
+            }
+            flags.push(wake as u8);
+        }
+        flags
+    };
+
     // Graph section.
     //   header (4 bytes): edge_count, flags, reserved[2]
     //   edges  (MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE bytes)
@@ -554,7 +595,9 @@ fn generate_config_impl(
     //              override or the consumer/producer port's content-
     //              type default. Consumed by the kernel's
     //              MODULE_FLOW_BUDGET query.
-    //   bytes 9-11: reserved (0)
+    //   byte 9:    bit 0 = wake_on_write (`wake: true`, RFC idle_skip_wake
+    //              — control/transaction classes only); bits 1-7 reserved
+    //   bytes 10-11: reserved (0)
     //
     // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`. The
     // 5-bit `buffer_group` ceiling (31) is enforced by
@@ -585,7 +628,10 @@ fn generate_config_impl(
         graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
         graph_section.extend_from_slice(&buffer_bytes.to_le_bytes());
         graph_section.push(edge_rate_classes.get(i).copied().unwrap_or(0));
-        graph_section.extend_from_slice(&[0u8; 3]);
+        // byte 9: bit 0 = wake_on_write (RFC idle_skip_wake); bits 1-7
+        // reserved. bytes 10-11 reserved.
+        graph_section.push(edge_wake_flags.get(i).copied().unwrap_or(0) & 0x01);
+        graph_section.extend_from_slice(&[0u8; 2]);
     }
     // Pad edge entries to fixed offset, then write domain metadata
     while graph_section.len() < 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE {

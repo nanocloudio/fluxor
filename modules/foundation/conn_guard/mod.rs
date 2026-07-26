@@ -17,9 +17,25 @@
 //! insertion when full, the least-recently-touched entry is evicted.
 //!
 //! Params (TLV):
-//!   tag 1: rate_table_size (u8, default 32, max 32)
+//!   tag 1: rate_table_size (u8, default 32, max 32; **0 disables the fuse
+//!          entirely** — `admit_syn` short-circuits, every SYN is admitted)
 //!   tag 2: rate_limit_per_ip (u8, default 16)
 //!   tag 3: rate_window_ms (u16, default 1000)
+//!
+//! **The 16 SYN/s/IP default is sized for HOSTILE traffic.** A load probe or
+//! benchmark is indistinguishable from a SYN flood by that measure, so a
+//! measurement graph must widen it (or set `rate_table_size = 0`) explicitly.
+//! Dropped SYNs are not visibly errors: the peer retransmits on Linux's
+//! 1s/3s/7s backoff ladder, and that ladder then appears as the p90/p99 of
+//! whatever is being measured. See `standards/rig.md` §6 and §7a.
+//!
+//! Diagnosing a suspected trip: `[guard] drop_syn` in the heartbeat is the
+//! authoritative counter. Do NOT add a log line to `module_new` or to an
+//! early `module_step`: it wedges this module — it stops stepping, frames
+//! never reach `ip`, and the DUT boots unreachable in a way that reads as a
+//! network fault. The frame buffer lives in `GuardState` rather than on the
+//! stack precisely because `module_step`'s frame must stay tiny; new stack
+//! buffers here are not free.
 
 #![no_std]
 #![allow(
@@ -62,13 +78,21 @@ const TCP_FLAG_ACK: u8 = 0x10;
 struct RateEntry {
     ip: u32,        // 0 = empty slot
     last_ms: u32,   // monotonic ms timestamp (truncated)
-    count: u8,
-    _pad: [u8; 3],
+    /// SYNs seen from this IP inside the current window.
+    ///
+    /// `u16`, NOT `u8`, deliberately. `rate_limit_per_ip` is a `u8`, so with a
+    /// `u8` counter `count.saturating_add(1) <= limit` would be *always true*
+    /// at `limit == 255` — the fuse would silently be a no-op at its own
+    /// documented maximum. The wider counter makes 255 an ordinary limit that
+    /// drops the 256th SYN. Layout stays 12 bytes, so `STATE_SIZE` is
+    /// unaffected.
+    count: u16,
+    _pad: [u8; 2],
 }
 
 impl RateEntry {
     const fn empty() -> Self {
-        Self { ip: 0, last_ms: 0, count: 0, _pad: [0; 3] }
+        Self { ip: 0, last_ms: 0, count: 0, _pad: [0; 2] }
     }
 }
 
@@ -178,7 +202,7 @@ unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, now_ms: u32) -> bool {
                 (*e).count = c;
                 // Don't update last_ms inside the window — the window is
                 // anchored at the first SYN of the burst.
-                return c <= limit;
+                return c <= limit as u16;
             }
         }
         i += 1;

@@ -224,15 +224,31 @@ pub fn wake_pending_in_mask(mask: &ModuleMask) -> bool {
     ModuleMask::from_words(words).intersects(mask)
 }
 
+/// Latch a module's wake bit WITHOUT ringing the scheduler doorbell —
+/// the bare latch half of `event_signal`. Two callers, with opposite
+/// doorbell needs:
+/// - wake-on-write (`channel::wake_consumer_if_flagged`) latches here and
+///   rings `wake_scheduler()` itself, so a flagged write cuts an idle
+///   sleep short;
+/// - the woken-step budget bound (RFC idle_skip_wake §5) restores a
+///   deferred module's bit — already consumed by the caller's
+///   `take_wake_pending` — so the wake is not lost, and deliberately does
+///   NOT ring the doorbell: the deferral exists because the domain is
+///   over budget NOW, and the next pass drains the bit without an
+///   immediate re-wake storm.
+pub fn relatch_module_wake(module_idx: usize) {
+    if module_idx < crate::kernel::config::MAX_MODULES {
+        EVENT_WAKE_PENDING[module_idx / 64].fetch_or(1u64 << (module_idx % 64), Ordering::Release);
+    }
+}
+
 /// Test-only: latch a module's wake bit directly, as if an event owned by it
 /// fired. Lets the multi-graph runner tests exercise the §6.5 "woken idle graph"
 /// resumption path (RFC adaptive_tick_extra §7.4) without registering a real
 /// event. Mirrors the wake-latch `event_signal` performs; a later
 /// `take_wake_pending` consumes it identically.
 pub fn signal_module_wake_for_test(module_idx: usize) {
-    if module_idx < crate::kernel::config::MAX_MODULES {
-        EVENT_WAKE_PENDING[module_idx / 64].fetch_or(1u64 << (module_idx % 64), Ordering::Release);
-    }
+    relatch_module_wake(module_idx);
 }
 
 /// Atomically read-and-clear the wake-pending bits for the modules in `mask`,

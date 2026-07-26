@@ -218,6 +218,14 @@ pub struct Edge {
     /// Rate class: 0=control, 1=audio, 2=video, 3=bulk, 4=transaction.
     /// Drives MODULE_FLOW_BUDGET grants.
     pub rate_class: u8,
+    /// `wake: true` on the wiring entry (RFC idle_skip_wake §4
+    /// wake-on-write): a successful write on this edge latches the
+    /// consumer's event-wake bit and rings the scheduler doorbell.
+    /// Wired into the channel slot's `wake_module` by `prepare_graph`
+    /// for same-domain direct edges; cross-domain edges are bound to
+    /// the consumer-local delivery channel by the platform's
+    /// cross-domain bridging instead (delivery-side wake).
+    pub wake_on_write: bool,
 }
 
 impl Edge {
@@ -242,6 +250,7 @@ impl Edge {
             buffer_bytes: 0,
             rate_class: 0,
             bridge_slot: -1,
+            wake_on_write: false,
         }
     }
 
@@ -268,6 +277,7 @@ impl Edge {
             buffer_bytes: 0,
             rate_class: 0,
             bridge_slot: -1,
+            wake_on_write: false,
         }
     }
 
@@ -3334,6 +3344,61 @@ fn owner_timer_due(_slot: u16, _generation: u32, _domain: usize) -> bool {
     false
 }
 
+/// §6.5 readable-channel term (RFC idle_skip_wake §4): does any edge whose
+/// CONSUMER belongs to this graph — and whose PRODUCER does not — hold
+/// readable bytes? Without this term, data written into a skipped graph's
+/// inbound channel (a cross-owner `apply_add` edge, or a system-graph
+/// producer) waits for the graph's backstop cadence: under demand-driven
+/// idle that is `tick_max_us` per hop, which is exactly the multi-workload
+/// latency term the RFC exists to remove. The check adds a wake REASON
+/// evaluated at the runner's existing cadence — not a wake source — so
+/// there is no storm surface and no ordering change.
+///
+/// Cost: O(edges) per otherwise-idle graph per pass, one lock-guarded
+/// `channel_poll` per cross-graph edge (POLL_IN covers both FIFO fill and
+/// mailbox READY). Callers short-circuit it behind every cheaper runnable
+/// term. If graph counts ever make the scan measurable, the RFC's O1
+/// refinement is a per-graph dirty bit set inside `channel_write` — decide
+/// from density-scenario profiling, not up front.
+///
+/// Intra-graph edges are deliberately excluded: data on them can only have
+/// been produced by this graph's own modules, whose step already reported
+/// work/burst to the pacer — including them would keep a graph busy on
+/// bytes it is itself draining at its own pace.
+///
+/// Fills `out` with the CONSUMER modules that have readable inbound data;
+/// the runner adds them to the woken set so they step with
+/// `event_wake = true` (bypassing step-period gating) — cross-graph
+/// channel data thereby carries exactly the semantics of a targeted
+/// `event_signal`, which is what RFC adaptive_tick mechanism (a) named for
+/// "channel write" wakes all along. Returns `true` if any were found.
+#[cfg(feature = "multitenant")]
+fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut ModuleMask) -> bool {
+    let mut any = false;
+    for e in sched.edges.iter().take(sched.edge_count) {
+        if !mask.test(e.to_module) || mask.test(e.from_module) {
+            continue;
+        }
+        // Consumer-side handle: the bridged override when present (the
+        // consumer can only read what the pump already delivered), else
+        // the shared channel.
+        let ch = if e.consumer_channel >= 0 {
+            e.consumer_channel
+        } else {
+            e.channel
+        };
+        if ch < 0 {
+            continue;
+        }
+        let ready = crate::kernel::channel::channel_poll(ch, crate::kernel::channel::POLL_IN);
+        if ready > 0 && (ready as u32 & crate::kernel::channel::POLL_IN) != 0 {
+            out.set(e.to_module);
+            any = true;
+        }
+    }
+    any
+}
+
 /// The shared-cooperative-runner core (RFC adaptive_tick_extra §7.2). Steps
 /// every resident graph in `domain` independently, skips idle graphs (§6.5),
 /// and returns the merged physical-sleep deadline (µs). Mirrors the once-per-tick
@@ -3488,7 +3553,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
         let prior_runnable = graph_pacer_instance_runnable(slot, generation, domain as u8);
         let must_tick = mask.intersects(&must_tick_mask);
         let backstop_due = !is_system && !idle_safe && (snap_backstop == 0 || now >= snap_backstop);
-        let runnable = is_system
+        let base_runnable = is_system
             || !idle_skip
             || !primed
             || prior_runnable
@@ -3497,12 +3562,35 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
             || any_due
             || must_tick
             || backstop_due;
+        // Readable-channel term (RFC idle_skip_wake §4): an otherwise-idle
+        // graph with readable bytes on a cross-graph inbound edge is
+        // runnable NOW — not at its
+        // backstop. Evaluated last so the edge scan runs only for graphs
+        // every cheaper term already declared idle. The consumers found
+        // join the woken set below, stepping with `event_wake = true` so a
+        // period-gated consumer cannot leave the data sitting (which would
+        // re-fire this term every pass). In the normal case this fires once
+        // per arrival episode: the consuming step reports work to the
+        // pacer, so `prior_runnable` short-circuits the scan afterwards.
+        let mut inbound_mask = ModuleMask::new();
+        let inbound_ready =
+            !base_runnable && graph_inbound_readable(sched, &mask, &mut inbound_mask);
+        if inbound_ready {
+            // Once per arrival episode in the consuming case (see above);
+            // a repeat indicates a consumer sitting on readable data —
+            // visibility wanted, but debug-level so a wedged consumer
+            // can't flood the log ring at pass rate.
+            log::debug!("MON_GRAPH_INBOUND slot={slot} gen={generation} domain={domain}");
+        }
+        let runnable = base_runnable || inbound_ready;
 
-        // Fire ONLY the individually-due periodic modules (plus genuine wakes);
-        // `step_graph_owner` suppresses every other periodic module so the per-pass
-        // tick counter can't fire one early.
+        // Fire ONLY the individually-due periodic modules (plus genuine wakes
+        // and inbound-data consumers); `step_graph_owner` suppresses every
+        // other periodic module so the per-pass tick counter can't fire one
+        // early.
         let mut eff_woken = woken;
         eff_woken.or_assign(&due_mask);
+        eff_woken.or_assign(&inbound_mask);
 
         let mut eff_backstop = snap_backstop;
         let (work, burst) = if runnable {
@@ -3695,6 +3783,34 @@ pub fn step_resident_graphs_domain(
         }
     }
     let result = step_domain_modules(modules, domain);
+    // Event-wake drain for the single-graph domain path. Every consumer
+    // of latched wake bits must sit on some drain: the rp/linux platform
+    // loops drain `EVENT_WAKE_PENDING` around their sleeps, the >1-graph
+    // runner consumes wakes via `take_wake_in_mask`, and this path (the
+    // bcm2712 per-domain loop with one resident graph) drains here —
+    // otherwise a latched software wake (`event_signal`, wake-on-write)
+    // never reaches a period-gated module and the module waits out its
+    // full period with the bit stranded. Domain-scoped take so one
+    // domain's drain can't consume a sibling domain's wakes;
+    // `step_woken_modules` applies the woken-path budget bound
+    // (RFC idle_skip_wake §5). The WFI-latency caveat is unchanged: a
+    // software wake is serviced on the next timer pass (§5.4 clamp), not
+    // mid-sleep — this drain is what performs that service.
+    {
+        // SAFETY: scheduler-thread context — sole stepper for this domain.
+        let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
+        let count = sched.active_module_count;
+        let mut dmask = ModuleMask::new();
+        for i in 0..count {
+            if !sched.finished[i] && (sched.domain_id[i] as usize) == domain {
+                dmask.set(i);
+            }
+        }
+        let woken = crate::kernel::event::take_wake_in_mask(&dmask);
+        if !woken.is_empty() {
+            step_woken_modules(modules, count, &woken);
+        }
+    }
     (result, pacer_next_deadline_us(domain))
 }
 
@@ -4539,6 +4655,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
             e.edge_class = edge.edge_class;
             e.buffer_bytes = edge.buffer_bytes;
             e.rate_class = edge.rate_class;
+            e.wake_on_write = edge.wake_on_write;
             edges[i] = e;
         } else {
             log::error!("[graph] edge {i} missing");
@@ -4593,6 +4710,50 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // ISR→cooperative direction). See
     // `.context/rfc_isr_tier_surface.md` §D6.
     wire_isr_bridges(&mut edges[..runtime_edge_count]);
+
+    // Wake-on-write wiring (RFC idle_skip_wake §4): bind `wake: true`
+    // edges' channels to their consumer module so a successful write
+    // latches the consumer's event-wake bit and rings the scheduler
+    // doorbell. Same-domain direct edges only here: bridged (ISR-tier)
+    // endpoints have no PIPE writes to hook, and any edge the platform
+    // will split across the SPSC pump (different domains, or
+    // `EdgeClass::CrossCore`) must wake at consumer-side pump DELIVERY
+    // — a write-time wake on the producer-side channel is
+    // guaranteed-spurious because the consumer's domain steps before it
+    // pumps inbound, and the bytes aren't readable through the
+    // consumer's handle until the pump moves them. The cross-domain
+    // binding happens where the knowledge lives: the platform's
+    // cross-edge bridging binds the consumer-local channel (see bcm2712
+    // `bridge_cross_domain_edges`), so the pump's delivery write into
+    // it triggers the same wake hook at the first moment the consumer
+    // could actually read the bytes.
+    for e in edges[..runtime_edge_count].iter() {
+        if !e.wake_on_write || e.channel < 0 || e.bridge_slot >= 0 || e.consumer_channel >= 0 {
+            continue;
+        }
+        if e.edge_class == crate::kernel::config::EdgeClass::CrossCore {
+            // Bridged regardless of domain assignment — the consumer
+            // reads the pump-delivered consumer-local channel, so the
+            // wake binds there (platform bridging), not on the
+            // producer-side channel.
+            continue;
+        }
+        // SAFETY: scheduler-thread context during graph prep.
+        let same_domain = unsafe {
+            let p = core::ptr::addr_of!(SCHED);
+            (*p).domain_id[e.from_module] == (*p).domain_id[e.to_module]
+        };
+        if !same_domain {
+            continue; // bound at platform bridging, delivery side
+        }
+        crate::kernel::channel::channel_set_wake_module(e.channel, e.to_module as i32);
+        log::info!(
+            "[wake] edge {}→{} chan={} wake-on-write bound",
+            e.from_module,
+            e.to_module,
+            e.channel
+        );
+    }
 
     // Validate buffer-group constraints uniformly across every
     // platform. Runs after `collect_module_hints` (which populates
@@ -6727,6 +6888,8 @@ static mut MON_OVERRUN_LAST: u32 = 0;
 static mut MON_OVERRUN_SUP: u32 = 0;
 static mut MON_BURST_LAST: u32 = 0;
 static mut MON_BURST_SUP: u32 = 0;
+static mut MON_WAKE_DEFER_LAST: u32 = 0;
+static mut MON_WAKE_DEFER_SUP: u32 = 0;
 static mut MON_HOTSTART_LAST: u32 = 0;
 static mut MON_HOTSTART_SUP: u32 = 0;
 
@@ -8960,6 +9123,7 @@ pub fn step_woken_modules(
 
     let exec_count = sched.exec_order_count;
     let n = if exec_count > 0 { exec_count } else { count };
+    let mut deferred: u32 = 0;
     for order_pos in 0..n {
         let module_idx = if exec_count > 0 {
             sched.exec_order[order_pos] as usize
@@ -8972,6 +9136,25 @@ pub fn step_woken_modules(
         if !wake_bits.test(module_idx) {
             continue;
         }
+        // Budget bound on the woken path (RFC idle_skip_wake §5): woken
+        // steps are charged to the domain accumulators like pass steps,
+        // and the limit must bind here too — wake-on-write makes wakes
+        // data-driven, so without this bound one hot flagged edge steps
+        // its consumer unboundedly between ticks, bypassing the fairness
+        // rotation. Enforce the same soft limit the pass loop uses: an
+        // over-budget domain defers the remaining woken steps to the next
+        // pass by re-latching their bits (level-triggered — nothing is
+        // lost, the backstop semantics). An out-of-range domain id is
+        // fail-open (never deferred), matching the accounting path in
+        // `step_one_module`, which skips charging such modules — clamping
+        // it to a real domain would defer them against a budget they
+        // never consume from.
+        let domain = sched.domain_id[module_idx] as usize;
+        if domain_budget_exhausted(sched, domain) {
+            crate::kernel::event::relatch_module_wake(module_idx);
+            deferred += 1;
+            continue;
+        }
         step_one_module(
             modules,
             sched,
@@ -8980,6 +9163,23 @@ pub fn step_woken_modules(
             &mut active_count,
             true,
         );
+    }
+    if deferred > 0 {
+        // Same throttle as the other per-step budget monitors: on a
+        // coarse-timer host (wasm `now_micros` floor ~1-2 ms) every step
+        // trips the domain budget, so an unthrottled line here would emit
+        // once per wake drain, every tick, for as long as a wake is
+        // latched. The deferral itself is unthrottled — only the log line
+        // coalesces, carrying the suppressed-window count.
+        // SAFETY: scheduler-thread only; throttle via raw static ptrs.
+        if let Some(sup) = unsafe {
+            mon_throttle(
+                core::ptr::addr_of_mut!(MON_WAKE_DEFER_LAST),
+                core::ptr::addr_of_mut!(MON_WAKE_DEFER_SUP),
+            )
+        } {
+            log::info!("MON_WAKE_BUDGET_DEFER count={deferred} suppressed={sup}");
+        }
     }
 }
 

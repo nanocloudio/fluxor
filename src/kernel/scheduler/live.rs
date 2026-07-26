@@ -80,6 +80,15 @@ pub struct AddEdge {
     pub to_port_index: u8,
     /// Per-edge ring-buffer byte hint (0 = derive from module hints).
     pub buffer_bytes: u32,
+    /// Wake-on-write (RFC idle_skip_wake §4): a successful write on this
+    /// edge latches the consumer's event-wake bit and rings the scheduler
+    /// doorbell — same semantics as `wake: true` on a base-graph wiring
+    /// entry, bound with the same rules as `prepare_graph`'s wiring pass
+    /// (same-domain direct edges only). NOT expressible through the FLXA
+    /// wire codec: the v1 per-edge record has no reserved space, so
+    /// `apply_add_encoded` always decodes it as `false`; only direct
+    /// [`apply_add`] callers can set it.
+    pub wake_on_write: bool,
 }
 
 /// A new owner's subgraph. `modules` is `&mut` because the sources are moved
@@ -258,6 +267,7 @@ pub fn apply_add(
         let mut edge =
             Edge::new_indexed(from, "out", ae.from_port_index, to, "in", ae.to_port_index);
         edge.buffer_bytes = ae.buffer_bytes;
+        edge.wake_on_write = ae.wake_on_write;
         sched().edges[edge_base + i] = edge;
     }
 
@@ -343,6 +353,42 @@ pub fn apply_add(
             s.exec_order_count = pos + 1;
         }
         s.active_module_count += n;
+    }
+
+    // Wake-on-write wiring for the live-added edges — the same pass, with
+    // the same skip set, that `prepare_graph` runs for base-graph edges
+    // (RFC idle_skip_wake §4): bind `wake: true` edges' channels to their
+    // consumer so a successful write latches the consumer's event-wake bit
+    // and rings the scheduler doorbell. Same-domain direct edges only;
+    // anything the platform would split across the SPSC pump (different
+    // domains, or `EdgeClass::CrossCore`) must bind at consumer-side pump
+    // delivery instead — a producer-side binding is the guaranteed-spurious
+    // write-time wake — and the live path does no cross-domain bridging
+    // (Linux-first, see the module header), so such edges stay unbound and
+    // degrade to readable-channel-scan/backstop service. Runs after
+    // instantiation (the last fallible step, and the point where the new
+    // modules' `domain_id` is stamped), so a rollback never leaves a
+    // binding behind.
+    {
+        let s = sched();
+        for edge in s.edges[edge_base..edge_base + e].iter() {
+            if !edge.wake_on_write
+                || edge.channel < 0
+                || edge.bridge_slot >= 0
+                || edge.consumer_channel >= 0
+                || edge.edge_class == crate::kernel::config::EdgeClass::CrossCore
+                || s.domain_id[edge.from_module] != s.domain_id[edge.to_module]
+            {
+                continue;
+            }
+            crate::kernel::channel::channel_set_wake_module(edge.channel, edge.to_module as i32);
+            log::info!(
+                "[wake] live edge {}→{} chan={} wake-on-write bound",
+                edge.from_module,
+                edge.to_module,
+                edge.channel
+            );
+        }
     }
 
     // 8. Activate.
@@ -543,7 +589,9 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
 
     // 3. Close the owner's edges and compact the edges array. Nothing
     //    references edges by array index, and channel handles are unchanged by
-    //    the shift, so surviving owners are untouched.
+    //    the shift, so surviving owners are untouched. `channel_close` resets
+    //    the slot, which also clears any wake-on-write `wake_module` binding —
+    //    a reused channel slot can never latch wakes for a freed module index.
     {
         let s = sched();
         let mut w = 0usize;
@@ -733,6 +781,10 @@ pub unsafe fn apply_add_encoded(arg: *mut u8, arg_len: usize) -> i32 {
         to: Endpoint::New(0),
         to_port_index: 0,
         buffer_bytes: 0,
+        // The v1 per-edge wire record (kind/idx/port ×2 + buffer_bytes) has
+        // no reserved space to carry the wake flag; encoded edges are never
+        // wake-flagged. See the field doc on `AddEdge::wake_on_write`.
+        wake_on_write: false,
     }; MAX_ADD_EDGES];
     for edge in edges.iter_mut().take(ec) {
         let from_kind = c.u8();

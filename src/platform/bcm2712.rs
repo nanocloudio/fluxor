@@ -669,6 +669,28 @@ fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
         }
 
         sched.edges[e].consumer_channel = in_ch;
+        // Delivery-side wake (RFC idle_skip_wake §4): for a `wake: true`
+        // cross-domain edge, bind the CONSUMER-local channel — the
+        // consumer-side pump delivers into it via `channel_write`, so the
+        // existing wake hook fires at the first moment the consumer could
+        // actually read the bytes. The producer-side channel is left
+        // unbound (a write-time wake is guaranteed-spurious: the
+        // consumer's domain steps before it pumps inbound). Wake service
+        // latency is bounded by the consumer domain's tick — cutting WFI
+        // mid-sleep needs the targeted SGI doorbell, gated on the
+        // rfc_adaptive_tick §5.4 WFI-wake mitigation.
+        if edge_snapshot.wake_on_write {
+            fluxor::kernel::channel::channel_set_wake_module(
+                in_ch,
+                edge_snapshot.to_module as i32,
+            );
+            log::info!(
+                "[wake] cross-domain edge {}→{} consumer chan={} delivery-wake bound",
+                edge_snapshot.from_module,
+                edge_snapshot.to_module,
+                in_ch
+            );
+        }
         bridged += 1;
         e += 1;
     }

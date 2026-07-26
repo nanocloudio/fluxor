@@ -192,6 +192,15 @@ struct ChannelSlot {
     /// as `i16` so all `MAX_BUFFER_SLOTS = 256` registry slots fit
     /// without silent wrap to negative.
     buffer_slot: AtomicI16,
+    /// Consumer module to event-wake on a successful write (RFC
+    /// idle_skip_wake wake-on-write, `wake: true` edges). -1 = none
+    /// (default). Bound via `channel_set_wake_module` — by graph prep
+    /// for same-domain direct edges, by the platform's cross-domain
+    /// bridging for the consumer-local delivery channel. The wake
+    /// latches the module's event bit + rings the scheduler doorbell,
+    /// so an idle sleep is cut short by data instead of waiting for
+    /// the backstop. i16: MAX_MODULES fits comfortably.
+    wake_module: AtomicI16,
     /// FIFO state for circular buffer operations
     fifo: UnsafeCell<FifoState>,
     /// Optional module-registered ioctl handler. When non-null, any
@@ -231,6 +240,7 @@ impl ChannelSlot {
             mailbox: AtomicBool::new(false),
             aux_u32: AtomicU32::new(NO_AUX_PENDING),
             buffer_slot: AtomicI16::new(-1),
+            wake_module: AtomicI16::new(-1),
             fifo: UnsafeCell::new(FifoState::new()),
             ioctl_handler: AtomicPtr::new(core::ptr::null_mut()),
             ioctl_state: AtomicPtr::new(core::ptr::null_mut()),
@@ -287,6 +297,7 @@ impl ChannelSlot {
         self.hup_flag.store(false, Ordering::Release);
         self.mailbox.store(false, Ordering::Release);
         self.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
+        self.wake_module.store(-1, Ordering::Release);
         self.ioctl_handler
             .store(core::ptr::null_mut(), Ordering::Release);
         self.ioctl_owner.store(u8::MAX, Ordering::Release);
@@ -719,6 +730,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
         }
         core::ptr::copy_nonoverlapping(data, mbox_ptr, len);
         buffer_pool::mailbox_release_write(buf_slot, len as u32);
+        wake_consumer_if_flagged(slot);
         trace!("chan_write h={handle} mailbox len={len}");
         return len as i32;
     }
@@ -733,7 +745,42 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     if written == 0 {
         CHAN_EAGAIN
     } else {
+        wake_consumer_if_flagged(slot);
         written
+    }
+}
+
+/// Bind a consumer module to be event-woken by successful writes on this
+/// channel (RFC idle_skip_wake §4 wake-on-write). `module_idx < 0` clears
+/// the binding.
+pub fn channel_set_wake_module(handle: i32, module_idx: i32) {
+    if handle < 0 || handle as usize >= MAX_CHANNELS {
+        return;
+    }
+    let clamped = if module_idx < 0 || module_idx as usize >= crate::kernel::config::MAX_MODULES {
+        -1
+    } else {
+        module_idx as i16
+    };
+    CHANNELS[handle as usize]
+        .wake_module
+        .store(clamped, Ordering::Release);
+}
+
+/// Wake-on-write (RFC idle_skip_wake §4): after a successful write on a
+/// `wake: true` edge, latch the consumer's event-wake bit and ring the
+/// scheduler doorbell.
+/// The consumer then steps with `event_wake = true` on the next drain
+/// (period gate bypassed), and the woken-path domain budget bounds the
+/// rate (`step_woken_modules` defers over-budget wakes). No-op for the
+/// unflagged default, so unconfigured graphs pay one relaxed atomic
+/// load per write.
+#[inline]
+fn wake_consumer_if_flagged(slot: &ChannelSlot) {
+    let m = slot.wake_module.load(Ordering::Relaxed);
+    if m >= 0 {
+        crate::kernel::event::relatch_module_wake(m as usize);
+        crate::kernel::hal::wake_scheduler();
     }
 }
 
@@ -1222,7 +1269,13 @@ pub unsafe extern "C" fn syscall_buffer_release_write(chan: i32, len: u32) -> i3
         return CHAN_EINVAL;
     }
 
-    buffer_pool::mailbox_release_write(buf_slot as i32, len)
+    let rc = buffer_pool::mailbox_release_write(buf_slot as i32, len);
+    if rc == 0 {
+        // Zero-copy publish is the mailbox equivalent of a successful
+        // channel_write — same wake-on-write hook.
+        wake_consumer_if_flagged(channel);
+    }
+    rc
 }
 
 /// Acquire read access to the channel's buffer (mailbox mode: READY → CONSUMER).
