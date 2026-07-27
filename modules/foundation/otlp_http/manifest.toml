@@ -5,6 +5,18 @@ permissions = ["platform_raw"]
 # dev_micros; none are derived from scheduler step counts.
 timer_class = "wall_clock"
 
+# Single source of truth for the observability id-table bound. The module
+# compiles this as `IDTABLE_MAX` (a fixed array in its arena-allocated state)
+# and the config compiler reads it from here to bound the table it injects;
+# the drift guard in `tools/src/config/tests.rs` fails the build if the two
+# disagree. Per silicon because the table scales with graph size: a
+# broker-scale CM5 graph (15 instrumented modules) needs ~2.7 KiB of names,
+# while an rp2350 graph is a handful of modules and pays no arena for the
+# headroom. Overflow is silent at the collector — the sample still exports,
+# it just resolves to no name — so the compiler warns at the cap.
+[capacities]
+idtable = { default = 2048, bcm2712 = 4096 }
+
 # Module-scope telemetry arrives here as fixed-layout `TelemetryRecord`s
 # (modules/sdk/contracts/telemetry.rs) — the same edge `observe` and
 # `otel_udp_sample` consume.

@@ -965,14 +965,129 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
     pos
 }
 
-/// Load schema for a module type from the .fmod files directory.
-pub fn load_schema_for_module(module_type: &str, modules_dir: &Path) -> Option<ParamSchema> {
+/// Load the param schema for a module type from its `.fmod`.
+///
+/// The schema is generated at build time from the module's `define_params!`
+/// and lives ONLY in the `.fmod` (not the manifest), so config generation must
+/// read the actual artifact to encode a module's params. When the `.fmod` is
+/// absent from `modules_dir` the module may be a store-pinned provider composed
+/// in from a sibling project: resolve it from the OCI store exactly as the
+/// module TABLE builder (`parse_modules_from_config_multi`) does, else the
+/// provider's params (e.g. a connector `endpoint`) silently drop and the module
+/// runs unconfigured. `modules_dir` is already resolved to the build's silicon
+/// — the same answer `TargetDescriptor::module_silicon()` gives, which is also
+/// the silicon tag on the `fluxor.lock` pins consulted below.
+///
+/// Three outcomes, deliberately distinguishable:
+///   - `Ok(Some(schema))` — a schema was read.
+///   - `Ok(None)` — this module legitimately has no `.fmod`-borne schema: a
+///     built-in (schema lives in its `manifest.toml`), a module declaring no
+///     params, or an unpinned module whose `.fmod` simply isn't built (the
+///     module-table builder reports that one separately).
+///   - `Err` — the module IS pinned in `fluxor.lock` but its pinned artifact
+///     could not be resolved. Failing closed here mirrors
+///     `config::assert_pinned_manifests_resolvable` on the manifest half of the
+///     same pin: a pinned module that hard-fails port validation must not
+///     silently build with its params dropped.
+pub fn load_schema_for_module(
+    module_type: &str,
+    modules_dir: &Path,
+) -> crate::Result<Option<ParamSchema>> {
     let fmod_path = modules_dir.join(format!("{module_type}.fmod"));
-    if !fmod_path.exists() {
-        return None;
+    let info = if fmod_path.exists() {
+        match ModuleInfo::from_file(&fmod_path) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        let Some(pinned) = resolve_pinned_fmod(module_type, modules_dir)? else {
+            return Ok(None);
+        };
+        ModuleInfo::from_file(&pinned.path)
+            .map_err(|e| pinned_schema_error(module_type, &format!("{}: {e}", pinned.pin_label)))?
+    };
+    Ok(ParamSchema::from_module_info(&info))
+}
+
+/// A pin that resolved to real bytes, carrying the label the error path
+/// quotes when those bytes turn out to be unreadable.
+struct PinnedFmod {
+    path: std::path::PathBuf,
+    pin_label: String,
+}
+
+/// `pin <reference> (<digest>)` for the `[[oci_module]]` entry covering
+/// `module_type` on `silicon` — the same label the manifest-side resolver
+/// quotes, so a broken artifact reports one identity from both halves.
+/// Degrades to the silicon alone when the lockfile can't be re-read.
+fn pin_label(project_root: &Path, module_type: &str, silicon: &str) -> String {
+    let pin = crate::lockfile::read(project_root)
+        .ok()
+        .flatten()
+        .and_then(|l| {
+            l.oci_modules.into_iter().find(|m| {
+                m.name == module_type
+                    && crate::modules_build::target_to_silicon(&m.target) == silicon
+            })
+        });
+    match pin {
+        Some(p) => format!("pin {} ({})", p.reference, p.digest),
+        None => format!("pin target '{silicon}'"),
     }
-    let info = ModuleInfo::from_file(&fmod_path).ok()?;
-    ParamSchema::from_module_info(&info)
+}
+
+/// Sibling wording of `assert_pinned_manifests_resolvable`'s error so the two
+/// halves of a broken pin — manifest and params — read as one failure class.
+fn pinned_schema_error(module_type: &str, why: &str) -> crate::Error {
+    crate::Error::Config(format!(
+        "module '{module_type}' is pinned in fluxor.lock but its param schema could not be \
+         resolved from the OCI store: {why}"
+    ))
+}
+
+/// Resolve a module's `.fmod` path from the project's `[[oci_module]]` pins when
+/// it is absent on disk. The pin silicon is `modules_dir`'s own parent, which
+/// holds in both artifact layouts (`target/fluxor/<silicon>/modules` and the
+/// `--out target` form `target/<silicon>/modules`). The project root comes from
+/// the marker walk rather than a fixed ancestor depth: those two layouts differ
+/// by one level, so a fixed depth reads a foreign `fluxor.lock` under one of
+/// them and the pin silently fails to resolve.
+///
+/// `Ok(None)` means no pin covers this name; `Err` means one does and it is
+/// unresolvable (missing/corrupt blob, integrity failure, unreadable store or
+/// lockfile), which is a hard error rather than a silent drop to "no params".
+fn resolve_pinned_fmod(module_type: &str, modules_dir: &Path) -> crate::Result<Option<PinnedFmod>> {
+    let silicon = match modules_dir.parent().and_then(|p| p.file_name()) {
+        Some(s) => s.to_string_lossy().into_owned(),
+        None => return Ok(None),
+    };
+    // Anchor a relative dir to the cwd so the walk has a real path to climb.
+    let anchored = if modules_dir.is_absolute() {
+        modules_dir.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(modules_dir),
+            Err(_) => return Ok(None),
+        }
+    };
+    let project_root = crate::project::discover_from(&anchored)
+        .map(|r| r.path)
+        .unwrap_or_else(crate::project::root);
+    let Some(resolver) = crate::store_cli::lock_store_resolver(&project_root, &silicon, None)
+    else {
+        return Ok(None);
+    };
+    match resolver(module_type) {
+        crate::modules::StorePin::Resolved(path) => Ok(Some(PinnedFmod {
+            path,
+            pin_label: pin_label(&project_root, module_type, &silicon),
+        })),
+        crate::modules::StorePin::NotPinned => Ok(None),
+        crate::modules::StorePin::Failed(why) => Err(pinned_schema_error(
+            module_type,
+            &format!("{}: {why}", pin_label(&project_root, module_type, &silicon)),
+        )),
+    }
 }
 
 /// Expand a `routes:` YAML array into flat `route_N_*` keys in the kv map.
@@ -1173,5 +1288,80 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
                 Value::String(ct_val.to_string()),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a throwaway project root holding a `fluxor.lock` that pins
+    /// `pinned_conn` to a digest no store contains, plus an empty store the
+    /// resolver is pointed at. Returns (project, store, modules_dir).
+    fn pinned_but_missing_fixture() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        let project = tempfile::tempdir().expect("tempdir-project");
+        let store = tempfile::tempdir().expect("tempdir-store");
+        std::fs::write(project.path().join(".fluxor"), b"").expect("project marker");
+        std::fs::write(
+            project.path().join("fluxor.lock"),
+            "lockfile_version = 1\n\
+             generated_by = \"schema tests\"\n\
+             \n\
+             [[oci_module]]\n\
+             name = \"pinned_conn\"\n\
+             target = \"bcm2712\"\n\
+             digest = \"sha256:\
+             0000000000000000000000000000000000000000000000000000000000000000\"\n\
+             reference = \"local/pinned_conn:1\"\n",
+        )
+        .expect("write lockfile");
+        let modules_dir = project
+            .path()
+            .join("target")
+            .join("fluxor")
+            .join("bcm2712")
+            .join("modules");
+        std::fs::create_dir_all(&modules_dir).expect("modules dir");
+        (project, store, modules_dir)
+    }
+
+    /// A module pinned in `fluxor.lock` whose artifact the store cannot
+    /// produce must ABORT the build naming module, pin and cause — never
+    /// collapse to "this module has no params" and pack an empty TLV
+    /// section, which ships the module unconfigured (a connector with no
+    /// `endpoint`). Sibling of `config::assert_pinned_manifests_resolvable`,
+    /// which already fails closed on the manifest half of the same pin.
+    #[test]
+    fn pinned_module_with_unresolvable_store_is_a_hard_error() {
+        let (_project, store, modules_dir) = pinned_but_missing_fixture();
+        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
+
+        let err = load_schema_for_module("pinned_conn", &modules_dir)
+            .expect_err("pinned module with no store artifact must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("pinned_conn"), "names the module: {msg}");
+        assert!(msg.contains("fluxor.lock"), "names the lockfile: {msg}");
+        assert!(
+            msg.contains("pin local/pinned_conn:1") && msg.contains("sha256:0000"),
+            "names the pin reference and digest: {msg}"
+        );
+        assert!(
+            msg.contains("could not be resolved from the OCI store"),
+            "reads as a sibling of the manifest failure: {msg}"
+        );
+    }
+
+    /// The other two outcomes stay `Ok(None)`: a module the pins don't cover
+    /// and whose `.fmod` isn't on disk is "no schema here" — the built-in
+    /// lookup and the module-table builder handle that case, so turning it
+    /// into an error would break every built-in module.
+    #[test]
+    fn unpinned_module_without_fmod_reports_no_schema() {
+        let (_project, store, modules_dir) = pinned_but_missing_fixture();
+        let _env = crate::config::test_env::EnvGuard::set(&[("FLUXOR_STORE", store.path())]);
+
+        let schema =
+            load_schema_for_module("not_pinned_anywhere", &modules_dir).expect("not a hard error");
+        assert!(schema.is_none(), "no pin, no .fmod → no schema");
     }
 }

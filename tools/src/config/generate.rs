@@ -866,7 +866,7 @@ fn build_pod_section(
             // Inline-TLV params — identical packing to base modules, so the kernel
             // reads them via `params_ptr` exactly the same way.
             let params =
-                if let Some(param_schema) = schema::load_schema_for_module(mtype, modules_dir) {
+                if let Some(param_schema) = schema::load_schema_for_module(mtype, modules_dir)? {
                     let mut buf = vec![0u8; MAX_MODULE_PARAMS_SIZE];
                     let plen = schema::build_params_from_schema(
                         m,

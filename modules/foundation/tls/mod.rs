@@ -427,6 +427,12 @@ struct TlsState {
     /// `dev_micros` syscalls per tick (~25 µs at default tick_us);
     /// leave off for perf runs, on only when triaging step costs.
     diag_phase_timing: u8,
+    /// Handshake state transitions a session may take per tick.
+    /// 1 (the default, and the former hard-coded value) paces concurrent
+    /// connection setup at one leg per tick per session; raising it lets
+    /// simultaneous handshakes overlap. See the use site for why the
+    /// original starvation rationale no longer holds.
+    handshake_pump_budget: u16,
 
     // Channel ports (4-port node: cipher side facing IP, clear side facing HTTP)
     cipher_in: i32,  // from IP: ciphertext net_proto frames
@@ -554,6 +560,34 @@ struct TlsState {
     /// idle timeout — DTLS sessions don't have access to
     /// `dev_get_ticks` and the host syscall surface is the same.
     step_count: u32,
+
+    // ── Hot-path telemetry (standards/observability.md §6) ─────────────
+    //
+    // TLS sat between two instrumented modules and reported neither
+    // throughput nor idleness: `ip` and `http` both emit `[<mod>] tlm`,
+    // `tls` emitted only crypto-pool counters. That left the single most
+    // expensive layer in the stack — 76 % of a fresh connection on the
+    // 2026-07-26 rig baseline — as the one place you could not tell a
+    // compute-bound step from a back-pressured or an idle one.
+    //
+    // `tlm` covers the CIPHER side (the `ip` seam) so `[tls] tlm rx/tx`
+    // lines up directly against `[ip] tlm tx/rx` and a byte shortfall
+    // localises to that edge. The CLEAR side (the `http` seam) is carried
+    // on the `[tls] hb` line as `clr_rx` / `clr_tx`, comparable the same
+    // way against `[http] tlm rx/tx`. Both emit on the same 5000-step
+    // cadence as ip and http so the windows are actually alignable.
+    tlm: TlmCounters,
+    tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
+    /// Cleartext bytes read from `clear_in` (HTTP → TLS), delta per
+    /// `[tls] hb` window.
+    clear_in_bytes: u32,
+    /// Cleartext bytes written to `clear_out` (TLS → HTTP), delta per
+    /// `[tls] hb` window.
+    clear_out_bytes: u32,
+    /// `frame_write_dropped` snapshot at the top of `module_step`, so a
+    /// step that lost a write can be counted once as a back-pressure step
+    /// however many frames it dropped.
+    fwd_pre_step: u32,
 }
 
 /// DTLS half-open handshake idle timeout in module steps. At the
@@ -563,6 +597,12 @@ struct TlsState {
 /// Triggers a transition `Handshaking → Errored` so the slot is
 /// reclaimed on the next free-slot scan.
 const DTLS_HANDSHAKE_TIMEOUT_STEPS: u32 = 60_000;
+
+/// Cadence for `[tls] tlm` and `[tls] hb`, in module steps. Matches
+/// `IP_TLM_PERIOD` and `HTTP_TLM_PERIOD` so a window from any of the three
+/// modules on the ip→tls→http path covers the same interval and the byte
+/// counts either side of an edge can be differenced directly.
+const TLS_TLM_PERIOD: u32 = 5000;
 
 // ============================================================================
 // Parameter definitions
@@ -597,6 +637,15 @@ define_params! {
 
     8, diag_phase_timing, u8, 0
         => |s, d, len| { s.diag_phase_timing = p_u8(d, len, 0, 0); };
+
+    // Default 1 preserves the previous hard-coded pacing for every graph
+    // that does not set it. Clamped to >=1: 0 would stall every handshake
+    // forever rather than meaning "unlimited".
+    9, handshake_pump_budget, u16, 1
+        => |s, d, len| {
+            let v = p_u16(d, len, 0, 1);
+            s.handshake_pump_budget = if v == 0 { 1 } else { v };
+        };
 }
 
 // ============================================================================
@@ -657,6 +706,10 @@ pub unsafe extern "C" fn module_new(
     s.dtls_bound = false;
     s.dtls_client_started = false;
     s.step_count = 0;
+    s.tlm = TlmCounters::new();
+    s.clear_in_bytes = 0;
+    s.clear_out_bytes = 0;
+    s.fwd_pre_step = 0;
     let mut i = 0;
     while i < MAX_PEERS {
         s.peer_sessions[i] = PeerSession::empty();
@@ -871,6 +924,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // session.
     service_pending_peer_identity(s);
 
+    // Hot-path telemetry snapshots. Taken after the DTLS early-return so
+    // `tlm` describes the TCP record path only, and before any work so the
+    // end-of-step idle/back-pressure classification sees this step alone.
+    let rx_pre = s.tlm.bytes_in;
+    let tx_pre = s.tlm.bytes_out;
+    let bp_pre = s.tlm.bp_steps;
+    s.fwd_pre_step = s.frame_write_dropped;
+
     let sys = &*s.syscalls;
     let mut did_work = false;
 
@@ -879,8 +940,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // of the ~900 µs synchronous keygen once the initial pool is drained.
     pump_ecdh_refill(s);
 
-    // `[tls] hb` heartbeat — same cadence as `[ip] tlm` / `[http] tlm`.
-    if s.step_count.is_multiple_of(50_000) {
+    // `[tls] hb` heartbeat. 5000 steps to genuinely match `[ip] tlm` /
+    // `[http] tlm` — the comment here claimed parity while the constant was
+    // 50_000, i.e. a 5 s window against their 0.5 s one at `tick_us: 100`.
+    // Non-alignable windows are why a byte shortfall could never be pinned
+    // to a specific edge: you cannot subtract a 0.5 s delta from a 5 s one.
+    if s.step_count.is_multiple_of(TLS_TLM_PERIOD) {
         // Module-scope telemetry: emit cumulative crypto-pool / backpressure
         // counters to the `observe` collector (no-op when unwired). ids follow
         // `[observability].metrics`: 0=ecdh_pool_hit, 1=ecdh_fallback_keygen,
@@ -919,6 +984,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     2,
                     s.frame_write_dropped as u64,
                 );
+                // ids 3/4 = bytes_in / bytes_out. Read here, at the TOP of
+                // the step, while `tlm` still holds the completed window —
+                // `dev_tlm_maybe_emit` zeroes it at the END of this same
+                // cadence step. Reading after that reset is exactly the bug
+                // that made wave's http module export 0 on every scrape.
+                dev_telemetry_metric(tsys, s.telemetry_chan, midx, t, c, 3, s.tlm.bytes_in as u64);
+                dev_telemetry_metric(
+                    tsys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    c,
+                    4,
+                    s.tlm.bytes_out as u64,
+                );
             }
         }
         let buf = s.net_scratch.as_mut_ptr();
@@ -940,7 +1020,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         pos += fmt_u32_dec(s.frame_write_dropped, buf.add(pos));
         emit(b" pool_refill=", &mut pos);
         pos += fmt_u32_dec(s.ecdh_pool_refill, buf.add(pos));
+        // Clear-side (HTTP seam) byte deltas for this window. The cipher
+        // side rides the `[tls] tlm` line at the end of the step; keeping
+        // both on the same 5000-step cadence means a window's four byte
+        // counts describe one interval and the two seams can be differenced
+        // against `[ip] tlm` and `[http] tlm` respectively.
+        emit(b" clr_rx=", &mut pos);
+        pos += fmt_u32_dec(s.clear_in_bytes, buf.add(pos));
+        emit(b" clr_tx=", &mut pos);
+        pos += fmt_u32_dec(s.clear_out_bytes, buf.add(pos));
         dev_log(sys, 3, buf, pos);
+        s.clear_in_bytes = 0;
+        s.clear_out_bytes = 0;
     }
 
     // Per-phase timing for the heavy-step diagnostic; see the field
@@ -978,12 +1069,52 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         if s.sessions[i].state == SessionState::Handshaking {
-            // Yield after one state transition per tick so a heavy
-            // handshake step doesn't starve the IP/rp1_gem RX path
-            // long enough to drop arriving SYNs.
+            // How many handshake state transitions this session may take per
+            // tick. Was a hard-coded 1, to "yield after one state transition
+            // per tick so a heavy handshake step doesn't starve the
+            // IP/rp1_gem RX path long enough to drop arriving SYNs."
+            //
+            // That premise did not survive measurement. The dropped SYNs it
+            // was written to prevent were `conn_guard` running at its default
+            // 16/s because its params never reached it (see that module's
+            // `module_new`), not RX starvation. With that fixed, the CM5
+            // HTTPS rig run shows `drop_syn=0`, `bna=0 ovr=0 cdr=0`,
+            // `dupSYN=0` and a domain at ~11 % of its tick budget — there is
+            // no starvation left to throttle against.
+            //
+            // Made configurable to TEST whether this pacing was what
+            // serialised concurrent connection setup. It is not. Measured on
+            // the CM5 HTTPS rig at 32 concurrent connections, budget 1 vs 4
+            // produced tls step profiles identical inside noise: domain
+            // overruns 3181 vs 3151, heavy steps 126 vs 127, `MON_HIST` b7
+            // 693 vs 698, max step 277 vs 286 µs, burst aborts 126 vs 127.
+            //
+            // The loop below explains why: it breaks as soon as a pass
+            // neither drained input nor progressed the state machine, so a
+            // handshake is paced by ARRIVING DATA — round trips — not by this
+            // budget. There is rarely more than one transition's worth of
+            // input queued for the budget to release.
+            //
+            // Kept as a parameter because it is now plumbed and documented,
+            // and because a future latency-bound peer might genuinely queue
+            // several legs. It is NOT a throughput knob, and raising it on
+            // the evidence to date buys nothing.
+            //
+            // DEFAULT STAYS 1 — this is shared foundation code and every
+            // other project's graph keeps its current behaviour untouched
+            // unless it opts in.
             let mut steps = 0;
-            const PUMP_BUDGET: u32 = 1;
-            while steps < PUMP_BUDGET && s.sessions[i].state == SessionState::Handshaking {
+            // Floor at 1 here as well as in the param decoder. `set_defaults`
+            // covers the no-params case today, but a zero reaching this loop
+            // means `steps < 0` is false on entry and NO session ever advances
+            // a handshake — a total, silent failure to serve. Too severe a
+            // failure mode to leave resting on an initialisation order.
+            let pump_budget: u32 = if s.handshake_pump_budget == 0 {
+                1
+            } else {
+                s.handshake_pump_budget as u32
+            };
+            while steps < pump_budget && s.sessions[i].state == SessionState::Handshaking {
                 let drained = record_drain_inbound_one(s, i);
                 let progressed = pump_session(s, i);
                 record_drain_outbound(s, i);
@@ -1015,6 +1146,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         let (msg_type, payload_len) = tls_read_header(sys, s.cipher_in);
         if msg_type != 0 {
             did_work = true;
+            // Wire-side ingress. Counted at the single header-read
+            // chokepoint every cipher_in branch funnels through, so a new
+            // message type can't silently escape the accounting. Includes
+            // the 3-byte net_proto header so this is directly comparable
+            // with `[ip] tlm tx` across the edge.
+            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(3 + payload_len as u32);
             match msg_type {
                 t if t == NET_MSG_ACCEPTED || t == NET_MSG_CONNECTED => {
                     // Read conn_id from payload
@@ -1389,6 +1526,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         let (msg_type, payload_len) = tls_read_header(sys, s.clear_in);
         if msg_type != 0 {
             did_work = true;
+            // Clear-side ingress (HTTP → TLS), same chokepoint argument as
+            // the cipher_in counter above. Comparable with `[http] tlm tx`.
+            s.clear_in_bytes = s.clear_in_bytes.wrapping_add(3 + payload_len as u32);
             match msg_type {
                 t if t == NET_CMD_SEND => {
                     // Encrypt and forward as CMD_SEND on cipher_out
@@ -1453,6 +1593,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         total as u16,
                                         &mut s.net_scratch,
                                     );
+                                    if sent {
+                                        // Encrypted application records —
+                                        // the response path, and the bulk of
+                                        // cipher_out under keepalive load.
+                                        s.tlm.bytes_out =
+                                            s.tlm.bytes_out.wrapping_add(4 + total as u32);
+                                    }
                                     if !sent {
                                         let msg: &[u8] =
                                             b"[tls] cipher_out full mid-record; session->Error";
@@ -1648,6 +1795,30 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         emit(b" ready=", &mut pos);
         pos += fmt_u32_dec(p4, buf.add(pos));
         dev_log(sys, 3, buf, pos);
+    }
+
+    // ── Hot-path telemetry: classify this step, then emit on cadence ──
+    //
+    // A step that lost a write to a full downstream channel is a
+    // back-pressure step, however many frames it dropped — one classifier
+    // per step keeps `idle + bp + active == dt`, which is the property that
+    // makes the line answer "is TLS starved, blocked, or busy?".
+    if s.frame_write_dropped != s.fwd_pre_step {
+        s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
+    }
+    tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+    {
+        let scratch_ptr = s.tlm_scratch.as_mut_ptr();
+        let scratch_len = s.tlm_scratch.len();
+        dev_tlm_maybe_emit(
+            sys,
+            b"[tls]",
+            &mut s.tlm,
+            s.step_count,
+            TLS_TLM_PERIOD,
+            scratch_ptr,
+            scratch_len,
+        );
     }
 
     if did_work {
@@ -2325,6 +2496,12 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
             total_len as u16,
             &mut s.net_scratch,
         );
+        if sent {
+            // Handshake records. Separating these from the application
+            // records above is what makes the handshake-rate phase legible
+            // in the byte counters rather than only in the probe's timings.
+            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(4 + total_len as u32);
+        }
         if !sent {
             s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
             let msg: &[u8] = b"[tls] handshake out drop; session->Error";
@@ -3555,6 +3732,11 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                     pt_len as u16,
                     &mut s.net_scratch,
                 );
+                if sent {
+                    // Decrypted request bytes handed to HTTP. Comparable
+                    // with `[http] tlm rx` across the clear edge.
+                    s.clear_out_bytes = s.clear_out_bytes.wrapping_add(4 + pt_len as u32);
+                }
                 if !sent {
                     s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
                     let msg: &[u8] = b"[tls] clear_out full mid-record; session->Error";

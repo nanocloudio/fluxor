@@ -667,6 +667,14 @@ pub struct Manifest {
     /// binary manifest a variant fmod embeds is the already-filtered
     /// port table, not the variant declaration.
     pub variants: Vec<VariantDecl>,
+    /// `[capacities]` — module-scope capacity declarations, already
+    /// resolved for the silicon this manifest was loaded for (same
+    /// flat-or-per-silicon form as a port's `buffer_size`). These size a
+    /// buffer the MODULE owns but the build tooling must agree on, so the
+    /// manifest is the single place the bound is written and the tool
+    /// reads it instead of hard-coding a second copy. TOML-only, never
+    /// serialized to the binary manifest.
+    pub capacities: std::collections::BTreeMap<String, u32>,
     /// Module attests that its `module_step` / `module_isr_init` /
     /// `module_isr_entry` exports are safe to invoke from an ISR
     /// context: no heap allocation, no `provider_call`, no
@@ -738,6 +746,7 @@ impl Default for Manifest {
             observability: Observability::default(),
             builtin: false,
             variants: Vec::new(),
+            capacities: std::collections::BTreeMap::new(),
             isr_safe: false,
             pre_tick_drain: false,
             requires: TomlRequires::default(),
@@ -1535,6 +1544,15 @@ impl Manifest {
                 .collect();
         }
 
+        // Module-scope capacities resolve against the same silicon the port
+        // capacities do, so one manifest read yields every bound the build
+        // needs for this target.
+        let mut capacities = std::collections::BTreeMap::new();
+        for (name, value) in toml_val.capacities.unwrap_or_default() {
+            let resolved = value.resolve(silicon, &format!("capacities.{name}"))?;
+            capacities.insert(name, resolved);
+        }
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -1553,6 +1571,7 @@ impl Manifest {
             observability,
             builtin,
             variants,
+            capacities,
             isr_safe: toml_val.isr_safe,
             pre_tick_drain: toml_val.pre_tick_drain,
             requires: toml_val.requires,
@@ -1880,6 +1899,7 @@ impl Manifest {
             observability: Observability::default(), // not serialized in binary format
             builtin: false,
             variants: Vec::new(), // toml-only, not serialized
+            capacities: std::collections::BTreeMap::new(), // toml-only, not serialized
             isr_safe,
             pre_tick_drain,
             // `requires` is a TOML-only field — modules carry their
@@ -2046,6 +2066,11 @@ struct TomlManifest {
     builtin: Option<bool>,
     /// `[[variant]]` feature-set variants (RFC module_variants).
     variant: Option<Vec<TomlVariant>>,
+    /// `[capacities]` table — module-scope capacity declarations, each a
+    /// flat number or a per-silicon table exactly like a port's
+    /// `buffer_size`. Use it for a bound the module compiles in AND the
+    /// build tooling has to respect, so the two can't drift.
+    capacities: Option<std::collections::BTreeMap<String, CapacityValue>>,
     /// Author attests ISR-safety. Required for Tier 1b/2 admission.
     /// See `Manifest::isr_safe` for the contract.
     #[serde(default)]
@@ -2803,5 +2828,38 @@ required = true
         m.abi_surface = Some([0x44; 32]);
         let bytes = m.to_bytes();
         assert!(Manifest::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// Module-scope `[capacities]` resolve per silicon like port capacities do,
+    /// fall back to `default` for an unlisted silicon, and reject an unknown
+    /// silicon key so a typo can't silently hand back `default`.
+    #[test]
+    fn module_capacities_resolve_per_silicon() {
+        const TOML: &str = r#"
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350"]
+
+[capacities]
+idtable = { default = 2048, bcm2712 = 4096 }
+scratch = 512
+"#;
+        let big = Manifest::from_toml_str_for_target(TOML, Some("bcm2712")).expect("bcm2712");
+        assert_eq!(big.capacities["idtable"], 4096);
+        assert_eq!(big.capacities["scratch"], 512);
+
+        let small = Manifest::from_toml_str_for_target(TOML, Some("rp2350")).expect("rp2350");
+        assert_eq!(small.capacities["idtable"], 2048);
+
+        let none = Manifest::from_toml_str_for_target(TOML, None).expect("no silicon");
+        assert_eq!(none.capacities["idtable"], 2048);
+
+        let typo = "version = \"1.0.0\"\n[capacities]\nidtable = { default = 1, bcm2711 = 2 }\n";
+        let err = Manifest::from_toml_str_for_target(typo, Some("bcm2712"))
+            .expect_err("unknown silicon key is rejected")
+            .to_string();
+        assert!(
+            err.contains("capacities.idtable"),
+            "error should name the offending capacity: {err}"
+        );
     }
 }

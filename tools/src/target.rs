@@ -42,6 +42,10 @@ struct TomlTargetMeta {
     id: String,
     family: String,
     description: String,
+    /// Silicon whose PIC modules this target loads, when it differs from
+    /// the target's own id (the linux host runs the aarch64 `bcm2712`
+    /// modules). Absent means "my own silicon".
+    module_silicon: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +148,10 @@ pub struct TargetDescriptor {
     pub description: String,
     /// Board id, if loaded via board file (e.g. "pico2w")
     pub board_id: Option<String>,
+    /// `[target].module_silicon` from the descriptor TOML — set only when
+    /// the target's PIC modules come from another silicon. Read through
+    /// `module_silicon()`, which falls back to this target's own silicon.
+    pub module_silicon_override: Option<String>,
     /// Board description, if loaded via board file
     pub board_description: Option<String>,
     /// Build configuration (None for validation-only targets)
@@ -255,6 +263,23 @@ impl TargetDescriptor {
     /// Modules live under the silicon id (`self.id`) regardless.
     pub fn build_id(&self) -> &str {
         self.board_id.as_deref().unwrap_or(&self.id)
+    }
+
+    /// Silicon whose PIC modules (`.fmod`s) and OCI pins this target uses.
+    ///
+    /// Single source for "where do my modules come from": both the
+    /// `target/fluxor/<silicon>/modules` directory and the silicon tag on
+    /// `fluxor.lock` pins key off this. Most targets answer with their own
+    /// silicon; the linux host answers `bcm2712` because it loads the same
+    /// aarch64 PIC modules. Declare the exception in the target TOML
+    /// (`[target].module_silicon`) so a new host family never has to touch
+    /// this code. Board aliases (`cm5` → `bcm2712`, `rp2350a` → `rp2350`)
+    /// still resolve through `modules_build::target_to_silicon`.
+    pub fn module_silicon(&self) -> &str {
+        match self.module_silicon_override {
+            Some(ref s) => s,
+            None => crate::modules_build::target_to_silicon(&self.id),
+        }
     }
 
     /// Display name: "pico2w (RP2350A)" or just "rp2350a (RP2350A)"
@@ -428,6 +453,7 @@ fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
         description: silicon.target.description,
         board_id: None,
         board_description: None,
+        module_silicon_override: silicon.target.module_silicon,
         build,
         max_pin: silicon.gpio.max_pin.unwrap_or(29),
         reserved_pins: Vec::new(),
@@ -585,3 +611,54 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
 
 // Inline tests for `closest_match` / `levenshtein` live in
 // `tools/src/text_distance.rs` alongside the implementation.
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    fn repo_root() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p
+    }
+
+    /// Pins the "where do my modules come from" answer for every shipped
+    /// target. A new target that gets this wrong loads `.fmod`s from a
+    /// directory nothing writes, and resolves `fluxor.lock` pins tagged
+    /// with a silicon nothing publishes.
+    #[test]
+    fn module_silicon_pins_shipped_targets() {
+        let root = repo_root();
+        for (target, want) in [
+            ("linux", "bcm2712"),
+            ("cm5", "bcm2712"),
+            ("bcm2712", "bcm2712"),
+            ("qemu-virt", "bcm2712"),
+            ("rp2350a", "rp2350"),
+            ("rp2350b", "rp2350"),
+            ("pico2w", "rp2350"),
+            ("rp2040", "rp2040"),
+            ("pico", "rp2040"),
+            ("wasm", "wasm"),
+        ] {
+            let desc = super::load_target(target, &root).expect("target loads");
+            assert_eq!(
+                desc.module_silicon(),
+                want,
+                "target `{target}` must load modules built for `{want}`"
+            );
+        }
+    }
+
+    /// Only the linux host declares an override; every other descriptor
+    /// answers with its own silicon, so the mapping stays data-driven
+    /// rather than a family match in code.
+    #[test]
+    fn module_silicon_override_is_declared_in_toml() {
+        let root = repo_root();
+        let linux = super::load_target("linux", &root).expect("linux target loads");
+        assert_eq!(linux.module_silicon_override.as_deref(), Some("bcm2712"));
+        let bcm = super::load_target("bcm2712", &root).expect("bcm2712 target loads");
+        assert_eq!(bcm.module_silicon_override, None);
+    }
+}

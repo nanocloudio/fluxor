@@ -122,6 +122,13 @@ pub struct GuardState {
     /// Frame staging buffer (length-prefix + frame). Kept in state rather
     /// than on the stack so `module_step` has a tiny frame.
     frame_buf: [u8; 2 + MAX_FRAME],
+
+    /// Heartbeat line buffer. In state for the same reason `frame_buf` is:
+    /// a stack array in `module_step` wedges this module. 128 bytes so the
+    /// full field set fits at worst-case u32 widths — the previous 96-byte
+    /// stack array had ~103 bytes of worst-case content once the effective
+    /// config fields were added, i.e. it could format past its own end.
+    log_buf: [u8; 128],
 }
 
 const STATE_SIZE: usize = core::mem::size_of::<GuardState>();
@@ -280,18 +287,28 @@ pub extern "C" fn module_new(
     s.dropped_full = 0;
 
     unsafe {
-        params_def::set_defaults(s);
-        if !params.is_null() && params_len > 0 {
-            let mut off = 0usize;
-            while off + 2 <= params_len {
-                let tag = *params.add(off);
-                let len = *params.add(off + 1) as usize;
-                off += 2;
-                if off + len > params_len { break; }
-                params_def::dispatch_param(s, tag, params.add(off), len);
-                off += len;
-            }
-        }
+        // Use the generated `parse_tlv`, not a hand-rolled walk. The params
+        // blob is `[0xFE][0x01][payload_len:u16 LE]` followed by the entries
+        // and a `0xFF` end marker; `parse_tlv` starts at offset 4 and honours
+        // that marker, and calls `set_defaults` itself.
+        //
+        // The previous loop here started at offset 0, so it consumed the
+        // 4-byte header as if it were entries and every subsequent tag landed
+        // misaligned. The failure was silent and, worse, PARTIAL: walking
+        // `FE 01 0f 00 | 02 01 c8 | 03 02 64 00 | …` from 0 read (tag=0xFE,
+        // len=1), then (tag=0x00, len=2), and only then arrived at the real
+        // `03 02 64 00` — so `rate_window_ms` applied correctly by coincidence
+        // while `rate_table_size` (tag 1) and `rate_limit_per_ip` (tag 2) were
+        // silently swallowed and stayed at their defaults.
+        //
+        // Measured consequence on the 2026-07-27 wave HTTPS rig run: a config
+        // asking for `rate_limit_per_ip: 200` ran at the default 16, and the
+        // fuse tripped six times, each dropped SYN costing that client a full
+        // 1.01 s on Linux's retransmit ladder. This is also why
+        // `rate_table_size: 0` — documented as the explicit disable — measured
+        // `drop_syn=550` and was recorded as an unresolved bug in wave's
+        // `.context/perf_benchmarks.md`: tag 1 never reached the module either.
+        params_def::parse_tlv(s, params, params_len);
     }
     0
 }
@@ -313,10 +330,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // `module_step` wedges this module — frames stop reaching `ip` and the DUT
     // boots unreachable. The frame buffer lives in `GuardState` to keep this
     // stack frame tiny; the cadence below is the only thing that varies.
-    let cadence: u32 = if s.dropped_syn > 0 { 5_000 } else { 50_000 };
+    // 5_000 unconditionally: that is the cadence `ip`, `tls`, `http` and
+    // `rp1_gem` all emit on, so admission decisions land in the same window
+    // as the byte counts they gate. The previous 50_000 quiet-path value
+    // made a clean run's `[guard] pass=` unalignable with everything else;
+    // the drop path was already at 5_000 and is left as the floor.
+    let cadence: u32 = 5_000;
     if s.step_count.is_multiple_of(cadence) {
-        let mut msg = [0u8; 96];
-        let p = msg.as_mut_ptr();
+        let p = s.log_buf.as_mut_ptr();
         let prefix = b"[guard] pass=";
         core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
         let mut pos = prefix.len();
@@ -329,6 +350,32 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         core::ptr::copy_nonoverlapping(f3.as_ptr(), p.add(pos), f3.len());
         pos += f3.len();
         pos += fmt_u32_dec(s.dropped_full, p.add(pos));
+        // EFFECTIVE fuse config, and the clock the window is measured
+        // against. Not decoration: a `drop_syn` that climbs on a benchmark
+        // configured far below the fuse is only interpretable if you can see
+        // whether the configured value actually reached the module and
+        // whether `dev_millis` is advancing at all — a stalled clock makes
+        // `elapsed >= window` permanently false, so the counter never resets
+        // and the fuse trips at `limit` admissions regardless of rate.
+        // These are three loads and three formats into the SAME buffer and
+        // the SAME dev_log; adding a second buffer or a second log call here
+        // wedges the module (see this file's step-frame note).
+        let f4 = b" lim=";
+        core::ptr::copy_nonoverlapping(f4.as_ptr(), p.add(pos), f4.len());
+        pos += f4.len();
+        pos += fmt_u32_dec(s.rate_limit_per_ip as u32, p.add(pos));
+        let f5 = b" win=";
+        core::ptr::copy_nonoverlapping(f5.as_ptr(), p.add(pos), f5.len());
+        pos += f5.len();
+        pos += fmt_u32_dec(s.rate_window_ms as u32, p.add(pos));
+        let f6 = b" tsz=";
+        core::ptr::copy_nonoverlapping(f6.as_ptr(), p.add(pos), f6.len());
+        pos += f6.len();
+        pos += fmt_u32_dec(s.rate_table_size as u32, p.add(pos));
+        let f7 = b" ms=";
+        core::ptr::copy_nonoverlapping(f7.as_ptr(), p.add(pos), f7.len());
+        pos += f7.len();
+        pos += fmt_u32_dec(dev_millis(sys) as u32, p.add(pos));
         dev_log(sys, 3, p, pos);
     }
 

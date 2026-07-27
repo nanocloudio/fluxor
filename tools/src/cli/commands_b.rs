@@ -1186,7 +1186,9 @@ fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Pat
     // `platform: storage: { media: nvme }` report the full injected
     // module set — matches the behaviour of `combine` / `validate`.
     let target_desc = resolve_target(&config, None)?;
-    let project_root = crate::project::root();
+    // Config-anchored root so a cross-cwd `fluxor run ../x.yaml` reads the
+    // CONFIG's fluxor.lock pins (symmetric with the build/validate paths).
+    let project_root = crate::project::root_for_config(config_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     let primary_dir = if modules_dirs.is_empty() {
@@ -1196,7 +1198,12 @@ fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Pat
     };
     let extra_dirs: Vec<&std::path::Path> =
         modules_dirs.iter().skip(1).map(|p| p.as_path()).collect();
-    let store_fb = store_cli::lock_store_resolver(&project_root, &target_desc.id, None);
+    // Pins are SILICON-tagged, and for the linux host that silicon is not its
+    // own id — it loads the aarch64 modules built for `bcm2712`. Filter to the
+    // silicon the .fmods actually come from, else a store-composed provider
+    // never resolves for a host `fluxor run`.
+    let pin_silicon = target_desc.module_silicon();
+    let store_fb = store_cli::lock_store_resolver(&project_root, pin_silicon, None);
     let modules = parse_modules_from_config_multi(
         &config,
         primary_dir,
@@ -1295,6 +1302,9 @@ fn build_one(
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     let family = target_desc.family.clone();
     let silicon_id = target_desc.id.clone();
+    // Silicon the PIC modules come from — the target's own for firmware
+    // families, `bcm2712` for the aarch64 linux host.
+    let module_silicon = target_desc.module_silicon().to_string();
     let build_id = target_desc.build_id().to_string();
     let board_id = target_desc.board_id.clone();
 
@@ -1405,29 +1415,32 @@ fn build_one(
             let config_bin_path = out_dir.join("config.bin");
             let modules_bin_path = out_dir.join("modules.bin");
 
-            // Linux host reuses the aarch64 PIC modules built for bcm2712.
-            // Anchor to the resolved project root (not the caller's cwd) so
-            // `fluxor run <path>` finds them regardless of where it is invoked
-            // from — a bare `fluxor run examples/hello/linux.yaml` from a
-            // subdirectory must resolve the same modules as from the repo root.
-            // When fluxor is consumed as a submodule, accept a sibling copy
-            // at ../deps/fluxor/target/fluxor/bcm2712/modules.
-            let modules_dir = project_root.join("target/fluxor/bcm2712/modules");
+            // The host loads whichever silicon's PIC modules the descriptor
+            // names (`module_silicon`, bcm2712 for the aarch64 host). Anchor to
+            // the resolved project root (not the caller's cwd) so `fluxor run
+            // <path>` finds them regardless of where it is invoked from — a bare
+            // `fluxor run examples/hello/linux.yaml` from a subdirectory must
+            // resolve the same modules as from the repo root. When fluxor is
+            // consumed as a submodule, accept a sibling copy under
+            // ../deps/fluxor/target/fluxor/<silicon>/modules.
+            let modules_rel = format!("target/fluxor/{module_silicon}/modules");
+            let modules_dir = project_root.join(&modules_rel);
             let mut fmod_dirs: Vec<PathBuf> = Vec::new();
             if modules_dir.exists() {
                 fmod_dirs.push(modules_dir.clone());
             }
             if let Some(config_parent) = yaml_path.parent().and_then(|p| p.parent()) {
-                let ext_modules = config_parent.join("deps/fluxor/target/fluxor/bcm2712/modules");
+                let ext_modules = config_parent.join(format!("deps/fluxor/{modules_rel}"));
                 if ext_modules.exists() {
                     fmod_dirs.push(ext_modules);
                 }
             }
             if fmod_dirs.is_empty() {
                 return Err(Error::Config(format!(
-                    "Modules not found at {}. Run 'fluxor modules build --target bcm2712' from the project \
+                    "Modules not found at {}. Run 'fluxor modules build --target {}' from the project \
                      root (`fluxor inspect` shows where that is) first.",
-                    modules_dir.display()
+                    modules_dir.display(),
+                    module_silicon
                 )));
             }
             // Cross-check the YAML against the linux binary's

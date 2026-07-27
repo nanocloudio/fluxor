@@ -931,11 +931,14 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let _ = poll_rx(s);
             poll_tx(s);
 
-            // Heartbeat cadence = 50_000 ticks. At tick_us=100
-            // (ethernet_hello) that's every 5 s; at tick_us=1000 it
-            // drops to every 50 s. Stat-counter reads are cheap
-            // (one MMIO word each) and touch no scheduler state.
-            if s.step_count % 50_000 == 0 {
+            // Heartbeat cadence = 5_000 ticks. At tick_us=100 that's every
+            // 0.5 s, matching `[ip] tlm` / `[tls] tlm` / `[http] tlm` so the
+            // NIC's drop counters (bna/ovr/cdr) fall in the same window as
+            // the byte counts of the modules above it. At 50_000 the driver
+            // reported once per 5 s against their 0.5 s, so a drop could not
+            // be attributed to the burst that caused it. Stat-counter reads
+            // are cheap (one MMIO word each) and touch no scheduler state.
+            if s.step_count % 5_000 == 0 {
                 heartbeat(s);
             }
             0

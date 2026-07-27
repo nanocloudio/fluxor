@@ -46,8 +46,16 @@ that periodically calls `STEP_HISTOGRAM_QUERY` and prints the line.
 MON_HIST mod=<idx> b0=<n> b1=<n> b2=<n> b3=<n> b4=<n> b5=<n> b6=<n> b7=<n>
 ```
 
-Buckets, in microseconds: `<64`, `<128`, `<256`, `<512`, `<1024`, `<2048`,
-`<4096`, `>=4096`.
+Buckets, in microseconds: `<2`, `<4`, `<8`, `<16`, `<32`, `<64`, `<256`,
+`>=256`.
+
+The ladder is weighted below the tick budget on purpose. Edges that started
+at `<64` put every step of a healthy `tick_us: 100` graph into `b0`, so the
+histogram could not separate a 1 µs module from a 50 µs one and no per-module
+share of the tick was computable. The heavy tail those edges resolved is
+already reported exactly by `MON_HEAVY_STEP` (per-module `elapsed_us`) and in
+aggregate by `MON_BUDGET_OVERRUN`; `b6`/`b7` retain enough of it to spot a
+heavy module without reading the fault stream.
 
 ### `MON_STATE`
 

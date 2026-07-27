@@ -2210,7 +2210,12 @@ fn build_module_entry(
     // it in `modules/builtin/<platform>/<name>/manifest.toml`. Both
     // paths produce a `ParamSchema` and feed the same TLV packer, so
     // the wire format is identical at the kernel boundary.
-    if let Some(param_schema) = schema::load_schema_for_module(type_name, modules_dir) {
+    //
+    // `?` propagates only the pinned-but-unresolvable case, which is a hard
+    // error (sibling of `assert_pinned_manifests_resolvable`). "No `.fmod`
+    // schema" stays `Ok(None)` and falls through to the built-in path — a
+    // built-in is never pinned and has no `.fmod`.
+    if let Some(param_schema) = schema::load_schema_for_module(type_name, modules_dir)? {
         validate_yaml_params(module, &param_schema, type_name)?;
         params_len = schema::build_params_from_schema(
             module,
@@ -2947,26 +2952,67 @@ fn build_otlp_id_table_text(list: &[Value], manifests: &HashMap<String, Manifest
             let _ = write!(out, "{idx}/{local_id}={span};");
         }
     }
-    // The `otlp_http` exporter stores the table in a fixed `IDTABLE_MAX = 2048`
-    // buffer. Bound it here at a `;` entry boundary so the device never receives
-    // a truncated mid-entry name, and warn rather than silently dropping.
-    const OTLP_IDTABLE_MAX: usize = 2048;
-    if out.len() > OTLP_IDTABLE_MAX {
-        let cut = out[..OTLP_IDTABLE_MAX]
-            .rfind(';')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        eprintln!(
-            "warning: observability id-table is {} bytes (> {} cap); names beyond \
-             the {}-byte boundary won't resolve in otlp_http — reduce instruments \
-             or raise IDTABLE_MAX",
-            out.len(),
-            OTLP_IDTABLE_MAX,
-            cut
-        );
-        out.truncate(cut);
+    // The `otlp_http` exporter stores the table in a fixed-size buffer whose
+    // bound its manifest declares (already resolved for the target silicon).
+    // Bound the table at a `;` entry boundary so the device never receives a
+    // truncated mid-entry name, and warn rather than silently dropping.
+    if let Some(cap) = otlp_idtable_bound(list, manifests) {
+        if out.len() > cap {
+            let cut = out[..cap].rfind(';').map(|i| i + 1).unwrap_or(0);
+            eprintln!(
+                "warning: observability id-table is {} bytes (> {} cap); names beyond \
+                 the {}-byte boundary won't resolve in otlp_http — reduce instruments \
+                 or raise `[capacities] idtable` in the otlp_http manifest (and its \
+                 `IDTABLE_MAX`)",
+                out.len(),
+                cap,
+                cut
+            );
+            out.truncate(cut);
+        }
     }
     out
+}
+
+/// Module type whose state holds the id-table, and the `[capacities]` key it
+/// declares the buffer's size under.
+const OTLP_EXPORTER_TYPE: &str = "otlp_http";
+const OTLP_IDTABLE_CAPACITY: &str = "idtable";
+/// Conservative bound for an exporter whose manifest declares no id-table
+/// capacity: the smallest size any silicon compiles. Under-filling loses
+/// names, over-filling would truncate mid-entry on device.
+const OTLP_IDTABLE_FLOOR: usize = 2048;
+
+/// Size limit for the injected id-table: the smallest capacity declared by an
+/// `otlp_http` instance in this graph. `None` when the graph has no exporter —
+/// nothing consumes the table, so nothing bounds it.
+fn otlp_idtable_bound(list: &[Value], manifests: &HashMap<String, Manifest>) -> Option<usize> {
+    let mut bound: Option<usize> = None;
+    for m in list.iter().take(MAX_MODULES) {
+        let Some(name) = m.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let ty = m.get("type").and_then(|v| v.as_str()).unwrap_or(name);
+        if ty != OTLP_EXPORTER_TYPE {
+            continue;
+        }
+        let cap = match manifests
+            .get(name)
+            .and_then(|man| man.capacities.get(OTLP_IDTABLE_CAPACITY))
+        {
+            Some(v) => *v as usize,
+            None => {
+                eprintln!(
+                    "warning: module '{name}' ({OTLP_EXPORTER_TYPE}) declares no \
+                     `[capacities] {OTLP_IDTABLE_CAPACITY}`; bounding the \
+                     observability id-table at {OTLP_IDTABLE_FLOOR} bytes"
+                );
+                OTLP_IDTABLE_FLOOR
+            }
+        };
+        bound = Some(bound.map_or(cap, |b: usize| b.min(cap)));
+    }
+    bound
 }
 
 fn parse_modules_map(

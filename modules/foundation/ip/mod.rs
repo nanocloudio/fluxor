@@ -1245,6 +1245,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // data moved), which is what we want for the bottleneck view: the
     // question is whether the data path is starved.
     tlm_idle_if_unchanged(&mut s.tlm, rx_pre, tx_pre, bp_pre);
+    // Latch the work signal before `dev_tlm_maybe_emit` zeroes the deltas —
+    // read afterwards it compares 0 against a non-zero snapshot and fires
+    // WORK_DONE on every cadence step whether or not the step moved data.
+    let moved_bytes = s.tlm.bytes_in != rx_pre || s.tlm.bytes_out != tx_pre;
     {
         let sys = &*s.syscalls;
         let scratch_ptr = s.tlm_scratch.as_mut_ptr();
@@ -1283,7 +1287,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // §6 work signal (RFC adaptive_tick_extra): if data moved this step but we
     // didn't take the RunnableBacklog yield above, report WorkDone — keeps the
     // pacer hot for an active data path without an immediate same-module re-step.
-    if s.tlm.bytes_in != rx_pre || s.tlm.bytes_out != tx_pre {
+    if moved_bytes {
         dev_report_step_effect(&*s.syscalls, step_effect::WORK_DONE);
     }
 

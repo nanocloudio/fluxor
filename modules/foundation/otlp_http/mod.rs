@@ -69,10 +69,11 @@ const MAX_JSON_PER_RECORD: usize = 256;
 /// Smallest record (a scalar metric) — the densest packing of `ACCUM_MAX`.
 const MIN_RECORD: usize = tlm::METRIC_SCALAR_SIZE; // 24
 /// OTLP/JSON body buffer. Sized so a FULL `ACCUM_MAX` batch always fits in ONE
-/// doc — the previous 4096 silently dropped a doc once ~24 scalar metrics
-/// (~4.5 KB JSON) accumulated. `metrics` and `spans` build here sequentially
-/// (one doc at a time); the all-scalar metrics case is the worst. The
-/// compile-time assertion below keeps this provably true if the sizes change.
+/// doc: a batch that overflows this is dropped whole, so ~24 scalar metrics
+/// (~4.5 KB of JSON) must not be able to exceed it. `metrics` and `spans` build
+/// here sequentially (one doc at a time); the all-scalar metrics case is the
+/// worst. The compile-time assertion below keeps this provably true if the
+/// sizes change.
 const JSON_MAX: usize = 8192;
 const JSON_ENVELOPE_MAX: usize = 256; // begin (~150) + finish (~6), rounded up.
 const _: () = assert!(JSON_MAX >= JSON_ENVELOPE_MAX + (ACCUM_MAX / MIN_RECORD + 1) * MAX_JSON_PER_RECORD);
@@ -90,8 +91,19 @@ const NET_BUF_SIZE: usize = 1600;
 /// unframed body forever).
 const RESP_TIMEOUT_MICROS: u64 = 10_000_000; // 10 s
 /// Id-table text blob (delivered as `str` TLV chunks of ≤255 B each, appended).
-/// Sized for a large instrumented graph; the compiler bounds the injected table
-/// to this and warns rather than silently truncating mid-entry.
+/// The compiler bounds the injected table to this and warns rather than
+/// silently truncating mid-entry.
+///
+/// Sized per silicon, because the table scales with the graph and this array
+/// sits in the module's arena-allocated state: a broker-scale aarch64 graph
+/// needs ~2.7 KiB of instrument names, an rp2350 graph a fraction of that.
+/// The bound is declared in `manifest.toml`'s `[capacities] idtable` table,
+/// which is what the config compiler reads; the drift guard in
+/// `tools/src/config/tests.rs` pins these constants to it.
+#[cfg(target_arch = "aarch64")]
+const IDTABLE_MAX: usize = 4096;
+/// See the `aarch64` arm above; `default` in the manifest capacity table.
+#[cfg(not(target_arch = "aarch64"))]
 const IDTABLE_MAX: usize = 2048;
 /// Scratch for a resolved-or-synthesised metric name.
 const NAME_MAX: usize = 48;
