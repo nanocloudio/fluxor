@@ -41,6 +41,7 @@ pub fn generate_config_ext(
     max_gpio: u8,
     pio_count: u8,
     resolved_target: Option<&str>,
+    project_root: &Path,
 ) -> Result<Vec<u8>> {
     generate_config_impl(
         config,
@@ -51,6 +52,7 @@ pub fn generate_config_ext(
         max_gpio,
         pio_count,
         resolved_target,
+        project_root,
     )
 }
 
@@ -67,6 +69,7 @@ fn generate_config_impl(
     max_gpio: u8,
     pio_count: u8,
     resolved_target: Option<&str>,
+    project_root: &Path,
 ) -> Result<Vec<u8>> {
     let modules = config
         .get("modules")
@@ -204,6 +207,18 @@ fn generate_config_impl(
     };
     let validation_list: &[Value] = &validation_modules;
 
+    // Fail closed on a pinned module whose `manifest.toml` can't be resolved
+    // from the store, ahead of every gate below that reads the manifest map.
+    // The map-building loader can only warn-and-omit, and an omitted manifest
+    // is indistinguishable from "module has no manifest" — so without this
+    // the pin's whole purpose (validating wiring against the surface the
+    // pinned bytes ship) is silently skipped.
+    crate::config::assert_pinned_manifests_resolvable(
+        &Value::Array(validation_modules.clone()),
+        resolved_target,
+        project_root,
+    )?;
+
     // Budget validation: prove step_deadlines, burst budgets, and
     // per-domain tick budgets fit together before the kernel ever
     // boots the graph. Until this lands, a config could declare
@@ -236,6 +251,7 @@ fn generate_config_impl(
         modules_dir,
         extra_module_dirs,
         resolved_target,
+        project_root,
     )?;
 
     // Tier 1c pre-pass drain admission: a module flagged
@@ -247,7 +263,7 @@ fn generate_config_impl(
     // misconfiguration surfaces at build time rather than as silent
     // misbehaviour at runtime. See `.context/rfc_isr_tier_surface.md`
     // §D8 for the contract.
-    validate_pre_tick_drain_admission(config, validation_list, extra_module_dirs)?;
+    validate_pre_tick_drain_admission(config, validation_list, extra_module_dirs, project_root)?;
 
     // Inject graph sample_rate into modules that don't declare their own
     let modules_with_rate;
@@ -284,6 +300,7 @@ fn generate_config_impl(
         &manifest_src,
         extra_module_dirs,
         resolved_target,
+        project_root,
     );
 
     // Adaptive-tick validation (range/D8/D9/D10 + timer-class gate). Run here,

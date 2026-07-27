@@ -198,8 +198,9 @@ fn warn_manifest_parse_error_once(path: &std::path::Path, err: &Error) {
 pub fn load_module_manifests_with_extra(
     modules_config: &Value,
     extra_dirs: &[&std::path::Path],
+    project_root: &std::path::Path,
 ) -> HashMap<String, Manifest> {
-    load_module_manifests_with_extra_for_target(modules_config, extra_dirs, None)
+    load_module_manifests_with_extra_for_target(modules_config, extra_dirs, None, project_root)
 }
 
 /// Target-aware variant used by config generation. Capacity tables in module
@@ -209,18 +210,85 @@ pub fn load_module_manifests_with_extra_for_target(
     modules_config: &Value,
     extra_dirs: &[&std::path::Path],
     target_silicon: Option<&str>,
+    project_root: &std::path::Path,
 ) -> HashMap<String, Manifest> {
     let mut manifests = HashMap::new();
     let list = match modules_config.as_array() {
         Some(l) => l,
         None => return manifests,
     };
+
+    // A pinned `[[oci_module]]` ships its `manifest.toml` in the same
+    // content-addressed store artifact as its `.fmod` (symmetric to
+    // `resolve_fmod`'s store fallback). Consult the pins FIRST and
+    // authoritatively: a store-only sibling module has no source tree
+    // here, and even when a stale copy sits on disk, resolving ports from
+    // anything but the pinned artifact lets wiring validate against a port
+    // surface the pinned bytes don't have. `None` when nothing is pinned —
+    // the common case pays no store I/O.
+    //
+    // `project_root` is config-anchored by the caller (`root_for_config`),
+    // never `project::root()`'s cwd fallback: a cross-project invocation
+    // (`fluxor validate ../other/x.yaml`) must read the CONFIG's
+    // `fluxor.lock` — the same lock the `.fmod` resolver uses — or port
+    // validation and fmod packaging consult different pins. Silicon-scoped
+    // so wiring binds to the exact artifact being packaged.
+    let store_manifests =
+        crate::store_cli::lock_store_manifest_resolver(project_root, target_silicon, None);
+
     for module in list {
         let name = match module["name"].as_str() {
             Some(n) => n,
             None => continue,
         };
         let type_name = module["type"].as_str().unwrap_or(name);
+
+        if let Some(resolver) = &store_manifests {
+            match resolver(type_name) {
+                crate::modules::ManifestPin::Resolved(toml) => {
+                    match Manifest::from_toml_str_for_target(&toml, target_silicon) {
+                        Ok(mut m) => {
+                            if let Some(variant) = module["variant"].as_str() {
+                                if let Err(e) = m.apply_variant(variant) {
+                                    warn_manifest_once(
+                                        std::path::Path::new(&format!("oci://{type_name}")),
+                                        &format!(
+                                            "module '{name}' (pinned oci_module): {e}; its \
+                                             manifest is omitted from wiring validation"
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            }
+                            manifests.insert(name.to_string(), m);
+                        }
+                        Err(e) => warn_manifest_parse_error_once(
+                            std::path::Path::new(&format!("oci://{type_name}")),
+                            &e,
+                        ),
+                    }
+                    // Pinned is authoritative — never fall through to disk.
+                    continue;
+                }
+                // This loader is infallible by construction, so it can only
+                // warn; enforcement lives in
+                // `assert_pinned_manifests_resolvable`, which every strict
+                // path (validate / config-gen / image build) calls before
+                // loading. Reaching this arm therefore means an advisory
+                // caller, where aborting would be wrong.
+                crate::modules::ManifestPin::Failed(why) => {
+                    warn_manifest_once(
+                        std::path::Path::new(&format!("oci://{type_name}")),
+                        &format!(
+                            "module '{name}' is pinned in fluxor.lock but its manifest \
+                             could not be resolved from the store: {why}"
+                        ),
+                    );
+                    continue;
+                }
+                crate::modules::ManifestPin::NotPinned => {}
+            }
+        }
 
         // `resolve_module_root` walks `extra_dirs` first (the
         // YAML-declared `module_search_paths:` order), then the
@@ -282,6 +350,62 @@ pub fn load_module_manifests_with_extra_for_target(
         }
     }
     manifests
+}
+
+/// Enforcement half of the pinned-manifest path: a module pinned in
+/// `fluxor.lock` whose `manifest.toml` cannot be resolved and parsed from
+/// the store (corrupt/missing blob, non-UTF-8 payload, unreadable store,
+/// unreadable lockfile, ambiguous multi-target pin, malformed TOML, unknown
+/// variant) is a HARD error naming the module, the pin and the cause. The
+/// pin exists precisely to enforce that port surface, so a strict caller
+/// must refuse rather than let the module drop out of wiring validation and
+/// pass a graph nothing checked.
+///
+/// Separate from `load_module_manifests_*` on purpose: that loader returns a
+/// map and cannot fail, so it warns and omits — right for advisory callers,
+/// wrong for `fluxor validate` / config generation / image build, which call
+/// this first. `project_root` is config-anchored (see the loader's note); a
+/// project with no pins resolves no resolver and this is a no-op.
+pub fn assert_pinned_manifests_resolvable(
+    modules_config: &Value,
+    target_silicon: Option<&str>,
+    project_root: &std::path::Path,
+) -> Result<()> {
+    let Some(list) = modules_config.as_array() else {
+        return Ok(());
+    };
+    let Some(resolver) =
+        crate::store_cli::lock_store_manifest_resolver(project_root, target_silicon, None)
+    else {
+        return Ok(());
+    };
+    for module in list {
+        let Some(name) = module["name"].as_str() else {
+            continue;
+        };
+        let type_name = module["type"].as_str().unwrap_or(name);
+        let why = match resolver(type_name) {
+            crate::modules::ManifestPin::NotPinned => continue,
+            crate::modules::ManifestPin::Failed(why) => why,
+            crate::modules::ManifestPin::Resolved(toml) => {
+                match Manifest::from_toml_str_for_target(&toml, target_silicon) {
+                    Ok(mut m) => match module["variant"].as_str() {
+                        Some(variant) => match m.apply_variant(variant) {
+                            Ok(()) => continue,
+                            Err(e) => format!("{e}"),
+                        },
+                        None => continue,
+                    },
+                    Err(e) => format!("{e}"),
+                }
+            }
+        };
+        return Err(Error::Config(format!(
+            "module '{name}' is pinned in fluxor.lock but its manifest could not be \
+             resolved from the OCI store: {why}"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a port spec using named ports from the module manifest.

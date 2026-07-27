@@ -1135,7 +1135,16 @@ impl Manifest {
     pub fn from_toml_for_target(path: &Path, silicon: Option<&str>) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Module(format!("cannot read {}: {}", path.display(), e)))?;
-        let toml_val: TomlManifest = toml::from_str(&content)
+        Self::from_toml_str_for_target(&content, silicon)
+    }
+
+    /// Parse a manifest from in-memory TOML bytes (already read), sharing
+    /// every rule with `from_toml_for_target`. Lets callers resolve a
+    /// manifest that never sits on disk — notably the `manifest.toml`
+    /// layer of a pinned `[[oci_module]]` artifact, which is fetched from
+    /// the OCI store rather than a source tree.
+    pub fn from_toml_str_for_target(content: &str, silicon: Option<&str>) -> Result<Self> {
+        let toml_val: TomlManifest = toml::from_str(content)
             .map_err(|e| Error::Module(format!("invalid manifest TOML: {e}")))?;
 
         let (major, minor, patch) = parse_semver(&toml_val.version)?;

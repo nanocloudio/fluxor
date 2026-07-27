@@ -376,6 +376,10 @@ fn cmd_store_rm(reference: &str, store_dir: Option<&Path>) -> Result<()> {
 /// hands to the packaging call sites.
 pub type BoxedStoreFallback = Box<dyn Fn(&str) -> crate::modules::StorePin>;
 
+/// Owned resolver from a module name to its pinned `manifest.toml` bytes —
+/// the manifest-loader counterpart of `BoxedStoreFallback`.
+pub type BoxedManifestResolver = Box<dyn Fn(&str) -> crate::modules::ManifestPin>;
+
 /// Upsert `[[oci_module]]` pins into the project's `fluxor.lock`,
 /// keyed by `(name, target)`. Creates a minimal lockfile when absent.
 /// The read-modify-write runs under an exclusive advisory lock so two
@@ -529,6 +533,115 @@ pub fn lock_store_resolver(
     }))
 }
 
+/// Manifest counterpart of `lock_store_resolver`: resolve a module name to
+/// the verified `manifest.toml` text its pinned `[[oci_module]]` artifact
+/// ships, so wiring/port validation sees the SAME surface the pinned
+/// `.fmod` was built with. Returns `None` when the project pins no
+/// oci_modules (the common case — zero store I/O).
+///
+/// Pin selection is silicon-aware. Manifest *content* is largely
+/// target-independent, but pin *selection* is not: the same name can be
+/// pinned at different digests for two targets, and binding wiring to the
+/// wrong one validates a port surface the packaged `.fmod` doesn't have.
+///   1. a pin whose target resolves (via `target_to_silicon`) to the same
+///      silicon as `silicon` wins — so a `cm5` graph matches a `bcm2712`
+///      pin, which is the same artifact;
+///   2. otherwise fall back to a name match, but only when it is
+///      unambiguous — every pin for that name shares one digest;
+///   3. several differing-digest pins with no silicon match is `Failed`:
+///      which port surface is authoritative is not guessable.
+///
+/// UTF-8 and integrity are strict. `read_blob` hashes the bytes against the
+/// layer digest; non-UTF-8 in a digest-verified artifact is corruption
+/// (`Failed`), never lossily repaired.
+///
+/// An artifact carrying no `manifest.toml` layer yields `NotPinned`, so an
+/// on-disk source manifest fills in. A pinned module with neither a
+/// manifest layer nor an on-disk source therefore drops out of wiring
+/// validation — the standing semantics for a manifest-less module, now
+/// reachable through a pin as well.
+pub fn lock_store_manifest_resolver(
+    project_root: &Path,
+    silicon: Option<&str>,
+    store_dir: Option<&Path>,
+) -> Option<BoxedManifestResolver> {
+    use crate::modules::ManifestPin;
+
+    let lock = match crate::lockfile::read(project_root) {
+        Ok(l) => l?,
+        Err(e) => {
+            let why = format!("fluxor.lock unreadable: {e}");
+            return Some(Box::new(move |_name: &str| {
+                ManifestPin::Failed(why.clone())
+            }));
+        }
+    };
+    let pins: Vec<crate::lockfile::LockedOciModule> = lock.oci_modules;
+    if pins.is_empty() {
+        return None;
+    }
+    let silicon = silicon.map(|s| crate::modules_build::target_to_silicon(s).to_string());
+    let store = match open_store(store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            let why = format!("cannot open OCI store: {e}");
+            return Some(Box::new(move |name: &str| {
+                if pins.iter().any(|p| p.name == name) {
+                    ManifestPin::Failed(why.clone())
+                } else {
+                    ManifestPin::NotPinned
+                }
+            }));
+        }
+    };
+    Some(Box::new(move |name: &str| {
+        let named: Vec<&crate::lockfile::LockedOciModule> =
+            pins.iter().filter(|p| p.name == name).collect();
+        if named.is_empty() {
+            return ManifestPin::NotPinned;
+        }
+        let silicon_match = silicon.as_deref().and_then(|want| {
+            named
+                .iter()
+                .find(|p| crate::modules_build::target_to_silicon(&p.target) == want)
+        });
+        let pin = match silicon_match {
+            Some(p) => *p,
+            None => {
+                let first = named[0];
+                if named.iter().all(|p| p.digest == first.digest) {
+                    first
+                } else {
+                    return ManifestPin::Failed(format!(
+                        "module '{name}' is pinned for several targets at differing digests \
+                         and none matches silicon {silicon:?}; pin it for this target"
+                    ));
+                }
+            }
+        };
+        let pin_id = format!("pin {} ({})", pin.reference, pin.digest);
+        let manifest_bytes = match store.read_blob(&pin.digest) {
+            Ok(b) => b,
+            Err(e) => return ManifestPin::Failed(format!("{pin_id}: {e}")),
+        };
+        let manifest: ImageManifest = match serde_json::from_slice(&manifest_bytes) {
+            Ok(m) => m,
+            Err(e) => return ManifestPin::Failed(format!("{pin_id}: corrupt manifest: {e}")),
+        };
+        match store.module_manifest_toml_blob(&manifest) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => ManifestPin::Resolved(text),
+                Err(e) => ManifestPin::Failed(format!(
+                    "{pin_id}: manifest.toml layer is not valid UTF-8 (corrupt artifact): {e}"
+                )),
+            },
+            // No manifest.toml layer — let an on-disk source manifest resolve it.
+            Ok(None) => ManifestPin::NotPinned,
+            Err(e) => ManifestPin::Failed(format!("{pin_id}: {e}")),
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +739,233 @@ mod tests {
             matches!(resolver("codec"), crate::modules::StorePin::Failed(_)),
             "tampered blob must be a hard failure, not a silent fall-through"
         );
+    }
+
+    fn publish_with_manifest(
+        store: &OciStore,
+        name: &str,
+        target: &str,
+        fmod: &[u8],
+        toml: &str,
+    ) -> String {
+        publish_module(
+            store,
+            &ModulePublish {
+                name,
+                target,
+                fmod_bytes: fmod,
+                manifest_toml: Some(toml),
+                provenance: PROVENANCE_LOCAL,
+                source_rev: None,
+                ref_name: &format!("{target}/{name}:0.1.0"),
+            },
+        )
+        .expect("publish")
+        .digest
+    }
+
+    #[test]
+    fn pin_resolves_manifest_toml_silicon_aware() {
+        use crate::modules::ManifestPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = OciStore::open(tmp.path().join("store")).expect("open store");
+
+        let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
+        let digest = publish_with_manifest(&store, "redis_client", "bcm2712", b"fmodA", toml);
+        upsert_pins(
+            &proj,
+            vec![crate::lockfile::LockedOciModule {
+                name: "redis_client".into(),
+                target: "bcm2712".into(),
+                digest,
+                reference: "bcm2712/redis_client:0.1.0".into(),
+            }],
+        )
+        .expect("upsert");
+
+        let store_dir = tmp.path().join("store");
+
+        // Exact silicon match resolves the pinned manifest as UTF-8 text.
+        let r = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
+            .expect("resolver present");
+        match r("redis_client") {
+            ManifestPin::Resolved(text) => assert_eq!(text, toml),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        assert!(matches!(r("unpinned"), ManifestPin::NotPinned));
+
+        // A `cm5` graph and a `bcm2712` pin are the same silicon.
+        let r_cm5 = lock_store_manifest_resolver(&proj, Some("cm5"), Some(&store_dir))
+            .expect("resolver present");
+        match r_cm5("redis_client") {
+            ManifestPin::Resolved(text) => assert_eq!(text, toml),
+            other => panic!("cm5 must match the bcm2712 pin, got {other:?}"),
+        }
+
+        // No silicon requested: the lone pin is unambiguous.
+        let r_any =
+            lock_store_manifest_resolver(&proj, None, Some(&store_dir)).expect("resolver present");
+        assert!(matches!(r_any("redis_client"), ManifestPin::Resolved(_)));
+    }
+
+    #[test]
+    fn silicon_selects_between_same_name_pins_at_different_targets() {
+        use crate::modules::ManifestPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = OciStore::open(tmp.path().join("store")).expect("open store");
+
+        let bcm = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n\
+                   [[ports]]\nname = \"big\"\ndirection = \"out\"\n";
+        let rp = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n\
+                  [[ports]]\nname = \"small\"\ndirection = \"out\"\n";
+        let d_bcm = publish_with_manifest(&store, "mqtt_client", "bcm2712", b"fmodA", bcm);
+        let d_rp = publish_with_manifest(&store, "mqtt_client", "rp2350", b"fmodB", rp);
+        assert_ne!(d_bcm, d_rp);
+        upsert_pins(
+            &proj,
+            vec![
+                crate::lockfile::LockedOciModule {
+                    name: "mqtt_client".into(),
+                    target: "bcm2712".into(),
+                    digest: d_bcm,
+                    reference: "bcm2712/mqtt_client:0.1.0".into(),
+                },
+                crate::lockfile::LockedOciModule {
+                    name: "mqtt_client".into(),
+                    target: "rp2350".into(),
+                    digest: d_rp,
+                    reference: "rp2350/mqtt_client:0.1.0".into(),
+                },
+            ],
+        )
+        .expect("upsert");
+
+        let store_dir = tmp.path().join("store");
+        for (silicon, want) in [("rp2350", rp), ("bcm2712", bcm), ("cm5", bcm)] {
+            let r = lock_store_manifest_resolver(&proj, Some(silicon), Some(&store_dir))
+                .expect("resolver present");
+            match r("mqtt_client") {
+                ManifestPin::Resolved(text) => assert_eq!(text, want, "silicon {silicon}"),
+                other => panic!("silicon {silicon}: expected Resolved, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_manifest_layer_is_a_hard_failure() {
+        use crate::modules::ManifestPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = OciStore::open(tmp.path().join("store")).expect("open store");
+
+        let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
+        let digest = publish_with_manifest(&store, "redis_client", "bcm2712", b"fmodA", toml);
+        upsert_pins(
+            &proj,
+            vec![crate::lockfile::LockedOciModule {
+                name: "redis_client".into(),
+                target: "bcm2712".into(),
+                digest,
+                reference: "bcm2712/redis_client:0.1.0".into(),
+            }],
+        )
+        .expect("upsert");
+
+        // Tamper with the manifest.toml blob: the digest no longer matches,
+        // and the payload isn't UTF-8 either.
+        let toml_digest = sha256_hex_prefixed(toml.as_bytes());
+        std::fs::write(store.blob_path(&toml_digest).unwrap(), [0xffu8, 0xfe, 0x00]).unwrap();
+
+        let store_dir = tmp.path().join("store");
+        let r = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
+            .expect("resolver present");
+        let why = match r("redis_client") {
+            ManifestPin::Failed(why) => why,
+            other => panic!("corrupt manifest layer must fail hard, got {other:?}"),
+        };
+        assert!(
+            why.contains("bcm2712/redis_client:0.1.0"),
+            "failure must name the pin: {why}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_multi_target_pins_refuse_without_silicon_match() {
+        use crate::modules::ManifestPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = OciStore::open(tmp.path().join("store")).expect("open store");
+
+        // Same name pinned for two silicons at different digests.
+        let d1 = publish_with_manifest(
+            &store,
+            "amqp_client",
+            "bcm2712",
+            b"fmodA",
+            "version=\"1\"\n",
+        );
+        let d2 =
+            publish_with_manifest(&store, "amqp_client", "rp2350", b"fmodB", "version=\"2\"\n");
+        assert_ne!(d1, d2);
+        upsert_pins(
+            &proj,
+            vec![
+                crate::lockfile::LockedOciModule {
+                    name: "amqp_client".into(),
+                    target: "bcm2712".into(),
+                    digest: d1,
+                    reference: "bcm2712/amqp_client:0.1.0".into(),
+                },
+                crate::lockfile::LockedOciModule {
+                    name: "amqp_client".into(),
+                    target: "rp2350".into(),
+                    digest: d2,
+                    reference: "rp2350/amqp_client:0.1.0".into(),
+                },
+            ],
+        )
+        .expect("upsert");
+
+        let store_dir = tmp.path().join("store");
+        let r = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir)).unwrap();
+        // Requested silicon matches one pin -> its manifest.
+        match r("amqp_client") {
+            ManifestPin::Resolved(text) => assert_eq!(text, "version=\"1\"\n"),
+            other => panic!("expected Resolved bcm2712, got {other:?}"),
+        }
+        // A silicon with NO matching pin and divergent digests -> refuse.
+        let r_other = lock_store_manifest_resolver(&proj, Some("stm32"), Some(&store_dir)).unwrap();
+        assert!(matches!(r_other("amqp_client"), ManifestPin::Failed(_)));
+    }
+
+    #[test]
+    fn pin_without_manifest_layer_falls_through_to_disk() {
+        use crate::modules::ManifestPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // Published with manifest_toml: None — no metadata layer.
+        let (_store, digest) = store_with_module(tmp.path());
+        upsert_pins(
+            &proj,
+            vec![crate::lockfile::LockedOciModule {
+                name: "codec".into(),
+                target: "bcm2712".into(),
+                digest,
+                reference: "bcm2712/codec:1.0.0".into(),
+            }],
+        )
+        .unwrap();
+        let store_dir = tmp.path().join("store");
+        let resolver = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
+            .expect("resolver present");
+        // No manifest layer => NotPinned so an on-disk source manifest can fill in.
+        assert!(matches!(resolver("codec"), ManifestPin::NotPinned));
     }
 }

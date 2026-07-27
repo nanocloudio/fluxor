@@ -263,6 +263,24 @@ pub enum StorePin {
 /// `store_cli::lock_store_resolver`.
 pub type StoreFallback<'a> = &'a dyn Fn(&str) -> StorePin;
 
+/// Outcome of consulting the `[[oci_module]]` pins for a module's
+/// `manifest.toml` — the wiring/port-resolution counterpart of
+/// `StorePin`. A pinned module resolves its manifest from the same
+/// content-addressed store artifact as its `.fmod`, so ports and bytes
+/// stay in lockstep.
+#[derive(Debug)]
+pub enum ManifestPin {
+    /// No pin covers this name — resolve the manifest from disk as usual.
+    NotPinned,
+    /// Pinned; the verified, UTF-8-validated `manifest.toml` text from the
+    /// store artifact.
+    Resolved(String),
+    /// Pinned but unresolvable (missing/corrupt blob, non-UTF-8 payload,
+    /// unreadable store). A hard error — the pin exists precisely to
+    /// enforce this port surface, so it must never silently fall through.
+    Failed(String),
+}
+
 /// Trailer for "artifact not found" errors when a variant was
 /// requested. The build emits the DEFAULT variant unsuffixed
 /// (`<type>.fmod`), so naming the default variant explicitly in YAML

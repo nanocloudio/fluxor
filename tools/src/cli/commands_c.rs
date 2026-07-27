@@ -1091,6 +1091,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                     &[],
                     &target_desc,
                     verbose,
+                    &crate::project::root_for_config(config_path),
                 )?;
                 let modules_data = modules_data.ok_or_else(|| {
                     Error::Config("QEMU bare-metal run requires at least one module blob".into())

@@ -1082,6 +1082,7 @@ fn validate_isr_tier_admission(
     modules_dir: &std::path::Path,
     extra_module_dirs: &[&std::path::Path],
     resolved_target: Option<&str>,
+    project_root: &std::path::Path,
 ) -> Result<()> {
     // Per-domain exec_mode for the four supported domains.
     let mut domain_exec_mode: [u8; 4] = [0; 4];
@@ -1137,8 +1138,11 @@ fn validate_isr_tier_admission(
         }
     };
 
-    let manifests =
-        load_module_manifests_with_extra(&Value::Array(module_list.to_vec()), extra_module_dirs);
+    let manifests = load_module_manifests_with_extra(
+        &Value::Array(module_list.to_vec()),
+        extra_module_dirs,
+        project_root,
+    );
 
     // ── Rule 0: Tier-2 IRQ range (structural, target-specific) ──────────
     // Validate the declared `irq:` against the resolved silicon's interrupt
@@ -1484,6 +1488,7 @@ fn validate_pre_tick_drain_admission(
     config: &Value,
     module_list: &[Value],
     extra_module_dirs: &[&std::path::Path],
+    project_root: &std::path::Path,
 ) -> Result<()> {
     // Per-domain exec_mode for the four supported domains.
     let mut domain_exec_mode: [u8; 4] = [0; 4];
@@ -1503,8 +1508,11 @@ fn validate_pre_tick_drain_admission(
         }
     }
 
-    let manifests =
-        load_module_manifests_with_extra(&Value::Array(module_list.to_vec()), extra_module_dirs);
+    let manifests = load_module_manifests_with_extra(
+        &Value::Array(module_list.to_vec()),
+        extra_module_dirs,
+        project_root,
+    );
 
     for module in module_list {
         let name = match module.get("name").and_then(|n| n.as_str()) {

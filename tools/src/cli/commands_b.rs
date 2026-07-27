@@ -39,7 +39,11 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
             .unwrap_or_default();
         let search_paths = crate::config::extract_module_search_paths(&config, config_path);
         let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
-        let manifests = crate::config::load_module_manifests_with_extra(modules, &extra_dirs);
+        // Config-anchored root so a cross-project `fluxor validate ../x.yaml`
+        // reads the CONFIG's fluxor.lock pins, not the cwd's.
+        let cfg_root = crate::project::root_for_config(config_path);
+        let manifests =
+            crate::config::load_module_manifests_with_extra(modules, &extra_dirs, &cfg_root);
         if let Err(e) =
             crate::config::validate_presentation_groups(&config, &module_names, &manifests)
         {
@@ -78,6 +82,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         target_desc.max_pin + 1,
         target_desc.pio_count,
         Some(&target_desc.id),
+        &crate::project::root_for_config(config_path),
     ) {
         result.add_error(format!("{e}"));
     }

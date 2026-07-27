@@ -529,6 +529,7 @@ fn cmd_generate(
         target_desc.max_pin + 1,
         target_desc.pio_count,
         Some(&target_desc.id),
+        &crate::project::root_for_config(config_path),
     )?;
 
     eprintln!("Config size: {} bytes", binary_data.len());
@@ -675,7 +676,13 @@ fn cmd_combine(
     let modules_dir = std::path::Path::new(&modules_dir_path);
     let search_paths = config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
-    let store_fb = store_cli::lock_store_resolver(&crate::project::root(), &target_desc.id, None);
+    // Config-anchored root so packaging reads the CONFIG's fluxor.lock pins,
+    // symmetric with the manifest resolver.
+    let store_fb = store_cli::lock_store_resolver(
+        &crate::project::root_for_config(config_path),
+        &target_desc.id,
+        None,
+    );
     let modules = parse_modules_from_config_multi(
         &config,
         modules_dir,
@@ -705,6 +712,7 @@ fn cmd_combine(
         target_desc.max_pin + 1,
         target_desc.pio_count,
         Some(&target_desc.id),
+        &crate::project::root_for_config(config_path),
     )?;
 
     let modules_data = if !modules.is_empty() {
@@ -962,8 +970,11 @@ fn build_packaged_blobs(
     extra_dirs: &[&std::path::Path],
     target_desc: &target::TargetDescriptor,
     verbose: bool,
+    project_root: &std::path::Path,
 ) -> Result<(Option<Vec<u8>>, Vec<u8>)> {
-    let store_fb = store_cli::lock_store_resolver(&crate::project::root(), &target_desc.id, None);
+    // `project_root` is config-anchored by the caller: fmod packaging and
+    // pinned-manifest resolution must consult the same fluxor.lock.
+    let store_fb = store_cli::lock_store_resolver(project_root, &target_desc.id, None);
     let modules = parse_modules_from_config_multi(
         config,
         modules_dir,
@@ -991,6 +1002,7 @@ fn build_packaged_blobs(
         target_desc.max_pin + 1,
         target_desc.pio_count,
         Some(&target_desc.id),
+        project_root,
     )?;
 
     let modules_data = if !modules.is_empty() {
@@ -1079,7 +1091,14 @@ fn cmd_slot_image(
     let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
     let modules_dir = std::path::Path::new(&modules_dir_path);
     let (modules_data, config_data) =
-        build_packaged_blobs(&config, modules_dir, &[], &target_desc, verbose)?;
+        build_packaged_blobs(
+            &config,
+            modules_dir,
+            &[],
+            &target_desc,
+            verbose,
+            &crate::project::root_for_config(config_path),
+        )?;
     let modules_data = modules_data
         .ok_or_else(|| error::Error::Config("Slot image requires at least one module".into()))?;
 

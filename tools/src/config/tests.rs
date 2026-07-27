@@ -1019,7 +1019,7 @@ mod scheduler_validation_tests {
         // tempdir — see the dedicated tests below.
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        validate_isr_tier_admission(&config, &modules, modules_dir, &extras, None)
+        validate_isr_tier_admission(&config, &modules, modules_dir, &extras, None, modules_dir)
     }
 
     #[test]
@@ -1159,7 +1159,7 @@ mod scheduler_validation_tests {
             vec![json!({"name": "unflagged", "type": "unflagged", "domain": "audio_isr"})];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("unflagged module in Tier 1b domain must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -1194,7 +1194,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("Tier 1b module with no resolvable manifest must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -1263,7 +1263,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![extra.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("extras-first lookup must surface the NEON-importing override");
         let msg = format!("{err:?}");
         assert!(
@@ -1303,7 +1303,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect("Tier 2 module exporting module_isr_entry must be admitted");
     }
 
@@ -1340,7 +1340,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("Tier 2 module without module_isr_entry must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -1378,7 +1378,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("Tier 2 module without irq: must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -1431,7 +1431,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = Vec::new();
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("standard-tree NEON-importing ISR module must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -1471,7 +1471,7 @@ mod scheduler_validation_tests {
             "type": "ext_drainer",
         }]);
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let manifests = load_module_manifests_with_extra(&modules_value, &extras);
+        let manifests = load_module_manifests_with_extra(&modules_value, &extras, dir.path());
         assert!(
             manifests
                 .get("ext_drainer")
@@ -1527,9 +1527,13 @@ mod scheduler_validation_tests {
 
         let modules = json!([{"name": "sized_stream", "type": "sized_stream"}]);
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let default_manifest = load_module_manifests_with_extra(&modules, &extras);
-        let bcm_manifest =
-            load_module_manifests_with_extra_for_target(&modules, &extras, Some("bcm2712"));
+        let default_manifest = load_module_manifests_with_extra(&modules, &extras, dir.path());
+        let bcm_manifest = load_module_manifests_with_extra_for_target(
+            &modules,
+            &extras,
+            Some("bcm2712"),
+            dir.path(),
+        );
 
         assert_eq!(default_manifest["sized_stream"].ports[0].buffer_size, 2048);
         assert_eq!(bcm_manifest["sized_stream"].ports[0].buffer_size, 8192);
@@ -1559,7 +1563,7 @@ mod scheduler_validation_tests {
         })];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect("isr_safe = true module in Tier 1b domain must be admitted");
     }
 
@@ -1615,7 +1619,7 @@ mod scheduler_validation_tests {
         ];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        let err = validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("untagged edge into Tier 1b module must still be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -1665,7 +1669,7 @@ mod scheduler_validation_tests {
         ];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect_err("dma_owned edge into Tier 1b module rejected (subsumed by ISR-edge rule)");
     }
 
@@ -1690,7 +1694,7 @@ mod scheduler_validation_tests {
         let modules = vec![json!({"name": "plain_mod", "type": "plain_mod", "domain": "main"})];
         let modules_dir = std::path::Path::new("/nonexistent/modules");
         let extras: Vec<&std::path::Path> = vec![dir.path()];
-        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None)
+        validate_isr_tier_admission(&cfg, &modules, modules_dir, &extras, None, modules_dir)
             .expect("cooperative tier with isr_safe=false on its modules is fine");
     }
 
@@ -1772,7 +1776,7 @@ mod module_discovery_tests {
             std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
         }
         let modules = json!([{"name": "bundled_mod", "type": "bundled_mod"}]);
-        let manifests = load_module_manifests_with_extra(&modules, &[]);
+        let manifests = load_module_manifests_with_extra(&modules, &[], install.path());
         unsafe {
             std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
             std::env::remove_var(crate::project::ENV_INSTALL_ROOT);
@@ -1802,7 +1806,7 @@ mod module_discovery_tests {
             std::env::set_var(crate::project::ENV_INSTALL_ROOT, install.path());
         }
         let modules = json!([{"name": "shared_mod", "type": "shared_mod"}]);
-        let manifests = load_module_manifests_with_extra(&modules, &[]);
+        let manifests = load_module_manifests_with_extra(&modules, &[], install.path());
         unsafe {
             std::env::remove_var(crate::project::ENV_PROJECT_ROOT);
             std::env::remove_var(crate::project::ENV_INSTALL_ROOT);

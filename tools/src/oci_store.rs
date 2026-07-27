@@ -477,6 +477,30 @@ impl OciStore {
         Ok((layer.digest.clone(), self.blob_path(&layer.digest)?))
     }
 
+    /// Return the verified bytes of a module artifact's `manifest.toml`
+    /// layer, or `None` if the artifact predates the metadata layer.
+    /// The symmetric partner of `module_fmod_blob`: wiring/port
+    /// resolution needs the manifest a pinned module ships alongside its
+    /// `.fmod`, so a store-only module resolves BOTH layers from the same
+    /// content-addressed artifact and its ports can never diverge from its
+    /// bytes. `read_blob` hashes the bytes against the layer digest.
+    pub fn module_manifest_toml_blob(&self, manifest: &ImageManifest) -> Result<Option<Vec<u8>>> {
+        if manifest.artifact_type.as_deref() != Some(MT_FLUXOR_MODULE) {
+            return Err(Error::Config(format!(
+                "artifact is not a fluxor module (artifactType {:?})",
+                manifest.artifact_type
+            )));
+        }
+        let Some(layer) = manifest
+            .layers
+            .iter()
+            .find(|l| l.media_type == MT_FLUXOR_MODULE_META)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.read_blob(&layer.digest)?))
+    }
+
     /// Remove a reference from the index, then delete every blob no longer
     /// reachable from any remaining indexed manifest. Content shared with
     /// other tags survives (content addressing does the refcounting).

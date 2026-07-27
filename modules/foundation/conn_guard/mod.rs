@@ -303,10 +303,18 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let sys = &*s.syscalls;
 
     s.step_count = s.step_count.wrapping_add(1);
-    // `[guard] pass=...` heartbeat — same cadence as other foundation
-    // modules. `drop_full` non-zero ⇒ IP not draining; `drop_syn`
-    // non-zero ⇒ SYN-rate fuse tripping.
-    if s.step_count.is_multiple_of(50_000) {
+    // `[guard] pass=...` heartbeat. `drop_full` non-zero ⇒ IP not draining;
+    // `drop_syn` non-zero ⇒ the SYN-rate fuse is tripping. A tripping fuse
+    // drops SYNs silently and the peer's retransmit ladder turns that into
+    // downstream latency, so the heartbeat runs 10x faster once the fuse has
+    // tripped at all.
+    //
+    // The heartbeat stays one buffer and one `dev_log`: a second log buffer in
+    // `module_step` wedges this module — frames stop reaching `ip` and the DUT
+    // boots unreachable. The frame buffer lives in `GuardState` to keep this
+    // stack frame tiny; the cadence below is the only thing that varies.
+    let cadence: u32 = if s.dropped_syn > 0 { 5_000 } else { 50_000 };
+    if s.step_count.is_multiple_of(cadence) {
         let mut msg = [0u8; 96];
         let p = msg.as_mut_ptr();
         let prefix = b"[guard] pass=";
