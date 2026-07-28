@@ -31,30 +31,18 @@ path = "src/bin/observe_udp_capture.rs"
 # HTTPS load-probe observer: drives concurrent TLS clients against the
 # rig's HTTPS endpoint and emits NDJSON bytes per phase so the matcher
 # can pin throughput, concurrency, and handshake-rate floors.
-# Gated behind the `observe-https-load` feature so the default fluxor
-# CLI build doesn't pull in tokio + reqwest + rustls. Build with:
-#   cargo build --release -p fluxor-tools --bin observe-https_load \
-#               --features observe-https-load
+# Built unconditionally: no feature gates on shipped artefacts
+# (standards/dependencies.md §9a). A `required-features` gate here
+# makes a plain `cargo build`/`test`/`install` silently omit the
+# binary, leaving the rig's backend symlink dangling — the rig then
+# reports "backend not found on any search path", which reads as a
+# missing install rather than a side effect of an unrelated build.
 [[bin]]
 name = "observe-https_load"
 path = "src/bin/observe_https_load.rs"
-required-features = ["observe-https-load"]
 
 [features]
 default = []
-# Pulls async + HTTPS client deps in for `observe-https_load` only.
-# The probe drives `tokio::net::TcpStream` + `tokio_rustls` directly
-# so it can measure each stage (TCP, TLS handshake, request send,
-# first byte, body complete) independently. reqwest used to sit
-# between probe and rig but added ~60ms per request on the
-# fresh-Client path — hiding the rig's real performance — so it was
-# removed.
-observe-https-load = [
-    "dep:tokio",
-    "dep:futures-util",
-    "dep:rustls",
-    "dep:tokio-rustls",
-]
 
 # Library target — gives integration tests under `tools/tests/` and
 # the auxiliary backend binaries under `src/bin/` access to individual
@@ -89,17 +77,18 @@ toml = "1.1.2"
 # keeps the scanner focused on AST work.
 walkdir = "2.5"
 
-# Optional deps used only by the `observe-https_load` rig backend.
-# Pulled in via the `observe-https-load` feature so the default
-# fluxor CLI build stays lean. The probe drives raw TCP + TLS so we
+# Deps for the `observe-https_load` rig backend. Not optional: the
+# binary is built unconditionally (standards/dependencies.md §9a), so
+# gating these would only reintroduce the missing-artefact failure
+# described above. The probe drives raw TCP + TLS so we
 # get clean per-stage timing — no client library between us and the
 # rig hiding overhead in `Client::new()` or connection-pool
 # bookkeeping. We accept invalid certs (the rig fixture's self-signed
 # cert is part of the test setup).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal", "net"], optional = true }
-futures-util = { version = "0.3", optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
-tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal", "net"] }
+futures-util = { version = "0.3" }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 
 [dev-dependencies]
 # Used by test-side `#[cfg(test)]` helpers to construct auto-cleaning

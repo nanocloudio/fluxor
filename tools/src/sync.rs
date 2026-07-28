@@ -353,7 +353,30 @@ fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) ->
                 continue;
             }
         } else {
-            fs::copy(&src, &dest)?;
+            // Clear `dest` first — for the same reason the `live` arm above
+            // does, but the consequence here is far worse than a stale link.
+            //
+            // A tree previously synced in `live` mode carries `dest` as a
+            // symlink back to `src` (the producing project's
+            // `target/fluxor/<silicon>/modules/<name>.fmod`). `fs::copy`
+            // follows the destination symlink and opens it
+            // `.write(true).truncate(true)`, so it truncates `src`, reads
+            // 0 bytes from it, and writes those 0 bytes back — destroying
+            // the artefact it was asked to copy. `std::fs::copy` has no
+            // same-file guard, unlike coreutils `cp`, so this is silent, and
+            // the consumer cannot repair it because the destroyed originals
+            // live in the producing checkout.
+            //
+            // Removing `dest` makes the copy write a fresh file, leaving
+            // `src` untouched whether or not a stale live-link is present.
+            if let Err(e) = copy_replacing(&src, &dest) {
+                errors.push(format!(
+                    "could not copy {} -> {}: {e}",
+                    src.display(),
+                    dest.display()
+                ));
+                continue;
+            }
         }
         written_fmods.insert(dest.clone(), (entry.project.clone(), actual_hash.clone()));
         match mode_label {
@@ -847,4 +870,77 @@ fn workspace_member_map() -> BTreeMap<String, PathBuf> {
         out.insert(identity.name, canon);
     }
     out
+}
+
+/// Copy `src` over `dest`, removing `dest` first.
+///
+/// The removal is the whole point. See the call site for the full account:
+/// when `dest` is a symlink back to `src` — which is exactly what a previous
+/// `live`-mode sync leaves behind — a bare `fs::copy` follows the destination
+/// link, truncates `src`, and then copies the resulting 0 bytes over itself.
+/// Rust's `std::fs::copy` has no same-file guard, so it destroys the artefact
+/// silently and reports success.
+fn copy_replacing(src: &Path, dest: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(dest) {
+        Ok(_) => fs::remove_file(dest)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::copy(src, dest).map(|_| ())
+}
+
+#[cfg(test)]
+mod copy_replacing_tests {
+    use super::copy_replacing;
+    use std::fs;
+
+    /// A downstream project synced in `live` mode holds `dest` as a symlink
+    /// to the producing project's real artefact; a later non-live sync must
+    /// not destroy it.
+    #[test]
+    fn copy_over_symlink_pointing_at_source_preserves_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("ip.fmod");
+        let dest_dir = tmp.path().join("consumer");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("ip.fmod");
+
+        fs::write(&src, b"real module bytes").unwrap();
+        std::os::unix::fs::symlink(&src, &dest).unwrap();
+
+        copy_replacing(&src, &dest).unwrap();
+
+        assert_eq!(
+            fs::read(&src).unwrap(),
+            b"real module bytes",
+            "source artefact was destroyed by the copy"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"real module bytes");
+        assert!(
+            !fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "dest should be a real file after a non-live sync, not a link"
+        );
+    }
+
+    /// A bare `fs::copy` in the same situation destroys the source — this is
+    /// the behaviour `copy_replacing` exists to prevent, pinned so nobody
+    /// "simplifies" the removal away.
+    #[test]
+    fn bare_fs_copy_would_destroy_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("ip.fmod");
+        let dest = tmp.path().join("link.fmod");
+        fs::write(&src, b"real module bytes").unwrap();
+        std::os::unix::fs::symlink(&src, &dest).unwrap();
+
+        let _ = fs::copy(&src, &dest);
+        assert!(
+            fs::read(&src).unwrap().is_empty(),
+            "if this ever stops truncating, std::fs::copy grew a same-file \
+             guard and copy_replacing's removal could be revisited"
+        );
+    }
 }

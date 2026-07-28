@@ -588,6 +588,21 @@ struct TlsState {
     /// step that lost a write can be counted once as a back-pressure step
     /// however many frames it dropped.
     fwd_pre_step: u32,
+
+    // ── Pipeline-advancement instrumentation ──────────────────────────
+    //
+    // Byte counters and step histograms say how much work the module did.
+    // Neither says whether it had more work available and stopped anyway,
+    // which is what distinguishes "this stage is the gate" from "this stage
+    // is starved waiting on someone else". A pipelined graph can sit well
+    // under its CPU budget with every drop counter at zero and still be
+    // rate-limited by a per-tick advancement rule; these two name where.
+    /// Inbound frames drained this window (both sides summed).
+    adv_items: u32,
+    /// Steps that ended with `cipher_in` or `clear_in` still readable —
+    /// tls had more to do and stopped. Sustained non-zero means tls is the
+    /// gate; zero means it is keeping up and the queue is elsewhere.
+    pend_steps: u32,
 }
 
 /// DTLS half-open handshake idle timeout in module steps. At the
@@ -603,6 +618,22 @@ const DTLS_HANDSHAKE_TIMEOUT_STEPS: u32 = 60_000;
 /// modules on the ip→tls→http path covers the same interval and the byte
 /// counts either side of an edge can be differenced directly.
 const TLS_TLM_PERIOD: u32 = 5000;
+
+/// Inbound net_proto frames drained per side, per `module_step`.
+///
+/// Without a budget each phase would take one frame per tick however many the
+/// producer had queued, which caps a pipelined graph at one frame per side per
+/// tick regardless of how much headroom the domain has. Burst does not
+/// compensate: `MAX_BURST_STEPS` re-steps the same module rather than
+/// advancing a request to the next one.
+///
+/// 8, deliberately below `ip`'s 32 RX budget. A larger drain lengthens every
+/// step, which costs the latency-bound paths — single-connection keepalive
+/// throughput is 1/latency and handshakes are round-trip bound — and buys
+/// nothing once the queue is already being cleared each tick. This is a
+/// throughput/latency trade: measure it under concurrency, because
+/// single-connection latency is the metric a larger budget damages first.
+const TLS_INBOUND_DRAIN_BUDGET: u32 = 8;
 
 // ============================================================================
 // Parameter definitions
@@ -710,6 +741,8 @@ pub unsafe extern "C" fn module_new(
     s.clear_in_bytes = 0;
     s.clear_out_bytes = 0;
     s.fwd_pre_step = 0;
+    s.adv_items = 0;
+    s.pend_steps = 0;
     let mut i = 0;
     while i < MAX_PEERS {
         s.peer_sessions[i] = PeerSession::empty();
@@ -1029,9 +1062,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         pos += fmt_u32_dec(s.clear_in_bytes, buf.add(pos));
         emit(b" clr_tx=", &mut pos);
         pos += fmt_u32_dec(s.clear_out_bytes, buf.add(pos));
+        emit(b" adv=", &mut pos);
+        pos += fmt_u32_dec(s.adv_items, buf.add(pos));
+        emit(b" pend=", &mut pos);
+        pos += fmt_u32_dec(s.pend_steps, buf.add(pos));
         dev_log(sys, 3, buf, pos);
         s.clear_in_bytes = 0;
         s.clear_out_bytes = 0;
+        s.adv_items = 0;
+        s.pend_steps = 0;
     }
 
     // Per-phase timing for the heavy-step diagnostic; see the field
@@ -1141,379 +1180,385 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let t1 = if diag_on { dev_micros(sys) } else { 0 };
 
     // ── Phase 2: Read from cipher_in (downstream: IP → TLS) ──
-    let poll_ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
-    if poll_ci > 0 && (poll_ci as u32 & POLL_IN) != 0 {
+    let mut ci_drained = 0u32;
+    while ci_drained < TLS_INBOUND_DRAIN_BUDGET {
+        let poll_ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
+        if poll_ci <= 0 || (poll_ci as u32 & POLL_IN) == 0 {
+            break;
+        }
         let (msg_type, payload_len) = tls_read_header(sys, s.cipher_in);
-        if msg_type != 0 {
-            did_work = true;
-            // Wire-side ingress. Counted at the single header-read
-            // chokepoint every cipher_in branch funnels through, so a new
-            // message type can't silently escape the accounting. Includes
-            // the 3-byte net_proto header so this is directly comparable
-            // with `[ip] tlm tx` across the edge.
-            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(3 + payload_len as u32);
-            match msg_type {
-                t if t == NET_MSG_ACCEPTED || t == NET_MSG_CONNECTED => {
-                    // Read conn_id from payload
-                    let mut payload = [0u8; 256];
-                    let pl = payload_len as usize;
-                    if pl > 0 {
-                        let rd = if pl < 256 { pl } else { 256 };
-                        (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
-                        // Discard excess
-                        if pl > 256 {
-                            tls_discard(sys, s.cipher_in, pl - 256);
-                        }
+        // A partial header means the producer is mid-write: no progress is
+        // possible this tick, and continuing would spin on a ready poll.
+        if msg_type == 0 {
+            break;
+        }
+        ci_drained += 1;
+        s.adv_items = s.adv_items.wrapping_add(1);
+        did_work = true;
+        // Wire-side ingress. Counted at the single header-read
+        // chokepoint every cipher_in branch funnels through, so a new
+        // message type can't silently escape the accounting. Includes
+        // the 3-byte net_proto header so this is directly comparable
+        // with `[ip] tlm tx` across the edge.
+        s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(3 + payload_len as u32);
+        match msg_type {
+            t if t == NET_MSG_ACCEPTED || t == NET_MSG_CONNECTED => {
+                // Read conn_id from payload
+                let mut payload = [0u8; 256];
+                let pl = payload_len as usize;
+                if pl > 0 {
+                    let rd = if pl < 256 { pl } else { 256 };
+                    (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
+                    // Discard excess
+                    if pl > 256 {
+                        tls_discard(sys, s.cipher_in, pl - 256);
                     }
-                    let conn_id = if pl > 0 {
-                        // SAFETY: forwarded to the runtime helper which validates the
-                        // pointer + length contract documented at its declaration.
-                        unsafe { *payload.as_ptr() }
+                }
+                let conn_id = if pl > 0 {
+                    // SAFETY: forwarded to the runtime helper which validates the
+                    // pointer + length contract documented at its declaration.
+                    unsafe { *payload.as_ptr() }
+                } else {
+                    0
+                };
+                // Stream-surface routing: `MSG_CONNECTED` carries a requester
+                // tag at payload[1]. When `ip.net_out` is fanned to TLS plus
+                // another stream consumer (e.g. an OTLP exporter), claim an
+                // outbound connect ONLY if its tag is ours (or untagged, for
+                // single-consumer / legacy graphs) — otherwise it belongs to
+                // the other consumer and starting a handshake on its plaintext
+                // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
+                // unaffected: TLS is the sole accept-claimant on its channel.
+                let claim = if t == NET_MSG_CONNECTED {
+                    let tag = if pl >= 2 { payload[1] } else { 0 };
+                    let me = dev_requester_tag(sys);
+                    tag == 0 || tag == me
+                } else if s.mode == 0 {
+                    // Client-mode TLS never listens (it only active-opens),
+                    // so an inbound accept on the shared net adapter belongs
+                    // to another consumer — e.g. an ssh server bound on the
+                    // same linux_net. Never claim it, or we'd start a TLS
+                    // handshake on that peer's plaintext stream and kill it.
+                    false
+                } else {
+                    // Server-mode inbound accept. Multi-anchor demux: when
+                    // the frame carries a listener port (pl >= 3) and we've
+                    // learned our bound port, claim only our port's accepts.
+                    // A port-less frame (legacy) or unknown bound port →
+                    // claim (sole-consumer behaviour).
+                    if pl >= 3 && s.accept_port != 0 {
+                        let port = (payload[1] as u16) | ((payload[2] as u16) << 8);
+                        port == s.accept_port
                     } else {
-                        0
-                    };
-                    // Stream-surface routing: `MSG_CONNECTED` carries a requester
-                    // tag at payload[1]. When `ip.net_out` is fanned to TLS plus
-                    // another stream consumer (e.g. an OTLP exporter), claim an
-                    // outbound connect ONLY if its tag is ours (or untagged, for
-                    // single-consumer / legacy graphs) — otherwise it belongs to
-                    // the other consumer and starting a handshake on its plaintext
-                    // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
-                    // unaffected: TLS is the sole accept-claimant on its channel.
-                    let claim = if t == NET_MSG_CONNECTED {
-                        let tag = if pl >= 2 { payload[1] } else { 0 };
-                        let me = dev_requester_tag(sys);
-                        tag == 0 || tag == me
-                    } else if s.mode == 0 {
-                        // Client-mode TLS never listens (it only active-opens),
-                        // so an inbound accept on the shared net adapter belongs
-                        // to another consumer — e.g. an ssh server bound on the
-                        // same linux_net. Never claim it, or we'd start a TLS
-                        // handshake on that peer's plaintext stream and kill it.
-                        false
-                    } else {
-                        // Server-mode inbound accept. Multi-anchor demux: when
-                        // the frame carries a listener port (pl >= 3) and we've
-                        // learned our bound port, claim only our port's accepts.
-                        // A port-less frame (legacy) or unknown bound port →
-                        // claim (sole-consumer behaviour).
-                        if pl >= 3 && s.accept_port != 0 {
-                            let port = (payload[1] as u16) | ((payload[2] as u16) << 8);
-                            port == s.accept_port
-                        } else {
-                            true
-                        }
-                    };
-                    // Allocate a session only for connections we claim. A
-                    // MSG_CONNECTED tagged for another consumer is consumed
-                    // (frame already read) but otherwise ignored.
-                    if claim {
-                        match alloc_session_for_conn(s, conn_id) {
-                            Some(idx) => {
-                                s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
-                                s.sessions[idx].held_msg_type = t;
-                                s.sessions[idx].state = SessionState::Handshaking;
-                                // For a client connect, carry the clear-side
-                                // consumer's original tag so the forwarded
-                                // MSG_CONNECTED routes back to it. Accepts: 0.
-                                s.sessions[idx].downstream_tag = if t == NET_MSG_CONNECTED {
-                                    let dt = s.pending_downstream_tag;
-                                    s.pending_downstream_tag = 0;
-                                    s.pending_connect_active = false; // connect completed
-                                    dt
-                                } else {
-                                    0
-                                };
-                                // Observability: start the `tls.handshake` span and
-                                // mint this session's own span id (used for the span
-                                // AND forwarded downstream so HTTP parents under it).
-                                // Gated on a wired telemetry port — no clock read,
-                                // no span, when tracing is off.
-                                if s.telemetry_chan >= 0 {
-                                    let sys = &*s.syscalls;
-                                    let now = dev_micros(sys);
-                                    s.sessions[idx].span_start_us = if now == 0 { 1 } else { now };
-                                    dev_csprng_fill(sys, s.sessions[idx].span_id.as_mut_ptr(), 8);
-                                }
-                                if s.sessions[idx].driver.is_server {
-                                    s.sessions[idx].driver.hs_state =
-                                        HandshakeState::RecvClientHello;
-                                } else {
-                                    s.sessions[idx].driver.hs_state =
-                                        HandshakeState::SendClientHello;
-                                }
-                                init_session_crypto(s, idx);
+                        true
+                    }
+                };
+                // Allocate a session only for connections we claim. A
+                // MSG_CONNECTED tagged for another consumer is consumed
+                // (frame already read) but otherwise ignored.
+                if claim {
+                    match alloc_session_for_conn(s, conn_id) {
+                        Some(idx) => {
+                            s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
+                            s.sessions[idx].held_msg_type = t;
+                            s.sessions[idx].state = SessionState::Handshaking;
+                            // For a client connect, carry the clear-side
+                            // consumer's original tag so the forwarded
+                            // MSG_CONNECTED routes back to it. Accepts: 0.
+                            s.sessions[idx].downstream_tag = if t == NET_MSG_CONNECTED {
+                                let dt = s.pending_downstream_tag;
+                                s.pending_downstream_tag = 0;
+                                s.pending_connect_active = false; // connect completed
+                                dt
+                            } else {
+                                0
+                            };
+                            // Observability: start the `tls.handshake` span and
+                            // mint this session's own span id (used for the span
+                            // AND forwarded downstream so HTTP parents under it).
+                            // Gated on a wired telemetry port — no clock read,
+                            // no span, when tracing is off.
+                            if s.telemetry_chan >= 0 {
+                                let sys = &*s.syscalls;
+                                let now = dev_micros(sys);
+                                s.sessions[idx].span_start_us = if now == 0 { 1 } else { now };
+                                dev_csprng_fill(sys, s.sessions[idx].span_id.as_mut_ptr(), 8);
                             }
-                            None => {
-                                // No session slots — close the socket upstream
-                                // (best-effort; a full channel still RSTs/times
-                                // out on the peer).
+                            if s.sessions[idx].driver.is_server {
+                                s.sessions[idx].driver.hs_state = HandshakeState::RecvClientHello;
+                            } else {
+                                s.sessions[idx].driver.hs_state = HandshakeState::SendClientHello;
+                            }
+                            init_session_crypto(s, idx);
+                        }
+                        None => {
+                            // No session slots — close the socket upstream
+                            // (best-effort; a full channel still RSTs/times
+                            // out on the peer).
+                            let _ = tls_write_or_count(
+                                s,
+                                s.cipher_out,
+                                NET_CMD_CLOSE,
+                                conn_id,
+                                core::ptr::null(),
+                                0,
+                            );
+                            // For a CLIENT connect the clear-side requester is
+                            // waiting on this completion — emit a TAGGED
+                            // terminal failure downstream and clear the pending
+                            // slot so it doesn't wedge. (Accepts aren't visible
+                            // downstream until the held handshake completes.)
+                            if t == NET_MSG_CONNECTED {
+                                let dtag = s.pending_downstream_tag;
+                                s.pending_connect_active = false;
+                                s.pending_downstream_tag = 0;
+                                let err = [(-12i8) as u8, dtag]; // ENOMEM + tag
                                 let _ = tls_write_or_count(
                                     s,
-                                    s.cipher_out,
-                                    NET_CMD_CLOSE,
+                                    s.clear_out,
+                                    NET_MSG_ERROR,
                                     conn_id,
-                                    core::ptr::null(),
-                                    0,
+                                    err.as_ptr(),
+                                    err.len() as u16,
                                 );
-                                // For a CLIENT connect the clear-side requester is
-                                // waiting on this completion — emit a TAGGED
-                                // terminal failure downstream and clear the pending
-                                // slot so it doesn't wedge. (Accepts aren't visible
-                                // downstream until the held handshake completes.)
-                                if t == NET_MSG_CONNECTED {
-                                    let dtag = s.pending_downstream_tag;
-                                    s.pending_connect_active = false;
-                                    s.pending_downstream_tag = 0;
-                                    let err = [(-12i8) as u8, dtag]; // ENOMEM + tag
-                                    let _ = tls_write_or_count(
-                                        s,
-                                        s.clear_out,
-                                        NET_MSG_ERROR,
-                                        conn_id,
-                                        err.as_ptr(),
-                                        err.len() as u16,
-                                    );
-                                }
                             }
                         }
                     }
                 }
-                t if t == NET_MSG_DATA => {
-                    // Read conn_id + ciphertext payload
-                    let pl = payload_len as usize;
-                    if pl < 1 {
-                        // Malformed — skip
-                    } else {
-                        let mut conn_id_buf = [0u8; 1];
-                        (sys.channel_read)(s.cipher_in, conn_id_buf.as_mut_ptr(), 1);
-                        // SAFETY: forwarded to the runtime helper which validates the
-                        // pointer + length contract documented at its declaration.
-                        let conn_id = unsafe { *conn_id_buf.as_ptr() };
-                        let data_len = pl - 1;
-                        let si = find_session_by_conn_id(s, conn_id);
-                        if si >= 0 {
-                            let idx = si as usize;
-                            if s.sessions[idx].state == SessionState::Handshaking {
-                                // Feed ciphertext into handshake recv_buf
-                                let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
-                                let to_read = if data_len < space { data_len } else { space };
-                                if to_read > 0 {
-                                    (sys.channel_read)(
-                                        s.cipher_in,
-                                        s.sessions[idx]
-                                            .recv_buf
-                                            .as_mut_ptr()
-                                            .add(s.sessions[idx].recv_len),
-                                        to_read,
-                                    );
-                                    s.sessions[idx].recv_len += to_read;
-                                }
-                                if data_len > to_read {
-                                    tls_discard(sys, s.cipher_in, data_len - to_read);
-                                }
-                            } else if s.sessions[idx].state == SessionState::Ready {
-                                // Feed ciphertext into recv_buf for decryption
-                                let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
-                                let to_read = if data_len < space { data_len } else { space };
-                                if to_read > 0 {
-                                    (sys.channel_read)(
-                                        s.cipher_in,
-                                        s.sessions[idx]
-                                            .recv_buf
-                                            .as_mut_ptr()
-                                            .add(s.sessions[idx].recv_len),
-                                        to_read,
-                                    );
-                                    s.sessions[idx].recv_len += to_read;
-                                }
-                                if data_len > to_read {
-                                    tls_discard(sys, s.cipher_in, data_len - to_read);
-                                }
-                                // Try to decrypt and forward
-                                try_decrypt_forward(s, idx);
-                            } else {
-                                tls_discard(sys, s.cipher_in, data_len);
+            }
+            t if t == NET_MSG_DATA => {
+                // Read conn_id + ciphertext payload
+                let pl = payload_len as usize;
+                if pl < 1 {
+                    // Malformed — skip
+                } else {
+                    let mut conn_id_buf = [0u8; 1];
+                    (sys.channel_read)(s.cipher_in, conn_id_buf.as_mut_ptr(), 1);
+                    // SAFETY: forwarded to the runtime helper which validates the
+                    // pointer + length contract documented at its declaration.
+                    let conn_id = unsafe { *conn_id_buf.as_ptr() };
+                    let data_len = pl - 1;
+                    let si = find_session_by_conn_id(s, conn_id);
+                    if si >= 0 {
+                        let idx = si as usize;
+                        if s.sessions[idx].state == SessionState::Handshaking {
+                            // Feed ciphertext into handshake recv_buf
+                            let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
+                            let to_read = if data_len < space { data_len } else { space };
+                            if to_read > 0 {
+                                (sys.channel_read)(
+                                    s.cipher_in,
+                                    s.sessions[idx]
+                                        .recv_buf
+                                        .as_mut_ptr()
+                                        .add(s.sessions[idx].recv_len),
+                                    to_read,
+                                );
+                                s.sessions[idx].recv_len += to_read;
                             }
+                            if data_len > to_read {
+                                tls_discard(sys, s.cipher_in, data_len - to_read);
+                            }
+                        } else if s.sessions[idx].state == SessionState::Ready {
+                            // Feed ciphertext into recv_buf for decryption
+                            let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
+                            let to_read = if data_len < space { data_len } else { space };
+                            if to_read > 0 {
+                                (sys.channel_read)(
+                                    s.cipher_in,
+                                    s.sessions[idx]
+                                        .recv_buf
+                                        .as_mut_ptr()
+                                        .add(s.sessions[idx].recv_len),
+                                    to_read,
+                                );
+                                s.sessions[idx].recv_len += to_read;
+                            }
+                            if data_len > to_read {
+                                tls_discard(sys, s.cipher_in, data_len - to_read);
+                            }
+                            // Try to decrypt and forward
+                            try_decrypt_forward(s, idx);
                         } else {
                             tls_discard(sys, s.cipher_in, data_len);
                         }
+                    } else {
+                        tls_discard(sys, s.cipher_in, data_len);
                     }
                 }
-                t if t == NET_MSG_CLOSED => {
-                    // Read conn_id and forward to clear_out
-                    let pl = payload_len as usize;
-                    let mut payload = [0u8; 16];
-                    let rd = if pl < 16 { pl } else { 16 };
-                    if rd > 0 {
-                        (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
+            }
+            t if t == NET_MSG_CLOSED => {
+                // Read conn_id and forward to clear_out
+                let pl = payload_len as usize;
+                let mut payload = [0u8; 16];
+                let rd = if pl < 16 { pl } else { 16 };
+                if rd > 0 {
+                    (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
+                }
+                if pl > 16 {
+                    tls_discard(sys, s.cipher_in, pl - 16);
+                }
+                let conn_id = if pl > 0 { payload[0] } else { 0 };
+                // Clean up session
+                let si = find_session_by_conn_id(s, conn_id);
+                if si >= 0 {
+                    s.sessions[si as usize].reset();
+                }
+                // Forward to HTTP — best-effort close notification.
+                let _ = tls_write_or_count(
+                    s,
+                    s.clear_out,
+                    NET_MSG_CLOSED,
+                    conn_id,
+                    core::ptr::null(),
+                    0,
+                );
+            }
+            t if t == NET_MSG_BOUND || t == NET_MSG_ERROR => {
+                let pl = payload_len as usize;
+                let rd = if pl < NET_SCRATCH_SIZE {
+                    pl
+                } else {
+                    NET_SCRATCH_SIZE
+                };
+                if rd > 0 {
+                    (sys.channel_read)(s.cipher_in, s.net_scratch.as_mut_ptr(), rd);
+                }
+                if pl > rd {
+                    tls_discard(sys, s.cipher_in, pl - rd);
+                }
+                // MSG_BOUND `[conn_id][local_port:2 LE]`: record the
+                // listener port so we can demux accepts in a
+                // multi-anchor fan-out (claim only our port's accepts).
+                // On a shared `cipher_in` fan, IP emits one MSG_BOUND
+                // per anchor's CMD_BIND; claim ONLY the one whose port
+                // matches the bind THIS instance forwarded
+                // (`bind_port`). A non-matching bound belongs to
+                // another anchor — don't latch it and don't forward it
+                // to our downstream. A port-less (legacy) bound or an
+                // unknown `bind_port` is accepted as before.
+                let mut bound_is_ours = true;
+                if t == NET_MSG_BOUND && rd >= 3 {
+                    let bp = (s.net_scratch[1] as u16) | ((s.net_scratch[2] as u16) << 8);
+                    if s.bind_port == 0 || bp == s.bind_port {
+                        s.accept_port = bp;
+                    } else {
+                        bound_is_ours = false;
                     }
-                    if pl > 16 {
-                        tls_discard(sys, s.cipher_in, pl - 16);
-                    }
-                    let conn_id = if pl > 0 { payload[0] } else { 0 };
-                    // Clean up session
+                }
+                // MSG_ERROR `[conn_id][errno][tag]` carries IP's tag (TLS's own
+                // tag). TRANSLATE it to the original downstream tag so the
+                // clear-side requester recognises the failure — otherwise it
+                // ignores the error and waits for a timeout. For an established
+                // conn the tag comes from its session; for a connect failure
+                // (no session yet) from the pending connect slot. MSG_BOUND has
+                // no tag and passes through unchanged.
+                let mut forward = bound_is_ours;
+                if t == NET_MSG_ERROR && rd >= 3 {
+                    let conn_id = s.net_scratch[0];
+                    let in_tag = s.net_scratch[2]; // IP-echoed requester tag
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
-                        s.sessions[si as usize].reset();
-                    }
-                    // Forward to HTTP — best-effort close notification.
-                    let _ = tls_write_or_count(
-                        s,
-                        s.clear_out,
-                        NET_MSG_CLOSED,
-                        conn_id,
-                        core::ptr::null(),
-                        0,
-                    );
-                }
-                t if t == NET_MSG_BOUND || t == NET_MSG_ERROR => {
-                    let pl = payload_len as usize;
-                    let rd = if pl < NET_SCRATCH_SIZE {
-                        pl
+                        // Established-connection error → its session's tag.
+                        s.net_scratch[2] = s.sessions[si as usize].downstream_tag;
+                    } else if s.pending_connect_active && in_tag == dev_requester_tag(sys) {
+                        // A CONNECT failure routed to TLS carries TLS's own
+                        // tag (TLS stamped it). Only THEN consume the pending
+                        // slot — a co-wired consumer's failure (different tag)
+                        // must not cancel our connect.
+                        s.pending_connect_active = false;
+                        s.net_scratch[2] = s.pending_downstream_tag;
+                        s.pending_downstream_tag = 0;
                     } else {
-                        NET_SCRATCH_SIZE
-                    };
-                    if rd > 0 {
-                        (sys.channel_read)(s.cipher_in, s.net_scratch.as_mut_ptr(), rd);
-                    }
-                    if pl > rd {
-                        tls_discard(sys, s.cipher_in, pl - rd);
-                    }
-                    // MSG_BOUND `[conn_id][local_port:2 LE]`: record the
-                    // listener port so we can demux accepts in a
-                    // multi-anchor fan-out (claim only our port's accepts).
-                    // On a shared `cipher_in` fan, IP emits one MSG_BOUND
-                    // per anchor's CMD_BIND; claim ONLY the one whose port
-                    // matches the bind THIS instance forwarded
-                    // (`bind_port`). A non-matching bound belongs to
-                    // another anchor — don't latch it and don't forward it
-                    // to our downstream. A port-less (legacy) bound or an
-                    // unknown `bind_port` is accepted as before.
-                    let mut bound_is_ours = true;
-                    if t == NET_MSG_BOUND && rd >= 3 {
-                        let bp = (s.net_scratch[1] as u16) | ((s.net_scratch[2] as u16) << 8);
-                        if s.bind_port == 0 || bp == s.bind_port {
-                            s.accept_port = bp;
-                        } else {
-                            bound_is_ours = false;
-                        }
-                    }
-                    // MSG_ERROR `[conn_id][errno][tag]` carries IP's tag (TLS's own
-                    // tag). TRANSLATE it to the original downstream tag so the
-                    // clear-side requester recognises the failure — otherwise it
-                    // ignores the error and waits for a timeout. For an established
-                    // conn the tag comes from its session; for a connect failure
-                    // (no session yet) from the pending connect slot. MSG_BOUND has
-                    // no tag and passes through unchanged.
-                    let mut forward = bound_is_ours;
-                    if t == NET_MSG_ERROR && rd >= 3 {
-                        let conn_id = s.net_scratch[0];
-                        let in_tag = s.net_scratch[2]; // IP-echoed requester tag
-                        let si = find_session_by_conn_id(s, conn_id);
-                        if si >= 0 {
-                            // Established-connection error → its session's tag.
-                            s.net_scratch[2] = s.sessions[si as usize].downstream_tag;
-                        } else if s.pending_connect_active && in_tag == dev_requester_tag(sys) {
-                            // A CONNECT failure routed to TLS carries TLS's own
-                            // tag (TLS stamped it). Only THEN consume the pending
-                            // slot — a co-wired consumer's failure (different tag)
-                            // must not cancel our connect.
-                            s.pending_connect_active = false;
-                            s.net_scratch[2] = s.pending_downstream_tag;
-                            s.pending_downstream_tag = 0;
-                        } else {
-                            // Another consumer's error on the shared fan, or an
-                            // error for a conn we don't own — not for HTTP. Drop.
-                            forward = false;
-                        }
-                    }
-                    if forward {
-                        tls_write_raw_frame(sys, s.clear_out, t, s.net_scratch.as_ptr(), rd as u16);
+                        // Another consumer's error on the shared fan, or an
+                        // error for a conn we don't own — not for HTTP. Drop.
+                        forward = false;
                     }
                 }
-                t if t == NET_MSG_ACK => {
-                    // Payload: [conn_id:1][acked_seq:4 LE].
-                    let pl = payload_len as usize;
-                    let mut payload = [0u8; 5];
-                    let rd = if pl < 5 { pl } else { 5 };
-                    if rd > 0 {
-                        (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
-                    }
-                    if pl > rd {
-                        tls_discard(sys, s.cipher_in, pl - rd);
-                    }
-                    if rd == 5 {
-                        let conn_id = payload[0];
-                        let acked_seq =
-                            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                        let si = find_session_by_conn_id(s, conn_id);
-                        if si >= 0 {
-                            retx_ack(&mut s.sessions[si as usize], acked_seq);
-                        }
+                if forward {
+                    tls_write_raw_frame(sys, s.clear_out, t, s.net_scratch.as_ptr(), rd as u16);
+                }
+            }
+            t if t == NET_MSG_ACK => {
+                // Payload: [conn_id:1][acked_seq:4 LE].
+                let pl = payload_len as usize;
+                let mut payload = [0u8; 5];
+                let rd = if pl < 5 { pl } else { 5 };
+                if rd > 0 {
+                    (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
+                }
+                if pl > rd {
+                    tls_discard(sys, s.cipher_in, pl - rd);
+                }
+                if rd == 5 {
+                    let conn_id = payload[0];
+                    let acked_seq =
+                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                    let si = find_session_by_conn_id(s, conn_id);
+                    if si >= 0 {
+                        retx_ack(&mut s.sessions[si as usize], acked_seq);
                     }
                 }
-                t if t == NET_MSG_RETRANSMIT => {
-                    // Payload: [conn_id:1][from_seq:4 LE].
-                    let pl = payload_len as usize;
-                    let mut payload = [0u8; 5];
-                    let rd = if pl < 5 { pl } else { 5 };
-                    if rd > 0 {
-                        (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
-                    }
-                    if pl > rd {
-                        tls_discard(sys, s.cipher_in, pl - rd);
-                    }
-                    if rd == 5 {
-                        let conn_id = payload[0];
-                        let from_seq =
-                            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                        let si = find_session_by_conn_id(s, conn_id);
-                        if si >= 0 {
-                            retx_replay(s, si as usize, from_seq);
-                        }
+            }
+            t if t == NET_MSG_RETRANSMIT => {
+                // Payload: [conn_id:1][from_seq:4 LE].
+                let pl = payload_len as usize;
+                let mut payload = [0u8; 5];
+                let rd = if pl < 5 { pl } else { 5 };
+                if rd > 0 {
+                    (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
+                }
+                if pl > rd {
+                    tls_discard(sys, s.cipher_in, pl - rd);
+                }
+                if rd == 5 {
+                    let conn_id = payload[0];
+                    let from_seq =
+                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                    let si = find_session_by_conn_id(s, conn_id);
+                    if si >= 0 {
+                        retx_replay(s, si as usize, from_seq);
                     }
                 }
-                t if t == NET_MSG_TRACE_CTX => {
-                    // Observability: IP's trace context for this connection.
-                    // Parent the `tls.handshake` span under IP's span, then
-                    // forward downstream (clear_out → HTTP) with TLS's own span
-                    // id so HTTP parents under it. Best-effort; payload always
-                    // consumed to stay frame-aligned.
-                    let pl = payload_len as usize;
-                    let mut pbuf = [0u8; 32];
-                    let rd = if pl < 32 { pl } else { 32 };
-                    if rd > 0 {
-                        (sys.channel_read)(s.cipher_in, pbuf.as_mut_ptr(), rd);
-                    }
-                    if pl > 32 {
-                        tls_discard(sys, s.cipher_in, pl - 32);
-                    }
-                    if pl >= abi::contracts::net::net_proto::TRACE_CTX_LEN && s.telemetry_chan >= 0
-                    {
-                        let conn_id = pbuf[0];
-                        let si = find_session_by_conn_id(s, conn_id);
-                        if si >= 0 {
-                            let idx = si as usize;
-                            // Latch IP's trace context. It is forwarded to HTTP
-                            // only AFTER the held MSG_ACCEPTED (at handshake
-                            // completion) — HTTP drops context for a conn_id it
-                            // hasn't accepted yet, so forwarding it now (before
-                            // the held accept) would lose the parenting.
-                            s.sessions[idx]
-                                .trace_ctx_trace
-                                .copy_from_slice(&pbuf[1..17]);
-                            s.sessions[idx]
-                                .trace_ctx_parent
-                                .copy_from_slice(&pbuf[17..25]);
-                            s.sessions[idx].trace_ctx_flags = pbuf[25];
-                        }
+            }
+            t if t == NET_MSG_TRACE_CTX => {
+                // Observability: IP's trace context for this connection.
+                // Parent the `tls.handshake` span under IP's span, then
+                // forward downstream (clear_out → HTTP) with TLS's own span
+                // id so HTTP parents under it. Best-effort; payload always
+                // consumed to stay frame-aligned.
+                let pl = payload_len as usize;
+                let mut pbuf = [0u8; 32];
+                let rd = if pl < 32 { pl } else { 32 };
+                if rd > 0 {
+                    (sys.channel_read)(s.cipher_in, pbuf.as_mut_ptr(), rd);
+                }
+                if pl > 32 {
+                    tls_discard(sys, s.cipher_in, pl - 32);
+                }
+                if pl >= abi::contracts::net::net_proto::TRACE_CTX_LEN && s.telemetry_chan >= 0 {
+                    let conn_id = pbuf[0];
+                    let si = find_session_by_conn_id(s, conn_id);
+                    if si >= 0 {
+                        let idx = si as usize;
+                        // Latch IP's trace context. It is forwarded to HTTP
+                        // only AFTER the held MSG_ACCEPTED (at handshake
+                        // completion) — HTTP drops context for a conn_id it
+                        // hasn't accepted yet, so forwarding it now (before
+                        // the held accept) would lose the parenting.
+                        s.sessions[idx]
+                            .trace_ctx_trace
+                            .copy_from_slice(&pbuf[1..17]);
+                        s.sessions[idx]
+                            .trace_ctx_parent
+                            .copy_from_slice(&pbuf[17..25]);
+                        s.sessions[idx].trace_ctx_flags = pbuf[25];
                     }
                 }
-                _ => {
-                    // Unknown — discard
-                    tls_discard(sys, s.cipher_in, payload_len as usize);
-                }
+            }
+            _ => {
+                // Unknown — discard
+                tls_discard(sys, s.cipher_in, payload_len as usize);
             }
         }
     }
@@ -1521,222 +1566,228 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let t2 = if diag_on { dev_micros(sys) } else { 0 };
 
     // ── Phase 3: Read from clear_in (upstream: HTTP → TLS) ──
-    let poll_cl = (sys.channel_poll)(s.clear_in, POLL_IN);
-    if poll_cl > 0 && (poll_cl as u32 & POLL_IN) != 0 {
+    let mut cl_drained = 0u32;
+    while cl_drained < TLS_INBOUND_DRAIN_BUDGET {
+        let poll_cl = (sys.channel_poll)(s.clear_in, POLL_IN);
+        if poll_cl <= 0 || (poll_cl as u32 & POLL_IN) == 0 {
+            break;
+        }
         let (msg_type, payload_len) = tls_read_header(sys, s.clear_in);
-        if msg_type != 0 {
-            did_work = true;
-            // Clear-side ingress (HTTP → TLS), same chokepoint argument as
-            // the cipher_in counter above. Comparable with `[http] tlm tx`.
-            s.clear_in_bytes = s.clear_in_bytes.wrapping_add(3 + payload_len as u32);
-            match msg_type {
-                t if t == NET_CMD_SEND => {
-                    // Encrypt and forward as CMD_SEND on cipher_out
-                    let pl = payload_len as usize;
-                    if pl < 1 {
-                        // Malformed
-                    } else {
-                        let mut conn_id_buf = [0u8; 1];
-                        (sys.channel_read)(s.clear_in, conn_id_buf.as_mut_ptr(), 1);
-                        let conn_id = conn_id_buf[0];
-                        let data_len = pl - 1;
-                        let si = find_session_by_conn_id(s, conn_id);
-                        if si >= 0 {
-                            let idx = si as usize;
-                            if s.sessions[idx].state == SessionState::Ready && data_len > 0 {
-                                // Split bodies larger than one wire
-                                // record into multiple application_data
-                                // records. Chunk size leaves room for
-                                // the 5-byte record header, content-type
-                                // trailer, AEAD tag, and outer framing.
-                                const CLEAR_CHUNK_MAX: usize = NET_SCRATCH_SIZE - 5 - 16 - 1 - 4;
-                                let mut remaining = data_len;
-                                while remaining > 0 {
-                                    let rd = remaining.min(CLEAR_CHUNK_MAX);
+        if msg_type == 0 {
+            break;
+        }
+        cl_drained += 1;
+        s.adv_items = s.adv_items.wrapping_add(1);
+        did_work = true;
+        // Clear-side ingress (HTTP → TLS), same chokepoint argument as
+        // the cipher_in counter above. Comparable with `[http] tlm tx`.
+        s.clear_in_bytes = s.clear_in_bytes.wrapping_add(3 + payload_len as u32);
+        match msg_type {
+            t if t == NET_CMD_SEND => {
+                // Encrypt and forward as CMD_SEND on cipher_out
+                let pl = payload_len as usize;
+                if pl < 1 {
+                    // Malformed
+                } else {
+                    let mut conn_id_buf = [0u8; 1];
+                    (sys.channel_read)(s.clear_in, conn_id_buf.as_mut_ptr(), 1);
+                    let conn_id = conn_id_buf[0];
+                    let data_len = pl - 1;
+                    let si = find_session_by_conn_id(s, conn_id);
+                    if si >= 0 {
+                        let idx = si as usize;
+                        if s.sessions[idx].state == SessionState::Ready && data_len > 0 {
+                            // Split bodies larger than one wire
+                            // record into multiple application_data
+                            // records. Chunk size leaves room for
+                            // the 5-byte record header, content-type
+                            // trailer, AEAD tag, and outer framing.
+                            const CLEAR_CHUNK_MAX: usize = NET_SCRATCH_SIZE - 5 - 16 - 1 - 4;
+                            let mut remaining = data_len;
+                            while remaining > 0 {
+                                let rd = remaining.min(CLEAR_CHUNK_MAX);
 
-                                    // Read plaintext directly into the
-                                    // wire-record buffer so encrypt
-                                    // happens in place (saves two memcpys
-                                    // vs the prior staged path).
-                                    let mut rec = [0u8; SEND_BUF_SIZE + 5];
-                                    (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
+                                // Read plaintext directly into the
+                                // wire-record buffer so encrypt
+                                // happens in place (saves two memcpys
+                                // vs the prior staged path).
+                                let mut rec = [0u8; SEND_BUF_SIZE + 5];
+                                (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
 
-                                    let sess = &mut s.sessions[idx];
-                                    let enc_payload_len = encrypt_record_in_place(
-                                        sess.driver.suite,
-                                        &mut sess.write_keys,
-                                        CT_APPLICATION_DATA,
-                                        rd,
-                                        &mut rec[5..],
-                                    );
-                                    // Header written AFTER encrypt so
-                                    // length reflects the actual
-                                    // payload, including seq-wrap
-                                    // (enc_payload_len == 0).
-                                    *rec.as_mut_ptr() = CT_APPLICATION_DATA;
-                                    *rec.as_mut_ptr().add(1) = 0x03;
-                                    *rec.as_mut_ptr().add(2) = 0x03;
-                                    *rec.as_mut_ptr().add(3) = (enc_payload_len >> 8) as u8;
-                                    *rec.as_mut_ptr().add(4) = enc_payload_len as u8;
-                                    let total = 5 + enc_payload_len;
+                                let sess = &mut s.sessions[idx];
+                                let enc_payload_len = encrypt_record_in_place(
+                                    sess.driver.suite,
+                                    &mut sess.write_keys,
+                                    CT_APPLICATION_DATA,
+                                    rd,
+                                    &mut rec[5..],
+                                );
+                                // Header written AFTER encrypt so
+                                // length reflects the actual
+                                // payload, including seq-wrap
+                                // (enc_payload_len == 0).
+                                *rec.as_mut_ptr() = CT_APPLICATION_DATA;
+                                *rec.as_mut_ptr().add(1) = 0x03;
+                                *rec.as_mut_ptr().add(2) = 0x03;
+                                *rec.as_mut_ptr().add(3) = (enc_payload_len >> 8) as u8;
+                                *rec.as_mut_ptr().add(4) = enc_payload_len as u8;
+                                let total = 5 + enc_payload_len;
 
-                                    // The AEAD seq has already advanced;
-                                    // dropping this record would desync
-                                    // the peer permanently. Fail the
-                                    // session loudly instead.
-                                    let sent = tls_write_frame(
-                                        sys,
-                                        s.cipher_out,
-                                        NET_CMD_SEND,
-                                        conn_id,
-                                        rec.as_ptr(),
-                                        total as u16,
-                                        &mut s.net_scratch,
-                                    );
-                                    if sent {
-                                        // Encrypted application records —
-                                        // the response path, and the bulk of
-                                        // cipher_out under keepalive load.
-                                        s.tlm.bytes_out =
-                                            s.tlm.bytes_out.wrapping_add(4 + total as u32);
-                                    }
-                                    if !sent {
-                                        let msg: &[u8] =
-                                            b"[tls] cipher_out full mid-record; session->Error";
-                                        dev_log(sys, 3, msg.as_ptr(), msg.len());
-                                        s.frame_write_dropped =
-                                            s.frame_write_dropped.wrapping_add(1);
-                                        s.sessions[idx].state = SessionState::Error;
-                                        if remaining > rd {
-                                            // Drop the rest of the
-                                            // incoming clear send;
-                                            // session is already
-                                            // Errored.
-                                            tls_discard(sys, s.clear_in, remaining - rd);
-                                        }
-                                        break;
-                                    }
-                                    retx_push(&mut s.sessions[idx], rec.as_ptr(), total as u16);
-                                    remaining -= rd;
+                                // The AEAD seq has already advanced;
+                                // dropping this record would desync
+                                // the peer permanently. Fail the
+                                // session loudly instead.
+                                let sent = tls_write_frame(
+                                    sys,
+                                    s.cipher_out,
+                                    NET_CMD_SEND,
+                                    conn_id,
+                                    rec.as_ptr(),
+                                    total as u16,
+                                    &mut s.net_scratch,
+                                );
+                                if sent {
+                                    // Encrypted application records —
+                                    // the response path, and the bulk of
+                                    // cipher_out under keepalive load.
+                                    s.tlm.bytes_out =
+                                        s.tlm.bytes_out.wrapping_add(4 + total as u32);
                                 }
-                            } else {
-                                tls_discard(sys, s.clear_in, data_len);
+                                if !sent {
+                                    let msg: &[u8] =
+                                        b"[tls] cipher_out full mid-record; session->Error";
+                                    dev_log(sys, 3, msg.as_ptr(), msg.len());
+                                    s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
+                                    s.sessions[idx].state = SessionState::Error;
+                                    if remaining > rd {
+                                        // Drop the rest of the
+                                        // incoming clear send;
+                                        // session is already
+                                        // Errored.
+                                        tls_discard(sys, s.clear_in, remaining - rd);
+                                    }
+                                    break;
+                                }
+                                retx_push(&mut s.sessions[idx], rec.as_ptr(), total as u16);
+                                remaining -= rd;
                             }
                         } else {
                             tls_discard(sys, s.clear_in, data_len);
                         }
-                    }
-                }
-                t if t == NET_CMD_CLOSE => {
-                    let pl = payload_len as usize;
-                    let mut payload = [0u8; 16];
-                    let rd = if pl < 16 { pl } else { 16 };
-                    if rd > 0 {
-                        (sys.channel_read)(s.clear_in, payload.as_mut_ptr(), rd);
-                    }
-                    if pl > 16 {
-                        tls_discard(sys, s.clear_in, pl - 16);
-                    }
-                    let conn_id = if pl > 0 { payload[0] } else { 0 };
-                    // Send close_notify alert if session is ready
-                    let si = find_session_by_conn_id(s, conn_id);
-                    if si >= 0 {
-                        let idx = si as usize;
-                        if s.sessions[idx].state == SessionState::Ready {
-                            send_alert(s, idx, ALERT_CLOSE_NOTIFY);
-                        }
-                        s.sessions[idx].reset();
-                    }
-                    // Forward CMD_CLOSE to cipher_out — best-effort.
-                    let _ = tls_write_or_count(
-                        s,
-                        s.cipher_out,
-                        NET_CMD_CLOSE,
-                        conn_id,
-                        core::ptr::null(),
-                        0,
-                    );
-                }
-                t if t == NET_CMD_BIND || t == NET_CMD_CONNECT => {
-                    // Forward to cipher_out (toward IP). For CMD_CONNECT, STAMP
-                    // the requester tag (byte 7) with TLS's own module index so
-                    // IP echoes it in MSG_CONNECTED and TLS — not a co-wired
-                    // exporter sharing ip.net_out — claims the resulting outbound
-                    // connection. CMD_BIND passes through unchanged.
-                    let pl = payload_len as usize;
-                    let mut rd = if pl < NET_SCRATCH_SIZE {
-                        pl
                     } else {
-                        NET_SCRATCH_SIZE
-                    };
-                    if rd > 0 {
-                        (sys.channel_read)(s.clear_in, s.net_scratch.as_mut_ptr(), rd);
+                        tls_discard(sys, s.clear_in, data_len);
                     }
-                    if pl > rd {
-                        tls_discard(sys, s.clear_in, pl - rd);
+                }
+            }
+            t if t == NET_CMD_CLOSE => {
+                let pl = payload_len as usize;
+                let mut payload = [0u8; 16];
+                let rd = if pl < 16 { pl } else { 16 };
+                if rd > 0 {
+                    (sys.channel_read)(s.clear_in, payload.as_mut_ptr(), rd);
+                }
+                if pl > 16 {
+                    tls_discard(sys, s.clear_in, pl - 16);
+                }
+                let conn_id = if pl > 0 { payload[0] } else { 0 };
+                // Send close_notify alert if session is ready
+                let si = find_session_by_conn_id(s, conn_id);
+                if si >= 0 {
+                    let idx = si as usize;
+                    if s.sessions[idx].state == SessionState::Ready {
+                        send_alert(s, idx, ALERT_CLOSE_NOTIFY);
                     }
-                    let mut forward = true;
-                    // For a CMD_CONNECT we're about to forward: the downstream tag
-                    // to latch, deferred until the upstream write actually lands.
-                    let mut arm_pending: Option<u8> = None;
-                    if t == NET_CMD_CONNECT && rd >= 7 && rd < NET_SCRATCH_SIZE {
-                        let new_tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
-                        if s.pending_connect_active {
-                            // SERIALIZE: a connect is already in flight and TLS
-                            // routes all mediated connects through its single tag,
-                            // so a second concurrent connect would clobber the
-                            // pending correlation. Reject it downstream with EAGAIN
-                            // (translated to the new request's tag) and DON'T
-                            // forward — the clear-side consumer retries.
-                            let err = [(-11i8) as u8, new_tag]; // EAGAIN + downstream tag
-                            let _ = tls_write_or_count(
-                                s,
-                                s.clear_out,
-                                NET_MSG_ERROR,
-                                0,
-                                err.as_ptr(),
-                                err.len() as u16,
-                            );
-                            forward = false;
-                        } else {
-                            // Remember the clear-side consumer's original tag, then
-                            // overwrite byte 7 with TLS's own tag so IP routes the
-                            // completion to TLS. Defer marking the connect pending
-                            // until the forward below actually succeeds.
-                            if rd == 7 {
-                                rd = 8;
-                            }
-                            s.net_scratch[7] = dev_requester_tag(sys);
-                            arm_pending = Some(new_tag);
-                        }
-                    }
-                    // Remember the port from OUR CMD_BIND so we can match
-                    // the corresponding MSG_BOUND on a shared fan (F5).
-                    if t == NET_CMD_BIND && rd >= 2 {
-                        s.bind_port = (s.net_scratch[0] as u16) | ((s.net_scratch[1] as u16) << 8);
-                    }
-                    if forward {
-                        let wrote = tls_write_raw_frame(
-                            sys,
-                            s.cipher_out,
-                            t,
-                            s.net_scratch.as_ptr(),
-                            rd as u16,
+                    s.sessions[idx].reset();
+                }
+                // Forward CMD_CLOSE to cipher_out — best-effort.
+                let _ = tls_write_or_count(
+                    s,
+                    s.cipher_out,
+                    NET_CMD_CLOSE,
+                    conn_id,
+                    core::ptr::null(),
+                    0,
+                );
+            }
+            t if t == NET_CMD_BIND || t == NET_CMD_CONNECT => {
+                // Forward to cipher_out (toward IP). For CMD_CONNECT, STAMP
+                // the requester tag (byte 7) with TLS's own module index so
+                // IP echoes it in MSG_CONNECTED and TLS — not a co-wired
+                // exporter sharing ip.net_out — claims the resulting outbound
+                // connection. CMD_BIND passes through unchanged.
+                let pl = payload_len as usize;
+                let mut rd = if pl < NET_SCRATCH_SIZE {
+                    pl
+                } else {
+                    NET_SCRATCH_SIZE
+                };
+                if rd > 0 {
+                    (sys.channel_read)(s.clear_in, s.net_scratch.as_mut_ptr(), rd);
+                }
+                if pl > rd {
+                    tls_discard(sys, s.clear_in, pl - rd);
+                }
+                let mut forward = true;
+                // For a CMD_CONNECT we're about to forward: the downstream tag
+                // to latch, deferred until the upstream write actually lands.
+                let mut arm_pending: Option<u8> = None;
+                if t == NET_CMD_CONNECT && rd >= 7 && rd < NET_SCRATCH_SIZE {
+                    let new_tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
+                    if s.pending_connect_active {
+                        // SERIALIZE: a connect is already in flight and TLS
+                        // routes all mediated connects through its single tag,
+                        // so a second concurrent connect would clobber the
+                        // pending correlation. Reject it downstream with EAGAIN
+                        // (translated to the new request's tag) and DON'T
+                        // forward — the clear-side consumer retries.
+                        let err = [(-11i8) as u8, new_tag]; // EAGAIN + downstream tag
+                        let _ = tls_write_or_count(
+                            s,
+                            s.clear_out,
+                            NET_MSG_ERROR,
+                            0,
+                            err.as_ptr(),
+                            err.len() as u16,
                         );
-                        // Latch pending ONLY after the connect was actually
-                        // written upstream — a dropped write must not wedge the
-                        // single pending slot (the consumer retries).
-                        if wrote {
-                            if let Some(dtag) = arm_pending {
-                                s.pending_downstream_tag = dtag;
-                                s.pending_connect_active = true;
-                            }
+                        forward = false;
+                    } else {
+                        // Remember the clear-side consumer's original tag, then
+                        // overwrite byte 7 with TLS's own tag so IP routes the
+                        // completion to TLS. Defer marking the connect pending
+                        // until the forward below actually succeeds.
+                        if rd == 7 {
+                            rd = 8;
+                        }
+                        s.net_scratch[7] = dev_requester_tag(sys);
+                        arm_pending = Some(new_tag);
+                    }
+                }
+                // Remember the port from OUR CMD_BIND so we can match
+                // the corresponding MSG_BOUND on a shared fan (F5).
+                if t == NET_CMD_BIND && rd >= 2 {
+                    s.bind_port = (s.net_scratch[0] as u16) | ((s.net_scratch[1] as u16) << 8);
+                }
+                if forward {
+                    let wrote = tls_write_raw_frame(
+                        sys,
+                        s.cipher_out,
+                        t,
+                        s.net_scratch.as_ptr(),
+                        rd as u16,
+                    );
+                    // Latch pending ONLY after the connect was actually
+                    // written upstream — a dropped write must not wedge the
+                    // single pending slot (the consumer retries).
+                    if wrote {
+                        if let Some(dtag) = arm_pending {
+                            s.pending_downstream_tag = dtag;
+                            s.pending_connect_active = true;
                         }
                     }
                 }
-                _ => {
-                    tls_discard(sys, s.clear_in, payload_len as usize);
-                }
+            }
+            _ => {
+                tls_discard(sys, s.clear_in, payload_len as usize);
             }
         }
     }
@@ -1803,6 +1854,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // back-pressure step, however many frames it dropped — one classifier
     // per step keeps `idle + bp + active == dt`, which is the property that
     // makes the line answer "is TLS starved, blocked, or busy?".
+
+    // Did this step leave work on the table? Either inbound side still
+    // readable means we stopped with frames pending — see `pend_steps`.
+    {
+        let ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
+        let cl = (sys.channel_poll)(s.clear_in, POLL_IN);
+        let ci_ready = ci > 0 && (ci as u32 & POLL_IN) != 0;
+        let cl_ready = cl > 0 && (cl as u32 & POLL_IN) != 0;
+        if ci_ready || cl_ready {
+            s.pend_steps = s.pend_steps.wrapping_add(1);
+        }
+    }
     if s.frame_write_dropped != s.fwd_pre_step {
         s.tlm.bp_steps = s.tlm.bp_steps.wrapping_add(1);
     }

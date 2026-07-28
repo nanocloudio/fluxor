@@ -448,6 +448,7 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
         "[https_load] startup target={} pre_boot_wait={}s boot_wait={}s probe=manual-rustls",
         cfg.base_url, cfg.pre_boot_wait_s, cfg.boot_wait_s,
     ));
+    emit_line(&host_state_line("pre"));
 
     // Sleep past the rig's power-cycle window. Without this delay the
     // warm-up loop may succeed against the *previous* kernel still
@@ -892,10 +893,47 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
         || s_err_n > 0
         || tp_mbps < cfg.throughput_floor_mbps
         || c_ok != target_total;
+    emit_line(&host_state_line("post"));
     emit_line(&format!(
         "[https_load] done phases=4 any_err={any_err} hs_rate_hps={hs_rate:.2} tp_rate_rps={tp_rate:.2} tp_mbps={tp_mbps:.3} conc_rate_rps={c_rate:.2} conc_ok={c_ok}/{target_total} stab_ok={s_ok_n}/{total_reqs}",
     ));
     Ok(())
+}
+
+/// State of the machine running the probe, emitted at `pre` and `post`.
+///
+/// This probe is closed-loop: it paces itself to whatever the driver host can
+/// issue, and reports the result as a property of the DUT. A throttled or
+/// contended host therefore presents as a slow server, and without this line
+/// nothing in the run distinguishes the two — a thermally throttled driver
+/// shows up as a monotonic throughput decline, and a loaded one as request
+/// timeouts whose SYNs never reached the device while the DUT's own accounting
+/// stays perfect. Both are attributable only if the measuring machine is on
+/// record.
+///
+/// Linux-specific and best-effort: a missing source degrades to `?` rather
+/// than failing a run.
+fn host_state_line(when: &str) -> String {
+    let temp_c = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|milli| format!("{:.1}", milli as f64 / 1000.0))
+        .unwrap_or_else(|| "?".into());
+    // Sticky "has occurred" bits (16-19) survive the event, so a run that was
+    // throttled at any point is visible even if it has since recovered.
+    let throttled = std::process::Command::new("vcgencmd")
+        .arg("get_throttled")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().split('=').nth(1).map(str::to_owned))
+        .unwrap_or_else(|| "?".into());
+    let loadavg = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+        .unwrap_or_else(|| "?".into());
+    format!("[https_load] host {when} temp_c={temp_c} throttled={throttled} load1={loadavg}")
 }
 
 /// Per-request latency breakdown. All fields in microseconds; sum

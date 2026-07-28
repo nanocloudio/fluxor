@@ -721,6 +721,16 @@ struct Fat32State {
     /// bloated root dir. Bench/clean-slate only.
     clean_root: u32,
 
+    /// Device rc recorded by the synchronous FS_CONTRACT helpers when a
+    /// block read/write fails inside an Option/sentinel-returning
+    /// function (`fs_dir_lookup`, `fs_scan_dir`, `fs_alloc_extent`, …)
+    /// whose signature cannot carry an errno. Cleared at each
+    /// FS_CONTRACT entry point; consulted by `fs_io_errno` so a device
+    /// failure is not collapsed into a hard ENOENT/EIO/ENOSPC — which
+    /// durability-grade callers rightly treat as fatal (quarantine), or
+    /// worse, as "file missing" (truncate-create over a live file).
+    io_rc: i32,
+
     /// Chain heads queued by `FS_UNLINK` for lazy freeing, drained by
     /// `fs_step_free_chains` one FAT-sector batch per step. Each slot is
     /// the next cluster to free in that chain (the cursor advances across
@@ -763,6 +773,7 @@ impl Fat32State {
         self.fsinfo_sector = 0;
         self.init_phase = Fat32InitPhase::Idle;
         self.next_free_hint = 2;
+        self.io_rc = 0;
         self.unlink_free = [0; UNLINK_FREE_SLOTS];
         self.file_count = 0;
         self.dir_cluster = 0;
@@ -1288,13 +1299,44 @@ unsafe fn fs_read_fat_entry(s: &mut Fat32State, cluster: u32) -> u32 {
     let fat_lba = fat_sector_for_cluster(s, cluster);
     let mut buf = [0u8; BLOCK_SIZE];
     let rc = fs_sync_read_sector(s, fat_lba, buf.as_mut_ptr());
-    if rc != 0 { return FAT32_EOC; }
+    if rc != 0 { fs_note_io(s, rc); return FAT32_EOC; }
     let off = fat_offset_for_cluster(s, cluster);
     if off + 4 > BLOCK_SIZE { return FAT32_EOC; }
     let raw = u32::from_le_bytes([
         buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
     ]) & FAT32_MASK;
     if raw == 0 || raw >= FAT32_EOC { FAT32_EOC } else { raw }
+}
+
+/// Record a device-I/O failure observed inside an Option/sentinel-
+/// returning helper (see `Fat32State::io_rc`). First failure wins.
+#[inline]
+fn fs_note_io(s: &mut Fat32State, rc: i32) {
+    if rc != 0 && s.io_rc == 0 {
+        s.io_rc = rc;
+    }
+}
+
+/// Errno for a device rc that reached the caller directly: `E_AGAIN`
+/// stays `E_AGAIN` (transient — nvme busy or still initialising, the
+/// caller retries next step), anything else is EIO. Collapsing a
+/// transient into EIO makes durability-grade callers quarantine on a
+/// hiccup.
+#[inline]
+fn fs_rc_errno(rc: i32) -> i32 {
+    if rc == E_AGAIN { E_AGAIN } else { -5 } // EIO
+}
+
+/// Errno for a failed resolve/scan/alloc at an FS_CONTRACT entry
+/// point: a recorded device rc wins (see [`fs_rc_errno`]), otherwise
+/// the semantic `default` (ENOENT, ENOSPC, …).
+#[inline]
+fn fs_io_errno(s: &Fat32State, default: i32) -> i32 {
+    if s.io_rc == 0 {
+        default
+    } else {
+        fs_rc_errno(s.io_rc)
+    }
 }
 
 /// Convert a path component to a FAT 8.3 short name (11 bytes,
@@ -1358,7 +1400,9 @@ unsafe fn fs_dir_lookup(
         let mut sec = 0u32;
         while sec < spc {
             let lba = cluster_first_sector + sec;
-            if fs_sync_read_sector(s, lba, buf.as_mut_ptr()) != 0 {
+            let rrc = fs_sync_read_sector(s, lba, buf.as_mut_ptr());
+            if rrc != 0 {
+                fs_note_io(s, rrc);
                 return None;
             }
             let mut e = 0usize;
@@ -1444,10 +1488,14 @@ unsafe fn fs_resolve_path(s: &mut Fat32State, path: &[u8]) -> Option<ResolvedFil
 unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len == 0 { return E_INVAL; }
     if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let resolved = match fs_resolve_path(s, path) {
         Some(r) => r,
-        None => return -2, // ENOENT
+        // A resolve that failed on a device read is not "no such file" —
+        // reporting ENOENT here makes callers truncate-create over a live
+        // file. Surface the real errno.
+        None => return fs_io_errno(s, -2), // ENOENT only when truly absent
     };
     // Allocate slot.
     let mut slot: i32 = -1;
@@ -1766,10 +1814,11 @@ unsafe fn fs_resolve_dir_path(s: &mut Fat32State, path: &[u8]) -> Option<u32> {
 unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len == 0 { return E_INVAL; }
     if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let dir_cluster = match fs_resolve_dir_path(s, path) {
         Some(c) => c,
-        None => return -2, // ENOENT
+        None => return fs_io_errno(s, -2), // ENOENT only when truly absent
     };
     let mut slot: i32 = -1;
     let mut k = 0usize;
@@ -1813,6 +1862,7 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
     if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
     if s.open_files[slot_idx].is_dir == 0 { return E_INVAL; }
     if s.open_files[slot_idx].dir_eof != 0 { return 0; }
+    s.io_rc = 0;
 
     let spc = s.sectors_per_cluster as u32;
     if spc == 0 { return E_AGAIN; }
@@ -1835,6 +1885,13 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
             // Cluster exhausted — walk the FAT chain.
             let next = fs_read_fat_entry(s, cur_cluster);
             if next >= FAT32_EOC {
+                if s.io_rc != 0 {
+                    // FAT read failed — that's an I/O error, not end of
+                    // directory. Latching dir_eof here would silently
+                    // truncate the listing (recovery would then treat
+                    // missing entries as deleted files).
+                    return fs_rc_errno(s.io_rc);
+                }
                 s.open_files[slot_idx].dir_eof = 1;
                 break;
             }
@@ -1844,10 +1901,11 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
             continue;
         }
         let lba = cluster_first_sector + sec;
-        if fs_sync_read_sector(s, lba, buf.as_mut_ptr()) != 0 {
-            // I/O error reading directory sector — surface ENOENT-ish
-            // and don't advance so the caller can retry / give up.
-            return -5; // EIO
+        let rrc = fs_sync_read_sector(s, lba, buf.as_mut_ptr());
+        if rrc != 0 {
+            // I/O error reading a directory sector — don't advance the
+            // cursor, so the caller can retry.
+            return fs_rc_errno(rrc);
         }
         let mut e = s.open_files[slot_idx].offset as usize;
         while e < entries_per_sector {
@@ -2074,7 +2132,8 @@ unsafe fn fs_scan_free_clusters(s: &mut Fat32State, lo: u32, hi: u32) -> u32 {
     let mut c = if lo < 2 { 2 } else { lo };
     while c < hi {
         let fat_sec = fat_sector_for_cluster(s, c);
-        if fs_read_blockbuf(s, fat_sec) != 0 { return 0; }
+        let rrc = fs_read_blockbuf(s, fat_sec);
+        if rrc != 0 { fs_note_io(s, rrc); return 0; }
         let first_in_sec = (fat_sec - s.fat_start_sector).wrapping_mul(eps);
         let end = first_in_sec + eps;
         let mut cc = c;
@@ -2171,7 +2230,9 @@ unsafe fn fs_alloc_extent(s: &mut Fat32State, prev: u32) -> (u32, u8) {
     let mut fi: u32 = 0;
     while fi < s.num_fats as u32 {
         let sec = s.fat_start_sector + fi * s.fat_size_32 + rel;
-        if fs_sync_write_sector(s, sec, s.block_buf.as_ptr()) != 0 {
+        let wrc = fs_sync_write_sector(s, sec, s.block_buf.as_ptr());
+        if wrc != 0 {
+            fs_note_io(s, wrc);
             return (0, 0);
         }
         fi += 1;
@@ -2181,8 +2242,12 @@ unsafe fn fs_alloc_extent(s: &mut Fat32State, prev: u32) -> (u32, u8) {
     // extent is durable in the FAT. An interruption can leak the new extent,
     // but can never leave the live file chain pointing into an uninitialised
     // allocation.
-    if prev >= 2 && !prev_inline && fs_write_fat_entry(s, prev, cc) != 0 {
-        return (0, 0);
+    if prev >= 2 && !prev_inline {
+        let lrc = fs_write_fat_entry(s, prev, cc);
+        if lrc != 0 {
+            fs_note_io(s, lrc);
+            return (0, 0);
+        }
     }
 
     s.next_free_hint = last + 1;
@@ -2215,14 +2280,17 @@ unsafe fn fs_op_unlink(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     if arg.is_null() || arg_len == 0 { return E_INVAL; }
     if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
     if s.root_cluster < 2 { return E_AGAIN; }
+    s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let (parent, want) = match fs_split_parent(s, path) {
         Some(p) => p,
-        None => return -2, // ENOENT
+        None => return fs_io_errno(s, -2), // ENOENT only when truly absent
     };
     let loc = match fs_scan_dir(s, parent, &want) {
         Some(l) if l.exists => l,
-        _ => return -2, // ENOENT (free slot / full dir both mean "no such file")
+        // Free slot / full dir both mean "no such file" — but a failed
+        // device read during the scan must keep its own errno.
+        _ => return fs_io_errno(s, -2), // ENOENT
     };
     if loc.is_dir { return -21; } // EISDIR — directory removal is not in the UNLINK surface
     let mut k = 0usize;
@@ -2239,9 +2307,11 @@ unsafe fn fs_op_unlink(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     // Namespace removal first: durably mark the entry deleted. After this
     // sector lands, OPEN/OPEN_CREATE no longer resolve the name; a crash
     // before the chain drain merely leaks clusters.
-    if fs_read_blockbuf(s, loc.lba) != 0 { return -5; } // EIO
+    let rrc = fs_read_blockbuf(s, loc.lba);
+    if rrc != 0 { return fs_rc_errno(rrc); }
     s.block_buf[loc.off as usize] = 0xE5;
-    if fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr()) != 0 { return -5; }
+    let wrc = fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr());
+    if wrc != 0 { return fs_rc_errno(wrc); }
     if loc.start_cluster >= 2 {
         let mut q = 0usize;
         loop {
@@ -2469,7 +2539,8 @@ unsafe fn fs_scan_dir(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11]) -> 
         let mut sec: u32 = 0;
         while sec < spc {
             let lba = first_sec + sec;
-            if fs_read_blockbuf(s, lba) != 0 { return None; }
+            let rrc = fs_read_blockbuf(s, lba);
+            if rrc != 0 { fs_note_io(s, rrc); return None; }
             let mut e: usize = 0;
             while e < BLOCK_SIZE {
                 let b0 = s.block_buf[e];
@@ -2575,10 +2646,11 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     if arg.is_null() || arg_len == 0 { return E_INVAL; }
     if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
     if s.root_cluster < 2 { return E_AGAIN; }
+    s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let (parent, want) = match fs_split_parent(s, path) {
         Some(p) => p,
-        None => return -2, // ENOENT
+        None => return fs_io_errno(s, -2), // ENOENT only when truly absent
     };
     // Resume the free-cluster scan past clusters consumed by earlier mounts
     // (and the orphaned chains of prior truncates) instead of rescanning the
@@ -2624,7 +2696,9 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
 
     let loc = match fs_scan_dir(s, parent, &want) {
         Some(l) => l,
-        None => return -28, // ENOSPC (directory full)
+        // Distinguish "directory genuinely full" from "the scan's
+        // device read failed".
+        None => return fs_io_errno(s, -28), // ENOSPC
     };
 
     // Never repurpose a directory entry as a regular file: truncating it would
@@ -2642,17 +2716,20 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
         // keeps create O(1); the lost space is reclaimed by a reformat. An
         // append-only workload creates fresh paths (the `else` branch), so it
         // never frees here.
-        if fs_patch_dirent(s, loc.lba, loc.off, 0, 0) != 0 { return -5; } // EIO
+        let prc = fs_patch_dirent(s, loc.lba, loc.off, 0, 0);
+        if prc != 0 { return fs_rc_errno(prc); }
     } else {
         // Write a fresh 8.3 entry (ATTR_ARCHIVE, cluster 0, size 0).
-        if fs_read_blockbuf(s, loc.lba) != 0 { return -5; }
+        let rrc = fs_read_blockbuf(s, loc.lba);
+        if rrc != 0 { return fs_rc_errno(rrc); }
         let e = loc.off as usize;
         let mut i = 0usize;
         while i < DIR_ENTRY_SIZE { s.block_buf[e + i] = 0; i += 1; }
         let mut n = 0usize;
         while n < 11 { s.block_buf[e + n] = want[n]; n += 1; }
         s.block_buf[e + 11] = 0x20; // ATTR_ARCHIVE
-        if fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr()) != 0 { return -5; }
+        let wrc = fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr());
+        if wrc != 0 { return fs_rc_errno(wrc); }
     }
 
     // Reserve the first extent as part of OPEN_CREATE. WAL opens its segment
@@ -2662,7 +2739,9 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     // fsynced; preallocation must never manufacture logical file contents.
     let (first, extent) = fs_alloc_extent(s, 0);
     if first < 2 {
-        return -28; // ENOSPC
+        // ENOSPC only when the scan really found no free cluster; a
+        // failed FAT read/write inside the allocator keeps its own errno.
+        return fs_io_errno(s, -28);
     }
     // Prime the first data LBA while OPEN_CREATE is still on the boot path.
     // Some consumer NVMe controllers have a one-time 100+ ms latency on the
@@ -2671,8 +2750,9 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     // The directory entry still has size 0 and cluster 0, so these zeroes are
     // not logical file contents and cannot be observed by STAT or replay.
     let zero = [0u8; BLOCK_SIZE];
-    if fs_sync_write_sector(s, cluster_to_sector(s, first), zero.as_ptr()) != 0 {
-        return -5; // EIO
+    let zrc = fs_sync_write_sector(s, cluster_to_sector(s, first), zero.as_ptr());
+    if zrc != 0 {
+        return fs_rc_errno(zrc);
     }
     let of = &mut s.open_files[slot];
     *of = OpenFile::empty();
@@ -2711,6 +2791,7 @@ unsafe fn fs_op_preallocate(
     }
     let capacity = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
     if capacity == 0 { return E_INVAL; }
+    s.io_rc = 0;
     let cpb = (s.bytes_per_sector as u32).saturating_mul(s.sectors_per_cluster as u32);
     if cpb == 0 { return E_AGAIN; }
     let target_clusters = capacity.saturating_add(cpb - 1) / cpb;
@@ -2718,7 +2799,7 @@ unsafe fn fs_op_preallocate(
     while s.open_files[slot].allocated_clusters < target_clusters {
         let prev = s.open_files[slot].allocation_tail;
         let (first, count) = fs_alloc_extent(s, prev);
-        if first < 2 || count == 0 { return -28; } // ENOSPC
+        if first < 2 || count == 0 { return fs_io_errno(s, -28); } // ENOSPC
         if first != prev.saturating_add(1) {
             s.open_files[slot].fixed_contiguous = 0;
         }
@@ -2760,6 +2841,7 @@ unsafe fn fs_op_write(
     if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
     if s.open_files[slot].writable == 0 { return E_INVAL; }
     if async_flush { s.open_files[slot].async_mode = 1; }
+    s.io_rc = 0;
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
     if bps == 0 || spc == 0 { return E_AGAIN; }
@@ -2814,8 +2896,9 @@ unsafe fn fs_op_write(
                         return done as i32;
                     }
                     if wr != 0 { return -5; }
-                } else if fs_sync_write_sector(s, prev, wp) != 0 {
-                    return -5;
+                } else {
+                    let wr = fs_sync_write_sector(s, prev, wp);
+                    if wr != 0 { return fs_rc_errno(wr); }
                 }
                 s.open_files[slot].scratch_dirty = 0;
             }
@@ -2838,11 +2921,11 @@ unsafe fn fs_op_write(
                 } else {
                     fs_read_fat_entry(s, cur)
                 };
-                if next < 2 || next >= FAT32_EOC { return -28; }
+                if next < 2 || next >= FAT32_EOC { return fs_io_errno(s, -28); }
                 s.open_files[slot].current_cluster = next;
             } else if start == 0 {
                 let (nc, extent) = fs_alloc_extent(s, 0);
-                if nc < 2 { return -28; } // ENOSPC
+                if nc < 2 { return fs_io_errno(s, -28); } // ENOSPC
                 s.open_files[slot].start_cluster = nc;
                 s.open_files[slot].current_cluster = nc;
                 s.open_files[slot].extent_remaining = extent.saturating_sub(1);
@@ -2856,7 +2939,7 @@ unsafe fn fs_op_write(
             } else {
                 let cur = s.open_files[slot].current_cluster;
                 let (nc, extent) = fs_alloc_extent(s, cur);
-                if nc < 2 { return -28; }
+                if nc < 2 { return fs_io_errno(s, -28); }
                 s.open_files[slot].current_cluster = nc;
                 s.open_files[slot].extent_remaining = extent.saturating_sub(1);
             }
@@ -2878,7 +2961,8 @@ unsafe fn fs_op_write(
         // neither fresh nor cached (e.g. reopened-file append).
         if off_in_sec != 0 && s.open_files[slot].scratch_lba != sector {
             let p = s.open_files[slot].scratch_block.as_mut_ptr();
-            if fs_sync_read_sector(s, sector, p) != 0 { return -5; }
+            let rrc = fs_sync_read_sector(s, sector, p);
+            if rrc != 0 { return fs_rc_errno(rrc); }
         }
         core::ptr::copy_nonoverlapping(
             arg.add(done),

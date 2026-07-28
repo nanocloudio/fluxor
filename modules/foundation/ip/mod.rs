@@ -313,6 +313,20 @@ pub struct IpState {
     /// our SYN-ACK didn't reach the peer (rig→peer loss, not
     /// peer→rig). Emitted on the `[ip] hb` line.
     tcp_dup_syn_rx: u32,
+
+    // ── Pipeline-advancement instrumentation ──────────────────────────
+    // See the matching fields in `tls`: byte counters say how much a
+    // module did, not whether it had more available and stopped anyway.
+    /// Ethernet frames drained from the NIC channel this window.
+    adv_rx_frames: u32,
+    /// Steps that ended with the RX channel still readable — `ip` stopped
+    /// with frames waiting. Sustained non-zero means the 32-frame drain
+    /// budget is the binding constraint.
+    pend_rx_steps: u32,
+    /// Steps that returned early from `service_net_channels` because
+    /// outbound headroom was low (`NET_OUT_QUEUE_SLOTS` pressure) — the
+    /// module refusing new commands rather than being idle.
+    pend_txq_steps: u32,
 }
 
 /// Cadence for the `[ip] tlm` line — every 5000 module steps.
@@ -1115,6 +1129,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // 1. Receive and process incoming frames
     let mac_was_valid = s.mac_valid;
     process_rx_frames(s);
+    // Did the 32-frame drain budget bind? A still-readable NIC channel
+    // after draining means `ip` stopped with frames waiting, which is the
+    // discriminator between "ip is the gate" and "ip is starved".
+    if s.in_chan >= 0 {
+        let p = ((*s.syscalls).channel_poll)(s.in_chan, POLL_IN);
+        if p > 0 && (p as u32 & POLL_IN) != 0 {
+            s.pend_rx_steps = s.pend_rx_steps.wrapping_add(1);
+        }
+    }
 
     // Diagnostic: log when MAC is first learned
     if !mac_was_valid && s.mac_valid {
@@ -1281,7 +1304,16 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         };
         emit(b"[ip] hb dupSYN=", &mut pos);
         pos += fmt_u32_dec(s.tcp_dup_syn_rx, buf.add(pos));
+        emit(b" adv=", &mut pos);
+        pos += fmt_u32_dec(s.adv_rx_frames, buf.add(pos));
+        emit(b" pendrx=", &mut pos);
+        pos += fmt_u32_dec(s.pend_rx_steps, buf.add(pos));
+        emit(b" pendtxq=", &mut pos);
+        pos += fmt_u32_dec(s.pend_txq_steps, buf.add(pos));
         dev_log(sys, 3, buf, pos);
+        s.adv_rx_frames = 0;
+        s.pend_rx_steps = 0;
+        s.pend_txq_steps = 0;
     }
 
     // §6 work signal (RFC adaptive_tick_extra): if data moved this step but we
@@ -1357,6 +1389,7 @@ unsafe fn process_rx_frames(s: &mut IpState) {
         s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(r as u32);
         process_frame(s, r as usize);
         count += 1;
+        s.adv_rx_frames = s.adv_rx_frames.wrapping_add(1);
     }
 }
 
@@ -2749,6 +2782,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
     // overflow. The pause propagates backpressure into the
     // consumer's write to `net_in_chan`.
     if NET_OUT_QUEUE_SLOTS - s.pending_net_out_count as usize <= NET_OUT_QUEUE_HEADROOM {
+        s.pend_txq_steps = s.pend_txq_steps.wrapping_add(1);
         return;
     }
 

@@ -89,10 +89,28 @@ fn generate_config_impl(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u16;
 
-    // Validate tick_us range
-    if tick_us > 0 && !(100..=50000).contains(&tick_us) {
+    // Validate tick_us range.
+    //
+    // The floor is a config-authoring bound, not a kernel limit — the kernel's
+    // protection is the per-module `step_deadline_us` guard, which is
+    // independent of tick period. It sits at 20 to leave room for
+    // latency-bound graphs: on a pipelined chain the tick is the unit of
+    // latency, since a request crosses one module boundary per tick wherever
+    // the consumer's scheduler slot precedes the producer's, and burst does
+    // not recover it (it re-steps the same module rather than advancing to
+    // the next).
+    //
+    // 20 is permitted, not recommended. Per-tick module work scales with
+    // concurrent session count — modules that iterate every session per step
+    // cost an order of magnitude more at high concurrency than at one
+    // connection — so a tick sized on a single-connection measurement will
+    // exceed its budget under load, and it does so with every drop counter at
+    // zero. Size the tick against peak-concurrency per-tick work. Where
+    // latency and concurrency genuinely conflict, adaptive tick
+    // (`tick_min_us`/`tick_max_us`) is the mechanism, not a smaller fixed one.
+    if tick_us > 0 && !(20..=50000).contains(&tick_us) {
         return Err(Error::Config(format!(
-            "tick_us {tick_us} out of range (valid: 100-50000, or 0 for default 1000)"
+            "tick_us {tick_us} out of range (valid: 20-50000, or 0 for default 1000)"
         )));
     }
 

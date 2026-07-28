@@ -206,8 +206,6 @@ RIG_BACKENDS    := telemetry-monitor_udp observe-https_load observe-udp_capture
 
 install-rig-backends:
 	$(CARGO) build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
-	$(CARGO) build --release -p fluxor-tools --bin observe-https_load \
-		--features observe-https-load --target aarch64-unknown-linux-gnu
 	@mkdir -p $(RIG_BACKEND_DIR)
 	@for b in $(RIG_BACKENDS); do \
 		src=$(CURDIR)/target/aarch64-unknown-linux-gnu/release/$$b; \
