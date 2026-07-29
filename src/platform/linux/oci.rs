@@ -39,6 +39,8 @@ use std::ffi::CString;
 const OCI_STATE_RUNNING: u8 = 0;
 const OCI_STATE_EXITED: u8 = 1;
 const OCI_STATE_SIGNALLED: u8 = 2;
+// Live, not terminal: frozen via PAUSE (rfc_workload_lifecycle §2.3).
+const OCI_STATE_PAUSED: u8 = 3;
 
 pub const MAX_SANDBOXES: usize = 16;
 
@@ -65,6 +67,15 @@ struct OciSlot {
     isolated: bool,
     /// Whether CREATE created a cgroup for this sandbox — DESTROY rmdir's it.
     cgrouped: bool,
+    /// Whether the container was actually moved into that cgroup — the PAUSE
+    /// gate. `cgrouped` alone is not enough: an unprivileged run can create
+    /// the dir yet fail the `cgroup.procs` move (the cgroup2 common-ancestor
+    /// rule), and freezing an EMPTY cgroup would report success while the
+    /// workload kept running — a lying PAUSE.
+    contained: bool,
+    /// Frozen via PAUSE (`cgroup.freeze` = 1). Live, not terminal; WAIT
+    /// reports [`OCI_STATE_PAUSED`] while set and the child has not exited.
+    paused: bool,
     exit_state: u8,
     exit_code: i32,
 }
@@ -79,6 +90,8 @@ const OCI_EMPTY: OciSlot = OciSlot {
     reaped: false,
     isolated: false,
     cgrouped: false,
+    contained: false,
+    paused: false,
     exit_state: OCI_STATE_RUNNING,
     exit_code: 0,
 };
@@ -220,18 +233,20 @@ pub fn cgroup_base() -> Option<std::path::PathBuf> {
 }
 
 /// Best-effort: create the sandbox's cgroup, enable the controllers, write the
-/// limits, and move the container into it. Returns true iff the cgroup dir was
-/// created (so DESTROY should rmdir it). NEVER fatal — a container runs
+/// limits, and move the container into it. Returns `(created, contained)`:
+/// `created` iff the cgroup dir was created (so DESTROY should rmdir it),
+/// `contained` iff the container was actually moved into it (the freezer
+/// gate — see `OciSlot::contained`). NEVER fatal — a container runs
 /// unlimited if the cgroup fs is unavailable/undelegated (every step ignores
 /// its error). Enforcement therefore depends on the runtime's cgroup being
 /// delegated with the cpu/memory/pids controllers available.
-fn oci_apply_cgroup(idx: usize, container_pid: i32, plan: &SpawnPlan) -> bool {
+fn oci_apply_cgroup(idx: usize, container_pid: i32, plan: &SpawnPlan) -> (bool, bool) {
     let writes = cgroup_writes(plan);
     if writes.is_empty() {
-        return false;
+        return (false, false);
     }
     let Some(base) = cgroup_base() else {
-        return false;
+        return (false, false);
     };
     // Make the controllers available to child cgroups. Enable each ONE AT A
     // TIME: a single `"+memory +pids +cpu"` write is rejected atomically when
@@ -246,18 +261,44 @@ fn oci_apply_cgroup(idx: usize, container_pid: i32, plan: &SpawnPlan) -> bool {
     }
     let dir = base.join(format!("fluxor.oci.{idx}"));
     if std::fs::create_dir_all(&dir).is_err() {
-        return false;
+        return (false, false);
     }
     for (file, value) in writes {
         let _ = std::fs::write(dir.join(file), value.as_bytes());
     }
     // Move the container into the cgroup (host pid; cgroups are orthogonal to
-    // the pid namespace).
-    let _ = std::fs::write(
-        dir.join("cgroup.procs"),
-        container_pid.to_string().as_bytes(),
-    );
-    true
+    // the pid namespace). This is the step an unprivileged run typically
+    // fails (cgroup2 requires write access on the source/destination COMMON
+    // ANCESTOR's cgroup.procs) — track it so PAUSE never freezes an empty
+    // cgroup.
+    let procs = dir.join("cgroup.procs");
+    let pid_bytes = container_pid.to_string();
+    let mut contained = std::fs::write(&procs, pid_bytes.as_bytes()).is_ok();
+    if !contained {
+        // Under a THREADED ROOT base (one of its children was made threaded),
+        // a fresh child is "domain invalid" and refuses processes (EOPNOTSUPP).
+        // Switching the child to threaded makes it a valid member; threaded
+        // cgroups still freeze (cgroup.freeze is core surface), only domain
+        // controllers (memory) stop applying — consistent with best-effort.
+        if std::fs::write(dir.join("cgroup.type"), b"threaded").is_ok() {
+            contained = std::fs::write(&procs, pid_bytes.as_bytes()).is_ok();
+        }
+    }
+    (true, contained)
+}
+
+/// Write a sandbox cgroup's `cgroup.freeze` ("1" freeze / "0" thaw). True on
+/// success. The freezer is core cgroup2 surface (present on every v2 cgroup
+/// since Linux 5.2), not a controller — no subtree_control dance needed.
+fn oci_freeze_write(idx: usize, freeze: bool) -> bool {
+    let Some(base) = cgroup_base() else {
+        return false;
+    };
+    std::fs::write(
+        base.join(format!("fluxor.oci.{idx}")).join("cgroup.freeze"),
+        if freeze { b"1".as_slice() } else { b"0" },
+    )
+    .is_ok()
 }
 
 /// Remove a sandbox's cgroup (once the container has exited so cgroup.procs is
@@ -343,6 +384,14 @@ unsafe fn oci_child(plan: &SpawnPlan, start_r: i32, out_w: i32, pid_w: i32) -> !
 /// an isolated sandbox, or as the direct child in a null sandbox; its
 /// namespaces are already unshared by the caller in the isolated case.
 unsafe fn oci_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
+    // Become a process-group leader (rfc_workload_lifecycle §3.1) so
+    // SIGNAL/DESTROY can deliver to the whole group (`kill(-pgid)`) and
+    // children of the container init hear a SIGTERM too. NB: the double-fork
+    // did NOT already do this — fork inherits the parent's pgid — so this
+    // call is load-bearing, not belt-and-braces. No controlling terminal to
+    // detach here (stdio is the out pipe), so setpgid suffices; the TTY
+    // session path does its own setsid.
+    libc::setpgid(0, 0);
     if plan.isolate {
         // Make `/` a private recursive mount so our mount changes don't
         // propagate to the host (nanocloud runtime.rs:876 — the first, load-
@@ -585,10 +634,13 @@ pub unsafe fn oci_spawn(
     slot.started = false;
     slot.reaped = false;
     slot.isolated = plan.isolate;
+    slot.paused = false;
     slot.exit_state = OCI_STATE_RUNNING;
     slot.exit_code = 0;
     // Apply resource limits before START releases the container (best-effort).
-    slot.cgrouped = oci_apply_cgroup(idx, container_pid, &plan);
+    let (cgrouped, contained) = oci_apply_cgroup(idx, container_pid, &plan);
+    slot.cgrouped = cgrouped;
+    slot.contained = contained;
     // Realize the network domain before START releases the container. Unlike
     // cgroups this is NOT best-effort: the network fields are Tier-1 spec, so
     // a failure fails the spawn rather than running with weaker networking.
@@ -1166,12 +1218,58 @@ pub unsafe fn oci_signal(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     if slot.reaped {
         return errno::OK; // already gone
     }
-    // Target the container init, not the intermediate (which is blocked in
-    // waitpid and would not forward the signal).
-    if libc::kill(slot.container_pid, signo) != 0 {
+    // Thaw-then-signal (rfc_workload_lifecycle §3.1/§3.3): a frozen cgroup
+    // queues signals and handlers cannot run — SIG_KILL and SIG_TERM alike
+    // thaw first so grace semantics stay uniform.
+    if slot.paused {
+        oci_freeze_write(raw as usize, false);
+        slot.paused = false;
+    }
+    // Target the container init's process group, not the intermediate (which
+    // is blocked in waitpid and would not forward the signal).
+    if kill_container_group(slot.container_pid, signo) != 0 {
         return errno::ERROR;
     }
     errno::OK
+}
+
+/// Deliver `signo` to the container's process group — the container body
+/// makes itself a group leader (`setpgid(0,0)`) before exec, so `-pgid` is
+/// `-container_pid` (rfc_workload_lifecycle §3.1: children of the init must
+/// hear the signal too, or grace semantics are meaningless). Falls back to
+/// single-pid delivery when the group kill fails with ESRCH — the one
+/// legitimate gap is a container signalled before its body reached setpgid.
+/// Returns 0 on success, -1 on failure (kill semantics).
+unsafe fn kill_container_group(container_pid: i32, signo: i32) -> i32 {
+    if libc::kill(-container_pid, signo) == 0 {
+        return 0;
+    }
+    if *libc::__errno_location() == libc::ESRCH {
+        return libc::kill(container_pid, signo);
+    }
+    -1
+}
+
+/// Non-blocking reap poll: latch the terminal state once the child is gone.
+/// Shared by WAIT (state reporting) and PAUSE (a terminal workload must be
+/// refused, so PAUSE needs the same freshness as WAIT).
+unsafe fn oci_poll_reap(slot: &mut OciSlot) {
+    if slot.reaped {
+        return;
+    }
+    let mut status: libc::c_int = 0;
+    let r = libc::waitpid(slot.pid, &mut status, libc::WNOHANG);
+    if r == slot.pid {
+        slot.reaped = true;
+        if libc::WIFEXITED(status) {
+            slot.exit_state = OCI_STATE_EXITED;
+            slot.exit_code = libc::WEXITSTATUS(status);
+        } else if libc::WIFSIGNALED(status) {
+            slot.exit_state = OCI_STATE_SIGNALLED;
+            slot.exit_code = libc::WTERMSIG(status);
+        }
+    }
+    // r == 0 → still running; r < 0 → already reaped elsewhere (leave running/unknown).
 }
 
 /// OCI_WAIT: non-blocking; returns [state:u8][code:i32 LE]. Caches the result.
@@ -1186,25 +1284,76 @@ pub unsafe fn oci_wait(raw: i32, out: *mut u8, out_len: usize) -> i32 {
     let Some(slot) = slot_for(raw) else {
         return errno::EINVAL;
     };
-    if !slot.reaped {
-        let mut status: libc::c_int = 0;
-        let r = libc::waitpid(slot.pid, &mut status, libc::WNOHANG);
-        if r == slot.pid {
-            slot.reaped = true;
-            if libc::WIFEXITED(status) {
-                slot.exit_state = OCI_STATE_EXITED;
-                slot.exit_code = libc::WEXITSTATUS(status);
-            } else if libc::WIFSIGNALED(status) {
-                slot.exit_state = OCI_STATE_SIGNALLED;
-                slot.exit_code = libc::WTERMSIG(status);
-            }
-        }
-        // r == 0 → still running; r < 0 → already reaped elsewhere (leave running/unknown).
-    }
+    oci_poll_reap(slot);
     let buf = core::slice::from_raw_parts_mut(out, out_len);
+    if !slot.reaped && slot.paused {
+        // Frozen and not exited → PAUSED, live, not terminal
+        // (rfc_workload_lifecycle §2.3). A workload that died BEFORE the
+        // freeze latched terminal in the poll above and reports it as today;
+        // a frozen one cannot exit, so the two never race. RESUME clears
+        // `paused`, so the next poll reflects RUNNING (§3.3).
+        buf[0] = OCI_STATE_PAUSED;
+        buf[1..5].copy_from_slice(&0i32.to_le_bytes());
+        return 5;
+    }
     buf[0] = slot.exit_state;
     buf[1..5].copy_from_slice(&slot.exit_code.to_le_bytes());
     5
+}
+
+/// OCI_PAUSE: freeze the sandbox via its cgroup's `cgroup.freeze`
+/// (rfc_workload_lifecycle §3.1). Gated on the container actually living in
+/// the per-sandbox cgroup (`cgrouped && contained`) — a workload whose
+/// best-effort cgroup setup failed gets ENOSYS, and there is never a SIGSTOP
+/// fallback (a stopped process is observable and thaw-able by its own
+/// children; the freezer is not). Idempotent: PAUSE on paused returns 0.
+/// PAUSE on a terminal workload is a state error — EINVAL, the backend's
+/// wrong-lifecycle-state convention (cf. EXEC/TTY_OPEN before START).
+/// # Safety
+/// Single-threaded platform dispatch only (process-global slot table).
+pub unsafe fn oci_pause(raw: i32) -> i32 {
+    use crate::kernel::errno;
+    let Some(slot) = slot_for(raw) else {
+        return errno::EINVAL;
+    };
+    oci_poll_reap(slot);
+    if slot.reaped {
+        return errno::EINVAL; // terminal — ESTATE-class refusal (§2.2)
+    }
+    if !(slot.cgrouped && slot.contained) {
+        return errno::ENOSYS; // this workload has no working freezer
+    }
+    if slot.paused {
+        return errno::OK;
+    }
+    if !oci_freeze_write(raw as usize, true) {
+        return errno::ERROR;
+    }
+    slot.paused = true;
+    errno::OK
+}
+
+/// OCI_RESUME: thaw a paused sandbox (`cgroup.freeze` = 0). Idempotent:
+/// RESUME on a running workload returns 0; a terminal workload is also 0
+/// (it is by definition not paused — thawing a corpse is a no-op).
+/// # Safety
+/// Single-threaded platform dispatch only (process-global slot table).
+pub unsafe fn oci_resume(raw: i32) -> i32 {
+    use crate::kernel::errno;
+    let Some(slot) = slot_for(raw) else {
+        return errno::EINVAL;
+    };
+    if !(slot.cgrouped && slot.contained) {
+        return errno::ENOSYS; // same per-workload gate as PAUSE
+    }
+    if !slot.paused {
+        return errno::OK;
+    }
+    if !oci_freeze_write(raw as usize, false) {
+        return errno::ERROR;
+    }
+    slot.paused = false;
+    errno::OK
 }
 
 /// OCI_DESTROY: kill (SIGTERM → brief grace → SIGKILL), reap, free the slot.
@@ -1223,12 +1372,22 @@ pub unsafe fn oci_destroy(raw: i32) -> i32 {
         libc::close(slot.start_w);
         slot.start_w = -1;
     }
+    // Thaw-then-destroy (rfc_workload_lifecycle §3.3): frozen, the init could
+    // never run a TERM handler and the graceful window below would always
+    // escalate to SIGKILL — thaw first so DESTROY-on-paused keeps the same
+    // grace semantics as DESTROY-on-running.
+    if slot.paused {
+        oci_freeze_write(raw as usize, false);
+        slot.paused = false;
+    }
     if !slot.reaped && slot.pid > 0 {
-        // Signal the container init (SIGKILL to PID 1 of a pid ns tears the
-        // whole namespace down); reap the intermediate/child via `pid`. A
-        // handler-less init ignores SIGTERM from our ancestor ns, so the grace
-        // simply elapses and SIGKILL settles it.
-        libc::kill(slot.container_pid, libc::SIGTERM);
+        // Signal the container init's process group (SIGKILL to PID 1 of a
+        // pid ns tears the whole namespace down; the group delivery also
+        // reaches a null sandbox's children — §3.1); reap the
+        // intermediate/child via `pid`. A handler-less init ignores SIGTERM
+        // from our ancestor ns, so the grace simply elapses and SIGKILL
+        // settles it.
+        kill_container_group(slot.container_pid, libc::SIGTERM);
         let mut status: libc::c_int = 0;
         let mut gone = false;
         for _ in 0..50 {
@@ -1239,7 +1398,7 @@ pub unsafe fn oci_destroy(raw: i32) -> i32 {
             libc::usleep(2000); // 2ms × 50 = 100ms grace
         }
         if !gone {
-            libc::kill(slot.container_pid, libc::SIGKILL);
+            kill_container_group(slot.container_pid, libc::SIGKILL);
             libc::waitpid(slot.pid, &mut status, 0);
         }
     }

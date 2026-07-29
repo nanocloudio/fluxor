@@ -155,6 +155,29 @@ impl FreeError {
     }
 }
 
+/// Why `owner_pause` / `owner_resume` failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PauseError {
+    /// The handle names the system owner, which can never be paused.
+    NotWorkload,
+    /// Unknown handle or stale generation (already freed / reused).
+    StaleHandle,
+    /// The owner is in a state the verb does not apply to (`Reserved`,
+    /// `Draining`, `Revoked`) — pause is Active↔Paused only; a draining
+    /// owner is past the point of reversibility.
+    BadState,
+}
+
+impl PauseError {
+    pub fn code(self) -> i32 {
+        match self {
+            PauseError::NotWorkload => -1,
+            PauseError::StaleHandle => -2,
+            PauseError::BadState => -3,
+        }
+    }
+}
+
 /// Borrow the scheduler state. Single-threaded scheduler context; callers must
 /// not hold the returned reference across a call that re-derives `SCHED`.
 #[inline]
@@ -533,8 +556,16 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     if handle.is_system() {
         return Err(FreeError::NotWorkload);
     }
-    if sched().owners.lookup(handle).is_none() {
-        return Err(FreeError::StaleHandle);
+    let state = match sched().owners.lookup(handle) {
+        Some(e) => e.state,
+        None => return Err(FreeError::StaleHandle),
+    };
+    if state == OwnerState::Paused {
+        // Freeing a paused owner: drop its wake masking first so the
+        // paused-owner count and mask bits can't outlive the owner. The
+        // deferred wakes are discarded — the modules are being torn down.
+        let mask = owned_module_mask(handle);
+        let _ = crate::kernel::event::unpause_mask_modules(&mask);
     }
     sched().owners.begin_drain(handle);
 
@@ -644,6 +675,102 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     // bumps the generation, so its §7 pacer instance resets (§7.1) and the
     // re-added entry is re-primed.
     super::rebuild_resident_graph_index();
+    Ok(())
+}
+
+// ============================================================================
+// owner_pause / owner_resume (rfc_workload_lifecycle.md §3.2, P4)
+// ============================================================================
+//
+// The metal PAUSE verb: a reversible quiesce built from exactly the two
+// primitives the drain RFC specifies — §3.5 admission close (the
+// `authorize_admit` gate, closed by the `Paused` owner state) and §3.6
+// per-owner wake masking (`event::pause_mask_modules`) — plus the re-latch
+// path `owner_resume` owns. Deliberately weaker than drain: no
+// `module_drain`, no channel-empty requirement, no deadline. In-flight
+// steps complete naturally (pause runs on the scheduler thread between
+// steps — there is no preemption to suppress); from the next runner pass
+// the §6.5 predicate treats the owner's graphs as not-runnable regardless
+// of readable inbound data, and inbound writes simply buffer in the
+// owner's channels (deferred, not refused — divergence from §3.5's
+// refuse-or-defer choice, documented here: channel rings are lossless and
+// bounded, so buffering IS the deferral; producers see normal
+// backpressure when the ring fills).
+
+/// The owner's stamped module set. Bounded scan; scheduler-thread only.
+fn owned_module_mask(handle: OwnerHandle) -> crate::kernel::bitmask::ModuleMask {
+    let s = sched();
+    let mut mask = crate::kernel::bitmask::ModuleMask::new();
+    for i in 0..MAX_MODULES {
+        if !matches!(s.modules[i], ModuleSlot::Empty) && super::module_owner(i) == handle {
+            mask.set(i);
+        }
+    }
+    mask
+}
+
+/// Pause `handle`: close admission and mask its wake sources so its graphs
+/// stop being stepped. Idempotent (pause of a paused owner is a no-op).
+/// The system owner is refused. Scheduler-thread only (same access class
+/// as `apply_add` / `free_owner`).
+pub fn owner_pause(handle: OwnerHandle) -> Result<(), PauseError> {
+    if handle.is_system() {
+        return Err(PauseError::NotWorkload);
+    }
+    let state = match sched().owners.lookup(handle) {
+        Some(e) => e.state,
+        None => return Err(PauseError::StaleHandle),
+    };
+    match state {
+        OwnerState::Paused => return Ok(()), // idempotent
+        OwnerState::Active => {}
+        _ => return Err(PauseError::BadState),
+    }
+    let mask = owned_module_mask(handle);
+    // Mask-then-check (lost-wakeup discipline): divert NEW wakes first,
+    // then sweep bits that latched before the mask was visible. A signal
+    // racing the sweep lands in EVENT_WAKE_PENDING and is deferred by the
+    // runner's per-pass straggler sweep / the woken-step guard.
+    crate::kernel::event::pause_mask_modules(&mask);
+    let latched = crate::kernel::event::take_wake_in_mask(&mask);
+    crate::kernel::event::defer_masked_wakes(&latched);
+    // State last: the runner skips on `Paused`, admission closes via
+    // `authorize_admit` (drain RFC §3.5 — the same gate, reversible).
+    sched().owners.set_state(handle, OwnerState::Paused);
+    Ok(())
+}
+
+/// Resume `handle`: reopen admission and re-latch every wake that arrived
+/// while paused, so deferred producers/timers are serviced on the next
+/// pass — a module with masked-arrived data steps exactly once with
+/// `event_wake = true`, as if the wake had just fired. Idempotent (resume
+/// of an Active owner is a no-op).
+pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
+    if handle.is_system() {
+        return Err(PauseError::NotWorkload);
+    }
+    let state = match sched().owners.lookup(handle) {
+        Some(e) => e.state,
+        None => return Err(PauseError::StaleHandle),
+    };
+    match state {
+        OwnerState::Active => return Ok(()), // idempotent
+        OwnerState::Paused => {}
+        _ => return Err(PauseError::BadState),
+    }
+    sched().owners.set_state(handle, OwnerState::Active);
+    let mask = owned_module_mask(handle);
+    // Unmask-then-drain: after the mask clears, new wakes latch normally;
+    // the returned set is everything that was diverted while masked. Both
+    // orders of a racing signal deliver — none are lost, a duplicate
+    // event-wake step is benign (level-triggered semantics).
+    let deferred = crate::kernel::event::unpause_mask_modules(&mask);
+    if !deferred.is_empty() {
+        for idx in deferred.iter_set() {
+            crate::kernel::event::relatch_module_wake(idx);
+        }
+        crate::kernel::hal::wake_scheduler();
+    }
     Ok(())
 }
 
@@ -862,4 +989,48 @@ pub unsafe fn free_owner_encoded(arg: *const u8, arg_len: usize) -> i32 {
         Ok(()) => 0,
         Err(e) => e.code(),
     }
+}
+
+/// Decode `[slot:u16 LE, generation:u32 LE]` and pause that owner
+/// (`OWNER_PAUSE = 0x0C72`). Same handle record as `FREE_OWNER`.
+///
+/// # Safety
+/// `arg` must point to at least `arg_len` readable bytes.
+pub unsafe fn owner_pause_encoded(arg: *const u8, arg_len: usize) -> i32 {
+    match decode_owner_handle(arg, arg_len) {
+        Some(h) => match owner_pause(h) {
+            Ok(()) => 0,
+            Err(e) => e.code(),
+        },
+        None => -22,
+    }
+}
+
+/// Decode `[slot:u16 LE, generation:u32 LE]` and resume that owner
+/// (`OWNER_RESUME = 0x0C73`).
+///
+/// # Safety
+/// `arg` must point to at least `arg_len` readable bytes.
+pub unsafe fn owner_resume_encoded(arg: *const u8, arg_len: usize) -> i32 {
+    match decode_owner_handle(arg, arg_len) {
+        Some(h) => match owner_resume(h) {
+            Ok(()) => 0,
+            Err(e) => e.code(),
+        },
+        None => -22,
+    }
+}
+
+/// Shared `[slot:u16 LE, generation:u32 LE]` handle decode.
+fn decode_owner_handle(arg: *const u8, arg_len: usize) -> Option<OwnerHandle> {
+    if arg.is_null() || arg_len < 6 {
+        return None;
+    }
+    // SAFETY: non-null with >= 6 readable bytes, checked above; callers
+    // guarantee validity for the call duration.
+    let bytes = unsafe { core::slice::from_raw_parts(arg, 6) };
+    Some(OwnerHandle {
+        slot: u16::from_le_bytes([bytes[0], bytes[1]]),
+        generation: u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]),
+    })
 }

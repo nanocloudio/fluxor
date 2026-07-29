@@ -15,30 +15,29 @@
 // Composes the host-process backend in the sibling `oci` module.
 
 use super::oci::{
-    oci_destroy, oci_exec, oci_read, oci_signal, oci_spawn, oci_start, oci_tty_close, oci_tty_open,
-    oci_tty_resize, oci_tty_step, oci_wait, ResourceEnvelope, MAX_SANDBOXES,
+    oci_destroy, oci_exec, oci_pause, oci_read, oci_resume, oci_signal, oci_spawn, oci_start,
+    oci_tty_close, oci_tty_open, oci_tty_resize, oci_tty_step, oci_wait, ResourceEnvelope,
+    MAX_SANDBOXES,
 };
 use crate::abi::contracts::workload as wl;
 use crate::kernel::owner::OwnerHandle;
 
-// Backend-local workload opcodes — not part of the hashed `workload` SDK
-// contract, so they need no ABI-surface re-pin; an opcode the runtime handles
-// beyond the contract set is ABI-compatible.
+// Optional workload opcodes (`wl::EXEC`/`wl::TTY_*`): the contract numbers them
+// (rfc_workload_lifecycle §2.1) and owns the consts. Only their arg/out wire
+// formats — backend detail, not contract surface — are documented here:
 //
-/// `EXEC` (0x1A06) — one-shot: run a command inside a workload and capture its
-/// output (`kubectl exec pod -- cmd`). `arg` in = command line; out =
-/// `[out_len:u32][output…]`; return = exit code.
-const WL_EXEC: u32 = 0x1A06;
-/// `TTY_OPEN` (0x1A07) — start an interactive PTY session (`kubectl exec -it`).
-/// `arg` = `[rows:u16][cols:u16][cmd…]`; return = session id.
-const WL_TTY_OPEN: u32 = 0x1A07;
-/// `TTY_STEP` (0x1A08) — pump a session: write stdin, drain output, poll exit.
-/// `arg` in = `[sid:u32][wlen:u32][stdin…]`; out = `[rlen:u32][state:u8][code:i32][out…]`.
-const WL_TTY_STEP: u32 = 0x1A08;
-/// `TTY_RESIZE` (0x1A09) — `arg` = `[sid:u32][rows:u16][cols:u16]`.
-const WL_TTY_RESIZE: u32 = 0x1A09;
-/// `TTY_CLOSE` (0x1A0A) — kill+reap+free a session. `arg` = `[sid:u32]`; return = exit code.
-const WL_TTY_CLOSE: u32 = 0x1A0A;
+// * `EXEC` (0x1A06) — one-shot: run a command inside a workload and capture
+//   its output (`kubectl exec pod -- cmd`). `arg` in = command line; out =
+//   `[out_len:u32][output…]`; return = exit code.
+// * `TTY_OPEN` (0x1A07) — start an interactive PTY session
+//   (`kubectl exec -it`). `arg` = `[rows:u16][cols:u16][cmd…]`; return =
+//   session id.
+// * `TTY_STEP` (0x1A08) — pump a session: write stdin, drain output, poll
+//   exit. `arg` in = `[sid:u32][wlen:u32][stdin…]`; out =
+//   `[rlen:u32][state:u8][code:i32][out…]`.
+// * `TTY_RESIZE` (0x1A09) — `arg` = `[sid:u32][rows:u16][cols:u16]`.
+// * `TTY_CLOSE` (0x1A0A) — kill+reap+free a session. `arg` = `[sid:u32]`;
+//   return = exit code.
 
 const MAX_WORKLOADS: usize = MAX_SANDBOXES;
 
@@ -87,6 +86,19 @@ fn host_backend_honors_option(_ns: &[u8], _key: &[u8]) -> bool {
 /// workload.
 fn host_backend_net_caps() -> u8 {
     wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY
+}
+/// Whether this host can freeze at all: cgroup2 is mounted (`cgroup.freeze`
+/// is core cgroup2 surface, present on every v2 cgroup since Linux 5.2 — not
+/// a controller) and a base cgroup for per-sandbox dirs resolves — the same
+/// preconditions `oci_apply_cgroup` relies on. Probed once per process; the
+/// per-workload gate still applies: a workload whose best-effort cgroup setup
+/// failed gets ENOSYS from PAUSE (rfc_workload_lifecycle §3.1).
+fn host_backend_can_freeze() -> bool {
+    static CAN_FREEZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAN_FREEZE.get_or_init(|| {
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").is_ok()
+            && super::oci::cgroup_base().is_some()
+    })
 }
 
 /// Validate the Tier-2 TLV options envelope. Advisory entries a backend does not
@@ -342,13 +354,13 @@ pub unsafe fn linux_workload_dispatch(
     }
     // Interactive-session pump ops carry the session id in `arg`, not the
     // workload handle, so they resolve independently of the sandbox slot.
-    if opcode == WL_TTY_STEP {
+    if opcode == wl::TTY_STEP {
         return oci_tty_step(arg, arg_len);
     }
-    if opcode == WL_TTY_RESIZE {
+    if opcode == wl::TTY_RESIZE {
         return oci_tty_resize(arg as *const u8, arg_len);
     }
-    if opcode == WL_TTY_CLOSE {
+    if opcode == wl::TTY_CLOSE {
         return oci_tty_close(arg as *const u8, arg_len);
     }
 
@@ -358,9 +370,11 @@ pub unsafe fn linux_workload_dispatch(
     };
     match opcode {
         wl::START => oci_start(bidx),
+        wl::PAUSE => oci_pause(bidx),
+        wl::RESUME => oci_resume(bidx),
         wl::READ => oci_read(bidx, arg, arg_len),
-        WL_EXEC => oci_exec(bidx, arg, arg_len),
-        WL_TTY_OPEN => oci_tty_open(bidx, arg as *const u8, arg_len),
+        wl::EXEC => oci_exec(bidx, arg, arg_len),
+        wl::TTY_OPEN => oci_tty_open(bidx, arg as *const u8, arg_len),
         wl::WAIT => oci_wait(bidx, arg, arg_len),
         wl::SIGNAL => {
             if arg.is_null() || arg_len < 4 {
@@ -395,7 +409,15 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
     out[0] = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
     out[1] = wl::caps::SOURCE_BUNDLE;
-    out[2..4].copy_from_slice(&wl::caps::READ.to_le_bytes());
+    // Implemented optional ops: READ + EXEC + the TTY set + real-signal SIGNAL
+    // delivery (process-group, rfc_workload_lifecycle §3.1). PAUSE is
+    // advertised iff the host can freeze at all (cgroup2 present); a workload
+    // whose own cgroup setup failed still gets per-workload ENOSYS.
+    let mut ops = wl::caps::READ | wl::caps::EXEC | wl::caps::TTY | wl::caps::SIGNAL;
+    if host_backend_can_freeze() {
+        ops |= wl::caps::PAUSE;
+    }
+    out[2..4].copy_from_slice(&ops.to_le_bytes());
     out[4] = host_backend_net_caps();
     out[5..7].copy_from_slice(&0u16.to_le_bytes()); // ns_count
     7

@@ -65,6 +65,12 @@ pub enum OwnerState {
     Active,
     Draining,
     Revoked,
+    /// Reversible quiesce (rfc_workload_lifecycle.md §3.2): admission is
+    /// closed (`authorize_admit` fails) and the scheduler skips the owner's
+    /// graphs, but held resources stay valid (`authorize_use` passes) so
+    /// `owner_resume` restores the exact pre-pause posture. Weaker than
+    /// `Draining` — no `module_drain`, no channel-empty requirement.
+    Paused,
 }
 
 /// Per-owner resource accounting and hard caps. Caps are populated from the
@@ -268,19 +274,27 @@ impl OwnerTable {
     }
 
     /// True when `h` may keep USING resources it already holds — established
-    /// connections, held provider handles, committed queue slots. Both `Active`
-    /// and `Draining` qualify: a draining owner keeps serving until revoked
-    /// (rfc_owner_drain_and_logs.md §3.5).
+    /// connections, held provider handles, committed queue slots. `Active`,
+    /// `Draining`, and `Paused` qualify: a draining owner keeps serving until
+    /// revoked (rfc_owner_drain_and_logs.md §3.5), and a paused owner keeps
+    /// everything it holds — pause is reversible, so revoking use would turn
+    /// resume into a partial re-admission (rfc_workload_lifecycle.md §3.2).
     pub fn authorize_use(&self, h: OwnerHandle) -> bool {
         self.lookup(h)
-            .map(|e| matches!(e.state, OwnerState::Active | OwnerState::Draining))
+            .map(|e| {
+                matches!(
+                    e.state,
+                    OwnerState::Active | OwnerState::Draining | OwnerState::Paused
+                )
+            })
             .unwrap_or(false)
     }
 
     /// True when `h` may ADMIT new work — new allocation, open, accept, queue
     /// grant, timer arm. Only `Active` qualifies: admission closes the moment a
     /// drain begins, which is what lets in-flight work run dry
-    /// (rfc_owner_drain_and_logs.md §3.5).
+    /// (rfc_owner_drain_and_logs.md §3.5). A `Paused` owner is likewise
+    /// admission-closed — the same §3.5 gate, reopened by `owner_resume`.
     pub fn authorize_admit(&self, h: OwnerHandle) -> bool {
         self.lookup(h)
             .map(|e| matches!(e.state, OwnerState::Active))

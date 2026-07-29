@@ -55,6 +55,137 @@ static EVENT_SLOTS: [EventSlot; MAX_EVENTS] = [const { EventSlot::new() }; MAX_E
 static EVENT_WAKE_PENDING: [AtomicU64; MODULE_MASK_WORDS] =
     [const { AtomicU64::new(0) }; MODULE_MASK_WORDS];
 
+// ── Owner pause wake masking (rfc_workload_lifecycle.md §3.2 / P4;
+//    rfc_owner_drain_and_logs.md §3.6 per-owner wake masking) ─────────
+//
+// While an owner is paused its modules' wake sources are MASKED, not
+// dropped: a wake that would latch `EVENT_WAKE_PENDING` (event signal,
+// wake-on-write, budget re-latch) is diverted into `PAUSED_DEFERRED_WAKES`
+// and the scheduler doorbell is NOT rung — so a paused owner neither steps
+// nor keeps its domain out of idle sleep, and no cross-domain doorbell
+// leaks for it. `owner_resume` drains the deferred bits back into
+// `EVENT_WAKE_PENDING` (the re-latch path), so anything that
+// arrived-while-paused produces a wake exactly once.
+//
+// Lost-wakeup discipline is mask-then-check: `owner_pause` sets the
+// PAUSED_MODULES bits FIRST, then sweeps already-latched bits into the
+// deferred store; a signaller that raced past the mask read latches
+// `EVENT_WAKE_PENDING`, where the runner's per-pass sweep (or the
+// woken-step guard) defers it. `owner_resume` clears the mask FIRST, then
+// drains the deferred store — a concurrent signal lands in whichever
+// store is live and is delivered either way.
+//
+// Default-off: `PAUSED_OWNER_COUNT == 0` short-circuits every check, and
+// non-multitenant builds compile the checks out entirely (a single-tenant
+// target has no pausable owner).
+
+/// Modules whose wake delivery is masked (their owner is paused).
+#[cfg(feature = "multitenant")]
+static PAUSED_MODULES: [AtomicU64; MODULE_MASK_WORDS] =
+    [const { AtomicU64::new(0) }; MODULE_MASK_WORDS];
+/// Wakes that arrived for masked modules; re-latched on resume.
+#[cfg(feature = "multitenant")]
+static PAUSED_DEFERRED_WAKES: [AtomicU64; MODULE_MASK_WORDS] =
+    [const { AtomicU64::new(0) }; MODULE_MASK_WORDS];
+/// Number of currently paused owners — the default-off guard.
+#[cfg(feature = "multitenant")]
+static PAUSED_OWNER_COUNT: portable_atomic::AtomicUsize = portable_atomic::AtomicUsize::new(0);
+
+/// Default-off guard: true iff at least one owner is paused. One relaxed
+/// load; every pause-aware check short-circuits on it.
+#[inline]
+pub fn paused_owners_present() -> bool {
+    #[cfg(feature = "multitenant")]
+    {
+        PAUSED_OWNER_COUNT.load(Ordering::Relaxed) != 0
+    }
+    #[cfg(not(feature = "multitenant"))]
+    {
+        false
+    }
+}
+
+/// True iff `module_idx`'s wake delivery is masked (its owner is paused).
+/// Callers MUST short-circuit behind [`paused_owners_present`].
+#[inline]
+pub fn module_wake_masked(module_idx: usize) -> bool {
+    #[cfg(feature = "multitenant")]
+    {
+        module_idx < crate::kernel::config::MAX_MODULES
+            && (PAUSED_MODULES[module_idx / 64].load(Ordering::Acquire) >> (module_idx % 64)) & 1
+                != 0
+    }
+    #[cfg(not(feature = "multitenant"))]
+    {
+        let _ = module_idx;
+        false
+    }
+}
+
+/// Divert a wake for a masked module into the deferred store.
+#[inline]
+pub fn defer_masked_wake(module_idx: usize) {
+    #[cfg(feature = "multitenant")]
+    if module_idx < crate::kernel::config::MAX_MODULES {
+        PAUSED_DEFERRED_WAKES[module_idx / 64]
+            .fetch_or(1u64 << (module_idx % 64), Ordering::Release);
+    }
+    #[cfg(not(feature = "multitenant"))]
+    {
+        let _ = module_idx;
+    }
+}
+
+/// Divert an already-taken wake set into the deferred store (the runner's
+/// per-pass straggler sweep for a paused graph).
+#[cfg(feature = "multitenant")]
+pub fn defer_masked_wakes(mask: &ModuleMask) {
+    for (atomic, w) in PAUSED_DEFERRED_WAKES.iter().zip(mask.as_words().iter()) {
+        if *w != 0 {
+            atomic.fetch_or(*w, Ordering::Release);
+        }
+    }
+}
+
+/// `owner_pause` half of §3.6 masking: mark `mask`'s modules wake-masked and
+/// bump the paused-owner count. Mask-then-check: callers sweep
+/// already-latched bits AFTER this returns.
+#[cfg(feature = "multitenant")]
+pub fn pause_mask_modules(mask: &ModuleMask) {
+    PAUSED_OWNER_COUNT.fetch_add(1, Ordering::Release);
+    for (atomic, w) in PAUSED_MODULES.iter().zip(mask.as_words().iter()) {
+        if *w != 0 {
+            atomic.fetch_or(*w, Ordering::Release);
+        }
+    }
+}
+
+/// `owner_resume` half: unmask `mask`'s modules and drop the paused-owner
+/// count. Returns the deferred wakes accumulated while masked — the caller
+/// re-latches them (or discards them on `free_owner` of a paused owner).
+#[cfg(feature = "multitenant")]
+pub fn unpause_mask_modules(mask: &ModuleMask) -> ModuleMask {
+    let mw = mask.as_words();
+    for (atomic, w) in PAUSED_MODULES.iter().zip(mw.iter()) {
+        if *w != 0 {
+            atomic.fetch_and(!*w, Ordering::Release);
+        }
+    }
+    let mut out = [0u64; MODULE_MASK_WORDS];
+    for ((atomic, w), o) in PAUSED_DEFERRED_WAKES
+        .iter()
+        .zip(mw.iter())
+        .zip(out.iter_mut())
+    {
+        if *w != 0 {
+            let prev = atomic.fetch_and(!*w, Ordering::AcqRel);
+            *o = prev & *w;
+        }
+    }
+    PAUSED_OWNER_COUNT.fetch_sub(1, Ordering::Release);
+    ModuleMask::from_words(out)
+}
+
 // ============================================================================
 // Ownership validation
 // ============================================================================
@@ -113,9 +244,9 @@ pub fn event_signal(handle: i32) -> i32 {
     }
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
-    if (owner as usize) < crate::kernel::config::MAX_MODULES {
-        EVENT_WAKE_PENDING[owner as usize / 64]
-            .fetch_or(1u64 << (owner as usize % 64), Ordering::Release);
+    if (owner as usize) < crate::kernel::config::MAX_MODULES && !latch_module_wake(owner as usize) {
+        // Owner paused: wake deferred, doorbell suppressed (§3.6 masking).
+        return 0;
     }
     hal::wake_scheduler();
     0
@@ -133,9 +264,9 @@ pub fn event_signal_from_isr(handle: i32) {
     let slot = &EVENT_SLOTS[handle as usize];
     slot.signaled.store(true, Ordering::Release);
     let owner = slot.owner.load(Ordering::Relaxed);
-    if (owner as usize) < crate::kernel::config::MAX_MODULES {
-        EVENT_WAKE_PENDING[owner as usize / 64]
-            .fetch_or(1u64 << (owner as usize % 64), Ordering::Release);
+    if (owner as usize) < crate::kernel::config::MAX_MODULES && !latch_module_wake(owner as usize) {
+        // Owner paused: wake deferred, doorbell suppressed (§3.6 masking).
+        return;
     }
     hal::wake_scheduler();
 }
@@ -237,9 +368,27 @@ pub fn wake_pending_in_mask(mask: &ModuleMask) -> bool {
 ///   over budget NOW, and the next pass drains the bit without an
 ///   immediate re-wake storm.
 pub fn relatch_module_wake(module_idx: usize) {
-    if module_idx < crate::kernel::config::MAX_MODULES {
-        EVENT_WAKE_PENDING[module_idx / 64].fetch_or(1u64 << (module_idx % 64), Ordering::Release);
+    let _ = latch_module_wake(module_idx);
+}
+
+/// Latch `module_idx`'s wake bit, honouring owner-pause masking: a masked
+/// module's wake is diverted to the deferred store instead. Returns `true`
+/// when the bit latched into `EVENT_WAKE_PENDING` (the caller may ring the
+/// doorbell), `false` when it was diverted (the caller MUST NOT ring — the
+/// suppressed doorbell is the §3.6 "no cross-domain leak" guarantee).
+/// When no owner is paused the masking adds one relaxed-load guard before
+/// the same `fetch_or`.
+#[inline]
+pub fn latch_module_wake(module_idx: usize) -> bool {
+    if module_idx >= crate::kernel::config::MAX_MODULES {
+        return false;
     }
+    if paused_owners_present() && module_wake_masked(module_idx) {
+        defer_masked_wake(module_idx);
+        return false;
+    }
+    EVENT_WAKE_PENDING[module_idx / 64].fetch_or(1u64 << (module_idx % 64), Ordering::Release);
+    true
 }
 
 /// Test-only: latch a module's wake bit directly, as if an event owned by it
@@ -291,6 +440,23 @@ pub fn release_owned_by(module_idx: u8) {
     }
 }
 
+/// Clear the owner-pause wake-masking state (mask, deferred wakes, count).
+/// Called on graph rebuild (`prepare_graph`) — the owner table is reset
+/// there (`reset_workloads`), so stale masks would suppress wakes for
+/// reused module slots — and folded into [`reset_all`].
+pub fn reset_pause_masking() {
+    #[cfg(feature = "multitenant")]
+    {
+        for w in PAUSED_MODULES.iter() {
+            w.store(0, Ordering::Release);
+        }
+        for w in PAUSED_DEFERRED_WAKES.iter() {
+            w.store(0, Ordering::Release);
+        }
+        PAUSED_OWNER_COUNT.store(0, Ordering::Release);
+    }
+}
+
 /// Clear all event slots. Called on graph teardown / reload.
 /// Device providers must clear their own bindings before calling this.
 pub fn reset_all() {
@@ -304,4 +470,5 @@ pub fn reset_all() {
     for w in EVENT_WAKE_PENDING.iter() {
         w.store(0, Ordering::Release);
     }
+    reset_pause_masking();
 }

@@ -1,0 +1,22 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+permissions = ["platform_raw"]
+
+# System-graph driver for the owner-pause silicon AC
+# (rfc_workload_lifecycle.md §3.2 P4): issues OWNER_PAUSE (0x0C72) /
+# OWNER_RESUME (0x0C73) against a resident pod's owner handle on a
+# wall-clock schedule and logs `[pdrv] pause/resume ms=<t> rc=<rc>`,
+# plus a `[pdrv] hb` heartbeat proving the system graph keeps stepping
+# through the pod's pause window. The ops sit in the 0x0C7x
+# live-mutation block (PLATFORM_RAW permission category, like
+# APPLY_ADD/FREE_OWNER).
+
+timer_class = "wall_clock"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "pause/resume driver fixture; its '[pdrv]' log lines are the observable, consumed by the rig scenario's pass rules"

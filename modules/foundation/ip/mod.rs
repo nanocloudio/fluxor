@@ -327,6 +327,22 @@ pub struct IpState {
     /// outbound headroom was low (`NET_OUT_QUEUE_SLOTS` pressure) — the
     /// module refusing new commands rather than being idle.
     pend_txq_steps: u32,
+    /// MSG_DATA frames emitted to `net_out` (wire -> tls direction).
+    out_items: u32,
+    /// CMD_SEND commands fully consumed from `net_in` (tls -> wire).
+    tx_cmd_items: u32,
+    /// Steps that left `service_net_channels` early with a PARTIALLY SENT
+    /// command stashed in `pending_cmd_*`.
+    ///
+    /// This is the response-path serialisation counter. While one
+    /// connection's response is mid-flight the function `return`s, so NO
+    /// other connection's commands are serviced that step — one connection
+    /// at a time regardless of how many have responses ready. If this is a
+    /// large fraction of steps it is the ceiling, and it would be invisible
+    /// to every other counter: no channel backs up (tls sees an empty
+    /// queue, so `pend=0`), no drop fires, and CPU stays low, because the
+    /// module is deliberately declining work rather than failing to do it.
+    pend_cmd_steps: u32,
 }
 
 /// Cadence for the `[ip] tlm` line — every 5000 module steps.
@@ -472,7 +488,12 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len:
     core::ptr::copy_nonoverlapping(data, scratch.add(4), data_len);
     let total = NET_FRAME_HDR + payload_len;
     let n = (sys.channel_write)(s.net_out_chan, scratch, total);
-    n == total as i32
+    if n == total as i32 {
+        s.out_items = s.out_items.wrapping_add(1);
+        true
+    } else {
+        false
+    }
 }
 
 /// Send a short control frame to `net_out_chan`, queueing when the
@@ -1310,10 +1331,22 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         pos += fmt_u32_dec(s.pend_rx_steps, buf.add(pos));
         emit(b" pendtxq=", &mut pos);
         pos += fmt_u32_dec(s.pend_txq_steps, buf.add(pos));
+        emit(b" out=", &mut pos);
+        pos += fmt_u32_dec(s.out_items, buf.add(pos));
+        emit(b" txcmd=", &mut pos);
+        pos += fmt_u32_dec(s.tx_cmd_items, buf.add(pos));
+        emit(b" pendcmd=", &mut pos);
+        pos += fmt_u32_dec(s.pend_cmd_steps, buf.add(pos));
         dev_log(sys, 3, buf, pos);
         s.adv_rx_frames = 0;
         s.pend_rx_steps = 0;
         s.pend_txq_steps = 0;
+        s.out_items = 0;
+        s.tx_cmd_items = 0;
+        s.pend_cmd_steps = 0;
+        s.out_items = 0;
+        s.tx_cmd_items = 0;
+        s.pend_cmd_steps = 0;
     }
 
     // §6 work signal (RFC adaptive_tick_extra): if data moved this step but we
@@ -2799,8 +2832,10 @@ unsafe fn service_net_channels(s: &mut IpState) {
             s.pending_cmd_valid = 0;
             s.pending_cmd_off = 0;
             s.pending_cmd_len = 0;
+            s.tx_cmd_items = s.tx_cmd_items.wrapping_add(1);
         } else {
             s.pending_cmd_off = new_off as u16;
+            s.pend_cmd_steps = s.pend_cmd_steps.wrapping_add(1);
             return;
         }
     }
@@ -2987,6 +3022,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                                 s.pending_cmd_off = new_off as u16;
                                 s.pending_cmd_len = total_len as u16;
                                 s.pending_cmd_valid = 1;
+                                s.pend_cmd_steps = s.pend_cmd_steps.wrapping_add(1);
                                 return;
                             }
                         }

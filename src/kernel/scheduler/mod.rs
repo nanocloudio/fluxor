@@ -3344,6 +3344,40 @@ fn owner_timer_due(_slot: u16, _generation: u32, _domain: usize) -> bool {
     false
 }
 
+/// §3.2 pause predicate for a resident graph: true iff the owning slot is
+/// `Paused` at this generation. Callers MUST short-circuit behind
+/// `event::paused_owners_present()` so the unused path stays a single
+/// relaxed load (default-off discipline).
+#[cfg(feature = "multitenant")]
+#[inline]
+fn owner_graph_paused(sched: &SchedulerState, slot: u16, generation: u32) -> bool {
+    slot != 0
+        && sched.owners.entry_at(slot as usize).is_some_and(|e| {
+            e.generation == generation
+                && matches!(e.state, crate::kernel::owner::OwnerState::Paused)
+        })
+}
+
+/// True iff any resident graph in `domain` belongs to a paused owner. Used
+/// by `step_resident_graphs_domain` to route a single-paused-graph domain
+/// through the multi-graph runner (whose §3.2 skip is the only paused-aware
+/// stepping path) instead of the pause-blind fast path. Bounded scan of the
+/// resident-graph index; callers short-circuit behind
+/// `event::paused_owners_present()`.
+#[cfg(feature = "multitenant")]
+fn domain_has_paused_graph(domain: usize) -> bool {
+    // SAFETY: scheduler-thread read; the table is only mutated at rebuild.
+    let table = unsafe { &*core::ptr::addr_of!(RESIDENT_GRAPHS) };
+    // SAFETY: scheduler-thread read of a bounded counter.
+    let rc = unsafe { RESIDENT_GRAPH_COUNT };
+    // SAFETY: scheduler-thread read of the owner table.
+    let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
+    table
+        .iter()
+        .take(rc)
+        .any(|e| e.domain as usize == domain && owner_graph_paused(sched, e.slot, e.generation))
+}
+
 /// §6.5 readable-channel term (RFC idle_skip_wake §4): does any edge whose
 /// CONSUMER belongs to this graph — and whose PRODUCER does not — hold
 /// readable bytes? Without this term, data written into a skipped graph's
@@ -3510,6 +3544,23 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
             snap_backstop = e.backstop_next_due_us;
         }
         if gdomain != domain {
+            continue;
+        }
+        // §3.2 pause skip (rfc_workload_lifecycle.md, P4): a paused owner's
+        // graph is not-runnable REGARDLESS of wakes, due periodic modules,
+        // backstop, must-tick, or readable inbound — evaluated before every
+        // §6.5 term so none of them can step it. Wake bits that latched
+        // before the pause mask became visible (the mask-then-check race)
+        // are swept into the deferred store here, pass by pass, so a paused
+        // owner's stragglers can't keep `domain_wake_pending` asserted and
+        // pin the domain out of idle sleep. Guarded by the default-off
+        // paused-owner count: with no owner paused this is one relaxed load
+        // per graph per pass, and stepping proceeds as the pause-free path.
+        if crate::kernel::event::paused_owners_present()
+            && owner_graph_paused(sched, slot, generation)
+        {
+            let stragglers = crate::kernel::event::take_wake_in_mask(&mask);
+            crate::kernel::event::defer_masked_wakes(&stragglers);
             continue;
         }
         // Atomically read-and-clear this owner's wake bits. The returned snapshot
@@ -3778,7 +3829,14 @@ pub fn step_resident_graphs_domain(
 ) -> (StepResult, u32) {
     #[cfg(feature = "multitenant")]
     {
-        if resident_graph_count_in_domain(domain) > 1 {
+        // A domain whose ONLY resident graph belongs to a paused owner must
+        // also take the runner path: the fast path below is pause-blind and
+        // would keep stepping the paused modules. Default-off — with no owner
+        // paused the second term is never evaluated and the predicate reduces
+        // to the `> 1` rule.
+        if resident_graph_count_in_domain(domain) > 1
+            || (crate::kernel::event::paused_owners_present() && domain_has_paused_graph(domain))
+        {
             return multi_graph_runner(modules, domain);
         }
     }
@@ -4560,6 +4618,12 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // here too — a rebuilt graph must start from a clean cadence (level/dwell/
     // deadband/idle-latch/burst) rather than inheriting the prior graph's.
     pacer_reset_all();
+    // Owner-pause wake masking also lives outside `Sched`; the rebuild clears
+    // every module's owner stamp (below) and plan re-apply reinstalls owners
+    // Active, so stale mask bits would suppress wakes for reused module slots
+    // (rfc_workload_lifecycle.md §3.2/§3.3 — pause is a runtime posture, not
+    // desired state; it does not survive a rebuild).
+    crate::kernel::event::reset_pause_masking();
 
     // Store graph-level sample rate from config header
     sched.graph_sample_rate = config.header.graph_sample_rate;
@@ -8464,6 +8528,14 @@ fn step_domain_pre_tick(
         if module_idx >= active_module_count {
             continue;
         }
+        // §3.2 pause guard: pre-tick drain is domain-global (not per-graph),
+        // so a paused owner's Tier-1c module must be skipped here explicitly.
+        // Default-off: one relaxed load when nothing is paused.
+        if crate::kernel::event::paused_owners_present()
+            && crate::kernel::event::module_wake_masked(module_idx)
+        {
+            continue;
+        }
         step_one_module(modules, sched, module_idx, not_ready, active_count, false);
         let used = sched.domain_budget_us_consumed[domain_id].saturating_sub(baseline);
         if used > budget {
@@ -8513,6 +8585,12 @@ fn step_domain_pipeline_refill(
             || sched.finished[module_idx]
             || !sched.ready[module_idx]
             || sched.fault_info[module_idx].state != FaultState::Running
+        {
+            continue;
+        }
+        // §3.2 pause guard — same rationale as `step_domain_pre_tick`.
+        if crate::kernel::event::paused_owners_present()
+            && crate::kernel::event::module_wake_masked(module_idx)
         {
             continue;
         }
@@ -9150,6 +9228,18 @@ pub fn step_woken_modules(
         if !wake_bits.test(module_idx) {
             continue;
         }
+        // §3.2 pause guard: a wake bit that escaped the pause-time sweep
+        // (latched between the mask write and the sweep, then taken by a
+        // GLOBAL `take_wake_pending` drain — the Linux/rp platform loops)
+        // must not step a paused owner's module; defer it so `owner_resume`
+        // re-latches it. Default-off: one relaxed load when nothing is
+        // paused.
+        if crate::kernel::event::paused_owners_present()
+            && crate::kernel::event::module_wake_masked(module_idx)
+        {
+            crate::kernel::event::defer_masked_wake(module_idx);
+            continue;
+        }
         // Budget bound on the woken path (RFC idle_skip_wake §5): woken
         // steps are charged to the domain accumulators like pass steps,
         // and the limit must bind here too — wake-on-write makes wakes
@@ -9588,6 +9678,10 @@ pub struct OwnerLiveStatus {
 pub const OWNER_STATE_ACTIVE: u8 = 0;
 /// `owner_state` code: the owner is draining before revocation.
 pub const OWNER_STATE_DRAINING: u8 = 1;
+/// `owner_state` code: the owner is paused (reversible quiesce,
+/// rfc_workload_lifecycle.md §3.2). Not terminal; `owner_resume` returns
+/// it to [`OWNER_STATE_ACTIVE`].
+pub const OWNER_STATE_PAUSED: u8 = 2;
 
 impl OwnerLiveStatus {
     pub const EMPTY: OwnerLiveStatus = OwnerLiveStatus {
@@ -9634,6 +9728,7 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
         }
         let owner_state = match e.state {
             crate::kernel::owner::OwnerState::Draining => OWNER_STATE_DRAINING,
+            crate::kernel::owner::OwnerState::Paused => OWNER_STATE_PAUSED,
             _ => OWNER_STATE_ACTIVE,
         };
         out[count] = OwnerLiveStatus {

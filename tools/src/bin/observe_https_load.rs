@@ -677,6 +677,39 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
     let tp_elapsed = t0.elapsed().as_secs_f64().max(0.001);
     let tp_mbps = (tp_bytes as f64) / 1_000_000.0 / tp_elapsed;
     let tp_rate = tp_ok as f64 / tp_elapsed;
+
+    // ── Steady-state, connection setup excluded ────────────────────────
+    //
+    // `tp_elapsed` spans the whole window, which in keepalive mode contains
+    // one TCP+TLS handshake per `ka_n` requests — that setup is charged to
+    // throughput. The per-request PERCENTILES are already clean (only request
+    // 0 of each session records `tls_us`), so the wall-clock RATE is the one
+    // figure not corrected for setup.
+    //
+    // Single-stream, so steady-state throughput is 1 / mean-per-request
+    // latency over the non-setup population; `steady_mbps` re-derives
+    // bandwidth from that rate and the mean body size, comparable with
+    // `steady_rps` rather than with the wall-clock figure.
+    let tp_steady: Vec<StageTimings> = tp_samples
+        .iter()
+        .filter(|t| t.tls_us == 0)
+        .copied()
+        .collect();
+    let tp_steady_n = tp_steady.len();
+    let (tp_steady_rps, tp_steady_mbps) = if tp_steady_n == 0 {
+        (0.0, 0.0)
+    } else {
+        let mean_us =
+            tp_steady.iter().map(|t| t.total_us).sum::<u128>() as f64 / tp_steady_n as f64;
+        let mean_body =
+            tp_steady.iter().map(|t| t.body_bytes).sum::<usize>() as f64 / tp_steady_n as f64;
+        if mean_us > 0.0 {
+            let rps = 1_000_000.0 / mean_us;
+            (rps, rps * mean_body / 1_000_000.0)
+        } else {
+            (0.0, 0.0)
+        }
+    };
     let tp_err_total = tp_errs.total();
     let tp_status = if tp_err_total == 0 && tp_mbps >= cfg.throughput_floor_mbps {
         "OK"
@@ -689,10 +722,11 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
         "close"
     };
     emit_line(&format!(
-        "[https_load] phase=1 name=throughput_single mode={tp_mode} ka_n={keepalive_n} bytes={tp_bytes} elapsed_s={tp_elapsed:.2} mbps={tp_mbps:.3} reqs={tp_ok} rate_rps={tp_rate:.2} errors={tp_err_total} {tp_err_breakdown} {tp_pct} floor_mbps={:.2} {tp_status}",
+        "[https_load] phase=1 name=throughput_single mode={tp_mode} ka_n={keepalive_n} bytes={tp_bytes} elapsed_s={tp_elapsed:.2} mbps={tp_mbps:.3} steady_mbps={tp_steady_mbps:.3} reqs={tp_ok} rate_rps={tp_rate:.2} steady_rps={tp_steady_rps:.2} steady_n={tp_steady_n} errors={tp_err_total} {tp_err_breakdown} {tp_pct} {tp_spct} floor_mbps={:.2} {tp_status}",
         cfg.throughput_floor_mbps,
         tp_err_breakdown = tp_errs.render("tp"),
         tp_pct = percentile_line(&tp_samples, "tp"),
+        tp_spct = percentile_line(&tp_steady, "tps"),
     ));
 
     // ── Phase 2: concurrent connections ──
@@ -809,18 +843,54 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
     let c_elapsed = t0.elapsed().as_secs_f64().max(0.001);
     let c_err_total = c_errs.total();
     let c_rate = c_ok as f64 / c_elapsed;
+
+    // ── Steady-state throughput, with connection setup excluded ────────
+    //
+    // `c_rate` divides by wall-clock elapsed, and `t0` is taken BEFORE the
+    // connection tasks spawn — so N TCP connects and N TLS handshakes are
+    // charged against steady-state throughput. In `keepalive` mode that is
+    // the wrong number: the mode exists to amortise the handshake, and the
+    // wall-clock arithmetic puts it back — the reported rate then climbs
+    // with `reqs_per_conn` purely by giving the setup cost more requests to
+    // hide behind.
+    //
+    // In a closed loop with N connections each issuing sequentially,
+    // steady-state throughput is N / mean-per-request-latency. Setup-bearing
+    // requests are exactly those carrying a handshake (`tls_us > 0` — only
+    // the first request of a keepalive session records one), so excluding
+    // them yields the steady-state population directly. Both figures are
+    // emitted: `rate_rps` stays wall-clock for continuity, `steady_rps` is
+    // the one to quote.
+    let steady: Vec<&StageTimings> = c_samples.iter().filter(|t| t.tls_us == 0).collect();
+    let steady_n = steady.len();
+    let steady_rps = if steady_n == 0 {
+        0.0
+    } else {
+        let mean_us = steady.iter().map(|t| t.total_us).sum::<u128>() as f64 / steady_n as f64;
+        if mean_us > 0.0 {
+            cfg.concurrent_n as f64 * 1_000_000.0 / mean_us
+        } else {
+            0.0
+        }
+    };
+    // Percentiles over the same steady-state population. The unfiltered
+    // ones mix N handshake latencies into a population of N x M requests,
+    // so at 32x50 the 32 setup requests are the top 2 % — an unfiltered p99
+    // reports the handshake cost, not a server tail.
+    let steady_owned: Vec<StageTimings> = steady.into_iter().copied().collect();
     let c_status = if c_err_total == 0 && c_ok == target_total {
         "OK"
     } else {
         "ERR"
     };
     emit_line(&format!(
-        "[https_load] phase=2 name=concurrent_{n} mode={c_mode} ka_n={ka_for_log} conns={n} reqs_per_conn={r} target={target_total} ok={c_ok} rate_rps={c_rate:.2} errors={c_err_total} {c_err_breakdown} {c_pct} elapsed_s={c_elapsed:.2} {c_status}",
+        "[https_load] phase=2 name=concurrent_{n} mode={c_mode} ka_n={ka_for_log} conns={n} reqs_per_conn={r} target={target_total} ok={c_ok} rate_rps={c_rate:.2} steady_rps={steady_rps:.2} steady_n={steady_n} errors={c_err_total} {c_err_breakdown} {c_pct} {c_spct} elapsed_s={c_elapsed:.2} {c_status}",
         n = cfg.concurrent_n,
         r = cfg.concurrent_reqs,
         ka_for_log = keepalive_n,
         c_err_breakdown = c_errs.render("c"),
         c_pct = percentile_line(&c_samples, "c"),
+        c_spct = percentile_line(&steady_owned, "cs"),
     ));
 
     // ── Phase 3: sustained-load stability ──

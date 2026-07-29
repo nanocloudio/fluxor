@@ -288,6 +288,14 @@ pub fn for_each_field(f: &mut impl FnMut(&str, i64)) {
         "reconfigure.FREE_OWNER",
         int::reconfigure::FREE_OWNER as i64,
     );
+    f(
+        "reconfigure.OWNER_PAUSE",
+        int::reconfigure::OWNER_PAUSE as i64,
+    );
+    f(
+        "reconfigure.OWNER_RESUME",
+        int::reconfigure::OWNER_RESUME as i64,
+    );
 
     f("bridge.WRITE", int::bridge::WRITE as i64);
     f("bridge.READ", int::bridge::READ as i64);

@@ -58,6 +58,38 @@ pub const DESTROY: u32 = 0x1A04;
 /// errno. Optional; advertised via [`caps::READ`].
 pub const READ: u32 = 0x1A05;
 
+// ---- optional ops (0x1A06..0x1A0A) ----
+//
+// Optional workload ops beyond the core lifecycle (rfc_workload_lifecycle
+// §2.1). The contract fixes their numbering so backends cannot collide; each
+// is optional — a backend advertises what it implements via the [`CAPS`] `ops`
+// bitmap ([`caps::EXEC`], [`caps::TTY`]) and an unadvertised op returns
+// `ENOSYS`. Arg/out wire formats are backend documentation
+// (`src/platform/linux/workload.rs`), not contract surface.
+
+/// `EXEC` — one-shot: run a command inside a running workload and capture its
+/// output (`kubectl exec pod -- cmd`). Optional; advertised via [`caps::EXEC`].
+pub const EXEC: u32 = 0x1A06;
+/// `TTY_OPEN` — start an interactive PTY session (`kubectl exec -it`).
+/// Optional; the TTY ops are advertised as a set via [`caps::TTY`].
+pub const TTY_OPEN: u32 = 0x1A07;
+/// `TTY_STEP` — pump a session: write stdin, drain output, poll exit.
+pub const TTY_STEP: u32 = 0x1A08;
+/// `TTY_RESIZE` — change a session's window size.
+pub const TTY_RESIZE: u32 = 0x1A09;
+/// `TTY_CLOSE` — kill+reap+free a session.
+pub const TTY_CLOSE: u32 = 0x1A0A;
+
+/// `PAUSE` — freeze a workload (reversible; not a terminal state;
+/// rfc_workload_lifecycle §2.2). Realized by the Linux host-process backend
+/// via the cgroup2 freezer (its P2); the metal backend is its P4. Idempotent:
+/// PAUSE on a paused workload returns status 0; PAUSE on a terminal workload
+/// is a state error. Advertised via [`caps::PAUSE`].
+pub const PAUSE: u32 = 0x1A0B;
+/// `RESUME` — thaw a paused workload, see [`PAUSE`]. Idempotent: RESUME on a
+/// running workload returns status 0.
+pub const RESUME: u32 = 0x1A0C;
+
 /// `CAPS` (`0x1AFF`) — backend capability discovery. Writes the fixed prefix
 /// `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]` then a
 /// namespace-directory the caller consults *before* flagging a Tier-2 entry
@@ -89,6 +121,10 @@ pub const SOURCE_BUNDLE: u8 = 1;
 pub const STATE_RUNNING: u8 = 0;
 pub const STATE_EXITED: u8 = 1;
 pub const STATE_SIGNALLED: u8 = 2;
+/// Frozen by [`PAUSE`]; live, not terminal (rfc_workload_lifecycle §2.3).
+/// A consumer's status loop must treat it as live — only EXITED/SIGNALLED
+/// latch. After [`RESUME`], the next WAIT poll reflects RUNNING (§3.3).
+pub const STATE_PAUSED: u8 = 3;
 
 // ---- portable signal subset (SIGNAL `signo`) ----
 /// Request graceful termination.
@@ -181,8 +217,21 @@ pub mod caps {
     pub const SOURCE_BUNDLE: u8 = 1 << 1;
 
     // `ops` bitmap — optional opcodes beyond the mandatory create/start/wait/
-    // signal/destroy set.
+    // signal/destroy set (rfc_workload_lifecycle §2.4). SIGNAL itself is
+    // mandatory to *accept*; its bit asserts real-signal delivery semantics.
     pub const READ: u16 = 1 << 0;
+    /// Backend implements [`super::EXEC`].
+    pub const EXEC: u16 = 1 << 1;
+    /// Backend implements the TTY session ops (OPEN/STEP/RESIZE/CLOSE) as a set.
+    pub const TTY: u16 = 1 << 2;
+    /// SIGNAL delivers real signals to the workload's process group (§3.1),
+    /// not merely a stop request.
+    pub const SIGNAL: u16 = 1 << 3;
+    /// Backend implements the [`super::PAUSE`]/[`super::RESUME`] pair. The
+    /// bit claims the backend can freeze AT ALL; a specific workload whose
+    /// freeze mechanism could not be set up may still return `ENOSYS`
+    /// (rfc_workload_lifecycle §3.1).
+    pub const PAUSE: u16 = 1 << 4;
 
     // `net` bitmap — which Tier-1 network fields the backend realizes. A
     // CREATE that asks for an unadvertised bit fails admission (`ENOSYS`),

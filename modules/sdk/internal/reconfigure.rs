@@ -63,3 +63,24 @@ pub const APPLY_ADD: u32 = 0x0C70;
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
 /// negative `FreeError` otherwise.
 pub const FREE_OWNER: u32 = 0x0C71;
+
+// ── Owner pause/resume: metal PAUSE as a reversible quiesce verb ─────────────
+// rfc_workload_lifecycle.md §3.2 (P4): the OWNER-level kernel mechanism the
+// future 0x1A metal workload backend / orchestrator maps PAUSE/RESUME onto.
+// Built from the drain RFC's §3.5 admission close + §3.6 wake masking, plus
+// the resume re-latch path. Deliberately in the 0x0C7x live-mutation block
+// beside APPLY_ADD/FREE_OWNER — NOT in monitor-gated 0x0C5x.
+
+/// Pause an owner (reversible quiesce): close admission for its subgraph,
+/// let in-flight steps complete (no preemption), and mask its wake sources
+/// (event signals, wake-on-write latches, cross-domain doorbells) so its
+/// graphs stop being stepped. Idempotent; the system owner is refused.
+/// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
+/// negative `PauseError` otherwise.
+pub const OWNER_PAUSE: u32 = 0x0C72;
+/// Resume a paused owner: reopen admission and re-latch every wake that
+/// arrived while paused (each masked-arrival produces a wake now, exactly
+/// once). Idempotent on an Active owner.
+/// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
+/// negative `PauseError` otherwise.
+pub const OWNER_RESUME: u32 = 0x0C73;

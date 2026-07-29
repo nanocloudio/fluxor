@@ -1,0 +1,18 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Resident-pod counter for the owner-pause silicon AC
+# (rfc_workload_lifecycle.md §3.2 P4). Logs `[pprobe] c=<n> ms=<t>`
+# periodically and `[pprobe] gap_ms=<g>` when the wall-clock gap between
+# two of its OWN consecutive steps exceeds gap_min_ms — the pod-side
+# proof that the pause froze it for exactly the driver's window.
+
+timer_class = "wall_clock"
+
+[[resources]]
+requires_contract = "timer"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "pause-freeze measurement fixture; its '[pprobe]' log lines are the observable, consumed by the rig scenario's pass rules"

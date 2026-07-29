@@ -1357,6 +1357,20 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
                 E_NOSYS
             }
         }
+        // Owner pause/resume (rfc_workload_lifecycle.md §3.2 P4). Arms are
+        // cfg-gated OUT (not ENOSYS-stubbed) on non-multitenant builds so the
+        // opcodes fall through to the platform extension — 0x0C72/0x0C73 are
+        // the rp PIO SM_READ_REG/SM_ENABLE register bridges there.
+        #[cfg(feature = "multitenant")]
+        reconfigure::OWNER_PAUSE => {
+            // SAFETY: `arg`/`arg_len` describe a readable handle record.
+            unsafe { scheduler::live::owner_pause_encoded(arg, arg_len) }
+        }
+        #[cfg(feature = "multitenant")]
+        reconfigure::OWNER_RESUME => {
+            // SAFETY: `arg`/`arg_len` describe a readable handle record.
+            unsafe { scheduler::live::owner_resume_encoded(arg, arg_len) }
+        }
 
         _ => {
             // Delegate to platform extension for hardware-specific opcodes

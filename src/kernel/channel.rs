@@ -779,8 +779,13 @@ pub fn channel_set_wake_module(handle: i32, module_idx: i32) {
 fn wake_consumer_if_flagged(slot: &ChannelSlot) {
     let m = slot.wake_module.load(Ordering::Relaxed);
     if m >= 0 {
-        crate::kernel::event::relatch_module_wake(m as usize);
-        crate::kernel::hal::wake_scheduler();
+        // `latch_module_wake` returns false when the consumer's owner is
+        // paused: the wake is deferred (re-latched on `owner_resume`) and
+        // the doorbell is suppressed, so a write into a paused owner never
+        // leaks a cross-domain wake (rfc_workload_lifecycle.md §3.2).
+        if crate::kernel::event::latch_module_wake(m as usize) {
+            crate::kernel::hal::wake_scheduler();
+        }
     }
 }
 
