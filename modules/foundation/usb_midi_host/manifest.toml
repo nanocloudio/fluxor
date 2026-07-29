@@ -16,7 +16,7 @@ capabilities = ["midi.input", "midi.output"]
 # their virtual cables as one logical MIDI port. `mode: in` emits
 # `input::midi` frames on `events_out`; `mode: out` consumes frames
 # on `events_in`; `mode: duplex` does both. Used by the `midi`
-# platform stack on rp2350 and cm5 to resolve `platform.midi:
+# platform stack on rp2350 and pi5 to resolve `platform.midi:
 # {direction: in|out|duplex}`.
 #
 # Implementation status: scaffold. The PIC module compiles, packs

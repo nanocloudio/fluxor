@@ -1,4 +1,4 @@
-//! NVMe block driver — Pi 5 / CM5 PCIe1 external slot.
+//! NVMe block driver — Pi 5 PCIe1 external slot.
 //!
 //! See `README.md` for the state-machine contract, spec citations, and
 //! the bring-up checklist. See `nvme_trace/baseline/` for the
@@ -428,7 +428,7 @@ struct NvmeState {
     /// seek lands. Cleared by the next BLK_PHASE_IDLE submission. Used
     /// to scope the per-sector async-stream path to "consumer just
     /// asked for an LBA" — without this gate the IDLE branch loops
-    /// sequentially through the disk forever, which on cm5 silicon
+    /// sequentially through the disk forever, which on the pi5 board (bcm2712 silicon)
     /// eventually misses a CQE (fault code 24).
     stream_armed:        u8,
 
@@ -2483,7 +2483,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             // forever after a fat32 consumer transitions to FS_CONTRACT
             // SYNC ioctls and stops draining the streaming channel —
             // that loop was the root cause of `block read CQE timeout`
-            // fault code 24 on cm5 silicon (the controller eventually
+            // fault code 24 on the pi5 board (bcm2712 silicon) (the controller eventually
             // misses a CQE when reads queue up faster than fat32 can
             // drain via the now-unused async path).
             if s.pending_batch_valid == 0 && s.stream_armed == 0 {

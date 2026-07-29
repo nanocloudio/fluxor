@@ -1,4 +1,4 @@
-# L2 packet filter (Pi 5 / CM5 bare-metal).
+# L2 packet filter (Pi 5 bare-metal).
 #
 # Demonstrates the `rp1_gem → eth_parser → pkt_filter → debug`
 # chain: every frame the NIC receives is parsed, matched against
@@ -17,10 +17,10 @@
 # isolate latency-sensitive work from the cooperative tick.
 #
 # Build:
-#   make cm5
+#   make pi5
 # Deploy:
-#   cp target/cm5/boot/kernel8.img /boot/firmware/
-target: cm5
+#   cp target/pi5/boot/kernel8.img /boot/firmware/
+target: pi5
 
 execution:
   domains:

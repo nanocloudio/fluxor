@@ -5,7 +5,7 @@ The kernel ships on four platforms with different concurrency profiles:
 | Platform | Cores | Domains | Pump shape |
 |---|---|---|---|
 | RP2040 / RP2350 | 1 (effective) | 1 | embassy executor on core 0 |
-| BCM2712 (Pi 5 / CM5) | 4 | up to 4 (`MAX_DOMAINS = 4`) | one bare-metal pump per core, each runs its assigned domain's modules |
+| BCM2712 (Pi 5) | 4 | up to 4 (`MAX_DOMAINS = 4`) | one bare-metal pump per core, each runs its assigned domain's modules |
 | Linux | 1 (cooperative) | 1 | std thread on the main process |
 | WASM | 1 (single-threaded) | 1 | host calls `kernel_step()` on its event loop |
 

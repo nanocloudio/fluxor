@@ -11,7 +11,7 @@
 //!   `[bus:u8, dev:u8, func:u8, nic_type:u8,
 //!     vendor_id:u16 LE, device_id:u16 LE, bar0:u64 LE]`
 //!
-//! # Controllers (BCM2712 / Pi 5 / CM5)
+//! # Controllers (BCM2712 / Pi 5)
 //!
 //! - `controller = 0` (default): PCIe2 — the internal x4 link to RP1.
 //!   ECAM at `0xFD50_0000` (the VPU-exposed fallback routing).
@@ -347,7 +347,7 @@ unsafe fn bar_map(s: &mut PcieScanState, dev_idx: u8, bar_idx: u8, arg: *mut u8,
         return -12; // ENOMEM
     }
 
-    // Identity mapping (CM5 outbound PCIe window / QEMU flat)
+    // Identity mapping (Pi 5 outbound PCIe window / QEMU flat)
     let virt = phys;
 
     let mp = s.bar_maps.as_mut_ptr().add(slot);

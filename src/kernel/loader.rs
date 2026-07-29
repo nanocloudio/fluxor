@@ -1172,7 +1172,7 @@ impl LoadedModule {
 /// loader applies — see `docs/architecture/security.md` §"Load-source
 /// trust profiles".
 ///
-/// `Flash`     — signed flash image (RP / CM5 production). Integrity hash
+/// `Flash`     — signed flash image (RP / Pi 5 production). Integrity hash
 ///               + signature checks via `hal::verify_integrity` and the
 ///               `enforce_signatures` feature gate.
 /// `Embedded`  — built-in static blob (WASM `EMBEDDED_MODULES_BLOB`, Linux
@@ -1215,7 +1215,7 @@ impl ModuleLoader {
             header: None,
             // Default to Flash; `init_from_blob` overrides to Embedded.
             // Platforms whose primary load path is the flash trailer
-            // (RP, CM5) never re-set this; hosted targets calling
+            // (RP, Pi 5) never re-set this; hosted targets calling
             // `init_from_blob` get the right value automatically.
             source: LoadSource::Flash,
         }
@@ -2320,7 +2320,7 @@ impl DynamicModule {
         // Failure here is a hard load error — a module that requested
         // an arena but didn't get one will fail every heap_alloc call,
         // typically silently (the http multi-conn refactor learned this
-        // the hard way on cm5: 16+ MiB arena ask vs 4 MiB STATE_ARENA
+        // the hard way on pi5: 16+ MiB arena ask vs 4 MiB STATE_ARENA
         // → arena alloc skipped → http silently never instantiated).
         // Heap arena pointer/size captured for MMU-isolation region
         // registration below (null/0 when the module has no arena).

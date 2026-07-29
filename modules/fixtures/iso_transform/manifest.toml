@@ -7,4 +7,4 @@ hardware_targets = ["bcm2712"]
 # channel I/O via mediated syscalls with no access to kernel memory. REQUIRES
 # `protection: isolated` (run non-isolated, its `svc #1` has no EL1 handler).
 # Diagnostic/demonstration — not loaded by production configs. See
-# docs/architecture/cm5_el0_isolation.md.
+# .context/pi5_el0_isolation.md.

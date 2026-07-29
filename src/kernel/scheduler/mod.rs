@@ -53,7 +53,7 @@ pub const MAX_MODULES: usize = CONFIG_MAX_MODULES;
 // are `ModuleMask`-backed, so they scale past 64.
 // The residual ceiling is fault-cascade attribution (`detect_caused_by` keeps
 // the caused-by module id in a `u8`) and the u16 module-index domain; 256 is
-// the validated multi-Pod profile (CM5). Raising it further requires widening
+// the validated multi-Pod profile (Pi 5). Raising it further requires widening
 // those id fields.
 const _: () = assert!(
     MAX_MODULES <= 256,
@@ -750,7 +750,7 @@ pub unsafe fn static_loader() -> &'static ModuleLoader {
 }
 
 /// Mutable access to the static loader for platforms that initialize
-/// it themselves (e.g. CM5 scans flash via the trailer).
+/// it themselves (e.g. Pi 5 scans flash via the trailer).
 ///
 /// # Safety
 /// Returns an exclusive `&mut` to `STATIC_LOADER`. Only sound during
@@ -2180,7 +2180,7 @@ pub const ADAPTIVE_FLAG_CADENCE: u8 = 0x02;
 
 // ── Mechanism (b) AIMD cadence tunables (RFC adaptive_tick §5.2/§5.3) ────────
 // These are PLACEHOLDER defaults — OQ1 marks the exact values as rig-tuned on
-// the cooled CM5. The locked design constraints they must respect: AIMD is
+// the cooled Pi 5. The locked design constraints they must respect: AIMD is
 // asymmetric (fast multiplicative decrease on busy, slow additive increase on
 // idle); the minimum dwell must be ≥ the workload's burst inter-arrival or the
 // cadence sawtooths (§5.2); levels are discrete to bound step-counted rescaling
@@ -7203,7 +7203,7 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                 if params[pos] >= 2 {
                     crate::kernel::mpu::set_enabled(true);
                     sched.isolated[module_idx] = true;
-                    // On CM5/BCM2712, enable the EL0 MMU-isolation regime so
+                    // On Pi 5 (BCM2712), enable the EL0 MMU-isolation regime so
                     // `mmu::protected_step` drops the module to EL0. No-op on
                     // other platforms (the Cortex-M MPU path above stands in).
                     #[cfg(feature = "chip-bcm2712")]

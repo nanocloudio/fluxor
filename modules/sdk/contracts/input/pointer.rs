@@ -6,7 +6,7 @@
 // surface for mouse, touch, and stylus input. Producers include
 // the browser DOM (wasm_browser_pointer), Linux libinput
 // (linux_input_evdev_pointer), and touchscreen drivers on RP /
-// CM5 silicon. Pointer-mapped overlay transformers
+// pi5 board (bcm2712 silicon). Pointer-mapped overlay transformers
 // (touch_gamepad_overlay, touch_keyboard_overlay) CONSUME this
 // contract and emit something else.
 //

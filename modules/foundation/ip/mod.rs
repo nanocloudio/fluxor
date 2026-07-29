@@ -1021,7 +1021,7 @@ pub unsafe extern "C" fn module_new(
         s.use_dhcp = 1;
         // Target-tier head-sampling default (rfc_observability §sampling),
         // overridable by the `trace_sample_permille` param. The bcm2712 (aarch64)
-        // module artefact is the CM5-class rig → 50‰; MCU silicon (rp2350/rp2040,
+        // module artefact is the pi5-class rig → 50‰; MCU silicon (rp2350/rp2040,
         // thumbv8m/v6m) → 0‰ so tiny targets pay no tracing cost by default.
         #[cfg(target_arch = "aarch64")]
         {

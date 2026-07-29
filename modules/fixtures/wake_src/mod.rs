@@ -35,7 +35,7 @@ struct State {
     /// Steps between probe emits. Default 997 — CO-PRIME with wake_snk's
     /// 200-tick period so emits drift across the period window (a
     /// divisible interval phase-locks onto the due slots and fakes
-    /// dt=0). `1` = storm mode (cm5_wake_storm): emit on every step.
+    /// dt=0). `1` = storm mode (pi5_wake_storm): emit on every step.
     emit_every: u32,
     /// Busy-spin per step in µs (storm mode): inflates the domain's
     /// consumed budget so the woken-path budget bound (RFC

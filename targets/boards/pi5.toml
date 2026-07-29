@@ -1,7 +1,7 @@
-# Raspberry Pi 5 / Compute Module 5
+# Raspberry Pi 5
 # BCM2712 bare-metal with RP1 peripherals via PCIe
 #
-# Build: make cm5
+# Build: make firmware TARGET=pi5
 # Boot:  Copy kernel8.img to SD card /boot/firmware/ alongside GPU firmware
 #
 # Required config.txt:
@@ -11,15 +11,15 @@
 #   pciex4_reset=0
 
 [board]
-id = "cm5"
+id = "pi5"
 silicon = "bcm2712"
-description = "Raspberry Pi 5 / Compute Module 5 (bare-metal)"
+description = "Raspberry Pi 5 (bare-metal)"
 
-# `board-cm5` selects the RAM-origin, UART base, and RP1 init that the VPU
+# `board-pi5` selects the RAM-origin, UART base, and RP1 init that the VPU
 # firmware leaves for a real Pi 5. Without it, the same silicon builds for
 # QEMU virt. Inherits rust_target + module_target from silicon.
 [build]
-cargo_features = ["board-cm5"]
+cargo_features = ["board-pi5"]
 
 # GPIO 14/15 reserved for UART console, activity LED on GPIO 25 (active low via RP1)
 [gpio]

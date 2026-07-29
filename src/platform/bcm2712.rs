@@ -1,8 +1,8 @@
-// Platform: BCM2712 (Raspberry Pi 5 / CM5) — Cortex-A76, aarch64 bare-metal
+// Platform: BCM2712 (Raspberry Pi 5) — Cortex-A76, aarch64 bare-metal
 //
 // Two board configurations (selected at compile time):
 //   - QEMU virt (default): PL011 at 0x0900_0000, GICv2 at 0x0800_0000, RAM at 0x4008_0000
-//   - Pi 5 / CM5 (feature "board-cm5"): PL011 at 0xFE20_1000, GIC-400 at 0xFF84_1000, RAM at 0x8_0000
+//   - Pi 5 (feature "board-pi5"): PL011 at 0xFE20_1000, GIC-400 at 0xFF84_1000, RAM at 0x8_0000
 //
 // Features:
 //   - Secondary core parking (Pi 5 boots all 4 cores; cores 1-3 wait in WFE)
@@ -75,9 +75,9 @@ use uart::*;
 // `bcm2712/gic.rs` (brought in via `use gic::*` near the top of this
 // file). The constants stay name-identical so existing references in
 // the boot path resolve through the glob import unchanged.
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 const QEMU_CONFIG_BLOB_ADDR: usize = 0x4100_0000;
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 const QEMU_MODULES_BLOB_ADDR: usize = 0x4200_0000;
 
 global_asm!(
@@ -108,20 +108,20 @@ global_asm!(
 // 0x1c_0000_0000 before kernel handoff. We only need to disable ASPM
 // for reliable infrequent-access patterns (per RP1 datasheet §3.3.1.3).
 // PCIe root complex (onboard) MMIO base — used by rp1_pcie_disable_aspm.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const PCIE_RC_BASE: usize = 0x10_0012_0000;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const PCIE_MISC_HARD_PCIE_HARD_DEBUG: usize = 0x4304;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const PCIE_MISC_UBUS_CTRL: usize = 0x40a4;
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 #[inline(always)]
 unsafe fn pcie_read(off: usize) -> u32 {
     core::ptr::read_volatile((PCIE_RC_BASE + off) as *const u32)
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 #[inline(always)]
 unsafe fn pcie_write(off: usize, val: u32) {
     core::ptr::write_volatile((PCIE_RC_BASE + off) as *mut u32, val);
@@ -133,7 +133,7 @@ unsafe fn pcie_write(off: usize, val: u32) {
 ///
 /// Does NOT toggle PCIe resets or touch the outbound window — VPU firmware
 /// already brought the link up at kernel handoff.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn rp1_pcie_disable_aspm() {
     // HARD_PCIE_HARD_DEBUG (+0x4304 on Pi 5 RC).
     //  bit 1  = CLKREQ_DEBUG_ENABLE
@@ -170,7 +170,7 @@ unsafe fn rp1_pcie_disable_aspm() {
 // handoff — ethernet works under Linux with no clock/reset setup in the
 // macb driver path. We rely on that state for initial bring-up.
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -807,7 +807,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // SAFETY: Single boot-thread; MMU init runs once before any module
     // observes virtual addresses. RP1 ASPM disable touches MMIO mapped
     // by init_page_tables one line earlier.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     unsafe {
         boot_mmu::init_page_tables();
         boot_mmu::enable();
@@ -828,14 +828,14 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         core::ptr::write_volatile(&raw mut _boot_dtb_ptr, dtb_phys);
     }
 
-    #[cfg(feature = "board-cm5")]
-    uart_puts(b"[fluxor] bcm2712 boot (Pi 5 / CM5)\r\n");
-    #[cfg(not(feature = "board-cm5"))]
+    #[cfg(feature = "board-pi5")]
+    uart_puts(b"[fluxor] bcm2712 boot (Pi 5)\r\n");
+    #[cfg(not(feature = "board-pi5"))]
     uart_puts(b"[fluxor] bcm2712 boot (QEMU virt)\r\n");
 
     // QEMU virt: MMU init happens here (Pi 5 did it earlier, before PCIe).
     // SAFETY: MMU init runs once at boot before any module observes virt addrs.
-    #[cfg(not(feature = "board-cm5"))]
+    #[cfg(not(feature = "board-pi5"))]
     unsafe {
         boot_mmu::init_page_tables();
         boot_mmu::enable();
@@ -847,7 +847,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // Keep the GEM module-ID probe pre-logger because it only feeds
     // UART diagnostics. Full PCIe enumeration runs below so its
     // log::info! lines reach the ring (and therefore log_net -> UDP).
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     {
         // SAFETY: GEM_BASE + MID is the documented module-ID register at the
         // GEM MMIO base; aligned u32 read.
@@ -870,7 +870,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Force the active cooler to full so sustained-load rig runs aren't
     // confounded by thermal throttling (RFC adaptive_tick AC7). Drives the RP1
-    // PWM channel the boot firmware uses for the Pi 5 / CM5 fan; the readback is
+    // PWM channel the boot firmware uses for the Pi 5 fan; the readback is
     // logged so the rig can confirm the writes took. No-op on QEMU. Placed after
     // logger init so the report reaches the UDP telemetry stream.
     rp1::cooling_full_on();
@@ -931,13 +931,13 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // `step_one_module` body.
     use fluxor::kernel::config;
 
-    // Parse config + loader into the kernel's static state. CM5 scans
+    // Parse config + loader into the kernel's static state. Pi 5 scans
     // flash via the trailer; QEMU side-loads a packed blob at a fixed
     // address. `prepare_graph` reads STATIC_CONFIG / STATIC_LOADER from
     // there.
     loader::reset_state_arena();
     let static_state_ok = {
-        #[cfg(not(feature = "board-cm5"))]
+        #[cfg(not(feature = "board-pi5"))]
         {
             // SAFETY: QEMU virt's fluxor.ld places the config blob and
             // modules blob at known phys addresses; mappings established
@@ -975,7 +975,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
                 l_ok && c_ok
             }
         }
-        #[cfg(feature = "board-cm5")]
+        #[cfg(feature = "board-pi5")]
         {
             // Flash-trailer path: the loader scans the packed image for
             // the module table; the config sits in the same trailer.
@@ -2032,14 +2032,14 @@ fn bcm_tick_count() -> u32 {
 // device-tree `coefficients = <-550, 450000>`:  T(milli°C) = 450000 − 550·raw.
 // Verified on silicon (raw=714 → 57.3 °C, matching the Linux thermal zone).
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const AVS_TEMP_STATUS: usize = 0x10_7d54_2200;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const AVS_TEMP_VALID: u32 = (1 << 16) | (1 << 10);
 
 /// SoC die temperature in milli-Celsius, or `None` if the sensor reading is not
-/// yet valid. Board-cm5 only (no AVS monitor on the QEMU virt model).
-#[cfg(feature = "board-cm5")]
+/// yet valid. Board-pi5 only (no AVS monitor on the QEMU virt model).
+#[cfg(feature = "board-pi5")]
 pub fn soc_temp_mc() -> Option<i32> {
     // SAFETY: AVS_TEMP_STATUS is a fixed, side-effect-free MMIO status register
     // in the SoC peripheral aperture mapped by boot_mmu.
@@ -2051,7 +2051,7 @@ pub fn soc_temp_mc() -> Option<i32> {
     Some(450_000 - 550 * raw)
 }
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub fn soc_temp_mc() -> Option<i32> {
     None
 }
@@ -2185,12 +2185,12 @@ static mut BCM_DEADLINE_TICKS: u64 = 0;
 fn bcm_read_cntpct() -> u64 {
     let val: u64;
     // SAFETY: reads CNTPCT_EL0 — generic timer counter, side-effect-free.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     unsafe {
         core::arch::asm!("mrs {}, cntpct_el0", out(reg) val)
     };
     // SAFETY: reads CNTVCT_EL0 — virtual counter under KVM/QEMU.
-    #[cfg(not(feature = "board-cm5"))]
+    #[cfg(not(feature = "board-pi5"))]
     unsafe {
         core::arch::asm!("mrs {}, cntvct_el0", out(reg) val)
     };
@@ -2739,24 +2739,24 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
 
 // iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000
 // with ranges <0x0 0x10_0000_0000 0x8000_0000>.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const RNG200_BASE: usize = 0x10_7d20_8000;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const RNG200_CTRL: *mut u32 = RNG200_BASE as *mut u32;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 const RNG200_STATUS: *const u32 = (RNG200_BASE + 0x04) as *const u32;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const RNG200_DATA: *const u32 = (RNG200_BASE + 0x08) as *const u32;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const RNG200_COUNT: *const u32 = (RNG200_BASE + 0x0C) as *const u32;
 
 /// Fill buffer with hardware random bytes.
 ///
-/// Pi 5 (board-cm5): Uses iproc-rng200 hardware TRNG at 0x10_7d20_8000.
+/// Pi 5 (board-pi5): Uses iproc-rng200 hardware TRNG at 0x10_7d20_8000.
 /// QEMU virt: Uses CNTPCT_EL0 counter jitter with LCG mixing (weak).
 ///
 /// Returns len on success, -1 if the hardware failed to produce entropy.
@@ -2765,7 +2765,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     // mapped by `boot_mmu::init_page_tables`. `buf`/`len` come from a
     // caller-owned slice via the syscall ABI.
     unsafe {
-        #[cfg(feature = "board-cm5")]
+        #[cfg(feature = "board-pi5")]
         {
             // Enable RNG if not already running
             let ctrl = core::ptr::read_volatile(RNG200_CTRL);
@@ -2804,7 +2804,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
             }
         }
 
-        #[cfg(not(feature = "board-cm5"))]
+        #[cfg(not(feature = "board-pi5"))]
         {
             // QEMU virt: no hardware RNG. Use counter jitter + LCG mixing.
             // Adequate for testing only.

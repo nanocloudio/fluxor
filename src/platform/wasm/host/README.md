@@ -88,7 +88,7 @@ bindings for separate galleries).
 This directory was previously `examples/wasm/{viewer.html,player.html,host_shims.js}` — a per-bundle layout that fossilised the Python-script era (one HTML per `.wasm` bundle, each with its own bespoke shim copy that drifted from the kernel ABI). The relocation makes wasm symmetric with the other platforms:
 
 - **Linux**: `src/bin/fluxor-linux.rs` is the runtime; `examples/<capability>/linux.yaml` are pure graph manifests.
-- **RP / BCM**: kernel firmware blob built by `make firmware`; `examples/<capability>/{pico2w,cm5}.yaml` are pure graph manifests.
+- **RP / BCM**: kernel firmware blob built by `make firmware`; `examples/<capability>/{pico2w,pi5}.yaml` are pure graph manifests.
 - **WASM**: `src/platform/wasm/host/*` is the runtime; `examples/<capability>/wasm.yaml` are pure graph manifests.
 
 No per-bundle HTML, no per-bundle JS. One runtime, infinitely many

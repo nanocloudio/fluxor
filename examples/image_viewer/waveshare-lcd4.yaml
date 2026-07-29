@@ -1,6 +1,6 @@
 # Image Viewer — Waveshare RP2350-Touch-LCD-4, SD-backed.
 #
-# Same overall shape as the cm5 / linux / wasm variants:
+# Same overall shape as the pi5 / linux / wasm variants:
 #
 #   storage → bank → codec → display
 #   input → bank.commands  (cycle next / prev)
@@ -23,7 +23,7 @@
 # cycle, single decoder pipeline):
 #   examples/image_viewer/waveshare-lcd4-inline.yaml — bake-in test
 #                                                     pattern; no SD
-#   examples/image_viewer/cm5.yaml                   — cm5 decodes, browser displays
+#   examples/image_viewer/pi5.yaml                   — pi5 decodes, browser displays
 #   examples/image_viewer/linux.yaml                 — linux decodes, browser displays
 #   examples/image_viewer/wasm.yaml                  — full browser
 target: waveshare-lcd4
@@ -49,7 +49,7 @@ modules:
   - name: flash_rp
 
   # Click counter + FMP mapper. Single tap = next, double tap = prev.
-  # Same `gesture` module the wasm / linux / cm5 variants use.
+  # Same `gesture` module the wasm / linux / pi5 variants use.
   - name: gesture
     click: next
     double_click: prev

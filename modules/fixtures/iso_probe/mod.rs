@@ -1,10 +1,10 @@
-//! EL0 isolation probe — a purpose-built PIC module for the CM5
+//! EL0 isolation probe — a purpose-built PIC module for the Pi 5
 //! module-isolation walking skeleton (`protection: isolated`).
 //!
 //! The probe runs **at EL0 under its own page table** and demonstrates, one
 //! `mode` at a time, that the hardware boundary behaves as designed:
 //!
-//! | mode | name          | expected result on CM5                              |
+//! | mode | name          | expected result on Pi 5                              |
 //! |------|---------------|-----------------------------------------------------|
 //! | 0    | `self_rw`     | reads+writes its own state, returns Continue (OK)   |
 //! | 1    | `kernel_read` | dereferences a kernel pointer → EL0 data abort      |
@@ -41,7 +41,7 @@
 //! (Continue / Done / Error) and through the faults it deliberately raises.
 //! `dev_log` is used only in `module_new`, which runs at EL1 during
 //! instantiation. A minimal SVC syscall gateway is a documented follow-up
-//! (see `docs/architecture/cm5_el0_isolation.md`).
+//! (see `.context/pi5_el0_isolation.md`).
 
 #![no_std]
 #![allow(

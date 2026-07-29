@@ -5,7 +5,7 @@
 //! `SyscallTable` function pointers.
 //!
 //! Wire it as an `protection: isolated` module; see
-//! `examples/iso_heap/cm5.yaml`.
+//! `examples/iso_heap/pi5.yaml`.
 //!
 //! ## What each `module_step` proves (one full cycle per step)
 //!

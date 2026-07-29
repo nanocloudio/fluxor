@@ -50,7 +50,7 @@ pub struct BuildRecipe {
 pub enum BuildOutput {
     /// Single-file artifact (e.g. a UF2). Absolute path.
     File(PathBuf),
-    /// Multi-file artifact bundle (e.g. CM5 boot bundle). Absolute path
+    /// Multi-file artifact bundle (e.g. pi5 boot bundle). Absolute path
     /// to the directory; the deploy adapter decides what to do with its
     /// contents based on the board's artifact class.
     Bundle(PathBuf),
@@ -224,9 +224,9 @@ mod tests {
     #[test]
     fn parses_both_artifact_shapes() {
         let src = r#"
-            [build.cm5]
-            command = ["make", "firmware", "TARGET=cm5"]
-            artifact_bundle_dir = "target/cm5/bundle"
+            [build.pi5]
+            command = ["make", "firmware", "TARGET=pi5"]
+            artifact_bundle_dir = "target/pi5/bundle"
 
             [build.pico2w]
             command = ["cargo", "build", "--release"]
@@ -236,11 +236,11 @@ mod tests {
             parse_project_str(src, Path::new("/home/me/proj"), "proj/.fluxor-rig.toml").unwrap();
         assert_eq!(p.builds.len(), 2);
 
-        let cm5 = p.recipe("cm5").unwrap();
-        assert_eq!(cm5.command, vec!["make", "firmware", "TARGET=cm5"]);
-        match &cm5.output {
+        let pi5 = p.recipe("pi5").unwrap();
+        assert_eq!(pi5.command, vec!["make", "firmware", "TARGET=pi5"]);
+        match &pi5.output {
             BuildOutput::Bundle(path) => {
-                assert_eq!(path, &PathBuf::from("/home/me/proj/target/cm5/bundle"));
+                assert_eq!(path, &PathBuf::from("/home/me/proj/target/pi5/bundle"));
             }
             _ => panic!("expected bundle"),
         }
@@ -258,13 +258,13 @@ mod tests {
     #[test]
     fn absolute_output_path_preserved() {
         let src = r#"
-            [build.cm5]
+            [build.pi5]
             command = ["make"]
-            artifact_bundle_dir = "/srv/fluxor/cm5-out"
+            artifact_bundle_dir = "/srv/fluxor/pi5-out"
         "#;
         let p = parse_project_str(src, Path::new("/proj"), "p").unwrap();
-        match &p.recipe("cm5").unwrap().output {
-            BuildOutput::Bundle(path) => assert_eq!(path, &PathBuf::from("/srv/fluxor/cm5-out")),
+        match &p.recipe("pi5").unwrap().output {
+            BuildOutput::Bundle(path) => assert_eq!(path, &PathBuf::from("/srv/fluxor/pi5-out")),
             _ => panic!(),
         }
     }
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn empty_command_rejected() {
         let src = r#"
-            [build.cm5]
+            [build.pi5]
             command = []
             artifact = "x.uf2"
         "#;
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn both_outputs_rejected() {
         let src = r#"
-            [build.cm5]
+            [build.pi5]
             command = ["a"]
             artifact = "a.uf2"
             artifact_bundle_dir = "b"
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn no_output_rejected() {
         let src = r#"
-            [build.cm5]
+            [build.pi5]
             command = ["a"]
         "#;
         assert!(parse_project_str(src, Path::new("/"), "p").is_err());
@@ -306,7 +306,7 @@ mod tests {
         std::fs::write(
             &descriptor,
             r#"
-                [build.cm5]
+                [build.pi5]
                 command = ["make"]
                 artifact_bundle_dir = "target/out"
             "#,
@@ -317,7 +317,7 @@ mod tests {
         let p = ProjectDescriptor::load_for_project(&descriptor, &elsewhere).unwrap();
 
         assert_eq!(p.project_root, elsewhere);
-        match &p.recipe("cm5").unwrap().output {
+        match &p.recipe("pi5").unwrap().output {
             BuildOutput::Bundle(path) => {
                 assert_eq!(path, &elsewhere.join("target").join("out"));
             }

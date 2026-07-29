@@ -100,7 +100,7 @@ Staging policy is target-specific:
 
 - RP-class boards stage into reserved flash sectors when capacity
   permits.
-- BCM2712/CM5-class targets stage into DRAM, NVMe, SD, or another
+- pi5-class targets stage into DRAM, NVMe, SD, or another
   board-selected backing store.
 - Linux-hosted runs stage into the host filesystem.
 - WASM-hosted deployments stage in the browser/host storage layer

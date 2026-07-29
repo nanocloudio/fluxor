@@ -4843,7 +4843,7 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             const E_NODEV: i32 = -19;
             const E_NOSYS: i32 = -38;
             const E_AGAIN: i32 = -11;
-            const FS_STAT_PROBE_TIMEOUT_TICKS: u16 = 1500; // ~30 s on cm5 4 kHz
+            const FS_STAT_PROBE_TIMEOUT_TICKS: u16 = 1500; // ~30 s on pi5 4 kHz
             let sys = &*s.syscalls;
             let mut stat = [0u8; 8];
             let st = (sys.provider_call)(

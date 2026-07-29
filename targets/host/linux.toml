@@ -1,4 +1,5 @@
-# Linux hosted — runs as a userspace process on aarch64 Linux
+# Linux host — fluxor as a userspace process on aarch64 Linux.
+# Host-level target: not a silicon, not a board (targets/host/).
 # No real hardware peripherals; modules communicate via kernel channels.
 
 [target]
@@ -40,3 +41,6 @@ ram_base = "0x00000000"
 ram_size = "0x00000000"
 flash_base = "0x00000000"
 flash_size = "0x00000000"
+
+[platform.net]
+provider = "host"

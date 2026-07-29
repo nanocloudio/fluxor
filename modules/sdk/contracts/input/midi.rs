@@ -7,7 +7,7 @@
 // not need to bit-twiddle MIDI status bytes. Producers include
 // browser Web MIDI (`wasm_browser_midi_in`), Linux ALSA seq
 // (`linux_alsa_midi`), and class-compliant USB-MIDI hosts on
-// rp2350 and cm5 (`usb_midi_host`). Symmetric output drivers
+// rp2350 and pi5 (`usb_midi_host`). Symmetric output drivers
 // (`wasm_browser_midi_out`, `linux_alsa_midi` in `out` mode,
 // `usb_midi_host` device-out) consume the same wire shape.
 //

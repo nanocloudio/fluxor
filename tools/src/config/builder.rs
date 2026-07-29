@@ -662,7 +662,7 @@ fn validate_adaptive_tick(
         )));
     }
 
-    // §10 BCM2712 wake-policy declaration (required statement). On bcm2712/cm5,
+    // §10 BCM2712 wake-policy declaration (required statement). On bcm2712 (pi5),
     // demand-driven idle (mechanism (a), bit 0) is NOT fully event-driven —
     // Tier-0/1a idle uses WFI, which software SEV does not break — so every
     // adaptive-idle config MUST declare how it bounds first-wake latency:
@@ -670,10 +670,11 @@ fn validate_adaptive_tick(
     // `wfe` (only where the platform contract proves it safe). The declaration
     // forces the deployment to acknowledge "bounded idle polling", not
     // "event-driven idle". rp/Linux/wasm are event-driven and exempt.
-    let is_bcm = silicon.is_some_and(|s| {
-        let s = s.to_ascii_lowercase();
-        s.contains("bcm") || s.contains("cm5")
-    });
+    // Registry-resolved: bcm2712 silicon (pi5, qemu-virt, raw bcm2712),
+    // NOT the linux host (event-driven, exempt) — no substring matching.
+    let is_bcm = silicon
+        .and_then(|s| crate::target::load_target(s, &crate::project::root()).ok())
+        .is_some_and(|d| !d.is_host() && d.id == "bcm2712");
     let any_idle = (0..MAX_DOMAINS).any(|d| flags[d] & ADAPTIVE_FLAG_IDLE as u64 != 0);
     if is_bcm && any_idle {
         let policy = config
@@ -691,7 +692,7 @@ fn validate_adaptive_tick(
             }
             None => {
                 return Err(Error::Config(
-                    "bcm2712/cm5 adaptive idle (adaptive_flags bit 0) requires an \
+                    "bcm2712 (pi5) adaptive idle (adaptive_flags bit 0) requires an \
                      explicit `execution.bcm_wake_policy` of \"clamp\", \"doorbell\", \
                      or \"wfe\". bcm2712 idle is WFI-based and not fully event-driven, \
                      so the deployment must declare how first-wake latency is bounded \
@@ -1153,7 +1154,7 @@ fn validate_isr_tier_admission(
     // The runtime `irq_bind` on each platform enforces the same bound as a
     // backstop.
     //
-    //   - GIC-400 (bcm2712/cm5): INTIDs 0..=1019. 1020..=1023 are
+    //   - GIC-400 (bcm2712): INTIDs 0..=1019. 1020..=1023 are
     //     reserved/special (e.g. 1023 = spurious). SGIs (0-15), PPIs (16-31) and
     //     SPIs (32-1019) are all valid Tier-2 owners (the `tier2_probe` example
     //     legitimately owns SGI 15).
@@ -1164,24 +1165,26 @@ fn validate_isr_tier_admission(
     //   - RP2040 (Cortex-M0+ NVIC): highest line is SWI_IRQ_5 = 31, so 0..=31
     //     (rp-pac `rp2040::Interrupt`).
     //
-    // `resolved_target` (the CLI's silicon id, e.g. "rp2350b") is authoritative;
-    // a board name in `config.target` (e.g. "pico2w") is the fallback and is
-    // matched on family substrings. Unknown/host targets keep the u16 bound.
+    // `resolved_target` (the CLI target) is authoritative; a `target:` in
+    // the YAML is the fallback. Board names resolve to silicon through the
+    // `targets/` registry (the only board→silicon mapping); the IRQ bound
+    // is then keyed on the exact silicon id. Host targets (linux/wasm)
+    // and unknown names keep the u16 bound.
     {
-        let silicon = resolved_target
+        let target_name = resolved_target
             .or_else(|| config.get("target").and_then(|t| t.as_str()))
             .map(|s| s.to_ascii_lowercase());
         // (max_valid_intid, controller_label) for the resolved silicon, if known.
-        let irq_bound: Option<(u64, &str)> = silicon.as_deref().and_then(|s| {
-            if s.contains("bcm") || s.contains("cm5") || s.contains("aarch64") || s.contains("pi5")
-            {
-                Some((1019, "GIC-400 (bcm2712/cm5)"))
-            } else if s.contains("rp2040") || s.contains("rp204") || s == "picow" || s == "pico" {
-                Some((31, "RP2040 NVIC"))
-            } else if s.contains("rp235") || s.contains("rp2") || s.contains("pico2") {
-                Some((52, "RP2350 NVIC"))
-            } else {
-                None
+        let irq_bound: Option<(u64, &str)> = target_name.as_deref().and_then(|t| {
+            let desc = crate::target::load_target(t, &crate::project::root()).ok()?;
+            if desc.is_host() {
+                return None;
+            }
+            match desc.id.as_str() {
+                "bcm2712" => Some((1019, "GIC-400 (bcm2712)")),
+                "rp2040" => Some((31, "RP2040 NVIC")),
+                "rp2350" => Some((52, "RP2350 NVIC")),
+                _ => None,
             }
         });
         if let Some((max_intid, label)) = irq_bound {
@@ -1610,7 +1613,7 @@ pub(crate) fn parse_domain_tier_to_exec_mode(domain: &Value) -> Option<u8> {
         }
     }
     // Legacy `exec_mode:` synonym — kept so existing configs (e.g.
-    // `examples/cm5/*` exercising Tier 1a) build unchanged.
+    // `examples/log_net/pi5*` exercising Tier 1a) build unchanged.
     if let Some(m) = domain.get("exec_mode").and_then(|m| m.as_str()) {
         return match m {
             "cooperative" => Some(0),

@@ -230,7 +230,7 @@ struct DnsState {
     tlm: TlmCounters,
     tlm_last_ms: u64,
     /// Head-sampling rate (per-mille) for `dns.query` spans. Target-tier
-    /// default: 50‰ on aarch64 (CM5-class), 0‰ on MCUs. Decided per query
+    /// default: 50‰ on aarch64 (pi5-class), 0‰ on MCUs. Decided per query
     /// from its minted trace id.
     sample_permille: u16,
 
@@ -1206,7 +1206,7 @@ pub extern "C" fn module_new(
 
         // Resolve the target-tier head-sampling default only when the
         // `trace_sample_permille` param was not explicitly supplied (still the
-        // `0xFFFF` sentinel): aarch64 (CM5-class) 50‰, MCUs 0‰. An explicit
+        // `0xFFFF` sentinel): aarch64 (pi5-class) 50‰, MCUs 0‰. An explicit
         // value (including 0) is honoured as-is.
         if s.sample_permille == 0xFFFF {
             #[cfg(target_arch = "aarch64")]

@@ -501,7 +501,7 @@ pub fn last_psci_ret(core_id: u8) -> i32 {
 /// `core_id`: 1, 2, or 3 (core 0 is the boot core).
 /// `entry`: function the secondary core will execute (never returns).
 /// Returns `true` if PSCI accepted the request.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     if core_id == 0 || core_id > 3 {
         return false;
@@ -547,7 +547,7 @@ pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
 }
 
 /// Wake a secondary core on QEMU virt via PSCI CPU_ON (HVC).
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub fn wake_core(core_id: u8, entry: fn() -> !) -> bool {
     if core_id == 0 || core_id > 3 {
         return false;
@@ -730,12 +730,12 @@ pub fn is_core_started(core_id: u8) -> bool {
 
 /// BCM2712 DMA40 controller base address (40-bit DMA).
 /// 16 channels (0-15), each with a 256-byte register block.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const DMA40_BASE: usize = 0x1000e000;
 
 /// RP1 DMA base address (Synopsys AXI DMA, 8 channels).
 /// Accessible via the RP1 PCIe BAR.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const RP1_DMA_BASE: usize = 0x1f00_8000;
 
 /// DMA40 channel register offsets (per-channel, 256 bytes apart).
@@ -773,7 +773,7 @@ pub mod dma40 {
     pub const TI_DEST_INC: u32 = 1 << 4;
 
     /// Compute base address for a DMA40 channel.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub fn channel_base(ch: u8) -> usize {
         super::DMA40_BASE + (ch as usize) * CHANNEL_SIZE
     }
@@ -782,7 +782,7 @@ pub mod dma40 {
     ///
     /// # Safety
     /// Caller must ensure the address is valid and mapped.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub unsafe fn read_reg(ch: u8, offset: usize) -> u32 {
         let addr = channel_base(ch) + offset;
         core::ptr::read_volatile(addr as *const u32)
@@ -792,13 +792,13 @@ pub mod dma40 {
     ///
     /// # Safety
     /// Caller must ensure the address is valid and mapped.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub unsafe fn write_reg(ch: u8, offset: usize, val: u32) {
         let addr = channel_base(ch) + offset;
         core::ptr::write_volatile(addr as *mut u32, val);
     }
 
-    /// Start a DMA40 memory-to-memory transfer (board-cm5 real hardware).
+    /// Start a DMA40 memory-to-memory transfer (board-pi5 real hardware).
     ///
     /// Programs the channel registers directly (no control block chain).
     /// `ch`: DMA40 channel (0-15).
@@ -808,7 +808,7 @@ pub mod dma40 {
     ///
     /// # Safety
     /// Addresses must be valid and mapped. Channel must not be in use.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub unsafe fn start_transfer(ch: u8, src: usize, dst: usize, len: usize) {
         let base = channel_base(ch);
         // Reset the channel
@@ -828,7 +828,7 @@ pub mod dma40 {
     /// Poll a DMA40 channel for completion.
     ///
     /// Returns `true` if the transfer is complete (or errored), `false` if still active.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub fn poll(ch: u8) -> bool {
         // SAFETY: DMA40 CS register read at a fixed MMIO address mapped
         // by boot_mmu::init_page_tables; `read_reg` does the channel-base
@@ -847,15 +847,15 @@ pub mod dma40 {
     /// of at least `len` bytes that are not aliased by any other reference
     /// for the duration of the call. Same contract as the real hardware
     /// path: this stub completes synchronously, but callers gate on `poll`
-    /// for parity with `board-cm5`.
-    #[cfg(not(feature = "board-cm5"))]
+    /// for parity with `board-pi5`.
+    #[cfg(not(feature = "board-pi5"))]
     pub unsafe fn start_transfer(ch: u8, src: usize, dst: usize, len: usize) {
         let _ = ch;
         core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
     }
 
     /// Poll a DMA40 channel (QEMU stub — always complete since start_transfer is synchronous).
-    #[cfg(not(feature = "board-cm5"))]
+    #[cfg(not(feature = "board-pi5"))]
     pub fn poll(_ch: u8) -> bool {
         true
     }
@@ -902,7 +902,7 @@ pub mod rp1_dma {
     pub const CFG_CH_PRIOR: u32 = 0; // Priority 0 (highest)
 
     /// Compute base address for an RP1 DMA channel.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub fn channel_base(ch: u8) -> usize {
         super::RP1_DMA_BASE + (ch as usize) * CHANNEL_SIZE
     }
@@ -911,7 +911,7 @@ pub mod rp1_dma {
     ///
     /// # Safety
     /// Caller must ensure the address is valid and mapped.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub unsafe fn read_reg(ch: u8, offset: usize) -> u32 {
         let addr = channel_base(ch) + offset;
         core::ptr::read_volatile(addr as *const u32)
@@ -921,13 +921,13 @@ pub mod rp1_dma {
     ///
     /// # Safety
     /// Caller must ensure the address is valid and mapped.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub unsafe fn write_reg(ch: u8, offset: usize, val: u32) {
         let addr = channel_base(ch) + offset;
         core::ptr::write_volatile(addr as *mut u32, val);
     }
 
-    /// Start an RP1 DMA memory-to-memory transfer (board-cm5 real hardware).
+    /// Start an RP1 DMA memory-to-memory transfer (board-pi5 real hardware).
     ///
     /// Programs the Synopsys AXI DMA channel for a single-block transfer.
     /// `ch`: RP1 DMA channel (0-7).
@@ -937,7 +937,7 @@ pub mod rp1_dma {
     ///
     /// # Safety
     /// Addresses must be valid and within RP1-accessible space. Channel must not be in use.
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub unsafe fn start_transfer(ch: u8, src: usize, dst: usize, len: usize) {
         if ch as usize >= NUM_CHANNELS {
             return;
@@ -967,7 +967,7 @@ pub mod rp1_dma {
     /// Poll an RP1 DMA channel for completion.
     ///
     /// Returns `true` if the channel is no longer enabled (transfer complete).
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     pub fn poll(ch: u8) -> bool {
         if ch as usize >= NUM_CHANNELS {
             return true;
@@ -986,17 +986,17 @@ pub mod rp1_dma {
     /// # Safety
     /// `src` and `dst` must point to valid, non-overlapping memory regions
     /// of at least `len` bytes, not aliased by any other reference for the
-    /// duration of the call. Mirrors the `board-cm5` hardware path's
+    /// duration of the call. Mirrors the `board-pi5` hardware path's
     /// contract — this stub completes synchronously, callers still gate on
     /// `poll` for shared scheduling logic.
-    #[cfg(not(feature = "board-cm5"))]
+    #[cfg(not(feature = "board-pi5"))]
     pub unsafe fn start_transfer(ch: u8, src: usize, dst: usize, len: usize) {
         let _ = ch;
         core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
     }
 
     /// Poll an RP1 DMA channel (QEMU stub — always complete).
-    #[cfg(not(feature = "board-cm5"))]
+    #[cfg(not(feature = "board-pi5"))]
     pub fn poll(_ch: u8) -> bool {
         true
     }

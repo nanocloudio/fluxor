@@ -56,6 +56,7 @@ pub mod publish;
 pub mod registry;
 pub mod render_template;
 pub mod sync;
+pub mod target;
 pub mod text_distance;
 pub mod trust;
 pub mod workload;

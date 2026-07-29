@@ -37,7 +37,7 @@ Fluxor takes a different approach:
 
 - **Determinism is structural, not aspirational.** No GC. No work-stealing scheduler. No mutex contention (each domain is single-threaded). No surprise allocations. Backpressure flows through channel fullness, not credit counters in application code. Modules are bounded in time per step and in memory per arena, by contract.
 
-- **Composition is the unit of reuse.** A module compiled once runs unchanged across silicon families with matching architecture. A music player on a Pico W and a music player streaming over network use the same MP3 decoder module, the same I2S driver module, with different wiring. A consensus node on bare-metal aarch64 reuses the same WAL, commit-tracker, and apply-pipeline modules whether the network underneath is virtio or PCIe Ethernet. A retro-computer emulator runs as the same Z80 core on a Pico 2 W, on a CM5 bare-metal stack, and as a WASM bundle in the browser — only the providers underneath change.
+- **Composition is the unit of reuse.** A module compiled once runs unchanged across silicon families with matching architecture. A music player on a Pico W and a music player streaming over network use the same MP3 decoder module, the same I2S driver module, with different wiring. A consensus node on bare-metal aarch64 reuses the same WAL, commit-tracker, and apply-pipeline modules whether the network underneath is virtio or PCIe Ethernet. A retro-computer emulator runs as the same Z80 core on a Pico 2 W, on a Raspberry Pi 5 bare-metal stack, and as a WASM bundle in the browser — only the providers underneath change.
 
 - **The kernel is small and stays small.** Adding support for a new chip means writing a driver module, not modifying the kernel. Adding a new protocol means writing a foundation module, not modifying the kernel. Nothing in the kernel grows with the number of supported devices or protocols.
 
@@ -79,7 +79,7 @@ These are not separate Fluxor variants. They are graphs in the same runtime, val
 |     scheduler  •  channels  •  events  •  loader  •  HAL        |
 +----------------------------------------------------------------+
 |                          Silicon                                 |
-|             RP2040  •  RP2350  •  BCM2712  •  CM5               |
+|               RP2040  •  RP2350  •  BCM2712                     |
 +----------------------------------------------------------------+
 ```
 
@@ -128,7 +128,7 @@ Fluxor separates **silicon** (the chip — its peripherals, register layout, and
 | **Pico 2**, **Pico 2 W** | RP2350A | Standard Raspberry Pi Pico 2 boards |
 | **Waveshare LCD modules** | RP2350A/B | RP2350-based boards with on-board displays and touch |
 | **QEMU virt** | BCM2712 | Synthetic aarch64 target for development under QEMU |
-| **CM5** | BCM2712 | Raspberry Pi Compute Module 5 (bare metal) |
+| **Pi 5** | BCM2712 | Raspberry Pi 5 (bare metal) |
 | **Linux** | Linux host | Host-side runtime for embedded Linux services and simulation |
 
 Silicon definitions live in `targets/silicon/*.toml`. Board definitions live in `targets/boards/*.toml` and layer board-specific pin assignments and on-board peripherals on top of the chosen silicon.
@@ -146,7 +146,7 @@ Install Rust targets you plan to build:
 ```bash
 rustup target add thumbv8m.main-none-eabihf   # RP2350
 rustup target add thumbv6m-none-eabi          # RP2040
-rustup target add aarch64-unknown-none        # BCM2712 / CM5
+rustup target add aarch64-unknown-none        # BCM2712 (pi5 / qemu-virt)
 rustup target add aarch64-unknown-linux-gnu   # host tools
 ```
 
@@ -165,7 +165,7 @@ default goal, so a bare `make` does the same.
 A single kernel target (the Makefile selector is `TARGET`):
 
 ```bash
-make firmware TARGET=rp2040    # also: rp2350 | bcm2712 | cm5 | wasm
+make firmware TARGET=rp2040    # also: rp2350 | qemu-virt | pi5 | wasm
 ```
 
 PIC modules, in the target layout consumed by `fluxor build`, `combine`, and `run`:
@@ -187,7 +187,7 @@ Hardware targets build an artifact and then flash:
 
 ```bash
 fluxor flash examples/static_server/pico2w.yaml
-fluxor flash examples/hello/cm5.yaml
+fluxor flash examples/hello/pi5.yaml
 ```
 
 You can also build a single packaged artifact without flashing:

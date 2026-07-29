@@ -33,7 +33,7 @@
 #   examples/audio_player_inline/pico2w.yaml  — synth-generated PCM
 #                                               baked into config,
 #                                               no SD card needed
-#   examples/audio_player/cm5-split.yaml      — pi5 decodes,
+#   examples/audio_player/pi5-split.yaml      — pi5 decodes,
 #                                               browser plays via WebAudio
 #   examples/audio_player/linux.yaml          — linux decodes,
 #                                               browser plays

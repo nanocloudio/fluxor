@@ -7,7 +7,7 @@
 //!
 //! `mode: in` emits frames on `events_out`; `mode: out` consumes
 //! frames on `events_in`; `mode: duplex` does both. The stack
-//! `stacks/midi.toml` selects this module on pico2w / picow / cm5
+//! `stacks/midi.toml` selects this module on pico2w / picow / pi5
 //! targets via `platform.midi: {direction: ...}`.
 //!
 //! Status: **scaffold only**. The module compiles, packs to `.fmod`,
@@ -16,7 +16,7 @@
 //!
 //!   1. A USB host controller driver on the target silicon (the
 //!      RP2350 has an OTG controller exposed via embassy-rp's device
-//!      side; the host side does not exist yet. BCM2712 / CM5 uses
+//!      side; the host side does not exist yet. BCM2712 / Pi 5 uses
 //!      DesignWare DWC2 — also absent.).
 //!   2. Kernel-side `provider::contract::USB_HOST` vtable wiring
 //!      `BIND` / `OPEN_ENDPOINT` / `BULK_READ` / `BULK_WRITE` /

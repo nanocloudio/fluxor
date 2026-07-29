@@ -33,7 +33,7 @@
 #
 # Sibling variants (same overall shape, different deployment):
 #   examples/image_viewer/linux.yaml  — linux decodes, browser displays
-#   examples/image_viewer/cm5.yaml    — cm5 silicon decodes, browser displays
+#   examples/image_viewer/pi5.yaml    — pi5 board (bcm2712 silicon) decodes, browser displays
 #   examples/image_viewer/waveshare-lcd4.yaml — single-board hardware display
 
 target: wasm
@@ -125,7 +125,7 @@ modules:
 
   # Unified PIC codec — auto-detects BMP/GIF/PNG/JPEG (and the
   # audio formats, though they're not wired here). Same module the
-  # cm5 / linux / pico2w producers use; lives at modules/app/codec/.
+  # pi5 / linux / pico2w producers use; lives at modules/app/codec/.
   - name: codec
     width: 960
     height: 540

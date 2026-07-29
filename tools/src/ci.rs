@@ -464,9 +464,9 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: Some("host-linux"),
             package_gate: None,
         },
-        // RP2350B firmware.
+        // RP2350 firmware (chip-rp2350b is the superset chip feature).
         ClippyJob {
-            label: "kernel rp2350b",
+            label: "kernel rp2350",
             cwd: "",
             args: &[
                 "clippy",
@@ -521,9 +521,9 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: Some("chip-bcm2712"),
             package_gate: None,
         },
-        // CM5 (BCM2712 with board overlay).
+        // Pi 5 (BCM2712 with board overlay).
         ClippyJob {
-            label: "kernel board-cm5",
+            label: "kernel board-pi5",
             cwd: "",
             args: &[
                 "clippy",
@@ -532,12 +532,12 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
                 "aarch64-unknown-none",
                 "--no-default-features",
                 "--features",
-                "board-cm5",
+                "board-pi5",
                 "--",
                 "-D",
                 "warnings",
             ],
-            feature_gate: Some("board-cm5"),
+            feature_gate: Some("board-pi5"),
             package_gate: None,
         },
         // wasm.

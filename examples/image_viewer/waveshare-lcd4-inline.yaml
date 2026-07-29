@@ -13,7 +13,7 @@
 #
 # Sibling variants (same overall shape, real image sources):
 #   examples/image_viewer/waveshare-lcd4.yaml — SD card
-#   examples/image_viewer/cm5.yaml            — cm5 decodes, browser displays
+#   examples/image_viewer/pi5.yaml            — pi5 decodes, browser displays
 #   examples/image_viewer/linux.yaml          — linux decodes, browser displays
 #   examples/image_viewer/wasm.yaml           — full browser
 target: waveshare-lcd4

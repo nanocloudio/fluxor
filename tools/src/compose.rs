@@ -98,13 +98,13 @@ pub struct NodeCapacity {
 /// mirror of the kernel's per-profile limits; `capacity_mirrors_kernel_sources`
 /// (below) textually extracts the kernel constants and fails when they drift.
 ///
-/// `linux` and `cm5`/`bcm2712` share values because both compile the aarch64
+/// `linux` and `pi5`/`bcm2712` share values because both compile the aarch64
 /// `profile_host` block (`modules/sdk/config.rs`) with the `multitenant`
 /// feature (`src/kernel/owner.rs` MAX_OWNERS). `max_endpoints` is agent-level
 /// admission policy — the kernel has no endpoint table constant yet.
 pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
     match profile {
-        "linux" | "cm5" | "bcm2712" => Some(NodeCapacity {
+        "linux" | "pi5" | "bcm2712" => Some(NodeCapacity {
             max_owners: 64,                // owner.rs MAX_OWNERS (multitenant)
             max_modules: 128,              // sdk config profile_host MAX_MODULES
             max_edges: 128,                // kernel/config.rs MAX_GRAPH_EDGES
@@ -1672,8 +1672,8 @@ mod tests {
         assert_eq!(cap.buffer_bytes as u64, extract(&sdk, "BUFFER_ARENA_SIZE"));
         assert_eq!(cap.max_edges as u64, extract(&kcfg, "MAX_GRAPH_EDGES"));
         assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
-        // cm5/bcm2712 alias the same aarch64 profile.
-        for alias in ["cm5", "bcm2712"] {
+        // pi5/bcm2712 alias the same aarch64 profile.
+        for alias in ["pi5", "bcm2712"] {
             let c = capacity_for_profile(alias).expect(alias);
             assert_eq!(c.max_modules, cap.max_modules);
             assert_eq!(c.max_owners, cap.max_owners);

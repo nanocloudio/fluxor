@@ -1,10 +1,13 @@
 //! Target configuration loader.
 //!
-//! Loads silicon and board TOML definitions from the `targets/` directory
-//! and provides a unified `TargetDescriptor` for validation and build.
+//! Loads silicon, board, and host TOML definitions from the `targets/`
+//! directory and provides a unified `TargetDescriptor` for validation and
+//! build.
 //!
-//! Resolution: `load_target("pico2w")` checks `targets/boards/pico2w.toml` first
-//! (which references silicon "rp2350a"), then falls back to `targets/silicon/pico2w.toml`.
+//! Resolution: `load_target("pico2w")` checks `targets/boards/pico2w.toml`
+//! first (which references silicon "rp2350"), then `targets/host/`, then
+//! `targets/silicon/`. The registry is the ONLY board→silicon mapping —
+//! tooling must not carry alias tables (standards/target_consolidation.md §3).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,6 +27,9 @@ struct TomlSiliconFile {
     memory: Option<TomlMemoryConfig>,
     kernel: Option<TomlKernelConfig>,
     isolation: Option<TomlIsolationConfig>,
+    /// Platform stack defaults — used by host descriptors (e.g.
+    /// `[platform.net] provider = "host"`); silicon files omit it.
+    platform: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -112,7 +118,7 @@ struct TomlBoardFile {
 }
 
 /// Board-level build overrides. Only present for boards that need cargo
-/// features beyond the silicon defaults (e.g. `board-cm5` selects Pi 5
+/// features beyond the silicon defaults (e.g. `board-pi5` selects Pi 5
 /// RAM origin and RP1 init). Unspecified fields inherit from silicon.
 #[derive(Deserialize)]
 struct TomlBoardBuild {
@@ -137,10 +143,22 @@ struct TomlBoardMeta {
 
 // ── Public types ────────────────────────────────────────────────────────────
 
+/// Which registry tier a target name resolved through. Boards deploy,
+/// hosts run fluxor as a process, silicon keys module artifacts. See
+/// standards/target_consolidation.md §2 for where each may appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Silicon,
+    Board,
+    Host,
+}
+
 /// Resolved target descriptor combining silicon + optional board info.
 #[derive(Debug, Clone)]
 pub struct TargetDescriptor {
-    /// Silicon target id (e.g. "rp2350a")
+    /// Registry tier the name resolved through.
+    pub kind: TargetKind,
+    /// Silicon target id (e.g. "rp2350")
     pub id: String,
     /// Silicon family (e.g. "rp2", "esp32")
     pub family: String,
@@ -273,16 +291,37 @@ impl TargetDescriptor {
     /// silicon; the linux host answers `bcm2712` because it loads the same
     /// aarch64 PIC modules. Declare the exception in the target TOML
     /// (`[target].module_silicon`) so a new host family never has to touch
-    /// this code. Board aliases (`cm5` → `bcm2712`, `rp2350a` → `rp2350`)
-    /// still resolve through `modules_build::target_to_silicon`.
+    /// this code. There are no alias tables: boards resolve through their
+    /// `[board].silicon` field, so `self.id` IS the silicon id here.
     pub fn module_silicon(&self) -> &str {
         match self.module_silicon_override {
             Some(ref s) => s,
-            None => crate::modules_build::target_to_silicon(&self.id),
+            None => &self.id,
         }
     }
 
-    /// Display name: "pico2w (RP2350A)" or just "rp2350a (RP2350A)"
+    /// True for host-level targets (`linux`, `wasm`) — fluxor as a
+    /// process on an OS/runtime rather than a board or bare silicon.
+    pub fn is_host(&self) -> bool {
+        self.kind == TargetKind::Host
+    }
+
+    /// Manifest `hardware_targets` strings this target accepts: its
+    /// module silicon, plus its own token when it is a host (host-capable
+    /// modules declare `linux`/`wasm` directly). Boards never appear —
+    /// a board id in `hardware_targets` is a validation error.
+    pub fn accepted_hardware_targets(&self) -> Vec<String> {
+        let mut v = vec![self.module_silicon().to_string()];
+        if self.is_host() {
+            let own = self.build_id().to_string();
+            if !v.contains(&own) {
+                v.push(own);
+            }
+        }
+        v
+    }
+
+    /// Display name: "pico2w (RP2350 (dual Cortex-M33))" or "rp2350 (...)"
     pub fn display_name(&self) -> String {
         if let Some(ref board) = self.board_id {
             format!("{} ({})", board, self.description)
@@ -296,8 +335,9 @@ impl TargetDescriptor {
 ///
 /// Resolution order:
 /// 1. Check `<project_root>/targets/boards/{name}.toml` — board first.
-/// 2. Check `<project_root>/targets/silicon/{name}.toml`.
-/// 3. **Fall back to the install root** (when discovered — see
+/// 2. Check `<project_root>/targets/host/{name}.toml` — host tier.
+/// 3. Check `<project_root>/targets/silicon/{name}.toml`.
+/// 4. **Fall back to the install root** (when discovered — see
 ///    `project::install_root`) and repeat 1+2 against it. Lets an
 ///    external user project reuse bundled targets without copying
 ///    them.
@@ -324,7 +364,7 @@ pub fn load_target(name: &str, project_root: &Path) -> Result<TargetDescriptor> 
     };
     // "Did you mean …?" hint — small Levenshtein with a cheap
     // threshold. Most typos are 1-2 character distance from the
-    // intended name (`pic2w` → `pico2w`, `cm` → `cm5`, …). Cap at
+    // intended name (`pic2w` → `pico2w`, `pi` → `pi5`, …). Cap at
     // distance 3 to avoid suggesting wildly unrelated targets.
     let suggestion = closest_match(name, &available, 3);
     let did_you_mean = match suggestion {
@@ -355,9 +395,13 @@ fn try_load_target_under(name: &str, root: &Path) -> Result<Option<TargetDescrip
     if board_path.exists() {
         return load_board_target(&board_path, &targets_dir).map(Some);
     }
+    let host_path = targets_dir.join("host").join(format!("{name}.toml"));
+    if host_path.exists() {
+        return load_silicon_target(&host_path, TargetKind::Host).map(Some);
+    }
     let silicon_path = targets_dir.join("silicon").join(format!("{name}.toml"));
     if silicon_path.exists() {
-        return load_silicon_target(&silicon_path).map(Some);
+        return load_silicon_target(&silicon_path, TargetKind::Silicon).map(Some);
     }
     Ok(None)
 }
@@ -402,7 +446,7 @@ pub fn list_targets_under(root: &Path) -> Vec<String> {
 /// root is walked first.
 fn collect_target_names_under(root: &Path, names: &mut Vec<String>) {
     let targets_dir = root.join("targets");
-    for subdir in ["boards", "silicon"] {
+    for subdir in ["boards", "host", "silicon"] {
         if let Ok(entries) = std::fs::read_dir(targets_dir.join(subdir)) {
             for entry in entries.flatten() {
                 if let Some(name) = entry
@@ -422,7 +466,7 @@ fn collect_target_names_under(root: &Path, names: &mut Vec<String>) {
 
 // ── Internal loading ────────────────────────────────────────────────────────
 
-fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
+fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("Failed to read {}: {}", path.display(), e)))?;
     let silicon: TomlSiliconFile = toml::from_str(&content)
@@ -448,6 +492,7 @@ fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
     let p = &silicon.peripherals;
 
     Ok(TargetDescriptor {
+        kind,
         id: silicon.target.id,
         family: silicon.target.family,
         description: silicon.target.description,
@@ -470,7 +515,7 @@ fn load_silicon_target(path: &Path) -> Result<TargetDescriptor> {
         i2c_pins: build_i2c_tables(p),
         memory,
         hardware_defaults: None,
-        platform_defaults: std::collections::HashMap::new(),
+        platform_defaults: silicon.platform.unwrap_or_default(),
         state_arena_kb: silicon
             .kernel
             .as_ref()
@@ -508,7 +553,8 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
         )));
     }
 
-    let mut desc = load_silicon_target(&silicon_path)?;
+    let mut desc = load_silicon_target(&silicon_path, TargetKind::Silicon)?;
+    desc.kind = TargetKind::Board;
 
     // Overlay board info
     desc.board_id = Some(board.board.id);
@@ -516,6 +562,22 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
 
     // Overlay GPIO reservations from board
     if let Some(gpio) = board.gpio {
+        // Package/pin-count narrowing: silicon pin data covers the full
+        // die pin-out; a board on a smaller package caps `max_pin` and
+        // the peripheral pin tables shrink to combos it can wire
+        // (pico2w = RP2350 QFN-60 → max_pin 29).
+        if let Some(max) = gpio.max_pin {
+            desc.max_pin = max;
+            let cap = |tables: &mut Vec<PinTable>| {
+                for t in tables.iter_mut() {
+                    if let PinTable::Explicit(combos) = t {
+                        combos.retain(|c| c.iter().all(|&pin| pin <= max));
+                    }
+                }
+            };
+            cap(&mut desc.spi_pins);
+            cap(&mut desc.i2c_pins);
+        }
         if let Some(pins) = gpio.reserved_pins {
             desc.reserved_pins = pins;
         }
@@ -555,7 +617,7 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
     }
 
     // Merge board-level build overrides onto silicon's build config. Only
-    // used by boards that need extra cargo features (cm5 adds `board-cm5`).
+    // used by boards that need extra cargo features (pi5 adds `board-pi5`).
     if let Some(bb) = board.build {
         if let Some(ref mut build) = desc.build {
             if let Some(rt) = bb.rust_target {
@@ -631,14 +693,15 @@ mod tests {
         let root = repo_root();
         for (target, want) in [
             ("linux", "bcm2712"),
-            ("cm5", "bcm2712"),
+            ("pi5", "bcm2712"),
             ("bcm2712", "bcm2712"),
             ("qemu-virt", "bcm2712"),
-            ("rp2350a", "rp2350"),
-            ("rp2350b", "rp2350"),
+            ("rp2350", "rp2350"),
             ("pico2w", "rp2350"),
+            ("waveshare-lcd4", "rp2350"),
             ("rp2040", "rp2040"),
             ("pico", "rp2040"),
+            ("picow", "rp2040"),
             ("wasm", "wasm"),
         ] {
             let desc = super::load_target(target, &root).expect("target loads");

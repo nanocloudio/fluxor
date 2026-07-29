@@ -23,7 +23,7 @@ match = { family = "linux" }
 modules = [{ name = "keyboard", type = "linux_input_keyboard" }]
 wiring = []
 
-# ── USB HID keyboard host on pico2w / picow / cm5
+# ── USB HID keyboard host on pico2w / picow / pi5
 [[variant]]
 match = { board = "pico2w" }
 modules = [{ name = "keyboard", type = "usb_hid_keyboard", params = { usb_bus = "0" } }]
@@ -35,6 +35,6 @@ modules = [{ name = "keyboard", type = "usb_hid_keyboard", params = { usb_bus = 
 wiring = []
 
 [[variant]]
-match = { board = "cm5" }
+match = { board = "pi5" }
 modules = [{ name = "keyboard", type = "usb_hid_keyboard", params = { usb_bus = "0" } }]
 wiring = []

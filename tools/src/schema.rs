@@ -1025,10 +1025,9 @@ fn pin_label(project_root: &Path, module_type: &str, silicon: &str) -> String {
         .ok()
         .flatten()
         .and_then(|l| {
-            l.oci_modules.into_iter().find(|m| {
-                m.name == module_type
-                    && crate::modules_build::target_to_silicon(&m.target) == silicon
-            })
+            l.oci_modules
+                .into_iter()
+                .find(|m| m.name == module_type && m.target == silicon)
         });
     match pin {
         Some(p) => format!("pin {} ({})", p.reference, p.digest),

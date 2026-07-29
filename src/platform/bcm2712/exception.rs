@@ -7,7 +7,7 @@
 //! `eret`.
 //!
 //! `irq_handler` reads `GICC_IAR`, EOIs, then either reloads the timer
-//! tick (PPI 30 on cm5 / PPI 27 on QEMU) or walks `IRQ_BINDINGS` to
+//! tick (PPI 30 on pi5 / PPI 27 on QEMU) or walks `IRQ_BINDINGS` to
 //! either fan out via `pcie::pcie1_msi_dispatch` or signal a single
 //! kernel event via `event_signal_from_isr`.
 //!

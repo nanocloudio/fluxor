@@ -170,7 +170,7 @@ mod tests {
                 run_id: "test-run".into(),
                 run_dir: "/tmp".into(),
                 scenario_name: "test".into(),
-                board: "cm5".into(),
+                board: "pi5".into(),
                 effective_timeout_ms: 10_000,
             },
             artifact: None,

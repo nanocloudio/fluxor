@@ -8,7 +8,7 @@ builtin = true
 #
 # This is the thin half of the split-deployment image-viewer
 # pipeline (see `examples/image_viewer/wasm-thin.yaml` +
-# `examples/image_viewer/cm5.yaml`):
+# `examples/image_viewer/pi5.yaml`):
 #
 #   pi5: bank → host_image_codec → ws_stream → http(/ws)
 #                                                |    ↓ WS BINARY frames

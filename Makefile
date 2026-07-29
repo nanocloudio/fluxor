@@ -13,12 +13,12 @@ SHELL       := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 CARGO       ?= cargo
 FLUXOR      ?= target/aarch64-unknown-linux-gnu/release/fluxor
-TARGET      ?= bcm2712
+TARGET      ?= qemu-virt
 
 .DEFAULT_GOAL := build
 
 .PHONY: help build test lint ci publish clean install \
-        firmware secure-cm5 install-rig-backends
+        firmware secure-pi5 install-rig-backends
 
 # `help` is zero-dependency: it must work before anything is built.
 help:
@@ -35,8 +35,8 @@ help:
 	@echo ""
 	@echo "Project targets (genuine compositions):"
 	@echo "  make firmware TARGET=…       one kernel: build + objcopy"
-	@echo "                               (rp2040 | rp2350 | bcm2712 | cm5 | wasm)"
-	@echo "  make secure-cm5              signature-enforced cm5 image"
+	@echo "                               (rp2350 | rp2040 | qemu-virt | pi5 | wasm)"
+	@echo "  make secure-pi5              signature-enforced pi5 image"
 	@echo "                               (keygen + build + sign + combine)"
 	@echo "  make install-rig-backends    symlink rig backends into the"
 	@echo "                               fluxor-rig discovery path"
@@ -67,8 +67,8 @@ build:
 	$(FLUXOR) modules build --all
 	$(MAKE) firmware TARGET=rp2350
 	$(MAKE) firmware TARGET=rp2040
-	$(MAKE) firmware TARGET=bcm2712
-	$(MAKE) firmware TARGET=cm5
+	$(MAKE) firmware TARGET=qemu-virt
+	$(MAKE) firmware TARGET=pi5
 	$(MAKE) firmware TARGET=wasm
 	$(CARGO) build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback --target aarch64-unknown-linux-gnu
 
@@ -120,10 +120,10 @@ clean:
 ifeq ($(TARGET),rp2040)
   RUST_TARGET    := thumbv6m-none-eabi
   CARGO_FEATURES := chip-rp2040
-else ifeq ($(TARGET),cm5)
+else ifeq ($(TARGET),pi5)
   RUST_TARGET    := aarch64-unknown-none
-  CARGO_FEATURES := board-cm5
-else ifeq ($(TARGET),bcm2712)
+  CARGO_FEATURES := board-pi5
+else ifeq ($(TARGET),qemu-virt)
   RUST_TARGET    := aarch64-unknown-none
   CARGO_FEATURES := chip-bcm2712
 else ifeq ($(TARGET),wasm)
@@ -150,50 +150,50 @@ endif
 	@mkdir -p target/$(TARGET)
 ifeq ($(TARGET),wasm)
 	@cp $(RELEASE_DIR)/fluxor.wasm target/wasm/firmware.wasm
-else ifeq ($(TARGET),bcm2712)
+else ifeq ($(TARGET),qemu-virt)
 	@rust-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
-else ifeq ($(TARGET),cm5)
+else ifeq ($(TARGET),pi5)
 	@rust-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
 else
 	@arm-none-eabi-objcopy -O binary $(FIRMWARE_ELF) $(FIRMWARE_BIN)
 endif
 
-# ── Secure (signature-enforced) cm5 image ──────────────────────────────
-# Produces a bootable cm5 image that REJECTS unsigned/tampered modules at
+# ── Secure (signature-enforced) pi5 image ──────────────────────────────
+# Produces a bootable pi5 image that REJECTS unsigned/tampered modules at
 # load: the kernel is built with `enforce_signatures` and the signing
 # PUBLIC key embedded (`FLUXOR_SIGNING_PUBKEY_HEX`), every module is signed
 # with the matching private seed, and the result is combined. Without this
-# target the default cm5 build is permissive (unsigned modules load) — see
-# docs/architecture/cm5_el0_isolation.md "Construction-phase trust boundary".
+# target the default pi5 build is permissive (unsigned modules load) — see
+# .context/pi5_el0_isolation.md "Construction-phase trust boundary".
 #
-#   make secure-cm5                       # uses default key path + iso_transform demo
-#   make secure-cm5 SECURE_CONFIG=examples/iso_probe/cm5.yaml
-#   make secure-cm5 SIGN_KEY=/path/to.seed SECURE_IMG=/srv/tftp/fluxor/kernel_2712.img
+#   make secure-pi5                       # uses default key path + iso_transform demo
+#   make secure-pi5 SECURE_CONFIG=examples/iso_probe/pi5.yaml
+#   make secure-pi5 SIGN_KEY=/path/to.seed SECURE_IMG=/srv/tftp/fluxor/kernel_2712.img
 #
 # The private seed is generated (0600) on first run and reused thereafter;
 # rotate with `fluxor keygen -k $(SIGN_KEY) --force`. Keep it OUT of git.
-SIGN_KEY      ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/fluxor/signing/cm5.seed
-SECURE_CONFIG ?= examples/iso_transform/cm5.yaml
-SECURE_IMG    ?= target/cm5/secure.img
+SIGN_KEY      ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/fluxor/signing/pi5.seed
+SECURE_CONFIG ?= examples/iso_transform/pi5.yaml
+SECURE_IMG    ?= target/pi5/secure.img
 
-secure-cm5:
+secure-pi5:
 	$(CARGO) build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
-	@mkdir -p $(dir $(SIGN_KEY)) target/cm5
+	@mkdir -p $(dir $(SIGN_KEY)) target/pi5
 	@echo "[secure] resolving signing pubkey ($(SIGN_KEY))..."
 	@PUBKEY=$$($(FLUXOR) keygen -k $(SIGN_KEY)) && \
 	  echo "[secure] FLUXOR_SIGNING_PUBKEY_HEX=$$PUBKEY" && \
 	  echo "[secure] building enforce_signatures firmware..." && \
 	  FLUXOR_SIGNING_PUBKEY_HEX=$$PUBKEY $(CARGO) build --release \
 	    --target aarch64-unknown-none --no-default-features \
-	    --features board-cm5,enforce_signatures && \
-	  rust-objcopy -O binary target/aarch64-unknown-none/release/fluxor target/cm5/firmware.bin && \
+	    --features board-pi5,enforce_signatures && \
+	  rust-objcopy -O binary target/aarch64-unknown-none/release/fluxor target/pi5/firmware.bin && \
 	  echo "[secure] building + signing modules..." && \
-	  $(FLUXOR) modules build --target cm5 && \
+	  $(FLUXOR) modules build --target bcm2712 && \
 	  for m in target/fluxor/bcm2712/modules/*.fmod; do \
 	    $(FLUXOR) sign -k $(SIGN_KEY) "$$m" || exit 1; \
 	  done && \
 	  echo "[secure] combining $(SECURE_CONFIG) -> $(SECURE_IMG)..." && \
-	  $(FLUXOR) combine -o $(SECURE_IMG) target/cm5/firmware.bin $(SECURE_CONFIG) && \
+	  $(FLUXOR) combine -o $(SECURE_IMG) target/pi5/firmware.bin $(SECURE_CONFIG) && \
 	  echo "[secure] done: $(SECURE_IMG) (unsigned/tampered modules will be rejected)"
 
 # ── Rig backends ───────────────────────────────────────────────────────

@@ -8,14 +8,14 @@ Replaces the older single-feature examples (`http_server`, `http_fs`,
 `http_synth`, `https_server`, `https_multilane`, `h2c_server`, `ws_echo`).
 Variant probes (multi-lane, perf, scripted echo) live under
 [`../test_harness/linux/web/`](../test_harness/linux/web/) and
-[`../test_harness/cm5/`](../test_harness/cm5/).
+[`../test_harness/pi5/`](../test_harness/pi5/).
 
 ## Targets
 
 - `linux.yaml` — full kitchen sink: HTTPS on 8443 with the four
   routes documented inside.
-- `cm5.yaml` — bare-metal mirror; drops `fs_path` / WebSocket routes
-  (no host filesystem on bare-metal cm5) but keeps TLS + HTTP/2.
+- `pi5.yaml` — bare-metal mirror; drops `fs_path` / WebSocket routes
+  (no host filesystem on bare-metal pi5) but keeps TLS + HTTP/2.
 
 ## Setup
 
@@ -43,8 +43,8 @@ websocat -k wss://localhost:8443/ws               # WebSocket round-trip
 ## Related
 
 - [`static_server/`](../static_server/) — HTTP file serving from
-  FAT32 storage (the storage-backed counterpart on pico2w / cm5).
+  FAT32 storage (the storage-backed counterpart on pico2w / pi5).
 - [`quic_loopback/`](../quic_loopback/) — different transport
   (QUIC instead of TCP+TLS), single-process loopback shape.
 - [`log_net/`](../log_net/) — netconsole flavour of network output
-  on the same cm5 platform.
+  on the same pi5 platform.

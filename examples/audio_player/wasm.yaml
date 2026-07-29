@@ -23,7 +23,7 @@
 #
 # Sibling variants (same overall shape, different deployment):
 #   examples/audio_player/linux.yaml         — linux decodes, browser plays
-#   examples/audio_player/cm5-split.yaml     — pi5 silicon decodes, browser plays
+#   examples/audio_player/pi5-split.yaml     — pi5 board (bcm2712 silicon) decodes, browser plays
 #   examples/audio_player/pico2w.yaml        — rp2350 SD card + BOOTSEL
 
 target: wasm
@@ -124,7 +124,7 @@ modules:
     path_2: "asset://cmajor.wav"
 
   # Unified embedded codec — auto-detects WAV/MP3/AAC on each new
-  # stream. Same module the cm5 / linux / pico2w producers use.
+  # stream. Same module the pi5 / linux / pico2w producers use.
   - name: codec
 
   - name: audio_out

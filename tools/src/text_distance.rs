@@ -61,13 +61,13 @@ mod tests {
         assert_eq!(levenshtein("", "abc"), 3);
         assert_eq!(levenshtein("kitten", "sitting"), 3);
         assert_eq!(levenshtein("pic2w", "pico2w"), 1);
-        assert_eq!(levenshtein("cm", "cm5"), 1);
+        assert_eq!(levenshtein("pi", "pi5"), 1);
         assert_eq!(levenshtein("pico", "pico2w"), 2);
     }
 
     #[test]
     fn closest_match_picks_one_character_typo() {
-        let targets: Vec<String> = ["pico2w", "pico", "cm5", "linux"]
+        let targets: Vec<String> = ["pico2w", "pico", "pi5", "linux"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn closest_match_returns_none_when_no_candidate_within_threshold() {
-        let targets: Vec<String> = ["pico2w", "cm5", "linux"]
+        let targets: Vec<String> = ["pico2w", "pi5", "linux"]
             .iter()
             .map(|s| s.to_string())
             .collect();

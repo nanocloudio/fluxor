@@ -1,7 +1,7 @@
 //! Gallery staging fixture — writes known-good image + audio assets
 //! onto the DUT's FAT32 root through the public FS contract.
 //!
-//! Provisions the `cm5_image_viewer` rig test's gallery: the assets
+//! Provisions the `pi5_image_viewer` rig test's gallery: the assets
 //! ship inside the fmod via `include_bytes!` and are written
 //! chunk-per-step through OPEN_CREATE → WRITE×N → FSYNC → CLOSE —
 //! the same op sequence as the fs_write_smoke fixture — with E_AGAIN
@@ -30,7 +30,7 @@ include!("../../sdk/runtime.rs");
 
 /// Oversized artifact that must not survive on the root, unlinked
 /// once at start: a 1920x1080 JPEG whose single-call decode blows the
-/// cm5 step budget (see .context/issue_cm5_codec_image_silicon.md).
+/// pi5 step budget (see .context/issue_pi5_codec_image_silicon.md).
 const STALE_PATH: &[u8] = b"/SPIRAL.JPG";
 
 /// Number of staged files (see `file()`).
@@ -65,7 +65,7 @@ fn file(idx: usize) -> (&'static [u8], &'static [u8]) {
 }
 
 /// Bytes copied into the state buffer and handed to FS_WRITE per step.
-/// Small enough that a step stays well inside the cm5 domain budget;
+/// Small enough that a step stays well inside the pi5 domain budget;
 /// Burst (return 2) lets the scheduler drain the whole payload in a
 /// handful of ticks anyway.
 const CHUNK: usize = 2048;
@@ -230,7 +230,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // Remove the oversized artifact from the earlier
                     // staging attempt — if it survives, bank streams it
                     // first and the codec dies on it (see
-                    // .context/issue_cm5_codec_image_silicon.md).
+                    // .context/issue_pi5_codec_image_silicon.md).
                     path[..STALE_PATH.len()].copy_from_slice(STALE_PATH);
                     let stale_rc =
                         call(sys, -1, fs::UNLINK, path.as_mut_ptr(), STALE_PATH.len());

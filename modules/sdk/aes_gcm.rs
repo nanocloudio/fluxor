@@ -132,11 +132,11 @@ impl AesKey {
         // ARMv8 Cryptography Extension fast path. Gated on
         // `target_feature = "aes"` (not just `target_arch =
         // "aarch64"`) — bare ARMv8-A without the +crypto extension
-        // SIGILLs on AESE/AESMC. Cortex-A76 (Pi 5, our cm5 build)
+        // SIGILLs on AESE/AESMC. Cortex-A76 (Pi 5, our pi5 build)
         // and every Pi-class A-core ships +crypto; the gate keeps
         // QEMU-unknown / older Cortex-A53 hosts honest.
         //
-        // RUSTFLAGS for the cm5 / bcm2712 PIC build sets
+        // RUSTFLAGS for the bcm2712 PIC build sets
         // `-C target-feature=+aes`. Host-test on the same Pi 5
         // gets it via the rustc auto-detect of the build host.
         // Everything else falls through to the scalar path that
@@ -180,7 +180,7 @@ impl AesKey {
 ///
 /// Compiled only when both `target_arch = "aarch64"` AND
 /// `target_feature = "aes"` are set — guards against SIGILL on
-/// ARMv8-A cores without the Cryptography Extension. The cm5 PIC
+/// ARMv8-A cores without the Cryptography Extension. The bcm2712 PIC
 /// build sets `-C target-feature=+aes` via the bcm2712 target
 /// spec; host-test on the same Pi 5 inherits the host CPU's
 /// feature set; non-aarch64 builds and aarch64-without-crypto

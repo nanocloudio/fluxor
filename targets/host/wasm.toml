@@ -41,3 +41,6 @@ ram_base = "0x00000000"
 ram_size = "0x00000000"
 flash_base = "0x00000000"
 flash_size = "0x00000000"
+
+[platform.net]
+provider = "host"

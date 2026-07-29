@@ -149,14 +149,14 @@ chip-rp2040 = ["rp", "embassy-rp/rp2040", "embedded-platform"]
 chip-bcm2712 = ["portable-atomic", "embedded-platform", "multitenant"]
 
 # Board-level selection for BCM2712 targets.
-# board-cm5: Real Raspberry Pi 5 / CM5 hardware (kernel loaded at 0x80000).
-# Without board-cm5: QEMU virt machine (kernel loaded at 0x40080000).
-board-cm5 = ["chip-bcm2712"]
+# board-pi5: Real Raspberry Pi 5 hardware (kernel loaded at 0x80000).
+# Without board-pi5: QEMU virt machine (kernel loaded at 0x40080000).
+board-pi5 = ["chip-bcm2712"]
 
 # Rig-validation opt-in: enables the deferred adaptive-tick mechanisms (the
 # §5.4 SGI wake doorbell + §7.1a absolute cntp_cval re-arm) at boot on
 # bcm2712. OFF by default and never in production — purely a build flag so the
-# CM5 rig can exercise these measured-option paths on silicon (RFC adaptive_tick).
+# pi5 rig can exercise these measured-option paths on silicon (RFC adaptive_tick).
 adaptive_deferred_rig = []
 
 # Rig-validation opt-in: from core 0, periodically fire SGI 15 at core 1 (the

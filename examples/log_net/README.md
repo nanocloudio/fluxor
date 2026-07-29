@@ -9,17 +9,17 @@ Optionally enables the monitor overlay — the monitor PIC module
 periodically emits `MON_HIST` lines via `log::info!`, which flow
 through the same netconsole stream. `fluxor monitor --net :6666`
 consumes that stream and renders a live dashboard.
-(Absorbed the former `log_net_monitor/cm5.yaml`.)
+(Absorbed the former `log_net_monitor/pi5.yaml`.)
 
 ## Targets
 
-- `cm5.yaml`
+- `pi5.yaml`
 
 ## Run
 
 ```sh
-make firmware TARGET=cm5 && fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/cm5/firmware.bin examples/log_net/cm5.yaml
+make firmware TARGET=pi5 && fluxor modules build --target bcm2712
+fluxor combine -o kernel8.img target/pi5/firmware.bin examples/log_net/pi5.yaml
 
 # Capture (any host on the same L2 segment)
 python3 - <<'PY'
@@ -36,7 +36,7 @@ fluxor monitor --net :6666
 
 ## Related
 
-- [`hello/`](../hello/) — the UART-only smoke test for cm5; use
+- [`hello/`](../hello/) — the UART-only smoke test for pi5; use
   that when even the network is suspect.
-- [`web_server/`](../web_server/) — the other canonical cm5
+- [`web_server/`](../web_server/) — the other canonical pi5
   network demo.

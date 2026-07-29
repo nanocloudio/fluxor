@@ -1,7 +1,7 @@
 //! GICv2 distributor + CPU interface + IRQ binding state.
 //!
 //! Boards covered:
-//!   * `board-cm5`: Pi 5 GIC-400 at 0x10_7fff_9000 (distributor) /
+//!   * `board-pi5`: Pi 5 GIC-400 at 0x10_7fff_9000 (distributor) /
 //!     0x10_7fff_a000 (CPU interface). Timer is the physical counter
 //!     PPI 30 (no hypervisor → direct hardware access).
 //!   * QEMU virt (default): GICv2 distributor at 0x0800_0000 / CPU
@@ -20,13 +20,13 @@
 )]
 
 // GIC
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub const GICD_BASE: usize = 0x0800_0000; // QEMU virt GICv2 distributor
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub const GICC_BASE: usize = 0x0801_0000; // QEMU virt GICv2 CPU interface
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const GICD_BASE: usize = 0x10_7fff_9000; // Pi 5 GIC-400 distributor
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const GICC_BASE: usize = 0x10_7fff_a000; // Pi 5 GIC-400 CPU interface
 
 pub const GICC_IAR: *mut u32 = (GICC_BASE + 0x00C) as *mut u32;
@@ -71,11 +71,11 @@ pub unsafe fn send_sgi(core: u32, sgi_id: u32) {
     core::ptr::write_volatile(GICD_SGIR, val);
 }
 
-// Pi 5 (board-cm5): physical timer PPI 30 — no hypervisor, direct access.
+// Pi 5 (board-pi5): physical timer PPI 30 — no hypervisor, direct access.
 // QEMU: virtual timer PPI 27 — avoids KVM trap overhead on physical timer.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const TIMER_PPI: u32 = 30;
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub const TIMER_PPI: u32 = 27;
 
 /// IRQ-to-event binding table. When a bound IRQ fires, the kernel signals the
@@ -126,12 +126,12 @@ pub static mut PCIE1_MSI_SPI_REGISTERED: bool = false;
 /// `pcie::pcie1_msi_dispatch` (via the `EVENT_HANDLE_PCIE1_MSI`
 /// sentinel). Returns 0 on success, -ENOMEM if the binding table is
 /// full.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
     irq_bind(spi_irq, EVENT_HANDLE_PCIE1_MSI, 0, 0)
 }
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
     fluxor::kernel::errno::ENOSYS
 }

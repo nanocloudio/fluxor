@@ -16,7 +16,7 @@
 ///   - `host:` present iff at least one binding's `on:` is omitted.
 ///   - Binding references resolve (`serve:` / `on:` name defined
 ///     components).
-///   - `runtime_override:` is one of {linux, qemu}; never on a wasm
+///   - `runtime_override:` is one of {linux, qemu-virt}; never on a wasm
 ///     component (§16 Q3).
 ///   - `host_page:` exists on disk (when set).
 ///   - `list:` directory exists on disk (when set).
@@ -103,7 +103,7 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
 
         if let Some(ovr) = &comp.runtime_override {
             match ovr.as_str() {
-                "linux" | "qemu" => {}
+                "linux" | "qemu-virt" => {}
                 "wasm" => {
                     return Err(Error::Config(format!(
                         "scenario {}: component `{}` has `runtime_override: wasm`. \
@@ -116,7 +116,7 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
                 other => {
                     return Err(Error::Config(format!(
                         "scenario {}: component `{}` has `runtime_override: {}`. \
-                         Must be one of {{linux, qemu}}.",
+                         Must be one of {{linux, qemu-virt}}.",
                         scenario_path.display(),
                         name,
                         other
@@ -352,7 +352,7 @@ fn check_binding_dag(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
 }
 
 /// Sniff a graph YAML's `target:` field cheaply. Returns the raw string
-/// (e.g. `"wasm"`, `"cm5"`, `"linux"`, `"pico2w"`); empty string on any
+/// (e.g. `"wasm"`, `"pi5"`, `"linux"`, `"pico2w"`); empty string on any
 /// parse error. We deliberately do NOT fully parse the graph here —
 /// that's `cmd_build`'s job.
 fn sniff_graph_target(path: &Path) -> Option<String> {

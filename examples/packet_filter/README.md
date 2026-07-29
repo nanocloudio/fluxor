@@ -29,13 +29,13 @@ a packet logger that does something more than `dev_log`.
 
 ## Targets
 
-- `cm5.yaml`
+- `pi5.yaml`
 
 ## Run
 
 ```sh
-make firmware TARGET=cm5 && fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/cm5/firmware.bin examples/packet_filter/cm5.yaml
+make firmware TARGET=pi5 && fluxor modules build --target bcm2712
+fluxor combine -o kernel8.img target/pi5/firmware.bin examples/packet_filter/pi5.yaml
 # observe filter accept/drop counts via UART or netconsole
 ```
 
@@ -52,4 +52,4 @@ either way.
 
 - The RP1 GEM driver: [`modules/drivers/rp1_gem/`](../../modules/drivers/rp1_gem/)
 - For a full IP/HTTP stack on bare-metal (the *normal* network
-  path, not filtering): [`web_server/cm5.yaml`](../web_server/cm5.yaml).
+  path, not filtering): [`web_server/pi5.yaml`](../web_server/pi5.yaml).

@@ -112,7 +112,7 @@ enum Commands {
     },
     /// Show target configuration details
     TargetInfo {
-        /// Target name (board or silicon, e.g. pico2w, rp2350a, rp2040)
+        /// Target name (board or silicon, e.g. pi5, pico2w, rp2350, rp2040)
         target: String,
         /// Query a specific field (rust_target, cargo_features, uf2_family_id, max_pin, module_target)
         #[arg(long)]
@@ -649,7 +649,7 @@ enum ModulesAction {
     /// (default) keeps warnings as warnings except for unfulfilled
     /// `#[expect(...)]` which always fails.
     Build {
-        /// Single target to build (e.g. `bcm2712`, `rp2350`, `cm5`).
+        /// Single target to build (e.g. `bcm2712`, `rp2350`, `rp2040`, `wasm`).
         /// Mutually exclusive with `--all`.
         #[arg(long, conflicts_with = "all")]
         target: Option<String>,

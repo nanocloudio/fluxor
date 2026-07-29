@@ -1,10 +1,10 @@
-# Audio Player — cm5 producer half of the split deployment.
+# Audio Player — pi5 producer half of the split deployment.
 #
 # Pairs with `wasm-thin.yaml` (the browser-side
 # audio_out + gesture chain) via the inline `scenario:` block
-# below — `fluxor run` orchestrates both halves. The cm5 graph runs
+# below — `fluxor run` orchestrates both halves. The pi5 graph runs
 # everything except the audio sink: bank cycles the FAT32 audio
-# library on the cm5's NVMe partition, the unified `codec` module
+# library on the pi5's NVMe partition, the unified `codec` module
 # decodes WAV/MP3/AAC to i16 LE PCM, and the http server fans the
 # samples out to any browser tab that opens `/player/`. Tap or
 # click on the player surface posts an FMP `toggle`/`next`/`prev`
@@ -25,22 +25,22 @@
 #   sudo cp ~/music/*.{wav,mp3,aac} /mnt/nvme/audio/
 #   sudo umount /mnt/nvme
 
-target: cm5
+target: pi5
 tick_us: 100
 
-# Inline scenario — `fluxor run examples/audio_player/cm5-split.yaml`
+# Inline scenario — `fluxor run examples/audio_player/pi5-split.yaml`
 # orchestrates this graph plus the thin wasm player at `/player/`.
-# Same shape as the cm5 image_viewer scenario: producer-side
+# Same shape as the pi5 image_viewer scenario: producer-side
 # graph is the synthesised scenario's `main` component; the wasm
 # thin player is the `player` companion.
 #
 # `runtime_override: linux` is the dev-iteration knob — it builds
-# and runs the cm5-targeted graph as a linux process on the
+# and runs the pi5-targeted graph as a linux process on the
 # workstation so the bcm2712-compiled PIC modules are exercised
 # end-to-end without real silicon. Drop the override for a real
-# cm5 deployment.
+# pi5 deployment.
 scenario:
-  name: audio_player_cm5
+  name: audio_player_pi5
   runtime_override: linux
   companions:
     player: wasm-thin.yaml
@@ -109,7 +109,7 @@ wiring:
   - from: ws.rx_out
     to: bank.commands
 
-  # Network plumbing for cm5
+  # Network plumbing for pi5
   - from: ip.net_out
     to: http.net_in
   - from: http.net_out

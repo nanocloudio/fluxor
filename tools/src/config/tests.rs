@@ -148,7 +148,7 @@ mod scheduler_validation_tests {
         // errors → the loader would warn + omit it from the parsed map.
         std::fs::write(
             mod_dir.join("manifest.toml"),
-            "version = \"0.1.0\"\nhardware_targets = [\"cm5\"]\ntimer_class = \"tikc_counted\"\n",
+            "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\ntimer_class = \"tikc_counted\"\n",
         )
         .expect("write manifest");
 
@@ -916,7 +916,7 @@ mod scheduler_validation_tests {
     #[test]
     fn legacy_exec_mode_field_still_parses() {
         // Pre-RFC configs use `exec_mode: tier1a`. The parser must
-        // keep accepting these so `examples/cm5/*` and other live
+        // keep accepting these so `examples/*/pi5.yaml` and other live
         // configs build unchanged.
         assert_eq!(
             parse_domain_tier_to_exec_mode(&json!({"exec_mode": "tier1a"})),
@@ -1050,7 +1050,7 @@ mod scheduler_validation_tests {
         // GIC-400 INTIDs are 0..=1019; an `irq:` past that would index the
         // distributor's enable/priority/target banks out of range on silicon.
         let cfg = json!({
-            "target": "cm5",
+            "target": "pi5",
             "execution": {"domains": [{"name": "isr", "tier": "2"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
@@ -1068,7 +1068,7 @@ mod scheduler_validation_tests {
         // range check must NOT reject it. Any other error (missing manifest,
         // etc.) is fine here — just not the range diagnostic.
         let cfg = json!({
-            "target": "cm5",
+            "target": "pi5",
             "execution": {"domains": [{"name": "isr", "tier": "2"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 15})];
@@ -1088,7 +1088,7 @@ mod scheduler_validation_tests {
         // bounds. (Tests pass no resolved_target, so Rule 0 falls back to
         // config.target.)
         let cfg = json!({
-            "target": "rp2350b",
+            "target": "rp2350",
             "execution": {"domains": [{"name": "isr", "tier": "2"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 1100})];
@@ -1106,7 +1106,7 @@ mod scheduler_validation_tests {
         // range check; any other error (missing manifest, etc.) is fine — just
         // not the range.
         let cfg = json!({
-            "target": "rp2350b",
+            "target": "rp2350",
             "execution": {"domains": [{"name": "isr", "tier": "2"}]}
         });
         let modules = vec![json!({"name": "probe", "type": "probe", "domain": "isr", "irq": 52})];

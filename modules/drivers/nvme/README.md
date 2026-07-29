@@ -1,6 +1,6 @@
-# nvme — NVMe block driver (Pi 5 / CM5, PCIe1 external slot)
+# nvme — NVMe block driver (Pi 5, PCIe1 external slot)
 
-Polled, single-queue NVMe driver for the CM5 NVMe HAT+. Implements
+Polled, single-queue NVMe driver for the Pi 5 NVMe HAT+. Implements
 NVMe 1.4 controller initialization, Identify Controller / Namespace,
 and 512-byte block read/write on one admin queue + one I/O queue.
 
@@ -17,7 +17,7 @@ trace that defines the expected controller init sequence.
 
 Every `log::info!` in this module flows through the kernel log ring
 and out over whatever transport `platform.debug.to` selects. On the
-cm5 rig we use `{ to: net, monitor: true }` and consume with
+pi5 rig we use `{ to: net, monitor: true }` and consume with
 `fluxor monitor --net :6666` — no UART cable required. See
 `.../memory/pi5_netconsole.md` for the bus details.
 
@@ -41,7 +41,7 @@ UART even if the log_net module isn't running yet.
 
 ## Device overview
 
-- **Bus:** PCIe1 (external x1 slot on CM5). Bound via the
+- **Bus:** PCIe1 (external x1 slot on Pi 5). Bound via the
   `PCIE_DEVICE` contract using the `bind:` selector param (default
   `m2_primary`); class code `0x01_08_02`.
 - **BAR:** BAR0 (memory-mapped). Controller registers NVMe 1.4 §3.1.

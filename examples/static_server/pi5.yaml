@@ -1,4 +1,4 @@
-# NVMe-backed HTTP file server on CM5 — unified FS_CONTRACT path.
+# NVMe-backed HTTP file server on Pi 5 — unified FS_CONTRACT path.
 #
 # fat32 registers as the FS provider; http opens files by absolute
 # path via `provider_call(-1, FS_OPEN, …)` against the configured
@@ -15,7 +15,7 @@
 # Test:
 #   curl http://<DUT_IP>/         # → INDEX.HTM
 #   curl http://<DUT_IP>/file1    # → FILE1.TXT
-target: cm5
+target: pi5
 tick_us: 100
 
 platform:

@@ -505,7 +505,7 @@ bindings:
         let (_tmp, path) = make_split_tree(
             "merge_silicon",
             "\
-target: cm5
+target: pi5
 modules:
   - name: http
     port: 9090
@@ -541,7 +541,7 @@ bindings:
         let (_tmp, path) = make_split_tree(
             "merge_override",
             "\
-target: cm5
+target: pi5
 modules:
   - name: http
     port: 9090
@@ -611,7 +611,7 @@ bindings:
     fn effective_target_honours_runtime_override() {
         let (_tmp, path) = make_split_tree(
             "et_override",
-            "target: cm5\nmodules: []\nwiring: []\n",
+            "target: pi5\nmodules: []\nwiring: []\n",
             "\
 kind: scenario
 name: split
@@ -698,15 +698,19 @@ bindings:
 
     #[test]
     fn target_aliases_table_is_sensible() {
+        let has = |t: &str, want: &str| target_aliases(t).iter().any(|a| a == want);
         // Linux reuses bcm2712 PIC modules — that's the whole point
-        // of `runtime_override: linux` working for cm5 graphs.
-        assert!(target_aliases("linux").contains(&"bcm2712"));
-        // cm5 board uses bcm2712 silicon — manifests can declare
-        // either.
-        assert!(target_aliases("cm5").contains(&"bcm2712"));
-        assert!(target_aliases("cm5").contains(&"cm5"));
+        // of `runtime_override: linux` working for pi5 graphs.
+        assert!(has("linux", "bcm2712"));
+        assert!(has("linux", "linux"));
+        // pi5 board uses bcm2712 silicon; the board id itself is NOT
+        // a legal `hardware_targets` token (§2 rule 1).
+        assert!(has("pi5", "bcm2712"));
+        assert!(!has("pi5", "pi5"));
+        assert!(has("qemu-virt", "bcm2712"));
+        assert!(has("pico2w", "rp2350"));
         // wasm is wasm — no aliasing.
-        assert_eq!(target_aliases("wasm"), &["wasm"]);
+        assert_eq!(target_aliases("wasm"), vec!["wasm".to_string()]);
         // Unknown target → empty (no aliases means strict
         // never-matches; the build path will surface this with its
         // own error).
@@ -794,7 +798,7 @@ bindings:
 
     #[test]
     fn validate_module_targets_accepts_bcm2712_under_runtime_override_linux() {
-        // The split-decoder pattern: a cm5 graph using foundation/http
+        // The split-decoder pattern: a pi5 graph using foundation/http
         // (hardware_targets = ["rp2350", "bcm2712"]) coerced to linux
         // — should pass because target_aliases("linux") includes
         // "bcm2712".
@@ -806,7 +810,7 @@ bindings:
         let graph = dir.join("graph.yaml");
         write!(
             fs::File::create(&graph).unwrap(),
-            "target: cm5\nmodules:\n  - name: http\n    port: 9090\nwiring: []\n"
+            "target: pi5\nmodules:\n  - name: http\n    port: 9090\nwiring: []\n"
         )
         .unwrap();
         let scenario = dir.join("scenario.yaml");

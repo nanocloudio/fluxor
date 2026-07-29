@@ -90,15 +90,24 @@ fn silicon_spec(silicon: &str) -> Option<&'static SiliconSpec> {
     SILICON_SPECS.iter().find(|s| s.silicon_id == silicon)
 }
 
-/// Resolve a user-supplied target name (rp2350a/rp2350b → rp2350,
-/// cm5 → bcm2712, etc.) to the silicon id used for module artefacts.
-/// Modules are byte-identical across boards that share silicon + module_target.
-pub fn target_to_silicon(target: &str) -> &str {
-    match target {
-        "rp2350a" | "rp2350b" => "rp2350",
-        "cm5" => "bcm2712",
-        other => other,
+/// Resolve a user-supplied module-build target name to the silicon id
+/// used for module artefacts, via the `targets/` registry (the ONLY
+/// board→silicon mapping — standards/target_consolidation.md §3).
+///
+/// Module builds take silicon and host ids only: a board name is a
+/// level error (build the board's silicon instead). Hosts redirect via
+/// `[target].module_silicon` (linux → bcm2712). Modules are
+/// byte-identical across boards that share silicon + module_target.
+pub fn resolve_silicon(target: &str, project_root: &Path) -> Result<String> {
+    let desc = crate::target::load_target(target, project_root)?;
+    if let Some(board) = &desc.board_id {
+        return Err(Error::Config(format!(
+            "'{board}' is a board id; module builds take silicon ids only \
+             (use `--target {}`)",
+            desc.module_silicon()
+        )));
     }
+    Ok(desc.module_silicon().to_string())
 }
 
 /// Caller-facing build options.
@@ -113,7 +122,7 @@ pub struct BuildOpts {
 
 #[derive(Debug, Clone)]
 pub enum TargetSelector {
-    /// Build for a single target. Resolved via `target_to_silicon`.
+    /// Build for a single target. Resolved via `resolve_silicon`.
     One(String),
     /// Build for every target listed in `fluxor.toml::[ci].targets`.
     All,
@@ -551,7 +560,7 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
     for cand in &candidates {
         // Lint against the first configured target this module builds for.
         let Some((target, spec)) = targets.iter().find_map(|t| {
-            let silicon = target_to_silicon(t).to_string();
+            let silicon = resolve_silicon(t, project_root).ok()?;
             let spec = silicon_spec(&silicon)?;
             // wasm builds as a cdylib and has no PIC lint surface here.
             if spec.linker.is_none() || !matches_target(cand, t, &silicon) {
@@ -644,7 +653,7 @@ fn build_one_target(
     candidates: &[Candidate],
     opts: &BuildOpts,
 ) -> Result<TargetReport> {
-    let silicon = target_to_silicon(target).to_string();
+    let silicon = resolve_silicon(target, &opts.project_root)?;
     let spec = silicon_spec(&silicon).ok_or_else(|| {
         Error::Module(format!(
             "unknown silicon `{silicon}` for target `{target}` — recognised: {}",
@@ -657,17 +666,6 @@ fn build_one_target(
     })?;
     let out_dir = opts.out_root.join(&silicon).join("modules");
     std::fs::create_dir_all(&out_dir)?;
-
-    if silicon == "rp2350" {
-        // Symlink rp2350a + rp2350b → rp2350 so consumers that key by
-        // silicon variant find modules at the unified directory.
-        for variant in &["rp2350a", "rp2350b"] {
-            let link_path = opts.out_root.join(variant);
-            if !link_path.exists() {
-                let _ = symlink_relative(&silicon, &link_path);
-            }
-        }
-    }
 
     let mut report = TargetReport {
         target: target.to_string(),
@@ -993,18 +991,6 @@ fn needle_in(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-fn symlink_relative(target: &str, link: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, link);
-        Ok(())
-    }
-}
-
 /// `fluxor modules clean` — remove every `.fmod` (and adjacent `.o` /
 /// `.elf` / `.wasm` intermediates) under the resolved output root.
 pub fn clean(opts: &BuildOpts) -> Result<usize> {
@@ -1057,22 +1043,37 @@ pub struct ModuleSummary {
 /// `fluxor modules resolve` — print the resolved `target/.../modules`
 /// directory for a given target, honouring the dual-root resolution
 /// from standards/fluxor-modules.md §6.
-pub fn resolve(out_root: &Path, target: &str) -> PathBuf {
-    out_root.join(target_to_silicon(target)).join("modules")
+pub fn resolve(project_root: &Path, out_root: &Path, target: &str) -> PathBuf {
+    // Fall back to the raw name if the registry doesn't know it — the
+    // caller is printing a path, not building; an unknown target still
+    // gets a deterministic answer.
+    let silicon = resolve_silicon(target, project_root).unwrap_or_else(|_| target.to_string());
+    out_root.join(silicon).join("modules")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn repo_root() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p
+    }
+
     #[test]
-    fn target_to_silicon_maps_known_aliases() {
-        assert_eq!(target_to_silicon("rp2350a"), "rp2350");
-        assert_eq!(target_to_silicon("rp2350b"), "rp2350");
-        assert_eq!(target_to_silicon("cm5"), "bcm2712");
-        assert_eq!(target_to_silicon("rp2040"), "rp2040");
-        assert_eq!(target_to_silicon("wasm"), "wasm");
-        assert_eq!(target_to_silicon("bcm2712"), "bcm2712");
+    fn resolve_silicon_uses_registry() {
+        let root = repo_root();
+        assert_eq!(resolve_silicon("rp2350", &root).unwrap(), "rp2350");
+        assert_eq!(resolve_silicon("rp2040", &root).unwrap(), "rp2040");
+        assert_eq!(resolve_silicon("wasm", &root).unwrap(), "wasm");
+        assert_eq!(resolve_silicon("bcm2712", &root).unwrap(), "bcm2712");
+        // Hosts redirect via [target].module_silicon.
+        assert_eq!(resolve_silicon("linux", &root).unwrap(), "bcm2712");
+        // Boards are a level error in module-build slots.
+        let err = resolve_silicon("pi5", &root).unwrap_err().to_string();
+        assert!(err.contains("board id"), "{err}");
+        assert!(err.contains("bcm2712"), "{err}");
     }
 
     #[test]
@@ -1126,7 +1127,7 @@ mod tests {
             check_cfg_features: Vec::new(),
         };
         assert!(matches_target(&c, "rp2350", "rp2350"));
-        assert!(matches_target(&c, "cm5", "bcm2712"));
+        assert!(matches_target(&c, "linux", "bcm2712"));
     }
 
     #[test]
@@ -1144,20 +1145,20 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
         };
-        // Board target "cm5" matches via its silicon mapping to bcm2712.
-        assert!(matches_target(&c, "cm5", "bcm2712"));
+        // Host target "linux" matches via its module silicon (bcm2712).
+        assert!(matches_target(&c, "linux", "bcm2712"));
         assert!(matches_target(&c, "bcm2712", "bcm2712"));
         assert!(!matches_target(&c, "rp2350", "rp2350"));
     }
 
     #[test]
-    fn matches_target_by_explicit_board_name() {
+    fn matches_target_by_raw_target_token() {
         let c = Candidate {
             name: "x".into(),
             dir: PathBuf::new(),
             entry: PathBuf::new(),
             manifest: PathBuf::new(),
-            hardware_targets: vec!["cm5".into()],
+            hardware_targets: vec!["linux".into()],
             type_id: 2,
             edition: "2021".into(),
             embed_name: "x".into(),
@@ -1165,11 +1166,10 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
         };
-        // Manifest pinned to the board name (cm5) — silicon-keyed
-        // match should still let it through when the user invokes
-        // with `--target cm5`.
-        assert!(matches_target(&c, "cm5", "bcm2712"));
-        // But a different board sharing the same silicon shouldn't.
+        // Manifest pinned to the raw host token — the target-string
+        // match lets it through when the user invokes `--target linux`.
+        assert!(matches_target(&c, "linux", "bcm2712"));
+        // But the silicon alone doesn't imply the host token.
         assert!(!matches_target(&c, "bcm2712", "bcm2712"));
     }
 }

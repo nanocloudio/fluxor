@@ -21,6 +21,6 @@
 #[cfg(feature = "rp")]
 include!("platform/rp.rs");
 
-// BCM2712 (Raspberry Pi 5 / CM5) — Cortex-A76, bare-metal
+// BCM2712 (Raspberry Pi 5) — Cortex-A76, bare-metal
 #[cfg(feature = "chip-bcm2712")]
 include!("platform/bcm2712.rs");

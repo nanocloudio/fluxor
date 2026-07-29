@@ -153,7 +153,7 @@ mod tests {
     use crate::rig::scenario::parse_scenario_str;
     use std::path::Path;
 
-    const CM5: &str = r#"
+    const PI5: &str = r#"
         [rig]
         artifact = "boot_bundle"
         deploy = ["deploy.netboot_tftp"]
@@ -165,8 +165,8 @@ mod tests {
         default_timeout_s = 30
     "#;
 
-    fn load_cm5() -> BoardRig {
-        parse_board_rig_str(CM5, "cm5.toml").unwrap().unwrap()
+    fn load_pi5() -> BoardRig {
+        parse_board_rig_str(PI5, "pi5.toml").unwrap().unwrap()
     }
 
     fn scn(src: &str) -> Scenario {
@@ -177,7 +177,7 @@ mod tests {
     fn matching_scenario_passes() {
         let s = scn(r#"
             name = "ok"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires = ["deploy.netboot_tftp", "power.cycle"]
             timeout_s = 20
@@ -186,7 +186,7 @@ mod tests {
             source = "console.serial"
             regex = "ok"
         "#);
-        let v = validate_scenario_against_board(&s, &load_cm5());
+        let v = validate_scenario_against_board(&s, &load_pi5());
         assert!(v.is_ok(), "errors: {:?}", v.errors);
     }
 
@@ -194,7 +194,7 @@ mod tests {
     fn missing_capability_fails() {
         let s = scn(r#"
             name = "needs_uf2"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires = ["deploy.uf2_mount"]
 
@@ -202,26 +202,26 @@ mod tests {
             source = "console.serial"
             regex = "ok"
         "#);
-        let v = validate_scenario_against_board(&s, &load_cm5());
+        let v = validate_scenario_against_board(&s, &load_pi5());
         assert!(!v.is_ok());
         assert!(v.errors[0].contains("deploy.uf2_mount"));
     }
 
     #[test]
     fn rule_source_must_be_declared() {
-        // Pick a source that is NOT in the cm5 fixture's declarations so
+        // Pick a source that is NOT in the pi5 fixture's declarations so
         // this test exercises the board-gate (not the matcher-support
         // gate).
         let s = scn(r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
 
             [[pass]]
             source = "console.usb_cdc"
             regex = "."
         "#);
-        let v = validate_scenario_against_board(&s, &load_cm5());
+        let v = validate_scenario_against_board(&s, &load_pi5());
         assert!(!v.is_ok());
         assert!(v.errors[0].contains("console.usb_cdc"));
     }
@@ -232,14 +232,14 @@ mod tests {
         // matcher evaluator; the scenario must fail at validation.
         let s = scn(r#"
             name = "monitor_stream_scenario"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
 
             [[pass]]
             source = "observe.monitor_stream"
             regex = "."
         "#);
-        let v = validate_scenario_against_board(&s, &load_cm5());
+        let v = validate_scenario_against_board(&s, &load_pi5());
         assert!(!v.is_ok());
         let msg = &v.errors[0];
         assert!(msg.contains("observe.monitor_stream"), "{msg}");
@@ -254,7 +254,7 @@ mod tests {
         // capability the board declares must validate cleanly.
         let s = scn(r#"
             name = "telemetry_scenario"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires = ["deploy.netboot_tftp", "power.cycle", "telemetry.monitor_udp"]
 
@@ -262,7 +262,7 @@ mod tests {
             source = "telemetry.monitor_udp"
             regex = "."
         "#);
-        let v = validate_scenario_against_board(&s, &load_cm5());
+        let v = validate_scenario_against_board(&s, &load_pi5());
         assert!(v.is_ok(), "errors: {:?}", v.errors);
     }
 
@@ -270,10 +270,10 @@ mod tests {
     fn missing_pass_rules_warns() {
         let s = scn(r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
         "#);
-        let v = validate_scenario_against_board(&s, &load_cm5());
+        let v = validate_scenario_against_board(&s, &load_pi5());
         assert!(v.is_ok());
         assert!(v.warnings.iter().any(|w| w.contains("no [[pass]]")));
     }
@@ -282,7 +282,7 @@ mod tests {
     fn zero_timeout_fails() {
         let s = scn(r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             timeout_s = 0
 
@@ -290,7 +290,7 @@ mod tests {
             source = "console.serial"
             regex = "."
         "#);
-        let v = validate_scenario_against_board(&s, &load_cm5());
+        let v = validate_scenario_against_board(&s, &load_pi5());
         assert!(!v.is_ok());
     }
 
@@ -298,7 +298,7 @@ mod tests {
     fn tag_mismatch_fails() {
         let s = scn(r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires_tags = ["nvme"]
         "#);
@@ -311,7 +311,7 @@ mod tests {
     fn empty_tags_match_anything() {
         let s = scn(r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
         "#);
         let rig_tags: Vec<String> = vec![];
@@ -322,14 +322,14 @@ mod tests {
     /// Guard against the in-tree board descriptor and example scenario
     /// drifting out of sync.
     #[test]
-    fn real_cm5_scenario_validates() {
+    fn real_pi5_scenario_validates() {
         use crate::rig::{load_scenario, resolve_board_rig};
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let scenario = load_scenario(&workspace.join("tests/hardware/cm5_boot_banner.toml"))
+        let scenario = load_scenario(&workspace.join("tests/hardware/pi5_boot_banner.toml"))
             .expect("load scenario");
         let (board, _source) =
             resolve_board_rig(&scenario.target, Some(workspace)).expect("resolve board");
-        let board = board.expect("cm5 should declare [rig]");
+        let board = board.expect("pi5 should declare [rig]");
         let v = validate_scenario_against_board(&scenario, &board);
         assert!(v.is_ok(), "errors: {:?}", v.errors);
     }

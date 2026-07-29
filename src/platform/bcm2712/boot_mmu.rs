@@ -1,4 +1,4 @@
-//! Boot-time MMU page tables — Pi 5 only (cm5 board).
+//! Boot-time MMU page tables — Pi 5 board only.
 //!
 //! Distinct from `fluxor::kernel::mmu`, which programmes per-module
 //! page tables for EL0 hardware isolation at runtime. This module
@@ -31,8 +31,8 @@
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 
-#[cfg(feature = "board-cm5")]
-mod cm5_impl {
+#[cfg(feature = "board-pi5")]
+mod pi5_impl {
     // Page table attributes for block descriptors (2MB or 1GB)
     const VALID: u64 = 1; // bit 0: valid
     const TABLE: u64 = 1 << 1; // bit 1: table descriptor (vs block for L1 1GB)
@@ -281,13 +281,13 @@ mod cm5_impl {
     }
 }
 
-// Re-export the cm5 implementation as the module's public API.
-#[cfg(feature = "board-cm5")]
-pub use cm5_impl::{enable, init_page_tables};
+// Re-export the pi5 implementation as the module's public API.
+#[cfg(feature = "board-pi5")]
+pub use pi5_impl::{enable, init_page_tables};
 
 // On QEMU virt, no MMU setup needed (identity mapped by QEMU firmware).
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn init_page_tables() {}
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn enable() {}

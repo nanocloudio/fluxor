@@ -80,7 +80,7 @@ include!("dtls_state.rs");
 ///
 /// TARGET-SPECIFIC: 64 sessions × ~13 KB ⇒ a ~1.4 MB module state arena — far
 /// past the rp2350 / wasm32 budget (rp2350's state arena is only 256 KiB). The
-/// 64-session throughput win is for the Pi 5 / CM5 bare-metal scenario only.
+/// 64-session throughput win is for the Pi 5 bare-metal scenario only.
 /// Embedded (non-aarch64) targets get a small count that fits their arena; the
 /// `cfg(target_arch = "aarch64")` split mirrors `dtls_record::DTLS_HS_REASSEMBLY_BUF`.
 /// (aarch64 covers both the bcm2712 firmware build and host-test on the Pi.)
@@ -1116,14 +1116,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // That premise did not survive measurement. The dropped SYNs it
             // was written to prevent were `conn_guard` running at its default
             // 16/s because its params never reached it (see that module's
-            // `module_new`), not RX starvation. With that fixed, the CM5
+            // `module_new`), not RX starvation. With that fixed, the Pi 5
             // HTTPS rig run shows `drop_syn=0`, `bna=0 ovr=0 cdr=0`,
             // `dupSYN=0` and a domain at ~11 % of its tick budget — there is
             // no starvation left to throttle against.
             //
             // Made configurable to TEST whether this pacing was what
             // serialised concurrent connection setup. It is not. Measured on
-            // the CM5 HTTPS rig at 32 concurrent connections, budget 1 vs 4
+            // the Pi 5 HTTPS rig at 32 concurrent connections, budget 1 vs 4
             // produced tls step profiles identical inside noise: domain
             // overruns 3181 vs 3151, heavy steps 126 vs 127, `MON_HIST` b7
             // 693 vs 698, max step 277 vs 286 µs, burst aborts 126 vs 127.

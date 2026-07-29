@@ -5,7 +5,7 @@
 //! access to kernel memory or the `SyscallTable` function pointers.
 //!
 //! Wire it between two ordinary (non-isolated) modules with
-//! `protection: isolated`; see `examples/iso_transform/cm5.yaml`.
+//! `protection: isolated`; see `examples/iso_transform/pi5.yaml`.
 //!
 //! Transform: byte-wise XOR with `0xFF` (involutive, so a second instance
 //! restores the original — handy for a loopback sanity check).

@@ -724,7 +724,7 @@ mod tests {
     use crate::rig::project::parse_project_str;
     use crate::rig::scenario::parse_scenario_str;
 
-    const CM5_BOARD: &str = r#"
+    const PI5_BOARD: &str = r#"
         [rig]
         artifact = "boot_bundle"
         deploy = ["deploy.netboot_tftp", "deploy.bootfs_copy"]
@@ -738,7 +738,7 @@ mod tests {
     const PROFILE: &str = r#"
         [rig]
         id = "pi5-a"
-        board = "cm5"
+        board = "pi5"
         tags = ["nvme"]
 
         [power]
@@ -758,9 +758,9 @@ mod tests {
     "#;
 
     const SCENARIO: &str = r#"
-        name = "cm5_boot_banner"
-        target = "cm5"
-        config = "../examples/cm5/hello.yaml"
+        name = "pi5_boot_banner"
+        target = "pi5"
+        config = "../examples/pi5/hello.yaml"
         requires = ["deploy.netboot_tftp", "power.cycle"]
 
         [[pass]]
@@ -773,13 +773,13 @@ mod tests {
     "#;
 
     const PROJECT: &str = r#"
-        [build.cm5]
-        command = ["make", "firmware", "TARGET=cm5"]
-        artifact_bundle_dir = "target/cm5/bundle"
+        [build.pi5]
+        command = ["make", "firmware", "TARGET=pi5"]
+        artifact_bundle_dir = "target/pi5/bundle"
     "#;
 
     fn load() -> (BoardRig, RigProfile, Scenario, ProjectDescriptor) {
-        let board = parse_board_rig_str(CM5_BOARD, "cm5.toml").unwrap().unwrap();
+        let board = parse_board_rig_str(PI5_BOARD, "pi5.toml").unwrap().unwrap();
         let profile = parse_profile_str(PROFILE, std::path::Path::new("/tmp/pi5-a.toml")).unwrap();
         let scenario = parse_scenario_str(
             SCENARIO,
@@ -817,7 +817,7 @@ mod tests {
         let profile_src = r#"
             [rig]
             id = "pi5-a"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             backend = "kasa_local"
@@ -829,7 +829,7 @@ mod tests {
             [console.serial]
             device = "/dev/ttyUSB0"
         "#;
-        let board = parse_board_rig_str(CM5_BOARD, "cm5.toml").unwrap().unwrap();
+        let board = parse_board_rig_str(PI5_BOARD, "pi5.toml").unwrap().unwrap();
         let profile = parse_profile_str(profile_src, std::path::Path::new("/tmp/p.toml")).unwrap();
         let scenario = parse_scenario_str(
             SCENARIO,
@@ -931,7 +931,7 @@ mod tests {
         let profile_toml = r#"
             [rig]
             id = "pi5-a"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             backend = "manual"
@@ -946,14 +946,14 @@ mod tests {
         "#;
         let scenario_toml = r#"
             name = "forces_bootfs"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires = ["deploy.bootfs_copy", "power.cycle", "observe.netboot_fetch"]
 
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml")
+        let board = parse_board_rig_str(board_toml, "pi5.toml")
             .unwrap()
             .unwrap();
         let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
@@ -989,20 +989,20 @@ mod tests {
         let profile_toml = r#"
             [rig]
             id = "pi5-a"
-            board = "cm5"
+            board = "pi5"
 
             [deploy.netboot_tftp]
             root = "/srv/tftp"
         "#;
         let scenario_toml = r#"
             name = "wants_bootfs"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires = ["deploy.bootfs_copy"]
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml")
+        let board = parse_board_rig_str(board_toml, "pi5.toml")
             .unwrap()
             .unwrap();
         let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
@@ -1036,7 +1036,7 @@ mod tests {
         let profile_toml = r#"
             [rig]
             id = "pi5-a"
-            board = "cm5"
+            board = "pi5"
 
             [deploy.netboot_tftp]
             root = "/srv/tftp"
@@ -1046,13 +1046,13 @@ mod tests {
         "#;
         let scenario_toml = r#"
             name = "needs_power"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires = ["deploy.netboot_tftp", "power.cycle"]
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml")
+        let board = parse_board_rig_str(board_toml, "pi5.toml")
             .unwrap()
             .unwrap();
         let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
@@ -1213,7 +1213,7 @@ mod tests {
         let profile_toml = r#"
             [rig]
             id = "pi5-a"
-            board = "cm5"
+            board = "pi5"
 
             [deploy.netboot_tftp]
             root = "/srv/tftp"
@@ -1226,12 +1226,12 @@ mod tests {
         "#;
         let scenario_toml = r#"
             name = "agnostic"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml")
+        let board = parse_board_rig_str(board_toml, "pi5.toml")
             .unwrap()
             .unwrap();
         let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();
@@ -1256,7 +1256,7 @@ mod tests {
         let src = format!(
             r#"
                 name = "x"
-                target = "cm5"
+                target = "pi5"
                 config = "a.yaml"
                 requires = [{requires_literal}]
                 [[pass]]
@@ -1321,7 +1321,7 @@ mod tests {
         let profile_toml = r#"
             [rig]
             id = "pi5-a"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             backend = "manual"
@@ -1334,13 +1334,13 @@ mod tests {
         "#;
         let scenario_toml = r#"
             name = "cold_start"
-            target = "cm5"
+            target = "pi5"
             config = "a.yaml"
             requires = ["deploy.netboot_tftp", "power.on", "observe.netboot_fetch"]
             [[pass]]
             source = "observe.netboot_fetch"
         "#;
-        let board = parse_board_rig_str(board_toml, "cm5.toml")
+        let board = parse_board_rig_str(board_toml, "pi5.toml")
             .unwrap()
             .unwrap();
         let profile = parse_profile_str(profile_toml, std::path::Path::new("/tmp/p.toml")).unwrap();

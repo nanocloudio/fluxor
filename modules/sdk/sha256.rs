@@ -245,7 +245,7 @@ impl Sha256 {
 #[cfg(target_arch = "aarch64")]
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     // SAFETY: `compress_neon` is gated on `target_feature = "sha2"`,
-    // which cm5 (Cortex-A76) provides.
+    // which the pi5 board (Cortex-A76) provides.
     unsafe { compress_neon(state, block) };
 }
 

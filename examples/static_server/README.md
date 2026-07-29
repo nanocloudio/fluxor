@@ -13,14 +13,14 @@ only the storage backend and NIC differ:
 | File | Storage backend | NIC |
 | --- | --- | --- |
 | `pico2w.yaml` | SD card on SPI0 (CS GPIO17) | cyw43 WiFi |
-| `cm5.yaml` | NVMe partition (via `storage: { media: nvme }`) | RP1 GEM ethernet |
+| `pi5.yaml` | NVMe partition (via `storage: { media: nvme }`) | RP1 GEM ethernet |
 
 ## Setup
 
 **pico2w:** format an SD card FAT32, drop files in the root (uppercase
 8.3 short names — `INDEX.HTM`, `ABOUT.TXT`), slot it in.
 
-**cm5:** format an NVMe partition FAT32, mount label `FLUXORNV`:
+**pi5:** format an NVMe partition FAT32, mount label `FLUXORNV`:
 
 ```sh
 sudo mkfs.vfat -F 32 -s 8 -n FLUXORNV /dev/nvme0n1p1
@@ -36,9 +36,9 @@ sudo umount /mnt/nvme
 make firmware TARGET=pico2w && fluxor modules build --target rp2350
 fluxor flash examples/static_server/pico2w.yaml
 
-# cm5
-make firmware TARGET=cm5 && fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/cm5/firmware.bin examples/static_server/cm5.yaml
+# pi5
+make firmware TARGET=pi5 && fluxor modules build --target bcm2712
+fluxor combine -o kernel8.img target/pi5/firmware.bin examples/static_server/pi5.yaml
 
 # either: files served at http://<device-ip>/<filename>
 curl http://<device-ip>/
@@ -47,6 +47,6 @@ curl http://<device-ip>/
 ## Related
 
 - The NVMe perf probe (regression fixture) lives at
-  [`../test_harness/cm5/nvme_perf.yaml`](../test_harness/cm5/nvme_perf.yaml).
+  [`../test_harness/pi5/nvme_perf.yaml`](../test_harness/pi5/nvme_perf.yaml).
 - For HTTP-only (without the storage backend) see
   [`web_server/`](../web_server/).

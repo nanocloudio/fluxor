@@ -1,7 +1,7 @@
 //! RP1 Cadence GEM NIC Driver PIC Module
 //!
 //! Kernel-bypass Ethernet driver for the Cadence GEM MAC on the RP1 chip
-//! (Pi 5 / CM5). Uses known RP1 GEM register base, creates DMA rings via
+//! (Pi 5). Uses known RP1 GEM register base, creates DMA rings via
 //! NIC_RING_CREATE, and drives the MAC directly from poll-mode (Tier 3).
 //!
 //! # Channels
@@ -811,7 +811,7 @@ unsafe fn poll_tx(s: &mut GemState) {
     //
     // DSB SY before the kick so every descriptor write has
     // committed to coherent memory before the MAC fetches the ring.
-    // Without this, the GEM has been observed on cm5 bringup
+    // Without this, the GEM has been observed on pi5 bringup
     // reading partially-written descriptors when the CPU bursts the
     // ring then immediately writes NWCTRL — the inner-shareable
     // domain that `core::sync::atomic::fence(Release)` covers

@@ -3,7 +3,7 @@
 //!
 //! Shared byte-for-byte between the host tools (`tools/src/genstore.rs`
 //! path-mounts this file, the same pattern as `wire.rs`) and the device-side
-//! CM5 backend, so both ends agree on pointer-record and generation-header
+//! Pi 5 backend, so both ends agree on pointer-record and generation-header
 //! encoding by construction rather than by mirrored copies.
 //!
 //! `no_std`, zero-alloc: decoding is a validated view over the caller's byte

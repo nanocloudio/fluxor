@@ -23,10 +23,10 @@
 //!
 //! ## Acceptance / regression gates
 //!
-//! The hardware fixture under `tests/hardware/cm5_nvme_perf.toml`
+//! The hardware fixture under `tests/hardware/pi5_nvme_perf.toml`
 //! pins per-phase thresholds. The probe stays scenario-agnostic —
 //! it emits raw numbers; the rig owns the policy. Today's measured
-//! ceilings on the CM5 + Biwin CE430T5D100-512G ride PCIe Gen2 x1:
+//! ceilings on the Pi 5 + Biwin CE430T5D100-512G ride PCIe Gen2 x1:
 //!
 //! - Phase 0 (seq write,  32p): ~ 390 MB/s (link cap, write stripe)
 //! - Phase 1 (seq read,   32p): ~ 240 MB/s (NEON memcpy + 4-queue pipeline)

@@ -261,6 +261,8 @@ fn cmd_targets() -> Result<()> {
             Ok(desc) => {
                 let kind = if desc.board_id.is_some() {
                     "board"
+                } else if desc.is_host() {
+                    "host"
                 } else if desc.build.is_some() {
                     "silicon"
                 } else {
@@ -494,6 +496,8 @@ fn cmd_inspect_json(config_path: Option<&Path>) -> Result<()> {
             Ok(desc) => {
                 let kind = if desc.board_id.is_some() {
                     "board"
+                } else if desc.is_host() {
+                    "host"
                 } else if desc.build.is_some() {
                     "silicon"
                 } else {
@@ -670,6 +674,8 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
             "id": desc.id,
             "kind": if desc.board_id.is_some() {
                 "board"
+            } else if desc.is_host() {
+                "host"
             } else if desc.build.is_some() {
                 "silicon"
             } else {
@@ -846,6 +852,8 @@ fn print_inspect_targets_block(project_root: &Path, install_distinct: Option<&Pa
                 Ok(desc) => {
                     let kind = if desc.board_id.is_some() {
                         "board"
+                    } else if desc.is_host() {
+                        "host"
                     } else if desc.build.is_some() {
                         "silicon"
                     } else {

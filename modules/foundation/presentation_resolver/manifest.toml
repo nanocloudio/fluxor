@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["cm5", "bcm2712", "rp2350", "wasm"]
+hardware_targets = ["bcm2712", "rp2350", "wasm"]
 
 # On-device placement resolver (.context/rfc_adaptive_presentation.md §10). Maps
 # a stream of `input::surface_traits` records onto a `presentation.layout` — the

@@ -236,7 +236,7 @@ pub(crate) struct QuicState {
     tlm: TlmCounters,
     tlm_last_ms: u64,
     /// Head-sampling rate (per-mille) for `quic.connection` spans. Target-tier
-    /// default: 50‰ on aarch64 (CM5-class), 0‰ on MCUs. Decided per accepted
+    /// default: 50‰ on aarch64 (pi5-class), 0‰ on MCUs. Decided per accepted
     /// connection from its minted trace id.
     sample_permille: u16,
     /// Configured ALPN list (RFC 7301), comma-separated raw bytes as supplied
@@ -403,7 +403,7 @@ pub unsafe extern "C" fn module_new(
 
     // Resolve the target-tier head-sampling default only when
     // `trace_sample_permille` was not explicitly supplied (still the sentinel):
-    // aarch64 (CM5-class) 50‰, MCUs 0‰. An explicit value (incl. 0) is honoured.
+    // aarch64 (pi5-class) 50‰, MCUs 0‰. An explicit value (incl. 0) is honoured.
     if s.sample_permille == 0xFFFF {
         #[cfg(target_arch = "aarch64")]
         {

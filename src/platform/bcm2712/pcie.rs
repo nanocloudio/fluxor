@@ -1,4 +1,4 @@
-//! PCIe enumeration and BAR mapping for BCM2712 (CM5) — thin kernel bridge.
+//! PCIe enumeration and BAR mapping for BCM2712 (Pi 5) — thin kernel bridge.
 //!
 //! The public enumeration path is the `pcie_scan` PIC module, which uses
 //! MMIO_READ32/WRITE32 bridges. This file keeps a built-in fallback
@@ -16,7 +16,7 @@
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-// PCIe controller addresses (BCM2712, Pi 5 / CM5)
+// PCIe controller addresses (BCM2712, Pi 5)
 // ----------------------------------------------------------------------------
 //
 // Source: mainline Linux `arch/arm64/boot/dts/broadcom/bcm2712.dtsi`
@@ -26,7 +26,7 @@
 //
 // There are two usable PCIe controllers on BCM2712:
 //   - PCIe2: the internal x4 link to RP1 (default in this codebase).
-//   - PCIe1: the external x1 slot used by the CM5 NVMe HAT+ and friends.
+//   - PCIe1: the external x1 slot used by the Pi 5 NVMe HAT+ and friends.
 //     Requires `pciex1` enabled in `config.txt` so VPU trains the link
 //     and programs the outbound window before kernel handoff.
 //
@@ -37,17 +37,17 @@
 
 /// BCM2712 PCIe2 (RP1) configuration-space base for the built-in
 /// fallback enumerator.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const ECAM_BASE: usize = 0xFD50_0000;
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 const ECAM_BASE: usize = 0;
 
 /// BCM2712 PCIe2 (RP1) outbound MMIO window base.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const PCIE_MMIO_BASE: usize = 0x1F_0000_0000;
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 const PCIE_MMIO_BASE: usize = 0x4000_0000;
 
 /// BCM2712 PCIe2 (RP1, x4) controller base — matches mainline DTS node
@@ -174,7 +174,7 @@ static mut BAR_MAPS: [BarMap; MAX_BAR_MAPS] = [const { BarMap::empty() }; MAX_BA
 // ECAM config space access
 // ============================================================================
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn ecam_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
     let addr = ECAM_BASE
         + ((bus as usize) << 20)
@@ -184,7 +184,7 @@ unsafe fn ecam_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
     core::ptr::read_volatile(addr as *const u32)
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn ecam_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
     let addr = ECAM_BASE
         + ((bus as usize) << 20)
@@ -233,21 +233,21 @@ unsafe fn ecam_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
 // For brcm,brcmstb-reset id=43: bank=id>>5=1, bit=id&0x1f=11. SW_INIT_SET
 // at +0x18+0x00, SW_INIT_CLEAR at +0x18+0x04, STATUS at +0x18+0x08.
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const RESCAL_BASE: u64 = 0x10_0011_9500;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const RESCAL_START: u64 = 0x00;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const RESCAL_STATUS: u64 = 0x08;
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const BCM_RESET_BASE: u64 = 0x10_0150_4318;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const BCM_RESET_PCIE1_BANK_OFF: u64 = 0x18;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 const BCM_RESET_PCIE1_BIT: u32 = 1 << 11;
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 mod brcm {
     pub const EXT_CFG_DATA: u64 = 0x8000;
     pub const EXT_CFG_INDEX: u64 = 0x9000;
@@ -363,7 +363,7 @@ mod brcm {
 /// Post-probe target values captured on the rig under Linux
 /// (nvme_trace/baseline/pcie1_rc_post_probe.txt). Stage-4 writes
 /// these verbatim so the Fluxor state converges on `brcm_pcie_probe`.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 mod post_probe {
     pub const MISC_CTRL: u32 = 0x00263480;
     pub const RC_CFG_RETRY: u32 = 0x0ABA0000;
@@ -380,12 +380,12 @@ mod post_probe {
     pub const UBUS_BAR2_REMAP_HI: u32 = 0x00000010;
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn rc_r32(rc: u64, off: u64) -> u32 {
     core::ptr::read_volatile((rc + off) as *const u32)
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn rc_w32(rc: u64, off: u64, val: u32) {
     core::ptr::write_volatile((rc + off) as *mut u32, val);
 }
@@ -393,7 +393,7 @@ unsafe fn rc_w32(rc: u64, off: u64, val: u32) {
 /// Program the EXT_CFG_INDEX for the target BDF, then return the CPU
 /// virtual address to access the requested `reg` via EXT_CFG_DATA.
 /// Bus 0 is the RC root bridge, accessed directly.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn cfg_r32(rc: u64, bus: u8, dev: u8, func: u8, reg: u16) -> u32 {
     if bus == 0 {
         return rc_r32(rc, (reg & 0xFFC) as u64);
@@ -405,7 +405,7 @@ unsafe fn cfg_r32(rc: u64, bus: u8, dev: u8, func: u8, reg: u16) -> u32 {
     rc_r32(rc, brcm::EXT_CFG_DATA + (reg & 0xFFC) as u64)
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn cfg_w32(rc: u64, bus: u8, dev: u8, func: u8, reg: u16, val: u32) {
     if bus == 0 {
         rc_w32(rc, (reg & 0xFFC) as u64, val);
@@ -421,7 +421,7 @@ unsafe fn cfg_w32(rc: u64, bus: u8, dev: u8, func: u8, reg: u16, val: u32) {
 /// Finish the PCIe1 outbound window programming that VPU started. After
 /// this runs, CPU reads in `PCIE1_OUTBOUND_CPU_BASE..PCIE1_OUTBOUND_CPU_LIMIT`
 /// reach PCI bus addresses `PCIE1_OUTBOUND_PCI_BASE..`.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_program_outbound() {
     let rc = BCM2712_PCIE1_RC_BASE;
 
@@ -449,7 +449,7 @@ unsafe fn pcie1_program_outbound() {
 ///
 /// Returns (is_mem, is_64bit, size_bytes). `size_bytes == 0` means
 /// the BAR is unimplemented or wasn't probeable.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_probe_bar0(rc: u64, bus: u8, dev: u8) -> (bool, bool, u64) {
     let original_lo = cfg_r32(rc, bus, dev, 0, 0x10);
     if original_lo == 0xFFFF_FFFF || original_lo == 0 {
@@ -514,11 +514,11 @@ unsafe fn pcie1_probe_bar0(rc: u64, bus: u8, dev: u8) -> (bool, bool, u64) {
 /// up to its natural alignment. Capped at
 /// `PCIE1_OUTBOUND_PCI_LIMIT`; devices past that are logged but not
 /// registered.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_enumerate_bus1() {
     let rc = BCM2712_PCIE1_RC_BASE;
 
-    // Outbound window is 2 GB wide on CM5 (CPU_LIMIT - CPU_BASE + 1).
+    // Outbound window is 2 GB wide on Pi 5 (CPU_LIMIT - CPU_BASE + 1).
     // Reserve a small slack at the start to match Linux's layout and
     // so the RC's own internal region isn't overlapped.
     let window_size = brcm::PCIE1_OUTBOUND_CPU_LIMIT - brcm::PCIE1_OUTBOUND_CPU_BASE + 1;
@@ -611,7 +611,7 @@ unsafe fn pcie1_enumerate_bus1() {
 /// Append `pdev` to the global DEVICES table if there's room.
 /// Uses raw pointer writes so each call site avoids tripping the
 /// Rust 2024 static_mut_refs lint individually.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn record_device(pdev: PcieDevice) {
     let count = *core::ptr::addr_of!(DEVICE_COUNT);
     if count >= MAX_SCAN_DEVS {
@@ -630,7 +630,7 @@ unsafe fn record_device(pdev: PcieDevice) {
 ///
 /// PCI CFG offset 0x18: [31:24] SEC_LAT | [23:16] SUB | [15:8] SEC | [7:0] PRI.
 /// PCI CFG offset 0x20 (MEM_BASE/LIMIT): [15:4] base[31:20], [31:20] limit[31:20].
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_program_bus_numbers() {
     let rc = BCM2712_PCIE1_RC_BASE;
     let cur = rc_r32(rc, 0x18);
@@ -660,7 +660,7 @@ unsafe fn pcie1_program_bus_numbers() {
 /// Busy-wait for the PCIe1 link to train. Uses the ARM generic timer
 /// `CNTPCT_EL0` counter instead of `now_millis()` because this runs
 /// before IRQs are enabled (the HAL `now_millis` is IRQ-driven).
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_wait_link_up(max_ms: u64) -> u32 {
     let rc = BCM2712_PCIE1_RC_BASE;
     let want = brcm::STATUS_PHYLINKUP | brcm::STATUS_DL_ACTIVE;
@@ -681,7 +681,7 @@ unsafe fn pcie1_wait_link_up(max_ms: u64) -> u32 {
 }
 
 /// Busy-wait for `us` microseconds via the generic timer counter.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn busy_wait_us(us: u64) {
     let freq = timer_freq_hz();
     let target_ticks = (us * freq) / 1_000_000;
@@ -689,14 +689,14 @@ unsafe fn busy_wait_us(us: u64) {
     while read_cntpct().wrapping_sub(start) < target_ticks {}
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn read_cntpct() -> u64 {
     let v: u64;
     core::arch::asm!("mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack));
     v
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn timer_freq_hz() -> u64 {
     let v: u64;
     core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack));
@@ -706,7 +706,7 @@ unsafe fn timer_freq_hz() -> u64 {
 /// MDIO write via the PCIe RC's indirect-access registers (brcm-pcie
 /// `brcm_pcie_mdio_write`). `port=0` is the sole port on 2712.
 /// Returns true on success; failure is logged by the caller.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_mdio_write(port: u8, regad: u8, wrdata: u16) -> bool {
     let rc = BCM2712_PCIE1_RC_BASE;
     let pkt = (((port as u32 >> 4) & 1) << 21) | (((port as u32) & 0xf) << 16) | (regad as u32);
@@ -736,7 +736,7 @@ unsafe fn pcie1_mdio_write(port: u8, regad: u8, wrdata: u16) -> bool {
 /// (idempotent: if already deasserted, the write is a no-op).
 /// The RESCAL sequence matches `brcm_rescal_reset_set`: set start bit,
 /// poll status bit (≤ 1 ms per driver), clear start bit.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_pre_init() -> bool {
     // 1. Deassert the PCIe1 bridge SW reset.
     let clr = BCM_RESET_BASE + BCM_RESET_PCIE1_BANK_OFF + 0x04;
@@ -771,13 +771,13 @@ unsafe fn pcie1_pre_init() -> bool {
 /// Track whether we've completed the one-shot bring-up (reset/RESCAL +
 /// MISC_CTRL + MDIO + SerDes). Re-running those after the link is
 /// already up would put the controller back into training.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 static mut PCIE1_BRINGUP_DONE: bool = false;
 
 /// Fast path: program outbound window + bridge bus numbers and
 /// enumerate bus 1. Safe to call repeatedly — the register writes are
 /// idempotent and `DEVICE_COUNT` is reset each call.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn pcie1_populate_devices() {
     DEVICE_COUNT = 0;
     pcie1_program_outbound();
@@ -785,7 +785,7 @@ unsafe fn pcie1_populate_devices() {
     pcie1_enumerate_bus1();
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub fn enumerate() -> usize {
     // SAFETY: PCIe RC + outbound aperture MMIO accesses target fixed
     // BCM2712 register addresses mapped by boot_mmu::init_page_tables.
@@ -918,7 +918,7 @@ pub fn enumerate() -> usize {
     }
 }
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub fn enumerate() -> usize {
     // SAFETY: QEMU virt enumeration runs once at boot; DEVICES /
     // DEVICE_COUNT statics have no concurrent reader yet.
@@ -976,7 +976,7 @@ pub fn device_count() -> usize {
 /// config space (must be 4-byte aligned; low 2 bits are ignored).
 /// Returns 0xFFFFFFFF on out-of-range arguments (same sentinel a real
 /// PCIe controller returns for a missing responder).
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub fn device_cfg_read32(dev_idx: usize, offset: u16) -> u32 {
     // SAFETY: DEVICE_COUNT bounds the `DEVICES` slot we read; `dev_idx`
     // bounds-checked. `cfg_r32` does MMIO at the RC config aperture
@@ -992,7 +992,7 @@ pub fn device_cfg_read32(dev_idx: usize, offset: u16) -> u32 {
     }
 }
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub fn device_cfg_read32(_dev_idx: usize, _offset: u16) -> u32 {
     0xFFFF_FFFF
 }
@@ -1000,7 +1000,7 @@ pub fn device_cfg_read32(_dev_idx: usize, _offset: u16) -> u32 {
 /// Write a 32-bit value into a discovered device's PCI configuration
 /// space. Returns 0 on success or `-EINVAL` for an out-of-range
 /// `dev_idx`.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub fn device_cfg_write32(dev_idx: usize, offset: u16, val: u32) -> i32 {
     // SAFETY: DEVICE_COUNT bounds the `DEVICES` slot we read; `dev_idx`
     // bounds-checked. `cfg_w32` does MMIO at the RC config aperture.
@@ -1016,7 +1016,7 @@ pub fn device_cfg_write32(dev_idx: usize, offset: u16, val: u32) -> i32 {
     }
 }
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub fn device_cfg_write32(_dev_idx: usize, _offset: u16, _val: u32) -> i32 {
     crate::kernel::errno::ENOSYS
 }
@@ -1195,7 +1195,7 @@ pub unsafe fn syscall_bar_unmap(arg: *mut u8, arg_len: usize) -> i32 {
 // complex, alias string for INFO) lives in `BOUND_DEVICES`, indexed
 // alongside `DEVICES`.
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 #[derive(Clone, Copy)]
 struct BoundDevice {
     active: bool,
@@ -1208,7 +1208,7 @@ struct BoundDevice {
     alias_len: u8,
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 impl BoundDevice {
     const fn empty() -> Self {
         Self {
@@ -1220,7 +1220,7 @@ impl BoundDevice {
     }
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 static mut BOUND_DEVICES: [BoundDevice; MAX_SCAN_DEVS] =
     [const { BoundDevice::empty() }; MAX_SCAN_DEVS];
 
@@ -1231,7 +1231,7 @@ static mut BOUND_DEVICES: [BoundDevice; MAX_SCAN_DEVS] =
 /// `sel` must be a valid byte slice readable for the duration of the call.
 /// On match, the caller takes ownership of the returned device handle and
 /// is responsible for releasing it via `PCIE_DEVICE::CLOSE`.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
     let s = match core::str::from_utf8(sel) {
         Ok(s) => s.trim_end_matches('\0').trim(),
@@ -1304,7 +1304,7 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
     }
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 unsafe fn finalize_bind(
     dev_idx: usize,
     root: crate::kernel::pcie_aliases::PcieRoot,
@@ -1329,7 +1329,7 @@ unsafe fn finalize_bind(
 
 /// Decode a PCIE_DEVICE handle to its device index. Accepts both the
 /// FD_TAG_PCIE_DEVICE-tagged form (from `BIND`) and a raw slot.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 fn decode_handle(handle: i32) -> Option<usize> {
     if handle < 0 {
         return None;
@@ -1345,7 +1345,7 @@ fn decode_handle(handle: i32) -> Option<usize> {
     Some(idx)
 }
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 fn decode_handle(_handle: i32) -> Option<usize> {
     None
 }
@@ -1354,7 +1354,7 @@ fn decode_handle(_handle: i32) -> Option<usize> {
 ///
 /// # Safety
 /// `_sel` is a valid byte slice; this stub does not touch hardware.
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn bind_selector(_sel: &[u8]) -> i32 {
     crate::kernel::errno::ENOSYS
 }
@@ -1367,7 +1367,7 @@ pub unsafe fn bind_selector(_sel: &[u8]) -> i32 {
 /// `handle` must be a value previously returned from `bind_selector` or
 /// the untagged slot index. Touches global `BOUND_DEVICES`; caller must
 /// not run concurrently with another close on the same handle.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub unsafe fn syscall_device_close(handle: i32) -> i32 {
     let idx = match decode_handle(handle) {
         Some(i) => i,
@@ -1384,7 +1384,7 @@ pub unsafe fn syscall_device_close(handle: i32) -> i32 {
 /// # Safety
 /// No invariants beyond receiving an i32 — the stub does not touch
 /// hardware or globals.
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn syscall_device_close(_handle: i32) -> i32 {
     0
 }
@@ -1470,7 +1470,7 @@ pub unsafe fn syscall_device_bar_map(handle: i32, arg: *mut u8, arg_len: usize) 
 /// `handle` must be a value returned by `bind_selector`. Reads from
 /// global `BOUND_DEVICES`; caller must not concurrently mutate that
 /// slot via `syscall_device_close`.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub unsafe fn bound_device_root(handle: i32) -> Option<crate::kernel::pcie_aliases::PcieRoot> {
     let idx = decode_handle(handle)?;
     let slot = &*core::ptr::addr_of!(BOUND_DEVICES[idx]);
@@ -1485,7 +1485,7 @@ pub unsafe fn bound_device_root(handle: i32) -> Option<crate::kernel::pcie_alias
 ///
 /// # Safety
 /// No invariants; this stub does not dereference any state.
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn bound_device_root(_handle: i32) -> Option<crate::kernel::pcie_aliases::PcieRoot> {
     None
 }
@@ -1526,14 +1526,14 @@ pub unsafe fn syscall_device_info(handle: i32, arg: *mut u8, arg_len: usize) -> 
     *arg.add(9) = dev.dev;
     *arg.add(10) = dev.func;
     *arg.add(11) = 0;
-    #[cfg(feature = "board-cm5")]
+    #[cfg(feature = "board-pi5")]
     {
         let slot = &*core::ptr::addr_of!(BOUND_DEVICES[idx]);
         for i in 0..20 {
             *arg.add(12 + i) = slot.alias[i];
         }
     }
-    #[cfg(not(feature = "board-cm5"))]
+    #[cfg(not(feature = "board-pi5"))]
     {
         for i in 0..20 {
             *arg.add(12 + i) = 0;
@@ -1567,17 +1567,17 @@ pub const BCM2712_PCIE1_MSI_SPI_IRQ: u32 = 237;
 // Nothing here runs unless a driver opts in via `PCIE1_MSI_INIT` +
 // `PCIE1_MSI_ALLOC_VECTOR` syscalls (e.g. nvme with `irq_mode=1`).
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const PCIE1_MSI_VECTORS: usize = 32;
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 #[derive(Clone, Copy)]
 struct MsiVector {
     event_handle: i32,
     active: bool,
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 impl MsiVector {
     const fn empty() -> Self {
         Self {
@@ -1587,11 +1587,11 @@ impl MsiVector {
     }
 }
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 static mut PCIE1_MSI_VECTORS_TAB: [MsiVector; PCIE1_MSI_VECTORS] =
     [const { MsiVector::empty() }; PCIE1_MSI_VECTORS];
 
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 static mut PCIE1_MSI_INITIALISED: bool = false;
 
 /// Program the brcmstb PCIe1 MSI controller. Idempotent.
@@ -1607,7 +1607,7 @@ static mut PCIE1_MSI_INITIALISED: bool = false;
 /// have MISC_CTRL programmed (done by `enumerate()`). Mutates
 /// `PCIE1_MSI_INITIALISED` and the RC MSI registers; must run from a
 /// single core during init or while interrupts are masked.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub unsafe fn pcie1_msi_init() -> bool {
     if PCIE1_MSI_INITIALISED {
         return true;
@@ -1667,7 +1667,7 @@ pub unsafe fn pcie1_msi_init() -> bool {
 /// the allocated MSI vector (released only on reboot — there is no
 /// per-vector free path today). Mutates `PCIE1_MSI_VECTORS_TAB`;
 /// caller must serialize with other allocators on the same root.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)> {
     if !PCIE1_MSI_INITIALISED && !pcie1_msi_init() {
         return None;
@@ -1693,7 +1693,7 @@ pub unsafe fn pcie1_msi_alloc_vector(event_handle: i32) -> Option<(u8, u64, u32)
 /// on allocators not freeing slots concurrently. Acks the MSI snapshot
 /// before fanning out so writes to STATUS during dispatch accumulate
 /// instead of being lost.
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub unsafe fn pcie1_msi_dispatch() -> u32 {
     if !PCIE1_MSI_INITIALISED {
         return 0;
@@ -1728,7 +1728,7 @@ pub unsafe fn pcie1_msi_dispatch() -> u32 {
 ///
 /// # Safety
 /// No invariants; this stub does not touch hardware or globals.
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn pcie1_msi_init() -> bool {
     false
 }
@@ -1736,7 +1736,7 @@ pub unsafe fn pcie1_msi_init() -> bool {
 ///
 /// # Safety
 /// No invariants; this stub does not touch hardware or globals.
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn pcie1_msi_alloc_vector(_e: i32) -> Option<(u8, u64, u32)> {
     None
 }
@@ -1744,7 +1744,7 @@ pub unsafe fn pcie1_msi_alloc_vector(_e: i32) -> Option<(u8, u64, u32)> {
 ///
 /// # Safety
 /// No invariants; this stub does not touch hardware or globals.
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn pcie1_msi_dispatch() -> u32 {
     0
 }

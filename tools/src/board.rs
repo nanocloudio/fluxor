@@ -761,7 +761,7 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
     if has_paged_arena && !target.has_mmu {
         result.add_error(format!(
             "paged_arena requires MMU support (target '{}' has_mmu=false). \
-             Only BCM2712/CM5 targets support demand paging.",
+             Only bcm2712-class targets (pi5 / qemu-virt) support demand paging.",
             target.id
         ));
     }

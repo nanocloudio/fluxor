@@ -449,7 +449,7 @@ fn spawn_scenario(
         if build.family != "linux" {
             return Err(Error::Config(format!(
                 "scenario {}: component `{}` built for family {:?}; PR 3-4 only spawn linux \
-                 components (use `runtime_override: linux` for cm5 graphs).",
+                 components (use `runtime_override: linux` for pi5 graphs).",
                 scenario_path.display(),
                 comp_name,
                 build.family
@@ -1296,13 +1296,13 @@ fn cmd_flash(config_path: &Path, verbose: bool) -> Result<()> {
             }
         }
         "bcm" => {
-            let is_cm5 = result
+            let is_pi5 = result
                 .board_id
                 .as_deref()
-                .map(|b| b == "cm5")
+                .map(|b| b == "pi5")
                 .unwrap_or(false);
 
-            if is_cm5 {
+            if is_pi5 {
                 let dest = PathBuf::from("/boot/firmware/kernel8.img");
                 eprintln!(
                     "\x1b[1;33mWarning:\x1b[0m This will replace {}",
@@ -1317,7 +1317,7 @@ fn cmd_flash(config_path: &Path, verbose: bool) -> Result<()> {
                 println!("\x1b[1;32mFlashed\x1b[0m kernel8.img — reboot to apply");
             } else {
                 return Err(Error::Config(
-                    "Only CM5 targets support flash. Use 'fluxor run' for QEMU targets.".into(),
+                    "Only pi5 targets support flash. Use 'fluxor run' for QEMU targets.".into(),
                 ));
             }
         }
@@ -1917,7 +1917,7 @@ fn cmd_modules_resolve(target: &str, out: &Path) -> Result<()> {
     } else {
         project_root.join(out)
     };
-    let path = modules_build::resolve(&out_root, target);
+    let path = modules_build::resolve(&project_root, &out_root, target);
     println!("{}", path.display());
     Ok(())
 }

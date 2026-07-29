@@ -19,7 +19,7 @@ driver modules  →  contract interfaces  →  foundation modules  →  app modu
 
 This separation enables portability: the same foundation module can run
 on any board as long as a compatible driver is present. The HTTP server
-that runs on a Pico W with a `cyw43` driver runs unchanged on a CM5 with
+that runs on a Pico W with a `cyw43` driver runs unchanged on a Pi 5 with
 a `virtio_net` driver, because both drivers expose Ethernet frames over
 a channel and the IP foundation module sits between them and HTTP.
 

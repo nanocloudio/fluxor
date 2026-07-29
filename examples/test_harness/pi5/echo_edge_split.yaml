@@ -1,4 +1,4 @@
-# Echo anchor/worker split across cores (Pi 5 / CM5) — multi-domain
+# Echo anchor/worker split across cores (Pi 5) — multi-domain
 # rebuild validation graph.
 #
 # Same graph as echo_edge.yaml, but `echo_worker` runs in its own domain on
@@ -15,15 +15,15 @@
 #
 # Build (test firmware):
 #   cargo build --release --target aarch64-unknown-none \
-#     --no-default-features --features board-cm5,test-rebuild
-#   fluxor combine -o kernel_2712.img target/cm5/firmware.bin \
-#     examples/test_harness/cm5/echo_edge_split.yaml
+#     --no-default-features --features board-pi5,test-rebuild
+#   fluxor combine -o kernel_2712.img target/pi5/firmware.bin \
+#     examples/test_harness/pi5/echo_edge_split.yaml
 #
 # Probe from the host (before and after the rebuild window). 192.168.2.1 is an
 # example DUT IP (documentation addresses follow the RFC 5737 TEST-NET-1 convention):
 #   printf 'ping' | nc -w2 192.168.2.1 9000
 
-target: cm5
+target: pi5
 tick_us: 100
 
 execution:

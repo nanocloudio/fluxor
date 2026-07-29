@@ -1,4 +1,4 @@
-//! MMU-based hardware isolation for Cortex-A76 (BCM2712 / CM5).
+//! MMU-based hardware isolation for Cortex-A76 (BCM2712 / Pi 5).
 //!
 //! # Architecture
 //!
@@ -14,7 +14,7 @@
 //!
 //! ## Memory Map
 //!
-//! | Region              | QEMU virt address      | CM5 address         |
+//! | Region              | QEMU virt address      | Pi 5 address         |
 //! |---------------------|------------------------|---------------------|
 //! | Kernel code+data    | 0x4008_0000..          | 0x0008_0000..       |
 //! | Module code (blob)  | After kernel           | After kernel        |
@@ -272,7 +272,7 @@ mod bcm2712_impl {
                 );
             }
 
-            // CM5: peripherals at 0xFE00_0000+ are in higher L1 entries
+            // Pi 5: peripherals at 0xFE00_0000+ are in higher L1 entries
             // This is handled by having additional L1→L2 mappings for those.
 
             // Kernel L1: point entry 0 to kernel L2 (covers 0..1GB)
@@ -837,7 +837,7 @@ mod bcm2712_impl {
     //                 access becomes a one-shot module fault, never a
     //                 re-faulting core spin.
     //
-    // Scope / known limits (see docs/architecture/cm5_el0_isolation.md):
+    // Scope / known limits (see .context/pi5_el0_isolation.md):
     //   * IRQs are masked during the EL0 step (SPSR DAIF). A runaway EL0
     //     loop that never faults and never returns would hang the owning
     //     core — bounding that needs an EL0 preemption timer (follow-up).

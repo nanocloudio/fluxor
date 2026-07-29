@@ -40,7 +40,7 @@ into driver modules and infrastructure wiring (see
 
 ### Top-Level Shape
 
-- `target` — silicon/board identifier (e.g. `pico2w`, `cm5`, `qemu-virt`)
+- `target` — silicon/board identifier (e.g. `pico2w`, `pi5`, `qemu-virt`)
 - `hardware` — physical hardware declarations (network, audio, display, storage)
 - `modules` — application module instances and their parameters
 - `wiring` — directed edges between module ports
@@ -170,7 +170,7 @@ The "sleep until tick or event" step differs by target:
 | Target | Sleep mechanism |
 |--------|----------------|
 | RP2040, RP2350 | Embassy `select(Timer::after(tick), SCHEDULER_WAKE.wait()).await` |
-| BCM2712, CM5 | Synchronous wait on the chip's monotonic timer with interrupt unmasking |
+| BCM2712, Pi 5 | Synchronous wait on the chip's monotonic timer with interrupt unmasking |
 
 In both cases, an event signal from an ISR or another module wakes the
 loop early — the sleep is bounded above by the configured tick period
@@ -365,7 +365,7 @@ Modules can declare a protection level:
 |-------|------|----------|
 | 0 | None | Direct call, no isolation |
 | 1 | Guarded | Step guard timer detects timeouts |
-| 2 | Isolated | Hardware memory protection (MPU on RP2350, MMU on CM5) per step |
+| 2 | Isolated | Hardware memory protection (MPU on RP2350, MMU on Pi 5) per step |
 
 Isolated modules execute with their state, code, and channel buffers
 mapped via the MPU/MMU and everything else excluded. A wild pointer
@@ -398,7 +398,7 @@ drain protocol.
 
 ## Demand-Paged Arenas
 
-On targets with an MMU (BCM2712, CM5), modules can request demand-paged
+On targets with an MMU (BCM2712, Pi 5), modules can request demand-paged
 arenas larger than physical RAM. The kernel allocates virtual address
 space backed by a page pool with clock eviction and a backing store
 (NVMe or RAM disk). The module sees a flat large arena and accesses

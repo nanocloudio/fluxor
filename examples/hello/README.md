@@ -8,25 +8,25 @@ every environment that lets the kernel run at all.
 
 ## Targets
 
-- `cm5.yaml` — bare-metal Pi 5; kernel log reaches the RP1 PL011
+- `pi5.yaml` — bare-metal Pi 5; kernel log reaches the RP1 PL011
   on GPIO14/15 via the built-in debug drain, no overlay module
   required.
 
 ## Run
 
 ```sh
-make firmware TARGET=cm5 && fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/cm5/firmware.bin examples/hello/cm5.yaml
+make firmware TARGET=pi5 && fluxor modules build --target bcm2712
+fluxor combine -o kernel8.img target/pi5/firmware.bin examples/hello/pi5.yaml
 # netboot or copy kernel8.img to /boot/firmware/
 tio /dev/ttyUSB0 -b 115200
 ```
 
 The rig regression that drives this end-to-end:
-[`tests/hardware/cm5_boot_banner.toml`](../../tests/hardware/cm5_boot_banner.toml).
+[`tests/hardware/pi5_boot_banner.toml`](../../tests/hardware/pi5_boot_banner.toml).
 
 ## Related
 
 - For network-aware demos see [`web_server/`](../web_server/) or
   [`log_net/`](../log_net/) (netconsole when UART is unavailable).
 - Platform-bringup probes (DMA, GEM, NVMe identify) live under
-  [`../test_harness/cm5/bringup/`](../test_harness/cm5/bringup/).
+  [`../test_harness/pi5/bringup/`](../test_harness/pi5/bringup/).

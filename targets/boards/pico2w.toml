@@ -1,9 +1,9 @@
 # Raspberry Pi Pico 2 W
-# RP2350A with CYW43439 wireless (uses GP23-25, GP29)
+# RP2350 (QFN-60 package A, 30 GPIO) with CYW43439 wireless (uses GP23-25, GP29)
 
 [board]
 id = "pico2w"
-silicon = "rp2350a"
+silicon = "rp2350"
 description = "Raspberry Pi Pico 2 W"
 
 # Default PIO: gSPI cmd (CYW43) on PIO1, I2S stream on PIO0
@@ -20,6 +20,8 @@ clk_pin = 26
 extra_pin = 27
 
 [gpio]
+# QFN-60 package: GPIO 0-29 only (silicon pin tables are QFN-80).
+max_pin = 29
 reserved_pins = [23, 24, 25, 29]
 
 [gpio.reserved_reasons]

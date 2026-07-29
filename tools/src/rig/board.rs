@@ -95,8 +95,8 @@ pub fn parse_board_rig_str(raw: &str, ctx: &str) -> Result<Option<BoardRig>> {
 /// Paths are relative to this file (`tools/src/rig/board.rs`) and reach
 /// up to the repo's `targets/boards/` directory at build time.
 const EMBEDDED_BOARDS: &[(&str, &str)] = &[
-    ("cm5", include_str!("../../../targets/boards/cm5.toml")),
-    ("linux", include_str!("../../../targets/boards/linux.toml")),
+    ("pi5", include_str!("../../../targets/boards/pi5.toml")),
+    ("linux", include_str!("../../../targets/host/linux.toml")),
     ("pico", include_str!("../../../targets/boards/pico.toml")),
     (
         "pico2w",
@@ -303,7 +303,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_cm5_shape() {
+    fn loads_pi5_shape() {
         let toml_src = r#"
             [rig]
             artifact = "boot_bundle"
@@ -317,7 +317,7 @@ mod tests {
             power = ["power.cycle"]
             default_timeout_s = 30
         "#;
-        let rig = parse_board_rig_str(toml_src, "cm5.toml").unwrap().unwrap();
+        let rig = parse_board_rig_str(toml_src, "pi5.toml").unwrap().unwrap();
         assert_eq!(rig.artifact.as_deref(), Some("boot_bundle"));
         assert_eq!(rig.deploy.len(), 2);
         assert_eq!(rig.default_timeout_s, Some(30));
@@ -364,17 +364,37 @@ mod tests {
     /// Guard that scopes env-var writes used by the resolver tests. Drop
     /// restores the previous values so parallel tests don't leak into
     /// each other.
+    ///
+    /// Save/restore alone is not enough: env vars are process-global and
+    /// cargo runs these tests on parallel threads, so one test's `HOME`
+    /// is visible to every other test in the binary for as long as it is
+    /// set. The guard therefore also holds the shared `ENV_LOCK` for its
+    /// whole lifetime — the same mutex `project::tests` serialises on —
+    /// which is what makes the save/restore pairing atomic. Without it
+    /// the resolver tests intermittently read another test's `HOME` and
+    /// resolve the wrong layer.
     struct EnvGuard {
         keys: Vec<(String, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn new(keys: &[&str]) -> Self {
+            // A poisoned lock means some other test panicked mid-mutation.
+            // Take it anyway: this guard restores every key it touches, so
+            // the next test still starts from a known environment.
+            let lock = match crate::project::tests::ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             let saved = keys
                 .iter()
                 .map(|k| (k.to_string(), std::env::var_os(k)))
                 .collect();
-            Self { keys: saved }
+            Self {
+                keys: saved,
+                _lock: lock,
+            }
         }
         fn set(&self, k: &str, v: &str) {
             std::env::set_var(k, v);
@@ -399,10 +419,10 @@ mod tests {
         g.set("XDG_CONFIG_HOME", empty.to_str().unwrap());
         g.set("HOME", empty.to_str().unwrap());
 
-        let (rig, source) = resolve_board_rig("cm5", None).unwrap();
-        assert!(rig.is_some(), "embedded cm5 must carry a [rig] section");
+        let (rig, source) = resolve_board_rig("pi5", None).unwrap();
+        assert!(rig.is_some(), "embedded pi5 must carry a [rig] section");
         match source {
-            BoardSource::Embedded(id) => assert_eq!(id, "cm5"),
+            BoardSource::Embedded(id) => assert_eq!(id, "pi5"),
             other => panic!("expected Embedded, got {other:?}"),
         }
         std::fs::remove_dir_all(&empty).ok();
@@ -419,7 +439,7 @@ mod tests {
         let project_boards = project.join("targets").join("boards");
         std::fs::create_dir_all(&project_boards).unwrap();
         std::fs::write(
-            project_boards.join("cm5.toml"),
+            project_boards.join("pi5.toml"),
             r#"[rig]
 artifact = "kernel8_img"
 deploy = ["deploy.bootfs_copy"]
@@ -432,13 +452,13 @@ default_timeout_s = 7
         )
         .unwrap();
 
-        let (rig, source) = resolve_board_rig("cm5", Some(&project)).unwrap();
+        let (rig, source) = resolve_board_rig("pi5", Some(&project)).unwrap();
         let rig = rig.expect("project descriptor has [rig]");
         // `default_timeout_s = 7` is unique to the project override; the
         // embedded descriptor would give a different value.
         assert_eq!(rig.default_timeout_s, Some(7));
         match source {
-            BoardSource::Project(p) => assert_eq!(p, project_boards.join("cm5.toml")),
+            BoardSource::Project(p) => assert_eq!(p, project_boards.join("pi5.toml")),
             other => panic!("expected Project source, got {other:?}"),
         }
         std::fs::remove_dir_all(&empty).ok();
@@ -453,7 +473,7 @@ default_timeout_s = 7
         let user_boards = xdg.join("fluxor").join("boards");
         std::fs::create_dir_all(&user_boards).unwrap();
         std::fs::write(
-            user_boards.join("cm5.toml"),
+            user_boards.join("pi5.toml"),
             r#"[rig]
 artifact = "kernel8_img"
 deploy = ["deploy.netboot_tftp"]
@@ -473,7 +493,7 @@ default_timeout_s = 999
         let project_boards = project.join("targets").join("boards");
         std::fs::create_dir_all(&project_boards).unwrap();
         std::fs::write(
-            project_boards.join("cm5.toml"),
+            project_boards.join("pi5.toml"),
             r#"[rig]
 artifact = "kernel8_img"
 deploy = ["deploy.bootfs_copy"]
@@ -484,12 +504,12 @@ default_timeout_s = 42
         )
         .unwrap();
 
-        let (rig, source) = resolve_board_rig("cm5", Some(&project)).unwrap();
+        let (rig, source) = resolve_board_rig("pi5", Some(&project)).unwrap();
         let rig = rig.expect("[rig] section");
         // `999` is unique to the user override.
         assert_eq!(rig.default_timeout_s, Some(999));
         match source {
-            BoardSource::UserOverride(p) => assert_eq!(p, user_boards.join("cm5.toml")),
+            BoardSource::UserOverride(p) => assert_eq!(p, user_boards.join("pi5.toml")),
             other => panic!("expected UserOverride, got {other:?}"),
         }
         std::fs::remove_dir_all(&xdg).ok();
@@ -506,7 +526,7 @@ default_timeout_s = 42
         let err = resolve_board_rig("definitely-not-a-board", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("definitely-not-a-board"), "{msg}");
-        assert!(msg.contains("cm5"), "{msg}");
+        assert!(msg.contains("pi5"), "{msg}");
         std::fs::remove_dir_all(&empty).ok();
     }
 }

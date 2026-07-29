@@ -10,7 +10,7 @@ builtin = true
 # canvas; HDR sources are tone-mapped by the browser's compositor.
 #
 # This is the wasm analogue of hardware-decode paths on other targets
-# (V4L2 stateless on the linux host, rpivid on cm5 — future). The
+# (V4L2 stateless on the linux host, rpivid on pi5 — future). The
 # pure-Rust PIC `codec` module remains the software fallback for
 # Constrained Baseline H.264 where WebCodecs is unavailable.
 #

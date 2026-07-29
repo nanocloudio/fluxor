@@ -69,7 +69,7 @@ mechanisms:
 
 These are not preferred-and-fallback. They are different connection
 classes selected by what the host can host. A bare-metal rp2350
-joining a CM5 graph uses remote channels because it runs a kernel.
+joining a Pi 5 graph uses remote channels because it runs a kernel.
 A DOM-only browser uses the endpoint surface because it does not. A
 browser tab running a WASM Fluxor build is the same shape as the
 rp2350 case — it joins via remote channels and the endpoint surface

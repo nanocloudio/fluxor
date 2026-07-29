@@ -14,7 +14,7 @@
 //!   I2C0:       BAR + 0x70000
 //!   I2C1:       BAR + 0x74000
 //!
-//! On non-`board-cm5` configs (QEMU virt) every entry point degrades to a
+//! On non-`board-pi5` configs (QEMU virt) every entry point degrades to a
 //! no-op stub so the same code calls compile.
 
 #![allow(
@@ -22,8 +22,8 @@
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 
-#[cfg(feature = "board-cm5")]
-mod cm5_impl {
+#[cfg(feature = "board-pi5")]
+mod pi5_impl {
     /// RP1 PCIe BAR base address as mapped by GPU firmware.
     /// This is the standard address on Pi 5 with stock firmware.
     const RP1_BAR_BASE: usize = 0x1c_0000_d000;
@@ -219,7 +219,7 @@ mod cm5_impl {
     // RP1 PWM — active-cooler ("pwm-fan") force-on
     // ==========================================================================
     //
-    // The Pi 5 / CM5 active cooler is driven by the RP1 `raspberrypi,rp1-pwm`
+    // The Pi 5 active cooler is driven by the RP1 `raspberrypi,rp1-pwm`
     // block (offset 0x9c000 within the RP1 peripheral aperture) on channel 3,
     // routed to gpio45 (function "pwm1" = ALT0). The fan PWM runs from a 50 MHz
     // clock with a ~41.5 µs (24 kHz) period and INVERTED polarity (matching the
@@ -264,7 +264,7 @@ mod cm5_impl {
         0x020 + ch * 0x10
     }
 
-    /// Fan PWM channel (Pi 5 / CM5 active cooler).
+    /// Fan PWM channel (Pi 5 active cooler).
     const FAN_PWM_CHANNEL: usize = 3;
     /// Period in 20 ns clock cycles (≈41.5 µs / 24 kHz).
     const FAN_PWM_RANGE: u32 = 2078;
@@ -379,9 +379,9 @@ mod cm5_impl {
     }
 }
 
-// Stub for non-board-cm5 (QEMU virt — no PCIe).
-#[cfg(not(feature = "board-cm5"))]
-mod cm5_impl {
+// Stub for non-board-pi5 (QEMU virt — no PCIe).
+#[cfg(not(feature = "board-pi5"))]
+mod pi5_impl {
     pub fn probe() -> bool {
         false
     }
@@ -390,4 +390,4 @@ mod cm5_impl {
     pub fn fan_report() {}
 }
 
-pub use cm5_impl::*;
+pub use pi5_impl::*;

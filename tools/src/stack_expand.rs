@@ -207,7 +207,7 @@ struct StackInjection {
     /// rejects cyclic graphs unless `scheduler.accept_cycles` is set, so an
     /// injection that knowingly creates a feedback pair sets that flag on the
     /// expanded config — otherwise every `debug: to: net` graph is rejected
-    /// at `prepare_graph` and boots with no working graph (the cm5 "low-module
+    /// at `prepare_graph` and boots with no working graph (the pi5 "low-module
     /// boot wedge" was this: small configs lacked an unrelated http<->ws cycle
     /// that would have set the flag for them).
     #[serde(default)]
@@ -479,14 +479,13 @@ fn merge_with_board_defaults(
         merged.insert("board".into(), board.clone());
     }
     merged.insert("family".into(), target.family.clone());
-    // `silicon` is the module-artefact silicon id (rp2350a/rp2350b → rp2350,
-    // cm5 → bcm2712). Lets an overlay select a narrower set than `family`
-    // when a module supports only some silicon within a family — e.g. the
-    // OTLP exporter is rp2350-only and must not match rp2040 under `family="rp2"`.
-    merged.insert(
-        "silicon".into(),
-        crate::modules_build::target_to_silicon(&target.id).to_string(),
-    );
+    // `silicon` is the module-artefact silicon id. Descriptors carry the
+    // silicon id directly (boards resolve through the registry), so no
+    // aliasing is needed. Lets an overlay select a narrower set than
+    // `family` when a module supports only some silicon within a family —
+    // e.g. the OTLP exporter is rp2350-only and must not match rp2040
+    // under `family="rp2"`.
+    merged.insert("silicon".into(), target.id.clone());
 
     merged
 }
@@ -953,7 +952,7 @@ mod tests {
     /// `debug: to: net` injects a `log_net <-> ip` feedback 2-cycle. An
     /// injection with `accept_cycles = true` must set
     /// `scheduler.accept_cycles` on the expanded config so `prepare_graph`
-    /// doesn't reject the graph (the cm5 low-module boot wedge). A user's
+    /// doesn't reject the graph (the pi5 low-module boot wedge). A user's
     /// explicit value is preserved (`.or_insert`).
     #[test]
     fn accept_cycles_injection_sets_scheduler_flag() {
@@ -1343,7 +1342,7 @@ mod tests {
         assert_eq!(
             merged.get("silicon"),
             Some(&"rp2350".to_string()),
-            "rp2350a board collapses to the rp2350 module silicon"
+            "pico2w board resolves to the rp2350 silicon"
         );
 
         let rp2040 = crate::target::load_target("pico", &root).unwrap();

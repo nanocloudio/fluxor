@@ -99,7 +99,7 @@ explicit timing, validated before deployment — stayed the same.
 
 That property is what makes the capability story credible. If a
 capability like audio playback must be expressible on a Pico W with
-PIO-driven I2S, on a CM5 with a DSP pipeline, and on a server-class
+PIO-driven I2S, on a Pi 5 with a DSP pipeline, and on a server-class
 node streaming to a network speaker, the graph model has to work
 across all of them. It does. Only the modules and their wiring
 change.
@@ -135,7 +135,7 @@ explicit at the right layer:
 
 This is different from pretending every target is the same. It keeps
 hardware-specific code local while preserving a stable graph model
-above it. A retro-emulator config that runs on a Pico W, on a CM5
+above it. A retro-emulator config that runs on a Pico W, on a Pi 5
 bare-metal stack, and as a WASM bundle in the browser does so because
 the modules above the HAL are identical — only the providers
 underneath swap.
@@ -157,7 +157,7 @@ What matters across the system is:
 - how capabilities compose into a coherent system
 
 In that frame, whether a capability runs on bare-metal Fluxor on an
-RP2040, bare-metal on a CM5, Linux hosting a bridge, a browser UI, an
+RP2040, bare-metal on a Pi 5, Linux hosting a bridge, a browser UI, an
 industrial controller, or a server-class node becomes secondary. The
 semantic architecture sits above the host boundary.
 
@@ -194,7 +194,7 @@ current tree:
 - the capability/manifest/stack-expansion machinery resolves
   hardware to provider chains at build time
 - modules cross targets unchanged: the same audio, codec, http,
-  fat32, and ip modules ship in MCU, bare-metal CM5, Linux, and
+  fat32, and ip modules ship in MCU, bare-metal Pi 5, Linux, and
   WASM examples
 - remote channels and protocol surfaces extend the channel model
   across process and network boundaries

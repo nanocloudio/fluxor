@@ -153,8 +153,8 @@ mod tests {
     fn fixture_scenario() -> Scenario {
         let raw = r#"
 name = "demo"
-target = "cm5"
-config = "../../examples/web_server/cm5.yaml"
+target = "pi5"
+config = "../../examples/web_server/pi5.yaml"
 "#;
         parse_scenario_str(raw, Path::new("/repo/tests/hardware"), "fixture").unwrap()
     }
@@ -163,7 +163,7 @@ config = "../../examples/web_server/cm5.yaml"
         let raw = format!(
             r#"
 name = "demo"
-target = "cm5"
+target = "pi5"
 config = "{path}"
 "#
         );
@@ -185,7 +185,7 @@ config = "{path}"
         // Path lands in its own argv slot; no shell involved.
         assert_eq!(
             out[3],
-            "/repo/tests/hardware/../../examples/web_server/cm5.yaml"
+            "/repo/tests/hardware/../../examples/web_server/pi5.yaml"
         );
     }
 
@@ -341,7 +341,7 @@ config = "{path}"
         let out = substitute_command(&cmd, &scenario).unwrap();
         assert_eq!(
             out[2],
-            "/repo/tests/hardware/../../examples/web_server/cm5.yaml"
+            "/repo/tests/hardware/../../examples/web_server/pi5.yaml"
         );
     }
 

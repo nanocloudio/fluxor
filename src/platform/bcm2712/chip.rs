@@ -3,7 +3,7 @@
 //! Capacity tunables are centralised in `abi::config::kernel`;
 //! per-board profiles live there, not here. This file used to
 //! shadow them with locally-defined values; that pattern caused
-//! the cm5 silent-fail in the multi-conn refactor when the http
+//! the pi5 silent-fail in the multi-conn refactor when the http
 //! module's arena demand outgrew an out-of-date local
 //! `STATE_ARENA_SIZE` here. Re-exporting from one source of truth
 //! prevents the recurrence.

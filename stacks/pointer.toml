@@ -33,7 +33,7 @@ wiring = []
 #    placeholder that fails-with-diagnostic until a real driver
 #    matches the panel.
 [[variant]]
-match = { board = "cm5" }
+match = { board = "pi5" }
 modules = [{ name = "pointer", type = "bcm2712_touch_panel" }]
 wiring = []
 

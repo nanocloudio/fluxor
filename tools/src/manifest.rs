@@ -333,6 +333,9 @@ fn hardware_targets_from_list(targets: &[String]) -> u16 {
         match t.to_ascii_lowercase().as_str() {
             "rp2350" => mask |= 0x01,
             "rp2040" => mask |= 0x02,
+            "bcm2712" => mask |= 0x04,
+            "wasm" => mask |= 0x08,
+            "linux" => mask |= 0x10,
             _ => {} // ignore unknown targets
         }
     }
@@ -2143,32 +2146,20 @@ pub struct TargetCapabilities {
 }
 
 impl TargetCapabilities {
-    /// Resolve capabilities for a silicon id OR a board id.
-    /// Conservative — unknown names return all-false so a manifest's
-    /// `requires.fpu = true` will reject placement until the name
-    /// is added here.
+    /// Resolve capabilities for a silicon or host id. Conservative —
+    /// unknown names return all-false so a manifest's `requires.fpu =
+    /// true` will reject placement until the name is added here.
     ///
-    /// Real YAML configs commonly use board ids (`cm5`, `pico2w`,
-    /// `linux`) rather than the silicon id (`bcm2712`, `rp2350a`).
-    /// The first arm of `match` normalises board ids to the matching
-    /// silicon entry; callers that already pass a silicon id pass
-    /// through unchanged. The board → silicon map mirrors
-    /// `targets/boards/<board>.toml`'s `board.silicon` field —
-    /// adding a board requires both the TOML descriptor AND a row
-    /// here.
+    /// Board names must be resolved to silicon through the `targets/`
+    /// registry BEFORE this call (`TargetDescriptor::module_silicon()`);
+    /// this table deliberately carries no board rows.
     pub fn for_silicon(name: &str) -> Self {
-        // Board → silicon normalisation. Mirrors
-        // `targets/boards/<board>.toml::[board].silicon`.
-        let silicon = match name {
-            "cm5" => "bcm2712",
-            "qemu-virt" => "bcm2712",
-            "pico2w" => "rp2350a",
-            "waveshare-lcd4" => "rp2350b",
-            "pico" | "picow" => "rp2040",
-            "linux-host" => "linux",
-            other => other,
-        };
-        match silicon {
+        // Silicon and host tokens only — board names resolve through the
+        // `targets/` registry BEFORE reaching this table (callers pass
+        // `TargetDescriptor::module_silicon()`). No alias rows: the
+        // registry is the single board→silicon mapping
+        // (standards/target_consolidation.md §3).
+        match name {
             // Cortex-M0+, no FPU, no SIMD, no MMU.
             "rp2040" => Self {
                 fpu: false,
@@ -2177,7 +2168,7 @@ impl TargetCapabilities {
             },
             // Cortex-M33 with FPv5-SP single-precision FPU, no SIMD,
             // MPU but not MMU.
-            s if s.starts_with("rp2350") => Self {
+            "rp2350" => Self {
                 fpu: true,
                 neon: false,
                 mmu: false,
@@ -2196,7 +2187,7 @@ impl TargetCapabilities {
             },
             // WASM: no NEON in the portable target; FPU yes via
             // wasm-mvp; no MMU (linear memory only).
-            "wasm" | "wasm32" => Self {
+            "wasm" => Self {
                 fpu: true,
                 neon: false,
                 mmu: false,

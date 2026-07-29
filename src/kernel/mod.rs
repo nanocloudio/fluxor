@@ -124,7 +124,7 @@ pub mod rp_providers;
 pub mod rp_step_guard;
 pub mod step_guard;
 // SMMU/IOMMU on BCM2712 lives in the `smmu` PIC module
-// (`modules/foundation/smmu/`) via MMIO bridges. CM5 NVMe uses
+// (`modules/foundation/smmu/`) via MMIO bridges. Pi 5 NVMe uses
 // direct UBUS_REMAP inbound-DMA windowing and does not need SMMU.
 #[cfg(feature = "rp")]
 #[path = "../platform/rp/io.rs"]

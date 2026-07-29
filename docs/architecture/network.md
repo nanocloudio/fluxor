@@ -234,7 +234,7 @@ channels are sized large enough to hold a few full-sized frames (typically
 `channel_write` / `channel_read` — the ring buffer provides flow control
 and the IP module's frame parser handles the boundaries.
 
-For high-throughput targets (CM5, server-class), drivers and IP can use
+For high-throughput targets (Pi 5, server-class), drivers and IP can use
 the **mailbox mode** of channels for zero-copy frame handoff. The driver
 acquires a buffer from the channel via `buffer_acquire_write`, the
 hardware DMA fills it directly, and the IP module reads it via
@@ -250,7 +250,7 @@ machine.
 | `enc28j60` | SPI | Any | Discrete Ethernet PHY |
 | `ch9120` | UART | Any | Hardware TCP/IP offload over UART |
 | `virtio_net` | MMIO | aarch64 (QEMU virt, BCM2712) | Paravirtualized NIC |
-| `e810` | PCIe | aarch64 (CM5, server) | Intel 800-series Ethernet |
+| `e810` | PCIe | aarch64 (Pi 5, server) | Intel 800-series Ethernet |
 | `linux_net` | libc TUN/socket | host-linux | Bridges Fluxor frames to Linux networking |
 
 Each is a PIC module under `modules/drivers/`. None contain TCP, ARP, or
@@ -277,7 +277,7 @@ admission filter (`modules/foundation/conn_guard/`). It parses Ethernet
 + IPv4 + TCP headers just far enough to identify pure SYNs and applies a
 per-source-IP rate limit (default: 16 SYNs per 1 s window, 32-entry
 LRU table). Non-TCP, non-SYN, and within-budget traffic passes through
-untouched. The CM5 ethernet stack wires it automatically via
+untouched. The Pi 5 ethernet stack wires it automatically via
 `stacks/net.toml`; `security.md` covers the full threat model.
 
 ## The IP Module

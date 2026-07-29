@@ -546,14 +546,14 @@ pub const GRAPH_EDGE_SIZE: usize = 12;
 /// `tick_min_us`/`tick_max_us` are deliberately NOT in this (checksummed) entry:
 /// they ride in the POST-BODY adaptive section past `total_size` (see
 /// `ADAPTIVE_POST_SIZE`), because growing the checksummed `body_size` hangs the
-/// bare-metal CM5 boot. So the entry stays 4 bytes and `body_size`/CRC are
+/// bare-metal Pi 5 boot. So the entry stays 4 bytes and `body_size`/CRC are
 /// unchanged. The blob format version is NOT bumped (latest-only; kernel + tools
 /// ship together) — a stale blob is rejected by the body-size/CRC check.
 pub const DOMAIN_META_ENTRY_SIZE: usize = 4;
 pub const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// Adaptive-tick post-body section: 4 domains × `[tick_min_us:u16, tick_max_us:u16]`.
 /// Stored AFTER the checksummed body (past `total_size`), never inside
-/// `body_size` — growing `body_size` hangs the bare-metal CM5 boot, but trailing
+/// `body_size` — growing `body_size` hangs the bare-metal Pi 5 boot, but trailing
 /// bytes past it are harmless (both rig-proven). See the read site in
 /// `read_config_from_slice`.
 pub const ADAPTIVE_POST_SIZE: usize = 16;
@@ -1232,7 +1232,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
             // post-body adaptive section (read below, after the hw section)
             // overrides these when present. They live there — not here in the
             // graph domain meta — because growing the checksummed `body_size`
-            // hangs the bare-metal CM5 boot (rig-proven), whereas trailing bytes
+            // hangs the bare-metal Pi 5 boot (rig-proven), whereas trailing bytes
             // past `body_size` are harmless.
             let eff = if dtick > 0 { dtick } else { global_tick };
             config.domain_tick_min_us[d] = eff;
@@ -1257,7 +1257,7 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // Adaptive-tick post-body section: 4 domains × [tick_min_us:u16 LE,
     // tick_max_us:u16 LE] = 16 bytes, placed AFTER the checksummed body (at
     // `total_size`), NOT inside `body_size`. This is deliberate: growing
-    // `body_size` itself hangs the bare-metal CM5 boot (rig-proven, mechanism
+    // `body_size` itself hangs the bare-metal Pi 5 boot (rig-proven, mechanism
     // unresolved — a body of N+16 hangs where N boots), but trailing bytes PAST
     // `body_size` are harmless (rig-proven: a 16B post-body pad boots). So the
     // body/checksum/parse stay byte-identical to a config without adaptive data,

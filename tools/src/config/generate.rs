@@ -350,8 +350,17 @@ fn generate_config_impl(
     // checked-in default. Legacy fixtures without either omit the
     // check entirely; that's by design, since the default `requires`
     // is all-false and satisfies every silicon.
-    let silicon_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
-    if let Some(silicon) = silicon_opt {
+    // YAML `target:` carries a board or host token; capability lookup is
+    // silicon-keyed, so resolve through the registry first. Falls back to
+    // the raw token (which then fails closed in `for_silicon`) when the
+    // registry doesn't know the name.
+    let target_opt = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
+    let silicon_owned = target_opt.map(|t| {
+        crate::target::load_target(t, &crate::project::root())
+            .map(|d| d.module_silicon().to_string())
+            .unwrap_or_else(|_| t.to_string())
+    });
+    if let Some(silicon) = silicon_owned.as_deref() {
         // Cover base AND pod modules — a pod module runs on the same silicon and
         // must satisfy the same `[requires]` (FPU/NEON/MMU).
         for (i, m) in validation_list.iter().enumerate() {
@@ -388,11 +397,12 @@ fn generate_config_impl(
 
     // Per-edge capacity + rate-class validation.
     {
-        // Callers pass the resolved SILICON id (e.g. board "pico2w" →
-        // silicon "rp2350a"); the small-buffer-arena profile is the
-        // rp2 family.
-        let embedded = silicon_opt
-            .map(|s| s.starts_with("rp2040") || s.starts_with("rp2350"))
+        // `silicon_owned` is the registry-resolved silicon id (board
+        // "pico2w" → silicon "rp2350"); the small-buffer-arena profile
+        // is the rp2 family.
+        let embedded = silicon_owned
+            .as_deref()
+            .map(|s| s == "rp2040" || s == "rp2350")
             .unwrap_or(false);
         validate_wiring_capacity(
             config,
@@ -676,7 +686,7 @@ fn generate_config_impl(
     //   tick_us:u16 LE | exec_mode:u8 | adaptive_flags:u8
     // tick_min_us/tick_max_us are appended in the post-body adaptive section
     // AFTER the checksum (see below), NOT in this entry — growing the checksummed
-    // body_size hangs the bare-metal CM5 boot.
+    // body_size hangs the bare-metal Pi 5 boot.
     let domains_arr = config
         .get("execution")
         .and_then(|e| e.get("domains"))
@@ -726,7 +736,7 @@ fn generate_config_impl(
     // tick_max_us:u16 LE] = 16 bytes, appended AFTER the checksum so it sits
     // PAST body_size (the kernel reads it at total_size). Deliberately not in
     // body_size / not checksum-covered: growing body_size hangs the bare-metal
-    // CM5 boot, but trailing bytes past it are harmless (both rig-proven).
+    // Pi 5 boot, but trailing bytes past it are harmless (both rig-proven).
     // Mirrors `kernel::config::ADAPTIVE_POST_SIZE`; default 0 ⇒ kernel uses the
     // domain tick (adaptive is a no-op when unconfigured).
     let adaptive_domains = config

@@ -3,7 +3,7 @@ version = "1.0.0"
 # rp2350 surface in this project is the headless I2S speaker (no display), so it
 # is intentionally NOT a target — there is nothing to draw to, and its 256 KiB
 # state arena can't satisfy this module's framebuffer arena anyway.
-hardware_targets = ["cm5", "bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm"]
 
 # Content-plane control panel (rfc_adaptive_presentation.md §11.3). Draws a touch
 # transport bar (prev / play-pause / next) into an RGB565 VideoRaster frame and,

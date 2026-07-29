@@ -1,6 +1,6 @@
 # Audio Player — linux producer half of the split scenario.
 #
-# Linux-native counterpart to `cm5-split.yaml`. The
+# Linux-native counterpart to `pi5-split.yaml`. The
 # producer pipeline (bank → codec → ws → http) is identical in
 # shape; the WebSocket bridges between the linux kernel and the
 # browser. The pure-wasm form (`wasm.yaml`) is the
@@ -32,7 +32,7 @@ tick_us: 100
 
 # Inline scenario — `fluxor run examples/audio_player/linux.yaml`
 # orchestrates this graph plus the thin wasm player at `/player/`.
-# Same shape as the cm5 split, just with the linux unified codec on
+# Same shape as the pi5 split, just with the linux unified codec on
 # the producer side.
 scenario:
   name: audio_player_linux
@@ -70,7 +70,7 @@ modules:
     paused: 1
 
   # Unified codec — auto-detects WAV/MP3/AAC; emits i16 LE PCM at
-  # the file's native sample rate. Same module the cm5 / wasm /
+  # the file's native sample rate. Same module the pi5 / wasm /
   # pico2w players use.
   - name: codec
 

@@ -4,7 +4,7 @@
 //!
 //! The logic here is backend-agnostic: it runs over a small [`Storage`] trait so
 //! it can be exhaustively tested with [`MemStorage`] in-memory, while the real
-//! device backend (CM5 eMMC/NVMe via `rfc_storage_io`, or a host filesystem)
+//! device backend (Pi 5 eMMC/NVMe via `rfc_storage_io`, or a host filesystem)
 //! implements the same trait. Power-loss safety is the central property: a crash
 //! at any write/commit boundary recovers either the previous committed
 //! generation or the new one, never a mixture (§12.4).
@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// On-storage wire records (pointer records, generation headers) —
 /// path-mounted from `modules/sdk/genstore_wire.rs` so the host store and
-/// the device-side CM5 backend share one codec by construction (the same
+/// the device-side Pi 5 backend share one codec by construction (the same
 /// lockstep discipline as `wire.rs` / the plan codec pair).
 #[path = "../../modules/sdk/genstore_wire.rs"]
 pub mod genstore_wire;
@@ -70,7 +70,7 @@ impl Storage for MemStorage {
 }
 
 /// Directory-backed store: one file per key, durable across process restarts.
-/// This is the Linux host / node-agent backend; the CM5 eMMC/NVMe backend
+/// This is the Linux host / node-agent backend; the Pi 5 eMMC/NVMe backend
 /// implements the same trait over `rfc_storage_io` primitives.
 ///
 /// Writes go through temp-file + rename so a crash mid-write can never leave a

@@ -63,7 +63,7 @@ logic — lives in modules.
 |        gpio  •  spi  •  i2c  •  pio  •  uart  •  timer  •  dma     |
 +--------------------------------------------------------------------+
 |                            Silicon                                 |
-|             RP2040  •  RP2350  •  BCM2712  •  CM5                  |
+|             RP2040  •  RP2350  •  BCM2712  •  Pi 5                  |
 +--------------------------------------------------------------------+
 ```
 
@@ -81,11 +81,11 @@ Each silicon target has its own HAL implementation under `src/platform/`:
 | RP2040 | `src/platform/rp.rs` | Embassy async (Cortex-M0+) |
 | RP2350 | `src/platform/rp.rs` | Embassy async (Cortex-M33) |
 | BCM2712 | `src/platform/bcm2712.rs` | Synchronous polling (Cortex-A76, EL1) |
-| CM5 | `src/platform/bcm2712.rs` (board overlay) | Synchronous polling |
+| Pi 5 | `src/platform/bcm2712.rs` (board overlay) | Synchronous polling |
 
 The two RP families share `rp.rs` because both run Embassy on a Cortex-M
 core with the same peripheral families. The aarch64 targets share
-`bcm2712.rs` because both run on the same SoC; CM5 is a board overlay
+`bcm2712.rs` because both run on the same SoC; pi5 is a board overlay
 on top of the same chip support.
 
 The kernel itself is mostly cfg-free. Per-silicon constants are generated
@@ -158,7 +158,7 @@ two distinct services:
 PIO programs are compiled into the module that uses them — the HAL just
 loads bytes into the instruction memory and starts the state machine.
 
-On targets without PIO (BCM2712, CM5), modules that depend on PIO are
+On targets without PIO (BCM2712, Pi 5), modules that depend on PIO are
 declared incompatible at config-validation time and the build fails with
 a clear diagnostic.
 
@@ -193,7 +193,7 @@ stays silicon-oblivious:
   against stored hash. Every silicon ships a real comparison; the
   loader relies on it for module admission.
 - `otp_read_signing_key(&mut [u8; 32]) -> bool` — returns the device
-  root-of-trust Ed25519 pubkey. CM5 reads it from a build-time
+  root-of-trust Ed25519 pubkey. Pi 5 reads it from a build-time
   environment variable (`FLUXOR_SIGNING_PUBKEY_HEX`) baked into the
   image; silicon with a real OTP bank reads from fuses. False means
   "no key provisioned" — the `enforce_signatures` feature then blocks

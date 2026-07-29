@@ -17,7 +17,7 @@
 #
 # Sibling variants (same interaction, real audio files):
 #   examples/audio_player/pico2w.yaml         — SD card
-#   examples/audio_player/cm5-split.yaml      — pi5 decodes, browser plays
+#   examples/audio_player/pi5-split.yaml      — pi5 decodes, browser plays
 #   examples/audio_player/wasm.yaml           — full browser
 target: pico2w
 

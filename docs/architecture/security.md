@@ -50,7 +50,7 @@ The loader path, implemented in `src/kernel/loader.rs::validate_module`:
 4. If the `enforce_signatures` cargo feature is set and the module is
    unsigned or the device has no provisioned pubkey, reject.
 
-The pubkey provisioning path is deliberately HAL-level. On CM5 today it
+The pubkey provisioning path is deliberately HAL-level. On Pi 5 today it
 comes from the `FLUXOR_SIGNING_PUBKEY_HEX` build-time environment
 variable (baked into the kernel image); future boards are expected to
 read it from an on-silicon OTP bank, and the HAL keeps the loader
@@ -66,7 +66,7 @@ about explicitly:
 | Profile | Source | Integrity check | Signature check | Used by |
 |---|---|---|---|---|
 | **Trusted built-in** | Compiled-in `BuiltInModule` (e.g. `linux_net`, `wasm_browser_canvas`) | n/a — code is in the kernel image | n/a | Linux/WASM host built-ins; bypass the loader entirely |
-| **Signed flash image** | RP / CM5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | If signature present, Ed25519 verify; if absent and `enforce_signatures` set, reject | Production RP2350 + CM5 firmware images |
+| **Signed flash image** | RP / Pi 5 flash, packed `.fmod` table | `hal::verify_integrity` runs SHA-256 over code+data; mismatch → `IntegrityMismatch` | If signature present, Ed25519 verify; if absent and `enforce_signatures` set, reject | Production RP2350 + Pi 5 firmware images |
 | **Embedded blob** | WASM `EMBEDDED_MODULES_BLOB`, Linux `mmap`'d `.fmod` file | `hal::verify_integrity` byte-compares SHA-256 on every platform (Linux/WASM/BCM/RP all match) | Same as flash image when present | Linux dev runs, WASM bundles |
 | **Network / staged** | TFTP / OTA delivered image into a staging area then promoted | Same as flash image once promoted | Same | Future scope; see `reconfigure.md` and `network_boot.md` for the staged-image model |
 
@@ -165,7 +165,7 @@ traffic) passes through unchanged. The table evicts the least-recently-
 touched entry on a full insert — so a flood from one source cannot
 starve unrelated peers.
 
-The `stacks/net.toml` entry for the CM5 ethernet variant injects
+The `stacks/net.toml` entry for the Pi 5 ethernet variant injects
 `conn_guard` between `rp1_gem` and `ip` automatically — HTTP/HTTPS YAML
 configs pick it up without any per-config wiring.
 
@@ -239,7 +239,7 @@ modules:
 one of two lanes (preserving connection affinity) and broadcasts
 control-plane traffic (ARP, DHCP) to both. Each TLS instance loads its
 own copy of the identity key material — key material is not shared
-across lanes. See `examples/test_harness/cm5/https_multilane.yaml` for a complete
+across lanes. See `examples/test_harness/pi5/https_multilane.yaml` for a complete
 config.
 
 ## Platform HAL Hooks

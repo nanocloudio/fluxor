@@ -543,9 +543,10 @@ pub fn lock_store_resolver(
 /// target-independent, but pin *selection* is not: the same name can be
 /// pinned at different digests for two targets, and binding wiring to the
 /// wrong one validates a port surface the packaged `.fmod` doesn't have.
-///   1. a pin whose target resolves (via `target_to_silicon`) to the same
-///      silicon as `silicon` wins — so a `cm5` graph matches a `bcm2712`
-///      pin, which is the same artifact;
+///   1. a pin whose target equals `silicon` wins. Pins are tagged with
+///      the module-silicon id at publish time, so this is a plain string
+///      match (pre-consolidation locks carrying board-tagged pins re-pin
+///      on the next `fluxor sync`);
 ///   2. otherwise fall back to a name match, but only when it is
 ///      unambiguous — every pin for that name shares one digest;
 ///   3. several differing-digest pins with no silicon match is `Failed`:
@@ -580,7 +581,7 @@ pub fn lock_store_manifest_resolver(
     if pins.is_empty() {
         return None;
     }
-    let silicon = silicon.map(|s| crate::modules_build::target_to_silicon(s).to_string());
+    let silicon = silicon.map(|s| s.to_string());
     let store = match open_store(store_dir) {
         Ok(s) => s,
         Err(e) => {
@@ -600,11 +601,9 @@ pub fn lock_store_manifest_resolver(
         if named.is_empty() {
             return ManifestPin::NotPinned;
         }
-        let silicon_match = silicon.as_deref().and_then(|want| {
-            named
-                .iter()
-                .find(|p| crate::modules_build::target_to_silicon(&p.target) == want)
-        });
+        let silicon_match = silicon
+            .as_deref()
+            .and_then(|want| named.iter().find(|p| p.target == want));
         let pin = match silicon_match {
             Some(p) => *p,
             None => {
@@ -796,12 +795,13 @@ mod tests {
         }
         assert!(matches!(r("unpinned"), ManifestPin::NotPinned));
 
-        // A `cm5` graph and a `bcm2712` pin are the same silicon.
-        let r_cm5 = lock_store_manifest_resolver(&proj, Some("cm5"), Some(&store_dir))
+        // Callers pass the module-silicon id (a pi5 graph resolves to
+        // `bcm2712` before pin lookup), so the pin matches by string.
+        let r_bcm = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
             .expect("resolver present");
-        match r_cm5("redis_client") {
+        match r_bcm("redis_client") {
             ManifestPin::Resolved(text) => assert_eq!(text, toml),
-            other => panic!("cm5 must match the bcm2712 pin, got {other:?}"),
+            other => panic!("bcm2712 must match the bcm2712 pin, got {other:?}"),
         }
 
         // No silicon requested: the lone pin is unambiguous.
@@ -845,7 +845,7 @@ mod tests {
         .expect("upsert");
 
         let store_dir = tmp.path().join("store");
-        for (silicon, want) in [("rp2350", rp), ("bcm2712", bcm), ("cm5", bcm)] {
+        for (silicon, want) in [("rp2350", rp), ("bcm2712", bcm)] {
             let r = lock_store_manifest_resolver(&proj, Some(silicon), Some(&store_dir))
                 .expect("resolver present");
             match r("mqtt_client") {

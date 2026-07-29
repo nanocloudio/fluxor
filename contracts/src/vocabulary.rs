@@ -51,7 +51,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // MIDI surface — paired with the `input::midi` contract and the
     // `MidiEvents` content type. Declared by the per-platform MIDI drivers
     // (Web MIDI on wasm, ALSA seq on linux, class-compliant USB-MIDI on
-    // rp2350 / cm5).
+    // rp2350 / bcm2712).
     "midi.input",
     "midi.output",
     // Transport surfaces + continuity roles (protocol_surfaces.md,

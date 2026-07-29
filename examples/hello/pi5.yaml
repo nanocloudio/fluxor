@@ -1,14 +1,14 @@
-# Hello UART (Pi 5 / CM5 bare-metal)
+# Hello UART (Pi 5 bare-metal)
 #
 # Minimal config for bare-metal Pi 5 boot validation. Kernel log output
 # reaches the RP1 PL011 on GPIO14/15 via the platform-runtime debug
 # drain — no overlay module required.
 #
 # Build + deploy over TFTP:
-#   fluxor rig test --scenario tests/hardware/cm5_boot_banner.toml
+#   fluxor rig test --scenario tests/hardware/pi5_boot_banner.toml
 # Console:
 #   tio /dev/ttyUSB0 -b 115200
-target: cm5
+target: pi5
 tick_us: 1000
 modules: []
 wiring: []

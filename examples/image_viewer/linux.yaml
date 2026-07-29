@@ -1,6 +1,6 @@
 # Image Viewer — linux producer half of the split scenario.
 #
-# Linux-native counterpart to `cm5.yaml`. The
+# Linux-native counterpart to `pi5.yaml`. The
 # producer pipeline (bank → codec → ws → http) is identical in
 # shape; the WebSocket bridges between the linux kernel and the
 # browser. The pure-wasm form (`wasm.yaml`) is the
@@ -21,15 +21,15 @@
 #
 # Uses the unified PIC `codec` module everywhere — the linux
 # kernel cross-loads the bcm2712-aarch64 .fmod via its PIC loader,
-# so the same code path that runs on cm5 silicon runs here.
+# so the same code path that runs on the pi5 board (bcm2712 silicon) runs here.
 
 target: linux
 tick_us: 100
 
 # Inline scenario — `fluxor run examples/image_viewer/linux.yaml`
 # orchestrates this graph plus the thin wasm viewer at `/viewer/`.
-# Same shape as the cm5 split, just with the linux host_image_codec
-# instead of the cm5 PIC image codec.
+# Same shape as the pi5 split, just with the linux host_image_codec
+# instead of the pi5 PIC image codec.
 scenario:
   name: image_viewer_linux
   companions:
@@ -61,7 +61,7 @@ modules:
 
   # Unified PIC codec — auto-detects BMP/GIF/PNG/JPEG. Linux loads
   # the aarch64 .fmod from target/bcm2712/modules/ via the PIC
-  # loader. Same module the cm5 / wasm producers use.
+  # loader. Same module the pi5 / wasm producers use.
   - name: codec
     width: 960
     height: 540

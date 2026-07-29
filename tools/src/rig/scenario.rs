@@ -152,10 +152,10 @@ fn parse_rules(rules: &[RuleToml], ctx: &str, kind: &str) -> Result<Vec<Observat
 mod tests {
     use super::*;
 
-    const CM5_BANNER: &str = r#"
-        name = "cm5_boot_banner"
-        target = "cm5"
-        config = "../../examples/hello/cm5.yaml"
+    const PI5_BANNER: &str = r#"
+        name = "pi5_boot_banner"
+        target = "pi5"
+        config = "../../examples/hello/pi5.yaml"
         requires_tags = ["nvme"]
         requires = ["deploy.netboot_tftp", "power.cycle", "observe.console_regex"]
         timeout_s = 30
@@ -172,12 +172,12 @@ mod tests {
     #[test]
     fn parses_example() {
         let dir = PathBuf::from("/repo/tests/hardware");
-        let s = parse_scenario_str(CM5_BANNER, &dir, "cm5_boot_banner.toml").unwrap();
-        assert_eq!(s.name, "cm5_boot_banner");
-        assert_eq!(s.target, "cm5");
+        let s = parse_scenario_str(PI5_BANNER, &dir, "pi5_boot_banner.toml").unwrap();
+        assert_eq!(s.name, "pi5_boot_banner");
+        assert_eq!(s.target, "pi5");
         assert_eq!(
             s.config,
-            PathBuf::from("/repo/tests/hardware/../../examples/hello/cm5.yaml")
+            PathBuf::from("/repo/tests/hardware/../../examples/hello/pi5.yaml")
         );
         assert_eq!(s.requires.len(), 3);
         assert_eq!(s.requires_tags, vec!["nvme"]);
@@ -190,7 +190,7 @@ mod tests {
     fn absolute_config_path_is_preserved() {
         let src = r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "/absolute/path/to/example.yaml"
         "#;
         let s = parse_scenario_str(src, Path::new("/repo"), "x.toml").unwrap();
@@ -201,7 +201,7 @@ mod tests {
     fn rejects_power_as_rule_source() {
         let src = r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "x.yaml"
             [[pass]]
             source = "power.cycle"
@@ -216,7 +216,7 @@ mod tests {
     fn rejects_unknown_capability() {
         let src = r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "x.yaml"
             requires = ["deploy.usb_rocket_launcher"]
         "#;
@@ -227,7 +227,7 @@ mod tests {
     fn empty_requires_tags_is_any_rig() {
         let src = r#"
             name = "x"
-            target = "cm5"
+            target = "pi5"
             config = "x.yaml"
             requires_tags = []
         "#;

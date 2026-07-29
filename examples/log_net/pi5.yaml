@@ -1,4 +1,4 @@
-# Netconsole-style log forwarding (Pi 5 / CM5 bare-metal).
+# Netconsole-style log forwarding (Pi 5 bare-metal).
 #
 # Enables the `debug` stack with `to: net`: the kernel log ring is drained
 # each tick and forwarded as UDP datagrams through the ethernet+ip path.
@@ -9,8 +9,8 @@
 # each other's modules.
 #
 # Build:
-#   make firmware TARGET=cm5 && fluxor modules build --target bcm2712
-#   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/log_net/cm5.yaml
+#   make firmware TARGET=pi5 && fluxor modules build --target bcm2712
+#   fluxor combine -o kernel8.img target/pi5/firmware.bin examples/log_net/pi5.yaml
 #
 # Host capture (same L2 segment):
 #   python3 - <<'PY'
@@ -24,9 +24,9 @@
 # The monitor PIC module periodically emits `MON_HIST` lines via
 # log::info! which flow through the log ring into the netconsole
 # stream; `fluxor monitor --net :6666` renders them as a live
-# dashboard. (Absorbs the former `log_net_monitor/cm5.yaml` demo.)
+# dashboard. (Absorbs the former `log_net_monitor/pi5.yaml` demo.)
 
-target: cm5
+target: pi5
 tick_us: 100
 
 platform:

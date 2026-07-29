@@ -20,8 +20,8 @@ track, long-press loops the bank.
 
 - `linux.yaml` — linux producer streaming to a browser player (split)
 - `wasm.yaml` — pure-wasm; entire kernel runs in the browser
-- `wasm-thin.yaml` — thin browser half of the linux / cm5 split
-- `cm5-split.yaml` — Pi 5 producer + browser player
+- `wasm-thin.yaml` — thin browser half of the linux / pi5 split
+- `pi5-split.yaml` — Pi 5 producer + browser player
 - `pico2w.yaml` — bare-metal pico2w with SD-FAT32 bank → I²S DAC
 - `pico2w-inline.yaml` — pico2w with audio baked into the bundle
 - `picow.yaml` — same shape on Pi Pico W

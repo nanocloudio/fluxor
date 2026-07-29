@@ -328,7 +328,7 @@ fn cmd_power(args: PowerArgs) -> Result<()> {
     let backend = resolve_backend(Surface::Power, backend_name)?;
 
     // The public board contract enumerates which power verbs a target
-    // supports (e.g. CM5 declares only power.cycle). `rig power` must
+    // supports (e.g. pi5 declares only power.cycle). `rig power` must
     // honour that contract — invoking `on` / `off` on a board that only
     // declares `cycle` would silently bypass the public surface.
     //
@@ -528,7 +528,7 @@ mod tests {
     use super::validate_power_verb_on_board;
     use crate::rig::parse_board_rig_str;
 
-    const CM5_RIG: &str = r#"
+    const PI5_RIG: &str = r#"
         [rig]
         artifact = "kernel8_img"
         deploy = ["deploy.netboot_tftp"]
@@ -552,21 +552,21 @@ mod tests {
 
     #[test]
     fn rig_power_accepts_verb_declared_by_board() {
-        let board = load(CM5_RIG);
-        assert!(validate_power_verb_on_board(&board, "cycle", "cm5").is_ok());
+        let board = load(PI5_RIG);
+        assert!(validate_power_verb_on_board(&board, "cycle", "pi5").is_ok());
     }
 
     #[test]
     fn rig_power_rejects_verb_not_in_board_rig_power_list() {
-        let board = load(CM5_RIG);
+        let board = load(PI5_RIG);
 
-        let err_on = validate_power_verb_on_board(&board, "on", "cm5").unwrap_err();
+        let err_on = validate_power_verb_on_board(&board, "on", "pi5").unwrap_err();
         let msg = format!("{err_on}");
         assert!(msg.contains("power.on"), "{msg}");
         assert!(msg.contains("power.cycle"), "{msg}");
-        assert!(msg.contains("cm5"), "{msg}");
+        assert!(msg.contains("pi5"), "{msg}");
 
-        let err_off = validate_power_verb_on_board(&board, "off", "cm5").unwrap_err();
+        let err_off = validate_power_verb_on_board(&board, "off", "pi5").unwrap_err();
         assert!(format!("{err_off}").contains("power.off"));
     }
 

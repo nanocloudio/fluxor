@@ -2,7 +2,7 @@ version = "1.0.0"
 # Cross-platform — pure logic; consumes raw button transitions
 # (modules/sdk/contracts/input/button.rs) and emits FMP. Producers
 # differ per target: `button` on rp (GPIO + BOOTSEL); `pointer_to_button`
-# anywhere a `pointer` capability is available (wasm, future linux/cm5).
+# anywhere a `pointer` capability is available (wasm, future linux/pi5).
 hardware_targets = ["rp2350", "bcm2712", "wasm", "linux"]
 
 [[ports]]

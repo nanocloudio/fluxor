@@ -1,4 +1,4 @@
-//! PL011 UART driver for BCM2712 (Pi 5 / CM5) and QEMU virt.
+//! PL011 UART driver for BCM2712 (Pi 5) and QEMU virt.
 //!
 //! Two write paths, both writing to the same MMIO:
 //!   * **Normal**: `uart_putc` / `uart_puts` push bytes into the kernel
@@ -9,7 +9,7 @@
 //!     scheduler still being alive. Gated on [`UART_READY`] so panics
 //!     before `uart_init` don't poke an unmapped peripheral.
 //!
-//! Register layout (PL011, board-cm5 only; QEMU's PL011 ignores FR for
+//! Register layout (PL011, board-pi5 only; QEMU's PL011 ignores FR for
 //! TX-readiness so the `#[cfg]` branches collapse to "always-write"):
 //!   * `+0x00 DR`    — data register (TX/RX FIFO)
 //!   * `+0x18 FR`    — flags (TXFF bit 5 = TX FIFO full)
@@ -28,17 +28,17 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // UART (PL011)
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub const UART_BASE: usize = 0x0900_0000; // QEMU virt PL011
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const UART_BASE: usize = 0x1c_0003_0000; // Pi 5 RP1 UART0 on GPIO14/15
                                              // RP1 is mapped at 0x1c_0000_0000 by VPU firmware (PCIe outbound window).
                                              // Requires enable_uart=1, enable_rp1_uart=1, and pciex4_reset=0 in config.txt.
 
 pub const UART_DR: *mut u32 = UART_BASE as *mut u32;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const UART_FR: *const u32 = (UART_BASE + 0x18) as *const u32;
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub const UART_FR_TXFF: u32 = 1 << 5;
 
 /// Set to 1 after `uart_init` completes — exception_dump / panic_handler
@@ -56,7 +56,7 @@ pub static UART_READY: AtomicU32 = AtomicU32::new(0);
 ///   +0x28 FBRD = 0x08  (8)
 ///   +0x2c LCRH = 0x70           -> 8N1, FIFO enabled
 ///   +0x30 CR   = 0x301          -> UARTEN | TXE | RXE (no hardware flow control)
-#[cfg(feature = "board-cm5")]
+#[cfg(feature = "board-pi5")]
 pub unsafe fn uart_init() {
     // VPU firmware (with enable_rp1_uart=1) fully configures PL011 at
     // 115200 8N1 before kernel handoff. We just reprogram to be sure.
@@ -84,7 +84,7 @@ pub unsafe fn uart_init() {
     core::ptr::write_volatile(cr, 0x301);
 }
 
-#[cfg(not(feature = "board-cm5"))]
+#[cfg(not(feature = "board-pi5"))]
 pub unsafe fn uart_init() {
     // QEMU virt: UART is already configured, nothing to do
 }
@@ -110,7 +110,7 @@ pub fn uart_raw_putc(c: u8) {
     // boot_mmu::init_page_tables; this is the panic-path synchronous
     // writer with no concurrent access (other cores are halted).
     unsafe {
-        #[cfg(feature = "board-cm5")]
+        #[cfg(feature = "board-pi5")]
         {
             while core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {}
         }
@@ -130,7 +130,7 @@ pub fn uart_raw_puts(s: &[u8]) {
 /// will accept right now, then returns the count. Used as the
 /// `DebugTx` backend for the platform debug drain — the drain owns
 /// retry/backpressure state so we never spin here. On QEMU virt
-/// (non-board-cm5) the FR bit isn't meaningful; fall back to writing
+/// (non-board-pi5) the FR bit isn't meaningful; fall back to writing
 /// all bytes.
 pub fn uart_nonblocking_write(bytes: &[u8]) -> usize {
     if UART_READY.load(Ordering::Relaxed) == 0 {
@@ -138,7 +138,7 @@ pub fn uart_nonblocking_write(bytes: &[u8]) -> usize {
     }
     let mut i = 0;
     while i < bytes.len() {
-        #[cfg(feature = "board-cm5")]
+        #[cfg(feature = "board-pi5")]
         // SAFETY: UART_FR is a fixed MMIO register; read is side-effect free.
         unsafe {
             if core::ptr::read_volatile(UART_FR) & UART_FR_TXFF != 0 {

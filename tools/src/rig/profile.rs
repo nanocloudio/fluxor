@@ -365,7 +365,7 @@ mod tests {
     const PROFILE: &str = r#"
         [rig]
         id = "pi5-a"
-        board = "cm5"
+        board = "pi5"
         tags = ["nvme", "bench-a"]
 
         [power]
@@ -393,7 +393,7 @@ mod tests {
     fn parses_example_profile() {
         let p = parse_profile_str(PROFILE, Path::new("/tmp/pi5-a.toml")).unwrap();
         assert_eq!(p.rig.id, "pi5-a");
-        assert_eq!(p.rig.board, "cm5");
+        assert_eq!(p.rig.board, "pi5");
         assert_eq!(p.rig.tags, vec!["nvme", "bench-a"]);
 
         let power = p.power.as_ref().unwrap();
@@ -419,7 +419,7 @@ mod tests {
         let src = r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [deploy.rocket_launcher]
             foo = "bar"
@@ -434,7 +434,7 @@ mod tests {
         let src = r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             backend = "kasa_local"
@@ -459,7 +459,7 @@ mod tests {
         let src = r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [secrets]
             v = "${env:FLUXOR_PROFILE_MISSING}"
@@ -472,7 +472,7 @@ mod tests {
         let src = r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             weight = 1.5
@@ -492,7 +492,7 @@ mod tests {
             r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             weight = nan
@@ -500,7 +500,7 @@ mod tests {
             r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             weight = inf
@@ -508,7 +508,7 @@ mod tests {
             r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             weight = -inf
@@ -529,7 +529,7 @@ mod tests {
             r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [power]
             list = [1, 2, 3]
@@ -537,7 +537,7 @@ mod tests {
             r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [power.nested]
             x = "y"

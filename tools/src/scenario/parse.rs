@@ -65,12 +65,12 @@ pub fn is_scenario_file(path: &Path) -> bool {
 // A graph YAML can carry an optional top-level `scenario:` block that
 // names the graph's deployment shape:
 //
-//   target: cm5
+//   target: pi5
 //   modules: [...]
 //   wiring:  [...]
 //
 //   scenario:
-//     name: image_viewer_cm5
+//     name: image_viewer_pi5
 //     companions:
 //       viewer: ../wasm/image_viewer_thin.yaml
 //     bindings:

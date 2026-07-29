@@ -112,7 +112,7 @@ pub struct RemoveArgs {
     /// 0 = revoke immediately.
     #[arg(long, default_value_t = 0)]
     pub grace: u16,
-    /// Target capacity profile (linux | cm5 | bcm2712) — sets the kernel
+    /// Target capacity profile (linux | pi5 | bcm2712) — sets the kernel
     /// limits admission checks against.
     #[arg(long, default_value = "linux")]
     pub profile: String,
@@ -150,7 +150,7 @@ pub struct CommitArgs {
     /// `resources.json` — overriding the explicit profile flags above.
     #[arg(long)]
     pub bundle: Option<PathBuf>,
-    /// Target capacity profile (linux | cm5 | bcm2712) — sets the kernel
+    /// Target capacity profile (linux | pi5 | bcm2712) — sets the kernel
     /// limits admission checks against.
     #[arg(long, default_value = "linux")]
     pub profile: String,
@@ -277,7 +277,7 @@ fn parse_pod_uid(hex: &str) -> Result<[u8; 16]> {
 fn capacity(profile: &str) -> Result<NodeCapacity> {
     capacity_for_profile(profile).ok_or_else(|| {
         Error::Config(format!(
-            "unknown capacity profile '{profile}' (known: linux, cm5, bcm2712)"
+            "unknown capacity profile '{profile}' (known: linux, pi5, bcm2712)"
         ))
     })
 }

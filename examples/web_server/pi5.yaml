@@ -1,9 +1,9 @@
-# Web Server (Pi 5 / CM5 bare-metal) — canonical HTTPS demo.
+# Web Server (Pi 5 bare-metal) — canonical HTTPS demo.
 #
-# Same shape as `examples/web_server/linux.yaml` but for the cm5
+# Same shape as `examples/web_server/linux.yaml` but for the pi5
 # bare-metal target: TLS 1.3 over RP1 GEM ethernet with DHCP,
 # 100 µs tick for responsive descriptor polling. The fs_path /
-# WebSocket routes are linux-only (bare-metal cm5 has no host
+# WebSocket routes are linux-only (bare-metal pi5 has no host
 # filesystem); the static `/` route and h2 ALPN both work
 # identically on both targets.
 #
@@ -15,14 +15,14 @@
 #   openssl ec  -in /tmp/server_key.pem  -outform DER -out /tmp/server_key.der
 #
 # Build:
-#   make firmware TARGET=cm5 && fluxor modules build --target bcm2712
-#   fluxor combine -o kernel8.img target/cm5/firmware.bin examples/web_server/cm5.yaml
+#   make firmware TARGET=pi5 && fluxor modules build --target bcm2712
+#   fluxor combine -o kernel8.img target/pi5/firmware.bin examples/web_server/pi5.yaml
 #
 # Probe:
 #   curl -vsk https://<DUT_IP>:443/
 #   curl -vk  --http2 https://<DUT_IP>:443/
 
-target: cm5
+target: pi5
 tick_us: 100
 
 platform:

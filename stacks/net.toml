@@ -43,7 +43,7 @@ wiring = [
 ]
 
 [[variant]]
-match = { board = "cm5", phy = "ethernet", driver = "rp1_gem" }
+match = { board = "pi5", phy = "ethernet", driver = "rp1_gem" }
 modules = [
   { name = "rp1_gem" },
   { name = "conn_guard" },

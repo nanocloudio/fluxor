@@ -18,8 +18,8 @@ codec auto-detects all four image formats from the byte stream.
 
 - `linux.yaml` — linux producer streaming to a browser viewer (split)
 - `wasm.yaml` — pure-wasm; entire kernel runs in the browser tab
-- `wasm-thin.yaml` — thin browser side of the linux/cm5 split
-- `cm5.yaml` — Pi 5 producer + browser viewer
+- `wasm-thin.yaml` — thin browser side of the linux/pi5 split
+- `pi5.yaml` — Pi 5 producer + browser viewer
 - `waveshare-lcd4.yaml` — pico2w + Waveshare 4" LCD (single board)
 - `waveshare-lcd4-inline.yaml` — inline-bytes variant (test fixture
   with bytes baked into the YAML)

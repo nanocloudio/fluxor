@@ -636,7 +636,7 @@ pub fn render_synthesised_host(
 /// §14 "Error UX").
 ///
 /// Host-FS gate: if the target component's effective target is not
-/// linux (i.e. cm5 silicon without `runtime_override: linux`), the
+/// linux (i.e. a pi5 graph without `runtime_override: linux`), the
 /// merger refuses to inject `fs_path:`/`fs_list:` routes (RFC §7,
 /// §16 Q9).
 pub fn merge_bindings_for_component(
@@ -686,7 +686,7 @@ pub fn merge_bindings_for_component(
     if let Some(target) = &effective_target {
         config["target"] = serde_json::Value::String(target.clone());
 
-        // When a cm5/pico/rp graph is run through `runtime_override:
+        // When a pi5/pico/rp graph is run through `runtime_override:
         // linux` the stack expander swaps the silicon-side network
         // modules (`rp1_gem`, `ip`, `wifi`, `cyw43`) for `linux_net`,
         // but it doesn't touch the user's hand-written wiring. A
@@ -701,14 +701,14 @@ pub fn merge_bindings_for_component(
         // in both endpoints of every wiring edge. We do this once,
         // immediately after the target flip so the rest of the
         // pipeline sees a self-consistent config.
-        if target == "linux" || target == "qemu" {
+        if target == "linux" || target == "qemu-virt" {
             rewrite_wiring_module(&mut config, "ip", "linux_net");
         }
     }
 
     // Host-FS gate: per RFC §7, binding-injected fs_path routes work
     // only when the effective target has a host filesystem accessible
-    // to the kernel.  Linux + qemu (with -hda or virtfs) qualify; cm5
+    // to the kernel.  Linux + qemu-virt (with -hda or virtfs) qualify; pi5
     // silicon without override does not.
     let target_str = config
         .get("target")
@@ -723,7 +723,7 @@ pub fn merge_bindings_for_component(
         return Err(Error::Config(format!(
             "scenario {}: binding(s) target `{}.<http>` but `{}`'s effective target is `{}`, \
              which has no shared host filesystem reachable from a static fs_path: route. \
-             Either add `runtime_override: linux` (or qemu) to the component, or stage the \
+             Either add `runtime_override: linux` (or qemu-virt) to the component, or stage the \
              asset onto the silicon's actual filesystem and write the route explicitly in \
              {}. See RFC §16 Q9.",
             scenario_path.display(),
@@ -832,7 +832,7 @@ fn rewrite_wiring_module(config: &mut serde_json::Value, old_name: &str, new_nam
 }
 
 fn target_supports_host_fs(target: &str) -> bool {
-    matches!(target, "linux" | "qemu" | "qemu-virt")
+    matches!(target, "linux" | "qemu-virt")
 }
 
 /// Per-target ceiling on a route's `fs_path:` byte length.  Must
@@ -1214,7 +1214,7 @@ pub fn is_single_component(scenario: &Scenario) -> bool {
 /// Effective target for a component: the `runtime_override:` (if set)
 /// wins, otherwise the graph's declared `target:`. Used by PR 4 to
 /// classify components as wasm (passive, build-bundle-only) vs.
-/// linux/qemu/cm5 (active, spawn-a-kernel).
+/// linux/qemu-virt/pi5 (active, spawn-a-kernel).
 pub fn effective_target(scenario_path: &Path, comp: &ComponentSpec) -> String {
     if let Some(ovr) = &comp.runtime_override {
         return ovr.clone();
@@ -1293,24 +1293,17 @@ pub fn write_merged_component_yaml(
 /// Per-effective-target aliases — which manifest `hardware_targets:`
 /// strings the runtime accepts.
 ///
-/// linux fluxor-linux reuses bcm2712 PIC modules (it loads aarch64
-/// .fmod blobs built for the bcm2712 silicon), so a module declaring
-/// `hardware_targets = ["bcm2712"]` is legal under
-/// `runtime_override: linux`. Same idea for qemu-virt (bcm2712
-/// firmware ELF run under qemu).
-fn target_aliases(target: &str) -> &'static [&'static str] {
-    match target {
-        "linux" => &["linux", "bcm2712"],
-        "cm5" => &["cm5", "bcm2712"],
-        "qemu" | "qemu-virt" => &["qemu", "qemu-virt", "bcm2712"],
-        "bcm2712" => &["bcm2712"],
-        "rp2350" => &["rp2350", "rp2350b"],
-        "rp2350a" => &["rp2350a"],
-        "rp2040" => &["rp2040"],
-        "pico2w" => &["pico2w", "rp2350", "rp2350b"],
-        "picow" => &["picow", "rp2040"],
-        "wasm" => &["wasm"],
-        _ => &[],
+/// Delegates to the `targets/` registry: a module is placeable when its
+/// `hardware_targets` names the target's module silicon, or the host
+/// token itself for host targets (linux fluxor-linux reuses bcm2712 PIC
+/// modules, so `["bcm2712"]` is legal under `runtime_override: linux`).
+/// Boards never appear in `hardware_targets` — a board id there is the
+/// level error this validator exists to catch
+/// (standards/target_consolidation.md §2 rule 1).
+fn target_aliases(target: &str) -> Vec<String> {
+    match crate::target::load_target(target, &crate::project::root()) {
+        Ok(desc) => desc.accepted_hardware_targets(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -1326,7 +1319,7 @@ const STANDARD_MANIFEST_DIRS: &[&str] = &[
     "modules/builtin/linux",
     "modules/builtin/host",
     "modules/builtin/wasm",
-    "modules/builtin/qemu",
+    "modules/builtin/qemu-virt",
     "modules",
 ];
 

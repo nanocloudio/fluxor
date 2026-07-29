@@ -8,4 +8,4 @@ hardware_targets = ["bcm2712"]
 # Exercises a rejected invalid free (a non-heap pointer) to prove the gateway
 # fails closed. REQUIRES `protection: isolated` (run non-isolated, its
 # `svc #1` has no EL1 handler). Diagnostic/demonstration — not loaded by
-# production configs. See docs/architecture/cm5_el0_isolation.md.
+# production configs. See .context/pi5_el0_isolation.md.

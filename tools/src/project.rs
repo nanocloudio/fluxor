@@ -164,7 +164,7 @@ fn has_install_markers(path: &Path) -> bool {
 }
 
 /// Resolve a resource (e.g. `stacks/audio.toml`,
-/// `targets/boards/cm5.toml`) against the project root first, then
+/// `targets/boards/pi5.toml`) against the project root first, then
 /// the install root. Returns the first existing match. Callers that
 /// just need "where does this resource live?" without re-doing the
 /// project/install discovery should use this helper instead of

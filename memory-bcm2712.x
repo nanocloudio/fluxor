@@ -2,7 +2,7 @@
  *
  * RAM origin is board-dependent:
  *   QEMU virt: 0x4008_0000 (default -kernel load address)
- *   Pi 5 / CM5: 0x8_0000 (GPU firmware loads kernel8.img here)
+ *   Pi 5: 0x8_0000 (GPU firmware loads kernel8.img here)
  *
  * Origin is set by build.rs via: -DRAM_ORIGIN=0x... (cargo:rustc-link-arg)
  * Default: QEMU virt address if not overridden.
@@ -16,7 +16,7 @@ EXTERN(_start)
  * the fixed tables/pools. 192M leaves headroom and both backings cover it:
  * QEMU virt runs with -m 256M (origin 0x4008_0000 → region ends 0x4C08_0000,
  * ~63M left for the relocated package payload above __end_block_addr) and
- * Pi 5 / CM5 has 8 GiB. */
+ * Pi 5 has 8 GiB. */
 MEMORY {
     RAM : ORIGIN = RAM_ORIGIN, LENGTH = 192M
 }

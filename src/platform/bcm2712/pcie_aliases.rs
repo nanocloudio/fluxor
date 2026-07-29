@@ -1,4 +1,4 @@
-//! Board-local PCIe device aliases for BCM2712 (CM5 / Pi 5).
+//! Board-local PCIe device aliases for BCM2712 (Pi 5).
 //!
 //! The alias table is the seam between board topology and a stable,
 //! user-facing name. Drivers and user YAML configs reference these

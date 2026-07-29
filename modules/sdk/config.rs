@@ -71,7 +71,7 @@ mod profile_host {
         /// the arena under sustained gigabit-class loads.
         pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
         // Multi-Pod: 128 lets the system substrate plus several Pod subgraphs
-        // co-reside on aarch64 (CM5 / host-linux). 128 keeps every module index
+        // co-reside on aarch64 (bcm2712 / linux). 128 keeps every module index
         // within the scheduler's u8 index domain (`exec_order: [u8; _]`,
         // `module_idx as u8`); going past 256 requires widening those ids to
         // u16. The `ModuleMask` bitmaps scale to match (MODULE_MASK_WORDS == 2
@@ -167,7 +167,7 @@ mod profile_host {
         pub const MAX_VARS: usize = 16;
         pub const MAX_VAR_VALUE: usize = 16;
         pub const MAX_CACHE: usize = 4;
-        // Host profile (aarch64: linux orchestrator, Pi 5 / cm5) serves
+        // Host profile (aarch64: linux orchestrator, pi5) serves
         // synthesised wasm-scenario hosts that inline the canonical browser
         // shell as `body:` routes — runtime.html (~83 KiB after scenario
         // substitution) + host_shims.js (~56 KiB) + scenario.json. 256 KiB

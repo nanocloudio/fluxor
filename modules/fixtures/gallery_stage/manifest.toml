@@ -3,7 +3,7 @@ hardware_targets = ["bcm2712"]
 
 # Portless staging fixture: writes the embedded gallery assets onto the
 # FAT32 root via the FS contract (OPEN_CREATE/WRITE/FSYNC/CLOSE), then
-# idles. Used by tests/hardware/cm5_stage_gallery.toml to provision the
+# idles. Used by tests/hardware/pi5_stage_gallery.toml to provision the
 # image_viewer rig test's gallery.
 
 [[resources]]

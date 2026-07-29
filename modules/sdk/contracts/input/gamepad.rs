@@ -5,7 +5,7 @@
 // Wire shape modelled on the W3C Gamepad API: up to 16 digital
 // buttons + up to 4 analog axes per device, plus connection
 // metadata. Producers include hardware USB-HID gamepads (pico2w,
-// cm5), Linux libinput / evdev, the browser's Gamepad API
+// pi5), Linux libinput / evdev, the browser's Gamepad API
 // (wasm_browser_gamepad), and pointer-mapped overlay transformers
 // (wasm_browser_touch_gamepad_overlay).
 //

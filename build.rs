@@ -243,12 +243,12 @@ fn main() {
 }
 
 fn emit_bcm2712(out: &Path) {
-    // BCM2712 / CM5: single linker script with board-dependent RAM origin
-    // via --defsym. Capacity constants come from the centralised
-    // `abi::config::kernel::profile_host`; `targets/silicon/bcm2712.toml`
-    // carries non-capacity metadata only.
-    let is_cm5 = env::var("CARGO_FEATURE_BOARD_CM5").is_ok();
-    let ram_origin = if is_cm5 { "0x80000" } else { "0x40080000" };
+    // BCM2712: single linker script with board-dependent RAM origin —
+    // real Pi 5 (board-pi5) vs QEMU virt — via --defsym. Capacity constants
+    // come from the centralised `abi::config::kernel::profile_host`;
+    // `targets/silicon/bcm2712.toml` carries non-capacity metadata only.
+    let is_pi5 = env::var("CARGO_FEATURE_BOARD_PI5").is_ok();
+    let ram_origin = if is_pi5 { "0x80000" } else { "0x40080000" };
     File::create(out.join("memory-bcm2712.x"))
         .unwrap()
         .write_all(include_bytes!("memory-bcm2712.x"))
@@ -279,7 +279,7 @@ fn emit_rp(out: &Path, family: Rp) {
     let toml_path = if is_rp2040 {
         "targets/silicon/rp2040.toml"
     } else {
-        "targets/silicon/rp2350a.toml"
+        "targets/silicon/rp2350.toml"
     };
     let content =
         fs::read_to_string(toml_path).unwrap_or_else(|e| panic!("Failed to read {toml_path}: {e}"));
@@ -299,6 +299,5 @@ fn emit_rp(out: &Path, family: Rp) {
     println!("cargo:rerun-if-changed=memory-rp2350.x");
     println!("cargo:rerun-if-changed=memory-rp2040.x");
     println!("cargo:rerun-if-changed=targets/silicon/rp2040.toml");
-    println!("cargo:rerun-if-changed=targets/silicon/rp2350a.toml");
-    println!("cargo:rerun-if-changed=targets/silicon/rp2350b.toml");
+    println!("cargo:rerun-if-changed=targets/silicon/rp2350.toml");
 }

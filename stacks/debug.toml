@@ -3,12 +3,12 @@ name = "debug"
 
 # Opt-in log observability.
 #
-# The local-transport debug path (UART on cm5, USB CDC on rp) is owned by
+# The local-transport debug path (UART on pi5, USB CDC on rp) is owned by
 # the platform runtime: it drains `kernel::log_ring` into a board-provided
 # sink each tick, independent of any modules. No YAML opt-in is required
 # for local output.
 #
-#   cm5:  tio /dev/ttyUSB0         (115200 by default)
+#   pi5:  tio /dev/ttyUSB0         (115200 by default)
 #   rp:   cat /dev/ttyACM0
 #
 # This stack adds the *network* transport as a second consumer of the

@@ -303,8 +303,8 @@ mod tests {
         // hash must reflect the file's actual bytes.
         let body = r#"
 name = "totally-different-name"
-target = "cm5"
-config = "../../examples/cm5/hello_uart.yaml"
+target = "pi5"
+config = "../../examples/pi5/hello_uart.yaml"
 requires = ["deploy.netboot_tftp", "observe.netboot_fetch"]
 [[pass]]
 source = "observe.netboot_fetch"
@@ -378,7 +378,7 @@ regex = "kernel\\.img$"
         let src_one = r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [secrets]
             tok = "${env:FLUXOR_PROFILE_HASH_TEST}"
@@ -402,7 +402,7 @@ regex = "kernel\\.img$"
         let with = r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
 
             [secrets]
             tok = "${env:FLUXOR_PROFILE_HASH_T2}"
@@ -410,7 +410,7 @@ regex = "kernel\\.img$"
         let without = r#"
             [rig]
             id = "x"
-            board = "cm5"
+            board = "pi5"
         "#;
 
         let p1 = parse_profile_str(with, Path::new("/tmp/x.toml")).unwrap();

@@ -25,7 +25,7 @@ pub struct LockOwner {
     pub pid: u32,
     pub hostname: String,
     pub rig: String,
-    /// What the owner is running — e.g. `"scenario:cm5_boot_banner"` or
+    /// What the owner is running — e.g. `"scenario:pi5_boot_banner"` or
     /// `"command:power cycle"`. Free-form, just has to be useful in logs.
     pub task: String,
     /// Seconds since Unix epoch.

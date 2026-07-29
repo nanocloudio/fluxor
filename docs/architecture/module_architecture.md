@@ -349,7 +349,7 @@ Modules can be assigned a protection level at config time:
 - **Level 1 (Guarded)** — step guard timer detects timeouts. A module
   that overruns its step deadline is marked as faulted.
 - **Level 2 (Isolated)** — hardware memory protection (MPU on RP2350,
-  MMU on CM5). The kernel maps only the module's state, code, channel
+  MMU on Pi 5). The kernel maps only the module's state, code, channel
   buffers, and heap; any other memory access raises a fault.
 
 Faulted modules transition through `Running → Faulted → Recovering`

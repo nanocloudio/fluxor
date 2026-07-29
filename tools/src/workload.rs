@@ -86,6 +86,9 @@ pub struct Contract {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
+    /// Silicon or host token from the closed §2 set
+    /// (standards/target_consolidation.md): `bcm2712`, `rp2040`,
+    /// `rp2350`, `esp32s3`, `linux`, `wasm`. Never a board id.
     pub family: String,
     pub architecture: String,
     pub fluxor_abi: u32,
