@@ -13,7 +13,9 @@
 //! into kernel memory and returns its total byte length (header + pixels), or 0
 //! when no frame is ready (camera still starting / permission pending).
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Fill `buf` (kernel pointer) with `[w:u16 LE][h:u16 LE][luma w*h]` for the

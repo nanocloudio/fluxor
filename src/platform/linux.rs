@@ -26,11 +26,11 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fluxor::kernel::channel;
-use fluxor::kernel::hal::HalOps;
-use fluxor::kernel::loader;
-use fluxor::kernel::scheduler;
-use fluxor::kernel::step_guard;
+use fluxor::kernel::exec::scheduler;
+use fluxor::kernel::exec::step_guard;
+use fluxor::kernel::ipc::channel;
+use fluxor::kernel::module::loader;
+use fluxor::kernel::sys::hal::HalOps;
 
 include!("linux/runtime.rs");
 
@@ -193,7 +193,7 @@ fn build_graph_linux() -> (usize, usize) {
     // plan on a rebuild (an ordinary rebuild must not drop isolation). Fail
     // closed: a staged-but-invalid plan rejects the graph rather than running it
     // system-owned (which would disable ownership isolation).
-    if let Err(e) = fluxor::kernel::owner_plan::apply_staged() {
+    if let Err(e) = fluxor::kernel::workload::owner_plan::apply_staged() {
         eprintln!("error: staged owner plan invalid ({e:?}); refusing to run the graph with ownership isolation disabled");
         process::exit(1);
     }
@@ -220,7 +220,8 @@ fn build_graph_linux() -> (usize, usize) {
             // (rfc_endpoint_lease.md §4.1). Owner stamps are live here: the
             // plan applied before instantiation (see apply_staged above).
             let mut net_ins = [-1i32; LINUX_NET_MAX_INBOUND];
-            let mut lane_owners = [fluxor::kernel::owner::OWNER_SYSTEM; LINUX_NET_MAX_INBOUND];
+            let mut lane_owners =
+                [fluxor::kernel::workload::owner::OWNER_SYSTEM; LINUX_NET_MAX_INBOUND];
             let mut lane_count = 0usize;
             for (k, slot) in net_ins.iter_mut().enumerate() {
                 let ch = scheduler::get_module_port(module_idx, 0, k as u8);
@@ -386,15 +387,17 @@ fn plan_mtime(path: &str) -> Option<std::time::SystemTime> {
 
 /// Read + stage the plan blob at `path`. The bytes are intentionally leaked:
 /// the staged-plan contract requires them valid until the (asynchronous)
-/// apply consumes them, and reloads happen at pod-lifecycle frequency — a few
-/// dozen bytes per pod churn, not a growth path.
+/// apply consumes them, and reloads happen at workload-lifecycle frequency — a few
+/// dozen bytes per workload churn, not a growth path.
 fn stage_plan_from(path: &str) {
     match std::fs::read(path) {
         Ok(bytes) => {
             log::info!("[owner] staging plan from {path} ({} bytes)", bytes.len());
             let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
             // SAFETY: 'static bytes satisfy the validity contract.
-            unsafe { fluxor::kernel::owner_plan::set_staged_plan(leaked.as_ptr(), leaked.len()) };
+            unsafe {
+                fluxor::kernel::workload::owner_plan::set_staged_plan(leaked.as_ptr(), leaked.len())
+            };
         }
         Err(e) => log::error!("[owner] plan reload from {path} failed: {e}"),
     }
@@ -509,7 +512,7 @@ fn main() {
     }
     // Node-agent mode also PUBLISHES per-owner live status next to the plan
     // it consumes (`owner_status.json`, atomic replace) so `fluxor agent
-    // status` can report truthful per-pod §7.2 state. Absent file / absent
+    // status` can report truthful per-workload §7.2 state. Absent file / absent
     // FLUXOR_PLAN ⇒ no runtime status surfaced.
     let mut owner_status = plan_path
         .as_deref()
@@ -530,16 +533,16 @@ fn main() {
         process::exit(0);
     }
 
-    // Admit resident pods declared in the config's `[FXPD]` section (RFC
-    // adaptive_tick_extra §7 — `pods:` / `combine <two-graph.yaml>`) as workload
+    // Admit resident workloads declared in the config's `[FXPD]` section (RFC
+    // adaptive_tick_extra §7 — `workloads:` / `combine <two-graph.yaml>`) as workload
     // owners via `apply_add`, then the multi-graph runner multiplexes them with
-    // the base graph. Boot-only (not re-run on live rebuild). No-op without pods.
-    scheduler::admit_resident_pods_from_config();
+    // the base graph. Boot-only (not re-run on live rebuild). No-op without workloads.
+    scheduler::admit_resident_workloads_from_config();
 
     // A revocation the just-applied plan still lists, naming an owner that was
     // NOT reinstalled, was mid-drain when the previous process died: the drain
     // is forfeited and recorded as drain-timeout-by-restart — unless the
-    // previous process already persisted that pod's terminal outcome
+    // previous process already persisted that workload's terminal outcome
     // (rfc_owner_drain_and_logs.md §3.6, §3.7 writer seeding).
     synthesize_restart_terminals(
         std::time::SystemTime::now()
@@ -639,7 +642,7 @@ fn main() {
                     // drain driver takes over — no rebuild, co-resident owners
                     // untouched (rfc_owner_drain_and_logs.md §3.4). Anything
                     // structural falls through to the rebuild as before.
-                    match fluxor::kernel::owner_plan::try_apply_drain_delta() {
+                    match fluxor::kernel::workload::owner_plan::try_apply_drain_delta() {
                         Some(delta) => arm_drains(&delta),
                         None => {
                             // Structural plan: not a pure-drain delta, but it may
@@ -648,7 +651,9 @@ fn main() {
                             // reset drops the owner from the table and the next
                             // drain_tick finalises it, instead of it vanishing
                             // untracked.
-                            let drains = fluxor::kernel::owner_plan::arm_staged_revocation_drains();
+                            let drains =
+                                fluxor::kernel::workload::owner_plan::arm_staged_revocation_drains(
+                                );
                             arm_drains(&drains);
                             // SAFETY: null/0 = reload current STATIC_CONFIG sentinel.
                             unsafe { scheduler::request_rebuild(core::ptr::null(), 0) };
@@ -708,9 +713,9 @@ fn main() {
         let (result, sleep_us) =
             scheduler::step_resident_graphs_flat(&mut sched.modules, module_count);
 
-        if matches!(result, fluxor::kernel::scheduler::StepResult::Done) {
+        if matches!(result, fluxor::kernel::exec::scheduler::StepResult::Done) {
             // Node-agent mode (FLUXOR_PLAN set): the runtime is the node's
-            // persistent substrate — pods come and go via plan reloads, so an
+            // persistent substrate — workloads come and go via plan reloads, so an
             // all-done/empty graph idles awaiting SIGHUP instead of exiting.
             if plan_path.is_some() {
                 thread::sleep(Duration::from_millis(100));
@@ -733,7 +738,7 @@ fn main() {
         // mid-tick on Linux waited until the next full tick to run —
         // an interrupt-driven module would observe its event arbitrarily
         // late depending on `tick_us`.
-        let wake = fluxor::kernel::event::take_wake_pending();
+        let wake = fluxor::kernel::ipc::event::take_wake_pending();
         if !wake.is_empty() {
             scheduler::step_woken_modules(&mut sched.modules, module_count, &wake);
         }
@@ -772,7 +777,7 @@ fn main() {
                 // Yield early on wake so woken modules don't wait out
                 // the remainder of the spin budget. The bit stays
                 // latched in EVENT_WAKE_PENDING for the next iteration.
-                if fluxor::kernel::event::wake_pending_nonzero() {
+                if fluxor::kernel::ipc::event::wake_pending_nonzero() {
                     break;
                 }
                 core::hint::spin_loop();
@@ -790,7 +795,7 @@ fn main() {
         // park_timeout (or between the first drain and entering the
         // spin) reaches `step_woken_modules` before the next full
         // step pass, matching RP's two-drain wake path.
-        let wake = fluxor::kernel::event::take_wake_pending();
+        let wake = fluxor::kernel::ipc::event::take_wake_pending();
         if !wake.is_empty() {
             // SAFETY: single-threaded linux main loop — sole scheduler user.
             let sched = unsafe { scheduler::sched_mut() };

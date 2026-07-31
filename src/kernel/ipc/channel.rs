@@ -1,0 +1,1374 @@
+//! Channel - kernel-managed pipes for inter-module data flow.
+//!
+//! Channels are FIFO buffers that connect modules in the processing graph.
+//! The kernel allocates channels at config time and passes handles to modules.
+//!
+//! From a module's perspective, channels are for reading/writing to adjacent
+//! modules in the graph. Network I/O also flows through channels: the ip or
+//! linux_net module exposes net_out/net_in ports wired to consumer modules.
+//!
+//! ## Buffer Modes
+//!
+//! Each channel's buffer supports two usage modes:
+//! - **FIFO:** Ring buffer via channel_write/channel_read (copy semantics). A
+//!   `channel_write` is **all-or-nothing**: it writes the whole record or
+//!   nothing and returns `len` or `CHAN_EAGAIN` — never a partial byte count
+//!   (`ringbuf::write` refuses a write that exceeds free space, since a partial
+//!   write would corrupt record framing). A `channel_read` MAY be partial: it
+//!   returns up to `len` bytes (a record-framed reader frames by length / keeps
+//!   a carry for a split tail).
+//! - **Mailbox:** Zero-copy via buffer_acquire_write/release/acquire_read/release
+//!
+//! Mailbox mode is not a separate channel type — it is enabled only when the
+//! scheduler aliases two or more edges via `buffer_group` in `open_channels`.
+//! See `scheduler::open_channels` for the aliasing rules.
+//!
+//! ## Mailbox size semantics
+//!
+//! `channel_read`/`channel_write` work transparently on both FIFO and mailbox
+//! channels but enforce exact-size semantics for mailbox:
+//!
+//! - **channel_read**: if the caller's buffer is smaller than the mailbox payload,
+//!   the read is cancelled (`mailbox_cancel_read`) and EINVAL is returned. The
+//!   payload stays in READY state for a retry with a larger buffer.
+//! - **channel_write**: if the data exceeds the buffer capacity, the acquire is
+//!   cancelled (`mailbox_flush`) and EINVAL is returned.
+//!
+//! No silent truncation occurs in either direction.
+//!
+//! ## buffer_acquire_write capacity_out semantics
+//!
+//! `buffer_acquire_write` returns `(null, capacity_out)` in two distinct cases:
+//!
+//! - **Not a mailbox channel** (`mailbox` flag is false): `capacity_out = 0`.
+//! - **Mailbox channel, buffer busy** (not in STREAMING state): `capacity_out > 0`
+//!   (the actual buffer capacity).
+//!
+//! Producers must check `capacity_out` to distinguish these cases. Treating a
+//! busy mailbox as "not mailbox" and falling back to FIFO writes would corrupt
+//! the in-flight mailbox data.
+//!
+//! ## In-place processing
+//!
+//! `buffer_acquire_inplace` allows a downstream module to modify the mailbox
+//! buffer in place (READY → PRODUCER). On release, the buffer transitions to
+//! READY_PROCESSED instead of READY, which prevents a second in-place module
+//! from re-processing the same buffer. The final consumer (`acquire_read`)
+//! accepts both READY and READY_PROCESSED.
+//!
+//! Current design supports at most one in-place module per alias chain. For
+//! multiple transforms, insert a FIFO copy step between them.
+//!
+//! ## FIFO→Mailbox chaining
+//!
+//! FIFO and mailbox channels coexist in a pipeline: use FIFO where the producer
+//! writes incrementally, switch to a mailbox chain at the first module that can
+//! produce whole buffers. See `docs/architecture/pipeline.md` §FIFO→Mailbox.
+
+use core::cell::UnsafeCell;
+use core::ffi::c_void;
+use portable_atomic::{AtomicBool, AtomicI16, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+
+use crate::kernel::boot::config::MAX_GRAPH_EDGES;
+use crate::kernel::ipc::buffer_pool::{self, BUFFER_SIZE};
+use crate::kernel::ipc::ringbuf::RingBufState;
+use crate::kernel::sys::errno;
+use log::{debug, trace};
+
+// ============================================================================
+// Channel Types & Events
+// ============================================================================
+
+/// Maximum channels matches max graph edges to support fan-in/out expansion
+pub const MAX_CHANNELS: usize = MAX_GRAPH_EDGES;
+
+// Channel ids are stored in `i16`-typed fields (notably
+// `BufferRegistrySlot.owner_channel`) with `-1` reserved as the
+// no-owner sentinel; the valid range is `[0, i16::MAX]`. Widening
+// `MAX_CHANNELS` past this requires widening the owner-channel
+// storage; the assert below fails the build if that invariant is
+// broken.
+const _: () = assert!(
+    MAX_CHANNELS <= i16::MAX as usize + 1,
+    "MAX_CHANNELS exceeds i16 sentinel-aware range; widen ChannelSlot.buffer_slot \
+     and BufferRegistrySlot.owner_channel storage before increasing this limit"
+);
+
+/// Pipe channel type (FIFO buffer) - the only channel type
+pub const CHANNEL_TYPE_PIPE: u8 = 3;
+
+// Poll flags — re-exported from abi::poll for kernel-internal use.
+pub use crate::abi::poll::CONN as POLL_CONN;
+pub use crate::abi::poll::ERR as POLL_ERR;
+pub use crate::abi::poll::HUP as POLL_HUP;
+pub use crate::abi::poll::IN as POLL_IN;
+pub use crate::abi::poll::OUT as POLL_OUT;
+
+// ============================================================================
+// Ioctl Commands (stable ABI values — modules hardcode these)
+// ============================================================================
+
+/// Post a u32 notification value to a channel's sideband slot.
+/// Semantics are channel-defined (seek position, sample rate, etc.).
+pub const IOCTL_NOTIFY: u32 = 1;
+
+/// Atomically read and clear the sideband notification. arg: pointer to u32 output.
+/// Returns CHAN_OK if value was pending (written to arg), CHAN_EAGAIN if not.
+pub const IOCTL_POLL_NOTIFY: u32 = 2;
+
+/// Full channel reset: clears ring buffer (or mailbox state), HUP flag,
+/// sticky event flags (HUP/ERR), and aux_u32. After flush the channel
+/// behaves as if freshly opened.
+pub const IOCTL_FLUSH: u32 = 3;
+
+/// Set HUP flag (end-of-stream signal from producer).
+/// Consumer detects via channel_poll/fd_poll with POLL_HUP.
+pub const IOCTL_SET_HUP: u32 = 4;
+
+/// Channel-side ioctl handler registered by a module. Signature matches
+/// [`syscall_channel_ioctl`] (cmd + arg pointer), with a state pointer
+/// bound at registration time so the handler can reach the owning
+/// module's state arena without looking it up each call.
+///
+/// The kernel does not own `state` — the module's state arena outlives
+/// the channel in the current single-binding-per-graph design (no
+/// module unload path exists). If a future feature adds unload,
+/// handlers must be cleared via `channel_register_ioctl_handler(handle,
+/// null, null)` before the state arena is released.
+pub type ChannelIoctlHandler =
+    unsafe extern "C" fn(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32;
+
+/// No auxiliary value pending (sentinel).
+const NO_AUX_PENDING: u32 = u32::MAX;
+
+// ============================================================================
+// Error Codes (aliases into kernel::sys::errno)
+// ============================================================================
+
+pub const CHAN_OK: i32 = errno::OK;
+pub const CHAN_ERROR: i32 = errno::ERROR;
+pub const CHAN_EAGAIN: i32 = errno::EAGAIN;
+pub const CHAN_EBUSY: i32 = errno::EBUSY;
+pub const CHAN_EINVAL: i32 = errno::EINVAL;
+pub const CHAN_EINPROGRESS: i32 = errno::EINPROGRESS;
+pub const CHAN_ENOSYS: i32 = errno::ENOSYS;
+pub const CHAN_ENOTCONN: i32 = errno::ENOTCONN;
+pub const CHAN_ECONNREFUSED: i32 = errno::ECONNREFUSED;
+pub const CHAN_ETIMEDOUT: i32 = errno::ETIMEDOUT;
+
+// ============================================================================
+// Channel Storage
+// ============================================================================
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelState {
+    Free = 0,
+    Allocated = 1,
+    Connected = 2,
+}
+
+/// FIFO state for circular buffer operations.
+///
+/// Uses shared `RingBufState` from `kernel::ipc::ringbuf`.
+/// `capacity` is set at channel open time from the arena-allocated buffer size.
+type FifoState = RingBufState;
+
+struct ChannelSlot {
+    state: AtomicU8,
+    chan_type: AtomicU8,
+    sticky_events: AtomicU8,
+    lock: AtomicBool,
+    /// HUP flag (producer signals end-of-stream / completion)
+    hup_flag: AtomicBool,
+    /// Channel is in mailbox mode (zero-copy buffer handoff).
+    /// Set by the scheduler for aliased channels (buffer_group != 0).
+    /// When false, buffer_acquire_write returns null, forcing FIFO mode.
+    mailbox: AtomicBool,
+    /// Auxiliary u32 value (module-defined: seek position, file index, etc.)
+    /// NO_AUX_PENDING if none pending.
+    aux_u32: AtomicU32,
+    /// Index into buffer registry (-1 if no buffer allocated). Stored
+    /// as `i16` so all `MAX_BUFFER_SLOTS = 256` registry slots fit
+    /// without silent wrap to negative.
+    buffer_slot: AtomicI16,
+    /// Consumer module to event-wake on a successful write (RFC
+    /// idle_skip_wake wake-on-write, `wake: true` edges). -1 = none
+    /// (default). Bound via `channel_set_wake_module` — by graph prep
+    /// for same-domain direct edges, by the platform's cross-domain
+    /// bridging for the consumer-local delivery channel. The wake
+    /// latches the module's event bit + rings the scheduler doorbell,
+    /// so an idle sleep is cut short by data instead of waiting for
+    /// the backstop. i16: MAX_MODULES fits comfortably.
+    wake_module: AtomicI16,
+    /// FIFO state for circular buffer operations
+    fifo: UnsafeCell<FifoState>,
+    /// Optional module-registered ioctl handler. When non-null, any
+    /// `channel_ioctl` cmd that does not match a built-in command is
+    /// forwarded to this function with `ioctl_state` as its first arg.
+    /// Stored as `*mut ()` because `AtomicPtr<fn>` is not available;
+    /// the reader transmutes back to [`ChannelIoctlHandler`].
+    ioctl_handler: AtomicPtr<()>,
+    /// Opaque module state pointer passed as the first argument to
+    /// `ioctl_handler`. See `channel_register_ioctl_handler`.
+    ioctl_state: AtomicPtr<()>,
+    /// Module index that registered the current `ioctl_handler`, or
+    /// `u8::MAX` if no handler is set. Recorded at registration so the
+    /// kernel can clear the handler on
+    /// `release_module_handlers(module_idx)` — without per-slot owner
+    /// tracking, a module's function and state pointers would survive
+    /// module unload / restart / finalisation and point into freed
+    /// memory.
+    ioctl_owner: AtomicU8,
+}
+
+// SAFETY: `ChannelSlot` interior is split between the atomics
+// (`state`, `lock`, `buffer_slot`, etc., all `Sync`) and the
+// `UnsafeCell<FifoState>` guarded by the spin-lock in `with_lock`.
+// Every mutation of `fifo` happens under that lock, so cross-thread
+// access is sequenced.
+unsafe impl Sync for ChannelSlot {}
+
+impl ChannelSlot {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(ChannelState::Free as u8),
+            chan_type: AtomicU8::new(0),
+            sticky_events: AtomicU8::new(0),
+            lock: AtomicBool::new(false),
+            hup_flag: AtomicBool::new(false),
+            mailbox: AtomicBool::new(false),
+            aux_u32: AtomicU32::new(NO_AUX_PENDING),
+            buffer_slot: AtomicI16::new(-1),
+            wake_module: AtomicI16::new(-1),
+            fifo: UnsafeCell::new(FifoState::new()),
+            ioctl_handler: AtomicPtr::new(core::ptr::null_mut()),
+            ioctl_state: AtomicPtr::new(core::ptr::null_mut()),
+            ioctl_owner: AtomicU8::new(u8::MAX),
+        }
+    }
+
+    fn try_allocate(&self, idx: usize, buf_capacity: usize, producer_module: u8) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                ChannelState::Free as u8,
+                ChannelState::Allocated as u8,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            // Allocate an arena-backed buffer of the requested size
+            let buf_slot =
+                buffer_pool::alloc_streaming_for_module(idx as i16, buf_capacity, producer_module);
+            if buf_slot < 0 {
+                // No buffer available, rollback
+                self.state
+                    .store(ChannelState::Free as u8, Ordering::Release);
+                return false;
+            }
+            self.buffer_slot.store(buf_slot as i16, Ordering::Release);
+            self.chan_type.store(CHANNEL_TYPE_PIPE, Ordering::Release);
+            self.sticky_events.store(0, Ordering::Release);
+            // Initialize FIFO with the allocated capacity
+            // SAFETY: `self.fifo` is an `UnsafeCell<FifoState>` owned by
+            // this slot; the slot's `state` transition above means no
+            // other reader/writer holds a reference yet.
+            unsafe {
+                (*self.fifo.get()).init(buf_capacity);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset(&self) {
+        // Free buffer back to registry
+        let buf_slot = self.buffer_slot.swap(-1, Ordering::AcqRel);
+        if buf_slot >= 0 {
+            buffer_pool::free_streaming(buf_slot as i32);
+        }
+        self.state
+            .store(ChannelState::Free as u8, Ordering::Release);
+        self.chan_type.store(0, Ordering::Release);
+        self.sticky_events.store(0, Ordering::Release);
+        self.hup_flag.store(false, Ordering::Release);
+        self.mailbox.store(false, Ordering::Release);
+        self.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
+        self.wake_module.store(-1, Ordering::Release);
+        self.ioctl_handler
+            .store(core::ptr::null_mut(), Ordering::Release);
+        self.ioctl_owner.store(u8::MAX, Ordering::Release);
+        self.ioctl_state
+            .store(core::ptr::null_mut(), Ordering::Release);
+        // SAFETY: `reset()` runs under the slot's free-transition; no
+        // active references to `self.fifo` are live at this point.
+        unsafe {
+            *self.fifo.get() = FifoState::new();
+        }
+    }
+
+    fn is_pipe(&self) -> bool {
+        self.chan_type.load(Ordering::Acquire) == CHANNEL_TYPE_PIPE
+    }
+
+    fn get_buffer_ptr(&self) -> *mut u8 {
+        let slot = self.buffer_slot.load(Ordering::Acquire);
+        if slot < 0 {
+            return core::ptr::null_mut();
+        }
+        buffer_pool::get_streaming_ptr(slot as i32)
+    }
+
+    fn with_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut FifoState, Option<&mut [u8]>) -> R,
+    {
+        // Bounded spin with yield to prevent starvation under cross-core contention.
+        // The critical section is short (ring buffer read/write), so contention is brief.
+        let mut spins = 0u32;
+        while self
+            .lock
+            .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            spins += 1;
+            if spins > 256 {
+                // SAFETY: aarch64 `YIELD` is a hint, side-effect-free,
+                // safe to issue from any privilege level.
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    core::arch::asm!("yield", options(nomem, nostack));
+                }
+                spins = 0;
+            }
+            core::hint::spin_loop();
+        }
+        let buf_ptr = self.get_buffer_ptr();
+        // SAFETY: the spin-lock above gives this thread exclusive access
+        // to `self.fifo` for the duration of `f`.
+        let fifo = unsafe { &mut *self.fifo.get() };
+        let storage = if buf_ptr.is_null() {
+            None
+        } else {
+            // SAFETY: `buf_ptr` was obtained from `buffer_pool::get_streaming_ptr`
+            // for the slot pinned in `self.buffer_slot`; the lock ensures the
+            // slot can't be released while this slice is live.
+            Some(unsafe { core::slice::from_raw_parts_mut(buf_ptr, fifo.capacity()) })
+        };
+        let result = f(fifo, storage);
+        self.lock.store(false, Ordering::Release);
+        result
+    }
+}
+
+static CHANNELS: [ChannelSlot; MAX_CHANNELS] = [const { ChannelSlot::new() }; MAX_CHANNELS];
+
+// ============================================================================
+// Channel API
+// ============================================================================
+
+pub fn channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
+    channel_open_for_module(chan_type, config, config_len, 0xFF)
+}
+
+/// Same as `channel_open`, but tags the buffer with its producer module
+/// so the scheduler can compute a per-module MPU region after graph setup.
+pub fn channel_open_for_module(
+    chan_type: u8,
+    config: *const u8,
+    config_len: usize,
+    producer_module: u8,
+) -> i32 {
+    // ISR-tier (Tier 1b / Tier 2) modules must not open generic
+    // PIPE channels — their I/O rides bridge channels, registered
+    // ahead of time via `isr_tier::register_tier1b_module` /
+    // `register_tier2_module`. Opening a PIPE from ISR context
+    // would cross-link the heap-allocating arena into an interrupt
+    // handler. The build-time validator
+    // (`tools/src/config.rs::validate_isr_tier_admission`) already
+    // rejects this shape at YAML-parse time; the runtime check is
+    // defense in depth for hand-rolled binaries. Fire BEFORE the
+    // chan_type check so a malformed ISR-tier syscall surfaces as
+    // EACCES (the permission violation) rather than CHAN_EINVAL
+    // (the type-tag mismatch). See `.context/rfc_isr_tier_surface.md`
+    // §D6.
+    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_open") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    if chan_type != CHANNEL_TYPE_PIPE {
+        return CHAN_EINVAL;
+    }
+    // The v1 channel-open request shape is exactly:
+    //   * `config = NULL && config_len == 0` → caller wants the
+    //     default capacity (`BUFFER_SIZE`).
+    //   * `config != NULL && config_len == 4` → the 4 bytes are a
+    //     little-endian `u32` carrying the desired ring capacity in
+    //     bytes. The capacity must already be within
+    //     `[MIN_CHAN_BYTES, MAX_CHAN_BYTES]` and a power of two —
+    //     anything else is rejected with `CHAN_EINVAL`.
+    //
+    // Every other shape (non-null pointer with the wrong length, null
+    // pointer with non-zero length, capacity outside the range, non-
+    // power-of-two capacity) is a wiring bug and gets a deterministic
+    // rejection.
+    const MIN_CHAN_BYTES: usize = 64;
+    // Matches the scheduler's normalisation cap. Raised 256 KiB -> 2 MiB -> 4 MiB
+    // so a whole app video/GPU frame (emulator command streams run past 1 MiB, and
+    // chunk's GPU ring carries a chunk mesh + far-terrain LOD ring in one step) fits
+    // one ring; the 8 MiB wasm buffer arena has ample room (only channels that
+    // request more allocate more).
+    const MAX_CHAN_BYTES: usize = 4 * 1024 * 1024;
+    let buf_capacity = if config.is_null() {
+        if config_len != 0 {
+            return CHAN_EINVAL;
+        }
+        BUFFER_SIZE
+    } else {
+        if config_len != 4 {
+            return CHAN_EINVAL;
+        }
+        // SAFETY: caller passed `config_len == 4`, so `config[0..4]` is
+        // a valid 4-byte read.
+        let size = unsafe {
+            u32::from_le_bytes([*config, *config.add(1), *config.add(2), *config.add(3)]) as usize
+        };
+        if !(MIN_CHAN_BYTES..=MAX_CHAN_BYTES).contains(&size) {
+            return CHAN_EINVAL;
+        }
+        if !size.is_power_of_two() {
+            return CHAN_EINVAL;
+        }
+        size
+    };
+
+    for (idx, slot) in CHANNELS.iter().enumerate() {
+        if slot.try_allocate(idx, buf_capacity, producer_module) {
+            slot.state
+                .store(ChannelState::Connected as u8, Ordering::Release);
+            debug!("channel_open: allocated channel {idx} buf_size={buf_capacity}");
+            return idx as i32;
+        }
+    }
+    CHAN_EBUSY
+}
+
+pub fn channel_close(handle: i32) {
+    if handle < 0 {
+        return;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return;
+    }
+    CHANNELS[idx].reset();
+}
+
+/// Snapshot of channel slot table usage. Used by diagnostics and
+/// harness tests that need to assert slot-table state without
+/// reaching into the private `CHANNELS` static.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelStats {
+    /// Slots in `ChannelState::Free` — available for `channel_open`.
+    pub free: usize,
+    /// Slots in `ChannelState::Allocated` — claimed but not yet bound
+    /// to a producer/consumer pair (transient state during graph setup).
+    pub allocated: usize,
+    /// Slots in `ChannelState::Connected` — actively wired in the graph.
+    pub connected: usize,
+    /// Total slots in the channel table.
+    pub capacity: usize,
+}
+
+/// Return current occupancy of the channel slot table. Snapshots are
+/// non-atomic — under concurrent load the sum of `free + allocated +
+/// connected` equals `capacity` only at quiescent moments. Intended
+/// for diagnostics, not for steady-state correctness reasoning.
+pub fn stats() -> ChannelStats {
+    let mut free = 0usize;
+    let mut allocated = 0usize;
+    let mut connected = 0usize;
+    for slot in CHANNELS.iter() {
+        let s = slot.state.load(Ordering::Acquire);
+        if s == ChannelState::Free as u8 {
+            free += 1;
+        } else if s == ChannelState::Allocated as u8 {
+            allocated += 1;
+        } else if s == ChannelState::Connected as u8 {
+            connected += 1;
+        }
+    }
+    ChannelStats {
+        free,
+        allocated,
+        connected,
+        capacity: MAX_CHANNELS,
+    }
+}
+
+/// Close every channel slot. Used at graph-reconfigure boundaries so a
+/// previous graph's slot claims don't accumulate across calls to
+/// `scheduler::prepare_graph` — without this, repeated reconfigures
+/// would gradually exhaust `MAX_CHANNELS` even when each individual
+/// graph fits well within the slot budget.
+///
+/// **DMA-owned edge contract**: callers must ensure any device with
+/// outstanding DMA against a streaming buffer attached to a channel
+/// has been quiesced (descriptors retired, device idle) before
+/// invoking `reset_all`. The kernel does not issue `DMA_INVALIDATE`
+/// on the buffer memory here — the streaming arena's bump allocator
+/// may reuse the underlying pages for the next graph immediately,
+/// and a still-active device would corrupt the new occupant.
+/// Platforms whose drivers hold DMA descriptors (NIC RX rings, NVMe
+/// submission queues, PIO DMA streams) are responsible for tearing
+/// the device down via their module's `module_drain` /
+/// `module_state_export` exports before the kernel reaches this
+/// point. See `.context/rfc_graph_reconfigure.md` for the
+/// operator-visible drain flow.
+pub fn reset_all() {
+    for slot in CHANNELS.iter() {
+        slot.reset();
+    }
+}
+
+/// Clear every ioctl handler whose `ioctl_owner` matches `module_idx`.
+///
+/// Called from `syscalls::release_module_handles(module_idx)` on
+/// module unload, finalisation, or restart so a module's
+/// `module_drain` / `module_state_export` exit cannot leave function
+/// and state pointers in the channel table pointing at memory the
+/// loader has reclaimed.
+///
+/// Only the handler triple (`ioctl_handler`, `ioctl_state`,
+/// `ioctl_owner`) is reset; the slot's `chan_type` and lifecycle
+/// state are left intact. Full slot teardown happens later through
+/// `reset_all` on graph rebuild.
+pub fn release_module_handlers(module_idx: u8) {
+    for slot in CHANNELS.iter() {
+        if slot.ioctl_owner.load(Ordering::Acquire) == module_idx {
+            slot.ioctl_handler
+                .store(core::ptr::null_mut(), Ordering::Release);
+            slot.ioctl_state
+                .store(core::ptr::null_mut(), Ordering::Release);
+            slot.ioctl_owner.store(u8::MAX, Ordering::Release);
+        }
+    }
+}
+
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes (or null, which is
+/// rejected). The function performs a `copy_nonoverlapping` of up to
+/// `len` bytes into `buf` — the destination region must not alias any
+/// kernel state observed via shared references.
+pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    // Defense in depth (RFC §D6): ISR-tier callers do not use the
+    // generic PIPE syscall — they read from bridge rings registered
+    // at `register_tier1b_module`/`register_tier2_module` time. Fire
+    // BEFORE the argument-validation checks so a malformed ISR-tier
+    // syscall surfaces as EACCES rather than CHAN_EINVAL.
+    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_read") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    if buf.is_null() {
+        return CHAN_EINVAL;
+    }
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        // Mailbox channel: acquire → copy to caller's buffer → release.
+        // Unlike FIFO, mailbox release is all-or-nothing — partial reads
+        // would discard the unreturned tail. Require the caller to provide
+        // a buffer large enough for the entire payload.
+        let buf_slot = slot.buffer_slot.load(Ordering::Acquire) as i32;
+        if buf_slot < 0 {
+            return CHAN_EAGAIN;
+        }
+        let (mbox_ptr, mbox_len) = buffer_pool::mailbox_acquire_read(buf_slot);
+        if mbox_ptr.is_null() {
+            return CHAN_EAGAIN; // No data ready (not in READY state)
+        }
+        if (len as u32) < mbox_len {
+            // Caller's buffer too small — cancel the acquire so the payload
+            // stays in READY state for a retry with a larger buffer.
+            buffer_pool::mailbox_cancel_read(buf_slot);
+            return CHAN_EINVAL;
+        }
+        let copy_len = mbox_len as usize;
+        core::ptr::copy_nonoverlapping(mbox_ptr, buf, copy_len);
+        buffer_pool::mailbox_release_read(buf_slot);
+        trace!("chan_read h={handle} mailbox copy_len={copy_len}");
+        return copy_len as i32;
+    }
+    let out = core::slice::from_raw_parts_mut(buf, len);
+    let read = slot.with_lock(|fifo, storage| {
+        let Some(storage) = storage else { return -1i32 };
+        fifo.read(storage, out) as i32
+    });
+    if read < 0 {
+        return CHAN_EINVAL; // Channel buffer not allocated
+    }
+    if read == 0 {
+        CHAN_EAGAIN
+    } else {
+        read
+    }
+}
+
+/// Copy up to `len` bytes from the head of the channel's FIFO ring
+/// into `buf` WITHOUT advancing the read pointer. Returns the number
+/// of bytes copied (0 if the ring is empty), or a negative errno.
+///
+/// Used by frame-aware fan modules (tee/merge) to inspect a length-
+/// prefixed header before deciding whether to consume the full frame
+/// — the read is committed only when every output ring has space,
+/// so producer atomic-write boundaries survive even when the fan
+/// outputs are temporarily backpressured. Mailbox channels are not
+/// peekable; the call returns CHAN_EINVAL on those.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `len` bytes (or null, which is
+/// rejected with `CHAN_EINVAL`). The function writes `n <= len` bytes
+/// through `buf`; the caller owns the buffer and is responsible for
+/// its lifetime and aliasing.
+pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    // RFC §D7 contract — deny PIPE-channel I/O from ISR-tier callers.
+    // Same rationale as `channel_read`: `peek` exposes the consumer
+    // side of a cooperative-PIPE channel and is not part of the
+    // bridge ABI.
+    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_peek") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    if buf.is_null() {
+        return CHAN_EINVAL;
+    }
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        // Mailbox channels deliver an opaque buffer reference, not a
+        // byte stream — no meaningful peek semantics.
+        return CHAN_EINVAL;
+    }
+    let out = core::slice::from_raw_parts_mut(buf, len);
+    let n = slot.with_lock(|fifo, storage| {
+        let Some(storage) = storage else { return -1i32 };
+        fifo.peek(storage, out) as i32
+    });
+    if n < 0 {
+        CHAN_EINVAL
+    } else {
+        n
+    }
+}
+
+/// # Safety
+/// `data` must be valid for reads of `len` bytes (or null, which is
+/// rejected). The function reads through `data` into the channel's
+/// FIFO/mailbox storage; the source region must remain initialised for
+/// the duration of the call.
+pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
+    // Defense in depth (RFC §D6): ISR-tier callers do not use the
+    // generic PIPE syscall — they write into bridge rings registered
+    // at `register_tier1b_module`/`register_tier2_module` time. Fire
+    // BEFORE the argument-validation checks so a malformed ISR-tier
+    // syscall surfaces as EACCES rather than CHAN_EINVAL.
+    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_write") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    if data.is_null() {
+        return CHAN_EINVAL;
+    }
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        // Mailbox channel: acquire → copy from caller's buffer → release.
+        // Unlike FIFO, mailbox release publishes the entire payload atomically —
+        // a short write would discard the remainder on the next cycle.
+        // Reject writes that exceed buffer capacity.
+        let buf_slot = slot.buffer_slot.load(Ordering::Acquire) as i32;
+        if buf_slot < 0 {
+            return CHAN_EAGAIN;
+        }
+        let (mbox_ptr, cap) = buffer_pool::mailbox_acquire_write(buf_slot);
+        if mbox_ptr.is_null() {
+            return CHAN_EAGAIN; // Buffer busy (not in STREAMING state)
+        }
+        if len as u32 > cap {
+            // Payload exceeds buffer capacity — cancel the acquire so the
+            // mailbox returns to STREAMING for a retry with smaller data.
+            buffer_pool::mailbox_flush(buf_slot);
+            return CHAN_EINVAL;
+        }
+        core::ptr::copy_nonoverlapping(data, mbox_ptr, len);
+        buffer_pool::mailbox_release_write(buf_slot, len as u32);
+        wake_consumer_if_flagged(slot);
+        trace!("chan_write h={handle} mailbox len={len}");
+        return len as i32;
+    }
+    let input = core::slice::from_raw_parts(data, len);
+    let written = slot.with_lock(|fifo, storage| {
+        let Some(storage) = storage else { return -1i32 };
+        fifo.write(storage, input) as i32
+    });
+    if written < 0 {
+        return CHAN_EINVAL; // Channel buffer not allocated
+    }
+    if written == 0 {
+        CHAN_EAGAIN
+    } else {
+        wake_consumer_if_flagged(slot);
+        written
+    }
+}
+
+/// Bind a consumer module to be event-woken by successful writes on this
+/// channel (RFC idle_skip_wake §4 wake-on-write). `module_idx < 0` clears
+/// the binding.
+pub fn channel_set_wake_module(handle: i32, module_idx: i32) {
+    if handle < 0 || handle as usize >= MAX_CHANNELS {
+        return;
+    }
+    let clamped =
+        if module_idx < 0 || module_idx as usize >= crate::kernel::boot::config::MAX_MODULES {
+            -1
+        } else {
+            module_idx as i16
+        };
+    CHANNELS[handle as usize]
+        .wake_module
+        .store(clamped, Ordering::Release);
+}
+
+/// Wake-on-write (RFC idle_skip_wake §4): after a successful write on a
+/// `wake: true` edge, latch the consumer's event-wake bit and ring the
+/// scheduler doorbell.
+/// The consumer then steps with `event_wake = true` on the next drain
+/// (period gate bypassed), and the woken-path domain budget bounds the
+/// rate (`step_woken_modules` defers over-budget wakes). No-op for the
+/// unflagged default, so unconfigured graphs pay one relaxed atomic
+/// load per write.
+#[inline]
+fn wake_consumer_if_flagged(slot: &ChannelSlot) {
+    let m = slot.wake_module.load(Ordering::Relaxed);
+    if m >= 0 {
+        // `latch_module_wake` returns false when the consumer's owner is
+        // paused: the wake is deferred (re-latched on `owner_resume`) and
+        // the doorbell is suppressed, so a write into a paused owner never
+        // leaks a cross-domain wake (rfc_workload_lifecycle.md §3.2).
+        if crate::kernel::ipc::event::latch_module_wake(m as usize) {
+            crate::kernel::sys::hal::wake_scheduler();
+        }
+    }
+}
+
+pub fn channel_poll(handle: i32, events: u32) -> i32 {
+    // RFC §D7 contract: ISR-tier modules have no PIPE-channel API.
+    // `channel_poll` is a read-only inspector, but exposing it would
+    // let an ISR module busy-wait on a PIPE — semantically out of
+    // contract — so deny along with channel_read/write/peek.
+    if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_poll") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+    let mut ready = 0u32;
+    if slot.mailbox.load(Ordering::Acquire) {
+        // Mailbox channels: check buffer state for readiness.
+        // POLL_IN = mailbox has data (READY/READY_PROCESSED state).
+        // POLL_OUT = mailbox can accept a write (STREAMING state).
+        // channel_read/channel_write handle mailbox transparently, so
+        // poll semantics are consistent for both FIFO and mailbox modes.
+        let buf_slot = slot.buffer_slot.load(Ordering::Acquire);
+        if buf_slot >= 0 {
+            if (events & POLL_IN) != 0 && buffer_pool::mailbox_has_data(buf_slot as i32) {
+                ready |= POLL_IN;
+            }
+            if (events & POLL_OUT) != 0 && buffer_pool::mailbox_can_write(buf_slot as i32) {
+                ready |= POLL_OUT;
+            }
+        }
+    } else {
+        // FIFO channels: check ring buffer occupancy
+        let (readable, writable) =
+            slot.with_lock(|fifo, _storage| (fifo.is_readable(), fifo.is_writable()));
+        if (events & POLL_IN) != 0 && readable {
+            ready |= POLL_IN;
+        }
+        if (events & POLL_OUT) != 0 && writable {
+            ready |= POLL_OUT;
+        }
+    }
+    // Include persistent flags (HUP, ERR) if requested
+    let persistent = slot.sticky_events.load(Ordering::Acquire) as u32;
+    if (events & POLL_HUP) != 0 {
+        // Check both: permanent HUP (from scheduler) and hup_flag (from IOCTL_SET_HUP).
+        // hup_flag is non-destructive here — cleared by IOCTL_FLUSH when
+        // the consumer starts a new stream.
+        if (persistent & POLL_HUP) != 0 || slot.hup_flag.load(Ordering::Acquire) {
+            ready |= POLL_HUP;
+        }
+    }
+    if (events & POLL_ERR) != 0 && (persistent & POLL_ERR) != 0 {
+        ready |= POLL_ERR;
+    }
+    trace!("chan_poll h={handle} events=0x{events:02x} ready=0x{ready:02x}");
+    ready as i32
+}
+
+pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+
+    match cmd {
+        IOCTL_NOTIFY => {
+            // Post sideband notification value
+            if arg.is_null() {
+                return CHAN_EINVAL;
+            }
+            // SAFETY: NOTIFY contract: `arg` is a `*const u32` from the
+            // caller; non-null checked above.
+            let val = unsafe { *(arg as *const u32) };
+            slot.aux_u32.store(val, Ordering::Release);
+            debug!("chan_ioctl h={handle} NOTIFY val={val}");
+            CHAN_OK
+        }
+        IOCTL_POLL_NOTIFY => {
+            // Atomically read and clear sideband notification
+            if arg.is_null() {
+                return CHAN_EINVAL;
+            }
+            let val = slot.aux_u32.swap(NO_AUX_PENDING, Ordering::AcqRel);
+            if val == NO_AUX_PENDING {
+                CHAN_EAGAIN
+            } else {
+                // SAFETY: POLL_NOTIFY contract: `arg` is a `*mut u32`
+                // from the caller; non-null checked above.
+                unsafe {
+                    *(arg as *mut u32) = val;
+                }
+                debug!("chan_ioctl h={handle} POLL_NOTIFY val={val}");
+                CHAN_OK
+            }
+        }
+        IOCTL_FLUSH => {
+            // Clear ring buffer and reset flags
+            if slot.mailbox.load(Ordering::Acquire) {
+                // Mailbox: reset buffer slot back to STREAMING so it can be reused
+                let buf_slot = slot.buffer_slot.load(Ordering::Acquire);
+                if buf_slot >= 0 {
+                    buffer_pool::mailbox_flush(buf_slot as i32);
+                }
+            } else {
+                // FIFO: flush ring buffer
+                slot.with_lock(|fifo, _storage| {
+                    fifo.clear();
+                });
+            }
+            slot.hup_flag.store(false, Ordering::Release);
+            slot.sticky_events.store(0, Ordering::Release);
+            slot.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
+            debug!("chan_ioctl h={handle} FLUSH");
+            CHAN_OK
+        }
+        IOCTL_SET_HUP => {
+            // Set HUP flag (producer signals completion / end-of-stream)
+            slot.hup_flag.store(true, Ordering::Release);
+            debug!("chan_ioctl h={handle} SET_HUP");
+            CHAN_OK
+        }
+        _ => {
+            // Forward unrecognised cmds to a module-registered handler
+            // if one was bound to this channel. Load the handler first,
+            // and only read `ioctl_state` if it's non-null — see
+            // `channel_register_ioctl_handler` for the store ordering.
+            let h = slot.ioctl_handler.load(Ordering::Acquire);
+            if h.is_null() {
+                return CHAN_ENOSYS;
+            }
+            let state = slot.ioctl_state.load(Ordering::Acquire);
+            // SAFETY: `ioctl_handler` is set by `channel_register_ioctl_handler`
+            // from a `ChannelIoctlHandler` fn-pointer via the same transmute;
+            // the registration / unregister handshake guarantees the pointer
+            // is either null (checked above) or points at a live handler.
+            let handler: ChannelIoctlHandler = unsafe { core::mem::transmute(h) };
+            // SAFETY: `handler` is the registered ABI function; `state` is
+            // the handler's own opaque pointer paired with `h` at register
+            // time.
+            unsafe { handler(state as *mut c_void, cmd, arg) }
+        }
+    }
+}
+
+/// Bind a module-provided ioctl handler to `handle`. Any `channel_ioctl`
+/// cmd that doesn't match a built-in (`IOCTL_NOTIFY`, `IOCTL_POLL_NOTIFY`,
+/// `IOCTL_FLUSH`, `IOCTL_SET_HUP`) is dispatched to `handler(state, cmd,
+/// arg)` instead of returning `CHAN_ENOSYS`.
+///
+/// Passing `handler == null` clears the registration (no call is made).
+/// Otherwise `handler` must be a function pointer whose lifetime exceeds
+/// the channel's — in practice the owning module's entry code, which
+/// lives as long as the loaded module image.
+///
+/// Returns `CHAN_OK` on success, or `CHAN_EINVAL` for an invalid handle.
+/// `state` is opaque to the kernel — typically a pointer into the
+/// module's state arena.
+pub fn channel_register_ioctl_handler(
+    handle: i32,
+    state: *mut c_void,
+    handler: Option<ChannelIoctlHandler>,
+) -> i32 {
+    if handle < 0 {
+        return CHAN_EINVAL;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return CHAN_EINVAL;
+    }
+
+    // Publish state before handler. Reader in channel_ioctl loads
+    // handler first (Acquire) — if it sees non-null, `ioctl_state`
+    // must already be visible.
+    slot.ioctl_state.store(state as *mut (), Ordering::Release);
+    // Record the current module as the owner so
+    // `release_module_handlers(module_idx)` can clear stale handlers
+    // when the module is finalised / restarted / torn down. Cleared
+    // on `handler == None` so a module can voluntarily unregister
+    // without taking ownership of an empty slot.
+    if handler.is_some() {
+        let owner = crate::kernel::exec::scheduler::current_module_index();
+        let owner_u8 = if owner < u8::MAX as usize {
+            owner as u8
+        } else {
+            u8::MAX
+        };
+        slot.ioctl_owner.store(owner_u8, Ordering::Release);
+    } else {
+        slot.ioctl_owner.store(u8::MAX, Ordering::Release);
+    }
+    match handler {
+        Some(h) => slot.ioctl_handler.store(h as *mut (), Ordering::Release),
+        None => slot
+            .ioctl_handler
+            .store(core::ptr::null_mut(), Ordering::Release),
+    }
+    CHAN_OK
+}
+
+/// Enable mailbox mode on a channel.
+///
+/// Called by the scheduler for aliased channels (buffer_group != 0).
+/// When set, buffer_acquire_write and buffer_acquire_inplace are allowed
+/// on this channel, enabling zero-copy producer→consumer handoff and
+/// in-place processing by intermediate modules.
+pub fn channel_set_mailbox(handle: i32) {
+    if handle < 0 {
+        return;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return;
+    }
+    CHANNELS[idx].mailbox.store(true, Ordering::Release);
+    debug!("channel_set_mailbox: ch {handle} enabled");
+}
+
+/// Does the channel hold undelivered data — covering BOTH transport modes:
+/// FIFO ring-buffer bytes AND a pending mailbox frame (which the byte-count
+/// accessor reports as 0). This is the drain-quiescence emptiness check
+/// (rfc_owner_drain_and_logs.md §3.1): a draining owner is not quiescent while
+/// any of its channels answers `true`. Invalid/closed handles are empty.
+pub fn channel_has_pending(handle: i32) -> bool {
+    if handle < 0 {
+        return false;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return false;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return false;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        let buf_slot = slot.buffer_slot.load(Ordering::Acquire);
+        return buf_slot >= 0 && buffer_pool::mailbox_has_data(i32::from(buf_slot));
+    }
+    slot.with_lock(|fifo, _| fifo.is_readable())
+}
+
+/// Return readable bytes in channel's ring buffer (0 for invalid/mailbox/empty).
+pub fn channel_readable_bytes(handle: i32) -> usize {
+    if handle < 0 {
+        return 0;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return 0;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return 0;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        return 0;
+    }
+    slot.with_lock(|fifo, _| fifo.len())
+}
+
+/// Return free space (writable bytes) in channel's ring buffer.
+/// 0 for invalid/mailbox/full channels.
+pub fn channel_writable_bytes(handle: i32) -> usize {
+    if handle < 0 {
+        return 0;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return 0;
+    }
+    let slot = &CHANNELS[idx];
+    if !slot.is_pipe() {
+        return 0;
+    }
+    if slot.mailbox.load(Ordering::Acquire) {
+        return 0;
+    }
+    slot.with_lock(|fifo, _| fifo.space())
+}
+
+/// Return true if channel is in mailbox mode.
+pub fn channel_is_mailbox(handle: i32) -> bool {
+    if handle < 0 {
+        return false;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return false;
+    }
+    CHANNELS[idx].mailbox.load(Ordering::Acquire)
+}
+
+/// Set persistent flags (HUP, ERR) on a channel.
+///
+/// These flags are returned by channel_poll() and indicate:
+/// - POLL_HUP: Writer has finished (upstream module done)
+/// - POLL_ERR: Writer encountered an error (upstream module error)
+///
+/// Once set, these flags persist until the channel is closed.
+pub fn channel_set_flags(handle: i32, flags: u8) {
+    if handle < 0 {
+        return;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return;
+    }
+    let slot = &CHANNELS[idx];
+    // Atomically OR the new flags with existing flags
+    slot.sticky_events.fetch_or(flags, Ordering::Release);
+}
+
+// ============================================================================
+// Syscall Entry Points
+// ============================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_channel_open(chan_type: u8, config: *const u8, config_len: usize) -> i32 {
+    channel_open(chan_type, config, config_len)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_channel_close(handle: i32) {
+    channel_close(handle);
+}
+
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes (or null, which is
+/// rejected by `channel_read`). See [`channel_read`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
+    channel_read(handle, buf, len)
+}
+
+/// # Safety
+/// `data` must be valid for reads of `len` bytes (or null, which is
+/// rejected by `channel_write`). See [`channel_write`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
+    channel_write(handle, data, len)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_channel_poll(handle: i32, events: u32) -> i32 {
+    channel_poll(handle, events)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
+    channel_ioctl(handle, cmd, arg)
+}
+
+/// Register (or clear) a module-provided ioctl handler on `handle`.
+/// `handler` is a C-ABI function pointer cast to `*mut ()`; a null
+/// handler clears the registration. `state` is an opaque module-state
+/// pointer echoed back as the handler's first argument.
+#[unsafe(no_mangle)]
+pub extern "C" fn syscall_channel_register_ioctl_handler(
+    handle: i32,
+    state: *mut c_void,
+    handler: *mut (),
+) -> i32 {
+    let h = if handler.is_null() {
+        None
+    } else {
+        // SAFETY: caller promises `handler` is a valid
+        // [`ChannelIoctlHandler`] function pointer; kernel merely
+        // stores and later calls it. Function-pointer lifetime is the
+        // module's — see the handler type's docstring.
+        Some(unsafe { core::mem::transmute::<*mut (), ChannelIoctlHandler>(handler) })
+    };
+    channel_register_ioctl_handler(handle, state, h)
+}
+
+// ============================================================================
+// Zero-Copy Mailbox Syscalls
+// ============================================================================
+//
+// These use the channel's own arena-allocated buffer as a single-message
+// mailbox. The buffer transitions:
+//   STREAMING (idle) → PRODUCER (writing) → READY (data) → CONSUMER (reading) → STREAMING
+//
+// No pool scan needed — the channel knows its buffer slot directly.
+
+/// Acquire write access to the channel's buffer (mailbox mode).
+///
+/// Returns pointer to buffer data for direct writing, or null if:
+/// - Channel is not in mailbox mode (FIFO-only channels return null)
+/// - Buffer is not in idle state (previous message not yet consumed)
+///
+/// The mailbox flag is set by the scheduler for aliased channels (buffer_group != 0).
+/// This prevents producers from accidentally using mailbox mode on FIFO channels,
+/// which would cause data loss (FIFO reads check ring buffer head/tail, not buffer state).
+///
+/// # Safety
+/// `capacity_out` must either be null or a valid `*mut u32` — the kernel
+/// writes the buffer capacity (or 0 on error) through it. The returned
+/// `*mut u8` is owned by the caller until matched with
+/// `syscall_buffer_release_write`; aliasing it past the release breaks
+/// the mailbox state machine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_buffer_acquire_write(
+    chan: i32,
+    capacity_out: *mut u32,
+) -> *mut u8 {
+    if chan < 0 || chan as usize >= MAX_CHANNELS {
+        if !capacity_out.is_null() {
+            *capacity_out = 0;
+        }
+        return core::ptr::null_mut();
+    }
+
+    let channel = &CHANNELS[chan as usize];
+
+    // Only allow mailbox writes on channels explicitly marked for mailbox mode
+    if !channel.mailbox.load(Ordering::Acquire) {
+        if !capacity_out.is_null() {
+            *capacity_out = 0;
+        }
+        return core::ptr::null_mut();
+    }
+
+    let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
+    if buf_slot < 0 {
+        if !capacity_out.is_null() {
+            *capacity_out = 0;
+        }
+        return core::ptr::null_mut();
+    }
+
+    // Transition channel's buffer: STREAMING → PRODUCER
+    let (ptr, cap) = buffer_pool::mailbox_acquire_write(buf_slot as i32);
+    if ptr.is_null() {
+        // Buffer is busy (not STREAMING) — signal mailbox-busy to the caller
+        // by writing the buffer capacity. This lets producers distinguish
+        // "not a mailbox channel" (capacity_out=0) from "mailbox channel,
+        // buffer busy" (capacity_out>0) and avoid falling back to FIFO writes
+        // that would corrupt the pending mailbox data.
+        if !capacity_out.is_null() {
+            *capacity_out = buffer_pool::get_capacity(buf_slot as i32);
+        }
+        return core::ptr::null_mut();
+    }
+
+    if !capacity_out.is_null() {
+        *capacity_out = cap;
+    }
+    ptr
+}
+
+/// Release buffer after writing (mailbox mode: PRODUCER → READY).
+///
+/// # Safety
+/// Must be paired with a prior successful `syscall_buffer_acquire_write`
+/// on the same `chan`. `len` must be `<=` the capacity returned by the
+/// acquire; the corresponding write region must not be accessed after
+/// this call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_buffer_release_write(chan: i32, len: u32) -> i32 {
+    if chan < 0 || chan as usize >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+
+    let channel = &CHANNELS[chan as usize];
+    let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
+    if buf_slot < 0 {
+        return CHAN_EINVAL;
+    }
+
+    let rc = buffer_pool::mailbox_release_write(buf_slot as i32, len);
+    if rc == 0 {
+        // Zero-copy publish is the mailbox equivalent of a successful
+        // channel_write — same wake-on-write hook.
+        wake_consumer_if_flagged(channel);
+    }
+    rc
+}
+
+/// Acquire read access to the channel's buffer (mailbox mode: READY → CONSUMER).
+///
+/// Returns pointer to buffer data, or null if no message ready.
+///
+/// # Safety
+/// `len_out` must either be null or a valid `*mut u32`. The returned
+/// `*const u8` is borrowed for read-only access until matched with
+/// `syscall_buffer_release_read`; mutation through this pointer or
+/// access after release breaks the mailbox state machine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_buffer_acquire_read(chan: i32, len_out: *mut u32) -> *const u8 {
+    if chan < 0 || chan as usize >= MAX_CHANNELS {
+        return core::ptr::null();
+    }
+
+    let channel = &CHANNELS[chan as usize];
+    let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
+    if buf_slot < 0 {
+        return core::ptr::null();
+    }
+
+    let (ptr, len) = buffer_pool::mailbox_acquire_read(buf_slot as i32);
+    if ptr.is_null() {
+        return core::ptr::null();
+    }
+
+    if !len_out.is_null() {
+        *len_out = len;
+    }
+    ptr
+}
+
+/// Release buffer after reading (mailbox mode: CONSUMER → STREAMING).
+///
+/// # Safety
+/// Must be paired with a prior successful `syscall_buffer_acquire_read`
+/// on the same `chan`. The pointer returned by acquire must not be
+/// accessed after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_buffer_release_read(chan: i32) -> i32 {
+    if chan < 0 || chan as usize >= MAX_CHANNELS {
+        return CHAN_EINVAL;
+    }
+
+    let channel = &CHANNELS[chan as usize];
+    let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
+    if buf_slot < 0 {
+        return CHAN_EINVAL;
+    }
+
+    buffer_pool::mailbox_release_read(buf_slot as i32)
+}
+
+/// Acquire in-place access to the channel's buffer (READY → PRODUCER).
+///
+/// For aliased buffer chains where an in-place module reads and modifies
+/// the upstream module's output buffer directly. Returns a mutable pointer
+/// to the existing data. After processing, call buffer_release_write to
+/// transition back to READY for the next module in the chain.
+///
+/// # Safety
+/// `len_out` must either be null or a valid `*mut u32`. The returned
+/// `*mut u8` is borrowed mutably until matched with
+/// `syscall_buffer_release_write`; concurrent access from another
+/// module (or another core) violates the single-writer invariant.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn syscall_buffer_acquire_inplace(chan: i32, len_out: *mut u32) -> *mut u8 {
+    if chan < 0 || chan as usize >= MAX_CHANNELS {
+        return core::ptr::null_mut();
+    }
+
+    let channel = &CHANNELS[chan as usize];
+    let buf_slot = channel.buffer_slot.load(Ordering::Acquire);
+    if buf_slot < 0 {
+        return core::ptr::null_mut();
+    }
+
+    // Transition channel's buffer: READY → PRODUCER
+    let (ptr, len) = buffer_pool::mailbox_acquire_inplace(buf_slot as i32);
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    if !len_out.is_null() {
+        *len_out = len;
+    }
+    ptr
+}

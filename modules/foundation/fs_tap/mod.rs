@@ -25,7 +25,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 /// Maximum line length before forcing a flush.
 const LINE_MAX: usize = 128;
@@ -237,4 +237,4 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

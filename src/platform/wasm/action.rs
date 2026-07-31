@@ -24,7 +24,9 @@
 //! here, so the two sides agree without shipping the strings on the
 //! wire.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     fn host_action_pop(buf: *mut u8, len: usize) -> i32;

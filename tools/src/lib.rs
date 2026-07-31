@@ -63,7 +63,7 @@ pub mod workload;
 pub mod workspace;
 
 /// Wire-format constants (ABI version byte, channel-hint stride,
-/// `fnv1a32`). Path-mounted from `modules/sdk/wire.rs` so the host
+/// `fnv1a32`). Path-mounted from `modules/sdk/wire/wire.rs` so the host
 /// tools agree byte-for-byte with the kernel and the module SDK.
 /// `#[allow(dead_code)]` because integration tests reach only a
 /// subset of the constants.
@@ -71,7 +71,7 @@ pub mod workspace;
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
-#[path = "../../modules/sdk/wire.rs"]
+#[path = "../../modules/sdk/wire/wire.rs"]
 pub mod wire;
 
 /// Canonical ABI wire-surface encoding — path-mounted from

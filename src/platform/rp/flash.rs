@@ -1,7 +1,5 @@
 //! RP flash support.
 
-use crate::kernel::chip;
-
 pub mod store {
     //! Runtime parameter store — boot scan, merge, and flash hardware bridge.
     //!
@@ -75,7 +73,7 @@ pub mod store {
         unsafe {
             let p = &raw const STORE_DISPATCH;
             if (*p).is_some() {
-                return crate::kernel::errno::EBUSY;
+                return crate::kernel::sys::errno::EBUSY;
             }
             STORE_DISPATCH = Some(dispatch);
             STORE_STATE = state;
@@ -92,7 +90,7 @@ pub mod store {
         unsafe {
             match STORE_DISPATCH {
                 Some(dispatch) => dispatch(STORE_STATE, opcode, arg, arg_len),
-                None => crate::kernel::errno::ENOSYS,
+                None => crate::kernel::sys::errno::ENOSYS,
             }
         }
     }
@@ -448,17 +446,17 @@ pub mod store {
     /// within a known writable region (`is_writable_sector`).
     pub fn raw_erase(offset: u32) -> i32 {
         if offset & (SECTOR_SIZE as u32 - 1) != 0 {
-            return crate::kernel::errno::EINVAL;
+            return crate::kernel::sys::errno::EINVAL;
         }
         if !is_writable_sector(offset, SECTOR_SIZE as u32) {
-            return crate::kernel::errno::EINVAL;
+            return crate::kernel::sys::errno::EINVAL;
         }
         // SAFETY: offset alignment + writable-region check above; with_flash_op
         // disables IRQs and detaches XIP across the ROM-bootloader call.
         unsafe {
             match with_flash_op(|| flash_erase_sector(offset)) {
                 Ok(()) => 0,
-                Err(()) => crate::kernel::errno::ERROR,
+                Err(()) => crate::kernel::sys::errno::ERROR,
             }
         }
     }
@@ -467,7 +465,7 @@ pub mod store {
     /// writable region (`is_writable_sector`).
     pub fn raw_program(offset: u32, data: *const u8) -> i32 {
         if !is_writable_sector(offset, PAGE_SIZE as u32) {
-            return crate::kernel::errno::EINVAL;
+            return crate::kernel::sys::errno::EINVAL;
         }
         // SAFETY: writable-region check above; with_flash_op disables IRQs
         // and detaches XIP. Caller must ensure `data` points to a readable
@@ -476,7 +474,7 @@ pub mod store {
         unsafe {
             match with_flash_op(|| flash_program_page(offset, data)) {
                 Ok(()) => 0,
-                Err(()) => crate::kernel::errno::ERROR,
+                Err(()) => crate::kernel::sys::errno::ERROR,
             }
         }
     }
@@ -518,7 +516,7 @@ pub mod store {
     #[inline(always)]
     unsafe fn copy_boot2(buf: &mut [u32; 256 / 4]) -> unsafe extern "C" fn() {
         core::ptr::copy_nonoverlapping(
-            super::chip::BOOT2_SRC as *const u8,
+            crate::platform::chip::BOOT2_SRC as *const u8,
             buf.as_mut_ptr() as *mut u8,
             256,
         );
@@ -545,8 +543,8 @@ pub mod store {
         (rom_data::flash_range_erase::ptr())(
             offset,
             SECTOR_SIZE,
-            super::chip::FLASH_ERASE_BLOCK_SIZE,
-            super::chip::FLASH_ERASE_CMD,
+            crate::platform::chip::FLASH_ERASE_BLOCK_SIZE,
+            crate::platform::chip::FLASH_ERASE_CMD,
         );
         (rom_data::flash_flush_cache::ptr())();
         boot2_fn();
@@ -600,7 +598,7 @@ pub mod xip_lock {
     //! interrupts disabled, release. The QSPI CS read technique follows the
     //! same approach as embassy-rp's bootsel module.
 
-    use crate::kernel::errno;
+    use crate::kernel::sys::errno;
     use portable_atomic::{AtomicU32, AtomicU8, Ordering};
 
     /// Maximum number of lockable resources.
@@ -639,7 +637,7 @@ pub mod xip_lock {
         if idx >= MAX_RESOURCES {
             return errno::EINVAL;
         }
-        let owner = crate::kernel::scheduler::current_module_index() as u8;
+        let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
         match RESOURCE_SLOTS[idx].owner.compare_exchange(
             OWNER_FREE,
             owner,
@@ -657,7 +655,7 @@ pub mod xip_lock {
             return errno::EINVAL;
         }
         let slot = &RESOURCE_SLOTS[handle as usize];
-        let owner = crate::kernel::scheduler::current_module_index() as u8;
+        let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
         match slot
             .owner
             .compare_exchange(owner, OWNER_FREE, Ordering::AcqRel, Ordering::Acquire)
@@ -697,7 +695,7 @@ pub mod xip_lock {
             return CACHED_RESULT.load(Ordering::Relaxed) as i32;
         }
 
-        let owner = crate::kernel::scheduler::current_module_index() as u8;
+        let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
         let slot = &RESOURCE_SLOTS[RESOURCE_FLASH_XIP];
 
         // Atomic short-term lock: try-lock, do the read, then unlock.
@@ -738,7 +736,7 @@ pub mod xip_lock {
     ///
     /// Returns 0 (not pressed) or 1 (pressed).
     fn read_bootsel() -> i32 {
-        use super::chip;
+        use crate::platform::chip;
         use embassy_rp::pac;
 
         let mut sio_hi_sample: u32 = 0;
@@ -785,7 +783,7 @@ pub mod xip_lock {
     #[inline(never)]
     #[link_section = ".data.ram_func"]
     unsafe fn read_bootsel_io_qspi() -> (u32, u32) {
-        use super::chip;
+        use crate::platform::chip;
 
         // Save originals
         let orig_ctrl = core::ptr::read_volatile(chip::BOOTSEL_CTRL_ADDR as *const u32);

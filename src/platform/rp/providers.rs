@@ -6,10 +6,10 @@
 
 use portable_atomic::{compiler_fence, AtomicU16, Ordering};
 
-use crate::kernel::errno;
-use crate::kernel::fd;
-use crate::kernel::gpio;
-use crate::kernel::syscalls::{register_dev_query_extension, register_system_extension};
+use crate::kernel::ipc::fd;
+use crate::kernel::module::syscalls::{register_dev_query_extension, register_system_extension};
+use crate::kernel::sys::errno;
+use crate::platform::rp_io::gpio;
 
 const E_INVAL: i32 = errno::EINVAL;
 const E_NOSYS: i32 = errno::ENOSYS;
@@ -74,7 +74,7 @@ pub(crate) unsafe fn dma_start_raw(
     let dma_ch = pac::DMA.ch(ch as usize);
     dma_ch.read_addr().write_value(read_addr);
     dma_ch.write_addr().write_value(write_addr);
-    super::chip::dma_write_trans_count(&dma_ch, count);
+    crate::platform::chip::dma_write_trans_count(&dma_ch, count);
     compiler_fence(Ordering::SeqCst);
 
     let incr_read = flags & 0x01 != 0;
@@ -191,7 +191,7 @@ pub fn dma_fd_create() -> i32 {
         dma_free_channel(ch_a as u8);
         return ch_b;
     }
-    let owner = crate::kernel::scheduler::current_module_index() as u8;
+    let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
     for (i, dma) in DMA_FD_SLOTS.iter().enumerate() {
         if dma
             .allocated
@@ -282,7 +282,7 @@ pub fn dma_fd_queue(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
         let inactive_ch = pac::DMA.ch(inactive as usize);
         let active_ch = pac::DMA.ch(active as usize);
         inactive_ch.read_addr().write_value(read_addr);
-        super::chip::dma_write_trans_count(&inactive_ch, count);
+        crate::platform::chip::dma_write_trans_count(&inactive_ch, count);
         compiler_fence(Ordering::SeqCst);
         let mut ctrl = pac::dma::regs::CtrlTrig(active_ch.al1_ctrl().read());
         ctrl.set_chain_to(inactive);
@@ -424,7 +424,7 @@ pub fn release_handles(module_idx: u8) {
 // `module_provides_contract` export. The raw register bridges they
 // call into remain in `rp_system_extension_dispatch` below.
 
-use crate::kernel::pio_util;
+use crate::platform::rp_io::pio as pio_util;
 
 /// Check if a GPIO pin has been claimed
 pub fn is_gpio_registered(pin_num: u8) -> bool {
@@ -447,7 +447,7 @@ pub unsafe extern "C" fn syscall_gpio_request_output(pin_num: u8) -> i32 {
     }
     gpio::gpio_set_owner(
         pin_num,
-        crate::kernel::scheduler::current_module_index() as u8,
+        crate::kernel::exec::scheduler::current_module_index() as u8,
     );
     let result = gpio::gpio_set_mode(handle, gpio::PinMode::Output, true);
     if result < 0 {
@@ -476,7 +476,7 @@ pub unsafe extern "C" fn syscall_gpio_request_input(pin_num: u8, pull: u8) -> i3
     }
     gpio::gpio_set_owner(
         pin_num,
-        crate::kernel::scheduler::current_module_index() as u8,
+        crate::kernel::exec::scheduler::current_module_index() as u8,
     );
     // Set pull configuration
     let pin_pull = match pull {
@@ -511,7 +511,7 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
     // Strip FD_TAG_HAL_GPIO so the inner ops see a raw pin number.
     // No-op on the -1 sentinel for open-style opcodes.
     let handle = if handle >= 0 {
-        crate::kernel::fd::slot_of(handle)
+        crate::kernel::ipc::fd::slot_of(handle)
     } else {
         handle
     };
@@ -522,7 +522,10 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
             }
             let result = gpio::syscall_gpio_claim(*arg);
             if result >= 0 {
-                gpio::gpio_set_owner(*arg, crate::kernel::scheduler::current_module_index() as u8);
+                gpio::gpio_set_owner(
+                    *arg,
+                    crate::kernel::exec::scheduler::current_module_index() as u8,
+                );
             }
             result
         }
@@ -601,7 +604,7 @@ unsafe fn spi9_pac_gpio_init(pin: u8, high: bool) {
         .ctrl()
         .write(|w| w.set_funcsel(5));
     pac::PADS_BANK0.gpio(pin as usize).write(|w| {
-        super::chip::pad_set_iso_false!(w);
+        crate::platform::chip::pad_set_iso_false!(w);
         w.set_schmitt(false);
         w.set_slewfast(false);
         w.set_ie(true);
@@ -636,7 +639,7 @@ unsafe fn spi9_pac_pin_set(pin: u8, high: bool) {
 /// Busy-wait for `us` microseconds using the RP hardware TIMER.
 #[inline(always)]
 unsafe fn spi9_timer_us(us: u32) {
-    let timer = super::chip::timer();
+    let timer = crate::platform::chip::timer();
     let t0 = timer.timerawl().read();
     while timer.timerawl().read().wrapping_sub(t0) < us {}
 }
@@ -720,8 +723,8 @@ fn is_dma_channel_handle(h: i32) -> bool {
     if h < 0 {
         return false;
     }
-    let (tag, _slot) = crate::kernel::fd::untag_fd(h);
-    tag == crate::kernel::fd::FD_TAG_DMA_CHANNEL || tag == 0
+    let (tag, _slot) = crate::kernel::ipc::fd::untag_fd(h);
+    tag == crate::kernel::ipc::fd::FD_TAG_DMA_CHANNEL || tag == 0
 }
 
 #[inline]
@@ -729,8 +732,8 @@ fn is_dma_fd_handle(h: i32) -> bool {
     if h < 0 {
         return false;
     }
-    let (tag, _slot) = crate::kernel::fd::untag_fd(h);
-    tag == crate::kernel::fd::FD_TAG_DMA
+    let (tag, _slot) = crate::kernel::ipc::fd::untag_fd(h);
+    tag == crate::kernel::ipc::fd::FD_TAG_DMA
 }
 
 unsafe fn rp_system_extension_dispatch(
@@ -761,7 +764,7 @@ unsafe fn rp_system_extension_dispatch(
             pac::PADS_BANK0.gpio(pin).modify(|w| {
                 w.set_ie(false);
                 w.set_od(false);
-                super::chip::pad_set_iso_false!(w);
+                crate::platform::chip::pad_set_iso_false!(w);
             });
             0
         }
@@ -1124,20 +1127,20 @@ unsafe fn rp_system_extension_dispatch(
 
             // TX DMA blocking
             if tx_words > 0 {
-                crate::kernel::rp_providers::dma_start_raw(
+                crate::platform::rp_providers::dma_start_raw(
                     ch_tx, tx_addr, txf_addr, tx_words, tx_dreq, 0x05,
                 );
                 compiler_fence(Ordering::SeqCst);
-                while crate::kernel::rp_providers::dma_busy(ch_tx) != 0 {}
+                while crate::platform::rp_providers::dma_busy(ch_tx) != 0 {}
                 compiler_fence(Ordering::SeqCst);
             }
 
             // RX DMA blocking (always — PIO needs full TX→RX cycle)
-            crate::kernel::rp_providers::dma_start_raw(
+            crate::platform::rp_providers::dma_start_raw(
                 ch_tx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06,
             );
             compiler_fence(Ordering::SeqCst);
-            while crate::kernel::rp_providers::dma_busy(ch_tx) != 0 {}
+            while crate::platform::rp_providers::dma_busy(ch_tx) != 0 {}
             compiler_fence(Ordering::SeqCst);
 
             (tx_words * 4 + rx_words * 4) as i32
@@ -1158,7 +1161,7 @@ unsafe fn rp_system_extension_dispatch(
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
-            dma_free_channel(crate::kernel::fd::slot_of(handle) as u8)
+            dma_free_channel(crate::kernel::ipc::fd::slot_of(handle) as u8)
         }
         dma_raw::channel::START => {
             if !is_dma_channel_handle(handle) {
@@ -1167,7 +1170,7 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 14 {
                 return E_INVAL;
             }
-            let ch = crate::kernel::fd::slot_of(handle) as u8;
+            let ch = crate::kernel::ipc::fd::slot_of(handle) as u8;
             let read_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let write_addr =
                 u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
@@ -1180,13 +1183,13 @@ unsafe fn rp_system_extension_dispatch(
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
-            dma_busy(crate::kernel::fd::slot_of(handle) as u8)
+            dma_busy(crate::kernel::ipc::fd::slot_of(handle) as u8)
         }
         dma_raw::channel::ABORT => {
             if !is_dma_channel_handle(handle) {
                 return E_INVAL;
             }
-            dma_abort(crate::kernel::fd::slot_of(handle) as u8)
+            dma_abort(crate::kernel::ipc::fd::slot_of(handle) as u8)
         }
         spi9_raw::SEND => {
             // 9-bit SPI bit-bang: send command + data using raw PAC GPIO.
@@ -1581,7 +1584,9 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             match *arg {
-                flash_sideband_op::READ_CS => crate::kernel::resource::flash_sideband_read_cs(),
+                flash_sideband_op::READ_CS => {
+                    crate::platform::rp_flash::xip_lock::flash_sideband_read_cs()
+                }
                 flash_sideband_op::XIP_READ => {
                     if arg_len < 6 {
                         return E_INVAL;
@@ -1607,12 +1612,12 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let module_id = crate::kernel::scheduler::current_module_index() as u8;
+            let module_id = crate::kernel::exec::scheduler::current_module_index() as u8;
             let mut fwd = [0u8; 252];
             fwd[0] = module_id;
             let n = if arg_len > 251 { 251 } else { arg_len };
             core::ptr::copy_nonoverlapping(arg, fwd.as_mut_ptr().add(1), n);
-            crate::kernel::flash_store::dispatch_param_op(
+            crate::platform::rp_flash::store::dispatch_param_op(
                 runtime_params::STORE,
                 fwd.as_mut_ptr(),
                 1 + n,
@@ -1622,9 +1627,9 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let module_id = crate::kernel::scheduler::current_module_index() as u8;
+            let module_id = crate::kernel::exec::scheduler::current_module_index() as u8;
             let mut fwd = [module_id, *arg];
-            crate::kernel::flash_store::dispatch_param_op(
+            crate::platform::rp_flash::store::dispatch_param_op(
                 runtime_params::DELETE,
                 fwd.as_mut_ptr(),
                 2,
@@ -1633,15 +1638,15 @@ unsafe fn rp_system_extension_dispatch(
         runtime_params::CLEAR_ALL => {
             if arg_len >= 1 && !arg.is_null() && *arg == 0xFF {
                 let mut fwd = [0xFFu8];
-                crate::kernel::flash_store::dispatch_param_op(
+                crate::platform::rp_flash::store::dispatch_param_op(
                     runtime_params::CLEAR_ALL,
                     fwd.as_mut_ptr(),
                     1,
                 )
             } else {
-                let module_id = crate::kernel::scheduler::current_module_index() as u8;
+                let module_id = crate::kernel::exec::scheduler::current_module_index() as u8;
                 let mut fwd = [module_id];
-                crate::kernel::flash_store::dispatch_param_op(
+                crate::platform::rp_flash::store::dispatch_param_op(
                     runtime_params::CLEAR_ALL,
                     fwd.as_mut_ptr(),
                     1,
@@ -1654,29 +1659,29 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let fn_addr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let module_idx = crate::kernel::scheduler::current_module_index();
+            let module_idx = crate::kernel::exec::scheduler::current_module_index();
             // Resolve export hash to absolute address (PIC-safe)
             let resolved_addr =
-                crate::kernel::loader::resolve_export_for_module(module_idx, fn_addr)
+                crate::kernel::module::loader::resolve_export_for_module(module_idx, fn_addr)
                     .unwrap_or(fn_addr as usize);
-            let dispatch: crate::kernel::flash_store::FlashStoreDispatchFn =
+            let dispatch: crate::platform::rp_flash::store::FlashStoreDispatchFn =
                 core::mem::transmute(resolved_addr);
-            let state = crate::kernel::scheduler::get_module_state(module_idx);
-            crate::kernel::flash_store::register_dispatch(dispatch, state)
+            let state = crate::kernel::exec::scheduler::get_module_state(module_idx);
+            crate::platform::rp_flash::store::register_dispatch(dispatch, state)
         }
         flash::RAW_ERASE => {
             if arg.is_null() || arg_len < 4 {
                 return E_INVAL;
             }
             let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            crate::kernel::flash_store::raw_erase(offset)
+            crate::platform::rp_flash::store::raw_erase(offset)
         }
         flash::RAW_PROGRAM => {
             if arg.is_null() || arg_len < 4 + 256 {
                 return E_INVAL;
             }
             let offset = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            crate::kernel::flash_store::raw_program(offset, arg.add(4))
+            crate::platform::rp_flash::store::raw_program(offset, arg.add(4))
         }
         // ── PLATFORM_DMA: fd family ──────────────────────────────────
         //
@@ -1748,7 +1753,7 @@ unsafe fn rp_system_extension_dispatch(
 unsafe fn rp_dev_query_extension(handle: i32, key: u32, out: *mut u8, out_len: usize) -> i32 {
     use crate::abi::contracts::hal::gpio as dev_gpio;
     use crate::abi::kernel_abi::SYS_CLOCK_HZ;
-    use crate::kernel::provider::contract as dev_class;
+    use crate::kernel::module::provider::contract as dev_class;
     let class = ((key >> 8) & 0xFF) as u16;
     match class {
         dev_class::GPIO => match key {
@@ -1780,7 +1785,7 @@ unsafe fn rp_dev_query_extension(handle: i32, key: u32, out: *mut u8, out_len: u
 
 /// Register RP-specific contract providers. Called from init_providers().
 fn init_rp_providers() {
-    use crate::kernel::provider::{self, contract as dev_class};
+    use crate::kernel::module::provider::{self, contract as dev_class};
     provider::register(dev_class::HAL_GPIO, gpio_provider_dispatch);
     // Handle-scoped vtable routes tracked GPIO handles by contract id;
     // the class-byte registration above is the fallback for handle=-1
@@ -1796,9 +1801,9 @@ fn init_rp_providers() {
 // `gpio_provider_dispatch`; open-style opcodes (CLAIM, SET_INPUT,
 // SET_OUTPUT) return a pin handle that `provider_open` tracks. Close
 // invokes RELEASE.
-static GPIO_VTABLE: crate::kernel::provider::ProviderVTable =
-    crate::kernel::provider::ProviderVTable {
-        contract: crate::kernel::provider::contract::HAL_GPIO,
+static GPIO_VTABLE: crate::kernel::module::provider::ProviderVTable =
+    crate::kernel::module::provider::ProviderVTable {
+        contract: crate::kernel::module::provider::contract::HAL_GPIO,
         call: gpio_provider_dispatch,
         query: None,
         default_close_op: crate::abi::contracts::hal::gpio::RELEASE,

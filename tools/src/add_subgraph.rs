@@ -23,8 +23,8 @@ pub const ADD_MAGIC: u32 = 0x464C_5841;
 /// `AddSubgraph` wire version. Mirrors `kernel::scheduler::live::ADD_VERSION`.
 pub const ADD_VERSION: u16 = 1;
 /// Resident-pod config-section magic: "FXPD". Mirrors
-/// `kernel::config::POD_SECTION_MAGIC`.
-pub const POD_SECTION_MAGIC: u32 = 0x4658_5044;
+/// `kernel::config::WORKLOAD_SECTION_MAGIC`.
+pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
 
 /// Largest subgraph one `apply_add` admits — mirrors
 /// `kernel::scheduler::live::MAX_ADD_MODULES`.
@@ -33,10 +33,10 @@ pub const MAX_ADD_MODULES: usize = 16;
 /// `kernel::scheduler::live::MAX_ADD_EDGES`.
 pub const MAX_ADD_EDGES: usize = 32;
 /// Largest resident-pod section the kernel will map — mirrors
-/// `kernel::config::MAX_POD_SECTION_BYTES`. The encoder rejects output beyond
+/// `kernel::config::MAX_WORKLOAD_SECTION_BYTES`. The encoder rejects output beyond
 /// this so a config that builds always admits ALL its pods (the kernel caps the
 /// mapped section at this size and would otherwise silently truncate).
-pub const MAX_POD_SECTION_BYTES: usize = 8 * 1024;
+pub const MAX_WORKLOAD_SECTION_BYTES: usize = 8 * 1024;
 
 /// One PIC module in a pod. `params` is the inline TLV blob (as
 /// `schema::build_params_from_schema` produces it for a base-graph module).
@@ -146,7 +146,7 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
 /// body's CRC-16, so it carries its OWN length + CRC over the payload (`count` +
 /// pods); the kernel validates the whole section before admitting ANY pod, so
 /// corruption can't change a pod's domain/wiring/params/attestation or leave a
-/// prefix active. Rejects output exceeding `MAX_POD_SECTION_BYTES` (the kernel's
+/// prefix active. Rejects output exceeding `MAX_WORKLOAD_SECTION_BYTES` (the kernel's
 /// mapped cap), so a config that builds always admits every pod.
 pub fn encode_pod_section(pods: &[Pod]) -> Result<Vec<u8>, String> {
     // Payload = count + pods (the CRC-covered, executable content).
@@ -161,15 +161,15 @@ pub fn encode_pod_section(pods: &[Pod]) -> Result<Vec<u8>, String> {
     }
     let crc = crc16_ccitt(&payload);
     let section_len = 10 + payload.len(); // header magic(4)+len(4)+crc(2) + payload
-    if section_len > MAX_POD_SECTION_BYTES {
+    if section_len > MAX_WORKLOAD_SECTION_BYTES {
         return Err(format!(
             "resident-pod section is {section_len} bytes, exceeding the kernel's mapped \
-             cap (MAX_POD_SECTION_BYTES = {MAX_POD_SECTION_BYTES}); the kernel would \
+             cap (MAX_WORKLOAD_SECTION_BYTES = {MAX_WORKLOAD_SECTION_BYTES}); the kernel would \
              truncate it. Reduce pod count or per-pod params."
         ));
     }
     let mut s = Vec::with_capacity(section_len);
-    s.extend_from_slice(&POD_SECTION_MAGIC.to_le_bytes());
+    s.extend_from_slice(&WORKLOAD_SECTION_MAGIC.to_le_bytes());
     s.extend_from_slice(&(section_len as u32).to_le_bytes());
     s.extend_from_slice(&crc.to_le_bytes());
     s.extend_from_slice(&payload);
@@ -223,13 +223,13 @@ mod tests {
         };
         let s = encode_pod_section(&[pod]).unwrap();
         // Header: magic(4) + section_len(4) + crc16(2) + count(2).
-        assert_eq!(&s[0..4], &POD_SECTION_MAGIC.to_le_bytes());
+        assert_eq!(&s[0..4], &WORKLOAD_SECTION_MAGIC.to_le_bytes());
         let section_len = u32::from_le_bytes([s[4], s[5], s[6], s[7]]) as usize;
         assert_eq!(section_len, s.len());
         let crc = u16::from_le_bytes([s[8], s[9]]);
         // CRC covers the payload (count + pods) = section[10..].
         assert_eq!(crc, crc16_ccitt(&s[10..]));
-        assert_eq!(&s[10..12], &1u16.to_le_bytes()); // pod_count
+        assert_eq!(&s[10..12], &1u16.to_le_bytes()); // workload_count
         let blob_len = u32::from_le_bytes([s[12], s[13], s[14], s[15]]) as usize;
         // Per-pod frame: blob_len(4) then flags(1) then the FLXA blob.
         assert_eq!(blob_len, 34); // 0-module blob: header(8)+uid(16)+caps(8)+counts(2)
@@ -250,7 +250,7 @@ mod tests {
             modules: vec![PodModule {
                 name_hash: 1,
                 domain_id: 0,
-                params: vec![0u8; MAX_POD_SECTION_BYTES], // > cap on its own
+                params: vec![0u8; MAX_WORKLOAD_SECTION_BYTES], // > cap on its own
             }],
             edges: vec![],
             idle_safe: false,

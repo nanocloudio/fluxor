@@ -136,7 +136,7 @@ impl H3State {
 /// Identify a unidirectional control stream by its first varint.
 /// Returns one of the `H3_UNI_STREAM_*` constants on success.
 pub fn classify_uni_stream_prefix(buf: &[u8]) -> Option<(u64, usize)> {
-    #[path = "../../sdk/varint.rs"]
+    #[path = "../../sdk/wire/varint.rs"]
     mod varint;
     // SAFETY: pointer/length pair derived from a Rust slice; varint_decode
     // bounds-checks against the supplied length.

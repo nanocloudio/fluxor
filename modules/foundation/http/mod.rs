@@ -82,11 +82,17 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 mod client;
 mod connection;
+#[cfg(not(feature = "host-test"))]
 mod server;
+// Exposed under host-test so the harness can unit-test the DynRoute
+// arena matching/selection directly (rfc_dynamic_routes §3.2). The
+// firmware symbol surface is unchanged (private otherwise).
+#[cfg(feature = "host-test")]
+pub mod server;
 
 // Feature gates (RFC module_variants): HTTP/2 (h2 + hpack + wire_h2 +
 // client_h2) and HTTP/3 (h3 + qpack + wire_h3) compile only when their
@@ -415,6 +421,22 @@ mod params_def {
             => |s, d, len| { server::set_route_fs_list(s, 7, d, len); };
         89, route_7_fs_filter, str, 0
             => |s, d, len| { server::set_route_fs_filter(s, 7, d, len); };
+
+        // Dynamic-route prefix (rfc_dynamic_routes §3.2). Not a
+        // `route_N_*` slot — it configures the store prefix the
+        // table_consumer subscribes to (e.g. `/dataplane/edge/`). Empty
+        // (default) leaves the whole dyn-route subsystem off, so an
+        // unconfigured server is byte-identical.
+        90, routes_prefix, str, 0
+            => |s, d, len| { server::set_routes_prefix(s, d, len); };
+
+        // Dynamic-listener prefix (rfc_workload_ingress §4.2). Configures
+        // the store prefix a SECOND table_consumer subscribes to (e.g.
+        // `/dataplane/edge-listeners/`) for mid-life bind of pooled ports.
+        // Empty (default) leaves the mid-life-bind subsystem off, so an
+        // unconfigured server is byte-identical.
+        91, listeners_prefix, str, 0
+            => |s, d, len| { server::set_listeners_prefix(s, d, len); };
     }
 }
 
@@ -639,6 +661,42 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     1,
                     s.tlm.bytes_out as u64,
                 );
+                // id 2 = http.routes.dropped — dynamic-route arena /
+                // backend-set overflow (rfc_dynamic_routes §2.5, §6:
+                // a store reader surfaces degradation through
+                // telemetry, never a store key). Cumulative; 0 when the
+                // dyn-route feature is off.
+                dev_telemetry_metric(
+                    sys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    counter,
+                    2,
+                    s.server.dyn_routes.dropped as u64,
+                );
+                // id 3 = http.proxy.retries, id 4 = http.proxy.5xx —
+                // proxy-relay failover / terminal 5xx (rfc_workload_ingress
+                // §3; a reader surfaces these via telemetry, never a
+                // store key). Cumulative; 0 when no relay is configured.
+                dev_telemetry_metric(
+                    sys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    counter,
+                    3,
+                    s.server.proxy_retries as u64,
+                );
+                dev_telemetry_metric(
+                    sys,
+                    s.telemetry_chan,
+                    midx,
+                    t,
+                    counter,
+                    4,
+                    s.server.proxy_5xx as u64,
+                );
             }
         }
 
@@ -749,6 +807,6 @@ pub unsafe extern "C" fn module_drain(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

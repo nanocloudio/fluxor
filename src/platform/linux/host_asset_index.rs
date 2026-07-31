@@ -68,9 +68,9 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
 
     // 2. Check for an upstream NOTIFY: switch to a new asset.
     let mut seek_idx: u32 = 0;
-    let res = fluxor::kernel::channel::channel_ioctl(
+    let res = fluxor::kernel::ipc::channel::channel_ioctl(
         st.out_chan,
-        fluxor::kernel::channel::IOCTL_POLL_NOTIFY,
+        fluxor::kernel::ipc::channel::IOCTL_POLL_NOTIFY,
         &mut seek_idx as *mut u32 as *mut u8,
     );
     if res == 0 {
@@ -92,9 +92,9 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
                     );
                     st.current = None;
                     // Signal HUP so the consumer doesn't block forever.
-                    fluxor::kernel::channel::channel_ioctl(
+                    fluxor::kernel::ipc::channel::channel_ioctl(
                         st.out_chan,
-                        fluxor::kernel::channel::IOCTL_SET_HUP,
+                        fluxor::kernel::ipc::channel::IOCTL_SET_HUP,
                         core::ptr::null_mut(),
                     );
                 }
@@ -105,9 +105,9 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
                 idx, st.paths.len()
             );
             st.current = None;
-            fluxor::kernel::channel::channel_ioctl(
+            fluxor::kernel::ipc::channel::channel_ioctl(
                 st.out_chan,
-                fluxor::kernel::channel::IOCTL_SET_HUP,
+                fluxor::kernel::ipc::channel::IOCTL_SET_HUP,
                 core::ptr::null_mut(),
             );
         }
@@ -124,9 +124,9 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
             // EOF reached. Signal HUP and close the file. The consumer
             // (e.g. foundation/http) flushes the channel before its
             // next IOCTL_NOTIFY, which clears the hup flag.
-            fluxor::kernel::channel::channel_ioctl(
+            fluxor::kernel::ipc::channel::channel_ioctl(
                 st.out_chan,
-                fluxor::kernel::channel::IOCTL_SET_HUP,
+                fluxor::kernel::ipc::channel::IOCTL_SET_HUP,
                 core::ptr::null_mut(),
             );
             st.current = None;
@@ -135,9 +135,9 @@ fn host_asset_index_step(state: *mut u8) -> i32 {
         Ok(n) => n,
         Err(e) => {
             log::warn!("[host_asset_index] read error: {e}");
-            fluxor::kernel::channel::channel_ioctl(
+            fluxor::kernel::ipc::channel::channel_ioctl(
                 st.out_chan,
-                fluxor::kernel::channel::IOCTL_SET_HUP,
+                fluxor::kernel::ipc::channel::IOCTL_SET_HUP,
                 core::ptr::null_mut(),
             );
             st.current = None;

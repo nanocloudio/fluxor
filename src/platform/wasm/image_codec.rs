@@ -37,7 +37,9 @@
 //! `createImageBitmap`'s async-ness behind the same poll-then-pull
 //! pattern as `host_browser_fetch`.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Hand the entire encoded image to the browser shim along with

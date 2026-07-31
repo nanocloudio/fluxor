@@ -10,10 +10,10 @@
 //! is gated on `host-linux`.
 
 pub mod builtin_params;
+pub mod host_backend;
 #[cfg(feature = "host-hsm")]
 pub mod hsm_key_vault;
 pub mod net_identity;
-pub mod oci;
 pub mod owner_drain;
 pub mod owner_status;
 pub mod providers;

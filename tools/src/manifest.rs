@@ -442,7 +442,7 @@ pub struct ManifestPermissions {
 }
 
 /// Permission category bits. Keep in sync with the kernel's
-/// `permission` module in `src/kernel/syscalls.rs`.
+/// `permission` module in `src/kernel/module/syscalls.rs`.
 pub mod permission {
     pub const RECONFIGURE: u8 = 1 << 0; // graph slot commit, boot counter, FMP routing
     pub const FLASH_RAW: u8 = 1 << 1; // flash ERASE / PROGRAM
@@ -450,6 +450,8 @@ pub mod permission {
     pub const PLATFORM_RAW: u8 = 1 << 3; // MMIO/DMA/PCIe/SMMU/NIC, raw peripheral register bridges
     pub const MONITOR: u8 = 1 << 4; // fault monitor BIND/WAIT/ACK/REPORT/RAISE
     pub const BRIDGE: u8 = 1 << 5; // cross-domain / cross-core dispatch
+    pub const PCIE_DEVICE: u8 = 1 << 6; // kernel-mediated PCIe device bind/config/BAR/MSI
+    pub const DMA: u8 = 1 << 7; // DMA-arena buffer alloc + cache maintenance
 
     pub fn from_name(s: &str) -> Option<u8> {
         match s {
@@ -459,6 +461,8 @@ pub mod permission {
             "platform_raw" => Some(PLATFORM_RAW),
             "monitor" => Some(MONITOR),
             "bridge" => Some(BRIDGE),
+            "pcie_device" => Some(PCIE_DEVICE),
+            "dma" => Some(DMA),
             _ => None,
         }
     }
@@ -482,6 +486,12 @@ pub mod permission {
         }
         if bits & BRIDGE != 0 {
             out.push("bridge");
+        }
+        if bits & PCIE_DEVICE != 0 {
+            out.push("pcie_device");
+        }
+        if bits & DMA != 0 {
+            out.push("dma");
         }
         out
     }

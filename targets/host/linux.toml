@@ -44,3 +44,11 @@ flash_size = "0x00000000"
 
 [platform.net]
 provider = "host"
+
+# Service facts (D-BOARD-STACK): the host presents OS-backed audio/display
+# sinks; stacks map these facts to driver modules.
+[platform.audio]
+sink = "host"
+
+[platform.display]
+sink = "host"

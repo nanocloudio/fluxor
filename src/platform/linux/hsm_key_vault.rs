@@ -72,8 +72,8 @@ use cryptoki::types::AuthPin;
 
 use crate::abi::contracts::key_vault as dev_key_vault;
 use crate::abi::errno::{EINVAL, ENOMEM, ENOSYS, ERROR};
-use crate::kernel::fd;
-use crate::kernel::provider;
+use crate::kernel::ipc::fd;
+use crate::kernel::module::provider;
 
 /// DER encoding of the `secp256r1` (NIST P-256, a.k.a. `prime256v1`)
 /// named-curve OID `1.2.840.10045.3.1.7`, as required for `CKA_EC_PARAMS`.
@@ -456,7 +456,7 @@ pub unsafe fn hsm_key_vault_dispatch(
         // custodial material — reuse the kernel software implementation
         // rather than a token round-trip.
         dev_key_vault::VERIFY => {
-            crate::kernel::key_vault::provider_dispatch(handle, opcode, arg, arg_len)
+            crate::kernel::security::key_vault::provider_dispatch(handle, opcode, arg, arg_len)
         }
         dev_key_vault::GENERATE => {
             // arg layout: [key_type:u8][flags:u8][pad:u16][pub_out[65]]

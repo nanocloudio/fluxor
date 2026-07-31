@@ -37,7 +37,7 @@ global_asm!(
     ".global exception_vectors",
     "exception_vectors:",
     // Current EL with SP_EL0 (4 entries). Tagged catch (`fluxor_el1_catch` in
-    // kernel::mmu): a kernel-side or async fault taken while servicing an
+    // platform::mmu): a kernel-side or async fault taken while servicing an
     // isolated module FAILS STOP — it latches ESR/FAR/SPSR/ELR (surfaced over
     // UDP by a sibling core) and spins, rather than longjmp-recovering out of a
     // possibly-held kernel lock. (Genuine EL0 module faults arrive at the
@@ -57,7 +57,7 @@ global_asm!(
     // Current EL with SP_ELx (4 entries)
     // Synchronous (EL1h): a fault in the kernel's own EL1 code — including
     // while servicing an isolated module's svc1/abort path — FAILS STOP via
-    // `fluxor_el1_sync_vec` (kernel::mmu): latch syndrome + dump + spin. It is
+    // `fluxor_el1_sync_vec` (platform::mmu): latch syndrome + dump + spin. It is
     // NOT recovered, because a fault inside kernel servicing may hold a lock
     // whose abandonment would deadlock the kernel.
     ".balign 128",
@@ -99,7 +99,7 @@ global_asm!(
     // Lower EL using AArch64 (4 entries)
     // Synchronous from a lower EL (EL0) — SVC return from an isolated
     // module_step, or a data/instruction abort while it runs. Routed to
-    // the EL0-isolation dispatcher in `kernel::mmu` (fluxor_el0_lower_sync_vec)
+    // the EL0-isolation dispatcher in `platform::mmu` (fluxor_el0_lower_sync_vec)
     // which longjmps back to the EL1 scheduler. The other three lower-EL
     // entries (IRQ/FIQ/SError) stay on the dump path: IRQs are masked for
     // the duration of an EL0 step, so they should not fire here.
@@ -123,7 +123,7 @@ global_asm!(
     "b unhandled_exception",
     ".balign 128",
     "b unhandled_exception",
-    // `.global` so the EL0-isolation dispatcher in `kernel::mmu`
+    // `.global` so the EL0-isolation dispatcher in `platform::mmu`
     // (a separate global_asm! block) can branch here when a lower-EL
     // synchronous exception arrives with no active EL0 step.
     ".global unhandled_exception",
@@ -230,7 +230,7 @@ pub unsafe extern "C" fn exception_dump(elr: u64, esr: u64, far: u64) {
     // the SPSC tail pointer, so a concurrent drain (if any remains)
     // still sees the same bytes.
     let mut buf = [0u8; 1024];
-    let n = fluxor::kernel::log_ring::read_tail(&mut buf);
+    let n = fluxor::kernel::sys::log_ring::read_tail(&mut buf);
     if n > 0 {
         uart_raw_puts(b"--- log tail (");
         uart_raw_put_u32(n as u32);
@@ -400,19 +400,19 @@ pub unsafe extern "C" fn irq_handler() {
         while i < n {
             let binding = &IRQ_BINDINGS[i];
             if binding.irq == irq_id {
-                if binding.event_handle == fluxor::kernel::isr_tier::ISR_TIER2_EVENT {
+                if binding.event_handle == fluxor::kernel::exec::isr_tier::ISR_TIER2_EVENT {
                     // Tier 2 (IRQ-owned) dispatch: route this hardware IRQ
                     // straight into the module's `module_isr_entry` via the
                     // trampoline (which looks the module up by IRQ number and
                     // enforces the §D7 ISR-context syscall gate). This is the
                     // bcm2712 counterpart to RP's `DefaultHandler` routing.
-                    let _ = fluxor::kernel::isr_tier::isr_tier2_trampoline(irq_id as u16);
+                    let _ = fluxor::kernel::exec::isr_tier::isr_tier2_trampoline(irq_id as u16);
                 } else if binding.event_handle == EVENT_HANDLE_PCIE1_MSI {
                     // brcmstb MSI mux: read + clear MSI_INT_STATUS,
                     // fan out per-vector events. Keeps total ISR
                     // cost proportional to the number of pending
                     // MSIs (typically 1).
-                    let _ = fluxor::kernel::pcie::pcie1_msi_dispatch();
+                    let _ = fluxor::platform::pcie::pcie1_msi_dispatch();
                 } else if binding.event_handle >= 0 {
                     // ACK device if mmio_base is set (virtio-mmio)
                     if binding.mmio_base != 0 {
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn irq_handler() {
                             core::ptr::write_volatile((binding.mmio_base + 0x64) as *mut u32, isr);
                         }
                     }
-                    fluxor::kernel::event::event_signal_from_isr(binding.event_handle);
+                    fluxor::kernel::ipc::event::event_signal_from_isr(binding.event_handle);
                 }
             }
             i += 1;

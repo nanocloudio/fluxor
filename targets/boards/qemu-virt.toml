@@ -6,10 +6,19 @@ id = "qemu-virt"
 silicon = "bcm2712"
 description = "QEMU aarch64 virt machine"
 
+# The QEMU virt machine's memory map (a board/emulator fact, not silicon).
+[memory]
+# QEMU virt: RAM at 0x4000_0000, 2 GB
+ram_base = "0x40000000"
+ram_size = "0x80000000"
+# No XIP flash — kernel loaded to RAM by bootloader
+flash_base = "0x00000000"
+flash_size = "0x00000000"
+
 # No reserved pins — virtual platform
 [gpio]
 reserved_pins = []
 
 [platform.net]
 phy = "ethernet"
-driver = "virtio_net"
+nic = "virtio"

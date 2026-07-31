@@ -32,7 +32,7 @@ const MAX_MODULES: usize = 64;
 /// entry_length widened to u32 so a single module's params can exceed
 /// 64 KiB — needed by synth host's http module when both halves of a
 /// split scenario inline the canonical wasm shell as body routes
-/// (~95 KiB combined). Coordinated with `src/kernel/config.rs`'s
+/// (~95 KiB combined). Coordinated with `src/kernel/boot/config.rs`'s
 /// `parse_module_entry`, which reads matching field widths.
 const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 
@@ -397,7 +397,7 @@ fn validate_scheduler_budgets(
 /// `adaptive_flags` — the runtime keys/steps the resident-graph table for ANY
 /// multi-graph config (fixed-tick included), and an overflow is silently dropped
 /// at runtime, so it must fail the build.
-fn validate_resident_pod_table(config: &Value, domain_count: usize) -> Result<()> {
+fn validate_resident_workload_table(config: &Value, domain_count: usize) -> Result<()> {
     let Some(pods) = config.get("pods").and_then(|p| p.as_array()) else {
         return Ok(());
     };
@@ -546,7 +546,7 @@ fn validate_adaptive_tick(
     // (fixed-tick multi-graph still uses it), so an overflowing `pods:` set must
     // be rejected at build time even with no adaptive domain — otherwise a
     // graph/domain instance would just be silently dropped at runtime.
-    validate_resident_pod_table(config, domain_count)?;
+    validate_resident_workload_table(config, domain_count)?;
 
     // Unconfigured ⇒ nothing more to check (byte-identical path).
     if flags.iter().all(|&f| f == 0) {

@@ -24,3 +24,68 @@ pub mod linux;
 #[cfg(feature = "host-linux")]
 #[path = "linux/proc_executor.rs"]
 pub mod proc_executor;
+
+// ── Chip-selected platform backends ──────────────────────────────────────────
+//
+// The per-chip platform modules, selected by `#[cfg]`. The chip selection lives
+// here in the platform layer; the kernel reaches them via `crate::platform::<name>`.
+
+/// Stage-1/2 MMU + per-module region protection (bcm2712).
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/mmu.rs"]
+pub mod mmu;
+/// Secondary-core bring-up + RP1/DMA40 (bcm2712).
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/multicore.rs"]
+pub mod multicore;
+/// NIC ring / GEM DMA descriptors (bcm2712 net).
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/net.rs"]
+pub mod nic_ring;
+/// PCIe root-complex bring-up (bcm2712 → RP1 over PCIe).
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/pcie.rs"]
+pub mod pcie;
+/// PCIe BAR/window alias tables (bcm2712).
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/pcie_aliases.rs"]
+pub mod pcie_aliases;
+
+/// Chip backend — the per-target chip services (clocks, arenas, boot glue),
+/// selected by `#[cfg]`. Every target has exactly one.
+#[cfg(feature = "rp")]
+#[path = "rp/chip.rs"]
+pub mod chip;
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/chip.rs"]
+pub mod chip;
+#[cfg(feature = "host-linux")]
+#[path = "linux/chip.rs"]
+pub mod chip;
+#[cfg(feature = "host-wasm")]
+#[path = "wasm/chip.rs"]
+pub mod chip;
+
+/// MPU region protection (rp / generic).
+#[path = "rp/mpu.rs"]
+pub mod mpu;
+/// Boot/config planner (rp flash-resident config staging).
+#[cfg(feature = "rp")]
+#[path = "rp/config.rs"]
+pub mod planner;
+/// RP flash store + XIP lock. Kernel re-exports `flash_store`/`resource`.
+#[cfg(feature = "rp")]
+#[path = "rp/flash.rs"]
+pub mod rp_flash;
+/// RP GPIO + PIO helpers. Kernel re-exports `gpio`/`pio_util`.
+#[cfg(feature = "rp")]
+#[path = "rp/io.rs"]
+pub mod rp_io;
+/// RP platform provider registrations.
+#[cfg(feature = "rp")]
+#[path = "rp/providers.rs"]
+pub mod rp_providers;
+/// RP step-guard (watchdog-backed step budget).
+#[cfg(feature = "rp")]
+#[path = "rp/step_guard.rs"]
+pub mod rp_step_guard;

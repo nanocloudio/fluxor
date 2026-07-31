@@ -1,6 +1,15 @@
 version = "2.0.0"
 hardware_targets = ["rp2350", "bcm2712"]
 
+# Ingress anchor role (rfc_workload_ingress §2, rfc_protocols.md §8.1):
+# in proxy mode on a leased TCP port the http fmod is the client-visible
+# stream transport attachment. Declared so the `continuity` config
+# validator (class edge_anchored) accepts an http-fronted edge; the
+# tls-fronted 443 edge additionally requires `transport.anchor.stream.secure`
+# on the tls module in front. `.secure` is an orthogonal child, so the
+# cleartext http anchor declares the base `transport.anchor.stream`.
+capabilities = ["transport.anchor.stream"]
+
 # Feature-set variants (RFC module_variants). `full` (default) emits
 # the unsuffixed http.fmod with every protocol generation;
 # `http-web.fmod` drops HTTP/2 + HTTP/3 (h2/hpack/wire_h2/client_h2 +
@@ -84,8 +93,58 @@ index = 3
 direction = "output"
 content_type = "Telemetry"
 
+# Dynamic-route subscription self-edge (rfc_dynamic_routes §2/§3.2).
+# A module cannot open a channel itself, so the graph self-wires
+# `routes_sink` (out[4]) -> `routes_changes` (in[4]) — a 1-node cycle
+# whose channel handle is passed as the storage.namespace SUBSCRIBE
+# sink. The store pushes `namespace.change` events for `routes_prefix`
+# onto in[4]; the module drains + applies them into the DynRoute arena.
+# Both ports are inert unless `routes_prefix` is configured.
+[[ports]]
+name = "routes_changes"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "routes_sink"
+index = 4
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# Dynamic-listener subscription self-edge (rfc_workload_ingress §4.2).
+# A SECOND table_consumer: the graph self-wires `listeners_sink` (out[5])
+# -> `listeners_changes` (in[5]) so the store's namespace.change SUBSCRIBE
+# for `listeners_prefix` (e.g. /dataplane/edge-listeners/) has a
+# module-owned sink. Each added `<port> = proto=tcp;tls=<0|1>` row drives a
+# mid-life CMD_BIND of the pooled port; a removed row tears the listener
+# down. Both ports are inert unless `listeners_prefix` is configured.
+[[ports]]
+name = "listeners_changes"
+index = 5
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "listeners_sink"
+index = 5
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
 [[resources]]
 requires_contract = "channel"
+access = "read"
+
+# Read-only grant on the compiled route prefix. A table consumer holds
+# a storage.namespace READ grant and nothing else (§6): it SUBSCRIBEs +
+# CHANGES the `/dataplane/edge/` prefix and never writes the store —
+# degradation goes to telemetry (http.routes.dropped), not a store key.
+[[resources]]
+requires_contract = "storage.namespace"
 access = "read"
 
 # HANDLER_FS_FILE routes serve files by path through the FS_CONTRACT
@@ -96,7 +155,12 @@ requires_contract = "fs"
 access = "read"
 
 [observability]
-metrics = ["bytes_in", "bytes_out"]
+# id 2 = routes_dropped (http.routes.dropped): dynamic-route arena /
+# backend-set overflow (rfc_dynamic_routes §2.5).
+# id 3 = proxy_retries (http.proxy.retries), id 4 = proxy_5xx
+# (http.proxy.5xx): proxy-relay failover / terminal 5xx
+# (rfc_workload_ingress §3).
+metrics = ["bytes_in", "bytes_out", "routes_dropped", "proxy_retries", "proxy_5xx"]
 # Span 0: one `http.server.request` span per request (head parsed -> response
 # drained), SERVER kind. Minted only when the telemetry port is wired
 # (zero-cost otherwise). Keepalive re-latches the span per request.

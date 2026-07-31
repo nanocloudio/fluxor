@@ -23,7 +23,9 @@
 //!     producer wired to it doesn't backpressure. Reads are
 //!     discarded. `midi_in` has no input port and is a pure no-op.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 #[repr(C)]
 pub(crate) struct MidiInState {

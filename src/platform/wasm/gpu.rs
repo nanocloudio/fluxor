@@ -109,7 +109,9 @@
     reason = "the command-stream reference above uses intentional field-alignment indentation"
 )]
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 // Command opcodes
 const CMD_FRAME_BEGIN: u8 = 0x01;

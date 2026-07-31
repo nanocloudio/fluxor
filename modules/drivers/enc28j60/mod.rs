@@ -35,7 +35,7 @@ use abi::SyscallTable;
 use abi::contracts::hal::spi::{OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs};
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 mod constants;
 use constants::*;
@@ -421,6 +421,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

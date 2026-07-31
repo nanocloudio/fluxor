@@ -8,8 +8,9 @@
 
 use super::abi::SyscallTable;
 use super::connection::{
-    NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_SEND, NET_MSG_ACCEPTED, NET_MSG_BOUND,
-    NET_MSG_CLOSED, NET_MSG_DATA, NET_MSG_ERROR, NET_MSG_TRACE_CTX,
+    NET_BUF_SIZE, NET_CMD_BIND, NET_CMD_CLOSE, NET_CMD_CONNECT, NET_CMD_SEND, NET_MSG_ACCEPTED,
+    NET_MSG_BOUND, NET_MSG_CLOSED, NET_MSG_CONNECTED, NET_MSG_DATA, NET_MSG_ERROR,
+    NET_MSG_TRACE_CTX,
 };
 #[cfg(feature = "h2")]
 use super::h2;
@@ -19,10 +20,11 @@ use super::wire_h2;
 use super::wire_ws as ws;
 use super::HttpState;
 use super::{
-    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_log, dev_micros, dev_millis as _,
-    dev_self_index, dev_telemetry_span, fmt_u32_raw, heap_alloc, heap_free, heap_realloc, msg_read,
-    net_read_frame, net_write_frame, p_u16, p_u32, p_u8, IOCTL_FLUSH, IOCTL_NOTIFY,
-    IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN, POLL_OUT,
+    dev_channel_ioctl, dev_channel_port, dev_csprng_fill, dev_log, dev_micros, dev_millis,
+    dev_owner_tag, dev_requester_tag, dev_self_index, dev_telemetry_span, fmt_u32_raw, heap_alloc,
+    heap_free, heap_realloc, msg_read, net_read_frame, net_write_frame, p_u16, p_u32, p_u8,
+    IOCTL_FLUSH, IOCTL_NOTIFY, IOCTL_POLL_NOTIFY, MSG_HDR_SIZE, NET_FRAME_HDR, POLL_HUP, POLL_IN,
+    POLL_OUT, SOCK_TYPE_STREAM,
 };
 
 // ── Sizes / capacities ─────────────────────────────────────────────────────
@@ -33,9 +35,21 @@ use super::{
 
 pub(crate) use super::abi::config::http::{
     ARENA_WORKING_SET_CONNS, DEFAULT_BODY_POOL_SIZE, MAX_CACHE, MAX_CONCURRENT_CONNS,
-    MAX_CONTENT_TYPE, MAX_FS_PATH, MAX_PATH, MAX_ROUTES, MAX_VARS, MAX_VAR_VALUE, RECV_BUF_SIZE,
-    SEND_BUF_SIZE,
+    MAX_CONTENT_TYPE, MAX_DYN_ROUTES, MAX_FS_PATH, MAX_PATH, MAX_ROUTES, MAX_ROUTE_BACKENDS,
+    MAX_VARS, MAX_VAR_VALUE, RECV_BUF_SIZE, SEND_BUF_SIZE,
 };
+
+// Dynamic-route table consumer (rfc_dynamic_routes §2/§3.2). The
+// `DynRoute` arena is populated at runtime from the `/dataplane/edge/`
+// prefix via the shared table_consumer state machine — the reusable
+// `cores/table_consumer` core, `include!`d here (it is an implementation,
+// not a wire contract; see the file header). `SyscallTable` is brought
+// into scope for the include per the core's includer contract.
+mod table_consumer {
+    use super::super::abi::SyscallTable;
+    include!("../../sdk/cores/table_consumer.rs");
+}
+use table_consumer::{TableConsumer, TableSink};
 
 /// Decode one hex digit (`0-9a-fA-F`) for percent-unescaping request
 /// paths. Returns `None` for non-hex bytes.
@@ -235,6 +249,742 @@ impl Route {
     }
 }
 
+// ── Dynamic routes (rfc_dynamic_routes §3.2) ───────────────────────────────
+//
+// A DEDICATED arena, separate from the TLV-locked static `routes`
+// above. Rows are programmed at runtime by the table_consumer helper
+// from the compiled `/dataplane/edge/<ns>/<name>` prefix, one key per
+// route carrying the full backend set:
+//
+//   host=<h>;path=<prefix>;be=<ip>:<port>:<w>:<r>,<ip>:<port>:<w>:<r>,…
+//
+// Host matching, weights, and readiness are net-new capabilities; the
+// static path matcher is path-only. The relay (HANDLER_PROXY) dials the
+// selected backend and streams both ways (rfc_workload_ingress P1); this
+// table is its runtime backend source.
+
+/// Host header buffer per dynamic route.
+pub(crate) const MAX_DYN_HOST: usize = 64;
+/// `/dataplane/edge/<ns>/<name>` key buffer — the row's stable identity
+/// for upsert/remove.
+pub(crate) const MAX_DYN_KEY: usize = 64;
+
+/// One backend of a dynamic route.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Backend {
+    pub(crate) ip: u32,
+    pub(crate) port: u16,
+    pub(crate) weight: u8,
+    pub(crate) ready: bool,
+}
+
+impl Backend {
+    const fn new() -> Self {
+        Self {
+            ip: 0,
+            port: 0,
+            weight: 0,
+            ready: false,
+        }
+    }
+}
+
+/// A runtime-programmed proxy route: host + path prefix + a weighted,
+/// readiness-gated backend set, plus a round-robin cursor.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DynRoute {
+    pub(crate) key: [u8; MAX_DYN_KEY],
+    pub(crate) host: [u8; MAX_DYN_HOST],
+    pub(crate) path: [u8; MAX_PATH],
+    pub(crate) backends: [Backend; MAX_ROUTE_BACKENDS],
+    pub(crate) key_len: u8,
+    pub(crate) host_len: u8,
+    pub(crate) path_len: u8,
+    pub(crate) backend_count: u8,
+    /// Weighted-round-robin cursor. u16 to keep modulo bias small; the
+    /// distribution is best-effort under churn (§3.2) and converges.
+    pub(crate) rr_cursor: u16,
+    /// 1 when this slot holds a live route.
+    pub(crate) used: u8,
+}
+
+impl DynRoute {
+    pub(crate) const fn new() -> Self {
+        Self {
+            key: [0; MAX_DYN_KEY],
+            host: [0; MAX_DYN_HOST],
+            path: [0; MAX_PATH],
+            backends: [Backend::new(); MAX_ROUTE_BACKENDS],
+            key_len: 0,
+            host_len: 0,
+            path_len: 0,
+            backend_count: 0,
+            rr_cursor: 0,
+            used: 0,
+        }
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.key[..self.key_len as usize]
+    }
+    pub(crate) fn host(&self) -> &[u8] {
+        &self.host[..self.host_len as usize]
+    }
+    pub(crate) fn path(&self) -> &[u8] {
+        &self.path[..self.path_len as usize]
+    }
+
+    /// Weighted round-robin over `ready` backends with `weight > 0`.
+    /// Advances `rr_cursor` by one each call; over `total_weight` calls
+    /// the distribution matches the weights. Returns `(ip, port)` or
+    /// `None` when no backend is ready.
+    pub fn select_backend(&mut self) -> Option<(u32, u16)> {
+        let mut total: u32 = 0;
+        for b in &self.backends[..self.backend_count as usize] {
+            if b.ready && b.weight > 0 {
+                total += b.weight as u32;
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+        let mut target = self.rr_cursor as u32 % total;
+        self.rr_cursor = self.rr_cursor.wrapping_add(1);
+        for b in &self.backends[..self.backend_count as usize] {
+            if b.ready && b.weight > 0 {
+                let w = b.weight as u32;
+                if target < w {
+                    return Some((b.ip, b.port));
+                }
+                target -= w;
+            }
+        }
+        None
+    }
+}
+
+/// The dynamic-route arena plus its rebuild shadow (§2 rule 4). The
+/// table_consumer helper fills `shadow` during a relist and
+/// `swap_shadow` promotes it atomically; live requests only ever see a
+/// whole, consistent `live` table.
+#[repr(C)]
+pub struct DynRoutes {
+    pub(crate) live: [DynRoute; MAX_DYN_ROUTES],
+    pub(crate) shadow: [DynRoute; MAX_DYN_ROUTES],
+    /// Cumulative rows/backends dropped on overflow — mirrored to the
+    /// `http.routes.dropped` telemetry counter (§2.5, §6: a reader
+    /// surfaces degradation through telemetry, never a store key).
+    pub(crate) dropped: u32,
+}
+
+impl DynRoutes {
+    pub(crate) const fn new() -> Self {
+        Self {
+            live: [DynRoute::new(); MAX_DYN_ROUTES],
+            shadow: [DynRoute::new(); MAX_DYN_ROUTES],
+            dropped: 0,
+        }
+    }
+
+    fn arena(&mut self, shadow: bool) -> &mut [DynRoute; MAX_DYN_ROUTES] {
+        if shadow {
+            &mut self.shadow
+        } else {
+            &mut self.live
+        }
+    }
+}
+
+/// Find the `;`-separated `tag=` field's value in a compact record.
+fn dyn_field<'a>(value: &'a [u8], tag: &[u8]) -> Option<&'a [u8]> {
+    let mut start = 0;
+    while start <= value.len() {
+        let end = value[start..]
+            .iter()
+            .position(|&b| b == b';')
+            .map(|i| start + i)
+            .unwrap_or(value.len());
+        let seg = &value[start..end];
+        if seg.len() >= tag.len() && &seg[..tag.len()] == tag {
+            return Some(&seg[tag.len()..]);
+        }
+        if end >= value.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    None
+}
+
+/// Parse a leading run of ASCII digits as u32.
+fn dyn_u32(b: &[u8]) -> u32 {
+    let mut n: u32 = 0;
+    for &c in b {
+        if c.is_ascii_digit() {
+            n = n.wrapping_mul(10).wrapping_add((c - b'0') as u32);
+        } else {
+            break;
+        }
+    }
+    n
+}
+
+/// Parse a dotted-quad IPv4 (`a.b.c.d`) into a big-endian-packed u32
+/// (`a<<24 | b<<16 | c<<8 | d`).
+fn dyn_ipv4(b: &[u8]) -> u32 {
+    let mut octets = [0u32; 4];
+    let mut oi = 0usize;
+    let mut cur = 0u32;
+    let mut seen = false;
+    for &c in b {
+        if c == b'.' {
+            if oi < 4 {
+                octets[oi] = cur & 0xFF;
+            }
+            oi += 1;
+            cur = 0;
+            seen = false;
+        } else if c.is_ascii_digit() {
+            cur = cur.wrapping_mul(10).wrapping_add((c - b'0') as u32);
+            seen = true;
+        } else {
+            break;
+        }
+    }
+    if seen && oi < 4 {
+        octets[oi] = cur & 0xFF;
+    }
+    (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+}
+
+/// Fill a `DynRoute` slot from `key` + compact `value`
+/// (`host=…;path=…;be=<ip>:<port>:<w>:<r>,…`). Returns the number of
+/// backends dropped because the set exceeded `MAX_ROUTE_BACKENDS`.
+fn dyn_fill(dst: &mut DynRoute, key: &[u8], value: &[u8]) -> u32 {
+    *dst = DynRoute::new();
+    let kn = key.len().min(MAX_DYN_KEY);
+    dst.key[..kn].copy_from_slice(&key[..kn]);
+    dst.key_len = kn as u8;
+
+    if let Some(h) = dyn_field(value, b"host=") {
+        let n = h.len().min(MAX_DYN_HOST);
+        dst.host[..n].copy_from_slice(&h[..n]);
+        dst.host_len = n as u8;
+    }
+    if let Some(p) = dyn_field(value, b"path=") {
+        let n = p.len().min(MAX_PATH);
+        dst.path[..n].copy_from_slice(&p[..n]);
+        dst.path_len = n as u8;
+    }
+
+    let mut dropped = 0u32;
+    if let Some(be) = dyn_field(value, b"be=") {
+        let mut start = 0usize;
+        while start <= be.len() {
+            let end = be[start..]
+                .iter()
+                .position(|&b| b == b',')
+                .map(|i| start + i)
+                .unwrap_or(be.len());
+            let seg = &be[start..end];
+            if !seg.is_empty() {
+                // `<ip>:<port>:<w>:<r>`
+                let mut it = seg.split(|&b| b == b':');
+                let ip = it.next().map(dyn_ipv4).unwrap_or(0);
+                let port = it.next().map(dyn_u32).unwrap_or(0) as u16;
+                let weight = it.next().map(dyn_u32).unwrap_or(1);
+                let ready = it.next().map(dyn_u32).unwrap_or(1);
+                if (dst.backend_count as usize) < MAX_ROUTE_BACKENDS {
+                    let i = dst.backend_count as usize;
+                    dst.backends[i] = Backend {
+                        ip,
+                        port,
+                        weight: weight.min(255) as u8,
+                        ready: ready != 0,
+                    };
+                    dst.backend_count += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+            if end >= be.len() {
+                break;
+            }
+            start = end + 1;
+        }
+    }
+    dropped
+}
+
+impl TableSink for DynRoutes {
+    fn upsert(&mut self, key: &[u8], value: &[u8], shadow: bool) {
+        // Reuse an existing slot with this key, else the first free one.
+        let arena = self.arena(shadow);
+        let mut free: Option<usize> = None;
+        let mut found: Option<usize> = None;
+        for (i, r) in arena.iter().enumerate() {
+            if r.used == 1 && r.key() == key {
+                found = Some(i);
+                break;
+            }
+            if r.used == 0 && free.is_none() {
+                free = Some(i);
+            }
+        }
+        let slot = match found.or(free) {
+            Some(i) => i,
+            None => {
+                // Arena full — serve what fits, count the drop (§2.5).
+                self.dropped = self.dropped.wrapping_add(1);
+                return;
+            }
+        };
+        let dropped = dyn_fill(&mut arena[slot], key, value);
+        arena[slot].used = 1;
+        if dropped > 0 {
+            self.dropped = self.dropped.wrapping_add(dropped);
+        }
+    }
+
+    fn remove(&mut self, key: &[u8], shadow: bool) {
+        let arena = self.arena(shadow);
+        for r in arena.iter_mut() {
+            if r.used == 1 && r.key() == key {
+                r.used = 0;
+                return;
+            }
+        }
+    }
+
+    fn clear_shadow(&mut self) {
+        for r in self.shadow.iter_mut() {
+            r.used = 0;
+        }
+    }
+
+    fn swap_shadow(&mut self) {
+        // Atomic promotion: one whole-arena copy. Requests are only
+        // served in separate step invocations, never mid-swap.
+        self.live = self.shadow;
+    }
+}
+
+// Host-test surface: the harness constructs and drives the DynRoute
+// arena directly to exercise matching / selection / overflow without a
+// full HttpState. No firmware symbol surface (the module is private
+// off `host-test`).
+#[cfg(feature = "host-test")]
+impl DynRoutes {
+    pub fn test_new() -> Self {
+        Self::new()
+    }
+    /// Program one live route from a compiled key + value.
+    pub fn test_program(&mut self, key: &[u8], value: &[u8]) {
+        self.upsert(key, value, false);
+    }
+    /// Remove one live route by key.
+    pub fn test_remove(&mut self, key: &[u8]) {
+        self.remove(key, false);
+    }
+    pub fn test_dropped(&self) -> u32 {
+        self.dropped
+    }
+    /// Mutable access to a live slot (for selection tests).
+    pub fn test_live_mut(&mut self, i: usize) -> &mut DynRoute {
+        &mut self.live[i]
+    }
+    /// Backend count on a live slot.
+    pub fn test_backend_count(&self, i: usize) -> usize {
+        self.live[i].backend_count as usize
+    }
+}
+
+// ── Dynamic listeners (rfc_workload_ingress §4.2) ─────────────────────
+//
+// A second table-consumer subscription: the anchor consumes
+// `/dataplane/edge-listeners/<port> = proto=tcp;tls=<0|1>` and binds each
+// listed port MID-LIFE (outside the Init→Binding→WaitBound bind path that
+// serves the single static `port`). The kernel's endpoint-lease gate
+// (rfc_endpoint_lease.md §5.3, already shipped) enforces "bind ∈ lease
+// set": a port the edge owner was not granted is refused with
+// `MSG_BIND_REFUSED`, so the listener never comes up. The grant model is a
+// pre-leased port POOL — the edge owner's plan carries one lease per pool
+// port (an `export` per port, tools/compose.rs) and mid-life bind draws
+// from it at runtime; no runtime lease-grant is needed.
+//
+// P3 scope: tcp / `tls=0` (cleartext) listeners, where http drives
+// linux_net directly. A `tls=1` dynamic listener would need the fronting
+// tls module to bind/accept a new port mid-life too (the static 443 bind
+// is forwarded through tls today); that per-listener tls state is a
+// follow-on — a `tls=1` row is recorded and reported but NOT bound in P3.
+
+/// linux_net's bind-refusal opcode (`src/platform/linux/providers.rs`
+/// `MSG_BIND_REFUSED`): `[port:u16 LE][errno:u8]`. Distinct from the
+/// metal `ip` module's 0x07 (RETRANSMIT) — acted on ONLY when the
+/// dynamic-listener feature is configured (linux edge), so the metal path
+/// stays byte-identical.
+pub(crate) const NET_MSG_BIND_REFUSED: u8 = 0x07;
+
+/// Additional listeners beyond the static `port`, bound from the
+/// pre-leased pool. Small: listener churn is operator-rate (§4.2).
+pub(crate) const MAX_DYN_LISTENERS: usize = 8;
+/// Input port index carrying the self-edged listener change sink (in[5]).
+pub(crate) const DYN_LISTENERS_PORT_INDEX: u8 = 5;
+
+// Reconciler bind states for one pooled listener.
+/// Desired, CMD_BIND not yet issued.
+const LISTENER_IDLE: u8 = 0;
+/// CMD_BIND issued; awaiting MSG_BOUND / MSG_BIND_REFUSED.
+const LISTENER_BINDING: u8 = 1;
+/// MSG_BOUND seen — accepts on this port are claimed.
+const LISTENER_BOUND: u8 = 2;
+/// MSG_BIND_REFUSED seen (port not leased) — not retried, never accepts.
+const LISTENER_REFUSED: u8 = 3;
+
+/// One desired listener row (table-consumer half). `tls=1` is recorded
+/// but not bound in P3 (see the module comment).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ListenerRow {
+    pub(crate) key: [u8; MAX_DYN_KEY],
+    pub(crate) key_len: u8,
+    pub(crate) port: u16,
+    pub(crate) tls: u8,
+    pub(crate) used: u8,
+}
+
+impl ListenerRow {
+    const fn new() -> Self {
+        Self {
+            key: [0; MAX_DYN_KEY],
+            key_len: 0,
+            port: 0,
+            tls: 0,
+            used: 0,
+        }
+    }
+    fn key(&self) -> &[u8] {
+        &self.key[..self.key_len as usize]
+    }
+}
+
+/// One runtime bind record (reconciler half). NOT part of the table, so
+/// it survives a LOST shadow-swap of the desired set.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct BoundListener {
+    pub(crate) port: u16,
+    pub(crate) state: u8,
+    pub(crate) used: u8,
+    /// linux_net listener conn_id from MSG_BOUND (teardown CMD_CLOSE).
+    pub(crate) conn_id: i16,
+}
+
+impl BoundListener {
+    const fn new() -> Self {
+        Self {
+            port: 0,
+            state: LISTENER_IDLE,
+            used: 0,
+            conn_id: -1,
+        }
+    }
+}
+
+/// The desired-listener table (live + rebuild shadow, table-consumer
+/// driven) plus the reconciler's runtime bind records. Default-off: an
+/// unconfigured `listeners_prefix` leaves every field zero-init and the
+/// pump a no-op, so the server is byte-identical.
+#[repr(C)]
+pub struct DynListeners {
+    pub(crate) live: [ListenerRow; MAX_DYN_LISTENERS],
+    pub(crate) shadow: [ListenerRow; MAX_DYN_LISTENERS],
+    /// Runtime bind state — owned by `reconcile_listeners`, never by the
+    /// TableSink swap.
+    pub(crate) bound: [BoundListener; MAX_DYN_LISTENERS],
+    /// Rows dropped on overflow (mirrors §2.5 degradation-to-telemetry).
+    pub(crate) dropped: u32,
+}
+
+impl DynListeners {
+    pub(crate) const fn new() -> Self {
+        Self {
+            live: [ListenerRow::new(); MAX_DYN_LISTENERS],
+            shadow: [ListenerRow::new(); MAX_DYN_LISTENERS],
+            bound: [BoundListener::new(); MAX_DYN_LISTENERS],
+            dropped: 0,
+        }
+    }
+    fn arena(&mut self, shadow: bool) -> &mut [ListenerRow; MAX_DYN_LISTENERS] {
+        if shadow {
+            &mut self.shadow
+        } else {
+            &mut self.live
+        }
+    }
+}
+
+/// The `<port>` tail of a `/dataplane/edge-listeners/<port>` key: the last
+/// '/'-delimited segment parsed as a u16. 0 (unparseable) is ignored.
+fn listener_port_of_key(key: &[u8]) -> u16 {
+    let seg = match key.iter().rposition(|&b| b == b'/') {
+        Some(i) => &key[i + 1..],
+        None => key,
+    };
+    (dyn_u32(seg) & 0xFFFF) as u16
+}
+
+impl TableSink for DynListeners {
+    fn upsert(&mut self, key: &[u8], value: &[u8], shadow: bool) {
+        let port = listener_port_of_key(key);
+        // `tls=1` recorded; only `tls=0` is bound in P3.
+        let tls = dyn_field(value, b"tls=")
+            .map(|v| dyn_u32(v) != 0)
+            .unwrap_or(false);
+        let arena = self.arena(shadow);
+        let mut free: Option<usize> = None;
+        let mut found: Option<usize> = None;
+        for (i, r) in arena.iter().enumerate() {
+            if r.used == 1 && r.key() == key {
+                found = Some(i);
+                break;
+            }
+            if r.used == 0 && free.is_none() {
+                free = Some(i);
+            }
+        }
+        let slot = match found.or(free) {
+            Some(i) => i,
+            None => {
+                self.dropped = self.dropped.wrapping_add(1);
+                return;
+            }
+        };
+        let r = &mut arena[slot];
+        *r = ListenerRow::new();
+        let kn = key.len().min(MAX_DYN_KEY);
+        r.key[..kn].copy_from_slice(&key[..kn]);
+        r.key_len = kn as u8;
+        r.port = port;
+        r.tls = tls as u8;
+        r.used = 1;
+    }
+
+    fn remove(&mut self, key: &[u8], shadow: bool) {
+        let arena = self.arena(shadow);
+        for r in arena.iter_mut() {
+            if r.used == 1 && r.key() == key {
+                r.used = 0;
+                return;
+            }
+        }
+    }
+
+    fn clear_shadow(&mut self) {
+        for r in self.shadow.iter_mut() {
+            r.used = 0;
+        }
+    }
+
+    fn swap_shadow(&mut self) {
+        // Promote only the DESIRED set; the reconciler's `bound` records
+        // are untouched, so a relist never drops a live listener.
+        self.live = self.shadow;
+    }
+}
+
+impl DynListeners {
+    /// A bound (accepting) dynamic listener owns `port`?
+    fn port_is_bound(&self, port: u16) -> bool {
+        self.bound
+            .iter()
+            .any(|b| b.used == 1 && b.state == LISTENER_BOUND && b.port == port)
+    }
+    /// A pending (BINDING) dynamic listener for `port`, if any.
+    fn bound_slot_for(&mut self, port: u16) -> Option<usize> {
+        self.bound
+            .iter()
+            .position(|b| b.used == 1 && b.port == port)
+    }
+}
+
+#[cfg(feature = "host-test")]
+impl DynListeners {
+    pub fn test_new() -> Self {
+        Self::new()
+    }
+    pub fn test_program(&mut self, key: &[u8], value: &[u8]) {
+        self.upsert(key, value, false);
+    }
+    pub fn test_remove(&mut self, key: &[u8]) {
+        self.remove(key, false);
+    }
+    /// `(state, conn_id)` of the runtime bind record for `port`, if any.
+    pub fn test_bound_state(&self, port: u16) -> Option<(u8, i16)> {
+        self.bound
+            .iter()
+            .find(|b| b.used == 1 && b.port == port)
+            .map(|b| (b.state, b.conn_id))
+    }
+    pub const LISTENER_BINDING: u8 = LISTENER_BINDING;
+    pub const LISTENER_BOUND: u8 = LISTENER_BOUND;
+    pub const LISTENER_REFUSED: u8 = LISTENER_REFUSED;
+}
+
+// Host-test hooks for the proxy relay (rfc_workload_ingress §3). They
+// reach into a booted module's opaque `module_state` buffer so the
+// harness can program a dynamic route without a live store, seed the
+// client source address for the `X-Forwarded-For` assertion, and read
+// the `http.proxy.*` counters. No firmware symbol surface.
+#[cfg(feature = "host-test")]
+/// Program one live dynamic route (`key` + compact `value`) directly
+/// into a booted http module's arena, as if the table-consumer applied
+/// it. `state` is the harness `module_state` pointer.
+///
+/// # Safety
+/// `state` must point at a live `HttpState` (a booted http module's
+/// state buffer).
+pub unsafe fn test_inject_dyn_route(state: *mut u8, key: &[u8], value: &[u8]) {
+    let s = &mut *(state as *mut HttpState);
+    s.server.dyn_routes.upsert(key, value, false);
+}
+
+#[cfg(feature = "host-test")]
+/// Enable the dynamic-listener subsystem on a booted module (as if
+/// `listeners_prefix` were configured), so `pump_listeners` reconciles
+/// injected desired rows. `sink` is left resolved so the table_consumer
+/// never touches the store in a harness.
+///
+/// # Safety
+/// See [`test_inject_dyn_route`].
+pub unsafe fn test_enable_listeners(state: *mut u8) {
+    let s = &mut *(state as *mut HttpState);
+    s.server.listeners_prefix[0] = b'/';
+    s.server.listeners_prefix_len = 1;
+    s.server.listeners_sink = i32::MAX; // non-negative: skip re-resolve
+    s.server.ltc.subscribed = 1; // skip SUBSCRIBE/relist in the harness
+}
+
+#[cfg(feature = "host-test")]
+/// Program one desired listener row (`/dataplane/edge-listeners/<port>` +
+/// `proto=tcp;tls=<0|1>`) directly, as if the listener table_consumer
+/// applied it.
+///
+/// # Safety
+/// See [`test_inject_dyn_route`].
+pub unsafe fn test_inject_listener(state: *mut u8, key: &[u8], value: &[u8]) {
+    let s = &mut *(state as *mut HttpState);
+    s.server.listeners.upsert(key, value, false);
+}
+
+#[cfg(feature = "host-test")]
+/// Withdraw a desired listener row by key.
+///
+/// # Safety
+/// See [`test_inject_dyn_route`].
+pub unsafe fn test_remove_listener(state: *mut u8, key: &[u8]) {
+    let s = &mut *(state as *mut HttpState);
+    s.server.listeners.remove(key, false);
+}
+
+#[cfg(feature = "host-test")]
+/// `(state, conn_id)` of the runtime bind record for `port`, if tracked.
+///
+/// # Safety
+/// See [`test_inject_dyn_route`].
+pub unsafe fn test_listener_state(state: *mut u8, port: u16) -> Option<(u8, i16)> {
+    let s = &*(state as *mut HttpState);
+    s.server.listeners.test_bound_state(port)
+}
+
+/// Listener bind-state discriminants for harness assertions.
+#[cfg(feature = "host-test")]
+pub const LISTENER_STATE_BINDING: u8 = LISTENER_BINDING;
+#[cfg(feature = "host-test")]
+pub const LISTENER_STATE_BOUND: u8 = LISTENER_BOUND;
+#[cfg(feature = "host-test")]
+pub const LISTENER_STATE_REFUSED: u8 = LISTENER_REFUSED;
+
+#[cfg(feature = "host-test")]
+/// Seed the client source address (`X-Forwarded-For`) for the slot
+/// currently owning `conn_id`. No-op if no slot owns it yet.
+///
+/// # Safety
+/// See [`test_inject_dyn_route`].
+pub unsafe fn test_set_client_ip(state: *mut u8, conn_id: u8, ip: u32) {
+    let s = &mut *(state as *mut HttpState);
+    if let Some(idx) = find_slot_by_conn_id(s, conn_id) {
+        let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+        slot.client_ip = ip;
+    }
+}
+
+#[cfg(feature = "host-test")]
+/// `(http.proxy.retries, http.proxy.5xx)` cumulative counters.
+///
+/// # Safety
+/// See [`test_inject_dyn_route`].
+pub unsafe fn test_proxy_metrics(state: *mut u8) -> (u32, u32) {
+    let s = &*(state as *mut HttpState);
+    (s.server.proxy_retries, s.server.proxy_5xx)
+}
+
+/// Param setter for `routes_prefix` (TLV tag 90). An empty value
+/// leaves the feature off. Copies up to `MAX_DYN_PREFIX` bytes.
+///
+/// # Safety
+/// `d` points at `len` readable bytes (the TLV value).
+pub(crate) unsafe fn set_routes_prefix(s: &mut HttpState, d: *const u8, len: usize) {
+    let n = len.min(MAX_DYN_PREFIX);
+    let dst = s.server.routes_prefix.as_mut_ptr();
+    let mut i = 0;
+    while i < n {
+        *dst.add(i) = *d.add(i);
+        i += 1;
+    }
+    s.server.routes_prefix_len = n as u16;
+}
+
+/// Param setter for `listeners_prefix` (TLV tag 91). Empty leaves the
+/// dynamic-listener feature off (byte-identical server). Copies up to
+/// `MAX_DYN_PREFIX` bytes (rfc_workload_ingress §4.2).
+///
+/// # Safety
+/// `d` points at `len` readable bytes (the TLV value).
+pub(crate) unsafe fn set_listeners_prefix(s: &mut HttpState, d: *const u8, len: usize) {
+    let n = len.min(MAX_DYN_PREFIX);
+    let dst = s.server.listeners_prefix.as_mut_ptr();
+    let mut i = 0;
+    while i < n {
+        *dst.add(i) = *d.add(i);
+        i += 1;
+    }
+    s.server.listeners_prefix_len = n as u16;
+}
+
+/// Match a request `host`/`path` against the dynamic-route table: host
+/// must match exactly (byte-wise), then the longest path prefix wins
+/// (an empty route path matches any path). Returns the live index, or
+/// `-1` when none match. Consulted after the static arena (§3.2).
+pub fn match_dyn_route(dyn_routes: &DynRoutes, host: &[u8], path: &[u8]) -> i32 {
+    let mut best: i32 = -1;
+    let mut best_len: usize = 0;
+    for (i, r) in dyn_routes.live.iter().enumerate() {
+        if r.used != 1 || r.host() != host {
+            continue;
+        }
+        let rp = r.path();
+        let matches = rp.is_empty() || (path.len() >= rp.len() && &path[..rp.len()] == rp);
+        if matches && (best < 0 || rp.len() > best_len) {
+            best = i as i32;
+            best_len = rp.len();
+        }
+    }
+    best
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CacheEntry {
@@ -432,6 +1182,41 @@ pub(crate) struct ConnSlot {
     pub(crate) conn_parent_id: [u8; 8],
     /// W3C trace-flags from the connection's `MSG_TRACE_CTX`. Low bit = `sampled`.
     pub(crate) conn_flags: u8,
+
+    // ── Proxy relay state (rfc_workload_ingress §3) ────────────────
+    //
+    // A HANDLER_PROXY route (static `proxy_ip/port`) or a dynamic-route
+    // match dials an upstream backend and relays bytes both ways
+    // within this slot's existing `recv_buf` (client→backend) and
+    // `send_buf` (backend→client) windows — no extra arenas.
+    /// Upstream backend conn id latched from `MSG_CONNECTED`; `-1`
+    /// when no backend conn is dialed / open.
+    pub(crate) backend_conn_id: i16,
+    /// Dyn-route index driving this relay (`-1` = static proxy route
+    /// or none). Used to advance `rr_cursor` + reselect on failover.
+    pub(crate) proxy_dyn_idx: i16,
+    /// Selected backend address for the (re)dial.
+    pub(crate) proxy_be_ip: u32,
+    pub(crate) proxy_be_port: u16,
+    /// Client's source address for `X-Forwarded-For`. 0 (`0.0.0.0`)
+    /// when unknown — the net layer's `MSG_ACCEPTED` carries only
+    /// `[conn_id][local_port]`, not the peer address (P1 correction),
+    /// so this stays 0 in production until a peer-address surface
+    /// lands. The XFF injection path itself is real and exercised.
+    pub(crate) client_ip: u32,
+    /// Wall-clock ms the current dial started (connect timeout).
+    pub(crate) proxy_connect_start_ms: u32,
+    /// Connect attempts made so far (0 = first). Retry budget is 1.
+    pub(crate) proxy_attempt: u8,
+    /// 1 once demux latched `MSG_CONNECTED` for our pending dial.
+    pub(crate) proxy_connected: u8,
+    /// 1 once demux saw a connect `MSG_ERROR` for our pending dial.
+    pub(crate) proxy_connect_failed: u8,
+    /// 1 once the backend peer closed (`MSG_CLOSED` on `backend_conn_id`).
+    pub(crate) backend_closed: u8,
+    /// Read cursor into `recv_buf` for the client→backend body relay.
+    pub(crate) proxy_creq_off: u16,
+    _proxy_pad: [u8; 2],
 }
 
 impl ConnSlot {
@@ -454,6 +1239,10 @@ unsafe fn slot_init_zero(slot: &mut ConnSlot) {
     slot.matched_route = -1;
     slot.file_index = -1;
     slot.fs_fd = -1;
+    // Proxy relay sentinels — a zero-fill leaves these at 0, which is
+    // a *valid* conn id / route index, so they must be re-set to -1.
+    slot.backend_conn_id = -1;
+    slot.proxy_dyn_idx = -1;
 }
 
 /// Free a slot's heap allocations (recv_buf, send_buf, h2),
@@ -467,6 +1256,11 @@ unsafe fn slot_release_buffers(s: &mut HttpState, idx: usize) {
     // matches the right owner check.
     if s.server.file_chan_owner == idx as i16 {
         s.server.file_chan_owner = -1;
+    }
+    // Same for a serialised proxy connect owned by this slot — a slot
+    // freed mid-dial must not wedge the connect serialisation.
+    if s.server.proxy_connect_owner == idx as i16 {
+        s.server.proxy_connect_owner = -1;
     }
     // If this slot was the current fan-out winner, clear the
     // pointer so the next subscriber doesn't immediately self-close
@@ -671,7 +1465,66 @@ pub(crate) struct ServerState {
     /// tab must NOT auto-reconnect (the WS source built-in and the
     /// canonical runtime shell both have no reconnect logic).
     pub(crate) latest_fanout_slot: i32,
+
+    // ── Dynamic routes (rfc_dynamic_routes §3.2) ──────────────────
+    //
+    // Default-off: `routes_prefix_len == 0` means the whole subsystem
+    // is dormant and the server behaves byte-for-byte as before.
+    /// Store prefix the table_consumer subscribes to (e.g.
+    /// `/dataplane/edge/`). Empty (`routes_prefix_len == 0`) = feature
+    /// off.
+    pub(crate) routes_prefix: [u8; MAX_DYN_PREFIX],
+    pub(crate) routes_prefix_len: u16,
+    /// Change-sink channel (store SUBSCRIBE pushes here; self-edge
+    /// alloc, in[DYN_ROUTES_PORT_INDEX]). `-1` until resolved.
+    pub(crate) routes_sink: i32,
+    /// Subscription bookkeeping.
+    pub(crate) tc: TableConsumer,
+    /// The dynamic-route arena + rebuild shadow.
+    pub(crate) dyn_routes: DynRoutes,
+    /// Scratch for the `CHANGES` relist response.
+    pub(crate) routes_scratch: [u8; DYN_SCRATCH],
+
+    // ── Proxy relay bookkeeping (rfc_workload_ingress §3) ──────────
+    /// Slot index owning the in-flight proxy `CONNECT` handshake, or
+    /// `-1`. `MSG_CONNECTED`/`MSG_ERROR` carry only `[conn_id][tag]`
+    /// and the tag is the module index (identical across slots), so
+    /// the CONNECT→CONNECTED window is serialised — demux correlates
+    /// the reply to this owner. Mirrors `file_chan_owner`; the relay
+    /// itself (the long part) runs concurrently across slots.
+    pub(crate) proxy_connect_owner: i16,
+    _proxy_owner_pad: [u8; 2],
+    /// Cumulative failover retries (`http.proxy.retries`, §3). A reader
+    /// surfaces this via telemetry, never a store key (dynamic_routes §6).
+    pub(crate) proxy_retries: u32,
+    /// Cumulative relay 5xx responses (`http.proxy.5xx`, §3).
+    pub(crate) proxy_5xx: u32,
+
+    // ── Dynamic listeners (rfc_workload_ingress §4.2) ──────────────
+    //
+    // Default-off: `listeners_prefix_len == 0` leaves the whole
+    // mid-life-bind subsystem dormant and the server byte-identical.
+    /// Store prefix the listener table_consumer subscribes to (e.g.
+    /// `/dataplane/edge-listeners/`). Empty = feature off.
+    pub(crate) listeners_prefix: [u8; MAX_DYN_PREFIX],
+    pub(crate) listeners_prefix_len: u16,
+    /// Change-sink channel (self-edge alloc, in[DYN_LISTENERS_PORT_INDEX]).
+    /// `-1` until resolved.
+    pub(crate) listeners_sink: i32,
+    /// Listener-subscription bookkeeping (second table consumer).
+    pub(crate) ltc: TableConsumer,
+    /// Desired-listener table + reconciler bind records.
+    pub(crate) listeners: DynListeners,
 }
+
+/// Store-prefix buffer for `routes_prefix`.
+pub(crate) const MAX_DYN_PREFIX: usize = 64;
+/// `CHANGES` relist scratch. Holds the full snapshot for a cold-start /
+/// LOST rebuild; a snapshot larger than this fails closed (keeps the
+/// prior table) — sized to comfortably cover the arena's worst case.
+pub(crate) const DYN_SCRATCH: usize = 8192;
+/// Input port index carrying the self-edged change sink (in[4]).
+pub(crate) const DYN_ROUTES_PORT_INDEX: u8 = 4;
 
 /// Number of `u64` words needed to cover `MAX_CONCURRENT_CONNS`
 /// bits (rounded up). At MAX=1024 this is 16 words = 128 bytes.
@@ -1078,6 +1931,15 @@ pub(crate) unsafe fn init(s: &mut HttpState) {
     s.server.ws_out_chan = -1;
     s.server.ws_in_chan = -1;
     s.server.latest_fanout_slot = -1;
+    // Dynamic-route subscription: sink resolved lazily on first pump.
+    // The arena, shadow, and TableConsumer are zero-init (kernel
+    // zero-fills state) — equivalent to `DynRoutes::new()` /
+    // `TableConsumer::new()`.
+    s.server.routes_sink = -1;
+    // Dynamic-listener subscription: sink resolved lazily on first pump;
+    // the table, shadow, bind records, and TableConsumer are zero-init.
+    s.server.listeners_sink = -1;
+    s.server.proxy_connect_owner = -1;
     s.server.port = 80;
     if let Some(cur) = cur_slot_mut(s) {
         cur.fs_fd = -1;
@@ -1320,6 +2182,21 @@ unsafe fn reset_connection(s: &mut HttpState) {
             0,
         );
     }
+    // Proxy relay teardown: close the upstream backend conn (if any,
+    // and not already closed by the peer) and drop any serialised
+    // connect ownership this slot held.
+    let (backend, backend_closed) = match cur_slot(s) {
+        Some(c) => (c.backend_conn_id, c.backend_closed),
+        None => (-1, 0),
+    };
+    if backend >= 0 && backend_closed == 0 && s.net_out_chan >= 0 {
+        close_net_conn(s, backend as u8);
+    }
+    if let Some(idx) = current_slot_index(s) {
+        if s.server.proxy_connect_owner == idx as i16 {
+            s.server.proxy_connect_owner = -1;
+        }
+    }
     // Release the slot's heap buffers (recv_buf, send_buf) and zero
     // every per-conn field so the next `alloc_free_slot` call can
     // reuse the slot cleanly. The `is_free()` predicate now reads
@@ -1363,6 +2240,296 @@ unsafe fn close_net_conn(s: &mut HttpState, conn_id: u8) {
         buf,
         NET_BUF_SIZE,
     );
+}
+
+// ── Proxy relay (rfc_workload_ingress §3) ─────────────────────────────
+//
+// A `HANDLER_PROXY` static route (`proxy_ip/port`) or a dynamic-route
+// match dials an upstream backend and relays bytes both ways within the
+// slot's existing arenas: `recv_buf` is the client→backend window,
+// `send_buf` the backend→client window. No transformation, no extra
+// buffering; content-length and chunked bodies pass through as bytes.
+
+/// Wall-clock budget for a backend connect before failover / 502.
+const PROXY_CONNECT_TIMEOUT_MS: u32 = 10_000;
+
+/// Find the slot whose upstream `backend_conn_id` matches `conn`.
+unsafe fn find_slot_by_backend_conn(s: &HttpState, conn: u8) -> Option<usize> {
+    let needle = conn as i16;
+    for i in 0..MAX_CONCURRENT_CONNS {
+        let slot = &*s.server.slots.as_ptr().add(i);
+        if slot.backend_conn_id == needle {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// True while a slot is in a byte-relay phase (request already
+/// forwarded). Demux stages backend→client bytes into `send_buf` only
+/// in these phases.
+#[inline(always)]
+fn is_proxy_relay_phase(p: Phase) -> bool {
+    matches!(p, Phase::ProxyRelayHeaders | Phase::ProxyRelayBody)
+}
+
+/// Append a dotted-quad IPv4 (`a.b.c.d`) for a big-endian-packed u32.
+unsafe fn put_ipv4_decimal(dst: *mut u8, cap: usize, mut off: usize, ip: u32) -> usize {
+    let o = ip.to_be_bytes();
+    off = put_u32_decimal(dst, cap, off, o[0] as u32);
+    off = put_bytes(dst, cap, off, b".");
+    off = put_u32_decimal(dst, cap, off, o[1] as u32);
+    off = put_bytes(dst, cap, off, b".");
+    off = put_u32_decimal(dst, cap, off, o[2] as u32);
+    off = put_bytes(dst, cap, off, b".");
+    off = put_u32_decimal(dst, cap, off, o[3] as u32);
+    off
+}
+
+/// Dial the active slot's selected backend via the runtime
+/// `NET_CMD_CONNECT` primitive — the exact payload the client side
+/// uses (`[sock_type][ip:4][port:2][requester_tag]`), reused
+/// server-side. Returns `true` when the CONNECT frame was written.
+unsafe fn proxy_dial(s: &mut HttpState) -> bool {
+    if s.net_out_chan < 0 {
+        return false;
+    }
+    let (ip, port) = match cur_slot(s) {
+        Some(c) => (c.proxy_be_ip, c.proxy_be_port),
+        None => return false,
+    };
+    let sys = &*s.syscalls;
+    let chan = s.net_out_chan;
+    let buf = s.net_buf.as_mut_ptr();
+    let ip_bytes = ip.to_le_bytes();
+    let mut payload = [0u8; 8];
+    payload[0] = SOCK_TYPE_STREAM;
+    payload[1] = ip_bytes[0];
+    payload[2] = ip_bytes[1];
+    payload[3] = ip_bytes[2];
+    payload[4] = ip_bytes[3];
+    payload[5] = (port & 0xFF) as u8;
+    payload[6] = (port >> 8) as u8;
+    payload[7] = dev_requester_tag(sys);
+    let wrote = net_write_frame(
+        sys,
+        chan,
+        NET_CMD_CONNECT,
+        payload.as_ptr(),
+        8,
+        buf,
+        NET_BUF_SIZE,
+    );
+    wrote != 0
+}
+
+/// Enter the proxy relay for the active slot against a chosen backend.
+/// `dyn_idx` is the dynamic-route index (for failover reselection) or
+/// `-1` for a static `HANDLER_PROXY` route. Proxy responses are
+/// close-delimited in v1 (no response parsing / keep-alive).
+unsafe fn begin_proxy(s: &mut HttpState, ip: u32, port: u16, dyn_idx: i16) {
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.proxy_be_ip = ip;
+        cur.proxy_be_port = port;
+        cur.proxy_dyn_idx = dyn_idx;
+        cur.proxy_attempt = 0;
+        cur.backend_conn_id = -1;
+        cur.proxy_connected = 0;
+        cur.proxy_connect_failed = 0;
+        cur.backend_closed = 0;
+        cur.proxy_creq_off = 0;
+        cur.keepalive = 0; // v1 relay is close-delimited
+        cur.phase = Phase::ProxyConnect;
+    }
+}
+
+/// A backend connect failed (error or timeout): one retry against the
+/// next `ready=1` dynamic backend (advancing `rr_cursor`), else a
+/// terminal 502. Counts `http.proxy.retries` / `http.proxy.5xx`.
+unsafe fn proxy_connect_failed(s: &mut HttpState) {
+    if let Some(idx) = current_slot_index(s) {
+        if s.server.proxy_connect_owner == idx as i16 {
+            s.server.proxy_connect_owner = -1;
+        }
+    }
+    let (attempt, dyn_idx) = match cur_slot(s) {
+        Some(c) => (c.proxy_attempt, c.proxy_dyn_idx),
+        None => (2, -1),
+    };
+    if attempt == 0 && dyn_idx >= 0 && (dyn_idx as usize) < MAX_DYN_ROUTES {
+        let next = s.server.dyn_routes.live[dyn_idx as usize].select_backend();
+        if let Some((ip, port)) = next {
+            s.server.proxy_retries = s.server.proxy_retries.wrapping_add(1);
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.proxy_be_ip = ip;
+                cur.proxy_be_port = port;
+                cur.proxy_attempt = 1;
+                cur.backend_conn_id = -1;
+                cur.proxy_connected = 0;
+                cur.proxy_connect_failed = 0;
+                cur.phase = Phase::ProxyConnect;
+            }
+            return;
+        }
+    }
+    s.server.proxy_5xx = s.server.proxy_5xx.wrapping_add(1);
+    build_error(s, b"502 Bad Gateway", b"Backend unavailable\n");
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.phase = Phase::DrainSend;
+    }
+}
+
+/// Build the request head to forward to the backend into `send_buf`:
+/// the parsed request line + headers with an appended
+/// `X-Forwarded-For: <client-ip>` (net-new serialization — the relay
+/// owns it). The Host header passes through unchanged (v1). Any client
+/// body bytes already buffered after the head are compacted to the
+/// front of `recv_buf` for the client→backend relay.
+unsafe fn proxy_build_forward_head(s: &mut HttpState) {
+    let (heo, recv_len, client_ip) = match cur_slot(s) {
+        Some(c) => (c.header_end_off as usize, c.recv_len as usize, c.client_ip),
+        None => return,
+    };
+    let recv = cur_recv_buf_ptr(s);
+    let send = cur_send_buf_mut_ptr(s);
+    if recv.is_null() || send.is_null() || heo < 4 {
+        return;
+    }
+    // Keep everything up to (but not including) the terminating blank
+    // line, so XFF splices in as the final header.
+    let head_body = heo - 2;
+    let mut off = 0usize;
+    off = put_bytes(
+        send,
+        SEND_BUF_SIZE,
+        off,
+        core::slice::from_raw_parts(recv, head_body),
+    );
+    off = put_bytes(send, SEND_BUF_SIZE, off, b"X-Forwarded-For: ");
+    off = put_ipv4_decimal(send, SEND_BUF_SIZE, off, client_ip);
+    off = put_bytes(send, SEND_BUF_SIZE, off, b"\r\n\r\n");
+    let leftover = recv_len.saturating_sub(heo);
+    if leftover > 0 {
+        let rbuf = cur_recv_buf_mut_ptr(s);
+        core::ptr::copy(rbuf.add(heo), rbuf, leftover);
+    }
+    if let Some(cur) = cur_slot_mut(s) {
+        cur.recv_len = leftover as u16;
+        cur.proxy_creq_off = 0;
+        cur.send_offset = 0;
+        cur.send_len = off as u16;
+    }
+}
+
+/// One bidirectional relay tick: drain buffered client bytes to the
+/// backend (`recv_buf`) and buffered backend bytes to the client
+/// (`send_buf`). Tears the slot down once the backend has closed and
+/// its last bytes have flushed to the client.
+unsafe fn proxy_relay_step(s: &mut HttpState) {
+    let (backend, client, recv_len, creq_off, send_len, send_off) = match cur_slot(s) {
+        Some(c) => (
+            c.backend_conn_id,
+            c.conn_id,
+            c.recv_len,
+            c.proxy_creq_off,
+            c.send_len,
+            c.send_offset,
+        ),
+        None => return,
+    };
+    // client → backend
+    if backend >= 0 && recv_len > creq_off {
+        let remaining = (recv_len - creq_off) as usize;
+        let sent = net_send_conn(
+            s,
+            backend as u8,
+            cur_recv_buf_ptr(s).add(creq_off as usize),
+            remaining,
+        );
+        if sent > 0 {
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.proxy_creq_off += sent as u16;
+                if cur.proxy_creq_off >= cur.recv_len {
+                    cur.recv_len = 0;
+                    cur.proxy_creq_off = 0;
+                }
+            }
+        }
+    }
+    // backend → client
+    if send_len > send_off {
+        let remaining = (send_len - send_off) as usize;
+        let sent = net_send_conn(
+            s,
+            client as u8,
+            cur_send_buf_ptr(s).add(send_off as usize),
+            remaining,
+        );
+        if sent > 0 {
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.send_offset += sent as u16;
+                if cur.send_offset >= cur.send_len {
+                    cur.send_len = 0;
+                    cur.send_offset = 0;
+                }
+            }
+        }
+    }
+    // Teardown: backend closed + its bytes fully flushed → close the
+    // client (`edge_anchored`: no session migration, §5).
+    let (backend_closed, send_len2, send_off2) = match cur_slot(s) {
+        Some(c) => (c.backend_closed, c.send_len, c.send_offset),
+        None => return,
+    };
+    if backend_closed != 0 && send_len2 == send_off2 {
+        if let Some(cur) = cur_slot_mut(s) {
+            cur.phase = Phase::CloseConn;
+        }
+    }
+}
+
+/// Consult the dynamic-route table for a proxy match on the active
+/// slot's Host + path (§5: host exact, then longest path-prefix, then
+/// readiness-gated backend selection). Returns `true` when it took
+/// over dispatch (started a relay or emitted a 502); `false` when no
+/// dynamic route matched (caller falls back to its fixed surface).
+unsafe fn try_begin_dyn_proxy(s: &mut HttpState) -> bool {
+    let (heo, rp_ptr, rp_len, recv_ptr) = match cur_slot(s) {
+        Some(c) => (
+            c.header_end_off as usize,
+            c.req_path.as_ptr(),
+            c.req_path_len as usize,
+            c.recv_buf as *const u8,
+        ),
+        None => return false,
+    };
+    if recv_ptr.is_null() || heo == 0 {
+        return false;
+    }
+    let host = match ws::find_header_value(recv_ptr, heo, b"Host") {
+        Some((o, n)) => core::slice::from_raw_parts(recv_ptr.add(o), n),
+        None => &[],
+    };
+    let path = core::slice::from_raw_parts(rp_ptr, rp_len);
+    let di = match_dyn_route(&s.server.dyn_routes, host, path);
+    if di < 0 {
+        return false;
+    }
+    match s.server.dyn_routes.live[di as usize].select_backend() {
+        Some((ip, port)) => {
+            begin_proxy(s, ip, port, di as i16);
+            true
+        }
+        None => {
+            // Matched a route but no `ready=1` backend (§5 readiness gate).
+            s.server.proxy_5xx = s.server.proxy_5xx.wrapping_add(1);
+            build_error(s, b"502 Bad Gateway", b"No ready backend\n");
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.phase = Phase::DrainSend;
+            }
+            true
+        }
+    }
 }
 
 pub(crate) unsafe fn match_route(s: &HttpState) -> i8 {
@@ -3004,6 +4171,16 @@ unsafe fn ws_process_inbound(s: &mut HttpState) -> bool {
 /// CMD_SEND frame. Returns the number of payload bytes actually
 /// accepted (0 if the channel is full).
 unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
+    let conn_id = cur_conn_id(s);
+    net_send_conn(s, conn_id, data, len)
+}
+
+/// Like [`net_send`] but targets an explicit `conn_id` rather than the
+/// active slot's client conn. The proxy relay uses it to write to the
+/// backend conn (`backend_conn_id`) while the same slot's client conn
+/// stays the `cur_conn_id` target. Byte-identical framing / sizing to
+/// `net_send`; the only difference is which conn the bytes address.
+unsafe fn net_send_conn(s: &mut HttpState, conn_id: u8, data: *const u8, len: usize) -> i32 {
     if s.net_out_chan < 0 {
         return 0;
     }
@@ -3035,7 +4212,6 @@ unsafe fn net_send(s: &mut HttpState, data: *const u8, len: usize) -> i32 {
 
     let sys = &*s.syscalls;
     let chan = s.net_out_chan;
-    let conn_id = cur_conn_id(s);
     let scratch = s.net_buf.as_mut_ptr();
     let payload_len = 1 + to_send;
     *scratch = NET_CMD_SEND;
@@ -3508,6 +4684,22 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 // has nowhere to go, but we still have to consume
                 // to make room on the channel. Falls through to
                 // the consume-and-discard path below.
+            } else if let Some(idx) = find_slot_by_backend_conn(s, conn) {
+                // Backend→client bytes for a proxy relay. Stage them
+                // into the slot's `send_buf`, but only once the request
+                // has been forwarded (relay phase). Before that, or
+                // when `send_buf` is full, leave the frame on the
+                // channel so TCP backpressure applies to the backend.
+                let slot = &*s.server.slots.as_ptr().add(idx);
+                if !is_proxy_relay_phase(slot.phase) {
+                    return;
+                }
+                if !slot.send_buf.is_null() {
+                    let space = slot.send_cap as usize - slot.send_len as usize;
+                    if data_len > space {
+                        return;
+                    }
+                }
             }
             // Unknown conn (no matching slot): same consume-and-
             // discard fallthrough — the IP module shouldn't send
@@ -3529,7 +4721,7 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                 let ours = payload_len < 3 || {
                     let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
                     let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
-                    ((lo as u16) | ((hi as u16) << 8)) == s.server.port
+                    is_listen_port(s, (lo as u16) | ((hi as u16) << 8))
                 };
                 if ours {
                     if let Some(idx) = alloc_free_slot(s, conn) {
@@ -3542,6 +4734,34 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                         // until per-conn timeout, exhausting MAX_TCP_CONNS).
                         close_net_conn(s, conn);
                     }
+                }
+            }
+            // A dynamic listener's mid-life bind completed (§4.2). Post-
+            // `bound`, a MSG_BOUND is only ever a pooled-listener bind (the
+            // static bind is consumed pre-`bound` by slot 0's WaitBound).
+            // Payload `[conn_id:1][port:2 LE]`.
+            NET_MSG_BOUND if payload_len >= 3 => {
+                let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR) as i16;
+                let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 2);
+                let port = (lo as u16) | ((hi as u16) << 8);
+                if let Some(bi) = s.server.listeners.bound_slot_for(port) {
+                    let b = &mut s.server.listeners.bound[bi];
+                    b.state = LISTENER_BOUND;
+                    b.conn_id = conn;
+                }
+            }
+            // A mid-life bind was refused — the port is outside the edge
+            // owner's lease pool (rfc_endpoint_lease.md §5.3). linux_net
+            // frames it `[port:2 LE][errno:1]`. Acted on ONLY with the
+            // feature configured, so the metal `ip` module's 0x07
+            // (RETRANSMIT) is never misread on the byte-identical path.
+            NET_MSG_BIND_REFUSED if s.server.listeners_prefix_len != 0 && payload_len >= 2 => {
+                let lo = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                let hi = *s.net_buf.as_ptr().add(NET_FRAME_HDR + 1);
+                let port = (lo as u16) | ((hi as u16) << 8);
+                if let Some(bi) = s.server.listeners.bound_slot_for(port) {
+                    s.server.listeners.bound[bi].state = LISTENER_REFUSED;
                 }
             }
             NET_MSG_DATA if payload_len > 1 => {
@@ -3565,15 +4785,60 @@ unsafe fn demux_inbound(s: &mut HttpState) {
                         slot.recv_len += to_copy as u16;
                         s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(to_copy as u32);
                     }
+                } else if let Some(idx) = find_slot_by_backend_conn(s, conn) {
+                    // Proxy backend→client: stage into `send_buf` for
+                    // the relay step to flush. Gated on the relay phase
+                    // (the peek above already backpressured otherwise).
+                    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                    if !slot.send_buf.is_null() && is_proxy_relay_phase(slot.phase) {
+                        let space = slot.send_cap as usize - slot.send_len as usize;
+                        let to_copy = data_len.min(space);
+                        if to_copy > 0 {
+                            let dst = slot.send_buf.add(slot.send_len as usize);
+                            core::ptr::copy_nonoverlapping(data_ptr, dst, to_copy);
+                            slot.send_len += to_copy as u16;
+                            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(to_copy as u32);
+                        }
+                    }
                 }
                 // Else: orphan — slot already closed; drop the data.
             }
+            NET_MSG_CONNECTED if payload_len >= 1 => {
+                // Reply to a serialised proxy dial. `MSG_CONNECTED`
+                // carries `[conn_id][tag]` and the tag is our module
+                // index (identical across slots), so the pending
+                // `proxy_connect_owner` is the correlator. The owner's
+                // `ProxyWaitConnect` handler releases the ownership
+                // once it forwards the request.
+                let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
+                let owner = s.server.proxy_connect_owner;
+                if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
+                    let slot = &mut *s.server.slots.as_mut_ptr().add(owner as usize);
+                    slot.backend_conn_id = conn as i16;
+                    slot.proxy_connected = 1;
+                }
+            }
+            NET_MSG_ERROR if payload_len >= 1 => {
+                // Post-bind, an ERROR is a backend connect failure for
+                // the serialised proxy dial (pre-bind errors are
+                // consumed by slot 0's `WaitBound` handler, before the
+                // demux runs).
+                let owner = s.server.proxy_connect_owner;
+                if owner >= 0 && (owner as usize) < MAX_CONCURRENT_CONNS {
+                    let slot = &mut *s.server.slots.as_mut_ptr().add(owner as usize);
+                    slot.proxy_connect_failed = 1;
+                }
+            }
             NET_MSG_CLOSED if payload_len >= 1 => {
                 let conn = *s.net_buf.as_ptr().add(NET_FRAME_HDR);
-                let mapped = find_slot_by_conn_id(s, conn);
-                if let Some(idx) = mapped {
+                if let Some(idx) = find_slot_by_conn_id(s, conn) {
                     let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
                     slot.peer_closed = 1;
+                } else if let Some(idx) = find_slot_by_backend_conn(s, conn) {
+                    // Upstream backend closed — the relay flushes any
+                    // staged bytes to the client, then tears down.
+                    let slot = &mut *s.server.slots.as_mut_ptr().add(idx);
+                    slot.backend_closed = 1;
                 }
                 // Else: nothing to clean up.
             }
@@ -3595,8 +4860,191 @@ unsafe fn demux_inbound(s: &mut HttpState) {
 /// Iteration starts at `step_cursor` and walks the bitmap forward
 /// (wrapping at the end). Each tick advances the cursor by one
 /// slot so no single conn can starve others on consecutive ticks.
+/// Pump the dynamic-route table consumer one step: resolve the sink on
+/// first use, then run the subscribe / apply / shadow-relist state
+/// machine against `routes_prefix`. No-op when the feature is off
+/// (`routes_prefix_len == 0`), keeping the server byte-identical.
+pub(crate) unsafe fn pump_dyn_routes(s: &mut HttpState) {
+    let prefix_len = s.server.routes_prefix_len as usize;
+    if prefix_len == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    if s.server.routes_sink < 0 {
+        s.server.routes_sink = dev_channel_port(sys, 0, DYN_ROUTES_PORT_INDEX);
+        if s.server.routes_sink < 0 {
+            return; // port unwired — nothing to subscribe against
+        }
+    }
+    let sink = s.server.routes_sink;
+    // Disjoint field borrows of `s.server`.
+    let prefix = &s.server.routes_prefix[..prefix_len];
+    let scratch = &mut s.server.routes_scratch;
+    let tc = &mut s.server.tc;
+    let dyn_routes = &mut s.server.dyn_routes;
+    tc.step(sys, sink, prefix, scratch, dyn_routes);
+}
+
+/// Pump the dynamic-listener table consumer one step, then reconcile the
+/// desired listener set against the runtime bind records: bind newly
+/// desired ports mid-life (`CMD_BIND`), tear down withdrawn ones
+/// (`CMD_CLOSE`). No-op when the feature is off (`listeners_prefix_len ==
+/// 0`), keeping the server byte-identical (rfc_workload_ingress §4.2).
+///
+/// The mid-life bind is issued only once the static listener is bound
+/// (`bound == 1`): the shared `net_out` / `net_in` pair carries the init
+/// bind first, and its `MSG_BOUND`/`MSG_BIND_REFUSED` for a dynamic port
+/// then arrives through `demux_inbound` (which runs post-`bound`).
+pub(crate) unsafe fn pump_listeners(s: &mut HttpState) {
+    let prefix_len = s.server.listeners_prefix_len as usize;
+    if prefix_len == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    if s.server.listeners_sink < 0 {
+        s.server.listeners_sink = dev_channel_port(sys, 0, DYN_LISTENERS_PORT_INDEX);
+        if s.server.listeners_sink < 0 {
+            return; // port unwired — nothing to subscribe against
+        }
+    }
+    let sink = s.server.listeners_sink;
+    // Disjoint field borrows of `s.server`. The listener CHANGES relist
+    // reuses `routes_scratch` — the two pumps run sequentially, never
+    // mid-relist of the other, so the transient buffer is free to share.
+    let prefix = &s.server.listeners_prefix[..prefix_len];
+    let scratch = &mut s.server.routes_scratch;
+    let ltc = &mut s.server.ltc;
+    let listeners = &mut s.server.listeners;
+    ltc.step(sys, sink, prefix, scratch, listeners);
+
+    // Reconcile only after the static bind: the mid-life CMD_BIND rides
+    // the same net_out, and its reply comes back through the demux.
+    if s.server.bound != 0 {
+        reconcile_listeners(s);
+    }
+}
+
+/// Diff the desired listener set against the runtime bind records and act:
+/// issue `CMD_BIND` for a newly desired `tls=0` port, `CMD_CLOSE` the
+/// linux_net listener conn for a withdrawn one. Idempotent — a port
+/// already tracked (any bind state) is left alone; the lease gate refuses
+/// an unleased port and the refusal surfaces as `MSG_BIND_REFUSED` in the
+/// demux (which flips the record to `LISTENER_REFUSED`, never retried).
+unsafe fn reconcile_listeners(s: &mut HttpState) {
+    // 1. Bind newly-desired ports. Skip `tls=1` (P3 scope: cleartext).
+    for li in 0..MAX_DYN_LISTENERS {
+        let (port, tls, used) = {
+            let r = &s.server.listeners.live[li];
+            (r.port, r.tls, r.used)
+        };
+        if used != 1 || port == 0 || tls != 0 {
+            continue;
+        }
+        if port == s.server.port {
+            continue; // the static listener already owns this port
+        }
+        if s.server.listeners.bound_slot_for(port).is_some() {
+            continue; // already tracked (binding / bound / refused)
+        }
+        // Claim a free bind record.
+        let Some(bi) = s.server.listeners.bound.iter().position(|b| b.used == 0) else {
+            s.server.listeners.dropped = s.server.listeners.dropped.wrapping_add(1);
+            continue;
+        };
+        s.server.listeners.bound[bi] = BoundListener {
+            port,
+            state: LISTENER_BINDING,
+            used: 1,
+            conn_id: -1,
+        };
+        if !listener_send_bind(s, port) {
+            // net_out full — roll back so a later tick retries.
+            s.server.listeners.bound[bi] = BoundListener::new();
+        }
+    }
+
+    // 2. Tear down withdrawn ports: a bind record with no live desired row.
+    for bi in 0..MAX_DYN_LISTENERS {
+        let (port, state, conn_id, used) = {
+            let b = &s.server.listeners.bound[bi];
+            (b.port, b.state, b.conn_id, b.used)
+        };
+        if used != 1 {
+            continue;
+        }
+        let still_desired = s
+            .server
+            .listeners
+            .live
+            .iter()
+            .any(|r| r.used == 1 && r.port == port && r.tls == 0);
+        if still_desired {
+            continue;
+        }
+        if state == LISTENER_BOUND && conn_id >= 0 {
+            close_net_conn(s, conn_id as u8);
+        }
+        s.server.listeners.bound[bi] = BoundListener::new();
+    }
+}
+
+/// Fill a `NET_CMD_BIND` payload for `port`, optionally owner-stamped for a
+/// metal `net=own` workload (`rfc_workload_backend_metal.md` §3.4 / P3a). The
+/// base payload is `[port:u16 LE]` (host/wildcard, byte-identical to pre-P3a);
+/// when this http instance belongs to a workload owner (`dev_owner_tag != 0`,
+/// stamped by `apply_add`'s `set_module_owner` post-alloc) it appends
+/// `[owner_tag:u16 LE]`, which the ip module's P2 admission resolves to the
+/// workload's owned address (a wrong/unowned tag is refused EACCES). A
+/// host-owned (base-graph) http reads owner slot 0 and appends nothing.
+/// Returns the payload length (2 or 4).
+#[inline]
+unsafe fn fill_bind_payload(sys: &SyscallTable, port: u16, out: &mut [u8; 4]) -> usize {
+    out[0] = (port & 0xFF) as u8;
+    out[1] = (port >> 8) as u8;
+    let owner_tag = dev_owner_tag(sys);
+    if owner_tag != 0 {
+        out[2] = (owner_tag & 0xFF) as u8;
+        out[3] = (owner_tag >> 8) as u8;
+        4
+    } else {
+        2
+    }
+}
+
+/// Issue a mid-life `CMD_BIND [port:u16 LE]` on `net_out` for a pooled
+/// listener. Returns false when the channel is unwired or full.
+unsafe fn listener_send_bind(s: &mut HttpState, port: u16) -> bool {
+    if s.net_out_chan < 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let chan = s.net_out_chan;
+    let buf = s.net_buf.as_mut_ptr();
+    let mut payload = [0u8; 4];
+    let plen = fill_bind_payload(sys, port, &mut payload);
+    net_write_frame(
+        sys,
+        chan,
+        NET_CMD_BIND,
+        payload.as_ptr(),
+        plen,
+        buf,
+        NET_BUF_SIZE,
+    ) != 0
+}
+
+/// True when `port` is one of the anchor's live listen ports: the single
+/// static listener, or a bound dynamic listener. Used by the accept demux
+/// to claim only accepts on a port this anchor owns.
+#[inline]
+unsafe fn is_listen_port(s: &HttpState, port: u16) -> bool {
+    port == s.server.port || s.server.listeners.port_is_bound(port)
+}
+
 pub(crate) unsafe fn step(s: &mut HttpState) -> i32 {
     demux_inbound(s);
+    pump_dyn_routes(s);
+    pump_listeners(s);
 
     // Graceful-drain check, run before any per-slot work. Drain is
     // complete once `module_drain` has set the flag, the listener
@@ -3696,7 +5144,12 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             | Phase::CacheStream
             | Phase::WsHandshake
             | Phase::WsClose
-            | Phase::AwaitFsStat => {
+            | Phase::AwaitFsStat
+            | Phase::ProxyConnect
+            | Phase::ProxyWaitConnect
+            | Phase::ProxySendRequest
+            | Phase::ProxyRelayHeaders
+            | Phase::ProxyRelayBody => {
                 if cur_fs_fd(s) >= 0 {
                     ((*s.syscalls).provider_call)(
                         cur_fs_fd(s),
@@ -3724,15 +5177,14 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             let sys = &*s.syscalls;
             let chan = s.net_out_chan;
             let buf = s.net_buf.as_mut_ptr();
-            let mut payload = [0u8; 2];
-            payload[0] = (s.server.port & 0xFF) as u8;
-            payload[1] = (s.server.port >> 8) as u8;
+            let mut payload = [0u8; 4];
+            let plen = fill_bind_payload(sys, s.server.port, &mut payload);
             let wrote = net_write_frame(
                 sys,
                 chan,
                 NET_CMD_BIND,
                 payload.as_ptr(),
-                2,
+                plen,
                 buf,
                 NET_BUF_SIZE,
             );
@@ -4143,6 +5595,12 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
 
             let ri = match_route(s);
             if ri < 0 {
+                // No static route — consult the dynamic-route proxy
+                // table (§3.2: after the static arena). An empty table
+                // falls through to the fixed 404 surface (§7).
+                if try_begin_dyn_proxy(s) {
+                    return 2;
+                }
                 build_error(s, b"404 Not Found", b"Not Found\n");
                 if let Some(cur) = cur_slot_mut(s) {
                     cur.phase = Phase::DrainSend;
@@ -4788,9 +6246,21 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
                     }
                 }
                 HANDLER_PROXY => {
-                    build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
-                    if let Some(cur) = cur_slot_mut(s) {
-                        cur.phase = Phase::DrainSend;
+                    // Build-time static proxy backend (`proxy_ip/port`).
+                    // The dynamic-route path is handled before dispatch
+                    // (no static route matched → `try_begin_dyn_proxy`).
+                    let (ip, port) = {
+                        let r = &*s.server.routes.as_ptr().add(ri as usize);
+                        (r.proxy_ip, r.proxy_port)
+                    };
+                    if ip == 0 || port == 0 {
+                        s.server.proxy_5xx = s.server.proxy_5xx.wrapping_add(1);
+                        build_error(s, b"502 Bad Gateway", b"No proxy backend\n");
+                        if let Some(cur) = cur_slot_mut(s) {
+                            cur.phase = Phase::DrainSend;
+                        }
+                    } else {
+                        begin_proxy(s, ip, port, -1);
                     }
                 }
                 HANDLER_WEBSOCKET | HANDLER_WEBSOCKET_FANOUT | HANDLER_WEBSOCKET_SESSION => {
@@ -5291,15 +6761,96 @@ unsafe fn step_active_slot(s: &mut HttpState) -> i32 {
             }
         }
 
-        Phase::ProxyConnect
-        | Phase::ProxyWaitConnect
-        | Phase::ProxySendRequest
-        | Phase::ProxyRelayHeaders
-        | Phase::ProxyRelayBody => {
-            build_error(s, b"502 Bad Gateway", b"Proxy not implemented\n");
-            if let Some(cur) = cur_slot_mut(s) {
-                cur.phase = Phase::DrainSend;
+        Phase::ProxyConnect => {
+            // Serialise the CONNECT→CONNECTED handshake so demux can
+            // correlate the reply (it carries only conn + module tag).
+            let me = match current_slot_index(s) {
+                Some(i) => i as i16,
+                None => return 0,
+            };
+            if s.server.proxy_connect_owner >= 0 && s.server.proxy_connect_owner != me {
+                return 0; // another slot mid-connect — retry next tick
             }
+            s.server.proxy_connect_owner = me;
+            if !proxy_dial(s) {
+                return 0; // net_out full — retry next tick, keep ownership
+            }
+            let now = dev_millis(&*s.syscalls) as u32;
+            if let Some(cur) = cur_slot_mut(s) {
+                cur.proxy_connect_start_ms = now;
+                cur.phase = Phase::ProxyWaitConnect;
+            }
+            return 2;
+        }
+
+        Phase::ProxyWaitConnect => {
+            let (connected, failed, start) = match cur_slot(s) {
+                Some(c) => (
+                    c.proxy_connected != 0,
+                    c.proxy_connect_failed != 0,
+                    c.proxy_connect_start_ms,
+                ),
+                None => return 0,
+            };
+            if failed {
+                proxy_connect_failed(s);
+                return 2;
+            }
+            if connected {
+                if let Some(idx) = current_slot_index(s) {
+                    if s.server.proxy_connect_owner == idx as i16 {
+                        s.server.proxy_connect_owner = -1;
+                    }
+                }
+                proxy_build_forward_head(s);
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.phase = Phase::ProxySendRequest;
+                }
+                return 2;
+            }
+            let now = dev_millis(&*s.syscalls) as u32;
+            if now.wrapping_sub(start) >= PROXY_CONNECT_TIMEOUT_MS {
+                proxy_connect_failed(s);
+                return 2;
+            }
+            return 0;
+        }
+
+        Phase::ProxySendRequest => {
+            let backend = match cur_slot(s) {
+                Some(c) => c.backend_conn_id,
+                None => return 0,
+            };
+            if backend < 0 {
+                proxy_connect_failed(s);
+                return 2;
+            }
+            let remaining = (cur_send_len(s) - cur_send_offset(s)) as usize;
+            if remaining == 0 {
+                // Head fully forwarded — enter the byte relay and free
+                // `send_buf` so demux can stage backend→client bytes.
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset = 0;
+                    cur.send_len = 0;
+                    cur.phase = Phase::ProxyRelayBody;
+                }
+                return 2;
+            }
+            let sent = net_send_conn(
+                s,
+                backend as u8,
+                cur_send_buf_ptr(s).add(cur_send_offset(s) as usize),
+                remaining,
+            );
+            if sent > 0 {
+                if let Some(cur) = cur_slot_mut(s) {
+                    cur.send_offset += sent as u16;
+                }
+            }
+        }
+
+        Phase::ProxyRelayHeaders | Phase::ProxyRelayBody => {
+            proxy_relay_step(s);
         }
 
         Phase::WsHandshake => {

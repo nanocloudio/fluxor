@@ -3,11 +3,11 @@ hardware_targets = ["bcm2712"]
 permissions = ["platform_raw"]
 
 # System-graph driver for the owner-pause silicon AC
-# (rfc_workload_lifecycle.md §3.2 P4): issues OWNER_PAUSE (0x0C72) /
-# OWNER_RESUME (0x0C73) against a resident pod's owner handle on a
+# (rfc_workload_lifecycle.md §3.2 P4): issues OWNER_PAUSE (0x0C49) /
+# OWNER_RESUME (0x0C4A) against a resident pod's owner handle on a
 # wall-clock schedule and logs `[pdrv] pause/resume ms=<t> rc=<rc>`,
 # plus a `[pdrv] hb` heartbeat proving the system graph keeps stepping
-# through the pod's pause window. The ops sit in the 0x0C7x
+# through the pod's pause window. The ops sit in the 0x0C47..=0x0C4A
 # live-mutation block (PLATFORM_RAW permission category, like
 # APPLY_ADD/FREE_OWNER).
 

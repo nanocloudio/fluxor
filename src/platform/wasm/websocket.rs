@@ -21,7 +21,9 @@
 //!     direction makes progress; this is the normal
 //!     connection-pending state.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Open a WebSocket to `url_ptr[..url_len]` (URL is a UTF-8 string

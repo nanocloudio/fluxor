@@ -464,9 +464,12 @@ fn merge_with_board_defaults(
     if user_overrides_phy
         && !user_fields
             .as_object()
-            .is_some_and(|o| o.contains_key("driver"))
+            .is_some_and(|o| o.contains_key("driver") || o.contains_key("nic"))
     {
         merged.remove("driver");
+        // Net boards declare the NIC as a hardware fact (`nic`), not a driver
+        // name — same clearing rule (facts are phy-specific too).
+        merged.remove("nic");
     }
 
     // Inject target metadata AUTHORITATIVELY. `board` / `family` / `silicon` are

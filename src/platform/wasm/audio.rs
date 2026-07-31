@@ -9,7 +9,9 @@
 //! State: heap-allocated; the `BuiltInModule` 64-byte inline state
 //! holds a `*mut AudioState` pointer.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Play a block of signed-16-bit PCM. `ptr`/`len` is in the

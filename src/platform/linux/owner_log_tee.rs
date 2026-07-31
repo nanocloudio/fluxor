@@ -62,11 +62,11 @@ impl log::Log for TeeLogger {
         // log record and the rollout it ran under. A plain static read on the
         // scheduler thread (we are on it: the SCHED_TID gate above), safe even
         // before HAL init; 0 until the first plan applies.
-        let plan_generation = fluxor::kernel::owner_plan::last_applied_generation();
+        let plan_generation = fluxor::kernel::workload::owner_plan::last_applied_generation();
         // `module` is left empty: the message text already carries the module's
         // own "[name] …" convention, and the graph module name is populated from
         // the module-scoped logger (never by parsing), per §4.2.
-        fluxor::kernel::owner_log::push_on_slot(
+        fluxor::kernel::workload::owner_log::push_on_slot(
             slot as usize,
             uid,
             generation,
@@ -129,8 +129,8 @@ fn enable_owner_log_attribution() {
 /// its owner `(uid, slot, generation)`, or owner 0 (system) when the current
 /// module is system-owned. Valid only on the scheduler thread.
 fn on_step_attribution() -> ([u8; 16], u16, u32) {
-    let idx = fluxor::kernel::scheduler::current_module_index();
-    fluxor::kernel::scheduler::module_owner_attribution(idx).unwrap_or_default()
+    let idx = fluxor::kernel::exec::scheduler::current_module_index();
+    fluxor::kernel::exec::scheduler::module_owner_attribution(idx).unwrap_or_default()
 }
 
 fn now_unix_ms() -> u64 {
@@ -152,16 +152,16 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
     // tenant's flushed ones and skip the new ring file entirely (a low-volume
     // module might never get its file). Main-thread-only, so a plain static is
     // safe.
-    static mut LAST_FLUSHED: [([u8; 16], u32, u64); fluxor::kernel::owner::MAX_OWNERS] =
-        [([0u8; 16], 0u32, 0u64); fluxor::kernel::owner::MAX_OWNERS];
+    static mut LAST_FLUSHED: [([u8; 16], u32, u64); fluxor::kernel::workload::owner::MAX_OWNERS] =
+        [([0u8; 16], 0u32, 0u64); fluxor::kernel::workload::owner::MAX_OWNERS];
 
     let mut created_dir = false;
-    for slot in 0..fluxor::kernel::owner::MAX_OWNERS {
-        let next = fluxor::kernel::owner_log::next_seq(slot);
+    for slot in 0..fluxor::kernel::workload::owner::MAX_OWNERS {
+        let next = fluxor::kernel::workload::owner_log::next_seq(slot);
         if next == 0 {
             continue; // never written
         }
-        let (uid, generation) = fluxor::kernel::owner_log::installed_identity(slot);
+        let (uid, generation) = fluxor::kernel::workload::owner_log::installed_identity(slot);
         // SAFETY: scheduler-thread-only access to the flush high-water table.
         let already_flushed = unsafe {
             let hw = &raw const LAST_FLUSHED;
@@ -171,7 +171,7 @@ fn flush_owner_rings(logs_dir: &std::path::Path) {
             continue; // nothing new since last flush
         }
 
-        let Some((header, buffer)) = fluxor::kernel::owner_log::snapshot_slot_bytes(slot) else {
+        let Some((header, buffer)) = fluxor::kernel::workload::owner_log::snapshot_slot_bytes(slot) else {
             continue;
         };
 

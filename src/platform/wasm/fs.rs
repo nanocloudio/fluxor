@@ -43,10 +43,10 @@
 //! FS_CLOSE calls `host_fetch_close`, cancelling any in-flight body
 //! reader and dropping the host-side handle entry.
 
-use crate::abi::contracts::fence as dev_fence;
 use crate::abi::contracts::storage::fs as dev_fs;
-use crate::kernel::errno;
-use crate::kernel::fd::{slot_of, tag_fd, FD_TAG_FS};
+use crate::abi::fence as dev_fence;
+use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_FS};
+use crate::kernel::sys::errno;
 
 const MAX_OPEN_FILES: usize = 16;
 
@@ -103,8 +103,8 @@ extern "C" {
 /// `requires_contract = "fs"` can dispatch FS_OPEN/READ/CLOSE through
 /// `provider_call` without further wiring.
 pub fn register() {
-    use crate::kernel::provider;
-    use crate::kernel::provider::contract as dev_class;
+    use crate::kernel::module::provider;
+    use crate::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::FS, wasm_fs_dispatch);
 }
 

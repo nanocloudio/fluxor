@@ -97,7 +97,7 @@ pub fn dispatch(opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     unsafe {
         match DISPATCH {
             Some(f) => f(STATE, opcode, arg, arg_len),
-            None => crate::kernel::errno::ENOSYS,
+            None => crate::kernel::sys::errno::ENOSYS,
         }
     }
 }

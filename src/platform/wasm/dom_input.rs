@@ -13,7 +13,9 @@
 //! Mapper modules and emulator cores normalise this into the full
 //! `InputBinaryEvent` shape per `input_capability_surface.md`.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Pop the next pending DOM input event into `buf` (kernel-side

@@ -21,7 +21,9 @@
 //! rxQueue until the channel accepts again. Same pattern as
 //! `wasm_browser_websocket`.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Open a WebSocket. Shared with `wasm_browser_websocket` — the

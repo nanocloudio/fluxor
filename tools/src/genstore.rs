@@ -20,10 +20,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// On-storage wire records (pointer records, generation headers) —
-/// path-mounted from `modules/sdk/genstore_wire.rs` so the host store and
+/// path-mounted from `modules/sdk/wire/genstore_wire.rs` so the host store and
 /// the device-side Pi 5 backend share one codec by construction (the same
 /// lockstep discipline as `wire.rs` / the plan codec pair).
-#[path = "../../modules/sdk/genstore_wire.rs"]
+#[path = "../../modules/sdk/wire/genstore_wire.rs"]
 pub mod genstore_wire;
 pub use genstore_wire::GenState;
 use genstore_wire::{GenHeaderView, PointerRecord};

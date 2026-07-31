@@ -94,11 +94,11 @@ pub unsafe fn uart_init() {
 // via the `Bcm2712UartSink` below. Keeps logs opt-in and orthogonal to
 // the application.
 pub fn uart_putc(c: u8) {
-    fluxor::kernel::log_ring::push_byte(c);
+    fluxor::kernel::sys::log_ring::push_byte(c);
 }
 
 pub fn uart_puts(s: &[u8]) {
-    fluxor::kernel::log_ring::push_bytes(s);
+    fluxor::kernel::sys::log_ring::push_bytes(s);
 }
 
 // Direct synchronous MMIO path — used only by the exception / panic

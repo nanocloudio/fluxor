@@ -1,7 +1,7 @@
 // TLV walker for built-in module params.
 //
 // Built-in modules receive a per-instance TLV blob via `ModuleEntry::params()`.
-// Format mirrors `modules/sdk/params.rs::parse_tlv` and the config-tool
+// Format mirrors `modules/sdk/runtime/params.rs::parse_tlv` and the config-tool
 // packer in `tools/src/schema.rs`:
 //
 //   [0xFE][0x01][len_lo][len_hi]
@@ -12,7 +12,7 @@
 // starting at 10. Tags 0xF0..0xFF are reserved for protection / fault
 // policy and are silently ignored here.
 
-use crate::kernel::scheduler;
+use crate::kernel::exec::scheduler;
 
 const TLV_MAGIC: u8 = 0xFE;
 const TLV_VERSION: u8 = 0x01;

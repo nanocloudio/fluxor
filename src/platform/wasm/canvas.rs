@@ -9,7 +9,9 @@
 //! does not fit in BuiltInModule's 64-byte inline state). The kernel
 //! state holds a `*mut CanvasState` pointer in bytes 0..4.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Present an RGB565-little-endian frame to the host canvas.

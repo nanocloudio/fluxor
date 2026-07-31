@@ -54,7 +54,7 @@ include!("../../sdk/runtime.rs");
 
 // ---- EL0 syscall gateway (SVC #1) — heap slice ----------------------------
 //
-// Mirrors `kernel::el0_abi`. Heap ops reuse the shared register file:
+// Mirrors `kernel::module::el0_abi`. Heap ops reuse the shared register file:
 //   x0 = op, x3 = size (alloc) / x2 = ptr (free) -> x0 = i64 result.
 const SYS_HEAP_ALLOC: u64 = 3;
 const SYS_HEAP_FREE: u64 = 4;
@@ -255,4 +255,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

@@ -32,6 +32,18 @@ direction = "input"
 content_type = "NetProto"
 buffer_size = { default = 2048, bcm2712 = 16384 }
 
+# Address-control port (in[2]) — rfc_net_identity_metal §3.2. Single writer:
+# the platform workload backend. Carries IP_ADDR_ADD / IP_ADDR_DEL as
+# net-proto-framed control messages. Optional: graphs that don't wire it get
+# today's single-address behaviour, byte-identical. Small ring — this is
+# low-rate control, not a data path.
+[[ports]]
+name = "addr_ctl"
+direction = "input"
+index = 2
+content_type = "NetProto"
+buffer_size = { default = 512, bcm2712 = 512 }
+
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
 # cumulative counters; no-op when unwired. See standards/observability.md.

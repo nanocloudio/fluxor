@@ -31,7 +31,19 @@ reserved_pins = [14, 15]
 
 [platform.net]
 phy = "ethernet"
-driver = "rp1_gem"
+nic = "rp1-gem"
+
+# PCIe device topology (board fact): stable alias → root complex + expected
+# PCI (bus, dev, func). Drivers and user YAML reference the alias names; the
+# binder matches the exact BDF on the named root (stable across enumeration
+# reorders). Only PCIe1 is brought up by the bare-metal kernel.
+#   m2_primary — external x1 slot (NVMe HAT+, M.2 HAT) on PCIe1
+#   rp1        — internal x4 link to RP1 (GEM, UART/…) on PCIe2
+[platform.pcie]
+aliases = [
+    { name = "m2_primary", root = "pcie1", bus = 1, dev = 0, func = 0 },
+    { name = "rp1", root = "pcie2", bus = 1, dev = 0, func = 0 },
+]
 
 # Public hardware-rig contract (see .context/rfc_hardware_rig.md §7).
 # Board-level facts only — bench-specific bindings live in private rig

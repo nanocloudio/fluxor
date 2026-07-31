@@ -93,15 +93,15 @@ fn linux_tick_count() -> u32 {
 fn linux_sleep_until(deadline_us: u64) -> u32 {
     let now = elapsed_micros();
     if deadline_us <= now {
-        return fluxor::kernel::hal::WOKEN_DEADLINE;
+        return fluxor::kernel::sys::hal::WOKEN_DEADLINE;
     }
     let remaining = deadline_us - now;
     std::thread::park_timeout(std::time::Duration::from_micros(remaining));
     // Distinguish deadline vs early wake by re-reading the clock.
     if elapsed_micros() >= deadline_us {
-        fluxor::kernel::hal::WOKEN_DEADLINE
+        fluxor::kernel::sys::hal::WOKEN_DEADLINE
     } else {
-        fluxor::kernel::hal::WOKEN_EVENT
+        fluxor::kernel::sys::hal::WOKEN_EVENT
     }
 }
 
@@ -163,10 +163,10 @@ fn linux_init_providers() {
     // libc I/O. The dispatcher also answers
     // `contracts::fence::QUERY_OP`, surfacing the per-handle fence
     // through `provider_query(handle, query_key::LAST_FENCE, …)`.
-    use fluxor::kernel::provider;
-    use fluxor::kernel::provider::contract as dev_class;
+    use fluxor::kernel::module::provider;
+    use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
-    provider::register(dev_class::HAL_PIO, linux_stream_time_dispatch);
+    provider::register(dev_class::STREAM_CLOCK, linux_stream_time_dispatch);
     // storage.object over HTTP `Range:` — wasm peer in
     // `src/platform/wasm/object.rs`; shared windowing in
     // `abi::contracts::storage::object::range`.
@@ -185,12 +185,23 @@ fn linux_init_providers() {
     // The impure boundary: host process executor (sector `do`). Gated by
     // `requires_contract="proc"`; only registered on host-linux (a PIC module
     // can't fork/exec, so a "worker" is by definition a Linux node).
-    provider::register(dev_class::PROC, linux_proc_dispatch);
+    provider::register(
+        fluxor::abi::platform::linux::host_process::PROC_CLASS,
+        linux_proc_dispatch,
+    );
+    provider::register_fd_tag_route(
+        fluxor::abi::platform::linux::host_process::FD_TAG_PROC,
+        fluxor::abi::platform::linux::host_process::PROC_CLASS,
+    );
     // Platform-neutral isolated-workload surface: parses the Tier-1 spec, binds
     // to a plan-allocated owner + lease, enforces the Tier-2 options envelope
     // fail-closed, and delegates to the owner-bound host-process backend.
     // Host-linux; gated by requires_contract = "workload" + platform_raw.
     provider::register(dev_class::WORKLOAD, linux_workload_dispatch);
+    provider::register(
+        dev_class::HOST_PROCESS,
+        fluxor::platform::linux::workload::host_process_dispatch,
+    );
     // KEY_VAULT hardware override (rfc_crypto_extensions §4.1/§4.3):
     // when a PKCS#11 token is configured, re-register both KEY_VAULT
     // dispatch paths over the kernel software default. Runs after the
@@ -225,6 +236,33 @@ fn linux_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _ma
     len
 }
 
+
+/// HalOps protection impls: the portable MPU facade (no-op internally on
+/// non-RP silicon) and the shared direct step dispatch.
+fn prot_register_module(
+    module_idx: usize,
+    code_base: usize,
+    code_size: usize,
+    state_ptr: *mut u8,
+    state_size: usize,
+    heap_ptr: *mut u8,
+    heap_size: usize,
+) {
+    fluxor::platform::mpu::register_module(
+        module_idx,
+        code_base as u32,
+        code_size as u32,
+        state_ptr,
+        state_size,
+        heap_ptr,
+        heap_size,
+    );
+}
+fn prot_set_channel_region(module_idx: usize, base: usize, size: usize) {
+    fluxor::platform::mpu::set_channel_region(module_idx, base as u32, size as u32);
+}
+use fluxor::kernel::sys::hal::protected_step_direct as fluxor_protected_step_direct;
+
 static LINUX_HAL_OPS: HalOps = HalOps {
     disable_interrupts: linux_disable_interrupts,
     restore_interrupts: linux_restore_interrupts,
@@ -257,8 +295,21 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     init_gpio: |_| 0,
     csprng_fill: linux_csprng_fill,
     core_id: || 0,
-    irq_bind: |_, _, _, _| fluxor::kernel::errno::ENOSYS,
+    irq_bind: |_, _, _, _| fluxor::kernel::sys::errno::ENOSYS,
     sleep_until: linux_sleep_until,
+    smp_quiesce_peers: || false,
+    smp_release_peers: || {},
+    smp_max_domains: || 1,
+    protection_set_enabled: fluxor::platform::mpu::set_enabled,
+    protection_reset: || {},
+    protection_register_module: prot_register_module,
+    protection_set_channel_region: prot_set_channel_region,
+    protection_set_isolated_channels: |_, _, _, _| {},
+    protected_step: fluxor_protected_step_direct,
+    protection_map_page: |_, _, _, _| {},
+    protection_unmap_page: |_, _| {},
+    stack_canary_check: fluxor::platform::mpu::check_stack_canary,
+    stack_canary_reinit: fluxor::platform::mpu::reinit_stack_canary,
 };
 
 fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {

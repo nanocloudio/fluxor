@@ -405,7 +405,7 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
     // domain that `dmb ish` orders. On other architectures
     // `compiler_fence(SeqCst)` keeps the optimiser from reordering
     // the kick before the publish. Mirrors
-    // `kernel::hal::dma_kick_barrier`.
+    // `kernel::sys::hal::dma_kick_barrier`.
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
@@ -554,6 +554,6 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

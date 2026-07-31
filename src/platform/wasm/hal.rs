@@ -15,8 +15,8 @@
 //! the bare-metal-only entries stubbed out, time + crypto plumbed
 //! through the host.
 
-use crate::kernel::config::GpioConfig;
-use crate::kernel::hal::HalOps;
+use crate::kernel::boot::config::GpioConfig;
+use crate::kernel::sys::hal::HalOps;
 
 extern "C" {
     fn host_now_us() -> u64;
@@ -171,8 +171,34 @@ fn wasm_irq_bind(_irq: u32, _event_handle: i32, _mmio_base: usize, _target_core:
 /// hint (the caller re-checks work state), it is correct: there is no idle
 /// posture to park into.
 fn wasm_sleep_until(_deadline_us: u64) -> u32 {
-    crate::kernel::hal::WOKEN_DEADLINE
+    crate::kernel::sys::hal::WOKEN_DEADLINE
 }
+
+/// HalOps protection impls: the portable MPU facade (no-op internally on
+/// non-RP silicon) and the shared direct step dispatch.
+fn prot_register_module(
+    module_idx: usize,
+    code_base: usize,
+    code_size: usize,
+    state_ptr: *mut u8,
+    state_size: usize,
+    heap_ptr: *mut u8,
+    heap_size: usize,
+) {
+    crate::platform::mpu::register_module(
+        module_idx,
+        code_base as u32,
+        code_size as u32,
+        state_ptr,
+        state_size,
+        heap_ptr,
+        heap_size,
+    );
+}
+fn prot_set_channel_region(module_idx: usize, base: usize, size: usize) {
+    crate::platform::mpu::set_channel_region(module_idx, base as u32, size as u32);
+}
+use crate::kernel::sys::hal::protected_step_direct as fluxor_protected_step_direct;
 
 pub static WASM_HAL_OPS: HalOps = HalOps {
     disable_interrupts: wasm_disable_interrupts,
@@ -208,4 +234,17 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     core_id: wasm_core_id,
     irq_bind: wasm_irq_bind,
     sleep_until: wasm_sleep_until,
+    smp_quiesce_peers: || false,
+    smp_release_peers: || {},
+    smp_max_domains: || 1,
+    protection_set_enabled: crate::platform::mpu::set_enabled,
+    protection_reset: || {},
+    protection_register_module: prot_register_module,
+    protection_set_channel_region: prot_set_channel_region,
+    protection_set_isolated_channels: |_, _, _, _| {},
+    protected_step: fluxor_protected_step_direct,
+    protection_map_page: |_, _, _, _| {},
+    protection_unmap_page: |_, _| {},
+    stack_canary_check: crate::platform::mpu::check_stack_canary,
+    stack_canary_reinit: crate::platform::mpu::reinit_stack_canary,
 };

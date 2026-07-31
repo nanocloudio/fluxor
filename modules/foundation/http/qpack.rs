@@ -15,7 +15,7 @@
 //! / decoder skeletons. Header-block emission is wired by the eventual
 //! `h3.rs` per-stream HEADERS frame builder.
 
-#[path = "../../sdk/varint.rs"]
+#[path = "../../sdk/wire/varint.rs"]
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"

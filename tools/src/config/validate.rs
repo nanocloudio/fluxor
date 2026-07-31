@@ -926,7 +926,7 @@ fn resolve_edge_classes(
 /// frame at 50 fps doesn't share a default with a low-rate
 /// telemetry edge from the same producer.
 fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
-    // Must match the kernel's channel/scheduler cap (src/kernel/channel.rs +
+    // Must match the kernel's channel/scheduler cap (src/kernel/ipc/channel.rs +
     // scheduler/mod.rs = 4 MiB). This is the config-build clamp: it was stale at
     // 256 KiB while the kernel allowed 2 MiB, so a wiring asking for 2 MiB (a
     // GPU-offload frame channel — dense frames near 1 MiB) was silently clamped

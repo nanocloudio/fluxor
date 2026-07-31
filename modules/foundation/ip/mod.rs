@@ -51,7 +51,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 #[allow(
     dead_code,
@@ -132,6 +132,91 @@ const NET_CMD_CONNECT: u8 = 0x13;
 // net_proto; the disjoint opcode ranges keep the contracts unambiguous.
 // See `modules/sdk/contracts/net/datagram.rs`.
 
+// ── Multi-homing address table (rfc_net_identity_metal §3) ──────────────────
+
+/// Address-table size. Slot 0 is the primary; slots 1.. are secondaries
+/// added via the `addr_ctl` port. Scanned per-frame on the RX path, so the
+/// tunable is deliberately small (see the demux comment in `process_ipv4`).
+pub use abi::config::ip::MAX_LOCAL_ADDRS;
+
+/// Wildcard local-address slot — re-exported from `tcp` so the two modules
+/// agree on the sentinel used by `TcpConn::local_slot` / `find_conn`.
+use tcp::LOCAL_SLOT_ANY;
+
+/// `LocalAddr::flags` bits.
+const ADDR_FLAG_PRIMARY: u8 = 0x01;
+
+/// One configured local address. 16-byte address with IPv4 in the first four
+/// bytes (network order), matching the workload CREATE-header convention so
+/// IPv6 later is a parser/ND project, not a layout migration
+/// (`rfc_net_identity_metal` §3.1, §6). Fields are reordered from the RFC's
+/// prose for tight `repr(C)` packing; the wire `addr_ctl` payload is parsed
+/// field-by-field, so struct layout is internal-only.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LocalAddr {
+    /// 16-byte address, IPv4 in bytes 0..4 (network order).
+    pub addr: [u8; 16],
+    /// Owning workload tag (0 = host/system — a legitimate owner, not a
+    /// sentinel). Enforced on bind (P2, `rfc_net_identity_metal` §3.4): an
+    /// owner-stamped bind binds only to the address whose `owner_tag` matches,
+    /// and an owned secondary (`owner_tag != 0`) is served only by a listener
+    /// explicitly bound to it — never by a host wildcard listener. Set via the
+    /// `addr_ctl` `IP_ADDR_ADD` payload by the trusted single writer.
+    pub owner_tag: u16,
+    pub prefix_len: u8,
+    pub flags: u8,
+}
+
+impl LocalAddr {
+    pub const fn empty() -> Self {
+        Self {
+            addr: [0u8; 16],
+            owner_tag: 0,
+            prefix_len: 0,
+            flags: 0,
+        }
+    }
+
+    /// A slot is in use when its IPv4 word is non-zero (v1 is IPv4-only).
+    #[inline(always)]
+    fn is_active(&self) -> bool {
+        (self.addr[0] | self.addr[1] | self.addr[2] | self.addr[3]) != 0
+    }
+
+    /// Decode the IPv4 address as the host-order `u32` the stack compares
+    /// against `ip_hdr.dst_ip` and stamps into headers.
+    #[inline(always)]
+    fn ipv4(&self) -> u32 {
+        u32::from_be_bytes([self.addr[0], self.addr[1], self.addr[2], self.addr[3]])
+    }
+
+    #[inline(always)]
+    fn set_ipv4(&mut self, ip: u32) {
+        let b = ip.to_be_bytes();
+        self.addr[0] = b[0];
+        self.addr[1] = b[1];
+        self.addr[2] = b[2];
+        self.addr[3] = b[3];
+    }
+}
+
+/// `addr_ctl` port opcodes — the shared `net::identity` control contract
+/// (`modules/sdk/contracts/net/identity.rs`). This module is one *provider* of
+/// that contract; the workload backend is its writer. Both sides reference these
+/// same constants, so the opcodes/payload layout have a single source of truth
+/// (they were previously duplicated here and in the kernel, hand-synced).
+///   ADDR_ADD payload: [addr:16][prefix_len:1][owner_tag:2 LE]
+///   ADDR_DEL payload: [addr:16]
+use abi::contracts::net::identity as netid;
+const IP_ADDR_ADD: u8 = netid::ADDR_ADD;
+const IP_ADDR_DEL: u8 = netid::ADDR_DEL;
+/// THIS module's input-port indices, declared to the kernel at init via the
+/// `NET_IDENT_PROVIDER` self-registration (module-local facts, matching
+/// `manifest.toml` — no longer part of the shared contract).
+const NET_IN_PORT: u8 = 1;
+const ADDR_CTL_PORT: u8 = 2;
+
 /// Max bytes per queued outbound control frame. Sized for the
 /// largest short frame `net_send_*` produces (MSG_RETRANSMIT /
 /// MSG_ACK at 8 bytes). MSG_DATA goes through its own per-conn
@@ -193,10 +278,19 @@ pub struct IpState {
     mac_addr: [u8; 6],
     mac_valid: bool,
     _mac_pad: u8,
+    /// Primary (slot-0) address, retained as a hot-path decoded cache of
+    /// `local_addrs[0]`'s IPv4 so the RX filter, checksums and source
+    /// stamping keep their single-`u32` compares (no per-frame byte-swap).
+    /// DHCP-managed when `use_dhcp=1`. `local_addrs[0]` mirrors it.
     local_ip: u32,
     netmask: u32,
     gateway: u32,
     dns_server: u32,
+    /// Multi-homing address table (`rfc_net_identity_metal` §3.1). Slot 0 is
+    /// the primary (mirrors `local_ip`, `flags.PRIMARY`, `owner_tag=0`);
+    /// slots 1.. are secondaries added via `addr_ctl`. One gateway / netmask /
+    /// segment for all addresses in v1 (§5) — those stay scalar fields above.
+    local_addrs: [LocalAddr; MAX_LOCAL_ADDRS],
     ip_configured: bool,
     signaled_ready: bool,
     _ip_pad: [u8; 2],
@@ -221,6 +315,10 @@ pub struct IpState {
     // Net protocol channels (consumer ↔ IP)
     net_in_chan: i32,
     net_out_chan: i32,
+    /// Address-control input port (in[2]); -1 when unwired. Single writer =
+    /// the platform workload backend. Graphs without it wired get today's
+    /// single-address behaviour, byte-identical. (`rfc_net_identity_metal` §3.2.)
+    addr_ctl_chan: i32,
     /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
     /// unwired. Cumulative counters are emitted on the tlm cadence.
     telemetry_chan: i32,
@@ -387,6 +485,141 @@ unsafe fn log_error(s: &IpState, msg: &[u8]) {
 }
 
 // Formatting helpers (fmt_u32_raw, fmt_ip_raw) are in pic_runtime.rs
+
+// ── Local-address table helpers (rfc_net_identity_metal §3) ─────────────────
+
+/// CIDR prefix length for a contiguous IPv4 netmask (host order). `0` for a
+/// zero mask. Used to seed slot 0's `prefix_len` from `s.netmask`.
+#[inline]
+fn prefix_len_from_netmask(netmask: u32) -> u8 {
+    netmask.count_ones() as u8
+}
+
+/// Mirror the primary identity (`local_ip` / `netmask`) into slot 0 of the
+/// address table. Called wherever `local_ip` changes (DHCP bind,
+/// `force_configured`). Keeps the table the single logical source of truth
+/// while `local_ip` remains the hot-path decoded cache.
+#[inline]
+unsafe fn sync_primary_slot(s: &mut IpState) {
+    let a = &mut s.local_addrs[0];
+    a.set_ipv4(s.local_ip);
+    a.prefix_len = prefix_len_from_netmask(s.netmask);
+    a.owner_tag = 0;
+    a.flags = ADDR_FLAG_PRIMARY;
+}
+
+/// Outbound IPv4 source address for a conn's bound `slot`. Slot 0 (and the
+/// `ANY` wildcard used by unbound/host traffic) sources from `local_ip`; a
+/// concrete secondary sources from its table entry, falling back to the
+/// primary if the slot has since been removed.
+#[inline]
+fn local_ip_for_slot(s: &IpState, slot: u8) -> u32 {
+    if slot == 0 || slot == LOCAL_SLOT_ANY {
+        return s.local_ip;
+    }
+    let i = slot as usize;
+    if i < MAX_LOCAL_ADDRS && s.local_addrs[i].is_active() {
+        s.local_addrs[i].ipv4()
+    } else {
+        s.local_ip
+    }
+}
+
+/// Resolve an inbound destination IP to a local-address slot. `Some(0)` =
+/// primary; `Some(i)` = secondary `i`; `None` = not one of ours. With no
+/// secondaries configured the `1..` scan sees only inactive entries, so this
+/// collapses to the single `dst == local_ip` compare — byte-identical.
+///
+/// ≤`MAX_LOCAL_ADDRS`-entry linear scan on the RX hot path: negligible next
+/// to the per-frame parse + checksum, but `MAX_LOCAL_ADDRS` must NOT be
+/// raised without a hot-path measurement (this module's perf discipline —
+/// it has a NEON-memcpy RX history).
+#[inline]
+fn local_slot_for_dst(s: &IpState, dst: u32) -> Option<u8> {
+    if s.local_ip != 0 && dst == s.local_ip {
+        return Some(0);
+    }
+    let mut i = 1;
+    while i < MAX_LOCAL_ADDRS {
+        let a = &s.local_addrs[i];
+        if a.is_active() && a.ipv4() == dst {
+            return Some(i as u8);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True if `ip` is any configured local address (primary or secondary).
+#[inline]
+fn is_local_addr(s: &IpState, ip: u32) -> bool {
+    local_slot_for_dst(s, ip).is_some()
+}
+
+/// Owner tag of a local-address slot. Slot 0 (host), the wildcard sentinel,
+/// out-of-range, and inactive slots all report 0 (host/system owner —
+/// `rfc_net_identity_metal` §3.1). Used by the bind-admission and demux gates.
+#[inline]
+fn owner_tag_for_slot(s: &IpState, slot: u8) -> u16 {
+    let i = slot as usize;
+    if slot == LOCAL_SLOT_ANY || i >= MAX_LOCAL_ADDRS {
+        return 0;
+    }
+    let a = &s.local_addrs[i];
+    if a.is_active() {
+        a.owner_tag
+    } else {
+        0
+    }
+}
+
+/// True if `slot` names an OWNED secondary (`owner_tag != 0`). Slot 0 and
+/// unowned secondaries return false. With no owned secondary configured this
+/// is always false, so every demux/admission gate keyed on it collapses to the
+/// pre-P2 behaviour — byte-identical (`rfc_net_identity_metal` §3.4).
+#[inline]
+fn slot_is_owned(s: &IpState, slot: u8) -> bool {
+    owner_tag_for_slot(s, slot) != 0
+}
+
+/// Resolve a nonzero bind `owner_tag` to the active local-address slot that
+/// owner owns. `None` = the owner has no configured address on this host, so a
+/// bind stamped with it is refused (the metal analogue of the Linux
+/// lease-owner gate; `rfc_net_identity_metal` §3.4). Owner 0 (host) is never
+/// resolved here — it binds the wildcard slot.
+#[inline]
+fn slot_for_owner(s: &IpState, owner_tag: u16) -> Option<u8> {
+    if owner_tag == 0 {
+        return None;
+    }
+    let mut i = 0;
+    while i < MAX_LOCAL_ADDRS {
+        let a = &s.local_addrs[i];
+        if a.is_active() && a.owner_tag == owner_tag {
+            return Some(i as u8);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Broadcast a gratuitous ARP (L2-broadcast ARP reply) claiming `addr` for our
+/// MAC. Sent once when a same-subnet secondary is added and after a DHCP
+/// renewal for slot 0 (`rfc_net_identity_metal` §3.3).
+unsafe fn send_gratuitous_arp(s: &mut IpState, addr: u32) {
+    if !s.mac_valid || addr == 0 {
+        return;
+    }
+    let frame_len = arp::build_arp(
+        s.tx_frame.as_mut_ptr(),
+        arp::ARP_REPLY,
+        &s.mac_addr,
+        addr,
+        &eth::BROADCAST_MAC,
+        addr,
+    );
+    send_frame(s, s.tx_frame.as_ptr(), frame_len);
+}
 
 /// Write a net protocol frame to a channel.
 /// Frame format: [msg_type: u8] [payload_len: u16 LE] [payload...]
@@ -1077,9 +1310,33 @@ pub unsafe extern "C" fn module_new(
 
         // Discover net protocol channels
         let sys = &*s.syscalls;
-        s.net_in_chan = dev_channel_port(sys, 0, 1); // in[1]: net commands from consumer
+        s.net_in_chan = dev_channel_port(sys, 0, NET_IN_PORT); // in[1]: net commands from consumer
         s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
         s.telemetry_chan = dev_channel_port(sys, 1, 2); // out[2]: telemetry (optional)
+        s.addr_ctl_chan = dev_channel_port(sys, 0, ADDR_CTL_PORT); // in[2]: addr control (optional)
+
+        // Self-register as the node's net-identity provider (the kernel-side
+        // workload backend resolves addr_ctl / ingress through this — no name
+        // convention). Declares OUR port indices; best-effort: on a
+        // single-tenant kernel this is ENOSYS, in a bare harness a stub — the
+        // single-address path is byte-identical either way.
+        let mut reg = [ADDR_CTL_PORT, NET_IN_PORT];
+        let _ = (sys.provider_call)(
+            -1,
+            abi::kernel_abi::NET_IDENT_PROVIDER,
+            reg.as_mut_ptr(),
+            reg.len(),
+        );
+
+        // Address table starts empty; slot 0 is the primary and is kept in
+        // sync with `local_ip` (host-owned, owner_tag 0, flags.PRIMARY). Its
+        // IPv4 is populated when DHCP binds or `force_configured` runs.
+        let mut ai = 0;
+        while ai < MAX_LOCAL_ADDRS {
+            *s.local_addrs.as_mut_ptr().add(ai) = LocalAddr::empty();
+            ai += 1;
+        }
+        s.local_addrs[0].flags = ADDR_FLAG_PRIMARY;
 
         // Parse TLV params
         if !params.is_null() && params_len > 0 {
@@ -1263,8 +1520,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         step_dhcp(s);
     }
 
-    // 3. Service net protocol channels (consumer ↔ IP)
+    // 3. Address control (in[2]) then net protocol channels (consumer ↔ IP).
+    // addr_ctl is drained first so a workload's address is live before any
+    // consumer command that binds/sends on it. No-op when the port is unwired.
     // channel_poll verified working from PIC on aarch64 after u8→u32 widening
+    service_addr_ctl(s);
     service_net_channels(s);
 
     // 4. Periodic ARP maintenance
@@ -1470,21 +1730,15 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     };
     let (opcode, sender_ip, sender_mac, target_ip) = parsed;
 
-    // Gratuitous-ARP conflict detection: if someone claims our IP from a
-    // different MAC, defend by broadcasting a gratuitous reply asserting
-    // our MAC for our IP, then notify the consumer via MSG_ERROR.
-    if s.local_ip != 0 && sender_ip == s.local_ip && sender_mac != s.mac_addr {
+    // Gratuitous-ARP conflict detection: if someone claims ANY of our local
+    // addresses from a different MAC, defend by broadcasting a gratuitous
+    // reply asserting our MAC for the conflicted address, then notify the
+    // consumer via MSG_ERROR. Now checks every configured local address
+    // (`rfc_net_identity_metal` §3.3), not just the primary.
+    if sender_mac != s.mac_addr && is_local_addr(s, sender_ip) {
         log_info(s, b"[ip] arp conflict");
         if s.mac_valid {
-            let frame_len = arp::build_arp(
-                s.tx_frame.as_mut_ptr(),
-                arp::ARP_REPLY,
-                &s.mac_addr,
-                s.local_ip,
-                &eth::BROADCAST_MAC,
-                s.local_ip,
-            );
-            send_frame(s, s.tx_frame.as_ptr(), frame_len);
+            send_gratuitous_arp(s, sender_ip);
         }
         net_send_error(s, 0, -1, 0);
         return;
@@ -1498,13 +1752,16 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
         s.arp_pending_state = arp::ARP_PENDING_NONE;
     }
 
-    // Reply to ARP requests for our IP
-    if opcode == arp::ARP_REQUEST && target_ip == s.local_ip && s.local_ip != 0 && s.mac_valid {
+    // Reply to ARP requests for ANY of our local addresses with the single
+    // GEM MAC — ordinary multi-homing on one interface, no per-address MAC
+    // (`rfc_net_identity_metal` §3.3). The reply's sender-protocol-address is
+    // the requested address, so each secondary answers as itself.
+    if opcode == arp::ARP_REQUEST && s.mac_valid && is_local_addr(s, target_ip) {
         let frame_len = arp::build_arp(
             s.tx_frame.as_mut_ptr(),
             arp::ARP_REPLY,
             &s.mac_addr,
-            s.local_ip,
+            target_ip,
             &sender_mac,
             sender_ip,
         );
@@ -1532,9 +1789,13 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
         }
     }
 
-    // Only process packets addressed to us (or broadcast)
-    if s.local_ip != 0 && ip_hdr.dst_ip != s.local_ip && ip_hdr.dst_ip != 0xFFFFFFFF {
-        // Not for us (also check subnet broadcast)
+    // Destination demux: which of our local addresses (if any) is this for?
+    // Replaces the single `dst == local_ip` compare with a table lookup
+    // (`rfc_net_identity_metal` §3.4). `None` = not a unicast local address;
+    // still accept the (subnet-)broadcast forms as before.
+    let dst_slot = local_slot_for_dst(s, ip_hdr.dst_ip);
+    if s.local_ip != 0 && dst_slot.is_none() && ip_hdr.dst_ip != 0xFFFFFFFF {
+        // Not for us (also check subnet broadcast — one segment in v1).
         if s.netmask != 0 {
             let subnet_broadcast = (s.local_ip & s.netmask) | (!s.netmask);
             if ip_hdr.dst_ip != subnet_broadcast {
@@ -1544,20 +1805,34 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
             return;
         }
     }
+    // Broadcast / not-yet-configured traffic answers from the primary slot.
+    let local_slot = dst_slot.unwrap_or(0);
+    // Reply source address: the exact address a unicast was sent to (so a
+    // ping/RST to a secondary answers as that secondary); primary otherwise.
+    let reply_src = match dst_slot {
+        Some(_) => ip_hdr.dst_ip,
+        None => s.local_ip,
+    };
 
     let proto_data = data.add(ip_hdr.header_len);
     let proto_len = ip_hdr.total_len as usize - ip_hdr.header_len;
 
     match ip_hdr.protocol {
-        ipv4::PROTO_ICMP => process_icmp(s, &ip_hdr, proto_data, proto_len),
-        ipv4::PROTO_TCP => process_tcp_segment(s, &ip_hdr, proto_data, proto_len),
-        ipv4::PROTO_UDP => process_udp_packet(s, &ip_hdr, proto_data, proto_len),
+        ipv4::PROTO_ICMP => process_icmp(s, &ip_hdr, proto_data, proto_len, reply_src),
+        ipv4::PROTO_TCP => process_tcp_segment(s, &ip_hdr, proto_data, proto_len, local_slot),
+        ipv4::PROTO_UDP => process_udp_packet(s, &ip_hdr, proto_data, proto_len, local_slot),
         _ => {}
     }
 }
 
 /// Process ICMP packet (echo request → reply).
-unsafe fn process_icmp(s: &mut IpState, ip_hdr: &ipv4::Ipv4Header, data: *const u8, len: usize) {
+unsafe fn process_icmp(
+    s: &mut IpState,
+    ip_hdr: &ipv4::Ipv4Header,
+    data: *const u8,
+    len: usize,
+    reply_src: u32,
+) {
     if !s.mac_valid || s.local_ip == 0 {
         return;
     }
@@ -1583,7 +1858,7 @@ unsafe fn process_icmp(s: &mut IpState, ip_hdr: &ipv4::Ipv4Header, data: *const 
         ip_start,
         ip_total,
         ipv4::PROTO_ICMP,
-        s.local_ip,
+        reply_src,
         ip_hdr.src_ip,
         s.ip_id,
     );
@@ -1606,6 +1881,7 @@ unsafe fn process_udp_packet(
     ip_hdr: &ipv4::Ipv4Header,
     data: *const u8,
     len: usize,
+    local_slot: u8,
 ) {
     let udp_hdr = match udp::parse_udp(data, len) {
         Some(h) => h,
@@ -1623,12 +1899,19 @@ unsafe fn process_udp_packet(
     // consumers now speak datagram (see
     // modules/sdk/contracts/net/datagram.rs) and receive source
     // addressing via MSG_DG_RX_FROM.
+    // Bind admission (`rfc_net_identity_metal` §3.4): a wildcard datagram
+    // endpoint serves slot 0 and unowned secondaries, but an OWNED secondary
+    // is served only by an endpoint bound to it (an owner-stamped DG bind).
+    // `dst_owned` is always false with no owned secondary configured, so this
+    // collapses to the pre-P2 wildcard match — byte-identical.
+    let dst_owned = slot_is_owned(s, local_slot);
     let mut i = 0;
     while i < tcp::MAX_TCP_CONNS {
         let conn = &*s.tcp_conns.as_ptr().add(i);
         if conn.is_datagram
             && conn.state == tcp::TcpState::Listen
             && conn.local_port == udp_hdr.dst_port
+            && (conn.local_slot == local_slot || (conn.local_slot == LOCAL_SLOT_ANY && !dst_owned))
         {
             let payload = data.add(udp_hdr.payload_offset);
             dg_send_rx_from_v4(
@@ -1651,18 +1934,22 @@ unsafe fn process_tcp_segment(
     ip_hdr: &ipv4::Ipv4Header,
     data: *const u8,
     len: usize,
+    local_slot: u8,
 ) {
     let tcp_hdr = match tcp::parse_tcp(data, len) {
         Some(h) => h,
         None => return,
     };
 
-    // Find matching connection
+    // Find matching connection. The local-address slot is the fourth axis
+    // (`rfc_net_identity_metal` §3.4): the same 4-tuple reached at two local
+    // addresses is two distinct conns.
     let conn_idx = tcp::find_conn(
         &s.tcp_conns,
         ip_hdr.src_ip,
         tcp_hdr.src_port,
         tcp_hdr.dst_port,
+        local_slot,
     );
 
     let conn_idx = match conn_idx {
@@ -1679,7 +1966,10 @@ unsafe fn process_tcp_segment(
                 && s.mac_valid
                 && s.local_ip != 0
             {
-                if let Some(li) = tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port) {
+                let dst_owned = slot_is_owned(s, local_slot);
+                if let Some(li) =
+                    tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port, local_slot, dst_owned)
+                {
                     let mut accept_idx: i32 = -1;
                     let mut fi = 0;
                     while fi < tcp::MAX_TCP_CONNS {
@@ -1703,6 +1993,9 @@ unsafe fn process_tcp_segment(
                     let conn = &mut *s.tcp_conns.as_mut_ptr().add(idx);
                     *conn = tcp::TcpConn::new();
                     conn.local_port = listener_port;
+                    // Latch the local address this SYN arrived at so replies
+                    // source from it and the demux axis distinguishes it.
+                    conn.local_slot = local_slot;
                     conn.remote_ip = ip_hdr.src_ip;
                     conn.remote_port = tcp_hdr.src_port;
                     conn.iss = iss;
@@ -1720,14 +2013,17 @@ unsafe fn process_tcp_segment(
                     return;
                 }
             }
-            // No listener either — send RST if not RST
+            // No listener either — send RST if not RST, sourced from the
+            // exact local address the segment targeted.
             if (tcp_hdr.flags & tcp::RST) == 0 && s.mac_valid && s.local_ip != 0 {
+                let rst_src = local_ip_for_slot(s, local_slot);
                 send_tcp_rst(
                     s,
                     ip_hdr.src_ip,
                     tcp_hdr.src_port,
                     tcp_hdr.dst_port,
                     &tcp_hdr,
+                    rst_src,
                 );
             }
             return;
@@ -2093,6 +2389,7 @@ unsafe fn send_tcp_rst(
     remote_port: u16,
     local_port: u16,
     hdr: &tcp::TcpHeader,
+    local_src: u32,
 ) {
     if !s.mac_valid || s.local_ip == 0 {
         return;
@@ -2125,7 +2422,7 @@ unsafe fn send_tcp_rst(
         ip_start,
         ip_total,
         ipv4::PROTO_TCP,
-        s.local_ip,
+        local_src,
         remote_ip,
         s.ip_id,
     );
@@ -2137,7 +2434,7 @@ unsafe fn send_tcp_rst(
         eth::ETHERTYPE_IPV4,
     );
 
-    tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, s.local_ip, remote_ip);
+    tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, local_src, remote_ip);
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     send_frame(s, s.tx_frame.as_ptr(), total);
@@ -2173,6 +2470,9 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
     let remote_port = conn.remote_port;
     let rcv_nxt = conn.rcv_nxt;
     let rcv_wnd = conn.rcv_wnd;
+    // Source from the conn's bound local address (`rfc_net_identity_metal`
+    // §3.4). Slot 0 / unbound → `local_ip`, so single-address is unchanged.
+    let local_src = local_ip_for_slot(s, conn.local_slot);
     let consumes_seq = (flags & (tcp::SYN | tcp::FIN)) != 0;
     let seq = if retransmit && consumes_seq {
         conn.snd_una
@@ -2210,7 +2510,7 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
         ip_start,
         ip_total,
         ipv4::PROTO_TCP,
-        s.local_ip,
+        local_src,
         remote_ip,
         s.ip_id,
     );
@@ -2222,7 +2522,7 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
         eth::ETHERTYPE_IPV4,
     );
 
-    tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, s.local_ip, remote_ip);
+    tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, local_src, remote_ip);
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     if !send_frame(s, s.tx_frame.as_ptr(), total) {
@@ -2263,6 +2563,8 @@ unsafe fn send_tcp_data(
     let snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt;
     let rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt;
     let rcv_wnd = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_wnd;
+    let local_slot = (*s.tcp_conns.as_ptr().add(conn_idx)).local_slot;
+    let local_src = local_ip_for_slot(s, local_slot);
 
     let dst_mac = resolve_mac(s, remote_ip);
     let dst_mac = match dst_mac {
@@ -2294,7 +2596,7 @@ unsafe fn send_tcp_data(
         ip_start,
         ip_total,
         ipv4::PROTO_TCP,
-        s.local_ip,
+        local_src,
         remote_ip,
         s.ip_id,
     );
@@ -2309,7 +2611,7 @@ unsafe fn send_tcp_data(
     tcp::compute_tcp_checksum(
         tcp_start,
         tcp::TCP_HEADER_LEN + payload_len,
-        s.local_ip,
+        local_src,
         remote_ip,
     );
 
@@ -2622,6 +2924,11 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
             if s.dhcp.state == dhcp::DhcpState::Requesting
                 || s.dhcp.state == dhcp::DhcpState::Discovering
             {
+                // Distinguish first acquisition from a lease renewal: only a
+                // renewal announces (gratuitous ARP for slot 0,
+                // `rfc_net_identity_metal` §3.3). Initial bind stays
+                // byte-identical to pre-multi-address behaviour.
+                let renewing = s.dhcp.renew_sent;
                 s.local_ip = offered_ip;
                 s.netmask = if subnet_mask != 0 {
                     subnet_mask
@@ -2630,6 +2937,11 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                 };
                 s.gateway = gateway;
                 s.dns_server = dns;
+                // Mirror the primary identity into slot 0 of the address table.
+                sync_primary_slot(s);
+                if renewing {
+                    send_gratuitous_arp(s, s.local_ip);
+                }
                 s.ip_configured = true;
                 s.dhcp.state = dhcp::DhcpState::Bound;
                 s.dhcp.lease_start = s.step_count;
@@ -2802,6 +3114,111 @@ unsafe fn try_send_cmd_payload(
     data_off
 }
 
+/// Add a secondary local address (`IP_ADDR_ADD`). No-op if the IPv4 word is
+/// zero, if the address is already configured (primary or secondary — only
+/// owner/prefix are refreshed then), or if the table is full. Sends a single
+/// same-subnet gratuitous ARP on first insertion (`rfc_net_identity_metal`
+/// §3.3). owner_tag stamps the slot's owner and is enforced on bind (P2, see
+/// `slot_for_owner` / `find_listener`).
+unsafe fn addr_ctl_add(s: &mut IpState, addr16: *const u8, prefix_len: u8, owner_tag: u16) {
+    let ipv4 = u32::from_be_bytes([*addr16, *addr16.add(1), *addr16.add(2), *addr16.add(3)]);
+    if ipv4 == 0 {
+        return;
+    }
+    if let Some(slot) = local_slot_for_dst(s, ipv4) {
+        // Already present. Slot 0 (primary) is off-limits to addr_ctl; a
+        // secondary just refreshes owner/prefix without re-announcing.
+        if slot != 0 {
+            let a = &mut s.local_addrs[slot as usize];
+            a.prefix_len = prefix_len;
+            a.owner_tag = owner_tag;
+        }
+        return;
+    }
+    let mut i = 1;
+    while i < MAX_LOCAL_ADDRS {
+        if !s.local_addrs[i].is_active() {
+            let a = &mut s.local_addrs[i];
+            let mut k = 0;
+            while k < 16 {
+                a.addr[k] = *addr16.add(k);
+                k += 1;
+            }
+            a.prefix_len = prefix_len;
+            a.owner_tag = owner_tag;
+            a.flags = 0;
+            log_info(s, b"[ip] addr_ctl add");
+            // GARP only teaches the local segment, so announce same-subnet
+            // additions only (§3.3). Off-segment addresses rely on upstream
+            // routing.
+            if s.netmask != 0 && s.local_ip != 0 && (ipv4 & s.netmask) == (s.local_ip & s.netmask) {
+                send_gratuitous_arp(s, ipv4);
+            }
+            return;
+        }
+        i += 1;
+    }
+    log_info(s, b"[ip] addr_ctl add: table full");
+}
+
+/// Remove a secondary local address (`IP_ADDR_DEL`). The slot ages out
+/// immediately; established conns latched to it keep their concrete slot and
+/// fall back to sourcing from the primary (they close naturally). The primary
+/// (slot 0) is not removable via addr_ctl.
+unsafe fn addr_ctl_del(s: &mut IpState, ipv4: u32) {
+    if ipv4 == 0 {
+        return;
+    }
+    match local_slot_for_dst(s, ipv4) {
+        Some(slot) if slot != 0 => {
+            s.local_addrs[slot as usize] = LocalAddr::empty();
+            log_info(s, b"[ip] addr_ctl del");
+        }
+        _ => {}
+    }
+}
+
+/// Drain the address-control port (in[2]) and apply IP_ADDR_ADD / IP_ADDR_DEL.
+/// Single writer = the platform workload backend (`rfc_net_identity_metal`
+/// §3.2). No-op — and byte-identical — when the port is unwired.
+unsafe fn service_addr_ctl(s: &mut IpState) {
+    if s.addr_ctl_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    // Bounded per step: a full table's worth of ops is ample; anything more
+    // waits for the next tick (the port is low-rate control, not data).
+    let mut count = 0;
+    while count <= MAX_LOCAL_ADDRS {
+        let mut buf = [0u8; 32];
+        let (msg_type, payload_len) =
+            ip_net_read_frame(sys, s.addr_ctl_chan, buf.as_mut_ptr(), buf.len());
+        if msg_type == 0 {
+            break;
+        }
+        let plen = payload_len as usize;
+        match msg_type {
+            // [addr:16][prefix_len:1][owner_tag:2 LE]
+            IP_ADDR_ADD if plen >= netid::ADDR_ADD_PAYLOAD_LEN => {
+                let prefix_len = *buf.as_ptr().add(netid::ADD_PREFIX_LEN_OFF);
+                let owner_tag = u16::from_le_bytes([
+                    *buf.as_ptr().add(netid::ADD_OWNER_TAG_OFF),
+                    *buf.as_ptr().add(netid::ADD_OWNER_TAG_OFF + 1),
+                ]);
+                addr_ctl_add(s, buf.as_ptr(), prefix_len, owner_tag);
+            }
+            // [addr:16]
+            IP_ADDR_DEL if plen >= netid::ADDR_DEL_PAYLOAD_LEN => {
+                let bp = buf.as_ptr();
+                let ipv4 = u32::from_be_bytes([*bp, *bp.add(1), *bp.add(2), *bp.add(3)]);
+                addr_ctl_del(s, ipv4);
+            }
+            _ => {}
+        }
+        count += 1;
+    }
+}
+
 /// Read and dispatch net protocol commands from the consumer channel.
 unsafe fn service_net_channels(s: &mut IpState) {
     if s.net_in_chan < 0 {
@@ -2883,16 +3300,53 @@ unsafe fn service_net_channels(s: &mut IpState) {
 
         match msg_type {
             NET_CMD_BIND => {
-                // Payload: [port: u16 LE]
+                // Payload: [port: u16 LE] (host / wildcard bind — pre-P2)
+                //     or   [port: u16 LE][owner_tag: u16 LE]  (P2 owner-stamped)
+                // The optional trailing owner_tag is the metal bind-admission
+                // axis (`rfc_net_identity_metal` §3.4). It is stamped by the
+                // trusted upstream on behalf of the binding workload; the ip
+                // module cannot itself learn the commanding owner (the module
+                // syscall ABI exposes no owner query), so the stamp source is
+                // the P3 workload-backend / ingress path. Absent or 0 ⇒ host
+                // wildcard, byte-identical to the pre-P2 bind.
                 if plen >= 2 {
                     let port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    // Idempotent bind: if a TCP listener for `port`
-                    // already exists, re-emit MSG_BOUND for it. The
-                    // BSD-accept path keeps the listener in `Listen`
-                    // across accepted connections, so a defensive
-                    // re-bind from a caller would otherwise grow a
-                    // duplicate listener every cycle and exhaust
-                    // MAX_TCP_CONNS.
+                    let owner_tag = if plen >= 4 {
+                        u16::from_le_bytes([*buf.as_ptr().add(2), *buf.as_ptr().add(3)])
+                    } else {
+                        0
+                    };
+                    // Resolve the target local-address slot for this bind.
+                    // owner 0 → wildcard (host). A nonzero owner must own a
+                    // configured address here; if it does not, the bind is
+                    // refused — the metal analogue of the Linux lease-owner
+                    // gate (`rfc_net_identity_metal` §3.4).
+                    let target_slot = if owner_tag == 0 {
+                        LOCAL_SLOT_ANY
+                    } else {
+                        match slot_for_owner(s, owner_tag) {
+                            Some(si) => si,
+                            None => {
+                                log_info(s, b"[ip] net bind: refused (owner has no addr)");
+                                // EACCES — cross-owner / no-lease bind refusal.
+                                // Signalled via the module's MSG_ERROR frame
+                                // ([conn_id=0][errno][tag]), the ip module's
+                                // established bind-failure channel (matches the
+                                // no-free-conn ENOMEM path below).
+                                net_send_error(s, 0, -13, 0);
+                                count += 1;
+                                continue;
+                            }
+                        }
+                    };
+                    // Idempotent bind: if a TCP listener for this
+                    // `(port, target_slot)` already exists, re-emit MSG_BOUND
+                    // for it. The BSD-accept path keeps the listener in
+                    // `Listen` across accepted connections, so a defensive
+                    // re-bind from a caller would otherwise grow a duplicate
+                    // listener every cycle and exhaust MAX_TCP_CONNS. The slot
+                    // axis is part of the key so the same port bound at two
+                    // owned addresses stays two distinct listeners.
                     let mut existing: Option<usize> = None;
                     let mut li = 0;
                     while li < tcp::MAX_TCP_CONNS {
@@ -2903,6 +3357,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         if conn.state == tcp::TcpState::Listen
                             && !conn.is_datagram
                             && conn.local_port == port
+                            && conn.local_slot == target_slot
                         {
                             existing = Some(li);
                             break;
@@ -2923,6 +3378,10 @@ unsafe fn service_net_channels(s: &mut IpState) {
                                 conn.remote_ip = 0;
                                 conn.remote_port = 0;
                                 conn.retransmit_timer = 0;
+                                // Wildcard (host) or the owner's own slot.
+                                // Reset explicitly — this path reuses a slot
+                                // without a full `TcpConn::new()`.
+                                conn.local_slot = target_slot;
                                 found = true;
                                 break;
                             }
@@ -2980,6 +3439,11 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             conn.remote_ip = ip;
                             conn.remote_port = port;
                             conn.local_port = local_port;
+                            // Outbound/host traffic sources from slot 0 in v1;
+                            // set it concretely so the peer's replies (dst =
+                            // local_ip → slot 0) match on the demux axis. Reset
+                            // explicitly — this path reuses a slot in place.
+                            conn.local_slot = 0;
                             conn.connect_tag = requester_tag;
                             conn.iss = iss;
                             conn.snd_nxt = iss;
@@ -3050,15 +3514,38 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 }
             }
             DG_CMD_BIND => {
-                // datagram bind. Payload: [port: u16 LE] [flags: u8].
+                // datagram bind. Payload: [port: u16 LE] [flags: u8]
+                //   or (P2 owner-stamped): [port: u16 LE][flags: u8][owner_tag: u16 LE]
                 // Port 0 requests ephemeral allocation. Provider responds
-                // with MSG_DG_BOUND [ep_id, local_port].
+                // with MSG_DG_BOUND [ep_id, local_port]. The optional trailing
+                // owner_tag is the same bind-admission axis as NET_CMD_BIND
+                // (`rfc_net_identity_metal` §3.4); absent or 0 ⇒ host wildcard,
+                // byte-identical to the pre-P2 datagram bind.
                 if plen >= 2 {
                     let req_port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
                     let port = if req_port == 0 {
                         next_port(s)
                     } else {
                         req_port
+                    };
+                    let owner_tag = if plen >= 5 {
+                        u16::from_le_bytes([*buf.as_ptr().add(3), *buf.as_ptr().add(4)])
+                    } else {
+                        0
+                    };
+                    let target_slot = if owner_tag == 0 {
+                        Some(LOCAL_SLOT_ANY)
+                    } else {
+                        slot_for_owner(s, owner_tag)
+                    };
+                    let target_slot = match target_slot {
+                        Some(si) => si,
+                        None => {
+                            log_info(s, b"[ip] dg bind: refused (owner has no addr)");
+                            dg_send_error(s, 0, -13); // EACCES — cross-owner refusal
+                            count += 1;
+                            continue;
+                        }
                     };
                     let mut ep_id: i32 = -1;
                     let mut ci = 0;
@@ -3069,6 +3556,10 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             conn.state = tcp::TcpState::Listen;
                             conn.local_port = port;
                             conn.is_datagram = true;
+                            // Wildcard (host) or the owner's own slot; the
+                            // wildcard endpoint is not served on owned
+                            // secondaries (see `process_udp_packet`).
+                            conn.local_slot = target_slot;
                             ep_id = ci as i32;
                             break;
                         }
@@ -3309,6 +3800,45 @@ pub mod test_helpers {
         s.gateway = gateway;
         s.ip_configured = true;
         s.use_dhcp = 0;
+        // Mirror the primary identity into slot 0 of the address table.
+        super::sync_primary_slot(s);
+    }
+
+    /// Number of active local-address slots (primary + secondaries).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn local_addr_count(state: *const u8) -> usize {
+        let s = &*(state as *const IpState);
+        let mut n = 0;
+        if s.local_ip != 0 {
+            n += 1;
+        }
+        let mut i = 1;
+        while i < super::MAX_LOCAL_ADDRS {
+            if s.local_addrs[i].is_active() {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    }
+
+    /// Resolve a dst IPv4 to its local-address slot, or `None` if not ours.
+    /// Mirrors the RX-path demux used by the module.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn local_slot_for_dst(state: *const u8, dst: u32) -> Option<u8> {
+        super::local_slot_for_dst(&*(state as *const IpState), dst)
+    }
+
+    /// Read the `local_slot` axis latched on a TCP conn slot.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn conn_local_slot(state: *const u8, idx: usize) -> u8 {
+        (*(state as *const IpState)).tcp_conns[idx].local_slot
     }
 
     /// Inspect the local IP currently held by the IP stack.
@@ -3364,6 +3894,6 @@ pub mod test_helpers {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

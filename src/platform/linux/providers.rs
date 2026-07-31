@@ -3,8 +3,8 @@
 // ============================================================================
 
 use super::builtin_params::instance_state;
-use crate::abi::contracts::fence::{DeviceId, Fence};
-use crate::kernel::channel;
+use crate::abi::fence::{DeviceId, Fence};
+use crate::kernel::ipc::channel;
 
 /// Stable device id for the Linux host's local filesystem. One
 /// logical backing store from Fluxor's point of view, so a single
@@ -103,7 +103,7 @@ unsafe fn validate_fs_path(
     arg_len: usize,
     out: &mut [u8; 256],
 ) -> Result<usize, i32> {
-    use crate::kernel::errno;
+    use crate::kernel::sys::errno;
     if arg.is_null() || arg_len == 0 {
         return Err(errno::EINVAL);
     }
@@ -138,10 +138,10 @@ unsafe fn validate_fs_path(
 /// state without synchronization. `arg` must be null or valid for reads
 /// and writes of `arg_len` bytes for the duration of the call.
 pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::abi::contracts::fence as dev_fence;
     use crate::abi::contracts::storage::fs as dev_fs;
-    use crate::kernel::errno;
-    use crate::kernel::fd::{tag_fd, FD_TAG_FS};
+    use crate::abi::fence as dev_fence;
+    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_FS};
+    use crate::kernel::sys::errno;
 
     // Cross-cutting fence-introspection opcode. Public surface:
     // `provider_query(handle, query_key::LAST_FENCE, …)`. The
@@ -691,10 +691,11 @@ fn proc_grant() -> &'static ProcGrant {
 /// state without synchronization. `arg` must be null or valid for reads
 /// and writes of `arg_len` bytes for the duration of the call.
 pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::kernel::errno;
-    use crate::kernel::extbridge::OverloadPolicy;
-    use crate::kernel::fd::{slot_of, tag_fd, FD_TAG_PROC};
-    use crate::kernel::owner::OWNER_SYSTEM;
+    use crate::abi::platform::linux::host_process::FD_TAG_PROC;
+    use crate::kernel::ipc::fd::{slot_of, tag_fd};
+    use crate::kernel::sys::errno;
+    use crate::kernel::workload::extbridge::OverloadPolicy;
+    use crate::kernel::workload::owner::OWNER_SYSTEM;
     use crate::platform::proc_executor::{ProcExecutor, SpawnPolicy};
 
     let procs = &mut *core::ptr::addr_of_mut!(LINUX_PROCS);
@@ -884,7 +885,7 @@ struct LinuxNetConn {
     /// bind/connect that created this slot (rfc_endpoint_lease.md §4.1:
     /// attribution is carried via the lane, never inferred from the executing
     /// module, which may be system-owned). Immutable for the life of the slot.
-    owner: crate::kernel::owner::OwnerHandle,
+    owner: crate::kernel::workload::owner::OwnerHandle,
     write_buf: [u8; LINUX_NET_WRITE_BUF],
 }
 
@@ -897,7 +898,7 @@ impl LinuxNetConn {
         write_offset: 0,
         write_len: 0,
         connect_tag: 0,
-        owner: crate::kernel::owner::OWNER_SYSTEM,
+        owner: crate::kernel::workload::owner::OWNER_SYSTEM,
         write_buf: [0u8; LINUX_NET_WRITE_BUF],
     };
 }
@@ -923,7 +924,7 @@ pub struct LinuxNetState {
     /// the wired edge (`channel_producer_owner`) and refreshed on every
     /// rebuild — the carried-attribution source for bind stamps
     /// (rfc_endpoint_lease.md §4.1).
-    lane_owners: [crate::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
+    lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
     net_out: i32,
     conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
     /// Sized to absorb a full multi-MSS `CMD_SEND` payload. The
@@ -960,7 +961,7 @@ impl LinuxNetState {
     /// slot at a time).
     pub fn new(
         net_ins: [i32; LINUX_NET_MAX_INBOUND],
-        lane_owners: [crate::kernel::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
+        lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
         net_out: i32,
     ) -> Box<Self> {
         let mut b: Box<core::mem::MaybeUninit<Self>> = Box::new_uninit();
@@ -1061,7 +1062,7 @@ pub fn linux_net_close_all_and_clear_registry() {
 /// The drain driver calls this BEFORE `free_owner`, so an observer never sees
 /// the owner's terminal record while its port is still accepting
 /// (rfc_endpoint_lease.md §4.4). Platform thread only.
-pub fn linux_net_close_owner_conns(owner: crate::kernel::owner::OwnerHandle) {
+pub fn linux_net_close_owner_conns(owner: crate::kernel::workload::owner::OwnerHandle) {
     // SAFETY: single-threaded platform access to registered live instances,
     // reached through a raw pointer.
     unsafe {
@@ -1088,7 +1089,7 @@ pub fn linux_net_close_owner_conns(owner: crate::kernel::owner::OwnerHandle) {
 /// live listener / UDP socket. Protocol: 1 = tcp, 2 = udp (matching
 /// CONN_TYPE_UDP_BOUND mnemonically). The runtime's raw report — declarations
 /// are the agent's business (rfc_endpoint_lease.md §4.3). Platform thread only.
-pub fn linux_net_bound_endpoints() -> Vec<(crate::kernel::owner::OwnerHandle, u8, u16)> {
+pub fn linux_net_bound_endpoints() -> Vec<(crate::kernel::workload::owner::OwnerHandle, u8, u16)> {
     let mut out = Vec::new();
     // SAFETY: single-threaded platform access to registered live instances,
     // reached through a raw pointer.
@@ -1194,27 +1195,27 @@ unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, errno: u8) {
 /// must be granted. System-owned commanders are ungated, as everywhere.
 /// Returns the refusal errno, or None to proceed.
 fn linux_net_new_bind_refusal(
-    commander: crate::kernel::owner::OwnerHandle,
+    commander: crate::kernel::workload::owner::OwnerHandle,
     protocol: u8,
     port: u16,
 ) -> Option<u8> {
     if commander.is_system() {
         return None;
     }
-    if !crate::kernel::scheduler::owners_mut().authorize_admit(commander) {
+    if !crate::kernel::exec::scheduler::owners_mut().authorize_admit(commander) {
         log::warn!(
             "[linux_net] bind port {port} refused: owner slot {} draining/revoked",
             commander.slot
         );
         return Some(1); // EPERM
     }
-    match crate::kernel::owner_plan::lease_gate(
+    match crate::kernel::workload::owner_plan::lease_gate(
         commander.slot,
         commander.generation,
         protocol,
         port,
     ) {
-        crate::kernel::owner_plan::LeaseGate::Refused => {
+        crate::kernel::workload::owner_plan::LeaseGate::Refused => {
             log::warn!(
                 "[linux_net] bind port {port} refused: no lease granted to owner slot {}",
                 commander.slot
@@ -1807,7 +1808,7 @@ unsafe fn accept_one_client(
     st: &mut LinuxNetState,
     client_fd: i32,
     listener_port: u16,
-    owner: crate::kernel::owner::OwnerHandle,
+    owner: crate::kernel::workload::owner::OwnerHandle,
 ) {
     // Enable application-friendly TCP keepalive so a silently-dead
     // peer (laptop suspended, NAT timeout without RST) is detected

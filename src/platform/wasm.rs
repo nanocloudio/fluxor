@@ -14,7 +14,8 @@
     reason = "explicit unsafe block kept for SAFETY documentation; compiler may elide the requirement"
 )]
 
-use crate::kernel::{channel, scheduler};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
 
 #[path = "wasm/canvas.rs"]
 mod canvas;
@@ -395,9 +396,9 @@ fn init_builtin_heap<S>(module_idx: usize) -> bool {
 /// State struct (e.g. `wasm_browser_image_codec` heap-allocs a
 /// max_bytes-sized encoded buffer alongside its small State).
 fn init_builtin_heap_sized(module_idx: usize, bytes: usize) -> bool {
-    match crate::kernel::loader::alloc_state(bytes) {
+    match crate::kernel::module::loader::alloc_state(bytes) {
         Ok(arena_ptr) => {
-            crate::kernel::heap::init_module_heap(module_idx, arena_ptr, bytes);
+            crate::kernel::mem::heap::init_module_heap(module_idx, arena_ptr, bytes);
             true
         }
         Err(_) => false,
@@ -1247,7 +1248,7 @@ unsafe fn load_embedded_modules() -> usize {
         // the host's wasmtime/browser instantiation below — the
         // kernel can't verify wasm32 instructions itself — but the
         // `.fmod` envelope is verified here.
-        if let Err(_e) = crate::kernel::loader::validate_module(&loaded, "wasm-child") {
+        if let Err(_e) = crate::kernel::module::loader::validate_module(&loaded, "wasm-child") {
             log_fmt2(
                 3,
                 "[wasm-kernel] module ",
@@ -1301,7 +1302,7 @@ unsafe fn load_embedded_modules() -> usize {
         // silently ignores every FMP message on its ctrl port —
         // which is exactly what was breaking the wasm audio_player
         // and image_viewer chains. Same lookup pattern bcm2712 and
-        // rp2350 use in `kernel::scheduler::instantiate_one_module`.
+        // rp2350 use in `kernel::exec::scheduler::instantiate_one_module`.
         let in_chan = scheduler::get_module_port(module_idx, 0, 0);
         let out_chan = scheduler::get_module_port(module_idx, 1, 0);
         let ctrl_chan = scheduler::get_module_port(module_idx, 2, 0);
@@ -1378,9 +1379,9 @@ unsafe fn load_embedded_modules() -> usize {
         // fits even after the heap's per-block header + alignment
         // slack, and tolerates a few in-flight syscalls per step.
         const PIC_KERNEL_SCRATCH_BYTES: usize = 256 * 1024;
-        match crate::kernel::loader::alloc_state(PIC_KERNEL_SCRATCH_BYTES) {
+        match crate::kernel::module::loader::alloc_state(PIC_KERNEL_SCRATCH_BYTES) {
             Ok(arena_ptr) => {
-                crate::kernel::heap::init_module_heap(
+                crate::kernel::mem::heap::init_module_heap(
                     module_idx,
                     arena_ptr,
                     PIC_KERNEL_SCRATCH_BYTES,
@@ -1411,7 +1412,7 @@ unsafe fn load_embedded_modules() -> usize {
         }
 
         // `module_init_wasm` is the wasm-only entry point each PIC
-        // module exports from `modules/sdk/wasm_entry.rs`. It owns
+        // module exports from `modules/sdk/runtime/wasm_entry.rs`. It owns
         // state allocation (via the module's bump heap) and calls
         // the module's `module_new` with `&WASM_SYSCALLS`. Args are
         // packed as four i32 LE values: in_chan, out_chan, ctrl_chan,
@@ -2023,7 +2024,7 @@ fn append_u64(buf: &mut [u8], mut pos: usize, value: u64) -> usize {
 )]
 #[no_mangle]
 pub unsafe extern "C" fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.channel_read)(handle, buf, len)
 }
 
@@ -2035,7 +2036,7 @@ pub unsafe extern "C" fn channel_read(handle: i32, buf: *mut u8, len: usize) -> 
 )]
 #[no_mangle]
 pub unsafe extern "C" fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.channel_write)(handle, data, len)
 }
 
@@ -2045,7 +2046,7 @@ pub unsafe extern "C" fn channel_write(handle: i32, data: *const u8, len: usize)
 )]
 #[no_mangle]
 pub unsafe extern "C" fn channel_poll(handle: i32, events: u32) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.channel_poll)(handle, events)
 }
 
@@ -2057,7 +2058,7 @@ pub unsafe extern "C" fn channel_poll(handle: i32, events: u32) -> i32 {
 )]
 #[no_mangle]
 pub unsafe extern "C" fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.channel_peek)(handle, buf, len)
 }
 
@@ -2071,7 +2072,7 @@ pub unsafe extern "C" fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> 
 )]
 #[no_mangle]
 pub unsafe extern "C" fn heap_alloc(size: u32) -> *mut u8 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.heap_alloc)(size)
 }
 
@@ -2081,7 +2082,7 @@ pub unsafe extern "C" fn heap_alloc(size: u32) -> *mut u8 {
 )]
 #[no_mangle]
 pub unsafe extern "C" fn heap_free(ptr: *mut u8) {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.heap_free)(ptr)
 }
 
@@ -2091,7 +2092,7 @@ pub unsafe extern "C" fn heap_free(ptr: *mut u8) {
 )]
 #[no_mangle]
 pub unsafe extern "C" fn heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u8 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.heap_realloc)(ptr, new_size)
 }
 
@@ -2106,7 +2107,7 @@ pub unsafe extern "C" fn provider_open(
     config: *const u8,
     config_len: usize,
 ) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.provider_open)(contract, open_op, config, config_len)
 }
 
@@ -2116,7 +2117,7 @@ pub unsafe extern "C" fn provider_open(
 )]
 #[no_mangle]
 pub unsafe extern "C" fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.provider_call)(handle, op, arg, arg_len)
 }
 
@@ -2131,7 +2132,7 @@ pub unsafe extern "C" fn provider_query(
     out: *mut u8,
     out_len: usize,
 ) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.provider_query)(handle, key, out, out_len)
 }
 
@@ -2141,7 +2142,7 @@ pub unsafe extern "C" fn provider_query(
 )]
 #[no_mangle]
 pub unsafe extern "C" fn provider_close(handle: i32) -> i32 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.provider_close)(handle)
 }
 
@@ -2155,7 +2156,7 @@ pub unsafe extern "C" fn provider_close(handle: i32) -> i32 {
 )]
 #[no_mangle]
 pub unsafe extern "C" fn kernel_heap_alloc(size: u32) -> *mut u8 {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.heap_alloc)(size)
 }
 
@@ -2165,6 +2166,6 @@ pub unsafe extern "C" fn kernel_heap_alloc(size: u32) -> *mut u8 {
 )]
 #[no_mangle]
 pub unsafe extern "C" fn kernel_heap_free(ptr: *mut u8) {
-    let table = crate::kernel::syscalls::get_syscall_table();
+    let table = crate::kernel::module::syscalls::get_syscall_table();
     (table.heap_free)(ptr)
 }

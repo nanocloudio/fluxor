@@ -15,11 +15,11 @@
 //! `consumed_units` directly (the portable form `consumed * 60 / (rate>>16)`
 //! reduces to `consumed` here). `t0_micros` is 0 until audio starts running.
 
-use crate::kernel::errno;
+use crate::kernel::sys::errno;
 
 /// PIO-side `STREAM_TIME` opcode that the `0x0C30` (`STREAM_TIME`) syscall
 /// delegates to (`src/kernel/syscalls.rs`). Kept in sync with `linux_audio.rs`.
-const PIO_STREAM_TIME: u32 = 0x0407;
+const STREAM_CLOCK_QUERY: u32 = 0x1C00;
 
 extern "C" {
     /// Fill a 24-byte `StreamTime { consumed_units u64, queued_units u32,
@@ -32,7 +32,7 @@ extern "C" {
 /// HAL_PIO dispatch: answer `STREAM_TIME` (handle=-1 → the single wasm audio
 /// stream) with the audio sink's clock. Shape mirrors `linux_stream_time_dispatch`.
 unsafe fn wasm_stream_time_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    if opcode != PIO_STREAM_TIME {
+    if opcode != STREAM_CLOCK_QUERY {
         return errno::ENOSYS;
     }
     if handle >= 0 {
@@ -52,7 +52,7 @@ unsafe fn wasm_stream_time_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_
 /// `hal.rs::wasm_init_providers()` at kernel boot (mirrors
 /// `linux/runtime.rs:162` `provider::register(HAL_PIO, linux_stream_time_dispatch)`).
 pub fn register() {
-    use crate::kernel::provider;
-    use crate::kernel::provider::contract as dev_class;
-    provider::register(dev_class::HAL_PIO, wasm_stream_time_dispatch);
+    use crate::kernel::module::provider;
+    use crate::kernel::module::provider::contract as dev_class;
+    provider::register(dev_class::STREAM_CLOCK, wasm_stream_time_dispatch);
 }

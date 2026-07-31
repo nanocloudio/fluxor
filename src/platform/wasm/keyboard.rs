@@ -15,7 +15,9 @@
 //! Host shim contract: `host_keyboard_pop(buf, len)` returns one
 //! 8-byte record on each call, or 0 when the queue is empty.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Pop the next pending DOM keyboard event into `buf` (kernel-

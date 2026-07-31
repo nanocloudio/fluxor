@@ -7,6 +7,12 @@ use super::ipv4;
 /// TCP header minimum length (no options)
 pub const TCP_HEADER_LEN: usize = 20;
 
+/// `TcpConn::local_slot` wildcard: not bound to a specific local address.
+/// Listeners and datagram endpoints carry this so they are reachable at
+/// every configured local address; accepted/connected conns latch a
+/// concrete slot instead. (`rfc_net_identity_metal` §3.4.)
+pub const LOCAL_SLOT_ANY: u8 = 0xFF;
+
 /// TCP flags
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
@@ -82,6 +88,16 @@ pub struct TcpConn {
     pub local_port: u16,
     pub remote_port: u16,
     pub remote_ip: u32,
+
+    /// Local-address slot this conn is reached at / sources from
+    /// (`rfc_net_identity_metal` §3.4). Index into `IpState::local_addrs`;
+    /// `0` = primary (today's `local_ip`). Accepted conns latch the slot the
+    /// inbound dst-IP matched; outbound connects use slot 0; listeners and
+    /// datagram endpoints carry `LOCAL_SLOT_ANY` (wildcard — reachable at
+    /// every local address). The tuple match (`find_conn`) gains this axis so
+    /// the same port at two addresses is two distinct listeners.
+    pub local_slot: u8,
+    pub _slot_pad: u8,
 
     /// When set, this slot is a datagram endpoint. UDP delivery to it
     /// uses `MSG_DG_RX_FROM` framing (opcodes 0x40..0x43). Always false
@@ -166,6 +182,8 @@ impl TcpConn {
             local_port: 0,
             remote_port: 0,
             remote_ip: 0,
+            local_slot: LOCAL_SLOT_ANY,
+            _slot_pad: 0,
             is_datagram: false,
             _dg_pad: [0; 3],
             snd_una: 0,
@@ -306,11 +324,19 @@ pub unsafe fn parse_tcp(data: *const u8, len: usize) -> Option<TcpHeader> {
 /// Find a TCP connection matching the incoming segment.
 /// # Safety
 /// `conns` must point to a valid array of at least `MAX_TCP_CONNS` entries.
+/// `local_slot` adds the local-address axis (`rfc_net_identity_metal` §3.4):
+/// the same 4-tuple reached at two different local addresses is two distinct
+/// connections. A conn carrying `LOCAL_SLOT_ANY` matches any dst slot (a
+/// wildcard listener); a conn on a concrete slot matches only that slot. With
+/// a single configured address every conn latches slot 0 and every inbound
+/// segment resolves to slot 0, so the axis is inert — behaviour is identical
+/// to the pre-multi-address port-only match.
 pub unsafe fn find_conn(
     conns: &[TcpConn; MAX_TCP_CONNS],
     remote_ip: u32,
     remote_port: u16,
     local_port: u16,
+    local_slot: u8,
 ) -> Option<usize> {
     let mut i = 0;
     while i < MAX_TCP_CONNS {
@@ -319,6 +345,7 @@ pub unsafe fn find_conn(
             && c.remote_ip == remote_ip
             && c.remote_port == remote_port
             && c.local_port == local_port
+            && (c.local_slot == LOCAL_SLOT_ANY || c.local_slot == local_slot)
         {
             return Some(i);
         }
@@ -327,16 +354,35 @@ pub unsafe fn find_conn(
     None
 }
 
-/// Find a listening TCP connection matching the destination port.
+/// Find a listening TCP connection matching the destination port and the
+/// local address the segment arrived at.
 ///
 /// Datagram endpoints share the same conn array and also sit in
 /// `Listen` state, so the match excludes `is_datagram` slots — a TCP
 /// SYN must never land on a UDP-bound endpoint.
-pub unsafe fn find_listener(conns: &[TcpConn; MAX_TCP_CONNS], local_port: u16) -> Option<usize> {
+///
+/// Bind admission (`rfc_net_identity_metal` §3.4): a listener bound to a
+/// concrete slot serves only that slot; a wildcard listener
+/// (`LOCAL_SLOT_ANY`) serves slot 0 and UNOWNED secondaries but NEVER an
+/// OWNED secondary (`dst_owned`) — an owned workload address is reachable
+/// only through a listener explicitly bound to it (an owner-stamped bind).
+/// With no owned secondary configured `dst_owned` is always false, so the
+/// wildcard matches every slot exactly as the pre-P2 port-only match did —
+/// byte-identical.
+pub unsafe fn find_listener(
+    conns: &[TcpConn; MAX_TCP_CONNS],
+    local_port: u16,
+    local_slot: u8,
+    dst_owned: bool,
+) -> Option<usize> {
     let mut i = 0;
     while i < MAX_TCP_CONNS {
         let c = &*conns.as_ptr().add(i);
-        if c.state == TcpState::Listen && !c.is_datagram && c.local_port == local_port {
+        if c.state == TcpState::Listen
+            && !c.is_datagram
+            && c.local_port == local_port
+            && (c.local_slot == local_slot || (c.local_slot == LOCAL_SLOT_ANY && !dst_owned))
+        {
             return Some(i);
         }
         i += 1;

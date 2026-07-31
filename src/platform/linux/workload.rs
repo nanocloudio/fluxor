@@ -8,35 +8,37 @@
 // lease-gates admission, enforces the Tier-2 options envelope FAIL-CLOSED
 // against the resolved backend's advertised capabilities, then delegates to the
 // backend. On Linux the only backend is the host-process backend — the
-// owner-bound `oci.rs` mechanism (namespaces/cgroups); an fmod-graph source has
+// owner-bound `host_backend.rs` mechanism (namespaces/cgroups); an fmod-graph source has
 // no Linux realization and is refused (it resolves to the MPU/EL0 backend on a
 // metal node, by placement).
 //
-// Composes the host-process backend in the sibling `oci` module.
+// Composes the host-process backend in the sibling `host_backend` module.
 
-use super::oci::{
-    oci_destroy, oci_exec, oci_pause, oci_read, oci_resume, oci_signal, oci_spawn, oci_start,
-    oci_tty_close, oci_tty_open, oci_tty_resize, oci_tty_step, oci_wait, ResourceEnvelope,
-    MAX_SANDBOXES,
+use super::host_backend::{
+    hp_destroy, hp_exec, hp_pause, hp_read, hp_resume, hp_signal, hp_spawn, hp_start, hp_tty_close,
+    hp_tty_open, hp_tty_resize, hp_tty_step, hp_wait, ResourceEnvelope, MAX_SANDBOXES,
 };
 use crate::abi::contracts::workload as wl;
-use crate::kernel::owner::OwnerHandle;
+use crate::abi::platform::linux::host_process as hp;
+use crate::kernel::workload::owner::OwnerHandle;
 
-// Optional workload opcodes (`wl::EXEC`/`wl::TTY_*`): the contract numbers them
+// Host-process opcodes (`hp::EXEC`/`hp::TTY_*`, class 0x1B): the host class numbers them
 // (rfc_workload_lifecycle §2.1) and owns the consts. Only their arg/out wire
 // formats — backend detail, not contract surface — are documented here:
 //
-// * `EXEC` (0x1A06) — one-shot: run a command inside a workload and capture
-//   its output (`kubectl exec pod -- cmd`). `arg` in = command line; out =
-//   `[out_len:u32][output…]`; return = exit code.
-// * `TTY_OPEN` (0x1A07) — start an interactive PTY session
-//   (`kubectl exec -it`). `arg` = `[rows:u16][cols:u16][cmd…]`; return =
-//   session id.
-// * `TTY_STEP` (0x1A08) — pump a session: write stdin, drain output, poll
+// Workload-scoped ops carry `[workload_fd: i32 LE]` before the payloads below
+// (handle = -1 calls; the kernel routes handle-tagged calls by tag→class).
+//
+// * `EXEC` (0x1B02) — one-shot: run a command inside a workload and capture
+//   its output. Payload in = command line; out = `[out_len:u32][output…]`;
+//   return = exit code.
+// * `TTY_OPEN` (0x1B03) — start an interactive PTY session. Payload =
+//   `[rows:u16][cols:u16][cmd…]`; return = session id.
+// * `TTY_STEP` (0x1B04) — pump a session: write stdin, drain output, poll
 //   exit. `arg` in = `[sid:u32][wlen:u32][stdin…]`; out =
 //   `[rlen:u32][state:u8][code:i32][out…]`.
-// * `TTY_RESIZE` (0x1A09) — `arg` = `[sid:u32][rows:u16][cols:u16]`.
-// * `TTY_CLOSE` (0x1A0A) — kill+reap+free a session. `arg` = `[sid:u32]`;
+// * `TTY_RESIZE` (0x1B05) — `arg` = `[sid:u32][rows:u16][cols:u16]`.
+// * `TTY_CLOSE` (0x1B06) — kill+reap+free a session. `arg` = `[sid:u32]`;
 //   return = exit code.
 
 const MAX_WORKLOADS: usize = MAX_SANDBOXES;
@@ -53,7 +55,7 @@ struct WorkloadSlot {
 
 const WORKLOAD_EMPTY: WorkloadSlot = WorkloadSlot {
     in_use: false,
-    owner: crate::kernel::owner::OWNER_SYSTEM,
+    owner: crate::kernel::workload::owner::OWNER_SYSTEM,
     backend_idx: -1,
 };
 
@@ -68,12 +70,12 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
-/// The host-process backend's honest capability set. `oci.rs` provides
+/// The host-process backend's honest capability set. `host_backend.rs` provides
 /// namespace + cgroup isolation but not seccomp/caps/SELinux, so it advertises
 /// `SHARED`/`ISOLATED` only — never `HARDENED` — and zero `linux.*` option
 /// keys. A `HARDENED` request, or a required option entry, therefore fails
 /// admission rather than running silently under-hardened (the §5.2/§5.3 rule).
-/// Extending `oci.rs` to apply a hardening knob is what adds its key here.
+/// Extending `host_backend.rs` to apply a hardening knob is what adds its key here.
 fn host_backend_honors_posture(posture: u8) -> bool {
     matches!(posture, wl::POSTURE_SHARED | wl::POSTURE_ISOLATED)
 }
@@ -90,14 +92,14 @@ fn host_backend_net_caps() -> u8 {
 /// Whether this host can freeze at all: cgroup2 is mounted (`cgroup.freeze`
 /// is core cgroup2 surface, present on every v2 cgroup since Linux 5.2 — not
 /// a controller) and a base cgroup for per-sandbox dirs resolves — the same
-/// preconditions `oci_apply_cgroup` relies on. Probed once per process; the
+/// preconditions `hp_apply_cgroup` relies on. Probed once per process; the
 /// per-workload gate still applies: a workload whose best-effort cgroup setup
 /// failed gets ENOSYS from PAUSE (rfc_workload_lifecycle §3.1).
 fn host_backend_can_freeze() -> bool {
     static CAN_FREEZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CAN_FREEZE.get_or_init(|| {
         std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").is_ok()
-            && super::oci::cgroup_base().is_some()
+            && super::host_backend::cgroup_base().is_some()
     })
 }
 
@@ -106,7 +108,7 @@ fn host_backend_can_freeze() -> bool {
 /// admission. Returns `Ok(())` or a negative errno. TLV entry:
 /// `[ns_len:u8][ns][key_len:u8][key][flags:u8][val_len:u16 LE][val]`.
 unsafe fn validate_options(opts: &[u8]) -> Result<(), i32> {
-    use crate::kernel::errno;
+    use crate::kernel::sys::errno;
     let mut p = 0usize;
     while p < opts.len() {
         if p + 1 > opts.len() {
@@ -146,8 +148,8 @@ unsafe fn validate_options(opts: &[u8]) -> Result<(), i32> {
 /// variable-length source-ref / endpoint / options sections. Returns a tagged
 /// `FD_TAG_WORKLOAD` handle or a negative errno.
 unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
-    use crate::kernel::errno;
-    use crate::kernel::fd::{tag_fd, FD_TAG_WORKLOAD};
+    use crate::kernel::ipc::fd::{tag_fd, FD_TAG_WORKLOAD};
+    use crate::kernel::sys::errno;
 
     if arg.is_null() || arg_len < wl::CREATE_HEADER_SIZE {
         return errno::EINVAL;
@@ -198,7 +200,7 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     // Backend selection is by source kind (placement routes fmod-graph to a
     // metal node; a bundle to a Linux node). Only the host-process backend
     // exists here.
-    if source_kind != wl::SOURCE_BUNDLE {
+    if source_kind != hp::SOURCE_HOST_PROCESS {
         return errno::ENOSYS; // fmod-graph → MPU/EL0 backend, not on Linux
     }
     if !host_backend_honors_posture(posture) {
@@ -212,14 +214,14 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     // uid must resolve to a plan-allocated owner — the provider references it, it
     // does not allocate (rfc_k8s: the plan is authoritative for owners).
     let owner = if identity == [0u8; 16] {
-        crate::kernel::owner::OWNER_SYSTEM
+        crate::kernel::workload::owner::OWNER_SYSTEM
     } else {
-        match crate::kernel::scheduler::owners().find_by_uid(identity) {
+        match crate::kernel::exec::scheduler::owners().find_by_uid(identity) {
             Some(h) => h,
-            None => return errno::EACCES, // no admitted pod for this uid
+            None => return errno::EACCES, // no admitted workload for this uid
         }
     };
-    if !crate::kernel::scheduler::owners().authorize_admit(owner) {
+    if !crate::kernel::exec::scheduler::owners().authorize_admit(owner) {
         return errno::EACCES; // draining/revoked owner cannot admit new work
     }
 
@@ -240,8 +242,16 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
             own_netns = true;
         }
         let port = rd_u16(buf, e + 2);
-        let gate = crate::kernel::owner_plan::lease_gate(owner.slot, owner.generation, proto, port);
-        if matches!(gate, crate::kernel::owner_plan::LeaseGate::Refused) {
+        let gate = crate::kernel::workload::owner_plan::lease_gate(
+            owner.slot,
+            owner.generation,
+            proto,
+            port,
+        );
+        if matches!(
+            gate,
+            crate::kernel::workload::owner_plan::LeaseGate::Refused
+        ) {
             return errno::EACCES;
         }
     }
@@ -286,12 +296,44 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
         return e;
     }
 
-    // Spawn on the host-process backend, bound to the owner.
-    let bundle = match core::str::from_utf8(&buf[src_start..ep_start]) {
-        Ok(s) => s.trim(),
+    // Spawn on the host-process backend, bound to the owner. The source section
+    // carries EXPLICIT spawn params (the orchestrator composes them from its own
+    // bundle/OCI format — this backend has no bundle knowledge):
+    //   [isolate:u8][rootfs_len:u16 LE][rootfs bytes][argv: rest, NUL-separated]
+    let src = &buf[src_start..ep_start];
+    if src.len() < 3 {
+        return errno::EINVAL;
+    }
+    let isolate = src[0] == 1;
+    let rootfs_len = u16::from_le_bytes([src[1], src[2]]) as usize;
+    let rootfs_end = 3 + rootfs_len;
+    if rootfs_end > src.len() {
+        return errno::EINVAL;
+    }
+    let rootfs = match core::str::from_utf8(&src[3..rootfs_end]) {
+        Ok(s) if !s.is_empty() => Some(s),
+        Ok(_) => None,
         Err(_) => return errno::EINVAL,
     };
-    let backend_idx = oci_spawn(bundle, &envelope, own_netns, net_ident.as_ref());
+    let argv_bytes = &src[rootfs_end..];
+    let mut argv: std::vec::Vec<&str> = std::vec::Vec::new();
+    for tok in argv_bytes.split(|b| *b == 0) {
+        if tok.is_empty() {
+            continue;
+        }
+        match core::str::from_utf8(tok) {
+            Ok(s) => argv.push(s),
+            Err(_) => return errno::EINVAL,
+        }
+    }
+    let backend_idx = hp_spawn(
+        &argv,
+        rootfs,
+        isolate,
+        &envelope,
+        own_netns,
+        net_ident.as_ref(),
+    );
     if backend_idx < 0 {
         return backend_idx;
     }
@@ -301,7 +343,7 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
         Some(i) => i,
         None => {
             // No workload slot: don't leak the backend sandbox.
-            oci_destroy(backend_idx);
+            hp_destroy(backend_idx);
             return errno::ENOMEM;
         }
     };
@@ -343,8 +385,8 @@ pub unsafe fn linux_workload_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    use crate::kernel::errno;
-    use crate::kernel::fd::slot_of;
+    use crate::kernel::ipc::fd::slot_of;
+    use crate::kernel::sys::errno;
 
     if opcode == wl::CREATE {
         return workload_create(arg as *const u8, arg_len);
@@ -352,30 +394,16 @@ pub unsafe fn linux_workload_dispatch(
     if opcode == wl::CAPS {
         return workload_caps(arg, arg_len);
     }
-    // Interactive-session pump ops carry the session id in `arg`, not the
-    // workload handle, so they resolve independently of the sandbox slot.
-    if opcode == wl::TTY_STEP {
-        return oci_tty_step(arg, arg_len);
-    }
-    if opcode == wl::TTY_RESIZE {
-        return oci_tty_resize(arg as *const u8, arg_len);
-    }
-    if opcode == wl::TTY_CLOSE {
-        return oci_tty_close(arg as *const u8, arg_len);
-    }
 
     let raw = slot_of(handle);
     let Some(bidx) = workload_backend_idx(raw) else {
         return errno::EINVAL;
     };
     match opcode {
-        wl::START => oci_start(bidx),
-        wl::PAUSE => oci_pause(bidx),
-        wl::RESUME => oci_resume(bidx),
-        wl::READ => oci_read(bidx, arg, arg_len),
-        wl::EXEC => oci_exec(bidx, arg, arg_len),
-        wl::TTY_OPEN => oci_tty_open(bidx, arg as *const u8, arg_len),
-        wl::WAIT => oci_wait(bidx, arg, arg_len),
+        wl::START => hp_start(bidx),
+        wl::PAUSE => hp_pause(bidx),
+        wl::RESUME => hp_resume(bidx),
+        wl::WAIT => hp_wait(bidx, arg, arg_len),
         wl::SIGNAL => {
             if arg.is_null() || arg_len < 4 {
                 return errno::EINVAL;
@@ -385,10 +413,10 @@ pub unsafe fn linux_workload_dispatch(
                 return errno::EINVAL;
             };
             let s = [hostsig];
-            oci_signal(bidx, s.as_ptr(), 1)
+            hp_signal(bidx, s.as_ptr(), 1)
         }
         wl::DESTROY => {
-            let rc = oci_destroy(bidx);
+            let rc = hp_destroy(bidx);
             let slots = &mut *core::ptr::addr_of_mut!(LINUX_WORKLOADS);
             slots[raw as usize] = WORKLOAD_EMPTY;
             rc
@@ -402,18 +430,19 @@ pub unsafe fn linux_workload_dispatch(
 /// then an empty namespace directory `[ns_count:u16 = 0]` (no `linux.*` keys
 /// defined).
 unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
-    use crate::kernel::errno;
+    use crate::kernel::sys::errno;
     if arg.is_null() || arg_len < 7 {
         return errno::EINVAL;
     }
     let out = core::slice::from_raw_parts_mut(arg, arg_len);
     out[0] = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
-    out[1] = wl::caps::SOURCE_BUNDLE;
+    out[1] = hp::CAPS_SOURCE_HOST_PROCESS;
     // Implemented optional ops: READ + EXEC + the TTY set + real-signal SIGNAL
     // delivery (process-group, rfc_workload_lifecycle §3.1). PAUSE is
     // advertised iff the host can freeze at all (cgroup2 present); a workload
     // whose own cgroup setup failed still gets per-workload ENOSYS.
-    let mut ops = wl::caps::READ | wl::caps::EXEC | wl::caps::TTY | wl::caps::SIGNAL;
+    // READ/EXEC/TTY retired to the 0x1B host-process class (D-WORKLOAD-ABI).
+    let mut ops = wl::caps::SIGNAL;
     if host_backend_can_freeze() {
         ops |= wl::caps::PAUSE;
     }
@@ -432,9 +461,55 @@ pub fn linux_workload_close_owner(owner: OwnerHandle) {
         let slots = &mut *core::ptr::addr_of_mut!(LINUX_WORKLOADS);
         for slot in slots.iter_mut() {
             if slot.in_use && slot.owner == owner {
-                oci_destroy(slot.backend_idx);
+                hp_destroy(slot.backend_idx);
                 *slot = WORKLOAD_EMPTY;
             }
         }
+    }
+}
+
+/// Host-process (0x1B) provider dispatch — the linux host mechanics evicted
+/// from the stable 0x1A surface (D-WORKLOAD-ABI). Every op is a `handle = -1`
+/// call; workload-targeting ops carry the tagged workload fd in the leading
+/// 4 bytes of `arg` (LE), TTY session ops carry the session id as before.
+///
+/// # Safety
+/// Scheduler-thread dispatch only; `arg` null or valid for `arg_len` bytes.
+pub unsafe fn host_process_dispatch(
+    _handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    use crate::kernel::ipc::fd::slot_of;
+    use crate::kernel::sys::errno;
+
+    // Session-scoped ops (no workload fd prefix).
+    if opcode == hp::TTY_STEP {
+        return hp_tty_step(arg, arg_len);
+    }
+    if opcode == hp::TTY_RESIZE {
+        return hp_tty_resize(arg as *const u8, arg_len);
+    }
+    if opcode == hp::TTY_CLOSE {
+        return hp_tty_close(arg as *const u8, arg_len);
+    }
+
+    // Workload-scoped ops: `[workload_fd: i32 LE]` prefix.
+    if arg.is_null() || arg_len < 4 {
+        return errno::EINVAL;
+    }
+    let a = core::slice::from_raw_parts(arg, 4);
+    let wfd = i32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+    let Some(bidx) = workload_backend_idx(slot_of(wfd)) else {
+        return errno::EINVAL;
+    };
+    let body = arg.add(4);
+    let body_len = arg_len - 4;
+    match opcode {
+        hp::READ => hp_read(bidx, body, body_len),
+        hp::EXEC => hp_exec(bidx, body, body_len),
+        hp::TTY_OPEN => hp_tty_open(bidx, body as *const u8, body_len),
+        _ => errno::ENOSYS,
     }
 }

@@ -55,10 +55,10 @@
 //! `ViewConsistent`-shaped but, as a volatile browser index, advertised
 //! `Volatile`.
 
-use crate::abi::contracts::fence as dev_fence;
 use crate::abi::contracts::storage::namespace as dev_ns;
-use crate::kernel::errno;
-use crate::kernel::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE};
+use crate::abi::fence as dev_fence;
+use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE};
+use crate::kernel::sys::errno;
 
 const MAX_OPEN: usize = 16;
 const MAX_PATH_LEN: usize = 256;
@@ -105,8 +105,8 @@ extern "C" {
 /// `requires_contract = "storage.namespace"` dispatches LOOKUP / STAT /
 /// LIST / CLOSE here. Called from `wasm_init_providers`.
 pub fn register() {
-    use crate::kernel::provider;
-    use crate::kernel::provider::contract as dev_class;
+    use crate::kernel::module::provider;
+    use crate::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::STORAGE_NAMESPACE, wasm_ns_dispatch);
 }
 

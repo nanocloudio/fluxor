@@ -21,7 +21,7 @@
 // bridges are drained. The plain-run completion branch then exits the
 // process with CLI_EXIT_CODE (rfc_cli_execution.md §6).
 
-use fluxor::kernel::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
+use fluxor::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
 use portable_atomic::AtomicI32;
 use std::sync::Arc;
 

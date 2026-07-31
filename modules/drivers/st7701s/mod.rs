@@ -38,7 +38,7 @@ mod init_seq;
 mod pio_programs;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
 // Constants
@@ -359,7 +359,7 @@ unsafe fn spi9_cs_set(s: &St7701sState, level: u8) {
 // GPIO / Timer helpers
 // ============================================================================
 
-// Contract ids (mirror kernel::provider::contract::*).
+// Contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
 const TIMER_CONTRACT:    u32 = 0x0006;
 
@@ -1342,6 +1342,6 @@ pub extern "C" fn module_deferred_ready() {}
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

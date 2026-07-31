@@ -52,11 +52,13 @@
 //!   readback outstanding at a time; requests larger than the staging buffer,
 //!   or with no output port wired, are dropped.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 /// Command opcodes — the shared producer↔consumer wire contract. Included from
 /// the same file a producer includes, so the two cannot drift.
-#[path = "../../../modules/sdk/contracts/gpu_compute_wire.rs"]
+#[path = "../../../modules/sdk/wire/gpu_compute_wire.rs"]
 mod wire;
 use wire::{
     CMD_CREATE_BUFFER, CMD_CREATE_PIPELINE, CMD_PRESENT, CMD_READBACK, CMD_SUBMIT,

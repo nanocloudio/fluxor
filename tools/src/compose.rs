@@ -100,7 +100,7 @@ pub struct NodeCapacity {
 ///
 /// `linux` and `pi5`/`bcm2712` share values because both compile the aarch64
 /// `profile_host` block (`modules/sdk/config.rs`) with the `multitenant`
-/// feature (`src/kernel/owner.rs` MAX_OWNERS). `max_endpoints` is agent-level
+/// feature (`src/kernel/workload/owner.rs` MAX_OWNERS). `max_endpoints` is agent-level
 /// admission policy — the kernel has no endpoint table constant yet.
 pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
     match profile {
@@ -1039,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_pod_keeps_slot_new_pod_bumps_generation() {
+    fn resident_workload_keeps_slot_new_pod_bumps_generation() {
         // pod 2 already resides in slot 1 at generation 5.
         let mut snap = OwnerSnapshot::empty(16);
         snap.slots[1] = SlotState {
@@ -1658,10 +1658,10 @@ mod tests {
                 .product()
         }
 
-        let owner = read("src/kernel/owner.rs");
-        let sdk = read("modules/sdk/config.rs");
-        let kcfg = read("src/kernel/config.rs");
-        let sched = read("src/kernel/scheduler/mod.rs");
+        let owner = read("src/kernel/workload/owner.rs");
+        let sdk = read("modules/sdk/abi/config.rs");
+        let kcfg = read("src/kernel/boot/config.rs");
+        let sched = read("src/kernel/exec/scheduler/mod.rs");
 
         let cap = capacity_for_profile("linux").expect("linux profile");
         // First MAX_OWNERS in owner.rs is the multitenant value.

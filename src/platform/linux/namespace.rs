@@ -29,10 +29,10 @@
 // This file is `include!`'d into `src/platform/linux.rs`, sharing its flat
 // namespace — so `fs`, `Path`, and `tag_fd` are already in scope from there;
 // only the names not already imported are pulled in here.
-use fluxor::abi::contracts::fence as dev_fence;
+use fluxor::abi::fence as dev_fence;
 use fluxor::abi::contracts::storage::namespace as dev_ns;
-use fluxor::kernel::errno;
-use fluxor::kernel::fd::{slot_of, FD_TAG_STORAGE_NAMESPACE};
+use fluxor::kernel::sys::errno;
+use fluxor::kernel::ipc::fd::{slot_of, FD_TAG_STORAGE_NAMESPACE};
 use std::time::UNIX_EPOCH;
 
 const NS_MAX_OPEN: usize = 16;

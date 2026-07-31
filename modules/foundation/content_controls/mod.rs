@@ -30,10 +30,10 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 // Shared 5×7 font (same file the host content_render.rs includes) — glyph /
 // draw_glyph / draw_text / GLYPH_W / GLYPH_H, for transport-button labels.
-include!("../../sdk/font5x7.rs");
+include!("../../sdk/assets/font5x7.rs");
 
 use abi::contracts::input::pointer as ptr;
 
@@ -789,4 +789,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

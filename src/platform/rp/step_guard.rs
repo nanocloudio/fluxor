@@ -4,7 +4,7 @@
 //!             (Embassy reserves TIMER0 / alarms 0-2 respectively).
 //! isr_tier:   RP2350 uses TIMER1 alarm 1, RP2040 uses TIMER alarm 2.
 
-use crate::kernel::step_guard;
+use crate::kernel::exec::step_guard;
 
 // ── RP2350 backend ────────────────────────────────────────────────────
 
@@ -159,7 +159,7 @@ pub unsafe extern "C" fn TIMER_IRQ_3() {
     rp2040_guard::on_timer_irq();
 }
 
-use crate::kernel::isr_tier;
+use crate::kernel::exec::isr_tier;
 
 // ── RP2350 backend ────────────────────────────────────────────────────
 

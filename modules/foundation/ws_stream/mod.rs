@@ -520,4 +520,4 @@ pub extern "C" fn module_arena_size() -> u32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

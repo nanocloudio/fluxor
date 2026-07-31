@@ -23,7 +23,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 const MAGIC: u32 = 0x574b_5031; // "WKP1"
 
@@ -144,4 +144,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

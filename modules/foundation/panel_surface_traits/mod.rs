@@ -48,7 +48,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 use abi::contracts::input::surface_traits as st;
 
@@ -201,4 +201,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

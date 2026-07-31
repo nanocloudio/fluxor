@@ -122,4 +122,4 @@ pub extern "C" fn module_isr_entry(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

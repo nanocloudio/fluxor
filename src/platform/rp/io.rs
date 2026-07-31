@@ -9,7 +9,7 @@ pub mod gpio {
     use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pull};
     use portable_atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
-    use crate::kernel::errno;
+    use crate::kernel::sys::errno;
 
     /// Maximum GPIO pins on RP2350B (superset for array sizing).
     /// Always 48 — runtime detection gates which pins are usable.
@@ -204,7 +204,8 @@ pub mod gpio {
             return false;
         }
         let owner = OWNER[handle as usize].load(Ordering::Acquire);
-        owner == OWNER_KERNEL || owner == crate::kernel::scheduler::current_module_index() as u8
+        owner == OWNER_KERNEL
+            || owner == crate::kernel::exec::scheduler::current_module_index() as u8
     }
 
     /// Release all GPIO pins owned by a specific module.
@@ -608,7 +609,7 @@ pub mod gpio {
                         if edge_detected {
                             let evt = GPIO_EVENT_BINDING[idx].load(Ordering::Relaxed);
                             if evt >= 0 {
-                                crate::kernel::event::event_signal(evt);
+                                crate::kernel::ipc::event::event_signal(evt);
                             }
                         }
                     }
@@ -662,7 +663,7 @@ pub mod gpio {
     // Config-driven initialization
     // ============================================================================
 
-    use crate::kernel::config::{GpioConfig, GpioDirection, GpioLevel, GpioPull};
+    use crate::kernel::boot::config::{GpioConfig, GpioDirection, GpioLevel, GpioPull};
 
     /// Initialize a GPIO pin from config.
     ///
@@ -753,7 +754,7 @@ pub mod pio {
     /// Get PAC PIO instance by block index (0, 1, 2).
     #[inline]
     pub fn pio_pac(pio_num: u8) -> pac::pio::Pio {
-        crate::kernel::chip::pio_pac(pio_num)
+        crate::platform::chip::pio_pac(pio_num)
     }
 
     /// Allocate contiguous instruction slots in a PIO block.
@@ -814,7 +815,7 @@ pub mod pio {
     /// FUNCSEL values: PIO0=6, PIO1=7, PIO2=8.
     pub fn setup_pio_pin(pin: u8, pio_num: u8, pull: PioPull) {
         debug_assert!(
-            pin < crate::kernel::gpio::runtime_max_gpio(),
+            pin < crate::platform::rp_io::gpio::runtime_max_gpio(),
             "PIO pin out of range"
         );
         let funcsel = 6 + pio_num;
@@ -822,7 +823,7 @@ pub mod pio {
             w.set_funcsel(funcsel as _);
         });
         pac::PADS_BANK0.gpio(pin as usize).write(|w| {
-            crate::kernel::chip::pad_set_iso_false!(w);
+            crate::platform::chip::pad_set_iso_false!(w);
             w.set_schmitt(true);
             w.set_slewfast(true);
             w.set_ie(true);

@@ -49,7 +49,7 @@ mod abi;
 use abi::SyscallTable;
 use abi::contracts::hal::spi::{OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs};
 
-// Provider contract ids (mirror kernel::provider::contract::*).
+// Provider contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
 const HAL_SPI_CONTRACT:  u32 = 0x0002;
 const TIMER_CONTRACT:    u32 = 0x0006;
@@ -76,7 +76,7 @@ struct SdParams {
 }
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
 // SD Protocol Constants
@@ -1689,6 +1689,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

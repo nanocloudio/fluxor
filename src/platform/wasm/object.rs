@@ -53,10 +53,10 @@
 //! that returns `EAGAIN` and is retried re-finds the same in-flight
 //! request rather than issuing a duplicate fetch.
 
-use crate::abi::contracts::fence as dev_fence;
 use crate::abi::contracts::storage::object as dev_obj;
-use crate::kernel::errno;
-use crate::kernel::fd::{slot_of, tag_fd, FD_TAG_STORAGE_OBJECT};
+use crate::abi::fence as dev_fence;
+use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_OBJECT};
+use crate::kernel::sys::errno;
 
 const MAX_OPEN_OBJECTS: usize = 16;
 /// Bounded copy of the object key so a slot can re-issue a ranged GET
@@ -154,8 +154,8 @@ extern "C" {
 /// `requires_contract = "storage.object"` dispatches HEAD / GET /
 /// RANGE_GET / CLOSE here. Called from `wasm_init_providers`.
 pub fn register() {
-    use crate::kernel::provider;
-    use crate::kernel::provider::contract as dev_class;
+    use crate::kernel::module::provider;
+    use crate::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::STORAGE_OBJECT, wasm_object_dispatch);
 }
 

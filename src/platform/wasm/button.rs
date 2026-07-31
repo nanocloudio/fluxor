@@ -19,7 +19,9 @@
 //! Host shim contract: `host_button_pop(buf, len)` returns one
 //! byte (0x01 or 0x00) per call, or 0 when the queue is empty.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     fn host_button_pop(buf: *mut u8, len: usize) -> i32;

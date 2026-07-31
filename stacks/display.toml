@@ -22,7 +22,7 @@ wiring = []
 # rejects window mode against a binary lacking the feature). `mode: file`
 # writes PPM frames to `path`; `mode: null` drains for performance tests.
 [[variant]]
-match = { family = "linux", driver = "host" }
+match = { family = "linux", sink = "host" }
 modules = [
   { name = "display", type = "linux_display",
     params = {

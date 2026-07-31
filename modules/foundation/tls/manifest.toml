@@ -3,6 +3,13 @@ version = "1.0.0"
 timer_class = "wall_clock"
 hardware_targets = ["rp2350", "bcm2712"]
 
+# Ingress anchor role for the tls-fronted 443 edge (rfc_workload_ingress
+# §2/§4.1, rfc_protocols.md §8.1): tls terminates the client-visible
+# secure stream in front of the http proxy anchor. Declared so the
+# `continuity` config validator (class edge_anchored) accepts a
+# tls-fronted edge whose anchor wants `transport.anchor.stream.secure`.
+capabilities = ["transport.anchor.stream.secure"]
+
 [[ports]]
 name = "cipher_in"
 direction = "input"

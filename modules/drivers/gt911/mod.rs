@@ -31,7 +31,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
 // Constants
@@ -180,7 +180,7 @@ unsafe fn setup_write(s: &mut Gt911State, reg: u16, data: &[u8]) -> usize {
 // GPIO helpers
 // ============================================================================
 
-// Provider contract ids (mirror kernel::provider::contract::*).
+// Provider contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
 const HAL_I2C_CONTRACT:  u32 = 0x0003;
 const TIMER_CONTRACT:    u32 = 0x0006;
@@ -611,6 +611,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

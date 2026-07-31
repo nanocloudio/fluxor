@@ -8,13 +8,21 @@
 //! the convention used by ip ⇄ NIC drivers.
 //!
 //! For each frame, parses Ethernet + IPv4 + TCP just enough to identify a
-//! pure SYN (SYN set, ACK clear). For SYNs, increments a per-source-IP
-//! counter; if more than `rate_limit_per_ip` SYNs arrive from the same IP
-//! within `rate_window_ms`, the SYN is dropped. All non-TCP, non-SYN, and
-//! within-budget traffic passes through unchanged.
+//! pure SYN (SYN set, ACK clear). For SYNs, increments a per-`(local-address,
+//! source-IP)` counter; if more than `rate_limit_per_ip` SYNs arrive from the
+//! same remote IP at the same local address within `rate_window_ms`, the SYN
+//! is dropped. All non-TCP, non-SYN, and within-budget traffic passes through
+//! unchanged.
 //!
-//! The rate table is a fixed-size LRU keyed by source IPv4 address. On
-//! insertion when full, the least-recently-touched entry is evicted.
+//! The rate table is a fixed-size LRU keyed by `(destination IPv4, source
+//! IPv4)`. The destination (local) address is the per-workload owner axis
+//! (`rfc_net_identity_metal` §3.5): one local address maps 1:1 to one owner in
+//! v1, so partitioning the SYN budget by destination IP gives each workload
+//! its own share without any owner_tag plumbing — a flood aimed at one owned
+//! address cannot exhaust another owner's or the host's budget. With a single
+//! local address the destination is invariant and the key collapses to the
+//! source IP alone, byte-identical to the pre-P2 fuse. On insertion when full,
+//! the least-recently-touched entry is evicted.
 //!
 //! Params (TLV):
 //!   tag 1: rate_table_size (u8, default 32, max 32; **0 disables the fuse
@@ -37,7 +45,7 @@
 //! stack precisely because `module_step`'s frame must stay tiny; new stack
 //! buffers here are not free.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -53,7 +61,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 mod params_def;
 
@@ -76,23 +84,34 @@ const TCP_FLAG_ACK: u8 = 0x10;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RateEntry {
-    ip: u32,        // 0 = empty slot
+    ip: u32,        // remote source IP; 0 = empty slot
+    /// Local (destination) address the SYN targeted — the per-workload owner
+    /// axis (`rfc_net_identity_metal` §3.5). In v1 one local address maps 1:1
+    /// to one owner (a workload can only be reached at its own address), so the
+    /// destination IP on the wire IS the owner discriminator — conn_guard needs
+    /// no owner_tag plumbing to partition by it. Keying on `(dst, ip)` gives
+    /// each local address its own per-remote-IP SYN budget, so a flood aimed at
+    /// one workload's address exhausts that workload's share, not the host's or
+    /// a neighbour's. With a single local address (every pre-P2 deployment)
+    /// `dst` is constant across all entries, so the partition structure,
+    /// eviction and counters are identical to the pre-P2 src-only key —
+    /// byte-identical.
+    dst: u32,
     last_ms: u32,   // monotonic ms timestamp (truncated)
-    /// SYNs seen from this IP inside the current window.
+    /// SYNs seen from this `(dst, ip)` pair inside the current window.
     ///
     /// `u16`, NOT `u8`, deliberately. `rate_limit_per_ip` is a `u8`, so with a
     /// `u8` counter `count.saturating_add(1) <= limit` would be *always true*
     /// at `limit == 255` — the fuse would silently be a no-op at its own
     /// documented maximum. The wider counter makes 255 an ordinary limit that
-    /// drops the 256th SYN. Layout stays 12 bytes, so `STATE_SIZE` is
-    /// unaffected.
+    /// drops the 256th SYN.
     count: u16,
     _pad: [u8; 2],
 }
 
 impl RateEntry {
     const fn empty() -> Self {
-        Self { ip: 0, last_ms: 0, count: 0, _pad: [0; 2] }
+        Self { ip: 0, dst: 0, last_ms: 0, count: 0, _pad: [0; 2] }
     }
 }
 
@@ -137,9 +156,11 @@ const STATE_SIZE: usize = core::mem::size_of::<GuardState>();
 // Frame classification
 // ============================================================================
 
-/// Returns Some(source_ip) if the frame is a pure TCP SYN (SYN set, ACK clear),
-/// otherwise None.
-unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<u32> {
+/// Returns `Some((source_ip, dest_ip))` if the frame is a pure TCP SYN (SYN
+/// set, ACK clear), otherwise None. The destination IP is the local address
+/// the SYN targeted — the per-owner partition axis (`rfc_net_identity_metal`
+/// §3.5).
+unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<(u32, u32)> {
     if len < 14 + 20 { return None; }
 
     // EtherType (offset 12-13, big-endian)
@@ -165,6 +186,13 @@ unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<u32> {
         | ((*ipv4.add(14) as u32) << 8)
         | (*ipv4.add(15) as u32);
 
+    // Destination IP (offset 16 within IPv4 header) — the local address the
+    // SYN is aimed at, i.e. the owner axis. Same host-endian keying as src.
+    let dst_ip = ((*ipv4.add(16) as u32) << 24)
+        | ((*ipv4.add(17) as u32) << 16)
+        | ((*ipv4.add(18) as u32) << 8)
+        | (*ipv4.add(19) as u32);
+
     // TCP header starts at frame + 14 + ip_hdr_len. Flags at offset 13.
     let tcp = frame.add(14 + ip_hdr_len);
     let flags = *tcp.add(13);
@@ -172,7 +200,7 @@ unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<u32> {
     // Pure SYN = SYN set, ACK clear. Treat SYN+ACK and other combos as already
     // part of an established or in-progress connection.
     if (flags & TCP_FLAG_SYN) != 0 && (flags & TCP_FLAG_ACK) == 0 {
-        Some(src_ip)
+        Some((src_ip, dst_ip))
     } else {
         None
     }
@@ -182,9 +210,17 @@ unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<u32> {
 // Rate table
 // ============================================================================
 
-/// Decide whether a SYN from `src_ip` at `now_ms` should be admitted.
-/// Updates the table in place. Returns true to admit, false to drop.
-unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, now_ms: u32) -> bool {
+/// Decide whether a SYN from `src_ip` targeting local address `dst_ip` at
+/// `now_ms` should be admitted. Updates the table in place. Returns true to
+/// admit, false to drop.
+///
+/// The key is `(dst_ip, src_ip)` — the destination (local address) axis
+/// partitions the per-remote-IP budget per workload (`rfc_net_identity_metal`
+/// §3.5): a flood aimed at one owned address burns that owner's SYN share, not
+/// another owner's or the host's. With a single local address `dst_ip` is
+/// invariant, so the key collapses to `src_ip` alone — byte-identical to the
+/// pre-P2 fuse.
+unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, dst_ip: u32, now_ms: u32) -> bool {
     let table_size = s.rate_table_size as usize;
     if table_size == 0 { return true; }
 
@@ -193,14 +229,14 @@ unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, now_ms: u32) -> bool {
 
     let base = s.table.as_mut_ptr();
 
-    // 1) Look for existing entry.
+    // 1) Look for existing entry for this (dst, src) pair.
     let mut i = 0usize;
     while i < table_size {
         let e = base.add(i);
-        if (*e).ip == src_ip && src_ip != 0 {
+        if (*e).ip == src_ip && (*e).dst == dst_ip && src_ip != 0 {
             let elapsed = now_ms.wrapping_sub((*e).last_ms);
             if elapsed >= window {
-                // Window expired — reset counter for this IP.
+                // Window expired — reset counter for this pair.
                 (*e).count = 1;
                 (*e).last_ms = now_ms;
                 return true;
@@ -236,6 +272,7 @@ unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, now_ms: u32) -> bool {
 
     let e = base.add(victim);
     (*e).ip = src_ip;
+    (*e).dst = dst_ip;
     (*e).last_ms = now_ms;
     (*e).count = 1;
     true
@@ -402,9 +439,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     }
 
     let frame_ptr = buf.add(2) as *const u8;
-    let pass = if let Some(src_ip) = classify_syn(frame_ptr, frame_len) {
+    let pass = if let Some((src_ip, dst_ip)) = classify_syn(frame_ptr, frame_len) {
         let now_ms = dev_millis(sys) as u32;
-        let admit = admit_syn(s, src_ip, now_ms);
+        let admit = admit_syn(s, src_ip, dst_ip, now_ms);
         if !admit { s.dropped_syn = s.dropped_syn.wrapping_add(1); }
         admit
     } else {
@@ -427,6 +464,51 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");
+
+// ============================================================================
+// Host-test API — the owner-partitioning SYN-fuse internals (`admit_syn` /
+// `classify_syn`) as a minimal, `host-test`-gated public surface so the fuse
+// can be exercised from `tests/harness/tests/conn_guard.rs`. Inline tests are
+// banned in `modules/` (no_std → they compile away silently,
+// fluxor.toml::[ci.hygiene]), so the suite lives in the harness; this keeps
+// `GuardState`/`RateEntry` fields private while giving the harness a stable
+// white-box entry point. Never compiled into the PIC firmware.
+// ============================================================================
+#[cfg(feature = "host-test")]
+impl GuardState {
+    /// A zeroed fuse with a full table and the given per-remote-IP limit /
+    /// window — the state a bind-time `GuardState` reaches after config parse.
+    pub fn new_for_test(limit: u8, window_ms: u16) -> Self {
+        // SAFETY: GuardState is repr(C) POD; zeroing is a valid initial value.
+        let mut s: GuardState = unsafe { core::mem::zeroed() };
+        s.rate_table_size = MAX_TABLE as u8;
+        s.rate_limit_per_ip = limit;
+        s.rate_window_ms = window_ms;
+        for e in s.table.iter_mut() {
+            *e = RateEntry::empty();
+        }
+        s
+    }
+
+    /// Set the rate-table size (0 disables the fuse — every SYN admitted).
+    pub fn set_table_size(&mut self, n: u8) {
+        self.rate_table_size = n;
+    }
+
+    /// Run one SYN through the fuse against the `(dst, src)` key. Returns
+    /// whether it is admitted.
+    pub fn admit(&mut self, src_ip: u32, dst_ip: u32, now_ms: u32) -> bool {
+        // SAFETY: touches only `self`'s POD table; no syscalls.
+        unsafe { admit_syn(self, src_ip, dst_ip, now_ms) }
+    }
+
+    /// Extract `(src_ip, dst_ip)` from a raw SYN frame, or `None` if it is not
+    /// a pure IPv4 TCP SYN.
+    pub fn classify(frame: &[u8]) -> Option<(u32, u32)> {
+        // SAFETY: `classify_syn` reads at most `frame.len()` bytes.
+        unsafe { classify_syn(frame.as_ptr(), frame.len()) }
+    }
+}

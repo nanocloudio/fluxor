@@ -133,7 +133,7 @@ pub fn register_pcie1_msi_spi(spi_irq: u32) -> i32 {
 
 #[cfg(not(feature = "board-pi5"))]
 pub fn register_pcie1_msi_spi(_spi_irq: u32) -> i32 {
-    fluxor::kernel::errno::ENOSYS
+    fluxor::kernel::sys::errno::ENOSYS
 }
 
 /// Bind an event to a hardware IRQ. Enables the IRQ in the GIC distributor.
@@ -151,14 +151,14 @@ pub fn irq_bind(irq: u32, event_handle: i32, mmio_base: usize, target_core: u8) 
     // build time — this is the runtime backstop). A larger value would also
     // index ISENABLER/IPRIORITYR/ITARGETSR past their banks.
     if irq > 1019 {
-        return fluxor::kernel::errno::EINVAL;
+        return fluxor::kernel::sys::errno::EINVAL;
     }
     // SAFETY: IRQ_BINDINGS / IRQ_BINDING_COUNT are scheduler-thread-only
     // and only grow at boot/configure time; `idx` is range-checked above.
     // GICD register addresses are fixed MMIO mapped by boot_mmu.
     unsafe {
         if IRQ_BINDING_COUNT >= MAX_IRQ_BINDINGS {
-            return fluxor::kernel::errno::ENOMEM;
+            return fluxor::kernel::sys::errno::ENOMEM;
         }
         let idx = IRQ_BINDING_COUNT;
         IRQ_BINDINGS[idx] = IrqBinding {

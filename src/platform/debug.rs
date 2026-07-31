@@ -1,6 +1,6 @@
 //! Platform-runtime debug drain.
 //!
-//! Owns the local-transport debug path: drains `kernel::log_ring` into a
+//! Owns the local-transport debug path: drains `kernel::sys::log_ring` into a
 //! board-provided `DebugTx` sink. Does **not** live in kernel — the
 //! kernel owns `log_ring` and nothing transport-specific. This module is
 //! a platform-runtime sibling, imported by platform entry points.
@@ -13,7 +13,7 @@
 //!
 //! This is the **normal-runtime** path. Panic / exception handlers do not
 //! use it: they dump a snapshot of `log_ring` via
-//! [`kernel::log_ring::read_tail`] over a platform-owned blocking
+//! [`kernel::sys::log_ring::read_tail`] over a platform-owned blocking
 //! transport (raw UART on bcm2712, RTT / RAM breadcrumbs on rp, etc.)
 //! that bypasses the scheduler entirely.
 //!
@@ -47,7 +47,7 @@
 //! The staging buffer sits entirely inside the drain struct; place the
 //! static in `.bss` via `static mut` or a suitable lock pattern on the
 //! board side.
-use crate::kernel::log_ring;
+use crate::kernel::sys::log_ring;
 /// Write raw bytes to a local debug transport.
 ///
 /// # Semantics
@@ -72,7 +72,7 @@ impl DebugTx for NullTx {
         bytes.len()
     }
 }
-/// Drains `kernel::log_ring` into a [`DebugTx`] sink with single-tail
+/// Drains `kernel::sys::log_ring` into a [`DebugTx`] sink with single-tail
 /// staging. See module docs for the backpressure policy.
 pub struct DebugDrain<const N: usize> {
     staging: [u8; N],

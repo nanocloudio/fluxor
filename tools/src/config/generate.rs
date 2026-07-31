@@ -454,7 +454,7 @@ fn generate_config_impl(
     // kernel's `populate_ports()` enforces the same bound at module
     // instantiation; catching it at build time gives a clear error
     // instead of a cryptic boot failure. Must equal
-    // `src/kernel/scheduler.rs::MAX_PORTS`. The wire encoding
+    // `src/kernel/exec/scheduler/mod.rs::MAX_PORTS`. The wire encoding
     // (`port_byte` is two 4-bit fields, indices 0..=15) is the
     // ultimate ceiling.
     const MAX_PORTS: u8 = 16;
@@ -530,7 +530,7 @@ fn generate_config_impl(
     // atomicity" (e.g. WsFrame envelopes between ws_stream and http).
     // A non-zero `buffer_group:` field on a wiring entry enables
     // mailbox mode on that channel (see
-    // `src/kernel/scheduler/mod.rs::open_channels` — mailbox flag is
+    // `src/kernel/exec/scheduler/mod.rs::open_channels` — mailbox flag is
     // set when buffer_group != 0). Without this, the channel is a
     // byte-streaming FIFO and structured envelopes get fragmented.
     let mut buffer_groups = assign_buffer_groups(&edges, &module_names, module_caps)?;
@@ -648,7 +648,7 @@ fn generate_config_impl(
     // 5-bit `buffer_group` ceiling (31) is enforced by
     // `assign_buffer_groups`.
     // Graph section header layout — must agree with the parser at
-    // `src/kernel/config.rs::read_config_at_into` (graph_flags read).
+    // `src/kernel/boot/config.rs::read_config_at_into` (graph_flags read).
     //   byte 0: edge_count
     //   byte 1: graph_flags (bit 0 = ACCEPT_CYCLES; bits 1-7 reserved)
     //   bytes 2-3: reserved (must be 0)

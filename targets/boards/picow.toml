@@ -31,7 +31,7 @@ reserved_pins = [23, 24, 25, 29]
 
 [platform.net]
 phy = "wifi"
-driver = "cyw43"
+nic = "cyw43"
 
 # Public hardware-rig contract (see .context/rfc_hardware_rig.md §7).
 [rig]
@@ -43,3 +43,7 @@ preferred_console = "console.usb_cdc"
 observe = ["observe.console_regex", "observe.usb_enumeration"]
 power = ["power.cycle"]
 default_timeout_s = 20
+
+# Audio hardware fact: I2S out via PIO-driven pins (D-BOARD-STACK).
+[platform.audio]
+sink = "i2s"

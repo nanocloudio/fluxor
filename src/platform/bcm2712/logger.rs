@@ -1,7 +1,7 @@
 //! `log` crate backend — formats records into the kernel log ring.
 //!
 //! Parallel to the RingLogger on RP platforms: both routes funnel every
-//! `log::info!` etc. into `kernel::log_ring::push_bytes`. Wire output is
+//! `log::info!` etc. into `kernel::sys::log_ring::push_bytes`. Wire output is
 //! driven by an opt-in overlay module (log_uart / log_usb / log_net).
 
 pub struct RingLogger;
@@ -46,7 +46,7 @@ impl log::Log for RingLogger {
             }
             w.pos
         };
-        fluxor::kernel::log_ring::push_bytes(&buf[..written]);
+        fluxor::kernel::sys::log_ring::push_bytes(&buf[..written]);
     }
     fn flush(&self) {}
 }

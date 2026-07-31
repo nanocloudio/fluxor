@@ -13,7 +13,9 @@
 //! Host shim contract: `host_pointer_pop(buf, len)` returns one
 //! 16-byte record per call.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     fn host_pointer_pop(buf: *mut u8, len: usize) -> i32;

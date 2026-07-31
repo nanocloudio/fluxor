@@ -194,7 +194,7 @@ const REQ_OP_WRITE:         u32 = 1;
 const REQ_HDR_SIZE:         usize = 20;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
 // Parameter Definitions
@@ -3123,8 +3123,8 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     // `contracts/storage/fs.rs` (OPEN/READ report Volatile). The handle is
     // validated like every other op: `EINVAL` for a malformed buffer,
     // `ENOSYS` for handles this provider does not own.
-    if opcode == abi::contracts::fence::QUERY_OP {
-        if arg.is_null() || arg_len < abi::contracts::fence::WIRE_MAX_LEN {
+    if opcode == abi::fence::QUERY_OP {
+        if arg.is_null() || arg_len < abi::fence::WIRE_MAX_LEN {
             return E_INVAL;
         }
         let slot_idx = handle as usize;
@@ -3133,12 +3133,12 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         }
         let of = &s.open_files[slot_idx];
         let fence = if of.writable != 0 && of.durable != 0 {
-            abi::contracts::fence::Fence::LocalDurable {
+            abi::fence::Fence::LocalDurable {
                 device_id: FAT32_FS_DEVICE_ID,
             }
         } else {
             // Read-only handle, or writable bytes not yet through FS_FSYNC.
-            abi::contracts::fence::Fence::Volatile
+            abi::fence::Fence::Volatile
         };
         let buf = core::slice::from_raw_parts_mut(arg, arg_len);
         return match fence.encode(buf) {
@@ -4685,9 +4685,9 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");
 
 // ============================================================================
 // Host-test surface (feature = "host-test")

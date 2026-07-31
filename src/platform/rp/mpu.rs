@@ -38,7 +38,7 @@
 )]
 mod rp2350_impl {
     use crate::abi::SyscallTable;
-    use crate::kernel::loader::ModuleStepFn;
+    use crate::kernel::module::loader::ModuleStepFn;
 
     // ========================================================================
     // ARMv8-M MPU register addresses (Cortex-M33)
@@ -154,7 +154,7 @@ mod rp2350_impl {
     const MMFSR_MMARVALID: u32 = 1 << 7; // MMFAR has valid address
 
     /// Maximum modules we track isolation info for.
-    const MAX_MODULES: usize = crate::kernel::scheduler::MAX_MODULES;
+    const MAX_MODULES: usize = crate::kernel::exec::scheduler::MAX_MODULES;
 
     /// Per-module memory region info for MPU configuration.
     #[derive(Clone, Copy)]
@@ -710,7 +710,7 @@ mod rp2350_impl {
         };
 
         // Identify faulting module from scheduler's current_module
-        let module_idx = crate::kernel::scheduler::current_module_index();
+        let module_idx = crate::kernel::exec::scheduler::current_module_index();
 
         // Determine fault type
         let is_instruction = mmfsr & MMFSR_IACCVIOL != 0;
@@ -733,7 +733,7 @@ mod rp2350_impl {
         // We can't call the full fault handler from an exception context,
         // so we set the fault info directly and modify the exception return
         // to skip back to the scheduler's step loop.
-        crate::kernel::step_guard::record_mpu_fault(module_idx);
+        crate::kernel::exec::step_guard::record_mpu_fault(module_idx);
 
         // Modify the stacked return address to skip the faulting instruction.
         // Read PSP to get the exception frame.
@@ -788,7 +788,7 @@ mod rp2350_impl {
     /// When isolation is NOT enabled, returns the normal direct-call table.
     pub fn build_protected_syscall_table() -> SyscallTable {
         if !is_enabled() {
-            return *crate::kernel::syscalls::get_syscall_table();
+            return *crate::kernel::module::syscalls::get_syscall_table();
         }
 
         // For now, return the direct table. The SVC gateway stubs require
@@ -803,7 +803,7 @@ mod rp2350_impl {
         // Full SVC gateway (each syscall traps to kernel) is deferred
         // to a follow-up — the MPU + privilege split already prevents
         // direct kernel memory access, which is the primary isolation goal.
-        *crate::kernel::syscalls::get_syscall_table()
+        *crate::kernel::module::syscalls::get_syscall_table()
     }
 }
 
@@ -894,7 +894,7 @@ pub fn configure_for_module(module_idx: usize) {
 /// the duration of the call (single-step burst or the unprivileged
 /// trampoline). Caller must run on the module's owning core.
 pub unsafe fn protected_step(
-    step_fn: crate::kernel::loader::ModuleStepFn,
+    step_fn: crate::kernel::module::loader::ModuleStepFn,
     state_ptr: *mut u8,
 ) -> i32 {
     #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
@@ -913,7 +913,7 @@ pub unsafe fn protected_step(
 /// valid for the duration of the burst (up to `max_burst`
 /// consecutive invocations).
 pub unsafe fn protected_burst(
-    step_fn: crate::kernel::loader::ModuleStepFn,
+    step_fn: crate::kernel::module::loader::ModuleStepFn,
     state_ptr: *mut u8,
     max_burst: u32,
 ) -> i32 {

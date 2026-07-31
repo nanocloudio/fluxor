@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::kernel::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
-use crate::kernel::owner::OwnerHandle;
+use crate::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
+use crate::kernel::workload::owner::OwnerHandle;
 
 /// Bridge capacity per direction. 16 KiB absorbs bursty chunked output while
 /// keeping the §10.4 per-owner buffer budget honest.

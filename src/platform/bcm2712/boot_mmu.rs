@@ -1,6 +1,6 @@
 //! Boot-time MMU page tables — Pi 5 board only.
 //!
-//! Distinct from `fluxor::kernel::mmu`, which programmes per-module
+//! Distinct from `fluxor::platform::mmu`, which programmes per-module
 //! page tables for EL0 hardware isolation at runtime. This module
 //! builds the **identity-mapped** L1 + L2 tables consulted by the
 //! Cortex-A76 immediately after `_start` and enables the MMU before
@@ -151,7 +151,7 @@ mod pi5_impl {
             // Non-Cacheable (MAIR index 2). Hardware DMA and CPU see
             // coherent memory by construction — no DC CVAC / IVAC on
             // the fast path.
-            let dma_addr = fluxor::kernel::nic_ring::dma_arena_base();
+            let dma_addr = fluxor::platform::nic_ring::dma_arena_base();
             if dma_addr != 0 && dma_addr < 0x4000_0000 {
                 let l2_idx = dma_addr >> 21;
                 l2[l2_idx] = dma_block((l2_idx as u64) * 0x20_0000);
@@ -159,8 +159,8 @@ mod pi5_impl {
             // The PCIe1 arena's size is a tunable in net.rs and may span
             // more than one 2 MB L2 block, so flip EVERY block it covers
             // — a block left cacheable would silently corrupt DMA.
-            let pcie1_dma = fluxor::kernel::nic_ring::pcie1_dma_arena_base();
-            let pcie1_size = fluxor::kernel::nic_ring::pcie1_dma_arena_size();
+            let pcie1_dma = fluxor::platform::nic_ring::pcie1_dma_arena_base();
+            let pcie1_size = fluxor::platform::nic_ring::pcie1_dma_arena_size();
             if pcie1_dma != 0 && pcie1_dma < 0x4000_0000 {
                 let first = pcie1_dma >> 21;
                 let last = (pcie1_dma + pcie1_size - 1) >> 21;
@@ -262,9 +262,9 @@ mod pi5_impl {
         // Publish MAIR/TCR/TTBR0 for the secondary-core trampoline in
         // `bcm2712/multicore.rs`, which reads them with MMU off and
         // needs the values to already be at PoC.
-        let mair_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_MAIR);
-        let tcr_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_TCR);
-        let ttbr_p = core::ptr::addr_of_mut!(fluxor::kernel::SECONDARY_MMU_TTBR0);
+        let mair_p = core::ptr::addr_of_mut!(fluxor::platform::multicore::SECONDARY_MMU_MAIR);
+        let tcr_p = core::ptr::addr_of_mut!(fluxor::platform::multicore::SECONDARY_MMU_TCR);
+        let ttbr_p = core::ptr::addr_of_mut!(fluxor::platform::multicore::SECONDARY_MMU_TTBR0);
         core::ptr::write_volatile(mair_p, MAIR_VALUE);
         core::ptr::write_volatile(tcr_p, TCR_VALUE);
         core::ptr::write_volatile(ttbr_p, ttbr);

@@ -49,10 +49,14 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 use abi::contracts::net::net_proto as np;
-use abi::contracts::otlp;
+/// OTLP/JSON encoder — the reusable `cores/otlp_json` implementation, `include!`d
+/// here (it is this exporter's encoder, not a wire contract; see the file header).
+mod otlp {
+    include!("../../sdk/cores/otlp_json.rs");
+}
 use abi::contracts::telemetry as tlm;
 
 // ============================================================================
@@ -76,7 +80,8 @@ const MIN_RECORD: usize = tlm::METRIC_SCALAR_SIZE; // 24
 /// sizes change.
 const JSON_MAX: usize = 8192;
 const JSON_ENVELOPE_MAX: usize = 256; // begin (~150) + finish (~6), rounded up.
-const _: () = assert!(JSON_MAX >= JSON_ENVELOPE_MAX + (ACCUM_MAX / MIN_RECORD + 1) * MAX_JSON_PER_RECORD);
+const _: () =
+    assert!(JSON_MAX >= JSON_ENVELOPE_MAX + (ACCUM_MAX / MIN_RECORD + 1) * MAX_JSON_PER_RECORD);
 /// HTTP request buffer (headers + body copy).
 const REQ_MAX: usize = JSON_MAX + 256;
 /// Response head scratch (status line + headers up to `\r\n\r\n`). A response
@@ -130,7 +135,7 @@ const CHUNK_SIZE_CR: u8 = 2; // saw the size line CR, expecting its '\n'
 const CHUNK_DATA: u8 = 3; // draining chunk bytes
 const CHUNK_DATA_CR: u8 = 4; // expecting '\r' after chunk data
 const CHUNK_DATA_LF: u8 = 5; // expecting '\n' after chunk data
-// After the 0-size chunk: an optional trailer section ends with a bare CRLF.
+                             // After the 0-size chunk: an optional trailer section ends with a bare CRLF.
 const CHUNK_TRAILER: u8 = 6; // at the start of a trailer line
 const CHUNK_TRAILER_LINE: u8 = 7; // inside a trailer line, skipping to CR
 const CHUNK_TRAILER_LINE_LF: u8 = 8; // expecting '\n' ending a trailer line
@@ -279,9 +284,9 @@ impl OtlpState {
 // ============================================================================
 
 mod params_def {
-    use super::OtlpState;
     use super::p_u16;
     use super::p_u32;
+    use super::OtlpState;
     use super::IDTABLE_MAX;
     use super::PARAM_ID_TABLE;
     use super::SCHEMA_MAX;
@@ -328,7 +333,11 @@ unsafe fn store_idtable(s: &mut OtlpState, d: *const u8, len: usize) {
 /// miss, so the exporter still emits valid OTLP if the table is absent.
 fn resolve_name(idtable: &[u8], module: u16, id: u16, out: &mut [u8]) -> usize {
     if let Some(name) = otlp::resolve_in_table(idtable, module, id) {
-        let n = if name.len() > out.len() { out.len() } else { name.len() };
+        let n = if name.len() > out.len() {
+            out.len()
+        } else {
+            name.len()
+        };
         out[..n].copy_from_slice(&name[..n]);
         return n;
     }
@@ -383,7 +392,11 @@ fn push_dec(out: &mut [u8], pos: &mut usize, val: u32) {
 /// `m<idx>.s<id>` on a miss. Mirrors `resolve_name` for the metric family.
 fn resolve_span_name(idtable: &[u8], module: u16, id: u16, out: &mut [u8]) -> usize {
     if let Some(name) = otlp::resolve_span_in_table(idtable, module, id) {
-        let n = if name.len() > out.len() { out.len() } else { name.len() };
+        let n = if name.len() > out.len() {
+            out.len()
+        } else {
+            name.len()
+        };
         out[..n].copy_from_slice(&name[..n]);
         return n;
     }
@@ -469,8 +482,14 @@ fn build_metrics_json(accum: &[u8], idtable: &[u8], epoch_nanos: u64, json: &mut
                 while bi < tlm::HIST_BUCKETS {
                     let bo = 16 + bi * 8;
                     buckets[bi] = u64::from_le_bytes([
-                        rec[bo], rec[bo + 1], rec[bo + 2], rec[bo + 3],
-                        rec[bo + 4], rec[bo + 5], rec[bo + 6], rec[bo + 7],
+                        rec[bo],
+                        rec[bo + 1],
+                        rec[bo + 2],
+                        rec[bo + 3],
+                        rec[bo + 4],
+                        rec[bo + 5],
+                        rec[bo + 6],
+                        rec[bo + 7],
                     ]);
                     bi += 1;
                 }
@@ -511,7 +530,11 @@ fn build_request(dst_ip: u32, path: &[u8], body: &[u8], req: &mut [u8]) -> usize
     push_dec(req, &mut pos, ip[2] as u32);
     putb(req, &mut pos, b".");
     push_dec(req, &mut pos, ip[3] as u32);
-    putb(req, &mut pos, b"\r\nContent-Type: application/json\r\nContent-Length: ");
+    putb(
+        req,
+        &mut pos,
+        b"\r\nContent-Type: application/json\r\nContent-Length: ",
+    );
     push_dec(req, &mut pos, body.len() as u32);
     putb(req, &mut pos, b"\r\nConnection: keep-alive\r\n\r\n");
     // Body.
@@ -644,7 +667,15 @@ unsafe fn send_connect(s: &mut OtlpState) -> bool {
     payload[5] = port[0];
     payload[6] = port[1];
     payload[7] = dev_requester_tag(sys);
-    net_write_frame(sys, s.net_out_chan, np::CMD_CONNECT, payload.as_ptr(), 8, buf, NET_BUF_SIZE) > 0
+    net_write_frame(
+        sys,
+        s.net_out_chan,
+        np::CMD_CONNECT,
+        payload.as_ptr(),
+        8,
+        buf,
+        NET_BUF_SIZE,
+    ) > 0
 }
 
 /// Send as much of req[req_sent..req_len] as net_out accepts this tick, one
@@ -654,7 +685,11 @@ unsafe fn pump_send(s: &mut OtlpState) -> bool {
     let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
     while (s.req_sent as usize) < (s.req_len as usize) {
         let remaining = (s.req_len - s.req_sent) as usize;
-        let chunk = if remaining > max_data { max_data } else { remaining };
+        let chunk = if remaining > max_data {
+            max_data
+        } else {
+            remaining
+        };
         let buf = s.net_buf.as_mut_ptr();
         // CMD_SEND payload: [conn_id][data...] — assemble payload then frame.
         *buf.add(NET_FRAME_HDR) = s.conn_id;
@@ -690,8 +725,7 @@ fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i + needle.len() <= hay.len() {
         let mut k = 0;
-        while k < needle.len()
-            && hay[i + k].to_ascii_lowercase() == needle[k].to_ascii_lowercase()
+        while k < needle.len() && hay[i + k].to_ascii_lowercase() == needle[k].to_ascii_lowercase()
         {
             k += 1;
         }
@@ -782,7 +816,12 @@ fn hex_val(b: u8) -> Option<u8> {
 /// per-connection chunk state. Returns `Some(true)` when the terminating
 /// zero-length chunk has been fully consumed (response complete), `Some(false)`
 /// when more data is needed, or `None` on a malformed encoding.
-unsafe fn drain_chunked(s: &mut OtlpState, data: *const u8, start: usize, dlen: usize) -> Option<bool> {
+unsafe fn drain_chunked(
+    s: &mut OtlpState,
+    data: *const u8,
+    start: usize,
+    dlen: usize,
+) -> Option<bool> {
     let mut i = start;
     while i < dlen {
         let b = *data.add(i);
@@ -791,8 +830,10 @@ unsafe fn drain_chunked(s: &mut OtlpState, data: *const u8, start: usize, dlen: 
                 if b == b'\r' {
                     s.resp_chunk_state = CHUNK_SIZE_CR;
                 } else if let Some(h) = hex_val(b) {
-                    s.resp_chunk_size_acc =
-                        s.resp_chunk_size_acc.wrapping_mul(16).wrapping_add(h as u32);
+                    s.resp_chunk_size_acc = s
+                        .resp_chunk_size_acc
+                        .wrapping_mul(16)
+                        .wrapping_add(h as u32);
                 } else if b == b';' {
                     // Start of a chunk extension — its bytes must NOT be folded
                     // into the size (e.g. `;name=cafe` contains hex digits).
@@ -1000,9 +1041,7 @@ unsafe fn read_response(s: &mut OtlpState) -> Option<bool> {
                     // RFC 7230 §3.3.3: 1xx / 204 / 304 carry NO body regardless of
                     // Content-Length / Transfer-Encoding. Frame them as a zero
                     // Content-Length so the message completes right at the head.
-                    if s.resp_code == 204
-                        || s.resp_code == 304
-                        || (100..200).contains(&s.resp_code)
+                    if s.resp_code == 204 || s.resp_code == 304 || (100..200).contains(&s.resp_code)
                     {
                         mode = RESP_MODE_CONTENT_LENGTH;
                         body_len = 0;
@@ -1054,7 +1093,15 @@ unsafe fn close_conn(s: &mut OtlpState) {
         let sys = &*s.syscalls;
         let buf = s.net_buf.as_mut_ptr();
         let payload = [s.conn_id];
-        net_write_frame(sys, s.net_out_chan, np::CMD_CLOSE, payload.as_ptr(), 1, buf, NET_BUF_SIZE);
+        net_write_frame(
+            sys,
+            s.net_out_chan,
+            np::CMD_CLOSE,
+            payload.as_ptr(),
+            1,
+            buf,
+            NET_BUF_SIZE,
+        );
     }
     s.connected = false;
     s.conn_id = 0;
@@ -1105,10 +1152,8 @@ pub extern "C" fn module_new(
         s.net_in_chan = dev_channel_port(sys, 0, 1); // in[1]: frames from ip
         s.net_out_chan = dev_channel_port(sys, 1, 0); // out[0]: frames to ip
 
-        let is_tlv = !params.is_null()
-            && params_len >= 4
-            && *params == 0xFE
-            && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -1142,7 +1187,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // complete; draining mid-batch would make the two docs disagree and could
         // drop records cleared with the batch. Frozen-out records stay queued in
         // the telemetry channel (bounded backpressure) and drain once we idle.
-        if !matches!(s.phase, Phase::Sending | Phase::WaitResponse | Phase::Disabled) {
+        if !matches!(
+            s.phase,
+            Phase::Sending | Phase::WaitResponse | Phase::Disabled
+        ) {
             drain_into_accum(s);
         }
 
@@ -1215,7 +1263,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 } else if msg_type == np::MSG_ERROR {
                     // Connect failure carries our tag at payload[2]
                     // ([conn_id][errno][tag]); back off only for our own.
-                    let etag = if copied >= 3 { *buf.add(NET_FRAME_HDR + 2) } else { 0 };
+                    let etag = if copied >= 3 {
+                        *buf.add(NET_FRAME_HDR + 2)
+                    } else {
+                        0
+                    };
                     if etag == 0 || etag == dev_requester_tag(sys) {
                         s.phase = Phase::Backoff;
                         s.backoff_until_micros = dev_micros(sys).wrapping_add(BACKOFF_MICROS);
@@ -1338,4 +1390,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

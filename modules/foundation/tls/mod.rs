@@ -41,15 +41,15 @@ use abi::SyscallTable;
 
 // PIC runtime (syscalls, helpers, intrinsics)
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // Crypto primitives
-include!("../../sdk/sha256.rs");
-include!("../../sdk/sha384.rs");
-include!("../../sdk/hmac.rs");
-include!("../../sdk/chacha20.rs");
-include!("../../sdk/aes_gcm.rs");
-include!("../../sdk/p256.rs");
+include!("../../sdk/crypto/sha256.rs");
+include!("../../sdk/crypto/sha384.rs");
+include!("../../sdk/crypto/hmac.rs");
+include!("../../sdk/crypto/chacha20.rs");
+include!("../../sdk/crypto/aes_gcm.rs");
+include!("../../sdk/crypto/p256.rs");
 include!("x509.rs");
 
 // TLS protocol
@@ -433,6 +433,13 @@ struct TlsState {
     /// simultaneous handshakes overlap. See the use site for why the
     /// original starvation rationale no longer holds.
     handshake_pump_budget: u16,
+    /// ALPN restriction for the server EncryptedExtensions selection.
+    /// 0 (default) offers the historic `h2` > `http/1.1` preference. 1
+    /// restricts the advertised set to `http/1.1` only, so a client that
+    /// offers both is steered to HTTP/1.1. An edge that fronts an h1-only
+    /// proxy relay (`workload_ingress` §3) sets this so h2 clients don't
+    /// negotiate a protocol the relay can't route.
+    alpn_h1_only: u8,
 
     // Channel ports (4-port node: cipher side facing IP, clear side facing HTTP)
     cipher_in: i32,  // from IP: ciphertext net_proto frames
@@ -493,6 +500,18 @@ struct TlsState {
     /// its single tag, so a SECOND concurrent connect is rejected with EAGAIN
     /// (translated downstream) rather than silently overwriting the pending slot.
     pending_connect_active: bool,
+
+    /// Cleartext-passthrough conn_id set (256-bit bitmap, conn_id → bit).
+    /// A NEW, additive conn class introduced for `workload_ingress` §5: when a
+    /// SERVER-mode TLS instance's clear-side consumer (an h1 proxy relay) dials
+    /// a cleartext backend, the resulting `MSG_CONNECTED` conn_id is marked here
+    /// instead of allocating a TLS session. Passthrough conns relay
+    /// `MSG_CONNECTED` / `MSG_DATA` / `MSG_CLOSED` (cipher→clear) and clear-side
+    /// `CMD_SEND` / `CMD_CLOSE` (clear→cipher) RAW — no session, no crypto, no
+    /// ClientHello. Inbound-terminated TLS sessions never set a bit here, so the
+    /// real-session data path (`find_session_by_conn_id` → encrypt/decrypt) is
+    /// byte-identical. conn_id 0 is a legitimate id and maps to bit 0.
+    passthrough_conns: [u8; 32],
 
     // Certificate and key (DER-encoded, loaded from params)
     cert: [u8; MAX_CERT_LEN],
@@ -677,6 +696,12 @@ define_params! {
             let v = p_u16(d, len, 0, 1);
             s.handshake_pump_budget = if v == 0 { 1 } else { v };
         };
+
+    // Restrict the server's ALPN advertisement to `http/1.1` only. 0 keeps the
+    // historic `h2` > `http/1.1` preference; 1 steers dual-offering clients to
+    // HTTP/1.1 so an h1-only proxy edge never negotiates h2 (workload_ingress §3).
+    10, alpn_h1_only, u8, 0
+        => |s, d, len| { s.alpn_h1_only = p_u8(d, len, 0, 0); };
 }
 
 // ============================================================================
@@ -727,6 +752,7 @@ pub unsafe extern "C" fn module_new(
     s.frame_write_dropped = 0;
     s.pending_downstream_tag = 0;
     s.pending_connect_active = false;
+    s.passthrough_conns = [0u8; 32];
     s.transport = TRANSPORT_TCP;
     s.accept_port = 0;
     s.bind_port = 0;
@@ -1253,10 +1279,30 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         true
                     }
                 };
-                // Allocate a session only for connections we claim. A
-                // MSG_CONNECTED tagged for another consumer is consumed
-                // (frame already read) but otherwise ignored.
-                if claim {
+                // Cleartext passthrough (workload_ingress §5): a SERVER-mode
+                // TLS instance's clear-side consumer (an h1 proxy relay) dialed
+                // a cleartext backend via CMD_CONNECT. `pending_connect_active`
+                // in server mode is set ONLY by a clear-side CMD_CONNECT (there
+                // is no client-side active-open), so this MSG_CONNECTED completes
+                // that backend dial. It must NOT become a TLS session — the
+                // backend speaks plaintext (RFC §5: backend hops are cleartext
+                // in v1). Mark the conn passthrough and relay MSG_CONNECTED down
+                // RAW; no session alloc, no ClientHello. Client-mode TLS
+                // (mode==0, real outbound TLS) is untouched — it falls through
+                // to the session-allocating path below exactly as before.
+                if claim && t == NET_MSG_CONNECTED && s.mode == 1 && s.pending_connect_active {
+                    let dtag = s.pending_downstream_tag;
+                    s.pending_connect_active = false;
+                    s.pending_downstream_tag = 0;
+                    set_passthrough(s, conn_id);
+                    // Forward MSG_CONNECTED to the clear side with the original
+                    // downstream requester tag at payload[1], matching the
+                    // session path's `forward_held_completion` framing so the
+                    // relay routes it on a fanned clear_out.
+                    let out = [conn_id, dtag];
+                    let _ =
+                        tls_write_raw_frame(sys, s.clear_out, NET_MSG_CONNECTED, out.as_ptr(), 2);
+                } else if claim {
                     match alloc_session_for_conn(s, conn_id) {
                         Some(idx) => {
                             s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
@@ -1338,6 +1384,19 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // pointer + length contract documented at its declaration.
                     let conn_id = unsafe { *conn_id_buf.as_ptr() };
                     let data_len = pl - 1;
+                    if is_passthrough(s, conn_id) {
+                        // Cleartext backend → clear side, RAW. No session, no
+                        // decryption (workload_ingress §5).
+                        passthrough_relay(
+                            s,
+                            s.cipher_in,
+                            s.clear_out,
+                            NET_MSG_DATA,
+                            conn_id,
+                            data_len,
+                        );
+                        continue;
+                    }
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         let idx = si as usize;
@@ -1399,7 +1458,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     tls_discard(sys, s.cipher_in, pl - 16);
                 }
                 let conn_id = if pl > 0 { payload[0] } else { 0 };
-                // Clean up session
+                // Clean up session (or drop a passthrough conn's mark). A
+                // passthrough conn has no session, so `find_session` is -1;
+                // clearing the bit lets the id be reused (workload_ingress §5).
+                clear_passthrough(s, conn_id);
                 let si = find_session_by_conn_id(s, conn_id);
                 if si >= 0 {
                     s.sessions[si as usize].reset();
@@ -1593,6 +1655,19 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     (sys.channel_read)(s.clear_in, conn_id_buf.as_mut_ptr(), 1);
                     let conn_id = conn_id_buf[0];
                     let data_len = pl - 1;
+                    if is_passthrough(s, conn_id) {
+                        // Clear side → cleartext backend, RAW. No session, no
+                        // encryption (workload_ingress §5).
+                        passthrough_relay(
+                            s,
+                            s.clear_in,
+                            s.cipher_out,
+                            NET_CMD_SEND,
+                            conn_id,
+                            data_len,
+                        );
+                        continue;
+                    }
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         let idx = si as usize;
@@ -1690,6 +1765,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     tls_discard(sys, s.clear_in, pl - 16);
                 }
                 let conn_id = if pl > 0 { payload[0] } else { 0 };
+                // Drop any passthrough mark (no session, no close_notify — the
+                // backend hop is cleartext; workload_ingress §5). The raw
+                // CMD_CLOSE forward below tears the backend TCP conn down.
+                clear_passthrough(s, conn_id);
                 // Send close_notify alert if session is ready
                 let si = find_session_by_conn_id(s, conn_id);
                 if si >= 0 {
@@ -1985,6 +2064,56 @@ fn find_session_by_conn_id(s: &TlsState, conn_id: u8) -> i32 {
         i += 1;
     }
     -1
+}
+
+// ── Cleartext-passthrough conn tracking (workload_ingress §5) ────────────────
+// A passthrough conn is NOT a session: no crypto state, no slot. These helpers
+// index a 256-bit bitmap by conn_id so the relay branches (added before every
+// `find_session_by_conn_id` on the data path) are O(1) and never disturb the
+// existing session lookup for inbound-terminated TLS.
+
+#[inline]
+fn is_passthrough(s: &TlsState, conn_id: u8) -> bool {
+    (s.passthrough_conns[(conn_id >> 3) as usize] >> (conn_id & 7)) & 1 != 0
+}
+
+#[inline]
+fn set_passthrough(s: &mut TlsState, conn_id: u8) {
+    s.passthrough_conns[(conn_id >> 3) as usize] |= 1 << (conn_id & 7);
+}
+
+#[inline]
+fn clear_passthrough(s: &mut TlsState, conn_id: u8) {
+    s.passthrough_conns[(conn_id >> 3) as usize] &= !(1 << (conn_id & 7));
+}
+
+/// Relay `data_len` bytes of a passthrough conn's stream from `from_chan` to
+/// `to_chan`, re-framing as `[msg_type][conn_id][chunk]` frames. No crypto —
+/// the bytes pass through unchanged. Chunked so each frame fits the shared
+/// `net_scratch` used by `tls_write_or_count` (which the local read buffer must
+/// not alias, hence the stack buffer here). A dropped chunk is counted via
+/// `tls_write_or_count`; TCP's ARQ recovers on the wire side.
+unsafe fn passthrough_relay(
+    s: &mut TlsState,
+    from_chan: i32,
+    to_chan: i32,
+    msg_type: u8,
+    conn_id: u8,
+    mut data_len: usize,
+) {
+    const RELAY_CHUNK: usize = 1400;
+    let sys = &*s.syscalls;
+    let mut buf = [0u8; RELAY_CHUNK];
+    while data_len > 0 {
+        let rd = if data_len < RELAY_CHUNK {
+            data_len
+        } else {
+            RELAY_CHUNK
+        };
+        (sys.channel_read)(from_chan, buf.as_mut_ptr(), rd);
+        let _ = tls_write_or_count(s, to_chan, msg_type, conn_id, buf.as_ptr(), rd as u16);
+        data_len -= rd;
+    }
 }
 
 // Peer certificate verification is deferred — requires larger module binary.
@@ -2666,6 +2795,9 @@ unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
 
 unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
+    // Captured before the `sess` borrow so the ALPN selection below can consult
+    // it without re-borrowing `s` (workload_ingress §3 ALPN restriction).
+    let alpn_h1_only = s.alpn_h1_only != 0;
     let sess = &mut s.sessions[idx];
 
     let (msg, total, msg_type) = match driver_read_handshake_message(sess) {
@@ -2732,10 +2864,12 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // preference order is `h2` then `http/1.1`; if the client's ALPN
     // extension overlaps with that list, we record the chosen
     // protocol so the EncryptedExtensions builder can echo it back.
+    // When `alpn_h1_only` is set the server advertises only `http/1.1`,
+    // so a dual-offering client is steered to HTTP/1.1 (workload_ingress §3).
     sess.driver.alpn_selected_len = 0;
     if let Some(list) = ch.alpn_protos {
         for offered in alpn_iter(list) {
-            if offered == b"h2" || offered == b"http/1.1" {
+            if offered == b"http/1.1" || (!alpn_h1_only && offered == b"h2") {
                 let n = offered.len();
                 if n <= sess.driver.alpn_selected.len() {
                     core::ptr::copy_nonoverlapping(
@@ -3815,9 +3949,9 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");
 
 // ============================================================================
 // Test helpers (host-test feature only)

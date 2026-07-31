@@ -42,7 +42,7 @@ include!("../../sdk/runtime.rs");
 
 // ---- EL0 syscall gateway (SVC #1) ------------------------------------------
 //
-// Calling convention mirrors `kernel::el0_abi`:
+// Calling convention mirrors `kernel::module::el0_abi`:
 //   x0 = op, x1 = channel handle, x2 = buffer ptr, x3 = len -> x0 = result.
 const SYS_CHANNEL_READ: u64 = 0;
 const SYS_CHANNEL_WRITE: u64 = 1;
@@ -251,4 +251,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

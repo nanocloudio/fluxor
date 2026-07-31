@@ -11,7 +11,7 @@ name = "audio"
 # ── RP2 family: I2S DAC driven by PIO ────────────────────────────────────
 # Pulls in `pio_rp` because i2s_pio claims a PIO state machine.
 [[variant]]
-match = { family = "rp", driver = "i2s_pio" }
+match = { family = "rp", sink = "i2s" }
 modules = [
   { name = "pio_rp" },
   { name = "audio_out", type = "i2s_pio",
@@ -31,7 +31,7 @@ wiring = []
 # feature). `mode: wav` writes a RIFF/WAVE file; `mode: raw` writes
 # little-endian PCM; `mode: null` drains for backpressure tests.
 [[variant]]
-match = { family = "linux", driver = "host" }
+match = { family = "linux", sink = "host" }
 modules = [
   { name = "audio_out", type = "linux_audio",
     params = {

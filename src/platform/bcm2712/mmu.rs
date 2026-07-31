@@ -33,7 +33,7 @@
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod bcm2712_impl {
-    use crate::kernel::scheduler::MAX_MODULES;
+    use crate::kernel::exec::scheduler::MAX_MODULES;
 
     // ========================================================================
     // AArch64 translation table constants (4KB granule)
@@ -562,10 +562,10 @@ mod bcm2712_impl {
     const EL0_FAIL_CLOSED: i32 = -14; // EFAULT
 
     pub unsafe fn enter_el0(
-        step_fn: crate::kernel::loader::ModuleStepFn,
+        step_fn: crate::kernel::module::loader::ModuleStepFn,
         state_ptr: *mut u8,
     ) -> i32 {
-        let idx = crate::kernel::scheduler::current_module_index();
+        let idx = crate::kernel::exec::scheduler::current_module_index();
         if is_enabled() {
             // The loader only routes here for a module that declared
             // `protection: isolated`. If its isolated page table isn't built
@@ -634,7 +634,7 @@ mod bcm2712_impl {
         core::arch::asm!("mrs {}, far_el1", out(reg) far);
         core::arch::asm!("mrs {}, esr_el1", out(reg) esr);
 
-        let module_idx = crate::kernel::scheduler::current_module_index();
+        let module_idx = crate::kernel::exec::scheduler::current_module_index();
         let dfsc = esr & 0x3F; // Data Fault Status Code
 
         // Check if this is a translation fault in a paged arena (DFSC 0x04-0x07 = translation fault)
@@ -658,7 +658,7 @@ mod bcm2712_impl {
         );
 
         // Record fault via step_guard
-        crate::kernel::step_guard::record_mpu_fault(module_idx);
+        crate::kernel::exec::step_guard::record_mpu_fault(module_idx);
     }
 
     // ========================================================================
@@ -1073,7 +1073,7 @@ mod bcm2712_impl {
 
         #[inline]
         fn cur_core() -> usize {
-            let id = crate::kernel::hal::core_id();
+            let id = crate::kernel::sys::hal::core_id();
             if id < MAX_CORES {
                 id
             } else {
@@ -1569,7 +1569,7 @@ mod bcm2712_impl {
         /// core (scheduler invariant).
         pub unsafe fn enter(
             module_idx: usize,
-            step_fn: crate::kernel::loader::ModuleStepFn,
+            step_fn: crate::kernel::module::loader::ModuleStepFn,
             state_ptr: *mut u8,
         ) -> i32 {
             let slot = MOD_TO_SLOT[module_idx];
@@ -1649,7 +1649,7 @@ mod bcm2712_impl {
                 core::ptr::write_volatile(core::ptr::addr_of_mut!((*cb).fault_pending), 0);
                 // Record against the fault state machine so the scheduler's
                 // post-step check runs the configured Skip/Restart policy.
-                crate::kernel::step_guard::record_mpu_fault(module_idx);
+                crate::kernel::exec::step_guard::record_mpu_fault(module_idx);
             } else {
                 // Clean EL0 round-trip: `module_step` ran at EL0 and returned
                 // via the `SVC #0` trampoline through the lower-EL vector —
@@ -1704,7 +1704,7 @@ mod bcm2712_impl {
                 (r.chan_base, r.chan_size),
                 (stack_lo, EL0_STACK_BYTES),
             ];
-            crate::kernel::el0_abi::buf_within_regions(ptr, len, &regions)
+            crate::kernel::module::el0_abi::buf_within_regions(ptr, len, &regions)
         }
 
         /// Authorize a channel handle for `module_idx`'s `SVC #1` gateway.
@@ -1769,8 +1769,8 @@ mod bcm2712_impl {
             len: usize,
             module_idx: u32,
         ) -> i64 {
-            use crate::kernel::channel;
-            use crate::kernel::el0_abi::{
+            use crate::kernel::ipc::channel;
+            use crate::kernel::module::el0_abi::{
                 classify_heap_free, HeapFreeAction, EL0_EFAULT, EL0_EINVAL, EL0_EPERM,
                 SYS_CHANNEL_POLL, SYS_CHANNEL_READ, SYS_CHANNEL_WRITE, SYS_HEAP_ALLOC,
                 SYS_HEAP_FREE,
@@ -1831,7 +1831,7 @@ mod bcm2712_impl {
                     if size == 0 {
                         return 0; // alloc(0) is null by contract
                     }
-                    let p = crate::kernel::heap::heap_alloc(module_idx, size);
+                    let p = crate::kernel::mem::heap::heap_alloc(module_idx, size);
                     if p.is_null() {
                         return 0;
                     }
@@ -1844,8 +1844,8 @@ mod bcm2712_impl {
                     // back and fail closed.
                     let pa = p as u64;
                     let (hb, hs) = el0_heap_region(module_idx);
-                    if !crate::kernel::el0_abi::buf_within_regions(pa, size, &[(hb, hs)]) {
-                        crate::kernel::heap::heap_free(module_idx, p);
+                    if !crate::kernel::module::el0_abi::buf_within_regions(pa, size, &[(hb, hs)]) {
+                        crate::kernel::mem::heap::heap_free(module_idx, p);
                         log::error!(
                             "[el0] module {module_idx} heap_alloc({size}) returned 0x{pa:x} \
                              OUTSIDE heap mapping 0x{hb:x}+{hs} — freed + failing closed"
@@ -1878,7 +1878,7 @@ mod bcm2712_impl {
                             // SAFETY: `ptr` is non-null and validated to lie in
                             // this module's heap arena; the allocator only
                             // touches block metadata within that arena.
-                            crate::kernel::heap::heap_free(module_idx, ptr as *mut u8);
+                            crate::kernel::mem::heap::heap_free(module_idx, ptr as *mut u8);
                             0
                         }
                         HeapFreeAction::Reject => {
@@ -2328,7 +2328,7 @@ pub fn switch_to_kernel() {
 /// Caller must run on the module's owning core so MMU isolation targets the
 /// correct per-module L2/L3 page tables installed via `setup_paged_arena`.
 pub unsafe fn protected_step(
-    step_fn: crate::kernel::loader::ModuleStepFn,
+    step_fn: crate::kernel::module::loader::ModuleStepFn,
     state_ptr: *mut u8,
 ) -> i32 {
     #[cfg(feature = "chip-bcm2712")]

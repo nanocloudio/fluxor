@@ -4,7 +4,7 @@
 //! and produces a ResourcePlan consumed by main.rs init code.
 //! Pure function: no side effects, no hardware access.
 
-use crate::kernel::config::{
+use crate::kernel::boot::config::{
     GpioConfig, HardwareConfig, I2cConfig, SpiConfig, MAX_GPIO_CONFIGS, MAX_I2C_BUSES,
     MAX_SPI_BUSES,
 };
@@ -339,10 +339,10 @@ pub fn log_plan(_plan: &ResourcePlan) {}
 // gSPI + I2S) when a field is absent. The defaults are
 // RP-platform-specific and live here rather than in the kernel —
 // platform-neutral parsing types (`HardwareConfig`, `SpiConfig`, …)
-// stay in `kernel::config` so non-RP targets (BCM, Linux, WASM)
+// stay in `kernel::boot::config` so non-RP targets (BCM, Linux, WASM)
 // never pick up RP hardware assumptions.
 
-use crate::kernel::config::{self as kernel_config, GpioDirection, PioConfig};
+use crate::kernel::boot::config::{self as kernel_config, GpioDirection, PioConfig};
 
 /// Default SPI configuration (Pico 2 W SD card pins).
 pub const DEFAULT_SPI: SpiConfig = SpiConfig {
@@ -449,12 +449,14 @@ impl Hardware {
     }
 
     /// Get GPIO config for a specific pin.
-    pub fn gpio(&self, pin: u8) -> Option<&crate::kernel::config::GpioConfig> {
+    pub fn gpio(&self, pin: u8) -> Option<&crate::kernel::boot::config::GpioConfig> {
         self.config.gpio.iter().flatten().find(|g| g.pin == pin)
     }
 
     /// Get raw GPIO configs.
-    pub fn gpio_configs(&self) -> &[Option<crate::kernel::config::GpioConfig>; MAX_GPIO_CONFIGS] {
+    pub fn gpio_configs(
+        &self,
+    ) -> &[Option<crate::kernel::boot::config::GpioConfig>; MAX_GPIO_CONFIGS] {
         &self.config.gpio
     }
 
@@ -465,7 +467,7 @@ impl Hardware {
 
     /// Initialize all GPIO pins from config.
     pub fn init_gpio(&self) -> usize {
-        (crate::kernel::hal::init_gpio)(&self.config.gpio)
+        (crate::kernel::sys::hal::init_gpio)(&self.config.gpio)
     }
 }
 

@@ -9,12 +9,12 @@ use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::{Duration, Timer};
 use {defmt_rtt as _, panic_probe as _};
 
-use fluxor::kernel::pio_util;
+use fluxor::platform::rp_io::pio as pio_util;
 
-use fluxor::kernel::planner::Hardware;
-use fluxor::kernel::planner::{self, PioRole};
-use fluxor::kernel::scheduler::{self, setup, RunnerConfig, StepResult, MAX_MODULES};
-use fluxor::kernel::syscalls;
+use fluxor::platform::planner::Hardware;
+use fluxor::platform::planner::{self, PioRole};
+use fluxor::kernel::exec::scheduler::{self, setup, RunnerConfig, StepResult, MAX_MODULES};
+use fluxor::kernel::module::syscalls;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
@@ -28,7 +28,7 @@ bind_interrupts!(struct Irqs {
 
 #[cortex_m_rt::exception]
 unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
-    use fluxor::kernel::scheduler::{CRASH_DATA, CRASH_MAGIC, DBG_STEP_MODULE, DBG_TICK};
+    use fluxor::kernel::exec::scheduler::{CRASH_DATA, CRASH_MAGIC, DBG_STEP_MODULE, DBG_TICK};
 
     let crash = (&raw mut CRASH_DATA) as *mut u32;
     core::ptr::write_volatile(crash, CRASH_MAGIC);
@@ -77,7 +77,7 @@ unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
 unsafe fn DefaultHandler(irqn: i16) {
     if irqn >= 0 {
         let irq = irqn as u16;
-        if fluxor::kernel::isr_tier::isr_tier2_trampoline(irq) < 0 {
+        if fluxor::kernel::exec::isr_tier::isr_tier2_trampoline(irq) < 0 {
             // No Tier 2 module owns this IRQ — mask it so it cannot storm.
             cortex_m::peripheral::NVIC::mask(RawIrq(irq));
         }
@@ -115,7 +115,7 @@ fn rp_irq_bind(irq: u32, _event_handle: i32, _trampoline_or_mmio: usize, _target
     #[cfg(not(feature = "chip-rp2040"))]
     const NVIC_IRQ_MAX: u32 = 52;
     if irq > NVIC_IRQ_MAX {
-        return fluxor::kernel::errno::EINVAL;
+        return fluxor::kernel::sys::errno::EINVAL;
     }
     // SAFETY: unmasking an NVIC line is sound; the line only fires once its
     // peripheral asserts, and an unowned fire is masked by `DefaultHandler`.
@@ -130,7 +130,7 @@ fn rp_irq_bind(irq: u32, _event_handle: i32, _trampoline_or_mmio: usize, _target
 // ============================================================================
 //
 // Replaces embassy_usb_logger on RP platforms. Every log crate record
-// becomes plain UTF-8 bytes in `kernel::log_ring`, which is the canonical
+// becomes plain UTF-8 bytes in `kernel::sys::log_ring`, which is the canonical
 // log bus across all boards. A transport overlay (`log_net`, `log_usb`,
 // `log_uart`) drains the ring and forwards the bytes on its wire; if no
 // overlay is loaded, log output stays in the ring until it overflows and
@@ -179,7 +179,7 @@ impl log::Log for RingLogger {
             }
             w.pos
         };
-        fluxor::kernel::log_ring::push_bytes(&buf[..written]);
+        fluxor::kernel::sys::log_ring::push_bytes(&buf[..written]);
     }
     fn flush(&self) {}
 }
@@ -287,7 +287,7 @@ async fn usb_cdc_task(driver: Driver<'static, USB>) {
             sender.wait_connection().await;
             // Host is attached; the local log-ring consumer is free to
             // flow without stalling the producer.
-            fluxor::kernel::log_ring::activate_local();
+            fluxor::kernel::sys::log_ring::activate_local();
             loop {
                 let n = USB_TX_PIPE.read(&mut buf).await;
                 if sender.write_packet(&buf[..n]).await.is_err() {
@@ -303,7 +303,7 @@ async fn usb_cdc_task(driver: Driver<'static, USB>) {
             // bytes staged between the ring and the USB endpoint, and
             // flush the CDC pipe so the next attach sees "now"-bytes
             // instead of pre-detach backlog.
-            fluxor::kernel::log_ring::disable_local();
+            fluxor::kernel::sys::log_ring::disable_local();
             USB_TX_PIPE.clear();
             // SAFETY: the Embassy main task is the only caller that
             // touches DEBUG_DRAIN; this branch runs inside that task.
@@ -330,10 +330,10 @@ async fn main(spawner: Spawner) {
     // SAFETY: WATCHDOG_CTRL is a fixed MMIO register on the RP2xxx peripheral
     // bus; single boot-thread writer.
     unsafe {
-        core::ptr::write_volatile(fluxor::kernel::chip::WATCHDOG_CTRL as *mut u32, 0);
+        core::ptr::write_volatile(fluxor::platform::chip::WATCHDOG_CTRL as *mut u32, 0);
     }
 
-    // Install the ring-backed log backend. Records go into kernel::log_ring
+    // Install the ring-backed log backend. Records go into kernel::sys::log_ring
     // and are consumed by PIC modules (e.g. log_net for UDP netconsole).
     init_logger();
 
@@ -350,7 +350,7 @@ async fn main(spawner: Spawner) {
     // --- Resolve resource plan (max_gpio from config target) ---
     let hw = Hardware::new();
     let max_gpio = hw.raw_config().max_gpio;
-    fluxor::kernel::gpio::set_runtime_max_gpio(max_gpio);
+    fluxor::platform::rp_io::gpio::set_runtime_max_gpio(max_gpio);
     let plan = match planner::resolve(hw.raw_config(), max_gpio) {
         Ok(p) => p,
         Err(e) => {
@@ -472,7 +472,7 @@ async fn main(spawner: Spawner) {
 // ============================================================================
 
 use embassy_sync::signal::Signal;
-use fluxor::kernel::hal::HalOps;
+use fluxor::kernel::sys::hal::HalOps;
 
 /// Scheduler wake signal — Embassy-safe, used by HAL wake_scheduler.
 pub static SCHEDULER_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -529,7 +529,7 @@ fn rp_tick_count() -> u32 {
 /// cannot report its wake source, so the caller re-checks its work state.
 fn rp_sleep_until(_deadline_us: u64) -> u32 {
     cortex_m::asm::wfe();
-    fluxor::kernel::hal::WOKEN_UNKNOWN
+    fluxor::kernel::sys::hal::WOKEN_UNKNOWN
 }
 
 // Flash bounds come from linker symbols declared in
@@ -595,13 +595,13 @@ fn rp_pic_barrier() {
         // SAFETY: counter increment + interrupt re-enable; we only enable
         // when PRIMASK shows IRQs were already enabled (mirroring caller state).
         unsafe {
-            fluxor::kernel::loader::increment_irq_disabled_count();
+            fluxor::kernel::module::loader::increment_irq_disabled_count();
             cortex_m::interrupt::enable();
         }
     }
 }
 
-use fluxor::kernel::rp_step_guard as step_guard_backend;
+use fluxor::platform::rp_step_guard as step_guard_backend;
 
 fn rp_step_guard_post_check() {
     // No-op on Cortex-M
@@ -638,22 +638,49 @@ fn rp_isr_tier_poll() {
 }
 
 fn rp_init_providers() {
-    fluxor::kernel::rp_providers::init();
+    fluxor::platform::rp_providers::init();
 }
 
 fn rp_release_module_handles(module_idx: u8) {
-    fluxor::kernel::rp_providers::release_handles(module_idx);
+    fluxor::platform::rp_providers::release_handles(module_idx);
 }
 
 fn rp_boot_scan() {
-    fluxor::kernel::flash_store::boot_scan();
+    fluxor::platform::rp_flash::store::boot_scan();
 }
 
 fn rp_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize {
     // SAFETY: forwards buf/len/max from the kernel's persistent-storage
     // caller; flash_store::merge_runtime_overrides documents the contract.
-    unsafe { fluxor::kernel::flash_store::merge_runtime_overrides(module_id as u8, buf, len, max) }
+    unsafe { fluxor::platform::rp_flash::store::merge_runtime_overrides(module_id as u8, buf, len, max) }
 }
+
+
+/// HalOps protection impls: the portable MPU facade (no-op internally on
+/// non-RP silicon) and the shared direct step dispatch.
+fn prot_register_module(
+    module_idx: usize,
+    code_base: usize,
+    code_size: usize,
+    state_ptr: *mut u8,
+    state_size: usize,
+    heap_ptr: *mut u8,
+    heap_size: usize,
+) {
+    fluxor::platform::mpu::register_module(
+        module_idx,
+        code_base as u32,
+        code_size as u32,
+        state_ptr,
+        state_size,
+        heap_ptr,
+        heap_size,
+    );
+}
+fn prot_set_channel_region(module_idx: usize, base: usize, size: usize) {
+    fluxor::platform::mpu::set_channel_region(module_idx, base as u32, size as u32);
+}
+use fluxor::kernel::sys::hal::protected_step_direct as fluxor_protected_step_direct;
 
 static RP_HAL_OPS: HalOps = HalOps {
     disable_interrupts: rp_disable_interrupts,
@@ -684,11 +711,24 @@ static RP_HAL_OPS: HalOps = HalOps {
     release_module_handles: rp_release_module_handles,
     boot_scan: rp_boot_scan,
     merge_runtime_overrides: rp_merge_runtime_overrides,
-    init_gpio: |gpio| fluxor::kernel::gpio::init_all_from_config(gpio),
+    init_gpio: |gpio| fluxor::platform::rp_io::gpio::init_all_from_config(gpio),
     csprng_fill: rp_csprng_fill,
     core_id: || 0,
     irq_bind: rp_irq_bind,
     sleep_until: rp_sleep_until,
+    smp_quiesce_peers: || false,
+    smp_release_peers: || {},
+    smp_max_domains: || 1,
+    protection_set_enabled: fluxor::platform::mpu::set_enabled,
+    protection_reset: || {},
+    protection_register_module: prot_register_module,
+    protection_set_channel_region: prot_set_channel_region,
+    protection_set_isolated_channels: |_, _, _, _| {},
+    protected_step: fluxor_protected_step_direct,
+    protection_map_page: |_, _, _, _| {},
+    protection_unmap_page: |_, _| {},
+    stack_canary_check: fluxor::platform::mpu::check_stack_canary,
+    stack_canary_reinit: fluxor::platform::mpu::reinit_stack_canary,
 };
 
 /// Fill buffer with random bytes from the ROSC RANDOMBIT register.
@@ -755,8 +795,8 @@ async fn rp_setup_graph_async() -> i32 {
 
 #[inline(never)]
 async fn rp_instantiate_all_modules_async(
-    loader: &fluxor::kernel::loader::ModuleLoader,
-    module_list: &[Option<fluxor::kernel::config::ModuleEntry>; MAX_MODULES],
+    loader: &fluxor::kernel::module::loader::ModuleLoader,
+    module_list: &[Option<fluxor::kernel::boot::config::ModuleEntry>; MAX_MODULES],
     module_count: usize,
     edges: &mut [scheduler::Edge; scheduler::MAX_CHANNELS],
     modules: &mut [scheduler::ModuleSlot; MAX_MODULES],
@@ -804,7 +844,7 @@ async fn rp_instantiate_all_modules_async(
             }
         }
 
-        fluxor::kernel::gpio::grant_pending_pins(instantiated as u8);
+        fluxor::platform::rp_io::gpio::grant_pending_pins(instantiated as u8);
         instantiated += 1;
         Timer::after(Duration::from_millis(1)).await;
     }
@@ -825,7 +865,7 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
     );
 
     loop {
-        fluxor::kernel::gpio::poll_gpio_edges();
+        fluxor::platform::rp_io::gpio::poll_gpio_edges();
 
         let result = scheduler::step_modules(modules, module_count);
         match result {
@@ -844,7 +884,7 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
         // configured period elapsed since the last poll. On RP this
         // is the only path that invokes the ISR dispatcher; without
         // this call, registered Tier 1b modules never run.
-        fluxor::kernel::isr_tier::poll_tier1b();
+        fluxor::kernel::exec::isr_tier::poll_tier1b();
 
         debug_drain_poll();
 
@@ -852,7 +892,7 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
             return Some(req);
         }
 
-        let wake = fluxor::kernel::event::take_wake_pending();
+        let wake = fluxor::kernel::ipc::event::take_wake_pending();
         if !wake.is_empty() {
             scheduler::step_woken_modules(modules, module_count, &wake);
         }
@@ -875,7 +915,7 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
         )
         .await;
 
-        let wake = fluxor::kernel::event::take_wake_pending();
+        let wake = fluxor::kernel::ipc::event::take_wake_pending();
         if !wake.is_empty() {
             scheduler::step_woken_modules(modules, module_count, &wake);
         }

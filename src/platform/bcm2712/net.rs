@@ -440,7 +440,7 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
     #[cfg(not(feature = "chip-bcm2712"))]
     {
         let _ = (rx_desc_count, tx_desc_count, buf_size, buf_count);
-        return crate::kernel::errno::ENOSYS;
+        return crate::kernel::sys::errno::ENOSYS;
     }
 
     #[cfg(feature = "chip-bcm2712")]
@@ -453,14 +453,14 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
             || buf_count as usize > MAX_BUFS
             || buf_size == 0
         {
-            return crate::kernel::errno::EINVAL;
+            return crate::kernel::sys::errno::EINVAL;
         }
 
         // Find free slot
         let nic_rings_p = &raw const NIC_RINGS;
         let slot = match (*nic_rings_p).iter().position(|r| !r.active) {
             Some(s) => s,
-            None => return crate::kernel::errno::ENOMEM,
+            None => return crate::kernel::sys::errno::ENOMEM,
         };
 
         // Calculate sizes
@@ -473,15 +473,15 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
         // Allocate from DMA arena
         let rx_off = dma_alloc(rx_desc_bytes);
         if rx_off == usize::MAX {
-            return crate::kernel::errno::ENOMEM;
+            return crate::kernel::sys::errno::ENOMEM;
         }
         let tx_off = dma_alloc(tx_desc_bytes);
         if tx_off == usize::MAX {
-            return crate::kernel::errno::ENOMEM;
+            return crate::kernel::sys::errno::ENOMEM;
         }
         let buf_off = dma_alloc(buf_pool_bytes);
         if buf_off == usize::MAX {
-            return crate::kernel::errno::ENOMEM;
+            return crate::kernel::sys::errno::ENOMEM;
         }
 
         // Zero the allocated regions
@@ -537,16 +537,16 @@ pub fn ring_create(rx_desc_count: u16, tx_desc_count: u16, buf_size: u16, buf_co
 /// FD_TAG_NIC_RING-tagged handle or a raw slot (legacy callers that
 /// serialise the handle as a payload u8 naturally pass raw).
 pub fn ring_destroy(ring_handle: i32) -> i32 {
-    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
+    let ring_handle = crate::kernel::ipc::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     // SAFETY: NIC_RINGS is scheduler-thread-owned ring registry;
     // `ring_handle` bounds-checked above.
     unsafe {
         let ring = &mut NIC_RINGS[ring_handle as usize];
         if !ring.active {
-            return crate::kernel::errno::EINVAL;
+            return crate::kernel::sys::errno::EINVAL;
         }
         ring.active = false;
         // Note: DMA arena is bump-allocated; we don't reclaim space.
@@ -564,17 +564,17 @@ pub fn ring_destroy(ring_handle: i32) -> i32 {
 ///  buf_pool_addr:u64 LE, buf_size:u16 LE, buf_count:u16 LE]
 /// Total: 32 bytes
 pub fn ring_info(ring_handle: i32, out: *mut u8, out_len: usize) -> i32 {
-    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
+    let ring_handle = crate::kernel::ipc::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     if out.is_null() || out_len < 32 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
 
     #[cfg(not(feature = "chip-bcm2712"))]
     {
-        return crate::kernel::errno::ENOSYS;
+        return crate::kernel::sys::errno::ENOSYS;
     }
 
     #[cfg(feature = "chip-bcm2712")]
@@ -584,7 +584,7 @@ pub fn ring_info(ring_handle: i32, out: *mut u8, out_len: usize) -> i32 {
     unsafe {
         let ring = &NIC_RINGS[ring_handle as usize];
         if !ring.active {
-            return crate::kernel::errno::EINVAL;
+            return crate::kernel::sys::errno::EINVAL;
         }
 
         let rx_addr = dma_arena_ptr(ring.rx_desc_offset) as u64;
@@ -625,7 +625,7 @@ pub fn ring_info(ring_handle: i32, out: *mut u8, out_len: usize) -> i32 {
 /// completed RX descriptor. Returns (null, 0) if no packets available.
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_acquire_rx(ring_handle: i32) -> (*mut u8, usize) {
-    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
+    let ring_handle = crate::kernel::ipc::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return (core::ptr::null_mut(), 0);
     }
@@ -663,7 +663,7 @@ pub fn nic_ring_acquire_rx(ring_handle: i32) -> (*mut u8, usize) {
 /// Release an RX buffer back to NIC ownership.
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_release_rx(ring_handle: i32) {
-    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
+    let ring_handle = crate::kernel::ipc::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return;
     }
@@ -695,7 +695,7 @@ pub fn nic_ring_release_rx(ring_handle: i32) {
 /// Acquire an empty TX buffer. Returns (buffer pointer, max_len).
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_acquire_tx(ring_handle: i32) -> (*mut u8, usize) {
-    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
+    let ring_handle = crate::kernel::ipc::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS {
         return (core::ptr::null_mut(), 0);
     }
@@ -727,7 +727,7 @@ pub fn nic_ring_acquire_tx(ring_handle: i32) -> (*mut u8, usize) {
 /// Submit a TX buffer to the NIC.
 #[cfg(feature = "chip-bcm2712")]
 pub fn nic_ring_submit_tx(ring_handle: i32, len: usize) {
-    let ring_handle = crate::kernel::fd::slot_of(ring_handle);
+    let ring_handle = crate::kernel::ipc::fd::slot_of(ring_handle);
     if ring_handle < 0 || ring_handle as usize >= MAX_NIC_RINGS || len == 0 {
         return;
     }
@@ -823,7 +823,7 @@ unsafe fn cache_invalidate(addr: *mut u8, size: usize) {
 /// must hold the platform_nic_ring permission gate.
 pub unsafe fn syscall_ring_create(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let rx_desc = u16::from_le_bytes([*arg, *arg.add(1)]);
     let tx_desc = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
@@ -840,7 +840,7 @@ pub unsafe fn syscall_ring_create(arg: *mut u8, arg_len: usize) -> i32 {
 /// hold the platform_nic_ring permission gate.
 pub unsafe fn syscall_ring_destroy(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 1 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     ring_destroy(*arg as i32)
 }

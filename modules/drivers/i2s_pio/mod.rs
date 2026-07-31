@@ -45,14 +45,14 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 mod pio;
 mod params_def;
 
 // ============================================================================
 // Provider contract id + PIO opcodes (mirror
-// `kernel::provider::contract::HAL_PIO` and `abi::contracts::hal::pio`).
+// `kernel::module::provider::contract::HAL_PIO` and `abi::platform::rp::pio`).
 // ============================================================================
 
 const HAL_PIO_CONTRACT: u32 = 0x0004;
@@ -522,6 +522,6 @@ pub extern "C" fn module_mailbox_safe() -> i32 {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

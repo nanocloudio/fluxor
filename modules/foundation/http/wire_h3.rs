@@ -14,7 +14,7 @@
 //! wiring into the existing http server (which currently runs h1/h2
 //! over TCP) waits for the QUIC transport (Phase C) to come up.
 
-#[path = "../../sdk/varint.rs"]
+#[path = "../../sdk/wire/varint.rs"]
 mod varint;
 use self::varint::{varint_decode, varint_encode, varint_size};
 

@@ -6,7 +6,9 @@
 //! → channel → consumer. Not a production module — it is the live
 //! acceptance check for `.context/rfc_surface_traits.md` (criterion 1).
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 /// Wire size of one record (matches input::surface_traits::EVENT_SIZE).
 const EVENT_RECORD: usize = 24;

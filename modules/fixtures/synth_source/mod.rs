@@ -49,7 +49,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
 // Constants
@@ -359,4 +359,4 @@ unsafe fn step_inner(s: &mut SynthState) -> i32 {
     2
 }
 
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

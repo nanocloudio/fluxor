@@ -2,7 +2,7 @@
 name = "net"
 
 [[variant]]
-match = { board = "qemu-virt", phy = "ethernet", driver = "virtio_net" }
+match = { board = "qemu-virt", phy = "ethernet", nic = "virtio" }
 modules = [
   { name = "virtio_net" },
   { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
@@ -13,7 +13,7 @@ wiring = [
 ]
 
 [[variant]]
-match = { board = "pico2w", phy = "wifi", driver = "cyw43" }
+match = { board = "pico2w", phy = "wifi", nic = "cyw43" }
 modules = [
   { name = "cyw43" },
   { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
@@ -28,7 +28,7 @@ wiring = [
 ]
 
 [[variant]]
-match = { board = "picow", phy = "wifi", driver = "cyw43" }
+match = { board = "picow", phy = "wifi", nic = "cyw43" }
 modules = [
   { name = "cyw43" },
   { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
@@ -43,7 +43,7 @@ wiring = [
 ]
 
 [[variant]]
-match = { board = "pi5", phy = "ethernet", driver = "rp1_gem" }
+match = { board = "pi5", phy = "ethernet", nic = "rp1-gem" }
 modules = [
   { name = "rp1_gem" },
   { name = "conn_guard" },

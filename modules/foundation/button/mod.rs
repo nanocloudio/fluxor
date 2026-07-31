@@ -38,7 +38,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
 // Constants
@@ -176,7 +176,7 @@ pub extern "C" fn module_new(
     }
 }
 
-// Contract id + opcodes mirror `abi::kernel::provider::contract::HAL_GPIO`
+// Contract id + opcodes mirror `abi::kernel::module::provider::contract::HAL_GPIO`
 // and `abi::contracts::hal::gpio::*`. Pinned here to keep the PIC
 // module self-contained (no imports into kernel paths).
 const GPIO_CONTRACT:  u32 = 0x0001;
@@ -239,6 +239,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

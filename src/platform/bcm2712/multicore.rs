@@ -32,6 +32,18 @@
 //! then executes `sev` (send event). Consumer calls `wfe` (wait for event) and reads.
 //! The DMB ensures the consumer sees the data written before the index update.
 
+/// Core 0's MMU attributes, published after the primary has set up its page
+/// tables and referenced by `secondary_core_trampoline` to enable MMU with
+/// identical attributes on cores 1-3 (required so their accesses participate
+/// in inner-shareable cache coherency). Platform-owned: written by
+/// `boot_mmu`, read by the trampoline below.
+#[no_mangle]
+pub static mut SECONDARY_MMU_MAIR: u64 = 0;
+#[no_mangle]
+pub static mut SECONDARY_MMU_TCR: u64 = 0;
+#[no_mangle]
+pub static mut SECONDARY_MMU_TTBR0: u64 = 0;
+
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // ============================================================================
@@ -689,9 +701,9 @@ unsafe extern "C" fn secondary_core_trampoline() -> ! {
         stack_base = sym CORE_STACKS,
         stack_size = const CORE_STACK_SIZE,
         entry = sym secondary_core_entry,
-        mair_ptr = sym crate::kernel::SECONDARY_MMU_MAIR,
-        tcr_ptr = sym crate::kernel::SECONDARY_MMU_TCR,
-        ttbr_ptr = sym crate::kernel::SECONDARY_MMU_TTBR0,
+        mair_ptr = sym crate::platform::multicore::SECONDARY_MMU_MAIR,
+        tcr_ptr = sym crate::platform::multicore::SECONDARY_MMU_TCR,
+        ttbr_ptr = sym crate::platform::multicore::SECONDARY_MMU_TTBR0,
     );
 }
 
@@ -1272,6 +1284,29 @@ const QUIESCE_REQUESTED: u32 = 1;
 
 static QUIESCE_STATE: AtomicU32 = AtomicU32::new(QUIESCE_RUNNING);
 static PARKED_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Set once by the primary AFTER every non-primary domain core has been woken
+/// into its run loop (where it honours `park_if_requested`). Until then a
+/// `request_quiesce` + `wait_parked` from the primary would spin forever: a
+/// secondary still blocked on `INIT_COMPLETE` never reaches the park point. The
+/// runtime WS-D live-splice (`scheduler::live::apply_add`/`free_owner`) consults
+/// this to decide whether a peer-core quiesce is possible — at boot the splice
+/// runs single-threaded (no peers stepping) and `finalize_resident_graphs`
+/// finishes the domain wiring, so no quiesce is needed OR safe there.
+static SMP_ONLINE: AtomicU32 = AtomicU32::new(0);
+
+/// Primary-only. Mark the SMP fabric live — all counted non-primary domains are
+/// in their run loop and will honour `park_if_requested`. Call after
+/// `wake_secondary_cores`, before the primary enters its own run loop.
+pub fn mark_smp_online() {
+    SMP_ONLINE.store(1, Ordering::Release);
+}
+
+/// True once [`mark_smp_online`] has run: peer domain cores are stepping and a
+/// `request_quiesce`/`wait_parked` will make progress (not deadlock).
+pub fn smp_online() -> bool {
+    SMP_ONLINE.load(Ordering::Acquire) == 1
+}
 
 /// Primary-only. Ask all non-primary domains to park at their next tick
 /// boundary. Must be paired with `release_quiesce()`.

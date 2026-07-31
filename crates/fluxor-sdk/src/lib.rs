@@ -53,25 +53,25 @@
 mod sdk_flat {
     // Wire constants (ABI_VERSION, fnv1a32) — needed by some helpers
     // and convenient to expose alongside the SDK surface.
-    include!("../sdk/wire.rs");
+    include!("../sdk/wire/wire.rs");
 
     // Crypto primitives.
-    include!("../sdk/sha256.rs");
-    include!("../sdk/sha384.rs");
-    include!("../sdk/hmac.rs");
-    include!("../sdk/chacha20.rs");
-    include!("../sdk/aes_gcm.rs");
-    include!("../sdk/p256.rs");
+    include!("../sdk/crypto/sha256.rs");
+    include!("../sdk/crypto/sha384.rs");
+    include!("../sdk/crypto/hmac.rs");
+    include!("../sdk/crypto/chacha20.rs");
+    include!("../sdk/crypto/aes_gcm.rs");
+    include!("../sdk/crypto/p256.rs");
     // ed25519.rs references `Sha512` (sha384.rs) and the `pic_*`/`U256`/
     // `zeroize` helpers (p256.rs) by bare name — see its header for the
     // required include set. Keep it after both.
-    include!("../sdk/ed25519.rs");
+    include!("../sdk/crypto/ed25519.rs");
 
     // Codecs.
-    include!("../sdk/varint.rs");
+    include!("../sdk/wire/varint.rs");
 
     // Param-schema macro + helpers.
-    include!("../sdk/params.rs");
+    include!("../sdk/runtime/params.rs");
 }
 
 pub use sdk_flat::*;

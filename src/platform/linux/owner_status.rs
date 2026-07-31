@@ -1,11 +1,11 @@
 // Owner live-status writer (rfc_k8s.md §7.2, §17.2, §18.2) — the runtime
-// half of the per-pod status surface.
+// half of the per-workload status surface.
 //
 // In node-agent mode (FLUXOR_PLAN set) the runtime consumes the committed
 // plan by file + mtime watch; symmetrically it PUBLISHES per-owner live
 // status by file: `owner_status.json`, next to the plan, atomically replaced
 // whenever the derived state changes. `fluxor agent status --json` joins it
-// into the durable per-pod status by Pod UID, so the orchestrator
+// into the durable per-workload status by owner UID, so the orchestrator
 // (nanocloud) reads one pull-based surface and never learns the
 // slot→module mapping — the kernel aggregated modules into owners in
 // `scheduler::owner_live_snapshot`, and this file only speaks the §7.2
@@ -23,13 +23,13 @@
 // restarted; an internal module retry (step-guard `Restart` policy) surfaces
 // only as transient unreadiness, never as a restart.
 
-/// One pod's tracked lifecycle latches, keyed by Pod UID. The kernel
+/// One workload's tracked lifecycle latches, keyed by owner UID. The kernel
 /// snapshot is instantaneous; phase transitions (activation time, terminal
 /// reason, restart count) are latched here across snapshots.
 use super::owner_drain::{drain_overlay_for_status, drain_terminal_pods_json};
 use super::providers::linux_net_bound_endpoints;
 
-pub struct PodTrack {
+pub struct OwnerTrack {
     restart_count: u32,
     /// Present once the aggregate has been observed Running.
     started_at_unix: Option<u64>,
@@ -43,20 +43,20 @@ pub struct PodTrack {
 /// node-agent mode; `tick()` is cheap when nothing changed (string compare).
 pub struct OwnerStatusWriter {
     path: std::path::PathBuf,
-    tracks: std::collections::HashMap<[u8; 16], PodTrack>,
-    /// Per-pod carryover recovered from a previous runtime process's status
-    /// file: restart count, and whether the pod had actually started there.
-    /// A pod that STARTED under the previous process re-activates under this
+    tracks: std::collections::HashMap<[u8; 16], OwnerTrack>,
+    /// Per-workload carryover recovered from a previous runtime process's status
+    /// file: restart count, and whether the workload had actually started there.
+    /// A workload that STARTED under the previous process re-activates under this
     /// one — that first activation is a restart. One that never got past
     /// Activating (e.g. ActivationBackOff) hasn't restarted anything.
     pub seeded: std::collections::HashMap<String, SeededPod>,
     /// This process's start time (clock ticks since boot), written into the
     /// file so the reader can tell this writer from a recycled PID.
     pid_start_ticks: u64,
-    /// Last emitted `(plan_generation, pods payload)` — rewrite only on
+    /// Last emitted `(plan_generation, workloads payload)` — rewrite only on
     /// change. The generation is part of the key: the reader scopes its join
     /// to the committed generation, so a plan reload must rewrite the file
-    /// even when the derived pod states are byte-identical.
+    /// even when the derived workload states are byte-identical.
     last_emit: Option<(u64, String)>,
 }
 
@@ -90,9 +90,9 @@ impl OwnerStatusWriter {
     /// latches forward, and atomically replace the status file if the
     /// derived state changed.
     pub fn tick(&mut self) {
-        let mut recs =
-            [crate::kernel::scheduler::OwnerLiveStatus::EMPTY; crate::kernel::owner::MAX_OWNERS];
-        let n = crate::kernel::scheduler::owner_live_snapshot(&mut recs);
+        let mut recs = [crate::kernel::exec::scheduler::OwnerLiveStatus::EMPTY;
+            crate::kernel::workload::owner::MAX_OWNERS];
+        let n = crate::kernel::exec::scheduler::owner_live_snapshot(&mut recs);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -119,7 +119,7 @@ impl OwnerStatusWriter {
             pods_json.push_str("\n    ");
             pods_json.push_str(&entry);
         }
-        let plan_generation = crate::kernel::owner_plan::last_applied_generation();
+        let plan_generation = crate::kernel::workload::owner_plan::last_applied_generation();
         if self
             .last_emit
             .as_ref()
@@ -130,7 +130,7 @@ impl OwnerStatusWriter {
         let body = format!(
             "{{\n  \"version\": 1,\n  \"pid\": {},\n  \"pid_start_ticks\": {},\n  \
              \"plan_generation\": {plan_generation},\n  \
-             \"written_at\": \"{}\",\n  \"pods\": [{}\n  ]\n}}\n",
+             \"written_at\": \"{}\",\n  \"workloads\": [{}\n  ]\n}}\n",
             std::process::id(),
             self.pid_start_ticks,
             rfc3339_utc(now),
@@ -160,23 +160,23 @@ impl OwnerStatusWriter {
 /// (`ExternalProcessExited`, `Evicted`, `FluxorReservationInvalid`) are not
 /// emitted here — the reader enforces the full §7.2 set.
 fn terminated_reason_for_fault(kind: u8) -> &'static str {
-    use crate::kernel::step_guard::fault_type;
+    use crate::kernel::exec::step_guard::fault_type;
     match kind {
         fault_type::TIMEOUT => "LivenessFailure",
         _ => "GraphNodeFault",
     }
 }
 
-/// Roll the per-pod latches forward against the instantaneous kernel
-/// snapshot and render the `pods` array body. Pure of I/O and clock —
+/// Roll the per-workload latches forward against the instantaneous kernel
+/// snapshot and render the `workloads` array body. Pure of I/O and clock —
 /// unit-testable.
 #[allow(
     clippy::implicit_hasher,
     reason = "internal platform surface; callers only ever pass std's default hasher"
 )]
 pub fn derive_pods_json(
-    recs: &[crate::kernel::scheduler::OwnerLiveStatus],
-    tracks: &mut std::collections::HashMap<[u8; 16], PodTrack>,
+    recs: &[crate::kernel::exec::scheduler::OwnerLiveStatus],
+    tracks: &mut std::collections::HashMap<[u8; 16], OwnerTrack>,
     seeded: &std::collections::HashMap<String, SeededPod>,
     now_unix: u64,
     bound_endpoints: &[(u16, u32, u8, u16)], // (slot, generation, protocol, port)
@@ -184,11 +184,11 @@ pub fn derive_pods_json(
     use std::fmt::Write;
     let mut entries: Vec<String> = Vec::with_capacity(recs.len());
     for rec in recs {
-        let uid_hex: String = rec.pod_uid.iter().fold(String::new(), |mut s, b| {
+        let uid_hex: String = rec.owner_uid.iter().fold(String::new(), |mut s, b| {
             let _ = write!(s, "{b:02x}");
             s
         });
-        let track = tracks.entry(rec.pod_uid).or_insert_with(|| PodTrack {
+        let track = tracks.entry(rec.owner_uid).or_insert_with(|| OwnerTrack {
             restart_count: seeded.get(&uid_hex).map_or(0, |s| s.restart_count),
             started_at_unix: None,
             generation: rec.generation,
@@ -208,7 +208,7 @@ pub fn derive_pods_json(
         // Instantaneous aggregate phase from the kernel counts. A stamped
         // module whose slot never instantiated (platform logs the error and
         // continues) keeps the aggregate out of Running: `modules_loaded <
-        // modules_total` is a partially-activated pod, not a healthy one.
+        // modules_total` is a partially-activated workload, not a healthy one.
         let fully_loaded = rec.modules_total > 0 && rec.modules_loaded >= rec.modules_total;
         let any_terminated = rec.modules_terminated > 0;
         let all_finished = fully_loaded && rec.modules_finished == rec.modules_total;
@@ -221,9 +221,9 @@ pub fn derive_pods_json(
                 track.started_at_unix = Some(now_unix);
             }
             if track.started_at_unix.is_none() {
-                // First activation under this runtime process of a pod that
+                // First activation under this runtime process of a workload that
                 // had STARTED under the previous one is a re-activation. A
-                // seeded pod that never started (stuck Activating) is simply
+                // seeded workload that never started (stuck Activating) is simply
                 // activating for the first time.
                 if let Some(seed) = seeded.get(&uid_hex) {
                     if seed.started && track.restart_count == seed.restart_count {
@@ -250,8 +250,8 @@ pub fn derive_pods_json(
         }
 
         // §7.2 shape. Reason strings are the fixed vocabulary; nothing else
-        // is ever emitted here. A partially-instantiated pod (some planned
-        // modules failed to load) waits in ActivationBackOff; a pod whose
+        // is ever emitted here. A partially-instantiated workload (some planned
+        // modules failed to load) waits in ActivationBackOff; a workload whose
         // graph hasn't instantiated at all is plainly Activating.
         let (phase, ready, started, waiting) = match (&track.terminated, fully_loaded) {
             (Some(_), _) => ("Terminated", false, false, None),
@@ -266,19 +266,19 @@ pub fn derive_pods_json(
         // A draining owner stops reporting ready while it is still serving
         // (rfc_owner_drain_and_logs.md §3.1) — no new phase value, just the
         // readiness withdrawal the terminating window needs.
-        let draining = rec.owner_state == crate::kernel::scheduler::OWNER_STATE_DRAINING;
+        let draining = rec.owner_state == crate::kernel::exec::scheduler::OWNER_STATE_DRAINING;
         let ready = ready && !draining;
         let mut e = String::new();
         let _ = write!(
             e,
-            "{{\"pod_uid_hex\":\"{uid_hex}\",\"slot\":{},\"owner_generation\":{},\
+            "{{\"owner_uid_hex\":\"{uid_hex}\",\"slot\":{},\"owner_generation\":{},\
              \"runtime\":{{\"phase\":\"{phase}\",\"ready\":{ready},\"started\":{started},\
              \"restart_count\":{}",
             rec.slot, rec.generation, track.restart_count,
         );
         // Bound network endpoints (rfc_endpoint_lease.md §4.3 doc 1): the raw
         // owner-attributed report. Additive; omitted when the owner has no
-        // bound ports, so port-less pods' output is byte-identical.
+        // bound ports, so port-less workloads' output is byte-identical.
         let mut bound_iter = bound_endpoints
             .iter()
             .filter(|(slot, generation, _, _)| *slot == rec.slot && *generation == rec.generation)
@@ -323,11 +323,11 @@ pub fn derive_pods_json(
         e.push_str("}}");
         entries.push(e);
     }
-    // Drop tracks for pods no longer resident: a removed pod's latches go
-    // with it (a re-added pod arrives at a strictly higher owner generation
-    // and starts a fresh activation record; the durable per-pod history
+    // Drop tracks for workloads no longer resident: a removed workload's latches go
+    // with it (a re-added workload arrives at a strictly higher owner generation
+    // and starts a fresh activation record; the durable per-workload history
     // lives with the orchestrator, not this runtime process).
-    tracks.retain(|uid, _| recs.iter().any(|r| r.pod_uid == *uid));
+    tracks.retain(|uid, _| recs.iter().any(|r| r.owner_uid == *uid));
     entries
         .iter()
         .map(|e| format!("\n    {e}"))
@@ -335,28 +335,28 @@ pub fn derive_pods_json(
         .join(",")
 }
 
-/// One pod's carryover from a previous runtime process's status file.
+/// One workload's carryover from a previous runtime process's status file.
 pub struct SeededPod {
     pub restart_count: u32,
-    /// The pod had actually started there: its entry carried a
+    /// The workload had actually started there: its entry carried a
     /// `started_at` stamp, or a terminal state (which counts as prior
     /// activity — a re-run after termination is a restart even in-process).
     pub started: bool,
-    /// The previous process persisted a TERMINAL state for this pod. Suppresses
+    /// The previous process persisted a TERMINAL state for this workload. Suppresses
     /// the boot-time drain-timeout-by-restart synthesis: a clean `Completed`
     /// from before the restart is never rewritten
     /// (rfc_owner_drain_and_logs.md §3.6/§3.7 writer seeding).
     pub terminated: bool,
 }
 
-/// Recover per-pod carryover from a previous runtime process's status file.
+/// Recover per-workload carryover from a previous runtime process's status file.
 /// This file is only ever written by `OwnerStatusWriter` (atomic replace),
-/// so a targeted scan of our own fixed emission order — each pod object
-/// opens with `"pod_uid_hex":"…"` and its runtime carries
+/// so a targeted scan of our own fixed emission order — each workload object
+/// opens with `"owner_uid_hex":"…"` and its runtime carries
 /// `"restart_count":N` plus optional `started_at`/`terminated` — is
 /// reliable without a JSON parser dependency.
 pub fn read_seed_restarts(path: &std::path::Path) -> std::collections::HashMap<String, SeededPod> {
-    const UID_KEY: &str = "\"pod_uid_hex\":\"";
+    const UID_KEY: &str = "\"owner_uid_hex\":\"";
     let mut seeds = std::collections::HashMap::new();
     let Ok(text) = std::fs::read_to_string(path) else {
         return seeds;
@@ -367,7 +367,7 @@ pub fn read_seed_restarts(path: &std::path::Path) -> std::collections::HashMap<S
         let Some(end) = rest.find('"') else { break };
         let uid = rest[..end].to_string();
         rest = &rest[end..];
-        // This pod's fields run until the next pod object (or end of file).
+        // This workload's fields run until the next workload object (or end of file).
         let span = &rest[..rest.find(UID_KEY).unwrap_or(rest.len())];
         let Some(j) = span.find("\"restart_count\":") else {
             break;

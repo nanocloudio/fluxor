@@ -3,7 +3,7 @@
 //!
 //! Runs in the SYSTEM graph and drives one pause→resume cycle against a
 //! resident pod's owner via the OWNER_PAUSE / OWNER_RESUME live-mutation
-//! ops (0x0C72/0x0C73, beside APPLY_ADD/FREE_OWNER):
+//! ops (0x0C49/0x0C4A, beside APPLY_ADD/FREE_OWNER):
 //!
 //!   at `pause_at_ms`  → OWNER_PAUSE  `[slot:u16 LE][generation:u32 LE]`
 //!   at `resume_at_ms` → OWNER_RESUME (same handle record)
@@ -33,7 +33,7 @@ use abi::internal::reconfigure::{OWNER_PAUSE, OWNER_RESUME};
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 #[repr(C)]
 struct State {
@@ -218,4 +218,4 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

@@ -62,7 +62,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // Sub-codecs. PIC builds keep these private; host-test builds expose
 // them so the harness can drive each sub-codec directly.
@@ -830,6 +830,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

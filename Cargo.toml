@@ -144,9 +144,30 @@ chip-rp2350b = ["rp", "embassy-rp/rp235xb", "embedded-platform"]
 # RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
 chip-rp2040 = ["rp", "embassy-rp/rp2040", "embedded-platform"]
 
+# Kernel hardware CAPABILITIES (what a platform can do, not which chip it is).
+# The kernel branches on these, never on chip identity; a chip feature turns on
+# whichever it provides. Behaviour is unchanged — bcm2712 is today the only
+# bare-metal target that provides all three — but the boundary is expressed as
+# capability so a future MMU-but-single-core (or MPU-but-multi-core) target
+# would flip only the capabilities it actually has.
+#   kernel-vm: kernel-managed page-table virtual memory + EL0 module isolation
+#              (external-arena paging, isolated/page-aligned allocation).
+#   smp:       multiple hardware execution domains (multi-core domain ordering).
+#   dtb:       boot configuration/identity read from a device tree.
+kernel-vm = []
+smp = []
+dtb = []
+
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
 # Minimal — no embassy, no cortex-m. Bare-metal from scratch.
-chip-bcm2712 = ["portable-atomic", "embedded-platform", "multitenant"]
+chip-bcm2712 = [
+    "portable-atomic",
+    "embedded-platform",
+    "multitenant",
+    "kernel-vm",
+    "smp",
+    "dtb",
+]
 
 # Board-level selection for BCM2712 targets.
 # board-pi5: Real Raspberry Pi 5 hardware (kernel loaded at 0x80000).
@@ -237,7 +258,7 @@ members = ["contracts", "crates/fluxor-abi", "crates/fluxor-sdk", "tools", "modu
 # (firmware `rustc` build ignores it) so the harness can link it as a host
 # rlib. Excluded — it is not subject to the workspace lint matrix; it only
 # needs to compile under `host-test` for the integration tests.
-exclude = ["tests", "modules/foundation/dns", "modules/foundation/quic", "modules/foundation/mqtt"]
+exclude = ["tests", "modules/foundation/conn_guard", "modules/foundation/dns", "modules/foundation/quic", "modules/foundation/mqtt"]
 
 [workspace.package]
 # Shared by every publishable crate via `version.workspace = true`.

@@ -468,15 +468,15 @@ impl Default for Store {
 // on Linux with this store. Env-gated:
 // when `FLUXOR_STORE_DIR` is set, the two providers route their ops here; else
 // they keep their filesystem/HTTP behaviour. Provider dispatch is single
-// scheduler thread (see kernel::provider), so the `static mut` singletons need
+// scheduler thread (see kernel::module::provider), so the `static mut` singletons need
 // no locking.
 // ===========================================================================
 
-use crate::abi::contracts::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
 use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
-use crate::kernel::channel::channel_write;
-use crate::kernel::errno;
-use crate::kernel::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
+use crate::abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
+use crate::kernel::ipc::channel::channel_write;
+use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
+use crate::kernel::sys::errno;
 
 /// mesh Event content-type for a `namespace.change` record (not yet in the mesh
 /// registry — assigned here; registry addition is a follow-up).

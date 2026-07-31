@@ -36,17 +36,17 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
-include!("../../sdk/varint.rs");
+include!("../../sdk/runtime/params.rs");
+include!("../../sdk/wire/varint.rs");
 
 // Crypto primitives (also used by tls/dtls modules — duplicated PIC
 // inclusion is the convention since each module compiles standalone).
-include!("../../sdk/sha256.rs");
-include!("../../sdk/sha384.rs");
-include!("../../sdk/hmac.rs");
-include!("../../sdk/aes_gcm.rs");
-include!("../../sdk/chacha20.rs");
-include!("../../sdk/p256.rs");
+include!("../../sdk/crypto/sha256.rs");
+include!("../../sdk/crypto/sha384.rs");
+include!("../../sdk/crypto/hmac.rs");
+include!("../../sdk/crypto/aes_gcm.rs");
+include!("../../sdk/crypto/chacha20.rs");
+include!("../../sdk/crypto/p256.rs");
 
 // Shared TLS / DTLS source — QUIC drives the same TLS 1.3 handshake
 // state machine via CRYPTO frames instead of records.
@@ -3619,6 +3619,6 @@ pub mod test_helpers {
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

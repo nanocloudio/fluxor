@@ -299,11 +299,11 @@ fn draw_play(fb: &mut [u16], stride: u16, ox: u16, oy: u16, w: u16, h: u16, flip
 
 // ── Bitmap text (5×7 glyphs) ─────────────────────────────────────────
 //
-// The font itself lives in `modules/sdk/font5x7.rs` (no_std-safe) and is shared
+// The font itself lives in `modules/sdk/assets/font5x7.rs` (no_std-safe) and is shared
 // verbatim with the on-device `content_controls` module via `include!`, so the
 // two can never drift. It defines `glyph` / `draw_glyph` / `draw_text` +
 // `GLYPH_W` / `GLYPH_H`.
-include!("../../modules/sdk/font5x7.rs");
+include!("../../modules/sdk/assets/font5x7.rs");
 
 /// Hit-test a point against the laid-out rects → control index.
 pub fn hit_test(rects: &[Rect], x: u16, y: u16) -> Option<usize> {

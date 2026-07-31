@@ -25,7 +25,7 @@
 // `setns()`s into the container's netns — never on the platform thread, whose
 // netns must not change.
 
-use crate::kernel::errno;
+use crate::kernel::sys::errno;
 
 /// The network identity from the `workload` CREATE header (family already
 /// validated by the provider; only IPv4 reaches this module today).
@@ -42,7 +42,7 @@ pub struct NetIdentity {
 /// IFNAMSIZ 15-byte limit; the assert keeps a future slot-table growth from
 /// silently truncating or overflowing names.
 fn ifnames(idx: usize) -> ([u8; 16], [u8; 16]) {
-    debug_assert!(idx < super::oci::MAX_SANDBOXES);
+    debug_assert!(idx < super::host_backend::MAX_SANDBOXES);
     let mut host = [0u8; 16];
     let mut cont = [0u8; 16];
     let h = format!("fxw{idx}");
@@ -275,7 +275,7 @@ unsafe fn if_set_v4(sock: i32, name: &[u8; 16], addr: [u8; 4], prefix_len: u8) -
 /// platform thread's netns is never changed. Returns 0 or a negative errno.
 fn configure_inside(idx: usize, container_pid: i32, ident: Option<&NetIdentity>) -> i32 {
     // Everything the child needs is materialized BEFORE the fork — same
-    // no-alloc-in-the-child doctrine as `oci_child`: the child touches only
+    // no-alloc-in-the-child doctrine as `hp_child`: the child touches only
     // stack + libc between fork and _exit.
     let path = format!("/proc/{container_pid}/ns/net\0");
     let (_, cont) = ifnames(idx);
@@ -381,7 +381,7 @@ fn wait_own_netns(container_pid: i32) -> i32 {
 /// Realize the workload's network domain for sandbox `idx`: `lo` up inside the
 /// container netns; with an identity also a veth pair (`fxw<idx>` host-side,
 /// up, unattached; `fxc<idx>` container-side with the identity address, up).
-/// Called by `oci_spawn` after the container pid is known and before START
+/// Called by `hp_spawn` after the container pid is known and before START
 /// releases the barrier, so the network exists before the workload runs.
 /// Returns 0 or a negative errno — a failure fails CREATE (the network is
 /// Tier-1; a workload must not run with silently-weaker networking).

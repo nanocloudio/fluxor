@@ -42,7 +42,9 @@
 //! params so per-graph custom layouts (a single big steering wheel,
 //! a dance-pad grid, etc.) can override.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 /// Input record (Pointer MSG_EVENT) — must match
 /// `modules/sdk/contracts/input/pointer.rs::EVENT_SIZE`.

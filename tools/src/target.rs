@@ -28,8 +28,11 @@ struct TomlSiliconFile {
     kernel: Option<TomlKernelConfig>,
     isolation: Option<TomlIsolationConfig>,
     /// Platform stack defaults — used by host descriptors (e.g.
-    /// `[platform.net] provider = "host"`); silicon files omit it.
-    platform: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+    /// `[platform.net] provider = "host"`); silicon files omit it. Values are
+    /// `toml::Value` so structured sections (e.g. `[platform.pcie] aliases`,
+    /// consumed by `build.rs`) parse; only string entries flow to stack facts.
+    platform:
+        Option<std::collections::HashMap<String, std::collections::HashMap<String, toml::Value>>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -113,8 +116,16 @@ struct TomlBoardFile {
     build: Option<TomlBoardBuild>,
     gpio: Option<TomlGpioConfig>,
     hardware: Option<TomlBoardHardware>,
-    /// Platform stack defaults (e.g. [platform.net] phy="wifi", driver="cyw43")
-    platform: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+    /// Board/emulator memory map. Silicon files describe the die, not where a
+    /// particular board or emulator places RAM/flash — so the concrete map is a
+    /// board-level fact and overrides any silicon default when present. (e.g.
+    /// `qemu-virt` carries the QEMU virt RAM map; a real board's RAM origin is
+    /// selected by its `board-*` cargo feature at link time.)
+    memory: Option<TomlMemoryConfig>,
+    /// Platform stack defaults (e.g. [platform.net] phy="wifi", nic="cyw43").
+    /// `toml::Value` values so structured sections parse (see SiliconToml).
+    platform:
+        Option<std::collections::HashMap<String, std::collections::HashMap<String, toml::Value>>>,
 }
 
 /// Board-level build overrides. Only present for boards that need cargo
@@ -331,6 +342,29 @@ impl TargetDescriptor {
     }
 }
 
+/// Reduce raw `[platform.*]` tables to the string-only facts stack expansion
+/// consumes (phy/nic/sink/provider). Structured sections such as
+/// `[platform.pcie] aliases` (an array of tables read by `build.rs` to generate
+/// the kernel alias table) carry non-string values; those entries are not stack
+/// facts and are dropped here.
+fn platform_string_defaults(
+    platform: Option<
+        std::collections::HashMap<String, std::collections::HashMap<String, toml::Value>>,
+    >,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, String>> {
+    platform
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(section, kv)| {
+            let strings = kv
+                .into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect();
+            (section, strings)
+        })
+        .collect()
+}
+
 /// Load and resolve a target by name.
 ///
 /// Resolution order:
@@ -515,7 +549,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
         i2c_pins: build_i2c_tables(p),
         memory,
         hardware_defaults: None,
-        platform_defaults: silicon.platform.unwrap_or_default(),
+        platform_defaults: platform_string_defaults(silicon.platform),
         state_arena_kb: silicon
             .kernel
             .as_ref()
@@ -559,6 +593,18 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
     // Overlay board info
     desc.board_id = Some(board.board.id);
     desc.board_description = Some(board.board.description);
+
+    // Board memory map overrides the silicon default (silicon describes the die,
+    // the board/emulator places RAM/flash). A board without its own [memory]
+    // keeps whatever the silicon declared (typically none).
+    if let Some(m) = board.memory {
+        desc.memory = Some(MemoryConfig {
+            flash_base: parse_hex_u32(&m.flash_base).unwrap_or(0),
+            flash_size: parse_hex_u32(&m.flash_size).unwrap_or(0),
+            ram_base: parse_hex_u32(&m.ram_base).unwrap_or(0),
+            ram_size: parse_hex_u32(&m.ram_size).unwrap_or(0),
+        });
+    }
 
     // Overlay GPIO reservations from board
     if let Some(gpio) = board.gpio {
@@ -611,10 +657,10 @@ fn load_board_target(board_path: &Path, targets_dir: &Path) -> Result<TargetDesc
         }
     }
 
-    // Platform stack defaults (e.g. [platform.net] phy="wifi")
-    if let Some(platform) = board.platform {
-        desc.platform_defaults = platform;
-    }
+    // Platform stack defaults (e.g. [platform.net] phy="wifi"). Only string
+    // entries are stack facts; structured sections (pcie aliases) are read from
+    // the raw board TOML by build.rs, not here.
+    desc.platform_defaults = platform_string_defaults(board.platform);
 
     // Merge board-level build overrides onto silicon's build config. Only
     // used by boards that need extra cargo features (pi5 adds `board-pi5`).

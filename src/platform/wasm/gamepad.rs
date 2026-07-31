@@ -11,7 +11,9 @@
 //! Host shim contract: `host_gamepad_pop(buf, len)` returns one
 //! 16-byte event record per call, or 0 when the queue is empty.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     fn host_gamepad_pop(buf: *mut u8, len: usize) -> i32;

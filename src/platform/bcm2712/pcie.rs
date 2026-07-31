@@ -1007,7 +1007,7 @@ pub fn device_cfg_write32(dev_idx: usize, offset: u16, val: u32) -> i32 {
     unsafe {
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
         if dev_idx >= count {
-            return crate::kernel::errno::EINVAL;
+            return crate::kernel::sys::errno::EINVAL;
         }
         let dev = &DEVICES[dev_idx];
         let rc = BCM2712_PCIE1_RC_BASE;
@@ -1018,7 +1018,7 @@ pub fn device_cfg_write32(dev_idx: usize, offset: u16, val: u32) -> i32 {
 
 #[cfg(not(feature = "board-pi5"))]
 pub fn device_cfg_write32(_dev_idx: usize, _offset: u16, _val: u32) -> i32 {
-    crate::kernel::errno::ENOSYS
+    crate::kernel::sys::errno::ENOSYS
 }
 
 /// Syscall handler for `PCIE_CFG_READ32`. Arg layout:
@@ -1127,7 +1127,7 @@ pub fn bar_unmap(virt_addr: usize) -> i32 {
                 return 0;
             }
         }
-        crate::kernel::errno::EINVAL
+        crate::kernel::sys::errno::EINVAL
     }
 }
 
@@ -1144,13 +1144,13 @@ pub fn bar_unmap(virt_addr: usize) -> i32 {
 /// this when invoking the handler.
 pub unsafe fn syscall_bar_map(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 2 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let dev_idx = *arg as usize;
     let bar_idx = *arg.add(1) as usize;
     let virt = bar_map(dev_idx, bar_idx);
     if virt == 0 {
-        return crate::kernel::errno::ENOMEM;
+        return crate::kernel::sys::errno::ENOMEM;
     }
     if arg_len >= 10 {
         let addr_bytes = (virt as u64).to_le_bytes();
@@ -1171,7 +1171,7 @@ pub unsafe fn syscall_bar_map(arg: *mut u8, arg_len: usize) -> i32 {
 /// duration of the call.
 pub unsafe fn syscall_bar_unmap(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let mut addr_buf = [0u8; 8];
     core::ptr::copy_nonoverlapping(arg, addr_buf.as_mut_ptr(), 8);
@@ -1201,7 +1201,7 @@ struct BoundDevice {
     active: bool,
     /// Root complex the device sits behind — selects the MSI mux in
     /// `MSI_ALLOC`.
-    root: crate::kernel::pcie_aliases::PcieRoot,
+    root: crate::platform::pcie_aliases::PcieRoot,
     /// Alias used at BIND (empty when bound by class). Echoed back
     /// through `INFO` so the driver can log what it got.
     alias: [u8; 20],
@@ -1213,7 +1213,7 @@ impl BoundDevice {
     const fn empty() -> Self {
         Self {
             active: false,
-            root: crate::kernel::pcie_aliases::PcieRoot::Pcie1,
+            root: crate::platform::pcie_aliases::PcieRoot::Pcie1,
             alias: [0u8; 20],
             alias_len: 0,
         }
@@ -1235,19 +1235,19 @@ static mut BOUND_DEVICES: [BoundDevice; MAX_SCAN_DEVS] =
 pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
     let s = match core::str::from_utf8(sel) {
         Ok(s) => s.trim_end_matches('\0').trim(),
-        Err(_) => return crate::kernel::errno::EINVAL,
+        Err(_) => return crate::kernel::sys::errno::EINVAL,
     };
     if s.is_empty() {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
 
     // "@class=<name>" — PCI-class match, must resolve uniquely.
     if let Some(rest) = s.strip_prefix("@class=") {
-        let code = match crate::kernel::pcie_aliases::class_code(rest) {
+        let code = match crate::platform::pcie_aliases::class_code(rest) {
             Some(c) => c,
             None => {
                 log::warn!("[pcie_device] unknown class selector '{rest}'");
-                return crate::kernel::errno::EINVAL;
+                return crate::kernel::sys::errno::EINVAL;
             }
         };
         let count = *core::ptr::addr_of!(DEVICE_COUNT);
@@ -1259,27 +1259,27 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
                     log::warn!(
                         "[pcie_device] class selector '@class={rest}' matches multiple devices"
                     );
-                    return crate::kernel::errno::EBUSY;
+                    return crate::kernel::sys::errno::EBUSY;
                 }
                 hit = Some(i);
             }
         }
         return match hit {
-            Some(idx) => finalize_bind(idx, crate::kernel::pcie_aliases::PcieRoot::Pcie1, ""),
-            None => crate::kernel::errno::ENODEV,
+            Some(idx) => finalize_bind(idx, crate::platform::pcie_aliases::PcieRoot::Pcie1, ""),
+            None => crate::kernel::sys::errno::ENODEV,
         };
     }
 
     // Otherwise it's a board-local alias. Resolve via the alias table.
-    let alias = match crate::kernel::pcie_aliases::resolve(s) {
+    let alias = match crate::platform::pcie_aliases::resolve(s) {
         Some(a) => a,
         None => {
             log::warn!("[pcie_device] unknown alias '{s}'");
-            return crate::kernel::errno::ENODEV;
+            return crate::kernel::sys::errno::ENODEV;
         }
     };
     match alias.root {
-        crate::kernel::pcie_aliases::PcieRoot::Pcie1 => {
+        crate::platform::pcie_aliases::PcieRoot::Pcie1 => {
             let count = *core::ptr::addr_of!(DEVICE_COUNT);
             let devs = &raw const DEVICES;
             for (i, d) in (*devs).iter().take(count).enumerate() {
@@ -1294,12 +1294,12 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
                 alias.dev,
                 alias.func,
             );
-            crate::kernel::errno::ENODEV
+            crate::kernel::sys::errno::ENODEV
         }
-        crate::kernel::pcie_aliases::PcieRoot::Pcie2 => {
+        crate::platform::pcie_aliases::PcieRoot::Pcie2 => {
             // PCIe2 (RP1) is not brought up by the bare-metal kernel.
             log::warn!("[pcie_device] alias '{s}' resolves to PCIe2; not supported");
-            crate::kernel::errno::ENODEV
+            crate::kernel::sys::errno::ENODEV
         }
     }
 }
@@ -1307,11 +1307,11 @@ pub unsafe fn bind_selector(sel: &[u8]) -> i32 {
 #[cfg(feature = "board-pi5")]
 unsafe fn finalize_bind(
     dev_idx: usize,
-    root: crate::kernel::pcie_aliases::PcieRoot,
+    root: crate::platform::pcie_aliases::PcieRoot,
     alias: &str,
 ) -> i32 {
     if dev_idx >= MAX_SCAN_DEVS {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let slot = &mut *core::ptr::addr_of_mut!(BOUND_DEVICES[dev_idx]);
     slot.active = true;
@@ -1324,7 +1324,7 @@ unsafe fn finalize_bind(
     let n = core::cmp::min(bytes.len(), slot.alias.len() - 1);
     slot.alias[..n].copy_from_slice(&bytes[..n]);
     slot.alias_len = n as u8;
-    crate::kernel::fd::tag_fd(crate::kernel::fd::FD_TAG_PCIE_DEVICE, dev_idx as i32)
+    crate::kernel::ipc::fd::tag_fd(crate::kernel::ipc::fd::FD_TAG_PCIE_DEVICE, dev_idx as i32)
 }
 
 /// Decode a PCIE_DEVICE handle to its device index. Accepts both the
@@ -1334,8 +1334,8 @@ fn decode_handle(handle: i32) -> Option<usize> {
     if handle < 0 {
         return None;
     }
-    let (tag, slot) = crate::kernel::fd::untag_fd(handle);
-    if tag != 0 && tag != crate::kernel::fd::FD_TAG_PCIE_DEVICE {
+    let (tag, slot) = crate::kernel::ipc::fd::untag_fd(handle);
+    if tag != 0 && tag != crate::kernel::ipc::fd::FD_TAG_PCIE_DEVICE {
         return None;
     }
     let idx = slot as usize;
@@ -1356,7 +1356,7 @@ fn decode_handle(_handle: i32) -> Option<usize> {
 /// `_sel` is a valid byte slice; this stub does not touch hardware.
 #[cfg(not(feature = "board-pi5"))]
 pub unsafe fn bind_selector(_sel: &[u8]) -> i32 {
-    crate::kernel::errno::ENOSYS
+    crate::kernel::sys::errno::ENOSYS
 }
 
 /// PCIE_DEVICE `CLOSE`: release per-handle bookkeeping. BAR maps
@@ -1371,7 +1371,7 @@ pub unsafe fn bind_selector(_sel: &[u8]) -> i32 {
 pub unsafe fn syscall_device_close(handle: i32) -> i32 {
     let idx = match decode_handle(handle) {
         Some(i) => i,
-        None => return crate::kernel::errno::EINVAL,
+        None => return crate::kernel::sys::errno::EINVAL,
     };
     let slot = &mut *core::ptr::addr_of_mut!(BOUND_DEVICES[idx]);
     slot.active = false;
@@ -1398,11 +1398,11 @@ pub unsafe fn syscall_device_close(_handle: i32) -> i32 {
 /// this contract.
 pub unsafe fn syscall_device_cfg_read32(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let idx = match decode_handle(handle) {
         Some(i) => i,
-        None => return crate::kernel::errno::EINVAL,
+        None => return crate::kernel::sys::errno::EINVAL,
     };
     let offset = u16::from_le_bytes([*arg, *arg.add(1)]);
     let val = device_cfg_read32(idx, offset);
@@ -1422,11 +1422,11 @@ pub unsafe fn syscall_device_cfg_read32(handle: i32, arg: *mut u8, arg_len: usiz
 /// `handle` must hold the right contract permission.
 pub unsafe fn syscall_device_cfg_write32(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let idx = match decode_handle(handle) {
         Some(i) => i,
-        None => return crate::kernel::errno::EINVAL,
+        None => return crate::kernel::sys::errno::EINVAL,
     };
     let offset = u16::from_le_bytes([*arg, *arg.add(1)]);
     let val = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
@@ -1443,16 +1443,16 @@ pub unsafe fn syscall_device_cfg_write32(handle: i32, arg: *mut u8, arg_len: usi
 /// duration of the call. `handle` must be a bound PCIE_DEVICE handle.
 pub unsafe fn syscall_device_bar_map(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 10 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let idx = match decode_handle(handle) {
         Some(i) => i,
-        None => return crate::kernel::errno::EINVAL,
+        None => return crate::kernel::sys::errno::EINVAL,
     };
     let bar_idx = *arg as usize;
     let virt = bar_map(idx, bar_idx);
     if virt == 0 {
-        return crate::kernel::errno::ENOMEM;
+        return crate::kernel::sys::errno::ENOMEM;
     }
     let ab = (virt as u64).to_le_bytes();
     for (i, byte) in ab.iter().enumerate() {
@@ -1471,7 +1471,7 @@ pub unsafe fn syscall_device_bar_map(handle: i32, arg: *mut u8, arg_len: usize) 
 /// global `BOUND_DEVICES`; caller must not concurrently mutate that
 /// slot via `syscall_device_close`.
 #[cfg(feature = "board-pi5")]
-pub unsafe fn bound_device_root(handle: i32) -> Option<crate::kernel::pcie_aliases::PcieRoot> {
+pub unsafe fn bound_device_root(handle: i32) -> Option<crate::platform::pcie_aliases::PcieRoot> {
     let idx = decode_handle(handle)?;
     let slot = &*core::ptr::addr_of!(BOUND_DEVICES[idx]);
     if !slot.active {
@@ -1486,7 +1486,7 @@ pub unsafe fn bound_device_root(handle: i32) -> Option<crate::kernel::pcie_alias
 /// # Safety
 /// No invariants; this stub does not dereference any state.
 #[cfg(not(feature = "board-pi5"))]
-pub unsafe fn bound_device_root(_handle: i32) -> Option<crate::kernel::pcie_aliases::PcieRoot> {
+pub unsafe fn bound_device_root(_handle: i32) -> Option<crate::platform::pcie_aliases::PcieRoot> {
     None
 }
 
@@ -1501,15 +1501,15 @@ pub unsafe fn bound_device_root(_handle: i32) -> Option<crate::kernel::pcie_alia
 /// the call. `handle` must be a bound PCIE_DEVICE handle.
 pub unsafe fn syscall_device_info(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 32 {
-        return crate::kernel::errno::EINVAL;
+        return crate::kernel::sys::errno::EINVAL;
     }
     let idx = match decode_handle(handle) {
         Some(i) => i,
-        None => return crate::kernel::errno::EINVAL,
+        None => return crate::kernel::sys::errno::EINVAL,
     };
     let count = *core::ptr::addr_of!(DEVICE_COUNT);
     if idx >= count {
-        return crate::kernel::errno::ENODEV;
+        return crate::kernel::sys::errno::ENODEV;
     }
     let dev = &DEVICES[idx];
     let vid = dev.vendor_id.to_le_bytes();
@@ -1717,7 +1717,7 @@ pub unsafe fn pcie1_msi_dispatch() -> u32 {
         }
         let slot = &*core::ptr::addr_of!(PCIE1_MSI_VECTORS_TAB[v]);
         if slot.active && slot.event_handle >= 0 {
-            crate::kernel::event::event_signal_from_isr(slot.event_handle);
+            crate::kernel::ipc::event::event_signal_from_isr(slot.event_handle);
             signalled += 1;
         }
     }

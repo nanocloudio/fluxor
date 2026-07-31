@@ -720,7 +720,7 @@ fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool
         cand.manifest.clone(),
         project_root.join("modules/sdk/abi.rs"),
         project_root.join("modules/sdk/runtime.rs"),
-        project_root.join("modules/sdk/params.rs"),
+        project_root.join("modules/sdk/runtime/params.rs"),
         // Linker script. Lives under modules/sdk/ so it ships in the
         // fluxor-abi / fluxor-sdk source bundle for downstream consumers.
         project_root.join("modules/sdk/module.ld"),

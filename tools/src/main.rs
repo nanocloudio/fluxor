@@ -69,7 +69,7 @@ mod wasm_bundle;
 mod workload_src;
 mod workspace;
 
-/// Wire-format constants — path-mounted from `modules/sdk/wire.rs` so
+/// Wire-format constants — path-mounted from `modules/sdk/wire/wire.rs` so
 /// the host tools see the exact same `ABI_VERSION` byte and `fnv1a32`
 /// implementation the kernel uses. The lib facade in `tools/src/lib.rs`
 /// mounts the same file for integration tests. `#[allow(dead_code)]`
@@ -80,7 +80,7 @@ mod workspace;
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
-#[path = "../../modules/sdk/wire.rs"]
+#[path = "../../modules/sdk/wire/wire.rs"]
 mod wire;
 
 /// Canonical ABI wire-surface encoding (see `tools/src/lib.rs` mount).

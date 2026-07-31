@@ -9,7 +9,9 @@
 //! Host shim contract: `host_scan_result(ptr, len)` — the shim copies the bytes
 //! and stashes them for the page (e.g. `window.__fluxor_scan_result`).
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Hand a decoded result (kernel pointer + length) to the host page.

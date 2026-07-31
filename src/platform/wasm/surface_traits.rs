@@ -12,7 +12,9 @@
 //! Host shim contract: `host_surface_traits_pop(buf, len)` returns one
 //! 24-byte record per call, or 0 when the queue is empty.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Pop the next pending surface-traits record into `buf` (kernel-side

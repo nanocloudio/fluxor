@@ -17,10 +17,11 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use fluxor::kernel::config::EdgeClass;
-use fluxor::kernel::loader;
-use fluxor::kernel::multicore;
-use fluxor::kernel::scheduler;
+use fluxor::kernel::boot::config::EdgeClass;
+use fluxor::kernel::module::loader;
+use fluxor::platform::multicore;
+use fluxor::platform::{mmu, mpu};
+use fluxor::kernel::exec::scheduler;
 
 // ── Boot-time submodules (binary-private; not exposed via fluxor::kernel) ──
 //
@@ -280,7 +281,7 @@ static INIT_COMPLETE: AtomicU32 = AtomicU32::new(0);
 // is harmless. With -smp 4, secondary cores will park correctly.
 
 // DTB pointer handed to us by the firmware. `main` records it once the
-// MMU is up; `kernel::dtb::read_ethernet_mac` consults it. Placed in
+// MMU is up; `kernel::boot::dtb::read_ethernet_mac` consults it. Placed in
 // `.data` with a non-zero sentinel to keep it out of `.bss` (which the
 // boot code zeros).
 #[no_mangle]
@@ -425,11 +426,11 @@ global_asm!(
 /// masked for the duration via the kernel guard. Caller owns cross-domain edge
 /// bridging (boot does it inline before this; single-domain rebuild needs none).
 fn instantiate_and_activate(
-    module_list: &[Option<fluxor::kernel::config::ModuleEntry>],
+    module_list: &[Option<fluxor::kernel::boot::config::ModuleEntry>],
     module_count: usize,
 ) -> usize {
     // Mask IRQs during module instantiation
-    let _inst_guard = fluxor::kernel::guard::KernelGuard::acquire();
+    let _inst_guard = fluxor::kernel::sys::guard::KernelGuard::acquire();
 
     // Establish plan ownership BEFORE instantiation: the caller's prepare_graph
     // reset every module to the system owner, and module_new (in the loop below)
@@ -439,7 +440,7 @@ fn instantiate_and_activate(
     // plan on a rebuild (an ordinary rebuild must not drop isolation). Fail
     // closed: a staged-but-invalid plan rejects the graph rather than running it
     // system-owned (which would disable ownership isolation).
-    if let Err(e) = fluxor::kernel::owner_plan::apply_staged() {
+    if let Err(e) = fluxor::kernel::workload::owner_plan::apply_staged() {
         panic!("[owner] staged plan invalid ({e:?}); refusing to run the graph with ownership isolation disabled");
     }
 
@@ -514,7 +515,7 @@ fn instantiate_and_activate(
     scheduler::set_active_module_count(module_count);
     // SAFETY: scheduler-thread read of the installed static config.
     let cfg = unsafe { scheduler::static_config() };
-    fluxor::kernel::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
+    fluxor::kernel::exec::scheduler::log_dma_owned_edges_from_config(&cfg.graph_edges);
 
     // Tier 1b admission: hand every module in a Tier 1b domain to
     // the ISR-tier dispatcher. The helper picks the appropriate
@@ -594,7 +595,7 @@ fn active_domain_count() -> usize {
 /// failing edge's `consumer_channel` is untouched, and the caller decides the
 /// posture (boot halts; rebuild leaves the graph idle / fail-safe).
 fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
-    use fluxor::kernel::channel;
+    use fluxor::kernel::ipc::channel;
 
     // SAFETY: scheduler-thread access during graph prep (boot) or under
     // full quiesce (rebuild) — sole mutator of scheduler state either way.
@@ -680,7 +681,7 @@ fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
         // mid-sleep needs the targeted SGI doorbell, gated on the
         // rfc_adaptive_tick §5.4 WFI-wake mitigation.
         if edge_snapshot.wake_on_write {
-            fluxor::kernel::channel::channel_set_wake_module(
+            fluxor::kernel::ipc::channel::channel_set_wake_module(
                 in_ch,
                 edge_snapshot.to_module as i32,
             );
@@ -819,7 +820,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     UART_READY.store(1, Ordering::Release);
     // UART FIFO is always drained by hardware, so the local log-ring
     // consumer can activate immediately.
-    fluxor::kernel::log_ring::activate_local();
+    fluxor::kernel::sys::log_ring::activate_local();
 
     // Record the DTB pointer now that the MMU is on; later DTB reads
     // dereference `_boot_dtb_ptr`.
@@ -879,7 +880,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // + MDIO tuning). Stage 2c onwards (SerDes/PERST#/link) is deferred
     // pending cold-boot stability work.
     {
-        let n = fluxor::kernel::pcie::enumerate();
+        let n = fluxor::platform::pcie::enumerate();
         log::info!("[pcie] bus1 devices={n}");
     }
 
@@ -918,7 +919,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // HAL ops, syscall table, providers, then the BCM2712
     // generic-timer-backed step guard.
     fluxor::kernel::boot(&BCM2712_HAL_OPS);
-    fluxor::kernel::step_guard::init();
+    fluxor::kernel::exec::step_guard::init();
 
     // --- Config-driven module graph ---
     //
@@ -929,7 +930,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     // core's run loop drives `scheduler::step_domain_modules` (or
     // `step_domain_modules_poll` for Tier 3) through the shared
     // `step_one_module` body.
-    use fluxor::kernel::config;
+    use fluxor::kernel::boot::config;
 
     // Parse config + loader into the kernel's static state. Pi 5 scans
     // flash via the trailer; QEMU side-loads a packed blob at a fixed
@@ -1047,11 +1048,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Test hook (feature `test-plan`): stage an embedded owner plan so the boot
     // `apply_staged()` exercises the live-ownership path on hardware. The blob
-    // (one pod in slot 1 owning module 0) is generated by
+    // (one workload in slot 1 owning module 0) is generated by
     // `cargo run -p fluxor-tools --example emit_plan`. test-only, never shipped.
     #[cfg(feature = "test-plan")]
     {
-        // One pod (slot 1, gen 2) owning module index 100 — deliberately beyond
+        // One workload (slot 1, gen 2) owning module index 100 — deliberately beyond
         // any real graph module, so the stamp is observable yet harmless (it
         // does not re-own the live net-stack modules and break the netconsole).
         static TEST_PLAN: [u8; 90] = [
@@ -1066,7 +1067,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
         ];
         // SAFETY: TEST_PLAN is 'static; the pointer stays valid for the run.
         unsafe {
-            fluxor::kernel::owner_plan::set_staged_plan(TEST_PLAN.as_ptr(), TEST_PLAN.len());
+            fluxor::kernel::workload::owner_plan::set_staged_plan(TEST_PLAN.as_ptr(), TEST_PLAN.len());
         }
         uart_puts(b"[test] staged embedded owner plan\r\n");
     }
@@ -1116,14 +1117,14 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(total_mods as u32);
     uart_puts(b" modules loaded total\r\n");
 
-    fluxor::kernel::scheduler::log_arena_summary();
+    fluxor::kernel::exec::scheduler::log_arena_summary();
 
-    // Admit resident pods declared in the config's `[FXPD]` section (RFC
-    // adaptive_tick_extra §7 — `pods:` / `combine <two-graph.yaml>`) as workload
+    // Admit resident workloads declared in the config's `[FXPD]` section (RFC
+    // adaptive_tick_extra §7 — `workloads:` / `combine <two-graph.yaml>`) as workload
     // owners via `apply_add` + finalize. Boot-time, before the run loops start.
-    // No-op without a pod section; the multi-graph runner multiplexes the pods
+    // No-op without a workload section; the multi-graph runner multiplexes the workloads
     // with the base graph on the shared cooperative runner.
-    fluxor::kernel::scheduler::admit_resident_pods_from_config();
+    fluxor::kernel::exec::scheduler::admit_resident_workloads_from_config();
 
     // Signal init complete — secondary cores can start
     INIT_COMPLETE.store(1, Ordering::Release);
@@ -1137,6 +1138,13 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Wake secondary cores that have non-empty domains assigned
     wake_secondary_cores();
+
+    // Every counted non-primary domain is now on its way into `run_domain_loop`
+    // (where it honours `park_if_requested`), so a runtime peer-core quiesce can
+    // make progress. This gates the WS-D live-splice's quiesce
+    // (`scheduler::live::apply_add`/`free_owner`): before this point the splice
+    // runs single-threaded (boot admission), after it under a real quiesce.
+    multicore::mark_smp_online();
 
     uart_puts(b"[sched] starting domain 0 on core 0\r\n");
 
@@ -1488,7 +1496,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
             );
             loop {
                 multicore::park_if_requested(domain_id);
-                fluxor::kernel::isr_tier::poll_tier1b();
+                fluxor::kernel::exec::isr_tier::poll_tier1b();
                 pump_cross_domain(domain_id);
                 if core_id == 0 {
                     debug_drain_poll_core0();
@@ -1508,7 +1516,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                         "[tier1b] d={} polls={} ticks={}",
                         domain_id,
                         metrics.tick_count,
-                        fluxor::kernel::isr_tier::tier1b_ticks(),
+                        fluxor::kernel::exec::isr_tier::tier1b_ticks(),
                     );
                 }
             }
@@ -1547,7 +1555,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                     log::info!(
                         "[tier2] d={domain_id} wakes={} irqs={}",
                         metrics.tick_count,
-                        fluxor::kernel::isr_tier::tier2_dispatch_count(),
+                        fluxor::kernel::exec::isr_tier::tier2_dispatch_count(),
                     );
                 }
             }
@@ -1574,7 +1582,7 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // Poll the Tier 1b timer here too — on configurations
                 // with no dedicated Tier 1b core, the cooperative pump
                 // is the only path to fire the ISR handler.
-                fluxor::kernel::isr_tier::poll_tier1b();
+                fluxor::kernel::exec::isr_tier::poll_tier1b();
                 if core_id == 0 {
                     debug_drain_poll_core0();
                 }
@@ -1685,7 +1693,7 @@ fn pump_cross_domain(domain_id: usize) {
                 // SAFETY: `buf` is `SLOT_DATA_SIZE` bytes on the stack;
                 // channel_read writes ≤ `buf.len()` bytes.
                 let n = unsafe {
-                    fluxor::kernel::channel::channel_read(
+                    fluxor::kernel::ipc::channel::channel_read(
                         edge.local_out_handle,
                         buf.as_mut_ptr(),
                         buf.len(),
@@ -1709,9 +1717,9 @@ fn pump_cross_domain(domain_id: usize) {
             let aux = edge.pending_aux.swap(u32::MAX, Ordering::AcqRel);
             if aux != u32::MAX {
                 let mut val = aux;
-                let _ = fluxor::kernel::channel::channel_ioctl(
+                let _ = fluxor::kernel::ipc::channel::channel_ioctl(
                     edge.local_out_handle,
-                    fluxor::kernel::channel::IOCTL_NOTIFY,
+                    fluxor::kernel::ipc::channel::IOCTL_NOTIFY,
                     &mut val as *mut u32 as *mut u8,
                 );
             }
@@ -1737,7 +1745,7 @@ fn pump_cross_domain(domain_id: usize) {
                 let Some(slot_len) = ch.try_peek_len() else {
                     break; // ring empty
                 };
-                if fluxor::kernel::channel::channel_writable_bytes(edge.local_in_handle) < slot_len
+                if fluxor::kernel::ipc::channel::channel_writable_bytes(edge.local_in_handle) < slot_len
                 {
                     multicore::CROSS_DOMAIN_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     break;
@@ -1750,19 +1758,19 @@ fn pump_cross_domain(domain_id: usize) {
                 // the FIFO was just confirmed to have room for the whole slot,
                 // so this write is complete (no truncation).
                 unsafe {
-                    fluxor::kernel::channel::channel_write(edge.local_in_handle, buf.as_ptr(), len);
+                    fluxor::kernel::ipc::channel::channel_write(edge.local_in_handle, buf.as_ptr(), len);
                 }
                 let mi = ((edge.from_domain as usize) * 4 + edge.to_domain as usize) & 15;
                 XPUMP_CONS[mi].fetch_add(1, Ordering::Relaxed);
                 moved += 1;
             }
             let mut val: u32 = 0;
-            let rc = fluxor::kernel::channel::channel_ioctl(
+            let rc = fluxor::kernel::ipc::channel::channel_ioctl(
                 edge.local_in_handle,
-                fluxor::kernel::channel::IOCTL_POLL_NOTIFY,
+                fluxor::kernel::ipc::channel::IOCTL_POLL_NOTIFY,
                 &mut val as *mut u32 as *mut u8,
             );
-            if rc == fluxor::kernel::channel::CHAN_OK && val != u32::MAX {
+            if rc == fluxor::kernel::ipc::channel::CHAN_OK && val != u32::MAX {
                 // `pending_aux` is single-slot — a fresh notification
                 // overwrites any prior one that the producer pump
                 // hadn't yet drained. The single-slot design is
@@ -1896,7 +1904,7 @@ pub fn wake_secondary_cores() {
 // BCM2712 HAL Ops
 // ============================================================================
 
-use fluxor::kernel::hal::HalOps;
+use fluxor::kernel::sys::hal::HalOps;
 
 fn bcm_disable_interrupts() -> u32 {
     let daif: u32;
@@ -1981,7 +1989,7 @@ fn bcm_sleep_until(_deadline_us: u64) -> u32 {
     unsafe {
         core::arch::asm!("wfi")
     };
-    fluxor::kernel::hal::WOKEN_UNKNOWN
+    fluxor::kernel::sys::hal::WOKEN_UNKNOWN
 }
 
 /// Monotonic milliseconds since boot. Reads the ARM generic timer
@@ -2104,7 +2112,7 @@ fn maybe_emit_soc_temp(core_id: usize) {
     // Surface the Tier-2 IRQ-dispatch count on the reliable core-0 cadence so a
     // dedicated-core Tier-2 module's `module_isr_entry` firing is observable
     // over UDP (its own loop logs only every 1M wakes).
-    let t2disp = fluxor::kernel::isr_tier::tier2_dispatch_count();
+    let t2disp = fluxor::kernel::exec::isr_tier::tier2_dispatch_count();
     if let Some(mc) = soc_temp_mc() {
         log::info!(
             "[therm] soc_temp_mC={mc} t_ms={now} ct0={ct0} irq_hz={irq_hz} dl0_us={dl0_us} dl0_max_us={dl0_max_us} worst_us={worst_us} ovr={ovr} t2disp={t2disp}"
@@ -2207,7 +2215,7 @@ fn bcm_counter_freq() -> u64 {
 fn bcm_step_guard_init() {}
 
 fn bcm_step_guard_arm(deadline_us: u32) {
-    use fluxor::kernel::step_guard;
+    use fluxor::kernel::exec::step_guard;
     step_guard::clear_timed_out();
     step_guard::set_armed(true);
     let freq = bcm_counter_freq();
@@ -2221,11 +2229,11 @@ fn bcm_step_guard_arm(deadline_us: u32) {
 }
 
 fn bcm_step_guard_disarm() {
-    fluxor::kernel::step_guard::set_armed(false);
+    fluxor::kernel::exec::step_guard::set_armed(false);
 }
 
 fn bcm_step_guard_post_check() {
-    use fluxor::kernel::step_guard;
+    use fluxor::kernel::exec::step_guard;
     if !step_guard::is_armed() {
         return;
     }
@@ -2250,7 +2258,7 @@ static mut BCM_ISR_LAST_TICK: u64 = 0;
 static mut BCM_ISR_PERIOD_TICKS: u64 = 0;
 
 fn bcm_isr_tier_start(period_us: u32) {
-    use fluxor::kernel::isr_tier;
+    use fluxor::kernel::exec::isr_tier;
     isr_tier::set_tier1b_period_us(period_us);
     let freq = bcm_counter_freq();
     // SAFETY: ISR-tier statics are set during init before any tier-1b
@@ -2263,11 +2271,11 @@ fn bcm_isr_tier_start(period_us: u32) {
 }
 
 fn bcm_isr_tier_stop() {
-    fluxor::kernel::isr_tier::TIER1B_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+    fluxor::kernel::exec::isr_tier::TIER1B_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
 }
 
 fn bcm_isr_tier_poll() {
-    use fluxor::kernel::isr_tier;
+    use fluxor::kernel::exec::isr_tier;
     if !isr_tier::TIER1B_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         return;
     }
@@ -2287,7 +2295,27 @@ fn bcm_isr_tier_poll() {
 
 fn bcm_init_providers() {
     // BCM2712 system extension for MMIO and NIC opcodes
-    fluxor::kernel::syscalls::register_system_extension(bcm_system_extension_dispatch);
+    fluxor::kernel::module::syscalls::register_system_extension(bcm_system_extension_dispatch);
+    // Metal fmod-graph `workload` (0x1A) backend (rfc_workload_backend_metal.md
+    // P1): stages a workload as an owned module subgraph via `apply_add`/owner/lease.
+    // Gated exactly like the Linux install — `requires_contract = "workload"` +
+    // `platform_raw` in the caller's manifest. The core logic is kernel-generic
+    // (`kernel::workload::workload_graph`); this is the metal registration that installs it.
+    use fluxor::kernel::module::provider;
+    use fluxor::kernel::module::provider::contract as dev_class;
+    provider::register(dev_class::WORKLOAD, bcm_workload_dispatch);
+}
+
+/// Metal `workload` (0x1A) provider dispatch — the thin bcm registration hook.
+/// Delegates to the kernel-generic backend (`kernel::workload::workload_graph`), which runs
+/// on the primary domain / core 0 (the system graph's domain) so the runtime
+/// `apply_add`/`free_owner` it drives honor the primary-only quiesce invariant
+/// (RFC §3.2 / P0).
+///
+/// # Safety
+/// Scheduler-thread dispatch only; see `workload_graph::workload_dispatch`.
+unsafe fn bcm_workload_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    fluxor::kernel::workload::workload_graph::workload_dispatch(handle, opcode, arg, arg_len)
 }
 
 /// Platform-specific per-module cleanup for BCM2712.
@@ -2320,7 +2348,8 @@ unsafe fn bcm_system_extension_dispatch(
     arg_len: usize,
 ) -> i32 {
     use fluxor::abi::contracts::storage::paged_arena;
-    use fluxor::abi::platform::bcm2712::{mmio_dma, pcie_device, pcie_nic};
+    use fluxor::abi::contracts::hal::pcie_device;
+    use fluxor::abi::platform::bcm2712::{mmio_dma, msi, nic_ring, pcie_config};
     match opcode {
         mmio_dma::MMIO_READ32 => {
             if arg.is_null() || arg_len < 12 {
@@ -2397,7 +2426,7 @@ unsafe fn bcm_system_extension_dispatch(
             // device DMA routed through the PCIe1 inbound window lands
             // in real DRAM. See `bcm2712_nic_ring::pcie1_dma_alloc_contig`.
             let phys =
-                fluxor::kernel::nic_ring::pcie1_dma_alloc_contig(size as usize, align as usize);
+                fluxor::platform::nic_ring::pcie1_dma_alloc_contig(size as usize, align as usize);
             if phys == 0 {
                 return -38;
             }
@@ -2415,7 +2444,7 @@ unsafe fn bcm_system_extension_dispatch(
             // with DMA_FLUSH before device-reads and DMA_INVALIDATE before
             // CPU-reads of device-written regions.
             let phys =
-                fluxor::kernel::nic_ring::pcie1_dma_alloc_streaming(size as usize, align as usize);
+                fluxor::platform::nic_ring::pcie1_dma_alloc_streaming(size as usize, align as usize);
             if phys == 0 {
                 return -38;
             }
@@ -2483,37 +2512,37 @@ unsafe fn bcm_system_extension_dispatch(
             core::arch::asm!("dsb sy");
             0
         }
-        pcie_nic::NIC_BAR_MAP => fluxor::kernel::pcie::syscall_bar_map(arg, arg_len),
-        pcie_nic::NIC_BAR_UNMAP => fluxor::kernel::pcie::syscall_bar_unmap(arg, arg_len),
-        pcie_nic::NIC_RING_CREATE => fluxor::kernel::nic_ring::syscall_ring_create(arg, arg_len),
-        pcie_nic::NIC_RING_DESTROY => fluxor::kernel::nic_ring::syscall_ring_destroy(arg, arg_len),
-        pcie_nic::NIC_RING_INFO => {
-            fluxor::kernel::nic_ring::syscall_ring_info(_handle, arg, arg_len)
+        nic_ring::NIC_BAR_MAP => fluxor::platform::pcie::syscall_bar_map(arg, arg_len),
+        nic_ring::NIC_BAR_UNMAP => fluxor::platform::pcie::syscall_bar_unmap(arg, arg_len),
+        nic_ring::NIC_RING_CREATE => fluxor::platform::nic_ring::syscall_ring_create(arg, arg_len),
+        nic_ring::NIC_RING_DESTROY => fluxor::platform::nic_ring::syscall_ring_destroy(arg, arg_len),
+        nic_ring::NIC_RING_INFO => {
+            fluxor::platform::nic_ring::syscall_ring_info(_handle, arg, arg_len)
         }
-        pcie_nic::PCIE_RESCAN => {
+        pcie_config::PCIE_RESCAN => {
             let _ = arg;
             let _ = arg_len;
-            fluxor::kernel::pcie::enumerate() as i32
+            fluxor::platform::pcie::enumerate() as i32
         }
-        pcie_nic::PCIE_CFG_READ32 => fluxor::kernel::pcie::syscall_cfg_read32(arg, arg_len),
-        pcie_nic::PCIE_CFG_WRITE32 => fluxor::kernel::pcie::syscall_cfg_write32(arg, arg_len),
-        pcie_nic::PCIE1_MSI_INIT => {
+        pcie_config::PCIE_CFG_READ32 => fluxor::platform::pcie::syscall_cfg_read32(arg, arg_len),
+        pcie_config::PCIE_CFG_WRITE32 => fluxor::platform::pcie::syscall_cfg_write32(arg, arg_len),
+        msi::PCIE1_MSI_INIT => {
             // arg = [spi_irq: u32 LE]
             if arg.is_null() || arg_len < 4 {
                 return -22;
             }
             let spi_irq = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            if !fluxor::kernel::pcie::pcie1_msi_init() {
-                return fluxor::kernel::errno::ENODEV;
+            if !fluxor::platform::pcie::pcie1_msi_init() {
+                return fluxor::kernel::sys::errno::ENODEV;
             }
             register_pcie1_msi_spi(spi_irq)
         }
-        pcie_nic::PCIE1_MSI_ALLOC_VECTOR => {
+        msi::PCIE1_MSI_ALLOC_VECTOR => {
             if arg.is_null() || arg_len < 20 {
                 return -22;
             }
             let event_handle = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            match fluxor::kernel::pcie::pcie1_msi_alloc_vector(event_handle) {
+            match fluxor::platform::pcie::pcie1_msi_alloc_vector(event_handle) {
                 None => -12, // ENOMEM
                 Some((vec, addr, data)) => {
                     *arg.add(4) = vec;
@@ -2538,41 +2567,41 @@ unsafe fn bcm_system_extension_dispatch(
                 return -22;
             }
             let sel = core::slice::from_raw_parts(arg, arg_len);
-            fluxor::kernel::pcie::bind_selector(sel)
+            fluxor::platform::pcie::bind_selector(sel)
         }
-        pcie_device::CLOSE => fluxor::kernel::pcie::syscall_device_close(_handle),
+        pcie_device::CLOSE => fluxor::platform::pcie::syscall_device_close(_handle),
         pcie_device::CFG_READ32 => {
-            fluxor::kernel::pcie::syscall_device_cfg_read32(_handle, arg, arg_len)
+            fluxor::platform::pcie::syscall_device_cfg_read32(_handle, arg, arg_len)
         }
         pcie_device::CFG_WRITE32 => {
-            fluxor::kernel::pcie::syscall_device_cfg_write32(_handle, arg, arg_len)
+            fluxor::platform::pcie::syscall_device_cfg_write32(_handle, arg, arg_len)
         }
-        pcie_device::BAR_MAP => fluxor::kernel::pcie::syscall_device_bar_map(_handle, arg, arg_len),
+        pcie_device::BAR_MAP => fluxor::platform::pcie::syscall_device_bar_map(_handle, arg, arg_len),
         pcie_device::MSI_ALLOC => {
             if arg.is_null() || arg_len < 20 || _handle < 0 {
                 return -22;
             }
             // The bound handle tells us which root complex's MSI mux
             // to use. Only PCIe1 is wired today.
-            match fluxor::kernel::pcie::bound_device_root(_handle) {
-                None => fluxor::kernel::errno::EINVAL,
+            match fluxor::platform::pcie::bound_device_root(_handle) {
+                None => fluxor::kernel::sys::errno::EINVAL,
                 Some(root) => {
-                    use fluxor::kernel::pcie_aliases::PcieRoot;
+                    use fluxor::platform::pcie_aliases::PcieRoot;
                     match root {
                         PcieRoot::Pcie1 => {
-                            if !fluxor::kernel::pcie::pcie1_msi_init() {
-                                return fluxor::kernel::errno::ENODEV;
+                            if !fluxor::platform::pcie::pcie1_msi_init() {
+                                return fluxor::kernel::sys::errno::ENODEV;
                             }
                             if !PCIE1_MSI_SPI_REGISTERED {
                                 let _ = register_pcie1_msi_spi(
-                                    fluxor::kernel::pcie::BCM2712_PCIE1_MSI_SPI_IRQ,
+                                    fluxor::platform::pcie::BCM2712_PCIE1_MSI_SPI_IRQ,
                                 );
                                 PCIE1_MSI_SPI_REGISTERED = true;
                             }
                             let event_handle =
                                 i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-                            match fluxor::kernel::pcie::pcie1_msi_alloc_vector(event_handle) {
-                                None => fluxor::kernel::errno::ENOMEM,
+                            match fluxor::platform::pcie::pcie1_msi_alloc_vector(event_handle) {
+                                None => fluxor::kernel::sys::errno::ENOMEM,
                                 Some((vec, addr, data)) => {
                                     *arg.add(4) = vec;
                                     *arg.add(5) = 0;
@@ -2590,12 +2619,12 @@ unsafe fn bcm_system_extension_dispatch(
                                 }
                             }
                         }
-                        PcieRoot::Pcie2 => fluxor::kernel::errno::ENOSYS,
+                        PcieRoot::Pcie2 => fluxor::kernel::sys::errno::ENOSYS,
                     }
                 }
             }
         }
-        pcie_device::INFO => fluxor::kernel::pcie::syscall_device_info(_handle, arg, arg_len),
+        pcie_device::INFO => fluxor::platform::pcie::syscall_device_info(_handle, arg, arg_len),
         paged_arena::ARENA_REGISTER => {
             if arg.is_null() || arg_len < 10 {
                 return -22;
@@ -2613,7 +2642,7 @@ unsafe fn bcm_system_extension_dispatch(
                 1 => fluxor::kernel::backing_store::WritebackPolicy::WriteThrough,
                 _ => return -22,
             };
-            let idx = fluxor::kernel::scheduler::current_module_index() as u8;
+            let idx = fluxor::kernel::exec::scheduler::current_module_index() as u8;
             fluxor::kernel::backing_store::backing_register(idx, vpages, rmax, bt, wb)
         }
         paged_arena::ARENA_READ => {
@@ -2701,6 +2730,80 @@ unsafe fn bcm_system_extension_dispatch(
     }
 }
 
+/// Protection impls (HalOps seam). On BCM2712 module protection is the EL0
+/// MMU; the portable MPU facade is a no-op here but is kept in the enable
+/// path for exact parity with the pre-seam behavior.
+fn bcm_protection_set_enabled(enabled: bool) {
+    mpu::set_enabled(enabled);
+    mmu::set_enabled(enabled);
+}
+fn bcm_protection_register_module(
+    module_idx: usize,
+    code_base: usize,
+    code_size: usize,
+    state_ptr: *mut u8,
+    state_size: usize,
+    heap_ptr: *mut u8,
+    heap_size: usize,
+) {
+    mmu::register_module(
+        module_idx,
+        code_base as u64,
+        code_size as u64,
+        state_ptr,
+        state_size,
+        heap_ptr,
+        heap_size,
+    );
+}
+/// Channel-region registration with the EL0 page-rounding + fail-closed
+/// interleave policy: an isolated module's channel span is mapped EL0-RW as
+/// one page-rounded range; if a PEER producer's buffer falls inside that span
+/// (possible for a multi-output module whose buffers bracket a peer's),
+/// mapping it would grant writable access to the peer's buffer — refuse to
+/// register instead (the isolated module's own channel I/O then faults per
+/// policy, but no peer buffer is ever exposed).
+fn bcm_protection_set_channel_region(i: usize, base: usize, size: usize) {
+    mpu::set_channel_region(i, base as u32, size as u32);
+    const PAGE: usize = 4096;
+    if fluxor::kernel::exec::scheduler::module_is_isolated(i) {
+        let pbase = base & !(PAGE - 1);
+        let pend = (base + size + PAGE - 1) & !(PAGE - 1);
+        if fluxor::kernel::ipc::buffer_pool::any_foreign_buffer_in_range(
+            i as u8,
+            pbase,
+            pend - pbase,
+        ) {
+            log::error!(
+                "[el0] module {i}: channel span 0x{pbase:x}+{} overlaps a peer buffer —                  REFUSING to map channel region (fail closed).",
+                pend - pbase,
+            );
+        } else {
+            mmu::set_channel_region(i, pbase as u64, (pend - pbase) as u64);
+        }
+    } else {
+        mmu::set_channel_region(i, base as u64, size as u64);
+    }
+}
+fn bcm_protection_map_page(module_idx: usize, vaddr: usize, phys: usize, writable: bool) {
+    mmu::map_4k_page(module_idx, vaddr as u64, phys as u64, writable);
+}
+fn bcm_protection_unmap_page(module_idx: usize, vaddr: usize) {
+    mmu::unmap_4k_page(module_idx, vaddr as u64);
+}
+
+/// Park online secondaries for a structural mutation (HalOps seam): no-op
+/// before SMP is online; otherwise request + wait for every active peer.
+fn bcm_smp_quiesce_peers() -> bool {
+    if multicore::smp_online() {
+        let expected = multicore::non_primary_active_count();
+        multicore::request_quiesce();
+        multicore::wait_parked(expected);
+        return true;
+    }
+    false
+}
+
 static BCM2712_HAL_OPS: HalOps = HalOps {
     disable_interrupts: bcm_disable_interrupts,
     restore_interrupts: bcm_restore_interrupts,
@@ -2735,6 +2838,19 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     core_id: || current_core_id() as usize,
     irq_bind,
     sleep_until: bcm_sleep_until,
+    smp_quiesce_peers: bcm_smp_quiesce_peers,
+    smp_release_peers: multicore::release_quiesce,
+    smp_max_domains: || multicore::MAX_DOMAINS,
+    protection_set_enabled: bcm_protection_set_enabled,
+    protection_reset: mmu::reset_isolation,
+    protection_register_module: bcm_protection_register_module,
+    protection_set_channel_region: bcm_protection_set_channel_region,
+    protection_set_isolated_channels: mmu::set_isolated_channels,
+    protected_step: mmu::protected_step,
+    protection_map_page: bcm_protection_map_page,
+    protection_unmap_page: bcm_protection_unmap_page,
+    stack_canary_check: mpu::check_stack_canary,
+    stack_canary_reinit: mpu::reinit_stack_canary,
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000
@@ -2863,7 +2979,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
             uart_raw_puts(b"\r\n");
         }
         let mut buf = [0u8; 1024];
-        let n = fluxor::kernel::log_ring::read_tail(&mut buf);
+        let n = fluxor::kernel::sys::log_ring::read_tail(&mut buf);
         if n > 0 {
             uart_raw_puts(b"--- log tail (");
             uart_raw_put_u32(n as u32);

@@ -5,7 +5,9 @@
 //! State: heap-allocated; the BuiltInModule's 64-byte inline state
 //! holds a `*mut FetchState` pointer.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Issue an HTTP GET to `url_ptr[..url_len]` (UTF-8). Returns a

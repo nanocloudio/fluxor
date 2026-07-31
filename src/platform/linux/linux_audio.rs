@@ -105,7 +105,7 @@ mod playback_backend {
 use std::io::{Seek, SeekFrom};
 
 const LINUX_AUDIO_HASH: u32 = 0xF62EA500; // fnv1a32("linux_audio")
-const PIO_STREAM_TIME: u32 = 0x0407;
+const STREAM_CLOCK_QUERY: u32 = 0x1C00;
 
 struct LinuxAudioClock {
     started: bool,
@@ -223,19 +223,19 @@ unsafe fn linux_stream_time_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    if opcode != PIO_STREAM_TIME {
-        return fluxor::kernel::errno::ENOSYS;
+    if opcode != STREAM_CLOCK_QUERY {
+        return fluxor::kernel::sys::errno::ENOSYS;
     }
     if handle >= 0 {
-        return fluxor::kernel::errno::EINVAL;
+        return fluxor::kernel::sys::errno::EINVAL;
     }
     if arg.is_null() || arg_len < 24 {
-        return fluxor::kernel::errno::EINVAL;
+        return fluxor::kernel::sys::errno::EINVAL;
     }
 
     let clock = &*core::ptr::addr_of!(LINUX_AUDIO_CLOCK);
     if !clock.started || clock.sample_rate == 0 || clock.channels == 0 {
-        return fluxor::kernel::errno::ENODEV;
+        return fluxor::kernel::sys::errno::ENODEV;
     }
 
     let bytes_per_frame = clock.channels as u64 * 2;

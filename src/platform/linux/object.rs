@@ -26,10 +26,10 @@
 // qualified; the two `io` traits are pulled in anonymously
 // (`as _`) inside `http_request` so their methods resolve without
 // binding a colliding name.
-use fluxor::abi::contracts::fence as obj_dev_fence;
+use fluxor::abi::fence as obj_dev_fence;
 use fluxor::abi::contracts::storage::object as obj_dev;
-use fluxor::kernel::errno as obj_errno;
-use fluxor::kernel::fd::{tag_fd, FD_TAG_STORAGE_OBJECT};
+use fluxor::kernel::sys::errno as obj_errno;
+use fluxor::kernel::ipc::fd::{tag_fd, FD_TAG_STORAGE_OBJECT};
 
 const OBJ_MAX_OPEN: usize = 16;
 const OBJ_MAX_KEY: usize = 256;

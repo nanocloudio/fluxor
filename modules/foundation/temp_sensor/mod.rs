@@ -26,7 +26,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 // ============================================================================
 // Constants
@@ -219,7 +219,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-// Contract ids + opcodes (mirror kernel::provider::contract + abi paths).
+// Contract ids + opcodes (mirror kernel::module::provider::contract + abi paths).
 const HAL_ADC_CONTRACT: u32 = 0x000E;
 const TIMER_CONTRACT:   u32 = 0x0006;
 const ADC_OPEN:     u32 = 0x0E00;
@@ -232,6 +232,6 @@ const TIMER_SET:    u32 = 0x0605;
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

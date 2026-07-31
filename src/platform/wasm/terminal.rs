@@ -16,7 +16,8 @@
 //! handles auto-scroll and line wrapping; this module just hands
 //! over UTF-8 bytes as they come off the ring.
 
-use crate::kernel::{scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::module::syscalls;
 
 extern "C" {
     /// Append `len` bytes to the in-page terminal scrollback. The

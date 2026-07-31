@@ -49,7 +49,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 
 #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
 mod constants;
@@ -60,9 +60,10 @@ mod wifi_ops;
 
 use constants::*;
 
-use abi::contracts::hal::{gpio as dev_gpio, pio as dev_pio};
+use abi::contracts::hal::gpio as dev_gpio;
+use abi::platform::rp::pio as dev_pio;
 
-// Provider contract ids (mirror kernel::provider::contract::*).
+// Provider contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
 const HAL_PIO_CONTRACT:  u32 = 0x0004;
 
@@ -467,7 +468,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
         }
         1 => {
             // Load gSPI PIO program
-            let load_args = abi::contracts::hal::pio::LoadProgramArgs {
+            let load_args = abi::platform::rp::pio::LoadProgramArgs {
                 program: GSPI_PIO_PROGRAM.as_ptr(),
                 program_len: GSPI_PIO_PROGRAM.len() as u32,
                 wrap_target: GSPI_PIO_WRAP_TARGET,
@@ -479,7 +480,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
                 s.pio_handle,
                 dev_pio::CMD_LOAD_PROGRAM,
                 &load_args as *const _ as *mut u8,
-                core::mem::size_of::<abi::contracts::hal::pio::LoadProgramArgs>(),
+                core::mem::size_of::<abi::platform::rp::pio::LoadProgramArgs>(),
             );
             if r < 0 {
                 log_error(s, b"[cyw43] pio prog fail");
@@ -488,7 +489,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
             }
 
             // Configure PIO pins
-            let cfg_args = abi::contracts::hal::pio::CmdConfigureArgs {
+            let cfg_args = abi::platform::rp::pio::CmdConfigureArgs {
                 data_pin: s.dio_pin,
                 clk_pin: s.clk_pin,
                 _pad: [0; 2],
@@ -498,7 +499,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
                 s.pio_handle,
                 dev_pio::CMD_CONFIGURE,
                 &cfg_args as *const _ as *mut u8,
-                core::mem::size_of::<abi::contracts::hal::pio::CmdConfigureArgs>(),
+                core::mem::size_of::<abi::platform::rp::pio::CmdConfigureArgs>(),
             );
             if r < 0 {
                 log_error(s, b"[cyw43] pio cfg fail");
@@ -2879,6 +2880,6 @@ unsafe fn process_wifi_command(s: &mut Cyw43State, msg_type: u32, payload: *cons
 // ============================================================================
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
-// `modules/sdk/wasm_entry.rs` for the wasm32 module_init_wasm /
+// `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../sdk/wasm_entry.rs");
+include!("../../sdk/runtime/wasm_entry.rs");

@@ -22,7 +22,9 @@
 //! (pure-Rust H.264 baseline) instead; `host_video_config` returning
 //! an error simply marks this module failed.
 
-use crate::kernel::{channel, scheduler, syscalls};
+use crate::kernel::exec::scheduler;
+use crate::kernel::ipc::channel;
+use crate::kernel::module::syscalls;
 
 #[path = "../../../modules/app/codec/mkv_demux.rs"]
 mod mkv_demux;

@@ -16,8 +16,9 @@
 
 use super::constants::*;
 use super::Cyw43State;
-use super::abi::contracts::hal::pio::CmdTransferArgs as PioCmdTransferArgs;
-use super::abi::contracts::hal::{pio as dev_pio, gpio as dev_gpio};
+use super::abi::platform::rp::pio::CmdTransferArgs as PioCmdTransferArgs;
+use super::abi::contracts::hal::gpio as dev_gpio;
+use super::abi::platform::rp::pio as dev_pio;
 
 // ============================================================================
 // PIO Word Byte Swap
