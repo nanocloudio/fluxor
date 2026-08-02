@@ -1,3 +1,25 @@
+/// Tie a spawned `fluxor-linux` to this process's lifetime: PR_SET_PDEATHSIG
+/// delivers SIGKILL to the child the moment its parent dies. Without this, a
+/// caller that kills (or `timeout`s) the `fluxor` CLI orphans the runtime,
+/// which then runs its scheduler loop forever holding its full state arena —
+/// the classic "endless memory-hungry fluxor-linux processes" leak. Graphs are
+/// servers by design and never exit on their own, so the parent's lifetime is
+/// the only lifetime they have.
+pub fn tie_to_parent(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: the pre_exec closure runs post-fork in the child, where only
+    // async-signal-safe calls are permitted — prctl(PR_SET_PDEATHSIG) is one,
+    // touches no memory shared with the parent, and only affects the child
+    // being exec'd. The disposition survives the subsequent exec (the runtime
+    // binary is neither setuid nor file-capability'd, which would clear it).
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        })
+    }
+}
+
 fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
     // A workload source manifest — a `.toml` with a `[workload]` table
     // (rfc_system_services.md §10) — emits the committed bundle + per-target
@@ -777,12 +799,13 @@ fn spawn_one(
     active: &ActiveComponent,
     _scenario_path: &Path,
 ) -> Result<SpawnedActive> {
-    let mut child = std::process::Command::new(linux_bin)
-        .arg("--config")
+    let mut cmd = std::process::Command::new(linux_bin);
+    cmd.arg("--config")
         .arg(&active.config_bin)
         .arg("--modules")
         .arg(&active.modules_bin)
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = tie_to_parent(&mut cmd)
         .spawn()
         .map_err(|e| {
             Error::Config(format!(
@@ -1041,12 +1064,12 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 modules_bin.display()
             );
 
-            let status = std::process::Command::new(&linux_bin)
-                .arg("--config")
+            let mut cmd = std::process::Command::new(&linux_bin);
+            cmd.arg("--config")
                 .arg(&config_bin)
                 .arg("--modules")
-                .arg(&modules_bin)
-                .status()?;
+                .arg(&modules_bin);
+            let status = tie_to_parent(&mut cmd).status()?;
 
             if !status.success() {
                 return Err(Error::Config(format!(

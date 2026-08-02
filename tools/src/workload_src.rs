@@ -514,7 +514,9 @@ pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> 
     if !app_args.is_empty() {
         cmd.arg("--").args(app_args);
     }
-    let status = cmd.status()?;
+    // Die-with-parent (see `tie_to_parent`): a killed/timeouted `fluxor exec`
+    // must not orphan a runtime that never exits on its own.
+    let status = crate::tie_to_parent(&mut cmd).status()?;
     // A CLI bundle's exit code IS the deliverable (rfc_cli_execution.md §6):
     // propagate it verbatim rather than wrapping it in a tool error.
     std::process::exit(status.code().unwrap_or(1));
