@@ -922,7 +922,7 @@ fn f() {}
             Tier::Tests
         );
         assert_eq!(
-            classify_tier(Path::new("modules/app/codec/benches/decode.rs")),
+            classify_tier(Path::new("modules/foundation/http/benches/decode.rs")),
             Tier::Tests
         );
     }
