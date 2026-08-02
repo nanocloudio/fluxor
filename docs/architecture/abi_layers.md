@@ -535,3 +535,89 @@ compile into the kernel binary; everything else is a PIC module:
 Anything device-shaped in the binary that is not manifest-visible or
 listed in the backends table is drift by construction — it bypasses
 the mechanism that keeps kernel-resident drivers accountable.
+
+## Boundary decisions
+
+Decisions on ABI vocabulary and surface placement. Each carries its status:
+`DECIDED` (an explicit operator decision) or `PROPOSED` (the implementer's
+recommendation, recorded for review — not yet agreed policy). Code may already
+follow a PROPOSED entry; that makes it current practice, not a settled rule.
+Code comments may summarize these; this section is the authority. Execution
+history is tracked in `.context/boundary_ledger.md`.
+
+### D-POSIX — low-level POSIX vocabulary: retain
+
+Status: **DECIDED** (operator, 2026-07-31).
+
+`fd` (tagged handle), `errno` (negative error code), poll flags, and syscall
+terminology at the kernel/module boundary are **retained deliberately**. They
+are universally-understood OS primitives, not orchestrator (K8s/OCI)
+vocabulary; renaming them to invented equivalents (handle/readiness/control-op)
+would churn the entire ABI and every consumer for zero architectural gain.
+Higher-level orchestration vocabulary is native Fluxor (`owner`, `workload`,
+`lease`, `posture`, `endpoint`, `drain`); Kubernetes vocabulary lives in
+nanocloud, which translates at its boundary.
+
+Reopens if: Fluxor grows a public API audience for whom POSIX vocabulary
+actively misleads (e.g. an `fd` that stops behaving like a handle table).
+
+### D-DIRS — source organization: domain directories via consolidation
+
+Status: **DECIDED in direction** (operator, 2026-07-31: consistency via domain
+directories, consolidating similar domains) and the concrete 8-kernel/8-SDK
+grouping was operator-approved before execution. Whether THIS exact hierarchy
+is the permanent rule (vs. one acceptable realization) is **PROPOSED** — open
+to revision.
+
+Every kernel and SDK source file lives under a domain directory; there are no
+loose top-level implementation files. Domains are formed by **consolidating
+similar concerns into a small set of coherent directories** (8 kernel domains:
+`boot exec ipc mem module security sys workload`; SDK: `abi contracts cores
+crypto internal platform runtime wire assets`) — not one directory per file,
+and not flat-until-forced. Named exceptions, each justified as an entry point
+or generated artifact that other files path-mount: `modules/sdk/abi.rs` (the
+assembler), `abi_surface.rs` / `abi_surface_srcpin.rs` (the pin machinery,
+path-referenced by `tools/src/abi_pin.rs`), `runtime.rs` (the module-side
+aggregator), `fence.rs` (a cross-cutting ABI value-type at the `abi` root).
+
+A domain earns a new directory when a concern no longer reads as one of the
+existing domains — prefer widening an existing domain over minting a new one.
+
+### D-WORKLOAD-ABI — host-process semantics leave the stable native surface
+
+Status: **DECIDED** (operator, 2026-08-01, criterion delegated: "strongest
+technical solution fully aligned with fluxor principles" — by D-HW-TAXONOMY's
+semantics-independence rule that is EVICTION). Executed.
+
+The stable 0x1A workload contract carries only the native core (CREATE/START/
+WAIT/SIGNAL-portable/DESTROY/PAUSE/RESUME/CAPS + Tier-1 header). Host-process
+mechanics — READ/EXEC/TTY_* opcodes, SOURCE_BUNDLE, FD_TAG_PROC, and the
+process-executor class (PROC_CLASS 0x0016) — live in the host-scoped class
+`abi::platform::linux::host_process` (0x1B), registered only by the linux
+platform; unregistered = ENOSYS = discovery. Workload-targeting ops carry the
+tagged fd in-arg since handle-tagged calls route by tag→class. Numeric values
+are unchanged on the wire; retired 0x1A positions are not reused; CAPS ops
+bits 0..2 are reserved and stable caps defines only the bit-0 native source
+kind. The generic kernel carries NO host vocabulary: the proc fd-tag routes
+via the platform-registered `register_fd_tag_route` table, and the kernel
+registry keeps 0x0016/tag 25 only as reserved numerics.
+
+### D-OCI-RUNTIME — where the container isolation mechanism lives
+
+Status: **DECIDED** (operator, 2026-08-01: "move full OCI mechanism to
+nanocloud", refined below). Host-side stages executed; rig validation pending
+(see `.context/boundary_ledger.md`).
+
+The constraint that shaped HOW: the isolation mechanism
+(`src/platform/linux/oci.rs`: fork/unshare/cgroups/rootfs) needs host `std`,
+and nanocloud has NO std-native code — it is entirely no_std PIC modules run
+BY fluxor-linux, the only std host on a node. So the mechanism cannot become a
+nanocloud *module*. Realization: the mechanism stays in fluxor's Linux
+platform but is reduced to a GENERIC isolation primitive that knows no OCI
+format; nanocloud owns the OCI→params mapping (policy). `oci.rs` reads no
+bundle/OCI on-disk format: `build_plan(argv, rootfs, isolate)` takes explicit
+params, cgroup limits come solely from the portable `ResourceEnvelope`, and
+the `workload` 0x1A CREATE source section carries explicit spawn params
+(`[isolate:u8][rootfs_len:u16][rootfs][argv NUL-sep]`) instead of a bundle-dir
+path. This mirrors how the nanocloud CLI is built: a PIC fmod owning logic +
+fluxor host built-ins for host facts.

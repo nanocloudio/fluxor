@@ -4,7 +4,7 @@
 // command execution, PTY sessions, stdout/stderr drains, rootfs bundles — are
 // one backend's implementation vocabulary, not native Fluxor workload
 // semantics, so they live here rather than in the stable `workload` (0x1A)
-// contract (docs/architecture/boundary_decisions.md D-WORKLOAD-ABI). The
+// contract (docs/architecture/abi_layers.md D-WORKLOAD-ABI). The
 // native surface stays CREATE/START/WAIT/SIGNAL/DESTROY/PAUSE/RESUME/CAPS.
 //
 // Calling convention: every op is a `handle = -1` call (the kernel routes

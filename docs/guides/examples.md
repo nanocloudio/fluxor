@@ -120,7 +120,6 @@ The **WASM** and **split** variants need an HTTP origin to host the
 browser side, which is a separate Fluxor graph. The deployment-scenario
 primitive solves this declaratively. Single-graph orchestration carries the
 `scenario:` block inline on the graph YAML (see
-`examples/image_viewer/pi5.yaml`); multi-graph harnesses use a
-standalone YAML with `kind: scenario` at the top
-(see `examples/test_harness/audio_codecs.yaml`). Either form is
+`examples/surface_traits/wasm.yaml`); multi-graph harnesses use a
+standalone YAML with `kind: scenario` at the top. Either form is
 run by `fluxor run <yaml>`.

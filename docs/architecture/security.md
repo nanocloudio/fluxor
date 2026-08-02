@@ -267,6 +267,34 @@ config.
   the LAN, but they will misdirect traffic on the originating host if
   the target IP is reassigned.
 
+## Boundary Decision: Cryptography Ownership (D-CRYPTO)
+
+Status: **PROPOSED** (implementer). The sha256/sha512 single-source sharing is
+landed and KAT-verified; the retain-divergence half awaits operator review.
+
+Two crypto bodies exist by design:
+
+- **Kernel** (`src/kernel/security/crypto/`) — the loader/key-vault
+  root-of-trust. The loader's signature check runs *before* any PIC module is
+  admitted, so this code cannot depend on modules or external crates, and it
+  stays readable and portable in preference to fast (an Ed25519 verify runs at
+  most once per module load).
+- **SDK** (`modules/sdk/crypto/`) — module-side crypto for protocol workloads
+  (TLS, QUIC), NEON-accelerated where it pays.
+
+The rule: **where an implementation is identical, it must have one source**
+(kernel `sha256.rs` and `sha512.rs` are `include!` shims over the SDK files —
+the two sides cannot drift); **where the trust domain demands divergence, the
+duplication is deliberate** (Ed25519 and P-256 differ: the kernel versions are
+minimal and audit-oriented; the SDK versions carry protocol-driven surface such
+as incremental ECDSA). Every kernel primitive is load-bearing: `ed25519` →
+loader signature verify, `p256` → key-vault ECDSA/ECDH, `sha512` → Ed25519
+inner hash.
+
+Reopens if: a kernel primitive and its SDK counterpart converge to the same
+surface (then merge to one source per the rule), or the kernel gains a crypto
+need the SDK already covers.
+
 ## Related Documentation
 
 - `architecture/module_architecture.md` — module binary format, manifest

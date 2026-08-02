@@ -381,6 +381,99 @@ with the union of every supported peripheral.
 | Silicon definitions | `targets/silicon/*.toml` |
 | Board definitions | `targets/boards/*.toml` |
 
+## Boundary Decisions
+
+Decisions on the kernel/platform/board boundary. Each carries its status:
+`DECIDED` (an explicit operator decision) or `PROPOSED` (the implementer's
+recommendation, recorded for review — not yet agreed policy). Code may already
+follow a PROPOSED entry; that makes it current practice, not a settled rule.
+Code comments may summarize these; this section is the authority. Execution
+history for these decisions is tracked in `.context/boundary_ledger.md`.
+
+### D-KERNEL-PLATFORM — the kernel's two platform seams
+
+Status: **PROPOSED** (implementer).
+
+The kernel reaches platform behavior through exactly two seams, and nothing
+else:
+
+1. **`HalOps`** (`kernel::sys::hal`) — the function-pointer table each platform
+   installs at boot. All platform *behavior* the kernel invokes goes through
+   it: timing, interrupts, step-guard, ISR tiers, SMP quiesce, and the module
+   protection surface (`protection_*`, `protected_step`, stack canaries — MPU
+   on Cortex-M, EL0 MMU on aarch64, direct dispatch elsewhere).
+2. **`platform::chip`** — the cfg-selected per-target *constants* module
+   (arena sizes, capacity ceilings). These size static arrays, so they must be
+   compile-time constants; a cfg-selected constants module IS the compile-time
+   half of the HAL. Not a boundary violation: rp2040 (264 KiB) and rp2350
+   (520 KiB) cannot share one arena figure, so the sizes are inherently
+   per-silicon and must be pulled at compile time. All kernel capacity reads
+   go through `crate::kernel::config` — the ONLY kernel↔`platform::chip`
+   reference — so this seam is a single audited surface.
+
+The kernel branches on CAPABILITY, never chip identity. What were once
+`cfg(feature = "chip-bcm2712")` sites are expressed as capability features a
+chip feature turns on: `kernel-vm` (page-table VM + EL0 isolation), `smp`
+(multi-core execution domains), `dtb` (device-tree boot). chip-bcm2712
+provides all three and is today the only target that does, but a future
+MMU-but-single-core (or MPU-but-multi-core) target flips only the capabilities
+it has; no chip name appears in `src/kernel`.
+
+Anything a kernel file wants from a platform beyond these two seams is a
+boundary bug: add a `HalOps` op (behavior), a `chip` constant (fact via
+`kernel::config`), or a capability feature (a `cfg` the kernel branches on).
+
+### D-HW-TAXONOMY — hardware capability placement
+
+Status: **DECIDED** (operator, 2026-08-01), superseding the implementer's
+earlier "promote after a second chip implements it" proposal.
+
+The principle: **a capability belongs in Fluxor's generic contract vocabulary
+when its semantics are independent of a particular controller implementation.**
+Platform namespaces contain controller-specific mechanisms and escape hatches.
+Boards declare topology and availability. Explicit drivers consume the
+capabilities and expose typed module surfaces. Implementation count is NOT the
+test — availability can be target-specific while the vocabulary stays generic.
+
+Applied:
+
+- **PCIe** — device access is generic vocabulary: the `pcie_device` contract
+  (handles, config space, BARs, interrupts, device info) lives at
+  `abi::contracts::hal::pcie_device` (id 0x0012). BCM2712 root-complex control
+  (outbound windows, MSI controller, SMMU mechanics) stays platform, split by
+  concern into `pcie_config`/`nic_ring`/`smmu`/`msi`. Board PCIe topology and
+  aliases (`m2_primary`, `rp1`) are board facts, generated from the board TOML
+  `[platform.pcie]`. Promoting the platform config/BAR ops into the generic
+  `contracts/hal/pcie` opcode *class* would be a deliberate wire renumber and
+  is operator-gated; the residual platform ops (dev_idx pre-open enumeration,
+  PCIE_RESCAN slow-link-train bring-up) are controller semantics and stay
+  platform by this section's own principle.
+- **PIO** — RP PIO instruction-engine mechanics (16-bit programs, wrap
+  targets, side-set, state-machine pin config), FIFO streaming, and the
+  associated DMA belong under `platform::rp::pio`; RP drivers (cyw43, i2s_pio,
+  mic_pio) consume them. The one truly platform-independent piece — the
+  audio/media clock query — is the portable `contracts::stream_clock`
+  capability (class 0x001C); linux/wasm register a real STREAM_CLOCK provider.
+  `STREAM_TIME` remains on RP only as the PIO backend's per-stream clock (the
+  kernel falls back to it when no STREAM_CLOCK provider is registered — on RP
+  the clock genuinely IS the PIO stream).
+- **DMA** — the portable channel-id surface (`peripherals.dma_channels`,
+  `EdgeClass::DmaOwned`) is the vocabulary; raw register layouts stay
+  per-family.
+- **USB** — reserved kernel contract id + handle tag stand; the SDK contract
+  is written when the first PIC module consumes it.
+
+### D-BOARD-STACK — boards declare hardware facts; stacks select drivers
+
+Status: **DECIDED** (operator, 2026-08-01). Executed for net, audio, display.
+
+A board file declares hardware identity (`[platform.net] phy`, `nic =
+"rp1-gem"|"virtio"|"cyw43"`; `[platform.audio] sink = "i2s"|"host"`;
+`[platform.display] sink = "host"`), never a driver module name. The stack
+owns the fact→driver mapping: its variants match on facts and name the driver
+modules. No `driver` match keys exist in any stack; midi/pointer match on
+`board`/`family`/`direction` facts.
+
 ## Related Documentation
 
 - [abi_layers.md](abi_layers.md) — ABI layers, contract inventory, provider dispatch

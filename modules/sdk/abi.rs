@@ -211,7 +211,7 @@ pub mod platform {
             include!("platform/rp/pwm_raw.rs");
         }
         /// PIO capability contract — RP silicon only, so it lives here rather
-        /// than the portable HAL (docs/architecture/boundary_decisions.md
+        /// than the portable HAL (docs/architecture/hal_architecture.md
         /// D-HW-TAXONOMY). Numeric contract id unchanged (wire is stable).
         pub mod pio {
             include!("platform/rp/pio.rs");

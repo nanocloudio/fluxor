@@ -6,7 +6,7 @@
 // a future NIC) depends on PCIe CAPABILITY, never on a silicon family.
 // Root-complex mechanics (outbound windows, MSI controller programming, SMMU)
 // are platform implementation; PCIe topology/aliases (`m2_primary`, `rp1`)
-// are board facts (see docs/architecture/boundary_decisions.md
+// are board facts (see docs/architecture/hal_architecture.md
 // D-HW-TAXONOMY).
 //
 // The PCIE_DEVICE contract (id 0x0012) lets a driver open a handle to
