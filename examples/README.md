@@ -53,7 +53,6 @@ examples/<capability>/
 | [`button_control/`](button_control/) | pico2w | GPIO button → gesture → action wiring. |
 | [`synth/`](synth/) | pico2w, picow | Multi-voice tonal synthesizer; button cycles voices. |
 | [`drums/`](drums/) | pico2w | TR-808-style synthesized percussion. |
-| [`voip_call/`](voip_call/) | pico2w | SIP signalling + RTP audio pipeline. |
 | [`packet_filter/`](packet_filter/) | pi5 | L2 packet filtering with custom accept rules (rp1_gem + eth_parser + pkt_filter chain). |
 
 > **Wasm runtime?** Any graph with `target: wasm` runs entirely in

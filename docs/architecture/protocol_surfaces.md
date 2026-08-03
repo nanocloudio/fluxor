@@ -341,7 +341,7 @@ Concrete Rust types land in `modules/sdk/contracts/net/`:
   HTTP, MQTT, TLS. Stream only; UDP has been retired from this contract
   (Phase 2d).
 - `datagram.rs` — Datagram Surface v1, opcodes `0x20..0x43`. Users:
-  DNS, RTP, log_net, VoIP. IPv4 addresses BE, ports LE, source always
+  DNS, RTP, log_net. IPv4 addresses BE, ports LE, source always
   carried on RX.
 - `packet.rs` — Packet Surface v1, opcodes `0x50..0x63`. Envelope
   reserved; first consumer = Phase 6 QUIC.
@@ -767,6 +767,12 @@ they are shipped workflows:
 
 ### VoIP edge-anchored
 
+The VoIP modules themselves live outside this repo — SIP dialog and
+jitter handling in wave (`sip`, on the RTP transport), G.711 in
+spectra (`g711`), composed into a voice workload by Conclave. The
+edge-anchor / session-worker split below is a scaling pattern for
+that composition, carried entirely by Fluxor contract surfaces.
+
 A VoIP front door split into `voip_edge_anchor` (owns SIP/RTP client
 attachment) + `voip_session_worker` (owns dialog state, fanout,
 durable interaction with backend) should fit the current contract
@@ -774,16 +780,16 @@ vocabulary:
 
 | Need | Provided by |
 |------|-------------|
-| SIP signalling | `datagram.rs` (SIP runs on UDP today; `voip` already migrated in Phase 2c) |
+| SIP signalling | `datagram.rs` (SIP runs on UDP) |
 | RTP media | `datagram.rs` for RX, jitter buffer in worker |
 | ATTACH / DETACH on call setup / teardown | `session_ctrl.rs` CMD_SC_ATTACH / DETACH |
 | Worker handoff during a live call | `session_ctrl.rs` CMD_SC_DRAIN / EXPORT / IMPORT / RESUME / RELOCATE |
 | Session epochs to reject stale RTP after rebind | `session_ctrl.rs` `session_epoch` |
 | Operator visibility | `monitor-protocol.md` `MON_SESSION` |
 
-What's still needed to ship: split the existing `voip` module's
-state into `voip_edge_anchor` + `voip_session_worker` along the
-SIP-state vs media-state boundary, wire SessionCtrlV1 between them.
+What's still needed to ship: split the SIP-state vs media-state
+boundary into `voip_edge_anchor` + `voip_session_worker` modules and
+wire SessionCtrlV1 between them.
 The `echo_anchor` + `echo_worker` demo proves the control-envelope
 shape, not a production VoIP handoff.
 

@@ -571,6 +571,17 @@
     const PRESSED_BIT = 0x8000;
     function pushKey(code, down) {
       inputQueue.push({ keyCode: (code & 0x7fff) | (down ? PRESSED_BIT : 0), modifiers: 0 });
+      // Also feed the canonical KEY capability driver
+      // (`wasm_browser_keyboard` ← `__fluxor_keyboard_queue`,
+      // input::key records). Without this, graphs that wire the
+      // keyboard driver (rather than `wasm_browser_dom_input`) never
+      // see physical keys unless a presentation overlay declares
+      // symbolic key controls. Each driver drains its own queue, so
+      // graphs still choose exactly one source per port.
+      const kbQ = window.__fluxor_keyboard_queue
+        || (window.__fluxor_keyboard_queue = []);
+      kbQ.push({ kind: down ? 0x01 : 0x02, modifiers: 0, repeat: 0,
+                 keyCode: code & 0x7fff, scanCode: 0 });
     }
     // Physical keyboard → queue. Dedupe auto-repeat by tracking held
     // codes, and swallow the default action (scroll on arrows/space) so

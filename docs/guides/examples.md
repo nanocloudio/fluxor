@@ -104,7 +104,6 @@ flash_rp.events / button.raw ──→ navigation
 ## Related guides
 
 - [audio.md](audio.md) — audio pipeline architecture
-- [codec_porting.md](codec_porting.md) — porting new audio codecs to the unified module
 - [displays.md](displays.md) — display panel drivers
 - [asset_banks.md](asset_banks.md) — `bank` module navigation semantics
 - [input_gestures.md](input_gestures.md) — single/double/triple click mapping to FMP verbs

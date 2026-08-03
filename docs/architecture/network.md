@@ -40,7 +40,7 @@ one.
    the same channel surface.
 
 4. **Consumer modules speak net_proto, not sockets.** HTTP, DNS, MQTT,
-   VoIP, RTP, TLS, and mesh modules each have a channel pair to the IP
+   RTP, TLS, and mesh modules each have a channel pair to the IP
    module. They send typed framed messages (`CMD_BIND`, `CMD_CONNECT`,
    `CMD_SEND`) and receive typed framed messages (`MSG_DATA`,
    `MSG_ACCEPTED`, `MSG_CLOSED`) over that channel pair. There is no
@@ -65,7 +65,7 @@ one.
 ```
 +------------------------------------------------------------------+
 |                      Application Modules                         |
-|              (HTTP, DNS, MQTT, VoIP, RTP, TLS, mesh)             |
+|                (HTTP, DNS, MQTT, RTP, TLS, mesh)                 |
 |                                                                  |
 |  Each module has a channel pair to the IP module.                |
 |  Frames carry the net_proto TLV protocol.                        |
@@ -107,7 +107,7 @@ its upstream commands and downstream events match the stream surface
 vocabulary directly, and stream consumers (HTTP, MQTT, TLS) use it
 without modification.
 
-Stream only. Datagram traffic (DNS, RTP, VoIP, log_net) uses the
+Stream only. Datagram traffic (DNS, RTP, log_net) uses the
 separate `datagram` contract
 (see `modules/sdk/contracts/net/datagram.rs`), which carries source
 addressing on every RX and destination addressing on every TX. Packet-
@@ -397,7 +397,6 @@ shipping today:
 | `http` | HTTP server / client (request parsing, header handling, body streaming) |
 | `dns` | DNS resolver and authoritative server |
 | `mqtt` | MQTT 3.1.1 client |
-| `voip` | SIP signalling and RTP transport |
 | `rtp` | RTP packet framing |
 | `tls` | Channel-to-channel TLS 1.3 transformer |
 | `mesh` | MQTT-bridged mesh transport |

@@ -220,6 +220,14 @@ registerProcessor('pcm-ring', PcmRing);
     // and the stats line are cheap. Stays 0 until process() runs (ctx running);
     // host_audio_ready now keeps pre-gesture PCM backpressured upstream.
     let ringFillFrames = 0, ringInRate = 0;
+    // Wall-clock stamp of the last ring report. leadUs() extrapolates
+    // consumption since this stamp: reports arrive only every
+    // REPORT_EVERY quanta (~21 ms) AND queue behind busy main-thread
+    // work (a kernel step burst), so the raw cached fill chronically
+    // OVERESTIMATES the ring. A sink pacing on the stale estimate
+    // stops refilling while the real ring drains — measured as
+    // deterministic ~20 ms silence gaps in a held note.
+    let ringReportT = -1;
     let underCount = 0, overCount = 0, consumedFrames = 0, ringPlayRate = 1;
     let realtimeBaseFrames = 0, realtimeBaseT = -1;
     // Phase-0 audio perf: lowest ring fill (ms) seen since the last [audio] tick
@@ -253,6 +261,7 @@ registerProcessor('pcm-ring', PcmRing);
     // backends drive the identical stats/backpressure/cursor path.
     function applyRingReport(s) {
       ringFillFrames = s.fill; ringInRate = s.inRate || 0;
+      ringReportT = performance.now();
       underCount = s.under; overCount = s.over; consumedFrames = s.consumed;
       if (s.playRate) ringPlayRate = s.playRate;
       if (realtimeBaseT < 0) { realtimeBaseT = performance.now(); realtimeBaseFrames = s.consumed; }
@@ -464,7 +473,15 @@ registerProcessor('pcm-ring', PcmRing);
       leadUs() {
         if (!audioCtx || audioCtx.state !== 'running' || !workletNode) return 0n;
         const rate = ringInRate || (audioCtx.sampleRate | 0) || 44100;
-        const us = Math.round(ringFillFrames / rate * 1_000_000);
+        // Extrapolate consumption since the last worklet report — the
+        // worklet drains `rate` content frames per wall second while
+        // running. Without this the fill estimate is stale-high and
+        // the sink starves the ring (see ringReportT above).
+        let fill = ringFillFrames;
+        if (ringReportT >= 0) {
+          fill -= (performance.now() - ringReportT) / 1000 * rate;
+        }
+        const us = Math.round(fill / rate * 1_000_000);
         return BigInt(us > 0 ? us : 0);
       },
       // The master clock for the unified A/V present: emulated frames whose audio

@@ -43,7 +43,7 @@ logic — lives in modules.
 ```
 +--------------------------------------------------------------------+
 |                            App Layer                               |
-|     synth, mixer, voip, sequencer, codec, raft_engine, ...         |
+|     synth, mixer, sequencer, codec, raft_engine, ...               |
 |                          (PIC modules)                             |
 +--------------------------------------------------------------------+
 |                        Foundation Layer                            |
@@ -63,7 +63,7 @@ logic — lives in modules.
 |        gpio  •  spi  •  i2c  •  pio  •  uart  •  timer  •  dma     |
 +--------------------------------------------------------------------+
 |                            Silicon                                 |
-|             RP2040  •  RP2350  •  BCM2712  •  Pi 5                  |
+|             RP2040  •  RP2350  •  BCM2712  •  Pi 5                 |
 +--------------------------------------------------------------------+
 ```
 

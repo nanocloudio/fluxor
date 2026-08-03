@@ -17,7 +17,7 @@ Fluxor is a runtime that replaces threads, processes, and ad-hoc event loops wit
 |  drivers     foundation     app                                |
 |  cyw43       ip             http     synth      sequencer      |
 |  enc28j60    fat32          mqtt     codec      mixer          |
-|  e810        tls            dns      voip       rtp            |
+|  e810        tls            dns      rtp                       |
 |  st7701s     wifi           quic     drum       echo_anchor    |
 |  ...         ...            ...      ...                       |
 +----------------------------------------------------------------+
@@ -48,7 +48,7 @@ The same primitives carry workloads that normally live in entirely different sof
 - **Audio products.** Music players, synthesizers with effects chains, MIDI sequencers, MP3 decoders, I2S drivers, microphone capture pipelines.
 - **Display and input.** ST7701S panel output, GT911 touch, buttons, keyboard/pointer/gamepad surfaces, gestures, browser canvas sinks, and split deployments where a browser hosts the presentation surface for a bare-metal back end.
 - **Storage and filesystems.** SD-card drivers, FAT32, flash blob serving, runtime parameter stores, NVMe with poll-mode completion approaching Linux line-rate at QD=1.
-- **Networking.** CYW43 Wi-Fi, ENC28J60, RP1 GEM, Intel E810, virtio-net, full TCP/UDP/IPv4 with ARP/ICMP/DHCP, HTTP/1.1 with Range, DNS, MQTT, VoIP/RTP, TLS 1.3 (pure Rust, no C dependency), DTLS, and an HTTP/3 path through the same module set.
+- **Networking.** CYW43 Wi-Fi, ENC28J60, RP1 GEM, Intel E810, virtio-net, full TCP/UDP/IPv4 with ARP/ICMP/DHCP, HTTP/1.1 with Range, DNS, MQTT, RTP, TLS 1.3 (pure Rust, no C dependency), DTLS, and an HTTP/3 path through the same module set.
 - **Real-time control.** Hardware-timer ISR-tier modules for motor control, sensor fusion, FOC current loops, drone PID stacks, PLC scan cycles, EtherCAT-style cyclic I/O — admitted into Tier 1b/2 domains alongside cooperative modules in the same graph.
 - **Distributed systems.** Raft consensus, write-ahead logging, group fsync batching, replication pipelines, and snapshot transport built as ordinary Fluxor module sets sharing the same scheduler and channel ABI as everything else.
 - **Edge data services.** Object and namespace surfaces, replicated key-value caches, message brokers, API gateways — every request phase as a module, deterministic P99, no OS tax between cycles.
@@ -64,30 +64,30 @@ These are not separate Fluxor variants. They are graphs in the same runtime, val
 
 ```text
 +----------------------------------------------------------------+
-|                       App Modules                                |
-|        synth, mixer, voip, sequencer, codec, rtp, drum, ...       |
+|                       App Modules                              |
+|        synth, mixer, sequencer, codec, rtp, drum, ...          |
 +----------------------------------------------------------------+
-|                    Foundation Modules                           |
-|     ip, fat32, http, dns, mqtt, tls, wifi, mesh, ...            |
+|                    Foundation Modules                          |
+|     ip, fat32, http, dns, mqtt, tls, wifi, mesh, ...           |
 +----------------------------------------------------------------+
-|                      Driver Modules                              |
-|     cyw43, enc28j60, virtio_net, sd, st7701s, gt911, i2s, ...    |
+|                      Driver Modules                            |
+|     cyw43, enc28j60, virtio_net, sd, st7701s, gt911, i2s, ...  |
 +----------------------------------------------------------------+
              Stable Syscall ABI (kernel_abi + HAL contracts)
 +----------------------------------------------------------------+
-|                          Kernel                                  |
-|     scheduler  •  channels  •  events  •  loader  •  HAL        |
+|                          Kernel                                |
+|     scheduler  •  channels  •  events  •  loader  •  HAL       |
 +----------------------------------------------------------------+
-|                          Silicon                                 |
-|               RP2040  •  RP2350  •  BCM2712                     |
+|                          Silicon                               |
+|               RP2040  •  RP2350  •  BCM2712                    |
 +----------------------------------------------------------------+
 ```
 
-Modules are organized into three categories by directory:
+Modules are organized into three layers:
 
 - **Drivers** (`modules/drivers/`) — touch hardware. Allowed to be platform-specific and to use bus syscalls (SPI, PIO, I2C, GPIO, MMIO).
 - **Foundation** (`modules/foundation/`) — portable building blocks. Filesystems, network protocols, transport layers. No direct hardware access; everything goes through channels and the syscall ABI.
-- **App** (`modules/app/`) — application-level modules. Audio synthesis, codecs, sequencers, distributed-systems components, anything that composes drivers and foundation modules into a workload.
+- **App** — application-level modules. Audio synthesis, codecs, sequencers, distributed-systems components, anything that composes drivers and foundation modules into a workload. App modules live in sibling repositories (grove, spectra, wave), built against the Fluxor SDK and loaded like any other PIC module.
 
 Every box above the syscall ABI is a position-independent module. On RP targets, modules execute in place from flash via XIP. On aarch64 targets, they are loaded from the boot image's module table into RAM. The same `.fmod` artifact works across every kernel build that exposes the same ABI version on that architecture.
 
@@ -234,7 +234,7 @@ fluxor/
 │   ├── sdk/            # Shared SDK: abi.rs, runtime.rs, params.rs
 │   ├── drivers/        # Hardware drivers (cyw43, enc28j60, sd, st7701s, ...)
 │   ├── foundation/     # Portable services (ip, fat32, http, mqtt, dns, tls, ...)
-│   └── app/            # Application modules (synth, codec, mixer, voip, ...)
+│   └── fixtures/       # Test scaffolds, probes, protocol-surface demos
 ├── tools/              # Host CLI: validate, build, run, flash, pack, sign, inspect
 ├── examples/           # Example YAML configs grouped by capability
 ├── docs/               # Architecture references and guides

@@ -458,11 +458,13 @@ reserved for drivers. They are required to declare the matching
 kernel-adjacent, not as typical foundation modules: new foundation
 modules must not take this shape.
 
-### App — `modules/app/`
+### App — sibling repositories
 
 Domain-specific compositions. Free to consume any foundation or
-driver output over channels. Examples: `codec`, `drum`, `effects`,
-`mixer`, `sequencer`, `synth`, `voip`.
+driver output over channels. App modules live in sibling
+repositories (grove, spectra, wave), built against the Fluxor SDK
+and loaded like any other PIC module. Examples: `codec`, `drum`,
+`effects`, `mixer`, `sequencer`, `synth`.
 
 ### Fixtures — `modules/fixtures/`
 
@@ -472,8 +474,8 @@ part of the stable module vocabulary and never shipped in a product
 graph. Examples: `load_gen`, `test_fault`, `tier2_probe`, the
 `iso_*` EL0-isolation probes, the `nvme_*_probe` bring-up probes,
 `synth_source`, and the `echo_anchor`/`echo_worker` continuity-role
-demonstration pair. Keeping them out of `foundation/`/`app/`
-preserves those trees' stable-vocabulary property (shadowing a
+demonstration pair. Keeping them out of `foundation/`
+preserves that tree's stable-vocabulary property (shadowing a
 foundation name is a build error; a fixture name carries no such
 weight). Fixtures are not publishable via `fluxor publish`.
 

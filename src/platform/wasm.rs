@@ -879,13 +879,15 @@ unsafe fn load_embedded_modules() -> usize {
             }
             let mut sample_rate = 0u32;
             let mut channels = 1u32;
+            let mut lead_ms = 0u32; // 0 = module default (codec-depth)
             walk_tlv(entry.params(), |tag, value| match tag {
                 10 => sample_rate = tlv_u32(value),
                 11 => channels = tlv_u32(value),
+                12 => lead_ms = tlv_u32(value),
                 _ => {}
             });
             let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-            let m = audio::build(sample_rate, channels, in_chan);
+            let m = audio::build(sample_rate, channels, lead_ms, in_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
             log_fmt2(
@@ -1255,12 +1257,11 @@ unsafe fn load_embedded_modules() -> usize {
         // `dev_channel_port`.
         //
         // Port direction id 2 = ctrl_input. Modules that declare a
-        // `ctrl_input` port (e.g. bank.commands, voip.call) need
-        // this; without it the module gets `ctrl_chan = -1` and
-        // silently ignores every FMP message on its ctrl port —
-        // which is exactly what was breaking the wasm audio_player
-        // and image_viewer chains. Same lookup pattern bcm2712 and
-        // rp2350 use in `kernel::exec::scheduler::instantiate_one_module`.
+        // `ctrl_input` port (e.g. bank.commands) need this; without
+        // it the module gets `ctrl_chan = -1` and silently ignores
+        // every FMP message on its ctrl port. Same lookup pattern
+        // bcm2712 and rp2350 use in
+        // `kernel::exec::scheduler::instantiate_one_module`.
         let in_chan = scheduler::get_module_port(module_idx, 0, 0);
         let out_chan = scheduler::get_module_port(module_idx, 1, 0);
         let ctrl_chan = scheduler::get_module_port(module_idx, 2, 0);

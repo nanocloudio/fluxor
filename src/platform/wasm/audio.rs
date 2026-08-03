@@ -53,6 +53,8 @@ const READ_BUF_BYTES: usize = 4096;
 /// the 320 ms ring cap. If production misses real time the worklet emits silence
 /// and reports an underflow; it must never hide the miss by changing music pitch
 /// or duration.
+/// Default ring lead when the graph doesn't set `lead_ms` — deep
+/// enough for codec playback to ride out main-thread jank.
 const LEAD_TARGET_US: u64 = 120_000;
 
 #[repr(C)]
@@ -60,10 +62,17 @@ pub(crate) struct AudioState {
     pub in_chan: i32,
     pub sample_rate: u32,
     pub channels: u32,
+    /// Ring lead target (µs) — see manifest `lead_ms`.
+    pub lead_target_us: u64,
     pub buf: [u8; READ_BUF_BYTES],
 }
 
-unsafe fn alloc_state(in_chan: i32, sample_rate: u32, channels: u32) -> *mut AudioState {
+unsafe fn alloc_state(
+    in_chan: i32,
+    sample_rate: u32,
+    channels: u32,
+    lead_target_us: u64,
+) -> *mut AudioState {
     let table = syscalls::get_syscall_table();
     let size = core::mem::size_of::<AudioState>() as u32;
     let raw = (table.heap_alloc)(size) as *mut AudioState;
@@ -76,6 +85,7 @@ unsafe fn alloc_state(in_chan: i32, sample_rate: u32, channels: u32) -> *mut Aud
             in_chan,
             sample_rate,
             channels,
+            lead_target_us,
             buf: [0u8; READ_BUF_BYTES],
         },
     );
@@ -112,7 +122,7 @@ fn audio_step(state: *mut u8) -> i32 {
             // is read straight from the audio clock, so transient channel
             // emptiness (the codec just hasn't written this pass) doesn't
             // perturb pacing: the queued WebAudio buffers are still there.
-            if host_audio_lead_us() >= LEAD_TARGET_US {
+            if host_audio_lead_us() >= st.lead_target_us {
                 break;
             }
             let n = channel::channel_read(st.in_chan, st.buf.as_mut_ptr(), st.buf.len());
@@ -128,10 +138,16 @@ fn audio_step(state: *mut u8) -> i32 {
 pub(crate) unsafe fn build(
     sample_rate: u32,
     channels: u32,
+    lead_ms: u32,
     in_chan: i32,
 ) -> scheduler::BuiltInModule {
     let mut m = scheduler::BuiltInModule::new("wasm_browser_audio", audio_step);
-    let raw = alloc_state(in_chan, sample_rate, channels);
+    let lead_target_us = if lead_ms > 0 {
+        (lead_ms as u64) * 1000
+    } else {
+        LEAD_TARGET_US
+    };
+    let raw = alloc_state(in_chan, sample_rate, channels, lead_target_us);
     core::ptr::write(m.state.as_mut_ptr() as *mut *mut AudioState, raw);
     m
 }

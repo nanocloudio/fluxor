@@ -531,7 +531,7 @@ type WiringEdges = (Vec<WireTuple>, Vec<bool>, Vec<String>, Vec<String>);
 
 /// Parse wiring edges from YAML config.
 /// Supports indexed port syntax: "bank.out[1]" → from_port_index=1
-/// Supports named port syntax: "voip.rtp" → resolves via manifest
+/// Supports named port syntax: "http.net_out" → resolves via manifest
 fn parse_wiring_edges(
     wiring: &Value,
     names: &[String],

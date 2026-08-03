@@ -36,6 +36,15 @@ name = "channels"
 type = "u8"
 default = 1
 
+[[params]]
+# Ring lead target in milliseconds: the sink forwards PCM only while
+# the WebAudio queue is shorter than this, so it bounds output
+# latency AND is the jank cushion. Codec playback wants the deep
+# default; live instruments (grove studio) set 30-50 ms.
+name = "lead_ms"
+type = "u8"
+default = 120
+
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]
 exempt = "browser-API shim (wasm) — observed via browser devtools; carries input events / media samples / canvas rasters / WS frames, not a measurable on-device byte stream"

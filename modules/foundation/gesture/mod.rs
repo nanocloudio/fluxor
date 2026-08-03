@@ -4,7 +4,7 @@
 //! click counting, long press detection, then emits FMP command messages.
 //!
 //! Sits between a raw input module (flash, button) and a consumer module
-//! (bank, voip, etc.), enabling input-device-agnostic control.
+//! (bank, http, etc.), enabling input-device-agnostic control.
 //!
 //! # Modes
 //!

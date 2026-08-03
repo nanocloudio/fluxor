@@ -42,4 +42,3 @@ dig @<pico-ip> example.com      # forwarded upstream
 
 - [`mqtt_publisher/`](../mqtt_publisher/) — another networked-app
   demo on the same pico2w + WiFi target.
-- [`voip_call/`](../voip_call/) — SIP / RTP on the same WiFi stack.
