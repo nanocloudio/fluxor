@@ -1513,7 +1513,7 @@ fn cmd_sign(
         } else {
             0
         };
-    let hash_offset = 16 + var_size;
+    let hash_offset = 17 + var_size; // = MANIFEST_HEADER_SIZE (u16 permissions)
     if hash_offset + 32 > layout.len() {
         return Err(Error::Module("manifest layout too small for hash".into()));
     }

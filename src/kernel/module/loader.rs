@@ -1007,9 +1007,9 @@ impl LoadedModule {
     /// or too small to contain the permissions byte. See
     /// `docs/architecture/abi_layers.md` and the `permission` module in
     /// `src/kernel/syscalls.rs` for the bit layout.
-    pub fn manifest_permissions(&self) -> u8 {
+    pub fn manifest_permissions(&self) -> u16 {
         let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 16 {
+        if manifest_size < 17 {
             return 0;
         }
         let code_size = self.header.code_size as usize;
@@ -1018,18 +1018,18 @@ impl LoadedModule {
         let schema_size = self.header.schema_size() as usize;
         let manifest_offset =
             ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
-        // SAFETY: `manifest_offset` plus 16 bytes lies inside the .fmod
+        // SAFETY: `manifest_offset` plus 17 bytes lies inside the .fmod
         // mapping (caller has already validated total_size by this point);
         // the FXMF magic check rejects mis-aligned tails before we trust
-        // byte 15.
+        // bytes 15..17 (the u16 permissions bitmap).
         unsafe {
             let p = offset_ptr(self.base, manifest_offset);
-            // Verify magic before trusting byte 15.
+            // Verify magic before trusting the permissions bytes.
             let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
             if magic != 0x464D5846 {
                 return 0;
             } // "FXMF"
-            *p.add(15)
+            u16::from_le_bytes([*p.add(15), *p.add(16)])
         }
     }
     /// Look up a port's `content_type` byte by direction and the
@@ -1047,7 +1047,7 @@ impl LoadedModule {
     /// `tools::manifest`.
     pub fn port_content_type(&self, direction: u8, index: u8) -> Option<u8> {
         let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 16 {
+        if manifest_size < 17 {
             return None;
         }
         let code_size = self.header.code_size as usize;
@@ -1058,7 +1058,7 @@ impl LoadedModule {
             ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
         // SAFETY: manifest_offset + manifest_size lies inside the .fmod
         // mapping (validated at load time). Inner loop bounded by
-        // `manifest_size >= 16 + port_count * 4`.
+        // `manifest_size >= 17 + port_count * 4`.
         unsafe {
             let p = offset_ptr(self.base, manifest_offset);
             let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
@@ -1066,13 +1066,13 @@ impl LoadedModule {
                 return None;
             } // "FXMF"
             let port_count = *p.add(5) as usize;
-            // Header is 16 bytes, each port record is 4 bytes:
+            // Header is 17 bytes, each port record is 4 bytes:
             // [direction, content_type, flags, index].
-            if manifest_size < 16 + port_count * 4 {
+            if manifest_size < 17 + port_count * 4 {
                 return None;
             }
             for i in 0..port_count {
-                let entry = p.add(16 + i * 4);
+                let entry = p.add(17 + i * 4);
                 if *entry == direction && *entry.add(3) == index {
                     return Some(*entry.add(1));
                 }
@@ -1098,7 +1098,7 @@ impl LoadedModule {
             max_record: 0,
         }; 8];
         let manifest_size = self.header.manifest_size() as usize;
-        if manifest_size < 16 {
+        if manifest_size < 17 {
             return (out, 0);
         }
         let code_size = self.header.code_size as usize;
@@ -1126,7 +1126,7 @@ impl LoadedModule {
             // Capacity section sits directly after the dependency
             // records (before the integrity hash) — see
             // tools/src/manifest.rs::to_bytes.
-            let cap_offset = 16 + port_count * 4 + resource_count * 4 + dep_count * 8;
+            let cap_offset = 17 + port_count * 4 + resource_count * 4 + dep_count * 8;
             if manifest_size < cap_offset + port_count * 8 {
                 return (out, 0);
             }
@@ -1135,7 +1135,9 @@ impl LoadedModule {
                 if n >= out.len() {
                     break;
                 }
-                let rec = p.add(16 + i * 4);
+                // Port records start after the 17-byte fixed head
+                // (permissions widened to u16 — bytes 15..17).
+                let rec = p.add(17 + i * 4);
                 let direction = *rec;
                 let index = *rec.add(3);
                 let cap = p.add(cap_offset + i * 8);
@@ -1715,7 +1717,11 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         } else {
                             0
                         };
-                    let hash_offset = 16 + var_size;
+                    // 17 = MANIFEST_HEADER_SIZE (tools/src/manifest.rs):
+                    // the fixed head grew a byte when permissions widened
+                    // to u16 (bytes 15..17). Every offset here must track
+                    // that constant or integrity/signature reads shear.
+                    let hash_offset = 17 + var_size;
                     if hash_offset + 32 > manifest_size {
                         log::error!("[loader] {name}: manifest hash out of range");
                         return Err(LoaderError::IntegrityMismatch);
@@ -1769,7 +1775,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         } else {
                             0
                         };
-                    let sig_offset = 16 + var_size + 32;
+                    let sig_offset = 17 + var_size + 32;
                     if sig_offset + 96 > manifest_size {
                         return Err(LoaderError::SignatureInvalid);
                     }
@@ -1789,7 +1795,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     //     (has_integrity/has_signature) MASKED — the only
                     //     [0..hash_offset] bytes that differ unsigned vs signed.
                     let hash = {
-                        let hash_offset = 16 + var_size;
+                        let hash_offset = 17 + var_size;
                         use crate::kernel::security::crypto::sha256::Sha256;
                         let mut eh = Sha256::new();
                         // SAFETY: [module.base, +manifest_offset) is the

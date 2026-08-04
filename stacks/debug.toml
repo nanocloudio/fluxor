@@ -135,6 +135,30 @@ modules = [
 ]
 wiring = []
 
+# ── Local sink only (no network transport) ──────────────────────────────
+#
+# The platform runtime already drains the log ring to the board's local sink
+# (UART on pi5, USB CDC on rp, stderr on linux) with no module involved, so
+# this is a no-module variant. It exists because every `platform.debug:` block
+# must select a transport, and a graph that wants only `observe:` or
+# `export_telemetry:` — no netconsole — has one to select. Matching on family
+# alone scores below the `to:`-qualified variants, so naming a transport still
+# wins.
+[[variant]]
+match = { family = "rp2" }
+modules = []
+wiring = []
+
+[[variant]]
+match = { family = "bcm" }
+modules = []
+wiring = []
+
+[[variant]]
+match = { family = "linux" }
+modules = []
+wiring = []
+
 # Monitor telemetry: periodic `MON_HIST` lines for the `fluxor monitor` CLI
 # (per-module step-time histogram). Orthogonal to `to:` — the monitor
 # module emits via log::info!, and whatever transports are active carry
@@ -154,11 +178,12 @@ modules = [
 ]
 wiring = []
 
-# Observability collector: the `observe` module subsumes `monitor` and adds the
-# module-scope signal path. Kernel-scope step histograms (`MON_HIST`) stream
-# immediately; module-scope `MON_METRIC` / `MON_SPAN` light up once an
-# instrumented module's telemetry output is wired to `observe.telemetry`. Emits
-# via the same `log_ring` path, so whatever `to:` transport is active carries it.
+# Observability collector: the `observe` module subsumes `monitor` and renders
+# the whole signal set as `MON_` text. It drains the kernel telemetry ring, so
+# no per-source wiring is needed — module `MON_METRIC` / `MON_SPAN` and the
+# kernel-pushed `MON_HIST` / `MON_RES` rounds all arrive on the ring. Emits via
+# the same `log_ring` path, so whatever `to:` transport is active carries it.
+# `observe_interval_ms` sets the kernel's PSTATUS cadence.
 #
 #   platform:
 #     debug:
@@ -174,15 +199,17 @@ modules = [
 wiring = []
 
 # Telemetry export: `platform.debug.export_telemetry: <kind>` selects a
-# pluggable exporter. `udp` inserts `otel_udp_sample`, which drains the same
-# `Telemetry` edge as `observe` and forwards id-interned records as compact UDP
-# datagrams (one batch envelope per datagram, see
-# `modules/sdk/contracts/telemetry.rs`) — the metric/span analogue of
-# `log_net`'s log forwarding. Like `log_net` it needs a unicast `dst_ip`
-# (per-config or `~/.config/fluxor`). The overlay supplies the module + its
-# datagram plumbing to the family's net module; you still wire each instrumented
-# source explicitly, e.g. `wiring: [ ip.telemetry -> otel_udp_sample.telemetry ]`.
-# Matched by exact value so future exporters (`otlp`) add their own overlay
+# pluggable export path. Every kind inserts the `otel` export engine + a generic
+# `transport_buffer` (the byte-egress stage), differing only in the buffer's
+# `transport` capability. `otel` drains the kernel telemetry ring (no per-source
+# wiring — emission is ring-based since `rfc_observability_surface.md` §5.2),
+# batches records as `fxtl-compact`, and frames each batch onto its `export` port;
+# `transport_buffer` forwards each framed batch over the selected transport.
+# `udp` (transport 0) sends each batch as one datagram off the family's net
+# module (needs a unicast `dst_ip`, per-config or `~/.config/fluxor`); a host
+# collector resolves `(module, id) -> name` and produces OTLP — the metric/span
+# analogue of `log_net`. `uart` (transport 1) writes to the debug serial sink for
+# network-less targets. Matched by exact value so new transports add an overlay
 # without colliding.
 #
 #   platform:
@@ -194,106 +221,89 @@ wiring = []
 match = { export_telemetry = "udp", family = "rp2" }
 accept_cycles = true
 modules = [
-  { name = "otel_udp_sample", params = {
+  { name = "otel", params = {
+      flush_ms  = "user:export_flush_ms",
+  } },
+  { name = "transport_buffer", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
       dst_port  = "user:export_dst_port|host:debug.telemetry_port",
       bind_port = "user:export_bind_port|host:debug.telemetry_bind_port",
-      flush_ms  = "user:export_flush_ms",
   } },
 ]
 wiring = [
-  "ip.net_out -> otel_udp_sample.net_in",
-  "otel_udp_sample.net_out -> ip.net_in",
+  "otel.export -> transport_buffer.payload",
+  "ip.net_out -> transport_buffer.net_in",
+  "transport_buffer.net_out -> ip.net_in",
 ]
 
 [[overlay]]
 match = { export_telemetry = "udp", family = "bcm" }
 accept_cycles = true
 modules = [
-  { name = "otel_udp_sample", params = {
+  { name = "otel", params = {
+      flush_ms  = "user:export_flush_ms",
+  } },
+  { name = "transport_buffer", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
       dst_port  = "user:export_dst_port|host:debug.telemetry_port",
       bind_port = "user:export_bind_port|host:debug.telemetry_bind_port",
-      flush_ms  = "user:export_flush_ms",
   } },
 ]
 wiring = [
-  "ip.net_out -> otel_udp_sample.net_in",
-  "otel_udp_sample.net_out -> ip.net_in",
+  "otel.export -> transport_buffer.payload",
+  "ip.net_out -> transport_buffer.net_in",
+  "transport_buffer.net_out -> ip.net_in",
 ]
 
 [[overlay]]
 match = { export_telemetry = "udp", family = "linux" }
 accept_cycles = true
 modules = [
-  { name = "otel_udp_sample", params = {
+  { name = "otel", params = {
+      flush_ms  = "user:export_flush_ms",
+  } },
+  { name = "transport_buffer", params = {
       dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
       dst_port  = "user:export_dst_port|host:debug.telemetry_port",
       bind_port = "user:export_bind_port|host:debug.telemetry_bind_port",
-      flush_ms  = "user:export_flush_ms",
   } },
 ]
 wiring = [
-  "linux_net.net_out -> otel_udp_sample.net_in",
-  "otel_udp_sample.net_out -> linux_net.net_in",
+  "otel.export -> transport_buffer.payload",
+  "linux_net.net_out -> transport_buffer.net_in",
+  "transport_buffer.net_out -> linux_net.net_in",
 ]
 
-# `export_telemetry: otlp` inserts `otlp_http` — the OTLP/HTTP (JSON) exporter.
-# It opens an outbound TCP connection to an OTLP/HTTP collector and POSTs metrics
-# as OpenTelemetry Protocol JSON to `/v1/metrics`, resolving `(module,id)` names
-# on-device, so no host decoder is needed (unlike `udp`). bcm/rp2350 only (the
-# module is heavier than the UDP exporter — rp2040 is excluded). The compiler injects the per-config
-# id-table param; you still wire each instrumented source's telemetry output.
+# `export_telemetry: uart` — the network-less export path: `otel` + a generic
+# `transport_buffer`. `otel` drains the ring and frames its batch onto `export`;
+# `transport_buffer` writes each framed payload to the platform debug serial sink
+# (SERIAL_WRITE — binary-safe). No net module is needed. On single-UART boards
+# the frames share the console with the log stream; a host capture demuxes them
+# by the `FXTL` batch magic. `fxtl-compact` (default) is the intended encoding.
 #
-#   platform:
-#     debug:
-#       export_telemetry: otlp
-#       export_epoch_sec: 1717200000  # REQUIRED — Unix seconds at boot (anchor)
-#       # export_dst_ip: "0xC0A80A0A"   # else host.toml debug.collector_ip
-#       # export_dst_port: 4318         # OTLP/HTTP port
-#
-# `epoch_sec` is `|required`: OTLP needs Unix-epoch `timeUnixNano`, which the
-# device can't synthesise from boot-relative micros, so a config WITHOUT an
-# epoch anchor FAILS validation here rather than validating and then disabling
-# the exporter at runtime. Supply a boot-synchronised value via the platform key
-# or `host.toml debug.otlp_epoch_sec`.
-#
-# NOTE: a reusable STATIC graph cannot inherently carry a true "Unix seconds at
-# boot" — a fixed `epoch_sec` baked into the config is only correct for the boot
-# it was generated for. Production OTLP needs a boot-time INJECTION path (the
-# flasher/launcher stamps `epoch_sec` from the host clock at deploy) or an
-# on-device runtime clock authority (RTC / NTP / SNTP). Until one exists, treat
-# `epoch_sec` as a per-deployment value, not a property of the saved graph.
-# rp2350-only: `silicon` (not `family="rp2"`) so this overlay does NOT match
-# rp2040 — otlp_http is too heavy for the M0+ and excludes it in its manifest.
+# An overlay, like every other export kind: the export path composes with
+# whatever `to:` transport the graph selects. A variant would compete with the
+# `to = net|console|terminal` pick and tie on specificity.
 [[overlay]]
-match = { export_telemetry = "otlp", silicon = "rp2350" }
-accept_cycles = true
+match = { export_telemetry = "uart", family = "rp2" }
 modules = [
-  { name = "otlp_http", params = {
-      dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
-      dst_port  = "user:export_dst_port|host:debug.otlp_port",
+  { name = "otel", params = {
       flush_ms  = "user:export_flush_ms",
-      epoch_sec = "user:export_epoch_sec|host:debug.otlp_epoch_sec|required",
   } },
+  { name = "transport_buffer", params = { transport = "1" } },
 ]
 wiring = [
-  "ip.net_out -> otlp_http.net_in",
-  "otlp_http.net_out -> ip.net_in",
+  "otel.export -> transport_buffer.payload",
 ]
 
 [[overlay]]
-match = { export_telemetry = "otlp", family = "bcm" }
-accept_cycles = true
+match = { export_telemetry = "uart", family = "bcm" }
 modules = [
-  { name = "otlp_http", params = {
-      dst_ip    = "user:export_dst_ip|host:debug.collector_ip|required",
-      dst_port  = "user:export_dst_port|host:debug.otlp_port",
+  { name = "otel", params = {
       flush_ms  = "user:export_flush_ms",
-      epoch_sec = "user:export_epoch_sec|host:debug.otlp_epoch_sec|required",
   } },
+  { name = "transport_buffer", params = { transport = "1" } },
 ]
 wiring = [
-  "ip.net_out -> otlp_http.net_in",
-  "otlp_http.net_out -> ip.net_in",
+  "otel.export -> transport_buffer.payload",
 ]

@@ -322,8 +322,6 @@ struct SdState {
     /// Pending write offset into block_buf
     pending_offset: u16,
     out_chan: i32,
-    /// Telemetry output (out[1]) to the `observe` collector; -1 when unwired.
-    telemetry_chan: i32,
     /// Cumulative full blocks delivered, emitted on the step cadence.
     blocks_read: u32,
     /// Step counter feeding the telemetry cadence.
@@ -386,7 +384,6 @@ impl SdState {
         self._pad5 = [0; 3];
         self.timer_fd = -1;
         self.out_chan = -1;
-        self.telemetry_chan = -1;
         self.blocks_read = 0;
         self.obs_step = 0;
         self.start_block = 0;
@@ -1406,7 +1403,6 @@ pub extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
 
         s.out_chan = out_chan;
-        s.telemetry_chan = dev_channel_port(&*s.syscalls, 1, 1); // out[1]: telemetry (optional)
 
         // Parse params
         let is_tlv = !params.is_null() && params_len >= 4
@@ -1543,13 +1539,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Module-scope telemetry: emit cumulative blocks delivered on a slow
         // cadence (no-op when the telemetry port is unwired). id 0 = blocks_read.
         s.obs_step = s.obs_step.wrapping_add(1);
-        if s.telemetry_chan >= 0 && s.obs_step.is_multiple_of(5000) {
+        if dev_telemetry_enabled(&*s.syscalls) && s.obs_step.is_multiple_of(5000) {
             let tsys = &*s.syscalls;
             let me = dev_self_index(tsys);
             if me >= 0 {
                 dev_telemetry_metric(
                     tsys,
-                    s.telemetry_chan,
+                    -1,
                     me as u16,
                     dev_micros(tsys),
                     abi::contracts::telemetry::METRIC_COUNTER,

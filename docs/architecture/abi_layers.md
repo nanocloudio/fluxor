@@ -446,7 +446,7 @@ Providers for HAL contracts also live here (`spi_pl022`, `i2c_dw`,
 Touch stable module contracts (FS, net_proto channels), kernel
 primitives, and timers/events. No direct hardware.
 
-Examples: `ip`, `tls`, `http`, `mqtt`, `dns`, `fat32`, `wifi`, `rtp`.
+Examples: `ip`, `tls`, `http_edge`, `mqtt`, `dns`, `fat32`, `wifi`, `quic`.
 
 A small set of **first-party orchestrator modules** under this tree
 (`reconfigure`, `graph_slot`, `ota_ingest`, `monitor`) also import

@@ -36,7 +36,7 @@ miss.
 |---|---|---|
 | **ABI** (`fluxor-abi`) | Wire-stable contract IDs, opcodes, wire structs. Source crate. | `~/.fluxor/registry/cargo/fluxor-abi-<v>.crate` |
 | **SDK** (`fluxor-sdk`) | `no_std` runtime helpers — crypto, codecs, params. Source crate. | `~/.fluxor/registry/cargo/fluxor-sdk-<v>.crate` |
-| **fmod palette** | Compiled `.fmod` artefacts for foundation modules (`ip`, `tls`, `http`, `ws_stream`, …). Per `(target, name, version)`. | `~/.fluxor/registry/fmod/fluxor/<target>/<name>/<v>.fmod` |
+| **fmod palette** | Compiled `.fmod` artefacts for foundation modules (`ip`, `tls`, `http_edge`, `quic`, …). Per `(target, name, version)`. | `~/.fluxor/registry/fmod/fluxor/<target>/<name>/<v>.fmod` |
 | **Runtime binary** (`fluxor-linux`) | Host executable that runs PIC modules under Linux. Per `(host-target, name, version)`. | `~/.fluxor/registry/bin/fluxor/<host-target>/fluxor-linux/<v>` |
 
 ## First-time setup (per developer machine)

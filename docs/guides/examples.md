@@ -1,105 +1,82 @@
-# Example pipelines
+# Example graphs
 
-This guide cross-references the canonical end-to-end examples in
-`examples/`. The same playback graphs appear in four variants per
-family, with **identical interaction models** but different
-deployment targets. Use this page to pick the variant that matches
-your hardware.
+This guide cross-references the end-to-end graphs in `examples/`. Each one is a
+complete, runnable configuration — `fluxor validate <yaml>` checks it and
+`fluxor run <yaml>` executes it on a host target.
 
-## Two playback families
+## Serving
 
-Fluxor ships two canonical playback families:
+| Example | Target | What it shows |
+|---|---|---|
+| [`examples/hello/`](../../examples/hello/) | linux | Smallest complete graph — one module, one channel |
+| [`examples/static_server/`](../../examples/static_server/) | pi5, pico2w | `http_edge` serving files off a real filesystem (`fat32` over NVMe or SD) via the FS contract |
+| [`examples/web_server/`](../../examples/web_server/) | linux, pi5 | TLS 1.3 termination in front of `http_edge` — `ip → tls → http_edge` |
+| [`examples/edge_server/`](../../examples/edge_server/) | linux | Route table with proxy and file handlers on a host TCP listener |
+| [`examples/dns_server/`](../../examples/dns_server/) | linux | Authoritative DNS over the datagram surface |
+| [`examples/mqtt_publisher/`](../../examples/mqtt_publisher/) | — | MQTT 3.1.1 client publishing on a cadence |
+| [`examples/quic_loopback/`](../../examples/quic_loopback/) | linux | QUIC transport against a loopback peer |
 
-| Family         | Source data       | Decoded form          | Sink           | Repo path                       |
-| -------------- | ----------------- | --------------------- | -------------- | ------------------------------- |
-| `image_viewer` | PNG/JPEG/GIF/BMP  | RGB565 frames          | `st7701s` LCD / `<canvas>` | see table below |
-| `audio_player` | WAV/MP3/AAC       | signed 16-bit PCM      | `i2s_pio` DAC / WebAudio   | see table below |
+## Observability
 
-Both families share the same module-graph shape:
+| Example | Target | What it shows |
+|---|---|---|
+| [`examples/observe_demo/pi5.yaml`](../../examples/observe_demo/pi5.yaml) | pi5 | `observe` rendering ring records as `MON_` console lines |
+| [`examples/observe_demo/pi5_udp_export.yaml`](../../examples/observe_demo/pi5_udp_export.yaml) | pi5 | `otel → transport_buffer` exporting batches as UDP datagrams |
+| [`examples/observe_demo/pi5_uart_export.yaml`](../../examples/observe_demo/pi5_uart_export.yaml) | pi5 | The network-less path — the same batches over the debug serial sink |
+| [`examples/log_net/`](../../examples/log_net/) | pi5 | Log-ring forwarding to a host collector, plus adaptive-tick probes |
+| [`examples/owner_status/`](../../examples/owner_status/) | — | Owner status surface and pod runtime reporting |
 
-```
-storage  ──→  bank  ──→  codec  ──→  sink
-              ↑
-        navigation events  (single-button / BOOTSEL / mouse click)
-```
+## Isolation and workloads
 
-`bank` enumerates the source directory (`dir:` + `formats:` params,
-runtime-scanned via the FS contract's `FS_OPENDIR` + `FS_READDIR`
-opcodes), cycles through entries on FMP commands, and opens each
-file via `FS_OPEN` against the configured FS provider.
+| Example | Target | What it shows |
+|---|---|---|
+| [`examples/iso_probe/`](../../examples/iso_probe/) | pi5 | EL0-isolated module, including fault containment under overflow |
+| [`examples/iso_heap/`](../../examples/iso_heap/) | pi5 | Heap allocation from inside an isolated module |
+| [`examples/iso_transform/`](../../examples/iso_transform/) | pi5 | An isolated transform stage in a live pipeline |
+| [`examples/multi_graph/`](../../examples/multi_graph/) | — | Several graphs coordinated by a scenario |
+| [`examples/compute_demo/`](../../examples/compute_demo/) | — | Compute-heavy module pacing |
 
-## Variant matrix
+## Surfaces and presentation
 
-Each family has four variants. The interaction model is the same in
-every column; only the deployment target changes.
+| Example | Target | What it shows |
+|---|---|---|
+| [`examples/surface_traits/wasm.yaml`](../../examples/surface_traits/wasm.yaml) | wasm | Browser-hosted graph with an inline `scenario:` block for the serving origin |
+| [`examples/presentation/`](../../examples/presentation/) | — | Presentation surfaces and role-based rendering |
+| [`examples/led_patterns/`](../../examples/led_patterns/) | rp2350 | Driver-level output with no network involved |
+| [`examples/packet_filter/`](../../examples/packet_filter/) | pi5 | Packet inspection on the NIC path |
+| [`examples/cli_cat/`](../../examples/cli_cat/) | linux | A CLI applet as a graph |
 
-### image_viewer
+## Media pipelines
 
-> single click → next image, double click → previous image
+Audio and image playback families (`image_viewer`, `audio_player`) are built
+from codec and synthesis modules, which live in the sibling repositories —
+[spectra](../../../spectra) owns codecs, [grove](../../../grove) owns synthesis
+and effects. Their graphs and guides ship there, built against this SDK and
+loaded like any other PIC module.
 
-| Variant         | Target            | Source                          | Sink                          | Config                                                       |
-| --------------- | ----------------- | ------------------------------- | ----------------------------- | ------------------------------------------------------------ |
-| inline          | `rp2350` (lcd-4)  | two BMPs baked into config       | ST7701S 480×480 RGB parallel  | [`examples/image_viewer/waveshare-lcd4-inline.yaml`](../../examples/image_viewer/waveshare-lcd4-inline.yaml) |
-| canonical SD    | `rp2350` (lcd-4)  | SPI SD card, `/images/*`         | ST7701S 480×480 RGB parallel  | [`examples/image_viewer/waveshare-lcd4.yaml`](../../examples/image_viewer/waveshare-lcd4.yaml) |
-| split           | `pi5` + browser   | NVMe FAT32, `/images/*` on pi5   | browser `<canvas>` via WS     | [`examples/image_viewer/pi5.yaml`](../../examples/image_viewer/pi5.yaml) |
-| full browser    | `wasm`            | `host_browser_fetch` over HTTP   | browser `<canvas>`            | [`examples/image_viewer/wasm.yaml`](../../examples/image_viewer/wasm.yaml) |
+## Running
 
-### audio_player
-
-> single click → toggle play/pause, double click → next track
-
-| Variant         | Target           | Source                           | Sink                          | Config                                                       |
-| --------------- | ---------------- | -------------------------------- | ----------------------------- | ------------------------------------------------------------ |
-| inline          | `rp2350` (pico2w)| four sequence presets baked in   | I²S DAC                       | [`examples/audio_player/pico2w-inline.yaml`](../../examples/audio_player/pico2w-inline.yaml) |
-| canonical SD    | `rp2350` (pico2w)| SPI SD card, `/audio/*`          | I²S DAC                       | [`examples/audio_player/pico2w.yaml`](../../examples/audio_player/pico2w.yaml) |
-| split           | `pi5` + browser  | NVMe FAT32, `/audio/*` on pi5    | browser WebAudio via WS       | [`examples/audio_player/pi5-split.yaml`](../../examples/audio_player/pi5-split.yaml) |
-| full browser    | `wasm`           | `host_browser_fetch` over HTTP   | browser WebAudio              | [`examples/audio_player/wasm.yaml`](../../examples/audio_player/wasm.yaml) |
-
-## Pipeline diagrams
-
-### Bare-metal SD canonical (rp2350)
-
-```
-sd ──→ fat32 ──→ bank ──→ codec ──→ st7701s   (image_viewer)
-sd ──→ fat32 ──→ bank ──→ codec ──→ mixer ──→ i2s_pio   (audio_player)
-                  ↑
-   button | flash_rp.events  ──→  gesture (audio only)  ──→  bank.commands
-```
-
-### Split deployment (pi5 decodes, browser renders)
+Host targets (`linux`, `qemu-virt`) run directly:
 
 ```
-nvme ──→ fat32 ──→ bank ──→ codec ──→ ws_stream ──→ http (ws fan-out)
-                                                         │
-                                                         ▼ /ws
-                                                    browser <canvas>
-                                                    browser WebAudio
+fluxor validate examples/web_server/linux.yaml
+fluxor run examples/web_server/linux.yaml
 ```
 
-The browser fetches `/`/`/api/list` from the same http listener, and
-the wasm-free host page (a static HTML file served via `fs_path:`)
-manages the WebSocket reception, fragment reassembly, and rendering.
-
-### Full browser (wasm)
+Embedded targets (`pi5`, `pico2w`, `waveshare-lcd4`) build a firmware image:
 
 ```
-host_browser_fetch ──→ codec ──→ wasm_browser_canvas   (image_viewer)
-host_browser_fetch ──→ codec ──→ wasm_browser_audio    (audio_player)
+make firmware TARGET=pi5
+fluxor modules build --target bcm2712
+fluxor combine -o kernel8.img target/pi5/firmware.bin examples/static_server/pi5.yaml
 ```
 
-The host HTML (`viewer.html` / `player.html`) provides the playlist
-and reboots the wasm kernel with a new URL on each navigation —
-until a `host_browser_fs` provider lands, the wasm-side `bank` cannot
-enumerate a browser-side directory, so cycling happens in JS.
-
-### Inline (no storage)
-
-```
-flash_rp.stream  ──→ bank ──→ codec ──→ st7701s        (image_viewer)
-gesture (synth bank) ──→ sequencer ──→ synth ──→ i2s   (audio_player)
-   ↑
-flash_rp.events / button.raw ──→ navigation
-```
+A **wasm** or **split** graph needs an HTTP origin to host the browser side,
+which is a separate Fluxor graph. The deployment-scenario primitive declares
+that: single-graph orchestration carries a `scenario:` block inline on the graph
+YAML (see `examples/surface_traits/wasm.yaml`); multi-graph harnesses use a
+standalone YAML with `kind: scenario` at the top. Either form is run by
+`fluxor run <yaml>`.
 
 ## Related guides
 
@@ -107,18 +84,3 @@ flash_rp.events / button.raw ──→ navigation
 - [displays.md](displays.md) — display panel drivers
 - [asset_banks.md](asset_banks.md) — `bank` module navigation semantics
 - [input_gestures.md](input_gestures.md) — single/double/triple click mapping to FMP verbs
-
-## Running the variants
-
-Embedded targets (`rp2350` waveshare-lcd4, `pico2w`) and self-hosting
-targets (`linux`, `qemu-virt`) build and run as a single Fluxor
-graph today — `fluxor run <yaml>` for linux/qemu, `make firmware`
-then flash for embedded.
-
-The **WASM** and **split** variants need an HTTP origin to host the
-browser side, which is a separate Fluxor graph. The deployment-scenario
-primitive solves this declaratively. Single-graph orchestration carries the
-`scenario:` block inline on the graph YAML (see
-`examples/surface_traits/wasm.yaml`); multi-graph harnesses use a
-standalone YAML with `kind: scenario` at the top. Either form is
-run by `fluxor run <yaml>`.

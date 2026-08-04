@@ -38,6 +38,9 @@ use crate::rig::vocab::{Capability, Surface};
 ///     load probe against the rig's IP and emits NDJSON bytes; the
 ///     matcher evaluates regex rules against the same byte-stream path
 ///     it uses for console/telemetry)
+///   * `observe.proto_load` (the protocol-agnostic successor: same
+///     byte-stream path, but the backend chooses the protocol from its
+///     binding rather than being HTTPS-only)
 ///   * `observe.udp_capture` (generic UDP-datagram capture transport —
 ///     binds a configured port and streams each datagram as bytes; the
 ///     matcher evaluates regex rules against that per-source byte stream,
@@ -52,6 +55,7 @@ pub fn supports_rule_source(cap: Capability) -> bool {
     matches!(cap.surface(), Surface::Console | Surface::Telemetry)
         || cap.as_str() == "observe.netboot_fetch"
         || cap.as_str() == "observe.https_load"
+        || cap.as_str() == "observe.proto_load"
         || cap.as_str() == "observe.udp_capture"
 }
 

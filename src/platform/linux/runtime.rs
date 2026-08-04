@@ -310,6 +310,16 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     protection_unmap_page: |_, _| {},
     stack_canary_check: fluxor::platform::mpu::check_stack_canary,
     stack_canary_reinit: fluxor::platform::mpu::reinit_stack_canary,
+    // Host serial sink = stderr (fd 2), unbuffered so framed telemetry bytes
+    // land verbatim for a capture tool. Binary-safe (no UTF-8 filtering).
+    serial_write: |b| unsafe {
+        let n = libc::write(2, b.as_ptr() as *const libc::c_void, b.len());
+        if n < 0 {
+            0
+        } else {
+            n as usize
+        }
+    },
 };
 
 fn linux_csprng_fill(buf: *mut u8, len: usize) -> i32 {

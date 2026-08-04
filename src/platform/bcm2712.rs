@@ -2851,6 +2851,8 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     protection_unmap_page: bcm_protection_unmap_page,
     stack_canary_check: mpu::check_stack_canary,
     stack_canary_reinit: mpu::reinit_stack_canary,
+    // Binary-safe debug-UART write (PL011) — the telemetry `transport_buffer` sink.
+    serial_write: |b| uart::uart_nonblocking_write(b),
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000

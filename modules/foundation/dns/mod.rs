@@ -200,9 +200,6 @@ struct DnsState {
     syscalls: *const SyscallTable,
     net_in_chan: i32,
     net_out_chan: i32,
-    /// Optional telemetry output (out[1]) to the `observe` collector; -1 when
-    /// the port is unwired, so module-scope metrics are zero-cost when disabled.
-    telemetry_chan: i32,
 
     upstream_ip: u32,
     /// Destination port for forwarded queries. Default 53; configurable so a
@@ -252,7 +249,6 @@ impl DnsState {
         self.syscalls = syscalls;
         self.net_in_chan = -1;
         self.net_out_chan = -1;
-        self.telemetry_chan = -1;
         self.upstream_ip = 0x08080808; // 8.8.8.8
         self.upstream_port = 53;
         self.ttl = 300;
@@ -775,10 +771,11 @@ unsafe fn dg_send_to_v4(
 /// datagram framing) on both directions.
 #[inline(never)]
 unsafe fn maybe_emit_telemetry(s: &mut DnsState) {
-    if s.telemetry_chan < 0 {
+    let sys = &*s.syscalls;
+    // Ring-based emission (§5.2): zero-cost when no consumer is subscribed.
+    if !dev_telemetry_enabled(sys) {
         return;
     }
-    let sys = &*s.syscalls;
     let now = dev_millis(sys);
     if now.wrapping_sub(s.tlm_last_ms) < 5000 {
         return;
@@ -791,8 +788,8 @@ unsafe fn maybe_emit_telemetry(s: &mut DnsState) {
     let midx = me as u16;
     let t = dev_micros(sys);
     let counter = abi::contracts::telemetry::METRIC_COUNTER;
-    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 0, s.tlm.bytes_in as u64);
-    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 1, s.tlm.bytes_out as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 0, s.tlm.bytes_in as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 1, s.tlm.bytes_out as u64);
 }
 
 /// Head-sampling decision for a new `dns.query` root, drawn deterministically
@@ -824,10 +821,11 @@ struct QuerySpan {
 /// only for sampled queries (the clock read is gated behind the sample bit).
 #[inline(never)]
 unsafe fn begin_query_span(s: &DnsState) -> Option<QuerySpan> {
-    if s.telemetry_chan < 0 {
+    let sys = &*s.syscalls;
+    // No consumer subscribed → skip the id draw + span mint entirely (§5.2).
+    if !dev_telemetry_enabled(sys) {
         return None;
     }
-    let sys = &*s.syscalls;
     let mut trace_id = [0u8; 16];
     let mut span_id = [0u8; 8];
     dev_csprng_fill(sys, trace_id.as_mut_ptr(), 16);
@@ -870,7 +868,7 @@ unsafe fn emit_query_span(s: &DnsState, span: &QuerySpan) {
     };
     dev_telemetry_span(
         sys,
-        s.telemetry_chan,
+        -1,
         me as u16,
         0, // name_id 0 = dns.query
         abi::contracts::telemetry::SPAN_SERVER,
@@ -1192,8 +1190,6 @@ pub extern "C" fn module_new(
         // Net channels: in[0] = net_in (from IP), out[0] = net_out (to IP)
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
-        // Port out[1] = optional module-scope telemetry (-1 when unwired).
-        s.telemetry_chan = dev_channel_port(&*(syscalls as *const SyscallTable), 1, 1);
 
         // Parse TLV params
         let is_tlv = !params.is_null() && params_len >= 4

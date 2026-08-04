@@ -71,6 +71,7 @@ pub fn set_syscall_table(table: SyscallTable) {
 pub fn init_syscall_table() {
     set_syscall_table(SyscallTable {
         version: ABI_VERSION,
+        telemetry_enabled: crate::kernel::sys::telemetry_ring::enabled_ptr(),
         channel_read: channel::syscall_channel_read,
         channel_write: channel::syscall_channel_write,
         channel_poll: channel::syscall_channel_poll,
@@ -842,21 +843,26 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
 ///
 /// Bit layout is shared with `tools/src/manifest.rs` — keep in sync.
 pub mod permission {
-    pub const RECONFIGURE: u8 = 1 << 0;
-    pub const FLASH_RAW: u8 = 1 << 1;
-    pub const BACKING_PROVIDER: u8 = 1 << 2;
-    pub const PLATFORM_RAW: u8 = 1 << 3;
-    pub const MONITOR: u8 = 1 << 4;
-    pub const BRIDGE: u8 = 1 << 5;
+    // 16-bit bitmap, bits 9.. free. Bit layout is shared with
+    // `tools/src/manifest.rs` — keep the two in sync.
+    pub const RECONFIGURE: u16 = 1 << 0;
+    pub const FLASH_RAW: u16 = 1 << 1;
+    pub const BACKING_PROVIDER: u16 = 1 << 2;
+    pub const PLATFORM_RAW: u16 = 1 << 3;
+    pub const MONITOR: u16 = 1 << 4;
+    pub const BRIDGE: u16 = 1 << 5;
     /// Kernel-mediated PCIe device binding (bind/config/BAR/MSI/info on a
     /// validated device handle) — distinct from raw MMIO/DMA (`platform_raw`).
-    pub const PCIE_DEVICE: u8 = 1 << 6;
+    pub const PCIE_DEVICE: u16 = 1 << 6;
     /// DMA-buffer allocation from the kernel's bounded DMA arena + the cache
     /// maintenance on those buffers — narrower than raw register poke
     /// (`platform_raw` still gates `MMIO_READ32`/`MMIO_WRITE32`).
-    pub const DMA: u8 = 1 << 7;
+    pub const DMA: u16 = 1 << 7;
+    /// Read-only telemetry-ring drain (`TLM_SUBSCRIBE`/`DRAIN`/`STATS`). Strictly
+    /// read-only — deliberately NOT `monitor`, which also grants `FAULT_RAISE`.
+    pub const OBSERVE: u16 = 1 << 8;
 
-    pub fn name(bit: u8) -> &'static str {
+    pub fn name(bit: u16) -> &'static str {
         match bit {
             RECONFIGURE => "reconfigure",
             FLASH_RAW => "flash_raw",
@@ -866,6 +872,7 @@ pub mod permission {
             BRIDGE => "bridge",
             PCIE_DEVICE => "pcie_device",
             DMA => "dma",
+            OBSERVE => "observe",
             _ => "<unknown>",
         }
     }
@@ -877,7 +884,7 @@ pub mod permission {
 /// `modules/sdk/internal/*` or `modules/sdk/platform/*`, it must be
 /// classified here or it falls through to `PLATFORM_RAW` (most
 /// restrictive, avoiding accidental privilege leakage).
-fn privileged_op_permission(op: u32) -> Option<u8> {
+fn privileged_op_permission(op: u32) -> Option<u16> {
     use permission::*;
     // USB host (0x15xx) — scaffold contract. The kernel-side vtable
     // is unimplemented; once it lands, every USB host op (BIND,
@@ -892,8 +899,8 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
     // a fine-grained match arm here.
     // USB host ops are kernel-mediated (a bound controller handle), so when the
     // stack lands they should gate on a dedicated `usb_host` grant like
-    // PCIE_DEVICE — not this `platform_raw` fallback. Deferred: the u8 permission
-    // bitmask is full (DMA took bit 7), so that grant needs a u16 widening.
+    // PCIE_DEVICE — not this `platform_raw` fallback. The permission bitmap is a
+    // u16 with bits 9.. free, so that grant costs nothing but the arm.
     if (0x1500..=0x15FF).contains(&op) {
         return Some(PLATFORM_RAW);
     }
@@ -919,6 +926,7 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
         | 0x0C35
         | 0x0C36
         | 0x0C3A..=0x0C3D
+        | 0x0C3E // TLM_EMIT — implicit primitive like LOG_WRITE (any module emits)
         | 0x0C40
         | 0x0C41
         | 0x0C42
@@ -937,6 +945,11 @@ fn privileged_op_permission(op: u32) -> Option<u8> {
 
         // ── flash_raw: flash ERASE / PROGRAM / sideband / store enable ──
         0x0C10 | 0x0C37 | 0x0C38 | 0x0C39 => Some(FLASH_RAW),
+
+        // ── observe: read-only telemetry-ring drain (TLM_SUBSCRIBE/DRAIN/STATS).
+        //    TLM_EMIT is above in the implicit-primitives arm. Strictly
+        //    read-only — NOT `monitor` (which also grants FAULT_RAISE). ──
+        0x0C4D..=0x0C4F => Some(OBSERVE),
 
         // ── monitor: FAULT_MONITOR_*, STEP_HISTOGRAM, PAGED_ARENA_STATS ─
         0x0C52..=0x0C5F | 0x0CF9 => Some(MONITOR),
@@ -1285,6 +1298,7 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
 }
 
 unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::abi::contracts::telemetry;
     use crate::abi::internal::diag;
     use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
     use crate::abi::kernel_abi::event::BIND_IRQ;
@@ -1292,6 +1306,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
         MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, PAGED_ARENA_GET,
         PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
+        SERIAL_WRITE,
     };
     use crate::kernel::exec::scheduler;
     match opcode {
@@ -1303,6 +1318,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | REPORT_LATENCY
         | REPORT_STEP_EFFECT
         | LOG_WRITE
+        | SERIAL_WRITE
         | GET_HW_ETHERNET_MAC
         | BIND_IRQ
         | HANDLE_POLL
@@ -1311,6 +1327,13 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | MODULE_FLOW_BUDGET
         | bridge::SELF_BRIDGES
         | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
+        // ── Telemetry ring (rfc_observability_surface.md §5.2). The
+        //    OBSERVE gate for the consumer ops is applied upstream by
+        //    `check_privileged_internal_op`; TLM_EMIT is ungated. ──
+        telemetry::TLM_EMIT
+        | telemetry::TLM_SUBSCRIBE
+        | telemetry::TLM_DRAIN
+        | telemetry::TLM_STATS => handle_telemetry_op(handle, opcode, arg, arg_len),
         // ── Diagnostics / log transport ──
         diag::LOG_RING_DRAIN | diag::FAN_DIAG_SNAPSHOT => handle_diag_op(opcode, arg, arg_len),
         // ── Bridge channel operations ──
@@ -1430,6 +1453,86 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // The 0x0Cxx opcode range is split across small category handlers below
 // so the top-level match stays readable and each concern is local.
 
+/// Telemetry ring ops (`rfc_observability_surface.md` §5.2). `TLM_EMIT` is an
+/// implicit primitive (any module); `TLM_SUBSCRIBE`/`DRAIN`/`STATS` are gated by
+/// the read-only `observe` permission upstream in `check_privileged_internal_op`.
+unsafe fn handle_telemetry_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::abi::contracts::telemetry as tlm;
+    use crate::kernel::exec::scheduler;
+    use crate::kernel::sys::telemetry_ring;
+    // Kernel-stamped identity: the current stepping module, or the UNATTRIBUTED
+    // sentinel when called outside a step bracket (a real module index never
+    // reaches the reserved high values). Stamps emits and owns drain slots, so a
+    // module can neither forge another's records nor drain another's slot.
+    let idx = scheduler::current_module_index();
+    let caller = if idx <= 0xFFFD {
+        idx as u16
+    } else {
+        tlm::MODULE_UNATTRIBUTED
+    };
+    match opcode {
+        tlm::TLM_EMIT => {
+            if arg.is_null() || arg_len < 12 {
+                return E_INVAL;
+            }
+            let module_idx = caller;
+            let rec = core::slice::from_raw_parts(arg, arg_len);
+            telemetry_ring::emit(module_idx, rec);
+            0
+        }
+        tlm::TLM_SUBSCRIBE => {
+            let filter = if !arg.is_null() && arg_len >= 4 {
+                u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)])
+            } else {
+                tlm::FILTER_ALL
+            };
+            // Optional trailing 8-byte LE PSTATUS cadence (§5.3): the collector
+            // declares how often it wants the kernel to push its step-histogram
+            // / arena round. Absent (4-byte arg) → keep the kernel default.
+            let off = tlm::SUBSCRIBE_INTERVAL_OFFSET;
+            if !arg.is_null() && arg_len >= off + 8 {
+                let mut b = [0u8; 8];
+                for (i, v) in b.iter_mut().enumerate() {
+                    *v = *arg.add(off + i);
+                }
+                scheduler::set_pstatus_interval_ms(u64::from_le_bytes(b));
+            }
+            telemetry_ring::subscribe(caller, filter)
+        }
+        tlm::TLM_DRAIN => {
+            // `handle` carries the slot id from TLM_SUBSCRIBE; `arg` is the
+            // caller's output buffer, filled with whole records only.
+            if arg.is_null() || handle < 0 {
+                return E_INVAL;
+            }
+            // A drain advances the tail, so draining a slot you do not own
+            // destroys its owner's records. `observe` grants the surface, not
+            // another consumer's stream.
+            if !telemetry_ring::owns(handle as usize, caller) {
+                return E_INVAL;
+            }
+            let out = core::slice::from_raw_parts_mut(arg, arg_len);
+            telemetry_ring::drain(handle as usize, out) as i32
+        }
+        tlm::TLM_STATS => {
+            // Layout: `[head u32][dropped u32 × CONSUMERS]`.
+            let need = 4 + telemetry_ring::CONSUMERS * 4;
+            if arg.is_null() || arg_len < need {
+                return E_INVAL;
+            }
+            let (head, slots) = telemetry_ring::stats();
+            let out = core::slice::from_raw_parts_mut(arg, arg_len);
+            out[0..4].copy_from_slice(&head.to_le_bytes());
+            for (i, (_active, _lag, dropped)) in slots.iter().enumerate() {
+                let off = 4 + i * 4;
+                out[off..off + 4].copy_from_slice(&dropped.to_le_bytes());
+            }
+            need as i32
+        }
+        _ => E_NOSYS,
+    }
+}
+
 unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::internal::bridge;
     use crate::abi::internal::monitor::ISR_METRICS;
@@ -1437,7 +1540,7 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     use crate::abi::kernel_abi::{
         ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
         MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, RANDOM_FILL, REPORT_LATENCY,
-        REPORT_STEP_EFFECT, SELF_INDEX,
+        REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE,
     };
     use crate::kernel::exec::scheduler;
     match opcode {
@@ -1610,6 +1713,15 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         LOG_WRITE => {
             syscall_log(handle as u8, arg, arg_len);
             0
+        }
+        SERIAL_WRITE => {
+            // Binary-safe raw write to the debug serial sink (the transport_buffer
+            // telemetry path). Returns bytes accepted.
+            if arg.is_null() || arg_len == 0 {
+                return 0;
+            }
+            let bytes = core::slice::from_raw_parts(arg, arg_len);
+            crate::kernel::sys::hal::serial_write(bytes) as i32
         }
         GET_HW_ETHERNET_MAC => {
             if arg.is_null() || arg_len < 6 {
@@ -2186,6 +2298,7 @@ impl SyscallTable {
     pub const fn empty() -> Self {
         Self {
             version: ABI_VERSION,
+            telemetry_enabled: core::ptr::null(),
             channel_read: stub_channel_read,
             channel_write: stub_channel_write,
             channel_poll: stub_channel_poll,

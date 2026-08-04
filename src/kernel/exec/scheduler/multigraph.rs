@@ -1525,7 +1525,7 @@ pub struct ModuleStateSnapshot {
     /// Capability tier (Driver/Service/Protocol — see scheduler docs).
     pub cap_class: u8,
     /// Permission bitmap (per `syscalls::permission` bits).
-    pub permissions: u8,
+    pub permissions: u16,
     /// Per-module fault state machine state.
     pub fault_state: FaultState,
     /// Step-period gate in scheduler ticks (0 = every tick, N = every

@@ -22,8 +22,11 @@ pub fn synthesise_host_config(
         .ok_or_else(|| Error::Config("scenario path has no parent dir".into()))?;
 
     let routes = synthesise_host_routes(scenario, base, scenario_path)?;
+    // `http_edge` — this repo's ingress variant. The synthesised serving host
+    // is fluxor-internal ingress, so it rides the edge module; Wave's plain
+    // `http` protocol module is what downstream graphs name directly.
     let http_module = serde_json::json!({
-        "name": "http",
+        "name": "http_edge",
         "port": host.port,
         "host_tcp": 1,
         "routes": routes,
@@ -43,8 +46,8 @@ pub fn synthesise_host_config(
         "scheduler": { "accept_cycles": true },
         "modules": [http_module],
         "wiring": [
-            { "from": "linux_net.net_out", "to": "http.net_in" },
-            { "from": "http.net_out",      "to": "linux_net.net_in" },
+            { "from": "linux_net.net_out", "to": "http_edge.net_in" },
+            { "from": "http_edge.net_out", "to": "linux_net.net_in" },
         ],
     });
 
@@ -1235,11 +1238,13 @@ pub fn effective_target(scenario_path: &Path, comp: &ComponentSpec) -> String {
 /// of "child bound a listener".
 pub fn extract_http_port(config: &serde_json::Value) -> Option<u16> {
     config.get("modules")?.as_array()?.iter().find_map(|m| {
-        // The convention is `name: http` for the http module; if
-        // a future scenario names it differently we'd need
-        // explicit per-component port hints in the schema.
+        // Any module that binds an HTTP listener. `http_edge` is this repo's
+        // ingress variant (workload-ingress + protocol); `http` is Wave's
+        // protocol module, which downstream graphs name directly. Both expose
+        // `port` the same way. A scenario naming its listener anything else
+        // needs an explicit port hint in the schema.
         let name = m.get("name").and_then(|n| n.as_str())?;
-        if name != "http" {
+        if name != "http" && name != "http_edge" {
             return None;
         }
         m.get("port")

@@ -40,12 +40,6 @@ max_record = 192
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
 # cumulative byte counters; no-op when unwired. See standards/observability.md.
-[[ports]]
-name = "telemetry"
-index = 2
-direction = "output"
-content_type = "Telemetry"
-
 [observability]
 metrics = ["bytes_in", "bytes_out"]
 

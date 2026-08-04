@@ -269,7 +269,7 @@ Recommended reading path:
 4. [docs/architecture/abi_layers.md](docs/architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
 5. [docs/architecture/network.md](docs/architecture/network.md) — channel-based networking and net_proto
 6. [docs/architecture/capability_surface.md](docs/architecture/capability_surface.md) — hardware section and capability vocabulary
-7. [docs/guides/examples.md](docs/guides/examples.md) — current end-to-end example families
+7. [docs/guides/examples.md](docs/guides/examples.md) — the end-to-end graphs in `examples/`
 8. [docs/vision.md](docs/vision.md) — the broader capability-centric argument
 
 ## Contributing

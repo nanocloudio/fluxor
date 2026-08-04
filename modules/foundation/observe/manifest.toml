@@ -1,18 +1,16 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350", "rp2040"]
-permissions = ["monitor", "reconfigure"]
-# Kernel histogram cadence uses dev_millis; telemetry draining is event/data
-# driven and independent of scheduler step counts.
+# Read-only telemetry-ring drain (TLM_SUBSCRIBE / TLM_DRAIN / TLM_STATS). The
+# collector reads records and renders text; it raises no faults and mutates no
+# graph state, so it holds `observe` and nothing wider.
+permissions = ["observe"]
+# Ring draining is event/data driven and independent of scheduler step counts;
+# the PSTATUS cadence the collector declares is wall-clock on the kernel side.
 timer_class = "wall_clock"
 
-# Module-scope telemetry arrives here as fixed-layout `TelemetryRecord`s
-# (modules/sdk/contracts/telemetry.rs). Kernel-scope signals (step-time
-# histograms, faults) are pulled over the monitor syscalls — no port.
-[[ports]]
-name = "telemetry"
-direction = "input"
-content_type = "Telemetry"
+# No ports: every signal arrives on the kernel telemetry ring (metrics and
+# spans from modules, PSTATUS step-histogram/arena rounds from the kernel).
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]
-exempt = "telemetry/log exporter or collector — forwards records, originates none (cf. otlp_http / otel_udp_sample)"
+exempt = "telemetry/log exporter or collector — forwards records, originates none (cf. transport_buffer / otel)"

@@ -147,7 +147,7 @@ of typed channels:
 
 `ws_drain_fanout_input` routes envelopes by their `conn_id` field
 to the target slot. A `u32::MAX` "unclaimed" sentinel from
-`ws_stream` (used until it observes a real inbound frame) routes
+`ws_stream` (a wave module; used until it observes a real inbound frame) routes
 to the first available fan-out slot. If the target's `send_buf`
 is non-empty (or it's mid-fragmentation), the envelope is written
 back to `ws_in_chan` so the next tick retries delivery.

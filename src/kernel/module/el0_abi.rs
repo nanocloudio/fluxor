@@ -58,6 +58,13 @@ pub const SYS_HEAP_ALLOC: u64 = 3;
 /// fall *inside* the heap are forwarded to the allocator, which detects and
 /// logs them without corrupting kernel state.
 pub const SYS_HEAP_FREE: u64 = 4;
+/// Append one telemetry record to the kernel ring
+/// (`rfc_observability_surface.md` §5.2). The record pointer travels in `x2`
+/// (`ptr`) and its length in `x3` (`len`); `x1` (`chan`) is unused. Identity is
+/// the kernel-known EL0 `module_idx` — an isolated module cannot forge it.
+/// Without this op, EL0-isolated modules would lose telemetry emission while the
+/// observability lint still mandates it.
+pub const SYS_TLM_EMIT: u64 = 5;
 
 /// The `SVC` immediate that selects the syscall gateway (vs `SVC #0`, the
 /// module-step return).

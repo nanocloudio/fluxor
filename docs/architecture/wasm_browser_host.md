@@ -163,7 +163,7 @@ host_ws_recv(handle: i32, buf: *mut u8, len: usize) -> i32       // bytes writte
 // source and the wasm-target FS provider (`src/platform/wasm/fs.rs`),
 // which fronts FS_CONTRACT (FS_OPEN / FS_READ / FS_CLOSE) on top of
 // `fetch()` so any module that uses the FS contract on bare-metal
-// (media_loader, foundation/http file routes, …) works on wasm
+// (media_loader, foundation/http_edge file routes, …) works on wasm
 // without channel plumbing for asset ingest.
 host_fetch_open(url_ptr: *const u8, url_len: usize) -> i32       // request handle
 host_fetch_recv(handle: i32, buf: *mut u8, len: usize) -> i32    // bytes written
@@ -343,7 +343,7 @@ emitting `missed_present` telemetry on each drop.
 
 A raw byte transport. Stream-surface semantics (Stream Surface v1,
 datagram, session_ctrl) live in modules layered above
-(`foundation/ws_stream` → `foundation/remote_channel`), the same
+(wave's `ws_stream` → `foundation/remote_channel`), the same
 way `tls` wraps `net_proto` byte streams. Consumers that want
 NetStreamCmdV1 semantics run `wasm_browser_websocket → ws_stream →
 remote_channel` and read from the top of the stack.

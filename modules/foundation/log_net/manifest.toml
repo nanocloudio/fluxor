@@ -25,4 +25,4 @@ max_record = 2048
 
 # Module-scope observability — exempt (see standards/observability.md §6).
 [observability]
-exempt = "telemetry/log exporter or collector — forwards records, originates none (cf. otlp_http / otel_udp_sample)"
+exempt = "telemetry/log exporter or collector — forwards records, originates none (cf. transport_buffer / otel)"

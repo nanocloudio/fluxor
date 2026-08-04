@@ -41,6 +41,8 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
+// Shared UDP datagram-endpoint lifecycle + send (also used by `transport_buffer`).
+include!("../../sdk/cores/dgram_egress.rs");
 
 // ============================================================================
 // Constants
@@ -63,31 +65,6 @@ const LOG_RING_DRAIN: u32 = 0x0C64;
 // State
 // ============================================================================
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-enum Phase {
-    Init = 0,
-    Binding = 1,
-    WaitBound = 2,
-    Serving = 3,
-    /// Bind failed or conn closed. Sleeps `BACKOFF_TICKS` then reruns Binding.
-    Backoff = 4,
-    /// `dst_ip` is unset (0) or an L2 broadcast. Terminal dormant
-    /// state with a one-shot warning so the operator sees why UDP
-    /// logging never started.
-    Disabled = 5,
-}
-
-/// Backoff window between retries (in scheduler ticks). At tick_us=100 this
-/// is 100 ms — slow enough to avoid flooding a broken ip module, fast
-/// enough to resume within a second of recovery.
-const BACKOFF_TICKS: u16 = 1000;
-
-/// Cap on consecutive bind retries before we give up and stop consuming the
-/// ring. Not an error state — the module keeps returning Continue(0) so the
-/// scheduler doesn't mark it faulted.
-const MAX_BIND_ATTEMPTS: u16 = 50;
-
 #[repr(C)]
 struct LogNetState {
     syscalls: *const SyscallTable,
@@ -98,15 +75,12 @@ struct LogNetState {
     dst_port: u16,
     bind_port: u16,
 
-    phase: Phase,
-    /// datagram endpoint id assigned by IP via MSG_DG_BOUND.
-    /// `0xFF` = unallocated.
-    ep_id: u8,
-
-    /// Backoff countdown (ticks remaining before next bind retry).
-    backoff_ticks: u16,
-    /// Number of consecutive bind attempts that have failed.
-    bind_attempts: u16,
+    /// Shared datagram-endpoint lifecycle + send (`dgram_egress` core). Owns the
+    /// bind handshake, ep_id, and backoff — the same machine `transport_buffer`
+    /// uses, so it lives in one place.
+    egress: DgramEgress,
+    /// One-shot flag so a disabled (dst unset/broadcast) endpoint warns once.
+    disabled_warned: u8,
 
     /// Length of drained-but-unsent bytes in `chunk`. Preserves data across
     /// channel-full retries — if emit_datagram fails, we keep the bytes and
@@ -133,10 +107,8 @@ impl LogNetState {
         self.dst_ip = 0;
         self.dst_port = 6666;
         self.bind_port = 6667;
-        self.phase = Phase::Init;
-        self.ep_id = 0xFF;
-        self.backoff_ticks = 0;
-        self.bind_attempts = 0;
+        self.egress = DgramEgress::new();
+        self.disabled_warned = 0;
         self.pending_len = 0;
         self.datagrams_sent = 0;
         self.bytes_forwarded = 0;
@@ -171,47 +143,22 @@ mod params_def {
 // Helpers
 // ============================================================================
 
-/// Build and emit a CMD_DG_SEND_TO frame carrying `payload` to the configured
-/// unicast destination. Returns true iff the channel accepted it.
-///
-/// Caller must have transitioned to Phase::Serving (ep_id set from MSG_DG_BOUND).
+/// Send `payload` to the configured unicast destination via the shared
+/// `dgram_egress` core (one `CMD_DG_SEND_TO` datagram). Returns true iff the
+/// channel accepted it. Caller must have observed `egress.is_ready()`.
 unsafe fn emit_datagram(s: &mut LogNetState, payload: *const u8, payload_len: usize) -> bool {
-    if s.net_out_chan < 0 || s.ep_id == 0xFF { return false; }
-    // CMD_DG_SEND_TO payload: [ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]
-    let body_len = DG_V4_PREFIX + payload_len;
-    if body_len + 3 > NET_BUF_SIZE { return false; }
-
-    let buf = s.net_buf.as_mut_ptr();
-    let out_chan = s.net_out_chan;
-    let ep_id = s.ep_id;
-    let dst_ip = s.dst_ip;
-    let dst_port = s.dst_port;
-    let sys_ptr = s.syscalls;
-
-    *buf = DG_CMD_SEND_TO;
-    let pl = (body_len as u16).to_le_bytes();
-    *buf.add(1) = pl[0];
-    *buf.add(2) = pl[1];
-    *buf.add(3) = ep_id;
-    *buf.add(4) = DG_AF_INET;
-    let ip = dst_ip.to_be_bytes();
-    *buf.add(5) = ip[0];
-    *buf.add(6) = ip[1];
-    *buf.add(7) = ip[2];
-    *buf.add(8) = ip[3];
-    let port = dst_port.to_le_bytes();
-    *buf.add(9) = port[0];
-    *buf.add(10) = port[1];
-
-    let mut i = 0;
-    while i < payload_len {
-        *buf.add(3 + DG_V4_PREFIX + i) = *payload.add(i);
-        i += 1;
-    }
-
-    let total = 3 + body_len;
-    let wrote = ((*sys_ptr).channel_write)(out_chan, buf, total);
-    if wrote > 0 {
+    let sys = &*s.syscalls;
+    let n = s.egress.send(
+        sys,
+        s.net_out_chan,
+        s.dst_ip,
+        s.dst_port,
+        payload,
+        payload_len,
+        s.net_buf.as_mut_ptr(),
+        NET_BUF_SIZE,
+    );
+    if n > 0 {
         s.datagrams_sent = s.datagrams_sent.wrapping_add(1);
         s.bytes_forwarded = s.bytes_forwarded.wrapping_add(payload_len as u32);
         true
@@ -290,172 +237,104 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut LogNetState);
         if s.syscalls.is_null() { return -1; }
 
-        match s.phase {
-            Phase::Init => {
-                // Refuse to run without a configured unicast dst_ip.
-                // Both unset (0) and L2 broadcast (0xFFFFFFFF) drop
-                // into `Disabled` — broadcast would flood the subnet
-                // at tick rate.
-                if s.dst_ip == 0 || s.dst_ip == 0xFFFF_FFFF {
-                    let sys = &*s.syscalls;
-                    let msg = if s.dst_ip == 0 {
-                        b"[log_net] dst_ip unset; UDP log forwarding disabled\0".as_ref()
-                    } else {
-                        b"[log_net] dst_ip = broadcast rejected; UDP log forwarding disabled\0".as_ref()
-                    };
-                    dev_log(sys, 2, msg.as_ptr(), msg.len() - 1);
-                    s.phase = Phase::Disabled;
-                    return 0;
-                }
-                s.phase = Phase::Binding;
+        let sys = &*s.syscalls;
+        // Drive the shared datagram-endpoint lifecycle (bind handshake + backoff);
+        // forward only once the endpoint is bound.
+        let ready = s.egress.poll(
+            sys,
+            s.net_out_chan,
+            s.net_in_chan,
+            s.bind_port,
+            s.dst_ip,
+            s.net_buf.as_mut_ptr(),
+            NET_BUF_SIZE,
+        );
+        if s.egress.is_disabled() && s.disabled_warned == 0 {
+            let msg = if s.dst_ip == 0 {
+                b"[log_net] dst_ip unset; UDP log forwarding disabled".as_ref()
+            } else {
+                b"[log_net] dst_ip = broadcast rejected; UDP log forwarding disabled".as_ref()
+            };
+            dev_log(sys, 2, msg.as_ptr(), msg.len());
+            s.disabled_warned = 1;
+        }
+        if !ready {
+            return 0;
+        }
+
+        // ── Serving: forward the log ring over the bound endpoint ──
+        // Always drain any inbound data to keep net_in from backing up.
+        discard_net_in(s);
+
+        // If a previous chunk couldn't be sent (channel full), retry
+        // it now before draining new bytes from the ring — otherwise
+        // the ring tail advances and we leak log data on the floor.
+        if s.pending_len > 0 {
+            let len = s.pending_len as usize;
+            if emit_datagram(s, s.chunk.as_ptr(), len) {
+                s.pending_len = 0;
+            } else {
+                // Still can't write. Wait for the downstream channel
+                // to drain. New ring bytes accumulate in-place and
+                // are handled by the ring's own drop-new policy.
+                // Blocked on downstream capacity → Waiting: do NOT heat
+                // the pacer (a channel-drain event wakes us); the held
+                // data is best-effort telemetry (RFC adaptive_tick_extra
+                // §6.2). Forwarding itself returns Burst below, so the
+                // hot path is already covered.
+                dev_report_step_effect(&*s.syscalls, step_effect::WAITING);
+                return 0;
             }
+        }
 
-            // Terminal. Returning 0 keeps the scheduler happy and
-            // the module faultless until the next reboot.
-            Phase::Disabled => return 0,
+        // Drain up to CHUNK_SIZE bytes from the ring.
+        let sys_ptr = s.syscalls;
+        let chunk_ptr = s.chunk.as_mut_ptr();
+        let ret = ((*sys_ptr).provider_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
+        if ret <= 0 {
+            return 0;
+        }
+        let len = (ret as u32) & 0xFFFF;
+        let dropped = ((ret as u32) >> 16) & 0xFFFF;
 
-            Phase::Binding => {
-                if s.net_out_chan < 0 { return 0; }
-                if s.bind_attempts >= MAX_BIND_ATTEMPTS {
-                    // Give up quietly — don't trip the fault monitor.
-                    return 0;
-                }
-                let sys_ptr = s.syscalls;
-                let out_chan = s.net_out_chan;
-                let buf = s.net_buf.as_mut_ptr();
-                // CMD_DG_BIND payload: [port: u16 LE] [flags: u8 = 0]
-                let mut payload = [0u8; 3];
-                let port = s.bind_port.to_le_bytes();
-                payload[0] = port[0];
-                payload[1] = port[1];
-                payload[2] = 0;
-                let wrote = net_write_frame(
-                    &*sys_ptr, out_chan, DG_CMD_BIND,
-                    payload.as_ptr(), 3, buf, NET_BUF_SIZE,
-                );
-                // Channel full — retry next tick (phase unchanged).
-                if wrote == 0 { return 0; }
-                s.bind_attempts += 1;
-                s.phase = Phase::WaitBound;
-                return 2;
+        // If drops happened, emit a marker datagram so viewers know
+        // there is a gap. Hex (4-bit shift) encoding avoids runtime
+        // division, which RP2350 PIC modules cannot link. Marker is
+        // fire-and-forget — if the channel is full, the marker is
+        // dropped and the main chunk still goes into pending_len.
+        if dropped > 0 {
+            let mut mark = [0u8; 40];
+            let prefix = b"[log_net: dropped 0x";
+            let mut pos = 0usize;
+            while pos < prefix.len() {
+                mark[pos] = prefix[pos];
+                pos += 1;
             }
-
-            Phase::WaitBound => {
-                if s.net_in_chan < 0 { return 0; }
-                let sys_ptr = s.syscalls;
-                let in_chan = s.net_in_chan;
-                let poll = ((*sys_ptr).channel_poll)(in_chan, 0x01);
-                if poll <= 0 || (poll & 0x01) == 0 { return 0; }
-                let buf = s.net_buf.as_mut_ptr();
-                let (msg_type, payload_len) = net_read_frame(&*sys_ptr, in_chan, buf, NET_BUF_SIZE);
-                // MSG_DG_BOUND payload: [ep_id:1][local_port:2 LE]. Match
-                // on local_port so we only claim the ep_id belonging to
-                // our own CMD_DG_BIND — `ip.net_out` may be tee'd to
-                // other consumers with their own binds in flight.
-                if msg_type == DG_MSG_BOUND && payload_len >= 3 {
-                    let bound_port = (*buf.add(4) as u16)
-                        | ((*buf.add(5) as u16) << 8);
-                    if bound_port == s.bind_port {
-                        s.ep_id = *buf.add(3);
-                        s.phase = Phase::Serving;
-                        s.bind_attempts = 0;
-                        s.pending_len = 0;
-                        return 2;
-                    }
-                } else if msg_type == DG_MSG_ERROR {
-                    // Transient — back off, then retry from Binding.
-                    // Never returns -1: a debug overlay must not kill its own
-                    // module and trigger the fault monitor.
-                    s.phase = Phase::Backoff;
-                    s.backoff_ticks = BACKOFF_TICKS;
-                    return 0;
-                }
-                // Other message type — ignore, stay in WaitBound.
+            let hex = b"0123456789abcdef";
+            let mut shift: i32 = 12;
+            while shift >= 0 {
+                let nib = ((dropped >> shift as u32) & 0xF) as usize;
+                mark[pos] = hex[nib];
+                pos += 1;
+                shift -= 4;
             }
-
-            Phase::Backoff => {
-                if s.backoff_ticks > 0 {
-                    s.backoff_ticks -= 1;
-                    return 0;
-                }
-                s.phase = Phase::Binding;
+            let suffix = b" bytes]\n";
+            let mut k = 0usize;
+            while k < suffix.len() && pos < mark.len() {
+                mark[pos] = suffix[k];
+                pos += 1;
+                k += 1;
             }
+            emit_datagram(s, mark.as_ptr(), pos);
+        }
 
-            Phase::Serving => {
-                // Always drain any inbound data to keep net_in from backing up.
-                discard_net_in(s);
-
-                // If a previous chunk couldn't be sent (channel full), retry
-                // it now before draining new bytes from the ring — otherwise
-                // the ring tail advances and we leak log data on the floor.
-                if s.pending_len > 0 {
-                    let len = s.pending_len as usize;
-                    if emit_datagram(s, s.chunk.as_ptr(), len) {
-                        s.pending_len = 0;
-                    } else {
-                        // Still can't write. Wait for the downstream channel
-                        // to drain. New ring bytes accumulate in-place and
-                        // are handled by the ring's own drop-new policy.
-                        // Blocked on downstream capacity → Waiting: do NOT heat
-                        // the pacer (a channel-drain event wakes us); the held
-                        // data is best-effort telemetry (RFC adaptive_tick_extra
-                        // §6.2). Forwarding itself returns Burst below, so the
-                        // hot path is already covered.
-                        dev_report_step_effect(&*s.syscalls, step_effect::WAITING);
-                        return 0;
-                    }
-                }
-
-                // Drain up to CHUNK_SIZE bytes from the ring.
-                let sys_ptr = s.syscalls;
-                let chunk_ptr = s.chunk.as_mut_ptr();
-                let ret = ((*sys_ptr).provider_call)(-1, LOG_RING_DRAIN, chunk_ptr, CHUNK_SIZE);
-                if ret <= 0 {
-                    return 0;
-                }
-                let len = (ret as u32) & 0xFFFF;
-                let dropped = ((ret as u32) >> 16) & 0xFFFF;
-
-                // If drops happened, emit a marker datagram so viewers know
-                // there is a gap. Hex (4-bit shift) encoding avoids runtime
-                // division, which RP2350 PIC modules cannot link. Marker is
-                // fire-and-forget — if the channel is full, the marker is
-                // dropped and the main chunk still goes into pending_len.
-                if dropped > 0 {
-                    let mut mark = [0u8; 40];
-                    let prefix = b"[log_net: dropped 0x";
-                    let mut pos = 0usize;
-                    while pos < prefix.len() {
-                        mark[pos] = prefix[pos];
-                        pos += 1;
-                    }
-                    let hex = b"0123456789abcdef";
-                    let mut shift: i32 = 12;
-                    while shift >= 0 {
-                        let nib = ((dropped >> shift as u32) & 0xF) as usize;
-                        mark[pos] = hex[nib];
-                        pos += 1;
-                        shift -= 4;
-                    }
-                    let suffix = b" bytes]\n";
-                    let mut k = 0usize;
-                    while k < suffix.len() && pos < mark.len() {
-                        mark[pos] = suffix[k];
-                        pos += 1;
-                        k += 1;
-                    }
-                    emit_datagram(s, mark.as_ptr(), pos);
-                }
-
-                if len > 0 {
-                    if !emit_datagram(s, chunk_ptr, len as usize) {
-                        // Hold the chunk across ticks until the channel
-                        // accepts it. No data is lost.
-                        s.pending_len = len as u16;
-                    }
-                    return 2;
-                }
+        if len > 0 {
+            if !emit_datagram(s, chunk_ptr, len as usize) {
+                // Hold the chunk across ticks until the channel
+                // accepts it. No data is lost.
+                s.pending_len = len as u16;
             }
+            return 2;
         }
 
         0

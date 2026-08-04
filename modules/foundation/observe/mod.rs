@@ -1,23 +1,24 @@
 //! observe — the observability collector.
 //!
-//! Subsumes the `monitor` module and adds the module-scope signal path:
+//! A pure telemetry-ring consumer: it drains the kernel ring each step and
+//! renders every `TelemetryRecord` as a `MON_` text line —
+//!   - `MON_METRIC` / `MON_SPAN` from module-scope metric/span records,
+//!   - `MON_HIST` / `MON_RES` from the kernel-pushed PSTATUS step-histogram and
+//!     arena/fault records (§5.3).
+//! `MON_FAULT` is emitted by the kernel directly. All lines ride the same
+//! transport-agnostic `log_ring` path as the rest of the `MON_*` protocol, so
+//! whatever debug transport is configured carries them.
 //!
-//!   1. **Module-scope** — drains `TelemetryRecord`s from its `telemetry`
-//!      input port (`Telemetry` content type) each step and renders each as a
-//!      `MON_METRIC` / `MON_SPAN` text line (the console exporter — the same
-//!      transport-agnostic `log_ring` path the rest of the `MON_*` protocol
-//!      uses).
-//!   2. **Kernel-scope** — on a slow cadence, pulls the per-module step-time
-//!      histogram (`STEP_HISTOGRAM_QUERY`) and emits one `MON_HIST` line per
-//!      active module. `MON_FAULT` is emitted by the kernel directly.
-//!
-//! This is the console exporter inline. Pluggable exporter modules
-//! (`otel_udp_sample`, `otlp_http`) and id→name resolution live downstream at
-//! the host collector; the device emits id-interned records and MON_ text.
+//! This is the console exporter, inline. The pluggable export path (the `otel`
+//! engine plus a transport carrier such as `transport_buffer`) and id→name
+//! resolution live downstream at the host collector; the device emits
+//! id-interned records and MON_ text.
 //!
 //! Parameters:
-//!   `interval_ms` — how often to emit a round of kernel-scope histograms
-//!                   (default 5000 ms). The module-scope drain runs every step.
+//!   `interval_ms` — the kernel PSTATUS cadence, declared via `TLM_SUBSCRIBE`
+//!                   (§5.3): how often the kernel pushes its step-histogram /
+//!                   arena round (default 5000 ms). The ring drain itself runs
+//!                   every step.
 
 #![no_std]
 #![allow(
@@ -37,38 +38,32 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
 use abi::contracts::telemetry as tlm;
-use abi::internal::monitor::STEP_HISTOGRAM_QUERY;
-use abi::internal::reconfigure::MODULE_COUNT as RECONFIGURE_MODULE_COUNT;
 use abi::kernel_abi::LOG_WRITE as SYSTEM_LOG;
 
 /// Build buffer for one MON_ line. MON_HIST with eight 10-digit buckets is the
 /// widest at ~140 chars; round up.
 const LINE_BUF: usize = 192;
 
-/// Largest single telemetry record (histogram = 80 B). One record is drained,
-/// rendered, and discarded per iteration, so this need only hold one.
-const REC_BUF: usize = 96;
-
-/// Bound on records drained per step so a flooded port can't starve the tick.
-const MAX_DRAIN_PER_STEP: u32 = 32;
+/// Records drained per step, in bytes. `TLM_DRAIN` copies whole records into
+/// this buffer, so it doubles as the bound that keeps a flooded ring from
+/// starving the tick.
+const BATCH_BUF: usize = 512;
 
 #[repr(C)]
 struct ObserveState {
     syscalls: *const SyscallTable,
-    /// Input channel carrying `TelemetryRecord`s (the `telemetry` port).
-    telemetry_in_chan: i32,
-    /// User-configurable period between kernel-scope rounds, in milliseconds.
+    /// Telemetry-ring drain slot claimed via `TLM_SUBSCRIBE` (`-1` = none).
+    tlm_slot: i32,
+    /// Declared to the kernel PSTATUS cadence via TLM_SUBSCRIBE (§5.3); the
+    /// kernel produces the step-histogram/arena records this module renders.
     interval_ms: u32,
-    /// Wall-clock anchor for the last kernel-scope round.
-    last_round_ms: u64,
 }
 
 impl ObserveState {
     fn init(&mut self, syscalls: *const SyscallTable) {
         self.syscalls = syscalls;
-        self.telemetry_in_chan = -1;
+        self.tlm_slot = -1;
         self.interval_ms = 5000;
-        self.last_round_ms = 0;
     }
 }
 
@@ -196,6 +191,39 @@ fn render_record(rec: &[u8], out: &mut [u8]) -> usize {
             emit_decimal(dur, out, &mut pos);
             pos
         }
+        x if x == tlm::SIGNAL_PSTATUS => {
+            // Kernel-pushed per-module process status (§5.3). STEP renders as the
+            // MON_HIST line the console used to pull via STEP_HISTOGRAM_QUERY;
+            // RES surfaces arena + fault state.
+            if knd == tlm::PSTATUS_STEP as u64 {
+                emit_bytes(b"MON_HIST mod=", out, &mut pos);
+                emit_decimal(module, out, &mut pos);
+                let mut bi = 0usize;
+                while bi < tlm::HIST_BUCKETS {
+                    emit_bytes(b" b", out, &mut pos);
+                    if pos < out.len() {
+                        out[pos] = b'0' + bi as u8;
+                        pos += 1;
+                    }
+                    emit_bytes(b"=", out, &mut pos);
+                    emit_decimal(tlm::pstatus_step_bucket(rec, bi) as u64, out, &mut pos);
+                    bi += 1;
+                }
+                pos
+            } else if knd == tlm::PSTATUS_RES as u64 {
+                emit_bytes(b"MON_RES mod=", out, &mut pos);
+                emit_decimal(module, out, &mut pos);
+                emit_bytes(b" arena=", out, &mut pos);
+                emit_decimal(tlm::pstatus_res_arena_used(rec) as u64, out, &mut pos);
+                emit_bytes(b"/", out, &mut pos);
+                emit_decimal(tlm::pstatus_res_arena_cap(rec) as u64, out, &mut pos);
+                emit_bytes(b" faults=", out, &mut pos);
+                emit_decimal(tlm::pstatus_res_faults(rec) as u64, out, &mut pos);
+                pos
+            } else {
+                0
+            }
+        }
         _ => 0,
     }
 }
@@ -213,56 +241,34 @@ fn read_u64(buf: &[u8], at: usize) -> u64 {
     ])
 }
 
-/// Build one MON_HIST line for module `mod_idx`. Returns bytes written, or 0
-/// if the query failed.
-unsafe fn build_mon_hist(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> usize {
-    let mut buckets = [0u32; 8];
-    let bp = buckets.as_mut_ptr() as *mut u8;
-    let rc = (sys.provider_call)(mod_idx as i32, STEP_HISTOGRAM_QUERY, bp, 32);
-    if rc < 0 {
-        return 0;
-    }
-    let mut pos = 0usize;
-    emit_bytes(b"MON_HIST mod=", out, &mut pos);
-    emit_decimal(mod_idx as u64, out, &mut pos);
-    let mut bi = 0usize;
-    while bi < 8 {
-        emit_bytes(b" b", out, &mut pos);
-        if pos < out.len() {
-            out[pos] = b'0' + bi as u8;
-            pos += 1;
-        }
-        emit_bytes(b"=", out, &mut pos);
-        emit_decimal(buckets[bi] as u64, out, &mut pos);
-        bi += 1;
-    }
-    pos
-}
-
 /// Drain the telemetry input port: read whole records (sized from the header)
 /// and emit each as a MON_ line. Bounded so a flooded port can't starve the
 /// tick.
 unsafe fn drain_telemetry(s: &ObserveState) {
-    if s.telemetry_in_chan < 0 {
+    if s.tlm_slot < 0 {
         return;
     }
     let sys = &*s.syscalls;
-    let chan = s.telemetry_in_chan;
-    let mut rec = [0u8; REC_BUF];
+    let mut batch = [0u8; BATCH_BUF];
+    // TLM_DRAIN copies whole records for this slot into the buffer and advances
+    // the tail; `handle` is the slot id.
+    let n = (sys.provider_call)(s.tlm_slot, tlm::TLM_DRAIN, batch.as_mut_ptr(), BATCH_BUF);
+    if n <= 0 {
+        return;
+    }
+    let n = n as usize;
     let mut line = [0u8; LINE_BUF];
-
-    let mut drained = 0u32;
-    while drained < MAX_DRAIN_PER_STEP {
-        // Shared self-sizing read (header → record_len → body).
-        let len = dev_read_telemetry_record(sys, chan, rec.as_mut_ptr(), REC_BUF);
-        if len == 0 {
-            break; // no full record, or unrecognised header.
+    let mut off = 0usize;
+    while off + tlm::HEADER_SIZE <= n {
+        let rlen = tlm::record_len(tlm::signal(&batch[off..]), tlm::kind(&batch[off..]));
+        if rlen == 0 || off + rlen > n {
+            break; // corrupt tail — stop rather than spin (ring is record-atomic)
         }
-        let n = render_record(&rec[..len], &mut line);
-        if n > 0 {
-            (sys.provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
+        let m = render_record(&batch[off..off + rlen], &mut line);
+        if m > 0 {
+            (sys.provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), m);
         }
-        drained += 1;
+        off += rlen;
     }
 }
 
@@ -305,7 +311,11 @@ pub extern "C" fn module_new(
 
         let s = &mut *(state as *mut ObserveState);
         s.init(syscalls as *const SyscallTable);
-        s.telemetry_in_chan = in_chan;
+        // Subscribe to the kernel telemetry ring (all signal types). The old
+        // `telemetry` input port is gone — emission is ring-based now
+        // (`rfc_observability_surface.md` §5.2). `in_chan` is unused.
+        let _ = in_chan;
+        let sys = &*s.syscalls;
 
         let is_tlv = !params.is_null()
             && params_len >= 4
@@ -317,7 +327,14 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        s.last_round_ms = dev_millis(&*(s.syscalls));
+        // Subscribe to the ring (all signals) AND declare the PSTATUS cadence in
+        // one call: `[filter u32][interval ms u64]` (§5.3). The kernel produces
+        // the step-histogram/arena records the console renders, so the
+        // collector's `interval_ms` sets that emit rate.
+        let mut sub = [0u8; tlm::SUBSCRIBE_INTERVAL_OFFSET + 8];
+        sub[..4].copy_from_slice(&tlm::FILTER_ALL.to_le_bytes());
+        sub[tlm::SUBSCRIBE_INTERVAL_OFFSET..].copy_from_slice(&(s.interval_ms as u64).to_le_bytes());
+        s.tlm_slot = (sys.provider_call)(-1, tlm::TLM_SUBSCRIBE, sub.as_mut_ptr(), sub.len());
 
         0
     }
@@ -335,36 +352,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return -1;
         }
 
-        // Module-scope: drain the telemetry port every step (bounded).
+        // Drain the ring every step and render each record as a MON_ line.
+        // This now carries the whole signal set — metrics, spans, AND the
+        // kernel-pushed PSTATUS step-histogram/arena records (MON_HIST/MON_RES),
+        // so no separate pull round is needed (§5.3).
         drain_telemetry(s);
-
-        // Kernel-scope: emit a histogram round on the slow cadence.
-        let now_ms = dev_millis(&*(s.syscalls));
-        if now_ms.wrapping_sub(s.last_round_ms) < u64::from(s.interval_ms.max(100)) {
-            return 0;
-        }
-        s.last_round_ms = now_ms;
-
-        let sys_ptr = s.syscalls;
-        let count = (((*sys_ptr).provider_call)(
-            -1,
-            RECONFIGURE_MODULE_COUNT,
-            core::ptr::null_mut(),
-            0,
-        )) as i32;
-        if count <= 0 {
-            return 0;
-        }
-
-        let mut line = [0u8; LINE_BUF];
-        let mut idx: i32 = 0;
-        while idx < count && idx < 64 {
-            let n = build_mon_hist(&*sys_ptr, idx as u8, &mut line);
-            if n > 0 {
-                ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
-            }
-            idx += 1;
-        }
 
         0
     }

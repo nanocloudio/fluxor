@@ -156,7 +156,7 @@ Browsers can speak any of the protocol surfaces in
 
 - **WebSocket** — stream-shaped record framing over an HTTP/1, /2, or
   /3 upgrade. Broadly available; the default first transport for new
-  browser endpoints. Already exposed by `foundation/http`.
+  browser endpoints. Already exposed by `foundation/http_edge`.
 - **WebTransport** — multiplexed-session and datagram surface over
   HTTP/3. The natural fit when migration, low-latency datagrams, or
   per-stream backpressure matter. Availability varies.

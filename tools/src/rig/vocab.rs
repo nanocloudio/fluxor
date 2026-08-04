@@ -71,6 +71,14 @@ impl Surface {
                 "observe.udp_capture",
                 "observe.usb_enumeration",
                 "observe.https_load",
+                // Protocol-agnostic successor to `observe.https_load`. The
+                // backend picks the protocol (h1 / h2c / ws / grpc, plaintext
+                // or TLS) from its profile binding, so a scenario can assert on
+                // any protocol a project owns without this vocabulary growing a
+                // name per protocol. The probe itself lives with whoever owns
+                // the protocols — Wave ships `observe-proto_load` — because a
+                // backend is just an executable on the discovery path.
+                "observe.proto_load",
             ],
             Self::Rig => &["rig.claim", "rig.release", "rig.lock"],
         }

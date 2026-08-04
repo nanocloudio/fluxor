@@ -56,7 +56,7 @@ How to build things with the system. Domain-specific patterns and recipes.
 - [guides/displays.md](guides/displays.md) — display/touch configuration and pixel pipeline
 - [guides/foundation.md](guides/foundation.md) — foundation layer, driver/foundation boundary, contract patterns
 - [guides/compute_heavy_modules.md](guides/compute_heavy_modules.md) — patterns for emulators, codecs, and compute-intensive workloads
-- [guides/examples.md](guides/examples.md) — canonical playback families (`image_viewer`, `audio_player`) and their four-variant deployment matrix
+- [guides/examples.md](guides/examples.md) — the end-to-end graphs in `examples/`, by what each one demonstrates
 
 ## Modules
 

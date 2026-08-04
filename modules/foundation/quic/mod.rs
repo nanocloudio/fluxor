@@ -230,7 +230,6 @@ pub(crate) struct QuicState {
     verify_hostname_len: usize,
     /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
     /// unwired, so module-scope metrics are zero-cost when disabled.
-    telemetry: i32,
     /// Cumulative application-stream byte counters + last-emit wallclock
     /// (cadence gated on `dev_millis` — quic has no per-step counter).
     tlm: TlmCounters,
@@ -380,7 +379,6 @@ pub unsafe extern "C" fn module_new(
     s.net_out = dev_channel_port(sys, 1, 0);
     s.app_out = dev_channel_port(sys, 1, 1);
     // out[2] = optional module-scope telemetry (-1 when unwired).
-    s.telemetry = dev_channel_port(sys, 1, 2);
     s.tlm = TlmCounters::new();
     s.tlm_last_ms = 0;
     // `sample_permille` resolved after param parsing below (set_defaults would
@@ -1622,10 +1620,11 @@ unsafe fn discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 /// deltas are NOT reset here.
 #[inline(never)]
 unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
-    if s.telemetry < 0 {
+    let sys = &*s.syscalls;
+    // Ring-based emission (§5.2): zero-cost when no consumer is subscribed.
+    if !dev_telemetry_enabled(sys) {
         return;
     }
-    let sys = &*s.syscalls;
     let now = dev_millis(sys);
     if now.wrapping_sub(s.tlm_last_ms) < 5000 {
         return;
@@ -1638,8 +1637,8 @@ unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
     let midx = me as u16;
     let t = dev_micros(sys);
     let counter = abi::contracts::telemetry::METRIC_COUNTER;
-    dev_telemetry_metric(sys, s.telemetry, midx, t, counter, 0, s.tlm.bytes_in as u64);
-    dev_telemetry_metric(sys, s.telemetry, midx, t, counter, 1, s.tlm.bytes_out as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 0, s.tlm.bytes_in as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 1, s.tlm.bytes_out as u64);
 }
 
 /// Head-sampling decision for a new `quic.connection` root, drawn
@@ -1668,7 +1667,9 @@ unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
     let flags = s.conns[idx].sampled_flags;
     let start = s.conns[idx].span_start_us;
     s.conns[idx].span_start_us = 0; // mark emitted before any early return
-    if flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0 || s.telemetry < 0 {
+    if flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0
+        || !dev_telemetry_enabled(&*s.syscalls)
+    {
         return;
     }
     let trace_id = s.conns[idx].trace_id;
@@ -1688,7 +1689,7 @@ unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
     };
     dev_telemetry_span(
         sys,
-        s.telemetry,
+        -1,
         me as u16,
         0, // name_id 0 = quic.connection
         abi::contracts::telemetry::SPAN_SERVER,
@@ -1705,7 +1706,7 @@ unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
 /// spans inherit the connection's sample decision.
 #[inline(always)]
 unsafe fn h3_span_start(s: &QuicState, idx: usize) -> u64 {
-    if s.telemetry < 0
+    if !dev_telemetry_enabled(&*s.syscalls)
         || s.conns[idx].sampled_flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0
     {
         return 0;
@@ -1739,7 +1740,7 @@ unsafe fn emit_h3_request_span(s: &QuicState, idx: usize, start: u64) {
     };
     dev_telemetry_span(
         sys,
-        s.telemetry,
+        -1,
         me as u16,
         1, // name_id 1 = h3.request
         abi::contracts::telemetry::SPAN_SERVER,
@@ -1898,8 +1899,8 @@ unsafe fn alloc_server_connection(
             // Observability: mint the `quic.connection` root trace context and
             // start the span clock when telemetry is wired. Head-sampling is
             // decided once here and latched in `sampled_flags`; the close path
-            // emits the span. Zero-cost (no mint) when the port is unwired.
-            if s.telemetry >= 0 {
+            // emits the span. Zero-cost (no mint) when no consumer is subscribed.
+            if dev_telemetry_enabled(sys) {
                 dev_csprng_fill(sys, conn.trace_id.as_mut_ptr(), 16);
                 dev_csprng_fill(sys, conn.span_id.as_mut_ptr(), 8);
                 conn.sampled_flags = ingress_sample_decision(permille, &conn.trace_id);

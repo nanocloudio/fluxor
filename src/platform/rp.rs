@@ -729,6 +729,8 @@ static RP_HAL_OPS: HalOps = HalOps {
     protection_unmap_page: |_, _| {},
     stack_canary_check: fluxor::platform::mpu::check_stack_canary,
     stack_canary_reinit: fluxor::platform::mpu::reinit_stack_canary,
+    // Binary-safe write into the USB-CDC TX pipe the debug drain forwards.
+    serial_write: |b| USB_TX_PIPE.try_write(b).unwrap_or_default(),
 };
 
 /// Fill buffer with random bytes from the ROSC RANDOMBIT register.

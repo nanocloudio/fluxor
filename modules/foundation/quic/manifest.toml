@@ -31,12 +31,6 @@ content_type = "OctetStream"
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
 # cumulative byte counters; no-op when unwired. See standards/observability.md.
-[[ports]]
-name = "telemetry"
-index = 2
-direction = "output"
-content_type = "Telemetry"
-
 [observability]
 # Application-stream bytes carried by QUIC (excludes handshake/ack overhead):
 # bytes_in  = stream data delivered inbound to app_out (peer → app)

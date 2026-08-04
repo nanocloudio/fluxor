@@ -881,19 +881,26 @@ fn compile_module_wasm(
     }
     let outcome = run_step_capture(rustc, "rustc")?;
     if !outcome.success {
-        // wasm compile failures are a `skip` rather than a hard fail
-        // for modules that aren't expected to be wasm payloads. Drop
-        // the `.fmod` and continue so the rest of the build proceeds.
         let _ = std::fs::remove_file(&wasm_path);
         let _ = std::fs::remove_file(&out_path);
+        let detail = outcome
+            .stderr
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        // A module that declares `wasm` in `hardware_targets` must compile for
+        // wasm, so a failure there is a real regression (an SDK ABI change, say)
+        // and fails the build. A module that does not claim wasm is legitimately
+        // not a wasm payload, and skipping it is correct.
+        if cand.hardware_targets.iter().any(|t| t == "wasm") {
+            return Err(Error::Module(format!(
+                "{}: declares `wasm` target but wasm32 compile failed: {detail}",
+                cand.name
+            )));
+        }
         return Ok(BuildOutcome::Skipped(format!(
-            "wasm32 compile failed: {}",
-            outcome
-                .stderr
-                .lines()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" | ")
+            "wasm32 compile failed (module does not declare `wasm`): {detail}"
         )));
     }
 

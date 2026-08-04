@@ -200,9 +200,6 @@ struct MqttState {
     mesh_out_chan: i32,
     net_in_chan: i32,
     net_out_chan: i32,
-    /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
-    /// the port is unwired, so module-scope metrics are zero-cost when disabled.
-    telemetry_chan: i32,
 
     // Connection params
     broker_ip: u32,
@@ -526,10 +523,11 @@ unsafe fn flush_tx(s: &mut MqttState) -> bool {
 /// deltas are NOT reset here.
 #[inline(never)]
 unsafe fn maybe_emit_telemetry(s: &mut MqttState) {
-    if s.telemetry_chan < 0 {
+    let sys = &*s.syscalls;
+    // Ring-based emission (§5.2): zero-cost when no consumer is subscribed.
+    if !dev_telemetry_enabled(sys) {
         return;
     }
-    let sys = &*s.syscalls;
     let now = dev_millis(sys);
     if now.wrapping_sub(s.tlm_last_ms) < 5000 {
         return;
@@ -542,8 +540,8 @@ unsafe fn maybe_emit_telemetry(s: &mut MqttState) {
     let midx = me as u16;
     let t = dev_micros(sys);
     let counter = abi::contracts::telemetry::METRIC_COUNTER;
-    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 0, s.tlm.bytes_in as u64);
-    dev_telemetry_metric(sys, s.telemetry_chan, midx, t, counter, 1, s.tlm.bytes_out as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 0, s.tlm.bytes_in as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 1, s.tlm.bytes_out as u64);
 }
 
 /// Start sending: set tx_len and tx_sent=0, attempt initial flush.
@@ -949,8 +947,6 @@ pub extern "C" fn module_new(
         // Port 1 in/out = mesh channels (discovered via dev_channel_port)
         s.mesh_in_chan = dev_channel_port(sys, 0, 1);  // in[1]: from mesh
         s.mesh_out_chan = dev_channel_port(sys, 1, 1); // out[1]: to mesh
-        // Port out[2] = optional module-scope telemetry (-1 when unwired).
-        s.telemetry_chan = dev_channel_port(sys, 1, 2);
         s.conn_id = 0;
         s.conn_present = 0;
 

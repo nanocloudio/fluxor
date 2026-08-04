@@ -44,11 +44,6 @@ direction = "output"
 content_type = "OctetStream"
 
 # Module-scope observability (out[3], optional); wired to observe.telemetry.
-[[ports]]
-name = "telemetry"
-direction = "output"
-content_type = "Telemetry"
-
 [observability]
 # `bytes_in` / `bytes_out` are the cipher-side (ip seam) byte counters that
 # standards/observability.md §6 requires of a data-moving module; tls carried

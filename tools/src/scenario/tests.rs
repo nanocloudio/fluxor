@@ -392,7 +392,10 @@ bindings:
         assert!(config["platform"]["net"].is_object());
         let modules = config["modules"].as_array().unwrap();
         assert_eq!(modules.len(), 1);
-        assert_eq!(modules[0]["name"], "http");
+        // `http_edge`: the synthesised serving host is fluxor's own ingress
+        // module. Wave's plain `http` protocol module is named directly by
+        // downstream graphs instead.
+        assert_eq!(modules[0]["name"], "http_edge");
         assert_eq!(modules[0]["port"], 9876);
         assert_eq!(modules[0]["host_tcp"], 1);
         let routes = modules[0]["routes"].as_array().unwrap();

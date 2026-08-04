@@ -30,6 +30,43 @@
 pub const SIGNAL_LOG: u8 = 1; // reserved — logs ride log_ring
 pub const SIGNAL_METRIC: u8 = 2;
 pub const SIGNAL_SPAN: u8 = 3;
+/// Kernel-produced per-module process status (step timing, arena, faults),
+/// pushed to the telemetry ring on a cadence. See `rfc_observability_surface.md`
+/// §5.3.
+pub const SIGNAL_PSTATUS: u8 = 4;
+
+// ── Process-status kind (header[1] when signal == PSTATUS) ───────────
+/// Step timing: total step count + the kernel's native u32×8 step histogram.
+pub const PSTATUS_STEP: u8 = 1;
+/// Resource state: arena used/cap, fault count, flags.
+pub const PSTATUS_RES: u8 = 2;
+
+// ── Syscall op numbers (rfc_observability_surface.md §5.2) ──────────
+// TLM_EMIT is an implicit primitive (any module, like LOG_WRITE); the consumer
+// ops require the read-only `observe` permission. Kept out of the monitor range
+// `0x0C52..=0x0C5F` (blanket monitor-gated).
+/// Append one record to the telemetry ring (kernel stamps identity).
+pub const TLM_EMIT: u32 = 0x0C3E;
+/// Claim a drain slot with a filter word; returns the slot id (or negative).
+pub const TLM_SUBSCRIBE: u32 = 0x0C4D;
+/// Copy whole records from a slot into a buffer; advances the tail.
+pub const TLM_DRAIN: u32 = 0x0C4E;
+/// Ring head + per-slot lag/drop counters.
+pub const TLM_STATS: u32 = 0x0C4F;
+
+/// `TLM_SUBSCRIBE` arg layout: a 4-byte filter word, optionally followed by an
+/// 8-byte LE PSTATUS cadence (ms) the subscriber wants the kernel to emit at
+/// (§5.3). Folding the cadence into subscribe avoids a separate op in the full
+/// `0x0C4x` space; `0` / a 4-byte arg leaves the kernel default.
+pub const SUBSCRIBE_INTERVAL_OFFSET: usize = 4;
+
+// ── Reserved module identities (kernel-stamped, §5.1) ───────────────
+// The kernel stamps the `module` header field at emit time so a module cannot
+// forge another's identity. Two indices are reserved and never assigned to a
+// real module: `UNATTRIBUTED` (emitted outside a step bracket — provider
+// re-entry, host built-ins) and `KERNEL` (the kernel's own PSTATUS records).
+pub const MODULE_UNATTRIBUTED: u16 = 0xFFFF;
+pub const MODULE_KERNEL: u16 = 0xFFFE;
 
 // ── Metric instrument kind (header[1] when signal == METRIC) ────────
 pub const METRIC_COUNTER: u8 = 1;
@@ -57,6 +94,13 @@ pub const HEADER_SIZE: usize = 12;
 pub const METRIC_SCALAR_SIZE: usize = HEADER_SIZE + 12;
 pub const METRIC_HIST_SIZE: usize = HEADER_SIZE + 4 + HIST_BUCKETS * 8;
 pub const SPAN_SIZE: usize = HEADER_SIZE + 52;
+/// PSTATUS step body: `[step_count u64][bucket u32 × 8]` (40 B → 52 total).
+pub const PSTATUS_STEP_SIZE: usize = HEADER_SIZE + 8 + HIST_BUCKETS * 4;
+/// PSTATUS resource body: `[arena_used u32][arena_cap u32][faults u32][flags u32]`
+/// (16 B → 28 total).
+pub const PSTATUS_RES_SIZE: usize = HEADER_SIZE + 16;
+/// Largest record the ring must reserve atomically — a histogram metric (80 B).
+pub const MAX_RECORD_SIZE: usize = METRIC_HIST_SIZE;
 
 /// W3C trace-context id widths.
 pub const TRACE_ID_LEN: usize = 16;
@@ -67,10 +111,10 @@ pub const SPAN_ID_LEN: usize = 8;
 /// contexts carry whatever the caller decided.
 pub const TRACE_FLAGS_SAMPLED: u8 = 0x01;
 
-// ── UDP batch envelope (otel_udp_sample exporter → host collector) ──────
+// ── FXTL batch envelope (otel `fxtl-compact` → host collector) ─────────
 //
-// The `otel_udp_sample` exporter forwards drained records verbatim, packed
-// behind one envelope per UDP datagram:
+// The `otel` engine forwards drained records verbatim, packed behind one
+// envelope per flush (a `transport_buffer` sends each envelope as one datagram):
 //
 //   [magic u32 = BATCH_MAGIC][version u8][_rsvd u8][count u16][record × count]
 //
@@ -111,6 +155,9 @@ const _: () = assert!(HEADER_SIZE == 12);
 const _: () = assert!(METRIC_SCALAR_SIZE == 24);
 const _: () = assert!(METRIC_HIST_SIZE == 80);
 const _: () = assert!(SPAN_SIZE == 64);
+const _: () = assert!(PSTATUS_STEP_SIZE == 52);
+const _: () = assert!(PSTATUS_RES_SIZE == 28);
+const _: () = assert!(MAX_RECORD_SIZE == 80);
 const _: () = assert!(BATCH_HEADER_SIZE == 8);
 
 /// Total record length for a `(signal, kind)` header pair, or 0 if the pair is
@@ -120,9 +167,47 @@ pub fn record_len(signal: u8, kind: u8) -> usize {
         SIGNAL_METRIC if kind == METRIC_HISTOGRAM => METRIC_HIST_SIZE,
         SIGNAL_METRIC => METRIC_SCALAR_SIZE,
         SIGNAL_SPAN => SPAN_SIZE,
+        SIGNAL_PSTATUS if kind == PSTATUS_STEP => PSTATUS_STEP_SIZE,
+        SIGNAL_PSTATUS if kind == PSTATUS_RES => PSTATUS_RES_SIZE,
         _ => 0,
     }
 }
+
+// ── Per-slot drain filter (rfc_observability_surface.md §5.4) ────────
+// A subscribe-time filter word: a signal-type mask in the low bits plus a span
+// sample-shift (keep 1-in-2^n spans) in the high byte. Applied at drain time on
+// the header, so records are never duplicated per consumer.
+pub const FILTER_METRIC: u32 = 1 << 0;
+pub const FILTER_SPAN: u32 = 1 << 1;
+pub const FILTER_PSTATUS: u32 = 1 << 2;
+/// Mask selecting all signal types — the default "take everything" filter.
+pub const FILTER_ALL: u32 = FILTER_METRIC | FILTER_SPAN | FILTER_PSTATUS;
+/// Span sample-shift lives in bits 24..32: keep 1-in-2^shift spans.
+pub const FILTER_SPAN_SHIFT_POS: u32 = 24;
+
+/// Does a record with this `(signal, kind)` pass `filter`? Kind is unused today
+/// (the mask is per-signal) but kept in the signature for forward room.
+pub fn filter_admits(filter: u32, signal: u8, _kind: u8) -> bool {
+    let bit = match signal {
+        SIGNAL_METRIC => FILTER_METRIC,
+        SIGNAL_SPAN => FILTER_SPAN,
+        SIGNAL_PSTATUS => FILTER_PSTATUS,
+        _ => 0,
+    };
+    filter & bit != 0
+}
+
+// ── Export delivery status (otel `delivery` backchannel, §5.5) ───────
+// One byte per batch, reported by a transport carrier back to `otel` so it can
+// retain/retry. Fire-and-forget carriers (UDP/UART) never send one.
+pub const DELIVERY_DELIVERED: u8 = 0;
+pub const DELIVERY_RETRY: u8 = 1; // transient — connect fail, 429/503, timeout
+pub const DELIVERY_DROP: u8 = 2; // permanent — other 4xx
+
+// ── Export encoding selector (otel `encoding` param, §5.5) ───────────
+pub const ENCODING_OTLP_JSON: u8 = 0;
+pub const ENCODING_OTLP_PROTO: u8 = 1;
+pub const ENCODING_FXTL_COMPACT: u8 = 2;
 
 // ── Header ──────────────────────────────────────────────────────────
 
@@ -293,6 +378,86 @@ pub fn span_parent_id(buf: &[u8]) -> [u8; SPAN_ID_LEN] {
     id
 }
 
+// ── Process status (PSTATUS) ────────────────────────────────────────
+//
+// Kernel-produced per-module status, pushed to the ring on a cadence
+// (`rfc_observability_surface.md` §5.3). `STEP` carries the module's step count
+// and the kernel's native u32×8 step-time histogram (the `MON_HIST` source);
+// `RES` carries arena + fault state. Body layouts (after the 12-byte header):
+//   STEP: `[step_count u64][bucket u32 × 8]`  (offsets 12, 20..52)
+//   RES:  `[arena_used u32][arena_cap u32][faults u32][flags u32]`  (12..28)
+
+/// Encode a PSTATUS `STEP` record: total step count + the u32×8 step histogram.
+pub fn write_pstatus_step(
+    buf: &mut [u8],
+    module: u16,
+    t_micros: u64,
+    step_count: u64,
+    buckets: &[u32; HIST_BUCKETS],
+) -> Option<usize> {
+    if buf.len() < PSTATUS_STEP_SIZE {
+        return None;
+    }
+    write_header(buf, SIGNAL_PSTATUS, PSTATUS_STEP, module, t_micros)?;
+    buf[12..20].copy_from_slice(&step_count.to_le_bytes());
+    for (i, v) in buckets.iter().enumerate() {
+        let off = 20 + i * 4;
+        buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    Some(PSTATUS_STEP_SIZE)
+}
+
+/// Encode a PSTATUS `RES` record: arena used/cap, fault count, and a flags word.
+pub fn write_pstatus_res(
+    buf: &mut [u8],
+    module: u16,
+    t_micros: u64,
+    arena_used: u32,
+    arena_cap: u32,
+    faults: u32,
+    flags: u32,
+) -> Option<usize> {
+    if buf.len() < PSTATUS_RES_SIZE {
+        return None;
+    }
+    write_header(buf, SIGNAL_PSTATUS, PSTATUS_RES, module, t_micros)?;
+    buf[12..16].copy_from_slice(&arena_used.to_le_bytes());
+    buf[16..20].copy_from_slice(&arena_cap.to_le_bytes());
+    buf[20..24].copy_from_slice(&faults.to_le_bytes());
+    buf[24..28].copy_from_slice(&flags.to_le_bytes());
+    Some(PSTATUS_RES_SIZE)
+}
+
+/// PSTATUS `STEP`: total step count.
+pub fn pstatus_step_count(buf: &[u8]) -> u64 {
+    read_u64(buf, 12)
+}
+
+/// PSTATUS `STEP`: histogram bucket `i` (0..`HIST_BUCKETS`).
+pub fn pstatus_step_bucket(buf: &[u8], i: usize) -> u32 {
+    read_u32(buf, 20 + i * 4)
+}
+
+/// PSTATUS `RES`: arena bytes in use.
+pub fn pstatus_res_arena_used(buf: &[u8]) -> u32 {
+    read_u32(buf, 12)
+}
+
+/// PSTATUS `RES`: arena capacity in bytes.
+pub fn pstatus_res_arena_cap(buf: &[u8]) -> u32 {
+    read_u32(buf, 16)
+}
+
+/// PSTATUS `RES`: cumulative fault count.
+pub fn pstatus_res_faults(buf: &[u8]) -> u32 {
+    read_u32(buf, 20)
+}
+
+/// PSTATUS `RES`: status flags word.
+pub fn pstatus_res_flags(buf: &[u8]) -> u32 {
+    read_u32(buf, 24)
+}
+
 // ── W3C Trace Context ───────────────────────────────────────────────
 //
 // Ingress propagation: a producer (e.g. http) parses an incoming `traceparent`
@@ -358,6 +523,10 @@ fn decode_hex(src: &[u8], dst: &mut [u8]) -> Option<()> {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
+
+fn read_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
 
 fn read_u64(buf: &[u8], at: usize) -> u64 {
     u64::from_le_bytes([

@@ -31,7 +31,7 @@ modules:
 
   - name: fat32
 
-  - name: http
+  - name: http_edge
     port: 80
     routes:
       - path: "/"
@@ -46,8 +46,8 @@ modules:
 
 wiring:
   - from: ip.net_out
-    to: http.net_in
-  - from: http.net_out
+    to: http_edge.net_in
+  - from: http_edge.net_out
     to: ip.net_in
 
   - from: sd.blocks

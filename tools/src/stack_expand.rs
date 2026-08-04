@@ -1333,9 +1333,9 @@ mod tests {
     }
 
     /// `merge_with_board_defaults` injects a `silicon` key (the module-artefact
-    /// silicon id) so overlays can select a narrower set than `family`. The
-    /// OTLP overlay relies on this to match rp2350 boards but not rp2040
-    /// (both are `family="rp2"`, but otlp_http is rp2350-only).
+    /// silicon id) so an overlay can select a narrower set than `family`: rp2040
+    /// and rp2350 are both `family="rp2"`, so a module that fits only the larger
+    /// part needs `silicon` to exclude the smaller one.
     #[test]
     fn merged_injects_silicon_id_distinct_from_family() {
         let root = project_root();
@@ -1354,7 +1354,7 @@ mod tests {
         assert_eq!(
             merged.get("silicon"),
             Some(&"rp2040".to_string()),
-            "rp2040 stays distinct so the OTLP `silicon=rp2350` overlay skips it"
+            "rp2040 stays distinct so a `silicon=rp2350` overlay skips it"
         );
     }
 }

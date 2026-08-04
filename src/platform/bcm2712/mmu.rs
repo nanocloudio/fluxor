@@ -1773,10 +1773,25 @@ mod bcm2712_impl {
             use crate::kernel::module::el0_abi::{
                 classify_heap_free, HeapFreeAction, EL0_EFAULT, EL0_EINVAL, EL0_EPERM,
                 SYS_CHANNEL_POLL, SYS_CHANNEL_READ, SYS_CHANNEL_WRITE, SYS_HEAP_ALLOC,
-                SYS_HEAP_FREE,
+                SYS_HEAP_FREE, SYS_TLM_EMIT,
             };
             let module_idx = module_idx as usize;
             match op {
+                // Telemetry emit: no channel handle; the record is at ptr/len.
+                // Identity is the kernel-known `module_idx` (EL0 cannot forge).
+                SYS_TLM_EMIT => {
+                    if len < 12 {
+                        return EL0_EINVAL;
+                    }
+                    if !el0_buf_ok(module_idx, ptr, len) {
+                        return EL0_EFAULT;
+                    }
+                    // SAFETY: range validated to lie in the module's EL0 memory;
+                    // the kernel reads up to `len` bytes from it.
+                    let rec = core::slice::from_raw_parts(ptr as *const u8, len);
+                    crate::kernel::sys::telemetry_ring::emit(module_idx as u16, rec);
+                    0
+                }
                 SYS_CHANNEL_READ | SYS_CHANNEL_WRITE | SYS_CHANNEL_POLL => {
                     // Every channel op names a handle; authorize it against the
                     // module's own [in, out, ctrl] before touching channel

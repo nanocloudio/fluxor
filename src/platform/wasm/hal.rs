@@ -247,4 +247,7 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     protection_unmap_page: |_, _| {},
     stack_canary_check: crate::platform::mpu::check_stack_canary,
     stack_canary_reinit: crate::platform::mpu::reinit_stack_canary,
+    // No serial sink in the browser host — telemetry export uses a network
+    // carrier on wasm. Report nothing accepted so a carrier stays dormant.
+    serial_write: |_| 0,
 };

@@ -452,9 +452,6 @@ struct TlsState {
     /// consumer needs it; -1 when the port is unwired makes the
     /// emit a no-op. Channel slot: out[2].
     peer_identity: i32,
-    /// Optional telemetry output (out[3]) to the `observe` collector; -1 when
-    /// unwired. Cumulative crypto/backpressure counters on the 50k cadence.
-    telemetry_chan: i32,
 
     // Pre-computed ephemeral ECDH key pairs (one per session, computed in module_new)
     eph_private: [[u8; 32]; MAX_SESSIONS],
@@ -785,7 +782,6 @@ pub unsafe extern "C" fn module_new(
     s.cipher_out = dev_channel_port(sys, 1, 0);
     s.clear_out = dev_channel_port(sys, 1, 1);
     s.peer_identity = dev_channel_port(sys, 1, 2);
-    s.telemetry_chan = dev_channel_port(sys, 1, 3); // out[3]: telemetry (optional)
 
     // Initialize sessions
     let mut i = 0;
@@ -1009,55 +1005,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // counters to the `observe` collector (no-op when unwired). ids follow
         // `[observability].metrics`: 0=ecdh_pool_hit, 1=ecdh_fallback_keygen,
         // 2=frame_write_dropped.
-        if s.telemetry_chan >= 0 {
+        if dev_telemetry_enabled(&*s.syscalls) {
             let tsys = &*s.syscalls;
             let me = dev_self_index(tsys);
             if me >= 0 {
                 let midx = me as u16;
                 let t = dev_micros(tsys);
                 let c = abi::contracts::telemetry::METRIC_COUNTER;
-                dev_telemetry_metric(
-                    tsys,
-                    s.telemetry_chan,
-                    midx,
-                    t,
-                    c,
-                    0,
-                    s.ecdh_pool_hit as u64,
-                );
-                dev_telemetry_metric(
-                    tsys,
-                    s.telemetry_chan,
-                    midx,
-                    t,
-                    c,
-                    1,
-                    s.ecdh_fallback_keygen as u64,
-                );
-                dev_telemetry_metric(
-                    tsys,
-                    s.telemetry_chan,
-                    midx,
-                    t,
-                    c,
-                    2,
-                    s.frame_write_dropped as u64,
-                );
+                dev_telemetry_metric(tsys, -1, midx, t, c, 0, s.ecdh_pool_hit as u64);
+                dev_telemetry_metric(tsys, -1, midx, t, c, 1, s.ecdh_fallback_keygen as u64);
+                dev_telemetry_metric(tsys, -1, midx, t, c, 2, s.frame_write_dropped as u64);
                 // ids 3/4 = bytes_in / bytes_out. Read here, at the TOP of
                 // the step, while `tlm` still holds the completed window —
                 // `dev_tlm_maybe_emit` zeroes it at the END of this same
                 // cadence step. Reading after that reset is exactly the bug
                 // that made wave's http module export 0 on every scrape.
-                dev_telemetry_metric(tsys, s.telemetry_chan, midx, t, c, 3, s.tlm.bytes_in as u64);
-                dev_telemetry_metric(
-                    tsys,
-                    s.telemetry_chan,
-                    midx,
-                    t,
-                    c,
-                    4,
-                    s.tlm.bytes_out as u64,
-                );
+                dev_telemetry_metric(tsys, -1, midx, t, c, 3, s.tlm.bytes_in as u64);
+                dev_telemetry_metric(tsys, -1, midx, t, c, 4, s.tlm.bytes_out as u64);
             }
         }
         let buf = s.net_scratch.as_mut_ptr();
@@ -1122,7 +1086,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // Observability: emit the `tls.handshake` span once the handshake has
         // resolved (Ready = ok, Error = failed). Done before the Closed/Error
         // branches below reset the slot. Zero-cost when the port is unwired.
-        if s.telemetry_chan >= 0 && s.sessions[i].span_start_us != 0 {
+        if dev_telemetry_enabled(&*s.syscalls) && s.sessions[i].span_start_us != 0 {
             let st = s.sessions[i].state;
             let resolved = st == SessionState::Ready
                 || st == SessionState::Closing
@@ -1324,7 +1288,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // AND forwarded downstream so HTTP parents under it).
                             // Gated on a wired telemetry port — no clock read,
                             // no span, when tracing is off.
-                            if s.telemetry_chan >= 0 {
+                            if dev_telemetry_enabled(&*s.syscalls) {
                                 let sys = &*s.syscalls;
                                 let now = dev_micros(sys);
                                 s.sessions[idx].span_start_us = if now == 0 { 1 } else { now };
@@ -1598,7 +1562,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if pl > 32 {
                     tls_discard(sys, s.cipher_in, pl - 32);
                 }
-                if pl >= abi::contracts::net::net_proto::TRACE_CTX_LEN && s.telemetry_chan >= 0 {
+                if pl >= abi::contracts::net::net_proto::TRACE_CTX_LEN
+                    && dev_telemetry_enabled(&*s.syscalls)
+                {
                     let conn_id = pbuf[0];
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
@@ -2027,7 +1993,7 @@ unsafe fn emit_handshake_span(s: &mut TlsState, idx: usize, ok: bool) {
     };
     dev_telemetry_span(
         sys,
-        s.telemetry_chan,
+        -1,
         me as u16,
         0, // name_id 0 = tls.handshake
         abi::contracts::telemetry::SPAN_INTERNAL,
@@ -3301,7 +3267,7 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
         // means a back-pressured clear_out that defers the accept to a
         // later Ready-loop step still carries the parent trace with it,
         // instead of dropping it (F4). Only when IP propagated a trace.
-        if s.telemetry_chan >= 0 && s.sessions[idx].trace_ctx_trace != [0u8; 16] {
+        if dev_telemetry_enabled(&*s.syscalls) && s.sessions[idx].trace_ctx_trace != [0u8; 16] {
             s.sessions[idx].trace_ctx_pending = true;
         }
         // Forward the held NET_MSG_ACCEPTED / NET_MSG_CONNECTED (+ the

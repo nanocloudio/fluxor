@@ -354,6 +354,7 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
     // entry point (default domain only — one sampler pass per tick).
     if di == 0 {
         sample_flow_stalls();
+        sample_pstatus();
     }
     let ms = crate::kernel::sys::hal::now_millis();
     // Wall-clock cadence (~30 s), driven by `now_millis()` rather than a
@@ -434,6 +435,78 @@ pub fn sample_flow_stalls() {
 }
 
 static LAST_FLOW_SAMPLE_MS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Wall-clock timestamp (ms) of the last PSTATUS cadence round.
+static LAST_PSTATUS_MS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+/// PSTATUS cadence interval (ms); a subscriber declares its own via the
+/// `TLM_SUBSCRIBE` interval field (§5.3). Default matches the observe/monitor
+/// console cadence.
+static PSTATUS_INTERVAL_MS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(5_000);
+
+/// Set the PSTATUS cadence interval, as declared by a `TLM_SUBSCRIBE` caller
+/// (§5.3). `0` leaves the default in place.
+pub fn set_pstatus_interval_ms(ms: u64) {
+    if ms != 0 {
+        PSTATUS_INTERVAL_MS.store(ms, Ordering::Relaxed);
+    }
+}
+
+/// Push one round of kernel-produced PSTATUS records to the telemetry ring: a
+/// `STEP` (step count + step-time histogram — the `MON_HIST` source) and a `RES`
+/// (arena + fault state) per active module, kernel-stamped with that module's
+/// identity (`rfc_observability_surface.md` §5.3). No-op unless a ring consumer
+/// is subscribed (`is_enabled()` — one relaxed load), so the default path is
+/// free. Called once per tick on the default domain from `maybe_emit_alive`;
+/// its own wall-clock cadence gates the actual emit.
+pub fn sample_pstatus() {
+    use crate::abi::contracts::telemetry as tlm;
+    // Cheap gate: nothing subscribed → build/emit nothing.
+    if !crate::kernel::sys::telemetry_ring::is_enabled() {
+        return;
+    }
+    let ms = crate::kernel::sys::hal::now_millis();
+    let last = LAST_PSTATUS_MS.load(Ordering::Relaxed);
+    if ms.wrapping_sub(last) < PSTATUS_INTERVAL_MS.load(Ordering::Relaxed) {
+        return;
+    }
+    LAST_PSTATUS_MS.store(ms, Ordering::Relaxed);
+    let t = crate::kernel::sys::hal::now_micros();
+
+    // SAFETY: called from the scheduler loop — single reader of SCHED here.
+    unsafe {
+        let p = &raw const SCHED;
+        let sched = &*p;
+        for i in 0..MAX_MODULES {
+            if matches!(sched.modules[i], ModuleSlot::Empty) {
+                continue;
+            }
+            let buckets = sched.step_hist[i];
+            let mut step_count: u64 = 0;
+            for b in &buckets {
+                step_count = step_count.wrapping_add(*b as u64);
+            }
+            let mut step = [0u8; tlm::PSTATUS_STEP_SIZE];
+            if let Some(n) = tlm::write_pstatus_step(&mut step, i as u16, t, step_count, &buckets) {
+                crate::kernel::sys::telemetry_ring::emit(i as u16, &step[..n]);
+            }
+
+            let hs = crate::kernel::mem::heap::heap_stats(i);
+            let fs = get_fault_stats(i);
+            let mut res = [0u8; tlm::PSTATUS_RES_SIZE];
+            if let Some(n) = tlm::write_pstatus_res(
+                &mut res,
+                i as u16,
+                t,
+                hs.allocated,
+                hs.arena_size,
+                fs.fault_count as u32,
+                fs.current_state as u32,
+            ) {
+                crate::kernel::sys::telemetry_ring::emit(i as u16, &res[..n]);
+            }
+        }
+    }
+}
 
 /// Per-domain wall-clock timestamp (ms) of the last `[sched] alive` heartbeat,
 /// so the cadence is driven by `now_millis()` instead of a tick count that

@@ -1,0 +1,39 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350", "rp2040"]
+permissions = ["platform_raw"]
+# Cadence-independent byte forwarder (framed payloads → a selected transport);
+# its emit cadence is cosmetic, not correctness-bearing. Explicit attestation to
+# run on a mechanism-(b) domain (RFC adaptive_tick §8 rule 2). Same shape as
+# `log_net`.
+timer_class = "agnostic"
+
+[[ports]]
+name = "payload"
+index = 0
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 2048, bcm2712 = 8192 }
+
+# net_in / net_out are used only by the `udp` transport (the ip datagram
+# surface). The `uart` transport leaves them unwired.
+[[ports]]
+name = "net_in"
+index = 1
+direction = "input"
+content_type = "NetProto"
+required = false
+buffer_size = { default = 2048, bcm2712 = 8192 }
+
+[[ports]]
+name = "net_out"
+index = 0
+direction = "output"
+content_type = "NetProto"
+required = false
+buffer_size = { default = 2048, bcm2712 = 8192 }
+max_record = 2048
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "transport buffer — forwards framed bytes to a selected transport (udp/uart), originates no telemetry of its own (cf. log_net)"

@@ -57,12 +57,26 @@ unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
     }
 }
 
-/// Emit a scalar metric (counter / up-down) on a telemetry output channel.
-/// No-op if `chan < 0`, so instrumentation costs nothing when the telemetry
-/// port is unwired. `module_idx` is the emitter's own index (`dev_self_index`);
-/// `t_micros` is a best-effort monotonic stamp (the host collector applies
-/// receive time). See `modules/sdk/contracts/telemetry.rs` and
-/// `standards/observability.md`.
+/// Producer-side enabled gate (`rfc_observability_surface.md` §5.1): a plain,
+/// trap-free single-word read of the kernel-published flag. `true` when at least
+/// one telemetry consumer is subscribed, so a record is built only when
+/// something would consume it. A null pointer means "cannot check", not
+/// "disabled" — a table without the word (the wasm host, an isolated module
+/// whose protection domain does not map kernel memory) emits unconditionally
+/// and the ring drops when no consumer is active.
+#[allow(dead_code, reason = "emit-side helper; invoked only by instrumented modules")]
+#[inline(always)]
+unsafe fn dev_telemetry_enabled(sys: &SyscallTable) -> bool {
+    sys.telemetry_enabled.is_null() || *sys.telemetry_enabled != 0
+}
+
+/// Emit a scalar metric (counter / up-down) to the kernel telemetry ring via
+/// `TLM_EMIT`. Gated by [`dev_telemetry_enabled`] so it is zero-cost when nothing
+/// is collecting. The kernel stamps the emitter's identity, so `module_idx` here
+/// is advisory (overwritten). `t_micros` is a best-effort monotonic stamp (the
+/// host collector applies receive time). `_chan` is accepted so instrumented
+/// call sites keep one shape across signals; emission is ring-based and reaches
+/// every consumer without a wired port.
 #[allow(
     dead_code,
     reason = "emit-side helper; invoked only by instrumented modules"
@@ -70,26 +84,26 @@ unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
 #[inline]
 unsafe fn dev_telemetry_metric(
     sys: &SyscallTable,
-    chan: i32,
+    _chan: i32,
     module_idx: u16,
     t_micros: u64,
     kind: u8,
     id: u16,
     value: u64,
 ) {
-    if chan < 0 {
+    if !dev_telemetry_enabled(sys) {
         return;
     }
     let mut buf = [0u8; abi::contracts::telemetry::METRIC_SCALAR_SIZE];
     if let Some(n) = abi::contracts::telemetry::write_metric_scalar(
         &mut buf, module_idx, t_micros, kind, id, value,
     ) {
-        let _ = (sys.channel_write)(chan, buf.as_ptr(), n);
+        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
     }
 }
 
-/// Emit a histogram metric (`HIST_BUCKETS` log2-spaced counts) on a telemetry
-/// output channel. No-op if `chan < 0`.
+/// Emit a histogram metric (`HIST_BUCKETS` log2-spaced counts) to the kernel
+/// telemetry ring. Gated by [`dev_telemetry_enabled`], like the scalar path.
 #[allow(
     dead_code,
     reason = "emit-side helper; invoked only by instrumented modules"
@@ -97,26 +111,26 @@ unsafe fn dev_telemetry_metric(
 #[inline]
 unsafe fn dev_telemetry_histogram(
     sys: &SyscallTable,
-    chan: i32,
+    _chan: i32,
     module_idx: u16,
     t_micros: u64,
     id: u16,
     buckets: &[u64; abi::contracts::telemetry::HIST_BUCKETS],
 ) {
-    if chan < 0 {
+    if !dev_telemetry_enabled(sys) {
         return;
     }
     let mut buf = [0u8; abi::contracts::telemetry::METRIC_HIST_SIZE];
     if let Some(n) = abi::contracts::telemetry::write_metric_histogram(
         &mut buf, module_idx, t_micros, id, buckets,
     ) {
-        let _ = (sys.channel_write)(chan, buf.as_ptr(), n);
+        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
     }
 }
 
-/// Emit a span on a telemetry output channel. No-op if `chan < 0`, so an
-/// uninstrumented (unwired) graph costs nothing. `ctx` carries the W3C trace
-/// context (trace/span/parent ids); `start_micros`/`end_micros` come from
+/// Emit a span to the kernel telemetry ring. Gated by [`dev_telemetry_enabled`],
+/// so a graph nobody is collecting from costs nothing. `ctx` carries the W3C
+/// trace context (trace/span/parent ids); `start_micros`/`end_micros` come from
 /// [`dev_micros`]. The header stamp is the span end. See
 /// `modules/sdk/contracts/telemetry.rs` and `standards/observability.md`.
 #[allow(
@@ -130,7 +144,7 @@ unsafe fn dev_telemetry_histogram(
 #[inline]
 unsafe fn dev_telemetry_span(
     sys: &SyscallTable,
-    chan: i32,
+    _chan: i32,
     module_idx: u16,
     name_id: u16,
     span_kind: u8,
@@ -139,7 +153,7 @@ unsafe fn dev_telemetry_span(
     start_micros: u64,
     end_micros: u64,
 ) {
-    if chan < 0 {
+    if !dev_telemetry_enabled(sys) {
         return;
     }
     let mut buf = [0u8; abi::contracts::telemetry::SPAN_SIZE];
@@ -154,49 +168,8 @@ unsafe fn dev_telemetry_span(
         start_micros,
         end_micros,
     ) {
-        let _ = (sys.channel_write)(chan, buf.as_ptr(), n);
+        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
     }
-}
-
-/// Read one whole self-sized `TelemetryRecord` from a telemetry channel into
-/// `out`. Returns the record's total length (header + body), or 0 if no full
-/// record is available or the header is unrecognised. The `observe` collector
-/// and every exporter share this, so the self-sizing read
-/// (`header → record_len → body`) lives in one place rather than being copied
-/// into each drain loop. `out_max` must be ≥ the largest record
-/// (`METRIC_HIST_SIZE`); a record that wouldn't fit returns 0 (the caller stops
-/// rather than mis-framing). See `modules/sdk/contracts/telemetry.rs`.
-#[allow(
-    dead_code,
-    reason = "drain-side helper; invoked only by the collector + exporters"
-)]
-unsafe fn dev_read_telemetry_record(
-    sys: &SyscallTable,
-    chan: i32,
-    out: *mut u8,
-    out_max: usize,
-) -> usize {
-    let hdr = abi::contracts::telemetry::HEADER_SIZE;
-    if out_max < hdr {
-        return 0;
-    }
-    let h = (sys.channel_read)(chan, out, hdr);
-    if h < hdr as i32 {
-        return 0; // no full header available.
-    }
-    // header[0] = signal, header[1] = kind.
-    let len = abi::contracts::telemetry::record_len(*out, *out.add(1));
-    if len < hdr || len > out_max {
-        return 0; // unrecognised / too large — stop rather than mis-frame.
-    }
-    let body = len - hdr;
-    if body > 0 {
-        let b = (sys.channel_read)(chan, out.add(hdr), body);
-        if b < body as i32 {
-            return 0;
-        }
-    }
-    len
 }
 
 /// Render `bytes` as lowercase hex into `out`. Caller must ensure

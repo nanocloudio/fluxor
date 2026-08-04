@@ -1160,6 +1160,21 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
         {
             // WebSocket handler — accepts the Upgrade and echoes frames.
             handler = 4;
+        } else if obj.get("grpc").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // gRPC unary handler (HANDLER_GRPC) — answers with a canned
+            // length-prefixed message and a `grpc-status: 0` trailer.
+            //
+            // A boolean key rather than a raw `handler:` number, matching
+            // `websocket:` above: the handler id is an internal constant of the
+            // http module, and letting graphs name it directly would make every
+            // renumbering a breaking config change. `handler` is derived here
+            // and never read from the yaml, so a raw `handler: 10` is silently
+            // ignored and the route serves an empty static body.
+            //
+            // The route path should be the gRPC SERVICE prefix
+            // (`/pkg.Service/`), because a method path is `/<service>/<Method>`
+            // and http matches a trailing `/` as a prefix.
+            handler = 10;
         } else if let Some(proxy_val) = obj.get("proxy") {
             // Proxy handler
             handler = 3;

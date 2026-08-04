@@ -39,7 +39,7 @@ pub const MANIFEST_MAGIC: u32 = 0x464D5846;
 pub const MANIFEST_VERSION: u8 = 1;
 
 /// Manifest header size (fixed portion before variable sections)
-pub const MANIFEST_HEADER_SIZE: usize = 16;
+pub const MANIFEST_HEADER_SIZE: usize = 17;
 
 /// Signature block size (ed25519 signature + signer fingerprint).
 pub const SIGNATURE_BLOCK_SIZE: usize = 96;
@@ -433,27 +433,29 @@ pub struct VariantDecl {
 /// subset of 0x0Cxx orchestration / platform opcodes; a module that
 /// needs only one surface does not implicitly get the others.
 ///
-/// Serialised as a u8 bitmap into the manifest binary (reserved byte
-/// at offset 15). Not part of the module header's flags byte — so
-/// that adding a permission does not require a module-header ABI bump.
+/// Serialised as a little-endian u16 bitmap into the manifest binary at
+/// offset 15 (bytes 15..17). Widened from u8 once the low 8 bits filled
+/// (DMA took bit 7); `observe` is bit 8. Not part of the module header's
+/// flags byte.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ManifestPermissions {
-    pub bits: u8,
+    pub bits: u16,
 }
 
 /// Permission category bits. Keep in sync with the kernel's
 /// `permission` module in `src/kernel/module/syscalls.rs`.
 pub mod permission {
-    pub const RECONFIGURE: u8 = 1 << 0; // graph slot commit, boot counter, FMP routing
-    pub const FLASH_RAW: u8 = 1 << 1; // flash ERASE / PROGRAM
-    pub const BACKING_PROVIDER: u8 = 1 << 2; // paged-arena / backing-provider registration
-    pub const PLATFORM_RAW: u8 = 1 << 3; // MMIO/DMA/PCIe/SMMU/NIC, raw peripheral register bridges
-    pub const MONITOR: u8 = 1 << 4; // fault monitor BIND/WAIT/ACK/REPORT/RAISE
-    pub const BRIDGE: u8 = 1 << 5; // cross-domain / cross-core dispatch
-    pub const PCIE_DEVICE: u8 = 1 << 6; // kernel-mediated PCIe device bind/config/BAR/MSI
-    pub const DMA: u8 = 1 << 7; // DMA-arena buffer alloc + cache maintenance
+    pub const RECONFIGURE: u16 = 1 << 0; // graph slot commit, boot counter, FMP routing
+    pub const FLASH_RAW: u16 = 1 << 1; // flash ERASE / PROGRAM
+    pub const BACKING_PROVIDER: u16 = 1 << 2; // paged-arena / backing-provider registration
+    pub const PLATFORM_RAW: u16 = 1 << 3; // MMIO/DMA/PCIe/SMMU/NIC, raw peripheral register bridges
+    pub const MONITOR: u16 = 1 << 4; // fault monitor BIND/WAIT/ACK/REPORT/RAISE
+    pub const BRIDGE: u16 = 1 << 5; // cross-domain / cross-core dispatch
+    pub const PCIE_DEVICE: u16 = 1 << 6; // kernel-mediated PCIe device bind/config/BAR/MSI
+    pub const DMA: u16 = 1 << 7; // DMA-arena buffer alloc + cache maintenance
+    pub const OBSERVE: u16 = 1 << 8; // read-only telemetry-ring drain (TLM_SUBSCRIBE/DRAIN/STATS)
 
-    pub fn from_name(s: &str) -> Option<u8> {
+    pub fn from_name(s: &str) -> Option<u16> {
         match s {
             "reconfigure" => Some(RECONFIGURE),
             "flash_raw" => Some(FLASH_RAW),
@@ -463,11 +465,12 @@ pub mod permission {
             "bridge" => Some(BRIDGE),
             "pcie_device" => Some(PCIE_DEVICE),
             "dma" => Some(DMA),
+            "observe" => Some(OBSERVE),
             _ => None,
         }
     }
 
-    pub fn names(bits: u8) -> Vec<&'static str> {
+    pub fn names(bits: u16) -> Vec<&'static str> {
         let mut out = Vec::new();
         if bits & RECONFIGURE != 0 {
             out.push("reconfigure");
@@ -492,6 +495,9 @@ pub mod permission {
         }
         if bits & DMA != 0 {
             out.push("dma");
+        }
+        if bits & OBSERVE != 0 {
+            out.push("observe");
         }
         out
     }
@@ -1672,7 +1678,7 @@ impl Manifest {
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
-        buf.push(self.permissions.bits);
+        buf.extend_from_slice(&self.permissions.bits.to_le_bytes());
 
         // Ports (4 bytes each: direction, content_type, flags, index).
         // Byte 3 is the per-direction port index (0..15) the TOML
@@ -1772,7 +1778,7 @@ impl Manifest {
         let pre_tick_drain = (flags & 0x08) != 0;
         let has_abi_surface = (flags & 0x10) != 0;
         let has_port_capacity = (flags & 0x20) != 0;
-        let permissions_bits = data[15]; // fine-grained permissions bitmap
+        let permissions_bits = u16::from_le_bytes([data[15], data[16]]); // fine-grained permissions bitmap (bytes 15..17)
 
         let expected_size = MANIFEST_HEADER_SIZE
             + port_count * 4
@@ -2387,10 +2393,11 @@ mod tests {
         });
         let bytes = m.to_bytes();
         assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
-        // Section sits after the port records (16 + 2*4), before any hash.
-        assert_eq!(&bytes[24..28], &65536u32.to_le_bytes());
-        assert_eq!(&bytes[32..36], &1048576u32.to_le_bytes());
-        assert_eq!(&bytes[36..40], &16384u32.to_le_bytes());
+        // Section sits after the header + port records (17 + 2*4 = 25),
+        // before any hash.
+        assert_eq!(&bytes[25..29], &65536u32.to_le_bytes());
+        assert_eq!(&bytes[33..37], &1048576u32.to_le_bytes());
+        assert_eq!(&bytes[37..41], &16384u32.to_le_bytes());
         let back = Manifest::from_bytes(&bytes).unwrap();
         assert_eq!(back.ports[0].buffer_size, 65536);
         assert_eq!(back.ports[0].max_record, 0);
@@ -2412,7 +2419,7 @@ mod tests {
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
-        assert_eq!(pb.len(), 16 + 4);
+        assert_eq!(pb.len(), 17 + 4);
         assert!(Manifest::from_bytes(&pb).is_ok());
     }
 

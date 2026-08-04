@@ -2120,7 +2120,7 @@ fn expand_compound_yaml_fields(type_name: &str, module: &Value, config: &Value) 
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "module-entry compilation threads the resolved graph context (config, manifests, modules_dir) plus the precomputed otlp id-table; splitting it into a context struct is a larger refactor than this one additive arg warrants"
+    reason = "module-entry compilation threads the resolved graph context (config, manifests, modules_dir); splitting it into a context struct is a larger refactor than the argument count warrants"
 )]
 fn build_module_entry(
     name: &str,
@@ -2130,7 +2130,6 @@ fn build_module_entry(
     config: &Value,
     modules_dir: &Path,
     manifests: &HashMap<String, Manifest>,
-    otlp_id_table: &str,
 ) -> Result<Vec<u8>> {
     // Start with max possible size, will truncate to actual used size
     let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + MAX_MODULE_PARAMS_SIZE];
@@ -2180,27 +2179,6 @@ fn build_module_entry(
     // into the flat fields the schema knows about before packing.
     let normalized_module = expand_compound_yaml_fields(type_name, module, config);
     let module = &normalized_module;
-
-    // `otlp_http` resolves `(module, id) -> name` on-device to emit real OTLP
-    // metric names. Inject the per-config id-table (built by the caller from
-    // every module's declared `[observability]` instruments, in graph order —
-    // index == runtime self-index) as a `str` param the exporter parses. Done
-    // here, after normalization, so it flows through the same TLV packer as
-    // every other param. Other modules are untouched.
-    let otlp_module;
-    let module = if type_name == "otlp_http" && !otlp_id_table.is_empty() {
-        let mut m = module.clone();
-        if let Some(obj) = m.as_object_mut() {
-            obj.insert(
-                "id_table".to_string(),
-                Value::String(otlp_id_table.to_string()),
-            );
-        }
-        otlp_module = m;
-        &otlp_module
-    } else {
-        module
-    };
 
     // The `heap:` subtree is structurally orthogonal to the schema
     // (it's emitted as protection TLV tags, not schema params), so
@@ -2928,95 +2906,6 @@ fn build_module_entry(
     Ok(entry)
 }
 
-/// Build the observability id-table the `otlp_http` exporter parses on-device:
-/// `module<sep>id=name;` text entries, with `module` the graph index (== runtime
-/// self-index) and `id` the instrument's declaration order in its manifest
-/// `[observability]` table (== the wire id the emitter uses). Metrics use a `:`
-/// separator and spans a `/`, so the two families don't collide in the shared
-/// `(module, id)` space. Returns an empty string if no module is instrumented.
-/// `manifests` is keyed by module instance name.
-fn build_otlp_id_table_text(list: &[Value], manifests: &HashMap<String, Manifest>) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    for (idx, m) in list.iter().enumerate() {
-        if idx >= MAX_MODULES {
-            break;
-        }
-        let Some(name) = m.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(manifest) = manifests.get(name) else {
-            continue;
-        };
-        for (local_id, metric) in manifest.observability.metrics.iter().enumerate() {
-            let _ = write!(out, "{idx}:{local_id}={metric};");
-        }
-        for (local_id, span) in manifest.observability.spans.iter().enumerate() {
-            let _ = write!(out, "{idx}/{local_id}={span};");
-        }
-    }
-    // The `otlp_http` exporter stores the table in a fixed-size buffer whose
-    // bound its manifest declares (already resolved for the target silicon).
-    // Bound the table at a `;` entry boundary so the device never receives a
-    // truncated mid-entry name, and warn rather than silently dropping.
-    if let Some(cap) = otlp_idtable_bound(list, manifests) {
-        if out.len() > cap {
-            let cut = out[..cap].rfind(';').map(|i| i + 1).unwrap_or(0);
-            eprintln!(
-                "warning: observability id-table is {} bytes (> {} cap); names beyond \
-                 the {}-byte boundary won't resolve in otlp_http — reduce instruments \
-                 or raise `[capacities] idtable` in the otlp_http manifest (and its \
-                 `IDTABLE_MAX`)",
-                out.len(),
-                cap,
-                cut
-            );
-            out.truncate(cut);
-        }
-    }
-    out
-}
-
-/// Module type whose state holds the id-table, and the `[capacities]` key it
-/// declares the buffer's size under.
-const OTLP_EXPORTER_TYPE: &str = "otlp_http";
-const OTLP_IDTABLE_CAPACITY: &str = "idtable";
-/// Conservative bound for an exporter whose manifest declares no id-table
-/// capacity: the smallest size any silicon compiles. Under-filling loses
-/// names, over-filling would truncate mid-entry on device.
-const OTLP_IDTABLE_FLOOR: usize = 2048;
-
-/// Size limit for the injected id-table: the smallest capacity declared by an
-/// `otlp_http` instance in this graph. `None` when the graph has no exporter —
-/// nothing consumes the table, so nothing bounds it.
-fn otlp_idtable_bound(list: &[Value], manifests: &HashMap<String, Manifest>) -> Option<usize> {
-    let mut bound: Option<usize> = None;
-    for m in list.iter().take(MAX_MODULES) {
-        let Some(name) = m.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let ty = m.get("type").and_then(|v| v.as_str()).unwrap_or(name);
-        if ty != OTLP_EXPORTER_TYPE {
-            continue;
-        }
-        let cap = match manifests
-            .get(name)
-            .and_then(|man| man.capacities.get(OTLP_IDTABLE_CAPACITY))
-        {
-            Some(v) => *v as usize,
-            None => {
-                eprintln!(
-                    "warning: module '{name}' ({OTLP_EXPORTER_TYPE}) declares no \
-                     `[capacities] {OTLP_IDTABLE_CAPACITY}`; bounding the \
-                     observability id-table at {OTLP_IDTABLE_FLOOR} bytes"
-                );
-                OTLP_IDTABLE_FLOOR
-            }
-        };
-        bound = Some(bound.map_or(cap, |b: usize| b.min(cap)));
-    }
-    bound
-}
 
 fn parse_modules_map(
     modules: &Value,
@@ -3046,12 +2935,6 @@ fn parse_modules_map(
             name_to_idx.entry(n.to_string()).or_insert(idx as u8);
         }
     }
-
-    // Pre-compute the observability id-table once over the canonical module
-    // list, so the `otlp_http` exporter can resolve `(module, id) -> name`
-    // on-device. Empty unless the graph actually instruments something; only
-    // `otlp_http` entries consume it (see `build_module_entry`).
-    let otlp_id_table = build_otlp_id_table_text(list, manifests);
 
     for (idx, module) in list.iter().enumerate() {
         if idx >= MAX_MODULES {
@@ -3133,7 +3016,6 @@ fn parse_modules_map(
             config,
             modules_dir,
             manifests,
-            &otlp_id_table,
         )?;
         entries.push(entry);
         names.push(name.to_string());

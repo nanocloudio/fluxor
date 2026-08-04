@@ -9,8 +9,8 @@
 //
 // Produces OpenTelemetry Protocol JSON (`application/json`, the OTLP/HTTP JSON
 // encoding) for metrics, built incrementally into a caller-owned byte buffer —
-// `no_std`, allocation-free, division-free (PIC link-trap safe). The
-// `otlp_http` exporter wraps the output in an HTTP/1.1 POST to `/v1/metrics`.
+// `no_std`, allocation-free, division-free (PIC link-trap safe). A carrier
+// posts the output as the body of an HTTP/1.1 request to `/v1/metrics`.
 //
 // Shape (flat — one resource, one scope, repeated metric entries; a collector
 // merges same-name metrics):
@@ -348,95 +348,6 @@ const POW10: [u64; 20] = [
     10,
     1,
 ];
-
-// ── id-table resolution ─────────────────────────────────────────────────
-//
-// The `otlp_http` exporter resolves `(module, id) -> name` on-device so it can
-// emit real OTLP instrument names. The table is a text blob the config compiler
-// injects (a `str` param): `module<sep>id=name;` entries, decimal indices. The
-// separator distinguishes the family — `:` for metrics, `/` for spans — so the
-// two never collide in the shared `(module, id)` space. Text keeps the compiled
-// config debuggable and the injection a plain string set.
-
-/// Resolve a metric `(module, id)` to a name (`module:id=name;` entries).
-pub fn resolve_in_table(table: &[u8], module: u16, id: u16) -> Option<&[u8]> {
-    resolve_sep(table, module, id, b':')
-}
-
-/// Resolve a span `(module, name_id)` to a name (`module/id=name;` entries).
-pub fn resolve_span_in_table(table: &[u8], module: u16, id: u16) -> Option<&[u8]> {
-    resolve_sep(table, module, id, b'/')
-}
-
-/// Scan the text table for `module<sep>id=name;`, returning the name slice on a
-/// match or `None`. Entries with a different separator (the other family) are
-/// skipped. Pure (no I/O), so the harness can pin the format.
-fn resolve_sep(table: &[u8], module: u16, id: u16, sep: u8) -> Option<&[u8]> {
-    let mut i = 0usize;
-    while i < table.len() {
-        // Skip any leading separators / whitespace between entries.
-        while i < table.len() && !is_digit(table[i]) {
-            i += 1;
-        }
-        if i >= table.len() {
-            break;
-        }
-        let (m, after_m) = parse_u16(table, i);
-        // Expect the family separator; a mismatch is the other family — skip it.
-        if after_m >= table.len() || table[after_m] != sep {
-            i = skip_entry(table, after_m);
-            continue;
-        }
-        let (entry_id, after_id) = parse_u16(table, after_m + 1);
-        if after_id >= table.len() || table[after_id] != b'=' {
-            i = skip_entry(table, after_id);
-            continue;
-        }
-        let name_start = after_id + 1;
-        let mut name_end = name_start;
-        while name_end < table.len() && table[name_end] != b';' {
-            name_end += 1;
-        }
-        if m == module && entry_id == id {
-            return Some(&table[name_start..name_end]);
-        }
-        i = if name_end < table.len() {
-            name_end + 1
-        } else {
-            name_end
-        };
-    }
-    None
-}
-
-fn is_digit(c: u8) -> bool {
-    c.is_ascii_digit()
-}
-
-/// Parse a decimal u16 starting at `at`; returns (value, index past the
-/// digits). `u16 * 10` needs no 64-bit divide, so this is PIC-safe.
-fn parse_u16(buf: &[u8], at: usize) -> (u16, usize) {
-    let mut v: u16 = 0;
-    let mut i = at;
-    while i < buf.len() && is_digit(buf[i]) {
-        v = v.wrapping_mul(10).wrapping_add((buf[i] - b'0') as u16);
-        i += 1;
-    }
-    (v, i)
-}
-
-/// Advance past the current entry to just after the next ';' (or to the end).
-fn skip_entry(buf: &[u8], from: usize) -> usize {
-    let mut i = from;
-    while i < buf.len() && buf[i] != b';' {
-        i += 1;
-    }
-    if i < buf.len() {
-        i + 1
-    } else {
-        i
-    }
-}
 
 fn hex_nibble(n: u8) -> u8 {
     if n < 10 {

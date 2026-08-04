@@ -157,6 +157,9 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
     provider_query: wasm_syscalls::provider_query,
     provider_close: wasm_syscalls::provider_close,
     channel_peek: wasm_syscalls::channel_peek,
+    // No telemetry ring in the browser host — null gate → the SDK emit helpers
+    // treat telemetry as unconditionally allowed (there is no consumer anyway).
+    telemetry_enabled: core::ptr::null(),
 };
 
 // On wasm32 `module_init_wasm` (in `modules/sdk/runtime/wasm_entry.rs`)

@@ -61,6 +61,11 @@ preferred_console = "console.serial"
 # `[nvme] / [fat32] / [ip] / [sched]` markers without a serial cable.
 telemetry = ["telemetry.monitor_udp"]
 preferred_telemetry = "telemetry.monitor_udp"
-observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load"]
+# `observe.proto_load` is the protocol-agnostic load probe (Wave T3.6.1): same
+# NIC and same DHCP-assigned address as observe.https_load, but the backend
+# picks the protocol from its binding instead of being HTTPS-only. Listed here
+# because it is the same physical capability — a host driving traffic at the
+# board over the network — not a new one.
+observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load", "observe.proto_load"]
 power = ["power.cycle"]
 default_timeout_s = 30

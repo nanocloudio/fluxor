@@ -254,7 +254,7 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "cbd146eb1cb0dd899da42242ef6234333e3ec17bf54996bc19202f86b46d14ed",
+            hex, "be14a62d15d06673bf9c9180f6e9d674e7071355159247e560c6309a29629074",
             "ABI wire-surface changed — see this test's doc comment"
         );
     }

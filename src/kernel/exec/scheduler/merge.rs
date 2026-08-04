@@ -337,7 +337,7 @@ pub struct SchedulerState {
     /// byte 15). Gates privileged 0x0Cxx opcodes by category — see the
     /// `permission` module in `syscalls.rs`. Separate from `required_caps`
     /// so non-contract permissions don't overload the contract bitmask.
-    pub(crate) permissions: [u8; MAX_MODULES],
+    pub(crate) permissions: [u16; MAX_MODULES],
     /// Per-module instance-params blob pointer + length. Populated
     /// by platform loaders that have access to the source bytes —
     /// the wasm loader uses this so modules can fetch their own
@@ -926,7 +926,7 @@ pub fn current_module_required_caps() -> u32 {
 /// Return the fine-grained permission bitmap of the module currently
 /// being stepped. Each bit corresponds to a privileged-opcode category
 /// — see the `permission` module in `syscalls.rs`.
-pub fn current_module_permissions() -> u8 {
+pub fn current_module_permissions() -> u16 {
     let idx = current_module_index();
     // SAFETY: scheduler-thread-only read.
     unsafe { SCHED.permissions[idx] }
@@ -978,7 +978,7 @@ pub fn module_code_region(idx: usize) -> (usize, u32) {
 /// Set the capability class, required_caps, and permissions bitmap for
 /// a module (used by the Linux / bcm2712 platform loaders when they
 /// stage modules from their embedded images).
-pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permissions: u8) {
+pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permissions: u16) {
     if idx >= MAX_MODULES {
         return;
     }

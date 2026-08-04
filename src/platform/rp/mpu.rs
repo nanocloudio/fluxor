@@ -803,7 +803,16 @@ mod rp2350_impl {
         // Full SVC gateway (each syscall traps to kernel) is deferred
         // to a follow-up — the MPU + privilege split already prevents
         // direct kernel memory access, which is the primary isolation goal.
-        *crate::kernel::module::syscalls::get_syscall_table()
+        //
+        // Null the telemetry-enabled pointer for the isolated table: it points
+        // at kernel .bss the MPU does not expose to unprivileged reads, so a
+        // module dereferencing it would fault. Null means "cannot check" — the
+        // SDK then emits unconditionally (the ring still drops when no consumer
+        // is subscribed). The zero-cost gate for isolated modules arrives with
+        // the EL0/MPU read-only telemetry page (§5.1, follow-up).
+        let mut t = *crate::kernel::module::syscalls::get_syscall_table();
+        t.telemetry_enabled = core::ptr::null();
+        t
     }
 }
 

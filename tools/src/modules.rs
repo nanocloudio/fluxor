@@ -50,7 +50,7 @@ pub struct ModuleInfo {
         dead_code,
         reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
     )]
-    pub permissions_bits: u8,
+    pub permissions_bits: u16,
     /// Raw param schema bytes (if module uses define_params! macro)
     pub schema: Option<Vec<u8>>,
     /// Module manifest (always present in ABI v2)
@@ -1481,8 +1481,12 @@ fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
     if start + 4 > data.len() {
         return None;
     }
+    // The count field is a u8, so it bounds itself at 255 — modules legitimately
+    // declare far more than a round-number guess would allow (grove's `effects`
+    // declares 88). An arbitrary cap here rejects the whole schema silently, and
+    // every param and voice blob then packs empty.
     let count = data[start + 3] as usize;
-    if count == 0 || count > 64 {
+    if count == 0 {
         return None;
     }
     let mut pos = start + 4;

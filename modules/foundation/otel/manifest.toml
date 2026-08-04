@@ -1,0 +1,38 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# OTEL export engine (rfc_observability_surface.md §5.5). A telemetry-ring
+# consumer that drains records, batches them, and emits request-ready payloads
+# on `export` for a transport-blind carrier (UDP/UART sender, or a downstream
+# HTTP/gRPC client) to deliver. Encodings: `fxtl-compact` (raw TelemetryRecord
+# batch a host collector decodes) and full on-device `otlp-json` / `otlp-proto`
+# metrics documents. The optional `delivery` input enables reliable mode
+# (retain + resend on RETRY).
+#
+# Requires the read-only `observe` permission to drain the ring
+# (TLM_SUBSCRIBE / TLM_DRAIN).
+permissions = ["observe"]
+
+[[ports]]
+name = "export"
+index = 0
+direction = "output"
+content_type = "OctetStream"
+
+# Optional delivery backchannel (§5.5): a carrier that can report per-batch
+# delivery status (HTTP/gRPC client) wires it so otel retains + retries on a
+# transient failure. Fire-and-forget carriers (UDP/UART) leave it unwired, and
+# otel stays fire-and-forget.
+[[ports]]
+name = "delivery"
+index = 0
+direction = "input"
+content_type = "OctetStream"
+required = false
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+[observability]
+exempt = "exporter — drains the telemetry ring, originates no telemetry of its own"

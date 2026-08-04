@@ -153,7 +153,29 @@ pub struct SyscallTable {
     /// as an opaque buffer reference, not a byte stream); peek
     /// returns `EINVAL` on those.
     pub channel_peek: unsafe extern "C" fn(handle: i32, buf: *mut u8, len: usize) -> i32,
+    /// Producer-side telemetry enabled gate (`rfc_observability_surface.md`
+    /// §5.1). Points at a kernel-published `u32` that is non-zero when at least
+    /// one telemetry consumer is subscribed. The `dev_telemetry_*` helpers read
+    /// it (a plain single-word load, no trap) before building a record, so
+    /// instrumentation is zero-cost when nothing is collecting.
+    ///
+    /// Null means "cannot check", NOT "disabled": a table without the word
+    /// (the wasm host, an isolated module whose protection domain does not map
+    /// kernel memory) emits unconditionally and lets the ring drop when no
+    /// consumer is subscribed. Losing the optimisation is the safe failure;
+    /// losing the records is not.
+    pub telemetry_enabled: *const u32,
 }
+
+// SAFETY: `SyscallTable` was auto-`Sync` before the `telemetry_enabled` raw
+// pointer was added (it is otherwise `fn` pointers + a `u32`). The table is
+// immutable after construction and shared by `&`-reference — the wasm runtime
+// holds it in a `static` (`WASM_SYSCALLS`), and the kernel hands out a shared
+// pointer to every module across cores. `telemetry_enabled` points at a
+// kernel-owned word that is only ever READ through this pointer (a benign
+// single-word load; the kernel writes it atomically), never written here — so
+// sharing the table across threads/cores is sound.
+unsafe impl Sync for SyscallTable {}
 
 // Positional `repr(C)` ABI ratchet. `SyscallTable` is the load-bearing
 // kernel<->module boundary: modules call through it by field *offset*, not
@@ -182,7 +204,8 @@ const _: () = {
     assert!(core::mem::offset_of!(SyscallTable, provider_query) == p * 9);
     assert!(core::mem::offset_of!(SyscallTable, provider_close) == p * 10);
     assert!(core::mem::offset_of!(SyscallTable, channel_peek) == p * 11);
-    assert!(core::mem::size_of::<SyscallTable>() == p * 12);
+    assert!(core::mem::offset_of!(SyscallTable, telemetry_enabled) == p * 12);
+    assert!(core::mem::size_of::<SyscallTable>() == p * 13);
 };
 
 /// Poll event flags (used with `handle_poll` / `channel_poll`).
@@ -337,6 +360,12 @@ pub mod event {
 
 /// Log message. handle=log_level, arg=message, arg_len=message length.
 pub const LOG_WRITE: u32 = 0x0C40;
+/// Write raw bytes to the platform debug serial sink (binary-safe, unlike
+/// LOG_WRITE which UTF-8-filters). arg=bytes, arg_len=count. Returns bytes
+/// accepted. The telemetry `transport_buffer` sink; `platform_raw`-gated. 0x0C66 is
+/// the slot the dispatch comment reserves for "raw UART / USB writes", beside
+/// LOG_RING_DRAIN (0x0C64) / FAN_DIAG_SNAPSHOT (0x0C65).
+pub const SERIAL_WRITE: u32 = 0x0C66;
 /// Poll any handle. handle=fd, arg[0]=events mask. Returns poll result bitmask.
 pub const HANDLE_POLL: u32 = 0x0C41;
 

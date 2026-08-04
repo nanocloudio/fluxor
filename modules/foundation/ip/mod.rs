@@ -319,9 +319,6 @@ pub struct IpState {
     /// the platform workload backend. Graphs without it wired get today's
     /// single-address behaviour, byte-identical. (`rfc_net_identity_metal` §3.2.)
     addr_ctl_chan: i32,
-    /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
-    /// unwired. Cumulative counters are emitted on the tlm cadence.
-    telemetry_chan: i32,
 
     // Net protocol scratch buffer: NET_FRAME_HDR(3) + conn_id(1) + TCP payload.
     net_scratch: [u8; 1600],
@@ -826,7 +823,7 @@ unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8, local_port: u16) -> bo
     // downstream (best-effort `MSG_TRACE_CTX`, right after ACCEPTED) so TLS/HTTP
     // parent their spans under it. One predicate — no clock read, no work — when
     // the telemetry port is unwired, so tracing is zero-cost when disabled.
-    if ok && s.telemetry_chan >= 0 {
+    if ok && dev_telemetry_enabled(&*s.syscalls) {
         let idx = conn_id as usize;
         if idx < tcp::MAX_TCP_CONNS {
             let sys = &*s.syscalls;
@@ -863,7 +860,10 @@ unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) -> bool {
     // full out-queue can't skip it. Only fires for a span that was started
     // (server-accepted, telemetry wired); client connects never set it.
     let idx = conn_id as usize;
-    if s.telemetry_chan >= 0 && idx < tcp::MAX_TCP_CONNS && s.tcp_conns[idx].span_start_us != 0 {
+    if dev_telemetry_enabled(&*s.syscalls)
+        && idx < tcp::MAX_TCP_CONNS
+        && s.tcp_conns[idx].span_start_us != 0
+    {
         emit_conn_span(s, idx);
         s.tcp_conns[idx].span_start_us = 0;
     }
@@ -917,7 +917,7 @@ unsafe fn emit_conn_span(s: &mut IpState, idx: usize) {
     };
     dev_telemetry_span(
         sys,
-        s.telemetry_chan,
+        -1,
         me as u16,
         0, // name_id 0 = tcp.connection
         abi::contracts::telemetry::SPAN_SERVER,
@@ -1312,7 +1312,6 @@ pub unsafe extern "C" fn module_new(
         let sys = &*s.syscalls;
         s.net_in_chan = dev_channel_port(sys, 0, NET_IN_PORT); // in[1]: net commands from consumer
         s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
-        s.telemetry_chan = dev_channel_port(sys, 1, 2); // out[2]: telemetry (optional)
         s.addr_ctl_chan = dev_channel_port(sys, 0, ADDR_CTL_PORT); // in[2]: addr control (optional)
 
         // Self-register as the node's net-identity provider (the kernel-side
@@ -1452,31 +1451,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         // Module-scope telemetry: emit cumulative counters to the `observe`
         // collector when the telemetry port is wired (no-op otherwise). Metric
         // ids follow `[observability].metrics` order: 0 = bytes_in, 1 = bytes_out.
-        if s.telemetry_chan >= 0 {
+        if dev_telemetry_enabled(&*s.syscalls) {
             let tsys = &*s.syscalls;
             let me = dev_self_index(tsys);
             if me >= 0 {
                 let midx = me as u16;
                 let t = dev_micros(tsys);
                 let counter = abi::contracts::telemetry::METRIC_COUNTER;
-                dev_telemetry_metric(
-                    tsys,
-                    s.telemetry_chan,
-                    midx,
-                    t,
-                    counter,
-                    0,
-                    s.tlm.bytes_in as u64,
-                );
-                dev_telemetry_metric(
-                    tsys,
-                    s.telemetry_chan,
-                    midx,
-                    t,
-                    counter,
-                    1,
-                    s.tlm.bytes_out as u64,
-                );
+                dev_telemetry_metric(tsys, -1, midx, t, counter, 0, s.tlm.bytes_in as u64);
+                dev_telemetry_metric(tsys, -1, midx, t, counter, 1, s.tlm.bytes_out as u64);
             }
         }
 

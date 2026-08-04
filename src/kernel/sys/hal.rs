@@ -163,6 +163,12 @@ pub struct HalOps {
     /// Stack-canary check / re-arm around module steps.
     pub stack_canary_check: fn() -> bool,
     pub stack_canary_reinit: fn(),
+    /// Write raw bytes to the platform's debug serial sink (the same UART / USB
+    /// CDC the log ring drains to). Binary-safe (no UTF-8 filtering, unlike the
+    /// log path), so a telemetry `transport_buffer` can push framed records to a host
+    /// collector on network-less targets. Returns bytes accepted; `0` if the sink
+    /// isn't ready or the target has none.
+    pub serial_write: fn(bytes: &[u8]) -> usize,
 }
 
 /// Default `protected_step` for platforms without a protected-call mechanism:
@@ -332,6 +338,13 @@ pub fn now_millis() -> u64 {
 #[inline(always)]
 pub fn now_micros() -> u64 {
     (ops().now_micros)()
+}
+
+/// Write raw bytes to the platform debug serial sink (binary-safe). Returns the
+/// number of bytes accepted.
+#[inline(always)]
+pub fn serial_write(bytes: &[u8]) -> usize {
+    (ops().serial_write)(bytes)
 }
 
 /// Wall-clock milliseconds since the Unix epoch (0 = no RTC on this platform).

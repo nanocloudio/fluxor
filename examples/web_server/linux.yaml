@@ -51,7 +51,7 @@ modules:
     cert_file: "/tmp/server_cert.der"
     key_file:  "/tmp/server_key.der"
 
-  - name: http
+  - name: http_edge
     port: 8443
     host_tcp: 1
     routes:
@@ -71,6 +71,6 @@ wiring:
     to: linux_net.net_in
   # tls ⇄ http (cleartext side)
   - from: tls.clear_out
-    to: http.net_in
-  - from: http.net_out
+    to: http_edge.net_in
+  - from: http_edge.net_out
     to: tls.clear_in
