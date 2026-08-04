@@ -583,25 +583,6 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             package_gate: Some("fluxor-mod-ip"),
         },
         ClippyJob {
-            label: "mod http_edge (host-test)",
-            cwd: "",
-            args: &[
-                "clippy",
-                "--all-targets",
-                "-p",
-                "fluxor-mod-http_edge",
-                "--features",
-                "host-test",
-                "--target",
-                "aarch64-unknown-linux-gnu",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            feature_gate: None,
-            package_gate: Some("fluxor-mod-http_edge"),
-        },
-        ClippyJob {
             label: "mod tls (host-test)",
             cwd: "",
             args: &[

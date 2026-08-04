@@ -9,8 +9,7 @@ complete, runnable configuration — `fluxor validate <yaml>` checks it and
 | Example | Target | What it shows |
 |---|---|---|
 | [`examples/hello/`](../../examples/hello/) | linux | Smallest complete graph — one module, one channel |
-| [`examples/static_server/`](../../examples/static_server/) | pi5, pico2w | `http_edge` serving files off a real filesystem (`fat32` over NVMe or SD) via the FS contract |
-| [`examples/web_server/`](../../examples/web_server/) | linux, pi5 | TLS 1.3 termination in front of `http_edge` — `ip → tls → http_edge` |
+| [`examples/web_server/`](../../examples/web_server/) | linux, pi5 | TLS 1.3 termination in front of `http` — `ip → tls → http` |
 | [`examples/edge_server/`](../../examples/edge_server/) | linux | Route table with proxy and file handlers on a host TCP listener |
 | [`examples/dns_server/`](../../examples/dns_server/) | linux | Authoritative DNS over the datagram surface |
 | [`examples/mqtt_publisher/`](../../examples/mqtt_publisher/) | — | MQTT 3.1.1 client publishing on a cadence |
@@ -68,7 +67,7 @@ Embedded targets (`pi5`, `pico2w`, `waveshare-lcd4`) build a firmware image:
 ```
 make firmware TARGET=pi5
 fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/pi5/firmware.bin examples/static_server/pi5.yaml
+fluxor combine -o kernel8.img target/pi5/firmware.bin examples/web_server/pi5.yaml
 ```
 
 A **wasm** or **split** graph needs an HTTP origin to host the browser side,

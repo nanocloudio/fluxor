@@ -1093,7 +1093,8 @@ impl Manifest {
         // (the source is newer than the published artefact during
         // active development).
         let mut search_roots: Vec<std::path::PathBuf> = Vec::new();
-        search_roots.push(crate::project::root());
+        let project = crate::project::root();
+        search_roots.push(project.clone());
         if let Some(install) = crate::project::install_root() {
             if !search_roots.contains(&install.path) {
                 search_roots.push(install.path);
@@ -1102,6 +1103,14 @@ impl Manifest {
         let cwd = std::env::current_dir().unwrap_or_default();
         if !search_roots.contains(&cwd) {
             search_roots.push(cwd);
+        }
+        // Sibling checkouts last, so an in-tree module always wins a name
+        // clash. See `workspace::member_roots` for why this is a dev
+        // convenience and not a resolution path anything shippable may rely on.
+        for member in crate::workspace::member_roots(&project) {
+            if !search_roots.contains(member) {
+                search_roots.push(member.clone());
+            }
         }
 
         let mut found: Option<Manifest> = None;

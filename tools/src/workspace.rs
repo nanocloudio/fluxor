@@ -64,6 +64,44 @@ pub fn load_workspace() -> Result<Option<Workspace>> {
     Ok(Some(ws))
 }
 
+/// Canonicalised workspace-member roots, excluding the current project.
+///
+/// Module lookup consults these last, so a graph can name a module owned by a
+/// sibling checkout (wave's `http`, say) and still resolve its manifest for
+/// validation. This mirrors what `sync` already does for fmods, which prefer a
+/// member's `target/` artefacts over the registry copy.
+///
+/// The workspace file is user-local and gitignored, so this is a developer
+/// convenience only — never a build dependency. Fluxor must not require its
+/// downstreams to be checked out, and anything that only resolves through this
+/// path will not resolve on a clean clone or in CI.
+///
+/// Cached for the process lifetime: `standard_module_dirs` runs per module
+/// lookup, and re-reading plus re-parsing the file for every module in a graph
+/// is pure waste. A malformed or unreadable file yields an empty list — a
+/// broken dev-local convenience must not fail an otherwise valid build.
+pub fn member_roots(project: &Path) -> &'static [PathBuf] {
+    static ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    let all = ROOTS.get_or_init(|| match load_workspace() {
+        Ok(Some(ws)) => ws
+            .workspace
+            .members
+            .into_iter()
+            .map(|m| m.canonicalize().unwrap_or(m))
+            .collect(),
+        _ => Vec::new(),
+    });
+    // `project` is not part of the cache key: within one invocation the project
+    // root is fixed, and filtering here keeps the cached vector reusable.
+    if all.iter().any(|m| m == project) {
+        // Rare enough (one allocation per process) to leak deliberately rather
+        // than thread a lifetime through every caller.
+        static FILTERED: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+        return FILTERED.get_or_init(|| all.iter().filter(|m| *m != project).cloned().collect());
+    }
+    all
+}
+
 #[derive(Debug, Clone)]
 pub struct MemberStatus {
     pub path: PathBuf,

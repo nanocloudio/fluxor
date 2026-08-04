@@ -394,7 +394,7 @@ shipping today:
 
 | Module | Role |
 |--------|------|
-| `http_edge` | HTTP server / client (request parsing, header handling, body streaming) |
+| `http` (wave) | HTTP server / client (request parsing, header handling, body streaming) |
 | `dns` | DNS resolver and authoritative server |
 | `mqtt` | MQTT 3.1.1 client |
 | `tls` | Channel-to-channel TLS 1.3 transformer |

@@ -152,7 +152,7 @@ HTTP/3) via the mux contract.
 
 ## HTTP/3
 
-HTTP/3 lives alongside h1 and h2 inside `modules/foundation/http_edge/`:
+HTTP/3 lives alongside h1 and h2 inside wave's `http` module:
 
 - `wire_h3.rs` — HTTP/3 frame format (HEADERS, DATA, SETTINGS,
   GOAWAY, etc.).

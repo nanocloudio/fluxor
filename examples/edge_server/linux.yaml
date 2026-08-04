@@ -23,7 +23,7 @@ platform:
   net: {}
 
 modules:
-  - name: http_edge
+  - name: http
     port: 18080
     host_tcp: 1
     routes:
@@ -38,6 +38,6 @@ modules:
 
 wiring:
   - from: linux_net.net_out
-    to: http_edge.net_in
-  - from: http_edge.net_out
+    to: http.net_in
+  - from: http.net_out
     to: linux_net.net_in

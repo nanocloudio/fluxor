@@ -104,6 +104,9 @@ const STANDARD_MODULE_SUBDIRS: &[&str] = &[
 ///      first so a local module shadows the bundled one.
 ///   2. `<install_root>/<standard subdirs>` — bundled fallback
 ///      when the install root differs from the project root.
+///   3. `<workspace member>/<standard subdirs>` — sibling checkouts,
+///      last so they never shadow an in-tree module. Dev-only; see
+///      `workspace::member_roots`.
 ///
 /// Returns absolute paths in priority order. Non-existent entries
 /// are kept (the manifest loader skips them) so a missing
@@ -124,6 +127,17 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
             }
         }
     }
+    // Sibling checkouts last, so an in-tree module always wins a name clash.
+    // See `workspace::member_roots` for why this is a dev convenience and not
+    // a resolution path anything shippable may rely on.
+    for member in crate::workspace::member_roots(&project) {
+        for sub in STANDARD_MODULE_SUBDIRS {
+            let p = member.join(sub);
+            if p.is_dir() && !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
     dirs
 }
 
@@ -138,7 +152,8 @@ fn standard_module_dirs() -> Vec<std::path::PathBuf> {
 ///      ordered*: an entry earlier in the list shadows a later one.
 ///   2. **`standard_module_dirs()`** — the bundled subtree layout
 ///      (`modules/drivers`, `modules/foundation`, ...) under the
-///      project root, then under the install root.
+///      project root, then the install root, then any workspace
+///      member checkout.
 ///
 /// Returns the first hit (`<dir>/<type_name>` whose directory
 /// exists). Centralising the lookup keeps the manifest loader

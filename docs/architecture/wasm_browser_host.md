@@ -163,7 +163,7 @@ host_ws_recv(handle: i32, buf: *mut u8, len: usize) -> i32       // bytes writte
 // source and the wasm-target FS provider (`src/platform/wasm/fs.rs`),
 // which fronts FS_CONTRACT (FS_OPEN / FS_READ / FS_CLOSE) on top of
 // `fetch()` so any module that uses the FS contract on bare-metal
-// (media_loader, foundation/http_edge file routes, …) works on wasm
+// (media_loader, wave's http file routes, …) works on wasm
 // without channel plumbing for asset ingest.
 host_fetch_open(url_ptr: *const u8, url_len: usize) -> i32       // request handle
 host_fetch_recv(handle: i32, buf: *mut u8, len: usize) -> i32    // bytes written
