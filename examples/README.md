@@ -1,8 +1,7 @@
 # `examples/` — onboarding catalog
 
-One demo per capability, each organized into its own directory with
-platform-named YAML files. Each example has a short `README.md`
-that says exactly what it teaches.
+One demo per capability, each in its own directory with platform-named YAML
+files. Each example has a short `README.md` saying exactly what it teaches.
 
 ## Layout
 
@@ -13,53 +12,36 @@ examples/<capability>/
   assets/                  # demo-specific media (when needed)
 ```
 
-## Capability groups
-
-### Hello, fluxor — minimal smoke per target
+## The examples
 
 | Example | Targets | Teaches |
 | --- | --- | --- |
-| [`hello/`](hello/) | pi5 | "Kernel boots; UART works" — the smoke test that survives without network. |
-| [`web_server/`](web_server/) | linux, pi5 | Canonical HTTP / HTTPS / WS / HTTP/2 surface. |
-| [`led_patterns/`](led_patterns/) | pico2w, picow | GPIO + sequencer + button input on RP boards. |
-| [`midi_echo/`](midi_echo/) | linux, wasm, pico2w | MIDI input/output surface (stubs today). |
-
-### Media
-
-| Example | Targets | Teaches |
-| --- | --- | --- |
-| [`image_viewer/`](image_viewer/) | linux, wasm, pi5, waveshare-lcd4 | Codec + bank + multiple sink platforms. |
-| [`audio_player/`](audio_player/) | linux, wasm, pico2w, picow, pi5 | Same shape for audio — codec-driven file playback. |
-
-### Network
-
-| Example | Targets | Teaches |
-| --- | --- | --- |
-| [`quic_loopback/`](quic_loopback/) | linux | QUIC server + client + sequencer-driven periodic data, all in one process. |
-| [`dns_server/`](dns_server/) | pico2w | Authoritative DNS resolver. |
-| [`mqtt_publisher/`](mqtt_publisher/) | pico2w | Sensor → MQTT publish pattern. |
+| [`hello/`](hello/) | linux, pi5 | "Kernel boots; UART works" — the smoke test that survives without network. `bundle/` is the same graph packaged as a workload bundle. |
+| [`dns_server/`](dns_server/) | pico2w | Authoritative DNS over the datagram surface. |
 | [`log_net/`](log_net/) | pi5 | Netconsole — kernel log ring over UDP, with optional monitor overlay. |
-
-### Storage
-
-| Example | Targets | Teaches |
-| --- | --- | --- |
-| [`static_server/`](static_server/) | pico2w (SD-FAT32), pi5 (NVMe-FAT32) | HTTP file serving from FAT32 storage. |
-
-### Embedded / advanced
-
-| Example | Targets | Teaches |
-| --- | --- | --- |
-| [`button_control/`](button_control/) | pico2w | GPIO button → gesture → action wiring. |
-| [`synth/`](synth/) | pico2w, picow | Multi-voice tonal synthesizer; button cycles voices. |
-| [`drums/`](drums/) | pico2w | TR-808-style synthesized percussion. |
+| [`owner_status/`](owner_status/) | linux | Two co-resident owners in one runtime; a fault in one terminates only that owner. |
 | [`packet_filter/`](packet_filter/) | pi5 | L2 packet filtering with custom accept rules (rp1_gem + eth_parser + pkt_filter chain). |
 
-> **Wasm runtime?** Any graph with `target: wasm` runs entirely in
-> the browser. The scenario synthesiser auto-mounts the wasm host
-> (HTML shell + JS shims + the `.wasm` bundle + scenario.json) when
-> you `fluxor run examples/<capability>/wasm.yaml`; no separate
-> "serve a wasm bundle" example needed. See
+`packet_filter/pi5.yaml` currently fails validation on an unrelated `rp1_gem`
+pre-tick-drain / domain-tier conflict; the graph is still the reference for
+NIC-path inspection.
+
+## Examples that live in sibling repositories
+
+Fluxor ships the runtime, the foundation modules and the drivers. Application
+modules live alongside their own graphs: [wave](../../wave) owns the protocol
+modules (`http`, `ws_stream`, `rtp`, `sip`), [spectra](../../spectra) the
+codecs, [grove](../../grove) synthesis and effects.
+
+A graph naming a module this repo does not contain cannot validate against a
+clean checkout, so those examples ship where their modules do — HTTP and HTTPS
+serving, WebSocket and QUIC demos, media playback, synthesis and percussion,
+MQTT publishing, and the LED/button/sequencer patterns.
+
+> **Wasm runtime?** Any graph with `target: wasm` runs entirely in the browser.
+> The scenario synthesiser auto-mounts the wasm host (HTML shell + JS shims +
+> the `.wasm` bundle + scenario.json) when you `fluxor run <graph>.yaml`; no
+> separate "serve a wasm bundle" example is needed. See
 > [`../src/platform/wasm/host/README.md`](../src/platform/wasm/host/README.md)
 > for the runtime contract.
 
@@ -81,15 +63,12 @@ fluxor combine -o kernel8.img target/<platform>/firmware.bin examples/<capabilit
 ## Where media lives
 
 Per-example assets live with the example: `examples/<capability>/assets/<file>`.
-The asset bank, `host_asset_source`, and similar loaders all resolve
-paths relative to the YAML's directory. See the root [README.md](../README.md)
-for the full convention.
+The asset bank, `host_asset_source`, and similar loaders all resolve paths
+relative to the YAML's directory. See the root [README.md](../README.md) for
+the full convention.
 
 ## What's *not* in here
 
-The [`test_harness/`](test_harness/) sub-tree holds smoke tests, perf
-probes, bringup validators, and codec coverage matrices. Those are
-loaded by `make test` and the hardware rig — they're not meant to be
-browsed as examples. If you find yourself looking for "the variant
-of `nvme_perf` that uses 4 queues," it's almost certainly in
-`test_harness/pi5/`.
+The `test_harness/` sub-tree holds smoke tests, perf probes, bringup
+validators, and codec coverage matrices. Those are loaded by `make test` and
+the hardware rig — they are not meant to be browsed as examples.

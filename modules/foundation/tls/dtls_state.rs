@@ -707,7 +707,7 @@ unsafe fn dtls_emit_ack(s: &mut TlsState, idx: usize, acked: (u64, u64)) {
     dtls_send_datagram(
         sys,
         s.cipher_out,
-        s.dtls_listen_ep,
+        &s.dtls_endpoint,
         &peer,
         &out[..n],
         &mut s.net_scratch,
@@ -804,7 +804,7 @@ unsafe fn dtls_drain_outbound(s: &mut TlsState, idx: usize) {
         dtls_send_datagram(
             sys,
             s.cipher_out,
-            s.dtls_listen_ep,
+            &s.dtls_endpoint,
             &peer,
             &datagram[..n],
             &mut s.net_scratch,
@@ -841,59 +841,28 @@ unsafe fn dtls_drain_outbound(s: &mut TlsState, idx: usize) {
     }
 }
 
+/// Emit one datagram (`CMD_DG_SEND_TO`) toward `peer` via the shared
+/// `datagram_endpoint` core. No-ops until the endpoint is bound.
 unsafe fn dtls_send_datagram(
     sys: &SyscallTable,
     net_out: i32,
-    ep: i16,
+    ep: &DatagramEndpoint,
     peer: &PeerAddr,
     bytes: &[u8],
     scratch: &mut [u8; NET_SCRATCH_SIZE],
 ) {
-    // CMD_DG_SEND_TO IPv4 (modules/sdk/contracts/net/datagram.rs):
-    //   [opcode 0x21][len LE u16][ep_id:1][af:1=4][addr:4 BE][port:2 LE][payload]
-    if ep < 0 {
-        return;
-    }
-    let payload_len = 1 + 1 + 4 + 2 + bytes.len();
-    let frame_len = 3 + payload_len;
-    if frame_len > scratch.len() {
-        return;
-    }
-    scratch[0] = DG_CMD_SEND_TO;
-    scratch[1] = payload_len as u8;
-    scratch[2] = (payload_len >> 8) as u8;
-    scratch[3] = ep as u8;
-    scratch[4] = DG_AF_INET;
-    scratch[5] = peer.ip[0];
-    scratch[6] = peer.ip[1];
-    scratch[7] = peer.ip[2];
-    scratch[8] = peer.ip[3];
-    scratch[9] = (peer.port & 0xFF) as u8;
-    scratch[10] = (peer.port >> 8) as u8;
-    core::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.as_mut_ptr().add(11), bytes.len());
-    (sys.channel_write)(net_out, scratch.as_ptr(), frame_len);
-}
-
-unsafe fn dtls_send_bind(s: &mut TlsState) {
-    let sys = &*s.syscalls;
-    // CMD_DG_BIND payload (modules/sdk/contracts/net/datagram.rs):
-    //   [port: u16 LE] [flags: u8].
-    let payload: [u8; 3] = [
-        (s.dtls_port & 0xFF) as u8,
-        (s.dtls_port >> 8) as u8,
-        0,
-    ];
-    let frame_len = 3 + payload.len();
-    let mut frame = [0u8; 8];
-    frame[0] = DG_CMD_BIND;
-    frame[1] = payload.len() as u8;
-    frame[2] = (payload.len() >> 8) as u8;
-    let mut i = 0;
-    while i < payload.len() {
-        frame[3 + i] = payload[i];
-        i += 1;
-    }
-    (sys.channel_write)(s.cipher_out, frame.as_ptr(), frame_len);
+    // `peer.ip` is wire-order octets; `send_to` re-serialises via `to_be_bytes`.
+    let dst_ip = u32::from_be_bytes(peer.ip);
+    ep.send_to(
+        sys,
+        net_out,
+        dst_ip,
+        peer.port,
+        bytes.as_ptr(),
+        bytes.len(),
+        scratch.as_mut_ptr(),
+        NET_SCRATCH_SIZE,
+    );
 }
 
 unsafe fn dtls_discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
@@ -914,11 +883,10 @@ unsafe fn dtls_discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
     let sys = &*s.syscalls;
 
-    if !s.dtls_bound {
-        dtls_send_bind(s);
-        s.dtls_bound = true;
-        return 1;
-    }
+    // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,
+    // with backoff/retry. MSG_DG_BOUND is consumed in the recv loop below.
+    s.dtls_endpoint
+        .poll_bind(sys, s.cipher_out, s.dtls_port, s.net_scratch.as_mut_ptr(), NET_SCRATCH_SIZE);
 
     // Retry any DTLS peer-identity envelopes that couldn't ship
     // at handshake completion because the consumer was backed
@@ -984,7 +952,7 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
                 dtls_send_datagram(
                     sys,
                     s.cipher_out,
-                    s.dtls_listen_ep,
+                    &s.dtls_endpoint,
                     &peer,
                     &buf[record_off..record_off + rec_len],
                     &mut s.net_scratch,
@@ -998,7 +966,7 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
     }
 
     // Client mode: kick off the handshake on the first tick after bind.
-    if s.mode == 0 && !s.dtls_client_started && s.dtls_listen_ep >= 0 {
+    if s.mode == 0 && !s.dtls_client_started && s.dtls_endpoint.is_ready() {
         let ip_bytes = s.dtls_peer_ip.to_le_bytes();
         let ip = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
         if let Some(idx) = dtls_alloc_client_session(s, &ip, s.dtls_peer_port) {
@@ -1049,8 +1017,10 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
                     }
                     if take >= 3 {
                         let bound_port = (buf[1] as u16) | ((buf[2] as u16) << 8);
-                        if bound_port == s.dtls_port && s.dtls_listen_ep < 0 {
-                            s.dtls_listen_ep = buf[0] as i16;
+                        // Port-filter our own BOUND off the (possibly broadcast)
+                        // channel, then hand the ep_id to the endpoint.
+                        if bound_port == s.dtls_port && !s.dtls_endpoint.is_ready() {
+                            s.dtls_endpoint.on_bound(buf[0]);
                             dev_log(sys, 3, b"[dtls] bound".as_ptr(), b"[dtls] bound".len());
                         }
                     }
@@ -1061,13 +1031,13 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
                     if payload_len >= 8 {
                         let mut hdr_buf = [0u8; 8];
                         (sys.channel_read)(s.cipher_in, hdr_buf.as_mut_ptr(), 8);
-                        let ep_id = hdr_buf[0] as i16;
+                        let ep_id = hdr_buf[0];
                         let ip = [hdr_buf[2], hdr_buf[3], hdr_buf[4], hdr_buf[5]];
                         let port = (hdr_buf[6] as u16) | ((hdr_buf[7] as u16) << 8);
                         let dgram_len = payload_len - 8;
                         // Drop datagrams routed to a different consumer's
                         // endpoint on the shared net_out channel.
-                        if ep_id != s.dtls_listen_ep {
+                        if !s.dtls_endpoint.owns(ep_id) {
                             dtls_discard_bytes(sys, s.cipher_in, dgram_len);
                             return 1;
                         }

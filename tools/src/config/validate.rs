@@ -962,3 +962,149 @@ fn resolve_edge_buffer_bytes(config: &Value) -> Vec<u32> {
     out
 }
 
+/// Contracts that tolerate more than one provider in a single graph
+/// because callers fan through them via the `CHAIN_NEXT` flag rather
+/// than letting the last registration win. Nothing declares
+/// chain-awareness today — `CHAIN_NEXT` is defined but unset by every
+/// module — so this list is empty and every duplicate provider is an
+/// error. It exists so the rule has a documented escape hatch rather than
+/// an invented user.
+const CHAIN_AWARE_PROVIDES: &[&str] = &[];
+
+/// Surfaces that are NOT routed by class-byte contract dispatch, so multiple
+/// providers of them do NOT shadow. `storage.block` is exposed through
+/// per-driver block-IO ioctls on each driver's own channels (wired by port
+/// name, e.g. `nvme.blocks -> fat32.blocks`), never through a single class
+/// byte — so an SD card + a flash blob store both providing `storage.block`
+/// is a legitimate composition, not a silent shadow. The single-provider
+/// rule targets class-byte dispatch shadowing (FS / storage.namespace /
+/// storage.object), so these are exempt.
+const NON_DISPATCH_SURFACES: &[&str] = &["storage.block"];
+
+/// The per-module `volume:` param — the instance selector that keys an
+/// FS/namespace provider. Empty string = the default (unkeyed) provider.
+/// Two providers of one surface may coexist ONLY with distinct selectors:
+/// the kernel reaches each keyed volume via `provider_call_sel` and the
+/// `mount` module routes paths to them.
+///
+/// The literal key `"volume"` mirrors the provider module's own selector
+/// param (`fat32`'s `define_params!` tag `volume`, which feeds
+/// `module_provider_selector`) — a rename must touch both sides.
+fn provider_volume<'a>(config: &'a Value, name: &str) -> &'a str {
+    config
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
+        })
+        .and_then(|e| e.get("params"))
+        .and_then(|p| p.get("volume"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// Reject a graph in which two modules provide the same contract surface
+/// (a `provides = [..]` entry) with the SAME instance selector.
+///
+/// Contract providers are auto-registered by the loader after each module
+/// reaches Ready, in module-index order. The class-byte dispatch path
+/// takes the top-most unkeyed (selector 0) layer, and a second unkeyed
+/// provider of the same surface silently shadows the first: two `fat32`
+/// volumes without distinct `volume:` selectors do not resolve by path —
+/// every `FS_OPEN` reaches the same one and the other drive is
+/// unreachable. This turns that into a build error, naming both modules.
+///
+/// Multiple providers of one surface ARE allowed when each declares a
+/// distinct `volume:` selector: they register as instance-keyed layers a
+/// `mount` module binds and routes between. The escape hatch
+/// `CHAIN_AWARE_PROVIDES` (empty today) additionally exempts a contract
+/// whose callers fan through `CHAIN_NEXT`.
+pub fn validate_single_provider(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    // (surface, selector) -> first module declaring it. A later module
+    // with the SAME (surface, selector) would shadow it at runtime.
+    let mut seen: HashMap<(&str, &str), &str> = HashMap::new();
+    for name in module_names {
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
+        let sel = provider_volume(config, name);
+        for surface in &m.provides {
+            if CHAIN_AWARE_PROVIDES.contains(&surface.as_str())
+                || NON_DISPATCH_SURFACES.contains(&surface.as_str())
+            {
+                continue;
+            }
+            let key = (surface.as_str(), sel);
+            match seen.get(&key) {
+                None => {
+                    seen.insert(key, name.as_str());
+                }
+                Some(earlier) if *earlier == name.as_str() => {}
+                Some(earlier) => {
+                    let detail = if sel.is_empty() {
+                        format!(
+                            "both are default (unkeyed) `{surface}` providers, so `{name}` silently \
+                             shadows `{earlier}` at runtime — whatever `{earlier}` backs becomes \
+                             unreachable with no diagnostic. Give each a distinct `volume:` param \
+                             and route between them with a `mount` module, or split them across \
+                             graphs."
+                        )
+                    } else {
+                        format!(
+                            "both declare `volume = \"{sel}\"` for `{surface}`, so their provider \
+                             registrations collide. Give each volume backend a distinct `volume:`."
+                        )
+                    };
+                    return Err(Error::Config(format!(
+                        "two modules provide the contract `{surface}`: `{earlier}` and `{name}` — {detail}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // A surface whose providers are ALL instance-keyed has no router: the
+    // class-byte (`handle == -1`) path that every `requires_contract` consumer
+    // uses resolves to nothing, and the kernel answers ENOSYS. Catch it here,
+    // where both the module names and the fix are in hand.
+    let mut keyed: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut has_default: HashMap<&str, bool> = HashMap::new();
+    for name in module_names {
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
+        let sel = provider_volume(config, name);
+        for surface in &m.provides {
+            if CHAIN_AWARE_PROVIDES.contains(&surface.as_str())
+                || NON_DISPATCH_SURFACES.contains(&surface.as_str())
+            {
+                continue;
+            }
+            if sel.is_empty() {
+                has_default.insert(surface.as_str(), true);
+            } else {
+                keyed.entry(surface.as_str()).or_default().push(name.as_str());
+            }
+        }
+    }
+    for (surface, backends) in keyed {
+        if has_default.get(surface).copied().unwrap_or(false) {
+            continue;
+        }
+        let list = backends.join("`, `");
+        return Err(Error::Config(format!(
+            "every provider of `{surface}` is instance-keyed (`{list}`) and none is the \
+             default — a consumer calling this contract without naming a volume has \
+             nothing to route it, and the kernel returns ENOSYS. Add a router that \
+             provides `{surface}` with no `volume:` (the `mount` module), or drop \
+             `volume:` from the single backend that should serve it."
+        )));
+    }
+    Ok(())
+}
+

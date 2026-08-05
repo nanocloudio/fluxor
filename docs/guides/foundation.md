@@ -42,11 +42,12 @@ data came from, it has crossed the line into being a driver.
 The foundation layer covers:
 
 - **Storage and filesystems** (`fat32`)
-- **Networking** (`ip`, `dns`, `dhcp`, `mqtt`, `http`, `tls`, `mesh`)
+- **Networking** (`ip`, `dns`, `dhcp`, `tls`) — application-protocol clients
+  (`http`, `mqtt`, …) live in sibling projects (wave, quantum)
 - **Network-plane hygiene** (`conn_guard` for per-source-IP SYN
   admission, `demux` for 4-tuple hashed fan-out to replicated IP
   lanes, `pkt_filter` for stateless rule-based filtering)
-- **Protocol clients and servers** (`mqtt`, `http`, `dns`)
+- **Protocol clients and servers** (`dns`; `http` in wave, `mqtt` in quantum)
 - **Media and session orchestration** (audio format normalization,
   control plane bridges)
 

@@ -40,7 +40,7 @@ one.
    the same channel surface.
 
 4. **Consumer modules speak net_proto, not sockets.** HTTP, DNS, MQTT,
-   RTP, TLS, and mesh modules each have a channel pair to the IP
+   RTP and TLS modules each have a channel pair to the IP
    module. They send typed framed messages (`CMD_BIND`, `CMD_CONNECT`,
    `CMD_SEND`) and receive typed framed messages (`MSG_DATA`,
    `MSG_ACCEPTED`, `MSG_CLOSED`) over that channel pair. There is no
@@ -65,7 +65,7 @@ one.
 ```
 +------------------------------------------------------------------+
 |                      Application Modules                         |
-|                (HTTP, DNS, MQTT, RTP, TLS, mesh)                 |
+|                (HTTP, DNS, MQTT, RTP, TLS)                 |
 |                                                                  |
 |  Each module has a channel pair to the IP module.                |
 |  Frames carry the net_proto TLV protocol.                        |
@@ -396,9 +396,8 @@ shipping today:
 |--------|------|
 | `http` (wave) | HTTP server / client (request parsing, header handling, body streaming) |
 | `dns` | DNS resolver and authoritative server |
-| `mqtt` | MQTT 3.1.1 client |
+| `mqtt` | MQTT 3.1.1 client (now `mqtt_client` in quantum) |
 | `tls` | Channel-to-channel TLS 1.3 transformer |
-| `mesh` | MQTT-bridged mesh transport |
 
 Every one of these modules opens a channel pair to the IP (or TLS) module
 in its config wiring and exchanges net_proto frames. None of them call a

@@ -412,3 +412,25 @@ unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
     (sys.provider_call)(chan, 0x0A03, core::ptr::null_mut(), 0)
 }
 
+/// Call an instance-keyed provider selected by name (`sel`, a short volume
+/// string). The contract is the opcode's class byte, so the `mount` policy
+/// module names the target volume inline on every op. `op_handle` carries
+/// the op's OWN handle (`-1` for open-style ops, or a provider-local slot);
+/// `sel` is purely routing. Returns the provider's result, or negative
+/// errno (`EINVAL` / `ENODEV` when no layer carries that selector).
+#[allow(
+    dead_code,
+    reason = "consumed by the mount policy module; not every module routes by selector"
+)]
+#[inline(always)]
+unsafe fn dev_provider_call_sel(
+    sys: &SyscallTable,
+    sel: &[u8],
+    op_handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    (sys.provider_call_sel)(sel.as_ptr(), sel.len(), op_handle, op, arg, arg_len)
+}
+

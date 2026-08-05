@@ -42,7 +42,7 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 // Shared UDP datagram-endpoint lifecycle + send (also used by `transport_buffer`).
-include!("../../sdk/cores/dgram_egress.rs");
+include!("../../sdk/cores/datagram_endpoint.rs");
 
 // ============================================================================
 // Constants
@@ -75,10 +75,10 @@ struct LogNetState {
     dst_port: u16,
     bind_port: u16,
 
-    /// Shared datagram-endpoint lifecycle + send (`dgram_egress` core). Owns the
+    /// Shared datagram-endpoint lifecycle + send (`datagram_endpoint` core). Owns the
     /// bind handshake, ep_id, and backoff — the same machine `transport_buffer`
     /// uses, so it lives in one place.
-    egress: DgramEgress,
+    endpoint: DatagramEndpoint,
     /// One-shot flag so a disabled (dst unset/broadcast) endpoint warns once.
     disabled_warned: u8,
 
@@ -107,7 +107,7 @@ impl LogNetState {
         self.dst_ip = 0;
         self.dst_port = 6666;
         self.bind_port = 6667;
-        self.egress = DgramEgress::new();
+        self.endpoint = DatagramEndpoint::new();
         self.disabled_warned = 0;
         self.pending_len = 0;
         self.datagrams_sent = 0;
@@ -144,11 +144,11 @@ mod params_def {
 // ============================================================================
 
 /// Send `payload` to the configured unicast destination via the shared
-/// `dgram_egress` core (one `CMD_DG_SEND_TO` datagram). Returns true iff the
-/// channel accepted it. Caller must have observed `egress.is_ready()`.
+/// `datagram_endpoint` core (one `CMD_DG_SEND_TO` datagram). Returns true iff the
+/// channel accepted it. Caller must have observed `endpoint.is_ready()`.
 unsafe fn emit_datagram(s: &mut LogNetState, payload: *const u8, payload_len: usize) -> bool {
     let sys = &*s.syscalls;
-    let n = s.egress.send(
+    let n = s.endpoint.send_to(
         sys,
         s.net_out_chan,
         s.dst_ip,
@@ -240,7 +240,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         // Drive the shared datagram-endpoint lifecycle (bind handshake + backoff);
         // forward only once the endpoint is bound.
-        let ready = s.egress.poll(
+        let ready = s.endpoint.poll(
             sys,
             s.net_out_chan,
             s.net_in_chan,
@@ -249,7 +249,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.net_buf.as_mut_ptr(),
             NET_BUF_SIZE,
         );
-        if s.egress.is_disabled() && s.disabled_warned == 0 {
+        if s.endpoint.is_disabled() && s.disabled_warned == 0 {
             let msg = if s.dst_ip == 0 {
                 b"[log_net] dst_ip unset; UDP log forwarding disabled".as_ref()
             } else {

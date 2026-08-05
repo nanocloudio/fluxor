@@ -48,6 +48,10 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
+// Bound-endpoint bind lifecycle + addressed send, shared with log_net /
+// transport_buffer / quic / dtls. dns composes two: server (port 53) + upstream
+// (ephemeral), demuxed by ep_id on one channel.
+include!("../../sdk/cores/datagram_endpoint.rs");
 
 // ============================================================================
 // Constants
@@ -87,19 +91,6 @@ const PENDING_TIMEOUT_MS: u32 = 5000;
 
 /// Maximum domain name length
 const MAX_NAME_LEN: usize = 63;
-
-/// DNS server/proxy lifecycle phases.
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
-enum DnsPhase {
-    Init = 0,
-    BindingServer = 1,
-    WaitBoundServer = 2,
-    BindingUpstream = 3,
-    WaitBoundUpstream = 4,
-    Serving = 5,
-    Error = 255,
-}
 
 // ============================================================================
 // Parameter Definitions
@@ -208,15 +199,15 @@ struct DnsState {
     upstream_port: u16,
     ttl: u32,
     listen_port: u16,
-    phase: DnsPhase,
     host_count: u8,
 
-    /// Endpoint IDs assigned by the IP module via MSG_DG_BOUND.
-    /// `server_ep` is bound to `listen_port`; `upstream_ep` is bound to an
-    /// ephemeral port and used only to send to / receive from the upstream
-    /// DNS server. Both values start as `0xFF` to distinguish unallocated.
-    server_ep: u8,
-    upstream_ep: u8,
+    /// Datagram endpoints (shared `datagram_endpoint` core). `server_ep` binds
+    /// `listen_port` for client queries; `upstream_ep` binds an ephemeral port
+    /// to forward to / receive from the upstream DNS server. They share one
+    /// channel and are demuxed by the provider-assigned ep_id; bound
+    /// sequentially (server, then upstream).
+    server_ep: DatagramEndpoint,
+    upstream_ep: DatagramEndpoint,
 
     // Statistics
     queries_local: u32,
@@ -253,10 +244,9 @@ impl DnsState {
         self.upstream_port = 53;
         self.ttl = 300;
         self.listen_port = 53;
-        self.phase = DnsPhase::Init;
         self.host_count = 0;
-        self.server_ep = 0xFF;
-        self.upstream_ep = 0xFF;
+        self.server_ep = DatagramEndpoint::new();
+        self.upstream_ep = DatagramEndpoint::new();
         self.queries_local = 0;
         self.queries_forwarded = 0;
         self.tlm = TlmCounters::new();
@@ -299,11 +289,6 @@ unsafe fn fnv1a_lower(data: *const u8, len: usize) -> u32 {
 #[inline(always)]
 unsafe fn log_info(s: &DnsState, msg: &[u8]) {
     dev_log(s.sys(), 3, msg.as_ptr(), msg.len());
-}
-
-#[inline(always)]
-unsafe fn log_err(s: &DnsState, msg: &[u8]) {
-    dev_log(s.sys(), 1, msg.as_ptr(), msg.len());
 }
 
 /// Parse a "hostname=ip" string and add to host table.
@@ -714,51 +699,23 @@ unsafe fn build_nxdomain(
     copy_len
 }
 
-/// Emit a datagram CMD_DG_SEND_TO frame from `ep_id` to an IPv4 dst.
-///
-/// Frame layout:
-///   `[0x21][len:2 LE][ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]`
-///
-/// Uses raw state pointer to access net_buf independently of any &mut
-/// borrow, since the received frame data has already been consumed by
-/// caller.
-unsafe fn dg_send_to_v4(
+/// Send `dns_data[..dns_len]` from `ep` to an IPv4 dst via the shared
+/// `datagram_endpoint` core, bumping the module's `bytes_out` counter on a
+/// successful (whole-datagram) write. Uses the raw state pointer so `net_buf`
+/// (the framing scratch) is reachable independently of any live borrow.
+unsafe fn dg_send_from(
     state: *mut DnsState,
-    ep_id: u8,
+    ep: &DatagramEndpoint,
     dst_ip: u32,
     dst_port: u16,
     dns_data: *const u8,
     dns_len: usize,
 ) {
+    let sys = &*(*state).syscalls;
     let net_out = (*state).net_out_chan;
-    let sys = (*state).syscalls;
-    if net_out < 0 || ep_id == 0xFF { return; }
-    let payload_len = DG_V4_PREFIX + dns_len;
-    let total = NET_FRAME_HDR + payload_len;
-    if total > NET_BUF_SIZE { return; }
-
     let buf = (*state).net_buf.as_mut_ptr();
-
-    *buf = DG_CMD_SEND_TO;
-    let pl = (payload_len as u16).to_le_bytes();
-    *buf.add(1) = pl[0];
-    *buf.add(2) = pl[1];
-    *buf.add(3) = ep_id;
-    *buf.add(4) = DG_AF_INET;
-    let ip_bytes = dst_ip.to_be_bytes();
-    *buf.add(5) = ip_bytes[0]; *buf.add(6) = ip_bytes[1];
-    *buf.add(7) = ip_bytes[2]; *buf.add(8) = ip_bytes[3];
-    let port_bytes = dst_port.to_le_bytes();
-    *buf.add(9) = port_bytes[0]; *buf.add(10) = port_bytes[1];
-
-    let mut i = 0;
-    while i < dns_len {
-        *buf.add(DG_V4_PREFIX + NET_FRAME_HDR + i) = *dns_data.add(i);
-        i += 1;
-    }
-
-    let written = ((*sys).channel_write)(net_out, buf, total);
-    if written > 0 {
+    let n = ep.send_to(sys, net_out, dst_ip, dst_port, dns_data, dns_len, buf, NET_BUF_SIZE);
+    if n > 0 {
         (*state).tlm.bytes_out = (*state).tlm.bytes_out.wrapping_add(dns_len as u32);
     }
 }
@@ -887,8 +844,7 @@ unsafe fn send_server_reply(
     dns_data: *const u8,
     dns_len: usize,
 ) {
-    let ep = (*state).server_ep;
-    dg_send_to_v4(state, ep, dst_ip, dst_port, dns_data, dns_len);
+    dg_send_from(state, &(*state).server_ep, dst_ip, dst_port, dns_data, dns_len);
 }
 
 /// Send a DNS query from the upstream endpoint to the configured upstream
@@ -898,10 +854,9 @@ unsafe fn send_upstream_query(
     dns_data: *const u8,
     dns_len: usize,
 ) {
-    let ep = (*state).upstream_ep;
     let upstream_ip = (*state).upstream_ip;
     let upstream_port = (*state).upstream_port;
-    dg_send_to_v4(state, ep, upstream_ip, upstream_port, dns_data, dns_len);
+    dg_send_from(state, &(*state).upstream_ep, upstream_ip, upstream_port, dns_data, dns_len);
 }
 
 /// Store a pending upstream query.
@@ -1130,7 +1085,7 @@ unsafe fn forward_to_upstream(
     pkt: *const u8,
     pkt_len: usize,
 ) {
-    if s.upstream_ep == 0xFF { return; }
+    if !s.upstream_ep.is_ready() { return; }
 
     // Store pending entry
     store_pending(s, dns_id, client_ip, client_port);
@@ -1233,144 +1188,60 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // when the telemetry port is unwired.
         maybe_emit_telemetry(s);
 
-        match s.phase {
-            DnsPhase::Init => {
-                s.phase = DnsPhase::BindingServer;
-            }
+        // Drive the two binds sequentially — server on `listen_port`, then the
+        // ephemeral upstream once the server is up — so each MSG_DG_BOUND routes
+        // to the single endpoint in WaitBound. The shared `datagram_endpoint`
+        // core owns the bind handshake (with backoff) and the addressed send;
+        // `dg_recv` classifies one inbound frame per step.
+        let sys = &*s.syscalls;
+        let net_out = s.net_out_chan;
+        let net_in = s.net_in_chan;
+        let buf = s.net_buf.as_mut_ptr();
 
-            DnsPhase::BindingServer => {
-                // CMD_DG_BIND [port: u16 LE] [flags: u8=0] — server port.
-                if s.net_out_chan < 0 { return 0; }
-                let sys = &*s.syscalls;
-                let buf = s.net_buf.as_mut_ptr();
-                let mut payload = [0u8; 3];
-                let pp = payload.as_mut_ptr();
-                let port_bytes = s.listen_port.to_le_bytes();
-                *pp = port_bytes[0];
-                *pp.add(1) = port_bytes[1];
-                *pp.add(2) = 0; // flags
-                let wrote = net_write_frame(
-                    sys, s.net_out_chan, DG_CMD_BIND,
-                    payload.as_ptr(), 3, buf, NET_BUF_SIZE,
-                );
-                if wrote == 0 { return 0; }
-                s.phase = DnsPhase::WaitBoundServer;
-                return 2;
-            }
+        s.server_ep.poll_bind(sys, net_out, s.listen_port, buf, NET_BUF_SIZE);
+        if s.server_ep.is_ready() {
+            s.upstream_ep.poll_bind(sys, net_out, 0, buf, NET_BUF_SIZE);
+        }
 
-            DnsPhase::WaitBoundServer => {
-                if s.net_in_chan < 0 { return 0; }
-                let sys = &*s.syscalls;
-                let chan = s.net_in_chan;
-                let poll = (sys.channel_poll)(chan, POLL_IN);
-                if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
-
-                let buf = s.net_buf.as_mut_ptr();
-                let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                if msg_type == DG_MSG_BOUND && payload_len >= 1 {
-                    s.server_ep = *buf.add(NET_FRAME_HDR);
-                    log_info(s, b"[dns] server bound");
-                    s.phase = DnsPhase::BindingUpstream;
-                    return 2;
-                } else if msg_type == DG_MSG_ERROR {
-                    log_err(s, b"[dns] server bind failed");
-                    s.phase = DnsPhase::Error;
-                    return -1;
+        let mut did_work = false;
+        if let Some(ev) = dg_recv(sys, net_in, buf, NET_BUF_SIZE) {
+            match ev {
+                DgEvent::Bound { ep_id, .. } => {
+                    // Sequential binds: exactly one endpoint is in WaitBound, so
+                    // the completion routes unambiguously.
+                    s.server_ep.on_bound(ep_id);
+                    s.upstream_ep.on_bound(ep_id);
+                    if s.server_ep.owns(ep_id) {
+                        log_info(s, b"[dns] server bound");
+                    } else if s.upstream_ep.owns(ep_id) {
+                        log_info(s, b"[dns] serving");
+                    }
+                    did_work = true;
                 }
-            }
-
-            DnsPhase::BindingUpstream => {
-                // CMD_DG_BIND with port=0 asks the IP module to allocate an
-                // ephemeral port for the upstream endpoint.
-                if s.net_out_chan < 0 { return 0; }
-                let sys = &*s.syscalls;
-                let buf = s.net_buf.as_mut_ptr();
-                let payload = [0u8, 0u8, 0u8]; // port=0, flags=0
-                let wrote = net_write_frame(
-                    sys, s.net_out_chan, DG_CMD_BIND,
-                    payload.as_ptr(), 3, buf, NET_BUF_SIZE,
-                );
-                if wrote == 0 { return 0; }
-                s.phase = DnsPhase::WaitBoundUpstream;
-            }
-
-            DnsPhase::WaitBoundUpstream => {
-                if s.net_in_chan < 0 { return 0; }
-                let sys = &*s.syscalls;
-                let chan = s.net_in_chan;
-                let poll = (sys.channel_poll)(chan, POLL_IN);
-                if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return 0; }
-
-                let buf = s.net_buf.as_mut_ptr();
-                let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-                if msg_type == DG_MSG_BOUND && payload_len >= 1 {
-                    s.upstream_ep = *buf.add(NET_FRAME_HDR);
-                    log_info(s, b"[dns] serving");
-                    s.phase = DnsPhase::Serving;
-                    return 2;
-                } else if msg_type == DG_MSG_ERROR {
-                    log_err(s, b"[dns] upstream bind failed");
-                    s.phase = DnsPhase::Error;
-                    return -1;
-                }
-            }
-
-            DnsPhase::Serving => {
-                let mut did_work = false;
-
-                // Read datagram frames from net_in channel.
-                let chan = s.net_in_chan;
-                if chan < 0 { return 0; }
-
-                let sys = &*s.syscalls;
-                let poll = (sys.channel_poll)(chan, POLL_IN);
-                if poll > 0 && (poll as u32 & POLL_IN) != 0 {
-                    let buf = s.net_buf.as_mut_ptr();
-                    let (msg_type, payload_len) = net_read_frame(sys, chan, buf, NET_BUF_SIZE);
-
-                    // MSG_DG_RX_FROM payload:
-                    //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][dns_data...]
-                    if msg_type == DG_MSG_RX_FROM
-                        && payload_len >= DG_V4_PREFIX + DNS_HEADER_LEN
-                    {
-                        let ep_id = *buf.add(NET_FRAME_HDR);
-                        let af = *buf.add(NET_FRAME_HDR + 1);
-                        if af == DG_AF_INET {
-                            let p = buf.add(NET_FRAME_HDR + 2);
-                            let src_ip = u32::from_be_bytes([
-                                *p, *p.add(1), *p.add(2), *p.add(3),
-                            ]);
-                            let src_port = u16::from_le_bytes([
-                                *p.add(4), *p.add(5),
-                            ]);
-                            let dns_data = buf.add(NET_FRAME_HDR + DG_V4_PREFIX) as *const u8;
-                            let dns_len = payload_len - DG_V4_PREFIX;
-                            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(dns_len as u32);
-
-                            if ep_id == s.server_ep {
-                                handle_query(s, src_ip, src_port, dns_data, dns_len);
-                            } else if ep_id == s.upstream_ep {
-                                handle_upstream_response(s, dns_data, dns_len);
-                            }
-                            did_work = true;
+                DgEvent::Rx { ep_id, src_ip, src_port, data, len } => {
+                    if len >= DNS_HEADER_LEN {
+                        s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(len as u32);
+                        if s.server_ep.owns(ep_id) {
+                            handle_query(s, src_ip, src_port, data, len);
+                        } else if s.upstream_ep.owns(ep_id) {
+                            handle_upstream_response(s, data, len);
                         }
+                        did_work = true;
                     }
                 }
-
-                // Expire old pending queries periodically
-                expire_pending(s);
-
-                if did_work {
-                    return 2; // Burst — handle remaining queries
+                DgEvent::Err { .. } => {
+                    // Bind failure — the endpoint in WaitBound backs off + retries.
+                    s.server_ep.on_error(sys);
+                    s.upstream_ep.on_error(sys);
                 }
-            }
-
-            DnsPhase::Error => {
-                return 1; // Done
+                DgEvent::Closed { .. } => {}
             }
         }
 
-        0 // Continue
+        // Expire old pending queries periodically.
+        expire_pending(s);
+
+        if did_work { 2 } else { 0 } // burst when work happened, else continue
     }
 }
 

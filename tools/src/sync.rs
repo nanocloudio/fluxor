@@ -138,6 +138,34 @@ fn all_destinations_present(pr: &Path, lock: &lockfile::LockFile) -> bool {
 /// The materialization body shared by `cmd_sync` (verbose) and
 /// `ensure_materialized` (quiet). `quiet` suppresses the advisory /
 /// fallback / summary chatter; errors always surface either way.
+fn hex12(d: &[u8; 32]) -> String {
+    d.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Why an `.fmod` cannot be loaded by the current runtime, or `""` if it can.
+///
+/// Two rejections, both meaning "staging this can only fail later":
+///   * it does not parse as a module at all (a snapshot built against a
+///     different manifest layout reads as a size mismatch), so no consumer
+///     can load it;
+///   * it attests an ABI surface that is not the current one.
+///
+/// An artefact carrying no attestation is left alone: that is a separate,
+/// pack-time concern with its own diagnosis.
+fn unloadable(path: &Path) -> String {
+    match crate::modules::ModuleInfo::from_file(path) {
+        Err(e) => format!("does not parse as a module ({e})"),
+        Ok(info) => match info.manifest.abi_surface {
+            Some(embedded) if embedded != crate::hash::abi_surface_digest() => format!(
+                "attests ABI surface {}, current is {}",
+                hex12(&embedded),
+                hex12(&crate::hash::abi_surface_digest())
+            ),
+            _ => String::new(),
+        },
+    }
+}
+
 fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) -> Result<()> {
     if lock.fmods.is_empty() && lock.runtimes.is_empty() && lock.crates.is_empty() {
         if !quiet {
@@ -294,11 +322,48 @@ fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) ->
         //   an upstream rebuild needs no re-sync, ever, because the
         //   destination was never a snapshot to begin with.
         // - registry: dest's content already matches what we'd copy.
-        let already_current = if mode_label == "live" {
+        let mut already_current = if mode_label == "live" {
             fs::read_link(&dest).map(|t| t == src).unwrap_or(false)
         } else {
             dest.exists() && file_sha256_prefixed(&dest)? == actual_hash
         };
+        // ABI-surface freshness, the same invalidation trigger
+        // `modules_build::is_up_to_date` applies to modules a project
+        // builds itself — extended here to modules it STAGES. Content
+        // equality with the source says the copy is faithful, not that
+        // it is loadable: after an ABI-surface change every artefact
+        // built before it is dead on arrival, and a registry snapshot
+        // stays dead until upstream rebuilds AND republishes. Without
+        // this check `sync` reports "already in place", the stale file
+        // survives, and the failure surfaces much later as a confusing
+        // "built against a different ABI surface" at graph-build time.
+        // Re-copying cannot fix a stale SOURCE, so say so precisely
+        // instead of silently staging it.
+        if already_current && !unloadable(&dest).is_empty() {
+            already_current = false;
+        }
+        // An unloadable source is reported but still staged. Refusing to stage
+        // it would trade a precise load-time error for a missing-file one, and
+        // an ABI-surface change makes every not-yet-rebuilt snapshot unloadable
+        // at once — a hard failure there blocks every consumer on an upstream
+        // rebuild. Warning keeps the diagnosis without holding the tree
+        // hostage.
+        if !dry_run && !quiet {
+            let why = unloadable(&src);
+            if !why.is_empty() {
+                eprintln!(
+                    "warning: {} {why} — rebuild it upstream with `fluxor modules build`{}",
+                    src.display(),
+                    if mode_label == "registry" {
+                        " and republish with `fluxor publish`. If the module no longer exists \
+                         upstream this registry snapshot is an orphan: delete it and re-run \
+                         `fluxor update` so consumers stop carrying it"
+                    } else {
+                        ""
+                    },
+                );
+            }
+        }
         if already_current {
             skipped_same += 1;
             written_fmods.insert(dest.clone(), (entry.project.clone(), actual_hash.clone()));

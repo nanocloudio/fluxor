@@ -2,6 +2,11 @@ version = "1.0.0"
 hardware_targets = ["rp2350"]
 permissions = ["flash_raw", "backing_provider"]
 
+# Provided storage surface (storage_capability_surface.md §1): raw
+# 512-byte block I/O from the flash-resident backing store. Free-form
+# provider capability string; tools-only, never serialized to the .fmod.
+provides = ["storage.block"]
+
 # BOOTSEL button driver — reads the QSPI CS pin via the flash
 # sideband, debounces, and emits the canonical `input::button` raw
 # transition contract on `raw` (out[0]). Same wire shape

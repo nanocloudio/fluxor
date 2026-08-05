@@ -42,6 +42,9 @@ use abi::SyscallTable;
 // PIC runtime (syscalls, helpers, intrinsics)
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
+// Bound-endpoint bind lifecycle + addressed send, shared across the datagram
+// modules. DTLS keeps its own per-peer (4-tuple) demux on the inbound path.
+include!("../../sdk/cores/datagram_endpoint.rs");
 
 // Crypto primitives
 include!("../../sdk/crypto/sha256.rs");
@@ -554,15 +557,15 @@ struct TlsState {
     /// `cipher_in` fan and ignore bounds belonging to other anchors.
     /// 0 = no bind forwarded yet (accept any bound, legacy behaviour).
     bind_port: u16,
-    /// DTLS listener endpoint id returned by `CMD_DG_BIND`.
-    dtls_listen_ep: i16,
+    /// DTLS listener socket (shared `datagram_endpoint` core): one bound UDP
+    /// endpoint for all peers, demuxed above by 4-tuple. Owns the bind
+    /// lifecycle + addressed send.
+    dtls_endpoint: DatagramEndpoint,
     /// DTLS listening UDP port (server) or local source port (client).
     dtls_port: u16,
     /// Client-mode peer IPv4 (LE) and UDP port.
     dtls_peer_ip: u32,
     dtls_peer_port: u16,
-    /// `CMD_DG_BIND` has been issued and `MSG_DG_BOUND` received.
-    dtls_bound: bool,
     /// Client-mode flag: have we kicked off the first ClientHello yet?
     dtls_client_started: bool,
     /// Per-peer DTLS sessions.
@@ -753,11 +756,10 @@ pub unsafe extern "C" fn module_new(
     s.transport = TRANSPORT_TCP;
     s.accept_port = 0;
     s.bind_port = 0;
-    s.dtls_listen_ep = -1;
+    s.dtls_endpoint = DatagramEndpoint::new();
     s.dtls_port = 4433;
     s.dtls_peer_ip = 0x0100007f;
     s.dtls_peer_port = 4433;
-    s.dtls_bound = false;
     s.dtls_client_started = false;
     s.step_count = 0;
     s.tlm = TlmCounters::new();
@@ -3952,5 +3954,30 @@ pub mod test_helpers {
         s.sessions
             .iter()
             .any(|sess| sess.state != SessionState::Idle && sess.conn_id == conn_id)
+    }
+
+    /// True once the DTLS listener endpoint has bound (a matching
+    /// `MSG_DG_BOUND` was accepted by the shared `datagram_endpoint` core).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn dtls_endpoint_bound(state: *const u8) -> bool {
+        let s = &*(state as *const TlsState);
+        s.dtls_endpoint.is_ready()
+    }
+
+    /// Count DTLS peer sessions that are not Idle — one is allocated when a
+    /// datagram routed to the bound endpoint (matched by `ep_id`) reaches the
+    /// per-4-tuple demux. A datagram dropped by the endpoint filter allocates
+    /// none.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn dtls_peer_count(state: *const u8) -> usize {
+        let s = &*(state as *const TlsState);
+        s.peer_sessions
+            .iter()
+            .filter(|p| !matches!(p.phase, super::DtlsPhase::Idle))
+            .count()
     }
 }

@@ -2,7 +2,7 @@ version = "2.0.0"
 hardware_targets = ["rp2350", "bcm2712", "wasm"]
 
 # Audio asset streamer + navigation — the storage.namespace/object
-# sibling of `foundation/bank`. Enumerates a `dir:` prefix via
+# sibling of `foundation/fs_bank`. Enumerates a `dir:` prefix via
 # storage.namespace::LIST and streams each entry via storage.object
 # GET/RANGE_GET (or uses explicit `path_*` object keys); cycles between
 # them in response to `next`/`prev`/`select` FMP commands. On wasm both

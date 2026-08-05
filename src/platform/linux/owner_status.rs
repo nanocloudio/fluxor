@@ -1,27 +1,29 @@
-// Owner live-status writer (rfc_k8s.md §7.2, §17.2, §18.2) — the runtime
-// half of the per-workload status surface.
+// Owner live-status writer — the runtime half of the per-owner status
+// surface. The contract (record shape, closed reason vocabularies, join key,
+// freshness and generation rules) is in
+// `docs/architecture/owner_status.md`; this file documents only what the
+// WRITER guarantees.
 //
-// In node-agent mode (FLUXOR_PLAN set) the runtime consumes the committed
-// plan by file + mtime watch; symmetrically it PUBLISHES per-owner live
-// status by file: `owner_status.json`, next to the plan, atomically replaced
-// whenever the derived state changes. `fluxor agent status --json` joins it
-// into the durable per-workload status by owner UID, so the orchestrator
-// (nanocloud) reads one pull-based surface and never learns the
-// slot→module mapping — the kernel aggregated modules into owners in
-// `scheduler::owner_live_snapshot`, and this file only speaks the §7.2
-// vocabulary:
+// In node-agent mode (FLUXOR_PLAN set) the runtime consumes the committed plan
+// by file + mtime watch and symmetrically publishes `owner_status.json` next to
+// it, atomically replaced whenever the derived state changes. The kernel has
+// already folded modules into owners in `scheduler::owner_live_snapshot`, so
+// nothing here re-derives an aggregate or exposes a slot→module mapping.
 //
-//   phase            "Activating" | "Running" | "Terminated"
-//   terminated.reason "Completed" | "GraphNodeFault" | "LivenessFailure"
-//                    (the reasons this runtime can currently observe; the
-//                    full §7.2 set is reserved and enforced by the reader)
-//   waiting_reason   "ActivationBackOff" (planned modules only partially
-//                    instantiated)
-//
-// `restart_count` counts AGGREGATE re-activations only: an owner observed
-// Terminated (or superseded by a new owner generation) that runs again has
-// restarted; an internal module retry (step-guard `Restart` policy) surfaces
-// only as transient unreadiness, never as a restart.
+// Writer invariants:
+//   - Values are drawn only from the closed vocabularies the reader enforces;
+//     emitting anything else is a bug that fails the reader's parse rather
+//     than reaching a consumer.
+//   - Reasons this runtime can currently observe are `Completed`,
+//     `GraphNodeFault` and `LivenessFailure`, plus the `ActivationBackOff`
+//     waiting reason. The rest of the vocabulary belongs to paths that do not
+//     exist here yet.
+//   - `restart_count` counts AGGREGATE re-activations only: an owner observed
+//     Terminated (or superseded by a new owner generation) that runs again. An
+//     internal module retry (step-guard `Restart` policy) surfaces as transient
+//     unreadiness, never as a restart.
+//   - The file is replaced whole, via temp + fsync + rename + parent-dir fsync,
+//     so a concurrent reader never sees a partial record.
 
 /// One workload's tracked lifecycle latches, keyed by owner UID. The kernel
 /// snapshot is instantaneous; phase transitions (activation time, terminal

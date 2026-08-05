@@ -65,6 +65,7 @@ pub mod export_hashes {
     pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743; // "module_isr_entry"
     pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76; // "module_provider_dispatch"
     pub const MODULE_PROVIDES_CONTRACT: u32 = 0x671c57bb; // "module_provides_contract"
+    pub const MODULE_PROVIDER_SELECTOR: u32 = 0xfd70b311; // "module_provider_selector"
     pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
 }
 /// Module table magic: "FXMT"
@@ -276,6 +277,11 @@ unsafe fn fn_ptr_from_addr<F: Copy>(addr: usize) -> F {
 struct ProviderAutoRegister {
     contract_fn: unsafe extern "C" fn() -> u32,
     dispatch_fn: crate::kernel::module::provider::ModuleProviderDispatchFn,
+    /// Optional `module_provider_selector(state) -> u32` export. Present on
+    /// instance-keyed volume backends (a fat32 with a `volume:` param), which
+    /// compute their selector hash from their own config and expose it here.
+    /// Absent on ordinary single-default providers (selector 0).
+    selector_fn: Option<unsafe extern "C" fn(*mut u8) -> u32>,
 }
 impl ProviderAutoRegister {
     /// Look for the `module_provides_contract` + `module_provider_dispatch`
@@ -287,19 +293,40 @@ impl ProviderAutoRegister {
         let dispatch_addr = module
             .get_export_addr(export_hashes::MODULE_PROVIDER_DISPATCH)
             .ok()?;
+        let selector_fn = module
+            .get_export_addr(export_hashes::MODULE_PROVIDER_SELECTOR)
+            .ok()
+            .map(|addr| {
+                // SAFETY: the address resolves inside the module's code
+                // region (get_export_addr bounds-checks it) and the symbol's
+                // declared C ABI is `fn(*mut u8) -> u32`.
+                unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8) -> u32>(addr) }
+            });
         Some(Self {
             contract_fn: fn_ptr_from_addr(contract_addr),
             dispatch_fn: fn_ptr_from_addr(dispatch_addr),
+            selector_fn,
         })
     }
     /// Register this module as a provider. Called after module_new() Ready.
     unsafe fn register(&self, module_idx: u8, state_ptr: *mut u8, name: &'static str) {
         let contract = (self.contract_fn)() as u16;
+        // Selector 0 = unkeyed / default provider (the class-byte dispatch
+        // path). Instance-keyed volume backends supply a non-zero selector
+        // through the optional `module_provider_selector` export (called with
+        // the module's state so it can derive the key from its `volume:`
+        // config); a module without it is the single default provider, exactly
+        // as before instance-keying existed.
+        let selector = match self.selector_fn {
+            Some(f) => f(state_ptr),
+            None => 0u32,
+        };
         let rc = crate::kernel::module::provider::register_module_provider(
             contract,
             module_idx,
             self.dispatch_fn,
             state_ptr,
+            selector,
         );
         if rc != 0 {
             log::warn!(

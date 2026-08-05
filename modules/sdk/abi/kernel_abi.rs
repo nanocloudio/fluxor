@@ -165,6 +165,23 @@ pub struct SyscallTable {
     /// consumer is subscribed. Losing the optimisation is the safe failure;
     /// losing the records is not.
     pub telemetry_enabled: *const u32,
+
+    /// Call an instance-keyed provider selected by name (`sel`, a short
+    /// volume string). The contract is the opcode's class byte, as on the
+    /// `handle = -1` path — so the `mount` policy module names the target
+    /// volume inline on every op, resolved by the shared
+    /// `provider_selector::hash`. `op_handle` carries the op's OWN handle
+    /// (`-1` for open-style ops, or a provider-local slot for handle-bound
+    /// ops); `sel` is purely routing. Returns the provider's result, or
+    /// `EINVAL` / `ENODEV` (no registered layer carries that selector).
+    pub provider_call_sel: unsafe extern "C" fn(
+        sel: *const u8,
+        sel_len: usize,
+        op_handle: i32,
+        op: u32,
+        arg: *mut u8,
+        arg_len: usize,
+    ) -> i32,
 }
 
 // SAFETY: `SyscallTable` was auto-`Sync` before the `telemetry_enabled` raw
@@ -182,15 +199,17 @@ unsafe impl Sync for SyscallTable {}
 // by name. Reordering, inserting, or removing a field silently breaks any
 // module built against a different layout (it jumps through the wrong
 // function pointer). These asserts pin the layout so any such change fails
-// the build — and is a forcing function to bump `ABI_VERSION` (wire.rs) and
-// re-validate every consumer. Layout is one `u32` slot (version, padded to
-// pointer width) followed by 11 function pointers = 12 pointer-sized slots,
+// the build. New fields are only ever APPENDED at the end (never inserted or
+// reordered), so a module built against an older, shorter layout keeps every
+// offset it knows and simply never reaches the new tail slots — a
+// backward-compatible extension, not a version break. Layout is one `u32` slot
+// (version, padded to pointer width), 11 function pointers, a telemetry gate
+// pointer, and 1 provider-instance routing pointer = 14 pointer-sized slots,
 // which holds on both 64-bit (native) and 32-bit wasm builds.
 const _: () = {
     // Every positional field is pinned, not just the first/last + size — a
     // size-preserving reorder (e.g. swapping channel_read and channel_write)
-    // would otherwise compile while breaking every module. `version` is one
-    // pointer-width slot (u32 padded), then 11 function pointers.
+    // would otherwise compile while breaking every module.
     let p = core::mem::size_of::<usize>();
     assert!(core::mem::offset_of!(SyscallTable, version) == 0);
     assert!(core::mem::offset_of!(SyscallTable, channel_read) == p);
@@ -205,7 +224,8 @@ const _: () = {
     assert!(core::mem::offset_of!(SyscallTable, provider_close) == p * 10);
     assert!(core::mem::offset_of!(SyscallTable, channel_peek) == p * 11);
     assert!(core::mem::offset_of!(SyscallTable, telemetry_enabled) == p * 12);
-    assert!(core::mem::size_of::<SyscallTable>() == p * 13);
+    assert!(core::mem::offset_of!(SyscallTable, provider_call_sel) == p * 13);
+    assert!(core::mem::size_of::<SyscallTable>() == p * 14);
 };
 
 /// Poll event flags (used with `handle_poll` / `channel_poll`).
@@ -615,6 +635,33 @@ pub mod fd {
     #[inline]
     pub const fn slot_of(fd: i32) -> i32 {
         fd & SLOT_MASK
+    }
+}
+
+/// Provider instance selectors — the shared hash the kernel and modules
+/// both compute so a module's declared selector string and a
+/// `provider_bind(contract, "name")` query resolve to the same u32 key.
+pub mod provider_selector {
+    /// FNV-1a hash of a short selector string (a volume / instance name
+    /// such as `"nvme0"` or `"boot"`). Single source of truth for both
+    /// sides of `provider_bind`; keep it a `const fn` so a module can fold
+    /// its selector at compile time. Hash `0` is reserved to mean "unkeyed
+    /// / default provider" — an input that happens to hash to `0` is
+    /// nudged to `1` so it never aliases the default.
+    #[inline]
+    pub const fn hash(bytes: &[u8]) -> u32 {
+        let mut h: u32 = 0x811c_9dc5;
+        let mut i = 0;
+        while i < bytes.len() {
+            h ^= bytes[i] as u32;
+            h = h.wrapping_mul(0x0100_0193);
+            i += 1;
+        }
+        if h == 0 {
+            1
+        } else {
+            h
+        }
     }
 }
 

@@ -812,6 +812,13 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
             if !is_owned {
                 continue;
             }
+            // A live-added module may have auto-registered as a contract
+            // provider (e.g. a mounted volume backend). Compact its layer out
+            // of the provider table before its state is freed, or a later
+            // dispatch would call into freed code. Boot modules reach this via
+            // `release_module_handles` on finish; the live-splice teardown must
+            // do it explicitly.
+            crate::kernel::module::provider::release_module_providers(i as u8);
             let taken = core::mem::replace(&mut s.modules[i], ModuleSlot::Empty);
             if let ModuleSlot::Dynamic(dm) = taken {
                 // SAFETY: slot unspliced and finished; never stepped again.

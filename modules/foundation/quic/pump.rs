@@ -1933,9 +1933,8 @@ unsafe fn emit_retry(
         return;
     }
     let sys = &*s.syscalls;
-    let listen_ep = s.listen_ep;
     let peer = s.conns[idx].peer;
-    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..n], &mut s.net_scratch);
     dev_log(sys, 3, b"[quic] retry sent".as_ptr(), b"[quic] retry sent".len());
 }
 
@@ -2076,8 +2075,7 @@ unsafe fn emit_version_negotiation(s: &mut QuicState, idx: usize, off: usize, av
     }
     let sys = &*s.syscalls;
     let peer = s.conns[idx].peer;
-    let listen_ep = s.listen_ep;
-    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..n], &mut s.net_scratch);
 }
 
 /// Walk and dispatch every frame in a decrypted packet payload. Sets
@@ -3446,8 +3444,7 @@ unsafe fn emit_crypto_packet(
         return (false, 0);
     }
 
-    let listen_ep = s.listen_ep;
-    if !send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..n], &mut s.net_scratch) {
+    if !send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..n], &mut s.net_scratch) {
         // Channel backpressure — the packet did NOT make it onto the
         // wire. Leave every per-conn field intact (PN, crypto offset,
         // ack_pending, pending_handshake_done, stream send buffers,
@@ -3691,8 +3688,7 @@ pub(crate) unsafe fn emit_connection_close(
         space.next_send_pn = pn + 1;
     }
     let sys = &*s.syscalls;
-    let listen_ep = s.listen_ep;
-    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..pkt_len], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..pkt_len], &mut s.net_scratch);
     let msg = b"[quic] CONNECTION_CLOSE sent";
     dev_log(sys, 3, msg.as_ptr(), msg.len());
 }
@@ -3733,12 +3729,11 @@ pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
         return;
     }
     let sys = &*s.syscalls;
-    let listen_ep = s.listen_ep;
     // Only burn the packet number and clear the pending flag once the
     // probe is actually accepted by the channel. On backpressure we
     // leave both intact so drain_outbound re-emits the SAME challenge
     // (same bytes, same PN-to-be) next tick rather than dropping it.
-    if send_datagram(sys, s.net_out, listen_ep, &cand, &pkt[..pkt_len], &mut s.net_scratch) {
+    if send_datagram(sys, s.net_out, &s.endpoint, &cand, &pkt[..pkt_len], &mut s.net_scratch) {
         s.conns[idx].one_rtt.next_send_pn = pn + 1;
         s.conns[idx].path_challenge_tx_pending = false;
         // Stamp the probe so quic_pto_check can retransmit it on timeout
@@ -3784,8 +3779,7 @@ pub(crate) unsafe fn emit_path_response(s: &mut QuicState, idx: usize) {
         return;
     }
     let sys = &*s.syscalls;
-    let listen_ep = s.listen_ep;
-    if send_datagram(sys, s.net_out, listen_ep, &dest, &pkt[..pkt_len], &mut s.net_scratch) {
+    if send_datagram(sys, s.net_out, &s.endpoint, &dest, &pkt[..pkt_len], &mut s.net_scratch) {
         s.conns[idx].one_rtt.next_send_pn = pn + 1;
         s.conns[idx].path_response_tx_pending = false;
     }
@@ -3841,8 +3835,7 @@ pub(crate) unsafe fn emit_reset_stream(
         conn.one_rtt.next_send_pn = pn + 1;
     }
     let sys = &*s.syscalls;
-    let listen_ep = s.listen_ep;
-    let _ = send_datagram(sys, s.net_out, listen_ep, &peer, &pkt[..pkt_len], &mut s.net_scratch);
+    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..pkt_len], &mut s.net_scratch);
 }
 
 /// Probe-Timeout (RFC 9002 §6.2) check — replay the saved packet for
@@ -3900,11 +3893,10 @@ pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
             }
             space.last_emitted_ms = now_ms; // exponential backoff in real impl
         }
-        let listen_ep = s.listen_ep;
         let _ = send_datagram(
             sys,
             s.net_out,
-            listen_ep,
+            &s.endpoint,
             &peer,
             &resend_bytes[..resend_len],
             &mut s.net_scratch,

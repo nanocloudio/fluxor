@@ -111,6 +111,17 @@ pub const PROVIDER_CONTRACTS: &[&str] = &[
     "usb_host",
 ];
 
+/// Names accepted in a module manifest's `provides = [..]` field — the
+/// producer side of a resolvable dependency. A superset of the
+/// `PROVIDER_CONTRACTS` service/contract names above with the storage
+/// **surface** family (`storage_capability_surface.md` §1): `storage.block`
+/// and `file.data` are surfaces a provider advertises but are not
+/// class-byte-dispatched contracts, so they live here rather than in
+/// `PROVIDER_CONTRACTS`. Validated case-insensitively at manifest parse so a
+/// typo (`file.dat`, `storage.blocks`) fails the build instead of silently
+/// never resolving.
+pub const PROVIDER_SURFACES: &[&str] = &["storage.block", "file.data"];
+
 /// The naming layer a rename touches. Part of every `RenameEntry`'s
 /// identity: the same legacy spelling may legitimately appear in more
 /// than one layer (e.g. `audio.pcm` is both a semantic-surface rename

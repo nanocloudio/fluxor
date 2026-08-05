@@ -477,7 +477,7 @@ Both are local-only by repo policy (not tracked — see `.gitignore`).
 **Putting the tiers together — the persistent-library player.** The
 write tier, the namespace tier, and the existing codec/audio path
 compose into a browser music library that survives reloads.
-`modules/foundation/object_bank` is `foundation/bank` with its `fs`
+`modules/foundation/object_bank` is `foundation/fs_bank` with its `fs`
 backend swapped for `storage.namespace::LIST` (enumerate a prefix) +
 `storage.object` `GET`/`RANGE_GET` (stream each entry) — identical
 navigation/FMP/streaming machinery, storage-backed source. The example

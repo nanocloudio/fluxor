@@ -47,7 +47,7 @@ logic — lives in modules.
 |                          (PIC modules)                             |
 +--------------------------------------------------------------------+
 |                        Foundation Layer                            |
-|        ip, fat32, http, dns, mqtt, tls, wifi, mesh, ...            |
+|        ip, fat32, dns, tls, wifi, ...            |
 |                          (PIC modules)                             |
 +--------------------------------------------------------------------+
 |                          Driver Layer                              |

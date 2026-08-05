@@ -27,9 +27,17 @@
 //! - A PIC module export (registered by the loader via
 //!   `register_module_provider()` after the module publishes a
 //!   `module_provides_contract` export). Module providers form a chain
-//!   (stack) per contract. The top-of-chain provider receives dispatch
-//!   first. Middleware modules (TLS, compression) intercept calls and
-//!   forward to the layer below via `CHAIN_NEXT`.
+//!   (stack) per contract. Middleware modules (TLS, compression)
+//!   intercept calls and forward to the layer below via `CHAIN_NEXT`.
+//!
+//! Each layer carries an **instance selector**: `0` for the default
+//! provider, or the hash of a short name (a volume, say) for a keyed one.
+//! Class-byte dispatch (`handle == -1`) reaches the top-most *unkeyed*
+//! layer; keyed layers are reachable only by name via `provider_call_sel`.
+//! That is what lets several providers of one contract coexist — two
+//! `fat32` volumes behind a `mount` router — without any of them shadowing
+//! another. Selectors are unique per contract: a duplicate is refused at
+//! registration, because a shadowed provider is silently unreachable.
 
 use crate::kernel::ipc::fd;
 use crate::kernel::sys::errno;
@@ -727,8 +735,24 @@ pub type ModuleProviderDispatchFn = unsafe extern "C" fn(
 /// Maximum registered contracts (indexed by `ContractId`).
 const MAX_PROVIDERS: usize = 32;
 
-/// Maximum chain depth per contract (kernel + up to 3 middleware modules).
+/// Layers registerable per contract: one default (unkeyed) provider plus the
+/// instance-keyed backends beneath it. A multi-volume storage graph spends one
+/// layer on the `mount` policy module and one per distinct volume, so
+/// `MAX_CHAIN_DEPTH - 1` is the hard ceiling on volumes a single graph can
+/// carry. `mount`'s `MAX_MOUNTS` bounds mount *prefixes*, which may share a
+/// volume, so it is allowed to exceed that.
+///
+/// Sized per target: a chain entry is 24 bytes and the table is
+/// `MAX_PROVIDERS × MAX_CHAIN_DEPTH`, so depth 8 costs ~6 KiB where depth 3
+/// costs ~2.3 KiB. An application processor can host a multi-drive carrier and
+/// has the RAM for it; the MCUs cannot and don't (rp2040 shares ~264 KiB with
+/// embassy-usb/net), so they keep the smaller table.
+#[cfg(feature = "chip-rp2040")]
 pub const MAX_CHAIN_DEPTH: usize = 3;
+#[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]
+pub const MAX_CHAIN_DEPTH: usize = 4; // rp2350
+#[cfg(not(feature = "rp"))]
+pub const MAX_CHAIN_DEPTH: usize = 8; // bcm2712 / host
 
 /// Flag ORed onto opcode to dispatch to the next provider below the caller.
 pub const CHAIN_NEXT: u32 = 0x0001_0000;
@@ -738,6 +762,15 @@ struct ProviderLayer {
     module_idx: u8,
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
+    /// Instance selector (FNV-1a hash of a short volume/instance string,
+    /// shared with modules via `abi::provider_selector::hash`). `0` =
+    /// unkeyed / default provider — the target of the class-byte
+    /// (`handle == -1`) dispatch path, so a graph with a single unkeyed
+    /// provider behaves exactly as before instance-keying existed. A
+    /// non-zero selector is reachable only via `provider_call_sel`, letting
+    /// multiple volumes of one contract (two `fat32`, NVMe + SD) coexist
+    /// without shadowing.
+    selector: u32,
 }
 
 /// Provider entry — combines kernel and module providers for a single contract.
@@ -815,6 +848,7 @@ pub fn register_module_provider(
     module_idx: u8,
     dispatch: ModuleProviderDispatchFn,
     state: *mut u8,
+    selector: u32,
 ) -> i32 {
     let idx = contract as usize;
     if idx >= MAX_PROVIDERS {
@@ -865,7 +899,36 @@ pub fn register_module_provider(
 
         // Check chain capacity
         if entry.depth as usize >= MAX_CHAIN_DEPTH {
+            log::error!(
+                "[provider] module {module_idx}: contract 0x{contract:04x} already has {MAX_CHAIN_DEPTH} layers (the per-target `MAX_CHAIN_DEPTH`); one is the default provider and the rest are instance-keyed backends, so this graph names more volumes than this target can register"
+            );
             return errno::EBUSY;
+        }
+
+        // Reject a duplicate selector, keyed or not — either shadows silently.
+        // A second unkeyed (selector 0) provider is unreachable because
+        // `default_layer_index` takes the top-most selector-0 layer; a
+        // duplicate keyed one is unreachable because `provider_call_sel`
+        // returns the first match. Selectors are a hash of a short name, so
+        // this also catches a genuine hash collision between two distinct
+        // volume names, which no amount of config validation could see. The
+        // config validator (`validate_single_provider`) blocks the graph
+        // earlier; this is the kernel-side backstop.
+        for i in 0..entry.depth as usize {
+            if let Some(ref layer) = entry.chain[i] {
+                if layer.selector == selector {
+                    let which = if selector == 0 {
+                        "a second unkeyed provider"
+                    } else {
+                        "a duplicate instance selector"
+                    };
+                    log::error!(
+                        "[provider] module {module_idx} registers {which} (0x{selector:08x}) for contract 0x{contract:04x}; it would shadow module {} — give each backend a distinct `volume:`",
+                        layer.module_idx
+                    );
+                    return errno::EBUSY;
+                }
+            }
         }
 
         // Push onto top of chain
@@ -874,13 +937,15 @@ pub fn register_module_provider(
             module_idx,
             dispatch,
             state,
+            selector,
         });
         entry.depth += 1;
         log::info!(
-            "[provider] module {} registered for contract 0x{:04x} at depth {}",
+            "[provider] module {} registered for contract 0x{:04x} at depth {} (selector 0x{:08x})",
             module_idx,
             contract,
-            entry.depth
+            entry.depth,
+            selector
         );
     }
     0
@@ -944,9 +1009,12 @@ pub unsafe fn dispatch(
     unsafe {
         let entry = &PROVIDERS[idx];
 
-        // Dispatch to top of chain if any module providers registered
-        if entry.depth > 0 {
-            let top = (entry.depth - 1) as usize;
+        // Dispatch to the default (unkeyed) module provider if one is
+        // registered: the top-most selector-0 layer — identical to
+        // `chain[depth-1]` when every provider is unkeyed, and the `mount`
+        // policy module when keyed volume backends coexist with it. Keyed
+        // backends are reached only via `dispatch_to`.
+        if let Some(top) = default_layer_index(entry) {
             if let Some(ref layer) = entry.chain[top] {
                 let saved = crate::kernel::exec::scheduler::current_module_index();
                 crate::kernel::exec::scheduler::set_current_module(layer.module_idx as usize);
@@ -954,6 +1022,18 @@ pub unsafe fn dispatch(
                 crate::kernel::exec::scheduler::set_current_module(saved);
                 return result;
             }
+        }
+
+        // Keyed backends exist but nothing serves the class-byte path. Name the
+        // shape explicitly: the generic "no provider" line below would send the
+        // reader looking for a missing module when the real fault is a missing
+        // router.
+        if entry.depth > 0 && entry.kernel_dispatch.is_none() {
+            log::error!(
+                "[provider] contract 0x{contract:04x} op 0x{opcode:04x}: {} instance-keyed provider(s) registered but no default (unkeyed) one — a `handle == -1` op has no router. Add a policy module (e.g. `mount`) that registers unkeyed and routes to the keyed backends.",
+                entry.depth
+            );
+            return errno::ENOSYS;
         }
 
         // Fall back to kernel provider
@@ -1046,6 +1126,85 @@ pub unsafe fn dispatch_next(
             None => errno::ENOSYS,
         }
     }
+}
+
+/// Index of the layer that serves the class-byte (`handle == -1`) dispatch
+/// path for a contract: the top-most (highest-index) unkeyed (selector 0)
+/// layer. Identical to `chain[depth-1]` when every provider is unkeyed (the
+/// pre-instance-keying world).
+///
+/// `None` when the chain is empty OR when every layer is instance-keyed.
+/// Falling back to some keyed layer would reinstate exactly the shadowing
+/// this keying exists to remove: a consumer calling `provider_call(-1, …)`
+/// against a multi-volume graph with no `mount` would silently reach an
+/// arbitrary volume. Returning `None` sends it to the kernel provider, or to
+/// `ENOSYS` — a caller that reaches an unrouted class-byte op here has a
+/// wiring bug, and the diagnostic is worth more than reaching a volume that
+/// is right only by luck.
+fn default_layer_index(entry: &ProviderEntry) -> Option<usize> {
+    for i in (0..entry.depth as usize).rev() {
+        if let Some(ref layer) = entry.chain[i] {
+            if layer.selector == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Call an instance-keyed provider selected by `sel` (a short selector
+/// string, e.g. a volume name). The contract is the opcode's class byte —
+/// the same rule the `handle == -1` path uses — so a policy module (e.g.
+/// `mount`) names the target volume inline on every op rather than caching
+/// a token. `op_handle` carries the op's OWN handle (`-1` for open-style
+/// ops, or a provider-local slot for handle-bound ops); `sel` is purely
+/// routing, so it never collides with a provider's slot space.
+///
+/// Resolving by selector on each call (rather than by a cached
+/// module-index token) is what keeps this sound under live graph mutation:
+/// a freed-then-reused module index cannot alias a stale binding, because
+/// the match is on the stable selector, not the volatile index. Returns
+/// `EINVAL` on bad args, `ENODEV` if no registered layer carries `sel`.
+///
+/// # Safety
+/// `sel` must point to `sel_len` readable bytes; `arg` must satisfy the
+/// registered dispatch handler's requirements for `opcode`.
+pub unsafe fn provider_call_sel(
+    sel: *const u8,
+    sel_len: usize,
+    op_handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    if sel.is_null() || sel_len == 0 {
+        return errno::EINVAL;
+    }
+    let contract = ((opcode >> 8) & 0xFF) as usize;
+    if contract >= MAX_PROVIDERS {
+        return errno::EINVAL;
+    }
+    // SAFETY: caller guarantees `sel[..sel_len]` is readable.
+    let bytes = unsafe { core::slice::from_raw_parts(sel, sel_len) };
+    // Never 0: `hash` nudges a zero result to 1 precisely so a real name can
+    // never alias the "unkeyed default" sentinel.
+    let want = crate::abi::kernel_abi::provider_selector::hash(bytes);
+    // SAFETY: PROVIDERS is mutated only on the scheduler thread.
+    unsafe {
+        let entry = &PROVIDERS[contract];
+        for i in 0..entry.depth as usize {
+            if let Some(ref layer) = entry.chain[i] {
+                if layer.selector == want {
+                    let saved = crate::kernel::exec::scheduler::current_module_index();
+                    crate::kernel::exec::scheduler::set_current_module(layer.module_idx as usize);
+                    let result = (layer.dispatch)(layer.state, op_handle, opcode, arg, arg_len);
+                    crate::kernel::exec::scheduler::set_current_module(saved);
+                    return result;
+                }
+            }
+        }
+    }
+    errno::ENODEV
 }
 
 // ── Platform-registered fd-tag routes ────────────────────────────────────────

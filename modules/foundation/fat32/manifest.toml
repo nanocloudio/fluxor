@@ -4,6 +4,13 @@ hardware_targets = ["rp2350", "bcm2712"]
 # cadence uses dev_millis and contains no scheduler-step deadline.
 timer_class = "wall_clock"
 
+# Provided storage surface (storage_capability_surface.md §1): `file.data`
+# byte-stream file access. Directory listing is served through the FS
+# contract's OPENDIR/READDIR, not the `storage.namespace` (0x13) contract,
+# which this module does not implement — so only `file.data` is declared.
+# Free-form provider capability string; tools-only, never serialized.
+provides = ["file.data"]
+
 # FAT32 filesystem provider. Random-access reads go through the
 # FS_CONTRACT (`provider_call(-1, FS_OPEN, …)`); the kernel routes
 # the dispatch to fat32 via `module_provides_contract = FS`. Writes

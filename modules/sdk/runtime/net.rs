@@ -223,61 +223,30 @@ unsafe fn parse_trace_ctx(
 // datagram contract helpers (modules/sdk/contracts/net/datagram.rs)
 // ============================================================================
 
-/// `datagram` IPv4 address-prefix size: `[ep_id:1][af:1][addr:4][port:2]`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_V4_PREFIX: usize = 8;
-
-// datagram opcodes — full set (see modules/sdk/contracts/net/datagram.rs).
-// Provided here so consumers don't redefine them.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_CMD_BIND: u8 = 0x20;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_CMD_SEND_TO: u8 = 0x21;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_CMD_CLOSE: u8 = 0x22;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_MSG_BOUND: u8 = 0x40;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_MSG_RX_FROM: u8 = 0x41;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_MSG_CLOSED: u8 = 0x42;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_MSG_ERROR: u8 = 0x43;
-/// `AF_INET` address-family code (matches contracts/net/datagram.rs).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_AF_INET: u8 = 4;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const DG_AF_INET6: u8 = 6;
+// datagram surface constants — the contract (`contracts/net/datagram.rs`) is
+// the single source of truth. Re-exported here under the `DG_` prefix that the
+// runtime helpers and the datagram modules use, so there is one definition of
+// each value, not two.
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_V4_PREFIX: usize = abi::contracts::net::datagram::V4_ADDR_PREFIX;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_CMD_BIND: u8 = abi::contracts::net::datagram::CMD_DG_BIND;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_CMD_SEND_TO: u8 = abi::contracts::net::datagram::CMD_DG_SEND_TO;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_CMD_CLOSE: u8 = abi::contracts::net::datagram::CMD_DG_CLOSE;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_MSG_BOUND: u8 = abi::contracts::net::datagram::MSG_DG_BOUND;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_MSG_RX_FROM: u8 = abi::contracts::net::datagram::MSG_DG_RX_FROM;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_MSG_CLOSED: u8 = abi::contracts::net::datagram::MSG_DG_CLOSED;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_MSG_ERROR: u8 = abi::contracts::net::datagram::MSG_DG_ERROR;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_AF_INET: u8 = abi::contracts::net::datagram::AF_INET;
+#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+const DG_AF_INET6: u8 = abi::contracts::net::datagram::AF_INET6;
 
 /// Build and emit a `CMD_DG_SEND_TO` frame for an IPv4 destination.
 /// Layout:

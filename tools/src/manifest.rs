@@ -196,6 +196,7 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
 // reason `CONTENT_TYPES` lives there). Re-exported here for manifest
 // validation and the presentation-group checks.
 pub use fluxor_contracts::vocabulary::CAPABILITY_NAMES;
+use fluxor_contracts::vocabulary::{PROVIDER_CONTRACTS, PROVIDER_SURFACES};
 
 /// Validate capability names against the whitelist and canonicalize each
 /// entry to its lowercase form in place. Downstream consumers — the
@@ -221,6 +222,36 @@ fn validate_capability_names(caps: &mut [String]) -> Result<()> {
                     CAPABILITY_NAMES.join(", "),
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Validate `provides = [..]` entries against the providable vocabulary
+/// (service/contract names in `PROVIDER_CONTRACTS` plus the storage
+/// **surface** family in `PROVIDER_SURFACES`). Like capabilities, `provides`
+/// is resolved by exact string match downstream — the config resolver wires
+/// consumers to providers by name — so an unwhitelisted typo would silently
+/// never resolve. Fail it at parse instead, with a did-you-mean.
+fn validate_provides_names(provides: &[String]) -> Result<()> {
+    for p in provides {
+        let known = PROVIDER_CONTRACTS
+            .iter()
+            .chain(PROVIDER_SURFACES.iter())
+            .any(|n| n.eq_ignore_ascii_case(p));
+        if !known {
+            let candidates: Vec<String> = PROVIDER_CONTRACTS
+                .iter()
+                .chain(PROVIDER_SURFACES.iter())
+                .map(|s| s.to_string())
+                .collect();
+            let did_you_mean = crate::text_distance::closest_match(p, &candidates, 3)
+                .map(|s| format!(" Did you mean `{s}`?"))
+                .unwrap_or_default();
+            return Err(Error::Module(format!(
+                "unknown provided surface/service `{p}`.{did_you_mean} Expected one of: {}.",
+                candidates.join(", "),
+            )));
         }
     }
     Ok(())
@@ -1322,6 +1353,7 @@ impl Manifest {
         };
 
         let provides = toml_val.provides.unwrap_or_default();
+        validate_provides_names(&provides)?;
         let mut capabilities = toml_val.capabilities.unwrap_or_default();
         validate_capability_names(&mut capabilities)?;
 

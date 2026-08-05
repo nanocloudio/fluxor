@@ -1,0 +1,29 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+# FS state is readiness-driven; no scheduler-step deadline.
+timer_class = "wall_clock"
+
+# Mount / VFS policy module. Registers as the DEFAULT (unkeyed) FS provider
+# and routes each path to a volume backend (a keyed `fat32`) by
+# longest-prefix match, binding backends via `provider_bind`. Dissolves the
+# by-name graph wiring: consumers keep `requires_contract = "fs"` and only
+# this module's `mounts:` config knows the volume set.
+# See docs/architecture/storage_capability_surface.md.
+provides = ["file.data"]
+
+# Optional hotplug control channel (in[0]). The platform backend that
+# detects media insert/remove writes one command per record
+# (`[cmd][prefix_len][prefix][volume_len][volume]`); `module_step` drains
+# and applies them, revoking outstanding handles on removal. Stays inert
+# when unwired. Base config is the `mounts:` param (`"/boot=sd0;/data=nvme0"`).
+[[ports]]
+name = "ctl"
+direction = "input"
+content_type = "OctetStream"
+
+# Module-scope observability. `mount` sits on the FS data path — every op a
+# consumer issues passes through its routing table — so it reports rather than
+# claims exemption. id 0 = ops_routed, id 1 = route_misses; a step in the
+# latter is how a removed volume or a stale mount prefix shows up.
+[observability]
+metrics = ["ops_routed", "route_misses"]

@@ -38,6 +38,7 @@ How the system works. These are the authoritative references.
 - [architecture/network.md](architecture/network.md) — channel-based networking, net_proto, drivers, IP module, TLS
 - [architecture/heap.md](architecture/heap.md) — per-module heap allocation
 - [architecture/reconfigure.md](architecture/reconfigure.md) — live graph reconfigure, drain protocol
+- [architecture/owner_status.md](architecture/owner_status.md) — per-owner live status, `owner_status.json`, orchestrator join
 - [architecture/security.md](architecture/security.md) — trust root, module signing, KEY_VAULT, network hardening
 - [architecture/pin_allocation.md](architecture/pin_allocation.md) — GPIO allocation, pin validation, peripheral assignments
 - [architecture/mesh.md](architecture/mesh.md) — mesh object, handle, event, and lease model

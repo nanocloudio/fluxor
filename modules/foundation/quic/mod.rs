@@ -37,6 +37,10 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
+// Bound-endpoint bind lifecycle + addressed send, shared with dns / dtls /
+// log_net / transport_buffer. quic keeps its own connection-id demux on the
+// inbound path; the core owns bind + send only.
+include!("../../sdk/cores/datagram_endpoint.rs");
 include!("../../sdk/wire/varint.rs");
 
 // Crypto primitives (also used by tls/dtls modules — duplicated PIC
@@ -162,12 +166,13 @@ pub(crate) struct QuicState {
     net_out: i32,
     app_in: i32,
     app_out: i32,
-    listen_ep: i16,
+    /// Single bound UDP endpoint (shared `datagram_endpoint` core) for all QUIC
+    /// connections; they are demuxed above it by connection id.
+    endpoint: DatagramEndpoint,
     port: u16,
     mode: u8,           // 0 = client, 1 = server
     peer_ip: u32,       // client mode: peer IPv4 (LE)
     peer_port: u16,     // client mode: peer port
-    bound: bool,
     client_started: bool,
     cert: [u8; MAX_CERT_LEN],
     cert_len: usize,
@@ -323,12 +328,11 @@ pub unsafe extern "C" fn module_new(
     s.syscalls = syscalls;
     s.cert_len = 0;
     s.key_len = 0;
-    s.listen_ep = -1;
+    s.endpoint = DatagramEndpoint::new();
     s.port = 4443;
     s.mode = 1;
     s.peer_ip = 0x0100007f;
     s.peer_port = 4443;
-    s.bound = false;
     s.client_started = false;
     s.require_retry = 0;
     s.enable_0rtt = 0;
@@ -723,21 +727,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // no-op when the telemetry port is unwired.
     maybe_emit_telemetry(s);
 
-    if !s.bound {
-        send_bind(s);
-        s.bound = true;
-        // StepOutcome::Continue — keep this module scheduled. The
-        // runtime maps a `1` return to StepOutcome::Done, which would
-        // finalize the module after the bind step and stop it ever
-        // draining net_in (no handshake would progress). See
-        // scheduler/module_types.rs rc mapping.
-        return 0;
-    }
+    // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,
+    // with backoff/retry. MSG_DG_BOUND is consumed in the recv loop below.
+    s.endpoint
+        .poll_bind(sys, s.net_out, s.port, s.net_scratch.as_mut_ptr(), NET_BUF_SIZE);
 
     // Client mode: kick off the handshake by allocating a connection,
     // queueing a ClientHello in driver.out_buf, and emitting the
     // first Initial packet.
-    if s.mode == 0 && !s.client_started && s.listen_ep >= 0 {
+    if s.mode == 0 && !s.client_started && s.endpoint.is_ready() {
         let ip_bytes = s.peer_ip.to_le_bytes();
         let ip = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
         if let Some(idx) = alloc_client_connection(s, &ip, s.peer_port) {
@@ -796,8 +794,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     if take >= 3 {
                         let bound_port = (buf[1] as u16) | ((buf[2] as u16) << 8);
-                        if bound_port == s.port && s.listen_ep < 0 {
-                            s.listen_ep = buf[0] as i16;
+                        // Port-filter our own BOUND off the (possibly broadcast)
+                        // channel, then hand the ep_id to the endpoint.
+                        if bound_port == s.port && !s.endpoint.is_ready() {
+                            s.endpoint.on_bound(buf[0]);
                             dev_log(sys, 3, b"[quic] bound".as_ptr(), b"[quic] bound".len());
                         }
                     }
@@ -1003,7 +1003,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // Established and a ticket is cached, open a second handshake on a
     // free slot using that ticket so the PSK + early_data path runs
     // end-to-end in a single fluxor process.
-    if s.mode == 0 && s.enable_0rtt != 0 && s.listen_ep >= 0 {
+    if s.mode == 0 && s.enable_0rtt != 0 && s.endpoint.is_ready() {
         let mut have_ticket = false;
         let mut active_count = 0;
         let mut t = 0;
@@ -1751,65 +1751,33 @@ unsafe fn emit_h3_request_span(s: &QuicState, idx: usize, start: u64) {
     );
 }
 
-unsafe fn send_bind(s: &mut QuicState) {
-    let sys = &*s.syscalls;
-    // CMD_DG_BIND payload (modules/sdk/contracts/net/datagram.rs):
-    //   [port: u16 LE] [flags: u8].
-    let payload: [u8; 3] = [
-        (s.port & 0xFF) as u8,
-        (s.port >> 8) as u8,
-        0,
-    ];
-    let frame_len = 3 + payload.len();
-    let mut frame = [0u8; 8];
-    frame[0] = DG_CMD_BIND;
-    frame[1] = payload.len() as u8;
-    frame[2] = (payload.len() >> 8) as u8;
-    let mut i = 0;
-    while i < payload.len() {
-        frame[3 + i] = payload[i];
-        i += 1;
-    }
-    (sys.channel_write)(s.net_out, frame.as_ptr(), frame_len);
-}
-
-/// Emit one datagram (`CMD_DG_SEND_TO`) toward `peer`. Returns `true`
-/// iff the whole frame was accepted by the channel (all-or-nothing
-/// write). Callers holding reliable control state (PATH_CHALLENGE /
-/// PATH_RESPONSE / NEW_CONNECTION_ID) MUST keep that state pending until
-/// this returns `true`, so a backpressured write is retried, not lost.
+/// Emit one datagram (`CMD_DG_SEND_TO`) toward `peer` via the shared
+/// `datagram_endpoint` core. Returns `true` iff the whole frame was accepted
+/// (all-or-nothing write). Callers holding reliable control state
+/// (PATH_CHALLENGE / PATH_RESPONSE / NEW_CONNECTION_ID) MUST keep that state
+/// pending until this returns `true`, so a backpressured write is retried, not
+/// lost. No-ops (returns `false`) until the endpoint is bound.
 #[must_use]
 unsafe fn send_datagram(
     sys: &SyscallTable,
     net_out: i32,
-    ep: i16,
+    ep: &DatagramEndpoint,
     peer: &PeerAddr,
     bytes: &[u8],
     scratch: &mut [u8; NET_BUF_SIZE],
 ) -> bool {
-    if ep < 0 {
-        return false;
-    }
-    // CMD_DG_SEND_TO IPv4 (datagram contract):
-    //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data].
-    let payload_len = 1 + 1 + 4 + 2 + bytes.len();
-    let frame_len = 3 + payload_len;
-    if frame_len > scratch.len() {
-        return false;
-    }
-    scratch[0] = DG_CMD_SEND_TO;
-    scratch[1] = payload_len as u8;
-    scratch[2] = (payload_len >> 8) as u8;
-    scratch[3] = ep as u8;
-    scratch[4] = DG_AF_INET;
-    scratch[5] = peer.ip[0];
-    scratch[6] = peer.ip[1];
-    scratch[7] = peer.ip[2];
-    scratch[8] = peer.ip[3];
-    scratch[9] = (peer.port & 0xFF) as u8;
-    scratch[10] = (peer.port >> 8) as u8;
-    core::ptr::copy_nonoverlapping(bytes.as_ptr(), scratch.as_mut_ptr().add(11), bytes.len());
-    (sys.channel_write)(net_out, scratch.as_ptr(), frame_len) == frame_len as i32
+    // `peer.ip` is wire-order octets; `send_to` re-serialises via `to_be_bytes`.
+    let dst_ip = u32::from_be_bytes(peer.ip);
+    ep.send_to(
+        sys,
+        net_out,
+        dst_ip,
+        peer.port,
+        bytes.as_ptr(),
+        bytes.len(),
+        scratch.as_mut_ptr(),
+        NET_BUF_SIZE,
+    ) != 0
 }
 
 // ---------------------------------------------------------------------
@@ -3463,8 +3431,7 @@ pub mod test_helpers {
         let s = &mut *(state as *mut QuicState);
         // Clear the bind gate so module_step reaches the per-connection
         // post-handshake loop (no real datagram provider in this path).
-        s.bound = true;
-        s.listen_ep = 0;
+        s.endpoint.bind_static(0);
         // Reflect a real ALPN-configured module: a non-empty ALPN means
         // the module offers ALPN, which switches the app surface to the
         // framed MSG_QUIC_* envelope (see the app_in gate in module_step).

@@ -343,6 +343,20 @@ mod params_def {
         // entries; do not set where on-disk files must survive a remount.
         10, clean_root, u32, 0
             => |s, d, len| { s.clean_root = p_u32(d, len, 0, 0); };
+
+        // Instance selector for multi-volume routing. When set (e.g.
+        // `volume: "nvme0"`), this fat32 registers as a KEYED FS provider
+        // the `mount` module binds by name via `provider_bind`, letting a
+        // boot volume and a data volume coexist without shadowing. Absent →
+        // selector 0 = the single default FS provider (unchanged). The hash
+        // is the shared `provider_selector::hash` so the module's declared
+        // key and the mount's `provider_bind("nvme0")` query agree.
+        11, volume, str, 0
+            => |s, d, len| {
+                if len > 0 {
+                    s.selector = super::hash_selector(d, len);
+                }
+            };
     }
 }
 
@@ -543,6 +557,12 @@ impl OpenFile {
 #[repr(C)]
 struct Fat32State {
     syscalls: *const SyscallTable,
+    /// Provider instance selector (FNV-1a hash of the `volume:` param).
+    /// `0` when no `volume:` is given → this fat32 is the single unkeyed
+    /// (default) FS provider, exactly as before. Non-zero → a keyed volume
+    /// backend the `mount` module reaches via `provider_bind`. Exposed to
+    /// the loader through the `module_provider_selector` export.
+    selector: u32,
     /// Channel handle for the upstream block source (nvme.blocks /
     /// sd.blocks). Every sector read — init MBR/boot/dir, write-path
     /// FAT walks, FS_CONTRACT sync block reads — flows through this
@@ -756,6 +776,7 @@ const UNLINK_FREE_SLOTS: usize = 8;
 impl Fat32State {
     fn init(&mut self, syscalls: *const SyscallTable) {
         self.syscalls = syscalls;
+        self.selector = 0;
         self.in_chan = -1;
         self.bytes_per_sector = 512;
         self.sectors_per_cluster = 0;
@@ -3185,6 +3206,30 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provides_contract")]
 pub extern "C" fn module_provides_contract() -> u32 {
     0x0009 // FS
+}
+
+/// FNV-1a hash of a `volume:` param string via the shared kernel/module
+/// `provider_selector::hash`, so this fat32's declared selector matches a
+/// `mount` module's `provider_bind("<volume>")` query byte-for-byte.
+///
+/// # Safety
+/// `d` must point to `len` readable bytes.
+unsafe fn hash_selector(d: *const u8, len: usize) -> u32 {
+    abi::kernel_abi::provider_selector::hash(core::slice::from_raw_parts(d, len))
+}
+
+/// Instance selector for this fat32 volume (0 = unkeyed default provider).
+/// The loader calls this after `module_new` so `state` holds the parsed
+/// `volume:` param; a keyed volume is bound by the `mount` module.
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_selector")]
+pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
+    if state.is_null() {
+        return 0;
+    }
+    // SAFETY: the loader passes this module's own state buffer, sized for
+    // `Fat32State` and initialised by `module_new`.
+    unsafe { (*(state as *const Fat32State)).selector }
 }
 
 // ============================================================================

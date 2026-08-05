@@ -1,12 +1,11 @@
-# mesh Module
+# fs_bank Module
 
-Module documentation for mesh.
+FS-backed Asset Bank PIC Module (Seekable Version)
 
 ## Files
 
 - `manifest.toml`
 - `mod.rs`
-- `mesh_types.rs`
 
 ## Interface (manifest)
 
@@ -15,36 +14,39 @@ version = "1.0.0"
 hardware_targets = ["rp2350"]
 
 [[ports]]
-name = "mqtt_rx"
+name = "files"
 direction = "input"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "stream"
+direction = "output"
 content_type = "OctetStream"
 required = true
 
 [[ports]]
 name = "notify"
 index = 1
-direction = "input"
-content_type = "FmpMessage"
-
-[[ports]]
-name = "mqtt_tx"
 direction = "output"
-content_type = "OctetStream"
-required = true
+content_type = "FmpMessage"
 
 [[ports]]
 name = "commands"
-direction = "ctrl_output"
+direction = "ctrl_input"
 content_type = "FmpMessage"
 
 [commands]
-accepts = ["status"]
-emits = ["next", "prev", "toggle", "select"]
+accepts = ["next", "prev", "toggle", "select"]
+emits = ["status"]
 ```
 
 ## Parameters
 
-- No TLV parameter tags detected in module source.
+- `auto_advance`
+- `file_count`
+- `initial_index`
+- `mode`
 
 ## Notes
 

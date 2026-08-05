@@ -17,7 +17,7 @@ TARGET      ?= qemu-virt
 
 .DEFAULT_GOAL := build
 
-.PHONY: help build test lint ci publish clean install \
+.PHONY: help build test lint ci publish clean install check-install \
         firmware secure-pi5 install-rig-backends
 
 # `help` is zero-dependency: it must work before anything is built.
@@ -30,6 +30,7 @@ help:
 	@echo "  make ci        fluxor ci — the full gate"
 	@echo "  make publish   build, then publish every artefact tier"
 	@echo "  make clean     cargo clean + module artefacts"
+	@echo "  make check-install  warn if the PATH fluxor lags this checkout"
 	@echo "  make install   CLI tools into ~/.cargo/bin (--locked --force,"
 	@echo "                 reusing the workspace build cache)"
 	@echo ""
@@ -71,6 +72,29 @@ build:
 	$(MAKE) firmware TARGET=pi5
 	$(MAKE) firmware TARGET=wasm
 	$(CARGO) build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback --target aarch64-unknown-linux-gnu
+	@$(MAKE) --no-print-directory check-install
+
+# `cargo build` writes $(FLUXOR); it does NOT touch the copy `make install`
+# put in ~/.cargo/bin. Every target here invokes $(FLUXOR) deliberately, so
+# the Makefile is immune — but a bare `fluxor` typed at a shell is not, and a
+# CLI lagging its checkout misbehaves silently: the symptom is a change you
+# just built appearing to have no effect. `cargo install` (with the shared
+# CARGO_TARGET_DIR `install` uses) copies the very bytes `build` produced, so
+# a content compare is exact — no false alarms.
+check-install:
+	@built=$$(sha256sum $(FLUXOR) 2>/dev/null | cut -c1-12); \
+	 which=$$(command -v fluxor 2>/dev/null); \
+	 if [ -z "$$built" ]; then \
+	   echo "note: $(FLUXOR) not built yet — run 'make build'"; \
+	 elif [ -z "$$which" ]; then \
+	   echo "note: no 'fluxor' on PATH — run 'make install'"; \
+	 else \
+	   inst=$$(sha256sum "$$which" | cut -c1-12); \
+	   if [ "$$built" != "$$inst" ]; then \
+	     echo "WARNING: 'fluxor' on PATH ($$which, $$inst) is NOT this checkout's build ($$built)."; \
+	     echo "         Run 'make install' — until you do, CLI changes you built are not live."; \
+	   fi; \
+	 fi
 
 # Install the CLI tools into ~/.cargo/bin. CARGO_TARGET_DIR reuses the
 # workspace build cache (cargo install otherwise recompiles in a temp

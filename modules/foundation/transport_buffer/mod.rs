@@ -8,7 +8,7 @@
 //! protocol (`rfc_observability_surface.md` §5.5).
 //!
 //! Transports:
-//!   - `udp` (0)  — via the shared `dgram_egress` core over the ip datagram
+//!   - `udp` (0)  — via the shared `datagram_endpoint` core over the ip datagram
 //!                  surface: it owns the bind lifecycle and the addressed send
 //!                  (the same core `log_net` uses). Needs the net channels wired:
 //!                  in[1]=net_in, out[0]=net_out; params dst_ip / dst_port /
@@ -17,7 +17,7 @@
 //!                  network, no addressing; net channels left unwired.
 //!
 //! A stream transport (TCP) or downstream client (HTTP/gRPC) is a new `send`
-//! arm — and, if datagram-shaped, reuses `dgram_egress` — not a new module.
+//! arm — and, if datagram-shaped, reuses `datagram_endpoint` — not a new module.
 //!
 //! # Wiring
 //!
@@ -57,7 +57,7 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 // Shared UDP datagram-endpoint lifecycle + send (also used by `log_net`).
-include!("../../sdk/cores/dgram_egress.rs");
+include!("../../sdk/cores/datagram_endpoint.rs");
 
 // ============================================================================
 // Constants
@@ -95,12 +95,12 @@ struct TransportBufferState {
     /// One-shot flag so a disabled udp endpoint warns only once.
     disabled_warned: u8,
 
-    // udp destination / bind (parsed from params, passed to `egress`).
+    // udp destination / bind (parsed from params, passed to `endpoint`).
     dst_ip: u32,
     dst_port: u16,
     bind_port: u16,
     /// Shared datagram-endpoint lifecycle + send (udp transport only).
-    egress: DgramEgress,
+    endpoint: DatagramEndpoint,
 
     /// A payload read from `payload_in` but not yet fully accepted by the sink
     /// (`pending_off` bytes sent so far). `pending_len == 0` means none held. The
@@ -129,7 +129,7 @@ impl TransportBufferState {
         self.dst_ip = 0;
         self.dst_port = 4317;
         self.bind_port = 4316;
-        self.egress = DgramEgress::new();
+        self.endpoint = DatagramEndpoint::new();
         self.pending_len = 0;
         self.pending_off = 0;
         self.frames_sent = 0;
@@ -171,7 +171,7 @@ mod params_def {
 /// Send as much of the held payload (from `pending_off`) as the selected
 /// transport accepts NOW. Returns the number of payload bytes accepted this call
 /// — `0` if the sink is not ready. UDP is atomic (whole payload or nothing, via
-/// the shared `dgram_egress` core); UART may partial-accept (buffer resumes).
+/// the shared `datagram_endpoint` core); UART may partial-accept (buffer resumes).
 unsafe fn send_one(s: &mut TransportBufferState) -> usize {
     let off = s.pending_off as usize;
     let len = s.pending_len as usize;
@@ -185,7 +185,7 @@ unsafe fn send_one(s: &mut TransportBufferState) -> usize {
             0
         }
     } else {
-        s.egress.send(
+        s.endpoint.send_to(
             sys,
             s.net_out_chan,
             s.dst_ip,
@@ -346,7 +346,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // UDP: drive the shared datagram-endpoint lifecycle; forward once bound.
         let sys = &*s.syscalls;
-        let ready = s.egress.poll(
+        let ready = s.endpoint.poll(
             sys,
             s.net_out_chan,
             s.net_in_chan,
@@ -355,7 +355,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.net_buf.as_mut_ptr(),
             NET_BUF_SIZE,
         );
-        if s.egress.is_disabled() && s.disabled_warned == 0 {
+        if s.endpoint.is_disabled() && s.disabled_warned == 0 {
             let msg = b"[transport_buffer] udp dst_ip unset/broadcast; forwarding disabled";
             dev_log(sys, 2, msg.as_ptr(), msg.len());
             s.disabled_warned = 1;

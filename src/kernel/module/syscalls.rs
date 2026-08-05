@@ -83,6 +83,7 @@ pub fn init_syscall_table() {
         provider_query: syscall_provider_query,
         provider_close: syscall_provider_close,
         channel_peek: syscall_channel_peek,
+        provider_call_sel: syscall_provider_call_sel,
     });
 }
 
@@ -181,6 +182,38 @@ unsafe extern "C" fn syscall_provider_call(
         return crate::kernel::sys::errno::EACCES;
     }
     crate::kernel::module::provider::provider_call(handle, op, arg, arg_len)
+}
+
+unsafe extern "C" fn syscall_provider_call_sel(
+    sel: *const u8,
+    sel_len: usize,
+    op_handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
+    if !crate::abi::internal::bridge::is_isr_safe(op)
+        && crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_call_sel")
+    {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    // The contract is the opcode's class byte (same rule as the handle=-1
+    // path); grant-check the caller against it, then apply the same
+    // open-class admission gate `provider_call` uses.
+    let c = ((op >> 8) & 0xFF) as u16;
+    if let Some(rc) = check_contract_grant(c) {
+        return rc;
+    }
+    if admission_class_op(op) && admission_closed("provider_call_sel") {
+        return crate::kernel::sys::errno::EACCES;
+    }
+    // SAFETY: same arg-validity contract as `provider_call`; `sel[..sel_len]`
+    // validity is the module's responsibility.
+    unsafe {
+        crate::kernel::module::provider::provider_call_sel(
+            sel, sel_len, op_handle, op, arg, arg_len,
+        )
+    }
 }
 
 unsafe extern "C" fn syscall_provider_query(
@@ -2310,6 +2343,7 @@ impl SyscallTable {
             provider_query: stub_provider_query,
             provider_close: stub_provider_close,
             channel_peek: stub_channel_peek,
+            provider_call_sel: stub_provider_call_sel,
         }
     }
 }
@@ -2381,6 +2415,16 @@ unsafe extern "C" fn stub_provider_query(
     E_NOSYS
 }
 unsafe extern "C" fn stub_provider_close(_handle: i32) -> i32 {
+    E_NOSYS
+}
+unsafe extern "C" fn stub_provider_call_sel(
+    _sel: *const u8,
+    _sel_len: usize,
+    _op_handle: i32,
+    _op: u32,
+    _arg: *mut u8,
+    _arg_len: usize,
+) -> i32 {
     E_NOSYS
 }
 

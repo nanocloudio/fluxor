@@ -1866,6 +1866,13 @@ mod continuity_tests {
         }
     }
 
+    fn prov(provides: &[&str]) -> Manifest {
+        Manifest {
+            provides: provides.iter().map(|s| s.to_string()).collect(),
+            ..Manifest::default()
+        }
+    }
+
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
     }
@@ -1899,6 +1906,141 @@ mod continuity_tests {
             {"id": "x", "class": "drain_only"}]});
         let e = validate_continuity(&cfg, &n, &m).unwrap_err();
         assert!(format!("{e:?}").contains("duplicate"), "got: {e:?}");
+    }
+
+    #[test]
+    fn single_provider_allows_distinct_and_absent_providers() {
+        // A graph with no `provides` anywhere is unaffected.
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), man(&[]));
+        validate_single_provider(&json!({}), &names(&["a"]), &m).unwrap();
+
+        // Two modules providing DIFFERENT surfaces coexist: a block
+        // driver under a filesystem is the normal storage stack.
+        let mut m = HashMap::new();
+        m.insert("nvme".to_string(), prov(&["storage.block"]));
+        m.insert(
+            "fat32".to_string(),
+            prov(&["file.data", "storage.namespace"]),
+        );
+        validate_single_provider(&json!({}), &names(&["nvme", "fat32"]), &m).unwrap();
+    }
+
+    #[test]
+    fn single_provider_rejects_two_fat32_volumes() {
+        // Two fat32 instances both provide file.data + storage.namespace;
+        // at runtime the higher-indexed one shadows the other and its
+        // drive is unreachable. Must fail validation, naming both.
+        let mut m = HashMap::new();
+        m.insert(
+            "fat32_a".to_string(),
+            prov(&["file.data", "storage.namespace"]),
+        );
+        m.insert(
+            "fat32_b".to_string(),
+            prov(&["file.data", "storage.namespace"]),
+        );
+        let e = validate_single_provider(&json!({}), &names(&["fat32_a", "fat32_b"]), &m)
+            .unwrap_err();
+        let s = format!("{e:?}");
+        assert!(
+            s.contains("fat32_a") && s.contains("fat32_b"),
+            "must name both modules, got: {s}"
+        );
+        assert!(
+            s.contains("`fat32_b` silently shadows `fat32_a`"),
+            "the later module shadows the earlier, got: {s}"
+        );
+    }
+
+    #[test]
+    fn single_provider_allows_two_block_drivers() {
+        // `storage.block` is not class-byte dispatched (block drivers wire by
+        // port name), so two block providers do NOT shadow — an SD card + a
+        // flash blob store is a legitimate composition, not an error.
+        let mut m = HashMap::new();
+        m.insert("sd".to_string(), prov(&["storage.block"]));
+        m.insert("flash_rp".to_string(), prov(&["storage.block"]));
+        validate_single_provider(&json!({}), &names(&["sd", "flash_rp"]), &m).unwrap();
+    }
+
+    #[test]
+    fn single_provider_module_may_list_a_surface_without_self_shadowing() {
+        // The same module appearing once with a surface is not a
+        // duplicate against itself.
+        let mut m = HashMap::new();
+        m.insert("fat32".to_string(), prov(&["file.data", "file.data"]));
+        validate_single_provider(&json!({}), &names(&["fat32"]), &m).unwrap();
+    }
+
+    #[test]
+    fn single_provider_allows_distinct_volume_selectors() {
+        // Two fat32 backends with distinct `volume:` params coexist — a
+        // `mount` module binds each and routes paths between them.
+        let mut m = HashMap::new();
+        m.insert(
+            "fat32_boot".to_string(),
+            prov(&["file.data", "storage.namespace"]),
+        );
+        m.insert(
+            "fat32_data".to_string(),
+            prov(&["file.data", "storage.namespace"]),
+        );
+        m.insert("mount".to_string(), prov(&["file.data", "storage.namespace"]));
+        let cfg = json!({"modules": [
+            {"name": "mount", "type": "mount"},
+            {"name": "fat32_boot", "type": "fat32", "params": {"volume": "sd0"}},
+            {"name": "fat32_data", "type": "fat32", "params": {"volume": "nvme0"}},
+        ]});
+        validate_single_provider(&cfg, &names(&["mount", "fat32_boot", "fat32_data"]), &m).unwrap();
+    }
+
+    #[test]
+    fn single_provider_rejects_same_volume_selector() {
+        // Two backends declaring the SAME volume still collide.
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), prov(&["file.data"]));
+        m.insert("b".to_string(), prov(&["file.data"]));
+        let cfg = json!({"modules": [
+            {"name": "a", "type": "fat32", "params": {"volume": "nvme0"}},
+            {"name": "b", "type": "fat32", "params": {"volume": "nvme0"}},
+        ]});
+        let e = validate_single_provider(&cfg, &names(&["a", "b"]), &m).unwrap_err();
+        let s = format!("{e:?}");
+        assert!(s.contains("nvme0") && s.contains("collide"), "got: {s}");
+    }
+
+    #[test]
+    fn single_provider_rejects_keyed_backends_with_no_router() {
+        // Distinct selectors, but nothing provides the surface unkeyed. The
+        // class-byte path every `requires_contract` consumer uses would
+        // resolve to nothing and the kernel would answer ENOSYS.
+        let mut m = HashMap::new();
+        m.insert("boot".to_string(), prov(&["file.data"]));
+        m.insert("data".to_string(), prov(&["file.data"]));
+        let cfg = json!({"modules": [
+            {"name": "boot", "type": "fat32", "params": {"volume": "sd0"}},
+            {"name": "data", "type": "fat32", "params": {"volume": "nvme0"}},
+        ]});
+        let e = validate_single_provider(&cfg, &names(&["boot", "data"]), &m).unwrap_err();
+        let s = format!("{e:?}");
+        assert!(
+            s.contains("none is the default") && s.contains("boot") && s.contains("data"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn single_provider_allows_one_keyed_backend_with_a_router() {
+        // A single keyed backend still needs the router: `volume:` moves it
+        // off the class-byte path whether or not it has siblings.
+        let mut m = HashMap::new();
+        m.insert("only".to_string(), prov(&["file.data"]));
+        let cfg = json!({"modules": [
+            {"name": "only", "type": "fat32", "params": {"volume": "nvme0"}},
+        ]});
+        let e = validate_single_provider(&cfg, &names(&["only"]), &m).unwrap_err();
+        assert!(format!("{e:?}").contains("none is the default"), "got: {e:?}");
     }
 
     #[test]

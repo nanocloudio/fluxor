@@ -1,6 +1,11 @@
 version = "1.0.0"
 hardware_targets = ["rp2350"]
 
+# Provided storage surface (storage_capability_surface.md §1): raw
+# 512-byte block I/O. Free-form provider capability string; tools-only,
+# never serialized to the .fmod.
+provides = ["storage.block"]
+
 [[ports]]
 name = "blocks"
 direction = "output"

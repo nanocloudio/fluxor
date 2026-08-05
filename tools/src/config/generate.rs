@@ -437,6 +437,14 @@ fn generate_config_impl(
     // unaffected.
     validate_continuity(config, &module_names, &manifests)?;
 
+    // Single-provider-per-contract. Providers auto-register in
+    // module-index order onto a bounded dispatch stack that returns the
+    // last registration unconditionally, so two modules providing the
+    // same surface (two `fat32` volumes, two `storage.block` drivers)
+    // silently shadow — one drive becomes unreachable with no runtime
+    // warning. Reject it at build time. See storage_capability_surface.md.
+    validate_single_provider(config, &module_names, &manifests)?;
+
     // Presentation-shell / browser-overlay descriptor validation
     // (RFC browser_overlay §19). Scenarios without a `presentation.shell`
     // block are unaffected. Lives in a standalone, unit-testable module.

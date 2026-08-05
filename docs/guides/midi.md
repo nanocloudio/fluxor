@@ -59,4 +59,4 @@ This keeps track navigation and playback policy separate from synthesis logic.
 
 - `docs/guides/audio.md`
 - `docs/guides/asset_banks.md`
-- module-local docs under `modules/synth/` and `modules/sequencer/`
+- module-local docs under grove's `modules/app/synth/` and `modules/app/sequencer/`

@@ -160,7 +160,21 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
     // No telemetry ring in the browser host — null gate → the SDK emit helpers
     // treat telemetry as unconditionally allowed (there is no consumer anyway).
     telemetry_enabled: core::ptr::null(),
+    // The browser host has no multi-volume mount routing; instance-keyed
+    // calls are unsupported (ENOSYS) — every wasm provider is the default one.
+    provider_call_sel: wasm_provider_call_sel,
 };
+
+unsafe extern "C" fn wasm_provider_call_sel(
+    _sel: *const u8,
+    _sel_len: usize,
+    _op_handle: i32,
+    _op: u32,
+    _arg: *mut u8,
+    _arg_len: usize,
+) -> i32 {
+    -38 // ENOSYS
+}
 
 // On wasm32 `module_init_wasm` (in `modules/sdk/runtime/wasm_entry.rs`)
 // passes `&WASM_SYSCALLS` to the module's `module_new`. On native

@@ -1,12 +1,12 @@
 [workspace]
 
 [package]
-name = "fluxor-mod-bank"
+name = "fluxor-mod-fs-bank"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
-description = "Asset bank PIC module — host-test build"
+description = "FS-backed asset bank PIC module — host-test build"
 
 # Bare-metal PIC builds use `rustc` directly against `mod.rs` and ignore
 # this file; Cargo only sees it during host-test builds where the test

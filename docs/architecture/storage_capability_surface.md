@@ -62,6 +62,125 @@ providers (see `contracts/storage/paged_arena.rs`).
   (`fs.rs`, `namespace.rs`, `object.rs`, plus the kernel-private
   `graph_slot.rs`, `paged_arena.rs`, `runtime_params.rs`).
 
+### Declared providers and consumers
+
+The surface names are wired into the shipping modules as follows.
+Provider modules carry `provides = [...]` in their `manifest.toml`;
+consumers reach a provider either through `requires_contract` (by
+contract, substitutable) or by naming the provider's ports directly
+in graph YAML (by name, not substitutable — prefer the former, and
+route multi-volume graphs through `mount`).
+
+| Surface             | Declared by (`provides`)                            |
+|---------------------|-----------------------------------------------------|
+| `storage.block`     | `foundation/sd`, `drivers/nvme`, `drivers/flash_rp` |
+| `file.data`         | `foundation/fat32`                                  |
+| `storage.namespace` | — no module declares it yet                         |
+| `storage.object`    | — no module declares it yet                         |
+
+The host has no `provides` row: on Linux the FS contract is served by
+`linux_fs_dispatch`, a platform dispatcher inside the runtime rather than a
+module with a manifest, so it registers directly and never advertises a
+surface. A surface with no declarant is a name plus opcodes waiting for a
+provider — `storage.namespace` and `storage.object` have consumers today but
+no in-tree producer.
+
+Consumers by contract (substitutable): `foundation/fs_bank`,
+`fixtures/gallery_stage` and `foundation/fs_tap` name `requires_contract =
+"fs"`; `foundation/object_bank` names `requires_contract =
+"storage.namespace"` + `"storage.object"`.
+
+The `linux_fs` and wasm-fetch adapters are host-side providers of the
+same surfaces (§5); they carry no `manifest.toml` because they are
+built into the platform, not loaded as `.fmod` modules.
+
+### Multiple volumes: instance-keyed providers + the `mount` module
+
+Contract providers are auto-registered by the loader after each
+module reaches Ready, in module-index order. The class-byte dispatch
+path (`handle == -1`, e.g. `FS_OPEN`) routes to the top-most **unkeyed**
+(selector 0) provider layer. A second *unkeyed* provider of the same
+surface would shadow the first silently — its drive is unreachable —
+so `validate_single_provider` rejects two unkeyed providers of one
+surface at build time, naming both.
+
+Two volumes coexist by declaring distinct **instance selectors**. A
+provider module (a `fat32`) sets a `volume:` param; it exports
+`module_provider_selector`, and the loader registers it as an
+instance-keyed layer rather than the default. The kernel exposes one
+syscall for reaching a keyed layer:
+
+- `provider_call_sel(sel, sel_len, op_handle, op, …)` hashes the
+  selector name, finds the layer carrying it, and dispatches — with the
+  contract taken from the opcode's class byte, exactly as the
+  `handle == -1` path does. The caller names the target volume inline
+  on **every** op; there is no bound token to cache. Resolving by
+  selector per call is what keeps it sound under live graph mutation —
+  a freed-then-reused module index cannot alias a stale binding.
+
+The **`mount` module** (`modules/foundation/mount/`) is the policy
+layer. It registers as the default (unkeyed) FS provider and carries a
+`mounts: "/boot=sd0;/data=nvme0"` table. On `FS_OPEN(path)` it
+longest-prefix-matches the path to a volume, forwards the
+prefix-stripped path to that volume via `provider_call_sel`, and remaps
+the returned handle so later handle-bound ops (`FS_READ` / `FS_CLOSE` /
+…) route back to the owning volume. Path policy stays in the module;
+the kernel never parses paths. `validate_single_provider` therefore
+allows several providers of one surface as long as each `volume:`
+selector is distinct (two *same*-volume or two *unkeyed* providers
+still error).
+
+Multi-volume routing today is **FS-only** (`file.data`): the `mount`
+module routes the `fs` contract. `storage.namespace` multi-volume
+routing is not yet wired — a keyed `fat32` still *provides* the
+namespace surface, but nothing routes `namespace::LIST` across volumes,
+so a graph needing multi-volume directory listing is future work (no
+consumer needs it today). A single unkeyed `fat32` remains the default
+`storage.namespace` provider as before.
+
+**Hotplug / removable media.** The `mount` module carries an optional
+control channel (`ctl`, in[0]) mirroring the IP `addr_ctl` port: the
+platform backend that detects an insert/remove writes one command per
+record (`[cmd][prefix_len][prefix][volume_len][volume]`), and
+`module_step` drains and applies them. A remove revokes every open
+handle on that volume — the next op fails `ENODEV` and frees the slot,
+the storage handle lease/revocation contract enforced at the handle
+authority (this module, which owns every consumer-facing FS handle).
+An add installs a mount whose backend binds lazily on first use.
+Media *detection* is platform-specific and outside the module's scope;
+the module only consumes the control messages.
+
+A contract may additionally opt out via a chain-aware allowlist so its
+providers fan through the `CHAIN_NEXT` flag; nothing declares
+chain-awareness today.
+
+### Where instance-keying applies — and where it does not
+
+Instance-keying (`provider_call_sel` + a policy router like `mount`) is
+for **logical, contract-dispatched service surfaces** — the storage
+surfaces (`file.data`, and, when a backend exists, `storage.namespace`
+/ `storage.object`), tenant-scoped stores, and similar. It is
+deliberately **not** applied to physical hardware channels:
+
+- **Block devices** (`storage.block` on `sd`/`nvme`/`flash_rp`) and
+  **NIC frames** are `OctetStream`/`EthernetFrame` *channels wired by
+  name*, not provider-call dispatch. A physical device's identity *is*
+  its graph position ("the NVMe on `m2_primary`", "the NIC at this
+  slot") — there is no logical abstraction to route the way a mount
+  prefix routes to a volume. Instance-keying them would first require
+  dragging them onto the provider-call axis (giving them dispatch
+  opcodes), adding a layer of indirection to physical resources that do
+  not need it.
+- The multi-instance cases people reach for — WAL + data volumes,
+  multiple NVMe namespaces, multiple NICs — are already handled at the
+  *logical* layer: `mount` routes several FS volumes (each still backed
+  by a by-name block channel), and net multi-homing lives in `ip`'s
+  address table. The physical layer stays explicit, which is correct.
+
+So the boundary is: **keep physical hardware channel-wired by name;
+instance-key only logical service surfaces.** This keeps the kernel
+mechanism minimal and the graph honest.
+
 ### Opcode class allocation
 
 Class-byte routing in the kernel (`provider::provider_call` /
