@@ -81,6 +81,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "security.key_wrap",
     "fence.enforceable",
     "durable.rpo_zero",
+    "replication.state_machine",
 ];
 
 /// Canonical provider-contract names accepted in

@@ -871,13 +871,17 @@ early-ack echo, snapshot callbacks for apply-derived state, and the
 reset signal have no equivalent in the `storage.namespace` + `event.log`
 pattern (see `storage_capability_surface.md` §4), which correctly stays
 at the storage layer. The full seven-primitive contract lives with its
-substrate provider's repo; only the surface name is canonicalized here. A consumer requires it by name
-through the same string-matched capability resolution as any other
-service capability (the resolver wires it to whichever module provides
-it) — not through the `[requires]` table, which carries typed CPU/board
-features. This gives the surface a documented home should a second
-provider (a single-node WAL stand-in or a managed-Raft service) ever
-ship.
+substrate provider's repo; only the surface name is canonicalized here
+(in `CAPABILITY_NAMES`, so a manifest can declare it typo-checked) —
+not in the `[requires]` table, which carries typed CPU/board features.
+Today the declaration is vocabulary only: the config-block validators
+(`presentation_group`, `continuity`) are the only consumers of
+`capabilities`, and no generic string-matched requires→provides
+resolver exists yet — graphs still wire the surface's ports
+explicitly. When such a validator or resolver lands, this name is the
+one it matches on, which also gives the surface a documented home
+should a second provider (a single-node WAL stand-in or a
+managed-Raft service) ever ship.
 
 ### Storage Capability Surfaces
 
@@ -975,8 +979,10 @@ durable.rpo_zero                 — synchronous quorum-durable-before-ack
 ```
 
 These are manifest-level capability names. They do not consume bits in
-the `required_caps` device-class mask; they participate in the same
-string-matched capability resolution as `file.data` or `audio.sample`.
+the `required_caps` device-class mask; they live in the same declared
+vocabulary (`CAPABILITY_NAMES`) as `file.data` or `audio.sample`, and
+are resolved by the config-block validators below — not by a generic
+requires→provides resolver, which does not exist yet.
 
 The last four exist so continuity-class validation (the `continuity`
 config block, rfc_protocols.md §7.3) can check the §13.7.6 mandatory
