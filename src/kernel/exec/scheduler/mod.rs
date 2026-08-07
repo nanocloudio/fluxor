@@ -784,5 +784,6 @@ pub use multigraph::*;
 pub use ownership::*;
 pub use setup::*;
 pub use static_storage::*;
+pub use stepping::set_forced_pipeline_passes;
 pub use stepping::*;
 pub use wiring::*;

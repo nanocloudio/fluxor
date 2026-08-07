@@ -740,6 +740,42 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 /// multi-pass re-run nondeterministic and risking a poll-mode domain WFE-ing
 /// while it still has local pending work. A slot per domain keeps each core's
 /// burst signal isolated to its own pass.
+/// Minimum exec-order passes per tick, regardless of `Burst`.
+///
+/// Default 1 is the baseline: idle ticks run one pass, and only a module
+/// returning `StepOutcome::Burst` earns a re-pass. Raising it forces the
+/// first K passes unconditionally, so a request's reply path — which flows
+/// AGAINST exec order and otherwise pays one tick per hop — can complete
+/// within the tick without any module opting in via Burst.
+///
+/// Scheduler-side rather than module-side, deliberately. Letting modules
+/// ask for the extra pass by returning Burst on productive work starves the
+/// CM5 write path: a module that always has work monopolises the re-passes.
+/// Forcing them here is fairness-neutral — every module steps the same K
+/// times — and the per-domain budget still bounds the busy case, so the
+/// guards that make one pass safe make K passes safe.
+pub(crate) static FORCED_PIPELINE_PASSES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(1);
+
+/// Should the exec-order loop take another pass purely because the forced
+/// count has not been reached yet? Both the single-graph loop
+/// (`domain_budget`) and the multi-graph runner (`multigraph`) gate their
+/// idle exit on this, so the knob cannot come to mean two different things
+/// depending on which scheduler path a graph took.
+#[inline]
+pub(crate) fn forced_pass_pending(tick_pass: u32) -> bool {
+    tick_pass < FORCED_PIPELINE_PASSES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the forced pass count, clamped to `[1, MAX_PIPELINE_PASSES]`.
+pub fn set_forced_pipeline_passes(n: u32) {
+    let clamped = n.clamp(
+        1,
+        crate::kernel::exec::scheduler::domain_budget::MAX_PIPELINE_PASSES,
+    );
+    FORCED_PIPELINE_PASSES.store(clamped, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) static BURST_SEEN_THIS_PASS: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
 

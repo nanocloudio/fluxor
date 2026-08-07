@@ -629,12 +629,39 @@ pub fn cmd_publish_fmod(
                     skipped_idempotent += 1;
                     continue;
                 }
-                errors.push(format!(
-                    "{} already exists with different content — bump module version in modules/<tier>/{}/manifest.toml",
-                    dest.display(),
-                    owned_module.name,
-                ));
-                continue;
+                // One exception to the immutability promise, and it is not a
+                // loosening of it: an artefact that attests a SUPERSEDED ABI
+                // surface cannot be loaded by any consumer — the runtime
+                // rejects it outright — so the version currently identifies
+                // something unusable. Replacing it restores the promise that
+                // `(name, version)` names the artefact that actually runs.
+                //
+                // Without this an ABI-surface change would strand every
+                // published fmod in the ecosystem simultaneously, since each
+                // would need a version bump to become republishable — bumping
+                // module versions to describe a change in the BUILD
+                // ENVIRONMENT rather than in the module.
+                let stale_surface = match crate::modules::ModuleInfo::from_file(&dest) {
+                    Ok(info) => {
+                        info.manifest.abi_surface != Some(crate::hash::abi_surface_digest())
+                    }
+                    // Unreadable is stale by the same argument: unusable.
+                    Err(_) => true,
+                };
+                if stale_surface {
+                    println!(
+                        "note: replacing {} — it attests a superseded ABI surface \
+                         and cannot be loaded",
+                        dest.display()
+                    );
+                } else {
+                    errors.push(format!(
+                        "{} already exists with different content — bump module version in modules/<tier>/{}/manifest.toml",
+                        dest.display(),
+                        owned_module.name,
+                    ));
+                    continue;
+                }
             }
             fs::copy(&src, &dest)?;
             published.push(dest);

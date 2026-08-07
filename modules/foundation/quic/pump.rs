@@ -3202,12 +3202,24 @@ unsafe fn emit_crypto_packet(
     let mut main_stream_fin_emitted = false;
     let mut had_extra_stream = [false; MAX_EXTRA_STREAMS];
     let mut extra_stream_buf_len = [0usize; MAX_EXTRA_STREAMS];
+    let mut had_max_streams = false;
     let mut extra_stream_fin_emitted = [false; MAX_EXTRA_STREAMS];
     let mut had_bidi_stream = [false; MAX_BIDI_EXTRA_STREAMS];
     let mut bidi_stream_buf_len = [0usize; MAX_BIDI_EXTRA_STREAMS];
     let mut bidi_stream_fin_emitted = [false; MAX_BIDI_EXTRA_STREAMS];
     if matches!(level, EncLevel::OneRtt) && !ack_only_mode {
         let conn = &s.conns[idx];
+        // MAX_STREAMS credit first: it is small, and a peer blocked on stream
+        // count cannot make progress until it lands.
+        if conn.max_streams_tx_pending {
+            let mut frame_buf = [0u8; 16];
+            let n = build_max_streams_bidi(conn.max_streams_bidi_granted, &mut frame_buf);
+            if n > 0 && payload_len + n <= payload.len() {
+                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                payload_len += n;
+                had_max_streams = true;
+            }
+        }
         if conn.stream_send_buf_len > 0 || conn.stream_send_fin {
             let mut frame_buf = [0u8; QUIC_DGRAM_MAX];
             let n = build_stream(
@@ -3369,14 +3381,25 @@ unsafe fn emit_crypto_packet(
         0
     };
     if pad_to_min_initial {
-        let token_len_size = if token_inline_len == 0 { 1 } else { 2 };
-        let est_length_size = 4; // varint(len) — bumped pessimistically
+        // RFC 9000 §14.1 cuts both ways: a client MUST expand a datagram
+        // carrying an Initial to at least 1200 bytes, and a server MUST DISCARD
+        // one that is smaller. So the estimate below must err HIGH on the
+        // padding, never high on the header — an over-padded Initial is legal
+        // (any size up to the path MTU), an under-padded one is invisible.
+        //
+        // "Invisible" is the whole difficulty: a short Initial draws no error
+        // and no close, just silence, so it presents as packet loss. A peer
+        // that retransmits and never gets a reply is the signature to look for.
+        // Every size below is therefore the MINIMUM plausible one, so any
+        // estimation error can only add padding.
+        let token_len_size = 1;
+        let est_length_size = 1;
         let hdr = 1 + 4 + 1 + dcid.len() + 1 + scid.len()
             + token_len_size + token_inline_len + est_length_size;
         let aead = pn_len + payload_len + 16;
         let total = hdr + aead;
-        if total < 1200 {
-            let pad = 1200 - total;
+        if total < INITIAL_MIN_DATAGRAM_LEN {
+            let pad = INITIAL_MIN_DATAGRAM_LEN - total;
             if payload_len + pad <= payload.len() {
                 payload_len += pad;
             }
@@ -3465,6 +3488,9 @@ unsafe fn emit_crypto_packet(
         let conn = &mut s.conns[idx];
         if had_handshake_done {
             conn.pending_handshake_done = false;
+        }
+        if had_max_streams {
+            conn.max_streams_tx_pending = false;
         }
         if had_new_cid {
             conn.new_cid_tx_pending = false;

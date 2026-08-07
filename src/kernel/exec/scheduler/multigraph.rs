@@ -493,7 +493,12 @@ fn step_graph_owner(
         // system-graph output through their normal scheduled pass.
         let refilled =
             slot == 0 && step_domain_pipeline_refill(modules, sched, domain, active_count);
-        if !BURST_SEEN_THIS_PASS[domain].load(Ordering::Relaxed) && !refilled {
+        // Same forced-pass override as the single-graph loop in
+        // domain_budget.rs, via the shared predicate.
+        if !BURST_SEEN_THIS_PASS[domain].load(Ordering::Relaxed)
+            && !refilled
+            && !super::stepping::forced_pass_pending(tick_pass)
+        {
             break;
         }
     }

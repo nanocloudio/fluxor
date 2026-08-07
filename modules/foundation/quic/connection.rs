@@ -267,6 +267,12 @@ pub struct BidiExtraStream {
     pub recv_buf_len: usize,
     pub recv_fin: bool,
 
+    /// `h3_app`: has this slot's STREAM_ACCEPTED / STREAM_CLOSED been
+    /// delivered to the app? Per slot, and latched only on a successful
+    /// enqueue, so backpressure retries rather than losing the event.
+    pub app_open_sent: bool,
+    pub app_close_sent: bool,
+
     /// Per-slot POST body accumulation; mirrors the legacy stream's
     /// `h3_post_*` fields on `QuicConnection`.
     pub h3_post_in_progress: bool,
@@ -280,6 +286,8 @@ pub struct BidiExtraStream {
 impl BidiExtraStream {
     pub const fn empty() -> Self {
         Self {
+            app_open_sent: false,
+            app_close_sent: false,
             stream_id: 0,
             allocated: false,
             locally_initiated: false,
@@ -878,6 +886,13 @@ pub struct QuicConnection {
     // ── Raw bidi-stream surface (non-h3 ALPN) ──────────────────────
     /// Whether we've emitted the one-shot MSG_QUIC_STREAM_OPEN event for
     /// the main bidi stream (id 0) to the app surface.
+    /// Cumulative bidi-stream allowance granted to the peer (RFC 9000 §4.6).
+    /// Starts at the `initial_max_streams_bidi` transport parameter and rises
+    /// as request streams are reclaimed, so a connection is not limited to its
+    /// initial allowance for life.
+    pub max_streams_bidi_granted: u64,
+    /// A MAX_STREAMS frame is owed to the peer.
+    pub max_streams_tx_pending: bool,
     pub raw_stream_open_sent: bool,
     /// Whether the terminal MSG_MUX_STREAM_CLOSED has been emitted to the
     /// app for the main bidi stream. Latched so a peer FIN (including an
@@ -1020,6 +1035,8 @@ impl QuicConnection {
             path_response_to_port: 0,
             recv_ip: [0; 4],
             recv_port: 0,
+            max_streams_bidi_granted: 4,
+            max_streams_tx_pending: false,
             raw_stream_open_sent: false,
             raw_stream_close_sent: false,
             peer_identity_sent: false,

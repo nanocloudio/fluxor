@@ -34,6 +34,7 @@ mod hash;
 mod hygiene;
 mod lockfile;
 mod manifest;
+mod module_test;
 mod modules;
 mod modules_build;
 mod monitor;
@@ -320,6 +321,11 @@ fn main() {
             project_root,
             features,
         } => lockfile::cmd_update(project_root.as_deref(), &features),
+        Commands::Test {
+            module,
+            project_root,
+            verbose,
+        } => module_test::cmd_test(project_root.as_deref(), module.as_deref(), verbose),
         Commands::Sync {
             project_root,
             dry_run,

@@ -577,6 +577,18 @@ fn main() {
     // Test hook: when FLUXOR_TEST_REBUILD_EVERY=N is set,
     // self-trigger a graph rebuild every N loop iterations to exercise the
     // live-rebuild loop without a full reconfigure graph. No-op when unset.
+    // FLUXOR_FORCED_PASSES=K makes the scheduler run at least K exec-order
+    // passes per tick (clamped to MAX_PIPELINE_PASSES), so a reply path that
+    // flows against exec order can complete within a tick without any module
+    // returning Burst. Unset means 1: one pass per idle tick, the same as a
+    // build without the variable. See `scheduler::FORCED_PIPELINE_PASSES`.
+    if let Some(k) = std::env::var("FLUXOR_FORCED_PASSES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        fluxor::kernel::exec::scheduler::set_forced_pipeline_passes(k);
+        eprintln!("[fluxor-linux] forced pipeline passes = {k}");
+    }
     let test_rebuild_every: u64 = std::env::var("FLUXOR_TEST_REBUILD_EVERY")
         .ok()
         .and_then(|s| s.parse().ok())

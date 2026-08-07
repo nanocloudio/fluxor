@@ -448,6 +448,26 @@ pub fn build_max_data(maximum_data: u64, out: &mut [u8]) -> usize {
     pos + n
 }
 
+/// Build a MAX_STREAMS (bidi) frame (RFC 9000 §19.11).
+///
+/// The value is a CUMULATIVE maximum stream count, not an increment: it says
+/// "you may have opened this many bidirectional streams in total", so a sender
+/// that treats it as a delta grants far less credit than it means to.
+///
+/// Without this frame a connection is limited forever to the
+/// `initial_max_streams_bidi` transport parameter — 4 here — which for HTTP/3
+/// means four requests per connection for its entire life. Browsers reuse a
+/// connection for dozens.
+pub fn build_max_streams_bidi(maximum_streams: u64, out: &mut [u8]) -> usize {
+    let mut pos = 0;
+    if out.is_empty() { return 0; }
+    out[pos] = FRAME_MAX_STREAMS_BIDI;
+    pos += 1;
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_streams) };
+    if n == 0 { return 0; }
+    pos + n
+}
+
 /// Build a MAX_STREAM_DATA frame (RFC 9000 §19.10). Bumps the peer's
 /// per-stream send window for `stream_id`.
 pub fn build_max_stream_data(stream_id: u64, maximum: u64, out: &mut [u8]) -> usize {

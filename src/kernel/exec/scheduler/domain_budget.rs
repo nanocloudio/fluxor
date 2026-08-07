@@ -356,7 +356,12 @@ pub fn step_domain_modules(
         }
         let refilled = step_domain_pipeline_refill(modules, sched, domain_id, &mut active_count);
         // No module backlog and no newly-admitted device input → drained.
-        if !BURST_SEEN_THIS_PASS[domain_id].load(Ordering::Relaxed) && !refilled {
+        // A forced pass overrides this exit only: the budget breaks above
+        // still apply, so K forced passes are bounded as one pass is.
+        if !BURST_SEEN_THIS_PASS[domain_id].load(Ordering::Relaxed)
+            && !refilled
+            && !super::stepping::forced_pass_pending(tick_pass)
+        {
             break;
         }
     }
