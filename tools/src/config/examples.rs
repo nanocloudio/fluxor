@@ -82,7 +82,7 @@ pub static EXAMPLES: LazyLock<HashMap<&'static str, Value>> = LazyLock::new(|| {
     // HTTP/Icecast streaming - URL configured at runtime via MQTT
     m.insert("http-stream", json!({
         "sources": [
-            {"type": "TcpSocket", "id": 0, "content_type": "AudioMp3"}
+            {"type": "TcpSocket", "id": 0, "content_type": "AudioEncoded"}
         ],
         "sinks": [
             {"type": "I2sOutput", "id": 0, "data_pin": 28, "clock_pin_base": 26, "bits": 16, "sample_rate": 44100}

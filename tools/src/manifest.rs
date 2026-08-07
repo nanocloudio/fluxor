@@ -58,8 +58,8 @@ fn content_type_from_str(s: &str) -> Result<u8> {
         return Ok(idx as u8);
     }
     // Levenshtein "did you mean" hint — content_type typos in port
-    // declarations are common (e.g. `content_type: "AudioMP3"` vs
-    // `"AudioMp3"`). Case-insensitive match would have caught the
+    // declarations are common (e.g. `content_type: "AudioSAMPLE"` vs
+    // `"AudioSample"`). Case-insensitive match would have caught the
     // capitalisation difference; the closest_match catches actual
     // misspellings (`"AudioSamle"` → `"AudioSample"`). The helper
     // lives in `crate::text_distance` so it's reachable from both

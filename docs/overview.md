@@ -32,6 +32,7 @@ How the system works. These are the authoritative references.
 - [architecture/timing.md](architecture/timing.md) — stream clock vs wall clock, StreamTime, producer scheduling
 - [architecture/hal_architecture.md](architecture/hal_architecture.md) — HAL boundaries, syscall table, kernel/module split, per-silicon HAL
 - [architecture/abi_layers.md](architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
+- [architecture/abi_surface.md](architecture/abi_surface.md) — the ABI-surface digest: what it hashes, where it is stamped, and the four gates that check it
 - [architecture/events.md](architecture/events.md) — event objects, IRQ binding, scheduler wake, ISR safety contract
 - [architecture/capability_surface.md](architecture/capability_surface.md) — capability resolution, auto-wiring, hardware abstraction
 - [architecture/input_capability_surface.md](architecture/input_capability_surface.md) — input surfaces, capabilities, interaction groups

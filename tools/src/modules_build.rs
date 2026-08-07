@@ -747,6 +747,15 @@ fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool
             }
         }
     }
+    // Project-local sources pulled in by `include!` — shared cores that live
+    // OUTSIDE the module directory (the common pattern: many modules include one
+    // `modules/common/*.rs`). The walk above cannot see them, so without this a
+    // shared-core edit leaves every consumer's `.fmod` looking up to date and
+    // silently ships stale device code. The SDK's own deep includes are covered
+    // by the digest check below; this covers the project's.
+    if !includes_are_older(&cand.dir, out_mtime) {
+        return false;
+    }
     // ABI-surface freshness — the precise invalidation trigger. Mtime cannot
     // catch a digest change that comes from a deep SDK edit (kernel_abi.rs,
     // wire.rs, contracts/*, platform/*, internal/*) or a regenerated digest
@@ -767,6 +776,79 @@ fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool
 
 fn mtime(p: &Path) -> Option<SystemTime> {
     p.metadata().ok()?.modified().ok()
+}
+
+/// Whether every file transitively reachable from `dir`'s `.rs` sources via
+/// `include!("…")` is older than `out_mtime`.
+///
+/// Follows the include graph rather than guessing at a directory convention, so
+/// it holds for any layout, and tracks a `visited` set so an include cycle or a
+/// diamond terminates. Paths that don't resolve are ignored: a missing include
+/// is the compiler's error to report, not a reason to rebuild forever.
+fn includes_are_older(dir: &Path, out_mtime: SystemTime) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut queue: Vec<std::path::PathBuf> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    while let Some(path) = queue.pop() {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !visited.insert(canonical) {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let base = path.parent().unwrap_or(Path::new("."));
+        for target in include_paths(&src) {
+            let resolved = base.join(&target);
+            let Ok(resolved) = resolved.canonicalize() else {
+                continue;
+            };
+            if let Some(im) = mtime(&resolved) {
+                if im > out_mtime {
+                    return false;
+                }
+            }
+            queue.push(resolved);
+        }
+    }
+    true
+}
+
+/// Extract the literal paths from `include!("…")` / `include_str!` /
+/// `include_bytes!` invocations in `src`.
+fn include_paths(src: &str) -> Vec<String> {
+    const MACROS: [&str; 3] = ["include!", "include_str!", "include_bytes!"];
+    let mut out = Vec::new();
+    for mac in MACROS {
+        let mut from = 0;
+        while let Some(hit) = src[from..].find(mac) {
+            let after = from + hit + mac.len();
+            from = after;
+            // Skip whitespace and the opening delimiter, then take the string
+            // literal. Anything else (a macro-generated path, say) is ignored.
+            let rest = src[after..].trim_start();
+            let Some(rest) = rest
+                .strip_prefix('(')
+                .or_else(|| rest.strip_prefix('['))
+                .or_else(|| rest.strip_prefix('{'))
+            else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_string());
+            }
+        }
+    }
+    out
 }
 
 fn compile_module_pic(
@@ -1178,5 +1260,52 @@ mod tests {
         assert!(matches_target(&c, "linux", "bcm2712"));
         // But the silicon alone doesn't imply the host token.
         assert!(!matches_target(&c, "bcm2712", "bcm2712"));
+    }
+
+    #[test]
+    fn include_paths_finds_every_include_macro_form() {
+        let src = r#"
+            include!("../common/agg_core.rs");
+            include_str!("banner.txt");
+            include_bytes!( "blob.bin" );
+            include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+        "#;
+        let got = include_paths(src);
+        assert!(got.contains(&"../common/agg_core.rs".to_string()));
+        assert!(got.contains(&"banner.txt".to_string()));
+        assert!(
+            got.contains(&"blob.bin".to_string()),
+            "whitespace before the literal is fine"
+        );
+        assert_eq!(
+            got.len(),
+            3,
+            "a macro-generated path has no literal to follow"
+        );
+    }
+
+    #[test]
+    fn a_shared_core_edit_invalidates_a_module_that_includes_it() {
+        // A core OUTSIDE the module directory, reached only via `include!`,
+        // must still invalidate the module that includes it — otherwise
+        // editing the core silently ships a stale .fmod.
+        let tmp = std::env::temp_dir().join(format!("fluxbuild-{}", std::process::id()));
+        let moddir = tmp.join("app/thing");
+        let common = tmp.join("common");
+        std::fs::create_dir_all(&moddir).unwrap();
+        std::fs::create_dir_all(&common).unwrap();
+        let core = common.join("core.rs");
+        std::fs::write(&core, "// core").unwrap();
+        std::fs::write(moddir.join("mod.rs"), "include!(\"../../common/core.rs\");").unwrap();
+
+        // An output newer than everything: fresh.
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(includes_are_older(&moddir, future));
+
+        // An output older than the core: stale, via the include edge alone.
+        let past = SystemTime::now() - std::time::Duration::from_secs(3600);
+        assert!(!includes_are_older(&moddir, past));
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

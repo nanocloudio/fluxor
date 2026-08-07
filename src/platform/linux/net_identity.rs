@@ -6,7 +6,7 @@
 // CREATE header — not a consumer-facing surface. The contract carries only
 // portable intents (own network domain; an address/segment); this module maps
 // them onto the Linux mechanism: the sandbox's own netns (unshared in
-// `oci.rs`), a veth pair whose peer is moved into that netns at creation, and
+// `host_backend.rs`), a veth pair whose peer is moved into that netns at creation, and
 // the identity address configured on the peer.
 //
 // Division of labour (fluxor = mechanism, nanocloud = policy):
@@ -37,8 +37,8 @@ pub struct NetIdentity {
     pub prefix_len: u8,
 }
 
-/// Interface names for a sandbox slot: host end / container end. `idx` is an
-/// `oci` slot index (`< MAX_SANDBOXES`), so `fx?{idx}` stays far inside the
+/// Interface names for a sandbox slot: host end / container end. `idx` is a
+/// `host_backend` sandbox slot index (`< MAX_SANDBOXES`), so `fx?{idx}` stays far inside the
 /// IFNAMSIZ 15-byte limit; the assert keeps a future slot-table growth from
 /// silently truncating or overflowing names.
 fn ifnames(idx: usize) -> ([u8; 16], [u8; 16]) {

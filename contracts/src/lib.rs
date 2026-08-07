@@ -52,9 +52,14 @@ pub mod content_type {
 //   - VideoScanout — present-ready output to a paced display sink
 //   - MediaMuxed   — deliberate combined AV/timing/container streams
 //
-// AudioOpus / AudioMp3 / AudioAac / ImageJpeg / ImagePng are codec-tagged
-// variants kept distinct from the generic AudioEncoded / VideoEncoded
-// surfaces so `content_type` can carry codec identity without sideband.
+// Codec identity is deliberately NOT part of this table. Encoded surfaces
+// are generic (AudioEncoded / VideoEncoded): a content type names a
+// substitution surface, not an implementation enumeration, so per-codec
+// forks are rejected at review. Codec identity travels in-band — encoded
+// access units and container formats are self-describing — or as a
+// capability fact on the wiring edge. Whole encoded images ride
+// OctetStream (magic-byte self-describing). See the vocabulary admission
+// test in `docs/architecture/abi_layers.md`.
 
 /// Content-type byte → friendly name. Single source of truth re-exported
 /// by `fluxor-tools` so manifest parsing and compiled-config decoding
@@ -67,14 +72,9 @@ pub const CONTENT_TYPES: &[&str] = &[
     "Cbor",
     "Json",
     "AudioSample",
-    "AudioOpus",
-    "AudioMp3",
-    "AudioAac",
     "TextPlain",
     "TextHtml",
     "VideoRaster",
-    "ImageJpeg",
-    "ImagePng",
     "MeshEvent",
     "MeshCommand",
     "MeshState",
@@ -235,14 +235,9 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     Control, // Cbor
     Control, // Json
     Audio,   // AudioSample
-    Audio,   // AudioOpus
-    Audio,   // AudioMp3
-    Audio,   // AudioAac
     Control, // TextPlain
     Control, // TextHtml
     Audio,   // VideoRaster (see note above)
-    Control, // ImageJpeg (whole-image, latency-tolerant)
-    Control, // ImagePng
     Control, // MeshEvent
     Control, // MeshCommand
     Control, // MeshState

@@ -538,6 +538,55 @@ Anything device-shaped in the binary that is not manifest-visible or
 listed in the backends table is drift by construction — it bypasses
 the mechanism that keeps kernel-resident drivers accountable.
 
+## Vocabulary admission
+
+Fluxor owns every shared naming and numeric namespace — `CONTENT_TYPES`
+wire bytes, `CAPABILITY_NAMES`, `PROVIDER_CONTRACTS`, contract ids,
+permission bits, fd tags. Centrality is what makes cross-repo wiring
+and drift-guarding possible, so the tables stay here; the question is
+only what earns an entry. Apply this two-question test to every
+proposed name:
+
+1. **Does the kernel or fluxor tooling need it to route, validate, or
+   gate?** A wire byte the kernel routes by, a manifest name the config
+   compiler validates, a contract id with a vtable, a permission bit —
+   central, no debate.
+2. **Is it a substitution point across repo boundaries?** Could a
+   producer or consumer from a *different* sibling plausibly sit on
+   either end of the edge? If yes — central: surfaces exist precisely
+   so siblings interoperate without depending on each other. If the
+   only parties that will ever speak it are a matched pair inside one
+   sibling — it stays sibling-private, riding a generic envelope.
+
+Fail both questions and the name does not land, however useful it is
+to the sibling proposing it.
+
+**Envelope vs. payload.** Central vocabulary names the envelope — the
+generic, substitutable surface. The payload schema inside it is
+sibling-owned. `EventTimelineVideo` / `EventTimelineAudio` are the
+canonical example: the surface declares "frame-aligned event stream,
+video/audio flavour" and receivers parse the sibling-defined inner
+packet; the producer's domain identity never enters the table. The GPU
+capabilities follow the same split (`gpu.render` / `gpu.compute` are
+central; RDP-level semantics live in the sibling that owns them). Any
+sibling that needs private semantics gets them this way — never by
+minting a central name.
+
+**No implementation enumerations.** A name must identify *what the
+data is*, not *which implementation produced it*. Codec identity is
+the standing example: encoded surfaces are the generic `AudioEncoded`
+/ `VideoEncoded`, and codec identity travels in-band (access units and
+containers are self-describing) or as a capability fact on the edge —
+per-codec content types are rejected. The same reasoning bars
+per-vendor, per-chip, or per-protocol-revision forks of any existing
+surface; those are facts or in-band discriminants, not names.
+
+**Review smell.** If evaluating a table addition requires
+understanding one sibling's internals, the entry is in the wrong
+place. A central name must be reviewable from its own definition:
+what bytes flow, what substitutes for what, and what the kernel or
+tooling does with it.
+
 ## Boundary decisions
 
 Decisions on ABI vocabulary and surface placement. Each carries its status:
@@ -579,7 +628,8 @@ crypto internal platform runtime wire assets`) — not one directory per file,
 and not flat-until-forced. Named exceptions, each justified as an entry point
 or generated artifact that other files path-mount: `modules/sdk/abi.rs` (the
 assembler), `abi_surface.rs` / `abi_surface_srcpin.rs` (the pin machinery,
-path-referenced by `tools/src/abi_pin.rs`), `runtime.rs` (the module-side
+path-referenced by `tools/src/abi_pin.rs` — see
+[abi_surface.md](abi_surface.md)), `runtime.rs` (the module-side
 aggregator), `fence.rs` (a cross-cutting ABI value-type at the `abi` root).
 
 A domain earns a new directory when a concern no longer reads as one of the
@@ -611,12 +661,12 @@ nanocloud", refined below). Host-side stages executed; rig validation pending
 (see `.context/boundary_ledger.md`).
 
 The constraint that shaped HOW: the isolation mechanism
-(`src/platform/linux/oci.rs`: fork/unshare/cgroups/rootfs) needs host `std`,
+(`src/platform/linux/host_backend.rs`: fork/unshare/cgroups/rootfs) needs host `std`,
 and nanocloud has NO std-native code — it is entirely no_std PIC modules run
 BY fluxor-linux, the only std host on a node. So the mechanism cannot become a
 nanocloud *module*. Realization: the mechanism stays in fluxor's Linux
 platform but is reduced to a GENERIC isolation primitive that knows no OCI
-format; nanocloud owns the OCI→params mapping (policy). `oci.rs` reads no
+format; nanocloud owns the OCI→params mapping (policy). `host_backend.rs` reads no
 bundle/OCI on-disk format: `build_plan(argv, rootfs, isolate)` takes explicit
 params, cgroup limits come solely from the portable `ResourceEnvelope`, and
 the `workload` 0x1A CREATE source section carries explicit spawn params

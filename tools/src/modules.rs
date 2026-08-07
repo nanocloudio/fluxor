@@ -345,13 +345,15 @@ fn verify_module_abi_surface(info: &ModuleInfo, path: &Path) -> Result<()> {
         Some(packed) if packed == current => Ok(()),
         Some(packed) => Err(Error::Module(format!(
             "{}: built against a different ABI surface (module attests \
-             {}, current is {}) — rebuild it with `fluxor modules build`",
+             {}, current is {}) — rebuild it with `fluxor modules build`. \
+             See docs/architecture/abi_surface.md",
             path.display(),
             hex12(&packed),
             hex12(&current),
         ))),
         None => Err(Error::Module(format!(
-            "{}: carries no ABI-surface attestation — rebuild it with `fluxor modules build`",
+            "{}: carries no ABI-surface attestation — rebuild it with \
+             `fluxor modules build`. See docs/architecture/abi_surface.md",
             path.display(),
         ))),
     }
@@ -882,7 +884,33 @@ fn write_atomic(output: &Path, data: &[u8]) -> std::io::Result<()> {
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
     std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, output)
+    // Read back what actually landed, before publishing it. A writer that
+    // reports success while leaving a short or empty artefact is the worst
+    // failure this path has: the build prints `failed 0`, the artefact is
+    // corrupt, and the damage surfaces later — in another repo, as a load
+    // error, with nothing pointing back here. Verify at the point of
+    // production so it cannot be reported as built.
+    verify_written(&tmp, data.len())?;
+    std::fs::rename(&tmp, output)?;
+    // And again after the rename: this is the file consumers symlink to, so
+    // confirm the published artefact is the one just verified.
+    verify_written(output, data.len())
+}
+
+/// Fail unless `path` is exactly `expected` bytes on disk. On mismatch the
+/// file is removed rather than left behind: a short artefact that survives
+/// would be picked up by the next consumer, whereas a missing one is rebuilt.
+fn verify_written(path: &Path, expected: usize) -> std::io::Result<()> {
+    let landed = std::fs::metadata(path)?.len();
+    if landed as usize == expected {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(path);
+    Err(std::io::Error::other(format!(
+        "{}: wrote {expected} bytes but {landed} landed on disk — the artefact \
+         was truncated or replaced while being written",
+        path.display(),
+    )))
 }
 
 /// Pack ELF object into .fmod format (ABI v2 with manifest)
@@ -1656,5 +1684,31 @@ mod tests {
             u32::from_le_bytes([table[0], table[1], table[2], table[3]]),
             MODULE_TABLE_MAGIC
         );
+    }
+
+    /// A writer that produces a short artefact must fail loudly at the point
+    /// of production, not leave a corrupt `.fmod` that reports as built. The
+    /// failure this guards is silent: an empty artefact passes every build
+    /// gate and only surfaces later, in another repo, as a load error.
+    #[test]
+    fn write_atomic_rejects_a_short_write() {
+        let dir = std::env::temp_dir().join(format!("fluxwrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.fmod");
+
+        // Honest write succeeds and lands whole.
+        write_atomic(&path, &[7u8; 128]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 128);
+
+        // A mismatch between what we claim to write and what lands is caught.
+        let err = verify_written(&path, 999).unwrap_err();
+        assert!(
+            format!("{err}").contains("landed on disk"),
+            "expected a size-mismatch error, got: {err}"
+        );
+        // …and the bad artefact is removed rather than left for a consumer.
+        assert!(!path.exists(), "short artefact must not survive");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

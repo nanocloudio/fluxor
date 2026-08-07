@@ -17,14 +17,17 @@
 //! one.
 //!
 //! Workspace mode is detected and surfaced via advisory: when the
-//! upstream lives as a live workspace member, sync *prefers* the
-//! member's locally-built `target/` artefacts as an override.
-//! Anything the member hasn't built locally falls through to the
-//! lockfile's registry copy (hash-verified). This matches RFC §5's
-//! "availability ≠ wiring" stance — the lockfile records what's
-//! available; the live build is an optional iteration override, not
-//! a prerequisite. A summary advisory names every workspace member
-//! that fell back so developers know which local builds are missing.
+//! upstream lives as a live workspace member, the member is the
+//! AUTHORITATIVE fmod source — the registry copy is never consulted
+//! for it. An fmod the member hasn't built locally is built by sync
+//! itself (one `fluxor modules build --target T` per member/target,
+//! cheap when digest-fresh); an fmod the member no longer provides is
+//! a stale lock entry and a hard error naming `fluxor update`.
+//! Falling back to the registry instead would let a snapshot of a
+//! module upstream has deleted keep resolving indefinitely, with
+//! nothing to reveal it. Runtime binaries keep the registry fallback
+//! (rebuilding a kernel is not sync's call), surfaced by the
+//! per-member advisory.
 //!
 //! **Live-sourced destinations are symlinks, not copies** — for all
 //! three artefact kinds (fmods, runtime binaries, and `[[crate]]`
@@ -198,6 +201,11 @@ fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) ->
     let mut copied_live = 0usize;
     let mut skipped_same = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    // Sources that cannot load. Counted only on the reporting path (the
+    // `unloadable` probe parses the module, which quiet callers should not
+    // pay for) and surfaced in the summary, so the last line a caller reads
+    // matches what the warnings above it said.
+    let mut unloadable_sources = 0usize;
     // (project, target) → count of fmods/runtimes that fell back to
     // the registry because the workspace member had no local build.
     // Aggregated to one summary line per (project, target) so a
@@ -216,51 +224,105 @@ fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) ->
     // error.
     let mut written_fmods: BTreeMap<PathBuf, (String, String)> = BTreeMap::new(); // dest -> (project, hash)
 
+    // (project, target) pairs we've already run a convergence build
+    // for this sync, and the subset whose build failed (so later
+    // entries report "build failed" rather than "stale entry").
+    let mut build_attempted: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    let mut build_failed: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+
     for entry in &lock.fmods {
-        // Resolve fmod source: live workspace member's local build
-        // wins if present, otherwise fall back to the registry copy
-        // recorded in the lockfile (hash-verified). A live workspace
-        // member that hasn't built a particular fmod locally is fine
-        // — that fmod just resolves from the registry like any
-        // non-member dep. Iteration is opt-in per-artefact, not
-        // all-or-nothing.
+        // A missing local build in a live member is one of exactly two
+        // things, and sync resolves both rather than papering over them:
+        //
+        //   1. Not built yet → build it now (once per project/target;
+        //      digest-keyed staleness makes the no-op case fast).
+        //   2. The member no longer provides the module → the lock
+        //      entry is stale; hard error naming `fluxor update`.
         //
         // Live layouts: `fluxor modules build` (no --out) writes to
         // `target/fluxor/<silicon>/modules/`; `fluxor modules build
         // --all --out target` writes to `target/<silicon>/modules/`.
         // Sync accepts either; the registry-shaped layout wins when
         // both exist.
-        let live_src_opt = workspace_members
-            .get(&entry.project)
-            .and_then(|member_path| {
-                let canonical = member_path
-                    .join("target")
-                    .join("fluxor")
-                    .join(&entry.target)
-                    .join("modules")
-                    .join(format!("{}.fmod", entry.name));
-                let flat = member_path
-                    .join("target")
-                    .join(&entry.target)
-                    .join("modules")
-                    .join(format!("{}.fmod", entry.name));
-                if canonical.exists() {
-                    Some(canonical)
-                } else if flat.exists() {
-                    Some(flat)
-                } else {
-                    None
+        fn live_fmod_path(member_path: &Path, target: &str, name: &str) -> Option<PathBuf> {
+            let canonical = member_path
+                .join("target")
+                .join("fluxor")
+                .join(target)
+                .join("modules")
+                .join(format!("{name}.fmod"));
+            let flat = member_path
+                .join("target")
+                .join(target)
+                .join("modules")
+                .join(format!("{name}.fmod"));
+            if canonical.exists() {
+                Some(canonical)
+            } else if flat.exists() {
+                Some(flat)
+            } else {
+                None
+            }
+        }
+        let member = workspace_members.get(&entry.project);
+        let mut live_src_opt = member.and_then(|m| live_fmod_path(m, &entry.target, &entry.name));
+
+        if live_src_opt.is_none() {
+            if let Some(member_path) = member {
+                let key = (entry.project.clone(), entry.target.clone());
+                if dry_run {
+                    // Report what a real sync would do; build nothing.
+                    *fallback_counts.entry(key).or_insert(0) += 1;
+                    continue;
                 }
-            });
+                if !build_attempted.contains(&key) {
+                    build_attempted.insert(key.clone());
+                    if !quiet {
+                        println!(
+                            "note: live member `{}` has no local build for target `{}` — building…",
+                            entry.project, entry.target
+                        );
+                    }
+                    let built = std::env::current_exe()
+                        .ok()
+                        .and_then(|exe| {
+                            std::process::Command::new(exe)
+                                .args(["modules", "build", "--target", &entry.target])
+                                .current_dir(member_path)
+                                .status()
+                                .ok()
+                        })
+                        .is_some_and(|s| s.success());
+                    if !built {
+                        build_failed.insert(key.clone());
+                    }
+                }
+                live_src_opt = live_fmod_path(member_path, &entry.target, &entry.name);
+                if live_src_opt.is_none() {
+                    errors.push(if build_failed.contains(&key) {
+                        format!(
+                            "{}::{}/{}: live member's `fluxor modules build --target {}` failed \
+                             (see output above); registry copies are not used for live members",
+                            entry.project, entry.target, entry.name, entry.target,
+                        )
+                    } else {
+                        format!(
+                            "stale lockfile entry {}::{}/{}: live workspace member `{}` no longer \
+                             builds this module (registry copies are not used for live members) — \
+                             run `fluxor update` to drop it",
+                            entry.project, entry.target, entry.name, entry.project,
+                        )
+                    });
+                    continue;
+                }
+            }
+        }
 
         let (src, mode_label, expect_hash) = if let Some(live_src) = live_src_opt {
             (live_src, "live", None)
         } else {
-            if workspace_members.contains_key(&entry.project) {
-                *fallback_counts
-                    .entry((entry.project.clone(), entry.target.clone()))
-                    .or_insert(0) += 1;
-            }
             let reg_src = registry_root.join(&entry.source);
             if !reg_src.exists() {
                 errors.push(format!(
@@ -351,6 +413,7 @@ fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) ->
         if !dry_run && !quiet {
             let why = unloadable(&src);
             if !why.is_empty() {
+                unloadable_sources += 1;
                 eprintln!(
                     "warning: {} {why} — rebuild it upstream with `fluxor modules build`{}",
                     src.display(),
@@ -760,13 +823,22 @@ fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) ->
 
     // One-line advisory per (workspace-member, target) that lacked
     // local builds. Aggregated so a freshly-cloned upstream doesn't
-    // produce dozens of noisy lines — most of the time the developer
-    // just hasn't built anything yet, and that's fine.
+    // produce dozens of noisy lines. In a real run only RUNTIME
+    // artefacts still fall back to the registry (rebuilding a kernel
+    // binary is not sync's call to make); fmods converge via the
+    // member build above. In a dry run the counter instead reports
+    // the fmods a real sync would build.
     if !quiet {
         for ((project, target), count) in &fallback_counts {
-            println!(
-                "note: workspace member `{project}` had no local build for {count} artefact(s) ({target}); used registry copies (lockfile-pinned)"
-            );
+            if dry_run {
+                println!(
+                    "note: workspace member `{project}` has no local build for {count} fmod(s) ({target}); a real sync will build them"
+                );
+            } else {
+                println!(
+                    "note: workspace member `{project}` had no local build for {count} runtime artefact(s) ({target}); used registry copies (lockfile-pinned)"
+                );
+            }
         }
     }
 
@@ -780,8 +852,17 @@ fn run_sync(pr: &Path, lock: &lockfile::LockFile, dry_run: bool, quiet: bool) ->
             errors.len(),
         );
     } else if !quiet {
+        // Staged-but-unloadable is not an error (the artefact is staged so a
+        // later upstream rebuild fixes it in place), but a bare "0 errors"
+        // after a screen of warnings reads as success. Name it, and only when
+        // there is something to name.
+        let unloadable_note = match unloadable_sources {
+            0 => String::new(),
+            1 => ", 1 unloadable source".to_string(),
+            n => format!(", {n} unloadable sources"),
+        };
         println!(
-            "sync: copied {copied} (registry) + {copied_live} (live), {skipped_same} already in place, {} errors.",
+            "sync: copied {copied} (registry) + {copied_live} (live), {skipped_same} already in place, {} errors{unloadable_note}.",
             errors.len()
         );
     }

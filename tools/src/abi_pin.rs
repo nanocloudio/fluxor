@@ -79,23 +79,20 @@ pub fn compute(repo: &Path) -> Result<PinPlan> {
     let digest: [u8; 32] = h.finalize().into();
     let digest_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
 
+    // Two sites, not three: the harness lock asserts the kernel mount against
+    // `ABI_SURFACE_DIGEST` rather than restating the digest, so the only
+    // spelled-out copy in the tree is the tools-side tripwire below.
     let srcpin_file = repo.join("modules/sdk/abi_surface_srcpin.rs");
     let hash_file = repo.join("tools/src/hash.rs");
-    let harness_file = repo.join("tests/harness/tests/abi_surface_digest.rs");
 
     let mut sp = std::fs::read_to_string(&srcpin_file)?;
     sp = replace_u8_array(&sp, "CONTRACTS_PLATFORM_SRC_HASH", &srcpin)?;
     sp = replace_u8_array(&sp, "ABI_SURFACE_DIGEST", &digest)?;
     let hs = replace_hex(&std::fs::read_to_string(&hash_file)?, "hex, ", &digest_hex)?;
-    let hr = replace_hex(
-        &std::fs::read_to_string(&harness_file)?,
-        "LOCKED_DIGEST_HEX: &str = ",
-        &digest_hex,
-    )?;
 
     Ok(PinPlan {
         digest_hex,
-        edits: vec![(srcpin_file, sp), (hash_file, hs), (harness_file, hr)],
+        edits: vec![(srcpin_file, sp), (hash_file, hs)],
     })
 }
 

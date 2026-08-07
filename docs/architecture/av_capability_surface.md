@@ -26,9 +26,12 @@ AV pipelines move data on channels typed by `content_type`:
 | `VideoScanout`  | Present-ready frames to a paced sink| compositor → HDMI / DSI sink, page-flip, vsync handoff  |
 | `MediaMuxed`    | Deliberate AV / timing / container  | recording, broadcast packaging, MP4 / TS streams        |
 
-`AudioOpus`, `AudioMp3`, `AudioAac`, `ImageJpeg`, `ImagePng` exist as
-codec-tagged variants of the generic encoded surfaces so codec identity
-can travel in `content_type` itself without a sideband channel.
+Codec identity is not part of the surface family: a `content_type`
+names a substitution surface, not a codec enumeration, so there are no
+per-codec variants of the encoded surfaces. Codec identity travels
+in-band (encoded access units and container formats are
+self-describing) or as a capability fact on the wiring edge. See the
+vocabulary admission test in `abi_layers.md`.
 
 The capture-side companion, `VideoSensorRaw`, is a source-only surface
 covered by the capture-side architecture and is not part of this page.

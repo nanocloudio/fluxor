@@ -54,6 +54,15 @@ pub const TLM_DRAIN: u32 = 0x0C4E;
 /// Ring head + per-slot lag/drop counters.
 pub const TLM_STATS: u32 = 0x0C4F;
 
+/// Consumer slots the ring exposes — the `TLM_STATS` reply is
+/// `[head u32][dropped u32 × RING_CONSUMERS]`, so a caller sizes its buffer
+/// and indexes its own slot from this. Mirror of
+/// `kernel::sys::telemetry_ring::CONSUMERS`, pinned by `telemetry_ring.rs`'s
+/// wire test.
+pub const RING_CONSUMERS: usize = 4;
+/// Byte length of a `TLM_STATS` reply.
+pub const TLM_STATS_LEN: usize = 4 + RING_CONSUMERS * 4;
+
 /// `TLM_SUBSCRIBE` arg layout: a 4-byte filter word, optionally followed by an
 /// 8-byte LE PSTATUS cadence (ms) the subscriber wants the kernel to emit at
 /// (§5.3). Folding the cadence into subscribe avoids a separate op in the full
@@ -116,18 +125,28 @@ pub const TRACE_FLAGS_SAMPLED: u8 = 0x01;
 // The `otel` engine forwards drained records verbatim, packed behind one
 // envelope per flush (a `transport_buffer` sends each envelope as one datagram):
 //
-//   [magic u32 = BATCH_MAGIC][version u8][_rsvd u8][count u16][record × count]
+//   [magic u32 = BATCH_MAGIC][version u8][_rsvd u8][count u16][dropped u32]
+//   [record × count]
 //
 // Records are concatenated raw (each self-sizing via `record_len`), so the
 // host walks them without per-record framing. `count` is advisory — a decoder
 // that trusts the byte length can ignore it, but it catches truncation.
+//
+// `dropped` (rfc_observability_surface.md §11) is the CUMULATIVE count of
+// records the ring discarded for this consumer slot since boot — the export
+// path's own fidelity, reported in-band. Cumulative rather than per-batch so
+// the series is monotone: a lost datagram costs resolution, not truth, and the
+// host recovers the gap by differencing. Without it a saturated exporter is
+// indistinguishable from an idle one, which is precisely the failure §11
+// closes.
 pub const BATCH_MAGIC: u32 = 0x4C54_5846; // b"FXTL" little-endian
 pub const BATCH_VERSION: u8 = 1;
-pub const BATCH_HEADER_SIZE: usize = 8;
+pub const BATCH_HEADER_SIZE: usize = 12;
 
-/// Write the 8-byte batch envelope header. Returns its length, or `None` if
-/// `buf` is too small.
-pub fn write_batch_header(buf: &mut [u8], count: u16) -> Option<usize> {
+/// Write the batch envelope header. Returns its length, or `None` if `buf` is
+/// too small. `dropped` is the cumulative ring-drop count for the emitting
+/// consumer slot (see the envelope comment above).
+pub fn write_batch_header(buf: &mut [u8], count: u16, dropped: u32) -> Option<usize> {
     if buf.len() < BATCH_HEADER_SIZE {
         return None;
     }
@@ -135,6 +154,7 @@ pub fn write_batch_header(buf: &mut [u8], count: u16) -> Option<usize> {
     buf[4] = BATCH_VERSION;
     buf[5] = 0;
     buf[6..8].copy_from_slice(&count.to_le_bytes());
+    buf[8..12].copy_from_slice(&dropped.to_le_bytes());
     Some(BATCH_HEADER_SIZE)
 }
 
@@ -150,6 +170,12 @@ pub fn batch_count(buf: &[u8]) -> u16 {
     u16::from_le_bytes([buf[6], buf[7]])
 }
 
+/// Cumulative records dropped by the ring for the emitting consumer slot.
+/// Difference successive batches for the per-interval loss.
+pub fn batch_dropped(buf: &[u8]) -> u32 {
+    u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+}
+
 // Compile-time invariants — checked when the SDK compiles during module build.
 const _: () = assert!(HEADER_SIZE == 12);
 const _: () = assert!(METRIC_SCALAR_SIZE == 24);
@@ -158,7 +184,7 @@ const _: () = assert!(SPAN_SIZE == 64);
 const _: () = assert!(PSTATUS_STEP_SIZE == 52);
 const _: () = assert!(PSTATUS_RES_SIZE == 28);
 const _: () = assert!(MAX_RECORD_SIZE == 80);
-const _: () = assert!(BATCH_HEADER_SIZE == 8);
+const _: () = assert!(BATCH_HEADER_SIZE == 12);
 
 /// Total record length for a `(signal, kind)` header pair, or 0 if the pair is
 /// unrecognised. Lets a reader size a record from its header before draining.

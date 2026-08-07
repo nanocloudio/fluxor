@@ -50,7 +50,22 @@ mod otlp_pb {
     include!("../../sdk/cores/otlp_proto.rs");
 }
 
-/// Raw records staged between flushes.
+/// Raw records staged between flushes (rfc_observability_surface.md §11.2).
+///
+/// Target-split rather than flat: the ring this drains is itself scaled (32 KiB
+/// on bcm2712) and the sibling forwarders scale their channel buffers per
+/// target, so a flat 512 left an application processor staging 1/64th of what
+/// the ring holds. `cfg(target_arch)` is the established idiom for a
+/// module-internal array (cf. `tls`, `ip`, `dns`); a manifest `buffer_size`
+/// sizes *channel* rings and cannot reach a static like this one.
+///
+/// The bound is the path MTU, NOT available RAM: one batch is one datagram on
+/// the UDP carrier, so a batch past the MTU fragments and any single lost
+/// fragment destroys the whole batch. 1280 B of records + the 12 B envelope
+/// sits well inside a 1500 B Ethernet MTU with room for encapsulation.
+#[cfg(target_arch = "aarch64")]
+const ACCUM_MAX: usize = 1280;
+#[cfg(not(target_arch = "aarch64"))]
 const ACCUM_MAX: usize = 512;
 /// Resends of one retained batch before it is dropped. A carrier that cannot
 /// place a batch after this many attempts is not going to, and holding it
@@ -69,7 +84,11 @@ const EXPORT_MSG: u8 = 0x01;
 /// Output frame: carrier header + FXTL batch envelope + one full accumulation.
 const OUT_MAX: usize = FRAME_HDR + tlm::BATCH_HEADER_SIZE + ACCUM_MAX;
 /// OTLP/JSON body buffer — a full `ACCUM_MAX` of scalar metrics expands to a
-/// few KB of JSON (carrier header + document).
+/// few KB of JSON (carrier header + document). Scales with `ACCUM_MAX`: the
+/// ~8x expansion factor is a property of the encoding, not of the target.
+#[cfg(target_arch = "aarch64")]
+const JSON_MAX: usize = FRAME_HDR + 10240;
+#[cfg(not(target_arch = "aarch64"))]
 const JSON_MAX: usize = FRAME_HDR + 4096;
 
 #[repr(C)]
@@ -100,6 +119,11 @@ struct OtelState {
     ack_deadline_micros: u64,
     /// Resends spent on the currently retained batch.
     resends: u8,
+    /// Cumulative ring drops for our slot, sampled at each flush and stamped
+    /// into the batch envelope (rfc_observability_surface.md §11.2). Held
+    /// across flushes so a retained/resent batch reports the value that was
+    /// true when it was built.
+    dropped: u32,
     accum_len: u16,
     accum: [u8; ACCUM_MAX],
     out: [u8; OUT_MAX],
@@ -118,6 +142,7 @@ impl OtelState {
         self.awaiting_ack = false;
         self.ack_deadline_micros = 0;
         self.resends = 0;
+        self.dropped = 0;
         self.accum_len = 0;
     }
 }
@@ -332,7 +357,7 @@ unsafe fn emit_batch(s: &mut OtelState) -> bool {
     } else {
         // Compact FXTL: the raw record batch a host collector decodes.
         let count = record_count(&s.accum[..used]);
-        let Some(hdr) = tlm::write_batch_header(&mut s.out[FRAME_HDR..], count) else {
+        let Some(hdr) = tlm::write_batch_header(&mut s.out[FRAME_HDR..], count, s.dropped) else {
             return false;
         };
         s.out[FRAME_HDR + hdr..FRAME_HDR + hdr + used].copy_from_slice(&s.accum[..used]);
@@ -351,8 +376,34 @@ unsafe fn step_flush(s: &mut OtelState) {
     }
     let sys = &*s.syscalls;
     let now = dev_micros(sys);
-    if now.wrapping_sub(s.last_flush_micros) < (s.flush_ms as u64) * 1000 {
+    // Two triggers (rfc_observability_surface.md §11.2): the cadence, and a
+    // full accumulator. Without the size trigger a burst that fills `accum`
+    // stalls `step_drain` (which refuses to drain into less than one whole
+    // record of room) until the timer fires, pushing the overflow back onto
+    // the ring to be dropped. Flushing when full decouples burst capacity
+    // from cadence and leaves `flush_ms` a pure freshness knob.
+    let full = ACCUM_MAX - (s.accum_len as usize) < tlm::MAX_RECORD_SIZE;
+    if !full && now.wrapping_sub(s.last_flush_micros) < (s.flush_ms as u64) * 1000 {
         return;
+    }
+    // Sample our slot's cumulative ring drops so the batch reports the export
+    // path's own fidelity in-band. Best-effort: a failed read keeps the last
+    // known value rather than reporting a false zero.
+    // The slot bound is load-bearing, not defensive noise: `stats` is a fixed
+    // TLM_STATS_LEN buffer holding RING_CONSUMERS counters, so a slot outside
+    // that range would index past it.
+    if s.tlm_slot >= 0 && (s.tlm_slot as usize) < tlm::RING_CONSUMERS {
+        let mut stats = [0u8; tlm::TLM_STATS_LEN];
+        let n = (sys.provider_call)(s.tlm_slot, tlm::TLM_STATS, stats.as_mut_ptr(), stats.len());
+        if n >= tlm::TLM_STATS_LEN as i32 {
+            let off = 4 + (s.tlm_slot as usize) * 4;
+            s.dropped = u32::from_le_bytes([
+                stats[off],
+                stats[off + 1],
+                stats[off + 2],
+                stats[off + 3],
+            ]);
+        }
     }
     if !emit_batch(s) {
         return; // carrier not ready / nothing encoded — retry next step.

@@ -59,8 +59,13 @@ pub fn file_sha256_short(path: &Path) -> Result<String> {
 /// Recompute the canonical source hash over ALL of `modules/sdk` — the
 /// full SDK a module compiles against: kernel_abi (incl. SyscallTable
 /// layout and helper signatures), wire, config profiles, internal
-/// layers, contracts, platform. Only the generated pin file itself is
-/// excluded (self-reference).
+/// layers, contracts, platform — PLUS the repo-root `contracts/src`
+/// crate. The latter carries the wire vocabulary (`CONTENT_TYPES`
+/// positional bytes, capability names, rate classes) that every
+/// compiled manifest and config embeds: a vocabulary edit re-numbers
+/// bytes already packed into artefacts, so it must move this digest
+/// exactly like an opcode change does. Only the generated pin file
+/// itself is excluded (self-reference).
 ///
 /// Canonicalization is **token-based** (`canonicalize_source`): each file is
 /// tokenized and the token stream is hashed structurally. Comments and
@@ -101,6 +106,7 @@ pub fn compute_contracts_platform_src_hash(repo_root: &Path) -> Result<[u8; 32]>
     }
     let mut files = Vec::new();
     walk(&repo_root.join("modules/sdk"), &mut files)?;
+    walk(&repo_root.join("contracts/src"), &mut files)?;
     let mut rels: Vec<(String, std::path::PathBuf)> = files
         .into_iter()
         .map(|p| {
@@ -250,12 +256,14 @@ mod tests {
             digest,
             crate::abi_surface::ABI_SURFACE_DIGEST,
             "ABI_SURFACE_DIGEST const in modules/sdk/abi_surface_srcpin.rs is \
-             stale — replace it with the computed digest below"
+             stale — run `fluxor abi-regen` (never hand-edit it). \
+             See docs/architecture/abi_surface.md"
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "9674c1302a908349f48cec7a2a0d6d829770ec1fca600961d72be9c61986c40d",
-            "ABI wire-surface changed — see this test's doc comment"
+            hex, "dd1a2fb88d552abf93d34e4e6c712a2f68270ac77ea4089a3f23a52ee08c5178",
+            "ABI wire-surface changed — this is a deliberate wire break or it is \
+             a mistake; see docs/architecture/abi_surface.md before updating"
         );
     }
 
@@ -320,8 +328,8 @@ mod tests {
         if computed != stored {
             let arr: Vec<String> = computed.iter().map(|b| format!("0x{b:02x}")).collect();
             panic!(
-                "contracts/platform source pin is stale (a modules/sdk source \
-                 changed).\nRun `fluxor abi-regen` to rewrite all pin sites, \
+                "contracts/platform source pin is stale (a modules/sdk or \
+                 contracts/src source changed).\nRun `fluxor abi-regen` to rewrite all pin sites, \
                  then `fluxor modules build --all` so .fmods re-attest.\n(Manual fallback — \
                  replace the const in modules/sdk/abi_surface_srcpin.rs \
                  with:\n[{}])",

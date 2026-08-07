@@ -282,6 +282,11 @@ pub fn expand_platform_stacks(
     for (stack_name, user_fields) in &platform_map {
         let stack_file = load_stack(stack_name, project_root)?;
         let merged = merge_with_board_defaults(user_fields, stack_name, target);
+        let user_keys: Vec<String> = user_fields
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        check_overlay_keys_matched(&stack_file, &merged, &user_keys)?;
         resolved.push(Resolved { stack_file, merged });
     }
 
@@ -545,6 +550,14 @@ fn select_variant<'a>(
 ///
 /// A match value of `"*"` matches any present truthy value (non-empty,
 /// not `"false"`, not `"0"`). Exact string match otherwise.
+/// Is a stack field set to something meaningful? `""` / `"false"` / `"0"`
+/// read as "not set" — what the `"*"` wildcard treats as absent, and what
+/// `check_overlay_keys_matched` skips rather than demanding a match for.
+/// One definition so the two cannot disagree about `debug: { observe: 0 }`.
+fn field_is_set(v: &str) -> bool {
+    !v.is_empty() && v != "false" && v != "0"
+}
+
 fn injection_matches(
     match_keys: &HashMap<String, String>,
     merged: &HashMap<String, String>,
@@ -552,11 +565,78 @@ fn injection_matches(
     match_keys.iter().all(|(k, expected)| {
         let actual = merged.get(k);
         if expected == "*" {
-            actual.is_some_and(|v| !v.is_empty() && v != "false" && v != "0")
+            actual.is_some_and(|v| field_is_set(v))
         } else {
             actual == Some(expected)
         }
     })
+}
+
+/// A user-supplied stack field whose only consumer is overlay match
+/// predicates must actually select an overlay. Overlays match by exact
+/// value so new kinds compose without colliding — the flip side is that
+/// a stale or typo'd value matches nothing, and the path it names
+/// (telemetry export, netconsole, …) silently never materializes while
+/// validation still passes. Catch that here: for every user-written
+/// field that appears in overlay match-sets (and in no variant's —
+/// variant keys already hard-error via `select_variant`), at least one
+/// overlay matching on it must fire.
+///
+/// Exemptions: the authoritative target facts (`board`/`family`/
+/// `silicon`), which are injected over user values and legitimately
+/// appear in predicates the user's other fields don't satisfy; and
+/// explicit off-values, which [`field_is_set`] defines once for both
+/// this check and wildcard matching.
+fn check_overlay_keys_matched(
+    stack: &StackFile,
+    merged: &HashMap<String, String>,
+    user_keys: &[String],
+) -> Result<()> {
+    for key in user_keys {
+        if matches!(key.as_str(), "board" | "family" | "silicon") {
+            continue;
+        }
+        if stack.variant.iter().any(|v| v.match_keys.contains_key(key)) {
+            continue;
+        }
+        let overlays_with_key: Vec<&StackInjection> = stack
+            .overlay
+            .iter()
+            .filter(|o| o.match_keys.contains_key(key))
+            .collect();
+        if overlays_with_key.is_empty() {
+            continue;
+        }
+        let Some(value) = merged.get(key).filter(|v| field_is_set(v)) else {
+            continue;
+        };
+        if overlays_with_key
+            .iter()
+            .any(|o| injection_matches(&o.match_keys, merged))
+        {
+            continue;
+        }
+        let mut accepted: Vec<&str> = overlays_with_key
+            .iter()
+            .filter_map(|o| o.match_keys.get(key))
+            .map(String::as_str)
+            .filter(|v| *v != "*")
+            .collect();
+        accepted.sort_unstable();
+        accepted.dedup();
+        let accepted_str = if accepted.is_empty() {
+            "none on this target".to_string()
+        } else {
+            accepted.join(", ")
+        };
+        return Err(Error::Config(format!(
+            "platform.{}.{key} = {value:?} selects no overlay on this target — \
+             the graph would silently omit what it names. Accepted values \
+             (subject to target match): {accepted_str}.",
+            stack.stack.name,
+        )));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -909,6 +989,53 @@ mod tests {
 
     fn edge_strings(config: &Value) -> Vec<String> {
         collect_existing_edges(config)
+    }
+
+    /// An overlay-reserved key with a value no overlay matches must be
+    /// a hard error, not a silent no-op — the classic case is a stale
+    /// `export_telemetry:` value that quietly drops the whole export
+    /// path while validation passes.
+    #[test]
+    fn unmatched_overlay_key_value_is_a_hard_error() {
+        let stack: StackFile = toml::from_str(
+            r#"
+            [stack]
+            name = "debug"
+            [[overlay]]
+            match = { export_telemetry = "udp", family = "bcm" }
+            [[overlay]]
+            match = { export_telemetry = "uart", family = "bcm" }
+            "#,
+        )
+        .unwrap();
+        let merged: HashMap<String, String> = [
+            ("export_telemetry".to_string(), "otlp".to_string()),
+            ("family".to_string(), "bcm".to_string()),
+        ]
+        .into();
+        let err = check_overlay_keys_matched(&stack, &merged, &["export_telemetry".to_string()])
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("otlp"), "names the bad value: {msg}");
+        assert!(msg.contains("uart, udp"), "lists accepted values: {msg}");
+
+        // The same value matching an overlay passes.
+        let mut ok = merged.clone();
+        ok.insert("export_telemetry".into(), "udp".into());
+        check_overlay_keys_matched(&stack, &ok, &["export_telemetry".to_string()]).unwrap();
+
+        // Explicit off-values are not errors.
+        let mut off = merged.clone();
+        off.insert("export_telemetry".into(), "false".into());
+        check_overlay_keys_matched(&stack, &off, &["export_telemetry".to_string()]).unwrap();
+
+        // A valid value on a target no overlay covers still errors —
+        // the export path would silently vanish on that family.
+        let mut wrong_family = merged.clone();
+        wrong_family.insert("export_telemetry".into(), "udp".into());
+        wrong_family.insert("family".into(), "wasm".into());
+        check_overlay_keys_matched(&stack, &wrong_family, &["export_telemetry".to_string()])
+            .unwrap_err();
     }
 
     /// Original name-based dedup: stack module whose name matches an

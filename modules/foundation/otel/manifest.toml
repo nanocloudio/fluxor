@@ -1,4 +1,7 @@
 version = "1.0.0"
+# timer_class: flush cadence and reliable-mode ack deadlines gate on
+# dev_micros (wall-clock), not per-step counting.
+timer_class = "wall_clock"
 hardware_targets = ["rp2350", "bcm2712"]
 
 # OTEL export engine (rfc_observability_surface.md §5.5). A telemetry-ring
@@ -35,4 +38,9 @@ requires_contract = "channel"
 access = "read"
 
 [observability]
-exempt = "exporter — drains the telemetry ring, originates no telemetry of its own"
+# Narrowed by rfc_observability_surface.md §11.2(5): an exporter originates no
+# telemetry ABOUT ITS SUBJECTS, but must account for its OWN fidelity. otel
+# reports the ring's cumulative drop count for its slot in every batch envelope
+# (the FXTL `dropped` field), so a saturated export is distinguishable from an
+# idle one. The exemption covers forwarded records only.
+exempt = "exporter — forwards ring records, originates none about them; self-fidelity reported in-band via the FXTL `dropped` counter"

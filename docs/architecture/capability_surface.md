@@ -333,8 +333,7 @@ deliberate dotted exception among contracts). Their byte streams ride
 | Content Type | Description | Example Providers |
 |-------------|-------------|-------------------|
 | `AudioSample` | Raw PCM samples (interleaved stereo) | synth, mp3_decoder, mic_source |
-| `AudioEncoded` | Compressed audio (MP3, AAC, WAV) | file reader, http client |
-| `AudioMp3` | Specifically MP3 | file reader with MP3 files |
+| `AudioEncoded` | Compressed audio access units (MP3, AAC, Opus, …) — codec identity travels in-band, never as a content-type fork | file reader, http client |
 | `VideoDraw` | Drawing commands or framebuffer | photo viewer, UI renderer |
 | `PointerEvents` | Pointer / touch coordinates and gestures | xpt2046, ft6236 |
 | `OctetStream` | Untyped byte stream (block I/O, file data, project-local protocols) | sd, fat32, littlefs, http |
