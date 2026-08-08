@@ -74,6 +74,12 @@ pub struct CryptoReassembler {
     pub contiguous_high: usize,
 }
 
+impl Default for CryptoReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CryptoReassembler {
     pub const fn new() -> Self {
         Self {
@@ -105,11 +111,7 @@ impl CryptoReassembler {
             // the excess; if the lost bytes never get retransmitted
             // the handshake will time out (which is fine — production
             // deployments would size the hold larger).
-            let n = if rel_off >= CRYPTO_HOLD_LEN {
-                0
-            } else {
-                CRYPTO_HOLD_LEN - rel_off
-            };
+            let n = CRYPTO_HOLD_LEN.saturating_sub(rel_off);
             self.write_range(rel_off, &data[..n]);
         } else {
             self.write_range(rel_off, data);
@@ -372,7 +374,7 @@ pub struct PnSpace {
     /// Ring of recently-sent in-flight packets (RFC 9002 §A.1). On
     /// ACK we look up the matching pn here and credit `bytes_in_flight`
     /// + drive the NewReno controller. Older entries roll out as new
-    /// packets are sent.
+    ///   packets are sent.
     pub sent_packets: [SentPacket; SENT_PACKET_RING],
     pub sent_head: usize,
 
@@ -392,6 +394,12 @@ pub struct PnSpace {
     pub next_read_secret: [u8; 48],
     pub next_write_secret: [u8; 48],
     pub next_keys_ready: bool,
+}
+
+impl Default for PnSpace {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PnSpace {
@@ -534,6 +542,12 @@ pub struct RttSample {
     pub seeded: bool,
 }
 
+impl Default for RttSample {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RttSample {
     pub const fn new() -> Self {
         Self {
@@ -561,11 +575,7 @@ impl RttSample {
         }
         // RFC 9002 §5.3: rttvar = 3/4 * rttvar + 1/4 * |smoothed - latest|
         // smoothed = 7/8 * smoothed + 1/8 * latest
-        let abs_diff = if self.smoothed_rtt > sample_ms {
-            self.smoothed_rtt - sample_ms
-        } else {
-            sample_ms - self.smoothed_rtt
-        };
+        let abs_diff = self.smoothed_rtt.abs_diff(sample_ms);
         self.rttvar = (3 * self.rttvar + abs_diff) / 4;
         self.smoothed_rtt = (7 * self.smoothed_rtt + sample_ms) / 8;
     }
@@ -926,6 +936,12 @@ pub struct QuicConnection {
     /// set (preserves pre-ALPN behaviour). A non-h3 ALPN (e.g. `mqtt`)
     /// routes raw bidi streams to the app surface instead of h3.
     pub use_h3: bool,
+}
+
+impl Default for QuicConnection {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QuicConnection {

@@ -9,7 +9,7 @@
 // `cache_try_or_fetch`).
 //
 // Params declared in
-// `modules/builtin/host/host_asset_index/manifest.toml`:
+// `modules/platform/wasm/host_asset_index/manifest.toml`:
 //   paths: newline-separated list of filesystem paths (required).
 //          Index in the list is the source_index a HANDLER_FILE route
 //          declares to select that asset.

@@ -496,7 +496,7 @@ pub fn subscribe(event_handle: i32) -> i32 {
 /// Push a fault record into the ring and signal the subscribed event.
 /// Safe to call from scheduler thread context. Drops oldest if full.
 pub fn push_fault(rec: FaultRecord) {
-    // Emit on the host-facing log transport so `fluxor monitor` can
+    // Emit on the host-facing log transport so `fluxor rig monitor` can
     // parse faults without a second channel — operators see cascade
     // origin and consumed content_type alongside the regular counters
     // without decoding the binary FaultRecord stream separately.

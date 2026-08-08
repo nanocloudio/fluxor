@@ -1,6 +1,6 @@
 // host_asset_source built-in — streams a host file as OctetStream.
 //
-// Params declared in `modules/builtin/host/host_asset_source/manifest.toml`:
+// Params declared in `modules/platform/wasm/host_asset_source/manifest.toml`:
 //   path: filesystem path to the asset (required, no default)
 //
 // Tag layout (declaration order, starting at 10):

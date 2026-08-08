@@ -377,7 +377,7 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                     Some(sel) if sel.len() <= MAX_ALPN => {
                         sel_len = sel.len();
                         sel_buf[..sel_len].copy_from_slice(sel);
-                        decided_h3 = &sel_buf[..sel_len] == &b"h3"[..];
+                        decided_h3 = sel_buf[..sel_len] == b"h3"[..];
                     }
                     _ => {
                         // No overlap (or malformed/oversize) → fail closed.
@@ -1582,7 +1582,7 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         if conn.inbound_off >= conn.inbound_len {
             mark_inbound_consumed(conn);
         }
-        return true;
+        true
     } else {
         // 1-RTT short header — RFC 9000 §17.2: cannot be coalesced
         // (no length field), so it occupies the entire remaining
@@ -1691,7 +1691,7 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         process_frames(conn, EncLevel::OneRtt, payload, now_ms, &mut non_probing);
         arm_migration_if_new_path(conn, &*s.syscalls, migration_enabled, non_probing);
         mark_inbound_consumed(conn);
-        return true;
+        true
     }
 }
 
@@ -2454,7 +2454,7 @@ unsafe fn process_frames(
                     conn.handshake_confirmed = true;
                 }
             }
-            t if t >= FRAME_STREAM_BASE && t <= FRAME_STREAM_END => {
+            t if (FRAME_STREAM_BASE..=FRAME_STREAM_END).contains(&t) => {
                 pos += 1;
                 let after = &payload[pos..];
                 let (sf, n) = match parse_stream(t, after) {
@@ -3188,13 +3188,11 @@ unsafe fn emit_crypto_packet(
     if matches!(level, EncLevel::OneRtt)
         && !ack_only_mode
         && s.conns[idx].pending_handshake_done
-    {
-        if payload_len + 1 <= payload.len() {
+        && payload_len < payload.len() {
             payload[payload_len] = FRAME_HANDSHAKE_DONE;
             payload_len += 1;
             had_handshake_done = true;
         }
-    }
 
     // STREAM frame (1-RTT only) carrying app data on stream id 0.
     let mut had_main_stream = false;

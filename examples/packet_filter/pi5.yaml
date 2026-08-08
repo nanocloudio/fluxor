@@ -10,11 +10,16 @@
 # or custom protocols that don't need an IP stack. A real consumer
 # replaces `debug` with whatever module wants the accepted frames.
 #
-# The graph runs the NIC pipeline on a separate domain (`nic`,
-# cores: [1], `exec_mode: poll`). Poll-mode keeps the NIC ring
-# from missing frames at line rate; the dedicated core is optional
-# (the demo would run on a single domain too) but documents how to
-# isolate latency-sensitive work from the cooperative tick.
+# The graph runs the NIC pipeline on a separate domain (`nic`, cores: [1]),
+# which isolates latency-sensitive NIC work from the cooperative tick on
+# core 0. The demo would run on a single domain too — the split is here to
+# document the shape.
+#
+# The domain stays COOPERATIVE rather than `exec_mode: poll`: `rp1_gem`
+# declares `pre_tick_drain`, which runs its TX/RX step at the start of each
+# scheduler pass, ahead of its exec_order slot. A poll-mode (Tier 3) domain
+# has no such pass to run ahead of, so the two are mutually exclusive and
+# config build rejects the combination.
 #
 # Build:
 #   make pi5
@@ -28,7 +33,6 @@ execution:
       cores: [0]
     - name: nic
       cores: [1]
-      exec_mode: poll      # Tier 3: tight poll loop, no sleep
 
 modules:
   - name: rp1_gem

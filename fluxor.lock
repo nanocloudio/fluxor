@@ -1,0 +1,4 @@
+# fluxor.lock — generated, edit via `fluxor update`
+# Pinned store artifacts: one [[artifact]] entry per resolved digest.
+
+artifact = []

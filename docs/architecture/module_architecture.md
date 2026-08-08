@@ -250,7 +250,7 @@ The runtime loader enforces a concrete module binary contract:
   time and rejects any module whose bytes drift from the manifest
   (`IntegrityMismatch`); with the `enforce_signatures` feature set,
   unsigned modules and bad signatures are rejected
-  (`SignatureInvalid`). `fluxor sign` produces signed manifests; see
+  (`SignatureInvalid`). `fluxor modules sign` produces signed manifests; see
   `security.md` for the trust chain and `network_boot.md` for the
   deployment-time use of the same signing key.
 
@@ -292,7 +292,7 @@ schema into, built-ins declare their parameter schema in the manifest
 TOML under a `[[params]]` section — same wire format (TLV) as PIC
 modules, but the schema is read off disk at config-build time.
 
-Built-in manifests live under `modules/builtin/<platform>/<name>/`,
+Built-in manifests live under `modules/platform/<platform>/<name>/`,
 with `linux/` for Linux-host APIs and `host/` for host-OS-agnostic
 pure-Rust modules. The Rust implementation sits in
 `src/platform/<platform>/<name>.rs`. Built-in vs PIC is a

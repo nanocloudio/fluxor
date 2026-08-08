@@ -48,7 +48,10 @@ unsafe fn msg_write(
     payload: *const u8,
     payload_len: u16,
 ) -> i32 {
-    const MAX_MSG: usize = crate::abi::CHANNEL_BUFFER_SIZE;
+    // `self::`, not `crate::` — this file splices into the module root,
+    // which is the crate root only in the PIC build; host consumers
+    // mount module cores as nested modules.
+    const MAX_MSG: usize = self::abi::CHANNEL_BUFFER_SIZE;
     let total = MSG_HDR_SIZE + payload_len as usize;
     if total > MAX_MSG {
         return -1;

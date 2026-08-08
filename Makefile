@@ -1,7 +1,7 @@
 # fluxor Makefile — the lifecycle only: clean / build / test / lint /
 # ci / publish / install (see ../standards/make.md). Anything else is the
 # `fluxor` CLI invoked directly (`fluxor modules build`, `fluxor run`,
-# `fluxor up`, `fluxor update`, `fluxor sync`, …) — a make target that
+# `fluxor run --replicas`, `fluxor update`, `fluxor sync`, …) — a make target that
 # merely renames one CLI command is bloat, not convenience.
 #
 # fluxor's workspace root is the bare-metal kernel and cannot build on
@@ -13,12 +13,13 @@ SHELL       := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 CARGO       ?= cargo
 FLUXOR      ?= target/aarch64-unknown-linux-gnu/release/fluxor
+LAUNCHER    ?= target/aarch64-unknown-linux-gnu/release/fluxor-launcher
+BINDIR      ?= $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)/bin
 TARGET      ?= qemu-virt
 
 .DEFAULT_GOAL := build
 
-.PHONY: help build test lint ci publish clean install check-install \
-        firmware secure-pi5 install-rig-backends
+.PHONY: help build test lint ci publish clean install firmware secure-pi5
 
 # `help` is zero-dependency: it must work before anything is built.
 help:
@@ -30,30 +31,30 @@ help:
 	@echo "  make ci        fluxor ci — the full gate"
 	@echo "  make publish   build, then publish every artefact tier"
 	@echo "  make clean     cargo clean + module artefacts"
-	@echo "  make check-install  warn if the PATH fluxor lags this checkout"
-	@echo "  make install   CLI tools into ~/.cargo/bin (--locked --force,"
-	@echo "                 reusing the workspace build cache)"
+	@echo "  make install   bootstrap only: build tools + runtime + launcher,"
+	@echo "                 publish the CLI/runtime into the local OCI store,"
+	@echo "                 install the resolving launcher as ~/.cargo/bin/fluxor,"
+	@echo "                 and symlink the rig backends into the fluxor-rig"
+	@echo "                 discovery path. If no 'fluxor' is on PATH, run it."
 	@echo ""
 	@echo "Project targets (genuine compositions):"
 	@echo "  make firmware TARGET=…       one kernel: build + objcopy"
 	@echo "                               (rp2350 | rp2040 | qemu-virt | pi5 | wasm)"
 	@echo "  make secure-pi5              signature-enforced pi5 image"
 	@echo "                               (keygen + build + sign + combine)"
-	@echo "  make install-rig-backends    symlink rig backends into the"
-	@echo "                               fluxor-rig discovery path"
 	@echo ""
 	@echo "Not make targets (use the CLI directly):"
 	@echo "  fluxor modules build [--target …|--all]    PIC modules"
 	@echo "  fluxor modules list|resolve|clean          module discovery"
 	@echo "  fluxor run <cfg> [--node-id N]             single replica"
-	@echo "  fluxor up <cfg> --replicas N               cluster bring-up"
+	@echo "  fluxor run <cfg> --replicas N               cluster bring-up"
 	@echo "  fluxor flash <cfg>                         flash a USB-DFU target"
-	@echo "  fluxor update [--features …]               regenerate fluxor.lock"
-	@echo "  fluxor sync [--dry-run]                    install lockfile fmods"
-	@echo "  fluxor publish <tier> [--local]            per-tier publish"
-	@echo "  fluxor registry init|list|gc|setup-cargo   registry maintenance"
-	@echo "  fluxor workspace status                    workspace-mode state"
-	@echo "  fluxor targets                             list build targets"
+	@echo "  fluxor update [--from snapshot/<name>]     advance fluxor.lock pins"
+	@echo "  fluxor sync [--dry-run]                    materialise fluxor.lock"
+	@echo "  fluxor publish [--only source|fmod|runtime]  publish to the OCI store"
+	@echo "  fluxor store ls|rm|pin|snapshot            store maintenance"
+	@echo "  fluxor workspace status|publish|add|rm     live-workspace policy"
+	@echo "  fluxor inspect [cfg|uf2|store-ref]         project / artifact info"
 	@echo "  .context/drift/run.sh                      local drift checks (if installed)"
 	@echo ""
 	@echo "One-time setup: make install"
@@ -72,37 +73,33 @@ build:
 	$(MAKE) firmware TARGET=pi5
 	$(MAKE) firmware TARGET=wasm
 	$(CARGO) build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback --target aarch64-unknown-linux-gnu
-	@$(MAKE) --no-print-directory check-install
 
-# `cargo build` writes $(FLUXOR); it does NOT touch the copy `make install`
-# put in ~/.cargo/bin. Every target here invokes $(FLUXOR) deliberately, so
-# the Makefile is immune — but a bare `fluxor` typed at a shell is not, and a
-# CLI lagging its checkout misbehaves silently: the symptom is a change you
-# just built appearing to have no effect. `cargo install` (with the shared
-# CARGO_TARGET_DIR `install` uses) copies the very bytes `build` produced, so
-# a content compare is exact — no false alarms.
-check-install:
-	@built=$$(sha256sum $(FLUXOR) 2>/dev/null | cut -c1-12); \
-	 which=$$(command -v fluxor 2>/dev/null); \
-	 if [ -z "$$built" ]; then \
-	   echo "note: $(FLUXOR) not built yet — run 'make build'"; \
-	 elif [ -z "$$which" ]; then \
-	   echo "note: no 'fluxor' on PATH — run 'make install'"; \
-	 else \
-	   inst=$$(sha256sum "$$which" | cut -c1-12); \
-	   if [ "$$built" != "$$inst" ]; then \
-	     echo "WARNING: 'fluxor' on PATH ($$which, $$inst) is NOT this checkout's build ($$built)."; \
-	     echo "         Run 'make install' — until you do, CLI changes you built are not live."; \
-	   fi; \
-	 fi
-
-# Install the CLI tools into ~/.cargo/bin. CARGO_TARGET_DIR reuses the
-# workspace build cache (cargo install otherwise recompiles in a temp
-# dir); --force overwrites same-version binaries so a rebuilt checkout
-# always replaces the installed CLI — an installed `fluxor` that lags
-# the checkout misbehaves silently.
+# What lives on PATH is the resolving LAUNCHER (Decision 8,
+# registry_consolidation.md): every invocation resolves the CLI's
+# `:latest` store artifact and execs its blob, so an installed copy can
+# never lag a publish. The only failure mode left is the launcher being
+# absent entirely — `make install` (help text) is the fix. CLI changes
+# go live via `$(FLUXOR) publish --only runtime` (or `fluxor workspace
+# publish`), not reinstall.
+#
+# Bootstrap ONLY (Decision 8) — first build on an empty-store machine:
+# build the tools CLI, the linux runtime, and the launcher; publish the
+# CLI + fluxor-linux into the local OCI store with the freshly built
+# tools binary (publish auto-includes the CLI for fluxor); install the
+# resolving launcher as ~/.cargo/bin/fluxor. After this, every publish
+# supersedes the CLI in place — there is nothing to reinstall.
+# The launcher builds as `fluxor-launcher` and is copied onto PATH as
+# `fluxor`, so it shares the workspace target dir with the CLI without
+# either uplifting over the other.
 install:
-	CARGO_TARGET_DIR=target $(CARGO) install --locked --force --path tools --target aarch64-unknown-linux-gnu
+	$(CARGO) build --release -p fluxor-tools -p fluxor-launcher --target aarch64-unknown-linux-gnu
+	$(CARGO) build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback --target aarch64-unknown-linux-gnu
+	$(FLUXOR) publish --only runtime
+	install -D -m755 $(LAUNCHER) $(BINDIR)/fluxor
+	@mkdir -p $(RIG_BACKEND_DIR)
+	ln -snf $(CURDIR)/target/aarch64-unknown-linux-gnu/release/telemetry-monitor_udp $(RIG_BACKEND_DIR)/telemetry-monitor_udp
+	ln -snf $(CURDIR)/target/aarch64-unknown-linux-gnu/release/observe-https_load   $(RIG_BACKEND_DIR)/observe-https_load
+	ln -snf $(CURDIR)/target/aarch64-unknown-linux-gnu/release/observe-udp_capture  $(RIG_BACKEND_DIR)/observe-udp_capture
 
 # Tools tests, then the linux-runtime host tests. The runtime line
 # canonicalizes flags that are easy to get wrong: the default cargo
@@ -123,10 +120,10 @@ ci:
 	$(CARGO) build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
 	$(FLUXOR) ci
 
-# Canonical publish of every publishable tier (abi source, sdk source,
-# fmod palette, runtime binary — driven by fluxor.toml). Builds first
-# so every artefact is current. `--local` / per-tier variants are CLI
-# invocations (see help).
+# Publish every artifact kind into the local OCI store (source trees,
+# fmod palette, runtime binaries + the CLI — driven by fluxor.toml).
+# Builds first so every artifact is current. `--only <kind>` variants
+# are CLI invocations (see help).
 publish: build
 	$(FLUXOR) publish
 
@@ -195,7 +192,7 @@ endif
 #   make secure-pi5 SIGN_KEY=/path/to.seed SECURE_IMG=/srv/tftp/fluxor/kernel_2712.img
 #
 # The private seed is generated (0600) on first run and reused thereafter;
-# rotate with `fluxor keygen -k $(SIGN_KEY) --force`. Keep it OUT of git.
+# rotate with `fluxor modules keygen -k $(SIGN_KEY) --force`. Keep it OUT of git.
 SIGN_KEY      ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/fluxor/signing/pi5.seed
 SECURE_CONFIG ?= examples/iso_transform/pi5.yaml
 SECURE_IMG    ?= target/pi5/secure.img
@@ -221,19 +218,10 @@ secure-pi5:
 	  echo "[secure] done: $(SECURE_IMG) (unsigned/tampered modules will be rejected)"
 
 # ── Rig backends ───────────────────────────────────────────────────────
-# Symlink rig backend executables into the discovery path used by
-# `fluxor rig …`. `observe-https_load` is feature-gated (tokio + reqwest
-# + rustls) so the plain tools build doesn't carry async-HTTPS deps —
-# it must be built explicitly with its feature before symlinking.
+# Discovery path `fluxor rig …` probes for backend executables; `install`
+# symlinks the three backends there (dependencies.md §10a: one invariant
+# artefact set — install always installs them). All three build
+# unconditionally with the plain tools build (dependencies.md §9a), and
+# the links point at the build outputs, so a later rebuild is picked up
+# with no re-install.
 RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
-RIG_BACKENDS    := telemetry-monitor_udp observe-https_load observe-udp_capture
-
-install-rig-backends:
-	$(CARGO) build --release -p fluxor-tools --target aarch64-unknown-linux-gnu
-	@mkdir -p $(RIG_BACKEND_DIR)
-	@for b in $(RIG_BACKENDS); do \
-		src=$(CURDIR)/target/aarch64-unknown-linux-gnu/release/$$b; \
-		dst=$(RIG_BACKEND_DIR)/$$b; \
-		ln -snf "$$src" "$$dst"; \
-		echo "install-rig-backends: $$dst -> $$src"; \
-	done

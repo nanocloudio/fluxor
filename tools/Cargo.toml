@@ -11,8 +11,8 @@ name = "fluxor"
 path = "src/main.rs"
 
 # Rig backend executables. Discovered by name (`<surface>-<name>`)
-# on the rig backend search path; the Makefile's `install-rig-backends`
-# target symlinks them into `$XDG_DATA_HOME/fluxor/backends/` after a
+# on the rig backend search path; the Makefile's `install` target
+# symlinks them into `$XDG_DATA_HOME/fluxor/backends/` after a
 # release build.
 [[bin]]
 name = "telemetry-monitor_udp"

@@ -75,7 +75,7 @@ pub unsafe fn compute_retry_integrity_tag(
     let mut p = 0;
     aad[p] = odcid.len() as u8;
     p += 1;
-    if odcid.len() > 0 && p + odcid.len() <= aad.len() {
+    if !odcid.is_empty() && p + odcid.len() <= aad.len() {
         core::ptr::copy_nonoverlapping(odcid.as_ptr(), aad.as_mut_ptr().add(p), odcid.len());
         p += odcid.len();
     }
@@ -279,6 +279,10 @@ pub unsafe fn build_version_negotiation(
 /// Build + protect an Initial packet. `crypto_frame_payload` is a
 /// pre-built sequence of frames (CRYPTO + PADDING etc.). Returns
 /// total bytes written into `out`, or 0 on overflow.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "arguments are the RFC 9000 packet-header fields in wire order; a params struct would rename the spec's own vocabulary"
+)]
 pub unsafe fn build_initial_packet(
     keys: &QuicKeys,
     hp: &Aes128Hp,
@@ -293,6 +297,10 @@ pub unsafe fn build_initial_packet(
     build_long_packet(keys, hp, pn, pn_len, PKT_INITIAL, dcid, scid, Some(token), payload, out)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "arguments are the RFC 9000 packet-header fields in wire order; a params struct would rename the spec's own vocabulary"
+)]
 pub unsafe fn build_handshake_packet(
     keys: &QuicKeys,
     hp: &Aes128Hp,
@@ -306,6 +314,10 @@ pub unsafe fn build_handshake_packet(
     build_long_packet(keys, hp, pn, pn_len, PKT_HANDSHAKE, dcid, scid, None, payload, out)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "arguments are the RFC 9000 packet-header fields in wire order; a params struct would rename the spec's own vocabulary"
+)]
 unsafe fn build_long_packet(
     keys: &QuicKeys,
     hp: &Aes128Hp,
@@ -575,6 +587,10 @@ pub unsafe fn parse_long_packet(
 //   payload (AEAD-protected)
 // --------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "arguments are the RFC 9000 packet-header fields in wire order; a params struct would rename the spec's own vocabulary"
+)]
 pub unsafe fn build_one_rtt_packet(
     keys: &QuicKeys,
     hp: &Aes128Hp,

@@ -261,6 +261,19 @@ pub fn emit_bundle(manifest_path: &Path, verbose: bool) -> Result<PathBuf> {
         let modules_dir = project_root.join("target/fluxor/bcm2712/modules");
         let mut module_refs = Vec::new();
         for ty in &facts.module_types {
+            // fixtures/ modules are test instruments — never part of a
+            // shipped workload bundle (standards/fluxor-modules.md §0.1).
+            if project_root
+                .join("modules/fixtures")
+                .join(ty.as_str())
+                .join("manifest.toml")
+                .is_file()
+            {
+                return Err(Error::Config(format!(
+                    "module '{ty}' is a fixtures-tier test instrument and cannot be \
+                     referenced by a workload bundle"
+                )));
+            }
             let fmod = modules_dir.join(format!("{ty}.fmod"));
             let bytes = std::fs::read(&fmod).map_err(|e| {
                 Error::Config(format!(
@@ -588,6 +601,11 @@ pub fn install_applet(
 ) -> Result<()> {
     let dir = if bundle.extension().is_some_and(|e| e == "toml") {
         emit_bundle(bundle, verbose)?
+    } else if !bundle.exists() {
+        // Not a path: a store reference (P10 — sibling CLIs are
+        // artifacts, not checkouts). Resolve the workload bundle from
+        // the OCI store and materialise it into the applet cache.
+        materialize_bundle_from_store(&bundle.to_string_lossy(), verbose)?
     } else {
         bundle.to_path_buf()
     };
@@ -647,6 +665,84 @@ pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
             known.join(", ")
         }
     )))
+}
+
+/// Resolve a workload-bundle artifact from the local OCI store and
+/// materialise it as a runnable bundle dir under the applet cache
+/// (`$XDG_DATA_HOME/fluxor/applets/<name>/`). The pinned docs
+/// (workload.json / graph.yaml / resources.json) come from the store
+/// verbatim — their digests are what the manifest pins — and the
+/// per-target blobs (config.bin / modules.bin) are synthesized from
+/// the graph exactly as `fluxor build` would produce them.
+fn materialize_bundle_from_store(reference: &str, verbose: bool) -> Result<PathBuf> {
+    use fluxor_tools::oci_store::{
+        self, OciStore, MT_FLUXOR_GRAPH, MT_FLUXOR_RESOURCES, MT_FLUXOR_WORKLOAD,
+    };
+    let store = OciStore::open(oci_store::store_root().map_err(|e| Error::Config(e.to_string()))?)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let full_ref = if reference.contains(':') || reference.starts_with("sha256:") {
+        reference.to_string()
+    } else {
+        format!("{reference}:latest")
+    };
+    let desc = store.resolve(&full_ref).map_err(|e| {
+        Error::Config(format!(
+            "'{reference}' is neither a path nor a store bundle ({e}) — \
+             publish it first (`fluxor publish bundle <dir>`)"
+        ))
+    })?;
+    let manifest = store
+        .read_manifest(&desc)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let layer = |mt: &str| -> Result<Vec<u8>> {
+        let l = manifest
+            .layers
+            .iter()
+            .find(|l| l.media_type == mt)
+            .ok_or_else(|| Error::Config(format!("store artifact {full_ref} has no {mt} layer")))?;
+        store
+            .read_blob(&l.digest)
+            .map_err(|e| Error::Config(e.to_string()))
+    };
+    let workload_json = layer(MT_FLUXOR_WORKLOAD)?;
+    let graph_yaml = layer(MT_FLUXOR_GRAPH)?;
+    let resources_json = layer(MT_FLUXOR_RESOURCES)?;
+
+    let parsed = fluxor_tools::workload::parse_manifest(
+        std::str::from_utf8(&workload_json)
+            .map_err(|e| Error::Config(format!("workload.json not UTF-8: {e}")))?,
+    )
+    .map_err(Error::Config)?;
+
+    let cache_root = match std::env::var_os("XDG_DATA_HOME") {
+        Some(x) if !x.is_empty() => PathBuf::from(x),
+        _ => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"),
+    }
+    .join("fluxor/applets")
+    .join(&parsed.name);
+    std::fs::create_dir_all(&cache_root)?;
+    std::fs::write(cache_root.join("workload.json"), &workload_json)?;
+
+    for imp in &parsed.implementations {
+        let target_dir = cache_root.join(&imp.target.family);
+        std::fs::create_dir_all(&target_dir)?;
+        std::fs::write(target_dir.join("workload.json"), &workload_json)?;
+        std::fs::write(target_dir.join("graph.yaml"), &graph_yaml)?;
+        std::fs::write(target_dir.join("resources.json"), &resources_json)?;
+        // Blobs: same synthesis as `fluxor build <graph>` (§10.3).
+        crate::build_one(
+            &target_dir.join("graph.yaml"),
+            Some(&target_dir.join("config.bin")),
+            verbose,
+        )?;
+    }
+    if verbose {
+        println!(
+            "materialised store bundle {full_ref} -> {}",
+            cache_root.display()
+        );
+    }
+    Ok(cache_root)
 }
 
 #[cfg(test)]

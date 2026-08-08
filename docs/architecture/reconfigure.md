@@ -84,7 +84,7 @@ Arena compaction (moving surviving module state blocks) is deferred to v2:
 - **Zero in-flight request loss** for drain-capable modules (e.g., http_server)
 - **Bounded drain timeout** prevents hung modules from blocking deployment
 - **A/B fallback** on migration failure (full destructive reconfigure from old config)
-- **Build-time transition plan preview** via `fluxor diff old.yaml new.yaml`
+- **Build-time transition plan preview** via `fluxor inspect new.yaml` --against old.yaml
 
 ### Out of scope for the current reconfigure path
 
@@ -100,7 +100,7 @@ items are needed for the supported reconfigure semantics.
 ## CLI: Transition Plan Preview
 
 ```bash
-$ fluxor diff old_config.yaml new_config.yaml
+$ fluxor inspect new_config.yaml --against old_config.yaml
 
 Reconfigure mode: live
 Drain timeout: 5000ms

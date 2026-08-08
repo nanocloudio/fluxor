@@ -32,7 +32,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -113,85 +112,85 @@ enum Fat32InitPhase {
 // ============================================================================
 
 // Idle (no write requested or write already complete).
-const WS_IDLE:              u8 = 0;
+const WS_IDLE: u8 = 0;
 // Locate the target file by 8.3 short-name; capture dir_lba/offset.
-const WS_SCAN:              u8 = 1;
+const WS_SCAN: u8 = 1;
 // Build one sector's worth of payload into the outbuf + transition to SendPacket.
-const WS_SEND_SECTOR:       u8 = 2;
+const WS_SEND_SECTOR: u8 = 2;
 // Called after SendPacket completes from WS_SEND_SECTOR — advance counters.
-const WS_AFTER_SECTOR:      u8 = 3;
+const WS_AFTER_SECTOR: u8 = 3;
 // Flush + seek to FAT sector containing the cur cluster; wait for read.
-const WS_WALK_FAT_READ:     u8 = 4;
-const WS_WALK_FAT_WAIT:     u8 = 5;
+const WS_WALK_FAT_READ: u8 = 4;
+const WS_WALK_FAT_WAIT: u8 = 5;
 // Allocate a new cluster: iterate FAT sectors looking for a zero entry.
-const WS_ALLOC_READ:        u8 = 6;
-const WS_ALLOC_WAIT:        u8 = 7;
+const WS_ALLOC_READ: u8 = 6;
+const WS_ALLOC_WAIT: u8 = 7;
 // New cluster found + patched in block_buf (EOC, and optionally prev→new).
 // Emit the write for the allocation-side FAT sector.
-const WS_ALLOC_WRITE:       u8 = 8;
+const WS_ALLOC_WRITE: u8 = 8;
 // Link the previous cluster to the new one (separate FAT sector case).
-const WS_LINK_READ:         u8 = 9;
-const WS_LINK_WAIT:         u8 = 10;
-const WS_LINK_WRITE:        u8 = 11;
+const WS_LINK_READ: u8 = 9;
+const WS_LINK_WAIT: u8 = 10;
+const WS_LINK_WRITE: u8 = 11;
 // Write the FAT sector mirror copy (FAT2) when num_fats > 1.
-const WS_MIRROR_WRITE:      u8 = 12;
+const WS_MIRROR_WRITE: u8 = 12;
 // Directory-entry size patch (read-modify-write).
-const WS_DIR_READ:          u8 = 13;
-const WS_DIR_WAIT:          u8 = 14;
-const WS_DIR_WRITE:         u8 = 15;
+const WS_DIR_READ: u8 = 13;
+const WS_DIR_WAIT: u8 = 14;
+const WS_DIR_WRITE: u8 = 15;
 // Terminal: all writes successfully pushed onto the request channel.
-const WS_DONE:              u8 = 16;
+const WS_DONE: u8 = 16;
 // Generic outbuf-drain state used by any emitter; resumes at
 // `w_return_state` when the packet (REQ_HDR_SIZE + nlb*512 B) is fully sent.
-const WS_SEND_PACKET:       u8 = 17;
+const WS_SEND_PACKET: u8 = 17;
 // FSINFO sector update (read-modify-write): decrement the free-cluster
 // count and bump the next-free hint after each successful allocation.
-const WS_FSINFO_READ:       u8 = 18;
-const WS_FSINFO_WAIT:       u8 = 19;
-const WS_FSINFO_WRITE:      u8 = 20;
+const WS_FSINFO_READ: u8 = 18;
+const WS_FSINFO_WAIT: u8 = 19;
+const WS_FSINFO_WRITE: u8 = 20;
 // ClnShutBit toggle on cluster 1's FAT entry. WS_MARK_DIRTY_* runs
 // once before any data/FAT writes so a crash mid-write leaves the
 // filesystem visibly dirty; WS_MARK_CLEAN_* runs last so a normal
 // completion restores the clean-shutdown bit and Linux doesn't warn
 // on the next mount. Both flows RMW fat_start_sector (the primary
 // FAT's sector 0) and mirror to FAT2 when num_fats > 1.
-const WS_MARK_DIRTY_READ:   u8 = 21;
-const WS_MARK_DIRTY_WAIT:   u8 = 22;
-const WS_MARK_DIRTY_WRITE:  u8 = 23;
+const WS_MARK_DIRTY_READ: u8 = 21;
+const WS_MARK_DIRTY_WAIT: u8 = 22;
+const WS_MARK_DIRTY_WRITE: u8 = 23;
 const WS_MARK_DIRTY_MIRROR: u8 = 24;
-const WS_MARK_CLEAN_READ:   u8 = 25;
-const WS_MARK_CLEAN_WAIT:   u8 = 26;
-const WS_MARK_CLEAN_WRITE:  u8 = 27;
+const WS_MARK_CLEAN_READ: u8 = 25;
+const WS_MARK_CLEAN_WAIT: u8 = 26;
+const WS_MARK_CLEAN_WRITE: u8 = 27;
 const WS_MARK_CLEAN_MIRROR: u8 = 28;
 // One-shot geometry query on the block_writes channel. If the consumer
 // (nvme) answers, fat32 logs size+lbads and verifies a 512 B LBA; on
 // ENOSYS (no handler registered, e.g. sd driver) the check is skipped.
-const WS_NS_CHECK:          u8 = 29;
+const WS_NS_CHECK: u8 = 29;
 
 /// FAT32 "clean shutdown" bit in cluster 1's FAT entry. When set the
 /// filesystem was properly unmounted; when cleared Linux reports
 /// "Dirty bit is set. Fs was not properly unmounted". See the FAT32
 /// white paper and dosfstools `FAT32_CLN_SHUT_BIT_MASK`.
-const CLN_SHUT_BIT:         u32 = 0x0800_0000;
+const CLN_SHUT_BIT: u32 = 0x0800_0000;
 
 /// Geometry-query ioctl on the block_writes channel. Matches
 /// `nvme::IOCTL_NVME_NS_INFO`. Arg is 13 B: in=`nsid:u32` / out=
 /// `ns_size:u64 + ns_lbads:u8`. A non-nvme consumer returns ENOSYS,
 /// which fat32 treats as "geometry info unavailable, proceed".
-const IOCTL_NVME_NS_INFO:   u32 = 0x4E56_0001;
+const IOCTL_NVME_NS_INFO: u32 = 0x4E56_0001;
 
 /// Expected LBA data-size shift. LBA size = 2^ns_lbads; fat32 only
 /// supports 512 B LBAs, i.e. `ns_lbads == 9`.
-const EXPECTED_LBADS:       u8 = 9;
+const EXPECTED_LBADS: u8 = 9;
 
 /// Operation tag inside the 20-byte write-request header. v1 only
 /// supports op=1 (single-block WRITE). Must match `nvme::pump_requests`.
-const REQ_OP_WRITE:         u32 = 1;
+const REQ_OP_WRITE: u32 = 1;
 
 /// Outbound write-request header size on `block_writes`:
 ///   op:u32 | lba:u64 | nlb:u32 | nsid:u32    (20 bytes)
 /// `nsid == 0` lets the consumer use its driver-wide default namespace.
-const REQ_HDR_SIZE:         usize = 20;
+const REQ_HDR_SIZE: usize = 20;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
@@ -201,9 +200,9 @@ include!("../../sdk/runtime/params.rs");
 // ============================================================================
 
 mod params_def {
+    use super::p_u32;
     use super::Fat32State;
     use super::SCHEMA_MAX;
-    use super::p_u32;
 
     define_params! {
         Fat32State;
@@ -251,7 +250,7 @@ mod params_def {
                 let mut j = 0usize;
                 while j < n_len {
                     let b = *d.add(j);
-                    name[j] = if b >= b'a' && b <= b'z' { b - 32 } else { b };
+                    name[j] = if b.is_ascii_lowercase() { b - 32 } else { b };
                     j += 1;
                 }
                 if dot_pos < len {
@@ -260,7 +259,7 @@ mod params_def {
                     let mut k = 0usize;
                     while k < e_len {
                         let b = *d.add(dot_pos + 1 + k);
-                        name[8 + k] = if b >= b'a' && b <= b'z' { b - 32 } else { b };
+                        name[8 + k] = if b.is_ascii_lowercase() { b - 32 } else { b };
                         k += 1;
                     }
                 }
@@ -376,14 +375,14 @@ struct FileEntry {
     /// directory entry. Captured during enumeration so the write path
     /// can re-read that exact sector for the size-field update without
     /// re-walking the directory.
-    dir_lba:    u32,
+    dir_lba: u32,
     /// Byte offset of the 32-byte entry inside `dir_lba`.
     dir_offset: u16,
     /// Short 8.3 name as stored in the directory entry: 8 name bytes
     /// padded with spaces, then 3 extension bytes. Used by the write
     /// path to locate a file by name.
     short_name: [u8; 11],
-    _pad:       u8,
+    _pad: u8,
 }
 
 impl FileEntry {
@@ -644,75 +643,75 @@ struct Fat32State {
     // The outbound packet format matches the nvme module's `requests`
     // port: REQ_HDR_SIZE header { op:u32=1, lba:u64, nlb:u32, nsid:u32 }
     // followed by nlb * 512 B payload.
-    write_out_chan:    i32,
+    write_out_chan: i32,
     /// NVMe namespace id stamped into every WRITE header. `0` forwards
     /// to the consumer's driver-wide default (nvme falls back to its
     /// `namespace` param in that case).
-    namespace:         u32,
-    write_state:       u8,   // current WS_* discriminant
-    write_file_len:    u8,   // 0 = disabled (no `write_file` param given)
+    namespace: u32,
+    write_state: u8,    // current WS_* discriminant
+    write_file_len: u8, // 0 = disabled (no `write_file` param given)
     /// 0 = inline `write_data` source (default, capped at `WRITE_DATA_MAX`).
     /// 1 = synthetic pattern source for `seed_byte_at(off)`. Combined
     /// with a non-zero `write_size`, lets a single fat32 instance lay
     /// down a multi-MB file without inflating module state past
     /// `WRITE_DATA_MAX`. Verifier on the read-back side recomputes
     /// the same pattern to confirm byte-exact write fidelity.
-    seed_pattern:      u8,
-    _pad_w0:           u8,
-    write_file:        [u8; 11],
-    _pad_w1:           u8,
-    write_data_len:    u16,
-    _pad_w2:           u16,
-    write_data:        [u8; WRITE_DATA_MAX],
+    seed_pattern: u8,
+    _pad_w0: u8,
+    write_file: [u8; 11],
+    _pad_w1: u8,
+    write_data_len: u16,
+    _pad_w2: u16,
+    write_data: [u8; WRITE_DATA_MAX],
 
     /// When > 0, the write loop walks this many bytes total instead
     /// of `write_data_len`. The bytes come from `seed_byte_at` if
     /// `seed_pattern == 1` or from `write_data` (zero-padded past
     /// `write_data_len`) otherwise. Caps at `u32::MAX`; practical
     /// values are bounded by free-cluster availability on the disk.
-    write_size:        u32,
+    write_size: u32,
 
     // Target file (resolved once during WS_Scan).
     w_target_first_cluster: u32,
-    w_target_old_size:      u32,
-    w_target_dir_lba:       u32,
-    w_target_dir_offset:    u16,
-    _pad_wt:                u16,
+    w_target_old_size: u32,
+    w_target_dir_lba: u32,
+    w_target_dir_offset: u16,
+    _pad_wt: u16,
 
     // Write-progress counters.
-    w_bytes_written:       u32, // bytes of `write_data` already pushed
-    w_current_cluster:     u32, // cluster currently being written into
-    w_sector_in_cluster:   u8,  // sector offset within current_cluster
-    _pad_wp:               [u8; 3],
+    w_bytes_written: u32,    // bytes of `write_data` already pushed
+    w_current_cluster: u32,  // cluster currently being written into
+    w_sector_in_cluster: u8, // sector offset within current_cluster
+    _pad_wp: [u8; 3],
 
     // Cluster-allocation scratch (used by AllocInit..LinkWait).
-    w_prev_cluster:        u32, // last cluster of the existing chain (parent of the new allocation)
-    w_new_cluster:         u32, // cluster just allocated (marked EOC)
-    w_alloc_probe:         u32, // next cluster number to test in the linear free-cluster scan
-    w_fat_sector_in_buf:   u32, // which absolute FAT LBA is currently cached in block_buf, or 0
-    w_fat_copy_idx:        u8,  // 0 = primary FAT, 1 = mirror FAT (only on num_fats=2)
-    w_patched_prev_inline: u8,  // 1 = prev_cluster's entry was in the same sector as new_cluster, already linked
-    w_fsinfo_pending:      u8,  // 1 = an FSINFO update is owed once the post-alloc FAT writes drain
-    _pad_wa:               u8,
+    w_prev_cluster: u32, // last cluster of the existing chain (parent of the new allocation)
+    w_new_cluster: u32,  // cluster just allocated (marked EOC)
+    w_alloc_probe: u32,  // next cluster number to test in the linear free-cluster scan
+    w_fat_sector_in_buf: u32, // which absolute FAT LBA is currently cached in block_buf, or 0
+    w_fat_copy_idx: u8,  // 0 = primary FAT, 1 = mirror FAT (only on num_fats=2)
+    w_patched_prev_inline: u8, // 1 = prev_cluster's entry was in the same sector as new_cluster, already linked
+    w_fsinfo_pending: u8,      // 1 = an FSINFO update is owed once the post-alloc FAT writes drain
+    _pad_wa: u8,
 
     // Post-write size patch.
-    w_new_size:            u32,
+    w_new_size: u32,
 
     // Outbound packet staging: REQ_HDR_SIZE request header + up to
     // MAX_WRITE_NLB sectors of payload. Filled before transitioning
     // into WS_SendPacket; drained across ticks (channel ring may take
     // several ticks to accept the full packet under backpressure).
-    w_outbuf:         [u8; REQ_HDR_SIZE + MAX_WRITE_NLB as usize * BLOCK_SIZE],
-    w_outbuf_sent:    u16,
+    w_outbuf: [u8; REQ_HDR_SIZE + MAX_WRITE_NLB as usize * BLOCK_SIZE],
+    w_outbuf_sent: u16,
     /// Total bytes in the current packet (REQ_HDR_SIZE + nlb * BLOCK_SIZE).
     /// Set by stage_header and consumed by drain_packet so the drain
     /// knows when the packet is fully on the wire.
-    w_outbuf_len:     u16,
+    w_outbuf_len: u16,
     /// NLB of the in-flight data batch. Used by ws_after_sector to
     /// advance w_bytes_written and w_sector_in_cluster by `nlb` sectors.
-    w_batch_nlb:      u16,
-    w_return_state:   u8,  // where to go after w_outbuf drains
-    _pad_w_ret:       u8,
+    w_batch_nlb: u16,
+    w_return_state: u8, // where to go after w_outbuf drains
+    _pad_w_ret: u8,
 
     /// Open-file slots backing the FS_CONTRACT dispatch path. Each
     /// slot is independent — multiple consumers can open multiple
@@ -896,8 +895,11 @@ fn cluster_count_ceiling(s: &Fat32State) -> u32 {
 #[inline(always)]
 fn fat_sector_for_cluster(s: &Fat32State, cluster: u32) -> u32 {
     let bps = s.bytes_per_sector as u32;
-    if bps == 0 { return s.fat_start_sector; }
-    s.fat_start_sector.wrapping_add((cluster.wrapping_mul(4)).wrapping_div(bps))
+    if bps == 0 {
+        return s.fat_start_sector;
+    }
+    s.fat_start_sector
+        .wrapping_add((cluster.wrapping_mul(4)).wrapping_div(bps))
 }
 
 /// Get offset within FAT sector for given cluster
@@ -905,7 +907,9 @@ fn fat_sector_for_cluster(s: &Fat32State, cluster: u32) -> u32 {
 #[inline(always)]
 fn fat_offset_for_cluster(s: &Fat32State, cluster: u32) -> usize {
     let bps = s.bytes_per_sector as u32;
-    if bps == 0 { return 0; }
+    if bps == 0 {
+        return 0;
+    }
     ((cluster.wrapping_mul(4)).wrapping_rem(bps)) as usize
 }
 
@@ -980,9 +984,13 @@ unsafe fn parse_boot_sector(s: &mut Fat32State) -> bool {
     // (trailing slack), so the allocator must bound on this, not FAT capacity.
     let tot_sec_16 = read_u16_le(buf, 19) as u32;
     let tot_sec_32 = read_u32_le(buf, 32);
-    let tot_sec = if tot_sec_16 != 0 { tot_sec_16 } else { tot_sec_32 };
-    let meta_sectors = (s.reserved_sectors as u32)
-        .wrapping_add((s.num_fats as u32).wrapping_mul(s.fat_size_32));
+    let tot_sec = if tot_sec_16 != 0 {
+        tot_sec_16
+    } else {
+        tot_sec_32
+    };
+    let meta_sectors =
+        (s.reserved_sectors as u32).wrapping_add((s.num_fats as u32).wrapping_mul(s.fat_size_32));
     let data_sectors = tot_sec.saturating_sub(meta_sectors);
     s.count_of_clusters = data_sectors / (s.sectors_per_cluster as u32);
 
@@ -1047,7 +1055,11 @@ unsafe fn try_read_block(s: &mut Fat32State) -> i32 {
 
 #[inline(always)]
 fn to_upper(c: u8) -> u8 {
-    if c >= b'a' && c <= b'z' { c - 32 } else { c }
+    if c.is_ascii_lowercase() {
+        c - 32
+    } else {
+        c
+    }
 }
 
 /// Compare a name (with optional dot) against an 8.3 directory entry.
@@ -1058,15 +1070,24 @@ unsafe fn matches_83(name: *const u8, name_len: usize, entry: *const u8) -> bool
     let mut dot = name_len;
     let mut i = 0;
     while i < name_len {
-        if *name.add(i) == b'.' { dot = i; break; }
+        if *name.add(i) == b'.' {
+            dot = i;
+            break;
+        }
         i += 1;
     }
 
     // Name part (8 bytes, space-padded)
     i = 0;
     while i < 8 {
-        let expected = if i < dot { to_upper(*name.add(i)) } else { b' ' };
-        if *entry.add(i) != expected { return false; }
+        let expected = if i < dot {
+            to_upper(*name.add(i))
+        } else {
+            b' '
+        };
+        if *entry.add(i) != expected {
+            return false;
+        }
         i += 1;
     }
 
@@ -1075,8 +1096,14 @@ unsafe fn matches_83(name: *const u8, name_len: usize, entry: *const u8) -> bool
     let ext_len = name_len - ext_start;
     i = 0;
     while i < 3 {
-        let expected = if i < ext_len { to_upper(*name.add(ext_start + i)) } else { b' ' };
-        if *entry.add(8 + i) != expected { return false; }
+        let expected = if i < ext_len {
+            to_upper(*name.add(ext_start + i))
+        } else {
+            b' '
+        };
+        if *entry.add(8 + i) != expected {
+            return false;
+        }
         i += 1;
     }
 
@@ -1090,12 +1117,16 @@ unsafe fn ext_matches(pp: *const u8, offset: usize, entry: *const u8) -> bool {
     let mut i = 0usize;
     let mut pi = offset;
     while i < 3 && *pp.add(pi) != 0 && *pp.add(pi) != b',' {
-        if *entry.add(8 + i) != to_upper(*pp.add(pi)) { return false; }
+        if *entry.add(8 + i) != to_upper(*pp.add(pi)) {
+            return false;
+        }
         i += 1;
         pi += 1;
     }
     while i < 3 {
-        if *entry.add(8 + i) != b' ' { return false; }
+        if *entry.add(8 + i) != b' ' {
+            return false;
+        }
         i += 1;
     }
     true
@@ -1114,12 +1145,14 @@ unsafe fn pattern_matches(pattern: &[u8; 16], entry: *const u8) -> bool {
     // "*.ext" or "*.ext,ext2,ext3" — match extension(s)
     if p0 == b'*' && *pp.add(1) == b'.' {
         // Try first extension at offset 2
-        if ext_matches(pp, 2, entry) { return true; }
+        if ext_matches(pp, 2, entry) {
+            return true;
+        }
         // Scan for comma-separated alternatives
         let mut pi = 2usize;
         while pi < 15 && *pp.add(pi) != 0 {
-            if *pp.add(pi) == b',' {
-                if ext_matches(pp, pi + 1, entry) { return true; }
+            if *pp.add(pi) == b',' && ext_matches(pp, pi + 1, entry) {
+                return true;
             }
             pi += 1;
         }
@@ -1128,7 +1161,9 @@ unsafe fn pattern_matches(pattern: &[u8; 16], entry: *const u8) -> bool {
 
     // Exact 8.3 match
     let mut plen = 0usize;
-    while plen < 15 && *pp.add(plen) != 0 { plen += 1; }
+    while plen < 15 && *pp.add(plen) != 0 {
+        plen += 1;
+    }
     matches_83(pp, plen, entry)
 }
 
@@ -1146,7 +1181,11 @@ unsafe fn start_enumeration(s: &mut Fat32State) {
         s.path_pos += 1;
     }
 
-    s.dir_mode = if *pp.add(s.path_pos as usize) == 0 { 1 } else { 0 };
+    s.dir_mode = if *pp.add(s.path_pos as usize) == 0 {
+        1
+    } else {
+        0
+    };
 }
 
 // ============================================================================
@@ -1231,16 +1270,16 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
 // block read is fully synchronous inside the dispatch call.
 
 // FS opcodes from the layered ABI.
-const FS_OPEN:    u32 = 0x0900;
-const FS_READ:    u32 = 0x0901;
-const FS_SEEK:    u32 = 0x0902;
-const FS_CLOSE:   u32 = 0x0903;
-const FS_STAT:    u32 = 0x0904;
-const FS_FSYNC:   u32 = 0x0905;
-const FS_WRITE:   u32 = 0x0906;
-const FS_WRITE_ASYNC:  u32 = 0x090F;
+const FS_OPEN: u32 = 0x0900;
+const FS_READ: u32 = 0x0901;
+const FS_SEEK: u32 = 0x0902;
+const FS_CLOSE: u32 = 0x0903;
+const FS_STAT: u32 = 0x0904;
+const FS_FSYNC: u32 = 0x0905;
+const FS_WRITE: u32 = 0x0906;
+const FS_WRITE_ASYNC: u32 = 0x090F;
 const FS_FSYNC_SUBMIT: u32 = 0x0910;
-const FS_FSYNC_POLL:   u32 = 0x0911;
+const FS_FSYNC_POLL: u32 = 0x0911;
 const FS_OPENDIR: u32 = 0x0907;
 const FS_READDIR: u32 = 0x0908;
 /// `OPEN_CREATE` (0x0909) is documented in
@@ -1272,12 +1311,12 @@ const FS_CAPS: u32 = 0x09FF;
 
 /// FS capability bits — must match
 /// `modules/sdk/contracts/storage/fs.rs::caps`.
-const FS_CAP_OPEN:        u32 = 1 << 0;
-const FS_CAP_OPENDIR:     u32 = 1 << 1;
+const FS_CAP_OPEN: u32 = 1 << 0;
+const FS_CAP_OPENDIR: u32 = 1 << 1;
 const FS_CAP_OPEN_CREATE: u32 = 1 << 2;
-const FS_CAP_WRITE:       u32 = 1 << 3;
-const FS_CAP_FSYNC:       u32 = 1 << 4;
-const FS_CAP_UNLINK:      u32 = 1 << 5;
+const FS_CAP_WRITE: u32 = 1 << 3;
+const FS_CAP_FSYNC: u32 = 1 << 4;
+const FS_CAP_UNLINK: u32 = 1 << 5;
 const FS_CAP_PREALLOCATE: u32 = 1 << 9;
 const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
 
@@ -1293,8 +1332,12 @@ const FAT32_FS_DEVICE_ID: u64 = 0x6661_7433_325f_6673; // "fat32_fs"
 unsafe fn fs_sync_read_sector(s: &Fat32State, lba: u32, out: *mut u8) -> i32 {
     let mut arg = [0u8; 16];
     let lba_b = lba.to_le_bytes();
-    arg[0] = lba_b[0]; arg[1] = lba_b[1]; arg[2] = lba_b[2]; arg[3] = lba_b[3];
-    arg[4] = 1; arg[5] = 0; // nlb = 1
+    arg[0] = lba_b[0];
+    arg[1] = lba_b[1];
+    arg[2] = lba_b[2];
+    arg[3] = lba_b[3];
+    arg[4] = 1;
+    arg[5] = 0; // nlb = 1
     let buf_b = (out as u64).to_le_bytes();
     let mut i = 0usize;
     while i < 8 {
@@ -1316,13 +1359,20 @@ unsafe fn fs_read_fat_entry(s: &mut Fat32State, cluster: u32) -> u32 {
     let fat_lba = fat_sector_for_cluster(s, cluster);
     let mut buf = [0u8; BLOCK_SIZE];
     let rc = fs_sync_read_sector(s, fat_lba, buf.as_mut_ptr());
-    if rc != 0 { fs_note_io(s, rc); return FAT32_EOC; }
+    if rc != 0 {
+        fs_note_io(s, rc);
+        return FAT32_EOC;
+    }
     let off = fat_offset_for_cluster(s, cluster);
-    if off + 4 > BLOCK_SIZE { return FAT32_EOC; }
-    let raw = u32::from_le_bytes([
-        buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
-    ]) & FAT32_MASK;
-    if raw == 0 || raw >= FAT32_EOC { FAT32_EOC } else { raw }
+    if off + 4 > BLOCK_SIZE {
+        return FAT32_EOC;
+    }
+    let raw = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) & FAT32_MASK;
+    if raw == 0 || raw >= FAT32_EOC {
+        FAT32_EOC
+    } else {
+        raw
+    }
 }
 
 /// Record a device-I/O failure observed inside an Option/sentinel-
@@ -1341,7 +1391,11 @@ fn fs_note_io(s: &mut Fat32State, rc: i32) {
 /// hiccup.
 #[inline]
 fn fs_rc_errno(rc: i32) -> i32 {
-    if rc == E_AGAIN { E_AGAIN } else { -5 } // EIO
+    if rc == E_AGAIN {
+        E_AGAIN
+    } else {
+        -5
+    } // EIO
 }
 
 /// Errno for a failed resolve/scan/alloc at an FS_CONTRACT entry
@@ -1360,18 +1414,23 @@ fn fs_io_errno(s: &Fat32State, default: i32) -> i32 {
 /// space-padded, uppercase). Returns true on success.
 fn fs_path_to_short_name(name: &[u8], out: &mut [u8; 11]) -> bool {
     *out = [b' '; 11];
-    if name.is_empty() || name.len() > 12 { return false; }
+    if name.is_empty() || name.len() > 12 {
+        return false;
+    }
     let mut dot: usize = name.len();
     let mut i = 0usize;
     while i < name.len() {
-        if name[i] == b'.' { dot = i; break; }
+        if name[i] == b'.' {
+            dot = i;
+            break;
+        }
         i += 1;
     }
     let n_len = if dot > 8 { 8 } else { dot };
     let mut j = 0usize;
     while j < n_len {
         let c = name[j];
-        out[j] = if (b'a'..=b'z').contains(&c) { c - 32 } else { c };
+        out[j] = if c.is_ascii_lowercase() { c - 32 } else { c };
         j += 1;
     }
     if dot < name.len() {
@@ -1380,7 +1439,7 @@ fn fs_path_to_short_name(name: &[u8], out: &mut [u8; 11]) -> bool {
         let mut k = 0usize;
         while k < e_len {
             let c = ext[k];
-            out[8 + k] = if (b'a'..=b'z').contains(&c) { c - 32 } else { c };
+            out[8 + k] = if c.is_ascii_lowercase() { c - 32 } else { c };
             k += 1;
         }
     }
@@ -1405,10 +1464,14 @@ unsafe fn fs_dir_lookup(
     dir_first_cluster: u32,
     want: &[u8; 11],
 ) -> Option<(u32, u32, u8)> {
-    if dir_first_cluster < 2 { return None; }
+    if dir_first_cluster < 2 {
+        return None;
+    }
     let entries_per_sector = BLOCK_SIZE / DIR_ENTRY_SIZE;
     let spc = s.sectors_per_cluster as u32;
-    if spc == 0 { return None; }
+    if spc == 0 {
+        return None;
+    }
     let mut cur_cluster = dir_first_cluster;
     let mut buf = [0u8; BLOCK_SIZE];
 
@@ -1453,7 +1516,9 @@ unsafe fn fs_dir_lookup(
         }
         // Cluster exhausted — follow FAT chain to next cluster.
         let next = fs_read_fat_entry(s, cur_cluster);
-        if next >= FAT32_EOC { return None; }
+        if next >= FAT32_EOC {
+            return None;
+        }
         cur_cluster = next;
     }
 }
@@ -1464,35 +1529,60 @@ unsafe fn fs_dir_lookup(
 /// path. Path components must already be in 8.3-compatible form
 /// (case-folded internally by `fs_path_to_short_name`).
 unsafe fn fs_resolve_path(s: &mut Fat32State, path: &[u8]) -> Option<ResolvedFile> {
-    if s.init_phase != Fat32InitPhase::Done { return None; }
-    if s.root_cluster < 2 { return None; }
-    if path.is_empty() { return None; }
+    if s.init_phase != Fat32InitPhase::Done {
+        return None;
+    }
+    if s.root_cluster < 2 {
+        return None;
+    }
+    if path.is_empty() {
+        return None;
+    }
     // Walk past leading slashes.
     let mut pos = 0usize;
-    while pos < path.len() && path[pos] == b'/' { pos += 1; }
-    if pos >= path.len() { return None; } // bare "/"
+    while pos < path.len() && path[pos] == b'/' {
+        pos += 1;
+    }
+    if pos >= path.len() {
+        return None;
+    } // bare "/"
 
     let mut cur_cluster = s.root_cluster;
     loop {
         // Extract the next component up to the next '/' or end-of-string.
         let start = pos;
-        while pos < path.len() && path[pos] != b'/' { pos += 1; }
+        while pos < path.len() && path[pos] != b'/' {
+            pos += 1;
+        }
         let comp = &path[start..pos];
-        if comp.is_empty() { return None; }
+        if comp.is_empty() {
+            return None;
+        }
         let mut want = [b' '; 11];
-        if !fs_path_to_short_name(comp, &mut want) { return None; }
+        if !fs_path_to_short_name(comp, &mut want) {
+            return None;
+        }
         let (sc, sz, attr) = fs_dir_lookup(s, cur_cluster, &want)?;
         // Skip trailing slashes.
-        while pos < path.len() && path[pos] == b'/' { pos += 1; }
+        while pos < path.len() && path[pos] == b'/' {
+            pos += 1;
+        }
         let is_final = pos >= path.len();
         if is_final {
             // The terminal component must be a regular file —
             // directories aren't openable through FS_OPEN.
-            if (attr & ATTR_DIRECTORY) != 0 { return None; }
-            return Some(ResolvedFile { start_cluster: sc, size: sz });
+            if (attr & ATTR_DIRECTORY) != 0 {
+                return None;
+            }
+            return Some(ResolvedFile {
+                start_cluster: sc,
+                size: sz,
+            });
         }
         // Intermediate component must be a directory.
-        if (attr & ATTR_DIRECTORY) == 0 { return None; }
+        if (attr & ATTR_DIRECTORY) == 0 {
+            return None;
+        }
         cur_cluster = sc;
     }
 }
@@ -1503,8 +1593,12 @@ unsafe fn fs_resolve_path(s: &mut Fat32State, path: &[u8]) -> Option<ResolvedFil
 /// populated with the file's `start_cluster` + `size`. Returns the
 /// slot index as the FD, or a negative errno.
 unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len == 0 { return E_INVAL; }
-    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    if arg.is_null() || arg_len == 0 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done {
+        return E_AGAIN;
+    }
     s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let resolved = match fs_resolve_path(s, path) {
@@ -1524,7 +1618,9 @@ unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 
         }
         k += 1;
     }
-    if slot < 0 { return -23; } // ENFILE
+    if slot < 0 {
+        return -23;
+    } // ENFILE
     let of = &mut s.open_files[slot as usize];
     of.in_use = 1;
     of.start_cluster = resolved.start_cluster;
@@ -1549,34 +1645,50 @@ unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 
 /// boundary). Returns bytes read on success; 0 at EOF; negative
 /// errno on error.
 unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len == 0 { return E_INVAL; }
-    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    if arg.is_null() || arg_len == 0 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done {
+        return E_AGAIN;
+    }
     let slot_idx = handle as usize;
-    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
-    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    if slot_idx >= MAX_OPEN_FILES {
+        return E_INVAL;
+    }
+    if s.open_files[slot_idx].in_use == 0 {
+        return E_INVAL;
+    }
     // A read reuses `scratch_block` as the read cache; if it still holds
     // un-flushed appends (deferred writes), persist them first so the device
     // is consistent and the data isn't clobbered. No-op for read-only FDs and
     // for append writers (whose read offset sits at EOF, so no fetch occurs).
     let sr = fs_flush_scratch(s, slot_idx);
-    if sr != 0 { return sr; }
+    if sr != 0 {
+        return sr;
+    }
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
-    if bps == 0 || spc == 0 { return E_AGAIN; }
+    if bps == 0 || spc == 0 {
+        return E_AGAIN;
+    }
 
     let mut written: usize = 0;
     let max = arg_len;
     while written < max {
         let of = &mut s.open_files[slot_idx];
         let remaining_in_file = of.size.saturating_sub(of.offset);
-        if remaining_in_file == 0 { break; }
+        if remaining_in_file == 0 {
+            break;
+        }
         if of.scratch_avail == 0 {
             // Fetch the current sector.
             let sector = cluster_to_sector(s, s.open_files[slot_idx].current_cluster)
                 + (s.open_files[slot_idx].sector_in_cluster as u32);
             let buf_ptr = s.open_files[slot_idx].scratch_block.as_mut_ptr();
             let rc = fs_sync_read_sector(s, sector, buf_ptr);
-            if rc != 0 { return rc; }
+            if rc != 0 {
+                return rc;
+            }
             let of2 = &mut s.open_files[slot_idx];
             of2.scratch_avail = bps as u16;
             of2.scratch_pos = 0;
@@ -1587,7 +1699,11 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
         let of3 = &mut s.open_files[slot_idx];
         let avail = of3.scratch_avail as u32;
         let want = (max - written) as u32;
-        let cap = if remaining_in_file < want { remaining_in_file } else { want };
+        let cap = if remaining_in_file < want {
+            remaining_in_file
+        } else {
+            want
+        };
         let take = if avail < cap { avail } else { cap } as usize;
         // Copy from scratch_block into caller's buffer.
         core::ptr::copy_nonoverlapping(
@@ -1625,12 +1741,20 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
 /// (matching the Linux FS dispatch). Returns the resulting offset on
 /// success or negative errno.
 unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 4 { return E_INVAL; }
+    if arg.is_null() || arg_len < 4 {
+        return E_INVAL;
+    }
     let slot_idx = handle as usize;
-    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
-    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    if slot_idx >= MAX_OPEN_FILES {
+        return E_INVAL;
+    }
+    if s.open_files[slot_idx].in_use == 0 {
+        return E_INVAL;
+    }
     let raw = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-    if raw < 0 { return E_INVAL; }
+    if raw < 0 {
+        return E_INVAL;
+    }
     let target = raw as u32;
     // Deferred-write coherence (the append writer's `scratch_block` may hold
     // un-flushed bytes): a seek to the CURRENT offset is a positional no-op —
@@ -1645,10 +1769,14 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         return target as i32;
     }
     let sr = fs_flush_scratch(s, slot_idx);
-    if sr != 0 { return sr; }
+    if sr != 0 {
+        return sr;
+    }
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
-    if bps == 0 || spc == 0 { return E_AGAIN; }
+    if bps == 0 || spc == 0 {
+        return E_AGAIN;
+    }
     let cluster_bytes = bps * spc;
     // Fixed-capacity WAL batches write a four-byte terminator and immediately
     // rewind over it. Keep that same-cluster reposition O(1): scratch_block
@@ -1718,7 +1846,9 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         let lba = cluster_to_sector(s, cluster) + (target_sector as u32);
         let buf_ptr = s.open_files[slot_idx].scratch_block.as_mut_ptr();
         let rc = fs_sync_read_sector(s, lba, buf_ptr);
-        if rc != 0 { return rc; }
+        if rc != 0 {
+            return rc;
+        }
         // scratch_block now holds `lba` — keep the write-back cache tag coherent.
         s.open_files[slot_idx].scratch_lba = lba;
     }
@@ -1744,8 +1874,12 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
 /// FS_CLOSE: free the OpenFile slot.
 unsafe fn fs_op_close(s: &mut Fat32State, handle: i32) -> i32 {
     let slot_idx = handle as usize;
-    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
-    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    if slot_idx >= MAX_OPEN_FILES {
+        return E_INVAL;
+    }
+    if s.open_files[slot_idx].in_use == 0 {
+        return E_INVAL;
+    }
     // Flush a dirty writable handle so the directory entry (size +
     // first cluster) is persisted before the slot is released — a
     // close without an explicit fsync must not lose the file.
@@ -1759,7 +1893,13 @@ unsafe fn fs_op_close(s: &mut Fat32State, handle: i32) -> i32 {
             let fl = fs_sync_flush(s);
             // Surface a genuine durability failure (FS_FSYNC returns success,
             // so a non-zero here is real); the slot is released either way.
-            rc = if sr != 0 { sr } else if wb != 0 { wb } else { fl };
+            rc = if sr != 0 {
+                sr
+            } else if wb != 0 {
+                wb
+            } else {
+                fl
+            };
         } else if sr != 0 {
             rc = sr;
         }
@@ -1777,17 +1917,26 @@ unsafe fn fs_op_close(s: &mut Fat32State, handle: i32) -> i32 {
 /// `arg`. mtime is reported as 0 — fat32 does not surface modification
 /// times through this dispatch.
 unsafe fn fs_op_stat(s: &Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 8 { return E_INVAL; }
+    if arg.is_null() || arg_len < 8 {
+        return E_INVAL;
+    }
     let slot_idx = handle as usize;
-    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
-    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
+    if slot_idx >= MAX_OPEN_FILES {
+        return E_INVAL;
+    }
+    if s.open_files[slot_idx].in_use == 0 {
+        return E_INVAL;
+    }
     let size = s.open_files[slot_idx].size;
     let s_b = size.to_le_bytes();
     *arg = s_b[0];
     *arg.add(1) = s_b[1];
     *arg.add(2) = s_b[2];
     *arg.add(3) = s_b[3];
-    *arg.add(4) = 0; *arg.add(5) = 0; *arg.add(6) = 0; *arg.add(7) = 0;
+    *arg.add(4) = 0;
+    *arg.add(5) = 0;
+    *arg.add(6) = 0;
+    *arg.add(7) = 0;
     0
 }
 
@@ -1796,30 +1945,52 @@ unsafe fn fs_op_stat(s: &Fat32State, handle: i32, arg: *mut u8, arg_len: usize) 
 /// Returns the directory's first cluster on success, or `None` for
 /// ENOENT / ENOTDIR. Used exclusively by `fs_op_opendir`.
 unsafe fn fs_resolve_dir_path(s: &mut Fat32State, path: &[u8]) -> Option<u32> {
-    if s.init_phase != Fat32InitPhase::Done { return None; }
-    if s.root_cluster < 2 { return None; }
+    if s.init_phase != Fat32InitPhase::Done {
+        return None;
+    }
+    if s.root_cluster < 2 {
+        return None;
+    }
     // Strip leading + trailing slashes; bare "/" → root.
     let mut start = 0usize;
-    while start < path.len() && path[start] == b'/' { start += 1; }
+    while start < path.len() && path[start] == b'/' {
+        start += 1;
+    }
     let mut end = path.len();
-    while end > start && path[end - 1] == b'/' { end -= 1; }
-    if start >= end { return Some(s.root_cluster); }
+    while end > start && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    if start >= end {
+        return Some(s.root_cluster);
+    }
 
     let mut cur_cluster = s.root_cluster;
     let mut pos = start;
     loop {
         let comp_start = pos;
-        while pos < end && path[pos] != b'/' { pos += 1; }
+        while pos < end && path[pos] != b'/' {
+            pos += 1;
+        }
         let comp = &path[comp_start..pos];
-        if comp.is_empty() { return None; }
+        if comp.is_empty() {
+            return None;
+        }
         let mut want = [b' '; 11];
-        if !fs_path_to_short_name(comp, &mut want) { return None; }
+        if !fs_path_to_short_name(comp, &mut want) {
+            return None;
+        }
         let (sc, _sz, attr) = fs_dir_lookup(s, cur_cluster, &want)?;
         // Every intermediate AND the terminal component must be a dir.
-        if (attr & ATTR_DIRECTORY) == 0 { return None; }
+        if (attr & ATTR_DIRECTORY) == 0 {
+            return None;
+        }
         cur_cluster = sc;
-        while pos < end && path[pos] == b'/' { pos += 1; }
-        if pos >= end { return Some(cur_cluster); }
+        while pos < end && path[pos] == b'/' {
+            pos += 1;
+        }
+        if pos >= end {
+            return Some(cur_cluster);
+        }
     }
 }
 
@@ -1829,8 +2000,12 @@ unsafe fn fs_resolve_dir_path(s: &mut Fat32State, path: &[u8]) -> Option<u32> {
 /// entry index within sector) starts at the first entry of the
 /// first cluster.
 unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len == 0 { return E_INVAL; }
-    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    if arg.is_null() || arg_len == 0 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done {
+        return E_AGAIN;
+    }
     s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let dir_cluster = match fs_resolve_dir_path(s, path) {
@@ -1846,7 +2021,9 @@ unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i
         }
         k += 1;
     }
-    if slot < 0 { return -23; } // ENFILE
+    if slot < 0 {
+        return -23;
+    } // ENFILE
     let of = &mut s.open_files[slot as usize];
     of.in_use = 1;
     of.is_dir = 1;
@@ -1872,17 +2049,31 @@ unsafe fn fs_op_opendir(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i
 /// On end-of-directory the function returns 0 and latches `dir_eof`
 /// so subsequent calls keep returning 0 without re-walking the chain.
 unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len < 2 { return E_INVAL; }
-    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
+    if arg.is_null() || arg_len < 2 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done {
+        return E_AGAIN;
+    }
     let slot_idx = handle as usize;
-    if slot_idx >= MAX_OPEN_FILES { return E_INVAL; }
-    if s.open_files[slot_idx].in_use == 0 { return E_INVAL; }
-    if s.open_files[slot_idx].is_dir == 0 { return E_INVAL; }
-    if s.open_files[slot_idx].dir_eof != 0 { return 0; }
+    if slot_idx >= MAX_OPEN_FILES {
+        return E_INVAL;
+    }
+    if s.open_files[slot_idx].in_use == 0 {
+        return E_INVAL;
+    }
+    if s.open_files[slot_idx].is_dir == 0 {
+        return E_INVAL;
+    }
+    if s.open_files[slot_idx].dir_eof != 0 {
+        return 0;
+    }
     s.io_rc = 0;
 
     let spc = s.sectors_per_cluster as u32;
-    if spc == 0 { return E_AGAIN; }
+    if spc == 0 {
+        return E_AGAIN;
+    }
     let entries_per_sector = BLOCK_SIZE / DIR_ENTRY_SIZE;
 
     // Reserve 2 bytes for the count header; entries start at offset 2.
@@ -1936,27 +2127,43 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
                 *arg.add(1) = cnt_le[1];
                 return out_pos as i32;
             }
-            if first == 0xE5 { e += 1; continue; }
+            if first == 0xE5 {
+                e += 1;
+                continue;
+            }
             let attr = buf[off + 11];
             // Skip LFN companion entries (attr == 0x0F), volume label
             // (0x08), hidden (0x02), system (0x04). Regular files +
             // dirs have neither of those four bits set in the lower
             // nibble combinations we filter.
-            if attr == ATTR_LONG_NAME { e += 1; continue; }
-            if (attr & (ATTR_VOLUME_ID | 0x02 | 0x04)) != 0 { e += 1; continue; }
+            if attr == ATTR_LONG_NAME {
+                e += 1;
+                continue;
+            }
+            if (attr & (ATTR_VOLUME_ID | 0x02 | 0x04)) != 0 {
+                e += 1;
+                continue;
+            }
             // Decode 8.3 short name back into "NAME.EXT" form.
             let raw = &buf[off..off + 11];
             // Skip "." and ".." pseudo-entries.
             if raw[0] == b'.' {
-                let is_dot    = raw[1] == b' ' && raw[2] == b' ';
+                let is_dot = raw[1] == b' ' && raw[2] == b' ';
                 let is_dotdot = raw[1] == b'.' && raw[2] == b' ';
-                if is_dot || is_dotdot { e += 1; continue; }
+                if is_dot || is_dotdot {
+                    e += 1;
+                    continue;
+                }
             }
             // Trim trailing spaces from name (0..8) and ext (8..11).
             let mut nlen = 8usize;
-            while nlen > 0 && raw[nlen - 1] == b' ' { nlen -= 1; }
+            while nlen > 0 && raw[nlen - 1] == b' ' {
+                nlen -= 1;
+            }
             let mut elen = 3usize;
-            while elen > 0 && raw[8 + elen - 1] == b' ' { elen -= 1; }
+            while elen > 0 && raw[8 + elen - 1] == b' ' {
+                elen -= 1;
+            }
             let total = nlen + if elen > 0 { 1 + elen } else { 0 };
             // Per-entry overhead: name_len(1) + type(1) + bytes.
             let need = 2 + total;
@@ -1974,14 +2181,14 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
                 *arg.add(1) = cnt_le[1];
                 return out_pos as i32;
             }
-            *arg.add(out_pos)     = total as u8;
+            *arg.add(out_pos) = total as u8;
             *arg.add(out_pos + 1) = if (attr & ATTR_DIRECTORY) != 0 { 1 } else { 0 };
             let mut wp = out_pos + 2;
             // Copy name (lower-cased for cleaner display).
             let mut i = 0usize;
             while i < nlen {
                 let c = raw[i];
-                let lc = if (b'A'..=b'Z').contains(&c) { c + 32 } else { c };
+                let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
                 *arg.add(wp) = lc;
                 wp += 1;
                 i += 1;
@@ -1992,7 +2199,7 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
                 let mut k = 0usize;
                 while k < elen {
                     let c = raw[8 + k];
-                    let lc = if (b'A'..=b'Z').contains(&c) { c + 32 } else { c };
+                    let lc = if c.is_ascii_uppercase() { c + 32 } else { c };
                     *arg.add(wp) = lc;
                     wp += 1;
                     k += 1;
@@ -2032,22 +2239,32 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
 /// Synchronously write `nlb` contiguous 512-byte sectors at absolute `lba`.
 /// The block contract and current NVMe producer accept at most eight sectors
 /// per call (one 4 KiB DMA page).
-unsafe fn fs_sync_write_sectors(
-    s: &Fat32State,
-    lba: u32,
-    nlb: u16,
-    buf: *const u8,
-) -> i32 {
-    if nlb == 0 || nlb > 8 { return E_INVAL; }
+unsafe fn fs_sync_write_sectors(s: &Fat32State, lba: u32, nlb: u16, buf: *const u8) -> i32 {
+    if nlb == 0 || nlb > 8 {
+        return E_INVAL;
+    }
     let mut arg = [0u8; 16];
     let lba_b = lba.to_le_bytes();
-    arg[0] = lba_b[0]; arg[1] = lba_b[1]; arg[2] = lba_b[2]; arg[3] = lba_b[3];
+    arg[0] = lba_b[0];
+    arg[1] = lba_b[1];
+    arg[2] = lba_b[2];
+    arg[3] = lba_b[3];
     let nlb_b = nlb.to_le_bytes();
-    arg[4] = nlb_b[0]; arg[5] = nlb_b[1];
+    arg[4] = nlb_b[0];
+    arg[5] = nlb_b[1];
     let buf_b = (buf as u64).to_le_bytes();
     let mut i = 0usize;
-    while i < 8 { arg[8 + i] = buf_b[i]; i += 1; }
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_WRITE_LBAS_SYNC, arg.as_mut_ptr(), 16)
+    while i < 8 {
+        arg[8 + i] = buf_b[i];
+        i += 1;
+    }
+    dev_channel_ioctl(
+        s.sys(),
+        s.in_chan,
+        IOCTL_BLOCKS_WRITE_LBAS_SYNC,
+        arg.as_mut_ptr(),
+        16,
+    )
 }
 
 /// Synchronously write one 512-byte sector at absolute `lba` from `buf`.
@@ -2060,7 +2277,13 @@ unsafe fn fs_sync_write_sector(s: &Fat32State, lba: u32, buf: *const u8) -> i32 
 /// success; ENOSYS-tolerant callers treat a negative result as "no
 /// durable flush available" but fat32 surfaces it.
 unsafe fn fs_sync_flush(s: &Fat32State) -> i32 {
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_FLUSH_SYNC, core::ptr::null_mut(), 0)
+    dev_channel_ioctl(
+        s.sys(),
+        s.in_chan,
+        IOCTL_BLOCKS_FLUSH_SYNC,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Submit one 512-byte sector write WITHOUT waiting (async durable-write
@@ -2073,12 +2296,25 @@ unsafe fn fs_sync_flush(s: &Fat32State) -> i32 {
 unsafe fn fs_async_write_sector(s: &Fat32State, lba: u32, buf: *const u8) -> i32 {
     let mut arg = [0u8; 16];
     let lba_b = lba.to_le_bytes();
-    arg[0] = lba_b[0]; arg[1] = lba_b[1]; arg[2] = lba_b[2]; arg[3] = lba_b[3];
-    arg[4] = 1; arg[5] = 0; // nlb = 1
+    arg[0] = lba_b[0];
+    arg[1] = lba_b[1];
+    arg[2] = lba_b[2];
+    arg[3] = lba_b[3];
+    arg[4] = 1;
+    arg[5] = 0; // nlb = 1
     let buf_b = (buf as u64).to_le_bytes();
     let mut i = 0usize;
-    while i < 8 { arg[8 + i] = buf_b[i]; i += 1; }
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_WRITE_LBAS_ASYNC, arg.as_mut_ptr(), 16)
+    while i < 8 {
+        arg[8 + i] = buf_b[i];
+        i += 1;
+    }
+    dev_channel_ioctl(
+        s.sys(),
+        s.in_chan,
+        IOCTL_BLOCKS_WRITE_LBAS_ASYNC,
+        arg.as_mut_ptr(),
+        16,
+    )
 }
 
 /// Open a durability fence over every async write submitted so far,
@@ -2089,9 +2325,15 @@ unsafe fn fs_async_write_sector(s: &Fat32State, lba: u32, buf: *const u8) -> i32
 unsafe fn fs_fence_submit(s: &Fat32State, ticket: &mut u64) -> i32 {
     let mut arg = [0u8; 8];
     let rc = dev_channel_ioctl(
-        s.sys(), s.in_chan, IOCTL_BLOCKS_FENCE_SUBMIT, arg.as_mut_ptr(), 8,
+        s.sys(),
+        s.in_chan,
+        IOCTL_BLOCKS_FENCE_SUBMIT,
+        arg.as_mut_ptr(),
+        8,
     );
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     *ticket = u64::from_le_bytes(arg);
     0
 }
@@ -2100,7 +2342,13 @@ unsafe fn fs_fence_submit(s: &Fat32State, ticket: &mut u64) -> i32 {
 /// or a negative errno if a harvested write failed.
 unsafe fn fs_fence_poll(s: &Fat32State, ticket: u64) -> i32 {
     let mut arg = ticket.to_le_bytes();
-    dev_channel_ioctl(s.sys(), s.in_chan, IOCTL_BLOCKS_FENCE_POLL, arg.as_mut_ptr(), 8)
+    dev_channel_ioctl(
+        s.sys(),
+        s.in_chan,
+        IOCTL_BLOCKS_FENCE_POLL,
+        arg.as_mut_ptr(),
+        8,
+    )
 }
 
 /// Synchronously read one sector at `lba` into `block_buf`. Hoists the
@@ -2118,7 +2366,9 @@ unsafe fn fs_read_blockbuf(s: &mut Fat32State, lba: u32) -> i32 {
 unsafe fn fs_write_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) -> i32 {
     let fat1 = fat_sector_for_cluster(s, cluster);
     let rc = fs_read_blockbuf(s, fat1);
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     let off = fat_offset_for_cluster(s, cluster);
     let existing = read_u32_le(&s.block_buf, off);
     let merged = (existing & !FAT32_MASK) | (value & FAT32_MASK);
@@ -2132,7 +2382,9 @@ unsafe fn fs_write_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) -> i3
     while fi < s.num_fats as u32 {
         let sec = s.fat_start_sector + fi * s.fat_size_32 + rel;
         let wc = fs_sync_write_sector(s, sec, s.block_buf.as_ptr());
-        if wc != 0 { return wc; }
+        if wc != 0 {
+            return wc;
+        }
         fi += 1;
     }
     0
@@ -2143,14 +2395,21 @@ unsafe fn fs_write_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) -> i3
 /// if none free in the range (or an I/O error). Does not mutate the FAT.
 unsafe fn fs_scan_free_clusters(s: &mut Fat32State, lo: u32, hi: u32) -> u32 {
     let bps = s.bytes_per_sector as u32;
-    if bps == 0 { return 0; }
+    if bps == 0 {
+        return 0;
+    }
     let eps = bps / 4;
-    if eps == 0 { return 0; }
+    if eps == 0 {
+        return 0;
+    }
     let mut c = if lo < 2 { 2 } else { lo };
     while c < hi {
         let fat_sec = fat_sector_for_cluster(s, c);
         let rrc = fs_read_blockbuf(s, fat_sec);
-        if rrc != 0 { fs_note_io(s, rrc); return 0; }
+        if rrc != 0 {
+            fs_note_io(s, rrc);
+            return 0;
+        }
         let first_in_sec = (fat_sec - s.fat_start_sector).wrapping_mul(eps);
         let end = first_in_sec + eps;
         let mut cc = c;
@@ -2179,17 +2438,27 @@ unsafe fn fs_find_free_cluster(s: &mut Fat32State) -> u32 {
     // Real data-cluster ceiling, not raw FAT capacity — never return a slack
     // entry that maps past the data area.
     let max_clst = cluster_count_ceiling(s);
-    if max_clst < 3 { return 0; }
-    let hint = if s.next_free_hint < 2 { 2 } else { s.next_free_hint };
+    if max_clst < 3 {
+        return 0;
+    }
+    let hint = if s.next_free_hint < 2 {
+        2
+    } else {
+        s.next_free_hint
+    };
     let found = fs_scan_free_clusters(s, hint, max_clst);
-    if found >= 2 { return found; }
+    if found >= 2 {
+        return found;
+    }
     // Wrap-around: the region at/after the hint is exhausted; reclaim from
     // the low region the hint skipped past. Cap the upper bound at `max_clst`
     // — a stale FSINFO hint or an `init_free_hint` set beyond the data area
     // would otherwise scan past it and return a bogus (out-of-range) cluster.
     if hint > 2 {
         let wrapped = fs_scan_free_clusters(s, 2, hint.min(max_clst));
-        if wrapped >= 2 { return wrapped; }
+        if wrapped >= 2 {
+            return wrapped;
+        }
     }
     0
 }
@@ -2213,7 +2482,9 @@ const FS_ALLOC_EXTENT_CLUSTERS: u8 = 127;
 /// from logical file size, so preallocation is invisible to STAT/replay.
 unsafe fn fs_alloc_extent(s: &mut Fat32State, prev: u32) -> (u32, u8) {
     let cc = fs_find_free_cluster(s);
-    if cc < 2 { return (0, 0); }
+    if cc < 2 {
+        return (0, 0);
+    }
 
     let fat_lba = fat_sector_for_cluster(s, cc);
     let max_clst = cluster_count_ceiling(s);
@@ -2276,10 +2547,12 @@ unsafe fn fs_alloc_extent(s: &mut Fat32State, prev: u32) -> (u32, u8) {
 unsafe fn fs_free_chain(s: &mut Fat32State, start: u32) {
     let mut c = start;
     let mut guard: u32 = 0;
-    while c >= 2 && c < FAT32_EOC && guard < 0x1000_0000 {
+    while (2..FAT32_EOC).contains(&c) && guard < 0x1000_0000 {
         let next = fs_read_fat_entry(s, c); // EOC on chain end / 0
         let _ = fs_write_fat_entry(s, c, 0);
-        if next >= FAT32_EOC || next < 2 { break; }
+        if !(2..FAT32_EOC).contains(&next) {
+            break;
+        }
         c = next;
         guard += 1;
     }
@@ -2294,9 +2567,15 @@ unsafe fn fs_free_chain(s: &mut Fat32State, start: u32) {
 /// cluster — because the read path walks the FAT chain the drain would
 /// be zeroing underneath it.
 unsafe fn fs_op_unlink(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len == 0 { return E_INVAL; }
-    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
-    if s.root_cluster < 2 { return E_AGAIN; }
+    if arg.is_null() || arg_len == 0 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done {
+        return E_AGAIN;
+    }
+    if s.root_cluster < 2 {
+        return E_AGAIN;
+    }
     s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let (parent, want) = match fs_split_parent(s, path) {
@@ -2309,7 +2588,9 @@ unsafe fn fs_op_unlink(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
         // device read during the scan must keep its own errno.
         _ => return fs_io_errno(s, -2), // ENOENT
     };
-    if loc.is_dir { return -21; } // EISDIR — directory removal is not in the UNLINK surface
+    if loc.is_dir {
+        return -21;
+    } // EISDIR — directory removal is not in the UNLINK surface
     let mut k = 0usize;
     while k < MAX_OPEN_FILES {
         let of = &s.open_files[k];
@@ -2325,10 +2606,14 @@ unsafe fn fs_op_unlink(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     // sector lands, OPEN/OPEN_CREATE no longer resolve the name; a crash
     // before the chain drain merely leaks clusters.
     let rrc = fs_read_blockbuf(s, loc.lba);
-    if rrc != 0 { return fs_rc_errno(rrc); }
+    if rrc != 0 {
+        return fs_rc_errno(rrc);
+    }
     s.block_buf[loc.off as usize] = 0xE5;
     let wrc = fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr());
-    if wrc != 0 { return fs_rc_errno(wrc); }
+    if wrc != 0 {
+        return fs_rc_errno(wrc);
+    }
     if loc.start_cluster >= 2 {
         let mut q = 0usize;
         loop {
@@ -2360,31 +2645,45 @@ unsafe fn fs_step_free_chains(s: &mut Fat32State) {
     while slot < UNLINK_FREE_SLOTS && s.unlink_free[slot] < 2 {
         slot += 1;
     }
-    if slot >= UNLINK_FREE_SLOTS { return; }
+    if slot >= UNLINK_FREE_SLOTS {
+        return;
+    }
     let bps = s.bytes_per_sector as u32;
-    if bps == 0 { return; }
+    if bps == 0 {
+        return;
+    }
     let eps = bps / 4; // FAT entries per sector
-    if eps == 0 { return; }
+    if eps == 0 {
+        return;
+    }
     let max_clst = cluster_count_ceiling(s);
 
     let mut c = s.unlink_free[slot];
     let fat_sec = fat_sector_for_cluster(s, c);
-    if fs_read_blockbuf(s, fat_sec) != 0 { return; } // retry next step
+    if fs_read_blockbuf(s, fat_sec) != 0 {
+        return;
+    } // retry next step
     let first_in_sec = (fat_sec - s.fat_start_sector).wrapping_mul(eps);
     let mut freed_low: u32 = u32::MAX;
     let mut guard: u32 = 0;
     // Zero every chain link that lives in the loaded sector. `guard`
     // bounds a corrupt/cyclic chain at one sector's entry count.
-    while c >= 2 && c < FAT32_EOC && c < max_clst && guard <= eps {
-        if fat_sector_for_cluster(s, c) != fat_sec { break; }
+    while (2..FAT32_EOC).contains(&c) && c < max_clst && guard <= eps {
+        if fat_sector_for_cluster(s, c) != fat_sec {
+            break;
+        }
         let off = ((c - first_in_sec) * 4) as usize;
-        if off + 4 > BLOCK_SIZE { break; }
+        if off + 4 > BLOCK_SIZE {
+            break;
+        }
         let next = read_u32_le(&s.block_buf, off) & FAT32_MASK;
         s.block_buf[off] = 0;
         s.block_buf[off + 1] = 0;
         s.block_buf[off + 2] = 0;
         s.block_buf[off + 3] = 0;
-        if c < freed_low { freed_low = c; }
+        if c < freed_low {
+            freed_low = c;
+        }
         c = next;
         guard += 1;
     }
@@ -2394,12 +2693,18 @@ unsafe fn fs_step_free_chains(s: &mut Fat32State) {
     let mut fi: u32 = 0;
     while fi < s.num_fats as u32 {
         let sec = s.fat_start_sector + fi * s.fat_size_32 + rel;
-        if fs_sync_write_sector(s, sec, s.block_buf.as_ptr()) != 0 { return; }
+        if fs_sync_write_sector(s, sec, s.block_buf.as_ptr()) != 0 {
+            return;
+        }
         fi += 1;
     }
     // Chain continues in another FAT sector → park the cursor there;
     // otherwise the chain is fully freed and the slot opens up.
-    s.unlink_free[slot] = if c >= 2 && c < FAT32_EOC && c < max_clst { c } else { 0 };
+    s.unlink_free[slot] = if (2..FAT32_EOC).contains(&c) && c < max_clst {
+        c
+    } else {
+        0
+    };
     if freed_low != u32::MAX && freed_low < s.next_free_hint {
         s.next_free_hint = freed_low;
     }
@@ -2457,12 +2762,16 @@ unsafe fn fs_write_fsinfo_hint(s: &mut Fat32State) -> i32 {
 /// only — discards existing root-dir entries.
 unsafe fn fs_clean_root(s: &mut Fat32State) {
     let spc = s.sectors_per_cluster as u32;
-    if spc == 0 || s.root_cluster < 2 { return; }
+    if spc == 0 || s.root_cluster < 2 {
+        return;
+    }
     let base = cluster_to_sector(s, s.root_cluster);
     let zero = [0u8; BLOCK_SIZE];
     let mut i: u32 = 0;
     while i < spc {
-        if fs_sync_write_sector(s, base + i, zero.as_ptr()) != 0 { return; }
+        if fs_sync_write_sector(s, base + i, zero.as_ptr()) != 0 {
+            return;
+        }
         i += 1;
     }
     // One-cluster root: point its FAT entry at EOC, leaking any tail clusters.
@@ -2483,9 +2792,13 @@ unsafe fn fs_clean_root(s: &mut Fat32State) {
 /// chain past the first cluster — hence the data — is lost on read-back).
 unsafe fn fs_clear_fat_region(s: &mut Fat32State, start: u32, count: u32) {
     let bps = s.bytes_per_sector as u32;
-    if bps == 0 { return; }
+    if bps == 0 {
+        return;
+    }
     let eps = bps / 4; // FAT entries per sector
-    if eps == 0 { return; }
+    if eps == 0 {
+        return;
+    }
     let max_clst = cluster_count_ceiling(s);
     // Never touch the reserved entries FAT[0]/FAT[1] (media byte / EOC marker).
     let start = start.max(2);
@@ -2493,7 +2806,9 @@ unsafe fn fs_clear_fat_region(s: &mut Fat32State, start: u32, count: u32) {
     let mut c = start;
     while c < endc {
         let fat_sec = fat_sector_for_cluster(s, c);
-        if fs_read_blockbuf(s, fat_sec) != 0 { return; }
+        if fs_read_blockbuf(s, fat_sec) != 0 {
+            return;
+        }
         let first_in_sec = (fat_sec - s.fat_start_sector).wrapping_mul(eps);
         let sec_end = first_in_sec.saturating_add(eps);
         let lo = c.max(first_in_sec);
@@ -2513,7 +2828,9 @@ unsafe fn fs_clear_fat_region(s: &mut Fat32State, start: u32, count: u32) {
         let mut fi: u32 = 0;
         while fi < s.num_fats as u32 {
             let sec = s.fat_start_sector + fi * s.fat_size_32 + rel;
-            if fs_sync_write_sector(s, sec, s.block_buf.as_ptr()) != 0 { return; }
+            if fs_sync_write_sector(s, sec, s.block_buf.as_ptr()) != 0 {
+                return;
+            }
             fi += 1;
         }
         c = sec_end;
@@ -2535,7 +2852,12 @@ struct DirentLoc {
 #[inline]
 fn name_eq(a: &[u8], b: &[u8; 11]) -> bool {
     let mut i = 0usize;
-    while i < 11 { if a[i] != b[i] { return false; } i += 1; }
+    while i < 11 {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
     true
 }
 
@@ -2544,9 +2866,13 @@ fn name_eq(a: &[u8], b: &[u8; 11]) -> bool {
 /// slot (deleted `0xE5`, else the `0x00` end marker). `None` only if the
 /// directory is full with no end marker (caller treats as ENOSPC).
 unsafe fn fs_scan_dir(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11]) -> Option<DirentLoc> {
-    if dir_cluster < 2 { return None; }
+    if dir_cluster < 2 {
+        return None;
+    }
     let spc = s.sectors_per_cluster as u32;
-    if spc == 0 { return None; }
+    if spc == 0 {
+        return None;
+    }
     let mut cur = dir_cluster;
     let mut free_lba: u32 = 0;
     let mut free_off: u16 = 0;
@@ -2557,7 +2883,10 @@ unsafe fn fs_scan_dir(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11]) -> 
         while sec < spc {
             let lba = first_sec + sec;
             let rrc = fs_read_blockbuf(s, lba);
-            if rrc != 0 { fs_note_io(s, rrc); return None; }
+            if rrc != 0 {
+                fs_note_io(s, rrc);
+                return None;
+            }
             let mut e: usize = 0;
             while e < BLOCK_SIZE {
                 let b0 = s.block_buf[e];
@@ -2565,24 +2894,46 @@ unsafe fn fs_scan_dir(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11]) -> 
                     // End of directory — reuse a remembered free slot if
                     // we found one earlier, else take this end slot.
                     if have_free {
-                        return Some(DirentLoc { lba: free_lba, off: free_off, exists: false, is_dir: false, start_cluster: 0, size: 0 });
+                        return Some(DirentLoc {
+                            lba: free_lba,
+                            off: free_off,
+                            exists: false,
+                            is_dir: false,
+                            start_cluster: 0,
+                            size: 0,
+                        });
                     }
-                    return Some(DirentLoc { lba, off: e as u16, exists: false, is_dir: false, start_cluster: 0, size: 0 });
+                    return Some(DirentLoc {
+                        lba,
+                        off: e as u16,
+                        exists: false,
+                        is_dir: false,
+                        start_cluster: 0,
+                        size: 0,
+                    });
                 }
                 if b0 == 0xE5 {
-                    if !have_free { free_lba = lba; free_off = e as u16; have_free = true; }
+                    if !have_free {
+                        free_lba = lba;
+                        free_off = e as u16;
+                        have_free = true;
+                    }
                 } else {
                     let attr = s.block_buf[e + 11];
-                    if attr != ATTR_LONG_NAME && (attr & ATTR_VOLUME_ID) == 0
+                    if attr != ATTR_LONG_NAME
+                        && (attr & ATTR_VOLUME_ID) == 0
                         && name_eq(&s.block_buf[e..e + 11], want)
                     {
                         let chi = read_u16_le(&s.block_buf, e + 20) as u32;
                         let clo = read_u16_le(&s.block_buf, e + 26) as u32;
                         let sz = read_u32_le(&s.block_buf, e + 28);
                         return Some(DirentLoc {
-                            lba, off: e as u16, exists: true,
+                            lba,
+                            off: e as u16,
+                            exists: true,
                             is_dir: (attr & ATTR_DIRECTORY) != 0,
-                            start_cluster: (chi << 16) | clo, size: sz,
+                            start_cluster: (chi << 16) | clo,
+                            size: sz,
                         });
                     }
                 }
@@ -2591,9 +2942,16 @@ unsafe fn fs_scan_dir(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11]) -> 
             sec += 1;
         }
         let next = fs_read_fat_entry(s, cur);
-        if next >= FAT32_EOC || next < 2 {
+        if !(2..FAT32_EOC).contains(&next) {
             if have_free {
-                return Some(DirentLoc { lba: free_lba, off: free_off, exists: false, is_dir: false, start_cluster: 0, size: 0 });
+                return Some(DirentLoc {
+                    lba: free_lba,
+                    off: free_off,
+                    exists: false,
+                    is_dir: false,
+                    start_cluster: 0,
+                    size: 0,
+                });
             }
             return None; // directory full, no end marker, no free slot
         }
@@ -2603,9 +2961,17 @@ unsafe fn fs_scan_dir(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11]) -> 
 
 /// Patch a directory entry's first-cluster (hi@20/lo@26) and size@28
 /// fields in place. Read-modify-write of the entry's sector.
-unsafe fn fs_patch_dirent(s: &mut Fat32State, lba: u32, off: u16, first_cluster: u32, size: u32) -> i32 {
+unsafe fn fs_patch_dirent(
+    s: &mut Fat32State,
+    lba: u32,
+    off: u16,
+    first_cluster: u32,
+    size: u32,
+) -> i32 {
     let rc = fs_read_blockbuf(s, lba);
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     let e = off as usize;
     s.block_buf[e + 20] = (first_cluster >> 16) as u8;
     s.block_buf[e + 21] = (first_cluster >> 24) as u8;
@@ -2627,7 +2993,9 @@ unsafe fn fs_writeback_dir_entry(s: &mut Fat32State, slot: usize) -> i32 {
         (of.dir_lba, of.dir_off, of.start_cluster, of.size)
     };
     let rc = fs_patch_dirent(s, lba, off, fc, sz);
-    if rc == 0 { s.open_files[slot].dirty = 0; }
+    if rc == 0 {
+        s.open_files[slot].dirty = 0;
+    }
     rc
 }
 
@@ -2637,20 +3005,34 @@ unsafe fn fs_writeback_dir_entry(s: &mut Fat32State, slot: usize) -> i32 {
 unsafe fn fs_split_parent(s: &mut Fat32State, path: &[u8]) -> Option<(u32, [u8; 11])> {
     let mut cur = s.root_cluster;
     let mut i = 0usize;
-    while i < path.len() && path[i] == b'/' { i += 1; }
+    while i < path.len() && path[i] == b'/' {
+        i += 1;
+    }
     loop {
         let start = i;
-        while i < path.len() && path[i] != b'/' { i += 1; }
+        while i < path.len() && path[i] != b'/' {
+            i += 1;
+        }
         let comp = &path[start..i];
-        if comp.is_empty() { return None; }
+        if comp.is_empty() {
+            return None;
+        }
         let mut j = i;
-        while j < path.len() && path[j] == b'/' { j += 1; }
+        while j < path.len() && path[j] == b'/' {
+            j += 1;
+        }
         let is_final = j >= path.len();
         let mut want = [b' '; 11];
-        if !fs_path_to_short_name(comp, &mut want) { return None; }
-        if is_final { return Some((cur, want)); }
+        if !fs_path_to_short_name(comp, &mut want) {
+            return None;
+        }
+        if is_final {
+            return Some((cur, want));
+        }
         let (sc, _sz, attr) = fs_dir_lookup(s, cur, &want)?;
-        if (attr & ATTR_DIRECTORY) == 0 { return None; }
+        if (attr & ATTR_DIRECTORY) == 0 {
+            return None;
+        }
         cur = sc;
         i = j;
     }
@@ -2660,9 +3042,15 @@ unsafe fn fs_split_parent(s: &mut Fat32State, path: &[u8]) -> Option<(u32, [u8; 
 /// positioned for append at offset 0. The parent directory must already
 /// exist (no mkdir). Append-only — an existing file is truncated to 0.
 unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
-    if arg.is_null() || arg_len == 0 { return E_INVAL; }
-    if s.init_phase != Fat32InitPhase::Done { return E_AGAIN; }
-    if s.root_cluster < 2 { return E_AGAIN; }
+    if arg.is_null() || arg_len == 0 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done {
+        return E_AGAIN;
+    }
+    if s.root_cluster < 2 {
+        return E_AGAIN;
+    }
     s.io_rc = 0;
     let path = core::slice::from_raw_parts(arg, arg_len);
     let (parent, want) = match fs_split_parent(s, path) {
@@ -2705,10 +3093,15 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     let mut slot: i32 = -1;
     let mut k = 0usize;
     while k < MAX_OPEN_FILES {
-        if s.open_files[k].in_use == 0 { slot = k as i32; break; }
+        if s.open_files[k].in_use == 0 {
+            slot = k as i32;
+            break;
+        }
         k += 1;
     }
-    if slot < 0 { return -23; } // ENFILE
+    if slot < 0 {
+        return -23;
+    } // ENFILE
     let slot = slot as usize;
 
     let loc = match fs_scan_dir(s, parent, &want) {
@@ -2721,7 +3114,9 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     // Never repurpose a directory entry as a regular file: truncating it would
     // orphan the directory's contents and leave a writable handle on an entry
     // still flagged ATTR_DIRECTORY.
-    if loc.exists && loc.is_dir { return -21; } // EISDIR
+    if loc.exists && loc.is_dir {
+        return -21;
+    } // EISDIR
 
     if loc.exists {
         // Truncate: zero the entry's cluster + size. The old cluster chain
@@ -2734,19 +3129,31 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
         // append-only workload creates fresh paths (the `else` branch), so it
         // never frees here.
         let prc = fs_patch_dirent(s, loc.lba, loc.off, 0, 0);
-        if prc != 0 { return fs_rc_errno(prc); }
+        if prc != 0 {
+            return fs_rc_errno(prc);
+        }
     } else {
         // Write a fresh 8.3 entry (ATTR_ARCHIVE, cluster 0, size 0).
         let rrc = fs_read_blockbuf(s, loc.lba);
-        if rrc != 0 { return fs_rc_errno(rrc); }
+        if rrc != 0 {
+            return fs_rc_errno(rrc);
+        }
         let e = loc.off as usize;
         let mut i = 0usize;
-        while i < DIR_ENTRY_SIZE { s.block_buf[e + i] = 0; i += 1; }
+        while i < DIR_ENTRY_SIZE {
+            s.block_buf[e + i] = 0;
+            i += 1;
+        }
         let mut n = 0usize;
-        while n < 11 { s.block_buf[e + n] = want[n]; n += 1; }
+        while n < 11 {
+            s.block_buf[e + n] = want[n];
+            n += 1;
+        }
         s.block_buf[e + 11] = 0x20; // ATTR_ARCHIVE
         let wrc = fs_sync_write_sector(s, loc.lba, s.block_buf.as_ptr());
-        if wrc != 0 { return fs_rc_errno(wrc); }
+        if wrc != 0 {
+            return fs_rc_errno(wrc);
+        }
     }
 
     // Reserve the first extent as part of OPEN_CREATE. WAL opens its segment
@@ -2799,29 +3206,42 @@ unsafe fn fs_op_preallocate(
     arg: *const u8,
     arg_len: usize,
 ) -> i32 {
-    if arg.is_null() || arg_len < 4 { return E_INVAL; }
+    if arg.is_null() || arg_len < 4 {
+        return E_INVAL;
+    }
     let slot = handle as usize;
-    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
-    if s.open_files[slot].writable == 0 { return E_INVAL; }
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 {
+        return E_INVAL;
+    }
+    if s.open_files[slot].writable == 0 {
+        return E_INVAL;
+    }
     if s.open_files[slot].offset != 0 || s.open_files[slot].size != 0 {
         return E_INVAL;
     }
     let capacity = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-    if capacity == 0 { return E_INVAL; }
+    if capacity == 0 {
+        return E_INVAL;
+    }
     s.io_rc = 0;
     let cpb = (s.bytes_per_sector as u32).saturating_mul(s.sectors_per_cluster as u32);
-    if cpb == 0 { return E_AGAIN; }
+    if cpb == 0 {
+        return E_AGAIN;
+    }
     let target_clusters = capacity.saturating_add(cpb - 1) / cpb;
 
     while s.open_files[slot].allocated_clusters < target_clusters {
         let prev = s.open_files[slot].allocation_tail;
         let (first, count) = fs_alloc_extent(s, prev);
-        if first < 2 || count == 0 { return fs_io_errno(s, -28); } // ENOSPC
+        if first < 2 || count == 0 {
+            return fs_io_errno(s, -28);
+        } // ENOSPC
         if first != prev.saturating_add(1) {
             s.open_files[slot].fixed_contiguous = 0;
         }
-        s.open_files[slot].allocated_clusters =
-            s.open_files[slot].allocated_clusters.saturating_add(count as u32);
+        s.open_files[slot].allocated_clusters = s.open_files[slot]
+            .allocated_clusters
+            .saturating_add(count as u32);
         s.open_files[slot].allocation_tail = first + count as u32 - 1;
     }
 
@@ -2832,7 +3252,9 @@ unsafe fn fs_op_preallocate(
     s.open_files[slot].fixed_capacity = 1;
     s.open_files[slot].dirty = 1;
     let rc = fs_writeback_dir_entry(s, slot);
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     let rc = fs_sync_flush(s);
     if rc == 0 {
         s.open_files[slot].durable = 1;
@@ -2852,16 +3274,28 @@ unsafe fn fs_op_write(
     arg_len: usize,
     async_flush: bool,
 ) -> i32 {
-    if arg.is_null() { return E_INVAL; }
-    if arg_len == 0 { return 0; }
+    if arg.is_null() {
+        return E_INVAL;
+    }
+    if arg_len == 0 {
+        return 0;
+    }
     let slot = handle as usize;
-    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
-    if s.open_files[slot].writable == 0 { return E_INVAL; }
-    if async_flush { s.open_files[slot].async_mode = 1; }
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 {
+        return E_INVAL;
+    }
+    if s.open_files[slot].writable == 0 {
+        return E_INVAL;
+    }
+    if async_flush {
+        s.open_files[slot].async_mode = 1;
+    }
     s.io_rc = 0;
     let bps = s.bytes_per_sector as u32;
     let spc = s.sectors_per_cluster as u32;
-    if bps == 0 || spc == 0 { return E_AGAIN; }
+    if bps == 0 || spc == 0 {
+        return E_AGAIN;
+    }
     let cpb = bps * spc; // bytes per cluster
 
     let total = arg_len;
@@ -2888,7 +3322,7 @@ unsafe fn fs_op_write(
         // already advanced (or an extent had been allocated and linked),
         // the retry would advance the chain a second time and corrupt it.
         if s.open_files[slot].scratch_dirty != 0 {
-            let leaving = if pos % cpb == 0 {
+            let leaving = if pos.is_multiple_of(cpb) {
                 true
             } else {
                 let cur = s.open_files[slot].current_cluster;
@@ -2912,17 +3346,21 @@ unsafe fn fs_op_write(
                         // within a step or two). No error, no data loss.
                         return done as i32;
                     }
-                    if wr != 0 { return -5; }
+                    if wr != 0 {
+                        return -5;
+                    }
                 } else {
                     let wr = fs_sync_write_sector(s, prev, wp);
-                    if wr != 0 { return fs_rc_errno(wr); }
+                    if wr != 0 {
+                        return fs_rc_errno(wr);
+                    }
                 }
                 s.open_files[slot].scratch_dirty = 0;
             }
         }
         // At a cluster boundary, select or allocate the cluster containing
         // byte `pos`.
-        if pos % cpb == 0 {
+        if pos.is_multiple_of(cpb) {
             let start = s.open_files[slot].start_cluster;
             if s.open_files[slot].cursor_positioned != 0 {
                 // A prior FS_SEEK already walked `current_cluster` to the
@@ -2938,11 +3376,15 @@ unsafe fn fs_op_write(
                 } else {
                     fs_read_fat_entry(s, cur)
                 };
-                if next < 2 || next >= FAT32_EOC { return fs_io_errno(s, -28); }
+                if !(2..FAT32_EOC).contains(&next) {
+                    return fs_io_errno(s, -28);
+                }
                 s.open_files[slot].current_cluster = next;
             } else if start == 0 {
                 let (nc, extent) = fs_alloc_extent(s, 0);
-                if nc < 2 { return fs_io_errno(s, -28); } // ENOSPC
+                if nc < 2 {
+                    return fs_io_errno(s, -28);
+                } // ENOSPC
                 s.open_files[slot].start_cluster = nc;
                 s.open_files[slot].current_cluster = nc;
                 s.open_files[slot].extent_remaining = extent.saturating_sub(1);
@@ -2956,7 +3398,9 @@ unsafe fn fs_op_write(
             } else {
                 let cur = s.open_files[slot].current_cluster;
                 let (nc, extent) = fs_alloc_extent(s, cur);
-                if nc < 2 { return fs_io_errno(s, -28); }
+                if nc < 2 {
+                    return fs_io_errno(s, -28);
+                }
                 s.open_files[slot].current_cluster = nc;
                 s.open_files[slot].extent_remaining = extent.saturating_sub(1);
             }
@@ -2979,11 +3423,16 @@ unsafe fn fs_op_write(
         if off_in_sec != 0 && s.open_files[slot].scratch_lba != sector {
             let p = s.open_files[slot].scratch_block.as_mut_ptr();
             let rrc = fs_sync_read_sector(s, sector, p);
-            if rrc != 0 { return fs_rc_errno(rrc); }
+            if rrc != 0 {
+                return fs_rc_errno(rrc);
+            }
         }
         core::ptr::copy_nonoverlapping(
             arg.add(done),
-            s.open_files[slot].scratch_block.as_mut_ptr().add(off_in_sec),
+            s.open_files[slot]
+                .scratch_block
+                .as_mut_ptr()
+                .add(off_in_sec),
             n,
         );
         // DEFER the device write: `scratch_block` now mirrors `sector` with the
@@ -3034,16 +3483,24 @@ unsafe fn fs_flush_scratch(s: &mut Fat32State, slot: usize) -> i32 {
 /// read-only FD.
 unsafe fn fs_op_fsync(s: &mut Fat32State, handle: i32) -> i32 {
     let slot = handle as usize;
-    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
-    if s.open_files[slot].writable == 0 { return 0; }
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 {
+        return E_INVAL;
+    }
+    if s.open_files[slot].writable == 0 {
+        return 0;
+    }
     // Flush any pending deferred data sector BEFORE the dir-entry writeback and
     // the device cache flush — otherwise the last partial sector of appends
     // would never reach the platter and a reopen-read would lose it.
     let sr = fs_flush_scratch(s, slot);
-    if sr != 0 { return sr; }
+    if sr != 0 {
+        return sr;
+    }
     if s.open_files[slot].dirty != 0 {
         let rc = fs_writeback_dir_entry(s, slot);
-        if rc != 0 { return rc; }
+        if rc != 0 {
+            return rc;
+        }
     }
     let rc = fs_sync_flush(s);
     if rc == 0 {
@@ -3066,10 +3523,18 @@ unsafe fn fs_op_fsync(s: &mut Fat32State, handle: i32) -> i32 {
 /// `fs_op_fsync_poll`.
 unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     let slot = handle as usize;
-    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
-    if arg.is_null() || arg_len < 8 { return E_INVAL; }
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 {
+        return E_INVAL;
+    }
+    if arg.is_null() || arg_len < 8 {
+        return E_INVAL;
+    }
     if s.open_files[slot].writable == 0 {
-        let mut i = 0usize; while i < 8 { *arg.add(i) = 0; i += 1; }
+        let mut i = 0usize;
+        while i < 8 {
+            *arg.add(i) = 0;
+            i += 1;
+        }
         return 0;
     }
     if s.open_files[slot].scratch_dirty != 0 {
@@ -3084,14 +3549,22 @@ unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_
         } else {
             fs_sync_write_sector(s, lba, wp)
         };
-        if rc != 0 { return rc; }
+        if rc != 0 {
+            return rc;
+        }
         s.open_files[slot].scratch_dirty = 0;
     }
     let mut ticket = 0u64;
     let rc = fs_fence_submit(s, &mut ticket);
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     let tb = ticket.to_le_bytes();
-    let mut i = 0usize; while i < 8 { *arg.add(i) = tb[i]; i += 1; }
+    let mut i = 0usize;
+    while i < 8 {
+        *arg.add(i) = tb[i];
+        i += 1;
+    }
     0
 }
 
@@ -3103,24 +3576,39 @@ unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_
 /// ahead of the data it points at (see `fs_op_fsync_submit`).
 unsafe fn fs_op_fsync_poll(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
     let slot = handle as usize;
-    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 { return E_INVAL; }
-    if arg.is_null() || arg_len < 8 { return E_INVAL; }
+    if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 {
+        return E_INVAL;
+    }
+    if arg.is_null() || arg_len < 8 {
+        return E_INVAL;
+    }
     let ticket = u64::from_le_bytes([
-        *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-        *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+        *arg,
+        *arg.add(1),
+        *arg.add(2),
+        *arg.add(3),
+        *arg.add(4),
+        *arg.add(5),
+        *arg.add(6),
+        *arg.add(7),
     ]);
     let rc = fs_fence_poll(s, ticket);
     if rc == 0 {
         if s.open_files[slot].dirty != 0 {
             let wb = fs_writeback_dir_entry(s, slot);
-            if wb != 0 { return wb; }
+            if wb != 0 {
+                return wb;
+            }
         }
         s.open_files[slot].durable = 1;
     }
     rc
 }
 
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_dispatch")]
+#[cfg_attr(
+    not(feature = "host-test"),
+    link_section = ".text.module_provider_dispatch"
+)]
 #[cfg_attr(not(feature = "host-test"), export_name = "module_provider_dispatch")]
 pub unsafe extern "C" fn fat32_fs_dispatch(
     state: *mut u8,
@@ -3129,7 +3617,9 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    if state.is_null() { return E_INVAL; }
+    if state.is_null() {
+        return E_INVAL;
+    }
     let s = &mut *(state as *mut Fat32State);
     // `contracts::fence::QUERY_OP` — fence introspection. A handle reports
     // `LocalDurable` ONLY after a writable handle's bytes have been committed
@@ -3172,38 +3662,46 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         if arg.is_null() || arg_len < 4 {
             return E_INVAL;
         }
-        let caps: u32 = FS_CAP_OPEN | FS_CAP_OPENDIR
-            | FS_CAP_OPEN_CREATE | FS_CAP_WRITE | FS_CAP_FSYNC
-            | FS_CAP_UNLINK | FS_CAP_PREALLOCATE | FS_CAP_FSYNC_ASYNC;
+        let caps: u32 = FS_CAP_OPEN
+            | FS_CAP_OPENDIR
+            | FS_CAP_OPEN_CREATE
+            | FS_CAP_WRITE
+            | FS_CAP_FSYNC
+            | FS_CAP_UNLINK
+            | FS_CAP_PREALLOCATE
+            | FS_CAP_FSYNC_ASYNC;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
     }
     match opcode {
-        FS_OPEN        => fs_op_open(s, arg as *const u8, arg_len),
-        FS_READ        => fs_op_read(s, handle, arg, arg_len),
-        FS_SEEK        => fs_op_seek(s, handle, arg as *const u8, arg_len),
-        FS_CLOSE       => fs_op_close(s, handle),
-        FS_STAT        => fs_op_stat(s, handle, arg, arg_len),
-        FS_OPENDIR     => fs_op_opendir(s, arg as *const u8, arg_len),
-        FS_READDIR     => fs_op_readdir(s, handle, arg, arg_len),
+        FS_OPEN => fs_op_open(s, arg as *const u8, arg_len),
+        FS_READ => fs_op_read(s, handle, arg, arg_len),
+        FS_SEEK => fs_op_seek(s, handle, arg as *const u8, arg_len),
+        FS_CLOSE => fs_op_close(s, handle),
+        FS_STAT => fs_op_stat(s, handle, arg, arg_len),
+        FS_OPENDIR => fs_op_opendir(s, arg as *const u8, arg_len),
+        FS_READDIR => fs_op_readdir(s, handle, arg, arg_len),
         // Append-only synchronous write contract. The write machinery is
         // driven through the producer's synchronous block ioctls — see the
         // FS_CONTRACT write-path section above.
         FS_OPEN_CREATE => fs_op_create(s, arg as *const u8, arg_len),
-        FS_UNLINK      => fs_op_unlink(s, arg as *const u8, arg_len),
+        FS_UNLINK => fs_op_unlink(s, arg as *const u8, arg_len),
         FS_PREALLOCATE => fs_op_preallocate(s, handle, arg as *const u8, arg_len),
-        FS_WRITE       => fs_op_write(s, handle, arg as *const u8, arg_len, false),
+        FS_WRITE => fs_op_write(s, handle, arg as *const u8, arg_len, false),
         FS_WRITE_ASYNC => fs_op_write(s, handle, arg as *const u8, arg_len, true),
-        FS_FSYNC       => fs_op_fsync(s, handle),
+        FS_FSYNC => fs_op_fsync(s, handle),
         FS_FSYNC_SUBMIT => fs_op_fsync_submit(s, handle, arg, arg_len),
-        FS_FSYNC_POLL  => fs_op_fsync_poll(s, handle, arg as *const u8, arg_len),
+        FS_FSYNC_POLL => fs_op_fsync_poll(s, handle, arg as *const u8, arg_len),
         _ => -38, // ENOSYS
     }
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provides_contract")]
+#[cfg_attr(
+    not(feature = "host-test"),
+    link_section = ".text.module_provides_contract"
+)]
 pub extern "C" fn module_provides_contract() -> u32 {
     0x0009 // FS
 }
@@ -3222,7 +3720,10 @@ unsafe fn hash_selector(d: *const u8, len: usize) -> u32 {
 /// The loader calls this after `module_new` so `state` holds the parsed
 /// `volume:` param; a keyed volume is bound by the `mount` module.
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_selector")]
+#[cfg_attr(
+    not(feature = "host-test"),
+    link_section = ".text.module_provider_selector"
+)]
 pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
     if state.is_null() {
         return 0;
@@ -3276,8 +3777,8 @@ pub extern "C" fn module_new(
         s.write_out_chan = dev_channel_port(&*s.syscalls, 1, 0);
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -3332,16 +3833,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
             let mut pos = prefix.len();
             let ip = s.init_phase as u8;
-            *p.add(pos)     = b'0' + (ip / 10);
+            *p.add(pos) = b'0' + (ip / 10);
             *p.add(pos + 1) = b'0' + (ip % 10);
             pos += 2;
             let fc_tag = b" files=";
             core::ptr::copy_nonoverlapping(fc_tag.as_ptr(), p.add(pos), fc_tag.len());
             pos += fc_tag.len();
             let fc = s.file_count.min(999);
-            *p.add(pos)     = b'0' + ((fc / 100) % 10) as u8;
-            *p.add(pos + 1) = b'0' + ((fc / 10)  % 10) as u8;
-            *p.add(pos + 2) = b'0' + ( fc         % 10) as u8;
+            *p.add(pos) = b'0' + ((fc / 100) % 10) as u8;
+            *p.add(pos + 1) = b'0' + ((fc / 10) % 10) as u8;
+            *p.add(pos + 2) = b'0' + (fc % 10) as u8;
             pos += 3;
             // Write-path progress: current write_state discriminant
             // and bytes pushed so far. A stuck write is observable
@@ -3350,7 +3851,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             core::ptr::copy_nonoverlapping(ws_tag.as_ptr(), p.add(pos), ws_tag.len());
             pos += ws_tag.len();
             let ws = s.write_state.min(99);
-            *p.add(pos)     = b'0' + (ws / 10);
+            *p.add(pos) = b'0' + (ws / 10);
             *p.add(pos + 1) = b'0' + (ws % 10);
             pos += 2;
             let bw_tag = b" bw=";
@@ -3449,7 +3950,7 @@ unsafe fn patch_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) {
     let merged = (existing & !FAT32_MASK) | (value & FAT32_MASK);
     let le = merged.to_le_bytes();
     let dst = s.block_buf.as_mut_ptr().add(off);
-    *dst        = le[0];
+    *dst = le[0];
     *dst.add(1) = le[1];
     *dst.add(2) = le[2];
     *dst.add(3) = le[3];
@@ -3461,20 +3962,32 @@ unsafe fn patch_fat_entry(s: &mut Fat32State, cluster: u32, value: u32) {
 /// packet is fully on the wire.
 unsafe fn stage_header(s: &mut Fat32State, lba: u32, nlb: u16) {
     let out = s.w_outbuf.as_mut_ptr();
-    let op  = REQ_OP_WRITE.to_le_bytes();
-    let lb  = (lba as u64).to_le_bytes();
-    let nb  = (nlb as u32).to_le_bytes();
-    let ns  = s.namespace.to_le_bytes();
+    let op = REQ_OP_WRITE.to_le_bytes();
+    let lb = (lba as u64).to_le_bytes();
+    let nb = (nlb as u32).to_le_bytes();
+    let ns = s.namespace.to_le_bytes();
     let mut i = 0usize;
-    while i < 4 { *out.add(i)      = op[i]; i += 1; }
+    while i < 4 {
+        *out.add(i) = op[i];
+        i += 1;
+    }
     i = 0;
-    while i < 8 { *out.add(4 + i)  = lb[i]; i += 1; }
+    while i < 8 {
+        *out.add(4 + i) = lb[i];
+        i += 1;
+    }
     i = 0;
-    while i < 4 { *out.add(12 + i) = nb[i]; i += 1; }
+    while i < 4 {
+        *out.add(12 + i) = nb[i];
+        i += 1;
+    }
     i = 0;
-    while i < 4 { *out.add(16 + i) = ns[i]; i += 1; }
+    while i < 4 {
+        *out.add(16 + i) = ns[i];
+        i += 1;
+    }
     s.w_outbuf_sent = 0;
-    s.w_outbuf_len = (REQ_HDR_SIZE as u16) + (nlb as u16) * (BLOCK_SIZE as u16);
+    s.w_outbuf_len = (REQ_HDR_SIZE as u16) + nlb * (BLOCK_SIZE as u16);
 }
 
 /// Stage a 1-sector WRITE whose payload is `payload_src[..BLOCK_SIZE]`.
@@ -3538,7 +4051,11 @@ const fn seed_byte_at(off: usize) -> u8 {
 /// machine for both the loop bound and the new-size computation.
 #[inline(always)]
 fn effective_write_size(s: &Fat32State) -> u32 {
-    if s.write_size > 0 { s.write_size } else { s.write_data_len as u32 }
+    if s.write_size > 0 {
+        s.write_size
+    } else {
+        s.write_data_len as u32
+    }
 }
 
 /// Drain `w_outbuf` through `write_out_chan`. Returns 1 when the
@@ -3565,7 +4082,11 @@ unsafe fn drain_packet(s: &mut Fat32State) -> i32 {
         return -1;
     }
     s.w_outbuf_sent += rc as u16;
-    if s.w_outbuf_sent as usize >= total { 1 } else { 0 }
+    if s.w_outbuf_sent as usize >= total {
+        1
+    } else {
+        0
+    }
 }
 
 /// Log a hex-formatted 32-bit LBA with the given prefix.
@@ -3574,8 +4095,10 @@ unsafe fn log_lba(s: &Fat32State, prefix: &[u8], v: u32) {
     let p = msg.as_mut_ptr();
     core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
     let mut pos = prefix.len();
-    *p.add(pos) = b'0'; pos += 1;
-    *p.add(pos) = b'x'; pos += 1;
+    *p.add(pos) = b'0';
+    pos += 1;
+    *p.add(pos) = b'x';
+    pos += 1;
     let mut bi = 0usize;
     while bi < 8 {
         let n = ((v >> (28 - bi * 4)) & 0xF) as u8;
@@ -3674,10 +4197,16 @@ unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
         let mut eq = true;
         let mut k = 0usize;
         while k < 11 {
-            if (*fptr).short_name[k] != s.write_file[k] { eq = false; break; }
+            if (*fptr).short_name[k] != s.write_file[k] {
+                eq = false;
+                break;
+            }
             k += 1;
         }
-        if eq { found = i as i32; break; }
+        if eq {
+            found = i as i32;
+            break;
+        }
         i += 1;
     }
     if found < 0 {
@@ -3688,33 +4217,33 @@ unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
 
     let fptr = s.files.as_ptr().add(found as usize);
     s.w_target_first_cluster = (*fptr).start_cluster;
-    s.w_target_old_size      = (*fptr).size;
-    s.w_target_dir_lba       = (*fptr).dir_lba;
-    s.w_target_dir_offset    = (*fptr).dir_offset;
+    s.w_target_old_size = (*fptr).size;
+    s.w_target_dir_lba = (*fptr).dir_lba;
+    s.w_target_dir_offset = (*fptr).dir_offset;
 
     // POSIX-style overwrite: extend the file if the write is longer
     // than the existing size, but keep the existing tail on shorter
     // writes (no truncation). `effective_write_size` honours
     // `write_size` (synth-pattern path) over the inline buffer length.
     let old_size = s.w_target_old_size;
-    let wdl      = effective_write_size(s);
+    let wdl = effective_write_size(s);
     s.w_new_size = if wdl > old_size { wdl } else { old_size };
 
     // Initial cluster-walk state.
-    s.w_bytes_written     = 0;
-    s.w_current_cluster   = s.w_target_first_cluster;
+    s.w_bytes_written = 0;
+    s.w_current_cluster = s.w_target_first_cluster;
     s.w_sector_in_cluster = 0;
-    s.w_prev_cluster      = 0;
-    s.w_new_cluster       = 0;
-    s.w_alloc_probe       = 2;
+    s.w_prev_cluster = 0;
+    s.w_new_cluster = 0;
+    s.w_alloc_probe = 2;
     s.w_fat_sector_in_buf = 0;
-    s.w_fat_copy_idx      = 0;
+    s.w_fat_copy_idx = 0;
 
     // Log the LBA of the first sector that will be written so test
     // harnesses can cross-check against host-side filefrag/dd offsets.
-    let first_lba = s.data_start_sector
-        .wrapping_add((s.w_target_first_cluster - 2)
-            * (s.sectors_per_cluster as u32));
+    let first_lba = s
+        .data_start_sector
+        .wrapping_add((s.w_target_first_cluster - 2) * (s.sectors_per_cluster as u32));
     log_lba(s, b"[fat32] write lba=", first_lba);
 
     if effective_write_size(s) == 0 {
@@ -3741,22 +4270,25 @@ unsafe fn ws_scan(s: &mut Fat32State) -> i32 {
 ///   - end of current cluster (cluster walk must happen at that boundary)
 ///   - MAX_WRITE_NLB (driver's PRP1-only single-SQE limit)
 ///   - remaining payload rounded up to whole sectors
-/// `w_batch_nlb` remembers the size so ws_after_sector can advance
-/// counters by the correct amount.
+///     `w_batch_nlb` remembers the size so ws_after_sector can advance
+///     counters by the correct amount.
 unsafe fn ws_send_sector(s: &mut Fat32State) -> i32 {
-    let lba = s.data_start_sector
+    let lba = s
+        .data_start_sector
         .wrapping_add((s.w_current_cluster - 2) * (s.sectors_per_cluster as u32))
         .wrapping_add(s.w_sector_in_cluster as u32);
 
     let off = s.w_bytes_written as usize;
     let total = effective_write_size(s) as usize;
     let remaining_bytes = total.saturating_sub(off);
-    let remaining_sectors = (remaining_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let remaining_sectors = remaining_bytes.div_ceil(BLOCK_SIZE);
     let cluster_remaining = (s.sectors_per_cluster - s.w_sector_in_cluster) as usize;
     let mut nlb = remaining_sectors
         .min(cluster_remaining)
         .min(MAX_WRITE_NLB as usize);
-    if nlb == 0 { nlb = 1; }
+    if nlb == 0 {
+        nlb = 1;
+    }
     let nlb = nlb as u16;
 
     stage_data_batch(s, lba, nlb, off);
@@ -3778,7 +4310,7 @@ unsafe fn ws_after_sector(s: &mut Fat32State) -> i32 {
     s.w_sector_in_cluster = s.w_sector_in_cluster.saturating_add(nlb as u8);
 
     let written = s.w_bytes_written;
-    let total   = effective_write_size(s);
+    let total = effective_write_size(s);
 
     if written >= total {
         // All payload pushed. Decide whether a dir-entry update is
@@ -3830,10 +4362,12 @@ unsafe fn ws_walk_fat_wait(s: &mut Fat32State) -> i32 {
         s.write_state = WS_DONE;
         return 0;
     }
-    if res == 0 { return 0; }
+    if res == 0 {
+        return 0;
+    }
 
     let next = read_fat_entry(s, s.w_current_cluster);
-    if next >= FAT32_EOC || next < 2 {
+    if !(2..FAT32_EOC).contains(&next) {
         // Tail of the chain — need to allocate a new cluster, link
         // it in, and mirror to FAT2 if num_fats > 1.
         s.w_prev_cluster = s.w_current_cluster;
@@ -3879,14 +4413,16 @@ unsafe fn ws_alloc_wait(s: &mut Fat32State) -> i32 {
         s.write_state = WS_DONE;
         return 0;
     }
-    if res == 0 { return 0; }
+    if res == 0 {
+        return 0;
+    }
 
     // Scan this FAT sector for a zero entry. `entries_per_sector`
     // = bytes_per_sector / 4.
     let bps = s.bytes_per_sector as u32;
     let entries_per_sector = bps / 4;
     // Absolute cluster number of the first entry in this sector.
-    let sec_rel    = s.w_fat_sector_in_buf - s.fat_start_sector;
+    let sec_rel = s.w_fat_sector_in_buf - s.fat_start_sector;
     let first_clst = sec_rel.wrapping_mul(entries_per_sector);
 
     // Scan starting from max(first_clst, w_alloc_probe).
@@ -3977,10 +4513,7 @@ fn next_state_after_fat_write(s: &mut Fat32State, links_prev: bool) -> u8 {
             // The chain is fully linked. If an allocation just landed
             // and the volume has an FSINFO sector, update its
             // free-cluster bookkeeping before resuming data writes.
-            if s.w_fsinfo_pending != 0
-                && s.fsinfo_sector != 0
-                && s.fsinfo_sector != 0xFFFF
-            {
+            if s.w_fsinfo_pending != 0 && s.fsinfo_sector != 0 && s.fsinfo_sector != 0xFFFF {
                 WS_FSINFO_READ
             } else {
                 s.w_current_cluster = s.w_new_cluster;
@@ -3999,7 +4532,8 @@ fn next_state_after_fat_write(s: &mut Fat32State, links_prev: bool) -> u8 {
 /// the primary write, so no re-read is needed.
 unsafe fn ws_mirror_write(s: &mut Fat32State) -> i32 {
     let rel = s.w_fat_sector_in_buf - s.fat_start_sector;
-    let lba = s.fat_start_sector
+    let lba = s
+        .fat_start_sector
         .wrapping_add(s.fat_size_32)
         .wrapping_add(rel);
     stage_packet(s, lba, s.block_buf.as_ptr());
@@ -4033,7 +4567,9 @@ unsafe fn ws_link_wait(s: &mut Fat32State) -> i32 {
         s.write_state = WS_DONE;
         return 0;
     }
-    if res == 0 { return 0; }
+    if res == 0 {
+        return 0;
+    }
 
     patch_fat_entry(s, s.w_prev_cluster, s.w_new_cluster);
     s.write_state = WS_LINK_WRITE;
@@ -4074,13 +4610,15 @@ unsafe fn ws_dir_wait(s: &mut Fat32State) -> i32 {
         s.write_state = WS_DONE;
         return 0;
     }
-    if res == 0 { return 0; }
+    if res == 0 {
+        return 0;
+    }
 
     // Per the FAT32 spec, the file-size field lives at dir_entry + 28.
     let off = s.w_target_dir_offset as usize + 28;
     let le = s.w_new_size.to_le_bytes();
     let dst = s.block_buf.as_mut_ptr().add(off);
-    *dst        = le[0];
+    *dst = le[0];
     *dst.add(1) = le[1];
     *dst.add(2) = le[2];
     *dst.add(3) = le[3];
@@ -4141,14 +4679,16 @@ unsafe fn ws_fsinfo_wait(s: &mut Fat32State) -> i32 {
         s.write_state = WS_SEND_SECTOR;
         return 2;
     }
-    if res == 0 { return 0; }
+    if res == 0 {
+        return 0;
+    }
 
     // FSINFO layout (FAT32 spec): lead sig at 0x000, struct sig at
     // 0x1E4, free count at 0x1E8, next-free hint at 0x1EC, trail sig
     // at 0x1FC. Reject the sector on any signature mismatch rather
     // than risk writing garbage back.
-    let lead    = read_u32_le(&s.block_buf, 0x000);
-    let struc   = read_u32_le(&s.block_buf, 0x1E4);
+    let lead = read_u32_le(&s.block_buf, 0x000);
+    let struc = read_u32_le(&s.block_buf, 0x1E4);
     let trailer = read_u32_le(&s.block_buf, 0x1FC);
     if lead != 0x4161_5252 || struc != 0x6141_7272 || trailer != 0xAA55_0000 {
         log_info(s, b"[fat32] write: fsinfo bad sig");
@@ -4162,7 +4702,7 @@ unsafe fn ws_fsinfo_wait(s: &mut Fat32State) -> i32 {
         let new_free = free - 1;
         let le = new_free.to_le_bytes();
         let dst = s.block_buf.as_mut_ptr().add(0x1E8);
-        *dst        = le[0];
+        *dst = le[0];
         *dst.add(1) = le[1];
         *dst.add(2) = le[2];
         *dst.add(3) = le[3];
@@ -4171,7 +4711,7 @@ unsafe fn ws_fsinfo_wait(s: &mut Fat32State) -> i32 {
     let hint = s.w_new_cluster.wrapping_add(1).max(2);
     let le = hint.to_le_bytes();
     let dst = s.block_buf.as_mut_ptr().add(0x1EC);
-    *dst        = le[0];
+    *dst = le[0];
     *dst.add(1) = le[1];
     *dst.add(2) = le[2];
     *dst.add(3) = le[3];
@@ -4223,7 +4763,7 @@ unsafe fn patch_clnshut_bit(buf: *mut u8, set_clean: bool) {
         cur & !CLN_SHUT_BIT
     };
     let le = next.to_le_bytes();
-    *entry_ptr        = le[0];
+    *entry_ptr = le[0];
     *entry_ptr.add(1) = le[1];
     *entry_ptr.add(2) = le[2];
     *entry_ptr.add(3) = le[3];
@@ -4239,10 +4779,16 @@ unsafe fn ws_mark_fat_wait(s: &mut Fat32State, set_clean: bool) -> i32 {
         s.write_state = WS_DONE;
         return 0;
     }
-    if res == 0 { return 0; }
+    if res == 0 {
+        return 0;
+    }
 
     patch_clnshut_bit(s.block_buf.as_mut_ptr(), set_clean);
-    s.write_state = if set_clean { WS_MARK_CLEAN_WRITE } else { WS_MARK_DIRTY_WRITE };
+    s.write_state = if set_clean {
+        WS_MARK_CLEAN_WRITE
+    } else {
+        WS_MARK_DIRTY_WRITE
+    };
     2
 }
 
@@ -4254,7 +4800,11 @@ unsafe fn ws_mark_fat_write(s: &mut Fat32State, set_clean: bool) -> i32 {
     let lba = s.fat_start_sector;
     stage_packet(s, lba, s.block_buf.as_ptr());
     let next = if s.num_fats > 1 {
-        if set_clean { WS_MARK_CLEAN_MIRROR } else { WS_MARK_DIRTY_MIRROR }
+        if set_clean {
+            WS_MARK_CLEAN_MIRROR
+        } else {
+            WS_MARK_DIRTY_MIRROR
+        }
     } else if set_clean {
         WS_DONE
     } else {
@@ -4316,8 +4866,8 @@ unsafe fn ws_ns_check(s: &mut Fat32State) -> i32 {
         }
         0 => {
             let ns_size = u64::from_le_bytes([
-                scratch[0], scratch[1], scratch[2], scratch[3],
-                scratch[4], scratch[5], scratch[6], scratch[7],
+                scratch[0], scratch[1], scratch[2], scratch[3], scratch[4], scratch[5], scratch[6],
+                scratch[7],
             ]);
             let ns_lbads = scratch[8];
             emit_ns_info(s, ns_size, ns_lbads);
@@ -4356,7 +4906,7 @@ unsafe fn emit_ns_info(s: &Fat32State, ns_size: u64, ns_lbads: u8) {
     let lb = b" lbads=";
     core::ptr::copy_nonoverlapping(lb.as_ptr(), p.add(pos), lb.len());
     pos += lb.len();
-    *p.add(pos)     = b'0' + (ns_lbads / 10);
+    *p.add(pos) = b'0' + (ns_lbads / 10);
     *p.add(pos + 1) = b'0' + (ns_lbads % 10);
     pos += 2;
     dev_log(s.sys(), 3, p, pos);
@@ -4377,8 +4927,13 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::WaitBlock0 => {
             let res = try_read_block(s);
-            if res < 0 { log_info(s, b"[fat32] blk0 read fail"); return -1; }
-            if res == 0 { return 0; }
+            if res < 0 {
+                log_info(s, b"[fat32] blk0 read fail");
+                return -1;
+            }
+            if res == 0 {
+                return 0;
+            }
 
             // Try as direct FAT32 boot sector first
             s.partition_lba = 0;
@@ -4428,8 +4983,13 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::WaitBoot => {
             let res = try_read_block(s);
-            if res < 0 { log_info(s, b"[fat32] boot read fail"); return -1; }
-            if res == 0 { return 0; }
+            if res < 0 {
+                log_info(s, b"[fat32] boot read fail");
+                return -1;
+            }
+            if res == 0 {
+                return 0;
+            }
 
             if !parse_boot_sector(s) {
                 log_info(s, b"[fat32] not fat32");
@@ -4442,8 +5002,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
         }
 
         Fat32InitPhase::ReadRoot => {
-            let sector = cluster_to_sector(s, s.dir_cluster)
-                + (s.dir_sector_in_cluster as u32);
+            let sector = cluster_to_sector(s, s.dir_cluster) + (s.dir_sector_in_cluster as u32);
             flush_input(s);
             if seek_sd(s, sector) < 0 {
                 return -1;
@@ -4455,8 +5014,13 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::WaitRoot => {
             let res = try_read_block(s);
-            if res < 0 { log_info(s, b"[fat32] dir read fail"); return -1; }
-            if res == 0 { return 0; }
+            if res < 0 {
+                log_info(s, b"[fat32] dir read fail");
+                return -1;
+            }
+            if res == 0 {
+                return 0;
+            }
 
             let entries_per_sector = BLOCK_SIZE / DIR_ENTRY_SIZE;
 
@@ -4473,11 +5037,17 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                     }
 
                     s.dir_entry_in_sector += 1;
-                    if first_byte == 0xE5 { continue; }
+                    if first_byte == 0xE5 {
+                        continue;
+                    }
 
                     let attr = *entry_ptr.add(11);
-                    if attr == ATTR_LONG_NAME { continue; }
-                    if (attr & ATTR_DIRECTORY) == 0 { continue; }
+                    if attr == ATTR_LONG_NAME {
+                        continue;
+                    }
+                    if (attr & ATTR_DIRECTORY) == 0 {
+                        continue;
+                    }
 
                     // Compare against current path component
                     let pp = s.path.as_ptr();
@@ -4495,13 +5065,13 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                         let cluster_hi = read_u16_le(&s.block_buf, offset + 20) as u32;
                         let cluster_lo = read_u16_le(&s.block_buf, offset + 26) as u32;
                         let cluster = (cluster_hi << 16) | cluster_lo;
-                        if cluster < 2 { continue; }
+                        if cluster < 2 {
+                            continue;
+                        }
 
                         s.dir_cluster = cluster;
                         s.path_pos += comp_len as u8;
-                        while (s.path_pos as usize) < 63
-                            && *pp.add(s.path_pos as usize) == b'/'
-                        {
+                        while (s.path_pos as usize) < 63 && *pp.add(s.path_pos as usize) == b'/' {
                             s.path_pos += 1;
                         }
                         if *pp.add(s.path_pos as usize) == 0 {
@@ -4539,7 +5109,8 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                         let mut t = 0usize;
                         while t < tag.len() {
                             *bp.add(p) = *tag.as_ptr().add(t);
-                            p += 1; t += 1;
+                            p += 1;
+                            t += 1;
                         }
                         p += fmt_u32_raw(bp.add(p), s.file_count as u32);
                         dev_log(&*s.syscalls, 3, bp, p);
@@ -4582,7 +5153,9 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
                 s.init_phase = Fat32InitPhase::Done;
                 return 0;
             }
-            if res == 0 { return 0; }
+            if res == 0 {
+                return 0;
+            }
 
             let offset = fat_offset_for_cluster(s, s.dir_cluster);
             if offset + 4 > BLOCK_SIZE {
@@ -4595,7 +5168,7 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
             }
             let next_cluster = read_u32_le(&s.block_buf, offset) & FAT32_MASK;
 
-            if next_cluster >= FAT32_EOC || next_cluster < 2 {
+            if !(2..FAT32_EOC).contains(&next_cluster) {
                 if s.dir_mode == 0 {
                     log_info(s, b"[fat32] path not found");
                     return -1;
@@ -4625,8 +5198,13 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::WaitGptHeader => {
             let res = try_read_block(s);
-            if res < 0 { log_info(s, b"[fat32] gpt hdr read fail"); return -1; }
-            if res == 0 { return 0; }
+            if res < 0 {
+                log_info(s, b"[fat32] gpt hdr read fail");
+                return -1;
+            }
+            if res == 0 {
+                return 0;
+            }
 
             // Verify "EFI PART" signature at offset 0
             let buf = s.block_buf.as_ptr();
@@ -4664,8 +5242,13 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
 
         Fat32InitPhase::WaitGptEntry => {
             let res = try_read_block(s);
-            if res < 0 { log_info(s, b"[fat32] gpt entry read fail"); return -1; }
-            if res == 0 { return 0; }
+            if res < 0 {
+                log_info(s, b"[fat32] gpt entry read fail");
+                return -1;
+            }
+            if res == 0 {
+                return 0;
+            }
 
             // Each GPT partition entry is 128 bytes, 4 per 512-byte sector.
             // Find first non-EFI-SP, non-empty partition with a valid FAT32 boot sector.
@@ -4722,7 +5305,6 @@ unsafe fn init_step(s: &mut Fat32State) -> i32 {
         _ => -1,
     }
 }
-
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /

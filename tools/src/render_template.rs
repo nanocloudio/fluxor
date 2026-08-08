@@ -4,7 +4,7 @@
 //! where a per-replica value (replica id, listen port, peer ports)
 //! lands at render time. This module is the canonical substitution
 //! engine — both `fluxor render-template` (the developer-facing
-//! command) and `fluxor up` (the multi-replica spawner) call into it.
+//! command) and `fluxor run --replicas` (the multi-replica spawner) call into it.
 //!
 //! Placeholder convention:
 //! - Each placeholder is `__KEY__` (double underscore prefix and

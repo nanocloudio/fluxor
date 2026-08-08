@@ -39,7 +39,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -68,10 +67,10 @@ const QTYPE_PTR: u16 = 12;
 const QCLASS_IN: u16 = 1;
 
 /// DNS flags
-const FLAG_QR: u16 = 0x8000;       // Response
-const FLAG_AA: u16 = 0x0400;       // Authoritative
-const FLAG_RA: u16 = 0x0080;       // Recursion available
-const FLAG_RD: u16 = 0x0100;       // Recursion desired
+const FLAG_QR: u16 = 0x8000; // Response
+const FLAG_AA: u16 = 0x0400; // Authoritative
+const FLAG_RA: u16 = 0x0080; // Recursion available
+const FLAG_RD: u16 = 0x0100; // Recursion desired
 const RCODE_NXDOMAIN: u16 = 0x0003;
 
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
@@ -97,9 +96,9 @@ const MAX_NAME_LEN: usize = 63;
 // ============================================================================
 
 mod params_def {
-    use super::DnsState;
     use super::p_u16;
     use super::p_u32;
+    use super::DnsState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -272,7 +271,7 @@ unsafe fn fnv1a_lower(data: *const u8, len: usize) -> u32 {
     let mut i = 0;
     while i < len {
         let mut b = *data.add(i);
-        if b >= b'A' && b <= b'Z' {
+        if b.is_ascii_uppercase() {
             b += 32;
         }
         h ^= b as u32;
@@ -324,7 +323,7 @@ unsafe fn parse_host_entry(s: &mut DnsState, data: *const u8, len: usize) {
     let mut i = 0;
     while i < name_len {
         let mut b = *data.add(i);
-        if b >= b'A' && b <= b'Z' {
+        if b.is_ascii_uppercase() {
             b += 32;
         }
         *entry.name.as_mut_ptr().add(i) = b;
@@ -348,12 +347,16 @@ unsafe fn parse_ipv4(data: *const u8, len: usize) -> u32 {
     while i < len {
         let b = *data.add(i);
         if b == b'.' {
-            if octet_idx >= 3 { return 0; }
-            if val > 255 { return 0; }
+            if octet_idx >= 3 {
+                return 0;
+            }
+            if val > 255 {
+                return 0;
+            }
             *op.add(octet_idx) = val as u8;
             octet_idx += 1;
             val = 0;
-        } else if b >= b'0' && b <= b'9' {
+        } else if b.is_ascii_digit() {
             val = val * 10 + (b - b'0') as u16;
         } else {
             break; // stop at non-digit/non-dot
@@ -361,12 +364,16 @@ unsafe fn parse_ipv4(data: *const u8, len: usize) -> u32 {
         i += 1;
     }
 
-    if octet_idx != 3 || val > 255 { return 0; }
+    if octet_idx != 3 || val > 255 {
+        return 0;
+    }
     *op.add(3) = val as u8;
 
     // Return as network byte order u32 (big endian)
-    ((*op as u32) << 24) | ((*op.add(1) as u32) << 16)
-        | ((*op.add(2) as u32) << 8) | (*op.add(3) as u32)
+    ((*op as u32) << 24)
+        | ((*op.add(1) as u32) << 16)
+        | ((*op.add(2) as u32) << 8)
+        | (*op.add(3) as u32)
 }
 
 /// Extract QNAME from DNS question section. Converts wire format labels to
@@ -382,7 +389,9 @@ unsafe fn extract_qname(
     let mut off = *offset;
 
     loop {
-        if off >= pkt_len { return 0; }
+        if off >= pkt_len {
+            return 0;
+        }
         let label_len = *pkt.add(off) as usize;
         off += 1;
 
@@ -397,7 +406,9 @@ unsafe fn extract_qname(
 
         // Add dot separator (not before first label)
         if name_pos > 0 {
-            if name_pos >= MAX_NAME_LEN { return 0; }
+            if name_pos >= MAX_NAME_LEN {
+                return 0;
+            }
             *name_buf.add(name_pos) = b'.';
             name_pos += 1;
         }
@@ -405,9 +416,11 @@ unsafe fn extract_qname(
         // Copy label bytes, lowercased
         let mut i = 0;
         while i < label_len {
-            if name_pos >= MAX_NAME_LEN { return 0; }
+            if name_pos >= MAX_NAME_LEN {
+                return 0;
+            }
             let mut b = *pkt.add(off + i);
-            if b >= b'A' && b <= b'Z' {
+            if b.is_ascii_uppercase() {
                 b += 32;
             }
             *name_buf.add(name_pos) = b;
@@ -452,11 +465,15 @@ unsafe fn lookup_host(s: &DnsState, name_ptr: *const u8, name_len: usize) -> Opt
 unsafe fn lookup_ptr(s: &DnsState, name_ptr: *const u8, name_len: usize) -> Option<(u32, usize)> {
     // Must end with ".in-addr.arpa"
     let suffix = b".in-addr.arpa";
-    if name_len <= suffix.len() { return None; }
+    if name_len <= suffix.len() {
+        return None;
+    }
     let suffix_start = name_len - suffix.len();
     let mut i = 0;
     while i < suffix.len() {
-        if *name_ptr.add(suffix_start + i) != *suffix.as_ptr().add(i) { return None; }
+        if *name_ptr.add(suffix_start + i) != *suffix.as_ptr().add(i) {
+            return None;
+        }
         i += 1;
     }
 
@@ -470,23 +487,29 @@ unsafe fn lookup_ptr(s: &DnsState, name_ptr: *const u8, name_len: usize) -> Opti
     while i < addr_len {
         let b = *name_ptr.add(i);
         if b == b'.' {
-            if octet_idx >= 4 || val > 255 { return None; }
+            if octet_idx >= 4 || val > 255 {
+                return None;
+            }
             *op.add(octet_idx) = val as u8;
             octet_idx += 1;
             val = 0;
-        } else if b >= b'0' && b <= b'9' {
+        } else if b.is_ascii_digit() {
             val = val * 10 + (b - b'0') as u16;
         } else {
             return None;
         }
         i += 1;
     }
-    if octet_idx != 3 || val > 255 { return None; }
+    if octet_idx != 3 || val > 255 {
+        return None;
+    }
     *op.add(3) = val as u8;
 
     // Reconstruct IP in network order (reversing the reversed octets)
-    let ip = ((*op.add(3) as u32) << 24) | ((*op.add(2) as u32) << 16)
-        | ((*op.add(1) as u32) << 8) | (*op as u32);
+    let ip = ((*op.add(3) as u32) << 24)
+        | ((*op.add(2) as u32) << 16)
+        | ((*op.add(1) as u32) << 8)
+        | (*op as u32);
 
     // Find matching host
     let mut h = 0;
@@ -509,7 +532,9 @@ unsafe fn encode_name(name: *const u8, name_len: usize, dst: *mut u8) -> usize {
     while i <= name_len {
         if i == name_len || *name.add(i) == b'.' {
             let label_len = i - label_start;
-            if label_len == 0 || label_len > 63 { return 0; }
+            if label_len == 0 || label_len > 63 {
+                return 0;
+            }
             *dst.add(pos) = label_len as u8;
             pos += 1;
             let mut j = label_start;
@@ -538,7 +563,9 @@ unsafe fn build_a_response(
     ip: u32,
     tx: *mut u8,
 ) -> usize {
-    if query_len < DNS_HEADER_LEN { return 0; }
+    if query_len < DNS_HEADER_LEN {
+        return 0;
+    }
 
     // Copy query header
     let mut i = 0;
@@ -558,8 +585,10 @@ unsafe fn build_a_response(
     *tx.add(6) = 0;
     *tx.add(7) = 1;
     // NSCOUNT = 0, ARCOUNT = 0
-    *tx.add(8) = 0; *tx.add(9) = 0;
-    *tx.add(10) = 0; *tx.add(11) = 0;
+    *tx.add(8) = 0;
+    *tx.add(9) = 0;
+    *tx.add(10) = 0;
+    *tx.add(11) = 0;
 
     // Answer section starts after question
     let mut pos = question_end;
@@ -570,27 +599,34 @@ unsafe fn build_a_response(
     pos += 2;
 
     // TYPE A = 1
-    *tx.add(pos) = 0; *tx.add(pos + 1) = 1;
+    *tx.add(pos) = 0;
+    *tx.add(pos + 1) = 1;
     pos += 2;
 
     // CLASS IN = 1
-    *tx.add(pos) = 0; *tx.add(pos + 1) = 1;
+    *tx.add(pos) = 0;
+    *tx.add(pos + 1) = 1;
     pos += 2;
 
     // TTL
     let ttl_bytes = s.ttl.to_be_bytes();
-    *tx.add(pos) = ttl_bytes[0]; *tx.add(pos + 1) = ttl_bytes[1];
-    *tx.add(pos + 2) = ttl_bytes[2]; *tx.add(pos + 3) = ttl_bytes[3];
+    *tx.add(pos) = ttl_bytes[0];
+    *tx.add(pos + 1) = ttl_bytes[1];
+    *tx.add(pos + 2) = ttl_bytes[2];
+    *tx.add(pos + 3) = ttl_bytes[3];
     pos += 4;
 
     // RDLENGTH = 4
-    *tx.add(pos) = 0; *tx.add(pos + 1) = 4;
+    *tx.add(pos) = 0;
+    *tx.add(pos + 1) = 4;
     pos += 2;
 
     // RDATA = IPv4 address (network byte order)
     let ip_bytes = ip.to_be_bytes();
-    *tx.add(pos) = ip_bytes[0]; *tx.add(pos + 1) = ip_bytes[1];
-    *tx.add(pos + 2) = ip_bytes[2]; *tx.add(pos + 3) = ip_bytes[3];
+    *tx.add(pos) = ip_bytes[0];
+    *tx.add(pos + 1) = ip_bytes[1];
+    *tx.add(pos + 2) = ip_bytes[2];
+    *tx.add(pos + 3) = ip_bytes[3];
     pos += 4;
 
     pos
@@ -605,7 +641,9 @@ unsafe fn build_ptr_response(
     host_idx: usize,
     tx: *mut u8,
 ) -> usize {
-    if query_len < DNS_HEADER_LEN { return 0; }
+    if query_len < DNS_HEADER_LEN {
+        return 0;
+    }
     let entry = &*s.hosts.as_ptr().add(host_idx);
 
     // Copy query up to end of question
@@ -623,28 +661,36 @@ unsafe fn build_ptr_response(
     *tx.add(3) = fb[1];
 
     // ANCOUNT = 1
-    *tx.add(6) = 0; *tx.add(7) = 1;
-    *tx.add(8) = 0; *tx.add(9) = 0;
-    *tx.add(10) = 0; *tx.add(11) = 0;
+    *tx.add(6) = 0;
+    *tx.add(7) = 1;
+    *tx.add(8) = 0;
+    *tx.add(9) = 0;
+    *tx.add(10) = 0;
+    *tx.add(11) = 0;
 
     let mut pos = question_end;
 
     // Name pointer
-    *tx.add(pos) = 0xC0; *tx.add(pos + 1) = 0x0C;
+    *tx.add(pos) = 0xC0;
+    *tx.add(pos + 1) = 0x0C;
     pos += 2;
 
     // TYPE PTR = 12
-    *tx.add(pos) = 0; *tx.add(pos + 1) = 12;
+    *tx.add(pos) = 0;
+    *tx.add(pos + 1) = 12;
     pos += 2;
 
     // CLASS IN
-    *tx.add(pos) = 0; *tx.add(pos + 1) = 1;
+    *tx.add(pos) = 0;
+    *tx.add(pos + 1) = 1;
     pos += 2;
 
     // TTL
     let ttl_bytes = s.ttl.to_be_bytes();
-    *tx.add(pos) = ttl_bytes[0]; *tx.add(pos + 1) = ttl_bytes[1];
-    *tx.add(pos + 2) = ttl_bytes[2]; *tx.add(pos + 3) = ttl_bytes[3];
+    *tx.add(pos) = ttl_bytes[0];
+    *tx.add(pos + 1) = ttl_bytes[1];
+    *tx.add(pos + 2) = ttl_bytes[2];
+    *tx.add(pos + 3) = ttl_bytes[3];
     pos += 4;
 
     // RDLENGTH placeholder
@@ -652,11 +698,7 @@ unsafe fn build_ptr_response(
     pos += 2;
 
     // Encode hostname as DNS wire format
-    let name_written = encode_name(
-        entry.name.as_ptr(),
-        entry.name_len as usize,
-        tx.add(pos),
-    );
+    let name_written = encode_name(entry.name.as_ptr(), entry.name_len as usize, tx.add(pos));
     pos += name_written;
 
     // Fill in RDLENGTH
@@ -669,12 +711,10 @@ unsafe fn build_ptr_response(
 }
 
 /// Build an NXDOMAIN response. Returns total packet length.
-unsafe fn build_nxdomain(
-    query_pkt: *const u8,
-    query_len: usize,
-    tx: *mut u8,
-) -> usize {
-    if query_len < DNS_HEADER_LEN { return 0; }
+unsafe fn build_nxdomain(query_pkt: *const u8, query_len: usize, tx: *mut u8) -> usize {
+    if query_len < DNS_HEADER_LEN {
+        return 0;
+    }
 
     // Copy entire query
     let copy_len = query_len.min(DNS_MAX_PACKET);
@@ -692,9 +732,12 @@ unsafe fn build_nxdomain(
     *tx.add(3) = fb[1];
 
     // No answer records
-    *tx.add(6) = 0; *tx.add(7) = 0;
-    *tx.add(8) = 0; *tx.add(9) = 0;
-    *tx.add(10) = 0; *tx.add(11) = 0;
+    *tx.add(6) = 0;
+    *tx.add(7) = 0;
+    *tx.add(8) = 0;
+    *tx.add(9) = 0;
+    *tx.add(10) = 0;
+    *tx.add(11) = 0;
 
     copy_len
 }
@@ -714,7 +757,16 @@ unsafe fn dg_send_from(
     let sys = &*(*state).syscalls;
     let net_out = (*state).net_out_chan;
     let buf = (*state).net_buf.as_mut_ptr();
-    let n = ep.send_to(sys, net_out, dst_ip, dst_port, dns_data, dns_len, buf, NET_BUF_SIZE);
+    let n = ep.send_to(
+        sys,
+        net_out,
+        dst_ip,
+        dst_port,
+        dns_data,
+        dns_len,
+        buf,
+        NET_BUF_SIZE,
+    );
     if n > 0 {
         (*state).tlm.bytes_out = (*state).tlm.bytes_out.wrapping_add(dns_len as u32);
     }
@@ -816,7 +868,11 @@ unsafe fn emit_query_span(s: &DnsState, span: &QuerySpan) {
         return;
     }
     let end_raw = dev_micros(sys);
-    let end = if end_raw < span.start_us { span.start_us } else { end_raw };
+    let end = if end_raw < span.start_us {
+        span.start_us
+    } else {
+        end_raw
+    };
     let ctx = abi::contracts::telemetry::SpanContext {
         trace_id: span.trace_id,
         span_id: span.span_id,
@@ -844,28 +900,33 @@ unsafe fn send_server_reply(
     dns_data: *const u8,
     dns_len: usize,
 ) {
-    dg_send_from(state, &(*state).server_ep, dst_ip, dst_port, dns_data, dns_len);
+    dg_send_from(
+        state,
+        &(*state).server_ep,
+        dst_ip,
+        dst_port,
+        dns_data,
+        dns_len,
+    );
 }
 
 /// Send a DNS query from the upstream endpoint to the configured upstream
 /// DNS server.
-unsafe fn send_upstream_query(
-    state: *mut DnsState,
-    dns_data: *const u8,
-    dns_len: usize,
-) {
+unsafe fn send_upstream_query(state: *mut DnsState, dns_data: *const u8, dns_len: usize) {
     let upstream_ip = (*state).upstream_ip;
     let upstream_port = (*state).upstream_port;
-    dg_send_from(state, &(*state).upstream_ep, upstream_ip, upstream_port, dns_data, dns_len);
+    dg_send_from(
+        state,
+        &(*state).upstream_ep,
+        upstream_ip,
+        upstream_port,
+        dns_data,
+        dns_len,
+    );
 }
 
 /// Store a pending upstream query.
-unsafe fn store_pending(
-    s: &mut DnsState,
-    dns_id: u16,
-    client_ip: u32,
-    client_port: u16,
-) -> bool {
+unsafe fn store_pending(s: &mut DnsState, dns_id: u16, client_ip: u32, client_port: u16) -> bool {
     let now = dev_millis(s.sys()) as u32;
     let p = s.pending.as_mut_ptr();
 
@@ -934,7 +995,9 @@ unsafe fn handle_query(
     pkt: *const u8,
     pkt_len: usize,
 ) {
-    if pkt_len < DNS_HEADER_LEN { return; }
+    if pkt_len < DNS_HEADER_LEN {
+        return;
+    }
 
     // Parse DNS header
     let id = u16::from_be_bytes([*pkt, *pkt.add(1)]);
@@ -942,17 +1005,25 @@ unsafe fn handle_query(
     let qdcount = u16::from_be_bytes([*pkt.add(4), *pkt.add(5)]);
 
     // Only process standard queries (QR=0, Opcode=0)
-    if (flags & 0xF800) != 0 { return; }
-    if qdcount == 0 { return; }
+    if (flags & 0xF800) != 0 {
+        return;
+    }
+    if qdcount == 0 {
+        return;
+    }
 
     // Extract QNAME from first question
     let mut offset = DNS_HEADER_LEN;
     let mut name_buf = [0u8; MAX_NAME_LEN + 1];
     let name_len = extract_qname(pkt, pkt_len, &mut offset, name_buf.as_mut_ptr());
-    if name_len == 0 { return; }
+    if name_len == 0 {
+        return;
+    }
 
     // Parse QTYPE and QCLASS
-    if offset + 4 > pkt_len { return; }
+    if offset + 4 > pkt_len {
+        return;
+    }
     let qtype = u16::from_be_bytes([*pkt.add(offset), *pkt.add(offset + 1)]);
     let qclass = u16::from_be_bytes([*pkt.add(offset + 2), *pkt.add(offset + 3)]);
     let question_end = offset + 4;
@@ -965,7 +1036,7 @@ unsafe fn handle_query(
     }
 
     // Use raw pointer to tx_buf to avoid borrow checker issues
-    let tx_ptr = (*s).tx_buf.as_mut_ptr();
+    let tx_ptr = s.tx_buf.as_mut_ptr();
 
     // Mint a `dns.query` trace context now (past the parse-fail returns, before
     // resolution). Emitted only at the local-reply sites below; forwarded
@@ -978,13 +1049,15 @@ unsafe fn handle_query(
             match lookup_host(s, name_buf.as_ptr(), name_len) {
                 Some(ip) => {
                     // Build and send local A response
-                    let resp_len = build_a_response(
-                        s, pkt, pkt_len, question_end, ip,
-                        tx_ptr,
-                    );
+                    let resp_len = build_a_response(s, pkt, pkt_len, question_end, ip, tx_ptr);
                     if resp_len > 0 {
-                        send_server_reply(s as *mut DnsState, client_ip, client_port,
-                            tx_ptr as *const u8, resp_len);
+                        send_server_reply(
+                            s as *mut DnsState,
+                            client_ip,
+                            client_port,
+                            tx_ptr as *const u8,
+                            resp_len,
+                        );
                         s.queries_local += 1;
                         if let Some(ref sp) = qspan {
                             emit_query_span(s, sp);
@@ -1002,13 +1075,15 @@ unsafe fn handle_query(
             // instead of forwarding to upstream
             if lookup_host(s, name_buf.as_ptr(), name_len).is_some() {
                 // Send empty response (no answer, no error) — host exists but no IPv6
-                let resp_len = build_empty_response(
-                    pkt, pkt_len,
-                    tx_ptr,
-                );
+                let resp_len = build_empty_response(pkt, pkt_len, tx_ptr);
                 if resp_len > 0 {
-                    send_server_reply(s as *mut DnsState, client_ip, client_port,
-                        tx_ptr as *const u8, resp_len);
+                    send_server_reply(
+                        s as *mut DnsState,
+                        client_ip,
+                        client_port,
+                        tx_ptr as *const u8,
+                        resp_len,
+                    );
                     if let Some(ref sp) = qspan {
                         emit_query_span(s, sp);
                     }
@@ -1021,13 +1096,16 @@ unsafe fn handle_query(
             // Reverse lookup
             match lookup_ptr(s, name_buf.as_ptr(), name_len) {
                 Some((_ip, host_idx)) => {
-                    let resp_len = build_ptr_response(
-                        s, pkt, pkt_len, question_end, host_idx,
-                        tx_ptr,
-                    );
+                    let resp_len =
+                        build_ptr_response(s, pkt, pkt_len, question_end, host_idx, tx_ptr);
                     if resp_len > 0 {
-                        send_server_reply(s as *mut DnsState, client_ip, client_port,
-                            tx_ptr as *const u8, resp_len);
+                        send_server_reply(
+                            s as *mut DnsState,
+                            client_ip,
+                            client_port,
+                            tx_ptr as *const u8,
+                            resp_len,
+                        );
                         s.queries_local += 1;
                         if let Some(ref sp) = qspan {
                             emit_query_span(s, sp);
@@ -1047,12 +1125,10 @@ unsafe fn handle_query(
 }
 
 /// Build an empty response (NOERROR, 0 answers) for local hosts with no matching record type.
-unsafe fn build_empty_response(
-    query_pkt: *const u8,
-    query_len: usize,
-    tx: *mut u8,
-) -> usize {
-    if query_len < DNS_HEADER_LEN { return 0; }
+unsafe fn build_empty_response(query_pkt: *const u8, query_len: usize, tx: *mut u8) -> usize {
+    if query_len < DNS_HEADER_LEN {
+        return 0;
+    }
 
     let copy_len = query_len.min(DNS_MAX_PACKET);
     let mut i = 0;
@@ -1069,9 +1145,12 @@ unsafe fn build_empty_response(
     *tx.add(3) = fb[1];
 
     // No answers
-    *tx.add(6) = 0; *tx.add(7) = 0;
-    *tx.add(8) = 0; *tx.add(9) = 0;
-    *tx.add(10) = 0; *tx.add(11) = 0;
+    *tx.add(6) = 0;
+    *tx.add(7) = 0;
+    *tx.add(8) = 0;
+    *tx.add(9) = 0;
+    *tx.add(10) = 0;
+    *tx.add(11) = 0;
 
     copy_len
 }
@@ -1085,7 +1164,9 @@ unsafe fn forward_to_upstream(
     pkt: *const u8,
     pkt_len: usize,
 ) {
-    if !s.upstream_ep.is_ready() { return; }
+    if !s.upstream_ep.is_ready() {
+        return;
+    }
 
     // Store pending entry
     store_pending(s, dns_id, client_ip, client_port);
@@ -1097,7 +1178,9 @@ unsafe fn forward_to_upstream(
 
 /// Process a response from the upstream DNS server.
 unsafe fn handle_upstream_response(s: &mut DnsState, pkt: *const u8, pkt_len: usize) {
-    if pkt_len < DNS_HEADER_LEN { return; }
+    if pkt_len < DNS_HEADER_LEN {
+        return;
+    }
 
     let id = u16::from_be_bytes([*pkt, *pkt.add(1)]);
 
@@ -1135,9 +1218,15 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() { return -5; }
-        if state_size < core::mem::size_of::<DnsState>() { return -6; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() {
+            return -5;
+        }
+        if state_size < core::mem::size_of::<DnsState>() {
+            return -6;
+        }
 
         let s = &mut *(state as *mut DnsState);
         s.init(syscalls as *const SyscallTable);
@@ -1147,8 +1236,8 @@ pub extern "C" fn module_new(
         s.net_out_chan = out_chan;
 
         // Parse TLV params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -1180,9 +1269,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut DnsState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
 
         // Module-scope metrics: cumulative byte counters, ~5s cadence, no-op
         // when the telemetry port is unwired.
@@ -1198,7 +1291,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let net_in = s.net_in_chan;
         let buf = s.net_buf.as_mut_ptr();
 
-        s.server_ep.poll_bind(sys, net_out, s.listen_port, buf, NET_BUF_SIZE);
+        s.server_ep
+            .poll_bind(sys, net_out, s.listen_port, buf, NET_BUF_SIZE);
         if s.server_ep.is_ready() {
             s.upstream_ep.poll_bind(sys, net_out, 0, buf, NET_BUF_SIZE);
         }
@@ -1218,7 +1312,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     did_work = true;
                 }
-                DgEvent::Rx { ep_id, src_ip, src_port, data, len } => {
+                DgEvent::Rx {
+                    ep_id,
+                    src_ip,
+                    src_port,
+                    data,
+                    len,
+                } => {
                     if len >= DNS_HEADER_LEN {
                         s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(len as u32);
                         if s.server_ep.owns(ep_id) {
@@ -1241,7 +1341,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Expire old pending queries periodically.
         expire_pending(s);
 
-        if did_work { 2 } else { 0 } // burst when work happened, else continue
+        if did_work {
+            2
+        } else {
+            0
+        } // burst when work happened, else continue
     }
 }
 

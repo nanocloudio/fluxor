@@ -1,19 +1,15 @@
-//! `fluxor workspace` — live-workspace detection and surface.
+//! `fluxor workspace` — the live-policy surface.
 //!
 //! A user-local `~/.fluxor/workspace.toml` lists project checkouts
-//! the CLI should treat as live source rather than registry
-//! artefacts. `fluxor sync` prefers a workspace member's locally-
-//! built fmods / runtime binaries over the registry copy when both
-//! exist; CI's lockfile-consistency check skips with an advisory
-//! rather than failing.
+//! whose artifacts are LIVE: `fluxor sync` write-through-resolves a
+//! member's `:latest` store tags into the lockfile instead of
+//! replaying pins verbatim, and `fluxor workspace publish`
+//! republishes every member whose input digests drifted from its
+//! published artifacts. Membership is the whole live/pinned
+//! distinction — a policy question, never a file format or mode.
 //!
-//! Source crates (`fluxor-abi`, `fluxor-sdk`) still resolve through
-//! the registry — workspace mode doesn't yet bypass `make publish`
-//! for SDK source edits.
-//!
-//! This module is the detection + inspection surface. The override
-//! semantics live in the consuming commands (`publish` /
-//! `sync` / `ci`).
+//! This module owns the file (load, save, `add`/`rm`, `status`); the
+//! resolution semantics live in `store_sync`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,8 +64,8 @@ pub fn load_workspace() -> Result<Option<Workspace>> {
 ///
 /// Module lookup consults these last, so a graph can name a module owned by a
 /// sibling checkout (wave's `http`, say) and still resolve its manifest for
-/// validation. This mirrors what `sync` already does for fmods, which prefer a
-/// member's `target/` artefacts over the registry copy.
+/// validation. This mirrors sync's live-member policy, where a member's
+/// checkout state (its `:latest` store tags) wins over replayed pins.
 ///
 /// The workspace file is user-local and gitignored, so this is a developer
 /// convenience only — never a build dependency. Fluxor must not require its
@@ -142,26 +138,79 @@ pub fn current_member(ws: &Workspace, cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-/// One-line advisory describing the live-mode state. Build / publish
-/// commands print this once per invocation so users know when
-/// registry resolution is being bypassed.
-pub fn advisory(ws: &Workspace, cwd: &Path) -> Option<String> {
-    let active = current_member(ws, cwd)?;
-    let live_count = ws
-        .workspace
-        .members
-        .iter()
-        .filter(|m| m.canonicalize().is_ok())
-        .count();
-    Some(format!(
-        "workspace mode active: {} member{} live, current project = {}",
-        live_count,
-        if live_count == 1 { "" } else { "s" },
-        active.display(),
-    ))
+/// Write `~/.fluxor/workspace.toml` (atomic replace; parent dir
+/// created if needed).
+pub fn save_workspace(ws: &Workspace) -> Result<PathBuf> {
+    let path = workspace_file_path()?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)
+            .map_err(|e| Error::Config(format!("create {}: {e}", dir.display())))?;
+    }
+    let body = toml::to_string_pretty(ws)
+        .map_err(|e| Error::Config(format!("serialise workspace: {e}")))?;
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    fs::write(&tmp, body).map_err(|e| Error::Config(format!("write {}: {e}", tmp.display())))?;
+    if let Err(e) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(Error::Config(format!("rename to {}: {e}", path.display())));
+    }
+    Ok(path)
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────
+
+/// `fluxor workspace add <path>` — append a member (canonicalised;
+/// creates the workspace file when absent; idempotent on re-add).
+pub fn cmd_workspace_add(path: &Path) -> Result<()> {
+    let member = path
+        .canonicalize()
+        .map_err(|e| Error::Config(format!("cannot resolve {}: {e}", path.display())))?;
+    if !member.join("fluxor.toml").exists() {
+        eprintln!(
+            "note: {} has no fluxor.toml — added anyway, but it will never \
+             resolve as a live project",
+            member.display()
+        );
+    }
+    let mut ws = load_workspace()?.unwrap_or(Workspace {
+        workspace: WorkspaceSection::default(),
+    });
+    if ws.workspace.members.contains(&member) {
+        println!("already a member: {}", member.display());
+        return Ok(());
+    }
+    ws.workspace.members.push(member.clone());
+    let file = save_workspace(&ws)?;
+    println!("added {} to {}", member.display(), file.display());
+    Ok(())
+}
+
+/// `fluxor workspace rm <path>` — remove a member. Errors when the
+/// workspace file is absent or the path isn't listed.
+pub fn cmd_workspace_rm(path: &Path) -> Result<()> {
+    let Some(mut ws) = load_workspace()? else {
+        return Err(Error::Config(format!(
+            "no workspace file at {} — nothing to remove",
+            workspace_file_path()?.display()
+        )));
+    };
+    // Match either the literal entry or its canonical form, so `rm`
+    // accepts the same spelling `add` recorded or a relative path to it.
+    let canon = path.canonicalize().ok();
+    let before = ws.workspace.members.len();
+    ws.workspace
+        .members
+        .retain(|m| m != path && Some(m) != canon.as_ref());
+    if ws.workspace.members.len() == before {
+        return Err(Error::Config(format!(
+            "{} is not a workspace member",
+            path.display()
+        )));
+    }
+    let file = save_workspace(&ws)?;
+    println!("removed {} from {}", path.display(), file.display());
+    Ok(())
+}
 
 pub fn cmd_workspace_status(json: bool) -> Result<()> {
     let path = workspace_file_path()?;

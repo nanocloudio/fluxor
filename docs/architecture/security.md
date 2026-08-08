@@ -34,7 +34,7 @@ Every PIC module carries a manifest section (`magic = "FXMF"`)
 containing a 16-byte header, ports, resources, dependencies, a 32-byte
 SHA-256 integrity hash over code+data, an optional 64-byte Ed25519
 signature, and an optional 32-byte signer public-key fingerprint. The
-signature/fingerprint pair is filled in by `fluxor sign`; an unsigned
+signature/fingerprint pair is filled in by `fluxor modules sign`; an unsigned
 manifest has those fields zeroed.
 
 The loader path, implemented in `src/kernel/loader.rs::validate_module`:
@@ -79,7 +79,7 @@ lives in the platform-side code that calls `init_from_blob`.
 
 ### Signing Tool
 
-`fluxor sign <module.fmod> --key <seed>` rewrites the `.fmod` with a v2
+`fluxor modules sign <module.fmod> --key <seed>` rewrites the `.fmod` with a v2
 manifest carrying a fresh signature. The tool uses the same hand-rolled
 Ed25519 code as the kernel verifier, so a kernel-rebuilt-from-source and
 a tool-signed module always agree. The private key is a raw 32-byte seed

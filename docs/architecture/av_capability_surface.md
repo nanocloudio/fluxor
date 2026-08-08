@@ -113,7 +113,7 @@ presentation_groups:
 ### Validator rules
 
 Implemented in `tools/src/config.rs::validate_presentation_groups` and
-invoked from both `fluxor build` and `fluxor validate`.
+invoked from both `fluxor build` and `fluxor build --check`.
 
 - `id` must be unique across the config.
 - `clock_authority` must be one of `members`, must resolve to a known

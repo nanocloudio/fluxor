@@ -38,7 +38,7 @@ pub struct ModuleInfo {
     /// Module uses buffer_acquire_inplace to modify buffer (header flags bit 1)
     pub in_place_writer: bool,
     /// Module exports module_drain for live reconfigure (header flags bit 3).
-    /// Used by `fluxor info` and `fluxor diff` for transition plan display.
+    /// Used by `fluxor inspect` for transition-plan display.
     #[allow(
         dead_code,
         reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -132,7 +132,7 @@ impl ModuleInfo {
         // (manifest_size == 0, a legitimate bare module) from "manifest
         // declared but overrunning the file" (a corrupt/truncated artifact),
         // which must fail loud rather than silently yield an empty,
-        // permission-less manifest to `fluxor info` and config validation.
+        // permission-less manifest to `fluxor inspect` and config validation.
         // Mirrors `cmd_sign`'s "fmod truncated before manifest" rejection.
         let manifest_offset = schema_offset + schema_size;
         let manifest = if manifest_size == 0 {
@@ -245,7 +245,7 @@ pub fn is_builtin_module(module_type: &str) -> bool {
 }
 
 /// Resolve a module .fmod file by searching primary dir, then extra dirs in order.
-/// Outcome of consulting the `fluxor.lock` `[[oci_module]]` pins for a
+/// Outcome of consulting the `fluxor.lock` `[[artifact]]` module pins for a
 /// module name (registry plan P2).
 pub enum StorePin {
     /// No pin for this name — resolve from the on-disk dirs as usual.
@@ -263,7 +263,7 @@ pub enum StorePin {
 /// `store_cli::lock_store_resolver`.
 pub type StoreFallback<'a> = &'a dyn Fn(&str) -> StorePin;
 
-/// Outcome of consulting the `[[oci_module]]` pins for a module's
+/// Outcome of consulting the `[[artifact]]` module pins for a module's
 /// `manifest.toml` — the wiring/port-resolution counterpart of
 /// `StorePin`. A pinned module resolves its manifest from the same
 /// content-addressed store artifact as its `.fmod`, so ports and bytes
@@ -459,7 +459,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                         module_name,
                         module_type,
                         artifact,
@@ -509,7 +509,7 @@ pub fn parse_modules_from_config_multi(
                         .map(|d| d.display().to_string())
                         .collect();
                     return Err(Error::Module(format!(
-                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                        "Module '{}' (type '{}', artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                         instance_name,
                         module_type,
                         artifact,
@@ -585,7 +585,7 @@ pub fn parse_modules_from_config_multi(
                             .map(|d| d.display().to_string())
                             .collect();
                         Error::Module(format!(
-                            "pod module type '{}' (artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[oci_module]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
+                            "pod module type '{}' (artifact '{}.fmod') not found in: {} (nor pinned in fluxor.lock [[artifact]])\nRun 'fluxor modules build' to build modules, or pin it with 'fluxor store pin'.{}",
                             module_type,
                             pod_artifact,
                             searched.join(", "),

@@ -1,10 +1,11 @@
-//! CLI glue for the local OCI artifact store (`.context/fmod_registry_plan.md`
-//! P1): `fluxor modules publish`, `fluxor bundle publish`, and
-//! `fluxor store ls|inspect|rm`.
+//! CLI glue for the local OCI artifact store: `fluxor publish bundle`
+//! and `fluxor store ls|rm|snapshot|pin`. (Project artifacts publish
+//! through `fluxor publish` — `fluxor_tools::store_publish`; read-only
+//! artifact display is `fluxor inspect <ref>` — Decision 5.)
 //!
 //! The store engine lives in the lib (`fluxor_tools::oci_store`); this module
-//! only walks the project tree (owned modules, built `.fmod`s, bundle dirs)
-//! and formats output. Offline-first: none of these verbs touch the network.
+//! only walks the project tree (bundle dirs) and formats output.
+//! Offline-first: none of these verbs touch the network.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,12 +13,14 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 
 use crate::error::{Error, Result};
-use crate::publish::{list_built_targets, list_owned_modules, resolve_project_root};
+// Bin-root helper (cli/commands_c.rs, flat `include!` scope).
+use crate::resolve_project_root;
 use fluxor_tools::oci_store::{
-    self, git_source_rev, publish_bundle, publish_module, sha256_hex_prefixed, BundlePublish,
-    ImageManifest, ModulePublish, OciStore, ANN_KIND, ANN_MODULE_NAME, ANN_PROVENANCE,
-    ANN_REF_NAME, ANN_SOURCE_REV, ANN_TARGET, PROVENANCE_LOCAL, PROVENANCE_PUBLISHED,
+    self, git_source_rev, publish_bundle, sha256_hex_prefixed, BundlePublish, ImageManifest,
+    OciStore, ANN_KIND, ANN_PROVENANCE, ANN_REF_NAME, ANN_SOURCE_REV, ANN_TARGET, PROVENANCE_LOCAL,
+    PROVENANCE_PUBLISHED,
 };
+use fluxor_tools::store_resolve;
 
 // ── Args ──────────────────────────────────────────────────────────────
 
@@ -42,14 +45,6 @@ pub enum StoreCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Show an artifact's OCI manifest and descriptor.
-    Inspect {
-        /// Tag (`name:ver`), `sha256:<hex>` digest, or unambiguous
-        /// digest prefix.
-        reference: String,
-        #[arg(long)]
-        store: Option<PathBuf>,
-    },
     /// Remove a tag (or, given a digest, every tag of that manifest) and
     /// sweep blobs no longer referenced by any remaining artifact.
     Rm {
@@ -57,12 +52,22 @@ pub enum StoreCommand {
         #[arg(long)]
         store: Option<PathBuf>,
     },
-    /// Pin a module artifact into `fluxor.lock` (`[[oci_module]]`) so
+    /// Name the current cross-project resolved set: writes one OCI
+    /// index over every tagged non-snapshot artifact, tagged
+    /// `snapshot/<name>`. Snapshots are GC roots; restore pins from
+    /// one with `fluxor update --from snapshot/<name>`.
+    Snapshot {
+        /// Snapshot name (tag becomes `snapshot/<name>`).
+        name: String,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// Pin an artifact into `fluxor.lock` (`[[artifact]]`) so
     /// combine/packaging resolve its `.fmod` by digest from the store
     /// when it's absent from `target/fluxor/<target>/modules/`.
     Pin {
         /// Tag (`target/name:ver`), digest, or unambiguous digest prefix
-        /// of a module artifact.
+        /// of a store artifact.
         reference: String,
         #[arg(long)]
         store: Option<PathBuf>,
@@ -88,156 +93,7 @@ fn provenance_flag(published: bool) -> &'static str {
     }
 }
 
-// ── fluxor modules publish ────────────────────────────────────────────
-
-/// Publish built `.fmod`s into the OCI store. Walks the project's owned
-/// modules (same ownership rule as the registry publisher: only modules with
-/// a local `manifest.toml` — never re-publish synced upstream artefacts).
-#[allow(clippy::too_many_arguments, reason = "CLI surface maps 1:1 to flags")]
-pub fn cmd_modules_publish(
-    store_dir: Option<&Path>,
-    target: Option<&str>,
-    module: Option<&str>,
-    tag: Option<&str>,
-    published: bool,
-    pin: bool,
-    project_root: Option<&Path>,
-) -> Result<()> {
-    let pr = resolve_project_root(project_root);
-    let store = open_store(store_dir)?;
-    let mut owned = list_owned_modules(&pr)?;
-    if let Some(m) = module {
-        owned.retain(|o| o.name == m);
-        if owned.is_empty() {
-            return Err(Error::Config(format!(
-                "no module manifest at modules/{{foundation,app,drivers}}/{m}/manifest.toml"
-            )));
-        }
-    }
-    if owned.is_empty() {
-        println!("no owned modules to publish.");
-        return Ok(());
-    }
-
-    let target_root_under_fluxor = pr.join("target").join("fluxor");
-    let target_root_bare = pr.join("target");
-    let candidate_roots = [&target_root_under_fluxor, &target_root_bare];
-    let targets: Vec<String> = match target {
-        Some(t) => vec![t.to_string()],
-        None => list_built_targets(&candidate_roots)?,
-    };
-    if targets.is_empty() {
-        return Err(Error::Config(
-            "no built fmods under target/fluxor/* or target/* — run `fluxor modules build` first"
-                .into(),
-        ));
-    }
-
-    let source_rev = git_source_rev(&pr);
-    let provenance = provenance_flag(published);
-
-    // A --tag override names exactly one artifact; refuse fan-out under it.
-    let selected: Vec<(String, &crate::publish::OwnedModule, PathBuf)> = targets
-        .iter()
-        .flat_map(|t| {
-            owned.iter().filter_map(move |o| {
-                candidate_roots
-                    .iter()
-                    .map(|r| r.join(t).join("modules").join(format!("{}.fmod", o.name)))
-                    .find(|p| p.exists())
-                    .map(|p| (t.clone(), o, p))
-            })
-        })
-        .collect();
-    if selected.is_empty() {
-        return Err(Error::Config(
-            "no built .fmod matched the selection — run `fluxor modules build` first".into(),
-        ));
-    }
-    if tag.is_some() && selected.len() > 1 {
-        return Err(Error::Config(format!(
-            "--tag names one artifact but {} (target, module) pairs matched — \
-             narrow with --target/--module",
-            selected.len()
-        )));
-    }
-
-    let mut pins: Vec<crate::lockfile::LockedOciModule> = Vec::new();
-    for (target_name, owned_module, fmod_path) in &selected {
-        let fmod_bytes = fs::read(fmod_path)?;
-        let manifest_toml = fs::read_to_string(&owned_module.manifest_path)?;
-        let ref_name = match tag {
-            Some(t) => t.to_string(),
-            None => format!(
-                "{target_name}/{}:{}",
-                owned_module.name, owned_module.version
-            ),
-        };
-        let desc = publish_module(
-            &store,
-            &ModulePublish {
-                name: &owned_module.name,
-                target: target_name,
-                fmod_bytes: &fmod_bytes,
-                manifest_toml: Some(&manifest_toml),
-                provenance,
-                source_rev: source_rev.as_deref(),
-                ref_name: &ref_name,
-            },
-        )
-        .map_err(|e| Error::Config(e.to_string()))?;
-        println!("{ref_name} -> {}", desc.digest);
-        if pin {
-            pins.push(crate::lockfile::LockedOciModule {
-                name: owned_module.name.clone(),
-                target: target_name.clone(),
-                digest: desc.digest.clone(),
-                reference: ref_name,
-            });
-        }
-    }
-    println!(
-        "published {} artifact(s) to {} (provenance={provenance})",
-        selected.len(),
-        store.root().display()
-    );
-    if pin {
-        let count = pins.len();
-        upsert_pins(&pr, pins)?;
-        println!(
-            "pinned {count} module(s) in {}",
-            crate::lockfile::lockfile_path(&pr).display()
-        );
-    }
-    Ok(())
-}
-
-// ── fluxor bundle publish ─────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-pub struct BundleArgs {
-    #[command(subcommand)]
-    pub command: BundleCommand,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum BundleCommand {
-    /// Publish a workload bundle directory (workload.json + resources.json +
-    /// graph.yaml) into the local OCI store. Every module digest the
-    /// manifest pins must already be in the store.
-    Publish {
-        /// Bundle directory.
-        bundle_dir: PathBuf,
-        #[arg(long)]
-        store: Option<PathBuf>,
-        /// Tag override (default: `<name>:<version>` from workload.json).
-        #[arg(long)]
-        tag: Option<String>,
-        /// Annotate provenance=published instead of local-build.
-        #[arg(long)]
-        published: bool,
-    },
-}
+// ── fluxor publish bundle ─────────────────────────────────────────────
 
 pub fn cmd_bundle_publish(
     bundle_dir: &Path,
@@ -289,10 +145,8 @@ pub fn dispatch_store(args: StoreArgs) -> Result<()> {
             provenance,
             json,
         } => cmd_store_ls(store.as_deref(), provenance.as_deref(), json),
-        StoreCommand::Inspect { reference, store } => {
-            cmd_store_inspect(&reference, store.as_deref())
-        }
         StoreCommand::Rm { reference, store } => cmd_store_rm(&reference, store.as_deref()),
+        StoreCommand::Snapshot { name, store } => cmd_store_snapshot(&name, store.as_deref()),
         StoreCommand::Pin {
             reference,
             store,
@@ -348,19 +202,6 @@ fn cmd_store_ls(store_dir: Option<&Path>, provenance: Option<&str>, json: bool) 
     Ok(())
 }
 
-fn cmd_store_inspect(reference: &str, store_dir: Option<&Path>) -> Result<()> {
-    let store = open_store(store_dir)?;
-    let desc = store
-        .resolve(reference)
-        .map_err(|e| Error::Config(e.to_string()))?;
-    let manifest = store
-        .read_manifest(&desc)
-        .map_err(|e| Error::Config(e.to_string()))?;
-    let doc = serde_json::json!({ "descriptor": desc, "manifest": manifest });
-    println!("{}", serde_json::to_string_pretty(&doc)?);
-    Ok(())
-}
-
 fn cmd_store_rm(reference: &str, store_dir: Option<&Path>) -> Result<()> {
     let store = open_store(store_dir)?;
     let removed = store
@@ -370,7 +211,7 @@ fn cmd_store_rm(reference: &str, store_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-// ── fluxor.lock pinning + consume-side resolution (P2) ──────────────
+// ── fluxor.lock pinning + consume-side resolution ────────────────────
 
 /// Owned form of `modules::StoreFallback` — what `lock_store_resolver`
 /// hands to the packaging call sites.
@@ -380,31 +221,43 @@ pub type BoxedStoreFallback = Box<dyn Fn(&str) -> crate::modules::StorePin>;
 /// the manifest-loader counterpart of `BoxedStoreFallback`.
 pub type BoxedManifestResolver = Box<dyn Fn(&str) -> crate::modules::ManifestPin>;
 
-/// Upsert `[[oci_module]]` pins into the project's `fluxor.lock`,
-/// keyed by `(name, target)`. Creates a minimal lockfile when absent.
-/// The read-modify-write runs under an exclusive advisory lock so two
-/// concurrent publish/pin commands can't discard each other's pins.
-fn upsert_pins(project_root: &Path, entries: Vec<crate::lockfile::LockedOciModule>) -> Result<()> {
-    let _guard = crate::lockfile::lock_lockfile(project_root)?;
-    let mut lock = crate::lockfile::read(project_root)?.unwrap_or_default();
-    if lock.lockfile_version == 0 {
-        lock.lockfile_version = 1;
-        lock.generated_by = format!("fluxor {}", env!("CARGO_PKG_VERSION"));
+/// One module pin from the `[[artifact]]` lockfile, in the shape the
+/// resolvers below key on. A module pin always carries its silicon
+/// target (`materialize` errors on one that doesn't; here it simply
+/// never matches).
+struct ModulePin {
+    name: String,
+    target: Option<String>,
+    digest: String,
+    reference: String,
+}
+
+/// Read the project's `[[artifact]]` module pins. `Ok(None)` when the
+/// lockfile is absent or pins no modules; `Err` when it exists but is
+/// unreadable/legacy-shape — which names are pinned is then unknowable,
+/// and guessing "none" would let packaging silently consume unpinned
+/// bytes.
+fn read_module_pins(project_root: &Path) -> Result<Option<Vec<ModulePin>>> {
+    let Some(lock) =
+        store_resolve::read_store_lock(project_root).map_err(|e| Error::Config(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let pins: Vec<ModulePin> = lock
+        .artifacts
+        .into_iter()
+        .filter(|a| a.kind == "module")
+        .map(|a| ModulePin {
+            name: a.name,
+            target: a.target,
+            digest: a.digest,
+            reference: a.reference,
+        })
+        .collect();
+    if pins.is_empty() {
+        return Ok(None);
     }
-    for entry in entries {
-        match lock
-            .oci_modules
-            .iter_mut()
-            .find(|m| m.name == entry.name && m.target == entry.target)
-        {
-            Some(existing) => *existing = entry,
-            None => lock.oci_modules.push(entry),
-        }
-    }
-    lock.oci_modules
-        .sort_by(|a, b| (&a.target, &a.name).cmp(&(&b.target, &b.name)));
-    crate::lockfile::write(project_root, &lock)?;
-    Ok(())
+    Ok(Some(pins))
 }
 
 fn cmd_store_pin(
@@ -417,47 +270,36 @@ fn cmd_store_pin(
     let desc = store
         .resolve(reference)
         .map_err(|e| Error::Config(e.to_string()))?;
-    let manifest = store
-        .read_manifest(&desc)
-        .map_err(|e| Error::Config(e.to_string()))?;
-    let name = manifest
-        .annotations
-        .get(ANN_MODULE_NAME)
-        .cloned()
+    let artifact = store_resolve::artifact_from_descriptor(&desc)
+        .map_err(|e| Error::Config(e.to_string()))?
         .ok_or_else(|| {
             Error::Config(format!(
-                "'{reference}' has no {ANN_MODULE_NAME} annotation — not a module \
-                 artifact (or published by an older tool; re-publish it)"
+                "'{reference}' is not a pinnable artifact (no kind annotation — \
+                 published by an older tool; re-publish it)"
             ))
         })?;
-    let target = manifest
-        .annotations
-        .get(ANN_TARGET)
-        .cloned()
-        .ok_or_else(|| Error::Config(format!("'{reference}' has no {ANN_TARGET} annotation")))?;
-    // Fail now, not at consume time, if the .fmod layer is unreadable.
-    store
-        .module_fmod_blob(&manifest)
-        .map_err(|e| Error::Config(e.to_string()))?;
-    upsert_pins(
-        &pr,
-        vec![crate::lockfile::LockedOciModule {
-            name: name.clone(),
-            target: target.clone(),
-            digest: desc.digest.clone(),
-            reference: reference.to_string(),
-        }],
-    )?;
+    if artifact.kind == "module" {
+        // Fail now, not at consume time, if the .fmod layer is unreadable.
+        let manifest = store
+            .read_manifest(&desc)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        store
+            .module_fmod_blob(&manifest)
+            .map_err(|e| Error::Config(e.to_string()))?;
+    }
+    store_resolve::pin_artifact(&pr, &artifact).map_err(|e| Error::Config(e.to_string()))?;
     println!(
-        "pinned {target}/{name} -> {} in {}",
-        desc.digest,
-        crate::lockfile::lockfile_path(&pr).display()
+        "pinned {} ({}) -> {} in {}",
+        artifact.name,
+        artifact.reference,
+        artifact.digest,
+        store_resolve::lockfile_path(&pr).display()
     );
     Ok(())
 }
 
 /// Build the `fluxor.lock`-pinned OCI-store fallback used by module
-/// resolution (registry plan P2). `None` when the project has no lockfile,
+/// resolution. `None` when the project has no lockfile,
 /// no pins for this target, or the store can't be opened — resolution then
 /// behaves exactly as before (on-disk dirs only). The returned closure
 /// verifies the `.fmod` bytes against the pinned layer digest before
@@ -473,17 +315,16 @@ pub fn lock_store_resolver(
     // An unreadable/corrupt lockfile is a hard error for EVERY module
     // resolution: which names are pinned is unknowable, and guessing
     // "none" would let packaging silently consume unpinned bytes.
-    let lock = match crate::lockfile::read(project_root) {
-        Ok(l) => l?,
+    let pins = match read_module_pins(project_root) {
+        Ok(p) => p?,
         Err(e) => {
             let why = format!("fluxor.lock unreadable: {e}");
             return Some(Box::new(move |_name: &str| StorePin::Failed(why.clone())));
         }
     };
-    let pins: Vec<crate::lockfile::LockedOciModule> = lock
-        .oci_modules
+    let pins: Vec<ModulePin> = pins
         .into_iter()
-        .filter(|m| m.target == target)
+        .filter(|m| m.target.as_deref() == Some(target))
         .collect();
     if pins.is_empty() {
         return None;
@@ -534,10 +375,10 @@ pub fn lock_store_resolver(
 }
 
 /// Manifest counterpart of `lock_store_resolver`: resolve a module name to
-/// the verified `manifest.toml` text its pinned `[[oci_module]]` artifact
-/// ships, so wiring/port validation sees the SAME surface the pinned
+/// the verified `manifest.toml` text its pinned `[[artifact]]` module
+/// entry ships, so wiring/port validation sees the SAME surface the pinned
 /// `.fmod` was built with. Returns `None` when the project pins no
-/// oci_modules (the common case — zero store I/O).
+/// modules (the common case — zero store I/O).
 ///
 /// Pin selection is silicon-aware. Manifest *content* is largely
 /// target-independent, but pin *selection* is not: the same name can be
@@ -568,8 +409,8 @@ pub fn lock_store_manifest_resolver(
 ) -> Option<BoxedManifestResolver> {
     use crate::modules::ManifestPin;
 
-    let lock = match crate::lockfile::read(project_root) {
-        Ok(l) => l?,
+    let pins = match read_module_pins(project_root) {
+        Ok(p) => p?,
         Err(e) => {
             let why = format!("fluxor.lock unreadable: {e}");
             return Some(Box::new(move |_name: &str| {
@@ -577,10 +418,6 @@ pub fn lock_store_manifest_resolver(
             }));
         }
     };
-    let pins: Vec<crate::lockfile::LockedOciModule> = lock.oci_modules;
-    if pins.is_empty() {
-        return None;
-    }
     let silicon = silicon.map(|s| s.to_string());
     let store = match open_store(store_dir) {
         Ok(s) => s,
@@ -596,14 +433,13 @@ pub fn lock_store_manifest_resolver(
         }
     };
     Some(Box::new(move |name: &str| {
-        let named: Vec<&crate::lockfile::LockedOciModule> =
-            pins.iter().filter(|p| p.name == name).collect();
+        let named: Vec<&ModulePin> = pins.iter().filter(|p| p.name == name).collect();
         if named.is_empty() {
             return ManifestPin::NotPinned;
         }
         let silicon_match = silicon
             .as_deref()
-            .and_then(|want| named.iter().find(|p| p.target == want));
+            .and_then(|want| named.iter().find(|p| p.target.as_deref() == Some(want)));
         let pin = match silicon_match {
             Some(p) => *p,
             None => {
@@ -641,10 +477,55 @@ pub fn lock_store_manifest_resolver(
     }))
 }
 
+/// `fluxor store snapshot <name>` — freeze the current resolved set.
+fn cmd_store_snapshot(name: &str, store_dir: Option<&Path>) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains(':') {
+        return Err(Error::Config(format!(
+            "snapshot name must be a plain identifier (got {name:?})"
+        )));
+    }
+    let store = open_store(store_dir)?;
+    let index = store
+        .read_index()
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let children: Vec<oci_store::Descriptor> = index
+        .manifests
+        .iter()
+        .filter(|d| {
+            d.annotations
+                .get(oci_store::ANN_REF_NAME)
+                .is_none_or(|r| !r.starts_with("snapshot/"))
+        })
+        .cloned()
+        .collect();
+    let n = children.len();
+    let desc = store
+        .create_snapshot(name, children)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    println!("snapshot/{name}: {} ({n} artifacts)", desc.digest);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxor_tools::oci_store::PROVENANCE_LOCAL;
+    use fluxor_tools::oci_store::{publish_module, ModulePublish, PROVENANCE_LOCAL};
+
+    /// Upsert one `[[artifact]]` module pin the way `store pin` does.
+    fn pin_module(proj: &Path, name: &str, target: &str, digest: &str, reference: &str) {
+        store_resolve::pin_artifact(
+            proj,
+            &store_resolve::Artifact {
+                kind: "module".into(),
+                name: name.into(),
+                project: "testproj".into(),
+                target: Some(target.into()),
+                digest: digest.into(),
+                reference: reference.into(),
+            },
+        )
+        .expect("pin");
+    }
 
     fn store_with_module(dir: &Path) -> (OciStore, String) {
         let store = OciStore::open(dir.join("store")).expect("open store");
@@ -671,30 +552,11 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         let (_store, digest) = store_with_module(tmp.path());
 
-        upsert_pins(
-            &proj,
-            vec![crate::lockfile::LockedOciModule {
-                name: "codec".into(),
-                target: "bcm2712".into(),
-                digest: digest.clone(),
-                reference: "bcm2712/codec:1.0.0".into(),
-            }],
-        )
-        .expect("upsert");
-
-        // Re-upsert with the same key replaces, not duplicates.
-        upsert_pins(
-            &proj,
-            vec![crate::lockfile::LockedOciModule {
-                name: "codec".into(),
-                target: "bcm2712".into(),
-                digest: digest.clone(),
-                reference: "bcm2712/codec:1.0.0".into(),
-            }],
-        )
-        .expect("upsert again");
-        let lock = crate::lockfile::read(&proj).unwrap().unwrap();
-        assert_eq!(lock.oci_modules.len(), 1);
+        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
+        // Re-pin with the same key replaces, not duplicates.
+        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
+        let lock = store_resolve::read_store_lock(&proj).unwrap().unwrap();
+        assert_eq!(lock.artifacts.len(), 1);
 
         let store_dir = tmp.path().join("store");
         let resolver =
@@ -722,16 +584,7 @@ mod tests {
         let fmod_digest = sha256_hex_prefixed(b"fake-fmod-bytes");
         std::fs::write(store.blob_path(&fmod_digest).unwrap(), b"tampered").unwrap();
 
-        upsert_pins(
-            &proj,
-            vec![crate::lockfile::LockedOciModule {
-                name: "codec".into(),
-                target: "bcm2712".into(),
-                digest,
-                reference: "bcm2712/codec:1.0.0".into(),
-            }],
-        )
-        .unwrap();
+        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
         let store_dir = tmp.path().join("store");
         let resolver = lock_store_resolver(&proj, "bcm2712", Some(&store_dir)).unwrap();
         assert!(
@@ -773,16 +626,13 @@ mod tests {
 
         let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
         let digest = publish_with_manifest(&store, "redis_client", "bcm2712", b"fmodA", toml);
-        upsert_pins(
+        pin_module(
             &proj,
-            vec![crate::lockfile::LockedOciModule {
-                name: "redis_client".into(),
-                target: "bcm2712".into(),
-                digest,
-                reference: "bcm2712/redis_client:0.1.0".into(),
-            }],
-        )
-        .expect("upsert");
+            "redis_client",
+            "bcm2712",
+            &digest,
+            "bcm2712/redis_client:0.1.0",
+        );
 
         let store_dir = tmp.path().join("store");
 
@@ -825,24 +675,20 @@ mod tests {
         let d_bcm = publish_with_manifest(&store, "mqtt_client", "bcm2712", b"fmodA", bcm);
         let d_rp = publish_with_manifest(&store, "mqtt_client", "rp2350", b"fmodB", rp);
         assert_ne!(d_bcm, d_rp);
-        upsert_pins(
+        pin_module(
             &proj,
-            vec![
-                crate::lockfile::LockedOciModule {
-                    name: "mqtt_client".into(),
-                    target: "bcm2712".into(),
-                    digest: d_bcm,
-                    reference: "bcm2712/mqtt_client:0.1.0".into(),
-                },
-                crate::lockfile::LockedOciModule {
-                    name: "mqtt_client".into(),
-                    target: "rp2350".into(),
-                    digest: d_rp,
-                    reference: "rp2350/mqtt_client:0.1.0".into(),
-                },
-            ],
-        )
-        .expect("upsert");
+            "mqtt_client",
+            "bcm2712",
+            &d_bcm,
+            "bcm2712/mqtt_client:0.1.0",
+        );
+        pin_module(
+            &proj,
+            "mqtt_client",
+            "rp2350",
+            &d_rp,
+            "rp2350/mqtt_client:0.1.0",
+        );
 
         let store_dir = tmp.path().join("store");
         for (silicon, want) in [("rp2350", rp), ("bcm2712", bcm)] {
@@ -865,16 +711,13 @@ mod tests {
 
         let toml = "version = \"0.1.0\"\ntype = \"Protocol\"\nentry = \"mod.rs\"\n";
         let digest = publish_with_manifest(&store, "redis_client", "bcm2712", b"fmodA", toml);
-        upsert_pins(
+        pin_module(
             &proj,
-            vec![crate::lockfile::LockedOciModule {
-                name: "redis_client".into(),
-                target: "bcm2712".into(),
-                digest,
-                reference: "bcm2712/redis_client:0.1.0".into(),
-            }],
-        )
-        .expect("upsert");
+            "redis_client",
+            "bcm2712",
+            &digest,
+            "bcm2712/redis_client:0.1.0",
+        );
 
         // Tamper with the manifest.toml blob: the digest no longer matches,
         // and the payload isn't UTF-8 either.
@@ -913,24 +756,20 @@ mod tests {
         let d2 =
             publish_with_manifest(&store, "amqp_client", "rp2350", b"fmodB", "version=\"2\"\n");
         assert_ne!(d1, d2);
-        upsert_pins(
+        pin_module(
             &proj,
-            vec![
-                crate::lockfile::LockedOciModule {
-                    name: "amqp_client".into(),
-                    target: "bcm2712".into(),
-                    digest: d1,
-                    reference: "bcm2712/amqp_client:0.1.0".into(),
-                },
-                crate::lockfile::LockedOciModule {
-                    name: "amqp_client".into(),
-                    target: "rp2350".into(),
-                    digest: d2,
-                    reference: "rp2350/amqp_client:0.1.0".into(),
-                },
-            ],
-        )
-        .expect("upsert");
+            "amqp_client",
+            "bcm2712",
+            &d1,
+            "bcm2712/amqp_client:0.1.0",
+        );
+        pin_module(
+            &proj,
+            "amqp_client",
+            "rp2350",
+            &d2,
+            "rp2350/amqp_client:0.1.0",
+        );
 
         let store_dir = tmp.path().join("store");
         let r = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir)).unwrap();
@@ -952,16 +791,7 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         // Published with manifest_toml: None — no metadata layer.
         let (_store, digest) = store_with_module(tmp.path());
-        upsert_pins(
-            &proj,
-            vec![crate::lockfile::LockedOciModule {
-                name: "codec".into(),
-                target: "bcm2712".into(),
-                digest,
-                reference: "bcm2712/codec:1.0.0".into(),
-            }],
-        )
-        .unwrap();
+        pin_module(&proj, "codec", "bcm2712", &digest, "bcm2712/codec:1.0.0");
         let store_dir = tmp.path().join("store");
         let resolver = lock_store_manifest_resolver(&proj, Some("bcm2712"), Some(&store_dir))
             .expect("resolver present");

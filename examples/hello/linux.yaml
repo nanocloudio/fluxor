@@ -5,8 +5,8 @@
 #
 # Usage:
 #   make linux
-#   fluxor generate examples/hello/linux.yaml -o /tmp/hello_config.bin
-#   fluxor mktable target/bcm2712/modules --config /tmp/hello_config.bin -o /tmp/hello_modules.bin
+#   fluxor build examples/hello/linux.yaml --emit=bin -o /tmp/hello_config.bin
+#   fluxor build --emit=table target/bcm2712/modules --config /tmp/hello_config.bin -o /tmp/hello_modules.bin
 #   target/aarch64-unknown-linux-gnu/release/fluxor-linux \
 #     --config /tmp/hello_config.bin --modules /tmp/hello_modules.bin
 target: linux

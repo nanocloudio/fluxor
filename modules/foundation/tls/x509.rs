@@ -571,7 +571,7 @@ pub fn dns_name_matches(presented: &[u8], expected: &[u8]) -> bool {
 }
 
 fn ascii_lower(b: u8) -> u8 {
-    if b >= b'A' && b <= b'Z' {
+    if b.is_ascii_uppercase() {
         b + 32
     } else {
         b

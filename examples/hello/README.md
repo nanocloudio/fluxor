@@ -16,7 +16,7 @@ every environment that lets the kernel run at all.
 
 ```sh
 make firmware TARGET=pi5 && fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/pi5/firmware.bin examples/hello/pi5.yaml
+fluxor build examples/hello/pi5.yaml --emit=combined --firmware target/pi5/firmware.bin -o kernel8.img
 # netboot or copy kernel8.img to /boot/firmware/
 tio /dev/ttyUSB0 -b 115200
 ```

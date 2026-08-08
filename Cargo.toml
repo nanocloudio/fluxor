@@ -248,17 +248,16 @@ debug = 2
 opt-level = 1
 
 [workspace]
-members = ["contracts", "crates/fluxor-abi", "crates/fluxor-sdk", "tools", "modules/foundation/ip", "modules/foundation/tls"]
+members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/fluxor-sdk", "tools"]
 # `tests/harness` is a self-contained sub-workspace (its Cargo.toml
 # declares its own `[workspace]`) that depends on the crates above
 # via path. It is intentionally not a member here — host integration
 # tests are run from inside `tests/harness` so the rest of the tree
-# builds without them present.
-# `modules/foundation/dns` carries a purely-additive host-test Cargo shim
-# (firmware `rustc` build ignores it) so the harness can link it as a host
-# rlib. Excluded — it is not subject to the workspace lint matrix; it only
-# needs to compile under `host-test` for the integration tests.
-exclude = ["tests", "modules/foundation/conn_guard", "modules/foundation/dns", "modules/foundation/quic"]
+# builds without them present. Module directories carry no Cargo
+# manifests at all (standards/fluxor-modules.md §1): the PIC build
+# invokes rustc directly, and the harness mounts module cores via
+# `include!`.
+exclude = ["tests"]
 
 [workspace.package]
 # Shared by every publishable crate via `version.workspace = true`.

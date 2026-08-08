@@ -23,7 +23,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
     let mut result = board::validate_config(&config, &target_desc)?;
 
     // Validate the `presentation_groups` block here as well as in the
-    // build path so `fluxor validate` catches authority / multihead /
+    // build path so `fluxor build --check` catches authority / multihead /
     // protected-path errors without compiling. The module-search dirs
     // mirror `cmd_build`'s derivation so a project-local manifest
     // reachable from `fluxor build` is also reachable from `fluxor
@@ -39,7 +39,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
             .unwrap_or_default();
         let search_paths = crate::config::extract_module_search_paths(&config, config_path);
         let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
-        // Config-anchored root so a cross-project `fluxor validate ../x.yaml`
+        // Config-anchored root so a cross-project `fluxor build --check ../x.yaml`
         // reads the CONFIG's fluxor.lock pins, not the cwd's.
         let cfg_root = crate::project::root_for_config(config_path);
         let manifests =
@@ -60,7 +60,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
 
     // Dry-run the full config-generation pipeline so missing
     // manifests, malformed wiring, unknown content types, and tier
-    // admission errors all surface as `fluxor validate` failures
+    // admission errors all surface as `fluxor build --check` failures
     // instead of waiting for `fluxor build` (which needs firmware
     // + .fmod files on disk). The result blob is discarded —
     // validate is read-only.
@@ -119,105 +119,6 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
     }
 }
 
-fn cmd_target_info(target_name: &str, field: Option<&str>) -> Result<()> {
-    let root = crate::project::root();
-    let desc = target::load_target(target_name, &root)?;
-
-    if let Some(field) = field {
-        // Machine-readable: print just the requested field value
-        match field {
-            "rust_target" => {
-                if let Some(ref b) = desc.build {
-                    println!("{}", b.rust_target);
-                }
-            }
-            "cargo_features" => {
-                if let Some(ref b) = desc.build {
-                    println!("{}", b.cargo_features.join(","));
-                }
-            }
-            "uf2_family_id" => {
-                if let Some(ref b) = desc.build {
-                    println!("0x{:08x}", b.uf2_family_id);
-                }
-            }
-            "module_target" => {
-                if let Some(ref b) = desc.build {
-                    println!("{}", b.module_target);
-                }
-            }
-            "max_pin" => println!("{}", desc.max_pin),
-            "family" => println!("{}", desc.family),
-            "id" => println!("{}", desc.id),
-            "pio_count" => println!("{}", desc.pio_count),
-            "spi_count" => println!("{}", desc.spi_count),
-            "i2c_count" => println!("{}", desc.i2c_count),
-            "dma_channels" => println!("{}", desc.dma_channels),
-            _ => {
-                return Err(error::Error::Config(format!(
-                    "Unknown field '{field}'. Available: rust_target, cargo_features, uf2_family_id, \
-                     module_target, max_pin, family, id, pio_count, spi_count, i2c_count, dma_channels"
-                )));
-            }
-        }
-        return Ok(());
-    }
-
-    // Human-readable output
-    println!("Target: {}", desc.display_name());
-    println!("  Silicon: {} ({})", desc.id, desc.family);
-    if let Some(ref board) = desc.board_id {
-        println!(
-            "  Board: {} ({})",
-            board,
-            desc.board_description.as_deref().unwrap_or("")
-        );
-    }
-    if let Some(ref b) = desc.build {
-        println!("  Rust target: {}", b.rust_target);
-        println!("  Features: {}", b.cargo_features.join(", "));
-        println!("  UF2 family: 0x{:08x}", b.uf2_family_id);
-        println!("  Module target: {}", b.module_target);
-    } else {
-        println!("  Build: validation only (no kernel build support)");
-    }
-    println!(
-        "  GPIO: 0-{} (reserved: {})",
-        desc.max_pin,
-        if desc.reserved_pins.is_empty() {
-            "none".to_string()
-        } else {
-            desc.reserved_pins
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    );
-    println!(
-        "  Peripherals: SPI={}, I2C={}, UART={}, ADC={}, PWM={}, PIO={} ({}SM each), DMA={}",
-        desc.spi_count,
-        desc.i2c_count,
-        desc.uart_count,
-        desc.adc_channels,
-        desc.pwm_slices,
-        desc.pio_count,
-        desc.pio_state_machines,
-        desc.dma_channels
-    );
-    if let Some(ref mem) = desc.memory {
-        println!(
-            "  Memory: flash={}K @ 0x{:08x}, RAM={}K @ 0x{:08x}",
-            mem.flash_size / 1024,
-            mem.flash_base,
-            mem.ram_size / 1024,
-            mem.ram_base
-        );
-    }
-
-    Ok(())
-}
-
 /// `fluxor abi-regen [--check]` — the single writer of the ABI-surface pin.
 /// Recomputes the SDK source hash + surface digest and rewrites all checked-in
 /// sites together (so they cannot drift). The shared computation lives in
@@ -246,39 +147,6 @@ fn cmd_abi_regen(check: bool) -> Result<()> {
     }
 }
 
-fn cmd_targets() -> Result<()> {
-    let root = crate::project::root();
-    let names = target::list_targets(&root);
-
-    if names.is_empty() {
-        println!("No targets found. Check targets/ directory.");
-        return Ok(());
-    }
-
-    println!("Available targets:");
-    for name in &names {
-        match target::load_target(name, &root) {
-            Ok(desc) => {
-                let kind = if desc.board_id.is_some() {
-                    "board"
-                } else if desc.is_host() {
-                    "host"
-                } else if desc.build.is_some() {
-                    "silicon"
-                } else {
-                    "validation"
-                };
-                println!("  {:20} {:12} {}", name, kind, desc.description);
-            }
-            Err(_) => {
-                println!("  {name:20} (error loading)");
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// `fluxor inspect [config] [--json]` — diagnostic surface for
 /// "what does fluxor resolve to from here?" Prints:
 ///
@@ -286,7 +154,7 @@ fn cmd_targets() -> Result<()> {
 ///    `.fluxor` marker, source-tree heuristic, CWD fallback) plus
 ///    the `$FLUXOR_PROJECT_ROOT` setting if any.
 /// 2. The available targets (`targets/boards/*.toml` +
-///    `targets/silicon/*.toml`) — same listing as `fluxor targets`.
+///    `targets/silicon/*.toml`) — same listing as `fluxor inspect`.
 /// 3. The available stacks (`stacks/*.toml`) — file listing only;
 ///    expansion happens against a specific platform during build.
 /// 4. **If a config is given**: the YAML's declared target, the
@@ -1135,46 +1003,6 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build a module table blob from .fmod files in a directory.
-fn cmd_mktable(dir: &PathBuf, output: &PathBuf) -> Result<()> {
-    use std::fs;
-
-    let mut fmod_files: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("fmod") {
-            fmod_files.push(path);
-        }
-    }
-    fmod_files.sort();
-
-    if fmod_files.is_empty() {
-        return Err(Error::Module("No .fmod files found".into()));
-    }
-
-    let mut modules = Vec::new();
-    for path in &fmod_files {
-        let info = modules::ModuleInfo::from_file(path)?;
-        modules.push(info);
-    }
-
-    let table = build_module_table(&modules)?;
-    fs::write(output, &table)?;
-
-    println!(
-        "{} modules, {} bytes → {}",
-        modules.len(),
-        table.len(),
-        output.display()
-    );
-    for m in &modules {
-        println!("  {} ({} bytes)", m.name, m.data.len());
-    }
-
-    Ok(())
-}
-
 fn cmd_mktable_config(config_path: &Path, modules_dirs: &[PathBuf], output: &Path) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
     let mut config: serde_json::Value = if config_path
@@ -1620,3 +1448,183 @@ fn extract_asset_pairs(
     Ok(out)
 }
 
+// ── Polymorphic `fluxor inspect` ─────────────────────────────────────
+
+/// Flag bundle for the polymorphic `fluxor inspect` (Decision 5: one
+/// read-only verb over project / config / UF2 / store subjects).
+struct InspectFlags {
+    json: bool,
+    emit_config: bool,
+    format: String,
+    against: Option<PathBuf>,
+    target: Option<String>,
+    store: bool,
+}
+
+/// Route an `inspect` subject: no subject → project info; an existing
+/// file wins ambiguity (UF2/fmod → info/decode, config → project+config
+/// view or `--against` diff); anything else (or `--store`) resolves as
+/// a store reference.
+fn cmd_inspect_dispatch(subject: Option<&str>, flags: InspectFlags) -> Result<()> {
+    let Some(subject) = subject else {
+        if flags.emit_config || flags.against.is_some() || flags.store {
+            return Err(Error::Config(
+                "--emit-config/--against/--store need a subject argument".into(),
+            ));
+        }
+        return cmd_inspect(None, flags.json);
+    };
+    if flags.store {
+        return cmd_inspect_store_ref(subject, flags.json);
+    }
+    let path = Path::new(subject);
+    if path.is_file() {
+        // A real file wins ambiguity over a store reference.
+        let pb = path.to_path_buf();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if flags.emit_config {
+            return cmd_decode(&pb, &flags.format);
+        }
+        if ext == "uf2" || ext == "fmod" {
+            return cmd_info(&pb);
+        }
+        if let Some(old) = flags.against.as_ref() {
+            return cmd_diff(old, &pb, flags.target.as_deref());
+        }
+        return cmd_inspect(Some(path), flags.json);
+    }
+    cmd_inspect_store_ref(subject, flags.json)
+}
+
+/// `fluxor inspect <store-ref>` — the read side of the identity model:
+/// kind, tags, epoch vs the current ABI surface, input digest, ci
+/// digest, provenance, source rev, and layers.
+fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
+    use fluxor_tools::oci_store::{
+        OciStore, ANN_ABI_SURFACE, ANN_CI_DIGEST, ANN_INPUT_DIGEST, ANN_KIND, ANN_PROVENANCE,
+        ANN_REF_NAME, ANN_SOURCE_REV, MT_OCI_INDEX,
+    };
+    let store = OciStore::open(
+        fluxor_tools::oci_store::store_root().map_err(|e| Error::Config(e.to_string()))?,
+    )
+    .map_err(|e| Error::Config(e.to_string()))?;
+    let desc = store.resolve(reference).map_err(|e| {
+        Error::Config(format!(
+            "'{reference}' is neither a file on disk nor a resolvable store reference ({e})"
+        ))
+    })?;
+    let index = store
+        .read_index()
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let tags: Vec<String> = index
+        .manifests
+        .iter()
+        .filter(|d| d.digest == desc.digest)
+        .filter_map(|d| d.annotations.get(ANN_REF_NAME).cloned())
+        .collect();
+    let short = |h: &str| h[..h.len().min(12)].to_string();
+    let tags_line = if tags.is_empty() {
+        "(none)".to_string()
+    } else {
+        tags.join(", ")
+    };
+
+    // Indexes (project index, snapshot) have no manifest annotations —
+    // show kind + children instead.
+    if desc.media_type == MT_OCI_INDEX {
+        let bytes = store
+            .read_blob(&desc.digest)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let idx: fluxor_tools::oci_store::ImageIndex = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::Config(format!("corrupt index {}: {e}", desc.digest)))?;
+        if json {
+            let doc = serde_json::json!({ "descriptor": desc, "tags": tags, "index": idx });
+            println!("{}", serde_json::to_string_pretty(&doc)?);
+            return Ok(());
+        }
+        println!(
+            "kind:          {}",
+            desc.annotations
+                .get(ANN_KIND)
+                .map(String::as_str)
+                .unwrap_or("index")
+        );
+        println!("digest:        {}", desc.digest);
+        println!("tags:          {tags_line}");
+        println!("children:      {}", idx.manifests.len());
+        for c in &idx.manifests {
+            println!(
+                "  {}  {}",
+                short(c.digest.strip_prefix("sha256:").unwrap_or(&c.digest)),
+                c.annotations
+                    .get(ANN_REF_NAME)
+                    .map(String::as_str)
+                    .unwrap_or("?")
+            );
+        }
+        return Ok(());
+    }
+
+    let manifest = store
+        .read_manifest(&desc)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    // Current epoch: a live fluxor workspace member's TREE wins over
+    // the compiled-in const — the same rule as sync's currency check.
+    let current_epoch = current_epoch_for_inspect();
+    let ann = |k: &str| manifest.annotations.get(k).map(String::as_str);
+    let epoch = ann(ANN_ABI_SURFACE);
+    let epoch_current = matches!(
+        (epoch, current_epoch.as_deref()),
+        (Some(e), Some(c)) if e == c
+    );
+    if json {
+        let doc = serde_json::json!({
+            "descriptor": desc,
+            "manifest": manifest,
+            "tags": tags,
+            "current_abi_surface": current_epoch,
+            "epoch_current": epoch_current,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc)?);
+        return Ok(());
+    }
+    let epoch_line = match (epoch, current_epoch.as_deref()) {
+        (Some(e), Some(c)) if e == c => format!("{} ✓ current surface", short(e)),
+        (Some(e), Some(c)) => format!("{} ✗ current surface is {}", short(e), short(c)),
+        (Some(e), None) => format!("{} (current surface unknown)", short(e)),
+        (None, _) => "(none — published pre-cutover; run `fluxor publish` in its producer)".into(),
+    };
+    println!("kind:          {}", ann(ANN_KIND).unwrap_or("?"));
+    println!("digest:        {}", desc.digest);
+    println!("tags:          {tags_line}");
+    println!("epoch:         {epoch_line}");
+    println!("input-digest:  {}", ann(ANN_INPUT_DIGEST).unwrap_or("(none)"));
+    println!("ci-digest:     {}", ann(ANN_CI_DIGEST).unwrap_or("(none)"));
+    println!("provenance:    {}", ann(ANN_PROVENANCE).unwrap_or("(none)"));
+    println!("source-rev:    {}", ann(ANN_SOURCE_REV).unwrap_or("(none)"));
+    println!("layers:");
+    for l in &manifest.layers {
+        println!("  {:>9}  {}  {}", l.size, l.digest, l.media_type);
+    }
+    Ok(())
+}
+
+/// The current ABI-surface hex for `inspect`'s epoch display. When
+/// fluxor is a workspace member its tree is authoritative (tree and
+/// compiled-in const diverge exactly during an epoch move); else the
+/// compiled-in const. `None` only if the tree computation fails.
+fn current_epoch_for_inspect() -> Option<String> {
+    let mut members = std::collections::BTreeMap::new();
+    if let Ok(Some(ws)) = crate::workspace::load_workspace() {
+        for m in &ws.workspace.members {
+            if let Ok(Some(id)) = crate::project::project_identity(m) {
+                members.insert(id.name, m.clone());
+            }
+        }
+    }
+    crate::store_resolve::current_epoch_hex(&members).ok()
+}

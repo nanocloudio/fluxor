@@ -188,6 +188,9 @@ struct Candidate {
     /// `host-test` cfg. Only populated (and only emitted) for variant
     /// candidates.
     check_cfg_features: Vec<String>,
+    /// `[build] wasm_opt_level` from the manifest — per-module rustc
+    /// `opt-level` for the wasm target. `None` keeps the default.
+    wasm_opt_level: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -208,6 +211,17 @@ struct ManifestRaw {
     edition: Option<String>,
     #[serde(default)]
     variant: Option<Vec<VariantRaw>>,
+    #[serde(default)]
+    build: Option<BuildRaw>,
+}
+
+/// Raw `[build]` table as discovery sees it — only the key the build
+/// itself consumes. Full validation shares
+/// `manifest::validate_wasm_opt_level` with the manifest parse.
+#[derive(serde::Deserialize)]
+struct BuildRaw {
+    #[serde(default)]
+    wasm_opt_level: Option<String>,
 }
 
 /// Raw `[[variant]]` row as discovery sees it. Full validation
@@ -290,6 +304,11 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
                 )));
             }
             let hardware_targets = raw.hardware_targets.unwrap_or_default();
+            let wasm_opt_level = raw.build.and_then(|b| b.wasm_opt_level);
+            if let Some(level) = &wasm_opt_level {
+                crate::manifest::validate_wasm_opt_level(level)
+                    .map_err(|e| Error::Module(format!("{}: {e}", manifest.display())))?;
+            }
             match raw.variant {
                 None => out.push(Candidate {
                     name: name.clone(),
@@ -303,6 +322,7 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
                     variant: None,
                     features: Vec::new(),
                     check_cfg_features: Vec::new(),
+                    wasm_opt_level: wasm_opt_level.clone(),
                 }),
                 Some(variants) => {
                     // Expansion-level validation only; the full table
@@ -344,6 +364,7 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
                             variant: Some(v.name.clone()),
                             features: v.features.clone(),
                             check_cfg_features: all.clone(),
+                            wasm_opt_level: wasm_opt_level.clone(),
                         });
                     }
                 }
@@ -441,11 +462,12 @@ fn matches_target(c: &Candidate, target: &str, silicon: &str) -> bool {
 
 /// Public entry point. Drives discovery, per-target compile, and pack.
 pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
-    // Staged consumption state (SDK crates under `target/fluxor/<crate>/`,
+    // Staged consumption state (source trees under `target/fluxor/<name>/`,
     // reached by module `#[path]` includes) is lockfile-recorded but lives in
-    // `target/`, so `cargo clean` wipes it; refill anything missing before
+    // `target/`, so `cargo clean` wipes it; replay the lockfile before
     // building rather than demanding a manual re-sync.
-    crate::sync::ensure_materialized(&opts.project_root)?;
+    crate::store_sync::ensure_synced(&opts.project_root)
+        .map_err(|e| crate::error::Error::Config(e.to_string()))?;
     let targets = match &opts.selector {
         TargetSelector::One(t) => vec![t.clone()],
         TargetSelector::All => resolve_all_targets(&opts.project_root)?,
@@ -551,7 +573,8 @@ pub fn fmt_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLin
 /// (`loop {}`) are idiomatic in `no_std` and would otherwise fire on
 /// every module through the `include!`d runtime.
 pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLintReport> {
-    crate::sync::ensure_materialized(project_root)?;
+    crate::store_sync::ensure_synced(project_root)
+        .map_err(|e| crate::error::Error::Config(e.to_string()))?;
     let targets = resolve_all_targets(project_root)?;
     let candidates = discover(project_root)?;
     let scratch = project_root.join("target/fluxor/clippy");
@@ -722,7 +745,7 @@ fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool
         project_root.join("modules/sdk/runtime.rs"),
         project_root.join("modules/sdk/runtime/params.rs"),
         // Linker script. Lives under modules/sdk/ so it ships in the
-        // fluxor-abi / fluxor-sdk source bundle for downstream consumers.
+        // fluxor-abi source artifact for downstream consumers.
         project_root.join("modules/sdk/module.ld"),
     ];
     for input in &inputs {
@@ -819,9 +842,98 @@ fn includes_are_older(dir: &Path, out_mtime: SystemTime) -> bool {
     true
 }
 
+/// Every file transitively reachable from `dir`'s `.rs` sources via
+/// `#[path = "…"]` / `include!`-family references that lives OUTSIDE
+/// `dir` — the inputs a module-directory walk cannot see (the truffle
+/// pattern: a module whose `mod.rs` is `#[path]`-mounted shared
+/// source elsewhere in the tree). Deduped, sorted, and confined to
+/// `allowed_roots` (project root + workspace-member roots): a
+/// reference escaping every root is not a build input of this
+/// checkout. Unresolvable paths are ignored — cfg'd variants and
+/// macro-generated paths are the compiler's business, not a hashing
+/// failure.
+#[allow(
+    dead_code,
+    reason = "lib-surface API: consumed by store_publish's input-digest walk, which the dual-context bin build does not include"
+)]
+pub fn transitive_source_refs(dir: &Path, allowed_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let roots: Vec<PathBuf> = allowed_roots
+        .iter()
+        .filter_map(|r| r.canonicalize().ok())
+        .collect();
+    let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut visited = std::collections::HashSet::new();
+    let mut out = std::collections::BTreeSet::new();
+    let mut queue: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    while let Some(path) = queue.pop() {
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !visited.insert(canonical.clone()) {
+            continue;
+        }
+        if !canonical.starts_with(&dir_canon) {
+            if !roots.iter().any(|r| canonical.starts_with(r)) {
+                continue;
+            }
+            out.insert(canonical.clone());
+        }
+        let Ok(src) = std::fs::read_to_string(&canonical) else {
+            continue;
+        };
+        let base = canonical.parent().unwrap_or(Path::new("."));
+        for target in include_paths(&src) {
+            let resolved = base.join(&target);
+            if resolved.is_file() {
+                queue.push(resolved);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Extract the literal paths from `include!("…")` / `include_str!` /
-/// `include_bytes!` invocations in `src`.
+/// `include_bytes!` invocations and `#[path = "…"]` module attributes
+/// in `src`. Both reach source files the directory walk cannot see, so
+/// both feed the staleness graph and the input digest identically.
 fn include_paths(src: &str) -> Vec<String> {
+    let mut out = source_ref_macro_paths(src);
+    out.extend(path_attr_paths(src));
+    out
+}
+
+/// `#[path = "…"]` string literals. Resolution is relative to the
+/// containing file, same as the include macros — the compiler's exact
+/// nested-inline-module rule is richer, but a miss only means an
+/// unresolvable path, which callers ignore by contract.
+fn path_attr_paths(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(hit) = src[from..].find("#[path") {
+        let after = from + hit + "#[path".len();
+        from = after;
+        let rest = src[after..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        if let Some(end) = rest.find('"') {
+            out.push(rest[..end].to_string());
+        }
+    }
+    out
+}
+
+fn source_ref_macro_paths(src: &str) -> Vec<String> {
     const MACROS: [&str; 3] = ["include!", "include_str!", "include_bytes!"];
     let mut out = Vec::new();
     for mac in MACROS {
@@ -947,7 +1059,10 @@ fn compile_module_wasm(
         .arg("--target")
         .arg(spec.module_target)
         .arg("-C")
-        .arg("opt-level=z")
+        .arg(format!(
+            "opt-level={}",
+            cand.wasm_opt_level.as_deref().unwrap_or("z")
+        ))
         .arg("-C")
         .arg("strip=symbols");
     rustc.args(cfg_feature_args(cand));
@@ -1019,10 +1134,9 @@ fn pick_linker_script(cand: &Candidate, project_root: &Path) -> PathBuf {
     if local.exists() {
         return local;
     }
-    // 2. Project-local default at `modules/sdk/module.ld` — bundled
-    //    into the `fluxor-abi`/`fluxor-sdk` crates via the symlinked
-    //    sdk/ directory. Also accept `modules/module.ld` as a
-    //    fallback location.
+    // 2. Project-local default at `modules/sdk/module.ld` — shipped in
+    //    the `fluxor-abi` source artifact (`sdk/**`). Also accept
+    //    `modules/module.ld` as a fallback location.
     for cand_path in [
         project_root.join("modules/sdk/module.ld"),
         project_root.join("modules/module.ld"),
@@ -1032,13 +1146,11 @@ fn pick_linker_script(cand: &Candidate, project_root: &Path) -> PathBuf {
         }
     }
     // 3. Downstream consumers materialise fluxor's SDK source into
-    //    `target/fluxor/{fluxor-abi,fluxor-sdk}/sdk/` via
-    //    `fluxor sync`. Pick that up so PIC builds in a downstream
-    //    project find the script without an explicit copy.
-    for cand_path in [
-        project_root.join("target/fluxor/fluxor-abi/sdk/module.ld"),
-        project_root.join("target/fluxor/fluxor-sdk/sdk/module.ld"),
-    ] {
+    //    `target/fluxor/fluxor-abi/sdk/` via `fluxor sync`. Pick that
+    //    up so PIC builds in a downstream project find the script
+    //    without an explicit copy.
+    {
+        let cand_path = project_root.join("target/fluxor/fluxor-abi/sdk/module.ld");
         if cand_path.exists() {
             return cand_path;
         }
@@ -1214,6 +1326,7 @@ mod tests {
             variant: None,
             features: Vec::new(),
             check_cfg_features: Vec::new(),
+            wasm_opt_level: None,
         };
         assert!(matches_target(&c, "rp2350", "rp2350"));
         assert!(matches_target(&c, "linux", "bcm2712"));
@@ -1233,6 +1346,7 @@ mod tests {
             variant: None,
             features: Vec::new(),
             check_cfg_features: Vec::new(),
+            wasm_opt_level: None,
         };
         // Host target "linux" matches via its module silicon (bcm2712).
         assert!(matches_target(&c, "linux", "bcm2712"));
@@ -1254,6 +1368,7 @@ mod tests {
             variant: None,
             features: Vec::new(),
             check_cfg_features: Vec::new(),
+            wasm_opt_level: None,
         };
         // Manifest pinned to the raw host token — the target-string
         // match lets it through when the user invokes `--target linux`.
@@ -1281,6 +1396,61 @@ mod tests {
             got.len(),
             3,
             "a macro-generated path has no literal to follow"
+        );
+    }
+
+    #[test]
+    fn include_paths_finds_path_attributes() {
+        let src = r#"
+            #[path = "../../shared/core.rs"]
+            mod core;
+            #[path="sibling.rs"]
+            mod sib;
+            #[path
+                = "spread.rs"]
+            mod spread;
+        "#;
+        let got = include_paths(src);
+        assert!(got.contains(&"../../shared/core.rs".to_string()));
+        assert!(got.contains(&"sibling.rs".to_string()));
+        assert!(got.contains(&"spread.rs".to_string()));
+    }
+
+    #[test]
+    fn transitive_source_refs_walks_path_mounts_within_roots() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pr = scratch.path().join("proj");
+        let mod_dir = pr.join("modules/app/demo");
+        std::fs::create_dir_all(&mod_dir).unwrap();
+        std::fs::create_dir_all(pr.join("shared")).unwrap();
+        // module → shared/core.rs (#[path]) → shared/deep.rs (include!),
+        // plus a reference escaping the project root that must be dropped.
+        std::fs::write(
+            mod_dir.join("mod.rs"),
+            "#[path = \"../../../shared/core.rs\"]\nmod core;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pr.join("shared/core.rs"),
+            "include!(\"deep.rs\");\n#[path = \"../../outside.rs\"]\nmod out;\n",
+        )
+        .unwrap();
+        std::fs::write(pr.join("shared/deep.rs"), "pub fn d() {}\n").unwrap();
+        std::fs::write(scratch.path().join("outside.rs"), "pub fn o() {}\n").unwrap();
+
+        let refs = transitive_source_refs(&mod_dir, std::slice::from_ref(&pr));
+        let names: Vec<String> = refs
+            .iter()
+            .filter_map(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+            .collect();
+        assert!(names.contains(&"core.rs".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"deep.rs".to_string()),
+            "recursion through a #[path] mount must follow include!: {names:?}"
+        );
+        assert!(
+            !names.contains(&"outside.rs".to_string()),
+            "references escaping every allowed root are not inputs: {names:?}"
         );
     }
 

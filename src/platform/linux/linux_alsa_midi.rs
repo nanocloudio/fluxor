@@ -8,7 +8,7 @@
 // frames back to ALSA events on the output side.
 //
 // Params declared in
-// `modules/builtin/linux/linux_alsa_midi/manifest.toml`:
+// `modules/platform/linux/linux_alsa_midi/manifest.toml`:
 //   mode:        enum {in, out, duplex} — selects which port(s) open
 //   port_filter: str — substring match against ALSA client:port name
 //   client_name: str — name the ALSA seq client publishes as

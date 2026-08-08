@@ -20,7 +20,7 @@ instead would make every consumer re-derive the aggregate and would leak module
 indices into orchestration.
 
 That is the whole reason this surface exists rather than consumers reading
-`fluxor monitor` output: monitor speaks modules, this speaks owners.
+`fluxor rig monitor` output: monitor speaks modules, this speaks owners.
 
 ## Data flow
 
@@ -93,7 +93,7 @@ can land without a format change.
 ## Semantics
 
 - **Aggregation is fluxor's job.** Module indices, per-module fault counts and
-  histograms stay in `fluxor monitor` (`MON_FAULT` / `MON_HIST` / `MON_STATE`);
+  histograms stay in `fluxor rig monitor` (`MON_FAULT` / `MON_HIST` / `MON_STATE`);
   this surface speaks only per-owner aggregates. A consumer never needs the
   slot→module mapping.
 - **`restart_count` counts aggregate re-activations only**: an owner observed

@@ -15,18 +15,6 @@ use crate::error::Result;
 
 pub use crate::wire::fnv1a32 as fnv1a_hash;
 
-/// SHA-256 of a file as 64 lowercase hex characters.
-pub fn file_sha256_full(path: &Path) -> Result<String> {
-    let bytes = fs::read(path)?;
-    let digest = Sha256::digest(&bytes);
-    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// `sha256:<full-hex>` — lockfile and index `hash` field convention.
-pub fn file_sha256_prefixed(path: &Path) -> Result<String> {
-    Ok(format!("sha256:{}", file_sha256_full(path)?))
-}
-
 /// sha256 of the canonical ABI wire-surface stream (`abi_surface`): the
 /// digest that pins a graph generation / slot image to the kernel surface
 /// it was built against. Equality = wire-compatible; no version windows.
@@ -44,16 +32,6 @@ pub fn abi_surface_digest() -> [u8; 32] {
     // including the regen command — whenever the pin is stale, i.e. it would
     // block its own fix path.
     out
-}
-
-/// First 12 hex characters of SHA-256(content). Used for the
-/// `-local.<sha>` content-hash suffix on local-publish artefacts —
-/// 48 bits of distinguisher is enough for any registry that holds
-/// thousands of snapshots.
-pub fn file_sha256_short(path: &Path) -> Result<String> {
-    let bytes = fs::read(path)?;
-    let digest = Sha256::digest(&bytes);
-    Ok(digest.iter().take(6).map(|b| format!("{b:02x}")).collect())
 }
 
 /// Recompute the canonical source hash over ALL of `modules/sdk` — the
@@ -137,7 +115,7 @@ pub fn compute_contracts_platform_src_hash(repo_root: &Path) -> Result<[u8; 32]>
 /// formatting (not tokens) while preserving every identifier, punct, and
 /// literal (so literal values, including string contents, are exact). Falls
 /// back to line-canonicalization if the file does not tokenize.
-fn canonicalize_source(text: &str) -> String {
+pub fn canonicalize_source(text: &str) -> String {
     use std::str::FromStr;
     match proc_macro2::TokenStream::from_str(text) {
         Ok(ts) => {
@@ -261,7 +239,7 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "dd1a2fb88d552abf93d34e4e6c712a2f68270ac77ea4089a3f23a52ee08c5178",
+            hex, "3f417051bc602cbec34ad7f64417e5071b686d5b2eb1f7fb3ea46d7f1ba0c303",
             "ABI wire-surface changed — this is a deliberate wire break or it is \
              a mistake; see docs/architecture/abi_surface.md before updating"
         );

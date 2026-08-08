@@ -267,26 +267,34 @@ pub fn root_for_config(config_path: &Path) -> PathBuf {
     root()
 }
 
-/// `[project]` table from `fluxor.toml`. Parsed lazily by publish-side
-/// commands that need to scope artefacts into
-/// `~/.fluxor/registry/{fmod,index}/<project>/`.
+/// `[project]` table from `fluxor.toml`. Parsed lazily by the store
+/// flow (`store_publish` / `store_sync`) to scope artifacts under the
+/// owning project's name.
 #[derive(Debug, Clone)]
 pub struct ProjectIdentity {
     /// `[project].name` — required for publish to succeed. The CLI
     /// does not fall back to a directory-name heuristic on purpose:
     /// silent identity inference would mean two checkouts with the
-    /// same path basename collide in the registry.
+    /// same path basename collide in the store.
     pub name: String,
-    /// `[project].version` — defaults to `"0.0.0-dev"` when absent.
-    /// Canonical publish (`fluxor publish` without `--local`) refuses
-    /// the dev default; `--local` accepts it.
+    /// `[project].version` — the human-readable `<ver>` tag label;
+    /// defaults to `"0.0.0-dev"` when absent. Resolution never orders
+    /// versions — `:latest` is the only tag with semantics.
+    #[allow(
+        dead_code,
+        reason = "read by the lib-context store flow; this file dual-compiles into the bin, whose paths only read `name`"
+    )]
     pub version: String,
     /// `[project].runtimes` — explicit opt-in list of host runtime
-    /// binaries this project owns. The bare `fluxor publish` sweep
-    /// only republishes binaries named here, so binaries synced from
+    /// binaries this project owns. The `fluxor publish` runtime sweep
+    /// only publishes binaries named here, so binaries synced from
     /// upstream into the consumer's `target/` tree don't get
     /// misclassified as owned and re-published under the consumer's
     /// namespace. Empty when omitted.
+    #[allow(
+        dead_code,
+        reason = "read by the lib-context store flow; this file dual-compiles into the bin, whose paths only read `name`"
+    )]
     pub runtimes: Vec<String>,
 }
 
@@ -330,43 +338,9 @@ pub struct DepSpec {
     pub optional: bool,
 }
 
-/// Parse `[features]` from `<project_root>/fluxor.toml`. Each entry
-/// maps a feature name to the list of dep names it activates.
-/// Returns an empty map when the section is absent.
-pub fn features(
-    project_root: &Path,
-) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
-    let Some(parsed) = read_fluxor_toml(project_root)? else {
-        return Ok(std::collections::BTreeMap::new());
-    };
-    Ok(parsed.features.unwrap_or_default())
-}
-
-/// Filter `[dependencies]` by the set of active features. Required
-/// deps (those without `optional = true`) always pass through.
-/// Optional deps pass through only when at least one active feature
-/// lists them in its activation set.
-pub fn active_dependencies(
-    project_root: &Path,
-    active_features: &[String],
-) -> Result<Vec<DepSpec>, String> {
-    let deps = dependencies(project_root)?;
-    let feats = features(project_root)?;
-    let activated_names: std::collections::BTreeSet<String> = active_features
-        .iter()
-        .flat_map(|f| feats.get(f).cloned().unwrap_or_default())
-        .collect();
-    Ok(deps
-        .into_iter()
-        .filter(|d| !d.optional || activated_names.contains(&d.name))
-        .collect())
-}
-
 /// Parse `[dependencies]` (and `[dependencies.X]` table forms) from
 /// `<project_root>/fluxor.toml`. Returns an empty vec when the
-/// section is absent. Includes both required and optional entries —
-/// callers that need feature-gated filtering should use
-/// [`active_dependencies`] instead.
+/// section is absent. Includes both required and optional entries.
 pub fn dependencies(project_root: &Path) -> Result<Vec<DepSpec>, String> {
     let Some(parsed) = read_fluxor_toml(project_root)? else {
         return Ok(Vec::new());
@@ -403,8 +377,6 @@ struct FluxorTomlParse {
     project: Option<ProjectSection>,
     #[serde(default)]
     dependencies: Option<std::collections::BTreeMap<String, DepValue>>,
-    #[serde(default)]
-    features: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -979,66 +951,5 @@ pub(crate) mod tests {
             found.env_var_value.as_deref(),
             Some("/this/path/does/not/exist")
         );
-    }
-
-    fn write_fluxor_toml(dir: &Path, body: &str) {
-        fs::write(dir.join("fluxor.toml"), body).unwrap();
-    }
-
-    #[test]
-    fn active_dependencies_filters_optional_deps_without_feature() {
-        let _g = lock();
-        let tmp =
-            std::env::temp_dir().join(format!("fluxor_active_deps_no_feat_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        write_fluxor_toml(
-            &tmp,
-            r#"
-                [project]
-                name = "x"
-                version = "0.1.0"
-                [dependencies]
-                req = "1.0"
-                [dependencies.opt]
-                version = "1.0"
-                optional = true
-                [features]
-                cluster = ["opt"]
-            "#,
-        );
-        let deps = active_dependencies(&tmp, &[]).unwrap();
-        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, vec!["req"]);
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn active_dependencies_includes_optional_when_feature_active() {
-        let _g = lock();
-        let tmp =
-            std::env::temp_dir().join(format!("fluxor_active_deps_feat_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).unwrap();
-        write_fluxor_toml(
-            &tmp,
-            r#"
-                [project]
-                name = "x"
-                version = "0.1.0"
-                [dependencies]
-                req = "1.0"
-                [dependencies.opt]
-                version = "1.0"
-                optional = true
-                [features]
-                cluster = ["opt"]
-            "#,
-        );
-        let mut deps = active_dependencies(&tmp, &["cluster".into()]).unwrap();
-        deps.sort_by(|a, b| a.name.cmp(&b.name));
-        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, vec!["opt", "req"]);
-        let _ = fs::remove_dir_all(&tmp);
     }
 }

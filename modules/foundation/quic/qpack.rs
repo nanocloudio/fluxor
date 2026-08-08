@@ -175,10 +175,7 @@ pub fn qpack_decode_int(buf: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
         if chunk > max_chunk {
             return None;
         }
-        value = match value.checked_add(chunk << shift) {
-            Some(v) => v,
-            None => return None,
-        };
+        value = value.checked_add(chunk << shift)?;
         if b & 0x80 == 0 {
             break;
         }

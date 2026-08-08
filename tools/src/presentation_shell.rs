@@ -4,7 +4,7 @@
 //!
 //! Kept as a standalone, dependency-light module (only `serde_json`) so
 //! it is unit-testable directly with synthetic configs — no module
-//! tree, no `fluxor validate` subprocess. It returns a plain
+//! tree, no `fluxor build --check` subprocess. It returns a plain
 //! `Result<(), String>` so it carries no coupling to the (dual-compiled)
 //! crate error type; the `config.rs` pass maps the message into its
 //! `Error::Config` via `.map_err(...)`.

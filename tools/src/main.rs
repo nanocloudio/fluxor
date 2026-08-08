@@ -3,9 +3,9 @@
 //! Host-side tools for building and extracting Fluxor firmware configuration.
 //!
 //! Usage:
-//!     fluxor decode firmware.uf2           # Decode config from UF2
-//!     fluxor info firmware.uf2             # Show UF2 file info
-//!     fluxor generate config.yaml -o config.uf2  # Generate config UF2
+//!     fluxor build config.yaml --emit=uf2 -o config.uf2   # config UF2
+//!     fluxor inspect firmware.uf2                         # UF2 info
+//!     fluxor inspect firmware.uf2 --emit-config           # embedded config
 
 #![allow(
     unsafe_code,
@@ -16,23 +16,20 @@
     clippy::print_stderr,
     reason = "CLI is the user-facing product surface; `println!`/`eprintln!` is intentional output, not log misuse"
 )]
-//!     fluxor combine firmware.uf2 config.yaml -o combined.uf2
-//!     fluxor example blinky                # Show example config
-//!     fluxor pack module.o -o module.fmod # Pack ELF into .fmod module
+//!     fluxor build config.yaml --emit=combined --firmware fw.uf2 -o out.uf2
+//!     fluxor modules pack module.o -o module.fmod  # Pack ELF into .fmod
 
 mod abi_pin;
 mod add_subgraph;
 mod agent_cli;
 mod asset_bank;
 mod board;
-mod cargo_index;
 mod ci;
 mod config;
 mod crypto;
 mod error;
 mod hash;
 mod hygiene;
-mod lockfile;
 mod manifest;
 mod module_test;
 mod modules;
@@ -50,18 +47,20 @@ pub(crate) use fluxor_tools::presentation_shell;
 // `ci.rs` runs the placement lint as `crate::presentation_resolver`; re-export
 // the lib's copy for the bin (same pattern as observability/presentation_shell).
 pub(crate) use fluxor_tools::presentation_resolver;
+// Dual-context files (`ci.rs`, `modules_build.rs`) reach the lib-only
+// store flow as `crate::store_resolve` / `crate::store_sync`; re-export
+// the lib's single copies here so both compile contexts resolve them
+// (same pattern as observability above).
+pub(crate) use fluxor_tools::store_resolve;
+pub(crate) use fluxor_tools::store_sync;
 mod project;
-mod project_meta;
-mod publish;
 pub mod reconfigure;
-mod registry;
 mod render_template;
 pub mod rig;
 mod scenario;
 mod schema;
 mod stack_expand;
 mod store_cli;
-mod sync;
 pub mod target;
 mod text_distance;
 mod uf2;
@@ -91,10 +90,9 @@ mod abi_surface;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use crate::config::{decode_config, generate_config_ext, ConfigBuilder, ModuleCaps, EXAMPLES};
+use crate::config::{decode_config, generate_config_ext, ConfigBuilder, ModuleCaps};
 use crate::error::{Error, Result};
 use crate::modules::{build_module_table, pack_fmod, parse_modules_from_config_multi};
-use crate::monitor::cmd_monitor_dispatch;
 use crate::uf2::{create_uf2_blocks, fix_uf2_block_numbers, parse_uf2, UF2_FAMILY_RP2350};
 
 /// Flash layout constants
@@ -131,49 +129,28 @@ fn main() {
     let verbose = cli.verbose;
 
     let result = match cli.command {
-        Commands::Decode { file, format } => cmd_decode(&file, &format),
-        Commands::Info { file } => cmd_info(&file),
-        Commands::Generate {
-            config,
+        Commands::Build {
+            path,
             output,
-            modules_dir,
-            binary,
-        } => cmd_generate(&config, output.as_deref(), modules_dir.as_deref(), binary),
-        Commands::Combine {
+            emit,
+            check,
             firmware,
-            config,
-            output,
-        } => cmd_combine(&firmware, &config, &output, verbose),
-        Commands::SlotImage {
-            config,
-            output,
+            modules_dir,
             target,
             epoch,
-        } => cmd_slot_image(&config, &output, target.as_deref(), epoch, verbose),
-        Commands::Example { name } => cmd_example(&name),
-        Commands::Pack {
-            input,
-            output,
-            name,
-            module_type,
-            manifest,
-        } => cmd_pack(&input, &output, name, module_type, manifest, verbose),
-        Commands::Validate { config, target } => cmd_validate(&config, target.as_deref()),
-        Commands::TargetInfo { target, field } => cmd_target_info(&target, field.as_deref()),
-        Commands::Targets => cmd_targets(),
-        Commands::AbiRegen { check } => cmd_abi_regen(check),
-        Commands::Mktable { dir, output } => cmd_mktable(&dir, &output),
-        Commands::MktableConfig {
-            config,
-            modules_dir,
-            output,
-        } => cmd_mktable_config(&config, &modules_dir, &output),
-        Commands::Diff {
-            old_config,
-            new_config,
-            target,
-        } => cmd_diff(&old_config, &new_config, target.as_deref()),
-        Commands::Build { path, output } => cmd_build(&path, output.as_deref(), verbose),
+        } => cmd_build_dispatch(
+            &path,
+            BuildFlags {
+                output,
+                emit,
+                check,
+                firmware,
+                modules_dir,
+                target,
+                epoch,
+            },
+            verbose,
+        ),
         Commands::Run {
             config,
             print_synthesised,
@@ -182,18 +159,32 @@ fn main() {
             graph,
             list,
             open,
-        } => cmd_run_dispatch(
-            config.as_ref(),
-            RunFlags {
-                print_synthesised,
-                print_merged,
-                validate_only,
-                graph,
-                list,
-                open,
+            replicas,
+            base_port,
+            http_offset,
+            vars,
+        } => match replicas {
+            // `--replicas` = the old `up`: render the template per
+            // replica and spawn them side-by-side.
+            Some(n) => match config.as_ref() {
+                Some(template) => up::cmd_up(template, n, base_port, http_offset, &vars, None),
+                None => Err(Error::Config(
+                    "run --replicas needs a template config argument".into(),
+                )),
             },
-            verbose,
-        ),
+            None => cmd_run_dispatch(
+                config.as_ref(),
+                RunFlags {
+                    print_synthesised,
+                    print_merged,
+                    validate_only,
+                    graph,
+                    list,
+                    open,
+                },
+                verbose,
+            ),
+        },
         Commands::Exec { name, args } => workload_src::exec_applet(&name, &args, verbose),
         Commands::Install { bundle, name, link } => {
             workload_src::install_applet(&bundle, name.as_deref(), link.as_deref(), verbose)
@@ -204,24 +195,28 @@ fn main() {
             vars,
             output,
         } => render_template::cmd_render_template(&template, &vars, output.as_deref()),
-        Commands::Up {
-            template,
-            replicas,
-            base_port,
-            http_offset,
-            vars,
-        } => up::cmd_up(&template, replicas, base_port, http_offset, &vars, None),
-        Commands::Sign { input, key, output } => cmd_sign(&input, &key, output.as_deref(), verbose),
-        Commands::Keygen { key, force } => cmd_keygen(&key, force),
-        Commands::Monitor {
-            port,
-            baud,
-            refresh_ms,
-            net,
-        } => cmd_monitor_dispatch(&port, baud, refresh_ms, net.as_deref()),
+        Commands::AbiRegen { check } => cmd_abi_regen(check),
         Commands::Agent(args) => agent_cli::dispatch(args),
         Commands::Rig(args) => rig::cli::dispatch(args),
-        Commands::Inspect { config, json } => cmd_inspect(config.as_deref(), json),
+        Commands::Inspect {
+            subject,
+            json,
+            emit_config,
+            format,
+            against,
+            target,
+            store,
+        } => cmd_inspect_dispatch(
+            subject.as_deref(),
+            InspectFlags {
+                json,
+                emit_config,
+                format,
+                against,
+                target,
+                store,
+            },
+        ),
         Commands::Lint { action } => match action {
             LintAction::Hygiene { project_root, json } => {
                 cmd_lint_hygiene(project_root.as_deref(), json)
@@ -257,108 +252,176 @@ fn main() {
             ModulesAction::List { project_root, json } => {
                 cmd_modules_list(project_root.as_deref(), json)
             }
-            ModulesAction::Publish {
-                store,
-                target,
-                module,
-                tag,
-                published,
-                pin,
-                project_root,
-            } => store_cli::cmd_modules_publish(
-                store.as_deref(),
-                target.as_deref(),
-                module.as_deref(),
-                tag.as_deref(),
-                published,
-                pin,
-                project_root.as_deref(),
-            ),
             ModulesAction::Resolve { target, out } => cmd_modules_resolve(&target, &out),
+            ModulesAction::Pack {
+                input,
+                output,
+                name,
+                module_type,
+                manifest,
+            } => cmd_pack(&input, &output, name, module_type, manifest, verbose),
+            ModulesAction::Sign { input, key, output } => {
+                cmd_sign(&input, &key, output.as_deref(), verbose)
+            }
+            ModulesAction::Keygen { key, force } => cmd_keygen(&key, force),
+            ModulesAction::Test {
+                module,
+                project_root,
+                verbose,
+            } => module_test::cmd_test(project_root.as_deref(), module.as_deref(), verbose),
         },
         Commands::Publish {
             action,
-            local,
+            only,
             project_root,
-        } => match action {
-            None => publish::cmd_publish_all(local, project_root.as_deref()),
-            Some(PublishAction::Abi {
-                local: sub_local,
-                project_root: sub_root,
-            }) => publish::cmd_publish_abi(local || sub_local, sub_root.as_deref()),
-            Some(PublishAction::Sdk {
-                local: sub_local,
-                project_root: sub_root,
-            }) => publish::cmd_publish_sdk(local || sub_local, sub_root.as_deref()),
-            Some(PublishAction::Common {
-                local: sub_local,
-                project_root: sub_root,
-            }) => publish::cmd_publish_common(local || sub_local, sub_root.as_deref()),
-            Some(PublishAction::Fmod {
-                target,
-                module,
-                local: sub_local,
-                project_root: sub_root,
-            }) => publish::cmd_publish_fmod(
-                target.as_deref(),
-                module.as_deref(),
-                local || sub_local,
-                sub_root.as_deref(),
-            ),
-            Some(PublishAction::Runtime {
-                binary,
-                host_target,
-                local: sub_local,
-                project_root: sub_root,
-            }) => publish::cmd_publish_runtime(
-                &binary,
-                host_target.as_deref(),
-                local || sub_local,
-                sub_root.as_deref(),
-            ),
-        },
-        Commands::Update {
-            project_root,
-            features,
-        } => lockfile::cmd_update(project_root.as_deref(), &features),
-        Commands::Test {
-            module,
-            project_root,
-            verbose,
-        } => module_test::cmd_test(project_root.as_deref(), module.as_deref(), verbose),
+        } => cmd_publish(action, &only, project_root.as_deref(), verbose),
+        Commands::Update { project_root, from } => {
+            let pr = project_root.unwrap_or_else(crate::project::root);
+            store_resolve::cmd_update(&pr, from.as_deref())
+                .map_err(|e| Error::Config(e.to_string()))
+        }
         Commands::Sync {
             project_root,
             dry_run,
-        } => sync::cmd_sync(project_root.as_deref(), dry_run),
-        Commands::Registry { action } => match action {
-            RegistryAction::Init => cargo_index::cmd_registry_init(),
-            RegistryAction::List { json } => registry::cmd_registry_list(json),
-            RegistryAction::Gc { dry_run } => registry::cmd_registry_gc(dry_run),
-            RegistryAction::SetupCargo => cargo_index::cmd_registry_setup_cargo(),
-        },
+        } => cmd_sync(project_root.as_deref(), dry_run),
         Commands::Workspace { action } => match action {
             WorkspaceAction::Status { json } => workspace::cmd_workspace_status(json),
+            WorkspaceAction::Publish { dry_run } => cmd_workspace_publish(dry_run),
+            WorkspaceAction::Add { path } => workspace::cmd_workspace_add(&path),
+            WorkspaceAction::Rm { path } => workspace::cmd_workspace_rm(&path),
         },
         Commands::Store(args) => store_cli::dispatch_store(args),
-        Commands::Bundle(args) => match args.command {
-            store_cli::BundleCommand::Publish {
-                bundle_dir,
-                store,
-                tag,
-                published,
-            } => store_cli::cmd_bundle_publish(
-                &bundle_dir,
-                store.as_deref(),
-                tag.as_deref(),
-                published,
-            ),
-        },
     };
 
     if let Err(e) = result {
         eprintln!("\x1b[1;31mError:\x1b[0m {e}");
         std::process::exit(1);
     }
+}
+
+/// `fluxor publish` — the single store-write verb. The optional
+/// subcommand (`abi|sdk|common|fmod|runtime`) and the `--only` flag
+/// both narrow the artifact kinds; `publish bundle <dir>` publishes a
+/// built workload bundle; bare `publish` sweeps everything
+/// publishable (sources, built fmods, `[project].runtimes` binaries —
+/// and, in the fluxor repo, the CLI itself).
+fn cmd_publish(
+    action: Option<PublishAction>,
+    only: &[String],
+    project_root: Option<&Path>,
+    verbose: bool,
+) -> Result<()> {
+    // clap can't express subcommand-vs-flag conflicts (`conflicts_with`
+    // only names sibling args), so enforce it here.
+    if action.is_some() && !only.is_empty() {
+        return Err(Error::Config(
+            "`--only` conflicts with a publish subcommand (the subcommand already names the kinds)"
+                .into(),
+        ));
+    }
+    if let Some(PublishAction::Bundle {
+        bundle_dir,
+        store,
+        tag,
+        published,
+    }) = action
+    {
+        return store_cli::cmd_bundle_publish(
+            &bundle_dir,
+            store.as_deref(),
+            tag.as_deref(),
+            published,
+        );
+    }
+    let (kinds, sub_root): (Vec<&str>, Option<PathBuf>) = match action {
+        // abi/sdk/common all name the source tier — the store publisher
+        // sweeps every source artifact the project owns.
+        Some(
+            PublishAction::Abi { project_root: r }
+            | PublishAction::Sdk { project_root: r }
+            | PublishAction::Common { project_root: r },
+        ) => (vec!["source"], r),
+        Some(PublishAction::Fmod { project_root: r }) => (vec!["fmod"], r),
+        Some(PublishAction::Runtime { project_root: r }) => (vec!["runtime"], r),
+        // Handled by the early return above.
+        Some(PublishAction::Bundle { .. }) => unreachable!("publish bundle handled above"),
+        None => {
+            let mut kinds = Vec::new();
+            for o in only {
+                kinds.push(match o.as_str() {
+                    "abi" | "sdk" | "common" | "source" => "source",
+                    "fmod" => "fmod",
+                    "runtime" => "runtime",
+                    other => {
+                        return Err(Error::Config(format!(
+                            "unknown --only kind '{other}' (expected source|fmod|runtime)"
+                        )))
+                    }
+                });
+            }
+            kinds.dedup();
+            (kinds, None)
+        }
+    };
+    let pr = sub_root
+        .or_else(|| project_root.map(Path::to_path_buf))
+        .unwrap_or_else(crate::project::root);
+    let tags = fluxor_tools::store_publish::publish_project_to_store(&pr, &kinds, verbose)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    for tag in &tags {
+        println!("{tag}");
+    }
+    println!("published {} tag(s)", tags.len());
+    Ok(())
+}
+
+/// `fluxor sync` — store → tree via the uniform lockfile.
+fn cmd_sync(project_root: Option<&Path>, dry_run: bool) -> Result<()> {
+    let pr = project_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::project::root);
+    let report =
+        store_sync::sync_project(&pr, dry_run).map_err(|e| Error::Config(e.to_string()))?;
+    for line in &report.materialized {
+        println!("{line}");
+    }
+    if report.lockfile_written {
+        println!(
+            "wrote fluxor.lock ({} artifact(s) pinned)",
+            report.entries.len()
+        );
+    } else {
+        println!(
+            "dry-run: {} artifact(s) resolved, lockfile untouched",
+            report.entries.len()
+        );
+    }
+    Ok(())
+}
+
+/// `fluxor workspace publish` — build + publish every workspace member
+/// whose input digests differ from its published artifacts, in
+/// dependency order.
+fn cmd_workspace_publish(dry_run: bool) -> Result<()> {
+    let outcomes =
+        store_sync::workspace_publish(dry_run).map_err(|e| Error::Config(e.to_string()))?;
+    for (name, outcome) in &outcomes {
+        match outcome {
+            fluxor_tools::store_sync::MemberOutcome::UpToDate => {
+                println!("{name}: up to date");
+            }
+            fluxor_tools::store_sync::MemberOutcome::WouldPublish(dirty) => {
+                println!("{name}: would publish ({})", dirty.join(", "));
+            }
+            fluxor_tools::store_sync::MemberOutcome::Published(tags) => {
+                println!("{name}: published {} tag(s)", tags.len());
+                for t in tags {
+                    println!("  {t}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── CLI definitions + command impls, split for navigability ─────────────────

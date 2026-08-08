@@ -2306,7 +2306,7 @@ mod rate_class_resolution_tests {
     /// without a `rate_class_default` the edge resolves to `audio`
     /// (NetProto's content-type default) via the consumer
     /// (`linux_net.net_in`), which exceeds the cap and fails
-    /// `fluxor validate`. Declaring `rate_class_default = transaction`
+    /// `fluxor build --check`. Declaring `rate_class_default = transaction`
     /// on the producer satisfies the cap without touching every
     /// consuming config's wiring.
     #[test]

@@ -71,7 +71,7 @@ Hardware resource ownership is explicit and declared, not opportunistic:
 Silicon capabilities are declared once per chip family in
 `targets/silicon/*.toml` and shared across every board that uses that
 chip. Boards layer their own pin assignments and on-board peripheral
-declarations on top in `targets/boards/*.toml`. The `fluxor targets`
+declarations on top in `targets/boards/*.toml`. The `fluxor inspect`
 CLI command lists every available target.
 
 ### Pico 2 W Pin Capabilities

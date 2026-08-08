@@ -1,4 +1,4 @@
-//! `fluxor test` — unit-test a module's `include!`d cores on the host.
+//! `fluxor modules test` — unit-test a module's `include!`d cores on the host.
 //!
 //! A `.fmod` core is `no_std`, no-alloc source that is `include!`d rather than
 //! linked, so `cargo test` cannot reach it: there is no crate to test. Today
@@ -17,9 +17,11 @@
 //!   [test]
 //!   harness = "tests/harness.rs"
 //!
-//! A harness must use line comments (`//`), not inner doc comments (`//!`): it
-//! is `include!`d into the generated crate, so an inner doc comment would not
-//! sit at the crate root and will not compile.
+//! The harness file is mounted into the generated crate as a `#[path]`
+//! module, so it may open with inner doc comments and use
+//! `#[path = "../mod.rs"] mod x;` to mount its module's root — the
+//! generated crate enables the `host-test` feature, disarming the
+//! module sources' `no_std`/`no_mangle` gates.
 //!
 //! The generated crate is disposable and lives under the project's target dir,
 //! so it never pollutes the source tree and is rebuilt from scratch when the
@@ -39,8 +41,23 @@ struct Harness {
 }
 
 /// Discover every module under `modules/**` whose manifest declares `[test]`.
+/// True when any module manifest declares a `[test] harness` — the
+/// condition for `fluxor ci` to run the module-test phase at all.
+pub fn has_harnesses(project_root: &Path) -> bool {
+    !discover(project_root).is_empty()
+}
+
 fn discover(project_root: &Path) -> Vec<Harness> {
-    const DIRS: [&str; 3] = ["modules/drivers", "modules/foundation", "modules/app"];
+    // Flat `modules/*` covers consumer projects (zedex-style layout);
+    // the tier dirs cover fluxor's own tree. A tier dir has no
+    // manifest.toml of its own, so scanning `modules` flat can't
+    // double-count its children.
+    const DIRS: [&str; 4] = [
+        "modules",
+        "modules/drivers",
+        "modules/foundation",
+        "modules/app",
+    ];
     let mut out = Vec::new();
     for d in DIRS {
         let root = project_root.join(d);
@@ -105,24 +122,39 @@ fn run_one(h: &Harness, out_root: &Path, verbose: bool) -> Result<bool> {
         dir.join("Cargo.toml"),
         format!(
             "[package]\nname = \"moduletest_{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             [lib]\npath = \"src/lib.rs\"\n[workspace]\n",
+             [lib]\npath = \"src/lib.rs\"\n[workspace]\n\
+             [features]\ndefault = [\"host-test\"]\nhost-test = []\n",
             h.module.replace('-', "_")
         ),
     )
     .map_err(Error::Io)?;
 
-    // `include!` resolves the harness's own relative includes against the
-    // harness file's directory, so mounting it by absolute path is enough —
-    // the harness keeps writing `include!("../../common/x.rs")` exactly as the
-    // module does.
+    // `#[path]`, not `include!`: a mounted module file may open with
+    // inner doc comments and `#![cfg_attr(...)]` attributes, which
+    // rustc rejects when macro-spliced but accepts in a real module
+    // file. Relative `include!`/`#[path]` inside the harness resolve
+    // against the harness file's own directory either way, so the
+    // harness keeps writing `include!("../../common/x.rs")` /
+    // `#[path = "../mod.rs"]` exactly as the module does.
+    //
+    // `pub`: the mounted cores are only *used* by their inline tests,
+    // so in the non-test compile of this crate every item would be
+    // dead code. Public reachability (here and via `pub mod` mounts
+    // inside the harness) is what marks them as exported API instead
+    // of warning noise.
     fs::write(
         dir.join("src/lib.rs"),
-        format!("include!(r\"{}\");\n", h.path.display()),
+        format!("#[path = r\"{}\"]\npub mod harness;\n", h.path.display()),
     )
     .map_err(Error::Io)?;
 
     let mut cmd = Command::new("cargo");
     cmd.arg("test").current_dir(&dir);
+    // Pin the HOST triple explicitly: the generated crate lives inside
+    // the project tree, so a bare `cargo test` inherits the repo's
+    // `.cargo/config` default target — a bare-metal triple in module
+    // projects, which has no std and no test runner.
+    cmd.args(["--target", host_triple()]);
     if !verbose {
         cmd.arg("--quiet");
     }
@@ -130,7 +162,13 @@ fn run_one(h: &Harness, out_root: &Path, verbose: bool) -> Result<bool> {
     Ok(status.success())
 }
 
-/// `fluxor test [--module NAME]`.
+/// The triple this tool was built for — by construction the host that
+/// is running it, and therefore the right `--target` for host tests.
+fn host_triple() -> &'static str {
+    env!("FLUXOR_HOST_TRIPLE")
+}
+
+/// `fluxor modules test [--module NAME]`.
 pub fn cmd_test(project_root: Option<&Path>, module: Option<&str>, verbose: bool) -> Result<()> {
     let root = match project_root {
         Some(p) => p.to_path_buf(),

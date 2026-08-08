@@ -9,14 +9,50 @@
 //!   - RFC 9147 §7.1 — DTLS 1.3 ACK record codec
 //!   - foundation/tls MSG_PEER_IDENTITY (Fluxor-owned wire)
 //!
-//! Lives in this crate (not the harness sub-workspace) so it
-//! ships with the source for everyone fetching the repo. Run via:
-//!     cargo test -p fluxor-mod-tls --features host-test \
-//!       --target aarch64-unknown-linux-gnu
-//! The `host-test` feature switches `mod.rs` away from `#![no_std]`
-//! so the integration test can link the crate as a normal rlib.
+//! Lives in the module (not the harness sub-workspace) so it ships
+//! with the source for everyone fetching the repo. Declared by
+//! `manifest.toml [test] harness` and run via `fluxor test` — the
+//! generated harness crate enables `host-test`, which switches
+//! `mod.rs` away from `#![no_std]` so the mount builds as host code.
 
-use fluxor_mod_tls as tls;
+#[path = "../mod.rs"]
+mod tls;
+
+// ============================================================================
+// Minimal `hex!` macro: turns a string literal into a fixed-size byte
+// array at compile time. Used by every KAT below. Inline so the
+// crate doesn't drag in `hex-literal`; defined before first use so
+// textual macro scoping covers the whole file with no `use` import.
+// ============================================================================
+
+#[allow(
+    unused_macros,
+    reason = "the generated module-test crate also builds a lib target, where the #[test] KATs (this macro's only users) are compiled out"
+)]
+macro_rules! hex {
+    ($($s:literal)+) => {{
+        const HEX: &[u8] = concat!($($s),+).as_bytes();
+        const N: usize = HEX.len() / 2;
+        const fn nibble(b: u8) -> u8 {
+            match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => panic!("non-hex digit"),
+            }
+        }
+        const fn decode() -> [u8; N] {
+            let mut out = [0u8; N];
+            let mut i = 0;
+            while i < N {
+                out[i] = (nibble(HEX[2 * i]) << 4) | nibble(HEX[2 * i + 1]);
+                i += 1;
+            }
+            out
+        }
+        decode()
+    }};
+}
 
 // ============================================================================
 // SHA-256 (FIPS 180-4 + a long-input check)
@@ -423,35 +459,3 @@ fn dtls_ack_record_empty_list_is_valid() {
     let count = tls::parse_dtls_ack_body(&buf[..n], &mut out).expect("parse empty");
     assert_eq!(count, 0);
 }
-
-// ============================================================================
-// Minimal `hex!` macro: turns a string literal into a fixed-size byte
-// array at compile time. Used by every KAT above. Inline so the
-// crate doesn't drag in `hex-literal`.
-// ============================================================================
-
-macro_rules! hex {
-    ($($s:literal)+) => {{
-        const HEX: &[u8] = concat!($($s),+).as_bytes();
-        const N: usize = HEX.len() / 2;
-        const fn nibble(b: u8) -> u8 {
-            match b {
-                b'0'..=b'9' => b - b'0',
-                b'a'..=b'f' => b - b'a' + 10,
-                b'A'..=b'F' => b - b'A' + 10,
-                _ => panic!("non-hex digit"),
-            }
-        }
-        const fn decode() -> [u8; N] {
-            let mut out = [0u8; N];
-            let mut i = 0;
-            while i < N {
-                out[i] = (nibble(HEX[2 * i]) << 4) | nibble(HEX[2 * i + 1]);
-                i += 1;
-            }
-            out
-        }
-        decode()
-    }};
-}
-use hex;

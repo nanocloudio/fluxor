@@ -1016,18 +1016,19 @@ struct PinnedFmod {
     pin_label: String,
 }
 
-/// `pin <reference> (<digest>)` for the `[[oci_module]]` entry covering
-/// `module_type` on `silicon` — the same label the manifest-side resolver
-/// quotes, so a broken artifact reports one identity from both halves.
-/// Degrades to the silicon alone when the lockfile can't be re-read.
+/// `pin <reference> (<digest>)` for the `[[artifact]]` module entry
+/// covering `module_type` on `silicon` — the same label the
+/// manifest-side resolver quotes, so a broken artifact reports one
+/// identity from both halves. Degrades to the silicon alone when the
+/// lockfile can't be re-read.
 fn pin_label(project_root: &Path, module_type: &str, silicon: &str) -> String {
-    let pin = crate::lockfile::read(project_root)
+    let pin = fluxor_tools::store_resolve::read_store_lock(project_root)
         .ok()
         .flatten()
         .and_then(|l| {
-            l.oci_modules
-                .into_iter()
-                .find(|m| m.name == module_type && m.target == silicon)
+            l.artifacts.into_iter().find(|a| {
+                a.kind == "module" && a.name == module_type && a.target.as_deref() == Some(silicon)
+            })
         });
     match pin {
         Some(p) => format!("pin {} ({})", p.reference, p.digest),
@@ -1044,7 +1045,7 @@ fn pinned_schema_error(module_type: &str, why: &str) -> crate::Error {
     ))
 }
 
-/// Resolve a module's `.fmod` path from the project's `[[oci_module]]` pins when
+/// Resolve a module's `.fmod` path from the project's `[[artifact]]` module pins when
 /// it is absent on disk. The pin silicon is `modules_dir`'s own parent, which
 /// holds in both artifact layouts (`target/fluxor/<silicon>/modules` and the
 /// `--out target` form `target/<silicon>/modules`). The project root comes from
@@ -1318,11 +1319,10 @@ mod tests {
         std::fs::write(project.path().join(".fluxor"), b"").expect("project marker");
         std::fs::write(
             project.path().join("fluxor.lock"),
-            "lockfile_version = 1\n\
-             generated_by = \"schema tests\"\n\
-             \n\
-             [[oci_module]]\n\
+            "[[artifact]]\n\
+             kind = \"module\"\n\
              name = \"pinned_conn\"\n\
+             project = \"local\"\n\
              target = \"bcm2712\"\n\
              digest = \"sha256:\
              0000000000000000000000000000000000000000000000000000000000000000\"\n\

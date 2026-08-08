@@ -1387,17 +1387,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "fluxor-mod-ip"
-version = "0.1.0"
+name = "fluxor-launcher"
+version = "0.0.1"
 dependencies = [
- "fluxor",
-]
-
-[[package]]
-name = "fluxor-mod-tls"
-version = "0.1.0"
-dependencies = [
- "fluxor",
+ "libc",
+ "serde_json",
 ]
 
 [[package]]

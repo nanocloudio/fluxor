@@ -22,14 +22,13 @@
 //!   permessage-deflate (full RFC 1951 / RFC 6455 / RFC 7692 / RFC 9220).
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
-#![no_main]
+#![cfg_attr(not(feature = "host-test"), no_main)]
 #![allow(
     dead_code,
     unused_imports,
     unreachable_patterns,
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
-
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
@@ -170,9 +169,9 @@ pub(crate) struct QuicState {
     /// connections; they are demuxed above it by connection id.
     endpoint: DatagramEndpoint,
     port: u16,
-    mode: u8,           // 0 = client, 1 = server
-    peer_ip: u32,       // client mode: peer IPv4 (LE)
-    peer_port: u16,     // client mode: peer port
+    mode: u8,       // 0 = client, 1 = server
+    peer_ip: u32,   // client mode: peer IPv4 (LE)
+    peer_port: u16, // client mode: peer port
     client_started: bool,
     cert: [u8; MAX_CERT_LEN],
     cert_len: usize,
@@ -524,10 +523,16 @@ fn qpack_huffman_self_check() -> bool {
     const CASES: &[(&[u8], &[u8])] = &[
         (&[0xc5, 0x83, 0x7f], b"GET"),
         (&[0x63], b"/"),
-        (&[0x60, 0xd5, 0x48, 0x5f, 0x2b, 0xce, 0x9a, 0x68], b"/index.html"),
+        (
+            &[0x60, 0xd5, 0x48, 0x5f, 0x2b, 0xce, 0x9a, 0x68],
+            b"/index.html",
+        ),
         (&[0xb9, 0x49, 0x53, 0x39, 0xe4], b":method"),
         (&[0xb9, 0x58, 0xd3, 0x3f], b":path"),
-        (&[0x9c, 0xb4, 0x50, 0x75, 0x3c, 0x1e, 0xca, 0x24], b"hello world"),
+        (
+            &[0x9c, 0xb4, 0x50, 0x75, 0x3c, 0x1e, 0xca, 0x24],
+            b"hello world",
+        ),
         (&[0x49, 0x7c, 0xa5, 0x8a, 0xe8, 0x19, 0xaa], b"text/plain"),
         (&[0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09], b"localhost"),
         (&[0xf0, 0x58, 0xd0, 0x72, 0x75, 0x2a, 0x7f], b"websocket"),
@@ -622,7 +627,12 @@ unsafe fn validate_retry_token(
     }
     // Recompute HMAC.
     let mut tag = [0u8; 32];
-    hmac(HashAlg::Sha256, &s.retry_secret, &token[..body_len], &mut tag);
+    hmac(
+        HashAlg::Sha256,
+        &s.retry_secret,
+        &token[..body_len],
+        &mut tag,
+    );
     let mut diff = 0u8;
     let mut i = 0;
     while i < 16 {
@@ -684,7 +694,11 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
             }
             match tag {
                 10 => {
-                    let n = if len < MAX_CERT_LEN { len } else { MAX_CERT_LEN };
+                    let n = if len < MAX_CERT_LEN {
+                        len
+                    } else {
+                        MAX_CERT_LEN
+                    };
                     core::ptr::copy_nonoverlapping(
                         data.as_ptr().add(start),
                         s.cert.as_mut_ptr(),
@@ -694,15 +708,15 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
                 }
                 11 => {
                     let n = if len < MAX_KEY_LEN { len } else { MAX_KEY_LEN };
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(start),
-                        s.key.as_mut_ptr(),
-                        n,
-                    );
+                    core::ptr::copy_nonoverlapping(data.as_ptr().add(start), s.key.as_mut_ptr(), n);
                     s.key_len = n;
                 }
                 12 => {
-                    let n = if len < MAX_CERT_LEN { len } else { MAX_CERT_LEN };
+                    let n = if len < MAX_CERT_LEN {
+                        len
+                    } else {
+                        MAX_CERT_LEN
+                    };
                     core::ptr::copy_nonoverlapping(
                         data.as_ptr().add(start),
                         s.trust_cert.as_mut_ptr(),
@@ -727,7 +741,11 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
                     // ALPN config list (RFC 7301): comma-separated raw
                     // tokens, e.g. `mqtt,h3`. Stored verbatim; selection
                     // splits on ',' at ClientHello time.
-                    let n = if len < MAX_ALPN_CFG { len } else { MAX_ALPN_CFG };
+                    let n = if len < MAX_ALPN_CFG {
+                        len
+                    } else {
+                        MAX_ALPN_CFG
+                    };
                     core::ptr::copy_nonoverlapping(
                         data.as_ptr().add(start),
                         s.alpn_cfg.as_mut_ptr(),
@@ -755,8 +773,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,
     // with backoff/retry. MSG_DG_BOUND is consumed in the recv loop below.
-    s.endpoint
-        .poll_bind(sys, s.net_out, s.port, s.net_scratch.as_mut_ptr(), NET_BUF_SIZE);
+    s.endpoint.poll_bind(
+        sys,
+        s.net_out,
+        s.port,
+        s.net_scratch.as_mut_ptr(),
+        NET_BUF_SIZE,
+    );
 
     // Client mode: kick off the handshake by allocating a connection,
     // queueing a ClientHello in driver.out_buf, and emitting the
@@ -854,7 +877,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         dcid_len = dl;
                                         dcid_buf[..dl].copy_from_slice(&peek[6..6 + dl]);
                                     }
-                                } else if 1 + 8 <= peek_len {
+                                } else if 8 < peek_len {
                                     dcid_len = 8;
                                     dcid_buf[..8].copy_from_slice(&peek[1..9]);
                                 }
@@ -898,8 +921,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // PATH_RESPONSE (§8.2.2 / §8.2.3).
                                 conn.recv_ip = ip;
                                 conn.recv_port = port;
-                                let take_peek =
-                                    if peek_len <= QUIC_DGRAM_MAX { peek_len } else { QUIC_DGRAM_MAX };
+                                let take_peek = if peek_len <= QUIC_DGRAM_MAX {
+                                    peek_len
+                                } else {
+                                    QUIC_DGRAM_MAX
+                                };
                                 conn.inbound[..take_peek].copy_from_slice(&peek[..take_peek]);
                                 let remain = dlen - peek_len;
                                 let want_remain = if remain + take_peek <= QUIC_DGRAM_MAX {
@@ -982,8 +1008,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let now_ms_top = dev_millis(sys);
     let mut i = 0;
     while i < MAX_CONNS {
-        if s.conns[i].phase == ConnPhase::Handshaking
-            || s.conns[i].phase == ConnPhase::Established
+        if s.conns[i].phase == ConnPhase::Handshaking || s.conns[i].phase == ConnPhase::Established
         {
             quic_pto_check(s, i);
             // Silently close on `idle_timeout_ms` of no activity
@@ -1075,10 +1100,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // CRYPTO frame into the client-side ticket cache.
     let mut i = 0;
     while i < MAX_CONNS {
-        if !s.conns[i].is_server
-            && s.conns[i].session_ticket_handled
-            && s.conns[i].psk_len > 0
-        {
+        if !s.conns[i].is_server && s.conns[i].session_ticket_handled && s.conns[i].psk_len > 0 {
             let psk_id_len = s.conns[i].psk_identity_len as usize;
             let mut already = false;
             let mut t = 0;
@@ -1110,9 +1132,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             lifetime_s: 7200,
                         };
                         let n = psk_id_len.min(entry.ticket.len());
-                        entry.ticket[..n].copy_from_slice(
-                            &s.conns[i].psk_identity[..n],
-                        );
+                        entry.ticket[..n].copy_from_slice(&s.conns[i].psk_identity[..n]);
                         let pl = s.conns[i].psk_len as usize;
                         entry.rms[..pl].copy_from_slice(&s.conns[i].psk[..pl]);
                         s.client_tickets[t] = entry;
@@ -1235,9 +1255,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // the app owns the protocol on the stream either way.
             let raw_alpn = (!s.conns[i].use_h3 && s.conns[i].alpn_selected_len > 0)
                 || (s.conns[i].use_h3 && s.h3_app != 0);
-            let raw_fin_pending = raw_alpn
-                && s.conns[i].stream_recv_fin
-                && !s.conns[i].raw_stream_close_sent;
+            let raw_fin_pending =
+                raw_alpn && s.conns[i].stream_recv_fin && !s.conns[i].raw_stream_close_sent;
             if s.conns[i].stream_recv_buf_len > 0 || raw_fin_pending {
                 let n = s.conns[i].stream_recv_buf_len;
                 if s.conns[i].use_h3 && s.h3_app == 0 {
@@ -1265,7 +1284,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let mut log_buf = [0u8; 96];
                     let prefix = b"[quic] stream rx=";
                     let mut p = 0;
-                    for &c in prefix { log_buf[p] = c; p += 1; }
+                    for &c in prefix {
+                        log_buf[p] = c;
+                        p += 1;
+                    }
                     let copy_n = n.min(log_buf.len() - p);
                     core::ptr::copy_nonoverlapping(
                         s.conns[i].stream_recv_buf.as_ptr(),
@@ -1282,7 +1304,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let to_copy = n.min(space);
                         core::ptr::copy_nonoverlapping(
                             conn.stream_recv_buf.as_ptr(),
-                            conn.stream_send_buf.as_mut_ptr().add(conn.stream_send_buf_len),
+                            conn.stream_send_buf
+                                .as_mut_ptr()
+                                .add(conn.stream_send_buf_len),
                             to_copy,
                         );
                         conn.stream_send_buf_len += to_copy;
@@ -1317,11 +1341,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let msg = b"hello quic stream";
                 let n = msg.len();
                 let conn = &mut s.conns[i];
-                core::ptr::copy_nonoverlapping(
-                    msg.as_ptr(),
-                    conn.stream_send_buf.as_mut_ptr(),
-                    n,
-                );
+                core::ptr::copy_nonoverlapping(msg.as_ptr(), conn.stream_send_buf.as_mut_ptr(), n);
                 conn.stream_send_buf_len = n;
                 conn.test_sent = true;
             }
@@ -1366,7 +1386,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let dn = s.conns[i].dgram_rx_len;
                 let mut data = [0u8; QUIC_MAX_DATAGRAM_SIZE];
                 core::ptr::copy_nonoverlapping(s.conns[i].dgram_rx.as_ptr(), data.as_mut_ptr(), dn);
-                if mux_emit(sys, s.app_out, mux::MSG_MUX_DATAGRAM_RX, i as u32, None, &data[..dn]) {
+                if mux_emit(
+                    sys,
+                    s.app_out,
+                    mux::MSG_MUX_DATAGRAM_RX,
+                    i as u32,
+                    None,
+                    &data[..dn],
+                ) {
                     s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(dn as u32);
                 }
                 s.conns[i].dgram_rx_pending = false;
@@ -1384,20 +1411,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // the app blocks.) A transparent module (no ALPN) reads app_in
             // as a raw byte stream into the current connection.
             if s.app_in >= 0 && s.alpn_cfg_len > 0 {
-                if !app_in_read_done
-                    && drained_for_app_in(s)
-                    && {
-                        let p = (sys.channel_poll)(s.app_in, POLL_IN);
-                        p > 0 && (p as u32 & POLL_IN) != 0
-                    }
-                {
+                if !app_in_read_done && drained_for_app_in(s) && {
+                    let p = (sys.channel_poll)(s.app_in, POLL_IN);
+                    p > 0 && (p as u32 & POLL_IN) != 0
+                } {
                     // Largest frame we accept on this surface. The
                     // alignment-preserving reader drains any payload beyond
                     // this so an oversize frame can neither desync the FIFO
                     // (its tail being mis-parsed as the next header) nor be
                     // silently truncated into the buffer.
-                    let mut buf =
-                        [0u8; NET_FRAME_HDR + mux::STREAM_DATA_PREFIX + mux::MUX_QUIC_STREAM_SEND_MAX];
+                    let mut buf = [0u8; NET_FRAME_HDR
+                        + mux::STREAM_DATA_PREFIX
+                        + mux::MUX_QUIC_STREAM_SEND_MAX];
                     let (mt, plen, full_plen) =
                         net_read_frame_aligned(sys, s.app_in, buf.as_mut_ptr(), buf.len());
                     app_in_read_done = true;
@@ -1416,9 +1441,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // command as "not honoured" because the only app
                             // surface was a single pre-opened stream; an h3
                             // client needs one per request.
-                            let cid =
-                                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
-                                    as usize;
+                            let cid = u32::from_le_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]) as usize;
                             let flags = if plen > mux::SESSION_ID_BYTES {
                                 payload[mux::SESSION_ID_BYTES]
                             } else {
@@ -1440,32 +1465,36 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 Some(sid),
                                 &body,
                             );
-                        } else if mt == mux::CMD_MUX_STREAM_CLOSE && plen >= mux::STREAM_DATA_PREFIX {
+                        } else if mt == mux::CMD_MUX_STREAM_CLOSE && plen >= mux::STREAM_DATA_PREFIX
+                        {
                             // The app has finished a response and the stream
                             // owes its FIN. An HTTP/3 response ENDS the stream;
                             // without the FIN a client keeps waiting for more
                             // body until its idle timeout — the response is
                             // correct, just never terminated, so a test that
                             // tolerates the wait still passes.
-                            let cid =
-                                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
-                                    as usize;
-                            let stream_id =
-                                u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                            let cid = u32::from_le_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]) as usize;
+                            let stream_id = u32::from_le_bytes([
+                                payload[4], payload[5], payload[6], payload[7],
+                            ]);
                             if cid < MAX_CONNS && s.conns[cid].use_h3 && s.h3_app != 0 {
                                 h3_app_fin_stream(s, cid, stream_id);
                             }
-                        } else if mt == mux::CMD_MUX_STREAM_SEND && plen >= mux::STREAM_DATA_PREFIX {
-                            let cid =
-                                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
-                                    as usize;
+                        } else if mt == mux::CMD_MUX_STREAM_SEND && plen >= mux::STREAM_DATA_PREFIX
+                        {
+                            let cid = u32::from_le_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]) as usize;
                             // QUIC v1 constrained profile (see
                             // contracts/net/mux.rs): the single application
                             // stream is the client-initiated bidi stream 0. A
                             // non-zero stream_id is REJECTED, never silently
                             // remapped onto stream 0.
-                            let stream_id =
-                                u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                            let stream_id = u32::from_le_bytes([
+                                payload[4], payload[5], payload[6], payload[7],
+                            ]);
                             let data = &payload[mux::STREAM_DATA_PREFIX..];
                             // Gate on the ADDRESSED connection's negotiated
                             // profile: only a raw, non-h3 ALPN connection
@@ -1480,9 +1509,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // legacy raw profile this is genuinely multi-stream
                             // — HTTP/3 multiplexes, and answering request 4 on
                             // stream 0 would corrupt both.
-                            let h3_mux = cid < MAX_CONNS
-                                && s.conns[cid].use_h3
-                                && s.h3_app != 0;
+                            let h3_mux = cid < MAX_CONNS && s.conns[cid].use_h3 && s.h3_app != 0;
                             if h3_mux {
                                 if !h3_app_stage_send(s, cid, stream_id, data) {
                                     let m = b"[quic] h3 mux send - no such stream";
@@ -1519,10 +1546,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     dev_log(sys, 2, m.as_ptr(), m.len());
                                 }
                             }
-                        } else if mt == mux::CMD_MUX_DATAGRAM_SEND && plen >= mux::SESSION_ID_BYTES {
-                            let cid =
-                                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
-                                    as usize;
+                        } else if mt == mux::CMD_MUX_DATAGRAM_SEND && plen >= mux::SESSION_ID_BYTES
+                        {
+                            let cid = u32::from_le_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]) as usize;
                             let data = &payload[mux::SESSION_ID_BYTES..];
                             // Same per-connection profile gate as stream send.
                             let raw_mux = cid < MAX_CONNS
@@ -1876,7 +1904,9 @@ unsafe fn h3_app_stage_send(s: &mut QuicState, cid: usize, stream_id: u32, data:
         }
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
-            conn.stream_send_buf.as_mut_ptr().add(conn.stream_send_buf_len),
+            conn.stream_send_buf
+                .as_mut_ptr()
+                .add(conn.stream_send_buf_len),
             data.len(),
         );
         conn.stream_send_buf_len += data.len();
@@ -1926,7 +1956,6 @@ unsafe fn h3_app_stage_send(s: &mut QuicState, cid: usize, stream_id: u32, data:
     false
 }
 
-
 /// Forward inbound stream bytes to the raw bidi-stream app surface
 /// (piece 2) as length-prefixed mux frames: a one-shot
 /// MSG_MUX_STREAM_ACCEPTED for the peer-opened bidi stream (id 0), a
@@ -1960,8 +1989,19 @@ unsafe fn raw_stream_forward_to_app(s: &mut QuicState, idx: usize, n: usize) -> 
     if n > 0 {
         let mut data = [0u8; MUX_DATA_MAX];
         let cn = n.min(data.len());
-        core::ptr::copy_nonoverlapping(s.conns[idx].stream_recv_buf.as_ptr(), data.as_mut_ptr(), cn);
-        if !mux_emit(sys, s.app_out, mux::MSG_MUX_STREAM_RX, session, Some(stream), &data[..cn]) {
+        core::ptr::copy_nonoverlapping(
+            s.conns[idx].stream_recv_buf.as_ptr(),
+            data.as_mut_ptr(),
+            cn,
+        );
+        if !mux_emit(
+            sys,
+            s.app_out,
+            mux::MSG_MUX_STREAM_RX,
+            session,
+            Some(stream),
+            &data[..cn],
+        ) {
             return false; // retain + retry (data not yet delivered)
         }
         s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(cn as u32);
@@ -2229,11 +2269,7 @@ unsafe fn find_conn_by_dcid(s: &QuicState, dcid: &[u8]) -> i32 {
     -1
 }
 
-unsafe fn alloc_server_connection(
-    s: &mut QuicState,
-    ip: &[u8; 4],
-    port: u16,
-) -> Option<usize> {
+unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
     // Snapshot the sampling rate before borrowing a connection slot mutably.
     let permille = s.sample_permille;
     let mut i = 0;
@@ -2292,11 +2328,7 @@ unsafe fn alloc_server_connection(
 /// Looks up the cached ticket for `(ip, port)`, copies the PSK +
 /// identity into the new conn, and stages a 0-RTT payload for
 /// emission as soon as the early-traffic keys are installed.
-unsafe fn alloc_resumption_connection(
-    s: &mut QuicState,
-    ip: &[u8; 4],
-    port: u16,
-) -> Option<usize> {
+unsafe fn alloc_resumption_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
     // Find the matching client_ticket entry.
     let mut tix = MAX_TICKETS;
     let mut t = 0;
@@ -2337,11 +2369,7 @@ unsafe fn alloc_resumption_connection(
             conn.original_dcid_len = 8;
             // Install Initial keys from the original DCID.
             let mut dcid_copy = [0u8; MAX_CID_LEN];
-            core::ptr::copy_nonoverlapping(
-                conn.peer_cid.as_ptr(),
-                dcid_copy.as_mut_ptr(),
-                8,
-            );
+            core::ptr::copy_nonoverlapping(conn.peer_cid.as_ptr(), dcid_copy.as_mut_ptr(), 8);
             install_initial_keys(conn, &dcid_copy[..8]);
             // Install the PSK + identity from the ticket entry.
             let pl = entry.rms_len as usize;
@@ -2366,11 +2394,7 @@ unsafe fn alloc_resumption_connection(
     None
 }
 
-unsafe fn alloc_client_connection(
-    s: &mut QuicState,
-    ip: &[u8; 4],
-    port: u16,
-) -> Option<usize> {
+unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
     let mut i = 0;
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Idle {
@@ -2402,11 +2426,7 @@ unsafe fn alloc_client_connection(
             // a slice to a function that also takes &mut conn.
             let mut dcid_copy = [0u8; MAX_CID_LEN];
             let n = conn.peer_cid_len as usize;
-            core::ptr::copy_nonoverlapping(
-                conn.peer_cid.as_ptr(),
-                dcid_copy.as_mut_ptr(),
-                n,
-            );
+            core::ptr::copy_nonoverlapping(conn.peer_cid.as_ptr(), dcid_copy.as_mut_ptr(), n);
             install_initial_keys(conn, &dcid_copy[..n]);
 
             conn.driver.ecdh_private = s.eph_private[i];
@@ -2430,34 +2450,33 @@ unsafe fn alloc_client_connection(
 ///   - control stream: type 0x00 + SETTINGS frame
 ///   - QPACK encoder stream: type 0x02 (no instructions)
 ///   - QPACK decoder stream: type 0x03 (no instructions)
-/// Stream IDs follow the QUIC initiator-direction encoding (RFC 9000
-/// §2.1): server uni = 3, 7, 11; client uni = 2, 6, 10.
+///     Stream IDs follow the QUIC initiator-direction encoding (RFC 9000
+///     §2.1): server uni = 3, 7, 11; client uni = 2, 6, 10.
 unsafe fn h3_open_uni_streams(s: &mut QuicState, idx: usize) {
     if s.conns[idx].h3_uni_streams_opened {
         return;
     }
     let is_server = s.conns[idx].is_server;
     // Allocate three slots: control / qpack-enc / qpack-dec.
-    let alloc_one =
-        |conn: &mut QuicConnection, role: H3StreamRole, type_byte: u64| -> bool {
-            let id = if is_server {
-                next_server_uni_id(conn.h3_next_uni_idx)
-            } else {
-                next_client_uni_id(conn.h3_next_uni_idx)
-            };
-            conn.h3_next_uni_idx = conn.h3_next_uni_idx.wrapping_add(1);
-            let slot_idx = match extra_alloc(conn, id, true) {
-                Some(i) => i,
-                None => return false,
-            };
-            conn.extra_streams[slot_idx].h3_role = role;
-            // Prime the type byte.
-            let mut tmp = [0u8; 4];
-            let n = varint_encode(tmp.as_mut_ptr(), tmp.len(), type_byte);
-            conn.extra_streams[slot_idx].send_buf[..n].copy_from_slice(&tmp[..n]);
-            conn.extra_streams[slot_idx].send_buf_len = n;
-            true
+    let alloc_one = |conn: &mut QuicConnection, role: H3StreamRole, type_byte: u64| -> bool {
+        let id = if is_server {
+            next_server_uni_id(conn.h3_next_uni_idx)
+        } else {
+            next_client_uni_id(conn.h3_next_uni_idx)
         };
+        conn.h3_next_uni_idx = conn.h3_next_uni_idx.wrapping_add(1);
+        let slot_idx = match extra_alloc(conn, id, true) {
+            Some(i) => i,
+            None => return false,
+        };
+        conn.extra_streams[slot_idx].h3_role = role;
+        // Prime the type byte.
+        let mut tmp = [0u8; 4];
+        let n = varint_encode(tmp.as_mut_ptr(), tmp.len(), type_byte);
+        conn.extra_streams[slot_idx].send_buf[..n].copy_from_slice(&tmp[..n]);
+        conn.extra_streams[slot_idx].send_buf_len = n;
+        true
+    };
     {
         let conn = &mut s.conns[idx];
         if !alloc_one(conn, H3StreamRole::Control, H3_UNI_TYPE_CONTROL) {
@@ -2559,10 +2578,7 @@ unsafe fn h3_pump_extra_streams(s: &mut QuicState, idx: usize) {
         // Classify by type byte if not already.
         if !s.conns[idx].extra_streams[k].h3_type_consumed {
             let slot = &s.conns[idx].extra_streams[k];
-            let (stype, n) = match varint_decode(
-                slot.recv_buf.as_ptr(),
-                slot.recv_buf_len,
-            ) {
+            let (stype, n) = match varint_decode(slot.recv_buf.as_ptr(), slot.recv_buf_len) {
                 Some(t) => t,
                 None => {
                     k += 1;
@@ -2664,14 +2680,20 @@ unsafe fn h3_drain_control_stream(s: &mut QuicState, idx: usize, slot_idx: usize
                     let mut log_buf = [0u8; 64];
                     let prefix = b"[quic] h3 GOAWAY id=";
                     let mut p = 0;
-                    while p < prefix.len() { log_buf[p] = prefix[p]; p += 1; }
+                    while p < prefix.len() {
+                        log_buf[p] = prefix[p];
+                        p += 1;
+                    }
                     // Truncate to u32 for log formatting — avoids
                     // pulling in __aeabi_uldivmod on thumbv8m for
                     // u64 division.
                     let mut v = id.min(u32::MAX as u64) as u32;
                     let mut tmp = [0u8; 12];
                     let mut t = 0;
-                    if v == 0 { tmp[0] = b'0'; t = 1; }
+                    if v == 0 {
+                        tmp[0] = b'0';
+                        t = 1;
+                    }
                     while v > 0 {
                         tmp[t] = b'0' + ((v % 10) as u8);
                         v /= 10;
@@ -2689,9 +2711,7 @@ unsafe fn h3_drain_control_stream(s: &mut QuicState, idx: usize, slot_idx: usize
             x if x == H3_FRAME_MAX_PUSH_ID => {
                 // Push not supported; accept the cap but no scheduling.
             }
-            x if x == H3_FRAME_PRIORITY_UPDATE_REQUEST
-                || x == H3_FRAME_PRIORITY_UPDATE_PUSH =>
-            {
+            x if x == H3_FRAME_PRIORITY_UPDATE_REQUEST || x == H3_FRAME_PRIORITY_UPDATE_PUSH => {
                 // RFC 9218 §7.2: parse + accept. We don't yet honor
                 // the urgency field for stream scheduling — the
                 // dispatcher emits in arrival order — but the frame
@@ -2701,11 +2721,17 @@ unsafe fn h3_drain_control_stream(s: &mut QuicState, idx: usize, slot_idx: usize
                     let mut log_buf = [0u8; 96];
                     let prefix = b"[quic] h3 PRIORITY_UPDATE id=";
                     let mut pos = 0;
-                    while pos < prefix.len() { log_buf[pos] = prefix[pos]; pos += 1; }
+                    while pos < prefix.len() {
+                        log_buf[pos] = prefix[pos];
+                        pos += 1;
+                    }
                     let mut v = p.prioritized_id.min(u32::MAX as u64) as u32;
                     let mut tmp = [0u8; 12];
                     let mut t = 0;
-                    if v == 0 { tmp[0] = b'0'; t = 1; }
+                    if v == 0 {
+                        tmp[0] = b'0';
+                        t = 1;
+                    }
                     while v > 0 {
                         tmp[t] = b'0' + ((v % 10) as u8);
                         v /= 10;
@@ -2779,30 +2805,31 @@ unsafe fn h3_handle_stream_recv(s: &mut QuicState, idx: usize) {
                     let h3_start = h3_span_start(s, idx);
                     h3_dispatch_request(s, idx, frame.payload);
                     emit_h3_request_span(s, idx, h3_start);
-                } else {
-                    if let Some(status) = h3_decode_status(frame.payload) {
-                        let mut log_buf = [0u8; 64];
-                        let prefix = b"[quic] h3 status=";
-                        let mut p = 0;
-                        for &c in prefix { log_buf[p] = c; p += 1; }
-                        let mut k = 0;
-                        while k < status.len() && status[k] != 0 && p < log_buf.len() {
-                            log_buf[p] = status[k];
-                            p += 1;
-                            k += 1;
-                        }
-                        dev_log(sys, 3, log_buf.as_ptr(), p);
-                        // RFC 9220: client transitions into WS mode
-                        // when its CONNECT request was accepted with
-                        // 200. We requested extended CONNECT iff the
-                        // module is in enable_ws mode.
-                        if s.enable_ws != 0
-                            && status[0] == b'2'
-                            && status[1] == b'0'
-                            && status[2] == b'0'
-                        {
-                            s.conns[idx].ws_mode = true;
-                        }
+                } else if let Some(status) = h3_decode_status(frame.payload) {
+                    let mut log_buf = [0u8; 64];
+                    let prefix = b"[quic] h3 status=";
+                    let mut p = 0;
+                    for &c in prefix {
+                        log_buf[p] = c;
+                        p += 1;
+                    }
+                    let mut k = 0;
+                    while k < status.len() && status[k] != 0 && p < log_buf.len() {
+                        log_buf[p] = status[k];
+                        p += 1;
+                        k += 1;
+                    }
+                    dev_log(sys, 3, log_buf.as_ptr(), p);
+                    // RFC 9220: client transitions into WS mode
+                    // when its CONNECT request was accepted with
+                    // 200. We requested extended CONNECT iff the
+                    // module is in enable_ws mode.
+                    if s.enable_ws != 0
+                        && status[0] == b'2'
+                        && status[1] == b'0'
+                        && status[2] == b'0'
+                    {
+                        s.conns[idx].ws_mode = true;
                     }
                 }
             }
@@ -2833,7 +2860,10 @@ unsafe fn h3_handle_stream_recv(s: &mut QuicState, idx: usize) {
                         b"[quic] h3 resp body="
                     };
                     let mut p = 0;
-                    for &c in prefix { log_buf[p] = c; p += 1; }
+                    for &c in prefix {
+                        log_buf[p] = c;
+                        p += 1;
+                    }
                     let copy_n = frame.payload.len().min(log_buf.len() - p);
                     core::ptr::copy_nonoverlapping(
                         frame.payload.as_ptr(),
@@ -2882,7 +2912,10 @@ unsafe fn h3_dispatch_post_complete(s: &mut QuicState, idx: usize) {
     let mut log_buf = [0u8; 96];
     let prefix = b"[quic] h3 POST body=";
     let mut p = 0;
-    while p < prefix.len() { log_buf[p] = prefix[p]; p += 1; }
+    while p < prefix.len() {
+        log_buf[p] = prefix[p];
+        p += 1;
+    }
     let copy_n = body_len.min(log_buf.len() - p);
     core::ptr::copy_nonoverlapping(
         s.conns[idx].h3_post_body.as_ptr(),
@@ -2897,7 +2930,7 @@ unsafe fn h3_dispatch_post_complete(s: &mut QuicState, idx: usize) {
     let mut k = 0;
     while k < body_len {
         let b = s.conns[idx].h3_post_body[k];
-        up[k] = if b >= b'a' && b <= b'z' { b - 32 } else { b };
+        up[k] = if b.is_ascii_lowercase() { b - 32 } else { b };
         k += 1;
     }
     let mut hdr_block = [0u8; 256];
@@ -2908,15 +2941,23 @@ unsafe fn h3_dispatch_post_complete(s: &mut QuicState, idx: usize) {
     let mut h3_buf = [0u8; 1500];
     let mut q = 0;
     let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[q..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     q += n;
-    if q + hdr_len > h3_buf.len() { return; }
+    if q + hdr_len > h3_buf.len() {
+        return;
+    }
     h3_buf[q..q + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
     q += hdr_len;
     let n = h3_build_frame_header(H3_FRAME_DATA, body_len, &mut h3_buf[q..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     q += n;
-    if q + body_len > h3_buf.len() { return; }
+    if q + body_len > h3_buf.len() {
+        return;
+    }
     h3_buf[q..q + body_len].copy_from_slice(&up[..body_len]);
     q += body_len;
     let conn = &mut s.conns[idx];
@@ -2924,7 +2965,9 @@ unsafe fn h3_dispatch_post_complete(s: &mut QuicState, idx: usize) {
     let to_copy = q.min(space);
     core::ptr::copy_nonoverlapping(
         h3_buf.as_ptr(),
-        conn.stream_send_buf.as_mut_ptr().add(conn.stream_send_buf_len),
+        conn.stream_send_buf
+            .as_mut_ptr()
+            .add(conn.stream_send_buf_len),
         to_copy,
     );
     conn.stream_send_buf_len += to_copy;
@@ -2953,12 +2996,16 @@ unsafe fn h3_dispatch_request_bidi(
     let mut log_buf = [0u8; 96];
     let prefix = b"[quic] h3 dispatch ";
     let mut p = 0;
-    for &c in prefix { log_buf[p] = c; p += 1; }
+    for &c in prefix {
+        log_buf[p] = c;
+        p += 1;
+    }
     let n = path_bytes.len().min(log_buf.len() - p);
     core::ptr::copy_nonoverlapping(path_bytes.as_ptr(), log_buf.as_mut_ptr().add(p), n);
     p += n;
     if p + 4 <= log_buf.len() {
-        log_buf[p] = b' '; p += 1;
+        log_buf[p] = b' ';
+        p += 1;
         let mut k = 0;
         while k < status.len() && p < log_buf.len() {
             log_buf[p] = status[k];
@@ -2976,15 +3023,23 @@ unsafe fn h3_dispatch_request_bidi(
     let mut h3_buf = [0u8; 1024];
     let mut p = 0;
     let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     p += n;
-    if p + hdr_len > h3_buf.len() { return; }
+    if p + hdr_len > h3_buf.len() {
+        return;
+    }
     h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
     p += hdr_len;
     let n = h3_build_frame_header(H3_FRAME_DATA, body.len(), &mut h3_buf[p..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     p += n;
-    if p + body.len() > h3_buf.len() { return; }
+    if p + body.len() > h3_buf.len() {
+        return;
+    }
     h3_buf[p..p + body.len()].copy_from_slice(body);
     p += body.len();
 
@@ -3009,10 +3064,15 @@ unsafe fn h3_dispatch_post_complete_bidi(s: &mut QuicState, idx: usize, slot_idx
     let mut log_buf = [0u8; 96];
     let prefix = b"[quic] h3 POST body=";
     let mut p = 0;
-    while p < prefix.len() { log_buf[p] = prefix[p]; p += 1; }
+    while p < prefix.len() {
+        log_buf[p] = prefix[p];
+        p += 1;
+    }
     let copy_n = body_len.min(log_buf.len() - p);
     core::ptr::copy_nonoverlapping(
-        s.conns[idx].bidi_extra_streams[slot_idx].h3_post_body.as_ptr(),
+        s.conns[idx].bidi_extra_streams[slot_idx]
+            .h3_post_body
+            .as_ptr(),
         log_buf.as_mut_ptr().add(p),
         copy_n,
     );
@@ -3023,24 +3083,34 @@ unsafe fn h3_dispatch_post_complete_bidi(s: &mut QuicState, idx: usize, slot_idx
     let mut k = 0;
     while k < body_len {
         let b = s.conns[idx].bidi_extra_streams[slot_idx].h3_post_body[k];
-        up[k] = if b >= b'a' && b <= b'z' { b - 32 } else { b };
+        up[k] = if b.is_ascii_lowercase() { b - 32 } else { b };
         k += 1;
     }
     let mut hdr_block = [0u8; 256];
     let hdr_len = h3_encode_response_headers(b"200", b"text/plain", body_len, &mut hdr_block);
-    if hdr_len == 0 { return; }
+    if hdr_len == 0 {
+        return;
+    }
     let mut h3_buf = [0u8; 1500];
     let mut q = 0;
     let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[q..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     q += n;
-    if q + hdr_len > h3_buf.len() { return; }
+    if q + hdr_len > h3_buf.len() {
+        return;
+    }
     h3_buf[q..q + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
     q += hdr_len;
     let n = h3_build_frame_header(H3_FRAME_DATA, body_len, &mut h3_buf[q..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     q += n;
-    if q + body_len > h3_buf.len() { return; }
+    if q + body_len > h3_buf.len() {
+        return;
+    }
     h3_buf[q..q + body_len].copy_from_slice(&up[..body_len]);
     q += body_len;
     let slot = &mut s.conns[idx].bidi_extra_streams[slot_idx];
@@ -3132,7 +3202,10 @@ unsafe fn h3_handle_bidi_extra_recv(s: &mut QuicState, idx: usize) {
                             let mut log_buf = [0u8; 64];
                             let prefix = b"[quic] h3 status=";
                             let mut p = 0;
-                            for &c in prefix { log_buf[p] = c; p += 1; }
+                            for &c in prefix {
+                                log_buf[p] = c;
+                                p += 1;
+                            }
                             let mut j = 0;
                             while j < status.len() && status[j] != 0 && p < log_buf.len() {
                                 log_buf[p] = status[j];
@@ -3166,7 +3239,10 @@ unsafe fn h3_handle_bidi_extra_recv(s: &mut QuicState, idx: usize) {
                             b"[quic] h3 resp body="
                         };
                         let mut p = 0;
-                        for &c in prefix { log_buf[p] = c; p += 1; }
+                        for &c in prefix {
+                            log_buf[p] = c;
+                            p += 1;
+                        }
                         let copy_n = frame.payload.len().min(log_buf.len() - p);
                         core::ptr::copy_nonoverlapping(
                             frame.payload.as_ptr(),
@@ -3185,7 +3261,10 @@ unsafe fn h3_handle_bidi_extra_recv(s: &mut QuicState, idx: usize) {
         let remain = take - cursor;
         if remain > 0 {
             core::ptr::copy(
-                s.conns[idx].bidi_extra_streams[k].recv_buf.as_ptr().add(cursor),
+                s.conns[idx].bidi_extra_streams[k]
+                    .recv_buf
+                    .as_ptr()
+                    .add(cursor),
                 s.conns[idx].bidi_extra_streams[k].recv_buf.as_mut_ptr(),
                 remain,
             );
@@ -3306,7 +3385,9 @@ unsafe fn h3_ws_recv(s: &mut QuicState, idx: usize, data: &[u8]) {
                 // Stream-validate as bytes arrive. On FIN we'll also
                 // require the validator to be at a codepoint boundary.
                 if conn.ws_msg_opcode == WS_OPCODE_TEXT {
-                    let mut st = Utf8State { state: conn.ws_utf8_state };
+                    let mut st = Utf8State {
+                        state: conn.ws_utf8_state,
+                    };
                     let ok = st.feed(&conn.ws_msg_buf[conn.ws_msg_len..conn.ws_msg_len + n]);
                     conn.ws_utf8_state = st.state;
                     if !ok {
@@ -3328,9 +3409,7 @@ unsafe fn h3_ws_recv(s: &mut QuicState, idx: usize, data: &[u8]) {
                 }
                 // FIN — full message ready. For TEXT, require the
                 // UTF-8 state machine at an accept boundary.
-                if conn.ws_msg_opcode == WS_OPCODE_TEXT
-                    && conn.ws_utf8_state != UTF8_ACCEPT
-                {
+                if conn.ws_msg_opcode == WS_OPCODE_TEXT && conn.ws_utf8_state != UTF8_ACCEPT {
                     let msgb = b"[quic] h3-ws UTF-8 truncated (close 1007)";
                     dev_log(sys, 2, msgb.as_ptr(), msgb.len());
                     let close_payload = [0x03, 0xEFu8];
@@ -3357,7 +3436,10 @@ unsafe fn h3_ws_recv(s: &mut QuicState, idx: usize, data: &[u8]) {
                     b"[quic] h3-ws client rx="
                 };
                 let mut p = 0;
-                for &c in prefix { log_buf[p] = c; p += 1; }
+                for &c in prefix {
+                    log_buf[p] = c;
+                    p += 1;
+                }
                 let copy_n = msg_len.min(log_buf.len() - p);
                 core::ptr::copy_nonoverlapping(
                     snapshot.as_ptr(),
@@ -3371,11 +3453,7 @@ unsafe fn h3_ws_recv(s: &mut QuicState, idx: usize, data: &[u8]) {
                     let mut k = 0;
                     while k < msg_len {
                         let b = snapshot[k];
-                        up[k] = if b >= b'a' && b <= b'z' {
-                            b - 32
-                        } else {
-                            b
-                        };
+                        up[k] = if b.is_ascii_lowercase() { b - 32 } else { b };
                         k += 1;
                     }
                     h3_ws_send(s, idx, msg_op, &up[..msg_len]);
@@ -3429,7 +3507,9 @@ unsafe fn h3_ws_send(s: &mut QuicState, idx: usize, opcode: u8, payload: &[u8]) 
     let to_copy = p.min(space);
     core::ptr::copy_nonoverlapping(
         h3_buf.as_ptr(),
-        conn.stream_send_buf.as_mut_ptr().add(conn.stream_send_buf_len),
+        conn.stream_send_buf
+            .as_mut_ptr()
+            .add(conn.stream_send_buf_len),
         to_copy,
     );
     conn.stream_send_buf_len += to_copy;
@@ -3475,7 +3555,9 @@ unsafe fn h3_dispatch_request(s: &mut QuicState, idx: usize, headers_block: &[u8
         let mut h3_buf = [0u8; 256];
         let mut p = 0;
         let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         p += n;
         h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
         p += hdr_len;
@@ -3484,7 +3566,9 @@ unsafe fn h3_dispatch_request(s: &mut QuicState, idx: usize, headers_block: &[u8
         let to_copy = p.min(space);
         core::ptr::copy_nonoverlapping(
             h3_buf.as_ptr(),
-            conn.stream_send_buf.as_mut_ptr().add(conn.stream_send_buf_len),
+            conn.stream_send_buf
+                .as_mut_ptr()
+                .add(conn.stream_send_buf_len),
             to_copy,
         );
         conn.stream_send_buf_len += to_copy;
@@ -3518,12 +3602,16 @@ unsafe fn h3_dispatch_request(s: &mut QuicState, idx: usize, headers_block: &[u8
     let mut log_buf = [0u8; 96];
     let prefix = b"[quic] h3 dispatch ";
     let mut p = 0;
-    for &c in prefix { log_buf[p] = c; p += 1; }
+    for &c in prefix {
+        log_buf[p] = c;
+        p += 1;
+    }
     let n = path_bytes.len().min(log_buf.len() - p);
     core::ptr::copy_nonoverlapping(path_bytes.as_ptr(), log_buf.as_mut_ptr().add(p), n);
     p += n;
     if p + 4 <= log_buf.len() {
-        log_buf[p] = b' '; p += 1;
+        log_buf[p] = b' ';
+        p += 1;
         let mut k = 0;
         while k < status.len() && p < log_buf.len() {
             log_buf[p] = status[k];
@@ -3543,22 +3631,32 @@ unsafe fn h3_dispatch_request(s: &mut QuicState, idx: usize, headers_block: &[u8
     let mut h3_buf = [0u8; 1024];
     let mut p = 0;
     let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     p += n;
-    if p + hdr_len > h3_buf.len() { return; }
+    if p + hdr_len > h3_buf.len() {
+        return;
+    }
     h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
     p += hdr_len;
     let n = h3_build_frame_header(H3_FRAME_DATA, body.len(), &mut h3_buf[p..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     p += n;
-    if p + body.len() > h3_buf.len() { return; }
+    if p + body.len() > h3_buf.len() {
+        return;
+    }
     h3_buf[p..p + body.len()].copy_from_slice(body);
     p += body.len();
     let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
     let to_copy = p.min(space);
     core::ptr::copy_nonoverlapping(
         h3_buf.as_ptr(),
-        conn.stream_send_buf.as_mut_ptr().add(conn.stream_send_buf_len),
+        conn.stream_send_buf
+            .as_mut_ptr()
+            .add(conn.stream_send_buf_len),
         to_copy,
     );
     conn.stream_send_buf_len += to_copy;
@@ -3587,9 +3685,13 @@ unsafe fn h3_emit_client_request(s: &mut QuicState, idx: usize) {
     let mut h3_buf = [0u8; 512];
     let mut p = 0;
     let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     p += n;
-    if p + hdr_len > h3_buf.len() { return; }
+    if p + hdr_len > h3_buf.len() {
+        return;
+    }
     h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
     p += hdr_len;
     let conn = &mut s.conns[idx];
@@ -3597,7 +3699,9 @@ unsafe fn h3_emit_client_request(s: &mut QuicState, idx: usize) {
     let to_copy = p.min(space);
     core::ptr::copy_nonoverlapping(
         h3_buf.as_ptr(),
-        conn.stream_send_buf.as_mut_ptr().add(conn.stream_send_buf_len),
+        conn.stream_send_buf
+            .as_mut_ptr()
+            .add(conn.stream_send_buf_len),
         to_copy,
     );
     conn.stream_send_buf_len += to_copy;
@@ -3620,9 +3724,13 @@ unsafe fn h3_emit_concurrent_bidi_request(s: &mut QuicState, idx: usize) {
     let mut h3_buf = [0u8; 512];
     let mut p = 0;
     let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     p += n;
-    if p + hdr_len > h3_buf.len() { return; }
+    if p + hdr_len > h3_buf.len() {
+        return;
+    }
     h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
     p += hdr_len;
 
@@ -3644,7 +3752,9 @@ fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
     }
     let mut i = 0;
     while i < a.len() {
-        if a[i] != b[i] { return false; }
+        if a[i] != b[i] {
+            return false;
+        }
         i += 1;
     }
     true
@@ -3801,8 +3911,8 @@ pub mod test_helpers {
 
     /// Run the real ALPN selection (RFC 7301 §3.2) over a configured list
     /// + a client-offered ProtocolNameList, copying the negotiated token
-    /// into `out` and returning its length (0 = none). Wraps the
-    /// module-internal `select_alpn`.
+    ///   into `out` and returning its length (0 = none). Wraps the
+    ///   module-internal `select_alpn`.
     ///
     /// # Safety
     /// `out` is valid for `cap` bytes.
@@ -3849,7 +3959,10 @@ pub mod test_helpers {
         conn.phase = ConnPhase::Established;
         conn.is_server = is_server;
         conn.handshake_confirmed = true;
-        conn.peer = PeerAddr { ip: peer_ip, port: peer_port };
+        conn.peer = PeerAddr {
+            ip: peer_ip,
+            port: peer_port,
+        };
         conn.our_cid_len = 8;
         conn.our_cid[..8].copy_from_slice(&[0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8]);
         conn.peer_cid_len = 8;
@@ -3922,7 +4035,13 @@ pub mod test_helpers {
         s.conns[idx].recv_ip = src_ip;
         s.conns[idx].recv_port = src_port;
         let mut non_probing = false;
-        super::process_frames(&mut s.conns[idx], EncLevel::OneRtt, payload, 1, &mut non_probing);
+        super::process_frames(
+            &mut s.conns[idx],
+            EncLevel::OneRtt,
+            payload,
+            1,
+            &mut non_probing,
+        );
         super::arm_migration_if_new_path(
             &mut s.conns[idx],
             &*s.syscalls,

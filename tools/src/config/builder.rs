@@ -2188,7 +2188,7 @@ fn build_module_entry(
     validate_heap_subtree(module, type_name)?;
 
     // PIC modules embed their schema in the `.fmod`; built-ins declare
-    // it in `modules/builtin/<platform>/<name>/manifest.toml`. Both
+    // it in `modules/platform/<platform>/<name>/manifest.toml`. Both
     // paths produce a `ParamSchema` and feed the same TLV packer, so
     // the wire format is identical at the kernel boundary.
     //

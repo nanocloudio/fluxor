@@ -187,6 +187,12 @@ pub struct Utf8State {
     pub state: u32,
 }
 
+impl Default for Utf8State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Utf8State {
     pub const fn new() -> Self {
         Self { state: UTF8_ACCEPT }

@@ -31,6 +31,7 @@ use syn::{Attribute, ItemMod, Meta};
 pub enum Rule {
     InlineTests,
     AllowWithoutReason,
+    ModuleStructure,
 }
 
 impl Rule {
@@ -38,6 +39,7 @@ impl Rule {
         match self {
             Rule::InlineTests => "inline-tests",
             Rule::AllowWithoutReason => "allow-without-reason",
+            Rule::ModuleStructure => "module-structure",
         }
     }
 
@@ -45,6 +47,7 @@ impl Rule {
         match s {
             "inline-tests" => Some(Rule::InlineTests),
             "allow-without-reason" => Some(Rule::AllowWithoutReason),
+            "module-structure" => Some(Rule::ModuleStructure),
             _ => None,
         }
     }
@@ -319,6 +322,13 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         }
     }
 
+    scan_module_structure(
+        project_root,
+        &mut report,
+        &exempt_lookup,
+        &mut exempt_applied,
+    );
+
     // Stale check pass 3: exemption rows that match an existing file
     // whose scan produced no violation under the named rule.
     for key in &exempt_lookup {
@@ -347,6 +357,165 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     });
 
     Ok(report)
+}
+
+/// Structure rules for the `modules/` tree (standards/fluxor-modules.md
+/// §1–§3, §7): a module is a directory, never a crate; tier placement
+/// must agree with the manifest; in-module `tests/` must be declared.
+/// `modules/sdk/` is the staged-source contract, not a module tree —
+/// exempt. All findings report under `Rule::ModuleStructure`.
+fn scan_module_structure(
+    project_root: &Path,
+    report: &mut Report,
+    exempt_lookup: &HashSet<(PathBuf, Rule)>,
+    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
+) {
+    let modules_root = project_root.join("modules");
+    if !modules_root.is_dir() {
+        return;
+    }
+    let mut push = |rel: PathBuf, message: String, report: &mut Report| {
+        let key = (rel.clone(), Rule::ModuleStructure);
+        if exempt_lookup.contains(&key) {
+            exempt_applied.insert(key);
+            return;
+        }
+        report.violations.push(Violation {
+            path: rel,
+            line: 0,
+            rule: Rule::ModuleStructure,
+            message,
+        });
+    };
+
+    for entry in walkdir::WalkDir::new(&modules_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            e.file_name() != "sdk" || e.path().parent() != Some(modules_root.as_path())
+        })
+        .filter_map(std::result::Result::ok)
+    {
+        let rel = match entry.path().strip_prefix(project_root) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy();
+
+        // Rule: no cargo build system anywhere under modules/**.
+        if entry.file_type().is_file() && (name == "Cargo.toml" || name == "Cargo.lock") {
+            push(
+                rel,
+                format!(
+                    "{name} under modules/ — a module is a directory, never a crate; \
+                     host tests go through `fluxor modules test` ([test] harness), not a shim crate"
+                ),
+                report,
+            );
+            continue;
+        }
+        if entry.file_type().is_dir() && name == "target" {
+            push(
+                rel,
+                "build-output directory under modules/ — stray cargo artefacts; delete it"
+                    .to_string(),
+                report,
+            );
+            continue;
+        }
+
+        // Module-directory rules key off manifest.toml presence.
+        if !(entry.file_type().is_file() && name == "manifest.toml") {
+            continue;
+        }
+        let module_dir = match entry.path().parent() {
+            Some(d) => d.to_path_buf(),
+            None => continue,
+        };
+        let module_rel = match module_dir.strip_prefix(project_root) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => continue,
+        };
+        let manifest = fs::read_to_string(entry.path()).unwrap_or_default();
+
+        // Entry file must exist (`entry = "..."` override, default
+        // mod.rs) — except for `builtin = true` manifests, which are
+        // declarations of kernel-side implementations and carry no
+        // module source of their own.
+        let is_builtin = manifest
+            .lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("builtin") && l.contains("true"));
+        let entry_file = manifest
+            .lines()
+            .find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("entry")
+                    .and_then(|r| r.trim().strip_prefix('='))
+                    .map(|v| v.trim().trim_matches('"').to_string())
+            })
+            .unwrap_or_else(|| "mod.rs".to_string());
+        if !is_builtin && !module_dir.join(&entry_file).is_file() {
+            push(
+                module_rel.clone(),
+                format!("module entry file `{entry_file}` missing"),
+                report,
+            );
+        }
+
+        // In-module tests/ requires a [test] declaration.
+        if module_dir.join("tests").is_dir() && !manifest.contains("[test]") {
+            push(
+                module_rel.clone(),
+                "undeclared tests/ directory — declare `[test] harness = \"tests/...\"` \
+                 (run by `fluxor modules test`) or relocate the tests"
+                    .to_string(),
+                report,
+            );
+        }
+
+        // Tier placement must agree with hardware_targets.
+        let targets_line = manifest
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("hardware_targets"))
+            .unwrap_or("")
+            .to_string();
+        let has = |t: &str| targets_line.contains(&format!("\"{t}\""));
+        let linux_only = has("linux") && !has("wasm");
+        let wasm_only = has("wasm") && !has("linux");
+        let module_rel_str = module_rel.to_string_lossy().replace('\\', "/");
+        if module_rel_str.starts_with("modules/platform/linux/") && !linux_only {
+            push(
+                module_rel.clone(),
+                format!(
+                    "platform/linux module must declare exactly hardware_targets = [\"linux\"] \
+                     (found: {targets_line})"
+                ),
+                report,
+            );
+        }
+        if module_rel_str.starts_with("modules/platform/wasm/") && !wasm_only {
+            push(
+                module_rel.clone(),
+                format!(
+                    "platform/wasm module must declare exactly hardware_targets = [\"wasm\"] \
+                     (found: {targets_line})"
+                ),
+                report,
+            );
+        }
+        if module_rel_str.starts_with("modules/drivers/") && (has("linux") || has("wasm")) {
+            push(
+                module_rel.clone(),
+                format!(
+                    "drivers/ modules are silicon-bound; a host platform in hardware_targets \
+                     belongs under platform/ (found: {targets_line})"
+                ),
+                report,
+            );
+        }
+    }
 }
 
 fn should_skip(entry: &walkdir::DirEntry) -> bool {

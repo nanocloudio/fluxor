@@ -1036,7 +1036,8 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
 
     // Synced fmods and the runtime binary live under `target/`, which
     // `cargo clean` wipes; refill lockfile-recorded holes before running.
-    crate::sync::ensure_materialized(&crate::project::root_for_config(config_path))?;
+    fluxor_tools::store_sync::ensure_synced(&crate::project::root_for_config(config_path))
+        .map_err(|e| Error::Config(e.to_string()))?;
 
     let result = build_one(config_path, None, verbose)?;
 
@@ -1419,7 +1420,7 @@ fn cmd_keygen(key_path: &PathBuf, force: bool) -> Result<()> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
     let pk = crypto::derive_public_key(&seed);
-    // stdout = JUST the pubkey hex, so `FLUXOR_SIGNING_PUBKEY_HEX=$(fluxor keygen …)` works.
+    // stdout = JUST the pubkey hex, so `FLUXOR_SIGNING_PUBKEY_HEX=$(fluxor modules keygen …)` works.
     let mut s = String::with_capacity(64);
     for &b in pk.iter() {
         s.push_str(&format!("{b:02x}"));
@@ -1954,5 +1955,82 @@ fn cmd_ci(skip: &[String], project_root: Option<&Path>, verbose: bool) -> Result
     if !ci::all_ok(&results) {
         std::process::exit(1);
     }
+    // Green FULL run: stamp the input digests it covered so `publish`
+    // can annotate `io.fluxor.ci-digest` on matching artifacts —
+    // information for `inspect`/promotion, never a gate. A run with
+    // any `--skip` flag proved less than the full gate, so it must
+    // not stamp (the ci-digest would claim coverage it doesn't have).
+    if skip.is_empty() {
+        match fluxor_tools::store_publish::write_ci_green_stamp(&project_root) {
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: could not write ci green stamp: {e}"),
+        }
+    }
     Ok(())
+}
+
+// ── Polymorphic `fluxor build` ───────────────────────────────────────
+
+/// Flag bundle for `fluxor build` — the absorbed
+/// generate/combine/slot-image/mktable-config/validate forms route to
+/// their original implementations unchanged (byte-identity by
+/// construction).
+struct BuildFlags {
+    output: Option<PathBuf>,
+    emit: Option<String>,
+    check: bool,
+    firmware: Option<PathBuf>,
+    modules_dir: Vec<PathBuf>,
+    target: Option<String>,
+    epoch: u64,
+}
+
+fn cmd_build_dispatch(path: &PathBuf, flags: BuildFlags, verbose: bool) -> Result<()> {
+    if flags.check {
+        if flags.emit.is_some() {
+            return Err(Error::Config(
+                "--check validates without building; drop --emit".into(),
+            ));
+        }
+        return cmd_validate(path, flags.target.as_deref());
+    }
+    let require_output = |what: &str| {
+        flags
+            .output
+            .clone()
+            .ok_or_else(|| Error::Config(format!("--emit={what} requires --output <FILE>")))
+    };
+    match flags.emit.as_deref() {
+        None => cmd_build(path, flags.output.as_deref(), verbose),
+        Some("uf2") => cmd_generate(
+            path,
+            flags.output.as_deref(),
+            flags.modules_dir.first().map(PathBuf::as_path),
+            false,
+        ),
+        Some("bin") => cmd_generate(
+            path,
+            flags.output.as_deref(),
+            flags.modules_dir.first().map(PathBuf::as_path),
+            true,
+        ),
+        Some("combined") => {
+            let firmware = flags.firmware.as_ref().ok_or_else(|| {
+                Error::Config("--emit=combined requires --firmware <UF2>".into())
+            })?;
+            let output = require_output("combined")?;
+            cmd_combine(firmware, path, &output, verbose)
+        }
+        Some("slot") => {
+            let output = require_output("slot")?;
+            cmd_slot_image(path, &output, flags.target.as_deref(), flags.epoch, verbose)
+        }
+        Some("table") => {
+            let output = require_output("table")?;
+            cmd_mktable_config(path, &flags.modules_dir, &output)
+        }
+        Some(other) => Err(Error::Config(format!(
+            "unknown --emit form '{other}' (expected uf2|bin|combined|slot|table)"
+        ))),
+    }
 }

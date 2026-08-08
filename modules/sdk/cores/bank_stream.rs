@@ -330,7 +330,7 @@ unsafe fn fs_open_index(s: &mut BankState, idx: u16) -> bool {
 /// Lowercase ASCII helper (case-insensitive extension match).
 #[inline(always)]
 fn to_lower(c: u8) -> u8 {
-    if (b'A'..=b'Z').contains(&c) {
+    if c.is_ascii_uppercase() {
         c + 32
     } else {
         c
@@ -453,12 +453,8 @@ unsafe fn finish_scan(s: &mut BankState) {
                 swap = true;
             }
             if swap {
-                let tmp_buf = s.paths[j];
-                s.paths[j] = s.paths[j + 1];
-                s.paths[j + 1] = tmp_buf;
-                let tmp_len = s.path_lens[j];
-                s.path_lens[j] = s.path_lens[j + 1];
-                s.path_lens[j + 1] = tmp_len;
+                s.paths.swap(j, j + 1);
+                s.path_lens.swap(j, j + 1);
             }
             j += 1;
         }
@@ -653,7 +649,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // the early-boot ring before DHCP came up. Same cadence +
         // format as `[fat32] hb`.
         s.tick_count = s.tick_count.wrapping_add(1);
-        if s.tick_count % 5000 == 0 {
+        if s.tick_count.is_multiple_of(5000) {
             let mut buf = [0u8; 96];
             let p = buf.as_mut_ptr();
             let pfx = b"[bank] hb phase=";
@@ -762,7 +758,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // stays 0. Without retry the player sits idle forever waiting
         // for a nav command that never comes. Retry every 500 ticks
         // (~50 ms at tick_us=100) until we get a real fd / path list.
-        if s.tick_count % 500 == 0 {
+        if s.tick_count.is_multiple_of(500) {
             // Dir-mode retry: re-scan the configured directory until
             // it returns at least one entry. `dir_scanned` is reset
             // here to force a fresh enumeration pass — the prior

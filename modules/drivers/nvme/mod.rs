@@ -13,7 +13,7 @@
 //! (multi-block reads into `read_buf`, drained to the consumer 512 B
 //! at a time) and a `requests` channel carrying write packets (header
 //! + NLB × 512 B payload, one SQE per packet, up to `inflight_cap` in
-//! flight per queue concurrently).
+//!   flight per queue concurrently).
 //!
 //! Up to `MAX_IO_QUEUES` I/O queue pairs (`io_queue_count` parameter,
 //! default 1). With `irq_mode = 1` the driver programs MSI-X table
@@ -69,51 +69,51 @@ const PCIE_RESCAN: u32 = 0x0CF5;
 const PCI_DMA_OFFSET: u64 = 0x10_0000_0000;
 
 // NVMe register offsets
-const REG_CAP:      u64 = 0x00;
-const REG_VS:       u64 = 0x08;
-const REG_CC:       u64 = 0x14;
-const REG_CSTS:     u64 = 0x1C;
-const REG_AQA:      u64 = 0x24;
-const REG_ASQ:      u64 = 0x28;
-const REG_ACQ:      u64 = 0x30;
-const REG_SQ0TDBL:  u64 = 0x1000;
+const REG_CAP: u64 = 0x00;
+const REG_VS: u64 = 0x08;
+const REG_CC: u64 = 0x14;
+const REG_CSTS: u64 = 0x1C;
+const REG_AQA: u64 = 0x24;
+const REG_ASQ: u64 = 0x28;
+const REG_ACQ: u64 = 0x30;
+const REG_SQ0TDBL: u64 = 0x1000;
 
 // CC bits (NVMe 1.4 §3.1.5)
-const CC_EN:       u32 = 1 << 0;
-const CC_CSS_NVM:  u32 = 0 << 4;
+const CC_EN: u32 = 1 << 0;
+const CC_CSS_NVM: u32 = 0 << 4;
 const CC_SHN_MASK: u32 = 0b11 << 14;
 const CC_IOSQES_6: u32 = 6 << 16;
 const CC_IOCQES_4: u32 = 4 << 20;
 
 // CSTS bits (NVMe 1.4 §3.1.6)
-const CSTS_RDY:    u32 = 1 << 0;
-const CSTS_CFS:    u32 = 1 << 1;
+const CSTS_RDY: u32 = 1 << 0;
+const CSTS_CFS: u32 = 1 << 1;
 
 // Admin queue sizing (well within any controller's MQES).
 const ADMIN_Q_ENTRIES: u32 = 64;
-const SQE_BYTES:       u32 = 64;
-const CQE_BYTES:       u32 = 16;
-pub const PAGE:        u32 = 4096;
+const SQE_BYTES: u32 = 64;
+const CQE_BYTES: u32 = 16;
+pub const PAGE: u32 = 4096;
 
 // Identify Controller field offsets (NVMe 1.4 §5.15.2.1 Figure 249).
-const ID_VID:  usize = 0;    // u16
-const ID_SN:   usize = 4;    // 20 bytes
-const ID_MN:   usize = 24;   // 40 bytes
-const ID_FR:   usize = 64;   // 8 bytes
+const ID_VID: usize = 0; // u16
+const ID_SN: usize = 4; // 20 bytes
+const ID_MN: usize = 24; // 40 bytes
+const ID_FR: usize = 64; // 8 bytes
 /// Identify Controller byte 525 (VWC). Bit 0 = controller has a Volatile
 /// Write Cache. When 0, writes are durable on completion and an NVMe Flush
 /// is unnecessary by spec (NVMe 1.4 §5.21.1.18 / Flush §6.8); when 1, an
 /// explicit Flush is REQUIRED on fsync to commit the cache to NAND.
-const ID_VWC:  usize = 525;
+const ID_VWC: usize = 525;
 
 // Timeouts (ms). Declared CAP.TO can be 50 s but typical is < 100 ms.
-const RESET_BUDGET_MS:  u64 = 500;
+const RESET_BUDGET_MS: u64 = 500;
 const ENABLE_BUDGET_MS: u64 = 500;
 const ADMIN_CMD_BUDGET_MS: u64 = 1000;
-const IO_READ_BUDGET_MS:   u64 = 1000;
+const IO_READ_BUDGET_MS: u64 = 1000;
 
 // Block I/O streaming phase (state field `blk_phase`).
-const BLK_PHASE_IDLE:    u8 = 0;
+const BLK_PHASE_IDLE: u8 = 0;
 const BLK_PHASE_READING: u8 = 1;
 const BLK_PHASE_WRITING: u8 = 2;
 
@@ -133,7 +133,7 @@ const REQ_HDR_SIZE: usize = 20;
 /// inflight writes 0x0100..=0x017F on aarch64 / 0x0100..=0x011F on
 /// embedded — see `CID_IO_WRITE_BASE` / `CID_SLOT_BITS`) so
 /// `poll_io_cqe` routines can't mistake them.
-pub const CID_PAGER_READ:  u16 = 0x0200;
+pub const CID_PAGER_READ: u16 = 0x0200;
 /// Synchronous single-page pager-write CID. One in-flight at a time;
 /// used by the per-page `PAGER_OP_WRITE` dispatch path.
 pub const CID_PAGER_WRITE: u16 = 0x0201;
@@ -171,10 +171,10 @@ const PAGER_SUBMIT_BUDGET_MS: u64 = 2000;
 
 /// Opcodes the kernel's `backing_provider::dispatch` forwards to us.
 /// Must match `src/kernel/internal/backing_provider.rs::op`.
-const PAGER_OP_READ:  u32 = 0x0001;
+const PAGER_OP_READ: u32 = 0x0001;
 const PAGER_OP_WRITE: u32 = 0x0002;
 const PAGER_OP_FLUSH: u32 = 0x0003;
-const PAGER_OP_READ_BULK:  u32 = 0x0004;
+const PAGER_OP_READ_BULK: u32 = 0x0004;
 const PAGER_OP_WRITE_BULK: u32 = 0x0005;
 
 /// Async bulk-read CID base. Reads pipeline like writes: up to
@@ -183,7 +183,7 @@ const PAGER_OP_WRITE_BULK: u32 = 0x0005;
 /// slot 0 (CID == CID_PAGER_READ_BULK); multi-chunk reads stripe
 /// across slots so a 1024-page transfer at MAX_BULK_PAGES = 32
 /// pipelines 32 commands instead of executing them serially.
-pub const CID_PAGER_READ_BULK:  u16 = 0x0300;
+pub const CID_PAGER_READ_BULK: u16 = 0x0300;
 
 /// Maximum pages per bulk transfer. Bounded by the count of pre-
 /// allocated DMA buffers (`PAGER_WRITE_SLOTS = ASYNC_BULK_SLOTS *
@@ -232,55 +232,55 @@ const IOCTL_NVME_NS_INFO: u32 = 0x4E56_0001;
 // State machine
 // ============================================================================
 
-const S_BIND:                u8 = 0;
-const S_MAP_BARS:            u8 = 1;
-const S_RESET:               u8 = 2;
-const S_CONFIG_QUEUES:       u8 = 3;
-const S_ENABLE:              u8 = 4;
+const S_BIND: u8 = 0;
+const S_MAP_BARS: u8 = 1;
+const S_RESET: u8 = 2;
+const S_CONFIG_QUEUES: u8 = 3;
+const S_ENABLE: u8 = 4;
 const S_IDENTIFY_CONTROLLER: u8 = 5;
-const S_IDENTIFY_NAMESPACE:  u8 = 6;
-const S_CREATE_IO_CQ:        u8 = 7;
-const S_CREATE_IO_SQ:        u8 = 8;
-const S_READ_LBA0:           u8 = 9;
-const S_READY:               u8 = 10;
-const S_FAULT:               u8 = 0xFF;
+const S_IDENTIFY_NAMESPACE: u8 = 6;
+const S_CREATE_IO_CQ: u8 = 7;
+const S_CREATE_IO_SQ: u8 = 8;
+const S_READ_LBA0: u8 = 9;
+const S_READY: u8 = 10;
+const S_FAULT: u8 = 0xFF;
 
 // NVMe opcodes (NVMe 1.4 §5).
-const OPC_DELETE_SQ:         u8 = 0x00;
-const OPC_CREATE_SQ:         u8 = 0x01;
-const OPC_CREATE_CQ:         u8 = 0x05;
-const OPC_IDENTIFY:          u8 = 0x06;
-const OPC_READ:              u8 = 0x02;
-const OPC_WRITE:             u8 = 0x01;
+const OPC_DELETE_SQ: u8 = 0x00;
+const OPC_CREATE_SQ: u8 = 0x01;
+const OPC_CREATE_CQ: u8 = 0x05;
+const OPC_IDENTIFY: u8 = 0x06;
+const OPC_READ: u8 = 0x02;
+const OPC_WRITE: u8 = 0x01;
 /// NVM command-set Flush (opcode 0x00) — commits the controller's
 /// volatile write cache to non-volatile media for the given NSID. No
 /// data transfer. (Same numeric value as `OPC_DELETE_SQ`, but that is
 /// an Admin-queue opcode; this is issued on an I/O SQ, a distinct
 /// command set, so there is no ambiguity.) A controller without a
 /// volatile write cache completes Flush successfully as a no-op.
-const OPC_FLUSH:             u8 = 0x00;
+const OPC_FLUSH: u8 = 0x00;
 
 // Command IDs — stable across admin queue lifetime so a CQE can be
 // cross-referenced to the command that issued it.
-const CID_IDENTIFY_CTRL:     u16 = 0x0001;
-const CID_IDENTIFY_NS:       u16 = 0x0002;
-const CID_CREATE_IO_CQ:      u16 = 0x0003;
-const CID_CREATE_IO_SQ:      u16 = 0x0004;
-const CID_READ_LBA0:         u16 = 0x0005;
+const CID_IDENTIFY_CTRL: u16 = 0x0001;
+const CID_IDENTIFY_NS: u16 = 0x0002;
+const CID_CREATE_IO_CQ: u16 = 0x0003;
+const CID_CREATE_IO_SQ: u16 = 0x0004;
+const CID_READ_LBA0: u16 = 0x0005;
 
 // I/O queue sizing. QIDs 1..=io_q_count form `io_q_count` SQ/CQ
 // pairs. 64 entries is well within any controller's MQES and more
 // than enough for the MAX_INFLIGHT-bounded pipelined I/O the driver
 // actually submits per queue.
-const IO_QID:                u16 = 1;
-pub const IO_Q_ENTRIES:                    u32 = 64;
+const IO_QID: u16 = 1;
+pub const IO_Q_ENTRIES: u32 = 64;
 
 /// Maximum I/O queue pairs. Hard cap bounded
 /// by (a) controller's Number of I/O Queues Requested admin feature
 /// result and (b) the CID encoding space `(q_idx << 3) | slot_idx`
 /// with slot_idx∈0..8 leaving 2 bits for q_idx. 4 pairs match the
 /// Pi 5 CM's 4 Cortex-A76 cores.
-pub const MAX_IO_QUEUES:                  usize = 4;
+pub const MAX_IO_QUEUES: usize = 4;
 
 /// Maximum write requests per queue the driver keeps in flight at
 /// once. Each in-flight slot owns a 4 KB DMA buffer, so this caps
@@ -296,19 +296,19 @@ pub const MAX_IO_QUEUES:                  usize = 4;
 /// **rp2350 / rp2040 / wasm32** — 8 (`128 KB` DMA, original budget).
 /// CID layout stays at `(q << 3) | slot` for ABI compatibility.
 #[cfg(target_arch = "aarch64")]
-pub const MAX_INFLIGHT:                    usize = 32;
+pub const MAX_INFLIGHT: usize = 32;
 #[cfg(not(target_arch = "aarch64"))]
-pub const MAX_INFLIGHT:                    usize = 8;
+pub const MAX_INFLIGHT: usize = 8;
 
 /// Slot-bits shift in the write-CID encoding. Caller-supplied so the
 /// queue-id occupies the high bits and the slot-id the low bits. Tied
 /// to `MAX_INFLIGHT` — keep the two in sync.
 #[cfg(target_arch = "aarch64")]
-pub const CID_SLOT_BITS:                  u32 = 5;
+pub const CID_SLOT_BITS: u32 = 5;
 #[cfg(not(target_arch = "aarch64"))]
-pub const CID_SLOT_BITS:                  u32 = 3;
+pub const CID_SLOT_BITS: u32 = 3;
 
-pub const CID_SLOT_MASK:                  u16 = (1 << CID_SLOT_BITS) - 1;
+pub const CID_SLOT_MASK: u16 = (1 << CID_SLOT_BITS) - 1;
 
 /// Base CID for pipelined write SQEs. With multi-queue, the CID is
 /// `CID_IO_WRITE_BASE | (q_idx << CID_SLOT_BITS) | slot_idx`:
@@ -317,7 +317,7 @@ pub const CID_SLOT_MASK:                  u16 = (1 << CID_SLOT_BITS) - 1;
 /// On aarch64 (slot_bits=5, 4 queues): 0x0100..=0x017F (128 CIDs).
 /// On embedded (slot_bits=3, 4 queues): 0x0100..=0x011F (32 CIDs).
 /// Both ranges stay disjoint from admin CIDs 0x0001..=0x000F.
-pub const CID_IO_WRITE_BASE:          u16 = 0x0100;
+pub const CID_IO_WRITE_BASE: u16 = 0x0100;
 
 /// Sentinel for `poll_io_cqe(_, CID_NONE)` — harvest-only mode.
 /// Tells the poller to drain any ready write-pipeline CQEs but not
@@ -327,17 +327,17 @@ pub const CID_IO_WRITE_BASE:          u16 = 0x0100;
 pub const CID_NONE: u16 = 0xFFFF;
 
 // Identify Namespace response (NVMe 1.4 §5.15.2.2 Figure 246).
-const INS_NSZE:              usize = 0;     // u64
-const INS_FLBAS:             usize = 26;    // u8, [3:0] = active LBAF index
-const INS_LBAF0:             usize = 128;   // u32, bits [23:16] = LBADS (log2 of LBA size)
+const INS_NSZE: usize = 0; // u64
+const INS_FLBAS: usize = 26; // u8, [3:0] = active LBAF index
+const INS_LBAF0: usize = 128; // u32, bits [23:16] = LBADS (log2 of LBA size)
 
 #[repr(C)]
 struct NvmeState {
     syscalls: *const SyscallTable,
 
-    req_in:  i32,
+    req_in: i32,
     blk_out: i32,
-    ctrl:    i32,
+    ctrl: i32,
 
     /// Device handle returned by `provider_open(PCIE_DEVICE, BIND, ...)`.
     /// Carries the per-device context (root complex, BDF, alias) for
@@ -371,35 +371,35 @@ struct NvmeState {
     // the Identify Controller response and is never overwritten, so the
     // heartbeat can re-emit the acceptance line; Identify Namespace
     // gets its own buffer.
-    admin_sq:        u64,
-    admin_cq:        u64,
-    identify_buf:    u64,
+    admin_sq: u64,
+    admin_cq: u64,
+    identify_buf: u64,
     identify_ns_buf: u64,
     /// Per-queue SQ/CQ DMA pages. Index i ⇒ QID i+1 (admin is QID 0).
     /// Slots past `io_q_count` stay at 0.
-    io_sq:           [u64; MAX_IO_QUEUES],
-    io_cq:           [u64; MAX_IO_QUEUES],
+    io_sq: [u64; MAX_IO_QUEUES],
+    io_cq: [u64; MAX_IO_QUEUES],
     /// DMA buffer for the read-stream pipeline (BLK_PHASE_READING
     /// fills it; BLK_PHASE_WRITING drains it byte-by-byte to
     /// `blk_out`). Reads always go through queue `read_q` — the
     /// shared buffer can't be striped across queues.
-    read_buf:        u64,
+    read_buf: u64,
     /// Per-queue ring of DMA buffers for write-request payloads
     /// accepted on `req_in`. Each entry is a 4 KB page lazily
     /// allocated on first use; separate-per-queue so concurrent
     /// writes on different queues can't alias each other's DMA.
-    write_bufs:      [[u64; MAX_INFLIGHT]; MAX_IO_QUEUES],
+    write_bufs: [[u64; MAX_INFLIGHT]; MAX_IO_QUEUES],
 
     // Admin queue indices (QID=0).
-    sq_tail:  u32,
-    cq_head:  u32,
+    sq_tail: u32,
+    cq_head: u32,
     cq_phase: u32,
 
     // Per-queue I/O indices (QID=1..=io_q_count). Each queue has its
     // own head/tail/phase; poll_io_cqe decodes the queue index from
     // the CID bits [4:3] and advances only that queue's head.
-    io_sq_tail:  [u32; MAX_IO_QUEUES],
-    io_cq_head:  [u32; MAX_IO_QUEUES],
+    io_sq_tail: [u32; MAX_IO_QUEUES],
+    io_cq_head: [u32; MAX_IO_QUEUES],
     io_cq_phase: [u32; MAX_IO_QUEUES],
 
     // Block I/O streaming state (S_READY). `current_block` is the LBA
@@ -409,10 +409,10 @@ struct NvmeState {
     // `discard_cqe` is set when a seek arrives while a read is still
     // in flight — the CQE still has to be harvested to free the I/O
     // queue slot, but we must not write its data to the channel.
-    current_block:    u32,
-    write_offset:     u16,
-    blk_phase:        u8,
-    discard_cqe:      u8,
+    current_block: u32,
+    write_offset: u16,
+    blk_phase: u8,
+    discard_cqe: u8,
 
     /// Pending batch read queued by an `IOCTL_BLOCKS_READ_NLB` call
     /// on `blk_out`. The next `BLK_PHASE_IDLE` tick consumes it,
@@ -421,8 +421,8 @@ struct NvmeState {
     /// `pending_batch_valid == 0` means no batch is queued; the IDLE
     /// tick falls back to the per-sector path driven by
     /// `IOCTL_NOTIFY` / `current_block`.
-    pending_batch_lba:   u32,
-    pending_batch_nlb:   u16,
+    pending_batch_lba: u32,
+    pending_batch_nlb: u16,
     pending_batch_valid: u8,
     /// Set to 1 by `apply_pending_seek` when an IOCTL_NOTIFY-driven
     /// seek lands. Cleared by the next BLK_PHASE_IDLE submission. Used
@@ -430,7 +430,7 @@ struct NvmeState {
     /// asked for an LBA" — without this gate the IDLE branch loops
     /// sequentially through the disk forever, which on the pi5 board (bcm2712 silicon)
     /// eventually misses a CQE (fault code 24).
-    stream_armed:        u8,
+    stream_armed: u8,
 
     // Incoming write-request pipeline. Producers push a REQ_HDR_SIZE
     // header `{ op:u32, lba:u64, nlb:u32, nsid:u32 }` followed by
@@ -442,14 +442,14 @@ struct NvmeState {
     // Completion harvest happens at the top of every pump tick, so
     // there is no separate "wait" phase — the pump keeps accepting
     // further requests while earlier ones are still in-flight.
-    req_phase:       u8,
+    req_phase: u8,
     /// Queue index chosen for the request currently in phase 1/2.
     /// Stable across partial-header/payload reads that span ticks.
-    req_q:           u8,
-    req_fill:        u16,
-    req_lba:         u64,
-    req_hdr:         [u8; REQ_HDR_SIZE],
-    req_nsid:        u32,
+    req_q: u8,
+    req_fill: u16,
+    req_lba: u64,
+    req_hdr: [u8; REQ_HDR_SIZE],
+    req_nsid: u32,
 
     // Per-queue in-flight write tracking. `inflight_count[q]`
     // outstanding writes; `inflight_head[q]` is the FIFO head (oldest
@@ -459,13 +459,13 @@ struct NvmeState {
     // IO_Q_ENTRIES - 1, queue_depth). `inflight_submit_ms[q][slot]`
     // is the submission timestamp used by the IO_READ_BUDGET_MS
     // stuck-write timeout.
-    inflight_count:    [u8; MAX_IO_QUEUES],
-    inflight_head:     [u8; MAX_IO_QUEUES],
-    inflight_tail:     [u8; MAX_IO_QUEUES],
-    inflight_cap:      u8,
-    _pad_if:           [u8; 3],
-    inflight_cid:      [[u16; MAX_INFLIGHT]; MAX_IO_QUEUES],
-    inflight_submit_ms:[[u64; MAX_INFLIGHT]; MAX_IO_QUEUES],
+    inflight_count: [u8; MAX_IO_QUEUES],
+    inflight_head: [u8; MAX_IO_QUEUES],
+    inflight_tail: [u8; MAX_IO_QUEUES],
+    inflight_cap: u8,
+    _pad_if: [u8; 3],
+    inflight_cid: [[u16; MAX_INFLIGHT]; MAX_IO_QUEUES],
+    inflight_submit_ms: [[u64; MAX_INFLIGHT]; MAX_IO_QUEUES],
 
     //  io_q_count    — active I/O queue pairs (1..=MAX_IO_QUEUES).
     //  bringup_qidx  — cursor for the CreateIoCQ/SQ admin loop.
@@ -473,24 +473,24 @@ struct NvmeState {
     //                  next incoming write request is submitted on.
     //  read_q        — queue index reads go through (fixed at 0 —
     //                  shared `read_buf` can't be striped).
-    io_q_count:   u8,
+    io_q_count: u8,
     bringup_qidx: u8,
-    pump_q:       u8,
-    read_q:       u8,
-    _pad_q:       [u8; 4],
+    pump_q: u8,
+    read_q: u8,
+    _pad_q: [u8; 4],
 
     // Namespace geometry (extracted from IdentifyNamespace response).
-    ns_size:  u64,
+    ns_size: u64,
     ns_lbads: u8,
-    _pad3:    [u8; 7],
+    _pad3: [u8; 7],
 
     // Timing anchors. `wait_start_ms` is owned by the admin queue
     // (submit_admin_cmd / poll_admin_cqe). `read_submit_ms` tracks
     // the last IO-queue read submission so its timeout budget is
     // independent of any concurrent write submits. Writes carry their
     // own per-slot timestamps in `inflight_submit_ms[]`.
-    wait_start_ms:   u64,
-    read_submit_ms:  u64,
+    wait_start_ms: u64,
+    read_submit_ms: u64,
 
     returned_ready: u8,
     _pad2: [u8; 7],
@@ -530,34 +530,34 @@ struct NvmeState {
     /// `bulk_count` is the in-flight depth. When the ring fills,
     /// the next submit spin-polls the oldest slot's CQE.
     /// `bulk_drain_writes` waits until `bulk_count == 0` for FLUSH.
-    pager_write_bufs:    [u64; PAGER_WRITE_SLOTS],
-    bulk_prp_list_bufs:  [u64; ASYNC_BULK_SLOTS],
-    bulk_head:           u8,
-    bulk_tail:           u8,
-    bulk_count:          u8,
-    bulk_depth_peak:     u8,
+    pager_write_bufs: [u64; PAGER_WRITE_SLOTS],
+    bulk_prp_list_bufs: [u64; ASYNC_BULK_SLOTS],
+    bulk_head: u8,
+    bulk_tail: u8,
+    bulk_count: u8,
+    bulk_depth_peak: u8,
     /// Peak in-flight depth observed inside `pager_read_pipelined`.
     /// Mirrors `bulk_depth_peak` but for the async-bulk-READ side
     /// so the heartbeat can tell us whether reads are actually
     /// pipelining (`rd >= 2` ⇒ multiple commands in flight, `rd=1`
     /// ⇒ effectively QD=1 even with a multi-slot caller).
-    read_depth_peak:     u8,
-    _pad_rdp:            [u8; 7],
+    read_depth_peak: u8,
+    _pad_rdp: [u8; 7],
     /// Per-section microsecond accumulators for the pipelined-read
     /// hot path. Heartbeat emits `[nvme] rperf calls=N sub=AVG
     /// poll=AVG copy=AVG total=AVG` so a drop into Linux-style
     /// throughput can pinpoint whether SQE submit, CQE poll, or
     /// the post-CQE memcpy is dominating.
-    read_call_count:     u64,
-    read_submit_us:      u64,
-    read_poll_us:        u64,
-    read_copy_us:        u64,
-    read_total_us:       u64,
+    read_call_count: u64,
+    read_submit_us: u64,
+    read_poll_us: u64,
+    read_copy_us: u64,
+    read_total_us: u64,
     /// Latched on async-bulk CQE failure so the next FLUSH (or
     /// next bulk submit) can surface the error to the caller. The
     /// original async submit has already returned 0 by the time the
     /// CQE arrives, so propagating sync is the only option.
-    bulk_err:            i32,
+    bulk_err: i32,
     /// Async-durability fence accounting (async WAL fsync path). Every
     /// bulk write increments `write_submit_seq` at submit and
     /// `write_complete_seq` when its CQE is retired. A fence ticket is a
@@ -566,15 +566,15 @@ struct NvmeState {
     /// writes — pager + async-LBA), so a fence conservatively also waits
     /// on any concurrent pager writes, which is safe. Monotonic; wrap is
     /// a non-issue at realistic rates within a fence's lifetime.
-    write_submit_seq:    u64,
-    write_complete_seq:  u64,
+    write_submit_seq: u64,
+    write_complete_seq: u64,
     /// Submit-seq of the FIRST async write whose CQE reported failure
     /// (1-based; 0 = none yet). A durability fence whose ticket is
     /// `>= first_fail_seq` MUST report error forever — a failed write is
     /// a permanent durability gap, and a fence covering it can never be
     /// honestly reported durable (even though `write_complete_seq` still
     /// advances past it for counter consistency). Monotonic latch.
-    first_fail_seq:      u64,
+    first_fail_seq: u64,
     /// 1 once `BACKING_PROVIDER_ENABLE` has succeeded, so S_READY
     /// entry only registers once.
     pager_registered: u8,
@@ -588,16 +588,16 @@ struct NvmeState {
     /// Message-Control Enable bit set. `msix_table_virt` is the CPU
     /// address of table entry 0 (held for a future affinity-rewrite
     /// path).
-    msix_enabled:    u8,
-    _pad4:           [u8; 5],
+    msix_enabled: u8,
+    _pad4: [u8; 5],
     msix_table_virt: u64,
     msix_cap_offset: u16,
-    msix_vector:     u8,
-    _pad5:           [u8; 5],
+    msix_vector: u8,
+    _pad5: [u8; 5],
     /// Event handle the kernel signals when the allocated MSI vector
     /// fires. Created lazily on the first `irq_mode=1` pass.
-    msix_event:      i32,
-    _pad6:           [u8; 4],
+    msix_event: i32,
+    _pad6: [u8; 4],
 
     /// Hot-path counters emitted as `[nvme] tlm dt=… rx=… tx=… idle=… bp=…`
     /// every `NVME_TLM_PERIOD` steps. `rx` is bytes pulled off `req_in`
@@ -619,8 +619,8 @@ const NVME_TLM_INTERVAL_MS: u64 = 5_000;
 
 mod params_def {
     use super::NvmeState;
-    use super::{p_u8, p_u16, p_u32};
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u32, p_u8};
 
     define_params! {
         NvmeState;
@@ -685,7 +685,7 @@ unsafe fn reg_r64(s: &NvmeState, off: u64) -> u64 {
 }
 
 unsafe fn reg_w64(s: &NvmeState, off: u64, val: u64) {
-    write_volatile((s.bar0_virt + off)     as *mut u32, val as u32);
+    write_volatile((s.bar0_virt + off) as *mut u32, val as u32);
     write_volatile((s.bar0_virt + off + 4) as *mut u32, (val >> 32) as u32);
 }
 
@@ -703,7 +703,9 @@ unsafe fn cq_doorbell(s: &NvmeState, qid: u32) -> u64 {
 // ============================================================================
 
 unsafe fn log_once(s: &mut NvmeState, msg: &[u8]) {
-    if s.logged_state == s.state { return; }
+    if s.logged_state == s.state {
+        return;
+    }
     s.logged_state = s.state;
     dev_log(&*s.syscalls, 3, msg.as_ptr(), msg.len());
 }
@@ -746,6 +748,10 @@ unsafe fn write_sqe(sq_base: u64, slot: u32, cdw: [u32; 16]) {
 /// SQ tail doorbell. `cid` is the Command Identifier; the device echoes
 /// it in the CQE so callers can cross-reference. `prp1_pci` is the PCI
 /// bus address (i.e. `arm_addr | PCI_DMA_OFFSET`) of the buffer.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "arguments mirror the NVMe admin SQE fields one-to-one; bundling them into a struct would rename the spec's own vocabulary"
+)]
 unsafe fn submit_admin_cmd(
     s: &mut NvmeState,
     opcode: u8,
@@ -757,17 +763,22 @@ unsafe fn submit_admin_cmd(
     cdw12: u32,
 ) {
     let cdw = [
-        ((cid as u32) << 16) | (opcode as u32),   // CDW0
-        nsid,                                       // CDW1
-        0, 0,                                       // CDW2-3 (reserved)
-        0, 0,                                       // CDW4-5 (MPTR)
-        prp1_pci as u32,                           // CDW6 (PRP1 low)
-        (prp1_pci >> 32) as u32,                   // CDW7 (PRP1 high)
-        0, 0,                                       // CDW8-9 (PRP2)
-        cdw10,                                      // CDW10
-        cdw11,                                      // CDW11
-        cdw12,                                      // CDW12
-        0, 0, 0,                                    // CDW13-15
+        ((cid as u32) << 16) | (opcode as u32), // CDW0
+        nsid,                                   // CDW1
+        0,
+        0, // CDW2-3 (reserved)
+        0,
+        0,                       // CDW4-5 (MPTR)
+        prp1_pci as u32,         // CDW6 (PRP1 low)
+        (prp1_pci >> 32) as u32, // CDW7 (PRP1 high)
+        0,
+        0,     // CDW8-9 (PRP2)
+        cdw10, // CDW10
+        cdw11, // CDW11
+        cdw12, // CDW12
+        0,
+        0,
+        0, // CDW13-15
     ];
     write_sqe(s.admin_sq, s.sq_tail, cdw);
     s.sq_tail = (s.sq_tail + 1) % ADMIN_Q_ENTRIES;
@@ -797,9 +808,15 @@ unsafe fn poll_admin_cqe(s: &mut NvmeState) -> CqeResult {
     }
     let sc = ((dw3 >> 17) & 0x7FFF) as u16;
     s.cq_head = (s.cq_head + 1) % ADMIN_Q_ENTRIES;
-    if s.cq_head == 0 { s.cq_phase ^= 1; }
+    if s.cq_head == 0 {
+        s.cq_phase ^= 1;
+    }
     reg_w32(s, cq_doorbell(s, 0), s.cq_head);
-    if sc == 0 { CqeResult::Ok } else { CqeResult::Failed(sc) }
+    if sc == 0 {
+        CqeResult::Ok
+    } else {
+        CqeResult::Failed(sc)
+    }
 }
 
 /// Write a hex-formatted u32 to `p[pos..pos+8]` and advance `pos`.
@@ -814,9 +831,9 @@ unsafe fn write_hex32(p: *mut u8, pos: &mut usize, v: u32) {
 /// Write a decimal u32 (zero-padded to 3 digits) to `p[pos..pos+3]`.
 unsafe fn write_dec3(p: *mut u8, pos: &mut usize, v: u32) {
     let v = v.min(999);
-    *p.add(*pos)     = b'0' + ((v / 100) % 10) as u8;
-    *p.add(*pos + 1) = b'0' + ((v / 10)  % 10) as u8;
-    *p.add(*pos + 2) = b'0' + ( v         % 10) as u8;
+    *p.add(*pos) = b'0' + ((v / 100) % 10) as u8;
+    *p.add(*pos + 1) = b'0' + ((v / 10) % 10) as u8;
+    *p.add(*pos + 2) = b'0' + (v % 10) as u8;
     *pos += 3;
 }
 
@@ -914,10 +931,27 @@ unsafe fn heartbeat(s: &mut NvmeState) {
         let mut rpos = prefix.len();
         // 4-digit decimal helper inline (calls can climb past 1000).
         fn write_dec_u32(out: *mut u8, pos: &mut usize, mut v: u32) {
-            if v == 0 { unsafe { *out.add(*pos) = b'0'; } *pos += 1; return; }
-            let mut d = [0u8; 10]; let mut n = 0usize;
-            while v > 0 { d[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
-            while n > 0 { n -= 1; unsafe { *out.add(*pos) = d[n]; } *pos += 1; }
+            if v == 0 {
+                unsafe {
+                    *out.add(*pos) = b'0';
+                }
+                *pos += 1;
+                return;
+            }
+            let mut d = [0u8; 10];
+            let mut n = 0usize;
+            while v > 0 {
+                d[n] = b'0' + (v % 10) as u8;
+                v /= 10;
+                n += 1;
+            }
+            while n > 0 {
+                n -= 1;
+                unsafe {
+                    *out.add(*pos) = d[n];
+                }
+                *pos += 1;
+            }
         }
         write_dec_u32(rp, &mut rpos, n as u32);
         let sub_avg = (s.read_submit_us / n) as u32;
@@ -960,7 +994,9 @@ unsafe fn heartbeat(s: &mut NvmeState) {
 /// Emit the boot-sector signature (offset 510-511) plus the first
 /// 16 bytes of LBA 0, both formatted as hex.
 unsafe fn emit_lba0_info(s: &NvmeState) {
-    if s.read_buf == 0 { return; }
+    if s.read_buf == 0 {
+        return;
+    }
     let buf = s.read_buf as *const u8;
     let sig = read_volatile(buf.add(510) as *const u16);
 
@@ -984,7 +1020,7 @@ unsafe fn emit_lba0_info(s: &NvmeState) {
         let b = *buf.add(i);
         let hi = b >> 4;
         let lo = b & 0x0F;
-        *p.add(pos)     = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+        *p.add(pos) = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
         *p.add(pos + 1) = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
         pos += 2;
     }
@@ -997,7 +1033,9 @@ unsafe fn emit_lba0_info(s: &NvmeState) {
 /// from the heartbeat loop once the state machine is in READY (repeat
 /// emit in case log_net hadn't started streaming during the first one).
 unsafe fn emit_identify_info(s: &NvmeState) {
-    if s.identify_buf == 0 { return; }
+    if s.identify_buf == 0 {
+        return;
+    }
     let id = s.identify_buf as *const u8;
     let vid = read_volatile(id.add(ID_VID) as *const u16);
 
@@ -1008,14 +1046,20 @@ unsafe fn emit_identify_info(s: &NvmeState) {
     let mut pos = prefix.len();
     for i in 0..4 {
         let nibble = ((vid >> (12 - i * 4)) & 0xF) as u8;
-        *p.add(pos) = if nibble < 10 { b'0' + nibble } else { b'a' + (nibble - 10) };
+        *p.add(pos) = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
         pos += 1;
     }
     let mn_tag = b" MN='";
     core::ptr::copy_nonoverlapping(mn_tag.as_ptr(), p.add(pos), mn_tag.len());
     pos += mn_tag.len();
     let mut mn_len = 40usize;
-    while mn_len > 0 && *id.add(ID_MN + mn_len - 1) == b' ' { mn_len -= 1; }
+    while mn_len > 0 && *id.add(ID_MN + mn_len - 1) == b' ' {
+        mn_len -= 1;
+    }
     let mut i = 0usize;
     while i < mn_len {
         *p.add(pos) = *id.add(ID_MN + i);
@@ -1028,7 +1072,9 @@ unsafe fn emit_identify_info(s: &NvmeState) {
     core::ptr::copy_nonoverlapping(fr_tag.as_ptr(), p.add(pos), fr_tag.len());
     pos += fr_tag.len();
     let mut fr_len = 8usize;
-    while fr_len > 0 && *id.add(ID_FR + fr_len - 1) == b' ' { fr_len -= 1; }
+    while fr_len > 0 && *id.add(ID_FR + fr_len - 1) == b' ' {
+        fr_len -= 1;
+    }
     let mut i = 0usize;
     while i < fr_len {
         *p.add(pos) = *id.add(ID_FR + i);
@@ -1140,12 +1186,12 @@ unsafe fn step_reset(s: &mut NvmeState) -> i32 {
         0 => {
             log_once(s, b"[nvme] Reset\0");
             s.cap = reg_r64(s, REG_CAP);
-            s.mqes         =  (s.cap        & 0xFFFF) as u16;
-            s.timeout_500ms = ((s.cap >> 24) & 0xFF)  as u8;
-            s.dstrd_shift   = ((s.cap >> 32) & 0xF)   as u8;
-            s.mpsmin        = ((s.cap >> 48) & 0xF)   as u8;
+            s.mqes = (s.cap & 0xFFFF) as u16;
+            s.timeout_500ms = ((s.cap >> 24) & 0xFF) as u8;
+            s.dstrd_shift = ((s.cap >> 32) & 0xF) as u8;
+            s.mpsmin = ((s.cap >> 48) & 0xF) as u8;
             let _vs = reg_r32(s, REG_VS);
-            let cc  = reg_r32(s, REG_CC);
+            let cc = reg_r32(s, REG_CC);
             // Clear EN + SHN. Baseline notes Linux may leave SHN=01
             // after unbind; this converges fresh-power-on and
             // fresh-unbind to the same post-state.
@@ -1182,7 +1228,9 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
         0 => {
             log_once(s, b"[nvme] ConfigQueues\0");
             let p = dev_dma_alloc(sys, PAGE, PAGE);
-            if p == 0 { return fault(s, 5, b"[nvme] SQ alloc fail\0"); }
+            if p == 0 {
+                return fault(s, 5, b"[nvme] SQ alloc fail\0");
+            }
             zero_page(p);
             s.admin_sq = p;
             s.substate = 1;
@@ -1190,7 +1238,9 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
         }
         1 => {
             let p = dev_dma_alloc(sys, PAGE, PAGE);
-            if p == 0 { return fault(s, 6, b"[nvme] CQ alloc fail\0"); }
+            if p == 0 {
+                return fault(s, 6, b"[nvme] CQ alloc fail\0");
+            }
             zero_page(p);
             s.admin_cq = p;
             s.substate = 2;
@@ -1198,7 +1248,9 @@ unsafe fn step_config_queues(s: &mut NvmeState) -> i32 {
         }
         2 => {
             let p = dev_dma_alloc(sys, PAGE, PAGE);
-            if p == 0 { return fault(s, 7, b"[nvme] identify alloc fail\0"); }
+            if p == 0 {
+                return fault(s, 7, b"[nvme] identify alloc fail\0");
+            }
             zero_page(p);
             s.identify_buf = p;
             s.substate = 3;
@@ -1271,9 +1323,9 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
             write_volatile(sqe.add(3), 0);
             write_volatile(sqe.add(4), 0); // MPTR lo
             write_volatile(sqe.add(5), 0); // MPTR hi
-            // PRP1 = PCI bus address inside BAR1's inbound window.
-            // See PCI_DMA_OFFSET — BAR1 maps PCI 0x10_0000_0000+X to
-            // fabric/ARM addr X for X in low 4 GB.
+                                           // PRP1 = PCI bus address inside BAR1's inbound window.
+                                           // See PCI_DMA_OFFSET — BAR1 maps PCI 0x10_0000_0000+X to
+                                           // fabric/ARM addr X for X in low 4 GB.
             let prp1_pci = s.identify_buf | PCI_DMA_OFFSET;
             write_volatile(sqe.add(6), prp1_pci as u32);
             write_volatile(sqe.add(7), (prp1_pci >> 32) as u32);
@@ -1313,7 +1365,9 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
 
             // Ring CQ head doorbell.
             s.cq_head = (s.cq_head + 1) % ADMIN_Q_ENTRIES;
-            if s.cq_head == 0 { s.cq_phase ^= 1; }
+            if s.cq_head == 0 {
+                s.cq_phase ^= 1;
+            }
             reg_w32(s, cq_doorbell(s, 0), s.cq_head);
 
             s.state = S_IDENTIFY_NAMESPACE;
@@ -1333,14 +1387,21 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
             let sys = &*s.syscalls;
             if s.identify_ns_buf == 0 {
                 let p = dev_dma_alloc(sys, PAGE, PAGE);
-                if p == 0 { return fault(s, 12, b"[nvme] id-ns alloc fail\0"); }
+                if p == 0 {
+                    return fault(s, 12, b"[nvme] id-ns alloc fail\0");
+                }
                 zero_page(p);
                 s.identify_ns_buf = p;
             }
             submit_admin_cmd(
-                s, OPC_IDENTIFY, CID_IDENTIFY_NS, s.namespace,
+                s,
+                OPC_IDENTIFY,
+                CID_IDENTIFY_NS,
+                s.namespace,
                 s.identify_ns_buf | PCI_DMA_OFFSET,
-                0x00, 0, 0,
+                0x00,
+                0,
+                0,
             );
             s.substate = 1;
             0
@@ -1361,7 +1422,7 @@ unsafe fn step_identify_namespace(s: &mut NvmeState) -> i32 {
                 s.substate = 0;
                 0
             }
-        }
+        },
     }
 }
 
@@ -1393,7 +1454,9 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
             let slot = *s.io_cq.as_ptr().add(q);
             if slot == 0 {
                 let p = dev_dma_alloc(sys, PAGE, PAGE);
-                if p == 0 { return fault(s, 15, b"[nvme] io cq alloc fail\0"); }
+                if p == 0 {
+                    return fault(s, 15, b"[nvme] io cq alloc fail\0");
+                }
                 zero_page(p);
                 *s.io_cq.as_mut_ptr().add(q) = p;
             }
@@ -1411,9 +1474,14 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
             };
             let cid = CID_CREATE_IO_CQ + (s.bringup_qidx as u16) * 0x10;
             submit_admin_cmd(
-                s, OPC_CREATE_CQ, cid, 0,
+                s,
+                OPC_CREATE_CQ,
+                cid,
+                0,
                 cq_phys | PCI_DMA_OFFSET,
-                cdw10, cdw11, 0,
+                cdw10,
+                cdw11,
+                0,
             );
             s.substate = 1;
             0
@@ -1430,7 +1498,7 @@ unsafe fn step_create_io_cq(s: &mut NvmeState) -> i32 {
                 s.substate = 0;
                 0
             }
-        }
+        },
     }
 }
 
@@ -1447,7 +1515,9 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
             let slot = *s.io_sq.as_ptr().add(q);
             if slot == 0 {
                 let p = dev_dma_alloc(sys, PAGE, PAGE);
-                if p == 0 { return fault(s, 18, b"[nvme] io sq alloc fail\0"); }
+                if p == 0 {
+                    return fault(s, 18, b"[nvme] io sq alloc fail\0");
+                }
                 zero_page(p);
                 *s.io_sq.as_mut_ptr().add(q) = p;
             }
@@ -1459,9 +1529,14 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
             let cdw11: u32 = ((qid as u32) << 16) | 0x0000_0001;
             let cid = CID_CREATE_IO_SQ + (s.bringup_qidx as u16) * 0x10;
             submit_admin_cmd(
-                s, OPC_CREATE_SQ, cid, 0,
+                s,
+                OPC_CREATE_SQ,
+                cid,
+                0,
                 sq_phys | PCI_DMA_OFFSET,
-                cdw10, cdw11, 0,
+                cdw10,
+                cdw11,
+                0,
             );
             s.substate = 1;
             0
@@ -1487,7 +1562,7 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
                 }
                 0
             }
-        }
+        },
     }
 }
 
@@ -1507,21 +1582,31 @@ unsafe fn step_create_io_sq(s: &mut NvmeState) -> i32 {
 unsafe fn submit_io_write(
     s: &mut NvmeState,
     q_idx: usize,
-    lba: u64, nlb: u16, cid: u16, nsid: u32, dma_buf: u64,
+    lba: u64,
+    nlb: u16,
+    cid: u16,
+    nsid: u32,
+    dma_buf: u64,
 ) {
     let nlb = clamp_nlb(nlb);
     let prp1_pci = dma_buf | PCI_DMA_OFFSET;
     let cdw = [
         ((cid as u32) << 16) | (OPC_WRITE as u32),
         nsid,
-        0, 0,
-        0, 0,
-        prp1_pci as u32, (prp1_pci >> 32) as u32,
-        0, 0,
+        0,
+        0,
+        0,
+        0,
+        prp1_pci as u32,
+        (prp1_pci >> 32) as u32,
+        0,
+        0,
         lba as u32,
         (lba >> 32) as u32,
-        (nlb - 1) as u32,   // CDW12: NLB-1 (zero-based)
-        0, 0, 0,
+        (nlb - 1) as u32, // CDW12: NLB-1 (zero-based)
+        0,
+        0,
+        0,
     ];
     let sq_base = *s.io_sq.as_ptr().add(q_idx);
     let tail = *s.io_sq_tail.as_ptr().add(q_idx);
@@ -1546,8 +1631,12 @@ unsafe fn submit_io_write(
 /// non-power-loss-protected volatile write cache.
 unsafe fn device_flush(s: &mut NvmeState) -> i32 {
     let drain = bulk_drain_writes(s);
-    if drain != 0 { return drain; }
-    if s.state != S_READY { return E_AGAIN; }
+    if drain != 0 {
+        return drain;
+    }
+    if s.state != S_READY {
+        return E_AGAIN;
+    }
     0
 }
 
@@ -1558,19 +1647,32 @@ unsafe fn device_flush(s: &mut NvmeState) -> i32 {
 /// `pager_spin_poll_cqe(s, cid)`. Flush with a given NSID covers that
 /// namespace regardless of which I/O queue submitted it, so queue 0 is
 /// always a valid choice.
-#[allow(dead_code, reason = "spec-correct Flush; unused while the target controller is \
-    durable-on-completion — see device_flush")]
+#[allow(
+    dead_code,
+    reason = "spec-correct Flush; unused while the target controller is \
+    durable-on-completion — see device_flush"
+)]
 unsafe fn submit_io_flush(s: &mut NvmeState, q_idx: usize, cid: u16, nsid: u32) {
-    if q_idx >= MAX_IO_QUEUES { return; }
+    if q_idx >= MAX_IO_QUEUES {
+        return;
+    }
     let cdw = [
         ((cid as u32) << 16) | (OPC_FLUSH as u32),
         nsid,
-        0, 0,
-        0, 0,
-        0, 0,
-        0, 0,
-        0, 0,
-        0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     ];
     let sq_base = *s.io_sq.as_ptr().add(q_idx);
     let tail = *s.io_sq_tail.as_ptr().add(q_idx);
@@ -1584,7 +1686,13 @@ unsafe fn submit_io_flush(s: &mut NvmeState, q_idx: usize, cid: u16, nsid: u32) 
 /// Clamp a caller-supplied NLB to the driver's single-PRP1 limit.
 #[inline(always)]
 pub fn clamp_nlb(nlb: u16) -> u16 {
-    if nlb == 0 { 1 } else if nlb > MAX_NLB { MAX_NLB } else { nlb }
+    if nlb == 0 {
+        1
+    } else if nlb > MAX_NLB {
+        MAX_NLB
+    } else {
+        nlb
+    }
 }
 
 /// Driver-facing limits, CID-encoding helpers, and the DMA slot
@@ -1598,31 +1706,13 @@ pub fn clamp_nlb(nlb: u16) -> u16 {
 #[cfg(feature = "host-test")]
 pub mod limits {
     pub use super::{
-        MAX_NLB,
-        MAX_IO_QUEUES,
-        MAX_INFLIGHT,
-        ASYNC_BULK_SLOTS,
-        MAX_BULK_PAGES,
-        IO_Q_ENTRIES,
-        PAGE,
-        CID_NONE,
-        CID_IO_WRITE_BASE,
-        CID_PAGER_READ,
-        CID_PAGER_WRITE,
-        CID_PAGER_READ_BULK,
-        CID_BULK_WRITE_BASE,
-        CID_SLOT_BITS,
-        CID_SLOT_MASK,
+        clamp_nlb, encode_write_cid, is_bulk_read_cid, is_bulk_write_cid, is_write_cid,
+        slot_page_addr, write_cid_queue, write_cid_slot,
     };
     pub use super::{
-        clamp_nlb,
-        encode_write_cid,
-        write_cid_queue,
-        write_cid_slot,
-        is_write_cid,
-        is_bulk_write_cid,
-        is_bulk_read_cid,
-        slot_page_addr,
+        ASYNC_BULK_SLOTS, CID_BULK_WRITE_BASE, CID_IO_WRITE_BASE, CID_NONE, CID_PAGER_READ,
+        CID_PAGER_READ_BULK, CID_PAGER_WRITE, CID_SLOT_BITS, CID_SLOT_MASK, IO_Q_ENTRIES,
+        MAX_BULK_PAGES, MAX_INFLIGHT, MAX_IO_QUEUES, MAX_NLB, PAGE,
     };
 }
 
@@ -1636,7 +1726,9 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
             let sys = &*s.syscalls;
             if s.read_buf == 0 {
                 let p = dev_dma_alloc(sys, PAGE, PAGE);
-                if p == 0 { return fault(s, 21, b"[nvme] read buf alloc fail\0"); }
+                if p == 0 {
+                    return fault(s, 21, b"[nvme] read buf alloc fail\0");
+                }
                 s.read_buf = p;
             }
             // Prime the buffer with a sentinel pattern so a
@@ -1670,7 +1762,7 @@ unsafe fn step_read_lba0(s: &mut NvmeState) -> i32 {
                 s.substate = 0;
                 0
             }
-        }
+        },
     }
 }
 
@@ -1687,14 +1779,20 @@ unsafe fn submit_io_read(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16) {
     let cdw = [
         ((cid as u32) << 16) | (OPC_READ as u32),
         s.namespace,
-        0, 0,
-        0, 0,
-        prp1_pci as u32, (prp1_pci >> 32) as u32,
-        0, 0,
+        0,
+        0,
+        0,
+        0,
+        prp1_pci as u32,
+        (prp1_pci >> 32) as u32,
+        0,
+        0,
         lba as u32,         // CDW10: SLBA lo
         (lba >> 32) as u32, // CDW11: SLBA hi
         (nlb - 1) as u32,   // CDW12: NLB-1 (zero-based)
-        0, 0, 0,
+        0,
+        0,
+        0,
     ];
     let sq_base = *s.io_sq.as_ptr().add(q);
     let tail = *s.io_sq_tail.as_ptr().add(q);
@@ -1723,7 +1821,7 @@ unsafe fn submit_io_read(s: &mut NvmeState, lba: u64, nlb: u16, cid: u16) {
 /// the current phase is present (does NOT consume it), `None` if not.
 unsafe fn peek_io_cqe(s: &NvmeState, q: usize) -> Option<(u16, u16)> {
     let cq_base = *s.io_cq.as_ptr().add(q);
-    let head    = *s.io_cq_head.as_ptr().add(q);
+    let head = *s.io_cq_head.as_ptr().add(q);
     let phase_want = *s.io_cq_phase.as_ptr().add(q);
     let cqe = (cq_base + (head as u64) * CQE_BYTES as u64) as *const u32;
     let dw3 = read_volatile(cqe.add(3));
@@ -1732,7 +1830,7 @@ unsafe fn peek_io_cqe(s: &NvmeState, q: usize) -> Option<(u16, u16)> {
         None
     } else {
         let cid = (dw3 & 0xFFFF) as u16;
-        let sc  = ((dw3 >> 17) & 0x7FFF) as u16;
+        let sc = ((dw3 >> 17) & 0x7FFF) as u16;
         Some((cid, sc))
     }
 }
@@ -1765,8 +1863,7 @@ pub fn write_cid_slot(cid: u16) -> usize {
 
 #[inline(always)]
 pub fn is_write_cid(cid: u16) -> bool {
-    cid >= CID_IO_WRITE_BASE
-        && cid < CID_IO_WRITE_BASE + (MAX_IO_QUEUES * MAX_INFLIGHT) as u16
+    cid >= CID_IO_WRITE_BASE && cid < CID_IO_WRITE_BASE + (MAX_IO_QUEUES * MAX_INFLIGHT) as u16
 }
 
 /// Encode a (queue, slot) pair into a write CID. Inverse of
@@ -1776,9 +1873,7 @@ pub fn is_write_cid(cid: u16) -> bool {
 /// formula in the test fixture.
 #[inline(always)]
 pub fn encode_write_cid(queue: usize, slot: usize) -> u16 {
-    CID_IO_WRITE_BASE
-        | ((queue as u16) << CID_SLOT_BITS)
-        | (slot as u16 & CID_SLOT_MASK)
+    CID_IO_WRITE_BASE | ((queue as u16) << CID_SLOT_BITS) | (slot as u16 & CID_SLOT_MASK)
 }
 
 /// Total writes currently outstanding across all queues.
@@ -1840,8 +1935,12 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
                     // the CQE, that's a bug — log and continue rather
                     // than silently mis-retiring an inflight slot.
                     if cq_idx != q {
-                        dev_log(&*s.syscalls, 2,
-                                b"[nvme] write CQE on wrong queue\0".as_ptr(), 31);
+                        dev_log(
+                            &*s.syscalls,
+                            2,
+                            b"[nvme] write CQE on wrong queue\0".as_ptr(),
+                            31,
+                        );
                     }
                     // Retire from the head of this queue's inflight
                     // ring. Head == oldest submission, first to
@@ -1863,7 +1962,11 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
                 // Non-write CQE — must be the read we're waiting on
                 // (admin CQEs land on their own CQ, separate ring).
                 if cid == expected_cid {
-                    return if sc == 0 { CqeResult::Ok } else { CqeResult::Failed(sc) };
+                    return if sc == 0 {
+                        CqeResult::Ok
+                    } else {
+                        CqeResult::Failed(sc)
+                    };
                 }
                 // Stray CQE with a CID we didn't submit. Hitting this
                 // branch points at a CID-allocation bug.
@@ -1883,14 +1986,15 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
             // this one — so no writer ever asks by CID here, but
             // keeping symmetry), use the read_q's oldest inflight
             // submit time.
-            let budget_start = if expected_cid == CID_READ_LBA0
-                || expected_cid < CID_IO_WRITE_BASE
+            let budget_start = if expected_cid == CID_READ_LBA0 || expected_cid < CID_IO_WRITE_BASE
             {
                 s.read_submit_ms
             } else {
                 let q = write_cid_queue(expected_cid);
                 let cnt = *s.inflight_count.as_ptr().add(q);
-                if cnt == 0 { return CqeResult::Pending; }
+                if cnt == 0 {
+                    return CqeResult::Pending;
+                }
                 let head = *s.inflight_head.as_ptr().add(q) as usize;
                 *(*s.inflight_submit_ms.as_ptr().add(q)).as_ptr().add(head)
             };
@@ -1912,10 +2016,13 @@ unsafe fn poll_io_cqe(s: &mut NvmeState, expected_cid: u16) -> CqeResult {
 /// (IOCTL_POLL_NOTIFY); apply it to `current_block` if present.
 /// Returns true if a seek was applied.
 unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
-    if s.blk_out < 0 { return false; }
+    if s.blk_out < 0 {
+        return false;
+    }
     let mut seek: u32 = 0;
     let res = dev_channel_ioctl(
-        &*s.syscalls, s.blk_out,
+        &*s.syscalls,
+        s.blk_out,
         IOCTL_POLL_NOTIFY,
         &mut seek as *mut u32 as *mut u8,
         4,
@@ -1984,7 +2091,9 @@ unsafe fn ensure_write_buf(s: &mut NvmeState, q: usize, slot: usize) -> bool {
 /// load.
 unsafe fn pick_pump_queue(s: &NvmeState) -> Option<usize> {
     let n = s.io_q_count as usize;
-    if n == 0 { return None; }
+    if n == 0 {
+        return None;
+    }
     let cap = s.inflight_cap;
     let start = (s.pump_q as usize) % n;
     for i in 0..n {
@@ -2010,7 +2119,9 @@ unsafe fn pick_pump_queue(s: &NvmeState) -> Option<usize> {
 ///
 /// Returns `true` iff the pump has work in progress this tick.
 unsafe fn pump_requests(s: &mut NvmeState) -> bool {
-    if s.req_in < 0 { return false; }
+    if s.req_in < 0 {
+        return false;
+    }
     let sys = &*s.syscalls;
 
     // Always try to drain completions first so freshly completed
@@ -2034,24 +2145,37 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 let need = REQ_HDR_SIZE - s.req_fill as usize;
                 let dst = s.req_hdr.as_mut_ptr().add(s.req_fill as usize);
                 let n = (sys.channel_read)(s.req_in, dst, need);
-                if n <= 0 { break; }
+                if n <= 0 {
+                    break;
+                }
                 s.req_fill += n as u16;
                 if s.req_fill as usize != REQ_HDR_SIZE {
                     // Partial header — the rest will land next tick.
                     break;
                 }
-                let op = u32::from_le_bytes([
-                    s.req_hdr[0], s.req_hdr[1], s.req_hdr[2], s.req_hdr[3],
-                ]);
+                let op =
+                    u32::from_le_bytes([s.req_hdr[0], s.req_hdr[1], s.req_hdr[2], s.req_hdr[3]]);
                 let lba = u64::from_le_bytes([
-                    s.req_hdr[4],  s.req_hdr[5],  s.req_hdr[6],  s.req_hdr[7],
-                    s.req_hdr[8],  s.req_hdr[9],  s.req_hdr[10], s.req_hdr[11],
+                    s.req_hdr[4],
+                    s.req_hdr[5],
+                    s.req_hdr[6],
+                    s.req_hdr[7],
+                    s.req_hdr[8],
+                    s.req_hdr[9],
+                    s.req_hdr[10],
+                    s.req_hdr[11],
                 ]);
                 let nlb = u32::from_le_bytes([
-                    s.req_hdr[12], s.req_hdr[13], s.req_hdr[14], s.req_hdr[15],
+                    s.req_hdr[12],
+                    s.req_hdr[13],
+                    s.req_hdr[14],
+                    s.req_hdr[15],
                 ]);
                 let nsid = u32::from_le_bytes([
-                    s.req_hdr[16], s.req_hdr[17], s.req_hdr[18], s.req_hdr[19],
+                    s.req_hdr[16],
+                    s.req_hdr[17],
+                    s.req_hdr[18],
+                    s.req_hdr[19],
                 ]);
                 if op != 1 {
                     s.req_fill = 0;
@@ -2083,7 +2207,9 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 let need = (total - s.req_fill as u32) as usize;
                 let dst = (buf as *mut u8).add(s.req_fill as usize);
                 let n = (sys.channel_read)(s.req_in, dst, need);
-                if n <= 0 { break; }
+                if n <= 0 {
+                    break;
+                }
                 s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(n as u32);
                 s.req_fill += n as u16;
                 if s.req_fill as u32 >= total {
@@ -2105,9 +2231,7 @@ unsafe fn pump_requests(s: &mut NvmeState) -> bool {
                 let tail = *s.inflight_tail.as_ptr().add(q) as usize;
                 let row = (*s.write_bufs.as_ptr().add(q)).as_ptr();
                 let buf = *row.add(tail);
-                let cid = CID_IO_WRITE_BASE
-                    | ((q as u16) << CID_SLOT_BITS)
-                    | (tail as u16);
+                let cid = CID_IO_WRITE_BASE | ((q as u16) << CID_SLOT_BITS) | (tail as u16);
                 let payload_bytes = (s.req_nlb as u32) * BLOCK_SIZE;
                 dev_dma_flush(sys, buf, payload_bytes);
                 submit_io_write(s, q, s.req_lba, s.req_nlb, cid, s.req_nsid, buf);
@@ -2167,7 +2291,7 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
         if w == 0xFFFF_FFFF {
             break;
         }
-        let id   = (w & 0xFF) as u8;
+        let id = (w & 0xFF) as u8;
         let next = ((w >> 8) & 0xFC) as u16;
 
         let mut buf = [0u8; 96];
@@ -2187,7 +2311,11 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
         pos += at.len();
         for i in 0..4 {
             let n = ((ptr >> (12 - i * 4)) & 0xF) as u16;
-            *p.add(pos) = if n < 10 { b'0' + n as u8 } else { b'a' + (n as u8 - 10) };
+            *p.add(pos) = if n < 10 {
+                b'0' + n as u8
+            } else {
+                b'a' + (n as u8 - 10)
+            };
             pos += 1;
         }
 
@@ -2212,9 +2340,20 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
             let mut v = table_sz as u32;
             let mut d = [0u8; 4];
             let mut dn = 0usize;
-            if v == 0 { d[0] = b'0'; dn = 1; }
-            while v > 0 { d[dn] = b'0' + (v % 10) as u8; v /= 10; dn += 1; }
-            while dn > 0 { dn -= 1; *p.add(pos) = d[dn]; pos += 1; }
+            if v == 0 {
+                d[0] = b'0';
+                dn = 1;
+            }
+            while v > 0 {
+                d[dn] = b'0' + (v % 10) as u8;
+                v /= 10;
+                dn += 1;
+            }
+            while dn > 0 {
+                dn -= 1;
+                *p.add(pos) = d[dn];
+                pos += 1;
+            }
 
             let tb = b" tbl=bar";
             core::ptr::copy_nonoverlapping(tb.as_ptr(), p.add(pos), tb.len());
@@ -2253,7 +2392,9 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
 
         dev_log(sys, 3, p, pos);
 
-        if next == 0 || next == ptr { break; }
+        if next == 0 || next == ptr {
+            break;
+        }
         ptr = next;
         guard += 1;
     }
@@ -2274,8 +2415,12 @@ unsafe fn walk_pcie_caps(s: &mut NvmeState) {
 /// 4. Write those into MSI-X table entry 0 with `ctrl=0` (unmasked).
 /// 5. Flip bit 15 (MSI-X Enable) in the cap's Message Control.
 unsafe fn enable_msix(s: &mut NvmeState) -> bool {
-    if s.msix_enabled != 0 { return true; }
-    if s.msix_cap_offset == 0 || s.bar0_virt == 0 { return false; }
+    if s.msix_enabled != 0 {
+        return true;
+    }
+    if s.msix_cap_offset == 0 || s.bar0_virt == 0 {
+        return false;
+    }
 
     let sys = &*s.syscalls;
 
@@ -2321,7 +2466,7 @@ unsafe fn enable_msix(s: &mut NvmeState) -> bool {
     // Table entry layout (16 bytes):
     //   +0  addr_lo   +4  addr_hi   +8  data   +12 vector control
     // `ctrl = 0` leaves the vector unmasked.
-    write_volatile((tbl_virt + 0x0) as *mut u32, addr as u32);
+    write_volatile(tbl_virt as *mut u32, addr as u32);
     write_volatile((tbl_virt + 0x4) as *mut u32, (addr >> 32) as u32);
     write_volatile((tbl_virt + 0x8) as *mut u32, data);
     write_volatile((tbl_virt + 0xC) as *mut u32, 0);
@@ -2404,14 +2549,24 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
     // failure here returns 0, leaving the module below Ready until
     // the next tick retries (lazy alloc helpers are idempotent on
     // success).
-    if s.pager_registered == 0 { return 0; }
-    if !pager_ensure_buf(s) { return 0; }
-    if !sync_blk_ensure_buf(s) { return 0; }
+    if s.pager_registered == 0 {
+        return 0;
+    }
+    if !pager_ensure_buf(s) {
+        return 0;
+    }
+    if !sync_blk_ensure_buf(s) {
+        return 0;
+    }
     {
         let mut s_idx: usize = 0;
         while s_idx < ASYNC_BULK_SLOTS {
-            if !pager_ensure_slot_bufs(s, s_idx) { return 0; }
-            if !pager_ensure_prp_list(s, s_idx) { return 0; }
+            if !pager_ensure_slot_bufs(s, s_idx) {
+                return 0;
+            }
+            if !pager_ensure_prp_list(s, s_idx) {
+                return 0;
+            }
             s_idx += 1;
         }
     }
@@ -2548,7 +2703,9 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             let src = (s.read_buf as *const u8).add(s.write_offset as usize);
             let n = (sys.channel_write)(s.blk_out, src, remaining as usize);
             if n < 0 {
-                if n == E_AGAIN { return 0; }
+                if n == E_AGAIN {
+                    return 0;
+                }
                 return fault(s, 26, b"[nvme] blocks channel write err\0");
             }
             let written = n as u32;
@@ -2627,15 +2784,16 @@ unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut 
     if s.ns_size == 0 {
         return E_AGAIN;
     }
-    let requested_nsid = u32::from_le_bytes([
-        *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-    ]);
+    let requested_nsid = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
     if requested_nsid != 0 && requested_nsid != s.namespace {
         return E_INVAL;
     }
     let size = s.ns_size.to_le_bytes();
     let mut i = 0usize;
-    while i < 8 { *arg.add(i) = size[i]; i += 1; }
+    while i < 8 {
+        *arg.add(i) = size[i];
+        i += 1;
+    }
     *arg.add(8) = s.ns_lbads;
     0
 }
@@ -2651,18 +2809,24 @@ unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut 
 ///   the dispatch call; no channel involvement. Used by file-system
 ///   providers (`fat32` FS_CONTRACT path) that need bytes immediately.
 unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
-    if state.is_null() { return E_INVAL; }
+    if state.is_null() {
+        return E_INVAL;
+    }
     let s = &mut *(state as *mut NvmeState);
     // FLUSH carries no arg buffer (kernel forwards zero-payload ioctl as null).
-    if cmd == IOCTL_BLOCKS_FLUSH_SYNC { return device_flush(s); }
-    if arg.is_null() { return E_INVAL; }
+    if cmd == IOCTL_BLOCKS_FLUSH_SYNC {
+        return device_flush(s);
+    }
+    if arg.is_null() {
+        return E_INVAL;
+    }
     match cmd {
         IOCTL_BLOCKS_READ_NLB => {
-            let lba = u32::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-            ]);
+            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 { return E_INVAL; }
+            if nlb_raw == 0 {
+                return E_INVAL;
+            }
             let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
             s.pending_batch_lba = lba;
             s.pending_batch_nlb = nlb;
@@ -2670,39 +2834,59 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
             0
         }
         IOCTL_BLOCKS_READ_LBAS_SYNC => {
-            let lba = u32::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-            ]);
+            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 { return E_INVAL; }
+            if nlb_raw == 0 {
+                return E_INVAL;
+            }
             let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
             let buf_u64 = u64::from_le_bytes([
-                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
-                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+                *arg.add(8),
+                *arg.add(9),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
+                *arg.add(14),
+                *arg.add(15),
             ]);
             sync_blk_read(s, lba as u64, nlb, buf_u64 as *mut u8)
         }
         IOCTL_BLOCKS_WRITE_LBAS_SYNC => {
-            let lba = u32::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-            ]);
+            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 { return E_INVAL; }
+            if nlb_raw == 0 {
+                return E_INVAL;
+            }
             let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
             let buf_u64 = u64::from_le_bytes([
-                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
-                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+                *arg.add(8),
+                *arg.add(9),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
+                *arg.add(14),
+                *arg.add(15),
             ]);
             sync_blk_write(s, lba as u64, nlb, buf_u64 as *const u8)
         }
         IOCTL_BLOCKS_WRITE_LBAS_ASYNC => {
             let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 { return E_INVAL; }
+            if nlb_raw == 0 {
+                return E_INVAL;
+            }
             let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
             let buf_u64 = u64::from_le_bytes([
-                *arg.add(8),  *arg.add(9),  *arg.add(10), *arg.add(11),
-                *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+                *arg.add(8),
+                *arg.add(9),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
+                *arg.add(14),
+                *arg.add(15),
             ]);
             async_blk_write(s, lba as u64, nlb, buf_u64 as *const u8)
         }
@@ -2712,14 +2896,23 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
             harvest_writes(s);
             let seq = s.write_submit_seq.to_le_bytes();
             let mut i = 0usize;
-            while i < 8 { *arg.add(i) = seq[i]; i += 1; }
+            while i < 8 {
+                *arg.add(i) = seq[i];
+                i += 1;
+            }
             0
         }
         IOCTL_BLOCKS_FENCE_POLL => {
             harvest_writes(s);
             let ticket = u64::from_le_bytes([
-                *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-                *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+                *arg,
+                *arg.add(1),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
             ]);
             // A fence covering a failed write reports error permanently —
             // the caller must withhold its durable ack and recover (fall
@@ -2728,7 +2921,11 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
             if s.first_fail_seq != 0 && ticket >= s.first_fail_seq {
                 return E_INVAL;
             }
-            if s.write_complete_seq >= ticket { 0 } else { 1 }
+            if s.write_complete_seq >= ticket {
+                0
+            } else {
+                1
+            }
         }
         // FLUSH handled above (no arg buffer).
         _ => E_NOSYS,
@@ -2757,7 +2954,7 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
 // NVME_ARENA_LBA_BASE offset.
 
 const PAGE_BYTES: u32 = 4096;
-const PAGE_LBAS:  u16 = 8; // 4 KB page = 8 × 512 B LBAs
+const PAGE_LBAS: u16 = 8; // 4 KB page = 8 × 512 B LBAs
 
 /// Spin-poll the I/O CQs until a CQE with `expected_cid` arrives.
 /// Scans all `io_q_count` queues each pass so a write CQE that lands
@@ -2805,10 +3002,8 @@ unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
                 dev_log(&*s.syscalls, 2, b"[nvme] pager: stray cqe\0".as_ptr(), 22);
             }
         }
-        if !made_progress {
-            if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-                return E_AGAIN;
-            }
+        if !made_progress && now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
+            return E_AGAIN;
         }
     }
 }
@@ -2816,8 +3011,7 @@ unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
 /// True iff `cid` belongs to the async bulk-write CID range.
 #[inline(always)]
 pub fn is_bulk_write_cid(cid: u16) -> bool {
-    cid >= CID_BULK_WRITE_BASE
-        && cid < CID_BULK_WRITE_BASE + (ASYNC_BULK_SLOTS as u16)
+    cid >= CID_BULK_WRITE_BASE && cid < CID_BULK_WRITE_BASE + (ASYNC_BULK_SLOTS as u16)
 }
 
 /// True iff `cid` belongs to the async bulk-read CID range
@@ -2826,8 +3020,7 @@ pub fn is_bulk_write_cid(cid: u16) -> bool {
 /// write-side encoding.
 #[inline(always)]
 pub fn is_bulk_read_cid(cid: u16) -> bool {
-    cid >= CID_PAGER_READ_BULK
-        && cid < CID_PAGER_READ_BULK + (ASYNC_BULK_SLOTS as u16)
+    cid >= CID_PAGER_READ_BULK && cid < CID_PAGER_READ_BULK + (ASYNC_BULK_SLOTS as u16)
 }
 
 /// Acquire the next free async bulk-write slot. If the ring is full,
@@ -2866,10 +3059,8 @@ unsafe fn bulk_acquire_slot(s: &mut NvmeState) -> Result<usize, i32> {
                     }
                 }
             }
-            if !progress {
-                if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-                    return Err(E_AGAIN);
-                }
+            if !progress && now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
+                return Err(E_AGAIN);
             }
         }
     }
@@ -2974,10 +3165,8 @@ unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
                 }
             }
         }
-        if !progress {
-            if now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
-                return E_AGAIN;
-            }
+        if !progress && now_ms(s).saturating_sub(start) > PAGER_SUBMIT_BUDGET_MS {
+            return E_AGAIN;
         }
     }
     let err = s.bulk_err;
@@ -3006,12 +3195,18 @@ unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
 /// NEON-paired memcpy (`nc_to_c_memcpy_aligned`) to extract
 /// throughput from the Non-Cacheable bus on Cortex-A76.
 unsafe fn pager_ensure_slot_bufs(s: &mut NvmeState, slot: usize) -> bool {
-    if slot >= ASYNC_BULK_SLOTS { return false; }
+    if slot >= ASYNC_BULK_SLOTS {
+        return false;
+    }
     let base = slot * (MAX_BULK_PAGES as usize);
-    if s.pager_write_bufs[base] != 0 { return true; }
+    if s.pager_write_bufs[base] != 0 {
+        return true;
+    }
     let bytes = MAX_BULK_PAGES * PAGE;
     let p = dev_dma_alloc(&*s.syscalls, bytes, PAGE);
-    if p == 0 { return false; }
+    if p == 0 {
+        return false;
+    }
     let mut i: usize = 0;
     while i < (MAX_BULK_PAGES as usize) {
         s.pager_write_bufs[base + i] = slot_page_addr(p, i);
@@ -3023,9 +3218,9 @@ unsafe fn pager_ensure_slot_bufs(s: &mut NvmeState, slot: usize) -> bool {
 /// Per-page DMA address inside a slot's contiguous DMA region.
 /// `slot_base` is the address returned by `dev_dma_alloc(MAX_BULK_PAGES
 /// * PAGE, PAGE)`; the bulk memcpy that follows assumes the resulting
-/// per-page addresses are PAGE-strided, which is what this function
-/// guarantees. Exposed so the harness can pin the contiguity invariant
-/// without instantiating a full driver state.
+///   per-page addresses are PAGE-strided, which is what this function
+///   guarantees. Exposed so the harness can pin the contiguity invariant
+///   without instantiating a full driver state.
 #[inline(always)]
 pub fn slot_page_addr(slot_base: u64, page_idx: usize) -> u64 {
     slot_base + (page_idx as u64) * (PAGE as u64)
@@ -3036,9 +3231,13 @@ pub fn slot_page_addr(slot_base: u64, page_idx: usize) -> u64 {
 /// have to issue DC CVAC / DC IVAC around each I/O — simpler and
 /// paging is never the latency-critical path anyway.
 unsafe fn pager_ensure_buf(s: &mut NvmeState) -> bool {
-    if s.pager_buf != 0 { return true; }
+    if s.pager_buf != 0 {
+        return true;
+    }
     let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
-    if p == 0 { return false; }
+    if p == 0 {
+        return false;
+    }
     s.pager_buf = p;
     true
 }
@@ -3047,9 +3246,13 @@ unsafe fn pager_ensure_buf(s: &mut NvmeState) -> bool {
 /// `IOCTL_BLOCKS_READ_LBAS_SYNC` path used by fat32's FS dispatch.
 /// Same coherent-arena tradeoff as `pager_buf`.
 unsafe fn sync_blk_ensure_buf(s: &mut NvmeState) -> bool {
-    if s.sync_blk_buf != 0 { return true; }
+    if s.sync_blk_buf != 0 {
+        return true;
+    }
     let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
-    if p == 0 { return false; }
+    if p == 0 {
+        return false;
+    }
     s.sync_blk_buf = p;
     true
 }
@@ -3060,29 +3263,39 @@ unsafe fn sync_blk_ensure_buf(s: &mut NvmeState) -> bool {
 /// dedicated `sync_blk_buf` lives outside the streaming-read path so
 /// fat32's FS dispatch never aliases the existing `read_buf`-driven
 /// channel pipeline. Returns 0 on success, negative errno otherwise.
-unsafe fn sync_blk_read(
-    s: &mut NvmeState,
-    lba: u64,
-    nlb: u16,
-    out_buf: *mut u8,
-) -> i32 {
-    if s.state != S_READY { return E_AGAIN; }
-    if nlb == 0 || nlb > MAX_NLB { return E_INVAL; }
-    if out_buf.is_null() { return E_INVAL; }
-    if !sync_blk_ensure_buf(s) { return E_INVAL; }
+unsafe fn sync_blk_read(s: &mut NvmeState, lba: u64, nlb: u16, out_buf: *mut u8) -> i32 {
+    if s.state != S_READY {
+        return E_AGAIN;
+    }
+    if nlb == 0 || nlb > MAX_NLB {
+        return E_INVAL;
+    }
+    if out_buf.is_null() {
+        return E_INVAL;
+    }
+    if !sync_blk_ensure_buf(s) {
+        return E_INVAL;
+    }
 
     let pager_q: usize = 0;
     let prp1_pci = s.sync_blk_buf | PCI_DMA_OFFSET;
     let cdw = [
         ((CID_PAGER_READ as u32) << 16) | (OPC_READ as u32),
         s.namespace,
-        0, 0,
-        0, 0,
-        prp1_pci as u32, (prp1_pci >> 32) as u32,
-        0, 0,
-        lba as u32, (lba >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        prp1_pci as u32,
+        (prp1_pci >> 32) as u32,
+        0,
+        0,
+        lba as u32,
+        (lba >> 32) as u32,
         (nlb as u32) - 1,
-        0, 0, 0,
+        0,
+        0,
+        0,
     ];
     let sq_base = *s.io_sq.as_ptr().add(pager_q);
     let tail = *s.io_sq_tail.as_ptr().add(pager_q);
@@ -3091,7 +3304,9 @@ unsafe fn sync_blk_read(
     *s.io_sq_tail.as_mut_ptr().add(pager_q) = new_tail;
     reg_w32(s, sq_doorbell(s, IO_QID as u32 + pager_q as u32), new_tail);
     let rc = pager_spin_poll_cqe(s, CID_PAGER_READ);
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     let bytes = (nlb as usize) * (BLOCK_SIZE as usize);
     let mut i = 0usize;
     while i < bytes {
@@ -3118,16 +3333,19 @@ unsafe fn sync_blk_read(
 /// doorbell. Guarantees the write reached the controller — NOT NAND
 /// durability; the caller issues `PAGER_OP_FLUSH` for fsync grade.
 /// Returns 0 on success, negative errno otherwise.
-unsafe fn sync_blk_write(
-    s: &mut NvmeState,
-    lba: u64,
-    nlb: u16,
-    in_buf: *const u8,
-) -> i32 {
-    if s.state != S_READY { return E_AGAIN; }
-    if nlb == 0 || nlb > MAX_NLB { return E_INVAL; }
-    if in_buf.is_null() { return E_INVAL; }
-    if !sync_blk_ensure_buf(s) { return E_INVAL; }
+unsafe fn sync_blk_write(s: &mut NvmeState, lba: u64, nlb: u16, in_buf: *const u8) -> i32 {
+    if s.state != S_READY {
+        return E_AGAIN;
+    }
+    if nlb == 0 || nlb > MAX_NLB {
+        return E_INVAL;
+    }
+    if in_buf.is_null() {
+        return E_INVAL;
+    }
+    if !sync_blk_ensure_buf(s) {
+        return E_INVAL;
+    }
 
     let bytes = (nlb as usize) * (BLOCK_SIZE as usize);
     let mut i = 0usize;
@@ -3140,7 +3358,15 @@ unsafe fn sync_blk_write(
     }
 
     let pager_q: usize = 0;
-    submit_io_write(s, pager_q, lba, nlb, CID_PAGER_WRITE, s.namespace, s.sync_blk_buf);
+    submit_io_write(
+        s,
+        pager_q,
+        lba,
+        nlb,
+        CID_PAGER_WRITE,
+        s.namespace,
+        s.sync_blk_buf,
+    );
     pager_spin_poll_cqe(s, CID_PAGER_WRITE)
 }
 
@@ -3157,9 +3383,15 @@ unsafe fn sync_blk_write(
 /// same `CID_BULK_WRITE_BASE + slot` completion identity the pager uses,
 /// so `harvest_writes` retires both uniformly.
 unsafe fn async_blk_write(s: &mut NvmeState, lba: u64, nlb: u16, in_buf: *const u8) -> i32 {
-    if s.state != S_READY { return E_AGAIN; }
-    if nlb == 0 || nlb > MAX_NLB { return E_INVAL; }
-    if in_buf.is_null() { return E_INVAL; }
+    if s.state != S_READY {
+        return E_AGAIN;
+    }
+    if nlb == 0 || nlb > MAX_NLB {
+        return E_INVAL;
+    }
+    if in_buf.is_null() {
+        return E_INVAL;
+    }
     // Ring full: one non-blocking harvest to free a slot, then give up
     // for this step (backpressure) rather than spin-drain.
     if (s.bulk_count as usize) >= ASYNC_BULK_SLOTS {
@@ -3169,10 +3401,14 @@ unsafe fn async_blk_write(s: &mut NvmeState, lba: u64, nlb: u16, in_buf: *const 
         }
     }
     let slot = s.bulk_tail as usize;
-    if !pager_ensure_slot_bufs(s, slot) { return E_INVAL; }
+    if !pager_ensure_slot_bufs(s, slot) {
+        return E_INVAL;
+    }
     let base = slot * (MAX_BULK_PAGES as usize);
     let dst = s.pager_write_bufs[base];
-    if dst == 0 { return E_INVAL; }
+    if dst == 0 {
+        return E_INVAL;
+    }
     let bytes = (nlb as usize) * (BLOCK_SIZE as usize);
     let mut i = 0usize;
     while i < bytes {
@@ -3184,7 +3420,9 @@ unsafe fn async_blk_write(s: &mut NvmeState, lba: u64, nlb: u16, in_buf: *const 
     s.bulk_tail = (s.bulk_tail + 1) % (ASYNC_BULK_SLOTS as u8);
     s.bulk_count += 1;
     s.write_submit_seq = s.write_submit_seq.wrapping_add(1);
-    if s.bulk_count > s.bulk_depth_peak { s.bulk_depth_peak = s.bulk_count; }
+    if s.bulk_count > s.bulk_depth_peak {
+        s.bulk_depth_peak = s.bulk_count;
+    }
     0
 }
 
@@ -3192,10 +3430,16 @@ unsafe fn async_blk_write(s: &mut NvmeState, lba: u64, nlb: u16, in_buf: *const 
 /// One per slot — the slot's outstanding command points at it while
 /// in flight, so they cannot share.
 unsafe fn pager_ensure_prp_list(s: &mut NvmeState, slot: usize) -> bool {
-    if slot >= ASYNC_BULK_SLOTS { return false; }
-    if s.bulk_prp_list_bufs[slot] != 0 { return true; }
+    if slot >= ASYNC_BULK_SLOTS {
+        return false;
+    }
+    if s.bulk_prp_list_bufs[slot] != 0 {
+        return true;
+    }
     let p = dev_dma_alloc(&*s.syscalls, PAGE, PAGE);
-    if p == 0 { return false; }
+    if p == 0 {
+        return false;
+    }
     s.bulk_prp_list_bufs[slot] = p;
     true
 }
@@ -3236,8 +3480,12 @@ unsafe fn submit_bulk_op(
 
     // Total LBAs across all pages. NLB field is zero-based.
     let nlb = count * (PAGE_LBAS as u32);
-    if nlb == 0 || nlb > 65536 { return E_INVAL; }
-    if slot >= ASYNC_BULK_SLOTS { return E_INVAL; }
+    if nlb == 0 || nlb > 65536 {
+        return E_INVAL;
+    }
+    if slot >= ASYNC_BULK_SLOTS {
+        return E_INVAL;
+    }
 
     let base = slot * (MAX_BULK_PAGES as usize);
     let prp1_pci = s.pager_write_bufs[base] | PCI_DMA_OFFSET;
@@ -3264,13 +3512,20 @@ unsafe fn submit_bulk_op(
     let cdw = [
         ((cid as u32) << 16) | (opcode as u32),
         s.namespace,
-        0, 0,
-        0, 0,
-        prp1_pci as u32, (prp1_pci >> 32) as u32,
-        prp2_lo, prp2_hi,
-        lba as u32, (lba >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        prp1_pci as u32,
+        (prp1_pci >> 32) as u32,
+        prp2_lo,
+        prp2_hi,
+        lba as u32,
+        (lba >> 32) as u32,
         nlb - 1,
-        0, 0, 0,
+        0,
+        0,
+        0,
     ];
     let sq_base = *s.io_sq.as_ptr().add(pager_q);
     let tail = *s.io_sq_tail.as_ptr().add(pager_q);
@@ -3295,8 +3550,12 @@ unsafe fn handle_pager_bulk(
     count: u32,
     user_buf: *mut u8,
 ) -> i32 {
-    if count == 0 { return E_INVAL; }
-    if count > MAX_BULK_PAGES { return E_INVAL; }
+    if count == 0 {
+        return E_INVAL;
+    }
+    if count > MAX_BULK_PAGES {
+        return E_INVAL;
+    }
 
     let lba = NVME_ARENA_LBA_BASE
         + ((arena_base_page as u64) + (vpage_start as u64)) * (PAGE_LBAS as u64);
@@ -3309,8 +3568,12 @@ unsafe fn handle_pager_bulk(
             Ok(s) => s,
             Err(e) => return e,
         };
-        if !pager_ensure_prp_list(s, slot) { return E_INVAL; }
-        if !pager_ensure_slot_bufs(s, slot) { return E_INVAL; }
+        if !pager_ensure_prp_list(s, slot) {
+            return E_INVAL;
+        }
+        if !pager_ensure_slot_bufs(s, slot) {
+            return E_INVAL;
+        }
         let base = slot * (MAX_BULK_PAGES as usize);
         // Stage every page from caller's buffer into the slot's DMA
         // region. DMA pages are coherent so no flush needed before
@@ -3324,7 +3587,9 @@ unsafe fn handle_pager_bulk(
         );
         let cid = CID_BULK_WRITE_BASE + (slot as u16);
         let rc = submit_bulk_op(s, true, lba, count, cid, slot);
-        if rc != 0 { return rc; }
+        if rc != 0 {
+            return rc;
+        }
         // Update ring before returning so the next call sees the
         // slot as in-flight even before the CQE arrives.
         s.bulk_tail = (s.bulk_tail + 1) % (ASYNC_BULK_SLOTS as u8);
@@ -3343,15 +3608,25 @@ unsafe fn handle_pager_bulk(
     // coherent before we read it. Then borrow slot 0's buffers and
     // PRP-list (no async writes can be using them post-drain).
     let drain_rc = bulk_drain_writes(s);
-    if drain_rc != 0 { return drain_rc; }
+    if drain_rc != 0 {
+        return drain_rc;
+    }
     let slot: usize = 0;
-    if !pager_ensure_prp_list(s, slot) { return E_INVAL; }
-    if !pager_ensure_slot_bufs(s, slot) { return E_INVAL; }
+    if !pager_ensure_prp_list(s, slot) {
+        return E_INVAL;
+    }
+    if !pager_ensure_slot_bufs(s, slot) {
+        return E_INVAL;
+    }
     let base = slot * (MAX_BULK_PAGES as usize);
     let rc = submit_bulk_op(s, false, lba, count, CID_PAGER_READ_BULK, slot);
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     let pr = pager_spin_poll_cqe(s, CID_PAGER_READ_BULK);
-    if pr != 0 { return pr; }
+    if pr != 0 {
+        return pr;
+    }
     // DMA pages are coherent and physically contiguous. Use the
     // NEON-paired memcpy: see `nc_to_c_memcpy_aligned` — copying
     // from Non-Cacheable memory with 128-bit register pairs keeps
@@ -3388,10 +3663,12 @@ struct ReadSlot {
 /// touching the tail if `len == 0`.
 #[inline(always)]
 unsafe fn nc_to_c_memcpy_aligned(dst: *mut u8, src: *const u8, len: usize) {
-    if len == 0 { return; }
-    debug_assert!(len % 128 == 0);
-    debug_assert!((src as usize) % 16 == 0);
-    debug_assert!((dst as usize) % 16 == 0);
+    if len == 0 {
+        return;
+    }
+    debug_assert!(len.is_multiple_of(128));
+    debug_assert!((src as usize).is_multiple_of(16));
+    debug_assert!((dst as usize).is_multiple_of(16));
     let iters = len / 128;
     core::arch::asm!(
         "1:",
@@ -3439,19 +3716,25 @@ unsafe fn pager_read_pipelined(
     count: u32,
     user_buf: *mut u8,
 ) -> i32 {
-    if count == 0 { return E_INVAL; }
-    if user_buf.is_null() { return E_INVAL; }
+    if count == 0 {
+        return E_INVAL;
+    }
+    if user_buf.is_null() {
+        return E_INVAL;
+    }
 
     let t_enter = dev_micros(&*s.syscalls);
     let drain_rc = bulk_drain_writes(s);
-    if drain_rc != 0 { return drain_rc; }
+    if drain_rc != 0 {
+        return drain_rc;
+    }
     let t_submit_start = dev_micros(&*s.syscalls);
     let mut copy_us_local: u64 = 0;
 
-    let mut slots: [ReadSlot; ASYNC_BULK_SLOTS] = [
-        ReadSlot { user_page_offset: 0, chunk: 0 };
-        ASYNC_BULK_SLOTS
-    ];
+    let mut slots: [ReadSlot; ASYNC_BULK_SLOTS] = [ReadSlot {
+        user_page_offset: 0,
+        chunk: 0,
+    }; ASYNC_BULK_SLOTS];
 
     let base_lba = NVME_ARENA_LBA_BASE
         + ((arena_base_page as u64) + (vpage_start as u64)) * (PAGE_LBAS as u64);
@@ -3464,12 +3747,18 @@ unsafe fn pager_read_pipelined(
     let mut slot_idx: usize = 0;
     while slot_idx < ASYNC_BULK_SLOTS && submitted_pages < count {
         let chunk = (count - submitted_pages).min(MAX_BULK_PAGES);
-        if !pager_ensure_prp_list(s, slot_idx) { return E_INVAL; }
-        if !pager_ensure_slot_bufs(s, slot_idx) { return E_INVAL; }
+        if !pager_ensure_prp_list(s, slot_idx) {
+            return E_INVAL;
+        }
+        if !pager_ensure_slot_bufs(s, slot_idx) {
+            return E_INVAL;
+        }
         let cid = CID_PAGER_READ_BULK + (slot_idx as u16);
         let lba = base_lba + (submitted_pages as u64) * (PAGE_LBAS as u64);
         let rc = submit_bulk_op(s, false, lba, chunk, cid, slot_idx);
-        if rc != 0 { return rc; }
+        if rc != 0 {
+            return rc;
+        }
         *slots.as_mut_ptr().add(slot_idx) = ReadSlot {
             user_page_offset: submitted_pages,
             chunk: chunk as u16,
@@ -3522,14 +3811,9 @@ unsafe fn pager_read_pipelined(
                     // the AXI read pipeline.
                     let t_copy_start = dev_micros(&*s.syscalls);
                     let src = s.pager_write_bufs[base] as *const u8;
-                    let dst = user_buf.add(
-                        (info.user_page_offset as usize) * (PAGE_BYTES as usize),
-                    );
-                    nc_to_c_memcpy_aligned(
-                        dst,
-                        src,
-                        (chunk as usize) * (PAGE_BYTES as usize),
-                    );
+                    let dst =
+                        user_buf.add((info.user_page_offset as usize) * (PAGE_BYTES as usize));
+                    nc_to_c_memcpy_aligned(dst, src, (chunk as usize) * (PAGE_BYTES as usize));
                     copy_us_local += dev_micros(&*s.syscalls).saturating_sub(t_copy_start);
                     completed_pages += chunk;
                     in_flight -= 1;
@@ -3543,10 +3827,11 @@ unsafe fn pager_read_pipelined(
                             return E_INVAL;
                         }
                         let next_cid = CID_PAGER_READ_BULK + (slot as u16);
-                        let next_lba = base_lba
-                            + (submitted_pages as u64) * (PAGE_LBAS as u64);
+                        let next_lba = base_lba + (submitted_pages as u64) * (PAGE_LBAS as u64);
                         let rc = submit_bulk_op(s, false, next_lba, next_chunk, next_cid, slot);
-                        if rc != 0 { return rc; }
+                        if rc != 0 {
+                            return rc;
+                        }
                         *slots.as_mut_ptr().add(slot) = ReadSlot {
                             user_page_offset: submitted_pages,
                             chunk: next_chunk as u16,
@@ -3585,7 +3870,12 @@ unsafe fn pager_read_pipelined(
                 }
 
                 // Stray CID — log and keep pumping.
-                dev_log(&*s.syscalls, 2, b"[nvme] pager read: stray cqe\0".as_ptr(), 28);
+                dev_log(
+                    &*s.syscalls,
+                    2,
+                    b"[nvme] pager read: stray cqe\0".as_ptr(),
+                    28,
+                );
             }
         }
         if !made_progress {
@@ -3602,24 +3892,32 @@ unsafe fn pager_read_pipelined(
     }
     let t_exit = dev_micros(&*s.syscalls);
     s.read_call_count = s.read_call_count.wrapping_add(1);
-    s.read_submit_us = s.read_submit_us
+    s.read_submit_us = s
+        .read_submit_us
         .wrapping_add(t_poll_start.saturating_sub(t_submit_start));
     // Poll = from end-of-submit to end-of-call MINUS the time the
     // memcpy used. Captures CQE-wait time minus copy time.
-    s.read_poll_us = s.read_poll_us
-        .wrapping_add(t_exit.saturating_sub(t_poll_start).saturating_sub(copy_us_local));
+    s.read_poll_us = s.read_poll_us.wrapping_add(
+        t_exit
+            .saturating_sub(t_poll_start)
+            .saturating_sub(copy_us_local),
+    );
     s.read_copy_us = s.read_copy_us.wrapping_add(copy_us_local);
-    s.read_total_us = s.read_total_us
-        .wrapping_add(t_exit.saturating_sub(t_enter));
+    s.read_total_us = s.read_total_us.wrapping_add(t_exit.saturating_sub(t_enter));
     0
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.backing_provider_dispatch"]
 pub unsafe extern "C" fn backing_provider_dispatch(
-    state: *mut u8, opcode: u32, arg: *mut u8, arg_len: usize,
+    state: *mut u8,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
 ) -> i32 {
-    if state.is_null() { return E_INVAL; }
+    if state.is_null() {
+        return E_INVAL;
+    }
     let s = &mut *(state as *mut NvmeState);
 
     if opcode == PAGER_OP_FLUSH {
@@ -3635,26 +3933,32 @@ pub unsafe extern "C" fn backing_provider_dispatch(
 
     // The module must be in S_READY before pager I/O is legal — the
     // I/O queue pair isn't live until CreateIoCQ/CreateIoSQ complete.
-    if s.state != S_READY { return E_AGAIN; }
+    if s.state != S_READY {
+        return E_AGAIN;
+    }
 
     // Bulk multi-page transfers. Arg layout (24 bytes):
     //   [arena_base_page: u32][vpage_start: u32][count: u32][_pad: u32][buf_ptr: u64]
     if opcode == PAGER_OP_READ_BULK || opcode == PAGER_OP_WRITE_BULK {
-        if arg.is_null() || arg_len < 24 { return E_INVAL; }
-        let arena_base_page = u32::from_le_bytes([
-            *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-        ]);
-        let vpage_start = u32::from_le_bytes([
-            *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
-        ]);
-        let count = u32::from_le_bytes([
-            *arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11),
-        ]);
+        if arg.is_null() || arg_len < 24 {
+            return E_INVAL;
+        }
+        let arena_base_page = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+        let vpage_start = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+        let count = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
         let buf_ptr = u64::from_le_bytes([
-            *arg.add(16), *arg.add(17), *arg.add(18), *arg.add(19),
-            *arg.add(20), *arg.add(21), *arg.add(22), *arg.add(23),
+            *arg.add(16),
+            *arg.add(17),
+            *arg.add(18),
+            *arg.add(19),
+            *arg.add(20),
+            *arg.add(21),
+            *arg.add(22),
+            *arg.add(23),
         ]) as *mut u8;
-        if buf_ptr.is_null() { return E_INVAL; }
+        if buf_ptr.is_null() {
+            return E_INVAL;
+        }
         if opcode == PAGER_OP_READ_BULK {
             // Pipelined read: submits up to ASYNC_BULK_SLOTS
             // MAX_BULK_PAGES-sized commands across all I/O queues,
@@ -3673,15 +3977,10 @@ pub unsafe extern "C" fn backing_provider_dispatch(
         while done < count {
             let chunk = (count - done).min(MAX_BULK_PAGES);
             let user = buf_ptr.add((done as usize) * (PAGE_BYTES as usize));
-            let rc = handle_pager_bulk(
-                s,
-                true,
-                arena_base_page,
-                vpage_start + done,
-                chunk,
-                user,
-            );
-            if rc != 0 { return rc; }
+            let rc = handle_pager_bulk(s, true, arena_base_page, vpage_start + done, chunk, user);
+            if rc != 0 {
+                return rc;
+            }
             done += chunk;
         }
         return 0;
@@ -3691,23 +3990,31 @@ pub unsafe extern "C" fn backing_provider_dispatch(
     // The kernel's backing_offset is abstract page-granular; this
     // driver converts to the device's LBA space using its own
     // NVME_ARENA_LBA_BASE offset.
-    if arg.is_null() || arg_len < 16 { return E_INVAL; }
-    let arena_base_page = u32::from_le_bytes([
-        *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-    ]);
-    let vpage_idx = u32::from_le_bytes([
-        *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
-    ]);
+    if arg.is_null() || arg_len < 16 {
+        return E_INVAL;
+    }
+    let arena_base_page = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+    let vpage_idx = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
     let buf_ptr = u64::from_le_bytes([
-        *arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11),
-        *arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15),
+        *arg.add(8),
+        *arg.add(9),
+        *arg.add(10),
+        *arg.add(11),
+        *arg.add(12),
+        *arg.add(13),
+        *arg.add(14),
+        *arg.add(15),
     ]) as *mut u8;
-    if buf_ptr.is_null() { return E_INVAL; }
+    if buf_ptr.is_null() {
+        return E_INVAL;
+    }
 
-    if !pager_ensure_buf(s) { return E_INVAL; }
+    if !pager_ensure_buf(s) {
+        return E_INVAL;
+    }
 
-    let lba = NVME_ARENA_LBA_BASE
-        + ((arena_base_page as u64) + (vpage_idx as u64)) * (PAGE_LBAS as u64);
+    let lba =
+        NVME_ARENA_LBA_BASE + ((arena_base_page as u64) + (vpage_idx as u64)) * (PAGE_LBAS as u64);
 
     if opcode == PAGER_OP_WRITE {
         // Single-page synchronous WRITE — submit then spin for
@@ -3716,9 +4023,19 @@ pub unsafe extern "C" fn backing_provider_dispatch(
         // `PAGER_OP_WRITE_BULK` (async, multiple in flight) for the
         // high-throughput path. This branch serves the kernel's
         // demand-page writeback, which is intrinsically per-page.
-        if !pager_ensure_buf(s) { return E_INVAL; }
+        if !pager_ensure_buf(s) {
+            return E_INVAL;
+        }
         core::ptr::copy_nonoverlapping(buf_ptr, s.pager_buf as *mut u8, PAGE_BYTES as usize);
-        submit_io_write(s, 0, lba, PAGE_LBAS, CID_PAGER_WRITE, s.namespace, s.pager_buf);
+        submit_io_write(
+            s,
+            0,
+            lba,
+            PAGE_LBAS,
+            CID_PAGER_WRITE,
+            s.namespace,
+            s.pager_buf,
+        );
         let rc = pager_spin_poll_cqe(s, CID_PAGER_WRITE);
         return rc;
     }
@@ -3733,13 +4050,20 @@ pub unsafe extern "C" fn backing_provider_dispatch(
     let cdw = [
         ((CID_PAGER_READ as u32) << 16) | (OPC_READ as u32),
         s.namespace,
-        0, 0,
-        0, 0,
-        prp1_pci as u32, (prp1_pci >> 32) as u32,
-        0, 0,
-        lba as u32, (lba >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        prp1_pci as u32,
+        (prp1_pci >> 32) as u32,
+        0,
+        0,
+        lba as u32,
+        (lba >> 32) as u32,
         (PAGE_LBAS as u32) - 1,
-        0, 0, 0,
+        0,
+        0,
+        0,
     ];
     let sq_base = *s.io_sq.as_ptr().add(pager_q);
     let tail = *s.io_sq_tail.as_ptr().add(pager_q);
@@ -3768,7 +4092,9 @@ pub unsafe extern "C" fn backing_provider_dispatch(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
@@ -3783,24 +4109,36 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    _in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize,
+    _in_chan: i32,
+    out_chan: i32,
+    ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<NvmeState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<NvmeState>() {
+            return -2;
+        }
 
         let s = &mut *(state as *mut NvmeState);
-        core::ptr::write_bytes(s as *mut NvmeState as *mut u8, 0, core::mem::size_of::<NvmeState>());
+        core::ptr::write_bytes(
+            s as *mut NvmeState as *mut u8,
+            0,
+            core::mem::size_of::<NvmeState>(),
+        );
         s.syscalls = syscalls as *const SyscallTable;
         // `requests` (the write-request input from fat32) is the only
         // input port. Device binding flows through the PCIE_DEVICE
         // contract, not a channel.
-        s.req_in  = dev_channel_port(&*s.syscalls, 0, 0);
+        s.req_in = dev_channel_port(&*s.syscalls, 0, 0);
         s.blk_out = out_chan;
-        s.ctrl    = ctrl_chan;
+        s.ctrl = ctrl_chan;
         s.pcie_handle = -1;
         s.state = S_BIND;
         s.logged_state = 0xFE;
@@ -3832,8 +4170,8 @@ pub extern "C" fn module_new(
             );
         }
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -3845,9 +4183,7 @@ pub extern "C" fn module_new(
         // `- name: nvme` entry still works.
         if s.bind_len == 0 {
             const DEFAULT_BIND: &[u8] = b"m2_primary";
-            for i in 0..DEFAULT_BIND.len() {
-                s.bind_str[i] = DEFAULT_BIND[i];
-            }
+            s.bind_str[..DEFAULT_BIND.len()].copy_from_slice(DEFAULT_BIND);
             s.bind_len = DEFAULT_BIND.len() as u8;
         }
 
@@ -3856,7 +4192,11 @@ pub extern "C" fn module_new(
         // floor at 1; IO_Q_ENTRIES-1 keeps a free SQE slot so a ring
         // full condition is distinguishable from empty. MAX_INFLIGHT
         // caps the DMA-buffer footprint.
-        let qd = if s.queue_depth == 0 { 1u32 } else { s.queue_depth as u32 };
+        let qd = if s.queue_depth == 0 {
+            1u32
+        } else {
+            s.queue_depth as u32
+        };
         let cap = qd.min(MAX_INFLIGHT as u32).min(IO_Q_ENTRIES - 1) as u8;
         s.inflight_cap = if cap == 0 { 1 } else { cap };
         // Floor io_q_count to [1, MAX_IO_QUEUES] — the TLV path clamps
@@ -3898,18 +4238,18 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let bp_pre = s.tlm.bp_steps;
 
     let rc = match s.state {
-        S_BIND                => step_bind(s),
-        S_MAP_BARS            => step_map_bars(s),
-        S_RESET               => step_reset(s),
-        S_CONFIG_QUEUES       => step_config_queues(s),
-        S_ENABLE              => step_enable(s),
+        S_BIND => step_bind(s),
+        S_MAP_BARS => step_map_bars(s),
+        S_RESET => step_reset(s),
+        S_CONFIG_QUEUES => step_config_queues(s),
+        S_ENABLE => step_enable(s),
         S_IDENTIFY_CONTROLLER => step_identify_controller(s),
-        S_IDENTIFY_NAMESPACE  => step_identify_namespace(s),
-        S_CREATE_IO_CQ        => step_create_io_cq(s),
-        S_CREATE_IO_SQ        => step_create_io_sq(s),
-        S_READ_LBA0           => step_read_lba0(s),
-        S_READY               => step_ready(s),
-        _                     => step_fault(s),
+        S_IDENTIFY_NAMESPACE => step_identify_namespace(s),
+        S_CREATE_IO_CQ => step_create_io_cq(s),
+        S_CREATE_IO_SQ => step_create_io_sq(s),
+        S_READ_LBA0 => step_read_lba0(s),
+        S_READY => step_ready(s),
+        _ => step_fault(s),
     };
 
     if s.state == S_READY {

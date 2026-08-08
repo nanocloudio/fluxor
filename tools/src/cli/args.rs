@@ -13,113 +13,54 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Decode configuration from UF2 firmware file
-    Decode {
-        /// UF2 file to decode
-        file: PathBuf,
-        /// Output format (json or yaml)
-        #[arg(short, long, default_value = "yaml")]
-        format: String,
-    },
-    /// Show UF2 file information
-    Info {
-        /// UF2 file to inspect
-        file: PathBuf,
-    },
-    /// Generate config UF2 from YAML/JSON file
-    Generate {
-        /// Config file (YAML or JSON)
-        config: PathBuf,
-        /// Output file
+    /// Build one config (or every config in a directory) into its
+    /// artefacts. `--check` validates against target constraints and
+    /// writes nothing; `--emit` selects a specific device encoding.
+    ///
+    /// Emit forms (flash/deploy encodings — never store artifacts):
+    ///   uf2       config UF2 for drag-drop flashing
+    ///   bin       raw config binary
+    ///   combined  firmware + config in one UF2. Dev-flash convenience
+    ///             only: the trailer-embedded modules/config are NOT an
+    ///             OTA path — OTA devices update runtime modules
+    ///             exclusively through `--emit=slot`.
+    ///   slot      OTA slot image (modules + config + slot header) for
+    ///             a graph_slot A/B region; excludes firmware. The ONLY
+    ///             sanctioned module-delivery path for OTA devices; the
+    ///             slot header pins kernel and graph to each other by
+    ///             the ABI-surface digest.
+    ///   table     module table blob from the modules the config names
+    Build {
+        /// Config file (YAML) or directory containing YAML files.
+        path: PathBuf,
+        /// Output file (default: auto-derived from target; required
+        /// for --emit=combined|slot|table).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Override modules directory (default: target/fluxor/{silicon}/modules)
-        #[arg(short = 'm', long)]
-        modules_dir: Option<PathBuf>,
-        /// Output raw binary instead of UF2
+        /// Emit a device encoding: uf2|bin|combined|slot|table.
         #[arg(long)]
-        binary: bool,
-    },
-    /// Combine firmware + config into single UF2.
-    ///
-    /// Dev-flash convenience only: the trailer-embedded modules/config
-    /// this produces are NOT an OTA path. OTA-capable devices update
-    /// runtime modules exclusively through `slot-image` (graph_slot A/B),
-    /// keeping kernel and graph formally separate with independent
-    /// rollback.
-    Combine {
-        /// Firmware UF2 file
-        firmware: PathBuf,
-        /// Config file (YAML, JSON, or UF2)
-        config: PathBuf,
-        /// Output combined UF2
-        #[arg(short, long)]
-        output: PathBuf,
-    },
-    /// Build an OTA slot image (modules + config + slot header) for
-    /// writing to a graph_slot A/B region. Excludes firmware.
-    ///
-    /// This is the ONLY sanctioned module-delivery path for OTA-capable
-    /// devices: the graph slot is the sole runtime-module source, the
-    /// kernel image carries built-ins only, and the two are pinned to
-    /// each other by the ABI-surface digest in the slot header. The
-    /// `combine` trailer path is a dev-flash convenience, never an
-    /// update path.
-    SlotImage {
-        /// Config file (YAML or JSON)
-        config: PathBuf,
-        /// Output slot image (raw binary sized to the slot)
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Target override (default: read from config YAML 'target:' field)
+        emit: Option<String>,
+        /// Validate the config against target constraints and exit
+        /// without building anything.
+        #[arg(long)]
+        check: bool,
+        /// --emit=combined: the firmware UF2 to combine with.
+        #[arg(long)]
+        firmware: Option<PathBuf>,
+        /// Modules directory override (default:
+        /// target/fluxor/{silicon}/modules). Single dir for uf2/bin;
+        /// repeatable for --emit=table.
+        #[arg(short = 'm', long = "modules-dir", action = clap::ArgAction::Append)]
+        modules_dir: Vec<PathBuf>,
+        /// Target override (--check / --emit=slot; default: read from
+        /// the config's `target:` field).
         #[arg(short, long)]
         target: Option<String>,
-        /// Epoch to embed in the slot header. Must exceed the currently
-        /// live slot's epoch for activation to succeed.
+        /// --emit=slot: epoch to embed in the slot header. Must exceed
+        /// the currently live slot's epoch for activation to succeed.
         #[arg(long, default_value = "1")]
         epoch: u64,
     },
-    /// Show example configuration
-    Example {
-        /// Example name: blinky, sd-audio, playlist, test-tone, gesture-led
-        #[arg(default_value = "blinky")]
-        name: String,
-    },
-    /// Pack ELF object file into .fmod module format
-    Pack {
-        /// Input ELF object file (.o or .a)
-        input: PathBuf,
-        /// Output .fmod file
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Module name (default: derived from filename)
-        #[arg(short, long)]
-        name: Option<String>,
-        /// Module type: 1=Source, 2=Transformer, 3=Sink, 4=EventHandler, 5=Protocol
-        #[arg(short = 't', long, default_value = "2")]
-        module_type: u8,
-        /// Path to manifest.toml (default: auto-detect next to input)
-        #[arg(short = 'm', long)]
-        manifest: Option<PathBuf>,
-    },
-    /// Validate config file against target constraints
-    Validate {
-        /// Config file (YAML or JSON)
-        config: PathBuf,
-        /// Target override (default: read from config YAML 'target:' field, fallback: pico2w)
-        #[arg(short, long)]
-        target: Option<String>,
-    },
-    /// Show target configuration details
-    TargetInfo {
-        /// Target name (board or silicon, e.g. pi5, pico2w, rp2350, rp2040)
-        target: String,
-        /// Query a specific field (rust_target, cargo_features, uf2_family_id, max_pin, module_target)
-        #[arg(long)]
-        field: Option<String>,
-    },
-    /// List available targets
-    Targets,
     /// Recompute and rewrite the ABI-surface pin in all checked-in sites
     /// (`abi_surface_srcpin.rs` src-hash + digest, the `tools/src/hash.rs`
     /// lock, and the harness lock). Run after any `modules/sdk` edit — it is
@@ -130,45 +71,11 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
-    /// Build module table blob from .fmod files
-    Mktable {
-        /// Directory containing .fmod files
-        dir: PathBuf,
-        /// Output binary file
-        #[arg(short, long)]
-        output: PathBuf,
-    },
-    /// Build a module table blob from modules referenced by a config file
-    MktableConfig {
-        /// Config file (YAML or JSON)
-        config: PathBuf,
-        /// Directory containing built .fmod files (repeatable)
-        #[arg(short = 'm', long, action = clap::ArgAction::Append)]
-        modules_dir: Vec<PathBuf>,
-        /// Output binary file
-        #[arg(short, long)]
-        output: PathBuf,
-    },
-    /// Show transition plan between two config files (live reconfigure diff)
-    Diff {
-        /// Old config file (YAML)
-        old_config: PathBuf,
-        /// New config file (YAML)
-        new_config: PathBuf,
-        /// Target override (default: read from new config YAML 'target:' field, fallback: pico2w)
-        #[arg(short, long)]
-        target: Option<String>,
-    },
-    /// Build one config or all configs in a directory
-    Build {
-        /// Config file (YAML) or directory containing YAML files
-        path: PathBuf,
-        /// Output file (default: auto-derived from target)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
     /// Build and run a config (Linux or QEMU targets), or run a
-    /// deployment scenario (`kind: scenario`).
+    /// deployment scenario (`kind: scenario`), or — with `--replicas`
+    /// — render a `__KEY__` template N times and spawn N processes
+    /// side-by-side (local multi-replica bring-up: Raft clusters,
+    /// partition experiments, …).
     ///
     /// Scenario flags (see `.context/rfc_deployment_scenarios.md`):
     ///   --print-synthesised      dump the synthesised host graph YAML
@@ -182,6 +89,11 @@ enum Commands {
     ///                            omitted.
     ///   --graph                  emit Graphviz DOT of the scenario
     ///                            (nodes = components, edges = bindings).
+    ///
+    /// Replica mode: the template should use the conventional
+    /// placeholder set __SELF_ID__, __LISTEN_PORT__ (base_port +
+    /// self_id), __PEER<i>_PORT__ (base_port + i), __HTTP_PORT__
+    /// (listen_port + http_offset); anything else via `--var`.
     Run {
         /// Config file (YAML).  Optional only when `--list` is given.
         config: Option<PathBuf>,
@@ -208,9 +120,26 @@ enum Commands {
         /// the synthesised-host URL.
         #[arg(long)]
         open: bool,
+        /// Spawn N replicas from a `__KEY__` template config instead
+        /// of running it once, tailing their stderr until Ctrl+C.
+        #[arg(short = 'r', long)]
+        replicas: Option<u8>,
+        /// Replica mode: base wire (`peer_router.listen_port`) port.
+        /// Replica i listens on `base_port + i`.
+        #[arg(short = 'b', long, default_value = "9090")]
+        base_port: u16,
+        /// Replica mode: offset added to `LISTEN_PORT` to derive
+        /// `HTTP_PORT`. Default 10000 matches the clustor
+        /// diagnostic-surface convention.
+        #[arg(long, default_value = "10000")]
+        http_offset: u16,
+        /// Replica mode: extra `KEY=VALUE` placeholder substitutions,
+        /// applied uniformly to every replica. Repeat for multiple.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
     },
     /// Run an installed applet: resolve <NAME> through the applet
-    /// registry (or the project's `target/fluxor/<NAME>/` bundle) and exec
+    /// catalogue (or the project's `target/fluxor/<NAME>/` bundle) and exec
     /// its cached bundle, passing everything after `--` to the app
     /// (rfc_cli_execution.md §5.1).
     Exec {
@@ -220,11 +149,13 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Register an applet: map a name to a cached workload bundle
-    /// (rfc_cli_execution.md §5.2). Accepts a bundle dir or a source
-    /// manifest (`app.fluxor.toml` — builds first).
+    /// Register an applet: map a name to a workload bundle
+    /// (rfc_cli_execution.md §5.2). Accepts a store bundle reference
+    /// (`<name>`, `<name>:<ver>`, `sha256:…` digest or unambiguous
+    /// prefix — resolved from the local OCI store), a built bundle
+    /// dir, or a source manifest (`app.fluxor.toml` — builds first).
     Install {
-        /// Bundle dir, or app.fluxor.toml to build-and-install.
+        /// Store bundle reference, bundle dir, or app.fluxor.toml.
         bundle: PathBuf,
         /// Applet name (default: the bundle's workload name).
         #[arg(long)]
@@ -265,124 +196,64 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Render a template N times and spawn N `fluxor run` processes
-    /// side-by-side, tailing their stderr until Ctrl+C. Designed
-    /// for local multi-replica bring-up (Raft clusters, partition
-    /// experiments, etc).
-    ///
-    /// The conventional placeholder set the template should use:
-    ///   __SELF_ID__       — replica index (0..replicas-1)
-    ///   __LISTEN_PORT__   — base_port + self_id
-    ///   __PEER<i>_PORT__  — base_port + i for i in 0..replicas-1
-    ///   __HTTP_PORT__     — listen_port + http_offset
-    ///
-    /// Anything else can be passed via `--var KEY=VALUE` and is
-    /// applied uniformly to every replica.
-    Up {
-        /// Template config to render per replica.
-        template: PathBuf,
-        /// Number of replicas to spawn.
-        #[arg(short = 'r', long, default_value = "3")]
-        replicas: u8,
-        /// Base wire (`peer_router.listen_port`) port. Replica i
-        /// listens on `base_port + i`.
-        #[arg(short = 'b', long, default_value = "9090")]
-        base_port: u16,
-        /// Offset added to `LISTEN_PORT` to derive `HTTP_PORT`.
-        /// Default 10000 matches the clustor diagnostic-surface
-        /// convention.
-        #[arg(long, default_value = "10000")]
-        http_offset: u16,
-        /// Extra `KEY=VALUE` placeholder substitutions, applied
-        /// uniformly to every replica. Repeat for multiple.
-        #[arg(long = "var", value_name = "KEY=VALUE")]
-        vars: Vec<String>,
-    },
-    /// Stream live fault stats, protection levels, and step timing
-    /// histograms from a running Fluxor device.
-    ///
-    /// Expects the device to emit newline-framed telemetry lines on the
-    /// given serial port. See `docs/architecture/monitor-protocol.md`
-    /// (text protocol: `MON_FAULT`, `MON_HIST`, `MON_STATE`).
-    Monitor {
-        /// Serial device path (default: /dev/ttyACM0)
-        #[arg(short = 'p', long, default_value = "/dev/ttyACM0")]
-        port: String,
-        /// Baud rate (default: 115200)
-        #[arg(short = 'b', long, default_value = "115200")]
-        baud: u32,
-        /// Refresh period in milliseconds (default: 500)
-        #[arg(long, default_value = "500")]
-        refresh_ms: u64,
-        /// Consume MON_* lines from UDP netconsole instead of a serial
-        /// port. Pass a bind spec like `:6666` or `0.0.0.0:6666`. When
-        /// set, --port is ignored.
-        #[arg(long)]
-        net: Option<String>,
-    },
-    /// Sign a packed .fmod module with an Ed25519 private key.
-    ///
-    /// Overwrites the module's manifest with a v2 manifest carrying a valid
-    /// Ed25519 signature over the existing SHA-256 integrity hash plus the
-    /// signer's public-key fingerprint. The module's code/data/export
-    /// sections are unchanged.
-    Sign {
-        /// Input .fmod file (modified in place unless --output is given)
-        input: PathBuf,
-        /// Path to a 32-byte raw Ed25519 seed (private key) file.
-        /// Generate with `head -c 32 /dev/urandom > key.raw`.
-        #[arg(short = 'k', long)]
-        key: PathBuf,
-        /// Output path (default: overwrite input in place)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-    },
-    /// Generate / inspect an Ed25519 module-signing keypair.
-    ///
-    /// Prints the 64-hex-char PUBLIC key to stdout (for the kernel's
-    /// `FLUXOR_SIGNING_PUBKEY_HEX` build env) and ensures the 32-byte private
-    /// seed exists at `--key` (generated 0600 from the OS RNG if absent). The
-    /// matching seed is what `fluxor sign` consumes. Idempotent: re-running
-    /// with an existing key just re-prints its pubkey (use `--force` to rotate).
-    Keygen {
-        /// Path to the 32-byte Ed25519 seed (private key). Created if absent.
-        #[arg(short = 'k', long)]
-        key: PathBuf,
-        /// Overwrite an existing key with a freshly-generated one (rotate).
-        #[arg(long)]
-        force: bool,
-    },
-    /// Hardware-rig orchestration (`rig test --scenario …`, `rig power`, …).
-    ///
-    /// Host-side hardware-rig orchestration with a board-agnostic
-    /// contract. See `.context/rfc_hardware_rig.md` for the model; scenarios
-    /// live in `tests/hardware/`, rig profiles live outside the repo in
-    /// `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`.
     /// Node-agent operations (reconcile/commit/publish plans)
     Agent(agent_cli::AgentArgs),
+    /// Hardware-rig orchestration (`rig test --scenario …`, `rig power`,
+    /// `rig monitor`, …) with a board-agnostic contract. See
+    /// `.context/rfc_hardware_rig.md` for the model; scenarios live in
+    /// `tests/hardware/`, rig profiles live outside the repo in
+    /// `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`.
     #[command(subcommand_value_name = "RIG_SUBCOMMAND")]
     Rig(rig::cli::RigArgs),
 
-    /// Describe what `fluxor` resolves to from your current working
-    /// directory: the project root (and how it was discovered),
-    /// available targets and stacks, and — when a config is given —
-    /// the resolved target, expanded stack modules, and module
-    /// search paths. The diagnostic surface for "why doesn't my
-    /// build see this stack?" / "is fluxor pointed at the right
-    /// tree?". See `tools/src/project.rs` for the resolution order.
+    /// THE read-only verb, polymorphic over its subject:
+    ///   (nothing)      project info — root (and how it was
+    ///                  discovered), available targets, stacks, rig,
+    ///                  scenarios. The diagnostic surface for "is
+    ///                  fluxor pointed at the right tree?"
+    ///   config.yaml    the above plus the resolved target, expanded
+    ///                  stack modules, and module search paths
+    ///   firmware.uf2   UF2 block/family/trailer info;
+    ///                  `--emit-config` decodes and prints the
+    ///                  embedded config
+    ///   store ref      tag, `sha256:…` digest, or unambiguous digest
+    ///                  prefix — shows kind, tags, epoch vs the
+    ///                  current ABI surface, input digest, ci digest,
+    ///                  provenance, source rev, and layers
+    ///
+    /// A subject naming an existing file wins over a store reference;
+    /// `--store` forces the store interpretation. `--against OLD`
+    /// shows the live-reconfigure transition plan from OLD to the
+    /// subject config.
     Inspect {
-        /// Optional config (YAML / JSON) to also resolve the target,
-        /// expanded stacks, and module search paths for. Without
-        /// this argument `inspect` prints project-level info only.
-        config: Option<PathBuf>,
+        /// Config / UF2 path, store reference, or nothing (project
+        /// info only).
+        subject: Option<String>,
         /// Emit machine-readable JSON instead of the default
-        /// human-friendly text. The shape is stable v1: a top-level
-        /// object with `project_root`, `install_root`, `targets`,
-        /// `stacks`, `rig`, `scenarios` keys (plus `config` when a
-        /// config arg is supplied). Use this for CI/IDE/dashboard
-        /// integrations that want to react to discovery state.
+        /// human-friendly text. For project/config subjects the shape
+        /// is stable v1: a top-level object with `project_root`,
+        /// `install_root`, `targets`, `stacks`, `rig`, `scenarios`
+        /// keys (plus `config` when a config subject is supplied).
         #[arg(long)]
         json: bool,
+        /// UF2 subject: decode and print the embedded config instead
+        /// of block info.
+        #[arg(long)]
+        emit_config: bool,
+        /// Output format for --emit-config (yaml or json).
+        #[arg(short, long, default_value = "yaml")]
+        format: String,
+        /// Config subject: old config to show the live-reconfigure
+        /// transition plan against (old → subject).
+        #[arg(long, value_name = "OLD_CONFIG")]
+        against: Option<PathBuf>,
+        /// Target override for --against (default: read from the
+        /// subject config's `target:` field, fallback: pico2w).
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Force store-reference interpretation of <SUBJECT>.
+        #[arg(long)]
+        store: bool,
     },
 
     /// Source-tree lint suite. Each subcommand enforces one rule
@@ -392,8 +263,10 @@ enum Commands {
         action: LintAction,
     },
 
-    /// PIC module build orchestration. In-process discovery +
-    /// compile + pack pipeline; flags are documented per subcommand.
+    /// PIC module build orchestration plus the module-artefact verbs
+    /// (`pack`, `sign`, `keygen`) and the hermetic module-core test
+    /// lane (`test`). In-process discovery + compile + pack pipeline;
+    /// flags are documented per subcommand.
     Modules {
         #[command(subcommand)]
         action: ModulesAction,
@@ -401,10 +274,10 @@ enum Commands {
 
     /// Full CI gate. Runs in order: fmt-check, clippy, workspace-lint
     /// opt-in audit, hygiene scan, observability + presentation lints,
-    /// template render, version-skew check, cargo unit tests, modules
-    /// build (strict), and cargo integration tests. Every phase runs even
-    /// when an earlier one fails; the summary lists all failures and exits
-    /// non-zero.
+    /// template render, version-skew check, lockfile consistency,
+    /// live-staleness, cargo unit tests, modules build (strict), and
+    /// cargo integration tests. Every phase runs even when an earlier
+    /// one fails; the summary lists all failures and exits non-zero.
     Ci {
         /// Skip an individual phase for local iteration. Rejected
         /// when `$CI=1` so production CI always runs the full set.
@@ -416,70 +289,52 @@ enum Commands {
         project_root: Option<PathBuf>,
     },
 
-    /// Publish artefacts to the local Fluxor registry
-    /// (`~/.fluxor/registry/`).
-    ///
-    /// `fluxor publish --local` (no subcommand) publishes every
-    /// publishable artefact in the project with content-hashed `-local.<sha>`
-    /// names, for path/git override workflows. Workspace mode
-    /// (`~/.fluxor/workspace.toml`) is the preferred way to iterate
-    /// across projects without needing publish-local at all.
+    /// Publish this project's artifacts into the local OCI store —
+    /// the single store-write verb. Every artifact is annotated with
+    /// its epoch (ABI-surface digest), token-canonical input digest,
+    /// provenance, and source rev; tags and the project index repoint
+    /// in one transactional index swap. In the fluxor repo, `runtime`
+    /// includes the CLI itself (the launcher resolves it on the next
+    /// invocation). `publish bundle` publishes a built workload
+    /// bundle directory.
     Publish {
         #[command(subcommand)]
         action: Option<PublishAction>,
-        /// Local-publish all publishable artefacts (no subcommand form).
-        /// Each artefact gets a `-local.<content-hash>` suffix.
-        #[arg(long, conflicts_with = "action")]
-        local: bool,
+        /// Restrict the publish sweep to artifact kinds:
+        /// `source` (aliases: abi, sdk, common), `fmod`, `runtime`.
+        /// Repeat or comma-separate. Empty = everything publishable.
+        /// Rejected alongside a subcommand (which already names the
+        /// kinds).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
         /// Project root override. Defaults to the directory resolved
         /// by `fluxor inspect`.
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
 
-    /// Regenerate `fluxor.lock` from the current `fluxor.toml` and the
-    /// registry's available versions.
+    /// Advance `fluxor.lock` pins: resolve every declared
+    /// `[dependencies]` project against the store's project indexes
+    /// (`<dep>/meta:latest`) and rewrite the `[[artifact]]` pin set.
+    /// The deliberate "take upstream's new state" verb — `sync` only
+    /// re-resolves workspace members.
     Update {
         #[arg(long)]
         project_root: Option<PathBuf>,
-        /// Features to activate when resolving `[dependencies]`.
-        /// Optional deps (those declared with `optional = true`)
-        /// participate only when at least one active feature lists
-        /// them under `[features]`. Repeat the flag or pass a
-        /// comma-separated list.
-        #[arg(long, value_delimiter = ',')]
-        features: Vec<String>,
+        /// Set the pins from a store snapshot instead of the deps'
+        /// latest published state: `--from snapshot/<name>` (the
+        /// `snapshot/` prefix is optional).
+        #[arg(long, value_name = "SNAPSHOT")]
+        from: Option<String>,
     },
 
-    /// Install lockfile-resolved fmods into
-    /// `<project>/target/fluxor/<target>/modules/`. The symmetric
-    /// half of `fluxor publish fmod`: where publish writes into the
-    /// registry, sync copies *from* the registry into the local
-    /// build tree where `fluxor modules build` / `fluxor flash`
-    /// expect to find foundation fmods.
-    ///
-    /// Hash-verified against the lockfile. Idempotent: re-running
-    /// is a no-op when destination hashes match.
-    /// Unit-test modules' `include!`d cores on the host.
-    ///
-    /// A core is `no_std` source that is included, not linked, so `cargo test`
-    /// cannot reach it. A module declares a harness in its manifest
-    /// (`[test] harness = "tests/harness.rs"`) that mounts its cores exactly as
-    /// the module does; this generates a disposable crate around that harness
-    /// and runs it. Mounting cannot be derived — include order is load-bearing
-    /// and some cores need a `SyscallTable` in scope — so the module owns the
-    /// harness and fluxor owns the mechanical part.
-    Test {
-        /// Limit to one module.
-        #[arg(long)]
-        module: Option<String>,
-        #[arg(long)]
-        project_root: Option<std::path::PathBuf>,
-        /// Show cargo's full output.
-        #[arg(short, long)]
-        verbose: bool,
-    },
-
+    /// Materialise `fluxor.lock` into the tree from the OCI store:
+    /// fmods → `target/fluxor/<silicon>/modules/`, source trees →
+    /// `target/fluxor/<name>/`, runtimes → `target/<triple>/release/`.
+    /// Workspace members' pins re-resolve `:latest` (write-through);
+    /// everyone else's pins replay verbatim. Digest- and
+    /// epoch-verified; per-artifact staleness advisories warn and
+    /// never block.
     Sync {
         #[arg(long)]
         project_root: Option<PathBuf>,
@@ -488,28 +343,21 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Inspect and maintain the local Fluxor registry.
-    Registry {
-        #[command(subcommand)]
-        action: RegistryAction,
-    },
-
-    /// Inspect and maintain the local OCI artifact store
-    /// (`$XDG_DATA_HOME/fluxor/store`, override `$FLUXOR_STORE`).
-    /// Modules and workload bundles publish into it as OCI artifacts
-    /// with provenance annotations; consume paths read only from it
-    /// (offline-first).
+    /// Maintain the local OCI artifact store
+    /// (`$XDG_DATA_HOME/fluxor/store`, override `$FLUXOR_STORE`):
+    /// `ls`, `rm`, `pin`, `snapshot`. Modules and workload bundles
+    /// publish into it as OCI artifacts with provenance annotations;
+    /// consume paths read only from it (offline-first). Read-only
+    /// artifact display lives on `fluxor inspect <ref>`.
     Store(store_cli::StoreArgs),
 
-    /// Workload-bundle operations against the local OCI store.
-    Bundle(store_cli::BundleArgs),
-
-    /// Inspect the live-workspace state (`~/.fluxor/workspace.toml`).
+    /// Live-workspace policy surface (`~/.fluxor/workspace.toml`).
     ///
-    /// Workspace mode is detected positionally — by whether the CWD
-    /// sits inside a listed member. This command shows whether the
-    /// workspace file is present, which members it lists, and whether
-    /// the current working directory triggers live-mode resolution.
+    /// Workspace membership is the whole live/pinned distinction:
+    /// `sync` write-through-resolves `:latest` for members and
+    /// replays pins for everyone else. `status` shows the state,
+    /// `publish` republishes every dirty member in dependency order,
+    /// `add`/`rm` edit the member list.
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
@@ -518,91 +366,52 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum PublishAction {
-    /// Publish `fluxor-abi` (fluxor repo only).
+    /// Publish source-tree artifacts (alias of `--only source`; in
+    /// the fluxor repo that is `fluxor-abi` + `fluxor-contracts`).
     Abi {
-        /// Content-hashed `-local.<sha>` suffix for the published
-        /// artefact — for cross-project iteration without committing
-        /// to a canonical version.
-        #[arg(long)]
-        local: bool,
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Publish `fluxor-sdk` and `fluxor-sdk-macros` (fluxor repo only).
+    /// Publish source-tree artifacts (alias of `--only source`).
     Sdk {
         #[arg(long)]
-        local: bool,
-        #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Publish `<project>-common` (every downstream project).
+    /// Publish source-tree artifacts (alias of `--only source`; in a
+    /// sibling repo that is `<project>-common`).
     Common {
         #[arg(long)]
-        local: bool,
-        #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Publish compiled `.fmod` artefacts. Defaults to every
-    /// `(target, module)` declared in `fluxor.toml::[ci].targets ×
-    /// modules/`.
+    /// Publish every built `.fmod` this project owns, across every
+    /// built target shelf.
     Fmod {
-        /// Limit to one target.
-        #[arg(long)]
-        target: Option<String>,
-        /// Limit to one module.
-        #[arg(long)]
-        module: Option<String>,
-        #[arg(long)]
-        local: bool,
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Publish a host runtime binary (e.g. `fluxor-linux`). Reads
-    /// `<project>/target/<host-target>/release/<binary>` and copies
-    /// to `~/.fluxor/registry/bin/<project>/<host-target>/<binary>/
-    /// <version>`. Downstream `fluxor run` resolves the runtime via
-    /// this registry path.
+    /// Publish the `[project].runtimes` binaries (plus, in the fluxor
+    /// repo, the CLI itself) as runtime artifacts.
     Runtime {
-        /// Binary name (cargo `[[bin]] name`). For fluxor itself,
-        /// `fluxor-linux`.
-        #[arg(long)]
-        binary: String,
-        /// Host triple — e.g. `aarch64-unknown-linux-gnu`. Defaults
-        /// to the running CLI's host target.
-        #[arg(long)]
-        host_target: Option<String>,
-        #[arg(long)]
-        local: bool,
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
-}
-
-#[derive(Subcommand)]
-enum RegistryAction {
-    /// Bootstrap the registry index — create `~/.fluxor/registry/`,
-    /// initialise the cargo git-index at `index/`, write
-    /// `config.json`. Idempotent; safe to re-run.
-    Init,
-    /// Inventory the local registry: source crates and fmod palettes
-    /// keyed by `(project, target, version)`.
-    List {
+    /// Publish a workload bundle directory (workload.json +
+    /// resources.json + graph.yaml) into the local OCI store. Every
+    /// module digest the manifest pins must already be in the store.
+    Bundle {
+        /// Bundle directory.
+        bundle_dir: PathBuf,
+        /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
+        /// override with $FLUXOR_STORE).
         #[arg(long)]
-        json: bool,
-    },
-    /// Trim old `-local.<sha>` and `-live.<sha>` artefacts from the
-    /// local registry. Default policy: keep newest N per
-    /// `(project, target, name)` plus anything younger than M days.
-    Gc {
-        /// Don't actually delete — list what would be removed.
+        store: Option<PathBuf>,
+        /// Tag override (default: `<name>:<version>` from workload.json).
         #[arg(long)]
-        dry_run: bool,
+        tag: Option<String>,
+        /// Annotate provenance=published instead of local-build.
+        #[arg(long)]
+        published: bool,
     },
-    /// Add the `[registries.fluxor]` alias to `~/.cargo/config.toml`
-    /// so cargo can resolve fluxor-published crates by name.
-    /// Idempotent: updates a sentinel-bounded block, preserves the
-    /// rest of the file.
-    SetupCargo,
 }
 
 #[derive(Subcommand)]
@@ -613,6 +422,26 @@ enum WorkspaceAction {
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// For every member whose input digests differ from its published
+    /// artifacts, run its module build and publish it — topologically
+    /// ordered by the members' `fluxor.toml` dependency declarations.
+    /// Aborts at the first failed member; the published prefix stands.
+    Publish {
+        /// Report what would publish without building or publishing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Add a project checkout to the workspace member list (creates
+    /// `~/.fluxor/workspace.toml` if absent).
+    Add {
+        /// Path to the project checkout.
+        path: PathBuf,
+    },
+    /// Remove a project checkout from the workspace member list.
+    Rm {
+        /// Path to the project checkout.
+        path: PathBuf,
     },
 }
 
@@ -710,36 +539,6 @@ enum ModulesAction {
         #[arg(long)]
         json: bool,
     },
-    /// Publish built `.fmod`s into the local OCI artifact store as
-    /// content-addressed artifacts tagged `<target>/<name>:<version>`,
-    /// annotated `io.fluxor.provenance=local-build` (or `published`
-    /// with --published) and `io.fluxor.source-rev=<git sha>`.
-    Publish {
-        /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
-        /// override with $FLUXOR_STORE).
-        #[arg(long)]
-        store: Option<PathBuf>,
-        /// Single silicon target (default: every built target).
-        #[arg(long)]
-        target: Option<String>,
-        /// Single module (default: every owned module with a built fmod).
-        #[arg(long)]
-        module: Option<String>,
-        /// Tag override (`name:version`); requires the selection to
-        /// match exactly one (target, module) pair.
-        #[arg(long)]
-        tag: Option<String>,
-        /// Annotate provenance=published instead of local-build.
-        #[arg(long)]
-        published: bool,
-        /// Also record each published artifact as a `[[oci_module]]`
-        /// digest pin in fluxor.lock (consume-side resolution, P2).
-        #[arg(long)]
-        pin: bool,
-        /// Project root override.
-        #[arg(long)]
-        project_root: Option<PathBuf>,
-    },
     /// Print the resolved `<out>/<silicon>/modules` path for a target.
     /// Lets Makefiles and harness scripts refer to the artefact dir
     /// without hard-coding the layout.
@@ -748,5 +547,74 @@ enum ModulesAction {
         target: String,
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
+    },
+    /// Pack an ELF object file into the `.fmod` module format.
+    Pack {
+        /// Input ELF object file (.o or .a)
+        input: PathBuf,
+        /// Output .fmod file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Module name (default: derived from filename)
+        #[arg(short, long)]
+        name: Option<String>,
+        /// Module type: 1=Source, 2=Transformer, 3=Sink, 4=EventHandler, 5=Protocol
+        #[arg(short = 't', long, default_value = "2")]
+        module_type: u8,
+        /// Path to manifest.toml (default: auto-detect next to input)
+        #[arg(short = 'm', long)]
+        manifest: Option<PathBuf>,
+    },
+    /// Sign a packed .fmod module with an Ed25519 private key.
+    ///
+    /// Overwrites the module's manifest with a v2 manifest carrying a valid
+    /// Ed25519 signature over the existing SHA-256 integrity hash plus the
+    /// signer's public-key fingerprint. The module's code/data/export
+    /// sections are unchanged.
+    Sign {
+        /// Input .fmod file (modified in place unless --output is given)
+        input: PathBuf,
+        /// Path to a 32-byte raw Ed25519 seed (private key) file.
+        /// Generate with `fluxor modules keygen -k key.raw`.
+        #[arg(short = 'k', long)]
+        key: PathBuf,
+        /// Output path (default: overwrite input in place)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Generate / inspect an Ed25519 module-signing keypair.
+    ///
+    /// Prints the 64-hex-char PUBLIC key to stdout (for the kernel's
+    /// `FLUXOR_SIGNING_PUBKEY_HEX` build env) and ensures the 32-byte private
+    /// seed exists at `--key` (generated 0600 from the OS RNG if absent). The
+    /// matching seed is what `fluxor modules sign` consumes. Idempotent:
+    /// re-running with an existing key just re-prints its pubkey (use
+    /// `--force` to rotate).
+    Keygen {
+        /// Path to the 32-byte Ed25519 seed (private key). Created if absent.
+        #[arg(short = 'k', long)]
+        key: PathBuf,
+        /// Overwrite an existing key with a freshly-generated one (rotate).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Unit-test modules' `include!`d cores on the host.
+    ///
+    /// A core is `no_std` source that is included, not linked, so `cargo test`
+    /// cannot reach it. A module declares a harness in its manifest
+    /// (`[test] harness = "tests/harness.rs"`) that mounts its cores exactly as
+    /// the module does; this generates a disposable crate around that harness
+    /// and runs it. Mounting cannot be derived — include order is load-bearing
+    /// and some cores need a `SyscallTable` in scope — so the module owns the
+    /// harness and fluxor owns the mechanical part.
+    Test {
+        /// Limit to one module.
+        #[arg(long)]
+        module: Option<String>,
+        #[arg(long)]
+        project_root: Option<std::path::PathBuf>,
+        /// Show cargo's full output.
+        #[arg(short, long)]
+        verbose: bool,
     },
 }

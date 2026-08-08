@@ -38,7 +38,7 @@
 //! ```toml
 //! command = [
 //!     "bash", "-c",
-//!     "fluxor combine fw.bin \"$1\" -o out.img",
+//!     "fluxor build \"$1\" --emit=combined --firmware fw.bin -o out.img",
 //!     "_",
 //!     "${scenario.config}",
 //! ]
@@ -251,7 +251,8 @@ config = "{path}"
         let cmd = vec![
             "bash".to_string(),
             "-c".to_string(),
-            "fluxor combine fw.bin ${scenario.config} -o out.img".to_string(),
+            "fluxor build ${scenario.config} --emit=combined --firmware fw.bin -o out.img"
+                .to_string(),
         ];
         let err = substitute_command(&cmd, &scenario).unwrap_err();
         let msg = format!("{err}");
@@ -295,12 +296,15 @@ config = "{path}"
         let cmd = vec![
             "bash".to_string(),
             "-c".to_string(),
-            "fluxor combine fw.bin \"$1\" -o out.img".to_string(),
+            "fluxor build \"$1\" --emit=combined --firmware fw.bin -o out.img".to_string(),
             "_".to_string(),
             "${scenario.config}".to_string(),
         ];
         let out = substitute_command(&cmd, &scenario).unwrap();
-        assert_eq!(out[2], "fluxor combine fw.bin \"$1\" -o out.img");
+        assert_eq!(
+            out[2],
+            "fluxor build \"$1\" --emit=combined --firmware fw.bin -o out.img"
+        );
         assert_eq!(out[3], "_");
         // Path with spaces is preserved verbatim — the shell will not
         // re-parse it because it arrives as one positional parameter.

@@ -209,7 +209,10 @@ unsafe fn parse_mounts(s: &mut MountState, d: *const u8, len: usize) {
         }
         let prefix = &entry[..eq];
         let volume = &entry[eq + 1..];
-        if prefix.is_empty() || volume.is_empty() || prefix.len() > PREFIX_MAX || volume.len() > VOLUME_MAX
+        if prefix.is_empty()
+            || volume.is_empty()
+            || prefix.len() > PREFIX_MAX
+            || volume.len() > VOLUME_MAX
         {
             continue;
         }
@@ -241,7 +244,8 @@ unsafe fn revoke_volume(s: &mut MountState, mi: usize) {
 unsafe fn remove_mount(s: &mut MountState, prefix: &[u8]) {
     for i in 0..s.mount_count as usize {
         let e = &s.mounts[i];
-        if e.active && e.prefix_len as usize == prefix.len() && &e.prefix[..prefix.len()] == prefix {
+        if e.active && e.prefix_len as usize == prefix.len() && &e.prefix[..prefix.len()] == prefix
+        {
             revoke_volume(s, i);
             s.mounts[i].active = false;
             return;
@@ -444,7 +448,13 @@ unsafe fn alloc_slot(s: &mut MountState, mount_idx: u8, backend_handle: i32) -> 
 
 /// The FS provider dispatch. Routes open-family and one-shot ops by path
 /// prefix; routes handle-bound ops by the mount slot recorded at open.
-unsafe fn mount_dispatch(s: &mut MountState, handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
+unsafe fn mount_dispatch(
+    s: &mut MountState,
+    handle: i32,
+    op: u32,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
     match op {
         FS_OPEN | FS_OPENDIR | FS_OPEN_CREATE => {
             let mi = match longest_prefix_match(s, arg, arg_len) {
@@ -461,7 +471,9 @@ unsafe fn mount_dispatch(s: &mut MountState, handle: i32, op: u32, arg: *mut u8,
                 return backend_h;
             }
             match alloc_slot(s, mi as u8, backend_h) {
-                Some(slot) => abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot as i32),
+                Some(slot) => {
+                    abi::kernel_abi::fd::tag_fd(abi::kernel_abi::fd::FD_TAG_FS, slot as i32)
+                }
                 None => {
                     // No free mount slot — close the backend handle so it
                     // doesn't leak, then report the table-full error.
@@ -617,13 +629,19 @@ unsafe fn emit_telemetry(s: &mut MountState) {
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provides_contract")]
+#[cfg_attr(
+    not(feature = "host-test"),
+    link_section = ".text.module_provides_contract"
+)]
 pub extern "C" fn module_provides_contract() -> u32 {
     CONTRACT_FS
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[cfg_attr(not(feature = "host-test"), link_section = ".text.module_provider_dispatch")]
+#[cfg_attr(
+    not(feature = "host-test"),
+    link_section = ".text.module_provider_dispatch"
+)]
 pub extern "C" fn module_provider_dispatch(
     state: *mut u8,
     handle: i32,

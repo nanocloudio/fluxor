@@ -35,7 +35,7 @@ a packet logger that does something more than `dev_log`.
 
 ```sh
 make firmware TARGET=pi5 && fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/pi5/firmware.bin examples/packet_filter/pi5.yaml
+fluxor build examples/packet_filter/pi5.yaml --emit=combined --firmware target/pi5/firmware.bin -o kernel8.img
 # observe filter accept/drop counts via UART or netconsole
 ```
 

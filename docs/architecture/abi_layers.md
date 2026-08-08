@@ -88,7 +88,7 @@ Rules for adding a backend: it must sit behind an **existing** kernel
 service contract (a backend never introduces opcodes consumers must
 know about), it must advertise its honest `TIER`/`CAPS` so consumers
 can adapt, and it must be visible — a row in this table plus a
-descriptor under `modules/builtin/<platform>/<name>/` (manifest-only,
+descriptor under `modules/platform/<platform>/<name>/` (manifest-only,
 not graph-placeable) so the inventory of kernel-resident code stays
 complete. A hardware token reached over a fluxor bus (e.g. a secure
 element on I2C/SPI) is **not** a kernel backend — that is a PIC driver
@@ -479,7 +479,7 @@ preserves that tree's stable-vocabulary property (shadowing a
 foundation name is a build error; a fixture name carries no such
 weight). Fixtures are not publishable via `fluxor publish`.
 
-### Built-in — `modules/builtin/<platform>/<name>/`
+### Built-in — `modules/platform/<platform>/<name>/`
 
 Manifest-only descriptors for kernel-resident built-ins — modules
 whose Rust code is linked into the kernel binary rather than shipped
@@ -529,9 +529,9 @@ compile into the kernel binary; everything else is a PIC module:
 2. **Kernel service contract implementations** and their
    platform-overridable backends (CHANNEL, TIMER, BUFFER, EVENT,
    KEY_VAULT) — each backend documented in the backends table above
-   with a descriptor under `modules/builtin/<platform>/`.
+   with a descriptor under `modules/platform/<platform>/`.
 3. **Built-in modules** — host-API drivers that are manifest-declared
-   under `modules/builtin/<platform>/<name>/` and therefore visible to
+   under `modules/platform/<platform>/<name>/` and therefore visible to
    the config tool and inventory.
 
 Anything device-shaped in the binary that is not manifest-visible or

@@ -1,4 +1,4 @@
-//! `fluxor monitor` — host-side telemetry viewer.
+//! `fluxor rig monitor` — host-side telemetry viewer.
 //!
 //! Parses the newline-framed `MON_FAULT` / `MON_HIST` / `MON_STATE` text
 //! protocol (see `docs/architecture/monitor-protocol.md`) and renders a
@@ -109,7 +109,7 @@ fn apply_line(rows: &mut BTreeMap<u8, ModuleRow>, line: &str) {
 fn render(rows: &BTreeMap<u8, ModuleRow>) {
     // Clear screen (ANSI) and move cursor to top-left.
     print!("\x1b[2J\x1b[H");
-    println!("fluxor monitor  —  {} modules", rows.len());
+    println!("fluxor rig monitor  —  {} modules", rows.len());
     println!();
     println!(
         "{:>3}  {:<16} {:<9} {:<9} {:<10} {:>6} {:>7} {:<9}   step-time buckets (us)",
@@ -162,7 +162,7 @@ pub fn cmd_monitor_dispatch(
 
 pub fn cmd_monitor(port: &str, _baud: u32, refresh_ms: u64) -> Result<()> {
     eprintln!(
-        "fluxor monitor: opening {port} (configure baud externally, e.g. \
+        "fluxor rig monitor: opening {port} (configure baud externally, e.g. \
          `stty -F {port} 115200 raw -echo`)"
     );
     let file = std::fs::File::open(port)
@@ -217,7 +217,7 @@ pub fn bind_udp_listener(
 pub fn cmd_monitor_udp(bind: &str, refresh_ms: u64) -> Result<()> {
     let sock = bind_udp_listener(bind, Some(Duration::from_millis(refresh_ms)))?;
     eprintln!(
-        "fluxor monitor: listening on {} (UDP)",
+        "fluxor rig monitor: listening on {} (UDP)",
         sock.local_addr()
             .map_or_else(|_| bind.to_string(), |a| a.to_string())
     );

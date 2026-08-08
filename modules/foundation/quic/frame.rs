@@ -143,7 +143,7 @@ pub struct StreamFrame<'a> {
 /// (0x08..0x0F); `body` is the payload that follows. Returns the parsed
 /// frame plus the number of body bytes consumed.
 pub fn parse_stream(type_byte: u8, body: &[u8]) -> Option<(StreamFrame<'_>, usize)> {
-    if type_byte < FRAME_STREAM_BASE || type_byte > FRAME_STREAM_END {
+    if !(FRAME_STREAM_BASE..=FRAME_STREAM_END).contains(&type_byte) {
         return None;
     }
     let has_off = type_byte & STREAM_FLAG_OFF != 0;

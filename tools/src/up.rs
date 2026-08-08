@@ -1,6 +1,6 @@
 //! Multi-replica deployment orchestrator.
 //!
-//! `fluxor up <template> --replicas N` is the developer-facing
+//! `fluxor run <template> --replicas N` is the developer-facing
 //! shortcut for "render this template N times and spawn N
 //! `fluxor run` processes side-by-side, tailing their stderr until
 //! Ctrl+C". Designed for local Raft-style cluster bring-up; a common
@@ -52,7 +52,8 @@ pub fn cmd_up(
 
     // Synced fmods / runtime binaries live under `target/`, which
     // `cargo clean` wipes; refill lockfile-recorded holes before bring-up.
-    crate::sync::ensure_materialized(&crate::project::root())?;
+    fluxor_tools::store_sync::ensure_synced(&crate::project::root())
+        .map_err(|e| Error::Config(e.to_string()))?;
 
     let fluxor = resolve_fluxor_bin(fluxor_bin)?;
     let extra = parse_vars(extra_vars)?;
@@ -291,7 +292,7 @@ fn resolve_fluxor_bin(override_path: Option<&Path>) -> Result<PathBuf> {
         }
         return Ok(p.to_path_buf());
     }
-    // Default: assume we're called as `fluxor up`, so re-invoke
+    // Default: assume we're called as `fluxor run --replicas`, so re-invoke
     // `fluxor run` via the same binary on $PATH. Falling back to
     // `current_exe()` covers the in-tree development case where
     // fluxor isn't installed system-wide.

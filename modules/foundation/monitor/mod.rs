@@ -1,4 +1,4 @@
-//! monitor — emit `MON_HIST` telemetry lines for the `fluxor monitor` CLI.
+//! monitor — emit `MON_HIST` telemetry lines for the `fluxor rig monitor` CLI.
 //!
 //! Polls the step-timing histogram for every active module on a slow
 //! cadence and emits one `MON_HIST` line per module via `log::info!`.

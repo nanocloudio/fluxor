@@ -165,6 +165,7 @@ pub static WASM_SYSCALLS: SyscallTable = SyscallTable {
     provider_call_sel: wasm_provider_call_sel,
 };
 
+#[cfg(target_arch = "wasm32")]
 unsafe extern "C" fn wasm_provider_call_sel(
     _sel: *const u8,
     _sel_len: usize,

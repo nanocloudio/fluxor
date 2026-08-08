@@ -2,7 +2,7 @@
 //!
 //! Supports both the current pointer-based format (FXCF) and legacy format (FXWR).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde_json::{json, Map, Value};
@@ -1188,5 +1188,4 @@ include!("builder.rs"); // ConfigBuilder + graph-config generation
 include!("manifest.rs"); // module search paths + manifest loading
 include!("validate.rs"); // presentation-group + continuity validators
 include!("generate.rs"); // FXWR encode, ModuleCaps, generate_config_ext
-include!("examples.rs"); // example-config builders
 include!("tests.rs"); // #[cfg(test)] suites

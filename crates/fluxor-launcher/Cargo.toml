@@ -1,0 +1,28 @@
+[package]
+name = "fluxor-launcher"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Resolving launcher: ~/.cargo/bin/fluxor resolves the CLI's :latest store artifact and execs its blob"
+
+# The one binary `make install` puts on PATH (Decision 8,
+# registry_consolidation.md): there is no installed CLI copy to go
+# stale — every invocation resolves `fluxor/run/fluxor-<triple>:latest`
+# from the local OCI store and execs the content-addressed blob via an
+# open descriptor, so a GC sweep can never race an in-flight launch.
+
+[lints]
+workspace = true
+
+# Built as `fluxor-launcher` and installed as `fluxor`: the tools CLI
+# already owns the `fluxor` bin name, and two bin targets of that name
+# would uplift over each other in the shared target dir — leaving
+# whichever built last at the path `publish` reads.
+[[bin]]
+name = "fluxor-launcher"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"

@@ -7,7 +7,7 @@
 // Param Helpers: Safe(r) little-endian reads from a raw params pointer.
 
 // The digest of the SDK this module is compiled against, embedded so
-// `fluxor pack` can verify compilation provenance: it reads this value from
+// `fluxor modules pack` can verify compilation provenance: it reads this value from
 // the ELF and requires it to equal the packer's own surface digest before
 // packaging, so a module whose hardcoded ABI numbers do not match the
 // current kernel is rejected rather than shipped.

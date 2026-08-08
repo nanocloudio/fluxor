@@ -218,7 +218,12 @@ unsafe fn backend_stream(s: &mut BankState) -> ReadOutcome {
             if written > 0 {
                 s.total_bytes_emitted = s.total_bytes_emitted.saturating_add(written as u32);
             }
-            track_pending(written, n as usize, &mut s.pending_out, &mut s.pending_offset);
+            track_pending(
+                written,
+                n as usize,
+                &mut s.pending_out,
+                &mut s.pending_offset,
+            );
             if (written as usize) < n as usize {
                 // Ring filled mid-chunk; drain_pending picks up the
                 // tail next step.

@@ -33,6 +33,12 @@ pub struct AckTracker {
     pub ack_pending: bool,
 }
 
+impl Default for AckTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AckTracker {
     pub const fn new() -> Self {
         Self {

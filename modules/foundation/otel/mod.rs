@@ -397,12 +397,8 @@ unsafe fn step_flush(s: &mut OtelState) {
         let n = (sys.provider_call)(s.tlm_slot, tlm::TLM_STATS, stats.as_mut_ptr(), stats.len());
         if n >= tlm::TLM_STATS_LEN as i32 {
             let off = 4 + (s.tlm_slot as usize) * 4;
-            s.dropped = u32::from_le_bytes([
-                stats[off],
-                stats[off + 1],
-                stats[off + 2],
-                stats[off + 3],
-            ]);
+            s.dropped =
+                u32::from_le_bytes([stats[off], stats[off + 1], stats[off + 2], stats[off + 3]]);
         }
     }
     if !emit_batch(s) {
@@ -538,14 +534,15 @@ pub extern "C" fn module_new(
         let sys = &*s.syscalls;
 
         s.export_chan = out_chan; // out[0]
-        // Optional `delivery` input (in[0]): a carrier that reports per-batch
-        // delivery status wires it; fire-and-forget carriers (UDP/UART) leave it
-        // unwired (`-1`), keeping otel in fire-and-forget mode.
+                                  // Optional `delivery` input (in[0]): a carrier that reports per-batch
+                                  // delivery status wires it; fire-and-forget carriers (UDP/UART) leave it
+                                  // unwired (`-1`), keeping otel in fire-and-forget mode.
         s.delivery_chan = dev_channel_port(sys, 0, 0);
         let filter = tlm::FILTER_ALL.to_le_bytes();
         s.tlm_slot = (sys.provider_call)(-1, tlm::TLM_SUBSCRIBE, filter.as_ptr() as *mut u8, 4);
 
-        let is_tlv = !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {

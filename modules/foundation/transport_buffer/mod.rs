@@ -9,12 +9,12 @@
 //!
 //! Transports:
 //!   - `udp` (0)  — via the shared `datagram_endpoint` core over the ip datagram
-//!                  surface: it owns the bind lifecycle and the addressed send
-//!                  (the same core `log_net` uses). Needs the net channels wired:
-//!                  in[1]=net_in, out[0]=net_out; params dst_ip / dst_port /
-//!                  bind_port.
+//!     surface: it owns the bind lifecycle and the addressed send
+//!     (the same core `log_net` uses). Needs the net channels wired:
+//!     in[1]=net_in, out[0]=net_out; params dst_ip / dst_port /
+//!     bind_port.
 //!   - `uart` (1) — via the raw `SERIAL_WRITE` sink (debug UART / USB-CDC). No
-//!                  network, no addressing; net channels left unwired.
+//!     network, no addressing; net channels left unwired.
 //!
 //! A stream transport (TCP) or downstream client (HTTP/gRPC) is a new `send`
 //! arm — and, if datagram-shaped, reuses `datagram_endpoint` — not a new module.
@@ -241,7 +241,11 @@ unsafe fn pump(s: &mut TransportBufferState) {
         if copied == 0 {
             break; // no full frame available.
         }
-        let take = if copied < PAYLOAD_MAX { copied } else { PAYLOAD_MAX };
+        let take = if copied < PAYLOAD_MAX {
+            copied
+        } else {
+            PAYLOAD_MAX
+        };
         core::ptr::copy_nonoverlapping(
             s.net_buf.as_ptr().add(NET_FRAME_HDR),
             s.pending.as_mut_ptr(),

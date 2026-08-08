@@ -53,7 +53,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -84,7 +83,7 @@ const TCP_FLAG_ACK: u8 = 0x10;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RateEntry {
-    ip: u32,        // remote source IP; 0 = empty slot
+    ip: u32, // remote source IP; 0 = empty slot
     /// Local (destination) address the SYN targeted — the per-workload owner
     /// axis (`rfc_net_identity_metal` §3.5). In v1 one local address maps 1:1
     /// to one owner (a workload can only be reached at its own address), so the
@@ -97,7 +96,7 @@ struct RateEntry {
     /// eviction and counters are identical to the pre-P2 src-only key —
     /// byte-identical.
     dst: u32,
-    last_ms: u32,   // monotonic ms timestamp (truncated)
+    last_ms: u32, // monotonic ms timestamp (truncated)
     /// SYNs seen from this `(dst, ip)` pair inside the current window.
     ///
     /// `u16`, NOT `u8`, deliberately. `rate_limit_per_ip` is a `u8`, so with a
@@ -111,7 +110,13 @@ struct RateEntry {
 
 impl RateEntry {
     const fn empty() -> Self {
-        Self { ip: 0, dst: 0, last_ms: 0, count: 0, _pad: [0; 2] }
+        Self {
+            ip: 0,
+            dst: 0,
+            last_ms: 0,
+            count: 0,
+            _pad: [0; 2],
+        }
     }
 }
 
@@ -161,23 +166,35 @@ const STATE_SIZE: usize = core::mem::size_of::<GuardState>();
 /// the SYN targeted — the per-owner partition axis (`rfc_net_identity_metal`
 /// §3.5).
 unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<(u32, u32)> {
-    if len < 14 + 20 { return None; }
+    if len < 14 + 20 {
+        return None;
+    }
 
     // EtherType (offset 12-13, big-endian)
     let et = ((*frame.add(12) as u16) << 8) | (*frame.add(13) as u16);
-    if et != ETHERTYPE_IPV4 { return None; }
+    if et != ETHERTYPE_IPV4 {
+        return None;
+    }
 
     // IPv4 header at offset 14
     let ipv4 = frame.add(14);
     let vihl = *ipv4;
-    if (vihl >> 4) != 4 { return None; }
+    if (vihl >> 4) != 4 {
+        return None;
+    }
     let ihl_words = (vihl & 0x0F) as usize;
-    if ihl_words < 5 { return None; }
+    if ihl_words < 5 {
+        return None;
+    }
     let ip_hdr_len = ihl_words * 4;
-    if len < 14 + ip_hdr_len + 20 { return None; }
+    if len < 14 + ip_hdr_len + 20 {
+        return None;
+    }
 
     // Protocol (offset 9 within IPv4 header)
-    if *ipv4.add(9) != IPPROTO_TCP { return None; }
+    if *ipv4.add(9) != IPPROTO_TCP {
+        return None;
+    }
 
     // Source IP (offset 12 within IPv4 header), big-endian on the wire.
     // Store as host-endian u32 for table key (endianness only matters for keying).
@@ -222,7 +239,9 @@ unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<(u32, u32)> {
 /// pre-P2 fuse.
 unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, dst_ip: u32, now_ms: u32) -> bool {
     let table_size = s.rate_table_size as usize;
-    if table_size == 0 { return true; }
+    if table_size == 0 {
+        return true;
+    }
 
     let limit = s.rate_limit_per_ip;
     let window = s.rate_window_ms as u32;
@@ -282,19 +301,23 @@ unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, dst_ip: u32, now_ms: u32) -
 // Module ABI
 // ============================================================================
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { STATE_SIZE }
+pub extern "C" fn module_state_size() -> usize {
+    STATE_SIZE
+}
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 { 0 }
+pub extern "C" fn module_arena_size() -> u32 {
+    0
+}
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -315,7 +338,9 @@ pub extern "C" fn module_new(
     let base = s.table.as_mut_ptr();
     let mut i = 0usize;
     while i < MAX_TABLE {
-        unsafe { *base.add(i) = RateEntry::empty(); }
+        unsafe {
+            *base.add(i) = RateEntry::empty();
+        }
         i += 1;
     }
 
@@ -350,7 +375,7 @@ pub extern "C" fn module_new(
     0
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut GuardState);
@@ -416,16 +441,22 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         dev_log(sys, 3, p, pos);
     }
 
-    if s.in_chan < 0 || s.out_chan < 0 { return 0; }
+    if s.in_chan < 0 || s.out_chan < 0 {
+        return 0;
+    }
 
     // Need at least the 2-byte length prefix to be ready.
     let poll = (sys.channel_poll)(s.in_chan, 0x01); // POLL_IN
-    if poll <= 0 || (poll as u32 & 0x01) == 0 { return 0; }
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return 0;
+    }
 
     // Read the length prefix directly into the staging buffer.
     let buf = s.frame_buf.as_mut_ptr();
     let hn = (sys.channel_read)(s.in_chan, buf, 2);
-    if hn < 2 { return 0; }
+    if hn < 2 {
+        return 0;
+    }
     let frame_len = (*buf as usize) | ((*buf.add(1) as usize) << 8);
     if frame_len == 0 || frame_len > MAX_FRAME {
         s.dropped_full = s.dropped_full.wrapping_add(1);
@@ -442,7 +473,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let pass = if let Some((src_ip, dst_ip)) = classify_syn(frame_ptr, frame_len) {
         let now_ms = dev_millis(sys) as u32;
         let admit = admit_syn(s, src_ip, dst_ip, now_ms);
-        if !admit { s.dropped_syn = s.dropped_syn.wrapping_add(1); }
+        if !admit {
+            s.dropped_syn = s.dropped_syn.wrapping_add(1);
+        }
         admit
     } else {
         true

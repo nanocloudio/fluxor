@@ -55,7 +55,16 @@ pub const PTYPE_STR: u8 = 3;
 pub const PTYPE_U16_ARRAY: u8 = 4;
 pub const PTYPE_BLOB: u8 = 5;
 
-#[macro_export]
+// Textually scoped, not `#[macro_export]`: every consumer `include!`s
+// this file before invoking the macro, so definition-order visibility
+// covers all of them — and a crate-root export would collide the
+// moment one crate mounts more than one module core (the test-harness
+// and multi-module host builds do exactly that). `allow(unused_macros)`
+// because modules without config params still include this file.
+#[allow(
+    unused_macros,
+    reason = "modules without config params still include this file"
+)]
 macro_rules! define_params {
     (
         $state_type:ty;

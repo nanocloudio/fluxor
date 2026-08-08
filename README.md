@@ -203,24 +203,25 @@ For each target, packaging is driven by the YAML config and the prebuilt `.fmod`
 The host tool is built as `fluxor` and provides packaging and inspection commands:
 
 ```bash
-# List all configured targets
-fluxor targets
+# Project info: root, available targets, stacks, rig, scenarios
+fluxor inspect
 
-# Validate a config without packaging
-fluxor validate examples/audio_player/pico2w.yaml
+# Validate a config against its target, writing nothing
+fluxor build --check examples/hello/linux.yaml
 
 # Build one YAML config into the target-specific artifact
-fluxor build examples/audio_player/pico2w.yaml
+fluxor build examples/hello/linux.yaml
 
-# Pack a module ELF into .fmod
-fluxor pack <module.elf> -o <module.fmod> -n <name> -t <module_type>
+# Build the PIC modules a config names, then pack an ELF by hand
+fluxor modules build --target bcm2712
+fluxor modules pack <module.elf> -o <module.fmod> -n <name> -t <module_type>
 
-# Inspect a built artifact
-fluxor info <file.uf2>
-fluxor decode <file.uf2>
+# Inspect a built artifact (or a store reference)
+fluxor inspect <file.uf2>
+fluxor inspect <file.uf2> --emit-config
 
-# Show what changes between two configs (used for live reconfigure planning)
-fluxor diff <old.yaml> <new.yaml>
+# Show what changes between two configs (live-reconfigure planning)
+fluxor inspect <new.yaml> --against <old.yaml>
 ```
 
 ## Repository Layout

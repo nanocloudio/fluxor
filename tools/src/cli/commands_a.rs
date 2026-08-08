@@ -1166,17 +1166,6 @@ fn cmd_slot_image(
     Ok(())
 }
 
-fn cmd_example(name: &str) -> Result<()> {
-    if let Some(example) = EXAMPLES.get(name) {
-        println!("{}", serde_json::to_string_pretty(example)?);
-        Ok(())
-    } else {
-        let available: Vec<_> = EXAMPLES.keys().copied().collect();
-        println!("Available examples: {}", available.join(", "));
-        Err(error::Error::Config(format!("Unknown example: {name}")))
-    }
-}
-
 fn cmd_pack(
     input: &Path,
     output: &Path,

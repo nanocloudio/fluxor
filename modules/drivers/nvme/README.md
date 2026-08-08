@@ -18,7 +18,7 @@ trace that defines the expected controller init sequence.
 Every `log::info!` in this module flows through the kernel log ring
 and out over whatever transport `platform.debug.to` selects. On the
 pi5 rig we use `{ to: net, monitor: true }` and consume with
-`fluxor monitor --net :6666` — no UART cable required. See
+`fluxor rig monitor --net :6666` — no UART cable required. See
 `.../memory/pi5_netconsole.md` for the bus details.
 
 The exception handler is a separate path that writes PL011 directly,

@@ -122,7 +122,7 @@ pub fn validate_dhcp_config(
     }
 
     // Lease time must be reasonable (> 60s, < 30 days)
-    if lease_time > 0 && (lease_time < 60 || lease_time > 2_592_000) {
+    if lease_time > 0 && !(60..=2_592_000).contains(&lease_time) {
         return false;
     }
 

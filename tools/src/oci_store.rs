@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 // ── Media types (rfc_k8s.md §9) ───────────────────────────────────────
 
 pub const MT_OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+pub const MT_OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 pub const MT_OCI_EMPTY: &str = "application/vnd.oci.empty.v1+json";
 pub const MT_FLUXOR_MODULE: &str = "application/vnd.nanocloud.fluxor.module.v1";
 pub const MT_FLUXOR_WORKLOAD: &str = "application/vnd.nanocloud.fluxor.workload.v1+json";
@@ -37,6 +38,13 @@ pub const MT_FLUXOR_GRAPH: &str = "application/vnd.nanocloud.fluxor.graph.v1+yam
 pub const MT_FLUXOR_RESOURCES: &str = "application/vnd.nanocloud.fluxor.resources.v1+json";
 /// Module manifest.toml metadata carried alongside the `.fmod` layer.
 pub const MT_FLUXOR_MODULE_META: &str = "application/vnd.nanocloud.fluxor.module.manifest.v1+toml";
+/// Staged source tree (canonical uncompressed tar) — the SDK /
+/// `<project>-common` trees that consumers `#[path]`/`include!` after
+/// `fluxor sync` extraction. Replaces the registry's `.crate` packages.
+pub const MT_FLUXOR_SOURCE: &str = "application/vnd.nanocloud.fluxor.source.v1+tar";
+/// Host runtime binary (one layer per host triple), `fluxor/run/`
+/// namespace only — including the `fluxor` CLI itself.
+pub const MT_FLUXOR_RUNTIME: &str = "application/vnd.nanocloud.fluxor.runtime.v1";
 
 // ── Annotation keys ───────────────────────────────────────────────────
 
@@ -47,6 +55,21 @@ pub const ANN_SOURCE_REV: &str = "io.fluxor.source-rev";
 pub const ANN_KIND: &str = "io.fluxor.kind";
 pub const ANN_TARGET: &str = "io.fluxor.module.target";
 pub const ANN_MODULE_NAME: &str = "io.fluxor.module.name";
+/// The ecosystem epoch: the ABI-surface digest the artifact was built
+/// against. Sync verifies set homogeneity (everyone) and currency
+/// (live members) on this annotation; an artifact without it is not
+/// consumable (registry_consolidation.md, epoch rules).
+pub const ANN_ABI_SURFACE: &str = "io.fluxor.abi-surface";
+/// Token-canonical digest of the artifact's actual inputs, stamped at
+/// publish — the per-artifact staleness signal and `workspace publish`
+/// work-list key. Runtimes carry `source-rev` + a dirty bit instead.
+pub const ANN_INPUT_DIGEST: &str = "io.fluxor.input-digest";
+/// The input digest the project's `ci` gate last passed on, when known.
+/// Information, never a gate: green-ci is required only at the future
+/// promotion-to-`published` re-tag.
+pub const ANN_CI_DIGEST: &str = "io.fluxor.ci-digest";
+/// Host triple of a runtime artifact's binary layer.
+pub const ANN_RUNTIME_TRIPLE: &str = "io.fluxor.runtime.triple";
 
 pub const PROVENANCE_LOCAL: &str = "local-build";
 pub const PROVENANCE_PUBLISHED: &str = "published";
@@ -378,23 +401,19 @@ impl OciStore {
     fn sweep_candidates(&self, index: &ImageIndex, victims: &[Descriptor]) -> Result<Vec<String>> {
         let mut live: BTreeSet<String> = BTreeSet::new();
         for d in &index.manifests {
-            live.insert(d.digest.clone());
-            let m = self.read_manifest(d).map_err(|e| {
+            // `add_closure` traverses image manifests AND image
+            // indexes (project indexes, snapshots) — a project-index
+            // descriptor must not be parsed as a manifest.
+            self.add_closure(d, &mut live).map_err(|e| {
                 Error::Config(format!("live manifest {} is unreadable ({e})", d.digest))
             })?;
-            live.insert(m.config.digest.clone());
-            for l in &m.layers {
-                live.insert(l.digest.clone());
-            }
         }
         let mut candidates: BTreeSet<String> = BTreeSet::new();
         for v in victims {
             candidates.insert(v.digest.clone());
-            if let Ok(m) = self.read_manifest(v) {
-                candidates.insert(m.config.digest.clone());
-                for l in &m.layers {
-                    candidates.insert(l.digest.clone());
-                }
+            let mut c = BTreeSet::new();
+            if self.add_closure(v, &mut c).is_ok() {
+                candidates.extend(c);
             }
         }
         let mut removed = Vec::new();
@@ -519,11 +538,14 @@ impl OciStore {
             }
         };
         // Fail-closed validation FIRST, before any mutation: every manifest
-        // that will remain live must be readable (its layer set feeds the
-        // keep-set). If this errors, the index is untouched and the command
-        // is safely retryable.
+        // that will remain live must be readable (its closure feeds the
+        // keep-set) — via `add_closure`, which understands both image
+        // manifests and image indexes (project indexes, snapshots). If this
+        // errors, the index is untouched and the command is safely
+        // retryable.
+        let mut probe = BTreeSet::new();
         for d in index.manifests.iter().filter(|d| survives(d)) {
-            self.read_manifest(d).map_err(|e| {
+            self.add_closure(d, &mut probe).map_err(|e| {
                 Error::Config(format!(
                     "refusing to remove: live manifest {} is unreadable ({e})",
                     d.digest
@@ -741,12 +763,579 @@ pub fn publish_bundle(store: &OciStore, b: &BundlePublish<'_>) -> Result<Descrip
     store.tag_manifest_locked(&oci_manifest, b.ref_name)
 }
 
+// ── Source / runtime artifacts + transactional batch publish ─────────
+//
+// The consolidated publish path (registry_consolidation.md P1): every
+// artifact kind is prepared (blobs staged, manifest built) and then a
+// whole publish commits in ONE locked index write — partial publish is
+// impossible by construction. Each artifact is tagged both `name:ver`
+// and `name:latest` (the tag `:latest` IS "most recently published
+// digest"; version strings are labels under never-bump).
+
+/// Project-association annotation: which project published an artifact.
+/// The project index is derived from it, so ownership never has to be
+/// inferred from tag shapes or name prefixes.
+pub const ANN_PROJECT: &str = "io.fluxor.project";
+
+/// A staged-but-uncommitted artifact: blobs are in the store, the
+/// manifest is built, no tag exists yet. Produced under the caller's
+/// batch lock by the `prepare_*` fns; committed by `commit_publish`.
+pub struct Prepared {
+    pub manifest: ImageManifest,
+    /// Canonical tag, e.g. `bcm2712/tls:0.0.1` or `fluxor/src/fluxor-abi:0.0.1`.
+    pub ref_name: String,
+    /// Moving tag repointed on every publish, e.g. `bcm2712/tls:latest`.
+    pub latest_ref: String,
+}
+
+/// Common annotation payload every prepared artifact carries.
+pub struct ArtifactMeta<'a> {
+    pub project: &'a str,
+    pub provenance: &'a str,
+    pub source_rev: Option<&'a str>,
+    /// The ecosystem epoch (hex) the artifact was built against.
+    pub abi_surface_hex: &'a str,
+    /// Token-canonical input digest (hex); `None` for runtimes, whose
+    /// binary layer digest already identifies their inputs.
+    pub input_digest_hex: Option<&'a str>,
+    /// Input digest the project's ci gate last passed on, when known.
+    pub ci_digest_hex: Option<&'a str>,
+}
+
+fn base_annotations(kind: &str, meta: &ArtifactMeta<'_>) -> Annotations {
+    let mut a = Annotations::new();
+    a.insert(ANN_KIND.into(), kind.into());
+    a.insert(ANN_PROJECT.into(), meta.project.into());
+    a.insert(ANN_PROVENANCE.into(), meta.provenance.into());
+    a.insert(ANN_ABI_SURFACE.into(), meta.abi_surface_hex.into());
+    if let Some(rev) = meta.source_rev {
+        a.insert(ANN_SOURCE_REV.into(), rev.into());
+    }
+    if let Some(d) = meta.input_digest_hex {
+        a.insert(ANN_INPUT_DIGEST.into(), d.into());
+    }
+    if let Some(d) = meta.ci_digest_hex {
+        a.insert(ANN_CI_DIGEST.into(), d.into());
+    }
+    a
+}
+
+/// Held for the duration of one publish transaction: blob staging via
+/// the `prepare_*` fns and the final `commit_publish` all happen under
+/// this one advisory lock, so a concurrent `remove`'s sweep can never
+/// delete staged-but-uncommitted blobs.
+pub struct PublishLock(#[allow(dead_code, reason = "held for its Drop")] fs::File);
+
+impl OciStore {
+    /// Open a publish transaction (see [`PublishLock`]).
+    pub fn begin_publish(&self) -> Result<PublishLock> {
+        Ok(PublishLock(self.lock_index()?))
+    }
+
+    /// Stage a module artifact for a batch commit — `publish_module`'s
+    /// body without the tagging, plus the consolidated annotations.
+    pub fn prepare_module(
+        &self,
+        name: &str,
+        target: &str,
+        version: &str,
+        fmod_bytes: &[u8],
+        manifest_toml: Option<&str>,
+        meta: &ArtifactMeta<'_>,
+    ) -> Result<Prepared> {
+        let (config_digest, config_size) = self.put_blob(EMPTY_CONFIG)?;
+        let (fmod_digest, fmod_size) = self.put_blob(fmod_bytes)?;
+        let mut layers = vec![Descriptor {
+            media_type: MT_FLUXOR_MODULE.into(),
+            digest: fmod_digest,
+            size: fmod_size,
+            annotations: one_annotation(ANN_TITLE, &format!("{name}.fmod")),
+        }];
+        if let Some(toml_text) = manifest_toml {
+            let (d, s) = self.put_blob(toml_text.as_bytes())?;
+            layers.push(Descriptor {
+                media_type: MT_FLUXOR_MODULE_META.into(),
+                digest: d,
+                size: s,
+                annotations: one_annotation(ANN_TITLE, "manifest.toml"),
+            });
+        }
+        let mut annotations = base_annotations("module", meta);
+        annotations.insert(ANN_MODULE_NAME.into(), name.into());
+        annotations.insert(ANN_TARGET.into(), target.into());
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: MT_OCI_MANIFEST.into(),
+            artifact_type: Some(MT_FLUXOR_MODULE.into()),
+            config: Descriptor {
+                media_type: MT_OCI_EMPTY.into(),
+                digest: config_digest,
+                size: config_size,
+                annotations: Annotations::new(),
+            },
+            layers,
+            annotations,
+        };
+        Ok(Prepared {
+            manifest,
+            ref_name: format!("{target}/{name}:{version}"),
+            latest_ref: format!("{target}/{name}:latest"),
+        })
+    }
+
+    /// Stage a source-tree artifact: one canonical-tar layer.
+    /// `files` must satisfy `canonical_tar`'s ordering contract.
+    pub fn prepare_source(
+        &self,
+        name: &str,
+        version: &str,
+        files: &[(String, Vec<u8>)],
+        meta: &ArtifactMeta<'_>,
+    ) -> Result<Prepared> {
+        let tar = canonical_tar(files)?;
+        let (config_digest, config_size) = self.put_blob(EMPTY_CONFIG)?;
+        let (tar_digest, tar_size) = self.put_blob(&tar)?;
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: MT_OCI_MANIFEST.into(),
+            artifact_type: Some(MT_FLUXOR_SOURCE.into()),
+            config: Descriptor {
+                media_type: MT_OCI_EMPTY.into(),
+                digest: config_digest,
+                size: config_size,
+                annotations: Annotations::new(),
+            },
+            layers: vec![Descriptor {
+                media_type: MT_FLUXOR_SOURCE.into(),
+                digest: tar_digest,
+                size: tar_size,
+                annotations: one_annotation(ANN_TITLE, &format!("{name}.tar")),
+            }],
+            annotations: base_annotations("source", meta),
+        };
+        Ok(Prepared {
+            manifest,
+            ref_name: format!("{}/src/{name}:{version}", meta.project),
+            latest_ref: format!("{}/src/{name}:latest", meta.project),
+        })
+    }
+
+    /// Stage a runtime artifact: one binary layer for one host triple.
+    /// Namespace is `fluxor/run/` only — a sibling publishing a runtime
+    /// is a design error, enforced here rather than documented around.
+    pub fn prepare_runtime(
+        &self,
+        name: &str,
+        version: &str,
+        triple: &str,
+        binary: &[u8],
+        meta: &ArtifactMeta<'_>,
+    ) -> Result<Prepared> {
+        if meta.project != "fluxor" {
+            return Err(Error::Config(format!(
+                "runtime artifacts are fluxor's alone (a sibling \"runtime\" is a graph \
+                 on fluxor-linux); refusing to publish runtime '{name}' from project '{}'",
+                meta.project
+            )));
+        }
+        let (config_digest, config_size) = self.put_blob(EMPTY_CONFIG)?;
+        let (bin_digest, bin_size) = self.put_blob(binary)?;
+        // Runtime blobs are executed in place: the CLI launcher opens
+        // the blob and `fexecve`s the descriptor, and exec requires the
+        // x bit on the file itself. Idempotent on re-publish.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                self.blob_path(&bin_digest)?,
+                fs::Permissions::from_mode(0o755),
+            )?;
+        }
+        let mut annotations = base_annotations("runtime", meta);
+        annotations.insert(ANN_RUNTIME_TRIPLE.into(), triple.into());
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: MT_OCI_MANIFEST.into(),
+            artifact_type: Some(MT_FLUXOR_RUNTIME.into()),
+            config: Descriptor {
+                media_type: MT_OCI_EMPTY.into(),
+                digest: config_digest,
+                size: config_size,
+                annotations: Annotations::new(),
+            },
+            layers: vec![Descriptor {
+                media_type: MT_FLUXOR_RUNTIME.into(),
+                digest: bin_digest,
+                size: bin_size,
+                annotations: one_annotation(ANN_TITLE, name),
+            }],
+            annotations,
+        };
+        Ok(Prepared {
+            manifest,
+            ref_name: format!("fluxor/run/{name}-{triple}:{version}"),
+            latest_ref: format!("fluxor/run/{name}-{triple}:latest"),
+        })
+    }
+
+    /// Commit a whole publish: stage every manifest blob, then repoint
+    /// every tag (`name:ver` + `name:latest`) and rewrite the project
+    /// index in ONE index write under the lock. Afterwards, sweep
+    /// displaced closures with the full liveness root set (tags ∪
+    /// snapshot children ∪ workspace-member lockfile digests).
+    pub fn commit_publish(
+        &self,
+        _txn: &PublishLock,
+        project: &str,
+        version: &str,
+        prepared: Vec<Prepared>,
+        deps_annotation: Option<&str>,
+    ) -> Result<Vec<Descriptor>> {
+        let mut index = self.read_index()?;
+        let mut new_descs: Vec<Descriptor> = Vec::new();
+        let mut repointed: BTreeSet<String> = BTreeSet::new();
+
+        for p in &prepared {
+            let bytes = serde_json::to_vec(&p.manifest)?;
+            let (digest, size) = self.put_blob(&bytes)?;
+            for r in [&p.ref_name, &p.latest_ref] {
+                let mut annotations = p.manifest.annotations.clone();
+                annotations.insert(ANN_REF_NAME.into(), r.clone());
+                new_descs.push(Descriptor {
+                    media_type: MT_OCI_MANIFEST.into(),
+                    digest: digest.clone(),
+                    size,
+                    annotations,
+                });
+                repointed.insert(r.clone());
+            }
+        }
+
+        // Project index: an OCI image index over every artifact this
+        // project currently publishes (the batch, plus prior artifacts
+        // of the project whose refs the batch did not repoint).
+        let mut children: Vec<Descriptor> = new_descs
+            .iter()
+            .filter(|d| {
+                d.annotations
+                    .get(ANN_REF_NAME)
+                    .is_some_and(|r| !r.ends_with(":latest"))
+            })
+            .cloned()
+            .collect();
+        for d in &index.manifests {
+            let same_project = d.annotations.get(ANN_PROJECT).map(String::as_str) == Some(project);
+            let is_meta = d
+                .annotations
+                .get(ANN_REF_NAME)
+                .is_some_and(|r| r.starts_with(&format!("{project}/meta:")));
+            let displaced_ref = d
+                .annotations
+                .get(ANN_REF_NAME)
+                .is_some_and(|r| repointed.contains(r) || r.ends_with(":latest"));
+            if same_project && !is_meta && !displaced_ref {
+                children.push(d.clone());
+            }
+        }
+        let mut idx_annotations = Annotations::new();
+        idx_annotations.insert(ANN_KIND.into(), "project-index".into());
+        idx_annotations.insert(ANN_PROJECT.into(), project.into());
+        if let Some(deps) = deps_annotation {
+            idx_annotations.insert("io.fluxor.deps".into(), deps.into());
+        }
+        let project_index = ImageIndex {
+            schema_version: 2,
+            media_type: MT_OCI_INDEX.into(),
+            manifests: children,
+        };
+        let idx_bytes = serde_json::to_vec(&project_index)?;
+        let (idx_digest, idx_size) = self.put_blob(&idx_bytes)?;
+        for r in [
+            format!("{project}/meta:{version}"),
+            format!("{project}/meta:latest"),
+        ] {
+            let mut annotations = idx_annotations.clone();
+            annotations.insert(ANN_REF_NAME.into(), r.clone());
+            new_descs.push(Descriptor {
+                media_type: MT_OCI_INDEX.into(),
+                digest: idx_digest.clone(),
+                size: idx_size,
+                annotations,
+            });
+            repointed.insert(r);
+        }
+
+        // The single swap: drop every repointed ref, append the batch.
+        let displaced: Vec<Descriptor> = index
+            .manifests
+            .iter()
+            .filter(|d| {
+                d.annotations
+                    .get(ANN_REF_NAME)
+                    .is_some_and(|r| repointed.contains(r))
+                    && !new_descs.iter().any(|n| n.digest == d.digest)
+            })
+            .cloned()
+            .collect();
+        index.manifests.retain(|d| {
+            d.annotations
+                .get(ANN_REF_NAME)
+                .is_none_or(|r| !repointed.contains(r))
+        });
+        index.manifests.extend(new_descs.clone());
+        self.write_index(&index)?;
+
+        if !displaced.is_empty() {
+            match self.sweep_with_roots(&index, &displaced) {
+                Ok(_removed) => {}
+                Err(e) => eprintln!(
+                    "warning: publish could not sweep displaced artifacts ({e}); \
+                     their blobs remain until a future sweep"
+                ),
+            }
+        }
+        Ok(new_descs)
+    }
+
+    /// Create (or repoint) a snapshot: one OCI index over `children`,
+    /// tagged `snapshot/<name>`. Snapshots are GC roots — everything
+    /// reachable from one survives every sweep.
+    pub fn create_snapshot(&self, name: &str, children: Vec<Descriptor>) -> Result<Descriptor> {
+        let _index_lock = self.lock_index()?;
+        let snap = ImageIndex {
+            schema_version: 2,
+            media_type: MT_OCI_INDEX.into(),
+            manifests: children,
+        };
+        let bytes = serde_json::to_vec(&snap)?;
+        let (digest, size) = self.put_blob(&bytes)?;
+        let ref_name = format!("snapshot/{name}");
+        let mut annotations = Annotations::new();
+        annotations.insert(ANN_KIND.into(), "snapshot".into());
+        annotations.insert(ANN_REF_NAME.into(), ref_name.clone());
+        let desc = Descriptor {
+            media_type: MT_OCI_INDEX.into(),
+            digest,
+            size,
+            annotations,
+        };
+        let mut index = self.read_index()?;
+        index
+            .manifests
+            .retain(|d| d.annotations.get(ANN_REF_NAME) != Some(&ref_name));
+        index.manifests.push(desc.clone());
+        self.write_index(&index)?;
+        Ok(desc)
+    }
+
+    /// Closure-add one descriptor's reachable digests into `live`,
+    /// traversing both image manifests and image indexes (project
+    /// indexes, snapshots).
+    fn add_closure(&self, d: &Descriptor, live: &mut BTreeSet<String>) -> Result<()> {
+        if !live.insert(d.digest.clone()) {
+            return Ok(());
+        }
+        if d.media_type == MT_OCI_INDEX {
+            let bytes = self.read_blob(&d.digest)?;
+            let idx: ImageIndex = serde_json::from_slice(&bytes)?;
+            for child in &idx.manifests {
+                self.add_closure(child, live)?;
+            }
+            return Ok(());
+        }
+        let m = self.read_manifest(d)?;
+        live.insert(m.config.digest.clone());
+        for l in &m.layers {
+            live.insert(l.digest.clone());
+        }
+        Ok(())
+    }
+
+    /// Sweep `victims`' closures against the full liveness root set:
+    /// every index tag (traversed through indexes), plus every
+    /// `sha256:` digest pinned by a workspace member's `fluxor.lock`.
+    /// An unreadable member lockfile fails CLOSED for the sweep only —
+    /// warn and delete nothing; the publish that triggered the sweep
+    /// has already succeeded (registry_consolidation.md, GC rules).
+    fn sweep_with_roots(&self, index: &ImageIndex, victims: &[Descriptor]) -> Result<Vec<String>> {
+        let mut live: BTreeSet<String> = BTreeSet::new();
+        for d in &index.manifests {
+            self.add_closure(d, &mut live).map_err(|e| {
+                Error::Config(format!("live manifest {} is unreadable ({e})", d.digest))
+            })?;
+        }
+        for digest in member_lockfile_digests()? {
+            live.insert(digest);
+        }
+        let mut candidates: BTreeSet<String> = BTreeSet::new();
+        for v in victims {
+            candidates.insert(v.digest.clone());
+            let mut c = BTreeSet::new();
+            if self.add_closure(v, &mut c).is_ok() {
+                candidates.extend(c);
+            }
+        }
+        let mut removed = Vec::new();
+        for digest in candidates.difference(&live) {
+            if let Ok(p) = self.blob_path(digest) {
+                if fs::remove_file(&p).is_ok() {
+                    removed.push(digest.clone());
+                }
+            }
+        }
+        Ok(removed)
+    }
+}
+
+/// Harvest every `sha256:<hex>` digest from every workspace member's
+/// `fluxor.lock` — the third GC root class. A member whose lockfile
+/// exists but cannot be read is a hard error (the caller downgrades to
+/// warn-and-skip-sweep); a member with no lockfile contributes nothing.
+fn member_lockfile_digests() -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    let Ok(Some(ws)) = crate::workspace::load_workspace() else {
+        return Ok(out);
+    };
+    for member in &ws.workspace.members {
+        let lock = member.join("fluxor.lock");
+        if !lock.exists() {
+            continue;
+        }
+        let text = fs::read_to_string(&lock).map_err(|e| {
+            Error::Config(format!(
+                "member lockfile {} unreadable ({e}) — sweep skipped (fail-closed)",
+                lock.display()
+            ))
+        })?;
+        let mut rest = text.as_str();
+        while let Some(pos) = rest.find("sha256:") {
+            let hex: String = rest[pos + 7..]
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect();
+            if hex.len() == 64 {
+                out.insert(format!("sha256:{hex}"));
+            }
+            rest = &rest[pos + 7..];
+        }
+    }
+    Ok(out)
+}
+
+// ── Canonical tar ─────────────────────────────────────────────────────
+
+/// Build a canonical, uncompressed ustar archive from `(path, bytes)`
+/// entries: paths sorted and unique, mtime 0, uid/gid 0 (empty names),
+/// mode 0644, no directory entries, two zero blocks at the end.
+/// Property: identical file content ⇒ identical archive bytes ⇒
+/// identical layer digest — the store's identity for source-tree
+/// artifacts (standards/fluxor-modules.md; registry_consolidation.md).
+/// No compression: gzip is nondeterministic across implementations and
+/// blobs are local.
+pub fn canonical_tar(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut prev: Option<&str> = None;
+    for (path, bytes) in files {
+        if path.starts_with('/') || path.split('/').any(|c| c == ".." || c.is_empty()) {
+            return Err(Error::Config(format!(
+                "canonical tar: path must be clean and relative: {path:?}"
+            )));
+        }
+        if let Some(p) = prev {
+            if p >= path.as_str() {
+                return Err(Error::Config(format!(
+                    "canonical tar: paths must be strictly sorted ({p:?} !< {path:?})"
+                )));
+            }
+        }
+        prev = Some(path.as_str());
+
+        // ustar name/prefix split: name ≤ 100 bytes, prefix ≤ 155.
+        let (prefix, name) = if path.len() <= 100 {
+            ("", path.as_str())
+        } else {
+            let split = path[..path.len().min(156)]
+                .rfind('/')
+                .filter(|&i| path.len() - i - 1 <= 100 && i <= 155)
+                .ok_or_else(|| {
+                    Error::Config(format!("canonical tar: path too long for ustar: {path:?}"))
+                })?;
+            (&path[..split], &path[split + 1..])
+        };
+
+        let mut hdr = [0u8; 512];
+        hdr[0..name.len()].copy_from_slice(name.as_bytes());
+        hdr[100..108].copy_from_slice(b"0000644\0");
+        hdr[108..116].copy_from_slice(b"0000000\0"); // uid
+        hdr[116..124].copy_from_slice(b"0000000\0"); // gid
+        let size_octal = format!("{:011o}\0", bytes.len());
+        hdr[124..136].copy_from_slice(size_octal.as_bytes());
+        hdr[136..148].copy_from_slice(b"00000000000\0"); // mtime 0
+        hdr[148..156].copy_from_slice(b"        "); // checksum placeholder
+        hdr[156] = b'0'; // regular file
+        hdr[257..263].copy_from_slice(b"ustar\0");
+        hdr[263..265].copy_from_slice(b"00");
+        // uname/gname left empty; devmajor/devminor zero.
+        hdr[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+        let checksum: u32 = hdr.iter().map(|&b| b as u32).sum();
+        let ck = format!("{checksum:06o}\0 ");
+        hdr[148..156].copy_from_slice(ck.as_bytes());
+
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(bytes);
+        let pad = (512 - bytes.len() % 512) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+    }
+    out.extend(std::iter::repeat_n(0u8, 1024));
+    Ok(out)
+}
+
+#[cfg(test)]
+mod canonical_tar_tests {
+    use super::canonical_tar;
+
+    #[test]
+    fn deterministic_and_extractable_shape() {
+        let files = vec![
+            ("a/mod.rs".to_string(), b"pub fn a() {}\n".to_vec()),
+            ("b.rs".to_string(), vec![0u8; 513]),
+        ];
+        let one = canonical_tar(&files).unwrap();
+        let two = canonical_tar(&files).unwrap();
+        assert_eq!(one, two, "identical input must yield identical bytes");
+        // 2 headers + 1 block + 2 blocks data + 2 terminator blocks.
+        assert_eq!(one.len(), 512 * 7);
+        // ustar magic present in each header.
+        assert_eq!(&one[257..262], b"ustar");
+    }
+
+    #[test]
+    fn rejects_unsorted_and_unclean_paths() {
+        let unsorted = vec![
+            ("b.rs".to_string(), Vec::new()),
+            ("a.rs".to_string(), Vec::new()),
+        ];
+        assert!(canonical_tar(&unsorted).is_err());
+        let dotdot = vec![("../x.rs".to_string(), Vec::new())];
+        assert!(canonical_tar(&dotdot).is_err());
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────
 
 pub fn sha256_hex_prefixed(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("sha256:{hex}")
+}
+
+/// Process-wide serialisation for tests that mutate `FLUXOR_STORE` /
+/// `FLUXOR_WORKSPACE`: env vars are process-global and cargo runs the
+/// lib tests threaded, so every env-touching test holds this guard.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    M.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn one_annotation(key: &str, value: &str) -> Annotations {

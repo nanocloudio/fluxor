@@ -22,10 +22,6 @@ examples/<capability>/
 | [`owner_status/`](owner_status/) | linux | Two co-resident owners in one runtime; a fault in one terminates only that owner. |
 | [`packet_filter/`](packet_filter/) | pi5 | L2 packet filtering with custom accept rules (rp1_gem + eth_parser + pkt_filter chain). |
 
-`packet_filter/pi5.yaml` currently fails validation on an unrelated `rp1_gem`
-pre-tick-drain / domain-tier conflict; the graph is still the reference for
-NIC-path inspection.
-
 ## Examples that live in sibling repositories
 
 Fluxor ships the runtime, the foundation modules and the drivers. Application
@@ -49,7 +45,7 @@ MQTT publishing, and the LED/button/sequencer patterns.
 
 ```sh
 # Validate without packaging
-fluxor validate examples/<capability>/<platform>.yaml
+fluxor build --check examples/<capability>/<platform>.yaml
 
 # For hosted targets (linux, wasm)
 fluxor run examples/<capability>/<platform>.yaml
@@ -57,7 +53,7 @@ fluxor run examples/<capability>/<platform>.yaml
 # For embedded targets (pico2w, pi5, etc.) build + flash
 make firmware TARGET=<platform>
 fluxor modules build --target <silicon>
-fluxor combine -o kernel8.img target/<platform>/firmware.bin examples/<capability>/<platform>.yaml
+fluxor build examples/<capability>/<platform>.yaml --emit=combined --firmware target/<platform>/firmware.bin -o kernel8.img
 ```
 
 ## Where media lives

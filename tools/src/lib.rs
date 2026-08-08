@@ -21,7 +21,6 @@ pub mod abi_pin;
 pub mod add_subgraph;
 pub mod agent_logs;
 pub mod asset_bank;
-pub mod cargo_index;
 pub mod ci;
 pub mod compose;
 pub mod error;
@@ -30,6 +29,7 @@ pub mod hash;
 pub mod hygiene;
 pub mod lockfile;
 pub mod manifest;
+pub mod module_test;
 pub mod node_agent;
 // `modules` carries the `.fmod` pack/parse primitives that
 // `modules_build` calls into. Exposed here (rather than left
@@ -51,11 +51,15 @@ pub mod content_render;
 pub mod presentation_resolver;
 pub mod presentation_shell;
 pub mod project;
-pub mod project_meta;
 pub mod publish;
-pub mod registry;
 pub mod render_template;
-pub mod sync;
+// The consolidated store flow: `store_publish` (the single store-write
+// path), `store_resolve` (uniform `[[artifact]]` lockfile resolution),
+// and `store_sync` (the one-path materialiser + `workspace publish`).
+// Lib-only; the bin reaches them via `fluxor_tools::…`.
+pub mod store_publish;
+pub mod store_resolve;
+pub mod store_sync;
 pub mod target;
 pub mod text_distance;
 pub mod trust;

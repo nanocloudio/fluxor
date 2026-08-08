@@ -16,223 +16,202 @@ This file is the how-to.
 make publish
 ```
 
-In fluxor's checkout. That builds modules + the linux runtime
-binary, then publishes four tiers (ABI source crate, SDK source crate,
-fmod palette, runtime binary) into `~/.fluxor/registry/`. Consumers
-then run `fluxor update && fluxor sync` in their own checkout and pick up
-the new state.
+In fluxor's checkout. That builds fluxor's owned artefacts (fmods
+for every silicon target, the linux runtime, the CLI) and runs
+`fluxor publish`, which writes them all into the local OCI store in
+**one transaction**: blobs staged first, then every `:ver` and
+`:latest` tag plus the project index repointed in a single locked
+`index.json` write. Partial publish is impossible by construction.
+Consumers pick up the new state with `fluxor sync` (workspace
+members) or `fluxor update && fluxor sync` (pinned checkouts).
 
-**Version source-of-truth rule:** every workspace member crate's
-`[package].version` MUST match fluxor.toml's `[project].version`.
-Bump them together via `workspace.package` inheritance. Canonical
-publish refuses mismatched crates because transitive-resolution
-lookup (`projects/<dep>/<version>.toml`) keys on the project
-version; a desynced crate version would make downstream lookups
-miss.
+## What fluxor owns and publishes
 
-## The four tiers
+"Owned" artefacts are the ones this repo is the producer of — the
+set `fluxor publish` builds, annotates, and tags, and the set the
+project index (`fluxor/meta`) lists:
 
-| Tier | What it is | Registry location |
+| Artefact | Content | Tag |
 |---|---|---|
-| **ABI** (`fluxor-abi`) | Wire-stable contract IDs, opcodes, wire structs. Source crate. | `~/.fluxor/registry/cargo/fluxor-abi-<v>.crate` |
-| **SDK** (`fluxor-sdk`) | `no_std` runtime helpers — crypto, codecs, params. Source crate. | `~/.fluxor/registry/cargo/fluxor-sdk-<v>.crate` |
-| **fmod palette** | Compiled `.fmod` artefacts for foundation modules (`ip`, `tls`, `quic`, …). Per `(target, name, version)`. | `~/.fluxor/registry/fmod/fluxor/<target>/<name>/<v>.fmod` |
-| **Runtime binary** (`fluxor-linux`) | Host executable that runs PIC modules under Linux. Per `(host-target, name, version)`. | `~/.fluxor/registry/bin/fluxor/<host-target>/fluxor-linux/<v>` |
+| SDK source tree | canonical tar of `modules/sdk/**` mapped under a `sdk/` path prefix — everything a `#[path]`/`include!` consumer reads; extraction preserves `target/fluxor/fluxor-abi/sdk/abi.rs` | `fluxor/src/fluxor-abi:<ver>` |
+| Contracts source tree | canonical tar of `contracts/src/**` mapped under a `src/` path prefix | `fluxor/src/fluxor-contracts:<ver>` |
+| fmod palette | compiled `.fmod` + manifest per foundation module (`ip`, `tls`, `quic`, …), per silicon target | `<target>/<name>:<ver>` |
+| Runtimes | `fluxor-linux` and the `fluxor` CLI itself, one binary layer per host triple | `fluxor/run/<name>-<triple>:<ver>` |
+| Project index | standard OCI index over the artefact manifests above; annotations carry fluxor's dependency declarations | `fluxor/meta:<ver>` |
+
+`fluxor publish --only <selector>` scopes the publish to a subset
+(a module name, a kind); the transaction and the index rewrite
+cover exactly what was published.
+
+Only fluxor publishes runtimes — the `fluxor/run/` namespace is
+reserved. A sibling "runtime" is a graph on `fluxor-linux`.
+
+## Annotations every publish stamps
+
+- `io.fluxor.abi-surface` — the epoch. Consumers hard-fail on an
+  artefact without it, so nothing consumable can skip a publish.
+- `io.fluxor.input-digest` — token-canonical digest of the
+  artefact's actual inputs (module source dir + SDK epoch for
+  fmods, the tree itself for source artefacts). This is what makes
+  downstream staleness advisories exact: comment and formatting
+  churn is digest-neutral.
+- `io.fluxor.ci-digest` — the input digest the `ci` gate last
+  passed on. `fluxor ci` on green writes a stamp under
+  `target/fluxor/`; publish annotates `ci-digest` when the
+  artefact's current input digest appears in the stamp and omits it
+  otherwise. Information, never a gate — publish does not refuse on
+  ci state.
+- provenance (`local-build` vs `published`) and `source-rev` (+
+  dirty bit). `local-build` is ordinary dev flow: every publish is
+  a real, consumable store write, distinguished by annotation, not
+  by filename or a separate shelf. Runtimes' staleness signal is
+  rev-scoped (their inputs are effectively the whole kernel tree).
+
+Every publish ends with the GC sweep: superseded blobs live until
+no tag, snapshot, or workspace member's `fluxor.lock` pins them,
+then go.
 
 ## First-time setup (per developer machine)
 
 ```sh
-make install                          # put the fluxor CLI on PATH
-fluxor registry init        # bootstrap ~/.fluxor/registry/ + cargo git index
-fluxor registry setup-cargo # add [registries.fluxor] to ~/.cargo/config.toml
+make install
 ```
 
-Idempotent. Re-running any of these is safe.
+**Bootstrap only** — the first build on an empty-store machine. It
+builds the CLI, publishes it as a runtime artefact, and installs
+the launcher at `~/.cargo/bin/fluxor` (resolve `:latest`, exec the
+content-addressed blob). After that there is no installed copy to
+go stale: every `fluxor publish` that covers the CLI repoints
+`:latest`, and the next invocation *is* the new CLI. An empty store
+reports the path back here:
+`no fluxor CLI in store — run 'make install' from a fluxor checkout`.
 
 ## Daily — keeping downstream projects current
 
-Two modes, depending on iteration intent.
-
-### Mode A — canonical publish (versioned, reproducible)
-
-Use when shipping a stable point — anything you want to be able to
-roll back to or that needs to land in a downstream's
-`fluxor.lock`.
+One flow. Whether the consumer is a workspace member or a pinned
+checkout changes only how it *resolves*, never how you publish.
 
 ```sh
-# in fluxor/
-
-# 1. Bump the version in TWO places:
-#    - fluxor.toml's `[project].version`
-#    - Cargo.toml's `[workspace.package].version`
-#    Publishable crates (fluxor-abi, fluxor-sdk) inherit via
-#    `version.workspace = true` so a single Cargo.toml edit
-#    propagates to them. Downstream projects do the same.
-
-# 2. Publish.
-make publish
+# in fluxor/, after editing
+fluxor publish              # or `make publish` for a full build-then-publish
 ```
 
-Canonical publish refuses to proceed when any workspace member
-crate's resolved `[package].version` doesn't match `[project].
-version` — the error names the offending crate, so you'll see
-immediately if anything's out of sync.
+- **Publish is always explicit.** Sync never builds or publishes on
+  fluxor's behalf. `:latest` means "most recently published digest"
+  and moves only when you run publish.
+- **Workspace members** (`~/.fluxor/workspace.toml`) pick the
+  change up on their next `fluxor sync`: sync resolves fluxor's
+  artefacts to `:latest` and writes the resolved digests through
+  the consumer's `fluxor.lock` — the change is visible as an
+  ordinary lockfile diff.
+- **Pinned checkouts** stay on their digests until they run
+  `fluxor update`.
+- **SDK edits flow the same way.** Source trees are artefacts:
+  editing `modules/sdk/abi.rs` and publishing repoints
+  `fluxor/src/fluxor-abi:latest`; the consumer's next sync
+  re-materialises `target/fluxor/fluxor-abi/` from the new digest.
 
-`make publish` runs `make build` (CLI, kernels, fmods for every
-silicon target, `fluxor-linux`) and then `fluxor publish`, which
-publishes every tier:
+### Forgotten-publish safety net
 
-1. `fluxor publish abi` — packages + indexes `fluxor-abi`
-2. `fluxor publish sdk` — packages + indexes `fluxor-sdk`
-3. `fluxor publish fmod` — copies all foundation fmods into the registry
-4. `fluxor publish runtime` — copies each binary in `fluxor.toml::[project].runtimes`
+Sync in a consumer compares each live member artefact's current
+input digest against the published annotation and warns per
+artefact — e.g. `warning: module 'tls' inputs changed since publish
+(fluxor)` — then proceeds. The same data shows in `fluxor workspace
+status`. The one place staleness is a hard failure is `fluxor ci`:
+a green gate against a known-stale upstream would be a clean build
+wearing a misleading name.
 
-Per artefact, this also:
+### Batching: `fluxor workspace publish`
 
-- Writes the cargo git-index entry (`~/.fluxor/registry/index/fl/ux/fluxor-abi`)
-- Updates the project-meta file (`~/.fluxor/registry/projects/fluxor/<v>.toml`)
-- Refuses to overwrite an existing `(name, version)` — bump if you forgot
-- Refuses if `[project].version = "0.0.0-dev"` — set a real version
-
-Consumers pick up the new version with `fluxor update && fluxor sync`
-in their own checkout.
-
-### Mode B — live workspace iteration (no version bumps)
-
-Use when iterating fast between fluxor and a colocated consumer. No
-version bumps, no canonical publish required for fmods and runtime
-binaries — the consumer's `fluxor sync` sources those tiers directly
-from each workspace member's `target/` tree.
-
-**What live mode covers today:**
-
-| Tier | Live source? | How updates flow |
-|---|---|---|
-| fmods | Yes | Build with `fluxor modules build --all` upstream; consumer's `fluxor sync` reads from your `target/<silicon>/modules/` |
-| Runtime binary (`fluxor-linux`) | Yes | Build with `make build` upstream; consumer's `fluxor sync` reads from your `target/<host-target>/release/` |
-| Source crates (`fluxor-abi`, `fluxor-sdk`) | No — still registry | Consumer's `fluxor sync` still extracts from `~/.fluxor/registry/cargo/`. To refresh: bump versions and run **canonical** `make publish` upstream, then `fluxor update && fluxor sync` in the consumer. |
-
-**Source-crate refresh requires canonical publish, not local.** The
-lockfile resolver only considers canonical artefacts — `-local.<sha>`
-snapshots are invisible to `fluxor update` and `fluxor sync` in normal
-(registry-resolved) consumption. They exist for the narrow case of a
-downstream that declares `[dependencies] X = { path = "..." }` and
-wants the path-overridden source to come from the registry directory
-extract. For the workspace-mode flow you're in here, treat them as
-out of scope.
-
-The source-crate gap is the one hand-off that isn't fully live: when
-you edit fluxor's SDK source (e.g. `modules/sdk/abi.rs`), the
-consumer doesn't see the change automatically — you have to bump
-versions, canonical-publish, and have the consumer `fluxor sync`. Live
-source-crate resolution across workspace members (so SDK edits flow
-without a publish) is not yet supported.
-
-**CI implication:** `fluxor ci`'s `lockfile-consistency` phase
-detects workspace mode and skips with an advisory rather than
-failing. CI runners shouldn't carry `~/.fluxor/workspace.toml` in the
-first place; if a CI worker is misconfigured, this saves it from
-spurious rejections.
+When several workspace members are stale (typically after an epoch
+move, which changes every fmod's input digest at once), one verb
+publishes them all:
 
 ```sh
-# one-time, per developer machine
-cat > ~/.fluxor/workspace.toml <<EOF
-[workspace]
-members = [
-  "/srv/code/fluxor",
-  "/srv/code/<consumer-project>",
-]
-EOF
-
-# then in fluxor/, edit anything
-# in the consumer's checkout, `fluxor modules build` / `make test` picks up live state
+fluxor workspace publish
 ```
 
-List every colocated checkout that should resolve to live source —
-add more entries as you take on additional concurrent work. `fluxor
-workspace status` (run from inside any member) confirms live mode is
-active. See
-[`../../../standards/dependencies.md`](../../../standards/dependencies.md)
-§6 for the override semantics.
+For every member whose input digests differ from its published
+artefacts, it runs that member's build + publish, topologically
+ordered by the members' `fluxor.toml` dependency declarations. It
+aborts at the first member whose build or publish fails; the
+already-published prefix stands (each member's publish is
+transactional, so the prefix is a coherent store state).
 
-When you've stabilised the change and want it tagged for distribution,
-switch to Mode A (canonical publish).
+## Version discipline
 
-### Mode B and the lockfile-consistency CI phase
+`[project].version` in `fluxor.toml` is a **label**: it becomes the
+`<ver>` component of every published tag, carried for human
+readability. Resolution never orders versions — `:latest` is the
+only tag with semantics, and consumers pin digests. Keep the label
+meaningful (bump it when you'd want the tag to read differently in
+`fluxor store ls` / `fluxor inspect`), and don't expect a bump to
+do anything mechanical.
 
-`fluxor ci`'s `lockfile-consistency` phase prints an advisory and
-skips the actual consistency check when the project root is a
-workspace member. CI shouldn't normally run inside a workspace
-member; if you put a CI runner's working directory inside a
-workspace-listed checkout, that's an env-hygiene bug.
+## The epoch (ABI surface)
 
-## Local snapshots (`publish --local`)
+Cross-artefact compatibility is the **epoch** — the ABI-surface
+digest annotated on every artefact — not a version number.
+`fluxor abi-regen` is the epoch's single writer; run it when the
+ABI surface genuinely moves (wire structs, opcodes, contract IDs),
+then rebuild and publish. Wire-stable improvements — faster crypto,
+new modules, better algorithms — leave the epoch untouched and cost
+consumers nothing.
 
-`fluxor publish --local` writes each artefact with a `-local.<sha>`
-suffix. Useful only for path/git override workflows in a
-downstream's `fluxor.toml`. `fluxor update` / `fluxor sync` in downstream
-projects **never** consume `-local` artefacts — they're invisible to
-canonical-mode resolution.
+An epoch move cascades by design: every fmod's input digest changes
+at once, `workspace publish` republishes everything, and consumers'
+sync enforces epoch homogeneity across their resolved set (a
+mixed-epoch lockfile is a hard error naming `fluxor update`). Live
+members must additionally match the *current* surface — that hard
+error names `fluxor workspace publish`.
 
-If you're reaching for `publish-local`, you probably want workspace
-mode (Mode B) instead.
+## Naming a released set
 
-## Version stability strategy
-
-The ABI version (`modules/sdk/wire.rs::ABI_VERSION`, currently `1`)
-is the load-bearing pin downstream projects assert against. Bump it
-only when the wire format genuinely breaks:
-
-- module-header layout change
-- channel-hint encoding change
-- contract-id table reorganisation
-
-Wire-stable improvements (faster crypto, NEON optimisations, new
-modules, better algorithms) stay at the current ABI. They land as
-patch / minor `[project].version` bumps without forcing downstream
-rebuilds.
-
-`[project].version` in fluxor.toml is independent of ABI. Bump it
-freely per canonical publish — downstream `[dependencies] fluxor =
-"0.1"` matches the whole 0.1.x family via cargo semver semantics.
-Bumping ABI requires a major version bump (`0.2`) so the dep range
-no longer matches and consumers explicitly opt in.
-
-## Inspecting registry state
+A release is a cross-project resolved state, which no single repo's
+git history can name. Snapshot it:
 
 ```sh
-fluxor registry list           # everything in ~/.fluxor/registry/
-fluxor registry gc --dry-run         # preview garbage-collection (locals/lives only)
-fluxor registry gc             # actually collect — keeps newest 3 per group, min-age 24h
-fluxor workspace status        # show workspace.toml state
-fluxor inspect <config.yaml> # full discovery: project root, search paths, target stack
+fluxor store snapshot <name>       # one OCI index over the resolved set
 ```
 
-The registry is a real on-disk tree under `~/.fluxor/registry/`. Tar
-through it with normal Unix tools if needed.
+Snapshots are also GC roots — everything a snapshot references is
+retained. A consumer restores one with
+`fluxor update --from snapshot/<name>` followed by `fluxor sync`.
+
+## Inspecting store state
+
+```sh
+fluxor store ls                # everything in the store
+fluxor inspect <ref>           # sha256:… or tag: kind, tags, epoch ✓/✗ vs current
+                               # surface, input-digest, ci-digest, provenance,
+                               # source-rev, layers
+fluxor workspace status        # members + per-artifact staleness
+```
+
+The store is a real on-disk OCI image layout (`$FLUXOR_STORE`,
+default `~/.local/share/fluxor/store`) — every construct in it is
+expressible against a stock OCI registry.
 
 ## When something is wrong
 
-- **"canonical X already exists, bump version"** — `[project].version`
-  unchanged since last publish, with **different content** in the
-  packaged crate. Bump the version (in both fluxor.toml `[project]`
-  AND the affected crate's `[package]`). Re-publishing the same
-  content at the same version is an **idempotent skip** and doesn't
-  error.
-- **"version mismatch: crate `X` is at A but [project].version is B"** —
-  a workspace member crate's `[package].version` desynced from
-  `[project].version`. Bring them in line; this is the single
-  source-of-truth rule.
-- **"refuses to publish 0.0.0-dev"** — `[project].version` was never
-  set. Add `version = "0.1.0"` (or whatever) to fluxor.toml's
-  `[project]` block.
-- **A consumer's `fluxor sync` reports `hash mismatch`** — the local
-  registry was tampered with or got out of sync with the consumer's
-  `fluxor.lock`. Republish from fluxor (`make publish`) and have the
-  consumer re-run `fluxor update` to pick up the new hashes.
-- **A consumer can't find the `fluxor` registry** — they haven't run
-  `fluxor registry setup-cargo` on their machine. Each developer
-  needs this once.
+- **`no fluxor CLI in store — run 'make install' from a fluxor
+  checkout`** — empty store or missing CLI tag; run the bootstrap.
+- **A live member's artefact has no `:latest` tag** — the member
+  has never published; the error names `fluxor publish` in that
+  member.
+- **A consumer errors on an artefact lacking the epoch annotation**
+  — its producer must publish; the error names `fluxor publish`
+  there.
+- **A consumer reports a mixed-epoch lockfile** — the resolved set
+  straddles an ABI-surface move; `fluxor update` in the consumer
+  advances the whole set.
+- **A consumer's sync says a pinned digest is `no longer in store —
+  run 'fluxor update'`** — the blob was garbage-collected (the
+  checkout isn't a workspace member, so its pins aren't GC roots);
+  `fluxor update && fluxor sync` there recovers in one step.
+- **Publish reports a cross-project name collision** — module and
+  bundle names are ecosystem-unique; the error names both owners.
+  Rename one.
 
 ## Related reading
 

@@ -1,7 +1,7 @@
 # Example graphs
 
 This guide covers the end-to-end graphs in `examples/`. Each is a complete,
-runnable configuration — `fluxor validate <yaml>` checks it, and on a host
+runnable configuration — `fluxor build --check <yaml>` checks it, and on a host
 target `fluxor run <yaml>` executes it.
 
 | Example | Target | What it shows |
@@ -25,7 +25,7 @@ per-target commands below are the common shape.
 Host targets (`linux`, `qemu-virt`) run directly:
 
 ```
-fluxor validate examples/hello/linux.yaml
+fluxor build --check examples/hello/linux.yaml
 fluxor run examples/hello/linux.yaml
 ```
 
@@ -35,7 +35,7 @@ combine the graph into it:
 ```
 make firmware TARGET=pi5
 fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/pi5/firmware.bin examples/log_net/pi5.yaml
+fluxor build examples/log_net/pi5.yaml --emit=combined --firmware target/pi5/firmware.bin -o kernel8.img
 ```
 
 ## Graphs that live elsewhere

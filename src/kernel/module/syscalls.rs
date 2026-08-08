@@ -862,7 +862,7 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
         && (req & (1u32 << contract)) == 0
     {
         log::warn!(
-            "[syscalls] module {} contract 0x{contract:04x}: manifest gate denied — staged required_caps=0x{req:08x} (returns ENOSYS; declare `[[resources]]` requires_contract for this contract, and confirm the packed .fmod header carries the bit — `fluxor info` shows the manifest-derived mask, not the header field)",
+            "[syscalls] module {} contract 0x{contract:04x}: manifest gate denied — staged required_caps=0x{req:08x} (returns ENOSYS; declare `[[resources]]` requires_contract for this contract, and confirm the packed .fmod header carries the bit — `fluxor inspect` shows the manifest-derived mask, not the header field)",
             crate::kernel::exec::scheduler::current_module_index(),
         );
         return Some(E_NOSYS);

@@ -86,16 +86,15 @@ pub fn extract_module_search_paths(
 /// any additional search paths (e.g., relative to the config file).
 /// Standard fluxor module subdirectories, relative to a root. Mirrors
 /// `Manifest::from_source_tree` in `tools/src/manifest.rs`. Built-ins
-/// live under `modules/builtin/<platform>/<name>/`.
+/// live under `modules/platform/<platform>/<name>/`.
 const STANDARD_MODULE_SUBDIRS: &[&str] = &[
     "modules/drivers",
     "modules/foundation",
     "modules/app",
     "modules/fixtures",
-    "modules/builtin/linux",
-    "modules/builtin/host",
-    "modules/builtin/wasm",
-    "modules/builtin/qemu",
+    "modules/platform/linux",
+    "modules/platform/wasm",
+    "modules/platform/qemu",
     "modules",
 ];
 
@@ -184,7 +183,7 @@ fn resolve_module_root(
 
 /// Process-global "already warned" cache for malformed manifest
 /// paths. `load_module_manifests_with_extra` runs multiple times
-/// in a single `fluxor validate` / `fluxor build` invocation
+/// in a single `fluxor build --check` / `fluxor build` invocation
 /// (presentation groups + the main pipeline + each scenario
 /// component); without deduplication the same warning fires 3-4
 /// times for a single broken manifest. The cache survives for the
@@ -233,7 +232,7 @@ pub fn load_module_manifests_with_extra_for_target(
         None => return manifests,
     };
 
-    // A pinned `[[oci_module]]` ships its `manifest.toml` in the same
+    // A pinned `[[artifact]]` module entry ships its `manifest.toml` in the same
     // content-addressed store artifact as its `.fmod` (symmetric to
     // `resolve_fmod`'s store fallback). Consult the pins FIRST and
     // authoritatively: a store-only sibling module has no source tree
@@ -244,7 +243,7 @@ pub fn load_module_manifests_with_extra_for_target(
     //
     // `project_root` is config-anchored by the caller (`root_for_config`),
     // never `project::root()`'s cwd fallback: a cross-project invocation
-    // (`fluxor validate ../other/x.yaml`) must read the CONFIG's
+    // (`fluxor build --check ../other/x.yaml`) must read the CONFIG's
     // `fluxor.lock` — the same lock the `.fmod` resolver uses — or port
     // validation and fmod packaging consult different pins. Silicon-scoped
     // so wiring binds to the exact artifact being packaged.
@@ -268,7 +267,7 @@ pub fn load_module_manifests_with_extra_for_target(
                                     warn_manifest_once(
                                         std::path::Path::new(&format!("oci://{type_name}")),
                                         &format!(
-                                            "module '{name}' (pinned oci_module): {e}; its \
+                                            "module '{name}' (pinned artifact): {e}; its \
                                              manifest is omitted from wiring validation"
                                         ),
                                     );
@@ -378,7 +377,7 @@ pub fn load_module_manifests_with_extra_for_target(
 ///
 /// Separate from `load_module_manifests_*` on purpose: that loader returns a
 /// map and cannot fail, so it warns and omits — right for advisory callers,
-/// wrong for `fluxor validate` / config generation / image build, which call
+/// wrong for `fluxor build --check` / config generation / image build, which call
 /// this first. `project_root` is config-anchored (see the loader's note); a
 /// project with no pins resolves no resolver and this is a no-op.
 pub fn assert_pinned_manifests_resolvable(

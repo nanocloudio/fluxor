@@ -5,7 +5,7 @@
 //   playback push samples to the host audio device via CPAL
 //            (requires `host-playback` Cargo feature)
 //
-// Params are declared in `modules/builtin/linux/linux_audio/manifest.toml`
+// Params are declared in `modules/platform/linux/linux_audio/manifest.toml`
 // and packed into the kernel's TLV stream by the config tool.
 
 #[cfg(feature = "host-playback")]

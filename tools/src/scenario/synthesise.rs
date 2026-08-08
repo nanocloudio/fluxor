@@ -1319,10 +1319,9 @@ const STANDARD_MANIFEST_DIRS: &[&str] = &[
     "modules/foundation",
     "modules/app",
     "modules/fixtures",
-    "modules/builtin/linux",
-    "modules/builtin/host",
-    "modules/builtin/wasm",
-    "modules/builtin/qemu-virt",
+    "modules/platform/linux",
+    "modules/platform/wasm",
+    "modules/platform/qemu",
     "modules",
 ];
 

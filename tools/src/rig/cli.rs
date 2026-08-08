@@ -51,6 +51,16 @@ pub enum RigCommand {
     Power(PowerArgs),
     /// Attach to the rig's primary console.
     Console(ConsoleArgs),
+    /// Stream live fault stats, protection levels, and step timing
+    /// histograms from a running Fluxor device (newline-framed
+    /// `MON_FAULT` / `MON_HIST` / `MON_STATE` lines; see
+    /// `docs/architecture/monitor-protocol.md`).
+    ///
+    /// The rig profile is OPTIONAL here: with `--rig` (or a single-rig
+    /// lab) the serial port and baud default from the profile's
+    /// `[console.serial]`; without one, `--port`/`--net` and the
+    /// defaults apply.
+    Monitor(MonitorArgs),
 }
 
 #[derive(Args, Debug)]
@@ -114,6 +124,33 @@ pub struct ConsoleArgs {
     pub lab: Option<String>,
 }
 
+#[derive(Args, Debug)]
+pub struct MonitorArgs {
+    /// Rig id — optional. When given (or when the lab has exactly one
+    /// rig), port/baud default from the profile's [console.serial].
+    #[arg(long)]
+    pub rig: Option<String>,
+    /// Lab namespace. Falls back to $FLUXOR_LAB, then "default".
+    #[arg(long)]
+    pub lab: Option<String>,
+    /// Serial device path (default: the rig profile's console.serial
+    /// device, else /dev/ttyACM0).
+    #[arg(short = 'p', long)]
+    pub port: Option<String>,
+    /// Baud rate (default: the rig profile's console.serial baud,
+    /// else 115200).
+    #[arg(short = 'b', long)]
+    pub baud: Option<u32>,
+    /// Refresh period in milliseconds.
+    #[arg(long, default_value = "500")]
+    pub refresh_ms: u64,
+    /// Consume MON_* lines from UDP netconsole instead of a serial
+    /// port. Pass a bind spec like `:6666` or `0.0.0.0:6666`. When
+    /// set, --port is ignored.
+    #[arg(long)]
+    pub net: Option<String>,
+}
+
 pub fn dispatch(args: RigArgs) -> Result<()> {
     match args.command {
         RigCommand::Test(a) => cmd_test(a),
@@ -128,7 +165,91 @@ pub fn dispatch(args: RigArgs) -> Result<()> {
              or equivalent covers this for now"
                 .into(),
         )),
+        RigCommand::Monitor(a) => cmd_monitor(a),
     }
+}
+
+/// `rig monitor` — the live-telemetry stream. Profile optional: an
+/// explicit `--rig` must resolve (hard error otherwise); with no
+/// `--rig`, a single-rig lab's profile is consulted best-effort and
+/// the classic defaults apply when nothing resolves.
+fn cmd_monitor(args: MonitorArgs) -> Result<()> {
+    if let Some(net) = args.net.as_deref() {
+        return crate::monitor::cmd_monitor_dispatch(
+            "",
+            args.baud.unwrap_or(115_200),
+            args.refresh_ms,
+            Some(net),
+        );
+    }
+    let mut port = args.port.clone();
+    let mut baud = args.baud;
+    if port.is_none() || baud.is_none() {
+        match profile_console_serial(args.rig.as_deref(), args.lab.as_deref()) {
+            Ok(Some((dev, profile_baud))) => {
+                if port.is_none() {
+                    port = Some(dev);
+                }
+                if baud.is_none() {
+                    baud = profile_baud;
+                }
+            }
+            Ok(None) => {}
+            // Only an explicit --rig propagates resolution errors.
+            Err(e) if args.rig.is_some() => return Err(e),
+            Err(_) => {}
+        }
+    }
+    crate::monitor::cmd_monitor_dispatch(
+        port.as_deref().unwrap_or("/dev/ttyACM0"),
+        baud.unwrap_or(115_200),
+        args.refresh_ms,
+        None,
+    )
+}
+
+/// Resolve `[console.serial]` (device, baud) from a rig profile.
+/// `Ok(None)` when no rig can be determined (no --rig and not exactly
+/// one rig in the lab) or the profile has no console.serial binding.
+fn profile_console_serial(
+    rig: Option<&str>,
+    lab: Option<&str>,
+) -> Result<Option<(String, Option<u32>)>> {
+    let lab = resolve_lab(lab);
+    let rig_id = match rig {
+        Some(r) => r.to_string(),
+        None => {
+            let rigs = enumerate_rigs(&lab).unwrap_or_default();
+            if rigs.len() == 1 {
+                rigs.into_iter().next().unwrap()
+            } else {
+                return Ok(None);
+            }
+        }
+    };
+    let Some(profile_path) = default_profile_path(&lab, &rig_id) else {
+        return Err(Error::Config("rig monitor: cannot resolve $HOME".into()));
+    };
+    if !profile_path.is_file() {
+        return Err(Error::Config(format!(
+            "rig monitor: profile not found at {}",
+            profile_path.display()
+        )));
+    }
+    let profile = load_profile(&profile_path)?;
+    let serial = crate::rig::vocab::Capability::parse("console.serial")
+        .ok()
+        .and_then(|cap| profile.console.get(&cap).cloned());
+    let Some(binding) = serial else {
+        return Ok(None);
+    };
+    let Some(device) = binding.optional_string("device").map(str::to_string) else {
+        return Ok(None);
+    };
+    let baud = binding
+        .optional_int("baud")
+        .and_then(|n| u32::try_from(n).ok());
+    Ok(Some((device, baud)))
 }
 
 fn cmd_test(args: TestArgs) -> Result<()> {

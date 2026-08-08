@@ -1778,7 +1778,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // For a CMD_CONNECT we're about to forward: the downstream tag
                 // to latch, deferred until the upstream write actually lands.
                 let mut arm_pending: Option<u8> = None;
-                if t == NET_CMD_CONNECT && rd >= 7 && rd < NET_SCRATCH_SIZE {
+                if t == NET_CMD_CONNECT && (7..NET_SCRATCH_SIZE).contains(&rd) {
                     let new_tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
                     if s.pending_connect_active {
                         // SERIALIZE: a connect is already in flight and TLS

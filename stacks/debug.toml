@@ -35,7 +35,7 @@ name = "debug"
 #       # bind_port: 6667
 #
 # Host capture:
-#   to: net  →  nc -ul 6666           (or `fluxor monitor --net :6666`)
+#   to: net  →  nc -ul 6666           (or `fluxor rig monitor --net :6666`)
 #
 # The same ring feeds MON_* monitor lines when the monitor overlay is on.
 
@@ -159,7 +159,7 @@ match = { family = "linux" }
 modules = []
 wiring = []
 
-# Monitor telemetry: periodic `MON_HIST` lines for the `fluxor monitor` CLI
+# Monitor telemetry: periodic `MON_HIST` lines for the `fluxor rig monitor` CLI
 # (per-module step-time histogram). Orthogonal to `to:` — the monitor
 # module emits via log::info!, and whatever transports are active carry
 # it out. `MON_FAULT` is emitted by the kernel itself, so it streams

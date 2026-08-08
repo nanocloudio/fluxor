@@ -4,7 +4,7 @@
 // for ~EOF_TICKS consecutive steps), decodes the accumulated buffer,
 // resizes, and emits a single frame on `pixels`.
 //
-// Params are declared in `modules/builtin/host/host_image_codec/manifest.toml`
+// Params are declared in `modules/platform/wasm/host_image_codec/manifest.toml`
 // and packed into the kernel's TLV stream by the config tool.
 
 #[cfg(feature = "host-image")]

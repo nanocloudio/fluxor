@@ -7,7 +7,7 @@ when you want to capture logs from multiple boards at once.
 
 Optionally enables the monitor overlay — the monitor PIC module
 periodically emits `MON_HIST` lines via `log::info!`, which flow
-through the same netconsole stream. `fluxor monitor --net :6666`
+through the same netconsole stream. `fluxor rig monitor --net :6666`
 consumes that stream and renders a live dashboard.
 (Absorbed the former `log_net_monitor/pi5.yaml`.)
 
@@ -19,7 +19,7 @@ consumes that stream and renders a live dashboard.
 
 ```sh
 make firmware TARGET=pi5 && fluxor modules build --target bcm2712
-fluxor combine -o kernel8.img target/pi5/firmware.bin examples/log_net/pi5.yaml
+fluxor build examples/log_net/pi5.yaml --emit=combined --firmware target/pi5/firmware.bin -o kernel8.img
 
 # Capture (any host on the same L2 segment)
 python3 - <<'PY'
@@ -31,7 +31,7 @@ while True:
 PY
 
 # Or, for the dashboard, uncomment `monitor: true` in the YAML and:
-fluxor monitor --net :6666
+fluxor rig monitor --net :6666
 ```
 
 ## Related

@@ -1,6 +1,6 @@
 # Monitor Protocol
 
-`fluxor monitor` displays a live per-module dashboard for a running Fluxor
+`fluxor rig monitor` displays a live per-module dashboard for a running Fluxor
 device. The device emits newline-framed text lines on its normal log
 transport (USB CDC on RP targets, UART on Pi 5); the host tool tails those
 lines, aggregates them into per-module rows, and renders an ANSI table.

@@ -260,14 +260,8 @@ pub fn h3_decode_request(block: &[u8]) -> Option<DecodedRequest<'_>> {
     // pseudo-header has been stashed into `out`).
     let mut name_scratch = [0u8; QPACK_HUFFMAN_SCRATCH];
     while cursor < block.len() {
-        let (name, value, n) = match qpack_decode_field(&block[cursor..]) {
-            Some(t) => t,
-            None => return None,
-        };
-        let name_bytes: &[u8] = match qpack_name_resolve(&name, &mut name_scratch) {
-            Some(b) => b,
-            None => return None,
-        };
+        let (name, value, n) = qpack_decode_field(&block[cursor..])?;
+        let name_bytes: &[u8] = qpack_name_resolve(&name, &mut name_scratch)?;
         if name_bytes == b":method" {
             match value {
                 QpackValue::Static(s) => out.method_static = Some(s),

@@ -1,5 +1,5 @@
-use super::{p_u8, p_u16, GuardState, MAX_TABLE};
 use super::SCHEMA_MAX;
+use super::{p_u16, p_u8, GuardState, MAX_TABLE};
 
 define_params! {
     GuardState;

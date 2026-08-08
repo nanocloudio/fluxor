@@ -1,7 +1,7 @@
 //! Transition plan computation for live graph reconfigure.
 //!
 //! Computes the diff between two graph configs and classifies each module
-//! as survive, drain, or terminate. Used by `fluxor diff` CLI command and
+//! as survive, drain, or terminate. Used by `fluxor inspect --against` and
 //! at runtime by the scheduler.
 
 use std::collections::HashMap;

@@ -756,6 +756,10 @@ pub struct Manifest {
     /// `TomlRequires::default()` (all-false) means "no specific
     /// requirements," which satisfies every silicon.
     pub requires: TomlRequires,
+    /// `[build] wasm_opt_level = "0"|"1"|"2"|"3"|"s"|"z"` — per-module
+    /// rustc `opt-level` for the wasm target. TOML-only, never
+    /// serialized to the binary. `None` keeps the build default.
+    pub wasm_opt_level: Option<String>,
     /// Built-in parameter declarations from `[[params]]` (toml-only).
     /// `.fmod` modules carry their schema embedded in the binary; built-ins
     /// declare it here so the config tool can validate YAML and pack TLV.
@@ -800,6 +804,7 @@ impl Default for Manifest {
             isr_safe: false,
             pre_tick_drain: false,
             requires: TomlRequires::default(),
+            wasm_opt_level: None,
             params: Vec::new(),
             timer_class: TimerClass::Unattested,
             step_period_ticks: 0,
@@ -1075,7 +1080,7 @@ impl Manifest {
     /// Search paths cover both PIC modules (one of `drivers/`,
     /// `foundation/`, `app/`, or the catch-all `modules/`) and
     /// kernel-resident built-ins (under
-    /// `modules/builtin/<platform>/<name>/`). See
+    /// `modules/platform/<platform>/<name>/`). See
     /// `docs/architecture/abi_layers.md` for what each tree is for.
     pub fn from_source_tree(module_type: &str) -> Result<Option<Self>> {
         static CACHE: std::sync::OnceLock<
@@ -1085,28 +1090,20 @@ impl Manifest {
         if let Some(hit) = cache.lock().unwrap().get(module_type) {
             return Ok(hit.clone());
         }
-        // Per-root manifest layouts. The first set targets a real
-        // fluxor source tree (modules/ at the root); the second
-        // targets a downstream project that has run `fluxor sync`
-        // and consumed fluxor's SDK via the registry — the SDK
-        // bundles `modules/builtin/*` so the per-platform manifests
-        // ship as part of the published `fluxor-sdk` crate.
+        // Per-root manifest layouts, targeting a fluxor source tree
+        // (modules/ at the root). Downstream projects reach these via
+        // the install-root / sibling-checkout search roots below — the
+        // published `fluxor-abi` source artifact ships `modules/sdk/**`
+        // only, no per-platform manifests.
         const SOURCE_TREE_DIRS: &[&str] = &[
             "modules/drivers",
             "modules/foundation",
             "modules/app",
             "modules/fixtures",
-            "modules/builtin/linux",
-            "modules/builtin/host",
-            "modules/builtin/wasm",
-            "modules/builtin/qemu",
+            "modules/platform/linux",
+            "modules/platform/wasm",
+            "modules/platform/qemu",
             "modules",
-        ];
-        const SYNCED_SDK_DIRS: &[&str] = &[
-            "target/fluxor/fluxor-sdk/builtin/linux",
-            "target/fluxor/fluxor-sdk/builtin/host",
-            "target/fluxor/fluxor-sdk/builtin/wasm",
-            "target/fluxor/fluxor-sdk/builtin/qemu",
         ];
 
         // Search roots are walked in order:
@@ -1146,7 +1143,7 @@ impl Manifest {
 
         let mut found: Option<Manifest> = None;
         'outer: for root in &search_roots {
-            for dir in SOURCE_TREE_DIRS.iter().chain(SYNCED_SDK_DIRS) {
+            for dir in SOURCE_TREE_DIRS {
                 let p = root.join(dir).join(module_type).join("manifest.toml");
                 if p.exists() {
                     let m = Manifest::from_toml(&p)?;
@@ -1209,7 +1206,7 @@ impl Manifest {
     /// Parse a manifest from in-memory TOML bytes (already read), sharing
     /// every rule with `from_toml_for_target`. Lets callers resolve a
     /// manifest that never sits on disk — notably the `manifest.toml`
-    /// layer of a pinned `[[oci_module]]` artifact, which is fetched from
+    /// layer of a pinned `[[artifact]]` module entry, which is fetched from
     /// the OCI store rather than a source tree.
     pub fn from_toml_str_for_target(content: &str, silicon: Option<&str>) -> Result<Self> {
         let toml_val: TomlManifest = toml::from_str(content)
@@ -1613,6 +1610,14 @@ impl Manifest {
             capacities.insert(name, resolved);
         }
 
+        let wasm_opt_level = match toml_val.build.and_then(|b| b.wasm_opt_level) {
+            Some(level) => {
+                validate_wasm_opt_level(&level)?;
+                Some(level)
+            }
+            None => None,
+        };
+
         Ok(Manifest {
             module_version,
             hardware_targets,
@@ -1635,6 +1640,7 @@ impl Manifest {
             isr_safe: toml_val.isr_safe,
             pre_tick_drain: toml_val.pre_tick_drain,
             requires: toml_val.requires,
+            wasm_opt_level,
             params,
             timer_class,
             step_period_ticks,
@@ -1967,7 +1973,8 @@ impl Manifest {
             // build-time concern, not a runtime one). Round-tripping
             // through the binary loses it; that's intentional.
             requires: TomlRequires::default(),
-            params: Vec::new(), // toml-only, not serialized
+            wasm_opt_level: None, // toml-only, not serialized
+            params: Vec::new(),   // toml-only, not serialized
             // timer_class is a TOML-only build-time concern (drives the config
             // validator's adaptive-tick gate); not serialized into the binary, so
             // a binary-loaded manifest is Unattested (fail-closed) by default.
@@ -2160,6 +2167,33 @@ struct TomlManifest {
     /// a mechanism-(b) domain unless `timer_class = "wall_clock"` (RFC §8 rule 1).
     #[serde(default)]
     step_period_ticks: Option<u64>,
+    /// `[build]` table — per-module build knobs.
+    build: Option<TomlBuild>,
+}
+
+/// `[build]` manifest table: per-module build configuration.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlBuild {
+    /// rustc `opt-level` for the wasm target (`"0"`–`"3"`, `"s"`,
+    /// `"z"`). Absent keeps the build default.
+    wasm_opt_level: Option<String>,
+}
+
+/// The accepted `wasm_opt_level` values — rustc's `opt-level` set.
+pub const WASM_OPT_LEVELS: [&str; 6] = ["0", "1", "2", "3", "s", "z"];
+
+/// Validate a `[build] wasm_opt_level` value against rustc's
+/// `opt-level` set. Shared by the manifest parse and module-build
+/// discovery so both reject a typo with the same message.
+pub fn validate_wasm_opt_level(level: &str) -> Result<()> {
+    if WASM_OPT_LEVELS.contains(&level) {
+        return Ok(());
+    }
+    Err(Error::Module(format!(
+        "invalid [build] wasm_opt_level '{level}' — expected one of {}",
+        WASM_OPT_LEVELS.join(", ")
+    )))
 }
 
 /// Hardware-feature requirements declared by a module in its
@@ -2397,6 +2431,30 @@ struct TomlCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[build] wasm_opt_level` parses into the manifest, absent means
+    /// `None` (build default), and a value outside rustc's `opt-level`
+    /// set is rejected at parse time.
+    #[test]
+    fn build_wasm_opt_level_parses_and_validates() {
+        let with = "version = \"0.1.0\"\n\n[build]\nwasm_opt_level = \"z\"\n";
+        let m = Manifest::from_toml_str_for_target(with, None).expect("parse");
+        assert_eq!(m.wasm_opt_level.as_deref(), Some("z"));
+
+        for level in WASM_OPT_LEVELS {
+            let toml = format!("version = \"0.1.0\"\n\n[build]\nwasm_opt_level = \"{level}\"\n");
+            let m = Manifest::from_toml_str_for_target(&toml, None).expect("parse");
+            assert_eq!(m.wasm_opt_level.as_deref(), Some(level));
+        }
+
+        let without = "version = \"0.1.0\"\n";
+        let m = Manifest::from_toml_str_for_target(without, None).expect("parse");
+        assert_eq!(m.wasm_opt_level, None);
+
+        let bad = "version = \"0.1.0\"\n\n[build]\nwasm_opt_level = \"fast\"\n";
+        let err = Manifest::from_toml_str_for_target(bad, None).unwrap_err();
+        assert!(err.to_string().contains("wasm_opt_level"), "{err}");
+    }
 
     #[test]
     fn semver_roundtrip() {

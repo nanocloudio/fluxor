@@ -5,6 +5,7 @@
 //! the first one. The final exit code is the OR of every phase's
 //! exit code.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -185,6 +186,35 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("presentation", verbose, || run_presentation(project_root))
     });
 
+    // ───── Phase 1.47: tracked examples build-check ─────────────────
+    //
+    // `examples/` is the front door, and a graph naming a module the repo no
+    // longer contains still *reads* fine — it only fails when someone runs it.
+    // Every module extraction and every domain/tier rule change can strand one
+    // silently. Build-check each tracked example so that lands here, on the
+    // day, rather than in a downstream clone.
+    //
+    // Tracked only: the working tree carries local scratch graphs that
+    // legitimately name sibling-repo modules.
+    results.push(if skip.lint {
+        skipped("examples")
+    } else {
+        run_step("examples", verbose, || run_examples(project_root))
+    });
+
+    // ───── Phase 1.48: Makefile standard ────────────────────────────
+    //
+    // `standards/make.md` was written, every repo was swept to it, and the
+    // repos drifted again — because nothing checked. A CLI verb that moves
+    // strands the help text and scripts naming it in nineteen checkouts, and
+    // each is found by hand, one annoyed session at a time. This phase reads
+    // the live CLI, so the standard is enforced where it is violated.
+    results.push(if skip.lint {
+        skipped("makefile")
+    } else {
+        run_step("makefile", verbose, || run_makefile(project_root))
+    });
+
     // ───── Phase 1.5: template render ───────────────────────────────
     results.push(if skip.templates {
         skipped("template-render")
@@ -200,12 +230,54 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // ───── Phase 1.7: lockfile consistency ──────────────────────────
     //
     // When the project declares `[dependencies]`, the committed
-    // `fluxor.lock` must match what the resolver would produce today
-    // against the local registry. Projects without `[dependencies]`
-    // skip cleanly — no lockfile is expected.
+    // `fluxor.lock` must be present, parse in the uniform
+    // `[[artifact]]` shape, and pin every declared dependency.
+    // Projects without `[dependencies]` skip cleanly — no lockfile is
+    // expected.
     results.push(run_step("lockfile-consistency", verbose, || {
         check_lockfile_consistency(project_root)
     }));
+
+    // ───── Phase 1.75: live staleness (hard-fail) ───────────────────
+    //
+    // The plan's one declared exception to warn-don't-act
+    // (`.context/registry_consolidation.md`): a green gate against a
+    // known-stale upstream is a clean build wearing a misleading name.
+    // Every workspace-member project among this project's declared
+    // dependencies — plus the project itself when it is a member — must
+    // have its current input digests match the published
+    // `<member>/meta:latest` annotations; a member with no published
+    // index fails likewise. Skips cleanly when no workspace file
+    // exists.
+    {
+        if verbose {
+            eprintln!("[ci] running phase: live-staleness");
+        }
+        let start = Instant::now();
+        let outcome = crate::store_sync::live_staleness_failures(project_root);
+        let elapsed_ms = start.elapsed().as_millis();
+        results.push(match outcome {
+            Ok(None) => skipped("live-staleness"),
+            Ok(Some(failures)) if failures.is_empty() => PhaseResult {
+                name: "live-staleness",
+                status: PhaseStatus::Ok,
+                elapsed_ms,
+                message: String::new(),
+            },
+            Ok(Some(failures)) => PhaseResult {
+                name: "live-staleness",
+                status: PhaseStatus::Failed,
+                elapsed_ms,
+                message: failures.join("; "),
+            },
+            Err(e) => PhaseResult {
+                name: "live-staleness",
+                status: PhaseStatus::Failed,
+                elapsed_ms,
+                message: e.to_string(),
+            },
+        });
+    }
 
     // ───── Phase 1.8: ABI-surface pin ───────────────────────────────
     //
@@ -324,28 +396,21 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // tls crypto KATs live in the modules/foundation/tls crate which
-    // defaults to `#![no_std]` / `#![no_main]`. `cargo test -p` from
-    // workspace root with `--features host-test` toggles those off.
-    let tls_path = project_root.join("modules/foundation/tls");
-    if tls_path.exists() {
+    // ───── Phase 4.5: module test harnesses ──────────────────────────
+    //
+    // Every module manifest declaring `[test] harness = "..."` gets its
+    // harness compiled and run host-side by `fluxor modules test` (generated
+    // zero-dependency crate mounting the harness file — see
+    // standards/fluxor-modules.md §3). Omitted when no module declares
+    // one, same policy as phase 3.5. This is the committed home of the
+    // tls crypto KATs, among others.
+    if crate::module_test::has_harnesses(project_root) {
         results.push(if skip.cargo {
-            skipped("cargo-test (tls KATs)")
+            skipped("module-tests")
         } else {
-            run_step("cargo-test (tls KATs)", verbose, || {
-                cargo_in(
-                    project_root,
-                    &[
-                        "test",
-                        "-p",
-                        "fluxor-mod-tls",
-                        "--features",
-                        "host-test",
-                        "--target",
-                        "aarch64-unknown-linux-gnu",
-                        "--no-fail-fast",
-                    ],
-                )
+            run_step("module-tests", verbose, || {
+                crate::module_test::cmd_test(Some(project_root), None, verbose)
+                    .map_err(|e| e.to_string())
             })
         });
     }
@@ -559,20 +624,19 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: Some("host-wasm"),
             package_gate: None,
         },
-        // Foundation PIC modules under the host-test feature, exercising
-        // the same code that ships as `.fmod` blobs on hardware. Catches
-        // workspace-clippy issues the per-target embedded matrix can't
-        // see (those targets exclude the `host-test` cfg branches).
+        // The harness sub-workspace `#[path]`-mounts every foundation
+        // module core under the host-test feature, exercising the same
+        // code that ships as `.fmod` blobs on hardware. One clippy pass
+        // there covers all mounted cores' host-test cfg branches —
+        // strictly wider than the per-crate jobs it replaced (module
+        // directories carry no crates; standards/fluxor-modules.md §0).
+        // Skipped naturally when `tests/harness/` doesn't exist.
         ClippyJob {
-            label: "mod ip (host-test)",
-            cwd: "",
+            label: "harness (module cores, host-test)",
+            cwd: "tests/harness",
             args: &[
                 "clippy",
                 "--all-targets",
-                "-p",
-                "fluxor-mod-ip",
-                "--features",
-                "host-test",
                 "--target",
                 "aarch64-unknown-linux-gnu",
                 "--",
@@ -580,26 +644,7 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
                 "warnings",
             ],
             feature_gate: None,
-            package_gate: Some("fluxor-mod-ip"),
-        },
-        ClippyJob {
-            label: "mod tls (host-test)",
-            cwd: "",
-            args: &[
-                "clippy",
-                "--all-targets",
-                "-p",
-                "fluxor-mod-tls",
-                "--features",
-                "host-test",
-                "--target",
-                "aarch64-unknown-linux-gnu",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            feature_gate: None,
-            package_gate: Some("fluxor-mod-tls"),
+            package_gate: None,
         },
     ];
     // Each kernel job is keyed by the feature it builds with; the
@@ -831,6 +876,225 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
 
 /// Run the placement-resolver lint over every config's `presentation.shell`
 /// (rfc_adaptive_presentation.md §9). Mirrors `fluxor lint presentation`.
+/// A `Command` that re-invokes this CLI binary as `fluxor`. The
+/// launcher `fexecve`s a digest-named store blob, so
+/// `current_exe()` is `blobs/sha256/<hex>` — spawning it bare puts
+/// the hex digest in the child's argv[0] and the busybox applet
+/// dispatch fires instead of the subcommand parse. Pin argv[0].
+fn self_invoke() -> Command {
+    let mut cmd = Command::new(std::env::current_exe().unwrap_or_else(|_| "fluxor".into()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.arg0("fluxor");
+    }
+    cmd
+}
+
+/// Build-check every git-tracked config under `examples/`.
+///
+/// Uses `git ls-files` rather than a directory walk so untracked local
+/// experiments — which may legitimately name sibling-repo modules — are not
+/// gated on. A repo without git, or without tracked examples, passes trivially.
+fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
+    let out = Command::new("git")
+        .args(["ls-files", "examples/*.yaml", "examples/**/*.yaml"])
+        .current_dir(project_root)
+        .output();
+    let Ok(out) = out else {
+        return Ok(()); // no git — nothing to enumerate
+    };
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let mut failures: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for rel in listing.lines().filter(|l| !l.trim().is_empty()) {
+        // The harness tree is fixtures and probes, not examples.
+        if rel.contains("test_harness/") {
+            continue;
+        }
+        checked += 1;
+        let st = self_invoke()
+            .args(["build", "--check", rel])
+            .current_dir(project_root)
+            .output();
+        match st {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                // The specific diagnostic goes to stdout; stderr carries only
+                // the "Validation failed" summary. Reporting the summary alone
+                // would make this phase say a config is broken without saying
+                // why — search both, and prefer the detailed line.
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                let detail = combined
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| l.contains("ERROR"))
+                    .or_else(|| {
+                        combined
+                            .lines()
+                            .map(str::trim)
+                            .find(|l| l.contains("error") && !l.contains("Validation failed"))
+                    })
+                    .unwrap_or("build --check failed")
+                    .to_string();
+                failures.push(format!("{rel}: {detail}"));
+            }
+            Err(e) => failures.push(format!("{rel}: could not run build --check: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} of {checked} tracked example(s) fail `fluxor build --check`:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    ))
+}
+
+/// The lifecycle targets every project's Makefile must define, and the
+/// target names `standards/make.md` §1 forbids because they either
+/// rename one CLI command or split a lifecycle stage.
+const LIFECYCLE_TARGETS: &[&str] = &["help", "build", "test", "lint", "ci", "publish", "clean"];
+const FORBIDDEN_TARGETS: &[&str] = &[
+    "fmt",
+    "fmt-check",
+    "clippy",
+    "check",
+    "verify",
+    "setup",
+    "sync",
+    "update",
+    "modules",
+    "validate",
+    "run",
+];
+
+/// Enforce `standards/make.md` against this project's Makefile.
+///
+/// The structural half (lifecycle target set, strict shell, default
+/// goal) is a transcription of the standard. The half that earns the
+/// phase is the last one: every `fluxor <verb>` the Makefile names is
+/// resolved against the *live* CLI, so a verb that is renamed or
+/// retired fails here on the day it moves rather than in a sibling
+/// repo weeks later. Nothing about the check needs updating when the
+/// CLI changes — it asks the binary.
+fn run_makefile(project_root: &Path) -> std::result::Result<(), String> {
+    let path = project_root.join("Makefile");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(()); // fmod-only projects ship no Makefile
+    };
+    let mut problems: Vec<String> = Vec::new();
+
+    // Compared whitespace-insensitively: the skeleton aligns its `:=`
+    // columns and real Makefiles do not always follow.
+    let squashed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for want in [
+        ".DEFAULT_GOAL := build",
+        "SHELL := /bin/bash",
+        ".SHELLFLAGS := -euo pipefail -c",
+    ] {
+        if !squashed.contains(want) {
+            problems.push(format!("missing `{want}` (§2)"));
+        }
+    }
+
+    let defined: BTreeSet<&str> = text
+        .lines()
+        .filter(|l| !l.starts_with('\t'))
+        .filter_map(|l| l.split_once(':'))
+        .map(|(name, _)| name.trim())
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+        .collect();
+    for want in LIFECYCLE_TARGETS {
+        if !defined.contains(want) {
+            problems.push(format!("no `{want}:` target (§1.1)"));
+        }
+    }
+    for bad in FORBIDDEN_TARGETS {
+        if defined.contains(bad) {
+            problems.push(format!(
+                "`{bad}:` renames a CLI command or splits a lifecycle stage (§1)"
+            ));
+        }
+    }
+
+    let verbs = cli_verbs();
+    if !verbs.is_empty() {
+        for (n, line) in text.lines().enumerate() {
+            for verb in command_verbs(line) {
+                if !verbs.contains(&verb) {
+                    problems.push(format!(
+                        "line {}: `fluxor {verb}` is not a CLI command — retired or renamed \
+                         (§5: update every in-tree reference in the same change)",
+                        n + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Makefile deviates from standards/make.md:\n  {}",
+        problems.join("\n  ")
+    ))
+}
+
+/// The verbs one Makefile line names in *command position*, which is
+/// the only position that has to resolve. A command reference either
+/// opens a backtick span or starts the line's payload — after the
+/// recipe tab, an `@echo "`, a `#`, and any indent. Everything else on
+/// a line is prose ("no fluxor launcher is on PATH", "composed into
+/// fluxor graphs"), and a path ending in `/fluxor` is not a command at
+/// all. A trailing `:` marks a heading, not an invocation.
+fn command_verbs(line: &str) -> Vec<String> {
+    let mut spans: Vec<&str> = line.split('`').skip(1).step_by(2).collect();
+    let payload = line
+        .trim_start()
+        .trim_start_matches("@echo \"")
+        .trim_start_matches('#')
+        .trim_start();
+    spans.push(payload);
+
+    spans
+        .into_iter()
+        .filter_map(|s| s.strip_prefix("fluxor "))
+        .filter_map(|rest| {
+            let verb: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+                .collect();
+            let heading = rest[verb.len()..].starts_with(':');
+            (!verb.is_empty() && !heading).then_some(verb)
+        })
+        .collect()
+}
+
+/// Top-level subcommand names, read from this binary's own `--help`
+/// so the set is whatever the CLI actually offers. An unreadable help
+/// output yields an empty set, which disables the verb check rather
+/// than failing the phase on a broken probe.
+fn cli_verbs() -> BTreeSet<String> {
+    let Ok(out) = self_invoke().arg("--help").output() else {
+        return BTreeSet::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .skip_while(|l| !l.starts_with("Commands:"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  ") || l.trim().is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
 fn run_presentation(project_root: &Path) -> std::result::Result<(), String> {
     let mut violations: Vec<String> = Vec::new();
     for entry in walkdir::WalkDir::new(project_root)
@@ -1155,34 +1419,33 @@ fn check_abi_pin(project_root: &Path) -> std::result::Result<(), String> {
     }
 }
 
-/// Lockfile-consistency phase. Skips cleanly when:
+/// Lockfile-consistency phase over the uniform `[[artifact]]` lockfile.
 ///
-/// - the project has no `[dependencies]` table (no lockfile expected); or
-/// - live workspace mode is active for this project root (live members
-///   bypass the lockfile and an advisory is printed at sync time; CI
-///   should treat drift as informational, not fatal).
-///
-/// Otherwise demands a present, parseable, drift-free `fluxor.lock`.
+/// Cheap by design: the lockfile must be present (when `[dependencies]`
+/// exist), parseable, non-legacy-shape, and carry at least one pin for
+/// every declared dependency. There is no live-mode skip — sync
+/// write-through-resolves workspace members through the same lockfile,
+/// so the file is authoritative for everyone (Decision 1). Digest/epoch
+/// verification against the store happens at sync/materialise time,
+/// not here.
 fn check_lockfile_consistency(project_root: &Path) -> std::result::Result<(), String> {
     let deps = crate::project::dependencies(project_root)?;
     if deps.is_empty() {
         return Ok(());
     }
-    // Live-mode advisory: workspace mode is per-developer, gitignored,
-    // and intentionally bypasses lockfile pinning. CI shouldn't reject
-    // a build just because the developer happens to have the project
-    // listed in `~/.fluxor/workspace.toml`.
-    if let Ok(Some(ws)) = crate::workspace::load_workspace() {
-        if crate::workspace::current_member(&ws, project_root).is_some() {
-            eprintln!(
-                "note: live workspace mode active for this project root — \
-                 lockfile-consistency check skipped. Run `fluxor update` after \
-                 leaving workspace mode to refresh fluxor.lock against the registry."
-            );
-            return Ok(());
+    let lock = crate::store_resolve::read_store_lock(project_root).map_err(|e| e.to_string())?;
+    let Some(lock) = lock else {
+        return Err("fluxor.lock missing — run `fluxor sync`".to_string());
+    };
+    for dep in &deps {
+        if !lock.artifacts.iter().any(|a| a.project == dep.name) {
+            return Err(format!(
+                "dependency '{}' has no [[artifact]] entry in fluxor.lock — run `fluxor sync`",
+                dep.name
+            ));
         }
     }
-    crate::lockfile::check_consistent(project_root).map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// Version-skew check.
@@ -1506,6 +1769,32 @@ type _PathBufRef = PathBuf;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verb scan reads command positions only. Prose that happens
+    /// to contain the word "fluxor" is not a command reference — the
+    /// distinction is the whole reason the phase is usable across
+    /// nineteen hand-written Makefiles.
+    #[test]
+    fn command_verbs_reads_commands_not_prose() {
+        // Command positions: recipe, help table, backticked comment.
+        assert_eq!(command_verbs("\tfluxor sync"), ["sync"]);
+        assert_eq!(
+            command_verbs("\t@echo \"  fluxor modules build [--target …]   PIC modules\""),
+            ["modules"]
+        );
+        assert_eq!(
+            command_verbs("# the CLI directly (`fluxor build --check …`)"),
+            ["build"]
+        );
+        // Prose, headings, and paths carry no command.
+        assert!(command_verbs("\t@echo \"fluxor lifecycle:\"").is_empty());
+        assert!(
+            command_verbs("\t@echo \"  make check-install  no fluxor launcher on PATH\"")
+                .is_empty()
+        );
+        assert!(command_verbs("\trust-objcopy -O binary target/release/fluxor out.bin").is_empty());
+        assert!(command_verbs("# composed into fluxor graphs in `packaging/`").is_empty());
+    }
 
     #[test]
     fn skipset_parses_comma_separated_phases() {

@@ -3,7 +3,7 @@
 //   window blit into a winit/softbuffer host window (host-window feature)
 //   null   discard
 //
-// Params are declared in `modules/builtin/linux/linux_display/manifest.toml`
+// Params are declared in `modules/platform/linux/linux_display/manifest.toml`
 // and packed into the kernel's TLV stream by the config tool.
 
 #[cfg(feature = "host-window")]
