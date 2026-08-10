@@ -386,12 +386,17 @@ pub fn lock_store_resolver(
 /// wrong one validates a port surface the packaged `.fmod` doesn't have.
 ///   1. a pin whose target equals `silicon` wins. Pins are tagged with
 ///      the module-silicon id at publish time, so this is a plain string
-///      match (pre-consolidation locks carrying board-tagged pins re-pin
-///      on the next `fluxor sync`);
+///      match;
 ///   2. otherwise fall back to a name match, but only when it is
 ///      unambiguous — every pin for that name shares one digest;
-///   3. several differing-digest pins with no silicon match is `Failed`:
-///      which port surface is authoritative is not guessable.
+///   3. differing digests and no match for a HOST target (`linux`,
+///      `wasm`) is `NotPinned`. A pin binds the target it names, and a
+///      host graph loads modules built from source into `modules.bin`,
+///      never store bytes — so no pin here binds anything, and the
+///      on-disk manifest is authoritative;
+///   4. differing digests and no match for a SILICON is `Failed`:
+///      firmware for that silicon needs the artifact for it, so the
+///      right port surface is missing rather than unguessable.
 ///
 /// UTF-8 and integrity are strict. `read_blob` hashes the bytes against the
 /// layer digest; non-UTF-8 in a digest-verified artifact is corruption
@@ -418,6 +423,11 @@ pub fn lock_store_manifest_resolver(
             }));
         }
     };
+    // Whether the requested target is a host (`linux`, `wasm`) rather than a
+    // silicon or board. Resolved through the target descriptor so the set lives
+    // in one place (`TargetKind::Host`) instead of being restated here.
+    let is_host = silicon
+        .is_some_and(|s| crate::target::load_target(s, project_root).is_ok_and(|t| t.is_host()));
     let silicon = silicon.map(|s| s.to_string());
     let store = match open_store(store_dir) {
         Ok(s) => s,
@@ -440,18 +450,26 @@ pub fn lock_store_manifest_resolver(
         let silicon_match = silicon
             .as_deref()
             .and_then(|want| named.iter().find(|p| p.target.as_deref() == Some(want)));
+        let unambiguous = named.iter().all(|p| p.digest == named[0].digest);
         let pin = match silicon_match {
             Some(p) => *p,
+            // One digest across every target: the artifact is
+            // target-agnostic, so any pin is the right pin.
+            None if unambiguous => named[0],
+            // Nothing for a pin to bind: a host graph loads modules built
+            // from source into `modules.bin`, never store bytes. Validating
+            // against a silicon pin would check wiring against a surface
+            // this run will not load.
+            None if is_host => return ManifestPin::NotPinned,
+            // A silicon does need the artifact for it, so the right one is
+            // missing rather than ambiguous. Falling through would validate
+            // against another silicon's surface.
             None => {
-                let first = named[0];
-                if named.iter().all(|p| p.digest == first.digest) {
-                    first
-                } else {
-                    return ManifestPin::Failed(format!(
-                        "module '{name}' is pinned for several targets at differing digests \
-                         and none matches silicon {silicon:?}; pin it for this target"
-                    ));
-                }
+                return ManifestPin::Failed(format!(
+                    "module '{name}' is pinned for several targets at differing digests \
+                     and none matches {}; pin it for this target",
+                    silicon.as_deref().unwrap_or("the requested target")
+                ))
             }
         };
         let pin_id = format!("pin {} ({})", pin.reference, pin.digest);
@@ -781,6 +799,36 @@ mod tests {
         // A silicon with NO matching pin and divergent digests -> refuse.
         let r_other = lock_store_manifest_resolver(&proj, Some("stm32"), Some(&store_dir)).unwrap();
         assert!(matches!(r_other("amqp_client"), ManifestPin::Failed(_)));
+    }
+
+    /// A HOST target with no matching pin falls through instead of refusing.
+    ///
+    /// Sibling of `ambiguous_multi_target_pins_refuse_without_silicon_match`,
+    /// and the pair is the whole rule: a pin binds the target it names, so a
+    /// silicon that should have an artifact and does not is an error, while a
+    /// host — whose modules are built from source into `modules.bin` and never
+    /// fetched from the store — has nothing for the pin to bind and takes the
+    /// on-disk manifest.
+    #[test]
+    fn ambiguous_multi_target_pins_fall_through_for_a_host_target() {
+        use crate::modules::ManifestPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let store = OciStore::open(tmp.path().join("store")).expect("open store");
+
+        let d1 = publish_with_manifest(&store, "tls", "bcm2712", b"fmodA", "version=\"1\"\n");
+        let d2 = publish_with_manifest(&store, "tls", "rp2350", b"fmodB", "version=\"2\"\n");
+        assert_ne!(d1, d2);
+        pin_module(&proj, "tls", "bcm2712", &d1, "bcm2712/tls:0.1.0");
+        pin_module(&proj, "tls", "rp2350", &d2, "rp2350/tls:0.1.0");
+
+        let store_dir = tmp.path().join("store");
+        let r = lock_store_manifest_resolver(&proj, Some("linux"), Some(&store_dir)).unwrap();
+        assert!(
+            matches!(r("tls"), ManifestPin::NotPinned),
+            "a host target must fall through to the on-disk manifest, not refuse"
+        );
     }
 
     #[test]

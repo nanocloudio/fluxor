@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::error::{Error, Result};
 use crate::rig::events::{DeployEvent, RunEvent};
@@ -315,9 +315,22 @@ impl Matcher {
 }
 
 fn compile_rule(rule: &ObservationRule, kind: RuleKind) -> Result<CompiledRule> {
+    // Anchors are per LINE. A console rule matches against the whole
+    // accumulated buffer (see `scan_console`), not one line at a time, so
+    // without this `$` binds to the end of everything received so far and `^`
+    // to the very start — and a rule ending `ERR$` fires only if its line is
+    // the last byte in the buffer at the instant of a scan, which for a probe
+    // that keeps emitting is never.
+    //
+    // Per-line is what a scenario author writing `$` means, and `.` still does
+    // not cross `\n`, so a pattern stays scoped to one line. Unanchored
+    // patterns are unaffected: multi-line only adds match positions for the
+    // anchors.
     let regex = match &rule.regex {
         Some(p) => Some(
-            Regex::new(p)
+            RegexBuilder::new(p)
+                .multi_line(true)
+                .build()
                 .map_err(|e| Error::Config(format!("rig rule: invalid regex {p:?}: {e}")))?,
         ),
         None => None,
@@ -456,6 +469,52 @@ mod tests {
             }
             other => panic!("expected Failed with console.serial source, got {other:?}"),
         }
+    }
+
+    /// A `$`-anchored rule fires on its line even when more output follows.
+    ///
+    /// Rules match against the whole accumulated buffer, so without per-line
+    /// anchoring `ERR$` binds to the end of everything received and stops
+    /// matching the moment the next line arrives — a scenario whose probe
+    /// printed its failure would report TIMEOUT instead.
+    #[test]
+    fn dollar_anchored_fail_rule_fires_when_more_output_follows() {
+        let mut m = Matcher::new(&[], &[console_rule("phase=h2c .* ERR$")]).unwrap();
+        // The matching line, then more output after it — the real ordering.
+        let outcome = m.observe(&serial_bytes(
+            b"[proto_load] phase=h2c committed=0 failed=8 ERR\n\
+              [proto_load] phase=ws start\n\
+              [proto_load] done protocols=h1,h2c,ws any_err=true\n",
+        ));
+        assert!(
+            matches!(outcome, MatcherOutcome::Failed { .. }),
+            "a $-anchored fail rule must fire on its own line, got {outcome:?}"
+        );
+    }
+
+    /// `^` likewise anchors per line, not to the start of the whole stream.
+    #[test]
+    fn caret_anchored_rule_matches_a_later_line() {
+        let mut m = Matcher::new(&[], &[console_rule("^\\[fluxor\\] PANIC")]).unwrap();
+        let outcome = m.observe(&serial_bytes(b"boot banner\n[fluxor] PANIC at 0x1234\n"));
+        assert!(
+            matches!(outcome, MatcherOutcome::Failed { .. }),
+            "a ^-anchored rule must match at a line start, got {outcome:?}"
+        );
+    }
+
+    /// `.` must still not cross a newline, so a pattern stays scoped to one
+    /// line rather than silently spanning the buffer.
+    #[test]
+    fn dot_does_not_span_lines() {
+        let mut m = Matcher::new(&[], &[console_rule("phase=h2c.*any_err=true")]).unwrap();
+        let outcome = m.observe(&serial_bytes(
+            b"[proto_load] phase=h2c OK\n[proto_load] done any_err=true\n",
+        ));
+        assert!(
+            matches!(outcome, MatcherOutcome::InProgress),
+            "`.` must not cross a newline, got {outcome:?}"
+        );
     }
 
     #[test]
