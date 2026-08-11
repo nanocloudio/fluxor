@@ -1310,20 +1310,10 @@ fn target_aliases(target: &str) -> Vec<String> {
     }
 }
 
-/// Standard module-search directories — mirrors
-/// `tools::config::load_module_manifests_with_extra`'s order. Kept
-/// in-sync by convention; if it ever drifts, the scenario validator
-/// will miss a manifest and report a false negative.
-const STANDARD_MANIFEST_DIRS: &[&str] = &[
-    "modules/drivers",
-    "modules/foundation",
-    "modules/app",
-    "modules/fixtures",
-    "modules/platform/linux",
-    "modules/platform/wasm",
-    "modules/platform/qemu",
-    "modules",
-];
+/// Standard module-search directories: the one tier list
+/// (`manifest::MODULE_TIERS`), so the scenario validator sees exactly
+/// the manifests the builder and config resolution see.
+const STANDARD_MANIFEST_DIRS: &[&str] = crate::manifest::MODULE_TIERS;
 
 /// Slim toml schema for `validate_module_targets`. We re-parse the
 /// manifest here (rather than going through `tools::manifest::Manifest`)

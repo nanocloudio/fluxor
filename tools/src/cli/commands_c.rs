@@ -1908,6 +1908,7 @@ fn cmd_modules_list(project_root: Option<&Path>, json: bool) -> Result<()> {
                 "manifest": s.manifest.to_string_lossy(),
                 "hardware_targets": s.hardware_targets,
                 "type_id": s.type_id,
+                "builtin": s.builtin,
             })).collect::<Vec<_>>(),
         });
         println!(
@@ -1923,12 +1924,14 @@ fn cmd_modules_list(project_root: Option<&Path>, json: bool) -> Result<()> {
         } else {
             s.hardware_targets.join(",")
         };
-        println!(
-            "  {name:24} type={type_id} targets={targets} entry={entry}",
-            name = s.name,
-            type_id = s.type_id,
-            entry = s.entry.display(),
-        );
+        // A `builtin = true` module is compiled into the kernel and
+        // has no entry file to name (standards/fluxor-modules.md §0.1).
+        let entry = if s.builtin {
+            "<builtin>".to_string()
+        } else {
+            s.entry.display().to_string()
+        };
+        println!("  {name:24} type={type_id} targets={targets} entry={entry}", name = s.name, type_id = s.type_id);
     }
     println!("({} modules)", summaries.len());
     Ok(())
@@ -1969,6 +1972,34 @@ fn cmd_ci(skip: &[String], project_root: Option<&Path>, verbose: bool) -> Result
     Ok(())
 }
 
+/// `fluxor help` — CLI help, or (`--make`) the canonical `make help`
+/// block for this checkout, which a Makefile's `help:` target emits
+/// verbatim.
+fn cmd_help(make: bool, project_root: Option<&Path>, command: Option<&str>) -> Result<()> {
+    if make {
+        print!(
+            "{}",
+            fluxor_tools::lifecycle::make_help(&resolve_project_root(project_root))
+        );
+        return Ok(());
+    }
+    let mut cli = <Cli as clap::CommandFactory>::command();
+    match command {
+        None => cli.print_help(),
+        Some(name) => match cli.find_subcommand_mut(name) {
+            Some(sub) => sub.print_help(),
+            None => {
+                return Err(Error::Config(format!(
+                    "`{name}` is not a fluxor command (see `fluxor --help`)"
+                )))
+            }
+        },
+    }
+    .map_err(|e| Error::Config(e.to_string()))?;
+    println!();
+    Ok(())
+}
+
 // ── Polymorphic `fluxor build` ───────────────────────────────────────
 
 /// Flag bundle for `fluxor build` — the absorbed
@@ -1985,7 +2016,29 @@ struct BuildFlags {
     epoch: u64,
 }
 
-fn cmd_build_dispatch(path: &PathBuf, flags: BuildFlags, verbose: bool) -> Result<()> {
+/// `fluxor build` — the whole project (no argument), or one named
+/// config (a path). Same stage, two scopes; the argument's presence is
+/// the discriminator, and every flag belongs to the config form.
+fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) -> Result<()> {
+    let Some(path) = path else {
+        if flags.check
+            || flags.emit.is_some()
+            || flags.output.is_some()
+            || flags.firmware.is_some()
+            || !flags.modules_dir.is_empty()
+            || flags.target.is_some()
+        {
+            return Err(Error::Config(
+                "`fluxor build`'s flags belong to the config form — name a config file or \
+                 directory, or drop the flags for the lifecycle build"
+                    .into(),
+            ));
+        }
+        return lifted(fluxor_tools::lifecycle::build(
+            &crate::project::root(),
+            verbose,
+        ));
+    };
     if flags.check {
         if flags.emit.is_some() {
             return Err(Error::Config(

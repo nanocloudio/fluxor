@@ -153,6 +153,13 @@ pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
         ref_roots.extend(ws.workspace.members.iter().cloned());
     }
     for m in crate::modules_build::list(pr)? {
+        // `builtin = true` manifests are declarations of kernel-side
+        // implementations: they build no `.fmod`, so publish emits no
+        // artifact to carry their input digest. Including them here
+        // would report a staleness no publish could ever clear.
+        if m.builtin {
+            continue;
+        }
         let Some(dir) = m.manifest.parent() else {
             continue;
         };

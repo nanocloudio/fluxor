@@ -255,10 +255,16 @@ pub fn emit_bundle(manifest_path: &Path, verbose: bool) -> Result<PathBuf> {
         // `fluxor build <graph>` would (§10.3 — it builds them anyway).
         crate::build_one(&graph_path, Some(&target_dir.join("config.bin")), verbose)?;
 
-        // Module refs pin the REAL built artifacts: read each .fmod from the
-        // silicon modules dir build_one just ensured. Linux-family graphs run
-        // bcm2712-built modules under the host runtime.
-        let modules_dir = project_root.join("target/fluxor/bcm2712/modules");
+        // Module refs pin the REAL built artifacts: read each .fmod from
+        // the silicon modules dir `build_one` just ensured. Asked, not
+        // spelled: `linux` redirects to its `module_silicon` (bcm2712)
+        // through the target registry, which is the only board/host →
+        // silicon mapping (standards/target_consolidation.md §3).
+        let modules_dir = crate::modules_build::resolve(
+            &project_root,
+            &project_root.join("target/fluxor"),
+            "linux",
+        );
         let mut module_refs = Vec::new();
         for ty in &facts.module_types {
             // fixtures/ modules are test instruments — never part of a

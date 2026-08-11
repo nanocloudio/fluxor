@@ -2,6 +2,11 @@
 #[command(name = "fluxor")]
 #[command(about = "Fluxor Config Tool - Build and extract configuration for Fluxor firmware")]
 #[command(version)]
+// `help` is a real subcommand here: it carries `--make`, which emits the
+// canonical `make help` block for the checkout. It still forwards to
+// clap's rendering for `fluxor help [COMMAND]`, so the built-in shape is
+// preserved — only the owner changes.
+#[command(disable_help_subcommand = true)]
 struct Cli {
     /// Verbose mode - show detailed output
     #[arg(short, long, global = true)]
@@ -13,9 +18,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build one config (or every config in a directory) into its
+    /// Source → artefacts, at two scopes: the whole project (no
+    /// argument) or one named config (a path).
+    ///
+    /// With no argument this is **the lifecycle build**, what `make
+    /// build` delegates to: stage `target/fluxor` when the tree mounts
+    /// it, build the cargo tree, then build this project's PIC modules.
+    ///
+    /// With a config file or directory: build that config into its
     /// artefacts. `--check` validates against target constraints and
     /// writes nothing; `--emit` selects a specific device encoding.
+    ///
+    /// The two forms are the same stage at two scopes — the whole
+    /// project, or one named config — and are told apart by the
+    /// presence of the argument. Every flag below belongs to the
+    /// config form.
     ///
     /// Emit forms (flash/deploy encodings — never store artifacts):
     ///   uf2       config UF2 for drag-drop flashing
@@ -32,7 +49,8 @@ enum Commands {
     ///   table     module table blob from the modules the config names
     Build {
         /// Config file (YAML) or directory containing YAML files.
-        path: PathBuf,
+        /// Omit for the lifecycle build.
+        path: Option<PathBuf>,
         /// Output file (default: auto-derived from target; required
         /// for --emit=combined|slot|table).
         #[arg(short, long)]
@@ -256,11 +274,65 @@ enum Commands {
         store: bool,
     },
 
-    /// Source-tree lint suite. Each subcommand enforces one rule
-    /// over the workspace.
+    /// The source-tree lint suite — one rule per subcommand, or the
+    /// lifecycle lint with no subcommand.
+    ///
+    /// With no subcommand this is **the lifecycle lint**, what `make
+    /// lint` delegates to: `cargo fmt --all -- --check` and `cargo
+    /// clippy … -D warnings` where a cargo tree exists, then `fluxor
+    /// lint hygiene`. Those are the precise checks the gate runs, minus
+    /// the ones that need a build — module fmt/clippy compile PIC
+    /// sources per target and stay `fluxor ci` phases.
     Lint {
         #[command(subcommand)]
-        action: LintAction,
+        action: Option<LintAction>,
+        /// Project root override (lifecycle form).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+
+    /// The lifecycle test stage — what `make test` delegates to.
+    ///
+    /// Runs, for whichever of the three a project has: `fluxor modules
+    /// test` (declared module harnesses), `cargo test` over the cargo
+    /// tree, and the `[ci.test] scripts` globs through `fluxor ci`'s own
+    /// project-e2e runner. Fails fast, unlike the gate.
+    Test {
+        /// Project root override.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+
+    /// The lifecycle clean stage — what `make clean` delegates to.
+    ///
+    /// Removes this project's module artefacts, runs `cargo clean`
+    /// where a cargo tree exists, and removes the generated module-test
+    /// crates under `target/fluxor/moduletests`. The staged source
+    /// trees under `target/fluxor/<name>/` are store-materialised, not
+    /// build output, and survive.
+    Clean {
+        /// Project root override.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
+
+    /// Show CLI help, or — with `--make` — this checkout's `make help`
+    /// block.
+    ///
+    /// `--make` emits lifecycle lines, the CLI commands that are
+    /// deliberately not make targets, every script under `tools/` and
+    /// `scripts/` (marked `(ci)` when `[ci.test] scripts` runs it), and
+    /// the one-time setup line. A Makefile's `help:` recipe is
+    /// `@fluxor help --make`, so the text cannot drift from the tree.
+    Help {
+        /// Emit the `make help` block for this project instead of CLI help.
+        #[arg(long)]
+        make: bool,
+        /// Project root override (with `--make`).
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Show help for this subcommand instead of the top-level help.
+        command: Option<String>,
     },
 
     /// PIC module build orchestration plus the module-artefact verbs
@@ -531,8 +603,13 @@ enum ModulesAction {
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
     },
-    /// Inventory the modules discovered under `modules/{drivers,
-    /// foundation,app}/<name>/manifest.toml`.
+    /// Inventory every module discovered under the standard's tier
+    /// directories (standards/fluxor-modules.md §0.1) —
+    /// `<tier>/<name>/manifest.toml`.
+    ///
+    /// A declaration-only manifest — a kernel-resident built-in, with
+    /// no PIC artefact to build — is marked `entry=<builtin>` in the
+    /// text output and carries `builtin: true` in `--json`.
     List {
         #[arg(long)]
         project_root: Option<PathBuf>,

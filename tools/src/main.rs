@@ -53,6 +53,12 @@ pub(crate) use fluxor_tools::presentation_resolver;
 // (same pattern as observability above).
 pub(crate) use fluxor_tools::store_resolve;
 pub(crate) use fluxor_tools::store_sync;
+// `ci.rs` runs the `fluxor.toml` schema and Makefile-conformance
+// phases as `crate::ci_schema` / `crate::makefile_lint`; both are
+// lib-only (the schema phase reads the project shape through
+// `lifecycle`), so re-export the lib's single copies.
+pub(crate) use fluxor_tools::ci_schema;
+pub(crate) use fluxor_tools::makefile_lint;
 mod project;
 pub mod reconfigure;
 mod render_template;
@@ -139,7 +145,7 @@ fn main() {
             target,
             epoch,
         } => cmd_build_dispatch(
-            &path,
+            path.as_ref(),
             BuildFlags {
                 output,
                 emit,
@@ -217,19 +223,37 @@ fn main() {
                 store,
             },
         ),
-        Commands::Lint { action } => match action {
-            LintAction::Hygiene { project_root, json } => {
+        Commands::Lint {
+            action,
+            project_root,
+        } => match action {
+            None => lifted(fluxor_tools::lifecycle::lint(&resolve_project_root(
+                project_root.as_deref(),
+            ))),
+            Some(LintAction::Hygiene { project_root, json }) => {
                 cmd_lint_hygiene(project_root.as_deref(), json)
             }
-            LintAction::Observability {
+            Some(LintAction::Observability {
                 project_root,
                 json,
                 strict,
-            } => cmd_lint_observability(project_root.as_deref(), json, strict),
-            LintAction::Presentation { project_root } => {
+            }) => cmd_lint_observability(project_root.as_deref(), json, strict),
+            Some(LintAction::Presentation { project_root }) => {
                 cmd_lint_presentation(project_root.as_deref())
             }
         },
+        Commands::Test { project_root } => lifted(fluxor_tools::lifecycle::test(
+            &resolve_project_root(project_root.as_deref()),
+            verbose,
+        )),
+        Commands::Clean { project_root } => lifted(fluxor_tools::lifecycle::clean(
+            &resolve_project_root(project_root.as_deref()),
+        )),
+        Commands::Help {
+            make,
+            project_root,
+            command,
+        } => cmd_help(make, project_root.as_deref(), command.as_deref()),
         Commands::Ci { skip, project_root } => cmd_ci(&skip, project_root.as_deref(), verbose),
         Commands::Modules { action } => match action {
             ModulesAction::Build {
@@ -297,6 +321,13 @@ fn main() {
         eprintln!("\x1b[1;31mError:\x1b[0m {e}");
         std::process::exit(1);
     }
+}
+
+/// The lib and the bin each carry their own `error::Error` (the bin
+/// compiles `error.rs` a second time), so a lib-side lifecycle result
+/// crosses into the bin's `Result` here rather than at six call sites.
+fn lifted(r: std::result::Result<(), fluxor_tools::error::Error>) -> Result<()> {
+    r.map_err(|e| Error::Config(e.to_string()))
 }
 
 /// `fluxor publish` — the single store-write verb. The optional

@@ -40,26 +40,38 @@ struct Harness {
     path: PathBuf,
 }
 
-/// Discover every module under `modules/**` whose manifest declares `[test]`.
-/// True when any module manifest declares a `[test] harness` — the
-/// condition for `fluxor ci` to run the module-test phase at all.
-pub fn has_harnesses(project_root: &Path) -> bool {
-    !discover(project_root).is_empty()
+/// Harnesses that resolve to a file on disk — what the phase would run,
+/// and the condition for the lifecycle `test` verb to run it at all.
+pub fn resolved_harness_count(project_root: &Path) -> usize {
+    discover(project_root).len()
+}
+
+/// Manifests that *declare* `[test] harness`, whether or not the file
+/// they name exists. The gap between this and
+/// [`resolved_harness_count`] is a phase that would run nothing while
+/// the project says it has tests, so `fluxor ci` compares the two
+/// rather than silently omitting the phase.
+pub fn declared_harness_count(project_root: &Path) -> usize {
+    let mut n = 0;
+    for d in crate::manifest::MODULE_TIERS {
+        let Ok(entries) = fs::read_dir(project_root.join(d)) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let text = fs::read_to_string(e.path().join("manifest.toml")).unwrap_or_default();
+            if harness_path(&text).is_some() {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 fn discover(project_root: &Path) -> Vec<Harness> {
-    // Flat `modules/*` covers consumer projects (zedex-style layout);
-    // the tier dirs cover fluxor's own tree. A tier dir has no
-    // manifest.toml of its own, so scanning `modules` flat can't
-    // double-count its children.
-    const DIRS: [&str; 4] = [
-        "modules",
-        "modules/drivers",
-        "modules/foundation",
-        "modules/app",
-    ];
+    // The one tier list, so a `[test]` harness is run wherever the
+    // module lives — fixtures and platform tiers included.
     let mut out = Vec::new();
-    for d in DIRS {
+    for d in crate::manifest::MODULE_TIERS {
         let root = project_root.join(d);
         let Ok(entries) = fs::read_dir(&root) else {
             continue;

@@ -84,19 +84,10 @@ pub fn extract_module_search_paths(
 }
 
 /// any additional search paths (e.g., relative to the config file).
-/// Standard fluxor module subdirectories, relative to a root. Mirrors
-/// `Manifest::from_source_tree` in `tools/src/manifest.rs`. Built-ins
-/// live under `modules/platform/<platform>/<name>/`.
-const STANDARD_MODULE_SUBDIRS: &[&str] = &[
-    "modules/drivers",
-    "modules/foundation",
-    "modules/app",
-    "modules/fixtures",
-    "modules/platform/linux",
-    "modules/platform/wasm",
-    "modules/platform/qemu",
-    "modules",
-];
+/// Standard fluxor module subdirectories, relative to a root: the one
+/// tier list (`manifest::MODULE_TIERS`). Built-ins live under
+/// `modules/platform/<platform>/<name>/`.
+const STANDARD_MODULE_SUBDIRS: &[&str] = crate::manifest::MODULE_TIERS;
 
 /// Build the prioritized list of module search roots. Order:
 ///   1. `<project_root>/<standard subdirs>` — user's overrides

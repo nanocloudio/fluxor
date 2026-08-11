@@ -30,6 +30,11 @@ vm/
 /tests/
 /tools/tests/
 
+# The shadow repo's own git-dir. `/tests/` and `/tools/tests/` above are
+# versioned in it rather than here (standards/test-tracking.md §4), so
+# they are recoverable instead of existing only on one machine.
+/.git-shadow/
+
 # Host-test shims for excluded (non-workspace) module crates generate
 # their own lockfile; not tracked (the crates carry no host-test deps).
 modules/**/Cargo.lock

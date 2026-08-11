@@ -215,6 +215,19 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("makefile", verbose, || run_makefile(project_root))
     });
 
+    // ───── Phase 1.49: fluxor.toml schema ───────────────────────────
+    //
+    // The config every other phase reads was itself unchecked, so a
+    // key naming a directory that does not exist, or a table at a
+    // placement nothing reads, cost nothing and stayed. Runs
+    // unconditionally: it is a file read, and a project whose config is
+    // wrong cannot trust the phases configured by it.
+    if project_root.join("fluxor.toml").is_file() {
+        results.push(run_step("fluxor-toml-schema", verbose, || {
+            crate::ci_schema::check(project_root)
+        }));
+    }
+
     // ───── Phase 1.5: template render ───────────────────────────────
     results.push(if skip.templates {
         skipped("template-render")
@@ -325,7 +338,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         } else {
             match tools_path.as_ref() {
                 Some(p) if p.is_dir() => run_step("cargo-test (tools)", verbose, || {
-                    cargo_in(p, &["test", "--all-targets", "--all-features"])
+                    cargo_test_phase(p, &["test", "--all-targets", "--all-features"])
                 }),
                 Some(p) => PhaseResult {
                     name: "cargo-test (tools)",
@@ -334,7 +347,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
                     message: format!("no host-tools crate at {}", p.display()),
                 },
                 None => run_step("cargo-test (unit)", verbose, || {
-                    cargo_in(project_root, &["test", "--workspace", "--lib", "--bins"])
+                    cargo_test_phase(project_root, &["test", "--workspace", "--lib", "--bins"])
                 }),
             }
         });
@@ -404,11 +417,25 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // standards/fluxor-modules.md §3). Omitted when no module declares
     // one, same policy as phase 3.5. This is the committed home of the
     // tls crypto KATs, among others.
-    if crate::module_test::has_harnesses(project_root) {
+    //
+    // Gated on manifests that *declare* a harness rather than on
+    // harnesses that resolve: a manifest naming a file that isn't there
+    // must fail the phase, not drop it from the pipeline — a missing
+    // phase is the same green-and-empty failure as building 0 of 36
+    // modules.
+    let declared_harnesses = crate::module_test::declared_harness_count(project_root);
+    if declared_harnesses > 0 {
         results.push(if skip.cargo {
             skipped("module-tests")
         } else {
             run_step("module-tests", verbose, || {
+                vacuity(
+                    "module-tests",
+                    crate::module_test::resolved_harness_count(project_root),
+                    declared_harnesses,
+                    "module manifest(s) declare `[test] harness`",
+                    "the declared harness file does not exist at the path the manifest names",
+                )?;
                 crate::module_test::cmd_test(Some(project_root), None, verbose)
                     .map_err(|e| e.to_string())
             })
@@ -453,7 +480,7 @@ fn skipped(name: &'static str) -> PhaseResult {
     }
 }
 
-fn cargo_in(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
+pub(crate) fn cargo_in(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(dir).args(args);
     let status = cmd
@@ -795,7 +822,7 @@ fn is_fluxor_kernel_workspace(project_root: &Path) -> bool {
 /// `fluxor.toml` → conventional `tools/` if present → `None`. The
 /// `cargo-test (tools)` phase reports "skipped" when this returns
 /// `None` instead of producing a spawn-failed error.
-fn load_host_tools_crate(project_root: &Path) -> Option<String> {
+pub(crate) fn load_host_tools_crate(project_root: &Path) -> Option<String> {
     let fp = project_root.join("fluxor.toml");
     if fp.exists() {
         #[derive(serde::Deserialize)]
@@ -831,7 +858,7 @@ fn load_host_tools_crate(project_root: &Path) -> Option<String> {
 
 /// Hygiene phase wraps the scanner and reports any violation or stale
 /// exemption as a phase failure with a brief summary.
-fn run_hygiene(project_root: &Path) -> std::result::Result<(), String> {
+pub(crate) fn run_hygiene(project_root: &Path) -> std::result::Result<(), String> {
     let config =
         hygiene::Config::load(project_root).map_err(|e| format!("loading fluxor.toml: {e}"))?;
     let report = hygiene::scan(project_root, &config).map_err(|e| e.to_string())?;
@@ -956,124 +983,65 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
     ))
 }
 
-/// The lifecycle targets every project's Makefile must define, and the
-/// target names `standards/make.md` §1 forbids because they either
-/// rename one CLI command or split a lifecycle stage.
-const LIFECYCLE_TARGETS: &[&str] = &["help", "build", "test", "lint", "ci", "publish", "clean"];
-const FORBIDDEN_TARGETS: &[&str] = &[
-    "fmt",
-    "fmt-check",
-    "clippy",
-    "check",
-    "verify",
-    "setup",
-    "sync",
-    "update",
-    "modules",
-    "validate",
-    "run",
-];
-
 /// Enforce `standards/make.md` against this project's Makefile.
 ///
-/// The structural half (lifecycle target set, strict shell, default
-/// goal) is a transcription of the standard. The half that earns the
-/// phase is the last one: every `fluxor <verb>` the Makefile names is
-/// resolved against the *live* CLI, so a verb that is renamed or
-/// retired fails here on the day it moves rather than in a sibling
-/// repo weeks later. Nothing about the check needs updating when the
-/// CLI changes — it asks the binary.
+/// The rules themselves — preamble, target set, canonical recipe
+/// bodies, §3 recipe complexity — live in [`crate::makefile_lint`],
+/// which is pure text and unit-tested as such. What this wrapper adds
+/// is the live CLI: every `fluxor <verb>` the Makefile names is
+/// resolved against *this binary's* command set, so a verb that is
+/// renamed or retired fails here on the day it moves rather than in a
+/// sibling repo weeks later. Nothing about the check needs updating
+/// when the CLI changes — it asks the binary.
 fn run_makefile(project_root: &Path) -> std::result::Result<(), String> {
     let path = project_root.join("Makefile");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(()); // fmod-only projects ship no Makefile
     };
-    let mut problems: Vec<String> = Vec::new();
-
-    // Compared whitespace-insensitively: the skeleton aligns its `:=`
-    // columns and real Makefiles do not always follow.
-    let squashed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    for want in [
-        ".DEFAULT_GOAL := build",
-        "SHELL := /bin/bash",
-        ".SHELLFLAGS := -euo pipefail -c",
-    ] {
-        if !squashed.contains(want) {
-            problems.push(format!("missing `{want}` (§2)"));
-        }
-    }
-
-    let defined: BTreeSet<&str> = text
-        .lines()
-        .filter(|l| !l.starts_with('\t'))
-        .filter_map(|l| l.split_once(':'))
-        .map(|(name, _)| name.trim())
-        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
-        .collect();
-    for want in LIFECYCLE_TARGETS {
-        if !defined.contains(want) {
-            problems.push(format!("no `{want}:` target (§1.1)"));
-        }
-    }
-    for bad in FORBIDDEN_TARGETS {
-        if defined.contains(bad) {
-            problems.push(format!(
-                "`{bad}:` renames a CLI command or splits a lifecycle stage (§1)"
-            ));
-        }
-    }
-
     let verbs = cli_verbs();
-    if !verbs.is_empty() {
-        for (n, line) in text.lines().enumerate() {
-            for verb in command_verbs(line) {
-                if !verbs.contains(&verb) {
-                    problems.push(format!(
-                        "line {}: `fluxor {verb}` is not a CLI command — retired or renamed \
-                         (§5: update every in-tree reference in the same change)",
-                        n + 1
-                    ));
-                }
-            }
-        }
+    let mut problems: Vec<String> = crate::makefile_lint::check(&text, &verbs)
+        .iter()
+        .map(|v| v.render("Makefile"))
+        .collect();
+
+    // The scripts §3 sends complexity into are part of the same surface:
+    // a Makefile one line long that calls a script naming a retired verb
+    // is drift the Makefile check cannot see.
+    for script in shell_scripts(project_root) {
+        let Ok(body) = std::fs::read_to_string(project_root.join(&script)) else {
+            continue;
+        };
+        problems.extend(
+            crate::makefile_lint::check_script(&body, &verbs)
+                .iter()
+                .map(|v| v.render(&script)),
+        );
     }
 
     if problems.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "Makefile deviates from standards/make.md:\n  {}",
+        "deviates from standards/make.md:\n  {}",
         problems.join("\n  ")
     ))
 }
 
-/// The verbs one Makefile line names in *command position*, which is
-/// the only position that has to resolve. A command reference either
-/// opens a backtick span or starts the line's payload — after the
-/// recipe tab, an `@echo "`, a `#`, and any indent. Everything else on
-/// a line is prose ("no fluxor launcher is on PATH", "composed into
-/// fluxor graphs"), and a path ending in `/fluxor` is not a command at
-/// all. A trailing `:` marks a heading, not an invocation.
-fn command_verbs(line: &str) -> Vec<String> {
-    let mut spans: Vec<&str> = line.split('`').skip(1).step_by(2).collect();
-    let payload = line
-        .trim_start()
-        .trim_start_matches("@echo \"")
-        .trim_start_matches('#')
-        .trim_start();
-    spans.push(payload);
-
-    spans
-        .into_iter()
-        .filter_map(|s| s.strip_prefix("fluxor "))
-        .filter_map(|rest| {
-            let verb: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
-                .collect();
-            let heading = rest[verb.len()..].starts_with(':');
-            (!verb.is_empty() && !heading).then_some(verb)
-        })
+/// Tracked `*.sh` under `tools/` and `scripts/` — the two directories
+/// §3 sanctions for recipe complexity and `fluxor help --make` walks.
+/// Tracked only, so an untracked local experiment is not gated.
+fn shell_scripts(project_root: &Path) -> Vec<String> {
+    let Ok(out) = Command::new("git")
+        .args(["ls-files", "tools/*.sh", "scripts/*.sh"])
+        .current_dir(project_root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
         .collect()
 }
 
@@ -1137,6 +1105,10 @@ fn run_presentation(project_root: &Path) -> std::result::Result<(), String> {
 /// `fluxor.toml::[[ci.lints.exemption]]`). New `cargo new` crates
 /// don't inherit workspace lints by default; this check catches that
 /// drift.
+///
+/// An exemption names a **crate name**, never a member path — the one
+/// semantic the schema phase enforces (`ci_schema`), applied here by
+/// resolving each member's `[package] name` before the comparison.
 fn check_workspace_lint_optin(project_root: &Path) -> std::result::Result<(), String> {
     // Read workspace Cargo.toml to enumerate members.
     let manifest_path = project_root.join("Cargo.toml");
@@ -1174,7 +1146,6 @@ fn check_workspace_lint_optin(project_root: &Path) -> std::result::Result<(), St
             }
             #[derive(serde::Deserialize)]
             struct Exemption {
-                crate_: Option<String>,
                 #[serde(rename = "crate")]
                 crate_field: Option<String>,
             }
@@ -1185,7 +1156,7 @@ fn check_workspace_lint_optin(project_root: &Path) -> std::result::Result<(), St
                 .map(|l| {
                     l.exemption
                         .into_iter()
-                        .filter_map(|e| e.crate_field.or(e.crate_))
+                        .filter_map(|e| e.crate_field)
                         .collect()
                 })
                 .unwrap_or_default()
@@ -1194,9 +1165,16 @@ fn check_workspace_lint_optin(project_root: &Path) -> std::result::Result<(), St
         }
     };
 
+    // Member path → package name, so an exemption written as a name
+    // (the one semantic) matches the member it names.
+    let names: std::collections::HashMap<String, String> =
+        crate::ci_schema::workspace_members(project_root)
+            .into_iter()
+            .collect();
+
     let mut bad = Vec::new();
     for member in &members {
-        if exempt.contains(member) {
+        if names.get(member).is_some_and(|n| exempt.contains(n)) {
             continue;
         }
         let path = project_root.join(member).join("Cargo.toml");
@@ -1456,9 +1434,10 @@ fn check_lockfile_consistency(project_root: &Path) -> std::result::Result<(), St
 /// bumps only when the wire ABI changes, so consumers re-pin at
 /// most once per breaking-change cycle.
 ///
-/// Legacy form: `fluxor.toml::[required].fluxor.rev = "<sha>"` —
-/// installed-CLI source SHA must match. Honoured for projects that
-/// need hermetic vendoring. If both fields are set, `abi` wins.
+/// Exact form: `fluxor.toml::[required].fluxor.rev = "<sha>"` — the
+/// installed CLI's source SHA must match. For projects that vendor
+/// hermetically and want the whole tree pinned, not just the wire
+/// ABI. If both fields are set, `abi` wins.
 fn check_version_skew(project_root: &Path) -> std::result::Result<(), String> {
     let fp = project_root.join("fluxor.toml");
     if !fp.exists() {
@@ -1578,7 +1557,7 @@ fn modules_clippy_check(project_root: &Path, verbose: bool) -> std::result::Resu
 /// unconfigured, which omits the phase entirely. A fluxor.toml that
 /// exists but can't be read or parsed is an error — a broken config must
 /// fail the phase, never silently omit it.
-fn load_test_scripts(project_root: &Path) -> std::result::Result<Vec<String>, String> {
+pub(crate) fn load_test_scripts(project_root: &Path) -> std::result::Result<Vec<String>, String> {
     let fp = project_root.join("fluxor.toml");
     if !fp.exists() {
         return Ok(Vec::new());
@@ -1608,7 +1587,7 @@ fn load_test_scripts(project_root: &Path) -> std::result::Result<Vec<String>, St
 /// component) relative to `project_root`, appending matches to `out`.
 /// Dependency-free — covers the `scripts/*-e2e.sh` shape without pulling
 /// in a glob crate.
-fn expand_glob(project_root: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
+pub(crate) fn expand_glob(project_root: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
     let (dir_part, file_pat) = match pattern.rsplit_once('/') {
         Some((d, f)) => (d, f),
         None => (".", pattern),
@@ -1646,7 +1625,7 @@ fn expand_glob(project_root: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
 /// the project's runtime gate. Aggregates: fails if any script exits
 /// non-zero, naming the failures and dumping a tail of each one's output
 /// so a CI log shows what broke without a re-run.
-fn run_test_scripts(
+pub(crate) fn run_test_scripts(
     project_root: &Path,
     globs: &[String],
     verbose: bool,
@@ -1671,6 +1650,14 @@ fn run_test_scripts(
     }
     scripts.sort();
     scripts.dedup();
+    vacuity(
+        "project-e2e",
+        scripts.len(),
+        globs.len(),
+        "`[ci.test] scripts` glob(s) are declared",
+        "every glob expanded to nothing — the scripts were moved, renamed, or are not in \
+         this checkout",
+    )?;
     let mut failed = Vec::new();
     for script in &scripts {
         let name = script
@@ -1724,16 +1711,150 @@ fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::
     };
     let report = modules_build::run(&opts).map_err(|e| e.to_string())?;
     let mut failed = Vec::new();
+    let mut considered = 0usize;
     for tr in &report.per_target {
+        considered += tr.built.len() + tr.up_to_date.len() + tr.skipped.len() + tr.failed.len();
         if !tr.failed.is_empty() {
             failed.push(format!("{}: {} failed", tr.target, tr.failed.len()));
         }
     }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(failed.join("; "))
+    if !failed.is_empty() {
+        return Err(failed.join("; "));
     }
+    vacuity(
+        "modules-build (strict)",
+        considered,
+        module_manifest_count(project_root),
+        "module manifest(s) exist under `modules/`",
+        "they are in a flat `modules/<name>/` layout the tiers do not cover \
+         (standards/fluxor-modules.md §0.1), or `[ci] targets` names no target",
+    )
+}
+
+/// Every `manifest.toml` under `modules/`, whatever layout it is in.
+///
+/// Deliberately *not* the tier walk: the point of the count is to
+/// notice modules the tier walk cannot see. A repo with 36 modules in a
+/// layout the builder does not discover reported `built 0 of 0` in 0 ms
+/// and passed — that is the shape of an unmigrated repo, and it must
+/// read as a failure, not as "no modules".
+fn module_manifest_count(project_root: &Path) -> usize {
+    let root = project_root.join("modules");
+    if !root.is_dir() {
+        return 0;
+    }
+    walkdir::WalkDir::new(&root)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_name() == "manifest.toml")
+        .count()
+}
+
+/// The vacuity rule, in one place: **a phase that consumed nothing
+/// while its inputs exist is a failure, not a pass.**
+///
+/// Green-and-empty is the failure mode that survived the last sweep —
+/// `built 0 of 0` in 0 ms, a cargo phase that executed no test, an e2e
+/// phase whose globs matched no file. Each read as a pass because
+/// nothing asserted otherwise. A repo that genuinely has no modules, no
+/// tests, or no scripts still passes: `inputs == 0` is not a failure,
+/// `inputs > 0 && consumed == 0` is.
+fn vacuity(
+    phase: &str,
+    consumed: usize,
+    inputs: usize,
+    inputs_desc: &str,
+    likely_cause: &str,
+) -> std::result::Result<(), String> {
+    if inputs == 0 || consumed > 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "`{phase}` processed nothing while {inputs} {inputs_desc} — a phase that consumes none \
+         of its inputs proves nothing, so it fails rather than reads green. Likely cause: \
+         {likely_cause}"
+    ))
+}
+
+/// A cargo test phase that must have executed a test.
+///
+/// The run itself is the gate; the count that follows is the assertion
+/// that the gate had something to hold. `-- --list` is libtest's own
+/// enumeration (not a parse of pass/fail prose), and integration-test
+/// targets come from `cargo metadata` — so "the tree has tests but this
+/// phase ran none" is a structural comparison of two machine surfaces.
+fn cargo_test_phase(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
+    cargo_in(dir, args)?;
+    let executed = libtest_case_count(dir, args);
+    if executed > 0 {
+        return Ok(());
+    }
+    let integration = integration_test_targets(dir);
+    if integration.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "`cargo {}` executed 0 tests, but this cargo tree declares integration test target(s) \
+         ({}) — either the selector does not reach them or their sources are absent from the \
+         checkout (a `tests/` tree that is gitignored and shadow-tracked is present only on the \
+         machine that wrote it; standards/test-tracking.md §7)",
+        args.join(" "),
+        integration.join(", ")
+    ))
+}
+
+/// Test cases the same invocation enumerates, via libtest's `--list`.
+fn libtest_case_count(dir: &Path, args: &[&str]) -> usize {
+    let mut full: Vec<&str> = args.to_vec();
+    full.extend_from_slice(&["--", "--list"]);
+    let Ok(out) = Command::new("cargo").current_dir(dir).args(&full).output() else {
+        return 0;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.ends_with(": test") || l.ends_with(": benchmark"))
+        .count()
+}
+
+/// Names of `tests/**` integration targets in this cargo tree.
+fn integration_test_targets(dir: &Path) -> Vec<String> {
+    let output = Command::new("cargo")
+        .arg("metadata")
+        .args(["--format-version", "1", "--no-deps"])
+        .current_dir(dir)
+        .output();
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for pkg in parsed
+        .get("packages")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        for target in pkg
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            let is_test = target
+                .get("kind")
+                .and_then(|v| v.as_array())
+                .is_some_and(|k| k.iter().any(|v| v.as_str() == Some("test")));
+            if is_test {
+                if let Some(n) = target.get("name").and_then(|v| v.as_str()) {
+                    names.push(n.to_string());
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Format the summary block printed at end-of-run.
@@ -1770,30 +1891,27 @@ type _PathBufRef = PathBuf;
 mod tests {
     use super::*;
 
-    /// The verb scan reads command positions only. Prose that happens
-    /// to contain the word "fluxor" is not a command reference — the
-    /// distinction is the whole reason the phase is usable across
-    /// nineteen hand-written Makefiles.
+    /// Vacuity, stated once: inputs without consumption is a failure;
+    /// no inputs at all is not. The second half is what keeps a repo
+    /// with genuinely no modules, tests, or scripts green.
     #[test]
-    fn command_verbs_reads_commands_not_prose() {
-        // Command positions: recipe, help table, backticked comment.
-        assert_eq!(command_verbs("\tfluxor sync"), ["sync"]);
-        assert_eq!(
-            command_verbs("\t@echo \"  fluxor modules build [--target …]   PIC modules\""),
-            ["modules"]
-        );
-        assert_eq!(
-            command_verbs("# the CLI directly (`fluxor build --check …`)"),
-            ["build"]
-        );
-        // Prose, headings, and paths carry no command.
-        assert!(command_verbs("\t@echo \"fluxor lifecycle:\"").is_empty());
+    fn vacuity_fails_only_when_inputs_exist_and_none_were_consumed() {
+        assert!(vacuity("p", 0, 0, "things", "cause").is_ok());
+        assert!(vacuity("p", 7, 7, "things", "cause").is_ok());
+        assert!(vacuity("p", 1, 36, "things", "cause").is_ok());
+        let e = vacuity(
+            "modules-build (strict)",
+            0,
+            36,
+            "module manifest(s)",
+            "flat layout",
+        )
+        .unwrap_err();
         assert!(
-            command_verbs("\t@echo \"  make check-install  no fluxor launcher on PATH\"")
-                .is_empty()
+            e.contains("processed nothing while 36 module manifest(s)"),
+            "{e}"
         );
-        assert!(command_verbs("\trust-objcopy -O binary target/release/fluxor out.bin").is_empty());
-        assert!(command_verbs("# composed into fluxor graphs in `packaging/`").is_empty());
+        assert!(e.contains("flat layout"), "{e}");
     }
 
     #[test]

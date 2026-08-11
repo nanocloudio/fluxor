@@ -384,7 +384,7 @@ impl OciStore {
         // leaves the blobs in place and warns rather than failing the
         // publish — a bounded leak is preferable to a failed publish.
         if !displaced.is_empty() {
-            match self.sweep_candidates(&index, &displaced) {
+            match self.sweep_with_roots(&index, &displaced) {
                 Ok(_removed) => {}
                 Err(e) => eprintln!(
                     "warning: retag of '{ref_name}' could not sweep the displaced \
@@ -393,40 +393,6 @@ impl OciStore {
             }
         }
         Ok(desc)
-    }
-
-    /// Delete every blob in `victims`' closures that no manifest in `index`
-    /// still reaches. Fails (deleting nothing) if any live manifest is
-    /// unreadable — an unknown layer set is never swept around.
-    fn sweep_candidates(&self, index: &ImageIndex, victims: &[Descriptor]) -> Result<Vec<String>> {
-        let mut live: BTreeSet<String> = BTreeSet::new();
-        for d in &index.manifests {
-            // `add_closure` traverses image manifests AND image
-            // indexes (project indexes, snapshots) — a project-index
-            // descriptor must not be parsed as a manifest.
-            self.add_closure(d, &mut live).map_err(|e| {
-                Error::Config(format!("live manifest {} is unreadable ({e})", d.digest))
-            })?;
-        }
-        let mut candidates: BTreeSet<String> = BTreeSet::new();
-        for v in victims {
-            candidates.insert(v.digest.clone());
-            let mut c = BTreeSet::new();
-            if self.add_closure(v, &mut c).is_ok() {
-                candidates.extend(c);
-            }
-        }
-        let mut removed = Vec::new();
-        for digest in candidates {
-            if !live.contains(&digest) {
-                let path = self.blob_path(&digest)?;
-                if path.exists() {
-                    fs::remove_file(&path)?;
-                    removed.push(digest);
-                }
-            }
-        }
-        Ok(removed)
     }
 
     /// Resolve a reference — a tag (`name:ver`), a full `sha256:<hex>`
@@ -557,7 +523,7 @@ impl OciStore {
 
         // Sweep the victim's now-unreachable closure. Readability of every
         // remaining manifest was proven above, before the index write.
-        self.sweep_candidates(&index, core::slice::from_ref(&victim))
+        self.sweep_with_roots(&index, core::slice::from_ref(&victim))
     }
 }
 
@@ -1151,9 +1117,15 @@ impl OciStore {
         Ok(())
     }
 
-    /// Sweep `victims`' closures against the full liveness root set:
-    /// every index tag (traversed through indexes), plus every
-    /// `sha256:` digest pinned by a workspace member's `fluxor.lock`.
+    /// The store's ONE garbage collector. Sweep `victims`' closures
+    /// against the full liveness root set: every index tag (traversed
+    /// through indexes — a project-index descriptor is never parsed as
+    /// a manifest), plus every `sha256:` digest pinned by a workspace
+    /// member's `fluxor.lock`.
+    ///
+    /// Every path that can orphan a blob — publish, retag, `remove` —
+    /// sweeps through here, so a blob a member lockfile pins is never
+    /// evicted regardless of which command triggered the sweep.
     /// An unreadable member lockfile fails CLOSED for the sweep only —
     /// warn and delete nothing; the publish that triggered the sweep
     /// has already succeeded (registry_consolidation.md, GC rules).
@@ -1503,7 +1475,11 @@ mod tests {
 
     #[test]
     fn remove_deletes_unreferenced_blobs_but_keeps_shared_ones() {
+        // Sweep liveness includes member lockfiles; point at a file that
+        // does not exist so the roots are the index alone.
+        let _env = test_env_lock();
         let (_dir, store) = temp_store();
+        std::env::set_var("FLUXOR_WORKSPACE", _dir.path().join("no-workspace.toml"));
         // Two tags over the same fmod bytes → shared blob.
         let a = publish_test_module(&store, "blinky", b"shared", "blinky:1.0.0");
         let _b = publish_test_module(&store, "blinky", b"shared", "blinky:1.0.1");
@@ -1518,8 +1494,63 @@ mod tests {
         // with nothing now, fmod blob too).
         let manifest = store.read_manifest(&a).unwrap();
         let removed = store.remove("blinky:1.0.1").unwrap();
+        std::env::remove_var("FLUXOR_WORKSPACE");
         assert!(removed.contains(&manifest.layers[0].digest));
         assert!(!store.has_blob(&manifest.layers[0].digest));
+    }
+
+    /// Every sweep — publish/retag and `store rm` alike — runs the same
+    /// liveness root set, so a blob pinned ONLY by a workspace member's
+    /// `fluxor.lock` (no tag reaches it) is never evicted. Before the
+    /// sweeps were unified, both paths used index-closure liveness only
+    /// and evicted the member's pinned blob out from under it.
+    #[test]
+    fn member_lockfile_pinned_blob_survives_retag_and_remove() {
+        let _env = test_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = OciStore::open(dir.path().join("store")).expect("open");
+
+        // A member checkout whose lockfile pins the fmod bytes' digest.
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        let pinned = sha256_hex_prefixed(b"pinned");
+        std::fs::write(
+            member.join("fluxor.lock"),
+            format!("[[artifact]]\nname = \"widget\"\ndigest = \"{pinned}\"\n"),
+        )
+        .unwrap();
+        let ws_file = dir.path().join("workspace.toml");
+        std::fs::write(
+            &ws_file,
+            format!(
+                "[workspace]\nmembers = [\"{}\"]\n",
+                member.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        std::env::set_var("FLUXOR_WORKSPACE", &ws_file);
+
+        // (a) A retag that displaces the only manifest reaching the blob.
+        publish_test_module(&store, "widget", b"pinned", "widget:latest");
+        assert!(store.has_blob(&pinned), "publish stored the fmod blob");
+        publish_test_module(&store, "widget", b"changed", "widget:latest");
+        assert!(
+            store.has_blob(&pinned),
+            "retag swept a blob pinned by a member lockfile"
+        );
+
+        // (b) A `store rm` of the only tag reaching the blob.
+        publish_test_module(&store, "blinky", b"pinned", "blinky:1.0.0");
+        let removed = store.remove("blinky:1.0.0").unwrap();
+        std::env::remove_var("FLUXOR_WORKSPACE");
+        assert!(
+            !removed.contains(&pinned),
+            "store rm reported sweeping a member-pinned blob: {removed:?}"
+        );
+        assert!(
+            store.has_blob(&pinned),
+            "store rm swept a blob pinned by a member lockfile"
+        );
     }
 
     fn bundle_fixture(store: &OciStore) -> (String, Vec<u8>, Vec<u8>) {

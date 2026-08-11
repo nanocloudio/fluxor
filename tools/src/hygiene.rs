@@ -9,11 +9,18 @@
 //!        `max_inline_lines`.
 //!      - `#[allow]` discipline: every `#[allow(...)]` and
 //!        `#![allow(...)]` must carry `reason = "..."`.
-//!   3. Skip directories named `generated/`, `target/`, `.git/`,
+//!      - SDK-mount rule: `#[path]`/`include!` mounts must read the
+//!        staged, digest-verified `target/fluxor/**` tree, never a
+//!        raw `deps/<project>/modules/{sdk,common}/` checkout.
+//!   3. Whole-repo checks:
+//!      - Module-structure rules over `modules/**`.
+//!      - Shadow-guard rules over the shadow-tracked test tiers.
+//!      - Repo-file conformance (files a standard mandates at root).
+//!   4. Skip directories named `generated/`, `target/`, `.git/`,
 //!      `node_modules/`, `.context/`; skip files starting with
 //!      `// @generated` on the first line.
-//!   4. Single-pass — emit every violation, exit non-zero at end.
-//!   5. Validate exemptions: paths must exist, `expires` must not be
+//!   5. Single-pass — emit every violation, exit non-zero at end.
+//!   6. Validate exemptions: paths must exist, `expires` must not be
 //!      in the past, and the file must still violate the named rule
 //!      (otherwise the exemption has silently rotted).
 
@@ -32,6 +39,9 @@ pub enum Rule {
     InlineTests,
     AllowWithoutReason,
     ModuleStructure,
+    ShadowGuard,
+    SdkMount,
+    RepoFiles,
 }
 
 impl Rule {
@@ -40,6 +50,9 @@ impl Rule {
             Rule::InlineTests => "inline-tests",
             Rule::AllowWithoutReason => "allow-without-reason",
             Rule::ModuleStructure => "module-structure",
+            Rule::ShadowGuard => "shadow-guard",
+            Rule::SdkMount => "sdk-mount",
+            Rule::RepoFiles => "repo-files",
         }
     }
 
@@ -48,6 +61,9 @@ impl Rule {
             "inline-tests" => Some(Rule::InlineTests),
             "allow-without-reason" => Some(Rule::AllowWithoutReason),
             "module-structure" => Some(Rule::ModuleStructure),
+            "shadow-guard" => Some(Rule::ShadowGuard),
+            "sdk-mount" => Some(Rule::SdkMount),
+            "repo-files" => Some(Rule::RepoFiles),
             _ => None,
         }
     }
@@ -138,7 +154,10 @@ pub enum ConfigError {
     },
     #[error("unknown hygiene mode {0:?}: expected \"strict\" or \"permissive\"")]
     UnknownMode(String),
-    #[error("unknown hygiene rule {0:?}: expected \"inline-tests\" or \"allow-without-reason\"")]
+    #[error(
+        "unknown hygiene rule {0:?}: expected one of \"inline-tests\", \"allow-without-reason\", \
+         \"module-structure\", \"shadow-guard\", \"sdk-mount\", \"repo-files\""
+    )]
     UnknownRule(String),
 }
 
@@ -280,6 +299,11 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
 
     let mut exempt_applied: HashSet<(PathBuf, Rule)> = HashSet::new();
 
+    // fluxor owns the SDK sources; every other repo consumes them from
+    // the staged tree. `modules/sdk/abi_surface.rs` is the same marker
+    // the ABI pin test keys off.
+    let sdk_owner = project_root.join("modules/sdk/abi_surface.rs").is_file();
+
     let walker = walkdir::WalkDir::new(project_root)
         .follow_links(false)
         .into_iter()
@@ -311,7 +335,10 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         report.files_scanned += 1;
 
         let tier = classify_tier(&rel);
-        let file_violations = scan_file(&rel, &content, tier, config);
+        let mut file_violations = scan_file(&rel, &content, tier, config);
+        if !sdk_owner {
+            file_violations.extend(scan_sdk_mounts(&rel, &content));
+        }
         for v in file_violations {
             let key = (rel.clone(), v.rule);
             if exempt_lookup.contains(&key) {
@@ -323,6 +350,18 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     }
 
     scan_module_structure(
+        project_root,
+        &mut report,
+        &exempt_lookup,
+        &mut exempt_applied,
+    );
+    scan_shadow_guard(
+        project_root,
+        &mut report,
+        &exempt_lookup,
+        &mut exempt_applied,
+    );
+    scan_repo_files(
         project_root,
         &mut report,
         &exempt_lookup,
@@ -518,6 +557,310 @@ fn scan_module_structure(
     }
 }
 
+/// Record one whole-repo violation unless an `[[ci.hygiene.exemption]]`
+/// row covers the `(path, rule)` pair.
+fn push_repo_violation(
+    report: &mut Report,
+    exempt_lookup: &HashSet<(PathBuf, Rule)>,
+    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
+    rel: PathBuf,
+    rule: Rule,
+    message: String,
+) {
+    let key = (rel.clone(), rule);
+    if exempt_lookup.contains(&key) {
+        exempt_applied.insert(key);
+        return;
+    }
+    report.violations.push(Violation {
+        path: rel,
+        line: 0,
+        rule,
+        message,
+    });
+}
+
+/// The tree tiers [`test-tracking.md §1`] shadow-tracks. `fuzz/` and
+/// `fixtures/` are listed by the standard and by the projects that use
+/// them; a tier only participates when it exists on disk.
+const SHADOW_TIERS: [&str; 5] = ["tests", "benches", "examples", "fixtures", "fuzz"];
+
+/// Shadow-tracking conformance (standards/test-tracking.md §4, §7) —
+/// the native replacement for the per-repo `tools/ci-shadow-guard.sh`
+/// copies. For every tier that exists on disk:
+///
+/// - a repo with a shadow repo (`.git-shadow/`) must exclude the tier
+///   from the primary repo, un-exclude it in `.git-shadow/info/exclude`,
+///   and actually have it committed there (an initialised-but-unborn
+///   shadow repo versions nothing);
+/// - a repo with no shadow repo must not gitignore the tier — a
+///   gitignored-only tier exists on exactly one machine and has no
+///   recovery path (§1's explicit failure mode).
+fn scan_shadow_guard(
+    project_root: &Path,
+    report: &mut Report,
+    exempt_lookup: &HashSet<(PathBuf, Rule)>,
+    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
+) {
+    let shadow_dir = project_root.join(".git-shadow");
+    let has_shadow = shadow_dir.is_dir();
+    let gitignore = fs::read_to_string(project_root.join(".gitignore")).unwrap_or_default();
+    let shadow_exclude =
+        fs::read_to_string(shadow_dir.join("info").join("exclude")).unwrap_or_default();
+
+    let present: Vec<&str> = SHADOW_TIERS
+        .iter()
+        .copied()
+        .filter(|t| project_root.join(t).is_dir())
+        .collect();
+
+    if !has_shadow {
+        for tier in present {
+            if !ignore_file_lists_tier(&gitignore, tier, false) {
+                continue;
+            }
+            push_repo_violation(
+                report,
+                exempt_lookup,
+                exempt_applied,
+                PathBuf::from(tier),
+                Rule::ShadowGuard,
+                format!(
+                    "`{tier}/` is gitignored in the primary repo and there is no `.git-shadow/` \
+                     — its contents are versioned nowhere and exist only on this machine. \
+                     Run the standards/test-tracking.md §4 setup (init `.git-shadow`, invert the \
+                     excludes, `git shadow add -A && git shadow commit`), or drop `{tier}/` from \
+                     .gitignore and track it in the primary repo"
+                ),
+            );
+        }
+        return;
+    }
+
+    let born = shadow_repo_is_born(&shadow_dir);
+    if !born {
+        push_repo_violation(
+            report,
+            exempt_lookup,
+            exempt_applied,
+            PathBuf::from(".git-shadow"),
+            Rule::ShadowGuard,
+            "`.git-shadow/` is initialised but has no commits — the shadow-tracked tiers are \
+             versioned nowhere, which is compliance shape without compliance. Run \
+             `git shadow add -A && git shadow commit -m \"Initial shadow-tracked tests/benches\"` \
+             (standards/test-tracking.md §4 step 5)"
+                .to_string(),
+        );
+    }
+
+    for tier in present {
+        // A tier with files tracked in the PRIMARY repo is primary-
+        // tracked by choice — fluxor's `examples/` is the onboarding
+        // catalog the docs link to. Having a shadow repo does not make
+        // every tier a shadow tier, and demanding `/examples/` in
+        // .gitignore would untrack the catalog to satisfy a rule about
+        // where tests live.
+        if primary_tracks_tier(project_root, tier) {
+            continue;
+        }
+        if !ignore_file_lists_tier(&gitignore, tier, false) {
+            push_repo_violation(
+                report,
+                exempt_lookup,
+                exempt_applied,
+                PathBuf::from(tier),
+                Rule::ShadowGuard,
+                format!(
+                    "`{tier}/` is a shadow-tracked tier but is not excluded from the primary \
+                     repo — add `/{tier}/` to .gitignore, or it reaches the shared remote \
+                     (standards/test-tracking.md §4 step 1)"
+                ),
+            );
+        }
+        if !ignore_file_lists_tier(&shadow_exclude, tier, true) {
+            push_repo_violation(
+                report,
+                exempt_lookup,
+                exempt_applied,
+                PathBuf::from(tier),
+                Rule::ShadowGuard,
+                format!(
+                    "`{tier}/` is not un-excluded in .git-shadow/info/exclude — the shadow repo \
+                     tracks nothing under it, so the tier is versioned nowhere. Add `!/{tier}/` \
+                     there (standards/test-tracking.md §4 step 3)"
+                ),
+            );
+            continue;
+        }
+        if born && shadow_tier_is_empty(&shadow_dir, project_root, tier) {
+            push_repo_violation(
+                report,
+                exempt_lookup,
+                exempt_applied,
+                PathBuf::from(tier),
+                Rule::ShadowGuard,
+                format!(
+                    "`{tier}/` exists on disk and is un-excluded in .git-shadow/info/exclude, but \
+                     no file under it is committed in the shadow repo — run \
+                     `git shadow add -A {tier} && git shadow commit` \
+                     (standards/test-tracking.md §5)"
+                ),
+            );
+        }
+    }
+}
+
+/// Does an exclude file list `tier`? `negated` selects the shadow
+/// repo's inverted form (`!/tests/`) over the primary form (`/tests/`).
+/// All four anchoring spellings git accepts are recognised.
+fn ignore_file_lists_tier(contents: &str, tier: &str, negated: bool) -> bool {
+    contents.lines().any(|line| {
+        let line = line.trim();
+        let Some(rest) = (if negated {
+            line.strip_prefix('!')
+        } else if line.starts_with('!') || line.starts_with('#') {
+            None
+        } else {
+            Some(line)
+        }) else {
+            return false;
+        };
+        let rest = rest.trim_start_matches('/').trim_end_matches('/');
+        rest == tier
+    })
+}
+
+/// A git repository is "born" once a branch ref exists — loose under
+/// `refs/heads/` or in `packed-refs`. Read from the git-dir directly so
+/// the check works without invoking git.
+/// Does the primary repo track anything under this tier? A non-empty
+/// `git ls-files <tier>` is the only signal that settles it, and it is
+/// the repo's own answer rather than a list this rule would have to
+/// keep.
+fn primary_tracks_tier(project_root: &Path, tier: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["ls-files", "--", tier])
+        .current_dir(project_root)
+        .output()
+        .is_ok_and(|o| !o.stdout.is_empty())
+}
+
+fn shadow_repo_is_born(shadow_dir: &Path) -> bool {
+    let heads = shadow_dir.join("refs").join("heads");
+    let loose = walkdir::WalkDir::new(&heads)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .any(|e| e.file_type().is_file());
+    if loose {
+        return true;
+    }
+    fs::read_to_string(shadow_dir.join("packed-refs"))
+        .is_ok_and(|s| s.lines().any(|l| l.contains("refs/heads/")))
+}
+
+/// Is `tier` absent from the shadow repo's committed tree? Needs git
+/// itself (the tree is packed); if git can't be run the check is
+/// skipped rather than guessed at, so it never reports a false
+/// violation on a machine without git.
+fn shadow_tier_is_empty(shadow_dir: &Path, project_root: &Path, tier: &str) -> bool {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(shadow_dir)
+        .arg("--work-tree")
+        .arg(project_root)
+        .args(["ls-tree", "-r", "--name-only", "HEAD", "--", tier])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => o.stdout.is_empty(),
+        _ => false,
+    }
+}
+
+/// SDK-mount rule (standards/dependencies.md): a consuming project
+/// mounts fluxor's SDK — and any sibling's shared source tree — from
+/// the staged, digest-verified tree `fluxor sync` materialises under
+/// `target/fluxor/`, never from a raw `deps/<project>/` checkout. A
+/// `deps/` mount has no pin, no digest, and no staleness signal.
+fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for (idx, line) in src.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("#[path") || trimmed.contains("include!(")) {
+            continue;
+        }
+        let Some(pos) = line.find("deps/") else {
+            continue;
+        };
+        let tail = &line[pos..];
+        let staged = if tail.contains("/modules/sdk/") {
+            "target/fluxor/fluxor-abi/sdk/"
+        } else if tail.contains("/modules/common/") {
+            "target/fluxor/<project>-common/"
+        } else {
+            continue;
+        };
+        out.push(Violation {
+            path: rel.to_path_buf(),
+            line: idx + 1,
+            rule: Rule::SdkMount,
+            message: format!(
+                "raw `deps/` source mount — no pin, no digest, no staleness signal. Mount the \
+                 staged tree `{staged}...` that `fluxor sync` materialises \
+                 (standards/dependencies.md)"
+            ),
+        });
+    }
+    out
+}
+
+/// Repo-file conformance: files a standard *states* a project carries
+/// at its root. Only standard-grounded entries live here — a required
+/// file with no standard behind it would be exactly the hand-written
+/// variant this rule exists to remove.
+///
+/// - `clippy.toml` — standards/lints.md §6 ("Workspace-shared
+///   `clippy.toml` at repo root"), for the lints that take
+///   configuration rather than a level. Checked for Cargo workspaces
+///   only; a repo with no workspace root has nothing to share.
+///
+/// `rustfmt.toml`, `rust-toolchain.toml` and `LICENSE` are deliberately
+/// absent: no standard states whether a project carries them, so the
+/// spread across the ecosystem is an open owner decision, not a
+/// violation. See standards/lints.md §6.1.
+fn scan_repo_files(
+    project_root: &Path,
+    report: &mut Report,
+    exempt_lookup: &HashSet<(PathBuf, Rule)>,
+    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
+) {
+    let root_manifest = project_root.join("Cargo.toml");
+    let Ok(manifest) = fs::read_to_string(&root_manifest) else {
+        return;
+    };
+    if !manifest
+        .lines()
+        .any(|l| l.trim_start().starts_with("[workspace"))
+    {
+        return;
+    }
+    if project_root.join("clippy.toml").is_file() {
+        return;
+    }
+    push_repo_violation(
+        report,
+        exempt_lookup,
+        exempt_applied,
+        PathBuf::from("Cargo.toml"),
+        Rule::RepoFiles,
+        "workspace root carries no `clippy.toml` — standards/lints.md §6 states the \
+         configuration-taking lints (`disallowed-macros`, `disallowed-methods`) are configured \
+         in a workspace-shared `clippy.toml` at the repo root; without it those lints are \
+         unconfigured and silently enforce nothing"
+            .to_string(),
+    );
+}
+
 fn should_skip(entry: &walkdir::DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
@@ -525,7 +868,7 @@ fn should_skip(entry: &walkdir::DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
     matches!(
         name.as_ref(),
-        "target" | ".git" | "node_modules" | "generated" | ".context"
+        "target" | ".git" | ".git-shadow" | "node_modules" | "generated" | ".context"
     )
 }
 
@@ -586,8 +929,9 @@ fn scan_file(rel: &Path, src: &str, tier: Tier, config: &Config) -> Vec<Violatio
             out.push(Violation {
                 path: rel.to_path_buf(),
                 line: e.span().start().line,
-                // Re-use AllowWithoutReason as a catch-all for now; a
-                // dedicated `ParseError` rule can land later.
+                // A file that will not parse cannot be checked against
+                // any rule, so the rule field is a placeholder — the
+                // message is the finding.
                 rule: Rule::AllowWithoutReason,
                 message: format!("syn parse error: {e}"),
             });
@@ -912,6 +1256,13 @@ fn today_yyyy_mm_dd() -> String {
 
 // Howard Hinnant's date algorithm (civil_from_days). Public domain.
 // `z` is days since 1970-01-01 (the unix epoch).
+//
+// The kernel carries its own copy in
+// `src/platform/linux/owner_status.rs::rfc3339_utc`, and the two stay
+// separate deliberately: the CLI does not link the kernel crate, and the
+// shared crate both DO depend on — `fluxor-contracts` — is inside the
+// ABI-surface digest, so housing a date helper there would move the
+// epoch and cost every sibling a re-sync.
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -1133,6 +1484,300 @@ extern crate alloc;
             v.iter().all(|v| v.rule != Rule::InlineTests),
             "host-test feature gate should not be flagged: {v:?}"
         );
+    }
+
+    // ---- shadow-guard / sdk-mount / repo-files fixtures ----
+
+    /// Hermetic project root under the process temp dir. Dropped by
+    /// the caller via `fs::remove_dir_all` at the end of each test.
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "fluxor-hygiene-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp root");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn dir(&self, rel: &str) -> &Self {
+            fs::create_dir_all(self.0.join(rel)).expect("create dir");
+            self
+        }
+
+        fn file(&self, rel: &str, body: &str) -> &Self {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).expect("create parent");
+            }
+            fs::write(p, body).expect("write file");
+            self
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn shadow_report(root: &TempRoot, config: &Config) -> Vec<Violation> {
+        let mut report = Report::default();
+        let mut applied = HashSet::new();
+        let exempt: HashSet<(PathBuf, Rule)> = config
+            .exemptions
+            .iter()
+            .map(|e| (e.path.clone(), e.rule))
+            .collect();
+        scan_shadow_guard(root.path(), &mut report, &exempt, &mut applied);
+        report.violations
+    }
+
+    #[test]
+    fn shadow_guard_flags_gitignored_tier_with_no_shadow_repo() {
+        let root = TempRoot::new("noshadow");
+        root.dir("tests").file(".gitignore", "target/\n/tests/\n");
+        let v = shadow_report(&root, &strict());
+        assert_eq!(v.len(), 1, "got: {v:?}");
+        assert_eq!(v[0].rule, Rule::ShadowGuard);
+        assert_eq!(v[0].path, Path::new("tests"));
+        assert!(v[0].message.contains("versioned nowhere"));
+    }
+
+    #[test]
+    fn shadow_guard_ignores_primary_tracked_tier() {
+        // Not gitignored, no shadow repo: the primary repo tracks it.
+        // Converging that state is a separate decision, not this rule's.
+        let root = TempRoot::new("tracked");
+        root.dir("tests").file(".gitignore", "target/\n");
+        assert!(shadow_report(&root, &strict()).is_empty());
+    }
+
+    #[test]
+    fn shadow_guard_flags_unborn_shadow_repo() {
+        let root = TempRoot::new("unborn");
+        root.dir("tests")
+            .dir(".git-shadow/refs/heads")
+            .file(".gitignore", "/tests/\n")
+            .file(".git-shadow/info/exclude", "/*\n!/tests/\n");
+        let v = shadow_report(&root, &strict());
+        assert_eq!(v.len(), 1, "got: {v:?}");
+        assert_eq!(v[0].path, Path::new(".git-shadow"));
+        assert!(v[0].message.contains("no commits"));
+    }
+
+    #[test]
+    fn shadow_guard_flags_tier_missing_from_shadow_exclude() {
+        // lattice's silent hole: benches/ shadow-tracked in the comment,
+        // absent from the exclude file, so the shadow repo tracks none
+        // of it.
+        let root = TempRoot::new("hole");
+        root.dir("tests")
+            .dir("benches")
+            .file(".git-shadow/refs/heads/main", "0".repeat(40).as_str())
+            .file(".gitignore", "/tests/\n/benches/\n")
+            .file(".git-shadow/info/exclude", "/*\n!/tests/\n");
+        let v = shadow_report(&root, &strict());
+        assert_eq!(v.len(), 1, "got: {v:?}");
+        assert_eq!(v[0].path, Path::new("benches"));
+        assert!(v[0].message.contains("un-excluded"));
+    }
+
+    #[test]
+    fn shadow_guard_flags_tier_not_excluded_from_primary() {
+        let root = TempRoot::new("leak");
+        root.dir("examples")
+            .file(".git-shadow/refs/heads/main", "0".repeat(40).as_str())
+            .file(".gitignore", "target/\n")
+            .file(".git-shadow/info/exclude", "/*\n!/examples/\n");
+        let v = shadow_report(&root, &strict());
+        assert_eq!(v.len(), 1, "got: {v:?}");
+        assert!(v[0].message.contains("shared remote"));
+    }
+
+    #[test]
+    fn shadow_guard_accepts_a_conformant_setup() {
+        let root = TempRoot::new("ok");
+        root.dir("tests")
+            .dir("examples")
+            .file(".git-shadow/refs/heads/main", "0".repeat(40).as_str())
+            .file(".gitignore", "target/\n/tests/\n/examples/\n")
+            .file(
+                ".git-shadow/info/exclude",
+                "/*\n!/tests/\n!/examples/\n!/.gitignore\n",
+            );
+        // `shadow_tier_is_empty` needs a real git object store; the
+        // fixture has none, so the check declines rather than guesses.
+        assert!(shadow_report(&root, &strict()).is_empty());
+    }
+
+    #[test]
+    fn shadow_guard_honours_an_exemption_row() {
+        let root = TempRoot::new("exempt");
+        root.dir("tests").file(".gitignore", "/tests/\n");
+        let config = Config {
+            exemptions: vec![Exemption {
+                path: PathBuf::from("tests"),
+                rule: Rule::ShadowGuard,
+                expires: None,
+            }],
+            ..strict()
+        };
+        assert!(shadow_report(&root, &config).is_empty());
+    }
+
+    #[test]
+    fn ignore_spellings_all_match() {
+        for spelling in ["/tests/", "/tests", "tests/", "tests"] {
+            assert!(
+                ignore_file_lists_tier(spelling, "tests", false),
+                "{spelling}"
+            );
+            assert!(
+                ignore_file_lists_tier(&format!("!{spelling}"), "tests", true),
+                "!{spelling}"
+            );
+        }
+        // A negation is not an exclusion, a comment is not a rule, and
+        // a longer path is not the tier.
+        assert!(!ignore_file_lists_tier("!/tests/", "tests", false));
+        assert!(!ignore_file_lists_tier("#/tests/", "tests", false));
+        assert!(!ignore_file_lists_tier("/tests/fixtures/", "tests", false));
+    }
+
+    #[test]
+    fn shadow_born_detects_packed_refs() {
+        let root = TempRoot::new("packed");
+        root.file(
+            ".git-shadow/packed-refs",
+            "# pack-refs with: peeled\nabc123 refs/heads/main\n",
+        );
+        assert!(shadow_repo_is_born(&root.path().join(".git-shadow")));
+        let bare = TempRoot::new("bare");
+        bare.dir(".git-shadow/refs/heads");
+        assert!(!shadow_repo_is_born(&bare.path().join(".git-shadow")));
+    }
+
+    #[test]
+    fn sdk_mount_flags_deps_path_and_include() {
+        let src = r#"
+#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+mod abi;
+include!("../../../deps/fluxor/modules/sdk/runtime.rs");
+"#;
+        let v = scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src);
+        assert_eq!(v.len(), 2, "got: {v:?}");
+        assert!(v.iter().all(|v| v.rule == Rule::SdkMount));
+        assert!(v[0].message.contains("target/fluxor/fluxor-abi/sdk/"));
+        assert_eq!(v[0].line, 2);
+        assert_eq!(v[1].line, 4);
+    }
+
+    #[test]
+    fn sdk_mount_flags_sibling_common_tree() {
+        let src = "#[path = \"../../../deps/clustor/modules/common/kv.rs\"]\nmod kv;\n";
+        let v = scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src);
+        assert_eq!(v.len(), 1, "got: {v:?}");
+        assert!(v[0].message.contains("<project>-common"));
+    }
+
+    #[test]
+    fn sdk_mount_accepts_the_staged_tree() {
+        let src = r#"
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
+mod abi;
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+"#;
+        assert!(scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src).is_empty());
+    }
+
+    #[test]
+    fn sdk_mount_ignores_non_sdk_deps_mounts() {
+        // A cross-project module mount is a different question; this
+        // rule is about the staged source tree only.
+        let src = "#[path = \"../../../deps/fluxor/modules/foundation/http/mod.rs\"]\nmod http;\n";
+        assert!(scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src).is_empty());
+    }
+
+    fn repo_files_report(root: &TempRoot, config: &Config) -> Vec<Violation> {
+        let mut report = Report::default();
+        let mut applied = HashSet::new();
+        let exempt: HashSet<(PathBuf, Rule)> = config
+            .exemptions
+            .iter()
+            .map(|e| (e.path.clone(), e.rule))
+            .collect();
+        scan_repo_files(root.path(), &mut report, &exempt, &mut applied);
+        report.violations
+    }
+
+    #[test]
+    fn repo_files_requires_clippy_toml_in_a_workspace() {
+        let root = TempRoot::new("noclippy");
+        root.file("Cargo.toml", "[workspace]\nmembers = [\"a\"]\n");
+        let v = repo_files_report(&root, &strict());
+        assert_eq!(v.len(), 1, "got: {v:?}");
+        assert_eq!(v[0].rule, Rule::RepoFiles);
+        assert!(v[0].message.contains("clippy.toml"));
+    }
+
+    #[test]
+    fn repo_files_passes_with_clippy_toml() {
+        let root = TempRoot::new("clippy");
+        root.file("Cargo.toml", "[workspace]\n")
+            .file("clippy.toml", "disallowed-macros = []\n");
+        assert!(repo_files_report(&root, &strict()).is_empty());
+    }
+
+    #[test]
+    fn repo_files_skips_a_non_workspace_repo() {
+        let root = TempRoot::new("nows");
+        root.file("Cargo.toml", "[package]\nname = \"x\"\n");
+        assert!(repo_files_report(&root, &strict()).is_empty());
+    }
+
+    #[test]
+    fn repo_files_does_not_invent_ungrounded_requirements() {
+        // rustfmt.toml / rust-toolchain.toml / LICENSE are absent from
+        // this fixture and no standard mandates them, so the rule stays
+        // silent about them.
+        let root = TempRoot::new("ungrounded");
+        root.file("Cargo.toml", "[workspace]\n")
+            .file("clippy.toml", "\n");
+        assert!(repo_files_report(&root, &strict()).is_empty());
+    }
+
+    #[test]
+    fn repo_files_honours_an_exemption_row() {
+        let root = TempRoot::new("rfexempt");
+        root.file("Cargo.toml", "[workspace]\n");
+        let config = Config {
+            exemptions: vec![Exemption {
+                path: PathBuf::from("Cargo.toml"),
+                rule: Rule::RepoFiles,
+                expires: None,
+            }],
+            ..strict()
+        };
+        assert!(repo_files_report(&root, &config).is_empty());
+    }
+
+    #[test]
+    fn new_rules_round_trip_through_exemption_parsing() {
+        for name in ["shadow-guard", "sdk-mount", "repo-files"] {
+            let rule = Rule::parse(name).expect("rule parses");
+            assert_eq!(rule.as_str(), name);
+        }
     }
 
     #[test]

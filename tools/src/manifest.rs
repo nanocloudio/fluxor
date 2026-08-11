@@ -16,6 +16,34 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::hash::fnv1a_hash;
 
+/// The module tiers, in tier-table order
+/// (standards/fluxor-modules.md §0.1). A module lives in exactly one
+/// of these directories; the tier is its ownership/portability
+/// statement, never its delivery (`builtin = true` is a manifest key).
+///
+/// This is the ONE list. Every consumer — the builder, manifest
+/// source-tree lookup, config module search roots, scenario
+/// validation, module tests — walks these and only these, so a tier
+/// that resolves is a tier that builds and is tested. There is no
+/// flat `modules/<name>/` entry: §0.1's table has none, so neither
+/// does this. A project with a flat layout is unmigrated, and its
+/// modules do not resolve until it moves them into tiers.
+///
+/// `modules/common/` holds shared sources rather than modules; it
+/// carries no `manifest.toml`, and every consumer keys discovery off
+/// manifest presence, so listing it here is inert until a sibling
+/// project puts a real module there.
+pub const MODULE_TIERS: &[&str] = &[
+    "modules/foundation",
+    "modules/drivers",
+    "modules/platform/linux",
+    "modules/platform/wasm",
+    "modules/platform/qemu",
+    "modules/fixtures",
+    "modules/app",
+    "modules/common",
+];
+
 /// Manifest section magic: "FXMF"
 pub const MANIFEST_MAGIC: u32 = 0x464D5846;
 
@@ -1077,9 +1105,8 @@ impl Manifest {
     /// process — each module type is parsed at most once per
     /// invocation, including negative lookups.
     ///
-    /// Search paths cover both PIC modules (one of `drivers/`,
-    /// `foundation/`, `app/`, or the catch-all `modules/`) and
-    /// kernel-resident built-ins (under
+    /// Search paths are the tier list (`MODULE_TIERS`), covering both
+    /// PIC modules and kernel-resident built-ins (under
     /// `modules/platform/<platform>/<name>/`). See
     /// `docs/architecture/abi_layers.md` for what each tree is for.
     pub fn from_source_tree(module_type: &str) -> Result<Option<Self>> {
@@ -1095,16 +1122,7 @@ impl Manifest {
         // the install-root / sibling-checkout search roots below — the
         // published `fluxor-abi` source artifact ships `modules/sdk/**`
         // only, no per-platform manifests.
-        const SOURCE_TREE_DIRS: &[&str] = &[
-            "modules/drivers",
-            "modules/foundation",
-            "modules/app",
-            "modules/fixtures",
-            "modules/platform/linux",
-            "modules/platform/wasm",
-            "modules/platform/qemu",
-            "modules",
-        ];
+        const SOURCE_TREE_DIRS: &[&str] = MODULE_TIERS;
 
         // Search roots are walked in order:
         //   1. Project root (CWD-relative discovery via marker walk, or

@@ -191,6 +191,9 @@ struct Candidate {
     /// `[build] wasm_opt_level` from the manifest — per-module rustc
     /// `opt-level` for the wasm target. `None` keeps the default.
     wasm_opt_level: Option<String>,
+    /// `builtin = true`: a declaration of a kernel-resident module.
+    /// Inventoried, never built — it has no source of its own.
+    builtin: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -203,6 +206,12 @@ struct ManifestRaw {
     version: Option<String>,
     #[serde(default)]
     hardware_targets: Option<Vec<String>>,
+    /// `builtin = true` marks a manifest as a declaration of a
+    /// kernel-resident module: the implementation is compiled into
+    /// the kernel and the directory carries no entry file
+    /// (standards/fluxor-modules.md §0.1). There is nothing to build.
+    #[serde(default)]
+    builtin: bool,
     #[serde(default, rename = "type")]
     type_str: Option<String>,
     #[serde(default)]
@@ -247,16 +256,11 @@ struct VariantRaw {
 /// fails discovery loudly instead of surfacing as an opaque rustc error.
 const SUPPORTED_EDITIONS: &[&str] = &["2015", "2018", "2021", "2024"];
 
-const MODULE_DIRS: &[&str] = &[
-    "modules/drivers",
-    "modules/foundation",
-    "modules/app",
-    "modules/fixtures",
-];
-
-fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
+/// Every module the project declares, buildable or not — the
+/// inventory `fluxor modules list` reports.
+fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
     let mut out = Vec::new();
-    for dir in MODULE_DIRS {
+    for dir in crate::manifest::MODULE_TIERS {
         let root = project_root.join(dir);
         if !root.is_dir() {
             continue;
@@ -283,9 +287,15 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
             let raw_text = std::fs::read_to_string(&manifest).map_err(Error::from)?;
             let raw: ManifestRaw = toml::from_str(&raw_text)
                 .map_err(|e| Error::Module(format!("{}: {e}", manifest.display())))?;
+            let builtin = raw.builtin;
             let entry_rel = raw.entry.unwrap_or_else(|| "mod.rs".to_string());
             let entry = dir.join(&entry_rel);
-            if !entry.exists() {
+            // A `builtin = true` manifest is a declaration of a
+            // kernel-resident module (standards/fluxor-modules.md
+            // §0.1): the implementation is compiled into the kernel
+            // and the directory carries no entry file. Its absence is
+            // correct, not the broken-module case below.
+            if !builtin && !entry.exists() {
                 // A manifest pointing at a missing entry is a broken
                 // module, not an absent one — diagnose the skip so the
                 // module doesn't silently vanish from the build set.
@@ -323,6 +333,7 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
                     features: Vec::new(),
                     check_cfg_features: Vec::new(),
                     wasm_opt_level: wasm_opt_level.clone(),
+                    builtin,
                 }),
                 Some(variants) => {
                     // Expansion-level validation only; the full table
@@ -365,6 +376,7 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
                             features: v.features.clone(),
                             check_cfg_features: all.clone(),
                             wasm_opt_level: wasm_opt_level.clone(),
+                            builtin,
                         });
                     }
                 }
@@ -388,6 +400,16 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
         }
     }
     Ok(out)
+}
+
+/// The buildable subset of the inventory: `builtin = true` manifests
+/// are declarations of kernel-resident modules with no source of
+/// their own, so the build, fmt, and clippy sweeps never see them.
+fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
+    Ok(discover_all(project_root)?
+        .into_iter()
+        .filter(|c| !c.builtin)
+        .collect())
 }
 
 /// `--cfg feature="…"` + `--check-cfg` arguments for a variant
@@ -1218,8 +1240,12 @@ pub fn clean(opts: &BuildOpts) -> Result<usize> {
 
 /// `fluxor modules list` — human-readable inventory of every module
 /// discovered under the project's `modules/` tree.
+///
+/// Reports the whole inventory, `builtin = true` declarations
+/// included: they are modules a graph can bind, they just carry no
+/// source to build.
 pub fn list(project_root: &Path) -> Result<Vec<ModuleSummary>> {
-    let cands = discover(project_root)?;
+    let cands = discover_all(project_root)?;
     Ok(cands
         .into_iter()
         .map(|c| ModuleSummary {
@@ -1228,6 +1254,7 @@ pub fn list(project_root: &Path) -> Result<Vec<ModuleSummary>> {
             manifest: c.manifest,
             hardware_targets: c.hardware_targets,
             type_id: c.type_id,
+            builtin: c.builtin,
         })
         .collect())
 }
@@ -1239,16 +1266,28 @@ pub struct ModuleSummary {
     pub manifest: PathBuf,
     pub hardware_targets: Vec<String>,
     pub type_id: u8,
+    /// Kernel-resident declaration: no entry file exists at `entry`.
+    pub builtin: bool,
 }
 
 /// `fluxor modules resolve` — print the resolved `target/.../modules`
 /// directory for a given target, honouring the dual-root resolution
 /// from standards/fluxor-modules.md §6.
 pub fn resolve(project_root: &Path, out_root: &Path, target: &str) -> PathBuf {
-    // Fall back to the raw name if the registry doesn't know it — the
-    // caller is printing a path, not building; an unknown target still
-    // gets a deterministic answer.
-    let silicon = resolve_silicon(target, project_root).unwrap_or_else(|_| target.to_string());
+    // A BOARD is a legitimate subject here even though it is not a
+    // legitimate build target: its modules live in its silicon's
+    // directory, and where they live is the whole question. Going
+    // through `resolve_silicon` would take the board's level error and
+    // fall back to the board's own name — a directory that is always
+    // empty, handed to the callers who use this verb precisely so they
+    // need not know the layout.
+    //
+    // The raw-name fallback stays for a genuinely unknown target: the
+    // caller is printing a path, not building, and an unknown name
+    // still gets a deterministic answer.
+    let silicon = crate::target::load_target(target, project_root)
+        .map(|d| d.module_silicon().to_string())
+        .unwrap_or_else(|_| target.to_string());
     out_root.join(silicon).join("modules")
 }
 
@@ -1260,6 +1299,34 @@ mod tests {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.pop();
         p
+    }
+
+    /// `resolve` answers for a BOARD, which `resolve_silicon` rejects.
+    /// The two differ on purpose: you build silicon, but you ask where a
+    /// board's modules are, and the answer is its silicon's directory.
+    #[test]
+    fn resolve_maps_a_board_onto_its_silicon_directory() {
+        let root = repo_root();
+        let out = root.join("target/fluxor");
+        assert_eq!(
+            resolve(&root, &out, "pi5"),
+            out.join("bcm2712").join("modules"),
+            "a board must not resolve to a directory that never holds modules"
+        );
+        // Silicon and hosts are unchanged.
+        assert_eq!(
+            resolve(&root, &out, "bcm2712"),
+            out.join("bcm2712").join("modules")
+        );
+        assert_eq!(
+            resolve(&root, &out, "rp2350"),
+            out.join("rp2350").join("modules")
+        );
+        // An unknown name still gets a deterministic answer.
+        assert_eq!(
+            resolve(&root, &out, "not-a-target"),
+            out.join("not-a-target").join("modules")
+        );
     }
 
     #[test]
@@ -1304,6 +1371,47 @@ mod tests {
         assert_eq!(resolve_type_id("http", None), 2);
     }
 
+    /// Discovery walks the one tier list, so a `platform/` module is
+    /// found — and a `builtin = true` manifest there is a declaration
+    /// with no entry file, so it must be skipped as a non-candidate
+    /// rather than diagnosed as a broken module.
+    #[test]
+    fn discovery_covers_tiers_and_skips_builtin_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let builtin = root.join("modules/platform/linux/host_thing");
+        std::fs::create_dir_all(&builtin).unwrap();
+        std::fs::write(
+            builtin.join("manifest.toml"),
+            "version = \"1.0.0\"\nhardware_targets = [\"linux\"]\nbuiltin = true\n",
+        )
+        .unwrap();
+
+        let real = root.join("modules/fixtures/probe");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("manifest.toml"), "version = \"1.0.0\"\n").unwrap();
+        std::fs::write(real.join("mod.rs"), "// probe\n").unwrap();
+
+        // The inventory sees both tiers…
+        let all = discover_all(root).unwrap();
+        let mut names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["host_thing", "probe"],
+            "the tier list must reach platform/ and fixtures/"
+        );
+        // …and the build set does not include the declaration.
+        let buildable = discover(root).unwrap();
+        let names: Vec<&str> = buildable.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["probe"],
+            "builtin declarations are not build candidates"
+        );
+    }
+
     #[test]
     fn silicon_spec_lookup_covers_all_documented_targets() {
         for s in ["rp2040", "rp2350", "bcm2712", "wasm"] {
@@ -1327,6 +1435,7 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
             wasm_opt_level: None,
+            builtin: false,
         };
         assert!(matches_target(&c, "rp2350", "rp2350"));
         assert!(matches_target(&c, "linux", "bcm2712"));
@@ -1347,6 +1456,7 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
             wasm_opt_level: None,
+            builtin: false,
         };
         // Host target "linux" matches via its module silicon (bcm2712).
         assert!(matches_target(&c, "linux", "bcm2712"));
@@ -1369,6 +1479,7 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
             wasm_opt_level: None,
+            builtin: false,
         };
         // Manifest pinned to the raw host token — the target-string
         // match lets it through when the user invokes `--target linux`.

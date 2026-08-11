@@ -22,12 +22,26 @@ pub mod add_subgraph;
 pub mod agent_logs;
 pub mod asset_bank;
 pub mod ci;
+// `fluxor.toml`'s schema, gated by `fluxor ci`'s `fluxor-toml-schema`
+// phase: which keys a project must carry, which its shape forbids, and
+// the one meaning each key has.
+pub mod ci_schema;
 pub mod compose;
 pub mod error;
 pub mod genstore;
 pub mod hash;
 pub mod hygiene;
+// `fluxor build|test|lint|clean` — the lifecycle verbs, plus the
+// generated `make help` block (`fluxor help --make`). Lives in the lib
+// so it can reach `ci`'s own phase runners rather than re-implementing
+// them; the bin dispatches to it.
+pub mod lifecycle;
 pub mod lockfile;
+// `standards/make.md` as checkable text: preamble, target set, the
+// canonical lifecycle recipe bodies, and §3 recipe complexity. Driven
+// by `fluxor ci`'s `makefile` phase, which adds the live-CLI verb
+// resolution on top.
+pub mod makefile_lint;
 pub mod manifest;
 pub mod module_test;
 pub mod node_agent;

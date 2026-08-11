@@ -25,7 +25,7 @@
 //! placeholder lands as its own argv element:
 //!
 //! ```toml
-//! command = ["fluxor", "combine", "fw.bin", "${scenario.config}", "-o", "out.img"]
+//! command = ["fluxor", "build", "${scenario.config}", "--emit=combined", "-o", "out.img"]
 //! ```
 //!
 //! The kernel hands the value to the executable as one `argv[i]` with
@@ -175,16 +175,16 @@ config = "{path}"
         let scenario = fixture_scenario();
         let cmd = vec![
             "fluxor".to_string(),
-            "combine".to_string(),
-            "fw.bin".to_string(),
+            "build".to_string(),
             "${scenario.config}".to_string(),
+            "--emit=combined".to_string(),
             "-o".to_string(),
             "packed.img".to_string(),
         ];
         let out = substitute_command(&cmd, &scenario).unwrap();
         // Path lands in its own argv slot; no shell involved.
         assert_eq!(
-            out[3],
+            out[2],
             "/repo/tests/hardware/../../examples/web_server/pi5.yaml"
         );
     }

@@ -25,6 +25,15 @@ fluxor = { abi = 1 }
 # iterates this list.
 targets = ["bcm2712", "rp2350", "rp2040", "wasm"]
 
+[ci.cargo]
+# Where the cargo phase runs. fluxor's workspace root is the bare-metal
+# kernel and cannot build on the host under default features, so the
+# host-testable crate is `tools/`. Declared rather than left to the
+# conventional fallback: `fluxor ci`, `fluxor test` and `fluxor lint`
+# all resolve their cargo site through this key, and a site nothing
+# names is a site nobody can check.
+host_tools_crate = "tools"
+
 [ci.templates]
 # Directory whose YAML files render through `fluxor render-template`.
 # No `__KEY__` placeholders today; the empty render acts as a
