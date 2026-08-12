@@ -149,6 +149,27 @@ pub const CONTENT_TYPES: &[&str] = &[
     // chrome/content renderers consume it. See
     // `.context/rfc_adaptive_presentation.md`.
     "PresentationLayout",
+    // HTTP application fan-out surface — the request half. Header
+    // `{conn_id u16, stream_id u16, method u8, flags u8, path_len u16,
+    // hdr_len u16, body_len u16}` followed by `path_len + hdr_len +
+    // body_len` bytes. Carried on a port when a transport gateway
+    // (wave's foundation/http) is configured to hand a matched route's
+    // requests to a downstream module instead of answering them itself.
+    //
+    // The pair with `HttpResponse` is what lets a graph serve an API
+    // whose meaning lives in an application module: the gateway keeps
+    // owning HTTP framing, connection state and bounded body handling,
+    // and owns none of the request's meaning. `stream_id` is carried
+    // beside `conn_id` because HTTP/2 multiplexes many requests over one
+    // connection — correlating on `conn_id` alone misroutes the moment a
+    // client opens parallel streams.
+    "HttpRequest",
+    // HTTP application fan-out surface — the response half. Header
+    // `{conn_id u16, stream_id u16, status u16, flags u8, ct_len u8,
+    // hdr_len u16, body_len u16}` followed by `ct_len + hdr_len +
+    // body_len` bytes. The gateway matches it back to the originating
+    // request by `(conn_id, stream_id)`.
+    "HttpResponse",
 ];
 
 // ── Rate classes ────────────────────────────────────────────────────────────
@@ -265,9 +286,83 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     Control, // Telemetry
     Control, // SurfaceTraits
     Control, // PresentationLayout
+    // Request and response envelopes are bursty control traffic by
+    // default, on the same reasoning as WsFrame: one envelope per
+    // request/response, not a sustained stream. A route that carries
+    // bulk bodies (artefact push/pull, media upload) declares `rate:`
+    // on the edge rather than reclassifying the type for everyone.
+    Control, // HttpRequest
+    Control, // HttpResponse
 ];
 
 const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
+
+// ── Framing ─────────────────────────────────────────────────────────────────
+
+/// How a channel must deliver a content type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// Bytes. A reader may be handed any split of the stream and
+    /// reassemble it — the default channel is a byte FIFO, and that is
+    /// the right shape.
+    Streamed,
+    /// Whole records. One write is one envelope with a header declaring
+    /// its own length, so a reader handed half of one cannot recover:
+    /// it parses the header of a fragment and reads a length that is not
+    /// there. Edges carrying these must be in mailbox mode, which is
+    /// what a non-zero `buffer_group:` selects.
+    Framed,
+}
+
+use Framing::{Framed, Streamed};
+
+/// Framing per content type — POSITION-PARALLEL with `CONTENT_TYPES`
+/// (compile-time length guard below).
+///
+/// `Framed` is the narrow case and is claimed only where fragmenting is
+/// a known correctness failure rather than a performance one. It is a
+/// property of the TYPE, not of a port: producer and consumer cannot be
+/// allowed to disagree about whether a record may arrive in pieces, and
+/// a per-manifest field would let them.
+pub const CONTENT_FRAMING: &[Framing] = &[
+    Streamed, // OctetStream
+    Streamed, // Cbor
+    Streamed, // Json
+    Streamed, // AudioSample
+    Streamed, // TextPlain
+    Streamed, // TextHtml
+    Streamed, // VideoRaster
+    Streamed, // MeshEvent
+    Streamed, // MeshCommand
+    Streamed, // MeshState
+    Streamed, // MeshHandle
+    Streamed, // InputEvent
+    Streamed, // GestureMatch
+    Streamed, // FmpMessage
+    Streamed, // EthernetFrame
+    Streamed, // HciMessage
+    Streamed, // AudioEncoded
+    Streamed, // VideoEncoded
+    Streamed, // VideoDraw
+    Streamed, // VideoScanout
+    Streamed, // MediaMuxed
+    Framed,   // WsFrame — fan-out envelope, header-framed per frame
+    Streamed, // InputBinaryState
+    Streamed, // EventTimelineVideo
+    Streamed, // EventTimelineAudio
+    Streamed, // NetProto
+    Streamed, // PointerEvents
+    Streamed, // KeyEvents
+    Streamed, // GamepadEvents
+    Streamed, // MidiEvents
+    Streamed, // Telemetry
+    Streamed, // SurfaceTraits
+    Streamed, // PresentationLayout
+    Framed,   // HttpRequest
+    Framed,   // HttpResponse
+];
+
+const _: () = assert!(CONTENT_FRAMING.len() == CONTENT_TYPES.len());
 
 /// Per-class sustained-rate floor in bytes/second, per profile family.
 /// `None` = the class is unsatisfiable on that profile (64 KiB buffer

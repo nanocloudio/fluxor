@@ -650,6 +650,56 @@ fn resolve_edge_rate_class(
         .unwrap_or(RateClass::Control))
 }
 
+/// Reject a `Framed` content type on a byte-streaming edge.
+///
+/// The type table owns the requirement (`CONTENT_FRAMING`), so a
+/// producer and a consumer cannot disagree about whether a record may
+/// arrive in pieces. The error names the edge and the fix, because the
+/// runtime symptom — a consumer parsing a length out of a fragment —
+/// looks like a protocol bug rather than a wiring one.
+#[allow(clippy::too_many_arguments, reason = "resolved edge context, all of it needed to name the offending wiring entry")]
+fn check_edge_framing(
+    i: usize,
+    edge: &(u8, u8, u8, u8, u8),
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    from_port_index: u8,
+    to_port_index: u8,
+    to_port: u8,
+    from_specs: &[String],
+    to_specs: &[String],
+) -> Result<()> {
+    use fluxor_contracts::{Framing, CONTENT_FRAMING, CONTENT_TYPES};
+
+    let framed_of = |spec: Option<&crate::manifest::PortSpec>| {
+        spec.and_then(|p| {
+            CONTENT_FRAMING
+                .get(p.content_type as usize)
+                .filter(|f| **f == Framing::Framed)
+                .map(|_| p.content_type)
+        })
+    };
+    let from_port = manifests
+        .get(&module_names[edge.0 as usize])
+        .and_then(|m| m.find_port_spec(1, from_port_index));
+    let to_direction = if to_port == 1 { 2u8 } else { 0u8 };
+    let to_port_spec = manifests
+        .get(&module_names[edge.1 as usize])
+        .and_then(|m| m.find_port_spec(to_direction, to_port_index));
+
+    if let Some(ct) = framed_of(from_port).or_else(|| framed_of(to_port_spec)) {
+        let name = CONTENT_TYPES.get(ct as usize).copied().unwrap_or("?");
+        return Err(Error::Config(format!(
+            "wiring[{i}] ({} → {}): `{name}` is a record envelope and needs a \
+             non-zero `buffer_group:` on this edge. Without one the channel is a \
+             byte FIFO, so a consumer can be handed part of an envelope and read \
+             a length that is not there.",
+            from_specs[i], to_specs[i]
+        )));
+    }
+    Ok(())
+}
+
 /// Per-edge capacity + rate-class validation.
 ///
 /// Static mirror of the runtime `open_channels` enforcement, using
@@ -704,6 +754,25 @@ fn validate_wiring_capacity(
         if buffer_group != 0 {
             continue; // mailbox/group-max semantics — runtime validates
         }
+
+        // Framing, before capacity: a `Framed` content type on a
+        // group-0 edge is a byte FIFO carrying header-framed records,
+        // which builds clean and then hands the consumer half an
+        // envelope at runtime. Checked here because this is where the
+        // edge's ports are already resolved, and only for group-0 edges
+        // because a non-zero group IS the mailbox mode the type needs.
+        check_edge_framing(
+            i,
+            &edges[i],
+            module_names,
+            manifests,
+            from_port_index,
+            to_port_index,
+            to_port,
+            from_specs,
+            to_specs,
+        )?;
+
         let buffer_bytes = entry
             .and_then(|e| e.get("buffer_bytes"))
             .and_then(|v| v.as_u64())

@@ -1128,7 +1128,14 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             kv.insert(format!("route_{i}_path"), path.clone());
         }
 
-        // Determine handler type and body
+        // Determine handler type and body.
+        //
+        // The handler id is DERIVED from the boolean route keys below and
+        // never read from the yaml: a raw `handler: 11` compiles to 0 and
+        // serves an empty static body (pinned by
+        // `a_raw_handler_number_is_ignored_not_honoured`). The ids are
+        // internal constants of wave's http module, so letting a graph name
+        // one would make every renumbering a breaking config change.
         let mut handler: u8 = 0;
 
         if obj
@@ -1165,17 +1172,20 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             // gRPC unary handler (HANDLER_GRPC) — answers with a canned
             // length-prefixed message and a `grpc-status: 0` trailer.
             //
-            // A boolean key rather than a raw `handler:` number, matching
-            // `websocket:` above: the handler id is an internal constant of the
-            // http module, and letting graphs name it directly would make every
-            // renumbering a breaking config change. `handler` is derived here
-            // and never read from the yaml, so a raw `handler: 10` is silently
-            // ignored and the route serves an empty static body.
-            //
             // The route path should be the gRPC SERVICE prefix
             // (`/pkg.Service/`), because a method path is `/<service>/<Method>`
             // and http matches a trailing `/` as a prefix.
             handler = 10;
+        } else if obj.get("app").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // Application fan-out (HANDLER_APP) — the request goes out on the
+            // http module's `req_out` port as an `HttpRequest` envelope and the
+            // answer comes back on `resp_in`, so a downstream graph node
+            // decides what the request MEANS while http keeps owning HTTP.
+            //
+            // The route path is normally a prefix ending in `/`, since an API
+            // mounted at `/v2/` must receive everything beneath it. A bare `/`
+            // is also a prefix for this handler alone.
+            handler = 11;
         } else if let Some(proxy_val) = obj.get("proxy") {
             // Proxy handler
             handler = 3;
@@ -1309,6 +1319,61 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Derive the handler byte a `routes:` entry compiles to.
+    fn handler_of(route: serde_json::Value) -> Option<u64> {
+        let mut kv: HashMap<String, Value> = HashMap::new();
+        expand_routes(&[route], &mut kv, None);
+        kv.get("route_0_handler").and_then(|v| v.as_u64())
+    }
+
+    /// Each boolean route key selects its handler, and the ids are the ones
+    /// wave's `modules/foundation/http/server/routes.rs` defines — the
+    /// compiler here and the module there must agree on a number neither
+    /// repo can check for the other. A silent disagreement is invisible in a
+    /// config dump: the route simply serves the wrong thing.
+    #[test]
+    fn boolean_route_keys_select_their_handlers() {
+        assert_eq!(
+            handler_of(serde_json::json!({"path": "/ws", "websocket": true})),
+            Some(4)
+        );
+        assert_eq!(
+            handler_of(serde_json::json!({"path": "/pkg.Svc/", "grpc": true})),
+            Some(10)
+        );
+        assert_eq!(
+            handler_of(serde_json::json!({"path": "/app/", "app": true})),
+            Some(11)
+        );
+    }
+
+    /// **The trap this test exists for.** `handler` is DERIVED from the
+    /// boolean keys and never read from the yaml, so a raw `handler: 11`
+    /// compiles to handler 0 — a static route with no body, which answers
+    /// `200 OK` with `Content-Length: 0` — a misconfigured route that reads
+    /// as a working server.
+    ///
+    /// Pinned so the silence is a decision rather than a surprise. If raw
+    /// handler numbers are ever accepted, this test is where that changes.
+    #[test]
+    fn a_raw_handler_number_is_ignored_not_honoured() {
+        assert_eq!(
+            handler_of(serde_json::json!({"path": "/app/", "handler": 11})),
+            Some(0),
+            "a raw `handler:` number must not select a handler — use the \
+             boolean key (`app: true`) instead"
+        );
+    }
+
+    /// A route with none of the boolean keys is a static body route.
+    #[test]
+    fn a_plain_route_is_static() {
+        assert_eq!(
+            handler_of(serde_json::json!({"path": "/", "body": "hi"})),
+            Some(0)
+        );
+    }
 
     /// Build a throwaway project root holding a `fluxor.lock` that pins
     /// `pinned_conn` to a digest no store contains, plus an empty store the

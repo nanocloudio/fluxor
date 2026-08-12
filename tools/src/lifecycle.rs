@@ -49,6 +49,12 @@ pub struct Shape {
     pub mounts_staged: bool,
     /// `[ci.test] scripts` globs — the project's runtime gate.
     pub test_scripts: Vec<String>,
+    /// `tests/harness/` exists — a sub-workspace holding the project's
+    /// integration suites, which `fluxor ci`'s phase 4 runs. Tracked here so
+    /// the `test` VERB runs it too: a lane the gate covers and the verb skips
+    /// makes `make test` quietly weaker than `make ci`, which is the one thing
+    /// a lifecycle verb must never be.
+    pub has_harness_crate: bool,
 }
 
 impl Shape {
@@ -89,6 +95,7 @@ pub fn shape(project_root: &Path) -> Shape {
         has_harnesses: crate::module_test::resolved_harness_count(project_root) > 0,
         mounts_staged: mounts_staged_tree(project_root),
         test_scripts: ci::load_test_scripts(project_root).unwrap_or_default(),
+        has_harness_crate: project_root.join("tests/harness").exists(),
     }
 }
 
@@ -271,6 +278,26 @@ pub fn test(project_root: &Path, verbose: bool) -> Result<()> {
         did_something = true;
     }
 
+    // The integration harness at `tests/harness/` is its own sub-workspace, so
+    // `cargo_site()` above does not reach it — a project whose only cargo tree
+    // IS the harness (wave: no root manifest, host crates each declaring their
+    // own `[workspace]`) would otherwise have every one of its integration
+    // suites skipped by `fluxor test` while `fluxor ci` phase 4 ran them.
+    // `make test` reporting green over hundreds of unrun tests is exactly the
+    // failure the lifecycle verbs exist to prevent.
+    if s.has_harness_crate {
+        let dir = s.project_root.join("tests/harness");
+        let args: &[&str] = &[
+            "test",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "--no-fail-fast",
+        ];
+        step("cargo test (tests/harness)");
+        ci::cargo_in(&dir, args).map_err(Error::Config)?;
+        did_something = true;
+    }
+
     if !s.test_scripts.is_empty() {
         step(&format!("[ci.test] scripts: {}", s.test_scripts.join(", ")));
         ci::run_test_scripts(&s.project_root, &s.test_scripts, true).map_err(Error::Config)?;
@@ -278,7 +305,10 @@ pub fn test(project_root: &Path, verbose: bool) -> Result<()> {
     }
 
     if !did_something {
-        println!("nothing to test: no module harnesses, no cargo tree, no `[ci.test] scripts`");
+        println!(
+            "nothing to test: no module harnesses, no cargo tree, no tests/harness, \
+             no `[ci.test] scripts`"
+        );
     }
     Ok(())
 }
@@ -534,6 +564,9 @@ fn describe_test(s: &Shape) -> String {
     if s.cargo_site().is_some() {
         parts.push("cargo test".to_string());
     }
+    if s.has_harness_crate {
+        parts.push("tests/harness".to_string());
+    }
     if !s.test_scripts.is_empty() {
         parts.push("e2e scripts".to_string());
     }
@@ -698,6 +731,7 @@ mod tests {
             has_harnesses: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
+            has_harness_crate: false,
         };
         assert_eq!(s.cargo_site(), Some((root.join("tools"), false)));
     }
@@ -714,6 +748,7 @@ mod tests {
             has_harnesses: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
+            has_harness_crate: false,
         };
         assert_eq!(s.cargo_site(), Some((root, true)));
     }
@@ -729,12 +764,44 @@ mod tests {
             has_harnesses: true,
             mounts_staged: false,
             test_scripts: vec!["tools/e2e/*.sh".into()],
+            has_harness_crate: false,
         };
         assert_eq!(s.cargo_site(), None);
         assert_eq!(describe_build(&s), "fluxor build — PIC modules".to_string());
         assert_eq!(
             describe_test(&s),
             "fluxor test — module harnesses + e2e scripts".to_string()
+        );
+    }
+
+    /// A project whose ONLY cargo tree is `tests/harness/` must still have it
+    /// tested by the verb.
+    ///
+    /// This is wave's shape: no root manifest, host crates each declaring
+    /// their own `[workspace]`, so `cargo_site()` is `None` and the harness is
+    /// invisible to every other lane. `fluxor ci` phase 4 runs it regardless,
+    /// and a verb that skipped what the gate covers would make `make test`
+    /// green over hundreds of unrun integration tests — which is the one thing
+    /// a lifecycle verb must never be.
+    #[test]
+    fn a_harness_only_project_still_gets_a_test_lane() {
+        let s = Shape {
+            project_root: PathBuf::from("/p"),
+            name: "p".into(),
+            has_cargo: false,
+            host_tools: None,
+            has_modules: true,
+            has_harnesses: false,
+            mounts_staged: false,
+            test_scripts: Vec::new(),
+            has_harness_crate: true,
+        };
+        assert_eq!(s.cargo_site(), None, "no cargo tree reaches the harness");
+        assert_eq!(
+            describe_test(&s),
+            "fluxor test — tests/harness".to_string(),
+            "the harness lane must be announced, or `make help` under-describes \
+             what `make test` runs"
         );
     }
 
@@ -750,6 +817,7 @@ mod tests {
             has_harnesses: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
+            has_harness_crate: false,
         };
         assert_eq!(cargo_label(&s, &root, &["test"]), "cargo test");
         assert_eq!(
