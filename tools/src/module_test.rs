@@ -38,6 +38,12 @@ struct Harness {
     module: String,
     /// Absolute path to the harness source.
     path: PathBuf,
+    /// The module's DEFAULT variant feature set (RFC module_variants), so the
+    /// harness tests the same cfg surface the unsuffixed `.fmod` ships with.
+    /// Empty for variant-less modules. Without this, a harness would compile
+    /// every gated feature OUT and its tests would silently not exercise what
+    /// the default artifact actually carries.
+    features: Vec<String>,
 }
 
 /// Harnesses that resolve to a file on disk — what the phase would run,
@@ -59,7 +65,11 @@ pub fn declared_harness_count(project_root: &Path) -> usize {
         };
         for e in entries.flatten() {
             let text = fs::read_to_string(e.path().join("manifest.toml")).unwrap_or_default();
-            if harness_path(&text).is_some() {
+            if toml::from_str::<toml::Value>(&text)
+                .ok()
+                .and_then(|d| harness_path(&d))
+                .is_some()
+            {
                 n += 1;
             }
         }
@@ -82,7 +92,10 @@ fn discover(project_root: &Path) -> Vec<Harness> {
             let Ok(text) = fs::read_to_string(&manifest) else {
                 continue;
             };
-            let Some(rel) = harness_path(&text) else {
+            let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+                continue;
+            };
+            let Some(rel) = harness_path(&doc) else {
                 continue;
             };
             let path = dir.join(&rel);
@@ -93,6 +106,7 @@ fn discover(project_root: &Path) -> Vec<Harness> {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                     path,
+                    features: default_variant_features(&doc),
                 });
             }
         }
@@ -101,28 +115,38 @@ fn discover(project_root: &Path) -> Vec<Harness> {
     out
 }
 
-/// Read `[test] harness = "..."` without pulling in a TOML dependency for one
-/// key: the manifests are small and this keeps the reader obvious.
-fn harness_path(manifest: &str) -> Option<String> {
-    let mut in_test = false;
-    for line in manifest.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_test = t == "[test]";
-            continue;
-        }
-        if !in_test {
-            continue;
-        }
-        let Some((k, v)) = t.split_once('=') else {
-            continue;
-        };
-        if k.trim() != "harness" {
-            continue;
-        }
-        return Some(v.trim().trim_matches('"').to_string());
-    }
-    None
+/// `[test] harness = "..."`, relative to the manifest's directory.
+fn harness_path(manifest: &toml::Value) -> Option<String> {
+    manifest
+        .get("test")?
+        .get("harness")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `features` of the `default = true` `[[variant]]`, empty when the
+/// module declares no variants (the common case).
+///
+/// Read through the TOML parser rather than by hand: a `features` array
+/// split across lines is legal and a line reader returns empty for it,
+/// which is silently the wrong answer — the harness would then compile
+/// every gated feature out, the exact miss this field exists to close.
+fn default_variant_features(manifest: &toml::Value) -> Vec<String> {
+    manifest
+        .get("variant")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|v| v.get("default").and_then(toml::Value::as_bool) == Some(true))
+        .and_then(|v| v.get("features"))
+        .and_then(toml::Value::as_array)
+        .map(|fs| {
+            fs.iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Generate a throwaway crate that mounts `h` and run `cargo test` in it.
@@ -130,12 +154,20 @@ fn run_one(h: &Harness, out_root: &Path, verbose: bool) -> Result<bool> {
     let dir = out_root.join(format!("moduletest-{}", h.module));
     fs::create_dir_all(dir.join("src")).map_err(Error::Io)?;
 
+    // The default-variant features are declared AND defaulted, so the harness
+    // compiles the exact cfg surface the unsuffixed `.fmod` ships with.
+    let mut feat_decl = String::new();
+    let mut feat_default = String::from("\"host-test\"");
+    for f in &h.features {
+        feat_decl.push_str(&format!("{f:?} = []\n"));
+        feat_default.push_str(&format!(", {f:?}"));
+    }
     fs::write(
         dir.join("Cargo.toml"),
         format!(
             "[package]\nname = \"moduletest_{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
              [lib]\npath = \"src/lib.rs\"\n[workspace]\n\
-             [features]\ndefault = [\"host-test\"]\nhost-test = []\n",
+             [features]\ndefault = [{feat_default}]\nhost-test = []\n{feat_decl}",
             h.module.replace('-', "_")
         ),
     )
@@ -225,5 +257,58 @@ pub fn cmd_test(project_root: Option<&Path>, module: Option<&str>, verbose: bool
         Ok(())
     } else {
         Err(Error::Config(format!("failed: {}", failed.join(", "))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_variant_features, harness_path};
+
+    fn doc(src: &str) -> toml::Value {
+        toml::from_str(src).expect("fixture parses")
+    }
+
+    #[test]
+    fn a_default_variant_yields_its_feature_set() {
+        let m = doc(r#"
+version = "1.0.0"
+[[variant]]
+name = "web"
+features = ["h1", "ws"]
+[[variant]]
+name = "full"
+features = ["h1", "h2", "ws"]
+default = true
+"#);
+        assert_eq!(default_variant_features(&m), vec!["h1", "h2", "ws"]);
+    }
+
+    #[test]
+    fn a_variantless_manifest_yields_no_features() {
+        assert!(default_variant_features(&doc("version = \"1.0.0\"\n")).is_empty());
+    }
+
+    /// A multi-line array is legal TOML, and the hand-rolled line reader
+    /// this replaced returned empty for it — silently compiling the
+    /// harness without the features it is meant to pin.
+    #[test]
+    fn a_features_array_split_across_lines_is_read_whole() {
+        let m = doc(r#"
+[[variant]]
+name = "full"
+default = true
+features = [
+    "h1",
+    "h2",
+]
+"#);
+        assert_eq!(default_variant_features(&m), vec!["h1", "h2"]);
+    }
+
+    #[test]
+    fn harness_path_reads_the_test_table() {
+        let m = doc("[test]\nharness = \"tests/x.rs\"\n");
+        assert_eq!(harness_path(&m).as_deref(), Some("tests/x.rs"));
+        assert!(harness_path(&doc("version = \"1\"\n")).is_none());
     }
 }

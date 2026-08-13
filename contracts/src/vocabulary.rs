@@ -82,6 +82,13 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "fence.enforceable",
     "durable.rpo_zero",
     "replication.state_machine",
+    // Streaming egress sink (lattice CDC RFC §11): the provider accepts
+    // ordered publishes and answers durable acks + link-state signals
+    // over the `cdc_wire` port pair. Wire contract and conformance
+    // vectors are owned by lattice (`modules/common/cdc_wire.rs`);
+    // providers in any repo declare this string and run the vectors in
+    // their own CI.
+    "stream.sink.ordered_ack",
 ];
 
 /// Canonical provider-contract names accepted in
