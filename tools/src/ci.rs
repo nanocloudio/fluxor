@@ -866,9 +866,8 @@ pub(crate) fn run_hygiene(project_root: &Path) -> std::result::Result<(), String
         return Ok(());
     }
     Err(format!(
-        "{} violation(s), {} stale exemption(s); run `fluxor lint hygiene` for details",
-        report.violations.len(),
-        report.stale_exemptions.len()
+        "{} violation(s); run `fluxor lint hygiene` for details",
+        report.violations.len()
     ))
 }
 

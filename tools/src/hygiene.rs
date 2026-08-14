@@ -33,7 +33,7 @@ use syn::visit::Visit;
 use syn::{Attribute, ItemMod, Meta};
 
 /// One discrete rule the scanner enforces. Matches the `rule = "..."`
-/// discriminator on `[[ci.hygiene.exemption]]` rows in `fluxor.toml`.
+/// discriminator carried on every violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rule {
     InlineTests,
@@ -55,36 +55,12 @@ impl Rule {
             Rule::RepoFiles => "repo-files",
         }
     }
-
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "inline-tests" => Some(Rule::InlineTests),
-            "allow-without-reason" => Some(Rule::AllowWithoutReason),
-            "module-structure" => Some(Rule::ModuleStructure),
-            "shadow-guard" => Some(Rule::ShadowGuard),
-            "sdk-mount" => Some(Rule::SdkMount),
-            "repo-files" => Some(Rule::RepoFiles),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Strict,
     Permissive,
-}
-
-/// Parsed `[[ci.hygiene.exemption]]` row.
-#[derive(Debug, Clone, Deserialize)]
-struct ExemptionRaw {
-    path: String,
-    rule: String,
-    #[serde(default)]
-    #[allow(dead_code, reason = "field is documentation-only at scan time")]
-    reason: String,
-    #[serde(default)]
-    expires: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -107,15 +83,6 @@ struct HygieneTable {
     forbid_inline_tests: Vec<String>,
     #[serde(default)]
     max_inline_lines: Option<usize>,
-    #[serde(default)]
-    exemption: Vec<ExemptionRaw>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Exemption {
-    pub path: PathBuf,
-    pub rule: Rule,
-    pub expires: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +90,6 @@ pub struct Config {
     pub mode: Mode,
     pub forbid_inline_tests: Vec<String>,
     pub max_inline_lines: usize,
-    pub exemptions: Vec<Exemption>,
 }
 
 impl Default for Config {
@@ -135,7 +101,6 @@ impl Default for Config {
             mode: Mode::Strict,
             forbid_inline_tests: vec!["modules".to_string(), "src".to_string()],
             max_inline_lines: 80,
-            exemptions: Vec::new(),
         }
     }
 }
@@ -154,11 +119,6 @@ pub enum ConfigError {
     },
     #[error("unknown hygiene mode {0:?}: expected \"strict\" or \"permissive\"")]
     UnknownMode(String),
-    #[error(
-        "unknown hygiene rule {0:?}: expected one of \"inline-tests\", \"allow-without-reason\", \
-         \"module-structure\", \"shadow-guard\", \"sdk-mount\", \"repo-files\""
-    )]
-    UnknownRule(String),
 }
 
 impl Config {
@@ -184,16 +144,6 @@ impl Config {
             Some("permissive") => Mode::Permissive,
             Some(other) => return Err(ConfigError::UnknownMode(other.to_string())),
         };
-        let mut exemptions = Vec::with_capacity(h.exemption.len());
-        for ex in h.exemption {
-            let rule =
-                Rule::parse(&ex.rule).ok_or_else(|| ConfigError::UnknownRule(ex.rule.clone()))?;
-            exemptions.push(Exemption {
-                path: PathBuf::from(ex.path),
-                rule,
-                expires: ex.expires,
-            });
-        }
         Ok(Self {
             mode,
             forbid_inline_tests: if h.forbid_inline_tests.is_empty() {
@@ -202,7 +152,6 @@ impl Config {
                 h.forbid_inline_tests
             },
             max_inline_lines: h.max_inline_lines.unwrap_or(80),
-            exemptions,
         })
     }
 }
@@ -215,40 +164,15 @@ pub struct Violation {
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct StaleExemption {
-    pub path: PathBuf,
-    pub rule: Rule,
-    pub kind: StaleKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StaleKind {
-    PathMissing,
-    Expired,
-    NoLongerViolates,
-}
-
-impl StaleKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            StaleKind::PathMissing => "path no longer exists",
-            StaleKind::Expired => "expires date is in the past",
-            StaleKind::NoLongerViolates => "file no longer violates the rule",
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct Report {
     pub violations: Vec<Violation>,
-    pub stale_exemptions: Vec<StaleExemption>,
     pub files_scanned: usize,
 }
 
 impl Report {
     pub fn ok(&self) -> bool {
-        self.violations.is_empty() && self.stale_exemptions.is_empty()
+        self.violations.is_empty()
     }
 }
 
@@ -265,39 +189,6 @@ pub enum ScanError {
 /// hygiene rules in `config`. Returns a one-pass diagnostic set.
 pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     let mut report = Report::default();
-    let today = today_yyyy_mm_dd();
-
-    // Pre-check exemptions for `path` missing / `expires` past. Those
-    // produce stale diagnostics regardless of whether the scan
-    // observes a violation.
-    let mut exempt_lookup: HashSet<(PathBuf, Rule)> = HashSet::new();
-    let mut already_flagged: HashSet<(PathBuf, Rule)> = HashSet::new();
-    for ex in &config.exemptions {
-        let abs = project_root.join(&ex.path);
-        let key = (ex.path.clone(), ex.rule);
-        if !abs.exists() {
-            report.stale_exemptions.push(StaleExemption {
-                path: ex.path.clone(),
-                rule: ex.rule,
-                kind: StaleKind::PathMissing,
-            });
-            already_flagged.insert(key);
-            continue;
-        }
-        if let Some(exp) = &ex.expires {
-            if exp.as_str() < today.as_str() {
-                report.stale_exemptions.push(StaleExemption {
-                    path: ex.path.clone(),
-                    rule: ex.rule,
-                    kind: StaleKind::Expired,
-                });
-                already_flagged.insert(key.clone());
-            }
-        }
-        exempt_lookup.insert(key);
-    }
-
-    let mut exempt_applied: HashSet<(PathBuf, Rule)> = HashSet::new();
 
     // fluxor owns the SDK sources; every other repo consumes them from
     // the staged tree. `modules/sdk/abi_surface.rs` is the same marker
@@ -350,49 +241,12 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         if !sdk_owner {
             file_violations.extend(scan_sdk_mounts(&rel, &content));
         }
-        for v in file_violations {
-            let key = (rel.clone(), v.rule);
-            if exempt_lookup.contains(&key) {
-                exempt_applied.insert(key);
-                continue;
-            }
-            report.violations.push(v);
-        }
+        report.violations.extend(file_violations);
     }
 
-    scan_module_structure(
-        project_root,
-        &mut report,
-        &exempt_lookup,
-        &mut exempt_applied,
-    );
-    scan_shadow_guard(
-        project_root,
-        &mut report,
-        &exempt_lookup,
-        &mut exempt_applied,
-    );
-    scan_repo_files(
-        project_root,
-        &mut report,
-        &exempt_lookup,
-        &mut exempt_applied,
-    );
-
-    // Stale check pass 3: exemption rows that match an existing file
-    // whose scan produced no violation under the named rule.
-    for key in &exempt_lookup {
-        if already_flagged.contains(key) {
-            continue;
-        }
-        if !exempt_applied.contains(key) {
-            report.stale_exemptions.push(StaleExemption {
-                path: key.0.clone(),
-                rule: key.1,
-                kind: StaleKind::NoLongerViolates,
-            });
-        }
-    }
+    scan_module_structure(project_root, &mut report);
+    scan_shadow_guard(project_root, &mut report);
+    scan_repo_files(project_root, &mut report);
 
     report.violations.sort_by(|a, b| {
         a.path
@@ -400,12 +254,6 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
             .then(a.line.cmp(&b.line))
             .then_with(|| (a.rule as u8).cmp(&(b.rule as u8)))
     });
-    report.stale_exemptions.sort_by(|a, b| {
-        a.path
-            .cmp(&b.path)
-            .then((a.rule as u8).cmp(&(b.rule as u8)))
-    });
-
     Ok(report)
 }
 
@@ -414,22 +262,12 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
 /// must agree with the manifest; in-module `tests/` must be declared.
 /// `modules/sdk/` is the staged-source contract, not a module tree —
 /// exempt. All findings report under `Rule::ModuleStructure`.
-fn scan_module_structure(
-    project_root: &Path,
-    report: &mut Report,
-    exempt_lookup: &HashSet<(PathBuf, Rule)>,
-    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
-) {
+fn scan_module_structure(project_root: &Path, report: &mut Report) {
     let modules_root = project_root.join("modules");
     if !modules_root.is_dir() {
         return;
     }
-    let mut push = |rel: PathBuf, message: String, report: &mut Report| {
-        let key = (rel.clone(), Rule::ModuleStructure);
-        if exempt_lookup.contains(&key) {
-            exempt_applied.insert(key);
-            return;
-        }
+    let push = |rel: PathBuf, message: String, report: &mut Report| {
         report.violations.push(Violation {
             path: rel,
             line: 0,
@@ -568,21 +406,9 @@ fn scan_module_structure(
     }
 }
 
-/// Record one whole-repo violation unless an `[[ci.hygiene.exemption]]`
-/// row covers the `(path, rule)` pair.
-fn push_repo_violation(
-    report: &mut Report,
-    exempt_lookup: &HashSet<(PathBuf, Rule)>,
-    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
-    rel: PathBuf,
-    rule: Rule,
-    message: String,
-) {
-    let key = (rel.clone(), rule);
-    if exempt_lookup.contains(&key) {
-        exempt_applied.insert(key);
-        return;
-    }
+/// Record one whole-repo violation (a finding about the repo's shape
+/// rather than about one file's contents).
+fn push_repo_violation(report: &mut Report, rel: PathBuf, rule: Rule, message: String) {
     report.violations.push(Violation {
         path: rel,
         line: 0,
@@ -607,12 +433,7 @@ const SHADOW_TIERS: [&str; 5] = ["tests", "benches", "examples", "fixtures", "fu
 /// - a repo with no shadow repo must not gitignore the tier — a
 ///   gitignored-only tier exists on exactly one machine and has no
 ///   recovery path (§1's explicit failure mode).
-fn scan_shadow_guard(
-    project_root: &Path,
-    report: &mut Report,
-    exempt_lookup: &HashSet<(PathBuf, Rule)>,
-    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
-) {
+fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
     let shadow_dir = project_root.join(".git-shadow");
     let has_shadow = shadow_dir.is_dir();
     let gitignore = fs::read_to_string(project_root.join(".gitignore")).unwrap_or_default();
@@ -632,8 +453,6 @@ fn scan_shadow_guard(
             }
             push_repo_violation(
                 report,
-                exempt_lookup,
-                exempt_applied,
                 PathBuf::from(tier),
                 Rule::ShadowGuard,
                 format!(
@@ -652,8 +471,6 @@ fn scan_shadow_guard(
     if !born {
         push_repo_violation(
             report,
-            exempt_lookup,
-            exempt_applied,
             PathBuf::from(".git-shadow"),
             Rule::ShadowGuard,
             "`.git-shadow/` is initialised but has no commits — the shadow-tracked tiers are \
@@ -677,8 +494,6 @@ fn scan_shadow_guard(
         if !ignore_file_lists_tier(&gitignore, tier, false) {
             push_repo_violation(
                 report,
-                exempt_lookup,
-                exempt_applied,
                 PathBuf::from(tier),
                 Rule::ShadowGuard,
                 format!(
@@ -691,8 +506,6 @@ fn scan_shadow_guard(
         if !ignore_file_lists_tier(&shadow_exclude, tier, true) {
             push_repo_violation(
                 report,
-                exempt_lookup,
-                exempt_applied,
                 PathBuf::from(tier),
                 Rule::ShadowGuard,
                 format!(
@@ -706,8 +519,6 @@ fn scan_shadow_guard(
         if born && shadow_tier_is_empty(&shadow_dir, project_root, tier) {
             push_repo_violation(
                 report,
-                exempt_lookup,
-                exempt_applied,
                 PathBuf::from(tier),
                 Rule::ShadowGuard,
                 format!(
@@ -839,12 +650,7 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
 /// absent: no standard states whether a project carries them, so the
 /// spread across the ecosystem is an open owner decision, not a
 /// violation. See standards/lints.md §6.1.
-fn scan_repo_files(
-    project_root: &Path,
-    report: &mut Report,
-    exempt_lookup: &HashSet<(PathBuf, Rule)>,
-    exempt_applied: &mut HashSet<(PathBuf, Rule)>,
-) {
+fn scan_repo_files(project_root: &Path, report: &mut Report) {
     let root_manifest = project_root.join("Cargo.toml");
     let Ok(manifest) = fs::read_to_string(&root_manifest) else {
         return;
@@ -860,8 +666,6 @@ fn scan_repo_files(
     }
     push_repo_violation(
         report,
-        exempt_lookup,
-        exempt_applied,
         PathBuf::from("Cargo.toml"),
         Rule::RepoFiles,
         "workspace root carries no `clippy.toml` — standards/lints.md §6 states the \
@@ -1354,41 +1158,6 @@ fn trailing_mod_exceeds(m: &ItemMod, cap: usize) -> Option<usize> {
     }
 }
 
-/// Today as `YYYY-MM-DD`. Lexicographic ordering is correct for the
-/// `expires` field comparison in the staleness check.
-fn today_yyyy_mm_dd() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86_400) as i64;
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-// Howard Hinnant's date algorithm (civil_from_days). Public domain.
-// `z` is days since 1970-01-01 (the unix epoch).
-//
-// The kernel carries its own copy in
-// `src/platform/linux/owner_status.rs::rfc3339_utc`, and the two stay
-// separate deliberately: the CLI does not link the kernel crate, and the
-// shared crate both DO depend on — `fluxor-contracts` — is inside the
-// ABI-surface digest, so housing a date helper there would move the
-// epoch and cost every sibling a re-sync.
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146_096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,7 +1171,6 @@ mod tests {
             mode: Mode::Strict,
             forbid_inline_tests: vec!["modules".into(), "src".into()],
             max_inline_lines: 80,
-            exemptions: vec![],
         }
     }
 
@@ -1411,7 +1179,6 @@ mod tests {
             mode: Mode::Permissive,
             forbid_inline_tests: vec!["modules".into(), "src".into()],
             max_inline_lines: cap,
-            exemptions: vec![],
         }
     }
 
@@ -1643,15 +1410,9 @@ extern crate alloc;
         }
     }
 
-    fn shadow_report(root: &TempRoot, config: &Config) -> Vec<Violation> {
+    fn shadow_report(root: &TempRoot, _config: &Config) -> Vec<Violation> {
         let mut report = Report::default();
-        let mut applied = HashSet::new();
-        let exempt: HashSet<(PathBuf, Rule)> = config
-            .exemptions
-            .iter()
-            .map(|e| (e.path.clone(), e.rule))
-            .collect();
-        scan_shadow_guard(root.path(), &mut report, &exempt, &mut applied);
+        scan_shadow_guard(root.path(), &mut report);
         report.violations
     }
 
@@ -1734,21 +1495,6 @@ extern crate alloc;
     }
 
     #[test]
-    fn shadow_guard_honours_an_exemption_row() {
-        let root = TempRoot::new("exempt");
-        root.dir("tests").file(".gitignore", "/tests/\n");
-        let config = Config {
-            exemptions: vec![Exemption {
-                path: PathBuf::from("tests"),
-                rule: Rule::ShadowGuard,
-                expires: None,
-            }],
-            ..strict()
-        };
-        assert!(shadow_report(&root, &config).is_empty());
-    }
-
-    #[test]
     fn ignore_spellings_all_match() {
         for spelling in ["/tests/", "/tests", "tests/", "tests"] {
             assert!(
@@ -1821,15 +1567,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
         assert!(scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src).is_empty());
     }
 
-    fn repo_files_report(root: &TempRoot, config: &Config) -> Vec<Violation> {
+    fn repo_files_report(root: &TempRoot, _config: &Config) -> Vec<Violation> {
         let mut report = Report::default();
-        let mut applied = HashSet::new();
-        let exempt: HashSet<(PathBuf, Rule)> = config
-            .exemptions
-            .iter()
-            .map(|e| (e.path.clone(), e.rule))
-            .collect();
-        scan_repo_files(root.path(), &mut report, &exempt, &mut applied);
+        scan_repo_files(root.path(), &mut report);
         report.violations
     }
 
@@ -1867,29 +1607,6 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
         root.file("Cargo.toml", "[workspace]\n")
             .file("clippy.toml", "\n");
         assert!(repo_files_report(&root, &strict()).is_empty());
-    }
-
-    #[test]
-    fn repo_files_honours_an_exemption_row() {
-        let root = TempRoot::new("rfexempt");
-        root.file("Cargo.toml", "[workspace]\n");
-        let config = Config {
-            exemptions: vec![Exemption {
-                path: PathBuf::from("Cargo.toml"),
-                rule: Rule::RepoFiles,
-                expires: None,
-            }],
-            ..strict()
-        };
-        assert!(repo_files_report(&root, &config).is_empty());
-    }
-
-    #[test]
-    fn new_rules_round_trip_through_exemption_parsing() {
-        for name in ["shadow-guard", "sdk-mount", "repo-files"] {
-            let rule = Rule::parse(name).expect("rule parses");
-            assert_eq!(rule.as_str(), name);
-        }
     }
 
     #[test]

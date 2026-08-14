@@ -45,16 +45,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("ci.cargo", &["host_tools_crate"]),
     (
         "ci.hygiene",
-        &[
-            "mode",
-            "forbid_inline_tests",
-            "max_inline_lines",
-            "exemption",
-        ],
-    ),
-    (
-        "ci.hygiene.exemption",
-        &["path", "rule", "reason", "expires"],
+        &["mode", "forbid_inline_tests", "max_inline_lines"],
     ),
     ("ci.lints", &["exemption"]),
     ("ci.lints.exemption", &["crate", "reason"]),
@@ -642,21 +633,5 @@ mod tests {
         assert!(e.contains("unknown key `[ci.test] script`"), "{e}");
         assert!(e.contains("keys under `[ci.test]`: scripts"), "{e}");
         assert!(!e.contains("SELF_ID"), "{e}");
-    }
-
-    #[test]
-    fn exemption_rows_are_schema_checked_row_by_row() {
-        let f = Fixture::new("rows");
-        f.dir("modules").write(
-            "fluxor.toml",
-            "[project]\nname = \"p\"\nversion = \"0\"\n\
-             [[ci.hygiene.exemption]]\npath = \"modules/x/mod.rs\"\nrule = \"inline-tests\"\n\
-             reason = \"r\"\nexpiry = \"2030-01-01\"\n",
-        );
-        let e = f.err();
-        assert!(
-            e.contains("unknown key `[ci.hygiene.exemption] expiry`"),
-            "{e}"
-        );
     }
 }

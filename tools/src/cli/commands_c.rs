@@ -1611,11 +1611,6 @@ fn cmd_lint_hygiene(project_root_override: Option<&Path>, json: bool) -> Result<
                 "rule": v.rule.as_str(),
                 "message": v.message,
             })).collect::<Vec<_>>(),
-            "stale_exemptions": report.stale_exemptions.iter().map(|s| serde_json::json!({
-                "path": s.path.to_string_lossy(),
-                "rule": s.rule.as_str(),
-                "reason": s.kind.as_str(),
-            })).collect::<Vec<_>>(),
         });
         println!(
             "{}",
@@ -1636,18 +1631,8 @@ fn cmd_lint_hygiene(project_root_override: Option<&Path>, json: bool) -> Result<
             message = v.message,
         );
     }
-    for s in &report.stale_exemptions {
-        eprintln!(
-            "\x1b[1;33mstale-exemption\x1b[0m {path} (rule={rule}): {reason}",
-            path = s.path.display(),
-            rule = s.rule.as_str(),
-            reason = s.kind.as_str(),
-        );
-    }
-
     let n_v = report.violations.len();
-    let n_s = report.stale_exemptions.len();
-    if n_v == 0 && n_s == 0 {
+    if n_v == 0 {
         eprintln!(
             "\x1b[1;32mhygiene clean\x1b[0m ({} files scanned)",
             report.files_scanned,
@@ -1655,7 +1640,7 @@ fn cmd_lint_hygiene(project_root_override: Option<&Path>, json: bool) -> Result<
         return Ok(());
     }
     eprintln!(
-        "\x1b[1;31mhygiene\x1b[0m {n_v} violation(s), {n_s} stale exemption(s) across {} files",
+        "\x1b[1;31mhygiene\x1b[0m {n_v} violation(s) across {} files",
         report.files_scanned,
     );
     std::process::exit(1);
