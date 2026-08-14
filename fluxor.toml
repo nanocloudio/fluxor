@@ -61,7 +61,3 @@ max_inline_lines    = 1000
 # KATs under `tests/harness` already exercise the module from
 # outside, so this is a structural cfg, not a smuggled inline test
 # suite.
-[[ci.hygiene.exemption]]
-path   = "modules/foundation/tls/mod.rs"
-rule   = "inline-tests"
-reason = "no_std/no_main predicate includes `test` so `cargo test -p fluxor-mod-tls` can link a harness binary"

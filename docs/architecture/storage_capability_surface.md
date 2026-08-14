@@ -30,7 +30,7 @@ surfaces compose the family; every provider declares one or more.
 |---------------------|-----------------------------------------------------------------|--------------------------------------------------------------|
 | `storage.block`     | Raw 512-byte block I/O                                          | sd, flash, nvme; fat32, littlefs consume                     |
 | `file.data`         | Byte-stream file access (open, read, seek, stat, write, fsync)  | fat32, linux_fs, http-as-fs; player / viewer modules consume |
-| `storage.namespace` | Name-keyed directory surface (lookup, list, rename, …)          | fat32 (readonly), linux_fs, replicated namespace adapters    |
+| `storage.namespace` | Name-keyed directory surface (bind, lookup, list, rename, …)    | fat32 (readonly), linux_fs, replicated namespace adapters    |
 | `storage.object`    | Whole-blob byte-addressed surface (put, get, head, range_get)   | content-addressed stores, replicated object stores, HTTP-backed adapters |
 
 Multipart object upload is deliberately not part of `storage.object`.
@@ -330,7 +330,7 @@ separate query-callback ABI.
 
 **2. Handle=-1 one-shot ops** (e.g. `object::PUT`, `object::HEAD`,
 `object::DELETE`, `namespace::LIST`, `namespace::RENAME`,
-`namespace::DELETE`, `object::PUT_STREAMED_COMMIT`) carry a
+`namespace::DELETE`, `namespace::BIND`, `object::PUT_STREAMED_COMMIT`) carry a
 `[fence_out_ptr: u64 LE, fence_out_cap: u16 LE]` pair at the end of
 their arg layout. The provider writes the encoded fence (up to
 `fence::WIRE_MAX_LEN` bytes) into that buffer atomically with

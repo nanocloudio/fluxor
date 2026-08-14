@@ -138,6 +138,9 @@ unsafe fn wasm_ns_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
         dev_ns::STAT => ns_stat(raw, arg, arg_len),
         dev_ns::LIST => ns_list(arg, arg_len),
         dev_ns::CLOSE => ns_close(raw),
+        // Read-only enumeration surface: no mutation or change ops, so
+        // every optional-cap bit is honestly zero (namespace.rs::caps).
+        dev_ns::CAPS => 0,
         _ => errno::ENOSYS,
     }
 }

@@ -304,6 +304,12 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
     // the ABI pin test keys off.
     let sdk_owner = project_root.join("modules/sdk/abi_surface.rs").is_file();
 
+    // Files whose inline tests actually run on the host (see
+    // `host_compiled_closure`). The inline-tests rule does not apply to
+    // them: it exists because a `#[cfg(test)]` block in a `no_std`
+    // module compiles away unnoticed, and these blocks do not.
+    let host_compiled = host_compiled_closure(project_root);
+
     let walker = walkdir::WalkDir::new(project_root)
         .follow_links(false)
         .into_iter()
@@ -335,6 +341,11 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
         report.files_scanned += 1;
 
         let tier = classify_tier(&rel);
+        let tier = if host_compiled.contains(&rel) {
+            Tier::Tests // host-compiled: inline tests run, so the rule is moot
+        } else {
+            tier
+        };
         let mut file_violations = scan_file(&rel, &content, tier, config);
         if !sdk_owner {
             file_violations.extend(scan_sdk_mounts(&rel, &content));
@@ -911,6 +922,107 @@ fn classify_tier(rel: &Path) -> Tier {
         return Tier::Modules;
     }
     Tier::Src
+}
+
+/// Every file reachable by `#[path]` from a host-compiled root.
+///
+/// The inline-tests rule bans `#[cfg(test)]` under `modules/` because a
+/// `no_std` module compiles the block away and the tests silently never
+/// run. That reasoning stops exactly where the file is ALSO pulled into
+/// a host build: the same block is compiled and executed there, which is
+/// the outcome the rule wants.
+///
+/// The roots are the three ways a module source becomes host-compiled: a
+/// file under `tests/`-like tiers, a file under `src/` (a crate lib that
+/// mounts module surfaces), and a `[test] harness` a manifest declares.
+/// From each root the mounts are followed transitively — a harness that
+/// mounts `../mod.rs` makes that file host-compiled, and anything it
+/// mounts in turn.
+///
+/// Derived, never listed: the alternative is an exemption row per file,
+/// which is how thirty of them accumulated saying the same sentence.
+fn host_compiled_closure(project_root: &Path) -> HashSet<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+
+    for entry in walkdir::WalkDir::new(project_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !should_skip(e))
+        .filter_map(std::result::Result::ok)
+    {
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(project_root) else {
+            continue;
+        };
+        match path.extension().and_then(|s| s.to_str()) {
+            // A host root: cargo compiles it, so what it mounts is host code.
+            Some("rs") if !classify_tier(rel).eq(&Tier::Modules) => {
+                queue.push(rel.to_path_buf());
+            }
+            // A declared module harness is host-compiled by `fluxor test`.
+            Some("toml") if path.file_name().is_some_and(|n| n == "manifest.toml") => {
+                if let Some(h) = fs::read_to_string(path)
+                    .ok()
+                    .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
+                    .and_then(|d| d.get("test")?.get("harness")?.as_str().map(str::to_string))
+                {
+                    if let Some(dir) = rel.parent() {
+                        queue.push(dir.join(h));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    while let Some(rel) = queue.pop() {
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(project_root.join(&rel)) else {
+            continue;
+        };
+        let Some(dir) = rel.parent() else { continue };
+        for line in text.lines() {
+            if let Some(target) = mount_target(line) {
+                queue.push(lexical_join(dir, &target));
+            }
+        }
+    }
+    seen
+}
+
+/// The file a line mounts, by either mechanism: `#[path = "…"]` on a
+/// `mod`, or `include!("…")`. Both splice a source file into the
+/// compiling crate, so both carry host-compilation to their target —
+/// following only one is how six of these exemptions survived a sweep
+/// that removed the rest.
+fn mount_target(line: &str) -> Option<String> {
+    let t = line.trim();
+    let rest = match (t.strip_prefix("#[path"), t.find("include!(")) {
+        (Some(after), _) => after.trim_start().strip_prefix('=')?,
+        (None, Some(i)) => &t[i + "include!(".len()..],
+        (None, None) => return None,
+    };
+    let q = rest.find('"')?;
+    let tail = &rest[q + 1..];
+    Some(tail[..tail.find('"')?].to_string())
+}
+
+/// Resolve `rel` against `base` textually — `..` pops, `.` is dropped.
+fn lexical_join(base: &Path, rel: &str) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for part in rel.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            p => out.push(p),
+        }
+    }
+    out
 }
 
 fn tier_forbids_inline_tests(tier: Tier, config: &Config) -> bool {
@@ -1788,5 +1900,33 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
         let src = "#[cfg(test_runner)]\nfn f() {}\n";
         let v = scan_str(src, Tier::Modules, &strict());
         assert!(v.iter().all(|v| v.rule != Rule::InlineTests));
+    }
+
+    /// A module source pulled into a host build is not what the
+    /// inline-tests rule is about: its `#[cfg(test)]` block compiles and
+    /// runs there. Both mounting mechanisms carry that, and following
+    /// only `#[path]` left every `include!`-mounted core still flagged.
+    #[test]
+    fn mount_target_reads_both_mounting_mechanisms() {
+        assert_eq!(
+            mount_target("#[path = \"../../common/ssh_wire.rs\"]").as_deref(),
+            Some("../../common/ssh_wire.rs")
+        );
+        assert_eq!(
+            mount_target("include!(\"../../../modules/common/sector_dedup.rs\");").as_deref(),
+            Some("../../../modules/common/sector_dedup.rs")
+        );
+        assert_eq!(mount_target("let p = \"not a mount\";"), None);
+    }
+
+    #[test]
+    fn lexical_join_resolves_parent_hops() {
+        assert_eq!(
+            lexical_join(
+                std::path::Path::new("tools/cli/tests"),
+                "../../../modules/common/x.rs"
+            ),
+            std::path::PathBuf::from("modules/common/x.rs")
+        );
     }
 }

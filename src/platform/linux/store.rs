@@ -955,6 +955,10 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
     };
 
     match opcode {
+        // Versioned store: live subscriptions and windowed change reads
+        // are implemented; mutation (BIND/RENAME/DELETE) flows through the
+        // object surface, not this one (namespace.rs::caps).
+        ns_op::CAPS => (ns_op::caps::SUBSCRIBE | ns_op::caps::CHANGES) as i32,
         ns_op::LIST => {
             // [prefix_len:u16][prefix][cursor_len:u16][cursor][out_buf:u64][out_cap:u32]
             // [fence_out_ptr:u64][fence_out_cap:u16]

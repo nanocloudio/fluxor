@@ -1,0 +1,27 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# RAM-backed `storage.namespace` fixture provider — the contract-proving
+# provider for the namespace surface and the first implementor of BIND
+# (0x1308). Exists so the surface and the `mount` routing tier above it
+# are testable with no on-disk format in the loop
+# (rfc_storage_capability_symmetry §5). All fences are honestly Volatile.
+provides = ["storage.namespace"]
+
+[test]
+harness = "tests/harness.rs"
+
+# No tick-based timekeeping: pure provider_call surface.
+timer_class = "agnostic"
+
+# Optional control channel, declared for symmetry with `mount`; inert
+# when unwired.
+[[ports]]
+name = "ctl"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "RAM fixture provider driven only by provider_call from contract tests; emits no sustained byte stream"

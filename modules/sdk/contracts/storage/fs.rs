@@ -99,6 +99,10 @@ pub const READDIR: u32 = 0x0908;
 /// so callers that skip the `CAPS` check still get a clean error
 /// — they just won't know up-front whether the call would
 /// succeed.
+///
+/// Normatively `storage.namespace::BIND(kind=object)` +
+/// `file.data::OPEN` fused into one round trip — see
+/// `namespace.rs::BIND` for the fused/split equivalence.
 pub const OPEN_CREATE: u32 = 0x0909;
 
 /// Remove a filesystem entry by path.
@@ -113,6 +117,8 @@ pub const UNLINK: u32 = 0x090A;
 /// `mkdir`, not `mkdir -p`); a missing parent returns `ENOENT`. An existing
 /// directory at the path is success, so callers that create each level
 /// top-down (e.g. `scp -r`, which sends one `D` per level) can re-issue safely.
+/// Normatively `storage.namespace::BIND(kind=namespace)` — see
+/// `namespace.rs::BIND` for the fused/split equivalence.
 ///
 /// `handle = -1`; `arg` points at the UTF-8 path without a NUL terminator and
 /// `arg_len` is its byte length. Returns `0` on success or a negative errno.
