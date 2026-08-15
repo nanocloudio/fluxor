@@ -85,7 +85,7 @@ const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 // surface reserved for QUIC. Every message is the universal
 // `[msg_type:u8][len:u16 LE][payload]` TLV (written via `net_write_frame`,
 // read via `net_read_frame`), so back-to-back stream writes / datagrams
-// never coalesce on the byte-stream FIFO. We map our 1-byte `conn_id` to
+// never coalesce on the byte-stream FIFO. We map our small `conn_id` to
 // a `session_id: u32 LE` and the QUIC stream id to `stream_id: u32 LE`.
 //
 //   quic → app: MSG_MUX_STREAM_ACCEPTED [session][stream][flags]

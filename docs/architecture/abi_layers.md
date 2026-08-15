@@ -303,9 +303,9 @@ one of which is selected at compile time via `cfg(target_arch)`:
 
 | Profile | Selected for | Sample sizes |
 |---|---|---|
-| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `STATE_ARENA = 32 MiB`, `BUFFER_ARENA = 8 MiB`, `MAX_MODULES = 64`, http `MAX_CONCURRENT_CONNS = 256` |
-| `profile_wasm` | `target_arch = "wasm32"` | `STATE_ARENA = 32 MiB`, `BUFFER_ARENA = 2 MiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 32` |
-| `profile_embedded` | anything else (`thumbv*`) | `STATE_ARENA = 256 KiB`, `BUFFER_ARENA = 64 KiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 1` |
+| `profile_host` | `target_arch = "aarch64"` (Pi 5, Linux host, BCM2712 bare-metal) | `STATE_ARENA = 96 MiB`, `BUFFER_ARENA = 8 MiB`, `MAX_MODULES = 128`, http `MAX_CONCURRENT_CONNS = 256`, `ELASTIC_REGION = 8 MiB` |
+| `profile_wasm` | `target_arch = "wasm32"` | `STATE_ARENA = 96 MiB`, `BUFFER_ARENA = 8 MiB`, `MAX_MODULES = 48`, http `MAX_CONCURRENT_CONNS = 256`, `ELASTIC_REGION = 2 MiB` |
+| `profile_embedded` | anything else (`thumbv*`) | `STATE_ARENA = 256 KiB`, `BUFFER_ARENA = 64 KiB`, `MAX_MODULES = 32`, http `MAX_CONCURRENT_CONNS = 1`, `ELASTIC_REGION = 0` |
 
 This is *not* a YAML overlay or a TOML-driven build artefact — it is a
 Rust file the SDK compiles into both the kernel and every module.

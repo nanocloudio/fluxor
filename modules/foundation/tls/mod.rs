@@ -91,6 +91,117 @@ include!("dtls_state.rs");
 const MAX_SESSIONS: usize = 64;
 #[cfg(not(target_arch = "aarch64"))]
 const MAX_SESSIONS: usize = 4;
+
+// ── Tier B session storage (`rfc_resource_model.md` §3.6) ────────────
+//
+// Sessions grow at runtime in whole chunks: the first chunk lives inline
+// in module state (always available — the pool's `min`), and further
+// chunks are granted on demand from the kernel elastic region
+// (`resource::ELASTIC_ALLOC`) up to `MAX_SESSIONS` (the pool's `max`).
+// Light-load footprint is one chunk (~8 sessions ≈ 100 KiB) rather than
+// an always-resident `MAX_SESSIONS` block (~830 KiB); grants are
+// reclaimed by the kernel when this module's owner is torn down. On
+// embedded targets the first chunk IS the whole pool (`MAX_SESSIONS`
+// inline) — no elastic dependency, identical behaviour to a static
+// array (§3.5 MCU degeneration).
+
+/// Sessions per chunk. One chunk (~100 KiB) rounds to two 64 KiB elastic
+/// quanta; embedded holds the whole (4-session) pool inline.
+#[cfg(target_arch = "aarch64")]
+const SESSION_CHUNK: usize = 8;
+#[cfg(not(target_arch = "aarch64"))]
+const SESSION_CHUNK: usize = MAX_SESSIONS;
+/// Elastic chunks past the inline first chunk.
+const EXTRA_CHUNKS: usize = (MAX_SESSIONS - SESSION_CHUNK) / SESSION_CHUNK;
+const _: () = assert!(SESSION_CHUNK * (1 + EXTRA_CHUNKS) == MAX_SESSIONS);
+
+/// Chunked session pool. `Index`/`IndexMut` keep every `sessions[i]`
+/// call site borrowing only this field, like a plain inline array —
+/// the chunk indirection is invisible to the state machine.
+/// Slots in granted chunks arrive kernel-zeroed, so a fresh slot's
+/// `SessionState` is `Idle` (discriminant 0), same as inline state.
+struct SessionArena {
+    first: [TlsSession; SESSION_CHUNK],
+    extra: [*mut TlsSession; EXTRA_CHUNKS],
+    extra_allocated: u8,
+}
+
+impl SessionArena {
+    /// Usable session slots (inline + granted chunks). Iteration bound —
+    /// slots past this are unbacked memory until [`Self::grow`] grants
+    /// them.
+    fn len(&self) -> usize {
+        SESSION_CHUNK + self.extra_allocated as usize * SESSION_CHUNK
+    }
+
+    /// Iterate the live slots (inline + granted chunks).
+    fn iter(&self) -> impl Iterator<Item = &TlsSession> {
+        (0..self.len()).map(move |i| &self[i])
+    }
+
+    /// Grant one more chunk from the kernel elastic region. `false` at
+    /// `MAX_SESSIONS` or when the region denies (the caller treats both
+    /// as pool-full). Control-plane only — called from the accept path,
+    /// never per-record.
+    fn grow(&mut self, sys: &SyscallTable) -> bool {
+        let next = self.extra_allocated as usize;
+        if next >= EXTRA_CHUNKS {
+            return false;
+        }
+        let bytes = (SESSION_CHUNK * core::mem::size_of::<TlsSession>()) as u32;
+        let mut arg = [0u8; 8];
+        arg[0..4].copy_from_slice(&bytes.to_le_bytes());
+        // SAFETY: kernel-owned syscall table; arg is an 8-byte local.
+        let rc = unsafe {
+            (sys.provider_call)(-1, abi::contracts::resource::ELASTIC_ALLOC, arg.as_mut_ptr(), 8)
+        };
+        if rc < bytes as i32 {
+            return false;
+        }
+        let chunk = u64::from_le_bytes(arg) as usize as *mut TlsSession;
+        // Slot-initialise the grant (same discipline as the module_new
+        // loop over the inline chunk): `empty()` is authoritative — the
+        // kernel zeroes the chunk, but enum/Option layouts are not
+        // promised to be zero-is-valid. `write` never drops the old
+        // bytes. aarch64-only path (EXTRA_CHUNKS is 0 elsewhere), so the
+        // temporary rides the kernel's full-size stack.
+        for k in 0..SESSION_CHUNK {
+            // SAFETY: the kernel granted `SESSION_CHUNK` sessions at `chunk`.
+            unsafe { core::ptr::write(chunk.add(k), TlsSession::empty()) };
+        }
+        self.extra[next] = chunk;
+        self.extra_allocated += 1;
+        true
+    }
+}
+
+impl core::ops::Index<usize> for SessionArena {
+    type Output = TlsSession;
+    fn index(&self, i: usize) -> &TlsSession {
+        if i < SESSION_CHUNK {
+            &self.first[i]
+        } else {
+            let chunk = (i - SESSION_CHUNK) / SESSION_CHUNK;
+            debug_assert!(chunk < self.extra_allocated as usize);
+            // SAFETY: `chunk < extra_allocated` — the pointer is a live
+            // kernel grant of `SESSION_CHUNK` sessions.
+            unsafe { &*self.extra[chunk].add((i - SESSION_CHUNK) % SESSION_CHUNK) }
+        }
+    }
+}
+
+impl core::ops::IndexMut<usize> for SessionArena {
+    fn index_mut(&mut self, i: usize) -> &mut TlsSession {
+        if i < SESSION_CHUNK {
+            &mut self.first[i]
+        } else {
+            let chunk = (i - SESSION_CHUNK) / SESSION_CHUNK;
+            debug_assert!(chunk < self.extra_allocated as usize);
+            // SAFETY: as in `Index`.
+            unsafe { &mut *self.extra[chunk].add((i - SESSION_CHUNK) % SESSION_CHUNK) }
+        }
+    }
+}
 const MAX_CERT_LEN: usize = 1024;
 const MAX_KEY_LEN: usize = 160;
 
@@ -149,7 +260,7 @@ enum SessionState {
 
 struct TlsSession {
     state: SessionState,
-    conn_id: u8,       // net_proto connection ID
+    conn_id: u16,      // net_proto connection ID
     held_msg_type: u8, // held ACCEPTED/CONNECTED msg type to forward after handshake
 
     /// Record-agnostic handshake state machine (Phase A — extracted into
@@ -536,8 +647,8 @@ struct TlsState {
     /// vault and falls back to the in-module `key` on ENOSYS.
     key_vault_handle: i32,
 
-    // Sessions
-    sessions: [TlsSession; MAX_SESSIONS],
+    // Sessions — Tier B chunked pool (see `SessionArena`).
+    sessions: SessionArena,
 
     // ------------------------------------------------------------------
     // DTLS mode (`transport == TRANSPORT_UDP`). The fields below are
@@ -785,9 +896,10 @@ pub unsafe extern "C" fn module_new(
     s.clear_out = dev_channel_port(sys, 1, 1);
     s.peer_identity = dev_channel_port(sys, 1, 2);
 
-    // Initialize sessions
+    // Initialize the inline session chunk; elastic chunks are
+    // slot-initialised by `SessionArena::grow` at grant time.
     let mut i = 0;
-    while i < MAX_SESSIONS {
+    while i < s.sessions.len() {
         s.sessions[i] = TlsSession::empty();
         i += 1;
     }
@@ -1084,7 +1196,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // installs `write_keys`. Draining only at the end would encrypt
     // ServerHello with handshake keys — the peer can't decrypt that.
     let mut i = 0;
-    while i < MAX_SESSIONS {
+    while i < s.sessions.len() {
         // Observability: emit the `tls.handshake` span once the handshake has
         // resolved (Ready = ok, Error = failed). Done before the Closed/Error
         // branches below reset the slot. Zero-cost when the port is unwired.
@@ -1206,10 +1318,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         tls_discard(sys, s.cipher_in, pl - 256);
                     }
                 }
-                let conn_id = if pl > 0 {
-                    // SAFETY: forwarded to the runtime helper which validates the
-                    // pointer + length contract documented at its declaration.
-                    unsafe { *payload.as_ptr() }
+                let conn_id = if pl >= 2 {
+                    u16::from_le_bytes([payload[0], payload[1]])
                 } else {
                     0
                 };
@@ -1222,7 +1332,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
                 // unaffected: TLS is the sole accept-claimant on its channel.
                 let claim = if t == NET_MSG_CONNECTED {
-                    let tag = if pl >= 2 { payload[1] } else { 0 };
+                    let tag = if pl >= 3 { payload[2] } else { 0 };
                     let me = dev_requester_tag(sys);
                     tag == 0 || tag == me
                 } else if s.mode == 0 {
@@ -1265,9 +1375,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // downstream requester tag at payload[1], matching the
                     // session path's `forward_held_completion` framing so the
                     // relay routes it on a fanned clear_out.
-                    let out = [conn_id, dtag];
+                    let cb = conn_id.to_le_bytes();
+                    let out = [cb[0], cb[1], dtag];
                     let _ =
-                        tls_write_raw_frame(sys, s.clear_out, NET_MSG_CONNECTED, out.as_ptr(), 2);
+                        tls_write_raw_frame(sys, s.clear_out, NET_MSG_CONNECTED, out.as_ptr(), 3);
                 } else if claim {
                     match alloc_session_for_conn(s, conn_id) {
                         Some(idx) => {
@@ -1341,15 +1452,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             t if t == NET_MSG_DATA => {
                 // Read conn_id + ciphertext payload
                 let pl = payload_len as usize;
-                if pl < 1 {
+                if pl < 2 {
                     // Malformed — skip
+                    tls_discard(sys, s.cipher_in, pl);
                 } else {
-                    let mut conn_id_buf = [0u8; 1];
-                    (sys.channel_read)(s.cipher_in, conn_id_buf.as_mut_ptr(), 1);
-                    // SAFETY: forwarded to the runtime helper which validates the
-                    // pointer + length contract documented at its declaration.
-                    let conn_id = unsafe { *conn_id_buf.as_ptr() };
-                    let data_len = pl - 1;
+                    let mut conn_id_buf = [0u8; 2];
+                    (sys.channel_read)(s.cipher_in, conn_id_buf.as_mut_ptr(), 2);
+                    let conn_id = u16::from_le_bytes(conn_id_buf);
+                    let data_len = pl - 2;
                     if is_passthrough(s, conn_id) {
                         // Cleartext backend → clear side, RAW. No session, no
                         // decryption (workload_ingress §5).
@@ -1423,7 +1533,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if pl > 16 {
                     tls_discard(sys, s.cipher_in, pl - 16);
                 }
-                let conn_id = if pl > 0 { payload[0] } else { 0 };
+                let conn_id = if pl >= 2 {
+                    u16::from_le_bytes([payload[0], payload[1]])
+                } else {
+                    0
+                };
                 // Clean up session (or drop a passthrough conn's mark). A
                 // passthrough conn has no session, so `find_session` is -1;
                 // clearing the bit lets the id be reused (workload_ingress §5).
@@ -1482,20 +1596,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // (no session yet) from the pending connect slot. MSG_BOUND has
                 // no tag and passes through unchanged.
                 let mut forward = bound_is_ours;
-                if t == NET_MSG_ERROR && rd >= 3 {
-                    let conn_id = s.net_scratch[0];
-                    let in_tag = s.net_scratch[2]; // IP-echoed requester tag
+                if t == NET_MSG_ERROR && rd >= 4 {
+                    let conn_id = u16::from_le_bytes([s.net_scratch[0], s.net_scratch[1]]);
+                    let in_tag = s.net_scratch[3]; // IP-echoed requester tag
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         // Established-connection error → its session's tag.
-                        s.net_scratch[2] = s.sessions[si as usize].downstream_tag;
+                        s.net_scratch[3] = s.sessions[si as usize].downstream_tag;
                     } else if s.pending_connect_active && in_tag == dev_requester_tag(sys) {
                         // A CONNECT failure routed to TLS carries TLS's own
                         // tag (TLS stamped it). Only THEN consume the pending
                         // slot — a co-wired consumer's failure (different tag)
                         // must not cancel our connect.
                         s.pending_connect_active = false;
-                        s.net_scratch[2] = s.pending_downstream_tag;
+                        s.net_scratch[3] = s.pending_downstream_tag;
                         s.pending_downstream_tag = 0;
                     } else {
                         // Another consumer's error on the shared fan, or an
@@ -1508,20 +1622,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
             t if t == NET_MSG_ACK => {
-                // Payload: [conn_id:1][acked_seq:4 LE].
+                // Payload: `[conn_id:2 LE][acked_seq:4 LE]`.
                 let pl = payload_len as usize;
-                let mut payload = [0u8; 5];
-                let rd = if pl < 5 { pl } else { 5 };
+                let mut payload = [0u8; 6];
+                let rd = if pl < 6 { pl } else { 6 };
                 if rd > 0 {
                     (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
                 }
                 if pl > rd {
                     tls_discard(sys, s.cipher_in, pl - rd);
                 }
-                if rd == 5 {
-                    let conn_id = payload[0];
+                if rd == 6 {
+                    let conn_id = u16::from_le_bytes([payload[0], payload[1]]);
                     let acked_seq =
-                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         retx_ack(&mut s.sessions[si as usize], acked_seq);
@@ -1529,20 +1643,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
             t if t == NET_MSG_RETRANSMIT => {
-                // Payload: [conn_id:1][from_seq:4 LE].
+                // Payload: `[conn_id:2 LE][from_seq:4 LE]`.
                 let pl = payload_len as usize;
-                let mut payload = [0u8; 5];
-                let rd = if pl < 5 { pl } else { 5 };
+                let mut payload = [0u8; 6];
+                let rd = if pl < 6 { pl } else { 6 };
                 if rd > 0 {
                     (sys.channel_read)(s.cipher_in, payload.as_mut_ptr(), rd);
                 }
                 if pl > rd {
                     tls_discard(sys, s.cipher_in, pl - rd);
                 }
-                if rd == 5 {
-                    let conn_id = payload[0];
+                if rd == 6 {
+                    let conn_id = u16::from_le_bytes([payload[0], payload[1]]);
                     let from_seq =
-                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                        u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         retx_replay(s, si as usize, from_seq);
@@ -1567,7 +1681,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if pl >= abi::contracts::net::net_proto::TRACE_CTX_LEN
                     && dev_telemetry_enabled(&*s.syscalls)
                 {
-                    let conn_id = pbuf[0];
+                    let conn_id = u16::from_le_bytes([pbuf[0], pbuf[1]]);
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         let idx = si as usize;
@@ -1578,11 +1692,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // the held accept) would lose the parenting.
                         s.sessions[idx]
                             .trace_ctx_trace
-                            .copy_from_slice(&pbuf[1..17]);
+                            .copy_from_slice(&pbuf[2..18]);
                         s.sessions[idx]
                             .trace_ctx_parent
-                            .copy_from_slice(&pbuf[17..25]);
-                        s.sessions[idx].trace_ctx_flags = pbuf[25];
+                            .copy_from_slice(&pbuf[18..26]);
+                        s.sessions[idx].trace_ctx_flags = pbuf[26];
                     }
                 }
             }
@@ -1616,13 +1730,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             t if t == NET_CMD_SEND => {
                 // Encrypt and forward as CMD_SEND on cipher_out
                 let pl = payload_len as usize;
-                if pl < 1 {
+                if pl < 2 {
                     // Malformed
+                    tls_discard(sys, s.clear_in, pl);
                 } else {
-                    let mut conn_id_buf = [0u8; 1];
-                    (sys.channel_read)(s.clear_in, conn_id_buf.as_mut_ptr(), 1);
-                    let conn_id = conn_id_buf[0];
-                    let data_len = pl - 1;
+                    let mut conn_id_buf = [0u8; 2];
+                    (sys.channel_read)(s.clear_in, conn_id_buf.as_mut_ptr(), 2);
+                    let conn_id = u16::from_le_bytes(conn_id_buf);
+                    let data_len = pl - 2;
                     if is_passthrough(s, conn_id) {
                         // Clear side → cleartext backend, RAW. No session, no
                         // encryption (workload_ingress §5).
@@ -1732,7 +1847,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if pl > 16 {
                     tls_discard(sys, s.clear_in, pl - 16);
                 }
-                let conn_id = if pl > 0 { payload[0] } else { 0 };
+                let conn_id = if pl >= 2 {
+                    u16::from_le_bytes([payload[0], payload[1]])
+                } else {
+                    0
+                };
                 // Drop any passthrough mark (no session, no close_notify — the
                 // backend hop is cleartext; workload_ingress §5). The raw
                 // CMD_CLOSE forward below tears the backend TCP conn down.
@@ -1843,7 +1962,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
     // ── Phase 4: For Ready sessions, try to decrypt any buffered data ──
     i = 0;
-    while i < MAX_SESSIONS {
+    while i < s.sessions.len() {
         if s.sessions[i].state == SessionState::Ready {
             // Retry any held completion that a back-pressured clear_out dropped
             // at handshake-complete, so the consumer always learns of the accept
@@ -2006,26 +2125,36 @@ unsafe fn emit_handshake_span(s: &mut TlsState, idx: usize, ok: bool) {
     );
 }
 
-fn alloc_session_for_conn(s: &mut TlsState, conn_id: u8) -> Option<usize> {
-    let mut i = 0;
-    while i < MAX_SESSIONS {
-        if s.sessions[i].state == SessionState::Idle {
-            s.sessions[i].state = SessionState::Allocated;
-            s.sessions[i].conn_id = conn_id;
-            s.sessions[i].held_msg_type = 0;
-            s.sessions[i].recv_len = 0;
-            s.sessions[i].send_len = 0;
-            s.sessions[i].send_offset = 0;
-            return Some(i);
+fn alloc_session_for_conn(s: &mut TlsState, conn_id: u16) -> Option<usize> {
+    loop {
+        let live = s.sessions.len();
+        let mut i = 0;
+        while i < live {
+            if s.sessions[i].state == SessionState::Idle {
+                s.sessions[i].state = SessionState::Allocated;
+                s.sessions[i].conn_id = conn_id;
+                s.sessions[i].held_msg_type = 0;
+                s.sessions[i].recv_len = 0;
+                s.sessions[i].send_len = 0;
+                s.sessions[i].send_offset = 0;
+                return Some(i);
+            }
+            i += 1;
         }
-        i += 1;
+        // Every live slot busy: grow by one chunk (Tier B) and rescan.
+        // `grow` is false at MAX_SESSIONS or on an elastic denial — the
+        // pool is full; the caller refuses the conn (never wedges).
+        // SAFETY: `s.syscalls` is the kernel table installed at module_new.
+        let sys = unsafe { &*s.syscalls };
+        if !s.sessions.grow(sys) {
+            return None;
+        }
     }
-    None
 }
 
-fn find_session_by_conn_id(s: &TlsState, conn_id: u8) -> i32 {
+fn find_session_by_conn_id(s: &TlsState, conn_id: u16) -> i32 {
     let mut i = 0;
-    while i < MAX_SESSIONS {
+    while i < s.sessions.len() {
         if s.sessions[i].state != SessionState::Idle && s.sessions[i].conn_id == conn_id {
             return i as i32;
         }
@@ -2041,17 +2170,25 @@ fn find_session_by_conn_id(s: &TlsState, conn_id: u8) -> i32 {
 // existing session lookup for inbound-terminated TLS.
 
 #[inline]
-fn is_passthrough(s: &TlsState, conn_id: u8) -> bool {
-    (s.passthrough_conns[(conn_id >> 3) as usize] >> (conn_id & 7)) & 1 != 0
+fn is_passthrough(s: &TlsState, conn_id: u16) -> bool {
+    // The bitmap covers the producer's 256-slot conn table; a (future)
+    // producer minting ids past it simply never marks passthrough.
+    conn_id < 256 && (s.passthrough_conns[(conn_id >> 3) as usize] >> (conn_id & 7)) & 1 != 0
 }
 
 #[inline]
-fn set_passthrough(s: &mut TlsState, conn_id: u8) {
+fn set_passthrough(s: &mut TlsState, conn_id: u16) {
+    if conn_id >= 256 {
+        return;
+    }
     s.passthrough_conns[(conn_id >> 3) as usize] |= 1 << (conn_id & 7);
 }
 
 #[inline]
-fn clear_passthrough(s: &mut TlsState, conn_id: u8) {
+fn clear_passthrough(s: &mut TlsState, conn_id: u16) {
+    if conn_id >= 256 {
+        return;
+    }
     s.passthrough_conns[(conn_id >> 3) as usize] &= !(1 << (conn_id & 7));
 }
 
@@ -2066,7 +2203,7 @@ unsafe fn passthrough_relay(
     from_chan: i32,
     to_chan: i32,
     msg_type: u8,
-    conn_id: u8,
+    conn_id: u16,
     mut data_len: usize,
 ) {
     const RELAY_CHUNK: usize = 1400;
@@ -2606,13 +2743,14 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
             );
             rec_len = 5 + total;
         } else {
-            let suite = s.sessions[idx].driver.suite;
+            let sess = &mut s.sessions[idx];
+            let suite = sess.driver.suite;
             let mut enc_buf = [0u8; SEND_BUF_SIZE];
             let enc_len = encrypt_record(
                 suite,
-                &mut s.sessions[idx].write_keys,
+                &mut sess.write_keys,
                 CT_HANDSHAKE,
-                &s.sessions[idx].driver.out_buf[..total],
+                &sess.driver.out_buf[..total],
                 &mut enc_buf,
             );
             rec[0] = CT_APPLICATION_DATA;
@@ -3300,7 +3438,7 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
 pub const MSG_PEER_IDENTITY: u8 = 0x5A;
 pub const PEER_IDENTITY_REPLICA_UNKNOWN: u8 = 0xFF;
 pub const PEER_IDENTITY_HEADER_LEN: usize = 3;
-pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = 4; // conn_id + replica + verified + svid_len
+pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = 5; // conn_id (u16) + replica + verified + svid_len
 pub const PEER_IDENTITY_MAX_SVID: usize = 32;
 pub const PEER_IDENTITY_MAX_TOTAL: usize =
     PEER_IDENTITY_HEADER_LEN + PEER_IDENTITY_FIXED_PAYLOAD_LEN + PEER_IDENTITY_MAX_SVID;
@@ -3310,7 +3448,7 @@ pub const PEER_IDENTITY_MAX_TOTAL: usize =
 /// emit path so the latch/retry logic can re-send byte-identical
 /// envelopes across ticks.
 pub fn build_peer_identity_envelope(
-    conn_id: u8,
+    conn_id: u16,
     svid: &[u8],
     out: &mut [u8; PEER_IDENTITY_MAX_TOTAL],
 ) -> usize {
@@ -3324,12 +3462,12 @@ pub fn build_peer_identity_envelope(
     out[0] = MSG_PEER_IDENTITY;
     out[1] = (payload_len & 0xFF) as u8;
     out[2] = ((payload_len >> 8) & 0xFF) as u8;
-    out[3] = conn_id;
-    out[4] = PEER_IDENTITY_REPLICA_UNKNOWN;
-    out[5] = verified;
-    out[6] = svid_len as u8;
+    out[3..5].copy_from_slice(&conn_id.to_le_bytes());
+    out[5] = PEER_IDENTITY_REPLICA_UNKNOWN;
+    out[6] = verified;
+    out[7] = svid_len as u8;
     if svid_len > 0 {
-        out[7..7 + svid_len].copy_from_slice(&svid[..svid_len]);
+        out[8..8 + svid_len].copy_from_slice(&svid[..svid_len]);
     }
     PEER_IDENTITY_HEADER_LEN + payload_len
 }
@@ -3409,7 +3547,7 @@ unsafe fn service_pending_peer_identity(s: &mut TlsState) {
         return;
     }
     let mut i = 0;
-    while i < MAX_SESSIONS {
+    while i < s.sessions.len() {
         if s.sessions[i].pending_peer_identity_len > 0 {
             try_drain_pending_peer_identity(s, i);
         }
@@ -3625,8 +3763,8 @@ unsafe fn tls_read_header(sys: &SyscallTable, chan: i32) -> (u8, u16) {
 }
 
 /// Write a net_proto frame with conn_id prefix, atomically.
-/// Frame: [msg_type: u8] [len: u16 LE] [conn_id: u8] [data...]
-/// len = 1 + data_len (conn_id byte + payload bytes)
+/// Frame: `[msg_type: u8][len: u16 LE][conn_id: u16 LE][data...]`
+/// len = 2 + data_len (conn_id + payload bytes)
 /// Assembled in scratch buffer and written in a single channel_write to
 /// prevent split-read issues on byte-stream FIFO channels.
 #[must_use = "may fail under backpressure; fail the session or use tls_write_or_count for best-effort sends"]
@@ -3634,24 +3772,26 @@ unsafe fn tls_write_frame(
     sys: &SyscallTable,
     chan: i32,
     msg_type: u8,
-    conn_id: u8,
+    conn_id: u16,
     data: *const u8,
     data_len: u16,
     scratch: &mut [u8; NET_SCRATCH_SIZE],
 ) -> bool {
-    let total_payload = 1u16 + data_len; // conn_id + data
+    let total_payload = 2u16 + data_len; // conn_id (u16 LE) + data
     let frame_len = 3 + total_payload as usize;
     if frame_len > NET_SCRATCH_SIZE {
         // Frame larger than the per-write scratch; chunk in the
         // caller. False makes the loss visible.
         return false;
     }
+    let cb = conn_id.to_le_bytes();
     *scratch.as_mut_ptr() = msg_type;
     *scratch.as_mut_ptr().add(1) = total_payload as u8;
     *scratch.as_mut_ptr().add(2) = (total_payload >> 8) as u8;
-    *scratch.as_mut_ptr().add(3) = conn_id;
+    *scratch.as_mut_ptr().add(3) = cb[0];
+    *scratch.as_mut_ptr().add(4) = cb[1];
     if data_len > 0 && !data.is_null() {
-        core::ptr::copy_nonoverlapping(data, scratch.as_mut_ptr().add(4), data_len as usize);
+        core::ptr::copy_nonoverlapping(data, scratch.as_mut_ptr().add(5), data_len as usize);
     }
     // `channel_write` is atomic-or-nothing: returns frame_len on
     // success, 0 on backpressure. A silent loss would advance the
@@ -3669,7 +3809,7 @@ unsafe fn tls_write_or_count(
     s: &mut TlsState,
     chan: i32,
     msg_type: u8,
-    conn_id: u8,
+    conn_id: u16,
     data: *const u8,
     data_len: u16,
 ) -> bool {
@@ -3949,7 +4089,7 @@ pub mod test_helpers {
     ///
     /// # Safety
     /// `state` must point to an initialised `TlsState`.
-    pub unsafe fn has_session_for_conn(state: *const u8, conn_id: u8) -> bool {
+    pub unsafe fn has_session_for_conn(state: *const u8, conn_id: u16) -> bool {
         let s = &*(state as *const TlsState);
         s.sessions
             .iter()

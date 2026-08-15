@@ -41,8 +41,6 @@ pub struct Shape {
     /// `modules/` exists and `[ci].targets` names at least one target,
     /// so `fluxor modules build --all` has something to do.
     pub has_modules: bool,
-    /// At least one module manifest declares `[test] harness = "…"`.
-    pub has_harnesses: bool,
     /// A cargo-visible source file `#[path]`-mounts something under
     /// `target/fluxor/`, so a wiped `target/` must be re-materialised
     /// before cargo reads the mount.
@@ -92,7 +90,6 @@ pub fn shape(project_root: &Path) -> Shape {
         has_cargo: project_root.join("Cargo.toml").is_file(),
         host_tools,
         has_modules: project_root.join("modules").is_dir() && !ci_targets(project_root).is_empty(),
-        has_harnesses: crate::module_test::resolved_harness_count(project_root) > 0,
         mounts_staged: mounts_staged_tree(project_root),
         test_scripts: ci::load_test_scripts(project_root).unwrap_or_default(),
         has_harness_crate: project_root.join("tests/harness").exists(),
@@ -257,15 +254,9 @@ pub fn build(project_root: &Path, verbose: bool) -> Result<()> {
 /// live; a project runs whichever it has. The e2e scripts run through
 /// `fluxor ci`'s own project-e2e runner, so `make test` and the gate
 /// agree on what "the scripts passed" means.
-pub fn test(project_root: &Path, verbose: bool) -> Result<()> {
+pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
     let s = shape(project_root);
     let mut did_something = false;
-
-    if s.has_harnesses {
-        step("fluxor modules test");
-        crate::module_test::cmd_test(Some(&s.project_root), None, verbose)?;
-        did_something = true;
-    }
 
     if let Some((dir, workspace)) = s.cargo_site() {
         let args: &[&str] = if workspace {
@@ -607,9 +598,6 @@ fn describe_build(s: &Shape) -> String {
 
 fn describe_test(s: &Shape) -> String {
     let mut parts = Vec::new();
-    if s.has_harnesses {
-        parts.push("module harnesses".to_string());
-    }
     if s.cargo_site().is_some() {
         parts.push("cargo test".to_string());
     }
@@ -777,7 +765,6 @@ mod tests {
             has_cargo: true,
             host_tools: Some(root.join("tools")),
             has_modules: false,
-            has_harnesses: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
             has_harness_crate: false,
@@ -794,7 +781,6 @@ mod tests {
             has_cargo: true,
             host_tools: None,
             has_modules: false,
-            has_harnesses: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
             has_harness_crate: false,
@@ -810,17 +796,13 @@ mod tests {
             has_cargo: false,
             host_tools: None,
             has_modules: true,
-            has_harnesses: true,
             mounts_staged: false,
             test_scripts: vec!["tools/e2e/*.sh".into()],
             has_harness_crate: false,
         };
         assert_eq!(s.cargo_site(), None);
         assert_eq!(describe_build(&s), "fluxor build — PIC modules".to_string());
-        assert_eq!(
-            describe_test(&s),
-            "fluxor test — module harnesses + e2e scripts".to_string()
-        );
+        assert_eq!(describe_test(&s), "fluxor test — e2e scripts".to_string());
     }
 
     /// A project whose ONLY cargo tree is `tests/harness/` must still have it
@@ -840,7 +822,6 @@ mod tests {
             has_cargo: false,
             host_tools: None,
             has_modules: true,
-            has_harnesses: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
             has_harness_crate: true,
@@ -863,7 +844,6 @@ mod tests {
             has_cargo: true,
             host_tools: None,
             has_modules: false,
-            has_harnesses: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
             has_harness_crate: false,

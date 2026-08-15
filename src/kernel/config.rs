@@ -24,3 +24,12 @@ pub const CONFIG_ARENA_SIZE: usize = crate::platform::chip::CONFIG_ARENA_SIZE;
 
 /// Maximum size of a single module's config-blob section.
 pub const MAX_MODULE_CONFIG_SIZE: usize = crate::platform::chip::MAX_MODULE_CONFIG_SIZE;
+
+/// Bytes of the Tier B elastic region (`rfc_resource_model.md` §3.6) and
+/// its grant quantum. Taken from the arch profile directly rather than
+/// through `platform::chip`: the values are profile-selected by target
+/// arch and have no per-silicon TOML variation (MCU profiles pin the
+/// region to 0 — elasticity compiles out).
+pub const ELASTIC_REGION_SIZE: usize = crate::abi::config::kernel::ELASTIC_REGION_SIZE;
+/// Grant granularity for [`ELASTIC_REGION_SIZE`] chunks.
+pub const ELASTIC_QUANTUM: usize = crate::abi::config::kernel::ELASTIC_QUANTUM;

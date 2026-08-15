@@ -24,6 +24,7 @@ mod add_subgraph;
 mod agent_cli;
 mod asset_bank;
 mod board;
+mod capacity;
 mod ci;
 mod config;
 mod crypto;
@@ -31,7 +32,6 @@ mod error;
 mod hash;
 mod hygiene;
 mod manifest;
-mod module_test;
 mod modules;
 mod modules_build;
 mod monitor;
@@ -288,11 +288,6 @@ fn main() {
                 cmd_sign(&input, &key, output.as_deref(), verbose)
             }
             ModulesAction::Keygen { key, force } => cmd_keygen(&key, force),
-            ModulesAction::Test {
-                module,
-                project_root,
-                verbose,
-            } => module_test::cmd_test(project_root.as_deref(), module.as_deref(), verbose),
         },
         Commands::Publish {
             action,

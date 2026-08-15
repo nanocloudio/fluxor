@@ -272,7 +272,7 @@ pub fn build_params_from_schema(
     if let Some(obj) = module.as_object() {
         if let Some(routes_val) = obj.get("routes") {
             if let Some(routes_arr) = routes_val.as_array() {
-                expand_routes(routes_arr, &mut kv, data_section);
+                expand_routes(routes_arr, &mut kv, data_section)?;
             }
         }
     }
@@ -1103,20 +1103,29 @@ fn resolve_pinned_fmod(module_type: &str, modules_dir: &Path) -> crate::Result<O
 ///   - `body` without → static (0)
 ///   - `source: files` → file (2)
 ///   - `proxy:` → proxy (3)
-fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section: Option<&Value>) {
-    // Must stay in sync with `modules/sdk/config.rs::http::MAX_ROUTES`
-    // for the host profile (target_arch=aarch64; currently 8 routes,
-    // tags 10..89). Embedded/wasm profiles share the same TLV table
-    // — the http module silently drops routes whose tags don't have
-    // matching `define_params!` entries in
-    // `modules/foundation/http/mod.rs`. The tool's 16 here is
-    // headroom; bumping MAX_ROUTES past 8 requires extending the TLV
-    // table at the kernel side first.
-    const TOOL_MAX_ROUTES: usize = 16;
+fn expand_routes(
+    routes: &[Value],
+    kv: &mut HashMap<String, Value>,
+    data_section: Option<&Value>,
+) -> Result<(), String> {
+    // The http module's TLV table (`define_params!`, host profile
+    // `http::MAX_ROUTES` in `modules/sdk/abi/config.rs`) carries 8 routes
+    // (tags 10..89). A route past that has no TLV tag and would vanish
+    // silently at runtime — so overflow is a compile error here, not
+    // headroom. Raising the ceiling means extending the module-side TLV
+    // table first; `tools/tests/http_route_tlv_coverage.rs` locks the pair.
+    const TOOL_MAX_ROUTES: usize = 8;
+    if routes.len() > TOOL_MAX_ROUTES {
+        return Err(format!(
+            "routes: {} declared, but the http module's TLV table carries {} — \
+             routes {}.. would be silently dropped at runtime. Split the routes \
+             across http module instances or extend the module-side table.",
+            routes.len(),
+            TOOL_MAX_ROUTES,
+            TOOL_MAX_ROUTES
+        ));
+    }
     for (i, route) in routes.iter().enumerate() {
-        if i >= TOOL_MAX_ROUTES {
-            break;
-        }
         let _base = i * 10 + 10; // tags: 10, 20, 30, 40
         let obj = match route.as_object() {
             Some(o) => o,
@@ -1314,6 +1323,7 @@ fn expand_routes(routes: &[Value], kv: &mut HashMap<String, Value>, data_section
             );
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1323,7 +1333,7 @@ mod tests {
     /// Derive the handler byte a `routes:` entry compiles to.
     fn handler_of(route: serde_json::Value) -> Option<u64> {
         let mut kv: HashMap<String, Value> = HashMap::new();
-        expand_routes(&[route], &mut kv, None);
+        expand_routes(&[route], &mut kv, None).expect("within route ceiling");
         kv.get("route_0_handler").and_then(|v| v.as_u64())
     }
 

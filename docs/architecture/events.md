@@ -231,7 +231,7 @@ For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` work
 
 | Code | Name | When |
 |------|------|------|
-| `-12` | `ENOMEM` | No free event slots (pool exhausted) |
+| `-28` | `ENOSPC` | No free event slots — an accounted capacity denial (`resource_ledger`, PSTATUS `POOL` records) |
 | `-16` | `EBUSY` | Event already has an IRQ binding |
 | `-19` | `ENODEV` | GPIO pin not claimed |
 | `-22` | `EINVAL` | Invalid handle, edge value, or source |

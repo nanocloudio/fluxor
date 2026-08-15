@@ -75,7 +75,10 @@ const DS_PENDING_TERMINATE: u8 = 3;
 // Bits returned by RECONFIGURE_MODULE_INFO.
 const INFO_DRAIN_CAPABLE: u32 = 0x01;
 
-// Matches the 32-bit upstream_mask the kernel exposes.
+// Module-local drain-state capacity (2-bit state × N in the packed ds_
+// table below). Independent of the kernel's upstream-mask width — a graph
+// with more modules than this cannot be live-drained by this module and
+// falls back to the timeout path.
 const MAX_TRACKED_MODULES: usize = 32;
 
 // StepOutcome return values.
@@ -173,20 +176,37 @@ unsafe fn sys_module_info(sys: &SyscallTable, idx: u8) -> u32 {
     if rc < 0 { 0 } else { rc as u32 }
 }
 
-unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u8) -> u64 {
-    // Arg layout: arg[0] = module idx in, arg[1..9] = u64 LE mask
-    // out. A 64-bit mask covers the full `MAX_MODULES = 64`
-    // (aarch64) index range.
-    let mut arg = [0u8; 9];
+/// Upstream-mask words per the `MODULE_UPSTREAM` wire contract: 4 × u64
+/// covers the whole u8 module-index domain (256 modules) on every profile.
+const UPSTREAM_WORDS: usize = 4;
+
+unsafe fn sys_module_upstream(sys: &SyscallTable, idx: u8) -> [u64; UPSTREAM_WORDS] {
+    // Arg layout: arg[0] = module idx in, arg[1..] = mask words u64 LE
+    // out (low word first); the kernel writes as many words as fit and
+    // returns its full word count.
+    let mut arg = [0u8; 1 + 8 * UPSTREAM_WORDS];
     arg[0] = idx;
-    let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_UPSTREAM, arg.as_mut_ptr(), 9);
-    if rc < 0 {
-        0
-    } else {
-        u64::from_le_bytes([
-            arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7], arg[8],
-        ])
+    let rc = (sys.provider_call)(
+        -1,
+        SYS_RECONFIG_MODULE_UPSTREAM,
+        arg.as_mut_ptr(),
+        arg.len(),
+    );
+    let mut mask = [0u64; UPSTREAM_WORDS];
+    if rc > 0 {
+        for (w, word) in mask.iter_mut().enumerate().take(rc as usize) {
+            let off = 1 + w * 8;
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&arg[off..off + 8]);
+            *word = u64::from_le_bytes(bytes);
+        }
     }
+    mask
+}
+
+/// Bit `j` of a flattened upstream mask.
+fn upstream_bit(mask: &[u64; UPSTREAM_WORDS], j: usize) -> bool {
+    j < UPSTREAM_WORDS * 64 && (mask[j / 64] >> (j % 64)) & 1 != 0
 }
 
 unsafe fn sys_module_done(sys: &SyscallTable, idx: u8) -> bool {
@@ -297,7 +317,7 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
                 let mut j = 0;
                 while j < count {
                     if j != i
-                        && (upstream & (1u64 << j)) != 0
+                        && upstream_bit(&upstream, j)
                         && ds_get(s, j) == DS_DRAINING
                     {
                         upstream_ok = false;

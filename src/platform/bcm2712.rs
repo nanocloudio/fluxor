@@ -77,9 +77,9 @@ use uart::*;
 // file). The constants stay name-identical so existing references in
 // the boot path resolve through the glob import unchanged.
 #[cfg(not(feature = "board-pi5"))]
-const QEMU_CONFIG_BLOB_ADDR: usize = 0x4100_0000;
+const QEMU_CONFIG_BLOB_ADDR: usize = 0x4C00_0000;
 #[cfg(not(feature = "board-pi5"))]
-const QEMU_MODULES_BLOB_ADDR: usize = 0x4200_0000;
+const QEMU_MODULES_BLOB_ADDR: usize = 0x4D00_0000;
 
 global_asm!(
     ".section .layout_header,\"a\"",

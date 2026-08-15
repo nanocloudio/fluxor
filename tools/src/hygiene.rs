@@ -351,12 +351,23 @@ fn scan_module_structure(project_root: &Path, report: &mut Report) {
             );
         }
 
-        // In-module tests/ requires a [test] declaration.
-        if module_dir.join("tests").is_dir() && !manifest.contains("[test]") {
+        // Tests live in the repo-root `tests/` tree, never under a module
+        // (standards/fluxor-modules.md §0.2) — and never as a manifest
+        // `[test]` lane.
+        if module_dir.join("tests").is_dir() {
             push(
                 module_rel.clone(),
-                "undeclared tests/ directory — declare `[test] harness = \"tests/...\"` \
-                 (run by `fluxor modules test`) or relocate the tests"
+                "tests/ directory under a module — relocate to the repo-root `tests/` tree \
+                 (standards/fluxor-modules.md §0.2)"
+                    .to_string(),
+                report,
+            );
+        }
+        if manifest.contains("[test]") {
+            push(
+                module_rel.clone(),
+                "manifest `[test]` section — the module-local test lane is retired; tests \
+                 live in the repo-root `tests/` tree (standards/fluxor-modules.md §0.2)"
                     .to_string(),
                 report,
             );

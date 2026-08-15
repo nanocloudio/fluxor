@@ -40,6 +40,10 @@ pub const SIGNAL_PSTATUS: u8 = 4;
 pub const PSTATUS_STEP: u8 = 1;
 /// Resource state: arena used/cap, fault count, flags.
 pub const PSTATUS_RES: u8 = 2;
+/// Resource-ledger pool state: capacity, in-use, peak, denials
+/// (`rfc_resource_model.md` §6.1). Pool ids and classes are the
+/// `resource` contract's registry.
+pub const PSTATUS_POOL: u8 = 3;
 
 // ── Syscall op numbers (rfc_observability_surface.md §5.2) ──────────
 // TLM_EMIT is an implicit primitive (any module, like LOG_WRITE); the consumer
@@ -108,6 +112,10 @@ pub const PSTATUS_STEP_SIZE: usize = HEADER_SIZE + 8 + HIST_BUCKETS * 4;
 /// PSTATUS resource body: `[arena_used u32][arena_cap u32][faults u32][flags u32]`
 /// (16 B → 28 total).
 pub const PSTATUS_RES_SIZE: usize = HEADER_SIZE + 16;
+/// PSTATUS pool body: `[pool u16][class u8][_rsvd u8][cap u32][cur u32]
+/// [peak u32][denials u32]` (20 B → 32 total). Units are the pool's own
+/// (bytes for arenas, slots for tables — see the `resource` contract).
+pub const PSTATUS_POOL_SIZE: usize = HEADER_SIZE + 20;
 /// Largest record the ring must reserve atomically — a histogram metric (80 B).
 pub const MAX_RECORD_SIZE: usize = METRIC_HIST_SIZE;
 
@@ -183,6 +191,7 @@ const _: () = assert!(METRIC_HIST_SIZE == 80);
 const _: () = assert!(SPAN_SIZE == 64);
 const _: () = assert!(PSTATUS_STEP_SIZE == 52);
 const _: () = assert!(PSTATUS_RES_SIZE == 28);
+const _: () = assert!(PSTATUS_POOL_SIZE == 32);
 const _: () = assert!(MAX_RECORD_SIZE == 80);
 const _: () = assert!(BATCH_HEADER_SIZE == 12);
 
@@ -195,6 +204,7 @@ pub fn record_len(signal: u8, kind: u8) -> usize {
         SIGNAL_SPAN => SPAN_SIZE,
         SIGNAL_PSTATUS if kind == PSTATUS_STEP => PSTATUS_STEP_SIZE,
         SIGNAL_PSTATUS if kind == PSTATUS_RES => PSTATUS_RES_SIZE,
+        SIGNAL_PSTATUS if kind == PSTATUS_POOL => PSTATUS_POOL_SIZE,
         _ => 0,
     }
 }
@@ -482,6 +492,66 @@ pub fn pstatus_res_faults(buf: &[u8]) -> u32 {
 /// PSTATUS `RES`: status flags word.
 pub fn pstatus_res_flags(buf: &[u8]) -> u32 {
     read_u32(buf, 24)
+}
+
+/// Encode a PSTATUS `POOL` record: one resource-ledger pool's state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wire-record encoder; the argument list mirrors the record's field layout"
+)]
+pub fn write_pstatus_pool(
+    buf: &mut [u8],
+    module: u16,
+    t_micros: u64,
+    pool: u16,
+    class: u8,
+    cap: u32,
+    cur: u32,
+    peak: u32,
+    denials: u32,
+) -> Option<usize> {
+    if buf.len() < PSTATUS_POOL_SIZE {
+        return None;
+    }
+    write_header(buf, SIGNAL_PSTATUS, PSTATUS_POOL, module, t_micros)?;
+    buf[12..14].copy_from_slice(&pool.to_le_bytes());
+    buf[14] = class;
+    buf[15] = 0;
+    buf[16..20].copy_from_slice(&cap.to_le_bytes());
+    buf[20..24].copy_from_slice(&cur.to_le_bytes());
+    buf[24..28].copy_from_slice(&peak.to_le_bytes());
+    buf[28..32].copy_from_slice(&denials.to_le_bytes());
+    Some(PSTATUS_POOL_SIZE)
+}
+
+/// PSTATUS `POOL`: pool id (the `resource` contract's registry).
+pub fn pstatus_pool_id(buf: &[u8]) -> u16 {
+    u16::from_le_bytes([buf[12], buf[13]])
+}
+
+/// PSTATUS `POOL`: resource class (`resource::CLASS_*`).
+pub fn pstatus_pool_class(buf: &[u8]) -> u8 {
+    buf[14]
+}
+
+/// PSTATUS `POOL`: capacity in the pool's own units.
+pub fn pstatus_pool_cap(buf: &[u8]) -> u32 {
+    read_u32(buf, 16)
+}
+
+/// PSTATUS `POOL`: units currently in use.
+pub fn pstatus_pool_cur(buf: &[u8]) -> u32 {
+    read_u32(buf, 20)
+}
+
+/// PSTATUS `POOL`: high-water mark of `cur`.
+pub fn pstatus_pool_peak(buf: &[u8]) -> u32 {
+    read_u32(buf, 24)
+}
+
+/// PSTATUS `POOL`: cumulative denied requests.
+pub fn pstatus_pool_denials(buf: &[u8]) -> u32 {
+    read_u32(buf, 28)
 }
 
 // ── W3C Trace Context ───────────────────────────────────────────────

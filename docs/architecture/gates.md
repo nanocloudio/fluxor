@@ -25,7 +25,7 @@ usual source of surprise.
 
 ### The epoch over-approximates, and that is fine
 
-`ABI_SURFACE_DIGEST = sha256(139 enumerated (name, value) pairs ‖
+`ABI_SURFACE_DIGEST = sha256(140 enumerated (name, value) pairs ‖
 CONTRACTS_PLATFORM_SRC_HASH)`.
 
 The first half is precise — a constant walk, immune to refactoring. The

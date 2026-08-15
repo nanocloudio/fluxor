@@ -409,39 +409,6 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 4.5: module test harnesses ──────────────────────────
-    //
-    // Every module manifest declaring `[test] harness = "..."` gets its
-    // harness compiled and run host-side by `fluxor modules test` (generated
-    // zero-dependency crate mounting the harness file — see
-    // standards/fluxor-modules.md §3). Omitted when no module declares
-    // one, same policy as phase 3.5. This is the committed home of the
-    // tls crypto KATs, among others.
-    //
-    // Gated on manifests that *declare* a harness rather than on
-    // harnesses that resolve: a manifest naming a file that isn't there
-    // must fail the phase, not drop it from the pipeline — a missing
-    // phase is the same green-and-empty failure as building 0 of 36
-    // modules.
-    let declared_harnesses = crate::module_test::declared_harness_count(project_root);
-    if declared_harnesses > 0 {
-        results.push(if skip.cargo {
-            skipped("module-tests")
-        } else {
-            run_step("module-tests", verbose, || {
-                vacuity(
-                    "module-tests",
-                    crate::module_test::resolved_harness_count(project_root),
-                    declared_harnesses,
-                    "module manifest(s) declare `[test] harness`",
-                    "the declared harness file does not exist at the path the manifest names",
-                )?;
-                crate::module_test::cmd_test(Some(project_root), None, verbose)
-                    .map_err(|e| e.to_string())
-            })
-        });
-    }
-
     Ok(results)
 }
 

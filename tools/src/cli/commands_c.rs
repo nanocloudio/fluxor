@@ -1031,8 +1031,8 @@ mod scenario_readiness_probe {
 }
 
 fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
-    const QEMU_CONFIG_BLOB_ADDR: u64 = 0x4100_0000;
-    const QEMU_MODULES_BLOB_ADDR: u64 = 0x4200_0000;
+    const QEMU_CONFIG_BLOB_ADDR: u64 = 0x4C00_0000;
+    const QEMU_MODULES_BLOB_ADDR: u64 = 0x4D00_0000;
 
     // Synced fmods and the runtime binary live under `target/`, which
     // `cargo clean` wipes; refill lockfile-recorded holes before running.

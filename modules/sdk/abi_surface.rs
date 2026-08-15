@@ -339,6 +339,9 @@ pub fn for_each_field(f: &mut impl FnMut(&str, i64)) {
     );
     f("monitor.ISR_METRICS", int::monitor::ISR_METRICS as i64);
 
+    // ── appended (append-only walk; newest wire values last) ──
+    f("errno.ENOSPC", ka::errno::ENOSPC as i64);
+
     f(
         "provider_registry.FLASH_STORE_ENABLE",
         int::provider_registry::FLASH_STORE_ENABLE as i64,

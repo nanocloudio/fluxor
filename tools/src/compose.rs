@@ -1663,6 +1663,37 @@ mod tests {
         let kcfg = read("src/kernel/boot/config.rs");
         let sched = read("src/kernel/exec/scheduler/mod.rs");
 
+        // All three per-profile MAX_MODULES values, in declaration order
+        // (host, wasm, embedded) — pins `kernel_max_modules` too.
+        fn extract_nth(src: &str, name: &str, n: usize) -> u64 {
+            let pat = format!("pub const {name}: usize = ");
+            let mut from = 0;
+            for _ in 0..n {
+                let at = src[from..]
+                    .find(&pat)
+                    .unwrap_or_else(|| panic!("{name} occurrence {n} not found"));
+                from += at + pat.len();
+            }
+            let rest = &src[from..];
+            rest[..rest.find(';').expect("terminator")]
+                .split('*')
+                .map(|t| t.trim().parse::<u64>().expect("integer term"))
+                .product()
+        }
+        use crate::capacity::kernel_max_modules;
+        assert_eq!(
+            kernel_max_modules("linux") as u64,
+            extract_nth(&sdk, "MAX_MODULES", 1)
+        );
+        assert_eq!(
+            kernel_max_modules("wasm") as u64,
+            extract_nth(&sdk, "MAX_MODULES", 2)
+        );
+        assert_eq!(
+            kernel_max_modules("rp2350") as u64,
+            extract_nth(&sdk, "MAX_MODULES", 3)
+        );
+
         let cap = capacity_for_profile("linux").expect("linux profile");
         // First MAX_OWNERS in owner.rs is the multitenant value.
         assert_eq!(cap.max_owners as u64, extract(&owner, "MAX_OWNERS"));

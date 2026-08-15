@@ -421,6 +421,11 @@ pub fn free_module_state(module_idx: usize) {
         &mut *p
     };
 
+    // Elastic-region chunks the module grew into (`rfc_resource_model.md`
+    // §3.6): teardown IS the reclaim path — release them before the slot
+    // is reused.
+    crate::kernel::mem::elastic::reclaim_module(module_idx as u8);
+
     // Heap arena (from module_arena_size export, if any).
     let arena = sched.arenas[module_idx];
     if !arena.ptr.is_null() && arena.size > 0 {

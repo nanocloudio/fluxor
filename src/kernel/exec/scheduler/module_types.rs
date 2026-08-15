@@ -215,20 +215,23 @@ pub const CONTENT_TYPE_TELEMETRY: u8 = 35;
 /// for an unrecognised header (a malformed record the fan rejects).
 pub fn telemetry_record_len(signal: u8, kind: u8) -> usize {
     // Mirror of contracts/telemetry.rs: SIGNAL_METRIC=2, SIGNAL_SPAN=3,
-    // SIGNAL_PSTATUS=4; METRIC_HISTOGRAM=3; PSTATUS_STEP=1, PSTATUS_RES=2.
-    // scalar=24, histogram=80, span=64, pstatus_step=52, pstatus_res=28.
+    // SIGNAL_PSTATUS=4; METRIC_HISTOGRAM=3; PSTATUS_STEP=1, PSTATUS_RES=2,
+    // PSTATUS_POOL=3. scalar=24, histogram=80, span=64, pstatus_step=52,
+    // pstatus_res=28, pstatus_pool=32.
     const SIGNAL_METRIC: u8 = 2;
     const SIGNAL_SPAN: u8 = 3;
     const SIGNAL_PSTATUS: u8 = 4;
     const METRIC_HISTOGRAM: u8 = 3;
     const PSTATUS_STEP: u8 = 1;
     const PSTATUS_RES: u8 = 2;
+    const PSTATUS_POOL: u8 = 3;
     match signal {
         SIGNAL_METRIC if kind == METRIC_HISTOGRAM => 80,
         SIGNAL_METRIC => 24,
         SIGNAL_SPAN => 64,
         SIGNAL_PSTATUS if kind == PSTATUS_STEP => 52,
         SIGNAL_PSTATUS if kind == PSTATUS_RES => 28,
+        SIGNAL_PSTATUS if kind == PSTATUS_POOL => 32,
         _ => 0,
     }
 }

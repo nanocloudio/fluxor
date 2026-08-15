@@ -336,8 +336,18 @@ fn generate_config_impl(
         resolved_target,
     )?;
 
-    let (module_entries, module_names) =
-        parse_modules_map(modules_ref, data_section, config, modules_dir, &manifests)?;
+    // Module-count ceiling for the target's kernel profile
+    // (`capacity::kernel_max_modules`, drift-pinned against the kernel
+    // source). Configs with no resolved target build for the host profile.
+    let max_modules = crate::capacity::kernel_max_modules(resolved_target.unwrap_or("linux"));
+    let (module_entries, module_names) = parse_modules_map(
+        modules_ref,
+        data_section,
+        config,
+        modules_dir,
+        &manifests,
+        max_modules,
+    )?;
 
     // Hardware-capability validation. Each module's `[requires]`
     // block declares what the silicon must provide (FPU / NEON /
@@ -774,7 +784,71 @@ fn generate_config_impl(
     let pod_section = build_pod_section(config, modules_dir, extra_module_dirs)?;
     result.extend_from_slice(&pod_section);
 
+    // Capacity-envelope section (`rfc_resource_model.md` §3 Tier A): the
+    // optional top-level `capacity:` map becomes an FXEV post-body section
+    // installing per-deployment enforced pool capacities. Same additive
+    // discipline as the sections above. Absent `capacity:` ⇒ no section ⇒
+    // compiled static sizes rule (byte-identical config).
+    let envelope = build_capacity_envelope(config, resolved_target)?;
+    result.extend_from_slice(&envelope);
+
     Ok(result)
+}
+
+/// Build the FXEV capacity-envelope section from the top-level `capacity:`
+/// map (`pool name: n`). Every name must be a registered kernel pool; `n`
+/// must be positive and, where the pool's compiled capacity is known
+/// host-side, must fit it — over-asking is a config error here rather than
+/// a clamp-and-log at boot. Prints the envelope (ask/static/slack) so a
+/// deployment's capacity choices are visible at compose time.
+fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Result<Vec<u8>> {
+    let Some(cap_map) = config.get("capacity") else {
+        return Ok(Vec::new());
+    };
+    let obj = cap_map.as_object().ok_or_else(|| {
+        Error::Config("capacity: must be a map of pool name → count/bytes".into())
+    })?;
+    let target = resolved_target.unwrap_or("linux");
+    let mut entries: Vec<(u16, u32)> = Vec::new();
+    println!("Capacity envelope ({target}):");
+    for (name, val) in obj {
+        let Some((_, pool_id)) = crate::capacity::POOL_IDS
+            .iter()
+            .find(|(n, _)| n == name)
+        else {
+            let known: Vec<&str> = crate::capacity::POOL_IDS.iter().map(|(n, _)| *n).collect();
+            return Err(Error::Config(format!(
+                "capacity: unknown pool '{name}' (known: {})",
+                known.join(", ")
+            )));
+        };
+        let n = val.as_u64().filter(|&n| n > 0).ok_or_else(|| {
+            Error::Config(format!("capacity: '{name}' must be a positive integer"))
+        })?;
+        match crate::capacity::kernel_pool_static_cap(target, name) {
+            Some(static_cap) if n > static_cap => {
+                return Err(Error::Config(format!(
+                    "capacity: '{name}' = {n} exceeds the {target} kernel's compiled \
+                     capacity {static_cap} — the envelope can only size DOWN from the \
+                     compiled tables (rfc_resource_model.md §3)"
+                )));
+            }
+            Some(static_cap) => {
+                println!("  {name}: {n} of {static_cap} (slack {})", static_cap - n);
+            }
+            None => {
+                println!("  {name}: {n} (compiled capacity target-specific; kernel clamps)");
+            }
+        }
+        if n > u32::MAX as u64 {
+            return Err(Error::Config(format!("capacity: '{name}' = {n} overflows u32")));
+        }
+        entries.push((*pool_id, n as u32));
+    }
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(crate::capacity::encode_envelope_section(&entries))
 }
 
 /// Build the resident-pod config section from the optional top-level `pods:`

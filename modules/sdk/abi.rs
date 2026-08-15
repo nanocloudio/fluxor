@@ -115,6 +115,10 @@ pub mod contracts {
     pub mod telemetry {
         include!("contracts/telemetry.rs");
     }
+    /// Resource-ledger pool registry (`rfc_resource_model.md` §6.1).
+    pub mod resource {
+        include!("contracts/resource.rs");
+    }
     /// Generic stream-clock capability (audio/media clock query).
     pub mod stream_clock {
         include!("contracts/stream_clock.rs");

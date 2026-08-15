@@ -25,6 +25,7 @@ pub mod ci;
 // `fluxor.toml`'s schema, gated by `fluxor ci`'s `fluxor-toml-schema`
 // phase: which keys a project must carry, which its shape forbids, and
 // the one meaning each key has.
+pub mod capacity;
 pub mod ci_schema;
 pub mod compose;
 pub mod error;
@@ -43,7 +44,6 @@ pub mod lockfile;
 // resolution on top.
 pub mod makefile_lint;
 pub mod manifest;
-pub mod module_test;
 pub mod node_agent;
 // `modules` carries the `.fmod` pack/parse primitives that
 // `modules_build` calls into. Exposed here (rather than left

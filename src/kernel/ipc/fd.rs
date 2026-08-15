@@ -42,7 +42,7 @@ pub use crate::abi::kernel_abi::fd::{
 // Timer-as-fd
 // ============================================================================
 
-const MAX_TIMERS: usize = 16;
+pub const MAX_TIMERS: usize = 16;
 
 struct TimerSlot {
     allocated: AtomicBool,
@@ -72,6 +72,12 @@ fn now_ms() -> u32 {
 /// Create a new timer owned by the current module.
 /// Returns tagged fd or negative errno.
 pub fn timer_create() -> i32 {
+    use crate::abi::contracts::resource::POOL_TIMERS;
+    use crate::kernel::sys::resource_ledger as ledger;
+    if !ledger::enforced_allows(POOL_TIMERS, timer_in_use_count() as u32 + 1) {
+        ledger::deny(POOL_TIMERS);
+        return errno::ENOSPC;
+    }
     let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
     for (i, timer) in TIMER_SLOTS.iter().enumerate() {
         if timer
@@ -85,7 +91,16 @@ pub fn timer_create() -> i32 {
             return tag_fd(FD_TAG_TIMER, i as i32);
         }
     }
-    errno::ENOMEM
+    crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_TIMERS);
+    errno::ENOSPC
+}
+
+/// Allocated timer slots — resource-ledger sample for `POOL_TIMERS`.
+pub fn timer_in_use_count() -> usize {
+    TIMER_SLOTS
+        .iter()
+        .filter(|t| t.allocated.load(Ordering::Relaxed))
+        .count()
 }
 
 /// Start (or restart) a timer with a delay in milliseconds.

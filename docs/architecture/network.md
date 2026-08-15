@@ -132,23 +132,23 @@ SDK helper `net_read_frame` in `modules/sdk/runtime.rs` handles this.
 
 | Type | Name | Payload | Meaning |
 |------|------|---------|---------|
-| `0x10` | `CMD_BIND` | port (u16) | Open a listener on a local port |
-| `0x11` | `CMD_SEND` | conn_id (u8) + bytes | Send bytes on an established connection |
-| `0x12` | `CMD_CONNECT` | dest_ip (u32) + dest_port (u16) | Initiate outbound connection |
-| `0x13` | `CMD_CLOSE` | conn_id (u8) | Tear down a connection |
+| `0x10` | `CMD_BIND` | port (u16 LE) | Open a listener on a local port |
+| `0x11` | `CMD_SEND` | conn_id (u16 LE) + bytes | Send bytes on an established connection |
+| `0x12` | `CMD_CLOSE` | conn_id (u16 LE) | Tear down a connection |
+| `0x13` | `CMD_CONNECT` | sock_type (u8) + dest_ip (u32 LE) + dest_port (u16 LE) + requester_tag (u8, optional) | Initiate outbound connection |
 
 ### Downstream messages (IP → consumer)
 
 | Type | Name | Payload | Meaning |
 |------|------|---------|---------|
-| `0x01` | `MSG_ACCEPTED` | conn_id (u8) + peer info | Inbound connection established |
-| `0x02` | `MSG_DATA` | conn_id (u8) + bytes | Received bytes on a connection |
-| `0x03` | `MSG_CLOSED` | conn_id (u8) | Connection torn down |
-| `0x04` | `MSG_BOUND` | port (u16) | Listener is ready |
-| `0x05` | `MSG_CONNECTED` | conn_id (u8) | Outbound connection established |
-| `0x06` | `MSG_ERROR` | code (i16) + conn_id (u8, optional) | Error |
-| `0x07` | `MSG_RETRANSMIT` | conn_id (u8) + from_seq (u32 LE) | Replay bytes from this TCP seq |
-| `0x08` | `MSG_ACK` | conn_id (u8) + acked_seq (u32 LE) | Consumer may drop bytes up to this seq |
+| `0x01` | `MSG_ACCEPTED` | conn_id (u16 LE) + local_port (u16 LE) | Inbound connection established |
+| `0x02` | `MSG_DATA` | conn_id (u16 LE) + bytes | Received bytes on a connection |
+| `0x03` | `MSG_CLOSED` | conn_id (u16 LE) | Connection torn down |
+| `0x04` | `MSG_BOUND` | conn_id (u16 LE) + local_port (u16 LE) | Listener is ready |
+| `0x05` | `MSG_CONNECTED` | conn_id (u16 LE) + requester_tag (u8) | Outbound connection established |
+| `0x06` | `MSG_ERROR` | conn_id (u16 LE) + errno (i8) + requester_tag (u8, optional) | Error |
+| `0x07` | `MSG_RETRANSMIT` | conn_id (u16 LE) + from_seq (u32 LE) | Replay bytes from this TCP seq |
+| `0x08` | `MSG_ACK` | conn_id (u16 LE) + acked_seq (u32 LE) | Consumer may drop bytes up to this seq |
 
 The IP module does not itself retain TCP segments for retransmission —
 the consumer does, if it wants to. `MSG_ACK` lets the consumer
@@ -159,12 +159,14 @@ encrypted records until they're acknowledged; see `security.md`.
 
 ### Connection identity
 
-`conn_id: u8` is a per-IP-instance handle. The IP module allocates it when
+`conn_id: u16 LE` is a per-IP-instance handle (the limit register documents
+the width; the conn table, not the id space, bounds concurrency). The IP
+module allocates it when
 a connection is opened and includes it in every downstream message. The
-consumer echoes it back on `CMD_SEND` and `CMD_CLOSE`. 256 concurrent
-connections per IP instance is sufficient for any practical workload —
-HTTP serving thousands of clients runs many IP instances or scales the
-type to u16 in a target-specific build.
+consumer echoes it back on `CMD_SEND` and `CMD_CLOSE`. The id space
+(65,535) deliberately exceeds any conn table a supported target can
+back, so concurrency is bounded by the table — a memory-only,
+per-profile choice — never by the wire.
 
 The connection handle is module-local. It is not a kernel resource. The
 kernel does not know what `conn_id 7` means or who owns it. Two consumer

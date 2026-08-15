@@ -35,12 +35,14 @@ const CAPACITY: usize = 8192; // rp2350
 const CAPACITY: usize = 32768; // bcm2712 / host
 const MASK: usize = CAPACITY - 1;
 
-/// One PSTATUS round: a `STEP` (52 B) and a `RES` (28 B) for every module slot.
-/// The scheduler emits a whole round in one uninterrupted burst with no drain
-/// interleaved, so a ring smaller than this drops the tail of *every* round and
-/// the high-index modules never report. Pinned here so the per-target capacity
-/// above cannot be sized below the round it has to hold.
-const PSTATUS_ROUND: usize = crate::kernel::exec::scheduler::MAX_MODULES * (52 + 28);
+/// One PSTATUS round: a `STEP` (52 B) and a `RES` (28 B) for every module slot,
+/// plus a `POOL` (32 B) for every kernel resource pool. The scheduler emits a
+/// whole round in one uninterrupted burst with no drain interleaved, so a ring
+/// smaller than this drops the tail of *every* round and the high-index
+/// modules / pools never report. Pinned here so the per-target capacity above
+/// cannot be sized below the round it has to hold.
+const PSTATUS_ROUND: usize = crate::kernel::exec::scheduler::MAX_MODULES * (52 + 28)
+    + crate::abi::contracts::resource::KERNEL_POOL_COUNT * 32;
 const _: () = assert!(CAPACITY >= PSTATUS_ROUND);
 
 /// Largest record accepted in one reservation — a histogram metric (80 B). A

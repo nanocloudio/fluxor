@@ -675,23 +675,4 @@ enum ModulesAction {
         #[arg(long)]
         force: bool,
     },
-    /// Unit-test modules' `include!`d cores on the host.
-    ///
-    /// A core is `no_std` source that is included, not linked, so `cargo test`
-    /// cannot reach it. A module declares a harness in its manifest
-    /// (`[test] harness = "tests/harness.rs"`) that mounts its cores exactly as
-    /// the module does; this generates a disposable crate around that harness
-    /// and runs it. Mounting cannot be derived — include order is load-bearing
-    /// and some cores need a `SyscallTable` in scope — so the module owns the
-    /// harness and fluxor owns the mechanical part.
-    Test {
-        /// Limit to one module.
-        #[arg(long)]
-        module: Option<String>,
-        #[arg(long)]
-        project_root: Option<std::path::PathBuf>,
-        /// Show cargo's full output.
-        #[arg(short, long)]
-        verbose: bool,
-    },
 }

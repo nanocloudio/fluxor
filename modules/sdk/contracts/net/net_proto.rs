@@ -21,8 +21,25 @@
 /// Frame header size (msg_type + len).
 pub const FRAME_HDR: usize = 3;
 
+/// Wire width of a connection id (u16 LE — see the limit register:
+/// 65,535 ids; the R1 conn tables bind long before the id space does).
+pub const CONN_ID_LEN: usize = 2;
+
+/// Read the leading `conn_id` of a payload. Callers bounds-check
+/// `payload.len() >= CONN_ID_LEN` first (frame validation).
+#[inline]
+pub fn conn_id(payload: &[u8]) -> u16 {
+    u16::from_le_bytes([payload[0], payload[1]])
+}
+
+/// Write `conn_id` into the leading bytes of a payload.
+#[inline]
+pub fn put_conn_id(payload: &mut [u8], conn_id: u16) {
+    payload[0..2].copy_from_slice(&conn_id.to_le_bytes());
+}
+
 // Downstream: IP/net → consumer
-/// New connection accepted. Payload: `[conn_id: u8][local_port: u16 LE]`.
+/// New connection accepted. Payload: `[conn_id: u16 LE][local_port: u16 LE]`.
 /// `local_port` is the listener port the connection was accepted on. When
 /// `net_out` is fanned to several stream consumers each bound to a
 /// distinct port (a multi-anchor graph), every consumer filters on
@@ -31,7 +48,7 @@ pub const FRAME_HDR: usize = 3;
 /// corrupt each other's subsequent `MSG_DATA`. A single-consumer graph
 /// may ignore the trailing port bytes and read just `conn_id`.
 pub const MSG_ACCEPTED: u8 = 0x01;
-/// Received data. Payload: `[conn_id: u8][data…]`. The `data` portion of a
+/// Received data. Payload: `[conn_id: u16 LE][data…]`. The `data` portion of a
 /// single `MSG_DATA` frame MUST NOT exceed [`MAX_DATA_FRAGMENT`] — a producer
 /// that has more bytes splits them across multiple frames. This bounds every
 /// consumer's per-frame scratch (so the alignment-safe reader never has to drop
@@ -41,28 +58,28 @@ pub const MSG_DATA: u8 = 0x02;
 /// Normative maximum `data` bytes in one [`MSG_DATA`] frame (one TCP MSS). A
 /// `net_out` producer (IP, the Linux host adapter, …) chunks larger reads into
 /// multiple frames; a consumer may therefore size its frame scratch to
-/// `FRAME_HDR + 1 + MAX_DATA_FRAGMENT` and be sure a whole frame always fits.
+/// `FRAME_HDR + CONN_ID_LEN + MAX_DATA_FRAGMENT` and be sure a whole frame always fits.
 pub const MAX_DATA_FRAGMENT: usize = 1460;
-/// Remote closed connection. Payload: [conn_id: u8]
+/// Remote closed connection. Payload: `[conn_id: u16 LE]`
 pub const MSG_CLOSED: u8 = 0x03;
-/// Bind/listen completed. Payload: `[conn_id: u8][local_port: u16 LE]`.
+/// Bind/listen completed. Payload: `[conn_id: u16 LE][local_port: u16 LE]`.
 /// `local_port` echoes the port from the consumer's `CMD_BIND`; a
 /// multi-anchor consumer records it and matches it against the
 /// `local_port` in subsequent `MSG_ACCEPTED` frames (see `MSG_ACCEPTED`).
 pub const MSG_BOUND: u8 = 0x04;
-/// Outbound connect completed. Payload: `[conn_id: u8][requester_tag: u8]`.
+/// Outbound connect completed. Payload: `[conn_id: u16 LE][requester_tag: u8]`.
 /// `requester_tag` echoes the tag the consumer put on its `CMD_CONNECT` (its
 /// module index **+ 1** — the `dev_requester_tag` wire encoding, NOT the raw
 /// index) so that when `ip.net_out` is fanned to several stream consumers (e.g.
 /// TLS + an OTLP exporter), each claims only the connections it opened. A
 /// consumer that doesn't filter just reads `conn_id` and ignores the trailing
-/// byte; legacy/untagged connects echo tag `0` (`REQUESTER_TAG_NONE`).
+/// byte; untagged connects echo tag `0` (`REQUESTER_TAG_NONE`).
 pub const MSG_CONNECTED: u8 = 0x05;
-/// Error. Payload: `[conn_id: u8][errno: i8][requester_tag: u8?]`. For a
+/// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u8?]`. For a
 /// connect-phase failure the trailing `requester_tag` echoes the failing
 /// `CMD_CONNECT`'s tag so a consumer that has no conn_id yet can recognise its
 /// own failure on a fanned `net_out`; established-connection errors carry the
-/// owning connection's conn_id (filter by that). Older 2-byte form = tag 0.
+/// owning connection's conn_id (filter by that). 3-byte form = tag 0.
 pub const MSG_ERROR: u8 = 0x06;
 // 0x07 / 0x08 are reserved: the IP module privately uses them for
 // `MSG_RETRANSMIT` / `MSG_ACK` (consumer-side retransmit + send-buffer release)
@@ -71,8 +88,8 @@ pub const MSG_ERROR: u8 = 0x06;
 /// Observability trace context for a connection (W3C). Emitted by the ingress
 /// (IP) right after `MSG_ACCEPTED`, and re-emitted by each forwarding stage
 /// (TLS) with its own span id, so the next stage parents its span correctly.
-/// Payload: `[conn_id: u8][trace_id: 16][parent_span_id: 8][trace_flags: u8]`
-/// (26 bytes). Purely additive and best-effort (direct write, dropped if the
+/// Payload: `[conn_id: u16 LE][trace_id: 16][parent_span_id: 8][trace_flags: u8]`
+/// (27 bytes). Purely additive and best-effort (direct write, dropped if the
 /// channel is full) — a stage that doesn't trace discards it like any unknown
 /// frame, so it never affects the data path. The trailing `trace_flags` byte is
 /// the W3C flags (low bit = `sampled`), so the head-sampling decision survives
@@ -81,12 +98,12 @@ pub const MSG_TRACE_CTX: u8 = 0x09;
 
 /// `MSG_TRACE_CTX` payload length: conn_id + 16-byte trace id + 8-byte span id
 /// + 1-byte W3C trace-flags.
-pub const TRACE_CTX_LEN: usize = 1 + 16 + 8 + 1;
+pub const TRACE_CTX_LEN: usize = CONN_ID_LEN + 16 + 8 + 1;
 
 // Upstream: consumer → IP/net
 /// Bind to port and listen. Payload: [port: u16 LE]
 pub const CMD_BIND: u8 = 0x10;
-/// Send data on connection. Payload: `[conn_id: u8][data…]`. The `data` portion
+/// Send data on connection. Payload: `[conn_id: u16 LE][data…]`. The `data` portion
 /// MUST NOT exceed [`MAX_CMD_DATA`]; a consumer with more bytes issues multiple
 /// `CMD_SEND`s. The net stack (IP / host adapter) re-segments to MSS on the
 /// wire. This bounds the receiver's command scratch; an oversized frame is
@@ -95,9 +112,9 @@ pub const CMD_SEND: u8 = 0x11;
 
 /// Normative maximum `data` bytes in one upstream command frame (`CMD_SEND`).
 /// Receivers (IP, the Linux host adapter) size their command scratch to
-/// `FRAME_HDR + 1 + MAX_CMD_DATA` and drain anything larger to stay frame-aligned.
+/// `FRAME_HDR + CONN_ID_LEN + MAX_CMD_DATA` and drain anything larger to stay frame-aligned.
 pub const MAX_CMD_DATA: usize = 8192;
-/// Close connection. Payload: [conn_id: u8]
+/// Close connection. Payload: `[conn_id: u16 LE]`
 pub const CMD_CLOSE: u8 = 0x12;
 /// Initiate outbound connection.
 /// Payload: `[sock_type: u8][ip: u32 LE][port: u16 LE][requester_tag: u8?]`.

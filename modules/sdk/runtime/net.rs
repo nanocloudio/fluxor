@@ -169,7 +169,7 @@ unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
 unsafe fn dev_net_send_trace_ctx(
     sys: &SyscallTable,
     chan: i32,
-    conn_id: u8,
+    conn_id: u16,
     trace_id: &[u8; 16],
     span_id: &[u8; 8],
     flags: u8,
@@ -178,10 +178,10 @@ unsafe fn dev_net_send_trace_ctx(
 ) -> bool {
     use abi::contracts::net::net_proto::{MSG_TRACE_CTX, TRACE_CTX_LEN};
     let mut payload = [0u8; TRACE_CTX_LEN];
-    payload[0] = conn_id;
-    payload[1..17].copy_from_slice(trace_id);
-    payload[17..25].copy_from_slice(span_id);
-    payload[25] = flags;
+    payload[0..2].copy_from_slice(&conn_id.to_le_bytes());
+    payload[2..18].copy_from_slice(trace_id);
+    payload[18..26].copy_from_slice(span_id);
+    payload[26] = flags;
     net_write_frame(
         sys,
         chan,
@@ -204,18 +204,18 @@ unsafe fn dev_net_send_trace_ctx(
 unsafe fn parse_trace_ctx(
     frame_buf: *const u8,
     payload_len: usize,
-) -> Option<(u8, [u8; 16], [u8; 8], u8)> {
+) -> Option<(u16, [u8; 16], [u8; 8], u8)> {
     use abi::contracts::net::net_proto::TRACE_CTX_LEN;
     if payload_len < TRACE_CTX_LEN {
         return None;
     }
     let p = frame_buf.add(NET_FRAME_HDR);
-    let conn_id = *p;
+    let conn_id = u16::from_le_bytes([*p, *p.add(1)]);
     let mut trace_id = [0u8; 16];
     let mut span_id = [0u8; 8];
-    core::ptr::copy_nonoverlapping(p.add(1), trace_id.as_mut_ptr(), 16);
-    core::ptr::copy_nonoverlapping(p.add(17), span_id.as_mut_ptr(), 8);
-    let flags = *p.add(25);
+    core::ptr::copy_nonoverlapping(p.add(2), trace_id.as_mut_ptr(), 16);
+    core::ptr::copy_nonoverlapping(p.add(18), span_id.as_mut_ptr(), 8);
+    let flags = *p.add(26);
     Some((conn_id, trace_id, span_id, flags))
 }
 

@@ -655,12 +655,23 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
         // arena. Overflow and over-cap fold into the same guard.
         let aligned = align_up(STATE_ARENA_OFFSET);
         let next = match aligned.checked_add(need) {
-            Some(n) if n <= STATE_ARENA_SIZE => n,
+            Some(n)
+                if n <= STATE_ARENA_SIZE
+                    && crate::kernel::sys::resource_ledger::enforced_allows(
+                        crate::abi::contracts::resource::POOL_STATE_ARENA,
+                        n as u32,
+                    ) =>
+            {
+                n
+            }
             _ => {
                 log::error!(
                     "[loader] STATE ARENA EXHAUSTED — need={need} used={aligned} cap={STATE_ARENA_SIZE} (raise \
                      abi::config::kernel::STATE_ARENA_SIZE or reduce module arena demand; \
                      modules without a heap arena will silently fail every heap_alloc call)"
+                );
+                crate::kernel::sys::resource_ledger::deny(
+                    crate::abi::contracts::resource::POOL_STATE_ARENA,
                 );
                 return Err(LoaderError::StatePoolExhausted);
             }

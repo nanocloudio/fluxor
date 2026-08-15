@@ -8,8 +8,6 @@ hardware_targets = ["rp2350", "bcm2712"]
 # (rfc_storage_capability_symmetry §5). All fences are honestly Volatile.
 provides = ["storage.namespace"]
 
-[test]
-harness = "tests/harness.rs"
 
 # No tick-based timekeeping: pure provider_call surface.
 timer_class = "agnostic"

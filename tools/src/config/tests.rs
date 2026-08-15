@@ -1490,6 +1490,7 @@ mod scheduler_validation_tests {
             &config,
             modules_dir,
             &manifests,
+            crate::capacity::kernel_max_modules("linux"),
         )
         .expect("emit module entry");
         // Entry layout (see `parse_module_entry`): bytes 0-3 =
@@ -2393,3 +2394,67 @@ mod rate_class_severity_tests {
     }
 }
 
+
+#[cfg(test)]
+mod capacity_envelope_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `capacity:` map → FXEV section appended; entries carry the contract
+    /// pool ids and the asked n.
+    #[test]
+    fn capacity_map_emits_fxev_section() {
+        let cfg = json!({"capacity": {"events": 4, "tls_unknown_not_here": null}});
+        // Unknown pool must error, not silently skip.
+        let err = build_capacity_envelope(&cfg, Some("linux"))
+            .expect_err("unknown pool name is a config error");
+        assert!(format!("{err:?}").contains("unknown pool"));
+
+        let cfg = json!({"capacity": {"events": 4, "timers": 2}});
+        let sec = build_capacity_envelope(&cfg, Some("linux")).expect("valid envelope");
+        assert_eq!(&sec[0..4], &0x4658_4556u32.to_le_bytes(), "FXEV magic");
+        let section_len = u32::from_le_bytes(sec[4..8].try_into().unwrap()) as usize;
+        assert_eq!(section_len, sec.len());
+        let count = u16::from_le_bytes(sec[10..12].try_into().unwrap());
+        assert_eq!(count, 2);
+        // Entries are (pool u16, n u32); map order is serde_json's
+        // (insertion-preserving) — events (0x0005) then timers (0x0006).
+        assert_eq!(u16::from_le_bytes(sec[12..14].try_into().unwrap()), 0x0005);
+        assert_eq!(u32::from_le_bytes(sec[14..18].try_into().unwrap()), 4);
+        assert_eq!(u16::from_le_bytes(sec[18..20].try_into().unwrap()), 0x0006);
+        assert_eq!(u32::from_le_bytes(sec[20..24].try_into().unwrap()), 2);
+    }
+
+    /// Over-asking a pool whose compiled capacity is known host-side is a
+    /// compose-time error (the envelope only sizes DOWN), and zero is
+    /// rejected (0 is the kernel's "unset" sentinel).
+    #[test]
+    fn over_ask_and_zero_are_config_errors() {
+        let cfg = json!({"capacity": {"events": 33}});
+        let err = build_capacity_envelope(&cfg, Some("linux"))
+            .expect_err("events=33 exceeds the compiled 32");
+        assert!(format!("{err:?}").contains("exceeds"));
+
+        let cfg = json!({"capacity": {"events": 0}});
+        let err = build_capacity_envelope(&cfg, Some("linux"))
+            .expect_err("zero is not a capacity");
+        assert!(format!("{err:?}").contains("positive"));
+    }
+
+    /// No `capacity:` block ⇒ no section ⇒ byte-identical config blobs.
+    #[test]
+    fn absent_capacity_block_emits_nothing() {
+        let sec = build_capacity_envelope(&json!({}), Some("linux")).expect("ok");
+        assert!(sec.is_empty());
+    }
+
+    /// RP arena asks aren't validated host-side (silicon-TOML-owned); the
+    /// section still encodes them — the kernel clamps at boot.
+    #[test]
+    fn rp_arena_ask_passes_through_for_kernel_clamp() {
+        let cfg = json!({"capacity": {"state_arena": 65536}});
+        let sec = build_capacity_envelope(&cfg, Some("rp2350")).expect("encodes");
+        assert_eq!(u16::from_le_bytes(sec[12..14].try_into().unwrap()), 0x0001);
+        assert_eq!(u32::from_le_bytes(sec[14..18].try_into().unwrap()), 65536);
+    }
+}

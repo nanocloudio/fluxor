@@ -7,7 +7,7 @@
 //!   conn_demux.lane_0 → tls_0.cipher_in
 //!   conn_demux.lane_1 → tls_1.cipher_in   (… lane_2, lane_3)
 //!
-//! Routing key is the per-connection `conn_id` — the first payload byte of
+//! Routing key is the per-connection `conn_id` — the leading u16 LE of
 //! every per-connection net_proto message (MSG_ACCEPTED `[conn_id][port]`,
 //! MSG_DATA `[conn_id][data]`, MSG_CLOSED `[conn_id]`, MSG_TRACE_CTX, …). All
 //! frames of one connection share a conn_id and therefore land on the same
@@ -95,7 +95,7 @@ const STATE_SIZE: usize = core::mem::size_of::<ConnDemuxState>();
 /// adjacent conn_ids spread across lanes; modulo over the (static) lane
 /// count gives a fixed assignment for the life of the graph.
 #[inline]
-fn lane_for_conn(conn_id: u8, lane_count: u32) -> usize {
+fn lane_for_conn(conn_id: u16, lane_count: u32) -> usize {
     if lane_count <= 1 {
         return 0;
     }
@@ -298,12 +298,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // and is retried (input-blocked) on the next step — no silent drop.
     //
     // Broadcast (fan to every live lane) when the frame is control-plane:
-    //   * `payload_len == 0` — no conn_id at all (edge/control frame), or
-    //   * `NET_MSG_BOUND`    — a listener bind reply whose payload[0] is a
+    //   * `payload_len < 2` — no conn_id at all (edge/control frame), or
+    //   * `NET_MSG_BOUND`    — a listener bind reply whose leading id is a
     //     listener id, not a routable conn_id; each lane's TLS waits for its
     //     own BOUND and filters by local_port.
-    // Everything else is per-connection: route by `payload[0]` (the conn_id).
-    let is_broadcast = payload_len == 0 || msg_type == NET_MSG_BOUND;
+    // Everything else is per-connection: route by the leading u16 conn_id.
+    let is_broadcast = payload_len < 2 || msg_type == NET_MSG_BOUND;
     if is_broadcast {
         s.pending_is_bcast = true;
         s.pending_mask = if s.lane_count >= 32 {
@@ -312,8 +312,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             (1u32 << s.lane_count) - 1
         };
     } else {
-        // payload[0] is the conn_id for every per-connection message.
-        let conn_id = *buf.add(HDR);
+        // The leading u16 LE is the conn_id for every per-connection message.
+        let conn_id = u16::from_le_bytes([*buf.add(HDR), *buf.add(HDR + 1)]);
         let lane = lane_for_conn(conn_id, s.lane_count);
         s.pending_is_bcast = false;
         s.pending_mask = 1u32 << lane;

@@ -960,6 +960,7 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         | 0x0C36
         | 0x0C3A..=0x0C3D
         | 0x0C3E // TLM_EMIT — implicit primitive like LOG_WRITE (any module emits)
+        | 0x0C3F // ELASTIC_ALLOC — Tier B chunk grant (denial is the gate)
         | 0x0C40
         | 0x0C41
         | 0x0C42
@@ -1331,6 +1332,7 @@ unsafe fn resolve_register_target(arg: *mut u8, arg_len: usize) -> Option<(usize
 }
 
 unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::abi::contracts::resource;
     use crate::abi::contracts::telemetry;
     use crate::abi::internal::diag;
     use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
@@ -1363,6 +1365,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         // ── Telemetry ring (rfc_observability_surface.md §5.2). The
         //    OBSERVE gate for the consumer ops is applied upstream by
         //    `check_privileged_internal_op`; TLM_EMIT is ungated. ──
+        resource::ELASTIC_ALLOC => handle_elastic_alloc(arg, arg_len),
         telemetry::TLM_EMIT
         | telemetry::TLM_SUBSCRIBE
         | telemetry::TLM_DRAIN
@@ -1489,6 +1492,53 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 /// Telemetry ring ops (`rfc_observability_surface.md` §5.2). `TLM_EMIT` is an
 /// implicit primitive (any module); `TLM_SUBSCRIBE`/`DRAIN`/`STATS` are gated by
 /// the read-only `observe` permission upstream in `check_privileged_internal_op`.
+/// `ELASTIC_ALLOC` (`resource` contract): grant a Tier B chunk from the
+/// kernel elastic region to the calling module. arg in `[bytes u32 LE]`,
+/// out `[ptr u64 LE]`; returns granted bytes or an accounted `ENOSPC`.
+/// EL0-isolated modules cannot reach this op at all — their SVC surface
+/// carries no `provider_call` — so grants are structurally EL1-only.
+unsafe fn handle_elastic_alloc(arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 8 {
+        return E_INVAL;
+    }
+    let bytes = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+    let idx = crate::kernel::exec::scheduler::current_module_index();
+    if idx >= crate::kernel::exec::scheduler::MAX_MODULES {
+        return E_INVAL;
+    }
+    // The deployment envelope may size the region down (Tier A over the
+    // Tier B reserve): check the enforced ceiling before granting.
+    {
+        use crate::kernel::config::ELASTIC_QUANTUM;
+        let (used, _) = crate::kernel::mem::elastic::region_usage();
+        let would = used + bytes.div_ceil(ELASTIC_QUANTUM.max(1)) * ELASTIC_QUANTUM.max(1);
+        if !crate::kernel::sys::resource_ledger::enforced_allows(
+            crate::abi::contracts::resource::POOL_ELASTIC_REGION,
+            would as u32,
+        ) {
+            crate::kernel::sys::resource_ledger::deny(
+                crate::abi::contracts::resource::POOL_ELASTIC_REGION,
+            );
+            return crate::kernel::sys::errno::ENOSPC;
+        }
+    }
+    match crate::kernel::mem::elastic::alloc(idx as u8, bytes) {
+        Some((ptr, len)) => {
+            let addr = (ptr as usize as u64).to_le_bytes();
+            for (i, b) in addr.iter().enumerate() {
+                *arg.add(i) = *b;
+            }
+            len as i32
+        }
+        None => {
+            crate::kernel::sys::resource_ledger::deny(
+                crate::abi::contracts::resource::POOL_ELASTIC_REGION,
+            );
+            crate::kernel::sys::errno::ENOSPC
+        }
+    }
+}
+
 unsafe fn handle_telemetry_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
     use crate::abi::contracts::telemetry as tlm;
     use crate::kernel::exec::scheduler;
@@ -1866,22 +1916,26 @@ unsafe fn handle_reconfigure_op(opcode: u32, arg: *mut u8, arg_len: usize) -> i3
             scheduler::module_info_flags(idx) as i32
         }
         reconfigure::MODULE_UPSTREAM => {
-            // Arg layout: in `[module_idx:u8]`, out `[mask:u64 LE]`.
-            // Caller must pass `arg_len >= 9` (1 byte for the input
-            // index + 8 bytes the kernel overwrites with the bitmask).
-            // A 64-bit mask is required so the full
-            // `MAX_MODULES = 64` index range (aarch64) is
-            // representable. Returns 0 on success.
+            // Arg layout: in `[module_idx:u8]`, out `[mask word u64 LE × W]`
+            // (low word first), where the kernel writes
+            // `W = min(MODULE_MASK_WORDS, (arg_len - 1) / 8)` words and
+            // returns `MODULE_MASK_WORDS` — so a caller whose buffer is
+            // narrower than the full mask can detect the truncation from
+            // the return value. `arg_len >= 9` (index byte + one word).
             if arg.is_null() || arg_len < 9 {
                 return E_INVAL;
             }
             let idx = core::ptr::read(arg) as usize;
-            let mask = scheduler::module_upstream_mask(idx);
-            let bytes = mask.to_le_bytes();
-            for (i, b) in bytes.iter().enumerate() {
-                *arg.add(1 + i) = *b;
+            let mut words = [0u64; crate::kernel::workload::bitmask::MODULE_MASK_WORDS];
+            let total = scheduler::module_upstream_words(idx, &mut words);
+            let fit = ((arg_len - 1) / 8).min(total);
+            for (w, word) in words.iter().enumerate().take(fit) {
+                let bytes = word.to_le_bytes();
+                for (i, b) in bytes.iter().enumerate() {
+                    *arg.add(1 + w * 8 + i) = *b;
+                }
             }
-            0
+            total as i32
         }
         reconfigure::MODULE_DONE => {
             if arg.is_null() || arg_len < 1 {

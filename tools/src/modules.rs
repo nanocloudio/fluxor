@@ -18,8 +18,13 @@ pub const MODULE_MAGIC: u32 = 0x444D5846;
 /// Current table version
 pub const TABLE_VERSION: u8 = 1;
 
-/// Maximum modules in table. Raised to 64 to match MAX_MODULES.
-pub const MAX_TABLE_MODULES: usize = 64;
+/// Maximum modules in one FXMT table: the largest kernel profile's
+/// `MAX_MODULES` (aarch64 profile_host, `modules/sdk/abi/config.rs`) —
+/// the count byte in the table header is a u8, so the format itself
+/// allows 255. Pinned by `compose::capacity_mirrors_kernel_sources`
+/// via `kernel_max_modules`; the per-target ceiling is enforced where
+/// the boot blob is built, not here.
+pub const MAX_TABLE_MODULES: usize = 128;
 
 /// Module table header (16 bytes)
 pub const TABLE_HEADER_SIZE: usize = 16;

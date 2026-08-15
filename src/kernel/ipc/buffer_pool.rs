@@ -118,6 +118,13 @@ static mut BUFFER_ARENA_OFFSET: usize = 0;
 #[cfg(feature = "kernel-vm")]
 const BUF_ISO_PAGE: usize = 4096;
 
+/// Bump high-water mark: `(used_bytes, total_bytes)` — resource-ledger
+/// sample for `POOL_BUFFER_ARENA`.
+pub fn arena_usage() -> (usize, usize) {
+    // SAFETY: word-sized read of a static usize; scheduler-thread writer.
+    (unsafe { BUFFER_ARENA_OFFSET }, BUFFER_ARENA_SIZE)
+}
+
 /// Allocate a buffer from the dedicated buffer arena.
 ///
 /// Returns pointer to zeroed buffer, aligned to 4 bytes.
@@ -127,8 +134,16 @@ fn alloc_buffer(size: usize) -> Option<*mut u8> {
     // (called during scheduler::prepare_graph), no concurrent allocators.
     unsafe {
         let aligned = (BUFFER_ARENA_OFFSET + 3) & !3;
-        if aligned + size > BUFFER_ARENA_SIZE {
+        if aligned + size > BUFFER_ARENA_SIZE
+            || !crate::kernel::sys::resource_ledger::enforced_allows(
+                crate::abi::contracts::resource::POOL_BUFFER_ARENA,
+                (aligned + size) as u32,
+            )
+        {
             log::error!("[buf] arena full need={size} used={aligned} cap={BUFFER_ARENA_SIZE}");
+            crate::kernel::sys::resource_ledger::deny(
+                crate::abi::contracts::resource::POOL_BUFFER_ARENA,
+            );
             return None;
         }
         let ptr = core::ptr::addr_of_mut!(BUFFER_ARENA.0)
@@ -156,6 +171,9 @@ fn alloc_buffer_page_aligned(size: usize) -> Option<*mut u8> {
         if aligned + reserve > BUFFER_ARENA_SIZE {
             log::error!(
                 "[buf] iso arena full need={reserve} used={aligned} cap={BUFFER_ARENA_SIZE}"
+            );
+            crate::kernel::sys::resource_ledger::deny(
+                crate::abi::contracts::resource::POOL_BUFFER_ARENA,
             );
             return None;
         }

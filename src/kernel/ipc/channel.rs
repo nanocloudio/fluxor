@@ -366,6 +366,14 @@ impl ChannelSlot {
 
 static CHANNELS: [ChannelSlot; MAX_CHANNELS] = [const { ChannelSlot::new() }; MAX_CHANNELS];
 
+/// Slots not in `Free` state — resource-ledger sample for `POOL_CHANNELS`.
+pub fn in_use_count() -> usize {
+    CHANNELS
+        .iter()
+        .filter(|c| c.state.load(Ordering::Relaxed) != ChannelState::Free as u8)
+        .count()
+}
+
 // ============================================================================
 // Channel API
 // ============================================================================
@@ -444,6 +452,13 @@ pub fn channel_open_for_module(
         size
     };
 
+    if !crate::kernel::sys::resource_ledger::enforced_allows(
+        crate::abi::contracts::resource::POOL_CHANNELS,
+        in_use_count() as u32 + 1,
+    ) {
+        crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_CHANNELS);
+        return crate::kernel::sys::errno::ENOSPC;
+    }
     for (idx, slot) in CHANNELS.iter().enumerate() {
         if slot.try_allocate(idx, buf_capacity, producer_module) {
             slot.state
@@ -452,7 +467,9 @@ pub fn channel_open_for_module(
             return idx as i32;
         }
     }
-    CHAN_EBUSY
+    // Slot table exhausted — an accounted capacity denial, not a busy peer.
+    crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_CHANNELS);
+    crate::kernel::sys::errno::ENOSPC
 }
 
 pub fn channel_close(handle: i32) {

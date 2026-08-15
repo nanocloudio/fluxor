@@ -258,6 +258,11 @@ pub mod errno {
     pub const EAGAIN: i32 = -11;
     /// Cannot allocate memory / no free slots.
     pub const ENOMEM: i32 = -12;
+    /// Capacity denial — a resource-ledger pool or budget is exhausted.
+    /// Distinct from `ENOMEM` (allocator failure): the request was
+    /// well-formed and the denial is accounted (pool `denials` counter,
+    /// PSTATUS `POOL` records).
+    pub const ENOSPC: i32 = -28;
     /// Argument list / output buffer too long — caller should retry
     /// with a larger buffer. Used by FS_READDIR when one entry
     /// doesn't fit and no progress could be made.

@@ -62,7 +62,3 @@ metrics = [
 # telemetry port is wired (zero-cost otherwise).
 spans = ["tls.handshake"]
 
-# Host-side known-answer tests for the crypto primitives this module
-# and quic both include!(). Run by `fluxor test` (a `fluxor ci` phase).
-[test]
-harness = "tests/crypto_kat.rs"

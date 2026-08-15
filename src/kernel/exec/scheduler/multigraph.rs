@@ -1492,6 +1492,26 @@ pub fn set_module_upstream_mask(module_idx: usize, mask: u64) {
     }
 }
 
+/// Full-width variant of [`set_module_upstream_mask`]: set individual
+/// upstream bits, including indices ≥ 64. Test-facing (like
+/// `clear_module_ready`) — production masks come from
+/// `compute_upstream_mask`.
+pub fn set_module_upstream_bits(module_idx: usize, bits: &[usize]) {
+    if module_idx >= MAX_MODULES {
+        return;
+    }
+    let mut mask = ModuleMask::new();
+    for &b in bits {
+        if b < MAX_MODULES {
+            mask.set(b);
+        }
+    }
+    // SAFETY: scheduler-thread-only mutation; module_idx bounded.
+    unsafe {
+        SCHED.upstream_mask[module_idx] = mask;
+    }
+}
+
 /// Clear the per-module ready bit. Test-facing helper so a fresh
 /// graph can be wired into a state where downstream modules are
 /// gated waiting on a not-yet-Ready upstream.

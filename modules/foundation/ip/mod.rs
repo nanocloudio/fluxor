@@ -333,6 +333,21 @@ pub struct IpState {
     _ptx_pad: [u8; 2],
     pending_tx_buf: [u8; MAX_FRAME_SIZE + 2],
 
+    /// LOCAL-DELIVERY FASTPATH (loopback). A CMD_CONNECT whose
+    /// destination is this host's own address (or 127.0.0.1) never
+    /// reaches TCP: it binds a PAIR of conn slots directly — the
+    /// connector's and an accepted-side one for the local listener —
+    /// and CMD_SEND on either becomes MSG_DATA tagged with the peer's
+    /// conn id. No segments, no ARP (a host cannot ARP-resolve
+    /// itself through a switch), no handshake; RFC-standard host
+    /// behavior (packets to self are delivered locally), which is
+    /// what lets one graph compose a client module against its own
+    /// listener (e.g. pg_client ↔ pg_edge_anchor on one board).
+    /// `-1` = not a loopback conn; otherwise the peer's slot index.
+    /// Both slots sit in the ordinary conn table as `Established`
+    /// with empty send queues, which the timer scan ignores.
+    loopback_peer: [i16; tcp::MAX_TCP_CONNS],
+
     /// Stash for a CMD_SEND tail that couldn't be drained in one tick
     /// (peer window closed mid-frame, or NIC out_chan rejected a
     /// segment). `service_net_channels` resumes from `pending_cmd_off`
@@ -341,7 +356,7 @@ pub struct IpState {
     /// propagates back to the consumer through its own
     /// `channel_write` to `net_in_chan`.
     pending_cmd_valid: u8,
-    pending_cmd_conn: u8,
+    pending_cmd_conn: u16,
     pending_cmd_off: u16,
     pending_cmd_len: u16,
     _pcmd_pad: [u8; 2],
@@ -353,7 +368,7 @@ pub struct IpState {
     /// itself was rejected by the NIC. Cleared once `process_cmd_close`
     /// confirms the FIN is queued.
     pending_close_valid: u8,
-    pending_close_conn: u8,
+    pending_close_conn: u16,
     _pcls_pad: [u8; 2],
 
     /// Outbound control-frame queue (MSG_BOUND / MSG_ACCEPTED /
@@ -699,14 +714,14 @@ unsafe fn ip_net_read_frame(
 /// ACKing data the consumer never received makes the peer think it
 /// landed and stop retransmitting, permanently losing payload.
 #[inline(always)]
-unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len: usize) -> bool {
+unsafe fn net_send_data(s: &mut IpState, conn_id: u16, data: *const u8, data_len: usize) -> bool {
     if s.net_out_chan < 0 || data_len == 0 {
         return true;
     }
     let sys = &*s.syscalls;
     let scratch = s.net_scratch.as_mut_ptr();
-    let payload_len = 1 + data_len; // conn_id + data
-    let max_copy = s.net_scratch.len() - NET_FRAME_HDR;
+    let payload_len = 2 + data_len; // conn_id (u16 LE) + data
+    let max_copy = s.net_scratch.len() - NET_FRAME_HDR - 2;
     if data_len > max_copy {
         return false;
     }
@@ -714,8 +729,10 @@ unsafe fn net_send_data(s: &mut IpState, conn_id: u8, data: *const u8, data_len:
     let pl = (payload_len as u16).to_le_bytes();
     core::ptr::write_volatile(scratch.add(1), pl[0]);
     core::ptr::write_volatile(scratch.add(2), pl[1]);
-    core::ptr::write_volatile(scratch.add(3), conn_id);
-    core::ptr::copy_nonoverlapping(data, scratch.add(4), data_len);
+    let cb = conn_id.to_le_bytes();
+    core::ptr::write_volatile(scratch.add(3), cb[0]);
+    core::ptr::write_volatile(scratch.add(4), cb[1]);
+    core::ptr::copy_nonoverlapping(data, scratch.add(5), data_len);
     let total = NET_FRAME_HDR + payload_len;
     let n = (sys.channel_write)(s.net_out_chan, scratch, total);
     if n == total as i32 {
@@ -791,32 +808,36 @@ unsafe fn drain_pending_net_out(s: &mut IpState) {
 /// false.
 #[inline(always)]
 #[must_use]
-unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u8) -> bool {
-    let mut frame = [0u8; 4];
+unsafe fn net_send_short(s: &mut IpState, msg_type: u8, conn_id: u16) -> bool {
+    let mut frame = [0u8; 5];
+    let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), msg_type);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 1u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 2u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     net_send_or_queue(s, &frame)
 }
 
 #[inline(always)]
 #[must_use]
-unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8, local_port: u16) -> bool {
-    // MSG_ACCEPTED payload: `[conn_id:1][local_port:2 LE]`, mirroring
+unsafe fn net_send_accepted(s: &mut IpState, conn_id: u16, local_port: u16) -> bool {
+    // MSG_ACCEPTED payload: `[conn_id:2 LE][local_port:2 LE]`, mirroring
     // `net_send_bound`. Consumers that share `net_out` with other anchors
     // (multi-anchor graphs binding distinct ports) filter on `local_port` so
     // they only claim conn_ids whose listener matches their own CMD_BIND;
     // without it every consumer alloc_slot()s the same new conn_id and
     // corrupts each other's subsequent NET_MSG_DATA dispatch.
-    let mut frame = [0u8; 6];
+    let mut frame = [0u8; 7];
+    let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACCEPTED);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     let pb = local_port.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), pb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), pb[1]);
     let ok = net_send_or_queue(s, &frame);
     // Observability: start a `tcp.connection` span for the accepted (server-
     // side) connection, mint its root trace context, and propagate that context
@@ -855,7 +876,7 @@ unsafe fn net_send_accepted(s: &mut IpState, conn_id: u8, local_port: u16) -> bo
 }
 
 #[inline(always)]
-unsafe fn net_send_closed(s: &mut IpState, conn_id: u8) -> bool {
+unsafe fn net_send_closed(s: &mut IpState, conn_id: u16) -> bool {
     // Observability: emit the `tcp.connection` span before the close frame so a
     // full out-queue can't skip it. Only fires for a span that was started
     // (server-accepted, telemetry wired); client connects never set it.
@@ -932,34 +953,38 @@ unsafe fn emit_conn_span(s: &mut IpState, idx: usize) {
 /// share `net_out` with other bound peers match on `local_port` so they
 /// only claim a conn_id for their own CMD_BIND.
 #[inline(always)]
-unsafe fn net_send_bound(s: &mut IpState, conn_id: u8, local_port: u16) {
-    let mut frame = [0u8; 6];
+unsafe fn net_send_bound(s: &mut IpState, conn_id: u16, local_port: u16) {
+    let mut frame = [0u8; 7];
+    let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_BOUND);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     let pb = local_port.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), pb[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), pb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), pb[1]);
     net_send_or_queue(s, &frame);
 }
 
 #[inline(always)]
 #[must_use]
-unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) -> bool {
-    // Payload `[conn_id][requester_tag]` — the tag echoes the connecting
+unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
+    // Payload `[conn_id:2 LE][requester_tag]` — the tag echoes the connecting
     // module's CMD_CONNECT tag so a fanned net_out routes the event back to it.
     let tag = if (conn_id as usize) < tcp::MAX_TCP_CONNS {
         s.tcp_conns[conn_id as usize].connect_tag
     } else {
         0
     };
-    let mut frame = [0u8; 5];
+    let mut frame = [0u8; 6];
+    let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_CONNECTED);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 2u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), tag);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), tag);
     net_send_or_queue(s, &frame)
 }
 
@@ -967,54 +992,60 @@ unsafe fn net_send_connected(s: &mut IpState, conn_id: u8) -> bool {
 /// or queued; callers latching `pending_close_notify` on connect /
 /// accept failure use the bool to know whether the latch is needed.
 #[inline(always)]
-unsafe fn net_send_error(s: &mut IpState, conn_id: u8, errno: i8, tag: u8) -> bool {
-    // Payload `[conn_id][errno][requester_tag]`. The tag echoes the failing
-    // CMD_CONNECT's tag so a consumer sharing a fanned net_out attributes a
-    // connect failure to the right requester (it has no conn_id yet). Errors
-    // not tied to an outbound connect pass tag 0 (untagged).
-    let mut frame = [0u8; 6];
+unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: u8) -> bool {
+    // Payload `[conn_id:2 LE][errno][requester_tag]`. The tag echoes the
+    // failing CMD_CONNECT's tag so a consumer sharing a fanned net_out
+    // attributes a connect failure to the right requester (it has no conn_id
+    // yet). Errors not tied to an outbound connect pass tag 0 (untagged).
+    let mut frame = [0u8; 7];
+    let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ERROR);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 3u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 4u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), errno as u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), tag);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), errno as u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), tag);
     net_send_or_queue(s, &frame)
 }
 
-/// Emit a MSG_RETRANSMIT frame. Payload: [conn_id:1][from_seq:4 LE].
+/// Emit a MSG_RETRANSMIT frame. Payload: `[conn_id:2 LE][from_seq:4 LE]`.
 #[inline(always)]
-unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u8, from_seq: u32) {
-    let mut frame = [0u8; 8];
+unsafe fn net_send_retransmit(s: &mut IpState, conn_id: u16, from_seq: u32) {
+    let mut frame = [0u8; 9];
+    let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_RETRANSMIT);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 5u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 6u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     let b = from_seq.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), b[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[1]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[2]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[3]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[2]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(8), b[3]);
     net_send_or_queue(s, &frame);
 }
 
-/// Emit a MSG_ACK frame. Payload: [conn_id:1][acked_seq:4 LE].
+/// Emit a MSG_ACK frame. Payload: `[conn_id:2 LE][acked_seq:4 LE]`.
 #[inline(always)]
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
-unsafe fn net_send_ack(s: &mut IpState, conn_id: u8, acked_seq: u32) {
-    let mut frame = [0u8; 8];
+unsafe fn net_send_ack(s: &mut IpState, conn_id: u16, acked_seq: u32) {
+    let mut frame = [0u8; 9];
+    let cb = conn_id.to_le_bytes();
     core::ptr::write_volatile(frame.as_mut_ptr(), NET_MSG_ACK);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 5u8);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(1), 6u8);
     core::ptr::write_volatile(frame.as_mut_ptr().add(2), 0u8);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(3), conn_id);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(3), cb[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(4), cb[1]);
     let b = acked_seq.to_le_bytes();
-    core::ptr::write_volatile(frame.as_mut_ptr().add(4), b[0]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[1]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[2]);
-    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[3]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(5), b[0]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(6), b[1]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(7), b[2]);
+    core::ptr::write_volatile(frame.as_mut_ptr().add(8), b[3]);
     net_send_or_queue(s, &frame);
 }
 
@@ -1286,6 +1317,14 @@ pub unsafe extern "C" fn module_new(
             s.sample_permille = 0;
         }
         s.mac_valid = false;
+
+        // No loopback pairs yet (state arrives zeroed; 0 is a valid
+        // slot index, so the "none" sentinel must be set explicitly).
+        let mut li = 0;
+        while li < tcp::MAX_TCP_CONNS {
+            s.loopback_peer[li] = -1;
+            li += 1;
+        }
 
         // Initialize ARP table
         let mut i = 0;
@@ -2035,7 +2074,7 @@ unsafe fn process_tcp_segment(
     let mut reorder_offset: usize = 0;
     let mut reorder_len: usize = 0;
     let mut net_send_fast_retransmit: bool = false;
-    let mut net_send_fast_retransmit_conn: u8 = 0;
+    let mut net_send_fast_retransmit_conn: u16 = 0;
     let mut net_send_fast_retransmit_seq: u32 = 0;
 
     {
@@ -2078,7 +2117,7 @@ unsafe fn process_tcp_segment(
                             if tcp::on_dup_ack(conn) {
                                 // Fast retransmit trigger — consumer notified.
                                 net_send_fast_retransmit = true;
-                                net_send_fast_retransmit_conn = conn_idx as u8;
+                                net_send_fast_retransmit_conn = conn_idx as u16;
                                 net_send_fast_retransmit_seq = conn.snd_una;
                             }
                         }
@@ -2199,7 +2238,7 @@ unsafe fn process_tcp_segment(
             send_tcp_control(s, conn_idx, tcp::ACK, false);
             // Latch the connected-notification for retry if it couldn't be
             // delivered now, so a waiter always learns the connect succeeded.
-            if !net_send_connected(s, conn_idx as u8) {
+            if !net_send_connected(s, conn_idx as u16) {
                 (*s.tcp_conns.as_mut_ptr().add(conn_idx)).pending_close_notify = NOTIFY_CONNECTED;
             }
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
@@ -2207,7 +2246,7 @@ unsafe fn process_tcp_segment(
         }
         ACTION_COMPLETE_REFUSED => {
             let tag = (*s.tcp_conns.as_ptr().add(conn_idx)).connect_tag;
-            let delivered = net_send_error(s, conn_idx as u8, -111i8, tag);
+            let delivered = net_send_error(s, conn_idx as u16, -111i8, tag);
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
             if delivered {
                 *conn = tcp::TcpConn::new();
@@ -2222,7 +2261,7 @@ unsafe fn process_tcp_segment(
         }
         ACTION_SET_CLOSED => {
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
-            let delivered = net_send_closed(s, conn_idx as u8);
+            let delivered = net_send_closed(s, conn_idx as u16);
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
             if delivered {
                 if remote_ip != 0 {
@@ -2238,7 +2277,7 @@ unsafe fn process_tcp_segment(
         }
         ACTION_SET_CLOSING => {
             send_tcp_control(s, conn_idx, tcp::ACK, false);
-            if !net_send_closed(s, conn_idx as u8) {
+            if !net_send_closed(s, conn_idx as u16) {
                 let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                 conn.pending_close_notify = NOTIFY_CLOSED;
             }
@@ -2251,7 +2290,7 @@ unsafe fn process_tcp_segment(
             // delivered and stop retransmitting. Closing the window
             // (rcv_wnd = 0) and emitting a duplicate ACK lets the
             // peer's retransmit re-deliver once the consumer drains.
-            let delivered = net_send_data(s, conn_idx as u8, payload, rx_payload_len);
+            let delivered = net_send_data(s, conn_idx as u16, payload, rx_payload_len);
             if !delivered {
                 let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                 conn.rcv_wnd = 0;
@@ -2275,7 +2314,7 @@ unsafe fn process_tcp_segment(
                     Some((slice, next_seq)) => {
                         let ptr = slice.as_ptr();
                         let len = slice.len();
-                        if !net_send_data(s, conn_idx as u8, ptr, len) {
+                        if !net_send_data(s, conn_idx as u16, ptr, len) {
                             break;
                         }
                         let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
@@ -2297,7 +2336,7 @@ unsafe fn process_tcp_segment(
             }
             update_rcv_wnd(s, conn_idx);
             send_tcp_control(s, conn_idx, tcp::ACK, false);
-            if action == ACTION_RX_DATA_FIN && !net_send_closed(s, conn_idx as u8) {
+            if action == ACTION_RX_DATA_FIN && !net_send_closed(s, conn_idx as u16) {
                 let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                 conn.pending_close_notify = NOTIFY_CLOSED;
             }
@@ -2310,13 +2349,13 @@ unsafe fn process_tcp_segment(
             let remote_ip = (*s.tcp_conns.as_ptr().add(conn_idx)).remote_ip;
             arp::pin(&mut s.arp_table, remote_ip);
             let local_port = (*s.tcp_conns.as_ptr().add(conn_idx)).local_port;
-            let _ = net_send_accepted(s, conn_idx as u8, local_port);
+            let _ = net_send_accepted(s, conn_idx as u16, local_port);
             // Piggybacked data (e.g. HTTP GET on the third handshake
             // ACK). Same gate as the regular RX_DATA path: don't ACK
             // payload the consumer didn't receive.
             if rx_payload_len > 0 {
                 let payload = data.add(rx_payload_offset);
-                if net_send_data(s, conn_idx as u8, payload, rx_payload_len) {
+                if net_send_data(s, conn_idx as u16, payload, rx_payload_len) {
                     let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                     conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
                     conn.delivered_bytes = conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
@@ -3000,8 +3039,113 @@ fn state_allows_send(state: tcp::TcpState) -> bool {
 /// close); from CloseWait → LAST_ACK (peer FIN'd first). State only
 /// advances on successful FIN queue, so a backpressured FIN doesn't
 /// strand the conn in FinWait1 with no frame on the wire.
+/// Serve a CMD_CONNECT addressed to this host (see `loopback_peer`):
+/// find the local listener, bind a conn-slot PAIR as `Established`,
+/// and notify both consumers. Failure surfaces exactly like the TCP
+/// path's: ECONNREFUSED when nothing listens, ENOMEM when the table
+/// is full — a consumer cannot tell the fastpath from a real connect.
+unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
+    // A listener must exist BEFORE the pair is allocated.
+    let mut listener = false;
+    let mut li = 0;
+    while li < tcp::MAX_TCP_CONNS {
+        let conn = &*s.tcp_conns.as_ptr().add(li);
+        if conn.state == tcp::TcpState::Listen && !conn.is_datagram && conn.local_port == port {
+            listener = true;
+            break;
+        }
+        li += 1;
+    }
+    if !listener {
+        let _ = net_send_error(s, 0, -111, requester_tag); // ECONNREFUSED
+        return;
+    }
+
+    // Two free slots: the connector's and the accepted side's.
+    let mut ci: i32 = -1;
+    let mut si: i32 = -1;
+    let mut i = 0;
+    while i < tcp::MAX_TCP_CONNS {
+        if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
+            if ci < 0 {
+                ci = i as i32;
+            } else {
+                si = i as i32;
+                break;
+            }
+        }
+        i += 1;
+    }
+    if ci < 0 || si < 0 {
+        let _ = net_send_error(s, 0, -12, requester_tag); // ENOMEM
+        return;
+    }
+    let (ci, si) = (ci as usize, si as usize);
+    let local_port = next_port(s);
+
+    // Established immediately — there is no handshake to perform.
+    // `remote_ip` stays 0 so no close path ever touches the ARP table
+    // and no incoming segment's 4-tuple can match these slots.
+    {
+        let c = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+        c.state = tcp::TcpState::Established;
+        c.remote_ip = 0;
+        c.remote_port = port;
+        c.local_port = local_port;
+        c.local_slot = 0;
+        c.connect_tag = requester_tag;
+        c.retransmit_timer = 0;
+    }
+    {
+        let v = &mut *s.tcp_conns.as_mut_ptr().add(si);
+        v.state = tcp::TcpState::Established;
+        v.remote_ip = 0;
+        v.remote_port = local_port;
+        v.local_port = port;
+        v.local_slot = 0;
+        v.connect_tag = 0;
+        v.retransmit_timer = 0;
+    }
+    s.loopback_peer[ci] = si as i16;
+    s.loopback_peer[si] = ci as i16;
+
+    // Listener first (it filters MSG_ACCEPTED by `local_port`), then
+    // the connector. `net_send_or_queue` holds these across full
+    // rings; if even the queue is full, tear the pair down — half a
+    // notification would strand one side forever.
+    if !net_send_accepted(s, si as u16, port) || !net_send_connected(s, ci as u16) {
+        s.loopback_peer[ci] = -1;
+        s.loopback_peer[si] = -1;
+        *s.tcp_conns.as_mut_ptr().add(ci) = tcp::TcpConn::new();
+        *s.tcp_conns.as_mut_ptr().add(si) = tcp::TcpConn::new();
+        let _ = net_send_error(s, 0, -12, requester_tag);
+        return;
+    }
+    log_info(s, b"[ip] loopback pair");
+}
+
+/// Tear down a loopback pair from either end: both consumers get
+/// MSG_CLOSED, both slots free. Mirrors a FIN'd TCP close as seen
+/// from the net-proto surface.
+unsafe fn close_loopback(s: &mut IpState, conn_id: usize) {
+    let peer = s.loopback_peer[conn_id];
+    s.loopback_peer[conn_id] = -1;
+    *s.tcp_conns.as_mut_ptr().add(conn_id) = tcp::TcpConn::new();
+    let _ = net_send_closed(s, conn_id as u16);
+    if peer >= 0 {
+        let pi = peer as usize;
+        s.loopback_peer[pi] = -1;
+        *s.tcp_conns.as_mut_ptr().add(pi) = tcp::TcpConn::new();
+        let _ = net_send_closed(s, peer as u16);
+    }
+}
+
 unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
     if conn_id >= tcp::MAX_TCP_CONNS {
+        return true;
+    }
+    if s.loopback_peer[conn_id] >= 0 {
+        close_loopback(s, conn_id);
         return true;
     }
     let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
@@ -3024,7 +3168,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
             // Close a listening socket
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
             *conn = tcp::TcpConn::new();
-            net_send_closed(s, conn_id as u8);
+            net_send_closed(s, conn_id as u16);
             true
         }
         _ => {
@@ -3035,7 +3179,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
             }
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
             *conn = tcp::TcpConn::new();
-            net_send_closed(s, conn_id as u8);
+            net_send_closed(s, conn_id as u16);
             true
         }
     }
@@ -3063,6 +3207,26 @@ unsafe fn try_send_cmd_payload(
     start_off: usize,
 ) -> usize {
     let mut data_off = start_off;
+    // Loopback pair: no segmentation, no windows — each chunk becomes
+    // one MSG_DATA tagged with the PEER's conn id, sized to the
+    // net_out scratch frame. A rejected write returns the offset so
+    // the caller's pending-cmd stash resumes next tick, exactly like
+    // a closed TCP window.
+    if s.loopback_peer[conn_id] >= 0 {
+        let peer = s.loopback_peer[conn_id] as u16;
+        let max_chunk = s.net_scratch.len() - NET_FRAME_HDR - 2;
+        while data_off < payload_len {
+            if s.loopback_peer[conn_id] < 0 {
+                return payload_len; // peer closed mid-send — drop the tail
+            }
+            let chunk = (payload_len - data_off).min(max_chunk);
+            if !net_send_data(s, peer, payload.add(data_off), chunk) {
+                return data_off;
+            }
+            data_off += chunk;
+        }
+        return payload_len;
+    }
     while data_off < payload_len {
         let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
         if !state_allows_send(conn_state) {
@@ -3349,7 +3513,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     }
                     if let Some(idx) = existing {
                         log_info(s, b"[ip] net bind: existing listener");
-                        net_send_bound(s, idx as u8, port);
+                        net_send_bound(s, idx as u16, port);
                     } else {
                         let mut found = false;
                         let mut ci = 0;
@@ -3372,7 +3536,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         }
                         if found {
                             log_info(s, b"[ip] net bind");
-                            net_send_bound(s, ci as u8, port);
+                            net_send_bound(s, ci as u16, port);
                         } else {
                             log_info(s, b"[ip] net bind: no free conn");
                             net_send_error(s, 0, -12, 0); // ENOMEM (bind — untagged)
@@ -3398,6 +3562,18 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         let ip =
                             u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
                         let port = u16::from_le_bytes([*bp.add(5), *bp.add(6)]);
+
+                        // LOCAL-DELIVERY FASTPATH: a connect to this host's
+                        // own address (or 127.0.0.1) is served entirely
+                        // in-module — see `loopback_peer`. Consumers encode
+                        // the address bytes so this LE parse yields the same
+                        // numeric form `s.local_ip` holds (pg_client et al.
+                        // reverse the endpoint bytes into the payload).
+                        if ip == 0x7F00_0001 || (s.local_ip != 0 && ip == s.local_ip) {
+                            connect_loopback(s, port, requester_tag);
+                            count += 1;
+                            continue;
+                        }
 
                         let mut conn_id: i32 = -1;
                         let mut ci = 0;
@@ -3441,19 +3617,20 @@ unsafe fn service_net_channels(s: &mut IpState) {
             }
             NET_CMD_SEND => {
                 // Stream Surface v1: send TCP payload.
-                // Payload: [conn_id: u8] [data...]. A single CMD_SEND
+                // Payload: `[conn_id: u16 LE][data...]`. A single CMD_SEND
                 // can carry many MSS; `try_send_cmd_payload` segments
                 // into MSS-sized writes against the peer window, and
                 // any unsent tail goes into `pending_cmd_*` for the
                 // next tick.
-                if plen >= 2 {
-                    let conn_id = *buf.as_ptr() as usize;
+                if plen >= 3 {
+                    let conn_id =
+                        u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
                     let total_len = plen;
                     if conn_id < tcp::MAX_TCP_CONNS && total_len <= PENDING_CMD_BUF_SIZE {
                         let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
                         if state_allows_send(conn_state) {
                             let new_off =
-                                try_send_cmd_payload(s, conn_id, buf.as_ptr(), total_len, 1);
+                                try_send_cmd_payload(s, conn_id, buf.as_ptr(), total_len, 2);
                             if new_off < total_len {
                                 // Stash the buffer verbatim (conn_id
                                 // at byte 0) so the resume path uses
@@ -3465,7 +3642,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                                     s.pending_cmd_buf.as_mut_ptr(),
                                     total_len,
                                 );
-                                s.pending_cmd_conn = conn_id as u8;
+                                s.pending_cmd_conn = conn_id as u16;
                                 s.pending_cmd_off = new_off as u16;
                                 s.pending_cmd_len = total_len as u16;
                                 s.pending_cmd_valid = 1;
@@ -3480,18 +3657,19 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 }
             }
             NET_CMD_CLOSE => {
-                // Payload: [conn_id: u8]. Defer the FIN if there's
+                // Payload: `[conn_id: u16 LE]`. Defer the FIN if there's
                 // stashed CMD_SEND data still draining (RFC 793 §3.5:
                 // CLOSE waits for queued SENDs to be transmitted) or
                 // if the FIN frame itself can't be queued; the prelude
                 // retry path resumes once the precondition clears.
-                if plen >= 1 {
-                    let conn_id = *buf.as_ptr() as usize;
+                if plen >= 2 {
+                    let conn_id =
+                        u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]) as usize;
                     if conn_id < tcp::MAX_TCP_CONNS
                         && (s.pending_cmd_valid != 0 || !process_cmd_close(s, conn_id))
                     {
                         s.pending_close_valid = 1;
-                        s.pending_close_conn = conn_id as u8;
+                        s.pending_close_conn = conn_id as u16;
                         return;
                     }
                 }
@@ -3640,10 +3818,10 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
             let tag = conn.connect_tag;
             if kind != NOTIFY_NONE {
                 let delivered = match kind {
-                    NOTIFY_CLOSED => net_send_closed(s, i as u8),
-                    NOTIFY_ERROR_REFUSED => net_send_error(s, i as u8, -111i8, tag),
-                    NOTIFY_ERROR_TIMEOUT => net_send_error(s, i as u8, -110i8, tag),
-                    NOTIFY_CONNECTED => net_send_connected(s, i as u8),
+                    NOTIFY_CLOSED => net_send_closed(s, i as u16),
+                    NOTIFY_ERROR_REFUSED => net_send_error(s, i as u16, -111i8, tag),
+                    NOTIFY_ERROR_TIMEOUT => net_send_error(s, i as u16, -110i8, tag),
+                    NOTIFY_CONNECTED => net_send_connected(s, i as u16),
                     _ => true, // unknown code → drop the latch
                 };
                 if delivered {
@@ -3682,7 +3860,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                     let tag = conn.connect_tag;
                     // Free on delivery; else latch (Closed + retry) so the
                     // requester always gets exactly one tagged terminal result.
-                    if net_send_error(s, i as u8, -110, tag) {
+                    if net_send_error(s, i as u16, -110, tag) {
                         *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
                     } else {
                         let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
@@ -3712,7 +3890,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                 // MSG_CLOSED can be delivered so consumers don't strand.
                 if conn.timewait_timer > 40 {
                     let remote_ip = conn.remote_ip;
-                    if net_send_closed(s, i as u8) {
+                    if net_send_closed(s, i as u16) {
                         if remote_ip != 0 {
                             arp::unpin(&mut s.arp_table, remote_ip);
                         }
@@ -3733,7 +3911,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                         // Exponential backoff — double RTO for next timeout.
                         conn.rto = core::cmp::min(conn.rto.saturating_mul(2), tcp::RTO_MAX);
                         conn.rtt_active = false; // Karn's algorithm
-                        net_send_retransmit(s, i as u8, seq);
+                        net_send_retransmit(s, i as u16, seq);
                     }
                 } else {
                     conn.retransmit_timer = 0;

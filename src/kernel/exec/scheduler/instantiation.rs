@@ -200,8 +200,16 @@ pub(crate) fn push_internal_module(
     domain_id: u8,
     frame_kind: u8,
 ) -> Option<usize> {
-    if *module_count >= MAX_MODULES {
+    if *module_count >= MAX_MODULES
+        || !crate::kernel::sys::resource_ledger::enforced_allows(
+            crate::abi::contracts::resource::POOL_MODULE_SLOTS,
+            *module_count as u32 + 1,
+        )
+    {
         log::error!("No room for internal module");
+        crate::kernel::sys::resource_ledger::deny(
+            crate::abi::contracts::resource::POOL_MODULE_SLOTS,
+        );
         return None;
     }
 
@@ -506,6 +514,10 @@ pub fn sample_pstatus() {
             }
         }
     }
+
+    // One `POOL` record per kernel resource pool, kernel-stamped — the
+    // ledger's cadence surface (`rfc_resource_model.md` §6.1).
+    crate::kernel::sys::resource_ledger::emit_all(t);
 }
 
 /// Per-domain wall-clock timestamp (ms) of the last `[sched] alive` heartbeat,

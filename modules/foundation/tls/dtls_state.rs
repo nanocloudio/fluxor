@@ -730,7 +730,7 @@ unsafe fn emit_peer_identity_dtls(s: &mut TlsState, idx: usize) {
     } else {
         &svid_buf[..0]
     };
-    let conn_id = idx as u8;
+    let conn_id = idx as u16;
     let mut envelope = [0u8; PEER_IDENTITY_MAX_TOTAL];
     let total = build_peer_identity_envelope(conn_id, svid_slice, &mut envelope);
     {

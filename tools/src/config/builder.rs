@@ -21,12 +21,6 @@ const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// Graph section size (header + edges + domain metadata)
 const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
 
-/// Maximum number of modules.
-///
-/// Raised from 24 to 64 to accommodate large multi-protocol broker graphs
-/// (~40+ modules combining a substrate layer with application modules). The
-/// wake bitmap in `kernel/event.rs` also bumped to u64 to match.
-const MAX_MODULES: usize = 64;
 
 /// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + reserved:u8).
 /// entry_length widened to u32 so a single module's params can exceed
@@ -2130,6 +2124,7 @@ fn build_module_entry(
     config: &Value,
     modules_dir: &Path,
     manifests: &HashMap<String, Manifest>,
+    max_modules: usize,
 ) -> Result<Vec<u8>> {
     // Start with max possible size, will truncate to actual used size
     let mut entry = vec![0u8; MODULE_ENTRY_HEADER_SIZE + MAX_MODULE_PARAMS_SIZE];
@@ -2603,11 +2598,11 @@ fn build_module_entry(
                     )));
                 }
             };
-            if partner >= MAX_MODULES as u64 {
+            if partner >= max_modules as u64 {
                 return Err(Error::Config(format!(
                     "module '{name}': quarantine_partner_idx {partner} out of range \
                      (max {})",
-                    MAX_MODULES - 1
+                    max_modules - 1
                 )));
             }
             if base + extra_len + 3 < entry.len() {
@@ -2913,6 +2908,7 @@ fn parse_modules_map(
     config: &Value,
     modules_dir: &Path,
     manifests: &HashMap<String, Manifest>,
+    max_modules: usize,
 ) -> Result<(Vec<Vec<u8>>, Vec<String>)> {
     let mut entries = Vec::new();
     let mut names = Vec::new();
@@ -2928,7 +2924,7 @@ fn parse_modules_map(
     // (numeric form) bypass this entirely.
     let mut name_to_idx: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     for (idx, m) in list.iter().enumerate() {
-        if idx >= MAX_MODULES {
+        if idx >= max_modules {
             break;
         }
         if let Some(n) = m.get("name").and_then(|v| v.as_str()) {
@@ -2937,11 +2933,11 @@ fn parse_modules_map(
     }
 
     for (idx, module) in list.iter().enumerate() {
-        if idx >= MAX_MODULES {
+        if idx >= max_modules {
             return Err(Error::Config(format!(
-                "Too many modules: {} > {}",
+                "Too many modules: {} > {} (the target profile's kernel MAX_MODULES)",
                 idx + 1,
-                MAX_MODULES
+                max_modules
             )));
         }
         let name = module["name"]
@@ -2982,10 +2978,10 @@ fn parse_modules_map(
             }
             Some(v) if v.is_u64() => {
                 let n = v.as_u64().unwrap();
-                if n >= MAX_MODULES as u64 {
+                if n >= max_modules as u64 {
                     return Err(Error::Config(format!(
                         "module '{name}': quarantine_partner index {n} out of range (max {})",
-                        MAX_MODULES - 1
+                        max_modules - 1
                     )));
                 }
                 Some(n as u8)
@@ -3016,6 +3012,7 @@ fn parse_modules_map(
             config,
             modules_dir,
             manifests,
+            max_modules,
         )?;
         entries.push(entry);
         names.push(name.to_string());

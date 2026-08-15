@@ -235,14 +235,17 @@ pub fn module_info_flags(module_idx: usize) -> u32 {
 }
 
 /// Upstream-module bitmask for module N.
-pub fn module_upstream_mask(module_idx: usize) -> u64 {
+pub fn module_upstream_words(module_idx: usize, out: &mut [u64]) -> usize {
     if module_idx >= MAX_MODULES {
         return 0;
     }
+    let words = crate::kernel::workload::bitmask::MODULE_MASK_WORDS;
     // SAFETY: scheduler-thread read; module_idx bounded.
-    // The reconfigure syscall ABI surfaces a u64; it observes the low-64
-    // upstream bits. Widening that opcode is tracked with the reconfigure ABI.
-    unsafe { SCHED.upstream_mask[module_idx].as_u64() }
+    let mask = unsafe { &SCHED.upstream_mask[module_idx] };
+    for (i, w) in out.iter_mut().take(words).enumerate() {
+        *w = mask.word(i);
+    }
+    words
 }
 
 /// Whether every producer that can still feed `module_idx` — over any edge,

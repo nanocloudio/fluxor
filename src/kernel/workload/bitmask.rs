@@ -136,6 +136,17 @@ impl ModuleMask {
     pub fn as_u64(&self) -> u64 {
         self.words[0]
     }
+
+    /// Word `i` of the mask (`0` beyond `MODULE_MASK_WORDS`), low word
+    /// first — the reconfigure `MODULE_UPSTREAM` wire order.
+    #[inline]
+    pub fn word(&self, i: usize) -> u64 {
+        if i < MODULE_MASK_WORDS {
+            self.words[i]
+        } else {
+            0
+        }
+    }
 }
 
 impl Default for ModuleMask {

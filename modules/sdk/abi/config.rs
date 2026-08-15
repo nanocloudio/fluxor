@@ -98,6 +98,16 @@ mod profile_host {
         /// Capacity of the in-memory log ring (`kernel::sys::log_ring`).
         /// Sized for moderate trace volume.
         pub const LOG_RING_CAPACITY: usize = 65536;
+        /// Kernel elastic region backing Tier B chunk grants
+        /// (`resource::ELASTIC_ALLOC`, `rfc_resource_model.md` §3.6).
+        /// 8 MiB: room for TLS-session growth to its compiled maximum
+        /// (~832 KiB) plus several workloads' worth of headroom, and
+        /// deliberately oversubscribable — Σ of pool maxima MAY exceed
+        /// it; contention is a counted denial, mins are load-time.
+        pub const ELASTIC_REGION_SIZE: usize = 8 * 1024 * 1024;
+        /// Grant granularity: chunks are rounded up to this quantum
+        /// (the 64 KiB platform quantum, §3.1).
+        pub const ELASTIC_QUANTUM: usize = 64 * 1024;
     }
 
     pub mod http {
@@ -253,6 +263,11 @@ mod profile_wasm {
         pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
         pub const CONFIG_ARENA_SIZE: usize = 32 * 1024;
         pub const LOG_RING_CAPACITY: usize = 16384;
+        /// Tier B elastic region (see the host profile). Browser tabs
+        /// page lazily, but the region is still budgeted small.
+        pub const ELASTIC_REGION_SIZE: usize = 2 * 1024 * 1024;
+        /// Grant granularity: the wasm page.
+        pub const ELASTIC_QUANTUM: usize = 64 * 1024;
     }
 
     pub mod http {
@@ -301,6 +316,10 @@ mod profile_embedded {
         pub const MAX_MODULE_CONFIG_SIZE: usize = 4 * 1024;
         pub const CONFIG_ARENA_SIZE: usize = 16 * 1024;
         pub const LOG_RING_CAPACITY: usize = 4096;
+        /// No Tier B on MCU-class targets: elasticity compiles out
+        /// (`rfc_resource_model.md` §3.5) — `ELASTIC_ALLOC` denies.
+        pub const ELASTIC_REGION_SIZE: usize = 0;
+        pub const ELASTIC_QUANTUM: usize = 1024;
     }
 
     pub mod http {

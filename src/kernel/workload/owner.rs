@@ -148,6 +148,15 @@ impl OwnerTable {
     /// `None` when every workload slot is occupied. The lowest-free-slot rule
     /// is required by the deterministic-composition contract (rfc_k8s.md §11).
     pub fn alloc(&mut self, owner_uid: [u8; 16]) -> Option<OwnerHandle> {
+        {
+            use crate::abi::contracts::resource::POOL_OWNERS;
+            use crate::kernel::sys::resource_ledger as ledger;
+            let live = self.active_workload_count() as u32;
+            if !ledger::enforced_allows(POOL_OWNERS, live + 1) {
+                ledger::deny(POOL_OWNERS);
+                return None;
+            }
+        }
         // `1..MAX_OWNERS` is empty on single-tenant (MAX_OWNERS == 1) builds —
         // no workload slots exist, so alloc correctly returns None.
         #[allow(
@@ -169,6 +178,7 @@ impl OwnerTable {
                 });
             }
         }
+        crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_OWNERS);
         None
     }
 

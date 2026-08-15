@@ -215,6 +215,12 @@ fn check_event_access(handle: i32) -> Result<&'static EventSlot, i32> {
 /// Create a new event owned by the currently executing module.
 /// Returns event handle (slot index, >=0) or negative errno.
 pub fn event_create() -> i32 {
+    use crate::abi::contracts::resource::POOL_EVENTS;
+    use crate::kernel::sys::resource_ledger as ledger;
+    if !ledger::enforced_allows(POOL_EVENTS, in_use_count() as u32 + 1) {
+        ledger::deny(POOL_EVENTS);
+        return errno::ENOSPC;
+    }
     let owner = crate::kernel::exec::scheduler::current_module_index() as u8;
     for (i, slot) in EVENT_SLOTS.iter().enumerate() {
         if slot
@@ -227,7 +233,16 @@ pub fn event_create() -> i32 {
             return i as i32;
         }
     }
-    errno::ENOMEM
+    crate::kernel::sys::resource_ledger::deny(crate::abi::contracts::resource::POOL_EVENTS);
+    errno::ENOSPC
+}
+
+/// Allocated slots — resource-ledger sample for `POOL_EVENTS`.
+pub fn in_use_count() -> usize {
+    EVENT_SLOTS
+        .iter()
+        .filter(|s| s.allocated.load(Ordering::Relaxed))
+        .count()
 }
 
 /// Signal an event. Safe to call from any context (module step, poll, ISR).

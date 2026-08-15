@@ -596,7 +596,15 @@ fn arena_alloc(size: usize) -> Option<&'static mut [u8]> {
     // `offset + size <= CONFIG_ARENA_SIZE` is checked before slicing.
     unsafe {
         let offset = ARENA_OFFSET;
-        if offset + size > CONFIG_ARENA_SIZE {
+        if offset + size > CONFIG_ARENA_SIZE
+            || !crate::kernel::sys::resource_ledger::enforced_allows(
+                crate::abi::contracts::resource::POOL_CONFIG_ARENA,
+                (offset + size) as u32,
+            )
+        {
+            crate::kernel::sys::resource_ledger::deny(
+                crate::abi::contracts::resource::POOL_CONFIG_ARENA,
+            );
             return None;
         }
         ARENA_OFFSET = offset + size;
@@ -1297,56 +1305,98 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         }
     }
 
-    // Resident-workload section (RFC adaptive_tick_extra §7), right after the 16-byte
-    // adaptive post-body, also PAST the checksummed body. `[FXPD u32 LE][count
-    // u16 LE]` then per workload `[blob_len u32 LE][FLXA blob]`. Record only its
-    // pointer+length here (the boot path walks it); validate the framing fits the
-    // mapped blob and the bound so a torn/hostile tail can't escape. Absent or
-    // bad magic ⇒ no workloads (single-graph boot, byte-identical).
-    // Header: `[FXPD u32][section_len u32][crc16 u16][count u16]` then workloads. The
-    // section rides past the body CRC, so it carries its OWN length + CRC over the
-    // payload (`count` + workloads). Validate the WHOLE section here — bounds AND CRC —
-    // before recording it: workloads are executable configuration (domains, wiring,
-    // params), so a corrupt or truncated section must admit ZERO workloads, never a
-    // partial/garbled prefix. Absent/bad-magic ⇒ no workloads (byte-identical boot).
-    let pod_off = post_off + ADAPTIVE_POST_SIZE;
-    if pod_off + 12 <= blob_len {
-        // SAFETY: `pod_off + 12 <= blob_len` checked; reads 4+4+2 bytes in range.
-        let magic = unsafe { read_u32(flash_ptr.add(pod_off)) };
-        if magic == WORKLOAD_SECTION_MAGIC {
-            // SAFETY: header fields within the 12 bytes checked above.
-            let section_len = unsafe { read_u32(flash_ptr.add(pod_off + 4)) } as usize;
-            // SAFETY: crc at offset 8, within the 12 header bytes checked above.
-            let stored_crc = unsafe { read_u16(flash_ptr.add(pod_off + 8)) };
-            if section_len < 12
-                || section_len > MAX_WORKLOAD_SECTION_BYTES
-                || pod_off + section_len > blob_len
-            {
-                log::error!(
-                    "[config] resident-workload section length {section_len} out of range \
-                     (cap {MAX_WORKLOAD_SECTION_BYTES}, blob_len {blob_len}); ignoring workloads"
-                );
-            } else {
-                // CRC over the payload = section[10..section_len] (count + workloads).
-                // SAFETY: `pod_off + section_len <= blob_len`, so this range is
-                // within the mapped blob; `section_len >= 12 > 10`.
-                let payload = unsafe {
-                    core::slice::from_raw_parts(flash_ptr.add(pod_off + 10), section_len - 10)
-                };
-                if crc16_ccitt(payload) == stored_crc {
-                    // SAFETY: `pod_off < blob_len`; pointer into the mapped blob.
-                    config.resident_workload_section = unsafe { flash_ptr.add(pod_off) };
-                    config.resident_workload_section_len = section_len;
-                } else {
-                    log::error!(
-                        "[config] resident-workload section CRC mismatch; ignoring workloads"
-                    );
-                }
-            }
+    // Post-body section chain, right after the 16-byte adaptive post-body and
+    // PAST the checksummed body (the additive discipline — growing `body_size`
+    // hangs the bare-metal Pi 5 boot; trailing sections are rig-proven
+    // harmless). Every section is self-describing with the same header:
+    // `[magic u32][section_len u32][crc16 u16][payload]`, `crc16` over
+    // `section[10..section_len]` — so the walk skips sections by length and an
+    // unknown magic ends the chain. Known sections:
+    //   FXPD — resident workloads (RFC adaptive_tick_extra §7): payload =
+    //          `[count u16]` then per workload `[blob_len u32][FLXA blob]`.
+    //   FXEV — capacity envelope (`rfc_resource_model.md` §3): payload =
+    //          `[entry_count u16]` then `[pool u16][n u32]` entries, installed
+    //          as the deployment's enforced pool capacities.
+    // Each is validated whole (bounds AND CRC) before use: workloads are
+    // executable configuration and the envelope gates admission, so a corrupt
+    // or truncated section must contribute NOTHING, never a garbled prefix.
+    // Absent sections ⇒ byte-identical single-graph, static-capacity boot.
+    crate::kernel::sys::resource_ledger::reset_enforced();
+    let mut section_off = post_off + ADAPTIVE_POST_SIZE;
+    while section_off + 12 <= blob_len {
+        // SAFETY: `section_off + 12 <= blob_len` checked; reads 4+4+2 bytes in range.
+        let magic = unsafe { read_u32(flash_ptr.add(section_off)) };
+        let cap = match magic {
+            WORKLOAD_SECTION_MAGIC => MAX_WORKLOAD_SECTION_BYTES,
+            ENVELOPE_SECTION_MAGIC => crate::abi::contracts::resource::MAX_ENVELOPE_SECTION_BYTES,
+            _ => break,
+        };
+        // SAFETY: header fields within the 12 bytes checked above.
+        let section_len = unsafe { read_u32(flash_ptr.add(section_off + 4)) } as usize;
+        // SAFETY: crc at offset 8, within the 12 header bytes checked above.
+        let stored_crc = unsafe { read_u16(flash_ptr.add(section_off + 8)) };
+        if section_len < 12 || section_len > cap || section_off + section_len > blob_len {
+            log::error!(
+                "[config] post-body section {magic:#010X} length {section_len} out of range \
+                 (cap {cap}, blob_len {blob_len}); section chain ends here"
+            );
+            break;
         }
+        // SAFETY: `section_off + section_len <= blob_len`; `section_len >= 12 > 10`.
+        let payload = unsafe {
+            core::slice::from_raw_parts(flash_ptr.add(section_off + 10), section_len - 10)
+        };
+        if crc16_ccitt(payload) != stored_crc {
+            log::error!("[config] post-body section {magic:#010X} CRC mismatch; section ignored");
+            section_off += section_len;
+            continue;
+        }
+        match magic {
+            WORKLOAD_SECTION_MAGIC => {
+                // SAFETY: `section_off < blob_len`; pointer into the mapped blob.
+                config.resident_workload_section = unsafe { flash_ptr.add(section_off) };
+                config.resident_workload_section_len = section_len;
+            }
+            ENVELOPE_SECTION_MAGIC => parse_envelope_payload(payload),
+            _ => unreachable!(),
+        }
+        section_off += section_len;
     }
 
     true
+}
+
+/// Capacity-envelope section magic ("FXEV") — mirror of
+/// `abi::contracts::resource::ENVELOPE_SECTION_MAGIC`.
+const ENVELOPE_SECTION_MAGIC: u32 = crate::abi::contracts::resource::ENVELOPE_SECTION_MAGIC;
+
+/// Install a CRC-validated envelope payload (`[entry_count u16]` then
+/// `[pool u16][n u32]` per entry) into the resource ledger. A count that
+/// disagrees with the payload length installs nothing.
+fn parse_envelope_payload(payload: &[u8]) {
+    use crate::abi::contracts::resource::ENVELOPE_ENTRY_SIZE;
+    if payload.len() < 2 {
+        return;
+    }
+    let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    if 2 + count * ENVELOPE_ENTRY_SIZE != payload.len() {
+        log::error!(
+            "[config] envelope count {count} disagrees with section length {}; ignored",
+            payload.len()
+        );
+        return;
+    }
+    for e in 0..count {
+        let off = 2 + e * ENVELOPE_ENTRY_SIZE;
+        let pool = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        let n = u32::from_le_bytes([
+            payload[off + 2],
+            payload[off + 3],
+            payload[off + 4],
+            payload[off + 5],
+        ]);
+        crate::kernel::sys::resource_ledger::set_enforced(pool, n);
+    }
 }
 
 // ============================================================================
