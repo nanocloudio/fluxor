@@ -451,6 +451,42 @@ fn run_modules_build(s: &Shape, verbose: bool) -> Result<()> {
 /// never drift from the CLI or fall behind the scripts in the tree: the
 /// script list is a directory walk, not a hand-kept list, and the
 /// lifecycle lines say what the verbs actually do for *this* shape.
+/// Non-lifecycle targets a project's Makefile defines, each with the
+/// first line of the comment block above it as its description.
+///
+/// `install` is omitted: it is described in the lifecycle block above
+/// for the project that ships the CLI, and absent everywhere else.
+fn project_targets(project_root: &Path) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(project_root.join("Makefile")) else {
+        return Vec::new();
+    };
+    let lifecycle: Vec<&str> = crate::makefile_lint::LIFECYCLE
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for t in crate::makefile_lint::parse(&text) {
+        if lifecycle.contains(&t.name.as_str()) || t.name == "install" {
+            continue;
+        }
+        // Walk back over the contiguous comment block; its first line is
+        // the one-line summary a reader wants.
+        let mut i = t.line.saturating_sub(1);
+        let mut first = String::new();
+        while i > 0 && lines[i - 1].trim_start().starts_with('#') {
+            first = lines[i - 1]
+                .trim_start()
+                .trim_start_matches('#')
+                .trim()
+                .to_string();
+            i -= 1;
+        }
+        out.push((t.name.clone(), first));
+    }
+    out
+}
+
 pub fn make_help(project_root: &Path) -> String {
     let s = shape(project_root);
     let mut out = String::new();
@@ -471,6 +507,19 @@ pub fn make_help(project_root: &Path) -> String {
     if is_fluxor_itself(&s) {
         line("  make install   one-time bootstrap: build the CLI + runtime, publish");
         line("                 them into the store, install the resolving launcher");
+    }
+
+    // Targets beyond the lifecycle set. Read from the Makefile rather
+    // than listed here: they are the project's own, and a generated
+    // help block that omits them makes them undiscoverable — which is
+    // the failure `help` exists to prevent.
+    let extra = project_targets(&s.project_root);
+    if !extra.is_empty() {
+        line("");
+        line("Project targets:");
+        for (name, desc) in &extra {
+            line(&column(&format!("make {name}"), desc));
+        }
     }
 
     line("");
@@ -845,5 +894,27 @@ mod tests {
         assert!(text.contains("scripts/bringup.sh"), "{text}");
         assert!(text.contains("One-time setup:"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Project targets are read from the Makefile, so a project's own
+    /// additions cannot be missing from generated help — the failure
+    /// `help` exists to prevent. The summary is the FIRST line of the
+    /// comment block above the target, so an author controls it.
+    #[test]
+    fn project_targets_reads_extras_with_their_first_comment_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Makefile"),
+            "build:\n\tfluxor build\n\n             # stage the shadow tiers\n             #\n             # a second paragraph nobody wants in help\n             shadow-add:\n\t@git shadow add -f\n\n             install:\n\tcargo install\n",
+        )
+        .unwrap();
+        let got = project_targets(dir.path());
+        assert_eq!(
+            got,
+            vec![(
+                "shadow-add".to_string(),
+                "stage the shadow tiers".to_string()
+            )],
+            "lifecycle and install are omitted; the extra keeps its first comment line"
+        );
     }
 }

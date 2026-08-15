@@ -29,6 +29,7 @@ vm/
 # not affected.
 /tests/
 /tools/tests/
+/examples/
 
 # The shadow repo's own git-dir. `/tests/` and `/tools/tests/` above are
 # versioned in it rather than here (standards/test-tracking.md §4), so

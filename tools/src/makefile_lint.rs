@@ -60,7 +60,7 @@ impl Violation {
 ///
 /// `help` is `@fluxor help --make` — generated, so the block can never
 /// drift from the CLI or fall behind the scripts in the tree.
-const LIFECYCLE: &[(&str, &str)] = &[
+pub(crate) const LIFECYCLE: &[(&str, &str)] = &[
     ("help", "fluxor help --make"),
     ("build", "fluxor build"),
     ("test", "fluxor test"),
@@ -97,9 +97,9 @@ const MAKE_CONDITIONALS: &[&str] = &["ifeq", "ifneq", "ifdef", "ifndef"];
 
 /// One parsed rule: `name: prereqs…` plus its tab-indented recipe.
 #[derive(Debug, Clone)]
-struct Target {
-    name: String,
-    line: usize,
+pub(crate) struct Target {
+    pub(crate) name: String,
+    pub(crate) line: usize,
     prereqs: Vec<String>,
     /// `(line, text)` per recipe line, tab and trailing space stripped.
     body: Vec<(usize, String)>,
@@ -111,7 +111,7 @@ struct Target {
 /// environment, and every rule here is about the text a contributor
 /// reads. Variable assignments (`:=`, `?=`, `+=`, `=`), `.PHONY`-style
 /// special targets, and comments are not rules.
-fn parse(text: &str) -> Vec<Target> {
+pub(crate) fn parse(text: &str) -> Vec<Target> {
     let mut out: Vec<Target> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let lineno = i + 1;

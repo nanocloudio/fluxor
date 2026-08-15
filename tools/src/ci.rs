@@ -923,19 +923,42 @@ fn self_invoke() -> Command {
 /// experiments — which may legitimately name sibling-repo modules — are not
 /// gated on. A repo without git, or without tracked examples, passes trivially.
 fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
-    let out = Command::new("git")
-        .args(["ls-files", "examples/*.yaml", "examples/**/*.yaml"])
-        .current_dir(project_root)
-        .output();
-    let Ok(out) = out else {
-        return Ok(()); // no git — nothing to enumerate
-    };
-    let listing = String::from_utf8_lossy(&out.stdout);
+    // Versioned examples, from BOTH repos: a project may keep its
+    // examples in the primary repo, shadow-track them
+    // (standards/test-tracking.md), or be mid-move between the two.
+    // Enumerating one repo silently gates a subset — this phase checked
+    // 7 of 40 graphs while every one of them was on disk.
+    let mut listing: BTreeSet<String> = BTreeSet::new();
+    for git_dir in [None, Some(project_root.join(".git-shadow"))] {
+        let mut cmd = Command::new("git");
+        if let Some(d) = &git_dir {
+            if !d.is_dir() {
+                continue;
+            }
+            cmd.arg("--git-dir")
+                .arg(d)
+                .arg("--work-tree")
+                .arg(project_root);
+        }
+        cmd.args(["ls-files", "examples/*.yaml", "examples/**/*.yaml"])
+            .current_dir(project_root);
+        if let Ok(out) = cmd.output() {
+            listing.extend(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
     let mut failures: Vec<String> = Vec::new();
     let mut checked = 0usize;
-    for rel in listing.lines().filter(|l| !l.trim().is_empty()) {
-        // The harness tree is fixtures and probes, not examples.
-        if rel.contains("test_harness/") {
+    for rel in &listing {
+        let rel = rel.as_str();
+        // Not examples: the harness tree is fixtures and probes, and a
+        // `bundle/` holds packaged OUTPUT (`workload.json` beside a
+        // rendered `graph.yaml`) whose source graph is checked already.
+        if rel.contains("test_harness/") || rel.contains("/bundle/") {
             continue;
         }
         checked += 1;

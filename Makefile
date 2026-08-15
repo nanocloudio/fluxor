@@ -27,7 +27,7 @@ TARGET      ?= rp2350
 
 .DEFAULT_GOAL := build
 
-.PHONY: help build test lint ci publish clean install firmware
+.PHONY: help build test lint ci publish clean install firmware shadow-add
 
 # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -92,6 +92,17 @@ install:
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-udp_capture  $(RIG_BACKEND_DIR)/observe-udp_capture
 
 RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
+
+# stage tests/ + tools/tests/ + examples/ into the shadow repo
+#
+# The `-f` and the exclude pathspec are both required and neither is
+# memorable (standards/test-tracking.md §8): without `-f` this stages
+# nothing, because `.gitignore` outranks `.git-shadow/info/exclude`;
+# without the pathspec `-f` overrides that exclude too and walks
+# `tests/harness/target` (42G). `git shadow status` / `log` are single
+# commands — type them.
+shadow-add:
+	@git shadow add -f -- tests tools/tests examples ':(exclude)**/target/**'
 
 # One kernel: build + objcopy to a raw boot image.
 #   make firmware TARGET=rp2040   # rp2350 | rp2040 | qemu-virt | pi5 | wasm

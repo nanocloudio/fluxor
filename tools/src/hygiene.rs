@@ -482,13 +482,14 @@ fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
     }
 
     for tier in present {
-        // A tier with files tracked in the PRIMARY repo is primary-
-        // tracked by choice — fluxor's `examples/` is the onboarding
-        // catalog the docs link to. Having a shadow repo does not make
-        // every tier a shadow tier, and demanding `/examples/` in
-        // .gitignore would untrack the catalog to satisfy a rule about
-        // where tests live.
+        // A tier the primary repo tracks is primary-tracked by choice —
+        // fluxor's `examples/` is the onboarding catalog the docs link
+        // to, and demanding `/examples/` in .gitignore would untrack it
+        // to satisfy a rule about where tests live. The tier-wide
+        // exclusion checks below do not apply to it; the per-file check
+        // still does, because a tier can be tracked in PART.
         if primary_tracks_tier(project_root, tier) {
+            report_unversioned(project_root, tier, &shadow_dir, report);
             continue;
         }
         if !ignore_file_lists_tier(&gitignore, tier, false) {
@@ -555,6 +556,65 @@ fn ignore_file_lists_tier(contents: &str, tier: &str, negated: bool) -> bool {
 /// A git repository is "born" once a branch ref exists — loose under
 /// `refs/heads/` or in `packed-refs`. Read from the git-dir directly so
 /// the check works without invoking git.
+/// Files under a tier that are versioned NOWHERE — not in the primary
+/// repo, not in the shadow repo, not ignored.
+///
+/// A tier is not all-or-nothing. `examples/` here holds fifteen tracked
+/// catalog files and a hundred-odd that were `git rm --cached`-ed and
+/// never given a home: not in the primary repo, not shadow-added, not
+/// gitignored. A tier-level predicate sees the fifteen and says nothing
+/// about the rest, which is how they stayed invisible.
+///
+/// `git ls-files --others --exclude-standard` is the repo's own answer
+/// for "untracked and not ignored"; subtracting what the shadow repo
+/// tracks leaves exactly the files that would vanish with the directory.
+fn report_unversioned(project_root: &Path, tier: &str, shadow_dir: &Path, report: &mut Report) {
+    let list = |dir: Option<&Path>, args: &[&str]| -> Vec<String> {
+        let mut c = std::process::Command::new("git");
+        if let Some(d) = dir {
+            c.arg("--git-dir")
+                .arg(d)
+                .arg("--work-tree")
+                .arg(project_root);
+        }
+        c.args(args).arg("--").arg(tier).current_dir(project_root);
+        c.output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let shadowed: HashSet<String> = if shadow_dir.is_dir() {
+        list(Some(shadow_dir), &["ls-files"]).into_iter().collect()
+    } else {
+        HashSet::new()
+    };
+    let nowhere: Vec<String> = list(None, &["ls-files", "--others", "--exclude-standard"])
+        .into_iter()
+        .filter(|f| !shadowed.contains(f))
+        .collect();
+    if nowhere.is_empty() {
+        return;
+    }
+    let sample: Vec<&str> = nowhere.iter().take(3).map(String::as_str).collect();
+    push_repo_violation(
+        report,
+        PathBuf::from(tier),
+        Rule::ShadowGuard,
+        format!(
+            "{} file(s) under `{tier}/` are versioned nowhere — untracked in the primary \
+             repo, absent from the shadow repo, and not ignored (e.g. {}). Track them, \
+             shadow-add them, or ignore them; leaving them is losing them",
+            nowhere.len(),
+            sample.join(", ")
+        ),
+    );
+}
+
 /// Does the primary repo track anything under this tier? A non-empty
 /// `git ls-files <tier>` is the only signal that settles it, and it is
 /// the repo's own answer rather than a list this rule would have to
