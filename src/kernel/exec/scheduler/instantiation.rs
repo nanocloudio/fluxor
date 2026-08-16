@@ -596,7 +596,7 @@ pub fn params_request_isolation(params: &[u8]) -> bool {
 ///
 /// Recognised tags in the schema-packed params blob:
 /// - 0xF0: step_deadline_us (u32 LE)
-/// - 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph)
+/// - 0xF1: fault_policy (u8: 0=skip, 1=restart, 2=restart_graph, 3=tolerate)
 /// - 0xF2: max_restarts (u16 LE)
 /// - 0xF3: restart_backoff_ms (u16 LE)
 /// - 0xF4: trust_tier (u8)
@@ -658,6 +658,7 @@ pub fn parse_protection_config(module_idx: usize, params: &[u8]) {
                     0 => FaultPolicy::Skip,
                     1 => FaultPolicy::Restart,
                     2 => FaultPolicy::RestartGraph,
+                    3 => FaultPolicy::Tolerate,
                     _ => FaultPolicy::Skip,
                 };
             }

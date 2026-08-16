@@ -59,6 +59,16 @@ pub enum FaultPolicy {
     Restart = 1,
     /// Tear down and re-instantiate entire graph.
     RestartGraph = 2,
+    /// Step-deadline overruns are RECORDED (fault counter, [guard]
+    /// log, fault ring) but never fault the module. The policy for a
+    /// module whose synchronous device ops carry a legitimate heavy
+    /// tail: a FAT32/NVMe cache flush stalls every op queued behind
+    /// it for 35-150 ms (pi5 rig measurement), so a hard deadline
+    /// would terminate a storage module for latency it does not
+    /// control. Step ERRORS (non-zero rc) still fault normally — only
+    /// the overrun path is tolerated, and the deadline keeps its
+    /// meaning as a telemetry threshold.
+    Tolerate = 3,
 }
 
 /// Fault type codes for last_fault_type.

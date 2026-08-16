@@ -246,6 +246,16 @@ pub(crate) fn handle_step_timeout(
         restart_count: fi.restart_count,
     });
 
+    if fi.policy == FaultPolicy::Tolerate {
+        // Recorded above (fault counter, [guard] warn, fault ring) —
+        // and that is ALL. The module keeps running: a storage step
+        // stalled behind a device cache flush is late work, not a
+        // runaway, and faulting it would take the graph down for
+        // latency the module does not control. Quarantine pairing is
+        // skipped too — a tolerated overrun must not execute a
+        // partner either.
+        return;
+    }
     if fi.can_restart() {
         fi.state = FaultState::Faulted;
         fi.backoff_remaining = fi.effective_backoff_ticks();

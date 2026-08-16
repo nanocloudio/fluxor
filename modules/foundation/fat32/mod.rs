@@ -732,10 +732,20 @@ struct Fat32State {
     /// Clusters to zero in the FAT starting at `init_free_hint` on first
     /// create (param `clear_free_region`); reclaims a span of a garbage FAT.
     clear_free_region: u32,
-    /// When non-zero (param `clean_root`), the first create truncates the root
-    /// directory to one empty, warm cluster — avoids cold-read scans of a
-    /// bloated root dir. Bench/clean-slate only.
+    /// When non-zero (param `clean_root`), the FIRST OPERATION after mount
+    /// truncates the root directory to one empty, warm cluster — avoids
+    /// cold-read scans of a bloated root dir. Bench/clean-slate only.
+    ///
+    /// First operation, not first create: consumers that read at boot
+    /// (replay, restore, recovery) open files before any create runs, so a
+    /// wipe deferred to the first create would delete files those readers
+    /// have already adopted and leave them serving state whose backing
+    /// files no longer exist. Wiping ahead of the first read of any kind is
+    /// what makes a clean-slate mount coherent: every reader sees the same
+    /// empty root the first writer does.
     clean_root: u32,
+    /// One-shot latch for the `clean_root` wipe (0 = not yet performed).
+    root_cleaned: u32,
 
     /// Device rc recorded by the synchronous FS_CONTRACT helpers when a
     /// block read/write fails inside an Option/sentinel-returning
@@ -790,6 +800,7 @@ impl Fat32State {
         self.fsinfo_sector = 0;
         self.init_phase = Fat32InitPhase::Idle;
         self.next_free_hint = 2;
+        self.root_cleaned = 0;
         self.io_rc = 0;
         self.unlink_free = [0; UNLINK_FREE_SLOTS];
         self.file_count = 0;
@@ -3064,7 +3075,12 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     // An explicit `init_free_hint` param wins over the on-disk FSINFO hint —
     // it is the operator's override for a volume whose FSINFO hint is stale.
     if s.next_free_hint <= 2 {
-        if s.clean_root > 0 {
+        // The dispatch chokepoint wipes before the first operation of any
+        // kind (`root_cleaned`), which is strictly earlier than any create,
+        // so this arm is unreached on that path. It stands as the guard for
+        // a caller that reaches creation without passing dispatch.
+        if s.clean_root > 0 && s.root_cleaned == 0 {
+            s.root_cleaned = 1;
             fs_clean_root(s);
             // `clear_free_region` blindly zeros the FAT span at
             // `init_free_hint` — DESTRUCTIVE. Run it ONLY on a fresh-format
@@ -3673,6 +3689,17 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
+    }
+    // Clean-slate wipe BEFORE the first operation of any kind (see the
+    // `clean_root` field doc): boot readers and the first writer must see
+    // the same empty root, or a reader adopts files the wipe later removes
+    // from under it.
+    if s.clean_root > 0 && s.root_cleaned == 0 && s.init_phase == Fat32InitPhase::Done {
+        s.root_cleaned = 1;
+        fs_clean_root(s);
+        if s.init_free_hint >= 2 && s.clear_free_region > 0 {
+            fs_clear_fat_region(s, s.init_free_hint, s.clear_free_region);
+        }
     }
     match opcode {
         FS_OPEN => fs_op_open(s, arg as *const u8, arg_len),

@@ -2392,17 +2392,21 @@ fn build_module_entry(
             let policy_str = v.as_str().ok_or_else(|| {
                 Error::Config(format!(
                     "module '{name}': fault_policy must be a string \
-                     (\"skip\" | \"restart\" | \"restart_graph\"); got {v}"
+                     (\"skip\" | \"restart\" | \"restart_graph\" | \"tolerate\"); got {v}"
                 ))
             })?;
             let policy_val: u8 = match policy_str {
                 "skip" => 0,
                 "restart" => 1,
                 "restart_graph" => 2,
+                // Overruns recorded but never fatal — for storage
+                // modules whose synchronous device ops have a
+                // legitimate heavy tail. Step errors still fault.
+                "tolerate" => 3,
                 _ => {
                     return Err(Error::Config(format!(
                         "module '{name}': fault_policy = '{policy_str}' is invalid \
-                         (use \"skip\", \"restart\", or \"restart_graph\")"
+                         (use \"skip\", \"restart\", \"restart_graph\", or \"tolerate\")"
                     )));
                 }
             };
