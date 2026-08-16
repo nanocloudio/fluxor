@@ -2720,12 +2720,13 @@ fn build_module_entry(
     // blobs. The schema SDK parser walks until it hits 0xFF and
     // ignores everything after; cert/key extended tags reuse low
     // tag numbers (10/11/12/13) that collide with real schema tags
-    // — notably QUIC's `enable_concurrent_bidi` at tag 10 — so they
-    // must live AFTER this marker. The TLS-module extended-TLV
-    // scanner independently walks the full params region looking
-    // for the `[tag, 0x00, hi, lo, payload]` extended pattern and
-    // picks them up there. Without this split, a cert-bearing QUIC
-    // config would silently reset `enable_concurrent_bidi` to 0.
+    // — notably QUIC's `trace_sample_permille` at tag 11 and
+    // `disable_migration` at tag 12 — so they must live AFTER this
+    // marker. The TLS-module extended-TLV scanner independently walks
+    // the full params region looking for the `[tag, 0x00, hi, lo,
+    // payload]` extended pattern and picks them up there. Without this
+    // split, a cert-bearing QUIC config would silently reset those
+    // params to their defaults.
     if base + extra_len + 1 < entry.len() {
         entry[base + extra_len] = 0xFF;
         entry[base + extra_len + 1] = 0x00;

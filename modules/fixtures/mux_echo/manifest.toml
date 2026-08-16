@@ -1,0 +1,33 @@
+version = "1.0.0"
+# `linux` so the transport self-test runs as an ordinary host graph; the silicon
+# targets so the same fixture can prove a QUIC bring-up on a board.
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# Tick-counted: this fixture holds no deadline of its own. It reacts to frames
+# and never samples a clock, so a variable scheduler cadence changes nothing
+# about its behaviour.
+timer_class = "tick_counted"
+
+# Multiplexed-session data from the transport (`quic.app_out`).
+[[ports]]
+name = "mux_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# Replies back to the transport (`quic.app_in`).
+[[ports]]
+name = "mux_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (see standards/observability.md §6). This
+# is a test fixture: what it proves is asserted by the suite that drives it, and
+# byte throughput is the transport's to report.
+[observability]
+exempt = "test fixture for the mux surface — the transport underneath it reports throughput"

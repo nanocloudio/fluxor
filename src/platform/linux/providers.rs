@@ -1331,11 +1331,18 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     // `fluxor run` kill a healthy, already-listening host after five seconds.
     log::warn!("[linux_net] listening on port {port} (slot {idx})");
 
-    // MSG_BOUND payload: [conn_id:1][local_port:2 LE]. Consumers
-    // sharing net_out filter by local_port; without it a second
-    // anchor's BIND races on the same channel and steals server_conn_id.
+    // MSG_BOUND payload: `[conn_id:2 LE][local_port:2 LE]`. Consumers sharing
+    // net_out filter by local_port; without it a second anchor's BIND races on
+    // the same channel and steals server_conn_id.
+    //
+    // This file has two bind paths — this one and the owner-gated one above —
+    // and both must emit this exact shape. A short frame does not fail loudly:
+    // the consumer skips the port it cannot read, never latches an accept port,
+    // and falls back to claiming every accept, which is indistinguishable from
+    // working multi-anchor filtering until a second anchor exists.
     let pb = port.to_le_bytes();
-    let msg = [MSG_BOUND, idx as u8, pb[0], pb[1]];
+    let cb = (idx as u16).to_le_bytes();
+    let msg = [MSG_BOUND, cb[0], cb[1], pb[0], pb[1]];
     linux_net_send_msg(st, &msg);
 }
 

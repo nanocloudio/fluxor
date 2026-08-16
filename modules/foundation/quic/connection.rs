@@ -269,20 +269,11 @@ pub struct BidiExtraStream {
     pub recv_buf_len: usize,
     pub recv_fin: bool,
 
-    /// `h3_app`: has this slot's STREAM_ACCEPTED / STREAM_CLOSED been
-    /// delivered to the app? Per slot, and latched only on a successful
-    /// enqueue, so backpressure retries rather than losing the event.
+    /// Has this slot's STREAM_ACCEPTED / STREAM_CLOSED been delivered to the
+    /// app? Per slot, and latched only on a successful enqueue, so
+    /// backpressure retries rather than losing the event.
     pub app_open_sent: bool,
     pub app_close_sent: bool,
-
-    /// Per-slot POST body accumulation; mirrors the legacy stream's
-    /// `h3_post_*` fields on `QuicConnection`.
-    pub h3_post_in_progress: bool,
-    pub h3_post_dispatched: bool,
-    pub h3_post_path: [u8; 64],
-    pub h3_post_path_len: usize,
-    pub h3_post_body: [u8; 1024],
-    pub h3_post_body_len: usize,
 }
 
 impl BidiExtraStream {
@@ -302,12 +293,6 @@ impl BidiExtraStream {
             recv_buf: [0; 1500],
             recv_buf_len: 0,
             recv_fin: false,
-            h3_post_in_progress: false,
-            h3_post_dispatched: false,
-            h3_post_path: [0; 64],
-            h3_post_path_len: 0,
-            h3_post_body: [0; 1024],
-            h3_post_body_len: 0,
         }
     }
 }
@@ -739,47 +724,24 @@ pub struct QuicConnection {
     /// uni = 3, 7, 11, ...; client uni = 2, 6, 10, ... — both
     /// increment by 4. We track the next index to allocate.
     pub h3_next_uni_idx: u8,
-    /// Whether the peer's SETTINGS has been observed on its control
-    /// stream. Becomes true once we successfully parse one SETTINGS
-    /// frame from the peer's recv'd control-stream payload.
+    /// The peer's HTTP/3 settings, latched from its control stream. Held here
+    /// rather than acted on: they bind the APPLICATION that encodes requests,
+    /// and reach it as `MSG_MUX_PEER_SETTINGS`. `h3_peer_settings_forwarded`
+    /// makes that emission one-shot AND retryable — it latches only on a
+    /// successful enqueue, so backpressure retries next step rather than
+    /// dropping the only copy the app will ever get.
     pub h3_peer_settings_seen: bool,
-    /// Whether the peer offered SETTINGS_ENABLE_CONNECT_PROTOCOL=1
-    /// (RFC 9220 §3) so we can use extended CONNECT for WebSocket.
+    pub h3_peer_settings_forwarded: bool,
+    /// `u32::MAX` = no limit advertised (the identifier's default), which is
+    /// distinct from an advertised 0.
+    pub h3_peer_max_field_section: u32,
+    pub h3_peer_qpack_max_table: u32,
+    pub h3_peer_qpack_blocked: u32,
+    /// The peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 9220 §3).
     pub h3_peer_enable_connect: bool,
     /// Sequence counter for our own bidi stream allocations on the
     /// client side. First client bidi = id 0; subsequent = 4, 8, ...
     pub h3_next_bidi_idx: u8,
-    /// WebSocket-over-HTTP/3 mode (RFC 9220). When true, the bidi
-    /// request stream's DATA frame payloads are interpreted as WS
-    /// frames rather than application body bytes. Set on both sides
-    /// once the extended-CONNECT exchange completes (server: on
-    /// receiving the CONNECT request and emitting 200; client: on
-    /// receiving the 200 response).
-    pub ws_mode: bool,
-    /// Whether the client has already emitted its initial WS payload.
-    /// One-shot per connection.
-    pub ws_test_sent: bool,
-    /// Whether the client has already emitted its second concurrent
-    /// `GET /two` request on the bidi extra pool. One-shot per
-    /// connection.
-    pub concurrent_bidi_sent: bool,
-    /// Reassembly buffer for incoming WS frames whose bytes might be
-    /// split across multiple h3 DATA frames.
-    pub ws_recv_accum: [u8; 256],
-    pub ws_recv_accum_len: usize,
-    /// Per-message reassembly buffer — accumulates payload bytes
-    /// across continuation frames (RFC 6455 §5.4). Reset on FIN.
-    pub ws_msg_buf: [u8; 512],
-    pub ws_msg_len: usize,
-    /// Opcode of the in-progress message (TEXT/BINARY). Set by the
-    /// first frame; CONT (0x0) frames extend it. Zero = no message.
-    pub ws_msg_opcode: u8,
-    /// UTF-8 streaming validator state for in-progress TEXT messages.
-    /// Reset to UTF8_ACCEPT on each new message; mid-message
-    /// continuation frames feed into it; rejection triggers a
-    /// connection-close with code 1007 (RFC 6455 §8.1).
-    pub ws_utf8_state: u32,
-
     /// Wall-clock millis of the most recent activity on this conn —
     /// any inbound packet decrypt success, any outbound emit. Drives
     /// idle-timeout closure (RFC 9000 §10.1). Zero = uninitialised
@@ -788,19 +750,6 @@ pub struct QuicConnection {
     /// Negotiated idle timeout in ms (the smaller of our + peer
     /// `max_idle_timeout` TPs, RFC 9000 §10.1.2). 0 = disabled.
     pub idle_timeout_ms: u64,
-
-    // ── HTTP/3 POST body accumulation ──────────────────────────────
-    /// Server-side flag: a POST request's HEADERS arrived; awaiting
-    /// DATA frames + FIN before dispatch.
-    pub h3_post_in_progress: bool,
-    /// Saved request path for the in-flight POST.
-    pub h3_post_path: [u8; 64],
-    pub h3_post_path_len: usize,
-    /// Accumulated request body bytes.
-    pub h3_post_body: [u8; 1024],
-    pub h3_post_body_len: usize,
-    /// Whether we've already dispatched (single-shot).
-    pub h3_post_dispatched: bool,
 
     // ── Observability: `quic.connection` span (server-accepted conns) ──
     /// 16-byte W3C trace id, minted at server-accept when telemetry is wired.
@@ -930,11 +879,15 @@ pub struct QuicConnection {
     pub alt_cid_issued: bool,
     /// A NEW_CONNECTION_ID frame for `alt_cid` is queued for emission.
     pub new_cid_tx_pending: bool,
-    /// Whether this connection drives the HTTP/3 application layer.
+    /// Whether this connection runs the HTTP/3 connection preamble — the
+    /// control and QPACK unidirectional streams and the SETTINGS exchange.
     /// Decided once, post-ALPN-selection: true when the negotiated ALPN
     /// is `h3`, or — when no ALPN is configured — when `enable_h3` is
-    /// set (preserves pre-ALPN behaviour). A non-h3 ALPN (e.g. `mqtt`)
-    /// routes raw bidi streams to the app surface instead of h3.
+    /// set (preserves pre-ALPN behaviour).
+    ///
+    /// It does NOT decide who owns the request streams. Both an h3 connection
+    /// and a non-h3 ALPN surface their streams to the application over `mux`;
+    /// the difference is only that h3 has a preamble to run first.
     pub use_h3: bool,
 }
 
@@ -1003,27 +956,16 @@ impl QuicConnection {
             h3_uni_streams_opened: false,
             h3_next_uni_idx: 0,
             h3_peer_settings_seen: false,
+            h3_peer_settings_forwarded: false,
+            h3_peer_max_field_section: u32::MAX,
+            h3_peer_qpack_max_table: 0,
+            h3_peer_qpack_blocked: 0,
             h3_peer_enable_connect: false,
             h3_next_bidi_idx: 0,
-            ws_mode: false,
-            ws_test_sent: false,
-            concurrent_bidi_sent: false,
-            ws_recv_accum: [0; 256],
-            ws_recv_accum_len: 0,
-            ws_msg_buf: [0; 512],
-            ws_msg_len: 0,
-            ws_msg_opcode: 0,
-            ws_utf8_state: 0,
             last_activity_ms: 0,
             // Default to our advertised TP value (30s); refined on
             // EncryptedExtensions parse for the smaller of the two TPs.
             idle_timeout_ms: 30_000,
-            h3_post_in_progress: false,
-            h3_post_path: [0; 64],
-            h3_post_path_len: 0,
-            h3_post_body: [0; 1024],
-            h3_post_body_len: 0,
-            h3_post_dispatched: false,
             trace_id: [0; 16],
             span_id: [0; 8],
             sampled_flags: 0,

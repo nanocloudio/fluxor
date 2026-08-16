@@ -14,12 +14,24 @@
 //!   key update next-phase derivation (RFC 9001 §5–§6).
 //! - [`pump`](pump.rs) — handshake state pump driving the shared
 //!   `HandshakeDriver` across Initial / Handshake / 1-RTT levels.
-//! - [`qpack`](qpack.rs) — QPACK encoder/decoder with the full
-//!   RFC 7541 Appendix B Huffman alphabet (RFC 9204).
 //! - [`h3`](h3.rs) — HTTP/3 frame layer + control-stream SETTINGS /
 //!   GOAWAY / PRIORITY_UPDATE (RFC 9114, RFC 9218).
-//! - [`ws`](ws.rs) — WebSocket frame codec, UTF-8 streaming validation,
-//!   permessage-deflate (full RFC 1951 / RFC 6455 / RFC 7692 / RFC 9220).
+//!
+//! # Where this module stops
+//!
+//! It carries connections and streams. It does not speak the protocols on
+//! them. Every application stream — an h3 REQUEST stream included — is
+//! surfaced over the `mux` contract (`contracts/net/mux.rs`) and answered by
+//! whatever is wired to `app_out` / `app_in`.
+//!
+//! Only the h3 CONNECTION PREAMBLE lives here: the control and QPACK
+//! unidirectional streams and the SETTINGS exchange. That is stream-type
+//! plumbing, it is connection-scoped, and no request can flow before it — so
+//! it is the transport's to run. Methods, paths, header compression, routing,
+//! WebSocket-over-HTTP/3 and request spans are HTTP semantics and live in
+//! Wave's `http`. See `docs/architecture/protocol_surfaces.md`, and
+//! `examples/test_harness/linux/quic/README.md` for how the transport proves
+//! itself without borrowing a protocol to do it.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![cfg_attr(not(feature = "host-test"), no_main)]
@@ -67,9 +79,7 @@ include!("streams.rs");
 include!("keys.rs");
 include!("connection.rs");
 include!("wire.rs");
-include!("qpack.rs");
 include!("h3.rs");
-include!("ws.rs");
 include!("pump.rs");
 
 const MAX_CONNS: usize = 2;
@@ -188,43 +198,29 @@ pub(crate) struct QuicState {
     /// 0-RTT enable: 0 = disabled, 1 = enabled (server may issue
     /// NewSessionTicket; client may attempt resumption + early data).
     enable_0rtt: u8,
-    /// HTTP/3 mode (RFC 9114 / RFC 9204): 0 = transparent stream echo,
-    /// 1 = h3 framing on bidi stream 0. The server dispatches HEADERS
-    /// frames as HTTP requests and emits HEADERS+DATA responses; the
-    /// client emits a `GET /` after the handshake and logs the
-    /// decoded `:status` and body.
+    /// Treat connections as HTTP/3 when no ALPN is configured: 0 = transparent
+    /// stream echo, 1 = run the h3 connection preamble (control + QPACK
+    /// unidirectional streams, SETTINGS) and surface request streams to the
+    /// app over `mux`.
+    ///
+    /// This is the pre-ALPN latch only. Configure `alpn` instead and `use_h3`
+    /// is decided per connection by negotiation, which is what a deployment
+    /// serving more than one protocol needs.
+    ///
+    /// **It does not make this module an HTTP server.** A connection's REQUEST
+    /// streams always cross to the application over the `mux` contract
+    /// (`MSG_MUX_STREAM_ACCEPTED` / `_RX` / `_CLOSED`, `CMD_MUX_STREAM_SEND`),
+    /// exactly as a non-h3 ALPN's streams do. That is the boundary
+    /// `docs/architecture/protocol_surfaces.md` draws and `contracts/net/mux.rs`
+    /// was written for: a transport exposes many logical streams; the app owns
+    /// the protocol on them. Methods, paths, header compression, routing and
+    /// request spans live in Wave's `http`, which owns HTTP semantics for h1
+    /// and h2 too.
+    ///
+    /// What stays here is the connection preamble — the h3 control and QPACK
+    /// unidirectional streams and the SETTINGS exchange. Stream-type plumbing
+    /// is transport-adjacent, and neither role can carry a request without it.
     enable_h3: u8,
-    /// WebSocket-over-HTTP/3 (RFC 9220). Requires `enable_h3 = 1`.
-    /// Client: emits an extended CONNECT (`:method = CONNECT`,
-    /// `:protocol = websocket`) instead of GET. Server: accepts
-    /// extended CONNECT with 200 + interprets DATA frame payloads as
-    /// WS frames, echoing TEXT uppercase.
-    enable_ws: u8,
-    /// Client-side: when `enable_h3 = 1` and this flag is set, emit a
-    /// second `GET /two` request on bidi stream id 4 alongside the
-    /// `GET /` on stream id 0. Both requests round-trip via the
-    /// `bidi_extra_streams` pool.
-    enable_concurrent_bidi: u8,
-    /// **The application owns HTTP/3.** With `h3_app = 1` a connection that
-    /// negotiates the `h3` ALPN surfaces its REQUEST streams to the app over
-    /// the `mux` contract (`MSG_MUX_STREAM_ACCEPTED` / `_RX` / `_CLOSED`,
-    /// `CMD_MUX_STREAM_SEND`) instead of being answered by this module's own
-    /// responder — exactly as a non-h3 ALPN already does.
-    ///
-    /// This is the scoping boundary `docs/architecture/protocol_surfaces.md`
-    /// draws and `contracts/net/mux.rs` was written for: a transport exposes
-    /// many logical streams; the app owns the protocol on them. `enable_h3`'s
-    /// built-in responder serves a HARDCODED three-entry route table
-    /// (`GET /` -> "hello h3", `/two` -> "hello two", else 404), which is a
-    /// transport self-test, not an HTTP server. A real one — routes, static /
-    /// template / file / proxy handlers, dynamic routes, request spans — lives
-    /// in Wave's `http` module, which owns HTTP semantics for h1 and h2 too.
-    ///
-    /// The connection preamble stays here: this module still opens the h3
-    /// control / QPACK unidirectional streams and sends SETTINGS, because
-    /// stream-type plumbing is transport-adjacent and the client mode needs it
-    /// regardless. Only request streams cross to the app.
-    h3_app: u8,
     /// Server: HMAC key for retry tokens. Generated at boot.
     retry_secret: [u8; 32],
     /// Server: key for ticket encryption. Generated at boot;
@@ -300,12 +296,9 @@ define_params! {
     7, enable_h3, u8, 0
         => |s, d, len| { s.enable_h3 = p_u8(d, len, 0, 0); };
 
-    8, enable_ws, u8, 0
-        => |s, d, len| { s.enable_ws = p_u8(d, len, 0, 0); };
-
-    10, enable_concurrent_bidi, u8, 0
-        => |s, d, len| { s.enable_concurrent_bidi = p_u8(d, len, 0, 0); };
-
+    // Tags 8, 10 and 13 are RETIRED and must not be reused: a graph still
+    // naming a retired param gets a clean "unknown param" from the composer,
+    // where a reused tag would silently bind it to an unrelated value.
     9, verify_peer, u8, 0
         => |s, d, len| { s.verify_peer = p_u8(d, len, 0, 0); };
 
@@ -317,11 +310,6 @@ define_params! {
 
     12, disable_migration, u8, 0
         => |s, d, len| { s.disable_migration = p_u8(d, len, 0, 0); };
-
-    // Surface h3 request streams to the app over the `mux` contract instead of
-    // answering them here. See the field doc on `h3_app`.
-    13, h3_app, u8, 0
-        => |s, d, len| { s.h3_app = p_u8(d, len, 0, 0); };
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -361,9 +349,6 @@ pub unsafe extern "C" fn module_new(
     s.require_retry = 0;
     s.enable_0rtt = 0;
     s.enable_h3 = 0;
-    s.h3_app = 0;
-    s.enable_ws = 0;
-    s.enable_concurrent_bidi = 0;
     s.verify_peer = 0;
     s.trust_cert_len = 0;
     s.verify_hostname_len = 0;
@@ -484,80 +469,7 @@ pub unsafe extern "C" fn module_new(
             b"[quic] RFC 9001 A.1 keys MISMATCH".len(),
         );
     }
-    if qpack_huffman_self_check() {
-        dev_log(
-            sys,
-            3,
-            b"[quic] QPACK Huffman OK".as_ptr(),
-            b"[quic] QPACK Huffman OK".len(),
-        );
-    } else {
-        dev_log(
-            sys,
-            2,
-            b"[quic] QPACK Huffman MISMATCH".as_ptr(),
-            b"[quic] QPACK Huffman MISMATCH".len(),
-        );
-    }
-    if pmd_decode_self_check() {
-        dev_log(
-            sys,
-            3,
-            b"[quic] DEFLATE OK".as_ptr(),
-            b"[quic] DEFLATE OK".len(),
-        );
-    } else {
-        dev_log(
-            sys,
-            2,
-            b"[quic] DEFLATE MISMATCH".as_ptr(),
-            b"[quic] DEFLATE MISMATCH".len(),
-        );
-    }
     0
-}
-
-/// Decode known-good RFC 7541 Appendix B Huffman vectors at
-/// module-init to catch table transcription errors.
-fn qpack_huffman_self_check() -> bool {
-    const CASES: &[(&[u8], &[u8])] = &[
-        (&[0xc5, 0x83, 0x7f], b"GET"),
-        (&[0x63], b"/"),
-        (
-            &[0x60, 0xd5, 0x48, 0x5f, 0x2b, 0xce, 0x9a, 0x68],
-            b"/index.html",
-        ),
-        (&[0xb9, 0x49, 0x53, 0x39, 0xe4], b":method"),
-        (&[0xb9, 0x58, 0xd3, 0x3f], b":path"),
-        (
-            &[0x9c, 0xb4, 0x50, 0x75, 0x3c, 0x1e, 0xca, 0x24],
-            b"hello world",
-        ),
-        (&[0x49, 0x7c, 0xa5, 0x8a, 0xe8, 0x19, 0xaa], b"text/plain"),
-        (&[0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09], b"localhost"),
-        (&[0xf0, 0x58, 0xd0, 0x72, 0x75, 0x2a, 0x7f], b"websocket"),
-    ];
-    let mut buf = [0u8; 64];
-    let mut i = 0;
-    while i < CASES.len() {
-        let (enc, want) = CASES[i];
-        let n = match qpack_huffman_decode(enc, &mut buf) {
-            Some(n) => n,
-            None => return false,
-        };
-        if n != want.len() {
-            return false;
-        }
-        let mut k = 0;
-        while k < n {
-            if buf[k] != want[k] {
-                return false;
-            }
-            k += 1;
-        }
-        i += 1;
-    }
-    true
 }
 
 // ---------------------------------------------------------------------
@@ -1221,8 +1133,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let _ = drain_inbound_one(s, i);
             }
             // HTTP/3: drain any peer-initiated unidirectional streams
-            // (control + qpack-enc + qpack-dec) + the bidi pool used
-            // for additional concurrent request streams.
+            // (control + qpack-enc + qpack-dec) and surface the request
+            // streams to the app.
             // Route by the per-connection negotiated protocol (`use_h3`),
             // NOT the module-wide `enable_h3`: a connection that negotiated
             // a non-h3 ALPN must never enter H3 handling, and a connection
@@ -1231,18 +1143,46 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // client: EncryptedExtensions) and defaults to `enable_h3` when
             // no ALPN is configured, preserving pre-ALPN behaviour.
             if s.conns[i].use_h3 {
-                // Uni control / QPACK streams stay here either way: stream-type
-                // plumbing is transport-adjacent, and the client mode needs it.
+                // The control / QPACK unidirectional streams are ours:
+                // stream-type plumbing is transport-adjacent, and both roles
+                // need the SETTINGS exchange before any request can flow.
                 h3_pump_extra_streams(s, i);
-                if s.h3_app == 0 {
-                    h3_handle_bidi_extra_recv(s, i);
-                } else {
-                    // The app owns HTTP/3: every peer-initiated request stream
-                    // is surfaced over the mux contract instead.
-                    h3_app_forward_bidi_extra(s, i);
+                // The peer's limits reached us on that control stream, and they
+                // bind the application that encodes requests — forward them
+                // BEFORE surfacing any request stream, so the app is never
+                // asked to encode a response under limits it has not been told
+                // about. Retried until the channel takes it (see
+                // `h3_peer_settings_forwarded`).
+                if s.conns[i].h3_peer_settings_seen
+                    && !s.conns[i].h3_peer_settings_forwarded
+                    && s.app_out >= 0
+                {
+                    let mut body = [0u8; mux::PEER_SETTINGS_BODY];
+                    body[0..4].copy_from_slice(&s.conns[i].h3_peer_max_field_section.to_le_bytes());
+                    body[4..8].copy_from_slice(&s.conns[i].h3_peer_qpack_max_table.to_le_bytes());
+                    body[8..12].copy_from_slice(&s.conns[i].h3_peer_qpack_blocked.to_le_bytes());
+                    body[12] = if s.conns[i].h3_peer_enable_connect {
+                        mux::PEER_SETTINGS_FLAG_ENABLE_CONNECT
+                    } else {
+                        0
+                    };
+                    if mux_emit(
+                        sys,
+                        s.app_out,
+                        mux::MSG_MUX_PEER_SETTINGS,
+                        i as u32,
+                        None,
+                        &body,
+                    ) {
+                        s.conns[i].h3_peer_settings_forwarded = true;
+                    }
                 }
+                // Request streams are NOT ours: every peer-initiated one is
+                // surfaced over the mux contract, exactly as a non-h3 ALPN's
+                // streams are.
+                h3_forward_request_streams(s, i);
                 // Reclaim finished request streams and grant the peer credit
-                // for more, on EITHER path — without it a connection serves
+                // for more — without it a connection serves
                 // MAX_BIDI_EXTRA_STREAMS + 1 requests and then stalls.
                 h3_reap_bidi_streams(s, i);
             }
@@ -1251,19 +1191,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // buffered data (empty FIN) so the terminal STREAM_CLOSED still
             // propagates — otherwise a stream the peer opens and closes
             // without payload would never surface its close to the app.
-            // `h3_app` connections use the same mux surface as a non-h3 ALPN:
-            // the app owns the protocol on the stream either way.
-            let raw_alpn = (!s.conns[i].use_h3 && s.conns[i].alpn_selected_len > 0)
-                || (s.conns[i].use_h3 && s.h3_app != 0);
+            // An h3 connection uses the same mux surface as a non-h3 ALPN: the
+            // app owns the protocol on the stream either way.
+            let raw_alpn = s.conns[i].alpn_selected_len > 0 || s.conns[i].use_h3;
             let raw_fin_pending =
                 raw_alpn && s.conns[i].stream_recv_fin && !s.conns[i].raw_stream_close_sent;
             if s.conns[i].stream_recv_buf_len > 0 || raw_fin_pending {
                 let n = s.conns[i].stream_recv_buf_len;
-                if s.conns[i].use_h3 && s.h3_app == 0 {
-                    // HTTP/3 framing on stream 0. Server: parse a
-                    // HEADERS frame + emit response; client: log.
-                    h3_handle_stream_recv(s, i);
-                } else if s.conns[i].alpn_selected_len > 0 || s.conns[i].use_h3 {
+                if raw_alpn {
                     // Raw bidi-stream surface: a non-h3 ALPN was
                     // negotiated, so forward inbound stream bytes to the
                     // app as length-prefixed mux frames (the app, e.g. an
@@ -1345,31 +1280,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 conn.stream_send_buf_len = n;
                 conn.test_sent = true;
             }
-            // HTTP/3 client: emit `GET /` once the handshake completes.
-            if s.conns[i].use_h3
-                && !s.conns[i].is_server
-                && !s.conns[i].test_sent
-                && s.conns[i].stream_send_off == 0
-                && s.conns[i].stream_send_buf_len == 0
-            {
-                h3_emit_client_request(s, i);
-                s.conns[i].test_sent = true;
-                if s.enable_concurrent_bidi != 0 && !s.conns[i].concurrent_bidi_sent {
-                    h3_emit_concurrent_bidi_request(s, i);
-                    s.conns[i].concurrent_bidi_sent = true;
-                }
-            }
-            // WS-on-h3 client: once the server's 200 flips us into
-            // ws_mode, send one TEXT frame and log the echo.
-            if s.enable_ws != 0
-                && !s.conns[i].is_server
-                && s.conns[i].ws_mode
-                && !s.conns[i].ws_test_sent
-            {
-                let payload = b"hello ws";
-                h3_ws_send(s, i, WS_OPCODE_TEXT, payload);
-                s.conns[i].ws_test_sent = true;
-            }
+            // An h3 client sends nothing of its own: WHICH request to make is
+            // the application's decision, and it makes it by opening a stream
+            // over the mux contract like any other app.
             // Forward any inbound DATAGRAM (RFC 9221) to the app as a
             // length-prefixed MSG_MUX_DATAGRAM_RX frame. Unreliable: the
             // single slot is cleared whether or not the best-effort
@@ -1449,7 +1362,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             } else {
                                 mux::STREAM_FLAG_BIDI
                             };
-                            let stream = h3_app_open_stream(s, cid, flags);
+                            let stream = h3_open_request_stream(s, cid, flags);
                             let mut body = [0u8; 1];
                             body[0] = if stream.is_some() {
                                 mux::STATUS_OK
@@ -1479,8 +1392,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             let stream_id = u32::from_le_bytes([
                                 payload[4], payload[5], payload[6], payload[7],
                             ]);
-                            if cid < MAX_CONNS && s.conns[cid].use_h3 && s.h3_app != 0 {
-                                h3_app_fin_stream(s, cid, stream_id);
+                            if cid < MAX_CONNS && s.conns[cid].use_h3 {
+                                h3_fin_request_stream(s, cid, stream_id);
                             }
                         } else if mt == mux::CMD_MUX_STREAM_SEND && plen >= mux::STREAM_DATA_PREFIX
                         {
@@ -1504,14 +1417,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             let raw_mux = cid < MAX_CONNS
                                 && s.conns[cid].alpn_selected_len > 0
                                 && !s.conns[cid].use_h3;
-                            // `h3_app`: the app owns HTTP/3 on this connection,
-                            // so it addresses request streams by id. Unlike the
+                            // On an h3 connection the app owns HTTP/3 and so
+                            // addresses request streams by id. Unlike the
                             // legacy raw profile this is genuinely multi-stream
                             // — HTTP/3 multiplexes, and answering request 4 on
                             // stream 0 would corrupt both.
-                            let h3_mux = cid < MAX_CONNS && s.conns[cid].use_h3 && s.h3_app != 0;
+                            let h3_mux = cid < MAX_CONNS && s.conns[cid].use_h3;
                             if h3_mux {
-                                if !h3_app_stage_send(s, cid, stream_id, data) {
+                                if !h3_stage_request_send(s, cid, stream_id, data) {
                                     let m = b"[quic] h3 mux send - no such stream";
                                     dev_log(sys, 2, m.as_ptr(), m.len());
                                 }
@@ -1681,7 +1594,7 @@ unsafe fn mux_emit(
         scratch.len(),
     ) != 0
 }
-/// `h3_app`: surface a peer-initiated REQUEST stream to the app over the `mux`
+/// surface a peer-initiated REQUEST stream to the app over the `mux`
 /// contract, instead of answering it inside the transport.
 ///
 /// The counterpart of `raw_stream_forward_to_app` for the multi-stream case:
@@ -1693,7 +1606,7 @@ unsafe fn mux_emit(
 /// are the same: STREAM_ACCEPTED once per stream, receive bytes consumed only
 /// on a successful enqueue, and STREAM_CLOSED emitted exactly once and retried
 /// under backpressure rather than dropped.
-unsafe fn h3_app_forward_bidi_extra(s: &mut QuicState, idx: usize) {
+unsafe fn h3_forward_request_streams(s: &mut QuicState, idx: usize) {
     if s.app_out < 0 {
         return;
     }
@@ -1780,9 +1693,8 @@ unsafe fn h3_app_forward_bidi_extra(s: &mut QuicState, idx: usize) {
 /// Reclaim request-stream slots whose exchange is over, and grant the peer
 /// credit to open more.
 ///
-/// Applies to BOTH h3 paths — the app-owned surface and this module's own
-/// responder — because stream lifecycle and flow control are the transport's
-/// job whoever owns the protocol above them.
+/// Stream lifecycle and flow control are the transport's job whoever owns the
+/// protocol above them.
 ///
 /// A `bidi_extra_streams` slot is allocated per request, so without reclamation
 /// a connection serves exactly `MAX_BIDI_EXTRA_STREAMS + 1` requests (the main
@@ -1794,16 +1706,14 @@ unsafe fn h3_app_forward_bidi_extra(s: &mut QuicState, idx: usize) {
 /// and our response has been fully sent and acknowledged as emitted (buffer
 /// drained, FIN emitted).
 unsafe fn h3_reap_bidi_streams(s: &mut QuicState, idx: usize) {
-    // The app surface owes one extra signal before a slot is done: the
-    // STREAM_CLOSED it emits upstream. The internal responder has no such
-    // step, so requiring it there would never reclaim anything.
-    let needs_app_close = s.h3_app != 0;
+    // A slot is not done until the STREAM_CLOSED we emit upstream has landed:
+    // reclaiming before that would recycle the id out from under the app.
     let mut k = 0usize;
     while k < MAX_BIDI_EXTRA_STREAMS {
         let slot = &mut s.conns[idx].bidi_extra_streams[k];
         if slot.allocated
             && slot.recv_fin
-            && (!needs_app_close || slot.app_close_sent)
+            && slot.app_close_sent
             && slot.send_buf_len == 0
             && slot.send_fin_emitted
         {
@@ -1821,13 +1731,13 @@ unsafe fn h3_reap_bidi_streams(s: &mut QuicState, idx: usize) {
     }
 }
 
-/// `h3_app`: mark the addressed request stream finished, so the engine emits a
+/// mark the addressed request stream finished, so the engine emits a
 /// STREAM frame with FIN once its buffer drains.
 ///
 /// The response half of the exchange ends here. Without it the peer's stream
 /// stays open and a well-behaved client waits for more body until its idle
 /// timeout — which reads as a slow server rather than an unterminated response.
-unsafe fn h3_app_fin_stream(s: &mut QuicState, cid: usize, stream_id: u32) {
+unsafe fn h3_fin_request_stream(s: &mut QuicState, cid: usize, stream_id: u32) {
     if cid >= MAX_CONNS {
         return;
     }
@@ -1846,13 +1756,13 @@ unsafe fn h3_app_fin_stream(s: &mut QuicState, cid: usize, stream_id: u32) {
     }
 }
 
-/// `h3_app` client mode: open a client-initiated bidi stream for one request.
+/// Client mode: open a client-initiated bidi stream for one request.
 ///
 /// Returns its id, or None when the pool is full. Ids follow RFC 9000 §2.1
 /// (0, 4, 8, …); id 0 is the connection's main stream and is used first, since
 /// it exists already and costs no pool slot.
-unsafe fn h3_app_open_stream(s: &mut QuicState, cid: usize, flags: u8) -> Option<u64> {
-    if cid >= MAX_CONNS || !s.conns[cid].use_h3 || s.h3_app == 0 {
+unsafe fn h3_open_request_stream(s: &mut QuicState, cid: usize, flags: u8) -> Option<u64> {
+    if cid >= MAX_CONNS || !s.conns[cid].use_h3 {
         return None;
     }
     // Unidirectional: HTTP/3's control and QPACK streams (RFC 9114 §6.2). The
@@ -1885,11 +1795,11 @@ unsafe fn h3_app_open_stream(s: &mut QuicState, cid: usize, flags: u8) -> Option
     Some(stream_id)
 }
 
-/// `h3_app`: stage app bytes onto the addressed request stream.
+/// stage app bytes onto the addressed request stream.
 ///
 /// Returns false when the stream is unknown, so the caller can log a rejection
 /// rather than silently writing the response of one request onto another.
-unsafe fn h3_app_stage_send(s: &mut QuicState, cid: usize, stream_id: u32, data: &[u8]) -> bool {
+unsafe fn h3_stage_request_send(s: &mut QuicState, cid: usize, stream_id: u32, data: &[u8]) -> bool {
     if cid >= MAX_CONNS {
         return false;
     }
@@ -2122,57 +2032,6 @@ unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
         -1,
         me as u16,
         0, // name_id 0 = quic.connection
-        abi::contracts::telemetry::SPAN_SERVER,
-        abi::contracts::telemetry::STATUS_OK,
-        &ctx,
-        start,
-        end,
-    );
-}
-
-/// Capture the start time for an `h3.request` child span, but only when the
-/// enclosing connection is head-sampled and telemetry is wired. Returns 0 (no
-/// span) otherwise, so the clock read and the emit are both skipped — child
-/// spans inherit the connection's sample decision.
-#[inline(always)]
-unsafe fn h3_span_start(s: &QuicState, idx: usize) -> u64 {
-    if !dev_telemetry_enabled(&*s.syscalls)
-        || s.conns[idx].sampled_flags & abi::contracts::telemetry::TRACE_FLAGS_SAMPLED == 0
-    {
-        return 0;
-    }
-    dev_micros(&*s.syscalls)
-}
-
-/// Emit a finished `h3.request` child span (name_id 1, SERVER kind) parented by
-/// the connection's `quic.connection` span — fresh span id, the connection's
-/// span id as parent, shared trace id and flags. No-op when `start == 0`
-/// (unsampled / unwired), so it composes with [`h3_span_start`].
-#[inline(never)]
-unsafe fn emit_h3_request_span(s: &QuicState, idx: usize, start: u64) {
-    if start == 0 {
-        return;
-    }
-    let sys = &*s.syscalls;
-    let me = dev_self_index(sys);
-    if me < 0 {
-        return;
-    }
-    let end_raw = dev_micros(sys);
-    let end = if end_raw < start { start } else { end_raw };
-    let mut child_span_id = [0u8; 8];
-    dev_csprng_fill(sys, child_span_id.as_mut_ptr(), 8);
-    let ctx = abi::contracts::telemetry::SpanContext {
-        trace_id: s.conns[idx].trace_id,
-        span_id: child_span_id,
-        parent_id: s.conns[idx].span_id, // parented by quic.connection
-        flags: s.conns[idx].sampled_flags,
-    };
-    dev_telemetry_span(
-        sys,
-        -1,
-        me as u16,
-        1, // name_id 1 = h3.request
         abi::contracts::telemetry::SPAN_SERVER,
         abi::contracts::telemetry::STATUS_OK,
         &ctx,
@@ -2441,8 +2300,8 @@ unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
 }
 
 // ---------------------------------------------------------------------
-// HTTP/3 dispatcher. Lives in mod.rs because it accesses QuicState
-// directly; framing + QPACK helpers are in h3.rs / qpack.rs.
+// HTTP/3 connection preamble. Lives in mod.rs because it accesses QuicState
+// directly; the frame and control-stream codecs are in h3.rs.
 // ---------------------------------------------------------------------
 
 /// On a fresh Established h3 connection, open the three required
@@ -2646,33 +2505,29 @@ unsafe fn h3_drain_control_stream(s: &mut QuicState, idx: usize, slot_idx: usize
         };
         match frame.frame_type {
             x if x == H3_FRAME_SETTINGS => {
-                let mut enable_connect = false;
-                {
-                    // Inline-parse without the closure path (the dyn
-                    // FnMut indirection seemed to inhibit the log).
-                    let payload = frame.payload;
-                    let mut pos = 0;
-                    while pos < payload.len() {
-                        let after = &payload[pos..];
-                        let (id, n1) = match varint_decode(after.as_ptr(), after.len()) {
-                            Some(t) => t,
-                            None => break,
-                        };
-                        pos += n1;
-                        let after = &payload[pos..];
-                        let (val, n2) = match varint_decode(after.as_ptr(), after.len()) {
-                            Some(t) => t,
-                            None => break,
-                        };
-                        pos += n2;
-                        if id == H3_SETTING_ENABLE_CONNECT_PROTOCOL && val == 1 {
-                            enable_connect = true;
-                        }
-                    }
-                }
-                s.conns[idx].h3_peer_settings_seen = true;
-                if enable_connect {
-                    s.conns[idx].h3_peer_enable_connect = true;
+                // The peer's settings are parsed here because they arrive on a
+                // connection-scoped control stream only the transport reads —
+                // but every one of them constrains how a REQUEST is encoded, so
+                // they are latched and forwarded to the application that owns
+                // the request streams (`MSG_MUX_PEER_SETTINGS`, emitted from
+                // `step` once the app_out channel will take it).
+                //
+                // A malformed payload is H3_FRAME_ERROR (RFC 9114 §7.2.4) and
+                // is worth a log: it means the peer's control stream is
+                // desynchronised, which shows up later as unexplained silence.
+                // The partially-filled settings are discarded with it rather
+                // than forwarded — half a limit is worse than the default.
+                let mut peer = H3PeerSettings::defaults();
+                if h3_parse_settings(frame.payload, &mut peer) {
+                    let conn = &mut s.conns[idx];
+                    conn.h3_peer_max_field_section = peer.max_field_section_size;
+                    conn.h3_peer_qpack_max_table = peer.qpack_max_table_capacity;
+                    conn.h3_peer_qpack_blocked = peer.qpack_blocked_streams;
+                    conn.h3_peer_enable_connect = peer.enable_connect_protocol;
+                    conn.h3_peer_settings_seen = true;
+                } else {
+                    let m = b"[quic] h3 malformed SETTINGS on control stream";
+                    dev_log(sys, 2, m.as_ptr(), m.len());
                 }
             }
             x if x == H3_FRAME_GOAWAY => {
@@ -2777,975 +2632,6 @@ unsafe fn h3_drain_control_stream(s: &mut QuicState, idx: usize, slot_idx: usize
     }
 }
 
-unsafe fn h3_handle_stream_recv(s: &mut QuicState, idx: usize) {
-    let sys = &*s.syscalls;
-    // Walk inbound buffer for complete H3 frames.
-    let n = s.conns[idx].stream_recv_buf_len;
-    if n == 0 {
-        return;
-    }
-    // Snapshot the buffer onto the stack so we can mutate the conn
-    // (re-borrow as &mut) without overlapping references.
-    let mut local = [0u8; 1500];
-    let take = n.min(local.len());
-    core::ptr::copy_nonoverlapping(
-        s.conns[idx].stream_recv_buf.as_ptr(),
-        local.as_mut_ptr(),
-        take,
-    );
-    let mut cursor = 0;
-    while cursor < take {
-        let (frame, consumed) = match h3_parse_frame(&local[cursor..take]) {
-            Some(p) => p,
-            None => break, // Truncated — wait for more.
-        };
-        match frame.frame_type {
-            x if x == H3_FRAME_HEADERS => {
-                if s.conns[idx].is_server {
-                    let h3_start = h3_span_start(s, idx);
-                    h3_dispatch_request(s, idx, frame.payload);
-                    emit_h3_request_span(s, idx, h3_start);
-                } else if let Some(status) = h3_decode_status(frame.payload) {
-                    let mut log_buf = [0u8; 64];
-                    let prefix = b"[quic] h3 status=";
-                    let mut p = 0;
-                    for &c in prefix {
-                        log_buf[p] = c;
-                        p += 1;
-                    }
-                    let mut k = 0;
-                    while k < status.len() && status[k] != 0 && p < log_buf.len() {
-                        log_buf[p] = status[k];
-                        p += 1;
-                        k += 1;
-                    }
-                    dev_log(sys, 3, log_buf.as_ptr(), p);
-                    // RFC 9220: client transitions into WS mode
-                    // when its CONNECT request was accepted with
-                    // 200. We requested extended CONNECT iff the
-                    // module is in enable_ws mode.
-                    if s.enable_ws != 0
-                        && status[0] == b'2'
-                        && status[1] == b'0'
-                        && status[2] == b'0'
-                    {
-                        s.conns[idx].ws_mode = true;
-                    }
-                }
-            }
-            x if x == H3_FRAME_DATA => {
-                if s.conns[idx].ws_mode {
-                    // RFC 9220 §3 — the bidi stream's DATA payloads
-                    // carry WS frames once the upgrade completes.
-                    h3_ws_recv(s, idx, frame.payload);
-                } else if s.conns[idx].is_server && s.conns[idx].h3_post_in_progress {
-                    // Accumulate POST body bytes. Dispatch on stream FIN
-                    // (handled below this match block).
-                    let conn = &mut s.conns[idx];
-                    let space = conn.h3_post_body.len() - conn.h3_post_body_len;
-                    let n = frame.payload.len().min(space);
-                    if n > 0 {
-                        core::ptr::copy_nonoverlapping(
-                            frame.payload.as_ptr(),
-                            conn.h3_post_body.as_mut_ptr().add(conn.h3_post_body_len),
-                            n,
-                        );
-                        conn.h3_post_body_len += n;
-                    }
-                } else {
-                    let mut log_buf = [0u8; 96];
-                    let prefix: &[u8] = if s.conns[idx].is_server {
-                        b"[quic] h3 req body="
-                    } else {
-                        b"[quic] h3 resp body="
-                    };
-                    let mut p = 0;
-                    for &c in prefix {
-                        log_buf[p] = c;
-                        p += 1;
-                    }
-                    let copy_n = frame.payload.len().min(log_buf.len() - p);
-                    core::ptr::copy_nonoverlapping(
-                        frame.payload.as_ptr(),
-                        log_buf.as_mut_ptr().add(p),
-                        copy_n,
-                    );
-                    p += copy_n;
-                    dev_log(sys, 3, log_buf.as_ptr(), p);
-                }
-            }
-            _ => {
-                // Skip unknown frames (RFC 9114 §9.).
-            }
-        }
-        cursor += consumed;
-    }
-    // Shift any unconsumed tail to the front of the recv buffer.
-    let remain = take - cursor;
-    if remain > 0 {
-        core::ptr::copy(
-            s.conns[idx].stream_recv_buf.as_ptr().add(cursor),
-            s.conns[idx].stream_recv_buf.as_mut_ptr(),
-            remain,
-        );
-    }
-    s.conns[idx].stream_recv_buf_len = remain;
-
-    // Server-side POST: dispatch once the request stream is
-    // FIN-closed (response is 200 + uppercase echo of the body).
-    if s.conns[idx].is_server
-        && s.conns[idx].h3_post_in_progress
-        && !s.conns[idx].h3_post_dispatched
-        && s.conns[idx].stream_recv_fin
-    {
-        h3_dispatch_post_complete(s, idx);
-        s.conns[idx].h3_post_dispatched = true;
-        s.conns[idx].h3_post_in_progress = false;
-    }
-}
-
-/// Server: POST request body has fully arrived. Build a 200 response
-/// with the body uppercased + echoed.
-unsafe fn h3_dispatch_post_complete(s: &mut QuicState, idx: usize) {
-    let sys = &*s.syscalls;
-    let body_len = s.conns[idx].h3_post_body_len;
-    let mut log_buf = [0u8; 96];
-    let prefix = b"[quic] h3 POST body=";
-    let mut p = 0;
-    while p < prefix.len() {
-        log_buf[p] = prefix[p];
-        p += 1;
-    }
-    let copy_n = body_len.min(log_buf.len() - p);
-    core::ptr::copy_nonoverlapping(
-        s.conns[idx].h3_post_body.as_ptr(),
-        log_buf.as_mut_ptr().add(p),
-        copy_n,
-    );
-    p += copy_n;
-    dev_log(sys, 3, log_buf.as_ptr(), p);
-
-    // Echo body uppercased.
-    let mut up = [0u8; 1024];
-    let mut k = 0;
-    while k < body_len {
-        let b = s.conns[idx].h3_post_body[k];
-        up[k] = if b.is_ascii_lowercase() { b - 32 } else { b };
-        k += 1;
-    }
-    let mut hdr_block = [0u8; 256];
-    let hdr_len = h3_encode_response_headers(b"200", b"text/plain", body_len, &mut hdr_block);
-    if hdr_len == 0 {
-        return;
-    }
-    let mut h3_buf = [0u8; 1500];
-    let mut q = 0;
-    let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[q..]);
-    if n == 0 {
-        return;
-    }
-    q += n;
-    if q + hdr_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[q..q + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
-    q += hdr_len;
-    let n = h3_build_frame_header(H3_FRAME_DATA, body_len, &mut h3_buf[q..]);
-    if n == 0 {
-        return;
-    }
-    q += n;
-    if q + body_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[q..q + body_len].copy_from_slice(&up[..body_len]);
-    q += body_len;
-    let conn = &mut s.conns[idx];
-    let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-    let to_copy = q.min(space);
-    core::ptr::copy_nonoverlapping(
-        h3_buf.as_ptr(),
-        conn.stream_send_buf
-            .as_mut_ptr()
-            .add(conn.stream_send_buf_len),
-        to_copy,
-    );
-    conn.stream_send_buf_len += to_copy;
-    conn.stream_send_fin = true;
-}
-
-/// Server-side counterpart to `h3_dispatch_request` for a bidi extra
-/// slot: routes `path_bytes` to a hardcoded body, encodes the
-/// response into the slot's send_buf, and arms FIN so the stream
-/// closes after emission.
-unsafe fn h3_dispatch_request_bidi(
-    s: &mut QuicState,
-    idx: usize,
-    slot_idx: usize,
-    path_bytes: &[u8],
-) {
-    let sys = &*s.syscalls;
-    let (status, body) = if eq_bytes(path_bytes, b"/") {
-        (&b"200"[..], &b"hello h3\n"[..])
-    } else if eq_bytes(path_bytes, b"/two") {
-        (&b"200"[..], &b"hello two\n"[..])
-    } else {
-        (&b"404"[..], &b"not found\n"[..])
-    };
-
-    let mut log_buf = [0u8; 96];
-    let prefix = b"[quic] h3 dispatch ";
-    let mut p = 0;
-    for &c in prefix {
-        log_buf[p] = c;
-        p += 1;
-    }
-    let n = path_bytes.len().min(log_buf.len() - p);
-    core::ptr::copy_nonoverlapping(path_bytes.as_ptr(), log_buf.as_mut_ptr().add(p), n);
-    p += n;
-    if p + 4 <= log_buf.len() {
-        log_buf[p] = b' ';
-        p += 1;
-        let mut k = 0;
-        while k < status.len() && p < log_buf.len() {
-            log_buf[p] = status[k];
-            p += 1;
-            k += 1;
-        }
-    }
-    dev_log(sys, 3, log_buf.as_ptr(), p);
-
-    let mut hdr_block = [0u8; 256];
-    let hdr_len = h3_encode_response_headers(status, b"text/plain", body.len(), &mut hdr_block);
-    if hdr_len == 0 {
-        return;
-    }
-    let mut h3_buf = [0u8; 1024];
-    let mut p = 0;
-    let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 {
-        return;
-    }
-    p += n;
-    if p + hdr_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
-    p += hdr_len;
-    let n = h3_build_frame_header(H3_FRAME_DATA, body.len(), &mut h3_buf[p..]);
-    if n == 0 {
-        return;
-    }
-    p += n;
-    if p + body.len() > h3_buf.len() {
-        return;
-    }
-    h3_buf[p..p + body.len()].copy_from_slice(body);
-    p += body.len();
-
-    let slot = &mut s.conns[idx].bidi_extra_streams[slot_idx];
-    let space = slot.send_buf.len() - slot.send_buf_len;
-    let to_copy = p.min(space);
-    core::ptr::copy_nonoverlapping(
-        h3_buf.as_ptr(),
-        slot.send_buf.as_mut_ptr().add(slot.send_buf_len),
-        to_copy,
-    );
-    slot.send_buf_len += to_copy;
-    slot.send_fin_pending = true;
-}
-
-/// Bidi-slot counterpart to `h3_dispatch_post_complete`: a POST has
-/// accumulated its body and the peer FIN'd the stream; build a 200
-/// + uppercase echo response into the slot's send_buf.
-unsafe fn h3_dispatch_post_complete_bidi(s: &mut QuicState, idx: usize, slot_idx: usize) {
-    let sys = &*s.syscalls;
-    let body_len = s.conns[idx].bidi_extra_streams[slot_idx].h3_post_body_len;
-    let mut log_buf = [0u8; 96];
-    let prefix = b"[quic] h3 POST body=";
-    let mut p = 0;
-    while p < prefix.len() {
-        log_buf[p] = prefix[p];
-        p += 1;
-    }
-    let copy_n = body_len.min(log_buf.len() - p);
-    core::ptr::copy_nonoverlapping(
-        s.conns[idx].bidi_extra_streams[slot_idx]
-            .h3_post_body
-            .as_ptr(),
-        log_buf.as_mut_ptr().add(p),
-        copy_n,
-    );
-    p += copy_n;
-    dev_log(sys, 3, log_buf.as_ptr(), p);
-
-    let mut up = [0u8; 1024];
-    let mut k = 0;
-    while k < body_len {
-        let b = s.conns[idx].bidi_extra_streams[slot_idx].h3_post_body[k];
-        up[k] = if b.is_ascii_lowercase() { b - 32 } else { b };
-        k += 1;
-    }
-    let mut hdr_block = [0u8; 256];
-    let hdr_len = h3_encode_response_headers(b"200", b"text/plain", body_len, &mut hdr_block);
-    if hdr_len == 0 {
-        return;
-    }
-    let mut h3_buf = [0u8; 1500];
-    let mut q = 0;
-    let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[q..]);
-    if n == 0 {
-        return;
-    }
-    q += n;
-    if q + hdr_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[q..q + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
-    q += hdr_len;
-    let n = h3_build_frame_header(H3_FRAME_DATA, body_len, &mut h3_buf[q..]);
-    if n == 0 {
-        return;
-    }
-    q += n;
-    if q + body_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[q..q + body_len].copy_from_slice(&up[..body_len]);
-    q += body_len;
-    let slot = &mut s.conns[idx].bidi_extra_streams[slot_idx];
-    let space = slot.send_buf.len() - slot.send_buf_len;
-    let to_copy = q.min(space);
-    core::ptr::copy_nonoverlapping(
-        h3_buf.as_ptr(),
-        slot.send_buf.as_mut_ptr().add(slot.send_buf_len),
-        to_copy,
-    );
-    slot.send_buf_len += to_copy;
-    slot.send_fin_pending = true;
-}
-
-/// Per-bidi-slot version of `h3_handle_stream_recv`: walks each
-/// allocated slot's recv_buf for complete h3 frames, dispatching
-/// using the slot's own send_buf and POST state.
-unsafe fn h3_handle_bidi_extra_recv(s: &mut QuicState, idx: usize) {
-    let sys = &*s.syscalls;
-    let mut k = 0;
-    while k < MAX_BIDI_EXTRA_STREAMS {
-        let allocated = s.conns[idx].bidi_extra_streams[k].allocated;
-        let buf_len = s.conns[idx].bidi_extra_streams[k].recv_buf_len;
-        if !allocated || buf_len == 0 {
-            // FIN may have arrived while the recv buffer is empty;
-            // dispatch any in-progress POST regardless.
-            if allocated
-                && s.conns[idx].is_server
-                && s.conns[idx].bidi_extra_streams[k].h3_post_in_progress
-                && !s.conns[idx].bidi_extra_streams[k].h3_post_dispatched
-                && s.conns[idx].bidi_extra_streams[k].recv_fin
-            {
-                h3_dispatch_post_complete_bidi(s, idx, k);
-                s.conns[idx].bidi_extra_streams[k].h3_post_dispatched = true;
-                s.conns[idx].bidi_extra_streams[k].h3_post_in_progress = false;
-            }
-            k += 1;
-            continue;
-        }
-        let mut local = [0u8; 1500];
-        let take = buf_len.min(local.len());
-        core::ptr::copy_nonoverlapping(
-            s.conns[idx].bidi_extra_streams[k].recv_buf.as_ptr(),
-            local.as_mut_ptr(),
-            take,
-        );
-        let mut cursor = 0;
-        while cursor < take {
-            let (frame, consumed) = match h3_parse_frame(&local[cursor..take]) {
-                Some(p) => p,
-                None => break,
-            };
-            match frame.frame_type {
-                x if x == H3_FRAME_HEADERS => {
-                    if s.conns[idx].is_server {
-                        // Mirror h3_dispatch_request server logic but
-                        // target this bidi slot. Decode method+path,
-                        // route GET / POST.
-                        if let Some(req) = h3_decode_request(frame.payload) {
-                            let method_bytes: &[u8] = match (req.method_static, req.method) {
-                                (Some(s), _) => s,
-                                (None, Some(b)) => b,
-                                _ => &[],
-                            };
-                            let path_bytes: &[u8] = match (req.path_static, req.path) {
-                                (Some(s), _) => s,
-                                (None, Some(b)) => b,
-                                _ => &[],
-                            };
-                            if eq_bytes(method_bytes, b"POST") {
-                                let slot = &mut s.conns[idx].bidi_extra_streams[k];
-                                slot.h3_post_in_progress = true;
-                                slot.h3_post_dispatched = false;
-                                let n = path_bytes.len().min(slot.h3_post_path.len());
-                                slot.h3_post_path[..n].copy_from_slice(&path_bytes[..n]);
-                                slot.h3_post_path_len = n;
-                                slot.h3_post_body_len = 0;
-                                let msg = b"[quic] h3 POST headers (bidi)";
-                                dev_log(sys, 3, msg.as_ptr(), msg.len());
-                            } else {
-                                let h3_start = h3_span_start(s, idx);
-                                h3_dispatch_request_bidi(s, idx, k, path_bytes);
-                                emit_h3_request_span(s, idx, h3_start);
-                            }
-                        }
-                    } else {
-                        // Client side: log :status from this stream.
-                        if let Some(status) = h3_decode_status(frame.payload) {
-                            let mut log_buf = [0u8; 64];
-                            let prefix = b"[quic] h3 status=";
-                            let mut p = 0;
-                            for &c in prefix {
-                                log_buf[p] = c;
-                                p += 1;
-                            }
-                            let mut j = 0;
-                            while j < status.len() && status[j] != 0 && p < log_buf.len() {
-                                log_buf[p] = status[j];
-                                p += 1;
-                                j += 1;
-                            }
-                            dev_log(sys, 3, log_buf.as_ptr(), p);
-                        }
-                    }
-                }
-                x if x == H3_FRAME_DATA => {
-                    if s.conns[idx].is_server
-                        && s.conns[idx].bidi_extra_streams[k].h3_post_in_progress
-                    {
-                        let slot = &mut s.conns[idx].bidi_extra_streams[k];
-                        let space = slot.h3_post_body.len() - slot.h3_post_body_len;
-                        let n = frame.payload.len().min(space);
-                        if n > 0 {
-                            core::ptr::copy_nonoverlapping(
-                                frame.payload.as_ptr(),
-                                slot.h3_post_body.as_mut_ptr().add(slot.h3_post_body_len),
-                                n,
-                            );
-                            slot.h3_post_body_len += n;
-                        }
-                    } else {
-                        let mut log_buf = [0u8; 96];
-                        let prefix: &[u8] = if s.conns[idx].is_server {
-                            b"[quic] h3 req body="
-                        } else {
-                            b"[quic] h3 resp body="
-                        };
-                        let mut p = 0;
-                        for &c in prefix {
-                            log_buf[p] = c;
-                            p += 1;
-                        }
-                        let copy_n = frame.payload.len().min(log_buf.len() - p);
-                        core::ptr::copy_nonoverlapping(
-                            frame.payload.as_ptr(),
-                            log_buf.as_mut_ptr().add(p),
-                            copy_n,
-                        );
-                        p += copy_n;
-                        dev_log(sys, 3, log_buf.as_ptr(), p);
-                    }
-                }
-                _ => {}
-            }
-            cursor += consumed;
-        }
-        // Shift unconsumed tail.
-        let remain = take - cursor;
-        if remain > 0 {
-            core::ptr::copy(
-                s.conns[idx].bidi_extra_streams[k]
-                    .recv_buf
-                    .as_ptr()
-                    .add(cursor),
-                s.conns[idx].bidi_extra_streams[k].recv_buf.as_mut_ptr(),
-                remain,
-            );
-        }
-        s.conns[idx].bidi_extra_streams[k].recv_buf_len = remain;
-
-        // POST: dispatch on FIN.
-        if s.conns[idx].is_server
-            && s.conns[idx].bidi_extra_streams[k].h3_post_in_progress
-            && !s.conns[idx].bidi_extra_streams[k].h3_post_dispatched
-            && s.conns[idx].bidi_extra_streams[k].recv_fin
-        {
-            h3_dispatch_post_complete_bidi(s, idx, k);
-            s.conns[idx].bidi_extra_streams[k].h3_post_dispatched = true;
-            s.conns[idx].bidi_extra_streams[k].h3_post_in_progress = false;
-        }
-        k += 1;
-    }
-}
-
-/// Accumulate WS frame bytes from an h3 DATA payload + decode any
-/// complete frames. Server: echo TEXT frames back uppercase.
-/// Client: log each TEXT frame.
-unsafe fn h3_ws_recv(s: &mut QuicState, idx: usize, data: &[u8]) {
-    let sys = &*s.syscalls;
-    {
-        let conn = &mut s.conns[idx];
-        let space = conn.ws_recv_accum.len() - conn.ws_recv_accum_len;
-        let n = data.len().min(space);
-        if n > 0 {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                conn.ws_recv_accum.as_mut_ptr().add(conn.ws_recv_accum_len),
-                n,
-            );
-            conn.ws_recv_accum_len += n;
-        }
-    }
-    loop {
-        let buf_len = s.conns[idx].ws_recv_accum_len;
-        if buf_len == 0 {
-            return;
-        }
-        let mut local = [0u8; 256];
-        let take = buf_len.min(local.len());
-        core::ptr::copy_nonoverlapping(
-            s.conns[idx].ws_recv_accum.as_ptr(),
-            local.as_mut_ptr(),
-            take,
-        );
-        let parsed = ws_parse_frame_with_mask(&local[..take]);
-        let (frame, mask, masked, consumed) = match parsed {
-            Some(p) => p,
-            None => return, // truncated
-        };
-        // Snapshot payload into a mutable buffer so we can unmask if
-        // needed.
-        let mut payload_buf = [0u8; 240];
-        let plen = frame.payload.len().min(payload_buf.len());
-        payload_buf[..plen].copy_from_slice(&frame.payload[..plen]);
-        if masked {
-            ws_unmask(&mut payload_buf[..plen], &mask);
-        }
-        let opcode = frame.opcode;
-        let fin = frame.fin;
-        let _ = fin;
-        // Shift the consumed bytes out of the accumulator.
-        {
-            let conn = &mut s.conns[idx];
-            let remain = conn.ws_recv_accum_len - consumed;
-            if remain > 0 {
-                core::ptr::copy(
-                    conn.ws_recv_accum.as_ptr().add(consumed),
-                    conn.ws_recv_accum.as_mut_ptr(),
-                    remain,
-                );
-            }
-            conn.ws_recv_accum_len = remain;
-        }
-        match opcode {
-            x if x == WS_OPCODE_TEXT || x == WS_OPCODE_BINARY || x == WS_OPCODE_CONT => {
-                // RFC 6455 §5.4 — fragmented messages: first frame
-                // carries TEXT/BINARY, intermediate carry CONT,
-                // last carries CONT+FIN. A non-CONT frame mid-message
-                // is a protocol error. CONT without an in-progress
-                // message likewise.
-                let conn = &mut s.conns[idx];
-                let is_server = conn.is_server;
-                if x == WS_OPCODE_CONT {
-                    if conn.ws_msg_opcode == 0 {
-                        let msg = b"[quic] h3-ws CONT without start";
-                        dev_log(sys, 2, msg.as_ptr(), msg.len());
-                        // Production: emit close with 1002 protocol error.
-                        return;
-                    }
-                } else {
-                    if conn.ws_msg_opcode != 0 {
-                        // New TEXT/BINARY before previous FIN.
-                        let msg = b"[quic] h3-ws frame interleave";
-                        dev_log(sys, 2, msg.as_ptr(), msg.len());
-                        return;
-                    }
-                    conn.ws_msg_opcode = x;
-                    conn.ws_msg_len = 0;
-                    if x == WS_OPCODE_TEXT {
-                        conn.ws_utf8_state = UTF8_ACCEPT;
-                    }
-                }
-                // Append payload bytes.
-                let space = conn.ws_msg_buf.len() - conn.ws_msg_len;
-                let n = plen.min(space);
-                core::ptr::copy_nonoverlapping(
-                    payload_buf.as_ptr(),
-                    conn.ws_msg_buf.as_mut_ptr().add(conn.ws_msg_len),
-                    n,
-                );
-                // RFC 6455 §8.1 — TEXT bytes must form valid UTF-8.
-                // Stream-validate as bytes arrive. On FIN we'll also
-                // require the validator to be at a codepoint boundary.
-                if conn.ws_msg_opcode == WS_OPCODE_TEXT {
-                    let mut st = Utf8State {
-                        state: conn.ws_utf8_state,
-                    };
-                    let ok = st.feed(&conn.ws_msg_buf[conn.ws_msg_len..conn.ws_msg_len + n]);
-                    conn.ws_utf8_state = st.state;
-                    if !ok {
-                        let msgb = b"[quic] h3-ws UTF-8 invalid (close 1007)";
-                        dev_log(sys, 2, msgb.as_ptr(), msgb.len());
-                        // Send close with 1007 (Invalid frame payload data).
-                        let close_payload = [0x03, 0xEFu8]; // 1007 BE
-                        h3_ws_send(s, idx, WS_OPCODE_CLOSE, &close_payload);
-                        let conn = &mut s.conns[idx];
-                        conn.ws_msg_opcode = 0;
-                        conn.ws_msg_len = 0;
-                        conn.ws_utf8_state = UTF8_ACCEPT;
-                        return;
-                    }
-                }
-                conn.ws_msg_len += n;
-                if !fin {
-                    return; // Wait for next continuation.
-                }
-                // FIN — full message ready. For TEXT, require the
-                // UTF-8 state machine at an accept boundary.
-                if conn.ws_msg_opcode == WS_OPCODE_TEXT && conn.ws_utf8_state != UTF8_ACCEPT {
-                    let msgb = b"[quic] h3-ws UTF-8 truncated (close 1007)";
-                    dev_log(sys, 2, msgb.as_ptr(), msgb.len());
-                    let close_payload = [0x03, 0xEFu8];
-                    h3_ws_send(s, idx, WS_OPCODE_CLOSE, &close_payload);
-                    let conn = &mut s.conns[idx];
-                    conn.ws_msg_opcode = 0;
-                    conn.ws_msg_len = 0;
-                    conn.ws_utf8_state = UTF8_ACCEPT;
-                    return;
-                }
-                let msg_op = conn.ws_msg_opcode;
-                let msg_len = conn.ws_msg_len;
-                // Snapshot message into a local for emission.
-                let mut snapshot = [0u8; 512];
-                snapshot[..msg_len].copy_from_slice(&conn.ws_msg_buf[..msg_len]);
-                conn.ws_msg_opcode = 0;
-                conn.ws_msg_len = 0;
-                conn.ws_utf8_state = UTF8_ACCEPT;
-                // Log + (server) echo back uppercase.
-                let mut log_buf = [0u8; 96];
-                let prefix: &[u8] = if is_server {
-                    b"[quic] h3-ws server rx="
-                } else {
-                    b"[quic] h3-ws client rx="
-                };
-                let mut p = 0;
-                for &c in prefix {
-                    log_buf[p] = c;
-                    p += 1;
-                }
-                let copy_n = msg_len.min(log_buf.len() - p);
-                core::ptr::copy_nonoverlapping(
-                    snapshot.as_ptr(),
-                    log_buf.as_mut_ptr().add(p),
-                    copy_n,
-                );
-                p += copy_n;
-                dev_log(sys, 3, log_buf.as_ptr(), p);
-                if is_server {
-                    let mut up = [0u8; 512];
-                    let mut k = 0;
-                    while k < msg_len {
-                        let b = snapshot[k];
-                        up[k] = if b.is_ascii_lowercase() { b - 32 } else { b };
-                        k += 1;
-                    }
-                    h3_ws_send(s, idx, msg_op, &up[..msg_len]);
-                }
-            }
-            x if x == WS_OPCODE_CLOSE => {
-                if s.conns[idx].is_server {
-                    h3_ws_send(s, idx, WS_OPCODE_CLOSE, &payload_buf[..plen]);
-                }
-                let msg = b"[quic] h3-ws close";
-                dev_log(sys, 3, msg.as_ptr(), msg.len());
-            }
-            x if x == WS_OPCODE_PING => {
-                h3_ws_send(s, idx, WS_OPCODE_PONG, &payload_buf[..plen]);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Wrap a WS frame in an HTTP/3 DATA frame and append to the bidi
-/// stream's send buffer.
-unsafe fn h3_ws_send(s: &mut QuicState, idx: usize, opcode: u8, payload: &[u8]) {
-    let mut ws_buf = [0u8; 256];
-    let n = if s.conns[idx].is_server {
-        ws_build_unmasked(opcode, true, payload, &mut ws_buf)
-    } else {
-        // Mask key from CSPRNG (RFC 6455 §5.3 — clients MUST mask).
-        let mut mk = [0u8; 4];
-        let sys = &*s.syscalls;
-        dev_csprng_fill(sys, mk.as_mut_ptr(), 4);
-        ws_build_masked(opcode, true, payload, mk, &mut ws_buf)
-    };
-    if n == 0 {
-        return;
-    }
-    let mut h3_buf = [0u8; 384];
-    let mut p = 0;
-    let hn = h3_build_frame_header(H3_FRAME_DATA, n, &mut h3_buf[p..]);
-    if hn == 0 {
-        return;
-    }
-    p += hn;
-    if p + n > h3_buf.len() {
-        return;
-    }
-    h3_buf[p..p + n].copy_from_slice(&ws_buf[..n]);
-    p += n;
-    let conn = &mut s.conns[idx];
-    let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-    let to_copy = p.min(space);
-    core::ptr::copy_nonoverlapping(
-        h3_buf.as_ptr(),
-        conn.stream_send_buf
-            .as_mut_ptr()
-            .add(conn.stream_send_buf_len),
-        to_copy,
-    );
-    conn.stream_send_buf_len += to_copy;
-}
-
-/// Server-side: hardcoded route table. `GET /` returns "hello h3";
-/// anything else returns 404. Extended-CONNECT for WebSocket
-/// (`:method=CONNECT`, `:protocol=websocket`, `:path=/ws`) gets a
-/// 200 response with no body and flips the connection into WS mode.
-unsafe fn h3_dispatch_request(s: &mut QuicState, idx: usize, headers_block: &[u8]) {
-    let sys = &*s.syscalls;
-    let req = match h3_decode_request(headers_block) {
-        Some(r) => r,
-        None => return,
-    };
-    let method_bytes: &[u8] = match (req.method_static, req.method) {
-        (Some(s), _) => s,
-        (None, Some(b)) => b,
-        _ => &[],
-    };
-    let path_bytes: &[u8] = match (req.path_static, req.path) {
-        (Some(s), _) => s,
-        (None, Some(b)) => b,
-        _ => &[],
-    };
-    let protocol_bytes: &[u8] = match (req.protocol_static, req.protocol) {
-        (Some(s), _) => s,
-        (None, Some(b)) => b,
-        _ => &[],
-    };
-
-    // Extended CONNECT for WebSocket (RFC 9220).
-    if s.enable_ws != 0
-        && eq_bytes(method_bytes, b"CONNECT")
-        && eq_bytes(protocol_bytes, b"websocket")
-        && eq_bytes(path_bytes, b"/ws")
-    {
-        let mut hdr_block = [0u8; 64];
-        let hdr_len = h3_encode_connect_accept(&mut hdr_block);
-        if hdr_len == 0 {
-            return;
-        }
-        let mut h3_buf = [0u8; 256];
-        let mut p = 0;
-        let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-        if n == 0 {
-            return;
-        }
-        p += n;
-        h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
-        p += hdr_len;
-        let conn = &mut s.conns[idx];
-        let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-        let to_copy = p.min(space);
-        core::ptr::copy_nonoverlapping(
-            h3_buf.as_ptr(),
-            conn.stream_send_buf
-                .as_mut_ptr()
-                .add(conn.stream_send_buf_len),
-            to_copy,
-        );
-        conn.stream_send_buf_len += to_copy;
-        // Do NOT FIN — stream stays open for tunnelled WS frames.
-        conn.ws_mode = true;
-        let msg = b"[quic] h3 ws upgrade accepted";
-        dev_log(sys, 3, msg.as_ptr(), msg.len());
-        return;
-    }
-
-    // POST: accumulate body across DATA frames, then emit response
-    // on stream FIN. Defers dispatch.
-    if eq_bytes(method_bytes, b"POST") {
-        let conn = &mut s.conns[idx];
-        conn.h3_post_in_progress = true;
-        conn.h3_post_dispatched = false;
-        let n = path_bytes.len().min(conn.h3_post_path.len());
-        conn.h3_post_path[..n].copy_from_slice(&path_bytes[..n]);
-        conn.h3_post_path_len = n;
-        conn.h3_post_body_len = 0;
-        let msg = b"[quic] h3 POST headers";
-        dev_log(sys, 3, msg.as_ptr(), msg.len());
-        return;
-    }
-
-    let (status, body) = if eq_bytes(path_bytes, b"/") {
-        (&b"200"[..], &b"hello h3\n"[..])
-    } else {
-        (&b"404"[..], &b"not found\n"[..])
-    };
-    let mut log_buf = [0u8; 96];
-    let prefix = b"[quic] h3 dispatch ";
-    let mut p = 0;
-    for &c in prefix {
-        log_buf[p] = c;
-        p += 1;
-    }
-    let n = path_bytes.len().min(log_buf.len() - p);
-    core::ptr::copy_nonoverlapping(path_bytes.as_ptr(), log_buf.as_mut_ptr().add(p), n);
-    p += n;
-    if p + 4 <= log_buf.len() {
-        log_buf[p] = b' ';
-        p += 1;
-        let mut k = 0;
-        while k < status.len() && p < log_buf.len() {
-            log_buf[p] = status[k];
-            p += 1;
-            k += 1;
-        }
-    }
-    dev_log(sys, 3, log_buf.as_ptr(), p);
-
-    // Build response: HEADERS + DATA frames into stream_send_buf.
-    let conn = &mut s.conns[idx];
-    let mut hdr_block = [0u8; 256];
-    let hdr_len = h3_encode_response_headers(status, b"text/plain", body.len(), &mut hdr_block);
-    if hdr_len == 0 {
-        return;
-    }
-    let mut h3_buf = [0u8; 1024];
-    let mut p = 0;
-    let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 {
-        return;
-    }
-    p += n;
-    if p + hdr_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
-    p += hdr_len;
-    let n = h3_build_frame_header(H3_FRAME_DATA, body.len(), &mut h3_buf[p..]);
-    if n == 0 {
-        return;
-    }
-    p += n;
-    if p + body.len() > h3_buf.len() {
-        return;
-    }
-    h3_buf[p..p + body.len()].copy_from_slice(body);
-    p += body.len();
-    let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-    let to_copy = p.min(space);
-    core::ptr::copy_nonoverlapping(
-        h3_buf.as_ptr(),
-        conn.stream_send_buf
-            .as_mut_ptr()
-            .add(conn.stream_send_buf_len),
-        to_copy,
-    );
-    conn.stream_send_buf_len += to_copy;
-    conn.stream_send_fin = true;
-}
-
-/// Client-side: emit a `GET /` HTTP/3 HEADERS frame on stream 0.
-/// In WS-on-h3 mode (RFC 9220) emits an extended CONNECT instead.
-unsafe fn h3_emit_client_request(s: &mut QuicState, idx: usize) {
-    // With `h3_app` the application owns HTTP/3, including WHICH request to
-    // make. This module's built-in `GET /` is a transport self-test, and
-    // emitting it alongside the app's request would put two requests on the
-    // wire where the graph asked for one.
-    if s.h3_app != 0 {
-        return;
-    }
-    let mut hdr_block = [0u8; 256];
-    let hdr_len = if s.enable_ws != 0 {
-        h3_encode_extended_connect(b"/ws", b"localhost", &mut hdr_block)
-    } else {
-        h3_encode_request_headers(b"GET", b"/", b"localhost", &mut hdr_block)
-    };
-    if hdr_len == 0 {
-        return;
-    }
-    let mut h3_buf = [0u8; 512];
-    let mut p = 0;
-    let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 {
-        return;
-    }
-    p += n;
-    if p + hdr_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
-    p += hdr_len;
-    let conn = &mut s.conns[idx];
-    let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-    let to_copy = p.min(space);
-    core::ptr::copy_nonoverlapping(
-        h3_buf.as_ptr(),
-        conn.stream_send_buf
-            .as_mut_ptr()
-            .add(conn.stream_send_buf_len),
-        to_copy,
-    );
-    conn.stream_send_buf_len += to_copy;
-}
-
-/// Queue a `GET /two` request on bidi stream id 4 (the second
-/// client-initiated bidi stream, RFC 9000 §2.1) so it runs in
-/// parallel with the `GET /` on stream id 0.
-unsafe fn h3_emit_concurrent_bidi_request(s: &mut QuicState, idx: usize) {
-    let stream_id: u64 = 4;
-    let slot_idx = match bidi_alloc(&mut s.conns[idx], stream_id, true) {
-        Some(i) => i,
-        None => return,
-    };
-    let mut hdr_block = [0u8; 256];
-    let hdr_len = h3_encode_request_headers(b"GET", b"/two", b"localhost", &mut hdr_block);
-    if hdr_len == 0 {
-        return;
-    }
-    let mut h3_buf = [0u8; 512];
-    let mut p = 0;
-    let n = h3_build_frame_header(H3_FRAME_HEADERS, hdr_len, &mut h3_buf[p..]);
-    if n == 0 {
-        return;
-    }
-    p += n;
-    if p + hdr_len > h3_buf.len() {
-        return;
-    }
-    h3_buf[p..p + hdr_len].copy_from_slice(&hdr_block[..hdr_len]);
-    p += hdr_len;
-
-    let slot = &mut s.conns[idx].bidi_extra_streams[slot_idx];
-    let space = slot.send_buf.len() - slot.send_buf_len;
-    let to_copy = p.min(space);
-    core::ptr::copy_nonoverlapping(
-        h3_buf.as_ptr(),
-        slot.send_buf.as_mut_ptr().add(slot.send_buf_len),
-        to_copy,
-    );
-    slot.send_buf_len += to_copy;
-    slot.send_fin_pending = true;
-}
-
 fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -3806,25 +2692,6 @@ pub mod test_helpers {
             }
             i += 1;
         }
-    }
-
-    /// Dispatch a synthetic HTTP/3 `GET /` through the real server request
-    /// handler on connection `idx`, bracketed exactly as the RX loop does — so
-    /// the module emits the `h3.request` child span (parented by the
-    /// connection's `quic.connection` span). Lets a test validate the
-    /// per-request span + its parent linkage without standing up a full QUIC +
-    /// TLS + HTTP/3 handshake.
-    ///
-    /// # Safety
-    /// `state` must point to a fully-initialised `QuicState`; `idx` must be an
-    /// allocated connection slot.
-    pub unsafe fn dispatch_h3_get(state: *mut u8, idx: usize) {
-        let s = &mut *(state as *mut QuicState);
-        let start = super::h3_span_start(s, idx);
-        let mut block = [0u8; 128];
-        let n = super::h3_encode_request_headers(b"GET", b"/", b"example.test", &mut block);
-        super::h3_dispatch_request(s, idx, &block[..n]);
-        super::emit_h3_request_span(s, idx, start);
     }
 
     /// True if any connection has completed the handshake (Established +

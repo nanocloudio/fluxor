@@ -40,11 +40,12 @@ metrics = ["bytes_in", "bytes_out"]
 # (accept -> close), SERVER kind, rooting its own trace. Minted at accept when
 # the telemetry port is wired and the connection is head-sampled; emitted by the
 # close reaper. Client connections are not spanned. Zero-cost otherwise.
-# Span 1: one `h3.request` child span per server-dispatched HTTP/3 GET
-# (request HEADERS -> response queued), SERVER kind, parented by the enclosing
-# `quic.connection` span (shared trace id), so a connection's requests form a
-# tree. Inherits the connection's head-sampling decision.
-spans = ["quic.connection", "h3.request"]
+# There is deliberately no request span here. A request is an HTTP concept and
+# this module does not serve HTTP — it surfaces streams and the application owns
+# the protocol on them, so the application is what can name a request. Wave's
+# `http` emits `http.server.request`, parented by the connection span above via
+# the propagated trace context.
+spans = ["quic.connection"]
 
 [[resources]]
 requires_contract = "channel"

@@ -165,6 +165,55 @@ pub const MSG_MUX_DATAGRAM_RX: u8 = 0xC7;
 /// `0x50..0x63`).
 pub const MSG_MUX_PEER_IDENTITY: u8 = 0xC8;
 
+/// Peer transport-parameter sideband for the session: a one-shot event a
+/// transport emits once it has learned the peer's protocol-level limits, so an
+/// application encoding requests onto the session's streams can respect them.
+/// Session-scoped. Payload:
+/// `[session_id: u32 LE] [max_field_section_size: u32 LE]
+///  [qpack_max_table_capacity: u32 LE] [qpack_blocked_streams: u32 LE]
+///  [flags: u8]`
+///
+/// Why this exists: the limits arrive on a CONNECTION-scoped control channel
+/// that only the transport reads (for QUIC/HTTP/3, the peer's SETTINGS frame on
+/// its h3 control stream), but every one of them constrains how a REQUEST is
+/// encoded — and requests belong to whoever owns the streams. Without this the
+/// application has to guess. Guessing low wastes capacity; guessing high gets
+/// the stream reset by the peer with an error that names a frame size rather
+/// than the setting that rejected it, which is a genuinely hard failure to read
+/// from the application side.
+///
+/// `max_field_section_size` is the peer's cap on the UNCOMPRESSED size of a
+/// header section (RFC 9114 §7.2.4.1), counted as the sum over fields of
+/// `name.len() + value.len() + 32`. `u32::MAX` means "no limit advertised" —
+/// the identifier was absent, whose default is unlimited — and is distinct from
+/// an advertised `0`, which forbids header sections entirely. A value above
+/// `u32::MAX` (the wire type is a varint up to 2^62) saturates, which is
+/// lossless in effect: nothing this stack emits approaches it.
+///
+/// `flags` bit 0 = the peer advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`
+/// (RFC 9220 §3 / RFC 8441), i.e. extended CONNECT may be used to open a
+/// WebSocket tunnel on this session. All other bits are reserved and MUST be
+/// zero.
+///
+/// Emitted at most once per session, after the peer's settings are parsed and
+/// before any application stream is accepted where the transport can order it.
+/// An application that never receives one MUST assume defaults (no limit, no
+/// extended CONNECT) — a transport that does not carry connection-scoped
+/// settings simply never emits it.
+pub const MSG_MUX_PEER_SETTINGS: u8 = 0xC9;
+
+/// Bit 0 of `MSG_MUX_PEER_SETTINGS`'s `flags`: the peer permits extended
+/// CONNECT (RFC 9220 §3).
+pub const PEER_SETTINGS_FLAG_ENABLE_CONNECT: u8 = 1 << 0;
+
+/// `max_field_section_size` sentinel meaning the peer advertised no limit.
+/// Distinct from `0`, which is an advertised limit forbidding header sections.
+pub const MAX_FIELD_SECTION_UNLIMITED: u32 = u32::MAX;
+
+/// Payload length of `MSG_MUX_PEER_SETTINGS` after the session id:
+/// three u32 limits plus the flags byte.
+pub const PEER_SETTINGS_BODY: usize = 4 + 4 + 4 + 1;
+
 /// Generic session-scoped error.
 /// Payload: [session_id: u32 LE] [errno: i8].
 pub const MSG_MUX_SESSION_ERROR: u8 = 0xCE;

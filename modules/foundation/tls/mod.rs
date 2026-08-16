@@ -223,6 +223,12 @@ const NET_SCRATCH_SIZE: usize = 1600;
 const RETX_BUF_SIZE: usize = 4096;
 
 // Net protocol message types (downstream: IP -> TLS -> HTTP)
+/// Wire width of a `conn_id` on the net_proto surface (`contracts/net/net_proto.rs`
+/// `CONN_ID_LEN`). Named rather than spelled as a literal offset at each use: a
+/// bare `payload[1]` still compiles if the width moves, and reads the tail of
+/// the conn id as the head of the next field.
+const CONN_ID_LEN: usize = 2;
+
 const NET_MSG_ACCEPTED: u8 = 0x01;
 const NET_MSG_DATA: u8 = 0x02;
 const NET_MSG_CLOSED: u8 = 0x03;
@@ -1324,7 +1330,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     0
                 };
                 // Stream-surface routing: `MSG_CONNECTED` carries a requester
-                // tag at payload[1]. When `ip.net_out` is fanned to TLS plus
+                // tag after the conn id. When `ip.net_out` is fanned to TLS plus
                 // another stream consumer (e.g. an OTLP exporter), claim an
                 // outbound connect ONLY if its tag is ours (or untagged, for
                 // single-consumer / legacy graphs) — otherwise it belongs to
@@ -1332,7 +1338,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
                 // unaffected: TLS is the sole accept-claimant on its channel.
                 let claim = if t == NET_MSG_CONNECTED {
-                    let tag = if pl >= 3 { payload[2] } else { 0 };
+                    let tag = if pl > CONN_ID_LEN { payload[CONN_ID_LEN] } else { 0 };
                     let me = dev_requester_tag(sys);
                     tag == 0 || tag == me
                 } else if s.mode == 0 {
@@ -1348,8 +1354,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // learned our bound port, claim only our port's accepts.
                     // A port-less frame (legacy) or unknown bound port →
                     // claim (sole-consumer behaviour).
-                    if pl >= 3 && s.accept_port != 0 {
-                        let port = (payload[1] as u16) | ((payload[2] as u16) << 8);
+                    if pl >= CONN_ID_LEN + 2 && s.accept_port != 0 {
+                        // `[conn_id u16 LE][local_port u16 LE]`, as MSG_BOUND.
+                        let port = (payload[CONN_ID_LEN] as u16)
+                            | ((payload[CONN_ID_LEN + 1] as u16) << 8);
                         port == s.accept_port
                     } else {
                         true
@@ -1580,8 +1588,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // to our downstream. A port-less (legacy) bound or an
                 // unknown `bind_port` is accepted as before.
                 let mut bound_is_ours = true;
-                if t == NET_MSG_BOUND && rd >= 3 {
-                    let bp = (s.net_scratch[1] as u16) | ((s.net_scratch[2] as u16) << 8);
+                if t == NET_MSG_BOUND && rd >= CONN_ID_LEN + 2 {
+                    // `[conn_id u16 LE][local_port u16 LE]` — the port follows
+                    // the conn id, so it is read at `CONN_ID_LEN`. An offset
+                    // that straddles the two fields yields a port no accept can
+                    // match, and every inbound connection is declined as
+                    // another anchor's.
+                    let bp = (s.net_scratch[CONN_ID_LEN] as u16)
+                        | ((s.net_scratch[CONN_ID_LEN + 1] as u16) << 8);
                     if s.bind_port == 0 || bp == s.bind_port {
                         s.accept_port = bp;
                     } else {

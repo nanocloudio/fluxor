@@ -24,6 +24,10 @@
 
 pub const OPEN: u32 = 0x0900;
 pub const READ: u32 = 0x0901;
+/// Set the absolute read/write offset. handle=file, arg=`[offset: u32 LE]`.
+/// Returns negative errno on failure; any non-negative value is success.
+/// Consumers must not require a particular success value — a provider may
+/// return 0 or the resulting absolute offset.
 pub const SEEK: u32 = 0x0902;
 pub const CLOSE: u32 = 0x0903;
 pub const STAT: u32 = 0x0904;

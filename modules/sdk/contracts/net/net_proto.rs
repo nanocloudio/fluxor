@@ -80,6 +80,11 @@ pub const MSG_CONNECTED: u8 = 0x05;
 /// `CMD_CONNECT`'s tag so a consumer that has no conn_id yet can recognise its
 /// own failure on a fanned `net_out`; established-connection errors carry the
 /// owning connection's conn_id (filter by that). 3-byte form = tag 0.
+/// On a connect-phase failure `conn_id` is MEANINGLESS — it is the id already
+/// allocated if the dial failed after allocation, and `0` if it failed before
+/// (bad `sock_type`, no free slot), which is indistinguishable from a valid id
+/// `0` — so a consumer must match a connect failure on `requester_tag` ALONE,
+/// never on a conn_id it has not yet been assigned.
 pub const MSG_ERROR: u8 = 0x06;
 // 0x07 / 0x08 are reserved: the IP module privately uses them for
 // `MSG_RETRANSMIT` / `MSG_ACK` (consumer-side retransmit + send-buffer release)

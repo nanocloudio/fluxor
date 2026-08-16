@@ -575,6 +575,26 @@ struct NvmeState {
     /// honestly reported durable (even though `write_complete_seq` still
     /// advances past it for counter consistency). Monotonic latch.
     first_fail_seq: u64,
+    /// Identify Controller byte 525 bit 0 (VWC): the controller holds
+    /// completed writes in a volatile write cache, so a write CQE alone
+    /// does not mean the data survives power loss and every durability
+    /// barrier must include an explicit Flush. Clear on a controller
+    /// that commits to non-volatile media on completion, where a Flush
+    /// is unnecessary.
+    needs_flush: bool,
+    /// `write_complete_seq` an in-flight Flush will cover once its CQE
+    /// retires (0 = no Flush outstanding). One Flush at a time: NVMe
+    /// Flush covers the whole namespace, so a later barrier reuses a
+    /// completing one rather than queueing its own.
+    flush_inflight_for: u64,
+    /// Highest `write_complete_seq` proven on non-volatile media by a
+    /// completed Flush. Only meaningful when `needs_flush`; a fence is
+    /// durable at `flush_complete_seq >= ticket`.
+    flush_complete_seq: u64,
+    /// Latched Flush failure. A barrier that cannot prove its writes
+    /// flushed reports error forever rather than downgrading to the
+    /// write-completion rule.
+    flush_err: i32,
     /// 1 once `BACKING_PROVIDER_ENABLE` has succeeded, so S_READY
     /// entry only registers once.
     pager_registered: u8,
@@ -1361,6 +1381,13 @@ unsafe fn step_identify_controller(s: &mut NvmeState) -> i32 {
                 return fault(s, 11, b"[nvme] Identify failed\0");
             }
 
+            // VWC decides the durability rule for every barrier below:
+            // set means a write CQE leaves data in a volatile cache and
+            // an explicit Flush is required to make it durable.
+            if s.identify_buf != 0 {
+                s.needs_flush = (*(s.identify_buf as *const u8).add(ID_VWC)) & 0x01 != 0;
+            }
+
             emit_identify_info(s);
 
             // Ring CQ head doorbell.
@@ -1624,11 +1651,10 @@ unsafe fn submit_io_write(
 /// write already spin-polls to completion). Serves `PAGER_OP_FLUSH` (pager)
 /// and `IOCTL_BLOCKS_FLUSH_SYNC` (a synchronous FS provider's fsync).
 ///
-/// No explicit NVM Flush (opcode 0x00) is issued: the target controller
-/// commits writes to non-volatile media on completion, so a Flush is
-/// unnecessary, and issuing one on this controller is unsafe. See
-/// `submit_io_flush` for a spec-correct Flush kept for controllers with a
-/// non-power-loss-protected volatile write cache.
+/// An explicit NVM Flush (opcode 0x00) is issued only when the
+/// controller reports a volatile write cache (`needs_flush`, Identify
+/// byte 525). A controller that commits on completion needs none, and
+/// issuing one there is unsafe.
 unsafe fn device_flush(s: &mut NvmeState) -> i32 {
     let drain = bulk_drain_writes(s);
     if drain != 0 {
@@ -1637,7 +1663,7 @@ unsafe fn device_flush(s: &mut NvmeState) -> i32 {
     if s.state != S_READY {
         return E_AGAIN;
     }
-    0
+    flush_barrier_sync(s)
 }
 
 /// Submit an NVMe Flush (NVM command set, opcode 0x00) on I/O queue
@@ -1647,11 +1673,6 @@ unsafe fn device_flush(s: &mut NvmeState) -> i32 {
 /// `pager_spin_poll_cqe(s, cid)`. Flush with a given NSID covers that
 /// namespace regardless of which I/O queue submitted it, so queue 0 is
 /// always a valid choice.
-#[allow(
-    dead_code,
-    reason = "spec-correct Flush; unused while the target controller is \
-    durable-on-completion — see device_flush"
-)]
 unsafe fn submit_io_flush(s: &mut NvmeState, q_idx: usize, cid: u16, nsid: u32) {
     if q_idx >= MAX_IO_QUEUES {
         return;
@@ -1706,8 +1727,8 @@ pub fn clamp_nlb(nlb: u16) -> u16 {
 #[cfg(feature = "host-test")]
 pub mod limits {
     pub use super::{
-        clamp_nlb, encode_write_cid, is_bulk_read_cid, is_bulk_write_cid, is_write_cid,
-        slot_page_addr, write_cid_queue, write_cid_slot,
+        clamp_nlb, encode_write_cid, fence_state, is_bulk_read_cid, is_bulk_write_cid,
+        is_write_cid, slot_page_addr, write_cid_queue, write_cid_slot, FenceState,
     };
     pub use super::{
         ASYNC_BULK_SLOTS, CID_BULK_WRITE_BASE, CID_IO_WRITE_BASE, CID_NONE, CID_PAGER_READ,
@@ -2914,17 +2935,29 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
                 *arg.add(6),
                 *arg.add(7),
             ]);
-            // A fence covering a failed write reports error permanently —
-            // the caller must withhold its durable ack and recover (fall
-            // back to the sync write+flush path). This is the safety
-            // interlock: a failed durable write must never surface durable.
-            if s.first_fail_seq != 0 && ticket >= s.first_fail_seq {
-                return E_INVAL;
-            }
-            if s.write_complete_seq >= ticket {
-                0
-            } else {
-                1
+            // The caller must withhold its durable ack on `Failed` and
+            // recover via the sync write+flush path: a failed durable
+            // write must never surface durable.
+            match fence_state(
+                ticket,
+                s.write_complete_seq,
+                s.first_fail_seq,
+                s.needs_flush,
+                s.flush_complete_seq,
+                s.flush_inflight_for != 0,
+                s.flush_err,
+            ) {
+                FenceState::Durable => 0,
+                FenceState::Pending => 1,
+                FenceState::Failed(rc) => rc,
+                FenceState::NeedsFlush => {
+                    // Keeps the fence non-blocking: submit on the poll
+                    // that first observes the covered writes complete,
+                    // then report pending until the Flush CQE retires.
+                    s.flush_inflight_for = s.write_complete_seq;
+                    submit_io_flush(s, 0, CID_PAGER_FLUSH, s.namespace);
+                    1
+                }
             }
         }
         // FLUSH handled above (no arg buffer).
@@ -2995,6 +3028,14 @@ unsafe fn pager_spin_poll_cqe(s: &mut NvmeState, expected_cid: u16) -> i32 {
                     // advance the ring head and latch any error so
                     // the next FLUSH (or submit) can surface it.
                     retire_bulk_write_cqe(s, sc);
+                    continue;
+                }
+
+                if cid == CID_PAGER_FLUSH {
+                    // A Flush opened by the async fence path. Retire it
+                    // here or its completion is lost and every fence
+                    // waiting on it stays pending forever.
+                    retire_flush_cqe(s, sc);
                     continue;
                 }
 
@@ -3107,7 +3148,10 @@ unsafe fn harvest_writes(s: &mut NvmeState) {
     let n = s.io_q_count as usize;
     for q in 0..n {
         while let Some((cid, sc)) = peek_io_cqe(s, q) {
-            if is_bulk_write_cid(cid) {
+            if cid == CID_PAGER_FLUSH {
+                consume_io_cqe(s, q);
+                retire_flush_cqe(s, sc);
+            } else if is_bulk_write_cid(cid) {
                 consume_io_cqe(s, q);
                 retire_bulk_write_cqe(s, sc);
             } else if is_write_cid(cid) {
@@ -3124,6 +3168,119 @@ unsafe fn harvest_writes(s: &mut NvmeState) {
             }
         }
     }
+}
+
+/// State a durability fence is in, given the writes it covers and what
+/// the controller has proven.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FenceState {
+    /// Every covered write is on non-volatile media.
+    Durable,
+    /// Not yet provable; poll again.
+    Pending,
+    /// Writes have completed but sit in the controller's volatile
+    /// cache, and no Flush that would cover this ticket is outstanding.
+    /// The caller submits one, then reports pending.
+    NeedsFlush,
+    /// Permanently unprovable — a covered write or the Flush failed.
+    Failed(i32),
+}
+
+/// The durability rule for a fence ticket, as a pure decision over the
+/// driver's completion counters.
+///
+/// A ticket is a `write_submit_seq` snapshot. Completion of the covered
+/// writes is sufficient only on a controller that commits to
+/// non-volatile media on completion; when `needs_flush` is set, a Flush
+/// submitted *after* those writes completed must also have retired.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the arguments are exactly the completion counters the rule reads; \
+    grouping them in a struct would only move the same fields behind a name"
+)]
+pub fn fence_state(
+    ticket: u64,
+    write_complete_seq: u64,
+    first_fail_seq: u64,
+    needs_flush: bool,
+    flush_complete_seq: u64,
+    flush_inflight: bool,
+    flush_err: i32,
+) -> FenceState {
+    // A failed write is a permanent durability gap: every fence
+    // covering it must report error forever, even though
+    // `write_complete_seq` advances past it for counter consistency.
+    if first_fail_seq != 0 && ticket >= first_fail_seq {
+        return FenceState::Failed(E_INVAL);
+    }
+    if write_complete_seq < ticket {
+        return FenceState::Pending;
+    }
+    if !needs_flush {
+        return FenceState::Durable;
+    }
+    if flush_err != 0 {
+        return FenceState::Failed(flush_err);
+    }
+    if flush_complete_seq >= ticket {
+        return FenceState::Durable;
+    }
+    // An outstanding Flush was submitted against an earlier
+    // high-water; it cannot cover writes that completed after it, so
+    // wait for it to retire before submitting one that does.
+    if flush_inflight {
+        FenceState::Pending
+    } else {
+        FenceState::NeedsFlush
+    }
+}
+
+/// Retire a Flush CQE: on success every write completed before the
+/// Flush was submitted is on non-volatile media; on failure the barrier
+/// is unprovable and latches an error.
+unsafe fn retire_flush_cqe(s: &mut NvmeState, sc: u16) {
+    if sc == 0 {
+        if s.flush_inflight_for > s.flush_complete_seq {
+            s.flush_complete_seq = s.flush_inflight_for;
+        }
+    } else if s.flush_err == 0 {
+        s.flush_err = E_INVAL;
+    }
+    s.flush_inflight_for = 0;
+}
+
+/// Submit a Flush covering everything completed so far and wait for it.
+/// No-op on a controller that commits on completion. Returns 0 when the
+/// covered writes are durable.
+unsafe fn flush_barrier_sync(s: &mut NvmeState) -> i32 {
+    if !s.needs_flush {
+        return 0;
+    }
+    if s.flush_err != 0 {
+        return s.flush_err;
+    }
+    // Reuse a Flush already in flight rather than queueing a second one
+    // on the same CID.
+    if s.flush_inflight_for == 0 {
+        s.flush_inflight_for = s.write_complete_seq;
+        submit_io_flush(s, 0, CID_PAGER_FLUSH, s.namespace);
+    }
+    let target = s.flush_inflight_for;
+    let rc = pager_spin_poll_cqe(s, CID_PAGER_FLUSH);
+    if rc != 0 {
+        // The Flush never proved durable (device error or poll budget
+        // exhausted). Leave it outstanding: harvest retires it if the
+        // CQE lands later, and until then no barrier reports durable.
+        if rc != E_AGAIN && s.flush_err == 0 {
+            s.flush_err = rc;
+        }
+        return if s.flush_err != 0 { s.flush_err } else { rc };
+    }
+    if target > s.flush_complete_seq {
+        s.flush_complete_seq = target;
+    }
+    s.flush_inflight_for = 0;
+    0
 }
 
 /// Drain every in-flight async bulk-write slot. Used by PAGER_OP_FLUSH
@@ -3145,6 +3302,13 @@ unsafe fn bulk_drain_writes(s: &mut NvmeState) -> i32 {
                     consume_io_cqe(s, q);
                     progress = true;
                     retire_bulk_write_cqe(s, sc);
+                } else if cid == CID_PAGER_FLUSH {
+                    // Retire an async-fence Flush rather than treating it
+                    // as foreign: left at the queue head it blocks every
+                    // write completion behind it.
+                    consume_io_cqe(s, q);
+                    progress = true;
+                    retire_flush_cqe(s, sc);
                 } else if is_write_cid(cid) {
                     consume_io_cqe(s, q);
                     progress = true;
