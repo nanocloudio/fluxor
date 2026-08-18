@@ -73,6 +73,10 @@ fn wasm_validate_module_base(_base: usize) -> bool {
 fn wasm_validate_fn_in_code(_addr: usize, _code_base: usize, _code_size: u32) -> bool {
     true
 }
+/// WASM has no RAM OTA staging surface.
+fn wasm_ota_stage_protect(_base: *mut u8, _len: usize, _executable: bool) -> bool {
+    false
+}
 fn wasm_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     if computed.len() != expected.len() {
         return false;
@@ -215,6 +219,7 @@ pub static WASM_HAL_OPS: HalOps = HalOps {
     validate_module_base: wasm_validate_module_base,
     validate_fn_in_code: wasm_validate_fn_in_code,
     verify_integrity: wasm_verify_integrity,
+    ota_stage_protect: wasm_ota_stage_protect,
     pic_barrier: wasm_pic_barrier,
     step_guard_init: wasm_step_guard_init,
     step_guard_arm: wasm_step_guard_arm,

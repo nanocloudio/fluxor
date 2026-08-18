@@ -142,6 +142,29 @@ fn linux_validate_fn_in_code(addr: usize, base: usize, size: u32) -> bool {
 fn linux_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     computed == expected
 }
+
+/// OTA staging page-permission flip: RW while staging bytes land, RX
+/// once committed (W^X — the staged region is only ever writable OR
+/// executable). The staging buffer is 16 KiB-aligned static BSS —
+/// covering the host kernel's actual page size (Raspberry Pi OS
+/// aarch64 runs 16 KiB pages), which is also what the range is
+/// rounded to here; a 4 KiB assumption made `mprotect` fail EINVAL on
+/// such kernels.
+fn linux_ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
+    // SAFETY: sysconf on a valid selector; falls back defensively.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = if page > 0 { page as usize } else { 16384 };
+    let start = (base as usize) & !(page - 1);
+    let end = (base as usize + len + page - 1) & !(page - 1);
+    let prot = if executable {
+        libc::PROT_READ | libc::PROT_EXEC
+    } else {
+        libc::PROT_READ | libc::PROT_WRITE
+    };
+    // SAFETY: whole-page range over the static staging buffer; mprotect
+    // on BSS pages is well-defined.
+    unsafe { libc::mprotect(start as *mut libc::c_void, end - start, prot) == 0 }
+}
 fn linux_pic_barrier() {}
 
 fn linux_step_guard_init() {}
@@ -278,6 +301,7 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     validate_module_base: linux_validate_module_base,
     validate_fn_in_code: linux_validate_fn_in_code,
     verify_integrity: linux_verify_integrity,
+    ota_stage_protect: linux_ota_stage_protect,
     pic_barrier: linux_pic_barrier,
     step_guard_init: linux_step_guard_init,
     step_guard_arm: linux_step_guard_arm,

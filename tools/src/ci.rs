@@ -875,7 +875,18 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
 /// the hex digest in the child's argv[0] and the busybox applet
 /// dispatch fires instead of the subcommand parse. Pin argv[0].
 fn self_invoke() -> Command {
-    let mut cmd = Command::new(std::env::current_exe().unwrap_or_else(|_| "fluxor".into()));
+    let exe = std::env::current_exe().unwrap_or_else(|_| "fluxor".into());
+    // A concurrent `cargo build` replaces the running binary by rename,
+    // after which `current_exe()` names a deleted inode and spawning it
+    // fails ENOENT. `/proc/self/exe` still execs the original image, so
+    // the run stays self-consistent instead of failing every spawn.
+    #[cfg(target_os = "linux")]
+    let exe = if exe.exists() {
+        exe
+    } else {
+        std::path::PathBuf::from("/proc/self/exe")
+    };
+    let mut cmd = Command::new(exe);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;

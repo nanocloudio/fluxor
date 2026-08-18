@@ -24,6 +24,9 @@ pub enum Error {
 
     #[error("Module error: {0}")]
     Module(String),
+
+    #[error("Remote registry error: {0}")]
+    Remote(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

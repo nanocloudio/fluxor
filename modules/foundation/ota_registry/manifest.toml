@@ -1,0 +1,61 @@
+version = "0.1.0"
+type = "Transformer"
+hardware_targets = ["bcm2712"]
+# OTA_STAGE_WRITE / OTA_STAGE_CTRL (0x0C20/0x0C21) classify as
+# platform_raw via the dev_system catch-all (see the permission map in
+# src/kernel/module/syscalls.rs).
+permissions = ["platform_raw"]
+
+# OTA registry puller — pulls a graph image (`fluxor build --emit=image`,
+# published as an `application/vnd.nanocloud.fluxor.image.v1` OCI
+# artifact) from an OCI distribution registry and activates it through
+# the kernel's OTA RAM staging surface.
+#
+# Wire path: this module speaks HTTP/1.1 + the distribution API on its
+# net pair; wiring the pair through the `tls` module (client mode, CA
+# pinned to the deployment CA) gives the transport TLS —
+#
+#   ota_registry.net_out → tls.clear_in ; tls.clear_out → ota_registry.net_in
+#   tls.cipher_out → ip.in ; ip.out → tls.cipher_in
+#
+# Sequence per attempt: GET manifest (by tag) → read the image layer's
+# digest/size and the `io.fluxor.image.epoch` annotation → skip when the
+# epoch is not newer than the live one (OTA_STAGE_CTRL EPOCH) → GET the
+# blob, streaming into OTA_STAGE_WRITE with an incremental SHA-256 →
+# verify the digest → OTA_STAGE_CTRL COMMIT (kernel re-validates
+# header, payload sha, ABI pin, epoch and fires the rebuild bridge).
+# Every failure backs off exponentially and restarts from the manifest.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+# Sized to absorb one full TLS-module step burst (its cipher_in ring is
+# 16 KiB; decrypt fan-out is ~1:1), with 4x headroom — the blob
+# download is a sustained inbound stream.
+buffer_size = 65536
+max_record = 8600
+required = true
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 16384
+max_record = 8600
+required = true
+
+# Optional signed-directive input (rfc_oci_distribution.md §7.2): FMP
+# frames whose payload is `[0x44][counter u64 LE][tag_len u8][tag]
+# [Ed25519 sig 64]`, verified against the `directive_pubkey` param.
+# Transport-agnostic by design — wire any byte transport here (a UDP
+# bridge, an mqtt_client subscription, linux cli_in, ...).
+[[ports]]
+name = "directive"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "control-plane puller — emits discrete progress log lines (manifest/blob/commit), not a sustained byte data path"

@@ -45,7 +45,26 @@ SECTIONS {
      * (no ALIGN here) for the trailer to land at the right offset. */
     __end_data_addr = .;
 
-    .bss (NOLOAD) : ALIGN(4096) {
+    /* PAYLOAD WINDOW. A RAM-loaded image (Pi 5: the VPU drops the whole
+     * kernel_2712.img at RAM_ORIGIN) carries its module blob + config
+     * appended after __end_data_addr, and `_start` zeroes
+     * __bss_start..__bss_end before `main` runs. Anything appended at or
+     * past __bss_start is therefore ERASED before the loader reads it —
+     * the module table decodes as empty and the board boots a graph with
+     * no modules: no network, no telemetry, no console, indistinguishable
+     * from a board that never booted.
+     *
+     * With plain ALIGN(4096) the usable window is only the gap that
+     * happens to fall between the firmware's end and the next alignment
+     * boundary — an accidental budget that shrinks with every byte of
+     * firmware growth and truncates payloads silently at a ceiling no
+     * config file records. 16 MiB alignment makes the window a
+     * deliberate ~13 MiB, so the real bound is the loader's designed
+     * MAX_MODULES_BLOB_SIZE (8 MiB) rather than a layout artifact.
+     * Costs nothing: .bss is NOLOAD, so the gap is unused address space,
+     * not image bytes, and the region below (192M) still holds everything.
+     */
+    .bss (NOLOAD) : ALIGN(0x1000000) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)

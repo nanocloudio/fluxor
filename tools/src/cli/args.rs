@@ -40,22 +40,24 @@ enum Commands {
     ///   combined  firmware + config in one UF2. Dev-flash convenience
     ///             only: the trailer-embedded modules/config are NOT an
     ///             OTA path — OTA devices update runtime modules
-    ///             exclusively through `--emit=slot`.
-    ///   slot      OTA slot image (modules + config + slot header) for
-    ///             a graph_slot A/B region; excludes firmware. The ONLY
-    ///             sanctioned module-delivery path for OTA devices; the
-    ///             slot header pins kernel and graph to each other by
-    ///             the ABI-surface digest.
+    ///             exclusively through `--emit=image`.
+    ///   image     graph image (modules + config + header): the
+    ///             packaged deployable graph — what an RP flash A/B
+    ///             graph slot holds and what an OTA device pulls;
+    ///             excludes firmware. The ONLY sanctioned
+    ///             module-delivery path for OTA devices; its header
+    ///             pins kernel and graph to each other by the
+    ///             ABI-surface digest.
     ///   table     module table blob from the modules the config names
     Build {
         /// Config file (YAML) or directory containing YAML files.
         /// Omit for the lifecycle build.
         path: Option<PathBuf>,
         /// Output file (default: auto-derived from target; required
-        /// for --emit=combined|slot|table).
+        /// for --emit=combined|image|table).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Emit a device encoding: uf2|bin|combined|slot|table.
+        /// Emit a device encoding: uf2|bin|combined|image|table.
         #[arg(long)]
         emit: Option<String>,
         /// Validate the config against target constraints and exit
@@ -66,16 +68,16 @@ enum Commands {
         #[arg(long)]
         firmware: Option<PathBuf>,
         /// Modules directory override (default:
-        /// target/fluxor/{silicon}/modules). Single dir for uf2/bin;
-        /// repeatable for --emit=table.
+        /// target/fluxor/{silicon}/modules). Single dir for
+        /// uf2/bin/image; repeatable for --emit=table.
         #[arg(short = 'm', long = "modules-dir", action = clap::ArgAction::Append)]
         modules_dir: Vec<PathBuf>,
-        /// Target override (--check / --emit=slot; default: read from
+        /// Target override (--check / --emit=image; default: read from
         /// the config's `target:` field).
         #[arg(short, long)]
         target: Option<String>,
-        /// --emit=slot: epoch to embed in the slot header. Must exceed
-        /// the currently live slot's epoch for activation to succeed.
+        /// --emit=image: epoch to embed in the image header. Must
+        /// exceed the live image's epoch for activation to succeed.
         #[arg(long, default_value = "1")]
         epoch: u64,
     },
@@ -466,6 +468,54 @@ enum PublishAction {
     Runtime {
         #[arg(long)]
         project_root: Option<PathBuf>,
+    },
+    /// Publish a built graph image (`fluxor build --emit=image`) as a
+    /// device artifact: the packaged deployable graph a device pulls
+    /// from a registry (`fluxor store push` serves it onward). Target,
+    /// epoch and ABI pin are read from the FXSL header and mirrored as
+    /// annotations for pre-fetch admission. By default the image is
+    /// EXPLODED into layers (skeleton + one layer per fmod + config,
+    /// offsets annotated) so registries deduplicate module content and
+    /// devices fetch only what changed; `--packed` keeps the single
+    ///-blob form (the RP flash-slot path's shape).
+    Image {
+        /// The graph image file.
+        file: PathBuf,
+        /// Publish as one packed blob instead of exploded layers.
+        #[arg(long)]
+        packed: bool,
+        /// Artifact name (default: file stem).
+        #[arg(long)]
+        name: Option<String>,
+        /// Target id annotation (e.g. pi5, rp2350).
+        #[arg(long)]
+        target: String,
+        /// Tag (default: `<name>:latest`).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
+        /// override with $FLUXOR_STORE).
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// Publish a boot image (e.g. Pi 5 `kernel_2712.img`) as a device
+    /// artifact for staging hosts (TFTP root, SD writers) to pull.
+    Firmware {
+        /// The firmware image file.
+        file: PathBuf,
+        /// Artifact name (default: file stem).
+        #[arg(long)]
+        name: Option<String>,
+        /// Target id annotation (e.g. pi5).
+        #[arg(long)]
+        target: String,
+        /// Tag (default: `<name>:latest`).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Store directory (default: $XDG_DATA_HOME/fluxor/store,
+        /// override with $FLUXOR_STORE).
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
     /// Publish a workload bundle directory (workload.json +
     /// resources.json + graph.yaml) into the local OCI store. Every

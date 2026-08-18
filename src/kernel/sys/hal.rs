@@ -54,6 +54,12 @@ pub struct HalOps {
     pub validate_fn_in_code: fn(addr: usize, code_base: usize, code_size: u32) -> bool,
     /// Verify integrity of module code (SHA-256 on RP, skip on aarch64).
     pub verify_integrity: fn(computed: &[u8], expected: &[u8]) -> bool,
+    /// Transition an OTA staging region between writable (staging) and
+    /// executable (committed): cache maintenance to the point of
+    /// unification on bare-metal aarch64, page-permission flips on
+    /// hosted targets. Returns `false` on targets without a RAM
+    /// staging surface (RP delivers OTA through flash graph slots).
+    pub ota_stage_protect: fn(base: *mut u8, len: usize, executable: bool) -> bool,
     /// Pipeline barrier after PIC call (DSB+ISB + interrupt restore check).
     pub pic_barrier: fn(),
 
@@ -401,6 +407,11 @@ pub fn validate_fn_in_code(addr: usize, code_base: usize, code_size: u32) -> boo
 #[inline(always)]
 pub fn verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     (ops().verify_integrity)(computed, expected)
+}
+
+/// See [`HalOps::ota_stage_protect`].
+pub fn ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
+    (ops().ota_stage_protect)(base, len, executable)
 }
 
 #[inline(always)]

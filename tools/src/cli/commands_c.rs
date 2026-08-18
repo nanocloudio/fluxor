@@ -1988,7 +1988,7 @@ fn cmd_help(make: bool, project_root: Option<&Path>, command: Option<&str>) -> R
 // ── Polymorphic `fluxor build` ───────────────────────────────────────
 
 /// Flag bundle for `fluxor build` — the absorbed
-/// generate/combine/slot-image/mktable-config/validate forms route to
+/// generate/combine/graph-image/mktable-config/validate forms route to
 /// their original implementations unchanged (byte-identity by
 /// construction).
 struct BuildFlags {
@@ -2059,16 +2059,23 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             let output = require_output("combined")?;
             cmd_combine(firmware, path, &output, verbose)
         }
-        Some("slot") => {
-            let output = require_output("slot")?;
-            cmd_slot_image(path, &output, flags.target.as_deref(), flags.epoch, verbose)
+        Some("image") => {
+            let output = require_output("image")?;
+            cmd_graph_image(
+                path,
+                &output,
+                flags.target.as_deref(),
+                flags.epoch,
+                flags.modules_dir.first().map(PathBuf::as_path),
+                verbose,
+            )
         }
         Some("table") => {
             let output = require_output("table")?;
             cmd_mktable_config(path, &flags.modules_dir, &output)
         }
         Some(other) => Err(Error::Config(format!(
-            "unknown --emit form '{other}' (expected uf2|bin|combined|slot|table)"
+            "unknown --emit form '{other}' (expected uf2|bin|combined|image|table)"
         ))),
     }
 }

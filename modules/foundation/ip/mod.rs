@@ -1166,7 +1166,21 @@ unsafe fn tcp_conn_mut(s: &mut IpState, idx: usize) -> &mut tcp::TcpConn {
 }
 
 /// Allocate next ephemeral port.
+///
+/// The sequence starts at a RANDOM point in the range (seeded once,
+/// lazily, from the CSPRNG): a reboot that restarts deterministically
+/// at 49152 reuses the exact 4-tuples of the previous boot's
+/// connections, colliding with peers' half-open state for those
+/// tuples (stray challenge-ACKs, RST churn on every fresh connect).
 fn next_port(s: &mut IpState) -> u16 {
+    if s.next_ephemeral_port == 0 {
+        let sys = unsafe { &*s.syscalls };
+        let mut r = [0u8; 2];
+        let _ = unsafe { dev_csprng_fill(sys, r.as_mut_ptr(), 2) };
+        let span = 65000u32 - 49152;
+        s.next_ephemeral_port =
+            49152 + ((u16::from_le_bytes(r) as u32) % span) as u16;
+    }
     let port = s.next_ephemeral_port;
     s.next_ephemeral_port = if port >= 65000 { 49152 } else { port + 1 };
     port
@@ -1345,7 +1359,8 @@ pub unsafe extern "C" fn module_new(
         }
 
         s.ip_id = 1;
-        s.next_ephemeral_port = 49152;
+        // 0 = "unseeded"; next_port() seeds lazily from the CSPRNG.
+        s.next_ephemeral_port = 0;
 
         // Discover net protocol channels
         let sys = &*s.syscalls;
@@ -2150,11 +2165,26 @@ unsafe fn process_tcp_segment(
                             // delivery is backpressure-rejected —
                             // CloseWait doesn't re-process data.
                             action = ACTION_RX_DATA_FIN;
-                        } else {
+                        } else if tcp_hdr
+                            .seq_num
+                            .wrapping_add(tcp_hdr.payload_len as u32)
+                            == conn.rcv_nxt
+                        {
+                            // The FIN sits exactly at our receive
+                            // position (a pure FIN at rcv_nxt, or a
+                            // retransmitted tail whose payload we have
+                            // already delivered): honour it.
                             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
                             conn.state = tcp::TcpState::CloseWait;
                             action = ACTION_SET_CLOSING;
                         }
+                        // Any other FIN is ahead of undelivered bytes
+                        // (out-of-order under loss, or a burst racing
+                        // the consumer): IGNORE it — honouring it here
+                        // would close the connection and abandon every
+                        // byte the consumer has not yet received. The
+                        // peer retransmits the gap and the FIN until
+                        // the stream completes.
                     }
                 }
             }

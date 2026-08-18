@@ -213,6 +213,17 @@ const TRANSPORT_UDP: u8 = 1; // DTLS records over a datagram channel (RFC 9147).
 const MAX_PEERS: usize = 4;
 /// Maximum DTLS datagram payload.
 const DGRAM_MAX: usize = 1500;
+/// TARGET-SPECIFIC (same split as `MAX_SESSIONS`): a TLS peer may send
+/// application records up to the protocol maximum (2^14 plaintext +
+/// header/tag), and a CLIENT-mode session pulling bulk data (e.g.
+/// `ota_registry` downloading a graph-image blob from a Go registry, which
+/// sends 16 KiB records) must be able to buffer one full record or no
+/// record ever decrypts. aarch64 (bcm2712 firmware + host-linux) sizes
+/// for the full record; the small-SRAM targets keep the 4 KiB buffer —
+/// their deployments are server-side with small inbound records.
+#[cfg(target_arch = "aarch64")]
+const RECV_BUF_SIZE: usize = 16704;
+#[cfg(not(target_arch = "aarch64"))]
 const RECV_BUF_SIZE: usize = 4096;
 const SEND_BUF_SIZE: usize = 2048;
 // SCRATCH_SIZE is defined in handshake_driver.rs.
@@ -691,6 +702,9 @@ struct TlsState {
 
     // Scratch buffer for net_proto frame assembly
     net_scratch: [u8; NET_SCRATCH_SIZE],
+    /// Decrypt scratch for one inbound application record (sized like
+    /// `recv_buf`); lives in module state, not on the kernel stack.
+    record_scratch: [u8; RECV_BUF_SIZE],
     /// Module step counter, incremented at the top of every
     /// `module_step` (regardless of TCP / DTLS path). Used as the
     /// monotonic clock source for the DTLS half-open handshake
@@ -1504,25 +1518,61 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 tls_discard(sys, s.cipher_in, data_len - to_read);
                             }
                         } else if s.sessions[idx].state == SessionState::Ready {
-                            // Feed ciphertext into recv_buf for decryption
-                            let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
-                            let to_read = if data_len < space { data_len } else { space };
-                            if to_read > 0 {
-                                (sys.channel_read)(
-                                    s.cipher_in,
-                                    s.sessions[idx]
-                                        .recv_buf
-                                        .as_mut_ptr()
-                                        .add(s.sessions[idx].recv_len),
-                                    to_read,
-                                );
-                                s.sessions[idx].recv_len += to_read;
+                            // Feed ciphertext into recv_buf, decrypting +
+                            // forwarding records as they complete so buffer
+                            // space frees mid-frame. A frame larger than the
+                            // remaining space is NOT silently truncated (the
+                            // old behaviour, which desynced the record stream
+                            // and lost bytes) — the loop drains it through
+                            // repeated decrypt passes; only a single record
+                            // that can never fit (> RECV_BUF_SIZE) fails the
+                            // session, loudly.
+                            let mut remaining = data_len;
+                            loop {
+                                let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
+                                let to_read = if remaining < space { remaining } else { space };
+                                if to_read > 0 {
+                                    (sys.channel_read)(
+                                        s.cipher_in,
+                                        s.sessions[idx]
+                                            .recv_buf
+                                            .as_mut_ptr()
+                                            .add(s.sessions[idx].recv_len),
+                                        to_read,
+                                    );
+                                    s.sessions[idx].recv_len += to_read;
+                                    remaining -= to_read;
+                                }
+                                // Drain every complete record currently
+                                // buffered (one per call).
+                                loop {
+                                    let before = s.sessions[idx].recv_len;
+                                    try_decrypt_forward(s, idx);
+                                    if s.sessions[idx].recv_len == before
+                                        || s.sessions[idx].state != SessionState::Ready
+                                    {
+                                        break;
+                                    }
+                                }
+                                if remaining == 0 || s.sessions[idx].state != SessionState::Ready {
+                                    if remaining > 0 {
+                                        tls_discard(sys, s.cipher_in, remaining);
+                                    }
+                                    break;
+                                }
+                                if s.sessions[idx].recv_len == RECV_BUF_SIZE {
+                                    // No space freed: the buffered record
+                                    // exceeds RECV_BUF_SIZE and can never
+                                    // decrypt. Fail the session rather than
+                                    // corrupt the stream.
+                                    let msg: &[u8] =
+                                        b"[tls] record exceeds recv_buf; session->Error";
+                                    dev_log(sys, 1, msg.as_ptr(), msg.len());
+                                    tls_discard(sys, s.cipher_in, remaining);
+                                    s.sessions[idx].state = SessionState::Error;
+                                    break;
+                                }
                             }
-                            if data_len > to_read {
-                                tls_discard(sys, s.cipher_in, data_len - to_read);
-                            }
-                            // Try to decrypt and forward
-                            try_decrypt_forward(s, idx);
                         } else {
                             tls_discard(sys, s.cipher_in, data_len);
                         }
@@ -3576,6 +3626,13 @@ unsafe fn service_pending_peer_identity(s: &mut TlsState) {
 
 unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
+    // `alpn_h1_only` governs BOTH directions: the server's
+    // EncryptedExtensions selection (below, server mode) and the client
+    // offer here. An HTTP/1.1-only consumer (e.g. `ota_registry`
+    // against a Go registry whose h2 path expects a preface) must not
+    // offer `h2`, or the peer selects it and the plain-text request is
+    // read as a bogus HTTP/2 preface.
+    let alpn_h1_only = s.alpn_h1_only != 0;
     let sess = &mut s.sessions[idx];
 
     let mut random = [0u8; 32];
@@ -3586,10 +3643,14 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     sess.driver.peer_session_id = session_id;
     sess.driver.peer_session_id_len = 32;
 
-    let msg_len = build_client_hello(
+    let alpn: &[u8] = if alpn_h1_only { b"http/1.1" } else { &[] };
+    let msg_len = build_client_hello_ext(
         &random,
         &session_id,
         &sess.driver.ecdh_public,
+        &[],
+        alpn,
+        TLS13_RECORD_SUITES,
         &mut sess.driver.scratch,
     );
 
@@ -3957,6 +4018,9 @@ unsafe fn tls_discard(sys: &SyscallTable, chan: i32, mut count: usize) {
 /// and forward the plaintext as MSG_DATA to clear_out.
 unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
     let sys = &*s.syscalls;
+    // Raw pointer to the decrypt scratch, taken before the session
+    // borrow: `record_scratch` and `sessions` are disjoint fields.
+    let ct_ptr = core::ptr::addr_of_mut!(s.record_scratch) as *mut u8;
     let sess = &mut s.sessions[idx];
 
     if sess.recv_len < 5 {
@@ -3989,11 +4053,13 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         return;
     }
 
-    // Copy header + ciphertext for decryption
+    // Copy header + ciphertext into the state-resident decrypt scratch
+    // (a full record no longer fits on the kernel stack).
     let mut hdr = [0u8; 5];
     core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
-    let mut ct = [0u8; RECV_BUF_SIZE];
-    core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr().add(5), ct.as_mut_ptr(), rec_len);
+    // SAFETY: `record_scratch` and `sessions[idx].recv_buf` are disjoint
+    // fields of `TlsState`; the raw copy avoids the double-borrow.
+    core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr().add(5), ct_ptr, rec_len);
 
     // Consume record from recv_buf
     let consumed = 5 + rec_len;
@@ -4007,6 +4073,8 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
     }
     sess.recv_len = remain;
 
+    // SAFETY: `ct_ptr` covers RECV_BUF_SIZE bytes; rec_len <= RECV_BUF_SIZE.
+    let ct = core::slice::from_raw_parts_mut(ct_ptr, RECV_BUF_SIZE);
     match decrypt_record(
         sess.driver.suite,
         &mut sess.read_keys,
@@ -4038,34 +4106,51 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 return;
             }
             if inner_type == CT_APPLICATION_DATA && pt_len > 0 {
-                // Forward decrypted bytes as MSG_DATA. The plaintext
-                // isn't retained — a dropped write would silently
-                // lose bytes the peer thinks were delivered, so we
-                // fail the session.
+                // Forward decrypted bytes as MSG_DATA, chunked to the
+                // per-write scratch (a 16 KiB record spans several
+                // frames — MSG_DATA is a byte stream to the consumer).
+                // The plaintext isn't retained — a dropped write would
+                // silently lose bytes the peer thinks were delivered,
+                // so any failed chunk fails the session.
                 let conn_id = sess.conn_id;
-                let sent = tls_write_frame(
-                    sys,
-                    s.clear_out,
-                    NET_MSG_DATA,
-                    conn_id,
-                    ct.as_ptr(),
-                    pt_len as u16,
-                    &mut s.net_scratch,
-                );
-                if sent {
-                    // Decrypted request bytes handed to HTTP. Comparable
-                    // with `[http] tlm rx` across the clear edge.
-                    s.clear_out_bytes = s.clear_out_bytes.wrapping_add(4 + pt_len as u32);
+                const CLEAR_FWD_CHUNK: usize = NET_SCRATCH_SIZE - 5;
+                let mut off = 0usize;
+                let mut ok = true;
+                while off < pt_len {
+                    let chunk = (pt_len - off).min(CLEAR_FWD_CHUNK);
+                    let sent = tls_write_frame(
+                        sys,
+                        s.clear_out,
+                        NET_MSG_DATA,
+                        conn_id,
+                        ct.as_ptr().add(off),
+                        chunk as u16,
+                        &mut s.net_scratch,
+                    );
+                    if !sent {
+                        ok = false;
+                        break;
+                    }
+                    off += chunk;
+                    // Decrypted bytes handed to the clear consumer.
+                    // Comparable with `[http] tlm rx` across the edge.
+                    s.clear_out_bytes = s.clear_out_bytes.wrapping_add(4 + chunk as u32);
                 }
-                if !sent {
+                if !ok {
                     s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
                     let msg: &[u8] = b"[tls] clear_out full mid-record; session->Error";
-                    dev_log(sys, 3, msg.as_ptr(), msg.len());
+                    dev_log(sys, 1, msg.as_ptr(), msg.len());
                     s.sessions[idx].state = SessionState::Error;
                 }
             }
         }
         None => {
+            // Loud failure: a decrypt error here is stream desync or
+            // corruption — the session is dead and every subsequent
+            // record will be discarded, which otherwise looks like a
+            // silent stall from the consumer's side.
+            let msg: &[u8] = b"[tls] record decrypt failed; session->Error";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
             sess.state = SessionState::Error;
         }
     }

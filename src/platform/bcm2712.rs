@@ -2180,6 +2180,37 @@ fn bcm_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     computed.len() == expected.len() && computed == expected
 }
 
+/// OTA staging cache maintenance. EL1 DRAM is mapped RWX by the boot
+/// page tables, so no permission flip is needed; what IS needed before
+/// executing freshly written module code is coherency between the data
+/// cache the writes landed in and the instruction stream: clean D-cache
+/// to PoU + invalidate I-cache over the region, then DSB/ISB
+/// (ARM DDI 0487, self-modifying-code sequence).
+fn bcm_ota_stage_protect(base: *mut u8, len: usize, executable: bool) -> bool {
+    if !executable {
+        // Region is plain RW DRAM; nothing to undo.
+        return true;
+    }
+    const LINE: usize = 64;
+    let start = (base as usize) & !(LINE - 1);
+    let end = (base as usize).saturating_add(len);
+    let mut p = start;
+    while p < end {
+        // SAFETY: dc/ic by VA over a valid mapped DRAM region; cache
+        // maintenance has no memory effects beyond coherency.
+        unsafe {
+            core::arch::asm!("dc cvau, {a}", a = in(reg) p);
+        }
+        p += LINE;
+    }
+    // SAFETY: barriers + broadcast I-cache invalidate, per the
+    // architectural code-modification sequence.
+    unsafe {
+        core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb");
+    }
+    true
+}
+
 fn bcm_pic_barrier() {
     // SAFETY: DSB SY + ISB are architectural barriers — no memory effects.
     unsafe { core::arch::asm!("dsb sy", "isb") };
@@ -2819,6 +2850,7 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     validate_module_base: bcm_validate_module_base,
     validate_fn_in_code: bcm_validate_fn_in_code,
     verify_integrity: bcm_verify_integrity,
+    ota_stage_protect: bcm_ota_stage_protect,
     pic_barrier: bcm_pic_barrier,
     step_guard_init: bcm_step_guard_init,
     step_guard_arm: bcm_step_guard_arm,

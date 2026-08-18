@@ -38,6 +38,29 @@ pub const MT_FLUXOR_GRAPH: &str = "application/vnd.nanocloud.fluxor.graph.v1+yam
 pub const MT_FLUXOR_RESOURCES: &str = "application/vnd.nanocloud.fluxor.resources.v1+json";
 /// Module manifest.toml metadata carried alongside the `.fmod` layer.
 pub const MT_FLUXOR_MODULE_META: &str = "application/vnd.nanocloud.fluxor.module.manifest.v1+toml";
+/// A GRAPH IMAGE (`fluxor build --emit=image`): FXSL header + modules
+/// blob + config blob — the packaged deployable graph, the sanctioned
+/// OTA delivery unit (on RP it is what a flash A/B graph slot holds).
+/// The header's own sha256/ABI-pin/epoch travel inside the layer; the
+/// annotations mirror target/epoch so admission can happen from the
+/// manifest alone, before the layer is fetched.
+pub const MT_FLUXOR_IMAGE: &str = "application/vnd.nanocloud.fluxor.image.v1";
+/// A complete boot image (e.g. Pi 5 `kernel_2712.img`): kernel +
+/// embedded graph, delivered to a staging host (TFTP root, SD writer),
+/// never consumed by a running device directly.
+pub const MT_FLUXOR_FIRMWARE: &str = "application/vnd.nanocloud.fluxor.firmware.v1";
+/// The non-payload prefix of a graph image (FXSL header + module-table
+/// header + entry array): the first layer of a LAYERED image manifest.
+/// The remaining layers are the raw fmods (`MT_FLUXOR_MODULE`) and the
+/// compiled config (`MT_FLUXOR_CONFIG_BIN`), each carrying an
+/// `io.fluxor.image.offset` annotation; a consumer reassembles the
+/// byte-exact image by placing blobs at their offsets and zero-filling
+/// the deterministic alignment gaps (rfc_oci_distribution.md §7.1).
+pub const MT_FLUXOR_IMAGE_SKELETON: &str = "application/vnd.nanocloud.fluxor.image.skeleton.v1";
+/// Compiled binary graph config (rfc_k8s.md §9).
+pub const MT_FLUXOR_CONFIG_BIN: &str = "application/vnd.nanocloud.fluxor.config.v1+bin";
+/// Byte offset of a layer within its reassembled graph image (decimal).
+pub const ANN_IMAGE_OFFSET: &str = "io.fluxor.image.offset";
 /// Staged source tree (canonical uncompressed tar) — the SDK /
 /// `<project>-common` trees that consumers `#[path]`/`include!` after
 /// `fluxor sync` extraction. Replaces the registry's `.crate` packages.
@@ -592,6 +615,220 @@ pub fn publish_module(store: &OciStore, m: &ModulePublish<'_>) -> Result<Descrip
         annotations,
     };
     store.tag_manifest_locked(&manifest, m.ref_name)
+}
+
+/// Everything needed to publish a device artifact (graph image or
+/// firmware image) into the store. `epoch` is the image header's epoch
+/// (image kind only); `abi_surface_hex` is the surface digest the
+/// artifact was built against, mirrored from the image header pin so a
+/// consumer can reject an incompatible artifact from the manifest
+/// alone.
+pub struct DeviceArtifactPublish<'a> {
+    /// `"image"` or `"firmware"`.
+    pub kind: &'a str,
+    pub bytes: &'a [u8],
+    pub name: &'a str,
+    pub target: &'a str,
+    pub epoch: Option<u64>,
+    pub abi_surface_hex: Option<&'a str>,
+    pub provenance: &'a str,
+    pub source_rev: Option<&'a str>,
+    pub ref_name: &'a str,
+}
+
+/// Image-header epoch annotation (`io.fluxor.image.epoch`, decimal).
+pub const ANN_IMAGE_EPOCH: &str = "io.fluxor.image.epoch";
+
+/// One layer of an exploded graph image: the blob plus where it sits in
+/// the reassembled image.
+pub struct ImageLayer<'a> {
+    pub media_type: &'a str,
+    pub bytes: &'a [u8],
+    pub offset: usize,
+    /// Human-facing layer title (module name, "skeleton", "config").
+    pub title: &'a str,
+}
+
+/// Explode a packed graph image into its layered form: skeleton (all
+/// bytes before the first fmod), one layer per fmod, one config layer.
+/// Pure function over the FXSL/FXMT formats — returns borrowed slices
+/// into `image`. The layers, placed at their offsets with zero-filled
+/// gaps, reproduce the hashed regions of `image` byte-for-byte (the
+/// modules-to-config alignment gap is outside the hashed regions).
+pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
+    const FXSL_MAGIC: u32 = 0x4C53_5846;
+    const FXMT_MAGIC: u32 = 0x544D_5846;
+    const TABLE_HEADER_SIZE: usize = 16;
+    const ENTRY_SIZE: usize = 16;
+    if image.len() < 96 || u32::from_le_bytes(image[0..4].try_into().unwrap()) != FXSL_MAGIC {
+        return Err(Error::Config("not a graph image (no FXSL header)".into()));
+    }
+    let modules_offset = u32::from_le_bytes(image[16..20].try_into().unwrap()) as usize;
+    let modules_size = u32::from_le_bytes(image[20..24].try_into().unwrap()) as usize;
+    let config_offset = u32::from_le_bytes(image[24..28].try_into().unwrap()) as usize;
+    let config_size = u32::from_le_bytes(image[28..32].try_into().unwrap()) as usize;
+    if modules_offset + modules_size > image.len() || config_offset + config_size > image.len() {
+        return Err(Error::Config("image regions out of bounds".into()));
+    }
+    let table = &image[modules_offset..modules_offset + modules_size];
+    if table.len() < TABLE_HEADER_SIZE
+        || u32::from_le_bytes(table[0..4].try_into().unwrap()) != FXMT_MAGIC
+    {
+        return Err(Error::Config("image has no FXMT module table".into()));
+    }
+    let count = table[5] as usize;
+    if TABLE_HEADER_SIZE + count * ENTRY_SIZE > table.len() {
+        return Err(Error::Config("module table entries out of bounds".into()));
+    }
+    let mut layers = Vec::with_capacity(count + 2);
+    // Entries are laid out in payload order; the skeleton ends where
+    // the first fmod begins.
+    let mut fmods: Vec<(usize, usize)> = Vec::with_capacity(count); // (table-rel offset, size)
+    for i in 0..count {
+        let e = TABLE_HEADER_SIZE + i * ENTRY_SIZE;
+        let off = u32::from_le_bytes(table[e + 4..e + 8].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(table[e + 8..e + 12].try_into().unwrap()) as usize;
+        if off + size > table.len() {
+            return Err(Error::Config(format!("fmod {i} out of table bounds")));
+        }
+        fmods.push((off, size));
+    }
+    let first_fmod = fmods.iter().map(|&(o, _)| o).min().unwrap_or(table.len());
+    layers.push(ImageLayer {
+        media_type: MT_FLUXOR_IMAGE_SKELETON,
+        bytes: &image[0..modules_offset + first_fmod],
+        offset: 0,
+        title: "skeleton",
+    });
+    for (i, &(off, size)) in fmods.iter().enumerate() {
+        let e = TABLE_HEADER_SIZE + i * ENTRY_SIZE;
+        let _name_hash = u32::from_le_bytes(table[e..e + 4].try_into().unwrap());
+        layers.push(ImageLayer {
+            media_type: MT_FLUXOR_MODULE,
+            bytes: &table[off..off + size],
+            offset: modules_offset + off,
+            title: "fmod",
+        });
+    }
+    layers.push(ImageLayer {
+        media_type: MT_FLUXOR_CONFIG_BIN,
+        bytes: &image[config_offset..config_offset + config_size],
+        offset: config_offset,
+        title: "config",
+    });
+    // Payload order for deterministic manifests and sequential fetch.
+    layers.sort_by_key(|l| l.offset);
+    Ok(layers)
+}
+
+/// Publish a LAYERED graph image: skeleton + per-fmod + config
+/// layers, offsets annotated (rfc_oci_distribution.md §7.1). Fmod
+/// layer blobs are byte-identical to individually published module
+/// artifacts, so the store (and any registry) deduplicates them.
+pub fn publish_layered_image(
+    store: &OciStore,
+    a: &DeviceArtifactPublish<'_>,
+) -> Result<Descriptor> {
+    let layers_src = explode_image(a.bytes)?;
+    let _index_lock = store.lock_index()?;
+    let (config_digest, config_size) = store.put_blob(EMPTY_CONFIG)?;
+    let mut layers = Vec::with_capacity(layers_src.len());
+    for l in &layers_src {
+        let (d, sz) = store.put_blob(l.bytes)?;
+        let mut ann = one_annotation(ANN_IMAGE_OFFSET, &l.offset.to_string());
+        ann.insert(ANN_TITLE.into(), l.title.into());
+        layers.push(Descriptor {
+            media_type: l.media_type.into(),
+            digest: d,
+            size: sz,
+            annotations: ann,
+        });
+    }
+    let mut annotations = Annotations::new();
+    annotations.insert(ANN_KIND.into(), a.kind.into());
+    annotations.insert(ANN_MODULE_NAME.into(), a.name.into());
+    annotations.insert(ANN_TARGET.into(), a.target.into());
+    annotations.insert(ANN_PROVENANCE.into(), a.provenance.into());
+    if let Some(e) = a.epoch {
+        annotations.insert(ANN_IMAGE_EPOCH.into(), e.to_string());
+    }
+    if let Some(hex) = a.abi_surface_hex {
+        annotations.insert(ANN_ABI_SURFACE.into(), hex.into());
+    }
+    if let Some(rev) = a.source_rev {
+        annotations.insert(ANN_SOURCE_REV.into(), rev.into());
+    }
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: MT_OCI_MANIFEST.into(),
+        artifact_type: Some(MT_FLUXOR_IMAGE.into()),
+        config: Descriptor {
+            media_type: MT_OCI_EMPTY.into(),
+            digest: config_digest,
+            size: config_size,
+            annotations: Annotations::new(),
+        },
+        layers,
+        annotations,
+    };
+    store.tag_manifest_locked(&manifest, a.ref_name)
+}
+
+/// Publish a device artifact (graph image / firmware image) as a
+/// one-layer OCI artifact. Unlike project artifacts these are
+/// *deployment encodings*: they exist so a device (graph image) or a
+/// staging host (firmware) can pull them from a registry — the
+/// store-side consume paths never read them.
+pub fn publish_device_artifact(
+    store: &OciStore,
+    a: &DeviceArtifactPublish<'_>,
+) -> Result<Descriptor> {
+    let media_type = match a.kind {
+        "image" => MT_FLUXOR_IMAGE,
+        "firmware" => MT_FLUXOR_FIRMWARE,
+        other => {
+            return Err(Error::Config(format!(
+                "unknown device artifact kind '{other}' (image|firmware)"
+            )))
+        }
+    };
+    let _index_lock = store.lock_index()?;
+    let (config_digest, config_size) = store.put_blob(EMPTY_CONFIG)?;
+    let (blob_digest, blob_size) = store.put_blob(a.bytes)?;
+    let layers = vec![Descriptor {
+        media_type: media_type.into(),
+        digest: blob_digest,
+        size: blob_size,
+        annotations: one_annotation(ANN_TITLE, a.name),
+    }];
+    let mut annotations = Annotations::new();
+    annotations.insert(ANN_KIND.into(), a.kind.into());
+    annotations.insert(ANN_MODULE_NAME.into(), a.name.into());
+    annotations.insert(ANN_TARGET.into(), a.target.into());
+    annotations.insert(ANN_PROVENANCE.into(), a.provenance.into());
+    if let Some(e) = a.epoch {
+        annotations.insert(ANN_IMAGE_EPOCH.into(), e.to_string());
+    }
+    if let Some(hex) = a.abi_surface_hex {
+        annotations.insert(ANN_ABI_SURFACE.into(), hex.into());
+    }
+    if let Some(rev) = a.source_rev {
+        annotations.insert(ANN_SOURCE_REV.into(), rev.into());
+    }
+    let manifest = ImageManifest {
+        schema_version: 2,
+        media_type: MT_OCI_MANIFEST.into(),
+        artifact_type: Some(media_type.into()),
+        config: Descriptor {
+            media_type: MT_OCI_EMPTY.into(),
+            digest: config_digest,
+            size: config_size,
+            annotations: Annotations::new(),
+        },
+        layers,
+        annotations,
+    };
+    store.tag_manifest_locked(&manifest, a.ref_name)
 }
 
 /// Everything needed to publish a workload bundle into the store.
@@ -1359,6 +1596,72 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal synthetic graph image (FXSL header + FXMT table
+    /// with two fmods + config), explode it, and reassemble from the
+    /// layers with zero-filled gaps — the hashed regions must be
+    /// byte-identical, which is exactly the device-side contract.
+    #[test]
+    fn explode_image_roundtrips_byte_exact() {
+        const HDR: usize = 256;
+        let modules_offset = 4096usize;
+        // FXMT: header 16 + 2 entries à 16, fmods page-aligned so code
+        // (offset + 72) is 4096-aligned, mirroring build_module_table.
+        let fmod_a = vec![0xAAu8; 300];
+        let fmod_b = vec![0xBBu8; 150];
+        let a_off = 4096 - 72; // table-relative; code at 4096
+        let b_off = 2 * 4096 - 72;
+        let table_len = b_off + fmod_b.len();
+        let mut table = vec![0u8; table_len];
+        table[0..4].copy_from_slice(&0x544D_5846u32.to_le_bytes());
+        table[4] = 1; // version
+        table[5] = 2; // count
+        for (i, (off, data)) in [(a_off, &fmod_a), (b_off, &fmod_b)].iter().enumerate() {
+            let e = 16 + i * 16;
+            table[e..e + 4].copy_from_slice(&(0x1111u32 * (i as u32 + 1)).to_le_bytes());
+            table[e + 4..e + 8].copy_from_slice(&(*off as u32).to_le_bytes());
+            table[e + 8..e + 12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        }
+        table[a_off..a_off + fmod_a.len()].copy_from_slice(&fmod_a);
+        table[b_off..b_off + fmod_b.len()].copy_from_slice(&fmod_b);
+        let config = vec![0xCCu8; 90];
+        let config_offset = (modules_offset + table_len).div_ceil(256) * 256;
+        let mut image = vec![0xFFu8; config_offset + config.len()];
+        image[0..4].copy_from_slice(&0x4C53_5846u32.to_le_bytes());
+        image[4] = 1;
+        image[16..20].copy_from_slice(&(modules_offset as u32).to_le_bytes());
+        image[20..24].copy_from_slice(&(table_len as u32).to_le_bytes());
+        image[24..28].copy_from_slice(&(config_offset as u32).to_le_bytes());
+        image[28..32].copy_from_slice(&(config.len() as u32).to_le_bytes());
+        image[modules_offset..modules_offset + table_len].copy_from_slice(&table);
+        image[config_offset..config_offset + config.len()].copy_from_slice(&config);
+        let _ = HDR;
+
+        let layers = explode_image(&image).unwrap();
+        assert_eq!(layers.len(), 4); // skeleton + 2 fmods + config
+        assert_eq!(layers[0].media_type, MT_FLUXOR_IMAGE_SKELETON);
+        assert_eq!(layers[0].offset, 0);
+        assert_eq!(layers[3].media_type, MT_FLUXOR_CONFIG_BIN);
+
+        // Reassemble: place layers at offsets, zero-fill gaps.
+        let mut out = vec![0u8; image.len()];
+        for l in &layers {
+            out[l.offset..l.offset + l.bytes.len()].copy_from_slice(l.bytes);
+        }
+        // Hashed regions must match byte-for-byte (the modules→config
+        // alignment gap is outside them and may differ: 0xFF vs 0).
+        assert_eq!(
+            out[modules_offset..modules_offset + table_len],
+            image[modules_offset..modules_offset + table_len]
+        );
+        assert_eq!(
+            out[config_offset..config_offset + config.len()],
+            image[config_offset..config_offset + config.len()]
+        );
+        // Fmod layer blobs are the raw fmod bytes (store-dedup contract).
+        assert_eq!(layers[1].bytes, &fmod_a[..]);
+        assert_eq!(layers[2].bytes, &fmod_b[..]);
+    }
 
     fn temp_store() -> (tempfile::TempDir, OciStore) {
         let dir = tempfile::tempdir().expect("tempdir");

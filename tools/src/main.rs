@@ -359,6 +359,41 @@ fn cmd_publish(
             published,
         );
     }
+    if let Some(PublishAction::Image {
+        ref file,
+        ref packed,
+        ref name,
+        ref target,
+        ref tag,
+        ref store,
+    }) = action
+    {
+        return store_cli::cmd_device_artifact_publish(
+            if *packed { "image-packed" } else { "image" },
+            file,
+            name.as_deref(),
+            target,
+            tag.as_deref(),
+            store.as_deref(),
+        );
+    }
+    if let Some(PublishAction::Firmware {
+        ref file,
+        ref name,
+        ref target,
+        ref tag,
+        ref store,
+    }) = action
+    {
+        return store_cli::cmd_device_artifact_publish(
+            "firmware",
+            file,
+            name.as_deref(),
+            target,
+            tag.as_deref(),
+            store.as_deref(),
+        );
+    }
     let (kinds, sub_root): (Vec<&str>, Option<PathBuf>) = match action {
         // abi/sdk/common all name the source tier — the store publisher
         // sweeps every source artifact the project owns.
@@ -369,8 +404,14 @@ fn cmd_publish(
         ) => (vec!["source"], r),
         Some(PublishAction::Fmod { project_root: r }) => (vec!["fmod"], r),
         Some(PublishAction::Runtime { project_root: r }) => (vec!["runtime"], r),
-        // Handled by the early return above.
-        Some(PublishAction::Bundle { .. }) => unreachable!("publish bundle handled above"),
+        // Handled by the early returns above.
+        Some(
+            PublishAction::Bundle { .. }
+            | PublishAction::Image { .. }
+            | PublishAction::Firmware { .. },
+        ) => {
+            unreachable!("publish bundle/image/firmware handled above")
+        }
         None => {
             let mut kinds = Vec::new();
             for o in only {
@@ -454,6 +495,6 @@ fn cmd_workspace_publish(dry_run: bool) -> Result<()> {
 // Flat `include!` scope (repo SDK-file convention) — `mod` decls above and
 // `fn main()` stay in the binary root; these files compile as if inlined here.
 include!("cli/args.rs"); // Cli / Commands / *Action clap definitions
-include!("cli/commands_a.rs"); // decode/info/generate/combine/slot/pack
+include!("cli/commands_a.rs"); // decode/info/generate/combine/image/pack
 include!("cli/commands_b.rs"); // validate/target/inspect/diff/mktable
 include!("cli/commands_c.rs"); // build/run/flash/sign/lint/modules/ci

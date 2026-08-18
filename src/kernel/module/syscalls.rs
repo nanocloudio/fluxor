@@ -1499,6 +1499,32 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             unsafe { scheduler::live::owner_resume_encoded(arg, arg_len) }
         }
 
+        // ── OTA RAM staging (Pi 5 / hosted Linux; ENOSYS elsewhere) ──
+        #[cfg(any(feature = "chip-bcm2712", feature = "host-linux"))]
+        reconfigure::OTA_STAGE_WRITE => {
+            // arg = [offset: u32 LE][payload bytes]
+            if arg.is_null() || arg_len < 4 {
+                return E_INVAL;
+            }
+            // SAFETY: 4-byte offset prefix bounds-checked above; the
+            // payload slice covers the caller's buffer for this call.
+            let (offset, data) = unsafe {
+                let off =
+                    u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+                (off, core::slice::from_raw_parts(arg.add(4), arg_len - 4))
+            };
+            crate::kernel::module::ota_stage::stage_write(offset, data)
+        }
+        #[cfg(any(feature = "chip-bcm2712", feature = "host-linux"))]
+        reconfigure::OTA_STAGE_CTRL => {
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
+            // SAFETY: 1-byte command bounds-checked above.
+            let cmd = unsafe { *arg };
+            crate::kernel::module::ota_stage::stage_ctrl(cmd)
+        }
+
         _ => {
             // Delegate to platform extension for hardware-specific opcodes
             if let Some(ext) = SYSTEM_EXTENSION {

@@ -241,17 +241,20 @@ pub const INITIAL_RCV_WND: u16 = 2048;
 /// Upper bound on the advertised receive window. Bounds how many bytes
 /// the peer may have in flight to us.
 ///
-/// **aarch64** — 32 KiB. Tracks BDP at 1 Gb/s × ~250 µs RTT (intra-LAN
-/// to a DUT). Stays under u16::MAX so we don't need TCP window scaling
-/// (RFC 1323), and is comfortably above the existing 8 KiB
-/// `CHANNEL_BUFFER_SIZE` so `update_rcv_wnd`'s self-throttle still
-/// keeps in-flight bounded by consumer-drain rate.
+/// **aarch64** — 4 KiB, held below the smallest consumer ring (8 KiB)
+/// so a compliant peer can never have more in flight than a single
+/// delivery pass absorbs: the ring-full/zero-window recovery path
+/// corrupts bulk inbound streams on bcm2712 (open defect,
+/// rfc_oci_distribution.md §8), and a window under one ring never
+/// enters it. Bulk-download throughput is bounded by the 1 ms tick
+/// either way; the `update_rcv_wnd` self-throttle still closes the
+/// window under consumer backpressure.
 ///
 /// **rp2350 / rp2040 / wasm32** — 8 KiB. Original embedded budget;
 /// bumping further would inflate per-`TcpConn` reorder bookkeeping
 /// past the 16 KiB stack budget.
 #[cfg(target_arch = "aarch64")]
-pub const MAX_RCV_WND: u16 = 32768;
+pub const MAX_RCV_WND: u16 = 4096;
 #[cfg(not(target_arch = "aarch64"))]
 pub const MAX_RCV_WND: u16 = 8192;
 

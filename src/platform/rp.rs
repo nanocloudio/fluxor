@@ -587,6 +587,12 @@ fn rp_verify_integrity(computed: &[u8], expected: &[u8]) -> bool {
     computed == expected
 }
 
+/// RP has no RAM OTA staging surface — OTA delivery is the flash
+/// graph-slot A/B path (`graph_slot` + `ota_ingest`).
+fn rp_ota_stage_protect(_base: *mut u8, _len: usize, _executable: bool) -> bool {
+    false
+}
+
 fn rp_pic_barrier() {
     cortex_m::asm::dsb();
     cortex_m::asm::isb();
@@ -697,6 +703,7 @@ static RP_HAL_OPS: HalOps = HalOps {
     validate_module_base: rp_validate_module_base,
     validate_fn_in_code: rp_validate_fn_in_code,
     verify_integrity: rp_verify_integrity,
+    ota_stage_protect: rp_ota_stage_protect,
     pic_barrier: rp_pic_barrier,
     step_guard_init: step_guard_backend::rp_step_guard_init,
     step_guard_arm: step_guard_backend::rp_step_guard_arm,

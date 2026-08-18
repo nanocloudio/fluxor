@@ -20,6 +20,7 @@ use fluxor_tools::oci_store::{
     OciStore, ANN_KIND, ANN_PROVENANCE, ANN_REF_NAME, ANN_SOURCE_REV, ANN_TARGET, PROVENANCE_LOCAL,
     PROVENANCE_PUBLISHED,
 };
+use fluxor_tools::store_remote;
 use fluxor_tools::store_resolve;
 
 // ── Args ──────────────────────────────────────────────────────────────
@@ -61,6 +62,41 @@ pub enum StoreCommand {
         name: String,
         #[arg(long)]
         store: Option<PathBuf>,
+    },
+    /// Push a local artifact (and every blob it references) to a remote
+    /// OCI registry. The ONE network-write verb: tags stay mutable on
+    /// the wire, digests are the identity, and blobs the registry
+    /// already holds are skipped.
+    Push {
+        /// Local store reference (tag, digest, or unambiguous prefix).
+        reference: String,
+        /// Remote reference:
+        /// `[https://]host[:port]/<repo>[:tag]` (e.g.
+        /// `registry.nanocloud.io/fluxor/lattice-cdc:latest`).
+        remote: String,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Extra CA bundle (PEM) trusted for this registry beyond the
+        /// webpki roots (e.g. the nanocloud deployment CA).
+        #[arg(long)]
+        ca: Option<PathBuf>,
+    },
+    /// Pull a remote artifact into the local store, digest-verifying
+    /// every blob. The ONE network-read verb; every consume path stays
+    /// offline against the local store.
+    Pull {
+        /// Remote reference:
+        /// `[https://]host[:port]/<repo>[:tag|@sha256:...]`.
+        remote: String,
+        /// Local tag to apply (default: `<repo>:<tag>` from the remote).
+        #[arg(long = "as")]
+        local_as: Option<String>,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Extra CA bundle (PEM) trusted for this registry beyond the
+        /// webpki roots (e.g. the nanocloud deployment CA).
+        #[arg(long)]
+        ca: Option<PathBuf>,
     },
     /// Pin an artifact into `fluxor.lock` (`[[artifact]]`) so
     /// combine/packaging resolve its `.fmod` by digest from the store
@@ -136,6 +172,80 @@ pub fn cmd_bundle_publish(
     Ok(())
 }
 
+// ── fluxor publish image|firmware ─────────────────────────────────────
+
+/// Publish a device artifact (graph image / firmware image). For a
+/// graph image the FXSL header supplies epoch + ABI pin, mirrored into
+/// annotations so a consumer can admit or reject from the manifest
+/// alone.
+pub fn cmd_device_artifact_publish(
+    kind: &str,
+    file: &Path,
+    name: Option<&str>,
+    target: &str,
+    tag: Option<&str>,
+    store_dir: Option<&Path>,
+) -> Result<()> {
+    let bytes = fs::read(file).map_err(|e| Error::Config(format!("{}: {e}", file.display())))?;
+    let name = name
+        .map(str::to_string)
+        .or_else(|| {
+            file.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .ok_or_else(|| Error::Config("cannot derive a name from the file path".into()))?;
+
+    // Graph images carry their own truth in the FXSL header.
+    const FXSL_MAGIC: u32 = 0x4C53_5846;
+    let image_kind = kind.starts_with("image");
+    let (epoch, abi_hex) = if image_kind {
+        if bytes.len() < 96
+            || u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != FXSL_MAGIC
+        {
+            return Err(Error::Config(format!(
+                "{} is not a graph image (missing FXSL header) — build it with `fluxor build <config> --emit=image`",
+                file.display()
+            )));
+        }
+        let epoch = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let mut hex = String::with_capacity(64);
+        for b in &bytes[64..96] {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        (Some(epoch), Some(hex))
+    } else {
+        (None, None)
+    };
+
+    let store = open_store(store_dir)?;
+    let ref_name = tag
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{name}:latest"));
+    let source_rev = git_source_rev(&resolve_project_root(None));
+    let publish = oci_store::DeviceArtifactPublish {
+        kind: if image_kind { "image" } else { kind },
+        bytes: &bytes,
+        name: &name,
+        target,
+        epoch,
+        abi_surface_hex: abi_hex.as_deref(),
+        provenance: PROVENANCE_LOCAL,
+        source_rev: source_rev.as_deref(),
+        ref_name: &ref_name,
+    };
+    // Layered (exploded) is the default graph-image form;
+    // `image-packed` and firmware stay single-blob.
+    let desc = if kind == "image" {
+        oci_store::publish_layered_image(&store, &publish)
+    } else {
+        oci_store::publish_device_artifact(&store, &publish)
+    }
+    .map_err(|e| Error::Config(e.to_string()))?;
+    println!("{ref_name} -> {}", desc.digest);
+    Ok(())
+}
+
 // ── fluxor store ls|inspect|rm ────────────────────────────────────────
 
 pub fn dispatch_store(args: StoreArgs) -> Result<()> {
@@ -147,12 +257,72 @@ pub fn dispatch_store(args: StoreArgs) -> Result<()> {
         } => cmd_store_ls(store.as_deref(), provenance.as_deref(), json),
         StoreCommand::Rm { reference, store } => cmd_store_rm(&reference, store.as_deref()),
         StoreCommand::Snapshot { name, store } => cmd_store_snapshot(&name, store.as_deref()),
+        StoreCommand::Push {
+            reference,
+            remote,
+            store,
+            ca,
+        } => cmd_store_push(&reference, &remote, store.as_deref(), ca.as_deref()),
+        StoreCommand::Pull {
+            remote,
+            local_as,
+            store,
+            ca,
+        } => cmd_store_pull(
+            &remote,
+            local_as.as_deref(),
+            store.as_deref(),
+            ca.as_deref(),
+        ),
         StoreCommand::Pin {
             reference,
             store,
             project_root,
         } => cmd_store_pin(&reference, store.as_deref(), project_root.as_deref()),
     }
+}
+
+fn cmd_store_push(
+    reference: &str,
+    remote: &str,
+    store_dir: Option<&Path>,
+    ca: Option<&Path>,
+) -> Result<()> {
+    let store = open_store(store_dir)?;
+    let remote =
+        store_remote::RemoteRef::parse(remote).map_err(|e| Error::Config(e.to_string()))?;
+    let client =
+        store_remote::RemoteClient::new(&remote, ca).map_err(|e| Error::Config(e.to_string()))?;
+    let desc = store_remote::push(&store, reference, &remote, &client)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    println!(
+        "\x1b[1;32mPushed\x1b[0m {reference} → {}/{}:{} ({})",
+        remote.host, remote.repo, remote.reference, desc.digest
+    );
+    Ok(())
+}
+
+fn cmd_store_pull(
+    remote: &str,
+    local_as: Option<&str>,
+    store_dir: Option<&Path>,
+    ca: Option<&Path>,
+) -> Result<()> {
+    let store = open_store(store_dir)?;
+    let remote =
+        store_remote::RemoteRef::parse(remote).map_err(|e| Error::Config(e.to_string()))?;
+    let client =
+        store_remote::RemoteClient::new(&remote, ca).map_err(|e| Error::Config(e.to_string()))?;
+    let desc = store_remote::pull(&store, &remote, &client, local_as)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    let tag = local_as
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}:{}", remote.repo, remote.reference));
+    println!(
+        "\x1b[1;32mPulled\x1b[0m {}/{}:{} → {tag} ({})",
+        remote.host, remote.repo, remote.reference, desc.digest
+    );
+    Ok(())
 }
 
 fn cmd_store_ls(store_dir: Option<&Path>, provenance: Option<&str>, json: bool) -> Result<()> {

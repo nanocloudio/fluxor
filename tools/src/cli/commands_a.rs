@@ -1025,27 +1025,34 @@ fn build_packaged_blobs(
     Ok((modules_data, config_data))
 }
 
-/// Emit an OTA slot image: 256-byte header + modules table + static config,
+/// Emit a graph image: 256-byte header + modules table + static config,
 /// padded to the slot size. Layout mirrors `abi::graph_slot`.
 ///
-/// The header records the epoch, the in-slot offsets and sizes of the
+/// The header records the epoch, the in-image offsets and sizes of the
 /// modules and config regions, and a SHA-256 over their concatenation.
 /// `graph_slot::ACTIVATE` recomputes the hash from flash and rejects
 /// mismatches.
-fn cmd_slot_image(
+fn cmd_graph_image(
     config_path: &PathBuf,
     output_path: &PathBuf,
     target_override: Option<&str>,
     epoch: u64,
+    modules_dir_override: Option<&std::path::Path>,
     verbose: bool,
 ) -> Result<()> {
-    // Slot layout constants mirror modules/sdk/abi.rs :: graph_slot.
-    const SLOT_SIZE: usize = 0x0008_0000;
+    // Image layout constants mirror modules/sdk/abi.rs :: graph_slot
+    // (the RP flash A/B slot holds exactly this graph-image format).
     const HEADER_SIZE: usize = 256;
     const MODULES_ALIGN: usize = 4096;
     const SECTION_ALIGN: usize = 256;
     const MAGIC: u32 = 0x4C53_5846; // "FXSL"
     const VERSION: u8 = 1;
+    /// RP flash A/B aperture (`GRAPH_SLOT_SIZE`) — the image fills it.
+    const FLASH_SLOT_SIZE: usize = 0x0008_0000;
+    /// RAM-staged image ceiling for targets without a flash aperture
+    /// (Pi 5 OTA staging region; mirrors the kernel's
+    /// `MAX_MODULES_BLOB_SIZE` reasoning).
+    const RAM_IMAGE_SIZE: usize = 8 * 1024 * 1024;
 
     // Parse config (reusing the same path as cmd_combine).
     let content = substitute_env_vars(&std::fs::read_to_string(config_path)?)?;
@@ -1089,7 +1096,8 @@ fn cmd_slot_image(
     }
 
     let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
-    let modules_dir = std::path::Path::new(&modules_dir_path);
+    let modules_dir =
+        modules_dir_override.unwrap_or_else(|| std::path::Path::new(&modules_dir_path));
     let (modules_data, config_data) =
         build_packaged_blobs(
             &config,
@@ -1100,16 +1108,28 @@ fn cmd_slot_image(
             &crate::project::root_for_config(config_path),
         )?;
     let modules_data = modules_data
-        .ok_or_else(|| error::Error::Config("Slot image requires at least one module".into()))?;
+        .ok_or_else(|| error::Error::Config("A graph image requires at least one module".into()))?;
 
-    // Lay out the slot: header | pad → 4KB | modules | pad → 256B | config.
+    // Image geometry is per-target: RP targets fill their fixed flash
+    // A/B slot aperture (padded to size, 0xFF like erased flash);
+    // everything else is a RAM-staged image — same header, bounded by
+    // the staging ceiling, emitted unpadded so the wire artifact is
+    // only as big as its payload.
+    let flash_slot = matches!(target_desc.id.as_str(), "rp2040" | "rp2350");
+    let image_size = if flash_slot {
+        FLASH_SLOT_SIZE
+    } else {
+        RAM_IMAGE_SIZE
+    };
+
+    // Lay out the image: header | pad → 4KB | modules | pad → 256B | config.
     let modules_offset = HEADER_SIZE.div_ceil(MODULES_ALIGN) * MODULES_ALIGN;
     let modules_end = modules_offset + modules_data.len();
     let config_offset = modules_end.div_ceil(SECTION_ALIGN) * SECTION_ALIGN;
     let config_end = config_offset + config_data.len();
-    if config_end > SLOT_SIZE {
+    if config_end > image_size {
         return Err(error::Error::Config(format!(
-            "Slot image ({config_end} bytes) exceeds slot size ({SLOT_SIZE} bytes). Reduce modules/config."
+            "Graph image ({config_end} bytes) exceeds the size ceiling ({image_size} bytes). Reduce modules/config."
         )));
     }
 
@@ -1122,8 +1142,9 @@ fn cmd_slot_image(
         sha2::Sha256::digest(&payload)
     };
 
-    // Compose the final slot image.
-    let mut out = vec![0xFFu8; SLOT_SIZE];
+    // Compose the final image (flash builds pad to the slot aperture).
+    let emit_len = if flash_slot { image_size } else { config_end };
+    let mut out = vec![0xFFu8; emit_len];
     // Header.
     out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     out[4] = VERSION;
@@ -1134,11 +1155,11 @@ fn cmd_slot_image(
     out[28..32].copy_from_slice(&(config_data.len() as u32).to_le_bytes());
     out[32..64].copy_from_slice(&digest);
     // ABI-surface pin (header 64..96): the wire-surface digest of the
-    // substrate this slot was built against (`hash::abi_surface_digest`).
-    // The kernel's slot selector may ignore it today; a selector that
-    // enforces it accepts the slot only on equality with its own surface —
-    // a graph built for an incompatible kernel fails closed to the other
-    // slot instead of loading modules with stale hardcoded wire values.
+    // substrate this image was built against (`hash::abi_surface_digest`).
+    // The RP boot slot selector and the OTA staging commit both enforce
+    // it: an image built for an incompatible kernel fails closed (to the
+    // other flash slot, or with -EACCES at commit) instead of loading
+    // modules with stale hardcoded wire values.
     out[64..96].copy_from_slice(&hash::abi_surface_digest());
     // Payload.
     out[modules_offset..modules_offset + modules_data.len()].copy_from_slice(&modules_data);
@@ -1147,7 +1168,7 @@ fn cmd_slot_image(
     std::fs::write(output_path, &out)?;
     if verbose {
         eprintln!(
-            "slot image: modules_off=0x{:x} ({} bytes), config_off=0x{:x} ({} bytes), epoch={}",
+            "graph image: modules_off=0x{:x} ({} bytes), config_off=0x{:x} ({} bytes), epoch={}",
             modules_offset,
             modules_data.len(),
             config_offset,
@@ -1160,7 +1181,7 @@ fn cmd_slot_image(
         output_path.display(),
         modules_data.len() / 1024,
         config_data.len() / 1024,
-        SLOT_SIZE / 1024,
+        emit_len / 1024,
         epoch,
     );
     Ok(())

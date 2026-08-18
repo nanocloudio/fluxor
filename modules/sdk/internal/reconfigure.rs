@@ -94,3 +94,26 @@ pub const OWNER_PAUSE: u32 = 0x0C49;
 /// handle=-1, arg = `[slot:u16 LE, generation:u32 LE]`. Returns 0 on success,
 /// negative `PauseError` otherwise.
 pub const OWNER_RESUME: u32 = 0x0C4A;
+
+// ── OTA RAM staging (Pi 5 / hosted Linux) ────────────────────────────────────
+// The RAM-staged counterpart of the RP flash graph-slot pair: a module
+// streams a GRAPH IMAGE (`fluxor build --emit=image`) into the kernel's
+// inactive staging buffer, then commits it. Commit validates header,
+// payload SHA-256, ABI-surface pin, and epoch monotonicity, then swaps
+// loader+config to the staged blobs and fires the rebuild bridge.
+// Gated platform_raw via the dev_system catch-all; ENOSYS on targets
+// without a RAM staging surface.
+
+/// Stream graph-image bytes into the staging buffer.
+/// handle=-1, arg = `[offset: u32 LE][payload bytes]`. `offset == 0`
+/// begins a fresh stage; writes advance monotonically — an offset
+/// below the staged length is -EINVAL, a forward gap is zero-filled
+/// (layered-pull alignment padding). Returns 0 / -EINVAL / -ENOSPC
+/// (over capacity) / -ENOSYS (no staging surface).
+pub const OTA_STAGE_WRITE: u32 = 0x0C20;
+/// Control the staged image. handle=-1, arg = `[cmd: u8]`:
+/// 0 COMMIT (validate + activate; 0 / -EINVAL bad header, sha, or
+/// populate failure / -EACCES ABI-pin mismatch / -EBUSY epoch not
+/// newer than live / -ERROR protect failure), 1 ABORT (discard staged
+/// bytes), 2 EPOCH (returns the live epoch, saturated to i32).
+pub const OTA_STAGE_CTRL: u32 = 0x0C21;

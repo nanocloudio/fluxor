@@ -57,6 +57,7 @@ pub fn cmd_up(
 
     let fluxor = resolve_fluxor_bin(fluxor_bin)?;
     let extra = parse_vars(extra_vars)?;
+    let project_root = crate::project::root();
 
     let scratch = tempdir_unique("fluxor-up")?;
     eprintln!("scratch:  {}", scratch.display());
@@ -116,9 +117,38 @@ pub fn cmd_up(
             ))
         })?;
 
-        let child = Command::new(&fluxor)
+        // Each replica gets its own working directory. Modules that
+        // persist relative to the cwd (a durability WAL writing
+        // `wal/`, raft metadata) would otherwise interleave one
+        // on-disk state across all replicas — a silent corruption of
+        // exactly the isolation a multi-replica bring-up exists to
+        // exercise. Project discovery is pinned via
+        // $FLUXOR_PROJECT_ROOT since the node cwd is outside the tree.
+        let node_dir = scratch.join(format!("n{i}"));
+        std::fs::create_dir_all(&node_dir).map_err(|e| {
+            Error::Config(format!(
+                "creating replica workdir {}: {}",
+                node_dir.display(),
+                e
+            ))
+        })?;
+
+        // The launcher fexecve's a digest-named store blob, so the
+        // resolved binary path may be `blobs/sha256/<hex>` — spawning
+        // it bare puts the hex digest in the child's argv[0] and the
+        // busybox applet dispatch fires instead of the subcommand
+        // parse. Pin argv[0] (same fix as ci.rs::self_invoke).
+        let mut cmd = Command::new(&fluxor);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.arg0("fluxor");
+        }
+        let child = cmd
             .arg("run")
             .arg(&yaml_path)
+            .current_dir(&node_dir)
+            .env(crate::project::ENV_PROJECT_ROOT, &project_root)
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
             .spawn()
@@ -290,7 +320,11 @@ fn resolve_fluxor_bin(override_path: Option<&Path>) -> Result<PathBuf> {
                 p.display()
             )));
         }
-        return Ok(p.to_path_buf());
+        // Absolutise: replicas spawn with a per-node cwd, and a
+        // relative program path containing a slash is resolved in the
+        // child AFTER the chdir — a relative override would fail to
+        // spawn against the replica dir.
+        return Ok(p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
     }
     // Default: assume we're called as `fluxor run --replicas`, so re-invoke
     // `fluxor run` via the same binary on $PATH. Falling back to
