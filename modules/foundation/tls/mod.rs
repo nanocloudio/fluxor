@@ -318,8 +318,9 @@ struct TlsSession {
     /// `module_step` walks active sessions and retries the write
     /// each tick until either the channel accepts the envelope or
     /// the session is released. Sized for the MSG_PEER_IDENTITY
-    /// envelope: 3 B header + 4 B fixed + 32 B SVID = 39 B max.
-    pending_peer_identity: [u8; 39],
+    /// envelope: 3 B header + 5 B fixed (u16 conn_id + replica +
+    /// verified + svid_len) + 32 B SVID = PEER_IDENTITY_MAX_TOTAL.
+    pending_peer_identity: [u8; PEER_IDENTITY_MAX_TOTAL],
     pending_peer_identity_len: u8,
 
     /// Observability: monotonic-micros start of this session's `tls.handshake`
@@ -373,7 +374,7 @@ impl TlsSession {
             retx_seq_anchored: false,
             pending_ccs: false,
             pending_ccs_client: false,
-            pending_peer_identity: [0; 39],
+            pending_peer_identity: [0; PEER_IDENTITY_MAX_TOTAL],
             pending_peer_identity_len: 0,
             span_start_us: 0,
             trace_ctx_trace: [0; 16],
@@ -496,7 +497,7 @@ struct PeerSession {
     /// distinguish DTLS vs TCP peers by the peer_identity
     /// channel routing alone, so the slot index is a stable per-
     /// transport identifier.
-    pending_peer_identity: [u8; 39],
+    pending_peer_identity: [u8; PEER_IDENTITY_MAX_TOTAL],
     pending_peer_identity_len: u8,
 }
 
@@ -513,7 +514,7 @@ impl PeerSession {
             last_flight_record_lens: [0; MAX_FLIGHT_RECORDS],
             last_flight_record_count: 0,
             handshake_start_step: 0,
-            pending_peer_identity: [0; 39],
+            pending_peer_identity: [0; PEER_IDENTITY_MAX_TOTAL],
             pending_peer_identity_len: 0,
         }
     }

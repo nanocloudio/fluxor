@@ -45,6 +45,21 @@ use abi::SyscallTable;
 /// Block size (always 512 for SD/FAT32)
 const BLOCK_SIZE: usize = 512;
 
+/// Sectors held by an FD's write-back scratch. A full run is one submit, so
+/// the ceiling is the block contract's per-request maximum
+/// ([`MAX_WRITE_NLB`] — one 4 KiB DMA page of LBAs).
+///
+/// Split by target: the coalescing win is a multi-sector-device concern, and
+/// the scratch is per-FD (`MAX_OPEN_FILES` of them) inside a state arena every
+/// module shares — 256 KiB of it on rp2350, where 8 sectors would cost 28 KiB
+/// more than 1. Embedded keeps a single sector, which degenerates to a plain
+/// write-back cache: `scratch_accepts` can never extend a run, so `span` stays
+/// 1 and every path behaves as the unbatched one.
+#[cfg(target_arch = "aarch64")]
+const SCRATCH_SECTORS: usize = 8;
+#[cfg(not(target_arch = "aarch64"))]
+const SCRATCH_SECTORS: usize = 1;
+
 /// Max sectors per WRITE packet. Matches `nvme::MAX_NLB` (one 4 KB PRP1
 /// page of LBAs). The batcher folds up to this many contiguous data
 /// sectors into a single request so the nvme driver can issue one Write
@@ -52,6 +67,10 @@ const BLOCK_SIZE: usize = 512;
 /// drained downstream in 512 B chunks (see `drain_packet`) so it fits
 /// any reasonable channel capacity without requiring hints.
 const MAX_WRITE_NLB: u16 = 8;
+
+// A scratch run is flushed in one submit, so it can never exceed what one
+// request carries. Both track `nvme::MAX_NLB`.
+const _: () = assert!(SCRATCH_SECTORS <= MAX_WRITE_NLB as usize);
 
 /// Maximum files to enumerate
 const MAX_FILES: usize = 128;
@@ -437,8 +456,10 @@ struct OpenFile {
     scratch_avail: u16,
     /// Read offset within `scratch_block` (= 512 - scratch_avail).
     scratch_pos: u16,
-    /// Most recently fetched 512-byte sector for this FD.
-    scratch_block: [u8; BLOCK_SIZE],
+    /// Write-back / read scratch for this FD. Holds `scratch_span`
+    /// contiguous sectors starting at `scratch_lba`; the read path uses only
+    /// the first sector.
+    scratch_block: [u8; BLOCK_SIZE * SCRATCH_SECTORS],
 
     // ── FS_CONTRACT write path (FS_OPEN_CREATE / FS_WRITE / FS_FSYNC) ──
     /// 1 = opened for append-writing via FS_OPEN_CREATE. Write ops
@@ -487,10 +508,10 @@ struct OpenFile {
     dir_lba: u32,
     dir_off: u16,
     _pad_of: u16,
-    /// Absolute LBA currently mirrored in `scratch_block` (single-sector
-    /// write-back cache), or 0 for none — LBA 0 is the MBR, never a file
-    /// data sector. When a write or RMW targets this same sector, the
-    /// device read is skipped because `scratch_block` already mirrors it.
+    /// Absolute LBA of the FIRST sector mirrored in `scratch_block`, or 0
+    /// for none — LBA 0 is the MBR, never a file data sector. When a write
+    /// or RMW targets a sector inside the mirrored run, the device read is
+    /// skipped because `scratch_block` already mirrors it.
     /// Eliminates the read-after-write of a freshly-allocated cluster (a
     /// cold first-touch read can blow the cooperative step guard) on the
     /// append pattern where a length prefix and the payload share a sector,
@@ -498,14 +519,22 @@ struct OpenFile {
     scratch_lba: u32,
     /// 1 when `scratch_block` holds appended data NOT yet written to the
     /// device at `scratch_lba`. Sequential small appends accumulate in
-    /// `scratch_block` and the sector is written once — on a sector change
-    /// (the old sector is complete), at FS_FSYNC, or at FS_CLOSE. This
+    /// `scratch_block` and the run is written once — when a write leaves it,
+    /// at FS_FSYNC, or at FS_CLOSE. This
     /// collapses the per-append synchronous sector rewrite (a ~88-byte WAL
     /// entry would otherwise re-write its 512-byte sector ~6×) into one write
     /// per filled sector. Safe for the durability contract: un-fsynced bytes
     /// are not durable, so deferring their device write loses nothing a crash
     /// wouldn't already lose — FS_FSYNC flushes the pending sector first.
     scratch_dirty: u8,
+    /// Sectors of `scratch_block` that mirror the device, starting at
+    /// `scratch_lba`. 0 = nothing mirrored. Never exceeds `SCRATCH_SECTORS`.
+    scratch_span: u8,
+    /// Cluster the mirrored run belongs to, or 0 when the run came from the
+    /// read path. A run only ever extends within one cluster, whose sectors
+    /// are physically contiguous, so `scratch_lba .. +scratch_span` is a
+    /// single device range and flushes in one submit.
+    scratch_cluster: u32,
     /// 1 when this FD uses the async durable-write path (`WRITE_ASYNC` +
     /// `FSYNC_SUBMIT`/`FSYNC_POLL`): deferred-sector flushes are submitted
     /// to the block source's async ring instead of spin-polled, and the
@@ -528,7 +557,7 @@ impl OpenFile {
             start_cluster: 0,
             scratch_avail: 0,
             scratch_pos: 0,
-            scratch_block: [0u8; BLOCK_SIZE],
+            scratch_block: [0u8; BLOCK_SIZE * SCRATCH_SECTORS],
             writable: 0,
             dirty: 0,
             durable: 0,
@@ -544,6 +573,8 @@ impl OpenFile {
             _pad_of: 0,
             scratch_lba: 0,
             scratch_dirty: 0,
+            scratch_span: 0,
+            scratch_cluster: 0,
             async_mode: 0,
         }
     }
@@ -1641,6 +1672,10 @@ unsafe fn fs_op_open(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 
     of.sector_in_cluster = 0;
     of.scratch_avail = 0;
     of.scratch_pos = 0;
+    of.scratch_lba = 0;
+    of.scratch_span = 0;
+    of.scratch_cluster = 0;
+    of.scratch_dirty = 0;
     of.writable = 0;
     of.dirty = 0;
     of.dir_lba = 0;
@@ -1704,8 +1739,12 @@ unsafe fn fs_op_read(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usi
             of2.scratch_avail = bps as u16;
             of2.scratch_pos = 0;
             // Keep the write-back cache tag coherent: scratch_block now holds
-            // `sector`, not whatever a prior write left.
+            // `sector` alone, not whatever a prior write run left. A
+            // read-established mirror carries no cluster, so a later write
+            // starts a fresh run rather than extending across it.
             of2.scratch_lba = sector;
+            of2.scratch_span = 1;
+            of2.scratch_cluster = 0;
         }
         let of3 = &mut s.open_files[slot_idx];
         let avail = of3.scratch_avail as u32;
@@ -1860,8 +1899,11 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         if rc != 0 {
             return rc;
         }
-        // scratch_block now holds `lba` — keep the write-back cache tag coherent.
+        // scratch_block now holds `lba` alone — keep the write-back cache tag
+        // coherent.
         s.open_files[slot_idx].scratch_lba = lba;
+        s.open_files[slot_idx].scratch_span = 1;
+        s.open_files[slot_idx].scratch_cluster = 0;
     }
     let of = &mut s.open_files[slot_idx];
     of.current_cluster = cluster;
@@ -2251,7 +2293,7 @@ unsafe fn fs_op_readdir(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: 
 /// The block contract and current NVMe producer accept at most eight sectors
 /// per call (one 4 KiB DMA page).
 unsafe fn fs_sync_write_sectors(s: &Fat32State, lba: u32, nlb: u16, buf: *const u8) -> i32 {
-    if nlb == 0 || nlb > 8 {
+    if nlb == 0 || nlb > MAX_WRITE_NLB {
         return E_INVAL;
     }
     let mut arg = [0u8; 16];
@@ -2304,15 +2346,19 @@ unsafe fn fs_sync_flush(s: &Fat32State) -> i32 {
 /// full (callers surface this as backpressure — a short write count or
 /// a retried fence — never a silent sync downgrade), or a negative
 /// errno.
-unsafe fn fs_async_write_sector(s: &Fat32State, lba: u32, buf: *const u8) -> i32 {
+unsafe fn fs_async_write_sectors(s: &Fat32State, lba: u32, nlb: u16, buf: *const u8) -> i32 {
+    if nlb == 0 || nlb > 8 {
+        return E_INVAL;
+    }
     let mut arg = [0u8; 16];
     let lba_b = lba.to_le_bytes();
     arg[0] = lba_b[0];
     arg[1] = lba_b[1];
     arg[2] = lba_b[2];
     arg[3] = lba_b[3];
-    arg[4] = 1;
-    arg[5] = 0; // nlb = 1
+    let nlb_b = nlb.to_le_bytes();
+    arg[4] = nlb_b[0];
+    arg[5] = nlb_b[1];
     let buf_b = (buf as u64).to_le_bytes();
     let mut i = 0usize;
     while i < 8 {
@@ -3338,22 +3384,26 @@ unsafe fn fs_op_write(
         // already advanced (or an extent had been allocated and linked),
         // the retry would advance the chain a second time and corrupt it.
         if s.open_files[slot].scratch_dirty != 0 {
+            // A cluster boundary always leaves the run: the next cluster's
+            // sectors are only known after the cursor advances, and a run
+            // never spans clusters.
             let leaving = if pos.is_multiple_of(cpb) {
                 true
             } else {
                 let cur = s.open_files[slot].current_cluster;
                 let sec = cluster_to_sector(s, cur) + (pos / bps) % spc;
-                sec != s.open_files[slot].scratch_lba
+                !scratch_accepts(&s.open_files[slot], cur, sec)
             };
             if leaving {
                 let prev = s.open_files[slot].scratch_lba;
+                let prev_span = s.open_files[slot].scratch_span as u16;
                 let wp = s.open_files[slot].scratch_block.as_ptr();
                 // Async mode submits the completed sector to the block ring
                 // (copied into a device DMA slot, so `scratch_block` is free
                 // to reuse on return) and pipelines; durability is proven by
                 // the FSYNC_SUBMIT/POLL fence, not this submit.
                 if async_flush {
-                    let wr = fs_async_write_sector(s, prev, wp);
+                    let wr = fs_async_write_sectors(s, prev, prev_span, wp);
                     if wr == E_AGAIN {
                         // Ring full — real backpressure, NOT a silent sync
                         // downgrade. Leave the sector in scratch (dirty) and
@@ -3366,12 +3416,13 @@ unsafe fn fs_op_write(
                         return -5;
                     }
                 } else {
-                    let wr = fs_sync_write_sector(s, prev, wp);
+                    let wr = fs_sync_write_sectors(s, prev, prev_span, wp);
                     if wr != 0 {
                         return fs_rc_errno(wr);
                     }
                 }
                 s.open_files[slot].scratch_dirty = 0;
+                scratch_retain_tail(&mut s.open_files[slot]);
             }
         }
         // At a cluster boundary, select or allocate the cluster containing
@@ -3436,8 +3487,10 @@ unsafe fn fs_op_write(
         // cluster, whose cold first-touch read could blow the step guard. The
         // read survives only for a genuine mid-sector write to a sector
         // neither fresh nor cached (e.g. reopened-file append).
-        if off_in_sec != 0 && s.open_files[slot].scratch_lba != sector {
-            let p = s.open_files[slot].scratch_block.as_mut_ptr();
+        let (idx, mirrored) = scratch_place(&mut s.open_files[slot], cur, sector);
+        let sec_off = idx * BLOCK_SIZE;
+        if off_in_sec != 0 && !mirrored {
+            let p = s.open_files[slot].scratch_block.as_mut_ptr().add(sec_off);
             let rrc = fs_sync_read_sector(s, sector, p);
             if rrc != 0 {
                 return fs_rc_errno(rrc);
@@ -3448,14 +3501,14 @@ unsafe fn fs_op_write(
             s.open_files[slot]
                 .scratch_block
                 .as_mut_ptr()
-                .add(off_in_sec),
+                .add(sec_off + off_in_sec),
             n,
         );
         // DEFER the device write: `scratch_block` now mirrors `sector` with the
-        // appended bytes, but we do NOT write it to the device yet. It is
-        // flushed on the next sector change (above), at FS_FSYNC, or at
-        // FS_CLOSE — collapsing repeated same-sector appends into one write.
-        s.open_files[slot].scratch_lba = sector;
+        // appended bytes, but we do NOT write it to the device yet. The run is
+        // flushed when a write leaves it (above), at FS_FSYNC, or at FS_CLOSE
+        // — collapsing repeated same-sector appends into one write, and a
+        // filled cluster's sectors into one submit.
         s.open_files[slot].scratch_dirty = 1;
         let new_offset = pos + n as u32;
         s.open_files[slot].offset = new_offset;
@@ -3476,7 +3529,63 @@ unsafe fn fs_op_write(
     done as i32
 }
 
-/// Write the pending (deferred) data sector to the device if `scratch_block`
+/// True when the mirrored run already covers `sector`, or can grow to cover
+/// it. A run grows only within `cluster`, whose sectors are physically
+/// contiguous, so the whole run stays one device range.
+fn scratch_accepts(of: &OpenFile, cluster: u32, sector: u32) -> bool {
+    let span = of.scratch_span as u32;
+    if span == 0 {
+        return false;
+    }
+    if sector >= of.scratch_lba && sector < of.scratch_lba + span {
+        return true;
+    }
+    of.scratch_cluster == cluster
+        && sector == of.scratch_lba + span
+        && (span as usize) < SCRATCH_SECTORS
+}
+
+/// Position `sector` within the FD's scratch, returning its sector index and
+/// whether `scratch_block` already mirrors it (in which case the caller skips
+/// the read-modify-write fetch). Covers three cases: the sector is inside the
+/// mirrored run; it extends the run by one; or it starts a fresh run — which
+/// is only reached once the previous run has been flushed, since an
+/// unflushable target is exactly what `scratch_accepts` rejects.
+fn scratch_place(of: &mut OpenFile, cluster: u32, sector: u32) -> (usize, bool) {
+    let span = of.scratch_span as u32;
+    if span > 0 && sector >= of.scratch_lba && sector < of.scratch_lba + span {
+        // A read-established mirror carries no cluster; adopt this one so
+        // subsequent appends can extend the run.
+        of.scratch_cluster = cluster;
+        return ((sector - of.scratch_lba) as usize, true);
+    }
+    if of.scratch_dirty != 0 && scratch_accepts(of, cluster, sector) {
+        of.scratch_span = (span + 1) as u8;
+        return (span as usize, false);
+    }
+    of.scratch_lba = sector;
+    of.scratch_span = 1;
+    of.scratch_cluster = cluster;
+    (0, false)
+}
+
+/// Collapse a just-flushed run to its final sector, which is the only one a
+/// sequential append can still land in. The tail moves to index 0 and stays
+/// mirrored, so the read-modify-write skip survives the flush while the next
+/// run rebuilds from there — without a later flush re-writing sectors the
+/// device already holds.
+unsafe fn scratch_retain_tail(of: &mut OpenFile) {
+    let span = of.scratch_span as usize;
+    if span <= 1 {
+        return;
+    }
+    let base = of.scratch_block.as_mut_ptr();
+    core::ptr::copy(base.add((span - 1) * BLOCK_SIZE), base, BLOCK_SIZE);
+    of.scratch_lba += (span - 1) as u32;
+    of.scratch_span = 1;
+}
+
+/// Write the pending (deferred) data run to the device if `scratch_block`
 /// carries un-flushed appends. The companion to the write-deferral in
 /// `fs_op_write`: called at FS_FSYNC / FS_CLOSE / before a read fetch so the
 /// device reflects every byte the caller wrote before durability or read-back
@@ -3486,10 +3595,12 @@ unsafe fn fs_flush_scratch(s: &mut Fat32State, slot: usize) -> i32 {
         return 0;
     }
     let lba = s.open_files[slot].scratch_lba;
+    let nlb = s.open_files[slot].scratch_span as u16;
     let wp = s.open_files[slot].scratch_block.as_ptr();
-    let rc = fs_sync_write_sector(s, lba, wp);
+    let rc = fs_sync_write_sectors(s, lba, nlb, wp);
     if rc == 0 {
         s.open_files[slot].scratch_dirty = 0;
+        scratch_retain_tail(&mut s.open_files[slot]);
     }
     rc
 }
@@ -3555,20 +3666,22 @@ unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_
     }
     if s.open_files[slot].scratch_dirty != 0 {
         let lba = s.open_files[slot].scratch_lba;
+        let nlb = s.open_files[slot].scratch_span as u16;
         let wp = s.open_files[slot].scratch_block.as_ptr();
-        // Async: submit the final partial sector to the ring. On ring-full
-        // return E_AGAIN so the caller retries the fence next step (real
+        // Async: submit the pending run to the ring. On ring-full return
+        // E_AGAIN so the caller retries the fence next step (real
         // backpressure — no sync downgrade). The fence opened below then
         // covers it.
         let rc = if s.open_files[slot].async_mode != 0 {
-            fs_async_write_sector(s, lba, wp)
+            fs_async_write_sectors(s, lba, nlb, wp)
         } else {
-            fs_sync_write_sector(s, lba, wp)
+            fs_sync_write_sectors(s, lba, nlb, wp)
         };
         if rc != 0 {
             return rc;
         }
         s.open_files[slot].scratch_dirty = 0;
+        scratch_retain_tail(&mut s.open_files[slot]);
     }
     let mut ticket = 0u64;
     let rc = fs_fence_submit(s, &mut ticket);

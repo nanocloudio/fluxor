@@ -823,6 +823,24 @@ pub const CAP_CONTRACT_MASK: [u32; 4] = [
 unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     use crate::kernel::module::provider::contract as ct;
 
+    // host_process (0x1B) is the workload contract's Linux host-class companion
+    // (D-WORKLOAD-ABI eviction from the 0x1A surface): the READ/EXEC/TTY ops act
+    // on a workload the module already created, so they carry the SAME
+    // `requires_contract = "workload"` grant (see provider::contract::HOST_PROCESS).
+    // Without this the opcode-class-byte gate would demand a separate 0x1B bit
+    // that no manifest can declare — `tools/src/manifest.rs` has no name mapping
+    // to 0x1B — so every host-process op fails ENOSYS.
+    //
+    // The remap covers the CONTRACT grant only. `platform_raw` is required for
+    // this class by its own arm in `privileged_op_permission` (0x1B00..=0x1BFF),
+    // which must stay in step with the 0x1A arm: executing a process and opening
+    // a PTY on the host is not a lesser privilege than creating the workload.
+    let contract = if contract == ct::HOST_PROCESS {
+        ct::WORKLOAD
+    } else {
+        contract
+    };
+
     let cap = crate::kernel::exec::scheduler::current_module_cap_class() as usize;
     if cap < CAP_CONTRACT_MASK.len() {
         let mask = CAP_CONTRACT_MASK[cap];
@@ -941,6 +959,16 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     // isolated workloads is privileged; gated by the same
     // platform_raw bit as raw DMA/MMIO/PCIe.
     if (0x1A00..=0x1AFF).contains(&op) {
+        return Some(PLATFORM_RAW);
+    }
+    // Host-process mechanics (host_process, 0x1Bxx) — EXEC / TTY_* / READ run
+    // and drive a real process on the Linux host, so they carry the same
+    // platform_raw bar as the 0x1A ops that created the workload. The contract
+    // grant for this class is the workload one (see `check_contract_grant`);
+    // this is the permission half, and dropping it would leave process
+    // execution reachable with a strictly weaker declaration than workload
+    // creation.
+    if (0x1B00..=0x1BFF).contains(&op) {
         return Some(PLATFORM_RAW);
     }
     if !(0x0C00..=0x0CFF).contains(&op) {
