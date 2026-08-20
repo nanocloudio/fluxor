@@ -115,7 +115,9 @@ enum Commands {
     /// self_id), __PEER<i>_PORT__ (base_port + i), __HTTP_PORT__
     /// (listen_port + http_offset); anything else via `--var`.
     Run {
-        /// Config file (YAML).  Optional only when `--list` is given.
+        /// Config file (YAML), or `-` to read the config from stdin
+        /// (heredoc-friendly; works with `--replicas` templates too).
+        /// Optional only when `--list` is given.
         config: Option<PathBuf>,
         /// Scenario only: dump the synthesised host graph YAML and exit.
         #[arg(long)]

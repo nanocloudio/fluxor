@@ -169,28 +169,37 @@ fn main() {
             base_port,
             http_offset,
             vars,
-        } => match replicas {
-            // `--replicas` = the old `up`: render the template per
-            // replica and spawn them side-by-side.
-            Some(n) => match config.as_ref() {
-                Some(template) => up::cmd_up(template, n, base_port, http_offset, &vars, None),
-                None => Err(Error::Config(
-                    "run --replicas needs a template config argument".into(),
-                )),
-            },
-            None => cmd_run_dispatch(
-                config.as_ref(),
-                RunFlags {
-                    print_synthesised,
-                    print_merged,
-                    validate_only,
-                    graph,
-                    list,
-                    open,
+        } => (|| {
+            // `-` reads the config from stdin into a scratch file, so a
+            // heredoc can feed `fluxor run` (and `--replicas` templates)
+            // without a checked-in config.
+            let config = match config {
+                Some(p) if p.as_os_str() == "-" => Some(stdin_config()?),
+                other => other,
+            };
+            match replicas {
+                // `--replicas` = the old `up`: render the template per
+                // replica and spawn them side-by-side.
+                Some(n) => match config.as_ref() {
+                    Some(template) => up::cmd_up(template, n, base_port, http_offset, &vars, None),
+                    None => Err(Error::Config(
+                        "run --replicas needs a template config argument".into(),
+                    )),
                 },
-                verbose,
-            ),
-        },
+                None => cmd_run_dispatch(
+                    config.as_ref(),
+                    RunFlags {
+                        print_synthesised,
+                        print_merged,
+                        validate_only,
+                        graph,
+                        list,
+                        open,
+                    },
+                    verbose,
+                ),
+            }
+        })(),
         Commands::Exec { name, args } => workload_src::exec_applet(&name, &args, verbose),
         Commands::Install { bundle, name, link } => {
             workload_src::install_applet(&bundle, name.as_deref(), link.as_deref(), verbose)
@@ -321,6 +330,24 @@ fn main() {
 /// The lib and the bin each carry their own `error::Error` (the bin
 /// compiles `error.rs` a second time), so a lib-side lifecycle result
 /// crosses into the bin's `Result` here rather than at six call sites.
+/// Persist a config piped on stdin (`fluxor run -`) to a scratch
+/// file and return its path. Pid-suffixed so parallel invocations
+/// stay apart.
+fn stdin_config() -> Result<PathBuf> {
+    use std::io::Read as _;
+    let mut yaml = String::new();
+    std::io::stdin()
+        .read_to_string(&mut yaml)
+        .map_err(|e| Error::Config(format!("reading config from stdin: {e}")))?;
+    if yaml.trim().is_empty() {
+        return Err(Error::Config("stdin config is empty".into()));
+    }
+    let path = std::env::temp_dir().join(format!("fluxor-stdin-{}.yaml", std::process::id()));
+    std::fs::write(&path, yaml)
+        .map_err(|e| Error::Config(format!("writing stdin config {}: {e}", path.display())))?;
+    Ok(path)
+}
+
 fn lifted(r: std::result::Result<(), fluxor_tools::error::Error>) -> Result<()> {
     r.map_err(|e| Error::Config(e.to_string()))
 }
