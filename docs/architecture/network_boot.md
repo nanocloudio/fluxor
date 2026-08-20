@@ -1,163 +1,209 @@
-# Network Boot
+# Network Boot and OTA
 
-Fluxor devices can boot their application graph from the network. The
-kernel and a minimal boot graph reside in local flash. The application
-graph — modules, configuration, and assets — is fetched from a
-deployment server at boot time. The device becomes a stateless compute
-node whose behaviour is determined by what the network provides.
+Fluxor devices can boot a base image from the network and then pull
+their application graph from an OCI registry at runtime. The delivered
+unit is a **graph image**: modules, compiled configuration, and a
+header that pins the graph to the kernel it runs on. The device
+becomes a compute node whose behaviour is determined by what the
+registry serves.
 
-This is a composition of existing architectural primitives: remote
-channels for transport, graph bundles for packaging, module signing
-for trust, live graph reconfigure for the transition from boot graph
-to application graph, and asset caching for incremental content
-delivery.
+Two delivery paths exist:
 
-The design is intentionally not PXE. Firmware still boots a local
-kernel and a minimal boot graph. The network only supplies a signed
-application graph bundle after the local trust root is already
-running.
+- **Pi-5-class targets** netboot their boot image over TFTP, then pull
+  graph images over TLS from an OCI registry and stage them in RAM
+  through a kernel staging surface.
+- **RP-class targets** stage graph images into on-flash A/B graph
+  slots through the `ota_ingest` / `graph_slot` module pair.
 
-## Building Blocks
+## The Graph Image
 
-| Primitive | Role |
-|---|---|
-| Graph bundles | Package modules, configuration, and assets for a target. |
-| Module signing | Verifies packed module hashes and Ed25519 signatures. |
-| `modules/foundation/graph_slot/` | Staged graph-slot storage and promotion semantics. |
-| `modules/foundation/ota_ingest/` | Ingests update data for staged deployment paths. |
-| `modules/foundation/remote_channel/` | Fluxor-native channel transport between nodes. |
-| `modules/foundation/reconfigure/` | Coordinates graph transition through the reconfigure path. |
-| `architecture/security.md` | Trust profiles, signature handling, and KEY_VAULT usage. |
+Source: `tools/src/cli/commands_a.rs` (writer),
+`src/kernel/module/ota_stage.rs` (reader).
 
-## Boot Flow
+`fluxor build <config> --emit=image` produces a graph image: a 256-byte
+FXSL header, the module table (FXMT format, one FXMD entry per
+module), and the compiled config blob. The header fields are
+little-endian:
 
-```text
-Power on
-  -> local kernel starts
-  -> local boot graph starts network driver and transport modules
-  -> boot graph discovers or contacts deployment server
-  -> server selects a graph bundle for this device class and version
-  -> device downloads bundle through remote channel or HTTP
-  -> device verifies signature, hashes, target compatibility, and graph shape
-  -> device stages bundle in graph_slot or volatile memory
-  -> reconfigure promotes the application graph
-  -> boot graph exits or remains as the fallback path
-```
+| Offset | Field |
+|--------|-------|
+| 0..4 | magic `FXSL` (`0x4C53_5846`) |
+| 4 | version (1) |
+| 8..16 | epoch (`u64`) |
+| 16..24 | modules offset and size |
+| 24..32 | config offset and size |
+| 32..64 | SHA-256 over modules ‖ config |
+| 64..96 | ABI-surface digest of the kernel the graph was built against |
 
-The boot graph is deliberately small: network driver, IP or host
-transport, bundle fetch, validation, staging, and reconfigure trigger.
-Application logic belongs in the loaded graph, not in the boot graph.
+The header pins kernel and graph to each other: a device refuses an
+image whose ABI-surface digest does not equal the running kernel's.
+The image excludes firmware; it is the only sanctioned module-delivery
+path for OTA devices. RP targets pad the image to the 512 KB flash
+slot aperture; other targets emit it unpadded with an 8 MiB ceiling.
 
-## Boot Image
+## Publish and Distribution
 
-A boot image is a local fallback image selected for the board being
-provisioned. The person provisioning the device knows what network
-hardware it has — they're holding the board — so the image carries
-the right network driver for that board. The image includes:
+Source: `tools/src/store_cli.rs`, `tools/src/oci_store.rs`,
+`tools/src/store_remote.rs`.
 
-- the target kernel and platform support
-- the minimal boot graph
-- the network driver or host transport for that board
-- the trust root used to validate downloaded bundles
-- enough configuration to find or discover the deployment server
+Graph images and boot images are OCI artefacts in the local store:
 
-Provisioning produces a complete boot image and writes it to the
-board's primary boot storage. Pre-built boot images exist for the
-common board/network-interface combinations.
+- `fluxor publish image <file>` publishes a built graph image (media
+  type `application/vnd.nanocloud.fluxor.image.v1`). By default the
+  image is exploded into layers — a skeleton (header + module-table
+  header), one layer per `.fmod`, and a config layer, each annotated
+  with its `io.fluxor.image.offset` — so registries deduplicate module
+  content and devices fetch only what changed. `--packed` keeps the
+  single-blob form used by the RP flash-slot path. Epoch and ABI pin
+  are mirrored from the header into the `io.fluxor.image.epoch` and
+  `io.fluxor.abi-surface` annotations so a consumer can admit an image
+  from the manifest alone.
+- `fluxor publish firmware <file>` publishes a boot image (for
+  example the Pi 5 `kernel_2712.img`) for staging hosts — TFTP roots
+  and SD writers — to pull.
+- `fluxor store push <ref> <host[:port]/repo:tag> [--ca <pem>]` and
+  `fluxor store pull` are the only network verbs. Digests are the
+  identity; tags stay mutable; blobs the registry already holds are
+  skipped. Pulls digest-verify every blob, and cross-host redirects
+  are refused.
 
-## Bundle Fetch
+Devices are targeted by tag (for example `devices/<device-id>:latest`)
+on an ordinary OCI-distribution registry. In the current model the
+device pull is anonymous; the registry does not authenticate devices
+or select per-device content beyond the tag.
 
-Two transports cover the common cases:
+## Boot Image and Netboot
 
-- **Remote channel** for Fluxor-native deployments, where the server
-  exposes a deployment endpoint over the channel fabric.
-- **HTTP GET** for simple infrastructure, where the response body is a
-  signed Fluxor bundle.
+Source: `targets/boards/pi5.toml`, `memory-bcm2712.x`.
 
-Both transports produce the same staging input: a byte stream
-containing the signed graph bundle. Transport choice does not affect
-validation or the runtime graph format.
+A boot image is the kernel with a module table and compiled config
+appended in the platform's payload window: the base graph the device
+runs before any OTA pull. On Pi 5 the board firmware netboots this
+image (`kernel_2712.img`) over TFTP from standard TFTP
+infrastructure; `fluxor flash` writes the SD-card alternative to
+`/boot/firmware/kernel8.img`. Nothing need reside in local flash on a
+netbooted Pi 5.
 
-## Validation
+The base graph for an OTA device is small: the network driver, `ip`,
+`tls` in client mode with the deployment CA pinned via its
+`trust_cert_file` param, and `ota_registry`. Application logic belongs
+in the pulled graph.
 
-Before promotion, the boot graph rejects any bundle that fails:
+## The Registry Puller: ota_registry
 
-- signature policy for the device trust profile
-- per-module SHA-256 hash checks
-- target and board compatibility checks
-- manifest resource checks, including `[[resources]].requires_contract`
-  and `[requires]` CPU-feature gating
-- graph validation: ports, content types, resource limits, and wiring
-- version or rollback policy
+Source: `modules/foundation/ota_registry/mod.rs` and its
+`manifest.toml`.
 
-Validation reuses the same rules as the host build tool so a bundle
-accepted by the device is not using a weaker schema than the one
-accepted during local builds.
+`ota_registry` is a PIC module that speaks HTTP/1.1 against the OCI
+distribution API over a `net_in` / `net_out` net_proto pair, wired
+through `tls`. Params (TLV tags): `registry_ip` (1), `registry_port`
+(2, default 5000), `host` (3), `repo` (4), `tag` (5), `poll_s` (6,
+0 = pull once), `boot_delay_ms` (7, default 2000), `chunk_bytes` (8,
+0 = whole blob), `directive_pubkey` (9, 64 hex chars of an Ed25519
+public key).
 
-## Staging
+The pull cycle:
 
-Staging policy is target-specific:
+1. After `boot_delay_ms`, `GET /v2/<repo>/manifests/<tag>` with the
+   OCI manifest media type accepted. One TCP connection per request
+   (`Connection: close`), Content-Length framing only; failures back
+   off exponentially from 2 s to 60 s.
+2. Read `io.fluxor.image.epoch` from the manifest and compare against
+   the live epoch (queried through the staging surface). An image that
+   is not newer is logged as up to date and the module parks or polls.
+3. Fetch each layer (or the single packed blob) with
+   `GET /v2/<repo>/blobs/sha256:<hex>`, optionally in `chunk_bytes`
+   Range slices, streaming the bytes into the kernel staging surface
+   at the layer's annotated offset while computing an incremental
+   SHA-256. A digest mismatch aborts the cycle.
+4. Commit. The kernel validates and activates the staged image (next
+   section).
 
-- RP-class boards stage into reserved flash sectors when capacity
-  permits.
-- pi5-class targets stage into DRAM, NVMe, SD, or another
-  board-selected backing store.
-- Linux-hosted runs stage into the host filesystem.
-- WASM-hosted deployments stage in the browser/host storage layer
-  when the platform exposes one.
+The optional `directive` input port accepts signed retarget records:
+`[0x44][counter: u64 LE][tag_len: u8][tag][Ed25519 signature: 64]`,
+signature over `counter ‖ tag` under `directive_pubkey`, with a
+monotonic counter for replay rejection (the counter is module state,
+so it resets on rebuild or reboot). A valid directive re-points the
+watched tag and forces an immediate check, so `poll_s` can be long or
+zero.
 
-Promotion goes through the graph-slot/reconfigure path rather than
-special-casing network boot in the kernel.
+## Kernel Staging Surface
 
-## Fallback
+Source: `src/kernel/module/ota_stage.rs`,
+`modules/sdk/internal/reconfigure.rs` (opcodes).
 
-The local boot image is the recovery path. If download, validation,
-instantiation, or first-tick health checks fail, the device remains on
-or returns to the boot graph and reports the failure when transport is
-available.
+Staging is a kernel surface reached through two `dev_system` opcodes,
+available to modules with the `platform_raw` permission:
 
-A failed application graph must not overwrite the local fallback image.
-Updating the fallback image is a separate, higher-risk operation and
-should require an explicit policy.
+- `OTA_STAGE_WRITE` (`0x0C20`) — payload `[offset: u32 LE][bytes]`.
+  Forward gaps are zero-filled; backward offsets are rejected.
+- `OTA_STAGE_CTRL` (`0x0C21`) — `COMMIT` (0), `ABORT` (1), `EPOCH`
+  (2, returns the live epoch).
 
-## Fleet Model
+The stage is RAM: two 8 MiB, 16 KiB-aligned static buffers used
+alternately A/B. `COMMIT` validates the staged image — FXSL magic and
+version, region bounds, SHA-256 over modules ‖ config against the
+header, strict ABI-surface-pin equality against the running kernel
+(`-EACCES` on mismatch), and epoch monotonicity (`-EBUSY`) — then
+flips the region non-writable and executable via the platform HAL,
+re-points the static loader at it, and requests a scheduler graph
+rebuild. Staged code is never executed before validation.
 
-A deployment server can be any service that maps a device identity and
-device class to a signed bundle. The server may also record boot
-attempts, active versions, validation failures, and health telemetry,
-but none of that changes the on-device graph model.
+Failure posture: a validation failure leaves the running graph
+untouched; a failure during the rebuild itself leaves the graph idle,
+recoverable by power cycle back into the netboot image. Staging never
+writes the boot image, so the netboot/SD image is the fallback by
+construction. Rollback to an older epoch is refused; recovering an
+older version means a power cycle and a re-pull, or publishing it
+under a newer epoch. On targets without the RAM stage (RP, WASM) the
+surface returns `ENOSYS`.
 
-Typical server responsibilities:
+Activating a new graph image restarts the graph. For graphs holding
+storage state, treat activation as reboot-class maintenance rather
+than a live handoff.
 
-- store graph bundles by target, board, version, and rollout channel
-- authenticate device boot requests when the deployment requires it
-- choose the bundle for the requesting device
-- stream the bundle through remote channel or HTTP
-- record success, failure, and rollback events
+## RP Flash Slots: ota_ingest and graph_slot
+
+Source: `modules/foundation/ota_ingest/`,
+`modules/foundation/graph_slot/`,
+`modules/sdk/platform/rp/flash_layout.rs`.
+
+RP2040/RP2350 targets stage into two 512 KB on-flash A/B graph slots
+instead of RAM. `graph_slot` owns the flash aperture and exposes an
+FMP channel protocol (`gs.erase`, `gs.write`, `gs.activate`,
+`gs.query_active`, `gs.query_cfg`; responses are
+`[req_type: u32 LE][value: i32 LE]`). `ota_ingest` accepts a graph
+image as a byte stream on its `stream` input, buffers it into 256-byte
+pages, and drives erase → write → activate, reporting progress on its
+`status` output as 4-byte records `[kind: u8][pad][rc: i16 LE]` with
+kinds `0x01` erased, `0x02` written, `0x03` activated, `0xFF` failed.
+The slot content is the packed (single-blob) graph-image form.
 
 ## Security Model
 
-Network boot relies on the same trust chain as local packed firmware.
-The network is not trusted. A transport can provide confidentiality and
-server authentication, but bundle signatures and hashes are still the
-authority for code and graph integrity.
-
-Important properties:
-
-- downloaded code is never executed before validation
-- unsigned bundles are accepted only when the device policy allows them
-- staged bundles must be bound to the target and board they were built for
-- rollback policy must be explicit
-- server compromise should not bypass the device trust root
-
-See `security.md` for the loader trust profiles and signing model.
+Content trust on the OTA path is digest pinning end to end: the
+manifest names layer digests, every fetched blob is hashed as it
+streams, and commit re-verifies the whole-image hash from the FXSL
+header. Transport trust is TLS with the deployment CA pinned in the
+base graph's `tls` module. Binding to the running kernel is the
+ABI-surface pin; downgrade resistance is epoch monotonicity. Graph
+images are not signature-verified on this path; module-level Ed25519
+signature enforcement exists in the loader as a build-time option and
+is described in `security.md`. Registry compromise is therefore
+bounded by the TLS trust root and the digest/ABI/epoch checks, not by
+a content signature.
 
 ## Where It Fits
 
-Network boot is one deployment shape for the same graph bundles used
-by local flash, browser-hosted WASM, and Linux-hosted runs. The
-bundle format, validation rules, signing model, and runtime graph
-semantics are all shared. A device that boots its application graph
-from the network and a device that boots the same graph from local
-flash differ only in where the bytes came from — not in how they
-execute.
+The same graph image and the same store/registry model serve every
+deployment shape: RP flash slots, Pi 5 RAM-staged OTA, and hosted
+runs. The image format, the digest/ABI/epoch validation, and the OCI
+artefact model are shared; devices differ only in where the bytes come
+from and where they are staged.
+
+## Related Documentation
+
+- `module_architecture.md` — FXMT/FXMD module table and `.fmod` format
+- `security.md` — loader trust profiles, KEY_VAULT, signing model
+- `reconfigure.md` — graph rebuild and drain semantics
+- `abi_surface.md` — the ABI-surface digest that pins kernel to graph

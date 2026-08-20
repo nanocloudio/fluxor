@@ -1,85 +1,80 @@
-# Displays Guide
+# Displays
 
-This guide describes the display architecture in Fluxor, including panel output,
-initialization, and touch integration.
+A display pipeline is ordinary graph wiring: producer modules emit pixel
+data on a channel, and a panel driver module scans it out to the hardware.
+Touch input, where the panel has it, is a separate input plane handled by
+its own driver module. This guide describes both, using the in-tree panel
+drivers as the reference.
 
-## Scope
+Source: `modules/drivers/st7701s/`, `modules/drivers/gt911/`,
+`modules/foundation/panel_surface_traits/`.
 
-Display pipelines in Fluxor are built from driver modules and rendering/data
-modules connected by explicit graph wiring.
-
-Typical responsibilities:
-
-- panel transport and timing
-- pixel stream formatting
-- optional touch input path
-- UI/control integration via status and event channels
-
-## Architectural Model
+## Pipeline shape
 
 ```text
-image/source -> decode/format -> display driver -> panel
-                               
- touch driver -----------------> control/event modules
+image/source -> decode/format -> panel driver -> panel
+touch driver -> gesture/UI modules
 ```
 
-Display output and touch input are independent planes that can be composed in
-one graph.
+The panel driver is a paced sink: it owns the display refresh timeline. In
+the capability model it declares `video.raster`, `video.scanout`,
+`display.scanout` and `presentation.clock`, so a display group that
+contains one panel driver has its presentation clock without further
+configuration. Upstream decode or format stages normalise content into the
+driver's input contract; the driver consumes `VideoRaster` records on its
+`pixels` input port.
 
-## Panel Configuration
+## The ST7701S panel driver
 
-Panel behavior is declared in configuration and applied by the display driver
-module. This includes:
+`st7701s` drives ST7701S-based RGB parallel panels on rp2350 boards. It is
+board-agnostic: pin assignments and PIO block selection come from module
+parameters, so one driver supports different board layouts without code
+changes.
 
-- resolution and orientation
-- transport/pin mapping
-- panel timing and initialization profile
-- backlight control policy
+Bring-up runs a reset pulse, writes the panel's register initialisation
+sequence over bit-banged 9-bit SPI, then configures four PIO state
+machines across two PIO blocks (hsync/vsync on the sync PIO, data-enable
+and RGB on the data PIO) and starts DMA-fed scan-out. Frame timing is
+generated entirely by the PIO hardware; the CPU only feeds pixel data into
+the RGB state machine's FIFO. The backlight is enabled once the first
+frame has loaded, so the panel never shows uninitialised memory.
 
-Keeping panel identity declarative allows one driver family to support multiple
-boards and displays.
+Geometry is parameterised (`width`, `height`, both defaulting to 480); the
+register initialisation sequence itself is compiled into the driver.
 
-## Initialization Strategy
+## Touch: the GT911 driver
 
-Panel bring-up uses profile-driven init sequences rather than hard-coded board
-logic in the kernel path.
+`gt911` drives GT911 five-point capacitive touch controllers over I2C,
+with configurable pin assignments. It selects the controller's I2C
+address during the reset sequence, verifies the product ID, then binds an
+event to the controller's interrupt line. On each interrupt it reads the
+active touch points and writes one `TouchEvent` record per contact to its
+`touch` output port (`InputEvent` content type).
 
-This keeps driver behavior portable and simplifies support for additional panel
-variants.
+Downstream interpretation (tap, gesture, UI navigation) is the consumer's
+job; the driver reports contacts, not semantics. See
+[input_gestures.md](input_gestures.md) for the interpretation layer.
 
-## Pixel Pipeline Contracts
+## Declaring the surface
 
-Display pipelines should define clear contracts for:
+Fixed-function panels have a statically known viewport and input modality
+set. The `panel_surface_traits` module emits one surface-traits record
+describing the configured geometry, orientation and modalities, so an
+application reacts to a buttoned panel the same way it reacts to a
+browser window. A screenless device (display count zero) is described the
+same way: the record then advertises an audio-only surface with physical
+buttons.
 
-- pixel format and ordering
-- frame or region update semantics
-- expected buffer ownership model (copy vs zero-copy)
+## Design guidance
 
-Upstream decode/format stages should normalize content into the driver's expected
-input contract.
+- Keep coordinate transform policy (rotation, mirroring, axis mapping)
+  explicit in configuration rather than implicit in a consumer.
+- Keep transport and backlight concerns inside the panel driver; upstream
+  stages deal only in pixel formats.
+- Prefer region updates over full-frame copies where the content allows.
 
-## Touch Integration
+## Related documentation
 
-Touch controllers are modeled as input producers that emit normalized touch data
-for gesture or UI modules.
-
-Recommended pattern:
-
-- touch driver emits contact/state events
-- transform/gesture layer interprets policy
-- application modules consume semantic actions
-
-Coordinate transform policy (rotation, mirroring, axis mapping) should remain
-explicit in configuration.
-
-## Performance Guidance
-
-- Avoid unnecessary full-frame copies when region updates are sufficient.
-- Keep transport/backlight concerns inside display driver boundaries.
-- Use buffer sizing consistent with target frame cadence and memory budget.
-
-## Related Documentation
-
-- `docs/architecture/pipeline.md`
-- `docs/guides/input_gestures.md`
-- module-local docs under `modules/st7701s/` and `modules/gt911/`
+- [../architecture/pipeline.md](../architecture/pipeline.md) — pipeline and channel model
+- [input_gestures.md](input_gestures.md) — turning input events into commands
+- module READMEs under `modules/drivers/st7701s/` and `modules/drivers/gt911/`

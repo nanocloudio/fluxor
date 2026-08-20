@@ -1,91 +1,83 @@
-# Input System
+# Input system
 
-The input system provides the architecture for turning hardware interactions
-into stable, routable control actions.
+The input system turns hardware interactions into stable, routable control
+actions without embedding board-specific behaviour in application modules.
 
-## Goal
+Source: `modules/sdk/contracts/input/`, `modules/foundation/gesture/`,
+`modules/drivers/button/`.
 
-Provide a uniform control surface across heterogeneous input sources without
-embedding board-specific behavior into application modules.
-
-## System Model
-
-```text
-hardware input -> input module -> gesture/mapper -> action consumers
-```
-
-The system emphasizes contract stability: modules consume actions, not electrical
-signal details.
-
-Implementation pattern:
+## System model
 
 ```text
 button/touch/bootsel module -> raw channel bytes -> gesture module -> FMP command messages -> target modules
 ```
 
-Input modules emit raw byte transitions on data channels. Gesture
-modules consume those transitions and emit FMP command messages on
-control channels. Target modules read the FMP messages and act on
-them. The kernel has no concept of "actions" — control flow is
-ordinary module-to-module channel traffic.
+Input modules emit raw byte transitions on data channels. The gesture
+module consumes those transitions and emits FMP command messages on
+control channels. Target modules read the FMP messages and act on them.
+The kernel has no concept of "actions": control flow is ordinary
+module-to-module channel traffic.
 
-## Core Principles
+The contract layer under `modules/sdk/contracts/input/` fixes the wire
+shapes: button transitions, pointer, key, gamepad, MIDI and surface-traits
+records each have one stable contract, and every platform's driver for a
+given source produces the same shape. Modules therefore consume actions,
+not electrical signal details.
+
+## Core principles
 
 - input capture is source-specific
 - action semantics are source-agnostic
-- bindings and policies are configuration-driven
-- control flow is decoupled from stream/data flow
+- bindings and timing policy are configuration-driven
+- control flow is decoupled from stream and data flow
 
-This model allows the same application graph to work with different physical
-control hardware.
+The same application graph works with different physical control hardware:
+only the input driver at the front of the chain changes.
 
-## Action Abstraction
+## Action abstraction
 
-Actions are compact command values with well-defined meaning at the consumer
-boundary.
+Actions are compact command values: FNV-1a hashes of command names carried
+in fixed-size FMP messages. This keeps transport overhead low, makes
+fan-out to multiple consumers cheap, and gives predictable behaviour under
+backpressure.
 
-Benefits:
+## Binding model
 
-- low transport overhead
-- simple fan-out to multiple consumers
-- predictable handling under backpressure
-
-## Binding Model
-
-Bindings connect actions to target capabilities through configuration.
-
-Typical binding choices:
+Bindings connect gesture patterns to commands through module parameters
+(`click`, `double_click`, `triple_click`, `long_press`), and commands to
+targets through graph wiring. Typical binding choices:
 
 - transport controls (play/pause/next/prev)
-- selection/navigation
+- selection and navigation
 - mode toggles
 - service operations
 
-The binding layer owns policy, keeping input and application modules reusable.
+The binding layer owns policy, keeping input and application modules
+reusable. [input_gestures.md](input_gestures.md) documents the gesture
+module's parameters and command vocabulary.
 
-In current modules, gesture mappings are typically configured as command hashes
-(`click`, `double_click`, `long_press`, etc.) and emitted on a control channel.
+## Event integration
 
-## Event Integration
+Input drivers use event objects and scheduler wake semantics for
+low-latency reaction to hardware changes: the `gt911` touch driver, for
+example, binds an event to the controller's interrupt line rather than
+polling. See [../architecture/events.md](../architecture/events.md).
 
-Input modules may use event objects and scheduler wake semantics for low-latency
-reaction to hardware changes.
+The BOOTSEL button on rp boards is read by the `flash_rp` driver through
+the QSPI sideband, not through GPIO; it emits the same raw transition
+contract as a GPIO button, so downstream modules cannot tell the
+difference.
 
-See `docs/architecture/events.md` for the event architecture.
+## Design guidance
 
-Special case: the board user button is available as virtual pin `0xFF` in the
-GPIO request-input path, allowing BOOTSEL-style input without board-specific
-logic in application modules.
-
-## Design Guidance
-
-- keep action vocabulary stable and semantic
+- keep the action vocabulary stable and semantic
 - avoid hard-coding target-specific logic in input modules
-- ensure gesture/action modules have deterministic timing windows
+- keep gesture timing windows explicit so recognition is deterministic
 - separate immediate input feedback from domain-side actions when needed
 
-## Related Documentation
+## Related documentation
 
-- `docs/guides/input_gestures.md`
-- `docs/architecture/events.md`
-- `docs/architecture/abi_layers.md`
+- [input_gestures.md](input_gestures.md) — the gesture layer in detail
+- [../architecture/events.md](../architecture/events.md) — event architecture
+- [../architecture/input_capability_surface.md](../architecture/input_capability_surface.md) — the input capability surface
+- [../architecture/abi_layers.md](../architecture/abi_layers.md) — contract layering

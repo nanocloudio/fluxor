@@ -1,9 +1,12 @@
 # Timing Model
 
 Fluxor distinguishes wall-clock time (when work is scheduled) from
-stream-clock time (what time the data corresponds to). Getting this
-distinction right is the difference between predictable A/V sync and
-mysterious drift.
+stream-clock time (what time the data corresponds to). Modules that
+keep the two clocks separate get predictable A/V sync; modules that
+conflate them drift.
+
+Source: `modules/sdk/abi/kernel_abi.rs` (`StreamTime`),
+`modules/sdk/contracts/stream_clock.rs`
 
 ## 1) Define what "time" means in your system
 
@@ -19,8 +22,8 @@ Do not try to achieve precise A/V sync using wall clock alone.
 
 For audio pipelines, the authority is the I2S DMA consumption rate.
 
-The kernel exposes timing via `StreamTime` (available through `provider_query` key
-`kernel_abi::STREAM_TIME` = 0x0C30, or the `stream_time` syscall):
+The kernel exposes timing via `StreamTime`, available through
+`provider_query` with key `kernel_abi::STREAM_TIME` (0x0C30):
 
 ```c
 struct StreamTime {
@@ -68,8 +71,8 @@ If you do not carry `target_frame`, you will get jitter equal to your processing
 ## 5) Quantisation rules you must accept (and minimise)
 
 Your system is inherently quantised by:
-- Audio chunk size (`SAMPLES_PER_CHUNK`): jitter up to one chunk if control applies at chunk boundaries.
-- Scheduler tick (`Timer::after`): jitter up to one tick if producers are wall-clock paced.
+- Audio chunk size: jitter up to one chunk if control applies at chunk boundaries.
+- Scheduler tick: jitter up to one tick if producers are wall-clock paced.
 - Channel partial reads/writes: jitter when messages are split across steps.
 
 To reduce jitter:
@@ -82,8 +85,8 @@ To reduce jitter:
 ## 6) Start-time alignment across a chain
 
 For any source -> processors -> sink chain, define a "start of stream" moment:
-1. Sink (I2S) exposes `t0_frame` when it begins playing the first committed frame.
-2. Upstream modules treat that as frame 0.
+1. The sink's `StreamTime` records `t0_micros` when the first committed frame is pushed.
+2. Upstream modules treat that moment as frame 0.
 
 Practical approach:
 - The kernel captures `t0_micros` automatically on first push (see `StreamTime`).
@@ -137,7 +140,7 @@ If LEDs are not tied to the audio sample clock, they will still have their own o
 
 ---
 
-## 10) Minimal instrumentation you should implement
+## 10) Instrumentation the stream service provides
 
 The PIO stream service already exposes `StreamTime` via `provider_query(-1, kernel_abi::STREAM_TIME, …)`
 (key 0x0C30). It provides everything needed for sync:
@@ -146,7 +149,7 @@ The PIO stream service already exposes `StreamTime` via `provider_query(-1, kern
 |-------|---------|
 | `consumed_units` | Frames consumed by DMA (monotonic) |
 | `queued_units` | Frames buffered ahead of DMA |
-| `units_per_sec_q16` | Consumption rate, Q16.16 (set via `SET_RATE`) |
+| `units_per_sec_q16` | Consumption rate, Q16.16 (set via `STREAM_SET_RATE`) |
 | `t0_micros` | Monotonic µs of first push (0 = not started) |
 
 Derived: `committed = consumed_units + queued_units`.

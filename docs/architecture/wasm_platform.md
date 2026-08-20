@@ -1,17 +1,17 @@
 # WASM Platform Target
 
 The WASM target is one of Fluxor's supported platforms, alongside
-`rp2350` (bare-metal silicon), `bcm2712` (Pi 5 / Linux user-process),
-and `linux` (generic Linux user-process). The defining feature of WASM
-is that one binary architecture runs on many host environments —
-browsers, `wasmtime`, edge runtimes, embedded `wasmtime` linked into a
-larger application — without the kernel or modules changing.
+`rp2350` (bare-metal silicon), `bcm2712` (Pi 5), and `linux` (generic
+Linux user-process). Its defining feature is that one binary
+architecture runs on any host environment that provides the fixed host
+import surface, without the kernel or modules changing. The browser is
+the host that exists today (`wasm_browser_host.md`); the import
+surface is deliberately host-neutral so other embeddings (a standalone
+WASM engine, an edge runtime) can implement the same contract.
 
 This document is the platform peer of the per-chip platform code under
-`src/platform/<chip>/` and the platform-specific module trees under
-`modules/sdk/platform/<chip>/`. It defines the WASM architecture model;
-each host environment that runs the WASM target is the subject of its
-own host doc (`wasm_browser_host.md`, `wasm_wasmtime_host.md`).
+`src/platform/<chip>/`. It defines the WASM architecture model; host
+specifics live in the per-host doc.
 
 ---
 
@@ -22,27 +22,21 @@ This doc defines:
 - the WASM platform's place in the existing target table
 - the module envelope (`.fmod`) and how WASM module bytes sit inside it
 - the bundle format (`.wasm`) and how `fluxor build` produces it
-- the kernel/module ↔ host import surface, including the two host
-  imports that distinguish WASM from native PIC targets
+- the kernel/module ↔ host import surface, including the host imports
+  that distinguish WASM from native PIC targets
 - the scheduler tick model
 - the build pipeline and its parallels with the existing targets
 
 It does not define:
 
 - a particular WASM host environment (deferred to host docs)
-- new content types, capability vocabulary, presentation/interaction
-  groups, or surface families — those remain authoritative across all
-  targets
-- a JavaScript framework, browser runtime profile, or endpoint surface
-  protocol — those are separate concerns
-- WASM Component Model bindings — core WASM is the contract; the
-  Component Model is a tooling layer that may be added later
+- new content types, capability vocabulary, presentation groups, or
+  surface families — those remain authoritative across all targets
+- WASM Component Model bindings — core WASM is the contract
 
 ---
 
-## 2. Platform Position
-
-The platform-targets table grows by one row:
+## 2. Platform position
 
 | Target    | Code architecture     | Module format | Bundle format |
 |-----------|-----------------------|---------------|---------------|
@@ -58,36 +52,39 @@ Three rules carry across:
    capabilities.
 2. The module envelope (`.fmod`) is identical across targets — same
    TLV parameter section, same manifest hash, same entry-point table
-   shape. Only the *code payload inside* the envelope changes.
+   shape. Only the code payload inside the envelope changes.
 3. The `fluxor build` tool selects modules and packages them with the
    kernel into the target's bundle format.
 
 The WASM target follows all three. There is no parallel envelope, no
-parallel manifest, no parallel build tool. WASM is a target row; the
-rest of the architecture handles it the way it handles any target.
+parallel manifest, no parallel build tool.
 
 ---
 
-## 3. Kernel and Module Code
+## 3. Kernel and module code
+
+Source: `src/platform/wasm.rs`, `modules/sdk/runtime/wasm.rs`.
 
 Both the Fluxor kernel and every PIC module compile for
-`wasm32-unknown-unknown` (no_std, no host imports beyond what this
-doc defines). Outputs:
+`wasm32-unknown-unknown` (no_std, no host imports beyond what this doc
+defines). Outputs:
 
 - `target/wasm/firmware.wasm` — the kernel as a single WASM module
-- `target/wasm/modules/<name>.fmod` — each module's `.fmod` envelope,
-  with a wasm32 module as its code payload
+  (built with the `host-wasm` cargo feature)
+- `target/fluxor/wasm/modules/<name>.fmod` — each module's `.fmod`
+  envelope, with a wasm32 module as its code payload
 
-The wasm32 build is selected via Cargo target plus the `target_arch =
-"wasm32"` `cfg` branch in `modules/sdk/runtime.rs`. That branch
-substitutes the `SyscallTable` struct of fn pointers (used on PIC
-targets) with WASM extern imports of the same names. Module source is
-unchanged; the SDK runtime knows how to talk to the kernel for either
-ABI shape.
+The wasm32 build is selected via the Cargo target plus the
+`target_arch = "wasm32"` branch of the module SDK runtime
+(`modules/sdk/runtime/wasm.rs`, `modules/sdk/runtime/wasm_entry.rs`).
+That branch substitutes the `SyscallTable` struct of fn pointers (used
+on PIC targets) with WASM extern imports of the same names. Module
+source is unchanged; the SDK runtime knows how to talk to the kernel
+for either ABI shape.
 
 ---
 
-## 4. Module Envelope
+## 4. Module envelope
 
 The `.fmod` envelope is unchanged from native targets:
 
@@ -95,105 +92,102 @@ The `.fmod` envelope is unchanged from native targets:
 [ magic | version | manifest_hash | exports_table | params_tlv | code_payload ]
 ```
 
-Only `code_payload` differs across targets. For wasm:
+Only `code_payload` differs across targets: for wasm it is the raw
+wasm32 module bytes for that module.
 
-- `code_payload` is the raw wasm32 module bytes for that module.
-- `exports_table` records the WASM export names the loader needs:
-  `module_state_size`, `module_init`, `module_new`, `module_step`.
-  Same names as native targets; same calling convention semantics.
+A module's wasm32 code exposes wasm-specific entry points that the
+kernel invokes by export name through the host (§6):
+`module_init_wasm` (no-arg init, replacing the pointer-argument native
+entry), `module_step_wasm` (no-arg step), and the optional
+`module_arena_size` probe. The kernel probes optional exports with
+`host_module_export_exists` before invoking them.
 
 A module's wasm32 code does not contain its `.fmod` parameters or
 manifest hash — those live in the envelope's `params_tlv` and
 `manifest_hash` fields exactly as on rp2350. The envelope is the
-target-agnostic packaging.
-
-This means the existing `tools/src/manifest.rs` `.fmod` packing code,
-the `modules.bin` layout, the cache lookup machinery, and every
-existing graph-validation rule apply to WASM modules byte-for-byte.
+target-agnostic packaging, so the existing `.fmod` packing code, the
+`modules.bin` layout, and every existing graph-validation rule apply
+to WASM modules unchanged.
 
 ---
 
-## 5. Bundle Format
+## 5. Bundle format
 
-`fluxor build config.yaml` for `target: wasm` emits exactly one file:
+Source: `tools/src/wasm_bundle.rs`, blob placeholders in
+`src/platform/wasm.rs`.
+
+`fluxor build config.yaml` for `target: wasm` emits one file:
 `target/wasm/<config>.wasm`. That file is a self-contained
-single-instance WASM bundle: kernel + selected modules + config TLV.
+single-instance bundle: kernel + selected modules + config.
 
-Layout:
+The kernel's Cargo build emits two placeholder blob structs as
+`#[no_mangle] pub static` data, each laid out as:
 
-```
-WASM module (kernel.wasm), with:
-
-  - standard sections: type, import, function, table, memory, export, code
-  - imports:           the host import surface (§6)
-  - exports:           kernel_step, kernel_init, kernel_query_*
-  - data section:      a passive data segment containing modules.bin
-                       (concatenated .fmods + index) at known
-                       symbol address EMBEDDED_MODULES_BLOB
-  - data section:      a passive data segment containing config.bin
-                       (route table, wiring, params) at known symbol
-                       address EMBEDDED_CONFIG_BLOB
+```text
+[0..16]   magic     — 16-byte ASCII sentinel (FLUXOR_MOD_BLOB / FLUXOR_CFG_BLOB)
+[16..20]  capacity  — u32 LE, bytes available in `data`
+[20..24]  used_len  — u32 LE, zero in the placeholder
+[24..32]  reserved
+[32..N]   data      — capacity bytes, zero in the placeholder
 ```
 
-The bundle tool's job is mechanical: take the kernel's compiled
-`firmware.wasm`, locate the placeholder data segments
-`EMBEDDED_MODULES_BLOB` and `EMBEDDED_CONFIG_BLOB` (allocated by the
-kernel's Cargo build with size 0), and rewrite them with the actual
-modules.bin and config.bin bytes. The output is a single `.wasm` file
-the host instantiates.
+The bundle tool locates each sentinel in the kernel `.wasm` (it must
+occur exactly once), validates the header, and overwrites `used_len`
+plus the payload bytes with the real `modules.bin` and `config.bin`.
+It refuses to write a bundle that overflows a placeholder's capacity
+and reports the required size, so the kernel can be rebuilt with a
+larger placeholder. Graph-declared assets are appended as a
+`fluxor.assets` custom section and served by the host through the
+`asset://` scheme.
 
-The choice of *passive* data segments matters: they're materialised on
-demand via `memory.init`, so the kernel can ask the engine to copy
-them into linear memory at boot exactly once. Active data segments
-work too but force the entire blob into memory before kernel init
-runs; passive segments give the kernel control over placement.
-
-The kernel boots by reading its own `EMBEDDED_MODULES_BLOB` symbol
-address as a known offset into linear memory, parsing modules.bin
-exactly the way `fluxor-linux` parses the on-disk modules.bin today,
-and instantiating each module via the host imports below.
-
-This mirrors how the rp2350 .uf2 trailer, the bcm2712 .img layout,
-and the Linux runtime-linked config+modules pair embed the same
-modules.bin in the same shape — just packaged for the target's
-deployment medium.
+At boot the kernel reads its own blob statics from linear memory
+(`used_len` via a volatile read, since the rewrite is invisible to the
+compiler), parses `modules.bin` the same way the Linux runtime parses
+its on-disk `modules.bin`, and instantiates each module via the host
+imports below. Hosts can also locate the blobs through the exported
+accessors `kernel_modules_blob_offset` / `_len` / `_capacity` and
+`kernel_config_blob_offset` / `_len` / `_capacity`.
 
 ---
 
-## 6. Host Import Surface
+## 6. Host import surface
+
+Source: `src/platform/wasm.rs`, `src/platform/wasm/hal.rs`.
 
 The kernel imports a small fixed set of functions from the WASM host.
-The set is identical across browser, wasmtime, edge, and any future
-host. Hosts implement these functions in their native language (JS,
-Rust, etc.) but expose the same names and signatures.
+The set is host-neutral: hosts implement these functions in their own
+language but expose the same names and signatures under the `env`
+namespace.
 
-### Time and log
-
-Mirror the existing platform-time and platform-log abstractions:
+### Time, log, random
 
 ```text
 host_now_us() -> u64
 host_log(level: u32, ptr: *const u8, len: usize)
 host_panic(ptr: *const u8, len: usize) -> !
+host_csprng_fill(buf: *mut u8, len: usize) -> i32
 ```
 
-Equivalent to `linux::Instant::now()` and `log::info!`/`log::warn!` on
-the Linux target; equivalent to silicon timer and UART logging on
-rp2350. Same role.
+The time and log imports fill the role the platform timer and UART
+logging fill on rp2350. `host_csprng_fill` fills a buffer with
+cryptographically secure random bytes (browser hosts delegate to
+`crypto.getRandomValues`); hosts that cannot provide a CSPRNG must
+return a negative errno, because TLS and key generation treat this as
+cryptographic entropy.
 
 ### Memory
 
-WASM linear memory is the kernel's heap. `host_alloc` is **not** a
-host import — the kernel manages its own linear memory via a
-in-binary allocator (same as how rp2350 manages its own RAM). The host
-only sets the memory's growth limit at instantiation time.
+WASM linear memory is the kernel's heap. There is no `host_alloc`
+import — the kernel manages its own linear memory with an in-binary
+allocator, the way rp2350 manages its own RAM. The host only sets the
+memory's growth limit at instantiation time.
 
 ### Module instantiation — the WASM-specific addition
 
-PIC ELF on native targets is loaded by the kernel itself: mmap, fix up
-relocations, jump to the entry point. WASM modules cannot self-host
-WASM modules — the engine has to do the instantiation. So the kernel
-delegates back to the host:
+PIC ELF on native targets is loaded by the kernel itself: map, fix up
+relocations, jump to the entry point. A WASM module cannot instantiate
+other WASM modules (the engine has to do it), so the kernel delegates
+back to the host:
 
 ```text
 host_instantiate_module(
@@ -209,7 +203,7 @@ host_invoke_module(
     export_name_len: usize,
     args_ptr: *const u8,           // packed i32 LE args (one per i32 param)
     args_len: usize,
-    ret_ptr: *mut u8,              // host writes the return value here
+    ret_ptr: *mut u8,              // host writes the i32 return value here
     ret_cap: usize,
 ) -> i32                           // bytes written to ret_ptr, or negative errno
 
@@ -222,16 +216,16 @@ host_module_export_exists(
 host_destroy_module(handle: i32) -> i32
 ```
 
-Exports are addressed by name; the host owns the export table and
-the kernel never sees indices. `host_module_export_exists` is the
-quiet probe for optional exports — `host_invoke_module` against an
-absent name is allowed to log and return an error, so callers use
-the probe before invoking when the export is optional. Args are
-packed as a sequence of i32 little-endian values, one per parameter.
+Exports are addressed by name; the host owns the export table and the
+kernel never sees indices. `host_module_export_exists` is the quiet
+probe for optional exports; callers use it before invoking when an
+export is optional. Args are packed as a sequence of i32
+little-endian values, one per parameter.
 
 `imports_ptr` / `imports_len` are reserved; the kernel passes
-`(null, 0)`. The host wires the PIC-module syscall surface by name
-under the `env` namespace:
+`(null, 0)`. The host wires the module-side syscall surface by name
+under the `env` namespace, forwarding each import to the kernel export
+of the same name:
 
 ```text
 env.channel_read   →  kernel.exports.channel_read
@@ -243,74 +237,56 @@ env.provider_query →  kernel.exports.provider_query
 env.provider_close →  kernel.exports.provider_close
 ```
 
-Heap functions live module-side (each module's bump allocator
-backed by `memory.grow` in its own linear memory), so they are not
-in the import set.
+Heap functions live module-side (each module's allocator backed by
+`memory.grow` in its own linear memory), so they are not in the
+import set.
 
-These are the only WASM-specific imports. Everything else (channels,
-heap, timer, capability dispatch) the modules see is the kernel's
-exported syscall surface, identical to the `SyscallTable` on PIC
-targets.
+These are the only kernel-uniform imports. Everything else the
+modules see is the kernel's exported syscall surface, identical to the
+`SyscallTable` on PIC targets.
 
 ### Host environment imports
 
-Beyond the kernel-uniform set above, each host adds a *small*
-host-environment import set covering capabilities the WASM sandbox
-cannot provide directly: realtime audio, raster output, network, DOM
-input, persistent storage. Those imports are the subject of the
-per-host docs and are implemented by built-in modules on the host
-side, exactly the way `linux_audio` and `host_image_codec` are
-built-in modules on the Linux target today.
+Beyond the kernel-uniform set, each host adds a host-environment
+import set covering capabilities the WASM sandbox cannot provide
+directly: realtime audio, raster output, network, input, persistent
+storage. Those imports are the subject of the per-host doc and are
+implemented by built-in modules on the host side, the way
+`linux_audio` is a built-in module on the Linux target.
 
 ---
 
-## 7. Tick Driver
+## 7. Tick driver
 
-The kernel's scheduler runs as a single function:
+The kernel's scheduler runs as exported functions:
 
 ```text
-export kernel_step() -> u32      // returns hint: ms-until-next-useful-tick,
-                                 // 0 means run again immediately
+kernel_init() -> i32
+kernel_step() -> u32      // hint: ms until the next useful tick; 0 = run again immediately
 ```
 
-The host calls `kernel_step` in a loop appropriate to its environment:
+The host calls `kernel_step` in a loop appropriate to its environment.
+The browser host pumps it from `requestAnimationFrame` in bounded
+synchronous bursts, optionally moving the whole pump into a Web
+Worker; see `wasm_browser_host.md`.
 
-- **Browser host**: typically `requestAnimationFrame` for ~60 Hz,
-  optionally an `AudioWorklet` for sample-rate-paced ticks when the
-  graph contains audio sinks.
-- **Wasmtime host**: a busy loop with `std::thread::sleep` honoring
-  the returned hint.
-- **Edge runtime host**: typically request-driven; `kernel_step` runs
-  for a bounded burst per request and the kernel's persistent state
-  lives across requests via host-provided storage.
-
-The kernel does not assume a specific tick rate. Modules already use
-monotonic time for any timing-critical work
-(`module_architecture.md` §3); same rule on WASM.
-
-The host does not poke kernel internals between ticks. Every
-externally-observable change happens inside `kernel_step`. This makes
-the kernel's behavior identical regardless of which host drives it.
+The kernel does not assume a specific tick rate. Modules use monotonic
+time for timing-critical work (`module_architecture.md`), the same
+rule as every target. The host does not poke kernel internals between
+ticks: every externally observable change happens inside
+`kernel_step`, which keeps kernel behaviour identical regardless of
+which host drives it.
 
 ---
 
-## 8. Build Pipeline
+## 8. Build pipeline
 
-The Makefile gains one target row plus the corresponding cargo target
-entries; otherwise the user-visible commands are unchanged:
-
-```sh
-fluxor modules build --target wasm    # → target/wasm/modules/*.fmod
-make firmware   TARGET=wasm    # → target/wasm/firmware.wasm
-fluxor build    config.yaml    # → target/wasm/<config>.wasm  (with target: wasm)
-```
-
-Symmetrical with:
+The user-visible commands parallel the other targets:
 
 ```sh
-fluxor modules build --target rp2350
-make firmware   TARGET=rp2350
-fluxor build    config.yaml    # → target/rp2350/uf2/<config>.uf2
+fluxor modules build --target wasm    # → target/fluxor/wasm/modules/*.fmod
+make firmware   TARGET=wasm           # → target/wasm/firmware.wasm
+fluxor build    config.yaml           # → target/wasm/<config>.wasm  (with target: wasm)
 ```
 
 Internally, `fluxor build` for `target: wasm`:
@@ -318,51 +294,23 @@ Internally, `fluxor build` for `target: wasm`:
 1. Reads `config.yaml`, resolves the module set, packs each module's
    parameters into its `.fmod` TLV section.
 2. Concatenates the selected `.fmod` files into `modules.bin` (same
-   layout as every other target).
-3. Loads `target/wasm/firmware.wasm`, locates the
-   `EMBEDDED_MODULES_BLOB` and `EMBEDDED_CONFIG_BLOB` placeholder
-   passive data segments, and rewrites them with the actual blobs.
+   layout as every other target) and compiles the config to
+   `config.bin`.
+3. Loads `target/wasm/firmware.wasm`, rewrites the two blob
+   placeholders in place (§5), and appends any declared assets.
 4. Writes the result to `target/wasm/<config>.wasm`.
 
-The kernel's Cargo build allocates the placeholder segments at fixed
-sizes large enough to hold the blob plus a small slack; the bundle
-tool refuses to write a `.wasm` that overflows the placeholder and
-prints the required size so the kernel can be rebuilt with a larger
-segment. Same defensive pattern as the rp2350 `modules.bin` size
-limit and the Linux config-arena cap.
-
-A build for `target: wasm` does **not** require selecting a specific
-host. The same `<config>.wasm` is given to a browser shim, a wasmtime
-shim, or an edge-runtime shim unchanged. Hosts differ only in which
-*built-in* modules they provide (audio, video, DOM input, network)
-and in the tick driver. Those built-ins live in the host shim and are
-mounted into the graph at scheduler init via the same builtin-module
-mechanism `fluxor-linux` uses today.
+A build for `target: wasm` does not select a host. The same
+`<config>.wasm` is handed to any host shim unchanged; hosts differ
+only in which built-in modules they provide and in the tick driver.
+Host built-ins are mounted into the graph at scheduler init via the
+same builtin-module mechanism the Linux runtime uses.
 
 ---
 
-## 9. Hosts at a Glance
+## 9. Relationship to the endpoint surface
 
-The platform itself is host-agnostic. Each host's specific contract
-(host-environment imports, built-in module set, audio/visibility
-policy, sandbox quirks) lives in its own doc. Brief sketch:
-
-| Host                   | Tick driver        | Built-in modules                                                                | Doc |
-|------------------------|--------------------|---------------------------------------------------------------------------------|-----|
-| Browser tab            | `requestAnimationFrame` + optional `AudioWorklet` | `wasm_browser_canvas`, `wasm_browser_audio`, `wasm_browser_dom_input`, `wasm_browser_websocket`, `host_browser_fetch` | `wasm_browser_host.md` |
-| `wasmtime` standalone | tick loop with sleep | `wasm_wasmtime_net`, `wasm_wasmtime_audio` (cpal-backed), file storage          | `wasm_wasmtime_host.md` |
-| Edge runtime           | request-driven     | host-specific HTTP / KV / queue / cache adapters                                | per-runtime doc                |
-
-Every host's built-in modules speak the existing AV / input / protocol
-surface families. A WASM-Fluxor instance running in any of these hosts
-joins larger Fluxor graphs the way any other Fluxor peer does — via
-remote channels (`protocol_surfaces.md`).
-
----
-
-## 10. Relationship to the Endpoint Surface
-
-WASM-Fluxor in a browser is **not** the endpoint surface. The endpoint
+WASM-Fluxor in a browser is not the endpoint surface. The endpoint
 surface (`endpoint_capability_surface.md`) covers hosts that don't run
 a kernel — the typed AV / input / control messages cross into a
 non-Fluxor runtime. WASM-Fluxor in a browser runs the kernel; channels
@@ -370,95 +318,79 @@ span the boundary instead.
 
 A browser tab can do either, both, or neither, independently:
 
-- WASM-Fluxor only: the tab loads `<config>.wasm`, joins an upstream
-  Fluxor graph via remote channels.
-- Endpoint surface only: the tab loads the endpoint runtime + an app
-  profile and talks to upstream Fluxor over
-  the endpoint session protocol.
-- Both: a tab might host a WASM-Fluxor for compute peers while also
-  running the endpoint runtime for a presentation surface in the same
-  graph. They don't share state.
+- WASM-Fluxor only: the tab loads `<config>.wasm` and joins an
+  upstream Fluxor graph via remote channels.
+- Endpoint surface only: the tab loads the endpoint runtime plus an
+  app profile and talks to upstream Fluxor over the endpoint session
+  protocol.
+- Both: a tab hosts a WASM-Fluxor for compute while also running the
+  endpoint runtime for a presentation surface in the same graph. They
+  don't share state.
 
 The choice is a deployment decision, not an architectural one. See
 `endpoint_capability_surface.md` §1a.
 
 ---
 
-## 11. Validation
+## 10. Platform invariants
 
-A WASM platform integration is healthy when:
-
-- `fluxor build` for `target: wasm` produces a single `.wasm` file
-  that runs unchanged on at least two host environments (browser +
-  wasmtime), with only host-shim differences.
-- Every existing PIC module that doesn't depend on chip-specific
-  hardware compiles for wasm32 with no source change beyond a
-  `#[cfg]` switch in `modules/sdk/runtime.rs`.
+- `fluxor build` for `target: wasm` produces a single `.wasm` file;
+  host differences live entirely in the host shim.
+- A PIC module that doesn't depend on chip-specific hardware compiles
+  for wasm32 with no source change beyond the SDK runtime's
+  `target_arch` switch.
 - Modules instantiated via `host_instantiate_module` see the same
   `SyscallTable`-equivalent surface they see on rp2350 / bcm2712 /
-  linux. No WASM-specific module logic.
+  linux.
 - The `.fmod` envelope, `modules.bin` layout, manifest hash check,
-  capability matching, content-type validation, and presentation /
-  interaction group rules apply to WASM-bundled modules unchanged.
+  capability matching, content-type validation, and presentation-group
+  rules apply to WASM-bundled modules unchanged.
 - A WASM-Fluxor peer joins an upstream native Fluxor peer via remote
-  channels using only the kernel's existing remote-channel transport
+  channels using the kernel's existing remote-channel transport
   modules.
-- Adding a new host environment (a new browser-WASM runtime, a new
-  edge platform) requires writing a host shim plus the host-specific
-  built-in modules, with no changes to the WASM kernel, the WASM
-  module ABI, or the bundle format.
-
-WASM should feel like one more row in the target table, not a parallel
-universe. The tooling, documentation, and graph definitions for any
-existing config should produce a working `.wasm` for any host where
-the required capabilities are present.
+- Adding a new host environment requires a host shim plus
+  host-specific built-in modules, with no changes to the WASM kernel,
+  the module ABI, or the bundle format.
 
 ---
 
-## 12. Open Items
+## 11. Open items
 
-These are deferred but tracked here for visibility:
+Status: design targets, not wired.
 
-- **WASM threads and shared memory.** The threads proposal lets
-  modules share linear memory and run on parallel workers. Enables
-  zero-copy channels and concurrent module ticks. Requires
-  `SharedArrayBuffer` (COOP/COEP) in browsers. Defer until a workload
-  needs it.
-- **Component Model.** Wraps core WASM modules in a typed-interface
-  envelope. Useful when exposing a Fluxor module as a consumer of
-  non-Fluxor WASM components (or vice versa). Not needed for
-  Fluxor-internal use; revisit when component-model toolchains
-  stabilise.
-- **WASI.** WASI provides POSIX-shaped syscalls. Fluxor's kernel does
-  not need them — `wasm32-unknown-unknown` plus the host imports here
-  are sufficient. WASI may matter on standalone hosts that prefer it
-  as the host import vocabulary; that's a host-doc concern, not a
-  platform-doc concern.
-- **Bundle signing.** The existing `modules.bin` manifest-hash field
-  protects per-module integrity. Bundle-level signature (signing the
-  whole `.wasm`) is a deployment-policy concern handled at the host
-  layer (e.g. browser SRI, wasmtime signature verification).
+- **WASM threads and shared memory.** The threads proposal would allow
+  zero-copy channels and concurrent module ticks; it requires
+  `SharedArrayBuffer` (COOP/COEP) in browsers. Deferred until a
+  workload needs it.
+- **Component Model.** Useful when exposing a Fluxor module to
+  non-Fluxor WASM components; not needed for Fluxor-internal use.
+- **WASI.** The kernel does not need POSIX-shaped syscalls —
+  `wasm32-unknown-unknown` plus the imports here are sufficient. WASI
+  could matter as the import vocabulary on a standalone host; that is
+  a host-doc concern.
+- **Bundle signing.** The `modules.bin` manifest-hash field protects
+  per-module integrity; whole-bundle signature is a deployment-policy
+  concern at the host layer.
 - **Live module reload.** WASM hosts can instantiate new module
-  versions without restarting the kernel. The reconfigure framework
-  (`reconfigure.md`) already covers the in-graph drain/swap dance;
-  WASM just changes the loader call from PIC mmap to
-  `host_instantiate_module`. Land reconfigure on WASM as a follow-up
-  when there's a use case.
+  versions without restarting the kernel; the reconfigure framework
+  (`reconfigure.md`) covers the in-graph drain/swap sequence, and on
+  WASM the loader call is `host_instantiate_module` instead of a PIC
+  map.
 
 ---
 
-## 13. Related Documentation
+## 12. Related documentation
 
-- `architecture/abi_layers.md` — kernel ABI layers; the
-  `kernel_abi` layer is what WASM modules see via WASM imports the
-  same way native modules see it via `SyscallTable`.
-- `architecture/module_architecture.md` — module interface contract,
+- `abi_layers.md` — kernel ABI layers; the `kernel_abi`
+  layer is what WASM modules see via WASM imports the same way native
+  modules see it via `SyscallTable`.
+- `module_architecture.md` — module interface contract,
   identical across targets.
-- `architecture/protocol_surfaces.md` — remote-channel surface that
+- `protocol_surfaces.md` — remote-channel surface that
   WASM-Fluxor peers use to join larger graphs.
-- `architecture/endpoint_capability_surface.md` — external-host
+- `endpoint_capability_surface.md` — external-host
   surface for environments that don't run a kernel.
-- `architecture/reconfigure.md` — drain / migrate phases that apply
+- `reconfigure.md` — drain / migrate phases that apply
   unchanged to WASM hosts.
-- `architecture/wasm_browser_host.md` — browser host shim, built-in
-  modules, audio unlock, background-throttle policy.
+- `wasm_browser_host.md` — browser host page, shims, and
+  built-in modules.

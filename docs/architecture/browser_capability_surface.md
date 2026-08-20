@@ -3,12 +3,14 @@
 The browser is a profile of the endpoint capability surface defined in
 `endpoint_capability_surface.md`. This document specifies the
 browser-specific bindings: which web platform APIs implement each
-generic concept, which browser quirks the runtime must absorb, and
+generic concept, which browser constraints the runtime absorbs, and
 which capability names describe browser-specific platform features.
 
 This document is normative only for browser endpoints. The shape of
 an endpoint, its role decomposition, its session protocol, and its
-audio routing modes are owned by the endpoint surface.
+audio routing modes are owned by the endpoint surface. A browser tab
+that runs a WASM Fluxor kernel is a different thing entirely; see
+`wasm_platform.md` and `wasm_browser_host.md`.
 
 ---
 
@@ -16,58 +18,59 @@ audio routing modes are owned by the endpoint surface.
 
 This profile defines:
 
-- which web platform APIs realize each generic endpoint role
+- which web platform APIs realise each generic endpoint role
+- the shipped browser runtime core (`endpoint_runtime.js`)
 - browser-specific capability names under `browser.*`
-- browser quirks the runtime must absorb (audio unlock, background
-  throttling, DOM event quirks, blur / focus / repeat policy)
+- browser constraints the runtime absorbs (audio unlock, background
+  throttling, sandboxed storage)
 - transport options a browser endpoint can speak
 - module and asset naming for browser endpoints
 
 It does not define:
 
-- new media or input primitives (delegated to AV / input surfaces)
+- new media or input primitives (delegated to the AV / input surfaces)
 - the endpoint role decomposition, session protocol, or audio routing
   modes (delegated to the endpoint surface)
 - a JavaScript application framework
-- a single module that hides every browser behavior
 
 ---
 
-## 2. Web API Realization
+## 2. Web API realisation
 
-Each generic endpoint surface concept maps to one or more web
-platform APIs. The implementation column is browser-specific; the
-surface column is not.
+Each generic endpoint surface concept maps to one or more web platform
+APIs. The implementation column is browser-specific; the surface
+column is not.
 
 ### AV surfaces
 
-| Fluxor surface                          | Browser implementation                                                  |
-|-----------------------------------------|-------------------------------------------------------------------------|
-| `AudioSample`                           | WebAudio PCM sink, usually via an AudioWorklet for timed playback       |
-| `AudioEncoded` / codec-tagged variants  | WebCodecs, Media Source Extensions, WASM decoder, or pass-through       |
-| `VideoRaster`                           | Canvas, WebGL texture upload, ImageBitmap, or WebGPU texture            |
-| `VideoDraw`                             | DOM / canvas retained UI renderer or app-specific draw-list renderer    |
-| `VideoEncoded`                          | WebCodecs or Media Source Extensions                                    |
-| `MediaMuxed`                            | MediaElement, MSE, or recording / broadcast path                        |
+| Fluxor surface  | Browser implementation                                                |
+|-----------------|-----------------------------------------------------------------------|
+| `AudioSample`   | WebAudio PCM sink via an AudioWorklet for timed playback              |
+| `AudioEncoded`  | WebCodecs, Media Source Extensions, WASM decoder, or pass-through     |
+| `VideoRaster`   | Canvas, WebGL texture upload, ImageBitmap, or WebGPU texture          |
+| `VideoDraw`     | DOM / canvas retained UI renderer or app-specific draw-list renderer  |
+| `VideoEncoded`  | WebCodecs or Media Source Extensions                                  |
+| `MediaMuxed`    | MediaElement, MSE, or recording / broadcast path                      |
 
 ### Input sources
 
-| Browser source            | Fluxor surface                                          |
-|---------------------------|---------------------------------------------------------|
-| DOM `KeyboardEvent`       | `InputKeyEvent`                                         |
-| `PointerEvent` (mouse)    | `InputPointerEvent`                                     |
-| `PointerEvent` (stylus)   | `InputPointerEvent` with pressure / tilt                |
-| `TouchEvent` contacts     | `InputTouchEvent`                                       |
-| `Gamepad` API             | `InputBinaryState` + `InputScalarState` (gamepad profile) |
-| WebXR pose                | `InputVectorEvent` / `InputVectorState`                 |
-| Form text / paste / IME   | `InputText`                                             |
-| Page virtual control      | `InputBinaryState` / `InputScalarState`                 |
-| App-semantic button       | `InputAction`                                           |
+Browser DOM events map onto the per-class input surfaces defined in
+`input_capability_surface.md`:
+
+| Browser source                    | Fluxor surface                        |
+|-----------------------------------|---------------------------------------|
+| DOM `KeyboardEvent`               | `KeyEvents`                           |
+| `PointerEvent` (mouse / stylus / touch) | `PointerEvents`                 |
+| `Gamepad` API                     | `GamepadEvents`                       |
+| Web MIDI                          | `MidiEvents`                          |
+| Page virtual button               | button wire (`OctetStream` transitions) |
+| App-semantic overlay control      | action wire (FNV-hashed FMP command)  |
+| Viewport / modality / audio state | `SurfaceTraits`                       |
 
 ### Audio routing modes
 
-The four generic audio routing modes (§9 of the endpoint surface) bind
-to web APIs as follows:
+The four generic audio routing modes (endpoint surface §9) bind to web
+APIs as follows:
 
 | Mode             | Browser implementation                                              |
 |------------------|---------------------------------------------------------------------|
@@ -78,15 +81,54 @@ to web APIs as follows:
 
 ---
 
-## 3. Browser Capability Names
+## 3. Shipped runtime core
+
+Source: `src/platform/wasm/host/endpoint_runtime.js`,
+`src/platform/wasm/host/browser_surface.css`.
+
+`endpoint_runtime.js` is the generic, reusable browser-endpoint
+runtime for pure-JS endpoints: pages that talk to a Fluxor producer
+over WebSocket without downloading a WASM kernel. It loads as a plain
+`<script>` tag, attaches `window.BrowserSurface`, and owns the generic
+mechanics:
+
+- **Connection** — WebSocket connect and reconnect, packet dispatch
+  over the `[kind | flags | reserved | payload_len]` envelope, with
+  per-kind handler registration.
+- **Audio** — lazy `AudioContext` creation, gesture-driven `unlock()`,
+  and timed PCM scheduling. Browsers require the first `unlock()` to
+  run inside a user gesture handler; PCM arriving before unlock queues
+  and flushes after it.
+- **Raster** — RGB565 raster sink helpers drawing into a page canvas.
+- **Input** — input capture lifecycle and button binding
+  (`createInput().bindButtons(...)`).
+- **Touch shell** — `createPlayerShell()` composes a canvas-plus-
+  controls layout (d-pad, face, menu, row control groups) and
+  `applyTouchDefaults()` injects `browser_surface.css`, the
+  system-neutral touch-UI primitive: iOS callout suppression,
+  orientation-driven flex layout, base button visuals, themeable via
+  CSS custom properties.
+
+Profile-specific code (renderers, keymaps, wire encoders) lives next
+to the application page that loads the runtime, as a
+`<profile>_browser_profile.js` alongside the generic core. Sibling
+projects carry their own profiles against this runtime.
+
+---
+
+## 4. Browser capability names
 
 Generic role and routing-mode names live under `endpoint.*` in the
 parent surface. Browser-specific *platform feature* names live here
-and are advertised in the `<host>:` block of the capability
-advertisement.
+and belong in the `<host>:` block of the capability advertisement
+defined by the endpoint surface.
+
+Status: design target, not wired. The runtime does not yet detect and
+advertise these names; the table fixes the vocabulary a browser
+endpoint will use.
 
 | Capability                 | Meaning                                                           |
-|----------------------------|-------------------------------------------------------------------|
+|----------------------------|--------------------------------------------------------------------|
 | `browser.media_element`    | Can play direct media URLs through `HTMLMediaElement`             |
 | `browser.webaudio`         | Can play or process audio through WebAudio                        |
 | `browser.audio_worklet`    | Can run a worklet-backed timed PCM sink                           |
@@ -100,45 +142,23 @@ advertisement.
 | `browser.websocket`        | Can connect via WebSocket                                         |
 | `browser.webtransport`     | Can connect via WebTransport                                      |
 
-Feature presence is detected by the runtime at startup and advertised
-in the `Hello` / `Caps` exchange. The Fluxor-side gateway picks a
-routing mode whose feature set is satisfied by the advertisement.
-
 ---
 
-## 4. Browser Runtime Concerns
+## 5. Browser constraints
 
-The generic endpoint runtime (§8 of the parent surface) absorbs most
-host mechanics. The following are browser-specific and live in a
-browser extension to that runtime.
+Three web-platform facts shape every browser endpoint, and the
+advertised constraints in the endpoint capability block reflect them:
 
-- **Audio unlock.** `AudioContext` cannot start without a user
-  gesture. The runtime intercepts the first qualifying gesture
-  (`pointerdown`, `keydown`, `touchstart`) and resumes the context
-  before scheduling any audio. Until then, audio routing falls back
-  to control-only.
+- **Audio unlock.** An `AudioContext` cannot start without a user
+  gesture. The runtime's `unlock()` must be called from a gesture
+  handler; until then audio routing is effectively control-only.
 - **Background throttling.** When `document.visibilityState` is
   `hidden`, browsers may throttle timers and downgrade audio
-  scheduling. The runtime emits `Telemetry` reports on visibility
-  transitions so the gateway can decide whether to drain, pause, or
-  switch to encoded-only delivery.
-- **Sandboxed storage.** Cache role uses `Cache Storage`, IndexedDB,
-  or `OPFS`. Quotas are origin-scoped and may be evicted; the cache
-  contract must remain best-effort.
-- **DOM event quirks.** Key repeat, focus / blur cleanup, pointer
-  capture, composition events, and synthetic touch / pointer
-  duplication are normalized inside the runtime so the gateway sees
-  clean `InputKeyEvent` / `InputPointerEvent` / `InputTouchEvent`
-  streams. Application code never sees the raw DOM.
-- **Permissions.** Microphone, camera, gamepad, midi, and XR access
-  follow the Permissions API model. The runtime requests on demand
-  and surfaces denials as capability downgrades, not errors.
-- **Tab lifecycle.** `pagehide` / `pageshow`, `freeze` / `resume`,
-  and BFCache restoration are mapped to session epoch handling so
-  reconnects after a suspended tab don't desynchronize.
-
-The advertised constraints in the capability block reflect these
-concerns:
+  scheduling. A producer deciding whether to drain, pause, or switch
+  delivery needs visibility transitions surfaced, not hidden.
+- **Sandboxed storage.** Host-side cache storage (Cache Storage,
+  IndexedDB, OPFS) is origin-scoped and may be evicted, so the cache
+  role stays best-effort.
 
 ```text
 constraints:
@@ -149,17 +169,19 @@ constraints:
 
 ---
 
-## 5. Transport Fit
+## 6. Transport fit
 
-Browsers can speak any of the protocol surfaces in
-`protocol_surfaces.md`, subject to web platform availability:
+Browsers can speak the protocol surfaces in `protocol_surfaces.md`,
+subject to web platform availability:
 
-- **WebSocket** — stream-shaped record framing over an HTTP/1, /2, or
-  /3 upgrade. Broadly available; the default first transport for new
-  browser endpoints. Already exposed by the `http` module.
+- **WebSocket** — stream-shaped record framing over an HTTP upgrade.
+  Broadly available and the default first transport for browser
+  endpoints; the runtime core connects over it, and wave's HTTP
+  gateway serves the upgrade on the Fluxor side.
 - **WebTransport** — multiplexed-session and datagram surface over
   HTTP/3. The natural fit when migration, low-latency datagrams, or
-  per-stream backpressure matter. Availability varies.
+  per-stream backpressure matter. Availability varies; not used by
+  the shipped runtime.
 - **HTTP range** — request / response. Used by direct-media routing,
   not by the session protocol itself.
 - **Server-Sent Events** — one-way stream from server to browser.
@@ -171,48 +193,46 @@ profile only determines which transports a browser can negotiate.
 
 ---
 
-## 6. Module and Asset Naming
+## 7. Module and asset naming
 
-- Fluxor-side gateway: `browser_endpoint_gateway` (extends the
-  generic gateway with browser-specific packetization where needed,
-  for example PCM-block sizing tuned to AudioWorklet quanta).
-- Browser-side runtime: `browser_endpoint_runtime.js` (extends the
-  generic `endpoint_runtime.js` with the §4 concerns).
-- Browser-side helpers may follow the pattern
-  `browser_audio_sink.js`, `browser_input_source.js`,
-  `browser_raster_sink.js`, `browser_draw_sink.js`.
-- Application profiles: `<app>_browser_profile` for both module and
-  asset naming.
+The naming convention follows the endpoint surface's module and
+runtime naming rules:
 
-The application profile is application-specific. The runtime and
-gateway are reusable across applications. Adding a new
-browser-facing application produces a new profile, never a new copy
-of the runtime.
+- Fluxor-side gateway modules for this profile take the
+  `browser_endpoint_*` prefix.
+- The browser-side generic core is `endpoint_runtime.js`;
+  browser-wide extensions layer on it rather than fork it.
+- Application profiles use `<app>_browser_profile` for both module
+  and asset naming.
+
+The application profile is application-specific; the runtime core is
+reusable across applications. Adding a new browser-facing application
+produces a new profile, never a new copy of the runtime.
 
 ---
 
-## 7. Validation
+## 8. Validation
 
 A browser endpoint integration is healthy when, in addition to the
 generic endpoint validation rules:
 
-- Audio unlock is implemented once in the browser runtime, not per
+- Audio unlock is implemented once in the runtime core, not per
   application page.
-- Application code never reads DOM events directly; it reads only
-  normalized `Input*` surfaces.
+- Application code never reads DOM events directly; it reads only the
+  normalised input surfaces.
 - Feature detection picks the highest-fidelity audio routing mode the
   capability advertisement supports, with documented fallback.
 - Background-throttling transitions are reported, not silently
   dropped.
-- Cache role is best-effort and never required for correctness.
+- The cache role is best-effort and never required for correctness.
 
-The browser should feel like one profile of the endpoint surface,
-interchangeable with mobile, desktop, headset, or kiosk profiles to
-the rest of the graph.
+A browser endpoint is one profile of the endpoint surface,
+interchangeable with mobile, desktop, headset, or kiosk profiles from
+the rest of the graph's point of view.
 
 ---
 
-## 8. Related Documentation
+## 9. Related documentation
 
 - `architecture/endpoint_capability_surface.md` — generic endpoint
   surface this profile refines. Owns role decomposition, session
@@ -224,5 +244,6 @@ the rest of the graph.
 - `architecture/protocol_surfaces.md` — protocol substrate WebSocket
   and WebTransport ride on.
 - `architecture/capability_surface.md` — capability matching and
-  content types; hosts both the `endpoint.*` and `browser.*`
-  capability names.
+  content types.
+- `architecture/wasm_browser_host.md` — the browser as a WASM kernel
+  host rather than an endpoint.

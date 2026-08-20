@@ -1,16 +1,14 @@
 # Publishing fluxor artefacts
 
-This guide is for fluxor maintainers — "I just edited fluxor, how
-do I get my changes into downstream projects?" If you're on the
-consumer side trying to figure out how to **use** fluxor in your
-own project, see your project's own `docs/consuming_fluxor.md` (or
-equivalent).
+This guide is for fluxor maintainers: "I just edited fluxor, how do
+I get my changes into downstream projects?" If you are on the
+consumer side trying to use fluxor in your own project, see that
+project's own `docs/consuming_fluxor.md` (or equivalent).
 
-The prescriptive standard is at
-[`../../../standards/dependencies.md`](../../../standards/dependencies.md).
-This file is the how-to.
+Source: `tools/src/store_publish.rs`, `tools/src/oci_store.rs`,
+`tools/src/store_sync.rs`, `tools/src/store_resolve.rs`.
 
-## TL;DR
+## The short version
 
 ```sh
 make publish
@@ -19,7 +17,7 @@ make publish
 In fluxor's checkout. That builds fluxor's owned artefacts (fmods
 for every silicon target, the linux runtime, the CLI) and runs
 `fluxor publish`, which writes them all into the local OCI store in
-**one transaction**: blobs staged first, then every `:ver` and
+one transaction: blobs staged first, then every `:ver` and
 `:latest` tag plus the project index repointed in a single locked
 `index.json` write. Partial publish is impossible by construction.
 Consumers pick up the new state with `fluxor sync` (workspace
@@ -39,11 +37,11 @@ project index (`fluxor/meta`) lists:
 | Runtimes | `fluxor-linux` and the `fluxor` CLI itself, one binary layer per host triple | `fluxor/run/<name>-<triple>:<ver>` |
 | Project index | standard OCI index over the artefact manifests above; annotations carry fluxor's dependency declarations | `fluxor/meta:<ver>` |
 
-`fluxor publish --only <selector>` scopes the publish to a subset
-(a module name, a kind); the transaction and the index rewrite
-cover exactly what was published.
+`fluxor publish --only <kind>` scopes the publish to a subset of
+artefact kinds (`source`, `fmod`, `runtime`); the transaction and
+the index rewrite cover exactly what was published.
 
-Only fluxor publishes runtimes — the `fluxor/run/` namespace is
+Only fluxor publishes runtimes; the `fluxor/run/` namespace is
 reserved. A sibling "runtime" is a graph on `fluxor-linux`.
 
 ## Annotations every publish stamps
@@ -55,21 +53,21 @@ reserved. A sibling "runtime" is a graph on `fluxor-linux`.
   fmods, the tree itself for source artefacts). This is what makes
   downstream staleness advisories exact: comment and formatting
   churn is digest-neutral.
-- `io.fluxor.ci-digest` — the input digest the `ci` gate last
-  passed on. `fluxor ci` on green writes a stamp under
-  `target/fluxor/`; publish annotates `ci-digest` when the
-  artefact's current input digest appears in the stamp and omits it
-  otherwise. Information, never a gate — publish does not refuse on
-  ci state.
-- provenance (`local-build` vs `published`) and `source-rev` (+
-  dirty bit). `local-build` is ordinary dev flow: every publish is
-  a real, consumable store write, distinguished by annotation, not
-  by filename or a separate shelf. Runtimes' staleness signal is
-  rev-scoped (their inputs are effectively the whole kernel tree).
+- `io.fluxor.ci-digest` — records whether the artefact was built
+  from a verified tree: publish annotates it when the artefact's
+  current input digest matches the last verification stamp under
+  `target/fluxor/`, and omits it otherwise. Information, never a
+  gate — publish does not refuse on its absence.
+- provenance (`local-build` vs `published`) and `source-rev` (plus
+  a dirty bit). `local-build` is ordinary dev flow: every publish
+  is a real, consumable store write, distinguished by annotation,
+  not by filename or a separate shelf. Runtimes' staleness signal
+  is rev-scoped (their inputs are effectively the whole kernel
+  tree).
 
-Every publish ends with the GC sweep: superseded blobs live until
-no tag, snapshot, or workspace member's `fluxor.lock` pins them,
-then go.
+Every publish ends with a GC sweep: superseded blobs live until no
+tag, snapshot, or workspace member's `fluxor.lock` pins them, then
+go.
 
 ## First-time setup (per developer machine)
 
@@ -77,19 +75,19 @@ then go.
 make install
 ```
 
-**Bootstrap only** — the first build on an empty-store machine. It
+Bootstrap only — the first build on an empty-store machine. It
 builds the CLI, publishes it as a runtime artefact, and installs
 the launcher at `~/.cargo/bin/fluxor` (resolve `:latest`, exec the
 content-addressed blob). After that there is no installed copy to
 go stale: every `fluxor publish` that covers the CLI repoints
-`:latest`, and the next invocation *is* the new CLI. An empty store
+`:latest`, and the next invocation is the new CLI. An empty store
 reports the path back here:
-`no fluxor CLI in store — run 'make install' from a fluxor checkout`.
+``no fluxor CLI in store — run `make install` from a fluxor checkout``.
 
-## Daily — keeping downstream projects current
+## Daily: keeping downstream projects current
 
 One flow. Whether the consumer is a workspace member or a pinned
-checkout changes only how it *resolves*, never how you publish.
+checkout changes only how it resolves, never how you publish.
 
 ```sh
 # in fluxor/, after editing
@@ -102,7 +100,7 @@ fluxor publish              # or `make publish` for a full build-then-publish
 - **Workspace members** (`~/.fluxor/workspace.toml`) pick the
   change up on their next `fluxor sync`: sync resolves fluxor's
   artefacts to `:latest` and writes the resolved digests through
-  the consumer's `fluxor.lock` — the change is visible as an
+  the consumer's `fluxor.lock`, so the change is visible as an
   ordinary lockfile diff.
 - **Pinned checkouts** stay on their digests until they run
   `fluxor update`.
@@ -117,9 +115,7 @@ Sync in a consumer compares each live member artefact's current
 input digest against the published annotation and warns per
 artefact — e.g. `warning: module 'tls' inputs changed since publish
 (fluxor)` — then proceeds. The same data shows in `fluxor workspace
-status`. The one place staleness is a hard failure is `fluxor ci`:
-a green gate against a known-stale upstream would be a clean build
-wearing a misleading name.
+status`.
 
 ### Batching: `fluxor workspace publish`
 
@@ -140,7 +136,7 @@ transactional, so the prefix is a coherent store state).
 
 ## Version discipline
 
-`[project].version` in `fluxor.toml` is a **label**: it becomes the
+`[project].version` in `fluxor.toml` is a label: it becomes the
 `<ver>` component of every published tag, carried for human
 readability. Resolution never orders versions — `:latest` is the
 only tag with semantics, and consumers pin digests. Keep the label
@@ -150,19 +146,19 @@ do anything mechanical.
 
 ## The epoch (ABI surface)
 
-Cross-artefact compatibility is the **epoch** — the ABI-surface
-digest annotated on every artefact — not a version number.
+Cross-artefact compatibility is the epoch — the ABI-surface digest
+annotated on every artefact — not a version number.
 `fluxor abi-regen` is the epoch's single writer; run it when the
 ABI surface genuinely moves (wire structs, opcodes, contract IDs),
-then rebuild and publish. Wire-stable improvements — faster crypto,
-new modules, better algorithms — leave the epoch untouched and cost
+then rebuild and publish. Wire-stable improvements (faster crypto,
+new modules, better algorithms) leave the epoch untouched and cost
 consumers nothing.
 
 An epoch move cascades by design: every fmod's input digest changes
 at once, `workspace publish` republishes everything, and consumers'
 sync enforces epoch homogeneity across their resolved set (a
 mixed-epoch lockfile is a hard error naming `fluxor update`). Live
-members must additionally match the *current* surface — that hard
+members must additionally match the *current* surface; that hard
 error names `fluxor workspace publish`.
 
 ## Naming a released set
@@ -182,20 +178,21 @@ retained. A consumer restores one with
 
 ```sh
 fluxor store ls                # everything in the store
-fluxor inspect <ref>           # sha256:… or tag: kind, tags, epoch ✓/✗ vs current
-                               # surface, input-digest, ci-digest, provenance,
-                               # source-rev, layers
-fluxor workspace status        # members + per-artifact staleness
+fluxor inspect <ref>           # sha256:… or tag: kind, tags, epoch vs current
+                               # surface, input digest, provenance,
+                               # source rev, layers
+fluxor workspace status        # members + per-artefact staleness
 ```
 
-The store is a real on-disk OCI image layout (`$FLUXOR_STORE`,
-default `~/.local/share/fluxor/store`) — every construct in it is
-expressible against a stock OCI registry.
+The store is a real on-disk OCI image layout
+(`$XDG_DATA_HOME/fluxor/store`, typically
+`~/.local/share/fluxor/store`, override `$FLUXOR_STORE`); every
+construct in it is expressible against a stock OCI registry.
 
 ## When something is wrong
 
-- **`no fluxor CLI in store — run 'make install' from a fluxor
-  checkout`** — empty store or missing CLI tag; run the bootstrap.
+- ``no fluxor CLI in store — run `make install` from a fluxor
+  checkout`` — empty store or missing CLI tag; run the bootstrap.
 - **A live member's artefact has no `:latest` tag** — the member
   has never published; the error names `fluxor publish` in that
   member.
@@ -205,16 +202,16 @@ expressible against a stock OCI registry.
 - **A consumer reports a mixed-epoch lockfile** — the resolved set
   straddles an ABI-surface move; `fluxor update` in the consumer
   advances the whole set.
-- **A consumer's sync says a pinned digest is `no longer in store —
-  run 'fluxor update'`** — the blob was garbage-collected (the
-  checkout isn't a workspace member, so its pins aren't GC roots);
-  `fluxor update && fluxor sync` there recovers in one step.
-- **Publish reports a cross-project name collision** — module and
-  bundle names are ecosystem-unique; the error names both owners.
-  Rename one.
+- **A consumer's sync reports a pinned digest missing from the
+  store** (the error names `fluxor update`) — the blob was
+  garbage-collected (the checkout isn't a workspace member, so its
+  pins aren't GC roots); `fluxor update && fluxor sync` there
+  recovers in one step.
+- **The module build reports an artefact name collision** — two
+  module sources (a `<module>-<variant>` and a module directory of
+  that literal name) would produce the same `<name>.fmod`; the
+  error names both manifests. Rename one.
 
 ## Related reading
 
-- [`../../../standards/dependencies.md`](../../../standards/dependencies.md) — prescriptive contract
-- [`../../../standards/fluxor-modules.md`](../../../standards/fluxor-modules.md) — module-level standard
 - [`../architecture/abi_layers.md`](../architecture/abi_layers.md) — what's actually in the ABI tier

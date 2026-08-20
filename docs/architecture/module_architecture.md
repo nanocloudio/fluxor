@@ -77,8 +77,8 @@ delivery, heavy logging).
 
 ### 4) Timer start is anchored to event commitment
 
-**Rule:** If an event’s duration is defined as “N ms after value X is delivered”,
-the timer must be initialized at the moment X is delivered—not at module
+**Rule:** If an event's duration is defined as "N ms after value X is delivered",
+the timer must be initialised at the moment X is delivered, not at module
 creation and not at the next `module_step`.
 
 **Rationale:** Prevents "first event too long" and start-up skew.
@@ -182,10 +182,12 @@ immediately before push.
 **Rationale:** Makes composition safe and prevents phase/time corruption.
 
 **Burst stepping:** Returning `2` (Burst) requests immediate re-step within the
-same tick, up to `MAX_BURST_STEPS` (4) additional steps. Each individual burst
-step must still satisfy all the rules above — Burst does not relax the bounded
-work contract. It is a scheduling hint for compute-heavy modules that can
-productively do multiple chunks per tick (see `guides/compute_heavy_modules.md`).
+same tick. The scheduler bounds the burst by a time deadline (the module's
+declared burst deadline, or the step deadline times a fixed multiplier) and by
+the domain budget, so each individual burst step must still satisfy all the
+rules above; Burst does not relax the bounded work contract. It is a scheduling
+hint for compute-heavy modules that can productively do multiple chunks per
+tick (see [../guides/compute_heavy_modules.md](../guides/compute_heavy_modules.md)).
 
 ---
 
@@ -195,7 +197,7 @@ productively do multiple chunks per tick (see `guides/compute_heavy_modules.md`)
 issues without intrusive debug changes.
 
 **Minimum expectation:**
-- initialization and error transitions are visible
+- initialisation and error transitions are visible
 - drop/starvation/backpressure counters are available where relevant
 - periodic status reporting is optional but supported
 
@@ -216,6 +218,8 @@ allowing hardware-specific driver modules to remain isolated and composable.
 
 ## Module Interface Contract
 
+Source: `src/kernel/module/loader.rs`, `tools/src/modules.rs`
+
 Modules are isolated runtime units with a stable kernel boundary.
 
 ### Lifecycle Shape
@@ -224,11 +228,12 @@ Each dynamic module follows this lifecycle:
 
 1. `module_state_size()` declares state memory requirements.
 2. `module_init(syscalls)` receives the syscall table.
-3. `module_new(...)` binds channels, parses params, and initializes module state.
+3. `module_new(...)` binds channels, parses params, and initialises module state.
 4. `module_step(state)` advances the state machine cooperatively.
 5. Module teardown occurs by graph reset/reconfigure and arena reset.
 
-This contract keeps modules loadable, relocatable, and independent of board-specific firmware code.
+This contract keeps modules loadable, relocatable, and independent of
+board-specific firmware code.
 
 ### Binary and Loader Contract
 
@@ -240,7 +245,10 @@ The runtime loader enforces a concrete module binary contract:
   `module_init`, `module_new`, `module_step`
 - Optional exports: `module_channel_hints`, `module_arena_size`,
   `module_drain`, `module_deferred_ready`, `module_mailbox_safe`,
-  `module_in_place_safe`
+  `module_in_place_safe`, `module_pipeline_refill`,
+  `module_post_tick_flush`, `module_isr_init` / `module_isr_entry`,
+  and the provider-contract exports (`module_provider_dispatch`,
+  `module_provides_contract`, `module_provider_selector`)
 - The header carries schema/manifest section sizes, capability flag
   byte (`reserved[0]`), and required capability bits
 - Parameter schema and manifest payloads are embedded in the `.fmod` image
@@ -251,10 +259,11 @@ The runtime loader enforces a concrete module binary contract:
   (`IntegrityMismatch`); with the `enforce_signatures` feature set,
   unsigned modules and bad signatures are rejected
   (`SignatureInvalid`). `fluxor modules sign` produces signed manifests; see
-  `security.md` for the trust chain and `network_boot.md` for the
-  deployment-time use of the same signing key.
+  [security.md](security.md) for the trust chain and
+  [network_boot.md](network_boot.md) for the deployment-time use of the
+  same signing key.
 
-Module sources include three SDK files via the standard pattern:
+Module sources include the SDK via the standard pattern:
 
 ```rust
 #![no_std]
@@ -266,47 +275,48 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
-include!("../../sdk/params.rs");
+include!("../../sdk/runtime/params.rs");
 ```
 
-`modules/sdk/abi.rs` is the *assembler* for the layered ABI. The
-actual content lives under `modules/sdk/kernel_abi.rs` (core
-primitives), `modules/sdk/contracts/{hal,net,storage,key_vault}.rs`
-(portable domain contracts), `modules/sdk/internal/*.rs`
-(kernel-private orchestration), and `modules/sdk/platform/{rp,bcm2712}/*.rs`
-(chip-specific raw register bridges). The assembler composes them
-into the `abi` namespace. There is no `dev_*` facade anymore; every
-opcode lives in exactly one layer file and consumers import by its
-real path. `abi_layers.md` is the public reference for the layering
-rules.
+`modules/sdk/abi.rs` is the assembler for the layered ABI. The
+actual content lives under `modules/sdk/abi/kernel_abi.rs` (core
+primitives), `modules/sdk/contracts/` (portable domain contracts such
+as `hal/`, `net/`, `storage/`, `key_vault.rs`),
+`modules/sdk/internal/` (kernel-private orchestration), and
+`modules/sdk/platform/` (chip-specific raw register bridges). The
+assembler composes them into the `abi` namespace; every opcode lives
+in exactly one layer file and consumers import it by its real path.
+[abi_layers.md](abi_layers.md) is the public reference for the
+layering rules.
 
 `runtime.rs` contains compiler intrinsics and helper functions every
-PIC module needs. `params.rs` provides the `define_params!` macro and
-parameter schema encoding. External modules can include the same SDK
-files via a relative path through their checked-out Fluxor SDK.
+PIC module needs. `runtime/params.rs` provides the `define_params!`
+macro and parameter schema encoding. External modules can include the
+same SDK files via a relative path through their checked-out Fluxor
+SDK.
 
 **Built-in modules** (`builtin = true` in their `manifest.toml`) are
 compiled directly into the kernel binary rather than shipped as
 `.fmod` images. Since there is no `.fmod` to embed a `define_params!`
 schema into, built-ins declare their parameter schema in the manifest
-TOML under a `[[params]]` section — same wire format (TLV) as PIC
+TOML under a `[[params]]` section: the same wire format (TLV) as PIC
 modules, but the schema is read off disk at config-build time.
 
 Built-in manifests live under `modules/platform/<platform>/<name>/`,
 with `linux/` for Linux-host APIs and `host/` for host-OS-agnostic
 pure-Rust modules. The Rust implementation sits in
 `src/platform/<platform>/<name>.rs`. Built-in vs PIC is a
-**deployment** distinction (linked-in vs loaded-at-runtime), not a
-selection one — `stacks/*.toml` route logical surfaces to either kind
+deployment distinction (linked-in vs loaded-at-runtime), not a
+selection one: `stacks/*.toml` route logical surfaces to either kind
 transparently.
 
-See `abi_layers.md` for the schema, validation rules
+See [abi_layers.md](abi_layers.md) for the schema, validation rules
 (unknown-key/range/required), the runtime-feature cross-check, and
 the full module-categories layout. The kernel itself sees only the
 resulting TLV bytes; built-in vs PIC is invisible at the wire layer.
 
-See `src/kernel/loader.rs`, `modules/module.ld`, and `tools/src/modules.rs`
-for the loader, linker script, and pack tool.
+See `src/kernel/module/loader.rs`, `modules/sdk/module.ld`, and
+`tools/src/modules.rs` for the loader, linker script, and pack tool.
 
 ### Step Outcome Contract
 
@@ -315,37 +325,39 @@ for the loader, linker script, and pack tool.
 - `0`: Continue (yield, no terminal state)
 - `1`: Done (module reached terminal completion)
 - `2`: Burst (request immediate re-step in the same scheduler cycle)
-- `3`: Ready (initialization complete, downstream may run)
+- `3`: Ready (initialisation complete, downstream may run)
 - `<0`: Error (errno-style failure)
 
-`Burst` is a scheduling hint, not a license for unbounded work. Each step
+`Burst` is a scheduling hint, not a licence for unbounded work. Each step
 call remains bounded and non-blocking.
 
 `Ready` participates in the deferred-ready chain. A module that exports
 `module_deferred_ready` (header flag bit 2) gates its downstream consumers
 until it returns `Ready` from a step. This is how drivers like cyw43 and
-the IP module signal "I am initialized" without the kernel needing to
-know what initialization means for any specific device.
+the IP module signal "I am initialised" without the kernel needing to
+know what initialisation means for any specific device.
 
 ### Drain Contract (Live Reconfigure)
 
 Modules that export `module_drain` participate in graceful shutdown
 during a live graph reconfigure. The pack tool sets header flag bit 3
-(`drain_capable`) when the export is present. During the `DRAINING`
+(`drain_capable`) when the export is present. During the `Draining`
 phase, the scheduler calls `module_drain(state)` once on the module
-(in reverse topological order) to signal "stop accepting new work."
+(in reverse topological order) to signal "stop accepting new work".
 The module then continues stepping normally until in-flight work is
 complete and it returns `Done` (1) from `module_step`. After all
 drain-capable modules have completed, the scheduler transitions to
-`MIGRATING` and instantiates the new graph.
+`Migrating` and instantiates the new graph.
 
-See `architecture/reconfigure.md` for the full state machine.
+See [reconfigure.md](reconfigure.md) for the full state machine.
 
 ### Fault Recovery
 
+Source: `src/kernel/exec/step_guard.rs`
+
 Modules can be assigned a protection level at config time:
 
-- **Level 0 (None)** — direct call, no isolation. Same as historical behavior.
+- **Level 0 (None)** — direct call, no isolation.
 - **Level 1 (Guarded)** — step guard timer detects timeouts. A module
   that overruns its step deadline is marked as faulted.
 - **Level 2 (Isolated)** — hardware memory protection (MPU on RP2350,
@@ -353,17 +365,18 @@ Modules can be assigned a protection level at config time:
   buffers, and heap; any other memory access raises a fault.
 
 Faulted modules transition through `Running → Faulted → Recovering`
-according to a per-module fault policy:
+(or `Terminated`) according to a per-module fault policy:
 
-| Policy | Behavior |
+| Policy | Behaviour |
 |--------|----------|
-| `Skip` | Log the fault and skip this module on subsequent ticks |
-| `Restart` | Re-allocate state, call `module_new` again, re-enter the graph |
+| `Skip` | Terminate the module; the graph continues without it |
+| `Restart` | Flush the module's channels and resume stepping. State is not zeroed and `module_new` is not re-called, so this is safe only for stateless or idempotent modules; stateful modules should use `Skip` and rely on the operator to drain and reload |
 | `RestartGraph` | Trigger a full graph reconfigure (last resort) |
+| `Tolerate` | Record step-deadline overruns (fault counter, log, fault ring) without faulting the module; step errors still fault normally. For modules whose synchronous device operations have a legitimate heavy tail |
 
 Recovery is bounded by a per-module restart count and exponential
-backoff. The kernel records `FaultStats` per module accessible via
-`dev_query` for telemetry.
+backoff. The kernel records `FaultStats` per module, exposed as a
+snapshot through the provider query surface for telemetry.
 
 ### Async I/O Pattern
 
@@ -373,9 +386,12 @@ Hardware-facing operations use start/poll sequencing:
 2. Return/yield while pending.
 3. Poll for completion (`*_poll`) in subsequent steps.
 
-This pattern keeps every module cooperative and preserves predictable scheduler latency under load.
+This pattern keeps every module cooperative and preserves predictable
+scheduler latency under load.
 
 ## Ports and Content Contracts
+
+Source: `tools/src/manifest.rs`
 
 Modules exchange data through named ports declared in each module manifest.
 
@@ -389,14 +405,17 @@ Modules exchange data through named ports declared in each module manifest.
 
 Port `content_type` is the semantic contract for graph wiring and validation.
 Examples include `OctetStream`, `AudioSample`, `VideoRaster`, and `FmpMessage`.
+The full list is the `CONTENT_TYPES` table in the contracts crate.
 
-The runtime transports bytes, while config-time validation enforces type compatibility.
+The runtime transports bytes, while config-time validation enforces type
+compatibility.
 
 ### Backpressure Contract
 
 - Sources do not advance production time without successful downstream commit.
 - Transforms either emit or retain enough state to retry safely.
-- Sinks behave deterministically under starvation (for example silence insertion or hold-last-value policies).
+- Sinks behave deterministically under starvation (for example silence
+  insertion or hold-last-value policies).
 
 ## Runtime and Memory Safety Invariants
 
@@ -410,17 +429,19 @@ The runtime transports bytes, while config-time validation enforces type compati
 
 - DMA-visible buffers use natural word alignment.
 - Memory ordering is explicit at producer-to-DMA handoff boundaries.
-- Zero-copy paths preserve ownership and sequencing invariants before release signals.
+- Zero-copy paths preserve ownership and sequencing invariants before release
+  signals.
 
 ### Determinism Rules
 
 - No unbounded loops over dynamic input in one step call.
-- Retry behavior is idempotent for partial progress cases.
-- Time is derived from monotonic clocks or committed stream progression, never assumed call frequency.
+- Retry behaviour is idempotent for partial progress cases.
+- Time is derived from monotonic clocks or committed stream progression, never
+  assumed call frequency.
 
 ## Operational Conventions
 
-### A) Edge metadata
+### Edge metadata
 
 In config/graph, record for each edge:
 - frame size (bytes)
@@ -428,25 +449,17 @@ In config/graph, record for each edge:
 - atomicity requirement
 - backpressure behaviour
 
-Then modules can validate at runtime (or loader-time) that they are connected to
-compatible edges.
+Modules can then validate at runtime (or loader-time) that they are connected
+to compatible edges.
 
-### B) A short "module author checklist"
+### Module author checklist
 
-A one-page checklist is more likely to be read than long docs. Example items:
 - Does my output message have a fixed size?
 - Can the channel partially write it? If yes, is reassembly safe and does time
   only advance on commit?
 - Am I using `millis()`/`micros()` deltas rather than step count?
 - Is logging disabled or throttled?
-- If DMA involved: did I fence correctly?
-
-### C) Provide reference implementations
-
-Keep "golden" modules that demonstrate the contracts:
-- `audio_source` (phase pacing + partial write correctness)
-- `sequencer` (timer anchored to commit)
-- `control_consumer` (drain-loop latest-wins pattern)
+- If DMA is involved: did I fence correctly?
 
 ## Runtime Graph Model
 
@@ -476,13 +489,12 @@ channels, and the runner steps all modules each iteration.
 |  State in kernel RAM, code executes from flash (XIP)        |
 +-------------------------------------------------------------+
 |                      RUNNER                                  |
-|  setup() -> setup_graph() -> run_main_loop()                  |
+|  setup() -> graph instantiation -> main loop                 |
 |  Automatic tee/merge insertion for fan-out/fan-in           |
 +-------------------------------------------------------------+
 ```
 
-
 For asset banks, selectors, and control bindings, see:
-- `../guides/asset_banks.md`
-- `../guides/input_system.md`
-- `../guides/input_gestures.md`
+- [../guides/asset_banks.md](../guides/asset_banks.md)
+- [../guides/input_system.md](../guides/input_system.md)
+- [../guides/input_gestures.md](../guides/input_gestures.md)

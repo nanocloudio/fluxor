@@ -1,98 +1,97 @@
-# Audio Guide
+# Audio
 
-This guide describes the architecture of audio pipelines in Fluxor.
-
-## Scope
-
-Fluxor audio pipelines are module graphs that separate:
-
-- source acquisition
-- format/decode/transform stages
-- hardware output
-
-The same graph model supports file playback, synthesis, network audio, and
+Fluxor audio pipelines are module graphs that separate source
+acquisition, decode and format conversion, and hardware output. The
+same graph model covers file playback, synthesis, network audio, and
 hybrid chains.
 
-## Reference Pipeline
+Source: `modules/foundation/format/`, `modules/drivers/i2s_pio/`,
+`modules/platform/linux/linux_audio/`,
+`modules/platform/wasm/wasm_browser_audio/`.
+
+## Reference pipeline
 
 ```text
-source -> bank/decoder/format -> mixer/effects -> i2s
+source -> bank/codec/format -> sink
 ```
 
-Not every pipeline uses every stage. Pipelines are assembled from required
-functional blocks and board capabilities.
+Not every pipeline uses every stage; graphs are assembled from the
+blocks a target's hardware and content require.
 
-## Architectural Roles
+## Stages
 
-- **Sources**: produce encoded or raw audio streams.
-- **Transformers**: decode, convert, resample, mix, or shape audio.
-- **Sinks**: consume PCM and drive output hardware.
+**Sources** produce encoded or raw audio bytes:
 
-Control inputs (gestures, network commands, UI events) run in a separate plane
-and should not be coupled to PCM transport timing.
+- `fs_bank` and `object_bank` stream stored assets
+  ([asset_banks.md](asset_banks.md))
+- `mic_pio` captures from an I2S MEMS microphone through PIO on
+  RP2350
+- network modules deliver encoded streams over TCP, QUIC, or datagram
+  transports
 
-## Timing and Backpressure
+**Transformers** turn bytes into the PCM a sink accepts:
 
-Audio correctness depends on explicit backpressure contracts.
+- codec modules decode compressed formats; they live in the spectra
+  repository and splice into the graph between a source's byte stream
+  and the PCM stages
+- `format` normalises raw input: 8-bit unsigned or 16-bit signed,
+  mono or stereo, resampled to the target rate via fixed-point linear
+  interpolation. Parameters: `input_rate`, `output_rate`,
+  `input_bits`, `input_channels`, `dither`.
+- mixing and effects modules live in the grove repository
 
-- Producers should only advance timeline when downstream accepts data.
-- Transformers should avoid consuming input they cannot eventually emit.
-- Sinks should handle starvation deterministically and report it.
+**Sinks** consume `AudioSample` PCM and drive output. A graph can
+name a concrete driver, or request the `audio` platform stack
+(`platform.audio:` in the YAML, defined in `stacks/audio.toml`),
+which provides a logical `audio_out` sink and picks the driver for
+the target so the same graph runs on hardware DACs and the host:
 
-See `docs/architecture/timing.md` for runtime timing rules.
+- `i2s_pio` drives an I2S DAC through PIO on RP2350
+  (`data_pin`, `clock_base`, `sample_rate`)
+- `linux_audio` runs on the Linux host; its `mode` selects `wav` or
+  `raw` file capture, `null` (drain), or live `playback` through the
+  host audio device, where the sink can also act as the presentation
+  clock. Playback mode requires a `fluxor-linux` binary built with
+  the `host-playback` feature; `fluxor build` rejects it otherwise.
+- `wasm_browser_audio` plays through the browser's audio output
 
-## Format Boundaries
+## Timing and backpressure
 
-Pipelines should keep boundaries explicit:
+Audio correctness depends on the channel backpressure contracts:
 
-- encoded stream boundaries (file/network)
-- decoded PCM boundaries
-- frame-size and sample-rate expectations per edge
+- producers advance their timeline only when downstream accepts data
+- transformers avoid consuming input they cannot eventually emit
+- sinks handle starvation deterministically and report it
 
-This reduces drift, avoids partial-state bugs across track switches, and keeps
-module contracts stable.
+[../architecture/timing.md](../architecture/timing.md) covers the
+runtime timing rules.
 
-## Switching and Reset Semantics
+## Format boundaries
 
-When changing tracks or sources, use clean cutover semantics:
+Keep boundaries explicit per edge: where the encoded stream ends,
+where decoded PCM begins, and what frame size and sample rate each
+edge carries. Treat sample rate and channel layout as graph-level
+contracts rather than per-module assumptions; this avoids drift and
+partial-frame carry-over across track switches.
 
-1. signal stream end to downstream decode/format stages
-2. flush stale bytes in transit
-3. seek/select new source
-4. restart decode/transform from initial detect/parse state
+## Switching and reset
 
-This avoids mixed-stream artifacts and partial-frame carryover.
+When changing tracks or sources, cut over cleanly: end the current
+stream toward the decode stages, flush stale bytes in transit, select
+the new source, and let decode restart from its initial detect state.
+The asset banks provide this boundary behaviour when they switch
+entries ([asset_banks.md](asset_banks.md)).
 
-## Composition Patterns
+## Composition patterns
 
-Common Fluxor audio patterns:
+- file playback: `sd -> fat32`-backed bank `-> codec -> i2s_pio`
+- generated audio: control modules `-> synthesis (grove) -> sink`
+- mixed inputs: two sources `-> mixer (grove) -> sink`
+- network ingest: transport `-> codec -> format -> sink`
 
-- file playback: `sd -> fat32 -> bank -> decoder -> i2s`
-- generated audio: `sequencer/control -> synth -> i2s`
-- mixed inputs: `source A + source B -> mixer -> i2s`
-- network ingest: `net -> protocol/decoder -> format -> i2s`
+## Related documentation
 
-## Configuration Guidance
-
-- Treat sample rate and channel layout as graph-level contracts.
-- Keep control-rate channels small and atomic.
-- Use mailbox or larger buffers for bulk audio frame movement when required.
-- Keep module params declarative; avoid embedding policy in firmware code paths.
-
-## Validation Checklist
-
-- no drift under sustained backpressure
-- deterministic behavior at source boundaries
-- predictable startup and switch latency
-- explicit handling of end-of-stream and starvation
-
-## Related Documentation
-
-- `docs/guides/codec_porting.md` in the spectra repo — workflow for
-  porting / validating audio codecs against an upstream reference
-  decoder (sample-accurate parity, layer-by-layer probing, standalone
-  Rust replica pattern)
-- `docs/guides/music_player.md`
-- `docs/guides/midi.md`
-- `docs/architecture/pipeline.md`
-- `docs/architecture/timing.md`
+- [music_player.md](music_player.md)
+- [midi.md](midi.md)
+- [../architecture/pipeline.md](../architecture/pipeline.md)
+- [../architecture/timing.md](../architecture/timing.md)

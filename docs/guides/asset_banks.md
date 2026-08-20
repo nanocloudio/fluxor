@@ -1,104 +1,79 @@
 # Asset Banks
 
-Asset banks provide a uniform way to package, index, and navigate reusable media
-or control assets in Fluxor graphs.
+An asset bank packages a set of assets behind an index and streams the
+selected one to the rest of the graph. Selection changes through
+commands, not rewiring, so playback, sequencing, and UI flows keep a
+stable topology while the content varies at runtime.
 
-## Purpose
+Source: `modules/sdk/cores/bank_stream.rs` (shared navigation and
+streaming core), `modules/foundation/fs_bank/`,
+`modules/foundation/object_bank/`.
 
-Banks decouple content selection from content consumption.
-
-- Producers expose indexed assets as a stream.
-- Consumers process only the selected asset payload.
-- Control modules change selection through commands, not rewiring.
-
-This model keeps playback, sequencing, and UI flows deterministic while allowing
-runtime navigation.
-
-## Architectural Model
+## Model
 
 ```text
-storage -> filesystem -> bank -> consumer
-                         ^
-                         |
-                      control
+storage backend -> bank -> consumer
+                    ^
+                    |
+                 control
 ```
 
-Typical consumers include decoders, synthesizers, display modules, and effect
-chains. The bank remains responsible for index selection and policy; downstream
-modules remain content-focused.
+- The bank owns index selection and progression policy.
+- Consumers (codecs, synthesis modules, displays) see only the
+  selected asset's byte stream.
+- Control modules (typically `gesture`) drive selection through
+  FMP commands.
 
-## Core Concepts
+## Implementations
 
-- **Bank**: Logical collection of assets.
-- **Cursor**: Current selection state (index + mode policy).
-- **Entry**: Metadata describing one asset.
-- **Locator**: Source location for reading payload bytes.
+Both banks share the `bank_stream` core, so navigation, commands, and
+status behave identically; only the storage backend differs.
 
-These contracts make the same control-plane behavior reusable across different
-asset types.
+- `fs_bank` reads files through the `fs` contract (`fat32` on bare
+  metal, the host filesystem dispatch on Linux). Entries come either
+  from explicit `path_N` parameters or from a directory scan.
+- `object_bank` enumerates a key prefix via `storage.namespace` LIST
+  and streams entries via `storage.object` GET/RANGE_GET. It works
+  against any provider pair that offers those surfaces, including the
+  browser's OPFS-backed object store on the wasm host.
 
-## Selection and Control
+## Ports
 
-Bank control is command-oriented.
+- `stream` (output, `OctetStream`): the selected asset's bytes.
+  Entries are walked one at a time; the next opens only after the
+  current one reaches end of stream or a navigation command arrives.
+- `notify` (output, `FmpMessage`): a `status` notification on each
+  selection change, carrying `{ index, count, file_type, flags }` for
+  UI and telemetry consumers.
+- `commands` (ctrl input, `FmpMessage`): accepts `next`, `prev`,
+  `toggle` (pause/resume), and `select` with a `u16` index payload.
 
-- next/previous selection
-- explicit index selection
-- play/pause style control for stream-backed assets
+Keeping the data plane (`stream`) and status plane (`notify`) on
+separate ports lets display updates and media transport back-pressure
+independently.
 
-The control source is typically gesture or UI modules, but the protocol is
-agnostic to input origin.
+## Parameters
 
-## Modes and Progression Policy
+- `item_count` (alias `file_count`): navigation positions; derived
+  from the populated `path_N` slots when unset.
+- `mode`: `once`, `loop`, or `hold`. `loop` wraps navigation past
+  either end of the index; the other two stop at the ends.
+- `initial_index`: startup selection.
+- `auto_advance`: advance to the next entry on end of stream.
+- `path_0` … (`fs_bank`): one path per index. With no paths set the
+  bank runs as a preset selector: navigation and status work, but no
+  bytes flow downstream.
 
-Banks define progression policy independently of content format.
+## Composition patterns
 
-- **Once**: advance until the final entry, then hold
-- **Loop**: wrap to index 0 after the final entry
+- music player: `fat32`-backed `fs_bank` streaming to a codec and an
+  audio sink ([music_player.md](music_player.md))
+- instrument or tone sets: bank selecting presets for a synthesis
+  module
+- image galleries: bank streaming to an image codec and a display
 
-This policy is evaluated on explicit commands and end-of-stream transitions.
+## Related documentation
 
-## Data and Status Planes
-
-Banks usually expose two outbound planes:
-
-- **Data plane**: selected asset stream for consumers
-- **Status plane**: current selection state for UI/telemetry
-
-Separating these planes keeps display updates and media transport independent
-under backpressure.
-
-## Configuration Surface
-
-Bank configuration typically defines:
-
-- entry count or catalog source
-- initial index
-- progression mode
-- optional metadata behavior for status reporting
-
-The exact parameter encoding is module-local; architecture-level behavior is the
-same across bank-backed pipelines.
-
-## Integration Patterns
-
-Common patterns in Fluxor:
-
-- music player: `fat32 -> bank -> decoder -> i2s`
-- instrument/tone sets: `bank -> synth`
-- image galleries: `bank -> image decode -> display`
-
-In each case, wiring remains stable while control changes only the selected
-asset.
-
-## Design Guidance
-
-- Keep bank modules policy-focused (selection + progression), not format-heavy.
-- Keep downstream modules stateless across asset boundaries when possible.
-- Emit status updates on selection changes so UI modules stay synchronized.
-- Treat end-of-stream as a first-class signal in bank state transitions.
-
-## Related Documentation
-
-- `docs/guides/music_player.md`
-- `docs/guides/audio.md`
-- `docs/architecture/pipeline.md`
+- [music_player.md](music_player.md)
+- [audio.md](audio.md)
+- [../architecture/pipeline.md](../architecture/pipeline.md)

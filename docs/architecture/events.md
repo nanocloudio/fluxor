@@ -2,6 +2,8 @@
 
 Kernel-managed signalable/pollable notification objects for event-driven hardware drivers.
 
+Source: `src/kernel/ipc/event.rs`
+
 ## Design Principles
 
 1. **Pure mechanism** — no domain semantics. Events are generic flags. The kernel has no knowledge of WiFi, sensors, or any device protocol.
@@ -31,7 +33,7 @@ poll_gpio_edges()  ──>  event_signal(handle)
                          signals SCHEDULER_WAKE
                               |
                               v
-                    run_main_loop() detects wake
+                    main loop detects wake
                               |
                               v
                     step_woken_modules() steps only affected modules
@@ -61,7 +63,7 @@ event_signal_from_isr(handle)
 // In module_new or module_step:
 let evt = (sys.provider_call)(-1, event::CREATE, core::ptr::null_mut(), 0);
 // evt >= 0: event handle
-// evt < 0: error (ENOMEM if pool exhausted)
+// evt < 0: error (ENOSPC if pool exhausted)
 ```
 
 The event is owned by the currently executing module. When signaled, the scheduler knows which module to wake.
@@ -176,7 +178,7 @@ loop {
 
 A lightweight variant of `step_modules` that:
 - Only steps modules whose bit is set in `wake_bits`
-- Bypasses frequency gating (`MODULE_STEP_PERIOD`) — event-triggered steps override period
+- Bypasses frequency gating (`step_period`) — event-triggered steps override period
 - Preserves topological order (producer before consumer)
 - Same done/error handling as the normal step path
 
@@ -194,18 +196,23 @@ A lightweight variant of `step_modules` that:
 
 1. Bounds check (`handle < MAX_EVENTS`)
 2. `slot.signaled.store(true, Release)` — one atomic store
-3. `EVENT_WAKE_PENDING.fetch_or(1 << owner, Release)` — one atomic RMW
-4. `SCHEDULER_WAKE.signal(())` — brief critical section via `CriticalSectionRawMutex`
+3. A wake-latch RMW into the owner's `EVENT_WAKE_PENDING` word; if the
+   owning module is paused, the wake is deferred and the doorbell
+   suppressed
+4. `hal::wake_scheduler()` — on RP this signals the
+   `SCHEDULER_WAKE` Embassy signal (a brief critical section via
+   `CriticalSectionRawMutex`)
 
 No validation beyond bounds. No allocation. No channel writes. No driver logic. Called at most once per ISR entry (coalesced), not per-pin.
 
-`SCHEDULER_WAKE` uses `Signal<CriticalSectionRawMutex, ()>`, which briefly disables interrupts on single-core Cortex-M33. This is the same mechanism Embassy uses for PIO DMA completion.
-
 ## GPIO Event Binding Model
 
-Embassy-rp (0.9.0) registers `#[interrupt] fn IO_IRQ_BANK0()` when the `rt` feature is enabled. The `rt` feature is required for PIO and USB interrupt handlers. `BANK0_WAKERS` is `pub(crate)` and not accessible outside the embassy-rp crate.
+On RP targets, embassy-rp owns the `IO_IRQ_BANK0` interrupt handler
+when its `rt` feature is enabled (required for the PIO and USB
+interrupt handlers), and its GPIO wakers are private to that crate, so
+the kernel cannot hook GPIO interrupts directly.
 
-GPIO event binding uses software polling via `poll_gpio_edges()` (same-tick-cycle response, ~1ms worst case). This model is suitable for buttons, sensors, and most GPIO-driven peripherals.
+GPIO event binding therefore uses software polling via `poll_gpio_edges()` (same-tick-cycle response, ~1ms worst case). This model is suitable for buttons, sensors, and most GPIO-driven peripherals.
 
 For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` works directly from ISR context. The `select()` mechanism provides sub-tick wake for these sources.
 
@@ -225,7 +232,7 @@ For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` work
 | `0x0B01` | `SIGNAL` | handle=event | 0 or error |
 | `0x0B02` | `POLL` | handle=event | 1 (was signaled), 0 (not), or error |
 | `0x0B03` | `DESTROY` | handle=event | 0 or error |
-| `0x0C51` | `BIND_IRQ` (kernel_abi::event) | handle=event, arg=[irq:u32 LE, mmio_base:u64 LE] (12B) | 0 or error |
+| `0x0C51` | `BIND_IRQ` (kernel_abi::event; kernel-primitive 0x0C5x range) | handle=event, arg=[irq:u32 LE, mmio_base:u64 LE] (12B) | 0 or error |
 
 ### Error Codes
 
@@ -266,7 +273,7 @@ fn module_step(state: *mut u8) -> i32 {
     match s.state {
         ST_INIT => {
             // Claim GPIO pin as input with pull-up
-            let rc = (sys.provider_call)(s.gpio_pin as i32, dev_gpio::CLAIM, ...);
+            let rc = (sys.provider_call)(s.gpio_pin as i32, gpio::CLAIM, ...);
             if rc < 0 { return rc; }
             s.state = ST_CREATE_EVENT;
             0
@@ -304,7 +311,7 @@ fn module_step(state: *mut u8) -> i32 {
             );
             if fired == 1 {
                 // Edge detected — read current level, emit control event
-                let level = (sys.provider_call)(s.gpio_pin as i32, dev_gpio::GET_LEVEL, ...);
+                let level = (sys.provider_call)(s.gpio_pin as i32, gpio::GET_LEVEL, ...);
                 // ... debounce logic, emit to out_chan ...
             }
             0 // Continue
@@ -335,18 +342,18 @@ The kernel does NOT provide:
 
 | File | Description |
 |------|-------------|
-| `src/kernel/event.rs` | Event pool, create/signal/poll/destroy; IRQ binding stored per-event |
-| `modules/sdk/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
+| `src/kernel/ipc/event.rs` | Event pool, create/signal/poll/destroy; IRQ binding stored per-event |
+| `modules/sdk/abi/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
 | `modules/sdk/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
-| `src/kernel/syscalls.rs` | EVENT contract vtable + provider dispatch |
-| `src/platform/rp/io.rs` | `GPIO_EVENT_BINDING`, `poll_gpio_edges()`, accessors (RP) |
-| `src/kernel/scheduler/mod.rs` | `select()` wake, `step_woken_modules()`, `current_module_index()` |
+| `src/kernel/module/syscalls.rs` | Event contract dispatch |
+| `src/platform/rp/io.rs` | `poll_gpio_edges()` and the per-pin edge bindings (RP) |
+| `src/kernel/exec/scheduler/` | wake handling, `step_woken_modules()` |
 
 ## Limits
 
 | Resource | Default | Notes |
 |----------|---------|-------|
-| Event slots | 32 | `MAX_EVENTS` in `event.rs` |
-| Modules (wake bitmask) | Sized to `MAX_MODULES` per target | u32 bitmask up to 32 modules; larger targets use a wider bitmask |
-| IRQ source types | GPIO (type 0); extensible per HAL |
-| GPIO pins per binding | 1 event per pin, 1 pin per event |
+| Event slots | 32 | `MAX_EVENTS` in `src/kernel/ipc/event.rs` |
+| Modules (wake mask) | Sized to `MAX_MODULES` per target | `ModuleMask` of 64-bit words, one bit per module slot |
+| IRQ source types | GPIO (type 0) | Extensible per HAL |
+| GPIO pins per binding | 1 event per pin, 1 pin per event | Enforced at `WATCH_EDGE` bind time |

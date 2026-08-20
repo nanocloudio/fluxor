@@ -1,9 +1,11 @@
 # Live Graph Reconfigure
 
+Source: `src/kernel/exec/scheduler/live_reconfig.rs`, `tools/src/reconfigure.rs`
+
 ## Overview
 
 Live graph reconfigure allows updating a running Fluxor graph without dropping
-in-flight work. The scheduler transitions through four phases:
+in-flight work. The scheduler transitions through phases:
 
 ```
 RUNNING -> DRAINING -> MIGRATING -> RUNNING
@@ -13,14 +15,14 @@ RUNNING -> DRAINING -> MIGRATING -> RUNNING
 
 ```yaml
 reconfigure:
-  mode: live           # "live" or "atomic" (default: atomic)
-  drain_timeout_ms: 5000  # max drain wait (100-30000ms, default: 5000)
+  mode: live              # "live" or "atomic" (default: atomic)
+  drain_timeout_ms: 5000  # max drain wait (default: 5000)
 
 modules:
-  - id: 1
+  - name: web
     type: http_server
     drain:
-      timeout: 3000     # per-module override (must be <= global)
+      timeout: 3000      # per-module override
       policy: graceful   # "graceful" (default) or "immediate"
 ```
 
@@ -35,8 +37,8 @@ Each module is classified as one of:
 | Terminate | Changed, no drain | Continues stepping, force-stopped in MIGRATING |
 
 Module identity is defined by three hashes:
-- **Binary identity**: module name hash (resolves to same .fmod)
-- **Config identity**: FNV-1a of serialized params (detects config-only changes)
+- **Binary identity**: module name hash (resolves to the same `.fmod`)
+- **Config identity**: FNV-1a of serialised params (detects config-only changes)
 - **Wiring identity**: FNV-1a of connected edges (detects topology changes)
 
 ## Adding Drain Support to a Module
@@ -59,43 +61,40 @@ topological order), then continues calling `module_step()` normally. When
 your module has no more in-flight work, return `StepOutcome::Done` (1)
 from `module_step()`.
 
-## V1 Implementation (Current)
+## Drain-Then-Reset Model
 
-The v1 implementation provides **drain-then-reset**:
+The implemented reconfigure model is drain-then-reset:
 
 1. **DRAINING**: Modules with `module_drain` get a graceful shutdown period.
    In-flight requests complete. The drain has a bounded timeout.
 
-2. **MIGRATING**: After drain completes (or times out), performs a **full
-   destructive reconfigure** — same as the existing `prepare_graph()` path.
-   All arenas are reset, all modules re-instantiated.
+2. **MIGRATING**: After drain completes (or times out), the scheduler performs
+   a full destructive reconfigure through the same `prepare_graph()` path used
+   at boot. All arenas are reset and all modules are re-instantiated.
 
-### Why V1 Uses Full Reset
+The full reset avoids moving surviving module state blocks: modules may hold
+absolute pointers into their own state, and relocating state would break
+self-referential pointers without a state export/import contract. The drain
+phase already provides the main value — in-flight work completes gracefully.
 
-Arena compaction (moving surviving module state blocks) is deferred to v2:
-
-- Many existing modules may use absolute pointers in state (not audited)
-- Moving state breaks self-referential pointers without `module_state_export/import`
-- The drain phase already provides the key value: in-flight work completes gracefully
-- Full reset is safe, simple, and matches the existing well-tested behavior
-
-### What V1 Delivers
+What this model delivers:
 
 - **Zero in-flight request loss** for drain-capable modules (e.g., http_server)
 - **Bounded drain timeout** prevents hung modules from blocking deployment
-- **A/B fallback** on migration failure (full destructive reconfigure from old config)
-- **Build-time transition plan preview** via `fluxor inspect new.yaml` --against old.yaml
+- **A/B fallback** on migration failure (full destructive reconfigure from the
+  old config)
+- **Build-time transition plan preview** via
+  `fluxor inspect new.yaml --against old.yaml`
 
-### Out of scope for the current reconfigure path
+Out of scope for the current reconfigure path:
 
 - State preservation for surviving modules (all state is reset)
 - Channel preservation between surviving modules
 - Arena compaction (selective module replacement without full reset)
 - Socket handoff to new module instances
 
-These are out of scope for the current drain-then-reset model and would
-require a future preservation-aware reconfigure path. None of the listed
-items are needed for the supported reconfigure semantics.
+None of these are needed for the supported reconfigure semantics; a
+preservation-aware reconfigure path would be a separate design.
 
 ## CLI: Transition Plan Preview
 
@@ -127,9 +126,9 @@ Summary: 3 survive, 1 drain, 1 terminate, 0 add, 0 remove
 
 ## Timeout and Forced Termination
 
-If the drain deadline is exceeded, all still-draining modules are force-terminated.
-Their in-flight work is lost — equivalent to the current atomic reconfigure for
-those specific modules.
+If the drain deadline is exceeded, all still-draining modules are
+force-terminated. Their in-flight work is lost — the same outcome those
+modules would see under an atomic reconfigure.
 
 ## Header Flag Layout (module header `reserved[0]`)
 
@@ -140,5 +139,5 @@ those specific modules.
 | 2 | deferred_ready | Needs init time before downstream runs |
 | 3 | drain_capable | Exports module_drain for live reconfigure |
 | 4 | isr_module | Exports module_isr_init / module_isr_entry (Tier 2) |
-| 5 | wasm_payload | Module body is a wasm payload (set by `pack_fmod_wasm`, read by `platform/wasm.rs`) |
+| 5 | wasm_payload | Module body is a wasm payload (set by `pack_fmod_wasm`, read by `src/platform/wasm.rs`) |
 | 6-7 | reserved | Must be 0 |

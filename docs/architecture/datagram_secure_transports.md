@@ -1,9 +1,11 @@
-# Datagram-Secured Transports — DTLS, QUIC, HTTP/3
+# Datagram-Secured Transports — DTLS and QUIC
 
-This document specifies how Fluxor's TLS 1.3 / DTLS 1.3 / QUIC v1 /
-HTTP/3 stack is structured. It is the canonical reference for which
-modules own which protocols, which primitives live in the SDK, and
-which contracts the network providers expose.
+This document describes how Fluxor's TLS 1.3, DTLS 1.3, and QUIC v1
+stack is structured: which modules own which protocols, which
+primitives live in the SDK, and which channel contracts the transports
+expose. Fluxor owns the secure transports; the HTTP request layer
+(HTTP/1.x, HTTP/2, and the HTTP/3 request path) lives in the wave
+sibling and consumes these transports over channel contracts.
 
 ## Module layout
 
@@ -11,105 +13,102 @@ which contracts the network providers expose.
 modules/
 ├── foundation/
 │   ├── tls/                  # TLS 1.3 + DTLS 1.3
-│   │   ├── mod.rs            # Server + client state machines
+│   │   ├── mod.rs            # Module surface, params, server + client roles
 │   │   ├── handshake.rs      # ClientHello / ServerHello / Finished etc.
-│   │   ├── handshake_driver.rs   # Record-agnostic handshake state
-│   │   ├── record.rs         # TLS record framing
-│   │   ├── dtls_record.rs    # DTLS record framing (seq num + retx)
+│   │   ├── handshake_driver.rs  # Record-agnostic handshake state machine
+│   │   ├── handshake_pump.rs # Drives the driver per connection
+│   │   ├── record.rs         # TLS record framing (TCP)
+│   │   ├── dtls_record.rs    # DTLS 1.3 record layer (RFC 9147)
+│   │   ├── dtls_state.rs     # Per-peer DTLS sessions, server + client
 │   │   ├── key_schedule.rs
 │   │   ├── x509.rs
 │   │   └── alert.rs
-│   ├── quic/                 # QUIC v1 (RFC 9000)
-│   │   ├── mod.rs            # Connection state, demuxing
-│   │   ├── packet.rs         # Long/short headers, header protection
-│   │   ├── frame.rs          # STREAM / ACK / CRYPTO / NEW_CONNECTION_ID …
-│   │   ├── ack.rs            # ACK ranges + RTT estimation
-│   │   ├── streams.rs        # Bidi/unidi stream multiplexing
-│   │   └── manifest.toml
-│   └── http/                 # h1 + h2 + h3
-│       ├── mod.rs
-│       ├── ...
-│       ├── wire_h3.rs        # HTTP/3 frame format
-│       ├── qpack.rs          # RFC 9204 header compression
-│       └── h3.rs             # Connection-level h3 dispatch
+│   └── quic/                 # QUIC v1 (RFC 9000/9001/9002)
+│       ├── mod.rs            # Module surface, channel plumbing
+│       ├── connection.rs     # Per-connection state, RTT, stream state
+│       ├── pump.rs           # Handshake pump, loss recovery, send path
+│       ├── packet.rs         # Long/short header parse, PN reconstruction
+│       ├── wire.rs           # Packet build + protection application
+│       ├── keys.rs           # Initial keys, AEAD schedule, header protection
+│       ├── frame.rs          # Frame parsers/builders
+│       ├── ack.rs            # Sliding ACK range tracker
+│       └── h3.rs             # HTTP/3 connection preamble only
 └── sdk/
-    ├── varint.rs             # RFC 9000 §16 (used by QUIC, h3, QPACK)
-    ├── aes_gcm.rs            # AES-128/256-GCM
-    ├── chacha20.rs           # ChaCha20-Poly1305
-    ├── hmac.rs               # HMAC + HKDF (extract/expand/expand_label)
-    ├── sha256.rs             # FIPS 180-4 SHA-256
-    ├── sha384.rs             # FIPS 180-4 SHA-384
-    └── p256.rs               # P-256 ECDH + ECDSA
+    ├── wire/varint.rs        # RFC 9000 §16 varints
+    ├── cores/datagram_endpoint.rs  # Shared bind/send/recv datagram core
+    └── crypto/
+        ├── aes_gcm.rs        # AES-GCM (AesGcm::new_128 / new_256) + Aes128Hp
+        ├── chacha20.rs       # ChaCha20-Poly1305
+        ├── hmac.rs           # HMAC + HKDF
+        ├── sha256.rs, sha384.rs  # FIPS 180-4 hashes
+        ├── p256.rs           # P-256 ECDH + ECDSA
+        └── ed25519.rs
 ```
 
 ## SDK primitives
 
-### Crypto
+Source: `modules/sdk/crypto/`, `modules/sdk/wire/varint.rs`.
 
-The TLS-1.3-grade primitives live in `modules/sdk/`:
+The TLS-1.3-grade primitives:
 
 - `sha256.rs`, `sha384.rs` — FIPS 180-4 hashes.
 - `hmac.rs` — HMAC + HKDF (`hkdf_extract`, `hkdf_expand`,
   `hkdf_expand_label`, `derive_secret`).
-- `aes_gcm.rs` — AES-128/256-GCM (`Aes128Gcm`, `Aes256Gcm`).
-- `chacha20.rs` — ChaCha20-Poly1305 (`chacha20_poly1305_encrypt/decrypt`).
-- `p256.rs` — P-256 ECDH + ECDSA, with a step-split scalar-mul
-  ladder (`ScalarMulState`) so a single handshake can't block a
-  concurrent one.
+- `aes_gcm.rs` — AES-GCM via one `AesGcm` type with `new_128` /
+  `new_256` constructors, plus `Aes128Hp` for QUIC header protection.
+- `chacha20.rs` — ChaCha20-Poly1305
+  (`chacha20_poly1305_encrypt` / `chacha20_poly1305_decrypt`).
+- `p256.rs` — P-256 ECDH + ECDSA, with a step-split scalar-mul ladder
+  (`ScalarMulState`) so a single handshake cannot block a concurrent
+  one.
 
 Modules that consume these include them with `include!`:
 
 ```rust
-include!("../../sdk/aes_gcm.rs");
-include!("../../sdk/hmac.rs");
+include!("../../sdk/crypto/aes_gcm.rs");
+include!("../../sdk/crypto/hmac.rs");
 ```
 
-Every primitive uses raw-pointer writes or `write_volatile` to dodge
-ADRP-based const loads that miscompile on PIC aarch64. Callers are
-expected to follow the same discipline in any code that touches
-crypto state.
+Every primitive uses raw-pointer writes or `write_volatile` to avoid
+ADRP-based const loads that miscompile on PIC aarch64, and callers
+follow the same discipline in code that touches crypto state.
 
-### Variable-length integer codec
-
-`modules/sdk/varint.rs` implements RFC 9000 §16 variable-length
-integers (1, 2, 4, or 8 bytes; max value 2^62 − 1). The same encoding
-is reused verbatim by HTTP/3 (RFC 9114 §7.1) and QPACK (RFC 9204 §4.5),
-so this single file serves the QUIC frame layer, the HTTP/3 frame
-layer, and the QPACK encoder/decoder.
-
-API: `varint_encode`, `varint_decode`, `varint_size`,
-`varint_size_from_first` — all `unsafe fn` operating on raw pointers
-with explicit length bounds, matching the rest of the wire-format
-helpers in this codebase.
+`modules/sdk/wire/varint.rs` implements RFC 9000 §16 variable-length
+integers (1, 2, 4, or 8 bytes; maximum value 2^62 − 1). The same
+encoding is used by the QUIC frame layer and the HTTP/3 preamble
+codecs. API: `varint_encode`, `varint_decode`, `varint_size`,
+`varint_size_from_first`.
 
 ## Channel contracts
 
-QUIC and DTLS bind through the existing **datagram** surface
-(`modules/sdk/contracts/net/datagram.rs`, opcode range `0x20..0x43`).
-Endpoints carry their source address on every RX so a connection can
-survive peer migration. The same surface is consumed today by DNS,
-RTP, and log_net, and is provided by linux_net (`SOCK_DGRAM`) and the
-bare-metal `ip` module.
+QUIC and DTLS bind through the **datagram** surface
+(`modules/sdk/contracts/net/datagram.rs`, opcodes `0x20..0x43`).
+Endpoints carry their source address on every RX, so a connection can
+survive peer migration. The same surface is consumed by DNS, log_net,
+and transport_buffer, and is provided by `linux_net` (host `SOCK_DGRAM`
+sockets) and the bare-metal `ip` module.
 
 QUIC publishes its application surface over the **mux** contract
-(`modules/sdk/contracts/net/mux.rs`, opcode range `0xB0..0xCF`) so an
-HTTP/3 module sees QUIC streams as a multiplexed-session channel
-without having to know anything about packet protection.
+(`modules/sdk/contracts/net/mux.rs`, opcodes `0xB0..0xCF`), so a
+consumer sees QUIC streams as a multiplexed-session channel without
+knowing anything about packet protection. Every application stream is
+surfaced this way; the transport does not speak the protocols carried
+on its streams.
 
 ## Handshake driver
 
-The TLS 1.3 handshake state machine lives in
-`tls/handshake_driver.rs`. It is record-agnostic — it consumes plain
-handshake bytes per encryption level and produces plain handshake
-bytes — so all three transports drive it the same way:
+Source: `modules/foundation/tls/handshake_driver.rs`.
+
+The TLS 1.3 handshake state machine is record-agnostic: it consumes
+plain handshake bytes per encryption level and produces plain handshake
+bytes, so all three transports drive it the same way.
 
 ```rust
 /// Encryption levels TLS exposes (RFC 8446 §7.1, RFC 9001 §4).
 pub enum EncLevel { Initial, Handshake, OneRtt }
 
-pub struct HandshakeDriver { /* … */ }
 impl HandshakeDriver {
-    pub fn feed_handshake(&mut self, level: EncLevel, bytes: &[u8]);
+    pub fn feed_handshake(&mut self, level: EncLevel, bytes: &[u8]) -> usize;
     pub fn poll_handshake(&mut self, level: EncLevel, out: &mut [u8]) -> usize;
     pub fn read_secret(&self, level: EncLevel, send: bool) -> Option<&[u8]>;
     pub fn is_handshake_complete(&self) -> bool;
@@ -120,88 +119,106 @@ impl HandshakeDriver {
   plaintext into `feed_handshake`; outbound bytes from
   `poll_handshake` are encrypted into records.
 - **DTLS over UDP** — `dtls_record.rs` adds sequence numbers,
-  per-record nonces, fragment reassembly, and a coarse retransmission
-  timer, then drives the same handshake driver.
-- **QUIC** — `quic/mod.rs` ferries handshake bytes via QUIC CRYPTO
-  frames and queries `read_secret` for the keys it derives its packet
+  per-record nonces, fragment reassembly, and a retransmission timer,
+  then drives the same handshake driver.
+- **QUIC** — `pump.rs` ferries handshake bytes via QUIC CRYPTO frames
+  and queries `read_secret` for the keys it derives its packet
   protection from.
 
-## QUIC
+## DTLS 1.3
 
-`modules/foundation/quic/` owns the transport. Source layout:
+Source: `modules/foundation/tls/dtls_record.rs`,
+`modules/foundation/tls/dtls_state.rs`.
 
-- `mod.rs` — connection state machine: per-connection ID, packet
-  number space tracking, encryption level transitions, demuxing
-  inbound packets to the handshake driver vs. the frame handler.
-- `packet.rs` — long/short header parse and build, header protection
-  (AES-ECB or ChaCha20 keystream applied to the packet number bytes).
-- `frame.rs` — STREAM, ACK, CRYPTO, NEW_CONNECTION_ID,
-  CONNECTION_CLOSE, MAX_DATA, MAX_STREAM_DATA, etc. Uses the SDK
-  `varint` codec.
-- `ack.rs` — ACK range tracking + RTT estimation (RFC 9002 §5.3) +
-  the retransmission queue.
-- `streams.rs` — bidirectional/unidirectional QUIC streams with
-  send-window/recv-window tracking. The data structures parallel the
-  h2 server's per-stream window logic
-  (`StreamSlot.recv_window` / `send_window`).
+DTLS 1.3 (RFC 9147) is a mode of the `tls` module, not a separate
+module. The `transport` param (id 4) selects it: `0` runs TLS records
+over a stream channel, `1` runs DTLS records over a datagram channel.
+Companion params: `dtls_port` (id 5, default 4433), `dtls_peer_ip`
+(id 6), `dtls_peer_port` (id 7). Both roles are implemented: the
+server accepts sessions demultiplexed per peer 4-tuple, and the client
+dials `dtls_peer_ip:dtls_peer_port`.
 
-Inbound packets arrive on a datagram channel; the connection-ID
-demultiplexes them across multiple QUIC connections sharing the same
-UDP socket. The application surface is exposed to consumers (e.g.
-HTTP/3) via the mux contract.
+In DTLS mode the module keeps its `cipher_in` / `cipher_out` ports but
+speaks datagram-contract opcodes on them: it binds with `CMD_DG_BIND`
+and receives `MSG_DG_RX_FROM` frames. The record layer implements the
+RFC 9147 unified header, sequence-number reconstruction and
+anti-replay windows, handshake fragment reassembly, the retransmission
+timer, and ACK records. Half-open handshakes are dropped after an idle
+timeout.
 
-## HTTP/3
+## QUIC v1
 
-HTTP/3 lives alongside h1 and h2 inside wave's `http` module:
+Source: `modules/foundation/quic/`.
 
-- `wire_h3.rs` — HTTP/3 frame format (HEADERS, DATA, SETTINGS,
-  GOAWAY, etc.).
-- `qpack.rs` — RFC 9204 header compression. The static table follows
-  HPACK's PIC-safe `match`-based lookup pattern (see `hpack.rs`); the
-  larger QPACK static table is encoded the same way.
-- `h3.rs` — connection-level h3 dispatch. Mirrors `h2.rs`'s
-  `StreamSlot` table on top of QUIC streams instead of h2 streams,
-  arms emission via the same `arm_slot_for_emission` pattern, and
-  reuses `server.rs`'s body renderers (`render_static_into`,
-  `render_template_into`, `render_file_into`, `render_index_into`)
-  unchanged — they already take `(dst, cap)` and return `(n, more)`.
+The `quic` module carries connections and streams; it does not speak
+the protocols on them. Scope:
 
-A single Fluxor process can serve all three HTTP versions over the
-same logical port. The h1/h2 path is a TCP listener
-(`linux_net.net_out → http.net_in`); h2c is detected via preface
-sniff inside that path. The h3 path is a UDP listener
-(`linux_net.dgram → quic.dgram_in → quic.app_out → http.h3_in`).
+- `connection.rs` — per-connection state: connection ids, packet
+  number spaces, encryption-level transitions, RTT estimation and PTO
+  (RFC 9002), stream state.
+- `pump.rs` — the handshake pump across Initial / Handshake / 1-RTT
+  levels, loss detection, retransmission, and the send path.
+- `packet.rs` — long/short header parsing and packet-number
+  reconstruction; `wire.rs` builds packets and applies protection;
+  `keys.rs` derives Initial keys, the AEAD schedule, and header
+  protection masks.
+- `frame.rs` — parsers and builders for CRYPTO, STREAM, ACK,
+  CONNECTION_CLOSE, RESET_STREAM, NEW_CONNECTION_ID, MAX_DATA /
+  MAX_STREAM_DATA / DATA_BLOCKED, and RFC 9221 DATAGRAM frames.
+- `ack.rs` — the sliding ACK range tracker.
 
-WebSocket-over-HTTP/3 (RFC 9220) reuses the same extended-CONNECT
-upgrade path the existing `accept_ws_upgrade` already implements; the
-h3 dispatch picks it up identically to h2.
+The single cipher suite is `TLS_AES_128_GCM_SHA256` (0x1301); header
+protection is the AES-ECB mask. A client rejects any other suite in
+the ServerHello.
 
-## Implementation phases
+Features beyond the base transport: Retry with HMAC retry tokens
+(`require_retry`), 0-RTT with single-use tickets (`enable_0rtt`), ALPN
+configuration (`alpn`), connection migration with
+PATH_CHALLENGE / PATH_RESPONSE (enabled unless `disable_migration`),
+key update, and RFC 9221 datagrams.
 
-The protocols above are landed in stages. Each phase is independently
-buildable, leaves earlier phases byte-for-byte intact, and avoids
-refactoring the contracts/abstractions that earlier phases settled.
+Channel surface: `net_in` / `net_out` carry datagram-contract frames
+to the network provider; `app_in` / `app_out` carry the mux-contract
+application surface. Inbound packets are demultiplexed by connection
+id, so multiple QUIC connections share one UDP socket. A loopback
+graph runs a server and a client instance in one process against
+`linux_net`.
 
-| Phase | Scope                                                       |
-|-------|-------------------------------------------------------------|
-| A     | Extract `HandshakeDriver` from `tls/mod.rs` (no DTLS yet).  |
-| B     | DTLS 1.3 record layer + retransmission timer.               |
-| C     | QUIC v1 transport (`modules/foundation/quic/`).             |
-| D     | HTTP/3 + QPACK (`wire_h3.rs`, `qpack.rs`, `h3.rs`).         |
-| E     | WebSocket over HTTP/3 (RFC 9220).                           |
+## The HTTP/3 boundary
 
-## Capability matrix at end-state
+Source: `modules/foundation/quic/h3.rs`.
 
-| Surface | Server | Client |
-|---|---|---|
-| HTTP/1.1 | ✅ | ✅ |
-| HTTP/2 cleartext | ✅ | ✅ |
-| HTTP/2 over TLS (ALPN h2) | ✅ | ✅ |
-| HTTP/3 over QUIC | Phase D | Phase D |
-| WebSocket on h1 | ✅ | — |
-| WebSocket on h2 | ✅ | ✅ |
-| WebSocket on h3 (RFC 9220) | Phase E | Phase E |
-| TLS 1.3 over TCP | ✅ | ✅ |
-| DTLS 1.3 over UDP | Phase B | Phase B |
-| QUIC v1 (RFC 9000) | Phase C | Phase C |
-| Plain UDP datagram (DNS, RTP, syslog) | ✅ | ✅ |
+Only the HTTP/3 connection preamble lives in the transport: the
+control and QPACK unidirectional stream types and the codecs for the
+connection-scoped frames the transport itself must exchange before any
+request exists (SETTINGS, GOAWAY, PRIORITY_UPDATE; RFC 9114,
+RFC 9218). The request layer (QPACK header compression,
+method/path dispatch, response generation, and
+WebSocket-over-HTTP/3 extended CONNECT, RFC 9220) belongs to
+whatever consumes the mux surface on `app_in` / `app_out`; the wave
+sibling's `http` module implements it. Fluxor's contribution to the
+RFC 9220 path is the sideband that advertises extended-CONNECT
+support: the `PEER_SETTINGS_FLAG_ENABLE_CONNECT` bit of
+`MSG_MUX_PEER_SETTINGS` in `modules/sdk/contracts/net/mux.rs`.
+
+A hosted h3 graph wires:
+
+```yaml
+wiring:
+  - from: linux_net.net_out
+    to: quic.net_in
+  - from: quic.net_out
+    to: linux_net.net_in
+  - from: quic.app_out
+    to: http.net_in
+  - from: http.net_out
+    to: quic.app_in
+```
+
+## Related Documentation
+
+- `protocol_surfaces.md` — the datagram, packet, and mux contracts in
+  the surface taxonomy
+- `network.md` — the stream contract, drivers, TLS as channel
+  transformer
+- `security.md` — key custody, certificate handling, trust model

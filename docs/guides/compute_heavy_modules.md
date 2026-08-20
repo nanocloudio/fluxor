@@ -4,52 +4,57 @@ This guide defines architecture patterns for modules that perform substantial
 CPU work per unit of data (for example emulation, decoding, rendering, or large
 state transforms).
 
-## Design Goal
+Source: `modules/mod.rs` (the step contract), with scheduler and memory
+background in [../architecture/scheduler.md](../architecture/scheduler.md)
+and [../architecture/heap.md](../architecture/heap.md).
+
+## Design goal
 
 Keep heavy modules composable inside Fluxor's cooperative scheduler without
-breaking latency or starving neighboring modules.
+breaking latency or starving neighbouring modules.
 
-## Execution Contract
+## Execution contract
 
-Heavy modules must preserve the same step contract as all modules:
+Heavy modules preserve the same step contract as all modules:
 
 - bounded work per `step()` call
-- non-blocking behavior
-- deterministic retry behavior under partial progress
+- non-blocking behaviour
+- deterministic retry behaviour under partial progress
 
-A module may return `Burst` when it can productively continue work in the same
-tick, but each burst step is still bounded.
+A module may return `StepOutcome::Burst` when it can productively continue
+work in the same tick, but each burst step is still bounded.
 
-## Memory Model
+## Memory model
 
 Use memory by role:
 
-- **state arena** for persistent module state
-- **channel/buffer arena** for frame transport and shared buffers
+- the module's heap arena (sized by `module_arena_size`, allocated from
+  `STATE_ARENA`) for persistent module state
+- channels and shared buffers for frame transport
 
-Large transient payloads should flow through buffers/channels rather than being
+Large transient payloads flow through buffers and channels rather than being
 copied into long-lived state.
 
-## Data Transport Patterns
+## Data transport patterns
 
-Choose transport to match workload:
+Choose transport to match the workload:
 
 - FIFO channels for stream-like sequential payloads
-- mailbox/zero-copy buffers for large frame handoff
+- mailbox and zero-copy buffers for large frame handoff
 
 Mailbox mode is preferred for framebuffer-scale or similarly large payloads
 where copy amplification dominates runtime cost.
 
-## Scheduling Guidance
+## Scheduling guidance
 
 - Use burst stepping only when more useful work is immediately available.
 - Avoid unbounded inner loops in a single step.
-- Prioritize forward progress and responsiveness over single-module throughput.
+- Prioritise forward progress and responsiveness over single-module throughput.
 
 If a module can generate output faster than consumers accept it, throttle at the
 module boundary rather than accumulating unbounded internal work.
 
-## Multi-Stage Heavy Pipelines
+## Multi-stage heavy pipelines
 
 For complex compute chains, split responsibilities across modules:
 
@@ -60,15 +65,15 @@ For complex compute chains, split responsibilities across modules:
 This keeps each module contract narrow and makes bottlenecks observable in the
 graph.
 
-## Reliability Checklist
+## Reliability checklist
 
 - bounded CPU per step under worst-case input
-- explicit behavior under backpressure
+- explicit behaviour under backpressure
 - no hidden timeline drift from dropped or partial output
-- clear recovery behavior on reset/end-of-stream
+- clear recovery behaviour on reset and end-of-stream
 
-## Related Documentation
+## Related documentation
 
-- `docs/architecture/module_architecture.md`
-- `docs/architecture/pipeline.md`
-- `docs/architecture/timing.md`
+- [../architecture/module_architecture.md](../architecture/module_architecture.md)
+- [../architecture/pipeline.md](../architecture/pipeline.md)
+- [../architecture/timing.md](../architecture/timing.md)

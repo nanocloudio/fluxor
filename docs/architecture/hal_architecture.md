@@ -12,16 +12,16 @@ logic — lives in modules.
    timers, DMA. Anything more specific (a TFT display controller, an
    audio DAC, a CAN bus chip) is a module that uses these primitives.
    The portable surface lives under
-   `modules/sdk/contracts/hal/{gpio,spi,i2c,pio,uart,adc,pwm}.rs`;
-   chip-specific raw register bridges live under
-   `modules/sdk/platform/<chip>/*`.
+   `modules/sdk/contracts/hal/{gpio,spi,i2c,uart,adc,pwm,pcie}.rs`;
+   chip-specific raw register bridges (including RP PIO) live under
+   `modules/sdk/platform/<chip>/`.
 
 2. **One stable contract surface across silicon.** The HAL contract
-   opcodes are identical on RP2040, RP2350, BCM2712, and (planned)
-   ESP32. The kernel implementation behind each opcode differs per
-   silicon, but a PIC module never sees that difference. Adding a new
-   chip is a new `platform/<chip>/*` tree plus HAL backings — it does
-   not change the public ABI.
+   opcodes are identical on RP2040, RP2350, and BCM2712. The kernel
+   implementation behind each opcode differs per silicon, but a PIC
+   module never sees that difference. Adding a new chip is a new
+   `platform/<chip>/` tree plus HAL backings — it does not change the
+   public ABI.
 
 3. **No hidden state.** Pin assignments, bus configurations, and clock
    settings come from the config binary at boot. The kernel does not
@@ -47,7 +47,7 @@ logic — lives in modules.
 |                          (PIC modules)                             |
 +--------------------------------------------------------------------+
 |                        Foundation Layer                            |
-|        ip, fat32, dns, tls, wifi, ...            |
+|                   ip, fat32, dns, tls, wifi, ...                   |
 |                          (PIC modules)                             |
 +--------------------------------------------------------------------+
 |                          Driver Layer                              |
@@ -63,7 +63,7 @@ logic — lives in modules.
 |        gpio  •  spi  •  i2c  •  pio  •  uart  •  timer  •  dma     |
 +--------------------------------------------------------------------+
 |                            Silicon                                 |
-|             RP2040  •  RP2350  •  BCM2712  •  Pi 5                 |
+|                   RP2040  •  RP2350  •  BCM2712                    |
 +--------------------------------------------------------------------+
 ```
 
@@ -149,7 +149,7 @@ two distinct services:
 - **PIO stream**: double-buffered DMA streaming for protocols where the
   state machine consumes a continuous data feed (I2S audio, WS2812 LEDs,
   CYW43 gSPI bursts). The kernel manages the double-buffer flip and
-  surfaces `StreamTime` for synchronization.
+  surfaces `StreamTime` for synchronisation.
 
 - **PIO command**: bidirectional transfers where the state machine sends
   a command and reads a response (gSPI for the cyw43 module, custom
@@ -180,27 +180,31 @@ timer hardware.
 
 DMA channels are claimed by drivers that need them (PIO, SPI). The HAL
 manages the channel pool per silicon — RP2040 has 12 channels, RP2350
-has 12 + a separate "system DMA" controller, BCM2712 has its own DMA
-engines. Modules see only the abstract `provider_call` operations on PIO and
-SPI; the DMA wiring is hidden.
+has 16, BCM2712 has its own DMA engines (the counts are declared as
+`dma_channels` in `targets/silicon/*.toml`). Modules see only the
+abstract `provider_call` operations on PIO and SPI; the DMA wiring is
+hidden.
 
 ### Trust and platform metadata
 
-Two HAL hooks front the security-relevant platform state so loader code
-stays silicon-oblivious:
+Source: `src/kernel/sys/hal.rs`, `src/kernel/module/loader.rs`
 
-- `verify_integrity(&[u8], &[u8]) -> bool` — byte-compare of computed
-  against stored hash. Every silicon ships a real comparison; the
-  loader relies on it for module admission.
-- `otp_read_signing_key(&mut [u8; 32]) -> bool` — returns the device
-  root-of-trust Ed25519 pubkey. Pi 5 reads it from a build-time
-  environment variable (`FLUXOR_SIGNING_PUBKEY_HEX`) baked into the
-  image; silicon with a real OTP bank reads from fuses. False means
-  "no key provisioned" — the `enforce_signatures` feature then blocks
+Security-relevant platform state is fronted so loader code stays
+silicon-oblivious:
+
+- `verify_integrity(&[u8], &[u8]) -> bool` — a `HalOps` hook that
+  byte-compares a computed hash against the stored one. Every silicon
+  ships a real comparison; the loader relies on it for module
+  admission.
+- The device root-of-trust Ed25519 pubkey is provisioned at build
+  time via the `FLUXOR_SIGNING_PUBKEY_HEX` environment variable,
+  baked into the image and read by the loader's signature check. No
+  key provisioned means the `enforce_signatures` feature blocks
   module load.
 
-On BCM2712, `kernel::dtb::read_ethernet_mac()` walks the firmware-
-provided flattened device tree for the `local-mac-address` property.
+On BCM2712, `kernel::boot::dtb::read_ethernet_mac()` walks the
+firmware-provided flattened device tree for the `local-mac-address`
+property.
 The rp1_gem driver calls this via a kernel-primitive syscall
 (`GET_HW_ETHERNET_MAC`, `0x0C3D`) and programs the returned MAC into
 the GEM's SA1 register. On silicon without DTB plumbing the syscall
@@ -209,9 +213,11 @@ default.
 
 ## Syscall Table
 
-The syscall table (`SyscallTable` in `modules/sdk/kernel_abi.rs`) is a
-`#[repr(C)]` struct of function pointers passed to each module at
-`module_init`. It is the only ABI surface PIC modules see.
+Source: `modules/sdk/abi/kernel_abi.rs`
+
+The syscall table (`SyscallTable`) is a `#[repr(C)]` struct of
+function pointers passed to each module at `module_init`. It is the
+only ABI surface PIC modules see.
 
 The table contains exactly:
 
@@ -219,10 +225,10 @@ The table contains exactly:
 |-------|----------|
 | Channel I/O | `channel_read`, `channel_write`, `channel_poll` |
 | Heap | `heap_alloc`, `heap_free`, `heap_realloc` |
-| Provider dispatch | `provider_open`, `provider_call`, `provider_query`, `provider_close` |
+| Provider dispatch | `provider_open`, `provider_call`, `provider_call_sel`, `provider_query`, `provider_close` |
 
 Channel I/O and heap are hot-path typed syscalls. Everything else
-routes through the four `provider_*` entries:
+routes through the `provider_*` entries:
 
 - `provider_open(contract, open_op, config, len)` returns a handle
   bound to that contract. The kernel tracks the handle → contract
@@ -231,13 +237,18 @@ routes through the four `provider_*` entries:
   contract's vtable. For handle=-1 global operations and untracked
   handles, the opcode's high byte carries the contract id and
   dispatch routes directly through the class chain.
+- `provider_call_sel(sel, sel_len, op_handle, op, arg, len)` calls an
+  instance-keyed provider selected by a short selector string (for
+  example a volume name on the storage surface). The contract is the
+  opcode's class byte; `op_handle` carries the op's own handle (`-1`
+  for open-style ops) and `sel` is purely routing.
 - `provider_query(handle, key, out, len)` reads introspection state.
 - `provider_close(handle)` invokes the contract's default close
   opcode (if any) and releases the tracking entry.
 
-There is no `provider_call` surface. The `provider_*` quartet
-is the complete dispatch API. See [abi_layers.md](abi_layers.md)
-for the contract inventory and opcode namespace.
+The `provider_*` set is the complete dispatch API. See
+[abi_layers.md](abi_layers.md) for the contract inventory and opcode
+namespace.
 
 ## What the Kernel Owns vs What Modules Own
 
@@ -352,12 +363,13 @@ with the union of every supported peripheral.
    driver modules differ — and only because the underlying hardware
    differs.
 
-3. **Testable.** A module can be tested by mocking the syscall table and
-   feeding synthetic channel data. No hardware required.
+3. **Hardware-independent modules.** A module's entire environment is
+   the syscall table and its channels, so it can run against a
+   synthetic table with synthetic channel data. No hardware required.
 
-4. **Small kernel.** The minimum kernel for a Pico is around 256 KB
-   compiled, including Embassy and the chip support. Nothing in the
-   kernel scales with the number of supported peripherals.
+4. **Small kernel.** Nothing in the kernel scales with the number of
+   supported peripherals; a Pico image carries only the chip support
+   for its own silicon.
 
 5. **Stable for third-party modules.** A module compiled against the
    syscall ABI can be loaded by any kernel build with the same ABI
@@ -368,38 +380,33 @@ with the union of every supported peripheral.
 
 | Component | Location |
 |-----------|----------|
-| Syscall table definition | `modules/sdk/abi.rs` |
-| Syscall dispatch | `src/kernel/syscalls.rs` |
-| Provider registry | `src/kernel/provider.rs` |
-| Channel implementation | `src/kernel/channel.rs` |
-| Buffer pool | `src/kernel/buffer_pool.rs` |
-| Loader | `src/kernel/loader.rs` |
-| Scheduler | `src/kernel/scheduler/mod.rs` |
-| Chip abstraction | `src/platform/{rp,bcm2712,linux,wasm}/chip.rs` (+ generated `chip_generated.rs` where applicable) |
-| RP HAL | `src/platform/rp.rs`, `src/platform/rp/*.rs` |
-| BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712/*.rs` |
+| Syscall table definition | `modules/sdk/abi/kernel_abi.rs` (assembled by `modules/sdk/abi.rs`) |
+| Syscall dispatch | `src/kernel/module/syscalls.rs` |
+| Provider registry | `src/kernel/module/provider.rs` |
+| Channel implementation | `src/kernel/ipc/channel.rs` |
+| Buffer pool | `src/kernel/ipc/buffer_pool.rs` |
+| Loader | `src/kernel/module/loader.rs` |
+| Scheduler | `src/kernel/exec/scheduler/` |
+| HalOps table | `src/kernel/sys/hal.rs` |
+| Chip abstraction | `src/platform/{rp,bcm2712,linux,wasm}/chip.rs` (RP includes the generated `chip_generated.rs`) |
+| RP HAL | `src/platform/rp.rs`, `src/platform/rp/` |
+| BCM2712 HAL | `src/platform/bcm2712.rs`, `src/platform/bcm2712/` |
 | Silicon definitions | `targets/silicon/*.toml` |
 | Board definitions | `targets/boards/*.toml` |
 
-## Boundary Decisions
+## Boundary Rules
 
-Decisions on the kernel/platform/board boundary. Each carries its status:
-`DECIDED` (an explicit operator decision) or `PROPOSED` (the implementer's
-recommendation, recorded for review — not yet agreed policy). Code may already
-follow a PROPOSED entry; that makes it current practice, not a settled rule.
-Code comments may summarize these; this section is the authority. Execution
-history for these decisions is tracked in `.context/boundary_ledger.md`.
+The rules that govern the kernel/platform/board boundary. Code comments
+may summarise these; this section is the authority.
 
-### D-KERNEL-PLATFORM — the kernel's two platform seams
+### The kernel's two platform seams
 
-Status: **PROPOSED** (implementer).
-
-The kernel reaches platform behavior through exactly two seams, and nothing
+The kernel reaches platform behaviour through exactly two seams, and nothing
 else:
 
-1. **`HalOps`** (`kernel::sys::hal`) — the function-pointer table each platform
-   installs at boot. All platform *behavior* the kernel invokes goes through
-   it: timing, interrupts, step-guard, ISR tiers, SMP quiesce, and the module
+1. **`HalOps`** (`src/kernel/sys/hal.rs`) — the function-pointer table each
+   platform installs at boot. All platform *behaviour* the kernel invokes goes
+   through it: timing, interrupts, step-guard, ISR tiers, SMP quiesce, and the module
    protection surface (`protection_*`, `protected_step`, stack canaries — MPU
    on Cortex-M, EL0 MMU on aarch64, direct dispatch elsewhere).
 2. **`platform::chip`** — the cfg-selected per-target *constants* module
@@ -411,25 +418,22 @@ else:
    go through `crate::kernel::config` — the ONLY kernel↔`platform::chip`
    reference — so this seam is a single audited surface.
 
-The kernel branches on CAPABILITY, never chip identity. What were once
-`cfg(feature = "chip-bcm2712")` sites are expressed as capability features a
-chip feature turns on: `kernel-vm` (page-table VM + EL0 isolation), `smp`
-(multi-core execution domains), `dtb` (device-tree boot). chip-bcm2712
-provides all three and is today the only target that does, but a future
-MMU-but-single-core (or MPU-but-multi-core) target flips only the capabilities
-it has; no chip name appears in `src/kernel`.
+The kernel branches on capability, never chip identity. Chip-conditional
+behaviour is expressed as capability features that a chip feature turns on:
+`kernel-vm` (page-table VM + EL0 isolation), `smp` (multi-core execution
+domains), `dtb` (device-tree boot). `chip-bcm2712` provides all three and is
+today the only target that does, but a future MMU-but-single-core (or
+MPU-but-multi-core) target flips only the capabilities it has; no chip name
+appears in `src/kernel`.
 
 Anything a kernel file wants from a platform beyond these two seams is a
-boundary bug: add a `HalOps` op (behavior), a `chip` constant (fact via
+boundary bug: add a `HalOps` op (behaviour), a `chip` constant (fact via
 `kernel::config`), or a capability feature (a `cfg` the kernel branches on).
 
-### D-HW-TAXONOMY — hardware capability placement
+### Hardware capability placement
 
-Status: **DECIDED** (operator, 2026-08-01), superseding the implementer's
-earlier "promote after a second chip implements it" proposal.
-
-The principle: **a capability belongs in Fluxor's generic contract vocabulary
-when its semantics are independent of a particular controller implementation.**
+The principle: a capability belongs in Fluxor's generic contract vocabulary
+when its semantics are independent of a particular controller implementation.
 Platform namespaces contain controller-specific mechanisms and escape hatches.
 Boards declare topology and availability. Explicit drivers consume the
 capabilities and expose typed module surfaces. Implementation count is NOT the
@@ -450,22 +454,21 @@ Applied:
   platform by this section's own principle.
 - **PIO** — RP PIO instruction-engine mechanics (16-bit programs, wrap
   targets, side-set, state-machine pin config), FIFO streaming, and the
-  associated DMA belong under `platform::rp::pio`; RP drivers (cyw43, i2s_pio,
-  mic_pio) consume them. The one truly platform-independent piece — the
-  audio/media clock query — is the portable `contracts::stream_clock`
-  capability (class 0x001C); linux/wasm register a real STREAM_CLOCK provider.
-  `STREAM_TIME` remains on RP only as the PIO backend's per-stream clock (the
-  kernel falls back to it when no STREAM_CLOCK provider is registered — on RP
-  the clock genuinely IS the PIO stream).
+  associated DMA belong under `modules/sdk/platform/rp/pio.rs`; RP drivers
+  (cyw43, i2s_pio, mic_pio) consume them. The one truly platform-independent
+  piece, the audio/media clock query, is the portable
+  `contracts/stream_clock.rs` capability (class 0x001C); linux/wasm register
+  a real STREAM_CLOCK provider. `STREAM_TIME` remains on RP as the PIO
+  backend's per-stream clock, and the kernel falls back to it when no
+  STREAM_CLOCK provider is registered (on RP the clock genuinely is the PIO
+  stream).
 - **DMA** — the portable channel-id surface (`peripherals.dma_channels`,
   `EdgeClass::DmaOwned`) is the vocabulary; raw register layouts stay
   per-family.
 - **USB** — reserved kernel contract id + handle tag stand; the SDK contract
   is written when the first PIC module consumes it.
 
-### D-BOARD-STACK — boards declare hardware facts; stacks select drivers
-
-Status: **DECIDED** (operator, 2026-08-01). Executed for net, audio, display.
+### Boards declare hardware facts; stacks select drivers
 
 A board file declares hardware identity (`[platform.net] phy`, `nic =
 "rp1-gem"|"virtio"|"cyw43"`; `[platform.audio] sink = "i2s"|"host"`;

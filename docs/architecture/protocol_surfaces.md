@@ -1,854 +1,502 @@
 # Protocol Surfaces and Session Continuity
 
-This document defines Fluxor's protocol substrate above channels: the four
-standard protocol surfaces, the five session continuity classes, and the
-architectural roles (transport anchor, session worker, session directory)
-that sit above those surfaces.
+This document defines Fluxor's protocol substrate above channels: the
+protocol surfaces (stream, datagram, packet, multiplexed session, and
+the session-control sideband), the five session continuity classes, and
+the architectural roles (transport anchor, session worker, session
+directory) that sit above them. It is the reference that modules,
+manifests, and graph configs use for protocol-surface vocabulary.
 
-This document is the normative Fluxor reference that modules, manifests,
-and graph configs use for protocol-surface vocabulary.
+Every surface is a channel contract under
+`modules/sdk/contracts/net/`. The kernel does not learn any of them:
+protocol state lives entirely in modules.
 
-## Scope
+## The Contract Files
 
-This architecture defines:
+Source: `modules/sdk/contracts/net/`.
 
-- the four **protocol surfaces** (stream, datagram, packet, multiplexed
-  session) as channel-level contracts
-- the five **session continuity classes** (reroutable, drain_only, resumable,
-  edge_anchored, transport_migratable) that classify what maintenance
-  behaviour a workload requires
-- the three **architectural roles** (transport anchor, session worker,
-  session directory) that express where client-visible transport identity,
-  movable session state, and placement metadata live
-- the **session identity model** (`conn_id`, `session_id`, `anchor_id`,
-  `session_epoch`) that makes continuity a validatable graph property
+| File | Surface | Opcodes | Status |
+|------|---------|---------|--------|
+| `net_proto.rs` | stream | `0x01..0x13` | live: `ip`, `tls`, `ota_registry`, `linux_net`, wave's `http` |
+| `datagram.rs` | datagram | `0x20..0x43` | live: `ip`, `linux_net`, `dns`, `log_net`, `quic`, `tls` (DTLS mode) |
+| `packet.rs` | packet | `0x50..0x63` | reserved: envelope defined, no consumer |
+| `identity.rs` | address control | `0x60..0x61` | live: net identity self-registration |
+| `session_ctrl.rs` | session control | `0x70..0x9F` | live: `echo_anchor` / `echo_worker` fixtures |
+| `mux.rs` | multiplexed session | `0xB0..0xCF` | live: `quic`, `mux_echo` fixture |
 
-It does not define:
+All six files share the 3-byte TLV header
+`[msg_type: u8][len: u16 LE]`, so the `net_read_frame` /
+`net_write_frame` helpers in `modules/sdk/runtime/net.rs` work
+unchanged on every surface. Opcode ranges are disjoint across the
+files that can share a channel, so a misconfigured channel fails
+loudly rather than silently misparsing. The one numeric overlap is
+`identity.rs` (`ADDR_ADD` 0x60 / `ADDR_DEL` 0x61 inside the packet
+range); those opcodes travel only on a dedicated single-writer
+`addr_ctl` port and never share a channel with packet frames.
 
-- kernel changes (there are none required by this document)
-- concrete Rust contract types — those land in phases that touch
-  `modules/sdk/contracts/net/`
-- packaging of reusable protocol cores — deferred by design
-- auto-wiring behaviour beyond what `capability_surface.md` already defines
-
-## Relationship to Existing Architecture
-
-This document extends, not replaces:
-
-- `architecture/network.md` — the current single `net_proto` contract is
-  reclassified as **Stream Surface v1** and remains wire-compatible with
-  everything that already speaks it
-- `architecture/capability_surface.md` — capability matching rules are
-  unchanged; new capability names live alongside the existing
-  `frame.*` / `audio.*` / `file.*` / `storage.*` taxonomy
-- `architecture/reconfigure.md` — `edge_anchored` and `transport_migratable`
-  continuity depend on reconfigure's drain/migrate phases plus opaque
-  state export/import hooks added in later phases
-- `architecture/pipeline.md` — channels remain the only module-to-module
-  data path; every surface here is a channel contract
-- `modules/foundation/remote_channel/` — remote channels are the natural
-  fabric between anchors and remote session workers
-
-## The Four Protocol Surfaces
-
-Every protocol surface is a channel contract. The kernel does not learn
-any of them.
+## The Protocol Surfaces
 
 ### Stream Surface
 
-For ordered byte streams: TCP, TLS-over-TCP, HTTP/1.x, MQTT, SSH-class
-protocols, WebSocket after upgrade.
+Contract: `modules/sdk/contracts/net/net_proto.rs`. Full opcode and
+payload reference: `network.md`.
 
-Operations:
-
-- bind / listen
-- connect
-- accept / connected
-- send bytes
-- receive bytes
-- close
-- error
-- optional flow-control and retransmit hints
-
-**The current `net_proto` TLV format codifies Stream Surface v1.** The
-`MSG_ACCEPTED` / `MSG_DATA` / `MSG_CLOSED` / `CMD_BIND` / `CMD_CONNECT` /
-`CMD_SEND` / `CMD_CLOSE` / `MSG_RETRANSMIT` / `MSG_ACK` frames described
-in `network.md` are Stream Surface v1 in all but name.
+Ordered byte streams: TCP, TLS-over-TCP, HTTP/1.x, MQTT, WebSocket
+after upgrade. Operations: bind/listen, connect, accept/connected,
+send, receive, close, error. The contract is stream-only: only
+`SOCK_TYPE_STREAM` (1) is accepted on `CMD_CONNECT`, and any other
+`sock_type` fails with EINVAL. The retransmit hints (`MSG_RETRANSMIT`
+0x07 / `MSG_ACK` 0x08) are reserved in the contract and defined
+privately by the `ip` module.
 
 ### Datagram Surface
 
-For message-oriented transports: UDP, DTLS, RTP, DNS, STUN/TURN,
-discovery and telemetry protocols.
+Contract: `modules/sdk/contracts/net/datagram.rs`.
 
-Operations:
+Message-oriented transports: UDP, DTLS, DNS, telemetry. Endpoints are
+provider-allocated one-byte handles (`ep_id`), and the source address
+rides every RX frame so a consumer can survive peer migration.
+Addresses are big-endian, ports little-endian.
 
-- bind endpoint
-- optionally connect a default remote endpoint
-- send datagram with explicit or default destination
-- receive datagram with explicit source metadata
-- close
-- error
+| Opcode | Name | Payload |
+|--------|------|---------|
+| `0x20` | `CMD_DG_BIND` | `[port: u16 LE][flags: u8]` — `BIND_FLAG_RX_ONLY` (0x01) is advisory |
+| `0x21` | `CMD_DG_SEND_TO` | `[ep_id: u8][af: u8][addr: 4\|16 BE][port: u16 LE][data…]` |
+| `0x22` | `CMD_DG_CLOSE` | `[ep_id: u8]` |
+| `0x40` | `MSG_DG_BOUND` | `[ep_id: u8][local_port: u16 LE]` |
+| `0x41` | `MSG_DG_RX_FROM` | `[ep_id: u8][af: u8][src_addr: 4\|16 BE][src_port: u16 LE][data…]` |
+| `0x42` | `MSG_DG_CLOSED` | `[ep_id: u8]` |
+| `0x43` | `MSG_DG_ERROR` | `[ep_id: u8][errno: i8]` |
 
-This removes UDP from its current awkward position sharing `net_proto`'s
-stream-shaped slots with a payload prefix. A future
-`contracts/net/datagram.rs` will define the envelope; until then, UDP
-consumers continue to use the existing `SOCK_TYPE_DGRAM` shape described
-in `network.md`.
+`af` is 4 (IPv4) or 6 (IPv6) as literal values (not POSIX constants),
+giving address prefixes of 8 (`V4_ADDR_PREFIX`) or 20
+(`V6_ADDR_PREFIX`) bytes before the payload. Every `CMD_DG_SEND_TO`
+carries an explicit destination; there is no connected-default TX
+form.
 
 ### Packet Surface
 
-For modules that need packet-preserving behaviour and richer metadata:
-QUIC engines, DTLS/SRTP packet processors, policy modules, packet
-classifiers, direct NIC fast paths, market-data and control-plane packet
-flows.
+Contract: `modules/sdk/contracts/net/packet.rs`.
 
-Packet envelope metadata may include:
+Packet-preserving flows with richer metadata: packet classifiers,
+policy modules, NIC fast paths. The envelope is defined; no module
+consumes it yet.
 
-- ingress lane / interface
-- timestamp
-- ECN / DSCP / traffic class
-- checksum / offload status
-- flow hint / connection ID hint
-- segmentation or batching markers
+TX (`CMD_PKT_TX` 0x51) and RX (`MSG_PKT_RX` 0x61) share the shape
+`[ep_id: u8][af: u8][addr: 4|16 BE][port: u16 LE][lane: u8][flags: u8]
+[dscp: u8][ts_us: u64 LE][flow_hint: u32 LE][packet…]` — a 15-byte
+metadata block after the address, prefixes 23 (`V4_META_PREFIX`) or 35
+(`V6_META_PREFIX`) bytes. RX flags: ECN-CE, checksum-ok,
+has-flow-hint, has-timestamp, fast-path. TX flags: ECN-capable,
+no-checksum, urgent. Bind/close/error opcodes mirror the datagram
+surface (`CMD_PKT_BIND` 0x50, `MSG_PKT_BOUND` 0x60, `CMD_PKT_CLOSE`
+0x52, `MSG_PKT_CLOSED` 0x62, `MSG_PKT_ERROR` 0x63).
 
-The packet surface composes naturally with mailbox and in-place buffer
-edge classes where available, but it remains a channel contract. The
-zero-copy fast path depends on the mailbox/in-place edge classes and the
-NIC-bypass work; this document only defines the protocol surface that
-those optimizations would use.
+The surface composes with mailbox and in-place buffer edges where
+available, but it remains a channel contract.
 
 ### Multiplexed Session Surface
 
-For transports that expose many logical streams or message channels over
-one transport association: QUIC, future SCTP-data-channel-style
-transports, application-defined mux layers.
+Contract: `modules/sdk/contracts/net/mux.rs`.
 
-Operations:
+Transports exposing many logical streams over one association. This
+keeps QUIC-class transports off a false TCP-shaped abstraction: a
+consumer sees streams, not packet protection. Operations: session
+open/close, stream open/accept/close, per-stream send/receive,
+per-stream and per-session error, readiness signalling.
 
-- session open / close
-- stream open / accept / close
-- per-stream send / receive
-- per-stream and per-session error
-- readiness and flow-control signaling
+Every stream-scoped message carries `session_id` (u32 LE, the
+transport association) and `stream_id` (u32 LE, per session). Stream
+open takes bidi / unidirectional / urgent flags. Flow-control credit
+messages exist in the contract (`MSG_MUX_STREAM_READY` 0xC6 /
+`CMD_MUX_STREAM_ACK` 0xB5). The peer sideband includes
+`MSG_MUX_PEER_IDENTITY` (0xC8) and `MSG_MUX_PEER_SETTINGS` (0xC9).
 
-This prevents QUIC and similar transports from being forced through a
-false TCP-shaped abstraction. HTTP/3 consumes `transport.mux`, not
-`transport.stream`.
+The live consumer is the `quic` module, under a constrained profile
+documented in the contract: `session_id` is the connection index,
+exactly one bidirectional stream (id 0) per session, a bounded
+per-send maximum (`MUX_QUIC_STREAM_SEND_MAX`, 1200 bytes), and the
+credit messages unused.
+
+### Session Control Sideband
+
+Contract: `modules/sdk/contracts/net/session_ctrl.rs`. See
+§SessionCtrl Envelope for the opcode table.
+
+The control plane between transport anchors, session workers, and
+session directories: attach/detach, drain, chunked opaque state
+export/import with CRC32 integrity, resume, epoch bump, relocation,
+and a hello handshake carrying role constants (`ROLE_ANCHOR` 1,
+`ROLE_WORKER` 2, `ROLE_DIRECTORY` 3).
 
 ## The Five Continuity Classes
 
-Session continuity is classified. A graph or module declares the class
-its workload requires; the config tool validates that the structural
-pieces needed for that class are present.
+Sources: `tools/src/config/validate.rs`,
+`tools/src/config/manifest.rs` (`CONTINUITY_CLASSES`),
+`modules/sdk/contracts/net/session_ctrl.rs` (`CC_*` wire constants).
+
+Session continuity is a declared, validated graph property. A graph
+declares the class its workload requires in a top-level `continuity`
+block (`id`, `class`, and per-class member fields), and the config
+tool confirms the structural pieces exist at build time. The five
+classes, with the structure the validator requires:
 
 ### `reroutable`
 
-The service may move freely. Existing flows may be dropped or retried.
-New flows are simply routed elsewhere.
-
-Examples: DNS, short HTTP, stateless UDP request/response.
-
-Required structure: none beyond the protocol surface itself.
+The service may move freely; existing flows may be dropped or retried,
+new flows route elsewhere. Examples: DNS, short HTTP, stateless UDP
+request/response. Required structure: none.
 
 ### `drain_only`
 
-Existing flows are allowed to finish gracefully, but no attempt is made
-to resume or preserve them beyond drain.
-
-Examples: many HTTP request/response services, short broker operations,
-simple stream relays.
-
-Required structure: the consuming module must export `module_drain`
-(see `reconfigure.md`).
+Existing flows finish gracefully; nothing is resumed or preserved
+beyond drain. Examples: HTTP request/response services, short broker
+operations, simple relays. Required structure: none checked by the
+validator; the operational expectation is that the consuming module is
+drain-capable (exports `module_drain` — see `reconfigure.md`).
 
 ### `resumable`
 
-The client may reconnect, but the application session can resume from a
-token, cursor, lease, or session identifier.
-
-Examples: MQTT session resume, watch-stream cursors, command cursors or
-checkpoints, push delivery cursors.
-
-Required structure:
-
-- a declared resumption state shape (token / cursor / lease / session id)
-- opaque state export / import hooks compatible with reconfigure's
-  migrate phase
-- a `session_id` convention for the protocol
+The client may reconnect and the application session resumes from a
+token, cursor, lease, or session identifier. Examples: MQTT session
+resume, watch-stream cursors, delivery cursors. Required structure: at
+least one declared member (the anchor or a worker) provides the
+`session.resume` capability.
 
 ### `edge_anchored`
 
-The client-visible transport remains attached to a stable anchor while
-the session or application worker may move behind it.
-
-Examples: large MQTT front doors, push notification gateways, long-lived
-watch streams, and remote control channels.
-
-Required structure:
-
-- a module providing `transport.anchor.*` (stream / datagram / mux) for
-  the protocol in question
-- a session worker providing `session.worker` with export / import hooks
-- a session directory providing `session.directory` for placement and
-  epoch tracking
-- `session_id` and `session_epoch` conventions
-
-This is the most important continuity class for TCP/TLS workloads
-because it delivers no-reconnect maintenance without requiring full live
-TCP migration.
+The client-visible transport stays attached to a stable anchor while
+the session worker moves behind it. Examples: broker front doors, push
+gateways, long-lived watch streams. Required structure: an `anchor`
+member providing a `transport.anchor.*` capability, one or more
+`workers` providing `session.worker`, and, when more than one worker
+is declared, `session.handoff` on every worker. This class delivers
+no-reconnect maintenance for TCP/TLS workloads without live TCP
+migration.
 
 ### `transport_migratable`
 
 The transport association itself may change path or attachment point
-without client reconnect.
+without client reconnect. Required structure: a declared `mechanism`,
+one of:
 
-Examples: QUIC and future QUIC-based services; selected internal
-remote-channel transports under full platform control.
+- `native_primitive` — the graph contains a `transport.mux.*`
+  provider (a transport whose connection model supports migration,
+  such as QUIC).
+- `platform_replicated_state` — the anchor must provide
+  `transport.anchor.datagram`; a `directory` member must provide
+  `session.directory`; the graph must contain providers for
+  `session.reservation`, `security.key_wrap`, `fence.enforceable`,
+  and `durable.rpo_zero`; the declared `aead` class must be
+  `on_wire_sequence` or `unencrypted` (`implicit_counter` is rejected
+  outright: a transport whose AEAD nonces cannot survive an anchor
+  move honestly tops out at `resumable`); and the declared
+  `failover_budget_ms` must be strictly below `client_keepalive_ms`.
 
-Required structure:
+Declaring `mechanism` or `aead` under any other class is a hard
+error. The validator checks structure only (the presence of the
+declared providers and the budget inequality), not behaviour under
+fault.
 
-- a transport with migration semantics (QUIC connection migration, an
-  internal remote-channel transport declaring migration support)
-- everything required for `edge_anchored`, because anchor movement may
-  participate in the migration handoff
-
-This is the strongest and most ambitious class. It is not required for
-all workloads.
-
-### Validation Rule
-
-Continuity class is a validated graph property, not a comment. If a
-graph or module declares a class above `drain_only`, the config tool
-must confirm the required structural pieces exist. A graph that declares
-`edge_anchored` without an anchor provider fails validation at build
-time.
+No module in this repository currently declares `session.directory`,
+`session.reservation`, `security.key_wrap`, `fence.enforceable`, or
+`durable.rpo_zero`, so a `platform_replicated_state` graph is a design
+target here: the vocabulary and validation exist, the providers do
+not.
 
 ## Architectural Roles
 
-These roles sit above the protocol surfaces. They are module roles, not
-kernel features.
+These are module roles, not kernel features. The role constants are on
+the wire in the session-control hello; the capability names live in
+the shared vocabulary (`contracts/src/vocabulary.rs`) and are
+documented in `capability_surface.md`.
 
 ### Transport Anchor
 
-A transport anchor owns the client-visible transport attachment:
-
-- listening socket or inbound transport endpoint
-- accepted client transport state
-- TLS or QUIC attachment point where appropriate
-- stable front-door identity
-
-The anchor is intentionally conservative about movement. It is the part
-that stays put so the client connection does not have to. The anchor
-does not have to own all session or application logic.
-
-Anchors typically run on server-class or edge-class targets.
-Constrained devices rarely host anchors; they usually act as clients
-served by an anchor elsewhere.
+Owns the client-visible transport attachment: the listening socket or
+inbound endpoint, accepted client transport state, the TLS or QUIC
+attachment point, a stable front-door identity. The anchor is
+deliberately conservative about movement: it stays put so the client
+connection does not have to. Anchors suit server-class and edge-class
+targets; constrained devices usually act as clients served by an
+anchor elsewhere. Capabilities: `transport.anchor.stream`,
+`transport.anchor.stream.secure` (declared by the `tls` module),
+`transport.anchor.datagram`, `transport.anchor.mux`.
 
 ### Session Worker
 
-A session worker owns movable state:
-
-- application session state
-- broker routing state
-- watch / filter state
-- fan-out or delivery planning
-- durable interaction with backend shards or storage
-
-Session workers may be local or remote relative to the anchor. They may
-be moved, drained, resumed, or replaced according to continuity policy.
+Owns movable state: application session state, routing state,
+watch/filter state, fan-out planning, durable interaction with
+backends. Workers may be local or remote relative to the anchor, and
+are moved, drained, resumed, or replaced according to continuity
+policy. Capabilities: `session.worker`, plus `session.handoff` and
+`session.resume` where supported.
 
 ### Session Directory
 
-A session directory provides placement and continuity metadata:
+Provides placement and continuity metadata: `session_id` → current
+worker binding, continuity class, `session_epoch`, resumption
+metadata. It is a role, not necessarily a dedicated binary. Its own
+continuity class is normally `resumable`: replicated and
+recoverable, but with no client-facing transport to preserve.
 
-- logical `session_id` -> current worker location
-- continuity class
-- `session_epoch` / generation
-- resumption metadata
-- optional anchor binding metadata
-
-The session directory is an architectural role, not necessarily a
-dedicated binary. It may be implemented by a shared service, a local
-module, or a replicated Fluxor deployment.
-
-The expected continuity class of the directory itself is normally
-`resumable`, not `edge_anchored`. It should be replicated and
-recoverable, but it does not need to preserve a client-facing transport.
-
-**Write semantics.** The minimum authoritative write semantic is
-single-writer authority per `(session_id, session_epoch)`: one
-authoritative owner decides the active worker binding for a session
-generation. Competing stale writers must be rejected.
-
-**Bootstrap and failure.** Anchors may continue to serve already-attached
-sessions using cached bindings during short directory outages, but they
-must not create conflicting new ownership. If the directory is
-partitioned, the safety rule is *preserve one authoritative owner per
-session generation*, not *accept progress everywhere*.
-
-**New-session admission under partition** is per-protocol policy. A
-protocol may reject, queue, or use tightly scoped provisional binding,
-but it must not create competing durable ownership while authority is
-uncertain.
+No directory implementation exists in this repository; the following
+semantics are the design contract a directory must satisfy. The
+minimum write semantic is single-writer authority per
+`(session_id, session_epoch)`: one authoritative owner decides the
+active worker binding for a session generation, and competing stale
+writers are rejected. During short directory outages an anchor may
+keep serving already-attached sessions from cached bindings but must
+not create conflicting new ownership. New-session admission under
+partition is per-protocol policy (reject, queue, or tightly scoped
+provisional binding), never competing durable ownership.
 
 ## Session Identity Model
 
-Four distinct identifiers, at three different scopes.
+Source: `modules/sdk/contracts/net/session_ctrl.rs`,
+`modules/sdk/contracts/net/net_proto.rs`.
 
-| Identifier     | Scope                          | Notes                                                  |
-|----------------|--------------------------------|--------------------------------------------------------|
-| `conn_id`      | per-module, per-IP-instance    | cheap local fast-path handle; already in `net_proto`   |
-| `session_id`   | stable logical session         | required for continuity classes above `drain_only`     |
-| `anchor_id`    | stable front-door anchor       | identifies the transport anchor a session is bound to  |
-| `session_epoch`| monotonic per `session_id`     | orders handoffs; stale epochs are rejected             |
+Four identifiers at three scopes:
 
-- `conn_id` remains module-local and cheap. It is not a kernel resource.
+| Identifier | Wire shape | Scope |
+|------------|-----------|-------|
+| `conn_id` | u16 LE | per-provider-instance fast-path handle (stream surface) |
+| `session_id` | 16 bytes BE | stable logical session |
+| `anchor_id` / `worker_id` | 8 bytes BE | stable front-door / worker identity |
+| `session_epoch` | u32 LE | monotonic per `session_id`; orders handoffs |
+
+- `conn_id` stays module-local and cheap; it is not a kernel
+  resource, and 0 is a valid handle.
 - `session_id` is the continuity-aware identifier used by anchors,
-  workers, and directories. It is not required for all protocols.
-- `anchor_id` identifies the anchor a session is currently attached to.
-- `session_epoch` increases on every authoritative rebind. A worker
-  that presents a stale epoch to the anchor or directory is rejected.
-
-**Minting.** In most `edge_anchored` designs, `session_id` is minted by
-the protocol owner at the continuity boundary — usually the anchor
-during first attach, or the resumption layer during reconnect. It is
-typically scoped to a tenant or cluster continuity domain rather than
-globally across all deployments. It does not need to appear on the
-public wire unless the protocol already exposes a resume token or
-session key; many stacks can keep it purely internal.
+  workers, and directories; it is minted by the protocol owner at the
+  continuity boundary (usually the anchor at first attach), scoped to
+  a deployment rather than globally, and need not appear on the
+  public wire.
+- `session_epoch` increases on every authoritative rebind; a peer
+  presenting a stale epoch is rejected.
+- Identity fields are big-endian so raw byte comparison matches the
+  canonical rendered identity; epoch, status, and length fields are
+  little-endian like the rest of the net contracts. Note the mux
+  surface's `session_id` is a different, unrelated identifier (u32 LE
+  transport association).
 
 ## Content Contracts
 
-Content contracts carry the envelope metadata each surface needs. They
-live alongside the existing content types defined in
-`capability_surface.md`.
+The envelope vocabulary is declared as content types alongside the
+registry in `capability_surface.md` (canonical names in
+`contracts/src/vocabulary.rs`): `NetStreamCmdV1` / `NetStreamEvtV1`
+(stream), `NetDatagramTxV1` / `NetDatagramRxV1` (datagram),
+`NetPacketV1` (packet), `NetMuxCmdV1` / `NetMuxEvtV1` (multiplexed
+session), and `NetSessionCtrlV1` (session control). These are declared
+vocabulary; current manifests type their net ports as `NetProto` or
+`OctetStream`.
 
-| Content contract   | Surface             | Purpose                                               |
-|--------------------|---------------------|-------------------------------------------------------|
-| `NetStreamCmdV1`   | stream              | upstream commands (bind, connect, send, close)        |
-| `NetStreamEvtV1`   | stream              | downstream events (accepted, data, closed, error)     |
-| `NetDatagramTxV1`  | datagram            | outbound datagrams with explicit destination          |
-| `NetDatagramRxV1`  | datagram            | inbound datagrams with explicit source                |
-| `NetPacketV1`      | packet              | packet-preserving envelope with ingress metadata      |
-| `NetMuxCmdV1`      | multiplexed session | session / stream open / close / send                  |
-| `NetMuxEvtV1`      | multiplexed session | session / stream events and readiness                 |
-| `SessionCtrlV1`    | any                 | control sideband between anchor, worker, directory    |
+## SessionCtrl Envelope
 
-Concrete Rust types land in `modules/sdk/contracts/net/`:
+Source: `modules/sdk/contracts/net/session_ctrl.rs`.
 
-- `net_proto.rs` — Stream Surface v1, opcodes `0x01..0x13`. Users:
-  HTTP, MQTT, TLS. Stream only; UDP has been retired from this contract
-  (Phase 2d).
-- `datagram.rs` — Datagram Surface v1, opcodes `0x20..0x43`. Users:
-  DNS, RTP, log_net. IPv4 addresses BE, ports LE, source always
-  carried on RX.
-- `packet.rs` — Packet Surface v1, opcodes `0x50..0x63`. Envelope
-  reserved; first consumer = Phase 6 QUIC.
-- `session_ctrl.rs` — SessionCtrlV1, opcodes `0x70..0x9F`. Envelope
-  reserved; first consumers = Phase 5 anchor / worker deployments.
-  Carries `session_id` (16 BE) + `anchor_id` / `worker_id` (8 BE) +
-  `session_epoch` (4 LE) across ATTACH / DETACH / DRAIN / EXPORT /
-  IMPORT / RESUME / EPOCH_BUMP / RELOCATE flows.
-- `mux.rs` — Multiplexed Session Surface, opcodes `0xB0..0xCF`.
-  Envelope reserved; first consumer = Phase 6 QUIC. Carries
-  `session_id` (u32 LE, transport association) + `stream_id` (u32 LE,
-  per-session) on every stream-scoped message. Bidi / unidirectional
-  / urgent flags on stream open; per-stream and per-session errors;
-  flow-control via `STREAM_READY` / `STREAM_ACK` credit messages.
-- `stream.rs` — planned, would formalise the Stream Surface v1
-  opcodes as a dedicated file once the naming history of `net_proto.rs`
-  becomes a burden; low priority while the legacy filename still reads
-  clearly.
+Commands (anchor/directory → worker):
 
-All four landed files share the 3-byte `[msg_type][len_lo][len_hi]`
-TLV header so the existing `net_read_frame` / `net_write_frame` helpers
-in `modules/sdk/runtime.rs` work unchanged. Opcode ranges are disjoint
-across the files so misconfigured channels fail loudly rather than
-silently misparsing.
+| Opcode | Name | Payload after `[session_id: 16 BE]` |
+|--------|------|-------------------------------------|
+| `0x70` | `CMD_SC_HELLO` | (no session id) `[role: u8][self_id: 8 BE][flags: u8]` |
+| `0x71` | `CMD_SC_ATTACH` | `[anchor_id: 8 BE][epoch: u32 LE][cc: u8][worker_id: 8 BE or zero]` |
+| `0x72` | `CMD_SC_DETACH` | `[epoch: u32 LE][reason: u8]` |
+| `0x73` | `CMD_SC_DRAIN` | `[epoch: u32 LE][deadline_ms: u32 LE]` |
+| `0x74` | `CMD_SC_EXPORT_BEGIN` | `[epoch: u32 LE][total_len: u32 LE]` |
+| `0x75` | `CMD_SC_EXPORT_CHUNK` | `[epoch: u32 LE][offset: u32 LE][data…]` |
+| `0x76` | `CMD_SC_EXPORT_END` | `[epoch: u32 LE][crc32: u32 LE]` |
+| `0x77` | `CMD_SC_RESUME` | `[new_epoch: u32 LE]` |
+| `0x78` | `CMD_SC_EPOCH_BUMP` | `[old_epoch: u32 LE][new_epoch: u32 LE]` |
+| `0x79` | `CMD_SC_RELOCATE` | `[epoch: u32 LE][new_worker: 8 BE]` |
 
-### Datagram Envelope
+Events (worker → anchor/directory):
 
-The datagram envelope carries:
+| Opcode | Name | Payload after `[session_id: 16 BE]` |
+|--------|------|-------------------------------------|
+| `0x90` | `MSG_SC_HELLO_ACK` | (no session id) `[role: u8][peer_id: 8 BE]` |
+| `0x91` | `MSG_SC_ATTACHED` | `[epoch: u32 LE][status: u8]` |
+| `0x92` | `MSG_SC_DETACHED` | `[epoch: u32 LE]` |
+| `0x93` | `MSG_SC_DRAINED` | `[epoch: u32 LE]` |
+| `0x94` | `MSG_SC_IMPORT_BEGIN` | `[epoch: u32 LE][status: u8]` |
+| `0x95` | `MSG_SC_IMPORT_CHUNK` | `[epoch: u32 LE][offset: u32 LE]` |
+| `0x96` | `MSG_SC_IMPORT_END` | `[epoch: u32 LE][status: u8]` — `CORRUPT` on CRC mismatch |
+| `0x97` | `MSG_SC_RESUMED` | `[new_epoch: u32 LE]` |
+| `0x98` | `MSG_SC_EPOCH_CONFIRMED` | `[new_epoch: u32 LE]` |
+| `0x99` | `MSG_SC_RELOCATED` | `[epoch: u32 LE][status: u8]` |
+| `0x9F` | `MSG_SC_ERROR` | `[epoch: u32 LE][errno: i8]` |
 
-- local endpoint handle
-- source address / port on RX
-- destination address / port on TX when not connected-default
-- payload length
-- metadata flags
+Detach reasons: normal (0), drain timeout (1), stale epoch (2), error
+(3), client gone (4). Status codes: OK (0), stale epoch (1), unknown
+session (2), no capacity (3), corrupt (4), not ready (5).
 
-### Packet Envelope
-
-The packet envelope carries:
-
-- payload span
-- ingress source / lane
-- timestamp
-- traffic markings (ECN, DSCP, class)
-- checksum / offload status
-- optional flow hint / connection ID hint
-
-This is the minimum needed for QUIC, WebRTC-class stacks, packet policy
-modules, and portability-aware routing.
-
-### SessionCtrlV1
-
-The control-plane sideband between anchors, workers, and directories
-carries events for:
-
-- attach (`CMD_SC_ATTACH` / `MSG_SC_ATTACHED`)
-- detach (`CMD_SC_DETACH` / `MSG_SC_DETACHED`)
-- pause / drain (`CMD_SC_DRAIN` / `MSG_SC_DRAINED`)
-- opaque state export / import with chunked transfer and CRC32
-  integrity (`CMD_SC_EXPORT_BEGIN` / `CMD_SC_EXPORT_CHUNK` /
-  `CMD_SC_EXPORT_END` / `MSG_SC_IMPORT_BEGIN` / `MSG_SC_IMPORT_CHUNK` /
-  `MSG_SC_IMPORT_END`)
-- resume (`CMD_SC_RESUME` / `MSG_SC_RESUMED`)
-- generation change (`CMD_SC_EPOCH_BUMP` / `MSG_SC_EPOCH_CONFIRMED`)
-- worker relocation (`CMD_SC_RELOCATE` / `MSG_SC_RELOCATED`)
-- role discovery handshake (`CMD_SC_HELLO` / `MSG_SC_HELLO_ACK`)
-
-`SessionCtrlV1` is a module-level contract, not a kernel interface. The
-landed envelope lives at `modules/sdk/contracts/net/session_ctrl.rs`.
-Identity byte order is **big-endian** for `session_id` / `anchor_id` /
-`worker_id` so raw byte comparison matches the cluster's canonical
-identity representation; `session_epoch` and status / length fields
-remain little-endian for consistency with the other net contracts.
-
-Stale-epoch rejection is an ordering invariant, not just a convention:
-receivers reject any message whose epoch is less than the last
-authoritative epoch for `session_id` and reply with
-`MSG_SC_ERROR` (or implicit drop, per peer policy).
+Stale-epoch rejection is the contract's ordering invariant: a receiver
+rejects any message whose epoch is below the last authoritative epoch
+it holds for that `session_id`. The in-tree worker fixture rejects and
+reports the event on the monitor path; replying with `MSG_SC_ERROR` is
+the contract's provision for peers that want an in-band signal.
 
 ## Observability
 
-Continuity transitions are observable through Fluxor's existing monitor
-and log path. Anchors, workers, and directories emit `MON_SESSION`
-lines at every `SessionCtrlV1` transition so operators can see attach,
-rebind, epoch bump, drain timeout, and stale-generation rejection on
-the same telemetry channel already used for other per-module
-visibility.
+Anchors, workers, and directories emit `MON_SESSION` lines at
+session-control transitions, on the same telemetry channel used for
+other per-module visibility. The line format is specified in
+`monitor-protocol.md`: one line per transition, with `session=`
+rendered as 32 big-endian hex characters so a single grep follows a
+session across all emitters. The fixtures emit via the
+`dev_mon_session` SDK helper (`modules/sdk/runtime/telemetry.rs`) and
+the `SELF_INDEX` syscall.
 
-The `MON_SESSION` line format is specified in `monitor-protocol.md`:
-one line per transition, `session=` rendered as 32 hex chars big-
-endian so a single grep follows a session across all emitters.
-
-`echo_anchor` and `echo_worker` emit live `MON_SESSION` lines at every
-transition (attach, drain, export, import, resume, epoch bump,
-relocate, detach) via the `dev_mon_session` SDK helper and the
-`SELF_INDEX` module-index syscall. The full lifecycle is observable by
-wiring the anchor with an active + standby worker pair and a non-zero
-`handoff_after_bytes` (see §First Live Consumer below).
-
-For platform-replicated-state `transport_migratable` sessions the
-record set extends with the failover events (`fence_initiated` /
+Event constants for replicated-state failover (`fence_initiated` /
 `fence_confirmed`, `vip_moved`, `reservation_granted` /
 `reservation_exhausted_stall`, `rpo_loss`,
-`unsafe_recovery_epoch_void`) and the per-session `class_report`
-(`declared_class` vs `achieved_class`) — see `monitor-protocol.md`
-§Failover records. A session running below its declared class must
-surface the degradation there rather than leaving it to be inferred.
+`unsafe_recovery_epoch_void`, `class_report`) are defined in the
+telemetry vocabulary and in `monitor-protocol.md`, but no emitter
+exists yet — they are reserved for the replicated-state mechanism.
 
-## Module Stack Patterns
+## Deployment Patterns
 
-### Stateless DNS / Short HTTP (`reroutable` / `drain_only`)
+The stacks below are design guidance for composing the surfaces and
+roles; apart from the fixture demonstration (§Reference Fixtures),
+none of the named front-door modules exist in this repository.
 
-```text
-driver(net.frame.ethernet) -> ip(transport.datagram.udp) -> dns
-driver(net.frame.ethernet) -> ip(transport.stream.tcp)   -> tls -> http
-```
-
-VIPs, anycast, and drain are typically sufficient.
-
-### Large MQTT Front Door (`edge_anchored`)
-
-```text
-client
-  -> mqtt_edge_anchor(transport.anchor.stream.secure, mqtt wire session)
-  -> remote/local channels
-  -> mqtt_session_worker(session.worker)
-  -> topic_router / fanout / persistence
-  -> replicated session.directory
-```
-
-The split:
-
-- the **edge anchor** keeps the TCP/TLS/MQTT client attachment stable
-- the **session core** and downstream broker logic may move
-- the **session directory** tracks where the session core lives
-
-For MQTT specifically, the recommended first split is:
-
-- the anchor owns TCP/TLS attachment, MQTT parser/serializer,
-  CONNECT/CONNACK attachment state, keepalive timers, negotiated
-  capability limits, and the bounded ingress/egress buffers needed to
-  survive short worker rebinding
-- the worker owns subscriptions, retained session state, shard routing,
-  delivery queues, and the durable QoS inflight ledger keyed by packet
-  ID and `session_epoch`
-
-The size and overflow policy of the temporary rebinding buffers must be
-declared explicitly in the anchor manifest or session contract rather
-than emerging implicitly from implementation defaults.
-
-Worker replacement sequence:
-
-1. the anchor enters rebinding mode for `session_id`
-2. it temporarily stops issuing new outbound deliveries while continuing
-   to service wire-liveness traffic such as keepalive exchange
-3. the old worker exports subscription state, delivery cursor, and QoS
-   inflight ledger
-4. the directory advances `session_epoch` and binds the session to the
-   new worker
-5. the new worker imports the snapshot, reclaims ownership of the
-   inflight ledger, and resumes delivery from the exported cursor
-6. the anchor reopens normal forwarding once the new worker declares
-   ready for that epoch
-
-MQTT shared-subscription semantics such as `$share/*` cut across
-individual session boundaries and are a later broker-specific extension
-to this split, not part of the first anchor/worker baseline.
-
-### Push Notification Front Door (`edge_anchored`)
-
-```text
-device
-  -> push_edge_anchor(transport.anchor.stream.secure)
-  -> delivery_worker(session.worker)
-  -> fanout / queue / backend
-```
-
-Same pattern as the MQTT front door, optimized for enormous numbers of mostly idle
-long-lived sessions.
-
-### Watch Streams / Control Channels (`resumable` or `edge_anchored`)
-
-```text
-client/agent
-  -> edge_anchor
-  -> watch_or_control_worker
-  -> replicated state / orchestration backend
-```
-
-### Internal Replication (`resumable`)
-
-```text
-replicator
-  -> transport.stream or transport.mux
-  -> peer replicator
-```
-
-Both endpoints are under platform control and the protocol already has
-indices, terms, and retry logic, so `resumable` is usually enough.
-
-### QUIC / HTTP/3 (`transport_migratable`)
-
-```text
-driver(net.frame.ethernet)
-  -> ip(transport.datagram.udp)
-  -> quic(transport.mux.quic, session continuity support)
-  -> http3 / broker / remote-channel transport
-```
-
-QUIC is the natural candidate for `transport_migratable` because its
-connection model is already designed for path movement.
-
-### WebRTC-Class Stack
-
-```text
-driver
-  -> ip(transport.datagram)
-  -> ice / stun / turn
-  -> dtls
-  -> srtp / data transport
-  -> media / data consumers
-```
-
-Benefits from the packet surface and continuity model, but is not the
-place to start full transport portability.
+- **Stateless DNS / short HTTP** (`reroutable` / `drain_only`):
+  driver → `ip` → consumer. VIPs, anycast, and drain suffice.
+- **Broker front door** (`edge_anchored`): an edge anchor owns the
+  TCP/TLS client attachment, the protocol parser, keepalive timers,
+  and bounded ingress/egress buffers sized to survive a short worker
+  rebinding; the worker owns subscriptions, retained state, shard
+  routing, and the durable in-flight ledger keyed by packet id and
+  `session_epoch`; a directory tracks placement. Worker replacement:
+  the anchor enters rebinding mode and pauses new deliveries while
+  keeping wire-liveness traffic flowing; the old worker exports its
+  state; the directory advances `session_epoch` and rebinds; the new
+  worker imports, reclaims the ledger, and resumes from the exported
+  cursor; the anchor reopens forwarding once the new worker is ready
+  for that epoch. The rebinding buffer's size and overflow policy
+  belong in the anchor's declared configuration, not implicit
+  defaults.
+- **Push gateways and watch streams** (`edge_anchored` or
+  `resumable`): the same split, tuned for very large numbers of
+  mostly idle long-lived sessions.
+- **Internal replication** (`resumable`): both endpoints are under
+  platform control and the protocol has its own indices and retry
+  logic, so `resumable` is usually enough.
+- **QUIC-based services** (`transport_migratable` via
+  `native_primitive`): the `quic` module provides the mux surface
+  over the datagram surface; its connection model is designed for
+  path movement.
 
 ## Handoff and Reconfigure Integration
 
-Drain-first reconfigure is necessary but not sufficient for continuity
-classes above `drain_only`.
+Drain-first reconfigure is necessary but not sufficient for classes
+above `drain_only`. Protocol modules additionally need opaque state
+export/import, epoch coordination, preserved anchor behaviour where
+applicable, and ready signalling so a replacement is not made live too
+early.
 
-### Handoff Requirements
+Handoff is module-owned and opaque. The kernel preserves channels,
+module identity mapping, lifecycle hooks, and opaque exported state
+blobs; it never interprets TCP control blocks, QUIC packet spaces, TLS
+secrets, subscription state, or cursors.
 
-For `resumable`, `edge_anchored`, and `transport_migratable`, protocol
-modules need:
+For `edge_anchored` maintenance the anchor survives, the worker drains
+and exports, the new worker imports and attaches, and the client
+transport stays alive. The target is planned maintenance and
+controlled relocation: if the anchor itself crashes, client-visible
+continuity is only as strong as the protocol's resume story or a
+separate anchor-HA mechanism.
 
-- graceful drain
-- opaque state export / import
-- optional session export / import
-- generation / epoch coordination
-- preserved anchor behaviour where applicable
-- ready signaling so a replacement path is not made live too early
-
-### Architectural Rule
-
-Handoff remains module-owned and opaque. The kernel may preserve:
-
-- channels
-- module identity mapping
-- module lifecycle hooks
-- opaque exported state blobs
-
-It must not interpret TCP control blocks, QUIC packet spaces, TLS
-secrets, MQTT subscription state, RTP jitter buffers, or watch cursors.
-
-### Anchor-Preserved Maintenance
-
-For `edge_anchored` continuity:
-
-- the anchor survives
-- the worker drains / exports
-- the new worker imports and attaches
-- the client transport stays alive
-
-The initial target is **planned** maintenance and controlled relocation.
-If the anchor itself crashes unexpectedly, client-visible continuity is
-only as strong as the protocol's resume story or a separate anchor-HA
-mechanism. This document does not claim that a single anchor failure
-becomes invisible; solving unplanned anchor loss requires paired
-anchors, replicated anchor state, or stronger transport semantics such
-as QUIC-class migration.
-
-### Handoff via `graph_slot`
-
-Fluxor already has machinery that fits anchor/worker replacement:
-
-- staged graph bundles via `graph_slot`
-- activation by epoch change
-- deferred readiness via `module_deferred_ready` so a module can delay
-  live participation until import and attach are complete
-
-On targets using A/B graph slots, the reference local handoff is:
-
-1. stage the replacement worker stack in the inactive slot
-2. activate the new slot or generation without dropping the surviving
-   anchor
-3. let the new worker import exported state while still held behind
-   deferred ready
-4. flip the anchor's forwarding target to the new worker generation
-5. drain and retire the old worker path
-
-On targets or workloads where worker placement is quorum-durable rather
-than single-node atomic, an equivalent staging mechanism such as a
-cluster-consensus-coordinated epoch transition serves the same
-architectural role. The architecture requires staged, fenced handoff
-with explicit ready and epoch semantics; it does not require that the
-staging primitive be local.
-
-If current `graph_slot` activation remains whole-graph rather than
-partial or per-subgraph, then anchor-preserved worker swap requires
-either a `graph_slot` extension or an equivalent staging mechanism.
+Machinery that fits anchor-preserved replacement: staged graph images
+via `graph_slot` with activation by epoch change, and deferred
+readiness (`module_deferred_ready`) so a module delays live
+participation until import and attach complete. `graph_slot`
+activation is whole-graph, so anchor-preserved worker swap uses an
+equivalent staging mechanism instead: both worker generations resident
+and statically wired, with the anchor's forwarding flip as the
+activation (§Reference Fixtures). On quorum-durable deployments a
+cluster-coordinated epoch transition serves the same role; the
+architecture requires staged, fenced handoff with explicit ready and
+epoch semantics, not a particular staging primitive.
 
 ## Remote Channels and Placement
 
-Remote channels are the natural fabric between anchors and movable
-workers. When the anchor is stable and the worker moves, the boundary
-between them is often naturally a channel boundary. Remote channels let
-that boundary cross nodes without rewriting the module model.
+`modules/foundation/remote_channel/` is the natural fabric between
+anchors and movable workers: when the worker moves, the
+anchor–worker boundary is a channel boundary, and remote channels let
+it cross nodes without rewriting the module model. When an anchor
+terminates TLS, DTLS, or QUIC crypto and forwards post-decrypt traffic
+to a worker on another node, that hop becomes the trust boundary, and
+the remote-channel transport must provide mutual authentication,
+integrity protection, and encryption. Continuity expectations differ
+per edge: internal cluster streams may be `resumable` while external
+client sessions are `edge_anchored`.
 
-When an anchor terminates TLS, DTLS, or QUIC crypto and forwards
-post-decrypt traffic to a worker on another node, the remote-channel
-hop becomes the new trust boundary. In that case the remote-channel
-transport **must** provide mutual authentication, integrity protection,
-and encryption.
+## Shared Continuity Cores
 
-The architecture should explicitly support different continuity
-expectations per edge:
+Source: `modules/sdk/cores/`.
 
-- internal cluster streams may be `resumable`
-- external client sessions may be `edge_anchored`
-- QUIC-based services may become `transport_migratable`
-
-## Packaging and Reuse
-
-Reusable protocol code lives in shared cores and helpers such as
-`tcp_core`, `udp_core`, `tls_record_core`, `quic_recovery_core`,
-`protocol_timer_core`, `stream_surface_core`, `datagram_surface_core`,
-`mux_surface_core`, `session_anchor_core`, `session_directory_core`,
-`session_handoff_core`, `nonce_reservation_core`.
-
-Three cores are implemented under `modules/sdk/cores/` (host-tested
-via the `tools` test suite, `include!`d by modules — the same
-path-mount pattern as `wire.rs` / `genstore_wire.rs`):
+Reusable continuity logic lives in cores that modules mount with
+`include!`:
 
 - `session_handoff.rs` — opaque export/import chunking with
   incremental CRC32 (`HandoffExport` / `HandoffImport`); consumed by
-  `echo_worker` for the live anchor-preserved swap.
+  `echo_worker` for the anchor-preserved swap.
 - `nonce_reservation.rs` — windowed egress-counter reservation with
-  epoch fencing (`NonceReservation`; rfc_protocols.md §13.7.2 / R2:
-  quorum-durable-before-emit discipline, monotonic epochs, voided
-  blocks after unsafe recovery, refill-ahead double-buffering). This
-  is the ANCHOR side; the granting authority — the durable
-  single-writer session directory of §8.3/§13.7 — is implemented in
-  a downstream substrate repo (out of scope here): single-writer
-  bindings, monotone never-re-handed counter grants, R4 rx floors,
-  R1 wrapped-key custody with quorum wipe, R3 fence ordering, and R2
-  unsafe-recovery voiding, with replies emitted only after quorum
-  commit.
+  epoch fencing (`NonceReservation`): the holder never emits a counter
+  value it has not been granted, grants are refused across an epoch
+  boundary, `void_outstanding` invalidates the rest of a block after
+  unsafe recovery, and `needs_refill` drives refill-ahead
+  double-buffering. This is the anchor side; the granting authority (a
+  durable single-writer directory) is not implemented in this
+  repository.
 - `protocol_timer.rs` — nearest-deadline tracking (`ProtocolTimers`)
-  with post-import rebase, for the §Timing model.
+  with post-import rebase, so imported sessions re-anchor their timers
+  on the new host's clock.
 
-The remaining names are architectural reuse units to be extracted once
-two consumers exist; none of these are necessarily separate `.fmod`s.
-Whether a target bundles monolithic `ip`, `ip` plus `quic`, a combined
-secure ingress stack, or individual modules is a packaging decision made
-per target. Whichever packaging is chosen must expose the same surfaces,
-continuity classes, and capabilities, so loose coupling and reuse do
-not depend on packaging shape.
+Further cores are extracted from real implementations once two
+consumers exist; packaging (monolithic `ip`, `ip` plus `quic`, or
+individual modules) is a per-target decision that must expose the same
+surfaces, continuity classes, and capabilities either way.
+
+## Reference Fixtures
+
+- `modules/fixtures/echo_anchor/` — a transport anchor
+  (`transport.anchor.stream`). Binds a TCP port on the stream
+  surface, accepts one client at a time, mints a `session_id`, and
+  attaches a worker with `CMD_SC_ATTACH`.
+- `modules/fixtures/echo_worker/` — a session worker
+  (`session.worker`, `session.handoff`, `session.resume`). Handles
+  attach / drain / detach, uppercases the data plane, and replies
+  with the corresponding events.
+
+A graph wires the pair against a network provider; the anchor↔worker
+feedback edges require `scheduler.accept_cycles`. With a second worker
+on the anchor's `ctrl2_*` / `data2_*` ports and a non-zero
+`handoff_after_bytes` param, the anchor runs the full session-control
+swap every `handoff_after_bytes` client bytes — drain, chunked export
+relayed opaquely, import, resume at epoch + 1, forwarding flip, detach
+of the old worker — while the client's TCP stream stays open; client
+bytes arriving during the rebinding window are held in the anchor's
+bounded ingress buffer and flushed when the new worker goes live. This
+is the statically wired active/standby form of the staged handoff
+described in §Handoff and Reconfigure Integration.
 
 ## Target-Class Fit
 
-Not every role belongs on every target.
-
-- transport anchors are primarily for server-class or edge-class targets
-- constrained devices typically act as clients, session workers,
-  resumable peers, or protocol consumers
-- the same surfaces and continuity vocabulary apply everywhere
-
-This keeps the model honest across RP-class devices, Pi-class systems,
-and larger clustered deployments.
-
-## Reference Implementation
-
-A minimal end-to-end demonstration of the anchor / worker split lives
-in the tree:
-
-- `modules/fixtures/echo_anchor/` — transport anchor. Binds a TCP port via
-  Stream Surface v1, accepts one client at a time, mints a
-  `session_id`, and attaches the worker via
-  `CMD_SC_ATTACH` (continuity class `edge_anchored`).
-- `modules/fixtures/echo_worker/` — session worker. Handles
-  `CMD_SC_ATTACH` / `CMD_SC_DRAIN` / `CMD_SC_DETACH`, uppercases each
-  byte in the data plane, returns `MSG_SC_ATTACHED` / `MSG_SC_DRAINED`
-  / `MSG_SC_DETACHED` back to the anchor.
-- A minimal graph wires the two modules against `linux_net` on port
-  9000 (anchor `net_*` ↔ `linux_net`, plus the ctrl/data channel pairs
-  between anchor and worker; the anchor↔worker feedback edges need
-  `scheduler.accept_cycles`). Exercised over plain TCP
-  (`nc 127.0.0.1 9000`).
-
-The demo validates the `SessionCtrlV1` envelope end-to-end: HELLO is
-skipped (optional), `ATTACH` / `ATTACHED` open the session, raw bytes
-flow bidirectionally over the data plane, and `DETACH` / `DETACHED`
-close it. Multiple sequential client sessions recycle cleanly through
-`ATTACH → ACTIVE → DETACH → LISTENING`.
-
-Live worker handoff (anchor-preserved worker swap) is exercised by
-the companion configuration: the same graph extended with a SECOND
-worker instance on the anchor's `ctrl2_*`/`data2_*` ports and a
-non-zero `handoff_after_bytes` param — active + standby, statically
-wired (the "equivalent staging mechanism" — both generations
-resident, the anchor's forwarding flip is the activation). Every
-`handoff_after_bytes` client bytes the anchor runs the full
-SessionCtrlV1 swap — DRAIN (worker finishes its in-flight tail before
-declaring DRAINED) → EXPORT_BEGIN/CHUNK…/END relayed opaquely →
-IMPORT_BEGIN/END → RESUME(epoch+1) → RESUMED → forwarding flip →
-DETACH old — while the client's TCP stream stays open. Client bytes
-arriving during the attach or rebinding window are held in the
-anchor's declared bounded ingress buffer and flushed when the worker
-goes live (the §Module Stack Patterns rebinding-buffer requirement).
-Repeated swaps on one TCP connection stay byte-exact and in order,
-with the session epoch advancing per swap.
-Fully-atomic swap via `graph_slot` per-subgraph activation remains a
-separate follow-up for staged-bundle targets.
-
-## Implementation Fit — VoIP-as-anchor and QUIC
-
-The five contract files (`net_proto`, `datagram`, `packet`, `mux`,
-`session_ctrl`) plus the `transport.*` / `session.*` capability
-vocabulary in `capability_surface.md` plus the `MON_SESSION` line
-format in `monitor-protocol.md` are intended to cover the operations
-these future deployments need. They still require module work before
-they are shipped workflows:
-
-### VoIP edge-anchored
-
-The VoIP modules themselves live outside this repo — SIP dialog and
-jitter handling in wave (`sip`, on the RTP transport), G.711 in
-spectra (`g711`), composed into a voice workload by Conclave. The
-edge-anchor / session-worker split below is a scaling pattern for
-that composition, carried entirely by Fluxor contract surfaces.
-
-A VoIP front door split into `voip_edge_anchor` (owns SIP/RTP client
-attachment) + `voip_session_worker` (owns dialog state, fanout,
-durable interaction with backend) should fit the current contract
-vocabulary:
-
-| Need | Provided by |
-|------|-------------|
-| SIP signalling | `datagram.rs` (SIP runs on UDP) |
-| RTP media | `datagram.rs` for RX, jitter buffer in worker |
-| ATTACH / DETACH on call setup / teardown | `session_ctrl.rs` CMD_SC_ATTACH / DETACH |
-| Worker handoff during a live call | `session_ctrl.rs` CMD_SC_DRAIN / EXPORT / IMPORT / RESUME / RELOCATE |
-| Session epochs to reject stale RTP after rebind | `session_ctrl.rs` `session_epoch` |
-| Operator visibility | `monitor-protocol.md` `MON_SESSION` |
-
-What's still needed to ship: split the SIP-state vs media-state
-boundary into `voip_edge_anchor` + `voip_session_worker` modules and
-wire SessionCtrlV1 between them.
-The `echo_anchor` + `echo_worker` demo proves the control-envelope
-shape, not a production VoIP handoff.
-
-### QUIC + HTTP/3
-
-A `quic` foundation module providing `transport.mux.quic` with
-`transport_migratable` continuity should fit the same vocabulary:
-
-| Need | Provided by |
-|------|-------------|
-| Underlying UDP transport with src/dst metadata | `datagram.rs` |
-| Packet-preserving fast path with timestamp / ECN / flow_hint / lane | `packet.rs` |
-| Multiplexed-session surface (one transport, many streams) | `mux.rs` |
-| Per-session migration (path change without reconnect) | `session_ctrl.rs` `CMD_SC_EPOCH_BUMP` / `CMD_SC_RELOCATE` |
-| `transport.mux.quic` capability | `capability_surface.md` |
-| `transport_migratable` continuity class | This document §Continuity Classes |
-
-The config tool validates the top-level `continuity` block
-(rfc_protocols.md §7.3): all five classes are checked as graph structure —
-`edge_anchored` requires a `transport.anchor.*` module and
-`session.worker` workers (plus `session.handoff` when more than one
-worker is declared), `resumable` requires a `session.resume` provider,
-and `transport_migratable` requires a declared mechanism:
-`native_primitive` needs a `transport.mux.*` provider;
-`platform_replicated_state` needs the declared AEAD class (an
-`implicit_counter` declaration is rejected outright — its honest
-ceiling is `resumable`), a `session.directory` module, providers for
-`session.reservation` / `security.key_wrap` / `fence.enforceable` /
-`durable.rpo_zero`, and a declared `failover_budget_ms` strictly below
-`client_keepalive_ms`. Structure only: R1–R5 correctness under fault
-and the real failover latency are proven by test and measurement, not
-by the graph.
-
-### What's NOT in this document
-
-The following are explicitly **out of scope** of the protocol substrate:
-
-- `graph_slot` per-subgraph activation — needed for fully-atomic
-  anchor-preserved worker swap on staged-bundle targets (the
-  statically-wired active/standby pattern in `echo_handoff.yaml`
-  covers the resident-generations case today).
-- Reusable protocol cores beyond the three in `modules/sdk/cores/`
-  (`tcp_core`, `quic_recovery_core`, `stream_surface_core`, etc.) —
-  extracted from real implementations once two consumers exist.
-
-These are engineering follow-ups. The five-contract substrate and the
-role / capability / continuity-class vocabulary should remain stable as
-the first production users land.
+Transport anchors are primarily for server-class and edge-class
+targets. Constrained devices typically act as clients, session
+workers, resumable peers, or protocol consumers. The surfaces and
+continuity vocabulary are the same everywhere.
 
 ## Related Documentation
 
-- `architecture/network.md` — current `net_proto` / Stream Surface v1
-  wire format, driver layering, TLS as channel transformer
-- `architecture/capability_surface.md` — capability matching, content
-  types, hardware-domain expansion; hosts the `transport.*` and
-  `session.*` capability names
-- `architecture/reconfigure.md` — drain / migrate phases, module_drain
-  export, staged reconfigure
-- `architecture/pipeline.md` — channel mechanics, mailbox mode,
-  deferred ready
-- `architecture/monitor-protocol.md` — MON_* telemetry families;
-  `MON_SESSION` lands here
+- `network.md` — the stream contract wire format, driver layering,
+  TLS as channel transformer
+- `capability_surface.md` — capability vocabulary, content types, the
+  `transport.*` and `session.*` capability names
+- `reconfigure.md` — drain and migrate phases, `module_drain`, staged
+  reconfigure
+- `pipeline.md` — channel mechanics, mailbox mode, deferred ready
+- `monitor-protocol.md` — `MON_*` telemetry families, including
+  `MON_SESSION`

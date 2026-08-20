@@ -1,8 +1,13 @@
 # Fluxor
 
-**Deterministic systems software, from interrupt to internet, expressed as a graph and validated before deployment.**
-
-Fluxor is a runtime that replaces threads, processes, and ad-hoc event loops with an explicit graph of position-independent modules connected by typed channels. The graph is described in a YAML config, validated against a target's hardware capabilities at build time, and executed cooperatively at runtime. The same model spans hardware-timer-driven control loops, microcontroller firmware, embedded Linux services, browser-hosted WASM bundles, and server-class workloads — without changing the abstraction.
+Fluxor is a runtime for deterministic systems software. It replaces
+threads, processes, and ad-hoc event loops with an explicit graph of
+position-independent modules connected by typed channels. The graph is
+described in a YAML config, validated against a target's hardware
+capabilities at build time, and executed cooperatively at runtime. The
+same model spans hardware-timer-driven control loops, microcontroller
+firmware, embedded Linux services, browser-hosted WASM bundles, and
+server-class workloads.
 
 ```text
 +-------------------------------+
@@ -14,64 +19,67 @@ Fluxor is a runtime that replaces threads, processes, and ad-hoc event loops wit
               v
 +----------------------------------------------------------------+
 |                    Position-Independent Modules                |
-|  drivers     foundation     app                                |
-|  cyw43       ip             http     synth      sequencer      |
-|  enc28j60    fat32          mqtt     codec      mixer          |
-|  e810        tls            dns      rtp                       |
-|  st7701s     wifi           quic     drum       echo_anchor    |
-|  ...         ...            ...      ...                       |
+|  drivers        foundation      app (sibling repos)            |
+|  cyw43          ip              consensus                      |
+|  enc28j60       fat32           codecs                         |
+|  e810           tls             synthesis                      |
+|  st7701s        dns             emulation                      |
+|  nvme           quic            ...                            |
 +----------------------------------------------------------------+
 ```
 
-The kernel knows how to step modules, move bytes between them, and expose low-level platform contracts. It does not know what TCP is, what a filesystem is, what audio sounds like, or what an HTTP request means. Everything else lives in modules.
+The kernel knows how to step modules, move bytes between them, and
+expose low-level platform contracts. It does not know what TCP is, what
+a filesystem is, what audio sounds like, or what an HTTP request means.
+Everything else lives in modules.
 
 ## Why Fluxor
 
-Existing systems software forces a choice. Embedded RTOSes give you predictable timing but no composition story above bare metal. Server-class runtimes give you composition but introduce GC pauses, kernel preemption, async work-stealing, and mutex contention that destroy tail latency. Linux real-time patches narrow the gap on one end; bare-metal frameworks narrow it on the other. Neither side gives you a single model that survives the transition from a 1µs ISR to a 10 GbE network stack.
+Embedded RTOSes give you predictable timing but no composition story
+above bare metal. Server-class runtimes give you composition but
+introduce GC pauses, kernel preemption, and scheduler contention that
+dominate tail latency. Neither side offers a single model that survives
+the transition from a microsecond ISR to a network stack.
 
-Fluxor takes a different approach:
+Fluxor's approach:
 
-- **One model from interrupt to internet.** Hardware-timer ISR work, cooperative microsecond-scale modules, network protocol stacks, distributed consensus, demand-paged compute, and browser-hosted bundles all use the same graph primitive — modules connected by channels, executed in topological order. There is no separate "real-time" tier and "service" tier with different APIs.
+- **One model from interrupt to internet.** Hardware-timer ISR work,
+  cooperative microsecond-scale modules, network protocol stacks, and
+  browser-hosted bundles use the same graph primitive: modules connected
+  by channels, executed in topological order. There is no separate
+  real-time tier with a different API.
+- **Validation is the trust root.** Every config is checked against a
+  target descriptor: pin assignments, bus configurations, capability
+  requirements, channel typing, resource budgets. A config that violates
+  an invariant fails at build time, not in production. The kernel
+  enforces the validated grant; modules cannot give themselves
+  permissions.
+- **Determinism is structural.** No GC, no work-stealing scheduler, no
+  cross-thread locking (each execution domain is single-threaded).
+  Backpressure flows through channel fullness. Modules are bounded in
+  time per step and in memory per arena, by contract.
+- **Composition is the unit of reuse.** A module compiled once runs
+  unchanged across silicon families with matching architecture; only the
+  wiring and the provider chain underneath change between targets.
+- **The kernel stays small.** New chip support is a driver module, not a
+  kernel change. A new protocol is a foundation module, not a kernel
+  change.
 
-- **Validation is the trust root.** Every config is checked against a target descriptor: pin assignments, bus configurations, capability requirements, channel typing, resource budgets, peripheral counts. A config that violates an invariant fails at build time, not in production. The kernel enforces the validated grant — modules cannot give themselves permissions.
-
-- **Determinism is structural, not aspirational.** No GC. No work-stealing scheduler. No mutex contention (each domain is single-threaded). No surprise allocations. Backpressure flows through channel fullness, not credit counters in application code. Modules are bounded in time per step and in memory per arena, by contract.
-
-- **Composition is the unit of reuse.** A module compiled once runs unchanged across silicon families with matching architecture. A music player on a Pico W and a music player streaming over network use the same MP3 decoder module, the same I2S driver module, with different wiring. A consensus node on bare-metal aarch64 reuses the same WAL, commit-tracker, and apply-pipeline modules whether the network underneath is virtio or PCIe Ethernet. A retro-computer emulator runs as the same Z80 core on a Pico 2 W, on a Raspberry Pi 5 bare-metal stack, and as a WASM bundle in the browser — only the providers underneath change.
-
-- **The kernel is small and stays small.** Adding support for a new chip means writing a driver module, not modifying the kernel. Adding a new protocol means writing a foundation module, not modifying the kernel. Nothing in the kernel grows with the number of supported devices or protocols.
-
-## What People Build With It
-
-The same primitives carry workloads that normally live in entirely different software ecosystems:
-
-- **Audio products.** Music players, synthesizers with effects chains, MIDI sequencers, MP3 decoders, I2S drivers, microphone capture pipelines.
-- **Display and input.** ST7701S panel output, GT911 touch, buttons, keyboard/pointer/gamepad surfaces, gestures, browser canvas sinks, and split deployments where a browser hosts the presentation surface for a bare-metal back end.
-- **Storage and filesystems.** SD-card drivers, FAT32, flash blob serving, runtime parameter stores, NVMe with poll-mode completion approaching Linux line-rate at QD=1.
-- **Networking.** CYW43 Wi-Fi, ENC28J60, RP1 GEM, Intel E810, virtio-net, full TCP/UDP/IPv4 with ARP/ICMP/DHCP, HTTP/1.1 with Range, DNS, MQTT, RTP, TLS 1.3 (pure Rust, no C dependency), DTLS, and an HTTP/3 path through the same module set.
-- **Real-time control.** Hardware-timer ISR-tier modules for motor control, sensor fusion, FOC current loops, drone PID stacks, PLC scan cycles, EtherCAT-style cyclic I/O — admitted into Tier 1b/2 domains alongside cooperative modules in the same graph.
-- **Distributed systems.** Raft consensus, write-ahead logging, group fsync batching, replication pipelines, and snapshot transport built as ordinary Fluxor module sets sharing the same scheduler and channel ABI as everything else.
-- **Edge data services.** Object and namespace surfaces, replicated key-value caches, message brokers, API gateways — every request phase as a module, deterministic P99, no OS tax between cycles.
-- **Fleet-deployable graph bundles.** Container-style packaging where the unit of deployment is a signed, validated graph rather than an OCI image. Bundles boot in milliseconds, deploy atomically with A/B rollback, and accept live reconfigure. Trust derives from signing rather than namespace isolation.
-- **Demand-paged compute.** Workloads with datasets larger than physical RAM, transparently paged from NVMe or other backing stores. KV stores, indexes, model weights, and decoded asset caches sit behind the same pager.
-- **AI inference pipelines.** Sensor → preprocess → inference → postprocess → action expressed as one graph. The pipeline structure stays identical from a quantized TinyML classifier on a Pico to an NPU-accelerated model on an aarch64 board to a poll-mode throughput pipeline on a server-class node — only the inference module differs.
-- **Retro emulators.** Z80 / 6502 / m68k cores, video, and audio subsystems are structurally isomorphic to a Fluxor pipeline; burst stepping handles compute-heavy CPU steps and StreamTime synchronises frames with audio. The same emulator graph runs on microcontroller, bare-metal aarch64, and browser targets.
-- **Industrial systems.** Hardware-timed execution tiers provide temporal enforcement for safety-relevant functions while non-safety logic runs cooperatively in the same graph. The model targets safety profiles with structural arguments rather than retrofitted analysis.
-
-These are not separate Fluxor variants. They are graphs in the same runtime, validated by the same tool, loaded by the same loader, scheduled by the same kernel.
+The broader capability-centric argument, and where the model is headed,
+is in [docs/vision.md](docs/vision.md).
 
 ## Architecture Snapshot
 
 ```text
 +----------------------------------------------------------------+
 |                       App Modules                              |
-|        synth, mixer, sequencer, codec, rtp, drum, ...          |
+|   consensus, codecs, synthesis, emulation (sibling repos)      |
 +----------------------------------------------------------------+
 |                    Foundation Modules                          |
-|     ip, fat32, http, dns, mqtt, tls, wifi, mesh, ...           |
+|     ip, fat32, dns, tls, quic, wifi, kv_store, sd, ...         |
 +----------------------------------------------------------------+
 |                      Driver Modules                            |
-|     cyw43, enc28j60, virtio_net, sd, st7701s, gt911, i2s, ...  |
+|     cyw43, enc28j60, virtio_net, nvme, st7701s, gt911, ...     |
 +----------------------------------------------------------------+
              Stable Syscall ABI (kernel_abi + HAL contracts)
 +----------------------------------------------------------------+
@@ -83,55 +91,82 @@ These are not separate Fluxor variants. They are graphs in the same runtime, val
 +----------------------------------------------------------------+
 ```
 
-Modules are organized into three layers:
+Modules are organised into three layers:
 
-- **Drivers** (`modules/drivers/`) — touch hardware. Allowed to be platform-specific and to use bus syscalls (SPI, PIO, I2C, GPIO, MMIO).
-- **Foundation** (`modules/foundation/`) — portable building blocks. Filesystems, network protocols, transport layers. No direct hardware access; everything goes through channels and the syscall ABI.
-- **App** — application-level modules. Audio synthesis, codecs, sequencers, distributed-systems components, anything that composes drivers and foundation modules into a workload. App modules live in sibling repositories (grove, spectra, wave), built against the Fluxor SDK and loaded like any other PIC module.
+- **Drivers** (`modules/drivers/`) touch hardware. They may be
+  platform-specific and use bus syscalls (SPI, PIO, I2C, GPIO, MMIO).
+- **Foundation** (`modules/foundation/`) holds portable building
+  blocks: filesystems, network protocols, transport layers. No direct
+  hardware access; everything goes through channels and the syscall ABI.
+- **App** modules compose drivers and foundation modules into a
+  workload. They live in sibling repositories, are built against the
+  Fluxor SDK, and load like any other PIC module.
 
-Every box above the syscall ABI is a position-independent module. On RP targets, modules execute in place from flash via XIP. On aarch64 targets, they are loaded from the boot image's module table into RAM. The same `.fmod` artifact works across every kernel build that exposes the same ABI version on that architecture.
+Every box above the syscall ABI is a position-independent module. On RP
+targets, modules execute in place from flash via XIP. On aarch64
+targets, they are loaded from the boot image's module table into RAM.
+The same `.fmod` artefact works across every kernel build that exposes
+the same ABI surface on that architecture.
 
 ## Core Capabilities
 
-- **Module graph runtime** with topological execution and explicit YAML wiring
-- **Cooperative scheduler** with intra-tick event-driven wake (sub-millisecond response to interrupts)
-- **Channel IPC** in FIFO mode (copy semantics) and mailbox mode (zero-copy buffer aliasing)
-- **Event objects** with IRQ binding, scheduler wake integration, and ISR-safe signalling
-- **Per-module heap** with bounded arenas, observable via `dev_query`
-- **Per-module sandboxing** at three protection levels (None / Guarded / Isolated) with MPU enforcement on RP2350 and MMU enforcement on aarch64
-- **Live graph reconfigure** with four-phase drain protocol and `module_drain` hook for in-flight work completion
-- **Demand-paged arenas** for compute workloads larger than physical RAM (aarch64 targets)
-- **Capability resolution** at build time: declare what hardware you have, the tool resolves driver chains and auto-wires infrastructure
-- **Hardware-timer ISR tier** for hard real-time control with cycle-accurate observability, admitted into the same scheduler as cooperative modules
-- **Stream clock vs wall clock separation** via `StreamTime`, enabling sample-accurate A/V sync without GC jitter
-- **Validation before deployment**: pin conflicts, bus assignments, content type compatibility, resource budgets — all checked at config compile time
+- Module graph runtime with topological execution and explicit YAML
+  wiring
+- Cooperative scheduler with intra-tick event-driven wake
+- Channel IPC in FIFO mode (copy semantics) and mailbox mode (zero-copy
+  buffer aliasing)
+- Event objects with IRQ binding, scheduler wake integration, and
+  ISR-safe signalling
+- Per-module heap with bounded arenas, observable via the provider
+  query surface
+- Per-module sandboxing at three protection levels (None / Guarded /
+  Isolated), MPU-enforced on RP2350 and MMU-enforced on aarch64
+- Live graph reconfigure with a four-phase drain protocol
+- Demand-paged arenas for workloads larger than physical RAM (aarch64
+  targets)
+- Platform stack expansion at build time: a config's `platform:`
+  section expands into the board-appropriate driver chain
+- Hardware-timer ISR tier for hard real-time control, admitted into the
+  same scheduler as cooperative modules
+- Stream clock vs wall clock separation via `StreamTime` for
+  sample-accurate A/V sync
+- Validation before deployment: pin conflicts, bus assignments, content
+  type compatibility, and resource budgets are checked at config compile
+  time
 
 ## Supported Targets
 
-Fluxor separates **silicon** (the chip — its peripherals, register layout, and CPU architecture) from **boards** (a chip plus a specific PCB layout, pin assignments, and on-board peripherals). One silicon definition can back many boards.
+Fluxor separates **silicon** (the chip: peripherals, register layout,
+CPU architecture) from **boards** (a chip plus a specific PCB layout,
+pin assignments, and on-board peripherals). One silicon definition can
+back many boards. **Host** targets run the graph inside an existing OS
+process.
 
 ### Silicon
 
 | Silicon | Architecture | Notes |
 |---------|--------------|-------|
-| **RP2040** | thumbv6m-none-eabi (Cortex-M0+) | XIP execution, current RP runtime uses Embassy |
-| **RP2350A / RP2350B** | thumbv8m.main-none-eabihf (Cortex-M33) | XIP execution, current RP runtime uses Embassy, larger RAM than RP2040 |
-| **BCM2712** | aarch64-unknown-none (Cortex-A76) | DRAM-resident, synchronous polling, MMU + page tables |
-| **ESP32-S3** | xtensa-esp32s3-none-elf | Validation-only (no kernel build yet) |
-| **Linux host** | aarch64-unknown-linux-gnu / x86_64-unknown-linux-gnu | Host-side simulation and tooling |
+| **RP2040** | thumbv6m-none-eabi (Cortex-M0+) | XIP execution |
+| **RP2350** | thumbv8m.main-none-eabihf (Cortex-M33) | XIP execution |
+| **BCM2712** | aarch64-unknown-none (Cortex-A76) | DRAM-resident, MMU + page tables |
+| **ESP32-S3** | xtensa-esp32s3-none-elf | Validation only (no kernel build) |
 
-### Boards
+### Boards and hosts
 
-| Board | Silicon | Notes |
-|-------|---------|-------|
-| **Pico**, **Pico W** | RP2040 | Standard Raspberry Pi Pico boards |
-| **Pico 2**, **Pico 2 W** | RP2350A | Standard Raspberry Pi Pico 2 boards |
-| **Waveshare LCD modules** | RP2350A/B | RP2350-based boards with on-board displays and touch |
-| **QEMU virt** | BCM2712 | Synthetic aarch64 target for development under QEMU |
-| **Pi 5** | BCM2712 | Raspberry Pi 5 (bare metal) |
-| **Linux** | Linux host | Host-side runtime for embedded Linux services and simulation |
+| Target | Silicon | Notes |
+|--------|---------|-------|
+| **pico**, **picow** | RP2040 | Raspberry Pi Pico / Pico W |
+| **pico2w** | RP2350 | Raspberry Pi Pico 2 W |
+| **waveshare-lcd4** | RP2350 | Waveshare board with on-board display and touch |
+| **qemu-virt** | BCM2712 | Synthetic aarch64 target for development under QEMU |
+| **pi5** | BCM2712 | Raspberry Pi 5, bare metal |
+| **linux** | host | Linux userspace runtime for embedded Linux services and simulation |
+| **wasm** | host | Browser-instantiated WASM bundle |
 
-Silicon definitions live in `targets/silicon/*.toml`. Board definitions live in `targets/boards/*.toml` and layer board-specific pin assignments and on-board peripherals on top of the chosen silicon.
+Silicon definitions live in `targets/silicon/*.toml`, board definitions
+in `targets/boards/*.toml`, and host definitions in
+`targets/host/*.toml`. `fluxor inspect` lists every target the checkout
+knows about.
 
 ## Quick Start
 
@@ -141,7 +176,7 @@ Silicon definitions live in `targets/silicon/*.toml`. Board definitions live in 
 - For RP targets: `arm-none-eabi-objcopy`, `arm-none-eabi-ld`
 - For aarch64 targets: `rust-objcopy` (via `cargo install cargo-binutils`)
 
-Install Rust targets you plan to build:
+Install the Rust targets you plan to build:
 
 ```bash
 rustup target add thumbv8m.main-none-eabihf   # RP2350
@@ -156,9 +191,9 @@ rustup target add aarch64-unknown-linux-gnu   # host tools
 make build
 ```
 
-This builds the `fluxor` CLI, the kernel for every target, every
-module palette, and the `fluxor-linux` runtime binary. It is the
-default goal, so a bare `make` does the same.
+This builds the `fluxor` CLI, the kernel for every target, every module
+palette, and the `fluxor-linux` runtime binary. It is the default goal,
+so a bare `make` does the same.
 
 ### 3. Build one piece at a time
 
@@ -168,61 +203,70 @@ A single kernel target (the Makefile selector is `TARGET`):
 make firmware TARGET=rp2040    # also: rp2350 | qemu-virt | pi5 | wasm
 ```
 
-PIC modules, in the target layout consumed by `fluxor build`, `combine`, and `run`:
+PIC modules, in the target layout consumed by `fluxor build` and
+`fluxor run`:
 
 ```bash
 fluxor modules build --target rp2350
 fluxor modules build --all
 ```
 
-### 4. Build or run an example
+### 4. Run a graph
 
-Linux-hosted examples run directly:
-
-```bash
-fluxor run examples/hello/linux.yaml
-```
-
-Hardware targets build an artifact and then flash:
+Linux-hosted configs run directly; the config can be a file or piped
+in on stdin:
 
 ```bash
-fluxor flash examples/static_server/pico2w.yaml
-fluxor flash examples/hello/pi5.yaml
+fluxor run - <<'EOF'
+<a minimal graph — embedded in docs/guides/running.md>
+EOF
 ```
 
-You can also build a single packaged artifact without flashing:
+[docs/guides/running.md](docs/guides/running.md) carries the full
+embedded config plus bring-up, smoke checks, and shutdown.
+
+Hardware targets build an artefact and flash it, and a packaged
+artefact can be built without flashing:
 
 ```bash
-target/aarch64-unknown-linux-gnu/release/fluxor build examples/static_server/pico2w.yaml
+fluxor flash <config.yaml>
+fluxor build <config.yaml>
 ```
 
-For each target, packaging is driven by the YAML config and the prebuilt `.fmod` modules. The kernel binary, the module table, and the validated config blob are assembled into the target's output format.
+For each target, packaging is driven by the YAML config and the
+prebuilt `.fmod` modules: the kernel binary, the module table, and the
+validated config blob are assembled into the target's output format.
 
 ## CLI Workflow
 
-The host tool is built as `fluxor` and provides packaging and inspection commands:
+The host tool is built as `fluxor` and provides packaging and
+inspection commands:
 
 ```bash
-# Project info: root, available targets, stacks, rig, scenarios
+# Project info: root, available targets, stacks
 fluxor inspect
 
 # Validate a config against its target, writing nothing
-fluxor build --check examples/hello/linux.yaml
+fluxor build --check <config.yaml>
 
-# Build one YAML config into the target-specific artifact
-fluxor build examples/hello/linux.yaml
+# Build one YAML config into the target-specific artefact
+fluxor build <config.yaml>
 
 # Build the PIC modules a config names, then pack an ELF by hand
 fluxor modules build --target bcm2712
 fluxor modules pack <module.elf> -o <module.fmod> -n <name> -t <module_type>
 
-# Inspect a built artifact (or a store reference)
+# Inspect a built artefact (or a store reference)
 fluxor inspect <file.uf2>
 fluxor inspect <file.uf2> --emit-config
 
 # Show what changes between two configs (live-reconfigure planning)
 fluxor inspect <new.yaml> --against <old.yaml>
 ```
+
+Publishing artefacts into the local OCI store, and consuming them from
+a downstream project, is covered in
+[docs/guides/publishing.md](docs/guides/publishing.md).
 
 ## Repository Layout
 
@@ -232,57 +276,40 @@ fluxor/
 │   ├── kernel/         # Cooperative scheduler, IPC, loader, fault recovery
 │   └── platform/       # Per-target runtime and HAL backends
 ├── modules/            # Position-independent modules
-│   ├── sdk/            # Shared SDK: abi.rs, runtime.rs, params.rs
-│   ├── drivers/        # Hardware drivers (cyw43, enc28j60, sd, st7701s, ...)
-│   ├── foundation/     # Portable services (ip, fat32, http, mqtt, dns, tls, ...)
-│   └── fixtures/       # Test scaffolds, probes, protocol-surface demos
+│   ├── sdk/            # Shared SDK: ABI, runtime, params
+│   ├── drivers/        # Hardware drivers (cyw43, enc28j60, nvme, st7701s, ...)
+│   ├── foundation/     # Portable services (ip, fat32, dns, tls, quic, ...)
+│   ├── platform/       # Dual-context platform tables shared with the kernel
+│   └── fixtures/       # Probe and demo modules for protocol surfaces
+├── crates/             # Host-side crates: fluxor-abi, fluxor-sdk, fluxor-launcher
+├── contracts/          # Capability contract definitions
 ├── tools/              # Host CLI: validate, build, run, flash, pack, sign, inspect
-├── examples/           # Example YAML configs grouped by capability
-├── docs/               # Architecture references and guides
-└── targets/            # Silicon and board definitions
+├── stacks/             # Reusable stack fragments referenced by configs
+├── targets/            # Silicon, board, and host definitions
+├── firmware/           # Vendored peripheral firmware blobs (CYW43)
+└── docs/               # Architecture references and guides
 ```
 
-### Where media lives
-
-Fluxor doesn't keep a central asset pool. Each consumer owns its media:
-
-- **Example media** lives next to the example that uses it:
-  `examples/<capability>/assets/<file>`. The wasm asset bank,
-  `host_asset_source`, and similar loaders resolve paths from there.
-- **Module media** lives next to the module that ships with it:
-  `modules/<area>/<module>/assets/<file>`.
-- **Browser-runtime code** (`runtime.html`, `host_shims.js`,
-  `endpoint_runtime.js`) lives at `src/platform/wasm/host/`.
-
-Anything that doesn't fit one of these homes shouldn't grow into a
-flat shared `assets/` directory; give it a real home beside the
-consumer that owns it.
+Media assets live beside the module that consumes them
+(`modules/<area>/<module>/assets/`); there is no central asset pool.
+Browser-runtime code (`runtime.html`, `host_shims.js`,
+`endpoint_runtime.js`) lives at `src/platform/wasm/host/`.
 
 ## Documentation
 
-Start with [docs/overview.md](docs/overview.md) for the documentation index.
+Start with [docs/overview.md](docs/overview.md) for the documentation
+index.
 
 Recommended reading path:
 
-1. [docs/architecture/pipeline.md](docs/architecture/pipeline.md) — graph runner, channels, scheduler, mailbox mode
-2. [docs/architecture/module_architecture.md](docs/architecture/module_architecture.md) — module contract, lifecycle, fault recovery
-3. [docs/architecture/hal_architecture.md](docs/architecture/hal_architecture.md) — kernel/module split and per-silicon HAL
-4. [docs/architecture/abi_layers.md](docs/architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
-5. [docs/architecture/network.md](docs/architecture/network.md) — channel-based networking and net_proto
-6. [docs/architecture/capability_surface.md](docs/architecture/capability_surface.md) — hardware section and capability vocabulary
-7. [docs/guides/examples.md](docs/guides/examples.md) — the end-to-end graphs in `examples/`
-8. [docs/vision.md](docs/vision.md) — the broader capability-centric argument
-
-## Contributing
-
-Issues and PRs are welcome. If you are adding a module, keep the contract explicit:
-
-- A clear `manifest.toml` with port definitions, content types, and capability declarations
-- Deterministic `module_step` behavior — bounded time, no blocking, no unbounded allocation
-- Documented parameters and wiring assumptions
-- Capability flag declarations (`mailbox_safe`, `in_place_writer`, `deferred_ready`, `drain_capable`) where appropriate
-
-If you are adding silicon support, you will need a TOML in `targets/silicon/` describing the chip's peripherals and a platform backend in `src/platform/`. The kernel itself should remain mostly cfg-free; per-silicon constants are generated into `chip_generated.rs` and included by the selected platform chip module.
+1. [docs/guides/running.md](docs/guides/running.md) — bring a graph up on the Linux host
+2. [docs/architecture/pipeline.md](docs/architecture/pipeline.md) — graph runner, channels, scheduler, mailbox mode
+3. [docs/architecture/module_architecture.md](docs/architecture/module_architecture.md) — module contract, lifecycle, fault recovery
+4. [docs/architecture/hal_architecture.md](docs/architecture/hal_architecture.md) — kernel/module split and per-silicon HAL
+5. [docs/architecture/abi_layers.md](docs/architecture/abi_layers.md) — ABI layers, contract inventory, provider dispatch
+6. [docs/architecture/network.md](docs/architecture/network.md) — channel-based networking and net_proto
+7. [docs/architecture/capability_surface.md](docs/architecture/capability_surface.md) — capability vocabulary and resolution
+8. [docs/vision.md](docs/vision.md) — the capability-centric argument
 
 ## License
 

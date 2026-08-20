@@ -1,9 +1,12 @@
 # Monitor Protocol
 
-`fluxor rig monitor` displays a live per-module dashboard for a running Fluxor
-device. The device emits newline-framed text lines on its normal log
-transport (USB CDC on RP targets, UART on Pi 5); the host tool tails those
-lines, aggregates them into per-module rows, and renders an ANSI table.
+The monitor protocol is a stream of newline-framed text records that a
+running Fluxor device emits on its normal log/telemetry transport (USB CDC
+on RP targets, UART on Pi 5). A host-side parser tails those lines,
+aggregates them into per-module rows, and renders an ANSI table.
+
+Source: `tools/src/monitor.rs` (host parser), `src/kernel/exec/step_guard.rs`
+(fault emission), `modules/sdk/runtime/telemetry.rs` (session emission).
 
 ## Transport
 
@@ -47,15 +50,32 @@ MON_HIST mod=<idx> b0=<n> b1=<n> b2=<n> b3=<n> b4=<n> b5=<n> b6=<n> b7=<n>
 ```
 
 Buckets, in microseconds: `<2`, `<4`, `<8`, `<16`, `<32`, `<64`, `<256`,
-`>=256`.
+`>=256` (`step_bucket` in `src/kernel/exec/scheduler/multigraph.rs`).
 
-The ladder is weighted below the tick budget on purpose. Edges that started
-at `<64` put every step of a healthy `tick_us: 100` graph into `b0`, so the
-histogram could not separate a 1 µs module from a 50 µs one and no per-module
-share of the tick was computable. The heavy tail those edges resolved is
-already reported exactly by `MON_HEAVY_STEP` (per-module `elapsed_us`) and in
-aggregate by `MON_BUDGET_OVERRUN`; `b6`/`b7` retain enough of it to spot a
-heavy module without reading the fault stream.
+The ladder is weighted below the tick budget on purpose: it exists to
+attribute a healthy graph's tick budget per module, so most of its
+resolution sits where healthy steps land. The heavy tail is reported
+exactly, per module, by `MON_HEAVY_STEP` (`elapsed_us` verbatim) and in
+aggregate by `MON_BUDGET_OVERRUN`; `b6`/`b7` retain enough of the top end
+to spot a heavy module without reading the fault stream.
+
+### `MON_HEAVY_STEP`
+
+Emitted (rate-limited) by the scheduler when a single module step exceeds
+the heavy-step threshold (`src/kernel/exec/scheduler/domain_budget.rs`):
+
+```
+MON_HEAVY_STEP module=<idx> domain=<d> elapsed_us=<n> tick=<t> suppressed=<n>
+```
+
+### `MON_BUDGET_OVERRUN`
+
+Emitted (rate-limited) by the scheduler when an execution domain exhausts
+its per-tick step budget (`src/kernel/exec/scheduler/domain_budget.rs`):
+
+```
+MON_BUDGET_OVERRUN domain=<d> consumed_us=<n> limit_us=<n> last_mod=<idx> overrun_count=<n> tick=<t> suppressed=<n>
+```
 
 ### `MON_STATE`
 
@@ -75,17 +95,13 @@ MON_STATE mod=<idx> name=<s> prot=<p> tier=<t> state=<s>
 
 ### `MON_SESSION`
 
-Reserved for session-continuity observability. Emitted by anchors,
-workers, and session directories (see
-`architecture/protocol_surfaces.md`) at every
-`SessionCtrlV1` state transition so operators can see attach, rebind,
-drain, epoch bump, relocation, and stale-generation rejection on the
-same telemetry channel as the rest of monitor output.
-
-The line format is part of the public observability surface defined
-by `architecture/protocol_surfaces.md`. Anchor / worker / directory
-modules (`echo_anchor` and `echo_worker` today) emit one line per
-state transition.
+Session-continuity observability. Emitted by anchors, workers, and session
+directories at every `SessionCtrlV1` state transition (see
+[protocol_surfaces.md](protocol_surfaces.md)) so operators can see attach,
+rebind, drain, epoch bump, relocation, and stale-generation rejection on
+the same telemetry channel as the rest of monitor output. The emission
+helpers live in `modules/sdk/runtime/telemetry.rs`; `echo_anchor` and
+`echo_worker` are the in-tree emitters.
 
 ```
 MON_SESSION mod=<idx> event=<e> session=<32-hex> epoch=<n> [anchor=<16-hex>] [worker=<16-hex>] [reason=<r>] [status=<s>]
@@ -100,11 +116,11 @@ MON_SESSION mod=<idx> event=<e> session=<32-hex> epoch=<n> [anchor=<16-hex>] [wo
 | `anchor`  | `anchor_id` (8 bytes) as 16 hex chars. Omit if emitter is anchor.    |
 | `worker`  | `worker_id` (8 bytes) as 16 hex chars. Omit on anchor-only events.   |
 | `reason`  | Detach reason name. Present only on `event=detached`.                |
-| `status`  | Status code name. Present only on `event=attached` / `imported` / `relocated`. |
+| `status`  | Status code name. Optional; present when the emitter supplies one (conventionally on `attached` / `imported` / `relocated`). |
 
-`session_id` rendering uses the canonical cluster byte order (big-
-endian) with no `-` separators, so `MON_SESSION` lines grep cleanly
-for a given session across emitters.
+`session_id` rendering uses the canonical cluster byte order (big-endian)
+with no `-` separators, so `MON_SESSION` lines grep cleanly for a given
+session across emitters.
 
 #### Events
 
@@ -121,32 +137,36 @@ for a given session across emitters.
 | `relocated`  | directory             | `MSG_SC_RELOCATED` emitted. `status=<code>`, `worker=<new>`.        |
 | `attach_req` | anchor                | `CMD_SC_ATTACH` sent. (Informational.)                              |
 | `detach_req` | anchor                | `CMD_SC_DETACH` sent. `reason=<name>`.                              |
+| `export_req` | anchor                | Export requested from the worker. (Informational.)                  |
+| `resume_req` | anchor                | Resume requested for the new epoch. (Informational.)                |
 | `rejected`   | any                   | Stale epoch / unknown session rejected inbound. `reason=stale_epoch` or `unknown_session`. |
 | `error`      | any                   | `MSG_SC_ERROR` emitted. `status=<code>`.                            |
 
-Reasons (from `DETACH_*` constants in `session_ctrl.rs`): `normal`,
-`drain_timeout`, `stale_epoch`, `error`, `client_gone`.
+Reasons (from the `DETACH_*` constants in
+`modules/sdk/contracts/net/session_ctrl.rs`): `normal`, `drain_timeout`,
+`stale_epoch`, `error`, `client_gone`.
 
-Status codes (from `STATUS_*` constants): `ok`, `stale_epoch`,
+Status codes (from the `STATUS_*` constants): `ok`, `stale_epoch`,
 `unknown_session`, `no_capacity`, `corrupt`, `not_ready`.
 
-#### Failover records (platform-replicated-state `transport_migratable`)
+#### Failover records (`transport_migratable` sessions)
 
-For sessions declared `transport_migratable` with the
-platform-replicated-state mechanism (rfc_protocols.md §13.7), the
-record set above is mandatory-extended so an unplanned failover is
-**legible** — a fallback the operator cannot see is not honest. Same
-line format; additional events:
+Status: design target, not wired — no module emits these lines yet.
+
+For sessions declared `transport_migratable` with platform-replicated
+state, the record set above is extended so an unplanned failover is
+visible in telemetry rather than inferred after the fact. Same line
+format; additional events:
 
 | Event                        | Emitter(s)          | When                                                                    |
 |------------------------------|---------------------|-------------------------------------------------------------------------|
 | `fence_initiated`            | directory / takeover| Enforceable emission fence (STONITH / fabric cutoff) fired at the old anchor. |
-| `fence_confirmed`            | directory / takeover| Fence CONFIRMED dead. Distinct from `fence_initiated` — the gap is safety-critical (§13.7.4); the VIP must not move before this record. |
+| `fence_confirmed`            | directory / takeover| Fence confirmed dead. Distinct from `fence_initiated`: the client-facing VIP must not move before this record. |
 | `vip_moved`                  | takeover anchor     | Client-facing VIP now attracts datagrams to the takeover host.          |
 | `reservation_granted`        | anchor              | A fresh egress counter/sequence block was quorum-committed. `status=ok`. |
-| `reservation_exhausted_stall`| anchor              | Emit path stalled waiting on a reservation grant (§13.7.7 P99 spike). |
+| `reservation_exhausted_stall`| anchor              | Emit path stalled waiting on a reservation grant.                       |
 | `rpo_loss`                   | takeover worker     | Un-checkpointed application tail lost at failover. `reason=<bound>` states what was lost (e.g. `reason=1_tick`). |
-| `unsafe_recovery_epoch_void` | directory           | Forced/unsafe quorum recovery voided all outstanding reservation blocks and forced an epoch bump (§13.7.6 R2). |
+| `unsafe_recovery_epoch_void` | directory           | Forced/unsafe quorum recovery voided all outstanding reservation blocks and forced an epoch bump. |
 | `class_report`               | anchor              | Per-session declared vs achieved continuity class (see below).          |
 
 `class_report` carries two extra keys:
@@ -157,16 +177,16 @@ MON_SESSION mod=<idx> event=class_report session=<32-hex> epoch=<n> declared_cla
 
 Class names: `reroutable`, `drain_only`, `resumable`, `edge_anchored`,
 `transport_migratable` (the `CC_*` constants in `session_ctrl.rs`).
-A session running below its declared class — budget miss, missing
-fence, encrypted implicit-counter AEAD — MUST surface the degradation
-here (`achieved_class` < `declared_class`), so a silent fall-back from
-`transport_migratable` to `resumable` is visible in production, not
-inferred.
+A session running below its declared class — budget miss, missing fence,
+encrypted implicit-counter AEAD — surfaces the degradation here
+(`achieved_class` below `declared_class`), so a silent fall-back from
+`transport_migratable` to `resumable` is visible in production rather
+than inferred.
 
 #### Example
 
 ```
-MON_SESSION mod=3 event=attach_req session=44454d4f2d413031000000000000000a epoch=1 worker=44454d4f2d573031 status=ok
+MON_SESSION mod=3 event=attached session=44454d4f2d413031000000000000000a epoch=1 worker=44454d4f2d573031 status=ok
 MON_SESSION mod=4 event=attached session=44454d4f2d413031000000000000000a epoch=1 anchor=44454d4f2d413031 status=ok
 MON_SESSION mod=4 event=drained session=44454d4f2d413031000000000000000a epoch=1 anchor=44454d4f2d413031
 MON_SESSION mod=4 event=detached session=44454d4f2d413031000000000000000a epoch=1 anchor=44454d4f2d413031 reason=client_gone
@@ -178,15 +198,14 @@ emitters.
 
 ### `MON_PRESENTATION`
 
-AV presentation-group observability. Emitted by clock authorities,
-presentation anchors, and group coordinators on every state change so
-operators can trace lip-sync drift, sink join / leave, anchor rebind,
-and missed present / audio boundaries on the same telemetry channel as
-session continuity.
+Status: design target, not wired — no module emits these lines yet.
 
-The line format is part of the public observability surface defined by
-`architecture/av_capability_surface.md`. Implementing modules emit one
-line per state transition.
+AV presentation-group observability, defined by
+[av_capability_surface.md](av_capability_surface.md). Clock authorities,
+presentation anchors, and group coordinators emit one line per state
+change so operators can trace lip-sync drift, sink join / leave, anchor
+rebind, and missed present / audio boundaries on the same telemetry
+channel as session continuity.
 
 ```
 MON_PRESENTATION mod=<idx> event=<e> group=<id> [member=<name>] [authority=<name>] [latency_ms=<n>] [skew_us=<n>] [epoch=<n>] [reason=<r>] [status=<s>]
@@ -223,29 +242,15 @@ MON_PRESENTATION mod=<idx> event=<e> group=<id> [member=<name>] [authority=<name
 | `missed_present`  | scanout sink       | Frame missed its target vsync. `status=missed_present`.                    |
 | `degraded_mode`   | coordinator        | Group entered/left degraded mode. `reason=<r> status=<s>`.                 |
 
-Reasons (for emit/report cleanliness): `cutover`, `clock_loss`,
-`member_drop`, `degraded_mode`, `member_recovered`, `protected_required`,
-`format_change`.
+Reasons: `cutover`, `clock_loss`, `member_drop`, `degraded_mode`,
+`member_recovered`, `protected_required`, `format_change`.
 
 Status codes: `ok`, `underflow`, `overflow`, `missed_present`,
 `drift_corrected`, `protected_denied`.
 
-#### Example
-
-```
-MON_PRESENTATION mod=2 event=group_active group=living_room authority=hdmi_audio
-MON_PRESENTATION mod=4 event=member_joined group=living_room member=lcd_panel
-MON_PRESENTATION mod=2 event=epoch_advance group=living_room epoch=4 reason=cutover
-MON_PRESENTATION mod=4 event=skew_report group=living_room skew_us=320
-MON_PRESENTATION mod=4 event=underflow group=living_room member=hdmi_audio status=underflow
-```
-
-Operators grep `MON_PRESENTATION ... group=living_room` to follow one
-group's lifecycle across emitters. The format is forward-compatible —
-unknown event names and unknown keys are ignored, so new transitions can
-be added without breaking older monitor builds.
-
 ## Kernel support
+
+Source: `modules/sdk/internal/monitor.rs`.
 
 - `FAULT_MONITOR_SUBSCRIBE` (`0x0C52`) — bind an event handle that the
   kernel signals on every fault.
@@ -257,5 +262,5 @@ be added without breaking older monitor builds.
   module (or the global histogram with `handle=-1`).
 
 A monitor module reads these syscalls on a slow cadence and prints the
-corresponding `MON_*` lines. The CLI scaffold in `tools/src/monitor.rs`
-parses whatever arrives — any subset is acceptable.
+corresponding `MON_*` lines. The parser in `tools/src/monitor.rs` accepts
+whatever arrives — any subset is acceptable.

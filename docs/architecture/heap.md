@@ -1,5 +1,7 @@
 # Per-Module Heap Allocation
 
+Source: `src/kernel/mem/heap.rs`, `modules/sdk/runtime/heap.rs`
+
 ## Overview
 
 Fluxor provides optional per-module heap allocation. Each module may request
@@ -47,7 +49,7 @@ pub extern "C" fn module_arena_size() -> u32 {
 ```
 
 The kernel allocates this from STATE_ARENA during module instantiation and
-initializes a freelist allocator within it. Modules without this export
+initialises a freelist allocator within it. Modules without this export
 receive no heap.
 
 ## Syscall API
@@ -62,7 +64,7 @@ Three entries in the SyscallTable:
 
 ## SDK Helpers
 
-In `modules/sdk/runtime.rs`:
+In `modules/sdk/runtime/heap.rs`:
 
 ```rust
 // Allocate from this module's heap
@@ -82,7 +84,9 @@ let bigger = heap_realloc(sys, buf, 512);
 
 ## Observability
 
-Query heap statistics via `dev_query` with key `HEAP_STATS` (6):
+Query heap statistics via `provider_query` with key
+`query_key::HEAP_STATS` (6); `handle = -1` queries the calling
+module's own heap:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -92,12 +96,13 @@ Query heap statistics via `dev_query` with key `HEAP_STATS` (6):
 | total_allocs | u16 | Lifetime allocation count |
 | high_water | u32 | Peak allocated bytes |
 | free_blocks | u16 | Number of free blocks (fragmentation indicator) |
-| largest_free | u16 | Largest free block in bytes |
+| largest_free | u32 | Largest contiguous free block in bytes |
 
 PIC runtime helper:
 
 ```rust
-let (arena_size, allocated, alloc_count, total_allocs, high_water) = heap_stats(sys);
+let (arena_size, allocated, alloc_count, total_allocs, high_water,
+     free_blocks, largest_free) = heap_stats(sys);
 ```
 
 ## Allocator Design
@@ -109,18 +114,24 @@ Simple freelist with first-fit and immediate coalescing on free:
 - O(n) allocation in number of free blocks (bounded by arena_size / 16)
 - Forward and backward coalescing on free to reduce fragmentation
 
-## Config Validation
+## Config Behaviour Keys
 
-The `heap_arena_kb` field in module config overrides the module's
-`module_arena_size()` value:
+The heap size comes from the module's `module_arena_size()` export.
+A module's YAML entry can tune heap behaviour through the optional
+`heap:` subtree, validated in `tools/src/config/builder.rs`:
 
 ```yaml
 modules:
   - name: json_parser
-    heap_arena_kb: 8
+    heap:
+      zero_on_free: true                 # scrub freed blocks
+      alloc_failure_policy: return_null  # or "fault"
+      canary_enabled: true               # overflow canaries
 ```
 
-The validation tool checks that total state + heap arena fits within the
+`alloc_failure_policy: fault` routes an exhausted arena into the
+module fault machinery instead of returning null. The config tool
+validates that total state plus heap arena usage fits within the
 target's STATE_ARENA:
 
 ```
@@ -153,16 +164,15 @@ sum(module_state_size[i] + heap_arena_size[i]) <= STATE_ARENA_SIZE
 - [ ] Does `module_new()` call `heap_alloc()` and check for null?
 - [ ] Is heap allocation confined to setup paths?
 - [ ] Is the heap budget documented and validated against the target?
-- [ ] Is the high-water mark tested under representative workloads?
+- [ ] Is the high-water mark checked under representative workloads?
 
 ## Impact on Constrained Targets
 
 | Target | STATE_ARENA | Typical Heap Budget |
 |--------|-------------|---------------------|
-| RP2040 | 64 KB | 1-4 KB per module |
-| RP2350 | 256 KB | 4-32 KB per module |
-| BCM2712 | 256 KB | 4-32 KB per module |
+| RP2040 | 64 KiB | 1-4 KiB per module |
+| RP2350 | 256 KiB | 4-32 KiB per module |
+| BCM2712 | 96 MiB (host profile) | KiB to MiB per module |
 
-The heap is opt-in, bounded, and zero-cost when unused. Modules that don't
-use heap pay nothing. A firmware image with no heap-requesting modules is
-functionally identical to pre-heap builds.
+The heap is opt-in and bounded. Modules that do not use it pay
+nothing.
