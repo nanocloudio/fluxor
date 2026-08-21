@@ -1453,6 +1453,26 @@ fn write_ext_server_name(out: &mut [u8], mut pos: usize, host: &[u8]) -> usize {
 /// each is offered in order — this is how the QUIC client advertises its
 /// configured ALPN instead of the TCP/HTTP defaults. Raw pointer writes
 /// for PIC aarch64 safety.
+/// Is `proto` one of the protocols [`write_ext_alpn_client`] offers when no
+/// ALPN list is configured?
+///
+/// The default offer is a TLS-layer decision — it is what this handshake
+/// puts on the wire — so the tokens live here, beside the code that writes
+/// them. A transport validating a server's selection asks this rather than
+/// restating the list: two copies of the same list is how a change to one
+/// of them becomes a connection that is rejected for offering exactly what
+/// it offered.
+///
+/// Written as comparisons rather than a `const [&[u8]; N]` table on
+/// purpose. A const array of slices is a table of fat pointers whose
+/// addresses are baked at link time, and these modules are
+/// position-independent with no relocation processing for one — the
+/// pointers would be read as absolute addresses that are wrong wherever
+/// the module happened to be loaded.
+pub fn tls_default_alpn_offers(proto: &[u8]) -> bool {
+    proto == b"h2" || proto == b"http/1.1"
+}
+
 fn write_ext_alpn_client(out: &mut [u8], mut pos: usize, alpn: &[u8]) -> usize {
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.

@@ -96,12 +96,17 @@ fn select_alpn<'a>(cfg: &'a [u8], offered: &[u8]) -> Option<&'a [u8]> {
 /// Client ALPN validation (RFC 7301 §3.1): was `proto` (the protocol the
 /// server selected in EncryptedExtensions) actually offered by us in the
 /// ClientHello? `offered_cfg` is the raw `alpn` config (comma-separated
-/// tokens). An empty config means we offered the TLS default list
-/// (`h2`, `http/1.1`) — see `write_ext_alpn_client`. A server selection
-/// the client never offered MUST be rejected, not adopted.
+/// tokens). A server selection the client never offered MUST be rejected,
+/// not adopted.
+///
+/// The tokens are opaque here — this compares byte strings against the
+/// list WE sent, and holds no opinion about what any of them mean. An
+/// empty config means the shared TLS layer wrote its own default offer, so
+/// the question of what that offer contains is asked of the code that
+/// wrote it rather than restated in this transport.
 fn alpn_offered_contains(offered_cfg: &[u8], proto: &[u8]) -> bool {
     if offered_cfg.is_empty() {
-        return proto == b"h2" || proto == b"http/1.1";
+        return tls_default_alpn_offers(proto);
     }
     offered_cfg
         .split(|&b| b == b',')
@@ -349,22 +354,24 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
     // Placed after the PSK block so no `driver` borrow is live. When an
     // `alpn` list is configured, pick the server's first configured
     // token the client also offered and latch it on the connection; it
-    // is echoed in EncryptedExtensions. The per-connection `use_h3` flag
-    // then decides whether this connection drives the HTTP/3 app layer
-    // (negotiated `h3`) or routes raw bidi streams to the app surface
-    // (any non-h3 ALPN, e.g. `mqtt`). With no ALPN configured, behaviour
-    // is unchanged: module-wide `enable_h3` governs.
+    // is echoed in EncryptedExtensions and reported to the application
+    // on MSG_MUX_SESSION_OPENED as opaque bytes.
+    //
+    // The selection is a byte-string intersection and nothing more. This
+    // module does not recognise any protocol token, so the selected
+    // value changes no behaviour here — what runs on the session is the
+    // application's decision, made from the token we hand it.
     let mut sel_buf = [0u8; MAX_ALPN];
     let mut sel_len = 0usize;
-    let mut decided_h3 = s.enable_h3 != 0;
     // RFC 7301 §3.2, fail-closed: an EXPLICITLY configured ALPN list means
     // the application requires a negotiated protocol. The server MUST then
     // either select exactly one overlapping token or abort with a fatal
     // no_application_protocol alert. There is no silent fallback — that
     // would route the connection over a protocol neither side agreed on.
     // A client that omits the ALPN extension entirely is also rejected
-    // (it cannot satisfy our requirement). Only when NO ALPN is configured
-    // do we keep the legacy `enable_h3` default.
+    // (it cannot satisfy our requirement). With NO ALPN configured the
+    // port is the transparent byte stream instead, and negotiation does
+    // not apply.
     let mut alpn_fatal = false;
     if s.alpn_cfg_len > 0 {
         match ch.alpn_protos {
@@ -377,7 +384,6 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                     Some(sel) if sel.len() <= MAX_ALPN => {
                         sel_len = sel.len();
                         sel_buf[..sel_len].copy_from_slice(sel);
-                        decided_h3 = sel_buf[..sel_len] == b"h3"[..];
                     }
                     _ => {
                         // No overlap (or malformed/oversize) → fail closed.
@@ -398,7 +404,6 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
     }
     conn.alpn_selected[..sel_len].copy_from_slice(&sel_buf[..sel_len]);
     conn.alpn_selected_len = sel_len as u8;
-    conn.use_h3 = decided_h3;
     true
 }
 
@@ -475,13 +480,18 @@ unsafe fn pump_send_server_hello(s: &mut QuicState, idx: usize) -> bool {
 }
 
 unsafe fn pump_derive_handshake_keys(s: &mut QuicState, idx: usize) -> bool {
+    // `bits_per_step` caps how much of the 256-bit ladder one step does.
+    // A zero budget means "run to completion in one call"
+    // (`handshake_pump.rs`) — a ~2 ms step that a short-tick target's step
+    // guard terminates outright.
+    let bits_per_step = ladder_bits_per_step(s);
     {
         let driver = &mut s.conns[idx].driver;
         if !driver.ecdh_state.is_initialised() {
             let new = match ecdh_shared_secret_init(
                 &driver.ecdh_private,
                 &driver.peer_key_share[..driver.peer_key_share_len as usize],
-                0u8,
+                bits_per_step,
             ) {
                 Some(v) => v,
                 None => {
@@ -634,43 +644,102 @@ unsafe fn pump_send_certificate(s: &mut QuicState, idx: usize) -> bool {
     true
 }
 
+/// Ladder bits per `module_step` for the handshake's P-256 scalar
+/// multiplications, as a `u8` for the crypto API.
+///
+/// The param is a `u16` so 256 is expressible; the ladder takes a `u8`
+/// where 0 means "the whole thing". Those meet at 256 → 0, which is the
+/// only value that needs translating.
+fn ladder_bits_per_step(s: &QuicState) -> u8 {
+    if s.ecdh_bits_per_step >= 256 {
+        0
+    } else {
+        s.ecdh_bits_per_step as u8
+    }
+}
+
+/// Emit CertificateVerify, driving the signature's scalar multiplication
+/// across as many steps as `ecdh_bits_per_step` calls for.
+///
+/// Three stages, re-entered until the ladder finishes:
+///   1. initialise the resumable signer from the identity key;
+///   2. advance the ladder one budget's worth;
+///   3. finalise the signature and emit the message.
+///
+/// Incremental because the non-incremental `ecdsa_sign` is a whole
+/// 256-bit constant-time ladder in a single step. On a host that is a
+/// slow millisecond; on a bare-metal target with a 50 µs tick the step
+/// guard terminates the module for it, and the transport vanishes
+/// mid-handshake with no error the peer can see. `tls` drives its
+/// signature this way for the same reason.
 unsafe fn pump_send_certificate_verify(s: &mut QuicState, idx: usize) -> bool {
     let sys = &*s.syscalls;
+    let bits_per_step = ladder_bits_per_step(s);
+
+    // ── Stage 1 — initialise, once.
+    if !s.conns[idx].driver.ecdsa_sign_state.is_initialised() {
+        let driver = &mut s.conns[idx].driver;
+        let hl = driver.suite.hash_len();
+        let transcript_hash = match &driver.transcript {
+            Some(t) => t.current_hash(),
+            None => {
+                driver.hs_state = HandshakeState::Error;
+                return true;
+            }
+        };
+        let context = b"TLS 1.3, server CertificateVerify";
+        let mut verify_content = [0u8; 200];
+        let vc_len =
+            build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
+        let vc_hash = sha256(&verify_content[..vc_len]);
+
+        let mut priv_key = [0u8; 32];
+        if s.key_len == 32 {
+            core::ptr::copy_nonoverlapping(s.key.as_ptr(), priv_key.as_mut_ptr(), 32);
+        } else if s.key_len > 32 {
+            extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
+        }
+        // RFC 6979: the nonce is derived deterministically from the key and
+        // the hash inside `ecdsa_sign_init`, so no CSPRNG draw is needed
+        // here — and a deterministic nonce cannot be weakened by a poor
+        // entropy source at exactly the wrong moment.
+        let started = ecdsa_sign_init(&priv_key, &vc_hash, bits_per_step);
+        let mut j = 0;
+        while j < 32 {
+            core::ptr::write_volatile(&mut priv_key[j], 0);
+            j += 1;
+        }
+        let _ = sys;
+        match started {
+            Some(st) => s.conns[idx].driver.ecdsa_sign_state = st,
+            None => {
+                // The configured identity key is not a usable P-256 scalar
+                // (absent, or outside [1, n-1]).
+                s.conns[idx].driver.hs_state = HandshakeState::Error;
+            }
+        }
+        return true;
+    }
+
+    // ── Stage 2 — advance the ladder one budget step.
+    {
+        let driver = &mut s.conns[idx].driver;
+        if !driver.ecdsa_sign_state.scalar_mul.complete() {
+            driver.ecdsa_sign_state.scalar_mul.step();
+            if !driver.ecdsa_sign_state.scalar_mul.complete() {
+                return true;
+            }
+        }
+    }
+
+    // ── Stage 3 — finalise and emit.
+    //
+    // `ecdsa_sign_finalise` consumes the state and zeroises its secrets,
+    // so it is swapped out by value.
     let driver = &mut s.conns[idx].driver;
-    let hl = driver.suite.hash_len();
-    let transcript_hash = match &driver.transcript {
-        Some(t) => t.current_hash(),
-        None => {
-            driver.hs_state = HandshakeState::Error;
-            return true;
-        }
-    };
-    let context = b"TLS 1.3, server CertificateVerify";
-    let mut verify_content = [0u8; 200];
-    let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
-    let vc_hash = sha256(&verify_content[..vc_len]);
-    let mut k_random = [0u8; 32];
-    dev_csprng_fill(sys, k_random.as_mut_ptr(), 32);
-    let mut priv_key = [0u8; 32];
-    if s.key_len == 32 {
-        core::ptr::copy_nonoverlapping(s.key.as_ptr(), priv_key.as_mut_ptr(), 32);
-    } else if s.key_len > 32 {
-        extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
-    }
-    let signed = ecdsa_sign(&priv_key, &vc_hash, &k_random);
-    let mut j = 0;
-    while j < 32 {
-        core::ptr::write_volatile(&mut priv_key[j], 0);
-        j += 1;
-    }
-    let raw_sig = match signed {
-        Some(sig) => sig,
-        None => {
-            // The configured identity key is not a usable P-256 scalar.
-            driver.hs_state = HandshakeState::Error;
-            return true;
-        }
-    };
+    let state = core::mem::replace(&mut driver.ecdsa_sign_state, EcdsaSignState::empty());
+    let raw_sig = ecdsa_sign_finalise(state);
+
     let (der_sig, der_len) = encode_der_signature(&raw_sig);
     let msg_len = build_certificate_verify(&der_sig, der_len, &mut driver.scratch);
     if let Some(ref mut t) = driver.transcript {
@@ -1066,9 +1135,6 @@ unsafe fn pump_recv_server_hello(s: &mut QuicState, idx: usize) -> bool {
 }
 
 unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool {
-    // Captured before borrowing the connection so the ALPN latch below
-    // can fall back to it without re-borrowing `s`.
-    let enable_h3 = s.enable_h3 != 0;
     // Snapshot the ALPN list we offered in our ClientHello so the
     // server's selection can be validated against it (RFC 7301 §3.1)
     // without re-borrowing `s` after `conn` is taken. Empty == the TLS
@@ -1162,13 +1228,14 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
         conn.driver.hs_state = HandshakeState::Error;
         return true;
     }
-    // RFC 9221 §3: capture the server's max_datagram_frame_size.
-    conn.peer_max_datagram_frame_size = parse_peer_max_datagram_frame_size(tp);
-    // RFC 7301: latch the server-negotiated ALPN so a client that
-    // negotiated a non-h3 protocol (e.g. `mqtt`) routes to the raw
-    // bidi-stream surface, symmetric with the server. With no ALPN
-    // extension `alpn_selected_len` stays 0 and h3 stays governed by
-    // `enable_h3`, preserving the pre-ALPN client behaviour.
+    // RFC 9000 §18.2 / RFC 9221 §3: capture the server's flow-control,
+    // stream-count and datagram limits in one pass, and apply them
+    // before any application stream can exist on this connection.
+    let peer_limits = parse_peer_transport_limits(tp);
+    apply_peer_transport_limits(conn, &peer_limits);
+    // RFC 7301: latch the server-negotiated ALPN verbatim, as opaque
+    // bytes. It reaches the application on MSG_MUX_SESSION_OPENED; this
+    // module never tests its value.
     if let Some(proto) = parse_encrypted_extensions_alpn(&data[4..len]) {
         // RFC 7301 §3.1: the client MUST fail the connection if the
         // server selects a protocol the client did not offer (or one
@@ -1183,7 +1250,6 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
         // Latch the negotiated protocol verbatim (never truncated).
         conn.alpn_selected[..proto.len()].copy_from_slice(proto);
         conn.alpn_selected_len = proto.len() as u8;
-        conn.use_h3 = proto == &b"h3"[..];
     } else if offered_cfg_len > 0 {
         // Fail-closed (RFC 7301 §3.1): we offered an EXPLICIT ALPN list, so
         // the server omitting the ALPN extension means it negotiated none
@@ -1194,11 +1260,6 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
         let sys = &*s.syscalls;
         dev_log(sys, 2, m.as_ptr(), m.len());
         return true;
-    } else {
-        // No ALPN configured locally and none echoed → behaviour governed
-        // by the module's enable_h3 flag, latched per-connection so
-        // post-handshake routing consults `use_h3` uniformly.
-        conn.use_h3 = enable_h3;
     }
     if let Some(ref mut t) = conn.driver.transcript {
         t.update(&data[..len]);
@@ -2339,44 +2400,6 @@ unsafe fn process_frames(
                     conn.cc_on_loss(total_lost, oldest_loss_time);
                 }
             }
-            FRAME_MAX_DATA => {
-                pos += 1;
-                let after = &payload[pos..];
-                let (max, n) = match varint_decode(after.as_ptr(), after.len()) {
-                    Some(t) => t,
-                    None => return,
-                };
-                pos += n;
-                // Peer is bumping our connection-level send window.
-                // Track but don't yet use for emission backpressure.
-                let _ = max;
-            }
-            FRAME_MAX_STREAM_DATA => {
-                pos += 1;
-                let after = &payload[pos..];
-                let (_id, n1) = match varint_decode(after.as_ptr(), after.len()) {
-                    Some(t) => t,
-                    None => return,
-                };
-                pos += n1;
-                let after = &payload[pos..];
-                let (_max, n2) = match varint_decode(after.as_ptr(), after.len()) {
-                    Some(t) => t,
-                    None => return,
-                };
-                pos += n2;
-            }
-            FRAME_DATA_BLOCKED => {
-                pos += 1;
-                let after = &payload[pos..];
-                let (_lim, n) = match varint_decode(after.as_ptr(), after.len()) {
-                    Some(t) => t,
-                    None => return,
-                };
-                pos += n;
-                // Peer is connection-blocked; a full implementation
-                // responds with MAX_DATA to unblock.
-            }
             FRAME_NEW_CONNECTION_ID => {
                 pos += 1;
                 let after = &payload[pos..];
@@ -2450,13 +2473,13 @@ unsafe fn process_frames(
             FRAME_RESET_STREAM => {
                 pos += 1;
                 let after = &payload[pos..];
-                let (_sid, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                let (sid, n1) = match varint_decode(after.as_ptr(), after.len()) {
                     Some(t) => t,
                     None => return,
                 };
                 pos += n1;
                 let after = &payload[pos..];
-                let (_err, n2) = match varint_decode(after.as_ptr(), after.len()) {
+                let (err, n2) = match varint_decode(after.as_ptr(), after.len()) {
                     Some(t) => t,
                     None => return,
                 };
@@ -2467,6 +2490,114 @@ unsafe fn process_frames(
                     None => return,
                 };
                 pos += n3;
+                // The peer abandoned the stream. Terminal for its receive
+                // half, and the application error code is its own — we
+                // carry it across without interpreting it.
+                if matches!(level, EncLevel::OneRtt) {
+                    handle_reset_stream(conn, sid, err);
+                }
+            }
+            FRAME_STOP_SENDING => {
+                pos += 1;
+                let after = &payload[pos..];
+                let (sid, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n1;
+                let after = &payload[pos..];
+                let (err, n2) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n2;
+                // Handled explicitly: an unrecognised frame abandons the
+                // rest of the packet, so a peer cancelling one stream
+                // would otherwise cost every frame coalesced behind it,
+                // ACKs included.
+                if matches!(level, EncLevel::OneRtt) {
+                    handle_stop_sending(conn, sid, err);
+                }
+            }
+            FRAME_MAX_STREAM_DATA => {
+                pos += 1;
+                let after = &payload[pos..];
+                let (sid, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n1;
+                let after = &payload[pos..];
+                let (maximum, n2) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n2;
+                if matches!(level, EncLevel::OneRtt) {
+                    handle_max_stream_data(conn, sid, maximum);
+                }
+            }
+            FRAME_MAX_DATA => {
+                pos += 1;
+                let after = &payload[pos..];
+                let (maximum, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n1;
+                if maximum > conn.send_max_data {
+                    conn.send_max_data = maximum;
+                    conn.data_blocked_pending = false;
+                }
+            }
+            FRAME_MAX_STREAMS_BIDI | FRAME_MAX_STREAMS_UNI => {
+                let is_bidi = payload[pos] == FRAME_MAX_STREAMS_BIDI;
+                pos += 1;
+                let after = &payload[pos..];
+                let (maximum, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n1;
+                // Cumulative, not an increment (RFC 9000 §19.11): treating
+                // it as a delta would grant far less than the peer meant.
+                if is_bidi {
+                    if maximum > conn.peer_max_streams_bidi {
+                        conn.peer_max_streams_bidi = maximum;
+                        conn.streams_blocked_bidi_pending = false;
+                    }
+                } else if maximum > conn.peer_max_streams_uni {
+                    conn.peer_max_streams_uni = maximum;
+                    conn.streams_blocked_uni_pending = false;
+                }
+            }
+            FRAME_DATA_BLOCKED | FRAME_STREAMS_BLOCKED_BIDI | FRAME_STREAMS_BLOCKED_UNI => {
+                // The peer is telling us it wants more credit. We grant
+                // credit from consumption and reclamation, so there is no
+                // extra action here — but the frame must be CONSUMED, or
+                // the rest of the packet is abandoned with it.
+                pos += 1;
+                let after = &payload[pos..];
+                let (_v, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n1;
+            }
+            FRAME_STREAM_DATA_BLOCKED => {
+                pos += 1;
+                let after = &payload[pos..];
+                let (_sid, n1) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n1;
+                let after = &payload[pos..];
+                let (_v, n2) = match varint_decode(after.as_ptr(), after.len()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                pos += n2;
             }
             FRAME_HANDSHAKE_DONE => {
                 pos += 1;
@@ -2576,14 +2707,20 @@ unsafe fn process_frames(
     }
 }
 
-/// Handle an inbound STREAM frame. stream_id 0 lands in the
-/// `stream_recv_buf` path; other bidi-shaped ids go to the
-/// `bidi_extra_streams` pool; uni-shaped ids go to the
-/// `extra_streams` table (RFC 9000 §2.1 stream-id encoding). Partial
-/// overlap is accepted; out-of-order arrivals are dropped and rely
-/// on the peer's retransmission.
+/// Handle an inbound STREAM frame.
+///
+/// On the framed mux surface every stream — including client bidi stream
+/// 0 — is an ordinary pool slot, routed by the direction bit of its id
+/// (RFC 9000 §2.1). On the transparent surface there is only one stream
+/// and it lands in the legacy receive buffer.
+///
+/// Partial overlap is accepted; out-of-order arrivals are dropped and
+/// rely on the peer's retransmission.
 unsafe fn handle_stream_frame(conn: &mut QuicConnection, sf: &StreamFrame<'_>) {
-    if sf.stream_id == 0 {
+    if !conn.framed_app_surface {
+        if sf.stream_id != 0 {
+            return;
+        }
         let base = conn.stream_recv_off;
         let frame_end = sf.offset + sf.data.len() as u64;
         if frame_end <= base {
@@ -2625,74 +2762,140 @@ unsafe fn handle_stream_frame(conn: &mut QuicConnection, sf: &StreamFrame<'_>) {
                 None => return,
             },
         };
-        let slot = &mut conn.bidi_extra_streams[slot_idx];
-        let base = slot.recv_off;
-        let frame_end = sf.offset + sf.data.len() as u64;
-        if frame_end <= base {
-            return;
-        }
-        let data_slice = if sf.offset < base {
-            let s = (base - sf.offset) as usize;
-            &sf.data[s..]
-        } else if sf.offset == base {
-            sf.data
-        } else {
-            return;
-        };
-        let space = slot.recv_buf.len() - slot.recv_buf_len;
-        let n = data_slice.len().min(space);
-        if n == 0 && !data_slice.is_empty() {
-            return;
-        }
-        core::ptr::copy_nonoverlapping(
-            data_slice.as_ptr(),
-            slot.recv_buf.as_mut_ptr().add(slot.recv_buf_len),
-            n,
+        let slot = &mut conn.bidi_streams[slot_idx];
+        stream_slot_ingest(
+            &mut slot.recv_off,
+            &mut slot.recv_buf,
+            &mut slot.recv_buf_len,
+            &mut slot.recv_fin,
+            sf,
         );
-        slot.recv_buf_len += n;
-        slot.recv_off += n as u64;
-        if sf.fin && n == data_slice.len() {
-            slot.recv_fin = true;
-        }
         return;
     }
 
-    // Uni stream id: route into extra_streams.
-    let slot_idx = match extra_find(conn, sf.stream_id) {
+    let slot_idx = match uni_find(conn, sf.stream_id) {
         Some(i) => i,
-        None => match extra_alloc(conn, sf.stream_id, false) {
+        None => match uni_alloc(conn, sf.stream_id, false) {
             Some(i) => i,
             None => return,
         },
     };
-    let slot = &mut conn.extra_streams[slot_idx];
-    let base = slot.recv_off;
+    let slot = &mut conn.uni_streams[slot_idx];
+    stream_slot_ingest(
+        &mut slot.recv_off,
+        &mut slot.recv_buf,
+        &mut slot.recv_buf_len,
+        &mut slot.recv_fin,
+        sf,
+    );
+}
+
+/// The offset/overlap/FIN bookkeeping one slot does with a STREAM frame.
+///
+/// Takes the four fields rather than the slot so the two pool shapes —
+/// which differ only in buffer size — share it without a trait object.
+/// A vtable is not available in a position-independent module: there is
+/// no relocation processing for one, so the call jumps to an unrelocated
+/// address and faults at runtime rather than failing the build.
+unsafe fn stream_slot_ingest(
+    recv_off: &mut u64,
+    recv_buf: &mut [u8],
+    recv_buf_len: &mut usize,
+    recv_fin: &mut bool,
+    sf: &StreamFrame<'_>,
+) {
+    let base = *recv_off;
     let frame_end = sf.offset + sf.data.len() as u64;
     if frame_end <= base {
         return;
     }
     let data_slice = if sf.offset < base {
-        let s = (base - sf.offset) as usize;
-        &sf.data[s..]
+        let skip = (base - sf.offset) as usize;
+        &sf.data[skip..]
     } else if sf.offset == base {
         sf.data
     } else {
         return;
     };
-    let space = slot.recv_buf.len() - slot.recv_buf_len;
+    let space = recv_buf.len() - *recv_buf_len;
     let n = data_slice.len().min(space);
     if n == 0 && !data_slice.is_empty() {
         return;
     }
     core::ptr::copy_nonoverlapping(
         data_slice.as_ptr(),
-        slot.recv_buf.as_mut_ptr().add(slot.recv_buf_len),
+        recv_buf.as_mut_ptr().add(*recv_buf_len),
         n,
     );
-    slot.recv_buf_len += n;
-    slot.recv_off += n as u64;
+    *recv_buf_len += n;
+    *recv_off += n as u64;
     if sf.fin && n == data_slice.len() {
-        slot.recv_fin = true;
+        *recv_fin = true;
+    }
+}
+
+/// Mark a stream's receive half terminally reset by the peer
+/// (RFC 9000 §19.4), carrying the peer's opaque application error code
+/// through to whoever owns the stream.
+unsafe fn handle_reset_stream(conn: &mut QuicConnection, stream_id: u64, app_error: u64) {
+    if !conn.framed_app_surface {
+        return;
+    }
+    if (stream_id & 0x2) == 0 {
+        if let Some(k) = bidi_find(conn, stream_id) {
+            conn.bidi_streams[k].abort.recv_reset = true;
+            conn.bidi_streams[k].abort.recv_reset_error = app_error;
+            // Bytes buffered behind a reset are bytes the peer has
+            // abandoned. Delivering them would let the application act
+            // on a prefix of a message the sender withdrew.
+            conn.bidi_streams[k].recv_buf_len = 0;
+        }
+    } else if let Some(k) = uni_find(conn, stream_id) {
+        conn.uni_streams[k].abort.recv_reset = true;
+        conn.uni_streams[k].abort.recv_reset_error = app_error;
+        conn.uni_streams[k].recv_buf_len = 0;
+    }
+}
+
+/// Record a peer STOP_SENDING (RFC 9000 §19.5). Not terminal: it asks
+/// our application to stop producing, and the application answers with a
+/// reset of its own choosing.
+unsafe fn handle_stop_sending(conn: &mut QuicConnection, stream_id: u64, app_error: u64) {
+    if !conn.framed_app_surface {
+        return;
+    }
+    if (stream_id & 0x2) == 0 {
+        if let Some(k) = bidi_find(conn, stream_id) {
+            conn.bidi_streams[k].abort.recv_stop = true;
+            conn.bidi_streams[k].abort.recv_stop_error = app_error;
+        }
+    } else if let Some(k) = uni_find(conn, stream_id) {
+        conn.uni_streams[k].abort.recv_stop = true;
+        conn.uni_streams[k].abort.recv_stop_error = app_error;
+    }
+}
+
+/// Raise a stream's send window on MAX_STREAM_DATA (RFC 9000 §19.10).
+unsafe fn handle_max_stream_data(conn: &mut QuicConnection, stream_id: u64, maximum: u64) {
+    if !conn.framed_app_surface {
+        return;
+    }
+    // Windows only ever move forward: a reordered frame carrying a
+    // smaller maximum must not retract credit we already used.
+    if (stream_id & 0x2) == 0 {
+        if let Some(k) = bidi_find(conn, stream_id) {
+            let f = &mut conn.bidi_streams[k].flow;
+            if maximum > f.send_max_data {
+                f.send_max_data = maximum;
+                f.send_blocked_pending = false;
+            }
+        }
+    } else if let Some(k) = uni_find(conn, stream_id) {
+        let f = &mut conn.uni_streams[k].flow;
+        if maximum > f.send_max_data {
+            f.send_max_data = maximum;
+            f.send_blocked_pending = false;
+        }
     }
 }
 
@@ -2856,20 +3059,23 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
             let conn = &s.conns[idx];
             let lvl_now = current_send_level(conn);
 
-            // Survey 1-RTT ack-eliciting work pending in any of the four
-            // sources (main stream, HANDSHAKE_DONE, h3 unidirectional
-            // extra streams, h3 bidirectional extra streams). Each one
-            // adds ack-eliciting frames to the packet and so must be
-            // gated by congestion control under RFC 9002 §7.
+            // Survey 1-RTT ack-eliciting work pending across every
+            // source: the transparent stream, HANDSHAKE_DONE, both
+            // stream pools, and the abrupt-termination and credit
+            // frames. Each adds ack-eliciting frames to the packet and
+            // so must be gated by congestion control under RFC 9002 §7.
             let has_extra_pending = {
                 let mut found = false;
                 let mut k = 0;
-                while k < MAX_EXTRA_STREAMS {
-                    let st = &conn.extra_streams[k];
+                while k < MAX_UNI_STREAMS {
+                    let st = &conn.uni_streams[k];
                     if st.allocated
-                        && st.locally_initiated
-                        && (st.send_buf_len > 0
-                            || (st.send_fin_pending && !st.send_fin_emitted))
+                        && ((st.locally_initiated
+                            && (st.send_buf_len > 0
+                                || (st.send_fin_pending && !st.send_fin_emitted)))
+                            || (st.abort.reset_pending && !st.abort.reset_emitted)
+                            || (st.abort.stop_pending && !st.abort.stop_emitted)
+                            || st.flow.recv_max_data_tx_pending)
                     {
                         found = true;
                         break;
@@ -2878,17 +3084,28 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
                 }
                 if !found {
                     let mut k = 0;
-                    while k < MAX_BIDI_EXTRA_STREAMS {
-                        let st = &conn.bidi_extra_streams[k];
+                    while k < MAX_BIDI_STREAMS {
+                        let st = &conn.bidi_streams[k];
                         if st.allocated
                             && (st.send_buf_len > 0
-                                || (st.send_fin_pending && !st.send_fin_emitted))
+                                || (st.send_fin_pending && !st.send_fin_emitted)
+                                || (st.abort.reset_pending && !st.abort.reset_emitted)
+                                || (st.abort.stop_pending && !st.abort.stop_emitted)
+                                || st.flow.recv_max_data_tx_pending)
                         {
                             found = true;
                             break;
                         }
                         k += 1;
                     }
+                }
+                if !found {
+                    found = conn.max_streams_tx_pending
+                        || conn.max_streams_uni_tx_pending
+                        || conn.max_data_tx_pending
+                        || conn.data_blocked_pending
+                        || conn.streams_blocked_bidi_pending
+                        || conn.streams_blocked_uni_pending;
                 }
                 found
             };
@@ -3216,21 +3433,39 @@ unsafe fn emit_crypto_packet(
             had_handshake_done = true;
         }
 
-    // STREAM frame (1-RTT only) carrying app data on stream id 0.
+    // STREAM frames. On the transparent surface there is one stream and
+    // it lives in the legacy buffer; on the framed mux surface every
+    // stream is a pool slot and several may be packed into one packet.
+    //
+    // Slots are visited round-robin from a rotating cursor rather than
+    // always from index 0, so one busy stream cannot starve the others:
+    // a stream that always fills the packet would otherwise be the only
+    // one ever emitted.
     let mut had_main_stream = false;
     let mut main_stream_buf_len: usize = 0;
     let mut main_stream_fin_emitted = false;
-    let mut had_extra_stream = [false; MAX_EXTRA_STREAMS];
-    let mut extra_stream_buf_len = [0usize; MAX_EXTRA_STREAMS];
+    let mut had_uni_stream = [false; MAX_UNI_STREAMS];
+    let mut uni_stream_buf_len = [0usize; MAX_UNI_STREAMS];
+    let mut uni_stream_fin_emitted = [false; MAX_UNI_STREAMS];
+    let mut had_uni_reset = [false; MAX_UNI_STREAMS];
+    let mut had_uni_stop = [false; MAX_UNI_STREAMS];
+    let mut had_bidi_stream = [false; MAX_BIDI_STREAMS];
+    let mut bidi_stream_buf_len = [0usize; MAX_BIDI_STREAMS];
+    let mut bidi_stream_fin_emitted = [false; MAX_BIDI_STREAMS];
+    let mut had_bidi_reset = [false; MAX_BIDI_STREAMS];
+    let mut had_bidi_stop = [false; MAX_BIDI_STREAMS];
+    let mut had_bidi_max_stream_data = [false; MAX_BIDI_STREAMS];
+    let mut had_uni_max_stream_data = [false; MAX_UNI_STREAMS];
     let mut had_max_streams = false;
-    let mut extra_stream_fin_emitted = [false; MAX_EXTRA_STREAMS];
-    let mut had_bidi_stream = [false; MAX_BIDI_EXTRA_STREAMS];
-    let mut bidi_stream_buf_len = [0usize; MAX_BIDI_EXTRA_STREAMS];
-    let mut bidi_stream_fin_emitted = [false; MAX_BIDI_EXTRA_STREAMS];
+    let mut had_max_streams_uni = false;
+    let mut had_max_data = false;
+    let mut had_data_blocked = false;
+    let mut had_streams_blocked_bidi = false;
+    let mut had_streams_blocked_uni = false;
     if matches!(level, EncLevel::OneRtt) && !ack_only_mode {
         let conn = &s.conns[idx];
-        // MAX_STREAMS credit first: it is small, and a peer blocked on stream
-        // count cannot make progress until it lands.
+        // Credit frames first: they are small, and a peer blocked on
+        // stream count or window cannot make progress until they land.
         if conn.max_streams_tx_pending {
             let mut frame_buf = [0u8; 16];
             let n = build_max_streams_bidi(conn.max_streams_bidi_granted, &mut frame_buf);
@@ -3240,7 +3475,54 @@ unsafe fn emit_crypto_packet(
                 had_max_streams = true;
             }
         }
-        if conn.stream_send_buf_len > 0 || conn.stream_send_fin {
+        if conn.max_streams_uni_tx_pending {
+            let mut frame_buf = [0u8; 16];
+            let n = build_max_streams_uni(conn.max_streams_uni_granted, &mut frame_buf);
+            if n > 0 && payload_len + n <= payload.len() {
+                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                payload_len += n;
+                had_max_streams_uni = true;
+            }
+        }
+        if conn.max_data_tx_pending {
+            let mut frame_buf = [0u8; 16];
+            let n = build_max_data(conn.recv_max_data, &mut frame_buf);
+            if n > 0 && payload_len + n <= payload.len() {
+                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                payload_len += n;
+                had_max_data = true;
+            }
+        }
+        // Blocked signalling: tell the peer we wanted to write or open
+        // and could not, so a stall has a cause on both sides.
+        if conn.data_blocked_pending {
+            let mut frame_buf = [0u8; 16];
+            let n = build_data_blocked(conn.send_max_data, &mut frame_buf);
+            if n > 0 && payload_len + n <= payload.len() {
+                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                payload_len += n;
+                had_data_blocked = true;
+            }
+        }
+        if conn.streams_blocked_bidi_pending {
+            let mut frame_buf = [0u8; 16];
+            let n = build_streams_blocked(true, conn.peer_max_streams_bidi, &mut frame_buf);
+            if n > 0 && payload_len + n <= payload.len() {
+                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                payload_len += n;
+                had_streams_blocked_bidi = true;
+            }
+        }
+        if conn.streams_blocked_uni_pending {
+            let mut frame_buf = [0u8; 16];
+            let n = build_streams_blocked(false, conn.peer_max_streams_uni, &mut frame_buf);
+            if n > 0 && payload_len + n <= payload.len() {
+                payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                payload_len += n;
+                had_streams_blocked_uni = true;
+            }
+        }
+        if !conn.framed_app_surface && (conn.stream_send_buf_len > 0 || conn.stream_send_fin) {
             let mut frame_buf = [0u8; QUIC_DGRAM_MAX];
             let n = build_stream(
                 0,
@@ -3257,68 +3539,145 @@ unsafe fn emit_crypto_packet(
                 main_stream_fin_emitted = conn.stream_send_fin;
             }
         }
-        // Extra streams (h3 control + qpack-enc + qpack-dec). One
-        // STREAM frame per slot; multiple may be packed into the same
-        // QUIC packet.
-        let mut k = 0;
-        while k < MAX_EXTRA_STREAMS {
-            let slot = &conn.extra_streams[k];
-            if slot.allocated && slot.locally_initiated
-                && (slot.send_buf_len > 0
-                    || (slot.send_fin_pending && !slot.send_fin_emitted))
-            {
-                let stream_id = slot.stream_id;
-                let send_off = slot.send_off;
-                let fin = slot.send_fin_pending;
-                let buf_len = slot.send_buf_len;
-                let mut frame_buf = [0u8; 384];
-                let n = build_stream(
-                    stream_id,
-                    send_off,
-                    fin,
-                    &slot.send_buf[..buf_len],
-                    &mut frame_buf,
+        // Bidirectional pool slots, round-robin from the cursor.
+        let mut step = 0;
+        while step < MAX_BIDI_STREAMS {
+            let k = (conn.tx_cursor_bidi as usize + step) % MAX_BIDI_STREAMS;
+            step += 1;
+            let slot = &conn.bidi_streams[k];
+            if !slot.allocated {
+                continue;
+            }
+            // An abrupt reset supersedes any queued bytes: those bytes
+            // were discarded when the application asked for the reset.
+            if slot.abort.reset_pending && !slot.abort.reset_emitted {
+                let mut fb = [0u8; 32];
+                let n = build_reset_stream(
+                    slot.stream_id,
+                    slot.abort.reset_error,
+                    slot.send_off,
+                    &mut fb,
                 );
                 if n > 0 && payload_len + n <= payload.len() {
-                    payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
                     payload_len += n;
-                    had_extra_stream[k] = true;
-                    extra_stream_buf_len[k] = buf_len;
-                    extra_stream_fin_emitted[k] = fin;
+                    had_bidi_reset[k] = true;
+                }
+                continue;
+            }
+            if slot.abort.stop_pending && !slot.abort.stop_emitted {
+                let mut fb = [0u8; 32];
+                let n = build_stop_sending(slot.stream_id, slot.abort.stop_error, &mut fb);
+                if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+                    payload_len += n;
+                    had_bidi_stop[k] = true;
                 }
             }
-            k += 1;
-        }
-        // Bidi extra streams (additional concurrent request streams).
-        // One STREAM frame per occupied slot per packet.
-        let mut k = 0;
-        while k < MAX_BIDI_EXTRA_STREAMS {
-            let slot = &conn.bidi_extra_streams[k];
-            if slot.allocated
-                && (slot.send_buf_len > 0
-                    || (slot.send_fin_pending && !slot.send_fin_emitted))
-            {
-                let stream_id = slot.stream_id;
-                let send_off = slot.send_off;
-                let fin = slot.send_fin_pending;
-                let buf_len = slot.send_buf_len;
+            if slot.flow.recv_max_data_tx_pending {
+                let mut fb = [0u8; 24];
+                let n = build_max_stream_data(slot.stream_id, slot.flow.recv_max_data, &mut fb);
+                if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+                    payload_len += n;
+                    had_bidi_max_stream_data[k] = true;
+                }
+            }
+            if slot.flow.send_blocked_pending {
+                let mut fb = [0u8; 24];
+                let n =
+                    build_stream_data_blocked(slot.stream_id, slot.flow.send_max_data, &mut fb);
+                if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+                    payload_len += n;
+                }
+            }
+            if slot.send_buf_len > 0 || (slot.send_fin_pending && !slot.send_fin_emitted) {
                 let mut frame_buf = [0u8; QUIC_DGRAM_MAX];
                 let n = build_stream(
-                    stream_id,
-                    send_off,
-                    fin,
-                    &slot.send_buf[..buf_len],
+                    slot.stream_id,
+                    slot.send_off,
+                    slot.send_fin_pending,
+                    &slot.send_buf[..slot.send_buf_len],
                     &mut frame_buf,
                 );
                 if n > 0 && payload_len + n <= payload.len() {
                     payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
                     payload_len += n;
                     had_bidi_stream[k] = true;
-                    bidi_stream_buf_len[k] = buf_len;
-                    bidi_stream_fin_emitted[k] = fin;
+                    bidi_stream_buf_len[k] = slot.send_buf_len;
+                    bidi_stream_fin_emitted[k] = slot.send_fin_pending;
                 }
             }
-            k += 1;
+        }
+        // Unidirectional pool slots, likewise round-robin.
+        let mut step = 0;
+        while step < MAX_UNI_STREAMS {
+            let k = (conn.tx_cursor_uni as usize + step) % MAX_UNI_STREAMS;
+            step += 1;
+            let slot = &conn.uni_streams[k];
+            if !slot.allocated {
+                continue;
+            }
+            if slot.locally_initiated
+                && slot.abort.reset_pending
+                && !slot.abort.reset_emitted
+            {
+                let mut fb = [0u8; 32];
+                let n = build_reset_stream(
+                    slot.stream_id,
+                    slot.abort.reset_error,
+                    slot.send_off,
+                    &mut fb,
+                );
+                if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+                    payload_len += n;
+                    had_uni_reset[k] = true;
+                }
+                continue;
+            }
+            if !slot.locally_initiated
+                && slot.abort.stop_pending
+                && !slot.abort.stop_emitted
+            {
+                let mut fb = [0u8; 32];
+                let n = build_stop_sending(slot.stream_id, slot.abort.stop_error, &mut fb);
+                if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+                    payload_len += n;
+                    had_uni_stop[k] = true;
+                }
+            }
+            if !slot.locally_initiated && slot.flow.recv_max_data_tx_pending {
+                let mut fb = [0u8; 24];
+                let n = build_max_stream_data(slot.stream_id, slot.flow.recv_max_data, &mut fb);
+                if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
+                    payload_len += n;
+                    had_uni_max_stream_data[k] = true;
+                }
+            }
+            if slot.locally_initiated
+                && (slot.send_buf_len > 0
+                    || (slot.send_fin_pending && !slot.send_fin_emitted))
+            {
+                let mut frame_buf = [0u8; 384];
+                let n = build_stream(
+                    slot.stream_id,
+                    slot.send_off,
+                    slot.send_fin_pending,
+                    &slot.send_buf[..slot.send_buf_len],
+                    &mut frame_buf,
+                );
+                if n > 0 && payload_len + n <= payload.len() {
+                    payload[payload_len..payload_len + n].copy_from_slice(&frame_buf[..n]);
+                    payload_len += n;
+                    had_uni_stream[k] = true;
+                    uni_stream_buf_len[k] = slot.send_buf_len;
+                    uni_stream_fin_emitted[k] = slot.send_fin_pending;
+                }
+            }
         }
     }
 
@@ -3512,6 +3871,21 @@ unsafe fn emit_crypto_packet(
         if had_max_streams {
             conn.max_streams_tx_pending = false;
         }
+        if had_max_streams_uni {
+            conn.max_streams_uni_tx_pending = false;
+        }
+        if had_max_data {
+            conn.max_data_tx_pending = false;
+        }
+        if had_data_blocked {
+            conn.data_blocked_pending = false;
+        }
+        if had_streams_blocked_bidi {
+            conn.streams_blocked_bidi_pending = false;
+        }
+        if had_streams_blocked_uni {
+            conn.streams_blocked_uni_pending = false;
+        }
         if had_new_cid {
             conn.new_cid_tx_pending = false;
         }
@@ -3523,22 +3897,48 @@ unsafe fn emit_crypto_packet(
             }
         }
         let mut k = 0;
-        while k < MAX_EXTRA_STREAMS {
-            if had_extra_stream[k] {
-                let slot = &mut conn.extra_streams[k];
-                slot.send_off += extra_stream_buf_len[k] as u64;
+        while k < MAX_UNI_STREAMS {
+            if had_uni_reset[k] {
+                conn.uni_streams[k].abort.reset_emitted = true;
+                conn.uni_streams[k].abort.reset_pending = false;
+            }
+            if had_uni_stop[k] {
+                conn.uni_streams[k].abort.stop_emitted = true;
+                conn.uni_streams[k].abort.stop_pending = false;
+            }
+            if had_uni_max_stream_data[k] {
+                conn.uni_streams[k].flow.recv_max_data_tx_pending = false;
+            }
+            if had_uni_stream[k] {
+                let slot = &mut conn.uni_streams[k];
+                slot.send_off += uni_stream_buf_len[k] as u64;
                 slot.send_buf_len = 0;
-                if extra_stream_fin_emitted[k] {
+                if uni_stream_fin_emitted[k] {
                     slot.send_fin_emitted = true;
                     slot.send_fin_pending = false;
                 }
             }
             k += 1;
         }
+        // Advance the round-robin cursors past whatever was served, so
+        // the next packet starts with a different slot.
+        conn.tx_cursor_uni = conn.tx_cursor_uni.wrapping_add(1) % MAX_UNI_STREAMS as u8;
+        conn.tx_cursor_bidi = conn.tx_cursor_bidi.wrapping_add(1) % MAX_BIDI_STREAMS as u8;
         let mut k = 0;
-        while k < MAX_BIDI_EXTRA_STREAMS {
+        while k < MAX_BIDI_STREAMS {
+            if had_bidi_reset[k] {
+                conn.bidi_streams[k].abort.reset_emitted = true;
+                conn.bidi_streams[k].abort.reset_pending = false;
+            }
+            if had_bidi_stop[k] {
+                conn.bidi_streams[k].abort.stop_emitted = true;
+                conn.bidi_streams[k].abort.stop_pending = false;
+            }
+            if had_bidi_max_stream_data[k] {
+                conn.bidi_streams[k].flow.recv_max_data_tx_pending = false;
+            }
             if had_bidi_stream[k] {
-                let slot = &mut conn.bidi_extra_streams[k];
+                let slot = &mut conn.bidi_streams[k];
                 slot.send_off += bidi_stream_buf_len[k] as u64;
                 slot.send_buf_len = 0;
                 if bidi_stream_fin_emitted[k] {
@@ -3571,21 +3971,29 @@ unsafe fn emit_crypto_packet(
     // the local `had_*` flags so the post-mutation state (which has
     // already cleared `pending_handshake_done` / zeroed buf_len)
     // doesn't make us under-count bytes-in-flight.
-    let mut had_extra_or_bidi = false;
+    let mut had_pool_frame = false;
     {
         let mut k = 0;
-        while k < MAX_EXTRA_STREAMS {
-            if had_extra_stream[k] {
-                had_extra_or_bidi = true;
+        while k < MAX_UNI_STREAMS {
+            if had_uni_stream[k]
+                || had_uni_reset[k]
+                || had_uni_stop[k]
+                || had_uni_max_stream_data[k]
+            {
+                had_pool_frame = true;
                 break;
             }
             k += 1;
         }
-        if !had_extra_or_bidi {
+        if !had_pool_frame {
             let mut k = 0;
-            while k < MAX_BIDI_EXTRA_STREAMS {
-                if had_bidi_stream[k] {
-                    had_extra_or_bidi = true;
+            while k < MAX_BIDI_STREAMS {
+                if had_bidi_stream[k]
+                    || had_bidi_reset[k]
+                    || had_bidi_stop[k]
+                    || had_bidi_max_stream_data[k]
+                {
+                    had_pool_frame = true;
                     break;
                 }
                 k += 1;
@@ -3595,7 +4003,13 @@ unsafe fn emit_crypto_packet(
     let ack_eliciting = crypto_packed > 0
         || had_handshake_done
         || had_main_stream
-        || had_extra_or_bidi
+        || had_pool_frame
+        || had_max_streams
+        || had_max_streams_uni
+        || had_max_data
+        || had_data_blocked
+        || had_streams_blocked_bidi
+        || had_streams_blocked_uni
         || had_datagram
         || had_new_cid;
     let conn = &mut s.conns[idx];

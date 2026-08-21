@@ -103,7 +103,15 @@ struct EchoState {
     role: u8,
     /// 1 once the driver has a stream id from the transport.
     have_stream: u8,
-    _pad: [u8; 2],
+    /// 1 once MSG_MUX_SESSION_OPENED has told us which session exists.
+    ///
+    /// The fixture waits for it rather than assuming session 0. Assuming
+    /// is what the contract forbids, and a self-test that assumed would
+    /// keep passing after the transport stopped announcing sessions at
+    /// all — which is the failure most likely to matter to a real
+    /// application.
+    have_session: u8,
+    _pad: [u8; 1],
     session_id: u32,
     stream_id: u32,
     ticks: u32,
@@ -149,6 +157,7 @@ pub extern "C" fn module_new(
         s.echoed = 0;
         s.verified = 0;
         s.have_stream = 0;
+        s.have_session = 0;
         s.session_id = 0;
         s.stream_id = 0;
         s.ticks = 0;
@@ -213,15 +222,69 @@ unsafe fn handle_frames(s: &mut EchoState, len: usize) {
         if body + plen > len {
             return; // partial trailing frame — wait for the rest
         }
-        if s.role == ROLE_DRIVE {
+        if t == mux::MSG_MUX_SESSION_OPENED && plen >= mux::SESSION_OPENED_BODY_MIN + 1 {
+            latch_session(s, body, plen);
+        } else if s.role == ROLE_DRIVE {
             driver_frame(s, t, body, plen);
-        } else if (t == mux::MSG_MUX_STREAM_ACCEPTED || t == mux::MSG_MUX_STREAM_RX)
-            && plen >= mux::STREAM_DATA_PREFIX
-        {
+        } else if t == mux::MSG_MUX_STREAM_RX && plen >= mux::STREAM_DATA_PREFIX {
+            // ONLY on stream bytes. An accepted-stream event shares the
+            // `[session][stream]` prefix but its remaining bytes are the
+            // event's own fields — direction flags and the transport
+            // stream id — not stream content. Echoing those back put a
+            // spurious prefix on the wire ahead of the real reply, which
+            // the peer then read as part of the message.
+            ack_bytes(s, body, plen - mux::STREAM_DATA_PREFIX);
             echo_stream(s, body, plen);
         }
         off = body + plen;
     }
+}
+
+/// Record which session the transport announced, and its ALPN.
+///
+/// `[session_id u32][status][flags][alpn_len][alpn]`.
+unsafe fn latch_session(s: &mut EchoState, body: usize, _plen: usize) {
+    let sys = &*s.syscalls;
+    if s.buf[body + mux::SESSION_ID_BYTES] != mux::STATUS_OK {
+        return;
+    }
+    s.session_id = u32::from_le_bytes([
+        s.buf[body],
+        s.buf[body + 1],
+        s.buf[body + 2],
+        s.buf[body + 3],
+    ]);
+    s.have_session = 1;
+    dev_log(sys, 3, b"[mux_echo] session up".as_ptr(), 21);
+}
+
+/// Return per-stream flow-control credit for bytes this fixture has
+/// consumed.
+///
+/// The transport advances MAX_STREAM_DATA and MAX_DATA from these
+/// acknowledgements and from nothing else. That is the correct division —
+/// it cannot know the application has drained its buffer — but it means a
+/// consumer that never acknowledges eventually stalls the peer. This
+/// fixture acknowledges so the credit path is exercised rather than
+/// merely present.
+unsafe fn ack_bytes(s: &mut EchoState, body: usize, data_len: usize) {
+    let sys = &*s.syscalls;
+    if s.mux_out < 0 || data_len == 0 {
+        return;
+    }
+    let plen = mux::STREAM_DATA_PREFIX + 4;
+    let mut f = [0u8; mux::FRAME_HDR + mux::STREAM_DATA_PREFIX + 4];
+    f[0] = mux::CMD_MUX_STREAM_ACK;
+    f[1] = plen as u8;
+    f[2] = 0;
+    core::ptr::copy_nonoverlapping(
+        s.buf.as_ptr().add(body),
+        f.as_mut_ptr().add(mux::FRAME_HDR),
+        mux::STREAM_DATA_PREFIX,
+    );
+    let n = (data_len as u32).to_le_bytes();
+    f[mux::FRAME_HDR + mux::STREAM_DATA_PREFIX..].copy_from_slice(&n);
+    let _ = (sys.channel_write)(s.mux_out, f.as_ptr(), f.len());
 }
 
 /// Send the payload back on the stream it arrived on, then close that stream.
@@ -295,7 +358,7 @@ unsafe fn echo_stream(s: &mut EchoState, body: usize, plen: usize) {
 /// would report a transport failure that is really its own impatience.
 unsafe fn drive(s: &mut EchoState) {
     s.ticks = s.ticks.wrapping_add(1);
-    if s.have_stream != 0 || s.mux_out < 0 {
+    if s.have_stream != 0 || s.have_session == 0 || s.mux_out < 0 {
         return;
     }
     if s.ticks % DRIVE_RETRY_TICKS != 1 {
@@ -307,7 +370,9 @@ unsafe fn drive(s: &mut EchoState) {
     f[0] = mux::CMD_MUX_STREAM_OPEN;
     f[1] = plen as u8;
     f[2] = 0;
-    // Session 0: the client instance holds exactly one connection.
+    // The session the transport announced — not an assumed 0.
+    f[mux::FRAME_HDR..mux::FRAME_HDR + mux::SESSION_ID_BYTES]
+        .copy_from_slice(&s.session_id.to_le_bytes());
     f[mux::FRAME_HDR + mux::SESSION_ID_BYTES] = mux::STREAM_FLAG_BIDI;
     let _ = (sys.channel_write)(s.mux_out, f.as_ptr(), f.len());
 }
@@ -315,7 +380,16 @@ unsafe fn drive(s: &mut EchoState) {
 /// Handle a frame in driver role: latch the stream id, then check the echo.
 unsafe fn driver_frame(s: &mut EchoState, t: u8, body: usize, plen: usize) {
     let sys = &*s.syscalls;
-    if t == mux::MSG_MUX_STREAM_OPENED && plen >= mux::STREAM_DATA_PREFIX {
+    if t == mux::MSG_MUX_STREAM_OPENED
+        && plen >= mux::STREAM_DATA_PREFIX + mux::STREAM_OPENED_BODY
+    {
+        // A refused open is answered too, with STATUS_NO_CAPACITY and no
+        // usable handle. Treating that as success would write the probe
+        // onto a stream that does not exist and then wait forever for a
+        // reply, which reads as a transport fault rather than a full pool.
+        if s.buf[body + mux::STREAM_DATA_PREFIX] != mux::STATUS_OK {
+            return;
+        }
         s.session_id = u32::from_le_bytes([
             s.buf[body],
             s.buf[body + 1],
@@ -347,6 +421,23 @@ unsafe fn driver_frame(s: &mut EchoState, t: u8, body: usize, plen: usize) {
             PROBE.len(),
         );
         let _ = (sys.channel_write)(s.mux_out, f.as_ptr(), mux::FRAME_HDR + payload);
+
+        // End our send half immediately: the probe is the whole of what
+        // this side has to say. Without the FIN the stream never
+        // finishes, so its slot is never reclaimed — and since the pool
+        // is fixed, the driver stops being able to open streams after a
+        // few round trips. That reads as the transport wedging, when it
+        // is the application holding every stream open.
+        let mut fin = [0u8; mux::FRAME_HDR + mux::STREAM_DATA_PREFIX];
+        fin[0] = mux::CMD_MUX_STREAM_CLOSE;
+        fin[1] = mux::STREAM_DATA_PREFIX as u8;
+        fin[2] = 0;
+        core::ptr::copy_nonoverlapping(
+            s.buf.as_ptr().add(body),
+            fin.as_mut_ptr().add(mux::FRAME_HDR),
+            mux::STREAM_DATA_PREFIX,
+        );
+        let _ = (sys.channel_write)(s.mux_out, fin.as_ptr(), fin.len());
         return;
     }
 
@@ -368,6 +459,7 @@ unsafe fn driver_frame(s: &mut EchoState, t: u8, body: usize, plen: usize) {
         dev_log(sys, 1, b"[mux_echo] WRONG STREAM".as_ptr(), 23);
         return;
     }
+    ack_bytes(s, body, plen - mux::STREAM_DATA_PREFIX);
     let at = body + mux::STREAM_DATA_PREFIX;
     let mut i = 0usize;
     while i < PROBE.len() {

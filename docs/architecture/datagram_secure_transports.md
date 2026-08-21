@@ -31,8 +31,7 @@ modules/
 │       ├── wire.rs           # Packet build + protection application
 │       ├── keys.rs           # Initial keys, AEAD schedule, header protection
 │       ├── frame.rs          # Frame parsers/builders
-│       ├── ack.rs            # Sliding ACK range tracker
-│       └── h3.rs             # HTTP/3 connection preamble only
+│       └── ack.rs            # Sliding ACK range tracker
 └── sdk/
     ├── wire/varint.rs        # RFC 9000 §16 varints
     ├── cores/datagram_endpoint.rs  # Shared bind/send/recv datagram core
@@ -186,20 +185,26 @@ graph runs a server and a client instance in one process against
 
 ## The HTTP/3 boundary
 
-Source: `modules/foundation/quic/h3.rs`.
+No HTTP/3 lives in this transport. It carries QUIC — sessions,
+streams, ordered bytes, FIN, reset, stop-sending, flow-control credit,
+datagrams — and projects all of it through the protocol-neutral mux
+contract on `app_in` / `app_out`.
 
-Only the HTTP/3 connection preamble lives in the transport: the
-control and QPACK unidirectional stream types and the codecs for the
-connection-scoped frames the transport itself must exchange before any
-request exists (SETTINGS, GOAWAY, PRIORITY_UPDATE; RFC 9114,
-RFC 9218). The request layer (QPACK header compression,
-method/path dispatch, response generation, and
-WebSocket-over-HTTP/3 extended CONNECT, RFC 9220) belongs to
-whatever consumes the mux surface on `app_in` / `app_out`; the wave
-sibling's `http` module implements it. Fluxor's contribution to the
-RFC 9220 path is the sideband that advertises extended-CONNECT
-support: the `PEER_SETTINGS_FLAG_ENABLE_CONNECT` bit of
-`MSG_MUX_PEER_SETTINGS` in `modules/sdk/contracts/net/mux.rs`.
+That includes the HTTP/3 connection preamble. A QUIC unidirectional
+stream is transport; the meaning of the first application byte on that
+stream is not. The control and QPACK streams are opened by the
+application, their stream-type prefixes and SETTINGS are written by the
+application, and every byte a peer sends on a unidirectional stream
+reaches the application unmodified — the leading type varint included.
+The transport does not read it, classify it, or discard it.
+
+The negotiated ALPN crosses as opaque bytes on
+`MSG_MUX_SESSION_OPENED`. This module performs the negotiation and
+never compares the result against a token; selecting HTTP/3 because of
+it is the consumer's decision. The wave sibling's `http` module is that
+consumer, and owns SETTINGS, GOAWAY, QPACK, priority, push policy,
+request and response semantics, and WebSocket-over-HTTP/3 extended
+CONNECT (RFC 9220) entirely.
 
 A hosted h3 graph wires:
 

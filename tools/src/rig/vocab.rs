@@ -79,6 +79,16 @@ impl Surface {
                 // the protocols — Wave ships `observe-proto_load` — because a
                 // backend is just an executable on the discovery path.
                 "observe.proto_load",
+                // The TRANSPORT probe, as distinct from `proto_load`'s
+                // protocol probes. Every protocol arrives through a stack
+                // that includes somebody else's module, so when a protocol
+                // scenario fails its output cannot say whether the fault is
+                // in the transport or above it. This one carries no
+                // protocol at all — it drives QUIC streams against a
+                // `mux_echo` and asserts only what a transport owes its
+                // application. Fluxor ships `observe-quic_mux`, because
+                // Fluxor owns the transport.
+                "observe.quic_mux",
             ],
             Self::Rig => &["rig.claim", "rig.release", "rig.lock"],
         }

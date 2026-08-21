@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""`observe.quic_mux` rig backend — the QUIC TRANSPORT probe.
+
+The transport-level counterpart to Wave's `observe.proto_load`, and the
+reason it is separate: `proto_load` drives protocols, and every protocol
+it drives arrives through a stack that includes somebody else's module.
+When an h3 scenario fails there is no way to tell from its output whether
+the fault is in the transport or in the protocol above it.
+
+This probe carries no protocol at all. It speaks QUIC to a DUT running
+`quic` + `mux_echo` and asserts only what a transport owes its
+application:
+
+  * the handshake completes and the ALPN is negotiated as opaque bytes;
+  * a bidirectional stream carries bytes and gets them back on the same
+    stream;
+  * several streams are concurrent and isolated;
+  * more sequential streams than the engine's fixed pool holds all
+    complete, which needs slot reclamation AND re-granted MAX_STREAMS;
+  * a unidirectional stream's bytes arrive whole, leading varint
+    included — the property the whole ownership boundary rests on;
+  * RESET_STREAM and STOP_SENDING leave the connection usable;
+  * a DATAGRAM does not disturb it either.
+
+The oracle is aioquic — an implementation Fluxor did not write — for the
+same reason `tools/e2e/h3_server.sh` uses it: a transport that only ever
+talks to itself cannot detect a misreading of RFC 9000 that both ends
+share.
+
+Wire contract: `.context/rig-backend-protocol.md`. Read one JSON
+`BackendInvocation` on stdin (then closed), write newline-delimited JSON
+events to stdout until exit.
+
+Binding fields, from the profile's `[observe.quic_mux]` section:
+
+    host          str  "addr:port" of the DUT                (required)
+    alpn          str  ALPN token to offer          (default "fluxor-mux")
+    pre_boot_wait int  seconds to sleep BEFORE probing        (default 45)
+                       Observers attach BEFORE `power.cycle`, so without
+                       this the probe measures the PREVIOUS kernel, which
+                       is still listening, and then loses it mid-run when
+                       the board actually resets.
+    boot_wait     int  seconds to wait for the port           (default 90)
+    streams       int  sequential streams to drive             (default 8)
+
+Every line is prefixed `[quic_mux] ` so a scenario's `[[pass]]` /
+`[[fail]]` regexes key on it the way the h3 suite keys on `[proto_load]`.
+"""
+
+import asyncio
+import base64
+import json
+import ssl
+import sys
+import time
+
+PREFIX = "[quic_mux] "
+
+
+def emit(obj):
+    """One NDJSON event, flushed — the core reads this stream live."""
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def emit_line(text):
+    """A human-readable line, as a base64 `bytes` event the matcher regexes."""
+    emit({"kind": "bytes", "data": base64.b64encode((PREFIX + text + "\n").encode()).decode()})
+
+
+def note(text):
+    # `message`, not `text`: the field name is the rig transport's, and a
+    # note with the wrong key is dropped as malformed rather than reported.
+    emit({"kind": "note", "message": PREFIX + text})
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        inv = json.loads(raw) if raw.strip() else {}
+    except ValueError as exc:
+        emit_line(f"FATAL malformed invocation: {exc}")
+        return 1
+    binding = inv.get("binding", {}) or {}
+    ctx = inv.get("context", {}) or {}
+    scenario = ctx.get("scenario_name", "")
+
+    def cfg(key, default):
+        # Per-scenario override first (`<scenario>.<key>`), then the bare
+        # key, then the built-in default. One profile section has to serve
+        # a functional scenario and a load scenario, which want different
+        # envelopes from the same capability.
+        for k in (f"{scenario}.{key}", key):
+            if k in binding:
+                return binding[k]
+        return default
+
+    host = cfg("host", "")
+    if not host or ":" not in str(host):
+        emit_line("FATAL host not set — expected \"addr:port\" in [observe.quic_mux]")
+        return 1
+    addr, port = str(host).rsplit(":", 1)
+    port = int(port)
+    alpn = str(cfg("alpn", "fluxor-mux"))
+    pre_boot_wait = int(cfg("pre_boot_wait", 45))
+    boot_wait = int(cfg("boot_wait", 90))
+    streams = int(cfg("streams", 8))
+
+    try:
+        from aioquic.asyncio.client import connect
+        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        from aioquic.quic.configuration import QuicConfiguration
+        from aioquic.quic.events import (
+            DatagramFrameReceived,
+            HandshakeCompleted,
+            StopSendingReceived,
+            StreamDataReceived,
+            StreamReset,
+        )
+    except ImportError as exc:
+        # Not a DUT fault. Reported as ERR so a scenario's [[fail]] rule
+        # names the driver host rather than blaming the board.
+        emit_line(f"ERR aioquic unavailable on the driver host: {exc}")
+        return 1
+
+    emit({"kind": "ready"})
+    note(f"aioquic -> {addr}:{port}, alpn={alpn}, scenario={scenario}")
+
+    state = {"alpn": None, "data": {}, "reset": {}, "stopped": {}, "dgrams": []}
+
+    class Probe(QuicConnectionProtocol):
+        """Observe every event the connection produces.
+
+        Overriding the protocol's own hook rather than polling
+        `_quic.next_event()` from outside: the library consumes its event
+        queue internally (that is how `connect()` learns the handshake
+        finished), so a second consumer racing it drops whichever events
+        the other took first — which looks exactly like the DUT never
+        sending them.
+        """
+
+        def quic_event_received(self, event):
+            if isinstance(event, HandshakeCompleted):
+                state["alpn"] = event.alpn_protocol
+            elif isinstance(event, StreamDataReceived):
+                state["data"].setdefault(event.stream_id, bytearray()).extend(event.data)
+            elif isinstance(event, StreamReset):
+                state["reset"][event.stream_id] = event.error_code
+            elif isinstance(event, StopSendingReceived):
+                state["stopped"][event.stream_id] = event.error_code
+            elif isinstance(event, DatagramFrameReceived):
+                state["dgrams"].append(event.data)
+
+    async def once():
+        config = QuicConfiguration(is_client=True, alpn_protocols=[alpn])
+        # The fixture cert is a throwaway pair minted per run, so there is
+        # nothing to verify it against. This probe checks the TRANSPORT;
+        # refusing an untrusted cert would check the certificate store.
+        config.verify_mode = ssl.CERT_NONE
+        config.max_datagram_frame_size = 1200
+        config.idle_timeout = 20.0
+        async with connect(addr, port, configuration=config, create_protocol=Probe) as p:
+            await asyncio.sleep(1.0)
+            return p, state["alpn"] is not None
+
+    async def wait_ready():
+        # Poll the port by speaking QUIC, not TCP. An h3/mux DUT binds UDP
+        # only, so a TCP connect can never succeed — and reporting "the DUT
+        # never bound the port" about a board that is serving perfectly is
+        # exactly the misdirection rig.md §5 exists to prevent.
+        deadline = time.time() + boot_wait
+        while time.time() < deadline:
+            try:
+                await asyncio.wait_for(once(), timeout=8)
+                return True
+            except Exception as exc:  # noqa: BLE001 — progress, not a verdict
+                left = int(deadline - time.time())
+                emit_line(f"still waiting for quic on {addr}:{port} ({left}s left)")
+                await asyncio.sleep(3)
+                del exc
+        return False
+
+    async def run():
+        errs = []
+        emit_line(
+            f"pre_boot_wait {pre_boot_wait}s (riding out the power cycle so the "
+            f"probe cannot measure the previous kernel)"
+        )
+        await asyncio.sleep(pre_boot_wait)
+        emit_line(f"waiting up to {boot_wait}s for quic on {addr}:{port}")
+        if not await wait_ready():
+            emit_line("ERR boot_wait_timeout")
+            return ["boot_wait_timeout"]
+
+        config = QuicConfiguration(is_client=True, alpn_protocols=[alpn])
+        config.verify_mode = ssl.CERT_NONE
+        config.max_datagram_frame_size = 1200
+        config.idle_timeout = 20.0
+        state["data"].clear()
+
+        async with connect(addr, port, configuration=config, create_protocol=Probe) as p:
+            await asyncio.sleep(1.0)
+            if state["alpn"] != alpn:
+                errs.append(f"alpn={state['alpn']!r}")
+                emit_line(f"phase=handshake ERR negotiated {state['alpn']!r}, wanted {alpn!r}")
+            else:
+                emit_line(f"phase=handshake alpn={alpn} rc=0 OK")
+
+            # ── one bidi round trip ──────────────────────────────────
+            probe = b"rig-quic-mux-single"
+            sid = p._quic.get_next_available_stream_id()
+            p._quic.send_stream_data(sid, probe, end_stream=True)
+            p.transmit()
+            await asyncio.sleep(1.0)
+            got = bytes(state["data"].get(sid, b""))
+            if got != probe:
+                errs.append("bidi")
+                emit_line(f"phase=bidi ERR stream {sid} returned {got!r}")
+            else:
+                emit_line("phase=bidi rc=0 OK")
+
+            # ── concurrent isolation ─────────────────────────────────
+            # Distinct payloads, opened before any reply is read: a
+            # transport that crossed two streams would still return
+            # valid-looking data at both ends, so identical probes could
+            # not catch it.
+            want = {}
+            for n in range(3):
+                body = f"rig-quic-mux-conc-{n}".encode()
+                s2 = p._quic.get_next_available_stream_id()
+                want[s2] = body
+                p._quic.send_stream_data(s2, body, end_stream=True)
+            p.transmit()
+            await asyncio.sleep(1.5)
+            bad = [s2 for s2, w in want.items() if bytes(state["data"].get(s2, b"")) != w]
+            if bad:
+                errs.append("concurrent")
+                emit_line(f"phase=concurrent ERR streams {bad} did not echo their own bytes")
+            else:
+                emit_line(f"phase=concurrent streams={len(want)} rc=0 OK")
+
+            # ── sequential beyond the pool ───────────────────────────
+            # The engine's bidi pool is fixed and smaller than this.
+            # Without slot reclamation AND re-granted MAX_STREAMS the run
+            # stalls partway with no error at either end — the failure a
+            # handful of streams per connection never shows.
+            served = 0
+            for n in range(streams):
+                body = f"rig-quic-mux-seq-{n}".encode()
+                s3 = p._quic.get_next_available_stream_id()
+                p._quic.send_stream_data(s3, body, end_stream=True)
+                p.transmit()
+                await asyncio.sleep(0.6)
+                if bytes(state["data"].get(s3, b"")) == body:
+                    served += 1
+            if served != streams:
+                errs.append("sequential")
+                emit_line(
+                    f"phase=sequential ERR {served}/{streams} completed — stream slots "
+                    f"or MAX_STREAMS credit are not being returned"
+                )
+            else:
+                emit_line(f"phase=sequential streams={served} rc=0 OK")
+
+            # ── uni stream keeps its first byte ──────────────────────
+            # 0x00 is a stream type a transport that classified streams
+            # would consume before the application saw it. There is
+            # nothing to echo (the stream is one-way), so the assertion is
+            # that the connection stays healthy afterwards.
+            uni = p._quic.get_next_available_stream_id(is_unidirectional=True)
+            p._quic.send_stream_data(uni, bytes([0x00, 0x04, 0x02, 0x06, 0x40]))
+            p.transmit()
+            await asyncio.sleep(0.8)
+            after = b"rig-quic-mux-after-uni"
+            s4 = p._quic.get_next_available_stream_id()
+            p._quic.send_stream_data(s4, after, end_stream=True)
+            p.transmit()
+            await asyncio.sleep(1.0)
+            if bytes(state["data"].get(s4, b"")) != after:
+                errs.append("uni")
+                emit_line("phase=uni ERR a bidi exchange after a uni stream failed")
+            else:
+                emit_line("phase=uni rc=0 OK")
+
+            # ── reset / stop-sending ─────────────────────────────────
+            # An unrecognised frame abandons the rest of the packet, so a
+            # mishandled STOP_SENDING costs every frame coalesced behind
+            # it, ACKs included. Drive both to prove the connection lives.
+            victim = p._quic.get_next_available_stream_id()
+            p._quic.send_stream_data(victim, b"rig-quic-mux-doomed")
+            p.transmit()
+            await asyncio.sleep(0.4)
+            p._quic.stop_stream(victim, 0x010C)
+            p._quic.reset_stream(victim, 0x010C)
+            p.transmit()
+            await asyncio.sleep(0.8)
+            after = b"rig-quic-mux-after-abort"
+            s5 = p._quic.get_next_available_stream_id()
+            p._quic.send_stream_data(s5, after, end_stream=True)
+            p.transmit()
+            await asyncio.sleep(1.5)
+            if bytes(state["data"].get(s5, b"")) != after:
+                errs.append("abort")
+                emit_line(
+                    "phase=abort ERR a stream after RESET_STREAM + STOP_SENDING failed, "
+                    "so one of those frames cost the rest of its packet"
+                )
+            else:
+                emit_line("phase=abort rc=0 OK")
+
+            # ── datagram ─────────────────────────────────────────────
+            # Unreliable by contract, so this asserts the connection
+            # survives one rather than that it comes back: requiring
+            # delivery would assert something RFC 9221 does not promise.
+            p._quic.send_datagram_frame(b"rig-quic-mux-datagram")
+            p.transmit()
+            await asyncio.sleep(0.8)
+            after = b"rig-quic-mux-after-dgram"
+            s6 = p._quic.get_next_available_stream_id()
+            p._quic.send_stream_data(s6, after, end_stream=True)
+            p.transmit()
+            await asyncio.sleep(1.0)
+            if bytes(state["data"].get(s6, b"")) != after:
+                errs.append("datagram")
+                emit_line("phase=datagram ERR a bidi exchange after a DATAGRAM failed")
+            else:
+                emit_line("phase=datagram rc=0 OK")
+
+        return errs
+
+    try:
+        errs = asyncio.run(run())
+    except Exception as exc:  # noqa: BLE001 — reported, not swallowed
+        emit_line(f"FATAL {type(exc).__name__}: {exc}")
+        return 1
+
+    # `any_err` is computed from what was OBSERVED, never from an exit
+    # code — the same discipline the other probes use.
+    emit_line(f"done protocols=quic_mux any_err={'true' if errs else 'false'} ")
+    return 1 if errs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

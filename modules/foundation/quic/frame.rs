@@ -455,15 +455,83 @@ pub fn build_max_data(maximum_data: u64, out: &mut [u8]) -> usize {
 /// that treats it as a delta grants far less credit than it means to.
 ///
 /// Without this frame a connection is limited forever to the
-/// `initial_max_streams_bidi` transport parameter — 4 here — which for HTTP/3
-/// means four requests per connection for its entire life. Browsers reuse a
-/// connection for dozens.
+/// `initial_max_streams_bidi` transport parameter, however many streams
+/// the application actually needs over the connection's life. The failure
+/// is silent on both sides: the peer simply stops opening streams.
 pub fn build_max_streams_bidi(maximum_streams: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
     if out.is_empty() { return 0; }
     out[pos] = FRAME_MAX_STREAMS_BIDI;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_streams) };
+    if n == 0 { return 0; }
+    pos + n
+}
+
+/// Build a MAX_STREAMS (uni) frame (RFC 9000 §19.11).
+///
+/// The unidirectional twin of [`build_max_streams_bidi`], and needed for
+/// the same reason: without it a peer that opens unidirectional streams
+/// — any control or metadata channel an application runs alongside its
+/// data streams — is capped at `initial_max_streams_uni` for the life of
+/// the connection, and simply stops opening them with no error on either
+/// side.
+pub fn build_max_streams_uni(maximum_streams: u64, out: &mut [u8]) -> usize {
+    let mut pos = 0;
+    if out.is_empty() { return 0; }
+    out[pos] = FRAME_MAX_STREAMS_UNI;
+    pos += 1;
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_streams) };
+    if n == 0 { return 0; }
+    pos + n
+}
+
+/// Build a STREAMS_BLOCKED frame (RFC 9000 §19.14). Tells the peer we
+/// wanted to open a stream and had no credit, so it knows to raise the
+/// limit rather than leaving us stalled silently.
+pub fn build_streams_blocked(bidi: bool, maximum_streams: u64, out: &mut [u8]) -> usize {
+    let mut pos = 0;
+    if out.is_empty() { return 0; }
+    out[pos] = if bidi {
+        FRAME_STREAMS_BLOCKED_BIDI
+    } else {
+        FRAME_STREAMS_BLOCKED_UNI
+    };
+    pos += 1;
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_streams) };
+    if n == 0 { return 0; }
+    pos + n
+}
+
+/// Build a STREAM_DATA_BLOCKED frame (RFC 9000 §19.13). The per-stream
+/// counterpart of DATA_BLOCKED.
+pub fn build_stream_data_blocked(stream_id: u64, maximum: u64, out: &mut [u8]) -> usize {
+    let mut pos = 0;
+    if out.is_empty() { return 0; }
+    out[pos] = FRAME_STREAM_DATA_BLOCKED;
+    pos += 1;
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, stream_id) };
+    if n == 0 { return 0; }
+    pos += n;
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum) };
+    if n == 0 { return 0; }
+    pos + n
+}
+
+/// Build a STOP_SENDING frame (RFC 9000 §19.5).
+///   stream_id (varint) + application_protocol_error_code (varint).
+///
+/// The error code is the APPLICATION's, passed through opaquely: the
+/// transport neither assigns nor interprets it.
+pub fn build_stop_sending(stream_id: u64, error_code: u64, out: &mut [u8]) -> usize {
+    let mut pos = 0;
+    if out.is_empty() { return 0; }
+    out[pos] = FRAME_STOP_SENDING;
+    pos += 1;
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, stream_id) };
+    if n == 0 { return 0; }
+    pos += n;
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, error_code) };
     if n == 0 { return 0; }
     pos + n
 }

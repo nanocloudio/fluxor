@@ -116,17 +116,35 @@ open/close, stream open/accept/close, per-stream send/receive,
 per-stream and per-session error, readiness signalling.
 
 Every stream-scoped message carries `session_id` (u32 LE, the
-transport association) and `stream_id` (u32 LE, per session). Stream
-open takes bidi / unidirectional / urgent flags. Flow-control credit
-messages exist in the contract (`MSG_MUX_STREAM_READY` 0xC6 /
-`CMD_MUX_STREAM_ACK` 0xB5). The peer sideband includes
-`MSG_MUX_PEER_IDENTITY` (0xC8) and `MSG_MUX_PEER_SETTINGS` (0xC9).
+transport association) and `stream_id` (u32 LE, per session). The
+`stream_id` is an OPAQUE LOCAL HANDLE, not the transport's own stream
+identity: data-plane commands address a stream by the handle, and the
+wire id travels as metadata on the opened/accepted event for the
+applications that need it (HTTP/3 names streams by it in GOAWAY and
+PRIORITY_UPDATE). Neither is derivable from the other.
 
-The live consumer is the `quic` module, under a constrained profile
-documented in the contract: `session_id` is the connection index,
-exactly one bidirectional stream (id 0) per session, a bounded
-per-send maximum (`MUX_QUIC_STREAM_SEND_MAX`, 1200 bytes), and the
-credit messages unused.
+Stream open takes bidi / unidirectional / urgent flags; opened and
+accepted events add a generic initiator bit. Flow-control credit is
+carried by `MSG_MUX_STREAM_READY` (0xC6) and `CMD_MUX_STREAM_ACK`
+(0xB5) — the consumer's acknowledgement is what advances the provider's
+receive windows. Abrupt termination is `CMD_MUX_STREAM_RESET` (0xB7) /
+`CMD_MUX_STREAM_STOP_SENDING` (0xB8) outbound and
+`MSG_MUX_STREAM_RESET` (0xCA) / `MSG_MUX_STREAM_STOPPED` (0xCB) inbound,
+each carrying an opaque application error code the provider never
+interprets. Peer identity is `MSG_MUX_PEER_IDENTITY` (0xC8).
+
+The surface is protocol-neutral and complete: the provider implements
+the whole lifecycle for every session it carries, whatever ALPN was
+negotiated. The negotiated ALPN itself crosses as opaque bytes on
+`MSG_MUX_SESSION_OPENED`, so choosing behaviour from it is the
+consumer's decision, not the transport's.
+
+The live consumers are the `quic` module (provider), the `mux_echo`
+fixture, wave's `http` HTTP/3 server and client, and quantum's
+`mqtt_quic_adapter`. `quic` bounds one reliable write at
+`MUX_QUIC_STREAM_SEND_MAX` (1200 bytes) — a transport bound, not a
+profile restriction — and refuses an oversize write rather than
+truncating it.
 
 ### Session Control Sideband
 

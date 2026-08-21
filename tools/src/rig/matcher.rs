@@ -41,6 +41,12 @@ use crate::rig::vocab::{Capability, Surface};
 ///   * `observe.proto_load` (the protocol-agnostic successor: same
 ///     byte-stream path, but the backend chooses the protocol from its
 ///     binding rather than being HTTPS-only)
+///   * `observe.quic_mux` (the TRANSPORT probe: drives QUIC streams
+///     against a `mux_echo` and emits the same NDJSON byte stream, so it
+///     evaluates on the identical path. Distinct from `proto_load`
+///     because it carries no protocol — a failure there could be the
+///     transport or the protocol above it, and this one cannot be the
+///     latter)
 ///   * `observe.udp_capture` (generic UDP-datagram capture transport —
 ///     binds a configured port and streams each datagram as bytes; the
 ///     matcher evaluates regex rules against that per-source byte stream,
@@ -56,6 +62,7 @@ pub fn supports_rule_source(cap: Capability) -> bool {
         || cap.as_str() == "observe.netboot_fetch"
         || cap.as_str() == "observe.https_load"
         || cap.as_str() == "observe.proto_load"
+        || cap.as_str() == "observe.quic_mux"
         || cap.as_str() == "observe.udp_capture"
 }
 

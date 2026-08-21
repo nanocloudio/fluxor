@@ -176,41 +176,161 @@ impl CryptoReassembler {
 }
 
 // ---------------------------------------------------------------------
-// Per-connection stream pools beyond the legacy bidi stream id 0.
+// Per-connection stream pools beyond the main bidirectional stream.
 //
-// `extra_streams` carries the small unidirectional streams HTTP/3
-// uses for control + QPACK encoder/decoder traffic
-// (RFC 9114 §6.2 + RFC 9204 §4.2); `bidi_extra_streams` carries
-// concurrent bidirectional request streams (stream ids 4, 8, … on
-// the client; 5, 9, … on the server).
+// Two fixed-size arrays, split by direction because the two shapes want
+// very different buffers: a unidirectional stream is typically a small
+// one-way control or metadata channel, a bidirectional one carries a
+// request/response-sized flight in each direction. Splitting them keeps
+// the uni pool numerous and narrow without paying bidi buffer sizes for
+// every slot.
+//
+// Both are TRANSPORT structures. Nothing here knows what protocol runs
+// on a stream: a slot carries opaque bytes, its offsets, its FIN and
+// reset state, and the local handle the application addresses it by.
 // ---------------------------------------------------------------------
 
-pub const MAX_EXTRA_STREAMS: usize = 6;
-pub const MAX_BIDI_EXTRA_STREAMS: usize = 2;
+pub const MAX_UNI_STREAMS: usize = 6;
+/// Three concurrent bidirectional streams per connection. Identical
+/// memory to the arrangement this replaced (a dedicated stream-0 buffer
+/// plus a pool of two) — the difference is that all three are now the
+/// same kind of thing, addressed the same way.
+pub const MAX_BIDI_STREAMS: usize = 3;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum H3StreamRole {
-    Unknown,
-    Control,
-    QpackEncoder,
-    QpackDecoder,
-    Push,
-    /// Additional bidi (e.g. concurrent request) — carries h3 frames.
-    BidiRequest,
+/// Per-stream delivery bookkeeping for the mux app surface, shared by
+/// both pool shapes and by the main stream.
+///
+/// Every field here answers "has this event actually been handed to the
+/// application yet", and each latches only on a successful enqueue —
+/// that is what makes a backpressured lifecycle event retryable instead
+/// of lost, and what stops a retried terminal event from re-delivering
+/// bytes that already landed.
+#[derive(Clone, Copy)]
+pub struct AppStreamView {
+    /// Opaque local handle the application addresses this stream by.
+    /// Allocated from the connection's monotonic counter, never derived
+    /// from the QUIC stream id and never recycled while the application
+    /// can still observe it.
+    pub handle: u32,
+    /// MSG_MUX_STREAM_OPENED (locally opened) or MSG_MUX_STREAM_ACCEPTED
+    /// (peer opened) has been delivered.
+    pub open_sent: bool,
+    /// MSG_MUX_STREAM_CLOSED has been delivered.
+    pub close_sent: bool,
+    /// MSG_MUX_STREAM_RESET has been delivered for a peer RESET_STREAM.
+    pub reset_sent: bool,
+    /// MSG_MUX_STREAM_STOPPED has been delivered for a peer STOP_SENDING.
+    pub stopped_sent: bool,
 }
 
+impl AppStreamView {
+    pub const fn empty() -> Self {
+        Self {
+            handle: 0,
+            open_sent: false,
+            close_sent: false,
+            reset_sent: false,
+            stopped_sent: false,
+        }
+    }
+}
+
+/// Abrupt-termination state for one stream half-pair (RFC 9000 §19.4 /
+/// §19.5). Held per slot; entirely opaque application error codes.
 #[derive(Clone, Copy)]
-pub struct ExtraStream {
+pub struct StreamAbort {
+    /// The application asked us to RESET_STREAM; not yet on the wire.
+    pub reset_pending: bool,
+    /// Error code to place in our RESET_STREAM.
+    pub reset_error: u64,
+    /// Our RESET_STREAM has been emitted.
+    pub reset_emitted: bool,
+    /// The application asked us to STOP_SENDING; not yet on the wire.
+    pub stop_pending: bool,
+    /// Error code to place in our STOP_SENDING.
+    pub stop_error: u64,
+    /// Our STOP_SENDING has been emitted.
+    pub stop_emitted: bool,
+    /// The peer RESET_STREAM'd us; receive half is terminal.
+    pub recv_reset: bool,
+    pub recv_reset_error: u64,
+    /// The peer STOP_SENDING'd us; it wants our send half to stop.
+    pub recv_stop: bool,
+    pub recv_stop_error: u64,
+}
+
+impl StreamAbort {
+    pub const fn empty() -> Self {
+        Self {
+            reset_pending: false,
+            reset_error: 0,
+            reset_emitted: false,
+            stop_pending: false,
+            stop_error: 0,
+            stop_emitted: false,
+            recv_reset: false,
+            recv_reset_error: 0,
+            recv_stop: false,
+            recv_stop_error: 0,
+        }
+    }
+}
+
+/// Per-stream flow control (RFC 9000 §4.1). Both directions.
+#[derive(Clone, Copy)]
+pub struct StreamFlow {
+    /// Highest offset the peer has allowed us to write (its
+    /// MAX_STREAM_DATA for this stream).
+    pub send_max_data: u64,
+    /// We hit `send_max_data` and owe the peer a STREAM_DATA_BLOCKED.
+    pub send_blocked_pending: bool,
+    /// Highest offset we have allowed the peer to write.
+    pub recv_max_data: u64,
+    /// Bytes the application has acknowledged consuming on this stream
+    /// (`CMD_MUX_STREAM_ACK`). Drives `recv_max_data` advancement.
+    pub recv_consumed: u64,
+    /// A MAX_STREAM_DATA frame is owed to the peer for this stream.
+    pub recv_max_data_tx_pending: bool,
+}
+
+impl StreamFlow {
+    pub const fn empty(initial_recv: u64) -> Self {
+        Self {
+            // Until the peer's transport parameters are parsed we assume
+            // nothing: `apply_peer_stream_limits` raises this at
+            // handshake completion. Starting at 0 would wedge 0-RTT
+            // writes, so seed it with the RFC 9000 minimum every peer we
+            // interoperate with advertises at least.
+            send_max_data: DEFAULT_PEER_STREAM_WINDOW,
+            send_blocked_pending: false,
+            recv_max_data: initial_recv,
+            recv_consumed: 0,
+            recv_max_data_tx_pending: false,
+        }
+    }
+}
+
+/// Conservative assumed peer per-stream window before its transport
+/// parameters arrive. Matches what we advertise ourselves, so a peer
+/// running the same defaults is never under-served.
+pub const DEFAULT_PEER_STREAM_WINDOW: u64 = 1 << 18;
+/// Our advertised per-stream receive window (mirrors the
+/// `initial_max_stream_data_*` transport parameters we emit).
+pub const LOCAL_STREAM_WINDOW: u64 = 1 << 18;
+/// Our advertised connection-level receive window (`initial_max_data`).
+pub const LOCAL_CONN_WINDOW: u64 = 1 << 20;
+/// Advance a receive window when the application has consumed at least
+/// this fraction of it — one frame per window rather than one per read.
+pub const FLOW_UPDATE_DIVISOR: u64 = 2;
+
+#[derive(Clone, Copy)]
+pub struct UniStream {
     pub stream_id: u64,
     pub allocated: bool,
     /// True when WE locally initiated this stream (we own its send
     /// half). For received unidirectional streams this is false and
     /// the send half is unused.
     pub locally_initiated: bool,
-    pub h3_role: H3StreamRole,
-    /// For received unidirectional streams: have we consumed the
-    /// varint stream-type prefix yet (RFC 9114 §6.2)?
-    pub h3_type_consumed: bool,
 
     pub send_off: u64,
     pub send_buf: [u8; 256],
@@ -222,16 +342,18 @@ pub struct ExtraStream {
     pub recv_buf: [u8; 256],
     pub recv_buf_len: usize,
     pub recv_fin: bool,
+
+    pub app: AppStreamView,
+    pub abort: StreamAbort,
+    pub flow: StreamFlow,
 }
 
-impl ExtraStream {
+impl UniStream {
     pub const fn empty() -> Self {
         Self {
             stream_id: 0,
             allocated: false,
             locally_initiated: false,
-            h3_role: H3StreamRole::Unknown,
-            h3_type_consumed: false,
             send_off: 0,
             send_buf: [0; 256],
             send_buf_len: 0,
@@ -241,21 +363,22 @@ impl ExtraStream {
             recv_buf: [0; 256],
             recv_buf_len: 0,
             recv_fin: false,
+            app: AppStreamView::empty(),
+            abort: StreamAbort::empty(),
+            flow: StreamFlow::empty(LOCAL_STREAM_WINDOW),
         }
     }
 }
 
-/// One bidi h3 request stream beyond stream id 0. Sized to carry a
-/// full HEADERS+DATA flight in each direction plus per-stream POST
-/// body accumulation; distinct from [`ExtraStream`] so the uni-stream
-/// pool can stay narrow.
+/// One bidirectional stream beyond the main one. Sized to carry a full
+/// application flight in each direction; distinct from [`UniStream`] so
+/// the uni pool can stay narrow.
 #[derive(Clone, Copy)]
-pub struct BidiExtraStream {
+pub struct BidiStream {
     pub stream_id: u64,
     pub allocated: bool,
-    /// True when the local endpoint opened the stream (client GET /
-    /// POST). False for server-side slots that hold a peer-initiated
-    /// request.
+    /// True when the local endpoint opened the stream. False for slots
+    /// holding a peer-initiated stream.
     pub locally_initiated: bool,
 
     pub send_off: u64,
@@ -269,18 +392,14 @@ pub struct BidiExtraStream {
     pub recv_buf_len: usize,
     pub recv_fin: bool,
 
-    /// Has this slot's STREAM_ACCEPTED / STREAM_CLOSED been delivered to the
-    /// app? Per slot, and latched only on a successful enqueue, so
-    /// backpressure retries rather than losing the event.
-    pub app_open_sent: bool,
-    pub app_close_sent: bool,
+    pub app: AppStreamView,
+    pub abort: StreamAbort,
+    pub flow: StreamFlow,
 }
 
-impl BidiExtraStream {
+impl BidiStream {
     pub const fn empty() -> Self {
         Self {
-            app_open_sent: false,
-            app_close_sent: false,
             stream_id: 0,
             allocated: false,
             locally_initiated: false,
@@ -293,6 +412,9 @@ impl BidiExtraStream {
             recv_buf: [0; 1500],
             recv_buf_len: 0,
             recv_fin: false,
+            app: AppStreamView::empty(),
+            abort: StreamAbort::empty(),
+            flow: StreamFlow::empty(LOCAL_STREAM_WINDOW),
         }
     }
 }
@@ -712,36 +834,35 @@ pub struct QuicConnection {
     /// (client). One-shot per connection.
     pub session_ticket_handled: bool,
 
-    // ── Multi-stream support (HTTP/3 control + QPACK uni streams) ──
-    pub extra_streams: [ExtraStream; MAX_EXTRA_STREAMS],
-    /// Pool for concurrent bidi h3 request streams beyond stream id 0
-    /// (client ids 4, 8, 12, …; server ids 5, 9, 13, …).
-    pub bidi_extra_streams: [BidiExtraStream; MAX_BIDI_EXTRA_STREAMS],
-    /// Whether we have already opened our HTTP/3 unidirectional streams
-    /// (control + qpack-enc + qpack-dec) on this connection.
-    pub h3_uni_streams_opened: bool,
+    // ── Stream pools ───────────────────────────────────────────────
+    /// Unidirectional streams, local and peer-initiated alike.
+    pub uni_streams: [UniStream; MAX_UNI_STREAMS],
+    /// Bidirectional streams beyond the main one (client ids 4, 8, 12, …;
+    /// server ids 5, 9, 13, …).
+    pub bidi_streams: [BidiStream; MAX_BIDI_STREAMS],
     /// Counter for self-allocated unidirectional stream ids. Server
     /// uni = 3, 7, 11, ...; client uni = 2, 6, 10, ... — both
     /// increment by 4. We track the next index to allocate.
-    pub h3_next_uni_idx: u8,
-    /// The peer's HTTP/3 settings, latched from its control stream. Held here
-    /// rather than acted on: they bind the APPLICATION that encodes requests,
-    /// and reach it as `MSG_MUX_PEER_SETTINGS`. `h3_peer_settings_forwarded`
-    /// makes that emission one-shot AND retryable — it latches only on a
-    /// successful enqueue, so backpressure retries next step rather than
-    /// dropping the only copy the app will ever get.
-    pub h3_peer_settings_seen: bool,
-    pub h3_peer_settings_forwarded: bool,
-    /// `u32::MAX` = no limit advertised (the identifier's default), which is
-    /// distinct from an advertised 0.
-    pub h3_peer_max_field_section: u32,
-    pub h3_peer_qpack_max_table: u32,
-    pub h3_peer_qpack_blocked: u32,
-    /// The peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 9220 §3).
-    pub h3_peer_enable_connect: bool,
-    /// Sequence counter for our own bidi stream allocations on the
-    /// client side. First client bidi = id 0; subsequent = 4, 8, ...
-    pub h3_next_bidi_idx: u8,
+    pub next_uni_idx: u8,
+    /// Sequence counter for our own bidi stream allocations. First local
+    /// bidi = the main stream; subsequent = 4, 8, ... (client) or
+    /// 5, 9, ... (server).
+    pub next_bidi_idx: u8,
+    /// Monotonic allocator for the opaque per-stream app handles the mux
+    /// contract addresses streams by. Starts at 1 — 0 is never a live
+    /// handle, so a zeroed field is unambiguously "unassigned".
+    ///
+    /// Deliberately NOT the QUIC stream id: the wire id is 62 bits and
+    /// the handle is 32, and a truncating map would alias two distinct
+    /// streams onto one handle on a long-lived connection. The wire id
+    /// travels separately as metadata on the opened/accepted event.
+    pub next_app_handle: u32,
+    /// Round-robin starting points for outbound stream emission, one per
+    /// pool. Without them the packer always starts at slot 0, so a slot
+    /// that can fill a packet on its own is the only one ever served and
+    /// every other stream on the connection starves.
+    pub tx_cursor_bidi: u8,
+    pub tx_cursor_uni: u8,
     /// Wall-clock millis of the most recent activity on this conn —
     /// any inbound packet decrypt success, any outbound emit. Drives
     /// idle-timeout closure (RFC 9000 §10.1). Zero = uninitialised
@@ -764,12 +885,16 @@ pub struct QuicConnection {
     pub span_start_us: u64,
 
     // ── ALPN (RFC 7301) ────────────────────────────────────────────
-    /// The negotiated application protocol for this connection, as a
-    /// raw token (e.g. `h3`, `mqtt`). Server: selected at ClientHello
-    /// from the intersection of the module's configured list and the
-    /// client's offered list. Client: the protocol we offered. Empty
-    /// (`alpn_selected_len == 0`) means no ALPN was negotiated — legacy
-    /// behaviour driven solely by `enable_h3`.
+    /// The negotiated application protocol for this connection, as an
+    /// opaque raw token. Server: selected at ClientHello from the
+    /// intersection of the module's configured list and the client's
+    /// offered list. Client: the protocol we offered and the server
+    /// echoed. Empty (`alpn_selected_len == 0`) means no ALPN was
+    /// negotiated.
+    ///
+    /// Reported to the application on `MSG_MUX_SESSION_OPENED` and used
+    /// for nothing else here — this module performs the negotiation and
+    /// holds no opinion about what any token means.
     pub alpn_selected: [u8; MAX_ALPN],
     pub alpn_selected_len: u8,
 
@@ -842,22 +967,80 @@ pub struct QuicConnection {
     pub recv_ip: [u8; 4],
     pub recv_port: u16,
 
-    // ── Raw bidi-stream surface (non-h3 ALPN) ──────────────────────
-    /// Whether we've emitted the one-shot MSG_QUIC_STREAM_OPEN event for
-    /// the main bidi stream (id 0) to the app surface.
-    /// Cumulative bidi-stream allowance granted to the peer (RFC 9000 §4.6).
-    /// Starts at the `initial_max_streams_bidi` transport parameter and rises
-    /// as request streams are reclaimed, so a connection is not limited to its
-    /// initial allowance for life.
+    // ── Stream-count flow control (RFC 9000 §4.6) ──────────────────
+    /// Cumulative bidi-stream allowance granted to the peer. Starts at the
+    /// `initial_max_streams_bidi` transport parameter and rises as streams
+    /// are reclaimed, so a connection is not limited to its initial
+    /// allowance for life.
     pub max_streams_bidi_granted: u64,
-    /// A MAX_STREAMS frame is owed to the peer.
+    /// A MAX_STREAMS (bidi) frame is owed to the peer.
     pub max_streams_tx_pending: bool,
-    pub raw_stream_open_sent: bool,
-    /// Whether the terminal MSG_MUX_STREAM_CLOSED has been emitted to the
-    /// app for the main bidi stream. Latched so a peer FIN (including an
-    /// empty FIN carrying no data) propagates exactly once, and is never
-    /// re-sent on a subsequent forward.
-    pub raw_stream_close_sent: bool,
+    /// Same, for unidirectional streams. Without this a peer that opens
+    /// uni streams — any control/metadata channel an application runs
+    /// alongside its data streams — stalls at the initial allowance.
+    pub max_streams_uni_granted: u64,
+    pub max_streams_uni_tx_pending: bool,
+    /// Peer-imposed caps on how many streams WE may open, from its
+    /// transport parameters (RFC 9000 §18.2). An open beyond these is
+    /// refused with STATUS_NO_CAPACITY and a STREAMS_BLOCKED frame,
+    /// never attempted on the wire.
+    pub peer_max_streams_bidi: u64,
+    pub peer_max_streams_uni: u64,
+    /// Peer's `initial_max_stream_data_*` (RFC 9000 §18.2), i.e. how much
+    /// WE may write on a stream before its MAX_STREAM_DATA moves.
+    ///
+    /// Three values because the peer advertises three: which one applies
+    /// depends on the stream's direction and who opened it, and getting
+    /// that wrong shows up as a stall only under load.
+    ///   * `_bidi_remote` — a bidi stream WE opened (remote to the peer);
+    ///   * `_bidi_local`  — a bidi stream the PEER opened;
+    ///   * `_uni`         — any unidirectional stream we send on.
+    pub peer_stream_window_bidi_local: u64,
+    pub peer_stream_window_bidi_remote: u64,
+    pub peer_stream_window_uni: u64,
+    /// Count of streams we have opened in each direction, against the
+    /// caps above.
+    pub local_bidi_opened: u64,
+    pub local_uni_opened: u64,
+    /// A STREAMS_BLOCKED frame is owed to the peer (we wanted to open and
+    /// had no credit).
+    pub streams_blocked_bidi_pending: bool,
+    pub streams_blocked_uni_pending: bool,
+
+    // ── Connection-level flow control (RFC 9000 §4.1) ──────────────
+    /// Highest aggregate offset the peer allows us to write.
+    pub send_max_data: u64,
+    /// Aggregate bytes we have written across all streams.
+    pub send_data_used: u64,
+    /// A DATA_BLOCKED frame is owed to the peer.
+    pub data_blocked_pending: bool,
+    /// Highest aggregate offset we allow the peer to write.
+    pub recv_max_data: u64,
+    /// Aggregate bytes the application has acknowledged consuming.
+    pub recv_data_consumed: u64,
+    /// A MAX_DATA frame is owed to the peer.
+    pub max_data_tx_pending: bool,
+
+    // ── Mux app surface ────────────────────────────────────────────
+    /// Which application-channel encoding this connection uses: the
+    /// framed `mux` contract (true) or the transparent raw byte stream
+    /// (false). Latched at connection allocation from whether the module
+    /// has an `alpn` list configured.
+    ///
+    /// It selects an ENCODING, not a protocol. On the framed surface
+    /// EVERY stream — including client bidi stream 0 — is an ordinary
+    /// pool slot with an app handle, so there is exactly one code path
+    /// for streams. The transparent surface owns `stream_send_buf` /
+    /// `stream_recv_buf` and never touches the pools; the two never mix.
+    pub framed_app_surface: bool,
+    /// Whether MSG_MUX_SESSION_OPENED has been delivered for this
+    /// connection. One-shot and retryable: latched only on a successful
+    /// enqueue, so a backpressured session-open is retried rather than
+    /// leaving the application with streams belonging to a session it
+    /// was never told about.
+    pub session_opened_sent: bool,
+    /// Whether MSG_MUX_SESSION_CLOSED has been delivered.
+    pub session_closed_sent: bool,
     /// Whether the post-handshake `MSG_MUX_PEER_IDENTITY` (mux 0xC8) has
     /// been emitted to the app surface.
     pub peer_identity_sent: bool,
@@ -879,16 +1062,6 @@ pub struct QuicConnection {
     pub alt_cid_issued: bool,
     /// A NEW_CONNECTION_ID frame for `alt_cid` is queued for emission.
     pub new_cid_tx_pending: bool,
-    /// Whether this connection runs the HTTP/3 connection preamble — the
-    /// control and QPACK unidirectional streams and the SETTINGS exchange.
-    /// Decided once, post-ALPN-selection: true when the negotiated ALPN
-    /// is `h3`, or — when no ALPN is configured — when `enable_h3` is
-    /// set (preserves pre-ALPN behaviour).
-    ///
-    /// It does NOT decide who owns the request streams. Both an h3 connection
-    /// and a non-h3 ALPN surface their streams to the application over `mux`;
-    /// the difference is only that h3 has a preamble to run first.
-    pub use_h3: bool,
 }
 
 impl Default for QuicConnection {
@@ -951,17 +1124,13 @@ impl QuicConnection {
             zero_rtt_payload: [0; 256],
             zero_rtt_payload_len: 0,
             session_ticket_handled: false,
-            extra_streams: [ExtraStream::empty(); MAX_EXTRA_STREAMS],
-            bidi_extra_streams: [BidiExtraStream::empty(); MAX_BIDI_EXTRA_STREAMS],
-            h3_uni_streams_opened: false,
-            h3_next_uni_idx: 0,
-            h3_peer_settings_seen: false,
-            h3_peer_settings_forwarded: false,
-            h3_peer_max_field_section: u32::MAX,
-            h3_peer_qpack_max_table: 0,
-            h3_peer_qpack_blocked: 0,
-            h3_peer_enable_connect: false,
-            h3_next_bidi_idx: 0,
+            uni_streams: [UniStream::empty(); MAX_UNI_STREAMS],
+            bidi_streams: [BidiStream::empty(); MAX_BIDI_STREAMS],
+            next_uni_idx: 0,
+            next_bidi_idx: 0,
+            next_app_handle: 1,
+            tx_cursor_bidi: 0,
+            tx_cursor_uni: 0,
             last_activity_ms: 0,
             // Default to our advertised TP value (30s); refined on
             // EncryptedExtensions parse for the smaller of the two TPs.
@@ -972,7 +1141,6 @@ impl QuicConnection {
             span_start_us: 0,
             alpn_selected: [0; MAX_ALPN],
             alpn_selected_len: 0,
-            use_h3: false,
             peer_max_datagram_frame_size: 0,
             dgram_tx: [0; QUIC_MAX_DATAGRAM_SIZE],
             dgram_tx_len: 0,
@@ -993,10 +1161,32 @@ impl QuicConnection {
             path_response_to_port: 0,
             recv_ip: [0; 4],
             recv_port: 0,
-            max_streams_bidi_granted: 4,
+            max_streams_bidi_granted: MAX_BIDI_STREAMS as u64,
             max_streams_tx_pending: false,
-            raw_stream_open_sent: false,
-            raw_stream_close_sent: false,
+            max_streams_uni_granted: MAX_UNI_STREAMS as u64,
+            max_streams_uni_tx_pending: false,
+            // Until the peer's transport parameters are parsed, assume it
+            // advertises what we do. A peer that advertises less is
+            // honoured the moment `apply_peer_stream_limits` runs, which
+            // is before any application stream can be opened.
+            peer_max_streams_bidi: 4,
+            peer_max_streams_uni: 4,
+            peer_stream_window_bidi_local: DEFAULT_PEER_STREAM_WINDOW,
+            peer_stream_window_bidi_remote: DEFAULT_PEER_STREAM_WINDOW,
+            peer_stream_window_uni: DEFAULT_PEER_STREAM_WINDOW,
+            local_bidi_opened: 0,
+            local_uni_opened: 0,
+            streams_blocked_bidi_pending: false,
+            streams_blocked_uni_pending: false,
+            send_max_data: LOCAL_CONN_WINDOW,
+            send_data_used: 0,
+            data_blocked_pending: false,
+            recv_max_data: LOCAL_CONN_WINDOW,
+            recv_data_consumed: 0,
+            max_data_tx_pending: false,
+            framed_app_surface: false,
+            session_opened_sent: false,
+            session_closed_sent: false,
             peer_identity_sent: false,
             alt_cid: [0; MAX_CID_LEN],
             alt_cid_len: 0,
@@ -1098,10 +1288,22 @@ pub const QUIC_OUT_SCRATCH: usize = 2048;
 // Extra stream helpers.
 // ---------------------------------------------------------------------
 
-pub fn extra_find(conn: &QuicConnection, stream_id: u64) -> Option<usize> {
+/// Take the next opaque app handle for this connection.
+///
+/// Wraps back to 1 rather than to 0 — 0 means "unassigned" everywhere
+/// else, and a wrapped handle colliding with that sentinel would make an
+/// unassigned slot look addressable.
+pub fn next_handle(conn: &mut QuicConnection) -> u32 {
+    let h = conn.next_app_handle;
+    // Wrap to 1, never 0: 0 is the "no handle" sentinel.
+    conn.next_app_handle = conn.next_app_handle.checked_add(1).unwrap_or(1);
+    h
+}
+
+pub fn uni_find(conn: &QuicConnection, stream_id: u64) -> Option<usize> {
     let mut i = 0;
-    while i < MAX_EXTRA_STREAMS {
-        if conn.extra_streams[i].allocated && conn.extra_streams[i].stream_id == stream_id {
+    while i < MAX_UNI_STREAMS {
+        if conn.uni_streams[i].allocated && conn.uni_streams[i].stream_id == stream_id {
             return Some(i);
         }
         i += 1;
@@ -1109,18 +1311,21 @@ pub fn extra_find(conn: &QuicConnection, stream_id: u64) -> Option<usize> {
     None
 }
 
-pub fn extra_alloc(
+pub fn uni_alloc(
     conn: &mut QuicConnection,
     stream_id: u64,
     locally_initiated: bool,
 ) -> Option<usize> {
     let mut i = 0;
-    while i < MAX_EXTRA_STREAMS {
-        if !conn.extra_streams[i].allocated {
-            conn.extra_streams[i] = ExtraStream::empty();
-            conn.extra_streams[i].stream_id = stream_id;
-            conn.extra_streams[i].allocated = true;
-            conn.extra_streams[i].locally_initiated = locally_initiated;
+    while i < MAX_UNI_STREAMS {
+        if !conn.uni_streams[i].allocated {
+            let handle = next_handle(conn);
+            conn.uni_streams[i] = UniStream::empty();
+            conn.uni_streams[i].stream_id = stream_id;
+            conn.uni_streams[i].allocated = true;
+            conn.uni_streams[i].locally_initiated = locally_initiated;
+            conn.uni_streams[i].app.handle = handle;
+            conn.uni_streams[i].flow.send_max_data = conn.peer_stream_window_uni;
             return Some(i);
         }
         i += 1;
@@ -1130,10 +1335,8 @@ pub fn extra_alloc(
 
 pub fn bidi_find(conn: &QuicConnection, stream_id: u64) -> Option<usize> {
     let mut i = 0;
-    while i < MAX_BIDI_EXTRA_STREAMS {
-        if conn.bidi_extra_streams[i].allocated
-            && conn.bidi_extra_streams[i].stream_id == stream_id
-        {
+    while i < MAX_BIDI_STREAMS {
+        if conn.bidi_streams[i].allocated && conn.bidi_streams[i].stream_id == stream_id {
             return Some(i);
         }
         i += 1;
@@ -1147,13 +1350,50 @@ pub fn bidi_alloc(
     locally_initiated: bool,
 ) -> Option<usize> {
     let mut i = 0;
-    while i < MAX_BIDI_EXTRA_STREAMS {
-        if !conn.bidi_extra_streams[i].allocated {
-            conn.bidi_extra_streams[i] = BidiExtraStream::empty();
-            conn.bidi_extra_streams[i].stream_id = stream_id;
-            conn.bidi_extra_streams[i].allocated = true;
-            conn.bidi_extra_streams[i].locally_initiated = locally_initiated;
+    while i < MAX_BIDI_STREAMS {
+        if !conn.bidi_streams[i].allocated {
+            let handle = next_handle(conn);
+            let window = if locally_initiated {
+                conn.peer_stream_window_bidi_remote
+            } else {
+                conn.peer_stream_window_bidi_local
+            };
+            conn.bidi_streams[i] = BidiStream::empty();
+            conn.bidi_streams[i].stream_id = stream_id;
+            conn.bidi_streams[i].allocated = true;
+            conn.bidi_streams[i].locally_initiated = locally_initiated;
+            conn.bidi_streams[i].app.handle = handle;
+            conn.bidi_streams[i].flow.send_max_data = window;
             return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find a stream by the opaque app handle the mux surface addresses it
+/// by. Two pools, split by direction; nothing else.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamLoc {
+    Bidi(usize),
+    Uni(usize),
+}
+
+pub fn locate_handle(conn: &QuicConnection, handle: u32) -> Option<StreamLoc> {
+    if handle == 0 {
+        return None;
+    }
+    let mut i = 0;
+    while i < MAX_BIDI_STREAMS {
+        if conn.bidi_streams[i].allocated && conn.bidi_streams[i].app.handle == handle {
+            return Some(StreamLoc::Bidi(i));
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < MAX_UNI_STREAMS {
+        if conn.uni_streams[i].allocated && conn.uni_streams[i].app.handle == handle {
+            return Some(StreamLoc::Uni(i));
         }
         i += 1;
     }
@@ -1176,6 +1416,12 @@ pub fn next_client_uni_id(idx: u8) -> u64 {
 /// Client bidi ids = 0, 4, 8, ...  (low 2 bits = 00).
 pub fn next_client_bidi_id(idx: u8) -> u64 {
     (idx as u64) * 4
+}
+
+/// Allocate the next server-initiated bidirectional stream id.
+/// Server bidi ids = 1, 5, 9, ...  (low 2 bits = 01).
+pub fn next_server_bidi_id(idx: u8) -> u64 {
+    1 + (idx as u64) * 4
 }
 
 /// Set up Initial-level keys for a freshly-allocated connection
@@ -1327,12 +1573,16 @@ pub unsafe fn build_transport_params_client(
     tp_put_bytes(out, &mut pos, TP_INITIAL_SOURCE_CID, scid);
     tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, 30_000);
     tp_put_int(out, &mut pos, TP_MAX_UDP_PAYLOAD_SIZE, 1500);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, 1 << 20);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, 1 << 18);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 1 << 18);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_UNI, 1 << 18);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, 4);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, 4);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, LOCAL_CONN_WINDOW);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, LOCAL_STREAM_WINDOW);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, LOCAL_STREAM_WINDOW);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_UNI, LOCAL_STREAM_WINDOW);
+    // Advertised from the fixed pools, not a round number. Advertising
+    // more than we can hold means a peer opens a stream we then have
+    // nowhere to put, and its bytes are dropped with no error on either
+    // side — which is indistinguishable from a slow application.
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, MAX_BIDI_STREAMS as u64);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, MAX_UNI_STREAMS as u64);
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
     // RFC 9221 §3: advertise our inbound DATAGRAM capacity so the peer
     // may send unreliable datagrams up to this size.
@@ -1371,12 +1621,16 @@ pub unsafe fn build_transport_params_server(
     }
     tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, 30_000);
     tp_put_int(out, &mut pos, TP_MAX_UDP_PAYLOAD_SIZE, 1500);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, 1 << 20);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, 1 << 18);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 1 << 18);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_UNI, 1 << 18);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, 4);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, 4);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, LOCAL_CONN_WINDOW);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, LOCAL_STREAM_WINDOW);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, LOCAL_STREAM_WINDOW);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_UNI, LOCAL_STREAM_WINDOW);
+    // Advertised from the fixed pools, not a round number. Advertising
+    // more than we can hold means a peer opens a stream we then have
+    // nowhere to put, and its bytes are dropped with no error on either
+    // side — which is indistinguishable from a slow application.
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, MAX_BIDI_STREAMS as u64);
+    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, MAX_UNI_STREAMS as u64);
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
     // RFC 9221 §3: advertise our inbound DATAGRAM capacity.
     tp_put_int(
@@ -1391,6 +1645,132 @@ pub unsafe fn build_transport_params_server(
         tp_put_bytes(out, &mut pos, TP_DISABLE_ACTIVE_MIGRATION, &[]);
     }
     pos
+}
+
+/// The peer's flow-control and stream-count limits, as far as this
+/// transport uses them (RFC 9000 §18.2).
+///
+/// **Fills a fixed struct; takes no callback.** A per-parameter
+/// `&mut dyn FnMut(u64, u64)` is a trait object, and a trait object is a
+/// vtable: these modules are position-independent with no relocation
+/// processing for one, so calling through it jumps to an unrelocated
+/// address. That failure is invisible to both the build and the host
+/// harness — it faults the runtime the first time a handshake completes.
+#[derive(Clone, Copy)]
+pub struct PeerTransportLimits {
+    pub max_data: u64,
+    pub max_stream_data_bidi_local: u64,
+    pub max_stream_data_bidi_remote: u64,
+    pub max_stream_data_uni: u64,
+    pub max_streams_bidi: u64,
+    pub max_streams_uni: u64,
+    pub max_datagram_frame_size: u64,
+}
+
+impl PeerTransportLimits {
+    /// RFC 9000 §18.2 defaults: every one of these parameters is
+    /// optional and defaults to zero, which means "no credit". We seed
+    /// with zero rather than a guess so an absent parameter is honoured
+    /// as the RFC states it, not silently widened.
+    pub const fn defaults() -> Self {
+        Self {
+            max_data: 0,
+            max_stream_data_bidi_local: 0,
+            max_stream_data_bidi_remote: 0,
+            max_stream_data_uni: 0,
+            max_streams_bidi: 0,
+            max_streams_uni: 0,
+            max_datagram_frame_size: 0,
+        }
+    }
+}
+
+/// Walk a transport_parameters payload, capturing the limits above.
+/// Lenient about unknown parameters (they are skipped, per §7.4.2);
+/// returns the defaults on a decode error.
+pub unsafe fn parse_peer_transport_limits(payload: &[u8]) -> PeerTransportLimits {
+    let mut out = PeerTransportLimits::defaults();
+    let mut pos = 0;
+    while pos < payload.len() {
+        let after = &payload[pos..];
+        let (id, n) = match varint_decode(after.as_ptr(), after.len()) {
+            Some(t) => t,
+            None => return out,
+        };
+        pos += n;
+        let after = &payload[pos..];
+        let (vlen, n) = match varint_decode(after.as_ptr(), after.len()) {
+            Some(t) => t,
+            None => return out,
+        };
+        pos += n;
+        let vlen = vlen as usize;
+        if pos + vlen > payload.len() {
+            return out;
+        }
+        let value = &payload[pos..pos + vlen];
+        pos += vlen;
+        let v = match varint_decode(value.as_ptr(), value.len()) {
+            Some((v, _)) => v,
+            None => continue,
+        };
+        if id == TP_INITIAL_MAX_DATA {
+            out.max_data = v;
+        } else if id == TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL {
+            out.max_stream_data_bidi_local = v;
+        } else if id == TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE {
+            out.max_stream_data_bidi_remote = v;
+        } else if id == TP_INITIAL_MAX_STREAM_DATA_UNI {
+            out.max_stream_data_uni = v;
+        } else if id == TP_INITIAL_MAX_STREAMS_BIDI {
+            out.max_streams_bidi = v;
+        } else if id == TP_INITIAL_MAX_STREAMS_UNI {
+            out.max_streams_uni = v;
+        } else if id == TP_MAX_DATAGRAM_FRAME_SIZE {
+            out.max_datagram_frame_size = v;
+        }
+    }
+    out
+}
+
+/// Latch the peer's limits onto the connection.
+///
+/// Applied once the peer's transport parameters are available, which is
+/// before any application stream can be opened on the connection —
+/// so no stream is ever allocated against a guessed window.
+pub fn apply_peer_transport_limits(conn: &mut QuicConnection, lim: &PeerTransportLimits) {
+    conn.peer_max_datagram_frame_size = lim.max_datagram_frame_size;
+    conn.peer_max_streams_bidi = lim.max_streams_bidi;
+    conn.peer_max_streams_uni = lim.max_streams_uni;
+    conn.peer_stream_window_bidi_local = lim.max_stream_data_bidi_local;
+    conn.peer_stream_window_bidi_remote = lim.max_stream_data_bidi_remote;
+    conn.peer_stream_window_uni = lim.max_stream_data_uni;
+    conn.send_max_data = lim.max_data;
+    // Streams allocated before the peer's parameters arrived (a 0-RTT
+    // write, a stream the peer opened inside its first flight) were
+    // seeded with the assumed window. Rewrite them from the real values
+    // now, or they keep writing against a number the peer never agreed
+    // to. Each stream's window depends on its direction and initiator —
+    // the peer names its two bidi windows from ITS OWN point of view, so
+    // a stream WE opened is the peer's `_bidi_remote`.
+    let mut i = 0;
+    while i < MAX_BIDI_STREAMS {
+        if conn.bidi_streams[i].allocated {
+            conn.bidi_streams[i].flow.send_max_data = if conn.bidi_streams[i].locally_initiated {
+                lim.max_stream_data_bidi_remote
+            } else {
+                lim.max_stream_data_bidi_local
+            };
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < MAX_UNI_STREAMS {
+        if conn.uni_streams[i].allocated && conn.uni_streams[i].locally_initiated {
+            conn.uni_streams[i].flow.send_max_data = lim.max_stream_data_uni;
+        }
+        i += 1;
+    }
 }
 
 /// Extract the peer's `max_datagram_frame_size` (RFC 9221 §3) from a

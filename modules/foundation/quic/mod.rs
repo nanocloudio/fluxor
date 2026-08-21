@@ -8,28 +8,30 @@
 //!   CRYPTO, STREAM, ACK, CONNECTION_CLOSE, RESET_STREAM, NEW_CONNECTION_ID,
 //!   MAX_DATA / MAX_STREAM_DATA / DATA_BLOCKED.
 //! - [`ack`](ack.rs) — sliding ACK range tracker (RFC 9000 §13, §19.3).
-//! - [`streams`](streams.rs) — bidirectional/unidirectional stream slot
-//!   table.
 //! - [`keys`](keys.rs) — Initial-keys derivation, AEAD key schedule,
 //!   key update next-phase derivation (RFC 9001 §5–§6).
 //! - [`pump`](pump.rs) — handshake state pump driving the shared
 //!   `HandshakeDriver` across Initial / Handshake / 1-RTT levels.
-//! - [`h3`](h3.rs) — HTTP/3 frame layer + control-stream SETTINGS /
-//!   GOAWAY / PRIORITY_UPDATE (RFC 9114, RFC 9218).
 //!
 //! # Where this module stops
 //!
 //! It carries connections and streams. It does not speak the protocols on
-//! them. Every application stream — an h3 REQUEST stream included — is
-//! surfaced over the `mux` contract (`contracts/net/mux.rs`) and answered by
-//! whatever is wired to `app_out` / `app_in`.
+//! them, and it does not know which protocol is on them.
 //!
-//! Only the h3 CONNECTION PREAMBLE lives here: the control and QPACK
-//! unidirectional streams and the SETTINGS exchange. That is stream-type
-//! plumbing, it is connection-scoped, and no request can flow before it — so
-//! it is the transport's to run. Methods, paths, header compression, routing,
-//! WebSocket-over-HTTP/3 and request spans are HTTP semantics and live in
-//! Wave's `http`. See `docs/architecture/protocol_surfaces.md`, and
+//! Every application stream is surfaced over the `mux` contract
+//! (`contracts/net/mux.rs`) and answered by whatever is wired to `app_out` /
+//! `app_in`: sessions, bidirectional and unidirectional streams, ordered
+//! bytes, FIN, reset, stop-sending, flow-control credit, and datagrams. The
+//! negotiated ALPN crosses that surface as an opaque byte string; this module
+//! performs the negotiation but never compares the result against a token or
+//! branches on its value.
+//!
+//! Nothing here parses application bytes — including the leading varint some
+//! protocols place on a unidirectional stream to type it. A stream's contents
+//! are the application's, first byte included. HTTP semantics (methods, paths,
+//! header compression, HTTP/3 SETTINGS and QPACK, routing, WebSocket tunnels,
+//! request spans) live in Wave's `http`. See
+//! `docs/architecture/protocol_surfaces.md`, and
 //! `examples/test_harness/linux/quic/README.md` for how the transport proves
 //! itself without borrowing a protocol to do it.
 
@@ -75,11 +77,9 @@ include!("../tls/handshake_driver.rs");
 include!("packet.rs");
 include!("frame.rs");
 include!("ack.rs");
-include!("streams.rs");
 include!("keys.rs");
 include!("connection.rs");
 include!("wire.rs");
-include!("h3.rs");
 include!("pump.rs");
 
 const MAX_CONNS: usize = 2;
@@ -90,25 +90,40 @@ const MAX_ALPN_CFG: usize = 64;
 /// matching PATH_RESPONSE (RFC 9000 §8.2.4).
 const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 
-// Raw (non-h3) app surface uses the multiplexed-session contract
+// The application surface is the multiplexed-session contract
 // (`abi::contracts::net::mux`, opcode range 0xB0..0xCF) — the channel
 // surface reserved for QUIC. Every message is the universal
 // `[msg_type:u8][len:u16 LE][payload]` TLV (written via `net_write_frame`,
 // read via `net_read_frame`), so back-to-back stream writes / datagrams
-// never coalesce on the byte-stream FIFO. We map our small `conn_id` to
-// a `session_id: u32 LE` and the QUIC stream id to `stream_id: u32 LE`.
+// never coalesce on the byte-stream FIFO. We map our small `conn_id` to a
+// `session_id: u32 LE`, and each stream to an opaque `stream_id: u32 LE`
+// handle whose transport identity travels alongside it as metadata.
 //
-//   quic → app: MSG_MUX_STREAM_ACCEPTED [session][stream][flags]
+//   quic → app: MSG_MUX_SESSION_OPENED  [session][status][flags][alpn]
+//   quic → app: MSG_MUX_SESSION_CLOSED  [session][reason]
+//   quic → app: MSG_MUX_PEER_IDENTITY   [session][verified][svid]
+//   quic → app: MSG_MUX_STREAM_ACCEPTED [session][stream][flags][quic_id]
+//   quic → app: MSG_MUX_STREAM_OPENED   [session][stream][status][flags][quic_id]
 //   quic → app: MSG_MUX_STREAM_RX       [session][stream][data]
 //   quic → app: MSG_MUX_STREAM_CLOSED   [session][stream][reason]  (FIN)
+//   quic → app: MSG_MUX_STREAM_RESET    [session][stream][app_error]
+//   quic → app: MSG_MUX_STREAM_STOPPED  [session][stream][app_error]
+//   quic → app: MSG_MUX_STREAM_READY    [session][stream][bytes]
+//   quic → app: MSG_MUX_STREAM_ERROR    [session][stream][errno]
 //   quic → app: MSG_MUX_DATAGRAM_RX     [session][data]
+//   app → quic: CMD_MUX_STREAM_OPEN     [session][flags]
 //   app → quic: CMD_MUX_STREAM_SEND     [session][stream][data]
+//   app → quic: CMD_MUX_STREAM_CLOSE    [session][stream][flags]
+//   app → quic: CMD_MUX_STREAM_RESET    [session][stream][app_error]
+//   app → quic: CMD_MUX_STREAM_STOP_SENDING [session][stream][app_error]
+//   app → quic: CMD_MUX_STREAM_ACK      [session][stream][bytes]
 //   app → quic: CMD_MUX_DATAGRAM_SEND   [session][data]
+//   app → quic: CMD_MUX_SESSION_CLOSE   [session][reason]
 //
-// (The legacy transparent-echo path — no ALPN configured — keeps its
-// net_proto MSG_DATA 0x02 framing, untouched.) Peer identity is emitted
-// as the public, length-prefixed mux event `MSG_MUX_PEER_IDENTITY`
-// (0xC8) — NOT an out-of-contract opcode.
+// This is the surface for EVERY session, whatever ALPN it negotiated.
+// (The transparent-echo path — no `alpn` configured at all — is a
+// different channel ENCODING, not a different protocol: it keeps its
+// net_proto MSG_DATA 0x02 framing and carries one raw byte stream.)
 use abi::contracts::net::mux;
 const MAX_CERT_LEN: usize = 1024;
 const MAX_KEY_LEN: usize = 160;
@@ -198,29 +213,6 @@ pub(crate) struct QuicState {
     /// 0-RTT enable: 0 = disabled, 1 = enabled (server may issue
     /// NewSessionTicket; client may attempt resumption + early data).
     enable_0rtt: u8,
-    /// Treat connections as HTTP/3 when no ALPN is configured: 0 = transparent
-    /// stream echo, 1 = run the h3 connection preamble (control + QPACK
-    /// unidirectional streams, SETTINGS) and surface request streams to the
-    /// app over `mux`.
-    ///
-    /// This is the pre-ALPN latch only. Configure `alpn` instead and `use_h3`
-    /// is decided per connection by negotiation, which is what a deployment
-    /// serving more than one protocol needs.
-    ///
-    /// **It does not make this module an HTTP server.** A connection's REQUEST
-    /// streams always cross to the application over the `mux` contract
-    /// (`MSG_MUX_STREAM_ACCEPTED` / `_RX` / `_CLOSED`, `CMD_MUX_STREAM_SEND`),
-    /// exactly as a non-h3 ALPN's streams do. That is the boundary
-    /// `docs/architecture/protocol_surfaces.md` draws and `contracts/net/mux.rs`
-    /// was written for: a transport exposes many logical streams; the app owns
-    /// the protocol on them. Methods, paths, header compression, routing and
-    /// request spans live in Wave's `http`, which owns HTTP semantics for h1
-    /// and h2 too.
-    ///
-    /// What stays here is the connection preamble — the h3 control and QPACK
-    /// unidirectional streams and the SETTINGS exchange. Stream-type plumbing
-    /// is transport-adjacent, and neither role can carry a request without it.
-    enable_h3: u8,
     /// Server: HMAC key for retry tokens. Generated at boot.
     retry_secret: [u8; 32],
     /// Server: key for ticket encryption. Generated at boot;
@@ -261,9 +253,33 @@ pub(crate) struct QuicState {
     /// Configured ALPN list (RFC 7301), comma-separated raw bytes as supplied
     /// by the `alpn` config param — e.g. `mqtt,h3`. The server offers the
     /// FIRST configured entry that the client also offered (server-preference
-    /// order). Empty = no ALPN negotiated (legacy `enable_h3`-driven path).
+    /// order). Empty = no ALPN configured, which selects the transparent
+    /// byte-stream surface instead of the framed mux one.
+    ///
+    /// The tokens are opaque to this module. It matches them against the
+    /// peer's offer as byte strings and reports the winner to the
+    /// application; it never tests one for a particular value.
     alpn_cfg: [u8; MAX_ALPN_CFG],
     alpn_cfg_len: usize,
+    /// P-256 scalar-multiplication chunking, in ladder bits per step.
+    ///
+    /// The handshake does two full 256-bit constant-time ladders — the
+    /// ECDH key agreement and the CertificateVerify signature — and both
+    /// are resumable. This caps how much of one a single `module_step`
+    /// performs, so a handshake cannot monopolise a scheduler tick.
+    ///
+    /// 256 (the default) means run to completion in one step, which is
+    /// right on a host where a millisecond step costs nothing. On a
+    /// bare-metal target with a short tick it is NOT: the pi5 graphs run
+    /// `tick_us = 50`, a run-to-completion ladder takes ~2 ms, and the
+    /// scheduler's step guard terminates the module with `rc=-110` — the
+    /// transport simply disappears, which presents as a board that
+    /// completes DHCP and then never answers.
+    ///
+    /// 32 splits each ladder into 8 chunks. Mirrors `tls`'s
+    /// `ecdh_bits_per_step`, which exists for exactly this reason and
+    /// which this module went without.
+    ecdh_bits_per_step: u16,
     /// Connection-migration policy (RFC 9000 §9). 0 (default) = migration
     /// enabled: we do NOT advertise `disable_active_migration`, and we
     /// validate + switch to a new client 4-tuple via PATH_CHALLENGE /
@@ -293,10 +309,7 @@ define_params! {
     6, enable_0rtt, u8, 0
         => |s, d, len| { s.enable_0rtt = p_u8(d, len, 0, 0); };
 
-    7, enable_h3, u8, 0
-        => |s, d, len| { s.enable_h3 = p_u8(d, len, 0, 0); };
-
-    // Tags 8, 10 and 13 are RETIRED and must not be reused: a graph still
+    // Tags 7, 8, 10 and 13 are RETIRED and must not be reused: a graph still
     // naming a retired param gets a clean "unknown param" from the composer,
     // where a reused tag would silently bind it to an unrelated value.
     9, verify_peer, u8, 0
@@ -310,6 +323,17 @@ define_params! {
 
     12, disable_migration, u8, 0
         => |s, d, len| { s.disable_migration = p_u8(d, len, 0, 0); };
+
+    // Ladder bits per step for the two P-256 scalar multiplications in the
+    // handshake. Clamped to [1, 256]: 0 would stall the ladder forever, and
+    // above 256 is a whole ladder anyway.
+    //
+    // Tag 15 — 14 is the extended-TLV `alpn` key (see `parse_extended_params`).
+    15, ecdh_bits_per_step, u16, 256
+        => |s, d, len| {
+            let v = p_u16(d, len, 0, 256);
+            s.ecdh_bits_per_step = if v == 0 { 1 } else if v > 256 { 256 } else { v };
+        };
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -348,7 +372,7 @@ pub unsafe extern "C" fn module_new(
     s.client_started = false;
     s.require_retry = 0;
     s.enable_0rtt = 0;
-    s.enable_h3 = 0;
+    s.ecdh_bits_per_step = 256;
     s.verify_peer = 0;
     s.trust_cert_len = 0;
     s.verify_hostname_len = 0;
@@ -958,6 +982,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Closed {
             emit_conn_span(s, i);
+            // Tell the application its session ended. Emitted here rather
+            // than in the established-connection sweep because by now the
+            // connection is no longer Established and that sweep no
+            // longer visits it — an application otherwise learns nothing
+            // and holds per-session state for a session that is gone.
+            //
+            // One-shot and retryable: it latches only on a successful
+            // enqueue, so a backpressured close is retried on the next
+            // step rather than dropped.
+            mux_emit_session_closed(s, i, mux::STATUS_CLOSED);
         }
         i += 1;
     }
@@ -1075,14 +1109,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // every later connection hangs waiting for its response. Latch on the first
     // established connection of the step instead.
     let mut app_in_read_done = false;
+    // Which application-channel ENCODING this module was configured for.
+    // `alpn` configured => the framed mux contract; otherwise the
+    // transparent byte stream. This is a length test, never a comparison
+    // against a protocol token: the transport does not recognise any.
+    let mux_mode = s.alpn_cfg_len > 0;
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Established {
-            // HTTP/3: ensure the three required uni streams (control,
-            // qpack-enc, qpack-dec) are open with their type prefix +
-            // SETTINGS frame on control, before any other emission.
-            if s.conns[i].use_h3 && !s.conns[i].h3_uni_streams_opened {
-                h3_open_uni_streams(s, i);
-            }
             // NEW_CONNECTION_ID issuance (RFC 9000 §5.1.1 / §19.15): once
             // the handshake is confirmed, mint one spare local CID
             // (sequence 1) and queue a NEW_CONNECTION_ID so a migrating
@@ -1102,392 +1135,60 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 conn.alt_cid_issued = true;
                 conn.new_cid_tx_pending = true;
             }
-            // Raw bidi-stream surface: once handshake-confirmed, emit a
-            // one-shot public MSG_MUX_PEER_IDENTITY (0xC8) so a non-h3 app
-            // learns the authenticated peer binding through the mux
-            // contract. Minimal form: no client cert → verified=0,
-            // svid_len=0. Session-scoped, length-prefixed via `mux_emit`;
-            // channel writes are all-or-nothing, so on backpressure leave
-            // `peer_identity_sent` clear and retry next tick.
-            if s.conns[i].alpn_selected_len > 0
-                && !s.conns[i].use_h3
-                && s.conns[i].handshake_confirmed
-                && !s.conns[i].peer_identity_sent
-                && s.app_out >= 0
-            {
-                // mux payload after the session id: [verified][svid_len:2 LE].
-                let body = [0u8, 0u8, 0u8]; // verified=0, svid_len=0
-                if mux_emit(
-                    sys,
-                    s.app_out,
-                    mux::MSG_MUX_PEER_IDENTITY,
-                    i as u32,
-                    None,
-                    &body,
-                ) {
-                    s.conns[i].peer_identity_sent = true;
-                }
-            }
             // Inbound 1-RTT packets.
             if s.conns[i].inbound_len > 0 {
                 let _ = drain_inbound_one(s, i);
             }
-            // HTTP/3: drain any peer-initiated unidirectional streams
-            // (control + qpack-enc + qpack-dec) and surface the request
-            // streams to the app.
-            // Route by the per-connection negotiated protocol (`use_h3`),
-            // NOT the module-wide `enable_h3`: a connection that negotiated
-            // a non-h3 ALPN must never enter H3 handling, and a connection
-            // that negotiated `h3` must never fall to the legacy path.
-            // `use_h3` is latched at handshake (server: ClientHello;
-            // client: EncryptedExtensions) and defaults to `enable_h3` when
-            // no ALPN is configured, preserving pre-ALPN behaviour.
-            if s.conns[i].use_h3 {
-                // The control / QPACK unidirectional streams are ours:
-                // stream-type plumbing is transport-adjacent, and both roles
-                // need the SETTINGS exchange before any request can flow.
-                h3_pump_extra_streams(s, i);
-                // The peer's limits reached us on that control stream, and they
-                // bind the application that encodes requests — forward them
-                // BEFORE surfacing any request stream, so the app is never
-                // asked to encode a response under limits it has not been told
-                // about. Retried until the channel takes it (see
-                // `h3_peer_settings_forwarded`).
-                if s.conns[i].h3_peer_settings_seen
-                    && !s.conns[i].h3_peer_settings_forwarded
-                    && s.app_out >= 0
+            if mux_mode {
+                // Framed mux surface: everything the application can
+                // observe about this session goes out here — session
+                // lifecycle, peer identity, every stream's accept /
+                // bytes / FIN / reset / stop, credit, and datagrams.
+                //
+                // One path for every session. There is no branch on the
+                // negotiated protocol, because the transport does not
+                // know what the protocol is.
+                mux_pump_downstream(s, i);
+            } else {
+                // Transparent byte-stream surface (no `alpn` configured):
+                // one raw stream, net_proto MSG_DATA framing, with the
+                // server echoing what it receives. A different channel
+                // ENCODING, not a different protocol — the mux contract
+                // is simply not in play on this port.
+                legacy_stream_forward(s, i);
+                // Client-side auto-probe for the transparent path only.
+                if !s.conns[i].is_server
+                    && !s.conns[i].test_sent
+                    && s.conns[i].stream_send_off == 0
+                    && s.conns[i].stream_send_buf_len == 0
                 {
-                    let mut body = [0u8; mux::PEER_SETTINGS_BODY];
-                    body[0..4].copy_from_slice(&s.conns[i].h3_peer_max_field_section.to_le_bytes());
-                    body[4..8].copy_from_slice(&s.conns[i].h3_peer_qpack_max_table.to_le_bytes());
-                    body[8..12].copy_from_slice(&s.conns[i].h3_peer_qpack_blocked.to_le_bytes());
-                    body[12] = if s.conns[i].h3_peer_enable_connect {
-                        mux::PEER_SETTINGS_FLAG_ENABLE_CONNECT
-                    } else {
-                        0
-                    };
-                    if mux_emit(
-                        sys,
-                        s.app_out,
-                        mux::MSG_MUX_PEER_SETTINGS,
-                        i as u32,
-                        None,
-                        &body,
-                    ) {
-                        s.conns[i].h3_peer_settings_forwarded = true;
-                    }
-                }
-                // Request streams are NOT ours: every peer-initiated one is
-                // surfaced over the mux contract, exactly as a non-h3 ALPN's
-                // streams are.
-                h3_forward_request_streams(s, i);
-                // Reclaim finished request streams and grant the peer credit
-                // for more — without it a connection serves
-                // MAX_BIDI_EXTRA_STREAMS + 1 requests and then stalls.
-                h3_reap_bidi_streams(s, i);
-            }
-            // Forward inbound stream bytes to clear_out. For the raw mux
-            // surface we also enter here on a peer FIN that carries no
-            // buffered data (empty FIN) so the terminal STREAM_CLOSED still
-            // propagates — otherwise a stream the peer opens and closes
-            // without payload would never surface its close to the app.
-            // An h3 connection uses the same mux surface as a non-h3 ALPN: the
-            // app owns the protocol on the stream either way.
-            let raw_alpn = s.conns[i].alpn_selected_len > 0 || s.conns[i].use_h3;
-            let raw_fin_pending =
-                raw_alpn && s.conns[i].stream_recv_fin && !s.conns[i].raw_stream_close_sent;
-            if s.conns[i].stream_recv_buf_len > 0 || raw_fin_pending {
-                let n = s.conns[i].stream_recv_buf_len;
-                if raw_alpn {
-                    // Raw bidi-stream surface: a non-h3 ALPN was
-                    // negotiated, so forward inbound stream bytes to the
-                    // app as length-prefixed mux frames (the app, e.g. an
-                    // mqtt codec, owns the protocol). No server-side
-                    // auto-echo — the app drives writes via app_in.
-                    // Reliable, with data and FIN tracked independently:
-                    // `raw_stream_forward_to_app` consumes the receive
-                    // buffer the moment STREAM_RX lands (so a later
-                    // backpressured STREAM_CLOSED never re-emits the data),
-                    // and latches `raw_stream_close_sent` once CLOSED lands.
-                    // The clear here is just a defensive no-op for the
-                    // all-landed path — no stream-byte and no FIN loss.
-                    if raw_stream_forward_to_app(s, i, n) {
-                        s.conns[i].stream_recv_buf_len = 0;
-                    }
-                } else {
-                    // Legacy echo / log behaviour.
-                    let mut log_buf = [0u8; 96];
-                    let prefix = b"[quic] stream rx=";
-                    let mut p = 0;
-                    for &c in prefix {
-                        log_buf[p] = c;
-                        p += 1;
-                    }
-                    let copy_n = n.min(log_buf.len() - p);
+                    let msg = b"hello quic stream";
+                    let n = msg.len();
+                    let conn = &mut s.conns[i];
                     core::ptr::copy_nonoverlapping(
-                        s.conns[i].stream_recv_buf.as_ptr(),
-                        log_buf.as_mut_ptr().add(p),
-                        copy_n,
+                        msg.as_ptr(),
+                        conn.stream_send_buf.as_mut_ptr(),
+                        n,
                     );
-                    p += copy_n;
-                    dev_log(sys, 3, log_buf.as_ptr(), p);
-                    // Echo path on the server: forward inbound bytes to
-                    // stream_send_buf so they round-trip back to the client.
-                    if s.conns[i].is_server {
-                        let conn = &mut s.conns[i];
-                        let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-                        let to_copy = n.min(space);
-                        core::ptr::copy_nonoverlapping(
-                            conn.stream_recv_buf.as_ptr(),
-                            conn.stream_send_buf
-                                .as_mut_ptr()
-                                .add(conn.stream_send_buf_len),
-                            to_copy,
-                        );
-                        conn.stream_send_buf_len += to_copy;
-                    }
-                    if s.app_out >= 0 {
-                        let mut frame = [0u8; 1600];
-                        if 3 + n <= frame.len() {
-                            frame[0] = 0x02;
-                            frame[1] = n as u8;
-                            frame[2] = (n >> 8) as u8;
-                            core::ptr::copy_nonoverlapping(
-                                s.conns[i].stream_recv_buf.as_ptr(),
-                                frame.as_mut_ptr().add(3),
-                                n,
-                            );
-                            (sys.channel_write)(s.app_out, frame.as_ptr(), 3 + n);
-                            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(n as u32);
-                        }
-                    }
-                    s.conns[i].stream_recv_buf_len = 0;
+                    conn.stream_send_buf_len = n;
+                    conn.test_sent = true;
                 }
             }
-            // Client-side auto-test (transparent path only — neither h3
-            // nor a negotiated raw ALPN, whose app drives its own writes).
-            if !s.conns[i].use_h3
-                && s.conns[i].alpn_selected_len == 0
-                && !s.conns[i].is_server
-                && !s.conns[i].test_sent
-                && s.conns[i].stream_send_off == 0
-                && s.conns[i].stream_send_buf_len == 0
-            {
-                let msg = b"hello quic stream";
-                let n = msg.len();
-                let conn = &mut s.conns[i];
-                core::ptr::copy_nonoverlapping(msg.as_ptr(), conn.stream_send_buf.as_mut_ptr(), n);
-                conn.stream_send_buf_len = n;
-                conn.test_sent = true;
-            }
-            // An h3 client sends nothing of its own: WHICH request to make is
-            // the application's decision, and it makes it by opening a stream
-            // over the mux contract like any other app.
-            // Forward any inbound DATAGRAM (RFC 9221) to the app as a
-            // length-prefixed MSG_MUX_DATAGRAM_RX frame. Unreliable: the
-            // single slot is cleared whether or not the best-effort
-            // forward succeeds (a backpressured datagram is dropped, per
-            // §5.2 — never retained). Gated on THIS connection's negotiated
-            // profile (a raw, non-h3 ALPN) — not merely on the module
-            // having ALPN configured — so an h3 connection never exposes
-            // the raw mux surface.
-            if s.conns[i].alpn_selected_len > 0
-                && !s.conns[i].use_h3
-                && s.conns[i].dgram_rx_pending
-                && s.app_out >= 0
-            {
-                let dn = s.conns[i].dgram_rx_len;
-                let mut data = [0u8; QUIC_MAX_DATAGRAM_SIZE];
-                core::ptr::copy_nonoverlapping(s.conns[i].dgram_rx.as_ptr(), data.as_mut_ptr(), dn);
-                if mux_emit(
-                    sys,
-                    s.app_out,
-                    mux::MSG_MUX_DATAGRAM_RX,
-                    i as u32,
-                    None,
-                    &data[..dn],
-                ) {
-                    s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(dn as u32);
-                }
-                s.conns[i].dgram_rx_pending = false;
-                s.conns[i].dgram_rx_len = 0;
-            }
-            // Read app→quic data.
+            // Read app→quic commands.
             //
-            // Framed mux surface (`alpn_cfg_len > 0`): once per step (on
-            // the i==0 pass) consume ONE length-prefixed mux frame via
-            // `net_read_frame` (the two-step header+payload read that keeps
-            // the byte-stream FIFO frame-aligned). Reliable backpressure:
-            // we only read when the addressed connection's send buffer is
-            // drained, so a CMD_MUX_STREAM_SEND payload always lands in
-            // full — never partially dropped. (Until then app_in fills and
-            // the app blocks.) A transparent module (no ALPN) reads app_in
-            // as a raw byte stream into the current connection.
-            if s.app_in >= 0 && s.alpn_cfg_len > 0 {
-                if !app_in_read_done && drained_for_app_in(s) && {
-                    let p = (sys.channel_poll)(s.app_in, POLL_IN);
-                    p > 0 && (p as u32 & POLL_IN) != 0
-                } {
-                    // Largest frame we accept on this surface. The
-                    // alignment-preserving reader drains any payload beyond
-                    // this so an oversize frame can neither desync the FIFO
-                    // (its tail being mis-parsed as the next header) nor be
-                    // silently truncated into the buffer.
-                    let mut buf = [0u8; NET_FRAME_HDR
-                        + mux::STREAM_DATA_PREFIX
-                        + mux::MUX_QUIC_STREAM_SEND_MAX];
-                    let (mt, plen, full_plen) =
-                        net_read_frame_aligned(sys, s.app_in, buf.as_mut_ptr(), buf.len());
+            // Framed mux surface: drain a BOUNDED NUMBER of commands per
+            // step rather than exactly one. One-per-step made the
+            // connection preamble of any protocol that opens several
+            // streams before it can speak cost one scheduler round trip
+            // per stream; the bound keeps the step time fixed while
+            // letting a burst of small commands clear together.
+            //
+            // A transparent module (no ALPN) reads app_in as a raw byte
+            // stream into the current connection instead.
+            if s.app_in >= 0 && mux_mode {
+                if !app_in_read_done {
                     app_in_read_done = true;
-                    // Oversize reliable write: the reader already drained the
-                    // tail to stay frame-aligned. Reject the whole frame
-                    // rather than act on a truncated prefix (no silent loss).
-                    if plen < full_plen {
-                        let m = b"[quic] mux frame over max - rejected";
-                        dev_log(sys, 2, m.as_ptr(), m.len());
-                    } else {
-                        let payload = &buf[NET_FRAME_HDR..NET_FRAME_HDR + plen];
-                        if mt == mux::CMD_MUX_STREAM_OPEN && plen >= mux::SESSION_ID_BYTES {
-                            // RFC 9114 client mode: the app owns HTTP/3, so it
-                            // decides when to make a request and needs a stream
-                            // to make it on. The QUIC v1 profile documented this
-                            // command as "not honoured" because the only app
-                            // surface was a single pre-opened stream; an h3
-                            // client needs one per request.
-                            let cid = u32::from_le_bytes([
-                                payload[0], payload[1], payload[2], payload[3],
-                            ]) as usize;
-                            let flags = if plen > mux::SESSION_ID_BYTES {
-                                payload[mux::SESSION_ID_BYTES]
-                            } else {
-                                mux::STREAM_FLAG_BIDI
-                            };
-                            let stream = h3_open_request_stream(s, cid, flags);
-                            let mut body = [0u8; 1];
-                            body[0] = if stream.is_some() {
-                                mux::STATUS_OK
-                            } else {
-                                mux::STATUS_NO_CAPACITY
-                            };
-                            let sid = stream.unwrap_or(0) as u32;
-                            let _ = mux_emit(
-                                sys,
-                                s.app_out,
-                                mux::MSG_MUX_STREAM_OPENED,
-                                cid as u32,
-                                Some(sid),
-                                &body,
-                            );
-                        } else if mt == mux::CMD_MUX_STREAM_CLOSE && plen >= mux::STREAM_DATA_PREFIX
-                        {
-                            // The app has finished a response and the stream
-                            // owes its FIN. An HTTP/3 response ENDS the stream;
-                            // without the FIN a client keeps waiting for more
-                            // body until its idle timeout — the response is
-                            // correct, just never terminated, so a test that
-                            // tolerates the wait still passes.
-                            let cid = u32::from_le_bytes([
-                                payload[0], payload[1], payload[2], payload[3],
-                            ]) as usize;
-                            let stream_id = u32::from_le_bytes([
-                                payload[4], payload[5], payload[6], payload[7],
-                            ]);
-                            if cid < MAX_CONNS && s.conns[cid].use_h3 {
-                                h3_fin_request_stream(s, cid, stream_id);
-                            }
-                        } else if mt == mux::CMD_MUX_STREAM_SEND && plen >= mux::STREAM_DATA_PREFIX
-                        {
-                            let cid = u32::from_le_bytes([
-                                payload[0], payload[1], payload[2], payload[3],
-                            ]) as usize;
-                            // QUIC v1 constrained profile (see
-                            // contracts/net/mux.rs): the single application
-                            // stream is the client-initiated bidi stream 0. A
-                            // non-zero stream_id is REJECTED, never silently
-                            // remapped onto stream 0.
-                            let stream_id = u32::from_le_bytes([
-                                payload[4], payload[5], payload[6], payload[7],
-                            ]);
-                            let data = &payload[mux::STREAM_DATA_PREFIX..];
-                            // Gate on the ADDRESSED connection's negotiated
-                            // profile: only a raw, non-h3 ALPN connection
-                            // exposes the mux stream surface. An h3 (or
-                            // not-yet-negotiated) connection must never have
-                            // app bytes staged onto its stream 0 here.
-                            let raw_mux = cid < MAX_CONNS
-                                && s.conns[cid].alpn_selected_len > 0
-                                && !s.conns[cid].use_h3;
-                            // On an h3 connection the app owns HTTP/3 and so
-                            // addresses request streams by id. Unlike the
-                            // legacy raw profile this is genuinely multi-stream
-                            // — HTTP/3 multiplexes, and answering request 4 on
-                            // stream 0 would corrupt both.
-                            let h3_mux = cid < MAX_CONNS && s.conns[cid].use_h3;
-                            if h3_mux {
-                                if !h3_stage_request_send(s, cid, stream_id, data) {
-                                    let m = b"[quic] h3 mux send - no such stream";
-                                    dev_log(sys, 2, m.as_ptr(), m.len());
-                                }
-                            } else if stream_id != 0 {
-                                let m = b"[quic] mux stream_id != 0 - rejected";
-                                dev_log(sys, 2, m.as_ptr(), m.len());
-                            } else if !raw_mux {
-                                let m = b"[quic] mux send on non-raw conn - rejected";
-                                dev_log(sys, 2, m.as_ptr(), m.len());
-                            } else {
-                                let conn = &mut s.conns[cid];
-                                let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-                                // `drained_for_app_in` guarantees the send
-                                // buffer was empty, so `space` == capacity.
-                                // Accept the write only if it fits whole;
-                                // reject (drop) rather than partially copy —
-                                // the contract forbids truncating a reliable
-                                // write.
-                                if data.len() <= space {
-                                    core::ptr::copy_nonoverlapping(
-                                        data.as_ptr(),
-                                        conn.stream_send_buf
-                                            .as_mut_ptr()
-                                            .add(conn.stream_send_buf_len),
-                                        data.len(),
-                                    );
-                                    conn.stream_send_buf_len += data.len();
-                                    s.tlm.bytes_out =
-                                        s.tlm.bytes_out.wrapping_add(data.len() as u32);
-                                } else {
-                                    let m = b"[quic] mux stream write over buf - rejected";
-                                    dev_log(sys, 2, m.as_ptr(), m.len());
-                                }
-                            }
-                        } else if mt == mux::CMD_MUX_DATAGRAM_SEND && plen >= mux::SESSION_ID_BYTES
-                        {
-                            let cid = u32::from_le_bytes([
-                                payload[0], payload[1], payload[2], payload[3],
-                            ]) as usize;
-                            let data = &payload[mux::SESSION_ID_BYTES..];
-                            // Same per-connection profile gate as stream send.
-                            let raw_mux = cid < MAX_CONNS
-                                && s.conns[cid].alpn_selected_len > 0
-                                && !s.conns[cid].use_h3;
-                            if raw_mux {
-                                let pmax = s.conns[cid].peer_max_datagram_frame_size as usize;
-                                if pmax > 0
-                                    && data.len() <= pmax
-                                    && data.len() <= QUIC_MAX_DATAGRAM_SIZE
-                                {
-                                    core::ptr::copy_nonoverlapping(
-                                        data.as_ptr(),
-                                        s.conns[cid].dgram_tx.as_mut_ptr(),
-                                        data.len(),
-                                    );
-                                    s.conns[cid].dgram_tx_len = data.len();
-                                    s.conns[cid].dgram_tx_pending = true;
-                                    s.tlm.bytes_out =
-                                        s.tlm.bytes_out.wrapping_add(data.len() as u32);
-                                }
-                            }
-                        }
-                    } // end !oversize
+                    mux_pump_upstream(s);
                 }
             } else if s.app_in >= 0 {
                 // Transparent (no-ALPN) raw byte stream → conn[i] stream.
@@ -1543,8 +1244,7 @@ unsafe fn drained_for_app_in(s: &QuicState) -> bool {
         // one keeps whatever was in its send buffer — nothing will ever
         // acknowledge it — and gating on that stalls the app surface for every
         // later connection: the first request works and the second never gets
-        // its response read. Found end to end with aioquic against the h3 app
-        // surface (docs/architecture/http3-ownership.md).
+        // its response read.
         let live = matches!(
             s.conns[i].phase,
             ConnPhase::Handshaking | ConnPhase::Established
@@ -1594,359 +1294,965 @@ unsafe fn mux_emit(
         scratch.len(),
     ) != 0
 }
-/// surface a peer-initiated REQUEST stream to the app over the `mux`
-/// contract, instead of answering it inside the transport.
+/// A read-only snapshot of one stream slot, taken so the emission path
+/// can decide what to send without holding a borrow on `s` across the
+/// channel writes.
 ///
-/// The counterpart of `raw_stream_forward_to_app` for the multi-stream case:
-/// HTTP/3 multiplexes, so each `bidi_extra_streams` slot is its own mux stream
-/// rather than everything collapsing onto stream 0. The QUIC 62-bit stream id
-/// maps onto the contract's u32 handle unchanged (request ids are 0, 4, 8, …).
-///
-/// Delivery discipline matches the raw path exactly, because the failure modes
-/// are the same: STREAM_ACCEPTED once per stream, receive bytes consumed only
-/// on a successful enqueue, and STREAM_CLOSED emitted exactly once and retried
-/// under backpressure rather than dropped.
-unsafe fn h3_forward_request_streams(s: &mut QuicState, idx: usize) {
-    if s.app_out < 0 {
-        return;
+/// Copying ~60 bytes per stream per step is cheaper than the
+/// alternatives: threading a borrow through the emit calls fights the
+/// fixed-array layout, and dispatching over the two pool shapes through
+/// a trait object is not available here at all — these modules are
+/// position-independent with no relocation processing for a vtable, so a
+/// trait-object call jumps to an unrelocated address and faults the
+/// runtime rather than failing the build.
+#[derive(Clone, Copy)]
+struct StreamSnap {
+    handle: u32,
+    quic_id: u64,
+    locally_initiated: bool,
+    is_bidi: bool,
+    recv_buf_len: usize,
+    recv_fin: bool,
+    send_buf_len: usize,
+    send_fin_emitted: bool,
+    open_sent: bool,
+    close_sent: bool,
+    reset_sent: bool,
+    stopped_sent: bool,
+    recv_reset: bool,
+    recv_reset_error: u64,
+    recv_stop: bool,
+    recv_stop_error: u64,
+    reset_emitted: bool,
+    reset_pending: bool,
+}
+
+/// Snapshot an allocated slot, or `None` when the slot is free.
+unsafe fn stream_snap(conn: &QuicConnection, loc: StreamLoc) -> Option<StreamSnap> {
+    match loc {
+        StreamLoc::Bidi(k) => {
+            let st = &conn.bidi_streams[k];
+            if !st.allocated {
+                return None;
+            }
+            Some(StreamSnap {
+                handle: st.app.handle,
+                quic_id: st.stream_id,
+                locally_initiated: st.locally_initiated,
+                is_bidi: true,
+                recv_buf_len: st.recv_buf_len,
+                recv_fin: st.recv_fin,
+                send_buf_len: st.send_buf_len,
+                send_fin_emitted: st.send_fin_emitted,
+                open_sent: st.app.open_sent,
+                close_sent: st.app.close_sent,
+                reset_sent: st.app.reset_sent,
+                stopped_sent: st.app.stopped_sent,
+                recv_reset: st.abort.recv_reset,
+                recv_reset_error: st.abort.recv_reset_error,
+                recv_stop: st.abort.recv_stop,
+                recv_stop_error: st.abort.recv_stop_error,
+                reset_emitted: st.abort.reset_emitted,
+                reset_pending: st.abort.reset_pending,
+            })
+        }
+        StreamLoc::Uni(k) => {
+            let st = &conn.uni_streams[k];
+            if !st.allocated {
+                return None;
+            }
+            Some(StreamSnap {
+                handle: st.app.handle,
+                quic_id: st.stream_id,
+                locally_initiated: st.locally_initiated,
+                is_bidi: false,
+                recv_buf_len: st.recv_buf_len,
+                recv_fin: st.recv_fin,
+                send_buf_len: st.send_buf_len,
+                send_fin_emitted: st.send_fin_emitted,
+                open_sent: st.app.open_sent,
+                close_sent: st.app.close_sent,
+                reset_sent: st.app.reset_sent,
+                stopped_sent: st.app.stopped_sent,
+                recv_reset: st.abort.recv_reset,
+                recv_reset_error: st.abort.recv_reset_error,
+                recv_stop: st.abort.recv_stop,
+                recv_stop_error: st.abort.recv_stop_error,
+                reset_emitted: st.abort.reset_emitted,
+                reset_pending: st.abort.reset_pending,
+            })
+        }
     }
+}
+
+/// Mutable access to the per-slot `AppStreamView`, which is the only
+/// part of a slot the emission path writes back.
+unsafe fn stream_app_mut(conn: &mut QuicConnection, loc: StreamLoc) -> &mut AppStreamView {
+    match loc {
+        StreamLoc::Bidi(k) => &mut conn.bidi_streams[k].app,
+        StreamLoc::Uni(k) => &mut conn.uni_streams[k].app,
+    }
+}
+
+/// Copy up to `cap` bytes out of a slot's receive buffer.
+unsafe fn stream_peek_recv(conn: &QuicConnection, loc: StreamLoc, out: &mut [u8]) -> usize {
+    let (src, len) = match loc {
+        StreamLoc::Bidi(k) => (
+            conn.bidi_streams[k].recv_buf.as_ptr(),
+            conn.bidi_streams[k].recv_buf_len,
+        ),
+        StreamLoc::Uni(k) => (
+            conn.uni_streams[k].recv_buf.as_ptr(),
+            conn.uni_streams[k].recv_buf_len,
+        ),
+    };
+    let n = len.min(out.len());
+    core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n);
+    n
+}
+
+/// Drop `n` delivered bytes off the front of a slot's receive buffer,
+/// keeping any tail that did not fit in one mux frame.
+unsafe fn stream_consume_recv(conn: &mut QuicConnection, loc: StreamLoc, n: usize) {
+    let (buf, len) = match loc {
+        StreamLoc::Bidi(k) => (
+            conn.bidi_streams[k].recv_buf.as_mut_ptr(),
+            &mut conn.bidi_streams[k].recv_buf_len,
+        ),
+        StreamLoc::Uni(k) => (
+            conn.uni_streams[k].recv_buf.as_mut_ptr(),
+            &mut conn.uni_streams[k].recv_buf_len,
+        ),
+    };
+    let rest = len.saturating_sub(n);
+    if rest > 0 {
+        core::ptr::copy(buf.add(n), buf, rest);
+    }
+    *len = rest;
+}
+
+/// The direction/initiator flag byte for an opened or accepted event.
+fn stream_flags(snap: &StreamSnap) -> u8 {
+    let mut f = if snap.is_bidi {
+        mux::STREAM_FLAG_BIDI
+    } else {
+        mux::STREAM_FLAG_UNI
+    };
+    if snap.locally_initiated {
+        f |= mux::STREAM_FLAG_LOCAL_INIT;
+    }
+    f
+}
+
+/// Free a slot and hand the peer credit for another stream of that kind.
+unsafe fn stream_release(conn: &mut QuicConnection, loc: StreamLoc) {
+    match loc {
+        StreamLoc::Bidi(k) => {
+            let peer_opened = !conn.bidi_streams[k].locally_initiated;
+            conn.bidi_streams[k] = BidiStream::empty();
+            // Freeing the slot is only half of it. The peer's ability to
+            // OPEN another stream is governed by MAX_STREAMS credit (RFC
+            // 9000 §4.6), which is cumulative — so without this a
+            // connection is limited to its initial allowance for life,
+            // and simply stops serving with no error on either side.
+            // Only a slot the PEER used consumed peer credit.
+            if peer_opened {
+                conn.max_streams_bidi_granted = conn.max_streams_bidi_granted.saturating_add(1);
+                conn.max_streams_tx_pending = true;
+            }
+        }
+        StreamLoc::Uni(k) => {
+            let peer_opened = !conn.uni_streams[k].locally_initiated;
+            conn.uni_streams[k] = UniStream::empty();
+            if peer_opened {
+                conn.max_streams_uni_granted = conn.max_streams_uni_granted.saturating_add(1);
+                conn.max_streams_uni_tx_pending = true;
+            }
+        }
+    }
+}
+
+/// Deliver everything one stream currently owes the application, in the
+/// order the contract requires: existence first, then bytes, then a
+/// terminal event.
+///
+/// Returns false when the app channel refused a write. The caller stops
+/// the whole sweep on false — every event here is reliable, so the slot
+/// keeps its state and the identical sequence is retried next step. What
+/// makes that safe is that each latch is set ONLY after its own
+/// successful enqueue, and receive bytes are consumed the moment
+/// STREAM_RX lands: a later backpressured terminal event can therefore
+/// never cause already-delivered bytes to be emitted twice.
+#[must_use]
+unsafe fn stream_deliver(s: &mut QuicState, idx: usize, loc: StreamLoc) -> bool {
     let sys = &*s.syscalls;
     let session = idx as u32;
-    let mut k = 0usize;
-    while k < MAX_BIDI_EXTRA_STREAMS {
-        if !s.conns[idx].bidi_extra_streams[k].allocated {
-            k += 1;
-            continue;
-        }
-        let stream = s.conns[idx].bidi_extra_streams[k].stream_id as u32;
+    let snap = match stream_snap(&s.conns[idx], loc) {
+        Some(v) => v,
+        None => return true,
+    };
 
-        if !s.conns[idx].bidi_extra_streams[k].app_open_sent {
-            let flags = [mux::STREAM_FLAG_BIDI];
+    // 1. The application must know the stream exists before anything
+    //    about it can mean something. A locally-opened stream already
+    //    got its MSG_MUX_STREAM_OPENED when the open was answered; a
+    //    peer-opened one is announced here.
+    if !snap.open_sent {
+        if snap.locally_initiated {
+            // Answered synchronously by the open command; nothing owed.
+            stream_app_mut(&mut s.conns[idx], loc).open_sent = true;
+        } else {
+            let mut body = [0u8; mux::STREAM_ACCEPTED_BODY];
+            body[0] = stream_flags(&snap);
+            body[1..9].copy_from_slice(&snap.quic_id.to_le_bytes());
             if !mux_emit(
                 sys,
                 s.app_out,
                 mux::MSG_MUX_STREAM_ACCEPTED,
                 session,
-                Some(stream),
-                &flags,
+                Some(snap.handle),
+                &body,
             ) {
-                return; // channel full — retry the whole slot next tick
+                return false;
             }
-            s.conns[idx].bidi_extra_streams[k].app_open_sent = true;
+            stream_app_mut(&mut s.conns[idx], loc).open_sent = true;
         }
+    }
 
-        let n = s.conns[idx].bidi_extra_streams[k].recv_buf_len;
-        if n > 0 {
-            let mut data = [0u8; MUX_DATA_MAX];
-            let cn = n.min(data.len());
-            core::ptr::copy_nonoverlapping(
-                s.conns[idx].bidi_extra_streams[k].recv_buf.as_ptr(),
-                data.as_mut_ptr(),
-                cn,
-            );
+    // 2. Ordered bytes. Every byte the peer sent, including the first —
+    //    this transport does not read, classify, or strip a leading
+    //    varint that an application protocol may use as a stream type.
+    if snap.recv_buf_len > 0 {
+        let mut data = [0u8; MUX_DATA_MAX];
+        let cn = stream_peek_recv(&s.conns[idx], loc, &mut data);
+        if cn > 0 {
             if !mux_emit(
                 sys,
                 s.app_out,
                 mux::MSG_MUX_STREAM_RX,
                 session,
-                Some(stream),
+                Some(snap.handle),
                 &data[..cn],
             ) {
-                return; // retain + retry; the bytes are not yet delivered
-            }
-            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(cn as u32);
-            // Consume only what was delivered. A partial take (recv_buf larger
-            // than MUX_DATA_MAX) leaves the tail for the next tick rather than
-            // dropping it.
-            let rest = n - cn;
-            if rest > 0 {
-                core::ptr::copy(
-                    s.conns[idx].bidi_extra_streams[k].recv_buf.as_ptr().add(cn),
-                    s.conns[idx].bidi_extra_streams[k].recv_buf.as_mut_ptr(),
-                    rest,
-                );
-            }
-            s.conns[idx].bidi_extra_streams[k].recv_buf_len = rest;
-        }
-
-        if s.conns[idx].bidi_extra_streams[k].recv_fin
-            && s.conns[idx].bidi_extra_streams[k].recv_buf_len == 0
-            && !s.conns[idx].bidi_extra_streams[k].app_close_sent
-        {
-            let reason = [mux::STATUS_OK];
-            if !mux_emit(
-                sys,
-                s.app_out,
-                mux::MSG_MUX_STREAM_CLOSED,
-                session,
-                Some(stream),
-                &reason,
-            ) {
-                return; // never best-effort: retry until it lands
-            }
-            s.conns[idx].bidi_extra_streams[k].app_close_sent = true;
-        }
-        k += 1;
-    }
-}
-
-/// Reclaim request-stream slots whose exchange is over, and grant the peer
-/// credit to open more.
-///
-/// Stream lifecycle and flow control are the transport's job whoever owns the
-/// protocol above them.
-///
-/// A `bidi_extra_streams` slot is allocated per request, so without reclamation
-/// a connection serves exactly `MAX_BIDI_EXTRA_STREAMS + 1` requests (the main
-/// stream plus the pool) and then stalls — no error on either side, the next
-/// request simply never completes. A load run is the only thing that shows it;
-/// a handful of requests per connection stays under the cap.
-///
-/// A slot is reclaimable once both halves are done: the peer FIN'd its request
-/// and our response has been fully sent and acknowledged as emitted (buffer
-/// drained, FIN emitted).
-unsafe fn h3_reap_bidi_streams(s: &mut QuicState, idx: usize) {
-    // A slot is not done until the STREAM_CLOSED we emit upstream has landed:
-    // reclaiming before that would recycle the id out from under the app.
-    let mut k = 0usize;
-    while k < MAX_BIDI_EXTRA_STREAMS {
-        let slot = &mut s.conns[idx].bidi_extra_streams[k];
-        if slot.allocated
-            && slot.recv_fin
-            && slot.app_close_sent
-            && slot.send_buf_len == 0
-            && slot.send_fin_emitted
-        {
-            *slot = BidiExtraStream::empty();
-            // Reclaiming the slot is only half of it. The peer's ability to
-            // OPEN another stream is governed by MAX_STREAMS credit (RFC 9000
-            // §4.6), which is cumulative and which this module never issued —
-            // so a connection was limited to its initial_max_streams_bidi (4)
-            // for life, whatever we freed locally. Grant one more.
-            s.conns[idx].max_streams_bidi_granted =
-                s.conns[idx].max_streams_bidi_granted.saturating_add(1);
-            s.conns[idx].max_streams_tx_pending = true;
-        }
-        k += 1;
-    }
-}
-
-/// mark the addressed request stream finished, so the engine emits a
-/// STREAM frame with FIN once its buffer drains.
-///
-/// The response half of the exchange ends here. Without it the peer's stream
-/// stays open and a well-behaved client waits for more body until its idle
-/// timeout — which reads as a slow server rather than an unterminated response.
-unsafe fn h3_fin_request_stream(s: &mut QuicState, cid: usize, stream_id: u32) {
-    if cid >= MAX_CONNS {
-        return;
-    }
-    if stream_id == 0 {
-        s.conns[cid].stream_send_fin = true;
-        return;
-    }
-    let mut k = 0usize;
-    while k < MAX_BIDI_EXTRA_STREAMS {
-        let slot = &mut s.conns[cid].bidi_extra_streams[k];
-        if slot.allocated && slot.stream_id as u32 == stream_id {
-            slot.send_fin_pending = true;
-            return;
-        }
-        k += 1;
-    }
-}
-
-/// Client mode: open a client-initiated bidi stream for one request.
-///
-/// Returns its id, or None when the pool is full. Ids follow RFC 9000 §2.1
-/// (0, 4, 8, …); id 0 is the connection's main stream and is used first, since
-/// it exists already and costs no pool slot.
-unsafe fn h3_open_request_stream(s: &mut QuicState, cid: usize, flags: u8) -> Option<u64> {
-    if cid >= MAX_CONNS || !s.conns[cid].use_h3 {
-        return None;
-    }
-    // Unidirectional: HTTP/3's control and QPACK streams (RFC 9114 §6.2). The
-    // app owns the protocol, so it owns the connection preamble too — it writes
-    // the stream-type prefix and its own SETTINGS. This module only hands out
-    // the id and carries the bytes.
-    if flags & mux::STREAM_FLAG_UNI != 0 {
-        let is_server = s.conns[cid].is_server;
-        let conn = &mut s.conns[cid];
-        let id = if is_server {
-            next_server_uni_id(conn.h3_next_uni_idx)
-        } else {
-            next_client_uni_id(conn.h3_next_uni_idx)
-        };
-        conn.h3_next_uni_idx = conn.h3_next_uni_idx.wrapping_add(1);
-        extra_alloc(conn, id, true)?;
-        return Some(id);
-    }
-    // The main stream first, once.
-    if !s.conns[cid].raw_stream_open_sent && s.conns[cid].stream_send_buf_len == 0 {
-        s.conns[cid].raw_stream_open_sent = true;
-        s.conns[cid].h3_next_bidi_idx = 1;
-        return Some(0);
-    }
-    let idx = s.conns[cid].h3_next_bidi_idx.max(1);
-    let stream_id = next_client_bidi_id(idx);
-    let slot = bidi_alloc(&mut s.conns[cid], stream_id, true)?;
-    let _ = slot;
-    s.conns[cid].h3_next_bidi_idx = idx.saturating_add(1);
-    Some(stream_id)
-}
-
-/// stage app bytes onto the addressed request stream.
-///
-/// Returns false when the stream is unknown, so the caller can log a rejection
-/// rather than silently writing the response of one request onto another.
-unsafe fn h3_stage_request_send(
-    s: &mut QuicState,
-    cid: usize,
-    stream_id: u32,
-    data: &[u8],
-) -> bool {
-    if cid >= MAX_CONNS {
-        return false;
-    }
-    // The connection's own first bidi stream is not in the extra pool — it is
-    // the legacy `stream_send_buf`. A response addressed to it must land there,
-    // or the first request on every connection is answered into the void.
-    if stream_id == 0 {
-        let conn = &mut s.conns[cid];
-        let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
-        if data.len() > space {
-            return false;
-        }
-        core::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            conn.stream_send_buf
-                .as_mut_ptr()
-                .add(conn.stream_send_buf_len),
-            data.len(),
-        );
-        conn.stream_send_buf_len += data.len();
-        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(data.len() as u32);
-        return true;
-    }
-    // Unidirectional streams the app opened (HTTP/3 control / QPACK) live in
-    // the `extra_streams` pool, not the bidi one.
-    let mut u = 0usize;
-    while u < MAX_EXTRA_STREAMS {
-        let slot = &mut s.conns[cid].extra_streams[u];
-        if slot.allocated && slot.locally_initiated && slot.stream_id as u32 == stream_id {
-            let space = slot.send_buf.len() - slot.send_buf_len;
-            if data.len() > space {
                 return false;
             }
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                slot.send_buf.as_mut_ptr().add(slot.send_buf_len),
-                data.len(),
-            );
-            slot.send_buf_len += data.len();
-            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(data.len() as u32);
-            return true;
+            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(cn as u32);
+            stream_consume_recv(&mut s.conns[idx], loc, cn);
         }
-        u += 1;
     }
-    let mut k = 0usize;
-    while k < MAX_BIDI_EXTRA_STREAMS {
-        let slot = &mut s.conns[cid].bidi_extra_streams[k];
-        if slot.allocated && slot.stream_id as u32 == stream_id {
-            let space = slot.send_buf.len() - slot.send_buf_len;
-            if data.len() > space {
-                return false; // reject whole, never truncate a reliable write
-            }
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                slot.send_buf.as_mut_ptr().add(slot.send_buf_len),
-                data.len(),
-            );
-            slot.send_buf_len += data.len();
-            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(data.len() as u32);
-            return true;
-        }
-        k += 1;
-    }
-    false
-}
 
-/// Forward inbound stream bytes to the raw bidi-stream app surface
-/// (piece 2) as length-prefixed mux frames: a one-shot
-/// MSG_MUX_STREAM_ACCEPTED for the peer-opened bidi stream (id 0), a
-/// MSG_MUX_STREAM_RX carrying the bytes, and a MSG_MUX_STREAM_CLOSED on
-/// FIN. Returns true iff every required frame was forwarded; on false
-/// (app backpressure) the caller MUST retain `stream_recv_buf` and retry
-/// — reliable stream bytes are never dropped. Only called for
-/// connections that negotiated a non-h3 ALPN.
-#[must_use]
-unsafe fn raw_stream_forward_to_app(s: &mut QuicState, idx: usize, n: usize) -> bool {
-    if s.app_out < 0 {
-        return false;
-    }
-    let sys = &*s.syscalls;
-    let session = idx as u32;
-    let stream = 0u32; // main client-initiated bidi stream
-    if !s.conns[idx].raw_stream_open_sent {
-        let flags = [mux::STREAM_FLAG_BIDI];
+    // 3. A peer STOP_SENDING is not terminal for the stream — it asks us
+    //    to stop producing — so it is delivered before any close.
+    if snap.recv_stop && !snap.stopped_sent {
+        let mut body = [0u8; mux::STREAM_APP_ERROR_BODY];
+        body.copy_from_slice(&snap.recv_stop_error.to_le_bytes());
         if !mux_emit(
             sys,
             s.app_out,
-            mux::MSG_MUX_STREAM_ACCEPTED,
+            mux::MSG_MUX_STREAM_STOPPED,
             session,
-            Some(stream),
-            &flags,
+            Some(snap.handle),
+            &body,
         ) {
-            return false; // channel full → retry the whole forward
+            return false;
         }
-        s.conns[idx].raw_stream_open_sent = true;
+        stream_app_mut(&mut s.conns[idx], loc).stopped_sent = true;
     }
-    if n > 0 {
-        let mut data = [0u8; MUX_DATA_MAX];
-        let cn = n.min(data.len());
-        core::ptr::copy_nonoverlapping(
-            s.conns[idx].stream_recv_buf.as_ptr(),
-            data.as_mut_ptr(),
-            cn,
-        );
+
+    // 4. Terminal events. A reset supersedes a clean close: the peer
+    //    abandoned the stream rather than finishing it, and telling the
+    //    application it ended cleanly would be a lie about whether the
+    //    bytes it did not receive were ever coming.
+    let refreshed = match stream_snap(&s.conns[idx], loc) {
+        Some(v) => v,
+        None => return true,
+    };
+    if refreshed.recv_reset && !refreshed.reset_sent {
+        let mut body = [0u8; mux::STREAM_APP_ERROR_BODY];
+        body.copy_from_slice(&refreshed.recv_reset_error.to_le_bytes());
         if !mux_emit(
             sys,
             s.app_out,
-            mux::MSG_MUX_STREAM_RX,
+            mux::MSG_MUX_STREAM_RESET,
             session,
-            Some(stream),
-            &data[..cn],
+            Some(refreshed.handle),
+            &body,
         ) {
-            return false; // retain + retry (data not yet delivered)
+            return false;
         }
-        s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(cn as u32);
-        // Data delivery is tracked INDEPENDENTLY of FIN delivery: the
-        // moment STREAM_RX lands we consume the receive buffer here, so a
-        // subsequently-backpressured STREAM_CLOSED (which returns `false`
-        // below) cannot cause these same bytes to be re-emitted on the
-        // retry tick. The caller's clear-on-true is then a no-op.
-        s.conns[idx].stream_recv_buf_len = 0;
-    }
-    if s.conns[idx].stream_recv_fin && !s.conns[idx].raw_stream_close_sent {
-        // FIN delivery is reliable: emit STREAM_CLOSED exactly once, and
-        // only mark it sent on a successful enqueue. On backpressure
-        // return false so the caller retains state and retries — the
-        // close is never dropped (including an empty FIN, where the data
-        // emit above is skipped). `raw_stream_close_sent` guards against a
-        // duplicate CLOSED on any later forward.
+        stream_app_mut(&mut s.conns[idx], loc).reset_sent = true;
+    } else if refreshed.recv_fin && refreshed.recv_buf_len == 0 && !refreshed.close_sent {
+        // Emitted for an empty FIN too — a stream the peer opens and
+        // closes without payload still owes its close, or the
+        // application waits forever for a stream that is already over.
+        let reason = [mux::STATUS_OK];
         if !mux_emit(
             sys,
             s.app_out,
             mux::MSG_MUX_STREAM_CLOSED,
             session,
-            Some(stream),
-            &[0u8],
+            Some(refreshed.handle),
+            &reason,
         ) {
             return false;
         }
-        s.conns[idx].raw_stream_close_sent = true;
+        stream_app_mut(&mut s.conns[idx], loc).close_sent = true;
+    }
+
+    // 5. Reclaim. Only once BOTH halves are finished AND every
+    //    notification about them has actually been delivered — recycling
+    //    a slot earlier would hand its handle to a new stream while the
+    //    application still believed the old one was live.
+    let done = match stream_snap(&s.conns[idx], loc) {
+        Some(v) => v,
+        None => return true,
+    };
+    let recv_done = (done.recv_fin && done.close_sent) || (done.recv_reset && done.reset_sent);
+    // A peer-initiated unidirectional stream has no send half, and a
+    // locally-initiated one has no recv half.
+    let send_half_applies = done.is_bidi || done.locally_initiated;
+    let send_done = !send_half_applies
+        || (done.send_buf_len == 0 && done.send_fin_emitted)
+        || (done.reset_emitted && !done.reset_pending);
+    let recv_half_applies = done.is_bidi || !done.locally_initiated;
+    if send_done && (!recv_half_applies || recv_done) {
+        stream_release(&mut s.conns[idx], loc);
     }
     true
+}
+
+/// Everything this connection owes the application this step, on the
+/// framed mux surface.
+///
+/// One path for every session. There is no branch on the negotiated
+/// protocol anywhere below, because the transport does not know what the
+/// protocol is — it knows there is a session, that the session has
+/// streams, and that bytes on those streams belong to somebody else.
+unsafe fn mux_pump_downstream(s: &mut QuicState, idx: usize) {
+    if s.app_out < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let session = idx as u32;
+
+    // 1. The session itself, before anything that belongs to it. An
+    //    application must never have to assume session 0, discover a
+    //    session from the first stream that arrives on it, or reach into
+    //    the transport's connection table.
+    if !s.conns[idx].session_opened_sent {
+        let alpn_len = s.conns[idx].alpn_selected_len as usize;
+        let mut body = [0u8; mux::SESSION_OPENED_BODY_MIN + MAX_ALPN];
+        body[0] = mux::STATUS_OK;
+        body[1] = if s.conns[idx].is_server {
+            0
+        } else {
+            mux::SESSION_FLAG_LOCAL_INIT
+        };
+        body[2] = alpn_len as u8;
+        body[3..3 + alpn_len].copy_from_slice(&s.conns[idx].alpn_selected[..alpn_len]);
+        if !mux_emit(
+            sys,
+            s.app_out,
+            mux::MSG_MUX_SESSION_OPENED,
+            session,
+            None,
+            &body[..mux::SESSION_OPENED_BODY_MIN + alpn_len],
+        ) {
+            return; // retry the whole session next step
+        }
+        s.conns[idx].session_opened_sent = true;
+    }
+
+    // 2. Peer identity, for every session — the authenticated binding is
+    //    a property of the secure transport, not of any one protocol
+    //    that runs over it. Minimal form: no client cert → verified=0.
+    if s.conns[idx].handshake_confirmed && !s.conns[idx].peer_identity_sent {
+        let body = [0u8, 0u8, 0u8]; // verified=0, svid_len=0
+        if !mux_emit(
+            sys,
+            s.app_out,
+            mux::MSG_MUX_PEER_IDENTITY,
+            session,
+            None,
+            &body,
+        ) {
+            return;
+        }
+        s.conns[idx].peer_identity_sent = true;
+    }
+
+    // 3. Every stream, both pools, bidirectional and unidirectional
+    //    alike, whoever opened it.
+    let mut k = 0;
+    while k < MAX_BIDI_STREAMS {
+        if !stream_deliver(s, idx, StreamLoc::Bidi(k)) {
+            return;
+        }
+        k += 1;
+    }
+    let mut k = 0;
+    while k < MAX_UNI_STREAMS {
+        if !stream_deliver(s, idx, StreamLoc::Uni(k)) {
+            return;
+        }
+        k += 1;
+    }
+
+    // 4. Inbound datagrams (RFC 9221), on every session. Unreliable by
+    //    contract: the single slot is cleared whether or not the
+    //    forward succeeds, because a retained datagram is a datagram
+    //    delivered late, which §5.2 does not promise and an application
+    //    reading them must not be given.
+    if s.conns[idx].dgram_rx_pending {
+        let dn = s.conns[idx].dgram_rx_len;
+        let mut data = [0u8; QUIC_MAX_DATAGRAM_SIZE];
+        core::ptr::copy_nonoverlapping(s.conns[idx].dgram_rx.as_ptr(), data.as_mut_ptr(), dn);
+        if mux_emit(
+            sys,
+            s.app_out,
+            mux::MSG_MUX_DATAGRAM_RX,
+            session,
+            None,
+            &data[..dn],
+        ) {
+            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(dn as u32);
+        }
+        s.conns[idx].dgram_rx_pending = false;
+        s.conns[idx].dgram_rx_len = 0;
+    }
+}
+
+/// Announce a session's end exactly once, to an application that was
+/// told the session began.
+///
+/// Called from the close paths rather than the established-connection
+/// sweep, because by then the connection is no longer Established and
+/// the sweep does not run for it.
+unsafe fn mux_emit_session_closed(s: &mut QuicState, idx: usize, reason: u8) {
+    if s.app_out < 0 || !s.conns[idx].framed_app_surface {
+        return;
+    }
+    if !s.conns[idx].session_opened_sent || s.conns[idx].session_closed_sent {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let body = [reason];
+    if mux_emit(
+        sys,
+        s.app_out,
+        mux::MSG_MUX_SESSION_CLOSED,
+        idx as u32,
+        None,
+        &body,
+    ) {
+        s.conns[idx].session_closed_sent = true;
+    }
+}
+
+/// Report a refused reliable command, so the application learns its
+/// bytes did not go out instead of watching them vanish.
+unsafe fn mux_emit_stream_error(s: &mut QuicState, idx: usize, handle: u32, errno: i8) {
+    let sys = &*s.syscalls;
+    let body = [errno as u8];
+    let _ = mux_emit(
+        sys,
+        s.app_out,
+        mux::MSG_MUX_STREAM_ERROR,
+        idx as u32,
+        Some(handle),
+        &body,
+    );
+}
+
+// ---------------------------------------------------------------------
+// Application commands (app → quic)
+// ---------------------------------------------------------------------
+
+/// Open a stream locally, in whichever direction was asked for.
+///
+/// Returns the app handle and the QUIC stream id, or None when there is
+/// no slot or no peer MAX_STREAMS credit. A refused open is reported to
+/// the application as STATUS_NO_CAPACITY and, where the peer is the
+/// limit, a STREAMS_BLOCKED frame tells the peer we wanted one — so a
+/// stalled application has a cause on both sides rather than silence.
+unsafe fn stream_open_local(s: &mut QuicState, cid: usize, flags: u8) -> Option<(u32, u64)> {
+    if cid >= MAX_CONNS {
+        return None;
+    }
+    let is_server = s.conns[cid].is_server;
+    let want_uni = flags & mux::STREAM_FLAG_UNI != 0;
+    let conn = &mut s.conns[cid];
+    if want_uni {
+        if conn.local_uni_opened >= conn.peer_max_streams_uni {
+            conn.streams_blocked_uni_pending = true;
+            return None;
+        }
+        let id = if is_server {
+            next_server_uni_id(conn.next_uni_idx)
+        } else {
+            next_client_uni_id(conn.next_uni_idx)
+        };
+        let slot = uni_alloc(conn, id, true)?;
+        conn.next_uni_idx = conn.next_uni_idx.wrapping_add(1);
+        conn.local_uni_opened = conn.local_uni_opened.saturating_add(1);
+        return Some((conn.uni_streams[slot].app.handle, id));
+    }
+    if conn.local_bidi_opened >= conn.peer_max_streams_bidi {
+        conn.streams_blocked_bidi_pending = true;
+        return None;
+    }
+    let id = if is_server {
+        next_server_bidi_id(conn.next_bidi_idx)
+    } else {
+        next_client_bidi_id(conn.next_bidi_idx)
+    };
+    let slot = bidi_alloc(conn, id, true)?;
+    conn.next_bidi_idx = conn.next_bidi_idx.wrapping_add(1);
+    conn.local_bidi_opened = conn.local_bidi_opened.saturating_add(1);
+    Some((conn.bidi_streams[slot].app.handle, id))
+}
+
+/// Stage application bytes onto a stream's send buffer.
+///
+/// All-or-nothing: a write that does not fit whole is refused, never
+/// truncated and never partially applied. Truncating a reliable write is
+/// worse than refusing it — the application has no way to learn which
+/// suffix was dropped, and the stream carries a silently corrupted
+/// message from then on.
+unsafe fn stream_stage_send(s: &mut QuicState, cid: usize, handle: u32, data: &[u8]) -> bool {
+    if cid >= MAX_CONNS {
+        return false;
+    }
+    let loc = match locate_handle(&s.conns[cid], handle) {
+        Some(l) => l,
+        None => return false,
+    };
+    // Connection-level flow control (RFC 9000 §4.1) applies across every
+    // stream, so a write can be refused by the aggregate window even
+    // when its own stream has room.
+    let conn = &mut s.conns[cid];
+    let need = data.len() as u64;
+    if conn.send_data_used.saturating_add(need) > conn.send_max_data {
+        conn.data_blocked_pending = true;
+        return false;
+    }
+    let ok = match loc {
+        StreamLoc::Bidi(k) => {
+            let st = &mut conn.bidi_streams[k];
+            let space = st.send_buf.len() - st.send_buf_len;
+            let window_left = st.flow.send_max_data.saturating_sub(st.send_off);
+            if need > window_left {
+                st.flow.send_blocked_pending = true;
+                false
+            } else if data.len() > space {
+                false
+            } else {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    st.send_buf.as_mut_ptr().add(st.send_buf_len),
+                    data.len(),
+                );
+                st.send_buf_len += data.len();
+                true
+            }
+        }
+        StreamLoc::Uni(k) => {
+            let st = &mut conn.uni_streams[k];
+            if !st.locally_initiated {
+                // A unidirectional stream the PEER opened is receive-only
+                // for us; there is no send half to write to.
+                false
+            } else {
+                let space = st.send_buf.len() - st.send_buf_len;
+                let window_left = st.flow.send_max_data.saturating_sub(st.send_off);
+                if need > window_left {
+                    st.flow.send_blocked_pending = true;
+                    false
+                } else if data.len() > space {
+                    false
+                } else {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        st.send_buf.as_mut_ptr().add(st.send_buf_len),
+                        data.len(),
+                    );
+                    st.send_buf_len += data.len();
+                    true
+                }
+            }
+        }
+    };
+    if ok {
+        conn.send_data_used = conn.send_data_used.saturating_add(need);
+        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(data.len() as u32);
+    }
+    ok
+}
+
+/// Mark a stream's local send half finished, so a STREAM frame with FIN
+/// goes out once its buffer drains.
+unsafe fn stream_fin_local(s: &mut QuicState, cid: usize, handle: u32) -> bool {
+    if cid >= MAX_CONNS {
+        return false;
+    }
+    match locate_handle(&s.conns[cid], handle) {
+        Some(StreamLoc::Bidi(k)) => {
+            s.conns[cid].bidi_streams[k].send_fin_pending = true;
+            true
+        }
+        Some(StreamLoc::Uni(k)) => {
+            if !s.conns[cid].uni_streams[k].locally_initiated {
+                return false;
+            }
+            s.conns[cid].uni_streams[k].send_fin_pending = true;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Queue a RESET_STREAM carrying the application's opaque error code,
+/// discarding whatever was still buffered for that stream.
+unsafe fn stream_reset_local(s: &mut QuicState, cid: usize, handle: u32, app_error: u64) -> bool {
+    if cid >= MAX_CONNS {
+        return false;
+    }
+    match locate_handle(&s.conns[cid], handle) {
+        Some(StreamLoc::Bidi(k)) => {
+            let st = &mut s.conns[cid].bidi_streams[k];
+            st.abort.reset_pending = true;
+            st.abort.reset_error = app_error;
+            st.send_buf_len = 0;
+            true
+        }
+        Some(StreamLoc::Uni(k)) => {
+            let st = &mut s.conns[cid].uni_streams[k];
+            if !st.locally_initiated {
+                return false;
+            }
+            st.abort.reset_pending = true;
+            st.abort.reset_error = app_error;
+            st.send_buf_len = 0;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Queue a STOP_SENDING carrying the application's opaque error code.
+unsafe fn stream_stop_local(s: &mut QuicState, cid: usize, handle: u32, app_error: u64) -> bool {
+    if cid >= MAX_CONNS {
+        return false;
+    }
+    match locate_handle(&s.conns[cid], handle) {
+        Some(StreamLoc::Bidi(k)) => {
+            let st = &mut s.conns[cid].bidi_streams[k];
+            st.abort.stop_pending = true;
+            st.abort.stop_error = app_error;
+            true
+        }
+        Some(StreamLoc::Uni(k)) => {
+            let st = &mut s.conns[cid].uni_streams[k];
+            if st.locally_initiated {
+                // Our own unidirectional stream: nothing is arriving on
+                // it to ask the peer to stop.
+                return false;
+            }
+            st.abort.stop_pending = true;
+            st.abort.stop_error = app_error;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Record that the application has consumed `bytes` from a stream, and
+/// advance the receive windows if that has opened enough room to be
+/// worth a frame.
+///
+/// This is the only thing that moves MAX_STREAM_DATA and MAX_DATA. The
+/// transport does not invent credit on the application's behalf: doing
+/// so would advertise buffer space that the application has not actually
+/// freed, and the peer would fill it.
+unsafe fn stream_ack_credit(s: &mut QuicState, cid: usize, handle: u32, bytes: u32) -> bool {
+    if cid >= MAX_CONNS {
+        return false;
+    }
+    let loc = match locate_handle(&s.conns[cid], handle) {
+        Some(l) => l,
+        None => return false,
+    };
+    let conn = &mut s.conns[cid];
+    let n = bytes as u64;
+    let flow = match loc {
+        StreamLoc::Bidi(k) => &mut conn.bidi_streams[k].flow,
+        StreamLoc::Uni(k) => &mut conn.uni_streams[k].flow,
+    };
+    flow.recv_consumed = flow.recv_consumed.saturating_add(n);
+    // Advance by a whole window once the application is half way through
+    // one — one frame per window rather than one per read.
+    if flow.recv_consumed + LOCAL_STREAM_WINDOW / FLOW_UPDATE_DIVISOR >= flow.recv_max_data {
+        flow.recv_max_data = flow.recv_consumed.saturating_add(LOCAL_STREAM_WINDOW);
+        flow.recv_max_data_tx_pending = true;
+    }
+    conn.recv_data_consumed = conn.recv_data_consumed.saturating_add(n);
+    if conn.recv_data_consumed + LOCAL_CONN_WINDOW / FLOW_UPDATE_DIVISOR >= conn.recv_max_data {
+        conn.recv_max_data = conn.recv_data_consumed.saturating_add(LOCAL_CONN_WINDOW);
+        conn.max_data_tx_pending = true;
+    }
+    true
+}
+
+/// Largest number of application commands consumed in one step.
+///
+/// Bounded rather than unbounded so one busy application cannot starve
+/// the packet path, and more than one so a protocol whose connection
+/// preamble opens several streams before it can speak does not pay a
+/// scheduler round trip per stream.
+const MUX_CMDS_PER_STEP: usize = 8;
+
+/// Drain up to [`MUX_CMDS_PER_STEP`] application commands.
+unsafe fn mux_pump_upstream(s: &mut QuicState) {
+    let sys = &*s.syscalls;
+    let mut budget = 0usize;
+    while budget < MUX_CMDS_PER_STEP {
+        budget += 1;
+        if !drained_for_app_in(s) {
+            // Reliable backpressure: we only take a command when the
+            // addressed connection can store its payload in full, so a
+            // CMD_MUX_STREAM_SEND always lands whole. Until then app_in
+            // fills and the application blocks.
+            return;
+        }
+        let p = (sys.channel_poll)(s.app_in, POLL_IN);
+        if p <= 0 || (p as u32 & POLL_IN) == 0 {
+            return;
+        }
+        // Largest frame we accept on this surface. The
+        // alignment-preserving reader drains any payload beyond this so
+        // an oversize frame can neither desync the FIFO (its tail being
+        // mis-parsed as the next header) nor be silently truncated.
+        let mut buf =
+            [0u8; NET_FRAME_HDR + mux::STREAM_DATA_PREFIX + mux::MUX_QUIC_STREAM_SEND_MAX];
+        let (mt, plen, full_plen) =
+            net_read_frame_aligned(sys, s.app_in, buf.as_mut_ptr(), buf.len());
+        if plen == 0 && full_plen == 0 {
+            return;
+        }
+        if plen < full_plen {
+            // Oversize reliable write: the reader already drained the
+            // tail to stay frame-aligned. Refuse the whole frame rather
+            // than act on a truncated prefix.
+            let m = b"[quic] mux frame over max - rejected";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            continue;
+        }
+        let payload = &buf[NET_FRAME_HDR..NET_FRAME_HDR + plen];
+        mux_apply_command(s, mt, payload);
+    }
+}
+
+/// Apply one decoded application command.
+unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
+    let sys = &*s.syscalls;
+    if plen_lt(payload, mux::SESSION_ID_BYTES) {
+        return;
+    }
+    let cid =
+        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if cid >= MAX_CONNS {
+        return;
+    }
+    // Stream-scoped commands share a prefix; decode it once.
+    let handle = if payload.len() >= mux::STREAM_DATA_PREFIX {
+        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+    } else {
+        0
+    };
+    match mt {
+        mux::CMD_MUX_STREAM_OPEN => {
+            let flags = if payload.len() > mux::SESSION_ID_BYTES {
+                payload[mux::SESSION_ID_BYTES]
+            } else {
+                mux::STREAM_FLAG_BIDI
+            };
+            let opened = stream_open_local(s, cid, flags);
+            let mut body = [0u8; mux::STREAM_OPENED_BODY];
+            match opened {
+                Some((h, quic_id)) => {
+                    body[0] = mux::STATUS_OK;
+                    body[1] = flags | mux::STREAM_FLAG_LOCAL_INIT;
+                    body[2..10].copy_from_slice(&quic_id.to_le_bytes());
+                    let _ = mux_emit(
+                        sys,
+                        s.app_out,
+                        mux::MSG_MUX_STREAM_OPENED,
+                        cid as u32,
+                        Some(h),
+                        &body,
+                    );
+                }
+                None => {
+                    body[0] = mux::STATUS_NO_CAPACITY;
+                    body[1] = flags | mux::STREAM_FLAG_LOCAL_INIT;
+                    let _ = mux_emit(
+                        sys,
+                        s.app_out,
+                        mux::MSG_MUX_STREAM_OPENED,
+                        cid as u32,
+                        Some(0),
+                        &body,
+                    );
+                }
+            }
+        }
+        mux::CMD_MUX_STREAM_SEND => {
+            if payload.len() < mux::STREAM_DATA_PREFIX {
+                return;
+            }
+            let data = &payload[mux::STREAM_DATA_PREFIX..];
+            if !stream_stage_send(s, cid, handle, data) {
+                // Never silently dropped: the application is told the
+                // bytes did not go out, so it can retry them.
+                mux_emit_stream_error(s, cid, handle, abi::errno::EAGAIN as i8);
+            }
+        }
+        mux::CMD_MUX_STREAM_CLOSE => {
+            if payload.len() < mux::STREAM_DATA_PREFIX {
+                return;
+            }
+            if !stream_fin_local(s, cid, handle) {
+                mux_emit_stream_error(s, cid, handle, abi::errno::EINVAL as i8);
+            }
+        }
+        mux::CMD_MUX_STREAM_RESET => {
+            if payload.len() < mux::STREAM_DATA_PREFIX + mux::STREAM_APP_ERROR_BODY {
+                return;
+            }
+            let app_error = le_u64(&payload[mux::STREAM_DATA_PREFIX..]);
+            if !stream_reset_local(s, cid, handle, app_error) {
+                mux_emit_stream_error(s, cid, handle, abi::errno::EINVAL as i8);
+            }
+        }
+        mux::CMD_MUX_STREAM_STOP_SENDING => {
+            if payload.len() < mux::STREAM_DATA_PREFIX + mux::STREAM_APP_ERROR_BODY {
+                return;
+            }
+            let app_error = le_u64(&payload[mux::STREAM_DATA_PREFIX..]);
+            if !stream_stop_local(s, cid, handle, app_error) {
+                mux_emit_stream_error(s, cid, handle, abi::errno::EINVAL as i8);
+            }
+        }
+        mux::CMD_MUX_STREAM_ACK => {
+            if payload.len() < mux::STREAM_DATA_PREFIX + 4 {
+                return;
+            }
+            let n = u32::from_le_bytes([
+                payload[mux::STREAM_DATA_PREFIX],
+                payload[mux::STREAM_DATA_PREFIX + 1],
+                payload[mux::STREAM_DATA_PREFIX + 2],
+                payload[mux::STREAM_DATA_PREFIX + 3],
+            ]);
+            let _ = stream_ack_credit(s, cid, handle, n);
+        }
+        mux::CMD_MUX_DATAGRAM_SEND => {
+            let data = &payload[mux::SESSION_ID_BYTES..];
+            // Available on every session. The negotiated max is enforced
+            // and the payload is never inspected.
+            let pmax = s.conns[cid].peer_max_datagram_frame_size as usize;
+            if pmax > 0 && data.len() <= pmax && data.len() <= QUIC_MAX_DATAGRAM_SIZE {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    s.conns[cid].dgram_tx.as_mut_ptr(),
+                    data.len(),
+                );
+                s.conns[cid].dgram_tx_len = data.len();
+                s.conns[cid].dgram_tx_pending = true;
+                s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(data.len() as u32);
+            }
+        }
+        mux::CMD_MUX_SESSION_CLOSE => {
+            // The application is done with the session. Move it to
+            // Closed; the idle sweep emits the close frame and frees the
+            // slot, and `mux_emit_session_closed` tells the application
+            // it happened.
+            s.conns[cid].phase = ConnPhase::Closed;
+        }
+        _ => {}
+    }
+}
+
+/// Length guard shared by the command decoders.
+#[inline(always)]
+fn plen_lt(payload: &[u8], need: usize) -> bool {
+    payload.len() < need
+}
+
+/// Read a little-endian u64 from the front of `b`, or 0 if it is short.
+#[inline(always)]
+fn le_u64(b: &[u8]) -> u64 {
+    if b.len() < 8 {
+        return 0;
+    }
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// The transparent (no-ALPN) byte-stream surface: log inbound bytes,
+/// echo them back on the server, and forward them to `app_out` with
+/// net_proto MSG_DATA framing.
+///
+/// Kept apart from the mux path on purpose. It is one raw stream with no
+/// session or stream identity of its own, so it has nothing to say on a
+/// contract built around both.
+unsafe fn legacy_stream_forward(s: &mut QuicState, idx: usize) {
+    let sys = &*s.syscalls;
+    let n = s.conns[idx].stream_recv_buf_len;
+    if n == 0 {
+        return;
+    }
+    let mut log_buf = [0u8; 96];
+    let prefix = b"[quic] stream rx=";
+    let mut p = 0;
+    for &c in prefix {
+        log_buf[p] = c;
+        p += 1;
+    }
+    let copy_n = n.min(log_buf.len() - p);
+    core::ptr::copy_nonoverlapping(
+        s.conns[idx].stream_recv_buf.as_ptr(),
+        log_buf.as_mut_ptr().add(p),
+        copy_n,
+    );
+    p += copy_n;
+    dev_log(sys, 3, log_buf.as_ptr(), p);
+    if s.conns[idx].is_server {
+        let conn = &mut s.conns[idx];
+        let space = conn.stream_send_buf.len() - conn.stream_send_buf_len;
+        let to_copy = n.min(space);
+        core::ptr::copy_nonoverlapping(
+            conn.stream_recv_buf.as_ptr(),
+            conn.stream_send_buf
+                .as_mut_ptr()
+                .add(conn.stream_send_buf_len),
+            to_copy,
+        );
+        conn.stream_send_buf_len += to_copy;
+    }
+    if s.app_out >= 0 {
+        let mut frame = [0u8; 1600];
+        if 3 + n <= frame.len() {
+            frame[0] = 0x02;
+            frame[1] = n as u8;
+            frame[2] = (n >> 8) as u8;
+            core::ptr::copy_nonoverlapping(
+                s.conns[idx].stream_recv_buf.as_ptr(),
+                frame.as_mut_ptr().add(3),
+                n,
+            );
+            (sys.channel_write)(s.app_out, frame.as_ptr(), 3 + n);
+            s.tlm.bytes_in = s.tlm.bytes_in.wrapping_add(n as u32);
+        }
+    }
+    s.conns[idx].stream_recv_buf_len = 0;
 }
 
 unsafe fn discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
@@ -2134,6 +2440,7 @@ unsafe fn find_conn_by_dcid(s: &QuicState, dcid: &[u8]) -> i32 {
 }
 
 unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
+    let framed = s.alpn_cfg_len > 0;
     // Snapshot the sampling rate before borrowing a connection slot mutably.
     let permille = s.sample_permille;
     let mut i = 0;
@@ -2141,12 +2448,17 @@ unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
         // A CLOSED or ERRORED slot is reusable: its span has been emitted
         // (`emit_conn_span` runs on the Closed pass) and `reset()` clears the
         // slot wholesale. Without this the pool is one-shot — with MAX_CONNS=2
-        // a server stops accepting after its second connection ever, which is
-        // what a live HTTP/3 client run hit on the third request.
+        // a server stops accepting after its second connection ever.
+        // A slot that still owes its MSG_MUX_SESSION_CLOSED is not free
+        // yet. Handing it to a new connection first would reuse the
+        // session id while the application still believes the previous
+        // session is live — every event for the new one would be read as
+        // belonging to the old.
+        let owes_close = s.conns[i].session_opened_sent && !s.conns[i].session_closed_sent;
         let reusable = matches!(
             s.conns[i].phase,
             ConnPhase::Idle | ConnPhase::Closed | ConnPhase::Errored
-        );
+        ) && !owes_close;
         if reusable {
             let conn = &mut s.conns[i];
             conn.reset();
@@ -2155,6 +2467,12 @@ unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
             conn.phase = ConnPhase::Handshaking;
             conn.is_server = true;
             conn.driver.is_server = true;
+            // Which application-channel encoding this connection uses.
+            // Latched per connection at allocation rather than read from
+            // module state at every use, so the frame path never has to
+            // reach back up to `QuicState` to know where a stream's
+            // bytes belong.
+            conn.framed_app_surface = framed;
             conn.driver.hs_state = HandshakeState::RecvClientHello;
             conn.driver.suite = CipherSuite::ChaCha20Poly1305;
 
@@ -2193,6 +2511,7 @@ unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
 /// identity into the new conn, and stages a 0-RTT payload for
 /// emission as soon as the early-traffic keys are installed.
 unsafe fn alloc_resumption_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
+    let framed = s.alpn_cfg_len > 0;
     // Find the matching client_ticket entry.
     let mut tix = MAX_TICKETS;
     let mut t = 0;
@@ -2221,6 +2540,12 @@ unsafe fn alloc_resumption_connection(s: &mut QuicState, ip: &[u8; 4], port: u16
             conn.phase = ConnPhase::Handshaking;
             conn.is_server = false;
             conn.driver.is_server = false;
+            // Which application-channel encoding this connection uses.
+            // Latched per connection at allocation rather than read from
+            // module state at every use, so the frame path never has to
+            // reach back up to `QuicState` to know where a stream's
+            // bytes belong.
+            conn.framed_app_surface = framed;
             conn.driver.hs_state = HandshakeState::SendClientHello;
             conn.driver.suite = CipherSuite::ChaCha20Poly1305;
             // Pick fresh CIDs.
@@ -2259,6 +2584,7 @@ unsafe fn alloc_resumption_connection(s: &mut QuicState, ip: &[u8; 4], port: u16
 }
 
 unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
+    let framed = s.alpn_cfg_len > 0;
     let mut i = 0;
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Idle {
@@ -2269,6 +2595,12 @@ unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
             conn.phase = ConnPhase::Handshaking;
             conn.is_server = false;
             conn.driver.is_server = false;
+            // Which application-channel encoding this connection uses.
+            // Latched per connection at allocation rather than read from
+            // module state at every use, so the frame path never has to
+            // reach back up to `QuicState` to know where a stream's
+            // bytes belong.
+            conn.framed_app_surface = framed;
             conn.driver.hs_state = HandshakeState::SendClientHello;
             conn.driver.suite = CipherSuite::ChaCha20Poly1305;
 
@@ -2304,339 +2636,6 @@ unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
     None
 }
 
-// ---------------------------------------------------------------------
-// HTTP/3 connection preamble. Lives in mod.rs because it accesses QuicState
-// directly; the frame and control-stream codecs are in h3.rs.
-// ---------------------------------------------------------------------
-
-/// On a fresh Established h3 connection, open the three required
-/// HTTP/3 unidirectional streams (RFC 9114 §6.2.1 + RFC 9204 §4.2):
-///   - control stream: type 0x00 + SETTINGS frame
-///   - QPACK encoder stream: type 0x02 (no instructions)
-///   - QPACK decoder stream: type 0x03 (no instructions)
-///     Stream IDs follow the QUIC initiator-direction encoding (RFC 9000
-///     §2.1): server uni = 3, 7, 11; client uni = 2, 6, 10.
-unsafe fn h3_open_uni_streams(s: &mut QuicState, idx: usize) {
-    if s.conns[idx].h3_uni_streams_opened {
-        return;
-    }
-    let is_server = s.conns[idx].is_server;
-    // Allocate three slots: control / qpack-enc / qpack-dec.
-    let alloc_one = |conn: &mut QuicConnection, role: H3StreamRole, type_byte: u64| -> bool {
-        let id = if is_server {
-            next_server_uni_id(conn.h3_next_uni_idx)
-        } else {
-            next_client_uni_id(conn.h3_next_uni_idx)
-        };
-        conn.h3_next_uni_idx = conn.h3_next_uni_idx.wrapping_add(1);
-        let slot_idx = match extra_alloc(conn, id, true) {
-            Some(i) => i,
-            None => return false,
-        };
-        conn.extra_streams[slot_idx].h3_role = role;
-        // Prime the type byte.
-        let mut tmp = [0u8; 4];
-        let n = varint_encode(tmp.as_mut_ptr(), tmp.len(), type_byte);
-        conn.extra_streams[slot_idx].send_buf[..n].copy_from_slice(&tmp[..n]);
-        conn.extra_streams[slot_idx].send_buf_len = n;
-        true
-    };
-    {
-        let conn = &mut s.conns[idx];
-        if !alloc_one(conn, H3StreamRole::Control, H3_UNI_TYPE_CONTROL) {
-            return;
-        }
-        if !alloc_one(conn, H3StreamRole::QpackEncoder, H3_UNI_TYPE_QPACK_ENCODER) {
-            return;
-        }
-        if !alloc_one(conn, H3StreamRole::QpackDecoder, H3_UNI_TYPE_QPACK_DECODER) {
-            return;
-        }
-    }
-    // Append SETTINGS frame to the control-stream send buffer.
-    h3_emit_settings(s, idx);
-    s.conns[idx].h3_uni_streams_opened = true;
-}
-
-/// Build SETTINGS frame + append to the control stream slot's
-/// send_buf. Both sides emit SETTINGS as the first frame on their
-/// control stream (RFC 9114 §7.2.4).
-unsafe fn h3_emit_settings(s: &mut QuicState, idx: usize) {
-    // Find the control stream slot.
-    let mut control_slot = MAX_EXTRA_STREAMS;
-    let mut k = 0;
-    while k < MAX_EXTRA_STREAMS {
-        if s.conns[idx].extra_streams[k].allocated
-            && s.conns[idx].extra_streams[k].h3_role == H3StreamRole::Control
-            && s.conns[idx].extra_streams[k].locally_initiated
-        {
-            control_slot = k;
-            break;
-        }
-        k += 1;
-    }
-    if control_slot == MAX_EXTRA_STREAMS {
-        return;
-    }
-    // SETTINGS payload: QPACK_MAX_TABLE_CAPACITY=0,
-    // MAX_FIELD_SECTION_SIZE=16384, QPACK_BLOCKED_STREAMS=0,
-    // ENABLE_CONNECT_PROTOCOL=1 (server only — clients SHOULD NOT
-    // send this per RFC 9220 §3, but we send it as advisory; servers
-    // use it to negotiate WS).
-    let settings_pairs: &[(u64, u64)] = if s.conns[idx].is_server {
-        &[
-            (H3_SETTING_QPACK_MAX_TABLE_CAPACITY, 0),
-            (H3_SETTING_MAX_FIELD_SECTION_SIZE, 16384),
-            (H3_SETTING_QPACK_BLOCKED_STREAMS, 0),
-            (H3_SETTING_ENABLE_CONNECT_PROTOCOL, 1),
-        ]
-    } else {
-        &[
-            (H3_SETTING_QPACK_MAX_TABLE_CAPACITY, 0),
-            (H3_SETTING_MAX_FIELD_SECTION_SIZE, 16384),
-            (H3_SETTING_QPACK_BLOCKED_STREAMS, 0),
-        ]
-    };
-    let mut payload = [0u8; 64];
-    let n = h3_build_settings_payload(settings_pairs, &mut payload);
-    if n == 0 {
-        return;
-    }
-    // Wrap as SETTINGS frame.
-    let mut frame_hdr = [0u8; 4];
-    let hdr_n = h3_build_frame_header(H3_FRAME_SETTINGS, n, &mut frame_hdr);
-    if hdr_n == 0 {
-        return;
-    }
-    let slot = &mut s.conns[idx].extra_streams[control_slot];
-    let space = slot.send_buf.len() - slot.send_buf_len;
-    if hdr_n + n > space {
-        return;
-    }
-    slot.send_buf[slot.send_buf_len..slot.send_buf_len + hdr_n]
-        .copy_from_slice(&frame_hdr[..hdr_n]);
-    slot.send_buf_len += hdr_n;
-    slot.send_buf[slot.send_buf_len..slot.send_buf_len + n].copy_from_slice(&payload[..n]);
-    slot.send_buf_len += n;
-}
-
-/// Walk every recv'd extra_stream slot. Classify uni streams by type
-/// byte (consume the leading varint on first observation), then
-/// dispatch frames appropriately:
-///   control stream → SETTINGS (mandatory first), GOAWAY, MAX_PUSH_ID
-///   qpack-encoder  → table-update instructions (we drop them since
-///                    QPACK_MAX_TABLE_CAPACITY=0; peer SHOULD NOT
-///                    send any)
-///   qpack-decoder  → ack/cancel instructions (likewise empty)
-unsafe fn h3_pump_extra_streams(s: &mut QuicState, idx: usize) {
-    let sys = &*s.syscalls;
-    let mut k = 0;
-    while k < MAX_EXTRA_STREAMS {
-        if !s.conns[idx].extra_streams[k].allocated
-            || s.conns[idx].extra_streams[k].locally_initiated
-            || s.conns[idx].extra_streams[k].recv_buf_len == 0
-        {
-            k += 1;
-            continue;
-        }
-        // Classify by type byte if not already.
-        if !s.conns[idx].extra_streams[k].h3_type_consumed {
-            let slot = &s.conns[idx].extra_streams[k];
-            let (stype, n) = match varint_decode(slot.recv_buf.as_ptr(), slot.recv_buf_len) {
-                Some(t) => t,
-                None => {
-                    k += 1;
-                    continue;
-                }
-            };
-            let role = match stype {
-                x if x == H3_UNI_TYPE_CONTROL => H3StreamRole::Control,
-                x if x == H3_UNI_TYPE_PUSH => H3StreamRole::Push,
-                x if x == H3_UNI_TYPE_QPACK_ENCODER => H3StreamRole::QpackEncoder,
-                x if x == H3_UNI_TYPE_QPACK_DECODER => H3StreamRole::QpackDecoder,
-                _ => H3StreamRole::Unknown,
-            };
-            let slot = &mut s.conns[idx].extra_streams[k];
-            slot.h3_role = role;
-            slot.h3_type_consumed = true;
-            // Drop the type byte.
-            let remain = slot.recv_buf_len - n;
-            if remain > 0 {
-                core::ptr::copy(
-                    slot.recv_buf.as_ptr().add(n),
-                    slot.recv_buf.as_mut_ptr(),
-                    remain,
-                );
-            }
-            slot.recv_buf_len = remain;
-        }
-        let role = s.conns[idx].extra_streams[k].h3_role;
-        match role {
-            H3StreamRole::Control => h3_drain_control_stream(s, idx, k),
-            H3StreamRole::QpackEncoder | H3StreamRole::QpackDecoder => {
-                // We advertise QPACK_MAX_TABLE_CAPACITY=0, so peer
-                // dynamic-table updates would be a protocol error.
-                s.conns[idx].extra_streams[k].recv_buf_len = 0;
-            }
-            _ => {
-                s.conns[idx].extra_streams[k].recv_buf_len = 0;
-            }
-        }
-        let _ = sys;
-        k += 1;
-    }
-}
-
-/// Drain a peer control stream slot: parse SETTINGS / GOAWAY /
-/// MAX_PUSH_ID frames. Bytes are consumed in-place (shifted out of
-/// the recv_buf) once a complete frame is processed.
-unsafe fn h3_drain_control_stream(s: &mut QuicState, idx: usize, slot_idx: usize) {
-    let sys = &*s.syscalls;
-    loop {
-        let buf_len = s.conns[idx].extra_streams[slot_idx].recv_buf_len;
-        if buf_len == 0 {
-            return;
-        }
-        let mut local = [0u8; 256];
-        let take = buf_len.min(local.len());
-        core::ptr::copy_nonoverlapping(
-            s.conns[idx].extra_streams[slot_idx].recv_buf.as_ptr(),
-            local.as_mut_ptr(),
-            take,
-        );
-        let (frame, consumed) = match h3_parse_frame(&local[..take]) {
-            Some(f) => f,
-            None => return,
-        };
-        match frame.frame_type {
-            x if x == H3_FRAME_SETTINGS => {
-                // The peer's settings are parsed here because they arrive on a
-                // connection-scoped control stream only the transport reads —
-                // but every one of them constrains how a REQUEST is encoded, so
-                // they are latched and forwarded to the application that owns
-                // the request streams (`MSG_MUX_PEER_SETTINGS`, emitted from
-                // `step` once the app_out channel will take it).
-                //
-                // A malformed payload is H3_FRAME_ERROR (RFC 9114 §7.2.4) and
-                // is worth a log: it means the peer's control stream is
-                // desynchronised, which shows up later as unexplained silence.
-                // The partially-filled settings are discarded with it rather
-                // than forwarded — half a limit is worse than the default.
-                let mut peer = H3PeerSettings::defaults();
-                if h3_parse_settings(frame.payload, &mut peer) {
-                    let conn = &mut s.conns[idx];
-                    conn.h3_peer_max_field_section = peer.max_field_section_size;
-                    conn.h3_peer_qpack_max_table = peer.qpack_max_table_capacity;
-                    conn.h3_peer_qpack_blocked = peer.qpack_blocked_streams;
-                    conn.h3_peer_enable_connect = peer.enable_connect_protocol;
-                    conn.h3_peer_settings_seen = true;
-                } else {
-                    let m = b"[quic] h3 malformed SETTINGS on control stream";
-                    dev_log(sys, 2, m.as_ptr(), m.len());
-                }
-            }
-            x if x == H3_FRAME_GOAWAY => {
-                if let Some(id) = h3_parse_goaway(frame.payload) {
-                    let mut log_buf = [0u8; 64];
-                    let prefix = b"[quic] h3 GOAWAY id=";
-                    let mut p = 0;
-                    while p < prefix.len() {
-                        log_buf[p] = prefix[p];
-                        p += 1;
-                    }
-                    // Truncate to u32 for log formatting — avoids
-                    // pulling in __aeabi_uldivmod on thumbv8m for
-                    // u64 division.
-                    let mut v = id.min(u32::MAX as u64) as u32;
-                    let mut tmp = [0u8; 12];
-                    let mut t = 0;
-                    if v == 0 {
-                        tmp[0] = b'0';
-                        t = 1;
-                    }
-                    while v > 0 {
-                        tmp[t] = b'0' + ((v % 10) as u8);
-                        v /= 10;
-                        t += 1;
-                    }
-                    let mut k = 0;
-                    while k < t && p < log_buf.len() {
-                        log_buf[p] = tmp[t - 1 - k];
-                        p += 1;
-                        k += 1;
-                    }
-                    dev_log(sys, 3, log_buf.as_ptr(), p);
-                }
-            }
-            x if x == H3_FRAME_MAX_PUSH_ID => {
-                // Push not supported; accept the cap but no scheduling.
-            }
-            x if x == H3_FRAME_PRIORITY_UPDATE_REQUEST || x == H3_FRAME_PRIORITY_UPDATE_PUSH => {
-                // RFC 9218 §7.2: parse + accept. We don't yet honor
-                // the urgency field for stream scheduling — the
-                // dispatcher emits in arrival order — but the frame
-                // is recognised + logged so peers don't see an
-                // H3_FRAME_UNEXPECTED protocol error.
-                if let Some(p) = h3_parse_priority_update(frame.payload) {
-                    let mut log_buf = [0u8; 96];
-                    let prefix = b"[quic] h3 PRIORITY_UPDATE id=";
-                    let mut pos = 0;
-                    while pos < prefix.len() {
-                        log_buf[pos] = prefix[pos];
-                        pos += 1;
-                    }
-                    let mut v = p.prioritized_id.min(u32::MAX as u64) as u32;
-                    let mut tmp = [0u8; 12];
-                    let mut t = 0;
-                    if v == 0 {
-                        tmp[0] = b'0';
-                        t = 1;
-                    }
-                    while v > 0 {
-                        tmp[t] = b'0' + ((v % 10) as u8);
-                        v /= 10;
-                        t += 1;
-                    }
-                    let mut k = 0;
-                    while k < t && pos < log_buf.len() {
-                        log_buf[pos] = tmp[t - 1 - k];
-                        pos += 1;
-                        k += 1;
-                    }
-                    if pos < log_buf.len() {
-                        log_buf[pos] = b' ';
-                        pos += 1;
-                    }
-                    let copy_n = p.field_value.len().min(log_buf.len() - pos);
-                    core::ptr::copy_nonoverlapping(
-                        p.field_value.as_ptr(),
-                        log_buf.as_mut_ptr().add(pos),
-                        copy_n,
-                    );
-                    pos += copy_n;
-                    dev_log(sys, 3, log_buf.as_ptr(), pos);
-                }
-            }
-            _ => {
-                // RFC 9114 §7.2 forbids DATA/HEADERS and unknown
-                // frames on the control stream; we tolerate by
-                // skipping rather than aborting the connection.
-            }
-        }
-        // Shift consumed bytes out of recv_buf.
-        let slot = &mut s.conns[idx].extra_streams[slot_idx];
-        let remain = slot.recv_buf_len - consumed;
-        if remain > 0 {
-            core::ptr::copy(
-                slot.recv_buf.as_ptr().add(consumed),
-                slot.recv_buf.as_mut_ptr(),
-                remain,
-            );
-        }
-        slot.recv_buf_len = remain;
-    }
-}
-
 fn eq_bytes(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -2666,6 +2665,21 @@ pub mod test_helpers {
     ///
     /// # Safety
     /// `state` must point to a fully-initialised `QuicState`.
+    /// The configured P-256 ladder chunk size, as the module actually
+    /// parsed it.
+    ///
+    /// Exposed because the difference between "the param is declared" and
+    /// "the param reaches the state" is invisible from outside: a
+    /// mis-tagged or mis-typed param leaves the default in place and the
+    /// handshake still works — just in one enormous step, which only a
+    /// board with a step guard ever complains about.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`.
+    pub unsafe fn configured_ladder_bits(state: *mut u8) -> u16 {
+        (*(state as *const QuicState)).ecdh_bits_per_step
+    }
+
     pub unsafe fn server_conn_count(state: *mut u8) -> usize {
         let s = &*(state as *const QuicState);
         let mut n = 0;
@@ -2822,7 +2836,7 @@ pub mod test_helpers {
         s.endpoint.bind_static(0);
         // Reflect a real ALPN-configured module: a non-empty ALPN means
         // the module offers ALPN, which switches the app surface to the
-        // framed MSG_QUIC_* envelope (see the app_in gate in module_step).
+        // framed `mux` envelope (see the `mux_mode` gate in module_step).
         let cfg_n = alpn.len().min(super::MAX_ALPN_CFG);
         s.alpn_cfg[..cfg_n].copy_from_slice(&alpn[..cfg_n]);
         s.alpn_cfg_len = cfg_n;
@@ -2842,7 +2856,7 @@ pub mod test_helpers {
         let n = alpn.len().min(MAX_ALPN);
         conn.alpn_selected[..n].copy_from_slice(&alpn[..n]);
         conn.alpn_selected_len = n as u8;
-        conn.use_h3 = alpn == b"h3";
+        conn.framed_app_surface = cfg_n > 0;
         conn.peer_max_datagram_frame_size = QUIC_MAX_DATAGRAM_SIZE as u64;
         conn.one_rtt.keys_set = true;
         conn.last_activity_ms = 1;

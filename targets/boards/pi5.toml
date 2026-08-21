@@ -66,6 +66,11 @@ preferred_telemetry = "telemetry.monitor_udp"
 # picks the protocol from its binding instead of being HTTPS-only. Listed here
 # because it is the same physical capability — a host driving traffic at the
 # board over the network — not a new one.
-observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load", "observe.proto_load"]
+# `observe.quic_mux` is the TRANSPORT probe (fluxor's own): same NIC and same
+# DHCP-assigned address, but it drives QUIC streams against a `mux_echo` and
+# carries no protocol at all. It is listed separately from `proto_load`
+# because the two answer different questions — when an h3 scenario fails,
+# only a transport-only run can say which half is at fault.
+observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load", "observe.proto_load", "observe.quic_mux"]
 power = ["power.cycle"]
 default_timeout_s = 30

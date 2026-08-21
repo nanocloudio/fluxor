@@ -1,4 +1,4 @@
-// Contract: mux — multiplexed session protocol surface (v1 wire format).
+// Contract: mux — multiplexed session protocol surface.
 //
 // Layer: contracts/net (public, stable).
 //
@@ -12,12 +12,17 @@
 // defined mux layers that don't want to be forced through a TCP-shaped
 // `transport.stream` abstraction.
 //
-// Status: envelope reserved. No module consumes this contract today;
-// the first consumer is planned to be the QUIC foundation module in
-// Phase 6 of the RFC. The fields below derive from the RFC's
-// operations list (RFC §6.4) and should remain source-compatible with
-// that first consumer, but minor revisions are possible before the
-// first .fmod ships against this contract.
+// Status: live. The QUIC foundation module is the provider; `mux_echo`
+// (fixtures), wave's `http` HTTP/3 server and client, and quantum's
+// `mqtt_quic_adapter` are consumers.
+//
+// This surface is PROTOCOL-NEUTRAL and complete. A provider implements
+// the whole lifecycle below for every session it carries, whatever
+// application protocol the session negotiated — there is no reduced
+// profile, no ALPN-conditional subset, and no application vocabulary in
+// any payload. Everything a transport knows about an application is
+// carried as opaque bytes: the negotiated ALPN token, stream contents,
+// datagram contents, and application error codes.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto, datagram, packet, and session_ctrl so the
@@ -28,7 +33,7 @@
 //     datagram      0x20..0x43   (Datagram Surface v1)
 //     packet        0x50..0x63   (Packet Surface v1)
 //     session_ctrl  0x70..0x9F   (SessionCtrlV1 control sideband)
-//     mux           0xB0..0xCF   (this file — Multiplexed Session Surface v1)
+//     mux           0xB0..0xCF   (this file — Multiplexed Session Surface)
 //
 // so a single channel pair may carry multiple contracts unambiguously.
 //
@@ -37,17 +42,30 @@
 //   session_id: u32 LE
 //     Transport-association handle. One mux-capable transport (one QUIC
 //     connection, one SCTP association) maps to one session_id. Allocated
-//     by the provider in MSG_MUX_SESSION_OPENED.
+//     by the provider and announced in MSG_MUX_SESSION_OPENED.
 //
 //   stream_id: u32 LE
 //     Stream-within-session handle. Per-session namespace — stream_id
 //     space is independent across sessions. Allocated by the provider
 //     in MSG_MUX_STREAM_OPENED / MSG_MUX_STREAM_ACCEPTED.
 //
-// Why u32 LE rather than QUIC's 62-bit varint: this is a module-to-
-// module local handle, not the wire ID. The QUIC engine maps its own
-// 62-bit varint connection/stream IDs onto these compact 32-bit
-// handles for channel-side use.
+// Why `stream_id` is u32 LE rather than QUIC's 62-bit varint: it is an
+// OPAQUE LOCAL HANDLE for addressing the stream over this channel, not
+// the wire id. Every data-plane command (`CMD_MUX_STREAM_SEND`,
+// `_CLOSE`, `_ACK`, `_RESET`, `_STOP_SENDING`) addresses a stream by
+// this handle, which keeps the hot-path prefix a fixed 8 bytes and lets
+// the provider index its slot table directly.
+//
+// An application that needs the transport's own stream identity — HTTP/3
+// needs it for GOAWAY and PRIORITY_UPDATE — reads the `quic_stream_id`
+// field carried on MSG_MUX_STREAM_OPENED / MSG_MUX_STREAM_ACCEPTED and
+// keeps its own handle→id mapping. The two are NOT derivable from each
+// other: a consumer must never do arithmetic on a handle to guess a wire
+// id, and a provider must never truncate a wire id into a handle.
+//
+// Handles are not reused while the application can still observe them: a
+// provider reclaims a handle only after the stream's terminal event
+// (MSG_MUX_STREAM_CLOSED / _RESET) has actually been delivered.
 //
 // Continuity integration: a QUIC `session_id` is the natural unit of
 // `transport_migratable` continuity (RFC §7.1). A migrated QUIC
@@ -61,15 +79,38 @@ pub const FRAME_HDR: usize = 3;
 pub const SESSION_ID_BYTES: usize = 4;
 /// Bytes of stream_id (u32 LE) carried on stream-scoped messages.
 pub const STREAM_ID_BYTES: usize = 4;
+/// Bytes of the transport's own stream identity (u64 LE) carried as
+/// metadata on MSG_MUX_STREAM_OPENED / MSG_MUX_STREAM_ACCEPTED.
+pub const QUIC_STREAM_ID_BYTES: usize = 8;
+/// Bytes of an application error code (u64 LE) on reset / stop-sending.
+pub const APP_ERROR_BYTES: usize = 8;
 
-// ─── Stream open flags (CMD_MUX_STREAM_OPEN) ───────────────────────
+// ─── Stream flags (open command + opened/accepted events) ──────────
 
-/// Bidirectional stream (QUIC client-initiated bidi).
+/// Bidirectional stream (both halves usable).
 pub const STREAM_FLAG_BIDI: u8 = 1 << 0;
-/// Unidirectional, send-only stream from the opener.
+/// Unidirectional stream — send-only from whoever opened it, and
+/// receive-only for the peer.
 pub const STREAM_FLAG_UNI: u8 = 1 << 1;
 /// Mark this stream as urgent / high priority.
 pub const STREAM_FLAG_URGENT: u8 = 1 << 2;
+/// Set on MSG_MUX_STREAM_OPENED / MSG_MUX_STREAM_ACCEPTED when the LOCAL
+/// endpoint initiated the stream; clear when the peer did.
+///
+/// This is the generic initiator bit. It exists so a consumer never has
+/// to recover direction and initiator by masking the low bits of a QUIC
+/// stream id — that arithmetic is transport-specific, and a consumer
+/// doing it has reached through the contract into the provider.
+pub const STREAM_FLAG_LOCAL_INIT: u8 = 1 << 3;
+
+// ─── Session flags (MSG_MUX_SESSION_OPENED) ────────────────────────
+
+/// Set when the LOCAL endpoint initiated the session (client role for a
+/// QUIC connection); clear when it was accepted from a peer.
+///
+/// The provider assigns no application meaning to the role — it reports
+/// which side dialled, and the application decides what that implies.
+pub const SESSION_FLAG_LOCAL_INIT: u8 = 1 << 0;
 
 // ─── Status codes ──────────────────────────────────────────────────
 
@@ -79,6 +120,11 @@ pub const STATUS_PROTOCOL_ERROR: u8 = 2;
 pub const STATUS_CLOSED: u8 = 3;
 pub const STATUS_TIMEOUT: u8 = 4;
 pub const STATUS_FLOW_BLOCKED: u8 = 5;
+/// The stream was terminated by RESET_STREAM (local or peer) rather than
+/// finishing cleanly. Carried as the `reason` on MSG_MUX_STREAM_CLOSED
+/// where a terminal event is owed but the detail already went out on
+/// MSG_MUX_STREAM_RESET.
+pub const STATUS_RESET: u8 = 6;
 
 // ─── Upstream: consumer → provider ─────────────────────────────────
 
@@ -89,53 +135,148 @@ pub const CMD_MUX_SESSION_OPEN: u8 = 0xB0;
 
 /// Close a transport-level session and all streams in it.
 /// Payload: [session_id: u32 LE] [reason: u8].
+///
+/// Optionally followed by [app_error: u64 LE], which the provider places
+/// in the transport's application-close frame (QUIC CONNECTION_CLOSE of
+/// type 0x1d). The provider does not interpret the code.
 pub const CMD_MUX_SESSION_CLOSE: u8 = 0xB1;
 
 /// Open a stream within an existing session.
 /// Payload: [session_id: u32 LE] [flags: u8].
 /// `flags` carries STREAM_FLAG_BIDI / STREAM_FLAG_UNI /
-/// STREAM_FLAG_URGENT. Provider responds with MSG_MUX_STREAM_OPENED.
+/// STREAM_FLAG_URGENT. Provider responds with MSG_MUX_STREAM_OPENED,
+/// whose `status` is STATUS_NO_CAPACITY when no slot or no peer
+/// MAX_STREAMS credit is available.
 pub const CMD_MUX_STREAM_OPEN: u8 = 0xB2;
 
-/// Close a stream (clean shutdown of one direction or both).
+/// Close the LOCAL SEND HALF of a stream — the clean end-of-stream
+/// signal (QUIC STREAM frame with the FIN bit) emitted after every byte
+/// already queued on the stream has drained.
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [flags: u8].
 pub const CMD_MUX_STREAM_CLOSE: u8 = 0xB3;
 
 /// Send bytes on a stream.
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [data: ...].
+///
+/// Reliable and all-or-nothing: a write the provider cannot take whole
+/// is refused with MSG_MUX_STREAM_ERROR rather than truncated, and the
+/// stream cursor does not advance.
 pub const CMD_MUX_STREAM_SEND: u8 = 0xB4;
 
 /// Acknowledge a flow-control credit grant from the consumer (consumer
 /// has drained `bytes` from its receive buffer for this stream).
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [bytes: u32 LE].
+///
+/// This is what advances the provider's MAX_STREAM_DATA and MAX_DATA
+/// windows. A consumer that never sends it will eventually be stalled by
+/// the peer running out of credit — the provider must not invent credit
+/// on the consumer's behalf.
 pub const CMD_MUX_STREAM_ACK: u8 = 0xB5;
 
 /// Send an unreliable datagram on the session (RFC 9221 QUIC DATAGRAM).
 /// Session-scoped, not stream-scoped: there is no stream_id and no
 /// retransmission. Payload: [session_id: u32 LE] [data: ...]. A datagram
 /// larger than the peer's advertised max is dropped by the provider.
+///
+/// Available on every session. The provider never inspects the payload
+/// and never gates this on the negotiated protocol.
 pub const CMD_MUX_DATAGRAM_SEND: u8 = 0xB6;
+
+/// Abruptly terminate the LOCAL SEND HALF of a stream (QUIC
+/// RESET_STREAM, RFC 9000 §19.4). Queued bytes are discarded.
+/// Payload: [session_id: u32 LE] [stream_id: u32 LE] [app_error: u64 LE].
+///
+/// `app_error` is an opaque application error code — the provider copies
+/// it into the transport frame and never interprets it. HTTP/3 and QPACK
+/// error codes are the application's values.
+pub const CMD_MUX_STREAM_RESET: u8 = 0xB7;
+
+/// Ask the peer to stop sending on a stream (QUIC STOP_SENDING,
+/// RFC 9000 §19.5).
+/// Payload: [session_id: u32 LE] [stream_id: u32 LE] [app_error: u64 LE].
+///
+/// The peer is expected to answer with RESET_STREAM, which surfaces
+/// locally as MSG_MUX_STREAM_RESET. `app_error` is opaque.
+pub const CMD_MUX_STREAM_STOP_SENDING: u8 = 0xB8;
+
+/// Open a stream AND queue its first bytes atomically.
+/// Payload: [session_id: u32 LE] [flags: u8] [data: ...].
+///
+/// Equivalent to CMD_MUX_STREAM_OPEN immediately followed by
+/// CMD_MUX_STREAM_SEND on the resulting handle, but without the
+/// round trip through MSG_MUX_STREAM_OPENED — which matters only for a
+/// protocol whose connection preamble opens several streams and writes a
+/// short prefix on each before anything else may flow. The provider
+/// still answers with MSG_MUX_STREAM_OPENED; on STATUS_NO_CAPACITY the
+/// data is discarded with the failed open, so nothing is half-applied.
+///
+/// RESERVED: the opcode is allocated and the semantics fixed, but no
+/// provider implements it. A consumer MUST implement the plain
+/// open/send path regardless and treat this purely as a latency
+/// optimisation.
+pub const CMD_MUX_STREAM_OPEN_WITH: u8 = 0xB9;
 
 // ─── Downstream: provider → consumer ───────────────────────────────
 
-/// Session opened and ready to carry streams.
-/// Payload: [session_id: u32 LE] [status: u8].
+/// Session established and ready to carry streams.
+/// Payload:
+/// `[session_id: u32 LE] [status: u8] [flags: u8] [alpn_len: u8]
+///  [alpn: alpn_len bytes]`
+///
+/// Emitted exactly once per session, before any stream event for that
+/// session, and retried under backpressure rather than dropped. This is
+/// how a consumer learns a session exists — it must never assume session
+/// `0`, infer a session from the first stream that arrives on it, or
+/// reach into the provider's connection table.
+///
+/// `flags` carries SESSION_FLAG_LOCAL_INIT. `alpn` is the negotiated
+/// application-layer protocol token as OPAQUE BYTES (RFC 7301), with
+/// `alpn_len == 0` meaning no ALPN was negotiated. The provider performs
+/// the negotiation but assigns the token no meaning: selecting behaviour
+/// from it is the consumer's job.
 pub const MSG_MUX_SESSION_OPENED: u8 = 0xC0;
 
 /// Session closed (peer-initiated, drain timeout, or local close).
 /// Payload: [session_id: u32 LE] [reason: u8].
+///
+/// Optionally followed by [app_error: u64 LE] when the close carried an
+/// application error code the contract can convey. Emitted exactly once
+/// per session that was announced with MSG_MUX_SESSION_OPENED.
 pub const MSG_MUX_SESSION_CLOSED: u8 = 0xC1;
 
-/// Stream opened locally (response to CMD_MUX_STREAM_OPEN).
-/// Payload: [session_id: u32 LE] [stream_id: u32 LE] [status: u8].
+/// Stream opened locally (response to CMD_MUX_STREAM_OPEN or
+/// CMD_MUX_STREAM_OPEN_WITH).
+/// Payload:
+/// `[session_id: u32 LE] [stream_id: u32 LE] [status: u8] [flags: u8]
+///  [quic_stream_id: u64 LE]`
+///
+/// `flags` carries STREAM_FLAG_BIDI / _UNI and STREAM_FLAG_LOCAL_INIT
+/// (always set here). `quic_stream_id` is the transport's own stream
+/// identity; it is meaningful only when `status == STATUS_OK`.
 pub const MSG_MUX_STREAM_OPENED: u8 = 0xC2;
 
-/// Stream opened by the remote peer; consumer should accept or close.
-/// Payload: [session_id: u32 LE] [stream_id: u32 LE] [flags: u8].
+/// Stream opened by the remote peer.
+/// Payload:
+/// `[session_id: u32 LE] [stream_id: u32 LE] [flags: u8]
+///  [quic_stream_id: u64 LE]`
+///
+/// Emitted for EVERY peer-initiated stream, bidirectional and
+/// unidirectional alike, before any bytes from that stream. `flags`
+/// carries STREAM_FLAG_BIDI / _UNI with STREAM_FLAG_LOCAL_INIT clear.
+///
+/// The provider does not read, classify, rewrite, or withhold any byte
+/// of the stream — including the leading varint that some application
+/// protocols use as a stream type. Every byte the peer sent reaches the
+/// consumer in order, on MSG_MUX_STREAM_RX.
 pub const MSG_MUX_STREAM_ACCEPTED: u8 = 0xC3;
 
-/// Stream closed (remote FIN or local close confirmation).
+/// Stream closed cleanly (peer FIN, or confirmation of a local close).
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [reason: u8].
+///
+/// Emitted exactly once per stream and retried under backpressure — an
+/// empty FIN that carries no data still produces it. Delivery of the
+/// terminal event is tracked independently of data delivery, so a
+/// backpressured close never causes already-delivered bytes to repeat.
 pub const MSG_MUX_STREAM_CLOSED: u8 = 0xC4;
 
 /// Received bytes on a stream.
@@ -149,6 +290,11 @@ pub const MSG_MUX_STREAM_READY: u8 = 0xC6;
 
 /// Received an unreliable datagram on the session (RFC 9221 QUIC
 /// DATAGRAM). Session-scoped. Payload: [session_id: u32 LE] [data: ...].
+///
+/// Delivered on every session that negotiated DATAGRAM support. The
+/// provider enforces the negotiated size and preserves unreliable
+/// semantics; it never interprets the payload and never gates delivery
+/// on the negotiated protocol.
 pub const MSG_MUX_DATAGRAM_RX: u8 = 0xC7;
 
 /// Peer-identity sideband for the session: a one-shot event a transport
@@ -163,56 +309,45 @@ pub const MSG_MUX_DATAGRAM_RX: u8 = 0xC7;
 /// must NOT be smuggled as an out-of-contract opcode (older revisions
 /// borrowed `0x5A`, which collides with the reserved `packet` range
 /// `0x50..0x63`).
+///
+/// Emitted for every mux session, whatever protocol it negotiated.
 pub const MSG_MUX_PEER_IDENTITY: u8 = 0xC8;
 
-/// Peer transport-parameter sideband for the session: a one-shot event a
-/// transport emits once it has learned the peer's protocol-level limits, so an
-/// application encoding requests onto the session's streams can respect them.
-/// Session-scoped. Payload:
-/// `[session_id: u32 LE] [max_field_section_size: u32 LE]
-///  [qpack_max_table_capacity: u32 LE] [qpack_blocked_streams: u32 LE]
-///  [flags: u8]`
-///
-/// Why this exists: the limits arrive on a CONNECTION-scoped control channel
-/// that only the transport reads (for QUIC/HTTP/3, the peer's SETTINGS frame on
-/// its h3 control stream), but every one of them constrains how a REQUEST is
-/// encoded — and requests belong to whoever owns the streams. Without this the
-/// application has to guess. Guessing low wastes capacity; guessing high gets
-/// the stream reset by the peer with an error that names a frame size rather
-/// than the setting that rejected it, which is a genuinely hard failure to read
-/// from the application side.
-///
-/// `max_field_section_size` is the peer's cap on the UNCOMPRESSED size of a
-/// header section (RFC 9114 §7.2.4.1), counted as the sum over fields of
-/// `name.len() + value.len() + 32`. `u32::MAX` means "no limit advertised" —
-/// the identifier was absent, whose default is unlimited — and is distinct from
-/// an advertised `0`, which forbids header sections entirely. A value above
-/// `u32::MAX` (the wire type is a varint up to 2^62) saturates, which is
-/// lossless in effect: nothing this stack emits approaches it.
-///
-/// `flags` bit 0 = the peer advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`
-/// (RFC 9220 §3 / RFC 8441), i.e. extended CONNECT may be used to open a
-/// WebSocket tunnel on this session. All other bits are reserved and MUST be
-/// zero.
-///
-/// Emitted at most once per session, after the peer's settings are parsed and
-/// before any application stream is accepted where the transport can order it.
-/// An application that never receives one MUST assume defaults (no limit, no
-/// extended CONNECT) — a transport that does not carry connection-scoped
-/// settings simply never emits it.
-pub const MSG_MUX_PEER_SETTINGS: u8 = 0xC9;
+// Opcode 0xC9 is RETIRED and must not be reused.
+//
+// It carried `MSG_MUX_PEER_SETTINGS`, whose payload was an HTTP/3 and
+// QPACK settings structure (max_field_section_size, QPACK table capacity
+// and blocked streams, an extended-CONNECT bit). That was an application
+// protocol's vocabulary embedded in a transport contract, and it existed
+// only because the QUIC provider used to read the peer's HTTP/3 control
+// stream itself. It no longer does: those bytes now reach the
+// application unmodified on the unidirectional stream they arrived on,
+// as MSG_MUX_STREAM_ACCEPTED + MSG_MUX_STREAM_RX like any other stream,
+// and the application parses SETTINGS where the rest of its protocol
+// state already lives.
+//
+// The number stays retired rather than being reallocated so a stale peer
+// emitting the old sideband gets an unknown opcode, not a new message
+// silently accepted as its old one.
 
-/// Bit 0 of `MSG_MUX_PEER_SETTINGS`'s `flags`: the peer permits extended
-/// CONNECT (RFC 9220 §3).
-pub const PEER_SETTINGS_FLAG_ENABLE_CONNECT: u8 = 1 << 0;
+/// Peer reset a stream abruptly (QUIC RESET_STREAM, RFC 9000 §19.4), or
+/// confirmation that a locally requested reset was applied.
+/// Payload: [session_id: u32 LE] [stream_id: u32 LE] [app_error: u64 LE].
+///
+/// Terminal for the stream's receive half. `app_error` is the peer's
+/// opaque application error code, passed through uninterpreted.
+pub const MSG_MUX_STREAM_RESET: u8 = 0xCA;
 
-/// `max_field_section_size` sentinel meaning the peer advertised no limit.
-/// Distinct from `0`, which is an advertised limit forbidding header sections.
-pub const MAX_FIELD_SECTION_UNLIMITED: u32 = u32::MAX;
+/// Peer asked us to stop sending on a stream (QUIC STOP_SENDING,
+/// RFC 9000 §19.5).
+/// Payload: [session_id: u32 LE] [stream_id: u32 LE] [app_error: u64 LE].
+///
+/// The consumer is expected to stop producing on that stream and answer
+/// with CMD_MUX_STREAM_RESET carrying an application error code of its
+/// choosing. `app_error` is opaque.
+pub const MSG_MUX_STREAM_STOPPED: u8 = 0xCB;
 
-/// Payload length of `MSG_MUX_PEER_SETTINGS` after the session id:
-/// three u32 limits plus the flags byte.
-pub const PEER_SETTINGS_BODY: usize = 4 + 4 + 4 + 1;
+// Opcodes 0xCC and 0xCD are unallocated.
 
 /// Generic session-scoped error.
 /// Payload: [session_id: u32 LE] [errno: i8].
@@ -220,6 +355,12 @@ pub const MSG_MUX_SESSION_ERROR: u8 = 0xCE;
 
 /// Generic stream-scoped error.
 /// Payload: [session_id: u32 LE] [stream_id: u32 LE] [errno: i8].
+///
+/// This is how a refused reliable command is reported. A provider that
+/// cannot take a `CMD_MUX_STREAM_SEND` whole — no capacity, no
+/// flow-control credit, unknown handle — emits this rather than
+/// truncating or silently dropping the write, so the consumer knows the
+/// bytes did not go out and can retry them.
 pub const MSG_MUX_STREAM_ERROR: u8 = 0xCF;
 
 // ─── Payload layout helpers ────────────────────────────────────────
@@ -230,48 +371,31 @@ pub const MSG_MUX_STREAM_ERROR: u8 = 0xCF;
 /// `[session_id:4][stream_id:4] = 8 bytes`.
 pub const STREAM_DATA_PREFIX: usize = SESSION_ID_BYTES + STREAM_ID_BYTES;
 
-// ─── QUIC v1 constrained profile ───────────────────────────────────
-//
-// The QUIC foundation module is the first (and currently only) consumer
-// of this contract. It does NOT implement the full lifecycle above; it
-// exposes a deliberately constrained profile, documented here so a
-// consumer (e.g. an mqtt-over-QUIC codec) knows exactly what to expect
-// rather than discovering an undocumented subset by trial:
-//
-//   • session_id == QUIC connection index. Sessions are NOT opened via
-//     CMD_MUX_SESSION_OPEN; a session exists implicitly once the QUIC
-//     handshake completes for a connection that negotiated a non-h3
-//     ALPN. MSG_MUX_SESSION_OPENED is not emitted (the app learns the
-//     binding from MSG_MUX_STREAM_ACCEPTED / a one-shot peer-identity
-//     event instead). CMD_MUX_SESSION_OPEN / _CLOSE and
-//     CMD_MUX_STREAM_OPEN are not honoured in this profile.
-//
-//   • Exactly one stream per session — the client-initiated bidi stream
-//     id 0. `stream_id` on CMD_MUX_STREAM_SEND MUST be 0; a non-zero
-//     stream_id is rejected (the frame is dropped), never silently
-//     remapped onto stream 0. The peer-opened stream surfaces once as
-//     MSG_MUX_STREAM_ACCEPTED(stream 0, STREAM_FLAG_BIDI).
-//
-//   • [`MUX_QUIC_STREAM_SEND_MAX`] bounds the data carried in one
-//     CMD_MUX_STREAM_SEND (it matches the engine's single-MTU stream
-//     send buffer). A larger reliable write is REJECTED without
-//     truncation rather than clipped — the engine reads frames with an
-//     alignment-preserving reader, so an oversize frame neither desyncs
-//     the FIFO nor silently loses its tail.
-//
-//   • FIN delivery is reliable: MSG_MUX_STREAM_CLOSED is emitted exactly
-//     once when the peer FINs the stream, including an empty FIN that
-//     carries no data, and is retained-and-retried under app
-//     backpressure (never best-effort-dropped).
-//
-//   • Datagrams (CMD_MUX_DATAGRAM_SEND / MSG_MUX_DATAGRAM_RX) follow the
-//     session-scoped, unreliable semantics above unchanged (RFC 9221).
-//
-// Flow-control credit messages (CMD_MUX_STREAM_ACK / MSG_MUX_STREAM_READY)
-// are not used in this profile; backpressure is expressed by the channel
-// fill level (all-or-nothing frame writes).
+/// Payload length of `MSG_MUX_STREAM_OPENED` after the session+stream
+/// prefix: `[status:1][flags:1][quic_stream_id:8]`.
+pub const STREAM_OPENED_BODY: usize = 1 + 1 + QUIC_STREAM_ID_BYTES;
 
-/// Maximum data bytes in one `CMD_MUX_STREAM_SEND` under the QUIC v1
-/// constrained profile (matches the engine's single-MTU stream send
-/// buffer). A reliable write larger than this is rejected, not truncated.
+/// Payload length of `MSG_MUX_STREAM_ACCEPTED` after the session+stream
+/// prefix: `[flags:1][quic_stream_id:8]`.
+pub const STREAM_ACCEPTED_BODY: usize = 1 + QUIC_STREAM_ID_BYTES;
+
+/// Payload length of `MSG_MUX_STREAM_RESET` / `_STOPPED` and of
+/// `CMD_MUX_STREAM_RESET` / `_STOP_SENDING` after the session+stream
+/// prefix: `[app_error:8]`.
+pub const STREAM_APP_ERROR_BODY: usize = APP_ERROR_BYTES;
+
+/// Minimum payload length of `MSG_MUX_SESSION_OPENED` after the session
+/// id: `[status:1][flags:1][alpn_len:1]`, plus `alpn_len` opaque bytes.
+pub const SESSION_OPENED_BODY_MIN: usize = 1 + 1 + 1;
+
+/// Maximum data bytes the QUIC provider accepts in one
+/// `CMD_MUX_STREAM_SEND` (it matches the engine's single-MTU stream send
+/// buffer). A reliable write larger than this is refused with
+/// `MSG_MUX_STREAM_ERROR`, not truncated — the engine reads frames with
+/// an alignment-preserving reader, so an oversize frame neither desyncs
+/// the FIFO nor silently loses its tail.
+///
+/// This is a real transport bound, independent of any protocol: it is
+/// how much unframed application data one stream can hold pending
+/// packetisation.
 pub const MUX_QUIC_STREAM_SEND_MAX: usize = 1200;
