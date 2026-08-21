@@ -542,6 +542,20 @@ struct OpenFile {
     /// a plain `WRITE`/`FS_FSYNC` FD leaves it 0 and takes the sync
     /// spin-polled path throughout.
     async_mode: u8,
+    /// Largest file size this FD has submitted into its directory entry on
+    /// the device. The async metadata stage only rewrites the entry when a
+    /// ticket's snapshot exceeds it, so out-of-order polls can never move
+    /// the on-media size frontier backwards.
+    dir_media_size: u32,
+    /// Largest file size proven on non-volatile media in this FD's
+    /// directory entry. A ticket whose snapshot is already covered by it
+    /// needs no metadata stage at all — the preallocated fixed-capacity
+    /// case, where the entry never changes.
+    dir_durable_size: u32,
+    /// First cluster proven on non-volatile media alongside
+    /// `dir_durable_size`. Both fields must match a ticket's snapshot
+    /// before its metadata stage can be skipped.
+    dir_durable_start: u32,
 }
 
 impl OpenFile {
@@ -576,6 +590,9 @@ impl OpenFile {
             scratch_span: 0,
             scratch_cluster: 0,
             async_mode: 0,
+            dir_media_size: 0,
+            dir_durable_size: 0,
+            dir_durable_start: 0,
         }
     }
 }
@@ -796,6 +813,12 @@ struct Fat32State {
     /// create-truncate, namespace removal always wins over reclaim.
     unlink_free: [u32; UNLINK_FREE_SLOTS],
 
+    /// Outstanding asynchronous durability fences (`FSYNC_SUBMIT` /
+    /// `FSYNC_POLL`). One table for the whole provider: a ticket names a
+    /// slot in it, so the poll path recovers the file-size frontier the
+    /// submit snapshotted instead of reading the FD's mutable state.
+    fences: [FenceSlot; MAX_FENCES],
+
     /// Hot-path counters emitted as `[fat32] tlm dt=… rx=… tx=… idle=… bp=…`
     /// every `FAT32_TLM_PERIOD` steps. `rx` is bytes consumed from
     /// the upstream blocks channel (init walks + write-path FAT/dir
@@ -812,6 +835,83 @@ const FAT32_OBSERVE_INTERVAL_MS: u64 = 5_000;
 /// Sized for the expected caller (WAL segment compaction retires a handful of
 /// segments per snapshot); overflow degrades to orphaning, never to blocking.
 const UNLINK_FREE_SLOTS: usize = 8;
+
+/// Asynchronous durability fences outstanding across all open files. Bounds
+/// the pipelining depth `FSYNC_SUBMIT` will admit; a submit that finds the
+/// table full returns `E_AGAIN` (backpressure) rather than silently reusing
+/// a live ticket.
+const MAX_FENCES: usize = 8;
+
+/// A fence whose covered data writes are still in flight.
+const FENCE_STAGE_DATA: u8 = 1;
+/// A fence whose data is durable and whose directory-entry write is in
+/// flight behind a second device fence.
+const FENCE_STAGE_META: u8 = 2;
+
+/// One outstanding `FSYNC_SUBMIT` fence.
+///
+/// The size and first cluster are snapshotted at submit because an
+/// asynchronous caller may issue further writes — growing the file — before
+/// it polls this ticket. Publishing the FD's *current* directory state on
+/// completion would attribute a newer size frontier to an older fence, and
+/// that newer frontier's data is not covered by the device fence this ticket
+/// represents.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FenceSlot {
+    /// 0 = free, otherwise `FENCE_STAGE_DATA` / `FENCE_STAGE_META`.
+    stage: u8,
+    /// Owning `open_files` index.
+    file: u8,
+    /// Incremented every time the slot is allocated, so a ticket held across
+    /// a close/reuse is rejected instead of resolving onto another file.
+    generation: u16,
+    /// File size at submit — the frontier this ticket is answerable for.
+    size: u32,
+    /// First cluster at submit; the other directory-entry field a growing
+    /// file can change.
+    start_cluster: u32,
+    /// Block-source ticket for the stage currently in flight.
+    device_ticket: u64,
+}
+
+impl FenceSlot {
+    const fn empty() -> Self {
+        Self {
+            stage: 0,
+            file: 0,
+            generation: 0,
+            size: 0,
+            start_cluster: 0,
+            device_ticket: 0,
+        }
+    }
+}
+
+/// Encode a fence slot index + generation into the opaque `u64` ticket the
+/// contract hands the caller. Index is stored biased by one so a valid
+/// ticket is never 0 — `FSYNC_SUBMIT` reserves 0 for "nothing to fence".
+fn fence_ticket_encode(idx: usize, generation: u16) -> u64 {
+    ((generation as u64) << 32) | (idx as u64 + 1)
+}
+
+/// Resolve a caller ticket back to a live fence slot owned by `file`.
+/// Returns `None` for a malformed, stale, or foreign ticket.
+fn fence_ticket_slot(s: &Fat32State, ticket: u64, file: usize) -> Option<usize> {
+    let idx = (ticket & 0xFFFF_FFFF) as usize;
+    if idx == 0 || idx > MAX_FENCES {
+        return None;
+    }
+    let idx = idx - 1;
+    let f = &s.fences[idx];
+    if f.stage == 0 || f.file as usize != file {
+        return None;
+    }
+    if f.generation as u64 != (ticket >> 32) {
+        return None;
+    }
+    Some(idx)
+}
 
 impl Fat32State {
     fn init(&mut self, syscalls: *const SyscallTable) {
@@ -834,6 +934,7 @@ impl Fat32State {
         self.root_cleaned = 0;
         self.io_rc = 0;
         self.unlink_free = [0; UNLINK_FREE_SLOTS];
+        self.fences = [FenceSlot::empty(); MAX_FENCES];
         self.file_count = 0;
         self.dir_cluster = 0;
         self.dir_sector_in_cluster = 0;
@@ -1345,6 +1446,13 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 const FS_UNLINK: u32 = 0x090A;
 const FS_PREALLOCATE: u32 = 0x090E;
 
+/// `FSYNC_NAME` (0x0912) — durably publish the parent-directory entry
+/// naming a path. FAT32 already writes every name-minting directory
+/// sector synchronously (`fs_op_create`, `fs_op_unlink`), so the entry is
+/// in the device's cache the moment the op returns; what is missing for
+/// durability is the cache flush, which is exactly what this opcode adds.
+const FS_FSYNC_NAME: u32 = 0x0912;
+
 /// `CAPS` (0x09FF) — capability-discovery opcode. Returns a u32
 /// LE bitmap of supported FS opcodes. Callers query this before
 /// invoking write-tier ops (currently just `OPEN_CREATE`) so
@@ -1361,6 +1469,7 @@ const FS_CAP_FSYNC: u32 = 1 << 4;
 const FS_CAP_UNLINK: u32 = 1 << 5;
 const FS_CAP_PREALLOCATE: u32 = 1 << 9;
 const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
+const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
 
 /// `Fence::LocalDurable` device id reported by fat32 handles once their
 /// data has been fsync'd. Opaque per `contracts::fence::DeviceId` (u64);
@@ -1961,6 +2070,16 @@ unsafe fn fs_op_close(s: &mut Fat32State, handle: i32) -> i32 {
         // for every writable handle — a write→fsync→close clears `dirty`
         // before close, so gating this on `dirty` would lose the hint.
         let _ = fs_write_fsinfo_hint(s);
+    }
+    // Release any fence still naming this slot. `fs_op_fsync_poll` rejects
+    // a ticket whose generation no longer matches, so a caller holding one
+    // across close gets `EINVAL` rather than a fence over another file.
+    let mut f = 0usize;
+    while f < MAX_FENCES {
+        if s.fences[f].stage != 0 && s.fences[f].file as usize == slot_idx {
+            s.fences[f].stage = 0;
+        }
+        f += 1;
     }
     s.open_files[slot_idx] = OpenFile::empty();
     rc
@@ -3043,7 +3162,9 @@ unsafe fn fs_patch_dirent(
 }
 
 /// Persist a writable FD's directory entry (first cluster + size) and
-/// clear its dirty flag.
+/// clear its dirty flag. The write reaches the device's cache; a caller
+/// needing durability follows with `fs_sync_flush` and
+/// `fs_note_dir_durable`.
 unsafe fn fs_writeback_dir_entry(s: &mut Fat32State, slot: usize) -> i32 {
     let (lba, off, fc, sz) = {
         let of = &s.open_files[slot];
@@ -3052,6 +3173,70 @@ unsafe fn fs_writeback_dir_entry(s: &mut Fat32State, slot: usize) -> i32 {
     let rc = fs_patch_dirent(s, lba, off, fc, sz);
     if rc == 0 {
         s.open_files[slot].dirty = 0;
+        if sz > s.open_files[slot].dir_media_size {
+            s.open_files[slot].dir_media_size = sz;
+        }
+    }
+    rc
+}
+
+/// Record that everything already submitted for `slot`'s directory entry is
+/// now on non-volatile media. Called after a successful device flush or a
+/// completed metadata fence; `covered` is the size frontier that flush
+/// proves and `start_cluster` the chain head published with it.
+fn fs_note_dir_durable(s: &mut Fat32State, slot: usize, covered: u32, start_cluster: u32) {
+    if covered >= s.open_files[slot].dir_durable_size {
+        s.open_files[slot].dir_durable_size = covered;
+        s.open_files[slot].dir_durable_start = start_cluster;
+    }
+}
+
+/// Submit `slot`'s directory entry carrying an explicit `size` /
+/// `first_cluster` into the block source's async ring, so a subsequent
+/// device fence covers it. Returns 0 on submit, `E_AGAIN` when the ring is
+/// full (the caller retries — nothing has been consumed), or a negative
+/// errno.
+///
+/// The size written is the frontier a fence ticket snapshotted, never the
+/// FD's current size: an older ticket must not publish a newer file extent
+/// whose data that ticket's device fence did not cover.
+unsafe fn fs_submit_dir_entry_async(
+    s: &mut Fat32State,
+    slot: usize,
+    first_cluster: u32,
+    size: u32,
+) -> i32 {
+    let (lba, off) = {
+        let of = &s.open_files[slot];
+        (of.dir_lba, of.dir_off)
+    };
+    if lba == 0 {
+        return E_INVAL;
+    }
+    let rc = fs_read_blockbuf(s, lba);
+    if rc != 0 {
+        return rc;
+    }
+    let e = off as usize;
+    if e + DIR_ENTRY_SIZE > BLOCK_SIZE {
+        return E_INVAL;
+    }
+    s.block_buf[e + 20] = (first_cluster >> 16) as u8;
+    s.block_buf[e + 21] = (first_cluster >> 24) as u8;
+    s.block_buf[e + 26] = first_cluster as u8;
+    s.block_buf[e + 27] = (first_cluster >> 8) as u8;
+    let sz = size.to_le_bytes();
+    s.block_buf[e + 28] = sz[0];
+    s.block_buf[e + 29] = sz[1];
+    s.block_buf[e + 30] = sz[2];
+    s.block_buf[e + 31] = sz[3];
+    let p = s.block_buf.as_ptr();
+    let rc = fs_async_write_sectors(s, lba, 1, p);
+    if rc == 0 {
+        s.open_files[slot].dirty = 0;
+        if size > s.open_files[slot].dir_media_size {
+            s.open_files[slot].dir_media_size = size;
+        }
     }
     rc
 }
@@ -3320,6 +3505,9 @@ unsafe fn fs_op_preallocate(
     let rc = fs_sync_flush(s);
     if rc == 0 {
         s.open_files[slot].durable = 1;
+        let covered = s.open_files[slot].dir_media_size;
+        let head = s.open_files[slot].start_cluster;
+        fs_note_dir_durable(s, slot, covered, head);
     }
     rc
 }
@@ -3634,20 +3822,60 @@ unsafe fn fs_op_fsync(s: &mut Fat32State, handle: i32) -> i32 {
         // Data + dir entry are now committed past the device's volatile
         // cache (NVMe Flush). Promote the handle's fence to LocalDurable.
         s.open_files[slot].durable = 1;
+        let covered = s.open_files[slot].dir_media_size;
+        let head = s.open_files[slot].start_cluster;
+        fs_note_dir_durable(s, slot, covered, head);
     }
     rc
+}
+
+/// FS_FSYNC_NAME: make the directory entry naming `path` durable.
+///
+/// FAT32 stores a name as a 32-byte entry inside its parent directory's
+/// data cluster, and every op that mints or removes one — `fs_op_create`,
+/// `fs_op_unlink` — writes that sector synchronously before returning.
+/// The sector therefore already carries the caller's intent; only the
+/// device's volatile write cache stands between it and stable storage,
+/// so this op resolves the parent (to reject a path that never named
+/// anything here) and issues the cache flush.
+///
+/// The entry may be present or absent — a removal is as much a name
+/// publication as a creation — so the entry itself is deliberately not
+/// required to exist. What must resolve is the parent directory.
+unsafe fn fs_op_fsync_name(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len == 0 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done || s.root_cluster < 2 {
+        return E_AGAIN;
+    }
+    s.io_rc = 0;
+    let path = core::slice::from_raw_parts(arg, arg_len);
+    if fs_split_parent(s, path).is_none() {
+        return fs_io_errno(s, -2); // ENOENT
+    }
+    fs_sync_flush(s)
 }
 
 /// FSYNC_SUBMIT: open a non-blocking durability fence over this FD's
 /// writes, returning its ticket (`u64` LE) in `arg` (≥8 bytes). Flushes
 /// the pending scratch sector — async when the FD is in async mode — so
 /// the fence covers it, then snapshots the block source's submit
-/// high-water. A dirty directory entry is NOT written here: the entry
-/// (size metadata pointing at the data) goes to the device only once
-/// the fence proves the data durable, in `fs_op_fsync_poll` — the same
-/// data-before-metadata order the sync `fs_op_fsync` path establishes.
-/// Does NOT block on durability; the caller polls with
-/// `fs_op_fsync_poll`.
+/// high-water together with the file's size and first cluster.
+///
+/// The snapshot is what makes the ticket answerable for a fixed extent.
+/// A caller may submit further writes, growing the file, before it polls
+/// this ticket; the directory entry published on completion carries the
+/// size recorded here, never the FD's later size, because only the bytes
+/// below this frontier are covered by this ticket's device fence.
+///
+/// A dirty directory entry is NOT written here: the entry (size metadata
+/// pointing at the data) goes to the device only once the fence proves
+/// the data durable, in `fs_op_fsync_poll` — the same data-before-metadata
+/// order the sync `fs_op_fsync` path establishes. Does NOT block on
+/// durability; the caller polls with `fs_op_fsync_poll`. Returns
+/// `E_AGAIN` when every fence slot is outstanding — real backpressure on
+/// pipelining depth, not a downgrade.
 unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     let slot = handle as usize;
     if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 {
@@ -3672,10 +3900,20 @@ unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_
         // E_AGAIN so the caller retries the fence next step (real
         // backpressure — no sync downgrade). The fence opened below then
         // covers it.
+        // Sync: the block source's fence high-water counts async
+        // submissions only, so a sector written through the synchronous
+        // path is not covered by the ticket opened below. Commit it with a
+        // blocking flush instead of fencing something the count cannot
+        // describe.
         let rc = if s.open_files[slot].async_mode != 0 {
             fs_async_write_sectors(s, lba, nlb, wp)
         } else {
-            fs_sync_write_sectors(s, lba, nlb, wp)
+            let w = fs_sync_write_sectors(s, lba, nlb, wp);
+            if w == 0 {
+                fs_sync_flush(s)
+            } else {
+                w
+            }
         };
         if rc != 0 {
             return rc;
@@ -3683,12 +3921,28 @@ unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_
         s.open_files[slot].scratch_dirty = 0;
         scratch_retain_tail(&mut s.open_files[slot]);
     }
-    let mut ticket = 0u64;
-    let rc = fs_fence_submit(s, &mut ticket);
+    let mut idx = 0usize;
+    while idx < MAX_FENCES && s.fences[idx].stage != 0 {
+        idx += 1;
+    }
+    if idx >= MAX_FENCES {
+        return E_AGAIN;
+    }
+    let mut device_ticket = 0u64;
+    let rc = fs_fence_submit(s, &mut device_ticket);
     if rc != 0 {
         return rc;
     }
-    let tb = ticket.to_le_bytes();
+    let generation = s.fences[idx].generation.wrapping_add(1);
+    s.fences[idx] = FenceSlot {
+        stage: FENCE_STAGE_DATA,
+        file: slot as u8,
+        generation,
+        size: s.open_files[slot].size,
+        start_cluster: s.open_files[slot].start_cluster,
+        device_ticket,
+    };
+    let tb = fence_ticket_encode(idx, generation).to_le_bytes();
     let mut i = 0usize;
     while i < 8 {
         *arg.add(i) = tb[i];
@@ -3698,11 +3952,34 @@ unsafe fn fs_op_fsync_submit(s: &mut Fat32State, handle: i32, arg: *mut u8, arg_
 }
 
 /// FSYNC_POLL: non-blocking poll of a fence ticket (`u64` LE in `arg`).
-/// Returns 0 = durable (promotes the FD's fence to LocalDurable), 1 =
-/// pending, or a negative errno if a fenced write failed. On the durable
-/// transition, a dirty directory entry is written back first — sync,
-/// durable on completion — so the size metadata never lands on media
-/// ahead of the data it points at (see `fs_op_fsync_submit`).
+/// Returns 0 = durable, 1 = pending, or a negative errno if a fenced write
+/// failed or the ticket does not name a live fence on this FD.
+///
+/// ## What a 0 return means
+///
+/// Every byte written to this FD before the ticket's `FSYNC_SUBMIT`, and a
+/// directory entry recording a size at least that frontier, are both on
+/// non-volatile media. It is a LOWER bound: writes issued after the submit
+/// may also have reached media, and a larger on-media size is a valid
+/// result, not a failure.
+///
+/// ## Two stages
+///
+/// A ticket runs `FENCE_STAGE_DATA` then `FENCE_STAGE_META`. The data
+/// stage waits on the block source's fence over the writes submitted
+/// before the ticket. Only once those are durable does the metadata stage
+/// submit the directory entry — carrying the ticket's snapshotted size and
+/// first cluster — into the same async ring, behind a second block-source
+/// fence. That second fence is what proves the entry itself is past the
+/// device's volatile cache, so the poll never reports durable on the back
+/// of an unflushed metadata write.
+///
+/// A ticket whose snapshot is already covered by a durable directory entry
+/// (the preallocated fixed-capacity file, whose size never changes) skips
+/// the metadata stage entirely. The entry is only rewritten when a
+/// ticket's frontier exceeds what has been submitted for this FD, so
+/// polling tickets out of order can never move the on-media size
+/// backwards.
 unsafe fn fs_op_fsync_poll(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: usize) -> i32 {
     let slot = handle as usize;
     if slot >= MAX_OPEN_FILES || s.open_files[slot].in_use == 0 {
@@ -3721,17 +3998,95 @@ unsafe fn fs_op_fsync_poll(s: &mut Fat32State, handle: i32, arg: *const u8, arg_
         *arg.add(6),
         *arg.add(7),
     ]);
-    let rc = fs_fence_poll(s, ticket);
-    if rc == 0 {
-        if s.open_files[slot].dirty != 0 {
-            let wb = fs_writeback_dir_entry(s, slot);
+    // Ticket 0 is the read-only FD's "nothing to fence" reply.
+    if ticket == 0 {
+        return 0;
+    }
+    let Some(idx) = fence_ticket_slot(s, ticket, slot) else {
+        return E_INVAL;
+    };
+    let rc = fs_fence_poll(s, s.fences[idx].device_ticket);
+    if rc == 1 {
+        return 1;
+    }
+    if rc != 0 {
+        s.fences[idx].stage = 0;
+        return rc;
+    }
+    if s.fences[idx].stage == FENCE_STAGE_META {
+        let covered = s.fences[idx].size;
+        let head = s.fences[idx].start_cluster;
+        s.fences[idx].stage = 0;
+        fs_note_dir_durable(s, slot, covered, head);
+        if s.open_files[slot].size == covered && s.open_files[slot].scratch_dirty == 0 {
+            s.open_files[slot].durable = 1;
+        }
+        return 0;
+    }
+    // Data stage complete. Publish the snapshotted frontier if the
+    // directory entry does not already carry it durably.
+    let (size, start_cluster) = (s.fences[idx].size, s.fences[idx].start_cluster);
+    if size <= s.open_files[slot].dir_durable_size
+        && start_cluster == s.open_files[slot].dir_durable_start
+    {
+        s.fences[idx].stage = 0;
+        if s.open_files[slot].size == size && s.open_files[slot].scratch_dirty == 0 {
+            s.open_files[slot].durable = 1;
+        }
+        return 0;
+    }
+    if s.open_files[slot].async_mode == 0 {
+        // A synchronous FD's writes are not counted by the block source's
+        // fence high-water, so the metadata cannot be fenced the same way:
+        // write the entry and commit it with a blocking flush. The ticket
+        // completes in one stage.
+        if size > s.open_files[slot].dir_media_size {
+            let (lba, off) = {
+                let of = &s.open_files[slot];
+                (of.dir_lba, of.dir_off)
+            };
+            let wb = fs_patch_dirent(s, lba, off, start_cluster, size);
             if wb != 0 {
+                s.fences[idx].stage = 0;
                 return wb;
             }
+            s.open_files[slot].dirty = 0;
+            s.open_files[slot].dir_media_size = size;
         }
-        s.open_files[slot].durable = 1;
+        let fl = fs_sync_flush(s);
+        if fl != 0 {
+            s.fences[idx].stage = 0;
+            return fl;
+        }
+        s.fences[idx].stage = 0;
+        fs_note_dir_durable(s, slot, size, start_cluster);
+        if s.open_files[slot].size == size && s.open_files[slot].scratch_dirty == 0 {
+            s.open_files[slot].durable = 1;
+        }
+        return 0;
     }
-    rc
+    if size > s.open_files[slot].dir_media_size {
+        let wr = fs_submit_dir_entry_async(s, slot, start_cluster, size);
+        if wr == E_AGAIN {
+            // Ring full — retry on the next poll. The ticket stays in the
+            // data stage with nothing consumed.
+            return 1;
+        }
+        if wr != 0 {
+            s.fences[idx].stage = 0;
+            return wr;
+        }
+    }
+    // A later ticket may already have submitted a wider entry; a fresh
+    // fence covers whichever submit carries this frontier either way.
+    let mut device_ticket = 0u64;
+    let frc = fs_fence_submit(s, &mut device_ticket);
+    if frc != 0 {
+        return 1;
+    }
+    s.fences[idx].stage = FENCE_STAGE_META;
+    s.fences[idx].device_ticket = device_ticket;
+    1
 }
 
 #[cfg_attr(
@@ -3783,10 +4138,15 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         };
     }
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
-    // FAT32 v1 is read-only — no cluster allocator, no FAT-table
-    // writeback, no directory-entry emit. The CAPS query is the
-    // canonical way for callers to discover the read-only posture
-    // before they call OPEN_CREATE / WRITE / etc and get ENOSYS.
+    // The CAPS query is the canonical way for callers to discover which
+    // tiers this provider serves before they call an opcode and get
+    // ENOSYS. `RENAME` stays clear: FAT32 has no atomic directory
+    // mutation — replacing a name means writing a new 8.3 entry and
+    // clearing the old one, and when the two entries fall in different
+    // sectors an interruption is visible as both names or neither. A
+    // consumer needing all-or-nothing publication must use
+    // `OPEN_CREATE` + `FSYNC_NAME` over a self-describing artefact, or
+    // refuse to run on this backend.
     if opcode == FS_CAPS {
         if arg.is_null() || arg_len < 4 {
             return E_INVAL;
@@ -3798,7 +4158,8 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
             | FS_CAP_FSYNC
             | FS_CAP_UNLINK
             | FS_CAP_PREALLOCATE
-            | FS_CAP_FSYNC_ASYNC;
+            | FS_CAP_FSYNC_ASYNC
+            | FS_CAP_FSYNC_NAME;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -3833,6 +4194,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         FS_FSYNC => fs_op_fsync(s, handle),
         FS_FSYNC_SUBMIT => fs_op_fsync_submit(s, handle, arg, arg_len),
         FS_FSYNC_POLL => fs_op_fsync_poll(s, handle, arg as *const u8, arg_len),
+        FS_FSYNC_NAME => fs_op_fsync_name(s, arg as *const u8, arg_len),
         _ => -38, // ENOSYS
     }
 }
@@ -5468,8 +5830,15 @@ pub mod test_ops {
     pub const FS_OPEN_CREATE: u32 = super::FS_OPEN_CREATE;
     pub const FS_UNLINK: u32 = super::FS_UNLINK;
     pub const FS_PREALLOCATE: u32 = super::FS_PREALLOCATE;
+    pub const FS_WRITE_ASYNC: u32 = super::FS_WRITE_ASYNC;
+    pub const FS_FSYNC_SUBMIT: u32 = super::FS_FSYNC_SUBMIT;
+    pub const FS_FSYNC_POLL: u32 = super::FS_FSYNC_POLL;
+    pub const FS_FSYNC_NAME: u32 = super::FS_FSYNC_NAME;
     pub const FS_CAPS: u32 = super::FS_CAPS;
     pub const FS_CAP_UNLINK: u32 = super::FS_CAP_UNLINK;
+    pub const FS_CAP_FSYNC_ASYNC: u32 = super::FS_CAP_FSYNC_ASYNC;
+    pub const FS_CAP_FSYNC_NAME: u32 = super::FS_CAP_FSYNC_NAME;
+    pub const FS_CAP_RENAME: u32 = 1 << 8;
     /// FAT end-of-chain marker; the harness writes it into FAT[root] so the
     /// allocator never hands out the root-directory cluster.
     pub const FAT32_TAIL: u32 = super::FAT32_TAIL;

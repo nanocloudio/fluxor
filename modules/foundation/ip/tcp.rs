@@ -55,6 +55,31 @@ pub enum TcpState {
     TimeWait = 7,
     Listen = 8,
     SynReceived = 9,
+    /// Simultaneous close: our FIN is outstanding and the peer's FIN has
+    /// already been acknowledged. Reached from `FinWait1` on a FIN that does
+    /// not also acknowledge our FIN; leaves for `TimeWait` when it is.
+    Closing = 10,
+}
+
+impl TcpState {
+    /// A synchronised state, i.e. one in which both sides have agreed a
+    /// sequence space, so RFC 9293 §3.10.7.4 receive-window acceptability
+    /// applies. `SynSent` is excluded: it has no `RCV.NXT` yet and RFC 9293
+    /// §3.10.7.3 gives it its own rules.
+    #[inline]
+    pub fn is_synchronised(self) -> bool {
+        matches!(
+            self,
+            TcpState::Established
+                | TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::CloseWait
+                | TcpState::Closing
+                | TcpState::LastAck
+                | TcpState::TimeWait
+                | TcpState::SynReceived
+        )
+    }
 }
 
 /// Reorder buffer: number of slots and bytes per slot.
@@ -99,6 +124,12 @@ pub struct TcpConn {
     pub local_slot: u8,
     pub _slot_pad: u8,
 
+    /// Owner stamped on this endpoint at bind (`rfc_net_identity_metal` §3.4).
+    /// `0` is the host wildcard. Part of the datagram bind identity: a second
+    /// bind of the same `(local_port, local_slot)` under a different owner is
+    /// a conflict, not an idempotent retry.
+    pub owner_tag: u16,
+
     /// When set, this slot is a datagram endpoint. UDP delivery to it
     /// uses `MSG_DG_RX_FROM` framing (opcodes 0x40..0x43). Always false
     /// for TCP conns.
@@ -113,6 +144,16 @@ pub struct TcpConn {
     // Receive sequence variables
     pub rcv_nxt: u32, // next expected
     pub rcv_wnd: u16, // our receive window advertisement
+
+    /// `SND.WL1` — the sequence number of the segment that last updated
+    /// `snd_wnd`. RFC 9293 §3.10.7.4: the window is refreshed only from a
+    /// strictly newer segment, so a replayed or reordered advertisement
+    /// cannot shrink or reopen the send window.
+    pub snd_wl1: u32,
+    /// `SND.WL2` — the acknowledgement number of the segment that last
+    /// updated `snd_wnd`. Breaks the tie when two segments carry the same
+    /// `SEG.SEQ`.
+    pub snd_wl2: u32,
 
     pub iss: u32,
     pub retransmit_timer: u16,
@@ -156,7 +197,11 @@ pub struct TcpConn {
     /// (`TRACE_FLAGS_SAMPLED` or 0) emitted for this connection's span AND
     /// propagated downstream. Read — never recomputed — at span close.
     pub sampled_flags: u8,
-    _close_pad: u8,
+    /// Per-peer challenge-ACK allowance remaining in the current refill
+    /// window (`CHALLENGE_ACK_PEER_BUDGET`, refilled by the 50 ms TCP timer).
+    /// Bounds how much traffic one connection can make this host emit in
+    /// response to spoofed in-window RSTs and SYNs.
+    pub chal_budget: u8,
 
     /// Observability: monotonic-micros start of this connection's
     /// `tcp.connection` span, latched at accept when the telemetry port is
@@ -184,11 +229,14 @@ impl TcpConn {
             remote_ip: 0,
             local_slot: LOCAL_SLOT_ANY,
             _slot_pad: 0,
+            owner_tag: 0,
             is_datagram: false,
             _dg_pad: [0; 3],
             snd_una: 0,
             snd_nxt: 0,
             snd_wnd: 0,
+            snd_wl1: 0,
+            snd_wl2: 0,
             rcv_nxt: 0,
             rcv_wnd: INITIAL_RCV_WND,
             iss: 0,
@@ -210,7 +258,7 @@ impl TcpConn {
             pending_close_notify: 0,
             connect_tag: 0,
             sampled_flags: 0,
-            _close_pad: 0,
+            chal_budget: CHALLENGE_ACK_PEER_BUDGET,
             span_start_us: 0,
             trace_id: [0; 16],
             span_id: [0; 8],
@@ -491,6 +539,138 @@ pub unsafe fn compute_tcp_checksum(
 #[inline]
 pub fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
+}
+
+/// Returns true if `a` is at or before `b` modulo 2^32.
+#[inline]
+pub fn seq_leq(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) <= 0
+}
+
+// ============================================================================
+// Segment admissibility (RFC 9293 §3.10.7.4, RFC 5961)
+// ============================================================================
+
+/// Global challenge-ACK allowance per refill window. RFC 5961 §7 requires a
+/// rate limit so the defence cannot be turned into a reflector: an attacker
+/// who can forge in-window RSTs must not be able to make this host emit one
+/// ACK per forged segment. Sized for MCU targets — an order of magnitude
+/// below a server-class limit, and still far above what a healthy peer needs
+/// (a legitimate connection issues at most a handful per second).
+pub const CHALLENGE_ACK_GLOBAL_BUDGET: u8 = 10;
+
+/// Per-connection share of the same allowance. One noisy peer must not be
+/// able to consume the whole global budget and silence the defence for every
+/// other connection.
+pub const CHALLENGE_ACK_PEER_BUDGET: u8 = 2;
+
+/// Refill period for both buckets, in 50 ms TCP timer ticks (≈1 s).
+pub const CHALLENGE_ACK_REFILL_TICKS: u8 = 20;
+
+/// Sequence space a segment occupies: its payload plus one for each of SYN
+/// and FIN, which are themselves sequenced (RFC 9293 §3.4).
+#[inline]
+pub fn seg_len(flags: u8, payload_len: usize) -> u32 {
+    let mut n = payload_len as u32;
+    if (flags & SYN) != 0 {
+        n = n.wrapping_add(1);
+    }
+    if (flags & FIN) != 0 {
+        n = n.wrapping_add(1);
+    }
+    n
+}
+
+/// Is `val` inside the half-open window `[start, start + wnd)`?
+#[inline]
+fn in_window(start: u32, wnd: u32, val: u32) -> bool {
+    val.wrapping_sub(start) < wnd
+}
+
+/// RFC 9293 §3.10.7.4 receive-window acceptability, over the segment's full
+/// extent rather than its first byte.
+///
+/// Four cases, on `SEG.LEN` and `RCV.WND`:
+///
+/// | `SEG.LEN` | `RCV.WND` | acceptable when                                    |
+/// |-----------|-----------|----------------------------------------------------|
+/// | 0         | 0         | `SEG.SEQ == RCV.NXT`                                |
+/// | 0         | > 0       | `RCV.NXT <= SEG.SEQ < RCV.NXT + RCV.WND`            |
+/// | > 0       | 0         | never                                               |
+/// | > 0       | > 0       | either endpoint of the segment falls in the window  |
+///
+/// Testing both endpoints is what makes a segment that straddles the window
+/// edge admissible while one that lies wholly beyond it is not; testing only
+/// `SEG.SEQ` would admit a segment whose first byte is old and whose tail
+/// carries injected data past `RCV.NXT`.
+pub fn segment_acceptable(rcv_nxt: u32, rcv_wnd: u16, seq: u32, seg_len: u32) -> bool {
+    let wnd = rcv_wnd as u32;
+    if seg_len == 0 {
+        if wnd == 0 {
+            return seq == rcv_nxt;
+        }
+        return in_window(rcv_nxt, wnd, seq);
+    }
+    if wnd == 0 {
+        return false;
+    }
+    let last = seq.wrapping_add(seg_len).wrapping_sub(1);
+    in_window(rcv_nxt, wnd, seq) || in_window(rcv_nxt, wnd, last)
+}
+
+/// What to do with an inbound RST, per RFC 5961 §3.2.
+pub enum RstAction {
+    /// `SEG.SEQ` is exactly `RCV.NXT` — the only sequence a legitimate peer
+    /// can produce. Tear the connection down.
+    Reset,
+    /// In the receive window but not at `RCV.NXT`. Off-path injection can
+    /// reach anywhere in the window, so answer with an ACK that tells a
+    /// genuine peer the expected sequence and drop the segment.
+    Challenge,
+    /// Outside the window entirely — not part of this conversation.
+    Drop,
+}
+
+/// Classify an inbound RST for a synchronised connection.
+pub fn classify_rst(rcv_nxt: u32, rcv_wnd: u16, seq: u32) -> RstAction {
+    if seq == rcv_nxt {
+        return RstAction::Reset;
+    }
+    // A zero receive window still admits the exact-`RCV.NXT` case above; a
+    // closed window has no other in-window sequence to challenge for.
+    if rcv_wnd != 0 && in_window(rcv_nxt, rcv_wnd as u32, seq) {
+        return RstAction::Challenge;
+    }
+    RstAction::Drop
+}
+
+/// Is `ack` a valid acknowledgement for a synchronised connection —
+/// `SND.UNA <= SEG.ACK <= SND.NXT` (RFC 9293 §3.10.7.4)?
+///
+/// An ACK above `SND.NXT` acknowledges data never sent; one below `SND.UNA`
+/// is a duplicate. Both are admissible as *segments* (the duplicate drives
+/// fast retransmit), but neither may install a window or advance `SND.UNA`.
+#[inline]
+pub fn ack_acceptable(snd_una: u32, snd_nxt: u32, ack: u32) -> bool {
+    seq_leq(snd_una, ack) && seq_leq(ack, snd_nxt)
+}
+
+/// RFC 9293 §3.10.7.4 send-window update rule. The window is taken only from
+/// a segment strictly newer than the one that last set it: `SND.WL1 < SEG.SEQ`,
+/// or the same `SEG.SEQ` with a not-older `SEG.ACK`. Without the test a
+/// replayed old advertisement — including a zero window — silently stalls or
+/// over-opens the sender.
+pub fn window_update_allowed(conn: &TcpConn, seq: u32, ack: u32) -> bool {
+    seq_lt(conn.snd_wl1, seq) || (conn.snd_wl1 == seq && seq_leq(conn.snd_wl2, ack))
+}
+
+/// Install `wnd` as the peer's advertised window and record the segment that
+/// supplied it. Callers must have established both segment acceptability and
+/// [`window_update_allowed`] first.
+pub fn apply_window_update(conn: &mut TcpConn, seq: u32, ack: u32, wnd: u16) {
+    conn.snd_wnd = wnd;
+    conn.snd_wl1 = seq;
+    conn.snd_wl2 = ack;
 }
 
 // ============================================================================

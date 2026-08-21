@@ -1799,7 +1799,12 @@ unsafe fn h3_open_request_stream(s: &mut QuicState, cid: usize, flags: u8) -> Op
 ///
 /// Returns false when the stream is unknown, so the caller can log a rejection
 /// rather than silently writing the response of one request onto another.
-unsafe fn h3_stage_request_send(s: &mut QuicState, cid: usize, stream_id: u32, data: &[u8]) -> bool {
+unsafe fn h3_stage_request_send(
+    s: &mut QuicState,
+    cid: usize,
+    stream_id: u32,
+    data: &[u8],
+) -> bool {
     if cid >= MAX_CONNS {
         return false;
     }

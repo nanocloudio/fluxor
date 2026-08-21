@@ -5,6 +5,18 @@ hardware_targets = ["bcm2712", "rp2350"]
 # rule 2 — an absent declaration is unattested → blocked on (b)).
 timer_class = "agnostic"
 
+# Eligible for `fault_policy: restart`, which releases provider handles,
+# flushes every channel, and resumes the same state without re-running
+# module_new. This module qualifies: one step handles exactly one frame from
+# length prefix to forward, it opens no provider handle, it sits on an
+# unreliable L2 path where dropping a frame is what the medium below already
+# does, and the fuse table is a rate limiter whose worst case after a partial
+# update is one admission of drift inside one `rate_window_ms`. A fault between
+# the prefix read and the body read cannot desynchronise the stream because the
+# restart path flushes the channel before the module runs again. Matrix:
+# tests/harness/tests/conn_guard_resume.rs.
+resume_after_fault = true
+
 [[ports]]
 name = "frames_rx"
 direction = "input"

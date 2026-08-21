@@ -149,15 +149,13 @@ struct LinuxAudioState {
     playback_cap_samples: usize,
 }
 
-// Tag layout (declaration order in manifest.toml, starting at 10):
-//   10: mode (enum wav=0, raw=1, null=2, playback=3)
-//   11: path (str)
-//   12: sample_rate (u32)
-//   13: channels (u8)
-const AUDIO_TAG_MODE: u8 = 10;
-const AUDIO_TAG_PATH: u8 = 11;
-const AUDIO_TAG_SAMPLE_RATE: u8 = 12;
-const AUDIO_TAG_CHANNELS: u8 = 13;
+// Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
+// generated into `builtin_param_tags`. `mode` selects wav=0, raw=1, null=2,
+// playback=3.
+use fluxor::platform::builtin_param_tags::linux_audio::{
+    TAG_CHANNELS as AUDIO_TAG_CHANNELS, TAG_MODE as AUDIO_TAG_MODE, TAG_PATH as AUDIO_TAG_PATH,
+    TAG_SAMPLE_RATE as AUDIO_TAG_SAMPLE_RATE,
+};
 
 const AUDIO_MODE_WAV: u8 = 0;
 const AUDIO_MODE_RAW: u8 = 1;

@@ -3,6 +3,24 @@
 //! Resolves configured hostnames locally, forwards everything else to an
 //! upstream DNS server (default 8.8.8.8).
 //!
+//! # Supported profile
+//!
+//! Exactly one question per query (`QDCOUNT == 1`), opcode 0. A local answer is
+//! constructed from the query header plus that question; nothing trailing the
+//! question is echoed back.
+//!
+//! # Forwarding correlation
+//!
+//! A forwarded query carries a CSPRNG-drawn upstream transaction id, never the
+//! client's own — two clients that pick the same id stay distinct
+//! conversations, and an off-path guess must also match the rest of the tuple.
+//! The pending slot retains the client id and endpoint, the upstream endpoint,
+//! the question (QNAME hash, QTYPE, QCLASS), the opcode, and a deadline; an
+//! answer is relayed only after reproducing all of them, and the slot is
+//! consumed as it is relayed so a duplicate cannot re-fire. Only free or
+//! expired slots are taken: with every slot live the NEW query is answered
+//! SERVFAIL rather than displacing work already accepted.
+//!
 //! # Architecture
 //!
 //! Uses the datagram surface
@@ -72,6 +90,14 @@ const FLAG_AA: u16 = 0x0400; // Authoritative
 const FLAG_RA: u16 = 0x0080; // Recursion available
 const FLAG_RD: u16 = 0x0100; // Recursion desired
 const RCODE_NXDOMAIN: u16 = 0x0003;
+const RCODE_SERVFAIL: u16 = 0x0002;
+
+/// Opcode field of the DNS header flags word (bits 11..14).
+const FLAG_OPCODE_MASK: u16 = 0x7800;
+const FLAG_OPCODE_SHIFT: u32 = 11;
+
+/// Only opcode 0 (standard query) is served or forwarded.
+const OPCODE_QUERY: u8 = 0;
 
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
 // modules/sdk/runtime.rs (shared across consumers).
@@ -88,8 +114,18 @@ const MAX_PENDING: usize = 8;
 /// Pending query timeout (milliseconds)
 const PENDING_TIMEOUT_MS: u32 = 5000;
 
-/// Maximum domain name length
-const MAX_NAME_LEN: usize = 63;
+/// Maximum dotted domain name length, in bytes. This is the DNS full-name
+/// ceiling (RFC 1035 §2.3.4), not the 63-byte per-label ceiling — a name of
+/// several ordinary labels must fit.
+const MAX_NAME_LEN: usize = 255;
+
+/// Maximum length of one wire-format label (RFC 1035 §2.3.4).
+const MAX_LABEL_LEN: usize = 63;
+
+/// Draws taken from the CSPRNG when allocating an upstream transaction id
+/// before the forward is refused. Each draw is rejected only on collision with
+/// a live pending slot, so the bound is reached with negligible probability.
+const UPSTREAM_ID_DRAWS: usize = 8;
 
 // ============================================================================
 // Parameter Definitions
@@ -157,28 +193,71 @@ impl HostEntry {
     }
 }
 
+/// One forwarded query awaiting its upstream answer.
+///
+/// The correlation key on the wire is `upstream_id` — drawn from the CSPRNG,
+/// never the client's own id — so two clients that pick the same id remain
+/// distinct conversations. Everything an answer must reproduce before it is
+/// relayed is retained here: the upstream endpoint it must come from, the
+/// question it must repeat, and the client endpoint plus original id it is
+/// rewritten for.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PendingQuery {
-    dns_id: u16,
+    /// Transaction id used towards the upstream resolver.
+    upstream_id: u16,
+    /// Transaction id the client chose, restored into the relayed answer.
+    client_id: u16,
     client_port: u16,
+    qtype: u16,
+    qclass: u16,
+    upstream_port: u16,
     client_ip: u32,
-    timestamp: u32,
+    upstream_ip: u32,
+    /// `fnv1a_lower` over the dotted lowercase QNAME of the forwarded question.
+    qname_hash: u32,
+    /// Wall-clock millisecond deadline; the slot is dead once it passes.
+    deadline_ms: u32,
+    opcode: u8,
     active: u8,
-    _pad: [u8; 3],
+    _pad: [u8; 2],
 }
 
 impl PendingQuery {
     const fn empty() -> Self {
         Self {
-            dns_id: 0,
+            upstream_id: 0,
+            client_id: 0,
             client_port: 0,
+            qtype: 0,
+            qclass: 0,
+            upstream_port: 0,
             client_ip: 0,
-            timestamp: 0,
+            upstream_ip: 0,
+            qname_hash: 0,
+            deadline_ms: 0,
+            opcode: 0,
             active: 0,
-            _pad: [0; 3],
+            _pad: [0; 2],
         }
     }
+}
+
+/// The question a response must repeat exactly to be accepted.
+#[derive(Clone, Copy)]
+struct Question {
+    qname_hash: u32,
+    qtype: u16,
+    qclass: u16,
+    /// Offset of the first byte after the question section.
+    end: usize,
+}
+
+/// True once `deadline_ms` has passed, wrap-safe over the 32-bit millisecond
+/// clock.
+#[inline(always)]
+fn deadline_passed(now_ms: u32, deadline_ms: u32) -> bool {
+    (now_ms.wrapping_sub(deadline_ms) as i32) >= 0
 }
 
 // ============================================================================
@@ -211,6 +290,14 @@ struct DnsState {
     // Statistics
     queries_local: u32,
     queries_forwarded: u32,
+    /// Upstream datagrams refused by correlation: wrong source endpoint, no
+    /// QR bit, unexpected opcode, unparsable or mismatched question, unknown /
+    /// expired transaction id, or a duplicate arriving after the first answer
+    /// was consumed.
+    upstream_drops: u32,
+    /// Client queries refused with SERVFAIL because every pending slot was
+    /// live, or because no upstream transaction id could be drawn.
+    forward_refusals: u32,
 
     // Module-scope telemetry: cumulative byte counters + last emit timestamp
     // (cadence gated on the wallclock since dns has no per-step counter).
@@ -248,6 +335,13 @@ impl DnsState {
         self.upstream_ep = DatagramEndpoint::new();
         self.queries_local = 0;
         self.queries_forwarded = 0;
+        self.upstream_drops = 0;
+        self.forward_refusals = 0;
+        let mut i = 0;
+        while i < MAX_PENDING {
+            self.pending[i] = PendingQuery::empty();
+            i += 1;
+        }
         self.tlm = TlmCounters::new();
         self.tlm_last_ms = 0;
         // `sample_permille` is resolved in `module_new` after param parsing
@@ -400,7 +494,7 @@ unsafe fn extract_qname(
         }
 
         // No compression pointer support needed for questions
-        if label_len > 63 || off + label_len > pkt_len {
+        if label_len > MAX_LABEL_LEN || off + label_len > pkt_len {
             return 0;
         }
 
@@ -434,9 +528,11 @@ unsafe fn extract_qname(
     name_pos
 }
 
-/// Look up a hostname in the local host table.
+/// Look up a hostname in the local host table. Insertion and lookup share the
+/// one `fnv1a_lower` invariant, so a caller that has not already lowercased its
+/// name still matches.
 unsafe fn lookup_host(s: &DnsState, name_ptr: *const u8, name_len: usize) -> Option<u32> {
-    let hash = fnv1a(core::slice::from_raw_parts(name_ptr, name_len));
+    let hash = fnv1a_lower(name_ptr, name_len);
     let mut i = 0;
     while i < s.host_count as usize {
         let entry = &*s.hosts.as_ptr().add(i);
@@ -445,7 +541,11 @@ unsafe fn lookup_host(s: &DnsState, name_ptr: *const u8, name_len: usize) -> Opt
             let mut match_ok = true;
             let mut j = 0;
             while j < name_len {
-                if *entry.name.as_ptr().add(j) != *name_ptr.add(j) {
+                let mut b = *name_ptr.add(j);
+                if b.is_ascii_uppercase() {
+                    b += 32;
+                }
+                if *entry.name.as_ptr().add(j) != b {
                     match_ok = false;
                     break;
                 }
@@ -532,7 +632,7 @@ unsafe fn encode_name(name: *const u8, name_len: usize, dst: *mut u8) -> usize {
     while i <= name_len {
         if i == name_len || *name.add(i) == b'.' {
             let label_len = i - label_start;
-            if label_len == 0 || label_len > 63 {
+            if label_len == 0 || label_len > MAX_LABEL_LEN {
                 return 0;
             }
             *dst.add(pos) = label_len as u8;
@@ -554,44 +654,68 @@ unsafe fn encode_name(name: *const u8, name_len: usize, dst: *mut u8) -> usize {
     pos
 }
 
-/// Build a DNS A record response. Returns total packet length.
-unsafe fn build_a_response(
-    s: &DnsState,
+/// Start a locally generated response: copy the query header and its FIRST
+/// question, stamp the response flags, and set the record counts. Bytes after
+/// the first question (further questions, additional records) are deliberately
+/// not copied — a local answer is constructed, never echoed. Returns the write
+/// position (the end of the question section), or 0 if the reply cannot fit.
+unsafe fn begin_local_response(
     query_pkt: *const u8,
-    query_len: usize,
     question_end: usize,
-    ip: u32,
+    extra_flags: u16,
+    ancount: u16,
+    answer_reserve: usize,
     tx: *mut u8,
 ) -> usize {
-    if query_len < DNS_HEADER_LEN {
+    // Smallest legal question is the root label plus QTYPE/QCLASS.
+    if question_end < DNS_HEADER_LEN + 5 || question_end + answer_reserve > DNS_MAX_PACKET {
         return 0;
     }
 
-    // Copy query header
     let mut i = 0;
-    while i < query_len.min(DNS_MAX_PACKET) {
+    while i < question_end {
         *tx.add(i) = *query_pkt.add(i);
         i += 1;
     }
 
-    // Set flags: QR=1, AA=1, RA=1, preserve RD
+    // QR=1, AA=1, RA=1, preserving the client's RD bit and opcode.
     let flags = u16::from_be_bytes([*query_pkt.add(2), *query_pkt.add(3)]);
-    let new_flags = FLAG_QR | FLAG_AA | FLAG_RA | (flags & FLAG_RD);
+    let new_flags =
+        FLAG_QR | FLAG_AA | FLAG_RA | (flags & FLAG_RD) | (flags & FLAG_OPCODE_MASK) | extra_flags;
     let fb = new_flags.to_be_bytes();
     *tx.add(2) = fb[0];
     *tx.add(3) = fb[1];
 
-    // ANCOUNT = 1
-    *tx.add(6) = 0;
-    *tx.add(7) = 1;
+    // QDCOUNT = 1 (the one question copied above)
+    *tx.add(4) = 0;
+    *tx.add(5) = 1;
+    let ab = ancount.to_be_bytes();
+    *tx.add(6) = ab[0];
+    *tx.add(7) = ab[1];
     // NSCOUNT = 0, ARCOUNT = 0
     *tx.add(8) = 0;
     *tx.add(9) = 0;
     *tx.add(10) = 0;
     *tx.add(11) = 0;
 
-    // Answer section starts after question
-    let mut pos = question_end;
+    question_end
+}
+
+/// Bytes an A record occupies: name pointer, type, class, TTL, RDLENGTH, RDATA.
+const A_RECORD_LEN: usize = 16;
+
+/// Build a DNS A record response. Returns total packet length.
+unsafe fn build_a_response(
+    s: &DnsState,
+    query_pkt: *const u8,
+    question_end: usize,
+    ip: u32,
+    tx: *mut u8,
+) -> usize {
+    let mut pos = begin_local_response(query_pkt, question_end, 0, 1, A_RECORD_LEN, tx);
+    if pos == 0 {
+        return 0;
+    }
 
     // Name pointer to question QNAME (offset 12)
     *tx.add(pos) = 0xC0;
@@ -636,39 +760,19 @@ unsafe fn build_a_response(
 unsafe fn build_ptr_response(
     s: &DnsState,
     query_pkt: *const u8,
-    query_len: usize,
     question_end: usize,
     host_idx: usize,
     tx: *mut u8,
 ) -> usize {
-    if query_len < DNS_HEADER_LEN {
-        return 0;
-    }
     let entry = &*s.hosts.as_ptr().add(host_idx);
 
-    // Copy query up to end of question
-    let mut i = 0;
-    while i < query_len.min(DNS_MAX_PACKET) {
-        *tx.add(i) = *query_pkt.add(i);
-        i += 1;
+    // Fixed record fields plus the worst-case encoded name (one length byte per
+    // label plus the root terminator).
+    let reserve = 12 + entry.name_len as usize + 2;
+    let mut pos = begin_local_response(query_pkt, question_end, 0, 1, reserve, tx);
+    if pos == 0 {
+        return 0;
     }
-
-    // Set flags: QR=1, AA=1, RA=1, preserve RD
-    let flags = u16::from_be_bytes([*query_pkt.add(2), *query_pkt.add(3)]);
-    let new_flags = FLAG_QR | FLAG_AA | FLAG_RA | (flags & FLAG_RD);
-    let fb = new_flags.to_be_bytes();
-    *tx.add(2) = fb[0];
-    *tx.add(3) = fb[1];
-
-    // ANCOUNT = 1
-    *tx.add(6) = 0;
-    *tx.add(7) = 1;
-    *tx.add(8) = 0;
-    *tx.add(9) = 0;
-    *tx.add(10) = 0;
-    *tx.add(11) = 0;
-
-    let mut pos = question_end;
 
     // Name pointer
     *tx.add(pos) = 0xC0;
@@ -711,41 +815,22 @@ unsafe fn build_ptr_response(
 }
 
 /// Build an NXDOMAIN response. Returns total packet length.
-unsafe fn build_nxdomain(query_pkt: *const u8, query_len: usize, tx: *mut u8) -> usize {
-    if query_len < DNS_HEADER_LEN {
-        return 0;
-    }
+unsafe fn build_nxdomain(query_pkt: *const u8, question_end: usize, tx: *mut u8) -> usize {
+    begin_local_response(query_pkt, question_end, RCODE_NXDOMAIN, 0, 0, tx)
+}
 
-    // Copy entire query
-    let copy_len = query_len.min(DNS_MAX_PACKET);
-    let mut i = 0;
-    while i < copy_len {
-        *tx.add(i) = *query_pkt.add(i);
-        i += 1;
-    }
-
-    // Set flags: QR=1, AA=1, RA=1, RCODE=NXDOMAIN, preserve RD
-    let flags = u16::from_be_bytes([*query_pkt.add(2), *query_pkt.add(3)]);
-    let new_flags = FLAG_QR | FLAG_AA | FLAG_RA | (flags & FLAG_RD) | RCODE_NXDOMAIN;
-    let fb = new_flags.to_be_bytes();
-    *tx.add(2) = fb[0];
-    *tx.add(3) = fb[1];
-
-    // No answer records
-    *tx.add(6) = 0;
-    *tx.add(7) = 0;
-    *tx.add(8) = 0;
-    *tx.add(9) = 0;
-    *tx.add(10) = 0;
-    *tx.add(11) = 0;
-
-    copy_len
+/// Build a SERVFAIL response — the answer to a query the resolver accepted but
+/// cannot forward, so the client learns to retry instead of waiting out its own
+/// timeout.
+unsafe fn build_servfail(query_pkt: *const u8, question_end: usize, tx: *mut u8) -> usize {
+    begin_local_response(query_pkt, question_end, RCODE_SERVFAIL, 0, 0, tx)
 }
 
 /// Send `dns_data[..dns_len]` from `ep` to an IPv4 dst via the shared
 /// `datagram_endpoint` core, bumping the module's `bytes_out` counter on a
 /// successful (whole-datagram) write. Uses the raw state pointer so `net_buf`
 /// (the framing scratch) is reachable independently of any live borrow.
+/// Returns true when the whole datagram was accepted; false is backpressure.
 unsafe fn dg_send_from(
     state: *mut DnsState,
     ep: &DatagramEndpoint,
@@ -753,7 +838,7 @@ unsafe fn dg_send_from(
     dst_port: u16,
     dns_data: *const u8,
     dns_len: usize,
-) {
+) -> bool {
     let sys = &*(*state).syscalls;
     let net_out = (*state).net_out_chan;
     let buf = (*state).net_buf.as_mut_ptr();
@@ -770,6 +855,7 @@ unsafe fn dg_send_from(
     if n > 0 {
         (*state).tlm.bytes_out = (*state).tlm.bytes_out.wrapping_add(dns_len as u32);
     }
+    n > 0
 }
 
 /// Module-scope telemetry: emit cumulative `bytes_in` / `bytes_out` counters to
@@ -777,7 +863,8 @@ unsafe fn dg_send_from(
 /// at a ~5s wallclock cadence. Metric ids follow `[observability].metrics`
 /// order: 0 = bytes_in, 1 = bytes_out. Counter semantics are monotonic, so the
 /// deltas are NOT reset here. Bytes counted are DNS payload (excluding the
-/// datagram framing) on both directions.
+/// datagram framing) on both directions. Metric ids 2/3 carry the correlation
+/// refusal counters (`upstream_drops`, `forward_refusals`).
 #[inline(never)]
 unsafe fn maybe_emit_telemetry(s: &mut DnsState) {
     let sys = &*s.syscalls;
@@ -799,6 +886,8 @@ unsafe fn maybe_emit_telemetry(s: &mut DnsState) {
     let counter = abi::contracts::telemetry::METRIC_COUNTER;
     dev_telemetry_metric(sys, -1, midx, t, counter, 0, s.tlm.bytes_in as u64);
     dev_telemetry_metric(sys, -1, midx, t, counter, 1, s.tlm.bytes_out as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 2, s.upstream_drops as u64);
+    dev_telemetry_metric(sys, -1, midx, t, counter, 3, s.forward_refusals as u64);
 }
 
 /// Head-sampling decision for a new `dns.query` root, drawn deterministically
@@ -899,7 +988,7 @@ unsafe fn send_server_reply(
     dst_port: u16,
     dns_data: *const u8,
     dns_len: usize,
-) {
+) -> bool {
     dg_send_from(
         state,
         &(*state).server_ep,
@@ -907,12 +996,12 @@ unsafe fn send_server_reply(
         dst_port,
         dns_data,
         dns_len,
-    );
+    )
 }
 
 /// Send a DNS query from the upstream endpoint to the configured upstream
 /// DNS server.
-unsafe fn send_upstream_query(state: *mut DnsState, dns_data: *const u8, dns_len: usize) {
+unsafe fn send_upstream_query(state: *mut DnsState, dns_data: *const u8, dns_len: usize) -> bool {
     let upstream_ip = (*state).upstream_ip;
     let upstream_port = (*state).upstream_port;
     dg_send_from(
@@ -922,69 +1011,164 @@ unsafe fn send_upstream_query(state: *mut DnsState, dns_data: *const u8, dns_len
         upstream_port,
         dns_data,
         dns_len,
-    );
+    )
 }
 
-/// Store a pending upstream query.
-unsafe fn store_pending(s: &mut DnsState, dns_id: u16, client_ip: u32, client_port: u16) -> bool {
-    let now = dev_millis(s.sys()) as u32;
-    let p = s.pending.as_mut_ptr();
-
-    // Find free slot (or oldest expired)
-    let mut best = 0usize;
-    let mut best_time = u32::MAX;
-
+/// Index of a slot that is free or whose deadline has passed. A LIVE slot is
+/// never recycled: accepted work is only ever displaced by its own timeout.
+unsafe fn free_pending_slot(s: &DnsState, now_ms: u32) -> Option<usize> {
+    let p = s.pending.as_ptr();
     let mut i = 0;
     while i < MAX_PENDING {
-        if (*p.add(i)).active == 0 {
-            best = i;
-            break;
-        }
-        if (*p.add(i)).timestamp < best_time {
-            best_time = (*p.add(i)).timestamp;
-            best = i;
-        }
-        i += 1;
-    }
-
-    (*p.add(best)).dns_id = dns_id;
-    (*p.add(best)).client_ip = client_ip;
-    (*p.add(best)).client_port = client_port;
-    (*p.add(best)).timestamp = now;
-    (*p.add(best)).active = 1;
-    true
-}
-
-/// Find and remove a pending query by DNS transaction ID.
-unsafe fn take_pending(s: &mut DnsState, dns_id: u16) -> Option<(u32, u16)> {
-    let p = s.pending.as_mut_ptr();
-    let mut i = 0;
-    while i < MAX_PENDING {
-        if (*p.add(i)).active != 0 && (*p.add(i)).dns_id == dns_id {
-            let ip = (*p.add(i)).client_ip;
-            let port = (*p.add(i)).client_port;
-            (*p.add(i)).active = 0;
-            return Some((ip, port));
+        let slot = &*p.add(i);
+        if slot.active == 0 || deadline_passed(now_ms, slot.deadline_ms) {
+            return Some(i);
         }
         i += 1;
     }
     None
 }
 
-/// Expire old pending queries.
+/// True if any live slot already holds `id` as its upstream transaction id.
+unsafe fn upstream_id_in_use(s: &DnsState, now_ms: u32, id: u16) -> bool {
+    let p = s.pending.as_ptr();
+    let mut i = 0;
+    while i < MAX_PENDING {
+        let slot = &*p.add(i);
+        if slot.active != 0 && !deadline_passed(now_ms, slot.deadline_ms) && slot.upstream_id == id
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Draw an unpredictable upstream transaction id that no live slot is using.
+/// Returns `None` when the CSPRNG is unavailable (the caller then refuses the
+/// query rather than forwarding a guessable id) or when every draw collided.
+unsafe fn alloc_upstream_id(s: &DnsState, now_ms: u32) -> Option<u16> {
+    let sys = s.sys();
+    let mut draw = 0usize;
+    while draw < UPSTREAM_ID_DRAWS {
+        let mut raw = [0u8; 2];
+        // Platform CSPRNGs report success as either 0 or the byte count; any
+        // negative value is a failure and must not be treated as entropy.
+        if dev_csprng_fill(sys, raw.as_mut_ptr(), 2) < 0 {
+            return None;
+        }
+        let id = u16::from_le_bytes(raw);
+        if !upstream_id_in_use(s, now_ms, id) {
+            return Some(id);
+        }
+        draw += 1;
+    }
+    None
+}
+
+/// Record a forwarded query in `slot`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pending record is the correlation tuple; grouping it into a struct would move the argument list, not shorten it"
+)]
+unsafe fn store_pending(
+    s: &mut DnsState,
+    slot: usize,
+    upstream_id: u16,
+    client_id: u16,
+    client_ip: u32,
+    client_port: u16,
+    q: &Question,
+    opcode: u8,
+    now_ms: u32,
+) {
+    let e = &mut *s.pending.as_mut_ptr().add(slot);
+    e.upstream_id = upstream_id;
+    e.client_id = client_id;
+    e.client_ip = client_ip;
+    e.client_port = client_port;
+    e.qname_hash = q.qname_hash;
+    e.qtype = q.qtype;
+    e.qclass = q.qclass;
+    e.upstream_ip = s.upstream_ip;
+    e.upstream_port = s.upstream_port;
+    e.opcode = opcode;
+    e.deadline_ms = now_ms.wrapping_add(PENDING_TIMEOUT_MS);
+    e.active = 1;
+}
+
+/// Consume the live pending slot an upstream answer correlates to. Every field
+/// the answer must reproduce is checked here, and the slot is cleared before
+/// returning, so a duplicate or late copy finds nothing and cannot re-fire.
+unsafe fn take_pending(
+    s: &mut DnsState,
+    now_ms: u32,
+    upstream_id: u16,
+    src_ip: u32,
+    src_port: u16,
+    opcode: u8,
+    q: &Question,
+) -> Option<(u16, u32, u16)> {
+    let p = s.pending.as_mut_ptr();
+    let mut i = 0;
+    while i < MAX_PENDING {
+        let slot = &mut *p.add(i);
+        if slot.active != 0
+            && !deadline_passed(now_ms, slot.deadline_ms)
+            && slot.upstream_id == upstream_id
+            && slot.upstream_ip == src_ip
+            && slot.upstream_port == src_port
+            && slot.opcode == opcode
+            && slot.qname_hash == q.qname_hash
+            && slot.qtype == q.qtype
+            && slot.qclass == q.qclass
+        {
+            slot.active = 0;
+            return Some((slot.client_id, slot.client_ip, slot.client_port));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Release pending slots whose deadline has passed.
 unsafe fn expire_pending(s: &mut DnsState) {
     let now = dev_millis(s.sys()) as u32;
     let p = s.pending.as_mut_ptr();
     let mut i = 0;
     while i < MAX_PENDING {
-        if (*p.add(i)).active != 0 {
-            let elapsed = now.wrapping_sub((*p.add(i)).timestamp);
-            if elapsed > PENDING_TIMEOUT_MS {
-                (*p.add(i)).active = 0;
-            }
+        let slot = &mut *p.add(i);
+        if slot.active != 0 && deadline_passed(now, slot.deadline_ms) {
+            slot.active = 0;
         }
         i += 1;
     }
+}
+
+/// Parse the single question section of `pkt`, writing the dotted lowercase
+/// QNAME into `name_buf` (at least `MAX_NAME_LEN + 1` bytes). Returns the
+/// question and the QNAME length.
+unsafe fn parse_question(
+    pkt: *const u8,
+    pkt_len: usize,
+    name_buf: *mut u8,
+) -> Option<(Question, usize)> {
+    let mut offset = DNS_HEADER_LEN;
+    let name_len = extract_qname(pkt, pkt_len, &mut offset, name_buf);
+    if name_len == 0 || offset + 4 > pkt_len {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([*pkt.add(offset), *pkt.add(offset + 1)]);
+    let qclass = u16::from_be_bytes([*pkt.add(offset + 2), *pkt.add(offset + 3)]);
+    Some((
+        Question {
+            qname_hash: fnv1a_lower(name_buf, name_len),
+            qtype,
+            qclass,
+            end: offset + 4,
+        },
+        name_len,
+    ))
 }
 
 /// Process a DNS query received on the server socket.
@@ -1005,33 +1189,30 @@ unsafe fn handle_query(
     let qdcount = u16::from_be_bytes([*pkt.add(4), *pkt.add(5)]);
 
     // Only process standard queries (QR=0, Opcode=0)
-    if (flags & 0xF800) != 0 {
+    if (flags & FLAG_QR) != 0
+        || ((flags & FLAG_OPCODE_MASK) >> FLAG_OPCODE_SHIFT) as u8 != OPCODE_QUERY
+    {
         return;
     }
-    if qdcount == 0 {
+    // The supported profile is exactly one question per query: local answers
+    // are constructed from that question, and an upstream answer is correlated
+    // against it.
+    if qdcount != 1 {
         return;
     }
 
-    // Extract QNAME from first question
-    let mut offset = DNS_HEADER_LEN;
     let mut name_buf = [0u8; MAX_NAME_LEN + 1];
-    let name_len = extract_qname(pkt, pkt_len, &mut offset, name_buf.as_mut_ptr());
-    if name_len == 0 {
-        return;
-    }
-
-    // Parse QTYPE and QCLASS
-    if offset + 4 > pkt_len {
-        return;
-    }
-    let qtype = u16::from_be_bytes([*pkt.add(offset), *pkt.add(offset + 1)]);
-    let qclass = u16::from_be_bytes([*pkt.add(offset + 2), *pkt.add(offset + 3)]);
-    let question_end = offset + 4;
+    let (question, name_len) = match parse_question(pkt, pkt_len, name_buf.as_mut_ptr()) {
+        Some(v) => v,
+        None => return,
+    };
+    let qtype = question.qtype;
+    let question_end = question.end;
 
     // Only handle IN class
-    if qclass != QCLASS_IN {
+    if question.qclass != QCLASS_IN {
         // Forward unknown classes
-        forward_to_upstream(s, id, client_ip, client_port, pkt, pkt_len);
+        forward_to_upstream(s, id, client_ip, client_port, &question, pkt, pkt_len);
         return;
     }
 
@@ -1049,7 +1230,7 @@ unsafe fn handle_query(
             match lookup_host(s, name_buf.as_ptr(), name_len) {
                 Some(ip) => {
                     // Build and send local A response
-                    let resp_len = build_a_response(s, pkt, pkt_len, question_end, ip, tx_ptr);
+                    let resp_len = build_a_response(s, pkt, question_end, ip, tx_ptr);
                     if resp_len > 0 {
                         send_server_reply(
                             s as *mut DnsState,
@@ -1066,7 +1247,7 @@ unsafe fn handle_query(
                 }
                 None => {
                     // Forward to upstream
-                    forward_to_upstream(s, id, client_ip, client_port, pkt, pkt_len);
+                    forward_to_upstream(s, id, client_ip, client_port, &question, pkt, pkt_len);
                 }
             }
         }
@@ -1075,7 +1256,7 @@ unsafe fn handle_query(
             // instead of forwarding to upstream
             if lookup_host(s, name_buf.as_ptr(), name_len).is_some() {
                 // Send empty response (no answer, no error) — host exists but no IPv6
-                let resp_len = build_empty_response(pkt, pkt_len, tx_ptr);
+                let resp_len = build_empty_response(pkt, question_end, tx_ptr);
                 if resp_len > 0 {
                     send_server_reply(
                         s as *mut DnsState,
@@ -1089,15 +1270,14 @@ unsafe fn handle_query(
                     }
                 }
             } else {
-                forward_to_upstream(s, id, client_ip, client_port, pkt, pkt_len);
+                forward_to_upstream(s, id, client_ip, client_port, &question, pkt, pkt_len);
             }
         }
         QTYPE_PTR => {
             // Reverse lookup
             match lookup_ptr(s, name_buf.as_ptr(), name_len) {
                 Some((_ip, host_idx)) => {
-                    let resp_len =
-                        build_ptr_response(s, pkt, pkt_len, question_end, host_idx, tx_ptr);
+                    let resp_len = build_ptr_response(s, pkt, question_end, host_idx, tx_ptr);
                     if resp_len > 0 {
                         send_server_reply(
                             s as *mut DnsState,
@@ -1113,82 +1293,194 @@ unsafe fn handle_query(
                     }
                 }
                 None => {
-                    forward_to_upstream(s, id, client_ip, client_port, pkt, pkt_len);
+                    forward_to_upstream(s, id, client_ip, client_port, &question, pkt, pkt_len);
                 }
             }
         }
         _ => {
             // Forward all other types to upstream
-            forward_to_upstream(s, id, client_ip, client_port, pkt, pkt_len);
+            forward_to_upstream(s, id, client_ip, client_port, &question, pkt, pkt_len);
         }
     }
 }
 
 /// Build an empty response (NOERROR, 0 answers) for local hosts with no matching record type.
-unsafe fn build_empty_response(query_pkt: *const u8, query_len: usize, tx: *mut u8) -> usize {
-    if query_len < DNS_HEADER_LEN {
-        return 0;
-    }
-
-    let copy_len = query_len.min(DNS_MAX_PACKET);
-    let mut i = 0;
-    while i < copy_len {
-        *tx.add(i) = *query_pkt.add(i);
-        i += 1;
-    }
-
-    // Set flags: QR=1, AA=1, RA=1, RCODE=0 (NOERROR), preserve RD
-    let flags = u16::from_be_bytes([*query_pkt.add(2), *query_pkt.add(3)]);
-    let new_flags = FLAG_QR | FLAG_AA | FLAG_RA | (flags & FLAG_RD);
-    let fb = new_flags.to_be_bytes();
-    *tx.add(2) = fb[0];
-    *tx.add(3) = fb[1];
-
-    // No answers
-    *tx.add(6) = 0;
-    *tx.add(7) = 0;
-    *tx.add(8) = 0;
-    *tx.add(9) = 0;
-    *tx.add(10) = 0;
-    *tx.add(11) = 0;
-
-    copy_len
+unsafe fn build_empty_response(query_pkt: *const u8, question_end: usize, tx: *mut u8) -> usize {
+    begin_local_response(query_pkt, question_end, 0, 0, 0, tx)
 }
 
-/// Forward a query to the upstream DNS server.
-unsafe fn forward_to_upstream(
+/// Answer a query the resolver accepted but cannot forward with SERVFAIL, so
+/// the client can retry immediately instead of waiting out its own timeout.
+unsafe fn refuse_with_servfail(
     s: &mut DnsState,
-    dns_id: u16,
     client_ip: u32,
     client_port: u16,
     pkt: *const u8,
+    question_end: usize,
+) {
+    s.forward_refusals = s.forward_refusals.wrapping_add(1);
+    let tx_ptr = s.tx_buf.as_mut_ptr();
+    let len = build_servfail(pkt, question_end, tx_ptr);
+    if len > 0 {
+        send_server_reply(
+            s as *mut DnsState,
+            client_ip,
+            client_port,
+            tx_ptr as *const u8,
+            len,
+        );
+    }
+}
+
+/// Forward a query to the upstream DNS server under a fresh, unpredictable
+/// transaction id. The client's own id never reaches the wire: it is retained
+/// in the pending slot and restored when the matching answer is relayed back.
+///
+/// A pending slot is taken before the send, and only free or expired slots are
+/// taken — accepted work is never displaced. With no slot, no id, or no bound
+/// upstream endpoint the query is refused with SERVFAIL.
+unsafe fn forward_to_upstream(
+    s: &mut DnsState,
+    client_id: u16,
+    client_ip: u32,
+    client_port: u16,
+    question: &Question,
+    pkt: *const u8,
     pkt_len: usize,
 ) {
-    if !s.upstream_ep.is_ready() {
+    if !s.upstream_ep.is_ready() || pkt_len > DNS_MAX_PACKET {
+        refuse_with_servfail(s, client_ip, client_port, pkt, question.end);
         return;
     }
 
-    // Store pending entry
-    store_pending(s, dns_id, client_ip, client_port);
+    let now = dev_millis(s.sys()) as u32;
+    let slot = match free_pending_slot(s, now) {
+        Some(i) => i,
+        None => {
+            refuse_with_servfail(s, client_ip, client_port, pkt, question.end);
+            return;
+        }
+    };
+    let upstream_id = match alloc_upstream_id(s, now) {
+        Some(id) => id,
+        None => {
+            refuse_with_servfail(s, client_ip, client_port, pkt, question.end);
+            return;
+        }
+    };
 
-    // Send query to upstream via CMD_DG_SEND_TO on the upstream endpoint.
-    send_upstream_query(s as *mut DnsState, pkt, pkt_len);
+    // Copy the query into the work buffer and stamp the upstream id over the
+    // client's. The rest of the query — including any EDNS additional records —
+    // is forwarded unchanged.
+    let tx_ptr = s.tx_buf.as_mut_ptr();
+    let mut i = 0;
+    while i < pkt_len {
+        *tx_ptr.add(i) = *pkt.add(i);
+        i += 1;
+    }
+    let idb = upstream_id.to_be_bytes();
+    *tx_ptr = idb[0];
+    *tx_ptr.add(1) = idb[1];
+
+    let opcode = ((u16::from_be_bytes([*pkt.add(2), *pkt.add(3)]) & FLAG_OPCODE_MASK)
+        >> FLAG_OPCODE_SHIFT) as u8;
+    store_pending(
+        s,
+        slot,
+        upstream_id,
+        client_id,
+        client_ip,
+        client_port,
+        question,
+        opcode,
+        now,
+    );
+
+    // Send query to upstream via CMD_DG_SEND_TO on the upstream endpoint. A
+    // rejected write means the query was never forwarded, so the slot is
+    // released again and the client is refused rather than left to time out.
+    if !send_upstream_query(s as *mut DnsState, tx_ptr as *const u8, pkt_len) {
+        (*s.pending.as_mut_ptr().add(slot)).active = 0;
+        refuse_with_servfail(s, client_ip, client_port, pkt, question.end);
+        return;
+    }
     s.queries_forwarded += 1;
 }
 
-/// Process a response from the upstream DNS server.
-unsafe fn handle_upstream_response(s: &mut DnsState, pkt: *const u8, pkt_len: usize) {
-    if pkt_len < DNS_HEADER_LEN {
+/// Process a datagram received on the upstream endpoint.
+///
+/// It is relayed to a client only if it is a response (QR set) from the exact
+/// configured upstream endpoint, carries the expected opcode and exactly the
+/// question that was forwarded, and matches a live upstream transaction id.
+/// Everything else — including a query arriving on the response port, a spoofed
+/// source, and a duplicate arriving after the first answer was consumed — is
+/// dropped and metered.
+unsafe fn handle_upstream_response(
+    s: &mut DnsState,
+    src_ip: u32,
+    src_port: u16,
+    pkt: *const u8,
+    pkt_len: usize,
+) {
+    if !(DNS_HEADER_LEN..=DNS_MAX_PACKET).contains(&pkt_len) {
+        s.upstream_drops = s.upstream_drops.wrapping_add(1);
         return;
     }
 
     let id = u16::from_be_bytes([*pkt, *pkt.add(1)]);
+    let flags = u16::from_be_bytes([*pkt.add(2), *pkt.add(3)]);
+    let qdcount = u16::from_be_bytes([*pkt.add(4), *pkt.add(5)]);
+    let opcode = ((flags & FLAG_OPCODE_MASK) >> FLAG_OPCODE_SHIFT) as u8;
 
-    // Find the pending query for this transaction ID
-    if let Some((client_ip, client_port)) = take_pending(s, id) {
-        // Relay response back to original client via server conn
-        send_server_reply(s as *mut DnsState, client_ip, client_port, pkt, pkt_len);
+    if (flags & FLAG_QR) == 0 || qdcount != 1 {
+        s.upstream_drops = s.upstream_drops.wrapping_add(1);
+        return;
     }
+
+    let mut name_buf = [0u8; MAX_NAME_LEN + 1];
+    let question = match parse_question(pkt, pkt_len, name_buf.as_mut_ptr()) {
+        Some((q, _)) => q,
+        None => {
+            s.upstream_drops = s.upstream_drops.wrapping_add(1);
+            return;
+        }
+    };
+
+    let (client_id, client_ip, client_port) = match take_pending(
+        s,
+        dev_millis(s.sys()) as u32,
+        id,
+        src_ip,
+        src_port,
+        opcode,
+        &question,
+    ) {
+        Some(v) => v,
+        None => {
+            s.upstream_drops = s.upstream_drops.wrapping_add(1);
+            return;
+        }
+    };
+
+    // Restore the client's own transaction id, then relay to the endpoint the
+    // query was accepted from.
+    let tx_ptr = s.tx_buf.as_mut_ptr();
+    let mut i = 0;
+    while i < pkt_len {
+        *tx_ptr.add(i) = *pkt.add(i);
+        i += 1;
+    }
+    let idb = client_id.to_be_bytes();
+    *tx_ptr = idb[0];
+    *tx_ptr.add(1) = idb[1];
+
+    send_server_reply(
+        s as *mut DnsState,
+        client_ip,
+        client_port,
+        tx_ptr as *const u8,
+        pkt_len,
+    );
 }
 
 // ============================================================================
@@ -1324,7 +1616,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         if s.server_ep.owns(ep_id) {
                             handle_query(s, src_ip, src_port, data, len);
                         } else if s.upstream_ep.owns(ep_id) {
-                            handle_upstream_response(s, data, len);
+                            handle_upstream_response(s, src_ip, src_port, data, len);
                         }
                         did_work = true;
                     }

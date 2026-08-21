@@ -1,15 +1,15 @@
 # nvme — NVMe block driver (Pi 5, PCIe1 external slot)
 
-Polled, single-queue NVMe driver for the Pi 5 NVMe HAT+. Implements
-NVMe 1.4 controller initialization, Identify Controller / Namespace,
-and 512-byte block read/write on one admin queue + one I/O queue.
+NVMe driver for the Pi 5 NVMe HAT+. Implements NVMe 1.4 controller
+initialisation, Identify Controller / Namespace, and 512-byte block
+read/write on one admin queue plus up to `MAX_IO_QUEUES` (4) I/O
+queue pairs (`io_queue_count` parameter, default 1). With
+`irq_mode = 1` completions are delivered via MSI-X through the
+brcmstb MSI mux; otherwise the CQ is drained by polling in
+`step_ready`.
 
-This is v1 per `.context/future/rfc_nvme_driver.md` — not optimised,
-not interrupt-driven, not multi-queue. The point is correctness.
-
-See also: `docs/guides/driver-bringup.md` for the general methodology
-this module was built against, and `nvme_trace/` for the userspace
-trace that defines the expected controller init sequence.
+See also: `nvme_trace/` for the userspace trace that defines the
+expected controller init sequence.
 
 ---
 
@@ -289,5 +289,3 @@ does one unit of work. That means:
   data.
 - Queue depth > 1 (v2) means tracking one in-flight record per CID;
   doable but out of scope for v1.
-
-See `docs/guides/driver-bringup.md` for the full model.

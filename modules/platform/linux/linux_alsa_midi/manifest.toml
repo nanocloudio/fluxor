@@ -27,17 +27,20 @@ required = false
 
 [[params]]
 name = "mode"
+tag = 10
 type = "enum"
 values = ["in", "out", "duplex"]
 default = "in"
 
 [[params]]
 name = "port_filter"
+tag = 11
 type = "str"
 default = ""
 
 [[params]]
 name = "client_name"
+tag = 12
 type = "str"
 default = "fluxor"
 

@@ -13,9 +13,8 @@
 //   paths: newline-separated list of filesystem paths (required).
 //          Index in the list is the source_index a HANDLER_FILE route
 //          declares to select that asset.
-//
-// Tag layout (declaration order, starting at 10):
-//   10: paths (str)
+// Its TLV tag is declared there too, and generated into
+// `builtin_param_tags`.
 
 // `File`, `Read`, and `CHUNK_SIZE` are pulled in via the sibling
 // `host_asset_source.rs` `include!()` in `linux.rs`; both files share
@@ -23,7 +22,7 @@
 
 const HOST_ASSET_INDEX_HASH: u32 = 0xFB4428B3; // fnv1a32("host_asset_index")
 
-const ASSET_INDEX_TAG_PATHS: u8 = 10;
+use fluxor::platform::builtin_param_tags::host_asset_index::TAG_PATHS as ASSET_INDEX_TAG_PATHS;
 
 struct HostAssetIndexState {
     out_chan: i32,

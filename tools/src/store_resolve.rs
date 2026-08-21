@@ -363,6 +363,36 @@ pub(crate) fn read_pinned_blob(store: &OciStore, name: &str, digest: &str) -> Re
     })
 }
 
+/// Read a layer blob a present manifest references. This is NOT
+/// "artifact no longer in store" — the manifest is right there; a blob
+/// it references is gone or damaged underneath it, which is a store
+/// integrity fault. `read_blob`'s own message distinguishes absent from
+/// unreadable from failed-integrity, so it is carried through verbatim
+/// rather than collapsed.
+///
+/// Re-publishing alone does not repair the pin: a runtime layer is
+/// `sha256(binary)` with no reproducible-build normalisation, so a
+/// republish mints a NEW manifest while this pinned one stays broken.
+/// The remedies that actually terminate are a republish FOLLOWED BY
+/// `fluxor update` (which rewrites the pins), or a re-pull for a store
+/// populated from a registry — which is also the only remedy a remote
+/// consumer, with no producing repo, can reach.
+pub(crate) fn read_manifest_layer_blob(
+    store: &OciStore,
+    name: &str,
+    manifest_digest: &str,
+    layer_digest: &str,
+) -> Result<Vec<u8>> {
+    store.read_blob(layer_digest).map_err(|e| {
+        Error::Config(format!(
+            "artifact '{name}': manifest {manifest_digest} is present but the layer it \
+             references cannot be read ({e}) — the store is inconsistent. Re-publish the \
+             artifact in its producing repo and then run `fluxor update` to repin, or \
+             re-run `fluxor store pull` if this store was populated from a registry"
+        ))
+    })
+}
+
 /// Read a pinned artifact's manifest by its lockfile digest — the
 /// lockfile-side counterpart to `OciStore::read_manifest`, which takes
 /// an index descriptor.

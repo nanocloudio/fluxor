@@ -19,8 +19,8 @@ use crate::oci_store::{
     OciStore, ANN_INPUT_DIGEST, ANN_REF_NAME, MT_FLUXOR_RUNTIME, MT_FLUXOR_SOURCE,
 };
 use crate::store_resolve::{
-    read_pinned_blob, read_pinned_manifest, read_store_lock, resolve_dependency, sort_entries,
-    write_store_lock, Artifact,
+    read_manifest_layer_blob, read_pinned_manifest, read_store_lock, resolve_dependency,
+    sort_entries, write_store_lock, Artifact,
 };
 
 /// Stamp file inside an extracted source tree: contains the artifact
@@ -265,7 +265,7 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
                 .iter()
                 .find(|l| l.media_type == crate::oci_store::MT_FLUXOR_MODULE)
                 .ok_or_else(|| missing_layer_err(e))?;
-            let bytes = read_pinned_blob(store, &e.name, &layer.digest)?;
+            let bytes = read_manifest_layer_blob(store, &e.name, &e.digest, &layer.digest)?;
             let target = e
                 .target
                 .as_deref()
@@ -292,7 +292,7 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
             if fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == e.digest) {
                 return Ok(format!("source {} up to date ({})", e.name, dest.display()));
             }
-            let tar = read_pinned_blob(store, &e.name, &layer.digest)?;
+            let tar = read_manifest_layer_blob(store, &e.name, &e.digest, &layer.digest)?;
             extract_tree_atomic(&tar, &dest, &e.digest)?;
             Ok(format!("source {} → {}", e.name, dest.display()))
         }
@@ -303,7 +303,7 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
                 .iter()
                 .find(|l| l.media_type == MT_FLUXOR_RUNTIME)
                 .ok_or_else(|| missing_layer_err(e))?;
-            let bytes = read_pinned_blob(store, &e.name, &layer.digest)?;
+            let bytes = read_manifest_layer_blob(store, &e.name, &e.digest, &layer.digest)?;
             let triple = e.target.as_deref().ok_or_else(|| {
                 Error::Config(format!("runtime '{}' pin has no host triple", e.name))
             })?;
@@ -745,32 +745,7 @@ mod tests {
         crate::oci_store::test_env_lock()
     }
 
-    struct EnvScope {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-    impl EnvScope {
-        fn set(pairs: &[(&'static str, &Path)]) -> EnvScope {
-            let saved = pairs
-                .iter()
-                .map(|(k, v)| {
-                    let old = std::env::var_os(k);
-                    std::env::set_var(k, v);
-                    (*k, old)
-                })
-                .collect();
-            EnvScope { saved }
-        }
-    }
-    impl Drop for EnvScope {
-        fn drop(&mut self) {
-            for (k, old) in self.saved.drain(..) {
-                match old {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+    use crate::oci_store::EnvScope;
 
     fn fake_project(root: &Path, name: &str, deps: &[&str]) {
         std::fs::create_dir_all(root).unwrap();
@@ -849,6 +824,63 @@ mod tests {
         // ensure_synced replays without re-resolving and stays green.
         let replayed = ensure_synced(&consumer).unwrap();
         assert_eq!(replayed.len(), 1);
+    }
+
+    /// A producer republish (retag) must never break a workspace
+    /// member's existing pin: the member's lockfile pins a manifest
+    /// digest, so the retag sweep must keep that manifest's whole
+    /// closure — layer blobs included — and the member's next sync
+    /// must still materialise.
+    #[test]
+    fn producer_republish_keeps_member_pin_consumable() {
+        let _env = env_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let producer = scratch.path().join("producer");
+        fake_project(&producer, "producer", &[]);
+        std::fs::create_dir_all(producer.join("modules/common")).unwrap();
+        std::fs::write(producer.join("modules/common/core.rs"), "pub fn a() {}\n").unwrap();
+        let consumer = scratch.path().join("consumer");
+        fake_project(&consumer, "consumer", &["producer"]);
+        // The consumer is a workspace member, so its lockfile pins are
+        // sweep roots.
+        let ws_file = scratch.path().join("workspace.toml");
+        std::fs::write(
+            &ws_file,
+            format!(
+                "[workspace]\nmembers = [\"{}\"]\n",
+                consumer.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+
+        let _scope = EnvScope::set(&[
+            ("FLUXOR_STORE", &scratch.path().join("store")),
+            ("FLUXOR_WORKSPACE", &ws_file),
+        ]);
+        crate::store_publish::publish_project_to_store(&producer, &["source"], false).unwrap();
+        let report = sync_project(&consumer, false).unwrap();
+        let pinned = report.entries[0].digest.clone();
+
+        // Producer republishes changed content: the old manifest is
+        // displaced from the index and swept.
+        std::fs::write(producer.join("modules/common/core.rs"), "pub fn b() {}\n").unwrap();
+        crate::store_publish::publish_project_to_store(&producer, &["source"], false).unwrap();
+
+        // The pinned manifest AND every blob it references survive.
+        let store = OciStore::open(scratch.path().join("store")).unwrap();
+        let manifest =
+            read_pinned_manifest(&store, &report.entries[0]).expect("pinned manifest readable");
+        for l in &manifest.layers {
+            assert!(
+                store.has_blob(&l.digest),
+                "layer {} of pinned manifest {pinned} swept — dangling manifest",
+                l.digest
+            );
+        }
+        // A cleaned checkout re-materialises from the pinned blobs, so
+        // this replay actually reads the layer.
+        std::fs::remove_dir_all(consumer.join("target")).unwrap();
+        ensure_synced(&consumer).expect("member pin still materialises after producer republish");
     }
 
     /// (2) A mixed-epoch set is the exact hard error naming
@@ -932,12 +964,69 @@ mod tests {
 
         let err = sync_project(&consumer, false).unwrap_err().to_string();
         assert!(
-            err.contains("no longer in store — run `fluxor update`"),
+            err.contains(&format!(
+                "manifest {} is present but the layer it references cannot be read",
+                desc.digest
+            )),
+            "{err}"
+        );
+        // The underlying `read_blob` cause survives, naming the layer
+        // and distinguishing absence from corruption.
+        assert!(
+            err.contains(&format!("blob {} not in store", manifest.layers[0].digest)),
+            "{err}"
+        );
+        // The remedy must be one that terminates: republish alone mints
+        // a new manifest and leaves this pin broken.
+        assert!(
+            err.contains("run `fluxor update` to repin")
+                && err.contains("re-run `fluxor store pull`"),
             "{err}"
         );
         assert!(
             !lockfile_path_exists(&consumer),
             "failed materialisation must not commit a pin"
+        );
+    }
+
+    /// The other half of the pair: the manifest itself is gone, not a
+    /// layer under it. That IS "no longer in store", and `fluxor update`
+    /// alone repairs it (the tag now names a different manifest), so the
+    /// two messages must stay distinct.
+    #[test]
+    fn missing_pinned_manifest_names_fluxor_update() {
+        let _env = env_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let producer = scratch.path().join("producer");
+        fake_project(&producer, "producer", &[]);
+        std::fs::create_dir_all(producer.join("modules/common")).unwrap();
+        std::fs::write(producer.join("modules/common/core.rs"), "pub fn w() {}\n").unwrap();
+        let consumer = scratch.path().join("consumer");
+        fake_project(&consumer, "consumer", &["producer"]);
+
+        let _scope = EnvScope::set(&[
+            ("FLUXOR_STORE", &scratch.path().join("store")),
+            (
+                "FLUXOR_WORKSPACE",
+                &scratch.path().join("no-workspace.toml"),
+            ),
+        ]);
+        crate::store_publish::publish_project_to_store(&producer, &["source"], false).unwrap();
+        let report = sync_project(&consumer, false).unwrap();
+        let pinned = report.entries[0].digest.clone();
+
+        // Delete the pinned manifest blob and force a re-materialisation
+        // from the existing lockfile.
+        let store = OciStore::open(scratch.path().join("store")).unwrap();
+        std::fs::remove_file(store.blob_path(&pinned).unwrap()).unwrap();
+        std::fs::remove_dir_all(consumer.join("target")).unwrap();
+
+        let err = ensure_synced(&consumer).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!(
+                "({pinned}) no longer in store — run `fluxor update`"
+            )),
+            "{err}"
         );
     }
 

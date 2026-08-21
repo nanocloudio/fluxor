@@ -13,29 +13,34 @@ required = true
 
 [[params]]
 name = "mode"
+tag = 10
 type = "enum"
 values = ["file", "null", "window"]
 default = "file"
 
 [[params]]
 name = "path"
+tag = 11
 type = "str"
 default = "./target/host-display/frame_%04d.ppm"
 
 [[params]]
 name = "width"
+tag = 12
 type = "u32"
 default = 480
 range = [1, 4096]
 
 [[params]]
 name = "height"
+tag = 13
 type = "u32"
 default = 480
 range = [1, 4096]
 
 [[params]]
 name = "scale"
+tag = 14
 type = "u32"
 default = 1
 range = [1, 16]
@@ -46,6 +51,7 @@ range = [1, 16]
 # agreeing on a static config. See sector modules/common/sector_raster.rs.
 [[params]]
 name = "header"
+tag = 15
 type = "u32"
 default = 0
 range = [0, 1]

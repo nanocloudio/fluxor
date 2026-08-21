@@ -20,6 +20,12 @@ const HT_CERTIFICATE: u8 = 11;
 const HT_CERTIFICATE_REQUEST: u8 = 13;
 const HT_CERTIFICATE_VERIFY: u8 = 15;
 const HT_FINISHED: u8 = 20;
+const HT_KEY_UPDATE: u8 = 24;
+
+/// KeyUpdate request_update values (RFC 8446 §4.6.3). The enum is
+/// closed: any other byte is illegal_parameter, not a value to ignore.
+pub const KEY_UPDATE_NOT_REQUESTED: u8 = 0;
+pub const KEY_UPDATE_REQUESTED: u8 = 1;
 
 /// Extension types
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
@@ -28,6 +34,7 @@ const EXT_SIGNATURE_ALGORITHMS: u16 = 13;
 const EXT_SUPPORTED_GROUPS: u16 = 10;
 const EXT_COOKIE: u16 = 44;
 const EXT_ALPN: u16 = 16;
+const EXT_SERVER_NAME: u16 = 0;
 /// QUIC transport_parameters extension (RFC 9001 §8.2). Carried in
 /// ClientHello and EncryptedExtensions during the QUIC handshake;
 /// must be empty for TLS-over-TCP and DTLS.
@@ -184,6 +191,27 @@ pub fn build_client_hello_ext(
     suites: &[u16],
     out: &mut [u8],
 ) -> usize {
+    build_client_hello_sni(random, session_id, pub_key, quic_tp, alpn, &[], suites, out)
+}
+
+/// As [`build_client_hello_ext`], plus a `server_name` extension
+/// (RFC 6066 §3) when `sni` is non-empty.
+///
+/// `sni` carries the DNS identity the caller also requires of the peer's
+/// certificate. Emitting a name selects which certificate a multi-tenant
+/// peer returns, so a client that sends one it does not then require would
+/// hold a handshake with a service it never asked to reach.
+#[allow(clippy::too_many_arguments, reason = "one ClientHello extension per argument; grouping them into a struct would move the same fields behind a name that adds nothing")]
+pub fn build_client_hello_sni(
+    random: &[u8; 32],
+    session_id: &[u8; 32],
+    pub_key: &[u8; 65],
+    quic_tp: &[u8],
+    alpn: &[u8],
+    sni: &[u8],
+    suites: &[u16],
+    out: &mut [u8],
+) -> usize {
     let mut pos = 0;
 
     // Handshake header: type(1) + length(3) — we'll fill length later
@@ -207,6 +235,7 @@ pub fn build_client_hello_ext(
 
     let ext_len_pos = pos; pos += 2;
     let ext_start = pos;
+    pos = write_ext_server_name(out, pos, sni);
     pos = write_ext_supported_versions(out, pos);
     pos = write_ext_supported_groups(out, pos);
     pos = write_ext_key_share_client(out, pos, pub_key);
@@ -1085,19 +1114,96 @@ pub fn parse_certificate_msg(data: &[u8]) -> Option<&[u8]> {
     Some(&data[pos..pos + cert_len])
 }
 
-/// Parse CertificateVerify message body
+/// Parse a CertificateVerify body: `algorithm(2) || signature<0..2^16-1>`.
+/// The signature must fill the message exactly — trailing bytes would
+/// be data the transcript covers but no field names.
 pub fn parse_certificate_verify(data: &[u8]) -> Option<(u16, &[u8])> {
     if data.len() < 4 { return None; }
     let scheme = get_u16(data, 0);
     let sig_len = get_u16(data, 2) as usize;
-    if 4 + sig_len > data.len() { return None; }
+    if 4 + sig_len != data.len() { return None; }
     Some((scheme, &data[4..4 + sig_len]))
 }
 
-/// Parse Finished message body
+/// Parse a CertificateVerify body and require the announced signature
+/// scheme to be `expected`.
+///
+/// The scheme is not decoration: it selects the hash and the curve the
+/// signature was produced under. Verifying under a fixed algorithm
+/// while ignoring the announced one accepts a signature whose stated
+/// meaning differs from the check performed.
+pub fn parse_certificate_verify_expecting(data: &[u8], expected: u16) -> Option<&[u8]> {
+    let (scheme, sig) = parse_certificate_verify(data)?;
+    if scheme != expected {
+        return None;
+    }
+    Some(sig)
+}
+
+/// Parse a Finished message body. RFC 8446 §4.4.4 fixes verify_data at
+/// exactly Hash.length for the negotiated suite, so a body of any
+/// other length is a protocol error rather than something to truncate
+/// or pad: the reassembler only guarantees the peer-declared message
+/// length, not that it matches the suite.
 pub fn parse_finished(data: &[u8], expected_len: usize) -> Option<&[u8]> {
-    if data.len() < expected_len { return None; }
-    Some(&data[..expected_len])
+    if data.len() != expected_len { return None; }
+    Some(data)
+}
+
+/// Parse a KeyUpdate body (RFC 8446 §4.6.3). The body is exactly one
+/// byte drawn from a two-value enum, so both a wrong length and an
+/// unknown value are protocol errors.
+pub fn parse_key_update(body: &[u8]) -> Option<u8> {
+    if body.len() != 1 {
+        return None;
+    }
+    match body[0] {
+        KEY_UPDATE_NOT_REQUESTED => Some(KEY_UPDATE_NOT_REQUESTED),
+        KEY_UPDATE_REQUESTED => Some(KEY_UPDATE_REQUESTED),
+        _ => None,
+    }
+}
+
+/// Build a KeyUpdate handshake message (4-byte header + 1-byte body).
+pub fn build_key_update(request_update: u8, out: &mut [u8]) -> usize {
+    out[0] = HT_KEY_UPDATE;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 1;
+    out[4] = request_update;
+    5
+}
+
+/// Structurally validate a NewSessionTicket body (RFC 8446 §4.6.1).
+///
+/// Session resumption is not implemented, so the ticket is discarded —
+/// but it is discarded only after the body is proved well formed and
+/// free of trailing bytes. Accepting a malformed message because its
+/// contents are unused would leave the peer free to desynchronise the
+/// post-handshake stream.
+pub fn parse_new_session_ticket_is_well_formed(body: &[u8]) -> bool {
+    // ticket_lifetime(4) + ticket_age_add(4) + nonce_len(1)
+    if body.len() < 9 {
+        return false;
+    }
+    let nonce_len = body[8] as usize;
+    let mut pos = 9 + nonce_len;
+    // ticket <1..2^16-1>
+    if pos + 2 > body.len() {
+        return false;
+    }
+    let ticket_len = get_u16(body, pos) as usize;
+    if ticket_len == 0 {
+        return false;
+    }
+    pos += 2 + ticket_len;
+    // extensions <0..2^16-2>
+    if pos + 2 > body.len() {
+        return false;
+    }
+    let ext_len = get_u16(body, pos) as usize;
+    pos += 2 + ext_len;
+    pos == body.len()
 }
 
 /// Build CertificateVerify signing content
@@ -1163,6 +1269,33 @@ fn write_ext_supported_groups(out: &mut [u8], mut pos: usize) -> usize {
     put_u16(out, pos, 2); pos += 2; // named_group_list length
     put_u16(out, pos, GROUP_SECP256R1); pos += 2;
     pos
+}
+
+/// `server_name` (RFC 6066 §3): a single `host_name` entry. Writes nothing
+/// when `host` is empty or longer than one extension can carry — an IP
+/// literal is never passed here, because RFC 6066 §3 forbids one and the
+/// caller rejects it at construction.
+fn write_ext_server_name(out: &mut [u8], mut pos: usize, host: &[u8]) -> usize {
+    if host.is_empty() || host.len() > 255 {
+        return pos;
+    }
+    let n = host.len();
+    put_u16(out, pos, EXT_SERVER_NAME);
+    pos += 2;
+    put_u16(out, pos, (n + 5) as u16); // extension_data length
+    pos += 2;
+    put_u16(out, pos, (n + 3) as u16); // ServerNameList length
+    pos += 2;
+    out[pos] = 0; // NameType.host_name
+    pos += 1;
+    put_u16(out, pos, n as u16);
+    pos += 2;
+    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
+    // checked against the message length before each deref.
+    unsafe {
+        core::ptr::copy_nonoverlapping(host.as_ptr(), out.as_mut_ptr().add(pos), n);
+    }
+    pos + n
 }
 
 /// Offer ALPN protocols (RFC 7301). When `alpn` is empty, defaults to

@@ -24,10 +24,10 @@ use crate::kernel::security::crypto::{ed25519, p256};
 const KEY_TYPE_P256_SCALAR: u8 = 1;
 /// Ed25519 raw-seed key type (RFC 8032), STORE/GENERATE `key_type` 2.
 const KEY_TYPE_ED25519_SEED: u8 = 2;
-/// P-256 group order n (big-endian) — GENERATE rejection-samples the
-/// scalar into [1, n-1] because `p256::ecdsa_sign` uses the scalar
-/// unreduced while `public_key_from_scalar` reduces mod n; only an
-/// in-range scalar is interpreted identically by both.
+/// P-256 group order n (big-endian). Every P-256 scalar this vault
+/// holds must lie in [1, n-1]: GENERATE rejection-samples into that
+/// range and STORE refuses anything outside it. `d == 0` signs under
+/// the identity and `d >= n` is a non-canonical encoding of `d mod n`.
 const P256_ORDER_BE: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
@@ -169,6 +169,25 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if key_len == 0 || key_len > MAX_KEY_BYTES || 4 + key_len > arg_len {
                 return EINVAL;
             }
+            // A P-256 slot must hold a scalar in [1, n-1]. Admitting
+            // `d == 0` or `d >= n` here would make SIGN, ECDH and PUBLIC
+            // operate under a degenerate key.
+            if key_type == KEY_TYPE_P256_SCALAR {
+                if key_len != 32 {
+                    return EINVAL;
+                }
+                let mut scalar = [0u8; 32];
+                for (j, b) in scalar.iter_mut().enumerate() {
+                    *b = *arg.add(4 + j);
+                }
+                let in_range = p256_scalar_in_range(&scalar);
+                for byte in scalar.iter_mut() {
+                    core::ptr::write_volatile(byte as *mut u8, 0);
+                }
+                if !in_range {
+                    return EINVAL;
+                }
+            }
             // Find a free slot.
             let mut slot_idx: isize = -1;
             let slots_ptr = &raw const SLOTS;
@@ -234,7 +253,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                     // Ed25519 is not prehashed: the `hash` field carries
                     // the whole message (any length the arg buffer fits).
                     let msg = core::slice::from_raw_parts(arg.add(4), hash_len);
-                    ed25519::sign(&priv_key, msg)
+                    Some(ed25519::sign(&priv_key, msg))
                 }
                 _ => {
                     for byte in priv_key.iter_mut() {
@@ -246,6 +265,10 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             for byte in priv_key.iter_mut() {
                 core::ptr::write_volatile(byte as *mut u8, 0);
             }
+            let sig = match sig {
+                Some(s) => s,
+                None => return EINVAL,
+            };
             let out = arg.add(4 + hash_len);
             core::ptr::copy_nonoverlapping(sig.as_ptr(), out, 64);
             0
@@ -361,7 +384,10 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                     if !in_range {
                         return ERROR;
                     }
-                    let pk = p256::public_key_from_scalar(&key);
+                    let pk = match p256::public_key_from_scalar(&key) {
+                        Some(pk) => pk,
+                        None => return ERROR,
+                    };
                     core::ptr::copy_nonoverlapping(pk.as_ptr(), arg.add(4), 65);
                 }
                 _ => {
@@ -401,9 +427,13 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             priv_key.copy_from_slice(&slot.data[..32]);
             let rc = match slot.key_type {
                 KEY_TYPE_P256_SCALAR if arg_len >= 65 => {
-                    let pk = p256::public_key_from_scalar(&priv_key);
-                    core::ptr::copy_nonoverlapping(pk.as_ptr(), arg, 65);
-                    0
+                    match p256::public_key_from_scalar(&priv_key) {
+                        Some(pk) => {
+                            core::ptr::copy_nonoverlapping(pk.as_ptr(), arg, 65);
+                            0
+                        }
+                        None => EINVAL,
+                    }
                 }
                 KEY_TYPE_ED25519_SEED if arg_len >= 32 => {
                     let pk = ed25519::public_key(&priv_key);

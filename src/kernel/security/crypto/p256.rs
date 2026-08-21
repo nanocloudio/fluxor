@@ -2,9 +2,45 @@
 //!
 //! Pure Rust, no_std, no heap. Field arithmetic over
 //! p = 2^256 - 2^224 + 2^192 + 2^96 - 1. Jacobian coordinates for point
-//! ops, constant-time Montgomery ladder for scalar multiplication, RFC 6979
+//! ops, a per-bit Montgomery ladder for scalar multiplication, RFC 6979
 //! deterministic nonces for ECDSA signing, low-s normalisation, volatile
 //! zeroisation of intermediate secrets.
+//!
+//! # Timing exposure
+//!
+//! This implementation is NOT constant-time, at three separate levels.
+//! Identifiers beginning `ct_` are individually branchless and do what
+//! their names say; they do not make the operations built on them
+//! constant-time.
+//!
+//!   1. Field and scalar arithmetic. `fp_add`, `fp_sub`, `mod_p`,
+//!      `mod_n_reduce` and `fn_add` branch on the carry or borrow of
+//!      secret operands. `fp_reduce` runs `while` loops whose trip
+//!      counts depend on the value being reduced, and `fn_reduce_wide`
+//!      iterates until the high limbs clear — so a single field
+//!      multiply takes a value-dependent number of iterations. Every
+//!      point operation is built out of these, so the exposure is
+//!      present on every ECDH agreement and every ECDSA signature.
+//!   2. Point arithmetic. `JacobianPoint::add_jacobian`,
+//!      `add_affine` and `double` short-circuit on identity inputs and
+//!      on the doubling case, which are branches on secret-derived
+//!      values.
+//!   3. Inversion. `fp_inv` and `fn_inv` are square-and-multiply over a
+//!      public exponent, so their own control flow is fine, but each of
+//!      their ~512 multiplies is value-dependent per (1). `fn_inv` is
+//!      applied to the ECDSA nonce `k`.
+//!
+//! The exposure is reachable from module code across a privilege
+//! boundary: `key_vault.rs` drives these primitives from the KEY_VAULT
+//! `SIGN` and `ECDH` opcodes, over a long-lived slot key.
+//!
+//! `ed25519.rs` in this directory is the constant-time signature
+//! primitive: complete unified formulas, branchless field arithmetic,
+//! branchless table lookup, no identity special cases.
+//!
+//! ECDSA signing uses RFC 6979 deterministic nonces and normalises
+//! signatures to low-s form. Intermediate secrets are zeroised via
+//! volatile writes before returning from each primitive.
 //!
 //! The `pic_u256` / `pic_u64` helpers assemble curve constants from u32
 //! immediates — harmless on kernel hosts, required on the PIC copy where
@@ -60,6 +96,15 @@ fn load_p() -> U256 {
     pic_u256([
         0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
         0xFFFFFFFF,
+    ])
+}
+
+/// Load P-256 curve coefficient b.
+#[inline(never)]
+fn load_b() -> U256 {
+    pic_u256([
+        0x27D2604B, 0x3BCE3C3E, 0xCC53B0F6, 0x651D06B0, 0x769886BC, 0xB3EBBD55, 0xAA3A93E7,
+        0x5AC635D8,
     ])
 }
 
@@ -821,9 +866,46 @@ impl JacobianPoint {
     }
 }
 
-/// Constant-time scalar multiplication via Montgomery ladder. R0 and R1
-/// are updated on every bit regardless of its value, so execution timing
-/// does not leak the secret scalar.
+/// Scalar multiplication via a per-bit Montgomery ladder: R0 and R1 are
+/// both updated on every bit, and the swap is branchless.
+///
+/// # Timing exposure
+///
+/// This routine is **not constant-time**, despite the `_ct` suffix,
+/// which names only the swap.
+///
+/// What is branchless: [`ct_swap`] masks and XORs all three coordinate
+/// limbs unconditionally, so the scalar bit never becomes a branch
+/// condition or a load address in the ladder itself.
+///
+/// What is not:
+///
+///   - [`JacobianPoint::add_jacobian`] and
+///     [`JacobianPoint::double`] short-circuit on identity inputs.
+///     The branch fires on every leading-zero bit of the scalar, where
+///     `r0` is still the identity, so the position of those bits is
+///     visible in the timing profile.
+///   - Every `fp_*` operation underneath is value-dependent — see the
+///     note at the top of this file. That channel is present even for
+///     a scalar with no leading zero bits.
+///
+/// The exposure is not a bounded disclosure of a few bits. For ECDSA
+/// the multiplied scalar is the per-signature nonce `k`; partial
+/// knowledge of `k` across a set of signatures is the input to
+/// hidden-number-problem lattice recovery of the long-term key, and
+/// published attacks of this shape have worked over a network rather
+/// than only from a co-located process. For ECDH the scalar is the
+/// vault's private key itself and the same measurements accumulate
+/// across agreements. Treat a timing-capable adversary as able to
+/// recover the key, not as able to learn a few bits of it.
+///
+/// Removing the exposure requires all three of: exception-free or
+/// complete addition formulas (Renes-Costello-Batina, ~50 % more
+/// multiplications); masked, fixed-trip-count field reductions; and a
+/// constant-time inversion for `fn_inv`.
+///
+/// KATs in `tests/harness/tests/kernel_crypto_p256.rs` gate correctness
+/// of the `(sign, verify, ECDH)` surface against expected outputs.
 fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
     let p_jac = JacobianPoint::from_affine(px, py);
     let mut r0 = JacobianPoint::identity();
@@ -906,14 +988,109 @@ fn u256_to_be(a: &U256) -> [u8; 32] {
 // Public API
 // ============================================================================
 
+/// Public-key validation: is the affine point (x, y) on the P-256 curve
+/// y² ≡ x³ - 3x + b (mod p)?
+///
+/// Without this gate a caller can submit a point on a different curve
+/// (different b) whose order has small factors, and use the resulting
+/// ECDH agreements to recover bits of the vault's private scalar over
+/// repeated calls — the invalid-curve attack. The KEY_VAULT slot key is
+/// long-lived and reachable from module code, so the point must be
+/// pinned to P-256 before any scalar multiplication touches it.
+pub fn is_on_curve(x: &U256, y: &U256) -> bool {
+    let y_sq = fp_sqr(y);
+    let x_sq = fp_sqr(x);
+    let x_cubed = fp_mul(&x_sq, x);
+    let two_x = fp_add(x, x);
+    let three_x = fp_add(&two_x, x);
+    let rhs = fp_add(&fp_sub(&x_cubed, &three_x), &load_b());
+    // Constant-time equality over the U256 limbs.
+    let mut diff = 0u64;
+    let mut i = 0;
+    while i < 4 {
+        diff |= y_sq[i] ^ rhs[i];
+        i += 1;
+    }
+    diff == 0
+}
+
+/// The single decode-and-validate gate for every P-256 public point that
+/// arrives from outside the kernel — KEY_VAULT `ECDH` peer shares and
+/// `VERIFY` public keys.
+///
+/// Accepts the SEC 1 uncompressed encoding `0x04 || X || Y` (65 bytes)
+/// and the bare `X || Y` form (64 bytes). Compressed prefixes
+/// (`0x02`/`0x03`) are not supported; any other prefix or length is
+/// malformed.
+///
+/// A point survives only if all of these hold:
+///   - X and Y are canonical, each numerically less than `p` (a
+///     non-reduced coordinate has two encodings, so accepting one lets
+///     a caller vary the wire bytes without varying the point);
+///   - the point is not the affine identity `(0, 0)`;
+///   - it satisfies y² ≡ x³ - 3x + b (mod p), pinning it to P-256
+///     rather than another curve over the same field with a smooth
+///     order;
+///   - it is therefore in the prime-order group, P-256 having cofactor
+///     1 and every on-curve non-identity point generating it.
+fn decode_public_point(encoded: &[u8]) -> Option<(U256, U256)> {
+    let offset = if encoded.len() == 65 {
+        if encoded[0] != 0x04 {
+            return None;
+        }
+        1
+    } else if encoded.len() == 64 {
+        0
+    } else {
+        return None;
+    };
+
+    let x = u256_from_be(&encoded[offset..offset + 32]);
+    let y = u256_from_be(&encoded[offset + 32..offset + 64]);
+
+    let p = load_p();
+    if u256_gte(&x, &p) != 0 || u256_gte(&y, &p) != 0 {
+        return None;
+    }
+    if x == ZERO && y == ZERO {
+        return None;
+    }
+    if !is_on_curve(&x, &y) {
+        return None;
+    }
+    Some((x, y))
+}
+
+/// True when `encoded` is a P-256 public point the kernel will use.
+/// Callers holding an encoded key before they need the coordinates gate
+/// on this, so a bad point is refused at the boundary it entered through
+/// rather than inside a scalar multiplication.
+pub fn public_point_is_valid(encoded: &[u8]) -> bool {
+    decode_public_point(encoded).is_some()
+}
+
+/// Decode a private scalar `d` supplied at an API boundary. `d` must lie
+/// in `[1, n-1]`: `d == 0` yields the identity for every input, and
+/// `d >= n` is a non-canonical encoding of `d mod n`. Key generation
+/// already clamps, but a stored or imported scalar may come from
+/// anywhere, so every entry point re-checks.
+fn decode_private_scalar(private_key: &[u8; 32]) -> Option<U256> {
+    let d = u256_from_be(private_key);
+    if u256_is_zero(&d) {
+        return None;
+    }
+    if u256_gte(&d, &load_n()) != 0 {
+        return None;
+    }
+    Some(d)
+}
+
 /// Derive the uncompressed P-256 public key (0x04 || X || Y) for the given
 /// 32-byte big-endian private scalar.
-pub fn public_key_from_scalar(private_key: &[u8; 32]) -> [u8; 65] {
-    let mut d = u256_from_be(private_key);
-    d = mod_n_reduce(&d);
-    if u256_is_zero(&d) {
-        d = ONE;
-    }
+///
+/// Returns None when the scalar is outside `[1, n-1]`.
+pub fn public_key_from_scalar(private_key: &[u8; 32]) -> Option<[u8; 65]> {
+    let d = decode_private_scalar(private_key)?;
     let point = scalar_mul_base(&d);
     let (x, y) = point.to_affine();
     let mut pk = [0u8; 65];
@@ -922,23 +1099,21 @@ pub fn public_key_from_scalar(private_key: &[u8; 32]) -> [u8; 65] {
     let yb = u256_to_be(&y);
     pk[1..33].copy_from_slice(&xb);
     pk[33..65].copy_from_slice(&yb);
-    pk
+    Some(pk)
 }
 
 /// ECDH shared secret: scalar_mult(my_private, peer_public).x
 /// peer_pub should be 65 bytes (0x04 || X || Y) or 64 bytes (X || Y)
+///
+/// Returns None on:
+///   - a private scalar outside [1, n-1];
+///   - malformed encoding (wrong length, non-uncompressed prefix);
+///   - non-canonical coordinates, the identity, or a point not on the
+///     curve;
+///   - scalar multiplication producing the point at infinity.
 pub fn ecdh_shared_secret(my_private: &[u8; 32], peer_pub: &[u8]) -> Option<[u8; 32]> {
-    let offset = if peer_pub.len() == 65 && peer_pub[0] == 0x04 {
-        1
-    } else if peer_pub.len() == 64 {
-        0
-    } else {
-        return None;
-    };
-
-    let px = u256_from_be(&peer_pub[offset..offset + 32]);
-    let py = u256_from_be(&peer_pub[offset + 32..offset + 64]);
-    let mut k = u256_from_be(my_private);
+    let (px, py) = decode_public_point(peer_pub)?;
+    let mut k = decode_private_scalar(my_private)?;
 
     let result = scalar_mul(&k, &px, &py);
     zeroize_u256(&mut k);
@@ -1064,8 +1239,12 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 /// from the private key and the hash (RFC 6979); the `_random_k` parameter
 /// is retained for API compatibility and ignored. Returns the 64-byte
 /// signature `r || s` in big-endian form, normalised to low-s.
-pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> [u8; 64] {
-    let d = u256_from_be(private_key);
+///
+/// Returns None when `private_key` is not a valid scalar in [1, n-1]:
+/// signing under `d == 0` produces a signature that verifies against the
+/// identity, and `d >= n` silently signs under `d mod n`.
+pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> Option<[u8; 64]> {
+    let d = decode_private_scalar(private_key)?;
     let mut k = rfc6979_nonce(private_key, hash);
 
     // r = (k * G).x mod n
@@ -1116,7 +1295,7 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
         core::ptr::copy_nonoverlapping(rb.as_ptr(), sig.as_mut_ptr(), 32);
         core::ptr::copy_nonoverlapping(sb.as_ptr(), sig.as_mut_ptr().add(32), 32);
     }
-    sig
+    Some(sig)
 }
 
 /// ECDSA verify: check (r, s) over message hash with public key
@@ -1125,18 +1304,15 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     if sig.len() < 64 {
         return false;
     }
-    let offset = if pub_key.len() == 65 && pub_key[0] == 0x04 {
-        1
-    } else if pub_key.len() == 64 {
-        0
-    } else {
-        return false;
+    // The public point is decoded and fully validated before it can
+    // reach a scalar multiplication.
+    let (qx, qy) = match decode_public_point(pub_key) {
+        Some(q) => q,
+        None => return false,
     };
 
     let r = u256_from_be(&sig[..32]);
     let s = u256_from_be(&sig[32..64]);
-    let qx = u256_from_be(&pub_key[offset..offset + 32]);
-    let qy = u256_from_be(&pub_key[offset + 32..offset + 64]);
 
     // Check r, s in [1, n-1]
     let n = load_n();

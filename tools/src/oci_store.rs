@@ -18,7 +18,7 @@
 //! manifests and therefore identical digests — the P5 promotion property
 //! (re-tag, never rebuild) falls out of this.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -314,13 +314,20 @@ impl OciStore {
     /// Read a blob and verify its bytes hash to the digest that names it —
     /// every consumer gets integrity for free; a substituted or corrupted
     /// file under a content-addressed path is an error, never data.
+    ///
+    /// The three failure modes are distinct and stay distinct in the
+    /// message: absent, present but unreadable (`EACCES`, `EIO`), and
+    /// present but failing integrity. Callers word remedies off them —
+    /// a corrupt blob is not a missing one.
     pub fn read_blob(&self, digest: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(digest)?;
         let bytes = fs::read(&path).map_err(|e| {
-            Error::Config(format!(
-                "blob {digest} not in store {}: {e}",
-                self.root.display()
-            ))
+            let what = if e.kind() == std::io::ErrorKind::NotFound {
+                "not in store"
+            } else {
+                "unreadable in store"
+            };
+            Error::Config(format!("blob {digest} {what} {}: {e}", self.root.display()))
         })?;
         if sha256_hex_prefixed(&bytes) != digest {
             return Err(Error::Config(format!(
@@ -533,13 +540,15 @@ impl OciStore {
         // errors, the index is untouched and the command is safely
         // retryable.
         let mut probe = BTreeSet::new();
+        let mut probe_tiers = BTreeMap::new();
         for d in index.manifests.iter().filter(|d| survives(d)) {
-            self.add_closure(d, &mut probe).map_err(|e| {
-                Error::Config(format!(
-                    "refusing to remove: live manifest {} is unreadable ({e})",
-                    d.digest
-                ))
-            })?;
+            self.add_closure(d, &mut probe, &mut probe_tiers)
+                .map_err(|e| {
+                    Error::Config(format!(
+                        "refusing to remove: live manifest {} is unreadable ({e})",
+                        d.digest
+                    ))
+                })?;
         }
         index.manifests.retain(survives);
         self.write_index(&index)?;
@@ -1333,8 +1342,24 @@ impl OciStore {
 
     /// Closure-add one descriptor's reachable digests into `live`,
     /// traversing both image manifests and image indexes (project
-    /// indexes, snapshots).
-    fn add_closure(&self, d: &Descriptor, live: &mut BTreeSet<String>) -> Result<()> {
+    /// indexes, snapshots). Every digest visited is filed in `tiers` by
+    /// its descriptor media type, which is the only place that
+    /// classification is available without re-reading the blob.
+    fn add_closure(
+        &self,
+        d: &Descriptor,
+        live: &mut BTreeSet<String>,
+        tiers: &mut BTreeMap<String, BlobTier>,
+    ) -> Result<()> {
+        record_tier(
+            tiers,
+            &d.digest,
+            if d.media_type == MT_OCI_INDEX {
+                BlobTier::Index
+            } else {
+                BlobTier::Manifest
+            },
+        );
         if !live.insert(d.digest.clone()) {
             return Ok(());
         }
@@ -1342,14 +1367,66 @@ impl OciStore {
             let bytes = self.read_blob(&d.digest)?;
             let idx: ImageIndex = serde_json::from_slice(&bytes)?;
             for child in &idx.manifests {
-                self.add_closure(child, live)?;
+                self.add_closure(child, live, tiers)?;
             }
             return Ok(());
         }
         let m = self.read_manifest(d)?;
         live.insert(m.config.digest.clone());
+        record_tier(tiers, &m.config.digest, tier_of(&m.config.media_type));
         for l in &m.layers {
             live.insert(l.digest.clone());
+            record_tier(tiers, &l.digest, tier_of(&l.media_type));
+        }
+        Ok(())
+    }
+
+    /// Closure-add a digest known only by value (a lockfile pin, whose
+    /// entry carries no media type). A pinned digest may name a
+    /// manifest or an index: everything IT references is live too — a
+    /// pinned manifest must keep its config and layer blobs, or the
+    /// store is left holding a dangling manifest (JSON present,
+    /// referenced blob gone).
+    ///
+    /// A pin whose blob is ABSENT contributes just itself and is not an
+    /// error: a direct layer pin has no closure, and a pin the store
+    /// never held cannot be walked. A pin whose blob is PRESENT but
+    /// unreadable — failed integrity verification, `EACCES`, `EIO` — is
+    /// an error: its closure is unknowable, so the sweep must fail
+    /// closed rather than assume the pin references nothing.
+    fn add_closure_by_digest(
+        &self,
+        digest: &str,
+        live: &mut BTreeSet<String>,
+        tiers: &mut BTreeMap<String, BlobTier>,
+    ) -> Result<()> {
+        if !live.insert(digest.to_string()) {
+            return Ok(());
+        }
+        if !self.has_blob(digest) {
+            return Ok(());
+        }
+        let bytes = self.read_blob(digest)?;
+        // An image manifest requires `config` + `layers`, which an
+        // index lacks; `ImageIndex.manifests` defaults, so the index
+        // parse must come second and gate on its media type.
+        if let Ok(m) = serde_json::from_slice::<ImageManifest>(&bytes) {
+            record_tier(tiers, digest, BlobTier::Manifest);
+            live.insert(m.config.digest.clone());
+            record_tier(tiers, &m.config.digest, tier_of(&m.config.media_type));
+            for l in &m.layers {
+                live.insert(l.digest.clone());
+                record_tier(tiers, &l.digest, tier_of(&l.media_type));
+            }
+            return Ok(());
+        }
+        if let Ok(idx) = serde_json::from_slice::<ImageIndex>(&bytes) {
+            if idx.media_type == MT_OCI_INDEX {
+                record_tier(tiers, digest, BlobTier::Index);
+                for child in &idx.manifests {
+                    self.add_closure_by_digest(&child.digest, live, tiers)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1358,34 +1435,47 @@ impl OciStore {
     /// against the full liveness root set: every index tag (traversed
     /// through indexes — a project-index descriptor is never parsed as
     /// a manifest), plus every `sha256:` digest pinned by a workspace
-    /// member's `fluxor.lock`.
+    /// member's `fluxor.lock` — each pin expanded through ITS closure,
+    /// so a pinned manifest keeps every blob it references.
     ///
     /// Every path that can orphan a blob — publish, retag, `remove` —
     /// sweeps through here, so a blob a member lockfile pins is never
     /// evicted regardless of which command triggered the sweep.
-    /// An unreadable member lockfile fails CLOSED for the sweep only —
-    /// warn and delete nothing; the publish that triggered the sweep
-    /// has already succeeded (registry_consolidation.md, GC rules).
+    /// An unreadable member lockfile — or a pin whose blob is present
+    /// but unreadable — fails CLOSED for the sweep only: warn and
+    /// delete nothing; the publish that triggered the sweep has already
+    /// succeeded (registry_consolidation.md, GC rules).
+    ///
+    /// Invariant: no blob referenced by any manifest still present in
+    /// the store is ever deleted, and deletion runs strictly in tier
+    /// order — indexes, then the manifests they list, then leaves. An
+    /// interrupted sweep therefore leaves orphaned bytes, never a
+    /// referent-missing index or manifest.
     fn sweep_with_roots(&self, index: &ImageIndex, victims: &[Descriptor]) -> Result<Vec<String>> {
         let mut live: BTreeSet<String> = BTreeSet::new();
+        let mut tiers: BTreeMap<String, BlobTier> = BTreeMap::new();
         for d in &index.manifests {
-            self.add_closure(d, &mut live).map_err(|e| {
+            self.add_closure(d, &mut live, &mut tiers).map_err(|e| {
                 Error::Config(format!("live manifest {} is unreadable ({e})", d.digest))
             })?;
         }
         for digest in member_lockfile_digests()? {
-            live.insert(digest);
+            self.add_closure_by_digest(&digest, &mut live, &mut tiers)
+                .map_err(|e| Error::Config(format!("pinned blob {digest} is unreadable ({e})")))?;
         }
         let mut candidates: BTreeSet<String> = BTreeSet::new();
         for v in victims {
             candidates.insert(v.digest.clone());
             let mut c = BTreeSet::new();
-            if self.add_closure(v, &mut c).is_ok() {
+            if self.add_closure(v, &mut c, &mut tiers).is_ok() {
                 candidates.extend(c);
             }
         }
+        let mut doomed: Vec<&String> = candidates.difference(&live).collect();
+        // Stable by tier: a referent always outlives its referrer.
+        doomed.sort_by_key(|d| tiers.get(*d).copied().unwrap_or(BlobTier::Leaf));
         let mut removed = Vec::new();
-        for digest in candidates.difference(&live) {
+        for digest in doomed {
             if let Ok(p) = self.blob_path(digest) {
                 if fs::remove_file(&p).is_ok() {
                     removed.push(digest.clone());
@@ -1394,6 +1484,34 @@ impl OciStore {
         }
         Ok(removed)
     }
+}
+
+/// Where a blob sits in the reference hierarchy, learned from the
+/// descriptor that names it during the closure walk. Ordering is
+/// deletion order: an index is deleted before the manifests it lists,
+/// a manifest before the leaves it references.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BlobTier {
+    Index,
+    Manifest,
+    Leaf,
+}
+
+fn tier_of(media_type: &str) -> BlobTier {
+    match media_type {
+        MT_OCI_INDEX => BlobTier::Index,
+        MT_OCI_MANIFEST => BlobTier::Manifest,
+        _ => BlobTier::Leaf,
+    }
+}
+
+/// File a digest's tier, keeping the strongest classification seen: one
+/// digest may be reached both as a manifest descriptor and as some
+/// other manifest's layer, and the referrer tier is what deletion order
+/// must respect.
+fn record_tier(tiers: &mut BTreeMap<String, BlobTier>, digest: &str, tier: BlobTier) {
+    let slot = tiers.entry(digest.to_string()).or_insert(tier);
+    *slot = (*slot).min(tier);
 }
 
 /// Harvest every `sha256:<hex>` digest from every workspace member's
@@ -1545,6 +1663,43 @@ pub fn sha256_hex_prefixed(bytes: &[u8]) -> String {
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
     M.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Scoped env override for tests: set on construction, restored to the
+/// prior value (or unset) on drop. Restoration must survive a panic
+/// between set and unset, or a failing test leaks a path naming a
+/// deleted tempdir into every later env-touching test — `test_env_lock`
+/// recovers from poisoning, so the leak is not contained by the guard.
+#[cfg(test)]
+pub(crate) struct EnvScope {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl EnvScope {
+    pub(crate) fn set(pairs: &[(&'static str, &Path)]) -> EnvScope {
+        let saved = pairs
+            .iter()
+            .map(|(k, v)| {
+                let old = std::env::var_os(k);
+                std::env::set_var(k, v);
+                (*k, old)
+            })
+            .collect();
+        EnvScope { saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvScope {
+    fn drop(&mut self) {
+        for (k, old) in self.saved.drain(..) {
+            match old {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
 }
 
 fn one_annotation(key: &str, value: &str) -> Annotations {
@@ -1831,7 +1986,7 @@ mod tests {
             ),
         )
         .unwrap();
-        std::env::set_var("FLUXOR_WORKSPACE", &ws_file);
+        let _scope = EnvScope::set(&[("FLUXOR_WORKSPACE", &ws_file)]);
 
         // (a) A retag that displaces the only manifest reaching the blob.
         publish_test_module(&store, "widget", b"pinned", "widget:latest");
@@ -1845,7 +2000,6 @@ mod tests {
         // (b) A `store rm` of the only tag reaching the blob.
         publish_test_module(&store, "blinky", b"pinned", "blinky:1.0.0");
         let removed = store.remove("blinky:1.0.0").unwrap();
-        std::env::remove_var("FLUXOR_WORKSPACE");
         assert!(
             !removed.contains(&pinned),
             "store rm reported sweeping a member-pinned blob: {removed:?}"
@@ -1853,6 +2007,161 @@ mod tests {
         assert!(
             store.has_blob(&pinned),
             "store rm swept a blob pinned by a member lockfile"
+        );
+    }
+
+    /// A member lockfile pins a MANIFEST digest — the shape `fluxor.lock`
+    /// actually writes. Liveness must cover the pinned manifest's whole
+    /// closure: keeping the manifest blob while sweeping its config/layer
+    /// blobs leaves a dangling manifest (JSON present, referenced blob
+    /// gone), which every consume path then misreports as the artifact
+    /// being absent.
+    #[test]
+    fn member_pinned_manifest_keeps_its_closure_across_retag() {
+        let _env = test_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = OciStore::open(dir.path().join("store")).expect("open");
+
+        let old = publish_test_module(&store, "widget", b"epoch-one", "widget:latest");
+        let old_manifest = store.read_manifest(&old).unwrap();
+
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("fluxor.lock"),
+            format!(
+                "[[artifact]]\nname = \"widget\"\ndigest = \"{}\"\n",
+                old.digest
+            ),
+        )
+        .unwrap();
+        let ws_file = dir.path().join("workspace.toml");
+        std::fs::write(
+            &ws_file,
+            format!(
+                "[workspace]\nmembers = [\"{}\"]\n",
+                member.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _scope = EnvScope::set(&[("FLUXOR_WORKSPACE", &ws_file)]);
+        publish_test_module(&store, "widget", b"epoch-two", "widget:latest");
+
+        assert!(
+            store.has_blob(&old.digest),
+            "pinned manifest blob must survive the retag sweep"
+        );
+        assert!(
+            store.has_blob(&old_manifest.config.digest),
+            "pinned manifest's config blob must survive the retag sweep"
+        );
+        for l in &old_manifest.layers {
+            assert!(
+                store.has_blob(&l.digest),
+                "pinned manifest's layer {} must survive the retag sweep",
+                l.digest
+            );
+        }
+    }
+
+    /// A sweep deletes strictly in tier order — index, then the
+    /// manifests it lists, then leaves — so an interrupted sweep can
+    /// only ever leave orphaned bytes, never a structural blob pointing
+    /// at a deleted referent.
+    #[test]
+    fn sweep_deletes_referrers_before_referents() {
+        let _env = test_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = OciStore::open(dir.path().join("store")).expect("open");
+        let ws_file = dir.path().join("no-workspace.toml");
+        let _scope = EnvScope::set(&[("FLUXOR_WORKSPACE", &ws_file)]);
+
+        let a = publish_test_module(&store, "alpha", b"alpha-bytes", "alpha:latest");
+        let b = publish_test_module(&store, "beta", b"beta-bytes", "beta:latest");
+        let snap = store
+            .create_snapshot("set", vec![a.clone(), b.clone()])
+            .unwrap();
+        // Untag both modules: the snapshot alone keeps them reachable.
+        store.remove("alpha:latest").unwrap();
+        store.remove("beta:latest").unwrap();
+
+        let layers: Vec<String> = [&a, &b]
+            .iter()
+            .flat_map(|d| store.read_manifest(d).unwrap().layers)
+            .map(|l| l.digest)
+            .collect();
+
+        let removed = store.remove("snapshot/set").unwrap();
+        let pos = |d: &str| removed.iter().position(|r| r == d).expect("swept");
+        assert_eq!(pos(&snap.digest), 0, "index must unlink first: {removed:?}");
+        let last_manifest = pos(&a.digest).max(pos(&b.digest));
+        for l in &layers {
+            assert!(
+                pos(l) > last_manifest,
+                "leaf {l} unlinked before a manifest referencing it: {removed:?}"
+            );
+        }
+    }
+
+    /// A pinned manifest whose blob is PRESENT but corrupt has an
+    /// unknowable closure: its config and layers may also sit inside a
+    /// displaced victim's closure (content-addressed layers dedupe
+    /// across artifacts), so proceeding would sweep them and leave the
+    /// pin dangling. The sweep must fail closed — warn, delete nothing.
+    #[test]
+    fn corrupt_pinned_manifest_aborts_the_sweep() {
+        let _env = test_env_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = OciStore::open(dir.path().join("store")).expect("open");
+
+        // `widget` is published, pinned by a member, then displaced —
+        // reachable only through the pin, exactly the case the pinned
+        // closure exists to protect.
+        let shared = b"shared-payload";
+        let pinned = publish_test_module(&store, "widget", shared, "widget:latest");
+        let pinned_manifest = store.read_manifest(&pinned).unwrap();
+        let shared_layer = pinned_manifest.layers[0].digest.clone();
+
+        let member = dir.path().join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("fluxor.lock"),
+            format!(
+                "[[artifact]]\nname = \"widget\"\ndigest = \"{}\"\n",
+                pinned.digest
+            ),
+        )
+        .unwrap();
+        let ws_file = dir.path().join("workspace.toml");
+        std::fs::write(
+            &ws_file,
+            format!(
+                "[workspace]\nmembers = [\"{}\"]\n",
+                member.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _scope = EnvScope::set(&[("FLUXOR_WORKSPACE", &ws_file)]);
+        publish_test_module(&store, "widget", b"widget-two", "widget:latest");
+
+        // `gadget` publishes the SAME payload bytes, so it shares the
+        // pinned manifest's layer blob; displacing it makes that shared
+        // layer a sweep candidate.
+        publish_test_module(&store, "gadget", shared, "gadget:latest");
+        std::fs::write(
+            store.blob_path(&pinned.digest).unwrap(),
+            b"truncated-manifest",
+        )
+        .unwrap();
+        publish_test_module(&store, "gadget", b"gadget-two", "gadget:latest");
+
+        assert!(
+            store.has_blob(&shared_layer),
+            "sweep deleted the pinned manifest's layer despite being unable to read the pin"
+        );
+        assert!(
+            store.has_blob(&pinned_manifest.config.digest),
+            "sweep deleted the pinned manifest's config despite being unable to read the pin"
         );
     }
 

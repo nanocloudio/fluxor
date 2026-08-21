@@ -18,7 +18,10 @@ use crate::hash::fnv1a_hash;
 /// Classification of a module during live reconfigure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleAction {
-    /// Module unchanged — continues running with state intact.
+    /// Module unchanged — same binary, config, and wiring, so it carries into
+    /// the new graph without a drain. Its state is re-instantiated like every
+    /// other module's: the migration resets the arenas and re-creates the
+    /// whole graph, so nothing survives but membership.
     Survive,
     /// Module changed but exports module_drain — graceful drain then replace.
     Drain,

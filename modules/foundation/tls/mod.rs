@@ -153,7 +153,12 @@ impl SessionArena {
         arg[0..4].copy_from_slice(&bytes.to_le_bytes());
         // SAFETY: kernel-owned syscall table; arg is an 8-byte local.
         let rc = unsafe {
-            (sys.provider_call)(-1, abi::contracts::resource::ELASTIC_ALLOC, arg.as_mut_ptr(), 8)
+            (sys.provider_call)(
+                -1,
+                abi::contracts::resource::ELASTIC_ALLOC,
+                arg.as_mut_ptr(),
+                8,
+            )
         };
         if rc < bytes as i32 {
             return false;
@@ -203,6 +208,16 @@ impl core::ops::IndexMut<usize> for SessionArena {
     }
 }
 const MAX_CERT_LEN: usize = 1024;
+/// Longest expected DNS identity. A DNS name is at most 253 octets, but the
+/// profile's names are service names in a configured deployment, and the
+/// buffer is per-instance module state on targets that count kilobytes.
+const MAX_EXPECTED_DNS: usize = 64;
+
+/// Certificate validity posture (`.context/rfc_tls_peer_identity.md` §6).
+const CLOCK_POLICY_REQUIRE: u8 = 0;
+
+/// `mode` values.
+const MODE_CLIENT: u8 = 0;
 const MAX_KEY_LEN: usize = 160;
 
 /// `transport` parameter values selecting which I/O path runs.
@@ -313,6 +328,10 @@ struct TlsSession {
     retx_base_seq: u32,
     retx_seq_anchored: bool,
 
+    /// Compatibility ChangeCipherSpec records consumed from this
+    /// peer, capped at `MAX_COMPAT_CCS`.
+    ccs_seen: u8,
+
     /// Middlebox-compat CCS injection (RFC 8446 §5). Set by
     /// `pump_send_server_hello` / `pump_send_hello_retry` to ask the
     /// outbound record bridge to append a 1-byte CCS record after the
@@ -383,6 +402,7 @@ impl TlsSession {
             retx_len: 0,
             retx_base_seq: 0,
             retx_seq_anchored: false,
+            ccs_seen: 0,
             pending_ccs: false,
             pending_ccs_client: false,
             pending_peer_identity: [0; PEER_IDENTITY_MAX_TOTAL],
@@ -421,6 +441,7 @@ impl TlsSession {
         self.retx_base_seq = 0;
         self.retx_seq_anchored = false;
         self.send_offset = 0;
+        self.ccs_seen = 0;
         self.pending_ccs = false;
         self.pending_ccs_client = false;
         self.pending_peer_identity_len = 0;
@@ -648,17 +669,32 @@ struct TlsState {
     key: [u8; MAX_KEY_LEN],
     key_len: usize,
 
-    // Trust anchor: public key extracted from a CA certificate provided via
-    // params. When require_ca is true and ca_pubkey is populated, every peer
-    // certificate's ECDSA signature is verified against this key before the
-    // handshake is allowed to proceed.
-    ca_pubkey: [u8; 65],
-    ca_pubkey_len: u8,
-    require_ca: bool,
+    /// Selected peer-authentication profile
+    /// (`.context/rfc_tls_peer_identity.md` §3). `PROFILE_NONE` is the
+    /// absence of a profile, not a permissive one: a client instance
+    /// carrying it does not construct.
+    peer_auth: u8,
+    /// `CLOCK_POLICY_REQUIRE` enforces certificate validity dates and
+    /// treats a missing wall clock as a failure; `CLOCK_POLICY_UNCHECKED`
+    /// is the explicitly recorded posture for a target with no time source.
+    clock_policy: u8,
 
-    // Trust domain for SPIFFE validation
-    trust_domain: [u8; 64],
-    trust_domain_len: usize,
+    /// Configured trust anchor, DER. Under `pinned` it is the certificate
+    /// whose subject public key is pinned; under `ca_dns` it is the
+    /// certificate authority. Retained whole because closing a path needs
+    /// the anchor's subject name as well as its key.
+    anchor: [u8; MAX_CERT_LEN],
+    anchor_len: usize,
+
+    /// Expected DNS identity: the name sent as SNI and the name required of
+    /// the peer leaf's `dNSName` SAN. One parameter feeds both, so a
+    /// certificate selected by SNI is a certificate the name rule accepts.
+    expected_dns: [u8; MAX_EXPECTED_DNS],
+    expected_dns_len: usize,
+
+    /// Reason code of the most recent peer-certificate refusal
+    /// (`x509.rs` `CERT_ERR_*`), retained for diagnostics.
+    last_peer_auth_error: u32,
 
     /// KEY_VAULT slot handle for the identity private key, or -1 if the
     /// vault is unavailable. When >= 0, CertificateVerify signs via the
@@ -834,6 +870,17 @@ define_params! {
     // HTTP/1.1 so an h1-only proxy edge never negotiates h2 (workload_ingress §3).
     10, alpn_h1_only, u8, 0
         => |s, d, len| { s.alpn_h1_only = p_u8(d, len, 0, 0); };
+
+    // Peer-authentication profile. `none` is not a permissive default: a
+    // client-mode instance that still carries it refuses to construct.
+    11, peer_auth, u8, 0, enum { none=0, pinned=1, ca_dns=2, insecure_no_verify=255 }
+        => |s, d, len| { s.peer_auth = p_u8(d, len, 0, 0); };
+
+    // Certificate validity posture. `require` needs a synchronised wall
+    // clock and fails closed without one; `unchecked` records the operator's
+    // decision to run without lifetime containment.
+    12, clock_policy, u8, 0, enum { require=0, unchecked=1 }
+        => |s, d, len| { s.clock_policy = p_u8(d, len, 0, 0); };
 }
 
 // ============================================================================
@@ -875,9 +922,9 @@ pub unsafe extern "C" fn module_new(
     s.syscalls = syscalls;
     s.cert_len = 0;
     s.key_len = 0;
-    s.trust_domain_len = 0;
-    s.ca_pubkey_len = 0;
-    s.require_ca = false;
+    s.anchor_len = 0;
+    s.expected_dns_len = 0;
+    s.last_peer_auth_error = 0;
     s.key_vault_handle = -1;
     s.ecdh_pool_hit = 0;
     s.ecdh_fallback_keygen = 0;
@@ -936,6 +983,22 @@ pub unsafe extern "C" fn module_new(
 
     // Parse extended TLV for cert/key blobs
     parse_extended_params(s, params, params_len);
+
+    // Peer authentication is admitted here, before any channel is serviced:
+    // a client with no trust policy must fail before network readiness, not
+    // at its first byte (`.context/rfc_tls_peer_identity.md` §4.2).
+    if !peer_auth_admissible(s) {
+        let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust_cert_file, and verify_hostname for ca_dns)";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
+    if s.peer_auth == PROFILE_INSECURE_NO_VERIFY {
+        let msg = b"[tls] peer auth DISABLED - insecure_no_verify profile: the peer is encrypted to, not authenticated";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+    } else if s.clock_policy != CLOCK_POLICY_REQUIRE {
+        let msg = b"[tls] validity unchecked (clock_policy=unchecked): certificate lifetime is not enforced";
+        dev_log(sys, 2, msg.as_ptr(), msg.len());
+    }
 
     // Pre-compute ephemeral ECDH key pairs (one per session) during module_new.
     // This runs on the full kernel stack, avoiding PIC stack overflow.
@@ -1007,8 +1070,9 @@ pub unsafe extern "C" fn module_new(
     0
 }
 
-/// Parse extended TLV entries (cert_file tag 10, key_file tag 11, trust_domain tag 3)
-/// Scans the entire params blob. Extended entries use: tag + 0x00 + len_hi + len_lo format.
+/// Parse extended TLV entries: `cert_file` (10), `key_file` (11),
+/// `trust_cert_file` (12), `verify_hostname` (13). Scans the entire params
+/// blob; extended entries use `tag + 0x00 + len_hi + len_lo`.
 unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len: usize) {
     if params.is_null() || params_len < 4 {
         return;
@@ -1031,7 +1095,7 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
     while pos + 4 <= end {
         let tag = data[pos];
-        let ext_tags = tag == 3 || tag == 10 || tag == 11 || tag == 12;
+        let ext_tags = tag == 10 || tag == 11 || tag == 12 || tag == 13;
         if ext_tags && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let data_start = pos + 4;
@@ -1040,15 +1104,6 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
             }
 
             match tag {
-                3 => {
-                    let n = if len < 64 { len } else { 64 };
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(data_start),
-                        s.trust_domain.as_mut_ptr(),
-                        n,
-                    );
-                    s.trust_domain_len = n;
-                }
                 10 => {
                     let n = if len < MAX_CERT_LEN {
                         len
@@ -1072,16 +1127,27 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                     s.key_len = n;
                 }
                 12 => {
-                    // Trust anchor: parse the supplied CA certificate and
-                    // extract its subject public key for later verification
-                    // of peer certs. Enables require_ca.
-                    let ca_der = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
-                    if let Some(ca) = parse_certificate(ca_der) {
-                        let pk = ca.public_key;
-                        let n = if pk.len() <= 65 { pk.len() } else { 65 };
-                        core::ptr::copy_nonoverlapping(pk.as_ptr(), s.ca_pubkey.as_mut_ptr(), n);
-                        s.ca_pubkey_len = n as u8;
-                        s.require_ca = true;
+                    // Trust anchor, retained whole. An anchor that does not
+                    // parse under the supported profile is not stored, so
+                    // the admission check in `module_new` refuses the
+                    // instance rather than letting it run anchorless.
+                    let der = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
+                    if len <= MAX_CERT_LEN && parse_certificate(der).is_some() {
+                        core::ptr::copy_nonoverlapping(der.as_ptr(), s.anchor.as_mut_ptr(), len);
+                        s.anchor_len = len;
+                    }
+                }
+                13 => {
+                    // Expected DNS identity. Truncating a name would
+                    // authenticate a different one, so an over-long value is
+                    // dropped and the admission check refuses the instance.
+                    if len > 0 && len <= MAX_EXPECTED_DNS {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(data_start),
+                            s.expected_dns.as_mut_ptr(),
+                            len,
+                        );
+                        s.expected_dns_len = len;
                     }
                 }
                 _ => {}
@@ -1353,7 +1419,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
                 // unaffected: TLS is the sole accept-claimant on its channel.
                 let claim = if t == NET_MSG_CONNECTED {
-                    let tag = if pl > CONN_ID_LEN { payload[CONN_ID_LEN] } else { 0 };
+                    let tag = if pl > CONN_ID_LEN {
+                        payload[CONN_ID_LEN]
+                    } else {
+                        0
+                    };
                     let me = dev_requester_tag(sys);
                     tag == 0 || tag == me
                 } else if s.mode == 0 {
@@ -1838,17 +1908,31 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
 
                                 let sess = &mut s.sessions[idx];
-                                let enc_payload_len = encrypt_record_in_place(
+                                let enc_payload_len = match encrypt_record_in_place(
                                     sess.driver.suite,
                                     &mut sess.write_keys,
                                     CT_APPLICATION_DATA,
                                     rd,
                                     &mut rec[5..],
-                                );
-                                // Header written AFTER encrypt so
-                                // length reflects the actual
-                                // payload, including seq-wrap
-                                // (enc_payload_len == 0).
+                                ) {
+                                    Ok(n) => n,
+                                    Err(_) => {
+                                        // No record was produced and
+                                        // the AEAD seq did not move,
+                                        // so nothing is on the wire
+                                        // to desync. The session
+                                        // cannot continue: there is
+                                        // no rekey path.
+                                        let msg: &[u8] =
+                                            b"[tls] record encrypt refused; session->Error";
+                                        dev_log(sys, 3, msg.as_ptr(), msg.len());
+                                        s.sessions[idx].state = SessionState::Error;
+                                        tls_discard(sys, s.clear_in, remaining - rd);
+                                        break;
+                                    }
+                                };
+                                // Header written AFTER encrypt so the
+                                // length reflects the actual payload.
                                 *rec.as_mut_ptr() = CT_APPLICATION_DATA;
                                 *rec.as_mut_ptr().add(1) = 0x03;
                                 *rec.as_mut_ptr().add(2) = 0x03;
@@ -1962,7 +2046,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // For a CMD_CONNECT we're about to forward: the downstream tag
                 // to latch, deferred until the upstream write actually lands.
                 let mut arm_pending: Option<u8> = None;
-                if t == NET_CMD_CONNECT && (7..NET_SCRATCH_SIZE).contains(&rd) {
+                // A second refusal behind `module_new`'s. Construction already
+                // rejects a client with no peer-authentication profile, so this
+                // cannot fire today; it is here so a future construction path
+                // cannot reopen the hole without also passing this gate.
+                if t == NET_CMD_CONNECT && !peer_auth_admissible(s) {
+                    let tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
+                    let err = [(-1i8) as u8, tag]; // EPERM + downstream tag
+                    let _ = tls_write_or_count(
+                        s,
+                        s.clear_out,
+                        NET_MSG_ERROR,
+                        0,
+                        err.as_ptr(),
+                        err.len() as u16,
+                    );
+                    forward = false;
+                } else if t == NET_CMD_CONNECT && (7..NET_SCRATCH_SIZE).contains(&rd) {
                     let new_tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
                     if s.pending_connect_active {
                         // SERIALIZE: a connect is already in flight and TLS
@@ -2311,7 +2411,7 @@ unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: us
     let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut vc);
     let vc_hash = sha256(&vc[..vc_len]);
     let cv_body = &data[4..len];
-    if let Some((_scheme, sig_der)) = parse_certificate_verify(cv_body) {
+    if let Some(sig_der) = parse_certificate_verify_expecting(cv_body, SIG_ECDSA_SECP256R1_SHA256) {
         if let Some(raw_sig) = parse_der_signature(sig_der) {
             let pk = &sess.driver.peer_cert_pubkey[..sess.driver.peer_cert_pubkey_len as usize];
             return ecdsa_verify(pk, &vc_hash, &raw_sig);
@@ -2320,100 +2420,194 @@ unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: us
     false
 }
 
-/// Shared peer-certificate validation. Used by both the TCP-TLS
-/// path (`extract_peer_cert_key`) and the DTLS path
-/// (`dtls_state.rs::dtls_extract_peer_cert_pubkey`) so the same
-/// chain-of-trust + SPIFFE rules apply to every transport.
+/// Does this instance carry a complete peer-authentication profile for the
+/// role it is configured in?
 ///
-/// Returns false on any parse / validation failure — empty
-/// Certificate list, malformed leaf cert, signature failure
-/// against the configured CA, empty pubkey, or SPIFFE SAN
-/// mismatch. On success, the peer's raw subjectPublicKey is
-/// written into `driver.peer_cert_pubkey` (length in
-/// `peer_cert_pubkey_len`).
+/// Server mode with `verify_peer = 0` never authenticates a peer and is
+/// unaffected. Every other role — a TLS or DTLS client, and an mTLS server —
+/// needs exactly one profile with all of its material present. A profile
+/// naming trust material it was not given is not a weaker profile; it is not
+/// a profile.
+fn peer_auth_admissible(s: &TlsState) -> bool {
+    let authenticates = s.mode == MODE_CLIENT || s.verify_peer != 0;
+    if !authenticates {
+        return true;
+    }
+    match s.peer_auth {
+        PROFILE_PINNED => s.anchor_len > 0,
+        PROFILE_CA_DNS => {
+            if s.anchor_len == 0 {
+                return false;
+            }
+            // The mTLS server has no name to expect of a client; a client
+            // reaching a named service must have one, and it must be a name
+            // rather than an address (RFC 6066 §3).
+            if s.mode == MODE_CLIENT {
+                s.expected_dns_len > 0 && !is_ip_literal(&s.expected_dns[..s.expected_dns_len])
+            } else {
+                true
+            }
+        }
+        PROFILE_INSECURE_NO_VERIFY => true,
+        _ => false,
+    }
+}
+
+/// The policy every certificate acceptance in this module is decided under.
+/// Built from module state in one place so no call site can assemble a
+/// weaker one.
+fn chain_policy(s: &TlsState, require_eku: u8, now_unix_secs: u64) -> ChainPolicy<'_> {
+    // A server validating a client certificate has no DNS identity to
+    // expect: the name rule is the profile's, and mTLS clients are
+    // identified by their issuer, not by a hostname they do not serve.
+    let expected: &[u8] = if s.mode == MODE_CLIENT {
+        &s.expected_dns[..s.expected_dns_len]
+    } else {
+        &[]
+    };
+    ChainPolicy {
+        profile: s.peer_auth,
+        anchor_der: &s.anchor[..s.anchor_len],
+        expected_dns: expected,
+        now_unix_secs,
+        // Pinning carries its own lifetime policy: the operator rotates the
+        // pin (`.context/rfc_tls_peer_identity.md` §3.1).
+        require_clock: s.clock_policy == CLOCK_POLICY_REQUIRE && s.peer_auth == PROFILE_CA_DNS,
+        require_eku,
+    }
+}
+
+/// Validate a peer's Certificate message.
 ///
-/// Pass `None` for `ca_pubkey` to skip CA verification, or
-/// `None` for `trust_domain` to skip SPIFFE SAN matching.
-/// Downstream code (`verify_peer_cert_verify`, `emit_peer_identity`)
-/// relies on `peer_cert_pubkey_len > 0` as the marker that a real
-/// identity was bound; this helper guarantees that property
-/// only when *every* configured check passes.
-unsafe fn validate_and_extract_peer_cert(
-    hs_body: &[u8],
-    driver: &mut HandshakeDriver,
-    ca_pubkey: Option<&[u8]>,
-    trust_domain: Option<&[u8]>,
-) -> bool {
+/// The single certificate-acceptance decision for every transport this
+/// module drives. Returns [`CERT_OK`] or the reason code.
+unsafe fn peer_cert_reason(s: &TlsState, is_server: bool, hs_body: &[u8]) -> u32 {
+    // A server validates a client certificate and a client validates a
+    // server's, so the purpose the leaf must be authorised for is the role
+    // of the peer, not of this instance.
+    let require_eku = if is_server {
+        EKU_CLIENT_AUTH
+    } else {
+        EKU_SERVER_AUTH
+    };
+    let now = div_u64(dev_unix_millis(&*s.syscalls), 1000);
+    verify_chain(hs_body, &chain_policy(s, require_eku, now))
+}
+
+/// Bind the accepted leaf's subject public key to `driver`.
+///
+/// Called only after [`peer_cert_reason`] returned [`CERT_OK`], so
+/// downstream code's use of `peer_cert_pubkey_len > 0` as the marker that a
+/// real identity was bound stays true.
+unsafe fn bind_peer_cert_key(driver: &mut HandshakeDriver, hs_body: &[u8]) -> u32 {
     let cert_der = match parse_certificate_msg(hs_body) {
         Some(d) => d,
-        None => return false,
+        None => return CERT_ERR_MSG_MALFORMED,
     };
     let cert = match parse_certificate(cert_der) {
         Some(c) => c,
-        None => return false,
+        None => return CERT_ERR_MALFORMED,
     };
-    if let Some(ca_pk) = ca_pubkey {
-        if !ca_pk.is_empty() {
-            // Chain-of-one path validation: leaf must be signed
-            // directly by the configured CA.
-            let tbs_hash = sha256(cert.tbs_raw);
-            let raw_sig = match parse_der_signature(cert.signature) {
-                Some(r) => r,
-                None => return false,
-            };
-            if !ecdsa_verify(ca_pk, &tbs_hash, &raw_sig) {
-                return false;
-            }
-        }
-    }
     let pk = cert.public_key;
-    if pk.is_empty() || pk.len() > 65 {
-        return false;
+    if !public_point_is_valid(pk) {
+        return CERT_ERR_BAD_KEY;
     }
     core::ptr::copy_nonoverlapping(pk.as_ptr(), driver.peer_cert_pubkey.as_mut_ptr(), pk.len());
     driver.peer_cert_pubkey_len = pk.len() as u8;
-    if let Some(td) = trust_domain {
-        if !td.is_empty() {
-            let mut spiffe_ok = false;
-            extract_san_uris(cert_der, |uri| {
-                if is_spiffe_match(uri, td) {
-                    spiffe_ok = true;
-                }
-                spiffe_ok
-            });
-            if !spiffe_ok {
-                return false;
-            }
-        }
+    CERT_OK
+}
+
+/// TCP-TLS adapter: validate, bind, and report. Returns false when the peer
+/// is refused, leaving the session for the caller to fail.
+unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8]) -> bool {
+    let is_server = s.sessions[idx].driver.is_server;
+    let mut rc = peer_cert_reason(s, is_server, hs_body);
+    if rc == CERT_OK {
+        rc = bind_peer_cert_key(&mut s.sessions[idx].driver, hs_body);
     }
+    if rc != CERT_OK {
+        let conn_id = s.sessions[idx].conn_id;
+        log_peer_auth_failure(s, conn_id, rc);
+        send_alert(s, idx, cert_error_alert(rc));
+        return false;
+    }
+    s.last_peer_auth_error = CERT_OK;
     true
 }
 
-/// TCP-TLS adapter: pulls the configured CA pubkey + trust domain
-/// off `TlsState` and delegates to `validate_and_extract_peer_cert`.
-unsafe fn extract_peer_cert_key(s: &mut TlsState, idx: usize, hs_body: &[u8]) -> bool {
-    let ca_pk = if s.require_ca && s.ca_pubkey_len > 0 {
-        Some(&s.ca_pubkey[..s.ca_pubkey_len as usize])
-    } else {
-        None
-    };
-    let td = if s.trust_domain_len > 0 {
-        Some(&s.trust_domain[..s.trust_domain_len])
-    } else {
-        None
-    };
-    validate_and_extract_peer_cert(hs_body, &mut s.sessions[idx].driver, ca_pk, td)
+/// Report a refusal at error level, naming the profile and the reason so an
+/// operator can tell wrong-authority from wrong-name from expired.
+unsafe fn log_peer_auth_failure(s: &mut TlsState, conn_id: u16, rc: u32) {
+    s.last_peer_auth_error = rc;
+    let sys = &*s.syscalls;
+    let mut buf = [0u8; 96];
+    let mut pos = 0usize;
+    for part in [
+        b"[tls] peer auth FAIL conn=" as &[u8],
+        b"",
+        b" profile=",
+        peer_auth_text(s.peer_auth),
+        b" reason=",
+        cert_error_text(rc),
+    ] {
+        if part.is_empty() {
+            pos += fmt_u32_dec(conn_id as u32, buf.as_mut_ptr().add(pos));
+            continue;
+        }
+        let mut k = 0;
+        while k < part.len() && pos < buf.len() {
+            buf[pos] = part[k];
+            pos += 1;
+            k += 1;
+        }
+    }
+    dev_log(sys, 1, buf.as_ptr(), pos);
 }
 
-/// Skip any CCS records at the front of a session's recv_buf.
+fn peer_auth_text(profile: u8) -> &'static [u8] {
+    match profile {
+        PROFILE_PINNED => b"pinned",
+        PROFILE_CA_DNS => b"ca_dns",
+        PROFILE_INSECURE_NO_VERIFY => b"insecure_no_verify",
+        _ => b"none",
+    }
+}
+
+/// The most compatibility ChangeCipherSpec records one session will
+/// consume. A TLS 1.3 peer sends at most one (immediately after its
+/// first flight); the second is slack for a HelloRetryRequest
+/// exchange. Beyond that a CCS stream is just work an unauthenticated
+/// peer can ask for.
+const MAX_COMPAT_CCS: u8 = 2;
+
+/// Consume compatibility ChangeCipherSpec records at the front of a
+/// session's recv_buf.
+///
+/// RFC 8446 appendix D.4 admits CCS only during the handshake, and
+/// only in the single fixed form `CCS_COMPAT_RECORD`. This function is
+/// reached only from the handshake record drain, which is that window;
+/// any other length or payload is rejected rather than skipped,
+/// because a CCS with a body is a TLS 1.2-shaped message and accepting
+/// it would let a peer steer the parser.
 unsafe fn skip_ccs(sess: &mut TlsSession) {
     while sess.recv_len >= 5 && *sess.recv_buf.as_ptr() == CT_CHANGE_CIPHER_SPEC {
-        let p = sess.recv_buf.as_ptr();
-        let ccs_len = ((*p.add(3) as usize) << 8) | (*p.add(4) as usize);
-        let consumed = 5 + ccs_len;
-        if sess.recv_len < consumed || consumed > RECV_BUF_SIZE {
-            break;
+        if sess.recv_len < CCS_COMPAT_RECORD.len() {
+            return; // Incomplete — wait for the remaining bytes.
         }
+        let mut i = 0;
+        while i < CCS_COMPAT_RECORD.len() {
+            if sess.recv_buf[i] != CCS_COMPAT_RECORD[i] {
+                sess.state = SessionState::Error;
+                return;
+            }
+            i += 1;
+        }
+        if sess.ccs_seen >= MAX_COMPAT_CCS {
+            sess.state = SessionState::Error;
+            return;
+        }
+        sess.ccs_seen += 1;
+        let consumed = CCS_COMPAT_RECORD.len();
         let remain = sess.recv_len - consumed;
         if remain > 0 {
             core::ptr::copy(
@@ -2666,10 +2860,18 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
     let _sys = &*s.syscalls;
     let sess = &mut s.sessions[idx];
     skip_ccs(sess);
+    if sess.state == SessionState::Error {
+        return false;
+    }
     if sess.recv_len < 5 {
         return false;
     }
     let rec_type = sess.recv_buf[0];
+    let legacy_version = [sess.recv_buf[1], sess.recv_buf[2]];
+    if !is_legal_record_type(rec_type) || !legacy_version_ok(&legacy_version) {
+        sess.state = SessionState::Error;
+        return false;
+    }
     let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
     if rec_len > MAX_CIPHERTEXT || rec_len > RECV_BUF_SIZE {
         sess.state = SessionState::Error;
@@ -2706,19 +2908,12 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
         sess.driver.in_len += rec_len;
     } else {
         if rec_type != CT_APPLICATION_DATA {
-            // Plaintext records after handshake keys are derived
-            // shouldn't appear; drop the record and signal progress.
-            let consumed = 5 + rec_len;
-            let remain = sess.recv_len - consumed;
-            if remain > 0 {
-                core::ptr::copy(
-                    sess.recv_buf.as_ptr().add(consumed),
-                    sess.recv_buf.as_mut_ptr(),
-                    remain,
-                );
-            }
-            sess.recv_len = remain;
-            return true;
+            // Once read keys exist every record from the peer is
+            // authenticated. A plaintext record here is either a
+            // downgrade attempt or an injection, and silently dropping
+            // it invites the sender to keep going.
+            sess.state = SessionState::Error;
+            return false;
         }
         let mut hdr = [0u8; 5];
         core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
@@ -2731,6 +2926,16 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             &mut ct[..rec_len],
         ) {
             Some((pt_len, inner_type)) => {
+                if !is_legal_inner_type(inner_type) {
+                    sess.state = SessionState::Error;
+                    return false;
+                }
+                if inner_type == CT_ALERT && pt_len != 2 {
+                    // RFC 8446 §6: an Alert body is exactly
+                    // level(1) || description(1).
+                    sess.state = SessionState::Error;
+                    return false;
+                }
                 if inner_type == CT_HANDSHAKE {
                     let space = HS_IO_BUF_SIZE - sess.driver.in_len;
                     if pt_len > space {
@@ -2743,8 +2948,8 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
                     );
                     sess.driver.in_len += pt_len;
                 }
-                // Other inner types (alert, app data) are handled
-                // outside the handshake path; drop here.
+                // Alerts and application data are handled outside the
+                // handshake path; drop here.
             }
             None => {
                 sess.state = SessionState::Error;
@@ -2810,20 +3015,36 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
         } else {
             let sess = &mut s.sessions[idx];
             let suite = sess.driver.suite;
-            let mut enc_buf = [0u8; SEND_BUF_SIZE];
-            let enc_len = encrypt_record(
+            // Encrypt straight into the wire-record buffer. `rec` is
+            // sized for the largest handshake message plus the inner
+            // content-type byte, the AEAD tag and the record header;
+            // `encrypt_record_in_place` re-checks that before writing.
+            core::ptr::copy_nonoverlapping(
+                sess.driver.out_buf.as_ptr(),
+                rec.as_mut_ptr().add(5),
+                total,
+            );
+            let enc_len = match encrypt_record_in_place(
                 suite,
                 &mut sess.write_keys,
                 CT_HANDSHAKE,
-                &sess.driver.out_buf[..total],
-                &mut enc_buf,
-            );
+                total,
+                &mut rec[5..],
+            ) {
+                Ok(n) => n,
+                Err(_) => {
+                    // Nothing was emitted and the AEAD seq did not
+                    // move, so the peer is not desynced — but the
+                    // handshake cannot make progress either.
+                    s.sessions[idx].state = SessionState::Error;
+                    return;
+                }
+            };
             rec[0] = CT_APPLICATION_DATA;
             rec[1] = 0x03;
             rec[2] = 0x03;
             rec[3] = (enc_len >> 8) as u8;
             rec[4] = enc_len as u8;
-            core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), rec.as_mut_ptr().add(5), enc_len);
             rec_len = 5 + enc_len;
         }
 
@@ -3056,7 +3277,11 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     }
 
     match ch.key_share {
-        Some((_, key_data)) if key_data.len() <= 65 => {
+        // The key share is a peer-supplied point; admit it only if
+        // it decodes to a canonical, on-curve, non-identity P-256
+        // point. Anything else falls through to the no-usable-share
+        // branch below rather than reaching the ECDH ladder.
+        Some((_, key_data)) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 sess.driver.peer_key_share.as_mut_ptr(),
@@ -3146,7 +3371,7 @@ unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                 t.update(&data[..len]);
             }
-            if !extract_peer_cert_key(s, idx, &data[4..len]) {
+            if !session_verify_peer_cert(s, idx, &data[4..len]) {
                 s.sessions[idx].state = SessionState::Error;
                 return true;
             }
@@ -3307,11 +3532,19 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
         } else if s.key_len > 32 {
             extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
         }
-        sess.driver.ecdsa_sign_state = ecdsa_sign_init(&priv_key, &vc_hash, bits_per_step);
+        let started = ecdsa_sign_init(&priv_key, &vc_hash, bits_per_step);
         let mut j = 0;
         while j < 32 {
             core::ptr::write_volatile(&mut priv_key[j], 0);
             j += 1;
+        }
+        match started {
+            Some(st) => sess.driver.ecdsa_sign_state = st,
+            None => {
+                // The configured identity key is not a usable P-256
+                // scalar (absent, or outside [1, n-1]).
+                sess.driver.hs_state = HandshakeState::Error;
+            }
         }
         return true;
     }
@@ -3633,6 +3866,18 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // offer `h2`, or the peer selects it and the plain-text request is
     // read as a bogus HTTP/2 preface.
     let alpn_h1_only = s.alpn_h1_only != 0;
+    // SNI is emitted only when a DNS identity is the thing being
+    // authenticated (`.context/rfc_tls_peer_identity.md` §7). Under `pinned`
+    // there is no authenticated name, and disclosing an unauthenticated one
+    // would promise nothing.
+    let sni_len = if s.peer_auth == PROFILE_CA_DNS {
+        s.expected_dns_len
+    } else {
+        0
+    };
+    let mut sni_buf = [0u8; MAX_EXPECTED_DNS];
+    core::ptr::copy_nonoverlapping(s.expected_dns.as_ptr(), sni_buf.as_mut_ptr(), sni_len);
+    let sni = &sni_buf[..sni_len];
     let sess = &mut s.sessions[idx];
 
     let mut random = [0u8; 32];
@@ -3644,12 +3889,13 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     sess.driver.peer_session_id_len = 32;
 
     let alpn: &[u8] = if alpn_h1_only { b"http/1.1" } else { &[] };
-    let msg_len = build_client_hello_ext(
+    let msg_len = build_client_hello_sni(
         &random,
         &session_id,
         &sess.driver.ecdh_public,
         &[],
         alpn,
+        sni,
         TLS13_RECORD_SUITES,
         &mut sess.driver.scratch,
     );
@@ -3718,7 +3964,7 @@ unsafe fn pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
                 t.update(&data[..len]);
             }
-            if !extract_peer_cert_key(s, idx, &data[4..len]) {
+            if !session_verify_peer_cert(s, idx, &data[4..len]) {
                 s.sessions[idx].state = SessionState::Error;
                 return true;
             }
@@ -3780,29 +4026,172 @@ unsafe fn recv_encrypted_handshake(
     driver_read_handshake_message(&mut s.sessions[idx])
 }
 
+/// Re-derive one direction's traffic keys from the next application
+/// traffic secret (RFC 8446 §7.2) and restart that direction's record
+/// sequence at zero. Returns false when the session has no key
+/// schedule to advance, which is a state error rather than a
+/// recoverable condition.
+unsafe fn rotate_traffic_keys(sess: &mut TlsSession, inbound: bool) -> bool {
+    let suite = sess.driver.suite;
+    let hl = suite.hash_len();
+    let is_server = sess.driver.is_server;
+    let ks = match &mut sess.driver.key_schedule {
+        Some(k) => k,
+        None => return false,
+    };
+    let alg = ks.alg;
+    // A server reads the client's secret and writes the server's; a
+    // client is the mirror image.
+    let use_server_secret = inbound != is_server;
+    let secret = if use_server_secret {
+        &mut ks.server_app_secret
+    } else {
+        &mut ks.client_app_secret
+    };
+    advance_traffic_secret(alg, hl, secret);
+    let fresh = TrafficKeys::from_secret(suite, &secret[..hl]);
+    if inbound {
+        sess.read_keys = fresh;
+    } else {
+        sess.write_keys = fresh;
+    }
+    true
+}
+
+/// Emit a KeyUpdate of our own and rotate the write keys behind it.
+/// The message must be sealed under the *current* write keys, so the
+/// rotation happens only after the record is accepted.
+unsafe fn send_key_update(s: &mut TlsState, idx: usize, request_update: u8) -> bool {
+    let mut rec = [0u8; 5 + 5 + 17];
+    let body_len = build_key_update(request_update, &mut rec[5..]);
+    let (enc_len, conn_id) = {
+        let sess = &mut s.sessions[idx];
+        let n = match encrypt_record_in_place(
+            sess.driver.suite,
+            &mut sess.write_keys,
+            CT_HANDSHAKE,
+            body_len,
+            &mut rec[5..],
+        ) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        (n, sess.conn_id)
+    };
+    rec[0] = CT_APPLICATION_DATA;
+    rec[1] = 0x03;
+    rec[2] = 0x03;
+    rec[3] = (enc_len >> 8) as u8;
+    rec[4] = enc_len as u8;
+    let total = 5 + enc_len;
+    let cipher_chan = s.cipher_out;
+    if !tls_write_or_count(
+        s,
+        cipher_chan,
+        NET_CMD_SEND,
+        conn_id,
+        rec.as_ptr(),
+        total as u16,
+    ) {
+        return false;
+    }
+    rotate_traffic_keys(&mut s.sessions[idx], false)
+}
+
+/// Consume post-handshake handshake messages queued in the driver's
+/// inbound buffer by `try_decrypt_forward`.
+///
+/// Only two message types are legal once the session is Ready:
+/// KeyUpdate, which rotates the peer's traffic keys (and ours when the
+/// peer asks), and NewSessionTicket, which is structurally validated
+/// and discarded because resumption is not implemented. Anything else
+/// is an unexpected message and fails the session — the alternative,
+/// dropping it, leaves an attacker free to probe.
+unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
+    loop {
+        let (data, len, msg_type) = match s.sessions[idx].driver.read_handshake_message() {
+            Some(t) => t,
+            None => {
+                // Either an incomplete message (wait for more records)
+                // or an oversized one, which the reader has already
+                // marked on the driver.
+                if s.sessions[idx].driver.hs_state == HandshakeState::Error {
+                    s.sessions[idx].state = SessionState::Error;
+                }
+                return;
+            }
+        };
+        let body = &data[4..len];
+        match msg_type {
+            HT_KEY_UPDATE => {
+                let request = match parse_key_update(body) {
+                    Some(r) => r,
+                    None => {
+                        s.sessions[idx].state = SessionState::Error;
+                        return;
+                    }
+                };
+                // The peer's next record already uses the new keys, so
+                // rotate inbound before anything else is read.
+                if !rotate_traffic_keys(&mut s.sessions[idx], true) {
+                    s.sessions[idx].state = SessionState::Error;
+                    return;
+                }
+                if request == KEY_UPDATE_REQUESTED
+                    && !send_key_update(s, idx, KEY_UPDATE_NOT_REQUESTED)
+                {
+                    s.sessions[idx].state = SessionState::Error;
+                    return;
+                }
+            }
+            HT_NEW_SESSION_TICKET => {
+                if !parse_new_session_ticket_is_well_formed(body) {
+                    s.sessions[idx].state = SessionState::Error;
+                    return;
+                }
+                // Resumption is unsupported: the ticket is validated
+                // and dropped, never stored.
+            }
+            _ => {
+                s.sessions[idx].state = SessionState::Error;
+                return;
+            }
+        }
+    }
+}
+
 /// Send an encrypted alert via cipher_out channel
 unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
     let alert_body = build_alert(description);
-    let mut enc_buf = [0u8; 64];
+    let mut rec = [0u8; 69];
+    core::ptr::copy_nonoverlapping(
+        alert_body.as_ptr(),
+        rec.as_mut_ptr().add(5),
+        alert_body.len(),
+    );
     let (enc_len, conn_id) = {
         let sess = &mut s.sessions[idx];
-        let n = encrypt_record(
+        let n = match encrypt_record_in_place(
             sess.driver.suite,
             &mut sess.write_keys,
             CT_ALERT,
-            &alert_body,
-            &mut enc_buf,
-        );
+            alert_body.len(),
+            &mut rec[5..],
+        ) {
+            Ok(n) => n,
+            // A refused encrypt produces no record. Emitting a
+            // zero-length one instead would put a record on the wire
+            // that no peer can authenticate.
+            Err(_) => return,
+        };
         (n, sess.conn_id)
     };
 
-    let mut rec = [0u8; 69];
     *rec.as_mut_ptr() = CT_APPLICATION_DATA;
     *rec.as_mut_ptr().add(1) = 0x03;
     *rec.as_mut_ptr().add(2) = 0x03;
     *rec.as_mut_ptr().add(3) = (enc_len >> 8) as u8;
     *rec.as_mut_ptr().add(4) = enc_len as u8;
-    core::ptr::copy_nonoverlapping(enc_buf.as_ptr(), rec.as_mut_ptr().add(5), enc_len);
 
     let total = 5 + enc_len;
     // Alerts are advisory (RFC 8446 §6) — best-effort is fine.
@@ -4028,28 +4417,24 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
     }
 
     let rec_type = *sess.recv_buf.as_ptr();
+    let legacy_version = [
+        *sess.recv_buf.as_ptr().add(1),
+        *sess.recv_buf.as_ptr().add(2),
+    ];
     let rec_len = ((*sess.recv_buf.as_ptr().add(3) as usize) << 8)
         | (*sess.recv_buf.as_ptr().add(4) as usize);
     if sess.recv_len < 5 + rec_len {
         return;
     }
 
-    if rec_type == CT_CHANGE_CIPHER_SPEC {
-        // Skip CCS
-        let consumed = 5 + rec_len;
-        let remain = sess.recv_len - consumed;
-        if remain > 0 {
-            core::ptr::copy(
-                sess.recv_buf.as_ptr().add(consumed),
-                sess.recv_buf.as_mut_ptr(),
-                remain,
-            );
-        }
-        sess.recv_len = remain;
-        return;
-    }
-
-    if rec_type != CT_APPLICATION_DATA {
+    // The session is Ready, so the compatibility ChangeCipherSpec
+    // window has closed and every record must be authenticated. Any
+    // other outer type — CCS included — fails the session. Returning
+    // without consuming would leave the record at the head of the
+    // buffer and wedge the parser on it for the life of the
+    // connection.
+    if rec_type != CT_APPLICATION_DATA || !legacy_version_ok(&legacy_version) {
+        sess.state = SessionState::Error;
         return;
     }
 
@@ -4082,8 +4467,38 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         &mut ct[..rec_len],
     ) {
         Some((pt_len, inner_type)) => {
+            if !is_legal_inner_type(inner_type) {
+                sess.state = SessionState::Error;
+                return;
+            }
+            if inner_type == CT_HANDSHAKE {
+                // Post-handshake messages (KeyUpdate, NewSessionTicket)
+                // arrive on the same authenticated stream as
+                // application data and may be fragmented across
+                // records, so they go through the driver's
+                // reassembler. `sess` is released first: the handler
+                // needs the whole state to emit a KeyUpdate response.
+                let space = HS_IO_BUF_SIZE - sess.driver.in_len;
+                if pt_len > space {
+                    sess.state = SessionState::Error;
+                    return;
+                }
+                core::ptr::copy_nonoverlapping(
+                    ct.as_ptr(),
+                    sess.driver.in_buf.as_mut_ptr().add(sess.driver.in_len),
+                    pt_len,
+                );
+                sess.driver.in_len += pt_len;
+                drive_post_handshake(s, idx);
+                return;
+            }
             if inner_type == CT_ALERT {
-                if pt_len >= 2 && *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
+                // RFC 8446 §6: exactly level(1) || description(1).
+                if pt_len != 2 {
+                    sess.state = SessionState::Error;
+                    return;
+                }
+                if *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
                     sess.state = SessionState::Closed;
                     let conn_id = sess.conn_id;
                     // Best-effort close notification (sess borrow
@@ -4219,5 +4634,53 @@ pub mod test_helpers {
             .iter()
             .filter(|p| !matches!(p.phase, super::DtlsPhase::Idle))
             .count()
+    }
+
+    /// True once the session bound to `conn_id` has completed its handshake.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn session_is_ready(state: *const u8, conn_id: u16) -> bool {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .any(|sess| sess.conn_id == conn_id && sess.state == SessionState::Ready)
+    }
+
+    /// True once the session bound to `conn_id` has failed.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn session_is_error(state: *const u8, conn_id: u16) -> bool {
+        let s = &*(state as *const TlsState);
+        s.sessions.iter().any(|sess| {
+            sess.conn_id == conn_id
+                && matches!(
+                    sess.state,
+                    SessionState::Error | SessionState::Closed | SessionState::Closing
+                )
+        })
+    }
+
+    /// Reason code of the most recent peer-certificate refusal
+    /// (`x509.rs` `CERT_ERR_*`), so a test asserts why a peer was refused
+    /// rather than only that it was.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn last_peer_auth_error(state: *const u8) -> u32 {
+        let s = &*(state as *const TlsState);
+        s.last_peer_auth_error
+    }
+
+    /// The configured profile, anchor length, and expected DNS identity, so
+    /// a test can assert that configuration reached the module rather than
+    /// inferring it from behaviour.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn peer_auth_config(state: *const u8) -> (u8, usize, usize) {
+        let s = &*(state as *const TlsState);
+        (s.peer_auth, s.anchor_len, s.expected_dns_len)
     }
 }

@@ -646,12 +646,20 @@ unsafe fn pump_send_certificate_verify(s: &mut QuicState, idx: usize) -> bool {
     } else if s.key_len > 32 {
         extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
     }
-    let raw_sig = ecdsa_sign(&priv_key, &vc_hash, &k_random);
+    let signed = ecdsa_sign(&priv_key, &vc_hash, &k_random);
     let mut j = 0;
     while j < 32 {
         core::ptr::write_volatile(&mut priv_key[j], 0);
         j += 1;
     }
+    let raw_sig = match signed {
+        Some(sig) => sig,
+        None => {
+            // The configured identity key is not a usable P-256 scalar.
+            driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+    };
     let (der_sig, der_len) = encode_der_signature(&raw_sig);
     let msg_len = build_certificate_verify(&der_sig, der_len, &mut driver.scratch);
     if let Some(ref mut t) = driver.transcript {
@@ -1335,7 +1343,9 @@ unsafe fn pump_recv_certificate_verify(s: &mut QuicState, idx: usize) -> bool {
     let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut vc);
     let vc_hash = sha256(&vc[..vc_len]);
     let cv_body = &data[4..len];
-    let ok = if let Some((_scheme, sig_der)) = parse_certificate_verify(cv_body) {
+    let ok = if let Some(sig_der) =
+        parse_certificate_verify_expecting(cv_body, SIG_ECDSA_SECP256R1_SHA256)
+    {
         if let Some(raw_sig) = parse_der_signature(sig_der) {
             let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
             ecdsa_verify(pk, &vc_hash, &raw_sig)

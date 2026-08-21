@@ -20,7 +20,8 @@ means editing its row here in the same change.
 |---|---|---|---|---|---|---|
 | TCP/HTTP `conn_id` (net-proto wire) | u16 LE | 65535 | `MAX_TCP_CONNS` | modules/sdk/abi/config.rs | 256 | The id space does not bind — the connection table does. Raising the table past 256 first requires widening the datagram/packet `ep_id` (next row), which shares it |
 | datagram/packet `ep_id` (DG/PKT wire) | u8 | 256 | — | modules/sdk/contracts/net/datagram.rs | — | Allocated from the TCP connection table, so `MAX_TCP_CONNS` = 256 exactly saturates this width; it is the binding id if the table grows |
-| contract class (`required_caps` bitmask, fmod header) | u32 bit position | 32 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 32 | 28 of 32 positions assigned (including four reserved ids; excluding the kernel-internal dispatch bucket) (`STREAM_CLOCK` = 0x1C) — the tightest id headroom in the ABI; registration past the ceiling is refused EINVAL |
+| contract class (`required_caps` bitmask, fmod header) | u32 bit position | 32 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 32 | The tightest id headroom in the ABI; registration past the ceiling is refused EINVAL |
+| contract-class positions consumed | — | 32 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 28 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `STREAM_CLOCK` = 0x1C; **allocation is frozen there** and 0x1D–0x1F are held in reserve, so a new contract id is refused at manifest parse until the capability representation is widened |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
 | module index (exec_order, fault ids) | u8 | 256 | `MAX_MODULES` | modules/sdk/abi/config.rs | 128 | Deliberate keep at u8; reopen on multi-node density evidence. Dual asserts: `src/kernel/boot/config.rs`, `src/kernel/exec/scheduler/mod.rs` |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | 256 | The buffer arena binds first by orders of magnitude |
@@ -43,6 +44,9 @@ means editing its row here in the same change.
 | Provider chain depth per contract | `MAX_CHAIN_DEPTH` | src/kernel/module/provider.rs | — | Policy, per-profile (3 RP2040 / 4 RP2350 / 8 aarch64-host); registration past the ceiling is refused EBUSY |
 | KEY_VAULT key slots | `MAX_SLOTS` | src/kernel/security/key_vault.rs | 8 | Policy: generate/import with no free slot is refused ENOMEM |
 | fat32 open files | `MAX_OPEN_FILES` | modules/foundation/fat32/mod.rs | 8 | Policy: an open past the table is refused ENFILE |
+| DNS pending forwarded queries | `MAX_PENDING` | modules/foundation/dns/mod.rs | 8 | Policy: with every slot live and unexpired, a new query is answered SERVFAIL rather than displacing accepted work |
+| DNS configured host entries | `MAX_HOSTS` | modules/foundation/dns/mod.rs | 16 | Policy: `host=` parameters past the table are ignored at parse |
+| DNS domain name length | `MAX_NAME_LEN` | modules/foundation/dns/mod.rs | 255 | The RFC 1035 full-name ceiling; a longer QNAME is refused at parse. Distinct from the 63-byte per-label ceiling (`MAX_LABEL_LEN`) |
 | mount open handles | `MAX_OPEN` | modules/foundation/mount/mod.rs | 64 | Policy: an open past the router table is refused ENFILE |
 | OTA image layers | `MAX_LAYERS` | modules/foundation/ota_registry/mod.rs | 48 | Policy: sized to the 48-module fleet profile; a larger manifest is refused whole |
 | SMMU DMA map table | `MAX_DMA_MAPS` | modules/foundation/smmu/mod.rs | 32 | Policy: a map past the translation table is refused ENOMEM before any MMIO write |

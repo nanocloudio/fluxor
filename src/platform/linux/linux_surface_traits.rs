@@ -16,9 +16,9 @@
 //   * audio channels / rate — published by `linux_audio` into `SURFACE_AUDIO`
 //     when an audio sink is in the graph (0 when none).
 //
-// Params (manifest order → auto-assigned TLV tags from 10):
-//   width  (tag 10, u32)   — fallback geometry when no window backend
-//   height (tag 11, u32)
+// Params, declared with their TLV tags in `manifest.toml`:
+//   width  (u32) — fallback geometry when no window backend
+//   height (u32)
 
 // The pure scan / size-class / audio logic + its shared consts
 // (`SURFACE_AUDIO`, MODALITY_*, SIZE_*, size-class thresholds) live in the
@@ -35,8 +35,9 @@ pub(crate) static SURFACE_WINDOW_GEOM: AtomicU32 = AtomicU32::new(0);
 
 const LINUX_SURFACE_TRAITS_HASH: u32 = 0x9772_C0F3; // fnv1a32("linux_surface_traits")
 
-const ST_TAG_WIDTH: u8 = 10;
-const ST_TAG_HEIGHT: u8 = 11;
+use fluxor::platform::builtin_param_tags::linux_surface_traits::{
+    TAG_HEIGHT as ST_TAG_HEIGHT, TAG_WIDTH as ST_TAG_WIDTH,
+};
 
 /// Re-scan modality presence every N steps so USB hot-plug is noticed without
 /// scanning /proc every tick. Geometry + audio are cheap atomic loads and are

@@ -10,19 +10,73 @@ Source: `src/kernel/exec/scheduler/mod.rs`, `src/kernel/exec/isr_tier.rs`
 
 ## Tier surface
 
-| Tier | Wire byte (`exec_mode`) | Execution context | Cycle budget | Allowed syscalls | Use cases |
-|------|-------------------------|-------------------|--------------|------------------|-----------|
-| **0** Cooperative | 0 | Main scheduler loop, 1 ms tick | per-module `step_deadline_us` | full (heap, `provider_call`, `channel_*`) | most modules |
-| **1a** High-rate cooperative | 1 | Sub-ms timer-driven cooperative tick | per-module `step_deadline_us` | full | audio loops, control loops |
-| **1b** Timer ISR | 2 | Polled-timer ISR (BCM2712: soft-polled from the scheduler thread; RP: real timer ISR) | `DEFAULT_ISR_BUDGET_CYCLES` (2000 cycles) | ISR-safe bridge ops only — see [ISR-tier I/O contract](#isr-tier-io-contract) | precise-cadence drivers |
-| **1c** Pre-pass drain | (per-module flag on a Tier 0/1a domain) | Cooperative, called at the start of every pass before `domain_exec_order` | combined `MAX_PRE_TICK_BUDGET_US` (5 µs) | full (cooperative) | NIC RX/TX, ARP-table drains |
-| **2** IRQ-owned | 4 | Per-IRQ ISR (dispatched via `isr_tier2_trampoline` bound through `hal::irq_bind`) | per-module budget | ISR-safe bridge ops only, from `module_isr_entry` | precise per-IRQ drivers |
-| **3** Poll | 3 | Continuous spin with WFE on idle | per-pass `domain_budget_us_limit` | full | tight polling loops |
+| Tier | Wire byte (`exec_mode`) | Execution context | Cycle budget | Budget enforcement | Allowed syscalls | Use cases |
+|------|-------------------------|-------------------|--------------|--------------------|------------------|-----------|
+| **0** Cooperative | 0 | Main scheduler loop, 1 ms tick | per-module `step_deadline_us` | Overrun is detected by the step guard, never pre-empted — see [Deadline enforcement](#deadline-enforcement) | full (heap, `provider_call`, `channel_*`) | most modules |
+| **1a** High-rate cooperative | 1 | Sub-ms timer-driven cooperative tick | per-module `step_deadline_us` | As Tier 0 | full | audio loops, control loops |
+| **1b** Timer ISR | 2 | Polled-timer ISR (BCM2712: soft-polled from the scheduler thread; RP: real timer ISR) | `DEFAULT_ISR_BUDGET_CYCLES` (2000 cycles) | Overruns are counted in the ISR metrics; the handler still runs to completion | ISR-safe bridge ops only — see [ISR-tier I/O contract](#isr-tier-io-contract) | precise-cadence drivers |
+| **1c** Pre-pass drain | (per-module flag on a Tier 0/1a domain) | Cooperative, called at the start of every pass before `domain_exec_order` | combined `MAX_PRE_TICK_BUDGET_US` (5 µs) | The pre-tick loop stops after the overrunning module returns; the rest wait for the next pass | full (cooperative) | NIC RX/TX, ARP-table drains |
+| **2** IRQ-owned | 4 | Per-IRQ ISR (dispatched via `isr_tier2_trampoline` bound through `hal::irq_bind`) | per-module budget | Overruns are counted in the ISR metrics; the handler still runs to completion | ISR-safe bridge ops only, from `module_isr_entry` | precise per-IRQ drivers |
+| **3** Poll | 3 | Continuous spin with WFE on idle | per-pass `domain_budget_us_limit` | The budget is checked between modules, rotating `exec_order_offset` rather than interrupting a step | full | tight polling loops |
 
 Wire-byte values are stable: changing the byte mapping would break
 already-built `.cfg.bin` blobs, so a new tier always reserves a fresh
 value rather than renumbering, which is why the tier ordering and the
 byte ordering differ (`1b → 2`, `2 → 4`).
+
+## Deadline enforcement
+
+Source: `src/kernel/exec/step_guard.rs`,
+`src/kernel/exec/scheduler/domain_budget.rs`,
+`src/kernel/exec/scheduler/stepping.rs`
+
+The per-module step deadline is a detection threshold, not a
+pre-emption mechanism. Before each `module_step()` the scheduler arms
+the step guard with the module's `effective_deadline_us()` (its
+declared `step_deadline_us`, or `DEFAULT_STEP_DEADLINE_US`, 2 ms, when
+it declares none) and disarms it on return. No target takes the
+processor back from a cooperative module that has already exceeded its
+deadline; what differs between targets is only how promptly the
+overrun is noticed.
+
+| Target | Guard mechanism | Overrun observed |
+|--------|-----------------|------------------|
+| RP2350, RP2040 | One-shot hardware alarm (TIMER1 alarm 0, TIMER alarm 3) whose ISR sets a per-core timeout flag | At the deadline, while the step is still running |
+| BCM2712 (AArch64) | Advisory elapsed-time comparison against `CNTPCT_EL0`, evaluated in the post-step check | After the step returns |
+| Linux host | None; the guard entry points are no-ops | Never observed |
+| WASM host | None; the guard entry points are no-ops | Never observed |
+
+On the RP family the alarm ISR records the overrun and disables the
+alarm, then returns to the interrupted module, which keeps running
+until it returns of its own accord. The forced-return trampoline that
+rewrites the stacked return address belongs to the memory-protection
+fault path (`src/platform/rp/mpu.rs`), not to the step guard. The one
+place the early flag changes scheduling is a `Burst` re-step loop: the
+loop tests the flag between iterations, so a module that overruns its
+burst deadline (its declared `step_deadline_burst_us`, or
+`step_deadline_us * BURST_MULTIPLIER`) stops re-stepping at the next
+iteration boundary rather than at the end of the loop.
+
+Once the scheduler observes the flag it calls `handle_step_timeout`,
+which records the fault against the module (fault counter, a `[guard]`
+warning, and a `MON_FAULT` record in the fault ring) and then applies
+the module's `FaultPolicy`:
+
+- `Tolerate` records the overrun and nothing else; the module keeps
+  running. This is the policy for modules whose synchronous device
+  operations carry a legitimate heavy tail, such as a storage module
+  stalled behind a device cache flush.
+- `Restart`, while the module is below `max_restarts`, moves it to
+  `Faulted` and holds it out of the step loop for a geometric backoff.
+- Otherwise the module moves to `Terminated`, is finalised, and leaves
+  the active set; a declared `quarantine_partner` that also faulted
+  inside the quarantine window is terminated with it.
+
+The practical consequence for timing claims: a deadline that produces
+a prompt fault record on RP silicon is inert on the Linux and WASM
+hosts, where the guard never fires. Deadline behaviour observed on a
+host does not carry over to the embedded targets, and on no target
+does the deadline bound the duration of a single step.
 
 ## Where tier is declared
 
@@ -246,6 +300,8 @@ Tier 1c pre-pass dispatch:
 
 - Tier 0 cooperative stepping honours per-module period gating, the
   fault state machine, and `Done` finalisation.
+- A step deadline bounds nothing on its own: an overrun is detected,
+  recorded, and acted on by fault policy, never pre-empted mid-step.
 - Domains are stepped in isolation: a module only ever runs from its
   own domain's exec order (or pre-tick order).
 - A per-domain budget overrun rotates `exec_order_offset` so the same

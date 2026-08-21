@@ -1108,3 +1108,62 @@ pub fn validate_single_provider(
     Ok(())
 }
 
+/// Reject `fault_policy: restart` for a module whose manifest does not
+/// attest that it can resume after an arbitrary fault.
+///
+/// The kernel's restart path releases every provider handle the module
+/// owned, flushes every connected input / output / control channel, and
+/// then resumes the **same** state allocation: state is not zeroed and
+/// `module_new` is not re-called. A module carrying an invariant across
+/// steps therefore resumes with its own bookkeeping describing handles
+/// and in-flight work that no longer exist — silent corruption, not
+/// recovery. Nothing at instantiation time can infer whether that is
+/// safe, so the module attests it in its own manifest
+/// (`resume_after_fault = true`) and this is where the claim is required.
+///
+/// A module with no manifest in the map is not gated — the same
+/// convention the other validators in this file use for modules supplied
+/// from outside the resolved set.
+pub fn validate_fault_policy(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    let Some(entries) = config.get("modules").and_then(|m| m.as_array()) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if !module_names.iter().any(|m| m == name) {
+            continue;
+        }
+        if entry.get("fault_policy").and_then(|v| v.as_str()) != Some("restart") {
+            continue;
+        }
+        let Some(m) = manifests.get(name) else {
+            continue;
+        };
+        if m.resume_after_fault {
+            continue;
+        }
+        return Err(Error::Config(format!(
+            "module '{name}': fault_policy = \"restart\" requires the module to attest \
+             that it can resume after a fault, and `{name}`'s manifest does not. \
+             This policy does NOT re-instantiate the module: it releases every provider \
+             handle the module holds, flushes every connected channel, and resumes the \
+             SAME state allocation without zeroing it and without re-running \
+             `module_new`. A module with state that spans steps therefore resumes with \
+             stale handles and stale bookkeeping. Either add `resume_after_fault = true` \
+             to `{name}`'s manifest.toml (only if every externally visible transition \
+             completes inside one step, no provider handle is held across steps, and \
+             discarding in-flight channel data loses nothing the module's protocol does \
+             not already treat as loss), or choose `fault_policy: \"skip\"` to terminate \
+             the module and let the operator drain and reload, or \
+             `fault_policy: \"restart_graph\"` to re-instantiate the whole graph."
+        )));
+    }
+    Ok(())
+}
+

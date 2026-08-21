@@ -181,6 +181,24 @@ impl KeySchedule {
     }
 }
 
+/// Advance one direction's application traffic secret in place, per
+/// RFC 8446 §7.2:
+///
+///   application_traffic_secret_N+1 =
+///       HKDF-Expand-Label(application_traffic_secret_N,
+///                         "traffic upd", "", Hash.length)
+///
+/// The caller derives fresh `TrafficKeys` from the new secret and
+/// restarts that direction's record sequence at zero. Free-standing
+/// rather than a `KeySchedule` method so the caller can hold a mutable
+/// borrow of the single secret being advanced.
+pub fn advance_traffic_secret(alg: HashAlg, hash_len: usize, secret: &mut [u8; 48]) {
+    let mut next = [0u8; 48];
+    hkdf_expand_label(alg, &secret[..hash_len], b"traffic upd", &[], &mut next[..hash_len]);
+    *secret = next;
+    zeroize(&mut next);
+}
+
 /// Hash of empty input for the selected algorithm
 fn hash_empty(alg: HashAlg, out: &mut [u8]) {
     match alg {

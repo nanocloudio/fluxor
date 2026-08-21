@@ -10,6 +10,7 @@ required = true
 
 [[params]]
 name = "path"
+tag = 10
 type = "str"
 required = true
 

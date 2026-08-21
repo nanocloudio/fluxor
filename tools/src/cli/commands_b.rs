@@ -56,6 +56,12 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         if let Err(e) = crate::config::validate_continuity(&config, &module_names, &manifests) {
             result.add_error(e.to_string());
         }
+        // Resume-style fault recovery needs a manifest attestation; report
+        // it here so the diagnostic names the module rather than arriving
+        // as a generic dry-run failure below.
+        if let Err(e) = crate::config::validate_fault_policy(&config, &module_names, &manifests) {
+            result.add_error(e.to_string());
+        }
     }
 
     // Dry-run the full config-generation pipeline so missing

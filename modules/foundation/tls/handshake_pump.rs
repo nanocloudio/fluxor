@@ -198,7 +198,11 @@ unsafe fn pump_recv_server_hello_core(driver: &mut HandshakeDriver) -> bool {
         t.set_alg(driver.suite.hash_alg());
     }
     match sh.key_share {
-        Some((_, key_data)) if key_data.len() <= 65 => {
+        // The key share is a peer-supplied point; admit it only if
+        // it decodes to a canonical, on-curve, non-identity P-256
+        // point. Anything else falls through to the no-usable-share
+        // branch below rather than reaching the ECDH ladder.
+        Some((_, key_data)) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 driver.peer_key_share.as_mut_ptr(),
@@ -256,7 +260,9 @@ unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) -> boo
     let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut vc);
     let vc_hash = sha256(&vc[..vc_len]);
     let cv_body = &data[4..len];
-    let ok = if let Some((_scheme, sig_der)) = parse_certificate_verify(cv_body) {
+    let ok = if let Some(sig_der) =
+        parse_certificate_verify_expecting(cv_body, SIG_ECDSA_SECP256R1_SHA256)
+    {
         if let Some(raw_sig) = parse_der_signature(sig_der) {
             let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
             ecdsa_verify(pk, &vc_hash, &raw_sig)
@@ -301,20 +307,33 @@ unsafe fn pump_recv_server_finished_core(driver: &mut HandshakeDriver) -> bool {
             return true;
         }
     };
-    if let Some(ref ks) = driver.key_schedule {
-        let finished_key = ks.compute_finished(&ks.server_hs_secret);
-        let expected = ks.finished_verify_data(&finished_key[..hl], &transcript_hash[..hl]);
-        let fin = &data[4..4 + hl];
-        let mut diff = 0u8;
-        let mut i = 0;
-        while i < hl {
-            diff |= fin[i] ^ expected[i];
-            i += 1;
-        }
-        if diff != 0 {
+    // The body must be exactly the suite's hash length before it is
+    // read; the reassembler only guarantees the peer-declared length.
+    let fin = match parse_finished(&data[4..len], hl) {
+        Some(f) => f,
+        None => {
             driver.hs_state = HandshakeState::Error;
             return true;
         }
+    };
+    let ks = match &driver.key_schedule {
+        Some(k) => k,
+        None => {
+            driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+    };
+    let finished_key = ks.compute_finished(&ks.server_hs_secret);
+    let expected = ks.finished_verify_data(&finished_key[..hl], &transcript_hash[..hl]);
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < hl {
+        diff |= fin[i] ^ expected[i];
+        i += 1;
+    }
+    if diff != 0 {
+        driver.hs_state = HandshakeState::Error;
+        return true;
     }
     if let Some(ref mut t) = driver.transcript {
         t.update(&data[..len]);
@@ -399,7 +418,14 @@ unsafe fn pump_recv_client_finished_core(driver: &mut HandshakeDriver) -> bool {
     };
     let finished_key = ks.compute_finished(&ks.client_hs_secret);
     let expected = ks.finished_verify_data(&finished_key[..hl], &transcript_hash[..hl]);
-    let fin = &data[4..4 + hl];
+    // Exact suite hash length or nothing — see `parse_finished`.
+    let fin = match parse_finished(&data[4..len], hl) {
+        Some(f) => f,
+        None => {
+            driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+    };
     let mut diff = 0u8;
     let mut i = 0;
     while i < hl {

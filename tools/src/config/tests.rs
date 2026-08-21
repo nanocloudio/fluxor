@@ -1909,6 +1909,53 @@ mod continuity_tests {
         assert!(format!("{e:?}").contains("duplicate"), "got: {e:?}");
     }
 
+    /// `fault_policy: restart` resumes the module's existing state after
+    /// releasing its handles and flushing its channels. A module that has
+    /// not attested it can survive that must not be able to select it.
+    #[test]
+    fn fault_policy_restart_requires_the_manifest_attestation() {
+        let cfg = json!({"modules": [{"name": "a", "fault_policy": "restart"}]});
+
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), man(&[]));
+        let e = validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(msg.contains("resume_after_fault"), "got: {msg}");
+        assert!(
+            msg.contains("does NOT re-instantiate"),
+            "the diagnostic must say what the policy actually does; got: {msg}"
+        );
+
+        // With the attestation the same graph passes.
+        let mut m = HashMap::new();
+        m.insert(
+            "a".to_string(),
+            Manifest {
+                resume_after_fault: true,
+                ..Manifest::default()
+            },
+        );
+        validate_fault_policy(&cfg, &names(&["a"]), &m).unwrap();
+    }
+
+    /// Every other policy, and a graph with no policy at all, is
+    /// unaffected — the gate is specific to the resuming one.
+    #[test]
+    fn fault_policy_gate_ignores_the_other_policies() {
+        let mut m = HashMap::new();
+        m.insert("a".to_string(), man(&[]));
+        let n = names(&["a"]);
+        validate_fault_policy(&json!({}), &n, &m).unwrap();
+        for policy in ["skip", "restart_graph", "tolerate"] {
+            let cfg = json!({"modules": [{"name": "a", "fault_policy": policy}]});
+            validate_fault_policy(&cfg, &n, &m).unwrap();
+        }
+        // A module with no manifest in the resolved set is not gated,
+        // matching every other validator in this file.
+        let cfg = json!({"modules": [{"name": "a", "fault_policy": "restart"}]});
+        validate_fault_policy(&cfg, &n, &HashMap::new()).unwrap();
+    }
+
     #[test]
     fn single_provider_allows_distinct_and_absent_providers() {
         // A graph with no `provides` anywhere is unaffected.

@@ -27,6 +27,11 @@ pub struct ArpEntry {
     pub pin_count: u8,
     /// Step count of last MAC change (for rate limiting)
     pub last_update: u16,
+    /// Set when a permanent pin has outlived `ARP_PIN_REVALIDATE_AGE` and
+    /// must be reconfirmed by a fresh ARP exchange. Permanent pins are
+    /// exempt from ordinary expiry, so without this they would never be
+    /// re-checked against the segment.
+    pub revalidate: bool,
 }
 
 /// Minimum steps between MAC address changes for a given IP (rate limiting).
@@ -43,6 +48,7 @@ impl ArpEntry {
             pinned: false,
             pin_count: 0,
             last_update: 0,
+            revalidate: false,
         }
     }
 }
@@ -76,7 +82,73 @@ pub fn lookup(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32) -> Option<[u8; 6]> {
     None
 }
 
-/// Insert or update an ARP table entry.
+/// Refresh an existing mapping whose MAC is unchanged.
+///
+/// This is the only ARP-table mutation ordinary IPv4 traffic is allowed to
+/// perform. It keeps a busy peer's entry from aging out without letting
+/// unauthenticated L3 traffic install a mapping or move one to a new MAC —
+/// those require a correlated ARP exchange (see [`insert`]).
+///
+/// Returns `true` iff a matching entry was found and refreshed; `false`
+/// means the caller observed a mapping it is not permitted to create or
+/// change.
+pub fn refresh_same_mac(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6]) -> bool {
+    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
+    // array; the unique re-borrow is safe because the loop holds no other
+    // live reference into `table`.
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            let entry = &mut *table.as_mut_ptr().add(i);
+            if entry.valid && entry.ip == ip {
+                if entry.mac == mac {
+                    entry.age = 0;
+                    return true;
+                }
+                return false;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Invalidate the entry for `ip`, if any. Used to force a fresh resolution
+/// before a mapping is granted elevated status.
+pub fn invalidate(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+    // SAFETY: as for `refresh_same_mac`.
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            let entry = &mut *table.as_mut_ptr().add(i);
+            if entry.valid && entry.ip == ip {
+                *entry = ArpEntry::empty();
+                return;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Report whether a MAC change for `ip` would be refused by a pin. Lets the
+/// caller distinguish "the segment moved and we rejected it" from an
+/// ordinary cache miss in its metrics.
+pub fn pin_would_reject(table: &[ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6]) -> bool {
+    // SAFETY: as for `refresh_same_mac`; shared borrow only.
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            let entry = &*table.as_ptr().add(i);
+            if entry.valid && entry.ip == ip {
+                return entry.pinned && entry.mac != mac;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Insert or update an ARP table entry from a correlated ARP exchange.
 /// Respects pinning (active TCP connections) and rate limiting.
 ///
 /// # Safety
@@ -92,9 +164,11 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
         while i < ARP_TABLE_SIZE {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid && entry.ip == ip {
-                // If MAC is unchanged, just refresh age
+                // If MAC is unchanged, refresh age and clear any outstanding
+                // revalidation — the segment has just reconfirmed the entry.
                 if entry.mac == mac {
                     entry.age = 0;
+                    entry.revalidate = false;
                     return;
                 }
                 // Reject MAC change if entry is pinned (active TCP connection)
@@ -127,6 +201,7 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
                     pinned: false,
                     pin_count: 0,
                     last_update: step_count,
+                    revalidate: false,
                 };
                 return;
             }
@@ -154,6 +229,7 @@ pub fn insert(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32, mac: [u8; 6], ste
                 pinned: false,
                 pin_count: 0,
                 last_update: step_count,
+                revalidate: false,
             };
         }
         // If all entries are pinned, drop the new entry (defence: don't evict pinned)
@@ -201,7 +277,12 @@ pub fn unpin(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
 }
 
 /// Permanently pin the gateway ARP entry (set pin_count = 255).
-pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
+///
+/// Callers must resolve `ip` afresh first: pinning is what makes a mapping
+/// immune to later MAC changes, so promoting an entry that was already in
+/// the cache would make whatever installed it authoritative for the rest of
+/// the lease. Returns `true` iff an entry was found and pinned.
+pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) -> bool {
     // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
     // array; the unique re-borrow is safe because the loop holds no other
     // live reference into `table`.
@@ -212,18 +293,45 @@ pub fn pin_gateway(table: &mut [ArpEntry; ARP_TABLE_SIZE], ip: u32) {
             if entry.valid && entry.ip == ip {
                 entry.pinned = true;
                 entry.pin_count = 255; // permanent
-                return;
+                entry.revalidate = false;
+                entry.age = 0;
+                return true;
             }
             i += 1;
         }
     }
+    false
 }
 
-/// Age all ARP table entries (call periodically).
+/// Steps a permanent pin may go unconfirmed before it must be reconfirmed by
+/// a fresh ARP exchange. Permanent pins are exempt from ordinary expiry, so
+/// without an explicit revalidation term a pin taken once at lease time
+/// would stay authoritative for the life of the boot.
+pub const ARP_PIN_REVALIDATE_AGE: u16 = 12000;
+
+/// Address of an entry needing revalidation, or `None`.
+pub fn revalidation_due(table: &[ArpEntry; ARP_TABLE_SIZE]) -> Option<u32> {
+    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)`; shared borrow only.
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            let entry = &*table.as_ptr().add(i);
+            if entry.valid && entry.revalidate {
+                return Some(entry.ip);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Age all ARP table entries (call periodically). Returns the number of
+/// permanent pins that entered revalidation on this pass.
 ///
 /// # Safety
 /// Uses raw pointer access to avoid bounds checks in PIC.
-pub fn age_entries(table: &mut [ArpEntry; ARP_TABLE_SIZE]) {
+pub fn age_entries(table: &mut [ArpEntry; ARP_TABLE_SIZE]) -> u32 {
+    let mut revalidations = 0u32;
     // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the fixed-size
     // array; the unique re-borrow is safe because the loop holds no other
     // live reference into `table`.
@@ -233,21 +341,39 @@ pub fn age_entries(table: &mut [ArpEntry; ARP_TABLE_SIZE]) {
             let entry = &mut *table.as_mut_ptr().add(i);
             if entry.valid {
                 entry.age = entry.age.saturating_add(1);
-                // Expire entries after ~5 minutes (at ~20ms step rate = 15000 steps)
-                if entry.age > 15000 {
+                if entry.pin_count == 255 {
+                    // Permanent: never expires, but must be reconfirmed.
+                    if entry.age > ARP_PIN_REVALIDATE_AGE && !entry.revalidate {
+                        entry.revalidate = true;
+                        revalidations += 1;
+                    }
+                } else if entry.age > 15000 {
+                    // Expire ordinary entries after ~5 minutes (at ~20ms step
+                    // rate = 15000 steps).
                     entry.valid = false;
                 }
             }
             i += 1;
         }
     }
+    revalidations
 }
 
-/// Parse an ARP packet and return (opcode, sender_ip, sender_mac, target_ip).
+/// A parsed ARP packet. `target_mac` is retained because correlating a reply
+/// needs the whole addressing quad, not just the sender's claim.
+pub struct ArpPacket {
+    pub opcode: u16,
+    pub sender_ip: u32,
+    pub sender_mac: [u8; 6],
+    pub target_ip: u32,
+    pub target_mac: [u8; 6],
+}
+
+/// Parse an ARP packet.
 ///
 /// # Safety
 /// `data` must point to at least `len` valid bytes of ARP payload (after eth header).
-pub unsafe fn parse_arp(data: *const u8, len: usize) -> Option<(u16, u32, [u8; 6], u32)> {
+pub unsafe fn parse_arp(data: *const u8, len: usize) -> Option<ArpPacket> {
     if len < ARP_HEADER_LEN {
         return None;
     }
@@ -283,11 +409,25 @@ pub unsafe fn parse_arp(data: *const u8, len: usize) -> Option<(u16, u32, [u8; 6
     let sender_ip =
         u32::from_be_bytes([*data.add(14), *data.add(15), *data.add(16), *data.add(17)]);
 
+    // Target hardware address (MAC) at offset 18
+    let mut target_mac = [0u8; 6];
+    i = 0;
+    while i < 6 {
+        *target_mac.as_mut_ptr().add(i) = *data.add(18 + i);
+        i += 1;
+    }
+
     // Target protocol address (IP) at offset 24
     let target_ip =
         u32::from_be_bytes([*data.add(24), *data.add(25), *data.add(26), *data.add(27)]);
 
-    Some((opcode, sender_ip, sender_mac, target_ip))
+    Some(ArpPacket {
+        opcode,
+        sender_ip,
+        sender_mac,
+        target_ip,
+        target_mac,
+    })
 }
 
 /// Build an ARP reply or request in `buf`.

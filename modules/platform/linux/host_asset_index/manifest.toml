@@ -30,6 +30,7 @@ content_type = "OctetStream"
 
 [[params]]
 name = "paths"
+tag = 10
 type = "str"
 required = true
 

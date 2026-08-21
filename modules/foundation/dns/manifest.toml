@@ -17,7 +17,7 @@ content_type = "NetProto"
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
 # cumulative byte counters; no-op when unwired. See standards/observability.md.
 [observability]
-metrics = ["bytes_in", "bytes_out"]
+metrics = ["bytes_in", "bytes_out", "upstream_drops", "forward_refusals"]
 # Span 0: one `dns.query` span per locally-resolved query (parse -> reply),
 # SERVER kind, rooting its own trace (DNS-over-UDP carries no inbound context).
 # Minted only when the telemetry port is wired and the query is head-sampled

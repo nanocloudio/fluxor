@@ -21,6 +21,59 @@
 // provider, so inbound ops see a raw slot. The tag is what lets
 // `provider_call` and `provider_query` (including `LAST_FENCE`)
 // resolve the contract from the handle through `fd_tag_contract`.
+//
+// ## Durability vocabulary
+//
+// Two independent things can be durable, and this contract keeps them
+// separate because a consumer's recovery depends on both:
+//
+//   - **Byte durability** — the file's contents, plus the size metadata
+//     of its own entry. Fenced by `FSYNC` (blocking) or by
+//     `FSYNC_SUBMIT`/`FSYNC_POLL` (pipelined). `WRITE` and `WRITE_ASYNC`
+//     are both submission only: bytes are volatile until a fence.
+//   - **Name durability** — the entry in the parent directory that lets
+//     a later mount *find* the file. Fenced by `FSYNC_NAME`, or achieved
+//     as part of `RENAME`.
+//
+// File `FSYNC` is not name publication on any provider. A consumer that
+// creates a recovery artefact and fsyncs only its FD can crash into a
+// state where durable bytes have no discoverable name. Durable
+// publication is one of two shapes:
+//
+//   1. `OPEN_CREATE`(final) → `WRITE` → `FSYNC` → `FSYNC_NAME`(final).
+//      Crash-visible outcomes: name absent, or name present with a
+//      prefix of the bytes. Use when the artefact is self-describing
+//      (a WAL segment with an in-band terminator, a checksummed record
+//      stream) so a truncated tail is recoverable.
+//   2. `OPEN_CREATE`(temp) → `WRITE` → `FSYNC` → `CLOSE` →
+//      `RENAME`(temp → final). Crash-visible outcomes: the old name, or
+//      the new complete artefact. Use when the artefact must be
+//      all-or-nothing (a snapshot, a pointer record, a content-addressed
+//      body).
+//
+// Each achieves `Fence::LocalDurable { device_id }` at its final step,
+// and nothing weaker at the steps before it. `MKDIR` and `UNLINK`
+// likewise publish a name only once `FSYNC_NAME` covers the path.
+//
+// Both `FSYNC_NAME` and `RENAME` are optional capabilities. A consumer
+// that needs crash-safe publication MUST query `CAPS` and fail closed
+// when the bit it needs is clear, rather than proceeding on file
+// `FSYNC` alone.
+//
+// ### Why these live here and not only on `storage.namespace`
+//
+// `storage.namespace` (0x13__) is the canonical naming surface, and
+// `OPEN_CREATE`/`MKDIR` are already documented as fused `BIND` + open
+// forms — see `namespace.rs::BIND`. `FSYNC_NAME` and `RENAME` complete
+// that fusion rather than competing with it: a filesystem provider whose
+// directory entries live inside the byte tier publishes names through
+// this surface, and a split provider (an index without bytes) publishes
+// them through `storage.namespace`. Requiring every consumer to hold a
+// second namespace-provider handle to fence a name it minted through
+// this contract would make the two surfaces mandatory in pairs, which
+// the split-provider design exists to avoid. The equivalence still
+// binds: `FSYNC_NAME` after `OPEN_CREATE`, and `RENAME` here, achieve
+// the same fence as `BIND` and `RENAME` there.
 
 pub const OPEN: u32 = 0x0900;
 pub const READ: u32 = 0x0901;
@@ -31,7 +84,13 @@ pub const READ: u32 = 0x0901;
 pub const SEEK: u32 = 0x0902;
 pub const CLOSE: u32 = 0x0903;
 pub const STAT: u32 = 0x0904;
-/// Sync file data to disk. handle=file. Returns 0 or negative errno.
+/// Blocking byte-durability fence: commit this file's contents and its
+/// own recorded size past the device's volatile cache. `handle=file`.
+/// Returns 0 or negative errno; the achieved fence is
+/// `LocalDurable { device_id }`.
+///
+/// It does NOT publish the name that finds the file — see [`FSYNC_NAME`]
+/// and the durability vocabulary at the top of this file.
 pub const FSYNC: u32 = 0x0905;
 /// Write data. handle=file, arg=data, arg_len=data_len. Returns bytes written.
 pub const WRITE: u32 = 0x0906;
@@ -144,30 +203,150 @@ pub const MKDIR: u32 = 0x090B;
 /// return `ENOSYS` and leave [`caps::PREALLOCATE`] clear.
 pub const PREALLOCATE: u32 = 0x090E;
 
-/// Write data through an FD **without** the synchronous durability the
-/// plain [`WRITE`] path implies — the provider submits the sectors to
-/// the block source's async ring (multiple in flight) and returns. The
-/// caller establishes durability with [`FSYNC_SUBMIT`] / [`FSYNC_POLL`].
-/// Same arg shape as [`WRITE`] (`handle=file`, `arg=data`,
+/// Write data through an FD that submits now and proves durability
+/// later — the provider hands the sectors to the block source's async
+/// ring (multiple in flight) and returns. Like plain [`WRITE`], the
+/// bytes are submitted but volatile; the caller establishes durability
+/// with [`FSYNC_SUBMIT`] / [`FSYNC_POLL`] instead of the blocking
+/// [`FSYNC`]. Same arg shape as [`WRITE`] (`handle=file`, `arg=data`,
 /// `arg_len=len`). Lets a durable append log (the WAL) pipeline its
 /// writes instead of spin-polling each, the single biggest write-
 /// throughput lever. Providers without the async tier return `ENOSYS`
 /// and leave [`caps::FSYNC_ASYNC`] clear; callers fall back to `WRITE`.
+///
+/// A short return is backpressure, not an error: the provider accepted
+/// the returned prefix and the caller rewinds and retries the rest.
 pub const WRITE_ASYNC: u32 = 0x090F;
 
-/// Open a non-blocking durability fence over every async write issued on
-/// this FD so far. `handle=file`; `arg` is a ≥8-byte output buffer that
-/// receives a `u64` LE ticket. Returns 0. The caller polls the ticket
-/// with [`FSYNC_POLL`] until it reports durable. Flushes any pending
-/// deferred sector into the async ring first so the fence covers it.
+/// Open a non-blocking durability fence over every write issued on this
+/// FD so far. `handle=file`; `arg` is a ≥8-byte output buffer that
+/// receives an opaque `u64` LE ticket. Returns 0, or `EAGAIN` when the
+/// provider has no free fence slot (bounded pipelining depth — retry the
+/// submit on a later step). The caller polls the ticket with
+/// [`FSYNC_POLL`] until it reports durable. Any pending deferred sector
+/// is submitted first so the fence covers it.
+///
+/// ## The ticket snapshots a frontier
+///
+/// A ticket is answerable for the file extent that existed at submit —
+/// its byte range **and** its file-size metadata. Callers may keep
+/// writing, growing the file, while the ticket is outstanding; those
+/// later bytes are not attributed to it. Tickets may be polled in any
+/// order and several may be outstanding on one FD.
+///
+/// The provider, not the caller, owns the directory/inode metadata that
+/// records the frontier. A caller never publishes size itself, and no
+/// provider may publish a frontier newer than the polled ticket's.
+///
+/// The ticket is opaque and provider-scoped: it is valid only on the FD
+/// that produced it, and only until that FD is closed. Presenting it on
+/// another FD, or after `CLOSE`, returns `EINVAL` — never a false
+/// durable.
 pub const FSYNC_SUBMIT: u32 = 0x0910;
 
 /// Non-blocking poll of a fence ticket from [`FSYNC_SUBMIT`].
-/// `handle=file`; `arg` holds the `u64` LE ticket. Returns 0 = durable
-/// (all fenced writes are on non-volatile media), 1 = pending, or a
-/// negative errno if a fenced write failed. The caller (WAL) must
-/// withhold its durable acknowledgement until this returns 0.
+/// `handle=file`; `arg` holds the `u64` LE ticket. Returns 0 = durable,
+/// 1 = pending, or a negative errno if a fenced write failed or the
+/// ticket is not live on this FD. The caller (WAL) must withhold its
+/// durable acknowledgement until this returns 0.
+///
+/// ## Exact meaning of a successful poll
+///
+/// A 0 return proves that every byte written to this FD before the
+/// ticket's [`FSYNC_SUBMIT`], and file-size metadata recording at least
+/// that frontier, are on non-volatile media — the device write cache
+/// included. Data reaches media before the metadata that describes it,
+/// so a crash can never expose a size pointing past durable bytes.
+///
+/// It is a **lower bound**. Writes issued after the submit may also have
+/// reached media, and the recorded size may be larger than the ticket's
+/// frontier. Neither makes the result invalid; a consumer must not
+/// require a fence to stop exactly at its frontier.
+///
+/// ## Failure and backpressure
+///
+/// A negative return latches: the covered writes are unprovable, the FD
+/// does not become `LocalDurable`, and the caller must treat the fence
+/// as failed and recover through checked [`WRITE`] + [`FSYNC`]. A `1`
+/// return may mean either "device writes outstanding" or "metadata
+/// publication is queued behind a full ring"; both clear by polling
+/// again on a later step, and neither consumes the ticket.
+///
+/// ## Name publication is a different fence
+///
+/// This fence covers an existing entry's contents and size frontier. It
+/// says nothing about whether the *name* that finds the file is durable
+/// in its parent directory — see [`FSYNC_NAME`].
 pub const FSYNC_POLL: u32 = 0x0911;
+
+/// Durably publish the parent-directory entry naming `path`.
+///
+/// `handle = -1`; `arg` points at the UTF-8 path (no NUL terminator),
+/// `arg_len` is its length. Returns `0` on success or a negative errno.
+///
+/// ## Why the byte tier needs this opcode
+///
+/// [`FSYNC`] and [`FSYNC_POLL`] fence a file's *bytes and its own size
+/// metadata* through an open FD. Neither publishes the directory entry
+/// that lets a later mount find the file by name. A consumer that
+/// creates a recovery artefact with [`OPEN_CREATE`], writes it, and
+/// fsyncs the FD has durable bytes reachable by no durable name: after
+/// a power cut the file may be absent, or present with its old contents.
+/// `FSYNC_NAME` is the fence that closes that gap for the operations
+/// this contract already mints names with — [`OPEN_CREATE`], [`MKDIR`],
+/// and [`UNLINK`].
+///
+/// ## Ordering contract
+///
+/// The caller issues the naming operation, makes the file's bytes
+/// durable, then calls `FSYNC_NAME` on the path. On success the entry —
+/// creation, directory creation, or removal, whichever the caller last
+/// performed on that path — is on non-volatile media, and the achieved
+/// fence is `LocalDurable { device_id }`. Publishing a name before the
+/// bytes is legal but pointless: the fence proves only what its own
+/// call covers.
+///
+/// Providers without durable name publication return `ENOSYS` and leave
+/// [`caps::FSYNC_NAME`] clear. A consumer that needs crash-safe
+/// publication MUST check the bit and fail closed when it is absent
+/// rather than treating file [`FSYNC`] as name publication — it is not.
+pub const FSYNC_NAME: u32 = 0x0912;
+
+/// Rename an entry, publishing the new name durably.
+///
+/// `handle = -1`; `arg` is:
+///
+/// ```text
+///   [src_len: u16 LE]
+///   [src: src_len bytes UTF-8]
+///   [dst_len: u16 LE]
+///   [dst: dst_len bytes UTF-8]
+/// ```
+///
+/// Returns `0` on success or a negative errno. Normatively
+/// `storage.namespace::RENAME` fused into the byte tier — see
+/// `namespace.rs::RENAME`.
+///
+/// ## Guarantee
+///
+/// Success means a later mount observes either the old name or the new
+/// name, never a state where the bytes exist under no name. Both parent
+/// directories are durable on return, so the achieved fence is
+/// `LocalDurable { device_id }` and no follow-up [`FSYNC_NAME`] is
+/// required.
+///
+/// The provider does **not** fence the source file's bytes. Durable
+/// publication of a newly written artefact is: [`OPEN_CREATE`] a
+/// temporary path, [`WRITE`], [`FSYNC`] (or the async fence), [`CLOSE`],
+/// then `RENAME` onto the final path. Renaming a file whose bytes are
+/// still volatile publishes a name over indeterminate contents.
+///
+/// An existing destination is replaced atomically where the backend
+/// supports it. Providers that cannot offer atomic replacement return
+/// `ENOSYS` and leave [`caps::RENAME`] clear — a consumer must then use
+/// [`OPEN_CREATE`] + [`FSYNC_NAME`] and tolerate a partially written
+/// final name, or refuse to run on that backend.
+pub const RENAME: u32 = 0x090D;
 
 /// FS provider capability bitmap. `provider_call(handle, CAPS,
 /// out, out_len)` writes a `u32` (little-endian, 4 bytes) into
@@ -252,11 +431,12 @@ pub mod caps {
     // provider implementations land in lockstep.
     /// [`UNLINK`] (0x090A) — remove a file by path.
     pub const UNLINK:         u32 = 1 << 5;
-    /// Reserved for `TRUNCATE` (planned 0x090B).
+    /// Reserved for `TRUNCATE` (0x090C, the free slot between [`MKDIR`] and
+    /// [`RENAME`]).
     pub const TRUNCATE:       u32 = 1 << 6;
-    /// Reserved for `MKDIR` (planned 0x090C).
+    /// [`MKDIR`] (0x090B) — create one directory by path.
     pub const MKDIR:          u32 = 1 << 7;
-    /// Reserved for `RENAME` (planned 0x090D).
+    /// [`RENAME`] (0x090D) — atomic, durably published rename.
     pub const RENAME:         u32 = 1 << 8;
     /// [`PREALLOCATE`] (0x090E) — physically reserve fixed file capacity and
     /// leave its descriptor positioned at byte zero.
@@ -267,4 +447,8 @@ pub mod caps {
     /// fence-later durability; callers fall back to `WRITE`+`FSYNC` when
     /// clear.
     pub const FSYNC_ASYNC:    u32 = 1 << 10;
+    /// [`FSYNC_NAME`] (0x0912) — durable publication of a parent-directory
+    /// entry. Set iff the provider can prove a name reaches non-volatile
+    /// media independently of the file's own bytes.
+    pub const FSYNC_NAME:     u32 = 1 << 11;
 }

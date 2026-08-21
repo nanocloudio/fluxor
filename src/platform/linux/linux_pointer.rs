@@ -10,6 +10,11 @@
 // pointer records, scaled from the device axis range to the surface's
 // logical geometry. Included into `linux.rs`; shares its imports.
 
+use fluxor::platform::builtin_param_tags::linux_pointer::{
+    TAG_HEIGHT as POINTER_TAG_HEIGHT, TAG_PATH as POINTER_TAG_PATH, TAG_WIDTH as POINTER_TAG_WIDTH,
+    TAG_X_MAX as POINTER_TAG_X_MAX, TAG_Y_MAX as POINTER_TAG_Y_MAX,
+};
+
 const LINUX_POINTER_HASH: u32 = 0xEEA3_12EF; // fnv1a32("linux_pointer")
 
 // Linux `struct input_event` on 64-bit: timeval(16) + type(2) + code(2) +
@@ -211,11 +216,11 @@ fn build_linux_pointer(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
     let mut x_max: i32 = 0;
     let mut y_max: i32 = 0;
     walk_tlv(params, |tag, value| match tag {
-        10 => path = tlv_str(value).to_string(),
-        11 => width = tlv_u32(value) as i32,
-        12 => height = tlv_u32(value) as i32,
-        13 => x_max = tlv_u32(value) as i32,
-        14 => y_max = tlv_u32(value) as i32,
+        POINTER_TAG_PATH => path = tlv_str(value).to_string(),
+        POINTER_TAG_WIDTH => width = tlv_u32(value) as i32,
+        POINTER_TAG_HEIGHT => height = tlv_u32(value) as i32,
+        POINTER_TAG_X_MAX => x_max = tlv_u32(value) as i32,
+        POINTER_TAG_Y_MAX => y_max = tlv_u32(value) as i32,
         _ => {}
     });
 

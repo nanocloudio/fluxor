@@ -170,6 +170,39 @@ pub fn pseudo_header_sum(src_ip: u32, dst_ip: u32, protocol: u8, payload_len: u1
     sum
 }
 
+/// Verify a transport checksum that covers the IPv4 pseudo-header plus the
+/// whole transport segment, with the checksum field still in place.
+///
+/// This is the receive half of the same arithmetic `build_udp_header` and
+/// `tcp::compute_tcp_checksum` use on transmit: summing a valid segment
+/// including its own checksum field yields all-ones, so the complement is
+/// zero. Odd-length segments pad the final byte into the high half, matching
+/// [`checksum`].
+///
+/// # Safety
+/// `data` must point to at least `len` valid bytes.
+pub unsafe fn verify_transport_checksum(
+    src_ip: u32,
+    dst_ip: u32,
+    protocol: u8,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    if len > u16::MAX as usize {
+        return false;
+    }
+    let mut sum = pseudo_header_sum(src_ip, dst_ip, protocol, len as u16);
+    let mut i = 0;
+    while i + 1 < len {
+        sum += ((*data.add(i) as u32) << 8) | (*data.add(i + 1) as u32);
+        i += 2;
+    }
+    if i < len {
+        sum += (*data.add(i) as u32) << 8;
+    }
+    finalize_checksum(sum) == 0
+}
+
 /// Finalize a checksum accumulator to a 16-bit ones-complement value.
 #[inline(never)]
 pub fn finalize_checksum(mut sum: u32) -> u16 {

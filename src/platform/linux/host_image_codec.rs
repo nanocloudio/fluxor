@@ -19,19 +19,13 @@ const EOF_TICKS: u32 = 200;
 #[cfg(feature = "host-image")]
 const WRITE_CHUNK: usize = 1024;
 
-// Tag layout (declaration order in manifest.toml, starting at 10):
-//   10: width (u32)
-//   11: height (u32)
-//   12: scale_mode (enum fit=0, stretch=1)
-//   13: max_bytes (u32)
+// Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
+// generated into `builtin_param_tags`. `scale_mode` selects fit=0, stretch=1.
 #[cfg(feature = "host-image")]
-const IMG_TAG_WIDTH: u8 = 10;
-#[cfg(feature = "host-image")]
-const IMG_TAG_HEIGHT: u8 = 11;
-#[cfg(feature = "host-image")]
-const IMG_TAG_SCALE_MODE: u8 = 12;
-#[cfg(feature = "host-image")]
-const IMG_TAG_MAX_BYTES: u8 = 13;
+use fluxor::platform::builtin_param_tags::host_image_codec::{
+    TAG_HEIGHT as IMG_TAG_HEIGHT, TAG_MAX_BYTES as IMG_TAG_MAX_BYTES,
+    TAG_SCALE_MODE as IMG_TAG_SCALE_MODE, TAG_WIDTH as IMG_TAG_WIDTH,
+};
 
 #[cfg(feature = "host-image")]
 const IMG_SCALE_MODE_FIT: u8 = 0;

@@ -455,6 +455,12 @@ fn generate_config_impl(
     // warning. Reject it at build time. See storage_capability_surface.md.
     validate_single_provider(config, &module_names, &manifests)?;
 
+    // Resume-style fault recovery. `fault_policy: restart` resumes the
+    // module's existing state after releasing its handles and flushing
+    // its channels; nothing at instantiation time can tell whether that
+    // is safe, so the module must attest it in its manifest.
+    validate_fault_policy(config, &module_names, &manifests)?;
+
     // Presentation-shell / browser-overlay descriptor validation
     // (RFC browser_overlay §19). Scenarios without a `presentation.shell`
     // block are unaffected. Lives in a standalone, unit-testable module.

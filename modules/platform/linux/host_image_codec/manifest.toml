@@ -16,24 +16,28 @@ required = true
 
 [[params]]
 name = "width"
+tag = 10
 type = "u32"
 default = 480
 range = [1, 4096]
 
 [[params]]
 name = "height"
+tag = 11
 type = "u32"
 default = 480
 range = [1, 4096]
 
 [[params]]
 name = "scale_mode"
+tag = 12
 type = "enum"
 values = ["fit", "stretch"]
 default = "fit"
 
 [[params]]
 name = "max_bytes"
+tag = 13
 type = "u32"
 default = 4194304
 range = [1024, 67108864]

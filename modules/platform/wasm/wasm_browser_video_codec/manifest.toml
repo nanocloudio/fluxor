@@ -26,12 +26,14 @@ required = true
 [[params]]
 # tag 10 — coded width hint for VideoDecoder.configure.
 name = "width"
+tag = 10
 type = "u16"
 required = true
 
 [[params]]
 # tag 11 — coded height hint.
 name = "height"
+tag = 11
 type = "u16"
 required = true
 
@@ -39,6 +41,7 @@ required = true
 # tag 12 — one-sample staging buffer cap. UHD remux I-frames run
 # several MB; 16 MiB default covers 4K BluRay-class streams.
 name = "max_frame_bytes"
+tag = 12
 type = "u32"
 default = 16777216
 range = [65536, 67108864]

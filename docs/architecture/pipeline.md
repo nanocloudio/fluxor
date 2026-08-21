@@ -10,7 +10,8 @@ execution loop, and the lifecycle of modules and graphs.
 - Compose modules into arbitrary graphs via configuration, not firmware code
 - Keep the kernel small and protocol-agnostic
 - Make all I/O non-blocking with structural backpressure
-- Support live reconfiguration without dropping in-flight work
+- Support live reconfiguration that drains admitted work before
+  reset, subject to a bounded timeout
 - Run identical module binaries across silicon families
 
 ## Runtime Model

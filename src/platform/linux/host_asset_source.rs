@@ -2,9 +2,8 @@
 //
 // Params declared in `modules/platform/wasm/host_asset_source/manifest.toml`:
 //   path: filesystem path to the asset (required, no default)
-//
-// Tag layout (declaration order, starting at 10):
-//   10: path (str)
+// Its TLV tag is declared there too, and generated into
+// `builtin_param_tags`.
 
 use std::fs::File;
 use std::io::Read;
@@ -15,7 +14,7 @@ const HOST_ASSET_SOURCE_HASH: u32 = 0x504EEEF0; // fnv1a32("host_asset_source")
 // channel never gets written.
 const CHUNK_SIZE: usize = 1024;
 
-const ASSET_TAG_PATH: u8 = 10;
+use fluxor::platform::builtin_param_tags::host_asset_source::TAG_PATH as ASSET_TAG_PATH;
 
 struct HostAssetState {
     out_chan: i32,

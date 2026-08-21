@@ -1,5 +1,18 @@
 // ChaCha20-Poly1305 AEAD (RFC 8439)
-// Pure Rust, constant-time, no lookup tables, PIC-safe
+// Pure Rust, PIC-safe.
+//
+// Constant-time on every target this tree builds for, with no
+// target-feature gate: ChaCha20 is add-rotate-xor over a fixed
+// schedule with no tables, Poly1305's final reduction selects between
+// `h` and `h + 5` by arithmetic mask rather than a branch, and tag
+// verification folds all 16 bytes before its single branch. No key,
+// nonce or plaintext byte becomes a branch condition or a load address
+// anywhere in this file. Message *length* is not hidden — it drives
+// the block count, as it does for any stream cipher.
+//
+// This is the portable AEAD with no timing exposure; `aes_gcm.rs` is
+// constant-time only on aarch64 targets built with `+aes`, and its
+// GHASH is not constant-time even there.
 
 /// ChaCha20 quarter round
 #[inline(always)]

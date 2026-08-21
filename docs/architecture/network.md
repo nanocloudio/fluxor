@@ -308,6 +308,28 @@ stack on bare-metal targets. Its channels are:
 - `net_in` (in[1]): net_proto / datagram commands from consumers
 - `net_out` (out[1]): net_proto / datagram messages to consumers
 
+### Supported profile
+
+The stack implements a deliberately narrow IPv4 profile. These are
+interoperability constraints, not gaps awaiting opportunistic patching:
+
+- **IPv4 fragments are not reassembled.** Any packet carrying MF or a
+  nonzero fragment offset is dropped before TCP or UDP sees it. A peer
+  that must reach the node has to keep its datagrams inside the path
+  MTU; the stack does not implement Path MTU Discovery either, so there
+  is no ICMP "Fragmentation Needed" signal to observe.
+- **One subnet, one default gateway.** An off-subnet destination with no
+  configured gateway is unreachable and returns `ENETUNREACH`. There is
+  no route table to populate and no on-link exception.
+- **ARP mappings are created only by ARP.** Ordinary IPv4 traffic may
+  refresh an existing mapping whose MAC is unchanged; installing a new
+  mapping, or moving one to a different MAC, requires a correlated ARP
+  reply. First contact with a new peer therefore costs one ARP round
+  trip even when that peer has just sent traffic.
+- **One transmit frame per datagram.** There is no transmit-side
+  fragmentation: a UDP payload larger than the frame ceiling is refused
+  with `EMSGSIZE` rather than truncated or split.
+
 ### Per-tick step
 
 Each step the IP module:

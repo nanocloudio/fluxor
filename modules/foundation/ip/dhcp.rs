@@ -298,8 +298,28 @@ pub unsafe fn build_dhcp_message(
     eth::ETH_HEADER_LEN + ip_total as usize
 }
 
+/// A parsed DHCP reply.
+pub struct DhcpReply {
+    pub msg_type: u8,
+    pub offered_ip: u32,
+    pub server_ip: u32,
+    pub subnet_mask: u32,
+    pub gateway: u32,
+    pub dns: u32,
+    pub lease_time: u32,
+}
+
 /// Parse a DHCP reply (OFFER or ACK).
-/// Returns (msg_type, offered_ip, server_ip, subnet_mask, gateway, dns, lease_time).
+///
+/// The reply must be addressed to this client: BOOTREPLY over Ethernet, our
+/// transaction ID, and our `chaddr`. The transaction ID alone identifies the
+/// exchange but not the client — a server (or anything else on the segment)
+/// replaying another client's transaction would otherwise be accepted.
+///
+/// `bootp_compat` admits a reply that carries no DHCP message-type option as
+/// an implicit ACK. That is a BOOTP server, not a DHCP one, and the profile
+/// is opt-in because it accepts an address assignment with no option 53 and
+/// no server identifier to bind the exchange to.
 ///
 /// # Safety
 /// `data` must point to at least `len` bytes of DHCP payload (after UDP header).
@@ -307,7 +327,9 @@ pub unsafe fn parse_dhcp_reply(
     data: *const u8,
     len: usize,
     expected_xid: u32,
-) -> Option<(u8, u32, u32, u32, u32, u32, u32)> {
+    client_mac: &[u8; 6],
+    bootp_compat: bool,
+) -> Option<DhcpReply> {
     if len < DHCP_HEADER_LEN + 4 {
         return None;
     }
@@ -317,10 +339,25 @@ pub unsafe fn parse_dhcp_reply(
         return None;
     }
 
+    // htype / hlen must describe a 6-byte Ethernet hardware address, or
+    // `chaddr` does not mean what the comparison below assumes.
+    if *data.add(1) != 1 || *data.add(2) != 6 {
+        return None;
+    }
+
     // Check XID
     let xid = u32::from_be_bytes([*data.add(4), *data.add(5), *data.add(6), *data.add(7)]);
     if xid != expected_xid {
         return None;
+    }
+
+    // chaddr at offset 28 must be our own MAC.
+    let mut i = 0;
+    while i < 6 {
+        if *data.add(28 + i) != *client_mac.as_ptr().add(i) {
+            return None;
+        }
+        i += 1;
     }
 
     // yiaddr (your IP address) at offset 16
@@ -362,11 +399,15 @@ pub unsafe fn parse_dhcp_reply(
             break;
         }
 
+        // Singleton options carry exactly one value. A longer or shorter
+        // encoding is a malformed option, not a prefix to read from: the
+        // trailing bytes would otherwise be silently discarded and the
+        // sender's intent guessed.
         match opt {
-            53 if opt_len >= 1 => {
+            53 if opt_len == 1 => {
                 msg_type = *data.add(opt_data);
             }
-            54 if opt_len >= 4 => {
+            54 if opt_len == 4 => {
                 server_ip = u32::from_be_bytes([
                     *data.add(opt_data),
                     *data.add(opt_data + 1),
@@ -374,7 +415,7 @@ pub unsafe fn parse_dhcp_reply(
                     *data.add(opt_data + 3),
                 ]);
             }
-            1 if opt_len >= 4 => {
+            1 if opt_len == 4 => {
                 subnet_mask = u32::from_be_bytes([
                     *data.add(opt_data),
                     *data.add(opt_data + 1),
@@ -382,7 +423,8 @@ pub unsafe fn parse_dhcp_reply(
                     *data.add(opt_data + 3),
                 ]);
             }
-            3 if opt_len >= 4 => {
+            3 if opt_len == 4 => {
+                // Router is a list; the first entry is the default gateway.
                 gateway = u32::from_be_bytes([
                     *data.add(opt_data),
                     *data.add(opt_data + 1),
@@ -390,7 +432,7 @@ pub unsafe fn parse_dhcp_reply(
                     *data.add(opt_data + 3),
                 ]);
             }
-            6 if opt_len >= 4 => {
+            6 if opt_len == 4 => {
                 dns = u32::from_be_bytes([
                     *data.add(opt_data),
                     *data.add(opt_data + 1),
@@ -398,7 +440,7 @@ pub unsafe fn parse_dhcp_reply(
                     *data.add(opt_data + 3),
                 ]);
             }
-            51 if opt_len >= 4 => {
+            51 if opt_len == 4 => {
                 lease_time = u32::from_be_bytes([
                     *data.add(opt_data),
                     *data.add(opt_data + 1),
@@ -412,10 +454,11 @@ pub unsafe fn parse_dhcp_reply(
         pos = opt_data + opt_len;
     }
 
-    // If no DHCP message type option (53) found, this is a pure BOOTP reply.
-    // BOOTP replies with a valid yiaddr are implicit address assignments —
-    // treat as DHCP ACK to complete the address configuration.
-    if msg_type == 0 && offered_ip != 0 {
+    // A reply with no message-type option is BOOTP, not DHCP. Treating a
+    // valid `yiaddr` as an implicit ACK completes address configuration
+    // against such a server, and is available only under the compatibility
+    // profile.
+    if msg_type == 0 && offered_ip != 0 && bootp_compat {
         msg_type = DHCP_ACK;
     }
 
@@ -423,7 +466,7 @@ pub unsafe fn parse_dhcp_reply(
         return None;
     }
 
-    Some((
+    Some(DhcpReply {
         msg_type,
         offered_ip,
         server_ip,
@@ -431,5 +474,5 @@ pub unsafe fn parse_dhcp_reply(
         gateway,
         dns,
         lease_time,
-    ))
+    })
 }

@@ -24,6 +24,27 @@
 //! - `net_in_chan` (in[1]): Net protocol commands from consumer (CMD_BIND, CMD_SEND, etc.)
 //! - `net_out_chan` (out[1]): Net protocol messages to consumer (MSG_DATA, MSG_ACCEPTED, etc.)
 //!
+//! # Stack profile
+//!
+//! The supported profile is deliberately narrow, and the narrowing is a
+//! constraint on what may reach the transport layers — not a gap to be filled
+//! opportunistically:
+//!
+//! - **No IPv4 reassembly.** Packets carrying MF or a nonzero fragment offset
+//!   are dropped before L4 dispatch. Presenting a fragment to TCP/UDP as a
+//!   whole packet lets a peer's second fragment decide what the first one
+//!   meant, and a bounded reassembler is not implemented.
+//! - **One subnet, one default gateway.** An off-subnet destination with no
+//!   configured gateway is unreachable; the stack does not ARP directly for
+//!   it, which would let any station on the segment answer for an address it
+//!   does not own.
+//! - **ARP mappings are created only by ARP.** Ordinary IPv4 traffic may
+//!   refresh an existing same-MAC entry; it can neither install a new mapping
+//!   nor move an existing one.
+//! - **One transmit frame per datagram.** There is no transmit-side
+//!   fragmentation, so a UDP payload past the frame ceiling is refused with
+//!   `EMSGSIZE` rather than truncated.
+//!
 //! # Config Parameters
 //!
 //! | Tag | Name     | Type | Default | Description                |
@@ -95,6 +116,32 @@ mod udp;
 
 /// Maximum ethernet frame size
 const MAX_FRAME_SIZE: usize = 1536;
+
+/// Largest transmit frame `send_frame` will accept. It stages
+/// `[len:u16 LE][frame…]` inside a single buffer, so two bytes of the
+/// ceiling belong to the length prefix.
+const MAX_TX_FRAME_PAYLOAD: usize = MAX_FRAME_SIZE - 2;
+
+/// Largest UDP payload that fits one transmit frame. Every frame builder
+/// writes into the fixed `tx_frame`, so a datagram past this size cannot be
+/// staged at all — it is refused before any copy, never truncated.
+const MAX_UDP_TX_PAYLOAD: usize =
+    MAX_TX_FRAME_PAYLOAD - eth::ETH_HEADER_LEN - ipv4::IPV4_HEADER_LEN - udp::UDP_HEADER_LEN;
+
+/// Largest TCP payload that fits one transmit frame. The segmenter caps
+/// chunks at `tcp::MSS`, which is below this; the bound is the frame
+/// builder's own precondition, independent of the caller's arithmetic.
+const MAX_TCP_TX_PAYLOAD: usize =
+    MAX_TX_FRAME_PAYLOAD - eth::ETH_HEADER_LEN - ipv4::IPV4_HEADER_LEN - tcp::TCP_HEADER_LEN;
+
+/// Largest ICMP message that fits one transmit frame (echo reply is built
+/// in place from the request, so the request bounds the reply).
+const MAX_ICMP_TX_LEN: usize = MAX_TX_FRAME_PAYLOAD - eth::ETH_HEADER_LEN - ipv4::IPV4_HEADER_LEN;
+
+/// Errno values surfaced to consumers through `MSG_ERROR` / `MSG_DG_ERROR`.
+/// Linux numbering, negated on the wire like the rest of the net surface.
+const E_MSGSIZE: i8 = -90;
+const E_NETUNREACH: i8 = -101;
 
 /// CMD_SEND stash capacity. Must match the largest single-frame
 /// payload an upstream consumer can write — `NET_BUF_SIZE` per
@@ -258,6 +305,107 @@ const NET_OUT_QUEUE_HEADROOM: usize = 4;
 // Module State
 // ============================================================================
 
+/// Ingress refusals and security-relevant admission decisions. Every field is
+/// a free-running lifetime counter: an operator reads deltas, and a
+/// non-advancing counter is itself the signal that a defence never fired.
+///
+/// These sit apart from `TlmCounters` (bytes / idle / backpressure) because
+/// they answer a different question — not "how much moved" but "what was
+/// refused, and why".
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct IpDrops {
+    /// Segments refused by the TCP pseudo-header checksum.
+    pub cksum_tcp: u32,
+    /// Datagrams refused by the UDP pseudo-header checksum. A zero checksum
+    /// is "not supplied" for IPv4 UDP and is not counted here.
+    pub cksum_udp: u32,
+    /// ICMP messages refused by the ICMP checksum.
+    pub cksum_icmp: u32,
+    /// IPv4 fragments refused before L4 dispatch (no reassembler — see the
+    /// module doc comment).
+    pub frag: u32,
+    /// Datagrams whose UDP length disagreed with the IPv4 payload length.
+    pub udp_len: u32,
+    /// New or changed ARP mappings refused because they arrived on an
+    /// ordinary IPv4 packet rather than on ARP.
+    pub arp_from_ipv4: u32,
+    /// ARP frames that did not correlate with the outstanding resolution
+    /// (wrong sender, wrong target address, or not addressed to us).
+    pub arp_uncorrelated: u32,
+    /// MAC changes refused because the entry is pinned. Distinguishes a
+    /// security refusal from an ordinary cache miss.
+    pub arp_pin_reject: u32,
+    /// Permanent pins that entered revalidation (a fresh ARP was issued for
+    /// an entry that ordinary aging would never expire).
+    pub arp_pin_revalidate: u32,
+    /// DHCP replies refused for a correlation failure: wrong `chaddr`, wrong
+    /// server, or an address that does not match the selected offer.
+    pub dhcp_uncorrelated: u32,
+    /// Datagrams refused because the payload cannot fit one transmit frame.
+    pub udp_oversize: u32,
+    /// Sends refused because the destination is off-subnet with no gateway.
+    pub route_unreachable: u32,
+    /// Passive or active opens refused because no ISN secret could be
+    /// established (the CSPRNG was unavailable).
+    pub entropy_unavailable: u32,
+    /// Ephemeral-port allocations that found no free port.
+    pub port_exhausted: u32,
+    /// Segments refused by the receive-window acceptability test before the
+    /// state machine saw them.
+    pub tcp_unacceptable: u32,
+    /// Segments whose `SEG.ACK` was outside `[SND.UNA, SND.NXT]`. Counted
+    /// whether or not the segment was otherwise admissible: an invalid ACK
+    /// never installs a window or advances the send sequence.
+    pub tcp_ack_invalid: u32,
+    /// In-window RSTs and synchronised-state SYNs answered with a challenge
+    /// ACK instead of being acted on.
+    pub tcp_challenge_sent: u32,
+    /// Challenge ACKs the rate limiter suppressed. A rising count is the
+    /// signal that a flood is being absorbed rather than reflected.
+    pub tcp_challenge_suppressed: u32,
+    /// RSTs dropped for landing outside the receive window.
+    pub tcp_rst_out_of_window: u32,
+    /// Window advertisements ignored for arriving on a segment no newer than
+    /// the one that last set `snd_wnd` (`SND.WL1`/`SND.WL2`).
+    pub tcp_stale_window: u32,
+    /// Datagram binds refused because the local identity is already held by
+    /// another endpoint (`EADDRINUSE`).
+    pub dg_bind_conflict: u32,
+    /// Datagram commands refused because the named endpoint slot is not a
+    /// live endpoint of the requesting consumer.
+    pub dg_ep_unowned: u32,
+}
+
+impl IpDrops {
+    pub const fn new() -> Self {
+        Self {
+            cksum_tcp: 0,
+            cksum_udp: 0,
+            cksum_icmp: 0,
+            frag: 0,
+            udp_len: 0,
+            arp_from_ipv4: 0,
+            arp_uncorrelated: 0,
+            arp_pin_reject: 0,
+            arp_pin_revalidate: 0,
+            dhcp_uncorrelated: 0,
+            udp_oversize: 0,
+            route_unreachable: 0,
+            entropy_unavailable: 0,
+            port_exhausted: 0,
+            tcp_unacceptable: 0,
+            tcp_ack_invalid: 0,
+            tcp_challenge_sent: 0,
+            tcp_challenge_suppressed: 0,
+            tcp_rst_out_of_window: 0,
+            tcp_stale_window: 0,
+            dg_bind_conflict: 0,
+            dg_ep_unowned: 0,
+        }
+    }
+}
+
 #[repr(C)]
 pub struct IpState {
     // Core module fields
@@ -268,7 +416,12 @@ pub struct IpState {
 
     // Config
     use_dhcp: u8,
-    _cfg_pad: u8,
+    /// Opt-in DHCP compatibility profile. Admits two shapes a strict DHCP
+    /// client refuses: a BOOTP reply with no message-type option treated as
+    /// an implicit ACK, and an ACK arriving in DISCOVERING with no preceding
+    /// OFFER to bind it to. Both accept an address assignment the client
+    /// cannot correlate to a selection it made.
+    dhcp_compat: u8,
     /// Head-sampling rate in per-mille (0–1000); the fraction of ingress roots
     /// that are sampled. Default 1000 (100%). The decision is made once per
     /// connection at accept and stored in `TcpConn::sampled_flags`.
@@ -424,6 +577,55 @@ pub struct IpState {
     /// peer→rig). Emitted on the `[ip] hb` line.
     tcp_dup_syn_rx: u32,
 
+    /// Ingress refusals — see [`IpDrops`].
+    drops: IpDrops,
+
+    /// Challenge ACKs still permitted across every connection in the current
+    /// refill window (`tcp::CHALLENGE_ACK_GLOBAL_BUDGET`). Paired with the
+    /// per-connection bucket in `TcpConn::chal_budget`: the global cap bounds
+    /// what the host can be made to emit in total, the per-peer cap stops one
+    /// connection consuming all of it.
+    chal_ack_budget: u8,
+    /// 50 ms timer ticks elapsed in the current challenge-ACK refill window.
+    chal_refill_ticks: u8,
+    _chal_pad: [u8; 2],
+
+    /// TCP connections currently in `SynReceived` (half-open). Recounted from
+    /// the table on each passive open rather than tracked as a delta, so a
+    /// teardown path that forgets to decrement cannot strand the gauge.
+    tcp_half_open: u16,
+    /// High-water mark of `tcp_half_open` since boot.
+    tcp_half_open_max: u16,
+    /// High-water mark of half-open connections attributable to one source
+    /// address. A flood from a single peer shows here, which
+    /// `tcp_half_open_max` alone cannot distinguish from legitimate load.
+    tcp_half_open_src_max: u16,
+    /// Passive opens refused for want of a free slot. Read together with
+    /// `tcp_half_open_max` this separates a genuine capacity ceiling from
+    /// half-open exhaustion.
+    tcp_half_open_refused: u32,
+
+    /// Per-boot secret for the RFC 6528-shaped ISN construction. Drawn once
+    /// from the kernel CSPRNG; a connection's ISS is a keyed mix of this
+    /// secret with the four-tuple plus a monotonic term, so an off-path peer
+    /// cannot derive one connection's sequence space from another's.
+    isn_secret: [u8; 16],
+    /// Set once `isn_secret` holds CSPRNG output. Until then no TCP
+    /// connection is opened in either direction.
+    isn_secret_valid: bool,
+    /// One-shot guard for the "entropy unavailable" log so a retry loop
+    /// cannot amplify itself through the log path.
+    entropy_warned: bool,
+    /// Gateway ARP resolution outstanding for a permanent pin. The pin is
+    /// installed only when a correlated reply arrives, so a cache entry
+    /// present before the lease was taken can never be promoted to permanent.
+    gw_pin_pending: bool,
+    _gwpin_pad: u8,
+    /// Address the outstanding gateway pin is for (0 = none).
+    gw_pin_ip: u32,
+    /// Step count at which the current gateway pin resolution was armed.
+    gw_pin_armed_step: u32,
+
     // ── Pipeline-advancement instrumentation ──────────────────────────
     // See the matching fields in `tls`: byte counters say how much a
     // module did, not whether it had more available and stopped anyway.
@@ -475,6 +677,8 @@ mod params_def {
             => |s, d, len| { s.dhcp.expected_server = p_u32(d, len, 0, 0); };
         3, trace_sample_permille, u16, 1000
             => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 1000); };
+        4, dhcp_compat, u8, 0, enum { strict=0, bootp_and_direct_ack=1 }
+            => |s, d, len| { s.dhcp_compat = p_u8(d, len, 0, 1); };
     }
 }
 
@@ -1165,25 +1369,251 @@ unsafe fn tcp_conn_mut(s: &mut IpState, idx: usize) -> &mut tcp::TcpConn {
     &mut *s.tcp_conns.as_mut_ptr().add(idx)
 }
 
-/// Allocate next ephemeral port.
+/// Ephemeral port range (IANA dynamic range, upper end kept clear of the
+/// well-known static assignments some deployments still park above 65000).
+const EPHEMERAL_LO: u16 = 49152;
+const EPHEMERAL_HI: u16 = 65000;
+
+/// CSPRNG candidates drawn before falling back to a scan.
+const EPHEMERAL_TRIES: usize = 8;
+
+/// Upper bound on the fallback scan. At most `MAX_TCP_CONNS` ports can be in
+/// use, so a scan this long either finds a free port or proves the table is
+/// the binding constraint rather than the range.
+const EPHEMERAL_SCAN_MAX: usize = tcp::MAX_TCP_CONNS * 2;
+
+/// Recount half-open (SYN_RECEIVED) connections and update the global and
+/// per-source high-water marks. Counting the table rather than tracking a
+/// delta keeps the gauge honest across every teardown path.
 ///
-/// The sequence starts at a RANDOM point in the range (seeded once,
-/// lazily, from the CSPRNG): a reboot that restarts deterministically
-/// at 49152 reuses the exact 4-tuples of the previous boot's
-/// connections, colliding with peers' half-open state for those
-/// tuples (stray challenge-ACKs, RST churn on every fresh connect).
-fn next_port(s: &mut IpState) -> u16 {
-    if s.next_ephemeral_port == 0 {
-        let sys = unsafe { &*s.syscalls };
-        let mut r = [0u8; 2];
-        let _ = unsafe { dev_csprng_fill(sys, r.as_mut_ptr(), 2) };
-        let span = 65000u32 - 49152;
-        s.next_ephemeral_port =
-            49152 + ((u16::from_le_bytes(r) as u32) % span) as u16;
+/// `src` is the source address of the SYN that just landed; its own count is
+/// tracked separately because a global gauge cannot distinguish a flood from
+/// one peer from a genuine burst of distinct clients.
+unsafe fn note_half_open(s: &mut IpState, src: u32) {
+    let mut total: u16 = 0;
+    let mut from_src: u16 = 0;
+    let mut i = 0;
+    while i < tcp::MAX_TCP_CONNS {
+        let c = &*s.tcp_conns.as_ptr().add(i);
+        if c.state == tcp::TcpState::SynReceived {
+            total = total.saturating_add(1);
+            if c.remote_ip == src {
+                from_src = from_src.saturating_add(1);
+            }
+        }
+        i += 1;
     }
-    let port = s.next_ephemeral_port;
-    s.next_ephemeral_port = if port >= 65000 { 49152 } else { port + 1 };
-    port
+    s.tcp_half_open = total;
+    if total > s.tcp_half_open_max {
+        s.tcp_half_open_max = total;
+    }
+    if from_src > s.tcp_half_open_src_max {
+        s.tcp_half_open_src_max = from_src;
+    }
+}
+
+/// Outcome of datagram bind admission.
+enum DgBind {
+    /// No endpoint holds an overlapping identity — allocate a new one.
+    Fresh,
+    /// The requested identity is already held by this owner; the bind is an
+    /// idempotent retry and re-uses the existing endpoint.
+    Existing(usize),
+    /// The identity is held by someone else, or reachability overlaps an
+    /// endpoint bound at a different address slot.
+    Conflict,
+}
+
+/// Decide whether a datagram bind of `(port, slot, owner_tag)` may proceed.
+///
+/// Reachability is what makes two binds conflict, not the numeric port. A
+/// concrete slot serves one local address; `LOCAL_SLOT_ANY` serves every
+/// unowned address, so it overlaps every concrete slot. Two concrete slots
+/// never overlap, which is why the same port bound at two local addresses is
+/// two sockets. TCP listeners are a different protocol and never conflict
+/// here — `find_listener` already excludes datagram slots in the other
+/// direction.
+unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u8, owner_tag: u16) -> DgBind {
+    let mut i = 0;
+    while i < tcp::MAX_TCP_CONNS {
+        let c = &*s.tcp_conns.as_ptr().add(i);
+        if c.is_active() && c.is_datagram && c.local_port == port {
+            if c.local_slot == slot {
+                if c.owner_tag == owner_tag {
+                    return DgBind::Existing(i);
+                }
+                return DgBind::Conflict;
+            }
+            if c.local_slot == LOCAL_SLOT_ANY || slot == LOCAL_SLOT_ANY {
+                return DgBind::Conflict;
+            }
+        }
+        i += 1;
+    }
+    DgBind::Fresh
+}
+
+/// Pick a free connection slot for a datagram endpoint, starting the scan at
+/// a CSPRNG-chosen offset.
+///
+/// The slot index is the `ep_id` the consumer echoes back on every send and
+/// close, and the command channel carries no producer identity, so a
+/// consecutively-allocated index is guessable from a consumer's own
+/// endpoints. Starting the scan at a random offset removes the ordinal
+/// relationship. It is unpredictability, not authority — see the datagram
+/// section of `README.md`. Falls back to the first free slot when the CSPRNG
+/// is unavailable: a bind carries no sequence-space secret, so refusing it
+/// for want of entropy would cost availability and buy nothing.
+unsafe fn alloc_dg_slot(s: &mut IpState) -> Option<usize> {
+    let sys = &*s.syscalls;
+    let mut r = [0u8; 1];
+    let start = if dev_csprng_fill(sys, r.as_mut_ptr(), 1) < 0 {
+        0usize
+    } else {
+        (r[0] as usize) % tcp::MAX_TCP_CONNS
+    };
+    let mut n = 0;
+    while n < tcp::MAX_TCP_CONNS {
+        let ci = (start + n) % tcp::MAX_TCP_CONNS;
+        if slot_is_free(&*s.tcp_conns.as_ptr().add(ci)) {
+            return Some(ci);
+        }
+        n += 1;
+    }
+    None
+}
+
+/// Is `port` already bound by a TCP connection or datagram endpoint?
+unsafe fn port_in_use(s: &IpState, port: u16) -> bool {
+    let mut i = 0;
+    while i < tcp::MAX_TCP_CONNS {
+        let c = &*s.tcp_conns.as_ptr().add(i);
+        if c.is_active() && c.local_port == port {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Allocate an ephemeral port.
+///
+/// Every allocation draws a fresh CSPRNG candidate rather than incrementing
+/// from the last one: an incrementing sequence makes the next allocation
+/// predictable from any observed connection, which is half of what an
+/// off-path attacker needs to forge into a live conversation. Candidates are
+/// probed against the table, and a bounded scan covers the case where the
+/// random draws keep landing on live ports.
+///
+/// `None` means no port could be allocated — either the CSPRNG is
+/// unavailable, in which case allocation fails closed rather than falling
+/// back to a guessable sequence, or the range is exhausted.
+unsafe fn next_port(s: &mut IpState) -> Option<u16> {
+    let sys = &*s.syscalls;
+    let span = (EPHEMERAL_HI - EPHEMERAL_LO) as u32;
+    let mut last = EPHEMERAL_LO;
+
+    let mut tries = 0;
+    while tries < EPHEMERAL_TRIES {
+        let mut r = [0u8; 2];
+        if dev_csprng_fill(sys, r.as_mut_ptr(), 2) < 0 {
+            s.drops.entropy_unavailable = s.drops.entropy_unavailable.wrapping_add(1);
+            return None;
+        }
+        let cand = EPHEMERAL_LO + ((u16::from_le_bytes(r) as u32) % span) as u16;
+        if !port_in_use(s, cand) {
+            s.next_ephemeral_port = cand;
+            return Some(cand);
+        }
+        last = cand;
+        tries += 1;
+    }
+
+    // Bounded fallback scan from the last candidate.
+    let mut scanned = 0;
+    let mut cand = last;
+    while scanned < EPHEMERAL_SCAN_MAX {
+        cand = if cand + 1 >= EPHEMERAL_HI {
+            EPHEMERAL_LO
+        } else {
+            cand + 1
+        };
+        if !port_in_use(s, cand) {
+            s.next_ephemeral_port = cand;
+            return Some(cand);
+        }
+        scanned += 1;
+    }
+    s.drops.port_exhausted = s.drops.port_exhausted.wrapping_add(1);
+    None
+}
+
+/// Establish the per-boot ISN secret, once. Returns `false` when the kernel
+/// CSPRNG is unavailable; callers must then refuse to open a connection
+/// rather than fall back to a derivation an observer can reproduce.
+unsafe fn ensure_isn_secret(s: &mut IpState) -> bool {
+    if s.isn_secret_valid {
+        return true;
+    }
+    let sys = &*s.syscalls;
+    if dev_csprng_fill(sys, s.isn_secret.as_mut_ptr(), 16) < 0 {
+        s.drops.entropy_unavailable = s.drops.entropy_unavailable.wrapping_add(1);
+        if !s.entropy_warned {
+            s.entropy_warned = true;
+            log_error(s, b"[ip] no entropy: tcp opens refused");
+        }
+        return false;
+    }
+    s.isn_secret_valid = true;
+    true
+}
+
+/// Avalanche mix (finaliser only — this is a keyed diffusion step, not a MAC).
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^= x >> 33;
+    x
+}
+
+/// Initial send sequence number, RFC 6528 §3: `ISN = M + F(tuple, secret)`,
+/// where `M` is a 4-microsecond timer and `F` mixes the connection's
+/// four-tuple with a per-boot secret.
+///
+/// The point of the construction is that the offset is per-tuple: the timer
+/// alone would let any peer predict every other connection's sequence space,
+/// and a per-tuple offset alone would repeat across incarnations of the same
+/// tuple. Callers must have established the secret first
+/// (`ensure_isn_secret`).
+unsafe fn compute_iss(
+    s: &IpState,
+    local_ip: u32,
+    local_port: u16,
+    remote_ip: u32,
+    remote_port: u16,
+) -> u32 {
+    let sys = &*s.syscalls;
+    // 4 µs tick, the rate RFC 6528 specifies for M.
+    let m = (dev_micros(sys) >> 2) as u32;
+
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < 16 {
+        h ^= *s.isn_secret.as_ptr().add(i) as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h ^= local_ip as u64;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    h ^= remote_ip as u64;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    h ^= ((local_port as u64) << 16) | (remote_port as u64);
+    let f = mix64(h) as u32;
+
+    m.wrapping_add(f)
 }
 
 /// Send a raw ethernet frame via `out_chan`. Frames are length-prefixed
@@ -1359,8 +1789,16 @@ pub unsafe extern "C" fn module_new(
         }
 
         s.ip_id = 1;
-        // 0 = "unseeded"; next_port() seeds lazily from the CSPRNG.
+        // Scan cursor only; every allocation draws a fresh CSPRNG candidate.
         s.next_ephemeral_port = 0;
+        s.drops = IpDrops::new();
+        s.chal_ack_budget = tcp::CHALLENGE_ACK_GLOBAL_BUDGET;
+        s.chal_refill_ticks = 0;
+        s.isn_secret = [0u8; 16];
+        s.isn_secret_valid = false;
+        s.entropy_warned = false;
+        s.gw_pin_pending = false;
+        s.gw_pin_ip = 0;
 
         // Discover net protocol channels
         let sys = &*s.syscalls;
@@ -1566,7 +2004,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
     // 4. Periodic ARP maintenance
     if s.step_count.is_multiple_of(256) {
-        arp::age_entries(&mut s.arp_table);
+        step_arp_maintenance(s);
     }
 
     // 5. TCP timers — wallclock-driven so the 50 ms-tick thresholds
@@ -1634,6 +2072,42 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         pos += fmt_u32_dec(s.tx_cmd_items, buf.add(pos));
         emit(b" pendcmd=", &mut pos);
         pos += fmt_u32_dec(s.pend_cmd_steps, buf.add(pos));
+        dev_log(sys, 3, buf, pos);
+
+        // Ingress refusals and half-open pressure. Separate line: these are
+        // lifetime counters, not per-window rates, and are not reset below.
+        pos = 0;
+        emit(b"[ip] drop cksum=", &mut pos);
+        pos += fmt_u32_dec(
+            s.drops
+                .cksum_tcp
+                .wrapping_add(s.drops.cksum_udp)
+                .wrapping_add(s.drops.cksum_icmp),
+            buf.add(pos),
+        );
+        emit(b" frag=", &mut pos);
+        pos += fmt_u32_dec(s.drops.frag, buf.add(pos));
+        emit(b" udplen=", &mut pos);
+        pos += fmt_u32_dec(s.drops.udp_len, buf.add(pos));
+        emit(b" arp=", &mut pos);
+        pos += fmt_u32_dec(
+            s.drops.arp_from_ipv4.wrapping_add(s.drops.arp_uncorrelated),
+            buf.add(pos),
+        );
+        emit(b" pinrej=", &mut pos);
+        pos += fmt_u32_dec(s.drops.arp_pin_reject, buf.add(pos));
+        emit(b" pinreval=", &mut pos);
+        pos += fmt_u32_dec(s.drops.arp_pin_revalidate, buf.add(pos));
+        emit(b" dhcp=", &mut pos);
+        pos += fmt_u32_dec(s.drops.dhcp_uncorrelated, buf.add(pos));
+        emit(b" unreach=", &mut pos);
+        pos += fmt_u32_dec(s.drops.route_unreachable, buf.add(pos));
+        emit(b" halfopen=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_half_open as u32, buf.add(pos));
+        emit(b"/", &mut pos);
+        pos += fmt_u32_dec(s.tcp_half_open_max as u32, buf.add(pos));
+        emit(b" hosrc=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_half_open_src_max as u32, buf.add(pos));
         dev_log(sys, 3, buf, pos);
         s.adv_rx_frames = 0;
         s.pend_rx_steps = 0;
@@ -1761,11 +2235,17 @@ unsafe fn process_frame(s: &mut IpState, len: usize) {
 
 /// Process an ARP packet.
 unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
-    let parsed = match arp::parse_arp(data, len) {
+    let pkt = match arp::parse_arp(data, len) {
         Some(p) => p,
         None => return,
     };
-    let (opcode, sender_ip, sender_mac, target_ip) = parsed;
+    let arp::ArpPacket {
+        opcode,
+        sender_ip,
+        sender_mac,
+        target_ip,
+        target_mac,
+    } = pkt;
 
     // Gratuitous-ARP conflict detection: if someone claims ANY of our local
     // addresses from a different MAC, defend by broadcasting a gratuitous
@@ -1781,12 +2261,51 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
         return;
     }
 
-    // Always learn from ARP packets
-    arp::insert(&mut s.arp_table, sender_ip, sender_mac, s.step_count as u16);
+    // A pending resolution is satisfied only by a reply that is genuinely an
+    // answer to the question we asked:
+    //
+    //   * an ARP *Reply* — a request carrying the same sender address is an
+    //     unsolicited announcement, not an answer;
+    //   * for exactly the address we asked about;
+    //   * targeted at one of our local addresses and at our MAC, both in the
+    //     ARP payload and in the Ethernet destination.
+    //
+    // Anything else may still be a legitimate frame on the segment, but it
+    // does not get to decide what our outstanding question resolved to.
+    let eth_dst = eth::dst_mac(s.rx_frame.as_ptr());
+    let correlated_reply = opcode == arp::ARP_REPLY
+        && s.arp_pending_state == arp::ARP_PENDING_WAITING
+        && s.arp_pending_ip == sender_ip
+        && is_local_addr(s, target_ip)
+        && target_mac == s.mac_addr
+        && eth_dst == s.mac_addr;
 
-    // If this resolves our pending ARP request
-    if s.arp_pending_state == arp::ARP_PENDING_WAITING && s.arp_pending_ip == sender_ip {
+    // A MAC change refused by a pin is metered wherever it is observed:
+    // an operator reading a cache miss needs to know whether the mapping is
+    // simply absent or whether the segment tried to move a pinned one.
+    if arp::pin_would_reject(&s.arp_table, sender_ip, sender_mac) {
+        s.drops.arp_pin_reject = s.drops.arp_pin_reject.wrapping_add(1);
+    }
+
+    if correlated_reply {
+        arp::insert(&mut s.arp_table, sender_ip, sender_mac, s.step_count as u16);
         s.arp_pending_state = arp::ARP_PENDING_NONE;
+        // A gateway pin is installed only against a mapping this exchange
+        // just produced, never against whatever happened to be cached.
+        if s.gw_pin_pending && s.gw_pin_ip == sender_ip {
+            s.gw_pin_pending = false;
+            arp::pin_gateway(&mut s.arp_table, sender_ip);
+        }
+        // A handshake blocked on this resolution ships now rather than
+        // waiting for the next timer tick — the whole stall is the ARP round
+        // trip, and the reply has just arrived.
+        retry_unsent_handshake(s, sender_ip);
+    } else {
+        // Uncorrelated ARP may still refresh an unchanged mapping — that is
+        // the same authority ordinary IPv4 traffic has, and no more.
+        if !arp::refresh_same_mac(&mut s.arp_table, sender_ip, sender_mac) {
+            s.drops.arp_uncorrelated = s.drops.arp_uncorrelated.wrapping_add(1);
+        }
     }
 
     // Reply to ARP requests for ANY of our local addresses with the single
@@ -1806,6 +2325,32 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     }
 }
 
+/// Ship any SYN or SYN-ACK that was held back because the peer's MAC was
+/// unresolved and `resolved_ip` is now its next hop. `snd_nxt == iss` is the
+/// marker: `send_tcp_control` credits the sequence byte only once the frame
+/// is queued, so a connection still sitting at its ISS never reached the wire.
+unsafe fn retry_unsent_handshake(s: &mut IpState, resolved_ip: u32) {
+    let mut i = 0;
+    while i < tcp::MAX_TCP_CONNS {
+        let conn = &*s.tcp_conns.as_ptr().add(i);
+        let state = conn.state;
+        let unsent = conn.snd_nxt == conn.iss;
+        let hop = next_hop(s, conn.remote_ip);
+        if unsent && hop == Some(resolved_ip) {
+            match state {
+                tcp::TcpState::SynReceived => {
+                    send_tcp_control(s, i, tcp::SYN | tcp::ACK, true);
+                }
+                tcp::TcpState::SynSent => {
+                    send_tcp_control(s, i, tcp::SYN, true);
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Process an IPv4 packet.
 unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
     let ip_hdr = match ipv4::parse_ipv4(data, len) {
@@ -1813,16 +2358,24 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
         None => return,
     };
 
-    // Opportunistic ARP: learn source IP→MAC from Ethernet header
+    // No reassembler exists, so a fragment is refused rather than handed to
+    // L4 as though it were a whole packet. MF set (0x2000) or a nonzero
+    // offset (low 13 bits) both qualify; DF and the reserved bit do not.
+    if (ip_hdr.flags_frag & 0x2000) != 0 || (ip_hdr.flags_frag & 0x1FFF) != 0 {
+        s.drops.frag = s.drops.frag.wrapping_add(1);
+        return;
+    }
+
+    // Refresh — never create — the sender's ARP mapping from ordinary IPv4
+    // traffic. A same-MAC refresh keeps a busy peer's entry alive without
+    // letting unauthenticated L3 traffic install or move a mapping; new and
+    // changed mappings are learnt only from a correlated ARP reply.
     if ip_hdr.src_ip != 0 && ip_hdr.src_ip != 0xFFFFFFFF {
         let src_mac = eth::src_mac(s.rx_frame.as_ptr());
-        if (src_mac[0] | src_mac[1] | src_mac[2] | src_mac[3] | src_mac[4] | src_mac[5]) != 0 {
-            arp::insert(
-                &mut s.arp_table,
-                ip_hdr.src_ip,
-                src_mac,
-                s.step_count as u16,
-            );
+        if (src_mac[0] | src_mac[1] | src_mac[2] | src_mac[3] | src_mac[4] | src_mac[5]) != 0
+            && !arp::refresh_same_mac(&mut s.arp_table, ip_hdr.src_ip, src_mac)
+        {
+            s.drops.arp_from_ipv4 = s.drops.arp_from_ipv4.wrapping_add(1);
         }
     }
 
@@ -1871,6 +2424,19 @@ unsafe fn process_icmp(
     reply_src: u32,
 ) {
     if !s.mac_valid || s.local_ip == 0 {
+        return;
+    }
+
+    // The reply is a copy of the request, so the request's length bounds the
+    // write into `tx_frame`. Refuse before `handle_icmp` copies.
+    if len > MAX_ICMP_TX_LEN {
+        return;
+    }
+
+    // Verify the ICMP checksum before generating any reply. An echo reply is
+    // an amplification surface: a corrupt request must not produce a frame.
+    if ipv4::checksum(data, len) != 0 {
+        s.drops.cksum_icmp = s.drops.cksum_icmp.wrapping_add(1);
         return;
     }
 
@@ -1925,6 +2491,31 @@ unsafe fn process_udp_packet(
         None => return,
     };
 
+    // The datagram must fill the (non-fragmented) IPv4 payload exactly. A
+    // shorter UDP length would leave trailing bytes whose meaning is decided
+    // by whichever layer looks next; no padding profile is supported.
+    if udp_hdr.length as usize != len {
+        s.drops.udp_len = s.drops.udp_len.wrapping_add(1);
+        return;
+    }
+
+    // Verify the checksum before demultiplex or any state lookup. For IPv4
+    // UDP a zero checksum means "not supplied" (RFC 768) and is accepted;
+    // every nonzero value is verified, including the 0xffff a transmitter
+    // sends in place of a computed zero.
+    if udp::checksum_field(data) != 0
+        && !ipv4::verify_transport_checksum(
+            ip_hdr.src_ip,
+            ip_hdr.dst_ip,
+            ipv4::PROTO_UDP,
+            data,
+            len,
+        )
+    {
+        s.drops.cksum_udp = s.drops.cksum_udp.wrapping_add(1);
+        return;
+    }
+
     // Check for DHCP reply
     if udp_hdr.dst_port == dhcp::DHCP_CLIENT_PORT && udp_hdr.src_port == dhcp::DHCP_SERVER_PORT {
         let dhcp_data = data.add(udp_hdr.payload_offset);
@@ -1978,6 +2569,14 @@ unsafe fn process_tcp_segment(
         None => return,
     };
 
+    // Verify the pseudo-header checksum before demultiplex or state lookup.
+    // Every branch below this point can change connection state or emit a
+    // frame, so a corrupt segment must not reach any of them.
+    if !ipv4::verify_transport_checksum(ip_hdr.src_ip, ip_hdr.dst_ip, ipv4::PROTO_TCP, data, len) {
+        s.drops.cksum_tcp = s.drops.cksum_tcp.wrapping_add(1);
+        return;
+    }
+
     // Find matching connection. The local-address slot is the fourth axis
     // (`rfc_net_identity_metal` §3.4): the same 4-tuple reached at two local
     // addresses is two distinct conns.
@@ -2007,6 +2606,12 @@ unsafe fn process_tcp_segment(
                 if let Some(li) =
                     tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port, local_slot, dst_owned)
                 {
+                    // A connection cannot be opened without an ISN secret:
+                    // a predictable ISS is an off-path injection surface, so
+                    // the SYN is dropped and the client retransmits.
+                    if !ensure_isn_secret(s) {
+                        return;
+                    }
                     let mut accept_idx: i32 = -1;
                     let mut fi = 0;
                     while fi < tcp::MAX_TCP_CONNS {
@@ -2020,13 +2625,20 @@ unsafe fn process_tcp_segment(
                     if accept_idx < 0 {
                         // No free slot — drop the SYN silently and let
                         // the client retransmit.
+                        s.tcp_half_open_refused = s.tcp_half_open_refused.wrapping_add(1);
                         log_info(s, b"[ip] tcp syn DROP no_slot");
                         return;
                     }
                     log_info(s, b"[ip] tcp syn received");
                     let idx = accept_idx as usize;
-                    let iss = s.step_count.wrapping_mul(2654435761);
                     let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
+                    let iss = compute_iss(
+                        s,
+                        local_ip_for_slot(s, local_slot),
+                        listener_port,
+                        ip_hdr.src_ip,
+                        tcp_hdr.src_port,
+                    );
                     let conn = &mut *s.tcp_conns.as_mut_ptr().add(idx);
                     *conn = tcp::TcpConn::new();
                     conn.local_port = listener_port;
@@ -2046,6 +2658,7 @@ unsafe fn process_tcp_segment(
                     conn.rto = tcp::RTO_INITIAL;
                     conn.retransmit_timer = 0;
                     conn.state = tcp::TcpState::SynReceived;
+                    note_half_open(s, ip_hdr.src_ip);
                     send_tcp_control(s, idx, tcp::SYN | tcp::ACK, false);
                     return;
                 }
@@ -2066,6 +2679,19 @@ unsafe fn process_tcp_segment(
             return;
         }
     };
+
+    // One admissibility decision, ahead of every state branch.
+    let ack_usable = match admit_tcp_segment(s, conn_idx, &tcp_hdr) {
+        Admission::Admit { ack_usable } => ack_usable,
+        Admission::Refused => return,
+    };
+
+    // Window updates are taken here, once, for every admitted segment that
+    // carries a usable ACK — never from inside a state branch, so no branch
+    // can install a window from a segment the gate would have refused.
+    if ack_usable {
+        note_window_update(s, conn_idx, &tcp_hdr);
+    }
 
     // Process TCP state machine using deferred actions to avoid borrow conflicts.
     // First update conn state, then perform sends/notifications.
@@ -2097,18 +2723,35 @@ unsafe fn process_tcp_segment(
 
         match conn.state {
             tcp::TcpState::SynSent => {
-                if (tcp_hdr.flags & (tcp::SYN | tcp::ACK)) == (tcp::SYN | tcp::ACK) {
-                    if tcp_hdr.ack_num == conn.snd_nxt {
-                        conn.rcv_nxt = tcp_hdr.seq_num.wrapping_add(1);
-                        conn.snd_una = tcp_hdr.ack_num;
-                        conn.snd_wnd = tcp_hdr.window;
-                        conn.state = tcp::TcpState::Established;
-                        conn.retransmit_timer = 0;
-                        action = ACTION_COMPLETE_CONNECT;
+                // RFC 9293 §3.10.7.3. `SEG.ACK` must acknowledge exactly our
+                // SYN — `ISS < SEG.ACK <= SND.NXT` collapses to `== SND.NXT`
+                // here because nothing else has been sent yet. An RST is
+                // acceptable ONLY when it carries such an ACK: without that
+                // test any host able to guess the four-tuple can refuse the
+                // connection, which is the whole point of the check.
+                let acks_our_syn =
+                    (tcp_hdr.flags & tcp::ACK) != 0 && tcp_hdr.ack_num == conn.snd_nxt;
+                if (tcp_hdr.flags & tcp::RST) != 0 {
+                    if acks_our_syn {
+                        conn.state = tcp::TcpState::Closed;
+                        action = ACTION_COMPLETE_REFUSED;
+                    } else {
+                        s.drops.tcp_ack_invalid = s.drops.tcp_ack_invalid.wrapping_add(1);
                     }
-                } else if (tcp_hdr.flags & tcp::RST) != 0 {
-                    conn.state = tcp::TcpState::Closed;
-                    action = ACTION_COMPLETE_REFUSED;
+                } else if (tcp_hdr.flags & (tcp::SYN | tcp::ACK)) == (tcp::SYN | tcp::ACK)
+                    && acks_our_syn
+                {
+                    conn.rcv_nxt = tcp_hdr.seq_num.wrapping_add(1);
+                    conn.snd_una = tcp_hdr.ack_num;
+                    tcp::apply_window_update(
+                        conn,
+                        tcp_hdr.seq_num,
+                        tcp_hdr.ack_num,
+                        tcp_hdr.window,
+                    );
+                    conn.state = tcp::TcpState::Established;
+                    conn.retransmit_timer = 0;
+                    action = ACTION_COMPLETE_CONNECT;
                 }
             }
             tcp::TcpState::Established => {
@@ -2116,13 +2759,12 @@ unsafe fn process_tcp_segment(
                     conn.state = tcp::TcpState::Closed;
                     action = ACTION_SET_CLOSED;
                 } else {
-                    if (tcp_hdr.flags & tcp::ACK) != 0 {
+                    if ack_usable {
                         let prev_una = conn.snd_una;
                         if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1))
                         {
                             conn.snd_una = tcp_hdr.ack_num;
                         }
-                        conn.snd_wnd = tcp_hdr.window;
                         if conn.snd_una != prev_una {
                             // New data acknowledged.
                             tcp::on_new_ack(conn);
@@ -2165,9 +2807,7 @@ unsafe fn process_tcp_segment(
                             // delivery is backpressure-rejected —
                             // CloseWait doesn't re-process data.
                             action = ACTION_RX_DATA_FIN;
-                        } else if tcp_hdr
-                            .seq_num
-                            .wrapping_add(tcp_hdr.payload_len as u32)
+                        } else if tcp_hdr.seq_num.wrapping_add(tcp_hdr.payload_len as u32)
                             == conn.rcv_nxt
                         {
                             // The FIN sits exactly at our receive
@@ -2189,13 +2829,19 @@ unsafe fn process_tcp_segment(
                 }
             }
             tcp::TcpState::FinWait1 => {
-                if (tcp_hdr.flags & tcp::ACK) != 0 {
+                // A FIN is honoured only at the receive position: `SEG.SEQ +
+                // payload == RCV.NXT`. Accepting one that merely fell in the
+                // window would let a segment sequenced ahead of undelivered
+                // bytes close the connection.
+                let fin_at_rcv_nxt = (tcp_hdr.flags & tcp::FIN) != 0
+                    && tcp_hdr.seq_num.wrapping_add(tcp_hdr.payload_len as u32) == conn.rcv_nxt;
+                if ack_usable {
                     if seq_between(conn.snd_una, tcp_hdr.ack_num, conn.snd_nxt.wrapping_add(1)) {
                         conn.snd_una = tcp_hdr.ack_num;
                     }
                     if tcp_hdr.ack_num == conn.snd_nxt {
-                        // FIN has been ACK'd
-                        if (tcp_hdr.flags & tcp::FIN) != 0 {
+                        // Our FIN has been acknowledged.
+                        if fin_at_rcv_nxt {
                             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
                             conn.state = tcp::TcpState::TimeWait;
                             conn.timewait_timer = 0;
@@ -2203,12 +2849,30 @@ unsafe fn process_tcp_segment(
                         } else {
                             conn.state = tcp::TcpState::FinWait2;
                         }
+                    } else if fin_at_rcv_nxt {
+                        // Simultaneous close: the peer's FIN arrived while
+                        // ours is still outstanding. Acknowledge it and wait
+                        // in CLOSING for the ACK of our own FIN.
+                        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+                        conn.state = tcp::TcpState::Closing;
+                        conn.retransmit_timer = 0;
+                        action = ACTION_SEND_ACK;
                     }
                     // Partial ACK (data ACK'd but not FIN) — stay in FinWait1
                 }
             }
+            tcp::TcpState::Closing => {
+                // Both FINs are exchanged; only the acknowledgement of ours
+                // is outstanding. Nothing else advances this state.
+                if ack_usable && tcp_hdr.ack_num == conn.snd_nxt {
+                    conn.state = tcp::TcpState::TimeWait;
+                    conn.timewait_timer = 0;
+                }
+            }
             tcp::TcpState::FinWait2 => {
-                if (tcp_hdr.flags & tcp::FIN) != 0 {
+                if (tcp_hdr.flags & tcp::FIN) != 0
+                    && tcp_hdr.seq_num.wrapping_add(tcp_hdr.payload_len as u32) == conn.rcv_nxt
+                {
                     conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
                     conn.state = tcp::TcpState::TimeWait;
                     conn.timewait_timer = 0;
@@ -2216,13 +2880,24 @@ unsafe fn process_tcp_segment(
                 }
             }
             tcp::TcpState::LastAck => {
-                if (tcp_hdr.flags & tcp::ACK) != 0 {
+                // Only the acknowledgement of our own FIN closes this
+                // state: a stale ACK of earlier data must not tear the
+                // slot down while the FIN is still in flight.
+                if ack_usable && tcp_hdr.ack_num == conn.snd_nxt {
                     conn.state = tcp::TcpState::Closed;
                     action = ACTION_SET_CLOSED;
                 }
             }
             tcp::TcpState::TimeWait => {
-                if (tcp_hdr.flags & tcp::FIN) != 0 {
+                // A retransmitted FIN at the receive position is re-ACKed and
+                // restarts the quiet period, which is what TIME-WAIT exists
+                // to provide. The gate has already established that the
+                // segment belongs to this conversation.
+                if (tcp_hdr.flags & tcp::FIN) != 0
+                    && tcp_hdr.seq_num.wrapping_add(tcp_hdr.payload_len as u32)
+                        == conn.rcv_nxt.wrapping_sub(1)
+                {
+                    conn.timewait_timer = 0;
                     action = ACTION_SEND_ACK;
                 }
             }
@@ -2238,11 +2913,10 @@ unsafe fn process_tcp_segment(
                     s.tcp_dup_syn_rx = s.tcp_dup_syn_rx.wrapping_add(1);
                     conn.retransmit_timer = 0;
                     action = ACTION_RETRANSMIT_SYNACK;
-                } else if (tcp_hdr.flags & tcp::ACK) != 0 {
+                } else if ack_usable {
                     // Handshake complete
                     if tcp_hdr.ack_num == conn.snd_nxt {
                         conn.snd_una = tcp_hdr.ack_num;
-                        conn.snd_wnd = tcp_hdr.window;
                         conn.state = tcp::TcpState::Established;
                         conn.retransmit_timer = 0;
                         action = ACTION_COMPLETE_ACCEPT;
@@ -2427,6 +3101,167 @@ unsafe fn process_tcp_segment(
     }
 }
 
+/// Emit a challenge ACK for `conn_idx` if both the global and the per-peer
+/// budget allow it (RFC 5961 §7).
+///
+/// The challenge ACK is the answer to a segment that is plausibly in the
+/// conversation but cannot be acted on. Every such segment is cheap for an
+/// off-path attacker to forge, so an unlimited response turns the defence
+/// into a reflector: the rate limit, not the check, is what keeps the
+/// exchange one-sided. A suppressed challenge is counted rather than logged
+/// — under a flood the log itself would be the amplifier.
+unsafe fn send_challenge_ack(s: &mut IpState, conn_idx: usize) -> bool {
+    let peer_budget = (*s.tcp_conns.as_ptr().add(conn_idx)).chal_budget;
+    if peer_budget == 0 || s.chal_ack_budget == 0 {
+        s.drops.tcp_challenge_suppressed = s.drops.tcp_challenge_suppressed.wrapping_add(1);
+        return false;
+    }
+    s.chal_ack_budget = s.chal_ack_budget.saturating_sub(1);
+    (*s.tcp_conns.as_mut_ptr().add(conn_idx)).chal_budget = peer_budget.saturating_sub(1);
+    s.drops.tcp_challenge_sent = s.drops.tcp_challenge_sent.wrapping_add(1);
+    send_tcp_control(s, conn_idx, tcp::ACK, false)
+}
+
+/// Outcome of the segment-admissibility gate.
+enum Admission {
+    /// The segment may reach the state machine. `ack_usable` is false when
+    /// `SEG.ACK` is below `SND.UNA`: RFC 9293 §3.10.7.4 ignores such an ACK
+    /// field but still processes the rest of the segment, so the payload is
+    /// not lost to a reordered acknowledgement.
+    Admit { ack_usable: bool },
+    /// Handled entirely by the gate — challenged, counted, or dropped.
+    Refused,
+}
+
+/// One admissibility decision for every synchronised state.
+///
+/// The state machine below is written on the assumption that a segment which
+/// reaches it belongs to the conversation. This gate is what makes that
+/// assumption true: receive-window acceptability over the segment's full
+/// sequence extent (RFC 9293 §3.10.7.4), RST classification (RFC 5961 §3.2),
+/// spoofed-SYN handling (RFC 5961 §4), and `SEG.ACK` range validation.
+///
+/// `SynSent` is excluded — it has no receive sequence space yet and RFC 9293
+/// §3.10.7.3 gives it separate rules, applied in its own branch. `Listen` and
+/// `Closed` slots are never reached here: `find_conn` matches on a concrete
+/// remote tuple.
+unsafe fn admit_tcp_segment(s: &mut IpState, conn_idx: usize, hdr: &tcp::TcpHeader) -> Admission {
+    let (state, rcv_nxt, rcv_wnd, snd_una, snd_nxt) = {
+        let c = &*s.tcp_conns.as_ptr().add(conn_idx);
+        (c.state, c.rcv_nxt, c.rcv_wnd, c.snd_una, c.snd_nxt)
+    };
+    if !state.is_synchronised() {
+        // `SynSent` only. Its branch validates `SEG.ACK` against `ISS`/`SND.NXT`
+        // itself and installs the window from the accepted SYN-ACK, so the
+        // shared ACK/window path stays out of it.
+        return Admission::Admit { ack_usable: false };
+    }
+
+    // A duplicate SYN in SYN-RECEIVED is the peer retransmitting its passive
+    // open. It carries the peer's ISS, exactly one below `RCV.NXT`, so it can
+    // never satisfy the window test. Admit that one shape — nothing else with
+    // the SYN bit gets past this gate in a synchronised state.
+    if state == tcp::TcpState::SynReceived
+        && (hdr.flags & tcp::SYN) != 0
+        && (hdr.flags & (tcp::ACK | tcp::RST)) == 0
+    {
+        if hdr.seq_num == rcv_nxt.wrapping_sub(1) {
+            return Admission::Admit { ack_usable: false };
+        }
+        s.drops.tcp_unacceptable = s.drops.tcp_unacceptable.wrapping_add(1);
+        return Admission::Refused;
+    }
+
+    // RFC 5961 §3.2 — RST is decided on its own sequence rules, before the
+    // window test, because a legitimate RST is the one segment whose sequence
+    // must match exactly rather than merely fall in the window.
+    if (hdr.flags & tcp::RST) != 0 {
+        return match tcp::classify_rst(rcv_nxt, rcv_wnd, hdr.seq_num) {
+            tcp::RstAction::Reset => Admission::Admit { ack_usable: false },
+            tcp::RstAction::Challenge => {
+                send_challenge_ack(s, conn_idx);
+                Admission::Refused
+            }
+            tcp::RstAction::Drop => {
+                s.drops.tcp_rst_out_of_window = s.drops.tcp_rst_out_of_window.wrapping_add(1);
+                Admission::Refused
+            }
+        };
+    }
+
+    // TIME-WAIT exists to absorb a retransmitted peer FIN, which sits one
+    // below `RCV.NXT` and so can never satisfy the window test. Admit exactly
+    // that shape; the branch re-ACKs it and restarts the quiet period.
+    if state == tcp::TcpState::TimeWait
+        && (hdr.flags & tcp::FIN) != 0
+        && hdr.seq_num.wrapping_add(hdr.payload_len as u32) == rcv_nxt.wrapping_sub(1)
+    {
+        return Admission::Admit { ack_usable: false };
+    }
+
+    let span = tcp::seg_len(hdr.flags, hdr.payload_len);
+    let mut acceptable = tcp::segment_acceptable(rcv_nxt, rcv_wnd, hdr.seq_num, span);
+    if !acceptable && rcv_wnd == 0 && span > 0 {
+        // The window may have been closed by consumer backpressure that has
+        // since drained. Re-poll before refusing the peer's retransmit: this
+        // is the path by which a backpressured stream resumes.
+        update_rcv_wnd(s, conn_idx);
+        let reopened = (*s.tcp_conns.as_ptr().add(conn_idx)).rcv_wnd;
+        acceptable = tcp::segment_acceptable(rcv_nxt, reopened, hdr.seq_num, span);
+    }
+    if !acceptable {
+        s.drops.tcp_unacceptable = s.drops.tcp_unacceptable.wrapping_add(1);
+        send_challenge_ack(s, conn_idx);
+        return Admission::Refused;
+    }
+
+    // RFC 5961 §4 — a SYN inside the window of an established conversation is
+    // spoofed or a stale duplicate. Answering with a challenge ACK lets a
+    // genuine peer that really did restart discover the true sequence and
+    // send a correctly-sequenced RST; acting on the SYN itself would let one
+    // forged segment tear the connection down.
+    if (hdr.flags & tcp::SYN) != 0 {
+        s.drops.tcp_unacceptable = s.drops.tcp_unacceptable.wrapping_add(1);
+        send_challenge_ack(s, conn_idx);
+        return Admission::Refused;
+    }
+
+    // Synchronised states carry ACK on every segment; one without it is not
+    // part of the conversation.
+    if (hdr.flags & tcp::ACK) == 0 {
+        s.drops.tcp_unacceptable = s.drops.tcp_unacceptable.wrapping_add(1);
+        return Admission::Refused;
+    }
+
+    if tcp::seq_lt(snd_nxt, hdr.ack_num) {
+        // Acknowledges data never sent.
+        s.drops.tcp_ack_invalid = s.drops.tcp_ack_invalid.wrapping_add(1);
+        send_challenge_ack(s, conn_idx);
+        return Admission::Refused;
+    }
+    let ack_usable = tcp::ack_acceptable(snd_una, snd_nxt, hdr.ack_num);
+    if !ack_usable {
+        s.drops.tcp_ack_invalid = s.drops.tcp_ack_invalid.wrapping_add(1);
+    }
+    Admission::Admit { ack_usable }
+}
+
+/// Take `SEG.WND` as the peer's window if the segment is newer than the one
+/// that last set it, else count the refusal (`SND.WL1`/`SND.WL2`,
+/// RFC 9293 §3.10.7.4).
+unsafe fn note_window_update(s: &mut IpState, conn_idx: usize, hdr: &tcp::TcpHeader) {
+    let allowed = {
+        let conn = &*s.tcp_conns.as_ptr().add(conn_idx);
+        tcp::window_update_allowed(conn, hdr.seq_num, hdr.ack_num)
+    };
+    if allowed {
+        let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
+        tcp::apply_window_update(conn, hdr.seq_num, hdr.ack_num, hdr.window);
+    } else {
+        s.drops.tcp_stale_window = s.drops.tcp_stale_window.wrapping_add(1);
+    }
+}
+
 /// Check if `val` is between `start` (inclusive) and `end` (exclusive) in sequence space.
 fn seq_between(start: u32, val: u32, end: u32) -> bool {
     let len = end.wrapping_sub(start);
@@ -2447,10 +3282,18 @@ unsafe fn send_tcp_rst(
         return;
     }
 
+    // RFC 9293 §3.10.7.1. Without an ACK to mirror, the RST must acknowledge
+    // the whole of the offending segment's sequence space — its payload plus
+    // one for each of SYN and FIN. A closed-port RST answering a bare SYN
+    // with `SEG.SEQ` alone is one short, and the peer discards it as
+    // out-of-window, so the connect hangs to its own timeout instead of
+    // failing immediately.
     let (seq, ack, flags) = if (hdr.flags & tcp::ACK) != 0 {
         (hdr.ack_num, 0u32, tcp::RST)
     } else {
-        let ack = hdr.seq_num.wrapping_add(hdr.payload_len as u32);
+        let ack = hdr
+            .seq_num
+            .wrapping_add(tcp::seg_len(hdr.flags, hdr.payload_len));
         (0u32, ack, tcp::RST | tcp::ACK)
     };
 
@@ -2604,6 +3447,13 @@ unsafe fn send_tcp_data(
     payload: *const u8,
     payload_len: usize,
 ) -> bool {
+    // The frame builder's own precondition: `payload` is copied into the
+    // fixed `tx_frame`, and the caller's stash buffer is larger than that
+    // frame on aarch64. Refuse before the copy rather than trusting the
+    // segmenter's `MSS` cap to stay below the frame ceiling.
+    if payload_len > MAX_TCP_TX_PAYLOAD {
+        return false;
+    }
     if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
         return false;
     }
@@ -2707,6 +3557,12 @@ fn is_broadcast_dst(dst: u32, local_ip: u32, netmask: u32) -> bool {
 /// tick rate would flood the L2 domain. Consumers that legitimately
 /// need broadcast (DHCP, future mDNS/NBNS responders) build their
 /// own frame and bypass this path.
+///
+/// Returns `0` when the datagram was staged (or transiently dropped for an
+/// unresolved neighbour, which UDP permits), or a negative errno the caller
+/// must report to the consumer. The size bound is enforced BEFORE any copy:
+/// the command buffer is larger than `tx_frame` on aarch64, so a late check
+/// would already have run past the end of the frame buffer.
 unsafe fn send_udp_data(
     s: &mut IpState,
     dst_ip: u32,
@@ -2714,9 +3570,14 @@ unsafe fn send_udp_data(
     src_port: u16,
     payload: *const u8,
     payload_len: usize,
-) {
+) -> i8 {
+    if payload_len > MAX_UDP_TX_PAYLOAD {
+        s.drops.udp_oversize = s.drops.udp_oversize.wrapping_add(1);
+        return E_MSGSIZE;
+    }
+
     if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
-        return;
+        return 0;
     }
 
     if is_broadcast_dst(dst_ip, s.local_ip, s.netmask) {
@@ -2726,13 +3587,18 @@ unsafe fn send_udp_data(
             let msg = b"[ip] UDP broadcast rejected (build-your-own-frame if legitimate)";
             dev_log(sys, 2, msg.as_ptr(), msg.len());
         }
-        return;
+        return 0;
+    }
+
+    if next_hop(s, dst_ip).is_none() {
+        s.drops.route_unreachable = s.drops.route_unreachable.wrapping_add(1);
+        return E_NETUNREACH;
     }
 
     let dst_mac = resolve_mac(s, dst_ip);
     let dst_mac = match dst_mac {
         Some(m) => m,
-        None => return,
+        None => return 0,
     };
 
     let hdr_offset = eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN;
@@ -2777,6 +3643,69 @@ unsafe fn send_udp_data(
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
     send_frame(s, s.tx_frame.as_ptr(), total);
+    0
+}
+
+/// Arm a permanent gateway pin: discard whatever the cache holds for `gw`
+/// and resolve it afresh. The pin is installed by `process_arp` when the
+/// correlated reply lands, so an entry seeded before this point — including
+/// one an attacker raced in ahead of the lease — is never the one promoted.
+unsafe fn arm_gateway_pin(s: &mut IpState, gw: u32) {
+    arp::invalidate(&mut s.arp_table, gw);
+    s.gw_pin_pending = true;
+    s.gw_pin_ip = gw;
+    s.gw_pin_armed_step = s.step_count;
+    // Issues the request when no other resolution is outstanding; the
+    // periodic maintenance pass retries otherwise.
+    let _ = resolve_mac(s, gw);
+}
+
+/// Periodic ARP upkeep: age the table, account permanent-pin revalidations,
+/// and drive an outstanding gateway pin to completion.
+unsafe fn step_arp_maintenance(s: &mut IpState) {
+    let revalidations = arp::age_entries(&mut s.arp_table);
+    if revalidations > 0 {
+        s.drops.arp_pin_revalidate = s.drops.arp_pin_revalidate.wrapping_add(revalidations);
+    }
+
+    // A permanent pin that has gone unconfirmed must be re-earned by a live
+    // exchange rather than trusted indefinitely.
+    if let Some(ip) = arp::revalidation_due(&s.arp_table) {
+        if ip == s.gateway && s.gateway != 0 && !s.gw_pin_pending {
+            arm_gateway_pin(s, s.gateway);
+            return;
+        }
+    }
+
+    // Retry an armed pin whose request could not go out because another
+    // resolution held the single pending slot.
+    if s.gw_pin_pending
+        && s.gw_pin_ip != 0
+        && s.arp_pending_state == arp::ARP_PENDING_NONE
+        && arp::lookup(&s.arp_table, s.gw_pin_ip).is_none()
+    {
+        let gw = s.gw_pin_ip;
+        let _ = resolve_mac(s, gw);
+    }
+}
+
+/// Next-hop IPv4 for `dst` under the deliberately small route model: one
+/// subnet plus one default gateway. `None` means there is no route — an
+/// off-subnet destination with no gateway configured. ARPing directly for
+/// such a destination would let anything on the local segment answer for an
+/// address it does not own, so the send fails with `ENETUNREACH` instead.
+fn next_hop(s: &IpState, dst: u32) -> Option<u32> {
+    if dst == 0xFFFF_FFFF {
+        return Some(dst);
+    }
+    if s.netmask == 0 || (dst & s.netmask) == (s.local_ip & s.netmask) {
+        return Some(dst);
+    }
+    if s.gateway != 0 {
+        Some(s.gateway)
+    } else {
+        None
+    }
 }
 
 /// Resolve IP to MAC (returns cached entry or triggers ARP request).
@@ -2786,15 +3715,14 @@ unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
         return Some(eth::BROADCAST_MAC);
     }
 
-    // Use gateway if destination is off-subnet
-    let target_ip = if s.netmask != 0 && (ip & s.netmask) != (s.local_ip & s.netmask) {
-        if s.gateway != 0 {
-            s.gateway
-        } else {
-            ip
+    // Off-subnet destinations route through the default gateway; with no
+    // gateway there is no route at all (see `next_hop`).
+    let target_ip = match next_hop(s, ip) {
+        Some(nh) => nh,
+        None => {
+            s.drops.route_unreachable = s.drops.route_unreachable.wrapping_add(1);
+            return None;
         }
-    } else {
-        ip
     };
 
     // Check ARP table
@@ -2935,20 +3863,44 @@ unsafe fn send_dhcp_request(s: &mut IpState) {
 
 /// Process a DHCP reply (called from UDP handler).
 unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
-    let parsed = match dhcp::parse_dhcp_reply(data, len, s.dhcp.xid) {
+    let bootp_compat = s.dhcp_compat != 0;
+    let client_mac = s.mac_addr;
+    let parsed = match dhcp::parse_dhcp_reply(data, len, s.dhcp.xid, &client_mac, bootp_compat) {
         Some(p) => p,
-        None => return,
+        None => {
+            s.drops.dhcp_uncorrelated = s.drops.dhcp_uncorrelated.wrapping_add(1);
+            return;
+        }
     };
-    let (msg_type, offered_ip, server_ip, subnet_mask, gateway, dns, lease_time) = parsed;
+    let dhcp::DhcpReply {
+        msg_type,
+        offered_ip,
+        server_ip,
+        subnet_mask,
+        gateway,
+        dns,
+        lease_time,
+    } = parsed;
 
     // Reject replies from servers other than the configured one.
     if s.dhcp.expected_server != 0 && server_ip != s.dhcp.expected_server {
         log_info(s, b"[ip] dhcp reject: unexpected server");
+        s.drops.dhcp_uncorrelated = s.drops.dhcp_uncorrelated.wrapping_add(1);
         return;
     }
 
+    // The mask actually adopted is validated, not the one on the wire: an
+    // absent option 1 means the /24 default below, and validating the raw
+    // zero would check a mask the stack never uses (making every gateway
+    // look on-subnet and every host part look valid).
+    let effective_mask = if subnet_mask != 0 {
+        subnet_mask
+    } else {
+        0xFFFF_FF00
+    };
+
     // Sanity-check the offered configuration.
-    if !dhcp::validate_dhcp_config(offered_ip, subnet_mask, gateway, lease_time) {
+    if !dhcp::validate_dhcp_config(offered_ip, effective_mask, gateway, lease_time) {
         log_info(s, b"[ip] dhcp reject: invalid config");
         return;
     }
@@ -2959,7 +3911,7 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
             if s.dhcp.state == dhcp::DhcpState::Discovering {
                 s.dhcp.offered_ip = offered_ip;
                 s.dhcp.server_ip = server_ip;
-                s.dhcp.subnet_mask = subnet_mask;
+                s.dhcp.subnet_mask = effective_mask;
                 s.dhcp.gateway = gateway;
                 s.dhcp.dns_server = dns;
                 s.dhcp.lease_time = lease_time;
@@ -2971,10 +3923,31 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
         }
         dhcp::DHCP_ACK => {
             log_info(s, b"[ip] dhcp ack rx");
-            // Accept ACK in either Requesting or Discovering state.
-            // Some DHCP servers (e.g. QEMU SLIRP) may send ACK directly.
-            if s.dhcp.state == dhcp::DhcpState::Requesting
-                || s.dhcp.state == dhcp::DhcpState::Discovering
+            // An ACK completes the exchange the REQUEST started, so it must
+            // come from the server we selected and name the address we asked
+            // for. Without both bindings any server on the segment can
+            // answer a REQUEST addressed to another, and a changed `yiaddr`
+            // silently redirects the client's identity.
+            // `server_ip == 0` covers a selection made from an OFFER that
+            // carried no server identifier; there is then nothing to bind to
+            // and the address match is the whole correlation.
+            let matches_selection = (s.dhcp.server_ip == 0 || server_ip == s.dhcp.server_ip)
+                && offered_ip == s.dhcp.offered_ip;
+            let bound_to_offer = s.dhcp.state == dhcp::DhcpState::Requesting && matches_selection;
+            // A renewal REQUEST is sent from BOUND and its ACK arrives there;
+            // it must match the same server and address as the lease it
+            // renews.
+            let renewal =
+                s.dhcp.state == dhcp::DhcpState::Bound && s.dhcp.renew_sent && matches_selection;
+            // A server that ACKs a DISCOVER without offering first (some
+            // embedded servers, QEMU SLIRP) skips the selection step
+            // entirely; there is then no offer to bind the ACK to.
+            let direct_ack = s.dhcp.state == dhcp::DhcpState::Discovering && s.dhcp_compat != 0;
+            if !bound_to_offer && !renewal && !direct_ack {
+                log_info(s, b"[ip] dhcp reject: ack does not match offer");
+                s.drops.dhcp_uncorrelated = s.drops.dhcp_uncorrelated.wrapping_add(1);
+                return;
+            }
             {
                 // Distinguish first acquisition from a lease renewal: only a
                 // renewal announces (gratuitous ARP for slot 0,
@@ -2982,11 +3955,7 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                 // byte-identical to pre-multi-address behaviour.
                 let renewing = s.dhcp.renew_sent;
                 s.local_ip = offered_ip;
-                s.netmask = if subnet_mask != 0 {
-                    subnet_mask
-                } else {
-                    0xFFFFFF00
-                };
+                s.netmask = effective_mask;
                 s.gateway = gateway;
                 s.dns_server = dns;
                 // Mirror the primary identity into slot 0 of the address table.
@@ -3002,9 +3971,11 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                 // an opaque tick counter and multiplying by 1000 to get ms).
                 s.dhcp.lease_duration = lease_time.saturating_mul(1000);
                 s.dhcp.renew_sent = false;
-                // Permanently pin the gateway ARP entry if already learnt.
+                // Resolve the gateway afresh, then pin the mapping that
+                // exchange produces (see `arm_gateway_pin`).
                 if s.gateway != 0 {
-                    arp::pin_gateway(&mut s.arp_table, s.gateway);
+                    let gw = s.gateway;
+                    arm_gateway_pin(s, gw);
                 }
 
                 // Log the assigned IP address with startup timing
@@ -3111,7 +4082,13 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
         return;
     }
     let (ci, si) = (ci as usize, si as usize);
-    let local_port = next_port(s);
+    let local_port = match next_port(s) {
+        Some(p) => p,
+        None => {
+            let _ = net_send_error(s, 0, -99, requester_tag); // EADDRNOTAVAIL
+            return;
+        }
+    };
 
     // Established immediately — there is no handshake to perform.
     // `remote_ip` stays 0 so no close path ever touches the ARP table
@@ -3618,10 +4595,14 @@ unsafe fn service_net_channels(s: &mut IpState) {
 
                         if conn_id < 0 {
                             net_send_error(s, 0, -12, requester_tag); // ENOMEM
-                        } else {
+                        } else if !ensure_isn_secret(s) {
+                            // EAGAIN — entropy may arrive later; the caller
+                            // may retry, but the stack will not substitute a
+                            // predictable sequence in the meantime.
+                            net_send_error(s, 0, -11, requester_tag);
+                        } else if let Some(local_port) = next_port(s) {
                             let ci = conn_id as usize;
-                            let local_port = next_port(s);
-                            let iss = s.step_count.wrapping_mul(2654435761);
+                            let iss = compute_iss(s, s.local_ip, local_port, ip, port);
 
                             let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
                             conn.state = tcp::TcpState::SynSent;
@@ -3641,6 +4622,9 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             conn.retransmit_timer = 0;
 
                             send_tcp_control(s, ci, tcp::SYN, false);
+                        } else {
+                            // EADDRNOTAVAIL — no ephemeral port available.
+                            net_send_error(s, 0, -99, requester_tag);
                         }
                     }
                 }
@@ -3714,16 +4698,14 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 // byte-identical to the pre-P2 datagram bind.
                 if plen >= 2 {
                     let req_port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
-                    let port = if req_port == 0 {
-                        next_port(s)
-                    } else {
-                        req_port
-                    };
                     let owner_tag = if plen >= 5 {
                         u16::from_le_bytes([*buf.as_ptr().add(3), *buf.as_ptr().add(4)])
                     } else {
                         0
                     };
+                    // Resolve the owner's address slot before drawing a port:
+                    // a bind that is going to be refused must not consume an
+                    // ephemeral allocation.
                     let target_slot = if owner_tag == 0 {
                         Some(LOCAL_SLOT_ANY)
                     } else {
@@ -3738,11 +4720,51 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             continue;
                         }
                     };
-                    let mut ep_id: i32 = -1;
-                    let mut ci = 0;
-                    while ci < tcp::MAX_TCP_CONNS {
-                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
-                        if slot_is_free(conn) {
+                    let port = if req_port == 0 {
+                        // Collision-aware: `next_port` probes the live table
+                        // for every candidate, so an ephemeral bind cannot
+                        // land on a port another endpoint already holds.
+                        match next_port(s) {
+                            Some(p) => p,
+                            None => {
+                                log_info(s, b"[ip] dg bind: no ephemeral port");
+                                dg_send_error(s, 0, -99); // EADDRNOTAVAIL
+                                count += 1;
+                                continue;
+                            }
+                        }
+                    } else {
+                        req_port
+                    };
+
+                    // Bind admission. A datagram endpoint's local identity is
+                    // `(protocol, local_port, local_slot)`; the owner stamp
+                    // distinguishes a retry by the holder from a second
+                    // claimant. Two endpoints on the same port at two distinct
+                    // concrete address slots are genuinely distinct sockets and
+                    // both stand; anything whose reachability overlaps is a
+                    // conflict, because delivery picks one and the other would
+                    // silently never receive.
+                    match dg_bind_admission(s, port, target_slot, owner_tag) {
+                        DgBind::Existing(idx) => {
+                            log_info(s, b"[ip] dg bind: existing endpoint");
+                            dg_send_bound(s, idx as u8, port);
+                            count += 1;
+                            continue;
+                        }
+                        DgBind::Conflict => {
+                            log_info(s, b"[ip] dg bind: in use");
+                            s.drops.dg_bind_conflict = s.drops.dg_bind_conflict.wrapping_add(1);
+                            dg_send_error(s, 0, -98); // EADDRINUSE
+                            count += 1;
+                            continue;
+                        }
+                        DgBind::Fresh => {}
+                    }
+
+                    match alloc_dg_slot(s) {
+                        Some(ci) => {
+                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
                             *conn = tcp::TcpConn::new();
                             conn.state = tcp::TcpState::Listen;
                             conn.local_port = port;
@@ -3751,17 +4773,14 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             // wildcard endpoint is not served on owned
                             // secondaries (see `process_udp_packet`).
                             conn.local_slot = target_slot;
-                            ep_id = ci as i32;
-                            break;
+                            conn.owner_tag = owner_tag;
+                            log_info(s, b"[ip] dg bind");
+                            dg_send_bound(s, ci as u8, port);
                         }
-                        ci += 1;
-                    }
-                    if ep_id >= 0 {
-                        log_info(s, b"[ip] dg bind");
-                        dg_send_bound(s, ep_id as u8, port);
-                    } else {
-                        log_info(s, b"[ip] dg bind: no free conn");
-                        dg_send_error(s, 0, -12); // ENOMEM
+                        None => {
+                            log_info(s, b"[ip] dg bind: no free conn");
+                            dg_send_error(s, 0, -12); // ENOMEM
+                        }
                     }
                 }
             }
@@ -3784,9 +4803,18 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             let dst_port = u16::from_le_bytes([*bp.add(6), *bp.add(7)]);
                             let udp_data = bp.add(8);
                             let udp_len = plen - 8;
-                            send_udp_data(s, dst_ip, dst_port, conn.local_port, udp_data, udp_len);
+                            let local_port = conn.local_port;
+                            let rv =
+                                send_udp_data(s, dst_ip, dst_port, local_port, udp_data, udp_len);
+                            if rv != 0 {
+                                dg_send_error(s, ep_id as u8, rv);
+                            }
                         } else {
-                            dg_send_error(s, ep_id as u8, -22); // EINVAL
+                            // The slot exists but holds no live datagram
+                            // endpoint: a stale handle whose endpoint was
+                            // closed, or a slot that was never bound.
+                            s.drops.dg_ep_unowned = s.drops.dg_ep_unowned.wrapping_add(1);
+                            dg_send_error(s, ep_id as u8, -88); // ENOTSOCK
                         }
                     } else {
                         dg_send_error(s, ep_id as u8, -97); // EAFNOSUPPORT
@@ -3797,13 +4825,22 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 // datagram close. Payload: [ep_id: u8].
                 if plen >= 1 {
                     let ep_id = *buf.as_ptr() as usize;
-                    if ep_id < tcp::MAX_TCP_CONNS {
+                    let live = ep_id < tcp::MAX_TCP_CONNS && {
                         let conn = &*s.tcp_conns.as_ptr().add(ep_id);
-                        if conn.is_datagram {
-                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ep_id);
-                            *conn = tcp::TcpConn::new();
-                            dg_send_closed(s, ep_id as u8);
-                        }
+                        conn.is_datagram && conn.state == tcp::TcpState::Listen
+                    };
+                    if live {
+                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(ep_id);
+                        *conn = tcp::TcpConn::new();
+                        dg_send_closed(s, ep_id as u8);
+                    } else {
+                        // A close naming a slot that is not a live endpoint
+                        // is answered rather than silently absorbed: the
+                        // counter is what distinguishes a consumer's own
+                        // duplicate close from a probe across the shared
+                        // command channel.
+                        s.drops.dg_ep_unowned = s.drops.dg_ep_unowned.wrapping_add(1);
+                        dg_send_error(s, ep_id as u8, -88); // ENOTSOCK
                     }
                 }
             }
@@ -3834,6 +4871,40 @@ fn is_syn_retransmit_tick(timer: u16) -> bool {
 }
 
 unsafe fn step_tcp_timers(s: &mut IpState) {
+    // Refill the challenge-ACK buckets once per ≈1 s window. Refilling to a
+    // fixed ceiling rather than accumulating tokens keeps the burst bound and
+    // the long-run rate the same number, which is what makes the defence
+    // non-amplifying under a sustained flood.
+    s.chal_refill_ticks = s.chal_refill_ticks.saturating_add(1);
+    if s.chal_refill_ticks >= tcp::CHALLENGE_ACK_REFILL_TICKS {
+        s.chal_refill_ticks = 0;
+        s.chal_ack_budget = tcp::CHALLENGE_ACK_GLOBAL_BUDGET;
+        let mut ci = 0;
+        while ci < tcp::MAX_TCP_CONNS {
+            (*s.tcp_conns.as_mut_ptr().add(ci)).chal_budget = tcp::CHALLENGE_ACK_PEER_BUDGET;
+            ci += 1;
+        }
+    }
+
+    // Reopen a receive window that consumer backpressure closed. Without
+    // this the admissibility gate — which refuses every data segment while
+    // `rcv_wnd == 0` — would have no path back once the consumer drained.
+    {
+        let mut ci = 0;
+        while ci < tcp::MAX_TCP_CONNS {
+            let c = &*s.tcp_conns.as_ptr().add(ci);
+            if c.rcv_wnd == 0
+                && matches!(
+                    c.state,
+                    tcp::TcpState::Established | tcp::TcpState::SynReceived
+                )
+            {
+                update_rcv_wnd(s, ci);
+            }
+            ci += 1;
+        }
+    }
+
     // Retry pending close-notifications first. Terminal slots
     // (`state == Closed`) are freed on successful retry; non-terminal
     // slots (`CloseWait`, `LastAck`) carried peer-FIN news to the
@@ -3877,9 +4948,15 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
         match conn.state {
             tcp::TcpState::SynSent => {
                 conn.retransmit_timer += 1;
+                // A SYN that never reached the wire (`snd_nxt` still at
+                // `iss`) is not a loss to back off from — it was blocked on
+                // neighbour resolution or NIC backpressure. Retry it every
+                // tick until it ships; the backoff schedule then governs
+                // genuine retransmits.
+                let unsent = conn.snd_nxt == conn.iss;
                 // Retransmit SYN on the exponential-backoff schedule
                 // (0.5/1.5/3.5/7.5 s) so a dropped SYN recovers fast.
-                if is_syn_retransmit_tick(conn.retransmit_timer) {
+                if unsent || is_syn_retransmit_tick(conn.retransmit_timer) {
                     send_tcp_control(s, i, tcp::SYN, true);
                 }
                 // Connect timeout after ~15 s: emit exactly one TAGGED terminal
@@ -3901,15 +4978,33 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
             }
             tcp::TcpState::SynReceived => {
                 conn.retransmit_timer += 1;
+                // As for SYN-SENT: an unsent SYN-ACK is waiting on neighbour
+                // resolution, not on the peer.
+                let unsent = conn.snd_nxt == conn.iss;
                 // Retransmit SYN-ACK on the exponential-backoff schedule
                 // (0.5/1.5/3.5/7.5 s) instead of the old flat 3 s — a dropped
                 // SYN-ACK was the main cause of slow connection establishment.
-                if is_syn_retransmit_tick(conn.retransmit_timer) {
+                if unsent || is_syn_retransmit_tick(conn.retransmit_timer) {
                     send_tcp_control(s, i, tcp::SYN | tcp::ACK, true);
                 }
                 // Timeout after ~15 seconds — free the slot.
                 if conn.retransmit_timer >= 300 {
                     *conn = tcp::TcpConn::new();
+                }
+            }
+            tcp::TcpState::Closing => {
+                // Waiting only for the ACK of our own FIN. Bound the wait so a
+                // peer that vanishes mid-simultaneous-close cannot hold the
+                // slot: same ~15 s ceiling the half-open states use.
+                conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
+                if conn.retransmit_timer >= 300 {
+                    let remote_ip = conn.remote_ip;
+                    if net_send_closed(s, i as u16) {
+                        if remote_ip != 0 {
+                            arp::unpin(&mut s.arp_table, remote_ip);
+                        }
+                        *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                    }
                 }
             }
             tcp::TcpState::TimeWait => {
@@ -3967,7 +5062,255 @@ pub mod test_helpers {
     //! exercised directly. Using them outside of `cfg(test)` is a
     //! contract violation — the kernel should never need them.
 
-    use super::{tcp, IpState};
+    use super::{arp, tcp, IpDrops, IpState};
+
+    /// Install a fixed ISN secret so a test can assert an exact sequence
+    /// number without depending on the harness CSPRNG. Production seeds this
+    /// from the kernel CSPRNG and refuses to open connections without it.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn set_isn_secret(state: *mut u8, secret: [u8; 16]) {
+        let s = &mut *(state as *mut IpState);
+        s.isn_secret = secret;
+        s.isn_secret_valid = true;
+    }
+
+    /// Set the MAC without forcing a configured identity, so a test can
+    /// exercise the real DHCP bring-up.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn set_mac(state: *mut u8, mac: [u8; 6]) {
+        let s = &mut *(state as *mut IpState);
+        s.mac_addr = mac;
+        s.mac_valid = true;
+    }
+
+    /// Snapshot of the module state immediately following `tx_frame`. A
+    /// transmit that runs past the frame buffer lands here, so a test can
+    /// assert the boundary held without reasoning about field layout.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn tx_frame_canary(state: *const u8) -> [u8; 64] {
+        let s = &*(state as *const IpState);
+        let past = s.tx_frame.as_ptr().add(super::MAX_FRAME_SIZE);
+        let mut out = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            out[i] = *past.add(i);
+            i += 1;
+        }
+        out
+    }
+
+    /// Promote an ARP entry to a permanent pin, standing in for a completed
+    /// gateway resolution.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn pin_gateway(state: *mut u8, ip: u32) -> bool {
+        let s = &mut *(state as *mut IpState);
+        arp::pin_gateway(&mut s.arp_table, ip)
+    }
+
+    /// Read the ingress refusal counters.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn drops(state: *const u8) -> IpDrops {
+        (*(state as *const IpState)).drops
+    }
+
+    /// Half-open gauges: `(current, max, per_source_max, refused)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn half_open(state: *const u8) -> (u16, u16, u16, u32) {
+        let s = &*(state as *const IpState);
+        (
+            s.tcp_half_open,
+            s.tcp_half_open_max,
+            s.tcp_half_open_src_max,
+            s.tcp_half_open_refused,
+        )
+    }
+
+    /// Local port latched on a connection slot.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn conn_local_port(state: *const u8, idx: usize) -> u16 {
+        (*(state as *const IpState)).tcp_conns[idx].local_port
+    }
+
+    /// Global challenge-ACK bucket: `(remaining, ticks_into_refill_window)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn challenge_bucket(state: *const u8) -> (u8, u8) {
+        let s = &*(state as *const IpState);
+        (s.chal_ack_budget, s.chal_refill_ticks)
+    }
+
+    /// Sequence and window variables of one connection slot, so a test can
+    /// assert what a segment did to the state machine rather than inferring
+    /// it from emitted frames.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct ConnView {
+        /// `TcpState` discriminant.
+        pub state: u8,
+        pub local_port: u16,
+        pub remote_port: u16,
+        pub snd_una: u32,
+        pub snd_nxt: u32,
+        pub snd_wnd: u16,
+        pub snd_wl1: u32,
+        pub snd_wl2: u32,
+        pub rcv_nxt: u32,
+        pub rcv_wnd: u16,
+        pub dup_ack_count: u8,
+        pub chal_budget: u8,
+        pub is_datagram: bool,
+        pub local_slot: u8,
+        pub owner_tag: u16,
+    }
+
+    /// Read one connection slot.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn conn_view(state: *const u8, idx: usize) -> ConnView {
+        let c = &(*(state as *const IpState)).tcp_conns[idx];
+        ConnView {
+            state: c.state as u8,
+            local_port: c.local_port,
+            remote_port: c.remote_port,
+            snd_una: c.snd_una,
+            snd_nxt: c.snd_nxt,
+            snd_wnd: c.snd_wnd,
+            snd_wl1: c.snd_wl1,
+            snd_wl2: c.snd_wl2,
+            rcv_nxt: c.rcv_nxt,
+            rcv_wnd: c.rcv_wnd,
+            dup_ack_count: c.dup_ack_count,
+            chal_budget: c.chal_budget,
+            is_datagram: c.is_datagram,
+            local_slot: c.local_slot,
+            owner_tag: c.owner_tag,
+        }
+    }
+
+    /// Force a connection's advertised receive window, standing in for the
+    /// consumer backpressure that closes it in production.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn set_rcv_wnd(state: *mut u8, idx: usize, wnd: u16) {
+        (*(state as *mut IpState)).tcp_conns[idx].rcv_wnd = wnd;
+    }
+
+    /// Initial send sequence number latched on a connection slot.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn conn_iss(state: *const u8, idx: usize) -> u32 {
+        (*(state as *const IpState)).tcp_conns[idx].iss
+    }
+
+    /// ARP cache view for one address: `(mac, pinned, pin_count, revalidate)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn arp_entry(state: *const u8, ip: u32) -> Option<([u8; 6], bool, u8, bool)> {
+        let s = &*(state as *const IpState);
+        let mut i = 0;
+        while i < arp::ARP_TABLE_SIZE {
+            let e = &s.arp_table[i];
+            if e.valid && e.ip == ip {
+                return Some((e.mac, e.pinned, e.pin_count, e.revalidate));
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Seed an ARP cache entry directly, standing in for whatever traffic
+    /// would have installed it.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn seed_arp(state: *mut u8, ip: u32, mac: [u8; 6]) {
+        let s = &mut *(state as *mut IpState);
+        arp::insert(&mut s.arp_table, ip, mac, 0);
+    }
+
+    /// Force ARP aging forward by `passes` maintenance ticks.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn age_arp(state: *mut u8, passes: u32) -> u32 {
+        let s = &mut *(state as *mut IpState);
+        let mut revalidations = 0;
+        let mut i = 0;
+        while i < passes {
+            revalidations += arp::age_entries(&mut s.arp_table);
+            i += 1;
+        }
+        s.drops.arp_pin_revalidate = s.drops.arp_pin_revalidate.wrapping_add(revalidations);
+        revalidations
+    }
+
+    /// Drive one periodic ARP maintenance pass.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn arp_maintenance(state: *mut u8) {
+        super::step_arp_maintenance(&mut *(state as *mut IpState));
+    }
+
+    /// DHCP client state as its discriminant, plus the bound identity:
+    /// `(state, local_ip, netmask, gateway)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn dhcp_view(state: *const u8) -> (u8, u32, u32, u32) {
+        let s = &*(state as *const IpState);
+        (s.dhcp.state as u8, s.local_ip, s.netmask, s.gateway)
+    }
+
+    /// Overwrite the DHCP client's exchange state so a test can drive a
+    /// reply against a known transaction.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn set_dhcp_exchange(
+        state: *mut u8,
+        dhcp_state: u8,
+        xid: u32,
+        offered_ip: u32,
+        server_ip: u32,
+    ) {
+        let s = &mut *(state as *mut IpState);
+        s.dhcp.state = match dhcp_state {
+            1 => super::dhcp::DhcpState::Discovering,
+            2 => super::dhcp::DhcpState::Requesting,
+            3 => super::dhcp::DhcpState::Bound,
+            _ => super::dhcp::DhcpState::Idle,
+        };
+        s.dhcp.xid = xid;
+        s.dhcp.offered_ip = offered_ip;
+        s.dhcp.server_ip = server_ip;
+    }
+
+    /// Mark a renewal REQUEST as outstanding.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn set_dhcp_renew_sent(state: *mut u8, sent: bool) {
+        (*(state as *mut IpState)).dhcp.renew_sent = sent;
+    }
 
     /// Force the IP stack into a "configured" state with the given
     /// MAC and IP. Skips DHCP entirely. Tests that exercise DHCP

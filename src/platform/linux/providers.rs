@@ -127,6 +127,63 @@ unsafe fn validate_fs_path(
     Ok(arg_len)
 }
 
+/// The directory component of `path` as a NUL-terminated buffer, or `"."`
+/// when the path has no separator. Trailing separators are ignored so
+/// `"a/b/"` and `"a/b"` share a parent.
+fn parent_of(path: &[u8]) -> [u8; 256] {
+    let mut out = [0u8; 256];
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let mut cut = None;
+    let mut i = end;
+    while i > 0 {
+        i -= 1;
+        if path[i] == b'/' {
+            cut = Some(i);
+            break;
+        }
+    }
+    match cut {
+        // A leading-slash path's parent is the root itself.
+        Some(0) => {
+            out[0] = b'/';
+        }
+        Some(n) => out[..n].copy_from_slice(&path[..n]),
+        None => out[0] = b'.',
+    }
+    out
+}
+
+/// `fsync(2)` the directory holding `path`, making the entry that names it
+/// durable. This is what turns a created, removed, or renamed name into a
+/// name a later mount can find; file `fsync` never does. Returns
+/// `errno::OK` or a negative errno.
+///
+/// # Safety
+/// Calls libc directly; `path` must be a valid slice with no interior NUL
+/// (guaranteed by `validate_fs_path`).
+unsafe fn fsync_parent_dir(path: &[u8]) -> i32 {
+    use crate::kernel::sys::errno;
+    let dir = parent_of(path);
+    let fd = libc::open(
+        dir.as_ptr() as *const libc::c_char,
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    );
+    if fd < 0 {
+        return -*libc::__errno_location();
+    }
+    let rc = libc::fsync(fd);
+    let err = if rc < 0 {
+        -*libc::__errno_location()
+    } else {
+        errno::OK
+    };
+    libc::close(fd);
+    err
+}
+
 /// FS provider dispatch.
 ///
 /// `OPEN` and `OPENDIR` self-tag their returns with `FD_TAG_FS` so
@@ -163,10 +220,10 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     }
 
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
-    // Linux implements the full read-tier + the write-tier ops with
-    // opcode assignments: WRITE 0x0906, FSYNC 0x0905, UNLINK 0x090A,
-    // MKDIR 0x090B. The remaining reserved bits (TRUNCATE / RENAME)
-    // stay 0 — those opcodes aren't assigned yet.
+    // Linux implements the full read-tier, the write-tier, and both
+    // name-publication ops (RENAME 0x090D, FSYNC_NAME 0x0912). TRUNCATE
+    // stays 0 — that opcode isn't assigned yet. FSYNC_ASYNC stays 0:
+    // this provider fences with a blocking `fsync(2)`.
     if opcode == dev_fs::CAPS {
         if arg.is_null() || arg_len < 4 {
             return errno::EINVAL;
@@ -178,7 +235,9 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             | dev_fs::caps::FSYNC
             | dev_fs::caps::UNLINK
             | dev_fs::caps::MKDIR
-            | dev_fs::caps::PREALLOCATE;
+            | dev_fs::caps::PREALLOCATE
+            | dev_fs::caps::RENAME
+            | dev_fs::caps::FSYNC_NAME;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -292,6 +351,63 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             } else {
                 errno::OK
             }
+        }
+        dev_fs::FSYNC_NAME => {
+            let mut path_buf = [0u8; 256];
+            let len = match validate_fs_path(arg, arg_len, &mut path_buf) {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            fsync_parent_dir(&path_buf[..len])
+        }
+        dev_fs::RENAME => {
+            if arg.is_null() || arg_len < 4 {
+                return errno::EINVAL;
+            }
+            let bytes = core::slice::from_raw_parts(arg, arg_len);
+            let src_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+            if arg_len < 2 + src_len + 2 {
+                return errno::EINVAL;
+            }
+            let dst_off = 2 + src_len + 2;
+            let dst_len = u16::from_le_bytes([bytes[2 + src_len], bytes[3 + src_len]]) as usize;
+            if arg_len < dst_off + dst_len {
+                return errno::EINVAL;
+            }
+            let mut src_buf = [0u8; 256];
+            let mut dst_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg.add(2), src_len, &mut src_buf) {
+                return e;
+            }
+            if let Err(e) = validate_fs_path(arg.add(dst_off), dst_len, &mut dst_buf) {
+                return e;
+            }
+            // `rename(2)` is atomic against a concurrent reader: the
+            // destination name resolves to the old inode or the new one,
+            // never to neither. It is NOT durable on return, so both
+            // parents are fsynced before the fence is advertised — the
+            // destination first, since that is the name a recovering
+            // consumer looks for.
+            if libc::rename(
+                src_buf.as_ptr() as *const libc::c_char,
+                dst_buf.as_ptr() as *const libc::c_char,
+            ) < 0
+            {
+                return -*libc::__errno_location();
+            }
+            let rc = fsync_parent_dir(&dst_buf[..dst_len]);
+            if rc != errno::OK {
+                return rc;
+            }
+            let src_parent = parent_of(&src_buf[..src_len]);
+            let dst_parent = parent_of(&dst_buf[..dst_len]);
+            if src_parent != dst_parent {
+                let rc = fsync_parent_dir(&src_buf[..src_len]);
+                if rc != errno::OK {
+                    return rc;
+                }
+            }
+            errno::OK
         }
         dev_fs::PREALLOCATE => {
             let slot_idx = handle as usize;

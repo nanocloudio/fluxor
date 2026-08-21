@@ -24,17 +24,20 @@ required = true
 # Tag 10 — evdev device (or a FIFO of input_event records).
 [[params]]
 name = "path"
+tag = 10
 type = "str"
 default = "/dev/input/event0"
 
 # Tag 11/12 — logical surface geometry the coords are scaled into.
 [[params]]
 name = "width"
+tag = 11
 type = "u32"
 default = 960
 
 [[params]]
 name = "height"
+tag = 12
 type = "u32"
 default = 540
 
@@ -43,11 +46,13 @@ default = 540
 # pre-scaled FIFO test input).
 [[params]]
 name = "x_max"
+tag = 13
 type = "u32"
 default = 0
 
 [[params]]
 name = "y_max"
+tag = 14
 type = "u32"
 default = 0
 

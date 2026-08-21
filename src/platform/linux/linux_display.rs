@@ -244,22 +244,21 @@ use std::path::Path;
 
 const LINUX_DISPLAY_HASH: u32 = 0xEE7453F4; // fnv1a32("linux_display")
 
-// Tag layout (declaration order in manifest.toml, starting at 10):
-//   10: mode (enum file=0, null=1, window=2)
-//   11: path (str)
-//   12: width (u32)
-//   13: height (u32)
-//   14: scale (u32)
-const DISPLAY_TAG_MODE: u8 = 10;
-const DISPLAY_TAG_PATH: u8 = 11;
-const DISPLAY_TAG_WIDTH: u8 = 12;
-const DISPLAY_TAG_HEIGHT: u8 = 13;
-const DISPLAY_TAG_SCALE: u8 = 14;
+// Param TLV tags come from the module's `manifest.toml` `[[params]]` table,
+// generated into `builtin_param_tags`. `mode` selects file=0, null=1, window=2.
+// `header`, when set, prefixes each frame on `pixels` with a self-describing
+// header and takes geometry from the STREAM rather than the width/height
+// config — so a producer can resize without the two ends agreeing on a config.
+// See sector/modules/common/sector_raster.rs (`SRF1`).
+use fluxor::platform::builtin_param_tags::linux_display::{
+    TAG_HEADER as DISPLAY_TAG_HEADER, TAG_HEIGHT as DISPLAY_TAG_HEIGHT,
+    TAG_MODE as DISPLAY_TAG_MODE, TAG_PATH as DISPLAY_TAG_PATH, TAG_SCALE as DISPLAY_TAG_SCALE,
+    TAG_WIDTH as DISPLAY_TAG_WIDTH,
+};
 // When set, each frame on `pixels` is prefixed with a self-describing header and the
 // display takes its geometry from the STREAM, not the `width`/`height` config — so a
 // producer can resize without the two ends agreeing on a config. See
 // sector/modules/common/sector_raster.rs (`SRF1`).
-const DISPLAY_TAG_HEADER: u8 = 15;
 const SRF1_MAGIC: &[u8; 4] = b"SRF1";
 const SRF1_HDR_LEN: usize = 10; // magic(4) + w(2) + h(2) + format(1) + flags(1)
 /// Max per-axis dimension a stream-supplied SRF1 header may request. The

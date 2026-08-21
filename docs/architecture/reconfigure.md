@@ -1,11 +1,13 @@
 # Live Graph Reconfigure
 
-Source: `src/kernel/exec/scheduler/live_reconfig.rs`, `tools/src/reconfigure.rs`
+Source: `src/kernel/exec/scheduler/live_reconfig.rs`,
+`src/kernel/exec/scheduler/setup.rs`, `tools/src/reconfigure.rs`
 
 ## Overview
 
-Live graph reconfigure allows updating a running Fluxor graph without dropping
-in-flight work. The scheduler transitions through phases:
+Live graph reconfigure updates a running Fluxor graph by gracefully draining
+admitted work before reset, subject to a bounded timeout. The scheduler
+transitions through phases:
 
 ```
 RUNNING -> DRAINING -> MIGRATING -> RUNNING
@@ -30,11 +32,21 @@ modules:
 
 Each module is classified as one of:
 
-| Status    | Criteria | During DRAINING |
-|-----------|----------|-----------------|
-| Survive   | Same binary + config + wiring | Normal stepping |
-| Drain     | Changed, exports `module_drain` | drain() called, then normal stepping until Done |
-| Terminate | Changed, no drain | Continues stepping, force-stopped in MIGRATING |
+| Status    | Criteria | During DRAINING | Across MIGRATING |
+|-----------|----------|-----------------|------------------|
+| Survive   | Same binary + config + wiring | Normal stepping | Unchanged graph membership, re-instantiated state |
+| Drain     | Changed, exports `module_drain` | drain() called, then normal stepping until Done | Replaced by the new definition, re-instantiated state |
+| Terminate | Changed, no drain | Continues stepping, force-stopped in MIGRATING | Replaced by the new definition, re-instantiated state |
+
+`Survive` names a property of the transition plan, not of the module
+instance. A surviving module is one whose three identity hashes are
+unchanged, so it appears in the new graph with the same binary,
+parameters, and wiring, is not asked to drain, and is not force-stopped.
+Its RAM state does not carry across: `prepare_graph` resets the state
+arena, the channel and buffer registries, and the name arena for every
+module in the graph, then re-instantiates each one through `module_new`.
+The status therefore predicts what the new graph looks like, not what
+the running instance keeps.
 
 Module identity is defined by three hashes:
 - **Binary identity**: module name hash (resolves to the same `.fmod`)

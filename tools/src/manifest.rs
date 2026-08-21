@@ -115,12 +115,47 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 // contracts and belong in the top-level `permissions = [...]` list — they
 // are rejected here with a schema-error pointing at the correct section.
 
+/// Highest public contract id that may be assigned while `required_caps`
+/// is a `u32`. `STREAM_CLOCK` (0x1C) is the highest allocated position;
+/// 0x1D, 0x1E and 0x1F are held in reserve so an urgent contract addition
+/// never forces the representation change under time pressure.
+///
+/// The bit position IS the contract id (fmod header `required_caps`, u32
+/// at `reserved[6..10]`), so assignment past this ceiling requires the
+/// widening described in `.context/rfc_contract_id_headroom.md` — not a
+/// new match arm here. `tools/tests/contract_id_freeze.rs` pins the
+/// occupancy inventory that makes this number checkable.
+pub const CONTRACT_ID_FREEZE: u8 = 0x1C;
+
+/// Positions consumed in the 32-bit `required_caps` space, counting the
+/// four reserved ids and excluding the kernel-internal dispatch bucket
+/// (0x0C). Registered in `docs/architecture/limit_register.md`.
+pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 28;
+
 /// Parse a contract name from `[[resources]].requires_contract`. Only
 /// public contract names are accepted here — `"internal"` and specific
 /// permission names like `"flash_raw"` or `"platform_raw"` are **not**
 /// contracts and must be declared under the top-level `permissions = [...]`
 /// list instead.
+///
+/// Ids above [`CONTRACT_ID_FREEZE`] are refused: the reserved tail is not
+/// available for assignment until the representation decision is taken.
 pub fn contract_id_from_name(s: &str) -> Result<u8> {
+    let id = contract_id_from_name_unfrozen(s)?;
+    if id > CONTRACT_ID_FREEZE {
+        return Err(Error::Module(format!(
+            "contract `{s}` resolves to id 0x{id:02x}, above the frozen ceiling \
+             0x{CONTRACT_ID_FREEZE:02x}. Contract ids are bit positions in the \
+             fmod header's 32-bit `required_caps`, and {CONTRACT_ID_POSITIONS_ASSIGNED} \
+             of 32 are assigned; the remaining positions are held in reserve until \
+             the capability representation is widened. Adding a contract id here \
+             requires that decision first."
+        )));
+    }
+    Ok(id)
+}
+
+fn contract_id_from_name_unfrozen(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
         "gpio" => Ok(0x01),
         "spi" => Ok(0x02),
@@ -562,6 +597,16 @@ pub mod permission {
     }
 }
 
+/// Lowest tag a built-in `[[params]]` entry may claim. Tags below this
+/// belong to the TLV framing and to fixed low-numbered fields, so a
+/// parameter must not occupy them.
+pub const PARAM_TAG_MIN: u8 = 10;
+
+/// Highest tag a built-in `[[params]]` entry may claim. 0xF0..=0xFF are
+/// reserved for protection/policy metadata (0xFD voice-preset blobs,
+/// 0xFE TLV magic, 0xFF terminator among them).
+pub const PARAM_TAG_MAX: u8 = 0xEF;
+
 /// Param type categories declared in `[[params]]`. Matches the wire
 /// types used by the runtime TLV packer in `tools/src/schema.rs`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -573,15 +618,18 @@ pub enum ManifestParamType {
     Enum,
 }
 
-/// A single `[[params]]` entry from a built-in's `manifest.toml`. The
-/// tag is auto-assigned in declaration order (10..) so manifest authors
-/// don't have to. Defaults are stored as 32-bit unsigned integers when
-/// numeric, or as a string for `str`/`enum`.
+/// A single `[[params]]` entry from a built-in's `manifest.toml`.
+/// Defaults are stored as 32-bit unsigned integers when numeric, or as
+/// a string for `str`/`enum`.
 #[derive(Debug, Clone)]
 pub struct ManifestParam {
-    /// TLV tag (auto-assigned: first param = 10, second = 11, ...).
-    /// Tags 0xF0..0xFF are reserved for protection/policy metadata; we
-    /// stay well below.
+    /// TLV tag — declared explicitly by the manifest (`tag = N`) and
+    /// permanent once a built-in ships. The tag, not the declaration
+    /// position, is the wire identity of the parameter, so entries may
+    /// be reordered or inserted without changing any encoding.
+    /// Legal range is [`PARAM_TAG_MIN`]..=[`PARAM_TAG_MAX`]; tags below
+    /// the minimum belong to the TLV framing and 0xF0..=0xFF are
+    /// reserved for protection/policy metadata.
     pub tag: u8,
     pub name: String,
     pub ptype: ManifestParamType,
@@ -765,6 +813,27 @@ pub struct Manifest {
     /// `.context/rfc_isr_tier_surface.md` §D7 for the contract this
     /// flag attests to and §Step-3 for the validator that enforces it.
     pub isr_safe: bool,
+    /// Module attests that it can resume after an arbitrary fault, and is
+    /// therefore eligible for `fault_policy: restart`. That policy releases
+    /// every provider handle the module owned, flushes every connected
+    /// input / output / control channel, and resumes the **same** state
+    /// allocation — it does not zero state and does not re-run
+    /// `module_new`. The attestation asserts all four of:
+    ///   * no invariant is carried across `module_step` boundaries — every
+    ///     externally visible transition completes within one step or is
+    ///     safely abandonable inside one;
+    ///   * losing every provider handle without notification is tolerable;
+    ///   * discarding everything in flight on every channel loses at most
+    ///     work the module's own protocol layer already treats as loss;
+    ///   * any counter or rate state that resumes part-updated affects
+    ///     behaviour only within its own bounded window.
+    ///
+    /// The author owns this claim; the tool does not statically verify it.
+    /// Absent ⇒ `false`, and the config validator refuses the policy.
+    /// TOML-only, never serialized to the binary manifest: the policy it
+    /// gates is itself a compose-time choice. See
+    /// `.context/rfc_fault_resume_contract.md`.
+    pub resume_after_fault: bool,
     /// Module opts into the **Tier 1c pre-pass drain slot**. Pre-tick
     /// modules run cooperatively at the *start* of every scheduler
     /// pass for their domain, before the regular `domain_exec_order`
@@ -830,6 +899,7 @@ impl Default for Manifest {
             variants: Vec::new(),
             capacities: std::collections::BTreeMap::new(),
             isr_safe: false,
+            resume_after_fault: false,
             pre_tick_drain: false,
             requires: TomlRequires::default(),
             wasm_opt_level: None,
@@ -1218,7 +1288,11 @@ impl Manifest {
     pub fn from_toml_for_target(path: &Path, silicon: Option<&str>) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| Error::Module(format!("cannot read {}: {}", path.display(), e)))?;
+        // Name the manifest in every diagnostic: the module identity lives in
+        // the path, not in the TOML, so a bare parse error would otherwise
+        // leave the reader guessing which of ~40 manifests failed.
         Self::from_toml_str_for_target(&content, silicon)
+            .map_err(|e| Error::Module(format!("{}: {e}", path.display())))
     }
 
     /// Parse a manifest from in-memory TOML bytes (already read), sharing
@@ -1397,10 +1471,36 @@ impl Manifest {
         }
 
         let mut params: Vec<ManifestParam> = Vec::new();
-        for (i, p) in raw_params.into_iter().enumerate() {
-            let tag = 10u8
-                .checked_add(i as u8)
-                .ok_or_else(|| Error::Module("too many [[params]] entries (max 245)".into()))?;
+        for p in raw_params {
+            // The tag is the parameter's wire identity, so it is declared,
+            // never derived from declaration position: reordering or
+            // inserting an entry must not re-point a shipped encoding.
+            let tag = p.tag.ok_or_else(|| {
+                Error::Module(format!(
+                    "param '{}': missing `tag = N`. Built-in parameter tags \
+                     are explicit and permanent — pick an unused value in \
+                     {PARAM_TAG_MIN}..={PARAM_TAG_MAX} and never reuse a \
+                     retired one.",
+                    p.name,
+                ))
+            })?;
+            if !(PARAM_TAG_MIN..=PARAM_TAG_MAX).contains(&tag) {
+                return Err(Error::Module(format!(
+                    "param '{}': tag {tag} out of range \
+                     ({PARAM_TAG_MIN}..={PARAM_TAG_MAX}). Tags below \
+                     {PARAM_TAG_MIN} belong to the TLV framing and \
+                     0xF0..=0xFF are reserved for protection metadata.",
+                    p.name,
+                )));
+            }
+            if let Some(prev) = params.iter().find(|q: &&ManifestParam| q.tag == tag) {
+                return Err(Error::Module(format!(
+                    "param '{}': tag {tag} is already claimed by param '{}'. \
+                     Each built-in parameter needs its own tag — two entries \
+                     sharing one tag collide on the wire.",
+                    p.name, prev.name,
+                )));
+            }
             let ptype = match p.ptype.as_str() {
                 "u8" => ManifestParamType::U8,
                 "u16" => ManifestParamType::U16,
@@ -1656,6 +1756,7 @@ impl Manifest {
             variants,
             capacities,
             isr_safe: toml_val.isr_safe,
+            resume_after_fault: toml_val.resume_after_fault,
             pre_tick_drain: toml_val.pre_tick_drain,
             requires: toml_val.requires,
             wasm_opt_level,
@@ -1985,6 +2086,9 @@ impl Manifest {
             variants: Vec::new(), // toml-only, not serialized
             capacities: std::collections::BTreeMap::new(), // toml-only, not serialized
             isr_safe,
+            // Author attestation, TOML-only: a binary-loaded manifest makes
+            // no claim, so `fault_policy: restart` is refused (fail-closed).
+            resume_after_fault: false,
             pre_tick_drain,
             // `requires` is a TOML-only field — modules carry their
             // binary manifest stripped of the requires block (it's a
@@ -2160,6 +2264,11 @@ struct TomlManifest {
     /// See `Manifest::isr_safe` for the contract.
     #[serde(default)]
     isr_safe: bool,
+    /// Author attests the module can resume after an arbitrary fault.
+    /// Required for `fault_policy: restart`. See
+    /// `Manifest::resume_after_fault` for the contract.
+    #[serde(default)]
+    resume_after_fault: bool,
     /// Author opts the module into the Tier 1c pre-pass drain slot.
     /// See `Manifest::pre_tick_drain` for the contract.
     #[serde(default)]
@@ -2346,8 +2455,12 @@ pub fn check_target_capabilities(manifest_requires: TomlRequires, silicon: &str)
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlParam {
     name: String,
+    /// `tag = N` — the permanent TLV tag for this parameter. Required on
+    /// every built-in entry; see `ManifestParam::tag`.
+    tag: Option<u8>,
     /// One of: u8, u16, u32, str, enum
     #[serde(rename = "type")]
     ptype: String,
@@ -2848,6 +2961,7 @@ content_type = "OctetStream"
 
 [[params]]
 name = "x"
+tag = 10
 type = "u32"
 default = 1
 "#;
@@ -2873,25 +2987,28 @@ content_type = "OctetStream"
 
 [[params]]
 name = "width"
+tag = 10
 type = "u32"
 default = 480
 range = [1, 4096]
 
 [[params]]
 name = "scale_mode"
+tag = 11
 type = "enum"
 values = ["fit", "stretch"]
 default = "fit"
 
 [[params]]
 name = "path"
+tag = 12
 type = "str"
 required = true
 "#;
         let m = parse_toml(src).expect("parse");
         assert!(m.builtin);
         assert_eq!(m.params.len(), 3);
-        // Tag auto-assignment starts at 10 in declaration order.
+        // Tags come from the manifest, not from declaration position.
         assert_eq!(m.params[0].tag, 10);
         assert_eq!(m.params[1].tag, 11);
         assert_eq!(m.params[2].tag, 12);
@@ -2915,6 +3032,7 @@ builtin = true
 
 [[params]]
 name = "path"
+tag = 10
 type = "str"
 default = "/tmp/foo"
 required = true

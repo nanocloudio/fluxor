@@ -12,23 +12,27 @@ required = true
 
 [[params]]
 name = "mode"
+tag = 10
 type = "enum"
 values = ["wav", "raw", "null", "playback"]
 default = "wav"
 
 [[params]]
 name = "path"
+tag = 11
 type = "str"
 default = "./target/host-audio/out.wav"
 
 [[params]]
 name = "sample_rate"
+tag = 12
 type = "u32"
 default = 48000
 range = [8000, 192000]
 
 [[params]]
 name = "channels"
+tag = 13
 type = "u8"
 default = 2
 range = [1, 8]

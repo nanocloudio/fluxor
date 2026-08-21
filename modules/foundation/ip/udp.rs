@@ -42,6 +42,16 @@ pub unsafe fn parse_udp(data: *const u8, len: usize) -> Option<UdpHeader> {
     })
 }
 
+/// Read the checksum field of a UDP header. Zero means "not supplied" for
+/// IPv4 (RFC 768); a transmitter with a computed checksum of zero sends
+/// 0xffff instead, so the two are distinguishable on the wire.
+///
+/// # Safety
+/// `data` must point to at least `UDP_HEADER_LEN` valid bytes.
+pub unsafe fn checksum_field(data: *const u8) -> u16 {
+    ((*data.add(6) as u16) << 8) | (*data.add(7) as u16)
+}
+
 /// Build a UDP header at `dst`.
 ///
 /// # Safety

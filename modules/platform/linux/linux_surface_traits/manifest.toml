@@ -20,12 +20,14 @@ required = true
 
 [[params]]
 name = "width"
+tag = 10
 type = "u32"
 default = 480
 range = [1, 4096]
 
 [[params]]
 name = "height"
+tag = 11
 type = "u32"
 default = 480
 range = [1, 4096]

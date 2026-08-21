@@ -29,12 +29,15 @@
 // 16-entry table lookup — the same shape as `scalar_mul_ct` in p256.rs.
 // Unlike p256, the underlying point formulas here have NO data-dependent
 // branches (completeness, above), so the secret-scalar path leaks less
-// than the p256 baseline: no zero-nibble timing signal. Residual
-// non-constant-time surfaces, matching the p256 house standard:
+// than the p256 baseline: no zero-nibble timing signal. The field
+// layer is branchless too — `fe_carry`, `fe_add`, `fe_sub`, `fe_mul`
+// and `fe_tobytes` are straight-line masked carry chains with fixed
+// trip counts, unlike p256's `fp_reduce`. Residual non-constant-time
+// surfaces:
 //
-//   - modular reductions branch on carry/borrow of intermediate values
-//     (`fe_*` carry chains, `sc_reduce_wide` conditional +L) — value
-//     magnitudes, not secret bit patterns, same as p256's `fp_add`;
+//   - `sc_reduce_wide` selects on the borrow of a subtraction to apply
+//     its conditional +L. That runs over the signing nonce, so it
+//     should become a masked select rather than a branch;
 //   - `ed25519_verify` is VARIABLE-TIME by design: it handles only
 //     public inputs (public key, message, signature).
 //

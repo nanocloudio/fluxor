@@ -19,12 +19,14 @@ required = true
 
 [[params]]
 name = "width"
+tag = 10
 type = "u16"
 required = false
 default = 800
 
 [[params]]
 name = "height"
+tag = 11
 type = "u16"
 required = false
 default = 600

@@ -32,12 +32,14 @@ required = true
 [[params]]
 # tag 10 — matches wasm_browser_canvas's `width` for symmetry.
 name = "width"
+tag = 10
 type = "u16"
 required = true
 
 [[params]]
 # tag 11 — matches wasm_browser_canvas's `height` for symmetry.
 name = "height"
+tag = 11
 type = "u16"
 required = true
 
@@ -45,6 +47,7 @@ required = true
 # tag 12 — encoded ingest cap. Larger than host_image_codec's
 # default to handle the test-harness 6.2 MB top-down BMP.
 name = "max_bytes"
+tag = 12
 type = "u32"
 default = 16777216
 range = [1024, 67108864]

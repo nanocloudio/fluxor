@@ -1,6 +1,43 @@
 // AES-128/256-GCM AEAD
-// Pure Rust, no_std, constant-time (no data-dependent table lookups)
-// Uses precomputed const S-box and RCON tables (in .rodata, not .data)
+// Pure Rust, no_std.
+//
+// # Timing exposure
+//
+// This implementation is NOT constant-time on any target that lacks
+// the ARMv8 Cryptography Extension, and GHASH is not constant-time on
+// any target at all.
+//
+//   - `sub_bytes` indexes the 256-byte `SBOX` with a byte of the AES
+//     state. That state is a function of the secret key, so the
+//     address of every S-box load is secret-dependent. An adversary
+//     who can observe the data-cache footprint of this code (shared
+//     cache, co-located hyperthread, or any local process on a
+//     multi-tenant host) can recover the key by the standard
+//     cache-timing attack on table-driven AES. The table living in
+//     `.rodata` bounds nothing here: read-only memory is cached like
+//     any other.
+//   - `GHash::gf_mul` branches on individual bits of the accumulator
+//     and on a reduction carry derived from the GHASH subkey `H`,
+//     which is `AES_K(0^128)` and therefore secret. Both the branch
+//     count and the branch pattern depend on `H`, leaking it to a
+//     timing observer; recovering `H` forges GCM tags without
+//     recovering the key.
+//
+// On aarch64 with `target_feature = "aes"` the block cipher runs on
+// AESE/AESMC, which are data-independent, so the S-box exposure is
+// absent there. GHASH stays scalar on that path too — there is no
+// PMULL implementation — so the `H` exposure applies everywhere.
+//
+// `target_feature = "aes"` is set only for the bcm2712 module build
+// (`tools/src/modules_build.rs` appends `-C
+// target-feature=+aes,+sha2,+neon`). Every other build — the Linux
+// host build including on aarch64 hosts, wasm32, rp2040, rp2350 —
+// compiles the scalar path, because rustc does not infer the build
+// host's CPU features without `-C target-cpu=native`.
+//
+// Callers that need a portable AEAD with no key-dependent memory
+// addressing and no key-dependent branches should select
+// ChaCha20-Poly1305 (`chacha20.rs`) instead.
 
 // AES S-box (256 bytes, const — placed in .rodata, safe for PIC)
 const SBOX: [u8; 256] = [
@@ -25,7 +62,8 @@ const SBOX: [u8; 256] = [
 const RCON: [u8; 11] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
 // ============================================================================
-// AES core (SubBytes uses S-box table in .rodata)
+// AES core. SubBytes is a secret-indexed lookup into the `.rodata`
+// S-box — see the timing-exposure note at the top of this file.
 // ============================================================================
 
 /// Multiply by 2 in GF(2^8)
@@ -136,11 +174,16 @@ impl AesKey {
         // and every Pi-class A-core ships +crypto; the gate keeps
         // QEMU-unknown / older Cortex-A53 hosts honest.
         //
-        // RUSTFLAGS for the bcm2712 PIC build sets
-        // `-C target-feature=+aes`. Host-test on the same Pi 5
-        // gets it via the rustc auto-detect of the build host.
-        // Everything else falls through to the scalar path that
-        // the KATs gate against.
+        // The feature is set for exactly one build: the bcm2712 PIC
+        // module build, whose RUSTFLAGS carry `-C
+        // target-feature=+aes`. It is NOT set for the Linux host
+        // build even on a Pi 5, because rustc reports only the
+        // target triple's baseline features (aarch64 baseline is
+        // `neon` alone) unless `-C target-cpu=native` is given, and
+        // no build in this tree gives it. Host tests, wasm32,
+        // rp2040 and rp2350 therefore all execute the scalar path,
+        // with the S-box cache-timing exposure documented at the top
+        // of this file.
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         unsafe {
             encrypt_block_aarch64_aes(block, &self.round_keys, self.rounds);
@@ -276,6 +319,10 @@ fn xor_block(a: &mut [u8; 16], b: &[u8; 16]) {
     while i < 16 { a[i] ^= b[i]; i += 1; }
 }
 
+/// SubBytes. The index is a byte of the AES state and therefore
+/// secret; this is a secret-indexed table lookup, and the load
+/// address it produces is observable through the data cache. See the
+/// timing-exposure note at the top of this file.
 fn sub_bytes(block: &mut [u8; 16]) {
     let mut i = 0;
     while i < 16 {
@@ -328,7 +375,22 @@ impl GHash {
         }
     }
 
-    /// Multiply in GF(2^128) with reduction polynomial x^128 + x^7 + x^2 + x + 1
+    /// Multiply in GF(2^128) with reduction polynomial
+    /// x^128 + x^7 + x^2 + x + 1.
+    ///
+    /// Not constant-time. Two distinct secret-dependent branches run
+    /// 128 times per block:
+    ///
+    ///   - `if (y >> i) & 1 == 1` — the accumulator `Y` is a function
+    ///     of `H` after the first block, so its bits are secret;
+    ///   - `if carry == 1` — `carry` is the low bit of the shifting
+    ///     `V`, which starts at the GHASH subkey `H` and is therefore
+    ///     secret on every iteration.
+    ///
+    /// `H` is `AES_K(0^128)`. Leaking it lets an adversary forge GCM
+    /// authentication tags for that key without recovering the key
+    /// itself. Closing this requires a branchless form that masks the
+    /// operand by the bit instead of branching on it.
     fn gf_mul(&mut self) {
         let mut z_hi: u64 = 0;
         let mut z_lo: u64 = 0;
@@ -580,7 +642,12 @@ impl AesGcm {
         let mut i = 0;
         while i < 16 { computed_tag[i] ^= tag_mask[i]; i += 1; }
 
-        // Constant-time compare
+        // Tag comparison is constant-time in the tag: all 16 bytes are
+        // folded into `diff` before any branch, so neither the number
+        // of matching bytes nor the position of the first mismatch is
+        // observable. This covers the comparison only — the GHASH that
+        // produced `computed_tag` and the AES that produced `tag_mask`
+        // carry the exposures documented at the top of this file.
         let mut diff = 0u8;
         i = 0;
         while i < 16 { diff |= computed_tag[i] ^ tag[i]; i += 1; }

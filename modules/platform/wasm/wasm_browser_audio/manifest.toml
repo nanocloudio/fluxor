@@ -28,11 +28,13 @@ required = true
 
 [[params]]
 name = "sample_rate"
+tag = 10
 type = "u32"
 required = true
 
 [[params]]
 name = "channels"
+tag = 11
 type = "u8"
 default = 1
 
@@ -42,6 +44,7 @@ default = 1
 # latency AND is the jank cushion. Codec playback wants the deep
 # default; live instruments (grove studio) set 30-50 ms.
 name = "lead_ms"
+tag = 12
 type = "u8"
 default = 120
 

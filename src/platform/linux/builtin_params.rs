@@ -8,9 +8,11 @@
 //   [tag][len][value...] [tag][len][value...] ... [0xFF (optional end)]
 //
 // Each built-in walks the blob with `walk_tlv` and dispatches by tag.
-// Tags are auto-assigned in declaration order in `manifest.toml`,
-// starting at 10. Tags 0xF0..0xFF are reserved for protection / fault
-// policy and are silently ignored here.
+// Tags are declared per parameter in the module's `manifest.toml` and are
+// permanent, so the wire meaning of a field survives any reordering of the
+// `[[params]]` table; the constants to match on are generated from those
+// manifests into `crate::platform::builtin_param_tags`. Tags 0xF0..0xFF are
+// reserved for protection / fault policy and are silently ignored here.
 
 use crate::kernel::exec::scheduler;
 

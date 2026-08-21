@@ -347,6 +347,71 @@ successful fsync; every other live handle, including any read-only
 handle, reports `Volatile`. The wasm fetch provider
 (`src/platform/wasm/fs.rs`) answers `Volatile` for every successful op.
 
+### Byte durability and name durability are separate fences
+
+A file's bytes can be durable while the directory entry that finds them is
+not. The `file.data` / `fs` contract therefore fences the two separately,
+and a consumer building a crash-recoverable artefact needs both:
+
+| Fence | Opcodes | Proves |
+|---|---|---|
+| Byte durability | `FSYNC`, or `FSYNC_SUBMIT` + `FSYNC_POLL` | The file's contents and its own recorded size are on non-volatile media |
+| Name durability | `FSYNC_NAME`, or `RENAME` | The parent-directory entry that resolves the path is on non-volatile media |
+
+File `fsync` is not name publication on any provider. The two supported
+publication recipes are:
+
+1. `OPEN_CREATE`(final) → `WRITE` → `FSYNC` → `FSYNC_NAME`(final). Crash
+   leaves the name absent, or present over a prefix of the bytes — correct
+   for self-describing artefacts (a WAL segment with an in-band
+   terminator).
+2. `OPEN_CREATE`(temp) → `WRITE` → `FSYNC` → `CLOSE` → `RENAME`(temp →
+   final). Crash leaves the old name or the new complete artefact —
+   correct for all-or-nothing artefacts (snapshots, pointer records,
+   content-addressed bodies).
+
+Both are optional capabilities (`caps::FSYNC_NAME`, `caps::RENAME`). A
+consumer that needs crash-safe publication queries `CAPS` and fails closed
+when the bit it needs is clear.
+
+Publication lives on the byte-tier surface rather than moving to
+`storage.namespace` because `OPEN_CREATE` and `MKDIR` are already the
+fused `BIND` + open forms (see `namespace.rs::BIND`); `FSYNC_NAME` and
+`RENAME` complete that fusion. A filesystem provider whose directory
+entries live inside the byte tier publishes names here; a split provider
+(an index without bytes) publishes them through `storage.namespace`. The
+two remain equivalent operations achieving the same fence.
+
+### Provider semantics in that vocabulary
+
+**Linux.** Byte durability is `fsync(2)` on the file descriptor. Name
+durability is `fsync(2)` on the parent directory (`FSYNC_NAME`) or, for
+`RENAME`, `rename(2)` followed by an fsync of the destination parent and,
+when it differs, the source parent. `RENAME` replaces an existing
+destination atomically. Achieved fence: `LocalDurable`.
+
+**FAT32.** Byte durability is the block source's Flush after the data
+sectors and the file's own directory-entry size. The async tier
+(`WRITE_ASYNC` + `FSYNC_SUBMIT`/`FSYNC_POLL`) runs a two-stage
+data-then-metadata state machine: each ticket snapshots the file's size
+and first cluster at submit, waits for the device fence over the data,
+then submits that snapshotted directory entry through the same ring
+behind a second fence. A successful poll therefore proves data *and*
+size metadata durable, and never publishes a frontier newer than the
+ticket it belongs to. The entry is only rewritten when a ticket's
+frontier exceeds what has already been submitted, so out-of-order polls
+cannot move the on-media size backwards. A preallocated fixed-capacity
+file has no metadata to publish and skips the second stage entirely.
+
+Name durability on FAT32 is `FSYNC_NAME`: every name-minting op
+(`OPEN_CREATE`, `UNLINK`) already writes its directory sector
+synchronously, so the opcode resolves the parent and issues the device
+Flush that commits it. `RENAME` is **not** supported and its capability
+bit stays clear — FAT32 has no atomic directory mutation, and a new entry
+plus a cleared old entry in different sectors is visible after a crash as
+both names or neither. A consumer needing all-or-nothing publication must
+use recipe 1 over a self-describing artefact, or refuse to run on FAT32.
+
 ---
 
 ## 3. Leased mesh Handles

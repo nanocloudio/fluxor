@@ -17,6 +17,39 @@ pub const MAX_CIPHERTEXT: usize = MAX_PLAINTEXT + 1 + 16;
 /// Legacy version in record header (TLS 1.2 for compatibility)
 const LEGACY_VERSION: [u8; 2] = [0x03, 0x03];
 
+/// The exact six bytes of a middlebox-compatibility ChangeCipherSpec
+/// record (RFC 8446 §5, appendix D.4): type 20, legacy version 0x0303,
+/// length 1, payload 0x01. A TLS 1.3 peer has no other legal CCS to
+/// send, so nothing else is accepted — a CCS with a different length
+/// or payload is a downgrade probe, not compatibility traffic.
+pub const CCS_COMPAT_RECORD: [u8; 6] = [CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01];
+
+/// True for the four content types that may appear in a record
+/// header. Anything else is a protocol violation rather than
+/// something to skip: an unknown type carries an unknown framing.
+pub fn is_legal_record_type(t: u8) -> bool {
+    t == CT_CHANGE_CIPHER_SPEC || t == CT_ALERT || t == CT_HANDSHAKE || t == CT_APPLICATION_DATA
+}
+
+/// True for the content types that may appear as the *inner* type of a
+/// TLS 1.3 encrypted record (RFC 8446 §5.4). ChangeCipherSpec is
+/// excluded: it exists only as an unencrypted compatibility record, so
+/// an encrypted one is malformed.
+pub fn is_legal_inner_type(t: u8) -> bool {
+    t == CT_ALERT || t == CT_HANDSHAKE || t == CT_APPLICATION_DATA
+}
+
+/// Validate a record header's `legacy_record_version` field.
+///
+/// RFC 8446 §5.1 pins this to 0x0303 for every record a TLS 1.3
+/// endpoint generates, and permits 0x0301 on an initial ClientHello
+/// for middlebox traversal. Values outside that window (including
+/// 0x0304 and SSL-era encodings) belong to no version this stack
+/// speaks.
+pub fn legacy_version_ok(v: &[u8; 2]) -> bool {
+    v[0] == 0x03 && (v[1] == 0x01 || v[1] == 0x03)
+}
+
 /// Cipher suite parameters
 #[derive(Clone, Copy, PartialEq)]
 pub enum CipherSuite {
@@ -161,22 +194,50 @@ pub fn build_encrypted_record_header(payload_len: usize, out: &mut [u8; 5]) {
     out[4] = total as u8;
 }
 
+/// Why an encrypt attempt produced no record. Both variants are
+/// terminal for the session: the AEAD sequence counter is a
+/// single-use nonce input, so there is no safe way to retry a record
+/// that was refused after the counter moved. Encryption is therefore
+/// all-or-nothing — on `Err` the destination buffer and `keys.seq`
+/// are both exactly as the caller left them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordError {
+    /// The destination cannot hold `plaintext_len + 1 + 16` bytes, or
+    /// that sum does not fit in a `usize`.
+    BufferTooSmall,
+    /// `keys.seq` is already `u64::MAX`; advancing would reuse a nonce.
+    SequenceExhausted,
+}
+
 /// Encrypt a TLS 1.3 record in-place. Caller positions plaintext at
 /// `buf[0..plaintext_len]`; on return `buf` holds the encrypted
 /// payload + content_type + 16-byte tag. `buf.len()` must be
 /// ≥ `plaintext_len + 17`. Returns `plaintext_len + 1 + 16` on
-/// success, `0` on seq wrap or buffer too small. Bit-identical to
-/// `encrypt_record`; avoids two memcpys per record on the hot send
-/// path.
+/// success. Bit-identical to `encrypt_record`; avoids two memcpys per
+/// record on the hot send path.
+///
+/// Both rejections are decided before the first destination byte is
+/// written, so a caller holding a partially filled record buffer can
+/// abandon it untouched.
 pub fn encrypt_record_in_place(
     suite: CipherSuite,
     keys: &mut TrafficKeys,
     content_type: u8,
     plaintext_len: usize,
     buf: &mut [u8],
-) -> usize {
-    if buf.len() < plaintext_len + 17 {
-        return 0;
+) -> Result<usize, RecordError> {
+    // `checked_add` because `plaintext_len` reaches this function from
+    // a peer-influenced length: a wrapping sum would compute a tiny
+    // requirement and admit an unbounded write.
+    let needed = match plaintext_len.checked_add(17) {
+        Some(n) => n,
+        None => return Err(RecordError::BufferTooSmall),
+    };
+    if buf.len() < needed {
+        return Err(RecordError::BufferTooSmall);
+    }
+    if keys.seq_exhausted() {
+        return Err(RecordError::SequenceExhausted);
     }
     let ct_len = plaintext_len + 1 + 16;
 
@@ -192,7 +253,7 @@ pub fn encrypt_record_in_place(
 
     let nonce = keys.nonce();
     if !keys.advance_seq() {
-        return 0;
+        return Err(RecordError::SequenceExhausted);
     }
 
     match suite {
@@ -227,82 +288,41 @@ pub fn encrypt_record_in_place(
         }
     }
 
-    ct_len
+    Ok(ct_len)
 }
 
-/// Encrypt a TLS 1.3 record in-place.
-/// `plaintext` is the data to encrypt. `content_type` is the inner type.
-/// On return, `out_buf` contains: encrypted_data + content_type + tag
-/// Returns total encrypted length (plaintext_len + 1 + 16)
+/// Encrypt a TLS 1.3 record into a separate destination buffer.
+/// `plaintext` is the data to encrypt, `content_type` the inner type.
+/// On success `out_buf` holds encrypted_data + content_type + tag and
+/// the returned length is `plaintext.len() + 1 + 16`.
+///
+/// Capacity and sequence headroom are settled before the plaintext is
+/// copied, so a rejected call leaves `out_buf` and `keys.seq`
+/// untouched. Output is bit-identical to `encrypt_record_in_place`
+/// for the same key, IV, sequence and content type.
 pub fn encrypt_record(
     suite: CipherSuite,
     keys: &mut TrafficKeys,
     content_type: u8,
     plaintext: &[u8],
     out_buf: &mut [u8],
-) -> usize {
-    let ct_len = plaintext.len() + 1 + 16; // data + content_type + tag
-
-    // Build AAD (record header)
-    let mut aad = [0u8; 5];
-    aad[0] = CT_APPLICATION_DATA;
-    aad[1] = 0x03; aad[2] = 0x03;
-    aad[3] = (ct_len >> 8) as u8;
-    aad[4] = ct_len as u8;
-
-    // Copy plaintext + content_type into output
-    // SAFETY: pointer arithmetic over the TLS record buffer; bounds
-    // checked against record length before each deref.
-    unsafe { core::ptr::copy_nonoverlapping(plaintext.as_ptr(), out_buf.as_mut_ptr(), plaintext.len()); }
-    out_buf[plaintext.len()] = content_type;
-
-    let data_len = plaintext.len() + 1;
-    // Nonce uses the current seq value; advance_seq bumps it for
-    // the next record. RFC 8446 §5.3: refuse to encrypt under a
-    // seq that would wrap, returning 0 (the caller's "no record
-    // produced" sentinel).
-    let nonce = keys.nonce();
-    if !keys.advance_seq() { return 0; }
-
-    match suite {
-        CipherSuite::ChaCha20Poly1305 => {
-            let mut key = [0u8; 32];
-            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
-            // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
-            let tag = chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut out_buf[..data_len]);
-            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
-            // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
-            zeroize(&mut key);
-        }
-        CipherSuite::Aes128Gcm => {
-            let mut key = [0u8; 16];
-            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
-            // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16); }
-            let gcm = AesGcm::new_128(&key);
-            let tag = gcm.encrypt(&nonce, &aad, &mut out_buf[..data_len]);
-            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
-            // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
-            zeroize(&mut key);
-        }
-        CipherSuite::Aes256Gcm => {
-            let mut key = [0u8; 32];
-            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
-            // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
-            let gcm = AesGcm::new_256(&key);
-            let tag = gcm.encrypt(&nonce, &aad, &mut out_buf[..data_len]);
-            // SAFETY: pointer arithmetic over the TLS record buffer; bounds
-            // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), out_buf.as_mut_ptr().add(data_len), 16); }
-            zeroize(&mut key);
-        }
+) -> Result<usize, RecordError> {
+    let needed = match plaintext.len().checked_add(17) {
+        Some(n) => n,
+        None => return Err(RecordError::BufferTooSmall),
+    };
+    if out_buf.len() < needed {
+        return Err(RecordError::BufferTooSmall);
     }
-
-    ct_len
+    if keys.seq_exhausted() {
+        return Err(RecordError::SequenceExhausted);
+    }
+    // SAFETY: `out_buf.len() >= plaintext.len() + 17` was checked above,
+    // and the two buffers are distinct slices.
+    unsafe {
+        core::ptr::copy_nonoverlapping(plaintext.as_ptr(), out_buf.as_mut_ptr(), plaintext.len());
+    }
+    encrypt_record_in_place(suite, keys, content_type, plaintext.len(), out_buf)
 }
 
 /// Decrypt a TLS 1.3 record in-place.

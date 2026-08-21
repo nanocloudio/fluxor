@@ -28,11 +28,13 @@ required = true
 
 [[params]]
 name = "width"
+tag = 10
 type = "u16"
 required = true
 
 [[params]]
 name = "height"
+tag = 11
 type = "u16"
 required = true
 
@@ -43,6 +45,7 @@ required = true
 # linux_display's `header` param.
 [[params]]
 name = "header"
+tag = 12
 type = "u16"
 default = 0
 

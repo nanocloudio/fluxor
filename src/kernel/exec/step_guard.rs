@@ -4,8 +4,12 @@
 //!
 //! Before each `module_step()`, the scheduler arms a one-shot hardware timer
 //! with the module's step deadline. On normal return, the timer is disarmed.
-//! If the timer fires (module exceeded deadline), the ISR sets a timeout flag
-//! and forces the module to return by modifying the exception return address.
+//! If the timer fires, the ISR records the overrun and disarms the alarm.
+//!
+//! An overrun is detected, never prevented: the module is not forced to
+//! return, and the scheduler acts on the recorded flag only after the step
+//! returns of its own accord. A module that never returns is not bounded by
+//! this mechanism on any target.
 //!
 //! ## Platform backends
 //!
@@ -14,13 +18,9 @@
 //! The `platform_init/arm/disarm` entry points are called by the HAL
 //! implementations and by the ISR vectors in the platform files.
 //!
-//! ## Fault trampoline
-//!
-//! On Cortex-M, the timer ISR fires in Handler mode. It modifies the stacked
-//! PC on PSP to point to `fault_trampoline`, which returns a timeout error
-//! code to the scheduler. On aarch64, forced return is not implemented (the
-//! step guard is advisory — it records the timeout but relies on cooperative
-//! return).
+//! On the Linux and WASM hosts the guard hooks are inert, so an overrun is
+//! not observed at all. The forced-return trampoline that rewrites a stacked
+//! PC belongs to the memory-protection fault path, not to this timer.
 
 use crate::kernel::sys::hal;
 use core::cell::UnsafeCell;

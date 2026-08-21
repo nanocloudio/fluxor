@@ -7,7 +7,7 @@ instantiated from a graph YAML and declares no ports or params.
 ## What it is
 
 `src/platform/linux/hsm_key_vault.rs` maps the `KEY_VAULT` (0x0010)
-contract opcodes onto a PKCS#11 token (rfc_crypto_extensions §4.3):
+contract opcodes onto a PKCS#11 token:
 `GENERATE` → `C_GenerateKeyPair` (non-extractable, key born in the token),
 `SIGN` → raw `CKM_ECDSA` folded to low-s, `ECDH` → `CKM_ECDH1_DERIVE`,
 `PUBLIC` → `CKA_EC_POINT`. `VERIFY` delegates to the kernel software

@@ -85,9 +85,16 @@ infrastructure; `fluxor flash` writes the SD-card alternative to
 netbooted Pi 5.
 
 The base graph for an OTA device is small: the network driver, `ip`,
-`tls` in client mode with the deployment CA pinned via its
-`trust_cert_file` param, and `ota_registry`. Application logic belongs
-in the pulled graph.
+`tls` in client mode, and `ota_registry`. Application logic belongs in
+the pulled graph.
+
+The `tls` client needs an explicit peer-authentication profile, or it
+refuses to construct — `peer_auth: ca_dns` with the deployment CA in
+`trust_cert_file` and the registry's name in `verify_hostname`, or
+`peer_auth: pinned` with the registry's own certificate in
+`trust_cert_file`. A device with no synchronised wall clock must also
+choose `clock_policy: unchecked`, which states that certificate
+lifetimes are not enforced on it.
 
 ## The Registry Puller: ota_registry
 

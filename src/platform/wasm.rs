@@ -123,11 +123,21 @@ mod stream_time;
 #[path = "wasm/hal.rs"]
 mod hal;
 
+use crate::platform::builtin_param_tags::{
+    host_browser_fetch as fetch_tags, wasm_browser_audio as audio_tags,
+    wasm_browser_canvas as canvas_tags, wasm_browser_gpu as gpu_tags,
+    wasm_browser_image_codec as image_codec_tags, wasm_browser_websocket as websocket_tags,
+    wasm_browser_ws_source as ws_source_tags,
+};
+
 /// Lightweight TLV walker for built-in module params. Mirrors
 /// `src/platform/linux/builtin_params.rs::walk_tlv`. Built-ins receive
 /// a per-instance TLV blob via `ModuleEntry::params()`; tags 10..0xEF
-/// are the manifest-declared params (auto-numbered in declaration
-/// order), tags 0xF0..0xFF are reserved.
+/// are the manifest-declared params, tags 0xF0..0xFF are reserved.
+///
+/// Each tag below comes from `crate::platform::builtin_param_tags`, which
+/// `build.rs` generates from the `[[params]]` tables of the wasm built-in
+/// manifests.
 fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
     if blob.len() < 4 || blob[0] != 0xFE || blob[1] != 0x01 {
         return;
@@ -516,9 +526,9 @@ unsafe fn load_embedded_modules() -> usize {
             let mut height = 0u16;
             let mut header = false;
             walk_tlv(entry.params(), |tag, value| match tag {
-                10 => width = tlv_u32(value) as u16,
-                11 => height = tlv_u32(value) as u16,
-                12 => header = tlv_u32(value) != 0,
+                canvas_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
+                canvas_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
+                canvas_tags::TAG_HEADER => header = tlv_u32(value) != 0,
                 _ => {}
             });
             let heap_bytes = canvas::heap_size_for(width, height);
@@ -881,9 +891,9 @@ unsafe fn load_embedded_modules() -> usize {
             let mut channels = 1u32;
             let mut lead_ms = 0u32; // 0 = module default (codec-depth)
             walk_tlv(entry.params(), |tag, value| match tag {
-                10 => sample_rate = tlv_u32(value),
-                11 => channels = tlv_u32(value),
-                12 => lead_ms = tlv_u32(value),
+                audio_tags::TAG_SAMPLE_RATE => sample_rate = tlv_u32(value),
+                audio_tags::TAG_CHANNELS => channels = tlv_u32(value),
+                audio_tags::TAG_LEAD_MS => lead_ms = tlv_u32(value),
                 _ => {}
             });
             let in_chan = scheduler::get_module_port(module_idx, 0, 0);
@@ -914,7 +924,7 @@ unsafe fn load_embedded_modules() -> usize {
             let mut url_buf = [0u8; 256];
             let mut url_len = 0usize;
             walk_tlv(entry.params(), |tag, value| {
-                if tag == 10 {
+                if tag == websocket_tags::TAG_URL {
                     let n = value.len().min(url_buf.len());
                     url_buf[..n].copy_from_slice(&value[..n]);
                     url_len = n;
@@ -949,7 +959,7 @@ unsafe fn load_embedded_modules() -> usize {
             let mut url_buf = [0u8; 256];
             let mut url_len = 0usize;
             walk_tlv(entry.params(), |tag, value| {
-                if tag == 10 {
+                if tag == ws_source_tags::TAG_URL {
                     let n = value.len().min(url_buf.len());
                     url_buf[..n].copy_from_slice(&value[..n]);
                     url_len = n;
@@ -985,7 +995,7 @@ unsafe fn load_embedded_modules() -> usize {
             let mut url_buf = [0u8; 256];
             let mut url_len = 0usize;
             walk_tlv(entry.params(), |tag, value| {
-                if tag == 10 {
+                if tag == fetch_tags::TAG_URL {
                     let n = value.len().min(url_buf.len());
                     url_buf[..n].copy_from_slice(&value[..n]);
                     url_len = n;
@@ -1012,9 +1022,9 @@ unsafe fn load_embedded_modules() -> usize {
             let mut height = 0u16;
             let mut max_bytes = 8u32 * 1024 * 1024;
             walk_tlv(entry.params(), |tag, value| match tag {
-                10 => width = tlv_u32(value) as u16,
-                11 => height = tlv_u32(value) as u16,
-                12 => max_bytes = tlv_u32(value),
+                image_codec_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
+                image_codec_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
+                image_codec_tags::TAG_MAX_BYTES => max_bytes = tlv_u32(value),
                 _ => {}
             });
             let heap_bytes = image_codec::heap_size_for(max_bytes);
@@ -1108,8 +1118,8 @@ unsafe fn load_embedded_modules() -> usize {
             let mut width = 800u16;
             let mut height = 600u16;
             walk_tlv(entry.params(), |tag, value| match tag {
-                10 => width = tlv_u32(value) as u16,
-                11 => height = tlv_u32(value) as u16,
+                gpu_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
+                gpu_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
                 _ => {}
             });
             let heap_bytes = gpu::heap_size_for(width, height);

@@ -282,7 +282,11 @@ unsafe fn dtls_pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     }
 
     match ch.key_share {
-        Some((_, key_data)) if key_data.len() <= 65 => {
+        // The key share is a peer-supplied point; admit it only if
+        // it decodes to a canonical, on-curve, non-identity P-256
+        // point. Anything else falls through to the no-usable-share
+        // branch below rather than reaching the ECDH ladder.
+        Some((_, key_data)) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 driver.peer_key_share.as_mut_ptr(),
@@ -383,11 +387,22 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
         } else if s.key_len > 32 {
             extract_ec_private_key(&s.key[..s.key_len], &mut priv_key);
         }
-        raw_sig = ecdsa_sign(&priv_key, &vc_hash, &k_random);
+        let signed = ecdsa_sign(&priv_key, &vc_hash, &k_random);
         let mut j = 0;
         while j < 32 {
             core::ptr::write_volatile(&mut priv_key[j], 0);
             j += 1;
+        }
+        match signed {
+            Some(sig) => raw_sig = sig,
+            None => {
+                // The configured identity key is not a usable P-256
+                // scalar (absent, or outside [1, n-1]). Signing under
+                // it would produce a CertificateVerify no peer can
+                // tie to this identity.
+                s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
+                return true;
+            }
         }
     }
 
@@ -424,6 +439,15 @@ unsafe fn dtls_pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
 
 unsafe fn dtls_pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
+    // Same rule as the stream path: the name is disclosed only when it is
+    // also the name required of the peer's certificate.
+    let sni_len = if s.peer_auth == PROFILE_CA_DNS {
+        s.expected_dns_len
+    } else {
+        0
+    };
+    let mut sni_buf = [0u8; MAX_EXPECTED_DNS];
+    core::ptr::copy_nonoverlapping(s.expected_dns.as_ptr(), sni_buf.as_mut_ptr(), sni_len);
     let driver = &mut s.peer_sessions[idx].endpoint.driver;
     let mut random = [0u8; 32];
     dev_csprng_fill(sys, random.as_mut_ptr(), 32);
@@ -432,10 +456,14 @@ unsafe fn dtls_pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     driver.peer_session_id = session_id;
     driver.peer_session_id_len = 32;
 
-    let msg_len = build_client_hello(
+    let msg_len = build_client_hello_sni(
         &random,
         &session_id,
         &driver.ecdh_public,
+        &[],
+        &[],
+        &sni_buf[..sni_len],
+        TLS13_RECORD_SUITES,
         &mut driver.scratch,
     );
 
@@ -470,39 +498,37 @@ unsafe fn dtls_pump_recv_encrypted_extensions(s: &mut TlsState, idx: usize) -> b
 }
 
 unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
-    // Snapshot the TLS-state-level CA + trust-domain config off the
-    // shared `TlsState` so the same chain-of-trust rules apply to
-    // DTLS. Earlier code skipped both checks and just copied the
-    // leaf public key — the TCP-TLS hardening in extract_peer_cert_key
-    // wasn't reaching DTLS peers (audit finding #6).
-    let ca_pk_ptr: Option<&[u8]> = if s.require_ca && s.ca_pubkey_len > 0 {
-        Some(&s.ca_pubkey[..s.ca_pubkey_len as usize])
-    } else {
-        None
-    };
-    let td_ptr: Option<&[u8]> = if s.trust_domain_len > 0 {
-        Some(&s.trust_domain[..s.trust_domain_len])
-    } else {
-        None
-    };
-    let endpoint = &mut s.peer_sessions[idx].endpoint;
-    let (data, len, msg_type) = match endpoint.driver.read_handshake_message() {
-        Some(t) => t,
-        None => return false,
+    let (data, len, msg_type, is_server) = {
+        let endpoint = &mut s.peer_sessions[idx].endpoint;
+        let is_server = endpoint.driver.is_server;
+        match endpoint.driver.read_handshake_message() {
+            Some((d, l, t)) => (d, l, t, is_server),
+            None => return false,
+        }
     };
     if msg_type != HT_CERTIFICATE {
-        endpoint.driver.hs_state = HandshakeState::Error;
+        s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
         return true;
     }
-    if let Some(ref mut t) = endpoint.driver.transcript {
+    if let Some(ref mut t) = s.peer_sessions[idx].endpoint.driver.transcript {
         t.update(&data[..len]);
     }
+    // The same acceptance decision the TCP path makes, from the same module
+    // policy: a datagram transport does not get a weaker peer identity.
     let body = &data[4..len];
-    if !validate_and_extract_peer_cert(body, &mut endpoint.driver, ca_pk_ptr, td_ptr) {
-        endpoint.driver.hs_state = HandshakeState::Error;
+    let mut rc = peer_cert_reason(s, is_server, body);
+    if rc == CERT_OK {
+        rc = bind_peer_cert_key(&mut s.peer_sessions[idx].endpoint.driver, body);
+    }
+    if rc != CERT_OK {
+        // DTLS peers have no IP-module conn_id; the peer-slot index is the
+        // stable per-transport identifier, as for MSG_PEER_IDENTITY.
+        log_peer_auth_failure(s, idx as u16, rc);
+        s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
         return true;
     }
-    endpoint.driver.hs_state = HandshakeState::RecvCertificateVerify;
+    s.last_peer_auth_error = CERT_OK;
+    s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::RecvCertificateVerify;
     true
 }
 

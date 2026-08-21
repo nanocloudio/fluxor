@@ -19,11 +19,13 @@ required = true
 
 [[params]]
 name = "port_filter"
+tag = 10
 type = "str"
 default = ""
 
 [[params]]
 name = "sysex"
+tag = 11
 type = "enum"
 values = ["off", "on"]
 default = "off"

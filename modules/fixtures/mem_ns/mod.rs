@@ -144,7 +144,10 @@ pub extern "C" fn module_new(
         }
         let mut j = 0;
         while j < MAX_OPEN {
-            s.open[j] = OpenSlot { in_use: 0, binding: 0 };
+            s.open[j] = OpenSlot {
+                in_use: 0,
+                binding: 0,
+            };
             j += 1;
         }
         0
@@ -365,8 +368,7 @@ unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
             }
             out[w] = b.path_len;
             out[w + 1] = b.kind;
-            out[w + 2..w + 2 + b.path_len as usize]
-                .copy_from_slice(&b.path[..b.path_len as usize]);
+            out[w + 2..w + 2 + b.path_len as usize].copy_from_slice(&b.path[..b.path_len as usize]);
             w += need;
         }
         i += 1;
@@ -454,7 +456,10 @@ fn ns_close(s: &mut MemNsState, handle: i32) -> i32 {
     if handle < 0 || idx >= MAX_OPEN || s.open[idx].in_use == 0 {
         return E_INVAL;
     }
-    s.open[idx] = OpenSlot { in_use: 0, binding: 0 };
+    s.open[idx] = OpenSlot {
+        in_use: 0,
+        binding: 0,
+    };
     0
 }
 

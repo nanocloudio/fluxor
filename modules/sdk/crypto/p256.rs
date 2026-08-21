@@ -2,22 +2,49 @@
 // Pure Rust, no_std, no heap
 // Field arithmetic over p = 2^256 - 2^224 + 2^192 + 2^96 - 1
 //
-// Uses projective (Jacobian) coordinates to avoid modular inversion
-// during point multiplication. Two scalar-multiplication paths:
+// # Timing exposure
+//
+// This implementation is NOT constant-time, at three separate levels.
+// Named helpers whose identifiers begin `ct_` are individually
+// branchless and do what their names say; they do not make the
+// operations built on top of them constant-time.
+//
+//   1. Field and scalar arithmetic. `fp_add`, `fp_sub`, `mod_p`,
+//      `mod_n_reduce` and `fn_add` branch on the carry or borrow of
+//      secret operands. `fp_reduce` runs two `while` loops whose trip
+//      counts depend on the value being reduced, and `fn_reduce_wide`
+//      iterates until the high limbs clear — so a single field
+//      multiply takes a value-dependent number of iterations. Every
+//      point operation and both scalar-multiplication paths are built
+//      out of these, so the exposure is present on every ECDH
+//      agreement and every ECDSA signature.
+//   2. Point arithmetic. `add_jacobian` and `add_affine`
+//      short-circuit on identity inputs and on the doubling case,
+//      which are branches on secret-derived values.
+//   3. Inversion. `fp_inv` and `fn_inv` are square-and-multiply over a
+//      public exponent, so their own control flow is fine, but each of
+//      their ~512 multiplies is value-dependent per (1). `fn_inv` is
+//      applied to the ECDSA nonce `k`.
+//
+// Two scalar-multiplication paths, both affected:
 //
 //   - `scalar_mul_ct` (one-shot, used by ECDH + ECDSA): fixed-window
-//     w=4 with constant-time table lookup. Same shape as BoringSSL /
-//     ring / OpenSSL. See the function's docstring for the residual-
-//     timing-leak disclosure (the lookup is constant-time; the
-//     underlying `add_jacobian` / `double` ops have identity-input
-//     short-circuits that leak the location of zero nibbles in the
-//     secret scalar).
+//     w=4 with a branchless table lookup. Same shape as BoringSSL /
+//     ring / OpenSSL, but those pair the lookup with complete or
+//     exception-free formulas; here the underlying `add_jacobian`
+//     short-circuits leak the location of zero nibbles in the secret
+//     scalar. See the function's docstring.
 //   - `ScalarMulState` (resumable, used when the kernel needs to
 //     yield mid-multiplication): per-bit Montgomery ladder. The
 //     `step()` API processes `bits_per_step` bits at a time so a
 //     concurrent handshake doesn't have to wait for the whole
-//     scalar multiplication to finish. Same constant-time
-//     considerations as `scalar_mul_ct` apply.
+//     scalar multiplication to finish. The ladder's swap is
+//     branchless, but the add and double it drives are not, and
+//     leading zero bits of the scalar hit the identity short-circuit.
+//
+// `ed25519.rs` in this directory is the constant-time signature
+// primitive: complete unified formulas, branchless field arithmetic,
+// branchless table lookup, no identity special cases.
 //
 // ECDSA signing uses RFC 6979 deterministic nonces and normalises
 // signatures to low-s form. Intermediate secrets are zeroised via
@@ -139,7 +166,10 @@ fn u256_sub(a: &U256, b: &U256) -> (U256, u64) {
     (r, borrow)
 }
 
-/// Compare: returns 1 if a >= b, 0 otherwise. Constant-time.
+/// Compare: returns 1 if a >= b, 0 otherwise. Branchless — the borrow
+/// chain runs over all four limbs regardless of where the values
+/// differ, and the result is arithmetic, not a branch. Callers that
+/// then branch on the returned value reintroduce the dependency.
 fn u256_gte(a: &U256, b: &U256) -> u64 {
     // Compute a - b with borrow tracking across all 4 limbs.
     // If no borrow out, a >= b.
@@ -160,10 +190,18 @@ fn u256_is_zero(a: &U256) -> bool {
 }
 
 // ============================================================================
-// Modular arithmetic mod p (P-256 prime)
+// Modular arithmetic mod p (P-256 prime).
+//
+// None of the routines in this section are constant-time. Each
+// conditional correction below (`mod_p`, `fp_add`, `fp_sub`) selects on
+// the carry or borrow of its operands, and `fp_reduce` corrects with
+// value-dependent loops. Operands are secret on every ECDH agreement
+// and ECDSA signature, so the whole layer carries the exposure noted
+// at the top of this file.
 // ============================================================================
 
-/// Reduce mod p
+/// Reduce mod p. Selects between `a - p` and `a` on the subtraction
+/// borrow, i.e. on a secret-derived value.
 fn mod_p(a: &U256) -> U256 {
     let p = load_p();
     let (r, borrow) = u256_sub(a, &p);
@@ -221,8 +259,15 @@ fn u256_mul_wide(a: &U256, b: &U256) -> [u64; 8] {
     out
 }
 
-/// Barrett-like reduction mod p for P-256
-/// Uses the special form of P-256 prime for fast reduction
+/// Barrett-like reduction mod p for P-256. Uses the special form of
+/// the P-256 prime for fast reduction.
+///
+/// Variable-time. The final corrections are three loops — `while c <
+/// 0`, `while c > 0`, and the `u256_gte` subtraction loop — whose trip
+/// counts depend on the magnitude of `t`. Since `fp_mul` and `fp_sqr`
+/// both end here, the cost of a single field multiply on secret data
+/// varies with that data. Making this constant-time means a fixed
+/// number of masked corrections rather than loops.
 fn fp_reduce(t: &[u64; 8]) -> U256 {
     // P-256 reduction using the NIST method (FIPS 186-4, D.2.3)
     // p = 2^256 - 2^224 + 2^192 + 2^96 - 1
@@ -440,7 +485,11 @@ fn fp_sqr(a: &U256) -> U256 {
     fp_reduce(&u256_sqr_wide(a))
 }
 
-/// Modular inversion using Fermat's little theorem: a^(p-2) mod p
+/// Modular inversion using Fermat's little theorem: a^(p-2) mod p.
+///
+/// The exponent is the public constant p-2, so the square-and-multiply
+/// schedule is fixed and reveals nothing. The individual `fp_mul` /
+/// `fp_sqr` calls it makes are still value-dependent per `fp_reduce`.
 fn fp_inv(a: &U256) -> U256 {
     // p-2 = 2^256 - 2^224 + 2^192 + 2^96 - 3
     // Use square-and-multiply with optimized addition chain
@@ -469,7 +518,12 @@ fn fp_inv(a: &U256) -> U256 {
 }
 
 // ============================================================================
-// Modular arithmetic mod n (curve order)
+// Modular arithmetic mod n (curve order).
+//
+// Not constant-time, for the same reasons as the mod-p section:
+// conditional corrections selected on secret-derived carries and
+// borrows, and a value-dependent fold loop in `fn_reduce_wide`. This
+// layer carries the ECDSA nonce and the private scalar.
 // ============================================================================
 
 fn mod_n_reduce(a: &U256) -> U256 {
@@ -499,6 +553,15 @@ fn fn_mul(a: &U256, b: &U256) -> U256 {
     fn_reduce_wide(&t)
 }
 
+/// Reduce a 512-bit value mod n.
+///
+/// Variable-time: the fold loop runs until the high four limbs are
+/// zero (capped at 16 passes), so the iteration count depends on the
+/// value. `fn_mul` and `fn_inv` both reduce here, and `fn_inv` is
+/// applied to the ECDSA nonce `k`, so the signing path's duration is a
+/// function of secret material. Partial nonce leakage is the input to
+/// the standard hidden-number-problem key recovery, so this is not a
+/// bounded disclosure — see the note on `scalar_mul_ct`.
 fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     // Reduce 512-bit value t mod n using iterative: t_hi * R + t_lo
     // R = 2^256 - n (small, ~128 bits)
@@ -542,7 +605,10 @@ fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     mod_n_reduce(&[acc[0], acc[1], acc[2], acc[3]])
 }
 
-/// Modular inverse mod n using Fermat's little theorem
+/// Modular inverse mod n using Fermat's little theorem.
+///
+/// The exponent n-2 is public, so the schedule is fixed; the multiplies
+/// underneath it are variable-time per `fn_reduce_wide`.
 fn fn_inv(a: &U256) -> U256 {
     let mut result = ONE;
     let mut base = *a;
@@ -571,7 +637,10 @@ fn fn_inv(a: &U256) -> U256 {
 }
 
 // ============================================================================
-// Constant-time helpers
+// Branchless helpers. Each of these is individually free of
+// data-dependent branches and data-dependent memory addressing. They
+// do not make their callers constant-time; the surrounding field,
+// point and scalar-multiplication layers are not.
 // ============================================================================
 
 /// Zeroise a byte buffer via volatile writes. `#[inline(never)]` prevents
@@ -658,9 +727,10 @@ impl JacobianPoint {
     /// No explicit `is_identity` short-circuit: the dbl-2001-b
     /// formulas naturally produce `z3 = 2yz = 0` when the input is
     /// identity (`z = 0`), so the output is semantically identity
-    /// regardless of what x3/y3 carry. Skipping the branch removes
-    /// one data-dependent path from the scalar-mult inner loop —
-    /// see [`scalar_mul_ct`] constant-time disclosure.
+    /// regardless of what x3/y3 carry. This routine therefore has no
+    /// data-dependent branch of its own. It is still not
+    /// constant-time: every `fp_*` call it makes is value-dependent —
+    /// see the timing-exposure note at the top of this file.
     fn double(&self) -> Self {
         // Using "dbl-2001-b" formulas (faster for a = -3)
         let s = fp_mul(&self.y, &self.y);
@@ -690,7 +760,12 @@ impl JacobianPoint {
         JacobianPoint { x: x3, y: y3, z: z3 }
     }
 
-    /// Point addition (mixed: Q is affine with Z=1)
+    /// Point addition (mixed: Q is affine with Z=1).
+    ///
+    /// Three data-dependent branches: identity input, `h == 0` with
+    /// `r == 0` (the doubling case), and `h == 0` with `r != 0` (the
+    /// inverse case). Each takes a different amount of work, so the
+    /// duration of the call reveals which case the inputs fell into.
     fn add_affine(&self, qx: &U256, qy: &U256) -> Self {
         if self.is_identity() {
             return JacobianPoint::from_affine(qx, qy);
@@ -725,8 +800,14 @@ impl JacobianPoint {
     /// coords). The accumulator in `scalar_mul_ct` adds the (Jacobian)
     /// table-lookup output each window, so we need a Jacobian-Jacobian
     /// add — `add_affine` only handles the case where the right-hand
-    /// side is in affine form. Identity inputs short-circuit; see
-    /// the constant-time disclosure on `scalar_mul_ct`.
+    /// side is in affine form.
+    ///
+    /// Same exceptional-case branches as `add_affine`, plus a second
+    /// identity test on the right-hand operand. In `scalar_mul_ct`
+    /// that operand is the table entry selected by a secret scalar
+    /// nibble and `table[0]` is the identity, so a zero nibble takes
+    /// the short-circuit and a non-zero nibble does not. See the
+    /// exposure note on `scalar_mul_ct`.
     fn add_jacobian(&self, other: &JacobianPoint) -> Self {
         if self.is_identity() {
             return JacobianPoint { x: other.x, y: other.y, z: other.z };
@@ -823,40 +904,44 @@ fn ct_lookup_table_16(table: &[JacobianPoint; 16], idx: usize) -> JacobianPoint 
 ///   additions, amortised once) + 64 windows × (4 doublings + 1
 ///   add) ≈ 256 doublings + 64 additions on the critical path.
 ///
-/// Net: about 25-40 % fewer additions on the inner loop. The
-/// table lookup is constant-time (16 × 4 ct-selects per window,
-/// see [`ct_lookup_table_16`]).
+/// Net: about 25-40 % fewer additions on the inner loop.
 ///
-/// # Constant-time disclosure
+/// # Timing exposure
 ///
-/// The **table lookup is constant-time** — no data-dependent
-/// branch or memory access on the secret scalar nibble.
+/// This routine is **not constant-time**, despite the `_ct` suffix,
+/// which names only the table lookup.
 ///
-/// The **underlying point arithmetic is NOT fully constant-time.**
-/// [`JacobianPoint::double`] and [`JacobianPoint::add_jacobian`]
-/// keep their classic short-circuit branches for identity inputs.
-/// Those branches fire predictably:
-///   - on every leading-zero nibble of the secret scalar
-///     (`acc.is_identity()` until we accumulate a non-zero
-///     window),
-///   - on every zero nibble of the secret scalar
-///     (`ct_lookup_table_16` returns `table[0] == identity`,
-///     so `acc.add_jacobian(&identity)` short-circuits).
+/// What is branchless: [`ct_lookup_table_16`] scans all 16 entries and
+/// selects arithmetically, so the secret nibble never becomes a load
+/// address. That closes the cache-timing channel on the table itself.
 ///
-/// In threat models where an adversary can observe sub-microsecond
-/// timing of the scalar mult (local cache attacks, co-located
-/// hyperthread), this leaks the location of zero nibbles in the
-/// scalar — about 16 bits of `log2(16) × 64 × P(nibble=0) ≈ 16`
-/// bits per ECDH for a uniform-random 256-bit scalar.
+/// What is not:
 ///
-/// For our embedded threat model (no co-located adversary, network
-/// timing only) this leak is below the noise floor of UDP/TCP RTT
-/// jitter and below what's relevant to a TLS handshake observer.
+///   - [`JacobianPoint::add_jacobian`] short-circuits on identity
+///     inputs. The branch fires on every leading-zero nibble of the
+///     scalar (`acc` is still the identity) and on every zero nibble
+///     anywhere in the scalar (the lookup returns `table[0]`, the
+///     identity). The position of the zero nibbles is therefore
+///     visible in the timing profile.
+///   - Every `fp_*` operation underneath is value-dependent — see the
+///     note at the top of this file. That channel is present even for
+///     a scalar with no zero nibbles.
 ///
-/// **Full constant-time requires complete addition formulas**
-/// (Renes-Costello-Batina, ~50 % more multiplications) **or
-/// Booth recoding** (signed-digit scalar representation with no
-/// zero digits). Both are tracked as follow-up work.
+/// The exposure is not a bounded disclosure of a few bits. For ECDSA
+/// the multiplied scalar is the per-signature nonce `k`; partial
+/// knowledge of `k` across a set of signatures is the input to
+/// hidden-number-problem lattice recovery of the long-term key, and
+/// published attacks of this shape have worked over a network rather
+/// than only from a co-located process. For ECDH the scalar is the
+/// private key itself and the same measurements accumulate across
+/// handshakes. Treat a timing-capable adversary as able to recover the
+/// key, not as able to learn a few bits of it.
+///
+/// Removing the exposure requires all three of: exception-free or
+/// complete addition formulas (Renes-Costello-Batina, ~50 % more
+/// multiplications) or a signed-digit recoding with no zero digits;
+/// masked, fixed-trip-count field reductions; and a constant-time
+/// inversion for `fn_inv`.
 ///
 /// KATs in `tests/harness/tests/tls_crypto_kat.rs` gate
 /// correctness of the entire `(sign, verify, ECDH)` surface
@@ -897,13 +982,12 @@ fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
     let mut window_idx: i32 = 63; // 64 nibbles of 4 bits each
     while window_idx >= 0 {
         // Quadruple the accumulator (4 doublings = shift-left-4).
-        // First iteration is identity → identity, the doublings
-        // are no-ops; later iterations do real work. The branch
-        // on `is_identity` inside `double` doesn't leak the secret
-        // scalar — it's a deterministic property of the iteration.
+        // `double` has no identity short-circuit, so the number of
+        // doublings per window is fixed at four regardless of the
+        // scalar.
         acc = acc.double().double().double().double();
-        // Extract this nibble (constant-time arithmetic — no branch
-        // on the secret nibble value).
+        // Extract this nibble arithmetically — the nibble value never
+        // becomes a branch condition or a load address here.
         let bit_pos = (window_idx as u32) * 4;
         let limb_idx = (bit_pos / 64) as usize;
         let limb_off = bit_pos % 64;
@@ -932,13 +1016,20 @@ fn scalar_mul(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
 // Resumable scalar multiplication
 // ============================================================================
 //
-// Splits the constant-time Montgomery ladder into chunks so a caller can
-// yield between chunks — each ECDH on aarch64 runs long enough that a
+// Splits the Montgomery ladder into chunks so a caller can yield
+// between chunks — each ECDH on aarch64 runs long enough that a
 // concurrent handshake otherwise waits for the whole ladder to finish.
 //
 // One ladder bit performs: ct_swap, add_jacobian, double, ct_swap. Each
 // step() processes `bits_per_step` ladder bits (clamped to remaining bits);
 // the caller checks `complete()` to know when to extract the result.
+//
+// The ladder shape is regular and `ct_swap` is branchless, so the
+// scalar bit does not select which operations run. It is still not a
+// constant-time ladder: `add_jacobian` short-circuits while `r0` is the
+// identity (every leading zero bit of the scalar), and the field
+// arithmetic beneath both the add and the double is value-dependent.
+// The same exposure documented on `scalar_mul_ct` applies here.
 
 pub struct ScalarMulState {
     r0: JacobianPoint,
@@ -1044,21 +1135,19 @@ impl ScalarMulState {
 
 /// Resumable variant of `ecdh_shared_secret`. The caller drives the returned
 /// state with `step()` and finalises with `ecdh_shared_secret_finalise`.
+///
+/// Admits exactly the same inputs as the one-shot form: the peer point
+/// goes through `decode_public_point` and the private scalar through
+/// `decode_private_scalar` before any ladder state exists. Splitting
+/// the multiplication across scheduler ticks changes when the work
+/// happens, never which inputs are acceptable.
 pub fn ecdh_shared_secret_init(
     my_private: &[u8; 32],
     peer_pub: &[u8],
     bits_per_step: u8,
 ) -> Option<ScalarMulState> {
-    let offset = if peer_pub.len() == 65 && peer_pub[0] == 0x04 {
-        1
-    } else if peer_pub.len() == 64 {
-        0
-    } else {
-        return None;
-    };
-    let px = u256_from_be(&peer_pub[offset..offset + 32]);
-    let py = u256_from_be(&peer_pub[offset + 32..offset + 64]);
-    let k = u256_from_be(my_private);
+    let (px, py) = decode_public_point(peer_pub)?;
+    let k = decode_private_scalar(my_private)?;
     Some(ScalarMulState::new(&k, &px, &py, bits_per_step))
 }
 
@@ -1130,12 +1219,15 @@ impl EcdsaSignState {
 /// to the inner `ScalarMulState` — 0 means "run to completion in one
 /// step" (matches non-incremental `ecdsa_sign`); a small value (e.g.
 /// 32) splits the ladder so each step fits a typical scheduler tick.
+///
+/// Returns None for a private scalar outside [1, n-1], matching the
+/// one-shot `ecdsa_sign`.
 pub fn ecdsa_sign_init(
     private_key: &[u8; 32],
     hash: &[u8],
     bits_per_step: u8,
-) -> EcdsaSignState {
-    let d = u256_from_be(private_key);
+) -> Option<EcdsaSignState> {
+    let d = decode_private_scalar(private_key)?;
     let k = rfc6979_nonce(private_key, hash);
     // Truncate / pad hash to 32 bytes, then reduce mod n. Matches
     // the prologue of `ecdsa_sign`.
@@ -1155,13 +1247,13 @@ pub fn ecdsa_sign_init(
         u256_from_be(&buf)
     };
     let z = mod_n_reduce(&z);
-    EcdsaSignState {
+    Some(EcdsaSignState {
         scalar_mul: ScalarMulState::new_base(&k, bits_per_step),
         d,
         k,
         z,
         initialised: 1,
-    }
+    })
 }
 
 /// Finalise resumable ECDSA signing. Callers must drive
@@ -1339,7 +1431,10 @@ pub fn is_on_curve(x: &U256, y: &U256) -> bool {
     let three_x = fp_add(&two_x, x);
     // x³ - 3x + b mod p
     let rhs = fp_add(&fp_sub(&x_cubed, &three_x), &load_b());
-    // Constant-time equality on the U256 limbs.
+    // Equality folded over all four limbs before the branch, so the
+    // comparison itself reveals nothing about where the values differ.
+    // The inputs here are a candidate public point — public — so this
+    // is hygiene rather than a required property.
     let mut diff = 0u64;
     let mut i = 0;
     while i < 4 {
@@ -1349,36 +1444,94 @@ pub fn is_on_curve(x: &U256, y: &U256) -> bool {
     diff == 0
 }
 
+/// The single decode-and-validate gate for every P-256 public point
+/// that arrives from outside this module — TLS key shares, peer
+/// CertificateVerify keys, certificate SubjectPublicKeyInfo, and both
+/// ECDH entry points.
+///
+/// Accepts the SEC 1 uncompressed encoding `0x04 || X || Y` (65 bytes)
+/// and the bare `X || Y` form (64 bytes). Everything else is refused:
+/// compressed prefixes (`0x02`/`0x03`) are not supported, and any
+/// other prefix or length is malformed.
+///
+/// A point survives only if all four hold:
+///   - X and Y are canonical, i.e. each is numerically less than `p`
+///     (a non-reduced coordinate has two encodings, so accepting one
+///     lets an attacker vary the wire bytes without varying the point);
+///   - the point is not the affine identity `(0, 0)`;
+///   - the point satisfies y² ≡ x³ - 3x + b (mod p), which pins it to
+///     P-256 rather than some other curve with the same field and a
+///     smooth order (the invalid-curve attack);
+///   - it is therefore in the prime-order group, since P-256 has
+///     cofactor 1 and every on-curve non-identity point generates it.
+fn decode_public_point(encoded: &[u8]) -> Option<(U256, U256)> {
+    let offset = if encoded.len() == 65 {
+        if encoded[0] != 0x04 {
+            return None;
+        }
+        1
+    } else if encoded.len() == 64 {
+        0
+    } else {
+        return None;
+    };
+
+    let x = u256_from_be(&encoded[offset..offset + 32]);
+    let y = u256_from_be(&encoded[offset + 32..offset + 64]);
+
+    // RFC 8446 §4.2.8.2 / SP 800-56A §5.6.2.3.4.
+    let p = load_p();
+    if u256_gte(&x, &p) != 0 || u256_gte(&y, &p) != 0 {
+        return None;
+    }
+    if x == ZERO && y == ZERO {
+        return None;
+    }
+    if !is_on_curve(&x, &y) {
+        return None;
+    }
+    Some((x, y))
+}
+
+/// True when `encoded` is a P-256 public point this module will use.
+/// Callers holding an encoded key before they need the coordinates —
+/// certificate SubjectPublicKeyInfo parsing, TLS key-share admission —
+/// gate on this so a bad point is refused at the boundary it entered
+/// through rather than deep inside a scalar multiplication.
+pub fn public_point_is_valid(encoded: &[u8]) -> bool {
+    decode_public_point(encoded).is_some()
+}
+
+/// Decode a private scalar `d` supplied at the standalone API
+/// boundary. `d` must lie in `[1, n-1]`: `d == 0` yields the identity
+/// for every input, and `d >= n` is a non-canonical encoding of
+/// `d mod n`. Internal key generation already clamps, but a caller may
+/// have obtained the scalar anywhere, so every entry point re-checks.
+fn decode_private_scalar(private_key: &[u8; 32]) -> Option<U256> {
+    let d = u256_from_be(private_key);
+    if u256_is_zero(&d) {
+        return None;
+    }
+    if u256_gte(&d, &load_n()) != 0 {
+        return None;
+    }
+    Some(d)
+}
+
 /// ECDH shared secret: scalar_mult(my_private, peer_public).x
 /// peer_pub should be 65 bytes (0x04 || X || Y) or 64 bytes (X || Y)
 ///
 /// Returns None on:
+///   - a private scalar outside [1, n-1]
 ///   - malformed encoding (wrong length, non-uncompressed prefix)
-///   - point not on the curve (invalid-curve attack defence)
+///   - noncanonical coordinates, the identity, or a point not on the
+///     curve (invalid-curve attack defence)
 ///   - scalar multiplication producing the point at infinity
 ///     (small-subgroup attack defence — peer submitted a point of
 ///     low order whose multiples cycle through the subgroup)
 pub fn ecdh_shared_secret(my_private: &[u8; 32], peer_pub: &[u8]) -> Option<[u8; 32]> {
-    let offset = if peer_pub.len() == 65 && peer_pub[0] == 0x04 { 1 } else if peer_pub.len() == 64 { 0 } else { return None; };
-
-    let px = u256_from_be(&peer_pub[offset..offset + 32]);
-    let py = u256_from_be(&peer_pub[offset + 32..offset + 64]);
-
-    // RFC 8446 §4.2.8.2 (and SP 800-56A §5.6.2.3.4): MUST verify the
-    // peer's key share is a valid point on the named curve.
-    let p = load_p();
-    if u256_gte(&px, &p) != 0 || u256_gte(&py, &p) != 0 {
-        return None; // coordinates must be canonical (< p)
-    }
-    if !is_on_curve(&px, &py) {
-        return None;
-    }
-    // Reject the identity (0, 0 in affine encoding).
-    if px == ZERO && py == ZERO {
-        return None;
-    }
-
-    let mut k = u256_from_be(my_private);
+    let (px, py) = decode_public_point(peer_pub)?;
+    let mut k = decode_private_scalar(my_private)?;
     let result = scalar_mul(&k, &px, &py);
     zeroize_u256(&mut k);
 
@@ -1502,8 +1655,12 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 /// from the private key and the hash (RFC 6979); the `_random_k` parameter
 /// is retained for API compatibility and ignored. Returns the 64-byte
 /// signature `r || s` in big-endian form, normalised to low-s.
-pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> [u8; 64] {
-    let d = u256_from_be(private_key);
+///
+/// Returns None when `private_key` is not a valid scalar in [1, n-1];
+/// signing with `d == 0` produces a signature that verifies under the
+/// identity, and `d >= n` silently signs under `d mod n`.
+pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> Option<[u8; 64]> {
+    let d = decode_private_scalar(private_key)?;
     let mut k = rfc6979_nonce(private_key, hash);
 
     // r = (k * G).x mod n
@@ -1548,19 +1705,24 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
         core::ptr::copy_nonoverlapping(rb.as_ptr(), sig.as_mut_ptr(), 32);
         core::ptr::copy_nonoverlapping(sb.as_ptr(), sig.as_mut_ptr().add(32), 32);
     }
-    sig
+    Some(sig)
 }
 
 /// ECDSA verify: check (r, s) over message hash with public key
 /// sig: 64 bytes (r || s), pub_key: 65 bytes (0x04 || X || Y)
 pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     if sig.len() < 64 { return false; }
-    let offset = if pub_key.len() == 65 && pub_key[0] == 0x04 { 1 } else if pub_key.len() == 64 { 0 } else { return false; };
+    // The public point is an untrusted input here exactly as it is in
+    // ECDH: an off-curve Q makes `scalar_mul` operate in a group that
+    // is not P-256, and the verification equation can then be
+    // satisfied by a signature no key holder produced.
+    let (qx, qy) = match decode_public_point(pub_key) {
+        Some(q) => q,
+        None => return false,
+    };
 
     let r = u256_from_be(&sig[..32]);
     let s = u256_from_be(&sig[32..64]);
-    let qx = u256_from_be(&pub_key[offset..offset + 32]);
-    let qy = u256_from_be(&pub_key[offset + 32..offset + 64]);
 
     // Check r, s in [1, n-1]
     let n = load_n();
@@ -1599,35 +1761,58 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     rx_mod_n == r
 }
 
-/// Parse DER-encoded ECDSA signature into (r, s) raw 64 bytes
+/// Parse a canonical DER-encoded ECDSA signature into raw `r || s`.
+///
+/// `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` has exactly
+/// one DER encoding for a given pair, and this parser accepts only
+/// that one:
+///
+///   - the SEQUENCE spans the whole input, so no bytes trail it;
+///   - each length uses the short form (an ECDSA integer is at most 33
+///     bytes, so the long form is never minimal here);
+///   - each INTEGER is non-empty, positive, and minimally encoded —
+///     one leading `0x00` only when needed to clear the sign bit.
+///
+/// Signature malleability by re-encoding matters wherever a signature
+/// is compared, cached, or logged as an identifier, and a lenient
+/// parser hands an attacker a family of distinct byte strings for one
+/// signature.
 pub fn parse_der_signature(der: &[u8]) -> Option<[u8; 64]> {
     if der.len() < 8 { return None; }
     if der[0] != 0x30 { return None; }
+    let seq_len = der[1] as usize;
+    if seq_len >= 0x80 { return None; } // long form is never minimal here
+    if 2 + seq_len != der.len() { return None; } // trailing bytes
 
-    let mut pos = 2; // skip SEQUENCE tag + length
+    let mut pos = 2;
 
-    // Parse r
-    if pos >= der.len() || der[pos] != 0x02 { return None; }
-    pos += 1;
-    let r_len = der[pos] as usize;
-    pos += 1;
-    if pos + r_len > der.len() { return None; }
-    let r_bytes = &der[pos..pos + r_len];
-    pos += r_len;
-
-    // Parse s
-    if pos >= der.len() || der[pos] != 0x02 { return None; }
-    pos += 1;
-    let s_len = der[pos] as usize;
-    pos += 1;
-    if pos + s_len > der.len() { return None; }
-    let s_bytes = &der[pos..pos + s_len];
+    let r_bytes = parse_der_positive_int(der, &mut pos)?;
+    let s_bytes = parse_der_positive_int(der, &mut pos)?;
+    if pos != der.len() { return None; } // extra SEQUENCE members
 
     // Convert to fixed 32-byte big-endian
     let mut sig = [0u8; 64];
     copy_be_padded(r_bytes, &mut sig[..32]);
     copy_be_padded(s_bytes, &mut sig[32..64]);
     Some(sig)
+}
+
+/// Read one minimally encoded, positive DER INTEGER, advancing `pos`.
+fn parse_der_positive_int<'a>(der: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    if *pos + 2 > der.len() || der[*pos] != 0x02 { return None; }
+    let len = der[*pos + 1] as usize;
+    if len == 0 || len >= 0x80 { return None; }
+    let start = *pos + 2;
+    if start + len > der.len() { return None; }
+    let body = &der[start..start + len];
+    // Negative values are not valid for r or s.
+    if body[0] & 0x80 != 0 { return None; }
+    // A leading zero is permitted only to clear the next byte's sign bit.
+    if len > 1 && body[0] == 0 && body[1] & 0x80 == 0 { return None; }
+    // r and s are at most 32 bytes, plus one optional sign byte.
+    if len > 33 { return None; }
+    *pos = start + len;
+    Some(body)
 }
 
 /// Copy big-endian integer into fixed-size buffer, handling leading zeros
