@@ -406,11 +406,28 @@ file has no metadata to publish and skips the second stage entirely.
 Name durability on FAT32 is `FSYNC_NAME`: every name-minting op
 (`OPEN_CREATE`, `UNLINK`) already writes its directory sector
 synchronously, so the opcode resolves the parent and issues the device
-Flush that commits it. `RENAME` is **not** supported and its capability
-bit stays clear — FAT32 has no atomic directory mutation, and a new entry
-plus a cleared old entry in different sectors is visible after a crash as
-both names or neither. A consumer needing all-or-nothing publication must
-use recipe 1 over a self-describing artefact, or refuse to run on FAT32.
+Flush that commits it.
+
+`RENAME` has no single-sector form when the two entries fall in different
+sectors, so it is ordered to be recoverable instead. An intent record in
+a spare reserved sector — a region no FAT32 reader interprets — names
+both entries together with the exact images they are expected to hold.
+The sequence is: arm the record, publish the destination entry, retire
+the source entry, disarm; every step commits through the device Flush.
+Mounting the volume replays the record ahead of the first operation,
+comparing the on-media entries against those images: destination
+published with the source still live completes the retirement,
+destination untouched rolls back, and anything else leaves the directory
+alone. No interruption leaves the artefact reachable by no name.
+
+Two consequences follow. Between publication and retirement both names
+exist, each naming the same cluster chain, so a volume read by another
+FAT32 implementation after a power cut and before this provider replays
+the record shows the source a completed rename would have removed. And
+the capability bit reads the mounted volume's geometry: it stays clear on
+a volume whose reserved region cannot hold the record, and a consumer
+that needs all-or-nothing publication there must use recipe 1 over a
+self-describing artefact, or refuse to run on that volume.
 
 ---
 

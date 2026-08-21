@@ -14,7 +14,7 @@ timer_class = "agnostic"
 # update is one admission of drift inside one `rate_window_ms`. A fault between
 # the prefix read and the body read cannot desynchronise the stream because the
 # restart path flushes the channel before the module runs again. Matrix:
-# tests/harness/tests/conn_guard_resume.rs.
+# tools/tests/conn_guard_resume.rs.
 resume_after_fault = true
 
 [[ports]]

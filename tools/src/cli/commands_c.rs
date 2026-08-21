@@ -1491,7 +1491,7 @@ fn cmd_sign(
     // even though code||data is untouched. MUST byte-match the kernel loader's
     // signature-verification envelope (`validate_module`):
     //   header[0..64]  (skip manifest_size @64..66 — signing grows it)
-    //   || header[66..72] || code || data || export-table || schema
+    //   || header[66..80] || code || data || export-table || schema
     //   || manifest[0..hash_offset] with flags byte 14 bits 0-1 masked
     //     (has_integrity / has_signature — the only [0..hash_offset] bytes that
     //      differ between the unsigned and signed image).

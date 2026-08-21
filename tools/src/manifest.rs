@@ -115,21 +115,16 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 // contracts and belong in the top-level `permissions = [...]` list — they
 // are rejected here with a schema-error pointing at the correct section.
 
-/// Highest public contract id that may be assigned while `required_caps`
-/// is a `u32`. `STREAM_CLOCK` (0x1C) is the highest allocated position;
-/// 0x1D, 0x1E and 0x1F are held in reserve so an urgent contract addition
-/// never forces the representation change under time pressure.
-///
-/// The bit position IS the contract id (fmod header `required_caps`, u32
-/// at `reserved[6..10]`), so assignment past this ceiling requires the
-/// widening described in `.context/rfc_contract_id_headroom.md` — not a
-/// new match arm here. `tools/tests/contract_id_freeze.rs` pins the
-/// occupancy inventory that makes this number checkable.
-pub const CONTRACT_ID_FREEZE: u8 = 0x1C;
+/// Width of the public contract-id space. A contract id is a bit position
+/// in the fmod header's `required_caps` (u64 at `reserved[6..14]`) and the
+/// index of the kernel's vtable registry, so this mirrors
+/// `MAX_CONTRACTS` in `src/kernel/module/provider.rs`; the two are checked
+/// against each other by `tools/tests/contract_id_inventory.rs`.
+pub const CONTRACT_ID_SPACE: usize = 64;
 
-/// Positions consumed in the 32-bit `required_caps` space, counting the
-/// four reserved ids and excluding the kernel-internal dispatch bucket
-/// (0x0C). Registered in `docs/architecture/limit_register.md`.
+/// Positions consumed in the `required_caps` space, counting the four
+/// reserved ids and excluding the kernel-internal dispatch bucket (0x0C).
+/// Registered in `docs/architecture/limit_register.md`.
 pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 28;
 
 /// Parse a contract name from `[[resources]].requires_contract`. Only
@@ -138,24 +133,10 @@ pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 28;
 /// contracts and must be declared under the top-level `permissions = [...]`
 /// list instead.
 ///
-/// Ids above [`CONTRACT_ID_FREEZE`] are refused: the reserved tail is not
-/// available for assignment until the representation decision is taken.
+/// An id outside [`CONTRACT_ID_SPACE`] is unrepresentable in the header
+/// mask and unregisterable as a vtable, and is refused by
+/// [`Manifest::required_caps_mask`].
 pub fn contract_id_from_name(s: &str) -> Result<u8> {
-    let id = contract_id_from_name_unfrozen(s)?;
-    if id > CONTRACT_ID_FREEZE {
-        return Err(Error::Module(format!(
-            "contract `{s}` resolves to id 0x{id:02x}, above the frozen ceiling \
-             0x{CONTRACT_ID_FREEZE:02x}. Contract ids are bit positions in the \
-             fmod header's 32-bit `required_caps`, and {CONTRACT_ID_POSITIONS_ASSIGNED} \
-             of 32 are assigned; the remaining positions are held in reserve until \
-             the capability representation is widened. Adding a contract id here \
-             requires that decision first."
-        )));
-    }
-    Ok(id)
-}
-
-fn contract_id_from_name_unfrozen(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
         "gpio" => Ok(0x01),
         "spi" => Ok(0x02),
@@ -1121,18 +1102,19 @@ fn walk_rs<F: FnMut(&Path, &str)>(root: &Path, f: &mut F) {
 
 impl Manifest {
     /// Compute the required_caps bitmask from resource claims. Each
-    /// declared contract id sets the corresponding bit in a u32; contract
-    /// ids must fall in 0..31 to be expressible. Non-contract permissions
+    /// declared contract id sets the corresponding bit in a u64; contract
+    /// ids must fall in 0..63 to be expressible, the same range the kernel
+    /// registers a vtable for (`MAX_CONTRACTS`). Non-contract permissions
     /// live in `self.permissions` and are serialised separately into
     /// manifest binary byte 15.
-    pub fn required_caps_mask(&self) -> Result<u32> {
-        let mut mask = 0u32;
+    pub fn required_caps_mask(&self) -> Result<u64> {
+        let mut mask = 0u64;
         for r in &self.resources {
-            if r.device_class < 32 {
-                mask |= 1u32 << r.device_class;
+            if (r.device_class as usize) < CONTRACT_ID_SPACE {
+                mask |= 1u64 << r.device_class;
             } else {
                 return Err(Error::Module(format!(
-                    "requires_contract {} (0x{:02x}) is outside the required_caps u32 range (bits 0..31).",
+                    "requires_contract {} (0x{:02x}) is outside the required_caps u64 range (bits 0..63).",
                     contract_name_to_str(r.device_class),
                     r.device_class,
                 )));
@@ -2114,7 +2096,7 @@ impl Manifest {
             format!("  version: {}.{}.{}", major, minor, patch),
             format!("  hardware_targets: 0x{:04x}", self.hardware_targets),
             match self.required_caps_mask() {
-                Ok(m) => format!("  required_caps: 0x{m:08x}"),
+                Ok(m) => format!("  required_caps: 0x{m:016x}"),
                 Err(e) => format!("  required_caps: <error: {e}>"),
             },
         ];
@@ -2798,7 +2780,26 @@ mod tests {
             access_mode: 2,
             instance: 0xFF,
         }); // PIO
-        assert_eq!(m.required_caps_mask().unwrap(), (1 << 1) | (1 << 4));
+        m.resources.push(ResourceClaim {
+            device_class: 0x3F,
+            access_mode: 0,
+            instance: 0xFF,
+        }); // highest representable position
+        assert_eq!(
+            m.required_caps_mask().unwrap(),
+            (1u64 << 1) | (1u64 << 4) | (1u64 << 0x3F)
+        );
+    }
+
+    #[test]
+    fn required_caps_mask_refuses_an_id_outside_the_space() {
+        let mut m = Manifest::default();
+        m.resources.push(ResourceClaim {
+            device_class: CONTRACT_ID_SPACE as u8,
+            access_mode: 0,
+            instance: 0xFF,
+        });
+        assert!(m.required_caps_mask().is_err());
     }
 
     fn parse_toml(src: &str) -> Result<Manifest> {
@@ -3103,6 +3104,306 @@ scratch = 512
         assert!(
             err.contains("capacities.idtable"),
             "error should name the offending capacity: {err}"
+        );
+    }
+
+    // ── Built-in parameter schema lock ──────────────────────────────────
+    //
+    // A built-in's configuration reaches the platform as a TLV blob keyed
+    // by tag, so the `(name, type, tag)` tuple of every `[[params]]` entry
+    // is a wire contract: rename a parameter and a config stops resolving,
+    // change its type and the value is decoded as something else, move its
+    // tag and a deployed encoding starts meaning a different field.
+    //
+    // `RELEASED_LAYOUT` pins that tuple for every shipped built-in.
+    // Changing a released parameter means changing this table in the same
+    // commit — an explicit, reviewable edit rather than a side effect of
+    // editing a manifest.
+
+    /// The built-in manifest trees, relative to the repository root.
+    const BUILTIN_TREES: [&str; 2] = ["modules/platform/linux", "modules/platform/wasm"];
+
+    /// Every released built-in parameter: `(module, name, type, tag)`.
+    ///
+    /// Adding a parameter adds a row. Removing one removes its row — and
+    /// retires its tag permanently, because a deployed config may still
+    /// carry it. Editing a row is a migration and needs to be justified as
+    /// one.
+    const RELEASED_LAYOUT: &[(&str, &str, &str, u8)] = &[
+        ("host_asset_index", "paths", "str", 10),
+        ("host_asset_source", "path", "str", 10),
+        ("host_image_codec", "width", "u32", 10),
+        ("host_image_codec", "height", "u32", 11),
+        ("host_image_codec", "scale_mode", "enum", 12),
+        ("host_image_codec", "max_bytes", "u32", 13),
+        ("linux_alsa_midi", "mode", "enum", 10),
+        ("linux_alsa_midi", "port_filter", "str", 11),
+        ("linux_alsa_midi", "client_name", "str", 12),
+        ("linux_audio", "mode", "enum", 10),
+        ("linux_audio", "path", "str", 11),
+        ("linux_audio", "sample_rate", "u32", 12),
+        ("linux_audio", "channels", "u8", 13),
+        ("linux_display", "mode", "enum", 10),
+        ("linux_display", "path", "str", 11),
+        ("linux_display", "width", "u32", 12),
+        ("linux_display", "height", "u32", 13),
+        ("linux_display", "scale", "u32", 14),
+        ("linux_display", "header", "u32", 15),
+        ("linux_pointer", "path", "str", 10),
+        ("linux_pointer", "width", "u32", 11),
+        ("linux_pointer", "height", "u32", 12),
+        ("linux_pointer", "x_max", "u32", 13),
+        ("linux_pointer", "y_max", "u32", 14),
+        ("linux_surface_traits", "width", "u32", 10),
+        ("linux_surface_traits", "height", "u32", 11),
+        ("host_browser_fetch", "url", "str", 10),
+        ("wasm_browser_audio", "sample_rate", "u32", 10),
+        ("wasm_browser_audio", "channels", "u8", 11),
+        ("wasm_browser_audio", "lead_ms", "u8", 12),
+        ("wasm_browser_canvas", "width", "u16", 10),
+        ("wasm_browser_canvas", "height", "u16", 11),
+        ("wasm_browser_canvas", "header", "u16", 12),
+        ("wasm_browser_gpu", "width", "u16", 10),
+        ("wasm_browser_gpu", "height", "u16", 11),
+        ("wasm_browser_image_codec", "width", "u16", 10),
+        ("wasm_browser_image_codec", "height", "u16", 11),
+        ("wasm_browser_image_codec", "max_bytes", "u32", 12),
+        ("wasm_browser_midi_in", "port_filter", "str", 10),
+        ("wasm_browser_midi_in", "sysex", "enum", 11),
+        ("wasm_browser_midi_out", "port_filter", "str", 10),
+        ("wasm_browser_video_codec", "width", "u16", 10),
+        ("wasm_browser_video_codec", "height", "u16", 11),
+        ("wasm_browser_video_codec", "max_frame_bytes", "u32", 12),
+        ("wasm_browser_websocket", "url", "str", 10),
+        ("wasm_browser_ws_source", "url", "str", 10),
+    ];
+
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("tools/ has a parent")
+            .to_path_buf()
+    }
+
+    fn param_type_name(t: ManifestParamType) -> &'static str {
+        match t {
+            ManifestParamType::U8 => "u8",
+            ManifestParamType::U16 => "u16",
+            ManifestParamType::U32 => "u32",
+            ManifestParamType::Str => "str",
+            ManifestParamType::Enum => "enum",
+        }
+    }
+
+    /// Load every built-in manifest that declares `[[params]]`, in tree
+    /// then directory order, as `(module, name, type, tag)` rows.
+    fn actual_builtin_layout() -> Vec<(String, String, &'static str, u8)> {
+        let root = repo_root();
+        let mut rows = Vec::new();
+        for tree in BUILTIN_TREES {
+            let dir = root.join(tree);
+            let mut modules: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.join("manifest.toml").exists())
+                .collect();
+            modules.sort();
+            for module in modules {
+                let name = module
+                    .file_name()
+                    .expect("module directory has a name")
+                    .to_string_lossy()
+                    .into_owned();
+                let manifest = Manifest::from_toml(&module.join("manifest.toml"))
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                for p in &manifest.params {
+                    rows.push((
+                        name.clone(),
+                        p.name.clone(),
+                        param_type_name(p.ptype),
+                        p.tag,
+                    ));
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn released_builtin_parameters_match_the_pinned_schema() {
+        let expected: Vec<(String, String, &str, u8)> = RELEASED_LAYOUT
+            .iter()
+            .map(|(m, n, t, g)| ((*m).to_string(), (*n).to_string(), *t, *g))
+            .collect();
+
+        // Compare as sorted sets: the tag, not the declaration position,
+        // is the identity, so a reordered manifest must NOT register as a
+        // change.
+        let mut a = actual_builtin_layout();
+        let mut e = expected;
+        a.sort();
+        e.sort();
+        assert_eq!(
+            a, e,
+            "built-in parameter schema drifted.\n\
+             Each row is (module, name, type, tag) and is a wire contract: a\n\
+             rename, a type change, or a tag reassignment changes what a\n\
+             deployed config means. If the change is intended, migrate it\n\
+             deliberately and update RELEASED_LAYOUT in the same commit.",
+        );
+    }
+
+    #[test]
+    fn every_builtin_tag_is_unique_and_in_range() {
+        let mut seen: Vec<(String, u8)> = Vec::new();
+        for (module, name, _, tag) in actual_builtin_layout() {
+            assert!(
+                (PARAM_TAG_MIN..=PARAM_TAG_MAX).contains(&tag),
+                "{module}.{name}: tag {tag} outside {PARAM_TAG_MIN}..={PARAM_TAG_MAX}",
+            );
+            let key = (module.clone(), tag);
+            assert!(
+                !seen.contains(&key),
+                "{module}.{name}: tag {tag} used twice in one module",
+            );
+            seen.push(key);
+        }
+    }
+
+    fn builtin_with_params(params: &str) -> String {
+        format!("version = \"1.0.0\"\nbuiltin = true\n{params}")
+    }
+
+    fn builtin_param_parse_err(params: &str) -> String {
+        let src = builtin_with_params(params);
+        let err =
+            Manifest::from_toml_str_for_target(&src, None).expect_err("expected a manifest error");
+        format!("{err}")
+    }
+
+    /// The defect the declared tag exists to prevent: with
+    /// position-derived tags, inserting `mode` ahead of `height` moved
+    /// `height`'s wire meaning onto the next field. With declared tags it
+    /// cannot.
+    #[test]
+    fn a_reordered_or_extended_params_table_leaves_released_tags_alone() {
+        let before = builtin_with_params(
+            "[[params]]\nname = \"width\"\ntag = 10\ntype = \"u32\"\n\n\
+             [[params]]\nname = \"height\"\ntag = 11\ntype = \"u32\"\n",
+        );
+        let after = builtin_with_params(
+            "[[params]]\nname = \"width\"\ntag = 10\ntype = \"u32\"\n\n\
+             [[params]]\nname = \"mode\"\ntag = 12\ntype = \"u8\"\n\n\
+             [[params]]\nname = \"height\"\ntag = 11\ntype = \"u32\"\n",
+        );
+        let tag_of = |src: &str, want: &str| {
+            Manifest::from_toml_str_for_target(src, None)
+                .expect("parse")
+                .params
+                .iter()
+                .find(|p| p.name == want)
+                .expect("param present")
+                .tag
+        };
+        assert_eq!(tag_of(&before, "height"), 11);
+        assert_eq!(tag_of(&after, "height"), 11);
+        assert_eq!(tag_of(&after, "width"), 10);
+    }
+
+    #[test]
+    fn a_missing_builtin_tag_is_rejected() {
+        let msg = builtin_param_parse_err("[[params]]\nname = \"width\"\ntype = \"u32\"\n");
+        assert!(
+            msg.contains("param 'width'") && msg.contains("missing `tag = N`"),
+            "unexpected message: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_builtin_tag_is_rejected() {
+        let msg = builtin_param_parse_err(
+            "[[params]]\nname = \"width\"\ntag = 10\ntype = \"u32\"\n\n\
+             [[params]]\nname = \"height\"\ntag = 10\ntype = \"u32\"\n",
+        );
+        assert!(
+            msg.contains("param 'height'") && msg.contains("already claimed by param 'width'"),
+            "unexpected message: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_reserved_or_out_of_range_builtin_tag_is_rejected() {
+        for tag in [0u16, 9, 0xF0, 0xFE, 0xFF] {
+            let msg = builtin_param_parse_err(&format!(
+                "[[params]]\nname = \"width\"\ntag = {tag}\ntype = \"u32\"\n"
+            ));
+            assert!(
+                msg.contains("param 'width'") && msg.contains("out of range"),
+                "tag {tag}: unexpected message: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_builtin_tag_beyond_a_byte_is_rejected() {
+        let msg =
+            builtin_param_parse_err("[[params]]\nname = \"width\"\ntag = 256\ntype = \"u32\"\n");
+        assert!(
+            msg.contains("invalid manifest TOML"),
+            "unexpected message: {msg}",
+        );
+    }
+
+    /// `build.rs` generates the tag constants the platform matches on from
+    /// these same manifests, so a second, hand-typed copy of a tag number
+    /// cannot exist to drift. Catch one being reintroduced.
+    #[test]
+    fn no_platform_source_hand_writes_a_param_tag() {
+        let root = repo_root().join("src/platform");
+        let mut offenders = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .expect("read src/platform")
+                .flatten()
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source");
+                for (n, line) in text.lines().enumerate() {
+                    let trimmed = line.trim();
+                    let Some(rest) = trimmed.strip_prefix("const ") else {
+                        continue;
+                    };
+                    if !rest.contains("_TAG_") {
+                        continue;
+                    }
+                    let Some((_, value)) = rest.split_once('=') else {
+                        continue;
+                    };
+                    let value = value.trim().trim_end_matches(';');
+                    if value
+                        .parse::<u8>()
+                        .is_ok_and(|v| (PARAM_TAG_MIN..=PARAM_TAG_MAX).contains(&v))
+                    {
+                        offenders.push(format!("{}:{}: {trimmed}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "hand-written parameter tag constant(s) in src/platform — take the \
+             value from `platform::builtin_param_tags`, which build.rs generates \
+             from the manifests:\n{}",
+            offenders.join("\n"),
         );
     }
 }

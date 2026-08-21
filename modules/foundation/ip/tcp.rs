@@ -322,6 +322,34 @@ pub const RTO_MAX: u16 = 6000;
 /// invariant in `modules/sdk/config.rs`).
 pub use super::abi::config::ip::MAX_TCP_CONNS;
 
+/// Data-offset byte written into every emitted TCP header: five 32-bit
+/// words, a 20-byte header, no option area. This stack negotiates no TCP
+/// option in either direction.
+pub const TCP_DATA_OFFSET_BYTE: u8 = 0x50;
+
+/// Half-open occupancy at which the passive-open path stops spending a
+/// connection slot per SYN and answers with a cookie instead. Derived from
+/// the table size, so a profile that resizes the table resizes the watermark
+/// with it: half the table always stays available to completed connections
+/// and to datagram binds, which share it.
+pub const SYN_COOKIE_WATERMARK: u16 = (MAX_TCP_CONNS / 2) as u16;
+
+/// Low bits of a SYN cookie that carry its epoch ordinal. Two bits give a
+/// validity window of the current epoch plus the preceding one — longer than
+/// any client SYN-retransmit ladder, far shorter than the wrap.
+pub const SYN_COOKIE_EPOCH_MASK: u32 = 0x3;
+
+/// A SYN cookie reconstructs the whole connection block from the returning
+/// ACK. That holds only while no SYN option is negotiated: an option's value
+/// is not in the ACK, and 32 bits of ISN cannot carry it honestly.
+///
+/// This assertion is the transmit half of that precondition — emitted
+/// headers are exactly `TCP_HEADER_LEN`, option area empty. Adding an option
+/// to an emitted SYN means changing `TCP_DATA_OFFSET_BYTE`, which fails the
+/// build here rather than silently invalidating every cookie.
+/// `cookie_mode_admissible` is the receive half.
+const _: () = assert!((TCP_DATA_OFFSET_BYTE >> 4) as usize * 4 == TCP_HEADER_LEN);
+
 /// Parsed TCP header
 pub struct TcpHeader {
     pub src_port: u16,
@@ -370,6 +398,16 @@ pub unsafe fn parse_tcp(data: *const u8, len: usize) -> Option<TcpHeader> {
         payload_offset: data_offset,
         payload_len,
     })
+}
+
+/// Receive half of the cookie precondition: a segment may take part in a
+/// cookie exchange only when it carries no option area, because everything a
+/// cookie must reconstruct has to be either a compile-time constant or a
+/// field of the segment itself. A parser that learns to read options must
+/// make this predicate account for them or cookie mode stops engaging.
+#[inline]
+pub fn cookie_mode_admissible(hdr: &TcpHeader) -> bool {
+    hdr.data_offset == TCP_HEADER_LEN
 }
 
 /// Find a TCP connection matching the incoming segment.
@@ -472,7 +510,7 @@ pub unsafe fn build_tcp_header(
     wv(dst.add(9), ack[1]);
     wv(dst.add(10), ack[2]);
     wv(dst.add(11), ack[3]);
-    wv(dst.add(12), 0x50u8);
+    wv(dst.add(12), TCP_DATA_OFFSET_BYTE);
     wv(dst.add(13), flags);
     wv(dst.add(14), (window >> 8) as u8);
     wv(dst.add(15), (window & 0xFF) as u8);

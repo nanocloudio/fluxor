@@ -785,9 +785,9 @@ unsafe fn key_vault_provider_dispatch(
 // handle via `storage.object`/`storage.namespace` without being
 // mis-typed as a CAP_FULL `Protocol` module just to get the grant.
 // STORAGE_NAMESPACE = 0x13, STORAGE_OBJECT = 0x14 — both read-only.
-const STORAGE_FAMILY: u32 = (1u32
-    << crate::kernel::module::provider::contract::STORAGE_NAMESPACE as u32)
-    | (1u32 << crate::kernel::module::provider::contract::STORAGE_OBJECT as u32);
+const STORAGE_FAMILY: u64 = (1u64
+    << crate::kernel::module::provider::contract::STORAGE_NAMESPACE as u64)
+    | (1u64 << crate::kernel::module::provider::contract::STORAGE_OBJECT as u64);
 
 /// Per-cap-class contract ceiling. Indexed by
 /// `scheduler::current_module_cap_class()`. Bits 7 / 8 / 17 / 18 / 21
@@ -806,18 +806,18 @@ const STORAGE_FAMILY: u32 = (1u32
 /// PROC (0x16, bit 22) — the host process-executor contract. Added to the service-tier
 /// ceilings so an app/Source/Transformer module (e.g. sector's `do`) CAN declare it; this
 /// is a ceiling only, the manifest `[[resources]]` gate still grants per-module.
-const PROC_CONTRACT: u32 = 1u32 << 0x16;
+const PROC_CONTRACT: u64 = 1u64 << 0x16;
 /// WORKLOAD (0x1A, bit 26) — the platform-neutral isolated-workload surface,
 /// the sole host-isolation contract. Service-tier ceiling so a node module (the workload manager) CAN declare
 /// it; the manifest `[[resources]]` gate still grants per-module, AND every
 /// 0x1Axx op additionally requires the `platform_raw` permission (spawning
 /// isolated workloads is privileged). Ceiling only.
-const WORKLOAD_CONTRACT: u32 = 1u32 << 0x1A;
-pub const CAP_CONTRACT_MASK: [u32; 4] = [
+const WORKLOAD_CONTRACT: u64 = 1u64 << 0x1A;
+pub const CAP_CONTRACT_MASK: [u64; 4] = [
     0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD
     0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
     0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
-    0xFFFF_FFFF,                                                      // CAP_FULL: any contract
+    u64::MAX,                                                         // CAP_FULL: any contract
 ];
 
 unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
@@ -841,10 +841,21 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
         contract
     };
 
+    // A contract id outside the representable range has no bit in either
+    // ceiling below, so neither gate could test it. Refuse it here: the
+    // alternative — skipping a gate whose bit does not exist — turns both
+    // ceilings off for exactly the ids no policy has ever admitted. The
+    // range is `MAX_CONTRACTS`, which is also the width of the header's
+    // `required_caps` and of `CAP_CONTRACT_MASK`; the three are one number.
+    if contract as usize >= crate::kernel::module::provider::MAX_CONTRACTS {
+        return Some(E_NOSYS);
+    }
+    let contract_bit = 1u64 << contract;
+
     let cap = crate::kernel::exec::scheduler::current_module_cap_class() as usize;
     if cap < CAP_CONTRACT_MASK.len() {
         let mask = CAP_CONTRACT_MASK[cap];
-        if (contract as u32) < 32 && (mask & (1u32 << contract)) == 0 {
+        if (mask & contract_bit) == 0 {
             return Some(E_NOSYS);
         }
     }
@@ -862,25 +873,22 @@ unsafe fn check_contract_grant(contract: u16) -> Option<i32> {
     // PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, and PCIE_DEVICE
     // are public contracts subject to the same declare-to-use rule as
     // HAL_* — they are NOT in this list.
-    const INFRA_CONTRACTS: u32 = (1u32 << 0)              |  // COMMON / cross-class
-        (1u32 << ct::CHANNEL)    |
-        (1u32 << ct::TIMER)      |
-        (1u32 << ct::BUFFER)     |
-        (1u32 << ct::EVENT)      |
-        (1u32 << 0x0C)           |  // 0x0Cxx transport bucket (implicit routing)
-        (1u32 << ct::KEY_VAULT);
+    const INFRA_CONTRACTS: u64 = (1u64 << 0)              |  // COMMON / cross-class
+        (1u64 << ct::CHANNEL)    |
+        (1u64 << ct::TIMER)      |
+        (1u64 << ct::BUFFER)     |
+        (1u64 << ct::EVENT)      |
+        (1u64 << 0x0C)           |  // 0x0Cxx transport bucket (implicit routing)
+        (1u64 << ct::KEY_VAULT);
 
     // Manifest gate: every non-infra contract must be declared in the
     // module's `[[resources]]` list. Channel-only consumers and app
     // modules are unaffected because channels/timers/etc. live in
     // INFRA_CONTRACTS.
     let req = crate::kernel::exec::scheduler::current_module_required_caps();
-    if (contract as u32) < 32
-        && (INFRA_CONTRACTS & (1u32 << contract)) == 0
-        && (req & (1u32 << contract)) == 0
-    {
+    if (INFRA_CONTRACTS & contract_bit) == 0 && (req & contract_bit) == 0 {
         log::warn!(
-            "[syscalls] module {} contract 0x{contract:04x}: manifest gate denied — staged required_caps=0x{req:08x} (returns ENOSYS; declare `[[resources]]` requires_contract for this contract, and confirm the packed .fmod header carries the bit — `fluxor inspect` shows the manifest-derived mask, not the header field)",
+            "[syscalls] module {} contract 0x{contract:04x}: manifest gate denied — staged required_caps=0x{req:016x} (returns ENOSYS; declare `[[resources]]` requires_contract for this contract, and confirm the packed .fmod header carries the bit — `fluxor inspect` shows the manifest-derived mask, not the header field)",
             crate::kernel::exec::scheduler::current_module_index(),
         );
         return Some(E_NOSYS);

@@ -11,8 +11,35 @@ pub const CT_APPLICATION_DATA: u8 = 23;
 pub const RECORD_HEADER_LEN: usize = 5;
 /// Max plaintext per record
 pub const MAX_PLAINTEXT: usize = 16384;
+/// Bytes an AEAD-protected record adds to its plaintext: the inner
+/// content-type byte (RFC 8446 §5.2) plus the authentication tag.
+pub const AEAD_EXPANSION: usize = 1 + 16;
 /// Max ciphertext = plaintext + content_type(1) + tag(16)
-pub const MAX_CIPHERTEXT: usize = MAX_PLAINTEXT + 1 + 16;
+pub const MAX_CIPHERTEXT: usize = MAX_PLAINTEXT + AEAD_EXPANSION;
+
+/// Largest record payload that still yields a wire record fitting one
+/// carrier write.
+///
+/// `carrier` is the number of record bytes one downstream write can
+/// take; `reserve` is what the caller may append to the same write (the
+/// compatibility ChangeCipherSpec record). The result subtracts the
+/// record header and the AEAD expansion, so the same budget holds
+/// whether the record goes out in the clear or sealed, and is capped by
+/// the protocol plaintext maximum.
+///
+/// Saturating rather than wrapping: a carrier too small for the
+/// overhead yields zero, which a caller reads as "cannot emit" instead
+/// of an enormous budget. Every ceiling on the path is an input here,
+/// so they cannot drift apart at their separate definitions.
+pub const fn record_payload_budget(carrier: usize, reserve: usize) -> usize {
+    let overhead = RECORD_HEADER_LEN + AEAD_EXPANSION + reserve;
+    let usable = carrier.saturating_sub(overhead);
+    if usable > MAX_PLAINTEXT {
+        MAX_PLAINTEXT
+    } else {
+        usable
+    }
+}
 
 /// Legacy version in record header (TLS 1.2 for compatibility)
 const LEGACY_VERSION: [u8; 2] = [0x03, 0x03];

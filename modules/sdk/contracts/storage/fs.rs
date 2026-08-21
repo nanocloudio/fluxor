@@ -346,6 +346,29 @@ pub const FSYNC_NAME: u32 = 0x0912;
 /// `ENOSYS` and leave [`caps::RENAME`] clear — a consumer must then use
 /// [`OPEN_CREATE`] + [`FSYNC_NAME`] and tolerate a partially written
 /// final name, or refuse to run on that backend.
+///
+/// ## What the guarantee costs on a backend without an atomic primitive
+///
+/// A backend whose directory mutation is not itself all-or-nothing may
+/// still meet the guarantee by ordering its writes so that every
+/// interruption is distinguishable, and settling the outcome when the
+/// volume is next mounted. Two consequences follow for a consumer:
+///
+///   - Between the interruption and that settlement, a reader outside
+///     this provider may observe BOTH names, each naming the artefact.
+///     Reading the volume with another implementation of the same
+///     filesystem after a power cut, before mounting it here, can
+///     therefore see the source that a completed rename would have
+///     removed — and a repair tool run at that moment may act on it.
+///   - The source name is not guaranteed gone until the volume has been
+///     mounted through this contract once. A consumer that treats the
+///     absence of the source as proof of publication must obtain it from
+///     a fresh lookup after mount, not from the rename's return.
+///
+/// Both are absent on a backend whose rename is a single atomic
+/// operation. Neither weakens the guarantee above: the artefact is never
+/// reachable by no name, and the destination is authoritative from the
+/// moment `RENAME` returns.
 pub const RENAME: u32 = 0x090D;
 
 /// FS provider capability bitmap. `provider_call(handle, CAPS,

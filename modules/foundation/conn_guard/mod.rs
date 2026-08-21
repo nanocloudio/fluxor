@@ -329,6 +329,9 @@ pub extern "C" fn module_new(
     _state_size: usize,
     syscalls: *const SyscallTable,
 ) -> i32 {
+    // SAFETY: the loader guarantees `state` points at a live allocation of at
+    // least `size_of::<GuardState>()`, aligned and exclusive to this module for
+    // the duration of the call.
     let s = unsafe { &mut *(state as *mut GuardState) };
     s.syscalls = syscalls;
     s.in_chan = in_chan;
@@ -338,6 +341,8 @@ pub extern "C" fn module_new(
     let base = s.table.as_mut_ptr();
     let mut i = 0usize;
     while i < MAX_TABLE {
+        // SAFETY: `i < MAX_TABLE` and `base` is the start of a `[RateEntry;
+        // MAX_TABLE]` inside the state allocation, so the offset is in bounds.
         unsafe {
             *base.add(i) = RateEntry::empty();
         }
@@ -348,6 +353,8 @@ pub extern "C" fn module_new(
     s.dropped_syn = 0;
     s.dropped_full = 0;
 
+    // SAFETY: `params` is the loader-supplied parameter blob, valid for
+    // `params_len` bytes, and `parse_tlv` reads only within that bound.
     unsafe {
         // Use the generated `parse_tlv`, not a hand-rolled walk. The params
         // blob is `[0xFE][0x01][payload_len:u16 LE]` followed by the entries

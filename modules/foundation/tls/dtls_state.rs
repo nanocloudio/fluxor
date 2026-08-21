@@ -182,7 +182,7 @@ unsafe fn dtls_pump_session(s: &mut TlsState, idx: usize) -> bool {
         HandshakeState::DeriveHandshakeKeys => dtls_pump_derive_handshake_keys(s, idx),
         HandshakeState::SendEncryptedExtensions => dtls_pump_send_encrypted_extensions(s, idx),
         HandshakeState::SendCertificate => {
-            let cert_len = if s.cert_len <= MAX_CERT_LEN { s.cert_len } else { 0 };
+            let cert_len = if s.cert_len <= MAX_CERT_CHAIN_BYTES { s.cert_len } else { 0 };
             let cert = core::slice::from_raw_parts(s.cert.as_ptr(), cert_len);
             pump_send_certificate_core(&mut s.peer_sessions[idx].endpoint.driver, cert)
         }
@@ -281,21 +281,33 @@ unsafe fn dtls_pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
         driver.transcript = Some(Transcript::new(driver.suite.hash_alg()));
     }
 
-    match ch.key_share {
-        // The key share is a peer-supplied point; admit it only if
-        // it decodes to a canonical, on-curve, non-identity P-256
-        // point. Anything else falls through to the no-usable-share
-        // branch below rather than reaching the ECDH ladder.
-        Some((_, key_data)) if public_point_is_valid(key_data) => {
+    // X25519 first, for the same reason as the TLS-over-TCP server: the
+    // agreement scalar stays out of P-256's variable-time arithmetic.
+    match (ch.key_share_x25519, ch.key_share) {
+        (Some(key_data), _) if key_data.len() == X25519_SHARE_LEN => {
+            core::ptr::copy_nonoverlapping(
+                key_data.as_ptr(),
+                driver.peer_key_share.as_mut_ptr(),
+                X25519_SHARE_LEN,
+            );
+            driver.peer_key_share_len = X25519_SHARE_LEN as u8;
+            driver.group = GROUP_X25519;
+            if !driver_gen_x25519(sys, driver) {
+                driver.hs_state = HandshakeState::Error;
+                return true;
+            }
+        }
+        (_, Some((_, key_data))) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 driver.peer_key_share.as_mut_ptr(),
                 key_data.len(),
             );
             driver.peer_key_share_len = key_data.len() as u8;
+            driver.group = GROUP_SECP256R1;
         }
         _ => {
-            // RFC 8446 §4.1.4: client offered no P-256 share. Send HRR
+            // RFC 8446 §4.1.4: client offered no usable share. Send HRR
             // unless this is already the second ClientHello.
             if driver.hrr_sent {
                 driver.hs_state = HandshakeState::Error;
@@ -456,10 +468,15 @@ unsafe fn dtls_pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     driver.peer_session_id = session_id;
     driver.peer_session_id_len = 32;
 
+    if !driver_gen_x25519(sys, driver) {
+        return false;
+    }
+    let x25519_pub = driver.x25519_public;
     let msg_len = build_client_hello_sni(
         &random,
         &session_id,
         &driver.ecdh_public,
+        Some(&x25519_pub),
         &[],
         &[],
         &sni_buf[..sni_len],

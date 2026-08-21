@@ -2,7 +2,8 @@
 //
 // Layer: cores (reusable SDK implementation, `include!`d at a consumer module's
 // top level so it shares the module's `sdk/runtime` scope — `net_write_frame`,
-// `net_read_frame`, `parse_dg_rx_from_v4`, `dev_dg_send_to_v4`, `dev_micros`, the
+// `net_read_frame`, `parse_dg_rx_from_v4`, `dev_dg_send_to_v4_owned`,
+// `dev_owner_tag`, `dev_micros`, the
 // `DG_*` opcodes). NOT a wire contract: it drives the EXISTING `datagram`
 // contract (CMD_DG_BIND / MSG_DG_BOUND / CMD_DG_SEND_TO / MSG_DG_RX_FROM), it
 // does not define a new one.
@@ -18,6 +19,15 @@
 // each event itself — by `ep_id` (`dns`), by an upper-layer key (`quic` DCID,
 // `dtls` 4-tuple), or ignoring it (send-only). Burying the channel read inside a
 // per-endpoint `recv` would drop another endpoint's frames on a shared channel.
+//
+// ENDPOINT AUTHORITY. An `ep_id` is a provider-side index, and the provider's
+// command channel merges every producer into one stream with no producer
+// identity attached, so the index alone cannot say who sent a command. The bind
+// therefore stamps the module's own owner slot (`dev_owner_tag`) on the
+// endpoint and every send presents it; the provider refuses a mismatch with
+// `EPERM`. The tag names an owner, not a module: two modules of the same owner
+// sharing a channel are not separated by it, and a base-graph module is owner
+// slot 0 (the host wildcard, emitted as the untagged shape).
 //
 // Two usage modes:
 //   send-only / single endpoint:
@@ -51,7 +61,10 @@ const BIND_BACKOFF_MICROS: u64 = 100_000; // 100 ms
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
-#[allow(dead_code, reason = "shared datagram-endpoint core; each including module uses a subset")]
+#[allow(
+    dead_code,
+    reason = "shared datagram-endpoint core; each including module uses a subset"
+)]
 enum BindPhase {
     Unbound = 0,
     Binding = 1,
@@ -67,12 +80,29 @@ enum BindPhase {
 /// One classified inbound datagram-surface event, produced by [`dg_recv`].
 /// `Rx.data` points into the caller's `scratch` buffer (valid until the next
 /// `net_in` read).
-#[allow(dead_code, reason = "shared datagram-endpoint core; each including module uses a subset")]
+#[allow(
+    dead_code,
+    reason = "shared datagram-endpoint core; each including module uses a subset"
+)]
 enum DgEvent {
-    Bound { ep_id: u8, local_port: u16 },
-    Rx { ep_id: u8, src_ip: u32, src_port: u16, data: *const u8, len: usize },
-    Err { ep_id: u8, errno: i8 },
-    Closed { ep_id: u8 },
+    Bound {
+        ep_id: u8,
+        local_port: u16,
+    },
+    Rx {
+        ep_id: u8,
+        src_ip: u32,
+        src_port: u16,
+        data: *const u8,
+        len: usize,
+    },
+    Err {
+        ep_id: u8,
+        errno: i8,
+    },
+    Closed {
+        ep_id: u8,
+    },
 }
 
 /// A bound UDP datagram endpoint over the ip datagram surface.
@@ -82,11 +112,18 @@ enum DgEvent {
 /// endpoint's. Multiple endpoints on one channel are distinguished by the
 /// provider-stamped `ep_id`, not the local port; bind them sequentially so a
 /// `MSG_DG_BOUND` routes to the single endpoint in `WaitBound`.
-#[allow(dead_code, reason = "shared datagram-endpoint core; each including module uses a subset")]
+#[allow(
+    dead_code,
+    reason = "shared datagram-endpoint core; each including module uses a subset"
+)]
 pub struct DatagramEndpoint {
     phase: BindPhase,
     /// endpoint id from MSG_DG_BOUND (`0xFF` = unallocated).
     ep_id: u8,
+    /// The owner tag this endpoint was bound with — the module's own owner slot
+    /// (`dev_owner_tag`), latched at the first bind attempt and presented on
+    /// every send. `0` is the host wildcard and emits the untagged shape.
+    owner_tag: u16,
     bind_attempts: u16,
     backoff_until_micros: u64,
 }
@@ -97,12 +134,16 @@ impl Default for DatagramEndpoint {
     }
 }
 
-#[allow(dead_code, reason = "shared datagram-endpoint core; each including module uses a subset")]
+#[allow(
+    dead_code,
+    reason = "shared datagram-endpoint core; each including module uses a subset"
+)]
 impl DatagramEndpoint {
     pub const fn new() -> Self {
         DatagramEndpoint {
             phase: BindPhase::Unbound,
             ep_id: 0xFF,
+            owner_tag: 0,
             bind_attempts: 0,
             backoff_until_micros: 0,
         }
@@ -161,14 +202,38 @@ impl DatagramEndpoint {
                 self.phase = BindPhase::Binding;
                 return;
             }
-            // CMD_DG_BIND payload: [port: u16 LE][flags: u8 = 0]
-            let mut payload = [0u8; 3];
+            // CMD_DG_BIND payload: [port: u16 LE][flags: u8 = 0][owner_tag: u16 LE]?
+            //
+            // The tag is the module's own owner slot, read from the kernel — a
+            // module can only read its own. It stamps the endpoint's holder, so
+            // a later send or close from another consumer on this shared command
+            // channel is refused rather than sourced from a socket it does not
+            // hold. Owner slot 0 (a base-graph, host-owned module) is the host
+            // wildcard: the tag field is omitted and the frame is the untagged
+            // shape, byte for byte.
+            self.owner_tag = dev_owner_tag(sys);
+            let mut payload = [0u8; 5];
             let p = bind_port.to_le_bytes();
             payload[0] = p[0];
             payload[1] = p[1];
             payload[2] = 0;
-            let wrote =
-                net_write_frame(sys, net_out, DG_CMD_BIND, payload.as_ptr(), 3, scratch, scratch_max);
+            let payload_len = if self.owner_tag == 0 {
+                3
+            } else {
+                let t = self.owner_tag.to_le_bytes();
+                payload[3] = t[0];
+                payload[4] = t[1];
+                5
+            };
+            let wrote = net_write_frame(
+                sys,
+                net_out,
+                DG_CMD_BIND,
+                payload.as_ptr(),
+                payload_len,
+                scratch,
+                scratch_max,
+            );
             if wrote == 0 {
                 self.phase = BindPhase::Binding; // channel full — retry next step.
                 return;
@@ -281,8 +346,17 @@ impl DatagramEndpoint {
         if self.phase != BindPhase::Bound || net_out < 0 || self.ep_id == 0xFF {
             return 0;
         }
-        let n = dev_dg_send_to_v4(
-            sys, net_out, self.ep_id, dst_ip, dst_port, data, len, scratch, scratch_max,
+        let n = dev_dg_send_to_v4_owned(
+            sys,
+            net_out,
+            self.ep_id,
+            self.owner_tag,
+            dst_ip,
+            dst_port,
+            data,
+            len,
+            scratch,
+            scratch_max,
         );
         if n > 0 {
             len
@@ -301,7 +375,10 @@ impl DatagramEndpoint {
 /// # Safety
 /// `scratch` must be valid for `scratch_max` writes; `sys` is the live syscall
 /// table.
-#[allow(dead_code, reason = "shared datagram-endpoint core; each including module uses a subset")]
+#[allow(
+    dead_code,
+    reason = "shared datagram-endpoint core; each including module uses a subset"
+)]
 unsafe fn dg_recv(
     sys: &SyscallTable,
     net_in: i32,
@@ -321,20 +398,30 @@ unsafe fn dg_recv(
         // informational (the endpoint routes by ep_id); tolerate its absence.
         let ep_id = *scratch.add(NET_FRAME_HDR);
         let local_port = if payload_len >= 3 {
-            (*scratch.add(NET_FRAME_HDR + 1) as u16) | ((*scratch.add(NET_FRAME_HDR + 2) as u16) << 8)
+            (*scratch.add(NET_FRAME_HDR + 1) as u16)
+                | ((*scratch.add(NET_FRAME_HDR + 2) as u16) << 8)
         } else {
             0
         };
         Some(DgEvent::Bound { ep_id, local_port })
     } else if msg_type == DG_MSG_RX_FROM {
-        parse_dg_rx_from_v4(scratch, payload_len)
-            .map(|(ep_id, src_ip, src_port, data, len)| DgEvent::Rx { ep_id, src_ip, src_port, data, len })
+        parse_dg_rx_from_v4(scratch, payload_len).map(|(ep_id, src_ip, src_port, data, len)| {
+            DgEvent::Rx {
+                ep_id,
+                src_ip,
+                src_port,
+                data,
+                len,
+            }
+        })
     } else if msg_type == DG_MSG_ERROR && payload_len >= 2 {
         let ep_id = *scratch.add(NET_FRAME_HDR);
         let errno = *scratch.add(NET_FRAME_HDR + 1) as i8;
         Some(DgEvent::Err { ep_id, errno })
     } else if msg_type == DG_MSG_CLOSED && payload_len >= 1 {
-        Some(DgEvent::Closed { ep_id: *scratch.add(NET_FRAME_HDR) })
+        Some(DgEvent::Closed {
+            ep_id: *scratch.add(NET_FRAME_HDR),
+        })
     } else {
         None
     }

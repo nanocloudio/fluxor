@@ -443,13 +443,24 @@ unsafe fn pump_send_server_hello(s: &mut QuicState, idx: usize) -> bool {
             &mut driver.scratch,
         )
     } else {
-        build_server_hello(
-            &driver.server_random,
-            &driver.peer_session_id,
-            driver.suite,
-            &driver.ecdh_public,
-            &mut driver.scratch,
-        )
+        {
+            // QUIC completes P-256 only; it offers no X25519 share, so
+            // the group here is fixed rather than negotiated.
+            let mut share = [0u8; P256_SHARE_LEN];
+            core::ptr::copy_nonoverlapping(
+                driver.ecdh_public.as_ptr(),
+                share.as_mut_ptr(),
+                P256_SHARE_LEN,
+            );
+            build_server_hello(
+                &driver.server_random,
+                &driver.peer_session_id,
+                driver.suite,
+                GROUP_SECP256R1,
+                &share,
+                &mut driver.scratch,
+            )
+        }
     };
     if let Some(ref mut t) = driver.transcript {
         t.update(&driver.scratch[..msg_len]);
@@ -962,6 +973,7 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
         &random,
         &session_id,
         &driver.ecdh_public,
+        None,
         &tp[..tp_len],
         alpn,
         QUIC_PACKET_SUITES,

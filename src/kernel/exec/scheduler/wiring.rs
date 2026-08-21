@@ -563,7 +563,7 @@ pub fn instantiate_one_module(
         // means the packer never populated the header field, and every
         // `provider_call` to those contracts returns ENOSYS.
         log::info!(
-            "[inst] module {} caps: required_caps=0x{:08x} cap_class={} permissions=0x{:02x}",
+            "[inst] module {} caps: required_caps=0x{:016x} cap_class={} permissions=0x{:02x}",
             instantiated,
             sched.required_caps[instantiated],
             sched.cap_class[instantiated],

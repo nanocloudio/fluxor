@@ -206,8 +206,12 @@ pub struct ProviderVTable {
     pub default_close_op: u32,
 }
 
-/// Maximum number of contracts. Contract ids fit in 5 bits today.
-pub const MAX_CONTRACTS: usize = 32;
+/// Maximum number of contracts. A contract id is simultaneously the
+/// vtable index here, the opcode's class byte, and a bit position in the
+/// fmod header's `required_caps` (`ModuleHeader::required_caps`, u64), so
+/// this ceiling and that field's width are one number and must move
+/// together.
+pub const MAX_CONTRACTS: usize = 64;
 
 /// Registered vtables, indexed by contract id.
 static mut VTABLES: [Option<&'static ProviderVTable>; MAX_CONTRACTS] =
@@ -732,8 +736,11 @@ pub type ModuleProviderDispatchFn = unsafe extern "C" fn(
     arg_len: usize,
 ) -> i32;
 
-/// Maximum registered contracts (indexed by `ContractId`).
-const MAX_PROVIDERS: usize = 32;
+/// Maximum registered contracts (indexed by `ContractId`). The provider
+/// chain table and the vtable registry index the same id space, so this is
+/// `MAX_CONTRACTS`, not an independent ceiling: a contract registerable in
+/// one and not the other would panic at boot on the narrower table.
+const MAX_PROVIDERS: usize = MAX_CONTRACTS;
 
 /// Layers registerable per contract: one default (unkeyed) provider plus the
 /// instance-keyed backends beneath it. A multi-volume storage graph spends one
@@ -743,8 +750,8 @@ const MAX_PROVIDERS: usize = 32;
 /// volume, so it is allowed to exceed that.
 ///
 /// Sized per target: a chain entry is 24 bytes and the table is
-/// `MAX_PROVIDERS × MAX_CHAIN_DEPTH`, so depth 8 costs ~6 KiB where depth 3
-/// costs ~2.3 KiB. An application processor can host a multi-drive carrier and
+/// `MAX_PROVIDERS × MAX_CHAIN_DEPTH`, so depth 8 costs ~12 KiB where depth 3
+/// costs ~4.6 KiB. An application processor can host a multi-drive carrier and
 /// has the RAM for it; the MCUs cannot and don't (rp2040 shares ~264 KiB with
 /// embassy-usb/net), so they keep the smaller table.
 #[cfg(feature = "chip-rp2040")]
@@ -793,7 +800,7 @@ impl ProviderEntry {
     }
 }
 
-/// Provider table — indexed by contract id (0x00..0x1F).
+/// Provider table — indexed by contract id (0x00..MAX_CONTRACTS).
 static mut PROVIDERS: [ProviderEntry; MAX_PROVIDERS] =
     [const { ProviderEntry::empty() }; MAX_PROVIDERS];
 

@@ -101,13 +101,14 @@ impl ModuleInfo {
         let in_place_writer = (flags_byte & 0x02) != 0;
         let drain_capable = (flags_byte & 0x08) != 0;
 
-        // ABI v3 reserved layout (in the 72-byte module header):
+        // Reserved layout (in the 80-byte module header):
         //   byte 0 (offset 60): flags
         //   byte 1 (offset 61): step_period_ticks (scheduler ticks, NOT ms)
         //   bytes 2-3 (offset 62-63): schema_size (u16 LE)
         //   bytes 4-5 (offset 64-65): manifest_size (u16 LE)
-        //   bytes 6-9 (offset 66-69): required_caps (u32 LE)
-        //   bytes 10-11 (offset 70-71): reserved
+        //   bytes 6-13 (offset 66-73): required_caps (u64 LE)
+        //   byte 14 (offset 74): step_phase
+        //   bytes 15-19 (offset 75-79): reserved
         let schema_size = if data.len() > 63 {
             u16::from_le_bytes([data[62], data[63]]) as usize
         } else {
@@ -612,11 +613,10 @@ pub fn parse_modules_from_config_multi(
 // ELF Parsing and Module Packing
 // =============================================================================
 
-/// Module header size (must match firmware's ModuleHeader::SIZE).
-/// ABI v3: 72 bytes (v2 was 68). The extra 4 bytes widen
-/// `required_caps` from u16 to u32 so every contract id in 0..31 is
-/// expressible in the manifest bitmask.
-pub const MODULE_HEADER_SIZE: usize = 72;
+/// Module header size (must match firmware's `ModuleHeader::SIZE`).
+/// The reserved tail carries `required_caps` as a u64, so every contract
+/// id in 0..63 (`MAX_CONTRACTS`) is expressible in the manifest bitmask.
+pub const MODULE_HEADER_SIZE: usize = 80;
 
 /// ABI version byte stamped into every packed module header. Sourced
 /// from `crate::wire` so the pack tool, the kernel loader, and the
@@ -1228,7 +1228,7 @@ pub fn pack_fmod(
     let copy_len = name_slice.len().min(31);
     name_bytes[..copy_len].copy_from_slice(&name_slice[..copy_len]);
     header.extend_from_slice(&name_bytes);
-    // Reserved (12 bytes) — ABI v3 layout:
+    // Reserved (20 bytes):
     //   byte 0: flags
     //     bit 0: mailbox_safe
     //     bit 1: in_place_writer
@@ -1240,8 +1240,9 @@ pub fn pack_fmod(
     //                              ticks. NOT milliseconds. Set by config, not pack)
     //   bytes 2-3: schema_size (u16 LE)
     //   bytes 4-5: manifest_size (u16 LE)
-    //   bytes 6-9: required_caps (u32 LE) — public contract bitmask, full 0..31 range
-    //   bytes 10-11: reserved (0)
+    //   bytes 6-13: required_caps (u64 LE) — public contract bitmask, full 0..63 range
+    //   byte 14: step_phase
+    //   bytes 15-19: reserved (0)
     //
     // Fine-grained permissions (flash_raw, platform_raw, …) live in the
     // manifest binary at byte 15 (written by Manifest::to_bytes).
@@ -1257,7 +1258,7 @@ pub fn pack_fmod(
     let has_drain = symbols
         .iter()
         .any(|s| s.bind == 1 && s.name == "module_drain");
-    let mut reserved = [0u8; 12];
+    let mut reserved = [0u8; 20];
     if has_in_place_safe {
         reserved[0] |= 0x03; // mailbox_safe (bit 0) + in_place_writer (bit 1)
     }
@@ -1283,7 +1284,7 @@ pub fn pack_fmod(
     reserved[1] = module_manifest.step_period_ticks;
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
-    reserved[6..10].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
+    reserved[6..14].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
     header.extend_from_slice(&reserved);
 
     assert_eq!(header.len(), MODULE_HEADER_SIZE);
@@ -1449,12 +1450,12 @@ pub fn pack_fmod_wasm(
 
     // Reserved bytes — same layout as PIC modules but with the
     // `wasm_payload` flag set in byte 0 bit 5.
-    let mut reserved = [0u8; 12];
+    let mut reserved = [0u8; 20];
     reserved[0] |= 0x20; // bit 5: wasm_payload
     reserved[1] = module_manifest.step_period_ticks; // byte 1: step_period_ticks (see pack_fmod)
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
-    reserved[6..10].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
+    reserved[6..14].copy_from_slice(&module_manifest.required_caps_mask()?.to_le_bytes());
     header.extend_from_slice(&reserved);
 
     assert_eq!(header.len(), MODULE_HEADER_SIZE);

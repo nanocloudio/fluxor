@@ -23,17 +23,34 @@ pub enum EncLevel {
     OneRtt,
 }
 
-/// Plaintext-handshake-byte queue size. Sized for a typical
-/// EE+Cert+CertificateVerify+Finished flight (cert chains up to ~1.2KB);
-/// `SCRATCH_SIZE` is the per-message limit on the return-by-value
-/// buffer of `read_handshake_message`.
-pub const HS_IO_BUF_SIZE: usize = 2048;
-
 /// Per-handshake-message stack buffer used both for building outbound
 /// messages and returning inbound messages. Sized to fit a 1561-byte
 /// curl-style ClientHello with extensions plus the longest server
-/// flight component (Certificate at 400-1200 bytes).
+/// flight component (a Certificate message carrying a chain).
 pub const SCRATCH_SIZE: usize = 4096;
+
+/// Most handshake plaintext one inbound record may carry. A record
+/// beyond this cannot be taken whole, and taking it in pieces would mean
+/// consuming a record partially — so it is refused rather than stalled
+/// on. A peer coalescing more than a full message's worth into one
+/// record is outside what this queue can assemble.
+pub const HS_RECORD_PLAINTEXT_MAX: usize = SCRATCH_SIZE;
+
+/// Inbound plaintext-handshake-byte queue. A handshake message is a byte
+/// stream over records, so this is where a message is assembled: it must
+/// hold any message `read_handshake_message` is prepared to return, plus
+/// one further record, or an incomplete message and the record that
+/// would complete it could not be held at the same time and the session
+/// would stall rather than progress.
+pub const HS_IN_BUF_SIZE: usize = SCRATCH_SIZE + HS_RECORD_PLAINTEXT_MAX;
+
+/// Outbound queue. Holds whole messages this endpoint has built; the
+/// record writer fragments them across records on the way out, so the
+/// queue only has to hold one message at a time.
+pub const HS_OUT_BUF_SIZE: usize = SCRATCH_SIZE;
+
+const _: () = assert!(HS_IN_BUF_SIZE >= SCRATCH_SIZE + HS_RECORD_PLAINTEXT_MAX);
+const _: () = assert!(HS_OUT_BUF_SIZE >= SCRATCH_SIZE);
 
 /// All record-agnostic TLS 1.3 handshake state.
 pub struct HandshakeDriver {
@@ -54,6 +71,19 @@ pub struct HandshakeDriver {
     pub ecdh_state: ScalarMulState,
     pub peer_key_share: [u8; 65],
     pub peer_key_share_len: u8,
+
+    /// X25519 agreement material (RFC 7748). The private value is the
+    /// raw 32 random bytes: `x25519_public_key` and
+    /// `x25519_shared_secret` clamp internally, so storing a
+    /// pre-clamped copy would only give the same scalar two encodings.
+    pub x25519_private: [u8; 32],
+    pub x25519_public: [u8; 32],
+
+    /// Negotiated named group — `GROUP_X25519` or `GROUP_SECP256R1`.
+    /// Chosen by the server from what the client offered, echoed to the
+    /// client in the ServerHello key_share, and read back here to pick
+    /// which private value completes the agreement.
+    pub group: u16,
 
     /// Resumable ECDSA signing for the server CertificateVerify;
     /// driven across ticks by `ecdh_bits_per_step` so concurrent
@@ -90,13 +120,13 @@ pub struct HandshakeDriver {
     /// post-decrypt handshake bytes (or pre-encryption plaintext for
     /// Initial-level records). Driver consumes via `feed_handshake` /
     /// `recv_handshake_message`. Reserved for Phase B (DTLS) / C (QUIC).
-    pub in_buf: [u8; HS_IO_BUF_SIZE],
+    pub in_buf: [u8; HS_IN_BUF_SIZE],
     pub in_len: usize,
 
     /// Plaintext output queue — driver writes ready-to-emit handshake
     /// bytes here; record/transport layer drains via `poll_handshake`.
     /// Reserved for Phase B / C.
-    pub out_buf: [u8; HS_IO_BUF_SIZE],
+    pub out_buf: [u8; HS_OUT_BUF_SIZE],
     pub out_len: usize,
 }
 
@@ -115,6 +145,9 @@ impl HandshakeDriver {
             ecdh_state: ScalarMulState::empty(),
             peer_key_share: [0; 65],
             peer_key_share_len: 0,
+            x25519_private: [0; 32],
+            x25519_public: [0; 32],
+            group: GROUP_SECP256R1,
             ecdsa_sign_state: EcdsaSignState::empty(),
             cert_verify_hash: [0; 32],
             cert_verify_hash_ready: 0,
@@ -129,9 +162,9 @@ impl HandshakeDriver {
             client_finished_hash: [0; 48],
             hs_accum_len: 0,
             scratch: [0; SCRATCH_SIZE],
-            in_buf: [0; HS_IO_BUF_SIZE],
+            in_buf: [0; HS_IN_BUF_SIZE],
             in_len: 0,
-            out_buf: [0; HS_IO_BUF_SIZE],
+            out_buf: [0; HS_OUT_BUF_SIZE],
             out_len: 0,
         }
     }
@@ -143,6 +176,7 @@ impl HandshakeDriver {
             let mut i = 0;
             while i < 32 {
                 core::ptr::write_volatile(&mut self.ecdh_private[i], 0);
+                core::ptr::write_volatile(&mut self.x25519_private[i], 0);
                 core::ptr::write_volatile(&mut self.server_random[i], 0);
                 i += 1;
             }
@@ -151,6 +185,7 @@ impl HandshakeDriver {
         self.client_cert_requested = false;
         self.hs_accum_len = 0;
         self.peer_key_share_len = 0;
+        self.group = GROUP_SECP256R1;
         self.peer_cert_pubkey_len = 0;
         self.alpn_selected_len = 0;
         self.peer_session_id_len = 0;
@@ -180,8 +215,12 @@ impl HandshakeDriver {
     /// drives the handshake via the legacy `recv_buf` path inside
     /// `recv_encrypted_handshake`.
     pub fn feed_handshake(&mut self, _level: EncLevel, bytes: &[u8]) -> usize {
-        let space = HS_IO_BUF_SIZE - self.in_len;
-        let n = if bytes.len() < space { bytes.len() } else { space };
+        let space = HS_IN_BUF_SIZE - self.in_len;
+        let n = if bytes.len() < space {
+            bytes.len()
+        } else {
+            space
+        };
         if n == 0 {
             return 0;
         }
@@ -274,11 +313,9 @@ impl HandshakeDriver {
     /// `feed_handshake`; the pump_* logic then calls this method to
     /// pull complete messages out).
     /// # Safety
-    /// `in_buf` is owned by `self` and sized `HS_IO_BUF_SIZE`; the
+    /// `in_buf` is owned by `self` and sized `HS_IN_BUF_SIZE`; the
     /// bounds-checks above ensure the message length fits in scratch.
-    pub unsafe fn read_handshake_message(
-        &mut self,
-    ) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
+    pub unsafe fn read_handshake_message(&mut self) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
         if self.in_len < 4 {
             return None;
         }
@@ -317,7 +354,7 @@ impl HandshakeDriver {
     /// `out_buf` is owned by `self`; the `msg.len() > space` guard
     /// keeps the `copy_nonoverlapping` write in-bounds.
     pub unsafe fn write_handshake_message(&mut self, msg: &[u8]) -> bool {
-        let space = HS_IO_BUF_SIZE - self.out_len;
+        let space = HS_OUT_BUF_SIZE - self.out_len;
         if msg.len() > space {
             return false;
         }

@@ -1,4 +1,5 @@
-// Ed25519 (RFC 8032, plain — not Ed25519ph/ctx) sign / verify
+// Ed25519 (RFC 8032, plain — not Ed25519ph/ctx) sign / verify, and
+// X25519 (RFC 7748) key agreement over the same field.
 // Pure Rust, no_std, no heap
 //
 // REQUIRED INCLUDE SET — this file is written for the flat `include!()`
@@ -27,17 +28,14 @@
 //
 // Scalar multiplication is fixed-window w=4 with a constant-time
 // 16-entry table lookup — the same shape as `scalar_mul_ct` in p256.rs.
-// Unlike p256, the underlying point formulas here have NO data-dependent
-// branches (completeness, above), so the secret-scalar path leaks less
-// than the p256 baseline: no zero-nibble timing signal. The field
+// The underlying point formulas here have NO data-dependent branches at
+// all (completeness, above), where p256 reaches the same property by
+// computing every exceptional case and selecting under a mask. The field
 // layer is branchless too — `fe_carry`, `fe_add`, `fe_sub`, `fe_mul`
 // and `fe_tobytes` are straight-line masked carry chains with fixed
-// trip counts, unlike p256's `fp_reduce`. Residual non-constant-time
-// surfaces:
+// trip counts. `sc_reduce_wide`'s +L repair is a masked select, not a
+// branch. Residual non-constant-time surface:
 //
-//   - `sc_reduce_wide` selects on the borrow of a subtraction to apply
-//     its conditional +L. That runs over the signing nonce, so it
-//     should become a masked select rather than a branch;
 //   - `ed25519_verify` is VARIABLE-TIME by design: it handles only
 //     public inputs (public key, message, signature).
 //
@@ -614,9 +612,13 @@ fn sc_reduce_wide(t: &[u64; 8]) -> U256 {
         prod[2] = carry as u64;
         prod[3] = (carry >> 64) as u64;
 
-        // acc = lo - hi·c0 (mod L); one +L repairs any borrow.
+        // acc = lo - hi·c0 (mod L); one +L repairs any borrow. The
+        // repair is computed unconditionally and selected under a mask
+        // built from the borrow, so the branch does not exist: this
+        // routine runs over the signing nonce.
         let (d, borrow) = u256_sub(&lo, &prod);
-        acc = if borrow != 0 { u256_add(&d, &l).0 } else { d };
+        let repaired = u256_add(&d, &l).0;
+        acc = ct_select_u256(&d, &repaired, borrow.wrapping_neg());
         i -= 1;
     }
     acc
@@ -769,4 +771,148 @@ pub fn ed25519_verify(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64
     let ka = ge_scalar_mul_ct(&k_bytes, &a_point);
     let rhs = ge_add(&r_point, &ka);
     ge_tobytes(&lhs) == ge_tobytes(&rhs)
+}
+
+// ============================================================================
+// X25519 key agreement (RFC 7748)
+// ============================================================================
+//
+// Curve25519 in Montgomery form v² = u³ + 486662·u² + u over the same
+// p = 2^255 - 19 and the same radix-51 `fe_*` layer above. It lives in
+// this file rather than a file of its own because it reuses that layer
+// verbatim; splitting it would add a mount to every consumer's include
+// set for no gain.
+//
+// This is the constant-time key agreement for this tree. Every
+// operation below is branchless with a fixed trip count:
+//
+//   - the ladder runs exactly 255 iterations regardless of the scalar;
+//   - the conditional swap is `fe_select` on a mask built from a scalar
+//     bit, never an `if`;
+//   - the field layer is the branchless one documented in this file's
+//     header — no value-dependent reduction loops;
+//   - the Montgomery ladder on Curve25519 has no exceptional cases, so
+//     there are no identity short-circuits to leak which case was hit;
+//   - inversion is `fe_invert`, whose square-and-multiply schedule is
+//     driven by the PUBLIC exponent p-2.
+//
+// The one value-dependent decision is the all-zero output check in
+// `x25519_shared_secret`, which acts on the RESULT of the exchange
+// after the secret scalar has been consumed and is a rejection
+// condition the caller must observe.
+
+/// Scalar clamping, RFC 7748 §5: clear the three low bits (cofactor),
+/// clear bit 255 and set bit 254 (fixed ladder length, and it keeps the
+/// scalar above the low-order subgroup).
+fn x25519_clamp(k: &mut [u8; 32]) {
+    k[0] &= 248;
+    k[31] &= 127;
+    k[31] |= 64;
+}
+
+/// The Montgomery ladder of RFC 7748 §5 over the radix-51 field.
+///
+/// `k` is consumed already clamped. `u` is the affine u-coordinate; per
+/// §5 its bit 255 is ignored on decode, which `fe_frombytes` already
+/// does. Returns the u-coordinate of `[k]·U`.
+///
+/// Constant-time in `k` and `u`: 255 fixed iterations, masked swaps, no
+/// data-dependent branch or load address.
+fn x25519_ladder(k: &[u8; 32], u: &Fe) -> Fe {
+    // a24 = (A - 2)/4 = 121665 for A = 486662. Small enough to be
+    // materialised as immediates; no .rodata pointer is taken.
+    let a24: Fe = [121665, 0, 0, 0, 0];
+
+    let x1 = *u;
+    let mut x2 = FE_ONE;
+    let mut z2 = FE_ZERO;
+    let mut x3 = *u;
+    let mut z3 = FE_ONE;
+    let mut swap: u64 = 0;
+
+    let mut t: i32 = 254;
+    while t >= 0 {
+        let bit = ((k[(t as usize) >> 3] >> ((t as usize) & 7)) & 1) as u64;
+        // mask is all-ones exactly when the accumulated swap state
+        // differs from the previous iteration's.
+        let mask = (swap ^ bit).wrapping_neg();
+        let nx2 = fe_select(&x2, &x3, mask);
+        let nx3 = fe_select(&x3, &x2, mask);
+        let nz2 = fe_select(&z2, &z3, mask);
+        let nz3 = fe_select(&z3, &z2, mask);
+        x2 = nx2; x3 = nx3; z2 = nz2; z3 = nz3;
+        swap = bit;
+
+        let a = fe_add(&x2, &z2);
+        let aa = fe_sq(&a);
+        let b = fe_sub(&x2, &z2);
+        let bb = fe_sq(&b);
+        let e = fe_sub(&aa, &bb);
+        let c = fe_add(&x3, &z3);
+        let d = fe_sub(&x3, &z3);
+        let da = fe_mul(&d, &a);
+        let cb = fe_mul(&c, &b);
+        x3 = fe_sq(&fe_add(&da, &cb));
+        z3 = fe_mul(&x1, &fe_sq(&fe_sub(&da, &cb)));
+        x2 = fe_mul(&aa, &bb);
+        z2 = fe_mul(&e, &fe_add(&aa, &fe_mul(&a24, &e)));
+
+        t -= 1;
+    }
+
+    // Final conditional swap for the last processed bit.
+    let mask = swap.wrapping_neg();
+    let fx2 = fe_select(&x2, &x3, mask);
+    let fz2 = fe_select(&z2, &z3, mask);
+
+    fe_mul(&fx2, &fe_invert(&fz2))
+}
+
+/// RFC 7748 §5 `X25519(k, u)` over wire encodings, with no output
+/// check. This is the raw primitive: it clamps `k`, ignores bit 255 of
+/// `u`, and returns the encoded u-coordinate whatever it is, so it
+/// matches the §5.2 vectors (which include non-canonical `u`) and the
+/// iterated test. Key agreement must use `x25519_shared_secret`, which
+/// adds the check RFC 7748 §6.1 requires.
+pub fn x25519(scalar: &[u8; 32], u_in: &[u8; 32]) -> [u8; 32] {
+    let mut k = *scalar;
+    x25519_clamp(&mut k);
+    let u = fe_frombytes(u_in);
+    let r = x25519_ladder(&k, &u);
+    zeroize(&mut k);
+    fe_tobytes(&r)
+}
+
+/// X25519 public key: `X25519(scalar, 9)`, RFC 7748 §6.1.
+pub fn x25519_public_key(scalar: &[u8; 32]) -> [u8; 32] {
+    let mut base = [0u8; 32];
+    base[0] = 9;
+    x25519(scalar, &base)
+}
+
+/// X25519 shared secret with the RFC 7748 §6.1 check.
+///
+/// Returns `None` when the result is the all-zero value. That happens
+/// exactly when the peer's `u` lies in a small-order subgroup — the
+/// eight points of order 1, 2, 4 and 8, including the non-canonical
+/// encodings of them — in which case the output carries none of our
+/// scalar and the exchange is not contributory. Rejecting is the
+/// required behaviour for a key agreement whose result is fed to a KDF.
+///
+/// The check is a fold over the whole output, so it does not reveal
+/// which byte differed; it does reveal that the output was zero, which
+/// is the answer the caller asked for.
+pub fn x25519_shared_secret(scalar: &[u8; 32], peer_u: &[u8; 32]) -> Option<[u8; 32]> {
+    let mut out = x25519(scalar, peer_u);
+    let mut acc = 0u8;
+    let mut i = 0;
+    while i < 32 {
+        acc |= out[i];
+        i += 1;
+    }
+    if acc == 0 {
+        zeroize(&mut out);
+        return None;
+    }
+    Some(out)
 }

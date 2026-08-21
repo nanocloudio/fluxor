@@ -198,8 +198,8 @@ in [`src/platform/rp/providers.rs`](../../src/platform/rp/providers.rs))
 so a raw channel number passed to an fd op — or vice versa — returns
 `EINVAL` at the kernel boundary, not an opaque failure downstream.
 
-`required_caps` is a u32 bitmask in the module header at bytes 6..10,
-so every contract id in 0..31 is expressible in the manifest bitmask —
+`required_caps` is a u64 bitmask in the module header at bytes 6..14,
+so every contract id in 0..63 is expressible in the manifest bitmask —
 neither DMA contract is infra-implicit and neither relies on a
 special-case fallback.
 

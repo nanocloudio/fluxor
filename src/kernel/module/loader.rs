@@ -850,9 +850,9 @@ pub struct ModuleTableEntry {
     pub flags: u8,
     pub reserved: [u8; 2],
 }
-/// Module header (72 bytes). `required_caps` is a u32 at bytes 6..10 so
-/// every contract id in `MAX_CONTRACTS` (0..31) is expressible in the
-/// manifest bitmask.
+/// Module header (80 bytes). `required_caps` is a u64 at reserved bytes
+/// 6..14 so every contract id in `MAX_CONTRACTS` (0..63) is expressible
+/// in the manifest bitmask.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ModuleHeader {
@@ -868,7 +868,7 @@ pub struct ModuleHeader {
     pub export_count: u16,
     pub export_offset: u16,
     pub name: [u8; 32],
-    pub reserved: [u8; 12],
+    pub reserved: [u8; 20],
 }
 
 // On-disk ABI ratchet. These three structs are read field-by-field from
@@ -876,15 +876,15 @@ pub struct ModuleHeader {
 // (`tools/src/modules.rs`) writes the identical byte layout. A size or
 // offset change here silently misaligns every downstream typed read (and
 // desyncs from the packer) — pin the load-bearing sizes and offsets so
-// any such change fails the build and forces a matching packer change +
-// format-version bump. (`SyscallTable` carries its own ratchet in
-// `kernel_abi.rs`.)
+// any such change fails the build and forces a matching packer change
+// and a rebuild of every packed module. (`SyscallTable` carries its own
+// ratchet in `kernel_abi.rs`.)
 const _: () = {
     // Sizes — catch any field add/remove.
     assert!(core::mem::size_of::<ModuleTableHeader>() == 16);
     assert!(core::mem::size_of::<ModuleTableEntry>() == 16);
     assert!(core::mem::size_of::<ModuleHeader>() == ModuleHeader::SIZE);
-    assert!(ModuleHeader::SIZE == 72);
+    assert!(ModuleHeader::SIZE == 80);
     // Every field offset is pinned, not a representative subset — a
     // size-preserving reorder (e.g. swapping data_size and bss_size, or
     // module_type and flags) would otherwise pass. These are the positions
@@ -913,12 +913,13 @@ const _: () = {
     assert!(core::mem::offset_of!(ModuleHeader, export_count) == 24);
     assert!(core::mem::offset_of!(ModuleHeader, export_offset) == 26);
     assert!(core::mem::offset_of!(ModuleHeader, name) == 28);
-    // schema_size / manifest_size live in reserved[2..4] / reserved[4..6].
+    // schema_size / manifest_size live in reserved[2..4] / reserved[4..6];
+    // required_caps in reserved[6..14]; step_phase at reserved[14].
     assert!(core::mem::offset_of!(ModuleHeader, reserved) == 60);
 };
 
 impl ModuleHeader {
-    pub const SIZE: usize = 72;
+    pub const SIZE: usize = 80;
     /// Reserved layout:
     ///   byte 0: flags
     ///     bit 0: mailbox_safe — module can safely consume from mailbox channels.
@@ -941,17 +942,17 @@ impl ModuleHeader {
     ///     the deployment's `tick_us`.
     ///   bytes 2-3: schema_size (u16 LE).
     ///   bytes 4-5: manifest_size (u16 LE).
-    ///   bytes 6-9: required_caps (u32 LE) — public contract bitmask,
+    ///   bytes 6-13: required_caps (u64 LE) — public contract bitmask,
     ///     bit N = contract id N required in `[[resources]]`. Covers
-    ///     the full 0..31 range of contract ids defined in
+    ///     the full 0..63 range of contract ids defined in
     ///     `provider::contract`.
-    ///   byte 10: step_phase — phase offset applied to the period
+    ///   byte 14: step_phase — phase offset applied to the period
     ///     counter at instantiation. Lets graph authors stagger
     ///     coarse-period modules so they don't all fire on the same
     ///     tick (convoy mitigation). Must satisfy
     ///     `step_phase < step_period_ticks`; validated by the loader.
     ///     `0` is the natural cadence.
-    ///   byte 11: reserved (0), available for future ABI extensions.
+    ///   bytes 15-19: reserved (0), available for future ABI extensions.
     /// Step period from reserved[1]: 0 = every tick, N = step every N
     /// scheduler ticks. Units are scheduler ticks, not milliseconds —
     /// the wall-clock period depends on the domain's `tick_us`.
@@ -965,7 +966,7 @@ impl ModuleHeader {
     /// natural cadence. Validated against `step_period_ticks` so
     /// `phase < period`.
     pub fn step_phase(&self) -> u8 {
-        self.reserved[10]
+        self.reserved[14]
     }
     /// Schema section size from reserved[2..4].
     pub fn schema_size(&self) -> u16 {
@@ -975,15 +976,20 @@ impl ModuleHeader {
     pub fn manifest_size(&self) -> u16 {
         u16::from_le_bytes([self.reserved[4], self.reserved[5]])
     }
-    /// Required public-contract bitmask from reserved[6..10].
+    /// Required public-contract bitmask from reserved[6..14].
     /// Bit N set = module declared `requires_contract = "..."` for
-    /// contract id N in its manifest. Full 0..31 contract id range.
-    pub fn required_caps(&self) -> u32 {
-        u32::from_le_bytes([
+    /// contract id N in its manifest. Full 0..63 contract id range —
+    /// the width is `MAX_CONTRACTS`, and the two must move together.
+    pub fn required_caps(&self) -> u64 {
+        u64::from_le_bytes([
             self.reserved[6],
             self.reserved[7],
             self.reserved[8],
             self.reserved[9],
+            self.reserved[10],
+            self.reserved[11],
+            self.reserved[12],
+            self.reserved[13],
         ])
     }
     /// Whether this module is an ISR module (Tier 2). Flags bit 4.
@@ -1828,7 +1834,7 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     // `cmd_sign`):
                     //   header[0..64]          (sizes, export_count, abi_version…)
                     //   skip header[64..66]    (manifest_size: signing grows it)
-                    //   header[66..72] || code || data || export-table || schema
+                    //   header[66..80] || code || data || export-table || schema
                     //   manifest[0..hash_offset] with flags byte 14 bits 0-1
                     //     (has_integrity/has_signature) MASKED — the only
                     //     [0..hash_offset] bytes that differ unsigned vs signed.
@@ -1838,7 +1844,8 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                         let mut eh = Sha256::new();
                         // SAFETY: [module.base, +manifest_offset) is the
                         // header+code+data+exports+schema region, inside the
-                        // validated entry footprint; manifest_offset >= 72.
+                        // validated entry footprint; manifest_offset >=
+                        // ModuleHeader::SIZE.
                         let pre =
                             unsafe { core::slice::from_raw_parts(module.base, manifest_offset) };
                         eh.update(&pre[0..64]);

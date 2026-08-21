@@ -53,6 +53,7 @@ include!("../../sdk/crypto/hmac.rs");
 include!("../../sdk/crypto/chacha20.rs");
 include!("../../sdk/crypto/aes_gcm.rs");
 include!("../../sdk/crypto/p256.rs");
+include!("../../sdk/crypto/ed25519.rs");
 include!("x509.rs");
 
 // TLS protocol
@@ -207,7 +208,13 @@ impl core::ops::IndexMut<usize> for SessionArena {
         }
     }
 }
-const MAX_CERT_LEN: usize = 1024;
+/// Longest single certificate this module retains — the trust anchor, and
+/// the leaf inside a configured chain.
+const MAX_CERT_LEN: usize = 2048;
+/// Longest certificate chain presented to a peer: the leaf followed by
+/// whatever issuers it needs to reach the peer's anchor, as concatenated
+/// DER. A bare leaf is the one-element case.
+const MAX_CERT_CHAIN_BYTES: usize = 3072;
 /// Longest expected DNS identity. A DNS name is at most 253 octets, but the
 /// profile's names are service names in a configured deployment, and the
 /// buffer is per-instance module state on targets that count kilobytes.
@@ -240,13 +247,63 @@ const DGRAM_MAX: usize = 1500;
 const RECV_BUF_SIZE: usize = 16704;
 #[cfg(not(target_arch = "aarch64"))]
 const RECV_BUF_SIZE: usize = 4096;
-const SEND_BUF_SIZE: usize = 2048;
 // SCRATCH_SIZE is defined in handshake_driver.rs.
 const NET_SCRATCH_SIZE: usize = 1600;
 /// Ciphertext retention window for TCP-level retransmission. Holds the
 /// encrypted net_proto frames TLS has written to `cipher_out` so they can
 /// be replayed on MSG_RETRANSMIT without re-encryption.
 const RETX_BUF_SIZE: usize = 4096;
+
+/// Bytes a `CMD_SEND` frame spends before its payload: the net_proto TLV
+/// header plus the conn id that prefixes every per-connection command.
+const NET_FRAME_OVERHEAD: usize =
+    abi::contracts::net::net_proto::FRAME_HDR + abi::contracts::net::net_proto::CONN_ID_LEN;
+
+/// Record bytes one `CMD_SEND` carries: the frame scratch this module
+/// assembles into, less the frame overhead, capped by the normative
+/// per-command payload maximum the receiving net stack sizes for. TCP is
+/// a byte stream, so a longer record is split over several commands
+/// rather than being an error — but a record that fits one command needs
+/// no splitting anywhere on the path, which is what the record writers
+/// below aim for.
+const NET_CMD_RECORD_CAPACITY: usize = {
+    let by_scratch = NET_SCRATCH_SIZE - NET_FRAME_OVERHEAD;
+    let by_contract = abi::contracts::net::net_proto::MAX_CMD_DATA;
+    if by_scratch < by_contract {
+        by_scratch
+    } else {
+        by_contract
+    }
+};
+
+/// Largest handshake-message fragment carried by one record. Room is
+/// kept for the compatibility ChangeCipherSpec record, which shares the
+/// write with the last plaintext handshake record of a flight.
+const HS_FRAGMENT_MAX: usize =
+    record_payload_budget(NET_CMD_RECORD_CAPACITY, CCS_COMPAT_RECORD.len());
+
+/// Largest application-data plaintext carried by one record. Nothing is
+/// appended to an application record, so the whole command is available.
+const CLEAR_CHUNK_MAX: usize = record_payload_budget(NET_CMD_RECORD_CAPACITY, 0);
+
+/// Wire bytes of the largest record either writer emits, plus the
+/// appended ChangeCipherSpec. Sizes the record staging buffers.
+const WIRE_RECORD_MAX: usize = NET_CMD_RECORD_CAPACITY;
+
+const _: () = assert!(HS_FRAGMENT_MAX > 0 && CLEAR_CHUNK_MAX > 0);
+const _: () = assert!(
+    4 + 1 + 3 + MAX_CHAIN_LEN * 5 + MAX_CERT_CHAIN_BYTES <= SCRATCH_SIZE,
+    "a Certificate message carrying the longest configured chain must fit one handshake message"
+);
+const _: () = assert!(
+    RECORD_HEADER_LEN + CLEAR_CHUNK_MAX + AEAD_EXPANSION <= WIRE_RECORD_MAX,
+    "an application record must fit the staging buffer and one command"
+);
+const _: () = assert!(
+    RECORD_HEADER_LEN + HS_FRAGMENT_MAX + AEAD_EXPANSION + CCS_COMPAT_RECORD.len()
+        <= WIRE_RECORD_MAX,
+    "a handshake record plus its ChangeCipherSpec must fit one command"
+);
 
 // Net protocol message types (downstream: IP -> TLS -> HTTP)
 /// Wire width of a `conn_id` on the net_proto surface (`contracts/net/net_proto.rs`
@@ -313,11 +370,6 @@ struct TlsSession {
     recv_buf: [u8; RECV_BUF_SIZE],
     recv_len: usize,
     recv_expected: usize, // expected record payload size (0 = reading header)
-
-    // Send buffer (for fragmented sends)
-    send_buf: [u8; SEND_BUF_SIZE],
-    send_len: usize,
-    send_offset: usize,
 
     // Retransmit buffer — retains ciphertext (including the net_proto
     // CMD_SEND framing bytes) so MSG_RETRANSMIT can replay unacked bytes
@@ -395,9 +447,6 @@ impl TlsSession {
             recv_buf: [0; RECV_BUF_SIZE],
             recv_len: 0,
             recv_expected: 0,
-            send_buf: [0; SEND_BUF_SIZE],
-            send_len: 0,
-            send_offset: 0,
             retx_buf: [0; RETX_BUF_SIZE],
             retx_len: 0,
             retx_base_seq: 0,
@@ -436,11 +485,9 @@ impl TlsSession {
         self.held_msg_type = 0;
         self.recv_len = 0;
         self.recv_expected = 0;
-        self.send_len = 0;
         self.retx_len = 0;
         self.retx_base_seq = 0;
         self.retx_seq_anchored = false;
-        self.send_offset = 0;
         self.ccs_seen = 0;
         self.pending_ccs = false;
         self.pending_ccs_client = false;
@@ -619,6 +666,15 @@ struct TlsState {
     /// non-zero in steady state means a downstream consumer is
     /// back-pressuring TLS. Emitted on the `[tls] hb` line.
     frame_write_dropped: u32,
+    /// Inbound handshake records held back because the handshake queue
+    /// could not take their plaintext. The record stays at the head of
+    /// `recv_buf` and no key state moves, so the next tick retries it
+    /// once the driver has drained a message.
+    hs_intake_deferred: u32,
+    /// Sessions that selected an AES-GCM suite on a build whose AES block
+    /// cipher is not data-independent. Zero on bcm2712 (hardware AES) and
+    /// on targets where `AES_GCM_SUITES_ENABLED` is false.
+    aes_variable_time_selected: u32,
 
     // ── Background ECDH-pool refill (see `pump_ecdh_refill`) ──────────
     // The pool is `MAX_SESSIONS` keys minted once at `module_new`; without
@@ -664,7 +720,7 @@ struct TlsState {
     passthrough_conns: [u8; 32],
 
     // Certificate and key (DER-encoded, loaded from params)
-    cert: [u8; MAX_CERT_LEN],
+    cert: [u8; MAX_CERT_CHAIN_BYTES],
     cert_len: usize,
     key: [u8; MAX_KEY_LEN],
     key_len: usize,
@@ -929,6 +985,8 @@ pub unsafe extern "C" fn module_new(
     s.ecdh_pool_hit = 0;
     s.ecdh_fallback_keygen = 0;
     s.frame_write_dropped = 0;
+    s.hs_intake_deferred = 0;
+    s.aes_variable_time_selected = 0;
     s.pending_downstream_tag = 0;
     s.pending_connect_active = false;
     s.passthrough_conns = [0u8; 32];
@@ -1105,17 +1163,18 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
 
             match tag {
                 10 => {
-                    let n = if len < MAX_CERT_LEN {
-                        len
-                    } else {
-                        MAX_CERT_LEN
-                    };
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(data_start),
-                        s.cert.as_mut_ptr(),
-                        n,
-                    );
-                    s.cert_len = n;
+                    // Certificate chain presented to the peer, leaf first,
+                    // as concatenated DER. Retained whole or not at all: a
+                    // truncated certificate is not a certificate, and the
+                    // admission check refuses a server instance without one.
+                    if len > 0 && len <= MAX_CERT_CHAIN_BYTES {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(data_start),
+                            s.cert.as_mut_ptr(),
+                            len,
+                        );
+                        s.cert_len = len;
+                    }
                 }
                 11 => {
                     let n = if len < MAX_KEY_LEN { len } else { MAX_KEY_LEN };
@@ -1890,12 +1949,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if si >= 0 {
                         let idx = si as usize;
                         if s.sessions[idx].state == SessionState::Ready && data_len > 0 {
-                            // Split bodies larger than one wire
-                            // record into multiple application_data
-                            // records. Chunk size leaves room for
-                            // the 5-byte record header, content-type
-                            // trailer, AEAD tag, and outer framing.
-                            const CLEAR_CHUNK_MAX: usize = NET_SCRATCH_SIZE - 5 - 16 - 1 - 4;
+                            // Split bodies larger than one wire record
+                            // into multiple application_data records.
+                            // `CLEAR_CHUNK_MAX` derives from the same
+                            // carrier capacity the handshake fragmenter
+                            // uses, so the record header, content-type
+                            // trailer, AEAD tag and outer framing are
+                            // accounted for in exactly one place.
                             let mut remaining = data_len;
                             while remaining > 0 {
                                 let rd = remaining.min(CLEAR_CHUNK_MAX);
@@ -1904,7 +1964,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // wire-record buffer so encrypt
                                 // happens in place (saves two memcpys
                                 // vs the prior staged path).
-                                let mut rec = [0u8; SEND_BUF_SIZE + 5];
+                                let mut rec = [0u8; WIRE_RECORD_MAX];
                                 (sys.channel_read)(s.clear_in, rec.as_mut_ptr().add(5), rd);
 
                                 let sess = &mut s.sessions[idx];
@@ -2300,8 +2360,6 @@ fn alloc_session_for_conn(s: &mut TlsState, conn_id: u16) -> Option<usize> {
                 s.sessions[i].conn_id = conn_id;
                 s.sessions[i].held_msg_type = 0;
                 s.sessions[i].recv_len = 0;
-                s.sessions[i].send_len = 0;
-                s.sessions[i].send_offset = 0;
                 return Some(i);
             }
             i += 1;
@@ -2770,6 +2828,23 @@ unsafe fn assign_fresh_ecdh_key(
     true
 }
 
+/// Mint the X25519 agreement keypair into `driver`.
+///
+/// The private value is the raw CSPRNG output: `x25519_public_key` and
+/// `x25519_shared_secret` clamp it internally (RFC 7748 §5), so keeping
+/// a pre-clamped copy would give one scalar two encodings. There is no
+/// pool to draw from — a single ladder is cheap enough to run inline,
+/// which is also why it needs no resumable state.
+unsafe fn driver_gen_x25519(sys: &SyscallTable, driver: &mut HandshakeDriver) -> bool {
+    let mut random = [0u8; X25519_SHARE_LEN];
+    if dev_csprng_fill(sys, random.as_mut_ptr(), X25519_SHARE_LEN) < 0 {
+        return false;
+    }
+    driver.x25519_public = x25519_public_key(&random);
+    driver.x25519_private = random;
+    true
+}
+
 /// Post-handshake key-material cleanup. Zeroes the ECDH private
 /// scalar and the handshake-tier secrets once application keys
 /// are derived. Neither piece of material is recoverable from
@@ -2850,6 +2925,42 @@ fn send_level_is_initial(sess: &TlsSession) -> bool {
     sess.write_keys.key_len == 0
 }
 
+/// What to do with an inbound record's handshake plaintext. Decided
+/// before any key state moves, because `decrypt_record` advances the
+/// AEAD sequence and a record whose plaintext then had nowhere to go
+/// could not be retried — the next attempt would authenticate it against
+/// the wrong sequence number and fail its MAC.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HsIntake {
+    /// Room now: decrypt and queue the plaintext.
+    Accept,
+    /// Room later. The record is left at the head of `recv_buf` and no
+    /// sequence state moves; the driver drains a message and the next
+    /// tick retries.
+    Defer,
+    /// More than an empty queue holds. No amount of draining makes room,
+    /// so deferring would be a hang; the session fails instead.
+    Refuse,
+}
+
+/// Decide the fate of a record carrying at most `plaintext` handshake
+/// bytes when `queued` bytes already wait in the inbound queue.
+///
+/// `Defer` always resolves: the queue only holds complete messages the
+/// driver has yet to consume plus at most one incomplete message, and
+/// `HS_IN_BUF_SIZE` is sized to hold an incomplete message alongside a
+/// whole further record — so the record that completes a message is
+/// never the one turned away.
+pub const fn hs_intake_decision(queued: usize, plaintext: usize) -> HsIntake {
+    if plaintext > HS_RECORD_PLAINTEXT_MAX {
+        return HsIntake::Refuse;
+    }
+    if queued >= HS_IN_BUF_SIZE || plaintext > HS_IN_BUF_SIZE - queued {
+        return HsIntake::Defer;
+    }
+    HsIntake::Accept
+}
+
 /// Drain one inbound record from `recv_buf` into `driver.in_buf`,
 /// decrypting if read_keys are set. Returns true if a record was
 /// successfully processed. Caller (`module_step`'s inner loop)
@@ -2858,6 +2969,10 @@ fn send_level_is_initial(sess: &TlsSession) -> bool {
 /// decrypted — draining everything up front would use stale keys.
 unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
     let _sys = &*s.syscalls;
+    // Taken before the session borrow: the counter and the session are
+    // disjoint fields of `TlsState`, but the pool's `Index` impl hides
+    // that from the borrow checker.
+    let deferred: *mut u32 = &mut s.hs_intake_deferred;
     let sess = &mut s.sessions[idx];
     skip_ccs(sess);
     if sess.state == SessionState::Error {
@@ -2896,9 +3011,18 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             sess.state = SessionState::Error;
             return false;
         }
-        let space = HS_IO_BUF_SIZE - sess.driver.in_len;
-        if rec_len > space {
-            return false; // in_buf full — caller must drain via pump_session.
+        match hs_intake_decision(sess.driver.in_len, rec_len) {
+            HsIntake::Accept => {}
+            HsIntake::Defer => {
+                // The record stays at the head of `recv_buf`; the next
+                // tick retries it once the driver has drained a message.
+                *deferred = (*deferred).wrapping_add(1);
+                return false;
+            }
+            HsIntake::Refuse => {
+                sess.state = SessionState::Error;
+                return false;
+            }
         }
         core::ptr::copy_nonoverlapping(
             sess.recv_buf.as_ptr().add(5),
@@ -2914,6 +3038,25 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             // it invites the sender to keep going.
             sess.state = SessionState::Error;
             return false;
+        }
+        // `decrypt_record` advances the AEAD sequence, and this path
+        // consumes the record only after the plaintext has been placed.
+        // A record decrypted but not consumed would be retried against
+        // the next sequence number and fail its MAC, killing the
+        // session. So destination capacity is settled first, against the
+        // largest plaintext this record can possibly yield — the
+        // ciphertext less the inner content type and the tag.
+        let max_pt = rec_len.saturating_sub(AEAD_EXPANSION);
+        match hs_intake_decision(sess.driver.in_len, max_pt) {
+            HsIntake::Accept => {}
+            HsIntake::Defer => {
+                *deferred = (*deferred).wrapping_add(1);
+                return false;
+            }
+            HsIntake::Refuse => {
+                sess.state = SessionState::Error;
+                return false;
+            }
         }
         let mut hdr = [0u8; 5];
         core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
@@ -2937,8 +3080,12 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
                     return false;
                 }
                 if inner_type == CT_HANDSHAKE {
-                    let space = HS_IO_BUF_SIZE - sess.driver.in_len;
-                    if pt_len > space {
+                    if pt_len > HS_IN_BUF_SIZE - sess.driver.in_len {
+                        // Capacity was settled before the decrypt, so
+                        // reaching here means that guard is wrong. The
+                        // sequence has moved and the record cannot be
+                        // retried — fail rather than stall.
+                        sess.state = SessionState::Error;
                         return false;
                     }
                     core::ptr::copy_nonoverlapping(
@@ -2972,10 +3119,20 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
 }
 
 /// Drain complete handshake messages from `driver.out_buf`, wrap each
-/// into a record (plaintext if write_keys haven't been derived,
-/// AEAD-sealed otherwise), and write to `cipher_out`. Honors the
-/// pending_ccs flags by appending a CHANGE_CIPHER_SPEC record after
-/// the next plaintext record so it ships in the same TCP segment.
+/// into one or more records (plaintext if write_keys haven't been
+/// derived, AEAD-sealed otherwise), and write to `cipher_out`. Honors
+/// the pending_ccs flags by appending a CHANGE_CIPHER_SPEC record after
+/// the last plaintext record of a message so it ships in the same TCP
+/// segment.
+///
+/// RFC 8446 §5.1: a handshake message may span several records and a
+/// record may carry several messages, so a message longer than
+/// `HS_FRAGMENT_MAX` goes out as consecutive fragments of the same
+/// logical message — its 4-byte header appears once, at the front of the
+/// first fragment. Every fragment is a legal record on its own and
+/// carries at least one byte; all fragments of a message are emitted
+/// under the same keys before the next message starts, so no message
+/// spans a key change.
 unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
     loop {
         let sess = &s.sessions[idx];
@@ -2989,111 +3146,20 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
         if total > sess.driver.out_len {
             return; // Wait for the rest of the message.
         }
-        if total > SEND_BUF_SIZE {
-            // A single handshake message larger than SEND_BUF_SIZE
-            // would need TLS-level fragmentation across records — we
-            // don't emit fragmented handshakes today.
-            s.sessions[idx].state = SessionState::Error;
-            return;
-        }
 
-        let mut rec = [0u8; SEND_BUF_SIZE + 32];
-        let rec_len: usize;
-
-        if send_level_is_initial(&s.sessions[idx]) {
-            rec[0] = CT_HANDSHAKE;
-            rec[1] = 0x03;
-            rec[2] = 0x03;
-            rec[3] = (total >> 8) as u8;
-            rec[4] = total as u8;
-            core::ptr::copy_nonoverlapping(
-                s.sessions[idx].driver.out_buf.as_ptr(),
-                rec.as_mut_ptr().add(5),
-                total,
-            );
-            rec_len = 5 + total;
-        } else {
-            let sess = &mut s.sessions[idx];
-            let suite = sess.driver.suite;
-            // Encrypt straight into the wire-record buffer. `rec` is
-            // sized for the largest handshake message plus the inner
-            // content-type byte, the AEAD tag and the record header;
-            // `encrypt_record_in_place` re-checks that before writing.
-            core::ptr::copy_nonoverlapping(
-                sess.driver.out_buf.as_ptr(),
-                rec.as_mut_ptr().add(5),
-                total,
-            );
-            let enc_len = match encrypt_record_in_place(
-                suite,
-                &mut sess.write_keys,
-                CT_HANDSHAKE,
-                total,
-                &mut rec[5..],
-            ) {
-                Ok(n) => n,
-                Err(_) => {
-                    // Nothing was emitted and the AEAD seq did not
-                    // move, so the peer is not desynced — but the
-                    // handshake cannot make progress either.
-                    s.sessions[idx].state = SessionState::Error;
-                    return;
-                }
+        let mut offset = 0usize;
+        while offset < total {
+            let frag = if total - offset > HS_FRAGMENT_MAX {
+                HS_FRAGMENT_MAX
+            } else {
+                total - offset
             };
-            rec[0] = CT_APPLICATION_DATA;
-            rec[1] = 0x03;
-            rec[2] = 0x03;
-            rec[3] = (enc_len >> 8) as u8;
-            rec[4] = enc_len as u8;
-            rec_len = 5 + enc_len;
+            let last = offset + frag == total;
+            if !record_emit_handshake_fragment(s, idx, offset, frag, last) {
+                return;
+            }
+            offset += frag;
         }
-
-        // Append CCS into the same record buffer if a flag is pending
-        // and this was a plaintext record (Initial level). Per RFC 8446
-        // §5 the CCS is dropped on the wire; preserving the same TCP
-        // segment matters for middlebox compatibility.
-        let mut total_len = rec_len;
-        if send_level_is_initial(&s.sessions[idx])
-            && (s.sessions[idx].pending_ccs || s.sessions[idx].pending_ccs_client)
-        {
-            rec[total_len] = CT_CHANGE_CIPHER_SPEC;
-            rec[total_len + 1] = 0x03;
-            rec[total_len + 2] = 0x03;
-            rec[total_len + 3] = 0x00;
-            rec[total_len + 4] = 0x01;
-            rec[total_len + 5] = 0x01;
-            total_len += 6;
-            s.sessions[idx].pending_ccs = false;
-            s.sessions[idx].pending_ccs_client = false;
-        }
-
-        let conn_id = s.sessions[idx].conn_id;
-        let sys = &*s.syscalls;
-        // AEAD seq already advanced; a dropped write would desync
-        // the peer permanently. Fail the session if the write fails.
-        let sent = tls_write_frame(
-            sys,
-            s.cipher_out,
-            NET_CMD_SEND,
-            conn_id,
-            rec.as_ptr(),
-            total_len as u16,
-            &mut s.net_scratch,
-        );
-        if sent {
-            // Handshake records. Separating these from the application
-            // records above is what makes the handshake-rate phase legible
-            // in the byte counters rather than only in the probe's timings.
-            s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(4 + total_len as u32);
-        }
-        if !sent {
-            s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
-            let msg: &[u8] = b"[tls] handshake out drop; session->Error";
-            dev_log(sys, 3, msg.as_ptr(), msg.len());
-            s.sessions[idx].state = SessionState::Error;
-            return;
-        }
-        retx_push(&mut s.sessions[idx], rec.as_ptr(), total_len as u16);
 
         let sess = &mut s.sessions[idx];
         let remain = sess.driver.out_len - total;
@@ -3106,6 +3172,125 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
         }
         sess.driver.out_len = remain;
     }
+}
+
+/// Emit `driver.out_buf[offset .. offset + frag]` as one handshake
+/// record on `cipher_out`. `last` marks the final fragment of a logical
+/// message, the only one a pending compatibility ChangeCipherSpec may
+/// follow. Returns false once the session has been failed, which is the
+/// caller's signal to stop draining.
+unsafe fn record_emit_handshake_fragment(
+    s: &mut TlsState,
+    idx: usize,
+    offset: usize,
+    frag: usize,
+    last: bool,
+) -> bool {
+    // RFC 8446 §5.1 forbids an empty handshake fragment.
+    if frag == 0 || frag > HS_FRAGMENT_MAX {
+        s.sessions[idx].state = SessionState::Error;
+        return false;
+    }
+
+    let mut rec = [0u8; WIRE_RECORD_MAX];
+    let rec_len: usize;
+
+    if send_level_is_initial(&s.sessions[idx]) {
+        rec[0] = CT_HANDSHAKE;
+        rec[1] = 0x03;
+        rec[2] = 0x03;
+        rec[3] = (frag >> 8) as u8;
+        rec[4] = frag as u8;
+        core::ptr::copy_nonoverlapping(
+            s.sessions[idx].driver.out_buf.as_ptr().add(offset),
+            rec.as_mut_ptr().add(RECORD_HEADER_LEN),
+            frag,
+        );
+        rec_len = RECORD_HEADER_LEN + frag;
+    } else {
+        let sess = &mut s.sessions[idx];
+        let suite = sess.driver.suite;
+        // Encrypt straight into the wire-record buffer. `rec` is sized
+        // by `HS_FRAGMENT_MAX` for the fragment plus the inner
+        // content-type byte, the AEAD tag and the record header;
+        // `encrypt_record_in_place` re-checks that before writing.
+        core::ptr::copy_nonoverlapping(
+            sess.driver.out_buf.as_ptr().add(offset),
+            rec.as_mut_ptr().add(RECORD_HEADER_LEN),
+            frag,
+        );
+        let enc_len = match encrypt_record_in_place(
+            suite,
+            &mut sess.write_keys,
+            CT_HANDSHAKE,
+            frag,
+            &mut rec[RECORD_HEADER_LEN..],
+        ) {
+            Ok(n) => n,
+            Err(_) => {
+                // Nothing was emitted and the AEAD seq did not move, so
+                // the peer is not desynced — but the handshake cannot
+                // make progress either.
+                s.sessions[idx].state = SessionState::Error;
+                return false;
+            }
+        };
+        rec[0] = CT_APPLICATION_DATA;
+        rec[1] = 0x03;
+        rec[2] = 0x03;
+        rec[3] = (enc_len >> 8) as u8;
+        rec[4] = enc_len as u8;
+        rec_len = RECORD_HEADER_LEN + enc_len;
+    }
+
+    // Append CCS into the same record buffer if a flag is pending and
+    // this was the last plaintext fragment (Initial level). Per RFC 8446
+    // §5 the CCS is dropped on the wire; preserving the same TCP segment
+    // matters for middlebox compatibility. A CCS between fragments would
+    // interleave another record type inside one handshake message, so it
+    // waits for the end of the message.
+    let mut total_len = rec_len;
+    if last
+        && send_level_is_initial(&s.sessions[idx])
+        && (s.sessions[idx].pending_ccs || s.sessions[idx].pending_ccs_client)
+    {
+        core::ptr::copy_nonoverlapping(
+            CCS_COMPAT_RECORD.as_ptr(),
+            rec.as_mut_ptr().add(total_len),
+            CCS_COMPAT_RECORD.len(),
+        );
+        total_len += CCS_COMPAT_RECORD.len();
+        s.sessions[idx].pending_ccs = false;
+        s.sessions[idx].pending_ccs_client = false;
+    }
+
+    let conn_id = s.sessions[idx].conn_id;
+    let sys = &*s.syscalls;
+    // AEAD seq already advanced; a dropped write would desync the peer
+    // permanently. Fail the session if the write fails.
+    let sent = tls_write_frame(
+        sys,
+        s.cipher_out,
+        NET_CMD_SEND,
+        conn_id,
+        rec.as_ptr(),
+        total_len as u16,
+        &mut s.net_scratch,
+    );
+    if sent {
+        // Handshake records. Separating these from the application
+        // records above is what makes the handshake-rate phase legible
+        // in the byte counters rather than only in the probe's timings.
+        s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(4 + total_len as u32);
+    } else {
+        s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
+        let msg: &[u8] = b"[tls] handshake out drop; session->Error";
+        dev_log(sys, 3, msg.as_ptr(), msg.len());
+        s.sessions[idx].state = SessionState::Error;
+        return false;
+    }
+    retx_push(&mut s.sessions[idx], rec.as_ptr(), total_len as u16);
+    true
 }
 
 /// Thin facade — kept so existing callers compile. The real logic
@@ -3276,26 +3461,41 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
         }
     }
 
-    match ch.key_share {
-        // The key share is a peer-supplied point; admit it only if
-        // it decodes to a canonical, on-curve, non-identity P-256
-        // point. Anything else falls through to the no-usable-share
-        // branch below rather than reaching the ECDH ladder.
-        Some((_, key_data)) if public_point_is_valid(key_data) => {
+    // X25519 first: its ladder is constant time by construction, so the
+    // agreement scalar never touches P-256's variable-time arithmetic.
+    // A P-256 share is admitted only if it decodes to a canonical,
+    // on-curve, non-identity point; X25519 needs no such check, because
+    // every 32-byte string is a legal `u` and the contributory-behaviour
+    // test happens on the result (RFC 7748 §6.1).
+    match (ch.key_share_x25519, ch.key_share) {
+        (Some(key_data), _) if key_data.len() == X25519_SHARE_LEN => {
+            core::ptr::copy_nonoverlapping(
+                key_data.as_ptr(),
+                sess.driver.peer_key_share.as_mut_ptr(),
+                X25519_SHARE_LEN,
+            );
+            sess.driver.peer_key_share_len = X25519_SHARE_LEN as u8;
+            sess.driver.group = GROUP_X25519;
+            if !driver_gen_x25519(sys, &mut sess.driver) {
+                sess.state = SessionState::Error;
+                return true;
+            }
+        }
+        (_, Some((_, key_data))) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 sess.driver.peer_key_share.as_mut_ptr(),
                 key_data.len(),
             );
             sess.driver.peer_key_share_len = key_data.len() as u8;
+            sess.driver.group = GROUP_SECP256R1;
         }
         _ => {
             if sess.driver.hrr_sent {
-                // Second ClientHello still has no P-256 → fatal
+                // Second ClientHello still carries no usable share → fatal
                 sess.state = SessionState::Error;
                 return true;
             }
-            // No P-256 key share → send HelloRetryRequest
             if let Some(ref mut t) = sess.driver.transcript {
                 t.update(hs_data);
             }
@@ -3413,8 +3613,43 @@ unsafe fn pump_derive_handshake_keys(s: &mut TlsState, idx: usize) -> bool {
     if let Some((wk, rk)) = pump_derive_handshake_keys_core(&mut sess.driver, bits_per_step) {
         sess.write_keys = wk;
         sess.read_keys = rk;
+        let suite = sess.driver.suite;
+        note_aes_gcm_exposure(s, suite);
     }
     true
+}
+
+/// Telemetry metric ids (`[observability].metrics`). 0-4 are emitted on
+/// the periodic heartbeat; 5 is emitted at the moment of selection.
+const TLM_METRIC_AES_VARIABLE_TIME: u16 = 5;
+
+/// Record that a session settled on an AES-GCM suite in a build whose
+/// AES block cipher indexes its table with key-dependent bytes.
+///
+/// The suite is still offered there (RFC 8446 §9.1 makes
+/// `TLS_AES_128_GCM_SHA256` mandatory, and a node that cannot speak it
+/// is not a TLS 1.3 implementation), so the exposure is accepted rather
+/// than absent — and an accepted exposure has to be visible. The metric
+/// value is the selected suite id, so an operator sees which suite was
+/// chosen and not merely that one was.
+unsafe fn note_aes_gcm_exposure(s: &mut TlsState, suite: CipherSuite) {
+    if AES_IS_CONSTANT_TIME || suite == CipherSuite::ChaCha20Poly1305 {
+        return;
+    }
+    s.aes_variable_time_selected = s.aes_variable_time_selected.wrapping_add(1);
+    let sys = &*s.syscalls;
+    let me = dev_self_index(sys);
+    if me >= 0 {
+        dev_telemetry_metric(
+            sys,
+            -1,
+            me as u16,
+            dev_micros(sys),
+            abi::contracts::telemetry::METRIC_UPDOWN,
+            TLM_METRIC_AES_VARIABLE_TIME,
+            suite.id() as u64,
+        );
+    }
 }
 
 unsafe fn pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> bool {
@@ -3445,7 +3680,7 @@ unsafe fn pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_send_certificate(s: &mut TlsState, idx: usize) -> bool {
-    let cert_len = if s.cert_len <= MAX_CERT_LEN {
+    let cert_len = if s.cert_len <= MAX_CERT_CHAIN_BYTES {
         s.cert_len
     } else {
         0
@@ -3888,11 +4123,16 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     sess.driver.peer_session_id = session_id;
     sess.driver.peer_session_id_len = 32;
 
+    if !driver_gen_x25519(sys, &mut sess.driver) {
+        return false;
+    }
     let alpn: &[u8] = if alpn_h1_only { b"http/1.1" } else { &[] };
+    let x25519_pub = sess.driver.x25519_public;
     let msg_len = build_client_hello_sni(
         &random,
         &session_id,
         &sess.driver.ecdh_public,
+        Some(&x25519_pub),
         &[],
         alpn,
         sni,
@@ -4478,7 +4718,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 // records, so they go through the driver's
                 // reassembler. `sess` is released first: the handler
                 // needs the whole state to emit a KeyUpdate response.
-                let space = HS_IO_BUF_SIZE - sess.driver.in_len;
+                let space = HS_IN_BUF_SIZE - sess.driver.in_len;
                 if pt_len > space {
                     sess.state = SessionState::Error;
                     return;
@@ -4528,7 +4768,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 // silently lose bytes the peer thinks were delivered,
                 // so any failed chunk fails the session.
                 let conn_id = sess.conn_id;
-                const CLEAR_FWD_CHUNK: usize = NET_SCRATCH_SIZE - 5;
+                const CLEAR_FWD_CHUNK: usize = NET_CMD_RECORD_CAPACITY;
                 let mut off = 0usize;
                 let mut ok = true;
                 while off < pt_len {
@@ -4682,5 +4922,72 @@ pub mod test_helpers {
     pub unsafe fn peer_auth_config(state: *const u8) -> (u8, usize, usize) {
         let s = &*(state as *const TlsState);
         (s.peer_auth, s.anchor_len, s.expected_dns_len)
+    }
+
+    /// Largest handshake-message fragment one record carries, as the
+    /// module derives it. A test asserting on fragment counts reads the
+    /// budget from here rather than restating the arithmetic.
+    pub fn handshake_fragment_max() -> usize {
+        super::HS_FRAGMENT_MAX
+    }
+
+    /// Queue `msg` (4-byte handshake header + body) on the session bound
+    /// to `conn_id` and run the outbound record writer over it. Returns
+    /// false if no such session exists or the message did not fit the
+    /// handshake queue.
+    ///
+    /// Drives the record writer with a message of the test's choosing,
+    /// which is otherwise reachable only through a peer that happens to
+    /// present a large enough certificate.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn emit_handshake_message(state: *mut u8, conn_id: u16, msg: &[u8]) -> bool {
+        let s = &mut *(state as *mut TlsState);
+        let si = super::find_session_by_conn_id(s, conn_id);
+        if si < 0 {
+            return false;
+        }
+        let idx = si as usize;
+        if !super::driver_write_handshake_message(&mut s.sessions[idx], msg) {
+            return false;
+        }
+        super::record_drain_outbound(s, idx);
+        true
+    }
+
+    /// Number of times an inbound handshake record was deferred because
+    /// the handshake queue could not take its plaintext. A deferral is
+    /// the point at which sequence state must not have moved.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn handshake_intake_deferred(state: *const u8) -> u32 {
+        let s = &*(state as *const TlsState);
+        s.hs_intake_deferred
+    }
+
+    /// Named group the session bound to `conn_id` agreed on, so a test
+    /// asserts which key agreement actually ran rather than inferring it
+    /// from a completed handshake.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn negotiated_group(state: *const u8, conn_id: u16) -> Option<u16> {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .find(|sess| sess.state != SessionState::Idle && sess.conn_id == conn_id)
+            .map(|sess| sess.driver.group)
+    }
+
+    /// Sessions that settled on an AES-GCM suite where the AES block
+    /// cipher is not data-independent.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn aes_variable_time_selected(state: *const u8) -> u32 {
+        let s = &*(state as *const TlsState);
+        s.aes_variable_time_selected
     }
 }

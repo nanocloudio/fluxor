@@ -49,7 +49,19 @@ pub const PSK_KE_MODE_PSK: u8 = 0;
 pub const PSK_KE_MODE_PSK_DHE: u8 = 1;
 
 /// Named group for P-256
-const GROUP_SECP256R1: u16 = 0x0017;
+pub const GROUP_SECP256R1: u16 = 0x0017;
+
+/// Named group for X25519 (RFC 8446 §4.2.7, RFC 7748). Preferred over
+/// P-256: the montgomery ladder is constant time by construction, so the
+/// long-lived key-agreement scalar never reaches P-256's variable-time
+/// arithmetic. The share is a bare 32-byte little-endian `u`
+/// coordinate — no `0x04` prefix and no point encoding.
+pub const GROUP_X25519: u16 = 0x001d;
+
+/// Wire length of an X25519 key share.
+pub const X25519_SHARE_LEN: usize = 32;
+/// Wire length of an uncompressed P-256 key share.
+pub const P256_SHARE_LEN: usize = 65;
 
 /// Signature algorithm: ecdsa_secp256r1_sha256
 const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
@@ -145,12 +157,34 @@ impl Transcript {
     }
 }
 
-/// The full TLS 1.3 cipher-suite offer for the record layer (which
-/// implements all three): ChaCha20-Poly1305, AES-128-GCM, AES-256-GCM,
-/// in the module's long-standing preference order. QUIC packet
+/// The TLS 1.3 cipher-suite offer for the record layer, in preference
+/// order: ChaCha20-Poly1305 first — constant time on every target — then
+/// the AES-GCM suites where the target admits them. QUIC packet
 /// protection only implements AES-128-GCM-SHA256, so the QUIC client
 /// passes a narrower list (see `quic::pump`).
-pub const TLS13_RECORD_SUITES: &[u16] = &[0x1303, 0x1301, 0x1302];
+///
+/// `AES_GCM_SUITES_ENABLED` gates the offer and `select_cipher_suite`
+/// gates the accept, from the same constant: accepting a suite this
+/// endpoint would not offer is the same exposure as offering it.
+pub const TLS13_RECORD_SUITES: &[u16] = if AES_GCM_SUITES_ENABLED {
+    &[0x1303, 0x1301, 0x1302]
+} else {
+    &[0x1303]
+};
+
+/// True when `id` is a suite this endpoint offered. The accept side
+/// reads the same table the offer is built from, so a server cannot
+/// select a suite the client declined to advertise.
+pub fn suite_is_offered(id: u16) -> bool {
+    let mut i = 0;
+    while i < TLS13_RECORD_SUITES.len() {
+        if TLS13_RECORD_SUITES[i] == id {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 
 /// Write the ClientHello `cipher_suites` vector: a 2-byte length prefix
 /// (in bytes) followed by each suite id as a big-endian u16. Returns the
@@ -170,11 +204,21 @@ fn write_cipher_suites(out: &mut [u8], mut pos: usize, suites: &[u16]) -> usize 
 pub fn build_client_hello(
     random: &[u8; 32],
     session_id: &[u8; 32],
-    pub_key: &[u8; 65],  // uncompressed P-256 public key
+    pub_key: &[u8; P256_SHARE_LEN],  // uncompressed P-256 public key
+    x25519_pub: Option<&[u8; X25519_SHARE_LEN]>,
     out: &mut [u8],
 ) -> usize {
     // Empty ALPN → builder keeps the default h2,http/1.1 offer.
-    build_client_hello_ext(random, session_id, pub_key, &[], &[], TLS13_RECORD_SUITES, out)
+    build_client_hello_ext(
+        random,
+        session_id,
+        pub_key,
+        x25519_pub,
+        &[],
+        &[],
+        TLS13_RECORD_SUITES,
+        out,
+    )
 }
 
 /// Variant taking a QUIC `transport_parameters` extension payload.
@@ -182,16 +226,20 @@ pub fn build_client_hello(
 /// parameters varint TLV list per RFC 9000 §18); the function wraps
 /// it in the [type(2)][length(2)][data] extension envelope. An
 /// empty `quic_tp` is equivalent to `build_client_hello`.
+#[allow(clippy::too_many_arguments, reason = "one ClientHello extension per argument; grouping them into a struct would move the same fields behind a name that adds nothing")]
 pub fn build_client_hello_ext(
     random: &[u8; 32],
     session_id: &[u8; 32],
-    pub_key: &[u8; 65],
+    pub_key: &[u8; P256_SHARE_LEN],
+    x25519_pub: Option<&[u8; X25519_SHARE_LEN]>,
     quic_tp: &[u8],
     alpn: &[u8],
     suites: &[u16],
     out: &mut [u8],
 ) -> usize {
-    build_client_hello_sni(random, session_id, pub_key, quic_tp, alpn, &[], suites, out)
+    build_client_hello_sni(
+        random, session_id, pub_key, x25519_pub, quic_tp, alpn, &[], suites, out,
+    )
 }
 
 /// As [`build_client_hello_ext`], plus a `server_name` extension
@@ -205,7 +253,8 @@ pub fn build_client_hello_ext(
 pub fn build_client_hello_sni(
     random: &[u8; 32],
     session_id: &[u8; 32],
-    pub_key: &[u8; 65],
+    pub_key: &[u8; P256_SHARE_LEN],
+    x25519_pub: Option<&[u8; X25519_SHARE_LEN]>,
     quic_tp: &[u8],
     alpn: &[u8],
     sni: &[u8],
@@ -237,8 +286,8 @@ pub fn build_client_hello_sni(
     let ext_start = pos;
     pos = write_ext_server_name(out, pos, sni);
     pos = write_ext_supported_versions(out, pos);
-    pos = write_ext_supported_groups(out, pos);
-    pos = write_ext_key_share_client(out, pos, pub_key);
+    pos = write_ext_supported_groups(out, pos, x25519_pub.is_some());
+    pos = write_ext_key_share_client(out, pos, pub_key, x25519_pub);
     pos = write_ext_signature_algorithms(out, pos);
     pos = write_ext_alpn_client(out, pos, alpn);
     if !quic_tp.is_empty() {
@@ -276,7 +325,8 @@ pub fn build_server_hello(
     random: &[u8; 32],
     session_id: &[u8; 32],
     suite: CipherSuite,
-    pub_key: &[u8; 65],
+    group: u16,
+    share: &[u8],
     out: &mut [u8],
 ) -> usize {
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
@@ -313,13 +363,16 @@ pub fn build_server_hello(
         pu16(p, &mut pos, 2); // extension data length
         pu16(p, &mut pos, TLS13_VERSION);
 
-        // key_share
+        // key_share — the group the server selected, with the share
+        // encoded as that group defines it: an uncompressed point for
+        // P-256, a bare `u` coordinate for X25519.
+        let n = share.len();
         pu16(p, &mut pos, EXT_KEY_SHARE);
-        pu16(p, &mut pos, 2 + 2 + 65); // key_share data length
-        pu16(p, &mut pos, GROUP_SECP256R1);
-        pu16(p, &mut pos, 65); // key length
-        core::ptr::copy_nonoverlapping(pub_key.as_ptr(), p.add(pos), 65);
-        pos += 65;
+        pu16(p, &mut pos, (2 + 2 + n) as u16); // key_share data length
+        pu16(p, &mut pos, group);
+        pu16(p, &mut pos, n as u16); // key length
+        core::ptr::copy_nonoverlapping(share.as_ptr(), p.add(pos), n);
+        pos += n;
 
         let ext_len = (pos - ext_start) as u16;
         wv(p.add(ext_len_pos), (ext_len >> 8) as u8);
@@ -519,12 +572,56 @@ pub fn build_encrypted_extensions_ext(out: &mut [u8], alpn: &[u8], quic_tp: &[u8
     }
 }
 
-/// Build Certificate message with a single cert.
+/// Build a Certificate message (RFC 8446 §4.4.2) from `chain`:
+/// concatenated DER certificates, leaf first, each becoming one
+/// `CertificateEntry` with no entry extensions. A single certificate is
+/// the one-element case. At most `MAX_CHAIN_LEN` entries are emitted —
+/// the same ceiling the peer's validator accepts — and a chain whose DER
+/// does not tessellate exactly is treated as a single opaque
+/// certificate, which the peer then refuses on its own terms rather than
+/// being sent a mis-framed list.
+///
+/// Returns 0 when the message would not fit `out`, which the caller
+/// reads as "cannot build" rather than emitting a truncated message.
+///
 /// Uses raw pointer writes — array indexing generates bounds-check panics
 /// that crash on PIC aarch64 (panic handler accesses .rodata via ADRP).
-pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> usize {
-    // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
-    // checked against the message length before each deref.
+pub fn build_certificate(chain: &[u8], out: &mut [u8]) -> usize {
+    // Entry boundaries first, so the total is known before anything is
+    // written and a short `out` costs nothing.
+    let mut starts = [0usize; MAX_CHAIN_LEN];
+    let mut lens = [0usize; MAX_CHAIN_LEN];
+    let mut count = 0usize;
+    let mut pos = 0usize;
+    while pos < chain.len() && count < MAX_CHAIN_LEN {
+        match der_tlv(chain, pos) {
+            Some((_, _, consumed)) if consumed > 0 => {
+                starts[count] = pos;
+                lens[count] = consumed;
+                count += 1;
+                pos += consumed;
+            }
+            _ => break,
+        }
+    }
+    if count == 0 || pos != chain.len() {
+        // Not a clean run of DER certificates: present it whole.
+        starts[0] = 0;
+        lens[0] = chain.len();
+        count = 1;
+    }
+
+    let mut list_len = 0usize;
+    for len in lens.iter().take(count) {
+        list_len += 3 + len + 2;
+    }
+    let total = 4 + 1 + 3 + list_len;
+    if total > out.len() {
+        return 0;
+    }
+
+    // SAFETY: pointer arithmetic over the handshake-state buffer; the
+    // `total > out.len()` check above bounds every write below.
     unsafe {
         let p = out.as_mut_ptr();
         let mut pos = 0;
@@ -536,24 +633,24 @@ pub fn build_certificate(cert_der: &[u8], out: &mut [u8]) -> usize {
         *p.add(pos) = 0; pos += 1;
 
         // certificate_list length
-        let list_len = 3 + cert_der.len() + 2;
-        let list_len_pos = pos; pos += 3;
-
-        // CertificateEntry: cert_data length (3 bytes)
-        *p.add(pos) = (cert_der.len() >> 16) as u8;
-        *p.add(pos + 1) = (cert_der.len() >> 8) as u8;
-        *p.add(pos + 2) = cert_der.len() as u8;
+        *p.add(pos) = (list_len >> 16) as u8;
+        *p.add(pos + 1) = (list_len >> 8) as u8;
+        *p.add(pos + 2) = list_len as u8;
         pos += 3;
-        // cert_data
-        core::ptr::copy_nonoverlapping(cert_der.as_ptr(), p.add(pos), cert_der.len());
-        pos += cert_der.len();
-        // extensions (empty)
-        *p.add(pos) = 0; *p.add(pos + 1) = 0; pos += 2;
 
-        // Fill lengths
-        *p.add(list_len_pos) = (list_len >> 16) as u8;
-        *p.add(list_len_pos + 1) = (list_len >> 8) as u8;
-        *p.add(list_len_pos + 2) = list_len as u8;
+        for i in 0..count {
+            let n = lens[i];
+            // CertificateEntry: cert_data length (3 bytes)
+            *p.add(pos) = (n >> 16) as u8;
+            *p.add(pos + 1) = (n >> 8) as u8;
+            *p.add(pos + 2) = n as u8;
+            pos += 3;
+            // cert_data
+            core::ptr::copy_nonoverlapping(chain.as_ptr().add(starts[i]), p.add(pos), n);
+            pos += n;
+            // extensions (empty)
+            *p.add(pos) = 0; *p.add(pos + 1) = 0; pos += 2;
+        }
 
         let body_len = pos - len_pos - 3;
         *p.add(len_pos) = (body_len >> 16) as u8;
@@ -619,6 +716,11 @@ pub struct ClientHello<'a> {
     pub session_id: &'a [u8], // 0-32 bytes
     pub cipher_suites: &'a [u8], // raw bytes
     pub key_share: Option<(u16, &'a [u8])>, // (group, key_exchange)
+    /// The client's X25519 share, when it offered one. Kept separate
+    /// from `key_share` so a consumer that only completes P-256 keeps
+    /// reading the P-256 share and never negotiates a group it cannot
+    /// finish.
+    pub key_share_x25519: Option<&'a [u8]>,
     pub supported_versions: Option<u16>,
     /// QUIC `transport_parameters` (RFC 9001 §8.2). `None` for
     /// TLS-over-TCP / DTLS clients that don't carry the extension.
@@ -715,6 +817,7 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
 
         // Extensions
         let mut key_share: Option<(u16, &[u8])> = None;
+        let mut key_share_x25519: Option<&[u8]> = None;
         let mut supported_versions: Option<u16> = None;
         let mut alpn_protos: Option<&[u8]> = None;
         let mut transport_parameters: Option<&[u8]> = None;
@@ -789,8 +892,11 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
                                 let group = get_u16(ext_data, spos); spos += 2;
                                 let klen = get_u16(ext_data, spos) as usize; spos += 2;
                                 if spos + klen > ext_data_len { break; }
-                                if group == GROUP_SECP256R1 {
+                                if group == GROUP_SECP256R1 && klen == P256_SHARE_LEN {
                                     key_share = Some((group, core::slice::from_raw_parts(ext_data.as_ptr().add(spos), klen)));
+                                } else if group == GROUP_X25519 && klen == X25519_SHARE_LEN {
+                                    key_share_x25519 =
+                                        Some(core::slice::from_raw_parts(ext_data.as_ptr().add(spos), klen));
                                 }
                                 spos += klen;
                             }
@@ -815,6 +921,7 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
             session_id,
             cipher_suites,
             key_share,
+            key_share_x25519,
             supported_versions,
             transport_parameters,
             alpn_protos,
@@ -1094,6 +1201,11 @@ pub fn select_cipher_suite(client_suites: &[u8]) -> Option<CipherSuite> {
         if cs == 0x1302 { found_aes256 = true; }
         i += 2;
     }
+    if !AES_GCM_SUITES_ENABLED {
+        // The offer omits these, so accepting one would let a peer
+        // select what this endpoint declined to advertise.
+        return None;
+    }
     if found_aes128 { return Some(CipherSuite::Aes128Gcm); }
     if found_aes256 { return Some(CipherSuite::Aes256Gcm); }
     None
@@ -1237,17 +1349,48 @@ fn write_ext_supported_versions(out: &mut [u8], mut pos: usize) -> usize {
     pos
 }
 
-fn write_ext_key_share_client(out: &mut [u8], mut pos: usize, pub_key: &[u8; 65]) -> usize {
+/// `key_share` (RFC 8446 §4.2.8). Shares are listed in the same
+/// preference order as `supported_groups`, so an X25519 share — when the
+/// caller has one — precedes the P-256 share.
+fn write_ext_key_share_client(
+    out: &mut [u8],
+    mut pos: usize,
+    pub_key: &[u8; P256_SHARE_LEN],
+    x25519_pub: Option<&[u8; X25519_SHARE_LEN]>,
+) -> usize {
+    let mut shares_len = 2 + 2 + P256_SHARE_LEN;
+    if x25519_pub.is_some() {
+        shares_len += 2 + 2 + X25519_SHARE_LEN;
+    }
     put_u16(out, pos, EXT_KEY_SHARE); pos += 2;
-    // ext data: shares_len(2) + group(2) + key_len(2) + key(65)
-    put_u16(out, pos, 2 + 2 + 2 + 65); pos += 2;
-    put_u16(out, pos, 2 + 2 + 65); pos += 2; // client_shares length
+    put_u16(out, pos, (2 + shares_len) as u16); pos += 2; // ext data length
+    put_u16(out, pos, shares_len as u16); pos += 2; // client_shares length
+    if let Some(x) = x25519_pub {
+        put_u16(out, pos, GROUP_X25519); pos += 2;
+        put_u16(out, pos, X25519_SHARE_LEN as u16); pos += 2;
+        // SAFETY: pointer arithmetic over the handshake-state buffer;
+        // bounds checked against the message length before each deref.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                x.as_ptr(),
+                out.as_mut_ptr().add(pos),
+                X25519_SHARE_LEN,
+            );
+        }
+        pos += X25519_SHARE_LEN;
+    }
     put_u16(out, pos, GROUP_SECP256R1); pos += 2;
-    put_u16(out, pos, 65); pos += 2;
+    put_u16(out, pos, P256_SHARE_LEN as u16); pos += 2;
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
-    unsafe { core::ptr::copy_nonoverlapping(pub_key.as_ptr(), out.as_mut_ptr().add(pos), 65); }
-    pos += 65;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            pub_key.as_ptr(),
+            out.as_mut_ptr().add(pos),
+            P256_SHARE_LEN,
+        );
+    }
+    pos += P256_SHARE_LEN;
     pos
 }
 
@@ -1261,12 +1404,18 @@ fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
 
 /// supported_groups (RFC 8446 §4.2.7). A client offering a `key_share` MUST
 /// also advertise the named group here — OpenSSL/mosquitto strictly reject a
-/// ClientHello that omits it ("missing supported groups extension"). We offer
-/// the single group we key-share on (secp256r1 / P-256).
-fn write_ext_supported_groups(out: &mut [u8], mut pos: usize) -> usize {
+/// ClientHello that omits it ("missing supported groups extension"). The list
+/// is in preference order, so only the groups this client actually key-shares
+/// on are named: advertising one it cannot complete invites a
+/// HelloRetryRequest it would have to fail.
+fn write_ext_supported_groups(out: &mut [u8], mut pos: usize, x25519: bool) -> usize {
+    let count: usize = if x25519 { 2 } else { 1 };
     put_u16(out, pos, EXT_SUPPORTED_GROUPS); pos += 2;
-    put_u16(out, pos, 4); pos += 2; // ext data length
-    put_u16(out, pos, 2); pos += 2; // named_group_list length
+    put_u16(out, pos, (2 + count * 2) as u16); pos += 2; // ext data length
+    put_u16(out, pos, (count * 2) as u16); pos += 2; // named_group_list length
+    if x25519 {
+        put_u16(out, pos, GROUP_X25519); pos += 2;
+    }
     put_u16(out, pos, GROUP_SECP256R1); pos += 2;
     pos
 }
@@ -1611,8 +1760,8 @@ pub fn build_client_hello_psk(
     pos += 2;
     let ext_start = pos;
     pos = write_ext_supported_versions(out, pos);
-    pos = write_ext_supported_groups(out, pos);
-    pos = write_ext_key_share_client(out, pos, pub_key);
+    pos = write_ext_supported_groups(out, pos, false);
+    pos = write_ext_key_share_client(out, pos, pub_key, None);
     pos = write_ext_signature_algorithms(out, pos);
     pos = write_ext_alpn_client(out, pos, alpn);
     if !quic_tp.is_empty() {

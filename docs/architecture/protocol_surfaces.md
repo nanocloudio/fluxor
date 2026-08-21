@@ -60,7 +60,7 @@ Addresses are big-endian, ports little-endian.
 
 | Opcode | Name | Payload |
 |--------|------|---------|
-| `0x20` | `CMD_DG_BIND` | `[port: u16 LE][flags: u8]` — `BIND_FLAG_RX_ONLY` (0x01) is advisory |
+| `0x20` | `CMD_DG_BIND` | `[port: u16 LE][flags: u8][owner_tag: u16 LE]?` — `BIND_FLAG_RX_ONLY` (0x01) is advisory |
 | `0x21` | `CMD_DG_SEND_TO` | `[ep_id: u8][af: u8][addr: 4\|16 BE][port: u16 LE][data…]` |
 | `0x22` | `CMD_DG_CLOSE` | `[ep_id: u8]` |
 | `0x40` | `MSG_DG_BOUND` | `[ep_id: u8][local_port: u16 LE]` |
@@ -73,6 +73,16 @@ giving address prefixes of 8 (`V4_ADDR_PREFIX`) or 20
 (`V6_ADDR_PREFIX`) bytes before the payload. Every `CMD_DG_SEND_TO`
 carries an explicit destination; there is no connected-default TX
 form.
+
+`CMD_DG_SEND_TO` and `CMD_DG_CLOSE` have an owner-tagged form that
+inserts `[OWNER_TAG_MARK = 0xFF][owner_tag: u16 LE]` between `ep_id`
+and the rest — at the offset `af` occupies, a value no address family
+takes, so the two shapes separate at a fixed position rather than by a
+length rule over variable-length data. The provider admits a command
+only when the presented tag equals the tag `CMD_DG_BIND` recorded, and
+refuses a mismatch with `EPERM`. An absent tag decodes as 0, so an
+endpoint bound with `owner_tag = 0` accepts untagged commands from any
+consumer sharing the channel.
 
 ### Packet Surface
 

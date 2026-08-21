@@ -332,7 +332,7 @@ pub struct SchedulerState {
     /// Per-module capability class (checked on provider dispatch)
     pub(crate) cap_class: [u8; MAX_MODULES],
     /// Per-module required_caps bitmask from manifest — public contract bits only
-    pub(crate) required_caps: [u32; MAX_MODULES],
+    pub(crate) required_caps: [u64; MAX_MODULES],
     /// Per-module fine-grained permissions bitmap (from manifest binary
     /// byte 15). Gates privileged 0x0Cxx opcodes by category — see the
     /// `permission` module in `syscalls.rs`. Separate from `required_caps`
@@ -912,7 +912,7 @@ pub fn current_module_cap_class() -> u8 {
 /// Bit N set = module declared it needs contract id N in its manifest.
 /// Contract bits only — internal-orchestration permission is in
 /// `current_module_internal_permission`.
-pub fn current_module_required_caps() -> u32 {
+pub fn current_module_required_caps() -> u64 {
     let idx = current_module_index();
     // Same sentinel guard as current_module_cap_class (a live-added module's early
     // provider_call can read the "no module" sentinel index).
@@ -978,7 +978,7 @@ pub fn module_code_region(idx: usize) -> (usize, u32) {
 /// Set the capability class, required_caps, and permissions bitmap for
 /// a module (used by the Linux / bcm2712 platform loaders when they
 /// stage modules from their embedded images).
-pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u32, permissions: u16) {
+pub fn set_module_caps(idx: usize, cap_class: u8, required_caps: u64, permissions: u16) {
     if idx >= MAX_MODULES {
         return;
     }

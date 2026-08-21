@@ -89,7 +89,7 @@ fn cmd_info_fmod(file: &Path) -> Result<()> {
     if let Some(schema) = &m.schema {
         println!("  param_schema: {} bytes", schema.len());
     }
-    // Packed-header `required_caps` (bytes 66..70) — the value the KERNEL
+    // Packed-header `required_caps` (bytes 66..74) — the value the KERNEL
     // reads and the capability gate enforces at runtime. This is distinct
     // from the manifest-derived mask in the `manifest:` block below: the
     // latter is recomputed from `[[resources]]`, the former is what was
@@ -97,9 +97,11 @@ fn cmd_info_fmod(file: &Path) -> Result<()> {
     // mismatch (header 0x0 while the manifest declares contracts) means the
     // module was packed without its header caps populated, and every
     // `provider_call` to a declared contract will return ENOSYS at runtime.
-    if m.data.len() >= 70 {
-        let header_caps = u32::from_le_bytes([m.data[66], m.data[67], m.data[68], m.data[69]]);
-        println!("  header required_caps (runtime-enforced): 0x{header_caps:08x}");
+    if m.data.len() >= 74 {
+        let mut caps_bytes = [0u8; 8];
+        caps_bytes.copy_from_slice(&m.data[66..74]);
+        let header_caps = u64::from_le_bytes(caps_bytes);
+        println!("  header required_caps (runtime-enforced): 0x{header_caps:016x}");
     }
     println!("  manifest:");
     println!("{}", m.manifest.display());

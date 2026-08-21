@@ -99,30 +99,56 @@ unsafe fn pump_derive_handshake_keys_core(
     driver: &mut HandshakeDriver,
     bits_per_step: u8,
 ) -> Option<(TrafficKeys, TrafficKeys)> {
-    if !driver.ecdh_state.is_initialised() {
-        let new = match ecdh_shared_secret_init(
-            &driver.ecdh_private,
-            &driver.peer_key_share[..driver.peer_key_share_len as usize],
-            bits_per_step,
-        ) {
+    let shared = if driver.group == GROUP_X25519 {
+        // One constant-time ladder, cheap enough to finish inside a
+        // single tick — there is no partial state to carry.
+        if driver.peer_key_share_len as usize != X25519_SHARE_LEN {
+            driver.hs_state = HandshakeState::Error;
+            return None;
+        }
+        let mut peer_u = [0u8; X25519_SHARE_LEN];
+        core::ptr::copy_nonoverlapping(
+            driver.peer_key_share.as_ptr(),
+            peer_u.as_mut_ptr(),
+            X25519_SHARE_LEN,
+        );
+        match x25519_shared_secret(&driver.x25519_private, &peer_u) {
+            Some(v) => v,
+            None => {
+                // RFC 7748 §6.1 contributory behaviour: an all-zero
+                // output means the peer sent a small-order point and the
+                // secret carries none of our contribution. Treating it
+                // as a key would hand the session to whoever sent it.
+                driver.hs_state = HandshakeState::Error;
+                return None;
+            }
+        }
+    } else {
+        if !driver.ecdh_state.is_initialised() {
+            let new = match ecdh_shared_secret_init(
+                &driver.ecdh_private,
+                &driver.peer_key_share[..driver.peer_key_share_len as usize],
+                bits_per_step,
+            ) {
+                Some(v) => v,
+                None => {
+                    driver.hs_state = HandshakeState::Error;
+                    return None;
+                }
+            };
+            driver.ecdh_state = new;
+            return None;
+        }
+        if !driver.ecdh_state.complete() {
+            driver.ecdh_state.step();
+            return None;
+        }
+        match ecdh_shared_secret_finalise(&driver.ecdh_state) {
             Some(v) => v,
             None => {
                 driver.hs_state = HandshakeState::Error;
                 return None;
             }
-        };
-        driver.ecdh_state = new;
-        return None;
-    }
-    if !driver.ecdh_state.complete() {
-        driver.ecdh_state.step();
-        return None;
-    }
-    let shared = match ecdh_shared_secret_finalise(&driver.ecdh_state) {
-        Some(v) => v,
-        None => {
-            driver.hs_state = HandshakeState::Error;
-            return None;
         }
     };
     driver.ecdh_state.zeroise_scalar();
@@ -188,8 +214,12 @@ unsafe fn pump_recv_server_hello_core(driver: &mut HandshakeDriver) -> bool {
         return true;
     }
     driver.suite = match CipherSuite::from_id(sh.cipher_suite) {
-        Some(cs) => cs,
-        None => {
+        Some(cs) if suite_is_offered(sh.cipher_suite) => cs,
+        _ => {
+            // RFC 8446 §4.1.3: the server selects from the client's
+            // offer. A suite outside it is either a downgrade attempt or
+            // a broken peer; either way this endpoint declined to speak
+            // it, so it must not start now.
             driver.hs_state = HandshakeState::Error;
             return true;
         }
@@ -197,18 +227,30 @@ unsafe fn pump_recv_server_hello_core(driver: &mut HandshakeDriver) -> bool {
     if let Some(ref mut t) = driver.transcript {
         t.set_alg(driver.suite.hash_alg());
     }
+    // The server selects one group out of what was offered. A P-256
+    // share is admitted only if it decodes to a canonical, on-curve,
+    // non-identity point; an X25519 share is any 32-byte string, with
+    // the contributory-behaviour test applied to the agreement result
+    // (RFC 7748 §6.1). A group that was never offered, or a share of
+    // the wrong width for the group named, fails the handshake.
     match sh.key_share {
-        // The key share is a peer-supplied point; admit it only if
-        // it decodes to a canonical, on-curve, non-identity P-256
-        // point. Anything else falls through to the no-usable-share
-        // branch below rather than reaching the ECDH ladder.
-        Some((_, key_data)) if public_point_is_valid(key_data) => {
+        Some((GROUP_X25519, key_data)) if key_data.len() == X25519_SHARE_LEN => {
+            core::ptr::copy_nonoverlapping(
+                key_data.as_ptr(),
+                driver.peer_key_share.as_mut_ptr(),
+                X25519_SHARE_LEN,
+            );
+            driver.peer_key_share_len = X25519_SHARE_LEN as u8;
+            driver.group = GROUP_X25519;
+        }
+        Some((GROUP_SECP256R1, key_data)) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 driver.peer_key_share.as_mut_ptr(),
                 key_data.len(),
             );
             driver.peer_key_share_len = key_data.len() as u8;
+            driver.group = GROUP_SECP256R1;
         }
         _ => {
             driver.hs_state = HandshakeState::Error;
@@ -445,11 +487,14 @@ unsafe fn pump_recv_client_finished_core(driver: &mut HandshakeDriver) -> bool {
 
 /// Build + queue Certificate, update transcript, and transition to
 /// SendCertificateVerify.
-unsafe fn pump_send_certificate_core(
-    driver: &mut HandshakeDriver,
-    cert: &[u8],
-) -> bool {
+unsafe fn pump_send_certificate_core(driver: &mut HandshakeDriver, cert: &[u8]) -> bool {
     let msg_len = build_certificate(cert, &mut driver.scratch);
+    if msg_len == 0 {
+        // The chain does not fit a handshake message; there is no
+        // shorter one to send in its place.
+        driver.hs_state = HandshakeState::Error;
+        return false;
+    }
     if let Some(ref mut t) = driver.transcript {
         t.update(&driver.scratch[..msg_len]);
     }
@@ -465,11 +510,30 @@ unsafe fn pump_send_certificate_core(
 /// Build + queue ServerHello, update transcript, and transition to
 /// DeriveHandshakeKeys.
 unsafe fn pump_send_server_hello_core(driver: &mut HandshakeDriver) -> bool {
+    // The share is copied out first: it is echoed in the group the
+    // server selected, and the builder needs `scratch` mutably.
+    let mut share = [0u8; P256_SHARE_LEN];
+    let share_len = if driver.group == GROUP_X25519 {
+        core::ptr::copy_nonoverlapping(
+            driver.x25519_public.as_ptr(),
+            share.as_mut_ptr(),
+            X25519_SHARE_LEN,
+        );
+        X25519_SHARE_LEN
+    } else {
+        core::ptr::copy_nonoverlapping(
+            driver.ecdh_public.as_ptr(),
+            share.as_mut_ptr(),
+            P256_SHARE_LEN,
+        );
+        P256_SHARE_LEN
+    };
     let msg_len = build_server_hello(
         &driver.server_random,
         &driver.peer_session_id,
         driver.suite,
-        &driver.ecdh_public,
+        driver.group,
+        &share[..share_len],
         &mut driver.scratch,
     );
     if let Some(ref mut t) = driver.transcript {
@@ -488,11 +552,8 @@ unsafe fn pump_send_server_hello_core(driver: &mut HandshakeDriver) -> bool {
 /// synthetic `message_hash(CH1)` per RFC 8446 §4.4.1, and transition
 /// to RecvSecondClientHello.
 unsafe fn pump_send_hello_retry_core(driver: &mut HandshakeDriver) -> bool {
-    let msg_len = build_hello_retry_request(
-        &driver.peer_session_id,
-        driver.suite,
-        &mut driver.scratch,
-    );
+    let msg_len =
+        build_hello_retry_request(&driver.peer_session_id, driver.suite, &mut driver.scratch);
     if let Some(ref mut t) = driver.transcript {
         let ch1_hash = t.current_hash();
         let hl = driver.suite.hash_len();

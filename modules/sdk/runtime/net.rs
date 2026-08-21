@@ -227,26 +227,66 @@ unsafe fn parse_trace_ctx(
 // the single source of truth. Re-exported here under the `DG_` prefix that the
 // runtime helpers and the datagram modules use, so there is one definition of
 // each value, not two.
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_V4_PREFIX: usize = abi::contracts::net::datagram::V4_ADDR_PREFIX;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_CMD_BIND: u8 = abi::contracts::net::datagram::CMD_DG_BIND;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_CMD_SEND_TO: u8 = abi::contracts::net::datagram::CMD_DG_SEND_TO;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_CMD_CLOSE: u8 = abi::contracts::net::datagram::CMD_DG_CLOSE;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_MSG_BOUND: u8 = abi::contracts::net::datagram::MSG_DG_BOUND;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_MSG_RX_FROM: u8 = abi::contracts::net::datagram::MSG_DG_RX_FROM;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_MSG_CLOSED: u8 = abi::contracts::net::datagram::MSG_DG_CLOSED;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_MSG_ERROR: u8 = abi::contracts::net::datagram::MSG_DG_ERROR;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_AF_INET: u8 = abi::contracts::net::datagram::AF_INET;
-#[allow(dead_code, reason = "re-exported datagram surface; each consumer uses a subset")]
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
 const DG_AF_INET6: u8 = abi::contracts::net::datagram::AF_INET6;
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
+const DG_OWNER_TAG_MARK: u8 = abi::contracts::net::datagram::OWNER_TAG_MARK;
+#[allow(
+    dead_code,
+    reason = "re-exported datagram surface; each consumer uses a subset"
+)]
+const DG_OWNER_TAG_FIELD: usize = abi::contracts::net::datagram::OWNER_TAG_FIELD;
 
 /// Build and emit a `CMD_DG_SEND_TO` frame for an IPv4 destination.
 /// Layout:
@@ -283,10 +323,61 @@ unsafe fn dev_dg_send_to_v4(
     scratch: *mut u8,
     scratch_max: usize,
 ) -> usize {
+    dev_dg_send_to_v4_owned(
+        sys,
+        chan,
+        ep_id,
+        0,
+        dst_ip,
+        dst_port,
+        data,
+        data_len,
+        scratch,
+        scratch_max,
+    )
+}
+
+/// Owner-tag-carrying form of [`dev_dg_send_to_v4`]. `owner_tag` is the tag the
+/// endpoint was bound with; the provider admits the command only when it equals
+/// the recorded one and answers `EPERM` otherwise. `owner_tag == 0` emits the
+/// untagged shape — the tag field is absent, and the bytes on the wire are
+/// exactly those of the untagged form.
+///
+/// Owner-tagged layout:
+///   `[0x21][len:2 LE][ep_id:1][MARK][owner_tag:2 LE][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]`
+///
+/// The marker sits where `af` sits and is no defined address family, so the two
+/// shapes separate at a fixed offset rather than by a length rule over the
+/// variable-length tail.
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "datagram send wire-shape: signature mirrors the on-wire datagram envelope fields"
+)]
+unsafe fn dev_dg_send_to_v4_owned(
+    sys: &SyscallTable,
+    chan: i32,
+    ep_id: u8,
+    owner_tag: u16,
+    dst_ip: u32,
+    dst_port: u16,
+    data: *const u8,
+    data_len: usize,
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
     if chan < 0 || ep_id == 0xFF {
         return 0;
     }
-    let body_len = DG_V4_PREFIX + data_len;
+    let tag_len = if owner_tag == 0 {
+        0
+    } else {
+        DG_OWNER_TAG_FIELD
+    };
+    let body_len = DG_V4_PREFIX + tag_len + data_len;
     let total = NET_FRAME_HDR + body_len;
     if total > scratch_max {
         return 0;
@@ -297,17 +388,28 @@ unsafe fn dev_dg_send_to_v4(
     *scratch.add(1) = pl[0];
     *scratch.add(2) = pl[1];
     *scratch.add(3) = ep_id;
-    *scratch.add(4) = DG_AF_INET;
+    if tag_len != 0 {
+        let tb = owner_tag.to_le_bytes();
+        *scratch.add(4) = DG_OWNER_TAG_MARK;
+        *scratch.add(5) = tb[0];
+        *scratch.add(6) = tb[1];
+    }
+    let af_at = NET_FRAME_HDR + 1 + tag_len;
+    *scratch.add(af_at) = DG_AF_INET;
     let ip_bytes = dst_ip.to_be_bytes();
-    *scratch.add(5) = ip_bytes[0];
-    *scratch.add(6) = ip_bytes[1];
-    *scratch.add(7) = ip_bytes[2];
-    *scratch.add(8) = ip_bytes[3];
+    *scratch.add(af_at + 1) = ip_bytes[0];
+    *scratch.add(af_at + 2) = ip_bytes[1];
+    *scratch.add(af_at + 3) = ip_bytes[2];
+    *scratch.add(af_at + 4) = ip_bytes[3];
     let port_bytes = dst_port.to_le_bytes();
-    *scratch.add(9) = port_bytes[0];
-    *scratch.add(10) = port_bytes[1];
+    *scratch.add(af_at + 5) = port_bytes[0];
+    *scratch.add(af_at + 6) = port_bytes[1];
     if data_len > 0 && !data.is_null() {
-        core::ptr::copy_nonoverlapping(data, scratch.add(NET_FRAME_HDR + DG_V4_PREFIX), data_len);
+        core::ptr::copy_nonoverlapping(
+            data,
+            scratch.add(NET_FRAME_HDR + DG_V4_PREFIX + tag_len),
+            data_len,
+        );
     }
     // Honour backpressure: a datagram frame is atomic, so anything short of the
     // full `total` means the channel rejected it. Return 0 so the caller keeps
@@ -352,4 +454,3 @@ unsafe fn parse_dg_rx_from_v4(
     let data_len = payload_len - DG_V4_PREFIX;
     Some((ep_id, src_ip, src_port, data_ptr, data_len))
 }
-

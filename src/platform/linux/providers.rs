@@ -951,6 +951,13 @@ const DG_MSG_CLOSED: u8 = 0x42;
 )]
 const DG_MSG_ERROR: u8 = 0x43;
 const DG_AF_INET: u8 = 4;
+/// Marker introducing the owner tag on `DG_CMD_SEND_TO` / `DG_CMD_CLOSE`. It
+/// sits at the offset that otherwise carries `af`, and is distinct from every
+/// defined address family, so the tagged and untagged shapes separate at a
+/// fixed offset rather than by a length rule over variable-length data.
+const DG_OWNER_TAG_MARK: u8 = 0xFF;
+/// Bytes the owner-tag field occupies: `[MARK][owner_tag: u16 LE]`.
+const DG_OWNER_TAG_FIELD: usize = 3;
 
 const CONN_TYPE_UDP_BOUND: u8 = 2;
 
@@ -1002,6 +1009,11 @@ struct LinuxNetConn {
     /// attribution is carried via the lane, never inferred from the executing
     /// module, which may be system-owned). Immutable for the life of the slot.
     owner: crate::kernel::workload::owner::OwnerHandle,
+    /// Datagram endpoints only: the `owner_tag` the consumer stamped on
+    /// `DG_CMD_BIND`. `DG_CMD_SEND_TO` / `DG_CMD_CLOSE` must present the same
+    /// value or the command is refused with `EPERM`. Zero is the host
+    /// wildcard, reachable by the untagged shape.
+    dg_owner_tag: u16,
     write_buf: [u8; LINUX_NET_WRITE_BUF],
 }
 
@@ -1015,6 +1027,7 @@ impl LinuxNetConn {
         write_len: 0,
         connect_tag: 0,
         owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+        dg_owner_tag: 0,
         write_buf: [0u8; LINUX_NET_WRITE_BUF],
     };
 }
@@ -1466,7 +1479,22 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
 // Datagram surface — UDP bind / send_to / recvfrom on the same channel
 // ----------------------------------------------------------------------
 
-unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
+/// Decode the optional owner tag at the head of a `DG_CMD_SEND_TO` /
+/// `DG_CMD_CLOSE` payload. Returns `(claimed_tag, offset_of_next_field)` —
+/// the offset is `1` for the untagged shape, so an untagged command decodes
+/// exactly as it did before the tag existed. An absent tag reads as 0.
+fn dg_claimed_owner_tag(payload: &[u8]) -> (u16, usize) {
+    if payload.len() > DG_OWNER_TAG_FIELD && payload[1] == DG_OWNER_TAG_MARK {
+        (
+            u16::from_le_bytes([payload[2], payload[3]]),
+            1 + DG_OWNER_TAG_FIELD,
+        )
+    } else {
+        (0, 1)
+    }
+}
+
+unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u16, lane: usize) {
     let commander = st.lane_owners[lane];
     if let Some(errno) = linux_net_new_bind_refusal(commander, 2, port) {
         linux_net_send_bind_refused(st, port, errno);
@@ -1525,6 +1553,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) 
         state: 3,
         port,
         owner: commander,
+        dg_owner_tag: owner_tag,
         ..LinuxNetConn::EMPTY
     };
     log::info!("[linux_net] UDP bound port {port} (slot {idx})");
@@ -1540,8 +1569,9 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) 
 }
 
 unsafe fn linux_net_dg_cmd_send_to(
-    st: &LinuxNetState,
+    st: &mut LinuxNetState,
     ep: i16,
+    claimed_tag: u16,
     ip: [u8; 4],
     port: u16,
     data: &[u8],
@@ -1550,8 +1580,18 @@ unsafe fn linux_net_dg_cmd_send_to(
         return;
     }
     let idx = ep as usize;
-    let conn = &st.conns[idx];
-    if conn.state != 3 || conn.conn_type != CONN_TYPE_UDP_BOUND || conn.fd < 0 {
+    let (state, conn_type, fd, bound_tag) = {
+        let c = &st.conns[idx];
+        (c.state, c.conn_type, c.fd, c.dg_owner_tag)
+    };
+    if state != 3 || conn_type != CONN_TYPE_UDP_BOUND || fd < 0 {
+        return;
+    }
+    // `ep` is an index, not an authority: the command channel merges every
+    // producer into one stream and carries no producer identity. The tag
+    // recorded at bind is what says who holds the endpoint.
+    if bound_tag != claimed_tag {
+        linux_net_send_dg_error(st, 1); // EPERM
         return;
     }
     let mut addr: libc::sockaddr_in = core::mem::zeroed();
@@ -1559,7 +1599,7 @@ unsafe fn linux_net_dg_cmd_send_to(
     addr.sin_port = port.to_be();
     addr.sin_addr.s_addr = u32::from_le_bytes([ip[0], ip[1], ip[2], ip[3]]);
     libc::sendto(
-        conn.fd,
+        fd,
         data.as_ptr() as *const libc::c_void,
         data.len(),
         libc::MSG_NOSIGNAL,
@@ -1568,11 +1608,16 @@ unsafe fn linux_net_dg_cmd_send_to(
     );
 }
 
-unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16) {
+unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16, claimed_tag: u16) {
     if ep < 0 || (ep as usize) >= LINUX_NET_MAX_CONNS {
         return;
     }
     let idx = ep as usize;
+    // Close is the destructive half of the same authority question as send.
+    if st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND && st.conns[idx].dg_owner_tag != claimed_tag {
+        linux_net_send_dg_error(st, 1); // EPERM
+        return;
+    }
     if st.conns[idx].fd >= 0 && st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND {
         libc::close(st.conns[idx].fd);
     }
@@ -2263,27 +2308,52 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                         }
                         DG_CMD_BIND if payload_len >= 3 => {
                             // Payload (modules/sdk/contracts/net/datagram.rs):
-                            //   [port: u16 LE] [flags: u8].
+                            //   [port: u16 LE] [flags: u8] [owner_tag: u16 LE]?
+                            // A bind that omits the tag records tag 0.
                             let port = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);
-                            linux_net_dg_cmd_bind(st, port, lane);
+                            let owner_tag = if payload_len >= 5 {
+                                u16::from_le_bytes([st.cmd_buf[3], st.cmd_buf[4]])
+                            } else {
+                                0
+                            };
+                            linux_net_dg_cmd_bind(st, port, owner_tag, lane);
                             had_work = true;
                         }
                         DG_CMD_SEND_TO if payload_len >= 8 => {
                             // IPv4 payload (datagram contract):
-                            //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...].
+                            //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...]
+                            // The owner-tagged form inserts [MARK][owner_tag:2 LE]
+                            // between `ep_id` and `af`.
+                            let (claimed_tag, dest_off) =
+                                dg_claimed_owner_tag(&st.cmd_buf[..payload_len]);
+                            if payload_len < dest_off + 7 {
+                                had_work = true;
+                                continue;
+                            }
                             let ep = st.cmd_buf[0] as i16;
-                            let ip = [st.cmd_buf[2], st.cmd_buf[3], st.cmd_buf[4], st.cmd_buf[5]];
-                            let port = u16::from_le_bytes([st.cmd_buf[6], st.cmd_buf[7]]);
-                            let data_len = payload_len - 8;
-                            let data =
-                                core::slice::from_raw_parts(st.cmd_buf.as_ptr().add(8), data_len);
-                            linux_net_dg_cmd_send_to(st, ep, ip, port, data);
+                            let ap = dest_off + 1;
+                            let ip = [
+                                st.cmd_buf[ap],
+                                st.cmd_buf[ap + 1],
+                                st.cmd_buf[ap + 2],
+                                st.cmd_buf[ap + 3],
+                            ];
+                            let port = u16::from_le_bytes([st.cmd_buf[ap + 4], st.cmd_buf[ap + 5]]);
+                            let data_off = dest_off + 7;
+                            let data_len = payload_len - data_off;
+                            let data = core::slice::from_raw_parts(
+                                st.cmd_buf.as_ptr().add(data_off),
+                                data_len,
+                            );
+                            linux_net_dg_cmd_send_to(st, ep, claimed_tag, ip, port, data);
                             had_work = true;
                         }
                         DG_CMD_CLOSE if payload_len >= 1 => {
-                            // Payload: [ep_id: u8].
+                            // Payload: [ep_id: u8], or the owner-tagged form
+                            // [ep_id: u8][MARK][owner_tag: u16 LE].
+                            let (claimed_tag, _) = dg_claimed_owner_tag(&st.cmd_buf[..payload_len]);
                             let ep = st.cmd_buf[0] as i16;
-                            linux_net_dg_cmd_close(st, ep);
+                            linux_net_dg_cmd_close(st, ep, claimed_tag);
                             had_work = true;
                         }
                         _ => {

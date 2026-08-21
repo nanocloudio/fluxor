@@ -2,49 +2,68 @@
 // Pure Rust, no_std, no heap
 // Field arithmetic over p = 2^256 - 2^224 + 2^192 + 2^96 - 1
 //
-// # Timing exposure
+// # Timing
 //
-// This implementation is NOT constant-time, at three separate levels.
-// Named helpers whose identifiers begin `ct_` are individually
-// branchless and do what their names say; they do not make the
-// operations built on top of them constant-time.
+// Every layer that touches secret material is constant-time in its
+// operands. Stated per layer, because a blanket claim asserts more
+// than a reader can check against the code:
 //
-//   1. Field and scalar arithmetic. `fp_add`, `fp_sub`, `mod_p`,
-//      `mod_n_reduce` and `fn_add` branch on the carry or borrow of
-//      secret operands. `fp_reduce` runs two `while` loops whose trip
-//      counts depend on the value being reduced, and `fn_reduce_wide`
-//      iterates until the high limbs clear — so a single field
-//      multiply takes a value-dependent number of iterations. Every
-//      point operation and both scalar-multiplication paths are built
-//      out of these, so the exposure is present on every ECDH
-//      agreement and every ECDSA signature.
-//   2. Point arithmetic. `add_jacobian` and `add_affine`
-//      short-circuit on identity inputs and on the doubling case,
-//      which are branches on secret-derived values.
-//   3. Inversion. `fp_inv` and `fn_inv` are square-and-multiply over a
-//      public exponent, so their own control flow is fine, but each of
-//      their ~512 multiplies is value-dependent per (1). `fn_inv` is
-//      applied to the ECDSA nonce `k`.
+//   1. Field and scalar arithmetic — constant-time. `mod_p`, `fp_add`,
+//      `fp_sub`, `mod_n_reduce` and `fn_add` compute the correction
+//      unconditionally and select it with `ct_select_u256` on a
+//      carry/borrow mask. `fp_reduce` applies a fixed five masked
+//      additions then eight masked subtractions instead of correcting
+//      in value-dependent loops, and `fn_reduce_wide` folds a fixed
+//      sixteen passes. A field multiply therefore costs the same
+//      whatever it multiplies.
+//   2. Point arithmetic — constant-time. `double` has no exceptional
+//      case to branch on, and `add_jacobian`/`add_affine` compute the
+//      generic add, the doubling and the identity outcomes and choose
+//      between them with masked selects, at the cost of one extra
+//      doubling per addition.
+//   3. Inversion — constant-time. `fp_inv` and `fn_inv` are
+//      square-and-multiply over the public exponents p-2 and n-2, so
+//      the schedule was never secret, and each of their ~512
+//      multiplies is fixed-cost per (1). `fn_inv` is applied to
+//      the ECDSA nonce `k`.
 //
-// Two scalar-multiplication paths, both affected:
+// Two scalar-multiplication paths, both constant-time in the scalar:
 //
 //   - `scalar_mul_ct` (one-shot, used by ECDH + ECDSA): fixed-window
-//     w=4 with a branchless table lookup. Same shape as BoringSSL /
-//     ring / OpenSSL, but those pair the lookup with complete or
-//     exception-free formulas; here the underlying `add_jacobian`
-//     short-circuits leak the location of zero nibbles in the secret
-//     scalar. See the function's docstring.
-//   - `ScalarMulState` (resumable, used when the kernel needs to
-//     yield mid-multiplication): per-bit Montgomery ladder. The
-//     `step()` API processes `bits_per_step` bits at a time so a
-//     concurrent handshake doesn't have to wait for the whole
-//     scalar multiplication to finish. The ladder's swap is
-//     branchless, but the add and double it drives are not, and
-//     leading zero bits of the scalar hit the identity short-circuit.
+//     w=4 with a branchless table lookup, four doublings and one
+//     addition per window regardless of the nibble. Same shape as
+//     BoringSSL / ring / OpenSSL.
+//   - `ScalarMulState` (resumable, used when the kernel needs to yield
+//     mid-multiplication): per-bit Montgomery ladder, one add and one
+//     double per bit with a branchless swap. The `step()` API
+//     processes `bits_per_step` bits at a time so a concurrent
+//     handshake doesn't have to wait for the whole scalar
+//     multiplication to finish; how the work is divided across ticks
+//     is a scheduling choice and does not depend on the scalar.
 //
-// `ed25519.rs` in this directory is the constant-time signature
-// primitive: complete unified formulas, branchless field arithmetic,
-// branchless table lookup, no identity special cases.
+// Named exceptions, none of them in the arithmetic stack:
+//
+//   - `rfc6979_nonce` retries when a candidate falls outside [1, n-1],
+//     so its duration reveals how many candidates were rejected. That
+//     is the RFC 6979 construction itself, and the retry probability is
+//     about 2^-32 per attempt.
+//   - `decode_private_scalar` and `decode_public_point` branch on
+//     whether an input is admissible. That decision is reported to the
+//     caller regardless.
+//   - The low-s normalisation in `ecdsa_sign` branches on `s`, which is
+//     half of the signature it is about to publish.
+//   - ECDSA *verification* is deliberately variable-time; it handles
+//     only public inputs (peer public key, message, signature).
+//
+// Not claimed: that the emitted machine code is constant-time. These
+// are source-level properties — no `black_box`-style barriers are
+// placed against an optimiser reintroducing a branch, and nothing in
+// the tree measures cycle counts.
+//
+// `ed25519.rs` in this directory is the other constant-time signature
+// primitive, and carries X25519 for key agreement: complete unified
+// formulas, branchless field arithmetic, branchless table lookup, no
+// identity special cases.
 //
 // ECDSA signing uses RFC 6979 deterministic nonces and normalises
 // signatures to low-s form. Intermediate secrets are zeroised via
@@ -148,7 +167,9 @@ fn u256_add(a: &U256, b: &U256) -> (U256, u64) {
     (r, carry)
 }
 
-/// a - b, returns (result, borrow)
+/// a - b, returns (result, borrow). Branchless: the borrow-out of each
+/// limb is bit 64 of the u128 difference, which is set exactly when the
+/// subtraction wrapped.
 #[inline]
 fn u256_sub(a: &U256, b: &U256) -> (U256, u64) {
     let mut r = [0u64; 4];
@@ -157,10 +178,7 @@ fn u256_sub(a: &U256, b: &U256) -> (U256, u64) {
     while i < 4 {
         let diff = (a[i] as u128).wrapping_sub(b[i] as u128).wrapping_sub(borrow as u128);
         r[i] = diff as u64;
-        borrow = if diff > (a[i] as u128) + (!borrow as u128) + 1 { 1 } else {
-            // Check if borrow occurred: if a < b + prev_borrow
-            if (a[i] as u128) < (b[i] as u128) + (borrow as u128) { 1 } else { 0 }
-        };
+        borrow = ((diff >> 64) & 1) as u64;
         i += 1;
     }
     (r, borrow)
@@ -192,44 +210,43 @@ fn u256_is_zero(a: &U256) -> bool {
 // ============================================================================
 // Modular arithmetic mod p (P-256 prime).
 //
-// None of the routines in this section are constant-time. Each
-// conditional correction below (`mod_p`, `fp_add`, `fp_sub`) selects on
-// the carry or borrow of its operands, and `fp_reduce` corrects with
-// value-dependent loops. Operands are secret on every ECDH agreement
-// and ECDSA signature, so the whole layer carries the exposure noted
-// at the top of this file.
+// Every routine in this section is constant-time in its operands.
+// `mod_p`, `fp_add` and `fp_sub` compute both the corrected and the
+// uncorrected value and choose between them with `ct_select_u256` on a
+// mask built from the carry or borrow; `fp_reduce` performs a fixed
+// number of masked corrections rather than looping until the value is
+// in range. Trip counts and memory addresses here are independent of
+// the operands, which are secret on every ECDH agreement and ECDSA
+// signature.
 // ============================================================================
 
-/// Reduce mod p. Selects between `a - p` and `a` on the subtraction
-/// borrow, i.e. on a secret-derived value.
+/// Reduce mod p, for `a < 2p`. Computes `a - p` and selects it over `a`
+/// on the subtraction borrow; the borrow is 1 exactly when `a < p`.
 fn mod_p(a: &U256) -> U256 {
     let p = load_p();
     let (r, borrow) = u256_sub(a, &p);
-    if borrow == 0 { r } else { *a }
+    ct_select_u256(&r, a, borrow.wrapping_neg())
 }
 
-/// Modular addition: (a + b) mod p
+/// Modular addition: (a + b) mod p. The correction is always computed
+/// and selected under a mask.
 fn fp_add(a: &U256, b: &U256) -> U256 {
     let p = load_p();
     let (sum, carry) = u256_add(a, b);
-    if carry != 0 || u256_gte(&sum, &p) != 0 {
-        let (r, _) = u256_sub(&sum, &p);
-        r
-    } else {
-        sum
-    }
+    let (corrected, _) = u256_sub(&sum, &p);
+    // Subtract p when the 256-bit sum overflowed or is already >= p.
+    // Both `carry` and `u256_gte` are 0/1 and neither is branched on.
+    let need = carry | u256_gte(&sum, &p);
+    ct_select_u256(&sum, &corrected, need.wrapping_neg())
 }
 
-/// Modular subtraction: (a - b) mod p
+/// Modular subtraction: (a - b) mod p. The correction is always
+/// computed and selected under a mask.
 fn fp_sub(a: &U256, b: &U256) -> U256 {
     let p = load_p();
     let (diff, borrow) = u256_sub(a, b);
-    if borrow != 0 {
-        let (r, _) = u256_add(&diff, &p);
-        r
-    } else {
-        diff
-    }
+    let (corrected, _) = u256_add(&diff, &p);
+    ct_select_u256(&diff, &corrected, borrow.wrapping_neg())
 }
 
 /// 256×256 → 512 bit multiplication
@@ -381,29 +398,46 @@ fn fp_reduce(t: &[u64; 8]) -> U256 {
         (acc[6] as u64) | ((acc[7] as u64) << 32),
     ];
 
-    // Handle negative carry (add p) or excess (subtract p)
+    // Fixed-trip-count correction. The value being reduced is
+    //   V = carry·2^256 + result
+    // with `carry` signed. The NIST sum above adds at most
+    // (1 + 2 + 2 + 1 + 1) = 7 and subtracts at most 4 full 256-bit
+    // terms, so V lies in (-4·2^256, 7·2^256).
+    //
+    // Both phases run a fixed number of iterations and apply their
+    // correction under a mask, so neither the trip count nor the
+    // branch pattern depends on V.
     let p = load_p();
-    if carry < 0 {
-        let mut c = carry;
-        while c < 0 {
-            let (r, _) = u256_add(&result, &p);
-            result = r;
-            c += 1;
-        }
-    } else {
-        let mut c = carry;
-        while c > 0 {
-            let (r, _) = u256_sub(&result, &p);
-            result = r;
-            c -= 1;
-        }
+
+    // Phase 1 — lift V to non-negative. Adding p when V < 0 preserves
+    // the invariant either way: if `result + p` overflows, the carry-out
+    // cancels one unit of 2^256, otherwise `carry` is unchanged and the
+    // whole value still rises by p. Since p > 0.99·2^256 and
+    // V > -4·2^256, five additions always suffice.
+    let mut i2 = 0;
+    while i2 < 5 {
+        // All-ones exactly when `carry` is negative.
+        let neg = (carry >> 63) as u64;
+        let (sum, carry_out) = u256_add(&result, &p);
+        result = ct_select_u256(&result, &sum, neg);
+        carry = carry.wrapping_add((carry_out & neg & 1) as i64);
+        i2 += 1;
     }
 
-    // Final reduction
-    while u256_gte(&result, &p) != 0 {
-        let (r, borrow) = u256_sub(&result, &p);
-        if borrow != 0 { break; }
-        result = r;
+    // Phase 2 — bring V below p. V is now in [0, 7·2^256), i.e. under
+    // 7.01·p, so eight masked subtractions always suffice. The
+    // condition is "carry is non-zero" (then V >= 2^256 > p) "or the
+    // low 256 bits are already >= p".
+    let mut i3 = 0;
+    while i3 < 8 {
+        let c = carry as u64;
+        // All-ones when `carry != 0`.
+        let carry_nonzero = !ct_eq_u64(c, 0);
+        let need = carry_nonzero | u256_gte(&result, &p).wrapping_neg();
+        let (diff, borrow) = u256_sub(&result, &p);
+        result = ct_select_u256(&result, &diff, need);
+        carry = carry.wrapping_sub((borrow & need & 1) as i64);
+        i3 += 1;
     }
 
     result
@@ -520,30 +554,27 @@ fn fp_inv(a: &U256) -> U256 {
 // ============================================================================
 // Modular arithmetic mod n (curve order).
 //
-// Not constant-time, for the same reasons as the mod-p section:
-// conditional corrections selected on secret-derived carries and
-// borrows, and a value-dependent fold loop in `fn_reduce_wide`. This
-// layer carries the ECDSA nonce and the private scalar.
+// Constant-time in its operands, on the same terms as the mod-p
+// section: masked corrections instead of conditional ones, and a
+// fixed-trip-count fold in `fn_reduce_wide`. This layer carries the
+// ECDSA nonce and the private scalar, so that property is load-bearing
+// rather than hygiene.
 // ============================================================================
 
+/// Reduce mod n, for `a < 2n`. Since `n > 2^255`, any 256-bit input
+/// satisfies that, so one masked conditional subtraction is exact.
 fn mod_n_reduce(a: &U256) -> U256 {
     let n = load_n();
-    if u256_gte(a, &n) != 0 {
-        let (r, borrow) = u256_sub(a, &n);
-        if borrow == 0 { return r; }
-    }
-    *a
+    let (r, borrow) = u256_sub(a, &n);
+    ct_select_u256(&r, a, borrow.wrapping_neg())
 }
 
 fn fn_add(a: &U256, b: &U256) -> U256 {
     let n = load_n();
     let (sum, carry) = u256_add(a, b);
-    if carry != 0 || u256_gte(&sum, &n) != 0 {
-        let (r, _) = u256_sub(&sum, &n);
-        r
-    } else {
-        sum
-    }
+    let (corrected, _) = u256_sub(&sum, &n);
+    let need = carry | u256_gte(&sum, &n);
+    ct_select_u256(&sum, &corrected, need.wrapping_neg())
 }
 
 fn fn_mul(a: &U256, b: &U256) -> U256 {
@@ -555,13 +586,15 @@ fn fn_mul(a: &U256, b: &U256) -> U256 {
 
 /// Reduce a 512-bit value mod n.
 ///
-/// Variable-time: the fold loop runs until the high four limbs are
-/// zero (capped at 16 passes), so the iteration count depends on the
-/// value. `fn_mul` and `fn_inv` both reduce here, and `fn_inv` is
-/// applied to the ECDSA nonce `k`, so the signing path's duration is a
-/// function of secret material. Partial nonce leakage is the input to
-/// the standard hidden-number-problem key recovery, so this is not a
-/// bounded disclosure — see the note on `scalar_mul_ct`.
+/// Constant-time: the fold runs a fixed 16 passes whatever the value.
+/// A pass whose high half is already zero multiplies by zero and adds
+/// the low half back unchanged, so running the full count is
+/// idempotent once the value has converged — the cost is fixed rather
+/// than data-dependent. `fn_mul` and `fn_inv` both reduce here and
+/// `fn_inv` is applied to the ECDSA nonce `k`, so a value-dependent
+/// trip count would have made the signing path's duration a function
+/// of the nonce, which is the input to hidden-number-problem key
+/// recovery.
 fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     // Reduce 512-bit value t mod n using iterative: t_hi * R + t_lo
     // R = 2^256 - n (small, ~128 bits)
@@ -575,12 +608,16 @@ fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe { core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8); }
 
-    // Each iteration: acc = acc_lo + acc_hi * R
-    // Convergence: ~128 bits per iteration (R is ~128 bits)
-    // 512 bits → need ~4 iterations (512→384→256+→256→done)
-    // But some products produce larger intermediates, need up to 10
+    // Each iteration: acc = acc_lo + acc_hi * R.
+    //
+    // R = 2^256 - n is just under 2^224, so one pass takes a value of
+    // bit length B to about B - 31. Sixteen passes therefore carry any
+    // 512-bit input down below 2^256 with margin, and passes beyond
+    // convergence are no-ops (acc_hi = 0 ⇒ the product is 0 and acc_lo
+    // is copied back). The loop is unconditional so the trip count
+    // does not depend on the value.
     let mut iters = 0;
-    while (acc[4] | acc[5] | acc[6] | acc[7]) != 0 && iters < 16 {
+    while iters < 16 {
         let lo: U256 = [acc[0], acc[1], acc[2], acc[3]];
         let hi: U256 = [acc[4], acc[5], acc[6], acc[7]];
         let prod = u256_mul_wide(&hi, &r_mod);
@@ -762,28 +799,25 @@ impl JacobianPoint {
 
     /// Point addition (mixed: Q is affine with Z=1).
     ///
-    /// Three data-dependent branches: identity input, `h == 0` with
-    /// `r == 0` (the doubling case), and `h == 0` with `r != 0` (the
-    /// inverse case). Each takes a different amount of work, so the
-    /// duration of the call reveals which case the inputs fell into.
+    /// Exception-free by evaluation rather than by formula: the generic
+    /// add and the doubling are both computed unconditionally, and the
+    /// four outcomes — P is identity, `h == 0 && r == 0` (doubling),
+    /// `h == 0 && r != 0` (inverse points, result is identity), and the
+    /// generic case — are chosen between with masked selects. No input
+    /// value selects a control-flow edge or a load address, so the
+    /// duration of the call does not reveal which case the inputs fell
+    /// into.
+    ///
+    /// The cost of that is one extra doubling per addition. In
+    /// `scalar_mul_ct` an addition is one of five point operations per
+    /// window, so the overhead is bounded by about a fifth.
     fn add_affine(&self, qx: &U256, qy: &U256) -> Self {
-        if self.is_identity() {
-            return JacobianPoint::from_affine(qx, qy);
-        }
-
         let z1z1 = fp_sqr(&self.z);
         let u2 = fp_mul(qx, &z1z1);
         let s2 = fp_mul(qy, &fp_mul(&self.z, &z1z1));
 
         let h = fp_sub(&u2, &self.x);
         let r = fp_sub(&s2, &self.y);
-
-        if u256_is_zero(&h) {
-            if u256_is_zero(&r) {
-                return self.double();
-            }
-            return JacobianPoint::identity();
-        }
 
         let hh = fp_sqr(&h);
         let hhh = fp_mul(&h, &hh);
@@ -792,8 +826,18 @@ impl JacobianPoint {
         let x3 = fp_sub(&fp_sub(&fp_sqr(&r), &hhh), &fp_add(&v, &v));
         let y3 = fp_sub(&fp_mul(&r, &fp_sub(&v, &x3)), &fp_mul(&self.y, &hhh));
         let z3 = fp_mul(&self.z, &h);
+        let generic = JacobianPoint { x: x3, y: y3, z: z3 };
 
-        JacobianPoint { x: x3, y: y3, z: z3 }
+        let h_zero = ct_is_zero_u256(&h);
+        let r_zero = ct_is_zero_u256(&r);
+        let self_id = ct_is_zero_u256(&self.z);
+
+        // h == 0, r != 0 → P and Q are inverses → identity.
+        let out = ct_select_point(&generic, &JacobianPoint::identity(), h_zero);
+        // h == 0, r == 0 → P == Q → doubling.
+        let out = ct_select_point(&out, &self.double(), h_zero & r_zero);
+        // P is the identity → the result is Q, whatever the above said.
+        ct_select_point(&out, &JacobianPoint::from_affine(qx, qy), self_id)
     }
 
     /// Full Jacobian-Jacobian point addition (both points in Jacobian
@@ -802,20 +846,14 @@ impl JacobianPoint {
     /// add — `add_affine` only handles the case where the right-hand
     /// side is in affine form.
     ///
-    /// Same exceptional-case branches as `add_affine`, plus a second
-    /// identity test on the right-hand operand. In `scalar_mul_ct`
-    /// that operand is the table entry selected by a secret scalar
-    /// nibble and `table[0]` is the identity, so a zero nibble takes
-    /// the short-circuit and a non-zero nibble does not. See the
-    /// exposure note on `scalar_mul_ct`.
+    /// Exception-free on the same terms as `add_affine`, with a second
+    /// identity test on the right-hand operand. That operand matters:
+    /// in `scalar_mul_ct` it is the table entry selected by a secret
+    /// scalar nibble and `table[0]` is the identity, so under the old
+    /// short-circuit the position of every zero nibble of the scalar
+    /// was visible in the timing profile. All five outcomes are now
+    /// computed and selected under masks.
     fn add_jacobian(&self, other: &JacobianPoint) -> Self {
-        if self.is_identity() {
-            return JacobianPoint { x: other.x, y: other.y, z: other.z };
-        }
-        if other.is_identity() {
-            return JacobianPoint { x: self.x, y: self.y, z: self.z };
-        }
-
         let z1z1 = fp_sqr(&self.z);
         let z2z2 = fp_sqr(&other.z);
         let u1 = fp_mul(&self.x, &z2z2);
@@ -826,13 +864,6 @@ impl JacobianPoint {
         let h = fp_sub(&u2, &u1);
         let r = fp_sub(&s2, &s1);
 
-        if u256_is_zero(&h) {
-            if u256_is_zero(&r) {
-                return self.double();
-            }
-            return JacobianPoint::identity();
-        }
-
         let hh = fp_sqr(&h);
         let hhh = fp_mul(&h, &hh);
         let v = fp_mul(&u1, &hh);
@@ -840,8 +871,23 @@ impl JacobianPoint {
         let x3 = fp_sub(&fp_sub(&fp_sqr(&r), &hhh), &fp_add(&v, &v));
         let y3 = fp_sub(&fp_mul(&r, &fp_sub(&v, &x3)), &fp_mul(&s1, &hhh));
         let z3 = fp_mul(&fp_mul(&self.z, &other.z), &h);
+        let generic = JacobianPoint { x: x3, y: y3, z: z3 };
 
-        JacobianPoint { x: x3, y: y3, z: z3 }
+        let h_zero = ct_is_zero_u256(&h);
+        let r_zero = ct_is_zero_u256(&r);
+        let self_id = ct_is_zero_u256(&self.z);
+        let other_id = ct_is_zero_u256(&other.z);
+
+        // h == 0, r != 0 → inverse points → identity.
+        let out = ct_select_point(&generic, &JacobianPoint::identity(), h_zero);
+        // h == 0, r == 0 → the same point → doubling.
+        let out = ct_select_point(&out, &self.double(), h_zero & r_zero);
+        // Either operand being the identity overrides all of the above.
+        // `other_id` is applied last so that identity + identity
+        // yields the identity rather than a copy of `other`'s
+        // coordinates.
+        let out = ct_select_point(&out, other, self_id);
+        ct_select_point(&out, self, other_id)
     }
 }
 
@@ -869,6 +915,24 @@ fn ct_select_u256(a: &U256, b: &U256, mask: u64) -> U256 {
         i += 1;
     }
     r
+}
+
+/// Constant-time zero test on a U256: returns all-ones if every limb
+/// is zero, else 0. Folds all four limbs, so the position of the first
+/// non-zero limb is not observable.
+#[inline(always)]
+fn ct_is_zero_u256(a: &U256) -> u64 {
+    ct_eq_u64(a[0] | a[1] | a[2] | a[3], 0)
+}
+
+/// Constant-time select on a whole Jacobian point.
+#[inline(always)]
+fn ct_select_point(a: &JacobianPoint, b: &JacobianPoint, mask: u64) -> JacobianPoint {
+    JacobianPoint {
+        x: ct_select_u256(&a.x, &b.x, mask),
+        y: ct_select_u256(&a.y, &b.y, mask),
+        z: ct_select_u256(&a.z, &b.z, mask),
+    }
 }
 
 /// Constant-time table lookup: returns `table[idx]` without
@@ -906,42 +970,32 @@ fn ct_lookup_table_16(table: &[JacobianPoint; 16], idx: usize) -> JacobianPoint 
 ///
 /// Net: about 25-40 % fewer additions on the inner loop.
 ///
-/// # Timing exposure
+/// # Timing
 ///
-/// This routine is **not constant-time**, despite the `_ct` suffix,
-/// which names only the table lookup.
+/// Constant-time in the scalar, at every layer beneath this function:
 ///
-/// What is branchless: [`ct_lookup_table_16`] scans all 16 entries and
-/// selects arithmetically, so the secret nibble never becomes a load
-/// address. That closes the cache-timing channel on the table itself.
+///   - [`ct_lookup_table_16`] scans all 16 entries and selects
+///     arithmetically, so the secret nibble never becomes a load
+///     address;
+///   - the per-window schedule is fixed at four doublings and one
+///     addition, and [`JacobianPoint::double`] and
+///     [`JacobianPoint::add_jacobian`] have no exceptional-case
+///     branches, so a zero nibble — including every leading-zero
+///     nibble, where `acc` is still the identity — costs exactly what
+///     a non-zero one costs;
+///   - the `fp_*` and `fn_*` layers have fixed trip counts with masked
+///     corrections.
 ///
-/// What is not:
-///
-///   - [`JacobianPoint::add_jacobian`] short-circuits on identity
-///     inputs. The branch fires on every leading-zero nibble of the
-///     scalar (`acc` is still the identity) and on every zero nibble
-///     anywhere in the scalar (the lookup returns `table[0]`, the
-///     identity). The position of the zero nibbles is therefore
-///     visible in the timing profile.
-///   - Every `fp_*` operation underneath is value-dependent — see the
-///     note at the top of this file. That channel is present even for
-///     a scalar with no zero nibbles.
-///
-/// The exposure is not a bounded disclosure of a few bits. For ECDSA
-/// the multiplied scalar is the per-signature nonce `k`; partial
-/// knowledge of `k` across a set of signatures is the input to
+/// That property is load-bearing rather than hygiene: for ECDSA the
+/// multiplied scalar is the per-signature nonce `k`, partial knowledge
+/// of which across a set of signatures is the input to
 /// hidden-number-problem lattice recovery of the long-term key, and
-/// published attacks of this shape have worked over a network rather
-/// than only from a co-located process. For ECDH the scalar is the
-/// private key itself and the same measurements accumulate across
-/// handshakes. Treat a timing-capable adversary as able to recover the
-/// key, not as able to learn a few bits of it.
+/// for ECDH it is the private key itself, measured again on every
+/// handshake.
 ///
-/// Removing the exposure requires all three of: exception-free or
-/// complete addition formulas (Renes-Costello-Batina, ~50 % more
-/// multiplications) or a signed-digit recoding with no zero digits;
-/// masked, fixed-trip-count field reductions; and a constant-time
-/// inversion for `fn_inv`.
+/// What is still not covered: the compiler and the microarchitecture.
+/// This docstring states what the source does, not what a given
+/// optimiser emits, and no test in the tree measures cycle counts.
 ///
 /// KATs in `tests/harness/tests/tls_crypto_kat.rs` gate
 /// correctness of the entire `(sign, verify, ECDH)` surface
@@ -1025,11 +1079,14 @@ fn scalar_mul(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
 // the caller checks `complete()` to know when to extract the result.
 //
 // The ladder shape is regular and `ct_swap` is branchless, so the
-// scalar bit does not select which operations run. It is still not a
-// constant-time ladder: `add_jacobian` short-circuits while `r0` is the
-// identity (every leading zero bit of the scalar), and the field
-// arithmetic beneath both the add and the double is value-dependent.
-// The same exposure documented on `scalar_mul_ct` applies here.
+// scalar bit does not select which operations run; `add_jacobian` and
+// `double` have no exceptional-case branches, so leading zero bits of
+// the scalar cost the same as any other bit; and the field arithmetic
+// beneath both has fixed trip counts. The ladder is constant-time in
+// the scalar on the terms documented on `scalar_mul_ct`.
+//
+// How many bits a given `step()` covers is set by the caller through
+// `bits_per_step`, not by the scalar.
 
 pub struct ScalarMulState {
     r0: JacobianPoint,

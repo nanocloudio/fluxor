@@ -795,6 +795,12 @@ struct Fat32State {
     /// One-shot latch for the `clean_root` wipe (0 = not yet performed).
     root_cleaned: u32,
 
+    /// One-shot latch for the rename-intent replay (0 = not yet performed).
+    /// The replay runs at the dispatch chokepoint ahead of the first
+    /// operation of any kind, so no reader can observe a directory still
+    /// carrying an interrupted rename's intermediate state.
+    rename_recovered: u32,
+
     /// Device rc recorded by the synchronous FS_CONTRACT helpers when a
     /// block read/write fails inside an Option/sentinel-returning
     /// function (`fs_dir_lookup`, `fs_scan_dir`, `fs_alloc_extent`, …)
@@ -932,6 +938,7 @@ impl Fat32State {
         self.init_phase = Fat32InitPhase::Idle;
         self.next_free_hint = 2;
         self.root_cleaned = 0;
+        self.rename_recovered = 0;
         self.io_rc = 0;
         self.unlink_free = [0; UNLINK_FREE_SLOTS];
         self.fences = [FenceSlot::empty(); MAX_FENCES];
@@ -1008,6 +1015,16 @@ unsafe fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
         | ((*p.add(1) as u32) << 8)
         | ((*p.add(2) as u32) << 16)
         | ((*p.add(3) as u32) << 24)
+}
+
+/// Write little-endian u32 into a buffer at `offset`.
+#[inline(always)]
+fn write_u32_le(buf: &mut [u8], offset: usize, value: u32) {
+    let b = value.to_le_bytes();
+    buf[offset] = b[0];
+    buf[offset + 1] = b[1];
+    buf[offset + 2] = b[2];
+    buf[offset + 3] = b[3];
 }
 
 /// Convert cluster number to first sector number
@@ -1446,6 +1463,16 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 const FS_UNLINK: u32 = 0x090A;
 const FS_PREALLOCATE: u32 = 0x090E;
 
+/// `RENAME` (0x090D) — move an 8.3 entry to another name, publishing the
+/// new name durably. FAT32 has no directory-mutation primitive that spans
+/// two sectors atomically, so the ordering is made recoverable instead: an
+/// intent record in the volume's spare reserved sectors names both entries
+/// and their exact expected images, and the replay at the next mount
+/// resolves whichever intermediate state the interruption left. See
+/// `fs_op_rename` for the phase sequence and `fs_rename_recover` for the
+/// state discrimination.
+const FS_RENAME: u32 = 0x090D;
+
 /// `FSYNC_NAME` (0x0912) — durably publish the parent-directory entry
 /// naming a path. FAT32 already writes every name-minting directory
 /// sector synchronously (`fs_op_create`, `fs_op_unlink`), so the entry is
@@ -1467,6 +1494,7 @@ const FS_CAP_OPEN_CREATE: u32 = 1 << 2;
 const FS_CAP_WRITE: u32 = 1 << 3;
 const FS_CAP_FSYNC: u32 = 1 << 4;
 const FS_CAP_UNLINK: u32 = 1 << 5;
+const FS_CAP_RENAME: u32 = 1 << 8;
 const FS_CAP_PREALLOCATE: u32 = 1 << 9;
 const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
 const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
@@ -2791,21 +2819,24 @@ unsafe fn fs_op_unlink(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
         return fs_rc_errno(wrc);
     }
     if loc.start_cluster >= 2 {
-        let mut q = 0usize;
-        loop {
-            if q >= UNLINK_FREE_SLOTS {
-                // Ring full: orphan (same posture as create-truncate).
-                dev_log(s.sys(), 4, b"[fat32] unlink orphan".as_ptr(), 21);
-                break;
-            }
-            if s.unlink_free[q] == 0 {
-                s.unlink_free[q] = loc.start_cluster;
-                break;
-            }
-            q += 1;
-        }
+        fs_queue_free_chain(s, loc.start_cluster);
     }
     0
+}
+
+/// Queue a chain head for lazy reclamation by `fs_step_free_chains`. A full
+/// ring orphans the chain instead (logged) — namespace removal always wins
+/// over reclaim, the same posture as create-truncate.
+fn fs_queue_free_chain(s: &mut Fat32State, head: u32) {
+    let mut q = 0usize;
+    while q < UNLINK_FREE_SLOTS {
+        if s.unlink_free[q] == 0 {
+            s.unlink_free[q] = head;
+            return;
+        }
+        q += 1;
+    }
+    unsafe { dev_log(s.sys(), 4, b"[fat32] unlink orphan".as_ptr(), 21) };
 }
 
 /// Drain one queued unlinked chain by at most ONE FAT-sector batch: load
@@ -3857,6 +3888,387 @@ unsafe fn fs_op_fsync_name(s: &mut Fat32State, arg: *const u8, arg_len: usize) -
     fs_sync_flush(s)
 }
 
+/// Marker of a live rename-intent record (`"FRN1"` little-endian).
+const RENAME_INTENT_MAGIC: u32 = 0x3146_524E;
+/// `state` value of a record whose rename is in flight.
+const RENAME_INTENT_ARMED: u32 = 1;
+/// Sectors the FAT32 format itself defines inside the reserved region: the
+/// boot sector (0), FSINFO (1), the third boot sector (2), and the backup
+/// copies at 6, 7 and 8. The intent record takes the region's LAST sector,
+/// which no FAT32 reader interprets, so a volume needs at least ten
+/// reserved sectors to carry one. Below that, `RENAME` is unavailable and
+/// its capability bit stays clear.
+const RENAME_INTENT_MIN_RESERVED: u16 = 10;
+
+// Field offsets inside the 512-byte intent record.
+const RI_MAGIC: usize = 0;
+const RI_STATE: usize = 4;
+const RI_SRC_LBA: usize = 8;
+const RI_DST_LBA: usize = 12;
+const RI_SRC_OFF: usize = 16;
+const RI_DST_OFF: usize = 18;
+/// The exact 32 bytes that must appear at the destination.
+const RI_ENT: usize = 20;
+/// The exact 32 bytes the source entry held when the record was armed.
+const RI_SRC_ENT: usize = 52;
+/// The exact 32 bytes the destination slot held when the record was armed.
+const RI_DST_PREV: usize = 84;
+const RI_CHECK: usize = 116;
+
+/// Absolute LBA of this volume's rename-intent record, or `None` when the
+/// reserved region is too small to hold one.
+fn fs_rename_intent_lba(s: &Fat32State) -> Option<u32> {
+    if s.reserved_sectors < RENAME_INTENT_MIN_RESERVED {
+        return None;
+    }
+    Some(s.partition_lba + s.reserved_sectors as u32 - 1)
+}
+
+/// FNV-1a over the record's fixed header. Rejects a torn or foreign sector
+/// before any of its LBAs are used to address a directory write.
+fn fs_intent_check(rec: &[u8; BLOCK_SIZE]) -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    let mut i = 0usize;
+    while i < RI_CHECK {
+        h ^= rec[i] as u32;
+        h = h.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    h
+}
+
+/// True when the 32 bytes at `off` in `block_buf` equal `rec[at..at + 32]`.
+fn fs_entry_matches(buf: &[u8; BLOCK_SIZE], off: usize, rec: &[u8; BLOCK_SIZE], at: usize) -> bool {
+    let mut i = 0usize;
+    while i < DIR_ENTRY_SIZE {
+        if buf[off + i] != rec[at + i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Return the intent record to its idle state and commit that.
+unsafe fn fs_rename_disarm(s: &Fat32State, intent_lba: u32) -> i32 {
+    let idle = [0u8; BLOCK_SIZE];
+    let rc = fs_sync_write_sector(s, intent_lba, idle.as_ptr());
+    if rc != 0 {
+        return rc;
+    }
+    fs_sync_flush(s)
+}
+
+/// FS_RENAME: move an entry to another name, publishing the new name
+/// durably.
+///
+/// A FAT32 directory entry is 32 bytes inside a 512-byte sector, so moving
+/// a name means writing the destination sector and clearing the source
+/// sector. One sector write is failure-atomic; two are not. When both
+/// entries share a sector the whole mutation IS one write and needs
+/// nothing else. When they do not, the ordering below makes every
+/// intermediate state distinguishable, and `fs_rename_recover` — which
+/// runs ahead of the first operation after any mount — resolves it:
+///
+///   1. arm — write the intent record (both LBAs/offsets and the exact
+///      expected images of the source entry, the destination's previous
+///      contents, and the entry to publish), flush;
+///   2. publish — write the destination entry, flush;
+///   3. retire — mark the source entry deleted (`0xE5`), flush;
+///   4. disarm — return the intent record to idle, flush.
+///
+/// What a reader finds after an interruption:
+///
+///   - before 1, or after 1: the old name, alone. The destination slot
+///     still holds its previous bytes, so the replay rolls back by simply
+///     disarming.
+///   - after 2: both names, naming one cluster chain. The replay reads the
+///     armed record, sees the destination carrying the published image and
+///     the source carrying its armed image, and completes step 3 — the
+///     destination is authoritative.
+///   - after 3: the new name, alone. The replay sees the source already
+///     `0xE5` and only disarms.
+///   - after 4: the new name, alone, with nothing outstanding.
+///
+/// So no interruption leaves the bytes reachable by no name, and no
+/// interruption leaves the outcome ambiguous to the next mount. The "both
+/// names" window between steps 2 and 3 is visible to a foreign FAT32
+/// reader that mounts the volume before this provider replays the record;
+/// such a reader sees two entries sharing a chain, and a repair tool run
+/// at that moment may act on it.
+///
+/// The record is addressed only after its own checksum verifies, and each
+/// phase is applied only when the on-media bytes still equal the image the
+/// record recorded, so a directory mutated by anything else between the
+/// interruption and the replay is left untouched.
+unsafe fn fs_op_rename(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 4 {
+        return E_INVAL;
+    }
+    if s.init_phase != Fat32InitPhase::Done || s.root_cluster < 2 {
+        return E_AGAIN;
+    }
+    let a = core::slice::from_raw_parts(arg, arg_len);
+    let src_len = u16::from_le_bytes([a[0], a[1]]) as usize;
+    if src_len == 0 || arg_len < 4 + src_len {
+        return E_INVAL;
+    }
+    let dst_len = u16::from_le_bytes([a[2 + src_len], a[3 + src_len]]) as usize;
+    if dst_len == 0 || arg_len < 4 + src_len + dst_len {
+        return E_INVAL;
+    }
+    let src_path = &a[2..2 + src_len];
+    let dst_path = &a[4 + src_len..4 + src_len + dst_len];
+
+    s.io_rc = 0;
+    let (src_parent, src_name) = match fs_split_parent(s, src_path) {
+        Some(p) => p,
+        None => return fs_io_errno(s, -2), // ENOENT
+    };
+    let (dst_parent, dst_name) = match fs_split_parent(s, dst_path) {
+        Some(p) => p,
+        None => return fs_io_errno(s, -2), // ENOENT
+    };
+    let src = match fs_scan_dir(s, src_parent, &src_name) {
+        Some(l) if l.exists => l,
+        _ => return fs_io_errno(s, -2), // ENOENT
+    };
+    if src.is_dir {
+        return -21; // EISDIR — directory rename is not in this surface
+    }
+    let dst = match fs_scan_dir(s, dst_parent, &dst_name) {
+        Some(l) => l,
+        None => return fs_io_errno(s, -28), // ENOSPC — destination directory full
+    };
+    if dst.exists && dst.is_dir {
+        return -21; // EISDIR
+    }
+    if dst.lba == src.lba && dst.off == src.off {
+        return 0; // the same entry under the same 8.3 name
+    }
+    // A live writable handle records its entry's location; moving the entry
+    // under it would leave the handle publishing size metadata into a slot
+    // that no longer names its file. Refuse, exactly as `UNLINK` does.
+    let mut k = 0usize;
+    while k < MAX_OPEN_FILES {
+        let of = &s.open_files[k];
+        // Only a writable handle records where its entry lives; a read
+        // handle leaves `dir_lba` at 0 and must not be matched by it.
+        let holds_entry = of.writable != 0;
+        let names_src = holds_entry && of.dir_lba == src.lba && of.dir_off == src.off;
+        let names_dst = holds_entry && dst.exists && of.dir_lba == dst.lba && of.dir_off == dst.off;
+        if of.in_use != 0
+            && (names_src
+                || names_dst
+                || (dst.exists && dst.start_cluster >= 2 && of.start_cluster == dst.start_cluster))
+        {
+            return -16; // EBUSY
+        }
+        k += 1;
+    }
+
+    // The entry to publish: the source's own record — chain head, size,
+    // attributes and timestamps — under the destination's 8.3 name.
+    let rc = fs_read_blockbuf(s, src.lba);
+    if rc != 0 {
+        return fs_rc_errno(rc);
+    }
+    let mut src_ent = [0u8; DIR_ENTRY_SIZE];
+    let mut i = 0usize;
+    while i < DIR_ENTRY_SIZE {
+        src_ent[i] = s.block_buf[src.off as usize + i];
+        i += 1;
+    }
+    let mut ent = src_ent;
+    let mut n = 0usize;
+    while n < 11 {
+        ent[n] = dst_name[n];
+        n += 1;
+    }
+
+    if src.lba == dst.lba {
+        // Both entries live in the one sector, so publication and
+        // retirement are a single failure-atomic write. No intent record
+        // can add anything a reader could observe.
+        let mut i = 0usize;
+        while i < DIR_ENTRY_SIZE {
+            s.block_buf[dst.off as usize + i] = ent[i];
+            i += 1;
+        }
+        s.block_buf[src.off as usize] = 0xE5;
+        let wrc = fs_sync_write_sector(s, src.lba, s.block_buf.as_ptr());
+        if wrc != 0 {
+            return fs_rc_errno(wrc);
+        }
+        let frc = fs_sync_flush(s);
+        if frc != 0 {
+            return fs_rc_errno(frc);
+        }
+        fs_rename_reclaim_replaced(s, &src, &dst);
+        return 0;
+    }
+
+    let intent_lba = match fs_rename_intent_lba(s) {
+        Some(l) => l,
+        None => return -38, // ENOSYS — matches the cleared capability bit
+    };
+
+    let rc = fs_read_blockbuf(s, dst.lba);
+    if rc != 0 {
+        return fs_rc_errno(rc);
+    }
+    let mut rec = [0u8; BLOCK_SIZE];
+    let mut i = 0usize;
+    while i < DIR_ENTRY_SIZE {
+        rec[RI_DST_PREV + i] = s.block_buf[dst.off as usize + i];
+        rec[RI_ENT + i] = ent[i];
+        rec[RI_SRC_ENT + i] = src_ent[i];
+        i += 1;
+    }
+    write_u32_le(&mut rec, RI_MAGIC, RENAME_INTENT_MAGIC);
+    write_u32_le(&mut rec, RI_STATE, RENAME_INTENT_ARMED);
+    write_u32_le(&mut rec, RI_SRC_LBA, src.lba);
+    write_u32_le(&mut rec, RI_DST_LBA, dst.lba);
+    rec[RI_SRC_OFF] = src.off as u8;
+    rec[RI_SRC_OFF + 1] = (src.off >> 8) as u8;
+    rec[RI_DST_OFF] = dst.off as u8;
+    rec[RI_DST_OFF + 1] = (dst.off >> 8) as u8;
+    let check = fs_intent_check(&rec);
+    write_u32_le(&mut rec, RI_CHECK, check);
+
+    // Phase 1 — arm. Nothing in either directory has changed yet, so a
+    // failure here rolls back by disarming.
+    let wrc = fs_sync_write_sector(s, intent_lba, rec.as_ptr());
+    if wrc != 0 {
+        return fs_rc_errno(wrc);
+    }
+    let frc = fs_sync_flush(s);
+    if frc != 0 {
+        let _ = fs_rename_disarm(s, intent_lba);
+        return fs_rc_errno(frc);
+    }
+
+    // Phase 2 — publish the destination.
+    let rc = fs_read_blockbuf(s, dst.lba);
+    if rc != 0 {
+        let _ = fs_rename_disarm(s, intent_lba);
+        return fs_rc_errno(rc);
+    }
+    let mut i = 0usize;
+    while i < DIR_ENTRY_SIZE {
+        s.block_buf[dst.off as usize + i] = ent[i];
+        i += 1;
+    }
+    let wrc = fs_sync_write_sector(s, dst.lba, s.block_buf.as_ptr());
+    if wrc != 0 {
+        let _ = fs_rename_disarm(s, intent_lba);
+        return fs_rc_errno(wrc);
+    }
+    let frc = fs_sync_flush(s);
+    if frc != 0 {
+        return fs_rc_errno(frc);
+    }
+
+    // Phase 3 — retire the source. From here the destination is
+    // authoritative; a failure leaves the armed record to complete it.
+    let rc = fs_read_blockbuf(s, src.lba);
+    if rc != 0 {
+        return fs_rc_errno(rc);
+    }
+    s.block_buf[src.off as usize] = 0xE5;
+    let wrc = fs_sync_write_sector(s, src.lba, s.block_buf.as_ptr());
+    if wrc != 0 {
+        return fs_rc_errno(wrc);
+    }
+    let frc = fs_sync_flush(s);
+    if frc != 0 {
+        return fs_rc_errno(frc);
+    }
+
+    // Phase 4 — disarm. Both names are settled; the record has no work
+    // left to describe.
+    let drc = fs_rename_disarm(s, intent_lba);
+    if drc != 0 {
+        return fs_rc_errno(drc);
+    }
+    fs_rename_reclaim_replaced(s, &src, &dst);
+    0
+}
+
+/// Queue the chain a replaced destination entry used to name, once that
+/// entry is gone from the directory. Ordering matches `UNLINK`: the name
+/// is retired first, so an interruption before the drain leaks clusters
+/// rather than leaving a live entry over freed ones.
+fn fs_rename_reclaim_replaced(s: &mut Fat32State, src: &DirentLoc, dst: &DirentLoc) {
+    if !dst.exists || dst.start_cluster < 2 || dst.start_cluster == src.start_cluster {
+        return;
+    }
+    fs_queue_free_chain(s, dst.start_cluster);
+}
+
+/// Replay an interrupted rename before this mount's first operation.
+///
+/// Reads the intent record and, when it is armed and its checksum
+/// verifies, classifies the directory by comparing the on-media entries
+/// against the images the record captured. Only two states are actionable
+/// — destination published with the source still live (complete the
+/// retirement), and destination untouched (roll back by disarming). Any
+/// other image means the directory moved under the record; the replay then
+/// touches no entry.
+unsafe fn fs_rename_recover(s: &mut Fat32State) {
+    let intent_lba = match fs_rename_intent_lba(s) {
+        Some(l) => l,
+        None => return,
+    };
+    let mut rec = [0u8; BLOCK_SIZE];
+    if fs_sync_read_sector(s, intent_lba, rec.as_mut_ptr()) != 0 {
+        return;
+    }
+    if read_u32_le(&rec, RI_MAGIC) != RENAME_INTENT_MAGIC
+        || read_u32_le(&rec, RI_STATE) != RENAME_INTENT_ARMED
+        || read_u32_le(&rec, RI_CHECK) != fs_intent_check(&rec)
+    {
+        return;
+    }
+    let src_lba = read_u32_le(&rec, RI_SRC_LBA);
+    let dst_lba = read_u32_le(&rec, RI_DST_LBA);
+    let src_off = u16::from_le_bytes([rec[RI_SRC_OFF], rec[RI_SRC_OFF + 1]]) as usize;
+    let dst_off = u16::from_le_bytes([rec[RI_DST_OFF], rec[RI_DST_OFF + 1]]) as usize;
+    if src_off + DIR_ENTRY_SIZE > BLOCK_SIZE || dst_off + DIR_ENTRY_SIZE > BLOCK_SIZE {
+        return;
+    }
+    // Both LBAs must name directory sectors on THIS volume. A record
+    // carried over from another volume checksums correctly and would
+    // otherwise aim a write at whatever those numbers mean here.
+    if src_lba < s.data_start_sector || dst_lba < s.data_start_sector {
+        return;
+    }
+    if fs_read_blockbuf(s, dst_lba) != 0 {
+        return;
+    }
+    let published = fs_entry_matches(&s.block_buf, dst_off, &rec, RI_ENT);
+    let untouched = fs_entry_matches(&s.block_buf, dst_off, &rec, RI_DST_PREV);
+    if published {
+        if fs_read_blockbuf(s, src_lba) != 0 {
+            return;
+        }
+        if fs_entry_matches(&s.block_buf, src_off, &rec, RI_SRC_ENT) {
+            s.block_buf[src_off] = 0xE5;
+            if fs_sync_write_sector(s, src_lba, s.block_buf.as_ptr()) != 0 {
+                return;
+            }
+            if fs_sync_flush(s) != 0 {
+                return;
+            }
+        } else if s.block_buf[src_off] != 0xE5 {
+            return; // neither armed image nor retired — leave it alone
+        }
+    } else if !untouched {
+        return;
+    }
+    let _ = fs_rename_disarm(s, intent_lba);
+}
+
 /// FSYNC_SUBMIT: open a non-blocking durability fence over this FD's
 /// writes, returning its ticket (`u64` LE) in `arg` (≥8 bytes). Flushes
 /// the pending scratch sector — async when the FD is in async mode — so
@@ -4140,18 +4552,17 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
     // FS capability bitmap (modules/sdk/contracts/storage/fs.rs::CAPS).
     // The CAPS query is the canonical way for callers to discover which
     // tiers this provider serves before they call an opcode and get
-    // ENOSYS. `RENAME` stays clear: FAT32 has no atomic directory
-    // mutation — replacing a name means writing a new 8.3 entry and
-    // clearing the old one, and when the two entries fall in different
-    // sectors an interruption is visible as both names or neither. A
-    // consumer needing all-or-nothing publication must use
-    // `OPEN_CREATE` + `FSYNC_NAME` over a self-describing artefact, or
-    // refuse to run on this backend.
+    // ENOSYS. `RENAME` reads the mounted volume's geometry: it needs a
+    // spare reserved sector for its intent record, so the bit is clear on
+    // a volume whose reserved region is too small and on a provider whose
+    // mount has not resolved that region yet — every opcode returns
+    // `E_AGAIN` until then, so the pre-mount answer can only be
+    // fail-closed.
     if opcode == FS_CAPS {
         if arg.is_null() || arg_len < 4 {
             return E_INVAL;
         }
-        let caps: u32 = FS_CAP_OPEN
+        let mut caps: u32 = FS_CAP_OPEN
             | FS_CAP_OPENDIR
             | FS_CAP_OPEN_CREATE
             | FS_CAP_WRITE
@@ -4160,9 +4571,19 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
             | FS_CAP_PREALLOCATE
             | FS_CAP_FSYNC_ASYNC
             | FS_CAP_FSYNC_NAME;
+        if fs_rename_intent_lba(s).is_some() {
+            caps |= FS_CAP_RENAME;
+        }
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
+    }
+    // Replay an interrupted rename before the first operation of any kind:
+    // a reader that resolves a name across the un-replayed window would
+    // adopt a directory the replay is about to settle.
+    if s.rename_recovered == 0 && s.init_phase == Fat32InitPhase::Done {
+        s.rename_recovered = 1;
+        fs_rename_recover(s);
     }
     // Clean-slate wipe BEFORE the first operation of any kind (see the
     // `clean_root` field doc): boot readers and the first writer must see
@@ -4195,6 +4616,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         FS_FSYNC_SUBMIT => fs_op_fsync_submit(s, handle, arg, arg_len),
         FS_FSYNC_POLL => fs_op_fsync_poll(s, handle, arg as *const u8, arg_len),
         FS_FSYNC_NAME => fs_op_fsync_name(s, arg as *const u8, arg_len),
+        FS_RENAME => fs_op_rename(s, arg as *const u8, arg_len),
         _ => -38, // ENOSYS
     }
 }
@@ -5834,11 +6256,15 @@ pub mod test_ops {
     pub const FS_FSYNC_SUBMIT: u32 = super::FS_FSYNC_SUBMIT;
     pub const FS_FSYNC_POLL: u32 = super::FS_FSYNC_POLL;
     pub const FS_FSYNC_NAME: u32 = super::FS_FSYNC_NAME;
+    pub const FS_RENAME: u32 = super::FS_RENAME;
     pub const FS_CAPS: u32 = super::FS_CAPS;
     pub const FS_CAP_UNLINK: u32 = super::FS_CAP_UNLINK;
     pub const FS_CAP_FSYNC_ASYNC: u32 = super::FS_CAP_FSYNC_ASYNC;
     pub const FS_CAP_FSYNC_NAME: u32 = super::FS_CAP_FSYNC_NAME;
-    pub const FS_CAP_RENAME: u32 = 1 << 8;
+    pub const FS_CAP_RENAME: u32 = super::FS_CAP_RENAME;
+    /// LBA of the rename-intent record on the harness geometry, so a crash
+    /// test can inspect or corrupt it directly.
+    pub const RENAME_INTENT_LBA: u32 = 31;
     /// FAT end-of-chain marker; the harness writes it into FAT[root] so the
     /// allocator never hands out the root-directory cluster.
     pub const FAT32_TAIL: u32 = super::FAT32_TAIL;

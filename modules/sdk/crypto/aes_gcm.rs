@@ -3,9 +3,9 @@
 //
 // # Timing exposure
 //
-// This implementation is NOT constant-time on any target that lacks
-// the ARMv8 Cryptography Extension, and GHASH is not constant-time on
-// any target at all.
+// The block cipher is NOT constant-time on any target that lacks the
+// ARMv8 Cryptography Extension. GHASH is constant-time on every
+// target.
 //
 //   - `sub_bytes` indexes the 256-byte `SBOX` with a byte of the AES
 //     state. That state is a function of the secret key, so the
@@ -16,17 +16,17 @@
 //     cache-timing attack on table-driven AES. The table living in
 //     `.rodata` bounds nothing here: read-only memory is cached like
 //     any other.
-//   - `GHash::gf_mul` branches on individual bits of the accumulator
-//     and on a reduction carry derived from the GHASH subkey `H`,
-//     which is `AES_K(0^128)` and therefore secret. Both the branch
-//     count and the branch pattern depend on `H`, leaking it to a
-//     timing observer; recovering `H` forges GCM tags without
-//     recovering the key.
+//   - `GHash::gf_mul` is branchless: the accumulator bit and the
+//     reduction carry are widened to masks and XORed unconditionally
+//     over a fixed 128-iteration schedule, so the GHASH subkey `H`
+//     (`AES_K(0^128)`, whose recovery is a tag-forgery capability)
+//     drives neither control flow nor a load address.
 //
 // On aarch64 with `target_feature = "aes"` the block cipher runs on
 // AESE/AESMC, which are data-independent, so the S-box exposure is
-// absent there. GHASH stays scalar on that path too — there is no
-// PMULL implementation — so the `H` exposure applies everywhere.
+// absent there. GHASH stays scalar on every target — there is no
+// PMULL implementation — but scalar here means branchless, not
+// variable-time.
 //
 // `target_feature = "aes"` is set only for the bcm2712 module build
 // (`tools/src/modules_build.rs` appends `-C
@@ -378,19 +378,22 @@ impl GHash {
     /// Multiply in GF(2^128) with reduction polynomial
     /// x^128 + x^7 + x^2 + x + 1.
     ///
-    /// Not constant-time. Two distinct secret-dependent branches run
-    /// 128 times per block:
+    /// Branchless. The loop runs a fixed 128 iterations and neither
+    /// the accumulator bit nor the reduction carry becomes a branch
+    /// condition: each is widened to an all-ones/all-zeros mask, the
+    /// mask is ANDed with the operand, and the result is XORed
+    /// unconditionally. No secret value selects a control-flow edge
+    /// or a memory address here.
     ///
-    ///   - `if (y >> i) & 1 == 1` — the accumulator `Y` is a function
-    ///     of `H` after the first block, so its bits are secret;
-    ///   - `if carry == 1` — `carry` is the low bit of the shifting
-    ///     `V`, which starts at the GHASH subkey `H` and is therefore
-    ///     secret on every iteration.
+    /// This matters because the GHASH subkey `H` is `AES_K(0^128)` and
+    /// the shifting `V` starts at `H`: a timing observer who recovers
+    /// `H` forges GCM authentication tags for that key without
+    /// recovering the key itself. GHASH is scalar on every target,
+    /// including the bcm2712 build with hardware AES, so this path is
+    /// the one AES-GCM exposure that no target escapes.
     ///
-    /// `H` is `AES_K(0^128)`. Leaking it lets an adversary forge GCM
-    /// authentication tags for that key without recovering the key
-    /// itself. Closing this requires a branchless form that masks the
-    /// operand by the bit instead of branching on it.
+    /// Constant-time here is a property of this function only; the
+    /// block cipher feeding it is not (see the file header).
     fn gf_mul(&mut self) {
         let mut z_hi: u64 = 0;
         let mut z_lo: u64 = 0;
@@ -399,37 +402,29 @@ impl GHash {
         let y_hi = self.y_hi;
         let y_lo = self.y_lo;
 
-        // Process high 64 bits of Y
-        let mut i: i32 = 63;
-        while i >= 0 {
-            if (y_hi >> i as u32) & 1 == 1 {
-                z_hi ^= v_hi;
-                z_lo ^= v_lo;
-            }
-            // v >>= 1 with reduction
-            let carry = v_lo & 1;
-            v_lo = (v_lo >> 1) | (v_hi << 63);
-            v_hi >>= 1;
-            if carry == 1 {
-                v_hi ^= 0xe100000000000000; // R = x^128 + x^7 + x^2 + x + 1
-            }
-            i -= 1;
-        }
+        // Process high 64 bits of Y, then the low 64 bits. Fixed
+        // 64-iteration trip counts, no early exit.
+        let mut word = 0;
+        while word < 2 {
+            let y = if word == 0 { y_hi } else { y_lo };
+            let mut i: i32 = 63;
+            while i >= 0 {
+                // mask = 0xffff_ffff_ffff_ffff when the bit is set,
+                // 0 when it is clear.
+                let mask = ((y >> i as u32) & 1).wrapping_neg();
+                z_hi ^= v_hi & mask;
+                z_lo ^= v_lo & mask;
 
-        // Process low 64 bits of Y
-        i = 63;
-        while i >= 0 {
-            if (y_lo >> i as u32) & 1 == 1 {
-                z_hi ^= v_hi;
-                z_lo ^= v_lo;
+                // v >>= 1 with reduction by
+                // R = x^128 + x^7 + x^2 + x + 1, applied under the
+                // carry mask rather than under an `if`.
+                let carry_mask = (v_lo & 1).wrapping_neg();
+                v_lo = (v_lo >> 1) | (v_hi << 63);
+                v_hi >>= 1;
+                v_hi ^= 0xe100000000000000 & carry_mask;
+                i -= 1;
             }
-            let carry = v_lo & 1;
-            v_lo = (v_lo >> 1) | (v_hi << 63);
-            v_hi >>= 1;
-            if carry == 1 {
-                v_hi ^= 0xe100000000000000;
-            }
-            i -= 1;
+            word += 1;
         }
 
         self.y_hi = z_hi;
@@ -500,6 +495,49 @@ pub const AES128_KEY_LEN: usize = 16;
 pub const AES256_KEY_LEN: usize = 32;
 pub const GCM_NONCE_LEN: usize = 12;
 pub const GCM_TAG_LEN: usize = 16;
+
+/// True when this build's AES block cipher is data-independent, i.e.
+/// when the ARMv8 Cryptography Extension path is compiled. Derived
+/// from the same `cfg` as `AesKey::encrypt_block`'s fast path, so the
+/// two cannot drift.
+///
+/// False means every block encryption indexes `SBOX` with a
+/// key-dependent byte. GHASH is branchless regardless, so this
+/// constant describes the block cipher only.
+///
+/// True for exactly one build: the bcm2712 PIC module build. The
+/// Linux host build (including on a Pi 5), wasm32, rp2040 and rp2350
+/// are all false.
+pub const AES_IS_CONSTANT_TIME: bool =
+    cfg!(all(target_arch = "aarch64", target_feature = "aes"));
+
+/// Whether AES-GCM cipher suites may be offered or accepted by suite
+/// selection on this target. Consulted by the TLS suite tables; this
+/// module does not select suites itself.
+///
+/// When `AES_IS_CONSTANT_TIME` is false, selecting AES-GCM puts the
+/// record key on the secret-indexed S-box, so selection becomes an
+/// explicit posture rather than a fallback reachable by peer
+/// preference alone. ChaCha20-Poly1305 (`chacha20.rs`) is
+/// constant-time on every target and is the preferred suite.
+///
+/// Defaults:
+///
+///   - rp2040, rp2350 (`target_arch = "arm"`) and wasm32: **off**.
+///     These are not general-purpose TLS clients, so RFC 8446 §9.1's
+///     mandatory-to-implement argument for `TLS_AES_128_GCM_SHA256`
+///     does not bind them, and declining AES-GCM is the complete
+///     mitigation there.
+///   - Every other target: on. On bcm2712 the block cipher is
+///     data-independent. On the Linux host it is not, and that host
+///     is the genuinely exposed target — multi-tenant, hardware data
+///     caches, possible co-resident untrusted workloads — but it is
+///     also the one target that must interoperate with arbitrary
+///     peers, and a node that cannot speak `TLS_AES_128_GCM_SHA256`
+///     is not a TLS 1.3 implementation. The default is therefore on
+///     and the exposure is accepted, not absent.
+pub const AES_GCM_SUITES_ENABLED: bool =
+    !cfg!(any(target_arch = "arm", target_arch = "wasm32"));
 
 /// AES-GCM context with expanded key and H (for GHASH)
 pub struct AesGcm {

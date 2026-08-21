@@ -179,6 +179,15 @@ const NET_CMD_CONNECT: u8 = 0x13;
 // net_proto; the disjoint opcode ranges keep the contracts unambiguous.
 // See `modules/sdk/contracts/net/datagram.rs`.
 
+// `DG_OWNER_TAG_MARK` / `DG_OWNER_TAG_FIELD` — the marker byte that introduces
+// the owner tag on `DG_CMD_SEND_TO` / `DG_CMD_CLOSE`, and the field's width —
+// come from `sdk/runtime/net.rs`, which re-exports the contract for every
+// module on the datagram surface.
+
+/// Bytes of a `DG_CMD_SEND_TO` payload after the owner-tag field:
+/// `[af:1][addr:4][port:2]`.
+const DG_V4_DEST_LEN: usize = 1 + 4 + 2;
+
 // ── Multi-homing address table (rfc_net_identity_metal §3) ──────────────────
 
 /// Address-table size. Slot 0 is the primary; slots 1.. are secondaries
@@ -375,6 +384,11 @@ pub struct IpDrops {
     /// Datagram commands refused because the named endpoint slot is not a
     /// live endpoint of the requesting consumer.
     pub dg_ep_unowned: u32,
+    /// Datagram commands refused because the owner tag presented does not
+    /// match the tag recorded when the endpoint was bound (`EPERM`). This is
+    /// the cross-consumer axis: a live slot reached by a consumer that does
+    /// not own it.
+    pub dg_ep_perm: u32,
 }
 
 impl IpDrops {
@@ -402,6 +416,7 @@ impl IpDrops {
             tcp_stale_window: 0,
             dg_bind_conflict: 0,
             dg_ep_unowned: 0,
+            dg_ep_perm: 0,
         }
     }
 }
@@ -604,6 +619,21 @@ pub struct IpState {
     /// `tcp_half_open_max` this separates a genuine capacity ceiling from
     /// half-open exhaustion.
     tcp_half_open_refused: u32,
+    /// SYN-ACKs answered from cookie mode, spending no connection slot.
+    /// `> 0` is the operator's signal that the deployment crossed the
+    /// watermark at all — the distinction between "sized correctly" and
+    /// "running on cookies" that `tcp_half_open_max` alone cannot make.
+    tcp_syn_cookie_sent: u32,
+    /// ACKs whose cookie validated and became a connection.
+    tcp_syn_cookie_ok: u32,
+    /// ACKs that reached cookie validation and failed it. Rising with a flat
+    /// `ok` is an off-path injection attempt; rising in step with `sent` is a
+    /// clock or secret problem.
+    tcp_syn_cookie_bad: u32,
+    /// SYNs above the watermark that carried a TCP option area. A cookie
+    /// cannot reconstruct a negotiated option from the returning ACK, so
+    /// cookie mode refuses to engage and the SYN is dropped.
+    tcp_syn_option_refused: u32,
 
     /// Per-boot secret for the RFC 6528-shaped ISN construction. Drawn once
     /// from the kernel CSPRNG; a connection's ISS is a keyed mix of this
@@ -1389,17 +1419,33 @@ const EPHEMERAL_SCAN_MAX: usize = tcp::MAX_TCP_CONNS * 2;
 /// `src` is the source address of the SYN that just landed; its own count is
 /// tracked separately because a global gauge cannot distinguish a flood from
 /// one peer from a genuine burst of distinct clients.
-unsafe fn note_half_open(s: &mut IpState, src: u32) {
+/// Half-open (SYN_RECEIVED) connections currently in the table. The cookie
+/// watermark reads this rather than the `tcp_half_open` gauge: the gauge is
+/// only refreshed on a passive open, and a stale one would latch cookie mode
+/// on after a flood had drained.
+///
+/// # Safety
+/// `s.tcp_conns` must be initialised.
+unsafe fn count_half_open(s: &IpState) -> u16 {
     let mut total: u16 = 0;
+    let mut i = 0;
+    while i < tcp::MAX_TCP_CONNS {
+        if (*s.tcp_conns.as_ptr().add(i)).state == tcp::TcpState::SynReceived {
+            total = total.saturating_add(1);
+        }
+        i += 1;
+    }
+    total
+}
+
+unsafe fn note_half_open(s: &mut IpState, src: u32) {
+    let total = count_half_open(s);
     let mut from_src: u16 = 0;
     let mut i = 0;
     while i < tcp::MAX_TCP_CONNS {
         let c = &*s.tcp_conns.as_ptr().add(i);
-        if c.state == tcp::TcpState::SynReceived {
-            total = total.saturating_add(1);
-            if c.remote_ip == src {
-                from_src = from_src.saturating_add(1);
-            }
+        if c.state == tcp::TcpState::SynReceived && c.remote_ip == src {
+            from_src = from_src.saturating_add(1);
         }
         i += 1;
     }
@@ -1409,6 +1455,32 @@ unsafe fn note_half_open(s: &mut IpState, src: u32) {
     }
     if from_src > s.tcp_half_open_src_max {
         s.tcp_half_open_src_max = from_src;
+    }
+}
+
+/// Decode the optional owner tag at the head of a `DG_CMD_SEND_TO` /
+/// `DG_CMD_CLOSE` payload. Returns `(claimed_tag, offset_of_next_field)`.
+///
+/// The tag is recognised by `DG_OWNER_TAG_MARK` at offset 1 — the byte that
+/// carries `af` in the untagged shape, and a value no address family takes —
+/// so the two shapes are distinguished without a length rule over a payload
+/// that ends in variable-length data.
+///
+/// An absent tag decodes as 0. Endpoints bound with `owner_tag == 0` are
+/// therefore reachable by any consumer sharing this module's command
+/// channel; endpoints bound with a nonzero tag are not.
+///
+/// # Safety
+/// `payload` must point to at least `plen` readable bytes.
+#[inline]
+unsafe fn dg_decode_owner_tag(payload: *const u8, plen: usize) -> (u16, usize) {
+    if plen > DG_OWNER_TAG_FIELD && *payload.add(1) == DG_OWNER_TAG_MARK {
+        (
+            u16::from_le_bytes([*payload.add(2), *payload.add(3)]),
+            1 + DG_OWNER_TAG_FIELD,
+        )
+    } else {
+        (0, 1)
     }
 }
 
@@ -1579,6 +1651,91 @@ fn mix64(mut x: u64) -> u64 {
     x
 }
 
+/// FNV fold of the per-boot ISN secret — the keyed prefix both the ISS
+/// construction and the SYN cookie start from. Callers must have established
+/// the secret first (`ensure_isn_secret`).
+///
+/// # Safety
+/// `s.isn_secret` must be initialised.
+#[inline]
+unsafe fn isn_secret_fold(s: &IpState) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < 16 {
+        h ^= *s.isn_secret.as_ptr().add(i) as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+/// Coarse epoch a SYN cookie is minted in: ~65.5 s per tick.
+#[inline]
+unsafe fn cookie_epoch(s: &IpState) -> u32 {
+    (dev_millis(&*s.syscalls) >> 16) as u32
+}
+
+/// SYN cookie for one four-tuple in one epoch. The construction is the ISS
+/// hash with the epoch mixed in and the epoch's low bits written into the
+/// cookie's low bits, so the returning ACK names the epoch its cookie was
+/// minted in without a table.
+///
+/// Nothing about the connection needs to be smuggled through the cookie: no
+/// TCP option is negotiated (`tcp::cookie_mode_admissible`), so every field
+/// of the connection block is either a compile-time constant or a field of
+/// the returning ACK.
+///
+/// # Safety
+/// The ISN secret must be established.
+unsafe fn compute_syn_cookie(
+    s: &IpState,
+    local_ip: u32,
+    local_port: u16,
+    remote_ip: u32,
+    remote_port: u16,
+    epoch: u32,
+) -> u32 {
+    let mut h = isn_secret_fold(s);
+    h ^= local_ip as u64;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    h ^= remote_ip as u64;
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    h ^= ((local_port as u64) << 16) | (remote_port as u64);
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    h ^= epoch as u64;
+    let f = mix64(h) as u32;
+    (f & !tcp::SYN_COOKIE_EPOCH_MASK) | (epoch & tcp::SYN_COOKIE_EPOCH_MASK)
+}
+
+/// Validate a cookie carried back in an ACK. Accepts the current epoch and
+/// the one before it — the epoch bits in the cookie select which, so at most
+/// one hash is evaluated and there is no scan an attacker can lengthen.
+///
+/// # Safety
+/// The ISN secret must be established.
+unsafe fn validate_syn_cookie(
+    s: &IpState,
+    local_ip: u32,
+    local_port: u16,
+    remote_ip: u32,
+    remote_port: u16,
+    cookie: u32,
+) -> bool {
+    let now = cookie_epoch(s);
+    let bits = cookie & tcp::SYN_COOKIE_EPOCH_MASK;
+    let mut back: u32 = 0;
+    while back < 2 {
+        let epoch = now.wrapping_sub(back);
+        if (epoch & tcp::SYN_COOKIE_EPOCH_MASK) == bits
+            && compute_syn_cookie(s, local_ip, local_port, remote_ip, remote_port, epoch) == cookie
+        {
+            return true;
+        }
+        back += 1;
+    }
+    false
+}
+
 /// Initial send sequence number, RFC 6528 §3: `ISN = M + F(tuple, secret)`,
 /// where `M` is a 4-microsecond timer and `F` mixes the connection's
 /// four-tuple with a per-boot secret.
@@ -1599,13 +1756,7 @@ unsafe fn compute_iss(
     // 4 µs tick, the rate RFC 6528 specifies for M.
     let m = (dev_micros(sys) >> 2) as u32;
 
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut i = 0;
-    while i < 16 {
-        h ^= *s.isn_secret.as_ptr().add(i) as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        i += 1;
-    }
+    let mut h = isn_secret_fold(s);
     h ^= local_ip as u64;
     h = h.wrapping_mul(0x0000_0100_0000_01b3);
     h ^= remote_ip as u64;
@@ -2108,6 +2259,22 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         pos += fmt_u32_dec(s.tcp_half_open_max as u32, buf.add(pos));
         emit(b" hosrc=", &mut pos);
         pos += fmt_u32_dec(s.tcp_half_open_src_max as u32, buf.add(pos));
+        dev_log(sys, 3, buf, pos);
+
+        // SYN-cookie pressure. Its own line: these are lifetime counters and
+        // the drop line above has no room left for four more u32 fields.
+        // `sent > 0` says the deployment crossed the watermark at all.
+        pos = 0;
+        emit(b"[ip] cookie sent=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_syn_cookie_sent, buf.add(pos));
+        emit(b" ok=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_syn_cookie_ok, buf.add(pos));
+        emit(b" bad=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_syn_cookie_bad, buf.add(pos));
+        emit(b" optref=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_syn_option_refused, buf.add(pos));
+        emit(b" horef=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_half_open_refused, buf.add(pos));
         dev_log(sys, 3, buf, pos);
         s.adv_rx_frames = 0;
         s.pend_rx_steps = 0;
@@ -2612,6 +2779,44 @@ unsafe fn process_tcp_segment(
                     if !ensure_isn_secret(s) {
                         return;
                     }
+                    // Half-open pressure decides whether this SYN costs a
+                    // slot. Recount rather than read the gauge: the gauge is
+                    // refreshed only on a passive open, so a stale one would
+                    // hold cookie mode on after the pressure had drained.
+                    let half_open = count_half_open(s);
+                    s.tcp_half_open = half_open;
+                    if half_open >= tcp::SYN_COOKIE_WATERMARK {
+                        let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
+                        let local_src = local_ip_for_slot(s, local_slot);
+                        if !tcp::cookie_mode_admissible(&tcp_hdr) {
+                            // A cookie carries no option state, so a SYN that
+                            // negotiates one cannot be answered from it.
+                            // Refuse to engage: drop, and the client
+                            // retransmits into whatever capacity frees up.
+                            s.tcp_syn_option_refused = s.tcp_syn_option_refused.wrapping_add(1);
+                            return;
+                        }
+                        let epoch = cookie_epoch(s);
+                        let cookie = compute_syn_cookie(
+                            s,
+                            local_src,
+                            listener_port,
+                            ip_hdr.src_ip,
+                            tcp_hdr.src_port,
+                            epoch,
+                        );
+                        send_syn_ack_cookie(
+                            s,
+                            ip_hdr.src_ip,
+                            tcp_hdr.src_port,
+                            listener_port,
+                            local_src,
+                            cookie,
+                            tcp_hdr.seq_num.wrapping_add(1),
+                        );
+                        s.tcp_syn_cookie_sent = s.tcp_syn_cookie_sent.wrapping_add(1);
+                        return;
+                    }
                     let mut accept_idx: i32 = -1;
                     let mut fi = 0;
                     while fi < tcp::MAX_TCP_CONNS {
@@ -2663,20 +2868,30 @@ unsafe fn process_tcp_segment(
                     return;
                 }
             }
-            // No listener either — send RST if not RST, sourced from the
-            // exact local address the segment targeted.
-            if (tcp_hdr.flags & tcp::RST) == 0 && s.mac_valid && s.local_ip != 0 {
-                let rst_src = local_ip_for_slot(s, local_slot);
-                send_tcp_rst(
-                    s,
-                    ip_hdr.src_ip,
-                    tcp_hdr.src_port,
-                    tcp_hdr.dst_port,
-                    &tcp_hdr,
-                    rst_src,
-                );
+            // A bare ACK matching no connection may be the third segment of a
+            // handshake answered from cookie mode, for which no state was
+            // kept. Anything else — and any cookie that fails — falls through
+            // to the RST below unchanged.
+            match try_cookie_accept(s, ip_hdr, &tcp_hdr, local_slot) {
+                CookieAccept::Installed(idx) => idx,
+                CookieAccept::Absorbed => return,
+                CookieAccept::NotACookie => {
+                    // No listener either — send RST if not RST, sourced from
+                    // the exact local address the segment targeted.
+                    if (tcp_hdr.flags & tcp::RST) == 0 && s.mac_valid && s.local_ip != 0 {
+                        let rst_src = local_ip_for_slot(s, local_slot);
+                        send_tcp_rst(
+                            s,
+                            ip_hdr.src_ip,
+                            tcp_hdr.src_port,
+                            tcp_hdr.dst_port,
+                            &tcp_hdr,
+                            rst_src,
+                        );
+                    }
+                    return;
+                }
             }
-            return;
         }
     };
 
@@ -3309,6 +3524,171 @@ unsafe fn send_tcp_rst(
         .as_mut_ptr()
         .add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
     tcp::build_tcp_header(tcp_start, local_port, remote_port, seq, ack, flags, 0);
+
+    let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN) as u16;
+    let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
+    s.ip_id = s.ip_id.wrapping_add(1);
+    ipv4::build_ipv4_header(
+        ip_start,
+        ip_total,
+        ipv4::PROTO_TCP,
+        local_src,
+        remote_ip,
+        s.ip_id,
+    );
+
+    eth::build_eth_header(
+        s.tx_frame.as_mut_ptr(),
+        &dst_mac,
+        &s.mac_addr,
+        eth::ETHERTYPE_IPV4,
+    );
+
+    tcp::compute_tcp_checksum(tcp_start, tcp::TCP_HEADER_LEN, local_src, remote_ip);
+
+    let total = eth::ETH_HEADER_LEN + ip_total as usize;
+    send_frame(s, s.tx_frame.as_ptr(), total);
+}
+
+/// Outcome of examining a connection-less segment for a returning SYN
+/// cookie.
+enum CookieAccept {
+    /// The cookie validated and the connection was installed on this slot,
+    /// still in `SynReceived` so the ordinary state machine performs the
+    /// transition, the accept notification and any piggybacked data.
+    Installed(usize),
+    /// Not a cookie ACK. The caller takes its unchanged path — an RST for
+    /// anything that is not itself an RST.
+    NotACookie,
+    /// A valid cookie with no slot left to install it on. Cookies bound
+    /// pre-handshake memory; they cannot manufacture capacity that does not
+    /// exist, so the ACK is dropped and the client retries.
+    Absorbed,
+}
+
+/// Examine a segment that matched no connection for a returning SYN cookie.
+///
+/// Validation is attempted only when a listener matches the `(port, local
+/// address)` the segment targets and the segment is a bare ACK; every other
+/// shape reaches the caller's RST path without any hashing, and a cookie
+/// that fails validation takes that same path. What a peer sees for a bad
+/// cookie is therefore byte-for-byte what it sees for a port nobody listens
+/// on.
+///
+/// # Safety
+/// `s` must be an initialised `IpState`; `tcp_hdr` must describe the
+/// segment.
+unsafe fn try_cookie_accept(
+    s: &mut IpState,
+    ip_hdr: &ipv4::Ipv4Header,
+    tcp_hdr: &tcp::TcpHeader,
+    local_slot: u8,
+) -> CookieAccept {
+    if (tcp_hdr.flags & tcp::ACK) == 0
+        || (tcp_hdr.flags & (tcp::SYN | tcp::RST | tcp::FIN)) != 0
+        || !s.isn_secret_valid
+        || !s.mac_valid
+        || s.local_ip == 0
+        || !tcp::cookie_mode_admissible(tcp_hdr)
+    {
+        return CookieAccept::NotACookie;
+    }
+    let dst_owned = slot_is_owned(s, local_slot);
+    let li = match tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port, local_slot, dst_owned) {
+        Some(i) => i,
+        None => return CookieAccept::NotACookie,
+    };
+    let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
+    let local_src = local_ip_for_slot(s, local_slot);
+    let cookie = tcp_hdr.ack_num.wrapping_sub(1);
+    if !validate_syn_cookie(
+        s,
+        local_src,
+        listener_port,
+        ip_hdr.src_ip,
+        tcp_hdr.src_port,
+        cookie,
+    ) {
+        s.tcp_syn_cookie_bad = s.tcp_syn_cookie_bad.wrapping_add(1);
+        return CookieAccept::NotACookie;
+    }
+
+    let mut accept_idx: i32 = -1;
+    let mut fi = 0;
+    while fi < tcp::MAX_TCP_CONNS {
+        if slot_is_free(&*s.tcp_conns.as_ptr().add(fi)) {
+            accept_idx = fi as i32;
+            break;
+        }
+        fi += 1;
+    }
+    if accept_idx < 0 {
+        s.tcp_half_open_refused = s.tcp_half_open_refused.wrapping_add(1);
+        return CookieAccept::Absorbed;
+    }
+
+    // Every field is a constant or a field of this ACK — see the cookie
+    // construction. The block is installed one step short of `Established`
+    // so the shared admissibility gate and state machine complete it.
+    let idx = accept_idx as usize;
+    let conn = &mut *s.tcp_conns.as_mut_ptr().add(idx);
+    *conn = tcp::TcpConn::new();
+    conn.local_port = listener_port;
+    conn.local_slot = local_slot;
+    conn.remote_ip = ip_hdr.src_ip;
+    conn.remote_port = tcp_hdr.src_port;
+    conn.iss = cookie;
+    conn.snd_una = cookie;
+    conn.snd_nxt = cookie.wrapping_add(1);
+    conn.rcv_nxt = tcp_hdr.seq_num;
+    conn.snd_wnd = tcp_hdr.window;
+    conn.rcv_wnd = tcp::INITIAL_RCV_WND;
+    conn.cwnd = tcp::INITIAL_CWND;
+    conn.ssthresh = 0xFFFF;
+    conn.rto = tcp::RTO_INITIAL;
+    conn.retransmit_timer = 0;
+    conn.state = tcp::TcpState::SynReceived;
+    s.tcp_syn_cookie_ok = s.tcp_syn_cookie_ok.wrapping_add(1);
+    CookieAccept::Installed(idx)
+}
+
+/// Send a SYN-ACK for a passive open that holds no connection slot: the
+/// sequence number is the cookie and every other field is a constant or a
+/// field of the SYN being answered. Nothing is allocated and nothing is
+/// swept, which is what makes cookie mode admissible on the MCU profiles.
+///
+/// # Safety
+/// `s` must be an initialised, configured `IpState`.
+unsafe fn send_syn_ack_cookie(
+    s: &mut IpState,
+    remote_ip: u32,
+    remote_port: u16,
+    local_port: u16,
+    local_src: u32,
+    cookie: u32,
+    rcv_nxt: u32,
+) {
+    if !s.mac_valid || s.local_ip == 0 {
+        return;
+    }
+    let dst_mac = match resolve_mac(s, remote_ip) {
+        Some(m) => m,
+        None => return,
+    };
+
+    let tcp_start = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
+    tcp::build_tcp_header(
+        tcp_start,
+        local_port,
+        remote_port,
+        cookie,
+        rcv_nxt,
+        tcp::SYN | tcp::ACK,
+        tcp::INITIAL_RCV_WND,
+    );
 
     let ip_total = (ipv4::IPV4_HEADER_LEN + tcp::TCP_HEADER_LEN) as u16;
     let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
@@ -4787,34 +5167,41 @@ unsafe fn service_net_channels(s: &mut IpState) {
             DG_CMD_SEND_TO => {
                 // datagram send. IPv4 payload:
                 //   [ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]
-                if plen >= 8 {
-                    let bp = buf.as_ptr();
+                // Owner-tagged form inserts [MARK][owner_tag:2 LE] between
+                // `ep_id` and `af`, so the tag sits at a fixed offset ahead of
+                // the variable-length data rather than after it.
+                let bp = buf.as_ptr();
+                let (claimed_tag, dest_off) = dg_decode_owner_tag(bp, plen);
+                if plen >= dest_off + DG_V4_DEST_LEN {
                     let ep_id = *bp as usize;
-                    let af = *bp.add(1);
+                    let af = *bp.add(dest_off);
                     if af == DG_AF_INET && ep_id < tcp::MAX_TCP_CONNS {
                         let conn = &*s.tcp_conns.as_ptr().add(ep_id);
-                        if conn.is_datagram && conn.state == tcp::TcpState::Listen {
-                            let dst_ip = u32::from_be_bytes([
-                                *bp.add(2),
-                                *bp.add(3),
-                                *bp.add(4),
-                                *bp.add(5),
-                            ]);
-                            let dst_port = u16::from_le_bytes([*bp.add(6), *bp.add(7)]);
-                            let udp_data = bp.add(8);
-                            let udp_len = plen - 8;
+                        if !(conn.is_datagram && conn.state == tcp::TcpState::Listen) {
+                            // The slot exists but holds no live datagram
+                            // endpoint: a stale handle whose endpoint was
+                            // closed, or a slot that was never bound.
+                            s.drops.dg_ep_unowned = s.drops.dg_ep_unowned.wrapping_add(1);
+                            dg_send_error(s, ep_id as u8, -88); // ENOTSOCK
+                        } else if conn.owner_tag != claimed_tag {
+                            // A live endpoint reached by a consumer that does
+                            // not hold it. `ep_id` is an index; the tag is the
+                            // authority.
+                            s.drops.dg_ep_perm = s.drops.dg_ep_perm.wrapping_add(1);
+                            dg_send_error(s, ep_id as u8, -1); // EPERM
+                        } else {
+                            let ap = bp.add(dest_off + 1);
+                            let dst_ip =
+                                u32::from_be_bytes([*ap, *ap.add(1), *ap.add(2), *ap.add(3)]);
+                            let dst_port = u16::from_le_bytes([*ap.add(4), *ap.add(5)]);
+                            let udp_data = bp.add(dest_off + DG_V4_DEST_LEN);
+                            let udp_len = plen - dest_off - DG_V4_DEST_LEN;
                             let local_port = conn.local_port;
                             let rv =
                                 send_udp_data(s, dst_ip, dst_port, local_port, udp_data, udp_len);
                             if rv != 0 {
                                 dg_send_error(s, ep_id as u8, rv);
                             }
-                        } else {
-                            // The slot exists but holds no live datagram
-                            // endpoint: a stale handle whose endpoint was
-                            // closed, or a slot that was never bound.
-                            s.drops.dg_ep_unowned = s.drops.dg_ep_unowned.wrapping_add(1);
-                            dg_send_error(s, ep_id as u8, -88); // ENOTSOCK
                         }
                     } else {
                         dg_send_error(s, ep_id as u8, -97); // EAFNOSUPPORT
@@ -4822,17 +5209,24 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 }
             }
             DG_CMD_CLOSE => {
-                // datagram close. Payload: [ep_id: u8].
+                // datagram close. Payload: [ep_id: u8], or the owner-tagged
+                // form [ep_id: u8][MARK][owner_tag: u16 LE].
                 if plen >= 1 {
-                    let ep_id = *buf.as_ptr() as usize;
+                    let bp = buf.as_ptr();
+                    let ep_id = *bp as usize;
+                    let (claimed_tag, _) = dg_decode_owner_tag(bp, plen);
                     let live = ep_id < tcp::MAX_TCP_CONNS && {
                         let conn = &*s.tcp_conns.as_ptr().add(ep_id);
                         conn.is_datagram && conn.state == tcp::TcpState::Listen
                     };
-                    if live {
+                    let owned = live && (*s.tcp_conns.as_ptr().add(ep_id)).owner_tag == claimed_tag;
+                    if owned {
                         let conn = &mut *s.tcp_conns.as_mut_ptr().add(ep_id);
                         *conn = tcp::TcpConn::new();
                         dg_send_closed(s, ep_id as u8);
+                    } else if live {
+                        s.drops.dg_ep_perm = s.drops.dg_ep_perm.wrapping_add(1);
+                        dg_send_error(s, ep_id as u8, -1); // EPERM
                     } else {
                         // A close naming a slot that is not a live endpoint
                         // is answered rather than silently absorbed: the
@@ -5136,6 +5530,24 @@ pub mod test_helpers {
             s.tcp_half_open_refused,
         )
     }
+
+    /// SYN-cookie counters: `(sent, ok, bad, option_refused)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn syn_cookies(state: *const u8) -> (u32, u32, u32, u32) {
+        let s = &*(state as *const IpState);
+        (
+            s.tcp_syn_cookie_sent,
+            s.tcp_syn_cookie_ok,
+            s.tcp_syn_cookie_bad,
+            s.tcp_syn_option_refused,
+        )
+    }
+
+    /// Half-open occupancy at which cookie mode engages, for a test that must
+    /// cross it without restating the derivation.
+    pub const SYN_COOKIE_WATERMARK: u16 = tcp::SYN_COOKIE_WATERMARK;
 
     /// Local port latched on a connection slot.
     ///
