@@ -138,10 +138,6 @@ fn source_candidates(
 /// annotates `ci-digest` where current digests match it).
 pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
     let identity = require_project_identity(pr)?;
-    let epoch_hex: String = crate::hash::abi_surface_digest()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
     let mut out = BTreeMap::new();
     for (name, dir, prefix) in source_candidates(pr, &identity.name) {
         out.insert(name, input_digest_hex(&collect_tree(&dir, prefix)?));
@@ -190,9 +186,14 @@ pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
             }
         }
         files.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut hex = input_digest_hex(&files);
-        hex.push_str(&epoch_hex[..16]);
-        out.insert(m.name, hex);
+        // Deliberately NOT suffixed with the ABI-surface epoch. The epoch
+        // is published per artifact in its own `io.fluxor.abi-surface`
+        // annotation, and admissibility against it is a separate question
+        // from whether this module's own inputs moved. Folding it in here
+        // made one surface edit read as "every module is stale", which no
+        // per-module publish could clear and which is exactly the
+        // repo-level signal per-artifact digests exist to replace.
+        out.insert(m.name, input_digest_hex(&files));
     }
     Ok(out)
 }

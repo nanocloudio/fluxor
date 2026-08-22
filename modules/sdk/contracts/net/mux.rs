@@ -399,3 +399,27 @@ pub const SESSION_OPENED_BODY_MIN: usize = 1 + 1 + 1;
 /// how much unframed application data one stream can hold pending
 /// packetisation.
 pub const MUX_QUIC_STREAM_SEND_MAX: usize = 1200;
+
+/// Maximum data bytes the QUIC provider delivers in one
+/// `MSG_MUX_STREAM_RX`, matching its per-stream receive buffer.
+///
+/// Published for the same reason the send bound is: a consumer has to size
+/// the scratch it copies a frame into, and the only safe number is the one
+/// the provider will actually emit. Sizing that scratch from a PROTOCOL
+/// budget instead — a maximum header block, a slot accumulator — silently
+/// couples two unrelated limits, and the failure is a truncated copy of a
+/// frame the channel has already consumed: no error, no retry, and a
+/// request or response that is simply short.
+///
+/// This is larger than [`MUX_QUIC_STREAM_SEND_MAX`], and deliberately so.
+/// The send bound is what one stream may hold pending packetisation; this
+/// is what a peer's packets may already have delivered, and the transport
+/// does not get to choose how much a peer sends.
+///
+/// A consumer that cannot accept this much MUST fail the stream explicitly
+/// rather than copy a prefix of it.
+pub const MUX_QUIC_STREAM_RX_MAX: usize = 1500;
+
+/// Largest whole `MSG_MUX_STREAM_RX` payload: the stream prefix plus the
+/// data bound above. This is the number to size a receive scratch from.
+pub const MUX_QUIC_STREAM_RX_FRAME_MAX: usize = STREAM_DATA_PREFIX + MUX_QUIC_STREAM_RX_MAX;

@@ -27,6 +27,9 @@ pub struct PhaseResult {
 pub enum PhaseStatus {
     Ok,
     Failed,
+    /// Ran, found something worth saying, and did not fail the run. For
+    /// a condition that is real but is not this project's to fix.
+    Warned,
     Skipped,
 }
 
@@ -35,6 +38,7 @@ impl PhaseStatus {
         match self {
             PhaseStatus::Ok => "ok",
             PhaseStatus::Failed => "FAILED",
+            PhaseStatus::Warned => "warn",
             PhaseStatus::Skipped => "skipped",
         }
     }
@@ -251,38 +255,35 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         check_lockfile_consistency(project_root)
     }));
 
-    // ───── Phase 1.75: live staleness (hard-fail) ───────────────────
+    // ───── Phase 1.75: live staleness ───────────────────────────────
     //
-    // The plan's one declared exception to warn-don't-act
-    // (`.context/registry_consolidation.md`): a green gate against a
-    // known-stale upstream is a clean build wearing a misleading name.
-    // Every workspace-member project among this project's declared
-    // dependencies — plus the project itself when it is a member — must
-    // have its current input digests match the published
-    // `<member>/meta:latest` annotations; a member with no published
-    // index fails likewise. Skips cleanly when no workspace file
-    // exists.
+    // Reports when a workspace-member DEPENDENCY has work it has not
+    // published, so a reader knows the pinned artefacts this build
+    // resolved are not the latest that checkout holds. Informational by
+    // default (`[ci] live_staleness`); a release gate sets `fail`.
+    //
+    // The project's own publish state is not checked: nothing builds
+    // against its own published artefacts. Skips cleanly when there is
+    // no workspace file or no member dependency to compare.
     {
         if verbose {
             eprintln!("[ci] running phase: live-staleness");
         }
         let start = Instant::now();
-        let outcome = crate::store_sync::live_staleness_failures(project_root);
+        let scope = live_staleness_scope(project_root);
+        let outcome = crate::store_sync::live_staleness_report(project_root);
         let elapsed_ms = start.elapsed().as_millis();
         results.push(match outcome {
             Ok(None) => skipped("live-staleness"),
-            Ok(Some(failures)) if failures.is_empty() => PhaseResult {
-                name: "live-staleness",
-                status: PhaseStatus::Ok,
-                elapsed_ms,
-                message: String::new(),
-            },
-            Ok(Some(failures)) => PhaseResult {
-                name: "live-staleness",
-                status: PhaseStatus::Failed,
-                elapsed_ms,
-                message: failures.join("; "),
-            },
+            Ok(Some(findings)) => {
+                let (status, message) = classify_staleness(&findings, scope);
+                PhaseResult {
+                    name: "live-staleness",
+                    status,
+                    elapsed_ms,
+                    message,
+                }
+            }
             Err(e) => PhaseResult {
                 name: "live-staleness",
                 status: PhaseStatus::Failed,
@@ -784,6 +785,49 @@ fn is_fluxor_kernel_workspace(project_root: &Path) -> bool {
     pkgs.contains("fluxor-tools")
 }
 
+/// Decide the live-staleness phase outcome.
+///
+/// Findings are about workspace-member dependencies; the default reports
+/// them and the run continues, because a pinned build resolving what an
+/// upstream published is correct behaviour, not a defect. `fail` is for
+/// a release gate that needs the whole member set current.
+fn classify_staleness(
+    findings: &[String],
+    scope: crate::store_sync::StalenessScope,
+) -> (PhaseStatus, String) {
+    if findings.is_empty() {
+        return (PhaseStatus::Ok, String::new());
+    }
+    let message = findings.join("; ");
+    match scope {
+        crate::store_sync::StalenessScope::Fail => (PhaseStatus::Failed, message),
+        crate::store_sync::StalenessScope::Report => (PhaseStatus::Warned, message),
+    }
+}
+
+/// How far the live-staleness phase acts, from `[ci] live_staleness`.
+///
+/// Defaults to `report`. Set `fail` for a release gate that requires
+/// every member dependency to be current. An unrecognised value falls
+/// back to the default; the `fluxor-toml-schema` phase reports the typo.
+pub(crate) fn live_staleness_scope(project_root: &Path) -> crate::store_sync::StalenessScope {
+    #[derive(serde::Deserialize)]
+    struct Top {
+        ci: Option<Ci>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Ci {
+        live_staleness: Option<String>,
+    }
+    std::fs::read_to_string(project_root.join("fluxor.toml"))
+        .ok()
+        .and_then(|raw| toml::from_str::<Top>(&raw).ok())
+        .and_then(|top| top.ci)
+        .and_then(|ci| ci.live_staleness)
+        .and_then(|v| crate::store_sync::StalenessScope::parse(&v))
+        .unwrap_or_default()
+}
+
 /// Resolve the host-tools cargo crate path relative to the project
 /// root. Order: explicit `[ci.cargo] host_tools_crate` in
 /// `fluxor.toml` → conventional `tools/` if present → `None`. The
@@ -937,6 +981,19 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
         // `bundle/` holds packaged OUTPUT (`workload.json` beside a
         // rendered `graph.yaml`) whose source graph is checked already.
         if rel.contains("test_harness/") || rel.contains("/bundle/") {
+            continue;
+        }
+        // Tracked in an index but absent from disk. Build-checking it
+        // yields a bare ENOENT that names no cause, so say the cause:
+        // an index (commonly the shadow one) still lists a file a
+        // deletion removed. Distinguishing this from a broken graph is
+        // the difference between "fix your config" and "fix your index".
+        if !project_root.join(rel).exists() {
+            failures.push(format!(
+                "{rel}: tracked but not on disk — a git index still lists it after \
+                 the file was deleted; drop the entry (`git rm --cached`) in \
+                 whichever index tracks it"
+            ));
             continue;
         }
         checked += 1;
@@ -1868,7 +1925,7 @@ pub fn format_summary(results: &[PhaseResult]) -> String {
             name = r.name,
             ms = r.elapsed_ms,
         ));
-        if r.status == PhaseStatus::Failed && !r.message.is_empty() {
+        if matches!(r.status, PhaseStatus::Failed | PhaseStatus::Warned) && !r.message.is_empty() {
             for line in r.message.lines() {
                 out.push_str(&format!("          {line}\n"));
             }
@@ -1889,6 +1946,69 @@ type _PathBufRef = PathBuf;
 
 #[cfg(test)]
 mod tests {
+    use super::{classify_staleness, live_staleness_scope, PhaseStatus};
+    use crate::store_sync::StalenessScope;
+
+    fn findings(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The default reports a dependency's unpublished work without
+    /// failing: a pinned build resolving what that dependency published
+    /// is correct behaviour, so the finding is news, not a defect.
+    #[test]
+    fn a_dependency_with_unpublished_work_warns_by_default() {
+        let (status, message) = classify_staleness(
+            &findings(&["dependency 'fluxor' has unpublished changes"]),
+            StalenessScope::Report,
+        );
+        assert_eq!(status, PhaseStatus::Warned);
+        assert!(message.contains("fluxor"), "{message}");
+    }
+
+    /// A release gate opts into failing on the same finding.
+    #[test]
+    fn a_dependency_with_unpublished_work_fails_under_fail_scope() {
+        let (status, message) = classify_staleness(
+            &findings(&["dependency 'fluxor' has unpublished changes"]),
+            StalenessScope::Fail,
+        );
+        assert_eq!(status, PhaseStatus::Failed);
+        assert!(message.contains("fluxor"), "{message}");
+    }
+
+    #[test]
+    fn nothing_stale_is_ok_under_every_scope() {
+        for scope in [StalenessScope::Report, StalenessScope::Fail] {
+            let (status, message) = classify_staleness(&[], scope);
+            assert_eq!(status, PhaseStatus::Ok, "{scope:?}");
+            assert!(message.is_empty(), "{scope:?}");
+        }
+    }
+
+    /// The `[ci] live_staleness` key: absent or unreadable → the safe
+    /// default; an unrecognised value likewise (the schema phase is what
+    /// reports the typo, not this reader).
+    #[test]
+    fn live_staleness_scope_reads_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |body: &str| std::fs::write(dir.path().join("fluxor.toml"), body).unwrap();
+
+        assert_eq!(live_staleness_scope(dir.path()), StalenessScope::Report);
+
+        write("[project]\nname = \"x\"\n");
+        assert_eq!(live_staleness_scope(dir.path()), StalenessScope::Report);
+
+        write("[ci]\nlive_staleness = \"fail\"\n");
+        assert_eq!(live_staleness_scope(dir.path()), StalenessScope::Fail);
+
+        write("[ci]\nlive_staleness = \"report\"\n");
+        assert_eq!(live_staleness_scope(dir.path()), StalenessScope::Report);
+
+        write("[ci]\nlive_staleness = \"everything\"\n");
+        assert_eq!(live_staleness_scope(dir.path()), StalenessScope::Report);
+    }
+
     use super::*;
 
     /// Vacuity, stated once: inputs without consumption is a failure;

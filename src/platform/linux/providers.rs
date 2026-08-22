@@ -82,22 +82,6 @@ pub fn slot_fence(slot: i32) -> Option<Fence> {
 /// `E2BIG` rather than a silently truncated open.
 const LINUX_FS_PATH_MAX: usize = 255;
 
-/// Validate + copy a UTF-8 path argument from a contract caller
-/// into `out` and NUL-terminate it for libc.
-///
-/// Returns the path length in bytes (NOT counting the NUL) on
-/// success, or a negative errno:
-///
-///   - `EINVAL` if the buffer is null, empty, or contains an
-///     interior NUL byte (interior NULs let an attacker submit
-///     `evil\0../etc/passwd` and have libc see `evil` while a
-///     downstream policy check saw the longer string),
-///   - `E2BIG` if the path length exceeds `LINUX_FS_PATH_MAX`.
-///
-/// Centralised so OPEN, OPEN_CREATE, and OPENDIR get identical
-/// path validation — previously each arm rolled its own
-/// `arg_len.min(255)` and OPENDIR silently truncated where the
-
 /// Decode the two-path argument `LINK`, `RENAME` and friends share:
 /// `[a_len: u16 LE][a][b_len: u16 LE][b]`, validating both as filesystem
 /// paths and returning them NUL-terminated.
@@ -132,7 +116,25 @@ unsafe fn two_paths(
     Some((a, a_len, b, b_len))
 }
 
-/// other two now reject overlong paths.
+/// Validate + copy a UTF-8 path argument from a contract caller
+/// into `out` and NUL-terminate it for libc.
+///
+/// Returns the path length in bytes (NOT counting the NUL) on
+/// success, or a negative errno:
+///
+///   - `EINVAL` if the buffer is null, empty, or contains an
+///     interior NUL byte (interior NULs let an attacker submit
+///     `evil\0../etc/passwd` and have libc see `evil` while a
+///     downstream policy check saw the longer string),
+///   - `E2BIG` if the path length exceeds `LINUX_FS_PATH_MAX`.
+///
+/// Centralised so OPEN, OPEN_CREATE, and OPENDIR get identical
+/// path validation: each arm previously rolled its own
+/// `arg_len.min(255)`, and OPENDIR silently truncated where the
+/// other two reject overlong paths.
+///
+/// # Safety
+/// `arg` must point at `arg_len` readable bytes.
 unsafe fn validate_fs_path(
     arg: *const u8,
     arg_len: usize,

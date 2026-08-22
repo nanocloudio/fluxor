@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::oci_store::{
-    OciStore, ANN_INPUT_DIGEST, ANN_REF_NAME, MT_FLUXOR_RUNTIME, MT_FLUXOR_SOURCE,
+    OciStore, ANN_ABI_SURFACE, ANN_INPUT_DIGEST, ANN_REF_NAME, MT_FLUXOR_RUNTIME, MT_FLUXOR_SOURCE,
 };
 use crate::store_resolve::{
     read_manifest_layer_blob, read_pinned_manifest, read_store_lock, resolve_dependency,
@@ -533,17 +533,15 @@ pub fn workspace_publish(dry_run: bool) -> Result<Vec<(String, MemberOutcome)>> 
     let mut outcomes = Vec::new();
     for (name, path) in order {
         let current = crate::store_publish::project_input_digests(&path)?;
-        let published = published_input_digests(&store, &name)?;
-        let dirty: Vec<String> = match &published {
-            // No published index yet: everything is dirty (first-ever
-            // publish).
-            None => current.keys().cloned().collect(),
-            Some(map) => current
-                .iter()
-                .filter(|(k, v)| map.get(*k) != Some(v))
-                .map(|(k, _)| k.clone())
-                .collect(),
-        };
+        let published = published_artifacts(&store, &name)?;
+        let epoch = current_epoch_hex();
+        // Epoch drift counts as dirty here even when sources are
+        // untouched: the published artifact carries a stale epoch
+        // annotation, and only a rebuild + restage can refresh it.
+        let dirty: Vec<String> = stale_artifacts(&current, &epoch, published.as_ref())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         if dirty.is_empty() && published.is_some() {
             outcomes.push((name, MemberOutcome::UpToDate));
             continue;
@@ -563,12 +561,23 @@ pub fn workspace_publish(dry_run: bool) -> Result<Vec<(String, MemberOutcome)>> 
     Ok(outcomes)
 }
 
-/// Published per-artifact input digests from `<project>/meta:latest`;
+/// What one published artifact records about how it was built: the
+/// token-canonical digest of its own inputs, and the ABI-surface epoch
+/// it was compiled against. The two answer different questions —
+/// "must this be rebuilt?" and "is this admissible here?" — so they are
+/// carried and compared separately.
+#[derive(Debug, Clone, Default)]
+struct PublishedArtifact {
+    input_digest: Option<String>,
+    epoch: Option<String>,
+}
+
+/// Published per-artifact build state from `<project>/meta:latest`;
 /// `None` when the project has never been published.
-fn published_input_digests(
+fn published_artifacts(
     store: &OciStore,
     project: &str,
-) -> Result<Option<BTreeMap<String, String>>> {
+) -> Result<Option<BTreeMap<String, PublishedArtifact>>> {
     let Ok(desc) = store.resolve(&format!("{project}/meta:latest")) else {
         return Ok(None);
     };
@@ -580,78 +589,204 @@ fn published_input_digests(
         let Some(a) = crate::store_resolve::artifact_from_descriptor(child)? else {
             continue;
         };
-        if let Some(d) = child.annotations.get(ANN_INPUT_DIGEST) {
-            out.insert(a.name, d.clone());
-        }
+        out.insert(
+            a.name,
+            PublishedArtifact {
+                input_digest: child.annotations.get(ANN_INPUT_DIGEST).cloned(),
+                epoch: child.annotations.get(ANN_ABI_SURFACE).cloned(),
+            },
+        );
     }
     Ok(Some(out))
 }
 
+/// Why one artifact is not current against what is published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleReason {
+    /// Never published.
+    Absent,
+    /// The artifact's own sources moved.
+    Inputs,
+    /// The sources are unchanged, but the artifact was compiled against a
+    /// different ABI surface than this checkout presents. It must be
+    /// rebuilt and restaged to carry a current epoch, but nothing about
+    /// the module itself was edited — worth saying separately, because a
+    /// whole project reporting this means one surface edit, not N module
+    /// edits.
+    Epoch,
+}
+
+impl StaleReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "unpublished",
+            Self::Inputs => "sources changed",
+            Self::Epoch => "ABI surface moved",
+        }
+    }
+}
+
+/// Compare a checkout's current artifact inputs against what is
+/// published, at `epoch`. Returns one entry per artifact that is not
+/// current, in artifact-name order.
+fn stale_artifacts(
+    current: &BTreeMap<String, String>,
+    epoch: &str,
+    published: Option<&BTreeMap<String, PublishedArtifact>>,
+) -> Vec<(String, StaleReason)> {
+    let Some(published) = published else {
+        // No published index at all: every artifact is a first publish.
+        return current
+            .keys()
+            .map(|k| (k.clone(), StaleReason::Absent))
+            .collect();
+    };
+    let mut out = Vec::new();
+    for (name, digest) in current {
+        let Some(entry) = published.get(name) else {
+            out.push((name.clone(), StaleReason::Absent));
+            continue;
+        };
+        if entry.input_digest.as_deref() != Some(digest.as_str()) {
+            out.push((name.clone(), StaleReason::Inputs));
+        } else if entry.epoch.as_deref().is_some_and(|e| e != epoch) {
+            // Source artifacts carry no epoch; only modules do, so a
+            // missing annotation is not drift.
+            out.push((name.clone(), StaleReason::Epoch));
+        }
+    }
+    out
+}
+
+/// Render a stale set as one human line: artifacts grouped by reason, so
+/// "every module, ABI surface moved" reads as the single cause it is
+/// rather than as N independent problems.
+fn describe_stale(stale: &[(String, StaleReason)]) -> String {
+    let mut groups: BTreeMap<&'static str, Vec<&str>> = BTreeMap::new();
+    for (name, reason) in stale {
+        groups.entry(reason.label()).or_default().push(name);
+    }
+    groups
+        .into_iter()
+        .map(|(reason, names)| {
+            // Past a handful, the list stops informing and starts hiding
+            // the reason, which is the part that tells you what to do.
+            if names.len() > 6 {
+                format!("{} artifacts: {reason}", names.len())
+            } else {
+                format!("{}: {reason}", names.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 // ── ci live-staleness gate ────────────────────────────────────────────
 
-/// The `fluxor ci` live-staleness check — the plan's one declared
-/// exception to warn-don't-act: a green gate against a known-stale
-/// upstream is a clean build wearing a misleading name.
+/// Current ABI-surface epoch as lower-case hex.
+fn current_epoch_hex() -> String {
+    crate::hash::abi_surface_digest()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Whether the `fluxor ci` live-staleness phase acts on what it finds.
+///
+/// It reports on **workspace-member dependencies** only. A project's own
+/// publish state is deliberately not checked: nothing builds against its
+/// own published artefacts, so comparing the checkout to them says
+/// nothing about the build. `fluxor workspace status` is where publish
+/// state lives.
+///
+/// Even for a dependency the finding is informational. A pinned build
+/// resolves the *published* artefact, which is what pinning means; an
+/// upstream checkout sitting ahead of it means the author has newer work
+/// you are not seeing, not that this build is wrong. The conditions that
+/// would make it wrong — a module compiled against a different ABI
+/// surface, a lockfile that no longer resolves, a skewed CLI — are
+/// separate phases that fail on their own account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StalenessScope {
+    /// Report and continue. The default.
+    #[default]
+    Report,
+    /// Fail when a member dependency is behind what it published. For a
+    /// release gate, where the whole member set must be publishable
+    /// together.
+    Fail,
+}
+
+impl StalenessScope {
+    /// Parse the `[ci] live_staleness` key.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "report" => Some(Self::Report),
+            "fail" => Some(Self::Fail),
+            _ => None,
+        }
+    }
+}
+
+/// The `fluxor ci` live-staleness check.
 ///
 /// For every workspace-member project among this project's declared
-/// dependencies — plus the project itself when it is a member — compare
-/// the member checkout's current input digests against the published
-/// `io.fluxor.input-digest` annotations in `<member>/meta:latest`.
+/// dependencies, compare the member checkout's current per-artifact
+/// input digests against the published `io.fluxor.input-digest`
+/// annotations in `<member>/meta:latest`, and the checkout's ABI-surface
+/// epoch against each artifact's published `io.fluxor.abi-surface`.
 ///
-/// Returns `Ok(None)` when no workspace file exists (the phase skips
-/// cleanly), otherwise `Ok(Some(failures))` — one line per stale or
-/// never-published member, each naming `fluxor workspace publish`.
+/// The two comparisons are reported as distinct causes. An artifact
+/// whose sources moved differs from one whose epoch moved: the first
+/// changed, the second had the ground move under it. Reading a whole
+/// module set as "ABI surface moved" names a single cause, where a bare
+/// list of every module names none.
 ///
-/// A published index with no artifact children (a zero-artifact
-/// project) is vacuously fresh: nothing is published, so nothing can
-/// be stale.
-pub fn live_staleness_failures(project_root: &Path) -> Result<Option<Vec<String>>> {
+/// Returns `Ok(None)` when there is no workspace file, or when this
+/// project declares no workspace-member dependencies — the root project
+/// of the family declares none, and a phase with nothing to compare
+/// skips rather than inventing a comparison against itself.
+pub fn live_staleness_report(project_root: &Path) -> Result<Option<Vec<String>>> {
     if crate::workspace::load_workspace()?.is_none() {
         return Ok(None);
     }
     let members = member_projects()?;
+
+    // Declared dependencies that are workspace members. Deliberately not
+    // including this project: see `StalenessScope`.
     let mut relevant: Vec<(String, PathBuf)> = Vec::new();
-    let deps = crate::project::dependencies(project_root).map_err(Error::Config)?;
-    for dep in &deps {
+    for dep in crate::project::dependencies(project_root).map_err(Error::Config)? {
         if let Some(path) = members.get(&dep.name) {
-            relevant.push((dep.name.clone(), path.clone()));
-        }
-    }
-    if let Ok(Some(identity)) = crate::project::project_identity(project_root) {
-        if let Some(path) = members.get(&identity.name) {
-            if !relevant.iter().any(|(n, _)| n == &identity.name) {
-                relevant.push((identity.name, path.clone()));
-            }
+            relevant.push((dep.name, path.clone()));
         }
     }
     if relevant.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(None);
     }
+
     let store = OciStore::open(crate::oci_store::store_root()?)?;
-    let mut failures = Vec::new();
+    let epoch = current_epoch_hex();
+    let mut findings = Vec::new();
     for (name, path) in relevant {
         let current = crate::store_publish::project_input_digests(&path)?;
-        match published_input_digests(&store, &name)? {
-            None => failures.push(format!(
-                "member '{name}' has no published index — run `fluxor workspace publish`"
+        match published_artifacts(&store, &name)? {
+            None => findings.push(format!(
+                "dependency '{name}' has never been published — run \
+                 `fluxor publish` in that checkout"
             )),
             Some(published) => {
-                let stale: Vec<&str> = current
-                    .iter()
-                    .filter(|(k, v)| published.get(*k) != Some(v))
-                    .map(|(k, _)| k.as_str())
-                    .collect();
+                let stale = stale_artifacts(&current, &epoch, Some(&published));
                 if !stale.is_empty() {
-                    failures.push(format!(
-                        "member '{name}' inputs changed since publish ({}) — \
-                         run `fluxor workspace publish`",
-                        stale.join(", ")
+                    findings.push(format!(
+                        "dependency '{name}' has unpublished changes ({}); this build \
+                         resolves what it published",
+                        describe_stale(&stale)
                     ));
                 }
             }
         }
     }
-    Ok(Some(failures))
+    Ok(Some(findings))
 }
 
 /// Run one member's module build: the current process's own project
@@ -1061,10 +1196,9 @@ mod tests {
         assert!(extract_ustar(&evil, dir.path()).is_err());
     }
 
-    /// The ci live-staleness gate: absent workspace file → `None`
-    /// (skip); unpublished member → failure naming `workspace
-    /// publish`; published + current → clean; edited inputs → failure
-    /// listing the artifact.
+    /// The ci live-staleness gate: no workspace file → `None` (skip);
+    /// a member dependency that has never published, or has unpublished
+    /// work → one finding naming it; published and current → nothing.
     #[test]
     fn live_staleness_gate_states() {
         let _env = env_lock();
@@ -1082,9 +1216,9 @@ mod tests {
             ("FLUXOR_STORE", &scratch.path().join("store")),
             ("FLUXOR_WORKSPACE", &no_ws),
         ]);
-        assert!(live_staleness_failures(&consumer).unwrap().is_none());
+        assert!(live_staleness_report(&consumer).unwrap().is_none());
 
-        // (1) Member never published → failure naming workspace publish.
+        // (1) Dependency never published → one finding naming it.
         let ws_file = scratch.path().join("workspace.toml");
         std::fs::write(
             &ws_file,
@@ -1092,32 +1226,122 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("FLUXOR_WORKSPACE", &ws_file);
-        let failures = live_staleness_failures(&consumer).unwrap().unwrap();
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(failures[0].contains("no published index"), "{failures:?}");
-        assert!(
-            failures[0].contains("fluxor workspace publish"),
-            "{failures:?}"
-        );
+        let found = live_staleness_report(&consumer).unwrap().unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("never been published"), "{found:?}");
 
-        // (2) Published and unchanged → clean.
+        // (2) Published and unchanged → nothing.
         crate::store_publish::publish_project_to_store(&producer, &["source"], false).unwrap();
-        let failures = live_staleness_failures(&consumer).unwrap().unwrap();
-        assert!(failures.is_empty(), "{failures:?}");
+        let found = live_staleness_report(&consumer).unwrap().unwrap();
+        assert!(found.is_empty(), "{found:?}");
 
-        // (3) Inputs edited since publish → failure listing the artifact.
+        // (3) Dependency edited since publish → one finding naming the
+        // artifact and the cause.
         std::fs::write(
             producer.join("modules/common/core.rs"),
             "pub fn z() -> u32 { 9 }\n",
         )
         .unwrap();
-        let failures = live_staleness_failures(&consumer).unwrap().unwrap();
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(failures[0].contains("producer-common"), "{failures:?}");
+        let found = live_staleness_report(&consumer).unwrap().unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("producer-common"), "{found:?}");
+        assert!(found[0].contains("sources changed"), "{found:?}");
+    }
+
+    /// The root project of the family declares no dependencies. The phase
+    /// must have nothing to say about it — it must not compare the
+    /// checkout against its own published artefacts, which is a
+    /// comparison no build depends on.
+    #[test]
+    fn a_project_with_no_member_dependencies_skips() {
+        let _env = env_lock();
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().join("root");
+        fake_project(&root, "root", &[]);
+        std::fs::create_dir_all(root.join("modules/common")).unwrap();
+        std::fs::write(root.join("modules/common/core.rs"), "pub fn z() {}\n").unwrap();
+
+        // `root` is itself a workspace member, and has never published.
+        let ws_file = scratch.path().join("workspace.toml");
+        std::fs::write(
+            &ws_file,
+            format!("[workspace]\nmembers = [\"{}\"]\n", root.display()),
+        )
+        .unwrap();
+        let _scope = EnvScope::set(&[
+            ("FLUXOR_STORE", &scratch.path().join("store")),
+            ("FLUXOR_WORKSPACE", &ws_file),
+        ]);
+
         assert!(
-            failures[0].contains("fluxor workspace publish"),
-            "{failures:?}"
+            live_staleness_report(&root).unwrap().is_none(),
+            "a project with no member dependencies has nothing to compare"
         );
+    }
+
+    /// An artifact whose sources are untouched but whose published epoch
+    /// differs is stale for a DIFFERENT reason, and says so. This is the
+    /// case that used to be indistinguishable from an edit, because the
+    /// epoch was concatenated into the input digest.
+    #[test]
+    fn epoch_drift_is_a_distinct_reason_from_an_edit() {
+        let published = |input: &str, epoch: &str| {
+            let mut m = BTreeMap::new();
+            m.insert(
+                "mod_a".to_string(),
+                PublishedArtifact {
+                    input_digest: Some(input.to_string()),
+                    epoch: Some(epoch.to_string()),
+                },
+            );
+            m
+        };
+        let mut current = BTreeMap::new();
+        current.insert("mod_a".to_string(), "aaaa".to_string());
+
+        // Same inputs, same epoch → current.
+        let map = published("aaaa", "e1");
+        assert!(stale_artifacts(&current, "e1", Some(&map)).is_empty());
+
+        // Same inputs, moved epoch → stale, but as a restage not an edit.
+        let map = published("aaaa", "e0");
+        assert_eq!(
+            stale_artifacts(&current, "e1", Some(&map)),
+            vec![("mod_a".to_string(), StaleReason::Epoch)]
+        );
+
+        // Edited inputs → reported as the edit, not as epoch drift, even
+        // when both moved: the edit is the actionable fact.
+        let map = published("bbbb", "e0");
+        assert_eq!(
+            stale_artifacts(&current, "e1", Some(&map)),
+            vec![("mod_a".to_string(), StaleReason::Inputs)]
+        );
+
+        // A source artifact carries no epoch annotation; a missing one is
+        // not drift.
+        let mut map = published("aaaa", "e0");
+        map.get_mut("mod_a").unwrap().epoch = None;
+        assert!(stale_artifacts(&current, "e1", Some(&map)).is_empty());
+    }
+
+    /// A whole module set going stale for one reason must read as one
+    /// cause, not as a wall of names that hides it.
+    #[test]
+    fn describe_stale_groups_large_sets_by_reason() {
+        let many: Vec<(String, StaleReason)> = (0..40)
+            .map(|i| (format!("mod_{i}"), StaleReason::Epoch))
+            .collect();
+        let line = describe_stale(&many);
+        assert_eq!(line, "40 artifacts: ABI surface moved");
+
+        // A small set still names its artifacts, which is what makes the
+        // message actionable when it is actionable.
+        let few = vec![
+            ("fat32".to_string(), StaleReason::Inputs),
+            ("nvme".to_string(), StaleReason::Inputs),
+        ];
+        assert_eq!(describe_stale(&few), "fat32, nvme: sources changed");
     }
 
     /// `ensure_synced` on a declared dependency with no pin names

@@ -1232,7 +1232,10 @@ pub unsafe extern "C" fn module_destroy(_state: *mut u8) {}
 /// Largest stream/datagram payload carried in one mux frame on the app
 /// surface (bounds the per-call stack scratch). Matches the inbound
 /// stream-reassembly + datagram staging buffers.
-const MUX_DATA_MAX: usize = 1500;
+// The contract publishes this bound so a consumer can size its receive
+// scratch from the same number the provider emits; deriving it here is what
+// keeps the two from drifting apart.
+const MUX_DATA_MAX: usize = mux::MUX_QUIC_STREAM_RX_MAX;
 
 /// True when every connection's outbound stream buffer is drained, so a
 /// freshly-read CMD_MUX_STREAM_SEND payload is guaranteed to land in full
