@@ -1,0 +1,14 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "rp2350"]
+
+# Puts a known file on a volume at bring-up, so a scenario that needs one
+# does not depend on a host having placed it there beforehand.
+#
+# A plain `fs` consumer: it opens, writes, fences and publishes through the
+# contract like any other caller. That is the point — seeding a volume is not
+# a filesystem's job, and a provider carrying its own private write path
+# carries a second implementation of everything the contract already does.
+
+[[resources]]
+requires_contract = "fs"
+access = "write"

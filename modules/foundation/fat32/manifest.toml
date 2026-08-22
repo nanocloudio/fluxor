@@ -11,25 +11,17 @@ timer_class = "wall_clock"
 # Free-form provider capability string; tools-only, never serialized.
 provides = ["file.data"]
 
-# FAT32 filesystem provider. Random-access reads go through the
-# FS_CONTRACT (`provider_call(-1, FS_OPEN, …)`); the kernel routes
-# the dispatch to fat32 via `module_provides_contract = FS`. Writes
-# are emitted as block-write requests on the `block_writes` output
-# port (typically wired to `nvme.requests`).
+# FAT32 filesystem provider. Every operation goes through the FS
+# contract (`provider_call(-1, FS_OPEN, …)`); the kernel routes the
+# dispatch here via `module_provides_contract = FS`. Reads and writes
+# both use the block source's synchronous ioctls on the `blocks` port,
+# so the module owns no outbound block channel of its own.
 
 [[ports]]
 name = "blocks"
 direction = "input"
 content_type = "OctetStream"
 required = true
-
-# Block-write output: connects to a block-source's write input
-# (e.g. `nvme.requests`). The `write_file:` / `write_data:` params
-# drive a one-shot write at boot.
-[[ports]]
-name = "block_writes"
-direction = "output"
-content_type = "OctetStream"
 
 # Module-scope observability (out[1], optional); wired to observe.telemetry.
 [observability]

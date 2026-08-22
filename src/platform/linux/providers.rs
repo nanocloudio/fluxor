@@ -97,6 +97,41 @@ const LINUX_FS_PATH_MAX: usize = 255;
 /// Centralised so OPEN, OPEN_CREATE, and OPENDIR get identical
 /// path validation — previously each arm rolled its own
 /// `arg_len.min(255)` and OPENDIR silently truncated where the
+
+/// Decode the two-path argument `LINK`, `RENAME` and friends share:
+/// `[a_len: u16 LE][a][b_len: u16 LE][b]`, validating both as filesystem
+/// paths and returning them NUL-terminated.
+///
+/// One decoder, because two copies of these offsets is two chances to
+/// validate one path and not the other — and the unvalidated one is the
+/// interesting half to an attacker.
+///
+/// # Safety
+/// `arg` must point at `arg_len` readable bytes.
+unsafe fn two_paths(
+    arg: *const u8,
+    arg_len: usize,
+) -> Option<([u8; 256], usize, [u8; 256], usize)> {
+    if arg.is_null() || arg_len < 4 {
+        return None;
+    }
+    let bytes = core::slice::from_raw_parts(arg, arg_len);
+    let a_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    if arg_len < 2 + a_len + 2 {
+        return None;
+    }
+    let b_off = 2 + a_len + 2;
+    let b_len = u16::from_le_bytes([bytes[2 + a_len], bytes[3 + a_len]]) as usize;
+    if arg_len < b_off + b_len {
+        return None;
+    }
+    let mut a = [0u8; 256];
+    let mut b = [0u8; 256];
+    validate_fs_path(arg.add(2), a_len, &mut a).ok()?;
+    validate_fs_path(arg.add(b_off), b_len, &mut b).ok()?;
+    Some((a, a_len, b, b_len))
+}
+
 /// other two now reject overlong paths.
 unsafe fn validate_fs_path(
     arg: *const u8,
@@ -237,7 +272,16 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             | dev_fs::caps::MKDIR
             | dev_fs::caps::PREALLOCATE
             | dev_fs::caps::RENAME
-            | dev_fs::caps::FSYNC_NAME;
+            | dev_fs::caps::TRUNCATE
+            | dev_fs::caps::FSYNC_NAME
+            // The host filesystem has a real object model and `fstat`
+            // answers all of it, plus `rmdir(2)`, `link(2)` and
+            // `readlink(2)`.
+            | dev_fs::caps::STAT_OBJECT
+            | dev_fs::caps::OWNERSHIP
+            | dev_fs::caps::RMDIR
+            | dev_fs::caps::LINK
+            | dev_fs::caps::SYMLINK;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -352,6 +396,119 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 errno::OK
             }
         }
+        dev_fs::RMDIR => {
+            let mut path_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg, arg_len, &mut path_buf) {
+                return e;
+            }
+            // Not idempotent, unlike MKDIR above: "the directory is gone" and
+            // "the directory was never there" are the same end state, but a
+            // caller removing a path it believes it created wants to hear
+            // that it was not there.
+            if libc::rmdir(path_buf.as_ptr() as *const libc::c_char) < 0 {
+                return -*libc::__errno_location();
+            }
+            // The removal is a change to the PARENT's directory entry, so
+            // that is what has to reach media for the name to stay gone.
+            fsync_parent_dir(&path_buf[..arg_len])
+        }
+        dev_fs::LINK => {
+            let Some((existing, existing_len, new, new_len)) = two_paths(arg, arg_len) else {
+                return errno::EINVAL;
+            };
+            // A directory hard link is refused by the kernel too, but saying
+            // so here means the caller gets the contract's errno rather than
+            // whatever the platform happens to raise.
+            let mut st: libc::stat = core::mem::zeroed();
+            if libc::stat(existing.as_ptr() as *const libc::c_char, &mut st) == 0
+                && st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            {
+                return errno::EISDIR;
+            }
+            if libc::link(
+                existing.as_ptr() as *const libc::c_char,
+                new.as_ptr() as *const libc::c_char,
+            ) < 0
+            {
+                return -*libc::__errno_location();
+            }
+            let _ = existing_len;
+            // Minted, not fenced — the contract's own rule. The caller
+            // publishes with FSYNC_NAME on the new path.
+            let _ = new_len;
+            errno::OK
+        }
+        dev_fs::READLINK => {
+            // `[path_len: u16][path]`, with `arg_len` sizing the OUTPUT
+            // buffer. The two are different numbers: a caller reading a long
+            // target through a short path would otherwise be told its own
+            // path length is the limit.
+            if arg.is_null() || arg_len < 2 {
+                return errno::EINVAL;
+            }
+            let path_len = usize::from(u16::from_le_bytes([*arg, *arg.add(1)]));
+            if path_len == 0 || arg_len < 2 + path_len {
+                return errno::EINVAL;
+            }
+            let mut path_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg.add(2), path_len, &mut path_buf) {
+                return e;
+            }
+            let mut target = [0u8; 512];
+            let n = libc::readlink(
+                path_buf.as_ptr() as *const libc::c_char,
+                target.as_mut_ptr() as *mut libc::c_char,
+                target.len(),
+            );
+            if n < 0 {
+                return -*libc::__errno_location();
+            }
+            let n = n as usize;
+            // `readlink(2)` truncates silently when the buffer is short, and
+            // a truncated path is a different path. Refuse rather than hand
+            // back a name that resolves somewhere else.
+            if n == target.len() {
+                return errno::E2BIG;
+            }
+            if n > arg_len {
+                return errno::E2BIG;
+            }
+            core::ptr::copy_nonoverlapping(target.as_ptr(), arg, n);
+            n as i32
+        }
+        dev_fs::TRUNCATE => {
+            // `[len: u64 LE][path]`.
+            if arg.is_null() || arg_len < 9 {
+                return errno::EINVAL;
+            }
+            let a = core::slice::from_raw_parts(arg, arg_len);
+            let len = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+            if len > i64::MAX as u64 {
+                return errno::EINVAL;
+            }
+            let mut path_buf = [0u8; 256];
+            if let Err(e) = validate_fs_path(arg.add(8), arg_len - 8, &mut path_buf) {
+                return e;
+            }
+            // Shrink only, matching the contract. `truncate(2)` would happily
+            // grow the file into a sparse tail, which is exactly the
+            // behaviour the contract excludes: it publishes storage the file
+            // never wrote as its contents.
+            let mut st: libc::stat = core::mem::zeroed();
+            if libc::stat(path_buf.as_ptr() as *const libc::c_char, &mut st) < 0 {
+                return -*libc::__errno_location();
+            }
+            if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                return -libc::EISDIR;
+            }
+            if len > st.st_size as u64 {
+                return errno::EINVAL;
+            }
+            if libc::truncate(path_buf.as_ptr() as *const libc::c_char, len as i64) < 0 {
+                return -*libc::__errno_location();
+            }
+            errno::OK
+        }
         dev_fs::FSYNC_NAME => {
             let mut path_buf = [0u8; 256];
             let len = match validate_fs_path(arg, arg_len, &mut path_buf) {
@@ -361,27 +518,9 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             fsync_parent_dir(&path_buf[..len])
         }
         dev_fs::RENAME => {
-            if arg.is_null() || arg_len < 4 {
+            let Some((src_buf, src_len, dst_buf, dst_len)) = two_paths(arg, arg_len) else {
                 return errno::EINVAL;
-            }
-            let bytes = core::slice::from_raw_parts(arg, arg_len);
-            let src_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-            if arg_len < 2 + src_len + 2 {
-                return errno::EINVAL;
-            }
-            let dst_off = 2 + src_len + 2;
-            let dst_len = u16::from_le_bytes([bytes[2 + src_len], bytes[3 + src_len]]) as usize;
-            if arg_len < dst_off + dst_len {
-                return errno::EINVAL;
-            }
-            let mut src_buf = [0u8; 256];
-            let mut dst_buf = [0u8; 256];
-            if let Err(e) = validate_fs_path(arg.add(2), src_len, &mut src_buf) {
-                return e;
-            }
-            if let Err(e) = validate_fs_path(arg.add(dst_off), dst_len, &mut dst_buf) {
-                return e;
-            }
+            };
             // `rename(2)` is atomic against a concurrent reader: the
             // destination name resolves to the old inode or the new one,
             // never to neither. It is NOT durable on return, so both
@@ -497,8 +636,24 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if arg.is_null() || arg_len < 4 {
                 return errno::EINVAL;
             }
-            let offset = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let pos = libc::lseek(files[slot_idx].fd, offset as i64, libc::SEEK_SET);
+            // 32-bit or 64-bit offset, selected by the buffer width the
+            // caller supplied. This backend has no 4 GiB ceiling, so the
+            // wide form is honoured as given.
+            let offset: i64 = if arg_len >= 8 {
+                let a = core::slice::from_raw_parts(arg, 8);
+                let v = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+                if v > i64::MAX as u64 {
+                    return errno::EINVAL;
+                }
+                v as i64
+            } else {
+                let v = i32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
+                if v < 0 {
+                    return errno::EINVAL;
+                }
+                i64::from(v)
+            };
+            let pos = libc::lseek(files[slot_idx].fd, offset, libc::SEEK_SET);
             if pos < 0 {
                 errno::ERROR
             } else {
@@ -543,21 +698,43 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             if ret < 0 {
                 return errno::ERROR;
             }
-            let size = (stat.st_size as u64).min(u32::MAX as u64) as u32;
-            let mtime = stat.st_mtime as u32;
-            let size_b = size.to_le_bytes();
-            let mtime_b = mtime.to_le_bytes();
-            *arg = size_b[0];
-            *arg.add(1) = size_b[1];
-            *arg.add(2) = size_b[2];
-            *arg.add(3) = size_b[3];
-            *arg.add(4) = mtime_b[0];
-            *arg.add(5) = mtime_b[1];
-            *arg.add(6) = mtime_b[2];
-            *arg.add(7) = mtime_b[3];
+            let size = stat.st_size as u64;
+            let mtime = stat.st_mtime as u64;
             // Metadata read; no durability claim.
             record_slot_fence(slot_idx, Fence::Volatile);
-            errno::OK
+            if arg_len >= 48 {
+                // This backend is the one that genuinely has an object model
+                // to report: `fstat` already answered every field. A provider
+                // that has the answer and returns the short form instead
+                // makes the wide form untestable.
+                let out = core::slice::from_raw_parts_mut(arg, 48);
+                out[..8].copy_from_slice(&size.to_le_bytes());
+                out[8..16].copy_from_slice(&mtime.to_le_bytes());
+                out[16..24].copy_from_slice(&(stat.st_ino as u64).to_le_bytes());
+                out[24..28].copy_from_slice(&(stat.st_nlink as u32).to_le_bytes());
+                out[28..32].copy_from_slice(&(stat.st_mode as u32).to_le_bytes());
+                out[32..36].copy_from_slice(&(stat.st_uid as u32).to_le_bytes());
+                out[36..40].copy_from_slice(&(stat.st_gid as u32).to_le_bytes());
+                out[40..48].copy_from_slice(&0u64.to_le_bytes());
+                return 48;
+            }
+            if arg_len >= 16 {
+                let out = core::slice::from_raw_parts_mut(arg, 16);
+                out[..8].copy_from_slice(&size.to_le_bytes());
+                out[8..].copy_from_slice(&mtime.to_le_bytes());
+                return 16;
+            }
+            // The narrow form cannot carry this file. Saying so is the whole
+            // point of having two widths: clamping to `u32::MAX` would hand
+            // the caller a number that is not the size, with no way to tell
+            // it apart from a file that really is that long.
+            if size > u64::from(u32::MAX) {
+                return errno::EOVERFLOW;
+            }
+            let out = core::slice::from_raw_parts_mut(arg, 8);
+            out[..4].copy_from_slice(&(size as u32).to_le_bytes());
+            out[4..].copy_from_slice(&(mtime as u32).to_le_bytes());
+            8
         }
         dev_fs::FSYNC => {
             let slot_idx = handle as usize;

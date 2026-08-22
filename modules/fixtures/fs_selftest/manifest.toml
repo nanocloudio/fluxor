@@ -1,0 +1,19 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# Silicon self-test for the `fs` contract's mutation surface.
+#
+# Every durability and namespace guarantee `fat32` makes is verified on the
+# host against a modelled volatile write cache. That model is the right one
+# for crash points, and it is not a device: it does not have an FTL, a real
+# Flush, a real atomic-write unit, or real latency. This fixture drives the
+# same guarantees against whatever block device the graph puts underneath, so
+# the claims are answered by hardware rather than by a model of it.
+#
+# Runs one operation per step — the surface it tests is synchronous, and a
+# fixture that blocked the lane while proving the provider does not would be
+# testing the wrong thing.
+
+[[resources]]
+requires_contract = "fs"
+access = "write"

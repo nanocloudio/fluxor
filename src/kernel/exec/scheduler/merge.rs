@@ -823,6 +823,32 @@ pub fn set_current_module(idx: usize) {
     CURRENT_MODULE_PER_CORE[core].store(idx as u32, portable_atomic::Ordering::Relaxed);
 }
 
+/// Per-core module index of whoever *asked* for the provider frame currently
+/// running, published for the duration of that frame.
+///
+/// `provider_call` carries no owner argument and should not gain one:
+/// widening it is a positional-ABI flag day across every module in the fleet,
+/// for a fact the kernel already holds. Publishing the caller instead costs
+/// one relaxed store per dispatch and lets a provider ask.
+static CALLER_MODULE_PER_CORE: [portable_atomic::AtomicU32; MAX_DOMAINS] =
+    [const { portable_atomic::AtomicU32::new(MAX_MODULES as u32) }; MAX_DOMAINS];
+
+/// Module index that invoked the provider frame currently running, or
+/// [`MAX_MODULES`] when nothing is on the stack (a module stepping normally
+/// rather than serving somebody's request).
+pub fn caller_module_index() -> usize {
+    let core = crate::kernel::sys::hal::core_id();
+    CALLER_MODULE_PER_CORE[core].load(portable_atomic::Ordering::Relaxed) as usize
+}
+
+/// Publish the caller for a provider frame. Each frame saves and restores its
+/// own predecessor, so nesting is exact: a provider that calls another
+/// provider is that one's caller, not the original requester.
+pub fn set_caller_module(idx: usize) {
+    let core = crate::kernel::sys::hal::core_id();
+    CALLER_MODULE_PER_CORE[core].store(idx as u32, portable_atomic::Ordering::Relaxed);
+}
+
 /// Get the state pointer for a module by index.
 /// Returns null if the slot is empty or not a dynamic module.
 /// State pointer for the module currently being instantiated (set during module_new).

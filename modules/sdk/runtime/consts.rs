@@ -51,15 +51,50 @@ pub const IOCTL_POLL_NOTIFY: u32 = 2;
 pub const IOCTL_FLUSH: u32 = 3;
 pub const IOCTL_EOF: u32 = 4;
 
+// ============================================================================
+// Block Source Ioctls
+// ============================================================================
+//
+// Every one of these addresses the device by **64-bit LBA**. At 512-byte
+// sectors a 32-bit LBA tops out at 2 TiB, which is smaller than drives that
+// are already on the bench, and the ceiling is invisible until a caller
+// silently addresses the wrong sector. A producer whose hardware cannot go
+// that far — SD block addressing is 32-bit by specification — refuses an
+// out-of-range LBA rather than truncating it: a request the device cannot
+// serve must fail, not land somewhere else.
+
+/// Field offsets of the block ioctls' shared argument.
+///
+/// These are constants rather than prose because the layout *is* the wire
+/// surface. A doc comment describing it is invisible to the ABI source pin,
+/// so widening a field here would not move the digest and every consumer
+/// built against the old layout would keep loading — reading a truncated LBA
+/// and a buffer pointer from the wrong offset. Naming the offsets puts the
+/// layout in the token stream the pin hashes.
+pub mod blk_arg {
+    /// Total argument length, in bytes.
+    pub const LEN: usize = 24;
+    /// `u64` LE — absolute logical block address.
+    pub const LBA: usize = 0;
+    /// `u16` LE — sector count. Clamped by the producer.
+    pub const NLB: usize = 8;
+    /// `u64` LE — caller's data buffer.
+    pub const BUF_PTR: usize = 16;
+}
+
 /// Block-source ioctl on a 512-byte sector channel: request a multi-
-/// sector read in a single device command. Producers that support
-/// it (currently `nvme`) parse `arg = [lba: u32 LE, nlb: u16 LE,
-/// _pad: u16]` (8 bytes), submit one Read with `nlb` LBAs, and
-/// stream `nlb * 512` bytes back-to-back on the channel without
-/// further IOCTLs. Consumers (fat32) use this to amortize the per-
-/// command roundtrip across a whole cluster of sectors. `nlb` is
-/// clamped on the producer side; ENOSYS from the producer means
-/// the consumer should fall back to per-sector `IOCTL_NOTIFY`.
+/// sector read in a single device command. Producers that support it
+/// (currently `nvme`) parse the shared `blk_arg` layout, submit one Read
+/// with `nlb` LBAs, and stream `nlb * 512` bytes back-to-back on the channel
+/// without further IOCTLs — amortizing the per-command round trip across a
+/// whole cluster of sectors. `buf_ptr` is unused: the data comes back on the
+/// channel, not into a caller buffer.
+///
+/// This is the *streaming* counterpart of [`IOCTL_BLOCKS_READ_LBAS_SYNC`],
+/// for a consumer participating in the channel state machine rather than one
+/// that needs bytes inside its own dispatch. `nlb` is clamped on the
+/// producer side; `ENOSYS` means the consumer should fall back to per-sector
+/// `IOCTL_NOTIFY`.
 pub const IOCTL_BLOCKS_READ_NLB: u32 = 0x4E56_0002;
 
 /// Block-source ioctl: synchronously read `nlb` sectors at `lba`
@@ -70,8 +105,8 @@ pub const IOCTL_BLOCKS_READ_NLB: u32 = 0x4E56_0002;
 /// dispatch) where the consumer needs bytes immediately and cannot
 /// participate in the channel state machine.
 ///
-/// arg layout (16 bytes, little-endian):
-///   [lba: u32][nlb: u16][_pad: u16][buf_ptr: u64]
+/// arg layout (24 bytes, little-endian):
+///   [lba: u64][nlb: u16][_pad: u16][_pad: u32][buf_ptr: u64]
 /// `buf_ptr` must point to ≥ `nlb * 512` writable bytes. `nlb` is
 /// clamped to the producer's per-command sector limit (NVMe MAX_NLB).
 /// Returns 0 on success, negative errno on submit / completion error.
@@ -92,8 +127,8 @@ pub const IOCTL_BLOCKS_READ_LBAS_SYNC: u32 = 0x4E56_0003;
 /// (`PAGER_OP_FLUSH`, which issues an NVMe Flush) is required for
 /// fsync-grade durability.
 ///
-/// arg layout (16 bytes, little-endian):
-///   [lba: u32][nlb: u16][_pad: u16][buf_ptr: u64]
+/// arg layout (24 bytes, little-endian):
+///   [lba: u64][nlb: u16][_pad: u16][_pad: u32][buf_ptr: u64]
 /// `buf_ptr` must point to ≥ `nlb * 512` readable bytes. `nlb` is
 /// clamped to the producer's per-command sector limit (NVMe MAX_NLB).
 /// Returns 0 on success, negative errno on submit / completion error.
@@ -107,6 +142,25 @@ pub const IOCTL_BLOCKS_WRITE_LBAS_SYNC: u32 = 0x4E56_0004;
 /// callers true fsync-grade durability after `IOCTL_BLOCKS_WRITE_LBAS_SYNC`.
 pub const IOCTL_BLOCKS_FLUSH_SYNC: u32 = 0x4E56_0005;
 
+/// Block-source ioctl: report the block source's own geometry.
+///
+/// arg layout (12 bytes, little-endian, written by the producer):
+///   [logical_block_size: u32][block_count: u64]
+///
+/// A consumer that has not asked has no licence to assume 512. The
+/// filesystem block a provider addresses in and the logical block the device
+/// addresses in are independent — ext2/3/4 uses 1K–4K filesystem blocks, and
+/// 4Kn NVMe namespaces report a 4096-byte logical block — so a provider that
+/// assumes they match is correct only by coincidence.
+///
+/// `E_AGAIN` while the device has not finished attaching: geometry is a
+/// property of the attached namespace, and a pessimistic guess latched by a
+/// consumer is worse than making it ask again. `E_NOSYS` from a source that
+/// cannot describe itself means 512, which is the answer for every block
+/// source that predates this query — stated here rather than assumed at each
+/// consumer.
+pub const IOCTL_BLOCKS_GEOMETRY: u32 = 0x4E56_0009;
+
 /// Block-source ioctl: submit `nlb` sectors at `lba` from the caller's
 /// buffer **without waiting** — the producer copies the data into a
 /// dedicated in-flight DMA slot, submits the Write, and returns
@@ -116,8 +170,8 @@ pub const IOCTL_BLOCKS_FLUSH_SYNC: u32 = 0x4E56_0005;
 /// spin-polling each one, which is the single biggest write-throughput
 /// lever (see clustor `rfc_async_wal_fsync.md`).
 ///
-/// arg layout (16 bytes, little-endian) — identical to the SYNC form:
-///   [lba: u32][nlb: u16][_pad: u16][buf_ptr: u64]
+/// arg layout (24 bytes, little-endian) — identical to the SYNC form:
+///   [lba: u64][nlb: u16][_pad: u16][_pad: u32][buf_ptr: u64]
 /// Returns 0 on success (queued), `E_AGAIN` when all in-flight slots
 /// are busy (caller retries next step), or a negative errno on submit
 /// error. Durability is NOT implied by return — the caller fences with

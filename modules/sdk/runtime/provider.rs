@@ -287,6 +287,37 @@ unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 
 /// Wire format is `[cmd:u32 LE][arg:arg_len bytes]`. Built-in cmds
 /// (`IOCTL_NOTIFY`, `IOCTL_POLL_NOTIFY` — `arg_len = 4`; `IOCTL_FLUSH`,
 /// `IOCTL_EOF` — `arg_len = 0`) are handled in the kernel. Any other
+/// Owner of the module that invoked the provider frame currently running,
+/// as `(slot, generation)`, or `None` when nothing is on the provider stack.
+///
+/// A provider inside a dispatch uses this to attribute the request it is
+/// serving: which owner's quota to charge, whose permissions apply. `None`
+/// means this module is stepping its own work rather than serving anybody —
+/// background reclamation, a heartbeat — and a provider MUST NOT fall back to
+/// the last caller it saw there, which would charge its own housekeeping to
+/// whoever happened to call it most recently.
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
+#[inline(always)]
+unsafe fn dev_caller_owner(sys: &SyscallTable) -> Option<(u16, u32)> {
+    let mut buf = [0u8; 8];
+    let rc = (sys.provider_query)(
+        -1,
+        abi::kernel_abi::query_key::CALLER_OWNER,
+        buf.as_mut_ptr(),
+        buf.len(),
+    );
+    if rc < 8 {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([buf[0], buf[1]]),
+        u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+    ))
+}
+
 /// `cmd` is forwarded to a module-registered handler bound via
 /// [`dev_channel_register_ioctl`]; that handler reads up to `arg_len`
 /// bytes from `arg` and may write back into the same buffer.

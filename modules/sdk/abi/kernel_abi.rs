@@ -267,6 +267,23 @@ pub mod errno {
     /// with a larger buffer. Used by FS_READDIR when one entry
     /// doesn't fit and no progress could be made.
     pub const E2BIG: i32 = -7;
+    /// Entry already exists. `LINK` against a name that is taken.
+    pub const EEXIST: i32 = -17;
+    /// Target is a directory. `LINK` against one, and `UNLINK` against one
+    /// on a provider that separates directory removal into `RMDIR`.
+    pub const EISDIR: i32 = -21;
+    /// Cross-device link: the two paths are not on the same volume, so no
+    /// second name can reference the same file.
+    pub const EXDEV: i32 = -18;
+    /// Directory not empty. `RMDIR` against a directory that still holds
+    /// entries; the check is the provider's, because a caller's enumeration
+    /// only describes the moment it looked.
+    pub const ENOTEMPTY: i32 = -39;
+    /// No such process / no such context. Answered by
+    /// [`query_key::CALLER_OWNER`] when nothing is on the provider stack —
+    /// there is no requester to name, which is a different statement from
+    /// "the requester is the system owner".
+    pub const ESRCH: i32 = -3;
     /// Resource busy.
     pub const EBUSY: i32 = -16;
     /// No such device.
@@ -277,6 +294,11 @@ pub mod errno {
     pub const EINPROGRESS: i32 = -36;
     /// Function / syscall not implemented.
     pub const ENOSYS: i32 = -38;
+    /// A value is too large for the width the caller asked it in. Used by
+    /// FS_STAT when a file's size does not fit the 32-bit output form, so
+    /// the caller learns to ask again with a wider buffer rather than
+    /// receiving a clamped number it cannot distinguish from a real one.
+    pub const EOVERFLOW: i32 = -75;
     /// Operation not supported (e.g. wrong pin mode).
     pub const ENOTSUP: i32 = -95;
     /// Transport endpoint is not connected.
@@ -549,6 +571,22 @@ pub mod query_key {
     /// `Volatile`; it means the provider did not advertise a
     /// recognised fence and the consumer refuses to proceed.
     pub const LAST_FENCE: u32 = 8;
+
+    /// Owner of the module that invoked the provider frame currently
+    /// running. `handle = -1`; writes `[slot: u16 LE][_pad: u16][generation:
+    /// u32 LE]` (8 bytes) and returns 8.
+    ///
+    /// This is the identity a provider needs to attribute a request, and it
+    /// is a query rather than an argument on `provider_call` on purpose:
+    /// widening that signature is a positional-ABI flag day across every
+    /// module in the fleet, for a fact the kernel already holds. A provider
+    /// that never asks is unaffected.
+    ///
+    /// Returns `ESRCH` when nothing is on the provider stack — a module
+    /// stepping normally is not serving anybody's request, and answering
+    /// with the system owner there would let a provider charge its own
+    /// background work to whoever last called it.
+    pub const CALLER_OWNER: u32 = 9;
 }
 
 // ─────────────────────────────────────────────────────────────────────

@@ -10,8 +10,8 @@
 // random-access file I/O (seek+read, stat-then-read, etc.) where
 // channels would require expensive out-of-band coordination.
 //
-// STAT output buffer layout (8 bytes): `[size: u32 LE, mtime: u32 LE]`.
-// Both `fat32` and `linux_fs_dispatch` populate it per this shape.
+// STAT's output buffer selects its own shape by width — 8, 16 or 48
+// bytes. See `STAT`.
 //
 // ## Handle identity
 //
@@ -77,12 +77,63 @@
 
 pub const OPEN: u32 = 0x0900;
 pub const READ: u32 = 0x0901;
-/// Set the absolute read/write offset. handle=file, arg=`[offset: u32 LE]`.
+/// Set the absolute read/write offset. `handle=file`.
+///
+/// `arg` is `[offset: u32 LE]`, or `[offset: u64 LE]` when `arg_len >= 8`.
+/// Providers MUST accept both widths and select on `arg_len`; callers with
+/// an offset that fits in 32 bits may keep sending the narrow form.
+///
 /// Returns negative errno on failure; any non-negative value is success.
 /// Consumers must not require a particular success value — a provider may
-/// return 0 or the resulting absolute offset.
+/// return 0 or the resulting absolute offset. A provider whose backing
+/// format cannot address the requested offset returns `EINVAL`; `fat32`
+/// does so past 4 GiB, which is the format's own file-size ceiling.
 pub const SEEK: u32 = 0x0902;
 pub const CLOSE: u32 = 0x0903;
+
+/// Report a handle's size and modification time.
+///
+/// `arg` points at an output buffer. Its width selects the shape:
+///
+///   - `arg_len >= 48` → `[size: u64 LE, mtime: u64 LE, ino: u64 LE,
+///     nlink: u32 LE, mode: u32 LE, uid: u32 LE, gid: u32 LE]`
+///   - `arg_len >= 16` → `[size: u64 LE, mtime: u64 LE]`
+///   - `arg_len >= 8` → `[size: u32 LE, mtime: u32 LE]`
+///
+/// Providers MUST serve the first two and return the number of bytes
+/// written, so a consumer learns the width it actually got rather than
+/// assuming the one it asked for.
+///
+/// The wide form exists because 32 bits is a property of FAT32, not of
+/// filesystems: `ext4` addresses files past 4 GiB and stores timestamps that
+/// pass 2038. Making the width a function of the buffer the caller supplies
+/// means a consumer moves to 64-bit when it needs to, against a provider
+/// that already answers, instead of every consumer and provider changing on
+/// the same day. A provider whose true size exceeds what the narrow form can
+/// carry returns `EOVERFLOW` (`-75`) rather than a truncated number.
+///
+/// # The object-model fields
+///
+/// The 48-byte form carries what an inode-based filesystem has and FAT32
+/// does not. A provider serves it only with [`caps::STAT_OBJECT`] set; the
+/// rules for what it may put there are not optional:
+///
+///   - **`ino` is opaque, and 0 means "this volume has no stable file
+///     identity"** — not a valid identity that could collide with a real
+///     one. Nothing may infer identity from anything else; in particular a
+///     start cluster is NOT an inode number, because FAT32 reuses freed
+///     clusters and two files that never coexisted share one. A consumer
+///     caching by it returns the wrong file.
+///   - **`uid`/`gid`/`mode` are reported, not enforced.** A provider whose
+///     format has no permission model reports the mount's declared defaults
+///     and clears [`caps::OWNERSHIP`]; it does NOT report 0, which reads as
+///     root. Enforcement needs an owner identity on the dispatch, which
+///     `provider_call` does not carry.
+///   - **`nlink` is the number of names.** [`UNLINK`] removes a name and
+///     queues storage for reclamation when the last one goes. A provider
+///     without hard links reports 1, which is true.
+///
+/// See `.context/rfc_fs_object_model.md`.
 pub const STAT: u32 = 0x0904;
 /// Blocking byte-durability fence: commit this file's contents and its
 /// own recorded size past the device's volatile cache. `handle=file`.
@@ -203,6 +254,25 @@ pub const MKDIR: u32 = 0x090B;
 /// return `ENOSYS` and leave [`caps::PREALLOCATE`] clear.
 pub const PREALLOCATE: u32 = 0x090E;
 
+/// Shrink an existing file to `len` bytes, releasing the storage past the
+/// new end.
+///
+/// `handle = -1`; `arg` is `[len: u64 LE][path]` — eight length bytes
+/// followed by the UTF-8 path, with `arg_len` covering both.
+///
+/// Shrink only. A `len` greater than the current size returns `EINVAL`:
+/// growing a file by moving its size field would publish storage the file
+/// never wrote as its contents, which on a recycled volume is whatever used
+/// to live there. A caller that wants capacity asks for [`PREALLOCATE`],
+/// which allocates it.
+///
+/// The new size is durable when the call returns; releasing the storage
+/// behind it may be deferred, so a crash can leave a correct shorter file
+/// with storage still attached. Returns `EBUSY` when a writable handle is
+/// open on the file, `EISDIR` for a directory. Providers that do not
+/// support it return `ENOSYS` and leave [`caps::TRUNCATE`] clear.
+pub const TRUNCATE: u32 = 0x090C;
+
 /// Write data through an FD that submits now and proves durability
 /// later — the provider hands the sectors to the block source's async
 /// ring (multiple in flight) and returns. Like plain [`WRITE`], the
@@ -312,6 +382,74 @@ pub const FSYNC_POLL: u32 = 0x0911;
 /// rather than treating file [`FSYNC`] as name publication — it is not.
 pub const FSYNC_NAME: u32 = 0x0912;
 
+/// Remove an empty directory by path.
+///
+/// `handle = -1`; `arg` is the path. Returns `0`, or `ENOTDIR` when the path
+/// is not a directory, `ENOTEMPTY` when it still holds entries, `EBUSY`
+/// while an FD references it, `ENOENT`, or `ENOSYS` where [`caps::RMDIR`]
+/// is clear.
+///
+/// Emptiness is the provider's check, not the caller's: a caller that
+/// enumerated the directory and found it empty has a fact that was true when
+/// it looked. Recursive removal is deliberately not offered — a provider
+/// walking an unbounded tree inside one `provider_call` is exactly the
+/// unbounded-work shape this contract's `EAGAIN` rule exists to prevent, and
+/// a caller that wants it can drive the walk and see each step's outcome.
+///
+/// As with [`UNLINK`], the removal is minted here and published by
+/// [`FSYNC_NAME`] on the path.
+pub const RMDIR: u32 = 0x0915;
+
+/// Add a second name for an existing file.
+///
+/// `handle = -1`; `arg` is the same two-path encoding [`RENAME`] uses:
+///
+/// ```text
+///   [existing_len: u16 LE]
+///   [existing: existing_len bytes UTF-8]
+///   [new_len: u16 LE]
+///   [new: new_len bytes UTF-8]
+/// ```
+///
+/// Returns `0`, or a negative errno: `EEXIST` if the new name is taken,
+/// `ENOENT` if the existing one is not there, `EISDIR` if it is a directory,
+/// `EXDEV` if the two paths are on different volumes, `ENOSYS` where
+/// [`caps::LINK`] is clear.
+///
+/// The name is minted, not fenced. As with [`OPEN_CREATE`], durable
+/// publication is [`FSYNC_NAME`] on the new path — a link that survives the
+/// call but not the power cut is the same failure this contract separates
+/// byte durability from name durability to prevent.
+///
+/// A provider whose format has no second-name concept leaves the bit clear
+/// and returns `ENOSYS`. It does NOT emulate one by copying: two names for
+/// one file and two files with equal contents differ under mutation, and a
+/// consumer that asked for the first would silently get the second.
+pub const LINK: u32 = 0x0913;
+
+/// Read a symbolic link's target without following it.
+///
+/// `handle = -1`; `arg` carries the path in and the target out:
+///
+/// ```text
+///   [path_len: u16 LE][path: path_len bytes UTF-8]
+/// ```
+///
+/// `arg_len` is the size of the WRITABLE buffer, not the path's length —
+/// they are different numbers and a single `arg_len` cannot be both. On
+/// success the target is written at offset 0 and its byte length returned;
+/// `E2BIG` when the buffer cannot hold it (retry with a larger one),
+/// `EINVAL` when the path is not a symlink, `ENOSYS` where
+/// [`caps::SYMLINK`] is clear.
+///
+/// Resolution stays with the caller, and that is the point of having this
+/// opcode at all rather than a "follow links" mode on [`OPEN`]. A provider
+/// that silently follows makes `O_NOFOLLOW` inexpressible, and on a system
+/// where a path is often the whole of an authority check that turns a
+/// symlink into a confused-deputy primitive: the caller names one thing, the
+/// provider opens another, and nothing in the return value says so.
+pub const READLINK: u32 = 0x0914;
+
 /// Rename an entry, publishing the new name durably.
 ///
 /// `handle = -1`; `arg` is:
@@ -413,7 +551,71 @@ pub const RENAME: u32 = 0x090D;
 ///
 /// All FS providers MUST implement `CAPS`. Bits not listed in
 /// [`caps`] are reserved and MUST be returned as 0.
+///
+/// # `EAGAIN` and the probe rule
+///
+/// A capability can depend on the backing volume, not only on the
+/// provider: `fat32` derives [`RENAME`] from the mounted volume's
+/// reserved-sector geometry. A provider whose backing store has not
+/// finished attaching therefore has no answer to give, and MUST return
+/// `EAGAIN` rather than a pessimistic bitmap.
+///
+/// Consumers accordingly MUST treat `EAGAIN` as "ask again", never as
+/// "capability absent", and MUST NOT latch a bitmap they have not
+/// successfully read. The failure this prevents is silent and
+/// permanent: a consumer probing during boot latches a clear bit,
+/// runs its degraded tier for the lifetime of the process, and is
+/// indistinguishable from one running on a volume that genuinely
+/// cannot support the capability.
 pub const CAPS: u32 = 0x09FF;
+
+/// # Errno taxonomy
+///
+/// Three failure classes are distinguished across EVERY opcode in this
+/// contract, because a consumer's correct response differs for each and
+/// collapsing them silently downgrades durability:
+///
+///   - **`ENOSYS` — the provider does not implement this opcode.** A
+///     permanent, structural answer about the provider, and the ONLY
+///     errno that permits a consumer to select a compatibility
+///     fallback. Always accompanied by a clear [`CAPS`] bit, so a
+///     consumer that probes CAPS should never see it.
+///   - **`EAGAIN` — not yet, ask again.** Transient: the mount has not
+///     resolved, a bounded internal resource (fence slots, submission
+///     ring) is momentarily exhausted, or the device is busy. Retry on
+///     a later step. Never a fallback trigger and never an error to
+///     report upward.
+///   - **Everything else (`EIO`, `ENODEV`, `ENOSPC`, `ENOENT`,
+///     `EBUSY`, …) — a real failure of this call.** In particular
+///     `ENODEV` means the provider or its device is *gone*, which is a
+///     failure, NOT permission to proceed in a weaker mode. A consumer
+///     that treats `ENODEV` like `ENOSYS` converts a dead device into
+///     a silent durability downgrade.
+///
+/// The distinction is load-bearing on [`PREALLOCATE`] specifically,
+/// where all three are reachable: `ENOSYS` selects a dynamically
+/// growing file, `EAGAIN` means retry, and `ENODEV`/`ENOSPC`/`EIO`
+/// MUST fail whatever admission the preallocation was gating.
+pub mod errno_classes {
+    /// Opcode not implemented by this provider. The only fallback trigger.
+    pub const UNSUPPORTED: i32 = -38;
+    /// Not yet — retry on a later step. Never a fallback trigger.
+    pub const TRANSIENT: i32 = -11;
+
+    /// True when `rc` permits a consumer to select a compatibility
+    /// fallback for the opcode that returned it. Deliberately narrow:
+    /// every other negative rc is a failure of this call.
+    #[must_use]
+    pub const fn permits_fallback(rc: i32) -> bool {
+        rc == UNSUPPORTED
+    }
+
+    /// True when `rc` means the call should simply be retried.
+    #[must_use]
+    pub const fn is_transient(rc: i32) -> bool {
+        rc == TRANSIENT
+    }
+}
 
 /// Capability bits returned by the [`CAPS`] opcode. A provider
 /// sets bit B iff calling the corresponding entry-point or
@@ -454,8 +656,8 @@ pub mod caps {
     // provider implementations land in lockstep.
     /// [`UNLINK`] (0x090A) — remove a file by path.
     pub const UNLINK:         u32 = 1 << 5;
-    /// Reserved for `TRUNCATE` (0x090C, the free slot between [`MKDIR`] and
-    /// [`RENAME`]).
+    /// [`TRUNCATE`] (0x090C) — shrink a file, releasing the storage past
+    /// the new end.
     pub const TRUNCATE:       u32 = 1 << 6;
     /// [`MKDIR`] (0x090B) — create one directory by path.
     pub const MKDIR:          u32 = 1 << 7;
@@ -474,4 +676,26 @@ pub mod caps {
     /// entry. Set iff the provider can prove a name reaches non-volatile
     /// media independently of the file's own bytes.
     pub const FSYNC_NAME:     u32 = 1 << 11;
+
+    // ── Object-model tier ───────────────────────────────────
+    // What an inode-based filesystem carries and FAT32 does not. A provider
+    // whose format has no answer clears the bit rather than fabricating one;
+    // see `.context/rfc_fs_object_model.md`.
+    /// [`STAT`]'s 48-byte form is served — `ino`, `nlink`, `mode`, `uid`,
+    /// `gid` in addition to size and mtime.
+    pub const STAT_OBJECT:    u32 = 1 << 12;
+    /// `uid`/`gid`/`mode` describe a real permission model rather than the
+    /// mount's declared defaults. Reporting only; enforcement needs an owner
+    /// identity on the dispatch, which `provider_call` does not carry.
+    pub const OWNERSHIP:      u32 = 1 << 13;
+    /// A name can be added to an existing file, and `nlink` counts names.
+    pub const LINK:           u32 = 1 << 14;
+    /// [`RMDIR`] (0x0915) — remove an empty directory by path.
+    pub const RMDIR:          u32 = 1 << 16;
+    /// Symbolic links exist on this volume and `READLINK` resolves one.
+    /// Resolution stays in the consumer: a provider that silently follows
+    /// links makes `O_NOFOLLOW` inexpressible and turns a symlink into a
+    /// confused-deputy primitive on a system where a path is often the whole
+    /// of an authority check.
+    pub const SYMLINK:        u32 = 1 << 15;
 }

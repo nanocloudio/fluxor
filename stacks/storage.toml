@@ -23,8 +23,12 @@ wiring = [
 # `bind = "m2_primary"` selects the board-local alias for the external
 # NVMe HAT+. Board topology (root complex, slot, MSI GIC SPI) lives
 # in the platform's PCIe alias table — nothing here or in user YAML
-# names `pcie1` directly. `fat32.block_writes → nvme.requests` is the
-# write path; drop that edge if only reads are needed.
+# names `pcie1` directly.
+#
+# One edge, both directions: `fat32` reads and writes through the block
+# source's synchronous ioctls on `blocks`, so there is no separate
+# write-request channel to wire and no way to compose a half-writable
+# volume by forgetting an edge.
 [[variant]]
 match = { board = "pi5", media = "nvme" }
 modules = [
@@ -33,7 +37,6 @@ modules = [
 ]
 wiring = [
   "nvme.blocks -> fat32.blocks",
-  "fat32.block_writes -> nvme.requests",
 ]
 
 # ── Linux: host filesystem ──────────────────────────────────────────────

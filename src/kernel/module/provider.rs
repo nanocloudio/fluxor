@@ -997,6 +997,28 @@ pub fn release_module_providers(module_idx: u8) {
 /// Module provider chain top takes priority. Falls back to kernel provider.
 /// Returns E_NOSYS if no provider is registered for this contract.
 ///
+/// Run a provider's dispatch with `module_idx` as the current module and the
+/// previous one published as the caller.
+///
+/// Both halves are restored on the way out, so nesting is exact: a provider
+/// that calls another provider is that one's caller, and the original
+/// requester is restored when the inner frame returns. This is the whole of
+/// the caller-identity mechanism — `provider_call` deliberately carries no
+/// owner argument, because widening it is a positional-ABI flag day across
+/// every module in the fleet for a fact the kernel already holds.
+#[inline]
+fn in_provider_frame<R>(module_idx: usize, f: impl FnOnce() -> R) -> R {
+    use crate::kernel::exec::scheduler;
+    let saved_current = scheduler::current_module_index();
+    let saved_caller = scheduler::caller_module_index();
+    scheduler::set_caller_module(saved_current);
+    scheduler::set_current_module(module_idx);
+    let result = f();
+    scheduler::set_current_module(saved_current);
+    scheduler::set_caller_module(saved_caller);
+    result
+}
+
 /// # Safety
 /// `arg` must satisfy the aliasing and validity requirements expected by the
 /// registered dispatch handler for the given `contract` and `opcode`.
@@ -1023,10 +1045,9 @@ pub unsafe fn dispatch(
         // backends are reached only via `dispatch_to`.
         if let Some(top) = default_layer_index(entry) {
             if let Some(ref layer) = entry.chain[top] {
-                let saved = crate::kernel::exec::scheduler::current_module_index();
-                crate::kernel::exec::scheduler::set_current_module(layer.module_idx as usize);
-                let result = (layer.dispatch)(layer.state, handle, opcode, arg, arg_len);
-                crate::kernel::exec::scheduler::set_current_module(saved);
+                let result = in_provider_frame(layer.module_idx as usize, || {
+                    (layer.dispatch)(layer.state, handle, opcode, arg, arg_len)
+                });
                 return result;
             }
         }
@@ -1120,10 +1141,9 @@ pub unsafe fn dispatch_next(
         // Dispatch to layer below
         let below = pos - 1;
         if let Some(ref layer) = entry.chain[below] {
-            let saved = crate::kernel::exec::scheduler::current_module_index();
-            crate::kernel::exec::scheduler::set_current_module(layer.module_idx as usize);
-            let result = (layer.dispatch)(layer.state, handle, opcode, arg, arg_len);
-            crate::kernel::exec::scheduler::set_current_module(saved);
+            let result = in_provider_frame(layer.module_idx as usize, || {
+                (layer.dispatch)(layer.state, handle, opcode, arg, arg_len)
+            });
             return result;
         }
 
@@ -1202,10 +1222,9 @@ pub unsafe fn provider_call_sel(
         for i in 0..entry.depth as usize {
             if let Some(ref layer) = entry.chain[i] {
                 if layer.selector == want {
-                    let saved = crate::kernel::exec::scheduler::current_module_index();
-                    crate::kernel::exec::scheduler::set_current_module(layer.module_idx as usize);
-                    let result = (layer.dispatch)(layer.state, op_handle, opcode, arg, arg_len);
-                    crate::kernel::exec::scheduler::set_current_module(saved);
+                    let result = in_provider_frame(layer.module_idx as usize, || {
+                        (layer.dispatch)(layer.state, op_handle, opcode, arg, arg_len)
+                    });
                     return result;
                 }
             }

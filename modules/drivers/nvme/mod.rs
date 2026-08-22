@@ -105,6 +105,20 @@ const ID_FR: usize = 64; // 8 bytes
 /// is unnecessary by spec (NVMe 1.4 §5.21.1.18 / Flush §6.8); when 1, an
 /// explicit Flush is REQUIRED on fsync to commit the cache to NAND.
 const ID_VWC: usize = 525;
+/// Identify Controller bytes 42..43 (AWUPF, NVMe 1.4 §5.15.2.1): Atomic
+/// Write Unit Power Fail, in logical blocks, reported 0-BASED — a value
+/// of 0 means one block.
+///
+/// This is the field every "one sector write is failure-atomic"
+/// argument in the stack rests on. `fat32` places a directory entry, a
+/// FAT entry, and its rename intent record each inside a single sector
+/// precisely so that an interrupted write leaves the old contents or
+/// the new, never a blend; `consensus` and `durability` then build
+/// two-slot recovery on top of that. Every one of those arguments is
+/// only as true as this number, so it is read and reported rather than
+/// assumed: an operator or a rig check can see what the device on this
+/// machine actually promises.
+const ID_AWUPF: usize = 42;
 
 // Timeouts (ms). Declared CAP.TO can be 50 s but typical is < 100 ms.
 const RESET_BUDGET_MS: u64 = 500;
@@ -409,7 +423,7 @@ struct NvmeState {
     // `discard_cqe` is set when a seek arrives while a read is still
     // in flight — the CQE still has to be harvested to free the I/O
     // queue slot, but we must not write its data to the channel.
-    current_block: u32,
+    current_block: u64,
     write_offset: u16,
     blk_phase: u8,
     discard_cqe: u8,
@@ -421,7 +435,7 @@ struct NvmeState {
     /// `pending_batch_valid == 0` means no batch is queued; the IDLE
     /// tick falls back to the per-sector path driven by
     /// `IOCTL_NOTIFY` / `current_block`.
-    pending_batch_lba: u32,
+    pending_batch_lba: u64,
     pending_batch_nlb: u16,
     pending_batch_valid: u8,
     /// Set to 1 by `apply_pending_seek` when an IOCTL_NOTIFY-driven
@@ -890,7 +904,7 @@ unsafe fn heartbeat(s: &mut NvmeState) {
     let cb = b" blk=";
     core::ptr::copy_nonoverlapping(cb.as_ptr(), p.add(pos), cb.len());
     pos += cb.len();
-    write_dec3(p, &mut pos, s.current_block);
+    write_dec3(p, &mut pos, s.current_block as u32);
     let bp = b" bp=";
     core::ptr::copy_nonoverlapping(bp.as_ptr(), p.add(pos), bp.len());
     pos += bp.len();
@@ -1110,6 +1124,16 @@ unsafe fn emit_identify_info(s: &NvmeState) {
     pos += vwc_tag.len();
     *p.add(pos) = b'0' + vwc;
     pos += 1;
+    // AWUPF (bytes 42..43, 0-based): how many logical blocks this
+    // controller writes atomically across a power failure. Reported in
+    // BLOCKS, already converted from the 0-based encoding, so `AWUPF=1`
+    // reads as "one block is atomic" — the guarantee `fat32`'s
+    // single-sector metadata writes depend on.
+    let awupf = (u16::from(*id.add(ID_AWUPF)) | (u16::from(*id.add(ID_AWUPF + 1)) << 8)) + 1;
+    let aw_tag = b" AWUPF=";
+    core::ptr::copy_nonoverlapping(aw_tag.as_ptr(), p.add(pos), aw_tag.len());
+    pos += aw_tag.len();
+    write_dec3(p, &mut pos, u32::from(awupf.min(999)));
     dev_log(&*s.syscalls, 3, p, pos);
 }
 
@@ -2049,7 +2073,7 @@ unsafe fn apply_pending_seek(s: &mut NvmeState) -> bool {
         4,
     );
     if res == 0 {
-        s.current_block = seek;
+        s.current_block = u64::from(seek);
         s.write_offset = 0;
         // A per-sector seek supersedes any not-yet-submitted batch
         // — fat32 alternates batch reads with single-sector FAT
@@ -2690,7 +2714,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
                 (s.current_block, 1u16)
             };
             s.blk_nlb = nlb;
-            submit_io_read(s, lba as u64, nlb, CID_READ_LBA0);
+            submit_io_read(s, lba, nlb, CID_READ_LBA0);
             s.blk_phase = BLK_PHASE_READING;
             0
         }
@@ -2733,7 +2757,7 @@ unsafe fn step_ready(s: &mut NvmeState) -> i32 {
             s.tlm.bytes_out = s.tlm.bytes_out.wrapping_add(written);
             s.write_offset += written as u16;
             if s.write_offset as u32 >= batch_bytes {
-                s.current_block = s.current_block.wrapping_add(s.blk_nlb as u32);
+                s.current_block = s.current_block.wrapping_add(u64::from(s.blk_nlb));
                 s.write_offset = 0;
                 s.blk_phase = BLK_PHASE_IDLE;
                 // Burst: kick straight into IDLE so a queued NOTIFY (or
@@ -2819,6 +2843,33 @@ unsafe extern "C" fn nvme_ioctl_handler(state: *mut c_void, cmd: u32, arg: *mut 
     0
 }
 
+/// Parse the block contract's ioctl argument at the offsets the SDK
+/// declares (`blk_arg`).
+///
+/// Returns `None` for a zero sector count. `nlb` is clamped to the
+/// controller's per-command limit — the contract says so, and a caller that
+/// asks for more gets a short transfer rather than a rejected one.
+///
+/// # Safety
+/// `arg` must point at least `blk_arg::LEN` readable bytes.
+#[inline]
+unsafe fn parse_blk_arg(arg: *const u8) -> Option<(u64, u16, u64)> {
+    let mut lba_b = [0u8; 8];
+    let mut buf_b = [0u8; 8];
+    let mut i = 0usize;
+    while i < 8 {
+        lba_b[i] = *arg.add(blk_arg::LBA + i);
+        buf_b[i] = *arg.add(blk_arg::BUF_PTR + i);
+        i += 1;
+    }
+    let nlb_raw = u16::from_le_bytes([*arg.add(blk_arg::NLB), *arg.add(blk_arg::NLB + 1)]);
+    if nlb_raw == 0 {
+        return None;
+    }
+    let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
+    Some((u64::from_le_bytes(lba_b), nlb, u64::from_le_bytes(buf_b)))
+}
+
 /// Services block-device ioctls on `blk_out`:
 ///
 /// * [`IOCTL_BLOCKS_READ_NLB`] — async batch read. Records
@@ -2842,74 +2893,55 @@ unsafe extern "C" fn nvme_blocks_ioctl_handler(state: *mut c_void, cmd: u32, arg
         return E_INVAL;
     }
     match cmd {
-        IOCTL_BLOCKS_READ_NLB => {
-            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 {
-                return E_INVAL;
+        IOCTL_BLOCKS_GEOMETRY => {
+            // `ns_lbads` is the LBA data size exponent of the format the
+            // namespace is actually using, so it answers for this device
+            // rather than for the 512-byte case. A namespace that has not
+            // reported yet has no geometry to give.
+            if s.ns_size == 0 || s.ns_lbads == 0 {
+                return E_AGAIN;
             }
-            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
+            let lbs: u32 = 1u32 << s.ns_lbads;
+            let lbs_b = lbs.to_le_bytes();
+            let cnt_b = s.ns_size.to_le_bytes();
+            let mut i = 0usize;
+            while i < 4 {
+                *arg.add(i) = lbs_b[i];
+                i += 1;
+            }
+            i = 0;
+            while i < 8 {
+                *arg.add(4 + i) = cnt_b[i];
+                i += 1;
+            }
+            12
+        }
+        IOCTL_BLOCKS_READ_NLB => {
+            let Some((lba, nlb, _)) = parse_blk_arg(arg) else {
+                return E_INVAL;
+            };
             s.pending_batch_lba = lba;
             s.pending_batch_nlb = nlb;
             s.pending_batch_valid = 1;
             0
         }
         IOCTL_BLOCKS_READ_LBAS_SYNC => {
-            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 {
+            let Some((lba, nlb, buf)) = parse_blk_arg(arg) else {
                 return E_INVAL;
-            }
-            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
-            let buf_u64 = u64::from_le_bytes([
-                *arg.add(8),
-                *arg.add(9),
-                *arg.add(10),
-                *arg.add(11),
-                *arg.add(12),
-                *arg.add(13),
-                *arg.add(14),
-                *arg.add(15),
-            ]);
-            sync_blk_read(s, lba as u64, nlb, buf_u64 as *mut u8)
+            };
+            sync_blk_read(s, lba, nlb, buf as *mut u8)
         }
         IOCTL_BLOCKS_WRITE_LBAS_SYNC => {
-            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 {
+            let Some((lba, nlb, buf)) = parse_blk_arg(arg) else {
                 return E_INVAL;
-            }
-            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
-            let buf_u64 = u64::from_le_bytes([
-                *arg.add(8),
-                *arg.add(9),
-                *arg.add(10),
-                *arg.add(11),
-                *arg.add(12),
-                *arg.add(13),
-                *arg.add(14),
-                *arg.add(15),
-            ]);
-            sync_blk_write(s, lba as u64, nlb, buf_u64 as *const u8)
+            };
+            sync_blk_write(s, lba, nlb, buf as *const u8)
         }
         IOCTL_BLOCKS_WRITE_LBAS_ASYNC => {
-            let lba = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let nlb_raw = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
-            if nlb_raw == 0 {
+            let Some((lba, nlb, buf)) = parse_blk_arg(arg) else {
                 return E_INVAL;
-            }
-            let nlb = if nlb_raw > MAX_NLB { MAX_NLB } else { nlb_raw };
-            let buf_u64 = u64::from_le_bytes([
-                *arg.add(8),
-                *arg.add(9),
-                *arg.add(10),
-                *arg.add(11),
-                *arg.add(12),
-                *arg.add(13),
-                *arg.add(14),
-                *arg.add(15),
-            ]);
-            async_blk_write(s, lba as u64, nlb, buf_u64 as *const u8)
+            };
+            async_blk_write(s, lba, nlb, buf as *const u8)
         }
         IOCTL_BLOCKS_FENCE_SUBMIT => {
             // Harvest first so the ticket reflects completions that already

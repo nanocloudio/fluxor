@@ -14,7 +14,7 @@
 //! memcpy bandwidth per sustained stream-second. See `step` below.
 //!
 //! A position-only pattern (`byte_at(off) = (off ^ off>>8) as u8`)
-//! matching `fat32`'s `seed_pattern=1` write path is retained as
+//! matching `fat32_seed`'s `pattern = 1` payload is retained as
 //! `fill_pattern` below and can be re-enabled in the hot path for
 //! byte-exact verifier runs; a future fat32-seeded NVMe read test
 //! could then verify equivalence between the two sources by comparing

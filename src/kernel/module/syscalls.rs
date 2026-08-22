@@ -2315,6 +2315,31 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
                 stats_size as i32
             }
             dev_query_key::LAST_FENCE => last_fence_query(handle, out, out_len),
+            dev_query_key::CALLER_OWNER => {
+                if out.is_null() || out_len < 8 {
+                    return E_INVAL;
+                }
+                let caller = crate::kernel::exec::scheduler::caller_module_index();
+                // Nothing on the provider stack means this module is stepping
+                // its own work, not serving a request. Answering with an
+                // owner here would let a provider charge background work to
+                // whoever called it last, which is worse than no answer.
+                if caller >= crate::kernel::exec::scheduler::MAX_MODULES {
+                    return errno::ESRCH;
+                }
+                let owner = crate::kernel::exec::scheduler::module_owner(caller);
+                let slot = owner.slot.to_le_bytes();
+                let generation = owner.generation.to_le_bytes();
+                *out = slot[0];
+                *out.add(1) = slot[1];
+                *out.add(2) = 0;
+                *out.add(3) = 0;
+                *out.add(4) = generation[0];
+                *out.add(5) = generation[1];
+                *out.add(6) = generation[2];
+                *out.add(7) = generation[3];
+                8
+            }
             _ => E_NOSYS,
         };
     }

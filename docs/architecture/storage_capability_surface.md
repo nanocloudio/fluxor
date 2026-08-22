@@ -374,6 +374,28 @@ Both are optional capabilities (`caps::FSYNC_NAME`, `caps::RENAME`). A
 consumer that needs crash-safe publication queries `CAPS` and fails closed
 when the bit it needs is clear.
 
+### The object-model tier
+
+`STAT_OBJECT`, `OWNERSHIP`, `LINK` and `SYMLINK` cover what an inode-based
+filesystem carries and FAT32 does not: `STAT`'s 48-byte form (`ino`, `nlink`,
+`mode`, `uid`, `gid`), a second name for a file, and symbolic links. A
+provider answers only what its format holds and clears the bit otherwise —
+FAT32 clears all four, which is honest rather than degraded. The host
+provider serves all of `STAT_OBJECT`, `OWNERSHIP`, `RMDIR`, `LINK` and
+`SYMLINK` because `fstat`, `link(2)` and `readlink(2)` already answer them.
+
+`ino = 0` is defined as "this volume has no stable file identity", not as a
+valid identity, and nothing may infer identity from anything else — a start
+cluster is not an inode number, because FAT32 reuses freed clusters and two
+files that never coexisted share one.
+
+Ownership is *reported*, and enforcement of a per-owner policy is a separate
+question answered by `query_key::CALLER_OWNER`: the owner of the module that
+invoked the current provider frame. It is a query rather than an argument on
+`provider_call` because widening that signature is a positional-ABI flag day
+across every module for a fact the kernel already holds. See
+`.context/rfc_fs_object_model.md`.
+
 Publication lives on the byte-tier surface rather than moving to
 `storage.namespace` because `OPEN_CREATE` and `MKDIR` are already the
 fused `BIND` + open forms (see `namespace.rs::BIND`); `FSYNC_NAME` and
@@ -404,9 +426,19 @@ cannot move the on-media size backwards. A preallocated fixed-capacity
 file has no metadata to publish and skips the second stage entirely.
 
 Name durability on FAT32 is `FSYNC_NAME`: every name-minting op
-(`OPEN_CREATE`, `UNLINK`) already writes its directory sector
-synchronously, so the opcode resolves the parent and issues the device
+(`OPEN_CREATE`, `MKDIR`, `UNLINK`, `RMDIR`) already writes its directory
+sector synchronously, so the opcode resolves the parent and issues the device
 Flush that commits it.
+
+A name that does not fit 8.3 is carried as a long-name companion set written
+*in front of* the entry it names, with a synthesised `BASE~N.EXT` alias in
+the 8.3 field the format indexes by. The companions land before the entry and
+are retired after it, so a crash can only leave companions naming nothing —
+which every reader ignores. Lookup matches whichever form the name is in: the
+alias depends on what else is in the directory, so it cannot be re-derived
+from the caller's name, and a provider that generated aliases without also
+matching on the companion run would let a caller write a file it could never
+open again.
 
 `RENAME` has no single-sector form when the two entries fall in different
 sectors, so it is ordered to be recoverable instead. An intent record in
@@ -566,7 +598,7 @@ into the runtime rather than loadable modules:
 
 On bare metal, `foundation/fat32` provides `file.data` over a
 `storage.block` channel: random-access reads through the FS contract,
-writes emitted as block-write requests on its `block_writes` output port
+reads and writes both riding the block source's synchronous ioctls on its `blocks` input port
 (typically wired to `nvme.requests`), and directory listing served
 through the FS contract's `OPENDIR` / `READDIR`. It does not implement
 the `storage.namespace` contract.
