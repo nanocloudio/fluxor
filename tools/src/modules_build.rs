@@ -490,11 +490,18 @@ pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
     // building rather than demanding a manual re-sync.
     crate::store_sync::ensure_synced(&opts.project_root)
         .map_err(|e| crate::error::Error::Config(e.to_string()))?;
+    let candidates = discover(&opts.project_root)?;
+    // A project with no module tree (a portable-core-only repo) has
+    // nothing to build and, per the fluxor.toml schema gate, declares
+    // no `[ci].targets`; report an empty build rather than demanding a
+    // target matrix for zero modules.
+    if candidates.is_empty() {
+        return Ok(BuildReport::default());
+    }
     let targets = match &opts.selector {
         TargetSelector::One(t) => vec![t.clone()],
         TargetSelector::All => resolve_all_targets(&opts.project_root)?,
     };
-    let candidates = discover(&opts.project_root)?;
     let mut report = BuildReport::default();
     for target in targets {
         report
