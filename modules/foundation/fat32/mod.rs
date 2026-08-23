@@ -790,6 +790,9 @@ struct Fat32State {
     /// Serial the graph declared it expects (param `expect_volume_id`), or 0
     /// when it declared none.
     expect_volume_id: u32,
+    /// Latch for the serial-mismatch report, so a refusal that repeats on
+    /// every call is described once.
+    volume_mismatch_logged: u8,
     /// Free clusters on the volume, and whether that number is trustworthy.
     /// Maintained incrementally; see [`fs_free_count_add`].
     free_count: u32,
@@ -951,6 +954,7 @@ impl Fat32State {
         self.io_rc = 0;
         self.volume_id = 0;
         self.expect_volume_id = 0;
+        self.volume_mismatch_logged = 0;
         self.free_count = 0;
         self.free_count_known = 0;
         // Unknown until the mount reads FAT[1]; treated as dirty so the
@@ -4162,6 +4166,24 @@ unsafe fn fs_step_free_chains(s: &mut Fat32State) {
 /// just-written cluster is warm, so the subsequent dir scan never cold-reads it
 /// (a cold first-touch read can blow the cooperative step guard). Clean-slate
 /// only — discards existing root-dir entries.
+/// Write a volume serial as `XXXX-XXXX` — the form `blkid` and
+/// `fatlabel -i` print, so a serial read off telemetry and one read off a
+/// host tool compare directly. 9 bytes.
+///
+/// # Safety
+/// `dst` must be valid for writes of 9 bytes. Bounds are not checked.
+unsafe fn fmt_volume_id(dst: *mut u8, id: u32) -> usize {
+    let mut i = 0usize;
+    while i < 8 {
+        let nib = ((id >> (28 - i * 4)) & 0x0F) as u8;
+        let ch = if nib < 10 { b'0' + nib } else { b'A' + nib - 10 };
+        *dst.add(if i < 4 { i } else { i + 1 }) = ch;
+        i += 1;
+    }
+    *dst.add(4) = b'-';
+    9
+}
+
 unsafe fn fs_clean_root(s: &mut Fat32State) {
     let spc = s.sectors_per_cluster as u32;
     if spc == 0 || s.root_cluster < 2 {
@@ -6962,6 +6984,20 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         && s.init_phase == Fat32InitPhase::Done
         && s.volume_id != s.expect_volume_id
     {
+        if s.volume_mismatch_logged == 0 {
+            s.volume_mismatch_logged = 1;
+            let mut msg = [0u8; 64];
+            let mp = msg.as_mut_ptr();
+            let head = b"[fat32] volume ";
+            core::ptr::copy_nonoverlapping(head.as_ptr(), mp, head.len());
+            let mut n = head.len();
+            n += fmt_volume_id(mp.add(n), s.volume_id);
+            let mid = b" is not the expected ";
+            core::ptr::copy_nonoverlapping(mid.as_ptr(), mp.add(n), mid.len());
+            n += mid.len();
+            n += fmt_volume_id(mp.add(n), s.expect_volume_id);
+            dev_log(s.sys(), 2, mp, n);
+        }
         return E_NODEV;
     }
     // Clean-slate wipe BEFORE the first operation of any kind (see the
@@ -6975,7 +7011,13 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
             // not pedantry: this is the one parameter whose effect cannot be
             // undone, and "whatever is on the blocks channel" is not a
             // specific enough answer to the question of which volume.
-            dev_log(s.sys(), 4, b"[fat32] clean_root needs expect_volume_id".as_ptr(), 41);
+            let mut msg = [0u8; 64];
+            let mp = msg.as_mut_ptr();
+            let head = b"[fat32] clean_root needs expect_volume_id: ";
+            core::ptr::copy_nonoverlapping(head.as_ptr(), mp, head.len());
+            let mut n = head.len();
+            n += fmt_volume_id(mp.add(n), s.volume_id);
+            dev_log(s.sys(), 2, mp, n);
         } else {
             fs_begin_mutation(s);
             fs_clean_root(s);
@@ -7183,6 +7225,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             pos += cl_tag.len();
             *p.add(pos) = b'0' + s.volume_clean;
             pos += 1;
+            // Which volume this is. `expect_volume_id` is the only way to
+            // authorise the destructive parameters, and this is where its
+            // value is read from.
+            let vol_tag = b" vol=";
+            core::ptr::copy_nonoverlapping(vol_tag.as_ptr(), p.add(pos), vol_tag.len());
+            pos += vol_tag.len();
+            pos += fmt_volume_id(p.add(pos), s.volume_id);
             dev_log(s.sys(), 3, p, pos);
         }
 

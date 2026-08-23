@@ -207,6 +207,20 @@ The destructive parameters refuse to act unless the graph has named the
 volume by serial. "Whatever is on the blocks channel" is not a specific
 enough answer to the question of which volume to wipe.
 
+The serial to put in `expect_volume_id` is reported by the module itself,
+as `vol=` on its heartbeat:
+
+```
+[fat32] hb init=12 files=003 fds=2 clean=0 vol=1A2B-3C4D
+```
+
+It is printed in the `XXXX-XXXX` form `blkid` and `fatlabel -i` use, so a
+serial read off a running graph and one read off a host tool compare
+without conversion. `expect_volume_id` takes the same digits as a number
+(`0x1A2B3C4D`). Both refusals name the serial too: a graph that asks to
+wipe a volume it has not named reports the one it found, and a serial
+mismatch reports what is on the device against what was expected.
+
 ## Limits, stated rather than discovered
 
 - **4 GiB files, 2 TiB volumes.** The format's own ceilings. `SEEK` and
