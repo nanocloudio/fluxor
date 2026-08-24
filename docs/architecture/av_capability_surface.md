@@ -24,7 +24,7 @@ AV pipelines move data on channels typed by `content_type`:
 | `AudioEncoded`  | Codec-domain audio access units     | re-encode, RTP / VoIP, storage paths                      |
 | `VideoEncoded`  | Codec-domain video access units     | hardware decode, transcoders, broadcast packagers         |
 | `VideoDraw`     | Retained / replayable draw lists    | UI / layout, browser, dashboard, remote-desktop UI        |
-| `VideoRaster`   | Pixel-domain frames / regions       | image codecs; `st7701s`, `linux_display`, `wasm_browser_canvas` (sinks) |
+| `VideoRaster`   | Pixel-domain frames / regions       | image codecs, `wasm_browser_display_capture` (sources); `st7701s`, `linux_display`, `wasm_browser_canvas` (sinks) |
 | `VideoScanout`  | Present-ready frames to a paced sink| compositor → HDMI / DSI sink, page-flip, vsync handoff    |
 | `MediaMuxed`    | Deliberate AV / timing / container  | recording, broadcast packaging, MP4 / TS streams          |
 
@@ -69,6 +69,8 @@ content-type wiring matches against `video.scanout`.
 - `display.scanout` — paced display output with frame-boundary present
 - `display.multihead` — more than one coordinated display output
 - `display.scanout.protected` — scanout path for rights-managed content
+- `display.capture` — produces frames of a display owned elsewhere (a
+  shared screen, window, or tab), as opposed to *being* one
 - `video.decode` / `video.encode` — hardware-assisted decode/encode endpoints
 - `video.decode.protected` — protected decode path
 - `audio.output.protected` — protected audio output path

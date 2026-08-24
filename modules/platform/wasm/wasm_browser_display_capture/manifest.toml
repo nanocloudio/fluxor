@@ -1,0 +1,67 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# Browser display-capture source: frames of a surface the *user* chose to
+# share, as `VideoRaster`.
+#
+# The peer of `wasm_browser_canvas`. That module presents pixels this host
+# owns; this one produces pixels the host does not own — a screen, a window,
+# or a tab the person picked in the browser's own share dialog. Everything
+# downstream (encode, remote channel, endpoint gateway) already exists; what
+# did not exist was a producer, which is why this module is the whole of the
+# screen-sharing gap on this target.
+#
+# `getDisplayMedia` is the browser's only display-capture API, so capture is
+# JS (the host shim's `host_display_frame` import) and the graph side is this
+# leaf. The shim asks lazily, on the first pull, because a permission prompt
+# at boot is a prompt with no context.
+#
+# The frame format is the one every present backend already speaks: RGB565-LE
+# behind an `SRF1` header (`sector/modules/common/sector_raster.rs`), so
+# `capture.pixels -> display.pixels` resolves against `linux_display`,
+# `st7701s`, and `wasm_browser_canvas` without a converter.
+
+# `video.raster` is the surface it carries. `display.capture` is the role: it
+# produces frames of a display that exists somewhere else. Nothing in the
+# registry said that before — `display.scanout` is what a display *is*, and a
+# viewer that cannot tell a shared screen from a camera cannot tell a person
+# what is being shared.
+capabilities = ["video.raster", "display.capture"]
+
+[[ports]]
+name = "pixels"
+direction = "output"
+content_type = "VideoRaster"
+required = true
+
+# Backing size, not the shared size. The person choosing what to share is the
+# one who decides the geometry, and they may change it mid-session by picking
+# a different window; these bound the buffer, and the per-frame SRF1 header
+# carries what actually arrived.
+[[params]]
+name = "width"
+tag = 10
+type = "u16"
+required = true
+
+[[params]]
+name = "height"
+tag = 11
+type = "u16"
+required = true
+
+# Defaults to 1, the opposite of `wasm_browser_canvas`: a capture source
+# cannot promise the configured geometry, so the stream has to describe
+# itself. Set to 0 only when the consumer has no header mode and the
+# capture is known to be fixed-size.
+[[params]]
+name = "header"
+tag = 12
+type = "u16"
+default = 1
+range = [0, 1]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; carries media samples, not a measurable on-device byte stream"

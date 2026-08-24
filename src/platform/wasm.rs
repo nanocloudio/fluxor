@@ -23,6 +23,9 @@ mod canvas;
 #[path = "wasm/camera.rs"]
 mod camera;
 
+#[path = "wasm/display_capture.rs"]
+mod display_capture;
+
 #[path = "wasm/scan_out.rs"]
 mod scan_out;
 
@@ -125,9 +128,9 @@ mod hal;
 
 use crate::platform::builtin_param_tags::{
     host_browser_fetch as fetch_tags, wasm_browser_audio as audio_tags,
-    wasm_browser_canvas as canvas_tags, wasm_browser_gpu as gpu_tags,
-    wasm_browser_image_codec as image_codec_tags, wasm_browser_websocket as websocket_tags,
-    wasm_browser_ws_source as ws_source_tags,
+    wasm_browser_canvas as canvas_tags, wasm_browser_display_capture as display_capture_tags,
+    wasm_browser_gpu as gpu_tags, wasm_browser_image_codec as image_codec_tags,
+    wasm_browser_websocket as websocket_tags, wasm_browser_ws_source as ws_source_tags,
 };
 
 /// Lightweight TLV walker for built-in module params. Mirrors
@@ -365,6 +368,7 @@ use crate::abi::wire::fnv1a32;
 
 const WASM_BROWSER_CANVAS_HASH: u32 = fnv1a32(b"wasm_browser_canvas");
 const WASM_BROWSER_CAMERA_HASH: u32 = fnv1a32(b"wasm_browser_camera");
+const WASM_BROWSER_DISPLAY_CAPTURE_HASH: u32 = fnv1a32(b"wasm_browser_display_capture");
 const WASM_BROWSER_SCAN_OUT_HASH: u32 = fnv1a32(b"wasm_browser_scan_out");
 const WASM_BROWSER_DOM_INPUT_HASH: u32 = fnv1a32(b"wasm_browser_dom_input");
 const WASM_BROWSER_KEYBOARD_HASH: u32 = fnv1a32(b"wasm_browser_keyboard");
@@ -603,6 +607,44 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_camera (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        // Display-capture source: frames of the surface the person chose to
+        // share. Heap-sized from the params, like canvas, because the buffer
+        // is also the bound on what a stream-supplied header may claim.
+        if entry.name_hash == WASM_BROWSER_DISPLAY_CAPTURE_HASH {
+            let mut width = 0u16;
+            let mut height = 0u16;
+            let mut header = true;
+            walk_tlv(entry.params(), |tag, value| match tag {
+                display_capture_tags::TAG_WIDTH => width = tlv_u32(value) as u16,
+                display_capture_tags::TAG_HEIGHT => height = tlv_u32(value) as u16,
+                display_capture_tags::TAG_HEADER => header = tlv_u32(value) != 0,
+                _ => {}
+            });
+            let heap_bytes = display_capture::heap_size_for(width, height);
+            if !init_builtin_heap_sized(module_idx, heap_bytes) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_display_capture: STATE_ARENA full, skipping",
+                    heap_bytes as u64,
+                );
+                continue;
+            }
+            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let m = display_capture::build(width, height, header, out_chan);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_display_capture (built-in)",
                 0,
             );
             continue;

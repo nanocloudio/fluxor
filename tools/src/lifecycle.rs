@@ -405,6 +405,13 @@ fn run_modules_build(s: &Shape, verbose: bool) -> Result<()> {
         strict: false,
         verbose,
     })?;
+    // An empty report means discovery found no module to build. Say so:
+    // printing nothing at all reads as a step that did not run, and the
+    // whole point of reporting per-target counts is that the operator can
+    // see what the build actually covered.
+    if report.per_target.is_empty() {
+        println!("  Modules: none — this project has no module tree");
+    }
     for tr in &report.per_target {
         println!(
             "  Modules ({}/{}): built {} of {}, up-to-date {}, skipped {}, failed {}",

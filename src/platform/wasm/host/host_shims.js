@@ -1647,6 +1647,89 @@ registerProcessor('pcm-ring', PcmRing);
       },
     };
 
+    // ── Display capture bridge (wasm_browser_display_capture) ────────
+    // getDisplayMedia is the browser's only display-capture API, so capture is
+    // JS; everything downstream is the graph. We ask lazily on the first pull —
+    // a share dialog at boot is a dialog with no context — draw each frame to an
+    // offscreen canvas, and hand the wasm side an SRF1 RGB565 frame.
+    //
+    // The person stopping the share is reported once, as ENDED, and the stream
+    // is not restarted. Re-calling getDisplayMedia would re-open the picker; a
+    // page that did that after someone stopped sharing would be re-asking for a
+    // screen they just took back.
+    const DISPLAY_ENDED = -2;
+    let dispState = null; // { video, canvas, ctx, ready, ended }
+    function startDisplayCapture() {
+      const video = document.createElement('video');
+      video.autoplay = true; video.playsInline = true; video.muted = true;
+      const canvas = document.createElement('canvas');
+      const st = {
+        video,
+        canvas,
+        ctx: canvas.getContext('2d', { willReadFrequently: true }),
+        ready: false,
+        ended: false,
+      };
+      dispState = st;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        st.ended = true; // no API here: report it as ended rather than as "starting" forever
+        return;
+      }
+      navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+        .then((stream) => {
+          // The browser's own "Stop sharing" ends the track without telling the
+          // page anything else. This is the only notice we get, and it is the
+          // notice the graph needs.
+          stream.getVideoTracks().forEach((t) => { t.onended = () => { st.ended = true; }; });
+          video.srcObject = stream;
+          return video.play();
+        })
+        .then(() => { st.ready = true; })
+        // A refusal is a decision, not a failure to retry: it ends the capture.
+        .catch((err) => {
+          st.ended = true;
+          console.warn('[display-capture] getDisplayMedia:', err && err.message);
+        });
+    }
+    const displayCaptureShim = {
+      host_display_frame: (bufPtr, bufLen) => {
+        if (!dispState) { startDisplayCapture(); return 0; }
+        const st = dispState;
+        if (st.ended) return DISPLAY_ENDED;
+        if (!st.ready || !st.video.videoWidth) return 0;
+        // The shared surface's own geometry, capped by what the graph sized its
+        // buffer for. The SRF1 header says which it turned out to be, so a
+        // consumer never has to guess.
+        const room = Math.max(0, (bufLen - 10) >> 1);
+        let w = st.video.videoWidth;
+        let h = st.video.videoHeight;
+        if (w * h > room) {
+          const scale = Math.sqrt(room / (w * h));
+          w = Math.max(1, Math.floor(w * scale));
+          h = Math.max(1, Math.floor(h * scale));
+        }
+        if (w * h === 0 || 10 + w * h * 2 > bufLen) return 0;
+        if (st.canvas.width !== w || st.canvas.height !== h) {
+          st.canvas.width = w; st.canvas.height = h;
+        }
+        st.ctx.drawImage(st.video, 0, 0, w, h);
+        const px = st.ctx.getImageData(0, 0, w, h).data;
+        const out = kview(bufPtr, 10 + w * h * 2);
+        out[0] = 0x53; out[1] = 0x52; out[2] = 0x46; out[3] = 0x31; // "SRF1"
+        out[4] = w & 0xFF; out[5] = (w >> 8) & 0xFF;
+        out[6] = h & 0xFF; out[7] = (h >> 8) & 0xFF;
+        out[8] = 1; // FMT_RGB565 (sector/modules/common/sector_raster.rs)
+        out[9] = 0;
+        for (let i = 0, p = 10; i < w * h; i++, p += 2) {
+          const o = i * 4;
+          const v = ((px[o] >> 3) << 11) | ((px[o + 1] >> 2) << 5) | (px[o + 2] >> 3);
+          out[p] = v & 0xFF;
+          out[p + 1] = (v >> 8) & 0xFF;
+        }
+        return 10 + w * h * 2;
+      },
+    };
+
     // Result sink (wasm_browser_scan_out): stash the decoded token for the page.
     const scanOutShim = {
       host_scan_result: (ptr, len) => {
@@ -2958,6 +3041,7 @@ registerProcessor('pcm-ring', PcmRing);
         audioShim,
         canvasShim,
         cameraShim,
+        displayCaptureShim,
         scanOutShim,
         terminalShim,
         imageShim,

@@ -218,6 +218,7 @@ Media, transport, and diagnostics:
 | `wasm_browser_ws_source`| `bytes` out (`VideoRaster`) | §4.5 |
 | `host_browser_fetch`    | `bytes` out (`OctetStream`) | §4.6 |
 | `wasm_browser_camera`   | `frames` out (`OctetStream`) | luma frames from `getUserMedia`, for a downstream decoder |
+| `wasm_browser_display_capture` | `pixels` out (`VideoRaster`) | `SRF1` RGB565 frames of a surface the person chose to share, from `getDisplayMedia`; §4.7 |
 | `wasm_browser_scan_out` | `result` in (`OctetStream`) | surfaces a decoded byte result (e.g. a scanned token) in the page |
 | `wasm_browser_terminal` | none | drains the kernel log ring (`LOG_RING_DRAIN`) into a DOM scrollback via `host_terminal_emit`; the wasm analogue of UART logging |
 | `wasm_browser_video_codec` | `encoded` in (`OctetStream`) | Status: manifest declared, not registered; design target for WebCodecs decode |
@@ -339,6 +340,32 @@ a host-provided capability in the same family as the Linux host
 built-ins. One in-flight request per module instance; for parallel
 fetches, instantiate one module per URL.
 
+### 4.7 `wasm_browser_display_capture` — shared-surface source
+
+Source: `src/platform/wasm/display_capture.rs`.
+
+The peer of §4.2: that module presents pixels this host owns, this one
+produces pixels it does not — the screen, window, or tab the person
+picked in the browser's own share dialog. `getDisplayMedia` is the only
+API for it, so capture is JS and the graph side is a pump.
+
+Params: `width` / `height` (u16, required) and `header` (u16, default
+1). The dimensions are the *backing* size, not the shared size: the
+person choosing what to share decides the geometry and may change it
+mid-session, so frames carry an `SRF1` header
+(`sector/modules/common/sector_raster.rs`) and the buffer bounds what a
+frame may claim. Larger surfaces are scaled to fit rather than refused.
+
+Frames are RGB565-LE, so `capture.pixels -> display.pixels` resolves
+against `linux_display`, `st7701s`, and `wasm_browser_canvas` with no
+converter; `header = 0` drops the header for a consumer that has no
+header mode and a capture that is known to be fixed-size.
+
+Ending is one-way. When the person stops sharing — through the
+browser's UI, which the page never sees otherwise — the current frame
+finishes and the module latches. It does not pull again, because
+pulling again means a fresh picker.
+
 ---
 
 ## 5. Storage providers
@@ -429,6 +456,15 @@ The shim's policy:
 Camera access (`wasm_browser_camera`) requests `getUserMedia` lazily
 on the first frame pull and simply produces no frames until the user
 grants it.
+
+Display capture (`wasm_browser_display_capture`) requests
+`getDisplayMedia` the same way, and differs in what happens after: the
+person chooses *what* is shared in the browser's own picker, and can
+stop it at any time from the browser's own UI. A refusal and a stop are
+both reported once as ended, and the shim does not call
+`getDisplayMedia` again — re-calling it would re-open the picker, which
+is asking someone for a screen they just took back. A new capture is a
+new module instance.
 
 ---
 

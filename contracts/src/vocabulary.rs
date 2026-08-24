@@ -25,6 +25,12 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "display.scanout",
     "display.multihead",
     "display.scanout.protected",
+    // Produces frames of a display that exists somewhere else — a shared
+    // screen, window, or tab — as opposed to *being* a display
+    // (`display.scanout`) or being a camera. A viewer that cannot tell a
+    // shared screen from a camera cannot tell a person what is being shared,
+    // so the distinction is a declared role rather than a convention.
+    "display.capture",
     "video.decode",
     "video.encode",
     "video.decode.protected",

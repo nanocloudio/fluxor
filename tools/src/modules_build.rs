@@ -490,11 +490,17 @@ pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
     // building rather than demanding a manual re-sync.
     crate::store_sync::ensure_synced(&opts.project_root)
         .map_err(|e| crate::error::Error::Config(e.to_string()))?;
+    // The target matrix only means something when there is something to
+    // build, so discovery comes first. A portable-core-only repo has no
+    // module tree and declares no `[ci].targets` — the `fluxor.toml` schema
+    // gate refuses that key when nothing needs targeting — and an empty
+    // build is the honest report for it.
+    //
+    // What keeps that from hiding a real fault is `ci`'s vacuity rule: a
+    // repo whose manifests exist but whose layout the tier walk cannot see
+    // reports zero here and fails there, because the count it is checked
+    // against is a separate walk of every `manifest.toml` under `modules/`.
     let candidates = discover(&opts.project_root)?;
-    // A project with no module tree (a portable-core-only repo) has
-    // nothing to build and, per the fluxor.toml schema gate, declares
-    // no `[ci].targets`; report an empty build rather than demanding a
-    // target matrix for zero modules.
     if candidates.is_empty() {
         return Ok(BuildReport::default());
     }
@@ -1306,6 +1312,58 @@ mod tests {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.pop();
         p
+    }
+
+    /// A project with no module tree builds nothing, and that is a report
+    /// rather than an error.
+    ///
+    /// The two halves are one rule seen from both sides. A portable-core-only
+    /// repo declares no `[ci].targets` — the `fluxor.toml` schema gate refuses
+    /// the key when nothing needs targeting — so resolving the target matrix
+    /// before discovering candidates makes such a project unbuildable by
+    /// construction. But the requirement itself has to survive: a repo that
+    /// *does* have modules and declares no targets is genuinely
+    /// misconfigured, and must still be told so.
+    #[test]
+    fn a_project_with_no_modules_builds_nothing_but_one_with_modules_still_needs_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("fluxor.toml"),
+            "[project]\nname = \"core_only\"\n",
+        )
+        .unwrap();
+
+        let opts = BuildOpts {
+            project_root: root.to_path_buf(),
+            selector: TargetSelector::All,
+            out_root: root.join("target/fluxor"),
+            strict: false,
+            verbose: false,
+        };
+        let report = run(&opts).expect("a project with no module tree is not a build failure");
+        assert!(
+            report.per_target.is_empty(),
+            "nothing was discovered, so there is nothing to report per target"
+        );
+        assert!(report.ok(), "an empty build is a passing build");
+
+        // Now give it a module. The missing target matrix becomes a real
+        // fault again, because there is now something that needs targeting.
+        let m = root.join("modules/fixtures/probe");
+        std::fs::create_dir_all(&m).unwrap();
+        std::fs::write(
+            m.join("manifest.toml"),
+            "version = \"1.0.0\"\nhardware_targets = [\"linux\"]\n",
+        )
+        .unwrap();
+        std::fs::write(m.join("mod.rs"), "// entry\n").unwrap();
+
+        let err = run(&opts).expect_err("a module with no declared target is misconfigured");
+        assert!(
+            err.to_string().contains("[ci].targets"),
+            "the diagnostic must name the missing key, not the symptom: {err}"
+        );
     }
 
     /// `resolve` answers for a BOARD, which `resolve_silicon` rejects.
