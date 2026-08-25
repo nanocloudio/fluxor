@@ -1263,6 +1263,105 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             core::ptr::write_unaligned(arg as *mut u64, hal::now_unix_millis());
             0
         }
+        dev_timer::TRUSTED_UNIX => {
+            use crate::abi::kernel_abi::trusted_time as tt;
+            if arg.is_null() || arg_len < tt::LEN {
+                return E_INVAL;
+            }
+            let unix_ms = hal::now_unix_millis();
+            let monotonic_us = syscall_micros();
+
+            // What this platform can honestly claim.
+            //
+            // `now_unix_millis` alone cannot answer this and never could: a
+            // nonzero reading from a clock nobody synchronised looks exactly
+            // like a good one. So the provider used to stop at `RTC` and
+            // never set `TRUSTED`, and every credential-validity decision in
+            // the ecosystem waited on a time source that could say more.
+            //
+            // `hal::clock_sync_status` is that source. An operating system
+            // running a time protocol tracks whether its clock has been
+            // disciplined and by how much it may be off, and asking it is
+            // evidence rather than assumption. Three distinguishable answers,
+            // and the distinctions are the point:
+            //
+            //   - the platform cannot tell           → `RTC`, untrusted
+            //   - it can tell, and says NOT synced   → `RTC`, untrusted
+            //   - it can tell, and says synced       → `NETWORK_SYNC`,
+            //                                          `SYNCHRONIZED | TRUSTED`
+            //
+            // The middle case is deliberately not weaker than the first. A
+            // clock the platform knows is unsynchronised is no worse than one
+            // it knows nothing about — it is the same reading with better
+            // reporting, and demoting it would punish the platform for being
+            // honest.
+            //
+            // `TRUSTED` is set only in the third case. It is the flag a
+            // consumer reads to decide whether a validity window means
+            // anything, so setting it without evidence would issue
+            // credentials against a clock that lies — and the fail-closed
+            // direction is that a missing flag denies.
+            let sync = hal::clock_sync_status();
+            let (source_class, flags, uncertainty_ms) = if unix_ms == 0 {
+                (tt::source::UNAVAILABLE, 0u8, u32::MAX)
+            } else {
+                match sync {
+                    Some((true, max_error_us)) => {
+                        // The kernel's own estimate of how far off it may be,
+                        // rounded UP to milliseconds: a consumer sizing a
+                        // window from this must not be handed a bound
+                        // narrower than the truth.
+                        let ms = max_error_us.div_ceil(1_000);
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "saturated to u32::MAX immediately below"
+                        )]
+                        let ms = if ms > u64::from(u32::MAX) {
+                            u32::MAX
+                        } else {
+                            ms as u32
+                        };
+                        (
+                            tt::source::NETWORK_SYNC,
+                            tt::flags::SYNCHRONIZED | tt::flags::TRUSTED,
+                            // Never narrower than the one-millisecond tick
+                            // this clock is read at.
+                            ms.max(1),
+                        )
+                    }
+                    // Either the platform cannot tell, or it can and the
+                    // answer is no. Same claim: a local clock, untrusted.
+                    _ => (tt::source::RTC, 0u8, 1u32),
+                }
+            };
+
+            let mut rec = [0u8; tt::LEN];
+            rec[tt::OFF_UNIX_SECONDS..tt::OFF_UNIX_SECONDS + 8]
+                .copy_from_slice(&(unix_ms / 1000).to_le_bytes());
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "sub-second remainder, always < 1e9"
+            )]
+            rec[tt::OFF_UNIX_NANOS..tt::OFF_UNIX_NANOS + 4]
+                .copy_from_slice(&(((unix_ms % 1000) * 1_000_000) as u32).to_le_bytes());
+            // The interval this reading is honest within: the kernel's own
+            // `maxerror` when it has one, the read granularity otherwise.
+            rec[tt::OFF_UNCERTAINTY_MS..tt::OFF_UNCERTAINTY_MS + 4]
+                .copy_from_slice(&uncertainty_ms.to_le_bytes());
+            rec[tt::OFF_MONOTONIC_US..tt::OFF_MONOTONIC_US + 8]
+                .copy_from_slice(&monotonic_us.to_le_bytes());
+            // No epoch tracking yet: a source that never claims to be
+            // synchronised cannot claim to have resynchronised either.
+            // Consumers must treat a constant epoch as "no rollback
+            // information", which combined with `TRUSTED` being unset means
+            // they refuse rather than trust it.
+            rec[tt::OFF_SOURCE_EPOCH..tt::OFF_SOURCE_EPOCH + 8]
+                .copy_from_slice(&0u64.to_le_bytes());
+            rec[tt::OFF_SOURCE_CLASS] = source_class;
+            rec[tt::OFF_FLAGS] = flags;
+            core::ptr::copy_nonoverlapping(rec.as_ptr(), arg, tt::LEN);
+            0
+        }
         dev_timer::CREATE => fd::timer_create(),
         dev_timer::SET => {
             if arg.is_null() || arg_len < 4 {

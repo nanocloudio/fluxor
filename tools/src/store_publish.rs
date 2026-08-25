@@ -217,6 +217,29 @@ pub fn publish_project_to_store(
     let want = |k: &str| only.is_empty() || only.contains(&k);
 
     let store = OciStore::open(crate::oci_store::store_root()?)?;
+
+    // Retire tags for modules this project no longer has, BEFORE opening
+    // the publish transaction.
+    //
+    // Publishing only ever ADDED tags, so a module deleted from the source
+    // tree kept its artefact in the store forever — at whatever ABI epoch it
+    // was last built against. Every consumer resolving this project then saw
+    // a mixed-epoch set and refused to sync, naming a module nobody could
+    // rebuild because its source was gone. `fluxor update` cannot fix that:
+    // there is nothing left to advance it to.
+    //
+    // Before the transaction rather than after, for two reasons. `remove`
+    // takes the same store lock `begin_publish` holds, so doing it inside
+    // deadlocks against ourselves. And tidying first means a publish that
+    // then fails still leaves the store consistent rather than half-swept.
+    //
+    // Only this project's own module tags, and only when the fmod sweep
+    // will actually run — a `--only source` publish has no opinion about
+    // which modules exist.
+    if want("fmod") {
+        retire_deleted_modules(&store, &pr, &identity.name, verbose)?;
+    }
+
     let txn = store.begin_publish()?;
     let mut prepared: Vec<Prepared> = Vec::new();
 
@@ -290,6 +313,45 @@ pub fn publish_project_to_store(
                         continue;
                     };
                     let bytes = std::fs::read(&fmod).map_err(Error::Io)?;
+                    // The artefact must have been BUILT against the surface
+                    // it is about to be labelled with.
+                    //
+                    // `abi_surface_hex` below comes from the current source
+                    // tree, so without this a `.fmod` left over from an
+                    // earlier surface is republished wearing a fresh epoch:
+                    // the annotation says one thing, the bytes say another,
+                    // and every downstream `fluxor sync` then either refuses
+                    // with a confusing message or — worse — loads a module
+                    // that speaks a retired wire format. That is not
+                    // hypothetical: a `storage.object` change published this
+                    // way had a new-format caller talking to an old-format
+                    // provider, and a create-only write and a
+                    // compare-and-swap silently became the same call.
+                    //
+                    // `fluxor modules build` does not rebuild when only the
+                    // SDK surface moved, so "I rebuilt everything" is not
+                    // enough on its own — `fluxor modules clean` first is.
+                    if let Ok(info) = crate::modules::ModuleInfo::from_file(&fmod) {
+                        if let Some(embedded) = info.manifest.abi_surface {
+                            let current = crate::hash::abi_surface_digest();
+                            if embedded != current {
+                                let short = |d: &[u8; 32]| {
+                                    d.iter()
+                                        .take(6)
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect::<String>()
+                                };
+                                return Err(Error::Module(format!(
+                                    "{}: built against ABI surface {} but the current surface \
+                                     is {} — run `fluxor modules clean && fluxor modules build \
+                                     --all` before publishing",
+                                    fmod.display(),
+                                    short(&embedded),
+                                    short(&current),
+                                )));
+                            }
+                        }
+                    }
                     let Some(input_hex) = input_digests.get(&name).cloned() else {
                         continue;
                     };
@@ -375,10 +437,75 @@ pub fn publish_project_to_store(
         prepared,
         if deps.is_empty() { None } else { Some(&deps) },
     )?;
-    Ok(committed
+    let tags: Vec<String> = committed
         .iter()
         .filter_map(|d| d.annotations.get(crate::oci_store::ANN_REF_NAME).cloned())
-        .collect())
+        .collect();
+
+    Ok(tags)
+}
+
+/// Remove store tags for modules that are no longer in `project_root`.
+///
+/// See the call site for why this exists and why it runs before the publish
+/// transaction.
+fn retire_deleted_modules(
+    store: &OciStore,
+    project_root: &Path,
+    project: &str,
+    verbose: bool,
+) -> Result<()> {
+    let live: std::collections::BTreeSet<String> = crate::modules_build::list(project_root)?
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    // An empty module list means "this project builds no modules", which is
+    // true of plenty of them — but it is also what a failed enumeration
+    // looks like, and retiring every module tag on the strength of that
+    // would be catastrophic and silent. Nothing is retired without at least
+    // one live module to compare against.
+    if live.is_empty() {
+        return Ok(());
+    }
+    let Ok(index) = store.read_index() else {
+        return Ok(());
+    };
+    let mut stale: Vec<String> = Vec::new();
+    for d in &index.manifests {
+        let Some(reference) = d.annotations.get(crate::oci_store::ANN_REF_NAME) else {
+            continue;
+        };
+        if d.annotations
+            .get(crate::oci_store::ANN_PROJECT)
+            .map(String::as_str)
+            != Some(project)
+        {
+            continue;
+        }
+        // A module tag is `<target>/<name>:<ver>`. Source trees
+        // (`<project>/src/...`), runtimes (`<project>/run/...`) and the
+        // project index are not module artefacts and are left alone.
+        let Some((body, _ver)) = reference.rsplit_once(':') else {
+            continue;
+        };
+        let Some((shelf, name)) = body.rsplit_once('/') else {
+            continue;
+        };
+        if shelf == "src" || shelf == "run" || name == "meta" || shelf.contains('/') {
+            continue;
+        }
+        if !live.contains(name) {
+            stale.push(reference.clone());
+        }
+    }
+    stale.sort();
+    stale.dedup();
+    for reference in stale {
+        if store.remove(&reference).is_ok() && verbose {
+            println!("retired {reference} (module no longer in the source tree)");
+        }
+    }
+    Ok(())
 }
 
 /// Record a green `fluxor ci` run: the per-artifact input digests the

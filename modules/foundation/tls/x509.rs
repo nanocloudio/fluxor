@@ -27,6 +27,10 @@ const TAG_CONTEXT_3: u8 = 0xA3;
 /// dNSName inside a SAN GeneralName ([2] IMPLICIT IA5String).
 const TAG_SAN_DNS: u8 = 0x82;
 
+/// uniformResourceIdentifier inside a SAN GeneralName
+/// ([6] IMPLICIT IA5String). This is where a SPIFFE ID lives.
+const TAG_SAN_URI: u8 = 0x86;
+
 /// OID for SubjectAltName: 2.5.29.17
 const OID_SAN: [u8; 3] = [0x55, 0x1D, 0x11];
 /// OID for BasicConstraints: 2.5.29.19
@@ -47,8 +51,184 @@ const OID_EC_PUBKEY: [u8; 7] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
 /// OID for prime256v1 (P-256): 1.2.840.10045.3.1.7
 const OID_P256: [u8; 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
+/// OID for prime384v1 (P-384): 1.3.132.0.34
+const OID_P384: [u8; 5] = [0x2B, 0x81, 0x04, 0x00, 0x22];
+
 /// OID for ecdsa-with-SHA256: 1.2.840.10045.4.3.2
 const OID_ECDSA_SHA256: [u8; 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+
+/// OID for ecdsa-with-SHA384: 1.2.840.10045.4.3.3
+const OID_ECDSA_SHA384: [u8; 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03];
+
+/// OID for id-Ed25519: 1.3.101.112. Ed25519 names one OID for both the
+/// key and the signature — there is no separate hash to name.
+const OID_ED25519: [u8; 3] = [0x2B, 0x65, 0x70];
+
+/// OIDs for ML-DSA (FIPS 204), 2.16.840.1.101.3.4.3.17/18/19.
+const OID_ML_DSA_44: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11];
+const OID_ML_DSA_65: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
+const OID_ML_DSA_87: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13];
+
+/// Certificate suites: a key type paired with the hash it signs under.
+///
+/// A suite id is what the rest of the stack carries instead of an OID. It
+/// exists so a size, a policy decision or a capability check is a lookup
+/// rather than a constant someone chose when only one algorithm existed.
+/// Every bound below was a literal `64`, `65` or `4` somewhere; those
+/// numbers are true for P-256 and wrong for everything else, and an
+/// ML-DSA-65 certificate is roughly 4 KB against P-256's few hundred bytes.
+///
+/// **Naming a suite is not implementing it.** [`is_implemented`] is the
+/// only thing that says whether this build can verify one, and
+/// `verify_chain` refuses anything else with
+/// [`CERT_ERR_UNSUPPORTED_SUITE`]. The ids exist so the interfaces do not
+/// have to change when the primitives arrive; they do not make a
+/// post-quantum certificate verifiable today.
+pub mod suite {
+    /// An algorithm this build could not resolve to a suite at all.
+    ///
+    /// Distinct from a suite that is known but not implemented: the first
+    /// is "we do not know what this is", the second "we know and cannot
+    /// check it". Both are refused, and the operator log tells them apart.
+    pub const UNKNOWN: u16 = 0;
+    pub const ECDSA_P256_SHA256: u16 = 1;
+    pub const ECDSA_P384_SHA384: u16 = 2;
+    pub const ED25519: u16 = 3;
+    pub const ML_DSA_44: u16 = 4;
+    pub const ML_DSA_65: u16 = 5;
+    pub const ML_DSA_87: u16 = 6;
+
+    /// Highest suite id this registry defines.
+    pub const MAX_ID: u16 = ML_DSA_87;
+
+    /// Whether this build can actually verify a signature in `suite`.
+    ///
+    /// Only P-256 today. The rest are named so sizes, policies and error
+    /// reporting are already suite-shaped; the primitives live in
+    /// `src/kernel/security/crypto/` and are a separate body of work.
+    #[must_use]
+    pub const fn is_implemented(suite: u16) -> bool {
+        matches!(suite, ECDSA_P256_SHA256)
+    }
+
+    /// Classical-equivalent security level in bits. Used to detect a
+    /// downgrade: an issuer weaker than the key it signs makes that key
+    /// only as strong as the issuer.
+    #[must_use]
+    pub const fn security_bits(suite: u16) -> u16 {
+        match suite {
+            ECDSA_P256_SHA256 | ED25519 | ML_DSA_44 => 128,
+            ECDSA_P384_SHA384 | ML_DSA_65 => 192,
+            ML_DSA_87 => 256,
+            // An unresolvable suite is worth nothing, so it can never be
+            // the stronger side of a comparison.
+            _ => 0,
+        }
+    }
+
+    /// Longest subject public key, in bytes.
+    #[must_use]
+    pub const fn max_public_key_len(suite: u16) -> usize {
+        match suite {
+            ECDSA_P256_SHA256 => 65, // uncompressed point: 0x04 || X || Y
+            ECDSA_P384_SHA384 => 97,
+            ED25519 => 32,
+            ML_DSA_44 => 1312,
+            ML_DSA_65 => 1952,
+            ML_DSA_87 => 2592,
+            _ => 0,
+        }
+    }
+
+    /// Longest signature, in bytes. DER-encoded for ECDSA, which is why
+    /// these exceed the raw `r‖s` length.
+    #[must_use]
+    pub const fn max_signature_len(suite: u16) -> usize {
+        match suite {
+            ECDSA_P256_SHA256 => 72,
+            ECDSA_P384_SHA384 => 104,
+            ED25519 => 64,
+            ML_DSA_44 => 2420,
+            ML_DSA_65 => 3309,
+            ML_DSA_87 => 4627,
+            _ => 0,
+        }
+    }
+
+    /// Buffer a single certificate in this suite must fit in.
+    ///
+    /// The names, extensions and DER framing around the key and signature
+    /// are bounded generously and identically across suites; what varies
+    /// is the two variable-length fields, so the bound is derived from
+    /// them rather than picked.
+    #[must_use]
+    pub const fn max_certificate_len(suite: u16) -> usize {
+        /// Names, validity, extensions and DER framing.
+        const ENVELOPE: usize = 1024;
+        if suite == UNKNOWN {
+            return 0;
+        }
+        ENVELOPE + max_public_key_len(suite) + max_signature_len(suite)
+    }
+
+    /// Buffer a whole chain in this suite must fit in.
+    #[must_use]
+    pub const fn max_chain_len_bytes(suite: u16) -> usize {
+        max_certificate_len(suite) * super::MAX_CHAIN_LEN
+    }
+
+    /// This suite's bit in an `allowed_suites` mask. `UNKNOWN` and any id
+    /// past [`MAX_ID`] have no bit, so they can never be allowed.
+    #[must_use]
+    pub const fn mask(suite: u16) -> u32 {
+        if suite == UNKNOWN || suite > MAX_ID {
+            0
+        } else {
+            1u32 << suite
+        }
+    }
+
+    /// Every suite this build can verify. The sane default for a policy.
+    pub const IMPLEMENTED: u32 = mask(ECDSA_P256_SHA256);
+
+    /// Short stable token for a suite, for the operator-facing log line.
+    #[must_use]
+    pub const fn text(suite: u16) -> &'static [u8] {
+        match suite {
+            ECDSA_P256_SHA256 => b"ecdsa-p256-sha256",
+            ECDSA_P384_SHA384 => b"ecdsa-p384-sha384",
+            ED25519 => b"ed25519",
+            ML_DSA_44 => b"ml-dsa-44",
+            ML_DSA_65 => b"ml-dsa-65",
+            ML_DSA_87 => b"ml-dsa-87",
+            _ => b"unknown",
+        }
+    }
+}
+
+/// Resolve a `signatureAlgorithm` OID to a suite id.
+///
+/// Returns [`suite::UNKNOWN`] rather than failing: an algorithm nobody
+/// here recognises is a policy answer, not a parse error, and reporting it
+/// as malformed DER would send an operator looking for a corrupt file.
+#[must_use]
+fn suite_from_signature_oid(oid: &[u8]) -> u16 {
+    if oid == OID_ECDSA_SHA256 {
+        suite::ECDSA_P256_SHA256
+    } else if oid == OID_ECDSA_SHA384 {
+        suite::ECDSA_P384_SHA384
+    } else if oid == OID_ED25519 {
+        suite::ED25519
+    } else if oid == OID_ML_DSA_44 {
+        suite::ML_DSA_44
+    } else if oid == OID_ML_DSA_65 {
+        suite::ML_DSA_65
+    } else if oid == OID_ML_DSA_87 {
+        suite::ML_DSA_87
+    } else {
+        suite::UNKNOWN
+    }
+}
 
 /// KeyUsage bit positions (RFC 5280 §4.2.1.3), numbered from the most
 /// significant bit of the first content octet.
@@ -154,6 +334,21 @@ pub const CERT_ERR_PIN_MISMATCH: u32 = 21;
 pub const CERT_ERR_BAD_KEY: u32 = 22;
 /// No peer-authentication profile was selected.
 pub const CERT_ERR_NO_PROFILE: u32 = 23;
+/// A certificate in the chain uses a suite the policy does not allow, or
+/// that this build cannot verify at all.
+///
+/// Distinct from [`CERT_ERR_MALFORMED`]: the DER was fine and the
+/// algorithm was legible. Answering "malformed" for an unsupported
+/// algorithm is how a deployment ends up hunting a corrupt file that is
+/// not corrupt.
+pub const CERT_ERR_UNSUPPORTED_SUITE: u32 = 24;
+/// An issuer's suite is weaker than the key it signed.
+///
+/// A signature is worth the weaker of the two: a P-256 key vouched for by
+/// a CA whose own signature is 80-bit is an 80-bit key with a 128-bit key
+/// inside it. Refused rather than reported, because the whole point of
+/// deploying the stronger key was not to have this happen.
+pub const CERT_ERR_DOWNGRADE: u32 = 25;
 
 /// Short stable token for a reason code, for the operator-facing log line.
 pub fn cert_error_text(code: u32) -> &'static [u8] {
@@ -182,6 +377,8 @@ pub fn cert_error_text(code: u32) -> &'static [u8] {
         CERT_ERR_PIN_MISMATCH => b"pin-mismatch",
         CERT_ERR_BAD_KEY => b"bad-key",
         CERT_ERR_NO_PROFILE => b"no-profile",
+        CERT_ERR_UNSUPPORTED_SUITE => b"unsupported-suite",
+        CERT_ERR_DOWNGRADE => b"downgrade",
         _ => b"unknown",
     }
 }
@@ -204,7 +401,21 @@ pub fn cert_error_alert(code: u32) -> u8 {
 pub struct X509Cert<'a> {
     /// Raw TBSCertificate (for signature verification)
     pub tbs_raw: &'a [u8],
-    /// Subject public key (uncompressed point for EC)
+    /// The suite this certificate's own signature is in — how its issuer
+    /// signed it. [`suite::UNKNOWN`] when the algorithm OID resolved to
+    /// nothing this build knows.
+    ///
+    /// Separate from `key_suite` because they are separate facts: a P-256
+    /// key signed by a P-384 CA is an ordinary, correct certificate. A
+    /// single `suite` field would have to pick one and silently lose the
+    /// other, and the one it lost is the one a downgrade check needs.
+    pub suite: u16,
+    /// The suite of the subject public key — what this certificate is
+    /// *about*, as opposed to who vouched for it.
+    pub key_suite: u16,
+    /// Subject public key. Its encoding is `key_suite`'s: an uncompressed
+    /// point for EC, the raw key for everything else. Never interpret it
+    /// without reading `key_suite` first.
     pub public_key: &'a [u8],
     /// Signature algorithm OID bytes
     pub sig_alg: &'a [u8],
@@ -264,7 +475,7 @@ pub fn parse_certificate(cert: &[u8]) -> Option<X509Cert<'_>> {
     if cert[sig_alg_pos] != TAG_SEQUENCE { return None; }
     let (_sa_start, _sa_len, sa_total) = der_tlv(cert, sig_alg_pos)?;
     let sig_alg = extract_oid(cert, sig_alg_pos)?;
-    if sig_alg != OID_ECDSA_SHA256 { return None; }
+    let sig_suite = suite_from_signature_oid(sig_alg);
 
     // Parse signatureValue (BIT STRING)
     let sig_pos = sig_alg_pos + sa_total;
@@ -281,8 +492,17 @@ pub fn parse_certificate(cert: &[u8]) -> Option<X509Cert<'_>> {
     // outer field contradicts.
     if tbs.inner_sig_alg != sig_alg { return None; }
 
+    // A signature longer than its suite allows is not that suite's
+    // signature. Refused here so no verifier is handed a length its
+    // suite says cannot exist.
+    if sig_suite != suite::UNKNOWN && signature.len() > suite::max_signature_len(sig_suite) {
+        return None;
+    }
+
     Some(X509Cert {
         tbs_raw,
+        suite: sig_suite,
+        key_suite: tbs.key_suite,
         public_key: tbs.public_key,
         sig_alg,
         signature,
@@ -296,6 +516,9 @@ pub fn parse_certificate(cert: &[u8]) -> Option<X509Cert<'_>> {
 }
 
 struct Tbs<'a> {
+    /// Suite of the subject public key, resolved from the SPKI
+    /// AlgorithmIdentifier.
+    key_suite: u16,
     inner_sig_alg: &'a [u8],
     issuer_raw: &'a [u8],
     subject_raw: &'a [u8],
@@ -347,7 +570,7 @@ fn parse_tbs(cert: &[u8], start: usize, len: usize) -> Option<Tbs<'_>> {
     // subjectPublicKeyInfo
     if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
     let (spki_start, spki_len, total) = der_tlv(cert, pos)?;
-    let public_key = extract_ec_pubkey(cert, spki_start, spki_len)?;
+    let (key_suite, public_key) = extract_pubkey(cert, spki_start, spki_len)?;
     pos += total;
     // issuerUniqueID [1] / subjectUniqueID [2], both optional and unused
     if pos < end && cert[pos] == TAG_CONTEXT_1 {
@@ -378,6 +601,7 @@ fn parse_tbs(cert: &[u8], start: usize, len: usize) -> Option<Tbs<'_>> {
         subject_raw,
         not_before,
         not_after,
+        key_suite,
         public_key,
         ext_off,
         ext_len,
@@ -498,17 +722,28 @@ fn extract_oid(data: &[u8], seq_pos: usize) -> Option<&[u8]> {
 
 /// Extract the EC public key bytes from SubjectPublicKeyInfo.
 ///
-/// The AlgorithmIdentifier must be exactly
-/// `SEQUENCE { id-ecPublicKey, prime256v1 }` — two OIDs, nothing else.
-/// Without that binding a key encoded for a different curve (or a
-/// different algorithm entirely) would be handed to the P-256 code as
+/// The AlgorithmIdentifier is read, not assumed: the curve or algorithm it
+/// names decides the key's suite, and the key bytes travel with that suite
+/// from here on. Without that binding a key encoded for a different curve
+/// (or a different algorithm entirely) would be handed to the P-256 code as
 /// a bare point, and its wire bytes would be reinterpreted rather than
 /// rejected.
-fn extract_ec_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<&[u8]> {
+///
+/// An algorithm this build does not recognise yields
+/// [`suite::UNKNOWN`] and the raw key bytes. That is deliberately not a
+/// parse failure: `verify_chain` refuses it with
+/// [`CERT_ERR_UNSUPPORTED_SUITE`], which tells an operator what is actually
+/// wrong. Reporting it as malformed DER — which is what this did when the
+/// profile was one shape — sent them looking for a corrupt file.
+///
+/// Shape rules still hold for every suite: an EC AlgorithmIdentifier is
+/// exactly two OIDs, a non-EC one is exactly one OID with no parameters,
+/// the BIT STRING is whole-octet, and the SPKI has no third member.
+fn extract_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<(u16, &[u8])> {
     let mut pos = spki_start;
     let end = spki_start + spki_len;
 
-    // AlgorithmIdentifier SEQUENCE { algorithm OID, parameters OID }
+    // AlgorithmIdentifier SEQUENCE { algorithm OID [, parameters OID] }
     if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
     let (alg_start, alg_len, alg_total) = der_tlv(cert, pos)?;
     let alg_end = alg_start + alg_len;
@@ -516,13 +751,39 @@ fn extract_ec_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<
     let mut ap = alg_start;
     if ap >= alg_end || cert[ap] != TAG_OID { return None; }
     let (a_start, a_len, a_total) = der_tlv(cert, ap)?;
-    if cert[a_start..a_start + a_len] != OID_EC_PUBKEY { return None; }
+    let alg_oid = &cert[a_start..a_start + a_len];
     ap += a_total;
 
-    if ap >= alg_end || cert[ap] != TAG_OID { return None; }
-    let (c_start, c_len, c_total) = der_tlv(cert, ap)?;
-    if cert[c_start..c_start + c_len] != OID_P256 { return None; }
-    ap += c_total;
+    let key_suite = if alg_oid == OID_EC_PUBKEY {
+        // EC keys name their curve in `parameters`, and the curve is what
+        // decides the suite — `ecPublicKey` alone says nothing about size.
+        if ap >= alg_end || cert[ap] != TAG_OID { return None; }
+        let (c_start, c_len, c_total) = der_tlv(cert, ap)?;
+        let curve = &cert[c_start..c_start + c_len];
+        ap += c_total;
+        if curve == OID_P256 {
+            suite::ECDSA_P256_SHA256
+        } else if curve == OID_P384 {
+            suite::ECDSA_P384_SHA384
+        } else {
+            suite::UNKNOWN
+        }
+    } else {
+        // Everything else names the algorithm in one OID and takes no
+        // parameters. An absent `parameters` is the point: a present one
+        // would mean this is a shape we have not been taught to read.
+        if alg_oid == OID_ED25519 {
+            suite::ED25519
+        } else if alg_oid == OID_ML_DSA_44 {
+            suite::ML_DSA_44
+        } else if alg_oid == OID_ML_DSA_65 {
+            suite::ML_DSA_65
+        } else if alg_oid == OID_ML_DSA_87 {
+            suite::ML_DSA_87
+        } else {
+            suite::UNKNOWN
+        }
+    };
     if ap != alg_end { return None; } // no extra AlgorithmIdentifier members
 
     pos += alg_total;
@@ -533,7 +794,13 @@ fn extract_ec_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<
     if bs_len < 2 || cert[bs_start] != 0 { return None; } // whole-octet only
     if pos + bs_total != end { return None; } // SPKI has exactly two members
     let key_bytes = &cert[bs_start + 1..bs_start + bs_len];
-    Some(key_bytes)
+
+    // A key longer than its suite can hold is not that suite's key. Checked
+    // here so no downstream buffer is sized from a suite the bytes contradict.
+    if key_suite != suite::UNKNOWN && key_bytes.len() > suite::max_public_key_len(key_suite) {
+        return None;
+    }
+    Some((key_suite, key_bytes))
 }
 
 // ======================================================================
@@ -835,6 +1102,71 @@ fn walk_san_dns(cert: &[u8], start: usize, len: usize, callback: &mut impl FnMut
     any
 }
 
+/// Walk a SAN extension value yielding each `uniformResourceIdentifier`.
+/// `callback` returning true stops the walk. Returns true if at least one
+/// URI was present.
+fn walk_san_uri(
+    cert: &[u8],
+    start: usize,
+    len: usize,
+    callback: &mut impl FnMut(&[u8]) -> bool,
+) -> bool {
+    if len == 0 || cert[start] != TAG_SEQUENCE {
+        return false;
+    }
+    let (s_start, s_len, _) = match der_tlv(cert, start) {
+        Some(v) => v,
+        None => return false,
+    };
+    let end = s_start + s_len;
+    let mut pos = s_start;
+    let mut any = false;
+    while pos < end {
+        let tag = cert[pos];
+        let (c_start, c_len, total) = match der_tlv(cert, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        if tag == TAG_SAN_URI {
+            any = true;
+            if callback(&cert[c_start..c_start + c_len]) {
+                return true;
+            }
+        }
+        pos += total;
+    }
+    any
+}
+
+impl X509Cert<'_> {
+    /// Yield each `uniformResourceIdentifier` SAN in this certificate.
+    ///
+    /// `callback` returning true stops the walk. Returns true if at least one
+    /// URI SAN was present.
+    ///
+    /// A method on the PARSED certificate, deliberately, and not a free
+    /// function over raw DER. The identity in a SPIFFE leaf is only worth
+    /// anything once the chain and profile have been validated, and a
+    /// `extract_san_uris(cert_der, ..)` shape invites exactly the mistake of
+    /// reading a name out of bytes nobody has verified. To get one of these
+    /// you must already hold a `X509Cert`, and to trust what it says you must
+    /// have put it through `verify_chain`.
+    ///
+    /// The `cert` argument is the same DER the certificate was parsed from.
+    /// Extensions are held as offsets into it rather than as copies, because
+    /// a module has no allocator to copy into — and because an extension's
+    /// offsets must stay comparable with the buffer the signature covered.
+    pub fn san_uris(&self, cert: &[u8], callback: &mut impl FnMut(&[u8]) -> bool) -> bool {
+        if self.ext_len == 0 {
+            return false;
+        }
+        match parse_extensions(cert, self.ext_off, self.ext_len).san {
+            Some((start, len)) => walk_san_uri(cert, start, len, callback),
+            None => false,
+        }
+    }
+}
+
 /// RFC 6125 §6.4.1 — case-insensitive ASCII match with optional
 /// leftmost-label wildcard (`*.example.com`). Returns true on match.
 pub fn dns_name_matches(presented: &[u8], expected: &[u8]) -> bool {
@@ -974,6 +1306,15 @@ pub const MAX_CHAIN_LEN: usize = 4;
 pub const PROFILE_NONE: u8 = 0;
 pub const PROFILE_PINNED: u8 = 1;
 pub const PROFILE_CA_DNS: u8 = 2;
+/// Chain to a CA, then match a URI SAN exactly.
+///
+/// The SPIFFE case. A SPIFFE ID is a URI and its comparison is byte
+/// equality — none of `PROFILE_CA_DNS`'s wildcard or label rules apply,
+/// and applying them to a URI would make `spiffe://a.b/x` match things it
+/// must not. A separate profile rather than a flag, so a policy cannot be
+/// written that asks for both name rules and gets whichever the code
+/// checks first.
+pub const PROFILE_CA_URI: u8 = 3;
 pub const PROFILE_INSECURE_NO_VERIFY: u8 = 255;
 
 /// Required extended key usage on the end entity.
@@ -992,6 +1333,20 @@ pub struct ChainPolicy<'a> {
     /// Expected DNS name, for `PROFILE_CA_DNS`. Empty means "no name rule",
     /// which is the mTLS server case.
     pub expected_dns: &'a [u8],
+    /// Expected URI SAN, for `PROFILE_CA_URI`. Compared as bytes: a URI is
+    /// not a hostname and admits no wildcard, no case folding and no
+    /// trailing-dot equivalence.
+    ///
+    /// Empty under `PROFILE_CA_URI` is a refusal, not "no name rule". A
+    /// profile whose entire purpose is to match a name cannot be satisfied
+    /// by a policy that names none.
+    pub expected_uri: &'a [u8],
+    /// Bitmask of permitted suites — `1 << suite_id`, see [`suite::mask`].
+    ///
+    /// Every certificate in the chain, the anchor included, must be in it.
+    /// [`suite::IMPLEMENTED`] is the sane default; `0` permits nothing and
+    /// is a valid, fail-closed way to say "not configured yet".
+    pub allowed_suites: u32,
     /// Wall clock in seconds since the Unix epoch; 0 means the platform has
     /// no synchronised clock.
     pub now_unix_secs: u64,
@@ -1001,6 +1356,24 @@ pub struct ChainPolicy<'a> {
     pub require_eku: u8,
 }
 
+/// Whether `cert`'s two suites are both permitted by `policy` and both
+/// verifiable by this build.
+///
+/// Applied to every certificate including the anchor. An anchor exempted
+/// from the suite rule would be a trust root the policy never examined,
+/// which is the one certificate it least makes sense to skip.
+fn check_suites(cert: &X509Cert<'_>, policy: &ChainPolicy<'_>) -> u32 {
+    for s in [cert.suite, cert.key_suite] {
+        if !suite::is_implemented(s) {
+            return CERT_ERR_UNSUPPORTED_SUITE;
+        }
+        if policy.allowed_suites & suite::mask(s) == 0 {
+            return CERT_ERR_UNSUPPORTED_SUITE;
+        }
+    }
+    CERT_OK
+}
+
 /// Validate a peer's Certificate message under `policy`. Returns
 /// [`CERT_OK`] or the reason code the failure is classified as.
 ///
@@ -1008,7 +1381,7 @@ pub struct ChainPolicy<'a> {
 /// once, leaf first, from the list the peer sent, in the order it sent it:
 /// no alternative path is searched, so a peer cannot make the validator try
 /// again with a different arrangement of the same certificates.
-pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy) -> u32 {
+pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
     if policy.profile == PROFILE_NONE {
         return CERT_ERR_NO_PROFILE;
     }
@@ -1034,6 +1407,18 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy) -> u32 {
         Some(c) => c,
         None => return CERT_ERR_MALFORMED,
     };
+    // The suite gate runs before anything reads the key, because what the
+    // key bytes MEAN depends on the suite. `public_point_is_valid` is a
+    // P-256 check; running it on an Ed25519 key would be reinterpreting
+    // bytes, which is the thing the suite field exists to stop.
+    let rc = check_suites(&leaf, policy);
+    if rc != CERT_OK {
+        return rc;
+    }
+    let rc = check_suites(&anchor, policy);
+    if rc != CERT_OK {
+        return rc;
+    }
     if !public_point_is_valid(leaf.public_key) {
         return CERT_ERR_BAD_KEY;
     }
@@ -1089,8 +1474,20 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy) -> u32 {
             Some(c) => c,
             None => return CERT_ERR_MALFORMED,
         };
+        let rc = check_suites(&issuer, policy);
+        if rc != CERT_OK {
+            return rc;
+        }
         if !public_point_is_valid(issuer.public_key) {
             return CERT_ERR_BAD_KEY;
+        }
+        // The issuer's KEY is what verifies `cur`'s signature, so the
+        // strength of `cur` is capped by it. Compared against the key
+        // being vouched for, not against `cur`'s own signature suite —
+        // those are the same value here, but they will not be once a
+        // chain can mix suites, and the key is the one that matters.
+        if suite::security_bits(issuer.key_suite) < suite::security_bits(cur.key_suite) {
+            return CERT_ERR_DOWNGRADE;
         }
         let rc = check_issuer(&issuer, issuer_der, &cur, cur_der, policy, depth);
         if rc != CERT_OK {
@@ -1114,6 +1511,9 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy) -> u32 {
         if rc != CERT_OK {
             return rc;
         }
+        if suite::security_bits(anchor.key_suite) < suite::security_bits(cur.key_suite) {
+            return CERT_ERR_DOWNGRADE;
+        }
         let rc = check_validity(&anchor, policy);
         if rc != CERT_OK {
             return rc;
@@ -1124,7 +1524,32 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy) -> u32 {
     }
 
     // --- name rule ------------------------------------------------------
-    if !policy.expected_dns.is_empty() {
+    if policy.profile == PROFILE_CA_URI {
+        // A URI SAN, matched byte-for-byte. An empty expectation cannot be
+        // satisfied and is refused rather than treated as "match
+        // anything" — under this profile the name IS the authorisation.
+        if policy.expected_uri.is_empty() {
+            return CERT_ERR_NAME_ABSENT;
+        }
+        let (san_start, san_len) = match leaf_exts.san {
+            Some(v) => v,
+            None => return CERT_ERR_NAME_ABSENT,
+        };
+        let mut matched = false;
+        let any = walk_san_uri(leaf_der, san_start, san_len, &mut |uri| {
+            if uri == policy.expected_uri {
+                matched = true;
+                return true;
+            }
+            false
+        });
+        if !any {
+            return CERT_ERR_NAME_ABSENT;
+        }
+        if !matched {
+            return CERT_ERR_NAME_MISMATCH;
+        }
+    } else if !policy.expected_dns.is_empty() {
         let (san_start, san_len) = match leaf_exts.san {
             Some(v) => v,
             None => return CERT_ERR_NAME_ABSENT,
@@ -1150,11 +1575,11 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy) -> u32 {
 
 /// Check `issuer` may issue `subject`, and that it did.
 fn check_issuer(
-    issuer: &X509Cert,
+    issuer: &X509Cert<'_>,
     issuer_der: &[u8],
-    subject: &X509Cert,
+    subject: &X509Cert<'_>,
     subject_der: &[u8],
-    policy: &ChainPolicy,
+    policy: &ChainPolicy<'_>,
     depth: usize,
 ) -> u32 {
     if !der_bytes_eq(subject.issuer_raw, issuer.subject_raw) {
@@ -1177,7 +1602,7 @@ fn check_issuer(
 /// A certificate used as an issuer must say it is one, must be permitted to
 /// sign certificates, and must not have constrained the path shorter than
 /// the one being built.
-fn check_ca_shape(cert: &X509Cert, der: &[u8], depth: usize) -> u32 {
+fn check_ca_shape(cert: &X509Cert<'_>, der: &[u8], depth: usize) -> u32 {
     let exts = parse_extensions(der, cert.ext_off, cert.ext_len);
     if exts.malformed {
         return CERT_ERR_MALFORMED;
@@ -1202,7 +1627,7 @@ fn check_ca_shape(cert: &X509Cert, der: &[u8], depth: usize) -> u32 {
 
 /// Lifetime, per the configured clock posture
 /// (`.context/rfc_tls_peer_identity.md` §6).
-fn check_validity(cert: &X509Cert, policy: &ChainPolicy) -> u32 {
+fn check_validity(cert: &X509Cert<'_>, policy: &ChainPolicy<'_>) -> u32 {
     if !policy.require_clock {
         return CERT_OK;
     }
@@ -1282,6 +1707,8 @@ pub fn verify_cert_chain(
             profile: PROFILE_CA_DNS,
             anchor_der: trust_anchor_der,
             expected_dns: expected_hostname,
+            expected_uri: &[],
+            allowed_suites: suite::IMPLEMENTED,
             now_unix_secs: 0,
             require_clock: false,
             require_eku: EKU_SERVER_AUTH,

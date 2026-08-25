@@ -220,6 +220,11 @@ const MAX_CERT_CHAIN_BYTES: usize = 3072;
 /// buffer is per-instance module state on targets that count kilobytes.
 const MAX_EXPECTED_DNS: usize = 64;
 
+/// Longest expected URI SAN. A SPIFFE ID is a trust domain plus a path and
+/// runs longer than a hostname, so it gets its own bound rather than
+/// borrowing the DNS one and silently truncating.
+const MAX_EXPECTED_URI: usize = 256;
+
 /// Certificate validity posture (`.context/rfc_tls_peer_identity.md` §6).
 const CLOCK_POLICY_REQUIRE: u8 = 0;
 
@@ -748,6 +753,13 @@ struct TlsState {
     expected_dns: [u8; MAX_EXPECTED_DNS],
     expected_dns_len: usize,
 
+    /// Expected URI SAN, required of the peer leaf under
+    /// `PROFILE_CA_URI`. Unlike `expected_dns` this feeds no SNI: a URI is
+    /// not a server name, and a SPIFFE peer is identified by it rather
+    /// than reached at it.
+    expected_uri: [u8; MAX_EXPECTED_URI],
+    expected_uri_len: usize,
+
     /// Reason code of the most recent peer-certificate refusal
     /// (`x509.rs` `CERT_ERR_*`), retained for diagnostics.
     last_peer_auth_error: u32,
@@ -794,6 +806,21 @@ struct TlsState {
 
     // Scratch buffer for net_proto frame assembly
     net_scratch: [u8; NET_SCRATCH_SIZE],
+    /// One inbound record's ciphertext, for the decrypt path.
+    ///
+    /// In MODULE STATE, not on the stack. `record_drain_inbound_one` used
+    /// `let mut ct = [0u8; RECV_BUF_SIZE]` — 16704 bytes zero-initialised
+    /// into a PIC module stack frame on every inbound record, in a function
+    /// that also holds a session borrow. This module already moved its
+    /// ECDH pre-computation to `module_new` "to run on the full kernel
+    /// stack, avoiding PIC stack overflow"; a 16 KB frame on the per-record
+    /// path is the same hazard on the hot path rather than the cold one.
+    ///
+    /// The copy itself cannot be avoided by decrypting in place:
+    /// `decrypt_record` needs `&mut sess.read_keys` and `&mut ciphertext`
+    /// at once, and both live under the same session borrow. Moving the
+    /// destination out of the session resolves that without a copy more.
+    rec_scratch: [u8; RECV_BUF_SIZE],
     /// Decrypt scratch for one inbound application record (sized like
     /// `recv_buf`); lives in module state, not on the kernel stack.
     record_scratch: [u8; RECV_BUF_SIZE],
@@ -821,6 +848,46 @@ struct TlsState {
     // cadence as ip and http so the windows are actually alignable.
     tlm: TlmCounters,
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
+    /// Session lifecycle totals, CUMULATIVE — never reset per window,
+    /// unlike the byte deltas beside them.
+    ///
+    /// The census on the same line is a SNAPSHOT, and a snapshot of a pool
+    /// whose sessions are created and freed between heartbeats reads `sess=0`
+    /// whether nothing ever happened or eleven handshakes ran and every one
+    /// of them ended. Those are opposite diagnoses and the snapshot cannot
+    /// tell them apart, which is exactly the hole that kept a control-plane
+    /// transport defect open: `pool_hit=11, sess=0` says work happened and
+    /// left no trace of where it went.
+    ///
+    /// `t_hs`/`t_rdy` are entries into `Handshaking`/`Ready`. The `f_*`
+    /// counters are frees, by the site that did it — a session freed because
+    /// the peer closed, because a consumer commanded a close, because it
+    /// reached `Closed`, or because it errored — because "the handshake
+    /// never finished" and "the handshake finished and something then closed
+    /// the connection" need different fixes and look identical from outside.
+    /// Which `SessionState::Error` assignment last fired, reported as
+    /// `err_site=` on the heartbeat.
+    ///
+    /// There are ~49 places this state machine can refuse a handshake and
+    /// from outside every one of them looks the same: a connection that
+    /// opens, exchanges bytes, and closes with no alert. Knowing WHICH check
+    /// refused is the difference between a bisect and a guess — it is what
+    /// turned a defect that had survived a whole programme of work into a
+    /// one-line answer.
+    ///
+    /// **The ids are mechanical, not an API.** They are assigned in source
+    /// order and are NOT stable across edits: inserting an error site
+    /// renumbers everything after it. An id is only meaningful against the
+    /// tree that produced it, which is the right trade for a debugging aid
+    /// — a stable enum here would be 49 names to invent and maintain for a
+    /// field only ever read next to the source.
+    last_err_site: u16,
+    sess_handshaking_total: u32,
+    sess_ready_total: u32,
+    free_closed: u32,
+    free_error: u32,
+    free_peer_closed: u32,
+    free_cmd_close: u32,
     /// Cleartext bytes read from `clear_in` (HTTP → TLS), delta per
     /// `[tls] hb` window.
     clear_in_bytes: u32,
@@ -929,7 +996,7 @@ define_params! {
 
     // Peer-authentication profile. `none` is not a permissive default: a
     // client-mode instance that still carries it refuses to construct.
-    11, peer_auth, u8, 0, enum { none=0, pinned=1, ca_dns=2, insecure_no_verify=255 }
+    11, peer_auth, u8, 0, enum { none=0, pinned=1, ca_dns=2, ca_uri=3, insecure_no_verify=255 }
         => |s, d, len| { s.peer_auth = p_u8(d, len, 0, 0); };
 
     // Certificate validity posture. `require` needs a synchronised wall
@@ -980,6 +1047,7 @@ pub unsafe extern "C" fn module_new(
     s.key_len = 0;
     s.anchor_len = 0;
     s.expected_dns_len = 0;
+    s.expected_uri_len = 0;
     s.last_peer_auth_error = 0;
     s.key_vault_handle = -1;
     s.ecdh_pool_hit = 0;
@@ -1002,6 +1070,14 @@ pub unsafe extern "C" fn module_new(
     s.tlm = TlmCounters::new();
     s.clear_in_bytes = 0;
     s.clear_out_bytes = 0;
+    // Cumulative, so initialised here and NOT in the per-window reset.
+    s.last_err_site = 0;
+    s.sess_handshaking_total = 0;
+    s.sess_ready_total = 0;
+    s.free_closed = 0;
+    s.free_error = 0;
+    s.free_peer_closed = 0;
+    s.free_cmd_close = 0;
     s.fwd_pre_step = 0;
     s.adv_items = 0;
     s.pend_steps = 0;
@@ -1046,7 +1122,7 @@ pub unsafe extern "C" fn module_new(
     // a client with no trust policy must fail before network readiness, not
     // at its first byte (`.context/rfc_tls_peer_identity.md` §4.2).
     if !peer_auth_admissible(s) {
-        let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust_cert_file, and verify_hostname for ca_dns)";
+        let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust_cert_file, and verify_hostname for ca_dns / verify_uri for ca_uri)";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
@@ -1098,10 +1174,20 @@ pub unsafe extern "C" fn module_new(
             } else {
                 extract_ec_private_key(&s.key[..s.key_len], &mut raw);
             }
-            let mut store_arg = [0u8; 4 + 32];
-            store_arg[0] = 1; // key_type = P-256 scalar
-            store_arg[1] = 32; // key_len
-            core::ptr::copy_nonoverlapping(raw.as_ptr(), store_arg.as_mut_ptr().add(4), 32);
+            // STORE v1: [suite:u16][usage_mask:u32][key_len:u32][key]
+            //
+            // The mask is SIGN only. This key exists to sign
+            // CertificateVerify and nothing else — not to agree keys (the
+            // ephemeral ECDH key does that) and not to be exported. Asking
+            // for exactly what is used is what makes the vault's per-op
+            // check worth having.
+            const SUITE_P256: u16 = 1;
+            const USAGE_SIGN: u32 = 1 << 0;
+            let mut store_arg = [0u8; 10 + 32];
+            store_arg[0..2].copy_from_slice(&SUITE_P256.to_le_bytes());
+            store_arg[2..6].copy_from_slice(&USAGE_SIGN.to_le_bytes());
+            store_arg[6..10].copy_from_slice(&32u32.to_le_bytes());
+            core::ptr::copy_nonoverlapping(raw.as_ptr(), store_arg.as_mut_ptr().add(10), 32);
             let h = (sys.provider_call)(-1, KV_STORE, store_arg.as_mut_ptr(), store_arg.len());
             if h >= 0 {
                 s.key_vault_handle = h;
@@ -1129,7 +1215,9 @@ pub unsafe extern "C" fn module_new(
 }
 
 /// Parse extended TLV entries: `cert_file` (10), `key_file` (11),
-/// `trust_cert_file` (12), `verify_hostname` (13). Scans the entire params
+/// `trust_cert_file` (12), `verify_hostname` (13), `verify_uri` (15).
+/// Tag 14 is `alpn`, which this module does not consume.
+/// Scans the entire params
 /// blob; extended entries use `tag + 0x00 + len_hi + len_lo`.
 unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len: usize) {
     if params.is_null() || params_len < 4 {
@@ -1153,7 +1241,7 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
     while pos + 4 <= end {
         let tag = data[pos];
-        let ext_tags = tag == 10 || tag == 11 || tag == 12 || tag == 13;
+        let ext_tags = tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 15;
         if ext_tags && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let data_start = pos + 4;
@@ -1207,6 +1295,20 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                             len,
                         );
                         s.expected_dns_len = len;
+                    }
+                }
+                15 => {
+                    // Expected URI SAN. Truncating it would authenticate a
+                    // different identity — and a prefix of a SPIFFE ID is
+                    // another valid SPIFFE ID — so an over-long value is
+                    // dropped and the admission check refuses the instance.
+                    if len > 0 && len <= MAX_EXPECTED_URI {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(data_start),
+                            s.expected_uri.as_mut_ptr(),
+                            len,
+                        );
+                        s.expected_uri_len = len;
                     }
                 }
                 _ => {}
@@ -1316,6 +1418,79 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         pos += fmt_u32_dec(s.adv_items, buf.add(pos));
         emit(b" pend=", &mut pos);
         pos += fmt_u32_dec(s.pend_steps, buf.add(pos));
+        // Session census: how many slots are live, and how many of those
+        // are still mid-handshake.
+        //
+        // Without it, a session that neither completes nor errors is
+        // invisible — the counters show bytes moving and nothing showing
+        // whether anything ever got past the handshake. That is the exact
+        // hole that made a control-plane transport bug unfalsifiable for a
+        // whole programme of work: `clr_rx > 0, clr_tx = 0` says data
+        // arrived and nothing came back, and says nothing at all about
+        // WHERE the sessions producing it got to.
+        //
+        // The bound is `sessions.len()` — GRANTED slots — and NOT
+        // `MAX_SESSIONS`, which is the pool's maximum. On aarch64 the arena
+        // starts with `SESSION_CHUNK` (8) inline slots and grows in chunks,
+        // so `sessions[8]` before the first grant indexes `extra[0]`, which
+        // is a NULL pointer in kernel-zeroed module state. `SessionArena`'s
+        // `Index` guards that with a `debug_assert!`, which is compiled out
+        // of a release PIC build — so the read is an unchecked deref of
+        // null and the runtime takes SIGSEGV on the first heartbeat.
+        //
+        // That is not a hypothetical: this loop shipped with the wrong bound
+        // and crashed `fluxor-linux` on every aarch64 `tls` graph as soon as
+        // the heartbeat fired, which from a client is a socket that opens
+        // and goes quiet — indistinguishable from the transport defect this
+        // census was added to diagnose. Iterating a pool by its capacity
+        // instead of its occupancy is the bug the `iter()` helper exists to
+        // make unavailable, so this uses it.
+        let mut live = 0u32;
+        let mut handshaking = 0u32;
+        let mut ready = 0u32;
+        for sess in s.sessions.iter() {
+            match sess.state {
+                SessionState::Idle => {}
+                SessionState::Handshaking => {
+                    live += 1;
+                    handshaking += 1;
+                }
+                SessionState::Ready => {
+                    live += 1;
+                    ready += 1;
+                }
+                _ => live += 1,
+            }
+        }
+        emit(b" sess=", &mut pos);
+        pos += fmt_u32_dec(live, buf.add(pos));
+        emit(b" hs=", &mut pos);
+        pos += fmt_u32_dec(handshaking, buf.add(pos));
+        emit(b" rdy=", &mut pos);
+        pos += fmt_u32_dec(ready, buf.add(pos));
+        // Granted slots, not `MAX_SESSIONS`: "3 live of 8 granted" and "3
+        // live of 64" describe different situations, and a pool about to
+        // grow is a pool about to call the elastic allocator.
+        emit(b" cap=", &mut pos);
+        pos += fmt_u32_dec(s.sessions.len() as u32, buf.add(pos));
+        // Cumulative lifecycle totals; see the field docs. Read them against
+        // the snapshot: `t_hs=11 t_rdy=0` with `sess=0` is eleven handshakes
+        // that started and none that finished, which the snapshot alone
+        // reports identically to an idle module.
+        emit(b" t_hs=", &mut pos);
+        pos += fmt_u32_dec(s.sess_handshaking_total, buf.add(pos));
+        emit(b" t_rdy=", &mut pos);
+        pos += fmt_u32_dec(s.sess_ready_total, buf.add(pos));
+        emit(b" f_closed=", &mut pos);
+        pos += fmt_u32_dec(s.free_closed, buf.add(pos));
+        emit(b" f_err=", &mut pos);
+        pos += fmt_u32_dec(s.free_error, buf.add(pos));
+        emit(b" f_peer=", &mut pos);
+        pos += fmt_u32_dec(s.free_peer_closed, buf.add(pos));
+        emit(b" f_cmd=", &mut pos);
+        pos += fmt_u32_dec(s.free_cmd_close, buf.add(pos));
+        emit(b" err_site=", &mut pos);
+        pos += fmt_u32_dec(u32::from(s.last_err_site), buf.add(pos));
         dev_log(sys, 3, buf, pos);
         s.clear_in_bytes = 0;
         s.clear_out_bytes = 0;
@@ -1414,6 +1589,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 steps += 1;
             }
         } else if s.sessions[i].state == SessionState::Closed {
+            s.free_closed = s.free_closed.wrapping_add(1);
             s.sessions[i].reset();
         } else if s.sessions[i].state == SessionState::Error {
             // Best-effort close notifications; if the channel is
@@ -1422,6 +1598,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let cid = s.sessions[i].conn_id;
             let _ = tls_write_or_count(s, s.cipher_out, NET_CMD_CLOSE, cid, core::ptr::null(), 0);
             let _ = tls_write_or_count(s, s.clear_out, NET_MSG_CLOSED, cid, core::ptr::null(), 0);
+            s.free_error = s.free_error.wrapping_add(1);
             s.sessions[i].reset();
         }
         i += 1;
@@ -1537,6 +1714,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
                             s.sessions[idx].held_msg_type = t;
                             s.sessions[idx].state = SessionState::Handshaking;
+                            s.sess_handshaking_total =
+                                s.sess_handshaking_total.wrapping_add(1);
                             // For a client connect, carry the clear-side
                             // consumer's original tag so the forwarded
                             // MSG_CONNECTED routes back to it. Accepts: 0.
@@ -1570,6 +1749,24 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // No session slots — close the socket upstream
                             // (best-effort; a full channel still RSTs/times
                             // out on the peer).
+                            //
+                            // Said out loud, because the peer cannot tell.
+                            // A close with no alert mid-handshake looks
+                            // identical to a crash, a firewall, or a
+                            // protocol bug, and this module used to do it
+                            // in complete silence — which is how one
+                            // instance of it went unexplained across an
+                            // entire programme of work. The session pool
+                            // grows in chunks from the elastic region, so
+                            // hitting this means either the pool is
+                            // genuinely full or a grant was refused; either
+                            // way the operator needs to know it happened.
+                            dev_log(
+                                sys,
+                                1,
+                                b"[tls] no session slot: closing accepted conn".as_ptr(),
+                                44,
+                            );
                             let _ = tls_write_or_count(
                                 s,
                                 s.cipher_out,
@@ -1633,7 +1830,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
                             let to_read = if data_len < space { data_len } else { space };
                             if to_read > 0 {
-                                (sys.channel_read)(
+                                let got = (sys.channel_read)(
                                     s.cipher_in,
                                     s.sessions[idx]
                                         .recv_buf
@@ -1641,7 +1838,28 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         .add(s.sessions[idx].recv_len),
                                     to_read,
                                 );
-                                s.sessions[idx].recv_len += to_read;
+                                // `channel_read` on a byte FIFO returns WHAT IS
+                                // AVAILABLE, up to `len`, so advance by what it
+                                // actually wrote. Advancing by what was ASKED
+                                // for would leave a hole of stale bytes in the
+                                // middle of the record stream, and every record
+                                // after it would fail to decrypt under a
+                                // perfectly good key.
+                                //
+                                // Measured as never firing on this path today
+                                // (the writer assembles each frame and writes it
+                                // in one call). Written this way anyway because
+                                // "never happens" here is a property of the
+                                // writer, not of this contract, and the failure
+                                // it would cause is silent.
+                                if got > 0 {
+                                    #[expect(
+                                        clippy::cast_sign_loss,
+                                        reason = "guarded > 0 above"
+                                    )]
+                                    let n = got as usize;
+                                    s.sessions[idx].recv_len += n;
+                                }
                             }
                             if data_len > to_read {
                                 tls_discard(sys, s.cipher_in, data_len - to_read);
@@ -1699,6 +1917,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     dev_log(sys, 1, msg.as_ptr(), msg.len());
                                     tls_discard(sys, s.cipher_in, remaining);
                                     s.sessions[idx].state = SessionState::Error;
+                                    s.last_err_site = 1;
                                     break;
                                 }
                             }
@@ -1732,6 +1951,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 clear_passthrough(s, conn_id);
                 let si = find_session_by_conn_id(s, conn_id);
                 if si >= 0 {
+                    s.free_peer_closed = s.free_peer_closed.wrapping_add(1);
                     s.sessions[si as usize].reset();
                 }
                 // Forward to HTTP — best-effort close notification.
@@ -1987,6 +2207,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                             b"[tls] record encrypt refused; session->Error";
                                         dev_log(sys, 3, msg.as_ptr(), msg.len());
                                         s.sessions[idx].state = SessionState::Error;
+                                        s.last_err_site = 2;
                                         tls_discard(sys, s.clear_in, remaining - rd);
                                         break;
                                     }
@@ -2026,6 +2247,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     dev_log(sys, 3, msg.as_ptr(), msg.len());
                                     s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
                                     s.sessions[idx].state = SessionState::Error;
+                                    s.last_err_site = 3;
                                     if remaining > rd {
                                         // Drop the rest of the
                                         // incoming clear send;
@@ -2072,6 +2294,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.sessions[idx].state == SessionState::Ready {
                         send_alert(s, idx, ALERT_CLOSE_NOTIFY);
                     }
+                    s.free_cmd_close = s.free_cmd_close.wrapping_add(1);
                     s.sessions[idx].reset();
                 }
                 // Forward CMD_CLOSE to cipher_out — best-effort.
@@ -2493,6 +2716,12 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
     }
     match s.peer_auth {
         PROFILE_PINNED => s.anchor_len > 0,
+        // `ca_uri` demands the name on BOTH sides, unlike `ca_dns`: a
+        // server under `ca_dns` legitimately has no name to expect of a
+        // client, whereas under `ca_uri` the URI is the whole
+        // authorisation and a policy that names none authorises everyone
+        // the CA ever signed.
+        PROFILE_CA_URI => s.anchor_len > 0 && s.expected_uri_len > 0,
         PROFILE_CA_DNS => {
             if s.anchor_len == 0 {
                 return false;
@@ -2527,10 +2756,19 @@ fn chain_policy(s: &TlsState, require_eku: u8, now_unix_secs: u64) -> ChainPolic
         profile: s.peer_auth,
         anchor_der: &s.anchor[..s.anchor_len],
         expected_dns: expected,
+        expected_uri: &s.expected_uri[..s.expected_uri_len],
+        // Only what this build can actually verify. A configured subset is
+        // a policy decision the graph does not express yet; when it does,
+        // this narrows rather than widens — a suite the code cannot check
+        // must never become permitted by configuration.
+        allowed_suites: suite::IMPLEMENTED,
         now_unix_secs,
         // Pinning carries its own lifetime policy: the operator rotates the
         // pin (`.context/rfc_tls_peer_identity.md` §3.1).
-        require_clock: s.clock_policy == CLOCK_POLICY_REQUIRE && s.peer_auth == PROFILE_CA_DNS,
+        // Pinning carries its own lifetime policy, but both CA profiles
+        // chain to an anchor whose certificates have real validity windows.
+        require_clock: s.clock_policy == CLOCK_POLICY_REQUIRE
+            && (s.peer_auth == PROFILE_CA_DNS || s.peer_auth == PROFILE_CA_URI),
         require_eku,
     }
 }
@@ -2626,6 +2864,7 @@ fn peer_auth_text(profile: u8) -> &'static [u8] {
     match profile {
         PROFILE_PINNED => b"pinned",
         PROFILE_CA_DNS => b"ca_dns",
+        PROFILE_CA_URI => b"ca_uri",
         PROFILE_INSECURE_NO_VERIFY => b"insecure_no_verify",
         _ => b"none",
     }
@@ -2888,6 +3127,7 @@ unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
     );
     if !ok {
         s.sessions[idx].state = SessionState::Error;
+        s.last_err_site = 6;
         return;
     }
     // Default suite (will be set during handshake)
@@ -2973,9 +3213,42 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
     // disjoint fields of `TlsState`, but the pool's `Index` impl hides
     // that from the borrow checker.
     let deferred: *mut u32 = &mut s.hs_intake_deferred;
+    // Same reason as `deferred`: `rec_scratch` and the session are disjoint
+    // fields of `TlsState`, but the pool's `Index` impl hides that from the
+    // borrow checker.
+    let rec_scratch: *mut u8 = s.rec_scratch.as_mut_ptr();
     let sess = &mut s.sessions[idx];
     skip_ccs(sess);
     if sess.state == SessionState::Error {
+        return false;
+    }
+    // Back-pressure: never take another record while the driver still holds
+    // a COMPLETE handshake message. Processing that message can install new
+    // read keys, and this function's own contract says records must be
+    // decrypted after any such rotation — "draining everything up front
+    // would use stale keys".
+    //
+    // The ordering that contract assumes (`drain` then `pump`, alternating)
+    // does not by itself achieve it. RFC 8446 §5.1 lets ONE record carry
+    // SEVERAL handshake messages, and rustls uses that: the client's
+    // Certificate, CertificateVerify and Finished arrive in a single record.
+    // The pump reads one message per tick, so after the Certificate the
+    // driver still holds ~115 bytes — and the loop's next `drain` reached
+    // for the following record before the Finished had been processed. That
+    // record is the client's first APPLICATION-key record, and the server
+    // was still holding handshake keys.
+    //
+    // The result was a decrypt failure with a CORRECT key at a CORRECT
+    // sequence number, which is why it survived being checked against the
+    // key, the nonce, the sequence and the framing in turn. Deferring here
+    // is what makes the alternation actually alternate.
+    //
+    // `false` means "no record taken", not "no progress": the caller's loop
+    // continues while `pump_session` reports progress, so the buffered
+    // message is consumed and the next iteration takes the record under
+    // whatever keys that left installed.
+    if sess.driver.has_complete_message() {
+        *deferred = (*deferred).wrapping_add(1);
         return false;
     }
     if sess.recv_len < 5 {
@@ -2985,11 +3258,13 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
     let legacy_version = [sess.recv_buf[1], sess.recv_buf[2]];
     if !is_legal_record_type(rec_type) || !legacy_version_ok(&legacy_version) {
         sess.state = SessionState::Error;
+        s.last_err_site = 7;
         return false;
     }
     let rec_len = ((sess.recv_buf[3] as usize) << 8) | (sess.recv_buf[4] as usize);
     if rec_len > MAX_CIPHERTEXT || rec_len > RECV_BUF_SIZE {
         sess.state = SessionState::Error;
+        s.last_err_site = 8;
         return false;
     }
     if sess.recv_len < 5 + rec_len {
@@ -3009,6 +3284,7 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
         }
         if rec_type != CT_HANDSHAKE {
             sess.state = SessionState::Error;
+            s.last_err_site = 9;
             return false;
         }
         match hs_intake_decision(sess.driver.in_len, rec_len) {
@@ -3021,6 +3297,7 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             }
             HsIntake::Refuse => {
                 sess.state = SessionState::Error;
+                s.last_err_site = 10;
                 return false;
             }
         }
@@ -3037,6 +3314,7 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             // downgrade attempt or an injection, and silently dropping
             // it invites the sender to keep going.
             sess.state = SessionState::Error;
+            s.last_err_site = 11;
             return false;
         }
         // `decrypt_record` advances the AEAD sequence, and this path
@@ -3055,13 +3333,17 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             }
             HsIntake::Refuse => {
                 sess.state = SessionState::Error;
+                s.last_err_site = 12;
                 return false;
             }
         }
         let mut hdr = [0u8; 5];
         core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
-        let mut ct = [0u8; RECV_BUF_SIZE];
-        core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr().add(5), ct.as_mut_ptr(), rec_len);
+        core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr().add(5), rec_scratch, rec_len);
+        // SAFETY: `rec_scratch` is `s.rec_scratch`, `RECV_BUF_SIZE` bytes of
+        // module state, and `rec_len` was bounded by `RECV_BUF_SIZE` above.
+        // It aliases no part of the session borrow.
+        let ct = core::slice::from_raw_parts_mut(rec_scratch, RECV_BUF_SIZE);
         match decrypt_record(
             sess.driver.suite,
             &mut sess.read_keys,
@@ -3071,12 +3353,14 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             Some((pt_len, inner_type)) => {
                 if !is_legal_inner_type(inner_type) {
                     sess.state = SessionState::Error;
+                    s.last_err_site = 13;
                     return false;
                 }
                 if inner_type == CT_ALERT && pt_len != 2 {
                     // RFC 8446 §6: an Alert body is exactly
                     // level(1) || description(1).
                     sess.state = SessionState::Error;
+                    s.last_err_site = 14;
                     return false;
                 }
                 if inner_type == CT_HANDSHAKE {
@@ -3086,6 +3370,7 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
                         // sequence has moved and the record cannot be
                         // retried — fail rather than stall.
                         sess.state = SessionState::Error;
+                        s.last_err_site = 15;
                         return false;
                     }
                     core::ptr::copy_nonoverlapping(
@@ -3100,6 +3385,7 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
             }
             None => {
                 sess.state = SessionState::Error;
+                s.last_err_site = 16;
                 return false;
             }
         }
@@ -3189,6 +3475,7 @@ unsafe fn record_emit_handshake_fragment(
     // RFC 8446 §5.1 forbids an empty handshake fragment.
     if frag == 0 || frag > HS_FRAGMENT_MAX {
         s.sessions[idx].state = SessionState::Error;
+        s.last_err_site = 17;
         return false;
     }
 
@@ -3232,6 +3519,7 @@ unsafe fn record_emit_handshake_fragment(
                 // the peer is not desynced — but the handshake cannot
                 // make progress either.
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 18;
                 return false;
             }
         };
@@ -3287,6 +3575,7 @@ unsafe fn record_emit_handshake_fragment(
         let msg: &[u8] = b"[tls] handshake out drop; session->Error";
         dev_log(sys, 3, msg.as_ptr(), msg.len());
         s.sessions[idx].state = SessionState::Error;
+        s.last_err_site = 19;
         return false;
     }
     retx_push(&mut s.sessions[idx], rec.as_ptr(), total_len as u16);
@@ -3354,6 +3643,7 @@ unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
 
         HandshakeState::Complete => {
             s.sessions[idx].state = SessionState::Ready;
+            s.sess_ready_total = s.sess_ready_total.wrapping_add(1);
             true
         }
         _ => false,
@@ -3362,6 +3652,7 @@ unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
     // driver into Error transitions the outer session state too.
     if s.sessions[idx].driver.is_handshake_error() {
         s.sessions[idx].state = SessionState::Error;
+        s.last_err_site = 21;
     }
     r
 }
@@ -3383,6 +3674,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     };
     if msg_type != HT_CLIENT_HELLO {
         sess.state = SessionState::Error;
+        s.last_err_site = 22;
         return true;
     }
     let hs_data = &msg[..total];
@@ -3391,6 +3683,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
         Some(c) => c,
         None => {
             sess.state = SessionState::Error;
+            s.last_err_site = 23;
             return true;
         }
     };
@@ -3404,6 +3697,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
             b"[tls] client not TLS 1.3".len(),
         );
         sess.state = SessionState::Error;
+        s.last_err_site = 24;
         return true;
     }
 
@@ -3418,6 +3712,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
                 b"[tls] no common cipher suite".len(),
             );
             sess.state = SessionState::Error;
+            s.last_err_site = 25;
             return true;
         }
     };
@@ -3478,6 +3773,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
             sess.driver.group = GROUP_X25519;
             if !driver_gen_x25519(sys, &mut sess.driver) {
                 sess.state = SessionState::Error;
+                s.last_err_site = 26;
                 return true;
             }
         }
@@ -3494,6 +3790,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
             if sess.driver.hrr_sent {
                 // Second ClientHello still carries no usable share → fatal
                 sess.state = SessionState::Error;
+                s.last_err_site = 27;
                 return true;
             }
             if let Some(ref mut t) = sess.driver.transcript {
@@ -3512,6 +3809,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // Generate server random (entropy failure is fatal)
     if dev_csprng_fill(sys, sess.driver.server_random.as_mut_ptr(), 32) < 0 {
         sess.state = SessionState::Error;
+        s.last_err_site = 28;
         return true;
     }
 
@@ -3566,6 +3864,7 @@ unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
             // Finished directly to skip auth — is a protocol error.
             if msg_type != HT_CERTIFICATE {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 29;
                 return true;
             }
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
@@ -3573,6 +3872,7 @@ unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
             }
             if !session_verify_peer_cert(s, idx, &data[4..len]) {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 30;
                 return true;
             }
             s.sessions[idx].driver.hs_state = HandshakeState::RecvClientCertVerify;
@@ -3587,10 +3887,12 @@ unsafe fn pump_recv_client_cert_verify(s: &mut TlsState, idx: usize) -> bool {
         Some((data, len, msg_type)) => {
             if msg_type != 15 {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 31;
                 return true;
             }
             if !verify_peer_cert_verify(s, idx, &data, len) {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 32;
                 return true;
             }
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
@@ -3712,6 +4014,7 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
             Some(t) => t.current_hash(),
             None => {
                 sess.state = SessionState::Error;
+                s.last_err_site = 33;
                 return true;
             }
         };
@@ -3738,9 +4041,22 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
         // vault side yet.
         const KV_SIGN: u32 = 0x1003;
         if s.key_vault_handle >= 0 {
-            let mut sign_arg = [0u8; 4 + 32 + 64];
-            sign_arg[0] = 32;
-            core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(4), 32);
+            // SIGN v1: [mode:u8][_pad:u8][input_len:u32][input]
+            //          [sig_ptr:u64][sig_cap:u16][sig_len_out:u16]
+            //
+            // `DIGEST` explicitly, because `vc_hash` IS the digest. Leaving
+            // the mode to be inferred from the key type is how a caller that
+            // passes a message here gets a valid signature over the wrong
+            // bytes, with nothing on the wire to catch it.
+            const SIGN_MODE_DIGEST: u8 = 1;
+            let mut raw_sig = [0u8; 64];
+            let mut sign_arg = [0u8; 6 + 32 + 12];
+            sign_arg[0] = SIGN_MODE_DIGEST;
+            sign_arg[2..6].copy_from_slice(&32u32.to_le_bytes());
+            core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(6), 32);
+            let sig_ptr = raw_sig.as_mut_ptr() as u64;
+            sign_arg[38..46].copy_from_slice(&sig_ptr.to_le_bytes());
+            sign_arg[46..48].copy_from_slice(&64u16.to_le_bytes());
             let rc = (sys.provider_call)(
                 s.key_vault_handle,
                 KV_SIGN,
@@ -3748,12 +4064,6 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
                 sign_arg.len(),
             );
             if rc == 0 {
-                let mut raw_sig = [0u8; 64];
-                core::ptr::copy_nonoverlapping(
-                    sign_arg.as_ptr().add(4 + 32),
-                    raw_sig.as_mut_ptr(),
-                    64,
-                );
                 return finalise_certificate_verify(s, idx, &raw_sig);
             }
         }
@@ -3953,56 +4263,227 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
     true
 }
 
-/// Fluxor-owned wire constants for `MSG_PEER_IDENTITY`. The
-/// envelope is a fluxor-graph primitive (foundation/tls emits it,
-/// any consumer module — peer_router, RBAC, log, audit — can read
-/// it); the format is documented here, not in any downstream
-/// consumer's repo. A downstream `peer_router` may mirror these
-/// constants but is one valid consumer among many.
+/// Fluxor-owned wire constants for `MSG_PEER_IDENTITY`.
 ///
-/// Wire format: `[msg_type:1][payload_len:2 LE]
-/// [conn_id:1][replica_id:1=0xFF][verified:1][svid_len:1][svid…]`
-/// (payload_len excludes the 3-byte header).
+/// The envelope is a fluxor-graph primitive — `foundation/tls` emits it and
+/// any consumer module (peer_router, RBAC, ingress, audit) reads it — so the
+/// format is documented here rather than in a downstream repo.
 ///
-/// `verified == 1` iff `svid_len > 0`. `svid` is the SHA-256 of
-/// the peer's raw cert subjectPublicKey (always 32 bytes for
-/// ECDSA-P-256). A peer with no cert (plaintext / anonymous
-/// handshake) gets `verified=0, svid_len=0`.
+/// ## What it carries, and why it is not a boolean
+///
+/// A boolean would tell an authorization consumer that *something* was
+/// checked without saying what: two deployments with different profiles
+/// both produce `verified=1`, and the consumer cannot tell them apart.
+/// Naming the peer's key hash "SVID" would mislead in the other direction —
+/// identity documentation uses that word for a SPIFFE credential or its
+/// URI, not for a 32-byte hash of a subject key.
+///
+/// So the record carries facts:
+///
+/// ```text
+/// [session_id: u32 LE]
+/// [verification_result: u8]     — see `peer_result`
+/// [credential_kind: u8]         — see `peer_credential`
+/// [profile_id: u16 LE]          — which configured profile was applied
+/// [not_before: u64 LE][not_after: u64 LE]
+/// [verification_flags: u32 LE]  — see `peer_check`; which checks RAN
+/// [key_fp_alg: u8][key_fp_len: u8]
+/// [principal_len: u16 LE]
+/// [key_fingerprint: key_fp_len][principal: principal_len]
+/// ```
+///
+/// **`principal` is non-empty only when `verification_result == OK` and both
+/// the SAN and the configured profile were verified.** That is the rule the
+/// whole record exists to make expressible: a name is the one field an
+/// authorization decision will act on directly, so it must be absent unless
+/// it was actually established. Everything a consumer might otherwise infer
+/// from a boolean is in `verification_flags` instead, which says which
+/// checks ran rather than asking the consumer to assume.
+///
+/// `key_fingerprint` is what the old `svid` field held — the SHA-256 of the
+/// peer leaf's raw subjectPublicKey — under a name that says so.
 pub const MSG_PEER_IDENTITY: u8 = 0x5A;
-pub const PEER_IDENTITY_REPLICA_UNKNOWN: u8 = 0xFF;
-pub const PEER_IDENTITY_HEADER_LEN: usize = 3;
-pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = 5; // conn_id (u16) + replica + verified + svid_len
-pub const PEER_IDENTITY_MAX_SVID: usize = 32;
-pub const PEER_IDENTITY_MAX_TOTAL: usize =
-    PEER_IDENTITY_HEADER_LEN + PEER_IDENTITY_FIXED_PAYLOAD_LEN + PEER_IDENTITY_MAX_SVID;
 
-/// Build the `MSG_PEER_IDENTITY` envelope into `out`. Returns the
-/// total byte count. Pure formatter — no I/O. Separated from the
-/// emit path so the latch/retry logic can re-send byte-identical
-/// envelopes across ticks.
+/// `verification_result` values.
+pub mod peer_result {
+    /// A credential was presented and passed the configured profile.
+    pub const OK: u8 = 0;
+    /// No credential was presented (plaintext or anonymous handshake).
+    pub const NO_CREDENTIAL: u8 = 1;
+    /// A credential was presented and its chain did not validate.
+    pub const CHAIN_FAILED: u8 = 2;
+    /// The chain validated but the profile (EKU, name, usage) did not.
+    pub const PROFILE_FAILED: u8 = 3;
+    /// The credential was outside its validity window.
+    pub const EXPIRED: u8 = 4;
+    /// The credential used a suite this endpoint does not accept.
+    pub const UNSUPPORTED_SUITE: u8 = 5;
+}
+
+/// `credential_kind` values.
+pub mod peer_credential {
+    pub const NONE: u8 = 0;
+    /// An X.509 certificate presented in a mutual-TLS handshake.
+    pub const X509_MTLS: u8 = 1;
+    /// A bare public key, with no certificate around it.
+    pub const RAW_PUBLIC_KEY: u8 = 2;
+}
+
+/// `verification_flags` bits — which checks actually ran.
+///
+/// A consumer reads these to know what a result is worth. `CHAIN` set with
+/// `VALIDITY` clear says the chain was trusted but its lifetime was not
+/// enforced, which is exactly the state `clock_policy: unchecked` produces
+/// and exactly the thing a boolean could never express.
+pub mod peer_check {
+    /// The chain was validated to a configured trust anchor.
+    pub const CHAIN: u32 = 0x0000_0001;
+    /// The certificate's validity window was enforced.
+    pub const VALIDITY: u32 = 0x0000_0002;
+    /// The required extended key usage was present.
+    pub const EKU: u32 = 0x0000_0004;
+    /// A subject alternative name was matched against the profile.
+    pub const SAN: u32 = 0x0000_0008;
+    /// Proof of possession of the subject key (the handshake signature).
+    pub const KEY_POSSESSION: u32 = 0x0000_0010;
+}
+
+/// `key_fp_alg` values.
+pub mod peer_fp_alg {
+    pub const NONE: u8 = 0;
+    pub const SHA256: u8 = 1;
+}
+
+pub const PEER_IDENTITY_HEADER_LEN: usize = 3;
+/// Fixed part of the payload, before the two variable fields.
+pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 1 + 1 + 2;
+pub const PEER_IDENTITY_MAX_FINGERPRINT: usize = 32;
+/// A SPIFFE URI comfortably fits; longer names are truncated to nothing
+/// rather than to a prefix, because half a name is a different name.
+pub const PEER_IDENTITY_MAX_PRINCIPAL: usize = 128;
+pub const PEER_IDENTITY_MAX_TOTAL: usize = PEER_IDENTITY_HEADER_LEN
+    + PEER_IDENTITY_FIXED_PAYLOAD_LEN
+    + PEER_IDENTITY_MAX_FINGERPRINT
+    + PEER_IDENTITY_MAX_PRINCIPAL;
+
+/// The facts a completed (or refused) handshake established.
+#[derive(Clone, Copy)]
+pub struct PeerIdentity<'a> {
+    pub session_id: u32,
+    pub verification_result: u8,
+    pub credential_kind: u8,
+    pub profile_id: u16,
+    pub not_before: u64,
+    pub not_after: u64,
+    pub verification_flags: u32,
+    pub key_fp_alg: u8,
+    pub key_fingerprint: &'a [u8],
+    pub principal: &'a [u8],
+}
+
+/// Build the `MSG_PEER_IDENTITY` envelope into `out`. Returns the total byte
+/// count. Pure formatter — no I/O. Separated from the emit path so the
+/// latch/retry logic can re-send byte-identical envelopes across ticks.
+///
+/// Enforces the record's one invariant rather than trusting the caller: a
+/// principal is dropped unless the result is `OK` and both `SAN` and `CHAIN`
+/// were checked. A caller that assembles a name it did not establish gets an
+/// empty one, not a trusted one.
 pub fn build_peer_identity_envelope(
-    conn_id: u16,
-    svid: &[u8],
+    id: &PeerIdentity<'_>,
     out: &mut [u8; PEER_IDENTITY_MAX_TOTAL],
 ) -> usize {
-    let svid_len = if svid.len() > PEER_IDENTITY_MAX_SVID {
-        PEER_IDENTITY_MAX_SVID
+    let fp_len = id.key_fingerprint.len().min(PEER_IDENTITY_MAX_FINGERPRINT);
+    let established = id.verification_result == peer_result::OK
+        && (id.verification_flags & peer_check::SAN) != 0
+        && (id.verification_flags & peer_check::CHAIN) != 0;
+    let principal_len = if established && id.principal.len() <= PEER_IDENTITY_MAX_PRINCIPAL {
+        id.principal.len()
     } else {
-        svid.len()
+        0
     };
-    let verified: u8 = if svid_len > 0 { 1 } else { 0 };
-    let payload_len = PEER_IDENTITY_FIXED_PAYLOAD_LEN + svid_len;
+
+    let payload_len = PEER_IDENTITY_FIXED_PAYLOAD_LEN + fp_len + principal_len;
     out[0] = MSG_PEER_IDENTITY;
     out[1] = (payload_len & 0xFF) as u8;
     out[2] = ((payload_len >> 8) & 0xFF) as u8;
-    out[3..5].copy_from_slice(&conn_id.to_le_bytes());
-    out[5] = PEER_IDENTITY_REPLICA_UNKNOWN;
-    out[6] = verified;
-    out[7] = svid_len as u8;
-    if svid_len > 0 {
-        out[8..8 + svid_len].copy_from_slice(&svid[..svid_len]);
+    let mut p = PEER_IDENTITY_HEADER_LEN;
+    out[p..p + 4].copy_from_slice(&id.session_id.to_le_bytes());
+    p += 4;
+    out[p] = id.verification_result;
+    out[p + 1] = id.credential_kind;
+    p += 2;
+    out[p..p + 2].copy_from_slice(&id.profile_id.to_le_bytes());
+    p += 2;
+    out[p..p + 8].copy_from_slice(&id.not_before.to_le_bytes());
+    p += 8;
+    out[p..p + 8].copy_from_slice(&id.not_after.to_le_bytes());
+    p += 8;
+    out[p..p + 4].copy_from_slice(&id.verification_flags.to_le_bytes());
+    p += 4;
+    out[p] = if fp_len > 0 {
+        id.key_fp_alg
+    } else {
+        peer_fp_alg::NONE
+    };
+    out[p + 1] = fp_len as u8;
+    p += 2;
+    out[p..p + 2].copy_from_slice(&(principal_len as u16).to_le_bytes());
+    p += 2;
+    if fp_len > 0 {
+        out[p..p + fp_len].copy_from_slice(&id.key_fingerprint[..fp_len]);
+        p += fp_len;
     }
-    PEER_IDENTITY_HEADER_LEN + payload_len
+    if principal_len > 0 {
+        out[p..p + principal_len].copy_from_slice(&id.principal[..principal_len]);
+        p += principal_len;
+    }
+    p
+}
+
+/// Parse a `MSG_PEER_IDENTITY` payload (the bytes AFTER the 3-byte header).
+///
+/// Returns `None` for anything malformed rather than a partly-filled record:
+/// a consumer that acted on a half-parsed identity would be acting on a
+/// name or fingerprint nobody wrote.
+#[must_use]
+pub fn parse_peer_identity(payload: &[u8]) -> Option<PeerIdentity<'_>> {
+    if payload.len() < PEER_IDENTITY_FIXED_PAYLOAD_LEN {
+        return None;
+    }
+    let session_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let verification_result = payload[4];
+    let credential_kind = payload[5];
+    let profile_id = u16::from_le_bytes([payload[6], payload[7]]);
+    let not_before = u64::from_le_bytes([
+        payload[8], payload[9], payload[10], payload[11], payload[12], payload[13], payload[14],
+        payload[15],
+    ]);
+    let not_after = u64::from_le_bytes([
+        payload[16], payload[17], payload[18], payload[19], payload[20], payload[21], payload[22],
+        payload[23],
+    ]);
+    let verification_flags =
+        u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
+    let key_fp_alg = payload[28];
+    let fp_len = payload[29] as usize;
+    let principal_len = u16::from_le_bytes([payload[30], payload[31]]) as usize;
+    let at = PEER_IDENTITY_FIXED_PAYLOAD_LEN;
+    if payload.len() < at + fp_len + principal_len {
+        return None;
+    }
+    Some(PeerIdentity {
+        session_id,
+        verification_result,
+        credential_kind,
+        profile_id,
+        not_before,
+        not_after,
+        verification_flags,
+        key_fp_alg,
+        key_fingerprint: &payload[at..at + fp_len],
+        principal: &payload[at + fp_len..at + fp_len + principal_len],
+    })
 }
 
 /// Build a `MSG_PEER_IDENTITY` envelope for the session and try to
@@ -4016,20 +4497,62 @@ unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
     if s.peer_identity < 0 {
         return;
     }
-    // Hash the peer pubkey into a 32-byte SVID. Plaintext peers
-    // (no cert) yield an empty slice → verified=0.
+    // The peer's key fingerprint: SHA-256 over its raw subjectPublicKey.
+    // A plaintext peer presents no certificate and yields an empty slice.
     let pk_len = s.sessions[idx].driver.peer_cert_pubkey_len as usize;
-    let mut svid_buf = [0u8; PEER_IDENTITY_MAX_SVID];
-    let svid_slice: &[u8] = if pk_len > 0 {
+    let mut fp_buf = [0u8; PEER_IDENTITY_MAX_FINGERPRINT];
+    let fingerprint: &[u8] = if pk_len > 0 {
         let digest = sha256(&s.sessions[idx].driver.peer_cert_pubkey[..pk_len]);
-        svid_buf.copy_from_slice(&digest);
-        &svid_buf[..]
+        fp_buf.copy_from_slice(&digest);
+        &fp_buf[..]
     } else {
-        &svid_buf[..0]
+        &fp_buf[..0]
     };
-    let conn_id = s.sessions[idx].conn_id;
+
+    // What this handshake actually established.
+    //
+    // The flags say which checks RAN, and they are derived from the
+    // configured profile rather than assumed: `verify_chain` was reached
+    // only if a certificate was presented, and the validity window was
+    // enforced only when `clock_policy` demanded it AND the profile was
+    // `ca_dns` — which is precisely the combination `chain_policy` uses.
+    // A consumer can therefore tell "trusted chain, lifetime unchecked"
+    // from "fully verified", which the old boolean could not express.
+    let (result, credential_kind, flags) = if pk_len == 0 {
+        (peer_result::NO_CREDENTIAL, peer_credential::NONE, 0u32)
+    } else {
+        let mut f = peer_check::CHAIN | peer_check::KEY_POSSESSION;
+        if s.clock_policy == CLOCK_POLICY_REQUIRE && s.peer_auth == PROFILE_CA_DNS {
+            f |= peer_check::VALIDITY;
+        }
+        // The EKU is required by `chain_policy` for every profile that
+        // validates a chain at all, so reaching here means it was checked.
+        f |= peer_check::EKU;
+        (peer_result::OK, peer_credential::X509_MTLS, f)
+    };
+
+    // No principal yet: emitting a name means having matched a SAN against
+    // the configured profile, and this module's server path applies no name
+    // rule to a client (an mTLS client is identified by its issuer, not by a
+    // hostname it does not serve). `build_peer_identity_envelope` enforces
+    // that anyway — it drops a principal unless SAN was checked — so this is
+    // the honest input rather than a value the formatter would discard.
+    let principal: &[u8] = &[];
+
+    let identity = PeerIdentity {
+        session_id: u32::from(s.sessions[idx].conn_id),
+        verification_result: result,
+        credential_kind,
+        profile_id: u16::from(s.peer_auth),
+        not_before: 0,
+        not_after: 0,
+        verification_flags: flags,
+        key_fp_alg: peer_fp_alg::SHA256,
+        key_fingerprint: fingerprint,
+        principal,
+    };
     let mut envelope = [0u8; PEER_IDENTITY_MAX_TOTAL];
-    let total = build_peer_identity_envelope(conn_id, svid_slice, &mut envelope);
+    let total = build_peer_identity_envelope(&identity, &mut envelope);
 
     // Latch first, then attempt an immediate write. If the write
     // accepts the full envelope we clear the latch in the same
@@ -4170,6 +4693,7 @@ unsafe fn pump_recv_encrypted(
         Some((data, len, msg_type)) => {
             if msg_type != expected_type {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 34;
                 return true;
             }
             // Update transcript
@@ -4199,6 +4723,7 @@ unsafe fn pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
             }
             if msg_type != 11 {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 35;
                 return true;
             }
             if let Some(ref mut t) = s.sessions[idx].driver.transcript {
@@ -4206,6 +4731,7 @@ unsafe fn pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
             }
             if !session_verify_peer_cert(s, idx, &data[4..len]) {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 36;
                 return true;
             }
             s.sessions[idx].driver.hs_state = HandshakeState::RecvCertificateVerify;
@@ -4357,6 +4883,7 @@ unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
                 // marked on the driver.
                 if s.sessions[idx].driver.hs_state == HandshakeState::Error {
                     s.sessions[idx].state = SessionState::Error;
+                    s.last_err_site = 37;
                 }
                 return;
             }
@@ -4368,6 +4895,7 @@ unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
                     Some(r) => r,
                     None => {
                         s.sessions[idx].state = SessionState::Error;
+                        s.last_err_site = 38;
                         return;
                     }
                 };
@@ -4375,18 +4903,21 @@ unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
                 // rotate inbound before anything else is read.
                 if !rotate_traffic_keys(&mut s.sessions[idx], true) {
                     s.sessions[idx].state = SessionState::Error;
+                    s.last_err_site = 39;
                     return;
                 }
                 if request == KEY_UPDATE_REQUESTED
                     && !send_key_update(s, idx, KEY_UPDATE_NOT_REQUESTED)
                 {
                     s.sessions[idx].state = SessionState::Error;
+                    s.last_err_site = 40;
                     return;
                 }
             }
             HT_NEW_SESSION_TICKET => {
                 if !parse_new_session_ticket_is_well_formed(body) {
                     s.sessions[idx].state = SessionState::Error;
+                    s.last_err_site = 41;
                     return;
                 }
                 // Resumption is unsupported: the ticket is validated
@@ -4394,6 +4925,7 @@ unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
             }
             _ => {
                 s.sessions[idx].state = SessionState::Error;
+                s.last_err_site = 42;
                 return;
             }
         }
@@ -4675,6 +5207,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
     // connection.
     if rec_type != CT_APPLICATION_DATA || !legacy_version_ok(&legacy_version) {
         sess.state = SessionState::Error;
+        s.last_err_site = 43;
         return;
     }
 
@@ -4709,6 +5242,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         Some((pt_len, inner_type)) => {
             if !is_legal_inner_type(inner_type) {
                 sess.state = SessionState::Error;
+                s.last_err_site = 44;
                 return;
             }
             if inner_type == CT_HANDSHAKE {
@@ -4721,6 +5255,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 let space = HS_IN_BUF_SIZE - sess.driver.in_len;
                 if pt_len > space {
                     sess.state = SessionState::Error;
+                    s.last_err_site = 45;
                     return;
                 }
                 core::ptr::copy_nonoverlapping(
@@ -4736,6 +5271,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                 // RFC 8446 §6: exactly level(1) || description(1).
                 if pt_len != 2 {
                     sess.state = SessionState::Error;
+                    s.last_err_site = 46;
                     return;
                 }
                 if *ct.as_ptr().add(1) == ALERT_CLOSE_NOTIFY {
@@ -4758,6 +5294,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                     return;
                 }
                 sess.state = SessionState::Error;
+                s.last_err_site = 47;
                 return;
             }
             if inner_type == CT_APPLICATION_DATA && pt_len > 0 {
@@ -4796,6 +5333,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                     let msg: &[u8] = b"[tls] clear_out full mid-record; session->Error";
                     dev_log(sys, 1, msg.as_ptr(), msg.len());
                     s.sessions[idx].state = SessionState::Error;
+                    s.last_err_site = 48;
                 }
             }
         }
@@ -4807,6 +5345,7 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
             let msg: &[u8] = b"[tls] record decrypt failed; session->Error";
             dev_log(sys, 1, msg.as_ptr(), msg.len());
             sess.state = SessionState::Error;
+            s.last_err_site = 49;
         }
     }
 }

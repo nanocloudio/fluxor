@@ -381,12 +381,19 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
     let mut raw_sig = [0u8; 64];
     let mut signed_via_vault = false;
     if s.key_vault_handle >= 0 {
-        let mut sign_arg = [0u8; 4 + 32 + 64];
-        sign_arg[0] = 32;
-        core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(4), 32);
+        // SIGN v1, `DIGEST` explicitly: `vc_hash` IS the digest. Leaving the
+        // mode to be inferred from the key type is how a message passed here
+        // gets signed as though it were one.
+        const SIGN_MODE_DIGEST: u8 = 1;
+        let mut sign_arg = [0u8; 6 + 32 + 12];
+        sign_arg[0] = SIGN_MODE_DIGEST;
+        sign_arg[2..6].copy_from_slice(&32u32.to_le_bytes());
+        core::ptr::copy_nonoverlapping(vc_hash.as_ptr(), sign_arg.as_mut_ptr().add(6), 32);
+        let sig_ptr = raw_sig.as_mut_ptr() as u64;
+        sign_arg[38..46].copy_from_slice(&sig_ptr.to_le_bytes());
+        sign_arg[46..48].copy_from_slice(&64u16.to_le_bytes());
         let rc = (sys.provider_call)(s.key_vault_handle, KV_SIGN, sign_arg.as_mut_ptr(), sign_arg.len());
         if rc == 0 {
-            core::ptr::copy_nonoverlapping(sign_arg.as_ptr().add(4 + 32), raw_sig.as_mut_ptr(), 64);
             signed_via_vault = true;
         }
     }
@@ -765,17 +772,39 @@ unsafe fn dtls_emit_ack(s: &mut TlsState, idx: usize, acked: (u64, u64)) {
 unsafe fn emit_peer_identity_dtls(s: &mut TlsState, idx: usize) {
     if s.peer_identity < 0 { return; }
     let pk_len = s.peer_sessions[idx].endpoint.driver.peer_cert_pubkey_len as usize;
-    let mut svid_buf = [0u8; PEER_IDENTITY_MAX_SVID];
-    let svid_slice: &[u8] = if pk_len > 0 {
+    let mut fp_buf = [0u8; PEER_IDENTITY_MAX_FINGERPRINT];
+    let fingerprint: &[u8] = if pk_len > 0 {
         let digest = sha256(&s.peer_sessions[idx].endpoint.driver.peer_cert_pubkey[..pk_len]);
-        svid_buf.copy_from_slice(&digest);
-        &svid_buf[..]
+        fp_buf.copy_from_slice(&digest);
+        &fp_buf[..]
     } else {
-        &svid_buf[..0]
+        &fp_buf[..0]
     };
-    let conn_id = idx as u16;
+    // Same facts as the TCP path; see `emit_peer_identity`. `session_id`
+    // carries the DTLS peer-slot index, since DTLS has no IP-module conn id.
+    let (result, credential_kind, flags) = if pk_len == 0 {
+        (peer_result::NO_CREDENTIAL, peer_credential::NONE, 0u32)
+    } else {
+        let mut f = peer_check::CHAIN | peer_check::KEY_POSSESSION | peer_check::EKU;
+        if s.clock_policy == CLOCK_POLICY_REQUIRE && s.peer_auth == PROFILE_CA_DNS {
+            f |= peer_check::VALIDITY;
+        }
+        (peer_result::OK, peer_credential::X509_MTLS, f)
+    };
+    let identity = PeerIdentity {
+        session_id: idx as u32,
+        verification_result: result,
+        credential_kind,
+        profile_id: u16::from(s.peer_auth),
+        not_before: 0,
+        not_after: 0,
+        verification_flags: flags,
+        key_fp_alg: peer_fp_alg::SHA256,
+        key_fingerprint: fingerprint,
+        principal: &[],
+    };
     let mut envelope = [0u8; PEER_IDENTITY_MAX_TOTAL];
-    let total = build_peer_identity_envelope(conn_id, svid_slice, &mut envelope);
+    let total = build_peer_identity_envelope(&identity, &mut envelope);
     {
         let sess = &mut s.peer_sessions[idx];
         sess.pending_peer_identity[..total].copy_from_slice(&envelope[..total]);

@@ -294,6 +294,20 @@ pub mod errno {
     pub const EINPROGRESS: i32 = -36;
     /// Function / syscall not implemented.
     pub const ENOSYS: i32 = -38;
+
+    /// No such entry. A lookup that found nothing, as distinct from one
+    /// that could not be performed.
+    pub const ENOENT: i32 = -2;
+
+    /// The caller's buffer is too small, and the call has written the
+    /// exact requirement into the layout's `*_len_out` field.
+    ///
+    /// Distinct from `ENOSPC` (the STORE is full) and from `EINVAL` (the
+    /// request was wrong). This one says the request was right and the
+    /// caller should resize — a caller that cannot tell those apart either
+    /// gives up on a recoverable call or retries an unrecoverable one
+    /// forever.
+    pub const ERANGE: i32 = -34;
     /// A value is too large for the width the caller asked it in. Used by
     /// FS_STAT when a file's size does not fit the 32-bit output form, so
     /// the caller learns to ask again with a wider buffer rather than
@@ -349,13 +363,95 @@ pub mod channel {
 // ─────────────────────────────────────────────────────────────────────
 // Timer primitive
 // ─────────────────────────────────────────────────────────────────────
+/// The `timer::TRUSTED_UNIX` observation record.
+pub mod trusted_time {
+    /// Encoded length of the record.
+    pub const LEN: usize = 8 + 4 + 4 + 8 + 8 + 1 + 1 + 2;
+
+    /// Field offsets within the record.
+    pub const OFF_UNIX_SECONDS: usize = 0;
+    pub const OFF_UNIX_NANOS: usize = 8;
+    pub const OFF_UNCERTAINTY_MS: usize = 12;
+    pub const OFF_MONOTONIC_US: usize = 16;
+    pub const OFF_SOURCE_EPOCH: usize = 24;
+    pub const OFF_SOURCE_CLASS: usize = 32;
+    pub const OFF_FLAGS: usize = 33;
+
+    /// Where the observation came from. Ordered by how much it is worth, so
+    /// a policy can say "at least this" rather than enumerate.
+    pub mod source {
+        /// No time source at all. `unix_seconds` is meaningless.
+        pub const UNAVAILABLE: u8 = 0;
+        /// A counter running since boot with no absolute reference.
+        pub const FREE_RUNNING: u8 = 1;
+        /// A local real-time clock, never externally checked.
+        pub const RTC: u8 = 2;
+        /// Synchronised against a network time source.
+        pub const NETWORK_SYNC: u8 = 3;
+        /// Signed by an authority whose signature was verified.
+        pub const SIGNED_AUTHORITY: u8 = 4;
+    }
+
+    /// What is known about the observation.
+    pub mod flags {
+        /// The source has been synchronised at least once.
+        pub const SYNCHRONIZED: u8 = 0x01;
+        /// The deployment's policy accepts this source for security
+        /// decisions. A provider sets it; a consumer does not infer it.
+        pub const TRUSTED: u8 = 0x02;
+        /// The source moved backwards, or its epoch advanced unexpectedly.
+        /// A consumer holding decisions cached under an earlier epoch must
+        /// discard them.
+        pub const ROLLBACK_SUSPECT: u8 = 0x04;
+    }
+}
+
 pub mod timer {
     pub const MILLIS: u32 = 0x0602;
     pub const MICROS: u32 = 0x0603;
     /// Wall-clock milliseconds since the Unix epoch (0 if the platform has no RTC).
-    /// Distinct from MILLIS (monotonic uptime); for absolute-time checks (cert validity,
-    /// JWT `exp`). handle=-1, arg=[u64 LE].
+    /// Distinct from MILLIS (monotonic uptime).
+    ///
+    /// A bare number, and it cannot say whether it is trustworthy: zero means
+    /// "no RTC" but every other value is indistinguishable from a good one,
+    /// including one from a clock that was never synchronised or has just
+    /// been stepped backwards. Suitable for timestamps a human reads and for
+    /// cache ages; NOT suitable for deciding whether a credential is still
+    /// valid. Use `TRUSTED_UNIX` for that. handle=-1, arg=[u64 LE].
     pub const UNIX_MILLIS: u32 = 0x0608;
+
+    /// A security-grade time observation: what time it is, and what is known
+    /// about how much that is worth.
+    ///
+    /// Not a second version of `UNIX_MILLIS` — a different question.
+    /// `UNIX_MILLIS` answers "what time is it"; this answers "what may I
+    /// conclude from it", which is what a credential decision actually needs
+    /// and what a bare `u64` structurally cannot carry. Every expiry, replay
+    /// window, certificate lifetime and key-retirement decision is a
+    /// statement about time, and on a board with no RTC each of them is
+    /// currently being made against a number that may be zero or may be
+    /// wrong with no way to tell the two apart.
+    ///
+    /// `handle=-1`, `arg` receives `trusted_time::LEN` bytes:
+    ///
+    /// ```text
+    /// [unix_seconds: u64 LE]
+    /// [unix_nanos:   u32 LE]
+    /// [uncertainty_ms: u32 LE]   — half-width of the confidence interval
+    /// [monotonic_us: u64 LE]     — read at the SAME instant, so a caller
+    ///                              can measure elapsed time without
+    ///                              re-reading a wall clock that may step
+    /// [source_epoch: u64 LE]     — increments on every step or resync
+    /// [source_class: u8]         — see `trusted_time::source`
+    /// [flags: u8]                — see `trusted_time::flags`
+    /// [_reserved: u16]
+    /// ```
+    ///
+    /// `source_epoch` is what makes rollback detectable: a consumer stamps a
+    /// cached decision with the epoch it was made under and invalidates the
+    /// decision when the epoch moves. Without it a clock that goes backwards
+    /// and comes forward again is invisible.
+    pub const TRUSTED_UNIX: u32 = 0x0609;
     /// Create a timer fd. handle=-1. Returns tagged timer fd.
     pub const CREATE: u32 = 0x0604;
     /// Start/restart timer. handle=timer_fd, arg[0..4]=delay_ms (LE).

@@ -30,14 +30,19 @@ name = "clear_out"
 direction = "output"
 content_type = "NetProto"
 
-# Per-session peer-identity envelope emitted after TLS handshake
-# completion. Wire format documented in
-# modules/foundation/tls/mod.rs (`MSG_PEER_IDENTITY` const block):
+# Per-session peer-identity record emitted after handshake completion,
+# for every session — including one whose peer presented no credential,
+# because silence is indistinguishable from an event still in flight.
+# Wire format documented in modules/foundation/tls/mod.rs
+# (`MSG_PEER_IDENTITY` const block):
 #   [msg_type:1=0x5A][payload_len:2 LE]
-#   [conn_id:1][replica_id:1=0xFF][verified:1][svid_len:1][svid…]
-# `verified == 1` iff `svid_len > 0`. SVID is SHA-256 of the peer
-# cert's raw subjectPublicKey (32 B). The TLS module retries on
-# back-pressure so delivery is at-least-once.
+#   [session_id:4][result:1][credential_kind:1][profile_id:2]
+#   [not_before:8][not_after:8][flags:4]
+#   [fp_alg:1][fp_len:1][principal_len:2][fingerprint][principal]
+# `flags` says which checks actually RAN, so a consumer knows what the
+# result is worth; the principal is absent unless the chain and the SAN
+# were both verified. The TLS module retries on back-pressure so
+# delivery is at-least-once.
 [[ports]]
 name = "peer_identity"
 direction = "output"

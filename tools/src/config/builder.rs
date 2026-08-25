@@ -1728,6 +1728,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     "key_file",
     "trust_cert_file",
     "verify_hostname",
+    "verify_uri", // URI SAN required under peer_auth: ca_uri, extended TLV tag 15
     "alpn", // RFC 7301 ALPN list, emitted as extended TLV tag 14
     "domain",
     "sample_rate", // injected by graph_sample_rate
@@ -2824,6 +2825,36 @@ fn build_module_entry(
             entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
             extra_len += 4 + n;
             eprintln!("  verify_hostname: {name}");
+        }
+    }
+
+    // Tag 15: verify_uri (ASCII URI, extended TLV). The name a peer leaf's
+    // URI SAN must equal under the tls module's `ca_uri` peer-auth profile
+    // — the SPIFFE case. Separate from `verify_hostname` because a URI is
+    // matched byte-for-byte where a hostname has wildcard and label rules;
+    // one key feeding both would apply whichever rule the code reached
+    // first.
+    if let Some(uri) = module.get("verify_uri").and_then(|v| v.as_str()) {
+        let bytes = uri.as_bytes();
+        let n = bytes.len();
+        // The module drops an over-long value rather than truncate it — a
+        // prefix of a SPIFFE ID is another valid SPIFFE ID — so refuse
+        // here instead, where the operator can still see why.
+        const VERIFY_URI_MAX: usize = 256;
+        if n > VERIFY_URI_MAX {
+            return Err(Error::Config(format!(
+                "verify_uri is {n} bytes, over the {VERIFY_URI_MAX}-byte limit: \
+                 truncating it would authenticate a different identity"
+            )));
+        }
+        if n > 0 && base + extra_len + 4 + n < entry.len() {
+            entry[base + extra_len] = 15;
+            entry[base + extra_len + 1] = 0x00;
+            entry[base + extra_len + 2] = (n >> 8) as u8;
+            entry[base + extra_len + 3] = n as u8;
+            entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(bytes);
+            extra_len += 4 + n;
+            eprintln!("  verify_uri: {uri}");
         }
     }
 

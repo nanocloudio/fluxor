@@ -172,6 +172,42 @@ pub struct Store {
     dir: Option<PathBuf>,
 }
 
+/// What a mutating write may be made conditional on.
+///
+/// A real three-way choice, and not `Option<u64>`, because that shape cannot
+/// hold one: "must not exist" was previously encoded as `Some(0)`, which is
+/// indistinguishable from "must currently be at revision 0". A
+/// compare-and-swap against a key at revision 0 and a create-only write were
+/// therefore the same request, and one of them was always answered wrongly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Precondition {
+    /// Apply unconditionally.
+    Any,
+    /// Apply only if the key does not exist.
+    Absent,
+    /// Apply only if the key exists at exactly this revision.
+    Revision(u64),
+}
+
+impl Precondition {
+    /// Evaluate against the key's current revision, `None` when absent.
+    fn check(self, existing: Option<u64>) -> Result<(), CasConflict> {
+        match self {
+            Self::Any => Ok(()),
+            Self::Absent => match existing {
+                None => Ok(()),
+                Some(current) => Err(CasConflict { current }),
+            },
+            Self::Revision(expect) => match existing {
+                Some(current) if current == expect => Ok(()),
+                other => Err(CasConflict {
+                    current: other.unwrap_or(0),
+                }),
+            },
+        }
+    }
+}
+
 impl Store {
     pub fn new() -> Self {
         Self::with_limits(4096, 1024)
@@ -243,6 +279,18 @@ impl Store {
         self.record(change);
     }
 
+    /// Whether writes to this store reach a durable log before they are
+    /// acknowledged.
+    ///
+    /// This is what decides the fence a write reports. A store with no log
+    /// is a store whose acknowledgement survives nothing, and saying so is
+    /// the whole point of the fence surface — a caller that must record a
+    /// revocation needs to be refused here rather than told it committed.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        self.log.is_some()
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -287,21 +335,17 @@ impl Store {
         self.record(change);
     }
 
-    /// Insert or update. `if_match`: `None` = unconditional; `Some(0)` = must not
-    /// exist; `Some(r)` = current per-key revision must equal `r`. Returns the
-    /// new store revision. Appends to the durable log (if any) before applying.
+    /// Insert or update under `precondition`. Returns the new store revision.
+    /// Appends to the durable log (if any) before applying.
     pub fn put(
         &mut self,
         key: &str,
         value: Vec<u8>,
-        if_match: Option<u64>,
+        precondition: Precondition,
     ) -> Result<u64, WriteError> {
         let existing_rev = self.entries.get(key).map(|e| e.revision);
-        if let Some(expect) = if_match {
-            let current = existing_rev.unwrap_or(0);
-            if current != expect {
-                return Err(WriteError::Conflict(CasConflict { current }));
-            }
+        if let Err(conflict) = precondition.check(existing_rev) {
+            return Err(WriteError::Conflict(conflict));
         }
         let rev = self.revision + 1;
         if let Some(log) = self.log.as_mut() {
@@ -312,14 +356,19 @@ impl Store {
         Ok(rev)
     }
 
-    /// Remove a key. `if_match` as in `put`. Returns the new revision, or
+    /// Remove a key under `precondition`. Returns the new revision, or
     /// `Ok(None)` for an unconditional delete of an absent key (no-op).
-    pub fn delete(&mut self, key: &str, if_match: Option<u64>) -> Result<Option<u64>, WriteError> {
+    pub fn delete(
+        &mut self,
+        key: &str,
+        precondition: Precondition,
+    ) -> Result<Option<u64>, WriteError> {
         let existing_rev = self.entries.get(key).map(|e| e.revision);
-        match Self::delete_precheck(if_match, existing_rev) {
-            Err(conflict) => return Err(WriteError::Conflict(conflict)),
-            Ok(false) => return Ok(None),
-            Ok(true) => {}
+        if let Err(conflict) = precondition.check(existing_rev) {
+            return Err(WriteError::Conflict(conflict));
+        }
+        if existing_rev.is_none() {
+            return Ok(None);
         }
         let rev = self.revision + 1;
         if let Some(log) = self.log.as_mut() {
@@ -328,23 +377,6 @@ impl Store {
         }
         self.apply_local(rev, OP_DELETE, key, Vec::new());
         Ok(Some(rev))
-    }
-
-    fn delete_precheck(
-        if_match: Option<u64>,
-        existing_rev: Option<u64>,
-    ) -> Result<bool, CasConflict> {
-        match (if_match, existing_rev) {
-            (Some(expect), current) => {
-                let cur = current.unwrap_or(0);
-                if cur != expect {
-                    return Err(CasConflict { current: cur });
-                }
-                Ok(current.is_some())
-            }
-            (None, None) => Ok(false),
-            (None, Some(_)) => Ok(true),
-        }
     }
 
     /// Key-ordered `(key, revision)` snapshot under `prefix`, plus the store
@@ -472,6 +504,7 @@ impl Default for Store {
 // no locking.
 // ===========================================================================
 
+use crate::abi::contracts::storage::object::precondition as obj_precondition;
 use crate::abi::contracts::storage::{namespace as ns_op, object as obj_op};
 use crate::abi::fence::{Fence, QUERY_OP, WIRE_MAX_LEN};
 use crate::kernel::ipc::channel::channel_write;
@@ -486,6 +519,16 @@ const EVENT_HEADER_SIZE: usize = 32;
 
 /// A fixed 16-byte source id for this store's fences/events (ObjectId).
 const STORE_SOURCE: [u8; 16] = *b"fluxor-cp-store\0";
+
+/// Device id reported in a `LocalDurable` fence.
+///
+/// One store, one device: this identifies the durability domain a write
+/// reached, so a caller comparing two `LocalDurable` fences can tell
+/// whether they survived the same failure. There is exactly one control-
+/// plane store per node, so it is a constant rather than a real device
+/// number — a fabricated per-write value would make two fences from the
+/// same store look like two independent domains.
+const STORE_DEVICE_ID: u64 = 1;
 
 const STORE_MAX_SUBS: usize = 64;
 const STORE_MAX_READS: usize = 32;
@@ -525,19 +568,48 @@ static mut LINUX_READS: [ReadSlot; STORE_MAX_READS] = [READ_EMPTY; STORE_MAX_REA
 /// # Safety
 /// Single-threaded platform dispatch only: initialises the `static mut`
 /// store singleton without synchronization.
-pub unsafe fn store_init_from_env() -> bool {
+/// What `store_init_from_env` did — three outcomes, not two.
+///
+/// `bool` could not tell "no store was asked for" from "a store was asked for
+/// and could not be opened", and the caller consequently discarded both. The
+/// first is the ordinary case for every graph that does not use the
+/// control-plane store; the second leaves EVERY store-backed module in the
+/// graph talking to a store that is not there, and it did so silently.
+///
+/// That silence is expensive out of proportion to the bug behind it: a module
+/// whose provider is absent does not fail, it simply never produces anything,
+/// and from outside that is indistinguishable from a module that has nothing
+/// to do. It is the same class of defect as a provider that answers
+/// `UNAVAILABLE` without logging — the reason `security_state` probes at init
+/// and says so.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreInit {
+    /// `FLUXOR_STORE_DIR` is unset: this node has no control-plane store, by
+    /// configuration. Not an error and not worth a line.
+    NotConfigured,
+    /// Opened, or already open.
+    Opened,
+    /// `FLUXOR_STORE_DIR` was set and the store could not be opened. The
+    /// caller MUST report this — see the type docs.
+    Failed,
+}
+
+/// # Safety
+/// Single-threaded startup only; initialises the `static mut` store singleton
+/// before any provider dispatch.
+pub unsafe fn store_init_from_env() -> StoreInit {
     if (*core::ptr::addr_of!(LINUX_STORE)).is_some() {
-        return true;
+        return StoreInit::Opened;
     }
     let Ok(dir) = std::env::var("FLUXOR_STORE_DIR") else {
-        return false;
+        return StoreInit::NotConfigured;
     };
     match Store::open(std::path::Path::new(&dir), 65536, 4096) {
         Ok(s) => {
             LINUX_STORE = Some(s);
-            true
+            StoreInit::Opened
         }
-        Err(_) => false,
+        Err(_) => StoreInit::Failed,
     }
 }
 
@@ -561,6 +633,28 @@ fn etag_from_rev(rev: u64) -> [u8; 32] {
     e[..8].copy_from_slice(&rev.to_le_bytes());
     e
 }
+/// Read a `[precondition: u8][etag_len: u8][etag]` block, advancing `p`.
+fn read_precondition(a: &[u8], p: &mut usize) -> Option<Precondition> {
+    let &kind = a.get(*p)?;
+    let &etag_len = a.get(*p + 1)?;
+    *p += 2;
+    let etag_len = etag_len as usize;
+    if a.len() < *p + etag_len {
+        return None;
+    }
+    let etag = &a[*p..*p + etag_len];
+    *p += etag_len;
+    match kind {
+        obj_precondition::ANY => Some(Precondition::Any),
+        obj_precondition::ABSENT => Some(Precondition::Absent),
+        obj_precondition::ETAG if etag_len > 0 => Some(Precondition::Revision(rev_from_etag(etag))),
+        // `ETAG` with no etag is not a weaker condition, it is a malformed
+        // request: answering it as unconditional would turn a guard the
+        // caller asked for into no guard at all.
+        _ => None,
+    }
+}
+
 fn rev_from_etag(etag: &[u8]) -> u64 {
     if etag.len() >= 8 {
         u64::from_le_bytes(etag[..8].try_into().unwrap())
@@ -729,7 +823,8 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
     match opcode {
         obj_op::PUT => {
             // [key_len:u16][key][ct_len:u8][ct][body_ptr:u64][body_len:u64]
-            // [if_match_len:u8][if_match][fence_out_ptr:u64][fence_out_cap:u16]
+            // [precondition:u8][etag_len:u8][etag]
+            // [fence_out_ptr:u64][fence_out_cap:u16]
             let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
@@ -749,16 +844,10 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 return errno::EINVAL;
             };
             p += 16;
-            let Some(&iml) = a.get(p) else {
+            let Some(precondition) = read_precondition(a, &mut p) else {
                 return errno::EINVAL;
             };
-            p += 1;
-            let if_match = if iml == 0 {
-                None
-            } else {
-                Some(rev_from_etag(&a[p..p + iml as usize]))
-            };
-            p += iml as usize;
+            let absent = precondition == Precondition::Absent;
             let fence_ptr = get_u64(a, p).unwrap_or(0);
             let fence_cap = get_u16(a, p + 8).unwrap_or(0);
 
@@ -767,20 +856,45 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             } else {
                 core::slice::from_raw_parts(body_ptr as *const u8, body_len as usize).to_vec()
             };
-            match store.put(&key, body, if_match) {
+            match store.put(&key, body, precondition) {
                 Ok(rev) => {
-                    write_fence(
+                    // `Log::append` does write_all → flush → sync_data, and
+                    // it runs BEFORE `apply_local`, so a returned `Ok` means
+                    // the record is on disk. That is `LocalDurable`, and it
+                    // is what this now says.
+                    //
+                    // It used to say `RevisionMonotone`, which is a
+                    // statement about ORDERING — revisions go up — and says
+                    // nothing about surviving a restart. A caller applying a
+                    // durability policy had to refuse a write that was in
+                    // fact durable, because the provider under-reported what
+                    // it had achieved. Under-reporting is the safe direction
+                    // to be wrong in, but it is still wrong, and it makes
+                    // the fence unusable for the decision it exists for.
+                    //
+                    // With no log there is no durability to claim, and
+                    // `RevisionMonotone` remains exactly right: the ordering
+                    // holds, nothing else does.
+                    let achieved = if store.is_durable() {
+                        Fence::LocalDurable {
+                            device_id: STORE_DEVICE_ID,
+                        }
+                    } else {
                         Fence::RevisionMonotone {
                             source: STORE_SOURCE,
                             revision: rev,
-                        },
-                        fence_ptr,
-                        fence_cap,
-                    );
+                        }
+                    };
+                    write_fence(achieved, fence_ptr, fence_cap);
                     pump_subscriptions(store);
                     0
                 }
-                Err(WriteError::Conflict(_)) => errno::EAGAIN, // CAS conflict
+                // Two answers, because they ask the caller to do two
+                // different things. `EEXIST`: somebody else created this key,
+                // so a create-only caller has LOST. `EAGAIN`: the key moved
+                // under a compare-and-swap, so re-read and retry.
+                Err(WriteError::Conflict(_)) if absent => errno::EEXIST,
+                Err(WriteError::Conflict(_)) => errno::EAGAIN,
                 Err(WriteError::Io(_)) => errno::ERROR,
             }
         }
@@ -866,7 +980,8 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             rec.len() as i32
         }
         obj_op::DELETE => {
-            // [key_len:u16][key][if_match_len:u8][if_match][fence_out_ptr:u64][fence_out_cap:u16]
+            // [key_len:u16][key][precondition:u8][etag_len:u8][etag]
+            //   [fence_out_ptr:u64][fence_out_cap:u16]
             let Some(kl) = get_u16(a, 0).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
@@ -875,29 +990,30 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             };
             let key = key.to_string();
             let mut p = 2 + kl;
-            let Some(&iml) = a.get(p) else {
+            let Some(precondition) = read_precondition(a, &mut p) else {
                 return errno::EINVAL;
             };
-            p += 1;
-            let if_match = if iml == 0 {
-                None
-            } else {
-                Some(rev_from_etag(&a[p..p + iml as usize]))
-            };
-            p += iml as usize;
             let fptr = get_u64(a, p).unwrap_or(0);
             let fcap = get_u16(a, p + 8).unwrap_or(0);
-            match store.delete(&key, if_match) {
+            match store.delete(&key, precondition) {
                 Ok(opt) => {
                     let rev = opt.unwrap_or_else(|| store.revision());
-                    write_fence(
+                    // As `PUT`: the delete is logged and fsynced before it
+                    // applies, so a logged store achieved `LocalDurable`.
+                    // A delete that reports weaker than it achieved is the
+                    // worse half of the pair — a caller removing a grant
+                    // needs to know the removal survives.
+                    let achieved = if store.is_durable() {
+                        Fence::LocalDurable {
+                            device_id: STORE_DEVICE_ID,
+                        }
+                    } else {
                         Fence::RevisionMonotone {
                             source: STORE_SOURCE,
                             revision: rev,
-                        },
-                        fptr,
-                        fcap,
-                    );
+                        }
+                    };
+                    write_fence(achieved, fptr, fcap);
                     pump_subscriptions(store);
                     0
                 }

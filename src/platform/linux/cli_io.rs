@@ -141,7 +141,24 @@ struct CliInState {
     /// channel (consumer was full). Drained before the next pop.
     pending: Vec<u8>,
     pending_pos: usize,
+    /// Steps spent trying to hand argv to a channel that will not take it.
+    ///
+    /// Bounded because the two reasons a write is refused are
+    /// indistinguishable here and only one of them ever resolves: a FIFO
+    /// answers `EAGAIN` both when it is momentarily FULL and when the record
+    /// is larger than it can EVER hold. Retrying forever is right for the
+    /// first and a hang for the second.
+    args_retries: u32,
 }
+
+/// How long to keep offering argv before calling it undeliverable.
+///
+/// At the default 100 µs tick this is a few seconds — far longer than a
+/// consumer needs to drain a full channel, and short enough that a record
+/// which will never fit is reported while someone is still watching. The
+/// reader side already bounds its own wait the same way (`ARGV_WAIT` in
+/// chronicle_cli); this is the missing half of that pair.
+const ARGS_WRITE_RETRIES: u32 = 20_000;
 
 fn cli_in_step(state: *mut u8) -> i32 {
     // SAFETY: kernel-owned arena sized to `CliInState` by the loader.
@@ -163,7 +180,33 @@ fn cli_in_step(state: *mut u8) -> i32 {
                 if w == rec.len() as i32 {
                     st.args_sent = true;
                 } else {
-                    return 0; // channel full — retry next step, order preserved
+                    st.args_retries = st.args_retries.saturating_add(1);
+                    if st.args_retries < ARGS_WRITE_RETRIES {
+                        return 0; // channel full — retry next step, order preserved
+                    }
+                    // Undeliverable. Almost always the record is bigger than
+                    // the channel, in which case no number of retries helps.
+                    //
+                    // **This used to hang, silently and forever**, and the
+                    // symptom was as far from the cause as it gets: a CLI
+                    // applet whose argument grew past the channel simply
+                    // never started, with nothing in the log and no exit. A
+                    // caller sees a command that produces no output and does
+                    // not return — indistinguishable from a deadlock in the
+                    // applet itself, which is where anyone would look first.
+                    //
+                    // Reported, then given up on rather than retried: the
+                    // graph continues, the applet reads no argv, and an
+                    // applet with no arguments prints its help. A visible
+                    // wrong answer beats an invisible non-answer.
+                    log::error!(
+                        "[cli_in] argv record ({} bytes) could not be written to the \
+                         args channel after {} attempts — it is most likely larger than \
+                         the channel's capacity. The applet will start with NO arguments.",
+                        rec.len(),
+                        st.args_retries
+                    );
+                    st.args_sent = true;
                 }
             }
         }
@@ -273,6 +316,7 @@ fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
             eof,
             pending: Vec::new(),
             pending_pos: 0,
+            args_retries: 0,
         }),
     );
     log::info!(

@@ -121,12 +121,29 @@ fn normalise_low_s(sig: &mut [u8; 64]) {
 /// small fixed handle space, not the token's whole object store.
 const MAX_SLOTS: usize = 8;
 
-/// CAPS bitmap: what this backend actually does — and, as importantly,
-/// what it doesn't (`STORE_IMPORT` and `ALG_ED25519` read 0).
-const HSM_CAPS: u32 = dev_key_vault::caps::GENERATE
-    | dev_key_vault::caps::PUBLIC
-    | dev_key_vault::caps::NON_EXTRACTABLE
-    | dev_key_vault::caps::ALG_P256;
+/// What this backend permits for the one suite it supports.
+///
+/// No `PERSIST` bit is needed: the token IS the persistence, and every key
+/// it generates is a session object today (see `GENERATE`). Nor is there a
+/// `STORE_IMPORT` equivalent — import is refused per-suite through
+/// `SUITE_QUERY` rather than as one global bit, because tokens differ by
+/// algorithm and a single bit could not say which.
+const HSM_P256_USAGE: u32 = dev_key_vault::usage::SIGN
+    | dev_key_vault::usage::VERIFY
+    | dev_key_vault::usage::AGREE
+    | dev_key_vault::usage::EXPORT_PUBLIC;
+
+/// Read a little-endian `u64` from `p`.
+///
+/// # Safety
+/// `p` must be readable for 8 bytes.
+unsafe fn read_u64(p: *const u8) -> u64 {
+    let mut b = [0u8; 8];
+    for (i, v) in b.iter_mut().enumerate() {
+        *v = *p.add(i);
+    }
+    u64::from_le_bytes(b)
+}
 
 /// One generated keypair living inside the token.
 struct HsmSlot {
@@ -340,13 +357,52 @@ pub unsafe fn hsm_key_vault_dispatch(
     };
     match opcode {
         dev_key_vault::PROBE => 1,
-        dev_key_vault::CAPS => {
-            if arg.is_null() || arg_len < 4 {
+        dev_key_vault::SUITE_QUERY => {
+            // arg: [suite:u16][_pad:u16][usage_out:u32]
+            //      [priv_len_out:u16][pub_len_out:u16][sig_len_out:u16]
+            if arg.is_null() || arg_len < 14 {
                 return EINVAL;
             }
-            let bytes = HSM_CAPS.to_le_bytes();
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
-            4
+            let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
+            if suite != dev_key_vault::suite::P256 {
+                return crate::abi::errno::ENOSYS;
+            }
+            let usage = HSM_P256_USAGE.to_le_bytes();
+            core::ptr::copy_nonoverlapping(usage.as_ptr(), arg.add(4), 4);
+            // The private length is 0 and that is the answer, not a gap:
+            // this backend never hands out a private key and never takes
+            // one, so there is no private length a caller could allocate
+            // for. `STORE` refuses accordingly.
+            core::ptr::copy_nonoverlapping(0u16.to_le_bytes().as_ptr(), arg.add(8), 2);
+            core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), arg.add(10), 2);
+            core::ptr::copy_nonoverlapping(64u16.to_le_bytes().as_ptr(), arg.add(12), 2);
+            14
+        }
+        dev_key_vault::SUITE_ENUM => {
+            // One suite, so the enumeration is short and always complete.
+            if arg.is_null() || arg_len < 16 {
+                return EINVAL;
+            }
+            let cursor = u16::from_le_bytes([*arg, *arg.add(1)]);
+            let out_ptr = {
+                let mut b = [0u8; 8];
+                for (i, v) in b.iter_mut().enumerate() {
+                    *v = *arg.add(4 + i);
+                }
+                u64::from_le_bytes(b) as *mut u8
+            };
+            let out_cap = u16::from_le_bytes([*arg.add(12), *arg.add(13)]) as usize;
+            let mut written = 0u16;
+            if cursor <= dev_key_vault::suite::P256 && out_cap >= 2 && !out_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(
+                    dev_key_vault::suite::P256.to_le_bytes().as_ptr(),
+                    out_ptr,
+                    2,
+                );
+                written = 1;
+            }
+            core::ptr::copy_nonoverlapping(written.to_le_bytes().as_ptr(), arg.add(14), 2);
+            0
         }
         dev_key_vault::TIER => {
             if arg.is_null() || arg_len < 1 {
@@ -359,16 +415,25 @@ pub unsafe fn hsm_key_vault_dispatch(
         // clears STORE_IMPORT so consumers already know (RFC §6.2).
         dev_key_vault::STORE => ENOSYS,
         dev_key_vault::ECDH => {
-            // arg layout: [peer_pub_len:u16][pad:u16][peer_pub[len]][out[32]]
+            // arg: [peer_len:u32][peer[peer_len]]
+            //      [out_ptr:u64][out_cap:u16][out_len_out:u16]
             if arg.is_null() || arg_len < 4 {
                 return EINVAL;
             }
             let Some(idx) = slot_index(handle) else {
                 return EINVAL;
             };
-            let peer_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
-            if peer_len == 0 || peer_len > 65 || 4 + peer_len + 32 > arg_len {
+            let peer_len =
+                u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as usize;
+            if peer_len == 0 || peer_len > 65 || 4 + peer_len + 12 > arg_len {
                 return EINVAL;
+            }
+            let ecdh_tail = arg.add(4 + peer_len);
+            let ecdh_out = read_u64(ecdh_tail) as *mut u8;
+            let ecdh_cap = u16::from_le_bytes([*ecdh_tail.add(8), *ecdh_tail.add(9)]) as usize;
+            if ecdh_cap < 32 {
+                core::ptr::copy_nonoverlapping(32u16.to_le_bytes().as_ptr(), ecdh_tail.add(10), 2);
+                return crate::abi::errno::ERANGE;
             }
             let peer = core::slice::from_raw_parts(arg.add(4), peer_len);
             // CKM_ECDH1_DERIVE takes the peer point as the raw ANSI
@@ -436,7 +501,10 @@ pub unsafe fn hsm_key_vault_dispatch(
                 }
             };
             let rc = if secret.len() == 32 {
-                core::ptr::copy_nonoverlapping(secret.as_ptr(), arg.add(4 + peer_len), 32);
+                if !ecdh_out.is_null() {
+                    core::ptr::copy_nonoverlapping(secret.as_ptr(), ecdh_out, 32);
+                }
+                core::ptr::copy_nonoverlapping(32u16.to_le_bytes().as_ptr(), ecdh_tail.add(10), 2);
                 0
             } else {
                 log::warn!(
@@ -459,17 +527,27 @@ pub unsafe fn hsm_key_vault_dispatch(
             crate::kernel::security::key_vault::provider_dispatch(handle, opcode, arg, arg_len)
         }
         dev_key_vault::GENERATE => {
-            // arg layout: [key_type:u8][flags:u8][pad:u16][pub_out[65]]
-            if arg.is_null() || arg_len < 4 {
+            // arg: [suite:u16][usage_mask:u32][flags:u8][_pad:u8]
+            //      [pub_out_ptr:u64][pub_out_cap:u16][pub_len_out:u16]
+            if arg.is_null() || arg_len < 20 {
                 return EINVAL;
             }
-            let key_type = *arg;
-            if key_type != KEY_TYPE_P256_SCALAR {
-                // ES256-scoped backend: ALG_ED25519 reads 0 in CAPS.
+            let suite = u16::from_le_bytes([*arg, *arg.add(1)]);
+            if suite != dev_key_vault::suite::P256 {
+                // ES256-scoped backend: `SUITE_QUERY` answers ENOSYS for
+                // everything else, and so does this.
+                return ENOSYS;
+            }
+            let usage = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
+            if usage == 0 || usage & !HSM_P256_USAGE != 0 {
                 return EINVAL;
             }
-            if 4 + 65 > arg_len {
-                return EINVAL;
+            let gen_tail = arg.add(8);
+            let gen_out = read_u64(gen_tail) as *mut u8;
+            let gen_cap = u16::from_le_bytes([*gen_tail.add(8), *gen_tail.add(9)]) as usize;
+            if gen_cap < 65 {
+                core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), gen_tail.add(10), 2);
+                return crate::abi::errno::ERANGE;
             }
             let mut slots = match vault.slots.lock() {
                 Ok(s) => s,
@@ -523,18 +601,27 @@ pub unsafe fn hsm_key_vault_dispatch(
                     return ERROR;
                 }
             };
-            core::ptr::copy_nonoverlapping(point.as_ptr(), arg.add(4), 65);
+            if !gen_out.is_null() {
+                core::ptr::copy_nonoverlapping(point.as_ptr(), gen_out, 65);
+            }
+            core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), gen_tail.add(10), 2);
             slots[idx] = Some(HsmSlot { private, public });
             fd::tag_fd(fd::FD_TAG_KEY_VAULT, idx as i32)
         }
         dev_key_vault::PUBLIC => {
-            // arg layout: [pub_out[65]]
-            if arg.is_null() || arg_len < 65 {
+            // arg: [out_ptr:u64][out_cap:u16][out_len_out:u16]
+            if arg.is_null() || arg_len < 12 {
                 return EINVAL;
             }
             let Some(idx) = slot_index(handle) else {
                 return EINVAL;
             };
+            let pub_out = read_u64(arg) as *mut u8;
+            let pub_cap = u16::from_le_bytes([*arg.add(8), *arg.add(9)]) as usize;
+            if pub_cap < 65 {
+                core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), arg.add(10), 2);
+                return crate::abi::errno::ERANGE;
+            }
             let slots = match vault.slots.lock() {
                 Ok(s) => s,
                 Err(_) => return ERROR,
@@ -548,7 +635,10 @@ pub unsafe fn hsm_key_vault_dispatch(
             };
             match read_public_point(&session, slot.public) {
                 Ok(point) => {
-                    core::ptr::copy_nonoverlapping(point.as_ptr(), arg, 65);
+                    if !pub_out.is_null() {
+                        core::ptr::copy_nonoverlapping(point.as_ptr(), pub_out, 65);
+                    }
+                    core::ptr::copy_nonoverlapping(65u16.to_le_bytes().as_ptr(), arg.add(10), 2);
                     0
                 }
                 Err(e) => {
@@ -558,16 +648,31 @@ pub unsafe fn hsm_key_vault_dispatch(
             }
         }
         dev_key_vault::SIGN => {
-            // arg layout: [hash_len:u16][pad:u16][hash[hash_len]][sig_out[64]]
-            if arg.is_null() || arg_len < 4 {
+            // arg: [sign_mode:u8][_pad:u8][input_len:u32][input[input_len]]
+            //      [sig_out_ptr:u64][sig_out_cap:u16][sig_len_out:u16]
+            if arg.is_null() || arg_len < 6 {
                 return EINVAL;
             }
             let Some(idx) = slot_index(handle) else {
                 return EINVAL;
             };
-            let hash_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
-            if hash_len == 0 || hash_len > 64 || 4 + hash_len + 64 > arg_len {
+            // P-256 signs a DIGEST. Explicit rather than inferred: a caller
+            // that handed this a message would otherwise get a valid
+            // signature over the wrong thing.
+            if *arg != dev_key_vault::sign_mode::DIGEST {
                 return EINVAL;
+            }
+            let hash_len =
+                u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]) as usize;
+            if hash_len == 0 || hash_len > 64 || 6 + hash_len + 12 > arg_len {
+                return EINVAL;
+            }
+            let sig_tail = arg.add(6 + hash_len);
+            let sig_out = read_u64(sig_tail) as *mut u8;
+            let sig_cap = u16::from_le_bytes([*sig_tail.add(8), *sig_tail.add(9)]) as usize;
+            if sig_cap < 64 {
+                core::ptr::copy_nonoverlapping(64u16.to_le_bytes().as_ptr(), sig_tail.add(10), 2);
+                return crate::abi::errno::ERANGE;
             }
             let slots = match vault.slots.lock() {
                 Ok(s) => s,
@@ -576,7 +681,7 @@ pub unsafe fn hsm_key_vault_dispatch(
             let Some(slot) = &slots[idx] else {
                 return EINVAL;
             };
-            let digest = core::slice::from_raw_parts(arg.add(4), hash_len);
+            let digest = core::slice::from_raw_parts(arg.add(6), hash_len);
             let session = match vault.session.lock() {
                 Ok(s) => s,
                 Err(_) => return ERROR,
@@ -598,7 +703,10 @@ pub unsafe fn hsm_key_vault_dispatch(
             // Contract SIGN output is low-s; the token's raw CKM_ECDSA
             // result is not guaranteed to be.
             normalise_low_s(&mut sig);
-            core::ptr::copy_nonoverlapping(sig.as_ptr(), arg.add(4 + hash_len), 64);
+            if !sig_out.is_null() {
+                core::ptr::copy_nonoverlapping(sig.as_ptr(), sig_out, 64);
+            }
+            core::ptr::copy_nonoverlapping(64u16.to_le_bytes().as_ptr(), sig_tail.add(10), 2);
             0
         }
         dev_key_vault::DESTROY => {

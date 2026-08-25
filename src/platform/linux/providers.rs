@@ -1989,6 +1989,10 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
             // gate the channel reader.
             let err = *libc::__errno_location();
             if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
+                // Said out loud. A connection dropped on a send error is
+                // indistinguishable, from the peer, from a crash or a
+                // firewall — and this path used to take it in silence.
+                log::warn!("[linux_net] dropping conn {conn_id} on send error (errno {err})");
                 let fd = conn.fd;
                 st.conns[idx] = LinuxNetConn::EMPTY;
                 libc::close(fd);
@@ -2070,6 +2074,7 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
             // can be reused and `heavy_pending` clears.
             let err = *libc::__errno_location();
             if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
+                log::warn!("[linux_net] dropping conn {i} on drain-write error (errno {err})");
                 let fd = c.fd;
                 let cb = (i as u16).to_le_bytes();
                 st.conns[i] = LinuxNetConn::EMPTY;
@@ -2234,6 +2239,23 @@ unsafe fn accept_one_client(
 
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
+        // A connection dropped without a word.
+        //
+        // This is what a client sees as "peer closed connection" mid-TLS
+        // handshake with no alert and no server-side error — the socket is
+        // accepted and immediately closed, so from the outside it is
+        // indistinguishable from a crash, a firewall, or a protocol bug.
+        // Debugging it from the client end is close to impossible, which is
+        // how one instance of this went unexplained across an entire
+        // programme of work.
+        //
+        // At `warn`, because a full connection table is not routine: it
+        // means the deployment is at its ceiling and refusing work.
+        log::warn!(
+            "[linux_net] connection table full ({LINUX_NET_MAX_CONNS} slots) — \
+             refusing an accepted connection on port {listener_port}; the peer \
+             will see a close with no alert"
+        );
         libc::close(client_fd);
         return;
     }

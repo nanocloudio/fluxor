@@ -1161,7 +1161,16 @@ fn expand_routes(
             // required for session protocols (e.g. the sector surface
             // auth gate), where replaying one connection's frames to
             // the next is a correctness/security failure.
-            handler = if obj
+            // `admit: true` hands the upgrade decision to the application:
+            // the request is reported on `ws_admit_out` and the 101 is
+            // composed only once `ws_admit_in` answers accept. It implies
+            // session semantics — an admission-gated route is exactly the
+            // place replaying a previous connection's frames to a fresh,
+            // not-yet-admitted subscriber would be wrong — so it is checked
+            // before `retain_replay` rather than combined with it.
+            handler = if obj.get("admit").and_then(|v| v.as_bool()).unwrap_or(false) {
+                12
+            } else if obj
                 .get("retain_replay")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true)
@@ -1355,6 +1364,51 @@ mod tests {
         assert_eq!(
             handler_of(serde_json::json!({"path": "/app/", "app": true})),
             Some(11)
+        );
+    }
+
+    /// The websocket fan-out family: retention, session isolation, and
+    /// admission are three different routes to three different handlers.
+    ///
+    /// `admit` is the one with a security consequence. A graph that meant to
+    /// gate its upgrade and silently compiled to handler 5 would accept every
+    /// connection and never report one on `ws_admit_out` — an unguarded
+    /// control socket that looks exactly like a guarded one in a config dump.
+    #[test]
+    fn websocket_fanout_variants_select_their_handlers() {
+        assert_eq!(
+            handler_of(serde_json::json!({"path": "/ws", "websocket_fanout": true})),
+            Some(5),
+            "retention on by default"
+        );
+        assert_eq!(
+            handler_of(serde_json::json!({
+                "path": "/ws", "websocket_fanout": true, "retain_replay": false
+            })),
+            Some(9),
+            "no replay across sessions"
+        );
+        assert_eq!(
+            handler_of(serde_json::json!({
+                "path": "/ws", "websocket_fanout": true, "admit": true
+            })),
+            Some(12),
+            "the application grants the upgrade"
+        );
+        // Admission implies session semantics, so it wins over an explicit
+        // `retain_replay` either way rather than combining into a fourth id.
+        assert_eq!(
+            handler_of(serde_json::json!({
+                "path": "/ws", "websocket_fanout": true, "admit": true, "retain_replay": true
+            })),
+            Some(12)
+        );
+        // And it is opt-in: absent or false leaves the ungated handler.
+        assert_eq!(
+            handler_of(serde_json::json!({
+                "path": "/ws", "websocket_fanout": true, "admit": false
+            })),
+            Some(5)
         );
     }
 

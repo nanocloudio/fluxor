@@ -2835,12 +2835,257 @@ fn bcm_smp_quiesce_peers() -> bool {
     false
 }
 
+// ── VideoCore property mailbox: the TRANSPORT half ──────────────────────
+//
+// The MESSAGE half — which tag, how the value region is sized, which
+// response codes mean the firmware actually answered — is
+// `src/kernel/sys/vc_mailbox.rs`, pure data, host-tested. What lives here
+// is only what genuinely cannot run off a board: four register accesses,
+// cache maintenance, and a bounded poll.
+
+/// ARM↔VC mailbox block. Device tree `mailbox@7c013880` under
+/// `soc@107c000000` (`ranges = <0x00 0x10 0x00 0x80000000>`), so physical
+/// 0x10_7c01_3880 — the same identity-mapped Device aperture (GB 65,
+/// 0x10_4000_0000..) that already carries RNG200 (0x10_7d20_8000) and the
+/// GIC. Mapped Device-nGnRnE by `boot_mmu`, so a wrong OFFSET here is at
+/// best a bounded timeout and may be an SError from the fabric (this SoC
+/// reports errors on some unbacked reads — see the UBUS REPLY_ERR_DIS note
+/// in `pcie.rs`); it is NOT a quiet guarantee, which is why the base is
+/// pinned against the DT rather than probed.
+const VC_MBOX_BASE: usize = 0x10_7c01_3880;
+/// Mailbox 0 (VC→ARM): read register and status.
+const VC_MBOX_READ: usize = VC_MBOX_BASE;
+const VC_MBOX0_STATUS: usize = VC_MBOX_BASE + 0x18;
+/// Mailbox 1 (ARM→VC): write register and status.
+const VC_MBOX_WRITE: usize = VC_MBOX_BASE + 0x20;
+const VC_MBOX1_STATUS: usize = VC_MBOX_BASE + 0x38;
+const VC_MBOX_FULL: u32 = 1 << 31;
+const VC_MBOX_EMPTY: u32 = 1 << 30;
+/// The property-tags channel (ARM→VC).
+const VC_CH_PROPERTY: u32 = 8;
+/// Status reads per wait before giving up. Device-memory reads are on the
+/// order of 100 ns, so this is roughly a tenth of a second — far past the
+/// ~100 µs a property call takes, and it runs on a lazy provider call
+/// (`TIER`/`DESCRIBE`), never on the boot path, so the worst case is one
+/// slow syscall that answers `false`.
+const VC_MBOX_POLL_BOUND: u32 = 1_000_000;
+
+/// The property buffer, and the invariant that makes the cache maintenance
+/// below LEGAL rather than merely fast.
+///
+/// `dc ivac` discards a line without writeback. If this buffer shared a
+/// cache line with a neighbouring kernel static, invalidating "our" line
+/// would throw away the neighbour's dirty data — silent corruption of an
+/// unrelated static — and a neighbour dirtied between our pre-ring clean
+/// and the VC's response would write back OVER the response. So the buffer
+/// must own its cache lines exclusively: aligned to 128 (CWG-safe on A76;
+/// lines are 64) and padded to a whole number of lines. 32 words = 128
+/// bytes = exactly its own lines; also headroom for any future tag (the
+/// OTP exchange needs 16).
+#[repr(C, align(128))]
+struct VcMboxBuf([u32; 32]);
+static mut VC_MBOX_BUF: VcMboxBuf = VcMboxBuf([0; 32]);
+
+/// One caller at a time; the loser answers `false` (fail-safe) rather than
+/// sharing the buffer. Needed because provider syscalls execute on the
+/// calling core and this platform runs module domains on secondaries —
+/// two cores CAN be in `TIER` at once. `compare_exchange` with
+/// Acquire/Release so the winner's buffer writes are ordered against the
+/// flag; every exit path below releases it, because in a kernel with no
+/// RAII a leaked flag would be a permanent SOFTWARE tier until reboot.
+static VC_MBOX_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Clean+invalidate the buffer's lines to PoC. Same idiom as the
+/// `DMA_FLUSH`/`DMA_INVALIDATE` handlers above (the PoC pair) — NOT the
+/// OTA-staging sequence, which is the PoU/instruction-coherency idiom.
+///
+/// # Safety
+/// `addr..addr+len` must be valid mapped memory owned by the caller.
+unsafe fn vc_cache_civac(addr: usize, len: usize) {
+    let mut ptr = addr & !63;
+    let end = (addr + len + 63) & !63;
+    while ptr < end {
+        core::arch::asm!("dc civac, {}", in(reg) ptr, options(nostack));
+        ptr += 64;
+    }
+    core::arch::asm!("dsb sy");
+}
+
+/// One property-mailbox exchange over `VC_MBOX_BUF[..words]`.
+///
+/// `true` means the firmware took our address and answered SOMETHING at it
+/// — whether it answered *successfully* is the parser's question, asked on
+/// the buffer afterwards. Every failure path answers `false`, which the
+/// caller turns into `SealProvenance::None`, which is the tier this part
+/// reported before any of this existed.
+///
+/// # Safety
+/// Kernel context; MMIO to the mailbox block; exclusive buffer access is
+/// guaranteed by `VC_MBOX_BUSY` (taken by the caller).
+unsafe fn vc_property_exchange(words: usize) -> bool {
+    // Identity map: VA == PA for kernel DRAM on this platform (boot_mmu maps
+    // all of DRAM 1:1), so the buffer's address IS its physical address. The
+    // mailbox word is 32-bit — `(phys & !0xF) | channel` — so a buffer that
+    // ever ended up above 4 GB is refused rather than truncated into
+    // somebody else's memory.
+    let addr = core::ptr::addr_of_mut!(VC_MBOX_BUF) as usize;
+    if addr > (u32::MAX as usize) - 128 {
+        return false;
+    }
+    let len = words * 4;
+
+    // Push the request to PoC so the VC reads what we wrote, and drop our
+    // own lines so the response is read from RAM, not stale cache.
+    vc_cache_civac(addr, len);
+
+    // Ring: wait for space, write `[phys | channel]`.
+    let mut waited = 0u32;
+    while core::ptr::read_volatile(VC_MBOX1_STATUS as *const u32) & VC_MBOX_FULL != 0 {
+        waited += 1;
+        if waited > VC_MBOX_POLL_BOUND {
+            return false;
+        }
+    }
+    core::ptr::write_volatile(
+        VC_MBOX_WRITE as *mut u32,
+        (addr as u32 & !0xF) | VC_CH_PROPERTY,
+    );
+
+    // Await OUR response. Status EMPTY==0 only says "a message is waiting";
+    // the read word carries the channel in its low nibble and the address
+    // above — anything not ours (another channel, RAZ garbage on a quiet
+    // bus) is discarded and the wait continues, inside the same bound.
+    waited = 0;
+    loop {
+        while core::ptr::read_volatile(VC_MBOX0_STATUS as *const u32) & VC_MBOX_EMPTY != 0 {
+            waited += 1;
+            if waited > VC_MBOX_POLL_BOUND {
+                return false;
+            }
+        }
+        let word = core::ptr::read_volatile(VC_MBOX_READ as *const u32);
+        if word & 0xF == VC_CH_PROPERTY && word & !0xF == addr as u32 & !0xF {
+            break;
+        }
+        waited += 1;
+        if waited > VC_MBOX_POLL_BOUND {
+            return false;
+        }
+    }
+
+    // Drop any line speculatively fetched while the VC owned the memory,
+    // so the parse below reads the firmware's bytes and not our stale ones.
+    vc_cache_civac(addr, len);
+    true
+}
+
+/// Read this board's provisioned sealing key: the raw customer-OTP bytes,
+/// `[SEAL_KEY_MAGIC][28 key bytes]` per the layout pinned in
+/// `vc_mailbox.rs`.
+///
+/// Build (host-tested core) → exchange (the transport above) → parse
+/// (host-tested core) → rows to LE bytes. `true` ONLY when a processed,
+/// well-formed firmware reply yielded exactly the eight rows — and even
+/// then the caller's rule still checks the magic and per-row degeneracy,
+/// so a mis-addressed or partially-provisioned read answers `None`.
+///
+/// Provisioning is a separate act and is not this function's business:
+/// blowing fuses is irreversible and belongs to a deliberate, audited step,
+/// not to a boot path. This only ever READS.
+fn bcm_read_device_seal_key(out: &mut [u8; 32]) -> bool {
+    use fluxor::kernel::sys::hal as k;
+
+    if VC_MBOX_BUSY
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // A concurrent caller holds the buffer. `false` here is transient
+        // and fail-safe — and `bcm_seal_provenance` memoizes SUCCESS, so
+        // after the first good read this path is effectively unreachable.
+        return false;
+    }
+    // SAFETY: the CAS above grants exclusive access to `VC_MBOX_BUF`, the
+    // exchange's MMIO targets the DT-pinned mailbox block in the mapped
+    // Device aperture, and the flag is released on every path below.
+    let ok = unsafe {
+        let buf = &mut (*core::ptr::addr_of_mut!(VC_MBOX_BUF)).0;
+        let result = (|| {
+            let words =
+                k::build_get_customer_otp(buf, k::CUSTOMER_OTP_FIRST_ROW, k::CUSTOMER_OTP_ROWS)?;
+            if !vc_property_exchange(words) {
+                return None;
+            }
+            let rows = k::parse_get_customer_otp(&buf[..words], k::CUSTOMER_OTP_ROWS)?;
+            for (i, row) in rows.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&row.to_le_bytes());
+            }
+            Some(())
+        })();
+        result.is_some()
+    };
+    VC_MBOX_BUSY.store(false, core::sync::atomic::Ordering::Release);
+    ok
+}
+
+/// This board's sealing provenance, memoized on SUCCESS only.
+///
+/// `key_vault` asks on every `TIER` and every `DESCRIBE`, and each ask is a
+/// full cache-maintained mailbox round trip — plus, under concurrency, the
+/// busy-flag loser would transiently answer `None`, and a `key_custody`
+/// check racing an unrelated `DESCRIBE` would refuse spuriously. A
+/// validated `DeviceUnique` read of OTP cannot become truer or falser
+/// later, so a confirmed answer is cached forever; a FAILURE is never
+/// cached, because "the mailbox was busy" must not become "this board has
+/// no device key" for the rest of the boot.
+fn bcm_seal_provenance() -> fluxor::kernel::sys::hal::SealProvenance {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static CONFIRMED: AtomicU8 = AtomicU8::new(0);
+    if CONFIRMED.load(Ordering::Acquire) == 1 {
+        return fluxor::kernel::sys::hal::SealProvenance::DeviceUnique;
+    }
+    let mut blob = [0u8; 32];
+    let ok = bcm_read_device_seal_key(&mut blob);
+    let p = fluxor::kernel::sys::hal::provenance_from_hardware_key(ok, &blob);
+    if matches!(p, fluxor::kernel::sys::hal::SealProvenance::DeviceUnique) {
+        CONFIRMED.store(1, Ordering::Release);
+    }
+    p
+}
+
 static BCM2712_HAL_OPS: HalOps = HalOps {
+    // No durable home for a sealed blob on this platform yet, and saying so
+    // is the point: the vault keeps its in-RAM entry and behaves exactly as
+    // before. A platform gains cold-restart persistence by implementing
+    // these two and loses nothing by not.
+    seal_blob_write: |_, _| false,
+    seal_blob_read: |_, _| None,
     disable_interrupts: bcm_disable_interrupts,
     restore_interrupts: bcm_restore_interrupts,
     wake_scheduler: bcm_wake_scheduler,
     now_millis: bcm_now_millis,
     now_unix_millis: || 0, // no RTC on this platform
+    // No RTC, so nothing to say about its synchronisation either.
+    // `None` rather than `Some((false, _))`: this board cannot tell, which
+    // is a different fact from telling us the clock is unsynchronised.
+    clock_sync_status: || None,
+    // No sealing on this platform yet.
+    //
+    // `None` rather than a host-readable stand-in: a sealing key stored in
+    // flash beside the blob it seals protects nothing and would still read
+    // as `HostReadable`, which is a stronger claim than the truth. bcm2712
+    // has OTP fuses that could back `DeviceUnique` — claiming it requires
+    // actually deriving from them, and a provenance that overstates itself
+    // raises a vault's isolation tier and with it what a deployment
+    // believes about keys it has not protected.
+    seal_provenance: bcm_seal_provenance,
+    seal: |_, _| None,
+    unseal: |_, _| None,
     now_micros: bcm_now_micros,
     tick_count: bcm_tick_count,
     flash_base: bcm_flash_base,

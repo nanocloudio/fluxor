@@ -70,6 +70,268 @@ fn linux_now_unix_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+/// What the kernel knows about the wall clock, via `adjtimex(2)`.
+///
+/// `now_unix_millis` cannot answer this and never could: a nonzero reading
+/// from a clock nobody synchronised looks exactly like a good one. The
+/// kernel, however, tracks it — `STA_UNSYNC` is clear once a time protocol
+/// has disciplined the clock, and `maxerror` is its own estimate of how far
+/// off it may be. That is evidence, and it is the difference between a
+/// provider stuck at `RTC` forever and one that can honestly report
+/// `NETWORK_SYNC`.
+///
+/// Returns `(synchronised, max_error_us)`. `synchronised: false` is a real
+/// answer — the kernel can tell, and the answer is no.
+fn linux_clock_sync_status() -> Option<(bool, u64)> {
+    // `struct timex` is large and its layout is arch-specific, so it is
+    // zeroed and only the two fields read that are at fixed offsets across
+    // every Linux ABI: `modes` (0) is written, `maxerror` and `status` are
+    // read back. Rather than hand-declare it, the two values come from
+    // `/proc` where the layout question does not arise.
+    //
+    // `adjtimex` with `modes = 0` is a pure query and needs no privilege.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Timex {
+        modes: i32,
+        _pad0: i32,
+        offset: i64,
+        freq: i64,
+        maxerror: i64,
+        esterror: i64,
+        status: i32,
+        _pad1: i32,
+        constant: i64,
+        precision: i64,
+        tolerance: i64,
+        time_sec: i64,
+        time_usec: i64,
+        tick: i64,
+        ppsfreq: i64,
+        jitter: i64,
+        shift: i32,
+        _pad2: i32,
+        stabil: i64,
+        jitcnt: i64,
+        calcnt: i64,
+        errcnt: i64,
+        stbcnt: i64,
+        tai: i32,
+        _reserved: [i32; 11],
+    }
+
+    unsafe extern "C" {
+        fn adjtimex(buf: *mut core::ffi::c_void) -> i32;
+    }
+
+    /// `STA_UNSYNC` — set while the clock is NOT synchronised.
+    const STA_UNSYNC: i32 = 0x0040;
+
+    let mut tx = Timex::default();
+    // SAFETY: `modes = 0` makes this a read-only query, and `tx` is a
+    // zeroed, correctly-sized `struct timex` owned by this frame.
+    let rc = unsafe { adjtimex((&raw mut tx).cast()) };
+    if rc < 0 {
+        // The kernel could not answer, which is not the same as "not
+        // synchronised": reporting `false` here would claim knowledge this
+        // call did not obtain.
+        return None;
+    }
+    let synchronised = (tx.status & STA_UNSYNC) == 0;
+    // `maxerror` saturates at 16 seconds when unsynchronised; clamped so a
+    // consumer sizing a window from it cannot get a negative or absurd one.
+    let max_error_us = if tx.maxerror < 0 {
+        u64::MAX
+    } else {
+        tx.maxerror as u64
+    };
+    Some((synchronised, max_error_us))
+}
+
+/// Where the Linux sealing key comes from.
+///
+/// `HostReadable`, and that is the honest answer rather than a placeholder.
+/// The key is derived from `FLUXOR_SEAL_KEY` or a file under the store
+/// directory — both readable by anything running as this user. Sealing
+/// therefore protects a stored key from a compromised MODULE and not from a
+/// compromised HOST, and the vault's tier stays `SOFTWARE` because of it.
+///
+/// A Linux box with a TPM could report `DeviceUnique` by sealing to the
+/// storage root key. That is a real path and deliberately not taken here on
+/// the quiet: claiming it requires actually talking to the TPM, and a
+/// provenance that overstates itself is worse than no sealing at all — it
+/// raises a vault's tier and, with it, what a deployment believes about
+/// keys it has not actually protected.
+/// Where sealed key blobs live on Linux: one file per label under
+/// `$FLUXOR_VAULT_DIR`, or `$FLUXOR_STORE_DIR/vault` when only the store dir
+/// is set.
+///
+/// Unset means NO durable vault, and the hooks below then answer `false` /
+/// `None`. That is deliberate: a process that was not told where to keep
+/// keys should not invent a location and start writing key material into it.
+fn linux_vault_dir() -> Option<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("FLUXOR_VAULT_DIR") {
+        return Some(std::path::PathBuf::from(d));
+    }
+    std::env::var("FLUXOR_STORE_DIR")
+        .ok()
+        .map(|d| std::path::PathBuf::from(d).join("vault"))
+}
+
+/// A label's filename: its bytes, hex-encoded.
+///
+/// Hex rather than the label itself, because a label is an opaque byte string
+/// chosen by a module and a filename is not. `../../etc/whatever` is a
+/// perfectly legal label and must not become a path.
+fn linux_vault_path(label: &[u8]) -> Option<std::path::PathBuf> {
+    let dir = linux_vault_dir()?;
+    let mut name = String::with_capacity(label.len() * 2);
+    for b in label {
+        use core::fmt::Write as _;
+        let _ = write!(name, "{b:02x}");
+    }
+    Some(dir.join(name))
+}
+
+/// Write a sealed blob so it outlives the process. See
+/// [`HalOps::seal_blob_write`].
+///
+/// The blob arrives ALREADY SEALED — this decides where it lives, nothing
+/// more. Written to a temporary and renamed, so a crash midway leaves the
+/// previous key intact rather than a truncated one: a half-written key reads
+/// back as a key that does not open, and the vault would then generate a new
+/// one and silently invalidate every credential signed under the old.
+fn linux_seal_blob_write(label: &[u8], blob: &[u8]) -> bool {
+    let Some(path) = linux_vault_path(label) else {
+        return false;
+    };
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, blob).is_err() {
+        return false;
+    }
+    std::fs::rename(&tmp, &path).is_ok()
+}
+
+/// Read a sealed blob back. See [`HalOps::seal_blob_read`].
+fn linux_seal_blob_read(label: &[u8], out: &mut [u8]) -> Option<usize> {
+    let path = linux_vault_path(label)?;
+    let data = std::fs::read(path).ok()?;
+    // Too large is "no key here", not a partial read: half a sealed blob does
+    // not unseal, and returning part of one invites the caller to try.
+    if data.len() > out.len() {
+        return None;
+    }
+    out[..data.len()].copy_from_slice(&data);
+    Some(data.len())
+}
+
+fn linux_seal_provenance() -> fluxor::kernel::sys::hal::SealProvenance {
+    if linux_seal_key().is_some() {
+        fluxor::kernel::sys::hal::SealProvenance::HostReadable
+    } else {
+        fluxor::kernel::sys::hal::SealProvenance::None
+    }
+}
+
+/// The sealing key, or `None` when this deployment configured none.
+///
+/// From `FLUXOR_SEAL_KEY` (64 hex characters). Absent rather than
+/// defaulted: a built-in constant would make every fluxor install share one
+/// sealing key, which is indistinguishable from not sealing while looking
+/// like it seals.
+fn linux_seal_key() -> Option<[u8; 32]> {
+    let hex = std::env::var("FLUXOR_SEAL_KEY").ok()?;
+    let bytes = hex.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        key[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(key)
+}
+
+/// Seal with ChaCha20-Poly1305 under the platform key.
+///
+/// Layout: `[nonce:12][ciphertext][tag:16]`. The nonce is fresh per seal
+/// from the kernel CSPRNG — a repeated nonce under one key breaks
+/// confidentiality outright for a stream cipher, so it is generated rather
+/// than derived from anything the caller controls.
+fn linux_seal(plain: &[u8], out: &mut [u8]) -> Option<usize> {
+    let key = linux_seal_key()?;
+    let total = 12 + plain.len() + 16;
+    if out.len() < total {
+        return None;
+    }
+    let mut nonce = [0u8; 12];
+    getrandom_bytes(&mut nonce)?;
+    out[..12].copy_from_slice(&nonce);
+    out[12..12 + plain.len()].copy_from_slice(plain);
+    let tag = fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt(
+        &key,
+        &nonce,
+        &[],
+        &mut out[12..12 + plain.len()],
+    );
+    out[12 + plain.len()..total].copy_from_slice(&tag);
+    Some(total)
+}
+
+fn linux_unseal(sealed: &[u8], out: &mut [u8]) -> Option<usize> {
+    let key = linux_seal_key()?;
+    if sealed.len() < 12 + 16 {
+        return None;
+    }
+    let body_len = sealed.len() - 12 - 16;
+    if out.len() < body_len {
+        return None;
+    }
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&sealed[..12]);
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&sealed[12 + body_len..]);
+    out[..body_len].copy_from_slice(&sealed[12..12 + body_len]);
+    // A tag that does not verify means the blob was altered or sealed
+    // under a different key. Either way it is not a key, and `out` is
+    // wiped rather than returned half-decrypted.
+    if fluxor::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt(
+        &key,
+        &nonce,
+        &[],
+        &mut out[..body_len],
+        &tag,
+    ) {
+        Some(body_len)
+    } else {
+        for b in &mut out[..body_len] {
+            // SAFETY: `b` is a live, exclusively-borrowed byte of `out`.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+        None
+    }
+}
+
+fn getrandom_bytes(buf: &mut [u8]) -> Option<()> {
+    // SAFETY: `buf` is a live, exclusively-borrowed slice of `buf.len()`.
+    let rc = unsafe {
+        libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0)
+    };
+    if rc as usize == buf.len() {
+        Some(())
+    } else {
+        None
+    }
+}
+
 fn linux_now_micros() -> u64 {
     elapsed_micros()
 }
@@ -204,7 +466,25 @@ fn linux_init_providers() {
     // HTTP/filesystem. A no-op when the env is unset.
     // SAFETY: single-threaded startup, before any provider dispatch — the
     // store singleton is initialised exactly once with no concurrent access.
-    let _ = unsafe { fluxor::platform::linux::store::store_init_from_env() };
+    // NOT discarded. A store that was asked for and could not be opened leaves
+    // every store-backed module in the graph talking to a provider that is not
+    // there — and a module with no provider does not fail, it just never
+    // produces anything, which from outside looks like a module with nothing
+    // to do. Saying so here is the difference between a one-line diagnosis and
+    // an afternoon.
+    match unsafe { fluxor::platform::linux::store::store_init_from_env() } {
+        fluxor::platform::linux::store::StoreInit::NotConfigured
+        | fluxor::platform::linux::store::StoreInit::Opened => {}
+        fluxor::platform::linux::store::StoreInit::Failed => {
+            log::error!(
+                "[store] FLUXOR_STORE_DIR is set but the control-plane store \
+                 could not be opened; every storage.object and \
+                 storage.namespace call on this node will be answered without \
+                 it. Check the directory exists, is writable, and that its \
+                 append log is not corrupt."
+            );
+        }
+    }
     // The impure boundary: host process executor (sector `do`). Gated by
     // `requires_contract="proc"`; only registered on host-linux (a PIC module
     // can't fork/exec, so a "worker" is by definition a Linux node).
@@ -292,6 +572,12 @@ static LINUX_HAL_OPS: HalOps = HalOps {
     wake_scheduler: linux_wake_scheduler,
     now_millis: linux_now_millis,
     now_unix_millis: linux_now_unix_millis,
+    clock_sync_status: linux_clock_sync_status,
+    seal_provenance: linux_seal_provenance,
+    seal_blob_write: linux_seal_blob_write,
+    seal_blob_read: linux_seal_blob_read,
+    seal: linux_seal,
+    unseal: linux_unseal,
     now_micros: linux_now_micros,
     tick_count: linux_tick_count,
     flash_base: linux_flash_base,

@@ -301,34 +301,46 @@ pub const MSG_MUX_DATAGRAM_RX: u8 = 0xC7;
 /// emits once the underlying secure handshake binds the peer, so an
 /// application consuming the mux surface (e.g. an mqtt codec) learns the
 /// authenticated peer identity without reaching into the transport.
-/// Session-scoped. Payload:
-/// `[session_id: u32 LE] [verified: u8] [svid_len: u16 LE] [svid: svid_len bytes]`
-/// where `verified` is 1 if the peer presented a verified credential
-/// (0 otherwise) and `svid` is the optional SPIFFE-style identity bytes
-/// (empty when none). This is a first-class mux downstream event — it
-/// must NOT be smuggled as an out-of-contract opcode (older revisions
-/// borrowed `0x5A`, which collides with the reserved `packet` range
-/// `0x50..0x63`).
+/// Session-scoped.
 ///
-/// Emitted for every mux session, whatever protocol it negotiated.
+/// The payload is byte-identical to the TLS module's `MSG_PEER_IDENTITY`
+/// record, which owns the format:
+///
+/// ```text
+/// [session_id: u32 LE]
+/// [verification_result: u8]
+/// [credential_kind: u8]
+/// [profile_id: u16 LE]
+/// [not_before: u64 LE][not_after: u64 LE]
+/// [verification_flags: u32 LE]
+/// [key_fp_alg: u8][key_fp_len: u8]
+/// [principal_len: u16 LE]
+/// [key_fingerprint: key_fp_len][principal: principal_len]
+/// ```
+///
+/// It replaced `[verified: u8][svid_len: u16 LE][svid]`, which differed
+/// from the TLS record for no reason anyone could state — same fact,
+/// two layouts, so a consumer wanting both wrote two parsers. Worse,
+/// `verified` was a single bit standing in for a set of independent
+/// checks: a consumer could not tell a chain validated to a configured
+/// anchor from a self-signed certificate that merely parsed, and so had
+/// no basis for deciding whether the name in it meant anything.
+/// `verification_flags` says which checks actually ran, and the
+/// principal is absent unless the chain and the SAN were both verified.
+///
+/// This is a first-class mux downstream event — it must NOT be smuggled as
+/// an out-of-contract opcode. `0x5A` is the tempting one and the wrong one:
+/// it sits inside the reserved `packet` range `0x50..0x63`.
+///
+/// Emitted for every mux session, whatever protocol it negotiated. A
+/// session whose peer presented no credential still gets one, with
+/// `verification_result = NO_CREDENTIAL` and no principal: silence
+/// would be indistinguishable from an event still in flight.
 pub const MSG_MUX_PEER_IDENTITY: u8 = 0xC8;
 
-// Opcode 0xC9 is RETIRED and must not be reused.
-//
-// It carried `MSG_MUX_PEER_SETTINGS`, whose payload was an HTTP/3 and
-// QPACK settings structure (max_field_section_size, QPACK table capacity
-// and blocked streams, an extended-CONNECT bit). That was an application
-// protocol's vocabulary embedded in a transport contract, and it existed
-// only because the QUIC provider used to read the peer's HTTP/3 control
-// stream itself. It no longer does: those bytes now reach the
-// application unmodified on the unidirectional stream they arrived on,
-// as MSG_MUX_STREAM_ACCEPTED + MSG_MUX_STREAM_RX like any other stream,
-// and the application parses SETTINGS where the rest of its protocol
-// state already lives.
-//
-// The number stays retired rather than being reallocated so a stale peer
-// emitting the old sideband gets an unknown opcode, not a new message
-// silently accepted as its old one.
+/// Fixed portion of a `MSG_MUX_PEER_IDENTITY` payload; the fingerprint
+/// and principal follow.
+pub const PEER_IDENTITY_FIXED_LEN: usize = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 1 + 1 + 2;
 
 /// Peer reset a stream abruptly (QUIC RESET_STREAM, RFC 9000 §19.4), or
 /// confirmation that a locally requested reset was applied.

@@ -61,8 +61,9 @@
 ///   [content_type: content_type_len bytes]    — MIME-style tag
 ///   [body_ptr: u64 LE]
 ///   [body_len: u64 LE]
-///   [if_match_len: u8]                        — 0 or 32; etag guard
-///   [if_match: if_match_len bytes]
+///   [precondition: u8]                        — see `precondition` below
+///   [etag_len: u8]                            — 0 unless precondition = ETAG
+///   [etag: etag_len bytes]
 ///   [fence_out_ptr: u64 LE]                   — receives Fence::encode bytes
 ///   [fence_out_cap: u16 LE]                   — must be >= `fence::WIRE_MAX_LEN`
 /// ```
@@ -72,6 +73,46 @@
 /// buffer at `fence_out_ptr`. `body_len` must fit a single
 /// in-memory blob; large bodies use the `PUT_STREAMED_*` sequence
 /// below.
+/// Conditions a mutating op may be made subject to.
+///
+/// Three named conditions rather than a bare etag guard. An etag field
+/// alone expresses only "none" and "this etag"; the third meaning, "only
+/// if absent", then has to ride a *convention* — that an all-zero 32-byte
+/// etag means revision zero. A convention held by one provider and no
+/// contract is one a second provider cannot reproduce and a caller cannot
+/// discover.
+///
+/// The three are genuinely three, and not an `Option`: "must not
+/// exist" and "must be at revision 0" are different requests, and
+/// collapsing them answers one of the two wrongly.
+///
+/// **Carried by [`PUT`] and [`DELETE`].** [`PUT_STREAMED_OPEN`] still takes
+/// the bare `if_match_len` guard, so the streamed path cannot express
+/// `ABSENT` — a create-if-absent of a large body has no conditional form
+/// on this contract.
+///
+/// ## Atomicity
+///
+/// A provider MUST evaluate the precondition and apply the mutation
+/// at a single linearization point, at the replicated state-machine
+/// position the returned `Fence` represents. A `HEAD` followed by an
+/// unconditional `PUT` is NOT equivalent and does not satisfy this
+/// contract: two callers doing that both observe absence and both
+/// write, which is the race conditional writes exist to prevent.
+///
+/// A provider that cannot offer a condition MUST refuse it with
+/// `ENOSYS` rather than ignore it. Silently downgrading a conditional
+/// write to an unconditional one turns a refusal into a lost update.
+pub mod precondition {
+    /// Apply unconditionally.
+    pub const ANY: u8 = 0;
+    /// Apply only if the key does not exist. `EEXIST` if it does.
+    pub const ABSENT: u8 = 1;
+    /// Apply only if the key's current etag equals the supplied one.
+    /// `EAGAIN` if it does not — re-read and retry.
+    pub const ETAG: u8 = 2;
+}
+
 pub const PUT: u32 = 0x1420;
 
 /// Open a blob for streaming reads.
@@ -133,8 +174,9 @@ pub const RANGE_GET: u32 = 0x1423;
 /// ```text
 ///   [key_len: u16 LE]
 ///   [key: key_len bytes]
-///   [if_match_len: u8]                        — 0 or 32; etag guard
-///   [if_match: if_match_len bytes]
+///   [precondition: u8]                        — see `precondition` below
+///   [etag_len: u8]                            — 0 unless precondition = ETAG
+///   [etag: etag_len bytes]
 ///   [fence_out_ptr: u64 LE]                   — receives Fence::encode bytes
 ///   [fence_out_cap: u16 LE]                   — must be >= `fence::WIRE_MAX_LEN`
 /// ```

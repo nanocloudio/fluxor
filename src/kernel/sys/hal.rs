@@ -36,6 +36,69 @@ pub struct HalOps {
     /// real-time clock. Distinct from `now_millis` (monotonic uptime); needed for absolute-
     /// time checks like certificate validity and JWT `exp` (see docs/surface-auth.md).
     pub now_unix_millis: fn() -> u64,
+    /// What the platform knows about its own wall clock, beyond the reading.
+    ///
+    /// `(synchronised, max_error_us)`, or `None` when the platform has no
+    /// way to tell — which is the honest answer on a board with a bare RTC
+    /// and no time protocol.
+    ///
+    /// This exists because `now_unix_millis` alone genuinely cannot answer
+    /// it: a nonzero reading from a clock nobody ever synchronised looks
+    /// exactly like a good one. An operating system that runs a time
+    /// protocol DOES know, and asking it is the difference between a
+    /// provider that claims `RTC` forever and one that can honestly say
+    /// `NETWORK_SYNC` — which is what every credential-validity decision in
+    /// the ecosystem is waiting on.
+    ///
+    /// `synchronised: false` is a real answer, not a failure: it says the
+    /// platform can tell, and the answer is no.
+    pub clock_sync_status: fn() -> Option<(bool, u64)>,
+
+    // ── Key sealing ───────────────────────────────────────────────────
+    /// Where this platform's sealing key comes from, and therefore what
+    /// sealing is WORTH here. See [`SealProvenance`].
+    ///
+    /// The provenance is a separate hook from `seal`/`unseal` on purpose.
+    /// Sealing that works and sealing that protects are different
+    /// questions, and a platform that can do the first without the second
+    /// must be able to say so — otherwise the vault's isolation tier would
+    /// have to be inferred from whether an encrypt call returned bytes,
+    /// which it always does.
+    pub seal_provenance: fn() -> SealProvenance,
+    /// Seal `plain` into `out`, returning the sealed length.
+    ///
+    /// `None` when this platform cannot seal, or the output does not fit.
+    /// A sealed blob is opaque: only [`unseal`](HalOps::unseal) on the same
+    /// platform reads it back.
+    pub seal: fn(&[u8], &mut [u8]) -> Option<usize>,
+    /// Reverse [`seal`](HalOps::seal). `None` on any failure — a sealed
+    /// blob that does not open is not a key, and there is no partial
+    /// answer worth returning.
+    pub unseal: fn(&[u8], &mut [u8]) -> Option<usize>,
+    /// Write a sealed blob under `label`, so it outlives the PROCESS.
+    ///
+    /// [`seal`](HalOps::seal) makes bytes opaque; this decides where they
+    /// live, and the two are separate because they fail for different
+    /// reasons. A platform that can seal but has nowhere durable to put the
+    /// result must be able to say so — which is exactly the state the kernel
+    /// was in: sealed blobs sat in a `static mut` table, so a labelled key
+    /// survived a scheduler reset and went with the process. An issuer that
+    /// re-keys on every cold start invalidates every credential it ever
+    /// signed, silently, because a verifier just sees a bad signature.
+    ///
+    /// `false` when this platform has no durable store. That is not an
+    /// error: the vault keeps its in-RAM entry and behaves exactly as it did
+    /// before, so a platform gains durability by implementing this and loses
+    /// nothing by not.
+    ///
+    /// The blob is already sealed. This hook must not be given plaintext.
+    pub seal_blob_write: fn(&[u8], &[u8]) -> bool,
+    /// Read back what [`seal_blob_write`](HalOps::seal_blob_write) stored.
+    ///
+    /// `None` when absent or too large for `out` — both mean "no key here",
+    /// and the vault then generates one rather than proceeding with a
+    /// partial read.
+    pub seal_blob_read: fn(&[u8], &mut [u8]) -> Option<usize>,
     /// Monotonic tick count (wrapping).
     pub tick_count: fn() -> u32,
 
@@ -357,6 +420,61 @@ pub fn serial_write(bytes: &[u8]) -> usize {
 #[inline(always)]
 pub fn now_unix_millis() -> u64 {
     (ops().now_unix_millis)()
+}
+
+/// What the platform knows about its wall clock. See
+/// [`HalOps::clock_sync_status`].
+#[inline(always)]
+pub fn clock_sync_status() -> Option<(bool, u64)> {
+    (ops().clock_sync_status)()
+}
+
+// The device-key provenance rule lives in its own file so a HOST test can
+// reach it. The kernel crate cannot build on the host (`[ci.cargo]
+// host_tools_crate = "tools"`), and this is the one decision here where
+// being wrong is expensive enough that "tested on the board only" means
+// "not tested" — no bare-metal board runs in CI.
+//
+// Beside the kernel, NOT under `modules/sdk/`. The crypto cores live there
+// because modules include them, and anything under `modules/sdk/` is part
+// of the ABI surface — putting this there advanced the surface digest and
+// would have forced every consumer through a migration for a rule no module
+// calls. Placement is an interface decision, not a filing one.
+include!("seal_provenance.rs");
+
+// The VideoCore property-mailbox MESSAGE format, mounted beside the
+// provenance rule for the same reason: both are the decidable half of
+// something whose other half only runs on a board.
+include!("vc_mailbox.rs");
+
+/// See [`HalOps::seal_blob_write`].
+#[inline(always)]
+pub fn seal_blob_write(label: &[u8], blob: &[u8]) -> bool {
+    (ops().seal_blob_write)(label, blob)
+}
+
+/// See [`HalOps::seal_blob_read`].
+#[inline(always)]
+pub fn seal_blob_read(label: &[u8], out: &mut [u8]) -> Option<usize> {
+    (ops().seal_blob_read)(label, out)
+}
+
+/// See [`HalOps::seal_provenance`].
+#[inline(always)]
+pub fn seal_provenance() -> SealProvenance {
+    (ops().seal_provenance)()
+}
+
+/// See [`HalOps::seal`].
+#[inline(always)]
+pub fn seal(plain: &[u8], out: &mut [u8]) -> Option<usize> {
+    (ops().seal)(plain, out)
+}
+
+/// See [`HalOps::unseal`].
+#[inline(always)]
+pub fn unseal(sealed: &[u8], out: &mut [u8]) -> Option<usize> {
+    (ops().unseal)(sealed, out)
 }
 
 #[inline(always)]

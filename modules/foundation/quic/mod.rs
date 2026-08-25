@@ -101,7 +101,7 @@ const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 //
 //   quic → app: MSG_MUX_SESSION_OPENED  [session][status][flags][alpn]
 //   quic → app: MSG_MUX_SESSION_CLOSED  [session][reason]
-//   quic → app: MSG_MUX_PEER_IDENTITY   [session][verified][svid]
+//   quic → app: MSG_MUX_PEER_IDENTITY   typed peer-identity record
 //   quic → app: MSG_MUX_STREAM_ACCEPTED [session][stream][flags][quic_id]
 //   quic → app: MSG_MUX_STREAM_OPENED   [session][stream][status][flags][quic_id]
 //   quic → app: MSG_MUX_STREAM_RX       [session][stream][data]
@@ -1669,7 +1669,20 @@ unsafe fn mux_pump_downstream(s: &mut QuicState, idx: usize) {
     //    a property of the secure transport, not of any one protocol
     //    that runs over it. Minimal form: no client cert → verified=0.
     if s.conns[idx].handshake_confirmed && !s.conns[idx].peer_identity_sent {
-        let body = [0u8, 0u8, 0u8]; // verified=0, svid_len=0
+        // The full record, reporting NO_CREDENTIAL. This provider does
+        // not request a client certificate, so there is nothing to
+        // verify and no check ran — which is what the zeroed
+        // `verification_flags` says. An application reading this
+        // learns "no identity was established here", not "an identity
+        // was established and it is anonymous"; the previous
+        // `verified=0` byte could not tell those apart from a
+        // credential that failed.
+        //
+        // `mux_emit` writes the session id, so the body starts at the
+        // record's second field.
+        const RESULT_NO_CREDENTIAL: u8 = 1;
+        let mut body = [0u8; mux::PEER_IDENTITY_FIXED_LEN - 4];
+        body[0] = RESULT_NO_CREDENTIAL;
         if !mux_emit(
             sys,
             s.app_out,

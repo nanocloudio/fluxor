@@ -315,6 +315,34 @@ impl HandshakeDriver {
     /// # Safety
     /// `in_buf` is owned by `self` and sized `HS_IN_BUF_SIZE`; the
     /// bounds-checks above ensure the message length fits in scratch.
+    /// True when `in_buf` already holds a COMPLETE handshake message that
+    /// `read_handshake_message` would return.
+    ///
+    /// The record layer uses this as back-pressure: it must not take another
+    /// record off the wire while a buffered message is still unprocessed,
+    /// because processing that message can change the read keys. RFC 8446
+    /// §5.1 lets a peer put several handshake messages in one record, so the
+    /// client's Certificate, CertificateVerify and Finished routinely arrive
+    /// together — and a server that consumed only the Certificate and then
+    /// reached for the next record would be reaching for a record the client
+    /// had already encrypted under its APPLICATION key, with the server's
+    /// handshake key still installed. That decrypts to nothing, with a valid
+    /// key, at a valid sequence number.
+    #[must_use]
+    pub fn has_complete_message(&self) -> bool {
+        if self.in_len < 4 {
+            return false;
+        }
+        let msg_body_len = ((self.in_buf[1] as usize) << 16)
+            | ((self.in_buf[2] as usize) << 8)
+            | (self.in_buf[3] as usize);
+        let total = 4 + msg_body_len;
+        // A message too large to ever read is not "complete" — it is a
+        // failure `read_handshake_message` reports, and deferring on it
+        // forever would wedge the session instead.
+        total <= SCRATCH_SIZE && self.in_len >= total
+    }
+
     pub unsafe fn read_handshake_message(&mut self) -> Option<([u8; SCRATCH_SIZE], usize, u8)> {
         if self.in_len < 4 {
             return None;

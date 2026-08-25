@@ -32,6 +32,36 @@ unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
     u64::from_le_bytes(buf)
 }
 
+/// A security-grade time observation (`TIMER::TRUSTED_UNIX` 0x0609).
+///
+/// Returns the raw record; `abi::kernel_abi::trusted_time` names its offsets
+/// and the meaning of `source_class` / `flags`. Use this, not
+/// `dev_unix_millis`, for anything that decides whether a credential is
+/// still valid: a bare `u64` cannot say whether it is worth trusting, and on
+/// a board with no RTC it is zero — which every current caller silently
+/// treats as "1970", i.e. as an expiry that has not happened yet.
+#[allow(
+    dead_code,
+    reason = "used by credential-validation consumers; not every module reads it"
+)]
+#[inline(always)]
+unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
+    // 36, which is `trusted_time::LEN`. It was 34 — the sum of the fields
+    // through `flags` — and the syscall refuses anything shorter than `LEN`,
+    // so EVERY call returned `E_INVAL` and every consumer saw `UNAVAILABLE`.
+    // The surface answered "no clock" on a machine with a synchronised one,
+    // and did it silently, because `UNAVAILABLE` is exactly what a platform
+    // with no RTC returns.
+    let mut buf = [0u8; 36];
+    let rc = (sys.provider_call)(-1, 0x0609, buf.as_mut_ptr(), buf.len());
+    if rc < 0 {
+        // A platform without the surface is UNAVAILABLE, which is the same
+        // answer as a platform with no clock — and the same refusal.
+        buf = [0u8; 36];
+    }
+    buf
+}
+
 /// Wall-clock milliseconds since the Unix epoch (TIMER::UNIX_MILLIS 0x0608), or 0 on a
 /// platform with no real-time clock. Distinct from `dev_millis` (monotonic uptime); use for
 /// absolute-time checks (certificate validity, JWT `exp`). See docs/surface-auth.md.

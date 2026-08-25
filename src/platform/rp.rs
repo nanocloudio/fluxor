@@ -689,11 +689,33 @@ fn prot_set_channel_region(module_idx: usize, base: usize, size: usize) {
 use fluxor::kernel::sys::hal::protected_step_direct as fluxor_protected_step_direct;
 
 static RP_HAL_OPS: HalOps = HalOps {
+    // No durable home for a sealed blob on this platform yet, and saying so
+    // is the point: the vault keeps its in-RAM entry and behaves exactly as
+    // before. A platform gains cold-restart persistence by implementing
+    // these two and loses nothing by not.
+    seal_blob_write: |_, _| false,
+    seal_blob_read: |_, _| None,
     disable_interrupts: rp_disable_interrupts,
     restore_interrupts: rp_restore_interrupts,
     wake_scheduler: rp_wake_scheduler,
     now_millis: rp_now_millis,
     now_unix_millis: || 0, // no RTC on this platform
+    // No RTC, so nothing to say about its synchronisation either.
+    // `None` rather than `Some((false, _))`: this board cannot tell, which
+    // is a different fact from telling us the clock is unsynchronised.
+    clock_sync_status: || None,
+    // No sealing on this platform yet.
+    //
+    // `None` rather than a host-readable stand-in: a sealing key stored in
+    // flash beside the blob it seals protects nothing and would still read
+    // as `HostReadable`, which is a stronger claim than the truth. bcm2712
+    // has OTP fuses that could back `DeviceUnique` — claiming it requires
+    // actually deriving from them, and a provenance that overstates itself
+    // raises a vault's isolation tier and with it what a deployment
+    // believes about keys it has not protected.
+    seal_provenance: || fluxor::kernel::sys::hal::SealProvenance::None,
+    seal: |_, _| None,
+    unseal: |_, _| None,
     now_micros: rp_now_micros,
     tick_count: rp_tick_count,
     flash_base: rp_flash_base,

@@ -54,6 +54,7 @@
 //! request rather than issuing a duplicate fetch.
 
 use crate::abi::contracts::storage::object as dev_obj;
+use crate::abi::contracts::storage::object::precondition as obj_precondition;
 use crate::abi::fence as dev_fence;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
@@ -299,7 +300,7 @@ unsafe fn alloc_slot(key: &[u8]) -> i32 {
 ///   [key_len:u16 LE][key]
 ///   [content_type_len:u8][content_type]
 ///   [body_ptr:u64 LE][body_len:u64 LE]
-///   [if_match_len:u8][if_match]
+///   [precondition:u8][etag_len:u8][etag]
 ///   [fence_out_ptr:u64 LE][fence_out_cap:u16 LE]
 /// ```
 ///
@@ -339,15 +340,17 @@ unsafe fn obj_put(arg: *mut u8, arg_len: usize) -> i32 {
     p += 8;
     let body_len = read_u64(arg, p) as usize;
     p += 8;
-    let if_match_len = *arg.add(p) as usize;
-    p += 1 + if_match_len;
+    let precondition = *arg.add(p);
+    let etag_len = *arg.add(p + 1) as usize;
+    p += 2 + etag_len;
     if arg_len < p + 8 + 2 {
         return errno::EINVAL;
     }
-    // Conditional PUT (nonzero if_match) can't be enforced without an
-    // etag store. Fail loudly rather than do an unconditional overwrite
-    // and falsely report the precondition as met.
-    if if_match_len != 0 {
+    // Anything but `ANY` asks for a guarantee this tier cannot make, so it
+    // is REFUSED rather than silently downgraded — the contract requires
+    // that, because downgrading a conditional write to an unconditional one
+    // turns a refusal into a lost update.
+    if precondition != obj_precondition::ANY {
         return errno::ENOSYS;
     }
     let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;

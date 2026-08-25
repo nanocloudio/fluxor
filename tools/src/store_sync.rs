@@ -550,6 +550,25 @@ pub fn workspace_publish(dry_run: bool) -> Result<Vec<(String, MemberOutcome)>> 
             outcomes.push((name, MemberOutcome::WouldPublish(dirty)));
             continue;
         }
+        // Materialise this member's dependencies BEFORE building it.
+        //
+        // Without this a surface migration cannot proceed: the member still
+        // holds the previous SDK under `target/fluxor/`, compiles against
+        // it, and the freshly built module embeds the OLD surface digest —
+        // which packaging then rejects with "compiled against a different
+        // ABI surface", in a member nobody edited. Topological order is what
+        // makes syncing here safe: every dependency has already been
+        // published at the current epoch by the time we reach a dependent,
+        // so the mixed-epoch guard cannot trip.
+        //
+        // Best effort by intent, not by accident: a member that cannot
+        // resolve (a pre-adoption checkout, or one whose deps this workspace
+        // does not own) is left to the build below to succeed or fail on its
+        // own terms. Refusing here would make `workspace publish` stricter
+        // than the build it is about to run.
+        if let Err(e) = sync_project(&path, false) {
+            println!("workspace publish: {name} — sync skipped ({e})");
+        }
         // Build the member's modules when it owns any. Errors abort
         // the run — the published topological prefix stands.
         if !crate::modules_build::list(&path)?.is_empty() {
