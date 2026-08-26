@@ -28,7 +28,6 @@ pub mod ci;
 pub mod capacity;
 pub mod ci_schema;
 pub mod compose;
-pub mod downstream;
 pub mod error;
 pub mod genstore;
 pub mod hash;

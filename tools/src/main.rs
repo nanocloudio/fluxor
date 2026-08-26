@@ -28,7 +28,6 @@ mod capacity;
 mod ci;
 mod config;
 mod crypto;
-mod downstream;
 mod error;
 mod hash;
 mod hygiene;

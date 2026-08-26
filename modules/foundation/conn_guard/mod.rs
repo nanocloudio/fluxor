@@ -361,22 +361,15 @@ pub extern "C" fn module_new(
         // and a `0xFF` end marker; `parse_tlv` starts at offset 4 and honours
         // that marker, and calls `set_defaults` itself.
         //
-        // The previous loop here started at offset 0, so it consumed the
-        // 4-byte header as if it were entries and every subsequent tag landed
-        // misaligned. The failure was silent and, worse, PARTIAL: walking
-        // `FE 01 0f 00 | 02 01 c8 | 03 02 64 00 | …` from 0 read (tag=0xFE,
-        // len=1), then (tag=0x00, len=2), and only then arrived at the real
-        // `03 02 64 00` — so `rate_window_ms` applied correctly by coincidence
-        // while `rate_table_size` (tag 1) and `rate_limit_per_ip` (tag 2) were
-        // silently swallowed and stayed at their defaults.
-        //
-        // Measured consequence on the 2026-07-27 wave HTTPS rig run: a config
-        // asking for `rate_limit_per_ip: 200` ran at the default 16, and the
-        // fuse tripped six times, each dropped SYN costing that client a full
-        // 1.01 s on Linux's retransmit ladder. This is also why
-        // `rate_table_size: 0` — documented as the explicit disable — measured
-        // `drop_syn=550` and was recorded as an unresolved bug in wave's
-        // `.context/perf_benchmarks.md`: tag 1 never reached the module either.
+        // Starting the walk at offset 0 instead consumes that 4-byte header
+        // as if it were entries, and every subsequent tag lands misaligned.
+        // The damage is silent and PARTIAL, which is what makes it worth a
+        // comment: walking `FE 01 0f 00 | 02 01 c8 | 03 02 64 00 | …` from 0
+        // reads (tag=0xFE, len=1), then (tag=0x00, len=2), and only then
+        // arrives at the real `03 02 64 00`. One parameter therefore applies
+        // by coincidence while its neighbours are swallowed and keep their
+        // defaults — a graph whose declared rate limits quietly are not the
+        // limits in force, with nothing in the logs to say so.
         params_def::parse_tlv(s, params, params_len);
     }
     0

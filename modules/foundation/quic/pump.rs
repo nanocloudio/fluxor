@@ -409,8 +409,9 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
 
 unsafe fn pump_send_hello_retry(s: &mut QuicState, idx: usize) -> bool {
     let driver = &mut s.conns[idx].driver;
+    let sid_len = driver.peer_session_id_len as usize;
     let msg_len = build_hello_retry_request(
-        &driver.peer_session_id,
+        &driver.peer_session_id[..sid_len],
         driver.suite,
         &mut driver.scratch,
     );
@@ -441,7 +442,7 @@ unsafe fn pump_send_server_hello(s: &mut QuicState, idx: usize) -> bool {
     let msg_len = if psk_selected {
         build_server_hello_psk(
             &driver.server_random,
-            &driver.peer_session_id,
+            &driver.peer_session_id[..driver.peer_session_id_len as usize],
             driver.suite,
             &driver.ecdh_public,
             0, /* selected_identity = first identity */
@@ -459,7 +460,7 @@ unsafe fn pump_send_server_hello(s: &mut QuicState, idx: usize) -> bool {
             );
             build_server_hello(
                 &driver.server_random,
-                &driver.peer_session_id,
+                &driver.peer_session_id[..driver.peer_session_id_len as usize],
                 driver.suite,
                 GROUP_SECP256R1,
                 &share,

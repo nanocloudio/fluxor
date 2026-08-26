@@ -30,6 +30,60 @@
 //    `const _: () = assert!(...);` at the bottom.
 // 4. `pub use abi::config::<subsystem>::*` in the consumer.
 
+/// The `handler` byte of a compiled route record.
+///
+/// One definition, because two independent ones cannot be checked
+/// against each other. The config compiler derives this byte from a
+/// graph's route keys and bakes it into the artefact; the serving
+/// module switches on it. Neither repo can see the other's literals,
+/// and a disagreement is invisible in a config dump — the route
+/// simply serves the wrong thing, with every field that a reader
+/// would check to notice looking exactly right.
+///
+/// Ids are wire values baked into shipped artefacts: a number may be
+/// added, and never reused for a different meaning.
+pub mod route_handler {
+    /// Fixed body served verbatim.
+    pub const STATIC: u8 = 0;
+    /// Fixed body with `{{ }}` substitution.
+    pub const TEMPLATE: u8 = 1;
+    /// File fetched through the file channel and staged in the body
+    /// pool.
+    pub const FILE: u8 = 2;
+    /// Forward to `proxy_ip` / `proxy_port`.
+    pub const PROXY: u8 = 3;
+    /// Accept the RFC 6455 upgrade and echo frames.
+    pub const WEBSOCKET: u8 = 4;
+    /// WebSocket fan-out; a new subscriber is replayed the retained
+    /// frame.
+    pub const WS_FANOUT_RETAIN: u8 = 5;
+    /// Fixed-index fetch piped straight to the socket, never staged —
+    /// for payloads past the body-pool cap.
+    pub const STREAM: u8 = 6;
+    /// One file from the filesystem surface.
+    pub const FS_FILE: u8 = 7;
+    /// Directory listing from the filesystem surface.
+    pub const FS_LIST: u8 = 8;
+    /// WebSocket fan-out with no replay: a subscriber sees only what
+    /// arrives after it joins.
+    pub const WS_FANOUT: u8 = 9;
+    /// gRPC unary. The route path is the SERVICE prefix, because a
+    /// method path is `/<service>/<Method>` and a trailing `/`
+    /// matches as a prefix.
+    pub const GRPC: u8 = 10;
+    /// Hand the request to a downstream graph node as an
+    /// `HttpRequest` and await its `HttpResponse`.
+    pub const APP: u8 = 11;
+    /// WebSocket fan-out gated on external admission: the 101 is
+    /// composed only once the admission answer accepts. Distinct
+    /// from [`WS_FANOUT_RETAIN`] because replaying an earlier
+    /// connection's frames to a not-yet-admitted subscriber is
+    /// exactly what admission exists to prevent.
+    pub const WS_FANOUT_ADMIT: u8 = 12;
+    /// Highest id this vocabulary defines.
+    pub const MAX_ID: u8 = WS_FANOUT_ADMIT;
+}
+
 #[cfg(target_arch = "aarch64")]
 pub use self::profile_host::*;
 

@@ -306,17 +306,6 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         }));
     }
 
-    // ───── Phase 1.9: downstream conformance ────────────────────────
-    //
-    // Do this repo's declared consumers still build against it? Runs only
-    // where `[ci.downstream]` names some — which is fluxor, the repo whose
-    // changes can break everyone else's build without its own suite noticing.
-    if let Some(consumers) = crate::downstream::configured(project_root) {
-        results.push(run_step("downstream-conformance", verbose, || {
-            crate::downstream::check(project_root, &consumers, self_invoke)
-        }));
-    }
-
     // ───── Phase 2: cargo unit + library tests ──────────────────────
     //
     // For fluxor itself, run from `tools/` rather than workspace

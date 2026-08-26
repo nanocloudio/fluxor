@@ -51,7 +51,6 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("ci.lints.exemption", &["crate", "reason"]),
     ("ci.templates", &["dir", "vars", "template"]),
     ("ci.templates.template", &["file", "vars"]),
-    ("ci.downstream", &["projects", "root"]),
     ("ci.test", &["scripts"]),
 ];
 

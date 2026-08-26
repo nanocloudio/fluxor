@@ -323,7 +323,7 @@ pub fn build_client_hello_sni(
 /// bounds-check stubs that miscompile on PIC aarch64.
 pub fn build_server_hello(
     random: &[u8; 32],
-    session_id: &[u8; 32],
+    session_id: &[u8],
     suite: CipherSuite,
     group: u16,
     share: &[u8],
@@ -344,10 +344,16 @@ pub fn build_server_hello(
         // random
         core::ptr::copy_nonoverlapping(random.as_ptr(), p.add(pos), 32);
         pos += 32;
-        // session_id (echo back)
-        wv(p.add(pos), 32u8); pos += 1;
-        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), 32);
-        pos += 32;
+        // session_id: echo EXACTLY what the client sent (RFC 8446 §4.1.3
+        // legacy_session_id_echo). A QUIC ClientHello carries an EMPTY
+        // session id, and echoing a fixed 32 bytes here is a decode error to
+        // OpenSSL ("invalid session id") and BoringSSL (DECODE_ERROR) — only
+        // lenient stacks ever completed a handshake against it. TCP TLS
+        // never noticed because those clients send a 32-byte compat id.
+        let sid_len = session_id.len().min(32);
+        wv(p.add(pos), sid_len as u8); pos += 1;
+        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), sid_len);
+        pos += sid_len;
         // cipher_suite
         let sid = suite.id();
         wv(p.add(pos), (sid >> 8) as u8); wv(p.add(pos + 1), sid as u8); pos += 2;
@@ -408,7 +414,7 @@ const HRR_RANDOM: [u8; 32] = [
 /// Build HelloRetryRequest (special ServerHello requesting P-256 key share).
 /// Uses raw pointer writes throughout for PIC aarch64 safety.
 pub fn build_hello_retry_request(
-    session_id: &[u8; 32],
+    session_id: &[u8],
     suite: CipherSuite,
     out: &mut [u8],
 ) -> usize {
@@ -445,10 +451,13 @@ pub fn build_hello_retry_request(
         wv(p.add(pos+28), 0xC8u8); wv(p.add(pos+29), 0xA8u8);
         wv(p.add(pos+30), 0x33u8); wv(p.add(pos+31), 0x9Cu8);
         pos += 32;
-        // session_id (echo)
-        wv(p.add(pos), 32u8); pos += 1;
-        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), 32);
-        pos += 32;
+        // session_id: echo EXACTLY what the client sent — see
+        // build_server_hello; a fixed 32-byte echo of a QUIC client's empty
+        // session id was a DECODE_ERROR to every strict TLS stack.
+        let sid_len = session_id.len().min(32);
+        wv(p.add(pos), sid_len as u8); pos += 1;
+        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), sid_len);
+        pos += sid_len;
         // cipher_suite
         let sid = suite.id();
         *p.add(pos) = (sid >> 8) as u8; *p.add(pos + 1) = sid as u8; pos += 2;
@@ -1893,7 +1902,7 @@ pub fn psk_overwrite_binder(buf: &mut [u8], full_ch_off: usize, binder: &[u8]) {
 /// `pre_shared_key` extension carrying `selected_identity` (a u16).
 pub fn build_server_hello_psk(
     random: &[u8; 32],
-    session_id: &[u8; 32],
+    session_id: &[u8],
     suite: CipherSuite,
     pub_key: &[u8; 65],
     selected_identity: u16,
@@ -1915,10 +1924,12 @@ pub fn build_server_hello_psk(
         pos += 2;
         core::ptr::copy_nonoverlapping(random.as_ptr(), p.add(pos), 32);
         pos += 32;
-        wv(p.add(pos), 32);
+        // session_id: exact echo — see build_server_hello.
+        let sid_len = session_id.len().min(32);
+        wv(p.add(pos), sid_len as u8);
         pos += 1;
-        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), 32);
-        pos += 32;
+        core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), sid_len);
+        pos += sid_len;
         let cs = suite.id();
         wv(p.add(pos), (cs >> 8) as u8);
         wv(p.add(pos + 1), cs as u8);

@@ -30,7 +30,7 @@
 //! protocols place on a unidirectional stream to type it. A stream's contents
 //! are the application's, first byte included. HTTP semantics (methods, paths,
 //! header compression, HTTP/3 SETTINGS and QPACK, routing, WebSocket tunnels,
-//! request spans) live in Wave's `http`. See
+//! request spans) live in whichever module consumes this one. See
 //! `docs/architecture/protocol_surfaces.md`, and
 //! `examples/test_harness/linux/quic/README.md` for how the transport proves
 //! itself without borrowing a protocol to do it.
@@ -82,7 +82,18 @@ include!("connection.rs");
 include!("wire.rs");
 include!("pump.rs");
 
-const MAX_CONNS: usize = 2;
+// Concurrent connections this endpoint will hold. Per-connection state is
+// ~20 KB — dominated by the datagram/stream buffers and the TLS handshake
+// driver's 4 KB scratch — so the table costs ~160 KB of module state, which
+// bcm2712 (this module's only target) carries without pressure.
+//
+// It is a deliberate envelope rather than a wedge, and what makes it safe to
+// state as one is the behaviour AT the ceiling: a connection past it is
+// REFUSED with a stateless CONNECTION_REFUSED Initial
+// (`emit_stateless_refusal`), never silently ignored. A client that is
+// refused fails in one round trip; a client that is ignored hangs to its own
+// handshake deadline, which is indistinguishable from an unreachable server.
+const MAX_CONNS: usize = 8;
 /// Configured ALPN list buffer (comma-separated raw tokens, e.g.
 /// `mqtt,h3`). 64 bytes holds several protocol names with separators.
 const MAX_ALPN_CFG: usize = 64;
@@ -186,6 +197,8 @@ struct ClientTicketEntry {
 #[repr(C)]
 pub(crate) struct QuicState {
     syscalls: *const SyscallTable,
+    /// Connections refused at the table ceiling (stateless CONNECTION_REFUSED).
+    refused_conns: u32,
     net_in: i32,
     net_out: i32,
     app_in: i32,
@@ -419,6 +432,7 @@ pub unsafe extern "C" fn module_new(
     // out[2] = optional module-scope telemetry (-1 when unwired).
     s.tlm = TlmCounters::new();
     s.tlm_last_ms = 0;
+    s.refused_conns = 0;
     // `sample_permille` resolved after param parsing below (set_defaults would
     // clobber a value set here) via the `trace_sample_permille` 0xFFFF sentinel.
 
@@ -703,8 +717,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = &mut *(state as *mut QuicState);
     let sys = &*s.syscalls;
 
-    // Module-scope metrics: cumulative app-stream byte counters, ~5s cadence,
-    // no-op when the telemetry port is unwired.
+    // Module-scope metrics (~5s cadence): a bounded log beat always, plus the
+    // telemetry-port counters when that port is wired.
     maybe_emit_telemetry(s);
 
     // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,
@@ -837,6 +851,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     let mc = find_conn(s, &ip, port);
                                     if mc >= 0 {
                                         idx = mc;
+                                    } else {
+                                        // Table full: refuse STATELESSLY so
+                                        // the client fails in one round trip
+                                        // rather than hanging to its own
+                                        // handshake deadline. Stateless
+                                        // because allocating for a
+                                        // connection being refused is what
+                                        // makes a full table an amplifier.
+                                        emit_stateless_refusal(
+                                            s,
+                                            &ip,
+                                            port,
+                                            &peek[..peek_len],
+                                        );
                                     }
                                 }
                             }
@@ -992,6 +1020,32 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // enqueue, so a backpressured close is retried on the next
             // step rather than dropped.
             mux_emit_session_closed(s, i, mux::STATUS_CLOSED);
+            // RECYCLE the slot once everything owed has gone out (the span
+            // is emitted above; the app notification has latched, or was
+            // never owed because the session was never announced). A Closed
+            // slot used to stay Closed forever — `alloc_server_connection`
+            // takes only Idle — so every ended session permanently consumed
+            // a slot and the table exhausted after MAX_CONNS dials, found
+            // the moment anything redialed the DUT repeatedly (Pi 5 h3
+            // ladder, 2026-08-26). The slot's ECDH keypair is REGENERATED:
+            // an "ephemeral" reused across connections is not one.
+            let owed_app =
+                s.conns[i].session_opened_sent && !s.conns[i].session_closed_sent;
+            if !owed_app && s.conns[i].span_start_us == 0 {
+                let mut random = [0u8; 32];
+                if dev_csprng_fill(sys, random.as_mut_ptr(), 32) >= 0 {
+                    let (priv_key, pub_key) = ecdh_keygen(&random);
+                    s.eph_private[i] = priv_key;
+                    s.eph_public[i] = pub_key;
+                    s.eph_used[i] = false;
+                    let mut j = 0;
+                    while j < 32 {
+                        core::ptr::write_volatile(&mut random[j], 0);
+                        j += 1;
+                    }
+                    s.conns[i].reset();
+                }
+            }
         }
         i += 1;
     }
@@ -2289,14 +2343,47 @@ unsafe fn discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
     let sys = &*s.syscalls;
     // Ring-based emission (§5.2): zero-cost when no consumer is subscribed.
-    if !dev_telemetry_enabled(sys) {
-        return;
-    }
     let now = dev_millis(sys);
     if now.wrapping_sub(s.tlm_last_ms) < 5000 {
         return;
     }
     s.tlm_last_ms = now;
+    // Bounded state beat, telemetry-wired or not: one-shot records at
+    // module_new/bind are emitted before DHCP binds and never leave a board
+    // over UDP telemetry, so the evidence a rig capture keys on must RECUR
+    // (the SIP/RTP §4.2 lesson; the h3 rig regression sat undiagnosable for
+    // four days for want of exactly this line). Endpoint id, conn count,
+    // refusals, and the ingress counter only.
+    {
+        let mut active: u32 = 0;
+        let mut i = 0;
+        while i < MAX_CONNS {
+            if s.conns[i].phase != ConnPhase::Idle {
+                active += 1;
+            }
+            i += 1;
+        }
+        let mut l = [0u8; 64];
+        let msg = b"[quic] hb ep=";
+        l[..13].copy_from_slice(msg);
+        let mut pos = 13;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.endpoint.ep_id() as u32);
+        l[pos..pos + 6].copy_from_slice(b" conns");
+        pos += 6;
+        l[pos] = b'=';
+        pos += 1;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), active);
+        l[pos..pos + 4].copy_from_slice(b" rx=");
+        pos += 4;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.tlm.bytes_in);
+        l[pos..pos + 5].copy_from_slice(b" ref=");
+        pos += 5;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.refused_conns);
+        dev_log(sys, 3, l.as_ptr(), pos);
+    }
+    if !dev_telemetry_enabled(sys) {
+        return;
+    }
     let me = dev_self_index(sys);
     if me < 0 {
         return;
@@ -2373,6 +2460,61 @@ unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
 /// (PATH_CHALLENGE / PATH_RESPONSE / NEW_CONNECTION_ID) MUST keep that state
 /// pending until this returns `true`, so a backpressured write is retried, not
 /// lost. No-ops (returns `false`) until the endpoint is bound.
+/// Server at capacity: answer a client Initial with a stateless
+/// CONNECTION_REFUSED close, sealed under the Initial keys every client can
+/// derive from its own DCID (RFC 9001 §5.2), holding no state. The refusal
+/// is what makes the connection ceiling a bounded envelope rather than a
+/// hang (RFC 9000 §5.2.2 permits a stateless close for an unwanted
+/// connection attempt).
+unsafe fn emit_stateless_refusal(s: &mut QuicState, ip: &[u8; 4], port: u16, dgram: &[u8]) {
+    // Only a long-header v1 Initial earns a reply; anything else is stray
+    // traffic and stays dropped.
+    if dgram.len() < 7 || dgram[0] & 0xF0 != 0xC0 {
+        return;
+    }
+    if dgram[1..5] != [0, 0, 0, 1] {
+        return;
+    }
+    let dcid_len = dgram[5] as usize;
+    if dcid_len == 0 || dcid_len > MAX_CID_LEN || 6 + dcid_len + 1 > dgram.len() {
+        return;
+    }
+    let dcid = &dgram[6..6 + dcid_len];
+    let scid_off = 6 + dcid_len;
+    let scid_len = dgram[scid_off] as usize;
+    if scid_len > MAX_CID_LEN || scid_off + 1 + scid_len > dgram.len() {
+        return;
+    }
+    let scid = &dgram[scid_off + 1..scid_off + 1 + scid_len];
+
+    let (_client, server) = derive_initial_keys(dcid);
+    let hp = Aes128Hp::new(&server.hp);
+    let mut close = [0u8; 32];
+    // 0x02 CONNECTION_REFUSED, no offending frame, no reason phrase — the
+    // code is the whole message and a phrase would cost bytes on a path that
+    // exists because resources ran out.
+    let n = build_connection_close(0x02, 0, &[], false, &mut close);
+    if n == 0 {
+        return;
+    }
+    let mut pkt = [0u8; 256];
+    // Our DCID is the client's SCID; our SCID echoes the client's DCID, as a
+    // server's first Initial does before it chooses its own.
+    let m = build_initial_packet(&server, &hp, 0, 1, scid, dcid, &[], &close[..n], &mut pkt);
+    if m == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let peer = PeerAddr { ip: *ip, port };
+    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..m], &mut s.net_scratch);
+    s.refused_conns = s.refused_conns.wrapping_add(1);
+    // Bounded evidence: log the 1st, 2nd, 4th, 8th… refusal, so a flood of
+    // refused dials cannot flood the log while the count stays observable.
+    if s.refused_conns & (s.refused_conns - 1) == 0 {
+        dev_log(sys, 2, b"[quic] conn refused (table full)".as_ptr(), 31);
+    }
+}
+
 #[must_use]
 unsafe fn send_datagram(
     sys: &SyscallTable,
@@ -2673,6 +2815,67 @@ pub mod test_helpers {
     //! connection lifecycle without standing up a full QUIC crypto handshake.
 
     use super::{ConnPhase, QuicState, MAX_CONNS};
+
+    /// Run the server admission decision for one inbound datagram, exactly
+    /// as the RX path does: match by DCID, else allocate, else emit the
+    /// stateless CONNECTION_REFUSED and return -1. Lets the ceiling test
+    /// fill the table and observe the refusal without nine real handshakes.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`.
+    pub unsafe fn admit_from(state: *mut u8, ip: [u8; 4], port: u16, dgram: &[u8]) -> i32 {
+        let s = &mut *(state as *mut QuicState);
+        let mut dcid_buf = [0u8; super::MAX_CID_LEN];
+        let mut dcid_len = 0usize;
+        if dgram.len() > 6 && dgram[0] & 0x80 != 0 {
+            let dl = dgram[5] as usize;
+            if dl <= super::MAX_CID_LEN && 6 + dl <= dgram.len() {
+                dcid_buf[..dl].copy_from_slice(&dgram[6..6 + dl]);
+                dcid_len = dl;
+            }
+        }
+        let mut idx = if dcid_len > 0 {
+            super::find_conn_by_dcid(s, &dcid_buf[..dcid_len])
+        } else {
+            -1
+        };
+        if idx < 0 {
+            if let Some(new) = super::alloc_server_connection(s, &ip, port) {
+                idx = new as i32;
+            } else {
+                let mc = super::find_conn(s, &ip, port);
+                if mc >= 0 {
+                    idx = mc;
+                } else {
+                    super::emit_stateless_refusal(s, &ip, port, dgram);
+                }
+            }
+        }
+        idx
+    }
+
+    /// Connections refused at the ceiling so far.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`.
+    pub unsafe fn refused_count(state: *const u8) -> u32 {
+        (*(state as *const QuicState)).refused_conns
+    }
+
+    /// The connection-table ceiling, for tests that fill it.
+    pub fn max_conns() -> usize {
+        MAX_CONNS
+    }
+
+    /// Mark the datagram endpoint bound, as MSG_DG_BOUND would — the refusal
+    /// path sends through it, and the ceiling test starts past the bind
+    /// handshake.
+    ///
+    /// # Safety
+    /// `state` must point to a fully-initialised `QuicState`.
+    pub unsafe fn force_endpoint_bound(state: *mut u8, ep_id: u8) {
+        (*(state as *mut QuicState)).endpoint.bind_static(ep_id);
+    }
 
     /// Number of server-accepted connections currently occupying a slot
     /// (anything past `Idle`). After the RX path allocates a server

@@ -17,7 +17,7 @@ Source: `modules/sdk/contracts/net/`.
 
 | File | Surface | Opcodes | Status |
 |------|---------|---------|--------|
-| `net_proto.rs` | stream | `0x01..0x13` | live: `ip`, `tls`, `ota_registry`, `linux_net`, wave's `http` |
+| `net_proto.rs` | stream | `0x01..0x13` | live: `ip`, `tls`, `ota_registry`, `linux_net`, downstream `http` |
 | `datagram.rs` | datagram | `0x20..0x43` | live: `ip`, `linux_net`, `dns`, `log_net`, `quic`, `tls` (DTLS mode) |
 | `packet.rs` | packet | `0x50..0x63` | reserved: envelope defined, no consumer |
 | `identity.rs` | address control | `0x60..0x61` | live: net identity self-registration |
@@ -140,8 +140,7 @@ negotiated. The negotiated ALPN itself crosses as opaque bytes on
 consumer's decision, not the transport's.
 
 The live consumers are the `quic` module (provider), the `mux_echo`
-fixture, wave's `http` HTTP/3 server and client, and quantum's
-`mqtt_quic_adapter`. `quic` bounds one reliable write at
+fixture, and downstream HTTP/3 and MQTT-over-QUIC modules. `quic` bounds one reliable write at
 `MUX_QUIC_STREAM_SEND_MAX` (1200 bytes) — a transport bound, not a
 profile restriction — and refuses an oversize write rather than
 truncating it.

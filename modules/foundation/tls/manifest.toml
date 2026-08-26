@@ -1,7 +1,11 @@
 version = "1.0.0"
 # timer_class: handshake/session timers read wall-clock (dev_millis).
 timer_class = "wall_clock"
-hardware_targets = ["rp2350", "bcm2712"]
+# The implementation is target-neutral PIC, so the target list is a statement
+# about what has been built and run, not about what the code can express.
+# `linux` is here because a Linux graph that terminates TLS is a first-class
+# deployment, and a consumer cannot wire a module its target list excludes.
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # Ingress anchor role for the tls-fronted 443 edge (rfc_workload_ingress
 # §2/§4.1, rfc_protocols.md §8.1): tls terminates the client-visible

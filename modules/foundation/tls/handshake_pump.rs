@@ -530,7 +530,7 @@ unsafe fn pump_send_server_hello_core(driver: &mut HandshakeDriver) -> bool {
     };
     let msg_len = build_server_hello(
         &driver.server_random,
-        &driver.peer_session_id,
+        &driver.peer_session_id[..driver.peer_session_id_len as usize],
         driver.suite,
         driver.group,
         &share[..share_len],
@@ -553,7 +553,11 @@ unsafe fn pump_send_server_hello_core(driver: &mut HandshakeDriver) -> bool {
 /// to RecvSecondClientHello.
 unsafe fn pump_send_hello_retry_core(driver: &mut HandshakeDriver) -> bool {
     let msg_len =
-        build_hello_retry_request(&driver.peer_session_id, driver.suite, &mut driver.scratch);
+        build_hello_retry_request(
+        &driver.peer_session_id[..driver.peer_session_id_len as usize],
+        driver.suite,
+        &mut driver.scratch,
+    );
     if let Some(ref mut t) = driver.transcript {
         let ch1_hash = t.current_hash();
         let hl = driver.suite.hash_len();

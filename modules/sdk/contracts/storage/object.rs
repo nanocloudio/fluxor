@@ -86,10 +86,11 @@
 /// exist" and "must be at revision 0" are different requests, and
 /// collapsing them answers one of the two wrongly.
 ///
-/// **Carried by [`PUT`] and [`DELETE`].** [`PUT_STREAMED_OPEN`] still takes
-/// the bare `if_match_len` guard, so the streamed path cannot express
-/// `ABSENT` — a create-if-absent of a large body has no conditional form
-/// on this contract.
+/// Carried by [`PUT`], [`DELETE`] and [`PUT_STREAMED_OPEN`]. The streamed
+/// path takes the same three because body size is not a reason to lose a
+/// guarantee: a create-if-absent of a large body is the same request as a
+/// small one, and a caller that could not express it would have to fall
+/// back to the `HEAD`-then-write race this contract forbids.
 ///
 /// ## Atomicity
 ///
@@ -231,13 +232,22 @@ pub const IMG_CLOSE: u32 = 0x1432;
 ///   [content_type_len: u8]
 ///   [content_type: content_type_len bytes]
 ///   [expected_size: u64 LE]                   — best-effort hint; 0 = unknown
-///   [if_match_len: u8]                        — 0 or 32; pre-existence etag guard
-///   [if_match: if_match_len bytes]
+///   [precondition: u8]                        — see `precondition`
+///   [etag_len: u8]                            — 0 unless precondition = ETAG
+///   [etag: etag_len bytes]
 /// ```
 ///
 /// Returns a non-negative streaming-write handle or negative errno.
 /// The handle's fence is `Fence::Volatile` until
 /// `PUT_STREAMED_COMMIT` succeeds.
+///
+/// The condition is stated at OPEN and evaluated at
+/// [`PUT_STREAMED_COMMIT`], not here: a streamed write is open across many
+/// calls, and a key that satisfied the condition when the handle opened may
+/// not when the bytes land. Evaluating at open would make the guard a
+/// statement about a moment that has passed by the time it matters — which
+/// is the same race a `HEAD` followed by an unconditional write loses, and
+/// the reason [`precondition`] insists on a single linearization point.
 pub const PUT_STREAMED_OPEN: u32 = 0x1426;
 
 /// Append a chunk of body bytes to a streaming-write handle.

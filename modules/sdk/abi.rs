@@ -110,6 +110,9 @@ pub mod contracts {
         pub mod identity {
             include!("contracts/net/identity.rs");
         }
+        pub mod ws_frame {
+            include!("contracts/net/ws_frame.rs");
+        }
     }
     /// Observability telemetry envelope (metric / span signals).
     pub mod telemetry {

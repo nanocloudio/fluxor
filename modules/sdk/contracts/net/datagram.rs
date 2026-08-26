@@ -118,6 +118,20 @@ pub const OWNER_TAG_NONE: u16 = 0;
 /// Payload: [ep_id: u8] [local_port: u16 LE].
 pub const MSG_DG_BOUND: u8 = 0x40;
 
+/// Parts of a `MSG_DG_BOUND` payload: `(ep_id, local_port)`.
+///
+/// On a fanned provider output every consumer sees every BOUND, and an
+/// endpoint id is an identity: a consumer that grabs the first BOUND it
+/// polls claims another module's endpoint, then filters every later
+/// datagram against the wrong id (found live on the Pi 5 SIP rig,
+/// 2026-08-26 — three binds, three BOUNDs, whoever read first won).
+/// A consumer that requested a specific port claims a BOUND only when
+/// `local_port` matches it. Callers bounds-check `payload.len() >= 3`.
+#[inline]
+pub fn dg_bound_parts(payload: &[u8]) -> (u8, u16) {
+    (payload[0], u16::from_le_bytes([payload[1], payload[2]]))
+}
+
 /// Received datagram. Source address and port are always present.
 ///
 /// IPv4 payload: [ep_id: u8] [af: u8 = 4] [src_addr: 4 bytes BE] [src_port: u16 LE] [data...]

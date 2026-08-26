@@ -47,7 +47,7 @@ The foundation layer covers:
 - **Storage and filesystems** (`fat32`, `sd`, `mount`)
 - **Networking** (`ip` — which includes the DHCP client — plus `dns`,
   `tls`, `quic`); application-protocol clients and servers (`http`,
-  `mqtt`, …) live in the sibling projects wave and quantum
+  `mqtt`, …) live in sibling projects that consume them
 - **Network-plane hygiene** (`conn_guard` for TCP-SYN connection-rate
   filtering, `demux` for 4-tuple hashed frame fan-out to replicated IP
   lanes, `conn_demux` for per-connection fan-out to parallel TLS

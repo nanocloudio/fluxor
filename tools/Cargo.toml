@@ -64,6 +64,11 @@ path = "src/lib.rs"
 [dependencies]
 base64 = "0.22"
 clap = { version = "4.6.0", features = ["derive"] }
+# The wire-ABI surface the config compiler bakes values FROM. A compiled
+# config carries route handler ids, contract opcodes and content-type bytes
+# that a module then switches on, so the compiler and the module must read
+# one definition — re-declaring them here is how the two silently diverge.
+fluxor-abi = { path = "../crates/fluxor-abi" }
 fluxor-contracts = { path = "../contracts" }
 libc = "0.2"
 regex = "1.10"
@@ -104,12 +109,6 @@ webpki-roots = "0.26"
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 
 [dev-dependencies]
-# The kernel↔module syscall table, as the loader hands it to a PIC
-# module. `tests/conn_guard_resume.rs` builds one so the mounted module
-# core runs against the real ABI struct rather than a hand-copied
-# replica that could drift from `modules/sdk/abi/kernel_abi.rs`.
-fluxor-abi = { path = "../crates/fluxor-abi" }
-
 # Used by test-side `#[cfg(test)]` helpers to construct auto-cleaning
 # scratch directories instead of leaking `std::env::temp_dir().join(...)`
 # paths to `/tmp`. Production tools that manage long-lived state in

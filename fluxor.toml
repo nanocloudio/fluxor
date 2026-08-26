@@ -25,24 +25,6 @@ fluxor = { abi = 1 }
 # iterates this list.
 targets = ["bcm2712", "rp2350", "rp2040", "wasm"]
 
-[ci.downstream]
-# The consumers whose build a change HERE can break, checked here rather
-# than waiting for someone to build them.
-#
-# Every other phase in this ecosystem is single-project, so a change to a
-# fluxor surface can leave a consumer unable to compile while fluxor's own
-# suite stays green. Reshaping an API for a good reason breaks its callers
-# as thoroughly as deleting one by accident, and both are cheapest to fix
-# in the hands already holding the change.
-#
-# An absent checkout is skipped, not failed: most people have some of these
-# and not all, and a gate demanding the full set is one everybody learns to
-# skip. A consumer whose synced SDK does not match this tree is REPORTED
-# rather than built, because building it would compile against the previous
-# fluxor and report green.
-projects = ["kagi", "wave", "sector", "chronicle", "clustor", "truffle", "lattice", "quantum"]
-root = ".."
-
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal
 # kernel and cannot build on the host under default features, so the

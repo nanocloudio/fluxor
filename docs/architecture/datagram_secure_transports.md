@@ -4,8 +4,8 @@ This document describes how Fluxor's TLS 1.3, DTLS 1.3, and QUIC v1
 stack is structured: which modules own which protocols, which
 primitives live in the SDK, and which channel contracts the transports
 expose. Fluxor owns the secure transports; the HTTP request layer
-(HTTP/1.x, HTTP/2, and the HTTP/3 request path) lives in the wave
-sibling and consumes these transports over channel contracts.
+(HTTP/1.x, HTTP/2, and the HTTP/3 request path) lives in a consuming
+sibling and reaches these transports over channel contracts.
 
 ## Module layout
 
@@ -201,8 +201,8 @@ The transport does not read it, classify it, or discard it.
 The negotiated ALPN crosses as opaque bytes on
 `MSG_MUX_SESSION_OPENED`. This module performs the negotiation and
 never compares the result against a token; selecting HTTP/3 because of
-it is the consumer's decision. The wave sibling's `http` module is that
-consumer, and owns SETTINGS, GOAWAY, QPACK, priority, push policy,
+it is the consumer's decision. A consuming `http` module owns that
+choice, along with SETTINGS, GOAWAY, QPACK, priority, push policy,
 request and response semantics, and WebSocket-over-HTTP/3 extended
 CONNECT (RFC 9220) entirely.
 

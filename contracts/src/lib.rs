@@ -152,8 +152,8 @@ pub const CONTENT_TYPES: &[&str] = &[
     // HTTP application fan-out surface — the request half. Header
     // `{conn_id u16, stream_id u16, method u8, flags u8, path_len u16,
     // hdr_len u16, body_len u16}` followed by `path_len + hdr_len +
-    // body_len` bytes. Carried on a port when a transport gateway
-    // (wave's foundation/http) is configured to hand a matched route's
+    // body_len` bytes. Carried on a port when a transport gateway — a
+    // consuming HTTP module — is configured to hand a matched route's
     // requests to a downstream module instead of answering them itself.
     //
     // The pair with `HttpResponse` is what lets a graph serve an API

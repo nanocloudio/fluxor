@@ -1380,8 +1380,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // ids 3/4 = bytes_in / bytes_out. Read here, at the TOP of
                 // the step, while `tlm` still holds the completed window —
                 // `dev_tlm_maybe_emit` zeroes it at the END of this same
-                // cadence step. Reading after that reset is exactly the bug
-                // that made wave's http module export 0 on every scrape.
+                // cadence step. Reading after that reset reports 0 on every
+                // scrape — a counter that looks wired and measures nothing.
                 dev_telemetry_metric(tsys, -1, midx, t, c, 3, s.tlm.bytes_in as u64);
                 dev_telemetry_metric(tsys, -1, midx, t, c, 4, s.tlm.bytes_out as u64);
             }

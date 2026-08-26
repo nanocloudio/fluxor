@@ -10,6 +10,12 @@ use serde_json::Value;
 
 use crate::modules::ModuleInfo;
 
+/// Route `handler` ids, from the SDK that the serving module also compiles
+/// against. Deriving the byte here and switching on it there are two halves
+/// of one wire value; reading both from `fluxor_abi` is what makes them
+/// checkable rather than merely intended to agree.
+use fluxor_abi::config::route_handler as handler_id;
+
 /// Schema magic bytes: "SP"
 const SCHEMA_MAGIC: [u8; 2] = [0x53, 0x50];
 
@@ -1140,12 +1146,13 @@ fn expand_routes(
         // Determine handler type and body.
         //
         // The handler id is DERIVED from the boolean route keys below and
-        // never read from the yaml: a raw `handler: 11` compiles to 0 and
-        // serves an empty static body (pinned by
-        // `a_raw_handler_number_is_ignored_not_honoured`). The ids are
-        // internal constants of wave's http module, so letting a graph name
-        // one would make every renumbering a breaking config change.
-        let mut handler: u8 = 0;
+        // never read from the yaml: a raw `handler: 11` compiles to
+        // `STATIC` and serves an empty static body (pinned by
+        // `a_raw_handler_number_is_ignored_not_honoured`). A graph naming a
+        // number directly would make every renumbering a breaking config
+        // change, and would let a config assert a handler the serving module
+        // does not have.
+        let mut handler: u8 = handler_id::STATIC;
 
         if obj
             .get("websocket_fanout")
@@ -1169,15 +1176,15 @@ fn expand_routes(
             // not-yet-admitted subscriber would be wrong — so it is checked
             // before `retain_replay` rather than combined with it.
             handler = if obj.get("admit").and_then(|v| v.as_bool()).unwrap_or(false) {
-                12
+                handler_id::WS_FANOUT_ADMIT
             } else if obj
                 .get("retain_replay")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true)
             {
-                5
+                handler_id::WS_FANOUT_RETAIN
             } else {
-                9
+                handler_id::WS_FANOUT
             };
         } else if obj
             .get("websocket")
@@ -1185,7 +1192,7 @@ fn expand_routes(
             .unwrap_or(false)
         {
             // WebSocket handler — accepts the Upgrade and echoes frames.
-            handler = 4;
+            handler = handler_id::WEBSOCKET;
         } else if obj.get("grpc").and_then(|v| v.as_bool()).unwrap_or(false) {
             // gRPC unary handler (HANDLER_GRPC) — answers with a canned
             // length-prefixed message and a `grpc-status: 0` trailer.
@@ -1193,7 +1200,7 @@ fn expand_routes(
             // The route path should be the gRPC SERVICE prefix
             // (`/pkg.Service/`), because a method path is `/<service>/<Method>`
             // and http matches a trailing `/` as a prefix.
-            handler = 10;
+            handler = handler_id::GRPC;
         } else if obj.get("app").and_then(|v| v.as_bool()).unwrap_or(false) {
             // Application fan-out (HANDLER_APP) — the request goes out on the
             // http module's `req_out` port as an `HttpRequest` envelope and the
@@ -1203,10 +1210,10 @@ fn expand_routes(
             // The route path is normally a prefix ending in `/`, since an API
             // mounted at `/v2/` must receive everything beneath it. A bare `/`
             // is also a prefix for this handler alone.
-            handler = 11;
+            handler = handler_id::APP;
         } else if let Some(proxy_val) = obj.get("proxy") {
             // Proxy handler
-            handler = 3;
+            handler = handler_id::PROXY;
             if let Some(proxy_str) = proxy_val.as_str() {
                 if let Some((ip_str, port_str)) = proxy_str.rsplit_once(':') {
                     kv.insert(
@@ -1228,7 +1235,7 @@ fn expand_routes(
             // FS_OPEN, ...)` against whichever module registered as
             // the FS provider (`fat32` on bare-metal, `linux_fs_dispatch`
             // on the host).
-            handler = 7; // HANDLER_FS_FILE
+            handler = handler_id::FS_FILE;
             kv.insert(format!("route_{i}_fs_path"), fs_path_val.clone());
         } else if let Some(fs_list_val) = obj.get("fs_list") {
             // FS_CONTRACT-served directory listing as JSON. The http
@@ -1238,7 +1245,7 @@ fn expand_routes(
             // insensitive comma-separated extension list) narrows the
             // result. Used by the browser image_viewer / audio_player
             // launchers to enumerate the asset bank.
-            handler = 8; // HANDLER_FS_LIST
+            handler = handler_id::FS_LIST;
             kv.insert(format!("route_{i}_fs_list"), fs_list_val.clone());
             if let Some(fs_filter_val) = obj.get("fs_filter") {
                 kv.insert(format!("route_{i}_fs_filter"), fs_filter_val.clone());
@@ -1264,14 +1271,18 @@ fn expand_routes(
             let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
             if let Some(idx_val) = obj.get("source_index") {
                 if let Some(idx) = idx_val.as_u64() {
-                    handler = if stream { 6 } else { 0 };
+                    handler = if stream {
+                        handler_id::STREAM
+                    } else {
+                        handler_id::STATIC
+                    };
                     kv.insert(
                         format!("route_{i}_source"),
                         Value::Number(serde_json::Number::from(idx)),
                     );
                 }
             } else {
-                handler = 2; // HANDLER_FILE
+                handler = handler_id::FILE;
             }
         } else if let Some(body_val) = obj.get("body") {
             // Static or template handler — resolve body through data section.
@@ -1309,8 +1320,8 @@ fn expand_routes(
             // Auto-detect template if body contains {{ }} (text bodies
             // only — binary byte arrays can't be templated).
             handler = match &body_value {
-                Value::String(s) if s.contains("{{") => 1, // template
-                _ => 0,                                    // static
+                Value::String(s) if s.contains("{{") => handler_id::TEMPLATE,
+                _ => handler_id::STATIC,
             };
 
             kv.insert(format!("route_{i}_body"), body_value);
@@ -1346,25 +1357,60 @@ mod tests {
         kv.get("route_0_handler").and_then(|v| v.as_u64())
     }
 
-    /// Each boolean route key selects its handler, and the ids are the ones
-    /// wave's `modules/foundation/http/server/routes.rs` defines — the
-    /// compiler here and the module there must agree on a number neither
-    /// repo can check for the other. A silent disagreement is invisible in a
-    /// config dump: the route simply serves the wrong thing.
+    /// Each boolean route key selects its handler.
+    ///
+    /// The ids come from `fluxor_abi::config::route_handler`, which
+    /// the serving module compiles against too — so this asserts the mapping
+    /// from route KEY to handler, not the numbers themselves. A silent
+    /// disagreement about a number would be invisible in a config dump (the
+    /// route simply serves the wrong thing), which is why there is one
+    /// definition rather than two that are checked against each other.
     #[test]
     fn boolean_route_keys_select_their_handlers() {
-        assert_eq!(
-            handler_of(serde_json::json!({"path": "/ws", "websocket": true})),
-            Some(4)
-        );
-        assert_eq!(
-            handler_of(serde_json::json!({"path": "/pkg.Svc/", "grpc": true})),
-            Some(10)
-        );
-        assert_eq!(
-            handler_of(serde_json::json!({"path": "/app/", "app": true})),
-            Some(11)
-        );
+        for (route, want) in [
+            (
+                serde_json::json!({"path": "/ws", "websocket": true}),
+                handler_id::WEBSOCKET,
+            ),
+            (
+                serde_json::json!({"path": "/pkg.Svc/", "grpc": true}),
+                handler_id::GRPC,
+            ),
+            (
+                serde_json::json!({"path": "/app/", "app": true}),
+                handler_id::APP,
+            ),
+            (
+                serde_json::json!({"path": "/sub", "websocket_fanout": true}),
+                handler_id::WS_FANOUT_RETAIN,
+            ),
+            (
+                serde_json::json!({"path": "/sub", "websocket_fanout": true, "retain_replay": false}),
+                handler_id::WS_FANOUT,
+            ),
+            (
+                serde_json::json!({"path": "/sub", "websocket_fanout": true, "admit": true}),
+                handler_id::WS_FANOUT_ADMIT,
+            ),
+            (
+                serde_json::json!({"path": "/p", "proxy": "10.0.0.1:80"}),
+                handler_id::PROXY,
+            ),
+            (
+                serde_json::json!({"path": "/t", "body": "hi {{name}}"}),
+                handler_id::TEMPLATE,
+            ),
+            (
+                serde_json::json!({"path": "/s", "body": "hi"}),
+                handler_id::STATIC,
+            ),
+        ] {
+            assert_eq!(
+                handler_of(route.clone()),
+                Some(u64::from(want)),
+                "route {route} selected the wrong handler"
+            );
+        }
     }
 
     /// The websocket fan-out family: retention, session isolation, and

@@ -42,9 +42,9 @@ metrics = ["bytes_in", "bytes_out"]
 # close reaper. Client connections are not spanned. Zero-cost otherwise.
 # There is deliberately no request span here. A request is an HTTP concept and
 # this module does not serve HTTP — it surfaces streams and the application owns
-# the protocol on them, so the application is what can name a request. Wave's
-# `http` emits `http.server.request`, parented by the connection span above via
-# the propagated trace context.
+# the protocol on them, so the application is what can name a request. A
+# consuming HTTP module emits `http.server.request`, parented by the
+# connection span above via the propagated trace context.
 spans = ["quic.connection"]
 
 [[resources]]

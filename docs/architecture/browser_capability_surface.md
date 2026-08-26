@@ -176,7 +176,7 @@ subject to web platform availability:
 
 - **WebSocket** — stream-shaped record framing over an HTTP upgrade.
   Broadly available and the default first transport for browser
-  endpoints; the runtime core connects over it, and wave's HTTP
+  endpoints; the runtime core connects over it, and a consuming HTTP
   gateway serves the upgrade on the Fluxor side.
 - **WebTransport** — multiplexed-session and datagram surface over
   HTTP/3. The natural fit when migration, low-latency datagrams, or

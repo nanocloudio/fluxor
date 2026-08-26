@@ -13,8 +13,8 @@
 // `transport.stream` abstraction.
 //
 // Status: live. The QUIC foundation module is the provider; `mux_echo`
-// (fixtures), wave's `http` HTTP/3 server and client, and quantum's
-// `mqtt_quic_adapter` are consumers.
+// (fixtures) is the in-tree consumer, and consuming HTTP/3 and MQTT-over-QUIC
+// modules live downstream.
 //
 // This surface is PROTOCOL-NEUTRAL and complete. A provider implements
 // the whole lifecycle below for every session it carries, whatever
@@ -74,6 +74,35 @@
 
 /// Frame header size (msg_type + len).
 pub const FRAME_HDR: usize = 3;
+
+/// Read the leading `session_id` of a session-scoped payload. Callers
+/// bounds-check `payload.len() >= SESSION_ID_BYTES` first (frame
+/// validation), as with `net_proto::conn_id`.
+#[inline]
+pub fn session_id(payload: &[u8]) -> u32 {
+    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
+}
+
+/// Write `session_id` into the leading bytes of a session-scoped payload.
+#[inline]
+pub fn put_session_id(payload: &mut [u8], session_id: u32) {
+    payload[0..SESSION_ID_BYTES].copy_from_slice(&session_id.to_le_bytes());
+}
+
+/// Read the `stream_id` of a stream-scoped payload
+/// (`[session_id: u32 LE][stream_id: u32 LE]…`). Callers bounds-check
+/// `payload.len() >= SESSION_ID_BYTES + STREAM_ID_BYTES` first.
+#[inline]
+pub fn stream_id(payload: &[u8]) -> u32 {
+    u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+}
+
+/// Write `stream_id` into a stream-scoped payload, after the session id.
+#[inline]
+pub fn put_stream_id(payload: &mut [u8], stream_id: u32) {
+    payload[SESSION_ID_BYTES..SESSION_ID_BYTES + STREAM_ID_BYTES]
+        .copy_from_slice(&stream_id.to_le_bytes());
+}
 
 /// Bytes of session_id (u32 LE) carried on session-scoped messages.
 pub const SESSION_ID_BYTES: usize = 4;
@@ -390,6 +419,20 @@ pub const STREAM_OPENED_BODY: usize = 1 + 1 + QUIC_STREAM_ID_BYTES;
 /// Payload length of `MSG_MUX_STREAM_ACCEPTED` after the session+stream
 /// prefix: `[flags:1][quic_stream_id:8]`.
 pub const STREAM_ACCEPTED_BODY: usize = 1 + QUIC_STREAM_ID_BYTES;
+
+/// Parts of a `MSG_MUX_STREAM_ACCEPTED` body: `(flags, quic_stream_id)`.
+/// The QUIC stream id is transport identity — consumers read it through
+/// this accessor rather than literal offsets. Callers bounds-check
+/// `body.len() >= STREAM_ACCEPTED_BODY` first.
+#[inline]
+pub fn stream_accepted_parts(body: &[u8]) -> (u8, u64) {
+    (
+        body[0],
+        u64::from_le_bytes([
+            body[1], body[2], body[3], body[4], body[5], body[6], body[7], body[8],
+        ]),
+    )
+}
 
 /// Payload length of `MSG_MUX_STREAM_RESET` / `_STOPPED` and of
 /// `CMD_MUX_STREAM_RESET` / `_STOP_SENDING` after the session+stream

@@ -2,8 +2,8 @@
 //!
 //! Fluxor has to be able to prove its own QUIC transport carries a real,
 //! multiplexed exchange using only Fluxor. The dependency direction forbids the
-//! obvious alternative: Wave depends on Fluxor, never the reverse, so `quic`
-//! cannot be tested through Wave's `http`.
+//! obvious alternative: a consumer depends on Fluxor, never the reverse, so
+//! `quic` cannot be tested through a consumer's `http`.
 //!
 //! The point of this module is that it is SMALL: proving a transport needs an
 //! application, not a protocol. An HTTP responder would work, but it would make
@@ -21,7 +21,7 @@
 //!   * closing frees the slot, so the next stream is not starved.
 //!
 //! Anything above that — methods, paths, header compression — belongs to a
-//! protocol, and protocols are Wave's.
+//! protocol, and protocols belong to the consumer.
 //!
 //! # Two roles, one fixture
 //!

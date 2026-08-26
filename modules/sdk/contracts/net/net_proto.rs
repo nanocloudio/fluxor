@@ -38,6 +38,53 @@ pub fn put_conn_id(payload: &mut [u8], conn_id: u16) {
     payload[0..2].copy_from_slice(&conn_id.to_le_bytes());
 }
 
+/// Parts of a `MSG_CONNECTED` payload: `(conn_id, requester_tag)`.
+///
+/// The legacy 2-byte form carries no tag and yields `REQUESTER_TAG_NONE`.
+/// Callers bounds-check `payload.len() >= CONN_ID_LEN` first (frame
+/// validation), as with `conn_id`.
+#[inline]
+pub fn connected_parts(payload: &[u8]) -> (u16, u8) {
+    let tag = if payload.len() > CONN_ID_LEN {
+        payload[CONN_ID_LEN]
+    } else {
+        REQUESTER_TAG_NONE
+    };
+    (conn_id(payload), tag)
+}
+
+/// Parts of a `MSG_ERROR` payload: `(conn_id, errno, requester_tag)`.
+///
+/// The 3-byte form carries no tag and yields `REQUESTER_TAG_NONE` — an
+/// UNTAGGED error is an established-connection error and routes by
+/// `conn_id`; a TAGGED error is a connect-phase failure and is attributed
+/// by tag ALONE, because its `conn_id` is meaningless on that path (see
+/// `MSG_ERROR`). This accessor exists so no consumer re-derives that
+/// discriminator from literal offsets — mis-reading it is exactly how a
+/// module claims another module's connect failure. Callers bounds-check
+/// `payload.len() >= CONN_ID_LEN + 1` first.
+#[inline]
+pub fn error_parts(payload: &[u8]) -> (u16, i8, u8) {
+    let errno = payload[CONN_ID_LEN] as i8;
+    let tag = if payload.len() > CONN_ID_LEN + 1 {
+        payload[CONN_ID_LEN + 1]
+    } else {
+        REQUESTER_TAG_NONE
+    };
+    (conn_id(payload), errno, tag)
+}
+
+/// Parts of a `MSG_ACCEPTED` / `MSG_BOUND` payload: `(conn_id, local_port)`.
+/// Callers bounds-check `payload.len() >= CONN_ID_LEN + 2` first; a consumer
+/// that ignores the port reads just `conn_id`.
+#[inline]
+pub fn accepted_parts(payload: &[u8]) -> (u16, u16) {
+    (
+        conn_id(payload),
+        u16::from_le_bytes([payload[CONN_ID_LEN], payload[CONN_ID_LEN + 1]]),
+    )
+}
+
 // Downstream: IP/net → consumer
 /// New connection accepted. Payload: `[conn_id: u16 LE][local_port: u16 LE]`.
 /// `local_port` is the listener port the connection was accepted on. When

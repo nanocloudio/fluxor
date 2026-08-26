@@ -61,7 +61,7 @@ preferred_console = "console.serial"
 # `[nvme] / [fat32] / [ip] / [sched]` markers without a serial cable.
 telemetry = ["telemetry.monitor_udp"]
 preferred_telemetry = "telemetry.monitor_udp"
-# `observe.proto_load` is the protocol-agnostic load probe (Wave T3.6.1): same
+# `observe.proto_load` is the protocol-agnostic load probe: same
 # NIC and same DHCP-assigned address as observe.https_load, but the backend
 # picks the protocol from its binding instead of being HTTPS-only. Listed here
 # because it is the same physical capability — a host driving traffic at the

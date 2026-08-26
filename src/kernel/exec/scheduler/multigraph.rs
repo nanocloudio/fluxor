@@ -1253,19 +1253,18 @@ pub fn downstream_latency(module_idx: usize) -> u32 {
 /// Bucket index for a step elapsed time in microseconds.
 /// 0: <2, 1: <4, 2: <8, 3: <16, 4: <32, 5: <64, 6: <256, 7: >=256
 ///
-/// The ladder is deliberately weighted BELOW the tick budget. The previous
-/// edges started at `<64` and doubled to `>=4096`, which put every step of a
-/// healthy `tick_us: 100` graph into `b0` — on the 2026-07-27 wave HTTPS run,
-/// eight of nine modules reported `b0=~100000` and zero everywhere else, so
-/// the histogram could not distinguish a 1 µs module from a 50 µs one and no
-/// per-module share of the tick budget could be computed at all.
+/// The ladder is deliberately weighted BELOW the tick budget. Edges that
+/// start at `<64` and double to `>=4096` put every step of a healthy
+/// `tick_us: 100` graph into `b0` — a histogram that cannot separate a 1 µs
+/// module from a 50 µs one, and from which no per-module share of the tick
+/// budget can be computed at all.
 ///
-/// The tail the old edges resolved is already reported exactly, and per
+/// The tail such edges would resolve is already reported exactly, and per
 /// module, by `MON_HEAVY_STEP` (`elapsed_us` verbatim) and in aggregate by
-/// `MON_BUDGET_OVERRUN` (`consumed_us` vs `limit_us`). Duplicating it here
-/// cost the only range where attribution was still possible. `b6`/`b7` keep
-/// enough of the top end to spot a heavy module without reading the fault
-/// stream.
+/// `MON_BUDGET_OVERRUN` (`consumed_us` vs `limit_us`). Spending resolution
+/// there costs the only range where attribution is still possible. `b6`/`b7`
+/// keep enough of the top end to spot a heavy module without reading the
+/// fault stream.
 #[inline]
 fn step_bucket(elapsed_us: u32) -> usize {
     if elapsed_us < 2 {
