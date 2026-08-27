@@ -249,21 +249,143 @@ use fluxor_contracts::vocabulary::{PROVIDER_CONTRACTS, PROVIDER_SURFACES};
 /// matching at every callsite.
 fn validate_capability_names(caps: &mut [String]) -> Result<()> {
     for c in caps {
-        match CAPABILITY_NAMES.iter().find(|n| n.eq_ignore_ascii_case(c)) {
-            Some(canonical) => {
-                if c.as_str() != *canonical {
-                    *c = canonical.to_string();
+        *c = canonical_capability(c, "capability")?;
+    }
+    Ok(())
+}
+
+/// Resolve one capability string to its canonical lowercase spelling, or
+/// fail with a did-you-mean. `field` names the manifest key being checked
+/// so the error points at `capabilities` or `requires_capability` rather
+/// than at "a capability" in the abstract.
+fn canonical_capability(name: &str, field: &str) -> Result<String> {
+    match CAPABILITY_NAMES
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(name))
+    {
+        Some(canonical) => Ok((*canonical).to_string()),
+        None => {
+            let candidates: Vec<String> = CAPABILITY_NAMES.iter().map(|s| s.to_string()).collect();
+            let did_you_mean = crate::text_distance::closest_match(name, &candidates, 3)
+                .map(|s| format!(" Did you mean `{s}`?"))
+                .unwrap_or_default();
+            Err(Error::Module(format!(
+                "unknown {field} `{name}`.{did_you_mean} Expected one of: {}.",
+                CAPABILITY_NAMES.join(", "),
+            )))
+        }
+    }
+}
+
+/// Validate a `[capability_facts]` table: every capability it names must be
+/// one this module declares or requires (or a parent of one), every fact
+/// must be admitted by that capability's schema, and every value must be
+/// admitted by that fact.
+///
+/// Declaring facts for a capability the module neither carries nor needs is
+/// an error rather than a no-op: it is always a mistake, and a silently
+/// ignored `ack = "durable"` is exactly the kind of unchecked promise the
+/// registry exists to prevent.
+/// Flatten `[capability_facts]` TOML values to strings.
+///
+/// A numeric fact reads naturally unquoted (`max_payload = 4096`) and a
+/// string fact quoted (`ack = "durable"`); both arrive here as raw TOML and
+/// leave as strings, so the schema check downstream has one shape to reason
+/// about. Any other TOML type is a manifest error rather than a coercion —
+/// `ack = true` is a mistake, not a boolean fact.
+fn normalise_capability_facts(
+    raw: Option<
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, toml::Value>>,
+    >,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>> {
+    let mut out: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        std::collections::BTreeMap::new();
+    for (capability, table) in raw.unwrap_or_default() {
+        let mut flat = std::collections::BTreeMap::new();
+        for (fact, value) in table {
+            let text = match value {
+                toml::Value::String(s) => s,
+                toml::Value::Integer(i) => {
+                    if i < 0 {
+                        return Err(Error::Module(format!(
+                            "fact `{fact}` on capability `{capability}` is negative ({i}); \
+                             capability facts are non-negative."
+                        )));
+                    }
+                    i.to_string()
                 }
-            }
-            None => {
+                other => {
+                    return Err(Error::Module(format!(
+                        "fact `{fact}` on capability `{capability}` must be a string or an \
+                         integer, got a {}.",
+                        other.type_str(),
+                    )))
+                }
+            };
+            flat.insert(fact, text);
+        }
+        out.insert(capability, flat);
+    }
+    Ok(out)
+}
+
+fn validate_capability_facts(
+    facts: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    declared: &[String],
+    required: &[String],
+) -> Result<()> {
+    use fluxor_contracts::vocabulary::{capability_and_parents, fact_is_numeric, facts_for};
+
+    for (capability, table) in facts {
+        let canonical = canonical_capability(capability, "capability_facts capability")?;
+        // Facts belong to either side of the surface. A PROVIDER states the
+        // terms it offers (`capabilities`); a CONSUMER states the terms it
+        // needs — what it sends, so a provider's ceiling can be checked
+        // against it — and names the capability on a port's
+        // `requires_capability` rather than providing it.
+        // The key may be the capability itself or a PARENT of it, since
+        // sibling roles share the parent's schema rather than repeating it.
+        let covered = declared
+            .iter()
+            .chain(required.iter())
+            .any(|name| capability_and_parents(name).any(|probe| probe == canonical));
+        if !covered {
+            return Err(Error::Module(format!(
+                "[capability_facts.\"{canonical}\"] declares facts for a capability this \
+                 module neither lists in `capabilities = [...]` nor names in any port's \
+                 `requires_capability`."
+            )));
+        }
+        let Some(schema) = facts_for(&canonical) else {
+            return Err(Error::Module(format!(
+                "capability `{canonical}` carries no facts, so \
+                 [capability_facts.\"{canonical}\"] has nothing to declare."
+            )));
+        };
+        for (fact, value) in table {
+            let Some((_, admitted)) = schema.iter().find(|(n, _)| n == fact) else {
                 let candidates: Vec<String> =
-                    CAPABILITY_NAMES.iter().map(|s| s.to_string()).collect();
-                let did_you_mean = crate::text_distance::closest_match(c, &candidates, 3)
+                    schema.iter().map(|(n, _)| (*n).to_string()).collect();
+                let did_you_mean = crate::text_distance::closest_match(fact, &candidates, 3)
                     .map(|s| format!(" Did you mean `{s}`?"))
                     .unwrap_or_default();
                 return Err(Error::Module(format!(
-                    "unknown capability `{c}`.{did_you_mean} Expected one of: {}.",
-                    CAPABILITY_NAMES.join(", "),
+                    "unknown fact `{fact}` on capability `{canonical}`.{did_you_mean} \
+                     Expected one of: {}.",
+                    candidates.join(", "),
+                )));
+            };
+            if fact_is_numeric(&canonical, fact) {
+                if value.parse::<u32>().is_err() {
+                    return Err(Error::Module(format!(
+                        "fact `{fact}` on capability `{canonical}` takes a u32, got `{value}`."
+                    )));
+                }
+            } else if !admitted.iter().any(|a| a == value) {
+                return Err(Error::Module(format!(
+                    "value `{value}` is not admitted for fact `{fact}` on capability \
+                     `{canonical}`. Expected one of: {}.",
+                    admitted.join(", "),
                 )));
             }
         }
@@ -454,6 +576,20 @@ pub struct PortSpec {
     /// per-edge `rate:` override. `None` = fall back to the
     /// content-type default (§ `resolve_edge_rate_class`).
     pub rate_class_default: Option<fluxor_contracts::RateClass>,
+    /// The capability the module wired to this port must declare.
+    ///
+    /// Tools-side only (not serialized). This is the CONSUMER half of the
+    /// capability registry, and it lives on the port rather than on the
+    /// module for a reason: a capability requirement is satisfied by the
+    /// peer on an EDGE, not by some module being present somewhere in the
+    /// graph. A module-level requirement would pass a config that wired
+    /// this port to entirely the wrong provider.
+    ///
+    /// Matching is the same parent/child prefix rule the graph validator
+    /// already uses for `capabilities`, so a port requiring `request` is
+    /// satisfied by a `request.http` provider but not the reverse.
+    /// `None` = undeclared = unchecked.
+    pub requires_capability: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -756,6 +892,11 @@ pub struct Manifest {
     /// binary format). Used by the config resolver to wire dependencies by
     /// service name (e.g. `pwm_rp` provides `"pwm"`).
     pub provides: Vec<String>,
+    /// Terms on which this module offers each capability it declares
+    /// (parsed from TOML, not serialized to the binary `.fmod`). Keyed by
+    /// capability name; see `fluxor_contracts::vocabulary::CAPABILITY_FACTS`.
+    pub capability_facts:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// Role/surface capabilities this module declares (parsed from TOML,
     /// not serialized to the binary `.fmod`). The whitelist lives in
     /// `CAPABILITY_NAMES`; the config validator consults this field to
@@ -874,6 +1015,7 @@ impl Default for Manifest {
             signer_fp: None,
             commands: CommandVocabulary::default(),
             provides: Vec::new(),
+            capability_facts: std::collections::BTreeMap::new(),
             capabilities: Vec::new(),
             observability: Observability::default(),
             builtin: false,
@@ -1307,6 +1449,9 @@ impl Manifest {
             if p.required.unwrap_or(false) {
                 flags |= 0x01;
             }
+            if p.framed.unwrap_or(false) {
+                flags |= 0x02;
+            }
 
             // Validate port name
             if let Some(ref name) = p.name {
@@ -1370,6 +1515,10 @@ impl Manifest {
                     }
                     None => None,
                 },
+                requires_capability: match &p.requires_capability {
+                    Some(c) => Some(canonical_capability(c, "requires_capability")?),
+                    None => None,
+                },
             });
         }
 
@@ -1427,6 +1576,12 @@ impl Manifest {
         validate_provides_names(&provides)?;
         let mut capabilities = toml_val.capabilities.unwrap_or_default();
         validate_capability_names(&mut capabilities)?;
+        let capability_facts = normalise_capability_facts(toml_val.capability_facts)?;
+        let required_caps: Vec<String> = ports
+            .iter()
+            .filter_map(|p| p.requires_capability.clone())
+            .collect();
+        validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
 
         let observability = toml_val
             .observability
@@ -1732,6 +1887,7 @@ impl Manifest {
             signer_fp: None,
             commands,
             provides,
+            capability_facts,
             capabilities,
             observability,
             builtin,
@@ -1968,6 +2124,7 @@ impl Manifest {
                 max_record: 0,
                 rate_class_max: None,
                 rate_class_default: None,
+                requires_capability: None,
             });
             offset += 4;
         }
@@ -2061,7 +2218,8 @@ impl Manifest {
             signature,
             signer_fp,
             commands: CommandVocabulary::default(),
-            provides: Vec::new(),     // not serialized in binary format
+            provides: Vec::new(), // not serialized in binary format
+            capability_facts: std::collections::BTreeMap::new(), // not serialized
             capabilities: Vec::new(), // not serialized in binary format
             observability: Observability::default(), // not serialized in binary format
             builtin: false,
@@ -2242,6 +2400,15 @@ struct TomlManifest {
     /// `buffer_size`. Use it for a bound the module compiles in AND the
     /// build tooling has to respect, so the two can't drift.
     capacities: Option<std::collections::BTreeMap<String, CapacityValue>>,
+    /// `[capability_facts."<capability>"]` tables — the terms on which this
+    /// module offers a capability it declares (`ack`, `ordering`,
+    /// `max_payload`, …). Schema and admitted values live in
+    /// `fluxor_contracts::vocabulary::CAPABILITY_FACTS`.
+    /// Values are read as raw TOML so a numeric fact may be written
+    /// naturally (`max_payload = 4096`) or as a string (`"4096"`); both
+    /// normalise to the same stored form.
+    capability_facts:
+        Option<std::collections::BTreeMap<String, std::collections::BTreeMap<String, toml::Value>>>,
     /// Author attests ISR-safety. Required for Tier 1b/2 admission.
     /// See `Manifest::isr_safe` for the contract.
     #[serde(default)]
@@ -2510,12 +2677,20 @@ struct TomlPort {
     direction: String,
     content_type: String,
     required: Option<bool>,
+    /// This port carries whole RECORDS, not a byte stream. A framed edge must
+    /// be in mailbox mode (`buffer_group` on the wiring entry) or the default
+    /// byte FIFO will fragment records under pressure — silently, and only
+    /// under load. Declaring it lets the graph build enforce it.
+    framed: Option<bool>,
     name: Option<String>,
     index: Option<u8>,
     buffer_size: Option<CapacityValue>,
     max_record: Option<CapacityValue>,
     rate_class_max: Option<String>,
     rate_class_default: Option<String>,
+    /// Capability the peer wired to this port must declare. See
+    /// [`PortSpec::requires_capability`].
+    requires_capability: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2591,6 +2766,7 @@ mod tests {
             max_record: 0,
             rate_class_max: None,
             rate_class_default: None,
+            requires_capability: None,
         });
         m.ports.push(PortSpec {
             direction: 1,
@@ -2602,6 +2778,7 @@ mod tests {
             max_record: 16384,
             rate_class_max: None,
             rate_class_default: None,
+            requires_capability: None,
         });
         let bytes = m.to_bytes();
         assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
@@ -2628,6 +2805,7 @@ mod tests {
             max_record: 0,
             rate_class_max: None,
             rate_class_default: None,
+            requires_capability: None,
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
@@ -2744,6 +2922,7 @@ mod tests {
             max_record: 0,
             rate_class_max: None,
             rate_class_default: None,
+            requires_capability: None,
         });
         m.resources.push(ResourceClaim {
             device_class: 0x04,

@@ -671,12 +671,21 @@ fn check_edge_framing(
 ) -> Result<()> {
     use fluxor_contracts::{Framing, CONTENT_FRAMING, CONTENT_TYPES};
 
+    // The type table is the primary source: it owns framing, so a producer and
+    // a consumer cannot disagree about it. A port may ALSO declare
+    // `framed = true` (flags bit 1), which is the escape hatch for a record
+    // carried over an ambiguous type — `OctetStream` is `Streamed` by default
+    // and rightly so, but a module emitting fixed record frames over it still
+    // needs mailbox delivery. Minting a content type for every such record
+    // would move the ABI surface digest and force a coordinated rebuild of
+    // every `.fmod` in every workspace member, so the port declares it and
+    // only the declaring module bears the requirement.
     let framed_of = |spec: Option<&crate::manifest::PortSpec>| {
         spec.and_then(|p| {
-            CONTENT_FRAMING
+            let by_type = CONTENT_FRAMING
                 .get(p.content_type as usize)
-                .filter(|f| **f == Framing::Framed)
-                .map(|_| p.content_type)
+                .is_some_and(|f| *f == Framing::Framed);
+            (by_type || p.flags & 0x02 != 0).then_some(p.content_type)
         })
     };
     let from_port = manifests

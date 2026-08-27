@@ -195,10 +195,7 @@ pub fn validate_presentation_groups(
 /// reverse never holds, and `.secure` variants are ordinary children —
 /// security orthogonality is enforced by *which* name is wanted.
 fn cap_satisfies(declared: &str, wanted: &str) -> bool {
-    declared == wanted
-        || (declared.len() > wanted.len()
-            && declared.starts_with(wanted)
-            && declared.as_bytes()[wanted.len()] == b'.')
+    capability_and_parents(declared).any(|name| name == wanted)
 }
 
 /// Validate the optional top-level `continuity` block — session
@@ -1167,3 +1164,141 @@ pub fn validate_fault_policy(
     Ok(())
 }
 
+
+/// Validate every `[[ports]] requires_capability` against the module actually
+/// wired to that port.
+///
+/// This is the consumer half of the capability registry. It lives on the EDGE
+/// rather than on the module because that is what a capability requirement
+/// actually means: a producer's `publish_out` needs the thing on the other end
+/// of *that wire* to be a publish sink, and a graph-wide "some module declares
+/// it" check would pass a config that wired it to a metrics collector.
+///
+/// Two checks per requiring port:
+///
+///   1. the peer declares a capability satisfying the requirement, under the
+///      same parent-matches-child rule [`cap_satisfies`] applies everywhere
+///      else;
+///   2. the peer's `max_payload` fact is not smaller than the REQUIRING
+///      module's own `max_payload` fact, when both declare one. This is the
+///      check with teeth: a provider's ceiling is a property of that
+///      provider, not of the protocol it speaks, and a producer wired to one
+///      whose backend takes less than it sends is a guaranteed runtime
+///      OVERSIZE refusal that nothing else sees before the graph runs.
+///
+///      Fact against fact, and NEVER a fact against a port's `max_record`:
+///      the two measure different things. `max_record` sizes a whole framed
+///      record — correlation id, flags, key, length prefixes — while
+///      `max_payload` is the payload alone, and on the ordered-ack surface
+///      they differ by 525 bytes. Port sizing is separately covered anyway:
+///      the kernel refuses a wiring whose `max_record` exceeds the granted
+///      ring. What a fact adds is what the BACKEND will take, and only
+///      another fact states what the producer will send.
+///
+///      Only a declared fact can be checked. A provider that states no
+///      `max_payload` is not assumed to accept everything — it is simply
+///      unvalidated here, which is the honest position and the reason
+///      declaring the fact is worth doing.
+///
+/// FAILS OPEN on a module whose manifest could not be resolved. A pinned
+/// store artifact may carry no `manifest.toml` layer at all, and refusing to
+/// build in that case would break every existing graph that composes a
+/// sibling-owned provider by digest.
+pub fn validate_port_capabilities(
+    config: &Value,
+    manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+
+    // ("module", "port") from a `module.port` endpoint spec.
+    let split = |spec: &str| -> Option<(String, String)> {
+        let (m, p) = spec.split_once('.')?;
+        Some((m.to_string(), p.to_string()))
+    };
+
+    let port_of = |module: &str, port: &str| -> Option<crate::manifest::PortSpec> {
+        manifests
+            .get(module)?
+            .ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some(port))
+            .cloned()
+    };
+
+    for entry in wiring {
+        let Some(from) = entry.get("from").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(to) = entry.get("to").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let (Some((from_mod, from_port)), Some((to_mod, to_port))) = (split(from), split(to)) else {
+            continue;
+        };
+
+        // Both directions: a requirement may sit on the producing or the
+        // consuming side of the edge.
+        for (req_mod, req_port, peer_mod) in [
+            (&from_mod, &from_port, &to_mod),
+            (&to_mod, &to_port, &from_mod),
+        ] {
+            let Some(spec) = port_of(req_mod, req_port) else {
+                continue;
+            };
+            let Some(wanted) = spec.requires_capability.as_deref() else {
+                continue;
+            };
+            // Fail open: unresolvable peer manifest is not a build error.
+            let Some(peer) = manifests.get(peer_mod) else {
+                continue;
+            };
+
+            let Some(satisfying) = peer
+                .capabilities
+                .iter()
+                .find(|c| cap_satisfies(c, wanted))
+            else {
+                return Err(Error::Config(format!(
+                    "`{req_mod}.{req_port}` requires capability `{wanted}`, but `{peer_mod}` \
+                     wired to it declares {}. Wire a provider that declares `{wanted}`, or \
+                     add it to that module's `capabilities = [...]`.",
+                    if peer.capabilities.is_empty() {
+                        "no capabilities".to_string()
+                    } else {
+                        format!("only [{}]", peer.capabilities.join(", "))
+                    },
+                )));
+            };
+
+            // What the producer says it sends, against what the provider's
+            // backend says it takes. Both sides state a payload; neither
+            // states the other's framing.
+            // Facts may be declared on a PARENT of the capability, since
+            // sibling roles share one schema.
+            let payload_fact = |m: &Manifest, cap: &str| -> Option<u32> {
+                capability_and_parents(cap).find_map(|probe| {
+                    m.capability_facts
+                        .get(probe)
+                        .and_then(|f| f.get("max_payload"))
+                        .and_then(|v| v.parse::<u32>().ok())
+                })
+            };
+            let sends = manifests
+                .get(req_mod)
+                .and_then(|m| payload_fact(m, wanted).or_else(|| payload_fact(m, satisfying)));
+            if let (Some(sends), Some(takes)) = (sends, payload_fact(peer, satisfying)) {
+                if sends > takes {
+                    return Err(Error::Config(format!(
+                        "`{req_mod}.{req_port}` sends payloads up to {sends} bytes but \
+                         `{peer_mod}` offers `{satisfying}` with max_payload = {takes}. \
+                         Every payload above {takes} bytes would be refused at runtime."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}

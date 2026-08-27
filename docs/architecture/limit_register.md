@@ -33,6 +33,10 @@ means editing its row here in the same change.
 
 | Cap | Symbol | Source | Value | Reason |
 |---|---|---|---|---|
+| Ordered-ack record payload | `PAYLOAD_MAX` | modules/sdk/contracts/exchange.rs | 8192 | Policy: the one ceiling every provider of `stream.ordered_ack` derives from, so a producer has a number it can hold itself to. A per-provider ceiling is undiscoverable by the producer that must stay under it. A provider whose backend cannot take the full size declares the smaller number as its `max_payload` capability fact, which the build checks against the producer's own `max_payload` fact |
+| Ordered-ack message key | `KEY_MAX` | modules/sdk/contracts/exchange.rs | 512 | Policy: a table or topic identifier plus a 256-byte natural key, with room for producers whose ordering unit is wider. The key is the ordering unit and is opaque to the provider |
+| Ordered-ack publish frame | `PUBLISH_FRAME_MAX` | modules/sdk/contracts/exchange.rs | 8717 | Derived, not chosen: `PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX` — what a `publish_in` port must take as one record and what a producer declares as `max_record`. Moves when any of its three parts moves, which is why it is checked rather than restated |
+| Ordered-ack reply frame | `REPLY_FRAME_MAX` | modules/sdk/contracts/exchange.rs | 8717 | Derived, not chosen: `REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX` — what a `reply_out` port must be able to emit as one record. Equal to `PUBLISH_FRAME_MAX` only because the two overheads happen to match; it is stated separately so a change to either frame moves only its own row |
 | Single module code segment | `MAX_MODULE_CODE_SIZE` | modules/sdk/abi/config.rs | 1048576 | Sanity bound: catches a corrupt or runaway blob, not a budget |
 | Whole modules blob | `MAX_MODULES_BLOB_SIZE` | src/kernel/module/loader.rs | 8388608 | Sanity bound: a boot-image module table past this is refused at load |
 | Boot config blob | `MAX_CONFIG_SIZE` | src/kernel/boot/config.rs | 262144 | Sanity bound on the packed config (32 KiB on RP/wasm profiles); an oversize blob is refused as `TooLarge` |

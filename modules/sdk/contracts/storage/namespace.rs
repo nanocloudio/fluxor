@@ -136,9 +136,23 @@ pub const STAT: u32 = 0x1301;
 ///   [name: name_len bytes UTF-8]
 /// ```
 ///
-/// followed by a trailing cursor record (`[0xFF, cursor_len, cursor…]`)
-/// when more pages remain. A trailing record with `cursor_len = 0`
-/// means "end of listing".
+/// followed by a trailing cursor record:
+///
+/// ```text
+///   [0xFF]
+///   [cursor_len: u8]              — 0 means END OF LISTING
+///   [cursor: cursor_len bytes]    — opaque, echo to fetch the next page
+/// ```
+///
+/// `cursor_len` in the trailing record is **u8** — narrower than the `u16`
+/// the request carries, and stated here because a consumer parses one shape
+/// and a provider that guesses the other width corrupts every page but the
+/// last.
+///
+/// A provider MUST page rather than refuse: fill the buffer, emit a cursor,
+/// and let the caller ask again. Answering ENOMEM because a whole listing
+/// does not fit turns the caller's buffer into a ceiling on how many entries
+/// a prefix may hold, which is a silent scaling cliff rather than a limit.
 pub const LIST: u32 = 0x1302;
 
 /// Rename or move an entry. Atomic within a single namespace

@@ -7,6 +7,8 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
+use fluxor_contracts::vocabulary::capability_and_parents;
+
 use crate::error::{Error, Result};
 use crate::hash::fnv1a_hash;
 use crate::manifest::{self, Manifest, TimerClass};

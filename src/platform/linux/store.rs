@@ -1088,30 +1088,81 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             let Some(cl) = get_u16(a, p).map(|v| v as usize) else {
                 return errno::EINVAL;
             };
-            p += 2 + cl; // cursor ignored (single-page; store lists are small)
+            // Opaque cursor, encoded as a 4-byte LE start index — the same
+            // encoding `platform/linux/namespace.rs` uses, so the two
+            // namespace providers agree on the wire a consumer must parse.
+            // Absent (length 0) starts at the beginning; any other length is
+            // refused rather than treated as absent, because silently
+            // restarting a listing the caller believed it was continuing
+            // loops it over the first page forever.
+            let start = match cl {
+                0 => 0usize,
+                4 => match a.get(p + 2..p + 6) {
+                    Some(idx) => u32::from_le_bytes([idx[0], idx[1], idx[2], idx[3]]) as usize,
+                    None => return errno::EINVAL,
+                },
+                _ => return errno::EINVAL,
+            };
+            p += 2 + cl;
+            // The fixed tail: out_buf(8) + out_cap(4) + fence_ptr(8) +
+            // fence_cap(2). Requiring all 22 bytes is what makes a
+            // `cursor_len` that does not match the bytes supplied detectable
+            // — it shifts the tail, and a partly-in-range read would
+            // otherwise yield a plausible-looking pointer to write into.
+            if a.len() < p + 22 {
+                return errno::EINVAL;
+            }
             let out_buf = get_u64(a, p).unwrap_or(0);
             let out_cap = get_u32(a, p + 8).unwrap_or(0) as usize;
             let fptr = get_u64(a, p + 12).unwrap_or(0);
             let fcap = get_u16(a, p + 20).unwrap_or(0);
 
             let (items, watermark) = store.list(prefix);
-            // entries: [name_len:u8][kind:u8][name] ; trailing [0xFF][cursor_len:u16=0]
+            // entries: [name_len:u8][kind:u8][name] ; trailing
+            // [0xFF][cursor_len:u8][cursor] — cursor_len 0 means end of listing.
+            //
+            // A prefix holds an unbounded number of objects, so the reply
+            // PAGES: fill the buffer, emit a cursor, let the caller ask
+            // again. Serving a listing whole and refusing with ENOMEM when it
+            // did not fit would make the caller's buffer a ceiling on how
+            // many objects a prefix may hold — a consumer would stop listing
+            // entirely once its prefix outgrew that buffer, rather than
+            // degrading.
+            //
+            // Worst case the trailing record is 6 bytes (0xFF + len + 4-byte
+            // cursor); reserve that so a page can always be terminated.
+            const TRAILER_MAX: usize = 6;
             let mut buf = Vec::new();
-            for (k, _rev) in &items {
+            let mut next = start;
+            for (k, _rev) in items.iter().skip(start) {
                 let name = k.as_bytes();
                 if name.len() > 255 {
-                    continue;
+                    next += 1;
+                    continue; // unrepresentable name length — skip
+                }
+                let need = 2 + name.len();
+                if out_buf != 0 && buf.len() + need + TRAILER_MAX > out_cap {
+                    break;
                 }
                 buf.push(name.len() as u8);
                 buf.push(ns_op::KIND_OBJECT);
                 buf.extend_from_slice(name);
+                next += 1;
             }
             buf.push(0xFF);
-            buf.extend_from_slice(&0u16.to_le_bytes()); // cursor_len 0 = end
-            if out_buf != 0 && buf.len() <= out_cap {
+            if next < items.len() {
+                buf.push(4); // cursor_len
+                buf.extend_from_slice(&(next as u32).to_le_bytes());
+            } else {
+                buf.push(0); // cursor_len 0 = end of listing
+            }
+            if out_buf != 0 {
+                if buf.len() > out_cap {
+                    // Too small to hold even one entry plus the trailer. The
+                    // caller must offer a usable buffer; paging cannot help.
+                    return errno::ENOMEM;
+                }
                 core::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf as *mut u8, buf.len());
-            } else if out_buf != 0 {
-                return errno::ENOMEM;
             }
             write_fence(
                 Fence::ViewConsistent {

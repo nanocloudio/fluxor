@@ -126,6 +126,12 @@ pub mod contracts {
     pub mod stream_clock {
         include!("contracts/stream_clock.rs");
     }
+    /// Ordered-ack record exchange (`stream.ordered_ack`): publish frames in,
+    /// durable acks out, and an optional reply carrying data back on the same
+    /// correlation.
+    pub mod exchange {
+        include!("contracts/exchange.rs");
+    }
     pub mod storage {
         pub mod graph_slot {
             include!("contracts/storage/graph_slot.rs");

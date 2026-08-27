@@ -2283,6 +2283,7 @@ mod rate_class_resolution_tests {
             max_record: 0,
             rate_class_max: None,
             rate_class_default: None,
+            requires_capability: None,
         }
     }
 
@@ -2503,5 +2504,215 @@ mod capacity_envelope_tests {
         let sec = build_capacity_envelope(&cfg, Some("rp2350")).expect("encodes");
         assert_eq!(u16::from_le_bytes(sec[12..14].try_into().unwrap()), 0x0001);
         assert_eq!(u32::from_le_bytes(sec[14..18].try_into().unwrap()), 65536);
+    }
+}
+
+/// Port-level `requires_capability`: the consumer half of the capability
+/// registry, checked against the peer on the actual edge.
+#[cfg(test)]
+mod port_capability_tests {
+    use super::*;
+    use crate::manifest::{Manifest, PortSpec};
+    use std::collections::{BTreeMap, HashMap};
+
+    /// A module with one named port that requires `wanted` and writes
+    /// records of at most `max_record` bytes.
+    fn consumer(port: &str, wanted: &str, max_record: u32) -> Manifest {
+        Manifest {
+            ports: vec![PortSpec {
+                name: Some(port.to_string()),
+                max_record,
+                requires_capability: Some(wanted.to_string()),
+                ..port_default()
+            }],
+            ..Manifest::default()
+        }
+    }
+
+    /// A provider declaring `caps`, optionally with a `max_payload` fact on
+    /// the first of them.
+    fn provider(caps: &[&str], max_payload: Option<u32>) -> Manifest {
+        let mut facts = BTreeMap::new();
+        if let (Some(cap), Some(limit)) = (caps.first(), max_payload) {
+            let mut table = BTreeMap::new();
+            table.insert("max_payload".to_string(), limit.to_string());
+            facts.insert((*cap).to_string(), table);
+        }
+        Manifest {
+            capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            capability_facts: facts,
+            ..Manifest::default()
+        }
+    }
+
+    /// A `capability_facts` table declaring one payload ceiling.
+    fn facts(cap: &str, max_payload: u32) -> BTreeMap<String, BTreeMap<String, String>> {
+        let mut inner = BTreeMap::new();
+        inner.insert("max_payload".to_string(), max_payload.to_string());
+        let mut outer = BTreeMap::new();
+        outer.insert(cap.to_string(), inner);
+        outer
+    }
+
+    fn port_default() -> PortSpec {
+        PortSpec {
+            direction: 0,
+            content_type: 0,
+            flags: 0,
+            name: None,
+            index: 0,
+            buffer_size: 0,
+            max_record: 0,
+            rate_class_max: None,
+            rate_class_default: None,
+            requires_capability: None,
+        }
+    }
+
+    fn edge() -> Value {
+        json!({"wiring": [{"from": "pump.publish_out", "to": "sink.publish_in"}]})
+    }
+
+    #[test]
+    fn accepts_a_peer_declaring_the_capability() {
+        let mut m = HashMap::new();
+        m.insert(
+            "pump".to_string(),
+            consumer("publish_out", "stream.publish", 0),
+        );
+        m.insert("sink".to_string(), provider(&["stream.publish"], None));
+        validate_port_capabilities(&edge(), &m).unwrap();
+    }
+
+    /// The whole point: a graph that wires the requiring port to the wrong
+    /// module fails, where a module-presence check would have passed it.
+    #[test]
+    fn rejects_a_peer_without_the_capability() {
+        let mut m = HashMap::new();
+        m.insert(
+            "pump".to_string(),
+            consumer("publish_out", "stream.publish", 0),
+        );
+        m.insert("sink".to_string(), provider(&["telemetry.sink"], None));
+        let e = validate_port_capabilities(&edge(), &m).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(msg.contains("stream.publish"), "got: {msg}");
+        assert!(msg.contains("sink"), "got: {msg}");
+    }
+
+    /// A declared child satisfies a wanted parent, never the reverse.
+    #[test]
+    fn parent_matches_child_but_not_the_reverse() {
+        let mut m = HashMap::new();
+        m.insert("pump".to_string(), consumer("publish_out", "stream", 0));
+        m.insert("sink".to_string(), provider(&["stream.publish"], None));
+        validate_port_capabilities(&edge(), &m).unwrap();
+
+        let mut m = HashMap::new();
+        m.insert(
+            "pump".to_string(),
+            consumer("publish_out", "stream.publish", 0),
+        );
+        m.insert("sink".to_string(), provider(&["stream"], None));
+        validate_port_capabilities(&edge(), &m).unwrap_err();
+    }
+
+    /// A producer that declares it sends more than the provider's backend
+    /// takes fails the build rather than collecting runtime OVERSIZE refusals.
+    #[test]
+    fn rejects_a_payload_larger_than_the_providers_ceiling() {
+        let mut m = HashMap::new();
+        let mut pump = consumer("publish_out", "stream.publish", 8717);
+        pump.capability_facts = facts("stream.publish", 8192);
+        m.insert("pump".to_string(), pump);
+        m.insert(
+            "sink".to_string(),
+            provider(&["stream.publish"], Some(1900)),
+        );
+        let e = validate_port_capabilities(&edge(), &m).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(msg.contains("8192") && msg.contains("1900"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_a_payload_within_the_ceiling() {
+        let mut m = HashMap::new();
+        let mut pump = consumer("publish_out", "stream.publish", 8717);
+        pump.capability_facts = facts("stream.publish", 1600);
+        m.insert("pump".to_string(), pump);
+        m.insert(
+            "sink".to_string(),
+            provider(&["stream.publish"], Some(1900)),
+        );
+        validate_port_capabilities(&edge(), &m).unwrap();
+    }
+
+    /// A port's `max_record` is never the quantity compared against a
+    /// provider's `max_payload`: `max_record` frames a whole record —
+    /// correlation id, flags, key, length prefixes — while `max_payload` is
+    /// the payload alone, and on the ordered-ack surface they differ by 525
+    /// bytes. This is the shape of the real graph — a pump whose port takes
+    /// an 8717-byte frame, sending 8192-byte payloads, into a sink that
+    /// accepts 8192 — so confusing the two would fail every correctly
+    /// configured producer.
+    #[test]
+    fn a_frame_sized_port_does_not_fail_against_an_equal_payload_ceiling() {
+        let mut m = HashMap::new();
+        let mut pump = consumer("publish_out", "stream.publish", 8717);
+        pump.capability_facts = facts("stream.publish", 8192);
+        m.insert("pump".to_string(), pump);
+        m.insert(
+            "sink".to_string(),
+            provider(&["stream.publish"], Some(8192)),
+        );
+        validate_port_capabilities(&edge(), &m).unwrap();
+    }
+
+    /// A producer that states no payload fact is unvalidated, not assumed
+    /// to fit: the honest position, and the reason declaring it is worth it.
+    #[test]
+    fn an_undeclared_producer_payload_is_unchecked() {
+        let mut m = HashMap::new();
+        m.insert(
+            "pump".to_string(),
+            consumer("publish_out", "stream.publish", 8717),
+        );
+        m.insert(
+            "sink".to_string(),
+            provider(&["stream.publish"], Some(1900)),
+        );
+        validate_port_capabilities(&edge(), &m).unwrap();
+    }
+
+    /// A pinned store artifact may carry no manifest layer at all. Refusing
+    /// to build in that case would break every graph composing a
+    /// sibling-owned provider by digest, so the check fails open.
+    #[test]
+    fn fails_open_on_an_unresolvable_peer_manifest() {
+        let mut m = HashMap::new();
+        m.insert(
+            "pump".to_string(),
+            consumer("publish_out", "stream.publish", 8192),
+        );
+        validate_port_capabilities(&edge(), &m).unwrap();
+    }
+
+    /// An undeclared requirement is unchecked: a port opts in by naming a
+    /// capability, and silence is not an implicit `request.http`.
+    #[test]
+    fn a_port_without_a_requirement_is_unchecked() {
+        let mut m = HashMap::new();
+        m.insert(
+            "pump".to_string(),
+            Manifest {
+                ports: vec![PortSpec {
+                    name: Some("publish_out".to_string()),
+                    ..port_default()
+                }],
+                ..Manifest::default()
+            },
+        );
+        m.insert("sink".to_string(), provider(&["telemetry.sink"], None));
+        validate_port_capabilities(&edge(), &m).unwrap();
     }
 }

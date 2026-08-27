@@ -23,11 +23,24 @@ Source: `modules/sdk/contracts/net/`.
 | `identity.rs` | address control | `0x60..0x61` | live: net identity self-registration |
 | `session_ctrl.rs` | session control | `0x70..0x9F` | live: `echo_anchor` / `echo_worker` fixtures |
 | `mux.rs` | multiplexed session | `0xB0..0xCF` | live: `quic`, `mux_echo` fixture |
+| `../exchange.rs` | ordered-ack record exchange | `0xED..0xEF` | live: downstream broker, queue and table sinks, and the producers that feed them |
 
-All six files share the 3-byte TLV header
-`[msg_type: u8][len: u16 LE]`, so the `net_read_frame` /
-`net_write_frame` helpers in `modules/sdk/runtime/net.rs` work
-unchanged on every surface. Opcode ranges are disjoint across the
+The exchange row sits outside `contracts/net/` — it is an application-effect
+surface rather than a transport, and it rides whatever transport its provider
+speaks. It is listed here because it shares the same envelope and must hold a
+disjoint opcode range: the 0xE0..0xEF band is reserved for it.
+
+Every row above shares the 3-byte TLV header `[msg_type: u8][len: u16 LE]`,
+so the `net_read_frame` / `net_write_frame` helpers in
+`modules/sdk/runtime/net.rs` work unchanged on all of them.
+
+`contracts/net/ws_frame.rs` is the seventh file in that directory and
+deliberately carries no row: it defines a connection-addressed envelope
+(`[conn: u32][opcode: u8][fin: u8][payload_len: u16]`) rather than a
+message-type range, so it holds no opcodes and the TLV helpers do not apply
+to it.
+
+Opcode ranges are disjoint across the
 files that can share a channel, so a misconfigured channel fails
 loudly rather than silently misparsing. The one numeric overlap is
 `identity.rs` (`ADDR_ADD` 0x60 / `ADDR_DEL` 0x61 inside the packet

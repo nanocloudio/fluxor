@@ -446,6 +446,7 @@ fn generate_config_impl(
     // (rfc_protocols.md §7.3). Graphs without a `continuity` block are
     // unaffected.
     validate_continuity(config, &module_names, &manifests)?;
+    validate_port_capabilities(config, &manifests)?;
 
     // Single-provider-per-contract. Providers auto-register in
     // module-index order onto a bounded dispatch stack that returns the

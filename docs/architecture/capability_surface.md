@@ -275,7 +275,23 @@ Replication and streaming:
 | Capability | Meaning |
 |------------|---------|
 | `replication.state_machine` | Replicated commit-and-apply surface: per-entry committed stream, accepted-into-WAL index echo, quorum-durability notice, snapshot install / export, apply-pipeline reset |
-| `stream.sink.ordered_ack` | Ordered-publish egress sink answering durable acks and link-state signals over the `cdc_wire` port pair; the wire contract is owned by lattice |
+| `stream.ordered_ack` | Ordered-publish surface answering durable acks and link-state signals; the parent a consumer requires when it only publishes, satisfied by either role below. Wire contract: `modules/sdk/contracts/exchange.rs` |
+| `stream.ordered_ack.sink` | A provider that accepts records and does not answer with data: an MQTT topic, a Kafka partition, an INSERT |
+| `stream.ordered_ack.exchange` | A provider that additionally answers each publish with data on the same correlation: an HTTP GET, a SELECT |
+| `stream.line` | Line- or byte-delimited text stream: one command's output feeding the next command's input, unidirectional, backpressured by the channel, with no correlation and no acks |
+| `stream.publish` | Substitutable fire-and-collect publish surface — what a pipeline stage or a program binds. Generalises `stream.ordered_ack`, which additionally promises the durable-ack session protocol |
+| `stream.subscribe` | Substitutable subscribe surface: records delivered to a stage, with the delivery guarantee and replay support declared as facts |
+| `request.http` | Substitutable HTTP request surface |
+| `request.record` | Substitutable record-query surface (a table, a key-value store) |
+
+The last four are application-EFFECT surfaces: what a graph binds when a
+stage publishes, subscribes, or calls out, as opposed to the transport it
+rides. Profile differences between providers are capability FACTS, never
+name forks — `stream.publish` with `broadcast = "fanout"` is Kafka's genuine
+multi-partition ack, and with `broadcast = "degenerate"` is MQTT's single
+ordering unit. The admitted facts and their values are
+`CAPABILITY_FACTS` in `contracts/src/vocabulary.rs`; unknown names and
+unadmitted values are rejected at manifest parse.
 
 `replication.state_machine` sits one layer above the storage
 read / write / durability surfaces: its index echo, snapshot callbacks, and

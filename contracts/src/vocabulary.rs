@@ -88,14 +88,188 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "fence.enforceable",
     "durable.rpo_zero",
     "replication.state_machine",
-    // Streaming egress sink (lattice CDC RFC §11): the provider accepts
-    // ordered publishes and answers durable acks + link-state signals
-    // over the `cdc_wire` port pair. Wire contract and conformance
-    // vectors are owned by lattice (`modules/common/cdc_wire.rs`);
-    // providers in any repo declare this string and run the vectors in
-    // their own CI.
-    "stream.sink.ordered_ack",
+    // The ordered-ack exchange surface (`modules/sdk/contracts/exchange.rs`):
+    // ordered publishes in, durable acks out, and — for a provider that
+    // answers — a reply carrying data on the same correlation.
+    //
+    // Three names — one parent and two roles — because the roles are not
+    // interchangeable in both directions. An exchange does everything a sink
+    // does and more, so a consumer that only publishes requires the PARENT
+    // and the parent-matches-child rule accepts either role; a consumer that
+    // needs an answer requires `.exchange`, which a sink correctly fails to
+    // satisfy.
+    "stream.ordered_ack",
+    "stream.ordered_ack.sink",
+    "stream.ordered_ack.exchange",
+    // ── Effect surfaces ────────────────────────────────────────────────
+    // Substitutable application-effect providers: what a graph binds when a
+    // stage publishes, subscribes, or calls out, as opposed to the transport
+    // it rides. Named domain-leading like every other entry (`stream.*`,
+    // `request.*`) — there is no `effect.` meta-prefix, because every name in
+    // this registry already denotes one.
+    //
+    // `stream.publish` generalises `stream.ordered_ack`. The narrower name
+    // is a capability of its own rather than a fact on this one, because it
+    // additionally promises the durable-ack session protocol in
+    // `modules/sdk/contracts/exchange.rs` — link-state signals and
+    // replay-after-LINK_DOWN, which is NOT a plain call. `stream.publish` is
+    // the substitutable fire-and-collect surface a pipeline stage or a
+    // program binds. A provider may declare both.
+    //
+    // Profile differences are CAPABILITY FACTS (`CAPABILITY_FACTS` below),
+    // never name forks: `stream.publish` with `broadcast = "fanout"` is
+    // Kafka's genuine multi-partition ack, and with `broadcast =
+    // "degenerate"` is MQTT's single ordering unit.
+    "stream.publish",
+    "stream.subscribe",
+    // A line-oriented text stream: the shell-pipe surface. One command's
+    // output feeds the next command's input, unidirectional, backpressured by
+    // the channel, with no correlation and no acks — deliberately NOT the
+    // ordered-ack surface, which exists to answer "did this record land
+    // durably?", a question a pipe never asks.
+    //
+    // Declared by a producer, required by a consuming port: the pairing of
+    // an output stream to the input it feeds is otherwise a naming
+    // convention with nothing verifying the join.
+    "stream.line",
+    "request.http",
+    "request.record",
 ];
+
+/// The values one fact admits: an enumerated set, or [`FACT_NUMERIC`] when
+/// the fact takes a `u32`.
+pub type FactValues = &'static [&'static str];
+
+/// One fact and what it admits — `("ordering", &["per_key", "single"])`.
+pub type Fact = (&'static str, FactValues);
+
+/// One capability and the facts it carries.
+pub type CapabilityFacts = (&'static str, &'static [Fact]);
+
+/// Facts a capability carries, and the values each fact admits.
+///
+/// The capability name says WHAT a provider offers; a fact says on what
+/// terms. Keeping terms as facts rather than name forks is what lets one
+/// consumer requirement match an MQTT, Kafka or AMQP provider alike while
+/// still refusing the one whose terms are too weak — the rule the
+/// capability-surface document states for quantitative constraints.
+///
+/// A fact whose admitted-value list is [`FACT_NUMERIC`] takes a `u32`
+/// instead of an enumerated string. `max_payload` is the load-bearing one:
+/// a provider's ceiling is whatever THAT provider can accept — a broker
+/// build, a frame negotiation, a column width — and in practice it lands
+/// far below the suite's 8192-byte record. It cannot be inferred from the
+/// protocol name, which is exactly why it is a declared fact; validating it
+/// against the producing port's `max_record` is what turns a runtime
+/// OVERSIZE refusal into a build failure.
+///
+/// Unknown fact names and unadmitted values are rejected at manifest parse
+/// with a did-you-mean, for the same reason the name registries exist: a
+/// typo in `ordering` must not read as "unconstrained".
+pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
+    (
+        // Declared on the PARENT: `.sink` and `.exchange` differ only in
+        // whether an answer comes back, which the name already says, so the
+        // terms below are the same for both and are stated once. Whether a
+        // provider replies is deliberately NOT a fact — a second spelling of
+        // the role could contradict the name.
+        "stream.ordered_ack",
+        &[
+            ("ack", &["durable", "transport", "none"]),
+            ("ordering", &["per_key", "single", "none"]),
+            ("broadcast", &["fanout", "degenerate", "unsupported"]),
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
+    (
+        "stream.publish",
+        &[
+            // Whether an ack means the provider durably accepted the record,
+            // or merely wrote it to a socket.
+            ("ack", &["durable", "transport", "none"]),
+            // Ordering the provider guarantees between records sharing a key.
+            ("ordering", &["per_key", "single", "none"]),
+            // Whether a broadcast is a genuine fan-out the provider acks
+            // across every ordering unit (Kafka), or degenerates to a plain
+            // publish because there is only one (MQTT, AMQP).
+            ("broadcast", &["fanout", "degenerate", "unsupported"]),
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
+    (
+        "stream.line",
+        &[
+            // Whether the stream is delimited into lines or is an opaque
+            // byte run: a byte-oriented producer feeding a line-oriented
+            // consumer is a mismatch the port types alone do not catch.
+            ("framing", &["line", "byte"]),
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
+    (
+        "stream.subscribe",
+        &[
+            (
+                "delivery",
+                &["at_least_once", "at_most_once", "exactly_once"],
+            ),
+            ("replay", &["yes", "no"]),
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
+    (
+        "request.http",
+        &[
+            ("tls", &["yes", "no"]),
+            ("streaming_body", &["yes", "no"]),
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
+    (
+        "request.record",
+        &[("txn", &["yes", "no"]), ("max_payload", FACT_NUMERIC)],
+    ),
+];
+
+/// Marker for a fact whose value is a `u32` rather than one of an
+/// enumerated set. Compared by identity of the empty slice's contents, so a
+/// fact table entry spells it as this constant rather than `&[]`.
+pub const FACT_NUMERIC: FactValues = &["<u32>"];
+
+/// The facts admitted for `capability`, or `None` when the capability
+/// carries none.
+pub fn facts_for(capability: &str) -> Option<&'static [Fact]> {
+    capability_and_parents(capability).find_map(|probe| {
+        CAPABILITY_FACTS
+            .iter()
+            .find(|(name, _)| *name == probe)
+            .map(|(_, facts)| *facts)
+    })
+}
+
+/// `capability` followed by each of its dot-separated parents, most
+/// specific first: `a.b.c`, then `a.b`, then `a`.
+///
+/// Sibling roles under one parent (`stream.ordered_ack.sink` and
+/// `.exchange`) share the parent's fact schema rather than repeating it, so
+/// resolving a name means walking this sequence. Both the registry lookup
+/// above and the build-time manifest checks use the same walk, so a name
+/// resolves identically wherever it is read.
+pub fn capability_and_parents(capability: &str) -> impl Iterator<Item = &str> {
+    let mut next = Some(capability);
+    core::iter::from_fn(move || {
+        let current = next?;
+        next = current.rfind('.').map(|dot| &current[..dot]);
+        Some(current)
+    })
+}
+
+/// Whether `fact` on `capability` takes a numeric value.
+pub fn fact_is_numeric(capability: &str, fact: &str) -> bool {
+    facts_for(capability)
+        .and_then(|facts| facts.iter().find(|(name, _)| *name == fact))
+        .is_some_and(|(_, admitted)| *admitted == FACT_NUMERIC)
+}
 
 /// Canonical provider-contract names accepted in
 /// `[[resources]].requires_contract`. Lowercase `snake_case` naming a stable
