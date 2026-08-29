@@ -453,6 +453,15 @@ pub mod timer {
     /// and comes forward again is invisible.
     pub const TRUSTED_UNIX: u32 = 0x0609;
     /// Create a timer fd. handle=-1. Returns tagged timer fd.
+    ///
+    /// A timer is an fd in every sense that matters: `SET` arms it, the
+    /// generic fd `POLL` reports `POLL_IN` once it has fired, and the KERNEL
+    /// steps the owning module when it fires — the owner's wake bit latches
+    /// exactly as an event's does, once per arming, and the earliest armed
+    /// timer bounds the pacer's sleep, relaxed idle backstop included. So a
+    /// module that arms 5 ms is stepped at ~5 ms on an idle domain whose
+    /// backstop is 50 ms, not at 50: a module waits on its timer rather than
+    /// polling the clock on a tick it does not control.
     pub const CREATE: u32 = 0x0604;
     /// Start/restart timer. handle=timer_fd, arg[0..4]=delay_ms (LE).
     pub const SET: u32 = 0x0605;

@@ -50,6 +50,12 @@ struct TimerSlot {
     owner: AtomicU8,
     /// Deadline in milliseconds (from Instant epoch), wrapping-safe comparison
     deadline_ms: AtomicU32,
+    /// The owner has been woken for THIS arming. A timer is an fd: the
+    /// kernel steps its owner once when it fires (`timer_pump`), and the
+    /// owner reads `POLL_IN` and re-arms or cancels. Without the latch an
+    /// expired-but-unconsumed timer would wake its owner every pass — a
+    /// level, where a fire is an edge. Cleared by SET / CANCEL / DESTROY.
+    woken: AtomicBool,
 }
 
 impl TimerSlot {
@@ -59,6 +65,7 @@ impl TimerSlot {
             active: AtomicBool::new(false),
             owner: AtomicU8::new(0xFF),
             deadline_ms: AtomicU32::new(0),
+            woken: AtomicBool::new(false),
         }
     }
 }
@@ -88,6 +95,7 @@ pub fn timer_create() -> i32 {
             timer.active.store(false, Ordering::Release);
             timer.owner.store(owner, Ordering::Release);
             timer.deadline_ms.store(0, Ordering::Release);
+            timer.woken.store(false, Ordering::Release);
             return tag_fd(FD_TAG_TIMER, i as i32);
         }
     }
@@ -116,6 +124,7 @@ pub fn timer_set(fd: i32, delay_ms: u32) -> i32 {
     }
     let deadline = now_ms().wrapping_add(delay_ms);
     timer.deadline_ms.store(deadline, Ordering::Release);
+    timer.woken.store(false, Ordering::Release);
     timer.active.store(true, Ordering::Release);
     0
 }
@@ -131,6 +140,7 @@ pub fn timer_cancel(fd: i32) -> i32 {
         return errno::EINVAL;
     }
     timer.active.store(false, Ordering::Release);
+    timer.woken.store(false, Ordering::Release);
     0
 }
 
@@ -145,9 +155,53 @@ pub fn timer_destroy(fd: i32) -> i32 {
         return errno::EINVAL;
     }
     timer.active.store(false, Ordering::Release);
+    timer.woken.store(false, Ordering::Release);
     timer.owner.store(0xFF, Ordering::Release);
     timer.allocated.store(false, Ordering::Release);
     0
+}
+
+/// The kernel's side of "a timer is an fd": service every armed timer once
+/// per pacing pass. An expired timer whose owner has not yet been woken for
+/// this arming latches the owner's wake bit — exactly what `event_signal`
+/// does for an event — so `step_woken_modules` runs it and it finds
+/// `POLL_IN`. Bounded scan of `MAX_TIMERS` slots; the woken latch makes a
+/// fire an edge, not a level.
+///
+/// Returns the milliseconds until the earliest armed timer OWNED BY
+/// `domain_id` that has not yet fired, so that domain's pacer can bound its
+/// sleep to it — a timer is serviced when it fires, not at the adaptive
+/// backstop. `None` when the domain has no pending armed timer, meaning
+/// nothing bounds its sleep. Firing is domain-blind and the deadline is not:
+/// whichever domain pumps first latches the owner's wake bit, but only the
+/// owner's own domain shortens its sleep for it, so a sibling domain's
+/// 5 ms timer cannot drag this one off its backstop.
+pub fn timer_pump(domain_id: u8) -> Option<u32> {
+    let now = now_ms();
+    let mut earliest: Option<u32> = None;
+    for timer in TIMER_SLOTS.iter() {
+        if !timer.allocated.load(Ordering::Acquire) || !timer.active.load(Ordering::Acquire) {
+            continue;
+        }
+        let owner = timer.owner.load(Ordering::Acquire) as usize;
+        if owner == 0xFF {
+            continue;
+        }
+        let deadline = timer.deadline_ms.load(Ordering::Acquire);
+        let delta = deadline.wrapping_sub(now) as i32;
+        if delta <= 0 {
+            if !timer.woken.swap(true, Ordering::AcqRel) {
+                let _ = event::latch_module_wake(owner);
+            }
+            continue;
+        }
+        if crate::kernel::exec::scheduler::module_domain_id(owner) != domain_id {
+            continue;
+        }
+        let remaining = delta as u32;
+        earliest = Some(earliest.map_or(remaining, |e| e.min(remaining)));
+    }
+    earliest
 }
 
 /// Non-destructive check: has this timer expired?
@@ -175,6 +229,7 @@ pub fn release_timers_owned_by(module_idx: u8) {
             continue;
         }
         timer.active.store(false, Ordering::Release);
+        timer.woken.store(false, Ordering::Release);
         timer.owner.store(0xFF, Ordering::Release);
         timer.allocated.store(false, Ordering::Release);
     }
@@ -292,7 +347,8 @@ pub fn fd_poll(fd: i32, events: u8) -> i32 {
 /// Poll multiple fds in one call. Returns count of fds with ready events.
 ///
 /// For each fd, writes the ready bitmask to `ready[i]` (0 if nothing ready or error).
-/// This is the `select()`/`epoll()` equivalent for modules.
+/// Non-destructive, like `fd_poll`: a module asks which of its handles are
+/// ready in one call, then consumes through each handle's own API.
 pub fn fd_poll_multi(fds: &[i32], events: &[u8], ready: &mut [u8]) -> i32 {
     let mut count = 0i32;
     for i in 0..fds.len() {

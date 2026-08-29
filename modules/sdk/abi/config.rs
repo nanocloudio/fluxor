@@ -124,13 +124,21 @@ mod profile_host {
         /// individual channels at 16-64 KiB without exhausting
         /// the arena under sustained gigabit-class loads.
         pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
-        // Multi-workload: 128 lets the system substrate plus several workload
-        // subgraphs co-reside on aarch64 (bcm2712 / linux). 128 keeps every module index
+        // Multi-workload: the system substrate plus several workload subgraphs
+        // co-resident on aarch64 (bcm2712 / linux). Every module index stays
         // within the scheduler's u8 index domain (`exec_order: [u8; _]`,
-        // `module_idx as u8`); going past 256 requires widening those ids to
-        // u16. The `ModuleMask` bitmaps scale to match (MODULE_MASK_WORDS == 2
-        // here). Edge capacity is the global MAX_GRAPH_EDGES.
-        pub const MAX_MODULES: usize = 128;
+        // `module_idx as u8`), which is what bounds this at 256 — past that the
+        // ids widen to u16. The `ModuleMask` bitmaps scale to match
+        // (MODULE_MASK_WORDS == 3 here). Edge capacity is MAX_GRAPH_EDGES.
+        //
+        // 128 -> 192: a control plane whose controllers are PARAMS is counted
+        // in decisions and connectors rather than in modules. nanocloud's
+        // all-in-one graph is 100 nodes of control plane plus a 35-node node
+        // plane, and the two cannot be split across processes — the linux store
+        // is deliberately single-writer with no `flock`, so one runtime owns
+        // the WAL. This is per-target (wasm32 48, Cortex-M 32 below), so the
+        // scheduler's static tables grow on aarch64 only.
+        pub const MAX_MODULES: usize = 192;
         /// Loader sanity ceiling for a single module's code segment.
         /// 1 MiB fits media modules (the unified codec's decoder plus
         /// its CAVLC/clip tables runs ~450 KiB) and protocol modules

@@ -103,12 +103,14 @@ pub mod suite {
 
     /// Whether this build can actually verify a signature in `suite`.
     ///
-    /// Only P-256 today. The rest are named so sizes, policies and error
-    /// reporting are already suite-shaped; the primitives live in
-    /// `src/kernel/security/crypto/` and are a separate body of work.
+    /// P-256 and the three ML-DSA parameter sets. P-384 and Ed25519 are
+    /// named but not verified here: the ids exist so sizes, policies and
+    /// error reporting are suite-shaped ahead of the primitives, and
+    /// `verify_chain` refuses anything this returns false for rather than
+    /// treating an unrecognised algorithm as an unchecked one.
     #[must_use]
     pub const fn is_implemented(suite: u16) -> bool {
-        matches!(suite, ECDSA_P256_SHA256)
+        matches!(suite, ECDSA_P256_SHA256 | ML_DSA_44 | ML_DSA_65 | ML_DSA_87)
     }
 
     /// Classical-equivalent security level in bits. Used to detect a
@@ -189,7 +191,21 @@ pub mod suite {
     }
 
     /// Every suite this build can verify. The sane default for a policy.
-    pub const IMPLEMENTED: u32 = mask(ECDSA_P256_SHA256);
+    ///
+    /// Derived from [`is_implemented`] rather than listed again, so a
+    /// suite cannot become verifiable without becoming permissible by
+    /// default — or, worse, the reverse.
+    pub const IMPLEMENTED: u32 = {
+        let mut allowed = 0u32;
+        let mut suite = 1u16;
+        while suite <= MAX_ID {
+            if is_implemented(suite) {
+                allowed |= mask(suite);
+            }
+            suite += 1;
+        }
+        allowed
+    };
 
     /// Short stable token for a suite, for the operator-facing log line.
     #[must_use]
@@ -244,24 +260,40 @@ const KU_KEY_CERT_SIGN: u16 = 1 << 5;
 /// several byte representations, which breaks the assumption that
 /// signing the bytes signs the structure.
 fn der_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
-    if pos >= data.len() { return None; }
+    if pos >= data.len() {
+        return None;
+    }
     let first = data[pos];
     if first < 0x80 {
         Some((first as usize, 1))
     } else if first == 0x81 {
-        if pos + 1 >= data.len() { return None; }
+        if pos + 1 >= data.len() {
+            return None;
+        }
         let len = data[pos + 1] as usize;
-        if len < 0x80 { return None; } // must have used the short form
+        if len < 0x80 {
+            return None;
+        } // must have used the short form
         Some((len, 2))
     } else if first == 0x82 {
-        if pos + 2 >= data.len() { return None; }
-        if data[pos + 1] == 0 { return None; } // non-minimal
+        if pos + 2 >= data.len() {
+            return None;
+        }
+        if data[pos + 1] == 0 {
+            return None;
+        } // non-minimal
         let len = ((data[pos + 1] as usize) << 8) | (data[pos + 2] as usize);
         Some((len, 3))
     } else if first == 0x83 {
-        if pos + 3 >= data.len() { return None; }
-        if data[pos + 1] == 0 { return None; } // non-minimal
-        let len = ((data[pos + 1] as usize) << 16) | ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
+        if pos + 3 >= data.len() {
+            return None;
+        }
+        if data[pos + 1] == 0 {
+            return None;
+        } // non-minimal
+        let len = ((data[pos + 1] as usize) << 16)
+            | ((data[pos + 2] as usize) << 8)
+            | (data[pos + 3] as usize);
         Some((len, 4))
     } else {
         None
@@ -270,11 +302,15 @@ fn der_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
 
 /// Parse DER tag+length, return (content_start, content_length, total_consumed)
 fn der_tlv(data: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
-    if pos >= data.len() { return None; }
+    if pos >= data.len() {
+        return None;
+    }
     let _tag = data[pos];
     let (len, len_bytes) = der_length(data, pos + 1)?;
     let content_start = pos + 1 + len_bytes;
-    if content_start + len > data.len() { return None; }
+    if content_start + len > data.len() {
+        return None;
+    }
     Some((content_start, len, 1 + len_bytes + len))
 }
 
@@ -457,32 +493,50 @@ pub struct X509Cert<'a> {
 ///     is located by guessing an index.
 pub fn parse_certificate(cert: &[u8]) -> Option<X509Cert<'_>> {
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
-    if cert.len() < 10 { return None; }
-    if cert[0] != TAG_SEQUENCE { return None; }
+    if cert.len() < 10 {
+        return None;
+    }
+    if cert[0] != TAG_SEQUENCE {
+        return None;
+    }
     let (cert_start, cert_len, cert_total) = der_tlv(cert, 0)?;
-    if cert_total != cert.len() { return None; } // trailing bytes
+    if cert_total != cert.len() {
+        return None;
+    } // trailing bytes
     let cert_end = cert_start + cert_len;
 
     // Parse TBSCertificate
     let tbs_tag_pos = cert_start;
-    if cert[tbs_tag_pos] != TAG_SEQUENCE { return None; }
+    if cert[tbs_tag_pos] != TAG_SEQUENCE {
+        return None;
+    }
     let (tbs_start, tbs_len, tbs_total) = der_tlv(cert, tbs_tag_pos)?;
     let tbs_raw = &cert[tbs_tag_pos..tbs_tag_pos + tbs_total];
 
     // Parse signatureAlgorithm
     let sig_alg_pos = tbs_tag_pos + tbs_total;
-    if sig_alg_pos >= cert_end { return None; }
-    if cert[sig_alg_pos] != TAG_SEQUENCE { return None; }
+    if sig_alg_pos >= cert_end {
+        return None;
+    }
+    if cert[sig_alg_pos] != TAG_SEQUENCE {
+        return None;
+    }
     let (_sa_start, _sa_len, sa_total) = der_tlv(cert, sig_alg_pos)?;
     let sig_alg = extract_oid(cert, sig_alg_pos)?;
     let sig_suite = suite_from_signature_oid(sig_alg);
 
     // Parse signatureValue (BIT STRING)
     let sig_pos = sig_alg_pos + sa_total;
-    if sig_pos >= cert_end || cert[sig_pos] != TAG_BIT_STRING { return None; }
+    if sig_pos >= cert_end || cert[sig_pos] != TAG_BIT_STRING {
+        return None;
+    }
     let (sig_start, sig_len, sig_total) = der_tlv(cert, sig_pos)?;
-    if sig_pos + sig_total != cert_end { return None; } // trailing bytes
-    if sig_len < 2 || cert[sig_start] != 0 { return None; } // unused-bits must be 0
+    if sig_pos + sig_total != cert_end {
+        return None;
+    } // trailing bytes
+    if sig_len < 2 || cert[sig_start] != 0 {
+        return None;
+    } // unused-bits must be 0
     let signature = &cert[sig_start + 1..sig_start + sig_len];
 
     let tbs = parse_tbs(cert, tbs_start, tbs_len)?;
@@ -490,7 +544,9 @@ pub fn parse_certificate(cert: &[u8]) -> Option<X509Cert<'_>> {
     // The inner `tbsCertificate.signature` must name the same
     // algorithm; a mismatch means the signature covers a claim the
     // outer field contradicts.
-    if tbs.inner_sig_alg != sig_alg { return None; }
+    if tbs.inner_sig_alg != sig_alg {
+        return None;
+    }
 
     // A signature longer than its suite allows is not that suite's
     // signature. Refused here so no verifier is handed a length its
@@ -542,33 +598,47 @@ fn parse_tbs(cert: &[u8], start: usize, len: usize) -> Option<Tbs<'_>> {
         pos += total;
     }
     // serialNumber
-    if pos >= end || cert[pos] != TAG_INTEGER { return None; }
+    if pos >= end || cert[pos] != TAG_INTEGER {
+        return None;
+    }
     let (_, _, total) = der_tlv(cert, pos)?;
     pos += total;
     // signature AlgorithmIdentifier
-    if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
+    if pos >= end || cert[pos] != TAG_SEQUENCE {
+        return None;
+    }
     let inner_sig_alg = extract_oid(cert, pos)?;
     let (_, _, total) = der_tlv(cert, pos)?;
     pos += total;
     // issuer Name
-    if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
+    if pos >= end || cert[pos] != TAG_SEQUENCE {
+        return None;
+    }
     let (_, _, total) = der_tlv(cert, pos)?;
     let issuer_raw = &cert[pos..pos + total];
     pos += total;
     // validity SEQUENCE { notBefore, notAfter }
-    if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
+    if pos >= end || cert[pos] != TAG_SEQUENCE {
+        return None;
+    }
     let (v_start, v_len, total) = der_tlv(cert, pos)?;
     let (not_before, nb_total) = parse_time(cert, v_start)?;
     let (not_after, na_total) = parse_time(cert, v_start + nb_total)?;
-    if nb_total + na_total != v_len { return None; } // exactly two times
+    if nb_total + na_total != v_len {
+        return None;
+    } // exactly two times
     pos += total;
     // subject Name
-    if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
+    if pos >= end || cert[pos] != TAG_SEQUENCE {
+        return None;
+    }
     let (_, _, total) = der_tlv(cert, pos)?;
     let subject_raw = &cert[pos..pos + total];
     pos += total;
     // subjectPublicKeyInfo
-    if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
+    if pos >= end || cert[pos] != TAG_SEQUENCE {
+        return None;
+    }
     let (spki_start, spki_len, total) = der_tlv(cert, pos)?;
     let (key_suite, public_key) = extract_pubkey(cert, spki_start, spki_len)?;
     pos += total;
@@ -586,14 +656,20 @@ fn parse_tbs(cert: &[u8], start: usize, len: usize) -> Option<Tbs<'_>> {
     let mut ext_len = 0usize;
     if pos < end && cert[pos] == TAG_CONTEXT_3 {
         let (e_start, e_len, total) = der_tlv(cert, pos)?;
-        if e_start >= cert.len() || cert[e_start] != TAG_SEQUENCE { return None; }
+        if e_start >= cert.len() || cert[e_start] != TAG_SEQUENCE {
+            return None;
+        }
         let (s_start, s_len, s_total) = der_tlv(cert, e_start)?;
-        if s_total != e_len { return None; } // one SEQUENCE, no trailing bytes
+        if s_total != e_len {
+            return None;
+        } // one SEQUENCE, no trailing bytes
         ext_off = s_start;
         ext_len = s_len;
         pos += total;
     }
-    if pos != end { return None; } // no unexpected trailing TBS members
+    if pos != end {
+        return None;
+    } // no unexpected trailing TBS members
 
     Some(Tbs {
         inner_sig_alg,
@@ -615,14 +691,18 @@ fn parse_tbs(cert: &[u8], start: usize, len: usize) -> Option<Tbs<'_>> {
 /// requires `Z`, and a local-time offset would make a certificate's lifetime
 /// depend on where it is read.
 fn parse_time(data: &[u8], pos: usize) -> Option<(u64, usize)> {
-    if pos >= data.len() { return None; }
+    if pos >= data.len() {
+        return None;
+    }
     let tag = data[pos];
     let (start, len, total) = der_tlv(data, pos)?;
     let body = &data[start..start + len];
     let (year, rest) = match tag {
         TAG_UTC_TIME => {
             // YYMMDDHHMMSSZ
-            if body.len() != 13 || body[12] != b'Z' { return None; }
+            if body.len() != 13 || body[12] != b'Z' {
+                return None;
+            }
             let yy = two_digits(body, 0)? as u32;
             // RFC 5280 §4.1.2.5.1: 00..49 is 2000..2049, 50..99 is 1950..1999.
             let year = if yy < 50 { 2000 + yy } else { 1900 + yy };
@@ -630,7 +710,9 @@ fn parse_time(data: &[u8], pos: usize) -> Option<(u64, usize)> {
         }
         TAG_GENERALIZED_TIME => {
             // YYYYMMDDHHMMSSZ
-            if body.len() != 15 || body[14] != b'Z' { return None; }
+            if body.len() != 15 || body[14] != b'Z' {
+                return None;
+            }
             let year = (two_digits(body, 0)? as u32) * 100 + two_digits(body, 2)? as u32;
             (year, &body[4..14])
         }
@@ -655,10 +737,14 @@ fn parse_time(data: &[u8], pos: usize) -> Option<(u64, usize)> {
 }
 
 fn two_digits(b: &[u8], at: usize) -> Option<u8> {
-    if at + 1 >= b.len() { return None; }
+    if at + 1 >= b.len() {
+        return None;
+    }
     let hi = b[at];
     let lo = b[at + 1];
-    if !hi.is_ascii_digit() || !lo.is_ascii_digit() { return None; }
+    if !hi.is_ascii_digit() || !lo.is_ascii_digit() {
+        return None;
+    }
     Some((hi - b'0') * 10 + (lo - b'0'))
 }
 
@@ -744,12 +830,16 @@ fn extract_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<(u1
     let end = spki_start + spki_len;
 
     // AlgorithmIdentifier SEQUENCE { algorithm OID [, parameters OID] }
-    if pos >= end || cert[pos] != TAG_SEQUENCE { return None; }
+    if pos >= end || cert[pos] != TAG_SEQUENCE {
+        return None;
+    }
     let (alg_start, alg_len, alg_total) = der_tlv(cert, pos)?;
     let alg_end = alg_start + alg_len;
 
     let mut ap = alg_start;
-    if ap >= alg_end || cert[ap] != TAG_OID { return None; }
+    if ap >= alg_end || cert[ap] != TAG_OID {
+        return None;
+    }
     let (a_start, a_len, a_total) = der_tlv(cert, ap)?;
     let alg_oid = &cert[a_start..a_start + a_len];
     ap += a_total;
@@ -757,7 +847,9 @@ fn extract_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<(u1
     let key_suite = if alg_oid == OID_EC_PUBKEY {
         // EC keys name their curve in `parameters`, and the curve is what
         // decides the suite — `ecPublicKey` alone says nothing about size.
-        if ap >= alg_end || cert[ap] != TAG_OID { return None; }
+        if ap >= alg_end || cert[ap] != TAG_OID {
+            return None;
+        }
         let (c_start, c_len, c_total) = der_tlv(cert, ap)?;
         let curve = &cert[c_start..c_start + c_len];
         ap += c_total;
@@ -784,15 +876,23 @@ fn extract_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<(u1
             suite::UNKNOWN
         }
     };
-    if ap != alg_end { return None; } // no extra AlgorithmIdentifier members
+    if ap != alg_end {
+        return None;
+    } // no extra AlgorithmIdentifier members
 
     pos += alg_total;
 
     // subjectPublicKey BIT STRING
-    if pos >= end || cert[pos] != TAG_BIT_STRING { return None; }
+    if pos >= end || cert[pos] != TAG_BIT_STRING {
+        return None;
+    }
     let (bs_start, bs_len, bs_total) = der_tlv(cert, pos)?;
-    if bs_len < 2 || cert[bs_start] != 0 { return None; } // whole-octet only
-    if pos + bs_total != end { return None; } // SPKI has exactly two members
+    if bs_len < 2 || cert[bs_start] != 0 {
+        return None;
+    } // whole-octet only
+    if pos + bs_total != end {
+        return None;
+    } // SPKI has exactly two members
     let key_bytes = &cert[bs_start + 1..bs_start + bs_len];
 
     // A key longer than its suite can hold is not that suite's key. Checked
@@ -1074,7 +1174,12 @@ fn parse_eku(cert: &[u8], start: usize, len: usize, out: &mut CertExts) -> bool 
 
 /// Walk a SAN extension value yielding each `dNSName`. `callback` returning
 /// true stops the walk. Returns true if at least one `dNSName` was present.
-fn walk_san_dns(cert: &[u8], start: usize, len: usize, callback: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn walk_san_dns(
+    cert: &[u8],
+    start: usize,
+    len: usize,
+    callback: &mut impl FnMut(&[u8]) -> bool,
+) -> bool {
     if len == 0 || cert[start] != TAG_SEQUENCE {
         return false;
     }
@@ -1259,21 +1364,98 @@ pub fn is_ip_literal(name: &[u8]) -> bool {
 // Signature verification
 // ======================================================================
 
-/// Verify ECDSA-SHA256 signature on a certificate
-pub fn verify_cert_signature(cert_bytes: &[u8], issuer_pubkey: &[u8]) -> bool {
+/// The ML-DSA parameter set a CERTIFICATE suite names.
+///
+/// The crossing between this module's suite registry and the primitive's
+/// own naming is this one function, so certificate ids can be renumbered
+/// without the assumption leaking into every call site.
+#[must_use]
+fn ml_dsa_set_for(cert_suite: u16) -> Option<MlDsaSet> {
+    match cert_suite {
+        suite::ML_DSA_44 => Some(MlDsaSet::MlDsa44),
+        suite::ML_DSA_65 => Some(MlDsaSet::MlDsa65),
+        suite::ML_DSA_87 => Some(MlDsaSet::MlDsa87),
+        _ => None,
+    }
+}
+
+/// Whether `key` is a well-formed public key for `suite`.
+///
+/// Suite-aware because what the key bytes MEAN depends on the suite: the
+/// P-256 check is a curve-membership test, and running it over a lattice
+/// key would be reinterpreting bytes — the exact confusion the suite
+/// field exists to prevent.
+#[must_use]
+pub fn key_is_valid(suite: u16, key: &[u8]) -> bool {
+    match suite {
+        suite::ECDSA_P256_SHA256 => public_point_is_valid(key),
+        suite::ML_DSA_44 | suite::ML_DSA_65 | suite::ML_DSA_87 => {
+            // A lattice public key has no structure to check beyond its
+            // length: every byte string of the right size decodes, and
+            // whether it decodes to a key anyone holds is what the
+            // signature check answers.
+            key.len() == suite::max_public_key_len(suite)
+        }
+        _ => false,
+    }
+}
+
+/// Verify a certificate's signature under its issuer's public key.
+///
+/// `issuer_key_suite` is what the issuer's OWN certificate said its key
+/// is, and it must match the algorithm this certificate claims to be
+/// signed with. Without that check an ML-DSA-87 signature could be
+/// offered against a key its issuer published as ML-DSA-44 — the
+/// signature would fail, but only by accident of length, and a suite
+/// whose sizes happened to line up would not fail at all.
+pub fn verify_cert_signature(
+    cert_bytes: &[u8],
+    issuer_key_suite: u16,
+    issuer_pubkey: &[u8],
+) -> bool {
     let cert = match parse_certificate(cert_bytes) {
         Some(c) => c,
         None => return false,
     };
-    if cert.sig_alg != OID_ECDSA_SHA256 {
+    if cert.suite != issuer_key_suite || !key_is_valid(issuer_key_suite, issuer_pubkey) {
         return false;
     }
-    let tbs_hash = sha256(cert.tbs_raw);
-    let raw_sig = match parse_der_signature(cert.signature) {
-        Some(s) => s,
-        None => return false,
-    };
-    ecdsa_verify(issuer_pubkey, &tbs_hash, &raw_sig)
+    match cert.suite {
+        suite::ECDSA_P256_SHA256 => {
+            if cert.sig_alg != OID_ECDSA_SHA256 {
+                return false;
+            }
+            let tbs_hash = sha256(cert.tbs_raw);
+            let raw_sig = match parse_der_signature(cert.signature) {
+                Some(s) => s,
+                None => return false,
+            };
+            ecdsa_verify(issuer_pubkey, &tbs_hash, &raw_sig)
+        }
+        suite::ML_DSA_44 | suite::ML_DSA_65 | suite::ML_DSA_87 => {
+            // The signature is the BIT STRING contents as they stand: no
+            // DER wrapper, no digest step. FIPS 204's pure variant signs
+            // the tbsCertificate bytes themselves, under the empty
+            // context — a certificate is already domain-separated by
+            // everything inside it.
+            let Some(set) = ml_dsa_set_for(cert.suite) else {
+                return false;
+            };
+            if cert.signature.len() != set.params().sig_len {
+                return false;
+            }
+            // The workspace is a LOCAL: a position-independent module has
+            // no `.bss` — its state arrives as a pointer from the kernel —
+            // so a static is not available here at all. One workspace at
+            // the widest dimensions rather than one per set, because a
+            // chain may mix sets and a frame whose size does not depend on
+            // which certificate arrived is the one that can be checked
+            // against the module's stack. 13 KB, of the 64 KB it gets.
+            let mut ws: VerifyWorkspace<L_MAX> = VerifyWorkspace::new();
+            ml_dsa_verify(set, issuer_pubkey, &[], cert.tbs_raw, cert.signature, &mut ws)
+        }
+        _ => false,
+    }
 }
 
 fn pubkey_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1408,9 +1590,10 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
         None => return CERT_ERR_MALFORMED,
     };
     // The suite gate runs before anything reads the key, because what the
-    // key bytes MEAN depends on the suite. `public_point_is_valid` is a
-    // P-256 check; running it on an Ed25519 key would be reinterpreting
-    // bytes, which is the thing the suite field exists to stop.
+    // key bytes MEAN depends on the suite. `key_is_valid` dispatches on
+    // it for that reason: the P-256 branch is a curve-membership test,
+    // and running it over a lattice key would be reinterpreting bytes,
+    // which is the thing the suite field exists to stop.
     let rc = check_suites(&leaf, policy);
     if rc != CERT_OK {
         return rc;
@@ -1419,7 +1602,7 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
     if rc != CERT_OK {
         return rc;
     }
-    if !public_point_is_valid(leaf.public_key) {
+    if !key_is_valid(leaf.key_suite, leaf.public_key) {
         return CERT_ERR_BAD_KEY;
     }
 
@@ -1478,7 +1661,7 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
         if rc != CERT_OK {
             return rc;
         }
-        if !public_point_is_valid(issuer.public_key) {
+        if !key_is_valid(issuer.key_suite, issuer.public_key) {
             return CERT_ERR_BAD_KEY;
         }
         // The issuer's KEY is what verifies `cur`'s signature, so the
@@ -1518,7 +1701,7 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
         if rc != CERT_OK {
             return rc;
         }
-        if !verify_cert_signature(cur_der, anchor.public_key) {
+        if !verify_cert_signature(cur_der, anchor.key_suite, anchor.public_key) {
             return CERT_ERR_SIGNATURE;
         }
     }
@@ -1593,7 +1776,7 @@ fn check_issuer(
     if rc != CERT_OK {
         return rc;
     }
-    if !verify_cert_signature(subject_der, issuer.public_key) {
+    if !verify_cert_signature(subject_der, issuer.key_suite, issuer.public_key) {
         return CERT_ERR_SIGNATURE;
     }
     CERT_OK
@@ -1657,9 +1840,8 @@ pub fn parse_cert_chain<'a>(
         return Err(CERT_ERR_MSG_MALFORMED);
     }
     let mut pos = 1 + ctx_len;
-    let list_len = ((body[pos] as usize) << 16)
-        | ((body[pos + 1] as usize) << 8)
-        | (body[pos + 2] as usize);
+    let list_len =
+        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
     pos += 3;
     let list_end = pos + list_len;
     if list_end > body.len() {
@@ -1726,20 +1908,35 @@ pub fn verify_cert_chain(
 /// `der` is a kernel-owned blob; the body bounds-checks every read
 /// against `der.len()` before indexing.
 pub unsafe fn extract_ec_private_key(der: &[u8], out: &mut [u8; 32]) {
-    if der.len() < 4 { return; }
-    if der[0] != 0x30 { return; }
-    let (seq_start, _seq_len, _) = match der_tlv(der, 0) { Some(v) => v, None => return };
+    if der.len() < 4 {
+        return;
+    }
+    if der[0] != 0x30 {
+        return;
+    }
+    let (seq_start, _seq_len, _) = match der_tlv(der, 0) {
+        Some(v) => v,
+        None => return,
+    };
 
     let mut pos = seq_start;
-    if pos >= der.len() || der[pos] != 0x02 { return; }
-    let (int_start, int_len, int_total) = match der_tlv(der, pos) { Some(v) => v, None => return };
+    if pos >= der.len() || der[pos] != 0x02 {
+        return;
+    }
+    let (int_start, int_len, int_total) = match der_tlv(der, pos) {
+        Some(v) => v,
+        None => return,
+    };
     let version = if int_len == 1 { der[int_start] } else { 0xFF };
     pos += int_total;
 
     if version == 1 {
         // SEC1 ECPrivateKey: OCTET STRING with the private key.
         if pos < der.len() && der[pos] == 0x04 {
-            let (os_start, os_len, _) = match der_tlv(der, pos) { Some(v) => v, None => return };
+            let (os_start, os_len, _) = match der_tlv(der, pos) {
+                Some(v) => v,
+                None => return,
+            };
             if os_len == 32 && os_start + 32 <= der.len() {
                 core::ptr::copy_nonoverlapping(der.as_ptr().add(os_start), out.as_mut_ptr(), 32);
             }
@@ -1748,11 +1945,17 @@ pub unsafe fn extract_ec_private_key(der: &[u8], out: &mut [u8; 32]) {
         // PKCS#8: skip AlgorithmIdentifier, then OCTET STRING with
         // the SEC1 ECPrivateKey nested inside.
         if pos < der.len() && der[pos] == 0x30 {
-            let (_, _, alg_total) = match der_tlv(der, pos) { Some(v) => v, None => return };
+            let (_, _, alg_total) = match der_tlv(der, pos) {
+                Some(v) => v,
+                None => return,
+            };
             pos += alg_total;
         }
         if pos < der.len() && der[pos] == 0x04 {
-            let (inner_start, inner_len, _) = match der_tlv(der, pos) { Some(v) => v, None => return };
+            let (inner_start, inner_len, _) = match der_tlv(der, pos) {
+                Some(v) => v,
+                None => return,
+            };
             let inner = &der[inner_start..inner_start + inner_len];
             extract_ec_private_key(inner, out);
         }

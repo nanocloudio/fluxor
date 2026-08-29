@@ -48,6 +48,10 @@ pub mod chacha20 {
 }
 
 pub mod ed25519;
+// ml_dsa mounts the shared source with `sha3`'s SHAKE in scope, so it must
+// come after that module is declared.
+pub mod ml_dsa;
 pub mod p256;
 pub mod sha256;
+pub mod sha3;
 pub mod sha512;

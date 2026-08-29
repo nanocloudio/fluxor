@@ -850,6 +850,69 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<ElfSection>, Vec<ElfSymbol>)> {
     Ok((sections, symbols))
 }
 
+/// The ABI surface a project pins, found by walking up from the ELF, with
+/// whether that project OWNS the SDK source (`modules/sdk/`) or consumes a
+/// synced copy of it (`target/fluxor/fluxor-abi/sdk/`) — the two are told
+/// apart because they are put right by different commands. `None` when
+/// neither pin is found or it does not parse.
+fn project_sdk_pin(elf: &Path) -> Option<([u8; 32], bool)> {
+    let mut dir = elf.parent();
+    while let Some(d) = dir {
+        for (rel, owns_sdk) in [
+            ("target/fluxor/fluxor-abi/sdk/abi_surface_srcpin.rs", false),
+            ("modules/sdk/abi_surface_srcpin.rs", true),
+        ] {
+            let pin = d.join(rel);
+            if !pin.is_file() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&pin).ok()?;
+            // The generated const is a bracketed list of `0x..` bytes;
+            // parse the first 32 after the declaration. Anchored on the
+            // declaration rather than the bare name so a doc comment that
+            // mentions the const is not mistaken for it.
+            let at = text.find("ABI_SURFACE_DIGEST: [u8; 32] = [")?;
+            let bytes: Vec<u8> = text[at..]
+                .split(|c: char| !c.is_ascii_hexdigit() && c != 'x')
+                .filter_map(|tok| tok.strip_prefix("0x"))
+                .filter_map(|h| u8::from_str_radix(h, 16).ok())
+                .take(32)
+                .collect();
+            let digest: [u8; 32] = bytes.try_into().ok()?;
+            return Some((digest, owns_sdk));
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// What to actually DO about a module whose embedded surface is not the one
+/// this tool carries. Rebuilding from source is the answer only when the
+/// project's SDK already pins the tool's surface; otherwise the project's
+/// pin says which of the two is behind, and a rebuild would reproduce the
+/// same digest and the same refusal.
+fn abi_surface_advice(elf: &Path, embedded: &[u8; 32], current: &[u8; 32]) -> &'static str {
+    const REBUILD: &str = "rebuild it from source with `fluxor modules build`";
+    let Some((pin, owns_sdk)) = project_sdk_pin(elf) else {
+        return REBUILD;
+    };
+    if &pin == current {
+        REBUILD
+    } else if &pin == embedded && owns_sdk {
+        "this tool is behind the SDK source it is built from — republish it \
+         with `fluxor publish --only runtime` and pack again"
+    } else if &pin == embedded {
+        "this tool is behind the project's SDK copy — update it with \
+         `fluxor update` and pack again"
+    } else if owns_sdk {
+        "the SDK source pins neither digest — regenerate it with `fluxor \
+         abi-regen`, then rebuild"
+    } else {
+        "the project's SDK copy is behind this tool — run `fluxor sync` (or \
+         `fluxor workspace publish` from the root) and then rebuild"
+    }
+}
+
 /// Read the compile-time ABI-surface attestation embedded by the SDK
 /// (`runtime.rs` `FLUXOR_ABI_SURFACE`, a 32-byte `.rodata` static). Returns
 /// `None` when the symbol is absent (a module built by a pre-embed SDK).
@@ -1160,12 +1223,18 @@ pub fn pack_fmod(
             module_manifest.abi_surface = Some(embedded);
         }
         Some(embedded) => {
+            // Which side is behind decides the advice. Telling a caller to
+            // rebuild when the SDK or the tool is the stale one sends them
+            // round a loop that cannot converge: the rebuild reproduces the
+            // same digest and the same refusal.
+            let hint = abi_surface_advice(input, &embedded, &current_surface);
             return Err(Error::Module(format!(
                 "{}: compiled against a different ABI surface (module embeds {}, \
-                 current is {}) — rebuild it from source with `fluxor modules build`",
+                 current is {}) — {}",
                 input.display(),
                 hex12(&embedded),
                 hex12(&current_surface),
+                hint,
             )));
         }
         None => {

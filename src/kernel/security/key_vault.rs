@@ -31,7 +31,56 @@ unsafe fn read_u64(p: *const u8) -> u64 {
     u64::from_le_bytes(b)
 }
 use crate::kernel::ipc::fd;
-use crate::kernel::security::crypto::{ed25519, p256};
+use crate::kernel::security::crypto::{ed25519, ml_dsa, p256};
+
+/// The ML-DSA parameter set a VAULT SUITE names, or `None` on a target
+/// without the `pq-vault` capability.
+///
+/// The crossing between the vault's suite registry and the primitive's own
+/// naming is this one function, so the two can be renumbered independently
+/// and every call site reads the mapping from one place. It is also the
+/// single gate: every length, usage mask and enumeration the ML-DSA suites
+/// appear in flows from this answer, so a target that cannot afford the
+/// signing workspace reports them unsupported everywhere at once rather
+/// than admitting a key it could not then sign with.
+#[cfg(feature = "pq-vault")]
+const fn ml_dsa_set_for(suite: u16) -> Option<ml_dsa::MlDsaSet> {
+    match suite {
+        dev_key_vault::suite::ML_DSA_44 => Some(ml_dsa::MlDsaSet::MlDsa44),
+        dev_key_vault::suite::ML_DSA_65 => Some(ml_dsa::MlDsaSet::MlDsa65),
+        dev_key_vault::suite::ML_DSA_87 => Some(ml_dsa::MlDsaSet::MlDsa87),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "pq-vault"))]
+const fn ml_dsa_set_for(_suite: u16) -> Option<ml_dsa::MlDsaSet> {
+    None
+}
+
+/// Scratch for the vault's ML-DSA operations.
+///
+/// Static rather than a local because an ML-DSA-87 signature needs more
+/// polynomial scratch than the stack any caller reaches this code on. One
+/// workspace serves all three parameter sets — it carries the widest
+/// dimensions and each operation uses the prefix its own set needs — so
+/// the cost is paid once for the backend rather than once per suite.
+///
+/// This is ~58 KB of `.bss`, which is what makes ML-DSA a per-target
+/// capability rather than something every kernel carries.
+///
+/// Serialised by the same single-core cooperative model as `SLOTS`.
+#[cfg(feature = "pq-vault")]
+static mut ML_DSA_WS: ml_dsa::SignWorkspace<{ ml_dsa::K_MAX }, { ml_dsa::L_MAX }> =
+    ml_dsa::SignWorkspace::new();
+
+/// Staging for an ML-DSA signature and public key. Both are larger than
+/// any value this backend can return in a register-sized buffer, and both
+/// are public, so they are staged here and copied to the caller.
+#[cfg(feature = "pq-vault")]
+static mut ML_DSA_SIG: [u8; ml_dsa::SIG_MAX] = [0; ml_dsa::SIG_MAX];
+#[cfg(feature = "pq-vault")]
+static mut ML_DSA_PK: [u8; ml_dsa::PK_MAX] = [0; ml_dsa::PK_MAX];
 /// P-256 group order n (big-endian). Every P-256 scalar this vault
 /// holds must lie in [1, n-1]: GENERATE rejection-samples into that
 /// range and STORE refuses anything outside it. `d == 0` signs under
@@ -328,6 +377,17 @@ unsafe fn alloc_slot() -> Option<usize> {
 const fn suite_private_len(suite: u16) -> usize {
     match suite {
         dev_key_vault::suite::P256 | dev_key_vault::suite::ED25519 => 32,
+        // The ML-DSA private key this backend holds is the 32-byte FIPS
+        // 204 seed, not the 2560/4032/4896-byte encoded key. KeyGen is a
+        // deterministic function of that seed, so the seed IS the key: it
+        // reproduces the encoded form exactly, and it is what STORE
+        // imports and what the sealed blob carries.
+        //
+        // The consequence is on the wire and is deliberate: a caller
+        // holding an ALREADY-EXPANDED key cannot import it here, because
+        // an expanded key does not reduce back to a seed. `SUITE_QUERY`
+        // reporting 32 is what tells that caller so, before it allocates.
+        _ if ml_dsa_set_for(suite).is_some() => ml_dsa::SEED_LEN,
         _ => 0,
     }
 }
@@ -337,7 +397,13 @@ const fn suite_public_len(suite: u16) -> usize {
     match suite {
         dev_key_vault::suite::P256 => 65,
         dev_key_vault::suite::ED25519 => 32,
-        _ => 0,
+        // Sizes come from the primitive's own parameter table rather than
+        // being repeated here, so the vault and the signer cannot come to
+        // disagree about how big an answer is.
+        _ => match ml_dsa_set_for(suite) {
+            Some(set) => set.params().pk_len,
+            None => 0,
+        },
     }
 }
 
@@ -345,7 +411,10 @@ const fn suite_public_len(suite: u16) -> usize {
 const fn suite_signature_len(suite: u16) -> usize {
     match suite {
         dev_key_vault::suite::P256 | dev_key_vault::suite::ED25519 => 64,
-        _ => 0,
+        _ => match ml_dsa_set_for(suite) {
+            Some(set) => set.params().sig_len,
+            None => 0,
+        },
     }
 }
 
@@ -360,6 +429,15 @@ const fn suite_usage(suite: u16) -> u32 {
                 | dev_key_vault::usage::PERSIST
         }
         dev_key_vault::suite::ED25519 => {
+            dev_key_vault::usage::SIGN
+                | dev_key_vault::usage::VERIFY
+                | dev_key_vault::usage::EXPORT_PUBLIC
+                | dev_key_vault::usage::PERSIST
+        }
+        // ML-DSA signs and nothing else. No `AGREE`: a signature scheme
+        // has no key-agreement half, and the post-quantum one that does is
+        // ML-KEM, which is a different suite with a different key.
+        _ if ml_dsa_set_for(suite).is_some() => {
             dev_key_vault::usage::SIGN
                 | dev_key_vault::usage::VERIFY
                 | dev_key_vault::usage::EXPORT_PUBLIC
@@ -403,8 +481,13 @@ unsafe fn generate_into(suite: u16, out: &mut [u8]) -> bool {
             }
             false
         }
+        // Both are 32-byte seeds and any 32 bytes are valid: RFC 8032 for
+        // Ed25519, FIPS 204 KeyGen for ML-DSA. Neither needs rejection
+        // sampling, which is what separates them from P-256.
         dev_key_vault::suite::ED25519 => {
-            // Any 32-byte seed is valid (RFC 8032).
+            out.len() == 32 && crate::kernel::sys::hal::csprng_fill(out.as_mut_ptr(), 32) == 0
+        }
+        _ if ml_dsa_set_for(suite).is_some() => {
             out.len() == 32 && crate::kernel::sys::hal::csprng_fill(out.as_mut_ptr(), 32) == 0
         }
         _ => false,
@@ -436,7 +519,26 @@ unsafe fn write_public(idx: usize, out_ptr: *mut u8, pub_len: usize) -> bool {
             core::ptr::copy_nonoverlapping(pk.as_ptr(), out_ptr, 32);
             true
         }
-        _ => false,
+        // ML-DSA derives its public key from the seed the same way KeyGen
+        // does, so a slot holding 32 bytes can answer PUBLIC without ever
+        // materialising the encoded private key.
+        suite => match ml_dsa_set_for(suite) {
+            #[cfg(feature = "pq-vault")]
+            Some(set) if pub_len == set.params().pk_len => {
+                let ws_ptr = &raw mut ML_DSA_WS;
+                let pk_ptr = &raw mut ML_DSA_PK;
+                let ws = &mut *ws_ptr;
+                let staged = &mut *pk_ptr;
+                let ok =
+                    ml_dsa::ml_dsa_public_key(set, &priv_key, ws, &mut staged[..pub_len]).is_ok();
+                ws.zeroize();
+                if ok {
+                    core::ptr::copy_nonoverlapping(staged.as_ptr(), out_ptr, pub_len);
+                }
+                ok
+            }
+            _ => false,
+        },
     };
     for b in priv_key.iter_mut() {
         core::ptr::write_volatile(b, 0);
@@ -643,13 +745,54 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // slot handed `RAW` would sign a message as though it were a
             // digest — a valid signature over the wrong thing, which is
             // exactly the trap the inferred convention set.
+            //
+            // ML-DSA takes the whole message, like Ed25519 — the pure
+            // variant of FIPS 204 is not prehashed, and HashML-DSA is a
+            // different algorithm rather than a mode of this one. It also
+            // takes a context string, and `CONTEXT` is refused here rather
+            // than silently signing with an empty one: the SIGN arg layout
+            // carries no context field, so a caller asking for one is
+            // asking for something this wire cannot express, and answering
+            // it with the empty context would produce a signature over a
+            // different domain than the caller asked for.
             let want_mode = match slot.suite {
                 dev_key_vault::suite::P256 => dev_key_vault::sign_mode::DIGEST,
                 dev_key_vault::suite::ED25519 => dev_key_vault::sign_mode::RAW,
+                _ if ml_dsa_set_for(slot.suite).is_some() => dev_key_vault::sign_mode::RAW,
                 _ => return ENOSYS,
             };
             if mode != want_mode {
                 return EINVAL;
+            }
+
+            // ML-DSA's signature does not fit the fixed 64-byte path
+            // below, and its scratch is a static rather than a local, so
+            // it answers here and returns.
+            #[cfg(feature = "pq-vault")]
+            if let Some(set) = ml_dsa_set_for(slot.suite) {
+                let mut seed = [0u8; ml_dsa::SEED_LEN];
+                seed.copy_from_slice(&slot.data[..ml_dsa::SEED_LEN]);
+                let msg = core::slice::from_raw_parts(arg.add(6), input_len);
+                let ws_ptr = &raw mut ML_DSA_WS;
+                let sig_ptr_staged = &raw mut ML_DSA_SIG;
+                let ws = &mut *ws_ptr;
+                let staged = &mut *sig_ptr_staged;
+                let signed =
+                    ml_dsa::ml_dsa_sign_seed(set, &seed, &[], msg, ws, &mut staged[..sig_len])
+                        .is_ok();
+                ws.zeroize();
+                for byte in seed.iter_mut() {
+                    core::ptr::write_volatile(byte as *mut u8, 0);
+                }
+                if !signed {
+                    return ERROR;
+                }
+                if !sig_ptr.is_null() {
+                    core::ptr::copy_nonoverlapping(staged.as_ptr(), sig_ptr, sig_len);
+                }
+                let wrote = (sig_len as u16).to_le_bytes();
+                core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
+                return 0;
             }
 
             let mut priv_key = [0u8; 32];

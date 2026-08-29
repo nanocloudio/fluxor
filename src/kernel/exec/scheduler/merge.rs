@@ -1751,8 +1751,12 @@ fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
 /// (deadband) and the §5.3 floor = `max(tick_min_us, worst_step × FLOOR_MARGIN)`
 /// so the chosen cadence never undershoots the live worst-step cost.
 ///
-/// When no adaptive flag is set this returns `domain_tick_us` exactly, so an
-/// unconfigured domain is byte-identical in pacing to today.
+/// An armed timer owned by this domain bounds whichever period the mechanisms
+/// choose, down to the §5.3 floor and no further: a module that arms 5 ms is
+/// stepped at ~5 ms even on an idle domain relaxed to a 50 ms backstop, and a
+/// heavy domain still never runs faster than its worst-step budget admits.
+/// With no adaptive flag set and no timer armed this returns `domain_tick_us`
+/// exactly, so an unconfigured domain paces on its declared tick alone.
 ///
 /// Idle is decided per-domain via `domain_wake_pending(domain_id)` (the
 /// `EVENT_WAKE_PENDING ∩ domain_module_mask` intersection), so on
@@ -1760,6 +1764,32 @@ fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
 /// single-domain target (Linux/rp) every module is in domain 0, so it
 /// degenerates exactly to the global `wake_pending_nonzero()`.
 pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
+    // Timers are fds (`fd::timer_pump`): service the ones that fired — their
+    // owners' wake bits latch, exactly as an event's would — and learn when
+    // this domain's earliest unfired one is due. Pumped FIRST so a fire that
+    // just happened reads as pending work to the idle decision below.
+    let timer_ms = crate::kernel::ipc::fd::timer_pump(domain_id as u8);
+    let period = pacer_next_deadline_us_unbounded(domain_id);
+    let Some(ms) = timer_ms else {
+        return period;
+    };
+    // Raised to the §5.3 floor before it is applied: an early timer may
+    // shorten the sleep, but not below one worst-case step, or the flow
+    // budget this period governs would be smaller than a step it must pay
+    // for.
+    let bound = ms
+        .saturating_mul(1000)
+        .max(pacer_domain_floor_us(domain_id));
+    if bound < period {
+        record_pacer_period_us(domain_id, bound)
+    } else {
+        period
+    }
+}
+
+/// The pacing period the adaptive mechanisms alone would choose, before any
+/// armed timer is allowed to shorten it.
+fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
     let flags = domain_adaptive_flags(domain_id);
     if flags == 0 {
         return record_pacer_period_us(domain_id, domain_tick_us(domain_id));

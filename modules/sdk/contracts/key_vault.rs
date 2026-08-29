@@ -41,6 +41,14 @@ pub const PROBE: u32 = 0x1000;
 /// received-then-wiped, not never-present. A non-extractable HSM may refuse
 /// it entirely; [`SUITE_QUERY`] reports import support per suite rather
 /// than as one global bit, because tokens differ by algorithm.
+///
+/// `key_len` is what [`SUITE_QUERY`] reported as `priv_len_out` for the
+/// suite, which is not always the algorithm's encoded private key. FIPS
+/// 204 KeyGen is a deterministic function of a 32-byte seed, so a backend
+/// may hold ML-DSA keys AS that seed and report 32 — the seed reproduces
+/// the encoded key exactly, and a caller holding an already-expanded key
+/// learns from the reported length that this backend is not where it can
+/// import one.
 pub const STORE: u32 = 0x1001;
 
 /// ECDH: derive shared secret. handle = slot.
@@ -84,6 +92,11 @@ pub const ECDH: u32 = 0x1002;
 ///   The 64-byte low-s `r‖s` output is exactly the JWS ES256 segment.
 /// - Ed25519: `RAW` over the full message (RFC 8032 is not prehashed).
 ///   Output is the 64-byte `R‖S`, deterministic by spec on every backend.
+/// - ML-DSA: `RAW` over the full message. The pure FIPS 204 variant is not
+///   prehashed — HashML-DSA is a different algorithm, not a mode of this
+///   one — and `PREHASH` is refused rather than answered with it. The
+///   signature is 2420 / 3309 / 4627 bytes by parameter set, so a caller
+///   must size its buffer from [`SUITE_QUERY`] and not from a constant.
 pub const SIGN: u32 = 0x1003;
 
 /// ECDSA verify (P-256) with a caller-supplied public key — the stored
@@ -187,6 +200,11 @@ pub mod sign_mode {
     pub const PREHASH: u8 = 2;
     /// As `RAW`, with a domain-separation context string prefixed
     /// (Ed25519ctx, ML-DSA's context parameter).
+    ///
+    /// The [`SIGN`] arg layout carries no context field, so a backend
+    /// that cannot express the request refuses it rather than signing
+    /// under the empty context: a signature in a domain the caller did
+    /// not ask for is worse than no signature, because it verifies.
     pub const CONTEXT: u8 = 3;
 }
 
@@ -284,13 +302,10 @@ pub const DESCRIBE: u32 = 0x100C;
 /// ```
 /// Returns 14 when the suite is supported, `-ENOSYS` when it is not.
 ///
-/// This replaced a `caps` bitmap, now deleted. That bitmap documented its
-/// own extension procedure as "reserve the bit, make every backend return
-/// 0, implement later" — a reserve-then-implement dance, which is
-/// compatibility machinery, which is what `C15` exists to remove. More
-/// practically, a bitmap answers "is P-256 supported" and cannot answer
-/// "how big is an ML-DSA-65 signature", which is what a caller sizing a
-/// buffer actually needs.
+/// Lengths rather than a capability bitmap, because a bitmap answers "is
+/// P-256 supported" and cannot answer "how big is an ML-DSA-65
+/// signature" — which is what a caller sizing a buffer actually needs,
+/// and the question a suite whose signature is 4627 bytes forces.
 pub const SUITE_QUERY: u32 = 0x100D;
 
 /// Enumerate supported suites.

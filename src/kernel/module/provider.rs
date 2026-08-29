@@ -586,6 +586,9 @@ pub fn provider_open(
 /// Invoke an operation on an open handle.
 ///
 /// Routing resolution order:
+///   0. Kernel primitives (opcode class `INTERNAL_DISPATCH_BUCKET`): a
+///      question about a handle rather than a request to its provider, so
+///      the opcode decides ahead of the handle.
 ///   1. `handle >= 0` with an FD tag: the tag self-identifies the
 ///      contract via `fd_tag_contract`.
 ///   2. Channel fds (tag 0) + `handle == -1` globals: HANDLE_BINDINGS
@@ -612,6 +615,17 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
     if deny_cross_owner_handle(handle, "provider_call") {
         return errno::EACCES;
     }
+    let class = ((op >> 8) & 0xFF) as u16;
+    // A kernel primitive (the 0x0Cxx class — HANDLE_POLL above all) is a
+    // question about a handle, not a request to its provider: `fd_poll` on a
+    // timer or event fd asks the KERNEL whether the fd is ready, and the
+    // handle's own provider has no opinion to offer. So the primitive is
+    // routed by its opcode class ahead of the handle's contract; a contract's
+    // vtable sees only the opcodes it defines.
+    if class == contract::INTERNAL_DISPATCH_BUCKET {
+        // SAFETY: dispatch routes to the kernel-internal bucket handler.
+        return unsafe { dispatch(class, handle, op, arg, arg_len) };
+    }
     if let Some(contract) = lookup_contract(handle) {
         if let Some(vt) = vtable_for(contract) {
             // SAFETY: vt.call is the contract's registered ABI entry;
@@ -621,9 +635,8 @@ pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 
         // SAFETY: dispatch routes to the chain-registered handler.
         return unsafe { dispatch(contract, handle, op, arg, arg_len) };
     }
-    let contract = ((op >> 8) & 0xFF) as u16;
     // SAFETY: as above; class-byte dispatch fallback.
-    unsafe { dispatch(contract, handle, op, arg, arg_len) }
+    unsafe { dispatch(class, handle, op, arg, arg_len) }
 }
 
 /// Query handle state by key.

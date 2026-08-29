@@ -154,9 +154,17 @@ chip-rp2040 = ["rp", "embassy-rp/rp2040", "embedded-platform"]
 #              (external-arena paging, isolated/page-aligned allocation).
 #   smp:       multiple hardware execution domains (multi-core domain ordering).
 #   dtb:       boot configuration/identity read from a device tree.
+#   pq-vault:  the key vault's ML-DSA suites. A signing operation needs ~58 KB
+#              of polynomial scratch and it is a kernel static, so this is a
+#              capability a target either has the RAM for or does not — an
+#              RP-class part with 256 KB does not. A target without it reports
+#              the ML-DSA suites as unsupported through SUITE_QUERY and omits
+#              them from SUITE_ENUM, rather than admitting a key it could not
+#              then sign with.
 kernel-vm = []
 smp = []
 dtb = []
+pq-vault = []
 
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
 # Minimal — no embassy, no cortex-m. Bare-metal from scratch.
@@ -167,6 +175,7 @@ chip-bcm2712 = [
     "kernel-vm",
     "smp",
     "dtb",
+    "pq-vault",
 ]
 
 # Board-level selection for BCM2712 targets.
@@ -188,7 +197,7 @@ test_tier2_sgi = []
 
 # Linux hosted (aarch64 userspace). Uses std — no embassy, no cortex-m.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
-host-linux = ["portable-atomic", "env_logger", "libc", "multitenant"]
+host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault"]
 
 # WASM target. Builds the kernel as a wasm32-unknown-unknown library.
 # A small bootstrap shim (browser, wasmtime, edge) provides the host
@@ -197,7 +206,7 @@ host-linux = ["portable-atomic", "env_logger", "libc", "multitenant"]
 # This feature gates the kernel into the same code paths as
 # `host-linux` for std/no-std purposes, except `no_std` and without
 # Linux-specific deps.
-host-wasm = ["portable-atomic"]
+host-wasm = ["portable-atomic", "pq-vault"]
 
 # Optional `linux_display` backend: open a real window via winit and
 # blit each RGB565 frame through softbuffer. Off by default; file +

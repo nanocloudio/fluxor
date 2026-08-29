@@ -1,7 +1,7 @@
 //! Fluxor SDK — `no_std` runtime helpers.
 //!
-//! Re-exports `modules/sdk/{sha256,sha384,hmac,chacha20,aes_gcm,
-//! p256,ed25519,varint,params}.rs` so cargo-based consumers (downstream
+//! Re-exports `modules/sdk/{sha256,sha384,sha3,hmac,chacha20,aes_gcm,
+//! p256,ed25519,ml_dsa,varint,params}.rs` so cargo-based consumers (downstream
 //! project tooling, host KAT harnesses, future common crates) can
 //! `use fluxor_sdk::Sha256` instead of `#[path]`-mounting individual
 //! files.
@@ -66,6 +66,11 @@ mod sdk_flat {
     // `zeroize` helpers (p256.rs) by bare name — see its header for the
     // required include set. Keep it after both.
     include!("../sdk/crypto/ed25519.rs");
+    include!("../sdk/crypto/sha3.rs");
+    // ml_dsa.rs references `Keccak` and the SHAKE rate/pad constants
+    // (sha3.rs) by bare name — see its header for the required include
+    // set. Keep it after sha3.rs.
+    include!("../sdk/crypto/ml_dsa.rs");
 
     // Codecs.
     include!("../sdk/wire/varint.rs");

@@ -216,6 +216,38 @@ GPIO event binding therefore uses software polling via `poll_gpio_edges()` (same
 
 For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` works directly from ISR context. The `select()` mechanism provides sub-tick wake for these sources.
 
+## Timers
+
+A timer is an fd, and it wakes its owner the same way an event does.
+`timer::CREATE` returns a tagged fd, `SET` arms it with a delay in
+milliseconds, and the generic fd `POLL` reports `POLL_IN` once it has
+fired. A module that wants to act in 5 ms arms a timer and waits on it; it
+does not read the clock on a tick it does not control.
+
+The kernel does two things with the armed timers of a domain each time it
+decides how long to sleep:
+
+- **Fire.** An expired timer latches its owner's wake bit exactly as
+  `event_signal` would, once per arming, so `step_woken_modules()` runs
+  that module and it finds `POLL_IN`. The latch is what makes a fire an
+  edge rather than a level — an expired-but-unread timer does not wake its
+  owner again on every pass. `SET`, `CANCEL` and `DESTROY` clear it.
+- **Bound the sleep.** The earliest armed timer that has not yet fired
+  bounds the pacing deadline the adaptive mechanisms chose, down to the
+  domain's worst-step floor and no further. So a module that arms 5 ms is
+  stepped at ~5 ms even on an idle domain relaxed to a 50 ms backstop,
+  while a heavy domain still never runs faster than its step budget admits.
+
+Firing is domain-blind and the deadline is not: whichever domain notices an
+expiry latches the owner's wake bit, but only the owner's own domain
+shortens its sleep for it, so a sibling domain's short timer cannot drag
+this one off its backstop.
+
+`POLL` on a timer or event fd is a kernel primitive — a question about the
+handle rather than a request to whatever provider the handle belongs to —
+so `provider_call` routes the `0x0C` opcode class to the kernel ahead of
+the handle's contract.
+
 ## ABI
 
 ### Device Class
@@ -343,6 +375,7 @@ The kernel does NOT provide:
 | File | Description |
 |------|-------------|
 | `src/kernel/ipc/event.rs` | Event pool, create/signal/poll/destroy; IRQ binding stored per-event |
+| `src/kernel/ipc/fd.rs` | Tagged fd table, unified `fd_poll`, timer slots and `timer_pump()` |
 | `modules/sdk/abi/kernel_abi.rs` | `event::{CREATE,SIGNAL,POLL,DESTROY,BIND_IRQ}` opcodes |
 | `modules/sdk/contracts/hal/gpio.rs` | `WATCH_EDGE` opcode for edge-triggered event wakes |
 | `src/kernel/module/syscalls.rs` | Event contract dispatch |
@@ -354,6 +387,7 @@ The kernel does NOT provide:
 | Resource | Default | Notes |
 |----------|---------|-------|
 | Event slots | 32 | `MAX_EVENTS` in `src/kernel/ipc/event.rs` |
+| Timer slots | 16 | `MAX_TIMERS` in `src/kernel/ipc/fd.rs` |
 | Modules (wake mask) | Sized to `MAX_MODULES` per target | `ModuleMask` of 64-bit words, one bit per module slot |
 | IRQ source types | GPIO (type 0) | Extensible per HAL |
 | GPIO pins per binding | 1 event per pin, 1 pin per event | Enforced at `WATCH_EDGE` bind time |

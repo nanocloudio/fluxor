@@ -106,27 +106,55 @@ domain); the implementation conforms to RFC 8032.
 Source: `modules/sdk/contracts/key_vault.rs` (contract),
 `src/kernel/security/key_vault.rs` (software backend).
 
-A kernel-managed asymmetric-key store for P-256 and Ed25519 keys.
-Opcodes:
+A kernel-managed asymmetric-key store. Every slot names its **suite** —
+P-256, Ed25519, or one of the three ML-DSA parameter sets — and the suite
+decides what the key bytes mean, which operations the slot admits, and how
+big each answer is. Opcodes:
 
 | Opcode | Name | Semantics |
 |--------|------|-----------|
 | `0x1000` | `PROBE` | Returns 1 if a backend is present. Callers detect at `module_new`. |
-| `0x1001` | `STORE` | Import a raw private key (key_type 1 = P-256 scalar, 2 = Ed25519 seed). Returns an opaque handle. |
+| `0x1001` | `STORE` | Import a raw private key of the named suite. Returns an opaque handle. |
 | `0x1002` | `ECDH` | Compute scalar mult against a caller-supplied public key. |
-| `0x1003` | `SIGN` | Deterministic ECDSA (RFC 6979 nonce) or Ed25519, by the slot's key type. |
+| `0x1003` | `SIGN` | Sign under the slot's suite, in the sign mode that suite uses. |
 | `0x1004` | `VERIFY` | Verify — takes a caller-supplied public key. |
 | `0x1005` | `DESTROY` | Zeroise and free the slot. |
 | `0x1006` | `GENERATE` | Generate a key in-backend; the private half never exists outside it. |
 | `0x1007` | `PUBLIC` | Export the public half of a slot's key. |
 | `0x1008` | `TIER` | Report the backend tier (software vs hardware-backed). |
-| `0x10FF` | `CAPS` | Report backend capability bits (e.g. whether `STORE` import is supported). |
+| `0x1009` | `OPEN_OR_GENERATE` | Open the slot filed under a label, generating it if absent. |
+| `0x100A` | `OPEN` | Open the slot filed under a label. |
+| `0x100B` | `DESTROY_BY_LABEL` | Zeroise and free the slot filed under a label. |
+| `0x100C` | `DESCRIBE` | Report a slot's suite, usage mask and label. |
+| `0x100D` | `SUITE_QUERY` | Report a suite's usage mask and its private, public and signature lengths. |
+| `0x100E` | `SUITE_ENUM` | Enumerate the suites this backend supports. |
 
-The software backend's slot table holds 8 slots of up to 64 bytes each.
-`reset_all()` zeroises every slot on scheduler reset. Slot contents are
-never surfaced through any introspection API. Crypto runs against the
-kernel-side `src/kernel/security/crypto/p256.rs` (field/group/scalar ops
-plus HMAC-SHA256 for the RFC 6979 nonce).
+Sizes come from `SUITE_QUERY` rather than from a caller's assumption,
+because they are no longer uniform: an ML-DSA-87 signature is 4627 bytes
+where a P-256 or Ed25519 one is 64. The private length a backend reports is
+what it actually holds, which is not always the algorithm's encoded private
+key — the software backend holds an ML-DSA key as the 32-byte FIPS 204 seed
+that reproduces it, so it reports 32 and a caller with an already-expanded
+key learns from that number that it cannot import one here.
+
+The software backend's slot table holds 8 slots of up to 64 bytes each — a
+seed or a scalar, never an expanded key. `reset_all()` zeroises every slot
+on scheduler reset. Slot contents are never surfaced through any
+introspection API. Crypto runs against the kernel-side
+`src/kernel/security/crypto/`: `p256.rs` (field/group/scalar ops plus
+HMAC-SHA256 for the RFC 6979 nonce), `ed25519.rs`, and `ml_dsa.rs` over
+`sha3.rs`.
+
+ML-DSA is a per-target capability, the `pq-vault` Cargo feature. Its
+polynomial scratch is a backend static dimensioned for the widest parameter
+set — a signing operation needs more of it than the stack any caller
+arrives on — and that is ~58 KB of kernel `.bss`, which an RP-class part
+with 256 KB of SRAM does not have to spare. A kernel built without
+`pq-vault` reports the ML-DSA suites as unsupported: `SUITE_QUERY` answers
+`ENOSYS` and `SUITE_ENUM` omits them, so a caller discovers the absence
+before it allocates rather than by storing a key the backend could not then
+sign with. Every length, usage mask and enumeration flows from one gate, so
+the suites cannot be half-present.
 
 The backend is platform-overridable: the Linux platform registers a
 PKCS#11 HSM backend (`src/platform/linux/hsm_key_vault.rs`) when
@@ -271,15 +299,26 @@ Two crypto bodies exist by design:
   workloads (TLS, QUIC), NEON-accelerated where it pays.
 
 The rule: where an implementation is identical, it has one source (kernel
-`sha256.rs` and `sha512.rs` are `include!` shims over the SDK files — the
-two sides cannot drift); where the trust domain demands divergence, the
-duplication is deliberate (Ed25519 and P-256 differ: the kernel versions
-are minimal and audit-oriented, the SDK versions carry protocol-driven
-surface such as incremental ECDSA). Every kernel primitive is
-load-bearing: `ed25519` backs the loader signature verify, `p256` the
-key-vault ECDSA/ECDH, `sha512` the Ed25519 inner hash. If a kernel
-primitive and its SDK counterpart converge to the same surface, they merge
-to one source per the rule.
+`sha256.rs`, `sha512.rs`, `sha3.rs` and `ml_dsa.rs` are `include!` shims
+over the SDK files — the two sides cannot drift); where the trust domain
+demands divergence, the duplication is deliberate (Ed25519 and P-256
+differ: the kernel versions are minimal and audit-oriented, the SDK
+versions carry protocol-driven surface such as incremental ECDSA). Every
+kernel primitive is load-bearing: `ed25519` backs the loader signature
+verify, `p256` the key-vault ECDSA/ECDH, `sha512` the Ed25519 inner hash,
+`ml_dsa` the vault's post-quantum signing and `sha3` the SHAKE stream it
+expands everything from. If a kernel primitive and its SDK counterpart
+converge to the same surface, they merge to one source per the rule.
+
+ML-DSA and SHA-3 are shared rather than duplicated for a reason particular
+to them: the vault signs with the same file a TLS module verifies with, so
+a disagreement between signer and verifier over FIPS 204 or FIPS 202 is not
+expressible. Both files derive their constants — Keccak's round constants
+and rho offsets from the FIPS 202 recurrences, the NTT twiddles from
+ζ = 1753 — instead of shipping the tables a reference implementation would,
+because a position-independent module cannot relocate an absolute address in
+`.rodata`. See `modules/sdk/crypto/p256.rs` for the same constraint solved
+the same way.
 
 ## Related Documentation
 
