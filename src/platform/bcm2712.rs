@@ -2335,6 +2335,13 @@ fn bcm_init_providers() {
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::WORKLOAD, bcm_workload_dispatch);
+    // The versioned watchable key store: `storage.object` (0x14) +
+    // `storage.namespace` (0x13) over a fixed-capacity RAM store. A
+    // store-backed graph reaches its state through these two contracts, and a
+    // provider that is absent answers ENOSYS: the graph runs and produces
+    // nothing, which is the failure that looks like no failure.
+    // SAFETY: single-threaded boot, before any provider dispatch.
+    unsafe { fluxor::platform::store::init() };
 }
 
 /// Metal `workload` (0x1A) provider dispatch — the thin bcm registration hook.

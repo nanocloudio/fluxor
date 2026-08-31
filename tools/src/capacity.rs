@@ -11,7 +11,7 @@
 pub fn kernel_max_modules(target: &str) -> usize {
     match target {
         // aarch64 profile_host (linux host + bcm2712-family boards).
-        "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt" => 128,
+        "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt" => 192,
         // wasm32 profile_wasm.
         "wasm" => 48,
         // Everything else (rp2040/rp2350 boards): profile_embedded.

@@ -56,6 +56,12 @@ pub mod pcie;
 #[cfg(feature = "chip-bcm2712")]
 #[path = "bcm2712/pcie_aliases.rs"]
 pub mod pcie_aliases;
+/// Versioned watchable key store — `storage.object` + `storage.namespace` on
+/// bare metal (bcm2712). Without it no store-backed graph can run on the board
+/// at all.
+#[cfg(feature = "chip-bcm2712")]
+#[path = "bcm2712/store.rs"]
+pub mod store;
 
 /// Chip backend — the per-target chip services (clocks, arenas, boot glue),
 /// selected by `#[cfg]`. Every target has exactly one.

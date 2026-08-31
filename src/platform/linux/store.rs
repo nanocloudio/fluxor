@@ -175,10 +175,10 @@ pub struct Store {
 /// What a mutating write may be made conditional on.
 ///
 /// A real three-way choice, and not `Option<u64>`, because that shape cannot
-/// hold one: "must not exist" was previously encoded as `Some(0)`, which is
+/// hold one: it would have to encode "must not exist" as `Some(0)`, which is
 /// indistinguishable from "must currently be at revision 0". A
-/// compare-and-swap against a key at revision 0 and a create-only write were
-/// therefore the same request, and one of them was always answered wrongly.
+/// compare-and-swap against a key at revision 0 and a create-only write would
+/// then be the same request, and one of them always answered wrongly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Precondition {
     /// Apply unconditionally.
@@ -511,9 +511,10 @@ use crate::kernel::ipc::channel::channel_write;
 use crate::kernel::ipc::fd::{slot_of, tag_fd, FD_TAG_STORAGE_NAMESPACE, FD_TAG_STORAGE_OBJECT};
 use crate::kernel::sys::errno;
 
-/// mesh Event content-type for a `namespace.change` record (not yet in the mesh
-/// registry — assigned here; registry addition is a follow-up).
-const CT_NAMESPACE_CHANGE: u8 = 15;
+/// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A
+/// watcher routes on this to tell a store change from anything else sharing
+/// its sink, so it must be the vocabulary's byte and not a private one.
+const CT_NAMESPACE_CHANGE: u8 = 0x23;
 /// mesh Event header size (see `modules/foundation/mesh/mesh_types.rs`).
 const EVENT_HEADER_SIZE: usize = 32;
 
@@ -860,17 +861,16 @@ pub unsafe fn dispatch_object(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
                 Ok(rev) => {
                     // `Log::append` does write_all → flush → sync_data, and
                     // it runs BEFORE `apply_local`, so a returned `Ok` means
-                    // the record is on disk. That is `LocalDurable`, and it
-                    // is what this now says.
+                    // the record is on disk. That is `LocalDurable`, and
+                    // it is what this reports.
                     //
-                    // It used to say `RevisionMonotone`, which is a
-                    // statement about ORDERING — revisions go up — and says
-                    // nothing about surviving a restart. A caller applying a
-                    // durability policy had to refuse a write that was in
-                    // fact durable, because the provider under-reported what
-                    // it had achieved. Under-reporting is the safe direction
-                    // to be wrong in, but it is still wrong, and it makes
-                    // the fence unusable for the decision it exists for.
+                    // `RevisionMonotone` would be a statement about ORDERING
+                    // — revisions go up — and says nothing about surviving a
+                    // restart. A caller applying a durability policy would
+                    // have to refuse a write that was in fact durable.
+                    // Under-reporting is the safe direction to be wrong in,
+                    // but it is still wrong, and it makes the fence unusable
+                    // for the decision it exists for.
                     //
                     // With no log there is no durability to claim, and
                     // `RevisionMonotone` remains exactly right: the ordering
@@ -1218,7 +1218,15 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
                         value: val,
                     };
                     let bytes = encode_event(subs[idx].sequence, &ch);
-                    let _ = channel_write(sink_chan as i32, bytes.as_ptr(), bytes.len());
+                    if channel_write(sink_chan as i32, bytes.as_ptr(), bytes.len()) <= 0 {
+                        // The snapshot could not be delivered whole. Release
+                        // the slot and refuse: a watcher established on a
+                        // partial list believes it has seen the full state,
+                        // and nothing later in the stream corrects it.
+                        subs[idx].in_use = false;
+                        store.unsubscribe(wid);
+                        return errno::EAGAIN;
+                    }
                     subs[idx].sequence = subs[idx].sequence.wrapping_add(1);
                 }
                 return tag_fd(FD_TAG_STORAGE_NAMESPACE, idx as i32);

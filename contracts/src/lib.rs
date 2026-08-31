@@ -170,6 +170,13 @@ pub const CONTENT_TYPES: &[&str] = &[
     // body_len` bytes. The gateway matches it back to the originating
     // request by `(conn_id, stream_id)`.
     "HttpResponse",
+    // Control-plane store change surface — one record per key mutation,
+    // emitted by the `storage.namespace` SUBSCRIBE stream. Payload
+    // `{revision u64, kind u8, key_len u16, val_len u32}` followed by
+    // `key_len + val_len` bytes, inside a mesh Event envelope. A watcher
+    // routes on this byte to tell a store change from every other event
+    // sharing its sink.
+    "NamespaceChange",
 ];
 
 // ── Rate classes ────────────────────────────────────────────────────────────
@@ -293,6 +300,8 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     // on the edge rather than reclassifying the type for everyone.
     Control, // HttpRequest
     Control, // HttpResponse
+    // One record per key mutation — bursty control traffic, not a stream.
+    Control, // NamespaceChange
 ];
 
 const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
@@ -360,6 +369,9 @@ pub const CONTENT_FRAMING: &[Framing] = &[
     Streamed, // PresentationLayout
     Framed,   // HttpRequest
     Framed,   // HttpResponse
+    // One record per key mutation, inside a mesh Event envelope — a reader
+    // that was handed half of one could not tell which key changed.
+    Framed, // NamespaceChange
 ];
 
 const _: () = assert!(CONTENT_FRAMING.len() == CONTENT_TYPES.len());

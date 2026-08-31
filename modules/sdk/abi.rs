@@ -110,6 +110,10 @@ pub mod contracts {
         pub mod identity {
             include!("contracts/net/identity.rs");
         }
+        /// What a TLS handshake established about the peer.
+        pub mod peer_identity {
+            include!("contracts/net/peer_identity.rs");
+        }
         pub mod ws_frame {
             include!("contracts/net/ws_frame.rs");
         }

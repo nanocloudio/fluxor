@@ -1,0 +1,32 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712"]
+
+# The store, on the board. Both contracts, because the point of the probe is
+# that a store-backed graph has BOTH: `storage.object` for the keyed bytes and
+# `storage.namespace` for the prefix walk and the change subscription that
+# wakes a source.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[[resources]]
+requires_contract = "storage.namespace"
+access = "write"
+
+# The subscription's sink: the store pushes namespace.change events here, and
+# the probe drains them to prove SUBSCRIBE actually delivers rather than merely
+# accepting the call. A self-edge in the graph allocates it.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[observability]
+exempt = "store contract probe; its '[stp]' heartbeat is the observable, consumed by the rig scenario's pass rules"

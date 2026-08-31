@@ -105,8 +105,11 @@ pub struct NodeCapacity {
 pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
     match profile {
         "linux" | "pi5" | "bcm2712" => Some(NodeCapacity {
-            max_owners: 64,                // owner.rs MAX_OWNERS (multitenant)
-            max_modules: 128,              // sdk config profile_host MAX_MODULES
+            max_owners: 64, // owner.rs MAX_OWNERS (multitenant)
+            // Taken from `capacity::kernel_max_modules`, not restated: two
+            // copies of one kernel constant is how the composer comes to
+            // admit a graph the kernel has no slots for.
+            max_modules: crate::capacity::kernel_max_modules(profile) as u16,
             max_edges: 128,                // kernel/config.rs MAX_GRAPH_EDGES
             state_bytes: 96 * 1024 * 1024, // profile_host STATE_ARENA_SIZE
             buffer_bytes: 8 * 1024 * 1024, // profile_host BUFFER_ARENA_SIZE

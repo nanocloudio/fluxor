@@ -141,8 +141,7 @@ pub const KEY_MAX: usize = 512;
 
 /// A whole publish frame at the ceiling — what a `publish_in` port must be
 /// able to take as one record, and what a producer declares as `max_record`.
-pub const PUBLISH_FRAME_MAX: usize =
-    PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX;
+pub const PUBLISH_FRAME_MAX: usize = PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX;
 
 impl<'a> Publish<'a> {
     pub fn wire_len(&self) -> usize {
@@ -257,7 +256,6 @@ impl Ack {
     }
 }
 
-
 /// A reply frame on `reply_out`: an answer carrying data.
 ///
 /// Distinct from [`Ack`] because an ack says only whether a record was
@@ -283,8 +281,7 @@ pub const REPLY_OVERHEAD: usize = 8 + 1 + 2 + 2;
 
 /// A whole reply frame at the ceiling — what a `reply_out` port must be able
 /// to emit as one record.
-pub const REPLY_FRAME_MAX: usize =
-    REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX;
+pub const REPLY_FRAME_MAX: usize = REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX;
 
 impl<'a> Reply<'a> {
     pub fn wire_len(&self) -> usize {

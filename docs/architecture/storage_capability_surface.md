@@ -596,6 +596,31 @@ into the runtime rather than loadable modules:
 - **wasm peers** — `src/platform/wasm/fs.rs`, `namespace.rs`, and
   `object.rs` serve the same three contracts in the browser host.
 
+### The versioned watchable key store
+
+Some consumers do not want a filesystem or a byte range; they want keys they
+can watch. Both hosted platforms therefore serve `storage.object` and
+`storage.namespace` a second way — as a versioned, watchable key store — and
+a graph selects it by wiring, not by asking which platform it is on:
+
+- **Linux** — `src/platform/linux/store.rs`. When `FLUXOR_STORE_DIR` is
+  set the two providers above route here instead of to HTTP and the host
+  filesystem, backed by an append-only log the directory holds.
+- **bcm2712** — `src/platform/bcm2712/store.rs`, the same semantics and
+  byte-identical wire over a fixed-capacity RAM store, because bare metal
+  has no heap to grow one on. Its capacities (`MAX_OBJECTS`, `MAX_KEY`,
+  `MAX_VALUE`, `HISTORY`) are the honest ceiling; exceeding one is refused
+  rather than evicted, since a consumer reads a missing key as a deletion and
+  would tear down whatever that key named.
+
+Both keep a monotone revision clock, use a key's revision as the CAS
+token, page `LIST` with a cursor, and drive `SUBSCRIBE` from a bounded
+change history — a watcher that falls out of that window is told to
+relist rather than handed a gap. The bcm2712 store is VOLATILE: it
+reports `Fence::RevisionMonotone` and never `LocalDurable`, because
+under-reporting durability is the safe direction and a caller must not
+conclude a write outlived a power cut.
+
 On bare metal, `foundation/fat32` provides `file.data` over a
 `storage.block` channel: random-access reads through the FS contract,
 reads and writes both riding the block source's synchronous ioctls on its `blocks` input port

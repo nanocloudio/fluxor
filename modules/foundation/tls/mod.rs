@@ -639,8 +639,8 @@ struct TlsState {
     /// Handshake state transitions a session may take per tick.
     /// 1 (the default, and the former hard-coded value) paces concurrent
     /// connection setup at one leg per tick per session; raising it lets
-    /// simultaneous handshakes overlap. See the use site for why the
-    /// original starvation rationale no longer holds.
+    /// simultaneous handshakes overlap. See the use site for the starvation
+    /// bound that makes a budget above one safe.
     handshake_pump_budget: u16,
     /// ALPN restriction for the server EncryptedExtensions selection.
     /// 0 (default) offers the historic `h2` > `http/1.1` preference. 1
@@ -1757,10 +1757,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // Said out loud, because the peer cannot tell.
                             // A close with no alert mid-handshake looks
                             // identical to a crash, a firewall, or a
-                            // protocol bug, and this module used to do it
-                            // in complete silence — which is how one
-                            // instance of it went unexplained across an
-                            // entire programme of work. The session pool
+                            // protocol bug, so a silent one is a failure
+                            // nobody can attribute. The session pool
                             // grows in chunks from the elastic region, so
                             // hitting this means either the pool is
                             // genuinely full or a grant was refused; either
@@ -4304,71 +4302,33 @@ unsafe fn pump_derive_app_keys(s: &mut TlsState, idx: usize) -> bool {
 /// from a boolean is in `verification_flags` instead, which says which
 /// checks ran rather than asking the consumer to assume.
 ///
-/// `key_fingerprint` is what the old `svid` field held — the SHA-256 of the
-/// peer leaf's raw subjectPublicKey — under a name that says so.
-pub const MSG_PEER_IDENTITY: u8 = 0x5A;
+/// `key_fingerprint` is the SHA-256 of the peer leaf's raw subjectPublicKey.
+///
+/// Every constant below is the contract's
+/// (`modules/sdk/contracts/net/peer_identity.rs`), re-exported under this
+/// module's names rather than restated: the writer and its readers must
+/// agree byte for byte, and two declarations of one wire is how they stop
+/// agreeing.
+pub const MSG_PEER_IDENTITY: u8 = abi::contracts::net::peer_identity::MSG_PEER_IDENTITY;
 
 /// `verification_result` values.
-pub mod peer_result {
-    /// A credential was presented and passed the configured profile.
-    pub const OK: u8 = 0;
-    /// No credential was presented (plaintext or anonymous handshake).
-    pub const NO_CREDENTIAL: u8 = 1;
-    /// A credential was presented and its chain did not validate.
-    pub const CHAIN_FAILED: u8 = 2;
-    /// The chain validated but the profile (EKU, name, usage) did not.
-    pub const PROFILE_FAILED: u8 = 3;
-    /// The credential was outside its validity window.
-    pub const EXPIRED: u8 = 4;
-    /// The credential used a suite this endpoint does not accept.
-    pub const UNSUPPORTED_SUITE: u8 = 5;
-}
+pub use abi::contracts::net::peer_identity::result as peer_result;
 
 /// `credential_kind` values.
-pub mod peer_credential {
-    pub const NONE: u8 = 0;
-    /// An X.509 certificate presented in a mutual-TLS handshake.
-    pub const X509_MTLS: u8 = 1;
-    /// A bare public key, with no certificate around it.
-    pub const RAW_PUBLIC_KEY: u8 = 2;
-}
+pub use abi::contracts::net::peer_identity::credential as peer_credential;
 
 /// `verification_flags` bits — which checks actually ran.
-///
-/// A consumer reads these to know what a result is worth. `CHAIN` set with
-/// `VALIDITY` clear says the chain was trusted but its lifetime was not
-/// enforced, which is exactly the state `clock_policy: unchecked` produces
-/// and exactly the thing a boolean could never express.
-pub mod peer_check {
-    /// The chain was validated to a configured trust anchor.
-    pub const CHAIN: u32 = 0x0000_0001;
-    /// The certificate's validity window was enforced.
-    pub const VALIDITY: u32 = 0x0000_0002;
-    /// The required extended key usage was present.
-    pub const EKU: u32 = 0x0000_0004;
-    /// A subject alternative name was matched against the profile.
-    pub const SAN: u32 = 0x0000_0008;
-    /// Proof of possession of the subject key (the handshake signature).
-    pub const KEY_POSSESSION: u32 = 0x0000_0010;
-}
+pub use abi::contracts::net::peer_identity::check as peer_check;
 
 /// `key_fp_alg` values.
-pub mod peer_fp_alg {
-    pub const NONE: u8 = 0;
-    pub const SHA256: u8 = 1;
-}
+pub use abi::contracts::net::peer_identity::fp_alg as peer_fp_alg;
 
-pub const PEER_IDENTITY_HEADER_LEN: usize = 3;
+pub const PEER_IDENTITY_HEADER_LEN: usize = abi::contracts::net::peer_identity::FRAME_HDR;
 /// Fixed part of the payload, before the two variable fields.
-pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 1 + 1 + 2;
-pub const PEER_IDENTITY_MAX_FINGERPRINT: usize = 32;
-/// A SPIFFE URI comfortably fits; longer names are truncated to nothing
-/// rather than to a prefix, because half a name is a different name.
-pub const PEER_IDENTITY_MAX_PRINCIPAL: usize = 128;
-pub const PEER_IDENTITY_MAX_TOTAL: usize = PEER_IDENTITY_HEADER_LEN
-    + PEER_IDENTITY_FIXED_PAYLOAD_LEN
-    + PEER_IDENTITY_MAX_FINGERPRINT
-    + PEER_IDENTITY_MAX_PRINCIPAL;
+pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = abi::contracts::net::peer_identity::PAYLOAD_FIXED;
+pub const PEER_IDENTITY_MAX_FINGERPRINT: usize = abi::contracts::net::peer_identity::MAX_FINGERPRINT;
+pub const PEER_IDENTITY_MAX_PRINCIPAL: usize = abi::contracts::net::peer_identity::MAX_PRINCIPAL;
+pub const PEER_IDENTITY_MAX_TOTAL: usize = abi::contracts::net::peer_identity::MAX_TOTAL;
 
 /// The facts a completed (or refused) handshake established.
 #[derive(Clone, Copy)]
@@ -4521,7 +4481,7 @@ unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
     // enforced only when `clock_policy` demanded it AND the profile was
     // `ca_dns` — which is precisely the combination `chain_policy` uses.
     // A consumer can therefore tell "trusted chain, lifetime unchecked"
-    // from "fully verified", which the old boolean could not express.
+    // from "fully verified" — the distinction a single boolean erases.
     let (result, credential_kind, flags) = if pk_len == 0 {
         (peer_result::NO_CREDENTIAL, peer_credential::NONE, 0u32)
     } else {
@@ -4758,12 +4718,11 @@ unsafe fn pump_send_client_finished(s: &mut TlsState, idx: usize) -> bool {
 }
 
 // ============================================================================
-// Encrypted record helpers — now thin queue facades.
+// Encrypted record helpers — thin queue facades.
 //
-// Both functions used to do their own record I/O. Phase A.next moves
-// encryption/decryption out into `record_drain_inbound` /
-// `record_drain_outbound`, leaving these as queue helpers so the
-// existing pump_* callers don't need to be touched.
+// Encryption and decryption live in `record_drain_inbound` /
+// `record_drain_outbound`; these only queue, so the record path has one
+// owner and a caller cannot reach the cipher by another route.
 // ============================================================================
 
 /// Append a complete handshake message (4-byte header + body) to the
@@ -5215,8 +5174,8 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         return;
     }
 
-    // Copy header + ciphertext into the state-resident decrypt scratch
-    // (a full record no longer fits on the kernel stack).
+    // Copy header + ciphertext into the state-resident decrypt scratch:
+    // a full record does not fit on the kernel stack.
     let mut hdr = [0u8; 5];
     core::ptr::copy_nonoverlapping(sess.recv_buf.as_ptr(), hdr.as_mut_ptr(), 5);
     // SAFETY: `record_scratch` and `sessions[idx].recv_buf` are disjoint

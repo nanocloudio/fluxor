@@ -153,6 +153,10 @@ Plus channel-served protocols (no contract id — there's nothing to
 dispatch, just message formats):
 
 - `contracts/net/net_proto.rs` — TCP/UDP control-plane framing between IP and higher layers
+- `contracts/net/peer_identity.rs` — what a TLS handshake established about
+  the peer, with accessors. `tls` writes the record and every consumer reads
+  it through this file, so the layout is declared once rather than counted at
+  each call site
 - `contracts/storage/graph_slot.rs` — OTA reconfigure FMP protocol
 - `contracts/storage/runtime_params.rs` — per-module-scoped `STORE` / `DELETE` / `CLEAR_ALL`
 - `contracts/storage/paged_arena.rs` — kernel-pager ↔ backing-store protocol

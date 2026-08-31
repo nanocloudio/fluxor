@@ -1,0 +1,28 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux"]
+
+# Seeds ONE key. A graph that needs several instantiates several — which keeps
+# the params flat and the wiring obvious, and matches how the Linux E2Es seed
+# (one store_put per object) rather than inventing a batch format.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+# A module with NO ports is not scheduled — it has no edge, so nothing places
+# it in the graph and it never steps. These exist only to give the seeder a
+# self-edge, the same 1-node cycle every store-driven source uses; nothing is
+# ever written to or read from them.
+[[ports]]
+name = "changes"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 256
+
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 256
+
+[observability]
+exempt = "one-shot store-seeding fixture; its '[seed]' log line is the observable, and it writes one key rather than carrying a byte stream"
