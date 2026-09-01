@@ -70,11 +70,11 @@ mod playback_backend {
                             }
                         }
                     },
-                    move |e| log::warn!("[linux_audio] cpal stream error: {}", e),
+                    move |e| log::warn!("[linux_audio] cpal stream error: {e}"),
                     None,
                 )
-                .map_err(|e| format!("cpal build_output_stream: {}", e))?;
-            stream.play().map_err(|e| format!("cpal play: {}", e))?;
+                .map_err(|e| format!("cpal build_output_stream: {e}"))?;
+            stream.play().map_err(|e| format!("cpal play: {e}"))?;
             log::info!(
                 "[linux_audio] cpal stream started ({}Hz {}ch on '{}')",
                 sample_rate,
@@ -432,7 +432,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
         match playback_backend::PlaybackBackend::spawn(sample_rate, channels) {
             Ok(p) => (Some(p), cap),
             Err(e) => {
-                log::warn!("[linux_audio] playback init failed: {}; muting", e);
+                log::warn!("[linux_audio] playback init failed: {e}; muting");
                 failed = true;
                 (None, 0)
             }

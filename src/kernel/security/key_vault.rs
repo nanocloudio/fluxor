@@ -1181,7 +1181,12 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                         }
                         match open_persisted(pi) {
                             Some(i) => i,
-                            None => return ERROR,
+                            None => {
+                                log::warn!(
+                                    "[vault] open refused: persisted entry would not reopen (suite={suite})"
+                                );
+                                return ERROR;
+                            }
                         }
                     }
                     None => {
@@ -1189,13 +1194,18 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                             return ENOENT;
                         }
                         if usage == 0 || usage & !suite_usage(suite) != 0 {
+                            log::warn!(
+                                "[vault] open refused: usage {usage:#x} outside suite {suite}'s mask"
+                            );
                             return EINVAL;
                         }
                         let Some(i) = alloc_slot() else {
+                            log::warn!("[vault] open refused: no free slot (suite={suite})");
                             return ENOMEM;
                         };
                         let mut key = [0u8; MAX_KEY_BYTES];
                         if !generate_into(suite, &mut key[..priv_len]) {
+                            log::warn!("[vault] open refused: keygen failed (suite={suite})");
                             return ERROR;
                         }
                         SLOTS[i].suite = suite;
@@ -1227,6 +1237,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 return ERANGE;
             }
             if !pub_ptr.is_null() && !write_public(idx, pub_ptr, pub_len) {
+                log::warn!("[vault] open refused: public-key derivation failed (suite={suite})");
                 return ERROR;
             }
             let wrote = (pub_len as u16).to_le_bytes();

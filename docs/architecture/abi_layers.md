@@ -80,7 +80,7 @@ A kernel service contract has one *default* implementation in
 `src/kernel/`, and a platform may re-register the class dispatch and
 vtable at platform boot with an alternate backend. The consumer-visible
 surface never changes; backends differ only in what the contract's own
-discovery opcodes report (`TIER`, `CAPS`).
+discovery opcodes report (for `KEY_VAULT`: `TIER` and `SUITE_QUERY`).
 
 Current backends of `KEY_VAULT`:
 
@@ -91,7 +91,7 @@ Current backends of `KEY_VAULT`:
 
 Rules for adding a backend: it must sit behind an **existing** kernel
 service contract (a backend never introduces opcodes consumers must
-know about), it must advertise its honest `TIER`/`CAPS` so consumers
+know about), it must advertise its honest discovery answers so consumers
 can adapt, and it must be visible — a row in this table plus a
 descriptor under `modules/platform/<platform>/<name>/` (manifest-only,
 not graph-placeable) so the inventory of kernel-resident code stays
@@ -332,7 +332,9 @@ TLV; built-ins don't re-encode defaults in code.
 
 `fluxor build` (linux family) queries the local `fluxor-linux` binary
 via `--print-features` and rejects YAML that asks for an optional
-backend the binary doesn't provide. Currently checked:
+backend the binary doesn't provide. The binary reports every optional
+backend it carries; the rows below are the subset a config can select,
+and so the subset there is anything to cross-check:
 
 | YAML                                | Required feature  |
 |-------------------------------------|-------------------|
@@ -342,6 +344,10 @@ backend the binary doesn't provide. Currently checked:
 
 The error message names the exact `cargo build` invocation that adds
 the missing feature.
+
+`host-hsm` is reported but has no row: the PKCS#11 `key_vault` backend
+is chosen by environment at platform boot, not by a config field, so
+there is nothing in the YAML to check it against.
 
 ## Capacity profiles — `abi::config`
 

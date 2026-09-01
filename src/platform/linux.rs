@@ -80,17 +80,23 @@ fn parse_args() -> CliArgs {
                 process::exit(0);
             }
             "--print-features" => {
-                // Newline-separated feature list. The tool's `fluxor
-                // run` (config.rs::validate_runtime_features) parses
-                // this to reject configs that need a feature absent
-                // from the binary, e.g. `linux_display.mode = "window"`
-                // without `--features host-window`.
+                // Newline-separated inventory of the optional backends
+                // this binary carries. `fluxor build` parses it to
+                // reject a config asking for one that is absent, e.g.
+                // `linux_display.mode = "window"` without
+                // `--features host-window`. The list is the whole
+                // inventory, not only the YAML-selectable part: a
+                // backend chosen by environment rather than by config
+                // is otherwise indistinguishable, from outside, from a
+                // backend that was never compiled in.
                 #[cfg(feature = "host-window")]
                 println!("host-window");
                 #[cfg(feature = "host-playback")]
                 println!("host-playback");
                 #[cfg(feature = "host-image")]
                 println!("host-image");
+                #[cfg(feature = "host-hsm")]
+                println!("host-hsm");
                 process::exit(0);
             }
             // Everything after `--` is the app's argv — cli_in reads it

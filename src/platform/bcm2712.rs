@@ -3169,14 +3169,26 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     unsafe {
         #[cfg(feature = "board-pi5")]
         {
-            // Enable RNG if not already running
+            // Enable RNG if not already running.
+            //
+            // The waits below are TIME-bounded, not iteration-bounded. The
+            // old spin (`wait < 1_000_000` iterations, ~0.4 ms at these
+            // clocks) sat under the FIFO's refill rate for anything past
+            // the words already buffered: an 8-byte read rode the FIFO and
+            // succeeded while a 32-byte key-generation fill starved on its
+            // later words and failed — so the vault could not open ANY key
+            // on this silicon while the RANDOM_FILL syscall looked healthy.
+            // Found by kagi's suite_bench probe beat (rng=8 beside five
+            // keygen-failed suites). 20 ms per word is orders of magnitude
+            // above the block's refill time and still small enough that a
+            // failure is a real hardware fault rather than a tight race.
+            const WORD_WAIT_US: u64 = 1_000_000;
             let ctrl = core::ptr::read_volatile(RNG200_CTRL);
             if ctrl & 1 == 0 {
                 core::ptr::write_volatile(RNG200_CTRL, ctrl | 1);
-                // Wait for initial seed
-                let mut wait = 0u32;
-                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 1_000_000 {
-                    wait += 1;
+                let deadline = bcm_now_micros() + WORD_WAIT_US;
+                while core::ptr::read_volatile(RNG200_COUNT) == 0 && bcm_now_micros() < deadline {
+                    core::hint::spin_loop();
                 }
                 if core::ptr::read_volatile(RNG200_COUNT) == 0 {
                     uart_puts(b"[rng200] FATAL: no entropy after enable\r\n");
@@ -3186,10 +3198,10 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
 
             let mut i = 0usize;
             while i < len {
-                // Wait for data available
-                let mut wait = 0u32;
-                while core::ptr::read_volatile(RNG200_COUNT) == 0 && wait < 1_000_000 {
-                    wait += 1;
+                // Wait for data available.
+                let deadline = bcm_now_micros() + WORD_WAIT_US;
+                while core::ptr::read_volatile(RNG200_COUNT) == 0 && bcm_now_micros() < deadline {
+                    core::hint::spin_loop();
                 }
                 if core::ptr::read_volatile(RNG200_COUNT) == 0 {
                     uart_puts(b"[rng200] FATAL: entropy timeout\r\n");

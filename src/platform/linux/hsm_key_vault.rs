@@ -20,22 +20,21 @@
 //! - `ECDH` → `C_DeriveKey` with `CKM_ECDH1_DERIVE` (CKD_NULL KDF): the
 //!   32-byte X coordinate lands in a throwaway extractable session
 //!   secret, is copied to the caller per the contract, and the object
-//!   is destroyed. `ALG_P256` in CAPS covers ECDSA *and* ECDH, so a
-//!   backend advertising it must implement both.
+//!   is destroyed. The P-256 usage mask covers both SIGN and AGREE, so a
+//!   backend reporting it must implement both.
 //! - `PUBLIC` → read `CKA_EC_POINT` (DER OCTET STRING unwrapped to the
 //!   65-byte SEC1 point).
 //! - `VERIFY` → delegated to the kernel software implementation: it takes
 //!   a caller-supplied public key and touches no custodial material.
 //! - `STORE` → `ENOSYS`. A non-extractable token cannot import an
-//!   external private key; CAPS clears `STORE_IMPORT` so consumers know
-//!   to use `GENERATE` (RFC §6.2).
+//!   external private key; `SUITE_QUERY` reports a private length of 0,
+//!   so consumers know to use `GENERATE` (RFC §6.2).
 //! - `TIER` → `PROCESS_HW`: a host process talking to a token isolates
 //!   the key from host-memory compromise to the extent the token does.
 //!
-//! CAPS advertises `GENERATE | PUBLIC | NON_EXTRACTABLE | ALG_P256` only:
-//! this backend is P-256-scoped, so `ALG_ED25519` reads 0 here per the
-//! CAPS discipline — a consumer that needs EdDSA sees the bit clear and
-//! falls back per its own policy.
+//! This backend is P-256-scoped. `SUITE_QUERY` answers `ENOSYS` for every
+//! other suite and `SUITE_ENUM` lists only P-256, so a consumer that needs
+//! EdDSA learns it before it commits and falls back per its own policy.
 //!
 //! Generated keys are *session* objects (`CKA_TOKEN=false`): vault slots
 //! are per-run (the software backend wipes on scheduler reset), so
@@ -78,10 +77,6 @@ use crate::kernel::module::provider;
 /// DER encoding of the `secp256r1` (NIST P-256, a.k.a. `prime256v1`)
 /// named-curve OID `1.2.840.10045.3.1.7`, as required for `CKA_EC_PARAMS`.
 const SECP256R1_OID_DER: [u8; 10] = [0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
-
-/// P-256 raw-scalar key type (contract `key_type` byte 1) — the only
-/// algorithm this backend implements.
-const KEY_TYPE_P256_SCALAR: u8 = 1;
 
 /// P-256 group order `n`, big-endian.
 const P256_N: [u8; 32] = [
@@ -411,8 +406,9 @@ pub unsafe fn hsm_key_vault_dispatch(
             *arg = dev_key_vault::tier::PROCESS_HW;
             1
         }
-        // Import is unavailable against a non-extractable token; CAPS
-        // clears STORE_IMPORT so consumers already know (RFC §6.2).
+        // Import is unavailable against a non-extractable token, which
+        // SUITE_QUERY already reported as a private length of 0
+        // (RFC §6.2).
         dev_key_vault::STORE => ENOSYS,
         dev_key_vault::ECDH => {
             // arg: [peer_len:u32][peer[peer_len]]
@@ -561,8 +557,8 @@ pub unsafe fn hsm_key_vault_dispatch(
                 Err(_) => return ERROR,
             };
             // The private key is sensitive + non-extractable regardless
-            // of the flags byte: this backend has nothing weaker to
-            // offer, and CAPS NON_EXTRACTABLE advertises the guarantee.
+            // of the flags byte: this backend has nothing weaker to offer,
+            // so a caller asking for the guarantee always gets it.
             // Session objects (Token=false): vault slots are per-run.
             let pub_template = [
                 Attribute::Token(false),

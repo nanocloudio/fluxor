@@ -158,9 +158,15 @@ the suites cannot be half-present.
 
 The backend is platform-overridable: the Linux platform registers a
 PKCS#11 HSM backend (`src/platform/linux/hsm_key_vault.rs`) when
-`FLUXOR_HSM_PKCS11_MODULE` is set at platform boot. The consumer-visible
-opcode surface is identical; backends differ only in what `TIER` and
-`CAPS` report. See [abi_layers.md](abi_layers.md) for the backend rules.
+`FLUXOR_HSM_PKCS11_MODULE` is set at platform boot. It is compiled into
+the published runtime (the `host-hsm` feature), so selecting it is a
+matter of configuration; a binary built without the feature reports the
+absence through `--print-features`. Registration is fail-soft — a
+configured token that cannot be opened leaves the software backend live
+rather than failing the boot, and `TIER` is what says which one answered.
+The consumer-visible opcode surface is identical; backends differ only in
+what `TIER` and `SUITE_QUERY` report. See [abi_layers.md](abi_layers.md)
+for the backend rules.
 
 ### TLS integration
 

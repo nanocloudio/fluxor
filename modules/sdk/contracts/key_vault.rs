@@ -13,12 +13,6 @@
 // cost" (per-suite, with sizes), and `TIER` answers "what isolation level
 // does it provide" (ordinal, [`tier`]). A consumer MUST NOT claim a
 // hardware guarantee it did not read from `TIER`.
-//
-// `SUITE_QUERY` replaced a `caps` bitmap whose own documentation described
-// a reserve-then-implement extension dance — compatibility machinery, which
-// `C15` exists to remove. It also could not answer the question a caller
-// actually has: a bit says P-256 is supported and cannot say how many bytes
-// an ML-DSA-65 signature needs.
 
 /// Returns 1 if a key-vault backend is present, 0 if not. Call with
 /// handle=-1 and arg=null to detect at `module_new`.
@@ -33,9 +27,8 @@ pub const PROBE: u32 = 0x1000;
 /// Returns an opaque handle (>= 0) or negative errno. Pass the handle back
 /// unmodified to SIGN / ECDH / PUBLIC / DESTROY; do not decode it.
 ///
-/// `suite` replaces `key_type: u8` and `key_len` is a `u32` — an ML-DSA-87
-/// private key is 4896 bytes, which the previous `u8` length could not
-/// express at all.
+/// `key_len` is a `u32` because an ML-DSA-87 private key is 4896 bytes; no
+/// narrower field can express one.
 ///
 /// STORE is an *import* path: the key existed outside the backend and is
 /// received-then-wiped, not never-present. A non-extractable HSM may refuse
@@ -76,7 +69,7 @@ pub const ECDH: u32 = 0x1002;
 /// Returns 0 on success, `-ERANGE` with `sig_len_out` set to the
 /// requirement when the buffer is short, negative errno otherwise.
 ///
-/// `sign_mode` is on the wire rather than inferred from `key_type` — see
+/// `sign_mode` is on the wire rather than inferred from the suite — see
 /// [`sign_mode`]. Inferring it means a caller that hands a P-256 slot a
 /// message rather than its digest gets a valid signature over the wrong
 /// thing, with nothing on the wire saying which convention applied.
@@ -152,9 +145,10 @@ pub const PUBLIC: u32 = 0x1007;
 /// guarantee it did not read from here.
 pub const TIER: u32 = 0x1008;
 
-/// Key suites. Replaces the two-value `key_type: u8`.
+/// Key suites: what a slot's key bytes mean, which operations it admits,
+/// and how big each answer is.
 ///
-/// A `u16` because the space this has to hold is not two: ML-DSA and
+/// A `u16` because the space this has to hold is large: ML-DSA and
 /// SLH-DSA come in three parameter sets each, ML-KEM in three more, and
 /// every hybrid is its own entry. A byte would have been enough for a
 /// decade and then not, and widening a field that eleven modules index by
@@ -183,12 +177,12 @@ pub mod suite {
 
 /// How [`SIGN`] should treat the bytes it is given.
 ///
-/// On the wire rather than inferred from `key_type`. Inference works while
-/// there are two algorithms and one convention each — a P-256 slot gets a
-/// digest, an Ed25519 slot gets the whole message — but it requires the
-/// caller to know which without the wire ever saying, and a caller that
-/// hands a P-256 slot a message rather than its digest gets a valid
-/// signature over the wrong thing.
+/// On the wire rather than inferred from the suite. Inference would hold
+/// only while each suite has one convention — a P-256 slot gets a digest,
+/// an Ed25519 slot gets the whole message — and it requires the caller to
+/// know which without the wire ever saying, so a caller that hands a P-256
+/// slot a message rather than its digest gets a valid signature over the
+/// wrong thing.
 pub mod sign_mode {
     /// Sign the bytes as given. Ed25519's convention (RFC 8032 signs the
     /// full message).

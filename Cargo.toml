@@ -96,8 +96,9 @@ cpal = { version = "0.15", optional = true }
 # ── host-hsm: PKCS#11 key_vault backend ────────────────────────────────
 # Hardware binding for the key_vault contract (rfc_crypto_extensions
 # §4.3): the cryptoki dependency lives here in fluxor's Linux platform,
-# never in a consumer. Gated behind `host-hsm` so default host builds
-# stay dep-free; the kernel software backend remains the default.
+# never in a consumer. It resolves its PKCS#11 module by path at
+# runtime, so it links no token library and costs nothing until one is
+# configured — which is why the published runtime carries it.
 cryptoki = { version = "0.12", optional = true }
 
 # ── host-image: host_image_codec (JPEG/PNG/BMP → RGB565) ───────────────
@@ -218,11 +219,13 @@ host-window = ["host-linux", "winit", "softbuffer"]
 # available.
 host-playback = ["host-linux", "cpal"]
 
-# Optional PKCS#11 `key_vault` backend: override the kernel software
-# vault with an HSM/token (SoftHSM2 in tests) when configured via
-# FLUXOR_HSM_PKCS11_MODULE + token selector + PIN env vars. Off by
-# default; without it (or without configuration) KEY_VAULT stays on
-# the kernel software backend (TIER=SOFTWARE).
+# PKCS#11 `key_vault` backend: overrides the kernel software vault with
+# an HSM/token (SoftHSM2 in tests) when FLUXOR_HSM_PKCS11_MODULE + token
+# selector + PIN are set. Carried by the published runtime (Makefile
+# `install`), so reaching a PROCESS_HW custody tier is a matter of
+# configuration rather than of rebuilding. Unconfigured, the backend
+# never registers and KEY_VAULT stays on the software one
+# (TIER=SOFTWARE).
 host-hsm = ["host-linux", "cryptoki"]
 
 # Optional `host_image_codec` built-in: decode JPEG/PNG/BMP/GIF into

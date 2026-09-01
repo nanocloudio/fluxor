@@ -83,7 +83,7 @@ clean:
 # rebuild is picked up with no re-install.
 install:
 	cargo build --release -p fluxor-tools -p fluxor-launcher --target $(HOST_TRIPLE)
-	cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback --target $(HOST_TRIPLE)
+	cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback,host-hsm --target $(HOST_TRIPLE)
 	$(HOST_DIR)/fluxor publish --only runtime
 	install -D -m755 $(LAUNCHER) $(BINDIR)/fluxor
 	@mkdir -p $(RIG_BACKEND_DIR)
