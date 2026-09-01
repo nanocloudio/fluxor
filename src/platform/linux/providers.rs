@@ -11,11 +11,24 @@ use crate::kernel::ipc::channel;
 /// constant suffices.
 const LINUX_FS_DEVICE_ID: DeviceId = 0x6c69_6e75_785f_6673; // "linux_fs"
 
-/// File handle table mapping Fluxor handles to libc fds (for files) or
-/// libc DIR* (for OPENDIR'd directories). Slot index is the Fluxor
-/// handle the caller passes back through subsequent FS_READ /
+/// File handle table mapping Fluxor handles to host file descriptors (for
+/// files) or directory streams (for OPENDIR'd directories). Slot index is
+/// the Fluxor handle the caller passes back through subsequent FS_READ /
 /// FS_READDIR / FS_CLOSE calls.
-const MAX_OPEN_FILES: usize = 16;
+///
+/// This table is a hard ceiling on concurrent opens for the whole node,
+/// not a per-consumer one, and exhausting it surfaces far from its cause:
+/// the open fails, and whatever the caller could not open becomes a
+/// failure in that caller's own terms. Sizing it generously is worth more
+/// than the memory it saves.
+///
+/// A replicated-state consumer is the demanding shape — it holds a write-
+/// ahead log open per group plus a couple of metadata slots, so roughly
+/// three handles per group — and 256 leaves room for sixty-odd groups
+/// alongside everything else a node has open. The cost is the static
+/// table below: 256 `LinuxFileSlot`s at 96 bytes each, 24 KiB of BSS on
+/// a platform that already maps a 96 MiB state arena.
+const MAX_OPEN_FILES: usize = 256;
 
 struct LinuxFileSlot {
     fd: i32,
@@ -128,10 +141,10 @@ unsafe fn two_paths(
 ///     downstream policy check saw the longer string),
 ///   - `E2BIG` if the path length exceeds `LINUX_FS_PATH_MAX`.
 ///
-/// Centralised so OPEN, OPEN_CREATE, and OPENDIR get identical
-/// path validation: each arm previously rolled its own
-/// `arg_len.min(255)`, and OPENDIR silently truncated where the
-/// other two reject overlong paths.
+/// Centralised so OPEN, OPEN_CREATE, and OPENDIR get identical path
+/// validation. Per-arm length handling is how one of them ends up
+/// truncating an overlong path where the others reject it, which turns a
+/// caller's mistake into a silently different file.
 ///
 /// # Safety
 /// `arg` must point at `arg_len` readable bytes.
@@ -1989,9 +2002,9 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
             // gate the channel reader.
             let err = *libc::__errno_location();
             if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
-                // Said out loud. A connection dropped on a send error is
+                // Said out loud: a connection dropped on a send error is
                 // indistinguishable, from the peer, from a crash or a
-                // firewall — and this path used to take it in silence.
+                // firewall.
                 log::warn!("[linux_net] dropping conn {conn_id} on send error (errno {err})");
                 let fd = conn.fd;
                 st.conns[idx] = LinuxNetConn::EMPTY;

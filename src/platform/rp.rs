@@ -768,6 +768,13 @@ static RP_HAL_OPS: HalOps = HalOps {
 /// provides one random bit per read from oscillator jitter. We accumulate
 /// 8 bits per output byte. This is genuine hardware entropy suitable for
 /// seeding cryptographic keys.
+///
+/// Returns 0 on success, negative errno on failure — the
+/// [`HalOps::csprng_fill`] contract. A byte count is not a success value
+/// here: callers test the result against 0, so returning `len` reads as a
+/// failure for every non-empty fill.
+///
+/// [`HalOps::csprng_fill`]: crate::kernel::sys::hal::HalOps::csprng_fill
 fn rp_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     // SAFETY: caller is `hal::csprng_fill` which guarantees `buf` is valid
     // for `len` bytes. `i` is bounded by `len`, so `buf.add(i)` stays
@@ -786,7 +793,7 @@ fn rp_csprng_fill(buf: *mut u8, len: usize) -> i32 {
             i += 1;
         }
     }
-    len as i32
+    0
 }
 
 // ============================================================================

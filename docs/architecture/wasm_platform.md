@@ -173,7 +173,8 @@ logging fill on rp2350. `host_csprng_fill` fills a buffer with
 cryptographically secure random bytes (browser hosts delegate to
 `crypto.getRandomValues`); hosts that cannot provide a CSPRNG must
 return a negative errno, because TLS and key generation treat this as
-cryptographic entropy.
+cryptographic entropy. A successful fill returns 0, not the byte count —
+the value is propagated unchanged to callers that test it against 0.
 
 ### Memory
 

@@ -3161,7 +3161,12 @@ const RNG200_COUNT: *const u32 = (RNG200_BASE + 0x0C) as *const u32;
 /// Pi 5 (board-pi5): Uses iproc-rng200 hardware TRNG at 0x10_7d20_8000.
 /// QEMU virt: Uses CNTPCT_EL0 counter jitter with LCG mixing (weak).
 ///
-/// Returns len on success, -1 if the hardware failed to produce entropy.
+/// Returns 0 on success, -1 if the hardware failed to produce entropy —
+/// the [`HalOps::csprng_fill`] contract. A byte count is not a success
+/// value here: callers test the result against 0, so returning `len`
+/// reads as a failure for every non-empty fill.
+///
+/// [`HalOps::csprng_fill`]: crate::kernel::sys::hal::HalOps::csprng_fill
 fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     // SAFETY: iproc-rng200 MMIO is the documented BCM2712 RNG block;
     // mapped by `boot_mmu::init_page_tables`. `buf`/`len` come from a
@@ -3236,7 +3241,7 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
             }
         }
     }
-    len as i32
+    0
 }
 
 /// Panic latch — a panic on a secondary core prints to the (possibly unwired)

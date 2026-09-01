@@ -559,8 +559,11 @@ pub const ARENA_GET: u32 = 0x0C3A;
 
 /// Fill buffer with cryptographically secure random bytes.
 /// handle=-1, arg=output buffer, arg_len=requested byte count.
-/// Returns bytes written (== arg_len) on success, or negative errno.
-/// Source: TRNG/ROSC on RP, timer hash on BCM2712, getrandom on Linux.
+/// Returns 0 on success, or a negative errno. A fill is all-or-nothing:
+/// there is no partial success to report a byte count for, and a caller
+/// that gets 0 has every one of `arg_len` bytes.
+/// Entropy comes from whatever the platform calls a CSPRNG — a hardware
+/// TRNG where one exists, the host CSPRNG where the kernel is hosted.
 pub const RANDOM_FILL: u32 = 0x0C3C;
 
 /// Query system clock frequency in Hz. handle=-1. Returns u32 (e.g. 125_000_000).

@@ -29,6 +29,11 @@ extern "C" {
     /// downstream consumers (TLS, key generation) treat
     /// `dev_csprng_fill` as cryptographic entropy and will produce
     /// insecure output if seeded with anything weaker.
+    ///
+    /// A successful fill returns **0**, not the byte count: this value is
+    /// propagated unchanged as the platform's `csprng_fill`, whose callers
+    /// test it against 0, so a host returning `len` reads as a failure on
+    /// every non-empty fill.
     fn host_csprng_fill(buf: *mut u8, len: usize) -> i32;
 }
 
