@@ -126,14 +126,13 @@ pub struct ModuleFaultInfo {
     /// Diagnostic-cadence class: feeds the ABI `FaultStats.ticks_since_fault`
     /// field and the best-effort cascade-attribution byte. Kept tick-counted
     /// — these are best-effort and mis-scale harmlessly under adaptive pacing
-    /// (RFC adaptive_tick §7.6, diagnostic class).
+    /// (diagnostic class).
     pub last_fault_tick: u32,
     /// Wall-clock timestamp (ms, `hal::now_millis()`) at last fault. Drives
     /// the *correctness* quarantine-window decision (`QUARANTINE_WINDOW_MS`),
     /// which must measure real elapsed time rather than a tick count that
     /// silently re-scales the moment mechanism (b) varies the period or
-    /// mechanism (a) idle-sleep stops advancing the tick (RFC adaptive_tick
-    /// §7.6 remedy iii).
+    /// mechanism (a) idle-sleep stops advancing the tick.
     pub last_fault_ms: u64,
     /// Backoff countdown (ticks remaining before restart attempt).
     pub backoff_remaining: u32,
@@ -206,7 +205,7 @@ impl ModuleFaultInfo {
         self.last_fault_type = fault_kind;
         self.last_fault_tick = tick;
         // Wall-clock stamp for the quarantine-window correctness decision;
-        // independent of the tick-counted diagnostics above (RFC §7.6 iii).
+        // independent of the tick-counted diagnostics above.
         self.last_fault_ms = hal::now_millis();
     }
 

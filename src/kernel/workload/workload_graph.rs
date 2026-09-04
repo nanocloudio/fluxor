@@ -1,6 +1,5 @@
 // ============================================================================
-// Metal module-graph `workload` backend (contract class 0x1A)
-// — rfc_workload_backend_metal.md P1.
+// Metal module-graph `workload` backend (contract class 0x1A).
 // ============================================================================
 //
 // The bare-metal realization of the `workload` contract: a workload is an owned
@@ -13,7 +12,7 @@
 // end-to-end there (the metal registration in `bcm2712::bcm_init_providers` is a
 // thin wrapper that installs `workload_dispatch` as the 0x1A provider).
 //
-// Per-op mapping (RFC §2):
+// Per-op mapping:
 //   CREATE  — decode the `source_ref` FLXA subgraph → `apply_add`; stage paused
 //             (§4.1 START barrier); lease-gate the header endpoints; allocate a
 //             `WorkloadSlot`; return `tag_fd(FD_TAG_WORKLOAD, idx)`.
@@ -23,14 +22,13 @@
 //   DESTROY — `free_owner` + clear the slot (idempotent).
 //   PAUSE / RESUME — `owner_pause` / `owner_resume` (direct).
 //   CAPS    — the metal bitmap (§4.4): SHARED posture, FMOD_GRAPH source, PAUSE
-//             op, no net identity (P2/P3).
+//             op, no net identity.
 //
-// **Dispatch context invariant (RFC §3.2 / P0):** runtime `apply_add`/
-// `free_owner` must run on the primary domain / core 0 — `request_quiesce` (the
-// metal WS-D peer-core quiesce P0 built into `apply_add`/`free_owner`) is
-// primary-only. The `workload` provider dispatches on the system graph, which
-// lives on domain 0, so this holds naturally; there is no secondary-core path
-// into this backend.
+// **Dispatch context invariant:** runtime `apply_add`/ `free_owner` must run
+// on the primary domain / core 0 — `request_quiesce` (the peer-core quiesce
+// built into `apply_add`/`free_owner`) is primary-only. The
+// `workload` provider dispatches on the system graph, which lives on domain 0,
+// so this holds naturally; there is no secondary-core path into this backend.
 
 use crate::abi::contracts::workload as wl;
 use crate::kernel::exec::scheduler::live;
@@ -42,19 +40,18 @@ use crate::kernel::sys::errno;
 use crate::kernel::workload::owner::{OwnerHandle, MAX_OWNERS, OWNER_SYSTEM};
 use crate::kernel::workload::owner_plan::{lease_gate, LeaseGate};
 
-// ── Metal net identity install (§3.3, P2) ───────────────────────────────────
+// ── Metal net identity install ───────────────────────────────────
 //
-// On CREATE of a `net=own` workload the backend installs the workload's address
-// into the node's shared net-identity provider (`rfc_net_identity_metal` §3) by
-// writing an `ADDR_ADD` control frame to the provider's `addr_ctl` port;
-// DESTROY/KILL writes `ADDR_DEL`. The backend does NOT know which module the
-// provider is, what it is named, or how it stores addresses — the provider
-// SELF-REGISTERS at init via the `NET_IDENT_PROVIDER` syscall, declaring its
-// module slot and its control/ingress port indices, and the backend speaks the
-// shared `net::identity` contract (opcodes, framing, payload layout) to
-// whatever registered. Any base-graph module implementing the contract's
-// `addr_ctl` receiver is a valid provider; the foundation `ip` module is
-// today's.
+// On CREATE of a `net=own` workload the backend installs the workload's
+// address into the node's shared net-identity provider by writing an
+// `ADDR_ADD` control frame to the provider's `addr_ctl` port; DESTROY/KILL
+// writes `ADDR_DEL`. The backend does NOT know which module the provider is,
+// what it is named, or how it stores addresses — the provider SELF-REGISTERS
+// at init via the `NET_IDENT_PROVIDER` syscall, declaring its module slot and
+// its control/ingress port indices, and the backend speaks the shared
+// `net::identity` contract (opcodes, framing, payload layout) to whatever
+// registered. Any base-graph module implementing the contract's `addr_ctl`
+// receiver is a valid provider; the foundation `ip` module is today's.
 
 use crate::abi::contracts::net::identity as netid;
 use portable_atomic::{AtomicU32, Ordering};
@@ -175,7 +172,7 @@ fn addr_ctl_channel() -> i32 {
 }
 
 /// Resolve the next FREE spare lane of the boot merge feeding the registered
-/// net-identity provider's declared ingress port (§7 P4 keystone). This is the
+/// net-identity provider's declared ingress port. This is the
 /// channel a `net=own` workload's net-facing producer edges into so its egress
 /// reaches the shared provider through the merge. Returns the lane channel id,
 /// or `-1` when no provider registered, there is no boot merge on the
@@ -228,7 +225,7 @@ unsafe fn write_addr_ctl_frame(ch: i32, msg_type: u8, payload: &[u8]) -> bool {
 /// `owner_tag = owner_slot`. The address is live before START releases the
 /// workload. Returns 0, or a negative errno:
 ///   * `ENODEV` — no provider / addr_ctl in the base graph (a `net=own` CREATE
-///     on a node with no network stack fails cleanly, §7 P2 — never silently
+///     on a node with no network stack fails cleanly — never silently
 ///     dropped),
 ///   * `EBUSY`  — the base graph wired a producer into addr_ctl (mis-wire),
 ///   * `EAGAIN` — the low-rate control ring rejected the frame.
@@ -321,13 +318,13 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     if source_kind != wl::SOURCE_FMOD_GRAPH {
         return errno::ENOSYS;
     }
-    // P1 realizes POSTURE_SHARED only; ISOLATED/HARDENED need EL0 wiring (§5).
+    // Only POSTURE_SHARED is realized; ISOLATED/HARDENED need EL0 wiring.
     if posture != wl::POSTURE_SHARED {
         return errno::ENOSYS;
     }
-    // Net identity admission (§3.3, P2). P2 realizes an IPv4 own-domain
-    // identity — `net_iso == OWN` together with `net_family == IPV4`. A bare
-    // host-shared workload (`SHARED` + `NONE`) keeps the P1 path (no install).
+    // Net identity admission. The realized identity is IPv4 own-domain —
+    // `net_iso == OWN` together with `net_family == IPV4`. A bare
+    // host-shared workload (`SHARED` + `NONE`) installs nothing.
     // Anything in between is fail-closed:
     //   * net_iso beyond OWN is malformed,
     //   * own-iso XOR a family (one without the other) is a half-specified
@@ -349,7 +346,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
             return errno::EINVAL;
         }
         if ep_iso == wl::NET_ISO_OWN {
-            return errno::ENOSYS; // own-domain endpoint is P2, not realized here
+            return errno::ENOSYS; // own-domain endpoint is not realized here
         }
     }
 
@@ -375,11 +372,11 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
     //    modules, edges, caps), allocates the owner, instantiates + splices —
     //    the complete admission gate (name_hash resolvable in flash, bounds,
     //    atomic rollback). On metal this is the first runtime `apply_add`, which
-    //    drives P0's dormant per-domain splice + multicore quiesce. On success
+    //    drives the per-domain splice + multicore quiesce. On success
     //    it writes `[slot:u16 LE][generation:u32 LE]` into the blob's first 6
     //    bytes; we read the owner handle back from there.
     //
-    //    Spare-lane injection seam (§7 P4 workload-manager, option A). A `net=own`
+    //    Spare-lane injection seam. A `net=own`
     //    workload composes its net-facing producer edge with a
     //    `SPARE_LANE_SENTINEL` `to` (the workload manager cannot name a kernel runtime
     //    channel off-node). Resolve the boot merge's next free spare lane on
@@ -422,7 +419,7 @@ unsafe fn workload_create(arg: *mut u8, arg_len: usize) -> i32 {
         }
     }
 
-    // ── Net-identity install (§3.3, P2). Install the workload's address into the
+    // ── Net-identity install. Install the workload's address into the
     //    net-identity provider BEFORE the START barrier — the address is
     //    live/ARP-answered before the workload ever runs (the provider makes it
     //    "live before any bind"). owner_tag = the just-allocated
@@ -549,20 +546,20 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     // exec into) stay clear; the SIGNAL bit asserts real process-group signal
     // delivery this backend does not provide (TERM→drain, KILL→free).
     out[2..4].copy_from_slice(&wl::caps::PAUSE.to_le_bytes());
-    // Net (§4.4): NET_ISO_OWN | NET_IDENTITY — P2 realizes a `net=own` workload's
-    // own IPv4 address (installed into the net-identity provider,
-    // ARP-answered). Owner-scoped *binds* to that address are still P3 (the
-    // workload's binds run host-wildcard until then), but the address itself is
-    // live at P2, so both bits are honestly set.
+    // Net: NET_ISO_OWN | NET_IDENTITY — a `net=own` workload's own IPv4
+    // address is installed into the net-identity provider and ARP-answered.
+    // Owner-scoped *binds* to that address are not resolved here (the
+    // workload's binds run host-wildcard), but the address itself is live,
+    // so both bits are honestly set.
     out[4] = wl::caps::NET_ISO_OWN | wl::caps::NET_IDENTITY;
     out[5..7].copy_from_slice(&0u16.to_le_bytes()); // ns_count
     7
 }
 
-/// The metal `workload` (0x1A) provider dispatch (RFC §2). CREATE/CAPS are the
-/// `handle = -1` globals; lifecycle ops carry the `FD_TAG_WORKLOAD` handle,
-/// stripped to a slot by `slot_of`. Matches `provider::ProviderDispatch` and the
-/// Linux `linux_workload_dispatch` signature.
+/// The metal `workload` (0x1A) provider dispatch. CREATE/CAPS are the `handle
+/// = -1` globals; lifecycle ops carry the `FD_TAG_WORKLOAD` handle, stripped
+/// to a slot by `slot_of`. Matches `provider::ProviderDispatch` and the Linux
+/// `linux_workload_dispatch` signature.
 ///
 /// # Safety
 /// Scheduler-thread dispatch only: touches `static mut` provider state and the

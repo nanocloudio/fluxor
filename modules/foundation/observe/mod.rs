@@ -312,8 +312,8 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut ObserveState);
         s.init(syscalls as *const SyscallTable);
         // Subscribe to the kernel telemetry ring (all signal types). The old
-        // `telemetry` input port is gone — emission is ring-based now
-        // (`rfc_observability_surface.md` §5.2). `in_chan` is unused.
+        // `telemetry` input port is gone — emission is ring-based now.
+        // `in_chan` is unused.
         let _ = in_chan;
         let sys = &*s.syscalls;
 

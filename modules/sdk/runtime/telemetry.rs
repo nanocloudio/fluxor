@@ -16,15 +16,15 @@ unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
 }
 
-/// Query the calling module's owner slot (`owner_tag`).
-/// See `kernel_abi::OWNER_TAG` (0x0C4B). Returns the module's owner slot as a
+/// Query the calling module's owner slot (`owner_tag`). See
+/// `kernel_abi::OWNER_TAG` (0x0C4B). Returns the module's owner slot as a
 /// `u16`: slot 0 (`OWNER_SYSTEM`) for a base-graph / host-owned module — the
 /// legitimate host / wildcard tag — or the workload's owner slot (>= 1) for a
-/// module `apply_add` staged for a `net=own` workload. A negative errno (called
-/// outside step, unsupported) maps to 0 (host), so an unstamped/host path stays
-/// byte-identical to the pre-P3a wildcard bind. Used by a bind-emitting module
-/// (http, a DG binder) to append the trailing `owner_tag` on its
-/// `NET_CMD_BIND` / `DG_CMD_BIND` (`rfc_workload_backend_metal.md` §3.4 / P3a).
+/// module `apply_add` staged for a `net=own` workload. A negative errno
+/// (called outside step, unsupported) maps to 0 (host), so an unstamped/host
+/// path binds host-wildcard. Used by a
+/// bind-emitting module (http, a DG binder) to append the trailing `owner_tag`
+/// on its `NET_CMD_BIND` / `DG_CMD_BIND`.
 #[allow(
     dead_code,
     reason = "owner-scoped bind stamping; used only by net-facing binders (http, DG)"
@@ -57,13 +57,13 @@ unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
     }
 }
 
-/// Producer-side enabled gate (`rfc_observability_surface.md` §5.1): a plain,
-/// trap-free single-word read of the kernel-published flag. `true` when at least
-/// one telemetry consumer is subscribed, so a record is built only when
-/// something would consume it. A null pointer means "cannot check", not
-/// "disabled" — a table without the word (the wasm host, an isolated module
-/// whose protection domain does not map kernel memory) emits unconditionally
-/// and the ring drops when no consumer is active.
+/// Producer-side enabled gate: a plain, trap-free single-word read of the
+/// kernel-published flag. `true` when at least one telemetry consumer is
+/// subscribed, so a record is built only when something would consume it. A
+/// null pointer means "cannot check", not "disabled" — a table without the
+/// word (the wasm host, an isolated module whose protection domain does not
+/// map kernel memory) emits unconditionally and the ring drops when no
+/// consumer is active.
 #[allow(dead_code, reason = "emit-side helper; invoked only by instrumented modules")]
 #[inline(always)]
 unsafe fn dev_telemetry_enabled(sys: &SyscallTable) -> bool {
@@ -300,8 +300,7 @@ pub const MON_EV_EXPORT_REQ: u8 = 14;
 )]
 pub const MON_EV_RESUME_REQ: u8 = 15;
 // Failover records for platform-replicated-state transport_migratable
-// sessions (monitor-protocol.md §MON_SESSION Failover records;
-// rfc_protocols.md §10.4, §13.7).
+// sessions (monitor-protocol.md §MON_SESSION Failover records).
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"

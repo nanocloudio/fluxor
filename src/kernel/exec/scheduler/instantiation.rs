@@ -366,13 +366,13 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
     }
     let ms = crate::kernel::sys::hal::now_millis();
     // Wall-clock cadence (~30 s), driven by `now_millis()` rather than a
-    // `30_000_000 / tick_us` tick-count threshold. The tick-count form silently
-    // mis-scales the moment mechanism (b) varies the period away from 1 ms, and
-    // stalls entirely when mechanism (a) idle-sleep stops advancing the tick —
-    // so the heartbeat would no longer be ~30 s. Diagnostic-cadence class:
-    // best-effort, no correctness impact (RFC adaptive_tick §7.6).
-    // `LAST_ALIVE_MS` is 0 at boot, so the first heartbeat lands ~30 s in,
-    // matching the previous tick-count behaviour.
+    // `30_000_000 / tick_us` tick-count threshold. The tick-count form
+    // silently mis-scales the moment mechanism (b) varies the period away from
+    // 1 ms, and stalls entirely when mechanism (a) idle-sleep stops advancing
+    // the tick — so the heartbeat would no longer be ~30 s. Diagnostic-cadence
+    // class: best-effort, no correctness impact. `LAST_ALIVE_MS` is 0 at boot,
+    // so the first heartbeat lands ~30 s in, matching the previous tick-count
+    // behaviour.
     let last = LAST_ALIVE_MS[di].load(Ordering::Relaxed);
     if ms.wrapping_sub(last) < ALIVE_INTERVAL_MS {
         return;
@@ -460,12 +460,12 @@ pub fn set_pstatus_interval_ms(ms: u64) {
 }
 
 /// Push one round of kernel-produced PSTATUS records to the telemetry ring: a
-/// `STEP` (step count + step-time histogram — the `MON_HIST` source) and a `RES`
-/// (arena + fault state) per active module, kernel-stamped with that module's
-/// identity (`rfc_observability_surface.md` §5.3). No-op unless a ring consumer
-/// is subscribed (`is_enabled()` — one relaxed load), so the default path is
-/// free. Called once per tick on the default domain from `maybe_emit_alive`;
-/// its own wall-clock cadence gates the actual emit.
+/// `STEP` (step count + step-time histogram — the `MON_HIST` source) and a
+/// `RES` (arena + fault state) per active module, kernel-stamped with that
+/// module's identity. No-op unless a ring consumer is subscribed
+/// (`is_enabled()` — one relaxed load), so the default path is free. Called
+/// once per tick on the default domain from `maybe_emit_alive`; its own
+/// wall-clock cadence gates the actual emit.
 pub fn sample_pstatus() {
     use crate::abi::contracts::telemetry as tlm;
     // Cheap gate: nothing subscribed → build/emit nothing.
@@ -516,13 +516,13 @@ pub fn sample_pstatus() {
     }
 
     // One `POOL` record per kernel resource pool, kernel-stamped — the
-    // ledger's cadence surface (`rfc_resource_model.md` §6.1).
+    // ledger's cadence surface.
     crate::kernel::sys::resource_ledger::emit_all(t);
 }
 
 /// Per-domain wall-clock timestamp (ms) of the last `[sched] alive` heartbeat,
 /// so the cadence is driven by `now_millis()` instead of a tick count that
-/// mis-scales under variable/idle pacing (RFC adaptive_tick §7.6).
+/// mis-scales under variable/idle pacing.
 static LAST_ALIVE_MS: [portable_atomic::AtomicU64; MAX_DOMAINS] =
     [const { portable_atomic::AtomicU64::new(0) }; MAX_DOMAINS];
 /// Wall-clock heartbeat interval for `maybe_emit_alive` (~30 s).
@@ -542,10 +542,10 @@ pub static mut CRASH_DATA: core::mem::MaybeUninit<[u32; 8]> = core::mem::MaybeUn
 pub const CRASH_MAGIC: u32 = 0xDEAD_BEEF;
 
 /// One-shot latch for the post-boot crash-info read (`step_modules`). Set once
-/// per boot so the prior-run `.uninit CRASH_DATA` is read exactly once, gated on
-/// a wall-clock delay rather than a `30_000_000 / tick_us` tick threshold that
-/// mis-scales / can be skipped under variable or idle pacing (RFC adaptive_tick
-/// §7.6, one-shot-correctness class).
+/// per boot so the prior-run `.uninit CRASH_DATA` is read exactly once, gated
+/// on a wall-clock delay rather than a `30_000_000 / tick_us` tick threshold
+/// that mis-scales / can be skipped under variable or idle pacing
+/// (shot-correctness class).
 pub(crate) static CRASH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// Wall-clock delay after boot before the crash-info read (USB serial up).
 pub(crate) const CRASH_CHECK_DELAY_MS: u64 = 30_000;

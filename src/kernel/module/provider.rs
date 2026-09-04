@@ -139,12 +139,12 @@ pub mod contract {
 
     // 0x0017 unused (reserved — do not reassign): a versioned watchable KV is
     // distributed-state logic, not a fluxor primitive; it lives in lattice, and
-    // nanocloud consumes it there. See `.context/fluxor_nanocloud.md` §3.
+    // nanocloud consumes it there.
 
     // 0x0018 and 0x0019 unused (reserved — do not reassign): host isolation is
     // expressed through WORKLOAD (0x1A). The host-process namespace/cgroup mechanism is
     // WORKLOAD's Linux host-process backend (`hp_spawn` in
-    // `src/platform/linux/host_backend.rs`). See `.context/fluxor_nanocloud.md`.
+    // `src/platform/linux/host_backend.rs`).
 
     /// Generic stream-clock capability — opcode class 0x1Cxx. Answers the
     /// `STREAM_TIME` (0x0C30) syscall's audio-clock query independently of any
@@ -160,7 +160,7 @@ pub mod contract {
     /// backend (MPU/EL0 + owner/lease, bare metal) and a host-process backend
     /// (namespaces/cgroups/veth, Linux). The consumer never names a platform.
     /// Gated by `requires_contract = "workload"` AND `platform_raw`; handles are
-    /// `FD_TAG_WORKLOAD`-tagged. See `.context/fluxor_nanocloud.md`.
+    /// `FD_TAG_WORKLOAD`-tagged.
     pub const WORKLOAD: u16 = 0x001A;
     /// Linux host-process mechanics (exec/PTY/read/bundles) — the host-scoped
     /// class evicted from the stable 0x1A surface (D-WORKLOAD-ABI). Registered
@@ -256,9 +256,8 @@ const MAX_TRACKED: usize = 128;
 struct HandleBinding {
     handle: i32,
     contract: ContractId,
-    /// Owner that opened the handle (rfc_k8s.md §14).
-    /// Present only on multi-tenant builds — bare metal carries no per-handle
-    /// ownership state.
+    /// Owner that opened the handle. Present only on multi-tenant builds —
+    /// bare metal carries no per-handle ownership state.
     #[cfg(feature = "multitenant")]
     owner: crate::kernel::workload::owner::OwnerHandle,
 }
@@ -312,14 +311,13 @@ fn track_handle(handle: i32, contract: ContractId) -> Result<(), ()> {
     }
 }
 
-/// Owner-scoping guard for tracked provider handles (rfc_k8s.md §14
-/// invariant 1). Returns `true` — deny — when the calling
-/// module's owner may not use `handle` because it was opened by a different,
-/// non-system owner. Self-identifying FDs (event/timer/dma) are skipped: they
-/// carry no tracking entry and the event/timer subsystems enforce their own
-/// per-module ownership. Compile-time `false` (allow) on single-tenant builds,
-/// and inert on multi-tenant builds until the node agent stamps per-workload owners
-/// (every module is the system owner until then).
+/// Owner-scoping guard for tracked provider handles. Returns `true` — deny —
+/// when the calling module's owner may not use `handle` because it was opened
+/// by a different, non-system owner. Self-identifying FDs (event/timer/dma)
+/// are skipped: they carry no tracking entry and the event/timer subsystems
+/// enforce their own per-module ownership. Compile-time `false` (allow) on
+/// single-tenant builds, and inert on multi-tenant builds until the node agent
+/// stamps per-workload owners (every module is the system owner until then).
 #[cfg(feature = "multitenant")]
 fn deny_cross_owner_handle(handle: i32, syscall: &str) -> bool {
     if handle < 0 || fd_tag_contract(handle).is_some() {
@@ -501,15 +499,15 @@ pub fn provider_open(
     config: *const u8,
     config_len: usize,
 ) -> i32 {
-    // RFC §D7: ISR-tier modules must not touch the provider table.
+    // ISR-tier modules must not touch the provider table.
     // Bridge channels are the only legal cross-tier conduit.
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_open") {
         return errno::EACCES;
     }
-    // Admission gate (rfc_owner_drain_and_logs.md §3.5): opening a provider
-    // handle is NEW admission, refused for a Draining owner. Handles it already
-    // holds keep working (`authorize_use` semantics) so in-flight work can run
-    // dry. System-owned modules are unaffected.
+    // Admission gate: opening a provider handle is NEW admission, refused for
+    // a Draining owner. Handles it already holds keep working (`authorize_use`
+    // semantics) so in-flight work can run dry. System-owned modules are
+    // unaffected.
     #[cfg(feature = "multitenant")]
     {
         let owner = crate::kernel::exec::scheduler::caller_owner();
@@ -599,14 +597,14 @@ pub fn provider_open(
 /// the tag when they need to reject a wrong-family handle (e.g. a
 /// channel-op handler rejecting a DMA-fd tag).
 pub fn provider_call(handle: i32, op: u32, arg: *mut u8, arg_len: usize) -> i32 {
-    // Defense in depth (RFC §D6): ISR-tier (Tier 1b/2) modules must
-    // not reach `provider_call` — the contract is "bridge-only I/O,
-    // no syscalls". The build-time validator already gates
-    // admission; this catches hand-rolled binaries that bypass the
-    // tools pipeline. EXCEPTION: the bridge ops and `SELF_BRIDGES`
-    // enumeration ARE the sanctioned ISR-tier I/O path (lock-free,
-    // allocation-free rings), so they are exempt from the deny here too —
-    // matching the exemption in `syscall_provider_call` (RFC §D7).
+    // Defense in depth: ISR-tier (Tier 1b/2) modules must not reach
+    // `provider_call` — the contract is "bridge-only I/O, no syscalls".
+    // The build-time validator already gates admission; this catches
+    // hand-rolled binaries that bypass the tools pipeline. EXCEPTION: the
+    // bridge ops and `SELF_BRIDGES` enumeration ARE the sanctioned
+    // ISR-tier I/O path (lock-free, allocation-free rings), so they are
+    // exempt from the deny here too — matching the exemption in
+    // `syscall_provider_call`.
     if !crate::abi::internal::bridge::is_isr_safe(op)
         && crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_call")
     {

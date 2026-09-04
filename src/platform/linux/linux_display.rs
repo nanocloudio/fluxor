@@ -21,8 +21,7 @@ mod window_backend {
 
     /// Publish the current logical content geometry into the Surface Traits
     /// authority's shared slot (`super::SURFACE_WINDOW_GEOM`, packed
-    /// `(w << 16) | h`). Dimensions are clamped to u16. See
-    /// `.context/rfc_surface_traits.md`.
+    /// `(w << 16) | h`). Dimensions are clamped to u16.
     fn publish_surface_geom(w: u32, h: u32) {
         let packed = ((w.min(0xFFFF)) << 16) | h.min(0xFFFF);
         super::SURFACE_WINDOW_GEOM.store(packed, std::sync::atomic::Ordering::Relaxed);
@@ -131,9 +130,8 @@ mod window_backend {
             self.context = Some(context);
             self.surface = Some(surface);
             // Publish the initial logical content geometry to the Surface
-            // Traits authority (rfc_surface_traits.md). `width`/`height` are the
-            // unscaled content size — the viewport an adaptive consumer reasons
-            // about.
+            // Traits authority. `width`/`height` are the unscaled content size
+            // — the viewport an adaptive consumer reasons about.
             publish_surface_geom(self.width, self.height);
         }
 

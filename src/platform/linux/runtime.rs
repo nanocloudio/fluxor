@@ -336,8 +336,8 @@ fn linux_now_micros() -> u64 {
     elapsed_micros()
 }
 fn linux_tick_count() -> u32 {
-    // RFC adaptive_tick §7.6 (D8 rule 8): back the HAL `tick_count`
-    // with wall-clock milliseconds instead of `DBG_TICK`. The identity
+    // Back the HAL `tick_count` with wall-clock milliseconds instead
+    // of `DBG_TICK`. The identity
     // "1 tick == 1 ms" holds only at the fixed 1 ms default; mechanism (b)
     // varies the period and mechanism (a) stops advancing `DBG_TICK` during
     // idle, so a `DBG_TICK`-backed `tick_count` returns wrong "ms since boot"
@@ -348,10 +348,10 @@ fn linux_tick_count() -> u32 {
     (elapsed_micros() / 1000) as u32
 }
 
-/// Portable `sleep_until` (RFC adaptive_tick §5.5 Option B). Parks the calling
-/// (scheduler) thread until `deadline_us` or until `linux_wake_scheduler`
-/// unparks it — the same primitive the native Linux loop uses. A spurious
-/// unpark just returns early; the caller re-checks its work state.
+/// Portable `sleep_until`. Parks the calling (scheduler) thread until
+/// `deadline_us` or until `linux_wake_scheduler` unparks it — the same
+/// primitive the native Linux loop uses. A spurious unpark just returns early;
+/// the caller re-checks its work state.
 fn linux_sleep_until(deadline_us: u64) -> u32 {
     let now = elapsed_micros();
     if deadline_us <= now {
@@ -505,11 +505,11 @@ fn linux_init_providers() {
         dev_class::HOST_PROCESS,
         fluxor::platform::linux::workload::host_process_dispatch,
     );
-    // KEY_VAULT hardware override (rfc_crypto_extensions §4.1/§4.3):
-    // when a PKCS#11 token is configured, re-register both KEY_VAULT
-    // dispatch paths over the kernel software default. Runs after the
-    // kernel-core registrations, so the override wins; unconfigured or
-    // failed, the software backend stays live and reports TIER=SOFTWARE.
+    // KEY_VAULT hardware override: when a PKCS#11 token is configured,
+    // re-register both KEY_VAULT dispatch paths over the kernel software
+    // default. Runs after the kernel-core registrations, so the override
+    // wins; unconfigured or failed, the software backend stays live and
+    // reports TIER=SOFTWARE.
     #[cfg(feature = "host-hsm")]
     fluxor::platform::linux::hsm_key_vault::try_register_from_env();
 }

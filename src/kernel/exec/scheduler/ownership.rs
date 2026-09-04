@@ -68,8 +68,8 @@ pub fn set_module_owner(module_idx: usize, owner: OwnerHandle) {
     }
 }
 
-/// Authorize `caller` to touch a resource owned by module `target_idx`. Returns
-/// true when the target is system-owned or the same owner (rfc_k8s.md §14).
+/// Authorize `caller` to touch a resource owned by module `target_idx`.
+/// Returns true when the target is system-owned or the same owner.
 /// Compile-time `true` on single-tenant builds.
 #[inline]
 pub fn authorize_module_access(caller: OwnerHandle, target_idx: usize) -> bool {
@@ -94,8 +94,8 @@ pub fn module_is_finished(module_idx: usize) -> bool {
 
 /// One resident owner's live runtime aggregate: the per-MODULE fault/finish
 /// state of its plan-assigned module range folded into per-owner counts
-/// (rfc_k8s.md §18.2 — "a Fluxor owner-status store keyed by owner UID"). This
-/// is the kernel half of the per-workload status surface: only the kernel knows
+/// — an owner-status store keyed by owner UID. This is the kernel half of
+/// the per-workload status surface: only the kernel knows
 /// the slot→module mapping, so the aggregation happens here and consumers
 /// (the node runtime's status writer, `fluxor agent status`) never see
 /// module indices.
@@ -122,9 +122,8 @@ pub struct OwnerLiveStatus {
     /// `fault_type::*` of the most recent fault among this owner's
     /// terminated modules (`fault_type::NONE` when none terminated).
     pub last_fault_kind: u8,
-    /// Owner lifecycle state: [`OWNER_STATE_ACTIVE`] or [`OWNER_STATE_DRAINING`]
-    /// (rfc_owner_drain_and_logs.md §3.7). `Active` until the drain driver flips
-    /// it.
+    /// Owner lifecycle state: [`OWNER_STATE_ACTIVE`] or
+    /// [`OWNER_STATE_DRAINING`]. `Active` until the drain driver flips it.
     pub owner_state: u8,
     /// Wall-clock second at which a drain forfeits its grace, or 0 when not
     /// draining. Set by the drain driver.
@@ -137,9 +136,8 @@ pub struct OwnerLiveStatus {
 pub const OWNER_STATE_ACTIVE: u8 = 0;
 /// `owner_state` code: the owner is draining before revocation.
 pub const OWNER_STATE_DRAINING: u8 = 1;
-/// `owner_state` code: the owner is paused (reversible quiesce,
-/// rfc_workload_lifecycle.md §3.2). Not terminal; `owner_resume` returns
-/// it to [`OWNER_STATE_ACTIVE`].
+/// `owner_state` code: the owner is paused (reversible quiesce). Not
+/// terminal; `owner_resume` returns it to [`OWNER_STATE_ACTIVE`].
 pub const OWNER_STATE_PAUSED: u8 = 2;
 
 impl OwnerLiveStatus {
@@ -241,8 +239,8 @@ pub fn owner_live_snapshot(out: &mut [OwnerLiveStatus; MAX_OWNERS]) -> usize {
     count
 }
 
-/// Is a draining owner's subgraph quiescent (rfc_owner_drain_and_logs.md §3.1)?
-/// Two structural conditions:
+/// Is a draining owner's subgraph quiescent? Two structural
+/// conditions:
 ///
 /// * every module the owner stamps ran to its natural end (`StepOutcome::Done`)
 ///   or terminal fault state, and
@@ -288,7 +286,7 @@ pub fn owner_modules_quiescent(handle: OwnerHandle) -> bool {
 
 /// Owner of the module that PRODUCES into channel `ch` — the carried-
 /// attribution source for provider modules that serve multiple owners over
-/// per-edge lanes (rfc_endpoint_lease.md §4.1: `linux_net` stamps each bind
+/// per-edge lanes (`linux_net` stamps each bind
 /// with its commanding lane's owner). `OWNER_SYSTEM` when no edge produces
 /// into the channel or the producer is system-owned. Scheduler thread only,
 /// resolved at instantiation (after plan apply) and re-resolved on rebuild.
@@ -421,9 +419,8 @@ pub fn free_module_state(module_idx: usize) {
         &mut *p
     };
 
-    // Elastic-region chunks the module grew into (`rfc_resource_model.md`
-    // §3.6): teardown IS the reclaim path — release them before the slot
-    // is reused.
+    // Elastic-region chunks the module grew into: teardown IS the reclaim
+    // path — release them before the slot is reused.
     crate::kernel::mem::elastic::reclaim_module(module_idx as u8);
 
     // Heap arena (from module_arena_size export, if any).

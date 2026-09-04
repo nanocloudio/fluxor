@@ -1,4 +1,4 @@
-//! Bounded external-node bridge (rfc_k8s.md §6.8, Q13).
+//! Bounded external-node bridge.
 //!
 //! The data path between a graph-resident proxy module and an external-hosted
 //! process (Linux OCI/`linux.oci` executor). The §6.8 contract this enforces:
@@ -30,7 +30,7 @@
 
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// What the bridge does when a push does not fit (rfc_k8s.md §6.8).
+/// What the bridge does when a push does not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverloadPolicy {
     /// Reject the push; the producer throttles/backpressures the external

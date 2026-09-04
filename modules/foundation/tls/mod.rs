@@ -97,7 +97,7 @@ const MAX_SESSIONS: usize = 64;
 #[cfg(not(target_arch = "aarch64"))]
 const MAX_SESSIONS: usize = 4;
 
-// ── Tier B session storage (`rfc_resource_model.md` §3.6) ────────────
+// ── Tier B session storage ────────────
 //
 // Sessions grow at runtime in whole chunks: the first chunk lives inline
 // in module state (always available — the pool's `min`), and further
@@ -229,7 +229,7 @@ const MAX_EXPECTED_DNS: usize = 64;
 /// borrowing the DNS one and silently truncating.
 const MAX_EXPECTED_URI: usize = 256;
 
-/// Certificate validity posture (`.context/rfc_tls_peer_identity.md` §6).
+/// Certificate validity posture.
 const CLOCK_POLICY_REQUIRE: u8 = 0;
 
 /// `mode` values.
@@ -734,8 +734,7 @@ struct TlsState {
     key: [u8; MAX_KEY_LEN],
     key_len: usize,
 
-    /// Selected peer-authentication profile
-    /// (`.context/rfc_tls_peer_identity.md` §3). `PROFILE_NONE` is the
+    /// Selected peer-authentication profile. `PROFILE_NONE` is the
     /// absence of a profile, not a permissive one: a client instance
     /// carrying it does not construct.
     peer_auth: u8,
@@ -1124,7 +1123,7 @@ pub unsafe extern "C" fn module_new(
 
     // Peer authentication is admitted here, before any channel is serviced:
     // a client with no trust policy must fail before network readiness, not
-    // at its first byte (`.context/rfc_tls_peer_identity.md` §4.2).
+    // at its first byte.
     if !peer_auth_admissible(s) {
         let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust_cert_file, and verify_hostname for ca_dns / verify_uri for ca_uri)";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
@@ -1694,7 +1693,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // in server mode is set ONLY by a clear-side CMD_CONNECT (there
                 // is no client-side active-open), so this MSG_CONNECTED completes
                 // that backend dial. It must NOT become a TLS session — the
-                // backend speaks plaintext (RFC §5: backend hops are cleartext
+                // backend speaks plaintext (backend hops are cleartext
                 // in v1). Mark the conn passthrough and relay MSG_CONNECTED down
                 // RAW; no session alloc, no ClientHello. Client-mode TLS
                 // (mode==0, real outbound TLS) is untouched — it falls through
@@ -2519,8 +2518,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 #[inline(never)]
 unsafe fn emit_handshake_span(s: &mut TlsState, idx: usize, ok: bool) {
     // Head-sampling gate FIRST — before any clock read or RNG. A propagated
-    // context carries the ingress decision in its flags; a root (no propagation)
-    // is sampled. An unsampled flow emits nothing (RFC observability §sampling).
+    // context carries the ingress decision in its flags; a root (no
+    // propagation) is sampled. An unsampled flow emits nothing.
     let propagated = s.sessions[idx].trace_ctx_trace != [0u8; 16];
     let eff_flags = if propagated {
         s.sessions[idx].trace_ctx_flags
@@ -2766,9 +2765,9 @@ fn chain_policy(s: &TlsState, require_eku: u8, now_unix_secs: u64) -> ChainPolic
         allowed_suites: suite::IMPLEMENTED,
         now_unix_secs,
         // Pinning carries its own lifetime policy: the operator rotates the
-        // pin (`.context/rfc_tls_peer_identity.md` §3.1).
-        // Pinning carries its own lifetime policy, but both CA profiles
-        // chain to an anchor whose certificates have real validity windows.
+        // pin. Pinning carries its own lifetime policy, but both CA
+        // profiles chain to an anchor whose certificates have real validity
+        // windows.
         require_clock: s.clock_policy == CLOCK_POLICY_REQUIRE
             && (s.peer_auth == PROFILE_CA_DNS || s.peer_auth == PROFILE_CA_URI),
         require_eku,
@@ -4589,9 +4588,8 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // read as a bogus HTTP/2 preface.
     let alpn_h1_only = s.alpn_h1_only != 0;
     // SNI is emitted only when a DNS identity is the thing being
-    // authenticated (`.context/rfc_tls_peer_identity.md` §7). Under `pinned`
-    // there is no authenticated name, and disclosing an unauthenticated one
-    // would promise nothing.
+    // authenticated. Under `pinned` there is no authenticated name, and
+    // disclosing an unauthenticated one would promise nothing.
     let sni_len = if s.peer_auth == PROFILE_CA_DNS {
         s.expected_dns_len
     } else {

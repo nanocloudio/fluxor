@@ -1,12 +1,11 @@
-//! WS-D-min: minimal live graph mutation — add and tear down a self-contained
+//! Minimal live graph mutation — add and tear down a self-contained
 //! subgraph owner on a *running* graph, without a destructive rebuild.
 //!
-//! This is the keystone primitive behind OTA, k8s-style workloads, and REPL
-//! subgraph-exec (the same mechanism under different lifecycle policies); the
-//! cheapest caller — an ephemeral REPL subgraph — is built first to force
-//! exactly the core. It narrows `k8s_plan.md` WS-D.1/D.2 to **add + teardown**
-//! and pulls in the slice of WS-C (per-owner reclaim) teardown needs. See the
-//! design note `.context/ws_d_min.md` for the full rationale.
+//! This is the keystone primitive behind OTA, orchestrated workloads, and
+//! REPL subgraph-exec: the same mechanism under different lifecycle
+//! policies. The surface is deliberately just add and teardown, plus the
+//! per-owner reclaim teardown needs — enough for the cheapest caller, an
+//! ephemeral REPL subgraph, which is what keeps it to the core.
 //!
 //! Two operations, both synchronous and owner-scoped:
 //!   * [`apply_add`]  — allocate an owner, instantiate its modules, open its
@@ -26,8 +25,8 @@
 //! ephemeral owner can't stall the system.
 //!
 //! Linux-first. The bcm2712/rp `domain_exec_order` splice + multicore quiesce,
-//! async PIC load, owner-tagged allocator (WS-C), and partial replacement
-//! (WS-D.4) are documented follow-ups, not built here. Gated on `multitenant`
+//! async PIC load, owner-tagged allocator, and partial replacement
+//! are documented follow-ups, not built here. Gated on `multitenant`
 //! (host-linux + bcm2712 enable it; bare-metal rp compiles it out at zero cost).
 
 use super::{
@@ -42,19 +41,19 @@ pub const MAX_ADD_MODULES: usize = 16;
 /// Largest edge count one `apply_add` admits.
 pub const MAX_ADD_EDGES: usize = 32;
 
-/// Reserved `Endpoint::Existing` global index marking a **net-facing spare-lane
-/// edge** in a FLXA blob (`rfc_workload_backend_metal.md` §7 P4 workload-manager-fmod,
-/// option A). The workload manager composes a `net=own` workload's FLXA off-node and
-/// CANNOT express `Endpoint::ExistingChannel` — the FLXA v1 wire has no
-/// channel-endpoint kind, and the spare-lane channel id is a kernel runtime
-/// value unknowable off-node. So a `net=own` template emits its net-facing
-/// producer edge with `to = Existing(SPARE_LANE_SENTINEL)`; the metal backend
+/// Reserved `Endpoint::Existing` global index marking a **net-facing
+/// spare-lane edge** in a FLXA blob ( option A). The workload manager composes
+/// a `net=own` workload's FLXA off-node and CANNOT express
+/// `Endpoint::ExistingChannel` — the FLXA v1 wire has no channel-endpoint
+/// kind, and the spare-lane channel id is a kernel runtime value unknowable
+/// off-node. So a `net=own` template emits its net-facing producer edge with
+/// `to = Existing(SPARE_LANE_SENTINEL)`; the metal backend
 /// (`workload_graph.rs`), between decode and apply, resolves the boot merge's
-/// next free spare lane and rewrites the edge to `ExistingChannel(lane)`
-/// (via [`apply_add_encoded_spare_lane`]). `0xFFFF` is never a real live module
+/// next free spare lane and rewrites the edge to `ExistingChannel(lane)` (via
+/// [`apply_add_encoded_spare_lane`]). `0xFFFF` is never a real live module
 /// slot (`MAX_MODULES` ≪ `0xFFFF`), so the marker is unambiguous and rides the
-/// EXISTING FLXA v1 wire with NO codec/ABI change (`decode_endpoint(1, 0xFFFF)`
-/// round-trips to `Existing(0xFFFF)`).
+/// EXISTING FLXA v1 wire with NO codec/ABI change (`decode_endpoint(1,
+/// 0xFFFF)` round-trips to `Existing(0xFFFF)`).
 pub const SPARE_LANE_SENTINEL: u16 = 0xFFFF;
 
 /// How a new module is instantiated.
@@ -84,15 +83,13 @@ pub enum Endpoint {
     New(u8),
     Existing(u16),
     /// A pre-existing **shared channel** by id — an attachable-lane merge's
-    /// spare input lane (`rfc_workload_backend_metal.md` §7 P4). Only valid as
-    /// an edge `to`: the producer (`from`, a `New` module) is wired to write
-    /// into this exact channel — which a boot merge already reads — instead of
-    /// `apply_add` opening a fresh ring. This is how a runtime `net=own`
-    /// workload reaches the node's one shared `ip` through the merge without
-    /// any runtime merge-state mutation (the P3b subsumption). Direct-API only:
-    /// the FLXA v1 wire has no channel-endpoint kind (the P4 workload manager composer
-    /// gets one when it lands), mirroring `AddEdge::wake_on_write`'s
-    /// direct-only status.
+    /// spare input lane. Only valid as an edge `to`: the producer (`from`, a
+    /// `New` module) is wired to write into this exact channel — which a boot
+    /// merge already reads — instead of `apply_add` opening a fresh ring. This
+    /// is how a runtime `net=own` workload reaches the node's one shared `ip`
+    /// through the merge without any runtime merge-state mutation.
+    /// Direct-API only: the FLXA v1 wire has no channel-endpoint kind,
+    /// mirroring `AddEdge::wake_on_write`'s direct-only status.
     ExistingChannel(i32),
 }
 
@@ -106,12 +103,12 @@ pub struct AddEdge {
     pub to_port_index: u8,
     /// Per-edge ring-buffer byte hint (0 = derive from module hints).
     pub buffer_bytes: u32,
-    /// Wake-on-write (RFC idle_skip_wake §4): a successful write on this
-    /// edge latches the consumer's event-wake bit and rings the scheduler
-    /// doorbell — same semantics as `wake: true` on a base-graph wiring
-    /// entry, bound with the same rules as `prepare_graph`'s wiring pass
-    /// (same-domain direct edges only). NOT expressible through the FLXA
-    /// wire codec: the v1 per-edge record has no reserved space, so
+    /// Wake-on-write: a successful write on this edge latches the
+    /// consumer's event-wake bit and rings the scheduler doorbell — same
+    /// semantics as `wake: true` on a base-graph wiring entry, bound with
+    /// the same rules as `prepare_graph`'s wiring pass (same-domain
+    /// direct edges only). NOT expressible through the FLXA wire codec:
+    /// the v1 per-edge record has no reserved space, so
     /// `apply_add_encoded` always decodes it as `false`; only direct
     /// [`apply_add`] callers can set it.
     pub wake_on_write: bool,
@@ -125,7 +122,7 @@ pub struct AddSubgraph<'a> {
     pub edges: &'a [AddEdge],
     /// Admitted hard caps from the resource profile; 0 = unlimited (the
     /// REPL/ephemeral default). Stored on the owner; fine-grained byte
-    /// enforcement is deferred to the owner-tagged allocator (WS-C).
+    /// enforcement is deferred to the owner-tagged allocator.
     pub state_cap: u32,
     pub buffer_cap: u32,
 }
@@ -213,15 +210,16 @@ fn sched() -> &'static mut SchedulerState {
 }
 
 // ============================================================================
-// Metal WS-D live-splice: multicore quiesce + per-domain dispatch-table splice
-// (rfc_workload_backend_metal.md §1.5, P0)
+// Live-splice: multicore quiesce + per-domain dispatch-table splice
+//
 // ============================================================================
 //
 // bcm2712 cores step the PER-DOMAIN `domain_exec_order` (via
 // `step_domain_modules` / `..._poll`), which only the boot-only
 // `finalize_resident_graphs` populates — so a *runtime* `apply_add`/`free_owner`
 // that mutates only the flat `exec_order` stages a subgraph the domain runners
-// never step. P0 closes that: after the exec_order mutation, on bcm2712, splice
+// never step. The per-domain splice closes that: after the exec_order
+// mutation, on bcm2712, splice
 // the affected domains' `domain_exec_order` incrementally
 // (`scheduler::recompute_domain_orders`, byte-identical to a full recompute for
 // those domains) while every peer domain core is parked.
@@ -247,7 +245,7 @@ fn domain_bit(domain_id: u8) -> u32 {
 /// **Invariant:** primary-core-only. `request_quiesce` is defined for domain 0;
 /// the runtime callers (`apply_add`/`free_owner`) must run on the primary
 /// domain's scheduler context (the metal `workload` provider dispatches on the
-/// system graph, which lives on domain 0 — `rfc_workload_backend_metal.md` §3.2).
+/// system graph, which lives on domain 0).
 #[inline]
 fn quiesce_peers() -> bool {
     crate::kernel::sys::hal::smp_quiesce_peers()
@@ -358,7 +356,7 @@ pub fn apply_add(
                 return Err(AddError::BadEndpoint);
             }
         };
-        // Attachable-lane merge (§7 P4, the P3b subsumption): `to` names a
+        // Attachable-lane merge: `to` names a
         // pre-existing shared spare-lane channel a boot merge already caches.
         // Wire the producer to write into THAT channel — no fresh ring — so its
         // frame reaches the shared consumer (metal `ip`) through the merge with
@@ -473,7 +471,7 @@ pub fn apply_add(
     }
 
     // 7. Publish the subgraph into the live schedule. On bcm2712 every peer
-    //    domain core is parked first (metal WS-D §1.5): the exec_order splice,
+    //    domain core is parked first: the exec_order splice,
     //    the per-domain dispatch-table splice, and the resident-graph reindex are
     //    the mutations a concurrently-stepping peer core must never observe half
     //    applied. No-op wrapper on single-domain hosts and at boot (both run
@@ -493,7 +491,7 @@ pub fn apply_add(
         s.active_module_count += n;
     }
 
-    // Metal WS-D per-domain splice (bcm2712 only): reproject the affected
+    // Per-domain splice (bcm2712 only): reproject the affected
     // domains' `domain_exec_order` from the freshly-spliced flat order so the
     // per-domain runners (`step_domain_modules`) step the new modules — not just
     // the flat-order path. Infallible (a bounded reprojection mirroring the boot
@@ -512,13 +510,13 @@ pub fn apply_add(
     }
 
     // Wake-on-write wiring for the live-added edges — the same pass, with
-    // the same skip set, that `prepare_graph` runs for base-graph edges
-    // (RFC idle_skip_wake §4): bind `wake: true` edges' channels to their
-    // consumer so a successful write latches the consumer's event-wake bit
-    // and rings the scheduler doorbell. Same-domain direct edges only;
-    // anything the platform would split across the SPSC pump (different
-    // domains, or `EdgeClass::CrossCore`) must bind at consumer-side pump
-    // delivery instead — a producer-side binding is the guaranteed-spurious
+    // the same skip set, that `prepare_graph` runs for base-graph edges:
+    // bind `wake: true` edges' channels to their consumer so a successful
+    // write latches the consumer's event-wake bit and rings the scheduler
+    // doorbell. Same-domain direct edges only; anything the platform would
+    // split across the SPSC pump (different domains, or
+    // `EdgeClass::CrossCore`) must bind at consumer-side pump delivery
+    // instead — a producer-side binding is the guaranteed-spurious
     // write-time wake — and the live path does no cross-domain bridging
     // (Linux-first, see the module header), so such edges stay unbound and
     // degrade to readable-channel-scan/backstop service. Runs after
@@ -700,7 +698,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
     };
     // Which module slots belong to this owner, and which domains they occupy —
     // captured up front (pure reads) BEFORE any mutation, because the metal
-    // WS-D per-domain unsplice below needs the freed owner's domain set, and
+    // per-domain unsplice below needs the freed owner's domain set, and
     // step 4 clears each module's `domain_id`. `affected` (bit d ⇒ domain d) is
     // used only on bcm2712.
     let mut owned = [false; MAX_MODULES];
@@ -721,7 +719,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
         }
     }
 
-    // Park every peer domain core for the teardown (metal WS-D §1.5): the drain,
+    // Park every peer domain core for the teardown: the drain,
     // exec_order compaction, edge close, state free, per-domain unsplice, and
     // reindex are the mutations a concurrently-stepping peer core must never
     // observe half applied. No-op wrapper on single-domain hosts and at boot.
@@ -785,7 +783,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
             let from_owned = edge.from_module < MAX_MODULES && owned[edge.from_module];
             let to_owned = edge.to_module < MAX_MODULES && owned[edge.to_module];
             if from_owned || to_owned {
-                // A shared spare-lane edge (attachable-lane merge, §7 P4) is
+                // A shared spare-lane edge (attachable-lane merge) is
                 // removed with the owner but its channel is NEVER closed — the
                 // boot merge caches it. Dropping the edge alone frees the lane
                 // (`channel_producer_owner` reverts to system on the next scan).
@@ -834,7 +832,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
         s.active_module_count = s.active_module_count.saturating_sub(owned_count);
     }
 
-    // Metal WS-D per-domain unsplice (bcm2712 only): reproject the affected
+    // Per-domain unsplice (bcm2712 only): reproject the affected
     // domains' `domain_exec_order` from the now-compacted flat order. The freed
     // modules are already gone from `exec_order` (step 2) and their slots are
     // `Empty` (step 4), so the reprojection naturally drops them and compacts —
@@ -855,7 +853,7 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
 }
 
 // ============================================================================
-// owner_pause / owner_resume (rfc_workload_lifecycle.md §3.2, P4)
+// owner_pause / owner_resume
 // ============================================================================
 //
 // The metal PAUSE verb: a reversible quiesce built from exactly the two
@@ -911,7 +909,7 @@ pub fn owner_pause(handle: OwnerHandle) -> Result<(), PauseError> {
     let latched = crate::kernel::ipc::event::take_wake_in_mask(&mask);
     crate::kernel::ipc::event::defer_masked_wakes(&latched);
     // State last: the runner skips on `Paused`, admission closes via
-    // `authorize_admit` (drain RFC §3.5 — the same gate, reversible).
+    // `authorize_admit` (the same gate, reversible).
     sched().owners.set_state(handle, OwnerState::Paused);
     Ok(())
 }
@@ -959,7 +957,7 @@ pub fn owner_resume(handle: OwnerHandle) -> Result<(), PauseError> {
 // `tools/src/compose.rs`. PIC modules only (a built-in has no serialisable
 // form); a target with asynchronous PIC load returns `WouldBlock` until the
 // async follow-up. Integrity/signature verification of the blob is the signing
-// layer's job (WS-H) and the channel is authenticated (k8s node-agent), so this
+// layer's job and the channel is authenticated (k8s node-agent), so this
 // decoder validates structure and bounds, not a content digest.
 
 /// Wire magic: "FLXA".
@@ -1021,17 +1019,16 @@ fn decode_endpoint(kind: u8, idx: u16) -> Option<Endpoint> {
 /// duration of the call (module params are borrowed from it in place).
 pub unsafe fn apply_add_encoded(arg: *mut u8, arg_len: usize) -> i32 {
     // SAFETY: forwarded contract; `None` = no spare-lane rewrite (the sentinel,
-    // if present, falls through to `BadEndpoint` — byte-identical to the
-    // pre-P4 decode).
+    // if present, falls through to `BadEndpoint`).
     unsafe { apply_add_encoded_inner(arg, arg_len, None) }
 }
 
-/// The metal `net=own` variant of [`apply_add_encoded`] (`rfc_workload_backend_
-/// metal.md` §7 P4 workload-manager-fmod, the decode→inject→apply seam). Identical to
+/// The metal `net=own` variant of [`apply_add_encoded`] — the
+/// decode→inject→apply seam. Identical to
 /// `apply_add_encoded`, except a net-facing [`SPARE_LANE_SENTINEL`] `to`
 /// endpoint is rewritten to `Endpoint::ExistingChannel(spare_lane)` before
 /// apply, wiring the workload's producer into the boot merge's pre-cached spare
-/// lane so its egress reaches the node's shared `ip` (the P4 keystone attach).
+/// lane so its egress reaches the node's shared `ip`.
 ///
 /// `spare_lane` is the caller-resolved free lane channel
 /// (`merge_next_free_lane(find_spare_lane_merge_for_channel(ingress))`, resolved from the registered net-identity provider):
@@ -1157,11 +1154,11 @@ unsafe fn apply_add_encoded_inner(arg: *mut u8, arg_len: usize, spare_lane: Opti
         let (Some(from), Some(mut to)) = (decode_endpoint(fk, fi), decode_endpoint(tk, ti)) else {
             return EINVAL;
         };
-        // Net-facing spare-lane sentinel (§7 P4): the composer marks the
+        // Net-facing spare-lane sentinel: the composer marks the
         // net-facing producer's `to` as `Existing(SPARE_LANE_SENTINEL)` because
         // it cannot name a kernel runtime channel off-node. Rewrite it to the
         // caller-resolved boot-merge spare lane (`ExistingChannel`) so the
-        // producer edges straight into the merge — the P4 keystone attach.
+        // producer edges straight into the merge.
         if matches!(to, Endpoint::Existing(SPARE_LANE_SENTINEL)) {
             match spare_lane {
                 Some(l) if l >= 0 => to = Endpoint::ExistingChannel(l),

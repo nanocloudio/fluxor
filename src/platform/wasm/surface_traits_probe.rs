@@ -4,7 +4,7 @@
 //! kernel log ring (visible in the DOM terminal), proving the full
 //! round-trip: browser publisher → host queue → wasm_browser_surface_traits
 //! → channel → consumer. Not a production module — it is the live
-//! acceptance check for `.context/rfc_surface_traits.md` (criterion 1).
+//! acceptance check for the Surface Traits surface.
 
 use crate::kernel::exec::scheduler;
 use crate::kernel::ipc::channel;

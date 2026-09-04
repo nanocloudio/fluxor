@@ -161,7 +161,7 @@ mod profile_host {
         /// Sized for moderate trace volume.
         pub const LOG_RING_CAPACITY: usize = 65536;
         /// Kernel elastic region backing Tier B chunk grants
-        /// (`resource::ELASTIC_ALLOC`, `rfc_resource_model.md` §3.6).
+        /// (`resource::ELASTIC_ALLOC`).
         /// 8 MiB: room for TLS-session growth to its compiled maximum
         /// (~832 KiB) plus several workloads' worth of headroom, and
         /// deliberately oversubscribable — Σ of pool maxima MAY exceed
@@ -218,14 +218,14 @@ mod profile_host {
         // (runtime.html, fluxor.wasm, host_shims.js, /scenario.json,
         // /api/list, plus 3 spare for user/scenario route merges).
         pub const MAX_ROUTES: usize = 8;
-        // Dynamic-route arena (rfc_dynamic_routes §3.2). A DEDICATED
-        // arena, deliberately separate from the TLV-locked static
-        // `MAX_ROUTES` budget above: dyn routes are programmed at
-        // runtime from `/dataplane/edge/` via the table_consumer helper,
-        // carry a host axis + weighted backend set, and are NOT wired
-        // through `define_params!` — so this ceiling is free to size for
-        // route×backend fanout without touching the TLV coverage lock.
-        // Host default 64; embedded/wasm keep 8 (see the other profiles).
+        // Dynamic-route arena. A DEDICATED arena, deliberately separate
+        // from the TLV-locked static `MAX_ROUTES` budget above: dyn
+        // routes are programmed at runtime from `/dataplane/edge/` via
+        // the table_consumer helper, carry a host axis + weighted backend
+        // set, and are NOT wired through `define_params!` — so this
+        // ceiling is free to size for route×backend fanout without
+        // touching the TLV coverage lock. Host default 64; embedded/wasm
+        // keep 8 (see the other profiles).
         pub const MAX_DYN_ROUTES: usize = 64;
         // Backends carried per dynamic route (the `be=` set). One PUT
         // replaces the whole set atomically (§3.1); the compiler
@@ -271,11 +271,11 @@ mod profile_host {
         /// Pinned at 256 alongside http until `conn_id` widens
         /// past u8 on the wire.
         pub const MAX_TCP_CONNS: usize = 256;
-        /// Multi-homing address-table size (`rfc_net_identity_metal` §3.1).
-        /// Slot 0 is the primary (DHCP-managed); slots 1.. are secondaries
-        /// added at runtime via the ip module's `addr_ctl` port. Scanned on
-        /// the RX hot path, so this must not grow without a hot-path
-        /// measurement (see the demux comment in `ip/mod.rs`).
+        /// Multi-homing address-table size. Slot 0 is the primary
+        /// (DHCP-managed); slots 1.. are secondaries added at runtime via
+        /// the ip module's `addr_ctl` port. Scanned on the RX hot path, so
+        /// this must not grow without a hot-path measurement (see the demux
+        /// comment in `ip/mod.rs`).
         pub const MAX_LOCAL_ADDRS: usize = 8;
     }
 
@@ -338,7 +338,7 @@ mod profile_wasm {
         pub const RECV_BUF_SIZE: usize = 4096;
         pub const SEND_BUF_SIZE: usize = 4100;
         pub const MAX_ROUTES: usize = 4;
-        // Dynamic-route arena (rfc_dynamic_routes §3.2); see profile_host.
+        // Dynamic-route arena; see profile_host.
         pub const MAX_DYN_ROUTES: usize = 8;
         pub const MAX_ROUTE_BACKENDS: usize = 4;
         pub const MAX_PATH: usize = 32;
@@ -352,7 +352,7 @@ mod profile_wasm {
 
     pub mod ip {
         pub const MAX_TCP_CONNS: usize = 256;
-        /// Multi-homing address-table size (`rfc_net_identity_metal` §3.1).
+        /// Multi-homing address-table size.
         pub const MAX_LOCAL_ADDRS: usize = 8;
     }
 
@@ -379,7 +379,7 @@ mod profile_embedded {
         pub const CONFIG_ARENA_SIZE: usize = 16 * 1024;
         pub const LOG_RING_CAPACITY: usize = 4096;
         /// No Tier B on MCU-class targets: elasticity compiles out
-        /// (`rfc_resource_model.md` §3.5) — `ELASTIC_ALLOC` denies.
+        /// — `ELASTIC_ALLOC` denies.
         pub const ELASTIC_REGION_SIZE: usize = 0;
         pub const ELASTIC_QUANTUM: usize = 1024;
     }
@@ -390,9 +390,9 @@ mod profile_embedded {
         pub const RECV_BUF_SIZE: usize = 2048;
         pub const SEND_BUF_SIZE: usize = 4100;
         pub const MAX_ROUTES: usize = 4;
-        // Dynamic-route arena (rfc_dynamic_routes §3.2); see profile_host.
-        // Embedded default 8 — small, and the feature is off (empty
-        // `routes_prefix`) on any edge that doesn't run the compiler.
+        // Dynamic-route arena; see profile_host. Embedded default 8 —
+        // small, and the feature is off (empty `routes_prefix`) on
+        // any edge that doesn't run the compiler.
         pub const MAX_DYN_ROUTES: usize = 8;
         pub const MAX_ROUTE_BACKENDS: usize = 4;
         pub const MAX_PATH: usize = 32;
@@ -406,7 +406,7 @@ mod profile_embedded {
 
     pub mod ip {
         pub const MAX_TCP_CONNS: usize = 16;
-        /// Multi-homing address-table size (`rfc_net_identity_metal` §3.1).
+        /// Multi-homing address-table size.
         pub const MAX_LOCAL_ADDRS: usize = 8;
     }
 

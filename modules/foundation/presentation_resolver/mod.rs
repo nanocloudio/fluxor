@@ -1,9 +1,9 @@
 //! On-device placement resolver — the bare-metal counterpart of the host
-//! reference `tools/src/presentation_resolver.rs` (`.context/rfc_adaptive_presentation.md`
-//! §10). It consumes the runtime environment plane (`input::surface_traits`
-//! MSG_TRAITS records) and emits a `presentation.layout` record describing, per
-//! declared control, its disposition (chrome / content / bound / hidden), plane,
-//! and physical-button legend.
+//! reference `tools/src/presentation_resolver.rs`. It consumes the runtime
+//! environment plane (`input::surface_traits` MSG_TRAITS records) and emits a
+//! `presentation.layout` record describing, per declared control, its
+//! disposition (chrome / content / bound / hidden), plane, and physical-button
+//! legend.
 //!
 //! The browser runs this same algorithm in JS (`browser_overlay_runtime.js`);
 //! this module is how Linux-display and bare-metal-panel surfaces get an

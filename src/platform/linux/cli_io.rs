@@ -1,7 +1,6 @@
-// cli_in / cli_out built-ins — the host stdio/argv/exit-code surface
-// (rfc_cli_execution.md §4). Host facts stay host-side: argv, stdin, stdout,
-// stderr, and the process exit code are owned by these built-ins; app modules
-// remain pure channel-in/out.
+// cli_in / cli_out built-ins — the host stdio/argv/exit-code surface. Host
+// facts stay host-side: argv, stdin, stdout, stderr, and the process exit
+// code are owned by these built-ins; app modules remain pure channel-in/out.
 //
 //   cli_in   args_out  (out 0)  one record: argv after `--`, NUL-separated
 //            stdin_out (out 1)  stdin bytes (worker thread → ExtBridge)
@@ -19,7 +18,7 @@
 // stdin has hit EOF fully flushed; cli_out returns Done when an exit record
 // arrives, or when every upstream producer is finished and its inputs and
 // bridges are drained. The plain-run completion branch then exits the
-// process with CLI_EXIT_CODE (rfc_cli_execution.md §6).
+// process with CLI_EXIT_CODE.
 
 use fluxor::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
 use portable_atomic::AtomicI32;

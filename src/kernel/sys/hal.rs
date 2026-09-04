@@ -177,11 +177,11 @@ pub struct HalOps {
 
     /// Block until the absolute `deadline_us` (microseconds since boot) OR an
     /// event/IRQ wakes the scheduler, whichever comes first; returns a
-    /// `WOKEN_*` reason. The portable unification of the per-platform split wake
-    /// arms (RFC adaptive_tick §5.5 Option B / D5): platform loops may keep
-    /// using their native arms (Embassy select, thread park, WFI/WFE), and this
-    /// field provides the single portable primitive a loop can adopt instead,
-    /// without per-platform `#[cfg]` branching. Supplied on every platform.
+    /// `WOKEN_*` reason. The portable unification of the per-platform split
+    /// wake arms: platform loops may keep using their native arms (Embassy
+    /// select, thread park, WFI/WFE), and this field provides the single
+    /// portable primitive a loop can adopt instead, without per-platform
+    /// `#[cfg]` branching. Supplied on every platform.
     pub sleep_until: fn(deadline_us: u64) -> u32,
 
     /// Park every online secondary core at a safe point for a structural graph
@@ -484,7 +484,7 @@ pub fn tick_count() -> u32 {
 
 /// Block until `deadline_us` (µs since boot) or an event/IRQ wakes the
 /// scheduler. Returns a `WOKEN_*` reason; treat it as a hint and re-check
-/// work state regardless (RFC adaptive_tick §5.5 Option B).
+/// work state regardless.
 #[inline(always)]
 pub fn sleep_until(deadline_us: u64) -> u32 {
     (ops().sleep_until)(deadline_us)

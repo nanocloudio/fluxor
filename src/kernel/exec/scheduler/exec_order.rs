@@ -12,7 +12,7 @@ use super::*;
 /// `i` over a **forward** edge — an edge whose source precedes its destination
 /// in the topological execution order (`exec_order`). Used with `ready[]` to
 /// skip a module while any of its forward upstreams has not yet signaled
-/// `StepOutcome::Ready` (see `.context/scheduler_domain_api.md` §4).
+/// `StepOutcome::Ready`.
 ///
 /// **Back-edges are excluded.** A back-edge is a cycle-closing edge that only
 /// exists when the graph declares `scheduler: accept_cycles: true`; under the
@@ -200,8 +200,7 @@ pub(crate) fn compute_domain_exec_orders_static(_module_count: usize) {
     // Walk exec_order (already topologically sorted) and partition by
     // domain. Modules flagged `pre_tick_drain` go into
     // `domain_pre_tick_order` instead of `domain_exec_order` so
-    // `step_domain_modules` can drain them before the regular rotation
-    // (see `.context/rfc_isr_tier_surface.md` §D8).
+    // `step_domain_modules` can drain them before the regular rotation.
     for order_pos in 0..sched.exec_order_count {
         let module_idx = sched.exec_order[order_pos] as usize;
         let domain = sched.domain_id[module_idx] as usize;
@@ -260,12 +259,12 @@ pub(crate) fn compute_domain_exec_orders_static(_module_count: usize) {
 /// `exec_order`, and grow `domain_count` to cover any newly-occupied domain
 /// (never shrink — matches `finalize_resident_graphs`).
 ///
-/// This is the metal WS-D live-splice (`rfc_workload_backend_metal.md` §1.5):
-/// `live::apply_add`/`free_owner` call it — under a multicore peer quiesce on
-/// bcm2712 — so a *runtime* CREATE/DESTROY's modules reach the per-domain
-/// runners that step `domain_exec_order` (`step_domain_modules`,
-/// `step_domain_modules_poll`), not only the flat `exec_order`. Boot-time domain
-/// wiring stays with `finalize_resident_graphs`; this never calls it.
+/// This is the live-splice: `live::apply_add`/`free_owner` call it
+/// — under a multicore peer quiesce on bcm2712 — so a *runtime*
+/// CREATE/DESTROY's modules reach the per-domain runners that step
+/// `domain_exec_order` (`step_domain_modules`, `step_domain_modules_poll`),
+/// not only the flat `exec_order`. Boot-time domain wiring stays with
+/// `finalize_resident_graphs`; this never calls it.
 ///
 /// Byte-identical, per affected domain, to a full `finalize_resident_graphs`
 /// recompute — the flat `exec_order` is the single source of truth both walk,

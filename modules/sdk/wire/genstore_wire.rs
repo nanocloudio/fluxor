@@ -1,5 +1,5 @@
 //! Genstore on-storage wire records — the byte format of the durable
-//! generation store (rfc_k8s.md §12.4 / §13, k8s_plan WS-F).
+//! generation store.
 //!
 //! Shared byte-for-byte between the host tools (`tools/src/genstore.rs`
 //! path-mounts this file, the same pattern as `wire.rs`) and the device-side

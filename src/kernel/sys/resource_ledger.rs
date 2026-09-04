@@ -1,5 +1,5 @@
 //! Kernel resource ledger — accounting and denial attribution for every
-//! kernel-owned capacity pool (`rfc_resource_model.md` §6.1).
+//! kernel-owned capacity pool.
 //!
 //! Pull-based by design: the ledger never keeps its own usage counters.
 //! Each pool's `cur`/`cap` is sampled from the subsystem that owns the
@@ -26,7 +26,7 @@ static DENIALS: [AtomicU32; res::KERNEL_POOL_COUNT] =
 static PEAKS: [AtomicU32; res::KERNEL_POOL_COUNT] =
     [const { AtomicU32::new(0) }; res::KERNEL_POOL_COUNT];
 /// Per-deployment enforced capacities from the boot config's FXEV
-/// envelope section (`rfc_resource_model.md` §3 Tier A). `0` = no
+/// envelope section. `0` = no
 /// envelope entry — the compiled static size rules.
 static ENFORCED: [AtomicU32; res::KERNEL_POOL_COUNT] =
     [const { AtomicU32::new(0) }; res::KERNEL_POOL_COUNT];

@@ -1,4 +1,4 @@
-// Resource-ledger registry (`rfc_resource_model.md` §6.1).
+// Resource-ledger registry.
 //
 // Every accounted capacity in the system is a *pool* with a stable u16 id.
 // The kernel ledger (`kernel::sys::resource_ledger`) tracks
@@ -10,7 +10,7 @@
 // Units are per-pool: arena pools count bytes; table pools count slots.
 // Ids are append-only — a pool id, once published, is never reused.
 
-// ── Resource classes (`rfc_resource_model.md` §2) ───────────────────
+// ── Resource classes ───────────────────
 
 /// R1: memory bytes/slots — the fungible class; pools grow with hardware.
 pub const CLASS_MEMORY: u8 = 1;
@@ -59,7 +59,7 @@ pub const fn kernel_pool_class(_pool: u16) -> u8 {
 
 const _: () = assert!(KERNEL_POOL_COUNT == POOL_ELASTIC_REGION as usize);
 
-// ── Tier B elastic-region chunk grants (`rfc_resource_model.md` §3.6) ─
+// ── Tier B elastic-region chunk grants ─
 //
 // A module whose manifest pool supports Tier B grows it at runtime in
 // whole chunks taken from the kernel's composer-reservable elastic
@@ -79,7 +79,7 @@ const _: () = assert!(KERNEL_POOL_COUNT == POOL_ELASTIC_REGION as usize);
 /// tables map state/heap/channels only — mapping grants is future work).
 pub const ELASTIC_ALLOC: u32 = 0x0C3F;
 
-// ── Capacity-envelope config section (`rfc_resource_model.md` §3) ───
+// ── Capacity-envelope config section ───
 //
 // The composer's per-deployment pool envelope, carried as a post-body
 // config section (PAST the checksummed body — the rig-proven additive

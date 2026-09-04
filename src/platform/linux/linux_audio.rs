@@ -417,8 +417,8 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
         clock.bytes_written = 0;
     }
 
-    // Publish the audio config to the Surface Traits authority
-    // (rfc_surface_traits.md): packed (channels << 24) | (rate & 0x00FF_FFFF).
+    // Publish the audio config to the Surface Traits authority:
+    // packed (channels << 24) | (rate & 0x00FF_FFFF).
     SURFACE_AUDIO.store(
         ((channels as u32) << 24) | (sample_rate & 0x00FF_FFFF),
         std::sync::atomic::Ordering::Relaxed,

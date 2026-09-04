@@ -56,7 +56,7 @@
 /// Give up binding after this many consecutive failures (stays faultless).
 const BIND_MAX_ATTEMPTS: u16 = 50;
 /// Backoff window between bind retries — wall-clock, tick-rate independent
-/// (RFC adaptive_tick §7.6: diagnostic cadence, no correctness impact).
+/// (diagnostic cadence, no correctness impact).
 const BIND_BACKOFF_MICROS: u64 = 100_000; // 100 ms
 
 #[repr(u8)]

@@ -151,11 +151,10 @@ unsafe extern "C" fn syscall_provider_call(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    // ISR-tier (Tier 1b/2) modules are denied `provider_call` in general
-    // (RFC §D6/§D7), but the bridge ops and the `SELF_BRIDGES` enumeration are
-    // exempt: their underlying ring operations are lock-free and
-    // allocation-free, so they are the *sanctioned* I/O path for an ISR-tier
-    // step body (RFC rfc_isr_tier_surface "ISR-tier I/O contract").
+    // ISR-tier (Tier 1b/2) modules are denied `provider_call` in general,
+    // but the bridge ops and the `SELF_BRIDGES` enumeration are exempt:
+    // their underlying ring operations are lock-free and allocation-free, so
+    // they are the *sanctioned* I/O path for an ISR-tier step body.
     if !crate::abi::internal::bridge::is_isr_safe(op)
         && crate::kernel::exec::scheduler::deny_isr_tier_syscall("provider_call")
     {
@@ -313,14 +312,14 @@ unsafe extern "C" fn syscall_channel_port(port_type: u8, index: u8) -> i32 {
 // Channel Wrappers
 // ============================================================================
 
-/// Admission gate (rfc_owner_drain_and_logs.md §3.5): true when the calling
-/// module's owner may NOT admit new work. Admission closes the moment a drain
-/// begins; existing-handle use stays state-blind (`authorize_use` semantics),
-/// which is what lets in-flight work run dry. System-owned modules always
-/// pass. Every module-facing create/open/accept/allocate/arm path consults
-/// this — the §3.5 checklist: provider open/bind, `channel_open`, open-style
-/// `provider_call` ops (`admission_class_op`), event create, heap
-/// allocation, timer arm.
+/// Admission gate: true when the calling module's owner may NOT admit new
+/// work. Admission closes the moment a drain begins; existing-handle use
+/// stays state-blind (`authorize_use` semantics), which is what lets
+/// in-flight work run dry. System-owned modules always pass. Every
+/// module-facing create/open/accept/allocate/arm path consults this — the
+/// §3.5 checklist: provider open/bind, `channel_open`, open-style
+/// `provider_call` ops (`admission_class_op`), event create, heap allocation,
+/// timer arm.
 fn admission_closed(surface: &'static str) -> bool {
     let owner = crate::kernel::exec::scheduler::module_owner(
         crate::kernel::exec::scheduler::current_module_index(),
@@ -444,11 +443,11 @@ pub fn init_providers() {
     // returns ENOSYS naturally; no stub needed.
     provider::register(dev_class::BUFFER, buffer_provider_dispatch);
     // KEY_VAULT: the kernel software backend is the *default* a platform
-    // may override (rfc_crypto_extensions §4.1). Unlike FS, KEY_VAULT is
-    // registered here in kernel core on BOTH paths — this class-byte
-    // dispatch and the KEY_VAULT_VTABLE below — so a hardware platform
-    // (e.g. the Linux PKCS#11 backend) must re-register BOTH at platform
-    // boot: `register` and `register_vtable` overwrite, and
+    // may override. Unlike FS, KEY_VAULT is registered here in kernel
+    // core on BOTH paths — this class-byte dispatch and the
+    // KEY_VAULT_VTABLE below — so a hardware platform (e.g. the Linux
+    // PKCS#11 backend) must re-register BOTH at platform boot:
+    // `register` and `register_vtable` overwrite, and
     // `hal::init_providers()` runs after these defaults, so a platform
     // override wins. Overriding only one path would split custody
     // between two backends. When no hardware is present the software
@@ -1027,7 +1026,7 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         // ── reconfigure: graph slot commit, boot counter, FMP routing ──
         0x0C67..=0x0C6F => Some(RECONFIGURE),
 
-        // ── live-mutation block (WS-D APPLY_ADD/FREE_OWNER + owner PAUSE/
+        // ── live-mutation block (APPLY_ADD/FREE_OWNER + owner PAUSE/
         //    RESUME, 0x0C47..=0x0C4A): dispatched by the reconfigure kernel
         //    arms in system_provider_dispatch. Classified PLATFORM_RAW via the
         //    catch-all below — no dedicated arm needed. Deliberately OUTSIDE
@@ -1497,7 +1496,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | MODULE_FLOW_BUDGET
         | bridge::SELF_BRIDGES
         | monitor::ISR_METRICS => handle_core_primitive(handle, opcode, arg, arg_len),
-        // ── Telemetry ring (rfc_observability_surface.md §5.2). The
+        // ── Telemetry ring. The
         //    OBSERVE gate for the consumer ops is applied upstream by
         //    `check_privileged_internal_op`; TLM_EMIT is ungated. ──
         resource::ELASTIC_ALLOC => handle_elastic_alloc(arg, arg_len),
@@ -1561,7 +1560,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
             0
         }
 
-        // ── WS-D-min: live graph mutation (multi-tenant only) ──
+        // ── Live graph mutation (multi-tenant only) ──
         reconfigure::APPLY_ADD => {
             #[cfg(feature = "multitenant")]
             {
@@ -1588,13 +1587,13 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
                 E_NOSYS
             }
         }
-        // Owner pause/resume (rfc_workload_lifecycle.md §3.2 P4). Arms are
-        // cfg-gated OUT (not ENOSYS-stubbed) on non-multitenant builds so the
-        // opcodes fall through to the platform extension. They live in the
-        // 0x0C47..=0x0C4A live-mutation block (well clear of the peripheral
-        // register-bridge range), so on an rp build 0x0C49/0x0C4A reach the
-        // platform extension and are simply unknown there — no longer
-        // shadowing the rp PIO SM_READ_REG/SM_ENABLE bridges at 0x0C72/0x0C73.
+        // Owner pause/resume. Arms are cfg-gated OUT (not ENOSYS-stubbed) on
+        // non-multitenant builds so the opcodes fall through to the platform
+        // extension. They live in the 0x0C47..=0x0C4A live-mutation block
+        // (well clear of the peripheral register-bridge range), so on an rp
+        // build 0x0C49/0x0C4A reach the platform extension and are simply
+        // unknown there — no longer shadowing the rp PIO SM_READ_REG/SM_ENABLE
+        // bridges at 0x0C72/0x0C73.
         #[cfg(feature = "multitenant")]
         reconfigure::OWNER_PAUSE => {
             // SAFETY: `arg`/`arg_len` describe a readable handle record.
@@ -1650,14 +1649,14 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
 // The 0x0Cxx opcode range is split across small category handlers below
 // so the top-level match stays readable and each concern is local.
 
-/// Telemetry ring ops (`rfc_observability_surface.md` §5.2). `TLM_EMIT` is an
-/// implicit primitive (any module); `TLM_SUBSCRIBE`/`DRAIN`/`STATS` are gated by
-/// the read-only `observe` permission upstream in `check_privileged_internal_op`.
-/// `ELASTIC_ALLOC` (`resource` contract): grant a Tier B chunk from the
-/// kernel elastic region to the calling module. arg in `[bytes u32 LE]`,
-/// out `[ptr u64 LE]`; returns granted bytes or an accounted `ENOSPC`.
-/// EL0-isolated modules cannot reach this op at all — their SVC surface
-/// carries no `provider_call` — so grants are structurally EL1-only.
+/// Telemetry ring ops. `TLM_EMIT` is an implicit primitive (any module);
+/// `TLM_SUBSCRIBE`/`DRAIN`/`STATS` are gated by the read-only `observe`
+/// permission upstream in `check_privileged_internal_op`. `ELASTIC_ALLOC`
+/// (`resource` contract): grant a Tier B chunk from the kernel elastic region
+/// to the calling module. arg in `[bytes u32 LE]`, out `[ptr u64 LE]`; returns
+/// granted bytes or an accounted `ENOSPC`. EL0-isolated modules cannot reach
+/// this op at all — their SVC surface carries no `provider_call` — so grants
+/// are structurally EL1-only.
 unsafe fn handle_elastic_alloc(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 8 {
         return E_INVAL;
@@ -1793,7 +1792,7 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
         // every module of a `net=own` workload with its owner post-alloc
         // (`set_module_owner`), so a bind-emitting module reads its owner here
         // and appends it to `NET_CMD_BIND` / `DG_CMD_BIND` (metal owner-scoped
-        // binds, `rfc_workload_backend_metal.md` §3.4 / P3a). Slot 0
+        // binds). Slot 0
         // (`OWNER_SYSTEM`, a base-graph module) is the host/wildcard tag — a
         // legitimate value, not an error. A module can only read its OWN owner.
         OWNER_TAG => scheduler::module_owner(scheduler::current_module_index()).slot as i32,
@@ -1823,8 +1822,8 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 crate::kernel::sys::errno::ENOSYS
             }
         }
-        // Module-facing ISR-bridge enumeration (RFC rfc_isr_tier_surface
-        // "ISR-tier I/O contract"). Returns the calling module's own input /
+        // Module-facing ISR-bridge enumeration. Returns the calling
+        // module's own input /
         // output bridge fds (tagged), so an ISR-tier step body can then move
         // data with the ISR-exempt bridge WRITE/READ/POLL/INFO ops.
         bridge::SELF_BRIDGES => {
@@ -2674,7 +2673,7 @@ unsafe extern "C" fn stub_provider_call_sel(
 
 /// Allocate from the calling module's heap.
 ///
-/// RFC §D7: ISR-tier modules are forbidden from heap operations.
+/// ISR-tier modules are forbidden from heap operations.
 /// The gate fires here (at the syscall boundary) rather than in
 /// `heap::heap_alloc` itself because kernel-internal heap callers
 /// must keep working — only the module-facing path is gated.

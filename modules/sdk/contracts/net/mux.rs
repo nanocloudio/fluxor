@@ -3,7 +3,7 @@
 // Layer: contracts/net (public, stable).
 //
 // See docs/architecture/protocol_surfaces.md §Multiplexed Session
-// Surface and the RFC in .context/rfc_protocols.md §6.4.
+// Surface.
 //
 // The multiplexed session surface is a channel contract for transports
 // that expose many logical streams or message channels over one
@@ -68,9 +68,9 @@
 // (MSG_MUX_STREAM_CLOSED / _RESET) has actually been delivered.
 //
 // Continuity integration: a QUIC `session_id` is the natural unit of
-// `transport_migratable` continuity (RFC §7.1). A migrated QUIC
-// connection retains its session_id; SessionCtrlV1 EPOCH_BUMP /
-// RELOCATE coordinate the migration with anchors / workers above.
+// `transport_migratable` continuity. A migrated QUIC connection
+// retains its session_id; SessionCtrlV1 EPOCH_BUMP / RELOCATE
+// coordinate the migration with anchors / workers above.
 
 /// Frame header size (msg_type + len).
 pub const FRAME_HDR: usize = 3;

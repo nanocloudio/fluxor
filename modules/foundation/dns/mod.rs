@@ -160,8 +160,8 @@ mod params_def {
             => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 0xFFFF); };
 
         // Destination port for forwarded (upstream) queries. Lets the
-        // upstream be a delegation listener on a non-standard port
-        // (rfc_system_services.md §4); default remains standard DNS.
+        // upstream be a delegation listener on a non-standard port;
+        // default remains standard DNS.
         6, upstream_port, u16, 53
             => |s, d, len| { s.upstream_port = p_u16(d, len, 0, 53); };
     }
@@ -272,8 +272,7 @@ struct DnsState {
 
     upstream_ip: u32,
     /// Destination port for forwarded queries. Default 53; configurable so a
-    /// host authority resolver on a non-standard port can be the upstream
-    /// (rfc_system_services.md §4 delegation).
+    /// host authority resolver on a non-standard port can be the upstream.
     upstream_port: u16,
     ttl: u32,
     listen_port: u16,

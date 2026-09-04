@@ -1,10 +1,9 @@
 // linux_surface_traits built-in — Linux Surface Traits authority.
 //
-// The Linux implementation of the runtime environment plane
-// (.context/rfc_surface_traits.md). Emits `input::surface_traits::MSG_TRAITS`
-// (24-byte) records on its output port: one baseline at startup, then one per
-// change. A consumer wired to it adapts to the surface; an unwired graph is
-// unaffected (purely additive).
+// The Linux implementation of the runtime environment plane. Emits
+// `input::surface_traits::MSG_TRAITS` (24-byte) records on its output port:
+// one baseline at startup, then one per change. A consumer wired to it adapts
+// to the surface; an unwired graph is unaffected (purely additive).
 //
 // Sources of each field:
 //   * geometry / orientation / size class — the live window size when a

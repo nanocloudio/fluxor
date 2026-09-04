@@ -1,5 +1,5 @@
 // protocol_timer_core — nearest-deadline tracking for portability-
-// sensitive protocol modules (rfc_protocols.md §12, §15.1).
+// sensitive protocol modules.
 //
 // Protocol timing state (retransmit timers, keepalive windows, pacing
 // cadence) must be explicit so it can be preserved and observed across

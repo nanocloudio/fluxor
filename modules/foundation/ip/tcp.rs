@@ -10,7 +10,7 @@ pub const TCP_HEADER_LEN: usize = 20;
 /// `TcpConn::local_slot` wildcard: not bound to a specific local address.
 /// Listeners and datagram endpoints carry this so they are reachable at
 /// every configured local address; accepted/connected conns latch a
-/// concrete slot instead. (`rfc_net_identity_metal` §3.4.)
+/// concrete slot instead.
 pub const LOCAL_SLOT_ANY: u8 = 0xFF;
 
 /// TCP flags
@@ -114,20 +114,20 @@ pub struct TcpConn {
     pub remote_port: u16,
     pub remote_ip: u32,
 
-    /// Local-address slot this conn is reached at / sources from
-    /// (`rfc_net_identity_metal` §3.4). Index into `IpState::local_addrs`;
-    /// `0` = primary (today's `local_ip`). Accepted conns latch the slot the
-    /// inbound dst-IP matched; outbound connects use slot 0; listeners and
-    /// datagram endpoints carry `LOCAL_SLOT_ANY` (wildcard — reachable at
-    /// every local address). The tuple match (`find_conn`) gains this axis so
-    /// the same port at two addresses is two distinct listeners.
+    /// Local-address slot this conn is reached at / sources from. Index into
+    /// `IpState::local_addrs`; `0` = primary (today's `local_ip`). Accepted
+    /// conns latch the slot the inbound dst-IP matched; outbound connects use
+    /// slot 0; listeners and datagram endpoints carry `LOCAL_SLOT_ANY`
+    /// (wildcard — reachable at every local address). The tuple match
+    /// (`find_conn`) gains this axis so the same port at two addresses is two
+    /// distinct listeners.
     pub local_slot: u8,
     pub _slot_pad: u8,
 
-    /// Owner stamped on this endpoint at bind (`rfc_net_identity_metal` §3.4).
-    /// `0` is the host wildcard. Part of the datagram bind identity: a second
-    /// bind of the same `(local_port, local_slot)` under a different owner is
-    /// a conflict, not an idempotent retry.
+    /// Owner stamped on this endpoint at bind. `0` is the host wildcard. Part
+    /// of the datagram bind identity: a second bind of the same `(local_port,
+    /// local_slot)` under a different owner is a conflict, not an idempotent
+    /// retry.
     pub owner_tag: u16,
 
     /// When set, this slot is a datagram endpoint. UDP delivery to it
@@ -292,11 +292,10 @@ pub const INITIAL_RCV_WND: u16 = 2048;
 /// **aarch64** — 4 KiB, held below the smallest consumer ring (8 KiB)
 /// so a compliant peer can never have more in flight than a single
 /// delivery pass absorbs: the ring-full/zero-window recovery path
-/// corrupts bulk inbound streams on bcm2712 (open defect,
-/// rfc_oci_distribution.md §8), and a window under one ring never
-/// enters it. Bulk-download throughput is bounded by the 1 ms tick
-/// either way; the `update_rcv_wnd` self-throttle still closes the
-/// window under consumer backpressure.
+/// corrupts bulk inbound streams on bcm2712 (open defect), and a
+/// window under one ring never enters it. Bulk-download throughput is
+/// bounded by the 1 ms tick either way; the `update_rcv_wnd`
+/// self-throttle still closes the window under consumer backpressure.
 ///
 /// **rp2350 / rp2040 / wasm32** — 8 KiB. Original embedded budget;
 /// bumping further would inflate per-`TcpConn` reorder bookkeeping
@@ -411,15 +410,17 @@ pub fn cookie_mode_admissible(hdr: &TcpHeader) -> bool {
 }
 
 /// Find a TCP connection matching the incoming segment.
+///
 /// # Safety
 /// `conns` must point to a valid array of at least `MAX_TCP_CONNS` entries.
-/// `local_slot` adds the local-address axis (`rfc_net_identity_metal` §3.4):
-/// the same 4-tuple reached at two different local addresses is two distinct
-/// connections. A conn carrying `LOCAL_SLOT_ANY` matches any dst slot (a
-/// wildcard listener); a conn on a concrete slot matches only that slot. With
-/// a single configured address every conn latches slot 0 and every inbound
-/// segment resolves to slot 0, so the axis is inert — behaviour is identical
-/// to the pre-multi-address port-only match.
+/// `local_slot`
+/// adds the local-address axis: the same 4-tuple reached at two different
+/// local addresses is two distinct connections. A conn carrying
+/// `LOCAL_SLOT_ANY` matches any dst slot (a wildcard listener); a conn on a
+/// concrete slot matches only that slot. With a single configured address
+/// every conn latches slot 0 and every inbound segment resolves to slot 0, so
+/// the axis is inert — behaviour is identical to the pre-multi-address
+/// port-only match.
 pub unsafe fn find_conn(
     conns: &[TcpConn; MAX_TCP_CONNS],
     remote_ip: u32,
@@ -450,14 +451,13 @@ pub unsafe fn find_conn(
 /// `Listen` state, so the match excludes `is_datagram` slots — a TCP
 /// SYN must never land on a UDP-bound endpoint.
 ///
-/// Bind admission (`rfc_net_identity_metal` §3.4): a listener bound to a
-/// concrete slot serves only that slot; a wildcard listener
-/// (`LOCAL_SLOT_ANY`) serves slot 0 and UNOWNED secondaries but NEVER an
-/// OWNED secondary (`dst_owned`) — an owned workload address is reachable
-/// only through a listener explicitly bound to it (an owner-stamped bind).
-/// With no owned secondary configured `dst_owned` is always false, so the
-/// wildcard matches every slot exactly as the pre-P2 port-only match did —
-/// byte-identical.
+/// Bind admission: a listener bound to a concrete slot serves only that
+/// slot; a wildcard listener (`LOCAL_SLOT_ANY`) serves slot 0 and UNOWNED
+/// secondaries but NEVER an OWNED secondary (`dst_owned`) — an owned
+/// workload address is reachable only through a listener explicitly bound
+/// to it (an owner-stamped bind). With no owned secondary configured
+/// `dst_owned` is always false, so the wildcard matches every slot exactly
+/// as a port-only match would.
 pub unsafe fn find_listener(
     conns: &[TcpConn; MAX_TCP_CONNS],
     local_port: u16,

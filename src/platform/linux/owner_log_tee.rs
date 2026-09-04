@@ -1,5 +1,5 @@
-// Per-owner log tee (rfc_owner_drain_and_logs.md Part B) — the Linux
-// realization of the owner-scoped log surface.
+// Per-owner log tee — the Linux realization of the owner-scoped log
+// surface.
 //
 // The global `log::Log`. Each record is (1) delegated to an env_logger `Logger`
 // for stderr formatting + env-filter behaviour, and (2), when emitted on the

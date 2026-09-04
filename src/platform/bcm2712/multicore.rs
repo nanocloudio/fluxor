@@ -1289,7 +1289,7 @@ static PARKED_COUNT: AtomicU32 = AtomicU32::new(0);
 /// into its run loop (where it honours `park_if_requested`). Until then a
 /// `request_quiesce` + `wait_parked` from the primary would spin forever: a
 /// secondary still blocked on `INIT_COMPLETE` never reaches the park point. The
-/// runtime WS-D live-splice (`scheduler::live::apply_add`/`free_owner`) consults
+/// runtime live-splice (`scheduler::live::apply_add`/`free_owner`) consults
 /// this to decide whether a peer-core quiesce is possible — at boot the splice
 /// runs single-threaded (no peers stepping) and `finalize_resident_graphs`
 /// finishes the domain wiring, so no quiesce is needed OR safe there.

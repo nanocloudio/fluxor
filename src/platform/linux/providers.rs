@@ -1116,10 +1116,10 @@ const MSG_CLOSED: u8 = 0x03;
 const MSG_BOUND: u8 = 0x04;
 const MSG_CONNECTED: u8 = 0x05;
 const MSG_ERROR: u8 = 0x06;
-/// Bind refusal / failure: `[port: u16 LE][errno: u8]`. The port is the routing
-/// key (consumers sharing net_out already filter by local_port). Emitted on a
-/// bind syscall failure and on an owner-gate refusal (rfc_endpoint_lease.md
-/// §5.3), so a requester never hangs waiting for MSG_BOUND on a failed bind.
+/// Bind refusal / failure: `[port: u16 LE][errno: u8]`. The port is the
+/// routing key (consumers sharing net_out already filter by local_port).
+/// Emitted on a bind syscall failure and on an owner-gate refusal, so a
+/// requester never hangs waiting for MSG_BOUND on a failed bind.
 const MSG_BIND_REFUSED: u8 = 0x07;
 
 // Net protocol command types (upstream: consumer → linux_net)
@@ -1197,8 +1197,7 @@ struct LinuxNetConn {
     /// connect-failure `MSG_ERROR` so a fanned net_out routes the event back.
     connect_tag: u8,
     /// The COMMANDING owner — the owner of the module whose lane issued the
-    /// bind/connect that created this slot (rfc_endpoint_lease.md §4.1:
-    /// attribution is carried via the lane, never inferred from the executing
+    /// bind/connect that created this slot (/// attribution is carried via the lane, never inferred from the executing
     /// module, which may be system-owned). Immutable for the life of the slot.
     owner: crate::kernel::workload::owner::OwnerHandle,
     /// Datagram endpoints only: the `owner_tag` the consumer stamped on
@@ -1243,8 +1242,7 @@ pub struct LinuxNetState {
     net_ins: [i32; LINUX_NET_MAX_INBOUND],
     /// Owner of each lane's producer module, resolved at instantiation from
     /// the wired edge (`channel_producer_owner`) and refreshed on every
-    /// rebuild — the carried-attribution source for bind stamps
-    /// (rfc_endpoint_lease.md §4.1).
+    /// rebuild — the carried-attribution source for bind stamps.
     lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
     net_out: i32,
     conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
@@ -1334,7 +1332,7 @@ unsafe fn set_nonblocking(fd: i32) {
 }
 
 // ----------------------------------------------------------------------
-// linux_net instance registry (rfc_endpoint_lease.md §4.3–§4.5)
+// linux_net instance registry
 //
 // The platform needs to reach every linux_net instance's connection table
 // from OUTSIDE its step — for the owner teardown hook (drain/free), the
@@ -1360,7 +1358,7 @@ pub fn linux_net_register_state(ptr: *mut LinuxNetState) {
 /// Called at the top of every graph (re)build, BEFORE the destructive graph
 /// reset drops the old module state — otherwise the old listener fds leak,
 /// still holding their ports, and the re-issued CMD_BINDs after the rebuild
-/// die on EADDRINUSE (rfc_endpoint_lease.md §4.5).
+/// die on EADDRINUSE.
 pub fn linux_net_close_all_and_clear_registry() {
     // SAFETY: single-threaded; pointers registered this graph generation are
     // still valid until prepare_graph tears the old graph down (called after).
@@ -1381,8 +1379,8 @@ pub fn linux_net_close_all_and_clear_registry() {
 
 /// Close every connection slot stamped with `owner`, across all instances.
 /// The drain driver calls this BEFORE `free_owner`, so an observer never sees
-/// the owner's terminal record while its port is still accepting
-/// (rfc_endpoint_lease.md §4.4). Platform thread only.
+/// the owner's terminal record while its port is still accepting. Platform
+/// thread only.
 pub fn linux_net_close_owner_conns(owner: crate::kernel::workload::owner::OwnerHandle) {
     // SAFETY: single-threaded platform access to registered live instances,
     // reached through a raw pointer.
@@ -1409,7 +1407,7 @@ pub fn linux_net_close_owner_conns(owner: crate::kernel::workload::owner::OwnerH
 /// Snapshot the bound endpoints per owner: `(owner, protocol, port)` for every
 /// live listener / UDP socket. Protocol: 1 = tcp, 2 = udp (matching
 /// CONN_TYPE_UDP_BOUND mnemonically). The runtime's raw report — declarations
-/// are the agent's business (rfc_endpoint_lease.md §4.3). Platform thread only.
+/// are the agent's business. Platform thread only.
 pub fn linux_net_bound_endpoints() -> Vec<(crate::kernel::workload::owner::OwnerHandle, u8, u16)> {
     let mut out = Vec::new();
     // SAFETY: single-threaded platform access to registered live instances,
@@ -1501,7 +1499,7 @@ unsafe fn linux_net_send_bind_refused(st: &mut LinuxNetState, port: u16, errno: 
 /// `DG_CMD_BIND`, alongside `MSG_BIND_REFUSED`: datagram-contract modules
 /// (dns et al.) parse only `DG_MSG_*` opcodes in their WaitBound states, so
 /// without this frame a refused UDP bind parks them forever instead of
-/// faulting (rfc_system_services.md §7 Q1). `ep_id` 0xFF = no endpoint was
+/// faulting. `ep_id` 0xFF = no endpoint was
 /// allocated. Emitting both frames is additive-safe: each surface's
 /// listeners match only their own opcode.
 unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, errno: u8) {
@@ -1509,12 +1507,12 @@ unsafe fn linux_net_send_dg_error(st: &mut LinuxNetState, errno: u8) {
     linux_net_send_msg(st, &msg);
 }
 
-/// The Part B bind gate (rfc_endpoint_lease.md §5.3) for a NEW bind by
-/// `commander`: admission must be open (a Draining owner binds nothing new —
-/// same-owner re-binds of held ports never reach this, they take the use-class
-/// fast path), and when the committed plan is lease-aware the (protocol, port)
-/// must be granted. System-owned commanders are ungated, as everywhere.
-/// Returns the refusal errno, or None to proceed.
+/// The Part B bind gate for a NEW bind by `commander`: admission must be open
+/// (a Draining owner binds nothing new — same-owner re-binds of held ports
+/// never reach this, they take the use-class fast path), and when the
+/// committed plan is lease-aware the (protocol, port) must be granted.
+/// System-owned commanders are ungated, as everywhere. Returns the refusal
+/// errno, or None to proceed.
 fn linux_net_new_bind_refusal(
     commander: crate::kernel::workload::owner::OwnerHandle,
     protocol: u8,
@@ -1551,14 +1549,14 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     let commander = st.lane_owners[lane];
     // Embedded IP modules close their listener after each accepted
     // connection; their TCP/IP servers re-issue CMD_BIND between
-    // requests. On Linux the listening fd persists, so a re-bind on
-    // the same port would fail with EADDRINUSE. Acknowledge the
-    // re-bind with MSG_BOUND immediately when an existing listener
-    // is alive *for the same port* — but ONLY for the same commanding
-    // owner (rfc_endpoint_lease.md §4.2): the fast path was owner-blind
-    // and would silently hand one owner's listener to another. Same-owner
-    // re-bind is use-class (allowed even while Draining — the accept-loop
-    // case); a cross-owner claim on a live listener is refused.
+    // requests. On Linux the listening fd persists, so a re-bind on the
+    // same port would fail with EADDRINUSE. Acknowledge the re-bind with
+    // MSG_BOUND immediately when an existing listener is alive *for the
+    // same port* — but ONLY for the same commanding owner: the fast path
+    // was owner-blind and would silently hand one owner's listener to
+    // another. Same-owner re-bind is use-class (allowed even while
+    // Draining — the accept-loop case); a cross-owner claim on a live
+    // listener is refused.
     for (li, c) in st.conns.iter().enumerate() {
         if c.state == 3 && c.conn_type == 1 && c.fd >= 0 && c.port == port {
             if c.owner == commander {
@@ -1737,8 +1735,7 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
     }
     set_nonblocking(fd);
     let idx = slot as usize;
-    // `port` is recorded: the endpoint report and the bind gate both need it
-    // (rfc_endpoint_lease.md §1.1).
+    // `port` is recorded: the endpoint report and the bind gate both need it.
     st.conns[idx] = LinuxNetConn {
         fd,
         conn_type: CONN_TYPE_UDP_BOUND,
@@ -1946,8 +1943,8 @@ unsafe fn linux_net_cmd_connect(
             state: 1,
             connect_tag: tag,
             // Stamp the commanding owner so this outbound data conn is torn
-            // down with its owner on drain/revoke (rfc_endpoint_lease.md §4.4);
-            // otherwise it stays OWNER_SYSTEM and outlives revocation.
+            // down with its owner on drain/revoke; otherwise it stays
+            // OWNER_SYSTEM and outlives revocation.
             owner: st.lane_owners[lane],
             ..LinuxNetConn::EMPTY
         };
@@ -2143,7 +2140,7 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
         let listener_fd = st.conns[li].fd;
         let listener_port = st.conns[li].port;
         // The accepted client inherits the listener's owner so it is torn down
-        // with the owner on drain/revoke (rfc_endpoint_lease.md §4.4).
+        // with the owner on drain/revoke.
         let listener_owner = st.conns[li].owner;
         let mut accepted_on_this_listener: u32 = 0;
         while accepted_on_this_listener < PER_TICK_ACCEPT_BUDGET {

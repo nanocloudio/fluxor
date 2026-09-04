@@ -1,5 +1,4 @@
-//! Wake-latency probe SOURCE (wake-on-write silicon AC, RFC
-//! idle_skip_wake).
+//! Wake-latency probe SOURCE (wake-on-write silicon AC).
 //!
 //! Every `emit_every` (default 997) of its own steps, writes a 12-byte
 //! probe on `out`: `[magic u32 LE][dev_millis u64 LE]`. The paired
@@ -38,8 +37,8 @@ struct State {
     /// dt=0). `1` = storm mode (pi5_wake_storm): emit on every step.
     emit_every: u32,
     /// Busy-spin per step in µs (storm mode): inflates the domain's
-    /// consumed budget so the woken-path budget bound (RFC
-    /// idle_skip_wake §5) is actually exercised.
+    /// consumed budget so the woken-path budget bound is actually
+    /// exercised.
     burn_us: u32,
 }
 
@@ -120,7 +119,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.tick = s.tick.wrapping_add(1);
         // Storm mode: burn budget before the emit so the domain's
         // consumed time genuinely exceeds its limit and the woken-path
-        // bound (RFC idle_skip_wake §5) has something to defer.
+        // bound has something to defer.
         if s.burn_us > 0 {
             let start = dev_micros(sys);
             while dev_micros(sys).saturating_sub(start) < s.burn_us as u64 {

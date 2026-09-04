@@ -289,7 +289,7 @@ pub const PUT_STREAMED_ABORT: u32 = 0x1429;
 /// Host-neutral helpers shared by the platform `storage.object`
 /// adapters that back `HEAD` / `RANGE_GET` with browser `fetch()`
 /// (wasm) and `Range:` requests (linux). The four browser host
-/// bindings named by the Playload RFC §12.3 — `host_object_head`,
+/// bindings — `host_object_head`,
 /// `host_object_range_open`, `host_object_recv`, `host_object_close`
 /// — and their Linux peers all reduce to the same three concerns:
 /// clamping a requested window against the object size, encoding the

@@ -512,8 +512,7 @@ impl MergeModule {
 
     /// The channel this merge fans its inputs into (its sole output). Used by
     /// the metal `workload` backend's spare-lane discovery to locate the merge
-    /// feeding a named consumer's input port
-    /// (`rfc_workload_backend_metal.md` §7 P4).
+    /// feeding a named consumer's input port.
     pub(super) fn out_chan(&self) -> i32 {
         self.out_chan
     }
@@ -521,10 +520,9 @@ impl MergeModule {
     /// The merge's cached input lanes `[0..in_count]`. Attachable-lane
     /// provisioning pre-caches spare lanes here at boot; a runtime workload's
     /// producer is wired to write into a *free* one of these (a lane whose
-    /// `channel_producer_owner` is still system) with no merge-state mutation —
-    /// the merge already reads every lane round-robin, so an empty spare lane
-    /// is a benign no-op read until a producer attaches
-    /// (`rfc_workload_backend_metal.md` §7 P4, the P3b subsumption).
+    /// `channel_producer_owner` is still system) with no merge-state mutation
+    /// — the merge already reads every lane round-robin, so an empty spare
+    /// lane is a benign no-op read until a producer attaches.
     pub(super) fn input_lanes(&self) -> &[i32] {
         &self.in_chans[..self.in_count.min(MAX_PORTS)]
     }

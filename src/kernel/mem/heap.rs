@@ -8,8 +8,6 @@
 //! Design: simple freelist with first-fit and immediate coalescing on free.
 //! 8-byte header per block, 16-byte minimum allocation granularity.
 //!
-//! See `.context/rfc-per-module-heap-allocation.md` for the full design.
-//!
 //! ## Concurrency
 //!
 //! Each `MODULE_HEAPS[i]` entry is owned by module `i`, which steps on

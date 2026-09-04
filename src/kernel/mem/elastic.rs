@@ -1,5 +1,5 @@
 //! Tier B elastic region — kernel-owned chunk grants for runtime pool
-//! growth (`rfc_resource_model.md` §3.6, `resource::ELASTIC_ALLOC`).
+//! growth ( `resource::ELASTIC_ALLOC`).
 //!
 //! Module state and heap arenas are committed whole at load, so a pool
 //! that grows *while the node runs* (TLS sessions, conns) takes chunks

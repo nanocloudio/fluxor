@@ -7,7 +7,7 @@
 use super::*;
 
 // ===========================================================================
-// Multi-graph runtime (RFC adaptive_tick_extra §7 — the resident-graph runner)
+// Multi-graph runtime (the resident-graph runner)
 // ===========================================================================
 //
 // The §7 graph-local pacer surface above is keyed by `(graph_slot, generation,
@@ -220,12 +220,12 @@ pub fn finalize_resident_graphs() {
 }
 
 /// Boot path: admit every resident workload declared in the config's `[FXPD]`
-/// post-body section (RFC adaptive_tick_extra §7 — the `combine <two-graph.yaml>`
-/// / `workloads:` mechanism) as a workload owner via `apply_add`, then finalize the
-/// domain dispatch tables. Call ONCE after `prepare_graph` + instantiation and
-/// BEFORE the per-domain run loops start (same constraint as
-/// `finalize_resident_graphs`). No-op when there is no workload section (single-graph
-/// config, byte-identical boot) or on non-multitenant builds.
+/// post-body section (the `combine <two-graph.yaml>` / `workloads:` mechanism)
+/// as a workload owner via `apply_add`, then finalize the domain dispatch
+/// tables. Call ONCE after `prepare_graph` + instantiation and BEFORE the
+/// per-domain run loops start (same constraint as `finalize_resident_graphs`).
+/// No-op when there is no workload section (single-graph config,
+/// byte-identical boot) or on non-multitenant builds.
 pub fn admit_resident_workloads_from_config() {
     #[cfg(feature = "multitenant")]
     {
@@ -552,15 +552,15 @@ fn domain_has_paused_graph(domain: usize) -> bool {
         .any(|e| e.domain as usize == domain && owner_graph_paused(sched, e.slot, e.generation))
 }
 
-/// §6.5 readable-channel term (RFC idle_skip_wake §4): does any edge whose
-/// CONSUMER belongs to this graph — and whose PRODUCER does not — hold
-/// readable bytes? Without this term, data written into a skipped graph's
-/// inbound channel (a cross-owner `apply_add` edge, or a system-graph
-/// producer) waits for the graph's backstop cadence: under demand-driven
-/// idle that is `tick_max_us` per hop, which is exactly the multi-workload
-/// latency term the RFC exists to remove. The check adds a wake REASON
-/// evaluated at the runner's existing cadence — not a wake source — so
-/// there is no storm surface and no ordering change.
+/// §6.5 readable-channel term: does any edge whose CONSUMER belongs to
+/// this graph — and whose PRODUCER does not — hold readable bytes? Without
+/// this term, data written into a skipped graph's inbound channel (a
+/// cross-owner `apply_add` edge, or a system-graph producer) waits for the
+/// graph's backstop cadence: under demand-driven idle that is
+/// `tick_max_us` per hop, which is exactly the multi-workload latency term
+/// the RFC exists to remove. The check adds a wake REASON evaluated at the
+/// runner's existing cadence — not a wake source — so there is no storm
+/// surface and no ordering change.
 ///
 /// Cost: O(edges) per otherwise-idle graph per pass, one lock-guarded
 /// `channel_poll` per cross-graph edge (POLL_IN covers both FIFO fill and
@@ -578,8 +578,8 @@ fn domain_has_paused_graph(domain: usize) -> bool {
 /// the runner adds them to the woken set so they step with
 /// `event_wake = true` (bypassing step-period gating) — cross-graph
 /// channel data thereby carries exactly the semantics of a targeted
-/// `event_signal`, which is what RFC adaptive_tick mechanism (a) named for
-/// "channel write" wakes all along. Returns `true` if any were found.
+/// `event_signal`, which is what mechanism (a) means by a "channel
+/// write" wake. Returns `true` if any were found.
 #[cfg(feature = "multitenant")]
 fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut ModuleMask) -> bool {
     let mut any = false;
@@ -608,11 +608,11 @@ fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut M
     any
 }
 
-/// The shared-cooperative-runner core (RFC adaptive_tick_extra §7.2). Steps
-/// every resident graph in `domain` independently, skips idle graphs (§6.5),
-/// and returns the merged physical-sleep deadline (µs). Mirrors the once-per-tick
-/// housekeeping of `step_domain_modules` (tick advance, drain timeout, budget
-/// reset, worst-step decay, Tier-1c pre-tick, ISR-bridge pump) but runs the
+/// The shared-cooperative-runner core. Steps every resident graph in `domain`
+/// independently, skips idle graphs (§6.5), and returns the merged
+/// physical-sleep deadline (µs). Mirrors the once-per-tick housekeeping of
+/// `step_domain_modules` (tick advance, drain timeout, budget reset,
+/// worst-step decay, Tier-1c pre-tick, ISR-bridge pump) but runs the
 /// exec-order rotation once PER resident graph so each graph's burst/budget
 /// fairness and pacer state stay independent.
 #[cfg(feature = "multitenant")]
@@ -721,7 +721,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
         if gdomain != domain {
             continue;
         }
-        // §3.2 pause skip (rfc_workload_lifecycle.md, P4): a paused owner's
+        // §3.2 pause skip: a paused owner's
         // graph is not-runnable REGARDLESS of wakes, due periodic modules,
         // backstop, must-tick, or readable inbound — evaluated before every
         // §6.5 term so none of them can step it. Wake bits that latched
@@ -788,9 +788,8 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
             || any_due
             || must_tick
             || backstop_due;
-        // Readable-channel term (RFC idle_skip_wake §4): an otherwise-idle
-        // graph with readable bytes on a cross-graph inbound edge is
-        // runnable NOW — not at its
+        // Readable-channel term: an otherwise-idle graph with readable
+        // bytes on a cross-graph inbound edge is runnable NOW — not at its
         // backstop. Evaluated last so the edge scan runs only for graphs
         // every cheaper term already declared idle. The consumers found
         // join the woken set below, stepping with `event_wake = true` so a
@@ -1026,10 +1025,10 @@ pub fn step_resident_graphs_domain(
     // never reaches a period-gated module and the module waits out its
     // full period with the bit stranded. Domain-scoped take so one
     // domain's drain can't consume a sibling domain's wakes;
-    // `step_woken_modules` applies the woken-path budget bound
-    // (RFC idle_skip_wake §5). The WFI-latency caveat is unchanged: a
-    // software wake is serviced on the next timer pass (§5.4 clamp), not
-    // mid-sleep — this drain is what performs that service.
+    // `step_woken_modules` applies the woken-path budget bound. The
+    // WFI-latency caveat is unchanged: a software wake is serviced on
+    // the next timer pass (§5.4 clamp), not mid-sleep — this drain is
+    // what performs that service.
     {
         // SAFETY: scheduler-thread context — sole stepper for this domain.
         let sched = unsafe { &*core::ptr::addr_of!(SCHED) };
@@ -1057,7 +1056,7 @@ pub fn step_resident_graphs_domain(
 /// kernels (and vice versa) must agree on the byte-to-tier mapping.
 /// The mapping is asymmetric (Tier 1b → 2, Tier 2 → 4) because Tier
 /// 1a/3 were allocated first; reshuffling would break already-built
-/// configs. See `.context/rfc_isr_tier_surface.md` §D5.
+/// configs.
 pub mod exec_mode {
     /// Tier 0 — cooperative, main scheduler loop.
     pub const COOPERATIVE: u8 = 0;
@@ -1075,8 +1074,7 @@ pub mod exec_mode {
     /// pass before any `domain_exec_order` modules. The byte value
     /// here is reserved for telemetry/logging only — the kernel reads
     /// the bit per-module from `ModuleEntry::pre_tick_drain`, not from
-    /// the domain's exec_mode. See `.context/rfc_isr_tier_surface.md`
-    /// §D8.
+    /// the domain's exec_mode.
     pub const TIER_1C: u8 = 5;
 }
 
@@ -1104,8 +1102,7 @@ pub fn is_isr_tier_exec_mode(mode: u8) -> bool {
 /// `true` if `module_idx`'s assigned domain is an ISR-tier
 /// (Tier 1b or Tier 2) domain. The cooperative scheduler skips
 /// stepping ISR-tier modules because they run from a timer/IRQ
-/// handler, not from `step_modules`. See
-/// `.context/rfc_isr_tier_surface.md` §D6.
+/// handler, not from `step_modules`.
 #[inline]
 pub fn module_is_isr_tier(module_idx: usize) -> bool {
     if module_idx >= MAX_MODULES {
@@ -1130,8 +1127,7 @@ pub fn module_is_isr_tier(module_idx: usize) -> bool {
 /// The runtime gate is defense in depth — the build-time validator
 /// (`tools/src/config.rs::validate_isr_tier_admission`) already
 /// rejects malformed graphs; this catches hand-rolled binaries that
-/// bypass the tools pipeline. See
-/// `.context/rfc_isr_tier_surface.md` §D6.
+/// bypass the tools pipeline.
 #[inline]
 pub fn deny_isr_tier_syscall(op: &'static str) -> bool {
     let module_idx = current_module_index();

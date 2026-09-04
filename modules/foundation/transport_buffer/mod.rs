@@ -1,11 +1,11 @@
 //! transport_buffer — a transport-agnostic byte-egress buffer.
 //!
-//! The stream-buffer stage between an encoder (e.g. `otel.export`) and the wire:
-//! it drains length-framed payloads from its `payload` input and forwards each to
-//! a selected transport, holding one in-flight payload against backpressure
-//! (resuming a partial write where the sink allows). One generic buffer core; the
-//! transport is a capability chosen by the `transport` param, not a module per
-//! protocol (`rfc_observability_surface.md` §5.5).
+//! The stream-buffer stage between an encoder (e.g. `otel.export`) and the
+//! wire: it drains length-framed payloads from its `payload` input and
+//! forwards each to a selected transport, holding one in-flight payload
+//! against backpressure (resuming a partial write where the sink allows). One
+//! generic buffer core; the transport is a capability chosen by the
+//! `transport` param, not a module per protocol.
 //!
 //! Transports:
 //!   - `udp` (0)  — via the shared `datagram_endpoint` core over the ip datagram

@@ -4,7 +4,7 @@
 //! (`modules/sdk/contracts/storage/namespace.rs`), and the first
 //! implementor of `BIND` (0x1308). Exists so the surface — and the
 //! `mount` routing tier above it — is testable with **no on-disk
-//! format in the loop** (rfc_storage_capability_symmetry §5: a repo
+//! format in the loop** (a repo
 //! that owns a contract holds an in-repo provider that proves it).
 //!
 //! Every binding lives in the module's state arena: a fixed table of

@@ -542,7 +542,7 @@ pub const PIO_CONFIG_BIN_SIZE: usize = 4;
 ///              size requested from `channel_open_for_module`.
 pub const GRAPH_EDGE_SIZE: usize = 12;
 /// Per-domain metadata entry, bytes: `tick_us:u16 | exec_mode:u8 |
-/// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags` (RFC adaptive_tick §8).
+/// adaptive_flags:u8` = 4. Byte 3 carries `adaptive_flags`.
 /// `tick_min_us`/`tick_max_us` are deliberately NOT in this (checksummed) entry:
 /// they ride in the POST-BODY adaptive section past `total_size` (see
 /// `ADAPTIVE_POST_SIZE`), because growing the checksummed `body_size` hangs the
@@ -558,12 +558,12 @@ pub const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
 /// `read_config_from_slice`.
 pub const ADAPTIVE_POST_SIZE: usize = 16;
 
-/// Resident-workload config-section magic: "FXPD". The section is appended PAST the
-/// checksummed body, right after the adaptive post-body tail (at
-/// `total_size + ADAPTIVE_POST_SIZE`), carrying one or more `AddSubgraph` (FLXA)
-/// blobs the kernel admits at boot via `scheduler::live::apply_add` (RFC
-/// adaptive_tick_extra §7). Layout: `[FXPD u32 LE][workload_count u16 LE]` then per
-/// workload `[blob_len u32 LE][FLXA blob]`. Mirrors `tools add_subgraph::WORKLOAD_SECTION_MAGIC`.
+/// Resident-workload config-section magic: "FXPD". The section is appended
+/// PAST the checksummed body, right after the adaptive post-body tail (at
+/// `total_size + ADAPTIVE_POST_SIZE`), carrying one or more `AddSubgraph`
+/// (FLXA) blobs the kernel admits at boot via `scheduler::live::apply_add`.
+/// Layout: `[FXPD u32 LE][workload_count u16 LE]` then per workload `[blob_len
+/// u32 LE][FLXA blob]`. Mirrors `tools add_subgraph::WORKLOAD_SECTION_MAGIC`.
 /// Same additive discipline as the adaptive tail — no format-version bump.
 pub const WORKLOAD_SECTION_MAGIC: u32 = 0x4658_5044;
 /// Largest resident-workload section the kernel will map, in bytes (bounds a torn or
@@ -649,7 +649,7 @@ pub struct ModuleEntry {
     /// tools-side build pipeline from the module manifest's
     /// `pre_tick_drain` field. Read by `prepare_graph` to populate
     /// `domain_pre_tick_order` and exclude the module from
-    /// `domain_exec_order`. See `.context/rfc_isr_tier_surface.md` §D8.
+    /// `domain_exec_order`.
     pub pre_tick_drain: bool,
     /// Tee/merge framing mode (`FRAME_KIND_*` from `module_types`).
     /// `FRAME_KIND_NONE` (0) is best-effort byte-stream forwarding;
@@ -753,11 +753,10 @@ pub struct GraphEdge {
     /// 3=bulk, 4=transaction (contracts `RateClass`). Feeds
     /// MODULE_FLOW_BUDGET grants and the wake-on-write class gate.
     pub rate_class: u8,
-    /// `wake: true` on the wiring entry (RFC idle_skip_wake §4
-    /// wake-on-write): a successful `channel_write` on this edge
-    /// latches the consumer's event-wake bit and rings the scheduler
-    /// doorbell so an idle sleep is cut short. Byte 9 bit 0 of the
-    /// edge record.
+    /// `wake: true` on the wiring entry: a successful
+    /// `channel_write` on this edge latches the consumer's
+    /// event-wake bit and rings the scheduler doorbell so an idle
+    /// sleep is cut short. Byte 9 bit 0 of the edge record.
     pub wake_on_write: bool,
 }
 
@@ -792,7 +791,7 @@ pub struct Config {
     pub domain_tick_us: [u16; 4],
     /// Per-domain execution mode: 0=cooperative, 1=high_rate/Tier1a, 3=poll/Tier3.
     pub domain_exec_mode: [u8; 4],
-    /// Per-domain adaptive-tick enable flags (RFC adaptive_tick §8), in byte 3 of
+    /// Per-domain adaptive-tick enable flags, in byte 3 of
     /// the per-domain metadata entry. `0` = adaptive off.
     ///   bit 0: enable mechanism (a) demand-driven idle.
     ///   bit 1: enable mechanism (b) adaptive cadence.
@@ -814,10 +813,8 @@ pub struct Config {
     ///          in best-effort declaration order. Without this bit,
     ///          `prepare_graph` rejects cycles (v1 strict invariant).
     /// bits 1-7: reserved (must be 0).
-    ///
-    /// See `.context/rfc_deployment_scenarios.md` §13 for the design rationale.
     pub graph_flags: u8,
-    /// Resident-workload section (RFC adaptive_tick_extra §7): pointer into the config
+    /// Resident-workload section: pointer into the config
     /// blob at the `[FXPD][count]…` post-body section, or null if absent. The
     /// boot path (`scheduler::admit_resident_workloads_from_config`) walks it and
     /// admits each workload via `apply_add`. Points into the persistent config image
@@ -1312,9 +1309,9 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // `[magic u32][section_len u32][crc16 u16][payload]`, `crc16` over
     // `section[10..section_len]` — so the walk skips sections by length and an
     // unknown magic ends the chain. Known sections:
-    //   FXPD — resident workloads (RFC adaptive_tick_extra §7): payload =
+    //   FXPD — resident workloads: payload =
     //          `[count u16]` then per workload `[blob_len u32][FLXA blob]`.
-    //   FXEV — capacity envelope (`rfc_resource_model.md` §3): payload =
+    //   FXEV — capacity envelope: payload =
     //          `[entry_count u16]` then `[pool u16][n u32]` entries, installed
     //          as the deployment's enforced pool capacities.
     // Each is validated whole (bounds AND CRC) before use: workloads are
@@ -1470,7 +1467,7 @@ fn parse_module_entry(ptr: *const u8, entry_len: usize) -> Option<ModuleEntry> {
 ///   resolved by the config compiler from the per-edge `rate:`
 ///   override / port content-type defaults. Consumed by the
 ///   MODULE_FLOW_BUDGET provider query.
-/// - byte 9:    bit 0 = wake_on_write (RFC idle_skip_wake §4 — a
+/// - byte 9:    bit 0 = wake_on_write (a
 ///   `channel_write` on this edge latches the consumer's event-wake
 ///   bit and rings the scheduler doorbell); bits 1-7 reserved
 /// - bytes 10-11: reserved (0)

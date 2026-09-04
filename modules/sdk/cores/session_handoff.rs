@@ -1,13 +1,12 @@
 // session_handoff_core — opaque state export/import chunking with
-// CRC32 integrity (rfc_protocols.md §13.1, §15.1; SessionCtrlV1
-// EXPORT_BEGIN/CHUNK/END → IMPORT_BEGIN/CHUNK/END, see
-// `contracts/net/session_ctrl.rs`).
+// CRC32 integrity (SessionCtrlV1 EXPORT_BEGIN/CHUNK/END →
+// IMPORT_BEGIN/CHUNK/END, see `contracts/net/session_ctrl.rs`).
 //
 // The exporting worker walks its opaque state blob through
 // `HandoffExport`; the importing worker validates ordering, bounds,
 // and integrity through `HandoffImport`. Both sides are pure logic
 // over caller-owned buffers — the kernel never interprets the blob
-// (RFC §13.2) and this core never allocates.
+// and this core never allocates.
 //
 // Chunks travel in offset order. The importer rejects gaps, overlaps,
 // and over-length deliveries with `HANDOFF_CORRUPT`-class statuses

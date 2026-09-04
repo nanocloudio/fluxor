@@ -132,8 +132,6 @@ pub const CLOSE: u32 = 0x0903;
 ///   - **`nlink` is the number of names.** [`UNLINK`] removes a name and
 ///     queues storage for reclamation when the last one goes. A provider
 ///     without hard links reports 1, which is true.
-///
-/// See `.context/rfc_fs_object_model.md`.
 pub const STAT: u32 = 0x0904;
 /// Blocking byte-durability fence: commit this file's contents and its
 /// own recorded size past the device's volatile cache. `handle=file`.
@@ -679,8 +677,7 @@ pub mod caps {
 
     // ── Object-model tier ───────────────────────────────────
     // What an inode-based filesystem carries and FAT32 does not. A provider
-    // whose format has no answer clears the bit rather than fabricating one;
-    // see `.context/rfc_fs_object_model.md`.
+    // whose format has no answer clears the bit rather than fabricating one.
     /// [`STAT`]'s 48-byte form is served — `ino`, `nlink`, `mode`, `uid`,
     /// `gid` in addition to size and mtime.
     pub const STAT_OBJECT:    u32 = 1 << 12;

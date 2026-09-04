@@ -150,7 +150,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // Owner-pause wake masking also lives outside `Sched`; the rebuild clears
     // every module's owner stamp (below) and plan re-apply reinstalls owners
     // Active, so stale mask bits would suppress wakes for reused module slots
-    // (rfc_workload_lifecycle.md §3.2/§3.3 — pause is a runtime posture, not
+    // (pause is a runtime posture, not
     // desired state; it does not survive a rebuild).
     crate::kernel::ipc::event::reset_pause_masking();
 
@@ -177,8 +177,8 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // reads it without re-touching the config blob.
     let mut max_domain: u8 = 0;
     // Rebuild the per-domain module bitmap from scratch (prepare_graph re-runs
-    // on live reconfigure). The pacer intersects it with EVENT_WAKE_PENDING for
-    // a per-domain idle decision (RFC adaptive_tick §5.1).
+    // on live reconfigure). The pacer intersects it with EVENT_WAKE_PENDING
+    // for a per-domain idle decision.
     for m in sched.domain_module_mask.iter_mut() {
         *m = ModuleMask::EMPTY;
     }
@@ -212,10 +212,10 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     for d in 0..MAX_DOMAINS {
         sched.domain_tick_us[d] = config.domain_tick_us[d] as u32;
         sched.domain_exec_mode[d] = config.domain_exec_mode[d];
-        // Adaptive-tick per-domain config (RFC adaptive_tick §8). The config
-        // parser already default-filled tick_min/tick_max to the domain's
-        // effective tick when unset, so for an unmodified config
-        // tick_min == tick_max == tick and adaptive_flags == 0 ⇒ no-op.
+        // Adaptive-tick per-domain config. The config parser already
+        // default-filled tick_min/tick_max to the domain's effective tick
+        // when unset, so for an unmodified config tick_min == tick_max ==
+        // tick and adaptive_flags == 0 ⇒ no-op.
         sched.domain_adaptive_flags[d] = config.domain_adaptive_flags[d];
         sched.domain_tick_min_us[d] = config.domain_tick_min_us[d] as u32;
         sched.domain_tick_max_us[d] = config.domain_tick_max_us[d] as u32;
@@ -314,26 +314,24 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // endpoint in a Tier 1b/2 domain. The producer continues to
     // write the regular PIPE channel; `pump_isr_bridges` drains it
     // into the bridge ring each scheduler tick (and vice versa for
-    // ISR→cooperative direction). See
-    // `.context/rfc_isr_tier_surface.md` §D6.
+    // ISR→cooperative direction).
     wire_isr_bridges(&mut edges[..runtime_edge_count]);
 
-    // Wake-on-write wiring (RFC idle_skip_wake §4): bind `wake: true`
-    // edges' channels to their consumer module so a successful write
-    // latches the consumer's event-wake bit and rings the scheduler
-    // doorbell. Same-domain direct edges only here: bridged (ISR-tier)
-    // endpoints have no PIPE writes to hook, and any edge the platform
-    // will split across the SPSC pump (different domains, or
-    // `EdgeClass::CrossCore`) must wake at consumer-side pump DELIVERY
-    // — a write-time wake on the producer-side channel is
-    // guaranteed-spurious because the consumer's domain steps before it
-    // pumps inbound, and the bytes aren't readable through the
-    // consumer's handle until the pump moves them. The cross-domain
-    // binding happens where the knowledge lives: the platform's
-    // cross-edge bridging binds the consumer-local channel (see bcm2712
-    // `bridge_cross_domain_edges`), so the pump's delivery write into
-    // it triggers the same wake hook at the first moment the consumer
-    // could actually read the bytes.
+    // Wake-on-write wiring: bind `wake: true` edges' channels to their
+    // consumer module so a successful write latches the consumer's
+    // event-wake bit and rings the scheduler doorbell. Same-domain
+    // direct edges only here: bridged (ISR-tier) endpoints have no PIPE
+    // writes to hook, and any edge the platform will split across the
+    // SPSC pump (different domains, or `EdgeClass::CrossCore`) must
+    // wake at consumer-side pump DELIVERY — a write-time wake on the
+    // producer-side channel is guaranteed-spurious because the
+    // consumer's domain steps before it pumps inbound, and the bytes
+    // aren't readable through the consumer's handle until the pump
+    // moves them. The cross-domain binding happens where the knowledge
+    // lives: the platform's cross-edge bridging binds the
+    // consumer-local channel (see bcm2712 `bridge_cross_domain_edges`),
+    // so the pump's delivery write into it triggers the same wake hook
+    // at the first moment the consumer could actually read the bytes.
     for e in edges[..runtime_edge_count].iter() {
         if !e.wake_on_write || e.channel < 0 || e.bridge_slot >= 0 || e.consumer_channel >= 0 {
             continue;

@@ -1,5 +1,5 @@
-// Owner drain driver (rfc_owner_drain_and_logs.md §3.4) — the platform half of
-// bounded owner drain on Linux.
+// Owner drain driver — the platform half of bounded owner
+// drain on Linux.
 //
 // A removal generation with a grace window reaches this file through the
 // pure-drain delta path (`owner_plan::try_apply_drain_delta`, no rebuild): each
@@ -125,7 +125,7 @@ pub fn drain_tick(now_unix: u64) {
         if !gone {
             // Close the owner's network endpoints BEFORE revoking it, so an
             // observer never sees the terminal record while a port is still
-            // accepting (rfc_endpoint_lease.md §4.4).
+            // accepting.
             linux_net_close_owner_conns(handle);
             // Tear down the owner's isolated workloads (containers) too, so a
             // revoked owner's host processes do not outlive its lease.

@@ -1,6 +1,6 @@
 // ============================================================================
 // Linux `workload` provider (contract class 0x1A) — the consumer-facing
-// isolated-workload surface. See `.context/fluxor_nanocloud.md`.
+// isolated-workload surface.
 // ============================================================================
 //
 // This provider is the platform-neutral front for isolated workloads. It parses
@@ -22,9 +22,9 @@ use crate::abi::contracts::workload as wl;
 use crate::abi::platform::linux::host_process as hp;
 use crate::kernel::workload::owner::OwnerHandle;
 
-// Host-process opcodes (`hp::EXEC`/`hp::TTY_*`, class 0x1B): the host class numbers them
-// (rfc_workload_lifecycle §2.1) and owns the consts. Only their arg/out wire
-// formats — backend detail, not contract surface — are documented here:
+// Host-process opcodes (`hp::EXEC`/`hp::TTY_*`, class 0x1B): the host class
+// numbers them and owns the consts. Only their arg/out wire formats — backend
+// detail, not contract surface — are documented here:
 //
 // Workload-scoped ops carry `[workload_fd: i32 LE]` before the payloads below
 // (handle = -1 calls; the kernel routes handle-tagged calls by tag→class).
@@ -94,7 +94,7 @@ fn host_backend_net_caps() -> u8 {
 /// a controller) and a base cgroup for per-sandbox dirs resolves — the same
 /// preconditions `hp_apply_cgroup` relies on. Probed once per process; the
 /// per-workload gate still applies: a workload whose best-effort cgroup setup
-/// failed gets ENOSYS from PAUSE (rfc_workload_lifecycle §3.1).
+/// failed gets ENOSYS from PAUSE.
 fn host_backend_can_freeze() -> bool {
     static CAN_FREEZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CAN_FREEZE.get_or_init(|| {
@@ -174,7 +174,7 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     let source_ref_len = rd_u16(buf, 40) as usize;
     let endpoint_count = rd_u16(buf, 42) as usize;
     let options_len = rd_u32(buf, 44) as usize;
-    // Tier-1 network identity (RFC §7): an input computed by the
+    // Tier-1 network identity: an input computed by the
     // orchestrator's address policy; the backend realizes it.
     let net_family = buf[48];
     let net_prefix_len = buf[49];
@@ -208,11 +208,11 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     }
 
     // Identity → owner. The null uid is the single-tenant / system workload:
-    // rfc_k8s.md §14 — "a single-tenant device runs entirely as owner 0", and
+    // a single-tenant device runs entirely as owner 0, and
     // when MAX_OWNERS == 1 there are no workload slots to admit into, so the
     // system owner (slot 0, permanently Active) is the only owner. A non-null
     // uid must resolve to a plan-allocated owner — the provider references it, it
-    // does not allocate (rfc_k8s: the plan is authoritative for owners).
+    // does not allocate (the plan is authoritative for owners).
     let owner = if identity == [0u8; 16] {
         crate::kernel::workload::owner::OWNER_SYSTEM
     } else {
@@ -226,9 +226,9 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     }
 
     // Lease-gate each declared endpoint against the owner's lease before any
-    // mechanism runs (rfc_endpoint_lease). A refusal blocks admission. The
-    // workload-level net_iso field — or any endpoint asking for its own
-    // network domain — puts the whole workload in its own netns.
+    // mechanism runs. A refusal blocks admission. The workload-level net_iso
+    // field — or any endpoint asking for its own network domain — puts the
+    // whole workload in its own netns.
     let mut own_netns = net_iso == wl::NET_ISO_OWN;
     for i in 0..endpoint_count {
         let e = ep_start + i * wl::NET_ENDPOINT_SIZE;
@@ -438,7 +438,7 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     out[0] = wl::caps::POSTURE_SHARED | wl::caps::POSTURE_ISOLATED;
     out[1] = hp::CAPS_SOURCE_HOST_PROCESS;
     // Implemented optional ops: READ + EXEC + the TTY set + real-signal SIGNAL
-    // delivery (process-group, rfc_workload_lifecycle §3.1). PAUSE is
+    // delivery (process-group). PAUSE is
     // advertised iff the host can freeze at all (cgroup2 present); a workload
     // whose own cgroup setup failed still gets per-workload ENOSYS.
     // READ/EXEC/TTY retired to the 0x1B host-process class (D-WORKLOAD-ABI).

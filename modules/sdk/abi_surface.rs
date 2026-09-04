@@ -1,6 +1,6 @@
 // Canonical encoding of the kernel ↔ module ABI wire surface, for
-// digest-pinning graph generations to the substrate they were built against
-// (rfc_k8s.md §12.2 identity-by-digest, applied to the kernel/graph boundary).
+// digest-pinning graph generations to the substrate they were built
+// against: identity by digest, applied to the kernel/graph boundary.
 //
 // The surface is the set of numeric allocations a compiled `.fmod` hardcodes
 // against the kernel — the same values the byte-stability net locks

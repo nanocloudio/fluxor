@@ -168,7 +168,7 @@ pub const IOCTL_BLOCKS_GEOMETRY: u32 = 0x4E56_0009;
 /// pipelined counterpart of [`IOCTL_BLOCKS_WRITE_LBAS_SYNC`]: it lets a
 /// durable writer (the WAL) keep multiple writes in flight instead of
 /// spin-polling each one, which is the single biggest write-throughput
-/// lever (see clustor `rfc_async_wal_fsync.md`).
+/// lever.
 ///
 /// arg layout (24 bytes, little-endian) — identical to the SYNC form:
 ///   [lba: u64][nlb: u16][_pad: u16][_pad: u32][buf_ptr: u64]

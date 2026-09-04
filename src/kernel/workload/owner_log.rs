@@ -1,4 +1,4 @@
-//! Per-owner in-memory log rings (`rfc_owner_drain_and_logs.md` §4.3, Phase 1).
+//! Per-owner in-memory log rings.
 //!
 //! A static `[MAX_OWNERS] × CAP` reservation keyed by owner **slot**, driven by
 //! the host-tested [`RingState`]/[`LogRecord`] primitives in `fluxor_contracts`
@@ -24,7 +24,7 @@ use crate::kernel::workload::owner::MAX_OWNERS;
 use fluxor_contracts::log_ring::{LogRecord, RingHeader, RingState};
 
 /// Per-owner ring byte capacity. Matches `log_ring`'s per-chip sizing; a
-/// per-profile knob is deferred (`rfc_owner_drain_and_logs.md` §6.3).
+/// per-profile knob is deferred.
 #[cfg(feature = "chip-rp2040")]
 pub const CAP: usize = 4096;
 #[cfg(not(feature = "chip-rp2040"))]

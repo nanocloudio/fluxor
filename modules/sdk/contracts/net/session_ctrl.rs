@@ -2,8 +2,7 @@
 //
 // Layer: contracts/net (public, stable).
 //
-// See docs/architecture/protocol_surfaces.md §Session Control Metadata
-// and .context/rfc_protocols.md §7, §8.
+// See docs/architecture/protocol_surfaces.md §Session Control Metadata.
 //
 // SessionCtrlV1 is the control-plane sideband exchanged between
 // **transport anchors**, **session workers**, and **session

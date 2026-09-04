@@ -1,5 +1,4 @@
-//! Owner-pause driver — base-graph half of the metal PAUSE silicon AC
-//! (rfc_workload_lifecycle.md §3.2, P4).
+//! Owner-pause driver — base-graph half of the metal PAUSE silicon AC.
 //!
 //! Runs in the SYSTEM graph and drives one pause→resume cycle against a
 //! resident pod's owner via the OWNER_PAUSE / OWNER_RESUME live-mutation

@@ -1,5 +1,5 @@
 // Core: table_consumer — the normative "subscribe, don't invent a
-// push contract" state machine (rfc_dynamic_routes §2).
+// push contract" state machine.
 //
 // Layer: cores (reusable SDK implementation, `include!`d by consumers —
 // NOT a wire contract, so it lives under `cores/` with `session_handoff`
@@ -16,7 +16,7 @@
 // `use crate::abi::SyscallTable;`, the harness via
 // `use fluxor::abi::SyscallTable;`).
 //
-// ## The pattern (rfc_dynamic_routes §2)
+// ## The pattern
 //
 //   1. Sink wiring — the graph self-edges an output port to an input
 //      port on the same module; the module passes that input channel
@@ -29,9 +29,8 @@
 //      (`Added=0`/`Modified=1`/`Deleted=2`) is applied in place.
 //   4. Loss recovery with shadow swap — on LOST (or any gap) rebuild
 //      via `CHANGES (0x1307)` into a SHADOW table, then swap
-//      atomically, never in place (the torn-table hazard the
-//      superseded rfc_dynamic_table §8 ruled out). Cold start shares
-//      this path.
+//      atomically, never in place — a table swapped in place is a
+//      torn table for any reader mid-scan. Cold start shares this path.
 //   5. Bounded admission — the arena is the caller's; overflow is the
 //      caller's to surface (a reader holds no write grant, §6).
 //   6. Single-writer prefix discipline — a compiler owns the prefix;

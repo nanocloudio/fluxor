@@ -16,12 +16,12 @@
 //!
 //! The rate table is a fixed-size LRU keyed by `(destination IPv4, source
 //! IPv4)`. The destination (local) address is the per-workload owner axis
-//! (`rfc_net_identity_metal` §3.5): one local address maps 1:1 to one owner in
+//!: one local address maps 1:1 to one owner in
 //! v1, so partitioning the SYN budget by destination IP gives each workload
 //! its own share without any owner_tag plumbing — a flood aimed at one owned
 //! address cannot exhaust another owner's or the host's budget. With a single
 //! local address the destination is invariant and the key collapses to the
-//! source IP alone, byte-identical to the pre-P2 fuse. On insertion when full,
+//! source IP alone. On insertion when full,
 //! the least-recently-touched entry is evicted.
 //!
 //! Params (TLV):
@@ -85,16 +85,15 @@ const TCP_FLAG_ACK: u8 = 0x10;
 struct RateEntry {
     ip: u32, // remote source IP; 0 = empty slot
     /// Local (destination) address the SYN targeted — the per-workload owner
-    /// axis (`rfc_net_identity_metal` §3.5). In v1 one local address maps 1:1
+    /// axis. In v1 one local address maps 1:1
     /// to one owner (a workload can only be reached at its own address), so the
     /// destination IP on the wire IS the owner discriminator — conn_guard needs
     /// no owner_tag plumbing to partition by it. Keying on `(dst, ip)` gives
     /// each local address its own per-remote-IP SYN budget, so a flood aimed at
     /// one workload's address exhausts that workload's share, not the host's or
-    /// a neighbour's. With a single local address (every pre-P2 deployment)
-    /// `dst` is constant across all entries, so the partition structure,
-    /// eviction and counters are identical to the pre-P2 src-only key —
-    /// byte-identical.
+    /// a neighbour's. With a single local address `dst` is constant across
+    /// all entries, so the partition structure, eviction and counters are
+    /// exactly those of a source-only key.
     dst: u32,
     last_ms: u32, // monotonic ms timestamp (truncated)
     /// SYNs seen from this `(dst, ip)` pair inside the current window.
@@ -163,8 +162,7 @@ const STATE_SIZE: usize = core::mem::size_of::<GuardState>();
 
 /// Returns `Some((source_ip, dest_ip))` if the frame is a pure TCP SYN (SYN
 /// set, ACK clear), otherwise None. The destination IP is the local address
-/// the SYN targeted — the per-owner partition axis (`rfc_net_identity_metal`
-/// §3.5).
+/// the SYN targeted — the per-owner partition axis.
 unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<(u32, u32)> {
     if len < 14 + 20 {
         return None;
@@ -232,11 +230,10 @@ unsafe fn classify_syn(frame: *const u8, len: usize) -> Option<(u32, u32)> {
 /// admit, false to drop.
 ///
 /// The key is `(dst_ip, src_ip)` — the destination (local address) axis
-/// partitions the per-remote-IP budget per workload (`rfc_net_identity_metal`
-/// §3.5): a flood aimed at one owned address burns that owner's SYN share, not
-/// another owner's or the host's. With a single local address `dst_ip` is
-/// invariant, so the key collapses to `src_ip` alone — byte-identical to the
-/// pre-P2 fuse.
+/// partitions the per-remote-IP budget per workload: a flood aimed at one
+/// owned address burns that owner's SYN share, not another owner's or the
+/// host's. With a single local address `dst_ip` is invariant, so the key
+/// collapses to `src_ip` alone.
 unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, dst_ip: u32, now_ms: u32) -> bool {
     let table_size = s.rate_table_size as usize;
     if table_size == 0 {

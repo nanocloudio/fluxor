@@ -2,8 +2,7 @@
 //
 // Layer: contracts/net (public, stable).
 //
-// See docs/architecture/protocol_surfaces.md §Datagram Surface and the
-// RFC in .context/rfc_protocols.md.
+// See docs/architecture/protocol_surfaces.md §Datagram Surface.
 //
 // The datagram surface is a channel contract for message-oriented
 // transports (UDP, DTLS, RTP, DNS, STUN/TURN, discovery/telemetry). It

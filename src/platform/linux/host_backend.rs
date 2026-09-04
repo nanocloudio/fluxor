@@ -42,7 +42,7 @@ use std::ffi::CString;
 const HP_STATE_RUNNING: u8 = 0;
 const HP_STATE_EXITED: u8 = 1;
 const HP_STATE_SIGNALLED: u8 = 2;
-// Live, not terminal: frozen via PAUSE (rfc_workload_lifecycle §2.3).
+// Live, not terminal: frozen via PAUSE.
 const HP_STATE_PAUSED: u8 = 3;
 
 pub const MAX_SANDBOXES: usize = 16;
@@ -383,13 +383,13 @@ unsafe fn hp_child(plan: &SpawnPlan, start_r: i32, out_w: i32, pid_w: i32) -> ! 
 /// an isolated sandbox, or as the direct child in a null sandbox; its
 /// namespaces are already unshared by the caller in the isolated case.
 unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
-    // Become a process-group leader (rfc_workload_lifecycle §3.1) so
-    // SIGNAL/DESTROY can deliver to the whole group (`kill(-pgid)`) and
-    // children of the container init hear a SIGTERM too. NB: the double-fork
-    // did NOT already do this — fork inherits the parent's pgid — so this
-    // call is load-bearing, not belt-and-braces. No controlling terminal to
-    // detach here (stdio is the out pipe), so setpgid suffices; the TTY
-    // session path does its own setsid.
+    // Become a process-group leader so SIGNAL/DESTROY can deliver to the
+    // whole group (`kill(-pgid)`) and children of the container init hear a
+    // SIGTERM too. NB: the double-fork did NOT already do this — fork
+    // inherits the parent's pgid — so this call is load-bearing, not
+    // belt-and-braces. No controlling terminal to detach here (stdio is the
+    // out pipe), so setpgid suffices; the TTY session path does its own
+    // setsid.
     libc::setpgid(0, 0);
     if plan.isolate {
         // Make `/` a private recursive mount so our mount changes don't
@@ -1214,9 +1214,9 @@ pub unsafe fn hp_signal(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
     if slot.reaped {
         return errno::OK; // already gone
     }
-    // Thaw-then-signal (rfc_workload_lifecycle §3.1/§3.3): a frozen cgroup
-    // queues signals and handlers cannot run — SIG_KILL and SIG_TERM alike
-    // thaw first so grace semantics stay uniform.
+    // Thaw-then-signal: a frozen cgroup queues signals and handlers cannot
+    // run — SIG_KILL and SIG_TERM alike thaw first so grace semantics stay
+    // uniform.
     if slot.paused {
         hp_freeze_write(raw as usize, false);
         slot.paused = false;
@@ -1231,7 +1231,7 @@ pub unsafe fn hp_signal(raw: i32, arg: *const u8, arg_len: usize) -> i32 {
 
 /// Deliver `signo` to the container's process group — the container body
 /// makes itself a group leader (`setpgid(0,0)`) before exec, so `-pgid` is
-/// `-container_pid` (rfc_workload_lifecycle §3.1: children of the init must
+/// `-container_pid` (children of the init must
 /// hear the signal too, or grace semantics are meaningless). Falls back to
 /// single-pid delivery when the group kill fails with ESRCH — the one
 /// legitimate gap is a container signalled before its body reached setpgid.
@@ -1283,8 +1283,8 @@ pub unsafe fn hp_wait(raw: i32, out: *mut u8, out_len: usize) -> i32 {
     hp_poll_reap(slot);
     let buf = core::slice::from_raw_parts_mut(out, out_len);
     if !slot.reaped && slot.paused {
-        // Frozen and not exited → PAUSED, live, not terminal
-        // (rfc_workload_lifecycle §2.3). A workload that died BEFORE the
+        // Frozen and not exited → PAUSED, live, not terminal.
+        // A workload that died BEFORE the
         // freeze latched terminal in the poll above and reports it as today;
         // a frozen one cannot exit, so the two never race. RESUME clears
         // `paused`, so the next poll reflects RUNNING (§3.3).
@@ -1297,14 +1297,15 @@ pub unsafe fn hp_wait(raw: i32, out: *mut u8, out_len: usize) -> i32 {
     5
 }
 
-/// HP_PAUSE: freeze the sandbox via its cgroup's `cgroup.freeze`
-/// (rfc_workload_lifecycle §3.1). Gated on the container actually living in
-/// the per-sandbox cgroup (`cgrouped && contained`) — a workload whose
-/// best-effort cgroup setup failed gets ENOSYS, and there is never a SIGSTOP
-/// fallback (a stopped process is observable and thaw-able by its own
-/// children; the freezer is not). Idempotent: PAUSE on paused returns 0.
-/// PAUSE on a terminal workload is a state error — EINVAL, the backend's
-/// wrong-lifecycle-state convention (cf. EXEC/TTY_OPEN before START).
+/// HP_PAUSE: freeze the sandbox via its cgroup's `cgroup.freeze`. Gated on
+/// the container actually living in the per-sandbox cgroup (`cgrouped &&
+/// contained`) — a workload whose best-effort cgroup setup failed gets
+/// ENOSYS, and there is never a SIGSTOP fallback (a stopped process is
+/// observable and thaw-able by its own children; the freezer is not).
+/// Idempotent: PAUSE on paused returns 0. PAUSE on a terminal workload is a
+/// state error — EINVAL, the backend's wrong-lifecycle-state convention (cf.
+/// EXEC/TTY_OPEN before START).
+///
 /// # Safety
 /// Single-threaded platform dispatch only (process-global slot table).
 pub unsafe fn hp_pause(raw: i32) -> i32 {
@@ -1368,10 +1369,10 @@ pub unsafe fn hp_destroy(raw: i32) -> i32 {
         libc::close(slot.start_w);
         slot.start_w = -1;
     }
-    // Thaw-then-destroy (rfc_workload_lifecycle §3.3): frozen, the init could
-    // never run a TERM handler and the graceful window below would always
-    // escalate to SIGKILL — thaw first so DESTROY-on-paused keeps the same
-    // grace semantics as DESTROY-on-running.
+    // Thaw-then-destroy: frozen, the init could never run a TERM handler
+    // and the graceful window below would always escalate to SIGKILL —
+    // thaw first so DESTROY-on-paused keeps the same grace semantics as
+    // DESTROY-on-running.
     if slot.paused {
         hp_freeze_write(raw as usize, false);
         slot.paused = false;

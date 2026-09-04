@@ -1,9 +1,8 @@
 // X.509 DER parser and constrained-path certificate validator.
 //
-// The supported profile is deliberately narrow (see
-// `.context/rfc_tls_peer_identity.md` §5): ECDSA-with-SHA-256 over a P-256
-// subject key, DER only, one path built in the order the peer sent it, no
-// revocation, no name constraints, no policy processing, one trust anchor.
+// The supported profile is deliberately narrow: ECDSA-with-SHA-256 over a
+// P-256 subject key, DER only, one path built in the order the peer sent it,
+// no revocation, no name constraints, no policy processing, one trust anchor.
 // Anything outside the profile is refused rather than partially interpreted —
 // a certificate that parses under looser rules than it was signed under is a
 // certificate whose validated meaning differs from its signed meaning.
@@ -1482,9 +1481,8 @@ fn der_bytes_eq(a: &[u8], b: &[u8]) -> bool {
 /// The most certificates one Certificate message may carry.
 pub const MAX_CHAIN_LEN: usize = 4;
 
-/// Peer-authentication profiles (`.context/rfc_tls_peer_identity.md` §3).
-/// `PROFILE_NONE` is not a profile: it is the absence of one, and every
-/// entry point refuses it.
+/// Peer-authentication profiles. `PROFILE_NONE` is not a profile: it is
+/// the absence of one, and every entry point refuses it.
 pub const PROFILE_NONE: u8 = 0;
 pub const PROFILE_PINNED: u8 = 1;
 pub const PROFILE_CA_DNS: u8 = 2;
@@ -1607,8 +1605,7 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
     }
 
     if policy.profile == PROFILE_PINNED {
-        // The pin is the whole policy: no chain, no name, no lifetime. See
-        // `.context/rfc_tls_peer_identity.md` §3.1.
+        // The pin is the whole policy: no chain, no name, no lifetime.
         if !pubkey_eq(leaf.public_key, anchor.public_key) {
             return CERT_ERR_PIN_MISMATCH;
         }
@@ -1808,8 +1805,7 @@ fn check_ca_shape(cert: &X509Cert<'_>, der: &[u8], depth: usize) -> u32 {
     CERT_OK
 }
 
-/// Lifetime, per the configured clock posture
-/// (`.context/rfc_tls_peer_identity.md` §6).
+/// Lifetime, per the configured clock posture.
 fn check_validity(cert: &X509Cert<'_>, policy: &ChainPolicy<'_>) -> u32 {
     if !policy.require_clock {
         return CERT_OK;
@@ -1876,8 +1872,7 @@ pub fn parse_cert_chain<'a>(
 
 /// Validate a server chain against a CA anchor and an expected hostname.
 /// Callers holding no clock policy of their own get the `ca_dns` profile
-/// with validity unchecked; see `.context/rfc_tls_peer_identity.md` §6 for
-/// what that posture does and does not contain.
+/// with validity unchecked.
 pub fn verify_cert_chain(
     cert_msg_body: &[u8],
     trust_anchor_der: &[u8],

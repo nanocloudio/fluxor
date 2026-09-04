@@ -63,9 +63,9 @@ pub fn read_timer_count_64() -> u64 {
 /// Unlike [`timer_set`] (a relative `tval` down-counter re-armed "from now"
 /// each fire, which accumulates IRQ-entry latency drift), arming an absolute
 /// compare relative to the *previous* programmed deadline keeps the tick grid
-/// drift-free (RFC adaptive_tick §7.1a). The caller MUST guard
-/// against a `cval` already in the past (e.g. after a long ISR) by resyncing
-/// to `now + period`, else the timer fires a catch-up burst of immediate IRQs.
+/// drift-free. The caller MUST guard against a `cval` already in the past
+/// (e.g. after a long ISR) by resyncing to `now + period`, else the timer
+/// fires a catch-up burst of immediate IRQs.
 #[inline(always)]
 pub unsafe fn timer_set_cval(cval: u64) {
     #[cfg(feature = "board-pi5")]

@@ -143,8 +143,7 @@ pub fn domain_budget_overruns(domain_id: usize) -> u32 {
 /// Diagnostic accessor — cumulative count of Tier 1c pre-tick budget
 /// overruns for `domain_id` since boot (one increment per pass where
 /// the combined pre-tick budget `MAX_PRE_TICK_BUDGET_US` was
-/// exceeded). Returns 0 for invalid `domain_id`. See
-/// `.context/rfc_isr_tier_surface.md` §D8.
+/// exceeded). Returns 0 for invalid `domain_id`.
 pub fn domain_pre_tick_overruns(domain_id: usize) -> u32 {
     if domain_id >= MAX_DOMAINS {
         return 0;
@@ -219,7 +218,7 @@ pub fn step_domain_modules(
     // (before any sub-pass or pre-tick step). `BURST_SEEN_THIS_PASS` is reset
     // per sub-pass for drain-detection and can't serve the pacer's "tick busy?".
     PACER_BURST_TICK[domain_id].store(false, Ordering::Relaxed);
-    // §6 work signal (RFC adaptive_tick_extra): same per-tick reset cadence.
+    // §6 work signal: same per-tick reset cadence.
     PACER_WORK_TICK[domain_id].store(false, Ordering::Relaxed);
     // SAFETY: scheduler-thread context — multi-domain platform's caller
     // (BCM2712 core pump) is the sole stepper for this domain.
@@ -392,7 +391,7 @@ pub fn step_domain_modules(
 /// side effect of `step_one_module`; this helper snapshots the
 /// accumulator before iterating and restores it on return so the
 /// regular `domain_exec_order` rotation that follows starts with a
-/// fresh budget. See `.context/rfc_isr_tier_surface.md` §D8.
+/// fresh budget.
 #[inline]
 pub(crate) fn step_domain_pre_tick(
     modules: &mut [ModuleSlot; MAX_MODULES],
@@ -602,8 +601,7 @@ pub(crate) fn step_domain_post_tick_flush(
 /// `step_woken_modules` (event wake). Encapsulates the full
 /// `StepOutcome` handling — period gating, ready gating, fault state
 /// machine, burst loop, finalisation — so every caller gets identical
-/// semantics. See `.context/scheduler_domain_api.md` for the full
-/// design.
+/// semantics.
 ///
 /// `event_wake = true` bypasses step-period gating (an event overrides
 /// the per-module period) but keeps every other invariant: upstream-
@@ -1129,16 +1127,16 @@ pub fn step_woken_modules(
             crate::kernel::ipc::event::defer_masked_wake(module_idx);
             continue;
         }
-        // Budget bound on the woken path (RFC idle_skip_wake §5): woken
-        // steps are charged to the domain accumulators like pass steps,
-        // and the limit must bind here too — wake-on-write makes wakes
-        // data-driven, so without this bound one hot flagged edge steps
-        // its consumer unboundedly between ticks, bypassing the fairness
-        // rotation. Enforce the same soft limit the pass loop uses: an
-        // over-budget domain defers the remaining woken steps to the next
-        // pass by re-latching their bits (level-triggered — nothing is
-        // lost, the backstop semantics). An out-of-range domain id is
-        // fail-open (never deferred), matching the accounting path in
+        // Budget bound on the woken path: woken steps are charged to the
+        // domain accumulators like pass steps, and the limit must bind
+        // here too — wake-on-write makes wakes data-driven, so without
+        // this bound one hot flagged edge steps its consumer unboundedly
+        // between ticks, bypassing the fairness rotation. Enforce the
+        // same soft limit the pass loop uses: an over-budget domain
+        // defers the remaining woken steps to the next pass by
+        // re-latching their bits (level-triggered — nothing is lost, the
+        // backstop semantics). An out-of-range domain id is fail-open
+        // (never deferred), matching the accounting path in
         // `step_one_module`, which skips charging such modules — clamping
         // it to a real domain would defer them against a budget they
         // never consume from.

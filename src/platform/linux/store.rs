@@ -1,7 +1,7 @@
 //! Local versioned watchable store — the in-runtime backing for the
 //! `storage.object` (0x14) and `storage.namespace` (0x13) contracts on Linux.
 //!
-//! Per `.context/fluxor_nanocloud.md` §3, a versioned watchable KV is not a
+//! A versioned watchable KV is not a
 //! bespoke fluxor contract — it decomposes into the standard storage surfaces
 //! (`storage.object` CAS + `storage.namespace` LIST/SUBSCRIBE + a
 //! `RevisionMonotone` fence). This module is the primitive-level implementation

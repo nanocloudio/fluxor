@@ -102,9 +102,9 @@ impl OwnerStatusWriter {
         // Live drain deadlines live in the drain driver; the kernel snapshot
         // carries only owner_state. Overlay before deriving.
         drain_overlay_for_status(&mut recs[..n], now);
-        // Bound network endpoints per owner (rfc_endpoint_lease.md §4.3): the
-        // runtime's RAW report — which (protocol, port) pairs are actually
-        // listening, owner-attributed. Declarations are the agent's business.
+        // Bound network endpoints per owner: the runtime's RAW report — which
+        // (protocol, port) pairs are actually listening, owner-attributed.
+        // Declarations are the agent's business.
         let bound = linux_net_bound_endpoints()
             .into_iter()
             .map(|(owner, proto, port)| (owner.slot, owner.generation, proto, port))
@@ -112,8 +112,7 @@ impl OwnerStatusWriter {
         let mut pods_json =
             derive_pods_json(&recs[..n], &mut self.tracks, &self.seeded, now, &bound);
         // Drained-and-revoked owners are gone from the live snapshot; their
-        // terminal records ride alongside until retention lapses
-        // (rfc_owner_drain_and_logs.md §3.7).
+        // terminal records ride alongside until retention lapses.
         for entry in drain_terminal_pods_json() {
             if !pods_json.is_empty() {
                 pods_json.push(',');
@@ -266,8 +265,8 @@ pub fn derive_pods_json(
             ),
         };
         // A draining owner stops reporting ready while it is still serving
-        // (rfc_owner_drain_and_logs.md §3.1) — no new phase value, just the
-        // readiness withdrawal the terminating window needs.
+        // — no new phase value, just the readiness withdrawal the
+        // terminating window needs.
         let draining = rec.owner_state == crate::kernel::exec::scheduler::OWNER_STATE_DRAINING;
         let ready = ready && !draining;
         let mut e = String::new();
@@ -278,9 +277,9 @@ pub fn derive_pods_json(
              \"restart_count\":{}",
             rec.slot, rec.generation, track.restart_count,
         );
-        // Bound network endpoints (rfc_endpoint_lease.md §4.3 doc 1): the raw
-        // owner-attributed report. Additive; omitted when the owner has no
-        // bound ports, so port-less workloads' output is byte-identical.
+        // Bound network endpoints: the raw owner-attributed report. Additive;
+        // omitted when the owner has no bound ports, so port-less workloads'
+        // output is byte-identical.
         let mut bound_iter = bound_endpoints
             .iter()
             .filter(|(slot, generation, _, _)| *slot == rec.slot && *generation == rec.generation)
@@ -346,8 +345,7 @@ pub struct SeededPod {
     pub started: bool,
     /// The previous process persisted a TERMINAL state for this workload. Suppresses
     /// the boot-time drain-timeout-by-restart synthesis: a clean `Completed`
-    /// from before the restart is never rewritten
-    /// (rfc_owner_drain_and_logs.md §3.6/§3.7 writer seeding).
+    /// from before the restart is never rewritten by writer seeding.
     pub terminated: bool,
 }
 

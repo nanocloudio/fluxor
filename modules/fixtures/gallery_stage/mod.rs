@@ -30,7 +30,7 @@ include!("../../sdk/runtime.rs");
 
 /// Oversized artifact that must not survive on the root, unlinked
 /// once at start: a 1920x1080 JPEG whose single-call decode blows the
-/// pi5 step budget (see .context/issue_pi5_codec_image_silicon.md).
+/// pi5 step budget.
 const STALE_PATH: &[u8] = b"/SPIRAL.JPG";
 
 /// Number of staged files (see `file()`).
@@ -229,8 +229,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if s.file_idx == 0 {
                     // Remove the oversized artifact from the earlier
                     // staging attempt — if it survives, bank streams it
-                    // first and the codec dies on it (see
-                    // .context/issue_pi5_codec_image_silicon.md).
+                    // first and the codec dies on it.
                     path[..STALE_PATH.len()].copy_from_slice(STALE_PATH);
                     let stale_rc =
                         call(sys, -1, fs::UNLINK, path.as_mut_ptr(), STALE_PATH.len());

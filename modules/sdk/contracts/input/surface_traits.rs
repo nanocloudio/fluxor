@@ -41,8 +41,6 @@
 //                             meaningless and a consumer drives UI by audio +
 //                             physical controls only.
 //   [pad:            u8 * 2]
-//
-// See `.context/rfc_surface_traits.md`.
 
 /// Total record size in bytes. Fixed-width so consumers can stride
 /// channel reads without parsing.

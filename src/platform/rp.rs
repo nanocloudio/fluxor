@@ -444,8 +444,7 @@ async fn main(spawner: Spawner) {
         // ISR-tier dispatcher and arm the timer-poll. RP's single
         // async executor calls `isr_tier::poll_tier1b` from
         // `rp_run_main_loop` each iteration, so registration
-        // here is the platform's only ISR setup. See
-        // `.context/rfc_isr_tier_surface.md` §D5+§D6.
+        // here is the platform's only ISR setup.
         let isr_registered = scheduler::register_isr_tier_modules_from_graph();
         if isr_registered > 0 {
             log::info!("[isr] Tier 1b admitted {isr_registered} module(s)");
@@ -520,7 +519,7 @@ fn rp_tick_count() -> u32 {
     embassy_time::Instant::now().as_millis() as u32
 }
 
-/// Portable `sleep_until` (RFC adaptive_tick §5.5 Option B). The Embassy
+/// Portable `sleep_until`. The Embassy
 /// thread-mode executor idles on WFE woken by SEV (via `SCHEDULER_WAKE` →
 /// `__pender`); a channel write or alarm raises SEV. This synchronous entry
 /// waits for the next such event with a bare WFE — the real rp idle path is
@@ -935,7 +934,7 @@ async fn rp_run_main_loop(module_count: usize) -> Option<(*const u8, usize)> {
             scheduler::step_woken_modules(modules, module_count, &wake);
         }
 
-        // Adaptive-tick pacer (RFC adaptive_tick §5.1): choose this iteration's
+        // Adaptive-tick pacer: choose this iteration's
         // deadline from the just-finished pass + its pre-sleep wake drain. With
         // no adaptive flag set it returns the nominal tick, so the timer arm is
         // byte-identical to the fixed-tick loop. With mechanism (a) idle it

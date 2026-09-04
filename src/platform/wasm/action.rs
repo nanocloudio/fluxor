@@ -2,12 +2,12 @@
 //!
 //! The presentation-shell overlay (`browser_overlay_runtime.js`) emits an
 //! opaque, *application-chosen* `action` id — `next`, `toggle`, or any
-//! app-specific verb (RFC browser_overlay §17.4) — when the user
-//! activates a control. This built-in is the kernel-side conduit: it
-//! drains the host action queue and emits each action-id hash
-//! **unchanged** as the FMP command type. The *consumer* (a `bank`
-//! selector, a player, or any app module) decides what the hash means by
-//! matching it — Fluxor carries no vocabulary of its own here.
+//! app-specific verb — when the user activates a control. This built-in
+//! is the kernel-side conduit: it drains the host action queue and emits
+//! each action-id hash **unchanged** as the FMP command type. The
+//! *consumer* (a `bank` selector, a player, or any app module) decides
+//! what the hash means by matching it — Fluxor carries no vocabulary of
+//! its own here.
 //!
 //! Keeping this a pure pass-through (rather than translating a fixed
 //! media/transport vocabulary into FMP verbs) is the point: an app that

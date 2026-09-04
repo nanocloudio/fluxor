@@ -100,7 +100,7 @@ fn parse_args() -> CliArgs {
                 process::exit(0);
             }
             // Everything after `--` is the app's argv — cli_in reads it
-            // from env::args() itself (rfc_cli_execution.md §4.1).
+            // from env::args() itself.
             "--" => break,
             other => {
                 eprintln!("error: unknown argument: {other}");
@@ -141,8 +141,7 @@ include!("linux/namespace.rs");
 // `fluxor::platform::linux::{workload, host_backend}` so the host test harness can
 // exercise them directly. Bring the binary-facing entry points into scope so
 // the flat provider-registration (`runtime.rs`) and owner-drain
-// (`owner_drain.rs`) sites resolve them by name. See
-// `.context/fluxor_nanocloud.md`.
+// (`owner_drain.rs`) sites resolve them by name.
 use fluxor::platform::linux::workload::linux_workload_dispatch;
 // TLV param walkers + per-instance state helpers, in the library so the
 // library provider modules can reach them; glob-imported so the flat
@@ -175,8 +174,8 @@ fn build_graph_linux() -> (usize, usize) {
     // drops their state: a leaked listener fd would keep its port bound and
     // every re-issued CMD_BIND after the rebuild would die on EADDRINUSE.
     // The endpoint report shows a bounded transient bound:false across the
-    // rebuild window (rfc_endpoint_lease.md §4.5); pure-drain removals never
-    // rebuild, so co-residents' reports don't flap on ordinary deletes.
+    // rebuild window; pure-drain removals never rebuild, so co-residents'
+    // reports don't flap on ordinary deletes.
     linux_net_close_all_and_clear_registry();
 
     // linux_net drains one inbound lane per wired edge (priority by
@@ -219,12 +218,12 @@ fn build_graph_linux() -> (usize, usize) {
 
         if entry.name_hash == LINUX_NET_HASH {
             scheduler::set_current_module(module_idx);
-            // Collect EVERY inbound command channel (priority lanes:
-            // one per `to: linux_net.net_in` edge, in wiring order), and
-            // resolve each lane's COMMANDING owner from its producing edge —
-            // the carried-attribution source for endpoint-lease stamps
-            // (rfc_endpoint_lease.md §4.1). Owner stamps are live here: the
-            // plan applied before instantiation (see apply_staged above).
+            // Collect EVERY inbound command channel (priority lanes: one per
+            // `to: linux_net.net_in` edge, in wiring order), and resolve
+            // each lane's COMMANDING owner from its producing edge — the
+            // carried-attribution source for endpoint-lease stamps. Owner
+            // stamps are live here: the plan applied before instantiation
+            // (see apply_staged above).
             let mut net_ins = [-1i32; LINUX_NET_MAX_INBOUND];
             let mut lane_owners =
                 [fluxor::kernel::workload::owner::OWNER_SYSTEM; LINUX_NET_MAX_INBOUND];
@@ -418,9 +417,9 @@ fn main() {
     }
 
     // Set up logging via the owner-log tee: identical env_logger stderr
-    // formatting/filtering, plus per-owner ring routing for `fluxor agent logs`
-    // (rfc_owner_drain_and_logs.md Part B). Registers this (main) thread as the
-    // scheduler thread — the only thread whose records reach the rings.
+    // formatting/filtering, plus per-owner ring routing for `fluxor agent
+    // logs`. Registers this (main) thread as the scheduler thread — the only
+    // thread whose records reach the rings.
     install_owner_log_tee();
     register_scheduler_thread();
 
@@ -539,17 +538,17 @@ fn main() {
         process::exit(0);
     }
 
-    // Admit resident workloads declared in the config's `[FXPD]` section (RFC
-    // adaptive_tick_extra §7 — `workloads:` / `combine <two-graph.yaml>`) as workload
-    // owners via `apply_add`, then the multi-graph runner multiplexes them with
-    // the base graph. Boot-only (not re-run on live rebuild). No-op without workloads.
+    // Admit resident workloads declared in the config's `[FXPD]` section
+    // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via
+    // `apply_add`, then the multi-graph runner multiplexes them with the base
+    // graph. Boot-only (not re-run on live rebuild). No-op without workloads.
     scheduler::admit_resident_workloads_from_config();
 
     // A revocation the just-applied plan still lists, naming an owner that was
     // NOT reinstalled, was mid-drain when the previous process died: the drain
     // is forfeited and recorded as drain-timeout-by-restart — unless the
-    // previous process already persisted that workload's terminal outcome
-    // (rfc_owner_drain_and_logs.md §3.6, §3.7 writer seeding).
+    // previous process already persisted that workload's terminal outcome (
+    // §3.7 writer seeding).
     synthesize_restart_terminals(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -630,10 +629,10 @@ fn main() {
         }
 
         // Node-agent generation update: the agent recommits + republishes the
-        // plan file; a changed mtime re-stages it and live-rebuilds ownership
-        // (rfc_k8s.md §12). Time-gated to one stat() per ~100 ms regardless of
-        // tick rate (a busy-loop tick would otherwise stat every spin; an
-        // idle 100 ms-per-iteration loop would otherwise check too rarely).
+        // plan file; a changed mtime re-stages it and live-rebuilds ownership.
+        // Time-gated to one stat() per ~100 ms regardless of tick rate (a
+        // busy-loop tick would otherwise stat every spin; an idle 100
+        // ms-per-iteration loop would otherwise check too rarely).
         if plan_path.is_some() && last_plan_check.elapsed() >= Duration::from_millis(100) {
             last_plan_check = Instant::now();
             // Settle armed drains BEFORE consuming a new plan: a drain that
@@ -654,11 +653,11 @@ fn main() {
                     last_plan_mtime = mtime;
                     log::info!("[owner] plan file changed; reloading from {path}");
                     stage_plan_from(path);
-                    // A pure-drain generation (records moved from the assignment
-                    // section to the revocation section, nothing else) applies as
-                    // a live delta: the departing owner flips to Draining and the
-                    // drain driver takes over — no rebuild, co-resident owners
-                    // untouched (rfc_owner_drain_and_logs.md §3.4). Anything
+                    // A pure-drain generation (records moved from the
+                    // assignment section to the revocation section, nothing
+                    // else) applies as a live delta: the departing owner flips
+                    // to Draining and the drain driver takes over — no
+                    // rebuild, co-resident owners untouched. Anything
                     // structural falls through to the rebuild as before.
                     match fluxor::kernel::workload::owner_plan::try_apply_drain_delta() {
                         Some(delta) => arm_drains(&delta),
@@ -723,11 +722,11 @@ fn main() {
         // SAFETY: linux platform is single-threaded; the main loop is the
         // sole scheduler user after instantiation.
         let sched = unsafe { scheduler::sched_mut() };
-        // Multi-graph runtime (RFC adaptive_tick_extra §7): when more than one
-        // resident graph is admitted this steps each owner independently, skips
-        // idle owners, and returns the §7.2 merged sleep deadline. With one
-        // resident graph it is byte-identical to `step_modules` +
-        // `pacer_next_deadline_us(0)` (the fast path inside the call).
+        // Multi-graph runtime: when more than one resident graph is admitted
+        // this steps each owner independently, skips idle owners, and returns
+        // the §7.2 merged sleep deadline. With one resident graph it is
+        // byte-identical to `step_modules` + `pacer_next_deadline_us(0)` (the
+        // fast path inside the call).
         let (result, sleep_us) =
             scheduler::step_resident_graphs_flat(&mut sched.modules, module_count);
 
@@ -741,7 +740,7 @@ fn main() {
             }
             // Plain-run/exec completion: report the CLI exit-code latch
             // (default 0 — non-CLI graphs are unchanged). Node-agent mode
-            // never reaches here (rfc_cli_execution.md §6).
+            // never reaches here.
             let code = CLI_EXIT_CODE.load(Ordering::Acquire);
             log::info!("[sched] all modules complete, exiting (code {code})");
             // Restore the terminal if an interactive applet put it in raw mode.

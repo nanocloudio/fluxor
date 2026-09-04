@@ -45,10 +45,10 @@ pub const MODULE_UPSTREAM: u32 = 0x0C6E;
 /// handle=-1, arg=[module_idx:u8]. Returns 1 if finished, 0 otherwise.
 pub const MODULE_DONE: u32 = 0x0C6F;
 
-// ── WS-D-min: live graph mutation (add owner / free owner) ──────────────────
+// ── Live graph mutation (add owner / free owner) ────────────────────────────
 // Splice a self-contained subgraph into a running graph, and tear it down,
-// without a destructive rebuild. See `.context/ws_d_min.md`. Only the keystone
-// add+teardown is here; partial replacement / migration are later phases.
+// without a destructive rebuild. Add and teardown only: partial
+// replacement and migration are not part of this surface.
 //
 // Wire numbers live in the free 0x0C47..=0x0C4A gap between the kernel core
 // primitives (0x0C40..=0x0C46) and the monitor range (0x0C52..=0x0C5F) — a
@@ -74,10 +74,10 @@ pub const APPLY_ADD: u32 = 0x0C47;
 pub const FREE_OWNER: u32 = 0x0C48;
 
 // ── Owner pause/resume: metal PAUSE as a reversible quiesce verb ─────────────
-// rfc_workload_lifecycle.md §3.2 (P4): the OWNER-level kernel mechanism the
-// future 0x1A metal workload backend / orchestrator maps PAUSE/RESUME onto.
-// Built from the drain RFC's §3.5 admission close + §3.6 wake masking, plus
-// the resume re-latch path. In the 0x0C47..=0x0C4A live-mutation block
+// The OWNER-level kernel mechanism a 0x1A workload backend or orchestrator
+// maps PAUSE/RESUME onto: the admission close and wake masking that drain
+// uses, plus the resume re-latch path. In the 0x0C47..=0x0C4A
+// live-mutation block
 // beside APPLY_ADD/FREE_OWNER — NOT in monitor-gated 0x0C5x, and NOT in the
 // peripheral register-bridge range (0x0C70..=0x0CCF).
 

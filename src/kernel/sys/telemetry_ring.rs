@@ -1,7 +1,7 @@
-//! Kernel telemetry ring — multi-producer, multi-consumer record buffer for the
-//! observability surface (`rfc_observability_surface.md` §5.1). The record-stream
-//! sibling of [`super::log_ring`]: independent consumer tails, drop-new on
-//! overflow, activation on subscribe.
+//! Kernel telemetry ring — multi-producer, multi-consumer record buffer for
+//! the observability surface. The record-stream sibling of
+//! [`super::log_ring`]: independent consumer tails, drop-new on overflow,
+//! activation on subscribe.
 //!
 //! Two things differ from the log ring, both deliberate:
 //!
@@ -94,7 +94,7 @@ static OWNERS: [AtomicU32; CONSUMERS] = [
 const NO_OWNER: u32 = u32::MAX;
 static LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Producer-side enabled gate (`rfc_observability_surface.md` §5.1, decision-10):
+/// Producer-side enabled gate (10):
 /// non-zero when at least one consumer is subscribed, so the SDK can skip
 /// building a record when nothing would consume it. Published to modules via the
 /// `SyscallTable.telemetry_enabled` pointer (EL1/host) and, in a later step, an

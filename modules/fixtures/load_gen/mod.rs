@@ -3,9 +3,9 @@
 //! A self-driven module (no I/O channels) that alternates between a "busy"
 //! and an "idle" phase on a wall-clock duty cycle. During the busy phase it
 //! returns `StepOutcome::Burst` a bounded number of times per tick — which is
-//! exactly the signal the adaptive-tick pacer reads as "this domain has work"
-//! (RFC adaptive_tick §5.6). During the idle phase it returns `Continue` with
-//! no burst, so the pacer sees the domain as idle.
+//! exactly the signal the adaptive-tick pacer reads as "this domain has
+//! work". During the idle phase it returns `Continue` with no burst, so the
+//! pacer sees the domain as idle.
 //!
 //! This lets a rig fixture exercise mechanism (b)'s AIMD cadence on bcm2712
 //! with a controllable, deterministic load — the real network poll-stack never

@@ -35,13 +35,13 @@ pub const GICC_EOIR: *mut u32 = (GICC_BASE + 0x010) as *mut u32;
 /// GICv2 Software-Generated-Interrupt register (GICD_SGIR).
 pub const GICD_SGIR: *mut u32 = (GICD_BASE + 0xF00) as *mut u32;
 
-/// SGI id used as the WFI wake doorbell (RFC adaptive_tick §5.4 mitigation 3).
-/// Tier 0/1a idle on **WFI**, which a global `SEV` does NOT break (SEV wakes
-/// WFE). Once mechanism (a) widens the idle deadline to `tick_max_us`, an
-/// intra-core `event_signal` or a cross-domain SPSC push can otherwise be
-/// delayed to the backstop. An SGI is a real IRQ, so it breaks WFI; the IRQ
-/// handler simply EOIs it (it matches no binding) and the loop re-evaluates.
-/// SGI ids 0-15 are always enabled in GICv2, so no `ISENABLER` setup is needed.
+/// SGI id used as the WFI wake doorbell. Tier 0/1a idle on **WFI**, which a
+/// global `SEV` does NOT break (SEV wakes WFE). Once mechanism (a) widens the
+/// idle deadline to `tick_max_us`, an intra-core `event_signal` or a
+/// cross-domain SPSC push can otherwise be delayed to the backstop. An SGI is
+/// a real IRQ, so it breaks WFI; the IRQ handler simply EOIs it (it matches no
+/// binding) and the loop re-evaluates. SGI ids 0-15 are always enabled in
+/// GICv2, so no `ISENABLER` setup is needed.
 pub const WAKE_SGI: u32 = 0;
 
 /// Send Software-Generated-Interrupt `sgi_id` to ALL cores (CPUTargetList =

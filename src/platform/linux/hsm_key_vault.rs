@@ -3,7 +3,7 @@
 //! Registers as the KEY_VAULT provider (class dispatch + vtable, see the
 //! registration note in `kernel/syscalls.rs`) when a token is configured,
 //! overriding the kernel software backend. Maps the vault opcodes onto
-//! PKCS#11 (rfc_crypto_extensions §4.3):
+//! PKCS#11:
 //!
 //! - `GENERATE` → `C_GenerateKeyPair` with `CKA_SENSITIVE=true`,
 //!   `CKA_EXTRACTABLE=false` — the private key is born inside the token
@@ -15,8 +15,7 @@
 //!   the low-s range so the output is exactly the contract's low-s JWS
 //!   ES256 segment. NOTE: tokens typically use random-k ECDSA, so
 //!   signatures are different-but-valid versus the deterministic
-//!   software backend — consumers verify, they don't byte-compare
-//!   (RFC §6.3).
+//!   software backend — consumers verify, they don't byte-compare.
 //! - `ECDH` → `C_DeriveKey` with `CKM_ECDH1_DERIVE` (CKD_NULL KDF): the
 //!   32-byte X coordinate lands in a throwaway extractable session
 //!   secret, is copied to the caller per the contract, and the object
@@ -28,7 +27,7 @@
 //!   a caller-supplied public key and touches no custodial material.
 //! - `STORE` → `ENOSYS`. A non-extractable token cannot import an
 //!   external private key; `SUITE_QUERY` reports a private length of 0,
-//!   so consumers know to use `GENERATE` (RFC §6.2).
+//!   so consumers know to use `GENERATE`.
 //! - `TIER` → `PROCESS_HW`: a host process talking to a token isolates
 //!   the key from host-memory compromise to the extent the token does.
 //!
@@ -407,8 +406,7 @@ pub unsafe fn hsm_key_vault_dispatch(
             1
         }
         // Import is unavailable against a non-extractable token, which
-        // SUITE_QUERY already reported as a private length of 0
-        // (RFC §6.2).
+        // SUITE_QUERY already reported as a private length of 0.
         dev_key_vault::STORE => ENOSYS,
         dev_key_vault::ECDH => {
             // arg: [peer_len:u32][peer[peer_len]]

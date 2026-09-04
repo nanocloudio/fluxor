@@ -31,8 +31,7 @@ pub const SIGNAL_LOG: u8 = 1; // reserved — logs ride log_ring
 pub const SIGNAL_METRIC: u8 = 2;
 pub const SIGNAL_SPAN: u8 = 3;
 /// Kernel-produced per-module process status (step timing, arena, faults),
-/// pushed to the telemetry ring on a cadence. See `rfc_observability_surface.md`
-/// §5.3.
+/// pushed to the telemetry ring on a cadence.
 pub const SIGNAL_PSTATUS: u8 = 4;
 
 // ── Process-status kind (header[1] when signal == PSTATUS) ───────────
@@ -40,15 +39,14 @@ pub const SIGNAL_PSTATUS: u8 = 4;
 pub const PSTATUS_STEP: u8 = 1;
 /// Resource state: arena used/cap, fault count, flags.
 pub const PSTATUS_RES: u8 = 2;
-/// Resource-ledger pool state: capacity, in-use, peak, denials
-/// (`rfc_resource_model.md` §6.1). Pool ids and classes are the
-/// `resource` contract's registry.
+/// Resource-ledger pool state: capacity, in-use, peak, denials.
+/// Pool ids and classes are the `resource` contract's registry.
 pub const PSTATUS_POOL: u8 = 3;
 
-// ── Syscall op numbers (rfc_observability_surface.md §5.2) ──────────
-// TLM_EMIT is an implicit primitive (any module, like LOG_WRITE); the consumer
-// ops require the read-only `observe` permission. Kept out of the monitor range
-// `0x0C52..=0x0C5F` (blanket monitor-gated).
+// ── Syscall op numbers ────────── TLM_EMIT is an implicit primitive (any
+// module, like LOG_WRITE); the consumer ops require the read-only `observe`
+// permission. Kept out of the monitor range `0x0C52..=0x0C5F` (blanket
+// monitor-gated).
 /// Append one record to the telemetry ring (kernel stamps identity).
 pub const TLM_EMIT: u32 = 0x0C3E;
 /// Claim a drain slot with a filter word; returns the slot id (or negative).
@@ -140,13 +138,12 @@ pub const TRACE_FLAGS_SAMPLED: u8 = 0x01;
 // host walks them without per-record framing. `count` is advisory — a decoder
 // that trusts the byte length can ignore it, but it catches truncation.
 //
-// `dropped` (rfc_observability_surface.md §11) is the CUMULATIVE count of
-// records the ring discarded for this consumer slot since boot — the export
-// path's own fidelity, reported in-band. Cumulative rather than per-batch so
-// the series is monotone: a lost datagram costs resolution, not truth, and the
-// host recovers the gap by differencing. Without it a saturated exporter is
-// indistinguishable from an idle one, which is precisely the failure §11
-// closes.
+// `dropped` is the CUMULATIVE count of records the ring discarded for this
+// consumer slot since boot — the export path's own fidelity, reported in-band.
+// Cumulative rather than per-batch so the series is monotone: a lost datagram
+// costs resolution, not truth, and the host recovers the gap by differencing.
+// Without it a saturated exporter is indistinguishable from an idle one, which
+// is precisely the failure §11 closes.
 pub const BATCH_MAGIC: u32 = 0x4C54_5846; // b"FXTL" little-endian
 pub const BATCH_VERSION: u8 = 1;
 pub const BATCH_HEADER_SIZE: usize = 12;
@@ -209,10 +206,10 @@ pub fn record_len(signal: u8, kind: u8) -> usize {
     }
 }
 
-// ── Per-slot drain filter (rfc_observability_surface.md §5.4) ────────
-// A subscribe-time filter word: a signal-type mask in the low bits plus a span
-// sample-shift (keep 1-in-2^n spans) in the high byte. Applied at drain time on
-// the header, so records are never duplicated per consumer.
+// ── Per-slot drain filter ──────── A subscribe-time filter word: a
+// signal-type mask in the low bits plus a span sample-shift (keep 1-in-2^n
+// spans) in the high byte. Applied at drain time on the header, so records are
+// never duplicated per consumer.
 pub const FILTER_METRIC: u32 = 1 << 0;
 pub const FILTER_SPAN: u32 = 1 << 1;
 pub const FILTER_PSTATUS: u32 = 1 << 2;
@@ -416,8 +413,8 @@ pub fn span_parent_id(buf: &[u8]) -> [u8; SPAN_ID_LEN] {
 
 // ── Process status (PSTATUS) ────────────────────────────────────────
 //
-// Kernel-produced per-module status, pushed to the ring on a cadence
-// (`rfc_observability_surface.md` §5.3). `STEP` carries the module's step count
+// Kernel-produced per-module status, pushed to the ring on a cadence.
+// `STEP` carries the module's step count
 // and the kernel's native u32×8 step-time histogram (the `MON_HIST` source);
 // `RES` carries arena + fault state. Body layouts (after the 12-byte header):
 //   STEP: `[step_count u64][bucket u32 × 8]`  (offsets 12, 20..52)

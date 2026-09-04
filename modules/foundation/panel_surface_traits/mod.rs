@@ -1,13 +1,13 @@
 //! Panel Surface Traits PIC module — bare-metal Surface Traits authority.
 //!
-//! The bare-metal implementation of the runtime environment plane
-//! (`.context/rfc_surface_traits.md`). A fixed-function panel (a speaker LCD, an
-//! instrument display) has a statically-known viewport and a statically-known
-//! set of input modalities (e.g. a few physical buttons, maybe a touchscreen),
-//! declared in the board graph. This module emits one
-//! `input::surface_traits::MSG_TRAITS` record describing that surface, so an
-//! application reacts to a buttoned panel the same way it reacts to a browser
-//! window — the whole point of the environment plane.
+//! The bare-metal implementation of the runtime environment plane. A
+//! fixed-function panel (a speaker LCD, an instrument display) has a
+//! statically-known viewport and a statically-known set of input modalities
+//! (e.g. a few physical buttons, maybe a touchscreen), declared in the board
+//! graph. This module emits one `input::surface_traits::MSG_TRAITS` record
+//! describing that surface, so an application reacts to a buttoned panel the
+//! same way it reacts to a browser window — the whole point of the environment
+//! plane.
 //!
 //! It derives orientation + size class from the configured geometry using the
 //! contract's own helpers (`abi::contracts::input::surface_traits`), so the

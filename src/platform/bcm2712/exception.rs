@@ -294,14 +294,14 @@ pub static CORE_LAST_ELR: [AtomicU64; 4] = [
     AtomicU64::new(0),
 ];
 
-/// Absolute-deadline (`cntp_cval`) re-arm toggle (RFC adaptive_tick §7.1a).
-/// Default OFF: the timer re-arms with the relative `cntp_tval` down-counter
-/// (`timer_set`). When ON, the IRQ handler
-/// re-arms an ABSOLUTE compare relative to the *previous* programmed deadline,
-/// eliminating the per-tick IRQ-entry-latency drift that makes the §7.1
-/// cross-domain skew bound optimistic under variable cadence — with a resync
-/// guard so a deadline that fell into the past during a long ISR snaps to
-/// `now + period` instead of emitting a catch-up burst of immediate IRQs.
+/// Absolute-deadline (`cntp_cval`) re-arm toggle. Default OFF: the timer
+/// re-arms with the relative `cntp_tval` down-counter (`timer_set`). When ON,
+/// the IRQ handler re-arms an ABSOLUTE compare relative to the *previous*
+/// programmed deadline, eliminating the per-tick IRQ-entry-latency drift that
+/// makes the §7.1 cross-domain skew bound optimistic under variable cadence —
+/// with a resync guard so a deadline that fell into the past during a long ISR
+/// snaps to `now + period` instead of emitting a catch-up burst of immediate
+/// IRQs.
 ///
 /// This is an opt-in measured option: it changes the most timing-critical
 /// path and MUST be validated on the rig (AC5b: long-run accumulated
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn irq_handler() {
         // from the per-core slot (not a shared global) is what lets each
         // core/domain pace at its own rate without a sibling clobbering it.
         //
-        // Re-arm drift (RFC adaptive_tick §7.1a): the default
+        // Re-arm drift: the default
         // relative `cntp_tval` re-arm ("from now") loses the IRQ-entry→rearm
         // latency (a few hundred ns on the A76) each period, so the tick grid
         // drifts vs an ideal absolute schedule. At a fixed 1 ms tick this is a
@@ -365,7 +365,7 @@ pub unsafe extern "C" fn irq_handler() {
         };
         let period = NEXT_DEADLINE_TICKS[core_id].load(Ordering::Relaxed);
         if ABSOLUTE_REARM.load(Ordering::Relaxed) {
-            // Drift-free absolute re-arm (RFC §7.1a remedy): next deadline =
+            // Drift-free absolute re-arm: next deadline =
             // previous programmed deadline + period. The resync guard handles
             // boot (last == 0) and post-long-ISR catch-up: if the computed
             // deadline already passed, snap to now + period so the timer never

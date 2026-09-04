@@ -26,7 +26,7 @@
 //! a per-session table keyed by `session_id` and a session-tagged
 //! data-plane framing.
 //!
-//! # Anchor-preserved worker handoff (rfc_protocols.md §13.3)
+//! # Anchor-preserved worker handoff
 //!
 //! When a SECOND worker is wired (ports `ctrl2_*` / `data2_*`) and
 //! `handoff_after_bytes` is non-zero, the anchor swaps the live session

@@ -53,8 +53,7 @@ mod gamepad;
 
 // Surface Traits authority — drains coalesced environment-plane snapshots
 // (viewport / orientation / size class / modality / audio) from the browser
-// host shim and emits `input::surface_traits::MSG_TRAITS` records. See
-// `.context/rfc_surface_traits.md`.
+// host shim and emits `input::surface_traits::MSG_TRAITS` records.
 #[path = "wasm/surface_traits.rs"]
 mod surface_traits;
 
@@ -758,8 +757,7 @@ unsafe fn load_embedded_modules() -> usize {
         // SURFACE TRAITS authority — drains coalesced environment-plane
         // snapshots (viewport / orientation / size class / modality /
         // audio) from the browser host shim and emits 24-byte
-        // `input::surface_traits::MSG_TRAITS` records on out[0]. See
-        // `.context/rfc_surface_traits.md`.
+        // `input::surface_traits::MSG_TRAITS` records on out[0].
         if entry.name_hash == WASM_BROWSER_SURFACE_TRAITS_HASH {
             if !init_builtin_heap::<surface_traits::SurfaceTraitsState>(module_idx) {
                 log_fmt2(

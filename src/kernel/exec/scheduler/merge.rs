@@ -7,7 +7,7 @@
 use super::*;
 
 // ============================================================================
-// Attachable-lane merge (rfc_workload_backend_metal.md §7 P4)
+// Attachable-lane merge
 // ============================================================================
 //
 // The keystone that unblocks the metal `net=own` path. The one shared `ip`
@@ -19,8 +19,8 @@ use super::*;
 // into a free spare lane (`Endpoint::ExistingChannel`, `live.rs`). Because the
 // merge's lanes are cached at boot and never mutated at runtime, attaching needs
 // NO merge-state mutation — the round-robin `MergeModule::step` reads an empty
-// spare lane as a benign no-op until a producer arrives. This subsumes the P3b
-// runtime fan-in: no `add_input_lane`, no under-quiesce merge restructure.
+// spare lane as a benign no-op until a producer arrives. Runtime fan-in
+// needs no `add_input_lane` and no under-quiesce merge restructure.
 
 /// Provision an attachable-lane `_merge` on a base-graph consumer's input port
 /// at boot, with `spare_count` pre-opened producer-less spare lanes. The merge's
@@ -376,14 +376,13 @@ pub struct SchedulerState {
     pub(crate) step_period: [u8; MAX_MODULES],
     /// Per-module step counter (counts ticks toward period)
     pub(crate) step_counter: [u8; MAX_MODULES],
-    /// Per-module ABSOLUTE next-due wall-clock (µs) for the multi-graph runner's
-    /// graph-local periodic schedule (RFC adaptive_tick_extra §7). A module with
-    /// `step_period > 1` in a resident workload graph fires when `now >=
-    /// module_next_due_us[i]`, then this advances by its own
-    /// `step_period × NOMINAL tick` — so each module keeps its OWN period and
-    /// phase, independent of sibling load and of other periodic modules in the
-    /// same graph. `0` ⇒ not yet anchored (primes on first encounter). Unused by
-    /// the single-graph fast path.
+    /// Per-module ABSOLUTE next-due wall-clock (µs) for the multi-graph
+    /// runner's graph-local periodic schedule. A module with `step_period > 1`
+    /// in a resident workload graph fires when `now >= module_next_due_us[i]`,
+    /// then this advances by its own `step_period × NOMINAL tick` — so each
+    /// module keeps its OWN period and phase, independent of sibling load and
+    /// of other periodic modules in the same graph. `0` ⇒ not yet anchored
+    /// (primes on first encounter). Unused by the single-graph fast path.
     #[cfg_attr(
         not(feature = "multitenant"),
         allow(dead_code, reason = "read only by the multi-graph runner")
@@ -472,7 +471,7 @@ pub struct SchedulerState {
     /// Per-domain execution mode (0=cooperative/Tier 0, 1=high-rate/Tier 1a, 3=poll/Tier 3).
     pub(crate) domain_exec_mode: [u8; MAX_DOMAINS],
 
-    // ── Adaptive-tick per-domain config (RFC adaptive_tick §8) ──────────
+    // ── Adaptive-tick per-domain config ──────────
     /// Per-domain adaptive enable flags: bit 0 = (a) demand-driven idle,
     /// bit 1 = (b) adaptive cadence. `0` (the default for every unmodified
     /// config) ⇒ adaptive tick is fully off and pacing is byte-identical.
@@ -512,24 +511,25 @@ pub struct SchedulerState {
     /// instrument modules individually.
     pub(crate) domain_budget_overruns: [u32; MAX_DOMAINS],
     /// Per-domain worst-recent single-step time, microseconds. This is the
-    /// adaptive-tick **floor input** (RFC adaptive_tick §5.3 / P0b): the pacer
-    /// must never drive the tick below `worst_step × margin` or it re-creates
-    /// the `tick_us=500` budget overrun (evidence #5). It is a **decaying
-    /// peak-hold**, NOT a monotonic max: `step_one_module` raises it to the
-    /// live worst, and the per-pass budget reset decays it by `>>
-    /// WORST_STEP_DECAY_SHIFT`, so a one-off (thermal) spike ages out and the
-    /// floor relaxes on cool-down (AC7). A monotonic max would pin the floor
-    /// high forever. Portable / measured on every tier + platform — the only
-    /// pre-existing worst-step (`DomainMetrics.worst_step_ticks`, bcm2712) is
-    /// Tier-1a-only, in cycles, and monotonic, so it cannot serve here.
+    /// adaptive-tick **floor input**: the pacer must never drive the tick
+    /// below `worst_step × margin` or it re-creates the `tick_us=500` budget
+    /// overrun (evidence #5). It is a **decaying peak-hold**, NOT a monotonic
+    /// max: `step_one_module` raises it to the live worst, and the per-pass
+    /// budget reset decays it by `>> WORST_STEP_DECAY_SHIFT`, so a one-off
+    /// (thermal) spike ages out and the floor relaxes on cool-down (AC7). A
+    /// monotonic max would pin the floor high forever. Portable / measured on
+    /// every tier + platform — the only pre-existing worst-step
+    /// (`DomainMetrics.worst_step_ticks`, bcm2712) is Tier-1a-only, in cycles,
+    /// and monotonic, so it cannot serve here.
     pub(crate) domain_worst_step_us: [u32; MAX_DOMAINS],
 
     /// Per-domain module bitmap — bit `m` set iff module `m` belongs to this
-    /// domain. Built once in `prepare_graph` from `domain_id`. The adaptive-tick
-    /// pacer intersects it with `EVENT_WAKE_PENDING` so one domain's idle
-    /// decision is not coupled to a sibling domain's wake (RFC adaptive_tick
-    /// §5.1). On a single-domain target every module lands in domain 0, so the
-    /// intersection degenerates exactly to the global `wake_pending_nonzero()`.
+    /// domain. Built once in `prepare_graph` from `domain_id`. The
+    /// adaptive-tick pacer intersects it with `EVENT_WAKE_PENDING` so one
+    /// domain's idle decision is not coupled to a sibling domain's wake. On a
+    /// single-domain target every module lands in domain 0, so the
+    /// intersection degenerates exactly to the global
+    /// `wake_pending_nonzero()`.
     pub(crate) domain_module_mask: [ModuleMask; MAX_DOMAINS],
 
     // ── Tier 1c pre-pass drain slot ─────────────────────────────────
@@ -539,7 +539,7 @@ pub struct SchedulerState {
     /// rotation, calling `step_one_module` for each entry. The
     /// indices are populated by `prepare_graph` from
     /// `ModuleEntry::pre_tick_drain` (which mirrors the manifest
-    /// flag). See `.context/rfc_isr_tier_surface.md` §D8.
+    /// flag).
     pub(crate) domain_pre_tick_order: [[u8; MAX_PRE_TICK_PER_DOMAIN]; MAX_DOMAINS],
     /// Number of pre-tick modules in each domain.
     pub(crate) domain_pre_tick_count: [u8; MAX_DOMAINS],
@@ -584,12 +584,12 @@ pub struct SchedulerState {
     pub(crate) step_hist: [[u32; 8]; MAX_MODULES],
     /// Global bucket counts across all modules.
     pub(crate) step_hist_global: [u32; 8],
-    /// Workload owner table (rfc_k8s.md §6.2, §10, §14).
-    /// Slot 0 is the system owner. Size-1 (system only) on single-tenant
-    /// builds, so it costs nothing meaningful when `multitenant` is off.
+    /// Workload owner table. Slot 0 is the system owner. Size-1 (system
+    /// only) on single-tenant builds, so it costs nothing meaningful
+    /// when `multitenant` is off.
     pub owners: OwnerTable,
     /// Per-module owner handle. Present only on multi-tenant builds — bare
-    /// metal carries no per-module ownership state (rfc_k8s.md §6.4, §19.2).
+    /// metal carries no per-module ownership state.
     #[cfg(feature = "multitenant")]
     pub(crate) module_owner: [OwnerHandle; MAX_MODULES],
 }
@@ -1334,13 +1334,12 @@ pub fn domain_worst_step_us(domain_id: usize) -> u32 {
 }
 
 /// True iff any module belonging to `domain_id` has a pending event
-/// (non-consuming peek). The per-domain wake signal for the adaptive-tick pacer
-/// (RFC adaptive_tick §5.1): a domain only counts its own
-/// modules' wakes, so a busy sibling domain can't keep this domain from
-/// relaxing/idling on multicore. If the domain's module mask is empty
-/// (unconfigured/degenerate domain) it falls back to the global wake signal, so
-/// a missing mask can never produce a false "idle" (which would over-relax the
-/// tick and risk a missed wake).
+/// (non-consuming peek). The per-domain wake signal for the adaptive-tick
+/// pacer: a domain only counts its own modules' wakes, so a busy sibling
+/// domain can't keep this domain from relaxing/idling on multicore. If the
+/// domain's module mask is empty (unconfigured/degenerate domain) it falls
+/// back to the global wake signal, so a missing mask can never produce a false
+/// "idle" (which would over-relax the tick and risk a missed wake).
 pub fn domain_wake_pending(domain_id: usize) -> bool {
     let d = domain_id.min(MAX_DOMAINS - 1);
     // SAFETY: scheduler-thread-only read; `ModuleMask` is `Copy`.
@@ -1351,8 +1350,8 @@ pub fn domain_wake_pending(domain_id: usize) -> bool {
     crate::kernel::ipc::event::wake_pending_in_mask(&mask)
 }
 
-/// Adaptive-tick enable flags for a domain (RFC adaptive_tick §8): bit 0 =
-/// (a) demand-driven idle, bit 1 = (b) adaptive cadence. `0` ⇒ adaptive off.
+/// Adaptive-tick enable flags for a domain: bit 0 = (a) demand-driven idle,
+/// bit 1 = (b) adaptive cadence. `0` ⇒ adaptive off.
 pub fn domain_adaptive_flags(domain_id: usize) -> u8 {
     if domain_id < MAX_DOMAINS {
         // SAFETY: scheduler-thread-only read; domain_id bounded.
@@ -1471,13 +1470,13 @@ pub const ADAPTIVE_FLAG_IDLE: u8 = 0x01;
 /// Bit 1 of `domain_adaptive_flags` — mechanism (b) adaptive cadence enabled.
 pub const ADAPTIVE_FLAG_CADENCE: u8 = 0x02;
 
-// ── Mechanism (b) AIMD cadence tunables (RFC adaptive_tick §5.2/§5.3) ────────
-// These are PLACEHOLDER defaults — OQ1 marks the exact values as rig-tuned on
-// the cooled Pi 5. The locked design constraints they must respect: AIMD is
-// asymmetric (fast multiplicative decrease on busy, slow additive increase on
-// idle); the minimum dwell must be ≥ the workload's burst inter-arrival or the
-// cadence sawtooths (§5.2); levels are discrete to bound step-counted rescaling
-// and keep diagnostics legible.
+// ── Mechanism (b) AIMD cadence tunables ──────── These are PLACEHOLDER
+// defaults — OQ1 marks the exact values as rig-tuned on the cooled Pi 5. The
+// locked design constraints they must respect: AIMD is asymmetric (fast
+// multiplicative decrease on busy, slow additive increase on idle); the
+// minimum dwell must be ≥ the workload's burst inter-arrival or the cadence
+// sawtooths (§5.2); levels are discrete to bound step-counted rescaling and
+// keep diagnostics legible.
 /// Floor margin: the pacer never drives the tick below `worst_step ×
 /// FLOOR_MARGIN` (so the per-domain budget always fits one heavy step —
 /// evidence #5). 2× leaves headroom for the rest of the pass.
@@ -1536,9 +1535,8 @@ static mut PACER: [PacerState; MAX_DOMAINS] = [PacerState::new(); MAX_DOMAINS];
 static PACER_IDLE_REPORTED: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
-/// Per-domain "was the previous pass idle" latch, for the §6.6 hot-start
-/// transition detector (RFC adaptive_tick_extra). An idle→busy edge arms the
-/// hot-start window.
+/// Per-domain "was the previous pass idle" latch, for the hot-start
+/// transition detector. An idle→busy edge arms the hot-start window.
 static PACER_WAS_IDLE: [AtomicBool; MAX_DOMAINS] = [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
 /// Per-domain hot-start passes remaining (§6.6). After a wake-from-idle the
@@ -1628,14 +1626,14 @@ pub(crate) fn pacer_reset_all() {
     graph_pacer_reset_all();
 }
 
-/// Drive the mechanism-(b) pacer to its fully-relaxed level (`tick_max`). Called
-/// on the mechanism-(a) demand-idle path: (a) returns `tick_max` directly WITHOUT
-/// running the (b) AIMD ladder, so without this the (b) `level_idx` /
-/// `last_reported_us` stay frozen at the pre-idle busy level — and the first busy
-/// pass after a long idle would jump straight back to the busy cadence,
-/// bypassing the intended AIMD cooldown + dwell (RFC adaptive_tick §5.3). Forcing
-/// level 0 makes the post-idle resume start from the relaxed cadence and ramp
-/// back down under sustained load. Per-domain-exclusive access (same invariant as
+/// Drive the mechanism-(b) pacer to its fully-relaxed level (`tick_max`).
+/// Called on the mechanism-(a) demand-idle path: (a) returns `tick_max`
+/// directly WITHOUT running the (b) AIMD ladder, so without this the (b)
+/// `level_idx` / `last_reported_us` stay frozen at the pre-idle busy level —
+/// and the first busy pass after a long idle would jump straight back to the
+/// busy cadence, bypassing the intended AIMD cooldown + dwell. Forcing level 0
+/// makes the post-idle resume start from the relaxed cadence and ramp back
+/// down under sustained load. Per-domain-exclusive access (same invariant as
 /// `pacer_apply_cadence`).
 fn pacer_force_relaxed(domain_id: usize, tick_max: u32) {
     let d = domain_id.min(MAX_DOMAINS - 1);
@@ -1736,10 +1734,9 @@ fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
 }
 
 /// Select the next pacing deadline (µs) for `domain_id` from existing kernel
-/// signals — the single adaptive-tick decision "how long until the next pass?"
-/// (RFC adaptive_tick §5.1). Call it at the platform pacing tail, AFTER the
-/// pass + its pre-sleep wake drain, so the busy/idle signal reflects the pass
-/// just finished.
+/// signals — the single adaptive-tick decision "how long until the next
+/// pass?". Call it at the platform pacing tail, AFTER the pass + its pre-sleep
+/// wake drain, so the busy/idle signal reflects the pass just finished.
 ///
 /// **Mechanism (a) demand-driven idle** (bit 0): when (a) is enabled and the
 /// pass was idle (no pending wake, no burst), relax the next sleep to
@@ -1800,10 +1797,10 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
         .get(domain_id.min(MAX_DOMAINS - 1))
         .map(|b| b.load(Ordering::Relaxed))
         .unwrap_or(false);
-    // §6 work signal (RFC adaptive_tick_extra): a module that did useful work
-    // this tick (WorkDone/RunnableBacklog/Burst, via REPORT_STEP_EFFECT) keeps
-    // the pacer hot even if it returned `Continue` for fairness (the IP/NIC
-    // case). Heat-only — re-step is still Burst-gated.
+    // §6 work signal: a module that did useful work this tick
+    // (WorkDone/RunnableBacklog/Burst, via REPORT_STEP_EFFECT) keeps the pacer
+    // hot even if it returned `Continue` for fairness (the IP/NIC case).
+    // Heat-only — re-step is still Burst-gated.
     let work = PACER_WORK_TICK
         .get(domain_id.min(MAX_DOMAINS - 1))
         .map(|b| b.load(Ordering::Relaxed))
@@ -1897,7 +1894,7 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
 }
 
 // ===========================================================================
-// §7 graph-local pacing (RFC adaptive_tick_extra)
+// §7 graph-local pacing
 // ===========================================================================
 //
 // Per-`(graph_instance, domain)` pacer state, so a hot graph cannot pin an idle

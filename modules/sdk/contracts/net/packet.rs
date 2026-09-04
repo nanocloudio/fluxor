@@ -2,8 +2,7 @@
 //
 // Layer: contracts/net (public, stable).
 //
-// See docs/architecture/protocol_surfaces.md §Packet Surface and the
-// RFC in .context/rfc_protocols.md.
+// See docs/architecture/protocol_surfaces.md §Packet Surface.
 //
 // The packet surface is a channel contract for flows that need
 // packet-preserving behaviour and richer ingress metadata than the

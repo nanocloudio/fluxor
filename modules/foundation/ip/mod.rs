@@ -188,7 +188,7 @@ const NET_CMD_CONNECT: u8 = 0x13;
 /// `[af:1][addr:4][port:2]`.
 const DG_V4_DEST_LEN: usize = 1 + 4 + 2;
 
-// ── Multi-homing address table (rfc_net_identity_metal §3) ──────────────────
+// ── Multi-homing address table ──────────────────
 
 /// Address-table size. Slot 0 is the primary; slots 1.. are secondaries
 /// added via the `addr_ctl` port. Scanned per-frame on the RX path, so the
@@ -204,17 +204,17 @@ const ADDR_FLAG_PRIMARY: u8 = 0x01;
 
 /// One configured local address. 16-byte address with IPv4 in the first four
 /// bytes (network order), matching the workload CREATE-header convention so
-/// IPv6 later is a parser/ND project, not a layout migration
-/// (`rfc_net_identity_metal` §3.1, §6). Fields are reordered from the RFC's
-/// prose for tight `repr(C)` packing; the wire `addr_ctl` payload is parsed
-/// field-by-field, so struct layout is internal-only.
+/// IPv6 later is a parser/ND project, not a layout migration. Fields are
+/// reordered from the RFC's prose for tight `repr(C)` packing; the wire
+/// `addr_ctl` payload is parsed field-by-field, so struct layout is
+/// internal-only.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LocalAddr {
     /// 16-byte address, IPv4 in bytes 0..4 (network order).
     pub addr: [u8; 16],
     /// Owning workload tag (0 = host/system — a legitimate owner, not a
-    /// sentinel). Enforced on bind (P2, `rfc_net_identity_metal` §3.4): an
+    /// sentinel). Enforced on bind: an
     /// owner-stamped bind binds only to the address whose `owner_tag` matches,
     /// and an owned secondary (`owner_tag != 0`) is served only by a listener
     /// explicitly bound to it — never by a host wildcard listener. Set via the
@@ -454,10 +454,10 @@ pub struct IpState {
     netmask: u32,
     gateway: u32,
     dns_server: u32,
-    /// Multi-homing address table (`rfc_net_identity_metal` §3.1). Slot 0 is
-    /// the primary (mirrors `local_ip`, `flags.PRIMARY`, `owner_tag=0`);
-    /// slots 1.. are secondaries added via `addr_ctl`. One gateway / netmask /
-    /// segment for all addresses in v1 (§5) — those stay scalar fields above.
+    /// Multi-homing address table. Slot 0 is the primary (mirrors `local_ip`,
+    /// `flags.PRIMARY`, `owner_tag=0`); slots 1.. are secondaries added via
+    /// `addr_ctl`. One gateway / netmask / segment for all addresses in v1
+    /// (§5) — those stay scalar fields above.
     local_addrs: [LocalAddr; MAX_LOCAL_ADDRS],
     ip_configured: bool,
     signaled_ready: bool,
@@ -485,7 +485,7 @@ pub struct IpState {
     net_out_chan: i32,
     /// Address-control input port (in[2]); -1 when unwired. Single writer =
     /// the platform workload backend. Graphs without it wired get today's
-    /// single-address behaviour, byte-identical. (`rfc_net_identity_metal` §3.2.)
+    /// single-address behaviour, byte-identical.
     addr_ctl_chan: i32,
 
     // Net protocol scratch buffer: NET_FRAME_HDR(3) + conn_id(1) + TCP payload.
@@ -732,7 +732,7 @@ unsafe fn log_error(s: &IpState, msg: &[u8]) {
 
 // Formatting helpers (fmt_u32_raw, fmt_ip_raw) are in pic_runtime.rs
 
-// ── Local-address table helpers (rfc_net_identity_metal §3) ─────────────────
+// ── Local-address table helpers ─────────────────
 
 /// CIDR prefix length for a contiguous IPv4 netmask (host order). `0` for a
 /// zero mask. Used to seed slot 0's `prefix_len` from `s.netmask`.
@@ -803,8 +803,8 @@ fn is_local_addr(s: &IpState, ip: u32) -> bool {
 }
 
 /// Owner tag of a local-address slot. Slot 0 (host), the wildcard sentinel,
-/// out-of-range, and inactive slots all report 0 (host/system owner —
-/// `rfc_net_identity_metal` §3.1). Used by the bind-admission and demux gates.
+/// out-of-range, and inactive slots all report 0 (host/system owner). Used by
+/// the bind-admission and demux gates.
 #[inline]
 fn owner_tag_for_slot(s: &IpState, slot: u8) -> u16 {
     let i = slot as usize;
@@ -820,9 +820,9 @@ fn owner_tag_for_slot(s: &IpState, slot: u8) -> u16 {
 }
 
 /// True if `slot` names an OWNED secondary (`owner_tag != 0`). Slot 0 and
-/// unowned secondaries return false. With no owned secondary configured this
-/// is always false, so every demux/admission gate keyed on it collapses to the
-/// pre-P2 behaviour — byte-identical (`rfc_net_identity_metal` §3.4).
+/// unowned secondaries return false. With no owned secondary configured
+/// this is always false, so every demux/admission gate keyed on it
+/// collapses to a plain unowned match.
 #[inline]
 fn slot_is_owned(s: &IpState, slot: u8) -> bool {
     owner_tag_for_slot(s, slot) != 0
@@ -831,7 +831,7 @@ fn slot_is_owned(s: &IpState, slot: u8) -> bool {
 /// Resolve a nonzero bind `owner_tag` to the active local-address slot that
 /// owner owns. `None` = the owner has no configured address on this host, so a
 /// bind stamped with it is refused (the metal analogue of the Linux
-/// lease-owner gate; `rfc_net_identity_metal` §3.4). Owner 0 (host) is never
+/// lease-owner gate). Owner 0 (host) is never
 /// resolved here — it binds the wildcard slot.
 #[inline]
 fn slot_for_owner(s: &IpState, owner_tag: u16) -> Option<u8> {
@@ -851,7 +851,7 @@ fn slot_for_owner(s: &IpState, owner_tag: u16) -> Option<u8> {
 
 /// Broadcast a gratuitous ARP (L2-broadcast ARP reply) claiming `addr` for our
 /// MAC. Sent once when a same-subnet secondary is added and after a DHCP
-/// renewal for slot 0 (`rfc_net_identity_metal` §3.3).
+/// renewal for slot 0.
 unsafe fn send_gratuitous_arp(s: &mut IpState, addr: u32) {
     if !s.mac_valid || addr == 0 {
         return;
@@ -1130,7 +1130,7 @@ unsafe fn net_send_closed(s: &mut IpState, conn_id: u16) -> bool {
 /// compares it to the configured `sample_permille` rate. Returns the W3C
 /// trace-flags to stamp: `TRACE_FLAGS_SAMPLED` when sampled, else 0. The result
 /// is stored in `TcpConn::sampled_flags` and BOTH emitted locally and
-/// propagated downstream, so the decision is never recomputed (RFC: decide once
+/// propagated downstream, so the decision is never recomputed (decide once
 /// at ingress, carry in flags).
 #[inline(always)]
 fn ingress_sample_decision(permille: u16, trace_id: &[u8; 16]) -> u8 {
@@ -1899,7 +1899,7 @@ pub unsafe extern "C" fn module_new(
         s.ctrl_chan = ctrl_chan;
 
         s.use_dhcp = 1;
-        // Target-tier head-sampling default (rfc_observability §sampling),
+        // Target-tier head-sampling default,
         // overridable by the `trace_sample_permille` param. The bcm2712 (aarch64)
         // module artefact is the pi5-class rig → 50‰; MCU silicon (rp2350/rp2040,
         // thumbv8m/v6m) → 0‰ so tiny targets pay no tracing cost by default.
@@ -2035,8 +2035,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         if s.pending_tx_len > 0 {
             // RunnableBacklog: more TX work is ready, but we yield for NIC
             // fairness. Heat the pacer (keep cadence tight for the in-flight
-            // traffic) WITHOUT the immediate re-step that would starve the ring
-            // (RFC adaptive_tick_extra §6.2 — the motivating IP/NIC case).
+            // traffic) WITHOUT the immediate re-step that would starve the
+            // ring (the motivating IP/NIC case).
             dev_report_step_effect(&*s.syscalls, step_effect::RUNNABLE_BACKLOG);
             return 0; // StepOutcome::Continue
         }
@@ -2287,9 +2287,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         s.pend_cmd_steps = 0;
     }
 
-    // §6 work signal (RFC adaptive_tick_extra): if data moved this step but we
-    // didn't take the RunnableBacklog yield above, report WorkDone — keeps the
-    // pacer hot for an active data path without an immediate same-module re-step.
+    // §6 work signal: if data moved this step but we didn't take the
+    // RunnableBacklog yield above, report WorkDone — keeps the pacer hot for
+    // an active data path without an immediate same-module re-step.
     if moved_bytes {
         dev_report_step_effect(&*s.syscalls, step_effect::WORK_DONE);
     }
@@ -2417,8 +2417,8 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     // Gratuitous-ARP conflict detection: if someone claims ANY of our local
     // addresses from a different MAC, defend by broadcasting a gratuitous
     // reply asserting our MAC for the conflicted address, then notify the
-    // consumer via MSG_ERROR. Now checks every configured local address
-    // (`rfc_net_identity_metal` §3.3), not just the primary.
+    // consumer via MSG_ERROR. Now checks every configured local address,
+    // not just the primary.
     if sender_mac != s.mac_addr && is_local_addr(s, sender_ip) {
         log_info(s, b"[ip] arp conflict");
         if s.mac_valid {
@@ -2476,9 +2476,9 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     }
 
     // Reply to ARP requests for ANY of our local addresses with the single
-    // GEM MAC — ordinary multi-homing on one interface, no per-address MAC
-    // (`rfc_net_identity_metal` §3.3). The reply's sender-protocol-address is
-    // the requested address, so each secondary answers as itself.
+    // GEM MAC — ordinary multi-homing on one interface, no per-address MAC.
+    // The reply's sender-protocol-address is the requested address, so each
+    // secondary answers as itself.
     if opcode == arp::ARP_REQUEST && s.mac_valid && is_local_addr(s, target_ip) {
         let frame_len = arp::build_arp(
             s.tx_frame.as_mut_ptr(),
@@ -2547,9 +2547,9 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
     }
 
     // Destination demux: which of our local addresses (if any) is this for?
-    // Replaces the single `dst == local_ip` compare with a table lookup
-    // (`rfc_net_identity_metal` §3.4). `None` = not a unicast local address;
-    // still accept the (subnet-)broadcast forms as before.
+    // Replaces the single `dst == local_ip` compare with a table lookup.
+    // `None` = not a unicast local address; still accept the
+    // (subnet-)broadcast forms as before.
     let dst_slot = local_slot_for_dst(s, ip_hdr.dst_ip);
     if s.local_ip != 0 && dst_slot.is_none() && ip_hdr.dst_ip != 0xFFFFFFFF {
         // Not for us (also check subnet broadcast — one segment in v1).
@@ -2690,15 +2690,13 @@ unsafe fn process_udp_packet(
         return;
     }
 
-    // Deliver UDP data to the matching datagram endpoint. All UDP
-    // consumers now speak datagram (see
-    // modules/sdk/contracts/net/datagram.rs) and receive source
-    // addressing via MSG_DG_RX_FROM.
-    // Bind admission (`rfc_net_identity_metal` §3.4): a wildcard datagram
-    // endpoint serves slot 0 and unowned secondaries, but an OWNED secondary
-    // is served only by an endpoint bound to it (an owner-stamped DG bind).
-    // `dst_owned` is always false with no owned secondary configured, so this
-    // collapses to the pre-P2 wildcard match — byte-identical.
+    // Deliver UDP data to the matching datagram endpoint. All UDP consumers
+    // now speak datagram (see modules/sdk/contracts/net/datagram.rs) and
+    // receive source addressing via MSG_DG_RX_FROM. Bind admission: a
+    // wildcard datagram endpoint serves slot 0 and unowned secondaries, but
+    // an OWNED secondary is served only by an endpoint bound to it (an
+    // owner-stamped DG bind). `dst_owned` is always false with no owned
+    // secondary configured, so this collapses to a plain wildcard match.
     let dst_owned = slot_is_owned(s, local_slot);
     let mut i = 0;
     while i < tcp::MAX_TCP_CONNS {
@@ -2744,9 +2742,9 @@ unsafe fn process_tcp_segment(
         return;
     }
 
-    // Find matching connection. The local-address slot is the fourth axis
-    // (`rfc_net_identity_metal` §3.4): the same 4-tuple reached at two local
-    // addresses is two distinct conns.
+    // Find matching connection. The local-address slot is the fourth axis:
+    // the same 4-tuple reached at two local addresses is two distinct
+    // conns.
     let conn_idx = tcp::find_conn(
         &s.tcp_conns,
         ip_hdr.src_ip,
@@ -3745,8 +3743,8 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
     let remote_port = conn.remote_port;
     let rcv_nxt = conn.rcv_nxt;
     let rcv_wnd = conn.rcv_wnd;
-    // Source from the conn's bound local address (`rfc_net_identity_metal`
-    // §3.4). Slot 0 / unbound → `local_ip`, so single-address is unchanged.
+    // Source from the conn's bound local address. Slot 0 / unbound →
+    // `local_ip`, so a single-address configuration is unaffected.
     let local_src = local_ip_for_slot(s, conn.local_slot);
     let consumes_seq = (flags & (tcp::SYN | tcp::FIN)) != 0;
     let seq = if retransmit && consumes_seq {
@@ -4330,9 +4328,8 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
             }
             {
                 // Distinguish first acquisition from a lease renewal: only a
-                // renewal announces (gratuitous ARP for slot 0,
-                // `rfc_net_identity_metal` §3.3). Initial bind stays
-                // byte-identical to pre-multi-address behaviour.
+                // renewal announces (gratuitous ARP for slot 0). Initial
+                // bind stays byte-identical to pre-multi-address behaviour.
                 let renewing = s.dhcp.renew_sent;
                 s.local_ip = offered_ip;
                 s.netmask = effective_mask;
@@ -4651,9 +4648,9 @@ unsafe fn try_send_cmd_payload(
 /// Add a secondary local address (`IP_ADDR_ADD`). No-op if the IPv4 word is
 /// zero, if the address is already configured (primary or secondary — only
 /// owner/prefix are refreshed then), or if the table is full. Sends a single
-/// same-subnet gratuitous ARP on first insertion (`rfc_net_identity_metal`
-/// §3.3). owner_tag stamps the slot's owner and is enforced on bind (P2, see
-/// `slot_for_owner` / `find_listener`).
+/// same-subnet gratuitous ARP on first insertion. owner_tag stamps the
+/// slot's owner and is enforced on bind (see `slot_for_owner` /
+/// `find_listener`).
 unsafe fn addr_ctl_add(s: &mut IpState, addr16: *const u8, prefix_len: u8, owner_tag: u16) {
     let ipv4 = u32::from_be_bytes([*addr16, *addr16.add(1), *addr16.add(2), *addr16.add(3)]);
     if ipv4 == 0 {
@@ -4713,8 +4710,8 @@ unsafe fn addr_ctl_del(s: &mut IpState, ipv4: u32) {
 }
 
 /// Drain the address-control port (in[2]) and apply IP_ADDR_ADD / IP_ADDR_DEL.
-/// Single writer = the platform workload backend (`rfc_net_identity_metal`
-/// §3.2). No-op — and byte-identical — when the port is unwired.
+/// Single writer = the platform workload backend. No-op — and byte-identical —
+/// when the port is unwired.
 unsafe fn service_addr_ctl(s: &mut IpState) {
     if s.addr_ctl_chan < 0 {
         return;
@@ -4834,15 +4831,14 @@ unsafe fn service_net_channels(s: &mut IpState) {
 
         match msg_type {
             NET_CMD_BIND => {
-                // Payload: [port: u16 LE] (host / wildcard bind — pre-P2)
-                //     or   [port: u16 LE][owner_tag: u16 LE]  (P2 owner-stamped)
-                // The optional trailing owner_tag is the metal bind-admission
-                // axis (`rfc_net_identity_metal` §3.4). It is stamped by the
-                // trusted upstream on behalf of the binding workload; the ip
-                // module cannot itself learn the commanding owner (the module
-                // syscall ABI exposes no owner query), so the stamp source is
-                // the P3 workload-backend / ingress path. Absent or 0 ⇒ host
-                // wildcard, byte-identical to the pre-P2 bind.
+                // Payload: [port: u16 LE]                        host/wildcard
+                //     or   [port: u16 LE][owner_tag: u16 LE]     owner-stamped
+                // The optional trailing owner_tag is the bind-admission axis.
+                // It is stamped by the trusted upstream on behalf of the
+                // binding workload; the ip module cannot itself learn the
+                // commanding owner (the module syscall ABI exposes no owner
+                // query), so the stamp comes from the workload-backend or
+                // ingress path. Absent or 0 ⇒ host wildcard.
                 if plen >= 2 {
                     let port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
                     let owner_tag = if plen >= 4 {
@@ -4854,7 +4850,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     // owner 0 → wildcard (host). A nonzero owner must own a
                     // configured address here; if it does not, the bind is
                     // refused — the metal analogue of the Linux lease-owner
-                    // gate (`rfc_net_identity_metal` §3.4).
+                    // gate.
                     let target_slot = if owner_tag == 0 {
                         LOCAL_SLOT_ANY
                     } else {
@@ -5070,12 +5066,11 @@ unsafe fn service_net_channels(s: &mut IpState) {
             }
             DG_CMD_BIND => {
                 // datagram bind. Payload: [port: u16 LE] [flags: u8]
-                //   or (P2 owner-stamped): [port: u16 LE][flags: u8][owner_tag: u16 LE]
+                //   or owner-stamped: [port: u16 LE][flags: u8][owner_tag: u16 LE]
                 // Port 0 requests ephemeral allocation. Provider responds
                 // with MSG_DG_BOUND [ep_id, local_port]. The optional trailing
-                // owner_tag is the same bind-admission axis as NET_CMD_BIND
-                // (`rfc_net_identity_metal` §3.4); absent or 0 ⇒ host wildcard,
-                // byte-identical to the pre-P2 datagram bind.
+                // owner_tag is the same bind-admission axis as NET_CMD_BIND;
+                // absent or 0 ⇒ host wildcard.
                 if plen >= 2 {
                     let req_port = u16::from_le_bytes([*buf.as_ptr(), *buf.as_ptr().add(1)]);
                     let owner_tag = if plen >= 5 {

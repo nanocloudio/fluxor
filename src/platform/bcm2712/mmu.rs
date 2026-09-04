@@ -837,7 +837,7 @@ mod bcm2712_impl {
     //                 access becomes a one-shot module fault, never a
     //                 re-faulting core spin.
     //
-    // Scope / known limits (see .context/pi5_el0_isolation.md):
+    // Scope / known limits:
     //   * IRQs are masked during the EL0 step (SPSR DAIF). A runaway EL0
     //     loop that never faults and never returns would hang the owning
     //     core — bounding that needs an EL0 preemption timer (follow-up).

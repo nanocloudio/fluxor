@@ -1,5 +1,5 @@
 // nonce_reservation_core — windowed egress-counter reservation with
-// epoch fencing (rfc_protocols.md §13.7.2, §13.7.6 R2; RFC §15.1).
+// epoch fencing ( §13.7.6 R2).
 //
 // Shared by any datagram anchor doing platform-replicated-state
 // `transport_migratable` migration, and by the session directory that

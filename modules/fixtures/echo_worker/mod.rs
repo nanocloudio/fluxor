@@ -29,9 +29,9 @@
 //! # Anchor-preserved handoff (export / import / resume)
 //!
 //! The worker also implements both halves of the SessionCtrlV1 opaque
-//! state handoff (`session_handoff` core; rfc_protocols.md §13.1,
-//! §13.3), so an anchor can swap a session between two worker
-//! instances while the client transport stays open:
+//! state handoff (`session_handoff` core), so an anchor can swap a
+//! session between two worker instances while the client transport
+//! stays open:
 //!
 //!   OUTGOING worker (drain implies handoff-export in this demo —
 //!   a real deployment may gate export on directory policy):
@@ -426,8 +426,7 @@ unsafe fn handle_ctrl(s: &mut WorkerState) {
             // forwarded before the anchor entered its rebinding hold
             // must not be dropped. MSG_SC_DRAINED and the export fire
             // from module_step once data_in runs dry. In this demo
-            // drain implies handoff-export (rfc_protocols.md §13.3:
-            // "the worker drains/exports"); a real deployment may gate
+            // drain implies handoff-export (// "the worker drains/exports"); a real deployment may gate
             // export on directory policy.
             if s.phase == WorkerPhase::Active {
                 s.phase = WorkerPhase::Draining;

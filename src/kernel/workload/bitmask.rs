@@ -1,4 +1,4 @@
-//! Width-parameterized module bitmask (rfc_k8s.md §10.4).
+//! Width-parameterized module bitmask.
 //!
 //! A single `u64` holds one bit per module but hard-caps `MAX_MODULES` at 64.
 //! `ModuleMask` generalises that bitmap to any `MAX_MODULES` by backing it with

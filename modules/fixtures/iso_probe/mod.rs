@@ -40,8 +40,7 @@
 //! regions and reports results through the **StepOutcome return value**
 //! (Continue / Done / Error) and through the faults it deliberately raises.
 //! `dev_log` is used only in `module_new`, which runs at EL1 during
-//! instantiation. A minimal SVC syscall gateway is a documented follow-up
-//! (see `.context/pi5_el0_isolation.md`).
+//! instantiation. EL0 code reaches no syscall gateway of its own.
 
 #![no_std]
 #![allow(

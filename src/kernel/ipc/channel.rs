@@ -192,14 +192,14 @@ struct ChannelSlot {
     /// as `i16` so all `MAX_BUFFER_SLOTS = 256` registry slots fit
     /// without silent wrap to negative.
     buffer_slot: AtomicI16,
-    /// Consumer module to event-wake on a successful write (RFC
-    /// idle_skip_wake wake-on-write, `wake: true` edges). -1 = none
-    /// (default). Bound via `channel_set_wake_module` — by graph prep
-    /// for same-domain direct edges, by the platform's cross-domain
-    /// bridging for the consumer-local delivery channel. The wake
-    /// latches the module's event bit + rings the scheduler doorbell,
-    /// so an idle sleep is cut short by data instead of waiting for
-    /// the backstop. i16: MAX_MODULES fits comfortably.
+    /// Consumer module to event-wake on a successful write (`wake:
+    /// true` edges). -1 = none (default). Bound via
+    /// `channel_set_wake_module` — by graph prep for same-domain
+    /// direct edges, by the platform's cross-domain bridging for the
+    /// consumer-local delivery channel. The wake latches the module's
+    /// event bit + rings the scheduler doorbell, so an idle sleep is
+    /// cut short by data instead of waiting for the backstop. i16:
+    /// MAX_MODULES fits comfortably.
     wake_module: AtomicI16,
     /// FIFO state for circular buffer operations
     fifo: UnsafeCell<FifoState>,
@@ -401,8 +401,7 @@ pub fn channel_open_for_module(
     // defense in depth for hand-rolled binaries. Fire BEFORE the
     // chan_type check so a malformed ISR-tier syscall surfaces as
     // EACCES (the permission violation) rather than CHAN_EINVAL
-    // (the type-tag mismatch). See `.context/rfc_isr_tier_surface.md`
-    // §D6.
+    // (the type-tag mismatch).
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_open") {
         return crate::kernel::sys::errno::EACCES;
     }
@@ -542,8 +541,7 @@ pub fn stats() -> ChannelStats {
 /// submission queues, PIO DMA streams) are responsible for tearing
 /// the device down via their module's `module_drain` /
 /// `module_state_export` exports before the kernel reaches this
-/// point. See `.context/rfc_graph_reconfigure.md` for the
-/// operator-visible drain flow.
+/// point.
 pub fn reset_all() {
     for slot in CHANNELS.iter() {
         slot.reset();
@@ -580,9 +578,9 @@ pub fn release_module_handlers(module_idx: u8) {
 /// `len` bytes into `buf` — the destination region must not alias any
 /// kernel state observed via shared references.
 pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
-    // Defense in depth (RFC §D6): ISR-tier callers do not use the
-    // generic PIPE syscall — they read from bridge rings registered
-    // at `register_tier1b_module`/`register_tier2_module` time. Fire
+    // Defense in depth: ISR-tier callers do not use the generic PIPE
+    // syscall — they read from bridge rings registered at
+    // `register_tier1b_module`/`register_tier2_module` time. Fire
     // BEFORE the argument-validation checks so a malformed ISR-tier
     // syscall surfaces as EACCES rather than CHAN_EINVAL.
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_read") {
@@ -660,7 +658,7 @@ pub unsafe fn channel_read(handle: i32, buf: *mut u8, len: usize) -> i32 {
 /// through `buf`; the caller owns the buffer and is responsible for
 /// its lifetime and aliasing.
 pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
-    // RFC §D7 contract — deny PIPE-channel I/O from ISR-tier callers.
+    // ISR-tier callers are denied PIPE-channel I/O.
     // Same rationale as `channel_read`: `peek` exposes the consumer
     // side of a cooperative-PIPE channel and is not part of the
     // bridge ABI.
@@ -704,9 +702,9 @@ pub unsafe fn channel_peek(handle: i32, buf: *mut u8, len: usize) -> i32 {
 /// FIFO/mailbox storage; the source region must remain initialised for
 /// the duration of the call.
 pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
-    // Defense in depth (RFC §D6): ISR-tier callers do not use the
-    // generic PIPE syscall — they write into bridge rings registered
-    // at `register_tier1b_module`/`register_tier2_module` time. Fire
+    // Defense in depth: ISR-tier callers do not use the generic PIPE
+    // syscall — they write into bridge rings registered at
+    // `register_tier1b_module`/`register_tier2_module` time. Fire
     // BEFORE the argument-validation checks so a malformed ISR-tier
     // syscall surfaces as EACCES rather than CHAN_EINVAL.
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("channel_write") {
@@ -768,8 +766,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
 }
 
 /// Bind a consumer module to be event-woken by successful writes on this
-/// channel (RFC idle_skip_wake §4 wake-on-write). `module_idx < 0` clears
-/// the binding.
+/// channel. `module_idx < 0` clears the binding.
 pub fn channel_set_wake_module(handle: i32, module_idx: i32) {
     if handle < 0 || handle as usize >= MAX_CHANNELS {
         return;
@@ -785,9 +782,8 @@ pub fn channel_set_wake_module(handle: i32, module_idx: i32) {
         .store(clamped, Ordering::Release);
 }
 
-/// Wake-on-write (RFC idle_skip_wake §4): after a successful write on a
-/// `wake: true` edge, latch the consumer's event-wake bit and ring the
-/// scheduler doorbell.
+/// Wake-on-write: after a successful write on a `wake: true` edge,
+/// latch the consumer's event-wake bit and ring the scheduler doorbell.
 /// The consumer then steps with `event_wake = true` on the next drain
 /// (period gate bypassed), and the woken-path domain budget bounds the
 /// rate (`step_woken_modules` defers over-budget wakes). No-op for the
@@ -800,7 +796,7 @@ fn wake_consumer_if_flagged(slot: &ChannelSlot) {
         // `latch_module_wake` returns false when the consumer's owner is
         // paused: the wake is deferred (re-latched on `owner_resume`) and
         // the doorbell is suppressed, so a write into a paused owner never
-        // leaks a cross-domain wake (rfc_workload_lifecycle.md §3.2).
+        // leaks a cross-domain wake.
         if crate::kernel::ipc::event::latch_module_wake(m as usize) {
             crate::kernel::sys::hal::wake_scheduler();
         }
@@ -808,7 +804,7 @@ fn wake_consumer_if_flagged(slot: &ChannelSlot) {
 }
 
 pub fn channel_poll(handle: i32, events: u32) -> i32 {
-    // RFC §D7 contract: ISR-tier modules have no PIPE-channel API.
+    // ISR-tier modules have no PIPE-channel API.
     // `channel_poll` is a read-only inspector, but exposing it would
     // let an ISR module busy-wait on a PIPE — semantically out of
     // contract — so deny along with channel_read/write/peek.
@@ -1042,9 +1038,9 @@ pub fn channel_set_mailbox(handle: i32) {
 
 /// Does the channel hold undelivered data — covering BOTH transport modes:
 /// FIFO ring-buffer bytes AND a pending mailbox frame (which the byte-count
-/// accessor reports as 0). This is the drain-quiescence emptiness check
-/// (rfc_owner_drain_and_logs.md §3.1): a draining owner is not quiescent while
-/// any of its channels answers `true`. Invalid/closed handles are empty.
+/// accessor reports as 0). This is the drain-quiescence emptiness check: a
+/// draining owner is not quiescent while any of its channels answers
+/// `true`. Invalid/closed handles are empty.
 pub fn channel_has_pending(handle: i32) -> bool {
     if handle < 0 {
         return false;

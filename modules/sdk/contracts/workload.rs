@@ -1,6 +1,6 @@
 // Contract: workload — platform-neutral isolated-workload surface (class 0x1A).
 //
-// Layer: contracts (public, stable). See `.context/fluxor_nanocloud.md`.
+// Layer: contracts (public, stable).
 //
 // One contract for "run an isolated workload with a declared capability
 // envelope," realized by two backends chosen by placement, never by the
@@ -33,7 +33,7 @@
 //     `source_kind` byte here defines only the native artifact
 //     (`SOURCE_FMOD_GRAPH = 0`); nonzero kinds are backend-defined.
 //
-// Two tiers (RFC §5):
+// Two tiers:
 //   * Tier 1 — typed portable fields (the CREATE header): identity, posture,
 //     resource envelope, network endpoints. Every backend maps them.
 //   * Tier 2 — a backend-opaque options envelope (the trailing TLV section):
@@ -43,10 +43,10 @@
 //     platform concepts (`seccomp`/`caps`/`selinux` are vocabulary in the Linux
 //     backend's own docs, not here).
 //
-// Load-bearing invariant (RFC §5.3): Tier 1 alone must fully establish the
-// isolation guarantee; the Tier-2 envelope may only refine WITHIN the declared
-// posture. A backend that ignores the entire envelope still yields a
-// correctly-isolated workload at the requested posture.
+// Load-bearing invariant: Tier 1 alone must fully establish the isolation
+// guarantee; the Tier-2 envelope may only refine WITHIN the declared posture.
+// A backend that ignores the entire envelope still yields a correctly-isolated
+// workload at the requested posture.
 
 /// `CREATE` — admit and instantiate a workload from a spec (below); returns a
 /// tagged `WorkloadHandle` fd, or a negative errno. The caller must hold the
@@ -77,12 +77,11 @@ pub const DESTROY: u32 = 0x1A04;
 // ---- 0x1A05..0x1A0A: retired to `abi::platform::linux::host_process` ----
 // (0x1B class). Do not reuse these opcode values.
 
-/// `PAUSE` — freeze a workload (reversible; not a terminal state;
-/// rfc_workload_lifecycle §2.2). Each backend realizes it with its own freeze
-/// mechanism (host-process: the process freezer, its P2; metal: its P4).
-/// Idempotent:
-/// PAUSE on a paused workload returns status 0; PAUSE on a terminal workload
-/// is a state error. Advertised via [`caps::PAUSE`].
+/// `PAUSE` — freeze a workload (reversible; not a terminal state). Each
+/// backend realizes it with its own freeze mechanism (host-process: the
+/// process freezer; metal: its own quiesce). Idempotent: PAUSE on a paused
+/// workload returns status 0; PAUSE on a terminal workload is a state error.
+/// Advertised via [`caps::PAUSE`].
 pub const PAUSE: u32 = 0x1A0B;
 /// `RESUME` — thaw a paused workload, see [`PAUSE`]. Idempotent: RESUME on a
 /// running workload returns status 0.
@@ -97,7 +96,7 @@ pub const RESUME: u32 = 0x1A0C;
 /// `postures`/`source_kinds`/`ops`/`net` are bitmaps over the constants below.
 pub const CAPS: u32 = 0x1AFF;
 
-// ---- posture ladder (RFC §6) — Tier-1 `posture` field values ----
+// ---- posture ladder — Tier-1 `posture` field values ----
 
 /// No isolation — same address space / null sandbox (PROC semantics).
 pub const POSTURE_SHARED: u8 = 0;
@@ -108,7 +107,7 @@ pub const POSTURE_ISOLATED: u8 = 1;
 /// surface; metal: strongest protection-domain config). Backend refinements are Tier-2.
 pub const POSTURE_HARDENED: u8 = 2;
 
-// ---- source kind (RFC §8.1) — Tier-1 `source_kind`; backend is placement-resolved ----
+// ---- source kind — Tier-1 `source_kind`; backend is placement-resolved ----
 
 /// A fluxor graph/fmod artifact — resolves to the MPU/EL0 backend on a metal
 /// node.
@@ -120,9 +119,9 @@ pub const SOURCE_FMOD_GRAPH: u8 = 0;
 pub const STATE_RUNNING: u8 = 0;
 pub const STATE_EXITED: u8 = 1;
 pub const STATE_SIGNALLED: u8 = 2;
-/// Frozen by [`PAUSE`]; live, not terminal (rfc_workload_lifecycle §2.3).
-/// A consumer's status loop must treat it as live — only EXITED/SIGNALLED
-/// latch. After [`RESUME`], the next WAIT poll reflects RUNNING (§3.3).
+/// Frozen by [`PAUSE`]; live, not terminal. A consumer's status loop must
+/// treat it as live — only EXITED/SIGNALLED latch. After [`RESUME`], the
+/// next WAIT poll reflects RUNNING (§3.3).
 pub const STATE_PAUSED: u8 = 3;
 
 // ---- portable signal subset (SIGNAL `signo`) ----
@@ -140,7 +139,7 @@ pub const SIG_KILL: u32 = 2;
 ///   0    16  identity        owner_uid → owner alloc/reuse
 ///  16     1  posture         POSTURE_*
 ///  17     1  source_kind     SOURCE_*
-///  18     1  net_iso         NET_ISO_* — workload-level network isolation (RFC §7);
+///  18     1  net_iso         NET_ISO_* — workload-level network isolation;
 ///                            OWN here or on any endpoint puts the workload in its
 ///                            own network domain (a workload can have an identity
 ///                            and no declared endpoints)
@@ -153,7 +152,7 @@ pub const SIG_KILL: u32 = 2;
 ///  40     2  source_ref_len  bytes of source-ref section that follows
 ///  42     2  endpoint_count  number of NetEndpoint entries after source-ref
 ///  44     4  options_len     bytes of the Tier-2 TLV envelope (last section)
-///  48     1  net_family      NET_FAM_* — network identity (RFC §7); NONE = unassigned
+///  48     1  net_family      NET_FAM_* — network identity; NONE = unassigned
 ///  49     1  net_prefix_len  address prefix length in bits (family-scoped)
 ///  50     2  net_segment     segment/lane id the identity belongs to (0 = default)
 ///  52    16  net_addr        address bytes (IPv4 in bytes 0..4, rest zero)
@@ -174,7 +173,7 @@ pub const NET_FAM_NONE: u8 = 0;
 pub const NET_FAM_IPV4: u8 = 4;
 pub const NET_FAM_IPV6: u8 = 6;
 
-/// One Tier-1 network endpoint the workload exports (RFC §7): `[proto:u8]
+/// One Tier-1 network endpoint the workload exports: `[proto:u8]
 /// [net_iso:u8][port:u16 LE]`. `proto` is a `NET_PROTO_*`; `net_iso` selects
 /// [`NET_ISO_SHARED`]/[`NET_ISO_OWN`]. Realized by the owner endpoint-lease
 /// machinery (metal → NIC-ring; Linux → host-process network machinery).
@@ -217,17 +216,16 @@ pub mod caps {
     // `abi::platform::linux::host_process::CAPS_SOURCE_HOST_PROCESS`).
 
     // `ops` bitmap — optional opcodes beyond the mandatory create/start/wait/
-    // signal/destroy set (rfc_workload_lifecycle §2.4). SIGNAL itself is
-    // mandatory to *accept*; its bit asserts real-signal delivery semantics.
-    // bits 0..2 reserved (formerly READ/EXEC/TTY — retired to the 0x1B
-    // host-process class; do not reuse the positions).
+    // signal/destroy set. SIGNAL itself is mandatory to *accept*; its bit
+    // asserts real-signal delivery semantics. bits 0..2 reserved (formerly
+    // READ/EXEC/TTY — retired to the 0x1B host-process class; do not reuse
+    // the positions).
     /// SIGNAL is delivered by the backend's real signal mechanism (§3.1),
     /// not merely recorded as a stop request.
     pub const SIGNAL: u16 = 1 << 3;
     /// Backend implements the [`super::PAUSE`]/[`super::RESUME`] pair. The
     /// bit claims the backend can freeze AT ALL; a specific workload whose
-    /// freeze mechanism could not be set up may still return `ENOSYS`
-    /// (rfc_workload_lifecycle §3.1).
+    /// freeze mechanism could not be set up may still return `ENOSYS`.
     pub const PAUSE: u16 = 1 << 4;
 
     // `net` bitmap — which Tier-1 network fields the backend realizes. A

@@ -1,6 +1,5 @@
 //! OTEL export engine — the telemetry-ring consumer that batches records and
-//! emits them on `export` for a transport-blind carrier to deliver
-//! (`rfc_observability_surface.md` §5.5).
+//! emits them on `export` for a transport-blind carrier to deliver.
 //!
 //! It subscribes to the kernel telemetry ring (`TLM_SUBSCRIBE`), drains whole
 //! records each step (`TLM_DRAIN`), accumulates them, and on a flush cadence
@@ -50,7 +49,7 @@ mod otlp_pb {
     include!("../../sdk/cores/otlp_proto.rs");
 }
 
-/// Raw records staged between flushes (rfc_observability_surface.md §11.2).
+/// Raw records staged between flushes.
 ///
 /// Target-split rather than flat: the ring this drains is itself scaled (32 KiB
 /// on bcm2712) and the sibling forwarders scale their channel buffers per
@@ -120,9 +119,8 @@ struct OtelState {
     /// Resends spent on the currently retained batch.
     resends: u8,
     /// Cumulative ring drops for our slot, sampled at each flush and stamped
-    /// into the batch envelope (rfc_observability_surface.md §11.2). Held
-    /// across flushes so a retained/resent batch reports the value that was
-    /// true when it was built.
+    /// into the batch envelope. Held across flushes so a retained/resent
+    /// batch reports the value that was true when it was built.
     dropped: u32,
     accum_len: u16,
     accum: [u8; ACCUM_MAX],
@@ -376,12 +374,12 @@ unsafe fn step_flush(s: &mut OtelState) {
     }
     let sys = &*s.syscalls;
     let now = dev_micros(sys);
-    // Two triggers (rfc_observability_surface.md §11.2): the cadence, and a
-    // full accumulator. Without the size trigger a burst that fills `accum`
-    // stalls `step_drain` (which refuses to drain into less than one whole
-    // record of room) until the timer fires, pushing the overflow back onto
-    // the ring to be dropped. Flushing when full decouples burst capacity
-    // from cadence and leaves `flush_ms` a pure freshness knob.
+    // Two triggers: the cadence, and a full accumulator. Without the size
+    // trigger a burst that fills `accum` stalls `step_drain` (which refuses
+    // to drain into less than one whole record of room) until the timer
+    // fires, pushing the overflow back onto the ring to be dropped.
+    // Flushing when full decouples burst capacity from cadence and leaves
+    // `flush_ms` a pure freshness knob.
     let full = ACCUM_MAX - (s.accum_len as usize) < tlm::MAX_RECORD_SIZE;
     if !full && now.wrapping_sub(s.last_flush_micros) < (s.flush_ms as u64) * 1000 {
         return;

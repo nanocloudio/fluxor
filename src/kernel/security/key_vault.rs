@@ -9,13 +9,13 @@
 //! directly: the vault is authoritative for any slot holding private
 //! key material.
 //!
-//! This is the platform-overridable *default* backend
-//! (rfc_crypto_extensions §4.1): a hardware platform may re-register both the
-//! KEY_VAULT class dispatch and its vtable at platform boot (e.g. the
-//! Linux PKCS#11 backend), swapping custody transparently behind the
-//! same contract. Isolation honesty: this backend reports
-//! `TIER = SOFTWARE` — kernel static memory isolates against a
-//! compromised *module*, not a compromised host/kernel.
+//! This is the platform-overridable *default* backend: a hardware
+//! platform may re-register both the KEY_VAULT class dispatch and its
+//! vtable at platform boot (e.g. the Linux PKCS#11 backend), swapping
+//! custody transparently behind the same contract. Isolation honesty:
+//! this backend reports `TIER = SOFTWARE` — kernel static memory
+//! isolates against a compromised *module*, not a compromised
+//! host/kernel.
 use crate::abi::contracts::key_vault as dev_key_vault;
 use crate::abi::errno::{EACCES, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE, ERROR};
 
@@ -1012,8 +1012,8 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             0
         }
         dev_key_vault::TIER => {
-            // Isolation honesty (rfc_crypto_extensions §3.5), and the one
-            // place persistence must NOT be allowed to speak.
+            // Isolation honesty, and the one place
+            // persistence must NOT be allowed to speak.
             //
             // This backend can now seal keys so they survive a restart —
             // see `seal_slot`. That is durability, and durability is not

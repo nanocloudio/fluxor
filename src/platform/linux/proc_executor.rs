@@ -1,4 +1,4 @@
-//! Linux external-process executor (rfc_k8s.md §6.8, §19.5).
+//! Linux external-process executor.
 //!
 //! Owns one external-hosted process for a graph-resident proxy node: blocking
 //! spawn/read/write/wait/kill all happen on worker threads or the caller's

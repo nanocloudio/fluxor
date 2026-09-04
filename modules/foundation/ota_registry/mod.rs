@@ -70,7 +70,7 @@ const MANIFEST_BUF_SIZE: usize = 16384;
 /// Layer table capacity (skeleton + fmods + config).
 const MAX_LAYERS: usize = 48;
 /// Directive record: `[0x44][counter u64 LE][tag_len u8][tag][sig 64]`,
-/// Ed25519 over `counter_le ‖ tag` (rfc_oci_distribution.md §7.2).
+/// Ed25519 over `counter_le ‖ tag`.
 const DIRECTIVE_MAGIC: u8 = 0x44;
 const PORT_IN_DIRECTIVE: u32 = 1;
 /// Request builder.
@@ -588,12 +588,12 @@ unsafe fn flush_tx(s: &mut State) -> bool {
 
 /// Extract image-layer digest/size + epoch annotation from the manifest.
 unsafe fn parse_manifest(s: &mut State) -> bool {
-    // Layered form first (rfc_oci_distribution.md §7.1): a skeleton
-    // layer marks it. Layers appear in JSON in publisher order =
-    // ascending offset; each carries digest, size and the
-    // `io.fluxor.image.offset` annotation. Field order within a layer
-    // object is fixed by our own serializer (mediaType, digest, size,
-    // annotations), so a sequential scan is sound.
+    // Layered form first: a skeleton layer marks it. Layers appear in
+    // JSON in publisher order = ascending offset; each carries
+    // digest, size and the `io.fluxor.image.offset` annotation. Field
+    // order within a layer object is fixed by our own serializer
+    // (mediaType, digest, size, annotations), so a sequential scan is
+    // sound.
     s.layers_count = 0;
     {
         // Copy out of self to scan while mutating the tables.
@@ -1070,9 +1070,9 @@ unsafe fn pump_net(s: &mut State) -> bool {
 }
 
 /// Drain the optional directive port: signed tag re-point / check-now
-/// records (rfc_oci_distribution.md §7.2). Silently drops anything
-/// that fails shape, signature, or the anti-replay counter — a
-/// directive channel is untrusted input by definition.
+/// records. Silently drops anything that fails shape, signature, or
+/// the anti-replay counter — a directive channel is untrusted input
+/// by definition.
 unsafe fn pump_directives(s: &mut State) {
     let sys = &*s.syscalls;
     if s.directive_ready == 0 {

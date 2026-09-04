@@ -1,5 +1,5 @@
 //! Kernel-side decode + apply of the bounded binary device-graph plan
-//! (rfc_k8s.md §11: "the kernel consumes a validated bounded binary plan; it
+//! ("the kernel consumes a validated bounded binary plan; it
 //! does not parse Kubernetes objects, OCI manifests, or arbitrary YAML").
 //!
 //! This is the kernel half of the host composer's wire format
@@ -32,11 +32,10 @@ const PLAN_HEADER_LEN: usize = 8;
 /// +edge_base(2)+edge_count(2).
 const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
 /// Per-revocation record: an assignment record verbatim + grace_secs(2) +
-/// deadline_unix(8) (rfc_owner_drain_and_logs.md §3.2). The revocation section
-/// is present only when non-empty.
+/// deadline_unix(8). The revocation section is present only when
+/// non-empty.
 const REVOKE_REC_LEN: usize = ASSIGN_REC_LEN + 2 + 8;
-/// Per-lease record: slot(2) + generation(4) + protocol(1) + port(2)
-/// (rfc_endpoint_lease.md §5.1).
+/// Per-lease record: slot(2) + generation(4) + protocol(1) + port(2).
 const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
 /// Opens the lease section: an impossible revocation count, so the first u32
 /// of the tail discriminates sections deterministically (48-byte revocation
@@ -80,7 +79,7 @@ impl PlanAssignment {
 }
 
 /// One decoded revocation: a departing owner's last assignment plus its drain
-/// window (rfc_owner_drain_and_logs.md §3.2).
+/// window.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PlanRevocation {
     pub assignment: PlanAssignment,
@@ -97,7 +96,7 @@ impl PlanRevocation {
 }
 
 /// One granted endpoint lease: owner `(slot, generation)` may bind
-/// `(protocol, port)` — 1 = tcp, 2 = udp (rfc_endpoint_lease.md §5.1).
+/// `(protocol, port)` — 1 = tcp, 2 = udp.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PlanLease {
     pub slot: u16,
@@ -198,10 +197,10 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
     if bytes.len() < base_total {
         return Err(PlanError::Truncated);
     }
-    // Tail grammar (rfc_endpoint_lease.md §5.1): [rev_section] [lease_section],
-    // fixed order, each omitted when empty. The first u32 of the surplus
-    // discriminates: LEASE_SECTION_MARKER opens a lease section; a valid count
-    // opens the revocation section. Lengths validate, never discriminate.
+    // Tail grammar: [rev_section] [lease_section], fixed order, each omitted
+    // when empty. The first u32 of the surplus discriminates:
+    // LEASE_SECTION_MARKER opens a lease section; a valid count opens the
+    // revocation section. Lengths validate, never discriminate.
     let mut tail_cursor = assign_len;
     let tail_end = bytes.len() - PLAN_HEADER_LEN - 32;
     let mut rev_count = 0usize;
@@ -283,14 +282,14 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPlan, PlanError> {
             deadline_unix: be_u64(&r[ASSIGN_REC_LEN + 2..ASSIGN_REC_LEN + 10]),
         };
     }
-    // Semantic validation: framing + digest prove the bytes are intact, not that
-    // the plan is coherent. The kernel does not trust the composer's promise of
-    // unique slots / non-overlapping ranges — a corrupt or hostile plan is
-    // rejected here rather than applied (a partial apply would leave modules with
-    // stale handles or the system owner, silently disabling isolation).
-    // Validate assignments AND revocations under one rule set: a draining owner
-    // still occupies its slot and module range (rfc_owner_drain_and_logs.md
-    // §3.2), so revocations participate in the same duplicate/overlap checks.
+    // Semantic validation: framing + digest prove the bytes are intact, not
+    // that the plan is coherent. The kernel does not trust the composer's
+    // promise of unique slots / non-overlapping ranges — a corrupt or hostile
+    // plan is rejected here rather than applied (a partial apply would leave
+    // modules with stale handles or the system owner, silently disabling
+    // isolation). Validate assignments AND revocations under one rule set: a
+    // draining owner still occupies its slot and module range, so revocations
+    // participate in the same duplicate/overlap checks.
     let record = |i: usize| -> &PlanAssignment {
         if i < count {
             &assignments[i]
@@ -373,10 +372,10 @@ pub fn apply(plan: &DecodedPlan) -> usize {
             table.install(a.slot, a.generation, a.owner_uid, a.state_cap, a.buffer_cap)
         {
             installed += 1;
-            // Reset the owner's log ring iff this is a genuinely new tenant on the
-            // slot; a same-triple reinstall (every routine rebuild) keeps the ring
-            // and its seq counter (rfc_owner_drain_and_logs.md §4.3). The ring
-            // module is host-linux-gated (see kernel/mod.rs).
+            // Reset the owner's log ring iff this is a genuinely new tenant on
+            // the slot; a same-triple reinstall (every routine rebuild) keeps
+            // the ring and its seq counter. The ring module is
+            // host-linux-gated (see kernel/mod.rs).
             #[cfg(feature = "host-linux")]
             crate::kernel::workload::owner_log::install_slot(
                 a.slot as usize,
@@ -394,7 +393,7 @@ pub fn apply(plan: &DecodedPlan) -> usize {
 }
 
 // ============================================================================
-// Staged-plan delivery (rfc_k8s.md §11, §12 — node-agent stages a plan; the
+// Staged-plan delivery (node-agent stages a plan; the
 // platform applies it BEFORE instantiation so module_new sees tenant ownership,
 // and RE-applies the retained plan on every rebuild since prepare_graph resets
 // every module to the system owner)
@@ -415,7 +414,7 @@ static mut RETAINED_PLAN: Option<DecodedPlan> = None;
 
 /// Generation of the last successfully-applied plan (0 = none yet). Lets the
 /// platform's owner-status writer stamp which plan generation the live state
-/// it reports came from (rfc_k8s.md §17.2 join key).
+/// it reports came from.
 pub fn last_applied_generation() -> u64 {
     let p = &raw const LAST_APPLIED_GENERATION;
     // SAFETY: scheduler-thread read (same access class as apply_staged).
@@ -458,9 +457,9 @@ fn take_staged_plan() -> Option<(*const u8, usize)> {
 
 /// Copy the retained plan's revocations into `out`, returning the count. The
 /// platform uses this at boot to synthesize drain-timeout-by-restart terminal
-/// records for owners that were mid-drain when the previous process died
-/// (rfc_owner_drain_and_logs.md §3.6) — they are absent from the assignment
-/// section, so nothing re-instantiates them; the record is the only trace.
+/// records for owners that were mid-drain when the previous process died —
+/// they are absent from the assignment section, so nothing re-instantiates
+/// them; the record is the only trace.
 pub fn retained_revocations(out: &mut [PlanRevocation; MAX_PLAN_ASSIGNMENTS]) -> usize {
     let retained = &raw const RETAINED_PLAN;
     // SAFETY: scheduler-thread read.
@@ -475,12 +474,12 @@ pub fn retained_revocations(out: &mut [PlanRevocation; MAX_PLAN_ASSIGNMENTS]) ->
 }
 
 /// Bind-gate verdict for `(slot, generation, protocol, port)` against the
-/// retained plan's lease grants (rfc_endpoint_lease.md §5.3).
+/// retained plan's lease grants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseGate {
     /// No enforcement: no plan is retained, or the bind is an ephemeral port-0
     /// source. A retained plan that simply grants nothing still enforces — it
-    /// refuses undeclared nonzero binds (rfc_endpoint_lease.md §5.1).
+    /// refuses undeclared nonzero binds.
     Ungated,
     /// The bind matches a granted lease.
     Granted,
@@ -518,9 +517,9 @@ pub fn lease_gate(slot: u16, generation: u32, protocol: u8, port: u16) -> LeaseG
     }
 }
 
-/// One drain to arm: the platform converts `deadline_unix` to its own clock and
-/// drives quiescence/deadline against it (the kernel never reads wall clock —
-/// rfc_owner_drain_and_logs.md §3.6).
+/// One drain to arm: the platform converts `deadline_unix` to its own clock
+/// and drives quiescence/deadline against it (the kernel never reads wall
+/// clock).
 #[derive(Clone, Copy)]
 pub struct DrainArm {
     pub owner_uid: [u8; 16],
@@ -547,15 +546,14 @@ pub struct DrainDelta {
 }
 
 /// Attempt to apply the staged plan as a **pure-drain delta** — the one plan
-/// shape a removal generation produces (rfc_owner_drain_and_logs.md §3.4):
-/// every staged assignment is byte-identical to a retained one, every
-/// retained assignment either survives or moved verbatim into the staged
-/// revocation section, and every retained revocation whose owner is still
-/// installed is carried forward verbatim. Then no rebuild is needed:
-/// co-resident owners are
-/// untouched, and each newly revoked owner is flipped to `Draining` in place
-/// (admission closes; its modules keep stepping until the platform's drain
-/// driver frees it at quiescence or deadline).
+/// shape a removal generation produces: every staged assignment is
+/// byte-identical to a retained one, every retained assignment either
+/// survives or moved verbatim into the staged revocation section, and every
+/// retained revocation whose owner is still installed is carried forward
+/// verbatim. Then no rebuild is needed: co-resident owners are untouched,
+/// and each newly revoked owner is flipped to `Draining` in place (admission
+/// closes; its modules keep stepping until the platform's drain driver frees
+/// it at quiescence or deadline).
 ///
 /// Returns `Some(delta)` (possibly with `count == 0` drains when every
 /// revocation names an already-gone owner) after consuming the staged plan and

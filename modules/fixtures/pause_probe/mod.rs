@@ -1,5 +1,4 @@
-//! Owner-pause probe — resident-pod half of the metal PAUSE silicon AC
-//! (rfc_workload_lifecycle.md §3.2, P4).
+//! Owner-pause probe — resident-pod half of the metal PAUSE silicon AC.
 //!
 //! A self-driven counter that runs inside a resident pod (workload owner).
 //! Every `log_every` steps it logs `[pprobe] c=<count> ms=<dev_millis>`

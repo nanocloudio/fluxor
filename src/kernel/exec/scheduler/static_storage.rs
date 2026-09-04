@@ -200,7 +200,7 @@ impl ModulePorts {
 }
 
 /// Resolve a base-graph module's input-port channel by the module's config
-/// `name_hash` (`rfc_workload_backend_metal.md` §3.3 discovery). `prepare_graph`
+/// `name_hash`. `prepare_graph`
 /// places config module index N at scheduler slot N, so scanning
 /// `STATIC_CONFIG.modules` for the name_hash yields the slot whose port table we
 /// read. Used by the metal `workload` backend to find the shared ip module's

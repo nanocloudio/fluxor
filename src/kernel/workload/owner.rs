@@ -35,7 +35,7 @@ const _: () = assert!(
 const _: () = assert!(MAX_OWNERS <= u16::MAX as usize);
 
 /// A bounded runtime capability identifying one workload owner. Not persisted
-/// as identity — the owner UID is the durable identity (rfc_k8s.md §6.5).
+/// as identity — the owner UID is the durable identity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OwnerHandle {
     pub slot: u16,
@@ -44,7 +44,7 @@ pub struct OwnerHandle {
 
 /// The system owner. Platform drivers, the network/storage/telemetry
 /// substrate, the graph manager, OTA, and the node agent run as this owner and
-/// cannot be replaced by ordinary workload updates (rfc_k8s.md §6.4).
+/// cannot be replaced by ordinary workload updates.
 pub const OWNER_SYSTEM: OwnerHandle = OwnerHandle {
     slot: 0,
     generation: 0,
@@ -65,11 +65,11 @@ pub enum OwnerState {
     Active,
     Draining,
     Revoked,
-    /// Reversible quiesce (rfc_workload_lifecycle.md §3.2): admission is
-    /// closed (`authorize_admit` fails) and the scheduler skips the owner's
-    /// graphs, but held resources stay valid (`authorize_use` passes) so
-    /// `owner_resume` restores the exact pre-pause posture. Weaker than
-    /// `Draining` — no `module_drain`, no channel-empty requirement.
+    /// Reversible quiesce: admission is closed (`authorize_admit` fails)
+    /// and the scheduler skips the owner's graphs, but held resources stay
+    /// valid (`authorize_use` passes) so `owner_resume` restores the exact
+    /// pre-pause posture. Weaker than `Draining` — no `module_drain`, no
+    /// channel-empty requirement.
     Paused,
 }
 
@@ -144,9 +144,10 @@ impl OwnerTable {
     }
 
     /// Allocate the lowest free slot for `owner_uid`. The reuse generation is
-    /// bumped monotonically so a stale handle cannot match after reuse. Returns
-    /// `None` when every workload slot is occupied. The lowest-free-slot rule
-    /// is required by the deterministic-composition contract (rfc_k8s.md §11).
+    /// bumped monotonically so a stale handle cannot match after reuse.
+    /// Returns `None` when every workload slot is occupied. The
+    /// lowest-free-slot rule is required by the deterministic-composition
+    /// contract.
     pub fn alloc(&mut self, owner_uid: [u8; 16]) -> Option<OwnerHandle> {
         {
             use crate::abi::contracts::resource::POOL_OWNERS;
@@ -183,7 +184,7 @@ impl OwnerTable {
     }
 
     /// Install an owner at a specific `slot`/`generation` as dictated by a
-    /// composed plan (rfc_k8s.md §11 — the plan is authoritative for slot and
+    /// composed plan (the plan is authoritative for slot and
     /// generation, unlike [`alloc`](Self::alloc) which picks them). The owner is
     /// installed `Active`. Returns `None` for the system slot, an out-of-range
     /// slot, or a `generation` that would *decrease* the slot's reuse counter.
@@ -259,7 +260,7 @@ impl OwnerTable {
     }
 
     /// Resolve the live owner handle for a durable `owner_uid` — the bridge from
-    /// the persistent identity (the owner UID, rfc_k8s.md §6.5) to the runtime
+    /// the persistent identity (the owner UID) to the runtime
     /// capability. A provider admitting owner-scoped work (e.g. the `workload`
     /// host-process backend spawning a workload's container) references the
     /// plan-allocated owner this way rather than allocating one itself. Returns
@@ -286,9 +287,9 @@ impl OwnerTable {
     /// True when `h` may keep USING resources it already holds — established
     /// connections, held provider handles, committed queue slots. `Active`,
     /// `Draining`, and `Paused` qualify: a draining owner keeps serving until
-    /// revoked (rfc_owner_drain_and_logs.md §3.5), and a paused owner keeps
-    /// everything it holds — pause is reversible, so revoking use would turn
-    /// resume into a partial re-admission (rfc_workload_lifecycle.md §3.2).
+    /// revoked, and a paused owner keeps everything it holds — pause is
+    /// reversible, so revoking use would turn resume into a partial
+    /// re-admission.
     pub fn authorize_use(&self, h: OwnerHandle) -> bool {
         self.lookup(h)
             .map(|e| {
@@ -301,10 +302,10 @@ impl OwnerTable {
     }
 
     /// True when `h` may ADMIT new work — new allocation, open, accept, queue
-    /// grant, timer arm. Only `Active` qualifies: admission closes the moment a
-    /// drain begins, which is what lets in-flight work run dry
-    /// (rfc_owner_drain_and_logs.md §3.5). A `Paused` owner is likewise
-    /// admission-closed — the same §3.5 gate, reopened by `owner_resume`.
+    /// grant, timer arm. Only `Active` qualifies: admission closes the moment
+    /// a drain begins, which is what lets in-flight work run dry. A `Paused`
+    /// owner is likewise admission-closed — the same §3.5 gate, reopened by
+    /// `owner_resume`.
     pub fn authorize_admit(&self, h: OwnerHandle) -> bool {
         self.lookup(h)
             .map(|e| matches!(e.state, OwnerState::Active))
@@ -322,7 +323,7 @@ impl OwnerTable {
         }
     }
 
-    /// Move an owner into `Draining` (rfc_k8s.md §12.3).
+    /// Move an owner into `Draining`.
     pub fn begin_drain(&mut self, h: OwnerHandle) -> bool {
         self.set_state(h, OwnerState::Draining)
     }
@@ -347,9 +348,9 @@ impl OwnerTable {
 
     /// Free every non-system owner slot (generation counters preserved, so
     /// later installs still issue strictly higher generations). Used by the
-    /// plan-apply path: the composed plan is authoritative for residency
-    /// (rfc_k8s.md §11), so owners absent from the new plan are revoked here
-    /// before the plan's owners are installed.
+    /// plan-apply path: the composed plan is authoritative for residency,
+    /// so owners absent from the new plan are revoked here before the
+    /// plan's owners are installed.
     pub fn reset_workloads(&mut self) {
         for e in self.entries.iter_mut().skip(1) {
             e.state = OwnerState::Free;
@@ -360,7 +361,7 @@ impl OwnerTable {
 
     /// The entry at `slot`, regardless of state. `None` only for an
     /// out-of-range slot. Read-only view for status/telemetry aggregation
-    /// (rfc_k8s.md §18.2 — the owner-status surface walks resident slots).
+    /// (the owner-status surface walks resident slots).
     pub fn entry_at(&self, slot: usize) -> Option<&OwnerEntry> {
         self.entries.get(slot)
     }
@@ -468,8 +469,8 @@ impl Default for OwnerTable {
 }
 
 /// Cross-owner access predicate: a caller may touch a target resource when the
-/// target is system-owned or the same owner. Explicit cross-owner bindings
-/// (rfc_k8s.md §10.2, §14 invariant 6) are not modeled by this predicate.
+/// target is system-owned or the same owner. Explicit cross-owner bindings are
+/// not modeled by this predicate.
 ///
 /// On single-tenant builds this is a compile-time `true` with no instructions.
 #[cfg(feature = "multitenant")]

@@ -6,7 +6,7 @@
 // (`src/platform/wasm/object.rs`). It backs the STORAGE_OBJECT
 // contract's `HEAD` / `GET` / `RANGE_GET` / `CLOSE` opcodes with
 // blocking HTTP/1.1 requests so a Linux-hosted graph can demand-page
-// immutable assets by byte range — the Playload RFC §12.3 surface.
+// immutable assets by byte range.
 //
 // All windowing math (clamp-to-tail, HEAD-record encoding, `Range`
 // header formatting) is shared with the wasm provider through the

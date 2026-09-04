@@ -1,5 +1,5 @@
 // ============================================================================
-// Linux realization of the `workload` Tier-1 network fields (RFC §7)
+// Linux realization of the `workload` Tier-1 network fields
 // ============================================================================
 //
 // Mechanism behind `NET_ISO_OWN` + the network identity in the `workload`

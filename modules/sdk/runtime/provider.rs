@@ -268,8 +268,8 @@ unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
     (sys.provider_call)(-1, 0x0C50, buf.as_mut_ptr(), 4);
 }
 
-/// `StepEffect` codes for [`dev_report_step_effect`] (RFC adaptive_tick_extra
-/// §6.1). Mirrors `kernel_abi::step_effect` and the kernel's `step_effect`.
+/// `StepEffect` codes for [`dev_report_step_effect`]. Mirrors
+/// `kernel_abi::step_effect` and the kernel's `step_effect`.
 #[allow(
     dead_code,
     reason = "module SDK surface; not every module reports every variant"

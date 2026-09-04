@@ -55,8 +55,7 @@ static EVENT_SLOTS: [EventSlot; MAX_EVENTS] = [const { EventSlot::new() }; MAX_E
 static EVENT_WAKE_PENDING: [AtomicU64; MODULE_MASK_WORDS] =
     [const { AtomicU64::new(0) }; MODULE_MASK_WORDS];
 
-// ── Owner pause wake masking (rfc_workload_lifecycle.md §3.2 / P4;
-//    rfc_owner_drain_and_logs.md §3.6 per-owner wake masking) ─────────
+// ── Owner pause wake masking ─────────────────────────────────────────
 //
 // While an owner is paused its modules' wake sources are MASKED, not
 // dropped: a wake that would latch `EVENT_WAKE_PENDING` (event signal,
@@ -362,9 +361,9 @@ pub fn wake_pending_nonzero() -> bool {
 /// Non-clearing peek at the wake-pending bitmask, restricted to a set of
 /// modules (a domain's modules). True iff any module in `mask` has a pending
 /// event. The adaptive-tick pacer uses this so one domain's idle decision is
-/// not coupled to a sibling domain's wake (RFC adaptive_tick §5.1). Like
-/// `wake_pending_nonzero`, it does NOT consume the bits — the next
-/// `take_wake_pending` still observes them.
+/// not coupled to a sibling domain's wake. Like `wake_pending_nonzero`, it
+/// does NOT consume the bits — the next `take_wake_pending` still observes
+/// them.
 #[inline]
 pub fn wake_pending_in_mask(mask: &ModuleMask) -> bool {
     let mut words = [0u64; MODULE_MASK_WORDS];
@@ -380,7 +379,7 @@ pub fn wake_pending_in_mask(mask: &ModuleMask) -> bool {
 /// - wake-on-write (`channel::wake_consumer_if_flagged`) latches here and
 ///   rings `wake_scheduler()` itself, so a flagged write cuts an idle
 ///   sleep short;
-/// - the woken-step budget bound (RFC idle_skip_wake §5) restores a
+/// - the woken-step budget bound restores a
 ///   deferred module's bit — already consumed by the caller's
 ///   `take_wake_pending` — so the wake is not lost, and deliberately does
 ///   NOT ring the doorbell: the deferral exists because the domain is
@@ -411,10 +410,10 @@ pub fn latch_module_wake(module_idx: usize) -> bool {
 }
 
 /// Test-only: latch a module's wake bit directly, as if an event owned by it
-/// fired. Lets the multi-graph runner tests exercise the §6.5 "woken idle graph"
-/// resumption path (RFC adaptive_tick_extra §7.4) without registering a real
-/// event. Mirrors the wake-latch `event_signal` performs; a later
-/// `take_wake_pending` consumes it identically.
+/// fired. Lets the multi-graph runner tests exercise the §6.5 "woken idle
+/// graph" resumption path without registering a real event. Mirrors the
+/// wake-latch `event_signal` performs; a later `take_wake_pending` consumes it
+/// identically.
 pub fn signal_module_wake_for_test(module_idx: usize) {
     relatch_module_wake(module_idx);
 }

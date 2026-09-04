@@ -122,7 +122,7 @@ pub mod contracts {
     pub mod telemetry {
         include!("contracts/telemetry.rs");
     }
-    /// Resource-ledger pool registry (`rfc_resource_model.md` §6.1).
+    /// Resource-ledger pool registry.
     pub mod resource {
         include!("contracts/resource.rs");
     }
@@ -166,8 +166,7 @@ pub mod contracts {
     pub mod key_vault {
         include!("contracts/key_vault.rs");
     }
-    /// Platform-neutral isolated-workload surface (contract class `0x1A`);
-    /// see `.context/fluxor_nanocloud.md`.
+    /// Platform-neutral isolated-workload surface (contract class `0x1A`).
     pub mod workload {
         include!("contracts/workload.rs");
     }

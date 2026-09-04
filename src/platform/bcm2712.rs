@@ -522,8 +522,7 @@ fn instantiate_and_activate(
     // (step_fn, state_ptr) pair from each slot and arms the
     // platform's polled-timer ISR (`bcm_isr_tier_poll`). Cooperative
     // domains are untouched; the cooperative scheduler already
-    // skips ISR-tier modules via `step_one_module`. See
-    // `.context/rfc_isr_tier_surface.md` §D5 + §D6.
+    // skips ISR-tier modules via `step_one_module`.
     let isr_registered = scheduler::register_isr_tier_modules_from_graph();
     if isr_registered > 0 {
         uart_puts(b"[isr] Tier 1b admitted ");
@@ -670,16 +669,15 @@ fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
         }
 
         sched.edges[e].consumer_channel = in_ch;
-        // Delivery-side wake (RFC idle_skip_wake §4): for a `wake: true`
-        // cross-domain edge, bind the CONSUMER-local channel — the
-        // consumer-side pump delivers into it via `channel_write`, so the
-        // existing wake hook fires at the first moment the consumer could
-        // actually read the bytes. The producer-side channel is left
-        // unbound (a write-time wake is guaranteed-spurious: the
-        // consumer's domain steps before it pumps inbound). Wake service
-        // latency is bounded by the consumer domain's tick — cutting WFI
-        // mid-sleep needs the targeted SGI doorbell, gated on the
-        // rfc_adaptive_tick §5.4 WFI-wake mitigation.
+        // Delivery-side wake: for a `wake: true` cross-domain edge, bind
+        // the CONSUMER-local channel — the consumer-side pump delivers
+        // into it via `channel_write`, so the existing wake hook fires at
+        // the first moment the consumer could actually read the bytes.
+        // The producer-side channel is left unbound (a write-time wake is
+        // guaranteed-spurious: the consumer's domain steps before it
+        // pumps inbound). Wake service latency is bounded by the consumer
+        // domain's tick — cutting WFI mid-sleep needs the targeted SGI
+        // doorbell, gated on the WFI-wake mitigation.
         if edge_snapshot.wake_on_write {
             fluxor::kernel::ipc::channel::channel_set_wake_module(
                 in_ch,
@@ -870,10 +868,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     log::set_max_level(log::LevelFilter::Info);
 
     // Force the active cooler to full so sustained-load rig runs aren't
-    // confounded by thermal throttling (RFC adaptive_tick AC7). Drives the RP1
-    // PWM channel the boot firmware uses for the Pi 5 fan; the readback is
-    // logged so the rig can confirm the writes took. No-op on QEMU. Placed after
-    // logger init so the report reaches the UDP telemetry stream.
+    // confounded by thermal throttling. Drives the RP1 PWM channel the boot
+    // firmware uses for the Pi 5 fan; the readback is logged so the rig can
+    // confirm the writes took. No-op on QEMU. Placed after logger init so the
+    // report reaches the UDP telemetry stream.
     rp1::cooling_full_on();
 
     // PCIe1 bring-up: stages 1 + 2a + 2b (reset/RESCAL + RC-wide regs
@@ -1029,10 +1027,10 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(tick_us);
     uart_puts(b"\r\n");
 
-    // Measured-option opt-in (RFC adaptive_tick §5.4 / §7.1a): the SGI wake
-    // doorbell and absolute `cntp_cval` re-arm ship OFF by default and stay
-    // off in production. This build-time feature flips them on at boot so the
-    // rig can validate them on silicon without disturbing the default path.
+    // Measured-option opt-in: the SGI wake doorbell and absolute `cntp_cval`
+    // re-arm ship OFF by default and stay off in production. This build-time
+    // feature flips them on at boot so the rig can validate them on silicon
+    // without disturbing the default path.
     #[cfg(feature = "adaptive_deferred_rig")]
     {
         set_wake_doorbell(true);
@@ -1119,11 +1117,11 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     fluxor::kernel::exec::scheduler::log_arena_summary();
 
-    // Admit resident workloads declared in the config's `[FXPD]` section (RFC
-    // adaptive_tick_extra §7 — `workloads:` / `combine <two-graph.yaml>`) as workload
-    // owners via `apply_add` + finalize. Boot-time, before the run loops start.
-    // No-op without a workload section; the multi-graph runner multiplexes the workloads
-    // with the base graph on the shared cooperative runner.
+    // Admit resident workloads declared in the config's `[FXPD]` section
+    // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via
+    // `apply_add` + finalize. Boot-time, before the run loops start. No-op
+    // without a workload section; the multi-graph runner multiplexes the
+    // workloads with the base graph on the shared cooperative runner.
     fluxor::kernel::exec::scheduler::admit_resident_workloads_from_config();
 
     // Signal init complete — secondary cores can start
@@ -1141,7 +1139,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
 
     // Every counted non-primary domain is now on its way into `run_domain_loop`
     // (where it honours `park_if_requested`), so a runtime peer-core quiesce can
-    // make progress. This gates the WS-D live-splice's quiesce
+    // make progress. This gates the live-splice's quiesce
     // (`scheduler::live::apply_add`/`free_owner`): before this point the splice
     // runs single-threaded (boot admission), after it under a real quiesce.
     multicore::mark_smp_online();
@@ -1422,10 +1420,10 @@ fn run_domain_loop(domain_id: usize) -> ! {
                         log::info!("[PANIC] core={pc} at {file}:{line}");
                     }
                 }
-                // Arm-after-step for Tier 1a too (RFC adaptive_tick §5.5 — the
-                // pacer governs Tier 0 AND Tier 1a). A Tier-1a domain with
-                // adaptive_flags advances its cadence here; byte-identical when
-                // adaptive_flags==0 (the pacer returns the fixed domain tick).
+                // Arm-after-step for Tier 1a too (the pacer governs Tier 0 AND
+                // Tier 1a). A Tier-1a domain with adaptive_flags advances its
+                // cadence here; byte-identical when adaptive_flags==0 (the
+                // pacer returns the fixed domain tick).
                 arm_next_deadline(domain_id, core_id);
             }
         }
@@ -1608,16 +1606,15 @@ fn run_domain_loop(domain_id: usize) -> ! {
 /// (same `step_one_module` body single-domain platforms use), so
 /// every BCM-domain step honours period gating, upstream-ready
 /// gating, `Done` finalisation, the fault state machine, and the
-/// `Burst` loop identically to RP/Linux/WASM. See
-/// `.context/scheduler_domain_api.md`.
+/// `Burst` loop identically to RP/Linux/WASM.
 fn domain_step_all(domain_id: usize) {
     // SAFETY: per-domain pump runs on the domain's owning core.
     let sched = unsafe { scheduler::sched_mut() };
-    // Multi-graph runtime (RFC adaptive_tick_extra §7): with more than one
-    // resident graph in this domain, steps each owner independently, skips idle
-    // owners, and returns the §7.2 merged deadline. Byte-identical to
-    // `step_domain_modules` + `pacer_next_deadline_us(domain)` with one resident
-    // graph. The deadline is stashed for the arm-after-step write below.
+    // Multi-graph runtime: with more than one resident graph in this domain,
+    // steps each owner independently, skips idle owners, and returns the §7.2
+    // merged deadline. Byte-identical to `step_domain_modules` +
+    // `pacer_next_deadline_us(domain)` with one resident graph. The deadline
+    // is stashed for the arm-after-step write below.
     let (_result, deadline_us) =
         scheduler::step_resident_graphs_domain(&mut sched.modules, domain_id);
     if domain_id < multicore::MAX_DOMAINS {
@@ -1824,12 +1821,12 @@ fn secondary_core_main(domain_id: usize) -> ! {
     uart_puts(b"\r\n");
     log::info!("[core{core_id}] started, domain={domain_id}");
 
-    // Set up GIC CPU interface + per-domain timer rate for this core.
-    // Tier 1a may run faster than the global tick; a Tier-0 lane domain may
-    // run slower. Storing the domain's tick into THIS core's deadline slot is
+    // Set up GIC CPU interface + per-domain timer rate for this core. Tier 1a
+    // may run faster than the global tick; a Tier-0 lane domain may run
+    // slower. Storing the domain's tick into THIS core's deadline slot is
     // what makes the rate stick: the TIMER_PPI handler reloads from the
     // per-core slot, so the rate is no longer clobbered by a shared global on
-    // the first IRQ (RFC adaptive_tick §5.5).
+    // the first IRQ.
     let domain_tick = scheduler::domain_tick_us(domain_id);
     let freq = timer::timer_freq();
     let ticks_for_domain = if freq > 0 {
@@ -1932,14 +1929,14 @@ fn bcm_restore_interrupts(saved: u32) {
     }
 }
 
-/// WFI wake-doorbell toggle (RFC adaptive_tick §5.4 mitigation 3). Default
-/// OFF: the wake path emits only `SEV`, paired with the `tick_max_us` idle
-/// clamp (mitigation 1). When ON, the wake path
-/// also broadcasts a GIC SGI so a WFI-parked Tier-0/1a core wakes immediately
-/// rather than waiting for the backstop — at the cost of an MMIO write on the
-/// hot `event_signal` / cross-domain SPSC-push paths. This is a measured
-/// option: enable only if AC1/AC2 show the clamp's first-request-after-idle
-/// latency is insufficient (RFC §5.4: "demoted to a measured option").
+/// WFI wake-doorbell toggle. Default OFF: the wake path emits only `SEV`,
+/// paired with the `tick_max_us` idle clamp (mitigation 1). When ON, the wake
+/// path also broadcasts a GIC SGI so a WFI-parked Tier-0/1a core wakes
+/// immediately rather than waiting for the backstop — at the cost of an MMIO
+/// write on the hot `event_signal` / cross-domain SPSC-push paths. This is a
+/// measured option: enable only if AC1/AC2 show the clamp's
+/// first-request-after-idle latency is insufficient ("demoted to a measured
+/// option").
 static WAKE_DOORBELL: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable the §5.4 SGI wake doorbell at runtime (default off).
@@ -1976,13 +1973,13 @@ fn bcm_wake_scheduler() {
     wake_doorbell();
 }
 
-/// Portable `sleep_until` (RFC adaptive_tick §5.5 Option B). The per-core
-/// periodic timer (the §5.1 idle backstop, ≤ `tick_max_us`) is already armed,
-/// and any bound IRQ — plus the §5.4 wake doorbell SGI — breaks WFI. So a
-/// single WFI blocks until the next wake without programming a separate
-/// one-shot (which would race the IRQ-handler's per-core deadline reload).
-/// Returns UNKNOWN: WFI cannot report its wake source, so the caller must
-/// re-check its work/deadline state.
+/// Portable `sleep_until`. The per-core periodic timer (the §5.1 idle
+/// backstop, ≤ `tick_max_us`) is already armed, and any bound IRQ — plus the
+/// §5.4 wake doorbell SGI — breaks WFI. So a single WFI blocks until the next
+/// wake without programming a separate one-shot (which would race the
+/// IRQ-handler's per-core deadline reload). Returns UNKNOWN: WFI cannot
+/// report its wake source, so the caller must re-check its work/deadline
+/// state.
 fn bcm_sleep_until(_deadline_us: u64) -> u32 {
     // SAFETY: WFI is a hint that parks the core until an unmasked IRQ.
     #[cfg(target_arch = "aarch64")]
@@ -2016,8 +2013,8 @@ fn bcm_now_micros() -> u64 {
     counter.wrapping_mul(1_000_000) / freq
 }
 fn bcm_tick_count() -> u32 {
-    // RFC adaptive_tick §7.6 (D8 rule 8): back the HAL `tick_count`
-    // with wall-clock milliseconds (CNTPCT-derived) instead of `DBG_TICK`. The
+    // Back the HAL `tick_count` with wall-clock milliseconds
+    // (CNTPCT-derived) instead of `DBG_TICK`. The
     // identity "1 tick == 1 ms" holds only at the fixed 1 ms default; under
     // mechanism (b) the period varies and under mechanism (a)/idle `DBG_TICK`
     // stops advancing, so a `DBG_TICK`-backed `tick_count` returns wrong
@@ -2327,11 +2324,12 @@ fn bcm_isr_tier_poll() {
 fn bcm_init_providers() {
     // BCM2712 system extension for MMIO and NIC opcodes
     fluxor::kernel::module::syscalls::register_system_extension(bcm_system_extension_dispatch);
-    // Metal fmod-graph `workload` (0x1A) backend (rfc_workload_backend_metal.md
-    // P1): stages a workload as an owned module subgraph via `apply_add`/owner/lease.
-    // Gated exactly like the Linux install — `requires_contract = "workload"` +
-    // `platform_raw` in the caller's manifest. The core logic is kernel-generic
-    // (`kernel::workload::workload_graph`); this is the metal registration that installs it.
+    // Metal fmod-graph `workload` (0x1A) backend: stages a workload as an
+    // owned module subgraph via `apply_add`/owner/lease. Gated exactly like
+    // the Linux install — `requires_contract = "workload"` + `platform_raw` in
+    // the caller's manifest. The core logic is kernel-generic
+    // (`kernel::workload::workload_graph`); this is the metal registration
+    // that installs it.
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::WORKLOAD, bcm_workload_dispatch);
@@ -2345,10 +2343,10 @@ fn bcm_init_providers() {
 }
 
 /// Metal `workload` (0x1A) provider dispatch — the thin bcm registration hook.
-/// Delegates to the kernel-generic backend (`kernel::workload::workload_graph`), which runs
-/// on the primary domain / core 0 (the system graph's domain) so the runtime
-/// `apply_add`/`free_owner` it drives honor the primary-only quiesce invariant
-/// (RFC §3.2 / P0).
+/// Delegates to the kernel-generic backend
+/// (`kernel::workload::workload_graph`), which runs on the primary domain /
+/// core 0 (the system graph's domain) so the runtime `apply_add`/`free_owner`
+/// it drives honor the primary-only quiesce invariant.
 ///
 /// # Safety
 /// Scheduler-thread dispatch only; see `workload_graph::workload_dispatch`.

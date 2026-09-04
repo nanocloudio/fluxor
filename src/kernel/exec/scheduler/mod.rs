@@ -117,8 +117,7 @@ const MAX_BURST_STEPS: usize = 16384;
 /// than a tick count: a fixed tick window silently shrinks/grows the
 /// real coincidence window the moment mechanism (b) varies the tick
 /// period, and stalls entirely under mechanism (a) idle-sleep — a
-/// correctness regression for this safety decision (RFC adaptive_tick
-/// §7.6 remedy iii).
+/// correctness regression for this safety decision.
 const QUARANTINE_WINDOW_MS: u64 = 100;
 
 /// Hard kernel ceiling on `Draining` phase duration, in scheduler
@@ -138,7 +137,7 @@ const QUARANTINE_WINDOW_MS: u64 = 100;
 /// rather than a tick count: under mechanism (b) the tick period
 /// varies, so a 30 000-tick ceiling would not map to 30 s, and under
 /// mechanism (a) the tick stops advancing while a hung module holds
-/// the graph — the ceiling would never fire (RFC adaptive_tick §7.6).
+/// the graph — the ceiling would never fire.
 const MAX_DRAIN_MS: u64 = 30_000;
 
 /// Maximum number of execution domains.
@@ -169,8 +168,6 @@ pub const MAX_PRE_TICK_PER_DOMAIN: usize = 4;
 /// the regular `domain_exec_order` rotation; this cap prevents
 /// cumulative pre-tick work from starving the cooperative loop.
 /// At `tick_us = 100`, 5 µs leaves >99 µs for Tier 0/1a modules.
-/// See `.context/rfc_isr_tier_surface.md` §D8 for the budget
-/// rationale.
 pub const MAX_PRE_TICK_BUDGET_US: u32 = 5;
 
 /// Describes a connection between two module ports.
@@ -218,23 +215,23 @@ pub struct Edge {
     /// Rate class: 0=control, 1=audio, 2=video, 3=bulk, 4=transaction.
     /// Drives MODULE_FLOW_BUDGET grants.
     pub rate_class: u8,
-    /// `wake: true` on the wiring entry (RFC idle_skip_wake §4
-    /// wake-on-write): a successful write on this edge latches the
-    /// consumer's event-wake bit and rings the scheduler doorbell.
-    /// Wired into the channel slot's `wake_module` by `prepare_graph`
-    /// for same-domain direct edges; cross-domain edges are bound to
-    /// the consumer-local delivery channel by the platform's
-    /// cross-domain bridging instead (delivery-side wake).
+    /// `wake: true` on the wiring entry: a successful write on this
+    /// edge latches the consumer's event-wake bit and rings the
+    /// scheduler doorbell. Wired into the channel slot's
+    /// `wake_module` by `prepare_graph` for same-domain direct edges;
+    /// cross-domain edges are bound to the consumer-local delivery
+    /// channel by the platform's cross-domain bridging instead
+    /// (delivery-side wake).
     pub wake_on_write: bool,
-    /// This edge references a **pre-existing shared channel** it neither opened
-    /// nor owns — an attachable-lane merge's spare input lane
-    /// (`rfc_workload_backend_metal.md` §7 P4). `channel` is pre-assigned to
-    /// that spare-lane id; `open_channels`/`close_channels` skip it (they must
-    /// not open a fresh ring, nor close a channel a boot merge caches) and
-    /// `free_owner` never closes it, so tearing the attaching workload down just
-    /// frees the lane (edge removed ⇒ `channel_producer_owner` reverts to
-    /// system) without disturbing the merge. `false` for every normal edge, so
-    /// the whole graph is byte-identical when no lane is attached.
+    /// This edge references a **pre-existing shared channel** it neither
+    /// opened nor owns — an attachable-lane merge's spare input lane.
+    /// `channel` is pre-assigned to that spare-lane id;
+    /// `open_channels`/`close_channels` skip it (they must not open a fresh
+    /// ring, nor close a channel a boot merge caches) and `free_owner` never
+    /// closes it, so tearing the attaching workload down just frees the lane
+    /// (edge removed ⇒ `channel_producer_owner` reverts to system) without
+    /// disturbing the merge. `false` for every normal edge, so the whole graph
+    /// is byte-identical when no lane is attached.
     pub shared_channel: bool,
 }
 
@@ -405,10 +402,10 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
     let mut count = 0;
     for edge in edges.iter_mut() {
         // Attachable-lane edge: `channel` is a pre-existing shared spare lane
-        // (an attachable-lane merge cached it at boot). Never open a fresh ring
-        // for it — the producer must write into the lane the merge already reads
-        // (`rfc_workload_backend_metal.md` §7 P4). No boot edge sets this, so the
-        // base-graph path is byte-identical.
+        // (an attachable-lane merge cached it at boot). Never open a fresh
+        // ring for it — the producer must write into the lane the merge
+        // already reads. No boot edge sets this, so the base-graph path is
+        // byte-identical.
         if edge.shared_channel {
             continue;
         }
@@ -594,9 +591,9 @@ pub fn validate_buffer_groups(edges: &[Edge]) -> bool {
 pub fn close_channels(edges: &[Edge]) {
     for edge in edges {
         // Never close a pre-existing shared spare lane — an attachable-lane
-        // merge caches it (`rfc_workload_backend_metal.md` §7 P4); closing it
-        // would strand the merge on a dead handle. Detaching a workload just
-        // drops the edge, reverting the lane to producer-less/free.
+        // merge caches it; closing it would strand the merge on a dead
+        // handle. Detaching a workload just drops the edge, reverting the
+        // lane to producer-less/free.
         if edge.shared_channel {
             continue;
         }
@@ -727,9 +724,8 @@ impl NameArena {
 pub mod module_types;
 pub use module_types::{BuiltInModule, DummyModule, MergeModule, ModuleSlot, TeeModule};
 
-/// WS-D-min: live graph mutation (add owner / free owner). Multi-tenant only —
-/// bare-metal single-tenant targets compile it out at zero cost. See
-/// `.context/ws_d_min.md`.
+/// Live graph mutation (add owner / free owner). Multi-tenant only —
+/// bare-metal single-tenant targets compile it out at zero cost.
 #[cfg(feature = "multitenant")]
 pub mod live;
 #[cfg(feature = "multitenant")]

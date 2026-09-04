@@ -29,7 +29,7 @@ pub(crate) fn enforce_drain_timeout(
     // Wall-clock ceiling: a tick-counted `MAX_DRAIN_TICKS` would no
     // longer mean 30 s once mechanism (b) varies the period, and a hung
     // module under mechanism (a) freezes the tick so the ceiling could
-    // never fire (RFC adaptive_tick §7.6 remedy iii).
+    // never fire.
     let now_ms = crate::kernel::sys::hal::now_millis();
     if start == u64::MAX || now_ms.wrapping_sub(start) <= MAX_DRAIN_MS {
         return false;
@@ -128,7 +128,7 @@ pub(crate) fn apply_quarantine(
     module_idx: usize,
     active_count: &mut usize,
 ) {
-    // Wall-clock window decision (RFC §7.6 iii): a tick-counted window
+    // Wall-clock window decision: a tick-counted window
     // re-scales under variable pacing and stalls under idle-sleep, so
     // the co-incidence test reads `last_fault_ms` against `now_millis()`.
     let now_ms = crate::kernel::sys::hal::now_millis();
@@ -390,8 +390,7 @@ pub(crate) fn handle_mpu_fault(
 ///
 /// Modules whose invariants do not survive "saw faulted state and got
 /// re-stepped" should use `FaultPolicy::Skip` and rely on the operator to
-/// drain+reload via the reconfigure module
-/// (`.context/rfc_graph_reconfigure.md`).
+/// drain+reload via the reconfigure module.
 pub(crate) fn handle_module_restart(
     sched: &mut SchedulerState,
     modules: &mut [ModuleSlot; MAX_MODULES],
@@ -488,17 +487,16 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         return StepResult::Done;
     }
 
-    // Crash-info one-shot: ~CRASH_CHECK_DELAY_MS after boot (by when USB serial
-    // is reliably connected), check the .uninit CRASH_DATA RAM that a HardFault
-    // handler may have left behind from the previous run, and clear the marker
-    // so it doesn't repeat. Gated on wall-clock + a one-shot latch rather than a
-    // `30_000_000 / tick_us` tick threshold: the tick form mis-scales when
-    // mechanism (b) varies the period, and under mechanism (a) idle-sleep the
-    // threshold tick may never be reached (DBG_TICK stalls) — a missed
-    // one-shot-correctness read (RFC adaptive_tick §7.6). The latch guarantees
-    // it fires exactly once per boot regardless of pass count. The `[sched]
-    // alive` log itself is emitted by the platform's outer loop via
-    // `maybe_emit_alive`.
+    // Crash-info one-shot: ~CRASH_CHECK_DELAY_MS after boot (by when USB
+    // serial is reliably connected), check the .uninit CRASH_DATA RAM that a
+    // HardFault handler may have left behind from the previous run, and clear
+    // the marker so it doesn't repeat. Gated on wall-clock + a one-shot latch
+    // rather than a `30_000_000 / tick_us` tick threshold: the tick form
+    // mis-scales when mechanism (b) varies the period, and under mechanism (a)
+    // idle-sleep the threshold tick may never be reached (DBG_TICK stalls) — a
+    // missed one-shot-correctness read. The latch guarantees it fires exactly
+    // once per boot regardless of pass count. The `[sched] alive` log itself
+    // is emitted by the platform's outer loop via `maybe_emit_alive`.
     if !CRASH_CHECKED.load(Ordering::Relaxed)
         && crate::kernel::sys::hal::now_millis() >= CRASH_CHECK_DELAY_MS
     {
@@ -578,7 +576,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // Step modules in topological order so producers run before
     // consumers. The per-module step body is in `step_one_module`
     // so the domain-scoped `step_domain_modules` can reuse the same
-    // semantics — see `.context/scheduler_domain_api.md`.
+    // semantics.
     //
     // When a previous pass tripped a budget overrun, the start of
     // `exec_order` is rotated by `exec_order_offset`. Without the
@@ -613,8 +611,8 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     for b in PACER_BURST_TICK.iter() {
         b.store(false, Ordering::Relaxed);
     }
-    // §6 work signal (RFC adaptive_tick_extra): reset on the same per-tick
-    // cadence as the burst accumulator.
+    // §6 work signal: reset on the same per-tick cadence as the burst
+    // accumulator.
     for b in PACER_WORK_TICK.iter() {
         b.store(false, Ordering::Relaxed);
     }
@@ -730,8 +728,8 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
 /// step-guard arm/disarm, step-time recording.
 ///
 /// Returns `StepResult::Done` when every active module across the
-/// whole graph is finalised (the active_count is global to v1; see
-/// `.context/scheduler_domain_api.md`). Sibling domains can keep
+/// whole graph is finalised (the active_count is global). Sibling
+/// domains can keep
 /// stepping independently; callers should decide global shutdown
 /// based on every domain returning `Done`.
 ///
@@ -800,18 +798,18 @@ pub(crate) static PACER_BURST_TICK: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
 /// Per-domain "a module reported useful work this outer tick" — the §6 work
-/// signal (RFC adaptive_tick_extra). Set by the `REPORT_STEP_EFFECT` syscall
-/// when a module reports `WorkDone`/`RunnableBacklog`/`Burst`; reset once per
-/// outer tick alongside `PACER_BURST_TICK`. Read by `pacer_next_deadline_us` so
-/// a graph that does useful work WITHOUT returning `StepOutcome::Burst` (e.g.
-/// the IP forwarding path, which avoids Burst to not starve the NIC ring) still
-/// keeps the pacer hot. This heats the pacer ONLY — it never authorises the
-/// immediate same-module re-step, which remains driven by the `Burst` return.
+/// signal. Set by the `REPORT_STEP_EFFECT` syscall when a module reports
+/// `WorkDone`/`RunnableBacklog`/`Burst`; reset once per outer tick alongside
+/// `PACER_BURST_TICK`. Read by `pacer_next_deadline_us` so a graph that does
+/// useful work WITHOUT returning `StepOutcome::Burst` (e.g. the IP forwarding
+/// path, which avoids Burst to not starve the NIC ring) still keeps the pacer
+/// hot. This heats the pacer ONLY — it never authorises the immediate
+/// same-module re-step, which remains driven by the `Burst` return.
 pub(crate) static PACER_WORK_TICK: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
-/// `StepEffect` codes reported via `REPORT_STEP_EFFECT` (RFC
-/// adaptive_tick_extra §6.1). Values are wire-stable (module SDK ↔ kernel).
+/// `StepEffect` codes reported via `REPORT_STEP_EFFECT`. Values are
+/// wire-stable (module SDK ↔ kernel).
 pub mod step_effect {
     /// No useful work; no known runnable backlog.
     pub const IDLE: u8 = 0;
@@ -827,11 +825,11 @@ pub mod step_effect {
     pub const BURST: u8 = 4;
 }
 
-/// Record a module's `StepEffect` for the current outer tick (RFC
-/// adaptive_tick_extra §6.1). `WorkDone`/`RunnableBacklog`/`Burst` mark the
-/// module's domain busy for the pacer; `Idle`/`Waiting` do nothing (a blocked
-/// module must not pin the pacer hot). Called from the `REPORT_STEP_EFFECT`
-/// syscall handler with the calling module's index.
+/// Record a module's `StepEffect` for the current outer tick.
+/// `WorkDone`/`RunnableBacklog`/`Burst` mark the module's domain busy for the
+/// pacer; `Idle`/`Waiting` do nothing (a blocked module must not pin the
+/// pacer hot). Called from the `REPORT_STEP_EFFECT` syscall handler with the
+/// calling module's index.
 pub fn report_step_effect(module_idx: usize, effect: u8) {
     if module_idx >= MAX_MODULES {
         return;

@@ -153,11 +153,11 @@ pub struct SyscallTable {
     /// as an opaque buffer reference, not a byte stream); peek
     /// returns `EINVAL` on those.
     pub channel_peek: unsafe extern "C" fn(handle: i32, buf: *mut u8, len: usize) -> i32,
-    /// Producer-side telemetry enabled gate (`rfc_observability_surface.md`
-    /// §5.1). Points at a kernel-published `u32` that is non-zero when at least
-    /// one telemetry consumer is subscribed. The `dev_telemetry_*` helpers read
-    /// it (a plain single-word load, no trap) before building a record, so
-    /// instrumentation is zero-cost when nothing is collecting.
+    /// Producer-side telemetry enabled gate. Points at a kernel-published
+    /// `u32` that is non-zero when at least one telemetry consumer is
+    /// subscribed. The `dev_telemetry_*` helpers read it (a plain single-word
+    /// load, no trap) before building a record, so instrumentation is
+    /// zero-cost when nothing is collecting.
     ///
     /// Null means "cannot check", NOT "disabled": a table without the word
     /// (the wasm host, an isolated module whose protection domain does not map
@@ -598,16 +598,16 @@ pub const MODULE_INSTANCE_PARAMS: u32 = 0x0C43;
 /// base-graph / host-owned module — which is the legitimate "host / wildcard"
 /// owner_tag, not an error.
 ///
-/// This is the self-identity read behind metal owner-scoped binds
-/// (`rfc_workload_backend_metal.md` §3.4 / P3a, `rfc_net_identity_metal`
-/// §3.4). `apply_add` stamps every module of a `net=own` workload with its
-/// owner (`set_module_owner`, post-`owners.alloc`), so a bind-emitting module
-/// (http, a DG binder) reads its owner slot here and appends it as the
-/// trailing `owner_tag` on `NET_CMD_BIND` / `DG_CMD_BIND` — the field the ip
-/// module's P2 admission resolves to the workload's owned address. Ungated
-/// self-query (same permission class as `SELF_INDEX` / `MODULE_INSTANCE_PARAMS`);
-/// a module can only ever read its OWN owner, never another's. Resolves the
-/// gap the ip module flagged ("the module syscall ABI exposes no owner query").
+/// This is the self-identity read behind metal owner-scoped binds. `apply_add`
+/// stamps every module of a `net=own` workload with its owner
+/// (`set_module_owner`, post-`owners.alloc`), so a bind-emitting module (http,
+/// a DG binder) reads its owner slot here and appends it as the trailing
+/// `owner_tag` on `NET_CMD_BIND` / `DG_CMD_BIND` — the field the ip module's
+/// bind admission resolves to the workload's owned address. Ungated
+/// self-query
+/// (same permission class as `SELF_INDEX` / `MODULE_INSTANCE_PARAMS`); a
+/// module can only ever read its OWN owner, never another's. Without it the
+/// module syscall ABI exposes no way to learn the calling owner at all.
 pub const OWNER_TAG: u32 = 0x0C4B;
 
 /// Register the CALLING module as the node's net-identity provider (the

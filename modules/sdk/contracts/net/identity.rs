@@ -2,8 +2,6 @@
 //
 // Layer: contracts/net (public, stable).
 //
-// See rfc_net_identity_metal.md §3 and rfc_workload_backend_metal.md §3.3.
-//
 // The control-plane contract by which a **workload backend** installs and
 // removes a workload's network identity (a secondary local address) on the
 // node's shared **net-identity provider** — the foundation module that owns the
