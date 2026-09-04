@@ -224,6 +224,21 @@ struct StackModule {
     /// `type` falls back to `name` at config-generation time.
     #[serde(default, rename = "type")]
     type_name: Option<String>,
+    /// `[[variant]]` selection for the injected instance, e.g. the
+    /// otlp-http export's `http` client asking for the `exchange` build.
+    #[serde(default)]
+    variant: Option<String>,
+    /// The stack needs its OWN instance of this type and cannot be
+    /// satisfied by one the graph already carries — the default type-dedup
+    /// (below) exists for infrastructure singletons like `ip`, and would
+    /// otherwise SILENTLY skip this module and drop its wiring. With this
+    /// set, a type collision is a hard config error naming the conflict,
+    /// never a silent skip: fail-loud is the whole point (rfc
+    /// observability_surface §12.7 — a graph that already serves `http`
+    /// cannot also carry the exchange-variant client, because one image
+    /// carries one build of a type).
+    #[serde(default)]
+    require_distinct: bool,
     #[serde(default)]
     params: HashMap<String, String>,
 }
@@ -339,7 +354,62 @@ pub fn expand_platform_stacks(
         obj.remove("platform");
     }
 
+    // ── Digest injection: a graph that carries the `otel` export engine
+    // gets the build-time id-table digest injected as its `table_digest`
+    // param, so every FXTL batch envelope names the table it was built with
+    // and the host collector can refuse a mismatch instead of resolving
+    // wrong names. Computed over the EXPANDED module list (indices =
+    // instantiation order) from the project's own `modules/` tree — the same
+    // default the `fluxor id-table` exporter uses. An explicit user
+    // `table_digest` wins.
+    inject_id_table_digest(config, project_root);
+
     Ok(auto_added)
+}
+
+/// See the call site in [`expand_platform_stacks`]. Separate so the walkdir
+/// cost is paid only when an `otel` entry exists.
+fn inject_id_table_digest(config: &mut Value, project_root: &std::path::Path) {
+    let has_otel = |entry: &Value| -> bool {
+        let name = entry
+            .as_str()
+            .or_else(|| entry.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let ty = entry.get("type").and_then(|v| v.as_str()).unwrap_or(name);
+        ty == "otel"
+    };
+    let any = config
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .is_some_and(|a| a.iter().any(has_otel));
+    if !any {
+        return;
+    }
+    let table = crate::observability::id_table_for_expanded_config(
+        config,
+        &crate::observability::id_table_roots(project_root),
+    );
+    let digest = table.digest();
+    let bounds_hex = table.bounds_blob_hex();
+    if let Some(arr) = config["modules"].as_array_mut() {
+        for entry in arr.iter_mut() {
+            if !has_otel(entry) {
+                continue;
+            }
+            let Some(obj) = entry.as_object_mut() else {
+                continue;
+            };
+            if obj.get("table_digest").is_none() {
+                obj.insert("table_digest".into(), json!(digest));
+            }
+            // The on-device id-table slice: per-instrument histogram
+            // bounds, so on-device OTLP encodings can emit histogram16 with
+            // DECLARED ladders instead of skipping them.
+            if let (Some(hex), None) = (&bounds_hex, obj.get("bounds")) {
+                obj.insert("bounds".into(), json!(hex));
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -720,24 +790,66 @@ fn inject_modules(
         // implementation selector.
         let effective_type = sm.type_name.as_deref().unwrap_or(&sm.name);
         if existing_types.iter().any(|t| t == effective_type) {
-            // Type-based dedup. Some existing module already provides
-            // this implementation; injecting another would create two
-            // independent instances (e.g. parallel IP stacks) — almost
-            // never what the user wants. Log the skip so it's obvious
-            // why a stack-default module didn't appear in the final
-            // graph, then suppress the module's wiring too.
-            eprintln!(
-                "stack expansion: skipped module '{}' (type='{}') — existing module(s) already provide this type; wiring referencing '{}' will be dropped",
-                sm.name, effective_type, sm.name,
-            );
-            globally_skipped.insert(sm.name.clone());
-            continue;
+            if sm.require_distinct {
+                // Same type, SAME variant → two instances of one build, which
+                // is ordinary graph composition — inject alongside. Only a
+                // variant mismatch is irreconcilable (one image carries one
+                // build of a type — module_variants §4.3), and a silent skip
+                // would silently kill the stack's feature, so that case is a
+                // hard error naming the ways out.
+                let existing_variant = config
+                    .get("modules")
+                    .and_then(|m| m.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find(|e| {
+                            let name = e
+                                .as_str()
+                                .or_else(|| e.get("name").and_then(|v| v.as_str()))
+                                .unwrap_or("");
+                            let ty = e.get("type").and_then(|v| v.as_str()).unwrap_or(name);
+                            ty == effective_type
+                        })
+                    })
+                    .and_then(|e| e.get("variant").and_then(|v| v.as_str()))
+                    .map(str::to_string);
+                if existing_variant.as_deref() != sm.variant.as_deref() {
+                    return Err(Error::Config(format!(
+                        "stack module '{}' needs its own '{}' instance (variant {}), but \
+the graph already carries that type at a different variant ({}) — one image \
+holds one build of a module type, so the two cannot coexist. Either align the \
+existing '{}' module on the same variant, drop it, or use a different \
+transport (e.g. `export_telemetry: udp` + fluxor-collect).",
+                        sm.name,
+                        effective_type,
+                        sm.variant.as_deref().unwrap_or("<default>"),
+                        existing_variant.as_deref().unwrap_or("<default>"),
+                        effective_type,
+                    )));
+                }
+                // fall through: inject a second instance of the same build.
+            } else {
+                // Type-based dedup. Some existing module already provides
+                // this implementation; injecting another would create two
+                // independent instances (e.g. parallel IP stacks) — almost
+                // never what the user wants. Log the skip so it's obvious
+                // why a stack-default module didn't appear in the final
+                // graph, then suppress the module's wiring too.
+                eprintln!(
+                    "stack expansion: skipped module '{}' (type='{}') — existing module(s) already provide this type; wiring referencing '{}' will be dropped",
+                    sm.name, effective_type, sm.name,
+                );
+                globally_skipped.insert(sm.name.clone());
+                continue;
+            }
         }
 
         let mut entry = serde_json::Map::new();
         entry.insert("name".into(), json!(&sm.name));
         if let Some(ref ty) = sm.type_name {
             entry.insert("type".into(), json!(ty));
+        }
+        if let Some(ref v) = sm.variant {
+            entry.insert("variant".into(), json!(v));
         }
 
         // Map params: module_param_name <- pipe-chained source list.
@@ -953,6 +1065,8 @@ mod tests {
         StackModule {
             name: name.to_string(),
             type_name: type_name.map(String::from),
+            variant: None,
+            require_distinct: false,
             params: HashMap::new(),
         }
     }
@@ -1483,5 +1597,118 @@ mod tests {
             Some(&"rp2040".to_string()),
             "rp2040 stays distinct so a `silicon=rp2350` overlay skips it"
         );
+    }
+
+    /// A stack module marked `require_distinct` must fail LOUD on a type
+    /// collision (a silent skip would silently kill the stack's feature),
+    /// and its `variant:` selection must reach the injected entry.
+    #[test]
+    fn require_distinct_collision_is_a_hard_error_and_variant_propagates() {
+        let toml = r#"
+[stack]
+name = "t"
+[[variant]]
+match = {}
+modules = [
+  { name = "cli_x", type = "widget", variant = "small", require_distinct = true },
+]
+wiring = []
+"#;
+        let stack: StackFile = toml::from_str(toml).expect("stack parses");
+        let sm = &stack.variant[0].modules[0];
+        assert!(sm.require_distinct);
+        assert_eq!(sm.variant.as_deref(), Some("small"));
+
+        // Injection with a colliding type present → hard error naming it.
+        let mut config = json!({ "modules": [ { "name": "w0", "type": "widget" } ] });
+        let mut skipped = std::collections::HashSet::new();
+        let host: HostConfig = toml::Value::Table(Default::default());
+        let err = inject_modules(
+            &mut config,
+            &stack.variant[0],
+            &HashMap::new(),
+            &host,
+            &stack.stack,
+            &mut skipped,
+        )
+        .expect_err("collision must refuse");
+        assert!(
+            err.to_string().contains("one build of a module type"),
+            "{err}"
+        );
+
+        // Same type at the SAME variant: two instances of one build is
+        // ordinary composition — the entry must inject alongside, not error.
+        let mut config = json!({ "modules": [
+            { "name": "w0", "type": "widget", "variant": "small" } ] });
+        inject_modules(
+            &mut config,
+            &stack.variant[0],
+            &HashMap::new(),
+            &host,
+            &stack.stack,
+            &mut skipped,
+        )
+        .expect("same variant coexists");
+        assert_eq!(config["modules"].as_array().unwrap().len(), 2);
+        assert_eq!(config["modules"][1]["variant"], "small");
+
+        // Without a collision the entry lands with its variant.
+        let mut config = json!({ "modules": [] });
+        inject_modules(
+            &mut config,
+            &stack.variant[0],
+            &HashMap::new(),
+            &host,
+            &stack.stack,
+            &mut skipped,
+        )
+        .expect("no collision");
+        assert_eq!(config["modules"][0]["variant"], "small");
+    }
+
+    /// An expanded graph carrying `otel` gets the id-table digest
+    /// injected as its `table_digest` param; a graph without otel is left
+    /// untouched, and an explicit user value wins.
+    #[test]
+    fn otel_entries_get_table_digest_injected() {
+        let tmp = std::env::temp_dir().join(format!("fx_digest_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(tmp.join("modules"));
+
+        let mut with_otel = json!({ "modules": [
+            { "name": "ip" },
+            { "name": "otel", "flush_ms": 500 },
+        ]});
+        inject_id_table_digest(&mut with_otel, &tmp);
+        let d = with_otel["modules"][1]["table_digest"]
+            .as_u64()
+            .expect("digest injected");
+        assert!(d > 0, "FNV-1a32 of a real table is never 0");
+        assert!(
+            with_otel["modules"][0].get("table_digest").is_none(),
+            "only otel entries carry the param"
+        );
+
+        // Deterministic: the same expanded config injects the same digest.
+        let mut again = json!({ "modules": [
+            { "name": "ip" },
+            { "name": "otel", "flush_ms": 500 },
+        ]});
+        inject_id_table_digest(&mut again, &tmp);
+        assert_eq!(again["modules"][1]["table_digest"].as_u64(), Some(d));
+
+        // Explicit user value wins.
+        let mut explicit = json!({ "modules": [
+            { "name": "otel", "table_digest": 7 },
+        ]});
+        inject_id_table_digest(&mut explicit, &tmp);
+        assert_eq!(explicit["modules"][0]["table_digest"].as_u64(), Some(7));
+
+        // No otel → untouched.
+        let mut none = json!({ "modules": [ { "name": "ip" } ]});
+        inject_id_table_digest(&mut none, &tmp);
+        assert!(none["modules"][0].get("table_digest").is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

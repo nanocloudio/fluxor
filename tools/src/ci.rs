@@ -890,7 +890,10 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
     let toml_exempt = crate::observability::load_toml_exemptions(project_root);
     let report =
         crate::observability::lint_with_exemptions(&project_root.join("modules"), &toml_exempt);
-    if report.invalid_names.is_empty() && report.uninstrumented.is_empty() {
+    if report.invalid_names.is_empty()
+        && report.invalid_attr_keys.is_empty()
+        && report.uninstrumented.is_empty()
+    {
         return Ok(());
     }
     let mut msg = String::new();
@@ -898,6 +901,18 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
         msg.push_str(&format!(
             "{} malformed instrument name(s); ",
             report.invalid_names.len()
+        ));
+    }
+    if !report.invalid_attr_keys.is_empty() {
+        msg.push_str(&format!(
+            "{} dimension key(s) outside the standards/observability.md §5              vocabulary ({}); ",
+            report.invalid_attr_keys.len(),
+            report
+                .invalid_attr_keys
+                .iter()
+                .map(|(m, k)| format!("{m}: {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if !report.uninstrumented.is_empty() {
@@ -911,13 +926,13 @@ fn run_observability(project_root: &Path) -> std::result::Result<(), String> {
     Err(msg)
 }
 
-/// Run the placement-resolver lint over every config's `presentation.shell`
-/// (rfc_adaptive_presentation.md §9). Mirrors `fluxor lint presentation`.
-/// A `Command` that re-invokes this CLI binary as `fluxor`. The
-/// launcher `fexecve`s a digest-named store blob, so
-/// `current_exe()` is `blobs/sha256/<hex>` — spawning it bare puts
-/// the hex digest in the child's argv[0] and the busybox applet
-/// dispatch fires instead of the subcommand parse. Pin argv[0].
+/// Run the placement-resolver lint over every config's
+/// `presentation.shell`. Mirrors `fluxor lint presentation`. A `Command`
+/// that re-invokes this CLI binary as `fluxor`. The launcher `fexecve`s a
+/// digest-named store blob, so `current_exe()` is `blobs/sha256/<hex>` —
+/// spawning it bare puts the hex digest in the child's argv[0] and the
+/// busybox applet dispatch fires instead of the subcommand parse. Pin
+/// argv[0].
 fn self_invoke() -> Command {
     let exe = std::env::current_exe().unwrap_or_else(|_| "fluxor".into());
     // A concurrent `cargo build` replaces the running binary by rename,

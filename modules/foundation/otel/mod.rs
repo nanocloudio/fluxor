@@ -14,9 +14,11 @@
 //! for a downstream HTTP/gRPC client. When the `delivery` input is wired otel
 //! runs in reliable mode: it retains the flushed batch and resends on `RETRY`.
 //!
-//! **Params (TLV v2):** tag 3 `flush_ms` (u32, default 1000) — max wall-clock a
-//! partial batch waits before it is flushed; tag 4 `encoding` (u8, default 2 =
-//! `fxtl-compact`; 0 = `otlp-json`, 1 = `otlp-proto`).
+//! **Params (TLV v2):** tag 3 `flush_ms` (u32, default 1000) — max wall-clock
+//! a partial batch waits before it is flushed; tag 4 `encoding` (u8, default 2
+//! = `fxtl-compact`; 0 = `otlp-json`, 1 = `otlp-proto`); tag 5 `table_digest`
+//! (u32, default 0) — the build-time id-table digest, injected by the config
+//! builder and stamped into every FXTL batch envelope.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -39,12 +41,18 @@ use abi::contracts::telemetry as tlm;
 
 /// OTLP/JSON encoder core — the reusable `cores/otlp_json` implementation,
 /// `include!`d verbatim so this module and the host tests compile the same bytes.
+/// Variant-gated (`[[variant]]` in the manifest): the `min` build ships the
+/// `fxtl-compact` path only — no OTLP encoder in flash — and refuses an OTLP
+/// `encoding` param at `module_new` rather than silently falling back. Host
+/// tests always compile the full surface.
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 mod otlp {
     include!("../../sdk/cores/otlp_json.rs");
 }
 
 /// OTLP/protobuf encoder core — the binary sibling of `otlp`, for the
 /// `otlp-proto` encoding (a gRPC/HTTP client posts these bytes to `/v1/metrics`).
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 mod otlp_pb {
     include!("../../sdk/cores/otlp_proto.rs");
 }
@@ -85,10 +93,18 @@ const OUT_MAX: usize = FRAME_HDR + tlm::BATCH_HEADER_SIZE + ACCUM_MAX;
 /// OTLP/JSON body buffer — a full `ACCUM_MAX` of scalar metrics expands to a
 /// few KB of JSON (carrier header + document). Scales with `ACCUM_MAX`: the
 /// ~8x expansion factor is a property of the encoding, not of the target.
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 #[cfg(target_arch = "aarch64")]
 const JSON_MAX: usize = FRAME_HDR + 10240;
+#[cfg(any(feature = "otlp", feature = "host-test"))]
 #[cfg(not(target_arch = "aarch64"))]
 const JSON_MAX: usize = FRAME_HDR + 4096;
+
+/// Bounds-table capacity: rows (instruments with declared bounds in this
+/// graph, injected at build) × per-row bound count (15 for histogram16;
+/// a histogram row carries 7 and zero-fills the rest).
+const BOUNDS_ROWS: usize = 8;
+const BOUNDS_MAX: usize = 15;
 
 #[repr(C)]
 struct OtelState {
@@ -99,10 +115,14 @@ struct OtelState {
     export_chan: i32,
     /// `delivery` input channel (`-1` = unwired → fire-and-forget). When wired,
     /// otel runs in reliable mode: it retains the flushed batch (the `accum`
-    /// records) until the carrier acks it, resending on `RETRY` (§5.5).
+    /// records) until the carrier acks it, resending on `RETRY`.
     delivery_chan: i32,
     /// Flush cadence (ms) and the wall-clock micros of the last flush.
     flush_ms: u32,
+    /// Build-injected id-table digest, stamped into every FXTL batch
+    /// envelope so the host collector can refuse a mismatched table. `0` =
+    /// not injected (unverified resolution).
+    table_digest: u32,
     last_flush_micros: u64,
     /// On-wire encoding: `ENCODING_FXTL_COMPACT` (default) | `ENCODING_OTLP_JSON`
     /// | `ENCODING_OTLP_PROTO`.
@@ -122,9 +142,30 @@ struct OtelState {
     /// into the batch envelope. Held across flushes so a retained/resent
     /// batch reports the value that was true when it was built.
     dropped: u32,
+    /// Build-injected per-instrument histogram bounds (µs), keyed by
+    /// `(module, id)` — the on-device slice of the id-table: lets the OTLP
+    /// encoders emit `histogram16` records with their DECLARED bounds instead
+    /// of skipping them. Zero rows = nothing injected; hist16 records are
+    /// then skipped by the on-device encodings (the fxtl path always carries
+    /// them for the host collector). One-shot: an OTLP encoding met a batch
+    /// with NOTHING it can encode (only skipped record kinds — e.g. hist16
+    /// without injected bounds, or PSTATUS). Such a batch is DISCARDED, not
+    /// retained: retaining it pins the accumulator forever and wedges the
+    /// whole export — the silent-stall class this exists to kill. Logged
+    /// once;
+    /// after that the discard is routine.
+    unencodable_warned: u8,
+    bounds_rows: u8,
+    bounds_mod: [u16; BOUNDS_ROWS],
+    bounds_id: [u16; BOUNDS_ROWS],
+    bounds_n: [u8; BOUNDS_ROWS],
+    bounds_us: [[u32; BOUNDS_MAX]; BOUNDS_ROWS],
     accum_len: u16,
     accum: [u8; ACCUM_MAX],
     out: [u8; OUT_MAX],
+    /// OTLP document build buffer — variant-gated with the encoders, so the
+    /// `min` build's state arena does not pay for a document it cannot build.
+    #[cfg(any(feature = "otlp", feature = "host-test"))]
     json: [u8; JSON_MAX],
 }
 
@@ -135,6 +176,13 @@ impl OtelState {
         self.export_chan = -1;
         self.delivery_chan = -1;
         self.flush_ms = 1000;
+        self.table_digest = 0;
+        self.unencodable_warned = 0;
+        self.bounds_rows = 0;
+        self.bounds_mod = [0; BOUNDS_ROWS];
+        self.bounds_id = [0; BOUNDS_ROWS];
+        self.bounds_n = [0; BOUNDS_ROWS];
+        self.bounds_us = [[0; BOUNDS_MAX]; BOUNDS_ROWS];
         self.last_flush_micros = 0;
         self.encoding = tlm::ENCODING_FXTL_COMPACT;
         self.awaiting_ack = false;
@@ -154,6 +202,103 @@ mod params_def {
         OtelState;
         3, flush_ms, u32, 1000 => |s, d, len| { s.flush_ms = p_u32(d, len, 0, 1000); };
         4, encoding, u8, 2 => |s, d, len| { s.encoding = p_u8(d, len, 0, 2); };
+        5, table_digest, u32, 0 => |s, d, len| { s.table_digest = p_u32(d, len, 0, 0); };
+        // Hex text of `[count u8]` then per row
+        // `[module u16 LE][id u16 LE][nbounds u8][bound_us u32 LE × nbounds]`,
+        // injected by the config builder from the graph's id-table. A row that
+        // does not fit is dropped whole (the encoder then skips that
+        // instrument — degraded, never wrong).
+        6, bounds, str, 0 => |s, d, len| {
+            let mut raw =
+                [0u8; 1 + super::BOUNDS_ROWS * (5 + 4 * super::BOUNDS_MAX)];
+            let mut rn = 0usize;
+            let mut i = 0usize;
+            while i + 1 < len && rn < raw.len() {
+                let hi = super::hex_nibble(*d.add(i));
+                let lo = super::hex_nibble(*d.add(i + 1));
+                let (Some(hi), Some(lo)) = (hi, lo) else { break };
+                raw[rn] = (hi << 4) | lo;
+                rn += 1;
+                i += 2;
+            }
+            super::parse_bounds_blob(s, &raw[..rn]);
+        };
+    }
+}
+
+/// One hex nibble, or `None` for a non-hex byte (stops the blob parse).
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode the injected bounds blob into the state table. Malformed tails are
+/// dropped whole — a half-read row would attach wrong bounds to an id.
+fn parse_bounds_blob(s: &mut OtelState, raw: &[u8]) {
+    let Some(&count) = raw.first() else { return };
+    let mut off = 1usize;
+    let mut row = 0usize;
+    while row < (count as usize).min(BOUNDS_ROWS) {
+        if off + 5 > raw.len() {
+            return;
+        }
+        let module = u16::from_le_bytes([raw[off], raw[off + 1]]);
+        let id = u16::from_le_bytes([raw[off + 2], raw[off + 3]]);
+        let n = raw[off + 4] as usize;
+        off += 5;
+        if n > BOUNDS_MAX || off + n * 4 > raw.len() {
+            return;
+        }
+        for k in 0..n {
+            let b = off + k * 4;
+            s.bounds_us[row][k] =
+                u32::from_le_bytes([raw[b], raw[b + 1], raw[b + 2], raw[b + 3]]);
+        }
+        s.bounds_mod[row] = module;
+        s.bounds_id[row] = id;
+        s.bounds_n[row] = n as u8;
+        off += n * 4;
+        row += 1;
+        s.bounds_rows = row as u8;
+    }
+}
+
+/// Copyable view of the bounds table, so the encode fns can take it alongside
+/// a `&mut` borrow of the output buffer (disjoint from the state fields).
+#[derive(Clone, Copy)]
+struct BoundsView<'a> {
+    rows: u8,
+    modules: &'a [u16; BOUNDS_ROWS],
+    ids: &'a [u16; BOUNDS_ROWS],
+    ns: &'a [u8; BOUNDS_ROWS],
+    us: &'a [[u32; BOUNDS_MAX]; BOUNDS_ROWS],
+}
+
+impl<'a> BoundsView<'a> {
+    fn of(s: &'a OtelState) -> Self {
+        BoundsView {
+            rows: s.bounds_rows,
+            modules: &s.bounds_mod,
+            ids: &s.bounds_id,
+            ns: &s.bounds_n,
+            us: &s.bounds_us,
+        }
+    }
+
+    /// Declared bounds (µs, ascending) for `(module, id)`, or `None`.
+    fn find(&self, module: u16, id: u16) -> Option<&'a [u32]> {
+        let mut r = 0usize;
+        while r < self.rows as usize {
+            if self.modules[r] == module && self.ids[r] == id {
+                return Some(&self.us[r][..self.ns[r] as usize]);
+            }
+            r += 1;
+        }
+        None
     }
 }
 
@@ -201,7 +346,8 @@ fn synthetic_name(module: u16, id: u16, out: &mut [u8]) -> usize {
 /// follow-up). Returns the body length, or 0 if nothing was encoded / it
 /// overflowed. `t_nanos` is the record's `t_micros × 1000` (boot-relative in
 /// v1 — a real epoch anchor is a follow-up; the collector may re-stamp).
-fn encode_metrics_json(accum: &[u8], json: &mut [u8]) -> usize {
+#[cfg(any(feature = "otlp", feature = "host-test"))]
+fn encode_metrics_json(accum: &[u8], json: &mut [u8], bounds: BoundsView<'_>) -> usize {
     let mut doc = otlp::MetricDoc::begin(json, b"fluxor");
     let mut off = 0usize;
     let mut namebuf = [0u8; 16];
@@ -216,12 +362,13 @@ fn encode_metrics_json(accum: &[u8], json: &mut [u8]) -> usize {
         if signal == tlm::SIGNAL_METRIC {
             let module = tlm::module(rec);
             let id = tlm::metric_id(rec);
+            let dim = tlm::metric_dim(rec);
             let t_nanos = tlm::t_micros(rec).wrapping_mul(1000);
             let n = synthetic_name(module, id, &mut namebuf);
             let name = &namebuf[..n];
             if kind == tlm::METRIC_HISTOGRAM {
                 // Histogram body: buckets are 8×u64 at offset 16 (after the
-                // 12-byte header + id u16 + 2 pad).
+                // 12-byte header + id u16 + dim u16).
                 let mut buckets = [0u64; tlm::HIST_BUCKETS];
                 for (i, b) in buckets.iter_mut().enumerate() {
                     let base = 16 + i * 8;
@@ -229,10 +376,52 @@ fn encode_metrics_json(accum: &[u8], json: &mut [u8]) -> usize {
                     v.copy_from_slice(&rec[base..base + 8]);
                     *b = u64::from_le_bytes(v);
                 }
-                doc.histogram(name, module, t_nanos, &buckets);
+                // A declared per-instrument ladder (build-injected bounds
+                // param) overrides the fixed one.
+                let mut b64 = [0u64; BOUNDS_MAX];
+                let eb: &[u64] = match bounds.find(module, id) {
+                    Some(us) if us.len() == tlm::HIST_BUCKETS - 1 => {
+                        for (k, v) in us.iter().enumerate() {
+                            b64[k] = *v as u64;
+                        }
+                        &b64[..us.len()]
+                    }
+                    _ => &otlp::HIST_BOUNDS_US,
+                };
+                doc.histogram_bounded(name, module, dim, t_nanos, &buckets, eb);
+            } else if kind == tlm::METRIC_HISTOGRAM_16 {
+                // hist16 bounds are per-instrument id-table metadata. When the
+                // build injected them (`bounds` param, the on-device
+                // slice) the record encodes with its DECLARED ladder; without
+                // them it is skipped — a made-up ladder would be unsound. The
+                // fxtl-compact path always forwards it verbatim for the host
+                // collector.
+                if let Some(us) = bounds.find(module, id) {
+                    if us.len() == tlm::HIST16_BUCKETS - 1 {
+                        let mut buckets = [0u64; tlm::HIST16_BUCKETS];
+                        for (i, b) in buckets.iter_mut().enumerate() {
+                            let base = 16 + i * 8;
+                            let mut v = [0u8; 8];
+                            v.copy_from_slice(&rec[base..base + 8]);
+                            *b = u64::from_le_bytes(v);
+                        }
+                        let mut b64 = [0u64; BOUNDS_MAX];
+                        for (k, v) in us.iter().enumerate() {
+                            b64[k] = *v as u64;
+                        }
+                        doc.histogram_bounded(
+                            name,
+                            module,
+                            dim,
+                            t_nanos,
+                            &buckets,
+                            &b64[..us.len()],
+                        );
+                    }
+                }
             } else {
                 let value = tlm::metric_scalar_value(rec);
-                doc.sum(name, module, t_nanos, value, kind == tlm::METRIC_COUNTER);
+                doc.sum_dim(name, module, dim, t_nanos, value, kind == tlm::METRIC_COUNTER);
             }
         }
         off += rlen;
@@ -246,7 +435,8 @@ fn encode_metrics_json(accum: &[u8], json: &mut [u8]) -> usize {
 /// Encode the accumulated **metric** records as one OTLP/protobuf metrics
 /// document into `out` (the binary sibling of [`encode_metrics_json`]; spans are
 /// skipped). Returns the byte length, or 0 if nothing encoded / it overflowed.
-fn encode_metrics_proto(accum: &[u8], out: &mut [u8]) -> usize {
+#[cfg(any(feature = "otlp", feature = "host-test"))]
+fn encode_metrics_proto(accum: &[u8], out: &mut [u8], bounds: BoundsView<'_>) -> usize {
     let mut doc = otlp_pb::MetricProtoDoc::begin(out, b"fluxor");
     let mut off = 0usize;
     let mut namebuf = [0u8; 16];
@@ -261,6 +451,7 @@ fn encode_metrics_proto(accum: &[u8], out: &mut [u8]) -> usize {
         if signal == tlm::SIGNAL_METRIC {
             let module = tlm::module(rec);
             let id = tlm::metric_id(rec);
+            let dim = tlm::metric_dim(rec);
             let t_nanos = tlm::t_micros(rec).wrapping_mul(1000);
             let n = synthetic_name(module, id, &mut namebuf);
             let name = &namebuf[..n];
@@ -272,10 +463,46 @@ fn encode_metrics_proto(accum: &[u8], out: &mut [u8]) -> usize {
                     v.copy_from_slice(&rec[base..base + 8]);
                     *b = u64::from_le_bytes(v);
                 }
-                doc.histogram(name, module, t_nanos, &buckets);
+                let mut bits = [0u64; BOUNDS_MAX];
+                let eb: &[u64] = match bounds.find(module, id) {
+                    Some(us) if us.len() == tlm::HIST_BUCKETS - 1 => {
+                        for (k, v) in us.iter().enumerate() {
+                            bits[k] = otlp_pb::f64_bits_from_u64(*v as u64);
+                        }
+                        &bits[..us.len()]
+                    }
+                    _ => &otlp_pb::HIST_BOUNDS_BITS,
+                };
+                doc.histogram_bounded(name, module, dim, t_nanos, &buckets, eb);
+            } else if kind == tlm::METRIC_HISTOGRAM_16 {
+                // Same contract as the JSON path: declared bounds when
+                // injected, skip otherwise.
+                if let Some(us) = bounds.find(module, id) {
+                    if us.len() == tlm::HIST16_BUCKETS - 1 {
+                        let mut buckets = [0u64; tlm::HIST16_BUCKETS];
+                        for (i, b) in buckets.iter_mut().enumerate() {
+                            let base = 16 + i * 8;
+                            let mut v = [0u8; 8];
+                            v.copy_from_slice(&rec[base..base + 8]);
+                            *b = u64::from_le_bytes(v);
+                        }
+                        let mut bits = [0u64; BOUNDS_MAX];
+                        for (k, v) in us.iter().enumerate() {
+                            bits[k] = otlp_pb::f64_bits_from_u64(*v as u64);
+                        }
+                        doc.histogram_bounded(
+                            name,
+                            module,
+                            dim,
+                            t_nanos,
+                            &buckets,
+                            &bits[..us.len()],
+                        );
+                    }
+                }
             } else {
                 let value = tlm::metric_scalar_value(rec);
-                doc.sum(name, module, t_nanos, value, kind == tlm::METRIC_COUNTER);
+                doc.sum_dim(name, module, dim, t_nanos, value, kind == tlm::METRIC_COUNTER);
             }
         }
         off += rlen;
@@ -310,8 +537,14 @@ unsafe fn step_drain(s: &mut OtelState) {
     let sys = &*s.syscalls;
     let used = s.accum_len as usize;
     let room = ACCUM_MAX - used;
-    // TLM_DRAIN copies as many WHOLE records as fit in the offered room.
-    if room >= tlm::MAX_RECORD_SIZE {
+    // TLM_DRAIN copies as many WHOLE records as fit in the offered room, so
+    // the gate only needs to clear the SMALLEST record (a 24 B scalar), not
+    // MAX_RECORD_SIZE — gating on the maximum reserved a full 144 B of every
+    // batch for a record kind most graphs never emit (on rp2040's 512 B
+    // accumulator that is 28% of the batch). If the record at the ring head is
+    // larger than `room`, the kernel copies nothing and the size-triggered
+    // flush below clears the accumulator — no stall either way.
+    if room >= tlm::METRIC_SCALAR_SIZE {
         let n = (sys.provider_call)(
             s.tlm_slot,
             tlm::TLM_DRAIN,
@@ -339,31 +572,53 @@ unsafe fn emit_batch(s: &mut OtelState) -> bool {
     let used = s.accum_len as usize;
     // Each encoding lays its payload after a reserved `FRAME_HDR` prefix; the
     // carrier header is stamped last so it covers the exact encoded length.
+    #[cfg(any(feature = "otlp", feature = "host-test"))]
     if s.encoding == tlm::ENCODING_OTLP_JSON || s.encoding == tlm::ENCODING_OTLP_PROTO {
         // On-device OTLP metrics document (JSON or protobuf) → carrier posts it
-        // as the request body.
+        // as the request body. Early-return so the fxtl path below stays the
+        // unconditional tail — the `min` variant compiles this block away and
+        // `module_new` has already refused an OTLP encoding there.
+        let bv = BoundsView {
+            rows: s.bounds_rows,
+            modules: &s.bounds_mod,
+            ids: &s.bounds_id,
+            ns: &s.bounds_n,
+            us: &s.bounds_us,
+        };
         let n = if s.encoding == tlm::ENCODING_OTLP_PROTO {
-            encode_metrics_proto(&s.accum[..used], &mut s.json[FRAME_HDR..])
+            encode_metrics_proto(&s.accum[..used], &mut s.json[FRAME_HDR..], bv)
         } else {
-            encode_metrics_json(&s.accum[..used], &mut s.json[FRAME_HDR..])
+            encode_metrics_json(&s.accum[..used], &mut s.json[FRAME_HDR..], bv)
         };
         if n == 0 {
+            // Nothing in this batch is encodable under this encoding. Keeping
+            // it would pin `accum` and wedge the export permanently (drain
+            // refuses a full accumulator; flush can never clear it), so the
+            // batch is dropped whole — loudly, once.
+            if s.unencodable_warned == 0 {
+                s.unencodable_warned = 1;
+                let msg = b"[otel] batch had no OTLP-encodable records; discarded (check hist16 bounds injection)";
+                dev_log(sys, 2, msg.as_ptr(), msg.len());
+            }
+            s.accum_len = 0;
             return false;
         }
         write_frame_header(&mut s.json, n);
-        (sys.channel_write)(s.export_chan, s.json.as_ptr(), FRAME_HDR + n) == (FRAME_HDR + n) as i32
-    } else {
-        // Compact FXTL: the raw record batch a host collector decodes.
-        let count = record_count(&s.accum[..used]);
-        let Some(hdr) = tlm::write_batch_header(&mut s.out[FRAME_HDR..], count, s.dropped) else {
-            return false;
-        };
-        s.out[FRAME_HDR + hdr..FRAME_HDR + hdr + used].copy_from_slice(&s.accum[..used]);
-        let payload = hdr + used;
-        write_frame_header(&mut s.out, payload);
-        (sys.channel_write)(s.export_chan, s.out.as_ptr(), FRAME_HDR + payload)
-            == (FRAME_HDR + payload) as i32
+        return (sys.channel_write)(s.export_chan, s.json.as_ptr(), FRAME_HDR + n)
+            == (FRAME_HDR + n) as i32;
     }
+    // Compact FXTL: the raw record batch a host collector decodes.
+    let count = record_count(&s.accum[..used]);
+    let Some(hdr) =
+        tlm::write_batch_header(&mut s.out[FRAME_HDR..], count, s.dropped, s.table_digest)
+    else {
+        return false;
+    };
+    s.out[FRAME_HDR + hdr..FRAME_HDR + hdr + used].copy_from_slice(&s.accum[..used]);
+    let payload = hdr + used;
+    write_frame_header(&mut s.out, payload);
+    (sys.channel_write)(s.export_chan, s.out.as_ptr(), FRAME_HDR + payload)
+        == (FRAME_HDR + payload) as i32
 }
 
 unsafe fn step_flush(s: &mut OtelState) {
@@ -457,10 +712,11 @@ unsafe fn step_ack_timeout(s: &mut OtelState) {
     retry_batch(s);
 }
 
-/// Reliable mode: consume delivery-status frames from the carrier and act on the
-/// retained batch. Frame = `[msg_type][len: u16 LE][status: u8]` where status is
-/// `DELIVERY_DELIVERED`/`RETRY`/`DROP` (§5.5). DELIVERED/DROP clear the retained
-/// batch and resume draining; RETRY resends it within the resend budget.
+/// Reliable mode: consume delivery-status frames from the carrier and act on
+/// the retained batch. Frame = `[msg_type][len: u16 LE][status: u8]` where
+/// status is `DELIVERY_DELIVERED`/`RETRY`/`DROP`. DELIVERED/DROP clear the
+/// retained batch and resume draining; RETRY resends it within the resend
+/// budget.
 unsafe fn step_delivery(s: &mut OtelState) {
     if s.delivery_chan < 0 || !s.awaiting_ack {
         return;
@@ -545,6 +801,14 @@ pub extern "C" fn module_new(
             params_def::parse_tlv(s, params, params_len);
         } else {
             params_def::set_defaults(s);
+        }
+        // Variant fail-closed: a `min` build carries no OTLP encoder, so a
+        // graph that selects an OTLP `encoding` against it must fault at
+        // instantiation — loudly, at bring-up — never silently export
+        // fxtl-compact bytes a JSON/protobuf sink cannot take.
+        #[cfg(not(any(feature = "otlp", feature = "host-test")))]
+        if s.encoding != tlm::ENCODING_FXTL_COMPACT {
+            return -7;
         }
         s.last_flush_micros = dev_micros(sys);
         0

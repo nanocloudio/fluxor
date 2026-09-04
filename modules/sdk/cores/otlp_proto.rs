@@ -38,6 +38,25 @@ const WIRE_VARINT: u8 = 0;
 const WIRE_I64: u8 = 1; // fixed64 / sfixed64 / double
 const WIRE_LEN: u8 = 2;
 
+/// Integer-only IEEE-754 double encoding for a non-negative integer — exact
+/// for values < 2^53 (a bucket bound in µs is < 2^32). Exists so a PIC module
+/// can emit runtime-supplied bounds as packed doubles without linking the
+/// `u64 as f64` soft-float conversion (the same reason the fixed ladder below
+/// is pre-computed).
+pub fn f64_bits_from_u64(v: u64) -> u64 {
+    if v == 0 {
+        return 0;
+    }
+    let msb = 63 - v.leading_zeros() as u64;
+    let exp = 1023 + msb;
+    let frac = if msb >= 52 {
+        (v >> (msb - 52)) & ((1u64 << 52) - 1)
+    } else {
+        (v << (52 - msb)) & ((1u64 << 52) - 1)
+    };
+    (exp << 52) | frac
+}
+
 /// IEEE-754 bit patterns of the histogram bucket bounds (µs), emitted as packed
 /// `double`s. Pre-computed so no runtime `u64 as f64` conversion is linked into
 /// the PIC module. Matches `otlp_json::HIST_BOUNDS_US` = [64,128,…,4096].
@@ -160,23 +179,50 @@ fn build_module_attr(module: u16, out: &mut [u8]) -> usize {
     p.len_or_zero()
 }
 
-/// `NumberDataPoint { time_unix_nano = 3; as_int = 6; attributes = 7 }`.
-fn build_number_dp(t_nanos: u64, value: u64, module: u16, out: &mut [u8]) -> usize {
+/// Append every datapoint attribute (`attributes = <field>`) for `(module,
+/// dim)` into `p` — one len-field per KeyValue, matching proto's
+/// repeated-message encoding. A nonzero `dim` adds the raw composite
+/// dimension index as `fluxor.dim`: the id-table resolves it into declared
+/// keys host-side, and emitting it raw keeps per-dimension series distinct
+/// on-device, where the table is absent.
+fn put_attr_fields(p: &mut ProtoBuf, field: u32, module: u16, dim: u16) {
     let mut attr = [0u8; 48];
     let alen = build_module_attr(module, &mut attr);
+    p.put_len_field(field, attr.get(..alen).unwrap_or(&[]));
+    if dim != 0 {
+        let mut av = [0u8; 16];
+        let avlen = build_any_value_int(dim as u64, &mut av);
+        let mut kv = [0u8; 32];
+        let mut kp = ProtoBuf::new(&mut kv);
+        kp.put_len_field(1, b"fluxor.dim");
+        kp.put_len_field(2, av.get(..avlen).unwrap_or(&[]));
+        let klen = kp.len_or_zero();
+        p.put_len_field(field, kv.get(..klen).unwrap_or(&[]));
+    }
+}
+
+/// `NumberDataPoint { time_unix_nano = 3; as_int = 6; attributes = 7 }`.
+fn build_number_dp(t_nanos: u64, value: u64, module: u16, dim: u16, out: &mut [u8]) -> usize {
     let mut p = ProtoBuf::new(out);
     p.put_tag(3, WIRE_I64);
     p.put_fixed64(t_nanos);
     p.put_tag(6, WIRE_I64); // as_int (sfixed64, two's complement — value bits verbatim)
     p.put_fixed64(value);
-    p.put_len_field(7, attr.get(..alen).unwrap_or(&[]));
+    put_attr_fields(&mut p, 7, module, dim);
     p.len_or_zero()
 }
 
 /// `Sum { data_points = 1; aggregation_temporality = 2; is_monotonic = 3 }`.
-fn build_sum(t_nanos: u64, value: u64, module: u16, monotonic: bool, out: &mut [u8]) -> usize {
-    let mut ndp = [0u8; 96];
-    let nlen = build_number_dp(t_nanos, value, module, &mut ndp);
+fn build_sum(
+    t_nanos: u64,
+    value: u64,
+    module: u16,
+    dim: u16,
+    monotonic: bool,
+    out: &mut [u8],
+) -> usize {
+    let mut ndp = [0u8; 128];
+    let nlen = build_number_dp(t_nanos, value, module, dim, &mut ndp);
     let mut p = ProtoBuf::new(out);
     p.put_len_field(1, ndp.get(..nlen).unwrap_or(&[]));
     p.put_tag(2, WIRE_VARINT);
@@ -187,8 +233,16 @@ fn build_sum(t_nanos: u64, value: u64, module: u16, monotonic: bool, out: &mut [
 }
 
 /// `HistogramDataPoint`: time, count, packed bucket_counts, packed
-/// explicit_bounds, module attribute.
-fn build_hist_dp(t_nanos: u64, buckets: &[u64], module: u16, out: &mut [u8]) -> usize {
+/// explicit_bounds (caller-supplied IEEE-754 bit patterns — per-instrument
+/// id-table metadata), datapoint attributes.
+fn build_hist_dp(
+    t_nanos: u64,
+    buckets: &[u64],
+    bounds_bits: &[u64],
+    module: u16,
+    dim: u16,
+    out: &mut [u8],
+) -> usize {
     let mut count = 0u64;
     for b in buckets {
         count = count.wrapping_add(*b);
@@ -201,14 +255,12 @@ fn build_hist_dp(t_nanos: u64, buckets: &[u64], module: u16, out: &mut [u8]) -> 
     }
     let bclen = bcw.len_or_zero();
     // Packed repeated double explicit_bounds (pre-computed bit patterns).
-    let mut eb = [0u8; 8 * 8];
+    let mut eb = [0u8; 8 * 16];
     let mut ebw = ProtoBuf::new(&mut eb);
-    for bits in HIST_BOUNDS_BITS.iter() {
+    for bits in bounds_bits.iter() {
         ebw.put_fixed64(*bits);
     }
     let eblen = ebw.len_or_zero();
-    let mut attr = [0u8; 48];
-    let alen = build_module_attr(module, &mut attr);
 
     let mut p = ProtoBuf::new(out);
     p.put_tag(3, WIRE_I64);
@@ -217,14 +269,21 @@ fn build_hist_dp(t_nanos: u64, buckets: &[u64], module: u16, out: &mut [u8]) -> 
     p.put_fixed64(count);
     p.put_len_field(6, bc.get(..bclen).unwrap_or(&[]));
     p.put_len_field(7, eb.get(..eblen).unwrap_or(&[]));
-    p.put_len_field(9, attr.get(..alen).unwrap_or(&[]));
+    put_attr_fields(&mut p, 9, module, dim);
     p.len_or_zero()
 }
 
 /// `Histogram { data_points = 1; aggregation_temporality = 2 }`.
-fn build_histogram(t_nanos: u64, buckets: &[u64], module: u16, out: &mut [u8]) -> usize {
-    let mut dp = [0u8; 256];
-    let dlen = build_hist_dp(t_nanos, buckets, module, &mut dp);
+fn build_histogram(
+    t_nanos: u64,
+    buckets: &[u64],
+    bounds_bits: &[u64],
+    module: u16,
+    dim: u16,
+    out: &mut [u8],
+) -> usize {
+    let mut dp = [0u8; 384];
+    let dlen = build_hist_dp(t_nanos, buckets, bounds_bits, module, dim, &mut dp);
     let mut p = ProtoBuf::new(out);
     p.put_len_field(1, dp.get(..dlen).unwrap_or(&[]));
     p.put_tag(2, WIRE_VARINT);
@@ -284,9 +343,26 @@ impl<'a> MetricProtoDoc<'a> {
 
     /// Append a scalar metric as an OTLP `Sum` (`Metric { name; sum }`).
     pub fn sum(&mut self, name: &[u8], module: u16, t_nanos: u64, value: u64, monotonic: bool) {
-        let mut sum = [0u8; 128];
-        let slen = build_sum(t_nanos, value, module, monotonic, &mut sum);
-        let mut metric = [0u8; 160];
+        self.sum_dim(name, module, 0, t_nanos, value, monotonic)
+    }
+
+    /// [`Self::sum`] with a composite dimension index (`0` = undimensioned).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "an OTLP datapoint is a flat record; a struct would just move the arg list"
+    )]
+    pub fn sum_dim(
+        &mut self,
+        name: &[u8],
+        module: u16,
+        dim: u16,
+        t_nanos: u64,
+        value: u64,
+        monotonic: bool,
+    ) {
+        let mut sum = [0u8; 160];
+        let slen = build_sum(t_nanos, value, module, dim, monotonic, &mut sum);
+        let mut metric = [0u8; 192];
         let mut mp = ProtoBuf::new(&mut metric);
         mp.put_len_field(1, name); // Metric.name
         mp.put_len_field(7, sum.get(..slen).unwrap_or(&[])); // Metric.sum
@@ -294,11 +370,26 @@ impl<'a> MetricProtoDoc<'a> {
         self.append_metric(metric.get(..mlen).unwrap_or(&[]));
     }
 
-    /// Append a histogram metric as an OTLP `Histogram` (`Metric { name; histogram }`).
+    /// Append a histogram metric as an OTLP `Histogram` with the fixed
+    /// 8-bucket ladder ([`HIST_BOUNDS_BITS`]).
     pub fn histogram(&mut self, name: &[u8], module: u16, t_nanos: u64, buckets: &[u64]) {
-        let mut hist = [0u8; 288];
-        let hlen = build_histogram(t_nanos, buckets, module, &mut hist);
-        let mut metric = [0u8; 320];
+        self.histogram_bounded(name, module, 0, t_nanos, buckets, &HIST_BOUNDS_BITS)
+    }
+
+    /// Append a histogram with caller-supplied explicit-bound bit patterns and
+    /// a composite dimension index (`bounds_bits.len() == buckets.len() - 1`).
+    pub fn histogram_bounded(
+        &mut self,
+        name: &[u8],
+        module: u16,
+        dim: u16,
+        t_nanos: u64,
+        buckets: &[u64],
+        bounds_bits: &[u64],
+    ) {
+        let mut hist = [0u8; 448];
+        let hlen = build_histogram(t_nanos, buckets, bounds_bits, module, dim, &mut hist);
+        let mut metric = [0u8; 480];
         let mut mp = ProtoBuf::new(&mut metric);
         mp.put_len_field(1, name); // Metric.name
         mp.put_len_field(9, hist.get(..hlen).unwrap_or(&[])); // Metric.histogram

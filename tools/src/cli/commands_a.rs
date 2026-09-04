@@ -494,7 +494,12 @@ fn cmd_generate(
         .unwrap_or_else(|| std::path::Path::new("."));
     inline_route_body_files(&mut config, yaml_dir)?;
     let target_desc = resolve_target(&config, None)?;
-    let project_root = crate::project::root();
+    // Resolve from the CONFIG's location, not the cwd: the rig and
+    // cross-repo builds invoke this from another project's root, and a
+    // cwd-resolved root gave the id-table digest injection the wrong
+    // `[observability] id_table_dirs` (a digest the exporter can never
+    // match).
+    let project_root = crate::project::root_for_config(config_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     let builder = ConfigBuilder::new();
@@ -585,7 +590,12 @@ fn cmd_combine(
         .unwrap_or_else(|| std::path::Path::new("."));
     inline_route_body_files(&mut config, yaml_dir)?;
     let target_desc = resolve_target(&config, None)?;
-    let project_root = crate::project::root();
+    // Resolve from the CONFIG's location, not the cwd: the rig and
+    // cross-repo builds invoke this from another project's root, and a
+    // cwd-resolved root gave the id-table digest injection the wrong
+    // `[observability] id_table_dirs` (a digest the exporter can never
+    // match).
+    let project_root = crate::project::root_for_config(config_path);
     let stack_added =
         stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     if verbose && !stack_added.is_empty() {
@@ -927,7 +937,12 @@ fn load_config_with_defaults(
     }
 
     // Expand platform: stacks (TOML-driven)
-    let project_root = crate::project::root();
+    // Resolve from the CONFIG's location, not the cwd: the rig and
+    // cross-repo builds invoke this from another project's root, and a
+    // cwd-resolved root gave the id-table digest injection the wrong
+    // `[observability] id_table_dirs` (a digest the exporter can never
+    // match).
+    let project_root = crate::project::root_for_config(config_path);
     let stack_added =
         stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
     if verbose && !stack_added.is_empty() {
@@ -1068,7 +1083,12 @@ fn cmd_graph_image(
     };
 
     let target_desc = resolve_target(&config, target_override)?;
-    let project_root = crate::project::root();
+    // Resolve from the CONFIG's location, not the cwd: the rig and
+    // cross-repo builds invoke this from another project's root, and a
+    // cwd-resolved root gave the id-table digest injection the wrong
+    // `[observability] id_table_dirs` (a digest the exporter can never
+    // match).
+    let project_root = crate::project::root_for_config(config_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     if let Some(ref defaults) = target_desc.hardware_defaults {

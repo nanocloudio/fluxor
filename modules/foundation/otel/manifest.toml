@@ -4,17 +4,32 @@ version = "1.0.0"
 timer_class = "wall_clock"
 hardware_targets = ["rp2350", "bcm2712"]
 
-# OTEL export engine (rfc_observability_surface.md §5.5). A telemetry-ring
-# consumer that drains records, batches them, and emits request-ready payloads
-# on `export` for a transport-blind carrier (UDP/UART sender, or a downstream
-# HTTP/gRPC client) to deliver. Encodings: `fxtl-compact` (raw TelemetryRecord
-# batch a host collector decodes) and full on-device `otlp-json` / `otlp-proto`
-# metrics documents. The optional `delivery` input enables reliable mode
-# (retain + resend on RETRY).
+# OTEL export engine. A telemetry-ring consumer that drains records, batches
+# them, and emits request-ready payloads on `export` for a transport-blind
+# carrier (UDP/UART sender, or a downstream HTTP/gRPC client) to deliver.
+# Encodings: `fxtl-compact` (raw TelemetryRecord batch a host collector
+# decodes) and full on-device `otlp-json` / `otlp-proto` metrics documents. The
+# optional `delivery` input enables reliable mode (retain + resend on RETRY).
 #
 # Requires the read-only `observe` permission to drain the ring
 # (TLM_SUBSCRIBE / TLM_DRAIN).
 permissions = ["observe"]
+
+# Feature-set variants. The on-device OTLP encoder cores (`otlp_json` +
+# `otlp_proto`, selected by `encoding` 0/1) are cfg-gated behind the `otlp`
+# feature: `full` (default, unsuffixed .fmod) carries them, so every
+# existing graph and pin resolves unchanged; `min` is the
+# constrained-target build — the `fxtl-compact` path only, no encoder in
+# flash. A `min` build asked for an OTLP encoding refuses at the param
+# (fail-closed), never silently falls back.
+[[variant]]
+name     = "full"
+features = ["otlp"]
+default  = true
+
+[[variant]]
+name     = "min"
+features = []
 
 [[ports]]
 name = "export"
@@ -22,10 +37,10 @@ index = 0
 direction = "output"
 content_type = "OctetStream"
 
-# Optional delivery backchannel (§5.5): a carrier that can report per-batch
-# delivery status (HTTP/gRPC client) wires it so otel retains + retries on a
-# transient failure. Fire-and-forget carriers (UDP/UART) leave it unwired, and
-# otel stays fire-and-forget.
+# Optional delivery backchannel: a carrier that can report per-batch delivery
+# status (HTTP/gRPC client) wires it so otel retains + retries on a transient
+# failure. Fire-and-forget carriers (UDP/UART) leave it unwired, and otel
+# stays fire-and-forget.
 [[ports]]
 name = "delivery"
 index = 0
@@ -38,7 +53,7 @@ requires_contract = "channel"
 access = "read"
 
 [observability]
-# Narrowed by rfc_observability_surface.md §11.2(5): an exporter originates no
+# Narrowed deliberately: an exporter originates no
 # telemetry ABOUT ITS SUBJECTS, but must account for its OWN fidelity. otel
 # reports the ring's cumulative drop count for its slot in every batch envelope
 # (the FXTL `dropped` field), so a saturated export is distinguishable from an

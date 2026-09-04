@@ -18,13 +18,13 @@
 // `Telemetry` edge is a byte FIFO, not a message channel.
 //
 //   header   [signal u8][kind u8][module u16][t_micros u64]
-//   metric   [id u16][_rsvd u16][value u64]                  (scalar → 24 B)
-//   metric   [id u16][_rsvd u16][bucket u64 × 8]             (histogram → 80 B)
+//   metric   [id u16][dim_id u16][value u64]                 (scalar → 24 B)
+//   metric   [id u16][dim_id u16][bucket u64 × 8]            (histogram → 80 B)
+//   metric   [id u16][dim_id u16][bucket u64 × 16]           (histogram16 → 144 B)
 //   span     [name_id u16][status u8][flags u8]
 //            [trace_id 16][span_id 8][parent_id 8][start u64][end u64]  (→ 64 B)
 //
-// `flags` is the W3C trace-flags byte (low bit = `sampled`); it occupies what
-// was a reserved byte, so the record size is unchanged.
+// `flags` is the W3C trace-flags byte (low bit = `sampled`).
 
 // ── Signal discriminator (header[0]) ────────────────────────────────
 pub const SIGNAL_LOG: u8 = 1; // reserved — logs ride log_ring
@@ -66,16 +66,16 @@ pub const RING_CONSUMERS: usize = 4;
 pub const TLM_STATS_LEN: usize = 4 + RING_CONSUMERS * 4;
 
 /// `TLM_SUBSCRIBE` arg layout: a 4-byte filter word, optionally followed by an
-/// 8-byte LE PSTATUS cadence (ms) the subscriber wants the kernel to emit at
-/// (§5.3). Folding the cadence into subscribe avoids a separate op in the full
+/// 8-byte LE PSTATUS cadence (ms) the subscriber wants the kernel to emit at.
+/// Folding the cadence into subscribe avoids a separate op in the full
 /// `0x0C4x` space; `0` / a 4-byte arg leaves the kernel default.
 pub const SUBSCRIBE_INTERVAL_OFFSET: usize = 4;
 
-// ── Reserved module identities (kernel-stamped, §5.1) ───────────────
-// The kernel stamps the `module` header field at emit time so a module cannot
-// forge another's identity. Two indices are reserved and never assigned to a
-// real module: `UNATTRIBUTED` (emitted outside a step bracket — provider
-// re-entry, host built-ins) and `KERNEL` (the kernel's own PSTATUS records).
+// ── Reserved module identities (kernel-stamped) ─────────────── The kernel
+// stamps the `module` header field at emit time so a module cannot forge
+// another's identity. Two indices are reserved and never assigned to a real
+// module: `UNATTRIBUTED` (emitted outside a step bracket — provider re-entry,
+// host built-ins) and `KERNEL` (the kernel's own PSTATUS records).
 pub const MODULE_UNATTRIBUTED: u16 = 0xFFFF;
 pub const MODULE_KERNEL: u16 = 0xFFFE;
 
@@ -83,6 +83,24 @@ pub const MODULE_KERNEL: u16 = 0xFFFE;
 pub const METRIC_COUNTER: u8 = 1;
 pub const METRIC_UPDOWN: u8 = 2;
 pub const METRIC_HISTOGRAM: u8 = 3;
+/// 16-bucket histogram (15 declared bounds + implicit `+Inf`), for
+/// distributions the 8-bucket ladder cannot resolve.
+pub const METRIC_HISTOGRAM_16: u8 = 4;
+
+// ── Metric dimension (bytes 14..16 of a metric body) ───── The row-major
+// composite index over an instrument's DECLARED dimension domains (product
+// ≤ 65534, enforced at build, so every index stays clear of the reserved
+// `0xFFFF`). `0` is what an undimensioned instrument writes, and `0xFFFF` =
+// `__other__`, the fold target for any tuple with a component outside its
+// declared domain (folded and counted, never dropped, so totals stay
+// correct).
+pub const DIM_NONE: u16 = 0;
+pub const DIM_OTHER: u16 = 0xFFFF;
+/// Ceiling on the product of an instrument's declared domain sizes, so the
+/// largest index it can produce stays below the reserved `DIM_OTHER`
+/// (`DIM_NONE` overlaps index 0 of
+/// an undimensioned instrument by construction).
+pub const DIM_MAX_PRODUCT: u32 = 65534;
 
 // ── Span kind (header[1] when signal == SPAN; OpenTelemetry SpanKind) ─
 pub const SPAN_INTERNAL: u8 = 0;
@@ -99,11 +117,16 @@ pub const STATUS_ERROR: u8 = 2;
 /// Number of histogram buckets (log2-spaced; matches the kernel step
 /// histogram: <64, <128, <256, <512, <1024, <2048, <4096, >=4096 µs).
 pub const HIST_BUCKETS: usize = 8;
+/// Bucket count of a `METRIC_HISTOGRAM_16` record: 15 per-instrument bounds
+/// declared in the manifest (shipped to consumers via the id-table — bounds
+/// are metadata, never sample data) plus the implicit `+Inf` bucket.
+pub const HIST16_BUCKETS: usize = 16;
 
 // ── Layout ──────────────────────────────────────────────────────────
 pub const HEADER_SIZE: usize = 12;
 pub const METRIC_SCALAR_SIZE: usize = HEADER_SIZE + 12;
 pub const METRIC_HIST_SIZE: usize = HEADER_SIZE + 4 + HIST_BUCKETS * 8;
+pub const METRIC_HIST16_SIZE: usize = HEADER_SIZE + 4 + HIST16_BUCKETS * 8;
 pub const SPAN_SIZE: usize = HEADER_SIZE + 52;
 /// PSTATUS step body: `[step_count u64][bucket u32 × 8]` (40 B → 52 total).
 pub const PSTATUS_STEP_SIZE: usize = HEADER_SIZE + 8 + HIST_BUCKETS * 4;
@@ -114,8 +137,9 @@ pub const PSTATUS_RES_SIZE: usize = HEADER_SIZE + 16;
 /// [peak u32][denials u32]` (20 B → 32 total). Units are the pool's own
 /// (bytes for arenas, slots for tables — see the `resource` contract).
 pub const PSTATUS_POOL_SIZE: usize = HEADER_SIZE + 20;
-/// Largest record the ring must reserve atomically — a histogram metric (80 B).
-pub const MAX_RECORD_SIZE: usize = METRIC_HIST_SIZE;
+/// Largest record the ring must reserve atomically — a 16-bucket histogram
+/// metric (144 B).
+pub const MAX_RECORD_SIZE: usize = METRIC_HIST16_SIZE;
 
 /// W3C trace-context id widths.
 pub const TRACE_ID_LEN: usize = 16;
@@ -132,6 +156,7 @@ pub const TRACE_FLAGS_SAMPLED: u8 = 0x01;
 // envelope per flush (a `transport_buffer` sends each envelope as one datagram):
 //
 //   [magic u32 = BATCH_MAGIC][version u8][_rsvd u8][count u16][dropped u32]
+//   [table_digest u32]
 //   [record × count]
 //
 // Records are concatenated raw (each self-sizing via `record_len`), so the
@@ -143,15 +168,27 @@ pub const TRACE_FLAGS_SAMPLED: u8 = 0x01;
 // Cumulative rather than per-batch so the series is monotone: a lost datagram
 // costs resolution, not truth, and the host recovers the gap by differencing.
 // Without it a saturated exporter is indistinguishable from an idle one, which
-// is precisely the failure §11 closes.
+// is precisely the failure this closes.
 pub const BATCH_MAGIC: u32 = 0x4C54_5846; // b"FXTL" little-endian
 pub const BATCH_VERSION: u8 = 1;
-pub const BATCH_HEADER_SIZE: usize = 12;
+// 16: `table_digest` — the FNV-1a32 of the build-time
+// id-table, injected as an `otel` param so a host collector can REFUSE to
+// resolve names against a table from a different image instead of reporting
+// wrong ones. `0` = no digest injected (collector may resolve, and should say
+// it is unverified). This lands together with the first in-tree decoder
+// (`fluxor-collect`), which ENDS the no-consumer exemption: any later
+// envelope change is a real migration with deployed readers.
+pub const BATCH_HEADER_SIZE: usize = 16;
 
 /// Write the batch envelope header. Returns its length, or `None` if `buf` is
 /// too small. `dropped` is the cumulative ring-drop count for the emitting
 /// consumer slot (see the envelope comment above).
-pub fn write_batch_header(buf: &mut [u8], count: u16, dropped: u32) -> Option<usize> {
+pub fn write_batch_header(
+    buf: &mut [u8],
+    count: u16,
+    dropped: u32,
+    table_digest: u32,
+) -> Option<usize> {
     if buf.len() < BATCH_HEADER_SIZE {
         return None;
     }
@@ -160,7 +197,14 @@ pub fn write_batch_header(buf: &mut [u8], count: u16, dropped: u32) -> Option<us
     buf[5] = 0;
     buf[6..8].copy_from_slice(&count.to_le_bytes());
     buf[8..12].copy_from_slice(&dropped.to_le_bytes());
+    buf[12..16].copy_from_slice(&table_digest.to_le_bytes());
     Some(BATCH_HEADER_SIZE)
+}
+
+/// The id-table digest this batch's emitter was built with (`0` = none
+/// injected — resolution is unverified, not wrong).
+pub fn batch_table_digest(buf: &[u8]) -> u32 {
+    u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])
 }
 
 pub fn batch_magic(buf: &[u8]) -> u32 {
@@ -185,18 +229,20 @@ pub fn batch_dropped(buf: &[u8]) -> u32 {
 const _: () = assert!(HEADER_SIZE == 12);
 const _: () = assert!(METRIC_SCALAR_SIZE == 24);
 const _: () = assert!(METRIC_HIST_SIZE == 80);
+const _: () = assert!(METRIC_HIST16_SIZE == 144);
 const _: () = assert!(SPAN_SIZE == 64);
 const _: () = assert!(PSTATUS_STEP_SIZE == 52);
 const _: () = assert!(PSTATUS_RES_SIZE == 28);
 const _: () = assert!(PSTATUS_POOL_SIZE == 32);
-const _: () = assert!(MAX_RECORD_SIZE == 80);
-const _: () = assert!(BATCH_HEADER_SIZE == 12);
+const _: () = assert!(MAX_RECORD_SIZE == 144);
+const _: () = assert!(BATCH_HEADER_SIZE == 16);
 
 /// Total record length for a `(signal, kind)` header pair, or 0 if the pair is
 /// unrecognised. Lets a reader size a record from its header before draining.
 pub fn record_len(signal: u8, kind: u8) -> usize {
     match signal {
         SIGNAL_METRIC if kind == METRIC_HISTOGRAM => METRIC_HIST_SIZE,
+        SIGNAL_METRIC if kind == METRIC_HISTOGRAM_16 => METRIC_HIST16_SIZE,
         SIGNAL_METRIC => METRIC_SCALAR_SIZE,
         SIGNAL_SPAN => SPAN_SIZE,
         SIGNAL_PSTATUS if kind == PSTATUS_STEP => PSTATUS_STEP_SIZE,
@@ -230,14 +276,14 @@ pub fn filter_admits(filter: u32, signal: u8, _kind: u8) -> bool {
     filter & bit != 0
 }
 
-// ── Export delivery status (otel `delivery` backchannel, §5.5) ───────
-// One byte per batch, reported by a transport carrier back to `otel` so it can
+// ── Export delivery status (otel `delivery` backchannel) ─────── One byte per
+// batch, reported by a transport carrier back to `otel` so it can
 // retain/retry. Fire-and-forget carriers (UDP/UART) never send one.
 pub const DELIVERY_DELIVERED: u8 = 0;
 pub const DELIVERY_RETRY: u8 = 1; // transient — connect fail, 429/503, timeout
 pub const DELIVERY_DROP: u8 = 2; // permanent — other 4xx
 
-// ── Export encoding selector (otel `encoding` param, §5.5) ───────────
+// ── Export encoding selector (otel `encoding` param) ───────────
 pub const ENCODING_OTLP_JSON: u8 = 0;
 pub const ENCODING_OTLP_PROTO: u8 = 1;
 pub const ENCODING_FXTL_COMPACT: u8 = 2;
@@ -276,7 +322,8 @@ pub fn t_micros(buf: &[u8]) -> u64 {
 // ── Metric ──────────────────────────────────────────────────────────
 
 /// Encode a scalar metric (counter / up-down) record. Returns the total record
-/// length, or `None` if `buf` is too small.
+/// length, or `None` if `buf` is too small. Emits `DIM_NONE` — the
+/// dimensioned form is [`write_metric_scalar_dim`].
 pub fn write_metric_scalar(
     buf: &mut [u8],
     module: u16,
@@ -285,18 +332,34 @@ pub fn write_metric_scalar(
     id: u16,
     value: u64,
 ) -> Option<usize> {
+    write_metric_scalar_dim(buf, module, t_micros, kind, id, DIM_NONE, value)
+}
+
+/// Encode a scalar metric record carrying a composite dimension
+/// index. `dim` is the row-major index over the instrument's declared
+/// domains; `DIM_NONE` for an undimensioned instrument, `DIM_OTHER`
+/// for a tuple that fell outside them.
+pub fn write_metric_scalar_dim(
+    buf: &mut [u8],
+    module: u16,
+    t_micros: u64,
+    kind: u8,
+    id: u16,
+    dim: u16,
+    value: u64,
+) -> Option<usize> {
     if buf.len() < METRIC_SCALAR_SIZE {
         return None;
     }
     write_header(buf, SIGNAL_METRIC, kind, module, t_micros)?;
     buf[12..14].copy_from_slice(&id.to_le_bytes());
-    buf[14] = 0;
-    buf[15] = 0;
+    buf[14..16].copy_from_slice(&dim.to_le_bytes());
     buf[16..24].copy_from_slice(&value.to_le_bytes());
     Some(METRIC_SCALAR_SIZE)
 }
 
 /// Encode a histogram metric record with `HIST_BUCKETS` log2-spaced counts.
+/// Emits `DIM_NONE`; the dimensioned/16-bucket forms are below.
 pub fn write_metric_histogram(
     buf: &mut [u8],
     module: u16,
@@ -309,8 +372,7 @@ pub fn write_metric_histogram(
     }
     write_header(buf, SIGNAL_METRIC, METRIC_HISTOGRAM, module, t_micros)?;
     buf[12..14].copy_from_slice(&id.to_le_bytes());
-    buf[14] = 0;
-    buf[15] = 0;
+    buf[14..16].copy_from_slice(&DIM_NONE.to_le_bytes());
     for (i, v) in buckets.iter().enumerate() {
         let off = 16 + i * 8;
         buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
@@ -318,8 +380,47 @@ pub fn write_metric_histogram(
     Some(METRIC_HIST_SIZE)
 }
 
+/// Encode a 16-bucket histogram record (`METRIC_HISTOGRAM_16`): cumulative
+/// counts against the instrument's 15 declared bounds plus `+Inf`, with a
+/// composite dimension index (`DIM_NONE` when undimensioned).
+pub fn write_metric_histogram16(
+    buf: &mut [u8],
+    module: u16,
+    t_micros: u64,
+    id: u16,
+    dim: u16,
+    buckets: &[u64; HIST16_BUCKETS],
+) -> Option<usize> {
+    if buf.len() < METRIC_HIST16_SIZE {
+        return None;
+    }
+    write_header(buf, SIGNAL_METRIC, METRIC_HISTOGRAM_16, module, t_micros)?;
+    buf[12..14].copy_from_slice(&id.to_le_bytes());
+    buf[14..16].copy_from_slice(&dim.to_le_bytes());
+    for (i, v) in buckets.iter().enumerate() {
+        let off = 16 + i * 8;
+        buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    Some(METRIC_HIST16_SIZE)
+}
+
 pub fn metric_id(buf: &[u8]) -> u16 {
     u16::from_le_bytes([buf[12], buf[13]])
+}
+
+/// The composite dimension index of a metric record (`DIM_NONE` when the
+/// instrument is undimensioned).
+pub fn metric_dim(buf: &[u8]) -> u16 {
+    u16::from_le_bytes([buf[14], buf[15]])
+}
+
+/// Bucket count for a histogram record's `kind`, or 0 for a scalar kind.
+pub fn hist_bucket_count(kind: u8) -> usize {
+    match kind {
+        METRIC_HISTOGRAM => HIST_BUCKETS,
+        METRIC_HISTOGRAM_16 => HIST16_BUCKETS,
+        _ => 0,
+    }
 }
 
 pub fn metric_scalar_value(buf: &[u8]) -> u64 {

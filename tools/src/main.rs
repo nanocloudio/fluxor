@@ -109,11 +109,11 @@ const TRAILER_MAGIC: u32 = 0x544C5846; // "FXLT"
 const TRAILER_VERSION: u8 = 1;
 
 fn main() {
-    // Busybox multi-call dispatch (rfc_cli_execution.md §5.3): invoked
-    // through a symlink whose basename isn't `fluxor`, dispatch as
-    // `fluxor exec <basename> -- <args…>` BEFORE clap sees argv (clap would
-    // try to parse argv[1] as a subcommand). argv[0] and argv[1] are on
-    // different axes, so applet names never shadow real subcommands.
+    // Busybox multi-call dispatch: invoked through a symlink whose basename
+    // isn't `fluxor`, dispatch as `fluxor exec <basename> -- <args…>`
+    // BEFORE clap sees argv (clap would try to parse argv[1] as a
+    // subcommand). argv[0] and argv[1] are on different axes, so applet
+    // names never shadow real subcommands.
     let argv0_stem = std::env::args_os()
         .next()
         .map(std::path::PathBuf::from)
@@ -319,6 +319,11 @@ fn main() {
             WorkspaceAction::Rm { path } => workspace::cmd_workspace_rm(&path),
         },
         Commands::Store(args) => store_cli::dispatch_store(args),
+        Commands::IdTable {
+            config,
+            out,
+            modules_dir,
+        } => cmd_id_table(&config, out.as_deref(), &modules_dir),
     };
 
     if let Err(e) = result {

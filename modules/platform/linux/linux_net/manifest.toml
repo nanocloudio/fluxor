@@ -2,6 +2,33 @@ version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
 
+# Connection table size: listeners + clients, and the ceiling on the
+# `u16` conn id net_proto carries. Idle slots hold no buffer.
+[[params]]
+name = "max_conns"
+tag = 10
+type = "u32"
+default = 128
+range = [2, 65535]
+
+# Per-connection unsent-byte backlog cap, KiB. Allocated on first
+# back-up and released with the slot; overflowing it closes the
+# connection.
+[[params]]
+name = "write_buf_kib"
+tag = 11
+type = "u32"
+default = 128
+range = [1, 65536]
+
+# `listen()` backlog: the SYN queue that absorbs a connect burst.
+[[params]]
+name = "listen_backlog"
+tag = 12
+type = "u32"
+default = 128
+range = [1, 65535]
+
 [[ports]]
 name = "net_out"
 direction = "output"

@@ -160,10 +160,9 @@ enum Commands {
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
     },
-    /// Run an installed applet: resolve <NAME> through the applet
-    /// catalogue (or the project's `target/fluxor/<NAME>/` bundle) and exec
-    /// its cached bundle, passing everything after `--` to the app
-    /// (rfc_cli_execution.md §5.1).
+    /// Run an installed applet: resolve <NAME> through the applet catalogue
+    /// (or the project's `target/fluxor/<NAME>/` bundle) and exec its
+    /// cached bundle, passing everything after `--` to the app.
     Exec {
         /// Applet name.
         name: String,
@@ -171,11 +170,11 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Register an applet: map a name to a workload bundle
-    /// (rfc_cli_execution.md §5.2). Accepts a store bundle reference
-    /// (`<name>`, `<name>:<ver>`, `sha256:…` digest or unambiguous
-    /// prefix — resolved from the local OCI store), a built bundle
-    /// dir, or a source manifest (`app.fluxor.toml` — builds first).
+    /// Register an applet: map a name to a workload bundle. Accepts
+    /// a store bundle reference (`<name>`, `<name>:<ver>`,
+    /// `sha256:…` digest or unambiguous prefix — resolved from the
+    /// local OCI store), a built bundle dir, or a source manifest
+    /// (`app.fluxor.toml` — builds first).
     Install {
         /// Store bundle reference, bundle dir, or app.fluxor.toml.
         bundle: PathBuf,
@@ -183,7 +182,7 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
         /// Also drop a busybox symlink `<DIR>/<name> -> fluxor` so the
-        /// applet dispatches by argv[0] (rfc_cli_execution.md §5.3).
+        /// applet dispatches by argv[0].
         #[arg(long, value_name = "DIR")]
         link: Option<PathBuf>,
     },
@@ -427,6 +426,23 @@ enum Commands {
     /// artifact display lives on `fluxor inspect <ref>`.
     Store(store_cli::StoreArgs),
 
+    /// Export a graph's observability id-table as JSON: instrument names,
+    /// per-instrument kinds / histogram bounds / dimension domains, and the
+    /// table digest carried by the FXTL batch envelope. `fluxor-collect`
+    /// loads this file to resolve id-interned telemetry records; a digest
+    /// mismatch there refuses resolution rather than reporting wrong names.
+    IdTable {
+        /// Graph config YAML — module index = position in `modules:`.
+        config: PathBuf,
+        /// Output path (defaults to stdout).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Extra module-tree roots to resolve types against, searched after
+        /// the project's `modules/` (e.g. a sibling fluxor checkout's).
+        #[arg(long)]
+        modules_dir: Vec<PathBuf>,
+    },
+
     /// Live-workspace policy surface (`~/.fluxor/workspace.toml`).
     ///
     /// Workspace membership is the whole live/pinned distinction:
@@ -602,11 +618,11 @@ enum LintAction {
         #[arg(long)]
         strict: bool,
     },
-    /// Presentation placement check (rfc_adaptive_presentation.md §9): runs the
-    /// placement resolver over every config's `presentation.shell` against the
-    /// surface it targets, and fails on any `essential` control that cannot be
-    /// surfaced there (no chrome/content plane and no `bind_physical`). Catches
-    /// "this control is dead on this device" at build time.
+    /// Presentation placement check: runs the placement resolver over every
+    /// config's `presentation.shell` against the surface it targets, and fails
+    /// on any `essential` control that cannot be surfaced there (no
+    /// chrome/content plane and no `bind_physical`). Catches "this control is
+    /// dead on this device" at build time.
     Presentation {
         /// Project root override (defaults to the resolved project root).
         #[arg(long)]

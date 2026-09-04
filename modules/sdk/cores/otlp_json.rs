@@ -73,10 +73,26 @@ impl<'a> JsonBuf<'a> {
     }
 
     fn put_module_attr(&mut self, module: u16) {
+        self.put_attrs(module, 0)
+    }
+
+    /// Datapoint attributes: the module index, plus — when nonzero — the raw
+    /// composite dimension index as `fluxor.dim`. The id-table holds the key
+    /// names and domain factorisation; emitting the raw index keeps distinct
+    /// series distinct on-device, where the table is absent — collapsing them
+    /// would silently merge per-dimension cumulative streams into one lying
+    /// series. A host collector resolves `fluxor.dim` into the declared keys.
+    fn put_attrs(&mut self, module: u16, dim: u16) {
         // Canonical semconv key (contracts/src/observability.rs FLUXOR_MODULE_INDEX).
         self.put(b"\"attributes\":[{\"key\":\"fluxor.module.index\",\"value\":{\"intValue\":\"");
         self.put_u64(module as u64);
-        self.put(b"\"}}]");
+        self.put(b"\"}}");
+        if dim != 0 {
+            self.put(b",{\"key\":\"fluxor.dim\",\"value\":{\"intValue\":\"");
+            self.put_u64(dim as u64);
+            self.put(b"\"}}");
+        }
+        self.put(b"]");
     }
 
     /// Lowercase-hex encode `bytes` (used for OTLP trace/span ids).
@@ -160,6 +176,23 @@ impl<'a> MetricDoc<'a> {
     /// Append a scalar metric (counter / up-down) as an OTLP `sum`.
     /// `monotonic` distinguishes a counter (true) from an up-down (false).
     pub fn sum(&mut self, name: &[u8], module: u16, t_nanos: u64, value: u64, monotonic: bool) {
+        self.sum_dim(name, module, 0, t_nanos, value, monotonic)
+    }
+
+    /// [`Self::sum`] with a composite dimension index (`0` = undimensioned).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "an OTLP datapoint is a flat record; a struct would just move the arg list"
+    )]
+    pub fn sum_dim(
+        &mut self,
+        name: &[u8],
+        module: u16,
+        dim: u16,
+        t_nanos: u64,
+        value: u64,
+        monotonic: bool,
+    ) {
         self.metric_sep();
         self.j.put(b"{\"name\":\"");
         self.j.put_json_str(name);
@@ -171,12 +204,28 @@ impl<'a> MetricDoc<'a> {
         self.j.put(b"\",\"timeUnixNano\":\"");
         self.j.put_u64(t_nanos);
         self.j.put(b"\",");
-        self.j.put_module_attr(module);
+        self.j.put_attrs(module, dim);
         self.j.put(b"}]}}");
     }
 
-    /// Append a histogram metric as an OTLP `histogram` with explicit bounds.
+    /// Append a histogram metric as an OTLP `histogram` with the fixed
+    /// 8-bucket ladder ([`HIST_BOUNDS_US`]).
     pub fn histogram(&mut self, name: &[u8], module: u16, t_nanos: u64, buckets: &[u64]) {
+        self.histogram_bounded(name, module, 0, t_nanos, buckets, &HIST_BOUNDS_US)
+    }
+
+    /// Append a histogram with caller-supplied explicit bounds (µs) and a
+    /// composite dimension index. Bounds are per-instrument id-table
+    /// metadata; `bounds.len()` must be `buckets.len() - 1`.
+    pub fn histogram_bounded(
+        &mut self,
+        name: &[u8],
+        module: u16,
+        dim: u16,
+        t_nanos: u64,
+        buckets: &[u64],
+        bounds: &[u64],
+    ) {
         self.metric_sep();
         let mut count = 0u64;
         let mut i = 0;
@@ -204,15 +253,15 @@ impl<'a> MetricDoc<'a> {
         }
         self.j.put(b"],\"explicitBounds\":[");
         i = 0;
-        while i < HIST_BOUNDS_US.len() {
+        while i < bounds.len() {
             if i > 0 {
                 self.j.put(b",");
             }
-            self.j.put_u64(HIST_BOUNDS_US[i]);
+            self.j.put_u64(bounds[i]);
             i += 1;
         }
         self.j.put(b"],");
-        self.j.put_module_attr(module);
+        self.j.put_attrs(module, dim);
         self.j.put(b"}]}}");
     }
 

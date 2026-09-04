@@ -199,18 +199,23 @@ modules = [
 wiring = []
 
 # Telemetry export: `platform.debug.export_telemetry: <kind>` selects a
-# pluggable export path. Every kind inserts the `otel` export engine + a generic
-# `transport_buffer` (the byte-egress stage), differing only in the buffer's
-# `transport` capability. `otel` drains the kernel telemetry ring (no per-source
-# wiring — emission is ring-based since `rfc_observability_surface.md` §5.2),
-# batches records as `fxtl-compact`, and frames each batch onto its `export` port;
-# `transport_buffer` forwards each framed batch over the selected transport.
-# `udp` (transport 0) sends each batch as one datagram off the family's net
-# module (needs a unicast `dst_ip`, per-config or `~/.config/fluxor`); a host
-# collector resolves `(module, id) -> name` and produces OTLP — the metric/span
-# analogue of `log_net`. `uart` (transport 1) writes to the debug serial sink for
-# network-less targets. Matched by exact value so new transports add an overlay
-# without colliding.
+# pluggable export path. Every kind inserts the `otel` export engine + a
+# generic `transport_buffer` (the byte-egress stage), differing only in the
+# buffer's `transport` capability. `otel` drains the kernel telemetry ring (no
+# per-source wiring — emission is ring-based since
+# ring-based), batches records as `fxtl-compact`, and
+# frames each batch onto its `export` port; `transport_buffer` forwards each
+# framed batch over the selected transport. `udp` (transport 0) sends each
+# batch as one datagram off the family's net module (needs a unicast `dst_ip`,
+# per-config or `~/.config/fluxor`); the host collector — `fluxor-collect`, fed
+# by `fluxor id-table <config>` — resolves `(module, id) -> name`, histogram
+# bounds, and composite dimensions, serves Prometheus text on :9464/metrics and
+# optionally pushes OTLP — the metric/span analogue of `log_net`. Stack
+# expansion injects the id-table digest as otel's `table_digest` param, so a
+# collector loaded with a table from a different build REFUSES to resolve
+# instead of reporting wrong names. `uart` (transport 1) writes to the debug
+# serial sink for network-less targets. Matched by exact value so new
+# transports add an overlay without colliding.
 #
 #   platform:
 #     debug:
@@ -284,6 +289,87 @@ wiring = [
 # An overlay, like every other export kind: the export path composes with
 # whatever `to:` transport the graph selects. A variant would compete with the
 # `to = net|console|terminal` pick and tie on specificity.
+# `export_telemetry: otlp-http` — on-device OTLP over HTTP POST. Inserts the
+# same `otel` engine in `otlp-proto`
+# encoding plus the generic exchange chain: `exchange_poster` wraps each
+# encoded document in an exchange MSG_PUBLISH (POST /v1/metrics,
+# application/x-protobuf) and an `http` client in exchange mode performs it;
+# the correlated reply drives `otel.delivery`, so batches are RETAINED and
+# retried on transport failure — the reliable-mode contract, composed
+# from generic parts. Protobuf (not JSON) is deliberate: an encoded document
+# must fit one exchange payload (8 KiB ceiling; a JSON body can exceed it,
+# and one document cannot be fragmented).
+#
+# The client is `require_distinct`: a graph that already carries an `http`
+# module of a DIFFERENT variant conflicts (one image, one build of a type)
+# and expansion fails with the ways out, never a silent skip. A graph serving
+# http can align its server on `variant: exchange` — a superset of the
+# default — and both instances then share one build.
+#
+#   platform:
+#     debug:
+#       export_telemetry: otlp-http
+#       export_otlp_ip: 3232238090     # collector IPv4 as a decimal u32
+#       # export_otlp_port: 4318
+#       # export_flush_ms: 1000
+[[overlay]]
+match = { export_telemetry = "otlp-http", family = "bcm" }
+accept_cycles = true
+modules = [
+  { name = "otel", params = {
+      flush_ms = "user:export_flush_ms",
+      encoding = "1",
+  } },
+  { name = "otlp_poster", type = "exchange_poster", params = {
+      path = "user:export_otlp_path|/v1/metrics",
+  } },
+  { name = "otlp_client", type = "http", variant = "exchange", require_distinct = true, params = {
+      mode           = "1",
+      protocol       = "0",
+      host_ip        = "user:export_otlp_ip|host:debug.otlp_ip|required",
+      port           = "user:export_otlp_port|host:debug.otlp_port|4318",
+      content_type   = "application/x-protobuf",
+      surface_status = "1",
+  } },
+]
+wiring = [
+  "otel.export -> otlp_poster.payload",
+  "otlp_poster.publish_out -> otlp_client.publish_in",
+  "otlp_client.reply_out -> otlp_poster.reply_in",
+  "otlp_poster.delivery_out -> otel.delivery",
+  "otlp_client.net_out -> ip.net_in",
+  "ip.net_out -> otlp_client.net_in",
+]
+
+[[overlay]]
+match = { export_telemetry = "otlp-http", family = "linux" }
+accept_cycles = true
+modules = [
+  { name = "otel", params = {
+      flush_ms = "user:export_flush_ms",
+      encoding = "1",
+  } },
+  { name = "otlp_poster", type = "exchange_poster", params = {
+      path = "user:export_otlp_path|/v1/metrics",
+  } },
+  { name = "otlp_client", type = "http", variant = "exchange", require_distinct = true, params = {
+      mode           = "1",
+      protocol       = "0",
+      host_ip        = "user:export_otlp_ip|host:debug.otlp_ip|required",
+      port           = "user:export_otlp_port|host:debug.otlp_port|4318",
+      content_type   = "application/x-protobuf",
+      surface_status = "1",
+  } },
+]
+wiring = [
+  "otel.export -> otlp_poster.payload",
+  "otlp_poster.publish_out -> otlp_client.publish_in",
+  "otlp_client.reply_out -> otlp_poster.reply_in",
+  "otlp_poster.delivery_out -> otel.delivery",
+  "otlp_client.net_out -> linux_net.net_in",
+  "linux_net.net_out -> otlp_client.net_in",
+]
+
 [[overlay]]
 match = { export_telemetry = "uart", family = "rp2" }
 modules = [

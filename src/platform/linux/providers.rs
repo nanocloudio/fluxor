@@ -926,11 +926,12 @@ static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] = [const {
     }
 }; MAX_PROCS];
 
-/// The node's `proc` grant — WHAT `do` may run and how, sourced from the environment
-/// so the operator declares it at launch (`SECTOR_PROC_ALLOW`, `_ROOT`, `_ENV`,
-/// `_TIMEOUT_MS`), with safe defaults. The allowlist is accident-prevention + the
-/// migration-frontier surface, NOT confinement (any dev tool is RCE-equivalent — the
-/// node is the boundary, §5); `root`/`env`/`timeout` are hygiene + blast-radius bounds.
+/// The node's `proc` grant — WHAT `do` may run and how, sourced from the
+/// environment so the operator declares it at launch (`SECTOR_PROC_ALLOW`,
+/// `_ROOT`, `_ENV`, `_TIMEOUT_MS`), with safe defaults. The allowlist is
+/// accident-prevention + the migration-frontier surface, NOT confinement (any
+/// dev tool is RCE-equivalent — the node is the boundary);
+/// `root`/`env`/`timeout` are hygiene + blast-radius bounds.
 struct ProcGrant {
     root: Option<std::path::PathBuf>,
     allow: std::vec::Vec<String>,
@@ -1066,8 +1067,8 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             if slot >= MAX_PROCS || !procs[slot].in_use {
                 return errno::EINVAL;
             }
-            // Timeout: past the deadline, kill the child and report done — a runaway
-            // build can't wedge the pipe (bounds the blast radius, §5).
+            // Timeout: past the deadline, kill the child and report done — a
+            // runaway build can't wedge the pipe (bounds the blast radius).
             let timed_out = procs[slot]
                 .deadline
                 .is_some_and(|dl| std::time::Instant::now() >= dl);
@@ -1153,30 +1154,35 @@ const DG_OWNER_TAG_FIELD: usize = 3;
 
 const CONN_TYPE_UDP_BOUND: u8 = 2;
 
-/// Total connection slots (listeners + clients). Bumped from 24 to
-/// 128 so apps that benchmark with high-concurrency connect bursts
-/// (Lattice's 32-/64-client etcd + redis loadtests) don't hit the
-/// platform's slot cap before the app's own anchor MAX_CONNS.
-///
-/// `LinuxNetState` is built directly on the heap (`LinuxNetState::new`
-/// returns `Box<Self>` via `Box::new_uninit`), so `LINUX_NET_MAX_CONNS *
-/// LINUX_NET_WRITE_BUF` (here 128 × 128 KiB = 16 MiB) is NOT bounded by
-/// the process stack — there is no stack-resident temporary of the full
-/// struct.
-const LINUX_NET_MAX_CONNS: usize = 128;
+/// Connection slots (listeners + clients) when the graph does not set
+/// `max_conns`. The table is a heap `Vec` sized once at instantiation
+/// from the built-in's `max_conns` param, capped at
+/// `LINUX_NET_MAX_CONNS_CAP` because net_proto carries the slot index
+/// as `u16 LE`. A slot holds no buffer until a send backs up, so a large
+/// table of idle connections costs only the fixed per-slot fields.
+pub const LINUX_NET_MAX_CONNS_DEFAULT: usize = 128;
+/// Hard ceiling on `max_conns`: the wire id is a `u16`.
+pub const LINUX_NET_MAX_CONNS_CAP: usize = 65535;
+/// Ready-event batch drained from the epoll set per step. Level
+/// triggered, so a socket left out of one batch is served next step.
+const LINUX_NET_READY_BATCH: usize = 1024;
 /// Max distinct inbound command channels (priority lanes).
 pub const LINUX_NET_MAX_INBOUND: usize = 8;
-/// Per-connection write backlog. Sized to hold a full Spectrum video
-/// frame's worth of WS fragments (~98 KB) so a slow peer can absorb one
-/// frame's transmission pause without the producer overflowing the
-/// backlog (which closes the connection). Kept at 128 KiB — the heap
-/// construction (see `LINUX_NET_MAX_CONNS`) lifts the prior stack-size
-/// constraint that had forced this down to 32 KiB.
-const LINUX_NET_WRITE_BUF: usize = 128 * 1024;
+/// Per-connection write backlog cap when the graph does not set
+/// `write_buf_kib`. 128 KiB holds a full Spectrum video frame's worth of
+/// WS fragments (~98 KB) so a slow peer can absorb one frame's
+/// transmission pause without the producer overflowing the backlog
+/// (which closes the connection). The buffer is allocated the first
+/// time a send backs up and released with the slot, so the cap is a
+/// per-connection worst case, not a resident cost.
+pub const LINUX_NET_WRITE_BUF_DEFAULT: usize = 128 * 1024;
+/// Listen backlog when the graph does not set `listen_backlog`. The
+/// kernel's SYN queue must absorb a whole connect burst; at 8 a
+/// 32-client burst dropped SYNs 9..=32.
+pub const LINUX_NET_LISTEN_BACKLOG_DEFAULT: i32 = 128;
 
-// Intentionally NOT Copy: this struct holds a 128 KiB inline buffer.
-// Implicit copies (`let conn = st.conns[idx];`) would push that whole
-// buffer onto the stack on every read. References / field-access only.
+// Intentionally NOT Copy: `write_buf` owns a heap allocation.
+// References / field-access only.
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -1205,22 +1211,26 @@ struct LinuxNetConn {
     /// value or the command is refused with `EPERM`. Zero is the host
     /// wildcard, reachable by the untagged shape.
     dg_owner_tag: u16,
-    write_buf: [u8; LINUX_NET_WRITE_BUF],
+    /// Unsent bytes. Empty until a send backs up; then sized to the
+    /// instance's `write_buf_max` and kept until the slot is released.
+    write_buf: Vec<u8>,
 }
 
 impl LinuxNetConn {
-    const EMPTY: Self = Self {
-        fd: -1,
-        conn_type: 0,
-        state: 0,
-        port: 0,
-        write_offset: 0,
-        write_len: 0,
-        connect_tag: 0,
-        owner: crate::kernel::workload::owner::OWNER_SYSTEM,
-        dg_owner_tag: 0,
-        write_buf: [0u8; LINUX_NET_WRITE_BUF],
-    };
+    fn empty() -> Self {
+        Self {
+            fd: -1,
+            conn_type: 0,
+            state: 0,
+            port: 0,
+            write_offset: 0,
+            write_len: 0,
+            connect_tag: 0,
+            owner: crate::kernel::workload::owner::OWNER_SYSTEM,
+            dg_owner_tag: 0,
+            write_buf: Vec::new(),
+        }
+    }
 }
 
 /// linux_net keeps per-instance state in a `Box<LinuxNetState>` like
@@ -1245,7 +1255,20 @@ pub struct LinuxNetState {
     /// rebuild — the carried-attribution source for bind stamps.
     lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
     net_out: i32,
-    conns: [LinuxNetConn; LINUX_NET_MAX_CONNS],
+    /// Connection table, `max_conns` slots; the slot index is the
+    /// net_proto conn id.
+    conns: Vec<LinuxNetConn>,
+    /// Per-connection write backlog cap (`write_buf_kib` param).
+    write_buf_max: usize,
+    /// `listen()` backlog for every listener this instance binds.
+    listen_backlog: i32,
+    /// epoll set holding every live fd, `data.u64` = slot index. Level
+    /// triggered: readiness is re-reported every step until consumed,
+    /// so a socket skipped for channel back-pressure is not lost.
+    epfd: i32,
+    /// Scratch for one `epoll_wait` batch.
+    ready: Vec<libc::epoll_event>,
+    ready_len: usize,
     /// Sized to absorb a full multi-MSS `CMD_SEND` payload. The
     /// upstream HTTP module stages up to `NET_BUF_SIZE` bytes per
     /// call (8 KiB on aarch64); a smaller cmd_buf would silently
@@ -1260,7 +1283,7 @@ pub struct LinuxNetState {
     /// in step T isn't immediately reused in step T+1 — that race lets
     /// stale `CMD_SEND` bytes from the previous session land on the
     /// fresh connection's fd, scrambling its response stream.
-    next_alloc: u8,
+    next_alloc: usize,
     /// Control-frame (MSG_CONNECTED / CLOSED / ERROR / BOUND) retry queue. The
     /// consumer channel is all-or-nothing; when it's momentarily full a tiny
     /// control frame would otherwise be DROPPED, stranding a waiter. Queue it and
@@ -1270,41 +1293,107 @@ pub struct LinuxNetState {
 }
 
 impl LinuxNetState {
-    /// Allocate the per-instance state DIRECTLY on the heap. At
-    /// `LINUX_NET_MAX_CONNS = 128` × `LINUX_NET_WRITE_BUF = 128 KiB` the
-    /// struct is ~16 MiB; building it by value (`Self { … }`) would
-    /// materialise that whole array as a stack temporary before the
-    /// `Box` move and overflow the 8 MiB default stack. Allocating with
-    /// `Box::new_uninit` and initialising fields in place never puts the
-    /// full struct on the stack (each `LinuxNetConn::EMPTY` write is one
-    /// slot at a time).
+    /// Build the per-instance state on the heap. The connection table is
+    /// a `Vec` of small slot records; write backlogs are allocated per
+    /// connection on first use, so the size of this struct does not
+    /// scale with `max_conns * write_buf_max`.
     pub fn new(
         net_ins: [i32; LINUX_NET_MAX_INBOUND],
         lane_owners: [crate::kernel::workload::owner::OwnerHandle; LINUX_NET_MAX_INBOUND],
         net_out: i32,
+        max_conns: usize,
+        write_buf_max: usize,
+        listen_backlog: i32,
     ) -> Box<Self> {
-        let mut b: Box<core::mem::MaybeUninit<Self>> = Box::new_uninit();
-        let p = b.as_mut_ptr();
-        // SAFETY: `p` points at the freshly-allocated, uninitialised Box
-        // contents; every field is written exactly once below before
-        // `assume_init`, and the pointer is valid + aligned for `Self`.
-        unsafe {
-            use core::ptr::addr_of_mut;
-            addr_of_mut!((*p).net_ins).write(net_ins);
-            addr_of_mut!((*p).lane_owners).write(lane_owners);
-            addr_of_mut!((*p).net_out).write(net_out);
-            let conns = addr_of_mut!((*p).conns) as *mut LinuxNetConn;
-            for i in 0..LINUX_NET_MAX_CONNS {
-                conns.add(i).write(LinuxNetConn::EMPTY);
-            }
-            addr_of_mut!((*p).cmd_buf).write([0u8; 49152]);
-            addr_of_mut!((*p).msg_buf).write([0u8; 16384]);
-            addr_of_mut!((*p).recv_buf).write([0u8; 16384]);
+        let max_conns = max_conns.clamp(2, LINUX_NET_MAX_CONNS_CAP);
+        let mut conns = Vec::with_capacity(max_conns);
+        for _ in 0..max_conns {
+            conns.push(LinuxNetConn::empty());
+        }
+        // SAFETY: plain libc call with no pointer arguments.
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epfd < 0 {
+            log::error!("[linux_net] epoll_create1 failed; sockets will never report ready");
+        }
+        let mut ready = Vec::with_capacity(LINUX_NET_READY_BATCH);
+        for _ in 0..LINUX_NET_READY_BATCH {
+            ready.push(libc::epoll_event { events: 0, u64: 0 });
+        }
+        Box::new(Self {
+            net_ins,
+            lane_owners,
+            net_out,
+            conns,
+            write_buf_max: write_buf_max.max(1),
+            listen_backlog: listen_backlog.max(1),
+            epfd,
+            ready,
+            ready_len: 0,
+            cmd_buf: [0u8; 49152],
+            msg_buf: [0u8; 16384],
+            recv_buf: [0u8; 16384],
             // Skip slot 0 in initial rotation — it's almost always the
             // TCP listener bound by the first CMD_BIND.
-            addr_of_mut!((*p).next_alloc).write(1);
-            addr_of_mut!((*p).pending_ctrl).write(std::collections::VecDeque::new());
-            b.assume_init()
+            next_alloc: 1,
+            pending_ctrl: std::collections::VecDeque::new(),
+        })
+    }
+
+    /// Register `fd` (held by slot `slot`) for `events` in the epoll set.
+    /// Closing the fd removes it again, so slots are never explicitly
+    /// deregistered.
+    unsafe fn watch(&self, fd: i32, slot: usize, events: u32) {
+        if self.epfd < 0 {
+            return;
+        }
+        let mut ev = libc::epoll_event {
+            events,
+            u64: slot as u64,
+        };
+        if libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) < 0 {
+            let err = *libc::__errno_location();
+            log::warn!("[linux_net] epoll add failed for slot {slot} (errno {err})");
+        }
+    }
+
+    /// Change the events watched for `fd`.
+    unsafe fn rewatch(&self, fd: i32, slot: usize, events: u32) {
+        if self.epfd < 0 {
+            return;
+        }
+        let mut ev = libc::epoll_event {
+            events,
+            u64: slot as u64,
+        };
+        libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev);
+    }
+
+    /// Fill `ready` with the slots whose fds report readiness. Zero
+    /// timeout: this runs inside a scheduler step.
+    unsafe fn poll_ready(&mut self) {
+        self.ready_len = 0;
+        if self.epfd < 0 {
+            return;
+        }
+        let n = libc::epoll_wait(
+            self.epfd,
+            self.ready.as_mut_ptr(),
+            self.ready.len() as i32,
+            0,
+        );
+        if n > 0 {
+            self.ready_len = n as usize;
+        }
+    }
+
+    /// Slot index carried by ready event `k`, or `None` if it no longer
+    /// names a slot.
+    fn ready_slot(&self, k: usize) -> Option<usize> {
+        let slot = self.ready[k].u64 as usize;
+        if slot < self.conns.len() {
+            Some(slot)
+        } else {
+            None
         }
     }
 
@@ -1370,7 +1459,7 @@ pub fn linux_net_close_all_and_clear_registry() {
                 if conn.fd >= 0 {
                     libc::close(conn.fd);
                 }
-                *conn = LinuxNetConn::EMPTY;
+                *conn = LinuxNetConn::empty();
             }
         }
         (*reg).clear();
@@ -1397,7 +1486,7 @@ pub fn linux_net_close_owner_conns(owner: crate::kernel::workload::owner::OwnerH
                             owner.slot
                         );
                     }
-                    *conn = LinuxNetConn::EMPTY;
+                    *conn = LinuxNetConn::empty();
                 }
             }
         }
@@ -1437,11 +1526,12 @@ fn linux_net_alloc_conn(st: &mut LinuxNetState) -> i32 {
     // table has cycled — by that time any stale CMD_SEND bytes for the
     // previous occupant have been drained and harmlessly dropped (they
     // hit `state == 0` and exit early).
-    let start = st.next_alloc as usize;
-    for off in 0..LINUX_NET_MAX_CONNS {
-        let i = (start + off) % LINUX_NET_MAX_CONNS;
+    let n = st.conns.len();
+    let start = st.next_alloc % n;
+    for off in 0..n {
+        let i = (start + off) % n;
         if st.conns[i].state == 0 {
-            st.next_alloc = ((i + 1) % LINUX_NET_MAX_CONNS) as u8;
+            st.next_alloc = (i + 1) % n;
             return i as i32;
         }
     }
@@ -1628,7 +1718,7 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
     // burst of a high-concurrency connect (clients ramp up
     // simultaneously in benchmarks). At backlog=8 a 32-client burst
     // dropped SYNs 9..=32 — clients saw ConnectionReset on connect.
-    if libc::listen(fd, 128) < 0 {
+    if libc::listen(fd, st.listen_backlog) < 0 {
         log::error!("[linux_net] listen() failed");
         libc::close(fd);
         linux_net_send_bind_refused(st, port, 95); // EOPNOTSUPP
@@ -1643,8 +1733,9 @@ unsafe fn linux_net_cmd_bind(st: &mut LinuxNetState, port: u16, lane: usize) {
         state: 3,
         port,
         owner: commander,
-        ..LinuxNetConn::EMPTY
+        ..LinuxNetConn::empty()
     };
+    st.watch(fd, idx, libc::EPOLLIN as u32);
     // The scenario runner uses this stderr line as its readiness signal. Keep it
     // visible at the default warning log level; an info-only signal makes
     // `fluxor run` kill a healthy, already-listening host after five seconds.
@@ -1743,8 +1834,9 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
         port,
         owner: commander,
         dg_owner_tag: owner_tag,
-        ..LinuxNetConn::EMPTY
+        ..LinuxNetConn::empty()
     };
+    st.watch(fd, idx, libc::EPOLLIN as u32);
     log::info!("[linux_net] UDP bound port {port} (slot {idx})");
 
     // MSG_DG_BOUND payload (datagram contract):
@@ -1765,7 +1857,7 @@ unsafe fn linux_net_dg_cmd_send_to(
     port: u16,
     data: &[u8],
 ) {
-    if ep < 0 || (ep as usize) >= LINUX_NET_MAX_CONNS {
+    if ep < 0 || (ep as usize) >= st.conns.len() {
         return;
     }
     let idx = ep as usize;
@@ -1798,7 +1890,7 @@ unsafe fn linux_net_dg_cmd_send_to(
 }
 
 unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16, claimed_tag: u16) {
-    if ep < 0 || (ep as usize) >= LINUX_NET_MAX_CONNS {
+    if ep < 0 || (ep as usize) >= st.conns.len() {
         return;
     }
     let idx = ep as usize;
@@ -1810,7 +1902,7 @@ unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16, claimed_tag: u
     if st.conns[idx].fd >= 0 && st.conns[idx].conn_type == CONN_TYPE_UDP_BOUND {
         libc::close(st.conns[idx].fd);
     }
-    st.conns[idx] = LinuxNetConn::EMPTY;
+    st.conns[idx] = LinuxNetConn::empty();
 
     let mut msg = [0u8; 3];
     msg[0] = DG_MSG_CLOSED;
@@ -1822,8 +1914,12 @@ unsafe fn linux_net_dg_cmd_close(st: &mut LinuxNetState, ep: i16, claimed_tag: u
 
 unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
     let mut had_work = false;
-    let mut i = 0;
-    while i < LINUX_NET_MAX_CONNS {
+    let mut k = 0;
+    while k < st.ready_len {
+        let Some(i) = st.ready_slot(k) else {
+            k += 1;
+            continue;
+        };
         if st.conns[i].conn_type == CONN_TYPE_UDP_BOUND
             && st.conns[i].state == 3
             && st.conns[i].fd >= 0
@@ -1846,7 +1942,7 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
                 //   [ep_id:1][af:1=4][src_addr:4 BE][src_port:2 LE][data...].
                 let payload_len = 1 + 1 + 4 + 2 + n;
                 if 1 + payload_len > st.msg_buf.len() {
-                    i += 1;
+                    k += 1;
                     continue;
                 }
                 st.msg_buf[0] = DG_MSG_RX_FROM;
@@ -1870,7 +1966,7 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
                 had_work = true;
             }
         }
-        i += 1;
+        k += 1;
     }
     had_work
 }
@@ -1906,7 +2002,7 @@ unsafe fn linux_net_cmd_connect(
     let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
     if fd < 0 {
         log::error!("[linux_net] socket() failed for connect");
-        st.conns[idx] = LinuxNetConn::EMPTY; // release the slot we reserved
+        st.conns[idx] = LinuxNetConn::empty(); // release the slot we reserved
         let errno = *libc::__errno_location();
         let cb = (idx as u16).to_le_bytes();
         let msg = [MSG_ERROR, cb[0], cb[1], errno as u8, tag];
@@ -1946,8 +2042,9 @@ unsafe fn linux_net_cmd_connect(
             // down with its owner on drain/revoke; otherwise it stays
             // OWNER_SYSTEM and outlives revocation.
             owner: st.lane_owners[lane],
-            ..LinuxNetConn::EMPTY
+            ..LinuxNetConn::empty()
         };
+        st.watch(fd, idx, (libc::EPOLLOUT | libc::EPOLLIN) as u32);
     } else {
         st.conns[idx] = LinuxNetConn {
             fd,
@@ -1955,8 +2052,9 @@ unsafe fn linux_net_cmd_connect(
             state: 2,
             connect_tag: tag,
             owner: st.lane_owners[lane],
-            ..LinuxNetConn::EMPTY
+            ..LinuxNetConn::empty()
         };
+        st.watch(fd, idx, libc::EPOLLIN as u32);
         let cb = (idx as u16).to_le_bytes();
         let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
         linux_net_send_msg(st, &msg);
@@ -1972,7 +2070,7 @@ unsafe fn linux_net_cmd_connect(
 /// upstream channel buffer instead of dropping data.
 unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) {
     let idx = conn_id as usize;
-    if idx >= LINUX_NET_MAX_CONNS || st.conns[idx].state < 2 {
+    if idx >= st.conns.len() || st.conns[idx].state < 2 {
         return;
     }
     let conn = &mut st.conns[idx];
@@ -2004,7 +2102,7 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
                 // firewall.
                 log::warn!("[linux_net] dropping conn {conn_id} on send error (errno {err})");
                 let fd = conn.fd;
-                st.conns[idx] = LinuxNetConn::EMPTY;
+                st.conns[idx] = LinuxNetConn::empty();
                 libc::close(fd);
                 let cb = conn_id.to_le_bytes();
                 let msg = [MSG_CLOSED, cb[0], cb[1]];
@@ -2028,19 +2126,17 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
     conn.write_len = already as u32;
     conn.write_offset = 0;
 
-    if already + remaining > conn.write_buf.len() {
+    let write_buf_max = st.write_buf_max;
+    let conn = &mut st.conns[idx];
+    if already + remaining > write_buf_max {
         // Backlog overflow: upstream produced data faster than our
         // sized backlog can absorb. Drop the connection cleanly so
         // the peer fails fast rather than waiting on a stalled stream.
         log::warn!(
-            "[linux_net] write backlog overflow on conn {} ({} pending + {} new > {})",
-            conn_id,
-            already,
-            remaining,
-            conn.write_buf.len()
+            "[linux_net] write backlog overflow on conn {conn_id} ({already} pending + {remaining} new > {write_buf_max})"
         );
         let fd = conn.fd;
-        st.conns[idx] = LinuxNetConn::EMPTY;
+        st.conns[idx] = LinuxNetConn::empty();
         libc::close(fd);
         let cb = conn_id.to_le_bytes();
         let msg = [MSG_CLOSED, cb[0], cb[1]];
@@ -2048,6 +2144,9 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
         return;
     }
 
+    if conn.write_buf.len() < write_buf_max {
+        conn.write_buf.resize(write_buf_max, 0);
+    }
     let dst = &mut conn.write_buf[already..already + remaining];
     dst.copy_from_slice(&data[sent_now..]);
     conn.write_len = (already + remaining) as u32;
@@ -2067,8 +2166,8 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
 /// the server unable to handle a second connection.
 unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
     let mut heavy_pending = false;
-    let threshold = LINUX_NET_WRITE_BUF / 2;
-    for i in 0..LINUX_NET_MAX_CONNS {
+    let threshold = st.write_buf_max / 2;
+    for i in 0..st.conns.len() {
         let c = &mut st.conns[i];
         if c.fd < 0 || c.write_len == c.write_offset {
             continue;
@@ -2087,7 +2186,7 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
                 log::warn!("[linux_net] dropping conn {i} on drain-write error (errno {err})");
                 let fd = c.fd;
                 let cb = (i as u16).to_le_bytes();
-                st.conns[i] = LinuxNetConn::EMPTY;
+                st.conns[i] = LinuxNetConn::empty();
                 libc::close(fd);
                 let msg = [MSG_CLOSED, cb[0], cb[1]];
                 linux_net_send_msg(st, &msg);
@@ -2108,13 +2207,13 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
 
 unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
     let idx = conn_id as usize;
-    if idx >= LINUX_NET_MAX_CONNS || st.conns[idx].state == 0 {
+    if idx >= st.conns.len() || st.conns[idx].state == 0 {
         return;
     }
     if st.conns[idx].fd >= 0 {
         libc::close(st.conns[idx].fd);
     }
-    st.conns[idx] = LinuxNetConn::EMPTY;
+    st.conns[idx] = LinuxNetConn::empty();
     let cb = conn_id.to_le_bytes();
     let msg = [MSG_CLOSED, cb[0], cb[1]];
     linux_net_send_msg(st, &msg);
@@ -2132,8 +2231,11 @@ unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
     // overhead ≈ a few hundred µs).
     const PER_TICK_ACCEPT_BUDGET: u32 = 32;
 
-    for li in 0..LINUX_NET_MAX_CONNS {
-        if st.conns[li].state != 3 || st.conns[li].fd < 0 {
+    for k in 0..st.ready_len {
+        let Some(li) = st.ready_slot(k) else {
+            continue;
+        };
+        if st.conns[li].state != 3 || st.conns[li].conn_type != 1 || st.conns[li].fd < 0 {
             continue;
         }
 
@@ -2262,9 +2364,10 @@ unsafe fn accept_one_client(
         // At `warn`, because a full connection table is not routine: it
         // means the deployment is at its ceiling and refusing work.
         log::warn!(
-            "[linux_net] connection table full ({LINUX_NET_MAX_CONNS} slots) — \
+            "[linux_net] connection table full ({} slots) — \
              refusing an accepted connection on port {listener_port}; the peer \
-             will see a close with no alert"
+             will see a close with no alert",
+            st.conns.len()
         );
         libc::close(client_fd);
         return;
@@ -2275,8 +2378,9 @@ unsafe fn accept_one_client(
         conn_type: 1,
         state: 2,
         owner,
-        ..LinuxNetConn::EMPTY
+        ..LinuxNetConn::empty()
     };
+    st.watch(client_fd, idx, libc::EPOLLIN as u32);
 
     // MSG_ACCEPTED payload: [conn_id:2 LE][listener_port:2 LE]
     let pb = listener_port.to_le_bytes();
@@ -2289,7 +2393,10 @@ unsafe fn accept_one_client(
 unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
     let mut had_work = false;
 
-    for i in 0..LINUX_NET_MAX_CONNS {
+    for k in 0..st.ready_len {
+        let Some(i) = st.ready_slot(k) else {
+            continue;
+        };
         if st.conns[i].state != 2 && st.conns[i].state != 1 {
             continue;
         }
@@ -2317,13 +2424,14 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                     let tag = st.conns[i].connect_tag;
                     if err == 0 {
                         st.conns[i].state = 2;
+                        st.rewatch(st.conns[i].fd, i, libc::EPOLLIN as u32);
                         let cb = (i as u16).to_le_bytes();
                         let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
                         linux_net_send_msg(st, &msg);
                         had_work = true;
                     } else {
                         libc::close(st.conns[i].fd);
-                        st.conns[i] = LinuxNetConn::EMPTY;
+                        st.conns[i] = LinuxNetConn::empty();
                         let cb = (i as u16).to_le_bytes();
                         let msg = [MSG_ERROR, cb[0], cb[1], err as u8, tag];
                         linux_net_send_msg(st, &msg);
@@ -2391,7 +2499,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             had_work = true;
         } else if n == 0 {
             libc::close(st.conns[i].fd);
-            st.conns[i] = LinuxNetConn::EMPTY;
+            st.conns[i] = LinuxNetConn::empty();
             let cb = (i as u16).to_le_bytes();
             let msg = [MSG_CLOSED, cb[0], cb[1]];
             linux_net_send_msg(st, &msg);
@@ -2408,7 +2516,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             let err = *libc::__errno_location();
             if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
                 libc::close(st.conns[i].fd);
-                st.conns[i] = LinuxNetConn::EMPTY;
+                st.conns[i] = LinuxNetConn::empty();
                 let cb = (i as u16).to_le_bytes();
                 let msg = [MSG_CLOSED, cb[0], cb[1]];
                 linux_net_send_msg(st, &msg);
@@ -2575,6 +2683,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
             }
         }
 
+        st.poll_ready();
         if linux_net_poll_accept(st) {
             had_work = true;
         }

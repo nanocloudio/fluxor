@@ -128,11 +128,17 @@ fn parse_args() -> CliArgs {
 // test harness can exercise them directly. Bring the binary-facing entry points
 // into scope so the flat registration (`runtime.rs`) and boot/watch sites
 // (`linux.rs` body) resolve them by name.
+use fluxor::platform::builtin_param_tags::linux_net::{
+    TAG_LISTEN_BACKLOG as NET_TAG_LISTEN_BACKLOG, TAG_MAX_CONNS as NET_TAG_MAX_CONNS,
+    TAG_WRITE_BUF_KIB as NET_TAG_WRITE_BUF_KIB,
+};
 use fluxor::platform::linux::owner_drain::{arm_drains, drain_tick, synthesize_restart_terminals};
 use fluxor::platform::linux::owner_status::OwnerStatusWriter;
 use fluxor::platform::linux::providers::{
     linux_fs_dispatch, linux_net_close_all_and_clear_registry, linux_net_register_state,
-    linux_net_step, linux_proc_dispatch, LinuxNetState, LINUX_NET_HASH, LINUX_NET_MAX_INBOUND,
+    linux_net_step, linux_proc_dispatch, LinuxNetState, LINUX_NET_HASH,
+    LINUX_NET_LISTEN_BACKLOG_DEFAULT, LINUX_NET_MAX_CONNS_DEFAULT, LINUX_NET_MAX_INBOUND,
+    LINUX_NET_WRITE_BUF_DEFAULT,
 };
 include!("linux/object.rs");
 include!("linux/namespace.rs");
@@ -237,8 +243,26 @@ fn build_graph_linux() -> (usize, usize) {
                 }
             }
             let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
+            // Table and backlog sizing from the graph (`platform: net:`
+            // fields); the manifest defaults apply when absent.
+            let mut max_conns = LINUX_NET_MAX_CONNS_DEFAULT as u32;
+            let mut write_buf_kib = (LINUX_NET_WRITE_BUF_DEFAULT / 1024) as u32;
+            let mut listen_backlog = LINUX_NET_LISTEN_BACKLOG_DEFAULT as u32;
+            walk_tlv(entry.params(), |tag, value| match tag {
+                NET_TAG_MAX_CONNS => max_conns = tlv_u32(value),
+                NET_TAG_WRITE_BUF_KIB => write_buf_kib = tlv_u32(value),
+                NET_TAG_LISTEN_BACKLOG => listen_backlog = tlv_u32(value),
+                _ => {}
+            });
             let mut m = scheduler::BuiltInModule::new("linux_net", linux_net_step);
-            let state = LinuxNetState::new(net_ins, lane_owners, net_out_ch);
+            let state = LinuxNetState::new(
+                net_ins,
+                lane_owners,
+                net_out_ch,
+                max_conns as usize,
+                write_buf_kib as usize * 1024,
+                listen_backlog.min(i32::MAX as u32) as i32,
+            );
             // Register for the platform-side endpoint report, the owner
             // teardown hook, and the rebuild fd close-out (§4.3–§4.5).
             linux_net_register_state(&*state as *const LinuxNetState as *mut LinuxNetState);

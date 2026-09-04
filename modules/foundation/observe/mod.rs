@@ -4,7 +4,7 @@
 //! renders every `TelemetryRecord` as a `MON_` text line —
 //!   - `MON_METRIC` / `MON_SPAN` from module-scope metric/span records,
 //!   - `MON_HIST` / `MON_RES` from the kernel-pushed PSTATUS step-histogram and
-//!     arena/fault records (§5.3).
+//!     arena/fault records.
 //! `MON_FAULT` is emitted by the kernel directly. All lines ride the same
 //! transport-agnostic `log_ring` path as the rest of the `MON_*` protocol, so
 //! whatever debug transport is configured carries them.
@@ -15,10 +15,10 @@
 //! id-interned records and MON_ text.
 //!
 //! Parameters:
-//!   `interval_ms` — the kernel PSTATUS cadence, declared via `TLM_SUBSCRIBE`
-//!                   (§5.3): how often the kernel pushes its step-histogram /
-//!                   arena round (default 5000 ms). The ring drain itself runs
-//!                   every step.
+//!   `interval_ms` — the kernel PSTATUS cadence, declared via
+//!                   `TLM_SUBSCRIBE`: how often the kernel pushes its
+//!                   step-histogram / arena round (default 5000 ms). The
+//!                   ring drain itself runs every step.
 
 #![no_std]
 #![allow(
@@ -40,9 +40,10 @@ include!("../../sdk/runtime/params.rs");
 use abi::contracts::telemetry as tlm;
 use abi::kernel_abi::LOG_WRITE as SYSTEM_LOG;
 
-/// Build buffer for one MON_ line. MON_HIST with eight 10-digit buckets is the
-/// widest at ~140 chars; round up.
-const LINE_BUF: usize = 192;
+/// Build buffer for one MON_ line. MON_METRIC kind=4 (histogram16) with
+/// sixteen 20-digit buckets plus mod/id/kind/dim prefix is the widest at
+/// ~450 chars; round up.
+const LINE_BUF: usize = 512;
 
 /// Records drained per step, in bytes. `TLM_DRAIN` copies whole records into
 /// this buffer, so it doubles as the bound that keeps a flooded ring from
@@ -54,8 +55,8 @@ struct ObserveState {
     syscalls: *const SyscallTable,
     /// Telemetry-ring drain slot claimed via `TLM_SUBSCRIBE` (`-1` = none).
     tlm_slot: i32,
-    /// Declared to the kernel PSTATUS cadence via TLM_SUBSCRIBE (§5.3); the
-    /// kernel produces the step-histogram/arena records this module renders.
+    /// Declared to the kernel PSTATUS cadence via TLM_SUBSCRIBE; the kernel
+    /// produces the step-histogram/arena records this module renders.
     interval_ms: u32,
 }
 
@@ -158,14 +159,19 @@ fn render_record(rec: &[u8], out: &mut [u8]) -> usize {
             emit_decimal(tlm::metric_id(rec) as u64, out, &mut pos);
             emit_bytes(b" kind=", out, &mut pos);
             emit_decimal(knd, out, &mut pos);
-            if knd == tlm::METRIC_HISTOGRAM as u64 {
+            // Composite dimension index: omitted when DIM_NONE, so a line
+            // for an undimensioned instrument carries no `dim=` field.
+            let dim = tlm::metric_dim(rec);
+            if dim != tlm::DIM_NONE {
+                emit_bytes(b" dim=", out, &mut pos);
+                emit_decimal(dim as u64, out, &mut pos);
+            }
+            let nbuckets = tlm::hist_bucket_count(knd as u8);
+            if nbuckets > 0 {
                 let mut bi = 0usize;
-                while bi < tlm::HIST_BUCKETS {
+                while bi < nbuckets {
                     emit_bytes(b" b", out, &mut pos);
-                    if pos < out.len() {
-                        out[pos] = b'0' + bi as u8;
-                        pos += 1;
-                    }
+                    emit_decimal(bi as u64, out, &mut pos);
                     emit_bytes(b"=", out, &mut pos);
                     let off = 16 + bi * 8;
                     emit_decimal(read_u64(rec, off), out, &mut pos);
@@ -192,9 +198,8 @@ fn render_record(rec: &[u8], out: &mut [u8]) -> usize {
             pos
         }
         x if x == tlm::SIGNAL_PSTATUS => {
-            // Kernel-pushed per-module process status (§5.3). STEP renders as the
-            // MON_HIST line the console used to pull via STEP_HISTOGRAM_QUERY;
-            // RES surfaces arena + fault state.
+            // Kernel-pushed per-module process status. STEP renders as a
+            // MON_HIST line; RES surfaces arena + fault state.
             if knd == tlm::PSTATUS_STEP as u64 {
                 emit_bytes(b"MON_HIST mod=", out, &mut pos);
                 emit_decimal(module, out, &mut pos);
@@ -327,8 +332,8 @@ pub extern "C" fn module_new(
             params_def::set_defaults(s);
         }
 
-        // Subscribe to the ring (all signals) AND declare the PSTATUS cadence in
-        // one call: `[filter u32][interval ms u64]` (§5.3). The kernel produces
+        // Subscribe to the ring (all signals) AND declare the PSTATUS cadence
+        // in one call: `[filter u32][interval ms u64]`. The kernel produces
         // the step-histogram/arena records the console renders, so the
         // collector's `interval_ms` sets that emit rate.
         let mut sub = [0u8; tlm::SUBSCRIBE_INTERVAL_OFFSET + 8];
@@ -353,9 +358,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // Drain the ring every step and render each record as a MON_ line.
-        // This now carries the whole signal set — metrics, spans, AND the
-        // kernel-pushed PSTATUS step-histogram/arena records (MON_HIST/MON_RES),
-        // so no separate pull round is needed (§5.3).
+        // The ring carries the whole signal set — metrics, spans, and the
+        // kernel-pushed PSTATUS step-histogram/arena records
+        // (MON_HIST/MON_RES) — so no separate pull round is needed.
         drain_telemetry(s);
 
         0

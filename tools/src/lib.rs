@@ -22,6 +22,7 @@ pub mod add_subgraph;
 pub mod agent_logs;
 pub mod asset_bank;
 pub mod ci;
+pub mod collect;
 // `fluxor.toml`'s schema, gated by `fluxor ci`'s `fluxor-toml-schema`
 // phase: which keys a project must carry, which its shape forbids, and
 // the one meaning each key has.
@@ -58,9 +59,9 @@ pub mod observability;
 // and consume both touch only the local store.
 pub mod oci_store;
 // Standalone, unit-testable validator for `presentation.shell` /
-// `presentation.browser_overlay` descriptors (RFC browser_overlay §19).
-// Dependency-light (serde_json + error) so it dual-compiles cleanly
-// into both the lib (tests) and the bin (called from `config.rs`).
+// `presentation.browser_overlay` descriptors. Dependency-light
+// (serde_json + error) so it dual-compiles cleanly into both the lib
+// (tests) and the bin (called from `config.rs`).
 pub mod content_render;
 pub mod presentation_resolver;
 pub mod presentation_shell;
@@ -100,10 +101,10 @@ pub mod wire;
 #[path = "../../modules/sdk/abi_surface.rs"]
 pub mod abi_surface;
 
-/// Reusable continuity/protocol cores (rfc_protocols.md §15.1) —
-/// path-mounted from `modules/sdk/cores/` so the host test suite
-/// exercises the exact logic modules `include!`. `nonce_reservation`
-/// carries the Phase-7 R2 fencing semantics; its tests are the
-/// executable, state-machine-level form of the §18 "R2 nonce non-reuse
-/// under forced recovery" verification gate.
+/// Reusable continuity/protocol cores — path-mounted from
+/// `modules/sdk/cores/` so the host test suite exercises the exact
+/// logic modules `include!`. `nonce_reservation` carries the Phase-7
+/// R2 fencing semantics; its tests are the executable,
+/// state-machine-level form of the §18 "R2 nonce non-reuse under
+/// forced recovery" verification gate.
 pub mod continuity_cores;

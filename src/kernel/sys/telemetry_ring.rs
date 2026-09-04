@@ -24,7 +24,7 @@ use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 pub const CONSUMERS: usize = 4;
 
 // Capacity per target family, power of two. Telemetry records are denser than
-// log text, so smaller than the log ring's 4/64 KiB split (§5.1). The `rp` MCUs
+// log text, so this sits below the log ring's 4/64 KiB split. The `rp` MCUs
 // are RAM-constrained (embassy-usb/net + kernel share ~256/520 KiB), so they get
 // a modest ring; only the bcm2712 application processor gets the full 32 KiB.
 #[cfg(feature = "chip-rp2040")]
@@ -45,11 +45,11 @@ const PSTATUS_ROUND: usize = crate::kernel::exec::scheduler::MAX_MODULES * (52 +
     + crate::abi::contracts::resource::KERNEL_POOL_COUNT * 32;
 const _: () = assert!(CAPACITY >= PSTATUS_ROUND);
 
-/// Largest record accepted in one reservation — a histogram metric (80 B). A
-/// larger record is rejected whole. Mirror of
+/// Largest record accepted in one reservation — a 16-bucket histogram
+/// metric (144 B). A larger record is rejected whole. Mirror of
 /// `abi::contracts::telemetry::MAX_RECORD_SIZE`, pinned by the same test that
 /// pins `telemetry_record_len`.
-const MAX_RECORD: usize = 80;
+const MAX_RECORD: usize = crate::kernel::exec::scheduler::module_types::TELEMETRY_MAX_RECORD;
 
 // Signal-type filter bits — mirror of `abi::contracts::telemetry::FILTER_*`.
 const FILTER_METRIC: u32 = 1 << 0;

@@ -60,7 +60,7 @@ wiring = [
 [[variant]]
 match = { family = "linux" }
 modules = [
-  { name = "linux_net" },
+  { name = "linux_net", params = { max_conns = "user:max_conns|128", write_buf_kib = "user:write_buf_kib|128", listen_backlog = "user:listen_backlog|128" } },
 ]
 wiring = []
 

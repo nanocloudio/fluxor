@@ -616,14 +616,13 @@ pub struct CommandVocabulary {
 }
 
 /// A named feature-set variant declared by a `[[variant]]` table in the
-/// source `manifest.toml` (RFC module_variants). Tools-side only — never
-/// serialized to the binary manifest. Each variant drives one rustc
-/// invocation (`--cfg feature="…"` per entry in `features`) producing one
-/// prebuilt `.fmod`; the default variant emits the unsuffixed
-/// `<module>.fmod`, non-default variants emit `<module>-<name>.fmod`.
-/// The variant suffix exists only in the filename — the embedded fmod
-/// name (and therefore the FXMT `name_hash` graphs bind against) stays
-/// the base module type.
+/// source `manifest.toml`. Tools-side only — never serialized to the
+/// binary manifest. Each variant drives one rustc invocation (`--cfg
+/// feature="…"` per entry in `features`) producing one prebuilt `.fmod`;
+/// the default variant emits the unsuffixed `<module>.fmod`, non-default
+/// variants emit `<module>-<name>.fmod`. The variant suffix exists only
+/// in the filename — the embedded fmod name (and therefore the FXMT
+/// `name_hash` graphs bind against) stays the base module type.
 #[derive(Debug, Clone)]
 pub struct VariantDecl {
     pub name: String,
@@ -797,16 +796,16 @@ pub enum TimerClass {
     /// Needs a fixed-cadence WCET guarantee (a control loop / hard-real-time
     /// step). UNSAFE on a mechanism-(b) (variable-cadence) domain UNLESS the
     /// domain re-validates its WCET/budget schedulability at `tick_min_us`
-    /// (RFC adaptive_tick §11 / D8 rule 6 — see `guaranteed_wcet_revalidated`).
+    /// (see `guaranteed_wcet_revalidated`).
     Guaranteed,
     /// Advances an externally committed / replicated logical clock (e.g.
     /// `ttl_scheduler`, `lease_manager`): it reads wall-clock `dev_millis` so
     /// it does NOT silently rescale under a variable cadence, but its expiry
     /// semantics must agree across replicas. Mechanism (b) MUST NOT change the
     /// replicated-tick *emission rate* unless all replicas agree, and
-    /// mechanism (a) idle must not stall the tick emitter (RFC adaptive_tick
-    /// §7.3 / D8 rule 4). The validator applies the dedicated replicated-clock
-    /// gate rather than the generic step-counted gate.
+    /// mechanism (a) idle must not stall the tick emitter. The validator
+    /// applies the dedicated replicated-clock gate rather than the generic
+    /// step-counted gate.
     ReplicatedClock,
 }
 
@@ -833,12 +832,13 @@ impl TimerClass {
     pub fn forbids_adaptive(self) -> bool {
         matches!(self, Self::TickCounted | Self::Guaranteed)
     }
-    /// True only for a POSITIVE attestation that the module tolerates a variable
-    /// cadence. Required for every admitted module on a mechanism-(b) domain (RFC
-    /// §8 rule 2): `Unattested` (absent declaration) does NOT qualify — that is
-    /// the fail-closed default. `ReplicatedClock` qualifies for the *per-module
-    /// rescale* concern (it reads wall-clock time), but the cross-replica
-    /// emission-rate hazard is gated separately by the replicated-clock gate.
+    /// True only for a POSITIVE attestation that the module tolerates a
+    /// variable cadence. Required for every admitted module on a mechanism-(b)
+    /// domain: `Unattested` (absent declaration) does NOT qualify — that is
+    /// the fail-closed default. `ReplicatedClock` qualifies for the
+    /// *per-module rescale* concern (it reads wall-clock time), but the
+    /// cross-replica emission-rate hazard is gated separately by the
+    /// replicated-clock gate.
     pub fn tolerates_variable_cadence(self) -> bool {
         matches!(
             self,
@@ -846,7 +846,7 @@ impl TimerClass {
         )
     }
     /// A replicated/committed logical clock whose cross-replica agreement the
-    /// adaptive cadence must not break (RFC §7.3 / D8 rule 4).
+    /// adaptive cadence must not break.
     pub fn is_replicated_clock(self) -> bool {
         matches!(self, Self::ReplicatedClock)
     }
@@ -910,10 +910,10 @@ pub struct Manifest {
     /// Module is built into the kernel (no .fmod file needed).
     /// Used by platform-specific modules like linux_net.
     pub builtin: bool,
-    /// `[[variant]]` feature-set variants (RFC module_variants). Parsed
-    /// from TOML, tools-side only, never serialized to binary — the
-    /// binary manifest a variant fmod embeds is the already-filtered
-    /// port table, not the variant declaration.
+    /// `[[variant]]` feature-set variants. Parsed from TOML, tools-side
+    /// only, never serialized to binary — the binary manifest a variant
+    /// fmod embeds is the already-filtered port table, not the variant
+    /// declaration.
     pub variants: Vec<VariantDecl>,
     /// `[capacities]` — module-scope capacity declarations, already
     /// resolved for the silicon this manifest was loaded for (same
@@ -990,12 +990,12 @@ pub struct Manifest {
     /// (`wall_clock` or `agnostic`) — `Unattested` is fail-closed for (b).
     pub timer_class: TimerClass,
     /// Coarse-step period in scheduler ticks (module ABI header byte 1,
-    /// loader.rs:846). 0 = step every tick (default). N>0 = step every N ticks;
-    /// the scheduler counts TICKS, so the wall-clock period is
+    /// loader.rs:846). 0 = step every tick (default). N>0 = step every N
+    /// ticks; the scheduler counts TICKS, so the wall-clock period is
     /// `step_period_ticks × domain_tick_us` — which a variable cadence WARPS.
     /// The adaptive validator therefore errors when a `step_period_ticks != 0`
-    /// module is on a mechanism-(b) domain unless it attests `wall_clock` (RFC
-    /// §8 rule 1). Wired into header byte 1 by `pack_fmod`/`pack_fmod_wasm`.
+    /// module is on a mechanism-(b) domain unless it attests `wall_clock`.
+    /// Wired into header byte 1 by `pack_fmod`/`pack_fmod_wasm`.
     pub step_period_ticks: u8,
 }
 
@@ -1047,6 +1047,217 @@ pub struct Observability {
     /// When set, the module opts out of the instrumentation contract with a
     /// stated reason (data-moving modules only).
     pub exempt: Option<String>,
+    /// Per-instrument metadata (`[[observability.instrument]]`): kind,
+    /// declared histogram bounds, and declared dimension domains. Optional
+    /// per instrument — a name in `metrics` with no row here is a plain
+    /// dimensionless counter, which is what every pre-§12 manifest declares
+    /// implicitly.
+    pub instruments: Vec<InstrumentDecl>,
+}
+
+/// One `[[observability.instrument]]` row: build-time metadata for a name in
+/// the `metrics` list. Bounds and dimension domains are id-table metadata —
+/// they ship to consumers out-of-band and never ride a sample record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentDecl {
+    /// Must match a name in `metrics`; the wire id stays that name's position.
+    pub name: String,
+    pub kind: InstrumentKind,
+    /// Histogram bucket upper bounds in µs, strictly ascending. Length is
+    /// fixed by kind: 7 for `histogram` (8 buckets), 15 for `histogram16`
+    /// (16 buckets, the last implicit `+Inf`). Empty for scalar kinds.
+    pub bounds_us: Vec<u64>,
+    /// Declared dimension keys, in composite-index order: `dim_id =
+    /// ((i0·s1)+i1)·s2+…` over the domain sizes.
+    pub dimensions: Vec<DimensionDecl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstrumentKind {
+    Counter,
+    UpDown,
+    Histogram,
+    Histogram16,
+}
+
+impl InstrumentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InstrumentKind::Counter => "counter",
+            InstrumentKind::UpDown => "updown",
+            InstrumentKind::Histogram => "histogram",
+            InstrumentKind::Histogram16 => "histogram16",
+        }
+    }
+
+    /// Declared-bound count this kind requires (buckets − 1), 0 for scalars.
+    pub fn bound_count(self) -> usize {
+        match self {
+            InstrumentKind::Histogram => 7,
+            InstrumentKind::Histogram16 => 15,
+            _ => 0,
+        }
+    }
+}
+
+/// One dimension key with its bounded value domain. The product of an
+/// instrument's domain sizes is capped at 65534 (`DIM_MAX_PRODUCT`) so the
+/// composite index always fits the record's u16 with `0xFFFF` left for
+/// `__other__`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DimensionDecl {
+    /// Attribute key — OTel semconv or `fluxor.*` (standards/observability.md
+    /// §5; vocabulary enforced by `fluxor lint observability`).
+    pub key: String,
+    pub domain: DimDomain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DimDomain {
+    /// Values `0..max` pass through as the component index.
+    Numeric { max: u32 },
+    /// Declared value set; the component index is the declared position. A
+    /// value outside the set folds to `__other__` at the emitter.
+    Enum { values: Vec<String> },
+}
+
+impl DimDomain {
+    pub fn size(&self) -> u32 {
+        match self {
+            DimDomain::Numeric { max } => *max,
+            DimDomain::Enum { values } => values.len() as u32,
+        }
+    }
+}
+
+/// Ceiling on the product of one instrument's declared domain sizes — mirror
+/// of `contracts/telemetry.rs::DIM_MAX_PRODUCT`, which keeps every composite
+/// index below the reserved `__other__` (`0xFFFF`).
+pub const DIM_MAX_PRODUCT: u32 = 65534;
+
+/// Convert one TOML instrument row into the typed declaration, rejecting
+/// unknown kinds/domains and domain/field mismatches at parse.
+fn convert_instrument(t: TomlInstrument) -> Result<InstrumentDecl> {
+    let ctx = |msg: String| Error::Module(format!("observability instrument '{}': {msg}", t.name));
+    let kind = match t.kind.as_str() {
+        "counter" => InstrumentKind::Counter,
+        "updown" => InstrumentKind::UpDown,
+        "histogram" => InstrumentKind::Histogram,
+        "histogram16" => InstrumentKind::Histogram16,
+        other => {
+            return Err(ctx(format!(
+                "unknown kind '{other}' (counter | updown | histogram | histogram16)"
+            )))
+        }
+    };
+    let mut dimensions = Vec::new();
+    for d in t.dimension.unwrap_or_default() {
+        let domain = match d.domain.as_str() {
+            "numeric" => {
+                if d.values.is_some() {
+                    return Err(ctx(format!(
+                        "dimension '{}': `values` belongs to domain = \"enum\"",
+                        d.key
+                    )));
+                }
+                DimDomain::Numeric {
+                    max: d.max.ok_or_else(|| {
+                        ctx(format!(
+                            "dimension '{}': numeric domain requires `max`",
+                            d.key
+                        ))
+                    })?,
+                }
+            }
+            "enum" => {
+                if d.max.is_some() {
+                    return Err(ctx(format!(
+                        "dimension '{}': `max` belongs to domain = \"numeric\"",
+                        d.key
+                    )));
+                }
+                DimDomain::Enum {
+                    values: d.values.ok_or_else(|| {
+                        ctx(format!(
+                            "dimension '{}': enum domain requires `values`",
+                            d.key
+                        ))
+                    })?,
+                }
+            }
+            other => {
+                return Err(ctx(format!(
+                    "dimension '{}': unknown domain '{other}' (numeric | enum)",
+                    d.key
+                )))
+            }
+        };
+        dimensions.push(DimensionDecl { key: d.key, domain });
+    }
+    Ok(InstrumentDecl {
+        name: t.name,
+        kind,
+        bounds_us: t.bounds_us,
+        dimensions,
+    })
+}
+
+/// Structural validation for `[[observability.instrument]]` rows.
+/// Vocabulary (semconv keys) is the lint's job; everything shape-shaped
+/// fails here, at manifest load.
+fn validate_instruments(obs: &Observability) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for inst in &obs.instruments {
+        let ctx =
+            |msg: String| Error::Module(format!("observability instrument '{}': {msg}", inst.name));
+        if !obs.metrics.iter().any(|m| m == &inst.name) {
+            return Err(ctx(
+                "not in the `metrics` list — the wire id is the name's position there, \
+                 so a metadata row without a metrics entry has no id to describe"
+                    .to_string(),
+            ));
+        }
+        if seen.contains(&inst.name.as_str()) {
+            return Err(ctx("declared twice".into()));
+        }
+        seen.push(&inst.name);
+        let want = inst.kind.bound_count();
+        if inst.bounds_us.len() != want {
+            return Err(ctx(format!(
+                "kind '{}' requires exactly {} `bounds_us` entries (buckets − 1), got {}",
+                inst.kind.as_str(),
+                want,
+                inst.bounds_us.len()
+            )));
+        }
+        if inst.bounds_us.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(ctx("`bounds_us` must be strictly ascending".into()));
+        }
+        let mut product: u64 = 1;
+        for d in &inst.dimensions {
+            let sz = d.domain.size();
+            if sz == 0 {
+                return Err(ctx(format!("dimension '{}' has an empty domain", d.key)));
+            }
+            match &d.domain {
+                DimDomain::Enum { values } => {
+                    let mut vs: Vec<&str> = values.iter().map(String::as_str).collect();
+                    vs.sort_unstable();
+                    if vs.windows(2).any(|w| w[0] == w[1]) {
+                        return Err(ctx(format!("dimension '{}' repeats a value", d.key)));
+                    }
+                }
+                DimDomain::Numeric { .. } => {}
+            }
+            product = product.saturating_mul(sz as u64);
+        }
+        if product > DIM_MAX_PRODUCT as u64 {
+            return Err(ctx(format!(
+                "declared dimension domains multiply to {product} series, over the                  {DIM_MAX_PRODUCT} the composite u16 index can carry (rfc §12.3);                  shrink a domain — cardinality is a declared resource bound"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// NEON / aarch64 intrinsic substrings that signal an
@@ -1376,13 +1587,13 @@ impl Manifest {
         Self::from_toml_for_target(path, None)
     }
 
-    /// Specialize this manifest to a named `[[variant]]` (RFC
-    /// module_variants): ports listed in the variant's `omit_ports` are
-    /// removed from the port table. Retained ports keep their
-    /// already-resolved indices — omission leaves holes, never shifts,
-    /// because module code addresses ports positionally. The filtered
-    /// manifest is what gets embedded in the variant's fmod, making the
-    /// artifact's advertised port surface honest.
+    /// Specialize this manifest to a named `[[variant]]`: ports listed
+    /// in the variant's `omit_ports` are removed from the port table.
+    /// Retained ports keep their already-resolved indices — omission
+    /// leaves holes, never shifts, because module code addresses ports
+    /// positionally. The filtered manifest is what gets embedded in the
+    /// variant's fmod, making the artifact's advertised port surface
+    /// honest.
     pub fn apply_variant(&mut self, variant: &str) -> Result<()> {
         let Some(decl) = self.variants.iter().find(|v| v.name == variant) else {
             let known: Vec<&str> = self.variants.iter().map(|v| v.name.as_str()).collect();
@@ -1583,13 +1794,23 @@ impl Manifest {
             .collect();
         validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
 
-        let observability = toml_val
-            .observability
-            .map_or_else(Observability::default, |o| Observability {
-                metrics: o.metrics,
-                spans: o.spans,
-                exempt: o.exempt,
-            });
+        let observability = match toml_val.observability {
+            None => Observability::default(),
+            Some(o) => {
+                let mut instruments = Vec::new();
+                for i in o.instrument.unwrap_or_default() {
+                    instruments.push(convert_instrument(i)?);
+                }
+                let obs = Observability {
+                    metrics: o.metrics,
+                    spans: o.spans,
+                    exempt: o.exempt,
+                    instruments,
+                };
+                validate_instruments(&obs)?;
+                obs
+            }
+        };
 
         let builtin = toml_val.builtin.unwrap_or(false);
 
@@ -1790,9 +2011,9 @@ impl Manifest {
             }
         };
 
-        // `[[variant]]` table (RFC module_variants). Validated here so a
-        // malformed table fails the build loudly rather than surfacing as
-        // a missing artifact at packaging.
+        // `[[variant]]` table. Validated here so a malformed table fails
+        // the build loudly rather than surfacing as a missing artifact at
+        // packaging.
         let mut variants: Vec<VariantDecl> = Vec::new();
         if let Some(raw_variants) = toml_val.variant {
             let port_names: std::collections::BTreeSet<&str> =
@@ -1818,9 +2039,11 @@ impl Manifest {
                         v.name
                     )));
                 }
-                if v.features.is_empty() {
+                if v.features.is_none() {
                     return Err(Error::Module(format!(
-                        "variant '{}' declares no features — a variant is a feature set",
+                        "variant '{}' declares no features — a variant is a feature \
+                         set; write `features = []` explicitly for a deliberate \
+                         base-surface-only variant",
                         v.name
                     )));
                 }
@@ -1849,7 +2072,7 @@ impl Manifest {
                 .into_iter()
                 .map(|v| VariantDecl {
                     name: v.name,
-                    features: v.features,
+                    features: v.features.unwrap_or_default(),
                     default: v.default,
                     omit_ports: v.omit_ports,
                 })
@@ -2355,8 +2578,10 @@ pub fn compute_integrity(code: &[u8], data: &[u8]) -> [u8; 32] {
 #[serde(deny_unknown_fields)]
 struct TomlVariant {
     name: String,
-    #[serde(default)]
-    features: Vec<String>,
+    /// `Option` so a FORGOTTEN `features` key stays an error while an
+    /// explicit `features = []` declares a legitimate base-surface-only
+    /// variant (e.g. `otel-min`: the fxtl path with no OTLP encoder).
+    features: Option<Vec<String>>,
     #[serde(default)]
     default: bool,
     #[serde(default)]
@@ -2370,6 +2595,30 @@ struct TomlObservability {
     #[serde(default)]
     spans: Vec<String>,
     exempt: Option<String>,
+    /// `[[observability.instrument]]` metadata rows.
+    instrument: Option<Vec<TomlInstrument>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlInstrument {
+    name: String,
+    kind: String,
+    #[serde(default)]
+    bounds_us: Vec<u64>,
+    /// `[[observability.instrument.dimension]]` rows, composite-index order.
+    dimension: Option<Vec<TomlDimension>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlDimension {
+    key: String,
+    domain: String,
+    /// `domain = "numeric"`: values are 0..max.
+    max: Option<u32>,
+    /// `domain = "enum"`: the declared value set, index = declared position.
+    values: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -2393,7 +2642,7 @@ struct TomlManifest {
     observability: Option<TomlObservability>,
     /// Module is built into the kernel (no .fmod file needed).
     builtin: Option<bool>,
-    /// `[[variant]]` feature-set variants (RFC module_variants).
+    /// `[[variant]]` feature-set variants.
     variant: Option<Vec<TomlVariant>>,
     /// `[capacities]` table — module-scope capacity declarations, each a
     /// flat number or a per-silicon table exactly like a port's
@@ -2439,8 +2688,8 @@ struct TomlManifest {
     timer_class: Option<String>,
     /// `step_period_ticks = N` — coarse-step period: run this module every N
     /// scheduler ticks (0/absent = every tick). Wired into ABI header byte 1.
-    /// A non-zero value is tick-counted, so the adaptive validator blocks it on
-    /// a mechanism-(b) domain unless `timer_class = "wall_clock"` (RFC §8 rule 1).
+    /// A non-zero value is tick-counted, so the adaptive validator blocks it
+    /// on a mechanism-(b) domain unless `timer_class = "wall_clock"`.
     #[serde(default)]
     step_period_ticks: Option<u64>,
     /// `[build]` table — per-module build knobs.
@@ -2994,7 +3243,7 @@ mod tests {
         Manifest::from_toml(&path)
     }
 
-    // ── [[variant]] table (RFC module_variants) ─────────────────────
+    // ── [[variant]] table ─────────────────────
 
     const VARIANT_MANIFEST: &str = r#"
 version = "1.0.0"
@@ -3110,10 +3359,19 @@ default = true
     }
 
     #[test]
-    fn variant_empty_features_is_an_error() {
+    fn variant_missing_features_key_is_an_error() {
         let src = VARIANT_MANIFEST.replace("features = [\"wav\", \"mp3\"]\n", "");
         let err = parse_toml(&src).unwrap_err().to_string();
         assert!(err.contains("declares no features"), "got: {err}");
+    }
+
+    /// An EXPLICIT `features = []` is a deliberate base-surface-only variant
+    /// (otel-min: the fxtl path with no OTLP encoder in flash) — allowed,
+    /// unlike a forgotten `features` key.
+    #[test]
+    fn variant_explicit_empty_features_is_allowed() {
+        let src = VARIANT_MANIFEST.replace("features = [\"wav\", \"mp3\"]", "features = []");
+        parse_toml(&src).expect("explicit empty feature set parses");
     }
 
     /// A typo'd key in a [[variant]] row must fail parsing, not be
@@ -3328,6 +3586,9 @@ scratch = 512
         ("linux_display", "height", "u32", 13),
         ("linux_display", "scale", "u32", 14),
         ("linux_display", "header", "u32", 15),
+        ("linux_net", "max_conns", "u32", 10),
+        ("linux_net", "write_buf_kib", "u32", 11),
+        ("linux_net", "listen_backlog", "u32", 12),
         ("linux_pointer", "path", "str", 10),
         ("linux_pointer", "width", "u32", 11),
         ("linux_pointer", "height", "u32", 12),
@@ -3587,5 +3848,73 @@ scratch = 512
              from the manifests:\n{}",
             offenders.join("\n"),
         );
+    }
+
+    // ── [[observability.instrument]] rows ───────────────────
+
+    fn obs_manifest(extra: &str) -> String {
+        format!(
+            "version = \"1.0.0\"\ntype = \"Transformer\"\nentry = \"mod.rs\"\n\
+             hardware_targets = [\"bcm2712\"]\n\n[observability]\n\
+             metrics = [\"requests_total\", \"lag\", \"latency_us\"]\n{extra}"
+        )
+    }
+
+    #[test]
+    fn instrument_rows_parse_with_dimensions_and_bounds() {
+        let src = obs_manifest(
+            "[[observability.instrument]]\nname = \"lag\"\nkind = \"updown\"\n\
+             [[observability.instrument.dimension]]\nkey = \"messaging.destination.partition.id\"\n\
+             domain = \"numeric\"\nmax = 64\n\
+             [[observability.instrument.dimension]]\nkey = \"messaging.consumer.group.name\"\n\
+             domain = \"enum\"\nvalues = [\"ingest\", \"audit\"]\n",
+        );
+        let m = Manifest::from_toml_str_for_target(&src, None).expect("parses");
+        let inst = &m.observability.instruments[0];
+        assert_eq!(inst.kind, InstrumentKind::UpDown);
+        assert_eq!(inst.dimensions.len(), 2);
+        assert_eq!(inst.dimensions[0].domain.size(), 64);
+        assert_eq!(inst.dimensions[1].domain.size(), 2);
+    }
+
+    #[test]
+    fn instrument_domain_product_over_the_u16_ceiling_is_rejected() {
+        // 64 × 1024 = 65536 > 65534 (DIM_MAX_PRODUCT): the composite index
+        // could not carry it, so the manifest must refuse at build.
+        let src = obs_manifest(
+            "[[observability.instrument]]\nname = \"lag\"\nkind = \"updown\"\n\
+             [[observability.instrument.dimension]]\nkey = \"messaging.destination.partition.id\"\n\
+             domain = \"numeric\"\nmax = 64\n\
+             [[observability.instrument.dimension]]\nkey = \"messaging.consumer.group.name\"\n\
+             domain = \"numeric\"\nmax = 1024\n",
+        );
+        let err = Manifest::from_toml_str_for_target(&src, None).expect_err("must refuse");
+        assert!(err.to_string().contains("65534"), "{err}");
+    }
+
+    #[test]
+    fn histogram16_requires_exactly_15_ascending_bounds() {
+        let short = obs_manifest(
+            "[[observability.instrument]]\nname = \"latency_us\"\nkind = \"histogram16\"\n\
+             bounds_us = [1, 2, 3]\n",
+        );
+        let err = Manifest::from_toml_str_for_target(&short, None).expect_err("must refuse");
+        assert!(err.to_string().contains("15"), "{err}");
+
+        let unsorted = obs_manifest(
+            "[[observability.instrument]]\nname = \"latency_us\"\nkind = \"histogram16\"\n\
+             bounds_us = [250, 500, 400, 2500, 5000, 10000, 25000, 50000, 100000, 250000, 500000, 1000000, 2500000, 5000000, 10000000]\n",
+        );
+        let err = Manifest::from_toml_str_for_target(&unsorted, None).expect_err("must refuse");
+        assert!(err.to_string().contains("ascending"), "{err}");
+    }
+
+    #[test]
+    fn instrument_row_must_name_a_declared_metric() {
+        let src = obs_manifest(
+            "[[observability.instrument]]\nname = \"not_a_metric\"\nkind = \"counter\"\n",
+        );
+        let err = Manifest::from_toml_str_for_target(&src, None).expect_err("must refuse");
+        assert!(err.to_string().contains("metrics"), "{err}");
     }
 }

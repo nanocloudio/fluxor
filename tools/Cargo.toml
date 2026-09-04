@@ -10,10 +10,16 @@ description       = "Host-side tools for Fluxor firmware configuration"
 name = "fluxor"
 path = "src/main.rs"
 
-# Rig backend executables. Discovered by name (`<surface>-<name>`)
-# on the rig backend search path; the Makefile's `install` target
-# symlinks them into `$XDG_DATA_HOME/fluxor/backends/` after a
-# release build.
+# Rig backend executables. Discovered by name (`<surface>-<name>`) on
+# the rig backend search path; the Makefile's `install` target symlinks
+# them into `$XDG_DATA_HOME/fluxor/backends/` after a release build.
+# Host-side telemetry collector: decodes fxtl-compact UDP batches
+# against the `fluxor id-table` export, serves Prometheus text on
+# /metrics, optionally pushes OTLP/JSON.
+[[bin]]
+name = "fluxor-collect"
+path = "src/bin/fluxor_collect.rs"
+
 [[bin]]
 name = "telemetry-monitor_udp"
 path = "src/bin/telemetry_monitor_udp.rs"

@@ -15,9 +15,9 @@
 //! unchanged.
 //!
 //! The rate table is a fixed-size LRU keyed by `(destination IPv4, source
-//! IPv4)`. The destination (local) address is the per-workload owner axis
-//!: one local address maps 1:1 to one owner in
-//! v1, so partitioning the SYN budget by destination IP gives each workload
+//! IPv4)`. The destination (local) address is the per-workload owner axis:
+//! one local address maps 1:1 to one owner, so partitioning the SYN budget
+//! by destination IP gives each workload
 //! its own share without any owner_tag plumbing — a flood aimed at one owned
 //! address cannot exhaust another owner's or the host's budget. With a single
 //! local address the destination is invariant and the key collapses to the

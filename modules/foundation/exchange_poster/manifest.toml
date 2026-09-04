@@ -1,0 +1,64 @@
+version          = "1.0.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712", "rp2350"]
+# Reacts to channel readiness only; nothing here measures time.
+timer_class      = "agnostic"
+
+# exchange_poster — the generic byte-egress adapter between a framed payload
+# producer (the `otel` export engine) and an exchange-contract request client
+# (wave's `http` in exchange mode, or any provider of the same surface).
+#
+#   payload_in   ->  one framed body per batch (net_proto [msg_type][len][body])
+#   publish_out  ->  MSG_PUBLISH: corr, msg_key, and a request record wrapping
+#                    the body (method/path from params)
+#   reply_in     <-  MSG_REPLY, correlated
+#   delivery_out ->  one status byte per batch (delivered / retry / drop),
+#                    the `otel.delivery` backchannel — which is what turns a
+#                    fire-and-forget export into a retained, retried one.
+#
+# The adapter is protocol-blind: it composes exchange frames and a request
+# record (framing, per the exchange contract's own doctrine — "a producer
+# composes this at a pipeline edge"), never an HTTP byte.
+#
+# Reply mapping: STATUS_OK -> delivered; REFUSE_UNROUTABLE (connect/exchange
+# failure — the collector is down) -> retry; REFUSE_UPSTREAM (the peer's own
+# status, u16 LE in the reply payload, from a client running
+# `surface_status`) -> retry when 5xx/429 (the OTLP retryable family), drop
+# otherwise; REFUSE_OVERSIZE and anything else -> drop (permanent; retrying
+# wedges the pipe).
+
+[[ports]]
+name         = "payload"
+index        = 0
+direction    = "input"
+content_type = "OctetStream"
+max_record   = 8500
+buffer_size  = { default = 8704, rp2350 = 4352 }
+
+[[ports]]
+name         = "publish_out"
+index        = 0
+direction    = "output"
+content_type = "OctetStream"
+max_record   = 8704
+buffer_size  = { default = 9216, rp2350 = 4608 }
+
+[[ports]]
+name         = "reply_in"
+index        = 1
+direction    = "input"
+content_type = "OctetStream"
+max_record   = 8704
+buffer_size  = { default = 9216, rp2350 = 4608 }
+
+[[ports]]
+name         = "delivery_out"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+max_record   = 16
+buffer_size  = 64
+
+[observability]
+exempt = "carrier adapter — forwards the export engine's batches verbatim; delivery outcomes ARE the engine's own fidelity accounting, reported on its backchannel"

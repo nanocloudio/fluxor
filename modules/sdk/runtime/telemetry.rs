@@ -102,6 +102,40 @@ unsafe fn dev_telemetry_metric(
     }
 }
 
+/// Emit a scalar metric carrying a composite dimension index: the
+/// row-major index over the instrument's declared dimension domains.
+/// `DIM_OTHER` folds an out-of-domain tuple; the undimensioned path is
+/// [`dev_telemetry_metric`]. Gated like every other emit helper.
+#[allow(
+    dead_code,
+    reason = "emit-side helper; invoked only by instrumented modules"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "flat args keep the emit path allocation-free and one shape across signals"
+)]
+#[inline]
+unsafe fn dev_telemetry_metric_dim(
+    sys: &SyscallTable,
+    _chan: i32,
+    module_idx: u16,
+    t_micros: u64,
+    kind: u8,
+    id: u16,
+    dim: u16,
+    value: u64,
+) {
+    if !dev_telemetry_enabled(sys) {
+        return;
+    }
+    let mut buf = [0u8; abi::contracts::telemetry::METRIC_SCALAR_SIZE];
+    if let Some(n) = abi::contracts::telemetry::write_metric_scalar_dim(
+        &mut buf, module_idx, t_micros, kind, id, dim, value,
+    ) {
+        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
+    }
+}
+
 /// Emit a histogram metric (`HIST_BUCKETS` log2-spaced counts) to the kernel
 /// telemetry ring. Gated by [`dev_telemetry_enabled`], like the scalar path.
 #[allow(
@@ -123,6 +157,35 @@ unsafe fn dev_telemetry_histogram(
     let mut buf = [0u8; abi::contracts::telemetry::METRIC_HIST_SIZE];
     if let Some(n) = abi::contracts::telemetry::write_metric_histogram(
         &mut buf, module_idx, t_micros, id, buckets,
+    ) {
+        let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
+    }
+}
+
+/// Emit a 16-bucket histogram (`METRIC_HISTOGRAM_16`): cumulative counts
+/// against the instrument's 15 manifest-declared bounds plus `+Inf`, with a
+/// composite dimension index (`DIM_NONE` when undimensioned). Bounds are
+/// id-table metadata and never ride the record. Gated like the scalar path.
+#[allow(
+    dead_code,
+    reason = "emit-side helper; invoked only by instrumented modules"
+)]
+#[inline]
+unsafe fn dev_telemetry_histogram16(
+    sys: &SyscallTable,
+    _chan: i32,
+    module_idx: u16,
+    t_micros: u64,
+    id: u16,
+    dim: u16,
+    buckets: &[u64; abi::contracts::telemetry::HIST16_BUCKETS],
+) {
+    if !dev_telemetry_enabled(sys) {
+        return;
+    }
+    let mut buf = [0u8; abi::contracts::telemetry::METRIC_HIST16_SIZE];
+    if let Some(n) = abi::contracts::telemetry::write_metric_histogram16(
+        &mut buf, module_idx, t_micros, id, dim, buckets,
     ) {
         let _ = (sys.provider_call)(-1, abi::contracts::telemetry::TLM_EMIT, buf.as_mut_ptr(), n);
     }

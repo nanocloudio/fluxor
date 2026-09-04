@@ -11,7 +11,12 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
 
     let mut config = config;
     let target_desc = resolve_target(&config, target_override)?;
-    let project_root = crate::project::root();
+    // Resolve from the CONFIG's location, not the cwd: the rig and
+    // cross-repo builds invoke this from another project's root, and a
+    // cwd-resolved root gave the id-table digest injection the wrong
+    // `[observability] id_table_dirs` (a digest the exporter can never
+    // match).
+    let project_root = crate::project::root_for_config(config_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     println!(

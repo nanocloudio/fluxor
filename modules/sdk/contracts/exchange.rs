@@ -92,6 +92,15 @@ pub const FLAG_BROADCAST: u8 = 0x01;
 pub const STATUS_OK: u8 = 0;
 pub const REFUSE_OVERSIZE: u8 = 1;
 pub const REFUSE_UNROUTABLE: u8 = 2;
+/// The exchange COMPLETED but the peer answered with an application-level
+/// failure the provider was configured to surface as a refusal rather than
+/// an answer (e.g. an HTTP client with `surface_status` enabled meeting a
+/// ≥400 response). The reply payload's first two bytes carry the peer's
+/// numeric status code (u16 LE); refusal payloads were empty before this,
+/// so the field is additive. Providers surface this ONLY on opt-in — a 404
+/// with a body is a perfectly good ANSWER for a generic REST consumer, and
+/// reclassifying it universally would break exchange semantics.
+pub const REFUSE_UPSTREAM: u8 = 3;
 /// Connection lost: every corr issued and not yet acked is now
 /// unknowable; the pump MUST re-publish all of them after LINK_UP.
 pub const STATUS_LINK_DOWN: u8 = 16;

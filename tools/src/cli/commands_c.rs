@@ -21,9 +21,9 @@ pub fn tie_to_parent(cmd: &mut std::process::Command) -> &mut std::process::Comm
 }
 
 fn cmd_build(path: &Path, output: Option<&std::path::Path>, verbose: bool) -> Result<()> {
-    // A workload source manifest — a `.toml` with a `[workload]` table
-    // (rfc_system_services.md §10) — emits the committed bundle + per-target
-    // blobs instead of a single image. Any other `.toml` falls through.
+    // A workload source manifest — a `.toml` with a `[workload]` table —
+    // emits the committed bundle + per-target blobs instead of a single
+    // image. Any other `.toml` falls through.
     if workload_src::is_source_manifest(path) {
         workload_src::emit_bundle(path, verbose)?;
         return Ok(());
@@ -133,7 +133,12 @@ fn validate_linux_runtime_features(yaml_path: &std::path::Path) -> Result<()> {
         serde_json::from_str(&content)?
     };
     let target_desc = resolve_target(&config, None)?;
-    let project_root = crate::project::root();
+    // Resolve from the CONFIG's location, not the cwd: the rig and
+    // cross-repo builds invoke this from another project's root, and a
+    // cwd-resolved root gave the id-table digest injection the wrong
+    // `[observability] id_table_dirs` (a digest the exporter can never
+    // match).
+    let project_root = crate::project::root_for_config(yaml_path);
     stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
 
     let modules = match config.get("modules").and_then(|m| m.as_array()) {
@@ -249,9 +254,9 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
         Error::Config("fluxor run: missing <CONFIG> argument (omit only with --list)".into())
     })?;
 
-    // A workload bundle — source manifest, bundle root, or target subdir
-    // (rfc_system_services.md §10.4): resolve an implementation with the
-    // agent's own resolver and exec its built blobs.
+    // A workload bundle — source manifest, bundle root, or target
+    // subdir: resolve an implementation with the agent's own resolver
+    // and exec its built blobs.
     if workload_src::is_bundle_path(config_path) {
         if flags.any_scenario_flag() {
             return Err(Error::Config(
@@ -1680,6 +1685,9 @@ fn cmd_lint_observability(
             "invalid_names": report.invalid_names.iter()
                 .map(|(m, n)| serde_json::json!({ "module": m, "name": n }))
                 .collect::<Vec<_>>(),
+            "invalid_attr_keys": report.invalid_attr_keys.iter()
+                .map(|(m, k)| serde_json::json!({ "module": m, "key": k }))
+                .collect::<Vec<_>>(),
         });
         println!(
             "{}",
@@ -1695,6 +1703,13 @@ fn cmd_lint_observability(
         eprintln!(
             "\x1b[1;31mobservability\x1b[0m {m}: invalid instrument name {n:?} \
              (instrument names are dotted lowercase)"
+        );
+    }
+    for (m, k) in &report.invalid_attr_keys {
+        eprintln!(
+            "\x1b[1;31mobservability\x1b[0m {m}: dimension key {k:?} is neither an \
+             OTel semantic-convention key from standards/observability.md §5 nor \
+             `fluxor.*`"
         );
     }
     for m in &report.uninstrumented {
@@ -1715,7 +1730,7 @@ fn cmd_lint_observability(
         report.instrumented,
         report.exempt.len(),
         report.uninstrumented.len(),
-        report.invalid_names.len(),
+        report.invalid_names.len() + report.invalid_attr_keys.len(),
     );
     if fail {
         std::process::exit(1);
@@ -2078,4 +2093,60 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             "unknown --emit form '{other}' (expected uf2|bin|combined|image|table)"
         ))),
     }
+}
+
+/// `fluxor id-table` — export a graph's observability id-table:
+/// instance-ordered instrument names plus per-instrument kind / bounds /
+/// dimension metadata and the FNV-1a32 table digest. Runs the same stack
+/// expansion the image build runs, so the exported indices are the indices
+/// the kernel stamps into records.
+///
+/// NOTE: extra `--modules-dir` roots change the table and therefore the
+/// digest; the build's injected digest (stack_expand) uses the project's
+/// `modules/` only, so pass extras only when the build did the same.
+fn cmd_id_table(
+    yaml_path: &Path,
+    out: Option<&Path>,
+    extra_roots: &[PathBuf],
+) -> Result<()> {
+    let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
+    let mut config: serde_json::Value = if yaml_path
+        .extension()
+        .is_some_and(|ext| ext == "yaml" || ext == "yml")
+    {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_str(&content)?
+    };
+    let target_desc = resolve_target(&config, None)?;
+    // Resolve from the CONFIG's location, not the cwd: the rig and
+    // cross-repo builds invoke this from another project's root, and a
+    // cwd-resolved root gave the id-table digest injection the wrong
+    // `[observability] id_table_dirs` (a digest the exporter can never
+    // match).
+    let project_root = fluxor_tools::project::root_for_config(yaml_path);
+    stack_expand::expand_platform_stacks(&mut config, &target_desc, &project_root)?;
+
+    // Default roots = the SAME set the build's digest injection uses
+    // (project modules/ + fluxor.toml [observability] id_table_dirs), so the
+    // exported digest matches the injected one by construction. --modules-dir
+    // extras change both the table and the digest; use them only when the
+    // build did the same.
+    let mut roots = fluxor_tools::observability::id_table_roots(&project_root);
+    roots.extend(extra_roots.iter().cloned());
+    let table = fluxor_tools::observability::id_table_for_expanded_config(&config, &roots);
+    let json = serde_json::to_string_pretty(&table.to_json()).unwrap_or_default();
+    match out {
+        Some(p) => {
+            std::fs::write(p, &json)?;
+            eprintln!(
+                "id-table: {} instruments, digest {:#010x} -> {}",
+                table.len(),
+                table.digest(),
+                p.display()
+            );
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
 }
