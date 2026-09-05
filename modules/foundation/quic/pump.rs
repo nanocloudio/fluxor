@@ -30,6 +30,22 @@ fn cipher_suites_offer(client_suites: &[u8], want: u16) -> bool {
 
 unsafe fn pump_session(s: &mut QuicState, idx: usize) -> bool {
     let st = s.conns[idx].driver.hs_state;
+    // First-contact attribution: the longest single handshake step since
+    // boot, and which state it was, ride the `[quic] hb` beat (`fcs=`/`fcu=`).
+    // Added because the Pi 5 rig faults this module on its first contact
+    // (a >2 ms step against the 2 ms guard) and a one-shot log of the phase
+    // never survives the UDP telemetry attach; a beat does.
+    let t0 = dev_micros(&*s.syscalls);
+    let progressed = pump_session_inner(s, idx, st);
+    let dt = dev_micros(&*s.syscalls).wrapping_sub(t0) as u32;
+    if dt > s.fc_max_us {
+        s.fc_max_us = dt;
+        s.fc_max_state = st as u8;
+    }
+    progressed
+}
+
+unsafe fn pump_session_inner(s: &mut QuicState, idx: usize, st: HandshakeState) -> bool {
     match st {
         // Server states
         HandshakeState::RecvClientHello => pump_recv_client_hello(s, idx),
@@ -1916,10 +1932,17 @@ unsafe fn peek_initial_for_retry(
         if token_len == 0 {
             // Issue a Retry (server picks a fresh SCID for the Retry).
             // The Retry's SCID becomes the client's new DCID; we use
-            // it as our_cid post-retry too.
+            // it as our_cid post-retry too. It is a connection ID like
+            // any other, so it is declined rather than emitted zero — a
+            // zero CID here would be rejected by a conforming peer, and
+            // it is the id the whole post-Retry connection is addressed
+            // by.
             let mut new_scid = [0u8; MAX_CID_LEN];
             let sys = &*s.syscalls;
-            dev_csprng_fill(sys, new_scid.as_mut_ptr(), 8);
+            if !csprng_fill_nonzero(sys, new_scid.as_mut_ptr(), 8) {
+                s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+                return InitialAction::Reject;
+            }
             return InitialAction::IssueRetry {
                 dcid: scid_buf,
                 scid: new_scid,

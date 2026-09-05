@@ -158,6 +158,16 @@ pub struct TcpConn {
     pub iss: u32,
     pub retransmit_timer: u16,
     pub timewait_timer: u16,
+    /// 50 ms ticks since the last payload byte moved in either direction on
+    /// an Established connection. Compared against the module's
+    /// `tcp_idle_s` (0 = never) so a peer that goes silent is closed rather
+    /// than holding its slot until it chooses to leave.
+    pub idle_timer: u16,
+    /// 50 ms ticks spent in CloseWait — the peer has closed and the
+    /// consumer has not yet answered with CMD_CLOSE. Bounded by
+    /// `CLOSE_WAIT_TICKS` so a consumer that never closes cannot pin the
+    /// slot (net_proto's release rule, `CLOSED_ID_GRACE_MS`).
+    pub closewait_timer: u16,
 
     // NewReno congestion control (§4.2)
     pub cwnd: u16,         // congestion window (bytes)
@@ -242,6 +252,8 @@ impl TcpConn {
             iss: 0,
             retransmit_timer: 0,
             timewait_timer: 0,
+            idle_timer: 0,
+            closewait_timer: 0,
             cwnd: INITIAL_CWND,
             ssthresh: 0xFFFF,
             dup_ack_count: 0,

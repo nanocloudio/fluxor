@@ -279,6 +279,26 @@ mod profile_host {
         pub const MAX_LOCAL_ADDRS: usize = 8;
     }
 
+    pub mod tls {
+        /// TLS session table. The ceiling on concurrent TLS connections — and
+        /// so on HTTPS concurrency, which `http::MAX_CONCURRENT_CONNS` above
+        /// does NOT bound on its own: an accept the tls module cannot seat is
+        /// closed before http ever sees it. Published here so a consumer reads
+        /// the envelope it actually has rather than inferring one from the
+        /// HTTP number. Sixty-four sessions is ~830 KiB of elastic pool on
+        /// aarch64; the module grows it in 8-session chunks.
+        pub const MAX_SESSIONS: usize = 64;
+    }
+
+    pub mod quic {
+        /// QUIC connection table. A connection carries ~58 KiB of state, so
+        /// the table is ~464 KiB — the dominant term in this module's
+        /// footprint, and why the ceiling is eight rather than a round
+        /// number. One past it is refused with a stateless
+        /// CONNECTION_REFUSED Initial.
+        pub const MAX_CONNS: usize = 8;
+    }
+
     pub mod h2 {
         /// Per-conn HTTP/2 stream slots.
         pub const MAX_STREAMS: usize = 4;
@@ -356,6 +376,26 @@ mod profile_wasm {
         pub const MAX_LOCAL_ADDRS: usize = 8;
     }
 
+    pub mod tls {
+        /// TLS session table. The ceiling on concurrent TLS connections — and
+        /// so on HTTPS concurrency, which `http::MAX_CONCURRENT_CONNS` above
+        /// does NOT bound on its own: an accept the tls module cannot seat is
+        /// closed before http ever sees it. Published here so a consumer reads
+        /// the envelope it actually has rather than inferring one from the
+        /// HTTP number. Sixty-four sessions is ~830 KiB of elastic pool on
+        /// aarch64; the module grows it in 8-session chunks.
+        pub const MAX_SESSIONS: usize = 64;
+    }
+
+    pub mod quic {
+        /// QUIC connection table. A connection carries ~58 KiB of state, so
+        /// the table is ~464 KiB — the dominant term in this module's
+        /// footprint, and why the ceiling is eight rather than a round
+        /// number. One past it is refused with a stateless
+        /// CONNECTION_REFUSED Initial.
+        pub const MAX_CONNS: usize = 8;
+    }
+
     pub mod h2 {
         pub const MAX_STREAMS: usize = 4;
     }
@@ -385,8 +425,13 @@ mod profile_embedded {
     }
 
     pub mod http {
-        pub const MAX_CONCURRENT_CONNS: usize = 1;
-        pub const ARENA_WORKING_SET_CONNS: usize = 1;
+        /// Four, not one: a browser opens several connections to a page in
+        /// parallel, and a one-slot server closes all but the first, which
+        /// presents as a page that half-loads. Four slots cost
+        /// 4 × (2048 + 4100) ≈ 24 KiB of the 256 KiB arena, sized against the
+        /// 4-session TLS table and the 16-slot TCP table in this profile.
+        pub const MAX_CONCURRENT_CONNS: usize = 4;
+        pub const ARENA_WORKING_SET_CONNS: usize = 4;
         pub const RECV_BUF_SIZE: usize = 2048;
         pub const SEND_BUF_SIZE: usize = 4100;
         pub const MAX_ROUTES: usize = 4;
@@ -410,6 +455,18 @@ mod profile_embedded {
         pub const MAX_LOCAL_ADDRS: usize = 8;
     }
 
+    pub mod tls {
+        /// Whole pool inline (no elastic region on MCU-class targets).
+        pub const MAX_SESSIONS: usize = 4;
+    }
+
+    pub mod quic {
+        /// The quic module does not build for this profile; the value is
+        /// published so a consumer reading the envelope sees a number rather
+        /// than an absence.
+        pub const MAX_CONNS: usize = 2;
+    }
+
     pub mod h2 {
         pub const MAX_STREAMS: usize = 4;
     }
@@ -420,6 +477,10 @@ mod profile_embedded {
 // Caught at compile time. Adding a new invariant here is the right
 // place when a tunable picks up a dependency on another subsystem.
 
+const _: () = assert!(
+    tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS,
+    "tls::MAX_SESSIONS cannot exceed ip::MAX_TCP_CONNS — a TLS session needs a TCP connection under it"
+);
 const _: () = assert!(
     http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS,
     "http::MAX_CONCURRENT_CONNS must not exceed ip::MAX_TCP_CONNS"

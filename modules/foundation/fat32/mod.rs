@@ -390,8 +390,13 @@ impl FileEntry {
 /// workload leaking handles takes the whole table down with it, and the
 /// operator sees `ENFILE` on a module that did nothing wrong. The identity
 /// comes from `query_key::CALLER_OWNER`, not from the dispatch arguments.
+/// A replicated-state consumer is the demanding shape — it holds a
+/// write-ahead log segment open per group plus a couple of metadata files,
+/// so roughly three handles per group. Sixty-odd groups reach 192 before
+/// any client workload opens a file of its own, which is why the aarch64
+/// table is sized in hundreds rather than tens.
 #[cfg(target_arch = "aarch64")]
-const MAX_OPEN_FILES: usize = 32;
+const MAX_OPEN_FILES: usize = 256;
 #[cfg(not(target_arch = "aarch64"))]
 const MAX_OPEN_FILES: usize = 8;
 
@@ -1889,7 +1894,10 @@ fn fs_path_component(comp: &[u8], out: &mut PathName) -> bool {
         }
         // The characters the format reserves for its own structure, plus the
         // separator this surface splits on.
-        if matches!(c, b'/' | b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|') {
+        if matches!(
+            c,
+            b'/' | b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|'
+        ) {
             return false;
         }
         i += 1;
@@ -1986,7 +1994,11 @@ unsafe fn fs_assign_short_alias(s: &mut Fat32State, parent: u32, name: &mut Path
             let mut d = 0usize;
             while d < 4 {
                 let nib = ((sum >> (12 - d * 4)) & 0xF) as u8;
-                cand[h] = if nib < 10 { b'0' + nib } else { b'A' + nib - 10 };
+                cand[h] = if nib < 10 {
+                    b'0' + nib
+                } else {
+                    b'A' + nib - 10
+                };
                 h += 1;
                 d += 1;
             }
@@ -2044,12 +2056,7 @@ unsafe fn fs_dirent_short_name(s: &mut Fat32State, loc: &DirentLoc) -> Option<[u
 }
 
 /// Walk `parent` for `name`, in whichever form it carries.
-unsafe fn fs_name_walk(
-    s: &mut Fat32State,
-    parent: u32,
-    name: &PathName,
-    need: u8,
-) -> DirScan {
+unsafe fn fs_name_walk(s: &mut Fat32State, parent: u32, name: &PathName, need: u8) -> DirScan {
     fs_dir_walk_long(s, parent, &name.short, need, name.long_slice())
 }
 
@@ -4176,7 +4183,11 @@ unsafe fn fmt_volume_id(dst: *mut u8, id: u32) -> usize {
     let mut i = 0usize;
     while i < 8 {
         let nib = ((id >> (28 - i * 4)) & 0x0F) as u8;
-        let ch = if nib < 10 { b'0' + nib } else { b'A' + nib - 10 };
+        let ch = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'A' + nib - 10
+        };
         *dst.add(if i < 4 { i } else { i + 1 }) = ch;
         i += 1;
     }
@@ -4429,12 +4440,7 @@ fn name_eq(a: &[u8], b: &[u8; 11]) -> bool {
 ///   - a `Free` result carries any companions stranded immediately in front
 ///     of the run, which the claim must retire before minting a new name
 ///     there — otherwise the new file inherits the old file's long name.
-unsafe fn fs_dir_walk(
-    s: &mut Fat32State,
-    dir_cluster: u32,
-    want: &[u8; 11],
-    need: u8,
-) -> DirScan {
+unsafe fn fs_dir_walk(s: &mut Fat32State, dir_cluster: u32, want: &[u8; 11], need: u8) -> DirScan {
     fs_dir_walk_long(s, dir_cluster, want, need, &[])
 }
 
@@ -5408,12 +5414,7 @@ unsafe fn fs_dirent_advance(
 /// companion carries the checksum of the 8.3 name behind it, which is what
 /// stops a stale run being read as naming whatever entry later occupies the
 /// slot after it.
-unsafe fn fs_lfn_write(
-    s: &mut Fat32State,
-    loc: &DirentLoc,
-    name: &PathName,
-    count: u8,
-) -> i32 {
+unsafe fn fs_lfn_write(s: &mut Fat32State, loc: &DirentLoc, name: &PathName, count: u8) -> i32 {
     let sum = fs_lfn_checksum(&name.short);
     let n = usize::from(name.long_len);
     let mut lba = loc.lba;
@@ -5701,12 +5702,7 @@ unsafe fn fs_op_truncate(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> 
 }
 
 /// Publish a truncated size (and possibly a cleared chain head) durably.
-unsafe fn fs_truncate_publish(
-    s: &mut Fat32State,
-    loc: &DirentLoc,
-    len: u32,
-    head: u32,
-) -> i32 {
+unsafe fn fs_truncate_publish(s: &mut Fat32State, loc: &DirentLoc, len: u32, head: u32) -> i32 {
     let rc = fs_patch_dirent(s, loc.lba, loc.off, head, len);
     if rc != 0 {
         return fs_rc_errno(rc);
@@ -7845,9 +7841,9 @@ pub unsafe fn test_force_ready(state: *mut u8, fat_size_32: u32, fsinfo_sector: 
     s.data_start_sector = 32 + 2 * fat_size_32;
     s.fsinfo_sector = fsinfo_sector;
     s.next_free_hint = 2; // mount default; the allocator skips FAT[2]=EOC (root)
-    // Addressable data clusters. `parse_boot_sector` derives this from the
-    // volume's total-sector count; with no boot sector to read, the FAT's own
-    // capacity is the honest ceiling for a harness disk sized to match it.
+                          // Addressable data clusters. `parse_boot_sector` derives this from the
+                          // volume's total-sector count; with no boot sector to read, the FAT's own
+                          // capacity is the honest ceiling for a harness disk sized to match it.
     s.count_of_clusters = fat_size_32 * (512 / 4);
     // A synthetic volume serial. Real mounts read `BS_VolID` from the boot
     // sector; a forced mount has no boot sector, and a serial of 0 would

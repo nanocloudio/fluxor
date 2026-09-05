@@ -1114,6 +1114,11 @@ pub const LINUX_NET_HASH: u32 = 0xFBCC7DC9;
 const MSG_ACCEPTED: u8 = 0x01;
 const MSG_DATA: u8 = 0x02;
 const MSG_CLOSED: u8 = 0x03;
+/// net_proto `CLOSED_ID_GRACE_MS`: how long a closed connection's id stays the
+/// consumer's after MSG_CLOSED. Mirrored by value here because this file
+/// carries its own copy of the opcode table; the contract module is the
+/// authority.
+const CLOSED_ID_GRACE_MS: u32 = 5_000;
 const MSG_BOUND: u8 = 0x04;
 const MSG_CONNECTED: u8 = 0x05;
 const MSG_ERROR: u8 = 0x06;
@@ -1214,6 +1219,13 @@ struct LinuxNetConn {
     /// Unsent bytes. Empty until a send backs up; then sized to the
     /// instance's `write_buf_max` and kept until the slot is released.
     write_buf: Vec<u8>,
+    /// `state == 4` (closed, id held): when the id is released if the
+    /// consumer has not sent CMD_CLOSE by then. net_proto's release rule —
+    /// after MSG_CLOSED the id stays the consumer's for
+    /// `CLOSED_ID_GRACE_MS`, so its CMD_CLOSE can never land on a newcomer
+    /// that took the same index, and a consumer that never closes cannot
+    /// pin the slot either.
+    release_at: Option<std::time::Instant>,
 }
 
 impl LinuxNetConn {
@@ -1226,6 +1238,7 @@ impl LinuxNetConn {
             write_offset: 0,
             write_len: 0,
             connect_tag: 0,
+            release_at: None,
             owner: crate::kernel::workload::owner::OWNER_SYSTEM,
             dg_owner_tag: 0,
             write_buf: Vec::new(),
@@ -2205,9 +2218,47 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
     heavy_pending
 }
 
+/// The socket is gone (peer FIN or a dead socket). Close the fd, report
+/// MSG_CLOSED, and HOLD the slot (`state = 4`) rather than freeing it, so the
+/// id is not handed to the next accept until the consumer has answered with
+/// CMD_CLOSE or the contract's grace interval has passed. Freeing on the
+/// spot would let a consumer's CMD_CLOSE close a newcomer that had already
+/// taken the index.
+unsafe fn hold_closed_slot(st: &mut LinuxNetState, i: usize) {
+    if st.conns[i].fd >= 0 {
+        libc::close(st.conns[i].fd);
+    }
+    let owner = st.conns[i].owner;
+    st.conns[i] = LinuxNetConn::empty();
+    st.conns[i].owner = owner;
+    st.conns[i].state = 4;
+    st.conns[i].release_at = Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(u64::from(CLOSED_ID_GRACE_MS)),
+    );
+    let cb = (i as u16).to_le_bytes();
+    let msg = [MSG_CLOSED, cb[0], cb[1]];
+    linux_net_send_msg(st, &msg);
+}
+
+/// Release held ids whose grace interval has passed.
+unsafe fn sweep_held_slots(st: &mut LinuxNetState) {
+    let now = std::time::Instant::now();
+    for i in 0..st.conns.len() {
+        if st.conns[i].state == 4 && st.conns[i].release_at.is_some_and(|t| now >= t) {
+            st.conns[i] = LinuxNetConn::empty();
+        }
+    }
+}
+
 unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
     let idx = conn_id as usize;
     if idx >= st.conns.len() || st.conns[idx].state == 0 {
+        return;
+    }
+    if st.conns[idx].state == 4 {
+        // The consumer answered MSG_CLOSED within the grace interval: the id
+        // is released now, and MSG_CLOSED is not repeated.
+        st.conns[idx] = LinuxNetConn::empty();
         return;
     }
     if st.conns[idx].fd >= 0 {
@@ -2498,11 +2549,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             }
             had_work = true;
         } else if n == 0 {
-            libc::close(st.conns[i].fd);
-            st.conns[i] = LinuxNetConn::empty();
-            let cb = (i as u16).to_le_bytes();
-            let msg = [MSG_CLOSED, cb[0], cb[1]];
-            linux_net_send_msg(st, &msg);
+            hold_closed_slot(st, i);
             had_work = true;
         } else {
             // n < 0. EAGAIN / EWOULDBLOCK / EINTR is "no data right
@@ -2515,11 +2562,7 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             // to "fall over after one connection".
             let err = *libc::__errno_location();
             if err != libc::EAGAIN && err != libc::EWOULDBLOCK && err != libc::EINTR {
-                libc::close(st.conns[i].fd);
-                st.conns[i] = LinuxNetConn::empty();
-                let cb = (i as u16).to_le_bytes();
-                let msg = [MSG_CLOSED, cb[0], cb[1]];
-                linux_net_send_msg(st, &msg);
+                hold_closed_slot(st, i);
                 had_work = true;
             }
         }
@@ -2546,6 +2589,7 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
         // pulling new commands off the channel — the upstream channel
         // buffer is the back-pressure point for `CMD_SEND`. Lighter
         // backlogs don't gate, so parallel `CMD_CLOSE` etc. still flow.
+        sweep_held_slots(st);
         let heavy_pending = linux_net_drain_writes(st);
         if heavy_pending {
             had_work = true;

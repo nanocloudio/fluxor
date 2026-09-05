@@ -255,8 +255,7 @@ fn parse_bounds_blob(s: &mut OtelState, raw: &[u8]) {
         }
         for k in 0..n {
             let b = off + k * 4;
-            s.bounds_us[row][k] =
-                u32::from_le_bytes([raw[b], raw[b + 1], raw[b + 2], raw[b + 3]]);
+            s.bounds_us[row][k] = u32::from_le_bytes([raw[b], raw[b + 1], raw[b + 2], raw[b + 3]]);
         }
         s.bounds_mod[row] = module;
         s.bounds_id[row] = id;
@@ -421,7 +420,14 @@ fn encode_metrics_json(accum: &[u8], json: &mut [u8], bounds: BoundsView<'_>) ->
                 }
             } else {
                 let value = tlm::metric_scalar_value(rec);
-                doc.sum_dim(name, module, dim, t_nanos, value, kind == tlm::METRIC_COUNTER);
+                doc.sum_dim(
+                    name,
+                    module,
+                    dim,
+                    t_nanos,
+                    value,
+                    kind == tlm::METRIC_COUNTER,
+                );
             }
         }
         off += rlen;
@@ -502,7 +508,14 @@ fn encode_metrics_proto(accum: &[u8], out: &mut [u8], bounds: BoundsView<'_>) ->
                 }
             } else {
                 let value = tlm::metric_scalar_value(rec);
-                doc.sum_dim(name, module, dim, t_nanos, value, kind == tlm::METRIC_COUNTER);
+                doc.sum_dim(
+                    name,
+                    module,
+                    dim,
+                    t_nanos,
+                    value,
+                    kind == tlm::METRIC_COUNTER,
+                );
             }
         }
         off += rlen;

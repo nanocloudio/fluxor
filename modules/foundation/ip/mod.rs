@@ -292,6 +292,16 @@ const NOTIFY_CONNECTED: u8 = 3;
 /// Connect timeout (`ETIMEDOUT`) whose `MSG_ERROR` couldn't be delivered yet —
 /// retried, then the slot frees (conn is `Closed`).
 const NOTIFY_ERROR_TIMEOUT: u8 = 4;
+/// TCP timer ticks per second (`step_tcp_timers` advances every 50 ms).
+const TCP_TIMER_HZ: u16 = 20;
+/// CloseWait bound: the peer has closed and the consumer has not answered
+/// with CMD_CLOSE. net_proto's release rule (`CLOSED_ID_GRACE_MS`, 5 s) — the
+/// consumer may still close within it and never hits a newcomer; after it
+/// this module finishes the close itself so a consumer that never answers
+/// cannot leak the slot. Unbounded, this is a slow table leak with a hard
+/// end: 254 client-closed connections fill the 256-slot table and every SYN
+/// after them is dropped `no_slot`.
+const CLOSE_WAIT_TICKS: u16 = (abi::contracts::net::net_proto::CLOSED_ID_GRACE_MS / 50) as u16;
 
 /// A TCP-conn slot is free for re-allocation only when it's `Closed`
 /// AND no close-notification latch is still pending — reusing a
@@ -561,6 +571,8 @@ pub struct IpState {
     /// in 50 ms ticks; gating on wallclock keeps them meaningful
     /// regardless of the host scheduler's `tick_us`.
     last_tcp_timer_ms: u64,
+    /// `tcp_idle_s` in 50 ms timer ticks; 0 disables the idle close.
+    tcp_idle_ticks: u16,
 
     // Diagnostic counters
     rx_frame_count: u32,
@@ -619,6 +631,11 @@ pub struct IpState {
     /// `tcp_half_open_max` this separates a genuine capacity ceiling from
     /// half-open exhaustion.
     tcp_half_open_refused: u32,
+    /// Established connections this module closed for `tcp_idle_s` silence.
+    tcp_idle_closed: u32,
+    /// CloseWait connections this module finished closing because the
+    /// consumer never sent CMD_CLOSE within the grace interval.
+    tcp_closewait_expired: u32,
     /// SYN-ACKs answered from cookie mode, spending no connection slot.
     /// `> 0` is the operator's signal that the deployment crossed the
     /// watermark at all — the distinction between "sized correctly" and
@@ -709,6 +726,15 @@ mod params_def {
             => |s, d, len| { s.sample_permille = p_u16(d, len, 0, 1000); };
         4, dhcp_compat, u8, 0, enum { strict=0, bootp_and_direct_ack=1 }
             => |s, d, len| { s.dhcp_compat = p_u8(d, len, 0, 1); };
+        // Seconds an Established connection may carry no payload in either
+        // direction before this module closes it (FIN, then ETIMEDOUT to the
+        // consumer). 0 disables the backstop entirely.
+        // A transport-level backstop under the consumer's own lifetime
+        // policy: the consumer knows what "idle" means for its protocol, but
+        // a consumer without one, or a slot no consumer is tracking, must
+        // not hold TCP state for good.
+        5, tcp_idle_s, u16, 0
+            => |s, d, len| { s.tcp_idle_ticks = p_u16(d, len, 0, 0).saturating_mul(TCP_TIMER_HZ); };
     }
 }
 
@@ -2275,6 +2301,10 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         pos += fmt_u32_dec(s.tcp_syn_option_refused, buf.add(pos));
         emit(b" horef=", &mut pos);
         pos += fmt_u32_dec(s.tcp_half_open_refused, buf.add(pos));
+        emit(b" idlec=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_idle_closed, buf.add(pos));
+        emit(b" cwexp=", &mut pos);
+        pos += fmt_u32_dec(s.tcp_closewait_expired, buf.add(pos));
         dev_log(sys, 3, buf, pos);
         s.adv_rx_frames = 0;
         s.pend_rx_steps = 0;
@@ -3218,6 +3248,7 @@ unsafe fn process_tcp_segment(
                 let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                 conn.rcv_nxt = conn.rcv_nxt.wrapping_add(rx_payload_len as u32);
                 conn.delivered_bytes = conn.delivered_bytes.wrapping_add(rx_payload_len as u32);
+                conn.idle_timer = 0;
             }
             // Drain any reorder slots that are now contiguous. Peek
             // first so a mid-loop channel-full leaves the payload in
@@ -5019,6 +5050,9 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     if conn_id < tcp::MAX_TCP_CONNS && total_len <= PENDING_CMD_BUF_SIZE {
                         let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
                         if state_allows_send(conn_state) {
+                            // A payload the consumer sends is activity for
+                            // the idle close, whether or not it ships now.
+                            (*s.tcp_conns.as_mut_ptr().add(conn_id)).idle_timer = 0;
                             let new_off =
                                 try_send_cmd_payload(s, conn_id, buf.as_ptr(), total_len, 2);
                             if new_off < total_len {
@@ -5381,10 +5415,28 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                     *conn = tcp::TcpConn::new();
                 }
             }
-            tcp::TcpState::Closing => {
+            tcp::TcpState::CloseWait => {
+                // The peer closed; the consumer owes CMD_CLOSE and has the
+                // contract's grace interval to send it. Past that, finish the
+                // close here exactly as its CMD_CLOSE would have: FIN, then
+                // LastAck. Without the bound a CloseWait slot lives until
+                // the consumer closes — forever, for a consumer that never
+                // does.
+                conn.closewait_timer = conn.closewait_timer.saturating_add(1);
+                if conn.closewait_timer >= CLOSE_WAIT_TICKS
+                    && send_tcp_control(s, i, tcp::FIN | tcp::ACK, false)
+                {
+                    let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                    conn.state = tcp::TcpState::LastAck;
+                    conn.retransmit_timer = 0;
+                    s.tcp_closewait_expired = s.tcp_closewait_expired.wrapping_add(1);
+                }
+            }
+            tcp::TcpState::Closing | tcp::TcpState::LastAck => {
                 // Waiting only for the ACK of our own FIN. Bound the wait so a
-                // peer that vanishes mid-simultaneous-close cannot hold the
-                // slot: same ~15 s ceiling the half-open states use.
+                // peer that vanishes mid-close cannot hold the slot: same
+                // ~15 s ceiling the half-open states use. LastAck joins
+                // Closing here — it is the same wait, reached from CloseWait.
                 conn.retransmit_timer = conn.retransmit_timer.saturating_add(1);
                 if conn.retransmit_timer >= 300 {
                     let remote_ip = conn.remote_ip;
@@ -5413,6 +5465,26 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                 }
             }
             tcp::TcpState::Established => {
+                // Idle close. `idle_timer` is reset wherever a payload byte
+                // moves (RX commit, CMD_SEND); pure ACKs and window updates do
+                // not count as activity. Closing goes the same way a
+                // CMD_CLOSE from Established does — FIN, FinWait1 — and the
+                // consumer learns through an untagged ETIMEDOUT, which routes
+                // by connection id like a close does.
+                if s.tcp_idle_ticks != 0 {
+                    conn.idle_timer = conn.idle_timer.saturating_add(1);
+                    if conn.idle_timer >= s.tcp_idle_ticks {
+                        conn.idle_timer = 0;
+                        if send_tcp_control(s, i, tcp::FIN | tcp::ACK, false) {
+                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+                            conn.state = tcp::TcpState::FinWait1;
+                            s.tcp_idle_closed = s.tcp_idle_closed.wrapping_add(1);
+                            let _ = net_send_error(s, i as u16, -110, 0);
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
                 // RTO: if there is unacknowledged data and the timer expires,
                 // collapse cwnd, signal the consumer to retransmit, and arm
                 // backoff. Karn: don't use the retransmit sample for RTT.

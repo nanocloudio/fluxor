@@ -3197,6 +3197,41 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
                     uart_puts(b"[rng200] FATAL: no entropy after enable\r\n");
                     return -1;
                 }
+                // Warm-up discard. From a COLD enable the ring-oscillator
+                // source has not seeded and the FIFO presents zero words with
+                // COUNT already non-zero — the count says a word is ready
+                // before the source is random. Discard until a non-zero word
+                // appears so the first fill after boot is real entropy, not
+                // zeros. Bounded by COUNT (not the wall clock — this runs
+                // during early boot where the timer may not be advancing, so a
+                // time bound could hang); the measured cold burst cleared in
+                // tens of words, and a run past this bound is a dead source.
+                // This seeds the source for the FIRST read; mid-run reseeds
+                // that briefly re-present zeros are handled by the consumer
+                // (quic re-fills a zero connection ID rather than using it).
+                let mut warm = 0u32;
+                loop {
+                    if core::ptr::read_volatile(RNG200_COUNT) == 0 {
+                        let d = bcm_now_micros() + WORD_WAIT_US;
+                        while core::ptr::read_volatile(RNG200_COUNT) == 0
+                            && bcm_now_micros() < d
+                        {
+                            core::hint::spin_loop();
+                        }
+                        if core::ptr::read_volatile(RNG200_COUNT) == 0 {
+                            uart_puts(b"[rng200] FATAL: entropy timeout (warm-up)\r\n");
+                            return -1;
+                        }
+                    }
+                    if core::ptr::read_volatile(RNG200_DATA) != 0 {
+                        break;
+                    }
+                    warm += 1;
+                    if warm >= 4096 {
+                        uart_puts(b"[rng200] FATAL: only zero words after enable\r\n");
+                        return -1;
+                    }
+                }
             }
 
             let mut i = 0usize;

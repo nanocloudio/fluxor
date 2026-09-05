@@ -108,7 +108,27 @@ pub const MSG_DATA: u8 = 0x02;
 /// `FRAME_HDR + CONN_ID_LEN + MAX_DATA_FRAGMENT` and be sure a whole frame always fits.
 pub const MAX_DATA_FRAGMENT: usize = 1460;
 /// Remote closed connection. Payload: `[conn_id: u16 LE]`
+///
+/// Release rule. After `MSG_CLOSED` the connection id stays RESERVED for the
+/// consumer's [`CMD_CLOSE`]: the transport does not hand it to a new accept
+/// until the consumer has closed or a bounded grace interval has elapsed
+/// ([`CLOSED_ID_GRACE_MS`]). So a consumer may always answer `MSG_CLOSED`
+/// with `CMD_CLOSE` and never hit a newcomer, and a consumer that never
+/// answers cannot leak the id for good. Both transports implement it: the
+/// bare-metal `ip` (which holds the TCP slot in CloseWait until the close,
+/// then times it out) and the Linux host adapter (which holds the freed
+/// slot's id for the grace interval). Without the rule the two failure
+/// modes meet: a transport that holds CloseWait indefinitely, and a consumer
+/// that withholds its close because some other transport freed the id
+/// underneath it — between them every client-closed keepalive connection
+/// leaks a slot until the table is full.
 pub const MSG_CLOSED: u8 = 0x03;
+/// How long a transport keeps a closed connection's id reserved for the
+/// consumer's [`CMD_CLOSE`] after [`MSG_CLOSED`] before releasing it itself.
+/// Five seconds: several scheduler passes on the slowest target and far
+/// longer than any consumer takes to notice a close, while short enough that
+/// a consumer which never closes cannot pin a 16-slot table through a burst.
+pub const CLOSED_ID_GRACE_MS: u32 = 5_000;
 /// Bind/listen completed. Payload: `[conn_id: u16 LE][local_port: u16 LE]`.
 /// `local_port` echoes the port from the consumer's `CMD_BIND`; a
 /// multi-anchor consumer records it and matches it against the
@@ -167,6 +187,10 @@ pub const CMD_SEND: u8 = 0x11;
 /// `FRAME_HDR + CONN_ID_LEN + MAX_CMD_DATA` and drain anything larger to stay frame-aligned.
 pub const MAX_CMD_DATA: usize = 8192;
 /// Close connection. Payload: `[conn_id: u16 LE]`
+///
+/// Always safe after [`MSG_CLOSED`] within [`CLOSED_ID_GRACE_MS`] — the id
+/// is still the consumer's — and a no-op on an id the transport has already
+/// released.
 pub const CMD_CLOSE: u8 = 0x12;
 /// Initiate outbound connection.
 /// Payload: `[sock_type: u8][ip: u32 LE][port: u16 LE][requester_tag: u8?]`.

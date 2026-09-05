@@ -92,10 +92,12 @@ include!("dtls_state.rs");
 /// Embedded (non-aarch64) targets get a small count that fits their arena; the
 /// `cfg(target_arch = "aarch64")` split mirrors `dtls_record::DTLS_HS_REASSEMBLY_BUF`.
 /// (aarch64 covers both the bcm2712 firmware build and host-test on the Pi.)
-#[cfg(target_arch = "aarch64")]
-const MAX_SESSIONS: usize = 64;
-#[cfg(not(target_arch = "aarch64"))]
-const MAX_SESSIONS: usize = 4;
+// Published in the SDK profile (`abi::config::tls::MAX_SESSIONS`, 64 on
+// aarch64 / 4 embedded) rather than held here, so a consumer can read the
+// HTTPS envelope it actually has: this table, not http's slot table, bounds
+// concurrent TLS connections, and an accept it cannot seat is closed before
+// http ever sees it.
+use abi::config::tls::MAX_SESSIONS;
 
 // ── Tier B session storage ────────────
 //
@@ -890,6 +892,12 @@ struct TlsState {
     free_closed: u32,
     free_error: u32,
     free_peer_closed: u32,
+    /// Accepted connections closed because the session table was full — the
+    /// concurrent-TLS envelope being exceeded, counted so a load ladder can
+    /// pin the number rather than count log lines. The table overflows before
+    /// the arithmetic suggests: 64 simultaneous fresh handshakes exceed a
+    /// 64-session table whenever sessions in teardown still hold their slots.
+    sess_refused: u32,
     free_cmd_close: u32,
     /// Cleartext bytes read from `clear_in` (HTTP → TLS), delta per
     /// `[tls] hb` window.
@@ -1494,6 +1502,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         pos += fmt_u32_dec(s.free_cmd_close, buf.add(pos));
         emit(b" err_site=", &mut pos);
         pos += fmt_u32_dec(u32::from(s.last_err_site), buf.add(pos));
+        emit(b" refused=", &mut pos);
+        pos += fmt_u32_dec(s.sess_refused, buf.add(pos));
         dev_log(sys, 3, buf, pos);
         s.clear_in_bytes = 0;
         s.clear_out_bytes = 0;
@@ -1717,8 +1727,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.sessions[idx].driver.is_server = t == NET_MSG_ACCEPTED;
                             s.sessions[idx].held_msg_type = t;
                             s.sessions[idx].state = SessionState::Handshaking;
-                            s.sess_handshaking_total =
-                                s.sess_handshaking_total.wrapping_add(1);
+                            s.sess_handshaking_total = s.sess_handshaking_total.wrapping_add(1);
                             // For a client connect, carry the clear-side
                             // consumer's original tag so the forwarded
                             // MSG_CONNECTED routes back to it. Accepts: 0.
@@ -1762,6 +1771,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // hitting this means either the pool is
                             // genuinely full or a grant was refused; either
                             // way the operator needs to know it happened.
+                            s.sess_refused = s.sess_refused.wrapping_add(1);
                             dev_log(
                                 sys,
                                 1,
@@ -1854,10 +1864,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // writer, not of this contract, and the failure
                                 // it would cause is silent.
                                 if got > 0 {
-                                    #[expect(
-                                        clippy::cast_sign_loss,
-                                        reason = "guarded > 0 above"
-                                    )]
+                                    #[expect(clippy::cast_sign_loss, reason = "guarded > 0 above")]
                                     let n = got as usize;
                                     s.sessions[idx].recv_len += n;
                                 }
@@ -4324,8 +4331,10 @@ pub use abi::contracts::net::peer_identity::fp_alg as peer_fp_alg;
 
 pub const PEER_IDENTITY_HEADER_LEN: usize = abi::contracts::net::peer_identity::FRAME_HDR;
 /// Fixed part of the payload, before the two variable fields.
-pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize = abi::contracts::net::peer_identity::PAYLOAD_FIXED;
-pub const PEER_IDENTITY_MAX_FINGERPRINT: usize = abi::contracts::net::peer_identity::MAX_FINGERPRINT;
+pub const PEER_IDENTITY_FIXED_PAYLOAD_LEN: usize =
+    abi::contracts::net::peer_identity::PAYLOAD_FIXED;
+pub const PEER_IDENTITY_MAX_FINGERPRINT: usize =
+    abi::contracts::net::peer_identity::MAX_FINGERPRINT;
 pub const PEER_IDENTITY_MAX_PRINCIPAL: usize = abi::contracts::net::peer_identity::MAX_PRINCIPAL;
 pub const PEER_IDENTITY_MAX_TOTAL: usize = abi::contracts::net::peer_identity::MAX_TOTAL;
 
@@ -4419,11 +4428,23 @@ pub fn parse_peer_identity(payload: &[u8]) -> Option<PeerIdentity<'_>> {
     let credential_kind = payload[5];
     let profile_id = u16::from_le_bytes([payload[6], payload[7]]);
     let not_before = u64::from_le_bytes([
-        payload[8], payload[9], payload[10], payload[11], payload[12], payload[13], payload[14],
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+        payload[12],
+        payload[13],
+        payload[14],
         payload[15],
     ]);
     let not_after = u64::from_le_bytes([
-        payload[16], payload[17], payload[18], payload[19], payload[20], payload[21], payload[22],
+        payload[16],
+        payload[17],
+        payload[18],
+        payload[19],
+        payload[20],
+        payload[21],
+        payload[22],
         payload[23],
     ]);
     let verification_flags =

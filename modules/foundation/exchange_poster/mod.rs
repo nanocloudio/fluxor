@@ -1,7 +1,7 @@
 //! exchange_poster — framed-payload → exchange-request adapter.
 //!
 //! Sits between the `otel` export engine and an exchange-contract request
-//! client (wave's `http` in exchange mode, or any provider of that surface):
+//! client (any provider of the ordered-ack exchange surface):
 //! each framed body read from `payload` becomes one `MSG_PUBLISH` whose
 //! request record is `[method u8][path_len u16 LE][body_len u16 LE][path…]
 //! [body…]` (the exchange request-record framing), and the correlated
@@ -250,7 +250,11 @@ unsafe fn step_payload(s: &mut PosterState) {
     }
 
     let corr = s.next_corr;
-    s.next_corr = if s.next_corr == u64::MAX { 1 } else { s.next_corr + 1 };
+    s.next_corr = if s.next_corr == u64::MAX {
+        1
+    } else {
+        s.next_corr + 1
+    };
 
     // Request record: [method][path_len][body_len][path][body].
     let plen = s.path_len as usize;

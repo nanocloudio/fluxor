@@ -97,7 +97,27 @@ include!("pump.rs");
 // (`emit_stateless_refusal`), never silently ignored. A client that is
 // refused fails in one round trip; a client that is ignored hangs to its own
 // handshake deadline, which is indistinguishable from an unreachable server.
-const MAX_CONNS: usize = 8;
+// Published in the SDK profile (`abi::config::quic::MAX_CONNS`) so a consumer
+// can read the QUIC envelope beside the TCP and TLS ones.
+use abi::config::quic::MAX_CONNS;
+/// Handshake work one step may do for one connection, in microseconds.
+///
+/// The pump loops below re-drive a handshaking connection until it stops
+/// progressing, up to 64 times per step. That defeats `ecdh_bits_per_step`:
+/// the ECDH ladder it splits into eight chunks ran all eight in one step,
+/// beside the run-to-completion ECDSA CertificateVerify (501 µs on the Pi 5,
+/// `fcs=8 fcu=501` in the heartbeat). Unbounded, the whole first contact
+/// lands in a single step and the kernel's 2 ms guard faults the module —
+/// which leaves the board deaf to QUIC from its very first client. Half the
+/// guard: one signature still fits, the ladder spreads across ticks, and a
+/// state that legitimately needs more resumes next step.
+const HANDSHAKE_STEP_BUDGET_US: u64 = 1_000;
+
+/// Whether this step's handshake budget for a connection is spent.
+#[inline(always)]
+unsafe fn handshake_budget_spent(sys: &SyscallTable, t_start: u64) -> bool {
+    dev_micros(sys).wrapping_sub(t_start) >= HANDSHAKE_STEP_BUDGET_US
+}
 /// Configured ALPN list buffer (comma-separated raw tokens, e.g.
 /// `mqtt,h3`). 64 bytes holds several protocol names with separators.
 const MAX_ALPN_CFG: usize = 64;
@@ -203,6 +223,20 @@ pub(crate) struct QuicState {
     syscalls: *const SyscallTable,
     /// Connections refused at the table ceiling (stateless CONNECTION_REFUSED).
     refused_conns: u32,
+    /// Connection IDs or reset tokens the CSPRNG could not fill non-zero
+    /// across every retry — a reseed the source did not recover from within
+    /// the attempt bound. Reported as `cidfail=` in the heartbeat; non-zero
+    /// means a CID was declined rather than emitted zero.
+    rng_cid_fail: u32,
+    /// Longest single handshake-pump step since boot, in microseconds, and
+    /// the `HandshakeState` it ran (first-contact attribution; see
+    /// `pump::pump_session`). Reported as `fcs=`/`fcu=` in the heartbeat.
+    fc_max_us: u32,
+    fc_max_state: u8,
+    /// Longest single inbound-datagram drain (`drain_inbound_one`) since
+    /// boot, in microseconds: the packet-level work — Initial key derivation,
+    /// AEAD, coalesced-packet parsing — that precedes the handshake pump.
+    fc_max_drain_us: u32,
     net_in: i32,
     net_out: i32,
     app_in: i32,
@@ -437,6 +471,7 @@ pub unsafe extern "C" fn module_new(
     s.tlm = TlmCounters::new();
     s.tlm_last_ms = 0;
     s.refused_conns = 0;
+    s.rng_cid_fail = 0;
     // `sample_permille` resolved after param parsing below (set_defaults would
     // clobber a value set here) via the `trace_sample_permille` 0xFFFF sentinel.
 
@@ -744,7 +779,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         if let Some(idx) = alloc_client_connection(s, &ip, s.peer_port) {
             // Drive far enough to get the ClientHello queued.
             let mut steps = 0;
-            while steps < 64 && s.conns[idx].phase == ConnPhase::Handshaking {
+            let t_start = dev_micros(&*s.syscalls);
+            while steps < 64
+                && s.conns[idx].phase == ConnPhase::Handshaking
+                && !handshake_budget_spent(&*s.syscalls, t_start)
+            {
                 let progressed = pump_session(s, idx);
                 drain_outbound(s, idx);
                 if !progressed {
@@ -761,8 +800,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Handshaking {
             let mut steps = 0;
-            while steps < 64 && s.conns[i].phase == ConnPhase::Handshaking {
+            let t_start = dev_micros(&*s.syscalls);
+            while steps < 64
+                && s.conns[i].phase == ConnPhase::Handshaking
+                && !handshake_budget_spent(&*s.syscalls, t_start)
+            {
+                let t0 = dev_micros(sys);
                 let drained = drain_inbound_one(s, i);
+                let dt = dev_micros(sys).wrapping_sub(t0) as u32;
+                if dt > s.fc_max_drain_us {
+                    s.fc_max_drain_us = dt;
+                }
                 let progressed = pump_session(s, i);
                 drain_outbound(s, i);
                 if !drained && !progressed {
@@ -863,12 +911,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         // because allocating for a
                                         // connection being refused is what
                                         // makes a full table an amplifier.
-                                        emit_stateless_refusal(
-                                            s,
-                                            &ip,
-                                            port,
-                                            &peek[..peek_len],
-                                        );
+                                        emit_stateless_refusal(s, &ip, port, &peek[..peek_len]);
                                     }
                                 }
                             }
@@ -947,7 +990,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     while i < MAX_CONNS {
         if s.conns[i].phase == ConnPhase::Handshaking && s.conns[i].inbound_len > 0 {
             let mut steps = 0;
-            while steps < 64 && s.conns[i].phase == ConnPhase::Handshaking {
+            let t_start = dev_micros(&*s.syscalls);
+            while steps < 64
+                && s.conns[i].phase == ConnPhase::Handshaking
+                && !handshake_budget_spent(&*s.syscalls, t_start)
+            {
                 let drained = drain_inbound_one(s, i);
                 let progressed = pump_session(s, i);
                 drain_outbound(s, i);
@@ -1026,15 +1073,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             mux_emit_session_closed(s, i, mux::STATUS_CLOSED);
             // RECYCLE the slot once everything owed has gone out (the span
             // is emitted above; the app notification has latched, or was
-            // never owed because the session was never announced). A Closed
-            // slot used to stay Closed forever — `alloc_server_connection`
-            // takes only Idle — so every ended session permanently consumed
-            // a slot and the table exhausted after MAX_CONNS dials, found
-            // the moment anything redialed the DUT repeatedly (Pi 5 h3
-            // ladder, 2026-08-26). The slot's ECDH keypair is REGENERATED:
-            // an "ephemeral" reused across connections is not one.
-            let owed_app =
-                s.conns[i].session_opened_sent && !s.conns[i].session_closed_sent;
+            // never owed because the session was never announced).
+            // Returning the slot to Idle is what makes it reusable at all:
+            // `alloc_server_connection` takes only Idle, so a slot left
+            // Closed is consumed for good and the table exhausts after
+            // MAX_CONNS dials — which anything redialing repeatedly reaches
+            // in seconds. The slot's ECDH keypair is REGENERATED: an
+            // "ephemeral" reused across connections is not one.
+            let owed_app = s.conns[i].session_opened_sent && !s.conns[i].session_closed_sent;
             if !owed_app && s.conns[i].span_start_us == 0 {
                 let mut random = [0u8; 32];
                 if dev_csprng_fill(sys, random.as_mut_ptr(), 32) >= 0 {
@@ -1082,7 +1128,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             if let Some(idx) = alloc_resumption_connection(s, &ip, s.peer_port) {
                 s.pending_resumption_test = true;
                 let mut steps = 0;
-                while steps < 64 && s.conns[idx].phase == ConnPhase::Handshaking {
+                let t_start = dev_micros(&*s.syscalls);
+                while steps < 64
+                    && s.conns[idx].phase == ConnPhase::Handshaking
+                    && !handshake_budget_spent(&*s.syscalls, t_start)
+                {
                     let progressed = pump_session(s, idx);
                     drain_outbound(s, idx);
                     if !progressed {
@@ -1186,12 +1236,45 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 && !s.conns[i].alt_cid_issued
             {
                 let conn = &mut s.conns[i];
-                dev_csprng_fill(sys, conn.alt_cid.as_mut_ptr(), 8);
-                conn.alt_cid_len = 8;
-                conn.alt_cid_seq = 1;
-                dev_csprng_fill(sys, conn.alt_cid_reset_token.as_mut_ptr(), 16);
+                // The spare CID and its stateless-reset token are minted from
+                // the CSPRNG, and BOTH fills must succeed before the frame is
+                // queued. On a platform whose entropy source can fail
+                // transiently under load (the Pi 5's RNG200 times out and
+                // returns an error), an unchecked fill leaves these buffers
+                // zero, and the server then emits a NEW_CONNECTION_ID carrying
+                // an all-zero CID and an all-zero reset token — which a
+                // conforming peer rejects with a FRAME_ENCODING_ERROR
+                // CONNECTION_CLOSE, killing a connection whose handshake had
+                // just completed (measured: quiche closes err=7 right after
+                // HANDSHAKE_DONE against the Pi 5 h3 server). When entropy is
+                // unavailable the spare CID is simply not issued this step and
+                // is retried on the next — the peer's active_connection_id_limit
+                // is an offer this endpoint may decline, so declining until the
+                // CSPRNG recovers is correct rather than sending zeros.
+                // One-shot per connection: `alt_cid_issued` latches whether it
+                // succeeds or not, so a connection whose spare CID cannot be
+                // minted does NOT re-attempt every step. Retrying forever is a
+                // hot loop — at a 50 us tick a single such connection burns
+                // ~20000 fills a second — and it starved h3 connection setup on
+                // the Pi 5, whose RNG200 re-presents zero words heavily
+                // (`cidfail=` counted 326538 declines in one load run before
+                // this). The spare CID is an offer the peer's
+                // active_connection_id_limit invites but does not require, so
+                // declining it for the connection's lifetime is correct; the
+                // fill already retried past a transient reseed-zero within the
+                // one attempt.
+                let cid_ok = csprng_fill_nonzero(sys, conn.alt_cid.as_mut_ptr(), 8);
+                let tok_ok = csprng_fill_nonzero(sys, conn.alt_cid_reset_token.as_mut_ptr(), 16);
                 conn.alt_cid_issued = true;
-                conn.new_cid_tx_pending = true;
+                if cid_ok && tok_ok {
+                    conn.alt_cid_len = 8;
+                    conn.alt_cid_seq = 1;
+                    conn.new_cid_tx_pending = true;
+                } else {
+                    // Declined for this connection: nothing queued, no retry.
+                    conn.alt_cid_len = 0;
+                    s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+                }
             }
             // Inbound 1-RTT packets.
             if s.conns[i].inbound_len > 0 {
@@ -2131,8 +2214,7 @@ unsafe fn mux_apply_command(s: &mut QuicState, mt: u8, payload: &[u8]) {
     if plen_lt(payload, mux::SESSION_ID_BYTES) {
         return;
     }
-    let cid =
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let cid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     if cid >= MAX_CONNS {
         return;
     }
@@ -2367,7 +2449,7 @@ unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
             }
             i += 1;
         }
-        let mut l = [0u8; 64];
+        let mut l = [0u8; 128];
         let msg = b"[quic] hb ep=";
         l[..13].copy_from_slice(msg);
         let mut pos = 13;
@@ -2383,6 +2465,18 @@ unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
         l[pos..pos + 5].copy_from_slice(b" ref=");
         pos += 5;
         pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.refused_conns);
+        l[pos..pos + 9].copy_from_slice(b" cidfail=");
+        pos += 9;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.rng_cid_fail);
+        l[pos..pos + 5].copy_from_slice(b" fcs=");
+        pos += 5;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), u32::from(s.fc_max_state));
+        l[pos..pos + 5].copy_from_slice(b" fcu=");
+        pos += 5;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.fc_max_us);
+        l[pos..pos + 5].copy_from_slice(b" fcd=");
+        pos += 5;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.fc_max_drain_us);
         dev_log(sys, 3, l.as_ptr(), pos);
     }
     if !dev_telemetry_enabled(sys) {
@@ -2510,7 +2604,14 @@ unsafe fn emit_stateless_refusal(s: &mut QuicState, ip: &[u8; 4], port: u16, dgr
     }
     let sys = &*s.syscalls;
     let peer = PeerAddr { ip: *ip, port };
-    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..m], &mut s.net_scratch);
+    let _ = send_datagram(
+        sys,
+        s.net_out,
+        &s.endpoint,
+        &peer,
+        &pkt[..m],
+        &mut s.net_scratch,
+    );
     s.refused_conns = s.refused_conns.wrapping_add(1);
     // Bounded evidence: log the 1st, 2nd, 4th, 8th… refusal, so a flood of
     // refused dials cannot flood the log while the count stays observable.
@@ -2601,6 +2702,38 @@ unsafe fn find_conn_by_dcid(s: &QuicState, dcid: &[u8]) -> i32 {
     -1
 }
 
+/// Fill `buf` with CSPRNG bytes that are not all zero.
+///
+/// A connection ID or reset token of all zeros is not a value this endpoint
+/// may put on the wire: a zero server CID, or a NEW_CONNECTION_ID carrying a
+/// zero CID, is rejected by a conforming peer (quiche closes with
+/// FRAME_ENCODING_ERROR the moment the handshake completes). The kernel CSPRNG
+/// seeds its source before the first read, but a hardware source can briefly
+/// re-present zero words when it reseeds mid-run, and the fill then SUCCEEDS
+/// while writing zeros. Re-fill on an all-zero result — the source recovers
+/// within a read or two — and report whether a non-zero fill was obtained.
+/// Returns false if a fill failed or stayed zero across every attempt; the
+/// caller then declines (refuses a connection, or does not offer a spare CID)
+/// rather than emitting zeros.
+#[inline]
+unsafe fn csprng_fill_nonzero(sys: &SyscallTable, buf: *mut u8, len: usize) -> bool {
+    let mut attempt = 0;
+    while attempt < 8 {
+        if dev_csprng_fill(sys, buf, len) < 0 {
+            return false;
+        }
+        let mut k = 0;
+        while k < len {
+            if *buf.add(k) != 0 {
+                return true;
+            }
+            k += 1;
+        }
+        attempt += 1;
+    }
+    false
+}
+
 unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
     let framed = s.alpn_cfg_len > 0;
     // Snapshot the sampling rate before borrowing a connection slot mutably.
@@ -2640,7 +2773,9 @@ unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
 
             // Pick our SCID (random 8 bytes).
             let sys = &*s.syscalls;
-            dev_csprng_fill(sys, conn.our_cid.as_mut_ptr(), 8);
+            if !csprng_fill_nonzero(sys, conn.our_cid.as_mut_ptr(), 8) {
+                s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+            }
             conn.our_cid_len = 8;
 
             // Observability: mint the `quic.connection` root trace context and
@@ -2712,7 +2847,9 @@ unsafe fn alloc_resumption_connection(s: &mut QuicState, ip: &[u8; 4], port: u16
             conn.driver.suite = CipherSuite::ChaCha20Poly1305;
             // Pick fresh CIDs.
             let sys = &*s.syscalls;
-            dev_csprng_fill(sys, conn.our_cid.as_mut_ptr(), 8);
+            if !csprng_fill_nonzero(sys, conn.our_cid.as_mut_ptr(), 8) {
+                s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+            }
             conn.our_cid_len = 8;
             dev_csprng_fill(sys, conn.peer_cid.as_mut_ptr(), 8);
             conn.peer_cid_len = 8;
@@ -2772,7 +2909,9 @@ unsafe fn alloc_client_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
             //     becomes the server-side "original DCID" used to derive
             //     Initial keys on both sides.
             let sys = &*s.syscalls;
-            dev_csprng_fill(sys, conn.our_cid.as_mut_ptr(), 8);
+            if !csprng_fill_nonzero(sys, conn.our_cid.as_mut_ptr(), 8) {
+                s.rng_cid_fail = s.rng_cid_fail.wrapping_add(1);
+            }
             conn.our_cid_len = 8;
             dev_csprng_fill(sys, conn.peer_cid.as_mut_ptr(), 8);
             conn.peer_cid_len = 8;
@@ -3181,6 +3320,31 @@ pub mod test_helpers {
     pub unsafe fn dgram_tx_pending(state: *const u8, idx: usize) -> bool {
         let s = &*(state as *const QuicState);
         idx < MAX_CONNS && s.conns[idx].dgram_tx_pending
+    }
+
+    /// The spare-CID state: `None` before one is issued, `Some(true)` once a
+    /// spare CID has been issued whose value is all zeros — the degenerate
+    /// NEW_CONNECTION_ID a peer rejects with FRAME_ENCODING_ERROR — and
+    /// `Some(false)` once one is issued with a non-zero value. `alt_cid_issued`
+    /// latches, so this is stable across steps (unlike the transient
+    /// `new_cid_tx_pending`, cleared the moment the frame is sent). The
+    /// invariant the CSPRNG-failure regression asserts is that this is NEVER
+    /// `Some(true)`: a spare CID is issued only from a successful fill.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn new_cid_pending_all_zero(state: *const u8, idx: usize) -> Option<bool> {
+        let s = &*(state as *const QuicState);
+        // Keyed on what is actually QUEUED (`alt_cid_len`), not the one-shot
+        // `alt_cid_issued` latch: a connection that attempted and DECLINED the
+        // spare CID latches `alt_cid_issued` but queues nothing
+        // (`alt_cid_len == 0`), which reads as `None` — no spare CID offered.
+        if idx >= MAX_CONNS || s.conns[idx].alt_cid_len == 0 {
+            return None;
+        }
+        let len = s.conns[idx].alt_cid_len as usize;
+        let all_zero = s.conns[idx].alt_cid[..len].iter().all(|&b| b == 0);
+        Some(all_zero)
     }
 
     /// Arm a migration on connection `idx`: record the candidate 4-tuple,

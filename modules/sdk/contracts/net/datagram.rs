@@ -122,8 +122,8 @@ pub const MSG_DG_BOUND: u8 = 0x40;
 /// On a fanned provider output every consumer sees every BOUND, and an
 /// endpoint id is an identity: a consumer that grabs the first BOUND it
 /// polls claims another module's endpoint, then filters every later
-/// datagram against the wrong id (found live on the Pi 5 SIP rig,
-/// 2026-08-26 — three binds, three BOUNDs, whoever read first won).
+/// datagram against the wrong id — three binds raise three BOUNDs, and
+/// whoever reads first wins.
 /// A consumer that requested a specific port claims a BOUND only when
 /// `local_port` matches it. Callers bounds-check `payload.len() >= 3`.
 #[inline]
