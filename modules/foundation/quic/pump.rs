@@ -183,23 +183,27 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                     let parity = id_bytes[0] as usize;
                     let key = s.ticket_key[parity];
                     let digest = ticket_digest(id_bytes);
-                    if ticket_seen(&s.ticket_seen, &digest) {
-                        // Single-use: a ticket accepted once buys nothing
-                        // twice, and the refusal is metered by log.
-                        let msg = b"[quic] 0-RTT ticket replay rejected";
+                    let now_ms = dev_millis(sys);
+                    // A ticket opens only under the key that sealed it and
+                    // the incarnation of the boot that minted it, so both
+                    // must be in hand before there is anything to open.
+                    let sealing = if key >= 0 {
+                        dev_boot_incarnation(sys)
+                    } else {
+                        None
+                    };
+                    if ticket_claim_held(&s.ticket_seen, &digest, now_ms) {
+                        // Single-use covers every resumption, not only the
+                        // ones carrying early data: a ticket accepted
+                        // twice also correlates two connections as one
+                        // client. The refusal is metered by log and the
+                        // handshake continues as a full one.
+                        let msg = b"[quic] ticket replay rejected";
                         dev_log(sys, 2, msg.as_ptr(), msg.len());
-                    } else if key >= 0 {
-                        let mut aad = [0u8; 16];
-                        aad[..TICKET_AAD.len()].copy_from_slice(TICKET_AAD);
-                        aad[TICKET_AAD.len()] = parity as u8;
+                    } else if let Some(incarnation) = sealing {
+                        let aad = ticket_aad(parity as u8, &incarnation);
                         let mut pt = [0u8; TICKET_PT_LEN];
-                        let n = vault_open(
-                            sys,
-                            key,
-                            &aad[..TICKET_AAD.len() + 1],
-                            &id_bytes[1..],
-                            &mut pt,
-                        );
+                        let n = vault_open(sys, key, &aad, &id_bytes[1..], &mut pt);
                         if n == TICKET_PT_LEN {
                             let suite_id = u16::from_le_bytes([pt[0], pt[1]]);
                             let rms_len = pt[2] as usize;
@@ -210,7 +214,10 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                             ]);
                             let lifetime_s = u32::from_le_bytes([pt[63], pt[64], pt[65], pt[66]]);
                             // RFC 8446 §4.6.1 — ticket lifetime check.
-                            let now_ms = dev_millis(sys);
+                            // `issue_ms` is this boot's uptime reading, and
+                            // the AAD has already established that the
+                            // ticket belongs to this boot, so the two
+                            // readings are on one timeline.
                             let elapsed_ms = now_ms.saturating_sub(issue_ms);
                             let lifetime_ok = elapsed_ms <= (lifetime_s as u64) * 1000;
                             if lifetime_ok && rms_len <= 48 {
@@ -243,12 +250,26 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                                             diff |= client_binder[k] ^ expected[k];
                                             k += 1;
                                         }
-                                        if diff == 0 {
+                                        // The claim is what makes the
+                                        // acceptance single-use, so it is
+                                        // taken first: an acceptance the
+                                        // store could not record is an
+                                        // acceptance with nothing behind
+                                        // it. A full store refuses, and
+                                        // the handshake completes in full
+                                        // — slower, never unprotected.
+                                        if diff == 0
+                                            && ticket_claim(
+                                                &mut s.ticket_seen[..],
+                                                digest,
+                                                issue_ms
+                                                    .saturating_add((lifetime_s as u64) * 1000),
+                                                now_ms,
+                                            )
+                                        {
                                             psk_accepted = true;
                                             accepted_psk[..hl].copy_from_slice(&psk[..hl]);
                                             accepted_psk_len = hl;
-                                            // Burn the ticket — single-use.
-                                            ticket_mark_seen(&mut s.ticket_seen, &mut s.ticket_seen_next, digest);
                                         }
                                     }
                                 }
@@ -919,13 +940,18 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     } else {
         return;
     }
-    // No sealing key, no ticket: resumption that cannot be sealed is not
-    // offered, and the handshake stays a full one.
+    // Resumption that cannot be sealed is not offered, and the handshake
+    // stays a full one. That needs both a key and an incarnation: a ticket
+    // outliving its host's memory of issuing it is a replay held open by a
+    // restart.
     let parity = s.ticket_parity as usize;
     let key = s.ticket_key[parity];
     if key < 0 {
         return;
     }
+    let Some(incarnation) = dev_boot_incarnation(sys) else {
+        return;
+    };
     // Random ticket_age_add + 8-byte nonce.
     let mut age_add_buf = [0u8; 4];
     dev_csprng_fill(sys, age_add_buf.as_mut_ptr(), 4);
@@ -948,12 +974,10 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     pt[55..63].copy_from_slice(&now_ms.to_le_bytes());
     pt[63..67].copy_from_slice(&lifetime_s.to_le_bytes());
     pt[67..75].copy_from_slice(&nonce);
-    let mut aad = [0u8; 16];
-    aad[..TICKET_AAD.len()].copy_from_slice(TICKET_AAD);
-    aad[TICKET_AAD.len()] = parity as u8;
+    let aad = ticket_aad(parity as u8, &incarnation);
     let mut ticket_bytes = [0u8; MAX_TICKET_LEN];
     ticket_bytes[0] = parity as u8;
-    let sealed = vault_seal(sys, key, &aad[..TICKET_AAD.len() + 1], &pt, &mut ticket_bytes[1..]);
+    let sealed = vault_seal(sys, key, &aad, &pt, &mut ticket_bytes[1..]);
     let mut i = 0;
     while i < pt.len() {
         core::ptr::write_volatile(pt.as_mut_ptr().add(i), 0);

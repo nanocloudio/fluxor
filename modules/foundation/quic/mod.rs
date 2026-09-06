@@ -54,6 +54,7 @@ include!("../../sdk/runtime/params.rs");
 // log_net / transport_buffer. quic keeps its own connection-id demux on the
 // inbound path; the core owns bind + send only.
 include!("../../sdk/cores/datagram_endpoint.rs");
+include!("../../sdk/cores/ticket_replay.rs");
 include!("../../sdk/wire/varint.rs");
 
 // Crypto primitives (also used by tls/dtls modules — duplicated PIC
@@ -169,13 +170,36 @@ const MAX_TICKETS: usize = 4;
 /// sealed under a vault-held key (`KEY_VAULT::AEAD_SEAL`) that never
 /// leaves the vault. Two labelled keys alternate by parity so a rotation
 /// leaves the previous generation openable until its tickets age out; a
-/// ticket names the parity that sealed it. Replay is refused against a
-/// bounded ring of recently accepted ticket digests — single-use is
-/// server-side state, kept small on purpose (RFC 8446 §8, RFC 9001 §9.2).
+/// ticket names the parity that sealed it.
+///
+/// A ticket may not outlive the boot that minted it, and nothing else here
+/// enforces that: the sealing key is persistent, the replay store is RAM
+/// that a restart clears, and `issue_ms` is an uptime reading that a
+/// restart moves backwards — which pins `elapsed` at zero and satisfies
+/// the lifetime check for good. So this boot's incarnation is part of the AAD, and a
+/// ticket from another boot does not fail a check: it does not open
+/// (RFC 8446 §8, RFC 9001 §9.2).
 const TICKET_AAD: &[u8] = b"quic-ticket-v1";
 const TICKET_LABEL: [&[u8]; 2] = [b"quic-resume-0", b"quic-resume-1"];
-/// Recently accepted tickets, by digest, for replay refusal.
-const TICKET_SEEN: usize = 16;
+/// `TICKET_AAD` + parity + this boot's incarnation. Derived from the label
+/// so that changing the label cannot leave a stale length that still
+/// compiles.
+const TICKET_AAD_LEN: usize = TICKET_AAD.len() + 1 + 16;
+/// Tickets claimed against replay, held for the claim's whole acceptance
+/// window and never reclaimed under pressure — that window is precisely
+/// where a replay lands.
+///
+/// Every resumption takes a slot, not only one carrying early data: a
+/// ticket accepted twice also correlates two connections as one client.
+/// A full store costs a resumption its round-trip saving, never its
+/// safety.
+///
+/// Depth is sized against `lifetime_s` in `emit_new_session_ticket`, since
+/// a claim lives as long as its ticket can still be replayed: the store
+/// bounds resumptions per ticket lifetime, and buying more of them means
+/// shortening the lifetime rather than widening the replay window.
+const TICKET_SEEN: usize = 64;
+
 /// Sealed ticket plaintext: suite(2) rms_len(1) rms(48) age_add(4)
 /// issue_ms(8) lifetime_s(4) nonce(8).
 const TICKET_PT_LEN: usize = 2 + 1 + 48 + 4 + 8 + 4 + 8;
@@ -262,9 +286,8 @@ pub(crate) struct QuicState {
     /// Seconds between key rotations; 0 = never.
     ticket_rotate_s: u32,
     ticket_rotated_ms: u64,
-    /// Digests of recently accepted tickets (replay refusal).
-    ticket_seen: [[u8; 16]; TICKET_SEEN],
-    ticket_seen_next: u8,
+    /// Accepted tickets held against replay for their acceptance window.
+    ticket_seen: [TicketClaim; TICKET_SEEN],
     /// Client-side ticket cache (per-peer).
     client_tickets: [ClientTicketEntry; MAX_TICKETS],
     /// Set after the client kicks off a 0-RTT resumption attempt so
@@ -434,8 +457,7 @@ pub unsafe extern "C" fn module_new(
     s.ticket_vault_warned = false;
     s.ticket_rotate_s = 3600;
     s.ticket_rotated_ms = 0;
-    s.ticket_seen = [[0u8; 16]; TICKET_SEEN];
-    s.ticket_seen_next = 0;
+    s.ticket_seen = [TicketClaim::EMPTY; TICKET_SEEN];
     s.pending_resumption_test = false;
     s.alpn_cfg_len = 0;
     let mut t = 0;
@@ -873,7 +895,17 @@ unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
     dev_log(sys, 3, msg.as_ptr(), msg.len());
 }
 
-/// First 16 bytes of SHA-256 over a ticket: what the replay ring holds.
+/// The AAD both seal and open must agree on: label, parity, and the boot
+/// incarnation that binds a ticket to the life of the host that minted it.
+fn ticket_aad(parity: u8, incarnation: &[u8; 16]) -> [u8; TICKET_AAD_LEN] {
+    let mut aad = [0u8; TICKET_AAD_LEN];
+    aad[..TICKET_AAD.len()].copy_from_slice(TICKET_AAD);
+    aad[TICKET_AAD.len()] = parity;
+    aad[TICKET_AAD.len() + 1..].copy_from_slice(incarnation);
+    aad
+}
+
+/// First 16 bytes of SHA-256 over a ticket: what the replay store holds.
 fn ticket_digest(identity: &[u8]) -> [u8; 16] {
     let mut h = Sha256::new();
     h.update(identity);
@@ -881,25 +913,6 @@ fn ticket_digest(identity: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&d[..16]);
     out
-}
-
-/// Whether `digest` is in the replay ring. Takes the ring itself so the
-/// borrow stays disjoint from a connection being driven.
-fn ticket_seen(ring: &[[u8; 16]; TICKET_SEEN], digest: &[u8; 16]) -> bool {
-    let mut i = 0;
-    while i < TICKET_SEEN {
-        if ring[i] == *digest {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-fn ticket_mark_seen(ring: &mut [[u8; 16]; TICKET_SEEN], next: &mut u8, digest: [u8; 16]) {
-    let i = *next as usize % TICKET_SEEN;
-    ring[i] = digest;
-    *next = ((i + 1) % TICKET_SEEN) as u8;
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]

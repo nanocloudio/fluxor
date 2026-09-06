@@ -269,7 +269,7 @@ model these support):
 | `transport.anchor.mux` | Stable multiplexed-session anchor |
 | `session.worker` | Movable session / application worker |
 | `session.directory` | Placement and continuity metadata service |
-| `session.resume` | Resumable session state support. Facts `scope` (`local`: the ticket names state only the minting host holds; `fleet`: the ticket is the state, sealed under a vault key any admitted host with that generation opens) and `early_data` (`off`, or `local_single_use` against the minting host's single-use record). quic declares `fleet` / `local_single_use` |
+| `session.resume` | Resumable session state support. Facts `scope` (`local`: the ticket names state only the minting host holds; `fleet`: the ticket is the state, sealed under a vault key any admitted host with that generation opens) and `early_data` (`off`, or `local_single_use` against the minting host's single-use record). quic declares `local` / `local_single_use` |
 | `session.handoff` | Opaque export / import handoff support |
 | `session.reservation` | Durable, quorum-committed reservation of nonce / sequence blocks, so a taken-over sender never reuses AEAD nonces |
 | `security.key_wrap` | Session-key custody wrapped under a KEK the storage layer cannot read |

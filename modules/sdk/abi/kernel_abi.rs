@@ -627,7 +627,12 @@ pub const NET_IDENT_PROVIDER: u32 = 0x0C4C;
 /// entry — mixes it in, so a value from a previous life of this host is
 /// structurally unmatchable rather than merely unlikely. Ungated self-query.
 /// `handle = -1`, `arg` receives 16 bytes.
-pub const BOOT_INCARNATION: u32 = 0x0C4D;
+///
+/// Sits below the 0x0C4x kernel-info run its neighbours occupy, because
+/// that run is full and its tail (0x0C4D..0x0C4F) is the OBSERVE-gated
+/// telemetry drain. An ungated self-query placed there would be refused to
+/// every caller holding no observe capability.
+pub const BOOT_INCARNATION: u32 = 0x0C2F;
 
 /// Per-step flow-budget grant for one of the calling module's ports.
 /// `arg[0] = port index`; optional `arg[1] = direction` (`0` output,

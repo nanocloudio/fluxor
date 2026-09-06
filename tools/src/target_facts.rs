@@ -26,6 +26,9 @@ pub mod vault_suite {
     pub const ML_DSA_44: u16 = 4;
     pub const ML_DSA_65: u16 = 5;
     pub const ML_DSA_87: u16 = 6;
+    /// A 32-byte ChaCha20-Poly1305 sealing key: no public half, signs
+    /// nothing, and what a resumption ticket is sealed under.
+    pub const AEAD_KEY: u16 = 8;
 }
 
 /// Vault custody tiers, `modules/sdk/contracts/key_vault.rs::tier`.
@@ -34,12 +37,20 @@ pub mod vault_tier {
     pub const DEVICE_HW: u8 = 2;
 }
 
-/// Suites every kernel vault holds.
-const SUITES_BASE: &[u16] = &[vault_suite::P256, vault_suite::ED25519];
+/// Suites every kernel vault holds. `AEAD_KEY` is here because it is
+/// ungated in `src/kernel/security/key_vault.rs` — unlike the ML-DSA
+/// suites it needs no polynomial scratch, so the smallest part carries it
+/// — and a resumption ticket cannot be sealed without it.
+const SUITES_BASE: &[u16] = &[
+    vault_suite::P256,
+    vault_suite::ED25519,
+    vault_suite::AEAD_KEY,
+];
 /// Suites a kernel built with the `pq-vault` feature adds.
 const SUITES_PQ: &[u16] = &[
     vault_suite::P256,
     vault_suite::ED25519,
+    vault_suite::AEAD_KEY,
     vault_suite::ML_DSA_44,
     vault_suite::ML_DSA_65,
     vault_suite::ML_DSA_87,

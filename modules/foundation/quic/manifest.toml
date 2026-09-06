@@ -5,14 +5,20 @@ hardware_targets = ["bcm2712"]
 
 # A stable multiplexed-session anchor (`protocol_surfaces.md` §Continuity),
 # and resumable sessions whose tickets are the session state sealed under a
-# vault-held key: any host holding that key generation can open one
-# (`scope = fleet`), and 0-RTT is admitted only against the minting host's
-# single-use record (`early_data = local_single_use`, and only with
-# `enable_0rtt`).
+# vault-held key.
 capabilities = ["transport.anchor.mux", "session.resume"]
 
+# `scope = local`: the sealing key is opened per instance from this host's
+# own vault and the ticket carries this boot's incarnation in its AAD, so a
+# ticket opens only where and when it was minted. Fleet scope would mean a
+# key generation shared across hosts, which is a distribution problem this
+# module does not solve.
+#
+# `early_data = local_single_use`: an accepted ticket is claimed for its
+# whole acceptance window, and a full claim store refuses the resumption
+# rather than evicting a live claim. 0-RTT additionally needs `enable_0rtt`.
 [capability_facts."session.resume"]
-scope      = "fleet"
+scope      = "local"
 early_data = "local_single_use"
 
 # QUIC v1 (RFC 9000 + RFC 9001). Drives the same TLS 1.3

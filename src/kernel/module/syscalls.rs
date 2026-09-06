@@ -986,8 +986,10 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
         // kernel_abi primitives: STREAM_TIME, GRAPH queries, ISR metrics,
         // runtime-params store/delete/clear (per-module-scoped),
         // ARENA_GET / BIND_IRQ / REPORT_LATENCY family, LOG_WRITE,
-        // HANDLE_POLL, RANDOM_FILL, SYS_CLOCK_HZ, paged-arena GET/PREFAULT.
-        0x0C30
+        // HANDLE_POLL, RANDOM_FILL, SYS_CLOCK_HZ, paged-arena GET/PREFAULT,
+        // BOOT_INCARNATION.
+        0x0C2F // BOOT_INCARNATION
+        | 0x0C30
         | 0x0C31
         | 0x0C33
         | 0x0C34
@@ -1486,8 +1488,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
     use crate::abi::internal::{bridge, monitor, provider_registry, reconfigure};
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
-        MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, PAGED_ARENA_GET,
+        ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
+        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, PAGED_ARENA_GET,
         PAGED_ARENA_PREFAULT, RANDOM_FILL, REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX,
         SERIAL_WRITE,
     };
@@ -1497,6 +1499,7 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         SELF_INDEX
         | OWNER_TAG
         | NET_IDENT_PROVIDER
+        | BOOT_INCARNATION
         | ARENA_GET
         | REPORT_LATENCY
         | REPORT_STEP_EFFECT

@@ -58,7 +58,7 @@ unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
     buf
 }
 
-/// This boot's incarnation (`BOOT_INCARNATION` 0x0C4D): 16 bytes fresh per
+/// This boot's incarnation (`BOOT_INCARNATION` 0x0C2F): 16 bytes fresh per
 /// boot, shared by every module. `None` until the kernel's entropy source
 /// has answered — a consumer minting a token waits rather than minting
 /// against zeros.
@@ -69,7 +69,7 @@ unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
 #[inline(always)]
 unsafe fn dev_boot_incarnation(sys: &SyscallTable) -> Option<[u8; 16]> {
     let mut buf = [0u8; 16];
-    let rc = (sys.provider_call)(-1, 0x0C4D, buf.as_mut_ptr(), 16);
+    let rc = (sys.provider_call)(-1, 0x0C2F, buf.as_mut_ptr(), 16);
     if rc < 0 || buf == [0u8; 16] {
         None
     } else {

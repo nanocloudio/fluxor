@@ -370,12 +370,15 @@ No surface ever carries the key in the clear.
 sealing primitive: a fresh CSPRNG nonce per call, the key never leaving.
 The quic module's resumption tickets are its first consumer — the ticket
 is the session state sealed under a labelled vault key, two generations
-alternating by parity so rotation never strands a live ticket, replay
-refused against a small ring of accepted digests; a fleet that shares the
-labelled keys through `KEY_WRAP` opens each other's tickets. Whether
-early data is admitted on a resumed handshake is a separate decision
-(`enable_0rtt`); the ticket itself only ever buys a one-round-trip
-resumption.
+alternating by parity so rotation never strands a live ticket. The AAD
+binds a ticket to the generation that sealed it and to this boot's
+incarnation, so it opens only on the host and the boot that minted it.
+Acceptance is single-use: a claim is retained for the ticket's whole
+acceptance window, and a store with no free slot refuses the resumption
+rather than evicting a live claim, since evicting one would make a
+captured ticket acceptable again. Whether early data is admitted on a
+resumed handshake is a separate decision (`enable_0rtt`); the ticket
+itself only ever buys a one-round-trip resumption.
 
 `BOOT_INCARNATION` (`kernel_abi`, 16 CSPRNG bytes per boot) is the value
 any boot-bound token mixes in, so a token from a previous life of the
