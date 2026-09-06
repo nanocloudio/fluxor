@@ -487,3 +487,38 @@ networking-related beyond the `channel_*` syscalls.
 - `abi_layers.md` — HAL contracts drivers use to touch hardware
 - `security.md` — conn_guard, retransmit buffering, KEY_VAULT, trust
   model
+
+## Emission Control
+
+Contract: `modules/sdk/contracts/net/identity.rs` (`ADDR_ARM`,
+`ADDR_FENCE`, the `addr_evt` events). Provider: `modules/foundation/ip`.
+
+A secondary local address is installed by the address-control writer
+(`ADDR_ADD`) and, from then on, is either **armed** — the stack sources
+frames from it and answers ARP for it — or **fenced** — it does neither.
+Every install mints an emission token (16 CSPRNG bytes mixed with the
+kernel's boot incarnation, `BOOT_INCARNATION`) and returns it on
+`addr_evt` (`MSG_ADDR_ADDED`); `ADDR_ARM` and `ADDR_FENCE` present that
+token. A token from a previous install of the address, or from a previous
+boot of the host, cannot match, which is what keeps a coordinator from a
+previous life from re-enabling emission it no longer owns. An install is
+armed unless the writer sets `install::DISARMED`, so a standby can hold an
+address silently until it is told to speak; arming announces the address
+with a gratuitous ARP.
+
+The fence closes one gate, the hand-off to the driver ring in `send_frame`,
+so it holds for every path that builds a frame: data, SYN-ACKs, RSTs, ARP
+replies and the defence of the address against a competing claim (a fenced
+address is not defended — its next owner may claim it). `MSG_ADDR_FENCED`
+reports the frame counter at the cutoff and what the boundary is worth:
+`cutoff::RING_HANDOFF` is what the ip module can prove on its own — a
+frame already in the driver ring may still leave — and a driver able to
+drain and report its completed transmit index would declare `wire`. The
+primary address is always armed and cannot be fenced. Refused frames are
+counted (`fenced=` on the `[ip] drop` line) so a fence that is doing its
+job is visible.
+
+This is the `fence.enforceable` capability with `cutoff = "ring_handoff"`
+in the ip manifest. IPv6 neighbour advertisement is not part of it: the
+stack is IPv4-only, so there is no IPv6 address to announce or fence.
+

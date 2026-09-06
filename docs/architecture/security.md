@@ -336,3 +336,48 @@ the same way.
 - [abi_layers.md](abi_layers.md) — ABI layer boundaries, contract
   inventory, KEY_VAULT position.
 - [hal_architecture.md](hal_architecture.md) — HAL boundaries and hooks.
+
+## Composition Attestation and Key Custody
+
+Source: `src/kernel/exec/scheduler/attest.rs`,
+`src/kernel/security/key_vault.rs`, contract
+`modules/sdk/contracts/key_vault.rs` (0x100F–0x1013).
+
+The vault can sign what the kernel is running. `ATTEST_COMPOSITION`
+builds the running-composition record from what the kernel holds — the
+boot incarnation, the caller's challenge, the kernel's ABI-surface
+digest, the SHA-256 of every loaded module blob with its size, every
+instantiated module's name and parameter digest, every graph edge — ends
+it with the vault's tier byte, and signs it with the named slot in that
+suite's convention. The challenge makes an answer unreplayable; the
+incarnation makes it unable to outlive the boot; the tier byte says what
+the signature is worth (`DEVICE_HW`: this hardware runs exactly this
+closure; `SOFTWARE`: a process that could be read does). The
+**composition digest** — the record with the challenge zeroed — is the
+composition's identity independent of who asked. None of this proves the
+closure correct or authorised; it proves bytes and wiring.
+
+Keys move between vaults only wrapped. `KEY_WRAP` seals a slot that
+permits `usage::WRAP` for one destination: an ephemeral P-256 agreement
+with the destination vault's public key, HKDF-SHA256 salted by the
+destination's composition digest, ChaCha20-Poly1305 with that digest as
+the associated data. `KEY_UNWRAP` on the destination recomputes its own
+composition digest first and refuses when it differs — the key was
+wrapped for the composition that was attested, and this is no longer it.
+No surface ever carries the key in the clear.
+
+`AEAD_SEAL` / `AEAD_OPEN` on a `suite::AEAD_KEY` slot are the vault-held
+sealing primitive: a fresh CSPRNG nonce per call, the key never leaving.
+The quic module's resumption tickets are its first consumer — the ticket
+is the session state sealed under a labelled vault key, two generations
+alternating by parity so rotation never strands a live ticket, replay
+refused against a small ring of accepted digests; a fleet that shares the
+labelled keys through `KEY_WRAP` opens each other's tickets. Whether
+early data is admitted on a resumed handshake is a separate decision
+(`enable_0rtt`); the ticket itself only ever buys a one-round-trip
+resumption.
+
+`BOOT_INCARNATION` (`kernel_abi`, 16 CSPRNG bytes per boot) is the value
+any boot-bound token mixes in, so a token from a previous life of the
+host is unmatchable by construction.
+

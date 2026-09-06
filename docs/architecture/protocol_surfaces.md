@@ -102,8 +102,8 @@ consumer sharing the channel.
 Contract: `modules/sdk/contracts/net/packet.rs`.
 
 Packet-preserving flows with richer metadata: packet classifiers,
-policy modules, NIC fast paths. The envelope is defined; no module
-consumes it yet.
+policy modules, NIC fast paths. The endpoint verbs are an envelope with
+no consumer yet; the decision-seam verbs below are consumed by `ip`.
 
 TX (`CMD_PKT_TX` 0x51) and RX (`MSG_PKT_RX` 0x61) share the shape
 `[ep_id: u8][af: u8][addr: 4|16 BE][port: u16 LE][lane: u8][flags: u8]
@@ -117,6 +117,54 @@ surface (`CMD_PKT_BIND` 0x50, `MSG_PKT_BOUND` 0x60, `CMD_PKT_CLOSE`
 
 The surface composes with mailbox and in-place buffer edges where
 available, but it remains a channel contract.
+
+#### Pre-transport decision seam
+
+The same contract carries a second family of verbs, consumed by the `ip`
+module with `packet_decision = pre_transport`: a point between L3
+validation and transport demux where a director settles every inbound
+IPv4 packet before any connection state exists for it.
+
+`ip` parses and validates each packet once — whole (fragments are
+refused before the seam and counted), L3 checksum, addressed to one of
+its local addresses, L4 header parsed and its checksum verified — then
+writes a `MSG_PKT_DECIDE` (0x64) record on `packet_out` and holds the
+frame. The record carries `pkt_id`, family, protocol, the canonical
+tuple, ingress interface and RX queue, `RX_FLAG_*` (checksum-ok set only
+after verification), timestamp, frame length and the L4 offset: enough
+to decide on, never the bytes, so a director does not re-parse.
+
+The director answers with one `CMD_PKT_DISPOSE` (0x53) on `packet_in`:
+
+| Disposition | Effect | Arguments |
+|---|---|---|
+| `LOCAL` | resume the ordinary transport path | — |
+| `DROP` | release silently | reason |
+| `REJECT` | release and answer the sender: TCP RST, ICMP port-unreachable, or nothing | reason, response |
+| `TUNNEL` | hand the whole frame to `packet_fwd` as `MSG_PKT_FORWARD` (0x65) | attach id, flow epoch |
+| `DSR` | as TUNNEL | endpoint id, rewrite id |
+
+Ownership follows the disposition: a buffer has one owner at a time and
+a second disposition for the same `pkt_id` is stale — `pkt_id` is
+`[slot][generation]`, so a released or reused slot cannot be acted on
+twice. `CMD_PKT_CLONE` (0x54) holds a second copy under a new id
+(`MSG_PKT_CLONED` 0x66) for a director that mirrors.
+
+The hold is bounded twice. `abi::config::ip::MAX_PACKET_HOLD` slots
+(one frame each; 32 on the host profile) — a packet arriving with every
+slot taken is refused and counted, never displaces one. And
+`packet_hold_ms` per packet: a hold past its deadline is released and
+reported (`MSG_PKT_EXPIRED` 0x67). A forward that does not fit the
+forward ring stays held with its disposition pending and is retried each
+step until it goes or expires.
+
+The seam is wholly present or wholly absent: `packet_decision = off`
+(the default) with the ports unwired is byte-identical to a stack without
+it, and either half without the other is refused at construct. Tables,
+affinity, health and policy are the director's; `ip` supplies the
+validated headers, the buffer, and the ownership rules.
+`modules/fixtures/packet_echo_director` is the reference director for
+the harness and the rig.
 
 ### Multiplexed Session Surface
 

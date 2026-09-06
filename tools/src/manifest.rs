@@ -393,6 +393,51 @@ fn validate_capability_facts(
     Ok(())
 }
 
+/// Validate `[[requires_when]]` entries: the capability must be one a
+/// target provides (`TARGET_CAPABILITIES`), spelled canonically, and the
+/// parameter and value must be named. Whether the parameter exists is the
+/// composer's to check, against the module's schema, when the module is
+/// placed.
+fn validate_requires_when(entries: Vec<TomlRequiresWhen>) -> Result<Vec<RequiresWhen>> {
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let capability = canonical_capability(&e.capability, "requires_when capability")?;
+        if !crate::target_facts::is_target_capability(&capability) {
+            return Err(Error::Module(format!(
+                "[[requires_when]] names `{capability}`, which a module provides and a port \
+                 requires (`requires_capability`); only a TARGET-provided capability may be \
+                 required conditionally. Expected one of: {}.",
+                fluxor_contracts::vocabulary::TARGET_CAPABILITIES.join(", "),
+            )));
+        }
+        if e.when.is_empty() {
+            return Err(Error::Module(format!(
+                "[[requires_when]] for `{capability}` has an empty `when`; an unconditional \
+                 requirement belongs in `[requires]`"
+            )));
+        }
+        let mut when = Vec::with_capacity(e.when.len());
+        for (param, values) in e.when {
+            let values = match values {
+                TomlWhenValues::One(v) => vec![v],
+                TomlWhenValues::Any(vs) => vs,
+            };
+            if param.trim().is_empty()
+                || values.is_empty()
+                || values.iter().any(|v| v.trim().is_empty())
+            {
+                return Err(Error::Module(format!(
+                    "[[requires_when]] for `{capability}`: every `when` condition needs a \
+                     parameter name and at least one value"
+                )));
+            }
+            when.push((param, values));
+        }
+        out.push(RequiresWhen { capability, when });
+    }
+    Ok(out)
+}
+
 /// Validate `provides = [..]` entries against the providable vocabulary
 /// (service/contract names in `PROVIDER_CONTRACTS` plus the storage
 /// **surface** family in `PROVIDER_SURFACES`). Like capabilities, `provides`
@@ -975,6 +1020,10 @@ pub struct Manifest {
     /// `TomlRequires::default()` (all-false) means "no specific
     /// requirements," which satisfies every silicon.
     pub requires: TomlRequires,
+    /// Conditional target-capability requirements (`[[requires_when]]`).
+    /// TOML-only, never serialized; evaluated at compose against the
+    /// resolved target's facts (`target_facts::TargetFacts`).
+    pub requires_when: Vec<RequiresWhen>,
     /// `[build] wasm_opt_level = "0"|"1"|"2"|"3"|"s"|"z"` — per-module
     /// rustc `opt-level` for the wasm target. TOML-only, never
     /// serialized to the binary. `None` keeps the build default.
@@ -1025,6 +1074,7 @@ impl Default for Manifest {
             resume_after_fault: false,
             pre_tick_drain: false,
             requires: TomlRequires::default(),
+            requires_when: Vec::new(),
             wasm_opt_level: None,
             params: Vec::new(),
             timer_class: TimerClass::Unattested,
@@ -1793,6 +1843,7 @@ impl Manifest {
             .filter_map(|p| p.requires_capability.clone())
             .collect();
         validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
+        let requires_when = validate_requires_when(toml_val.requires_when.unwrap_or_default())?;
 
         let observability = match toml_val.observability {
             None => Observability::default(),
@@ -2120,6 +2171,7 @@ impl Manifest {
             resume_after_fault: toml_val.resume_after_fault,
             pre_tick_drain: toml_val.pre_tick_drain,
             requires: toml_val.requires,
+            requires_when,
             wasm_opt_level,
             params,
             timer_class,
@@ -2458,8 +2510,9 @@ impl Manifest {
             // build-time concern, not a runtime one). Round-tripping
             // through the binary loses it; that's intentional.
             requires: TomlRequires::default(),
-            wasm_opt_level: None, // toml-only, not serialized
-            params: Vec::new(),   // toml-only, not serialized
+            requires_when: Vec::new(), // toml-only, not serialized
+            wasm_opt_level: None,      // toml-only, not serialized
+            params: Vec::new(),        // toml-only, not serialized
             // timer_class is a TOML-only build-time concern (drives the config
             // validator's adaptive-tick gate); not serialized into the binary, so
             // a binary-loaded manifest is Unattested (fail-closed) by default.
@@ -2678,6 +2731,9 @@ struct TomlManifest {
     /// requirements," which satisfies every silicon.
     #[serde(default)]
     requires: TomlRequires,
+    /// `[[requires_when]]` — a target-provided capability this module needs
+    /// only under one of its own parameter values. See `RequiresWhen`.
+    requires_when: Option<Vec<TomlRequiresWhen>>,
     /// `[[params]]` declarations — built-in modules only. PIC modules
     /// embed schema in their .fmod and these are ignored.
     params: Option<Vec<TomlParam>>,
@@ -2722,6 +2778,50 @@ pub fn validate_wasm_opt_level(level: &str) -> Result<()> {
 }
 
 /// Hardware-feature requirements declared by a module in its
+/// One `[[requires_when]]` entry as written in TOML.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+struct TomlRequiresWhen {
+    capability: String,
+    /// `when = { param = "value", other = ["a", "b"] }` — every parameter
+    /// must match one of its listed values.
+    when: std::collections::BTreeMap<String, TomlWhenValues>,
+}
+
+/// A `when` value: one admitted value or a list of them.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(untagged)]
+enum TomlWhenValues {
+    One(String),
+    Any(Vec<String>),
+}
+
+/// A conditional requirement on a TARGET-provided capability
+/// (`vocabulary::TARGET_CAPABILITIES`): when every condition in `when`
+/// holds for this module instance, the target must provide `capability`.
+///
+/// This is how a module binds a POSTURE to a platform fact. `tls` checks
+/// certificate lifetimes against the kernel's trusted clock only when it
+/// validates a chain (`peer_auth` is a CA profile) under `clock_policy =
+/// require`, and then fails closed without one; on a target with no clock
+/// the honest configuration is `unchecked`, and the wrong one should be
+/// refused at compose rather than at the first handshake. A static
+/// `[requires]` cannot say that: the same module on the same target is
+/// fine as a plain server, or under the other clock value.
+///
+/// Each condition is a parameter and the values that satisfy it — enum
+/// names or numbers, compared against the resolved value, with the schema
+/// default standing in when the graph does not set the parameter. All
+/// conditions must hold. TOML-only, never serialized — like `[requires]`,
+/// a compose-time concern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequiresWhen {
+    pub capability: String,
+    /// `(param, admitted values)`, ordered by parameter name — a TOML
+    /// inline table has no declaration order worth preserving.
+    pub when: Vec<(String, Vec<String>)>,
+}
+
 /// `[requires]` TOML section. Used by `check_target_capabilities` to
 /// reject the module at config time if the resolved target lacks
 /// the requested capability — catches a class of "module pulls in

@@ -170,9 +170,13 @@ pub mod suite {
     pub const ML_DSA_65: u16 = 5;
     pub const ML_DSA_87: u16 = 6;
     pub const ML_KEM_768: u16 = 7;
+    /// A 32-byte ChaCha20-Poly1305 key for [`AEAD_SEAL`] / [`AEAD_OPEN`]:
+    /// the shape a resumption-ticket key or any other sealing key takes.
+    /// It signs nothing and has no public half.
+    pub const AEAD_KEY: u16 = 8;
 
     /// Highest id this registry defines.
-    pub const MAX_ID: u16 = ML_KEM_768;
+    pub const MAX_ID: u16 = AEAD_KEY;
 }
 
 /// How [`SIGN`] should treat the bytes it is given.
@@ -221,6 +225,15 @@ pub mod usage {
     /// persistence says nothing about isolation, which is [`TIER`]'s
     /// business.
     pub const PERSIST: u32 = 1 << 4;
+    /// The key may leave the vault WRAPPED ([`KEY_WRAP`]): sealed to a
+    /// destination vault's public key and bound to that vault's attested
+    /// composition, never in the clear. A key without this bit never
+    /// leaves at all.
+    pub const WRAP: u32 = 1 << 5;
+    /// The key may seal ([`AEAD_SEAL`]).
+    pub const SEAL: u32 = 1 << 6;
+    /// The key may open ([`AEAD_OPEN`]).
+    pub const OPEN: u32 = 1 << 7;
 }
 
 /// Longest key label. Labels name a key across restarts, so this bounds
@@ -309,6 +322,76 @@ pub const SUITE_QUERY: u32 = 0x100D;
 /// writes `count_out` `u16` suite ids. Returns the next cursor, or 0 when
 /// the enumeration is complete.
 pub const SUITE_ENUM: u32 = 0x100E;
+
+/// Sign the running composition. handle = a signing slot. arg layout:
+/// `[challenge:32][out_ptr:u64][out_cap:u16][out_len_out:u16]`; the
+/// output is `[record][signature]`, where the record is the kernel's
+/// composition record (`scheduler::attest`, prefix `"FXAT"`) ending in
+/// the vault's tier byte, and the signature is over the record in the
+/// slot's suite convention: ECDSA over the record's SHA-256 for P-256,
+/// the whole record for Ed25519 and ML-DSA. Returns 0, or `-ERANGE` with
+/// the requirement in `out_len_out`.
+///
+/// The challenge is the caller's, so the answer cannot be replayed; the
+/// record carries the boot incarnation, so it cannot outlive the boot.
+/// What the signature MEANS is the tier byte's: `DEVICE_HW` says this
+/// hardware runs exactly this closure, `SOFTWARE` says a readable process
+/// does. It proves bytes and wiring, never that they are correct or
+/// intended. The composition digest — SHA-256 of the record with the
+/// challenge zeroed — is the identity [`KEY_WRAP`] binds to.
+pub const ATTEST_COMPOSITION: u32 = 0x100F;
+
+/// Wrap a slot's key for one destination vault. handle = the slot (must
+/// permit [`usage::WRAP`]). arg layout:
+/// `[dest_pub_len:u16][dest_pub][attest_digest:32][out_ptr:u64][out_cap:u16][out_len_out:u16]`
+/// where `dest_pub` is the destination's P-256 public key and
+/// `attest_digest` the composition digest from its [`ATTEST_COMPOSITION`]
+/// record. Output: `["FXKW"][eph_pub:65][attest_digest:32][nonce:12][sealed][tag:16]`,
+/// `sealed` being `[suite:u16][usage:u32][key_len:u8][key]` under a key
+/// derived from an ephemeral ECDH with `dest_pub`, salted by
+/// `attest_digest`. Returns 0, or `-ERANGE`.
+///
+/// The key never appears in the clear on any surface: only the vault
+/// holding `dest_pub`'s private half can open it, and only while its
+/// composition still digests to `attest_digest` ([`KEY_UNWRAP`]).
+pub const KEY_WRAP: u32 = 0x1010;
+
+/// Unwrap into a fresh slot. handle = the slot holding this vault's P-256
+/// private key (must permit [`usage::AGREE`]). arg layout:
+/// `[blob_len:u16][blob]`. Returns the new slot's handle, or `-EACCES`
+/// when the blob's `attest_digest` is not this composition's digest —
+/// the composition changed since it was attested, and the key was wrapped
+/// for the one that was — or `-EINVAL` when the blob does not open.
+pub const KEY_UNWRAP: u32 = 0x1011;
+
+/// Seal bytes under an [`suite::AEAD_KEY`] slot. handle = the slot (must
+/// permit [`usage::SEAL`]). arg layout:
+/// `[aad_len:u16][aad][pt_len:u16][pt][out_ptr:u64][out_cap:u16][out_len_out:u16]`;
+/// output `[nonce:12][ct][tag:16]`. Returns 0, or `-ERANGE`.
+///
+/// The nonce is fresh from the CSPRNG per call. What the bytes mean — a
+/// resumption ticket, a checkpoint — is the caller's; the vault only
+/// guarantees that the key never leaves it.
+pub const AEAD_SEAL: u32 = 0x1012;
+
+/// Open what [`AEAD_SEAL`] produced. handle = the slot (must permit
+/// [`usage::OPEN`]). arg layout:
+/// `[aad_len:u16][aad][blob_len:u16][blob][out_ptr:u64][out_cap:u16][out_len_out:u16]`;
+/// output the plaintext. Returns 0, `-EINVAL` when the tag does not
+/// verify, or `-ERANGE`.
+pub const AEAD_OPEN: u32 = 0x1013;
+
+/// Layout constants for [`KEY_WRAP`] blobs.
+pub mod wrap {
+    pub const MAGIC: [u8; 4] = *b"FXKW";
+    pub const EPH_PUB_LEN: usize = 65;
+    pub const ATTEST_OFF: usize = 4 + EPH_PUB_LEN;
+    pub const NONCE_OFF: usize = ATTEST_OFF + 32;
+    pub const SEALED_OFF: usize = NONCE_OFF + 12;
+    /// Sealed payload prefix before the key bytes.
+    pub const SEALED_PREFIX: usize = 2 + 4 + 1;
+    pub const TAG_LEN: usize = 16;
+}
 
 /// Flag bits for the [`GENERATE`] `flags` byte.
 pub mod generate_flags {

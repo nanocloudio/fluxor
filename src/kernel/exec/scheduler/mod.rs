@@ -758,6 +758,7 @@ impl Default for RunnerConfig {
 // ── Scheduler body: real responsibility modules ──────────────────────────────
 // Each is a genuine module boundary (its own namespace + explicit visibility),
 // re-exported flat so existing `scheduler::X` call sites are unchanged.
+pub mod attest;
 pub mod built_in;
 pub mod domain_budget;
 pub mod exec_order;

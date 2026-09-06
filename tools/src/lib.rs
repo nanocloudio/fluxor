@@ -77,6 +77,7 @@ pub mod store_remote;
 pub mod store_resolve;
 pub mod store_sync;
 pub mod target;
+pub mod target_facts;
 pub mod text_distance;
 pub mod trust;
 pub mod workload;

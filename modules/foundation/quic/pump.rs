@@ -153,7 +153,9 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
     let mut psk_accepted = false;
     let mut accepted_psk: [u8; 48] = [0; 48];
     let mut accepted_psk_len: usize = 0;
-    if s.enable_0rtt != 0
+    // A PSK offer is honoured whenever a sealing key can open the ticket;
+    // whether early data rides on it is `enable_0rtt`'s decision below.
+    if s.ticket_key[0] >= 0
         && ch.pre_shared_key.is_some()
         && ch.psk_dhe_offered
         && ch.psk_binders_off.is_some()
@@ -174,70 +176,88 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
             let mut bi_iter = psk_binder_iter(binders_payload);
             let binder_first = bi_iter.next();
             if let (Some((id_bytes, _age)), Some(client_binder)) = (id_first, binder_first) {
-                if id_bytes.len() >= 4 {
-                    let slot_idx = ((id_bytes[0] as u32) << 24)
-                        | ((id_bytes[1] as u32) << 16)
-                        | ((id_bytes[2] as u32) << 8)
-                        | (id_bytes[3] as u32);
-                    let slot_idx = (slot_idx as usize) % MAX_TICKETS;
-                    let entry = s.server_tickets[slot_idx];
-                    if entry.consumed && entry.used && id_bytes.len() == 20 + 8 {
+                let ticket_ok = id_bytes.len() >= 1 + 12 + 16
+                    && id_bytes.len() <= MAX_TICKET_LEN
+                    && (id_bytes[0] & 1) as usize == id_bytes[0] as usize;
+                if ticket_ok {
+                    let parity = id_bytes[0] as usize;
+                    let key = s.ticket_key[parity];
+                    let digest = ticket_digest(id_bytes);
+                    if ticket_seen(&s.ticket_seen, &digest) {
+                        // Single-use: a ticket accepted once buys nothing
+                        // twice, and the refusal is metered by log.
                         let msg = b"[quic] 0-RTT ticket replay rejected";
                         dev_log(sys, 2, msg.as_ptr(), msg.len());
-                    }
-                    if entry.used && !entry.consumed && id_bytes.len() == 20 + 8 {
-                        // Validate the random tag matches.
-                        let mut tag_match = true;
-                        let mut k = 0;
-                        while k < 16 {
-                            if entry.identity[4 + k] != id_bytes[4 + k] {
-                                tag_match = false;
-                                break;
+                    } else if key >= 0 {
+                        let mut aad = [0u8; 16];
+                        aad[..TICKET_AAD.len()].copy_from_slice(TICKET_AAD);
+                        aad[TICKET_AAD.len()] = parity as u8;
+                        let mut pt = [0u8; TICKET_PT_LEN];
+                        let n = vault_open(
+                            sys,
+                            key,
+                            &aad[..TICKET_AAD.len() + 1],
+                            &id_bytes[1..],
+                            &mut pt,
+                        );
+                        if n == TICKET_PT_LEN {
+                            let suite_id = u16::from_le_bytes([pt[0], pt[1]]);
+                            let rms_len = pt[2] as usize;
+                            let age_add = u32::from_le_bytes([pt[51], pt[52], pt[53], pt[54]]);
+                            let _ = age_add;
+                            let issue_ms = u64::from_le_bytes([
+                                pt[55], pt[56], pt[57], pt[58], pt[59], pt[60], pt[61], pt[62],
+                            ]);
+                            let lifetime_s = u32::from_le_bytes([pt[63], pt[64], pt[65], pt[66]]);
+                            // RFC 8446 §4.6.1 — ticket lifetime check.
+                            let now_ms = dev_millis(sys);
+                            let elapsed_ms = now_ms.saturating_sub(issue_ms);
+                            let lifetime_ok = elapsed_ms <= (lifetime_s as u64) * 1000;
+                            if lifetime_ok && rms_len <= 48 {
+                                let nonce = &pt[67..75];
+                                let suite = match CipherSuite::from_id(suite_id) {
+                                    Some(c) => c,
+                                    None => {
+                                        driver.hs_state = HandshakeState::Error;
+                                        return true;
+                                    }
+                                };
+                                let hl = suite.hash_len();
+                                if rms_len == hl {
+                                    let ks = KeySchedule::new(suite);
+                                    let mut psk = [0u8; 48];
+                                    ks.ticket_psk(&pt[3..3 + hl], nonce, &mut psk[..hl]);
+                                    // Recompute binder over partial-CH bytes
+                                    // [0..binders_off_in_body+4 (HS hdr)].
+                                    let partial_full_len = 4 + binders_off_in_body;
+                                    let mut partial_t = Transcript::new(suite.hash_alg());
+                                    partial_t.update(&hs_data[..partial_full_len]);
+                                    let partial_hash = partial_t.current_hash();
+                                    let mut ks2 = KeySchedule::new(suite);
+                                    ks2.seed_psk(&psk[..hl]);
+                                    let expected = ks2.psk_binder(&partial_hash[..hl]);
+                                    if client_binder.len() == hl {
+                                        let mut diff = 0u8;
+                                        let mut k = 0;
+                                        while k < hl {
+                                            diff |= client_binder[k] ^ expected[k];
+                                            k += 1;
+                                        }
+                                        if diff == 0 {
+                                            psk_accepted = true;
+                                            accepted_psk[..hl].copy_from_slice(&psk[..hl]);
+                                            accepted_psk_len = hl;
+                                            // Burn the ticket — single-use.
+                                            ticket_mark_seen(&mut s.ticket_seen, &mut s.ticket_seen_next, digest);
+                                        }
+                                    }
+                                }
                             }
-                            k += 1;
                         }
-                        // RFC 8446 §4.6.1 — ticket lifetime check.
-                        let now_ms = dev_millis(sys);
-                        let elapsed_ms = now_ms.saturating_sub(entry.issue_ms);
-                        let lifetime_ok = elapsed_ms <= (entry.lifetime_s as u64) * 1000;
-                        if tag_match && lifetime_ok {
-                            // Recompute PSK from RMS + nonce.
-                            let nonce = &id_bytes[20..28];
-                            let suite = match CipherSuite::from_id(entry.suite_id) {
-                                Some(c) => c,
-                                None => {
-                                    driver.hs_state = HandshakeState::Error;
-                                    return true;
-                                }
-                            };
-                            let hl = suite.hash_len();
-                            let ks = KeySchedule::new(suite);
-                            let mut psk = [0u8; 48];
-                            ks.ticket_psk(&entry.rms[..hl], nonce, &mut psk[..hl]);
-                            // Recompute binder over partial-CH bytes
-                            // [0..binders_off_in_body+4 (HS hdr)].
-                            let partial_full_len = 4 + binders_off_in_body;
-                            let mut partial_t = Transcript::new(suite.hash_alg());
-                            partial_t.update(&hs_data[..partial_full_len]);
-                            let partial_hash = partial_t.current_hash();
-                            let mut ks2 = KeySchedule::new(suite);
-                            ks2.seed_psk(&psk[..hl]);
-                            let expected = ks2.psk_binder(&partial_hash[..hl]);
-                            if client_binder.len() == hl {
-                                let mut diff = 0u8;
-                                let mut k = 0;
-                                while k < hl {
-                                    diff |= client_binder[k] ^ expected[k];
-                                    k += 1;
-                                }
-                                if diff == 0 {
-                                    psk_accepted = true;
-                                    accepted_psk[..hl].copy_from_slice(&psk[..hl]);
-                                    accepted_psk_len = hl;
-                                    // Burn the ticket — single-use.
-                                    s.server_tickets[slot_idx].consumed = true;
-                                }
-                            }
+                        let mut z = 0;
+                        while z < pt.len() {
+                            core::ptr::write_volatile(pt.as_mut_ptr().add(z), 0);
+                            z += 1;
                         }
                     }
                 }
@@ -344,7 +364,10 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
         conn.psk_len = accepted_psk_len as u8;
         conn.psk_selected = true;
         conn.zero_rtt_offered = ch.early_data;
-        if ch.early_data {
+        // Early data rides a resumed handshake only when admitted: without
+        // `enable_0rtt` the PSK still resumes in one round trip and the
+        // client's 0-RTT packets are refused.
+        if ch.early_data && s.enable_0rtt != 0 {
             conn.zero_rtt_accepted = true;
             // Derive client_early_traffic_secret from early_secret +
             // FULL ClientHello hash (which already has the binder).
@@ -867,9 +890,11 @@ unsafe fn pump_derive_app_keys(s: &mut QuicState, idx: usize) -> bool {
     conn.driver.hs_state = HandshakeState::Complete;
     // Server-only: now that we have master_secret + the
     // client_finished_hash, derive RMS and queue a NewSessionTicket
-    // for emission over 1-RTT (RFC 8446 §4.6.1). Skipped if
-    // `enable_0rtt` is off.
-    if conn.is_server && s.enable_0rtt != 0 && !conn.session_ticket_handled {
+    // for emission over 1-RTT (RFC 8446 §4.6.1). Resumption is offered
+    // whenever a sealing key exists; whether 0-RTT early data is
+    // admitted on it is `enable_0rtt`'s separate decision.
+    let sealing = s.ticket_key[s.ticket_parity as usize] >= 0;
+    if conn.is_server && sealing && !conn.session_ticket_handled {
         emit_new_session_ticket(s, idx);
         s.conns[idx].session_ticket_handled = true;
     }
@@ -879,7 +904,8 @@ unsafe fn pump_derive_app_keys(s: &mut QuicState, idx: usize) -> bool {
 /// Server: build a NewSessionTicket message + write into the
 /// handshake driver's `out_buf` so emit_crypto_packet picks it up
 /// at OneRtt level. Also stores the (RMS, suite, age_add) in
-/// `s.server_tickets` so a subsequent resumed CH can be validated.
+/// the ticket — the session state, sealed — so any host holding the key
+/// generation can validate a subsequent resumed CH.
 unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     let sys = &*s.syscalls;
     let hl = s.conns[idx].driver.suite.hash_len();
@@ -893,13 +919,13 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     } else {
         return;
     }
-    // Allocate identity bytes: [u32 BE: index][u8;16: random tag].
-    let slot = (s.server_ticket_next as usize) % MAX_TICKETS;
-    s.server_ticket_next = s.server_ticket_next.wrapping_add(1);
-    let mut identity = [0u8; 20];
-    let idx_be = (slot as u32).to_be_bytes();
-    identity[..4].copy_from_slice(&idx_be);
-    dev_csprng_fill(sys, identity.as_mut_ptr().add(4), 16);
+    // No sealing key, no ticket: resumption that cannot be sealed is not
+    // offered, and the handshake stays a full one.
+    let parity = s.ticket_parity as usize;
+    let key = s.ticket_key[parity];
+    if key < 0 {
+        return;
+    }
     // Random ticket_age_add + 8-byte nonce.
     let mut age_add_buf = [0u8; 4];
     dev_csprng_fill(sys, age_add_buf.as_mut_ptr(), 4);
@@ -911,35 +937,41 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     dev_csprng_fill(sys, nonce.as_mut_ptr(), 8);
     let now_ms = dev_millis(sys);
     let lifetime_s: u32 = 7200;
-    s.server_tickets[slot] = ServerTicketEntry {
-        used: true,
-        consumed: false,
-        identity,
-        rms: {
-            let mut r = [0u8; 48];
-            r[..hl].copy_from_slice(&rms[..hl]);
-            r
-        },
-        rms_len: hl as u8,
-        suite_id,
-        issue_ms: now_ms,
-        ticket_age_add: age_add,
-        lifetime_s,
-    };
-    // Build NewSessionTicket: identity is the ticket bytes the client
-    // will echo back. We pack [identity_bytes (20)][nonce (8)] so the
-    // client can recover both for binder + age computation.
-    let mut ticket_bytes = [0u8; 28];
-    ticket_bytes[..20].copy_from_slice(&identity);
-    ticket_bytes[20..28].copy_from_slice(&nonce);
+    // The ticket IS the session state, sealed: suite, RMS, age_add, issue
+    // time, lifetime and the nonce the PSK derives from. Nothing is kept
+    // here; any host holding this key generation can open it.
+    let mut pt = [0u8; TICKET_PT_LEN];
+    pt[0..2].copy_from_slice(&suite_id.to_le_bytes());
+    pt[2] = hl as u8;
+    pt[3..3 + hl].copy_from_slice(&rms[..hl]);
+    pt[51..55].copy_from_slice(&age_add.to_le_bytes());
+    pt[55..63].copy_from_slice(&now_ms.to_le_bytes());
+    pt[63..67].copy_from_slice(&lifetime_s.to_le_bytes());
+    pt[67..75].copy_from_slice(&nonce);
+    let mut aad = [0u8; 16];
+    aad[..TICKET_AAD.len()].copy_from_slice(TICKET_AAD);
+    aad[TICKET_AAD.len()] = parity as u8;
+    let mut ticket_bytes = [0u8; MAX_TICKET_LEN];
+    ticket_bytes[0] = parity as u8;
+    let sealed = vault_seal(sys, key, &aad[..TICKET_AAD.len() + 1], &pt, &mut ticket_bytes[1..]);
+    let mut i = 0;
+    while i < pt.len() {
+        core::ptr::write_volatile(pt.as_mut_ptr().add(i), 0);
+        i += 1;
+    }
+    if sealed == 0 {
+        return;
+    }
+    let ticket_len = 1 + sealed;
     let mut nst = [0u8; 256];
     let n = build_new_session_ticket(
         lifetime_s,
         age_add,
         &nonce,
-        &ticket_bytes,
-        // max_early_data_size — non-zero to advertise 0-RTT capability.
-        4096,
+        &ticket_bytes[..ticket_len],
+        // max_early_data_size — advertised only when early data would be
+        // admitted; a ticket without it still resumes in one round trip.
+        if s.enable_0rtt != 0 { 4096 } else { 0 },
         &mut nst,
     );
     if n == 0 {

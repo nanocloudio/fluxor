@@ -385,6 +385,37 @@ fn generate_config_impl(
                 {
                     return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
                 }
+                // `[[requires_when]]`: a target-provided capability needed
+                // only under one of this instance's parameter values. The
+                // value comes from this entry's YAML or the schema default,
+                // so the check sees the posture the module will actually
+                // run under.
+                if !manifest.requires_when.is_empty() {
+                    let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
+                    let param_schema = schema::load_schema_for_module(mtype, modules_dir)?;
+                    let facts = crate::target_facts::TargetFacts::for_silicon(silicon);
+                    for rw in &manifest.requires_when {
+                        let resolutions: Vec<crate::target_facts::ParamResolution> = rw
+                            .when
+                            .iter()
+                            .map(|(param, values)| match &param_schema {
+                                None => crate::target_facts::ParamResolution::NoSchema,
+                                Some(ps) => match schema::param_is_one_of(m, ps, param, values) {
+                                    None => crate::target_facts::ParamResolution::Undeclared,
+                                    Some(hit) => crate::target_facts::ParamResolution::Matches(hit),
+                                },
+                            })
+                            .collect();
+                        if let Err(e) = crate::target_facts::check_requires_when(
+                            &resolutions,
+                            rw,
+                            &facts,
+                            silicon,
+                        ) {
+                            return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
+                        }
+                    }
+                }
             }
         }
     }

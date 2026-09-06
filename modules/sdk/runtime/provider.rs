@@ -46,12 +46,8 @@ unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
 )]
 #[inline(always)]
 unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
-    // 36, which is `trusted_time::LEN`. It was 34 — the sum of the fields
-    // through `flags` — and the syscall refuses anything shorter than `LEN`,
-    // so EVERY call returned `E_INVAL` and every consumer saw `UNAVAILABLE`.
-    // The surface answered "no clock" on a machine with a synchronised one,
-    // and did it silently, because `UNAVAILABLE` is exactly what a platform
-    // with no RTC returns.
+    // 36 is `trusted_time::LEN`, reserved word included: the syscall refuses
+    // anything shorter, and a refused call reads as UNAVAILABLE below.
     let mut buf = [0u8; 36];
     let rc = (sys.provider_call)(-1, 0x0609, buf.as_mut_ptr(), buf.len());
     if rc < 0 {
@@ -60,6 +56,25 @@ unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
         buf = [0u8; 36];
     }
     buf
+}
+
+/// This boot's incarnation (`BOOT_INCARNATION` 0x0C4D): 16 bytes fresh per
+/// boot, shared by every module. `None` until the kernel's entropy source
+/// has answered — a consumer minting a token waits rather than minting
+/// against zeros.
+#[allow(
+    dead_code,
+    reason = "used by modules that mint boot-bound tokens; not every module reads it"
+)]
+#[inline(always)]
+unsafe fn dev_boot_incarnation(sys: &SyscallTable) -> Option<[u8; 16]> {
+    let mut buf = [0u8; 16];
+    let rc = (sys.provider_call)(-1, 0x0C4D, buf.as_mut_ptr(), 16);
+    if rc < 0 || buf == [0u8; 16] {
+        None
+    } else {
+        Some(buf)
+    }
 }
 
 /// Wall-clock milliseconds since the Unix epoch (TIMER::UNIX_MILLIS 0x0608), or 0 on a

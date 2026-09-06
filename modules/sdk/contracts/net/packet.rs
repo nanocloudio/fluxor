@@ -10,12 +10,10 @@
 // SRTP packet processors, packet policy modules, packet classifiers,
 // direct NIC fast paths, market-data and control-plane packet flows.
 //
-// Status: envelope reserved. No module consumes this contract today;
-// the first consumer is planned to be the QUIC foundation module in
-// Phase 6 of the RFC. The fields below are derived from the RFC's
-// envelope description and should remain source-compatible with that
-// first consumer, but minor revisions are possible before the first
-// .fmod ships against this contract.
+// Two verb families share the surface. The endpoint verbs (bind, tx, rx,
+// close) are an envelope with no consumer yet. The decision-seam verbs
+// below them are consumed by `modules/foundation/ip`: a director settles
+// every inbound packet before transport state exists for it.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto and datagram so the shared SDK helpers
@@ -121,6 +119,107 @@ pub const MSG_PKT_CLOSED: u8 = 0x62;
 
 /// Endpoint error. Payload: [ep_id: u8] [errno: i8].
 pub const MSG_PKT_ERROR: u8 = 0x63;
+
+// ─── Pre-transport decision seam ───────────────────────────────────
+//
+// A second use of this surface, alongside the endpoint verbs above: the
+// `ip` module, with `packet_decision = "pre_transport"`, parses and
+// validates every inbound IPv4 packet ONCE and — before any connection
+// state is created — hands a director the headers and holds the buffer
+// until exactly one disposition comes back. Ownership follows the
+// disposition: LOCAL resumes the ordinary transport path, DROP and REJECT
+// release the buffer here, TUNNEL and DSR hand the whole frame to the
+// director's forward port. A packet held past the configured deadline is
+// released and reported. Nothing about tables, affinity or policy crosses
+// this seam; those are the director's.
+//
+// Three ports carry it: decision records out, dispositions in, forwarded
+// frames out. `pkt_id` is `[slot:u16][generation:u16]`, so a disposition
+// for a packet already released — or for a reused slot — is refused as
+// stale rather than acted on.
+
+/// Consumer → provider: settle one held packet. Payload:
+/// `[pkt_id: u32 LE] [disposition: u8] [args...]` — see `DISP_*` for the
+/// argument bytes each disposition carries. A second disposition for the
+/// same `pkt_id` is a stale reference and is ignored.
+pub const CMD_PKT_DISPOSE: u8 = 0x53;
+
+/// Consumer → provider: hold a second copy of a held packet under a new
+/// `pkt_id`, so one copy can be forwarded and the other delivered or
+/// mirrored. Payload: `[pkt_id: u32 LE]`. Answered by `MSG_PKT_CLONED`.
+pub const CMD_PKT_CLONE: u8 = 0x54;
+
+/// Provider → consumer: a packet awaits disposition. Payload
+/// (`DECIDE_LEN` bytes):
+///
+/// ```text
+/// [pkt_id: u32 LE] [af: u8] [proto: u8]
+/// [src_addr: 4 BE] [dst_addr: 4 BE] [src_port: u16 LE] [dst_port: u16 LE]
+/// [iface: u8] [rx_queue: u8] [flags: u8] [frag: u8]
+/// [ts_us: u64 LE] [frame_len: u16 LE] [l4_off: u16 LE]
+/// ```
+///
+/// `flags` are the `RX_FLAG_*` bits; `RX_FLAG_CSUM_OK` is set only after
+/// the provider verified the L4 checksum, so a director never re-parses.
+/// Ports are 0 for a protocol that has none. `frag` is 0: the provider
+/// refuses fragments before the seam and counts them. `l4_off` is the
+/// transport header's offset from the frame start.
+pub const MSG_PKT_DECIDE: u8 = 0x64;
+
+/// Provider → consumer, on the forward port: a packet disposed TUNNEL or
+/// DSR, whole. Payload: `[pkt_id: u32 LE] [disposition: u8] [args: 6]
+/// [frame...]` — the disposition and its argument bytes exactly as the
+/// consumer wrote them, then the Ethernet frame. The buffer is the
+/// consumer's from here on.
+pub const MSG_PKT_FORWARD: u8 = 0x65;
+
+/// Provider → consumer: answer to `CMD_PKT_CLONE`. Payload:
+/// `[pkt_id: u32 LE] [clone_id: u32 LE]`, `clone_id = PKT_ID_NONE` when
+/// no hold slot was free.
+pub const MSG_PKT_CLONED: u8 = 0x66;
+
+/// Provider → consumer: a held packet reached its hold deadline with no
+/// disposition and was released. Payload: `[pkt_id: u32 LE]`.
+pub const MSG_PKT_EXPIRED: u8 = 0x67;
+
+/// Length of a `MSG_PKT_DECIDE` payload.
+pub const DECIDE_LEN: usize = 4 + 1 + 1 + 4 + 4 + 2 + 2 + 1 + 1 + 1 + 1 + 8 + 2 + 2;
+
+/// Length of the argument block following a disposition byte. Every
+/// disposition carries exactly this many bytes, unused ones zero, so the
+/// forward record has one shape.
+pub const DISP_ARGS_LEN: usize = 6;
+
+/// The `pkt_id` that names no packet.
+pub const PKT_ID_NONE: u32 = u32::MAX;
+
+/// Dispositions, and the argument bytes each carries.
+pub mod disposition {
+    /// Deliver to the local transport. No arguments.
+    pub const LOCAL: u8 = 0;
+    /// Release silently. `[reason: u8]`.
+    pub const DROP: u8 = 1;
+    /// Release and answer the sender. `[reason: u8] [response: u8]` — see
+    /// `reject`.
+    pub const REJECT: u8 = 2;
+    /// Hand the frame to the forward port for an attachment.
+    /// `[attach_id: u16 LE] [flow_epoch: u32 LE]`.
+    pub const TUNNEL: u8 = 3;
+    /// Hand the frame to the forward port for direct return.
+    /// `[endpoint_id: u16 LE] [rewrite_id: u16 LE]`.
+    pub const DSR: u8 = 4;
+}
+
+/// `REJECT` response kinds.
+pub mod reject {
+    /// No response on the wire.
+    pub const SILENT: u8 = 0;
+    /// A TCP RST acknowledging the offending segment (TCP only; a segment
+    /// that is itself an RST gets no answer).
+    pub const TCP_RST: u8 = 1;
+    /// ICMP destination unreachable, port unreachable.
+    pub const ICMP_UNREACHABLE: u8 = 2;
+}
 
 // ─── Payload layout helpers ────────────────────────────────────────
 

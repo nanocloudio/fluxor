@@ -364,6 +364,121 @@ unsafe fn open_persisted(idx: usize) -> Option<usize> {
 ///
 /// # Safety
 /// Kernel context, exclusive access to `SLOTS`.
+/// Largest plaintext [`AEAD_SEAL`] / [`AEAD_OPEN`] handle in one call: a
+/// resumption ticket or a checkpoint chunk, never a bulk stream.
+const MAX_SEAL_BYTES: usize = 2048;
+/// Scratch for seal/open, a static so PIC callers' stacks stay small.
+static mut SEAL_SCRATCH: [u8; MAX_SEAL_BYTES] = [0; MAX_SEAL_BYTES];
+/// Scratch for the composition record: sized for the largest table the
+/// host profile admits (192 blobs and instances, 128 edges).
+const MAX_ATTEST_RECORD: usize = 4096 + 192 * 40 + 192 * 37 + 128 * 5;
+static mut ATTEST_RECORD: [u8; MAX_ATTEST_RECORD] = [0; MAX_ATTEST_RECORD];
+
+#[inline]
+fn zeroize(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: `b` is a live, exclusively-borrowed byte.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+}
+
+/// The tier this vault reports: decided by the sealing key's provenance.
+fn current_tier() -> u8 {
+    match crate::kernel::sys::hal::seal_provenance() {
+        crate::kernel::sys::hal::SealProvenance::DeviceUnique => dev_key_vault::tier::DEVICE_HW,
+        _ => dev_key_vault::tier::SOFTWARE,
+    }
+}
+
+/// HMAC-SHA256 (RFC 2104).
+fn hmac_sha256(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
+    use crate::kernel::security::crypto::sha256::Sha256;
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let mut h = Sha256::new();
+        h.update(key);
+        k[..32].copy_from_slice(&h.finalize());
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    for d in data {
+        inner.update(d);
+    }
+    let ih = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&ih);
+    let out = outer.finalize();
+    zeroize(&mut k);
+    zeroize(&mut ipad);
+    zeroize(&mut opad);
+    out
+}
+
+/// The key-wrap KEK: HKDF-SHA256 (RFC 5869), one block —
+/// `salt = attest_digest`, `ikm = ECDH shared secret`,
+/// `info = "fluxor key_wrap v1" || dest_pub`. Salting with the
+/// destination's composition digest is what binds the wrap to it.
+fn wrap_kek(shared: &[u8; 32], attest: &[u8; 32], dest_pub: &[u8], out: &mut [u8; 32]) {
+    let mut prk = hmac_sha256(attest, &[shared]);
+    let okm = hmac_sha256(&prk, &[b"fluxor key_wrap v1", dest_pub, &[1u8]]);
+    zeroize(&mut prk);
+    out.copy_from_slice(&okm);
+}
+
+/// Sign `msg` with `slot` in its suite's convention, writing `sig_len`
+/// bytes to `out`. `None` on failure.
+unsafe fn sign_bytes(slot_idx: usize, msg: &[u8], out: *mut u8, sig_len: usize) -> Option<usize> {
+    use crate::kernel::security::crypto::sha256::Sha256;
+    let slot = &SLOTS[slot_idx];
+    #[cfg(feature = "pq-vault")]
+    if let Some(set) = ml_dsa_set_for(slot.suite) {
+        let mut seed = [0u8; ml_dsa::SEED_LEN];
+        seed.copy_from_slice(&slot.data[..ml_dsa::SEED_LEN]);
+        let ws_ptr = &raw mut ML_DSA_WS;
+        let sig_ptr_staged = &raw mut ML_DSA_SIG;
+        let ws = &mut *ws_ptr;
+        let staged = &mut *sig_ptr_staged;
+        let signed =
+            ml_dsa::ml_dsa_sign_seed(set, &seed, &[], msg, ws, &mut staged[..sig_len]).is_ok();
+        ws.zeroize();
+        zeroize(&mut seed);
+        if !signed {
+            return None;
+        }
+        if !out.is_null() {
+            core::ptr::copy_nonoverlapping(staged.as_ptr(), out, sig_len);
+        }
+        return Some(sig_len);
+    }
+    let mut priv_key = [0u8; 32];
+    priv_key.copy_from_slice(&slot.data[..32]);
+    let sig = match slot.suite {
+        dev_key_vault::suite::P256 => {
+            let mut h = Sha256::new();
+            h.update(msg);
+            let digest = h.finalize();
+            p256::ecdsa_sign(&priv_key, &digest, &[0u8; 32])
+        }
+        dev_key_vault::suite::ED25519 => Some(ed25519::sign(&priv_key, msg)),
+        _ => None,
+    };
+    zeroize(&mut priv_key);
+    let sig = sig?;
+    if !out.is_null() {
+        core::ptr::copy_nonoverlapping(sig.as_ptr(), out, sig_len.min(64));
+    }
+    Some(sig_len.min(64))
+}
+
 unsafe fn alloc_slot() -> Option<usize> {
     let slots = &raw const SLOTS;
     (*slots).iter().position(|s| (s.flags & FLAG_IN_USE) == 0)
@@ -377,6 +492,8 @@ unsafe fn alloc_slot() -> Option<usize> {
 const fn suite_private_len(suite: u16) -> usize {
     match suite {
         dev_key_vault::suite::P256 | dev_key_vault::suite::ED25519 => 32,
+        // A sealing key: 32 bytes of ChaCha20-Poly1305 key, no public half.
+        dev_key_vault::suite::AEAD_KEY => 32,
         // The ML-DSA private key this backend holds is the 32-byte FIPS
         // 204 seed, not the 2560/4032/4896-byte encoded key. KeyGen is a
         // deterministic function of that seed, so the seed IS the key: it
@@ -427,12 +544,20 @@ const fn suite_usage(suite: u16) -> u32 {
                 | dev_key_vault::usage::AGREE
                 | dev_key_vault::usage::EXPORT_PUBLIC
                 | dev_key_vault::usage::PERSIST
+                | dev_key_vault::usage::WRAP
         }
         dev_key_vault::suite::ED25519 => {
             dev_key_vault::usage::SIGN
                 | dev_key_vault::usage::VERIFY
                 | dev_key_vault::usage::EXPORT_PUBLIC
                 | dev_key_vault::usage::PERSIST
+                | dev_key_vault::usage::WRAP
+        }
+        dev_key_vault::suite::AEAD_KEY => {
+            dev_key_vault::usage::SEAL
+                | dev_key_vault::usage::OPEN
+                | dev_key_vault::usage::PERSIST
+                | dev_key_vault::usage::WRAP
         }
         // ML-DSA signs and nothing else. No `AGREE`: a signature scheme
         // has no key-agreement half, and the post-quantum one that does is
@@ -457,6 +582,10 @@ const fn suite_usage(suite: u16) -> u32 {
 /// Kernel context; `out` must be `suite_private_len(suite)` bytes.
 unsafe fn generate_into(suite: u16, out: &mut [u8]) -> bool {
     match suite {
+        // A sealing key is any 32 random bytes.
+        dev_key_vault::suite::AEAD_KEY => {
+            out.len() == 32 && crate::kernel::sys::hal::csprng_fill(out.as_mut_ptr(), 32) == 0
+        }
         dev_key_vault::suite::P256 => {
             if out.len() != 32 {
                 return false;
@@ -501,6 +630,10 @@ unsafe fn generate_into(suite: u16, out: &mut [u8]) -> bool {
 /// `pub_len` must be `suite_public_len` of the slot's suite.
 unsafe fn write_public(idx: usize, out_ptr: *mut u8, pub_len: usize) -> bool {
     let slot = &SLOTS[idx];
+    // A sealing key has no public half: nothing to write is success.
+    if slot.suite == dev_key_vault::suite::AEAD_KEY {
+        return pub_len == 0;
+    }
     let mut priv_key = [0u8; 32];
     if slot.key_len as usize != 32 {
         return false;
@@ -1009,6 +1142,392 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             let wrote = (pub_len as u16).to_le_bytes();
             core::ptr::copy_nonoverlapping(wrote.as_ptr(), arg.add(10), 2);
+            0
+        }
+        dev_key_vault::ATTEST_COMPOSITION => {
+            // arg: [challenge:32][out_ptr:u64][out_cap:u16][out_len_out:u16]
+            if arg.is_null() || arg_len < 32 + 12 {
+                return EINVAL;
+            }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
+            let slot = &SLOTS[slot_handle as usize];
+            if (slot.flags & FLAG_IN_USE) == 0 || !slot.permits(dev_key_vault::usage::SIGN) {
+                return EACCES;
+            }
+            let sig_len = suite_signature_len(slot.suite);
+            if sig_len == 0 {
+                return ENOSYS;
+            }
+            let mut challenge = [0u8; 32];
+            core::ptr::copy_nonoverlapping(arg, challenge.as_mut_ptr(), 32);
+            let tail = arg.add(32);
+            let out_ptr = read_u64(tail) as *mut u8;
+            let out_cap = u16::from_le_bytes([*tail.add(8), *tail.add(9)]) as usize;
+            let tier = current_tier();
+            let rec_ptr = &raw mut ATTEST_RECORD;
+            let rec = &mut *rec_ptr;
+            let Some(rec_len) = crate::kernel::exec::scheduler::attest::write_record(
+                &challenge,
+                tier,
+                &mut rec[..],
+            ) else {
+                return ENOMEM;
+            };
+            let need = rec_len + sig_len;
+            if out_cap < need {
+                let n = (need.min(u16::MAX as usize) as u16).to_le_bytes();
+                core::ptr::copy_nonoverlapping(n.as_ptr(), tail.add(10), 2);
+                return ERANGE;
+            }
+            let Some(sig_written) = sign_bytes(
+                slot_handle as usize,
+                &rec[..rec_len],
+                out_ptr.add(rec_len),
+                sig_len,
+            ) else {
+                return ERROR;
+            };
+            if !out_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(rec.as_ptr(), out_ptr, rec_len);
+            }
+            let wrote = ((rec_len + sig_written) as u16).to_le_bytes();
+            core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
+            0
+        }
+        dev_key_vault::KEY_WRAP => {
+            // arg: [dest_pub_len:u16][dest_pub][attest_digest:32]
+            //      [out_ptr:u64][out_cap:u16][out_len_out:u16]
+            use dev_key_vault::wrap as w;
+            if arg.is_null() || arg_len < 2 {
+                return EINVAL;
+            }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
+            let pub_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+            if pub_len != w::EPH_PUB_LEN || 2 + pub_len + 32 + 12 > arg_len {
+                return EINVAL;
+            }
+            let slot = &SLOTS[slot_handle as usize];
+            if (slot.flags & FLAG_IN_USE) == 0 {
+                return EINVAL;
+            }
+            if !slot.permits(dev_key_vault::usage::WRAP) {
+                return EACCES;
+            }
+            let dest_pub = core::slice::from_raw_parts(arg.add(2), pub_len);
+            if !p256::public_point_is_valid(dest_pub) {
+                return EINVAL;
+            }
+            let mut attest = [0u8; 32];
+            core::ptr::copy_nonoverlapping(arg.add(2 + pub_len), attest.as_mut_ptr(), 32);
+            let tail = arg.add(2 + pub_len + 32);
+            let out_ptr = read_u64(tail) as *mut u8;
+            let out_cap = u16::from_le_bytes([*tail.add(8), *tail.add(9)]) as usize;
+            let key_len = slot.key_len as usize;
+            let need = w::SEALED_OFF + w::SEALED_PREFIX + key_len + w::TAG_LEN;
+            if out_cap < need {
+                let n = (need as u16).to_le_bytes();
+                core::ptr::copy_nonoverlapping(n.as_ptr(), tail.add(10), 2);
+                return ERANGE;
+            }
+            // Ephemeral agreement key, used once and zeroised.
+            let mut eph = [0u8; 32];
+            if !generate_into(dev_key_vault::suite::P256, &mut eph) {
+                return ERROR;
+            }
+            let Some(eph_pub) = p256::public_key_from_scalar(&eph) else {
+                zeroize(&mut eph);
+                return ERROR;
+            };
+            let shared = p256::ecdh_shared_secret(&eph, dest_pub);
+            zeroize(&mut eph);
+            let Some(mut shared) = shared else {
+                return EINVAL;
+            };
+            let mut kek = [0u8; 32];
+            wrap_kek(&shared, &attest, dest_pub, &mut kek);
+            zeroize(&mut shared);
+            let mut nonce = [0u8; 12];
+            if crate::kernel::sys::hal::csprng_fill(nonce.as_mut_ptr(), 12) != 0 {
+                zeroize(&mut kek);
+                return ERROR;
+            }
+            let mut sealed = [0u8; dev_key_vault::wrap::SEALED_PREFIX + MAX_KEY_BYTES];
+            sealed[0..2].copy_from_slice(&slot.suite.to_le_bytes());
+            sealed[2..6].copy_from_slice(&slot.usage.to_le_bytes());
+            sealed[6] = slot.key_len;
+            sealed[7..7 + key_len].copy_from_slice(&slot.data[..key_len]);
+            let sealed_len = w::SEALED_PREFIX + key_len;
+            let tag = crate::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt(
+                &kek,
+                &nonce,
+                &attest,
+                &mut sealed[..sealed_len],
+            );
+            zeroize(&mut kek);
+            if !out_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(w::MAGIC.as_ptr(), out_ptr, 4);
+                core::ptr::copy_nonoverlapping(eph_pub.as_ptr(), out_ptr.add(4), w::EPH_PUB_LEN);
+                core::ptr::copy_nonoverlapping(attest.as_ptr(), out_ptr.add(w::ATTEST_OFF), 32);
+                core::ptr::copy_nonoverlapping(nonce.as_ptr(), out_ptr.add(w::NONCE_OFF), 12);
+                core::ptr::copy_nonoverlapping(
+                    sealed.as_ptr(),
+                    out_ptr.add(w::SEALED_OFF),
+                    sealed_len,
+                );
+                core::ptr::copy_nonoverlapping(
+                    tag.as_ptr(),
+                    out_ptr.add(w::SEALED_OFF + sealed_len),
+                    16,
+                );
+            }
+            zeroize(&mut sealed);
+            let wrote = (need as u16).to_le_bytes();
+            core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
+            0
+        }
+        dev_key_vault::KEY_UNWRAP => {
+            // arg: [blob_len:u16][blob]
+            use dev_key_vault::wrap as w;
+            if arg.is_null() || arg_len < 2 {
+                return EINVAL;
+            }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
+            let blob_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+            if 2 + blob_len > arg_len || blob_len < w::SEALED_OFF + w::SEALED_PREFIX + w::TAG_LEN {
+                return EINVAL;
+            }
+            let blob = core::slice::from_raw_parts(arg.add(2), blob_len);
+            if blob[..4] != w::MAGIC {
+                return EINVAL;
+            }
+            let slot = &SLOTS[slot_handle as usize];
+            if (slot.flags & FLAG_IN_USE) == 0
+                || slot.suite != dev_key_vault::suite::P256
+                || slot.key_len != 32
+            {
+                return EINVAL;
+            }
+            if !slot.permits(dev_key_vault::usage::AGREE) {
+                return EACCES;
+            }
+            // The blob was wrapped for a composition; it opens only while
+            // this one still IS that composition.
+            let mut attest = [0u8; 32];
+            attest.copy_from_slice(&blob[w::ATTEST_OFF..w::ATTEST_OFF + 32]);
+            let rec_ptr = &raw mut ATTEST_RECORD;
+            let rec = &mut *rec_ptr;
+            let Some(ours) = crate::kernel::exec::scheduler::attest::composition_digest(
+                current_tier(),
+                &mut rec[..],
+            ) else {
+                return ENOMEM;
+            };
+            let mut diff = 0u8;
+            let mut i = 0;
+            while i < 32 {
+                diff |= ours[i] ^ attest[i];
+                i += 1;
+            }
+            if diff != 0 {
+                return EACCES;
+            }
+            let eph_pub = &blob[4..4 + w::EPH_PUB_LEN];
+            let mut my_priv = [0u8; 32];
+            my_priv.copy_from_slice(&slot.data[..32]);
+            let shared = p256::ecdh_shared_secret(&my_priv, eph_pub);
+            zeroize(&mut my_priv);
+            let Some(mut shared) = shared else {
+                return EINVAL;
+            };
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&slot.data[..32]);
+            let my_pub = p256::public_key_from_scalar(&k);
+            zeroize(&mut k);
+            let Some(my_pub) = my_pub else {
+                zeroize(&mut shared);
+                return ERROR;
+            };
+            let mut kek = [0u8; 32];
+            wrap_kek(&shared, &attest, &my_pub, &mut kek);
+            zeroize(&mut shared);
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&blob[w::NONCE_OFF..w::NONCE_OFF + 12]);
+            let sealed_len = blob_len - w::SEALED_OFF - w::TAG_LEN;
+            if sealed_len < w::SEALED_PREFIX || sealed_len > w::SEALED_PREFIX + MAX_KEY_BYTES {
+                zeroize(&mut kek);
+                return EINVAL;
+            }
+            let mut sealed = [0u8; dev_key_vault::wrap::SEALED_PREFIX + MAX_KEY_BYTES];
+            sealed[..sealed_len].copy_from_slice(&blob[w::SEALED_OFF..w::SEALED_OFF + sealed_len]);
+            let mut tag = [0u8; 16];
+            tag.copy_from_slice(&blob[w::SEALED_OFF + sealed_len..]);
+            let ok = crate::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt(
+                &kek,
+                &nonce,
+                &attest,
+                &mut sealed[..sealed_len],
+                &tag,
+            );
+            zeroize(&mut kek);
+            if !ok {
+                zeroize(&mut sealed);
+                return EINVAL;
+            }
+            let suite = u16::from_le_bytes([sealed[0], sealed[1]]);
+            let usage = u32::from_le_bytes([sealed[2], sealed[3], sealed[4], sealed[5]]);
+            let key_len = sealed[6] as usize;
+            if suite_private_len(suite) != key_len || usage & !suite_usage(suite) != 0 || usage == 0
+            {
+                zeroize(&mut sealed);
+                return EINVAL;
+            }
+            let Some(new_slot) = alloc_slot() else {
+                zeroize(&mut sealed);
+                return ENOMEM;
+            };
+            let dst = &mut SLOTS[new_slot];
+            *dst = Slot::empty();
+            dst.suite = suite;
+            dst.usage = usage;
+            dst.key_len = key_len as u8;
+            dst.data[..key_len].copy_from_slice(&sealed[7..7 + key_len]);
+            dst.flags = FLAG_IN_USE;
+            zeroize(&mut sealed);
+            fd::tag_fd(fd::FD_TAG_KEY_VAULT, new_slot as i32)
+        }
+        dev_key_vault::AEAD_SEAL => {
+            // arg: [aad_len:u16][aad][pt_len:u16][pt][out_ptr:u64][out_cap:u16][out_len_out:u16]
+            if arg.is_null() || arg_len < 4 {
+                return EINVAL;
+            }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
+            let slot = &SLOTS[slot_handle as usize];
+            if (slot.flags & FLAG_IN_USE) == 0 || slot.suite != dev_key_vault::suite::AEAD_KEY {
+                return EINVAL;
+            }
+            if !slot.permits(dev_key_vault::usage::SEAL) {
+                return EACCES;
+            }
+            let aad_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+            if 2 + aad_len + 2 > arg_len {
+                return EINVAL;
+            }
+            let pt_off = 2 + aad_len + 2;
+            let pt_len =
+                u16::from_le_bytes([*arg.add(2 + aad_len), *arg.add(2 + aad_len + 1)]) as usize;
+            if pt_off + pt_len + 12 > arg_len || pt_len > MAX_SEAL_BYTES {
+                return EINVAL;
+            }
+            let tail = arg.add(pt_off + pt_len);
+            let out_ptr = read_u64(tail) as *mut u8;
+            let out_cap = u16::from_le_bytes([*tail.add(8), *tail.add(9)]) as usize;
+            let need = 12 + pt_len + 16;
+            if out_cap < need {
+                let n = (need as u16).to_le_bytes();
+                core::ptr::copy_nonoverlapping(n.as_ptr(), tail.add(10), 2);
+                return ERANGE;
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&slot.data[..32]);
+            let mut nonce = [0u8; 12];
+            if crate::kernel::sys::hal::csprng_fill(nonce.as_mut_ptr(), 12) != 0 {
+                zeroize(&mut key);
+                return ERROR;
+            }
+            let aad = core::slice::from_raw_parts(arg.add(2), aad_len);
+            let buf_ptr = &raw mut SEAL_SCRATCH;
+            let buf = &mut *buf_ptr;
+            core::ptr::copy_nonoverlapping(arg.add(pt_off), buf.as_mut_ptr(), pt_len);
+            let tag = crate::kernel::security::crypto::chacha20::chacha20_poly1305_encrypt(
+                &key,
+                &nonce,
+                aad,
+                &mut buf[..pt_len],
+            );
+            zeroize(&mut key);
+            if !out_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(nonce.as_ptr(), out_ptr, 12);
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), out_ptr.add(12), pt_len);
+                core::ptr::copy_nonoverlapping(tag.as_ptr(), out_ptr.add(12 + pt_len), 16);
+            }
+            zeroize(&mut buf[..pt_len]);
+            let wrote = (need as u16).to_le_bytes();
+            core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
+            0
+        }
+        dev_key_vault::AEAD_OPEN => {
+            // arg: [aad_len:u16][aad][blob_len:u16][blob][out_ptr:u64][out_cap:u16][out_len_out:u16]
+            if arg.is_null() || arg_len < 4 {
+                return EINVAL;
+            }
+            if slot_handle < 0 || (slot_handle as usize) >= MAX_SLOTS {
+                return EINVAL;
+            }
+            let slot = &SLOTS[slot_handle as usize];
+            if (slot.flags & FLAG_IN_USE) == 0 || slot.suite != dev_key_vault::suite::AEAD_KEY {
+                return EINVAL;
+            }
+            if !slot.permits(dev_key_vault::usage::OPEN) {
+                return EACCES;
+            }
+            let aad_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
+            if 2 + aad_len + 2 > arg_len {
+                return EINVAL;
+            }
+            let blob_off = 2 + aad_len + 2;
+            let blob_len =
+                u16::from_le_bytes([*arg.add(2 + aad_len), *arg.add(2 + aad_len + 1)]) as usize;
+            if blob_off + blob_len + 12 > arg_len
+                || blob_len < 12 + 16
+                || blob_len - 28 > MAX_SEAL_BYTES
+            {
+                return EINVAL;
+            }
+            let pt_len = blob_len - 28;
+            let tail = arg.add(blob_off + blob_len);
+            let out_ptr = read_u64(tail) as *mut u8;
+            let out_cap = u16::from_le_bytes([*tail.add(8), *tail.add(9)]) as usize;
+            if out_cap < pt_len {
+                let n = (pt_len as u16).to_le_bytes();
+                core::ptr::copy_nonoverlapping(n.as_ptr(), tail.add(10), 2);
+                return ERANGE;
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&slot.data[..32]);
+            let mut nonce = [0u8; 12];
+            core::ptr::copy_nonoverlapping(arg.add(blob_off), nonce.as_mut_ptr(), 12);
+            let mut tag = [0u8; 16];
+            core::ptr::copy_nonoverlapping(arg.add(blob_off + 12 + pt_len), tag.as_mut_ptr(), 16);
+            let aad = core::slice::from_raw_parts(arg.add(2), aad_len);
+            let buf_ptr = &raw mut SEAL_SCRATCH;
+            let buf = &mut *buf_ptr;
+            core::ptr::copy_nonoverlapping(arg.add(blob_off + 12), buf.as_mut_ptr(), pt_len);
+            let ok = crate::kernel::security::crypto::chacha20::chacha20_poly1305_decrypt(
+                &key,
+                &nonce,
+                aad,
+                &mut buf[..pt_len],
+                &tag,
+            );
+            zeroize(&mut key);
+            if !ok {
+                zeroize(&mut buf[..pt_len]);
+                return EINVAL;
+            }
+            if !out_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), out_ptr, pt_len);
+            }
+            zeroize(&mut buf[..pt_len]);
+            let wrote = (pt_len as u16).to_le_bytes();
+            core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
             0
         }
         dev_key_vault::TIER => {

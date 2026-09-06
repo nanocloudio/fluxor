@@ -262,6 +262,57 @@ pub(crate) const GROUPING_SUFFIXES: &[&str] = &["_envelope", "_config", "_settin
 ///
 /// Returns the number of bytes written to `entry` starting at `base_offset`.
 /// Returns Err if a preset reference cannot be resolved.
+/// The value `param` takes for this module entry: what the YAML sets —
+/// under the name directly or inside a `params:` wrapper — or the schema
+/// default when unset. `None` when the schema has no such parameter.
+///
+/// Numeric parameters resolve to their number; an enum resolves to its
+/// wire value, so a caller comparing against an enum NAME maps the name
+/// through the schema first. This is the same resolution `pack_param`
+/// applies, exposed for a compose-time check that has to know a value
+/// before anything is packed.
+pub fn effective_param_value(module: &Value, schema: &ParamSchema, param: &str) -> Option<u32> {
+    let def = schema.find(param)?;
+    let set = module
+        .get(param)
+        .or_else(|| module.get("params").and_then(|p| p.get(param)));
+    Some(match set {
+        Some(v) => match def.ptype {
+            ParamType::U8 => u32::from(resolve_u8(v, def)),
+            ParamType::U16 => u32::from(resolve_u16(v, def)),
+            _ => resolve_u32(v, def),
+        },
+        None => def.default,
+    })
+}
+
+/// Whether `param` on this module entry is one of `wanted` — enum names or
+/// numbers as a `[[requires_when]]` writes them. `None` when the schema has
+/// no such parameter or a wanted value names neither an enum value nor a
+/// number.
+pub fn param_is_one_of(
+    module: &Value,
+    schema: &ParamSchema,
+    param: &str,
+    wanted: &[String],
+) -> Option<bool> {
+    let def = schema.find(param)?;
+    let value = effective_param_value(module, schema, param)?;
+    let mut hit = false;
+    for w in wanted {
+        let target = match def
+            .enums
+            .get(w)
+            .or_else(|| def.enums.get(&w.to_lowercase()))
+        {
+            Some(&v) => u32::from(v),
+            None => w.parse::<u32>().ok()?,
+        };
+        hit |= value == target;
+    }
+    Some(hit)
+}
+
 pub fn build_params_from_schema(
     module: &Value,
     schema: &ParamSchema,
@@ -1552,5 +1603,76 @@ mod tests {
         let schema =
             load_schema_for_module("not_pinned_anywhere", &modules_dir).expect("not a hard error");
         assert!(schema.is_none(), "no pin, no .fmod → no schema");
+    }
+}
+
+#[cfg(test)]
+mod requires_when_resolution {
+    use super::*;
+    use crate::manifest::{Manifest, ManifestParam, ManifestParamType};
+
+    /// A schema shaped like tls's: `clock_policy` enum, `require = 0` default.
+    fn clock_schema() -> ParamSchema {
+        let m = Manifest {
+            params: vec![ManifestParam {
+                tag: 12,
+                name: "clock_policy".into(),
+                ptype: ManifestParamType::Enum,
+                default_num: 0,
+                default_str: "require".into(),
+                enum_values: vec![("require".into(), 0), ("unchecked".into(), 1)],
+                range: None,
+                required: false,
+            }],
+            ..Manifest::default()
+        };
+        ParamSchema::from_manifest(&m).expect("schema")
+    }
+
+    fn yaml(s: &str) -> Value {
+        serde_yaml::from_str(s).expect("yaml")
+    }
+
+    fn one_of(m: &Value, s: &ParamSchema, p: &str, w: &[&str]) -> Option<bool> {
+        let w: Vec<String> = w.iter().map(|x| x.to_string()).collect();
+        param_is_one_of(m, s, p, &w)
+    }
+
+    #[test]
+    fn unset_resolves_to_the_schema_default() {
+        let s = clock_schema();
+        let m = yaml("type: tls\n");
+        assert_eq!(effective_param_value(&m, &s, "clock_policy"), Some(0));
+        assert_eq!(one_of(&m, &s, "clock_policy", &["require"]), Some(true));
+        assert_eq!(one_of(&m, &s, "clock_policy", &["unchecked"]), Some(false));
+        assert_eq!(
+            one_of(&m, &s, "clock_policy", &["unchecked", "require"]),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn set_by_name_number_or_under_params_resolves_alike() {
+        let s = clock_schema();
+        for m in [
+            yaml("type: tls\nclock_policy: unchecked\n"),
+            yaml("type: tls\nparams:\n  clock_policy: unchecked\n"),
+            yaml("type: tls\nclock_policy: 1\n"),
+        ] {
+            assert_eq!(one_of(&m, &s, "clock_policy", &["unchecked"]), Some(true));
+            assert_eq!(one_of(&m, &s, "clock_policy", &["0"]), Some(false));
+        }
+    }
+
+    #[test]
+    fn undeclared_parameter_or_value_is_none() {
+        let s = clock_schema();
+        let m = yaml("type: tls\n");
+        assert_eq!(one_of(&m, &s, "no_such", &["require"]), None);
+        assert_eq!(one_of(&m, &s, "clock_policy", &["sometimes"]), None);
+        assert_eq!(
+            one_of(&m, &s, "clock_policy", &["require", "sometimes"]),
+            None
+        );
     }
 }

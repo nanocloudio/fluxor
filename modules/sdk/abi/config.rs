@@ -112,14 +112,18 @@ pub use self::profile_embedded::*;
 mod profile_host {
     pub mod kernel {
         /// Pool used by `loader::alloc_state` to back every loaded
-        /// module's `module_state` and `module_arena`. 96 MiB, matching
-        /// the wasm profile: it must hold a busy graph (64 modules ×
-        /// ~100 KiB state plus the http module's peak heap at full
-        /// `ARENA_WORKING_SET_CONNS` activity), a console-emulator
-        /// core's ~39 MiB working set, and a media-app host graph
-        /// (truffle_shell catalog + truffle_player + codec), which
-        /// peaks past 64 MiB.
-        pub const STATE_ARENA_SIZE: usize = 96 * 1024 * 1024;
+        /// module's `module_state` and `module_arena`. It must hold every
+        /// module of the busiest graph at once. The `ip` module's
+        /// connection table dominates: a `TcpConn` is ~2.2 KiB (its bounded
+        /// reorder buffer is the bulk of that) and `MAX_TCP_CONNS` is
+        /// 65,536 here, so `ip` alone asks for ~137 MiB. Beside it sit a
+        /// 64-module graph at ~100 KiB of state each plus the http module's
+        /// peak heap at full `ARENA_WORKING_SET_CONNS` activity, a
+        /// console-emulator core's ~39 MiB working set, and a media-app host
+        /// graph that peaks past 64 MiB. 256 MiB leaves ~117 MiB beside the
+        /// connection table, above that peak. Zero-initialised, so it costs
+        /// kernel `.bss` rather than image size.
+        pub const STATE_ARENA_SIZE: usize = 256 * 1024 * 1024;
         /// Per-channel buffer pool. 8 MiB lets graphs size
         /// individual channels at 16-64 KiB without exhausting
         /// the arena under sustained gigabit-class loads.
@@ -266,17 +270,30 @@ mod profile_host {
     }
 
     pub mod ip {
-        /// IP module's TCP-conn slot table size. Must be at least
-        /// `http::MAX_CONCURRENT_CONNS` (compile-time invariant).
-        /// Pinned at 256 alongside http until `conn_id` widens
-        /// past u8 on the wire.
-        pub const MAX_TCP_CONNS: usize = 256;
+        /// IP module's TCP-conn slot table size: the ceiling on locally
+        /// terminated TCP connections. The net-proto `conn_id` is u16, so
+        /// 65,536 slots is exactly the id space. A connection record is
+        /// ~2.2 KiB — most of it the bounded reorder buffer — so the table
+        /// is ~137 MiB and is what `kernel::STATE_ARENA_SIZE` is sized
+        /// around. Lookup is by hash index (`ip/index.rs`), never a scan,
+        /// and the timer sweep is sliced across the 50 ms window, so the
+        /// size costs nothing per packet or per step.
+        /// At least `http::MAX_CONCURRENT_CONNS` (compile-time invariant).
+        pub const MAX_TCP_CONNS: usize = 65536;
+        /// Datagram endpoints carry a u8 `ep_id` on the wire, so they are
+        /// allocated only from the first `MAX_DG_ENDPOINTS` connection
+        /// slots — the id space binds the endpoint count, not the table.
+        pub const MAX_DG_ENDPOINTS: usize = 256;
         /// Multi-homing address-table size. Slot 0 is the primary
         /// (DHCP-managed); slots 1.. are secondaries added at runtime via
-        /// the ip module's `addr_ctl` port. Scanned on the RX hot path, so
-        /// this must not grow without a hot-path measurement (see the demux
-        /// comment in `ip/mod.rs`).
-        pub const MAX_LOCAL_ADDRS: usize = 8;
+        /// the ip module's `addr_ctl` port. Demuxed through a hash index
+        /// on the RX path, so the size costs nothing per frame.
+        pub const MAX_LOCAL_ADDRS: usize = 4096;
+        /// Packets the pre-transport decision seam may hold awaiting a
+        /// director's disposition. One full frame each, so this is the
+        /// seam's whole footprint (~48 KiB here); a packet arriving with
+        /// every slot taken is refused and counted, never displaces one.
+        pub const MAX_PACKET_HOLD: usize = 32;
     }
 
     pub mod tls {
@@ -372,8 +389,12 @@ mod profile_wasm {
 
     pub mod ip {
         pub const MAX_TCP_CONNS: usize = 256;
+        /// Datagram endpoints; see profile_host.
+        pub const MAX_DG_ENDPOINTS: usize = 256;
         /// Multi-homing address-table size.
         pub const MAX_LOCAL_ADDRS: usize = 8;
+        /// Pre-transport decision hold slots; see profile_host.
+        pub const MAX_PACKET_HOLD: usize = 8;
     }
 
     pub mod tls {
@@ -451,8 +472,12 @@ mod profile_embedded {
 
     pub mod ip {
         pub const MAX_TCP_CONNS: usize = 16;
+        /// Datagram endpoints; see profile_host.
+        pub const MAX_DG_ENDPOINTS: usize = 16;
         /// Multi-homing address-table size.
         pub const MAX_LOCAL_ADDRS: usize = 8;
+        /// Pre-transport decision hold slots; see profile_host.
+        pub const MAX_PACKET_HOLD: usize = 4;
     }
 
     pub mod tls {
@@ -484,6 +509,18 @@ const _: () = assert!(
 const _: () = assert!(
     http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS,
     "http::MAX_CONCURRENT_CONNS must not exceed ip::MAX_TCP_CONNS"
+);
+const _: () = assert!(
+    ip::MAX_DG_ENDPOINTS <= ip::MAX_TCP_CONNS && ip::MAX_DG_ENDPOINTS <= 256,
+    "ip::MAX_DG_ENDPOINTS is bounded by the connection table and by the u8 ep_id"
+);
+const _: () = assert!(
+    ip::MAX_TCP_CONNS <= 65536 && ip::MAX_TCP_CONNS.is_power_of_two(),
+    "ip::MAX_TCP_CONNS is bounded by the u16 conn_id and indexed by a power-of-two table"
+);
+const _: () = assert!(
+    ip::MAX_LOCAL_ADDRS <= 4096 && ip::MAX_LOCAL_ADDRS.is_power_of_two(),
+    "ip::MAX_LOCAL_ADDRS is bounded by the u16 slot (0xFFFF = wildcard) and indexed by a power-of-two table"
 );
 
 const _: () = assert!(

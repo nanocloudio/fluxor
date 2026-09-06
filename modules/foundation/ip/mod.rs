@@ -94,6 +94,7 @@ mod eth;
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod icmp;
+mod index;
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -195,12 +196,48 @@ const DG_V4_DEST_LEN: usize = 1 + 4 + 2;
 /// tunable is deliberately small (see the demux comment in `process_ipv4`).
 pub use abi::config::ip::MAX_LOCAL_ADDRS;
 
+/// Packets the decision seam may hold at once (`abi::config::ip`). One
+/// frame each; exhaustion refuses the next packet rather than displacing a
+/// held one.
+pub use abi::config::ip::MAX_PACKET_HOLD;
+
+/// Datagram endpoints occupy the first `MAX_DG_ENDPOINTS` connection slots:
+/// the wire's `ep_id` is a u8, so the id space binds the endpoint count,
+/// not the connection table.
+pub use abi::config::ip::MAX_DG_ENDPOINTS;
+
+/// Hash index over the connection table: twice the table, so chains stay
+/// short (`index.rs`).
+const CONN_INDEX_SIZE: usize = tcp::MAX_TCP_CONNS * 2;
+/// Hash index over the local-address table: four times the table, since
+/// it is small and every inbound packet demuxes through it.
+const ADDR_INDEX_SIZE: usize = MAX_LOCAL_ADDRS * 4;
+/// Listening TCP slots tracked by list: a SYN is matched against these,
+/// never against the whole table.
+const MAX_LISTENERS: usize = if tcp::MAX_TCP_CONNS < 1024 {
+    tcp::MAX_TCP_CONNS
+} else {
+    1024
+};
+/// Per-port reference counts, so "is this port bound?" is a load. Only
+/// worth 128 KiB where the table is large enough for a scan to matter;
+/// the small profiles keep the scan.
+const PORT_REF_ENTRIES: usize = if tcp::MAX_TCP_CONNS >= 4096 { 65536 } else { 1 };
+/// Sources whose half-open count is tracked individually.
+const HO_SRC_ENTRIES: usize = if tcp::MAX_TCP_CONNS >= 4096 { 1024 } else { 16 };
+/// The TCP timer window: every connection's timers advance once per
+/// window, in slices spread across it.
+const TCP_SWEEP_WINDOW_MS: u32 = 50;
+
 /// Wildcard local-address slot — re-exported from `tcp` so the two modules
 /// agree on the sentinel used by `TcpConn::local_slot` / `find_conn`.
 use tcp::LOCAL_SLOT_ANY;
 
 /// `LocalAddr::flags` bits.
 const ADDR_FLAG_PRIMARY: u8 = 0x01;
+/// The address emits: frames are sourced from it and ARP for it answered.
+/// Clear = fenced. The primary is always armed.
+const ADDR_FLAG_ARMED: u8 = 0x02;
 
 /// One configured local address. 16-byte address with IPv4 in the first four
 /// bytes (network order), matching the workload CREATE-header convention so
@@ -213,6 +250,11 @@ const ADDR_FLAG_PRIMARY: u8 = 0x01;
 pub struct LocalAddr {
     /// 16-byte address, IPv4 in bytes 0..4 (network order).
     pub addr: [u8; 16],
+    /// Emission token minted at install; presented by `ADDR_ARM` /
+    /// `ADDR_FENCE`. Fresh per install and per boot.
+    pub token: [u8; 16],
+    /// Install generation, monotonic per module instance.
+    pub generation: u32,
     /// Owning workload tag (0 = host/system — a legitimate owner, not a
     /// sentinel). Enforced on bind: an
     /// owner-stamped bind binds only to the address whose `owner_tag` matches,
@@ -228,6 +270,8 @@ impl LocalAddr {
     pub const fn empty() -> Self {
         Self {
             addr: [0u8; 16],
+            token: [0u8; 16],
+            generation: 0,
             owner_tag: 0,
             prefix_len: 0,
             flags: 0,
@@ -267,11 +311,24 @@ impl LocalAddr {
 use abi::contracts::net::identity as netid;
 const IP_ADDR_ADD: u8 = netid::ADDR_ADD;
 const IP_ADDR_DEL: u8 = netid::ADDR_DEL;
+const IP_ADDR_ARM: u8 = netid::ADDR_ARM;
+const IP_ADDR_FENCE: u8 = netid::ADDR_FENCE;
+/// Emission events to the address-control writer (out[5]).
+const ADDR_EVT_PORT: u8 = 5;
 /// THIS module's input-port indices, declared to the kernel at init via the
 /// `NET_IDENT_PROVIDER` self-registration (module-local facts, matching
 /// `manifest.toml` — no longer part of the shared contract).
 const NET_IN_PORT: u8 = 1;
 const ADDR_CTL_PORT: u8 = 2;
+/// Pre-transport decision seam ports (`packet.rs` §decision seam):
+/// dispositions in, decision records out, forwarded frames out.
+const PACKET_IN_PORT: u8 = 3;
+const PACKET_OUT_PORT: u8 = 3;
+const PACKET_FWD_PORT: u8 = 4;
+
+/// `packet_decision` values.
+const PKT_DECISION_OFF: u8 = 0;
+const PKT_DECISION_PRE_TRANSPORT: u8 = 1;
 
 /// Max bytes per queued outbound control frame. Sized for the
 /// largest short frame `net_send_*` produces (MSG_RETRANSMIT /
@@ -310,6 +367,267 @@ const CLOSE_WAIT_TICKS: u16 = (abi::contracts::net::net_proto::CLOSED_ID_GRACE_M
 #[inline(always)]
 fn slot_is_free(conn: &tcp::TcpConn) -> bool {
     conn.state == tcp::TcpState::Closed && conn.pending_close_notify == NOTIFY_NONE
+}
+
+// ── Table lookup structures (`index.rs`) ────────────────────────────
+//
+// Every connection that becomes keyed — accepted, cookie-installed,
+// connected, bound, or paired for loopback — passes through
+// `conn_index_insert` once its fields are set, and every slot release
+// passes through `conn_reset`. Those two are the whole maintenance
+// surface; lookups validate what they find, so a stale entry can never
+// yield a wrong hit, only a longer probe.
+
+/// A connection's index key.
+#[inline]
+fn conn_key_of(c: &tcp::TcpConn) -> index::ConnKey {
+    index::ConnKey {
+        remote_ip: c.remote_ip,
+        remote_port: c.remote_port,
+        local_port: c.local_port,
+        local_slot: c.local_slot,
+    }
+}
+
+/// Whether a connection is looked up by 4-tuple: anything with a remote
+/// that is neither a listener nor a datagram endpoint.
+#[inline]
+fn conn_is_keyed(c: &tcp::TcpConn) -> bool {
+    !c.is_datagram && c.remote_ip != 0 && c.state != tcp::TcpState::Listen
+}
+
+#[inline]
+unsafe fn port_ref_inc(s: &mut IpState, port: u16) {
+    if PORT_REF_ENTRIES > 1 {
+        let e = &mut *s.port_ref.as_mut_ptr().add(port as usize);
+        *e = e.saturating_add(1);
+    }
+}
+
+#[inline]
+unsafe fn port_ref_dec(s: &mut IpState, port: u16) {
+    if PORT_REF_ENTRIES > 1 {
+        let e = &mut *s.port_ref.as_mut_ptr().add(port as usize);
+        *e = e.saturating_sub(1);
+    }
+}
+
+unsafe fn listener_add(s: &mut IpState, idx: usize) {
+    let mut i = 0;
+    while i < MAX_LISTENERS {
+        if s.listeners[i] == 0 {
+            s.listeners[i] = idx as u32 + 1;
+            return;
+        }
+        i += 1;
+    }
+}
+
+unsafe fn listener_remove(s: &mut IpState, idx: usize) {
+    let want = idx as u32 + 1;
+    let mut i = 0;
+    while i < MAX_LISTENERS {
+        if s.listeners[i] == want {
+            s.listeners[i] = 0;
+            return;
+        }
+        i += 1;
+    }
+}
+
+/// One more half-open connection from `ip`.
+unsafe fn half_open_enter(s: &mut IpState, ip: u32) {
+    s.tcp_half_open = s.tcp_half_open.saturating_add(1);
+    if s.tcp_half_open > s.tcp_half_open_max {
+        s.tcp_half_open_max = s.tcp_half_open;
+    }
+    match index::source_enter(&mut s.ho_src, ip) {
+        Some(n) => {
+            if n > s.tcp_half_open_src_max {
+                s.tcp_half_open_src_max = n;
+            }
+        }
+        None => s.ho_src_untracked = s.ho_src_untracked.wrapping_add(1),
+    }
+}
+
+/// One fewer half-open connection from `ip`.
+unsafe fn half_open_leave(s: &mut IpState, ip: u32) {
+    s.tcp_half_open = s.tcp_half_open.saturating_sub(1);
+    index::source_leave(&mut s.ho_src, ip);
+}
+
+/// Register a connection whose fields are now set: index it by tuple,
+/// list it if it listens, count its port, count it if half-open.
+unsafe fn conn_index_insert(s: &mut IpState, idx: usize) {
+    let (keyed, hash, listens, local_port, half_open, remote_ip) = {
+        let c = &*s.tcp_conns.as_ptr().add(idx);
+        (
+            conn_is_keyed(c),
+            conn_key_of(c).hash(),
+            c.state == tcp::TcpState::Listen && !c.is_datagram,
+            c.local_port,
+            c.state == tcp::TcpState::SynReceived && !c.half_open_counted,
+            c.remote_ip,
+        )
+    };
+    if keyed {
+        let _ = index::insert(&mut s.conn_index, hash, idx);
+    }
+    if listens {
+        listener_add(s, idx);
+    }
+    if local_port != 0 {
+        port_ref_inc(s, local_port);
+    }
+    if half_open {
+        (*s.tcp_conns.as_mut_ptr().add(idx)).half_open_counted = true;
+        half_open_enter(s, remote_ip);
+    }
+}
+
+/// A half-open connection completed or was abandoned: stop counting it.
+unsafe fn conn_leave_half_open(s: &mut IpState, idx: usize) {
+    let c = &mut *s.tcp_conns.as_mut_ptr().add(idx);
+    if c.half_open_counted {
+        c.half_open_counted = false;
+        let ip = c.remote_ip;
+        half_open_leave(s, ip);
+    }
+}
+
+/// Release a slot: unindex whatever it was, then reset it. Removal is by
+/// what the slot holds, not by its state — a slot latched `Closed` for a
+/// pending notification is still indexed until here.
+unsafe fn conn_reset(s: &mut IpState, idx: usize) {
+    let (is_datagram, remote_ip, local_port, hash, half_open) = {
+        let c = &*s.tcp_conns.as_ptr().add(idx);
+        (
+            c.is_datagram,
+            c.remote_ip,
+            c.local_port,
+            conn_key_of(c).hash(),
+            c.half_open_counted,
+        )
+    };
+    if !is_datagram && remote_ip != 0 {
+        let _ = index::remove(&mut s.conn_index, hash, idx);
+    }
+    if !is_datagram && local_port != 0 {
+        listener_remove(s, idx);
+    }
+    if local_port != 0 {
+        port_ref_dec(s, local_port);
+    }
+    if half_open {
+        half_open_leave(s, remote_ip);
+    }
+    *s.tcp_conns.as_mut_ptr().add(idx) = tcp::TcpConn::new();
+}
+
+/// A free connection slot for TCP, searched from where the last search
+/// stopped so allocation is amortised constant rather than a scan from
+/// zero.
+///
+/// The first `MAX_DG_ENDPOINTS` slots are the only ones a datagram endpoint
+/// can take (its `ep_id` is a u8), so TCP prefers the slots beyond that
+/// window and falls back into it only when the rest is full — otherwise a
+/// SYN flood, or simply a busy server, would leave no endpoint bindable.
+/// On a profile whose table is no larger than the window there is no
+/// "beyond", and the search is the whole table as before.
+unsafe fn alloc_free_slot(s: &mut IpState) -> Option<usize> {
+    let lo = if MAX_DG_ENDPOINTS < tcp::MAX_TCP_CONNS {
+        MAX_DG_ENDPOINTS
+    } else {
+        0
+    };
+    let span = tcp::MAX_TCP_CONNS - lo;
+    let mut n = 0;
+    let start = s.free_cursor as usize % span;
+    while n < span {
+        let i = lo + (start + n) % span;
+        if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
+            s.free_cursor = ((start + n + 1) % span) as u32;
+            return Some(i);
+        }
+        n += 1;
+    }
+    let mut i = 0;
+    while i < lo {
+        if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The connection an inbound segment belongs to, by index. A connection
+/// on a concrete local slot matches only that slot; one on the wildcard
+/// slot matches any, so both keys are tried.
+unsafe fn find_conn_indexed(
+    s: &IpState,
+    remote_ip: u32,
+    remote_port: u16,
+    local_port: u16,
+    local_slot: u16,
+) -> Option<usize> {
+    let conns = s.tcp_conns.as_ptr();
+    let matches = |slot: usize, want_slot: u16| {
+        let c = &*conns.add(slot);
+        c.is_active()
+            && c.remote_ip == remote_ip
+            && c.remote_port == remote_port
+            && c.local_port == local_port
+            && c.local_slot == want_slot
+    };
+    let key = index::ConnKey {
+        remote_ip,
+        remote_port,
+        local_port,
+        local_slot,
+    };
+    if let Some(i) = index::lookup(&s.conn_index, key.hash(), |slot| matches(slot, local_slot)) {
+        return Some(i);
+    }
+    if local_slot == LOCAL_SLOT_ANY {
+        return None;
+    }
+    let any = index::ConnKey {
+        local_slot: LOCAL_SLOT_ANY,
+        ..key
+    };
+    index::lookup(&s.conn_index, any.hash(), |slot| {
+        matches(slot, LOCAL_SLOT_ANY)
+    })
+}
+
+/// The listener for a SYN, by list. Same admission rule as before: a
+/// concrete-slot listener serves its slot; a wildcard listener serves slot 0
+/// and unowned secondaries, never an owned one.
+unsafe fn find_listener_indexed(
+    s: &IpState,
+    local_port: u16,
+    local_slot: u16,
+    dst_owned: bool,
+) -> Option<usize> {
+    let mut i = 0;
+    while i < MAX_LISTENERS {
+        let e = s.listeners[i];
+        if e != 0 {
+            let idx = (e - 1) as usize;
+            let c = &*s.tcp_conns.as_ptr().add(idx);
+            if c.state == tcp::TcpState::Listen
+                && !c.is_datagram
+                && c.local_port == local_port
+                && (c.local_slot == local_slot || (c.local_slot == LOCAL_SLOT_ANY && !dst_owned))
+            {
+                return Some(idx);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Inbound RX / command processing pauses when the outbound control
@@ -431,8 +749,56 @@ impl IpDrops {
     }
 }
 
+/// One packet held at the decision seam: the whole frame, where the IPv4
+/// header starts in it, which local-address slot it was demuxed to, and
+/// when it is released if no disposition comes.
 #[repr(C)]
-pub struct IpState {
+pub struct HeldPacket {
+    in_use: u8,
+    _pad0: u8,
+    /// Local-address slot the packet was demuxed to at intake.
+    local_slot: u16,
+    /// Generation stamped into the `pkt_id`; a disposition naming another
+    /// generation is stale.
+    gen: u16,
+    len: u16,
+    l3_off: u16,
+    deadline_ms: u32,
+    /// A TUNNEL/DSR disposition whose forward write did not fit yet:
+    /// `[disposition][args:6]`, `disposition = 0xFF` when none pending.
+    pending_fwd: [u8; 7],
+    _pad: u8,
+    frame: [u8; MAX_FRAME_SIZE],
+}
+
+/// Decision-seam counters. Lifetime counters like `IpDrops`; a director
+/// reads deltas, and `hold_refused` advancing is the signal that the hold
+/// bound is the gate.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct PktSeamStats {
+    /// Decision records handed to the director.
+    pub decided: u32,
+    /// Packets refused at intake because every hold slot was taken, or the
+    /// decision port had no room for the record.
+    pub hold_refused: u32,
+    /// Held packets released at their deadline with no disposition.
+    pub hold_expired: u32,
+    /// Dispositions naming a released or reused `pkt_id`.
+    pub stale_disposition: u32,
+    pub local: u32,
+    pub dropped: u32,
+    pub rejected: u32,
+    pub forwarded: u32,
+    /// TUNNEL/DSR dispositions with no forward port wired; released.
+    pub fwd_unwired: u32,
+    pub cloned: u32,
+    /// Clone requests refused for want of a slot.
+    pub clone_refused: u32,
+}
+
+#[repr(C)]
+struct IpState {
     // Core module fields
     syscalls: *const SyscallTable,
     in_chan: i32,
@@ -486,6 +852,27 @@ pub struct IpState {
     // TCP connections
     tcp_conns: [tcp::TcpConn; tcp::MAX_TCP_CONNS],
 
+    // Lookup structures over the tables (`index.rs`); maintained at
+    // `conn_index_insert` / `conn_reset` and the address-control paths.
+    conn_index: [u32; CONN_INDEX_SIZE],
+    addr_index: [u32; ADDR_INDEX_SIZE],
+    /// Listening (non-datagram) slots, `slot + 1`; 0 = empty.
+    listeners: [u32; MAX_LISTENERS],
+    port_ref: [u16; PORT_REF_ENTRIES],
+    ho_src: [index::SourceCount; HO_SRC_ENTRIES],
+    /// Half-open connections whose source the table had no room to track.
+    ho_src_untracked: u32,
+    /// Where the next free-slot search starts; amortises allocation.
+    free_cursor: u32,
+    /// Timer sweep position within the current window (0 = at the start).
+    sweep_cursor: u32,
+    /// When the current sweep window began.
+    sweep_window_ms: u32,
+    /// Challenge-ACK refill epoch: a connection whose epoch lags is
+    /// refilled when the sweep reaches it.
+    chal_epoch: u8,
+    _idx_pad: [u8; 3],
+
     // IP identification counter
     ip_id: u16,
     _id_pad: [u8; 2],
@@ -497,12 +884,39 @@ pub struct IpState {
     /// the platform workload backend. Graphs without it wired get today's
     /// single-address behaviour, byte-identical.
     addr_ctl_chan: i32,
+    /// Emission events back to that writer (out[5]); -1 when unwired.
+    addr_evt_chan: i32,
+    /// Install generation counter for local addresses.
+    addr_generation: u32,
+    /// Frames refused at the emission gate because their source address is
+    /// fenced. A non-zero delta after a fence is the fence doing its job.
+    tx_fenced: u32,
+
+    // Pre-transport decision seam (in[3], out[3], out[4]); -1 when unwired.
+    pkt_in_chan: i32,
+    pkt_out_chan: i32,
+    pkt_fwd_chan: i32,
+    /// `packet_decision` parameter: off, or pre_transport.
+    pkt_decision: u8,
+    _pkt_pad: u8,
+    /// How long a packet is held awaiting disposition before release.
+    pkt_hold_ms: u16,
+    /// Generation stamped into the next hold; never 0.
+    pkt_gen: u16,
+    /// Hold slots in use — the seam's live gauge.
+    pkt_held: u16,
+    pkt_stats: PktSeamStats,
+    pkt_hold: [HeldPacket; MAX_PACKET_HOLD],
 
     // Net protocol scratch buffer: NET_FRAME_HDR(3) + conn_id(1) + TCP payload.
     net_scratch: [u8; 1600],
 
     // Frame buffers
     rx_frame: [u8; MAX_FRAME_SIZE],
+    /// Length of the frame in `rx_frame` and where its L3 header starts,
+    /// recorded per frame so the decision seam can hold a whole frame.
+    rx_frame_len: u16,
+    rx_l3_off: u16,
     tx_frame: [u8; MAX_FRAME_SIZE],
     /// Length of a TX frame staged in `pending_tx_buf` awaiting channel space
     /// (0 = no pending). The frame is held in its own buffer so subsequent
@@ -524,7 +938,7 @@ pub struct IpState {
     /// `-1` = not a loopback conn; otherwise the peer's slot index.
     /// Both slots sit in the ordinary conn table as `Established`
     /// with empty send queues, which the timer scan ignores.
-    loopback_peer: [i16; tcp::MAX_TCP_CONNS],
+    loopback_peer: [i32; tcp::MAX_TCP_CONNS],
 
     /// Stash for a CMD_SEND tail that couldn't be drained in one tick
     /// (peer window closed mid-frame, or NIC out_chan rejected a
@@ -570,7 +984,6 @@ pub struct IpState {
     /// `retransmit_timer` / `timewait_timer` thresholds are defined
     /// in 50 ms ticks; gating on wallclock keeps them meaningful
     /// regardless of the host scheduler's `tick_us`.
-    last_tcp_timer_ms: u64,
     /// `tcp_idle_s` in 50 ms timer ticks; 0 disables the idle close.
     tcp_idle_ticks: u16,
 
@@ -620,13 +1033,13 @@ pub struct IpState {
     /// TCP connections currently in `SynReceived` (half-open). Recounted from
     /// the table on each passive open rather than tracked as a delta, so a
     /// teardown path that forgets to decrement cannot strand the gauge.
-    tcp_half_open: u16,
+    tcp_half_open: u32,
     /// High-water mark of `tcp_half_open` since boot.
-    tcp_half_open_max: u16,
+    tcp_half_open_max: u32,
     /// High-water mark of half-open connections attributable to one source
     /// address. A flood from a single peer shows here, which
     /// `tcp_half_open_max` alone cannot distinguish from legitimate load.
-    tcp_half_open_src_max: u16,
+    tcp_half_open_src_max: u32,
     /// Passive opens refused for want of a free slot. Read together with
     /// `tcp_half_open_max` this separates a genuine capacity ceiling from
     /// half-open exhaustion.
@@ -735,6 +1148,21 @@ mod params_def {
         // not hold TCP state for good.
         5, tcp_idle_s, u16, 0
             => |s, d, len| { s.tcp_idle_ticks = p_u16(d, len, 0, 0).saturating_mul(TCP_TIMER_HZ); };
+        // Pre-transport decision seam. `pre_transport` hands every validated
+        // inbound IPv4 packet to a director on `packet_out` and holds it
+        // until a disposition arrives on `packet_in`; `off` (the default)
+        // means the code path does not exist at runtime.
+        6, packet_decision, u8, 0, enum { off=0, pre_transport=1 }
+            => |s, d, len| { s.pkt_decision = p_u8(d, len, 0, 0); };
+        // Milliseconds a packet is held awaiting disposition before it is
+        // released and reported (`MSG_PKT_EXPIRED`). Clamped to >= 1: a
+        // packet released before the director can answer is a seam that
+        // does nothing.
+        7, packet_hold_ms, u16, 50
+            => |s, d, len| {
+                let v = p_u16(d, len, 0, 50);
+                s.pkt_hold_ms = if v == 0 { 1 } else { v };
+            };
     }
 }
 
@@ -777,7 +1205,7 @@ unsafe fn sync_primary_slot(s: &mut IpState) {
     a.set_ipv4(s.local_ip);
     a.prefix_len = prefix_len_from_netmask(s.netmask);
     a.owner_tag = 0;
-    a.flags = ADDR_FLAG_PRIMARY;
+    a.flags = ADDR_FLAG_PRIMARY | ADDR_FLAG_ARMED;
 }
 
 /// Outbound IPv4 source address for a conn's bound `slot`. Slot 0 (and the
@@ -785,7 +1213,7 @@ unsafe fn sync_primary_slot(s: &mut IpState) {
 /// concrete secondary sources from its table entry, falling back to the
 /// primary if the slot has since been removed.
 #[inline]
-fn local_ip_for_slot(s: &IpState, slot: u8) -> u32 {
+fn local_ip_for_slot(s: &IpState, slot: u16) -> u32 {
     if slot == 0 || slot == LOCAL_SLOT_ANY {
         return s.local_ip;
     }
@@ -798,28 +1226,27 @@ fn local_ip_for_slot(s: &IpState, slot: u8) -> u32 {
 }
 
 /// Resolve an inbound destination IP to a local-address slot. `Some(0)` =
-/// primary; `Some(i)` = secondary `i`; `None` = not one of ours. With no
-/// secondaries configured the `1..` scan sees only inactive entries, so this
-/// collapses to the single `dst == local_ip` compare — byte-identical.
-///
-/// ≤`MAX_LOCAL_ADDRS`-entry linear scan on the RX hot path: negligible next
-/// to the per-frame parse + checksum, but `MAX_LOCAL_ADDRS` must NOT be
-/// raised without a hot-path measurement (this module's perf discipline —
-/// it has a NEON-memcpy RX history).
+/// primary; `Some(i)` = secondary `i`; `None` = not one of ours. The
+/// primary is one compare; secondaries go through the address index, so
+/// the table's size costs nothing per frame.
 #[inline]
-fn local_slot_for_dst(s: &IpState, dst: u32) -> Option<u8> {
+fn local_slot_for_dst(s: &IpState, dst: u32) -> Option<u16> {
     if s.local_ip != 0 && dst == s.local_ip {
         return Some(0);
     }
-    let mut i = 1;
-    while i < MAX_LOCAL_ADDRS {
-        let a = &s.local_addrs[i];
-        if a.is_active() && a.ipv4() == dst {
-            return Some(i as u8);
-        }
-        i += 1;
+    if dst == 0 {
+        return None;
     }
-    None
+    // SAFETY: the index is a power-of-two length by construction.
+    unsafe {
+        index::lookup(&s.addr_index, index::mix32(dst), |i| {
+            i != 0 && i < MAX_LOCAL_ADDRS && {
+                let a = &s.local_addrs[i];
+                a.is_active() && a.ipv4() == dst
+            }
+        })
+        .map(|i| i as u16)
+    }
 }
 
 /// True if `ip` is any configured local address (primary or secondary).
@@ -832,7 +1259,7 @@ fn is_local_addr(s: &IpState, ip: u32) -> bool {
 /// out-of-range, and inactive slots all report 0 (host/system owner). Used by
 /// the bind-admission and demux gates.
 #[inline]
-fn owner_tag_for_slot(s: &IpState, slot: u8) -> u16 {
+fn owner_tag_for_slot(s: &IpState, slot: u16) -> u16 {
     let i = slot as usize;
     if slot == LOCAL_SLOT_ANY || i >= MAX_LOCAL_ADDRS {
         return 0;
@@ -850,7 +1277,7 @@ fn owner_tag_for_slot(s: &IpState, slot: u8) -> u16 {
 /// this is always false, so every demux/admission gate keyed on it
 /// collapses to a plain unowned match.
 #[inline]
-fn slot_is_owned(s: &IpState, slot: u8) -> bool {
+fn slot_is_owned(s: &IpState, slot: u16) -> bool {
     owner_tag_for_slot(s, slot) != 0
 }
 
@@ -860,7 +1287,7 @@ fn slot_is_owned(s: &IpState, slot: u8) -> bool {
 /// lease-owner gate). Owner 0 (host) is never
 /// resolved here — it binds the wildcard slot.
 #[inline]
-fn slot_for_owner(s: &IpState, owner_tag: u16) -> Option<u8> {
+fn slot_for_owner(s: &IpState, owner_tag: u16) -> Option<u16> {
     if owner_tag == 0 {
         return None;
     }
@@ -868,11 +1295,184 @@ fn slot_for_owner(s: &IpState, owner_tag: u16) -> Option<u8> {
     while i < MAX_LOCAL_ADDRS {
         let a = &s.local_addrs[i];
         if a.is_active() && a.owner_tag == owner_tag {
-            return Some(i as u8);
+            return Some(i as u16);
         }
         i += 1;
     }
     None
+}
+
+// ── Emission control ────────────────────────────────────────────────
+//
+// An installed address is armed (it emits and answers ARP) or fenced (it
+// does neither). The gate is `send_frame`, the one hand-off to the driver
+// ring, so a fence holds for every path that builds a frame; ARP answering
+// and conflict defence check the same flag. The primary is always armed.
+
+/// Whether `ip` is one of ours AND armed.
+#[inline]
+fn is_armed_addr(s: &IpState, ip: u32) -> bool {
+    match local_slot_for_dst(s, ip) {
+        Some(slot) => s.local_addrs[slot as usize].flags & ADDR_FLAG_ARMED != 0,
+        None => false,
+    }
+}
+
+/// Whether a frame may be handed to the driver: its source address is not
+/// one of ours, or is one of ours and armed. Source is read from the IPv4
+/// header or the ARP sender field; anything else (a DHCP discover from
+/// 0.0.0.0, a frame of another type) is not subject to emission control.
+///
+/// # Safety
+/// `frame` must point to `len` readable bytes.
+unsafe fn emission_allowed(s: &IpState, frame: *const u8, len: usize) -> bool {
+    if len < eth::ETH_HEADER_LEN + 2 {
+        return true;
+    }
+    let ethertype = ((*frame.add(12) as u16) << 8) | *frame.add(13) as u16;
+    let src = match ethertype {
+        eth::ETHERTYPE_IPV4 if len >= eth::ETH_HEADER_LEN + 20 => {
+            let p = frame.add(eth::ETH_HEADER_LEN + 12);
+            u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+        }
+        eth::ETHERTYPE_ARP if len >= eth::ETH_HEADER_LEN + 28 => {
+            let p = frame.add(eth::ETH_HEADER_LEN + 14);
+            u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+        }
+        _ => return true,
+    };
+    if src == 0 {
+        return true;
+    }
+    match local_slot_for_dst(s, src) {
+        Some(slot) => s.local_addrs[slot as usize].flags & ADDR_FLAG_ARMED != 0,
+        None => true,
+    }
+}
+
+/// Write one emission event to the address-control writer, if it listens.
+unsafe fn addr_evt(s: &mut IpState, msg: u8, payload: &[u8]) {
+    if s.addr_evt_chan < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let mut scratch = [0u8; NET_FRAME_HDR + 48];
+    let _ = ip_net_write_frame(
+        sys,
+        s.addr_evt_chan,
+        msg,
+        payload.as_ptr(),
+        payload.len(),
+        scratch.as_mut_ptr(),
+    );
+}
+
+unsafe fn addr_evt_refused(s: &mut IpState, addr16: &[u8; 16], op: u8, reason: u8) {
+    let mut p = [0u8; 18];
+    p[..16].copy_from_slice(addr16);
+    p[16] = op;
+    p[17] = reason;
+    addr_evt(s, netid::MSG_ADDR_REFUSED, &p);
+}
+
+/// Mint an emission token: CSPRNG bytes mixed with the boot incarnation,
+/// so it is fresh per install and unmatchable across boots. `None` when
+/// either source is unavailable — an install then fails closed.
+unsafe fn mint_token(s: &IpState) -> Option<[u8; 16]> {
+    let sys = &*s.syscalls;
+    let mut t = [0u8; 16];
+    if dev_csprng_fill(sys, t.as_mut_ptr(), 16) < 0 {
+        return None;
+    }
+    let inc = dev_boot_incarnation(sys)?;
+    let mut i = 0;
+    while i < 16 {
+        t[i] ^= inc[i];
+        i += 1;
+    }
+    if t == [0u8; 16] {
+        return None;
+    }
+    Some(t)
+}
+
+/// `ADDR_ARM` / `ADDR_FENCE`: the slot the token names, or the refusal.
+unsafe fn addr_ctl_resolve(
+    s: &mut IpState,
+    addr16: &[u8; 16],
+    token: &[u8; 16],
+    op: u8,
+) -> Option<usize> {
+    let ipv4 = u32::from_be_bytes([addr16[0], addr16[1], addr16[2], addr16[3]]);
+    let Some(slot) = local_slot_for_dst(s, ipv4) else {
+        addr_evt_refused(s, addr16, op, netid::refusal::NOT_FOUND);
+        return None;
+    };
+    if slot == 0 {
+        addr_evt_refused(s, addr16, op, netid::refusal::PRIMARY);
+        return None;
+    }
+    let a = &s.local_addrs[slot as usize];
+    // Constant-time compare: a token is a credential.
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < 16 {
+        diff |= a.token[i] ^ token[i];
+        i += 1;
+    }
+    if diff != 0 {
+        addr_evt_refused(s, addr16, op, netid::refusal::TOKEN_MISMATCH);
+        return None;
+    }
+    Some(slot as usize)
+}
+
+unsafe fn addr_ctl_arm(s: &mut IpState, addr16: &[u8; 16], token: &[u8; 16]) {
+    let Some(slot) = addr_ctl_resolve(s, addr16, token, IP_ADDR_ARM) else {
+        return;
+    };
+    let ipv4 = s.local_addrs[slot].ipv4();
+    let generation = s.local_addrs[slot].generation;
+    s.local_addrs[slot].flags |= ADDR_FLAG_ARMED;
+    log_info(s, b"[ip] addr armed");
+    if s.netmask != 0 && s.local_ip != 0 && (ipv4 & s.netmask) == (s.local_ip & s.netmask) {
+        send_gratuitous_arp(s, ipv4);
+    }
+    let mut p = [0u8; 20];
+    p[..16].copy_from_slice(addr16);
+    p[16..20].copy_from_slice(&generation.to_le_bytes());
+    addr_evt(s, netid::MSG_ADDR_ARMED, &p);
+}
+
+unsafe fn addr_ctl_fence(s: &mut IpState, addr16: &[u8; 16], token: &[u8; 16]) {
+    let Some(slot) = addr_ctl_resolve(s, addr16, token, IP_ADDR_FENCE) else {
+        return;
+    };
+    let ipv4 = s.local_addrs[slot].ipv4();
+    let generation = s.local_addrs[slot].generation;
+    s.local_addrs[slot].flags &= !ADDR_FLAG_ARMED;
+    // A frame from this address staged for the ring is not sent: the
+    // cutoff must mean what it says.
+    let mut discarded = 0u8;
+    if s.pending_tx_len > 0 {
+        let f = s.pending_tx_buf.as_ptr().add(2);
+        let flen = s.pending_tx_len as usize - 2;
+        if !emission_allowed(s, f, flen) {
+            s.pending_tx_len = 0;
+            s.tx_fenced = s.tx_fenced.wrapping_add(1);
+            discarded = 1;
+        }
+    }
+    let cutoff = u64::from(s.tx_frame_count);
+    log_info(s, b"[ip] addr fenced");
+    let mut p = [0u8; 30];
+    p[..16].copy_from_slice(addr16);
+    p[16..20].copy_from_slice(&generation.to_le_bytes());
+    p[20..28].copy_from_slice(&cutoff.to_le_bytes());
+    p[28] = netid::cutoff::RING_HANDOFF;
+    p[29] = discarded;
+    addr_evt(s, netid::MSG_ADDR_FENCED, &p);
+    let _ = ipv4;
 }
 
 /// Broadcast a gratuitous ARP (L2-broadcast ARP reply) claiming `addr` for our
@@ -1452,38 +2052,6 @@ const EPHEMERAL_SCAN_MAX: usize = tcp::MAX_TCP_CONNS * 2;
 ///
 /// # Safety
 /// `s.tcp_conns` must be initialised.
-unsafe fn count_half_open(s: &IpState) -> u16 {
-    let mut total: u16 = 0;
-    let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
-        if (*s.tcp_conns.as_ptr().add(i)).state == tcp::TcpState::SynReceived {
-            total = total.saturating_add(1);
-        }
-        i += 1;
-    }
-    total
-}
-
-unsafe fn note_half_open(s: &mut IpState, src: u32) {
-    let total = count_half_open(s);
-    let mut from_src: u16 = 0;
-    let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
-        let c = &*s.tcp_conns.as_ptr().add(i);
-        if c.state == tcp::TcpState::SynReceived && c.remote_ip == src {
-            from_src = from_src.saturating_add(1);
-        }
-        i += 1;
-    }
-    s.tcp_half_open = total;
-    if total > s.tcp_half_open_max {
-        s.tcp_half_open_max = total;
-    }
-    if from_src > s.tcp_half_open_src_max {
-        s.tcp_half_open_src_max = from_src;
-    }
-}
-
 /// Decode the optional owner tag at the head of a `DG_CMD_SEND_TO` /
 /// `DG_CMD_CLOSE` payload. Returns `(claimed_tag, offset_of_next_field)`.
 ///
@@ -1531,9 +2099,9 @@ enum DgBind {
 /// two sockets. TCP listeners are a different protocol and never conflict
 /// here — `find_listener` already excludes datagram slots in the other
 /// direction.
-unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u8, owner_tag: u16) -> DgBind {
+unsafe fn dg_bind_admission(s: &IpState, port: u16, slot: u16, owner_tag: u16) -> DgBind {
     let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
+    while i < MAX_DG_ENDPOINTS {
         let c = &*s.tcp_conns.as_ptr().add(i);
         if c.is_active() && c.is_datagram && c.local_port == port {
             if c.local_slot == slot {
@@ -1568,11 +2136,13 @@ unsafe fn alloc_dg_slot(s: &mut IpState) -> Option<usize> {
     let start = if dev_csprng_fill(sys, r.as_mut_ptr(), 1) < 0 {
         0usize
     } else {
-        (r[0] as usize) % tcp::MAX_TCP_CONNS
+        (r[0] as usize) % MAX_DG_ENDPOINTS
     };
+    // Endpoints live in the first `MAX_DG_ENDPOINTS` slots: the wire's
+    // `ep_id` is a u8, and the id space binds the endpoint count.
     let mut n = 0;
-    while n < tcp::MAX_TCP_CONNS {
-        let ci = (start + n) % tcp::MAX_TCP_CONNS;
+    while n < MAX_DG_ENDPOINTS {
+        let ci = (start + n) % MAX_DG_ENDPOINTS;
         if slot_is_free(&*s.tcp_conns.as_ptr().add(ci)) {
             return Some(ci);
         }
@@ -1583,6 +2153,9 @@ unsafe fn alloc_dg_slot(s: &mut IpState) -> Option<usize> {
 
 /// Is `port` already bound by a TCP connection or datagram endpoint?
 unsafe fn port_in_use(s: &IpState, port: u16) -> bool {
+    if PORT_REF_ENTRIES > 1 {
+        return *s.port_ref.as_ptr().add(port as usize) != 0;
+    }
     let mut i = 0;
     while i < tcp::MAX_TCP_CONNS {
         let c = &*s.tcp_conns.as_ptr().add(i);
@@ -1807,6 +2380,13 @@ unsafe fn send_frame(s: &mut IpState, frame: *const u8, len: usize) -> bool {
     if s.out_chan < 0 || len == 0 || len > MAX_FRAME_SIZE - 2 {
         return false;
     }
+    // The emission gate: a frame sourced from a fenced address does not
+    // reach the driver ring, whatever path built it. This is the boundary
+    // `MSG_ADDR_FENCED` reports, so it is the one place the check lives.
+    if !emission_allowed(s, frame, len) {
+        s.tx_fenced = s.tx_fenced.wrapping_add(1);
+        return false;
+    }
     let sys = &*s.syscalls;
 
     // Flush any frame pending from a previous step before writing a new one.
@@ -1964,6 +2544,28 @@ pub unsafe extern "C" fn module_new(
             *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
             i += 1;
         }
+        index::clear(&mut s.conn_index);
+        index::clear(&mut s.addr_index);
+        i = 0;
+        while i < MAX_LISTENERS {
+            s.listeners[i] = 0;
+            i += 1;
+        }
+        i = 0;
+        while i < PORT_REF_ENTRIES {
+            s.port_ref[i] = 0;
+            i += 1;
+        }
+        i = 0;
+        while i < HO_SRC_ENTRIES {
+            s.ho_src[i] = index::SourceCount::empty();
+            i += 1;
+        }
+        s.ho_src_untracked = 0;
+        s.free_cursor = 0;
+        s.sweep_cursor = 0;
+        s.sweep_window_ms = dev_millis(&*s.syscalls) as u32;
+        s.chal_epoch = 0;
 
         s.ip_id = 1;
         // Scan cursor only; every allocation draws a fresh CSPRNG candidate.
@@ -1982,6 +2584,27 @@ pub unsafe extern "C" fn module_new(
         s.net_in_chan = dev_channel_port(sys, 0, NET_IN_PORT); // in[1]: net commands from consumer
         s.net_out_chan = dev_channel_port(sys, 1, 1); // out[1]: net messages to consumer
         s.addr_ctl_chan = dev_channel_port(sys, 0, ADDR_CTL_PORT); // in[2]: addr control (optional)
+        s.addr_evt_chan = dev_channel_port(sys, 1, ADDR_EVT_PORT); // out[5]: emission events (optional)
+        s.addr_generation = 0;
+        s.tx_fenced = 0;
+        s.pkt_in_chan = dev_channel_port(sys, 0, PACKET_IN_PORT); // in[3]: dispositions (optional)
+        s.pkt_out_chan = dev_channel_port(sys, 1, PACKET_OUT_PORT); // out[3]: decision records
+        s.pkt_fwd_chan = dev_channel_port(sys, 1, PACKET_FWD_PORT); // out[4]: forwarded frames
+
+        // Decision seam starts empty; generation 1 so a zero `pkt_id` never
+        // names a live hold.
+        s.pkt_decision = PKT_DECISION_OFF;
+        s.pkt_hold_ms = 50;
+        s.pkt_gen = 1;
+        s.pkt_held = 0;
+        s.pkt_stats = PktSeamStats::default();
+        let mut hi = 0;
+        while hi < MAX_PACKET_HOLD {
+            let h = &mut *s.pkt_hold.as_mut_ptr().add(hi);
+            h.in_use = 0;
+            h.pending_fwd[0] = 0xFF;
+            hi += 1;
+        }
 
         // Self-register as the node's net-identity provider (the kernel-side
         // workload backend resolves addr_ctl / ingress through this — no name
@@ -2004,11 +2627,28 @@ pub unsafe extern "C" fn module_new(
             *s.local_addrs.as_mut_ptr().add(ai) = LocalAddr::empty();
             ai += 1;
         }
-        s.local_addrs[0].flags = ADDR_FLAG_PRIMARY;
+        s.local_addrs[0].flags = ADDR_FLAG_PRIMARY | ADDR_FLAG_ARMED;
 
         // Parse TLV params
         if !params.is_null() && params_len > 0 {
             params_def::parse_tlv(s, params, params_len);
+        }
+
+        // The decision seam is either wholly present or wholly absent. A
+        // director wired to a module that will never ask it, or a module
+        // configured to ask a director that is not there, would run as an
+        // ordinary stack with a silent hole where the decision was meant to
+        // be — refused here, before network readiness.
+        let seam_wired = s.pkt_in_chan >= 0 && s.pkt_out_chan >= 0;
+        if s.pkt_decision != PKT_DECISION_OFF && !seam_wired {
+            let msg = b"[ip] refusing to construct: packet_decision=pre_transport needs packet_in and packet_out wired";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            return -1;
+        }
+        if s.pkt_decision == PKT_DECISION_OFF && (s.pkt_in_chan >= 0 || s.pkt_out_chan >= 0) {
+            let msg = b"[ip] refusing to construct: packet ports wired but packet_decision=off";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            return -1;
         }
 
         log_info(s, b"[ip] module loaded");
@@ -2072,9 +2712,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // `net_out_chan` before producing new events; FIFO order matters.
     drain_pending_net_out(s);
 
+    // 0c. Settle the director's dispositions before taking new frames, so
+    // the slots they release are available to this step's intake; then
+    // release anything held past its deadline.
+    service_packet_in(s);
+
     // 1. Receive and process incoming frames
     let mac_was_valid = s.mac_valid;
     process_rx_frames(s);
+    expire_held(s);
     // Did the 32-frame drain budget bind? A still-readable NIC channel
     // after draining means `ip` stopped with frames waiting, which is the
     // discriminator between "ip is the gate" and "ip is starved".
@@ -2186,14 +2832,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
     // 5. TCP timers — wallclock-driven so the 50 ms-tick thresholds
     // hold across schedulers with different `tick_us`.
-    {
-        let sys = &*s.syscalls;
-        let now_ms = dev_millis(sys);
-        if now_ms.saturating_sub(s.last_tcp_timer_ms) >= 50 {
-            s.last_tcp_timer_ms = now_ms;
-            step_tcp_timers(s);
-        }
-    }
+    step_tcp_timers(s);
 
     // Tally idle steps and emit the periodic `[ip] tlm …` line.
     // "Idle" excludes back-pressure steps (so idle + bp + active = dt)
@@ -2279,13 +2918,39 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         pos += fmt_u32_dec(s.drops.dhcp_uncorrelated, buf.add(pos));
         emit(b" unreach=", &mut pos);
         pos += fmt_u32_dec(s.drops.route_unreachable, buf.add(pos));
+        emit(b" fenced=", &mut pos);
+        pos += fmt_u32_dec(s.tx_fenced, buf.add(pos));
         emit(b" halfopen=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_half_open as u32, buf.add(pos));
+        pos += fmt_u32_dec(s.tcp_half_open, buf.add(pos));
         emit(b"/", &mut pos);
-        pos += fmt_u32_dec(s.tcp_half_open_max as u32, buf.add(pos));
+        pos += fmt_u32_dec(s.tcp_half_open_max, buf.add(pos));
         emit(b" hosrc=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_half_open_src_max as u32, buf.add(pos));
+        pos += fmt_u32_dec(s.tcp_half_open_src_max, buf.add(pos));
         dev_log(sys, 3, buf, pos);
+
+        // Decision seam, only when it exists.
+        if s.pkt_decision != PKT_DECISION_OFF {
+            pos = 0;
+            emit(b"[ip] pkt held=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_held as u32, buf.add(pos));
+            emit(b" decided=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.decided, buf.add(pos));
+            emit(b" refused=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.hold_refused, buf.add(pos));
+            emit(b" expired=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.hold_expired, buf.add(pos));
+            emit(b" stale=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.stale_disposition, buf.add(pos));
+            emit(b" local=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.local, buf.add(pos));
+            emit(b" drop=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.dropped, buf.add(pos));
+            emit(b" reject=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.rejected, buf.add(pos));
+            emit(b" fwd=", &mut pos);
+            pos += fmt_u32_dec(s.pkt_stats.forwarded, buf.add(pos));
+            dev_log(sys, 3, buf, pos);
+        }
 
         // SYN-cookie pressure. Its own line: these are lifetime counters and
         // the drop line above has no room left for four more u32 fields.
@@ -2422,6 +3087,8 @@ unsafe fn process_frame(s: &mut IpState, len: usize) {
 
     let payload = s.rx_frame.as_ptr().add(payload_offset);
     let payload_len = len - payload_offset;
+    s.rx_frame_len = len as u16;
+    s.rx_l3_off = payload_offset as u16;
 
     match ethertype {
         eth::ETHERTYPE_ARP => process_arp(s, payload, payload_len),
@@ -2449,7 +3116,7 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     // reply asserting our MAC for the conflicted address, then notify the
     // consumer via MSG_ERROR. Now checks every configured local address,
     // not just the primary.
-    if sender_mac != s.mac_addr && is_local_addr(s, sender_ip) {
+    if sender_mac != s.mac_addr && is_armed_addr(s, sender_ip) {
         log_info(s, b"[ip] arp conflict");
         if s.mac_valid {
             send_gratuitous_arp(s, sender_ip);
@@ -2509,7 +3176,7 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
     // GEM MAC — ordinary multi-homing on one interface, no per-address MAC.
     // The reply's sender-protocol-address is the requested address, so each
     // secondary answers as itself.
-    if opcode == arp::ARP_REQUEST && s.mac_valid && is_local_addr(s, target_ip) {
+    if opcode == arp::ARP_REQUEST && s.mac_valid && is_armed_addr(s, target_ip) {
         let frame_len = arp::build_arp(
             s.tx_frame.as_mut_ptr(),
             arp::ARP_REPLY,
@@ -2604,11 +3271,597 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
     let proto_data = data.add(ip_hdr.header_len);
     let proto_len = ip_hdr.total_len as usize - ip_hdr.header_len;
 
+    // The decision seam sits exactly here: after the packet is known to be
+    // whole, checksummed at L3 and addressed to us, and before any
+    // transport state can be created for it. ICMP stays local — it is
+    // this stack's own control traffic, not a flow anyone directs.
+    if s.pkt_decision == PKT_DECISION_PRE_TRANSPORT && ip_hdr.protocol != ipv4::PROTO_ICMP {
+        seam_intake(s, &ip_hdr, proto_data, proto_len, local_slot);
+        return;
+    }
+
+    dispatch_l4(s, &ip_hdr, proto_data, proto_len, local_slot, reply_src);
+}
+
+/// Hand a validated IPv4 packet to its transport.
+unsafe fn dispatch_l4(
+    s: &mut IpState,
+    ip_hdr: &ipv4::Ipv4Header,
+    proto_data: *const u8,
+    proto_len: usize,
+    local_slot: u16,
+    reply_src: u32,
+) {
     match ip_hdr.protocol {
-        ipv4::PROTO_ICMP => process_icmp(s, &ip_hdr, proto_data, proto_len, reply_src),
-        ipv4::PROTO_TCP => process_tcp_segment(s, &ip_hdr, proto_data, proto_len, local_slot),
-        ipv4::PROTO_UDP => process_udp_packet(s, &ip_hdr, proto_data, proto_len, local_slot),
+        ipv4::PROTO_ICMP => process_icmp(s, ip_hdr, proto_data, proto_len, reply_src),
+        ipv4::PROTO_TCP => process_tcp_segment(s, ip_hdr, proto_data, proto_len, local_slot),
+        ipv4::PROTO_UDP => process_udp_packet(s, ip_hdr, proto_data, proto_len, local_slot),
         _ => {}
+    }
+}
+
+// ============================================================================
+// Pre-transport decision seam
+// ============================================================================
+//
+// `packet_decision = pre_transport`: every whole, locally-addressed IPv4
+// packet is described to a director and held until the director settles it.
+// The buffer has one owner at a time — this module until the disposition,
+// then the transport (LOCAL), nobody (DROP/REJECT), or the forward port's
+// consumer (TUNNEL/DSR). A hold is bounded twice: `MAX_PACKET_HOLD` slots,
+// and `packet_hold_ms` per slot.
+
+/// Transport header verified? What the L4 parse says about a packet at
+/// intake.
+struct L4Facts {
+    src_port: u16,
+    dst_port: u16,
+    csum_ok: bool,
+    /// The packet failed L4 validation and must not reach the seam.
+    refused: bool,
+}
+
+/// Parse and checksum the transport header once, at the seam. A packet
+/// that fails here is dropped and counted exactly as it would be on the
+/// ordinary path — the director never sees a corrupt segment.
+unsafe fn seam_l4_facts(
+    s: &mut IpState,
+    ip_hdr: &ipv4::Ipv4Header,
+    proto_data: *const u8,
+    proto_len: usize,
+) -> L4Facts {
+    let mut f = L4Facts {
+        src_port: 0,
+        dst_port: 0,
+        csum_ok: false,
+        refused: false,
+    };
+    match ip_hdr.protocol {
+        ipv4::PROTO_TCP => {
+            let Some(h) = tcp::parse_tcp(proto_data, proto_len) else {
+                f.refused = true;
+                return f;
+            };
+            if !ipv4::verify_transport_checksum(
+                ip_hdr.src_ip,
+                ip_hdr.dst_ip,
+                ipv4::PROTO_TCP,
+                proto_data,
+                proto_len,
+            ) {
+                s.drops.cksum_tcp = s.drops.cksum_tcp.wrapping_add(1);
+                f.refused = true;
+                return f;
+            }
+            f.src_port = h.src_port;
+            f.dst_port = h.dst_port;
+            f.csum_ok = true;
+        }
+        ipv4::PROTO_UDP => {
+            let Some(h) = udp::parse_udp(proto_data, proto_len) else {
+                f.refused = true;
+                return f;
+            };
+            if h.length as usize != proto_len {
+                s.drops.udp_len = s.drops.udp_len.wrapping_add(1);
+                f.refused = true;
+                return f;
+            }
+            if udp::checksum_field(proto_data) != 0 {
+                if !ipv4::verify_transport_checksum(
+                    ip_hdr.src_ip,
+                    ip_hdr.dst_ip,
+                    ipv4::PROTO_UDP,
+                    proto_data,
+                    proto_len,
+                ) {
+                    s.drops.cksum_udp = s.drops.cksum_udp.wrapping_add(1);
+                    f.refused = true;
+                    return f;
+                }
+                f.csum_ok = true;
+            }
+            f.src_port = h.src_port;
+            f.dst_port = h.dst_port;
+        }
+        _ => {}
+    }
+    f
+}
+
+/// A free hold slot, or `None` when every one is taken.
+unsafe fn hold_alloc(s: &mut IpState) -> Option<usize> {
+    let mut i = 0;
+    while i < MAX_PACKET_HOLD {
+        if (*s.pkt_hold.as_ptr().add(i)).in_use == 0 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Release a hold slot.
+unsafe fn hold_free(s: &mut IpState, slot: usize) {
+    let h = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+    if h.in_use != 0 {
+        h.in_use = 0;
+        h.pending_fwd[0] = 0xFF;
+        s.pkt_held = s.pkt_held.saturating_sub(1);
+    }
+}
+
+/// `pkt_id` for a slot under its current generation.
+fn hold_id(slot: usize, gen: u16) -> u32 {
+    (slot as u32) | ((gen as u32) << 16)
+}
+
+/// The live slot a `pkt_id` names, or `None` when it names a released or
+/// reused one.
+unsafe fn hold_lookup(s: &IpState, pkt_id: u32) -> Option<usize> {
+    let slot = (pkt_id & 0xFFFF) as usize;
+    let gen = (pkt_id >> 16) as u16;
+    if slot >= MAX_PACKET_HOLD {
+        return None;
+    }
+    let h = &*s.pkt_hold.as_ptr().add(slot);
+    if h.in_use != 0 && h.gen == gen {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// Describe the packet in `rx_frame` to the director and hold it.
+unsafe fn seam_intake(
+    s: &mut IpState,
+    ip_hdr: &ipv4::Ipv4Header,
+    proto_data: *const u8,
+    proto_len: usize,
+    local_slot: u16,
+) {
+    use abi::contracts::net::packet as pkt;
+
+    let facts = seam_l4_facts(s, ip_hdr, proto_data, proto_len);
+    if facts.refused {
+        return;
+    }
+
+    let Some(slot) = hold_alloc(s) else {
+        s.pkt_stats.hold_refused = s.pkt_stats.hold_refused.wrapping_add(1);
+        return;
+    };
+
+    let sys = &*s.syscalls;
+    let gen = s.pkt_gen;
+    let id = hold_id(slot, gen);
+    let frame_len = s.rx_frame_len as usize;
+    let l3_off = s.rx_l3_off as usize;
+    let l4_off = l3_off + ip_hdr.header_len;
+    let ts_us = dev_micros(sys);
+
+    let mut rec = [0u8; pkt::DECIDE_LEN];
+    rec[0..4].copy_from_slice(&id.to_le_bytes());
+    rec[4] = pkt::AF_INET;
+    rec[5] = ip_hdr.protocol;
+    rec[6..10].copy_from_slice(&ip_hdr.src_ip.to_be_bytes());
+    rec[10..14].copy_from_slice(&ip_hdr.dst_ip.to_be_bytes());
+    rec[14..16].copy_from_slice(&facts.src_port.to_le_bytes());
+    rec[16..18].copy_from_slice(&facts.dst_port.to_le_bytes());
+    rec[18] = 0; // iface: this module drives one
+    rec[19] = 0; // rx_queue: one queue on every current NIC
+    rec[20] = pkt::RX_FLAG_HAS_TIMESTAMP
+        | if facts.csum_ok {
+            pkt::RX_FLAG_CSUM_OK
+        } else {
+            0
+        };
+    rec[21] = 0; // frag: fragments never reach the seam
+    rec[22..30].copy_from_slice(&ts_us.to_le_bytes());
+    rec[30..32].copy_from_slice(&(frame_len as u16).to_le_bytes());
+    rec[32..34].copy_from_slice(&(l4_off as u16).to_le_bytes());
+
+    let mut scratch = [0u8; NET_FRAME_HDR + pkt::DECIDE_LEN];
+    if ip_net_write_frame(
+        sys,
+        s.pkt_out_chan,
+        pkt::MSG_PKT_DECIDE,
+        rec.as_ptr(),
+        rec.len(),
+        scratch.as_mut_ptr(),
+    ) != 0
+    {
+        // No room for the record: refuse the packet, as a full ring
+        // refuses anywhere else. The peer's retransmit covers it.
+        s.pkt_stats.hold_refused = s.pkt_stats.hold_refused.wrapping_add(1);
+        return;
+    }
+
+    let now_ms = dev_millis(sys);
+    let hold_ms = s.pkt_hold_ms;
+    let h = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+    h.in_use = 1;
+    h.local_slot = local_slot;
+    h.gen = gen;
+    h.len = frame_len as u16;
+    h.l3_off = l3_off as u16;
+    h.deadline_ms = (now_ms as u32).wrapping_add(u32::from(hold_ms));
+    h.pending_fwd[0] = 0xFF;
+    core::ptr::copy_nonoverlapping(s.rx_frame.as_ptr(), h.frame.as_mut_ptr(), frame_len);
+    s.pkt_gen = if s.pkt_gen == u16::MAX {
+        1
+    } else {
+        s.pkt_gen + 1
+    };
+    s.pkt_held += 1;
+    s.pkt_stats.decided = s.pkt_stats.decided.wrapping_add(1);
+}
+
+/// Deliver a held packet to its transport — the LOCAL disposition.
+///
+/// The held frame becomes the current frame first: transport paths that
+/// answer the sender read its MAC from `rx_frame`, and the L4 pointers
+/// handed on are into `rx_frame` so nothing aliases the hold slot.
+unsafe fn deliver_held(s: &mut IpState, slot: usize) {
+    let (len, l3_off, local_slot) = {
+        let h = &*s.pkt_hold.as_ptr().add(slot);
+        core::ptr::copy_nonoverlapping(h.frame.as_ptr(), s.rx_frame.as_mut_ptr(), h.len as usize);
+        (h.len as usize, h.l3_off as usize, h.local_slot)
+    };
+    s.rx_frame_len = len as u16;
+    s.rx_l3_off = l3_off as u16;
+    let l3 = s.rx_frame.as_ptr().add(l3_off);
+    let Some(ip_hdr) = ipv4::parse_ipv4(l3, len - l3_off) else {
+        return;
+    };
+    let proto_data = l3.add(ip_hdr.header_len);
+    let proto_len = ip_hdr.total_len as usize - ip_hdr.header_len;
+    // Only ICMP consults `reply_src`, and ICMP never reaches the seam.
+    dispatch_l4(s, &ip_hdr, proto_data, proto_len, local_slot, ip_hdr.dst_ip);
+}
+
+/// Answer a held packet's sender — the REJECT disposition — then release.
+unsafe fn reject_held(s: &mut IpState, slot: usize, response: u8) {
+    use abi::contracts::net::packet as pkt;
+    let (len, l3_off) = {
+        let h = &*s.pkt_hold.as_ptr().add(slot);
+        // Replies resolve the sender's MAC from the frame they answer.
+        core::ptr::copy_nonoverlapping(h.frame.as_ptr(), s.rx_frame.as_mut_ptr(), h.len as usize);
+        (h.len as usize, h.l3_off as usize)
+    };
+    let l3 = s.rx_frame.as_ptr().add(l3_off);
+    let l3_len = len - l3_off;
+    let Some(ip_hdr) = ipv4::parse_ipv4(l3, l3_len) else {
+        return;
+    };
+    let proto_data = l3.add(ip_hdr.header_len);
+    let proto_len = ip_hdr.total_len as usize - ip_hdr.header_len;
+    let reply_src = ip_hdr.dst_ip;
+    match response {
+        pkt::reject::TCP_RST if ip_hdr.protocol == ipv4::PROTO_TCP => {
+            let Some(tcp_hdr) = tcp::parse_tcp(proto_data, proto_len) else {
+                return;
+            };
+            // RFC 9293 §3.10.7.1: an RST is never answered with an RST,
+            // and without an ACK to mirror the RST acknowledges the whole
+            // of the offending segment's sequence space.
+            if tcp_hdr.flags & tcp::RST != 0 {
+                return;
+            }
+            let (seq, ack, flags) = if (tcp_hdr.flags & tcp::ACK) != 0 {
+                (tcp_hdr.ack_num, 0u32, tcp::RST)
+            } else {
+                let ack = tcp_hdr
+                    .seq_num
+                    .wrapping_add(tcp::seg_len(tcp_hdr.flags, tcp_hdr.payload_len));
+                (0u32, ack, tcp::RST | tcp::ACK)
+            };
+            let src_mac = eth::src_mac(s.rx_frame.as_ptr());
+            send_tcp_rst_to(
+                s,
+                ip_hdr.src_ip,
+                tcp_hdr.src_port,
+                tcp_hdr.dst_port,
+                seq,
+                ack,
+                flags,
+                reply_src,
+                &src_mac,
+            );
+        }
+        pkt::reject::ICMP_UNREACHABLE => {
+            send_icmp_unreachable(s, &ip_hdr, l3, l3_len, reply_src);
+        }
+        _ => {}
+    }
+}
+
+/// ICMP destination unreachable, port unreachable (RFC 792): the original
+/// IPv4 header plus eight bytes of its payload, back to the sender.
+unsafe fn send_icmp_unreachable(
+    s: &mut IpState,
+    ip_hdr: &ipv4::Ipv4Header,
+    l3: *const u8,
+    l3_len: usize,
+    reply_src: u32,
+) {
+    if !s.mac_valid || s.local_ip == 0 {
+        return;
+    }
+    let quoted = (ip_hdr.header_len + 8).min(l3_len);
+    let icmp_len = icmp::ICMP_HEADER_LEN + quoted;
+    let icmp_start = s
+        .tx_frame
+        .as_mut_ptr()
+        .add(eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN);
+    *icmp_start = 3; // destination unreachable
+    *icmp_start.add(1) = 3; // port unreachable
+    *icmp_start.add(2) = 0;
+    *icmp_start.add(3) = 0;
+    *icmp_start.add(4) = 0;
+    *icmp_start.add(5) = 0;
+    *icmp_start.add(6) = 0;
+    *icmp_start.add(7) = 0;
+    core::ptr::copy_nonoverlapping(l3, icmp_start.add(icmp::ICMP_HEADER_LEN), quoted);
+    let csum = ipv4::checksum(icmp_start, icmp_len);
+    *icmp_start.add(2) = (csum >> 8) as u8;
+    *icmp_start.add(3) = csum as u8;
+
+    let src_mac = eth::src_mac(s.rx_frame.as_ptr());
+    let ip_total = (ipv4::IPV4_HEADER_LEN + icmp_len) as u16;
+    let ip_start = s.tx_frame.as_mut_ptr().add(eth::ETH_HEADER_LEN);
+    s.ip_id = s.ip_id.wrapping_add(1);
+    ipv4::build_ipv4_header(
+        ip_start,
+        ip_total,
+        ipv4::PROTO_ICMP,
+        reply_src,
+        ip_hdr.src_ip,
+        s.ip_id,
+    );
+    eth::build_eth_header(
+        s.tx_frame.as_mut_ptr(),
+        &src_mac,
+        &s.mac_addr,
+        eth::ETHERTYPE_IPV4,
+    );
+    let total = eth::ETH_HEADER_LEN + ip_total as usize;
+    send_frame(s, s.tx_frame.as_ptr(), total);
+}
+
+/// Try to write a held packet's forward record. `true` when it went, and
+/// the slot is released; `false` leaves the slot held with the disposition
+/// pending for the next step.
+unsafe fn forward_held(s: &mut IpState, slot: usize) -> bool {
+    use abi::contracts::net::packet as pkt;
+    let sys = &*s.syscalls;
+    let h = &*s.pkt_hold.as_ptr().add(slot);
+    let len = h.len as usize;
+    let payload_len = 4 + 1 + pkt::DISP_ARGS_LEN + len;
+    let total = NET_FRAME_HDR + payload_len;
+    if total > s.net_scratch.len() {
+        return true; // cannot ever fit: release rather than hold forever
+    }
+    let scratch = s.net_scratch.as_mut_ptr();
+    *scratch = pkt::MSG_PKT_FORWARD;
+    let pl = (payload_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    let id = hold_id(slot, h.gen).to_le_bytes();
+    core::ptr::copy_nonoverlapping(id.as_ptr(), scratch.add(NET_FRAME_HDR), 4);
+    core::ptr::copy_nonoverlapping(
+        h.pending_fwd.as_ptr(),
+        scratch.add(NET_FRAME_HDR + 4),
+        1 + pkt::DISP_ARGS_LEN,
+    );
+    core::ptr::copy_nonoverlapping(
+        h.frame.as_ptr(),
+        scratch.add(NET_FRAME_HDR + 4 + 1 + pkt::DISP_ARGS_LEN),
+        len,
+    );
+    let n = (sys.channel_write)(s.pkt_fwd_chan, scratch, total);
+    if n == total as i32 {
+        s.pkt_stats.forwarded = s.pkt_stats.forwarded.wrapping_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+/// Act on one disposition.
+unsafe fn dispose_held(s: &mut IpState, pkt_id: u32, disp: u8, args: &[u8; 6]) {
+    use abi::contracts::net::packet as pkt;
+    let Some(slot) = hold_lookup(s, pkt_id) else {
+        s.pkt_stats.stale_disposition = s.pkt_stats.stale_disposition.wrapping_add(1);
+        return;
+    };
+    // A slot with a forward pending has been disposed already.
+    if (*s.pkt_hold.as_ptr().add(slot)).pending_fwd[0] != 0xFF {
+        s.pkt_stats.stale_disposition = s.pkt_stats.stale_disposition.wrapping_add(1);
+        return;
+    }
+    match disp {
+        pkt::disposition::LOCAL => {
+            s.pkt_stats.local = s.pkt_stats.local.wrapping_add(1);
+            deliver_held(s, slot);
+            hold_free(s, slot);
+        }
+        pkt::disposition::DROP => {
+            s.pkt_stats.dropped = s.pkt_stats.dropped.wrapping_add(1);
+            hold_free(s, slot);
+        }
+        pkt::disposition::REJECT => {
+            s.pkt_stats.rejected = s.pkt_stats.rejected.wrapping_add(1);
+            reject_held(s, slot, args[1]);
+            hold_free(s, slot);
+        }
+        pkt::disposition::TUNNEL | pkt::disposition::DSR => {
+            if s.pkt_fwd_chan < 0 {
+                s.pkt_stats.fwd_unwired = s.pkt_stats.fwd_unwired.wrapping_add(1);
+                hold_free(s, slot);
+                return;
+            }
+            {
+                let h = &mut *s.pkt_hold.as_mut_ptr().add(slot);
+                h.pending_fwd[0] = disp;
+                h.pending_fwd[1..7].copy_from_slice(args);
+            }
+            if forward_held(s, slot) {
+                hold_free(s, slot);
+            }
+        }
+        _ => {
+            // An unknown disposition is a protocol error; the packet is
+            // released as dropped rather than held to its deadline.
+            s.pkt_stats.dropped = s.pkt_stats.dropped.wrapping_add(1);
+            hold_free(s, slot);
+        }
+    }
+}
+
+/// Hold a second copy of a held packet under a new id.
+unsafe fn clone_held(s: &mut IpState, pkt_id: u32) {
+    use abi::contracts::net::packet as pkt;
+    let sys = &*s.syscalls;
+    let clone_id = match hold_lookup(s, pkt_id) {
+        None => {
+            s.pkt_stats.stale_disposition = s.pkt_stats.stale_disposition.wrapping_add(1);
+            pkt::PKT_ID_NONE
+        }
+        Some(src) => match hold_alloc(s) {
+            None => {
+                s.pkt_stats.clone_refused = s.pkt_stats.clone_refused.wrapping_add(1);
+                pkt::PKT_ID_NONE
+            }
+            Some(dst) => {
+                let gen = s.pkt_gen;
+                let from = s.pkt_hold.as_ptr().add(src);
+                let to = s.pkt_hold.as_mut_ptr().add(dst);
+                core::ptr::copy_nonoverlapping(from, to, 1);
+                (*to).gen = gen;
+                (*to).pending_fwd[0] = 0xFF;
+                s.pkt_gen = if s.pkt_gen == u16::MAX {
+                    1
+                } else {
+                    s.pkt_gen + 1
+                };
+                s.pkt_held += 1;
+                s.pkt_stats.cloned = s.pkt_stats.cloned.wrapping_add(1);
+                hold_id(dst, gen)
+            }
+        },
+    };
+    let mut rec = [0u8; 8];
+    rec[0..4].copy_from_slice(&pkt_id.to_le_bytes());
+    rec[4..8].copy_from_slice(&clone_id.to_le_bytes());
+    let mut scratch = [0u8; NET_FRAME_HDR + 8];
+    let _ = ip_net_write_frame(
+        sys,
+        s.pkt_out_chan,
+        pkt::MSG_PKT_CLONED,
+        rec.as_ptr(),
+        rec.len(),
+        scratch.as_mut_ptr(),
+    );
+}
+
+/// Service the director's port: retry pending forwards, then read
+/// dispositions and clone requests.
+unsafe fn service_packet_in(s: &mut IpState) {
+    use abi::contracts::net::packet as pkt;
+    if s.pkt_decision == PKT_DECISION_OFF || s.pkt_in_chan < 0 {
+        return;
+    }
+    if s.pkt_held > 0 && s.pkt_fwd_chan >= 0 {
+        let mut i = 0;
+        while i < MAX_PACKET_HOLD {
+            let h = &*s.pkt_hold.as_ptr().add(i);
+            if h.in_use != 0 && h.pending_fwd[0] != 0xFF && forward_held(s, i) {
+                hold_free(s, i);
+            }
+            i += 1;
+        }
+    }
+    let sys = &*s.syscalls;
+    let mut budget = MAX_PACKET_HOLD * 2;
+    while budget > 0 {
+        budget -= 1;
+        let poll = (sys.channel_poll)(s.pkt_in_chan, POLL_IN);
+        if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+            break;
+        }
+        let mut buf = [0u8; 16];
+        let (msg, plen) = ip_net_read_frame(sys, s.pkt_in_chan, buf.as_mut_ptr(), buf.len());
+        let plen = plen as usize;
+        match msg {
+            pkt::CMD_PKT_DISPOSE if plen >= 5 => {
+                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let mut args = [0u8; 6];
+                let n = (plen - 5).min(6);
+                args[..n].copy_from_slice(&buf[5..5 + n]);
+                dispose_held(s, id, buf[4], &args);
+            }
+            pkt::CMD_PKT_CLONE if plen >= 4 => {
+                let id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                clone_held(s, id);
+            }
+            0 => break,
+            _ => {}
+        }
+    }
+}
+
+/// Release every hold past its deadline and tell the director.
+unsafe fn expire_held(s: &mut IpState) {
+    use abi::contracts::net::packet as pkt;
+    if s.pkt_held == 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let now = dev_millis(sys) as u32;
+    let mut i = 0;
+    while i < MAX_PACKET_HOLD {
+        let (live, gen, deadline) = {
+            let h = &*s.pkt_hold.as_ptr().add(i);
+            (h.in_use != 0, h.gen, h.deadline_ms)
+        };
+        // At or past the deadline, wrapping: the hold is milliseconds, the
+        // counter is days.
+        if live && now.wrapping_sub(deadline) < 0x8000_0000 {
+            s.pkt_stats.hold_expired = s.pkt_stats.hold_expired.wrapping_add(1);
+            let id = hold_id(i, gen).to_le_bytes();
+            let mut scratch = [0u8; NET_FRAME_HDR + 4];
+            let _ = ip_net_write_frame(
+                sys,
+                s.pkt_out_chan,
+                pkt::MSG_PKT_EXPIRED,
+                id.as_ptr(),
+                4,
+                scratch.as_mut_ptr(),
+            );
+            hold_free(s, i);
+        }
+        i += 1;
     }
 }
 
@@ -2681,7 +3934,7 @@ unsafe fn process_udp_packet(
     ip_hdr: &ipv4::Ipv4Header,
     data: *const u8,
     len: usize,
-    local_slot: u8,
+    local_slot: u16,
 ) {
     let udp_hdr = match udp::parse_udp(data, len) {
         Some(h) => h,
@@ -2729,7 +3982,7 @@ unsafe fn process_udp_packet(
     // secondary configured, so this collapses to a plain wildcard match.
     let dst_owned = slot_is_owned(s, local_slot);
     let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
+    while i < MAX_DG_ENDPOINTS {
         let conn = &*s.tcp_conns.as_ptr().add(i);
         if conn.is_datagram
             && conn.state == tcp::TcpState::Listen
@@ -2757,7 +4010,7 @@ unsafe fn process_tcp_segment(
     ip_hdr: &ipv4::Ipv4Header,
     data: *const u8,
     len: usize,
-    local_slot: u8,
+    local_slot: u16,
 ) {
     let tcp_hdr = match tcp::parse_tcp(data, len) {
         Some(h) => h,
@@ -2775,8 +4028,8 @@ unsafe fn process_tcp_segment(
     // Find matching connection. The local-address slot is the fourth axis:
     // the same 4-tuple reached at two local addresses is two distinct
     // conns.
-    let conn_idx = tcp::find_conn(
-        &s.tcp_conns,
+    let conn_idx = find_conn_indexed(
+        s,
         ip_hdr.src_ip,
         tcp_hdr.src_port,
         tcp_hdr.dst_port,
@@ -2798,8 +4051,7 @@ unsafe fn process_tcp_segment(
                 && s.local_ip != 0
             {
                 let dst_owned = slot_is_owned(s, local_slot);
-                if let Some(li) =
-                    tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port, local_slot, dst_owned)
+                if let Some(li) = find_listener_indexed(s, tcp_hdr.dst_port, local_slot, dst_owned)
                 {
                     // A connection cannot be opened without an ISN secret:
                     // a predictable ISS is an off-path injection surface, so
@@ -2808,12 +4060,11 @@ unsafe fn process_tcp_segment(
                         return;
                     }
                     // Half-open pressure decides whether this SYN costs a
-                    // slot. Recount rather than read the gauge: the gauge is
-                    // refreshed only on a passive open, so a stale one would
-                    // hold cookie mode on after the pressure had drained.
-                    let half_open = count_half_open(s);
-                    s.tcp_half_open = half_open;
-                    if half_open >= tcp::SYN_COOKIE_WATERMARK {
+                    // slot. The gauge is maintained at every enter and
+                    // leave (`conn_index_insert`, `conn_leave_half_open`,
+                    // `conn_reset`), so it is current here.
+                    let half_open = s.tcp_half_open;
+                    if half_open >= u32::from(tcp::SYN_COOKIE_WATERMARK) {
                         let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
                         let local_src = local_ip_for_slot(s, local_slot);
                         if !tcp::cookie_mode_admissible(&tcp_hdr) {
@@ -2845,16 +4096,10 @@ unsafe fn process_tcp_segment(
                         s.tcp_syn_cookie_sent = s.tcp_syn_cookie_sent.wrapping_add(1);
                         return;
                     }
-                    let mut accept_idx: i32 = -1;
-                    let mut fi = 0;
-                    while fi < tcp::MAX_TCP_CONNS {
-                        let c = &*s.tcp_conns.as_ptr().add(fi);
-                        if slot_is_free(c) {
-                            accept_idx = fi as i32;
-                            break;
-                        }
-                        fi += 1;
-                    }
+                    let accept_idx: i32 = match alloc_free_slot(s) {
+                        Some(i) => i as i32,
+                        None => -1,
+                    };
                     if accept_idx < 0 {
                         // No free slot — drop the SYN silently and let
                         // the client retransmit.
@@ -2891,7 +4136,7 @@ unsafe fn process_tcp_segment(
                     conn.rto = tcp::RTO_INITIAL;
                     conn.retransmit_timer = 0;
                     conn.state = tcp::TcpState::SynReceived;
-                    note_half_open(s, ip_hdr.src_ip);
+                    conn_index_insert(s, idx);
                     send_tcp_control(s, idx, tcp::SYN | tcp::ACK, false);
                     return;
                 }
@@ -3160,6 +4405,7 @@ unsafe fn process_tcp_segment(
                     // Handshake complete
                     if tcp_hdr.ack_num == conn.snd_nxt {
                         conn.snd_una = tcp_hdr.ack_num;
+                        conn_leave_half_open(s, conn_idx);
                         conn.state = tcp::TcpState::Established;
                         conn.retransmit_timer = 0;
                         action = ACTION_COMPLETE_ACCEPT;
@@ -3196,7 +4442,7 @@ unsafe fn process_tcp_segment(
             let delivered = net_send_error(s, conn_idx as u16, -111i8, tag);
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
             if delivered {
-                *conn = tcp::TcpConn::new();
+                conn_reset(s, conn_idx);
             } else {
                 // Latch the slot until `step_tcp_timers` retries so
                 // the consumer learns of the refusal — dropping the
@@ -3214,7 +4460,7 @@ unsafe fn process_tcp_segment(
                 if remote_ip != 0 {
                     arp::unpin(&mut s.arp_table, remote_ip);
                 }
-                *conn = tcp::TcpConn::new();
+                conn_reset(s, conn_idx);
             } else {
                 // ARP unpin is deferred until the slot actually frees
                 // so a retry storm doesn't churn the table.
@@ -3319,8 +4565,7 @@ unsafe fn process_tcp_segment(
             // Reset this slot back to Closed. Used when an accepted
             // conn never completes the handshake (RST in SynReceived
             // or 15s timeout).
-            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
-            *conn = tcp::TcpConn::new();
+            conn_reset(s, conn_idx);
         }
         ACTION_RETRANSMIT_SYNACK => {
             send_tcp_control(s, conn_idx, tcp::SYN | tcp::ACK, true);
@@ -3547,7 +4792,38 @@ unsafe fn send_tcp_rst(
         Some(m) => m,
         None => return,
     };
+    send_tcp_rst_to(
+        s,
+        remote_ip,
+        remote_port,
+        local_port,
+        seq,
+        ack,
+        flags,
+        local_src,
+        &dst_mac,
+    );
+}
 
+/// Emit an RST to a known MAC. The decision seam answers the frame it
+/// holds, whose source MAC is in hand, rather than resolving the sender —
+/// a REJECT must not turn into an ARP exchange with the party it refuses.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one wire frame's fields; a struct would be built and unpacked at the single call site"
+)]
+unsafe fn send_tcp_rst_to(
+    s: &mut IpState,
+    remote_ip: u32,
+    remote_port: u16,
+    local_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    local_src: u32,
+    dst_mac: &[u8; 6],
+) {
+    let dst_mac = *dst_mac;
     let tcp_start = s
         .tx_frame
         .as_mut_ptr()
@@ -3611,7 +4887,7 @@ unsafe fn try_cookie_accept(
     s: &mut IpState,
     ip_hdr: &ipv4::Ipv4Header,
     tcp_hdr: &tcp::TcpHeader,
-    local_slot: u8,
+    local_slot: u16,
 ) -> CookieAccept {
     if (tcp_hdr.flags & tcp::ACK) == 0
         || (tcp_hdr.flags & (tcp::SYN | tcp::RST | tcp::FIN)) != 0
@@ -3623,7 +4899,7 @@ unsafe fn try_cookie_accept(
         return CookieAccept::NotACookie;
     }
     let dst_owned = slot_is_owned(s, local_slot);
-    let li = match tcp::find_listener(&s.tcp_conns, tcp_hdr.dst_port, local_slot, dst_owned) {
+    let li = match find_listener_indexed(s, tcp_hdr.dst_port, local_slot, dst_owned) {
         Some(i) => i,
         None => return CookieAccept::NotACookie,
     };
@@ -3642,15 +4918,10 @@ unsafe fn try_cookie_accept(
         return CookieAccept::NotACookie;
     }
 
-    let mut accept_idx: i32 = -1;
-    let mut fi = 0;
-    while fi < tcp::MAX_TCP_CONNS {
-        if slot_is_free(&*s.tcp_conns.as_ptr().add(fi)) {
-            accept_idx = fi as i32;
-            break;
-        }
-        fi += 1;
-    }
+    let accept_idx: i32 = match alloc_free_slot(s) {
+        Some(i) => i as i32,
+        None => -1,
+    };
     if accept_idx < 0 {
         s.tcp_half_open_refused = s.tcp_half_open_refused.wrapping_add(1);
         return CookieAccept::Absorbed;
@@ -3677,6 +4948,7 @@ unsafe fn try_cookie_accept(
     conn.rto = tcp::RTO_INITIAL;
     conn.retransmit_timer = 0;
     conn.state = tcp::TcpState::SynReceived;
+    conn_index_insert(s, idx);
     s.tcp_syn_cookie_ok = s.tcp_syn_cookie_ok.wrapping_add(1);
     CookieAccept::Installed(idx)
 }
@@ -4521,8 +5793,8 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
         v.connect_tag = 0;
         v.retransmit_timer = 0;
     }
-    s.loopback_peer[ci] = si as i16;
-    s.loopback_peer[si] = ci as i16;
+    s.loopback_peer[ci] = si as i32;
+    s.loopback_peer[si] = ci as i32;
 
     // Listener first (it filters MSG_ACCEPTED by `local_port`), then
     // the connector. `net_send_or_queue` holds these across full
@@ -4531,8 +5803,8 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
     if !net_send_accepted(s, si as u16, port) || !net_send_connected(s, ci as u16) {
         s.loopback_peer[ci] = -1;
         s.loopback_peer[si] = -1;
-        *s.tcp_conns.as_mut_ptr().add(ci) = tcp::TcpConn::new();
-        *s.tcp_conns.as_mut_ptr().add(si) = tcp::TcpConn::new();
+        conn_reset(s, ci);
+        conn_reset(s, si);
         let _ = net_send_error(s, 0, -12, requester_tag);
         return;
     }
@@ -4545,12 +5817,12 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
 unsafe fn close_loopback(s: &mut IpState, conn_id: usize) {
     let peer = s.loopback_peer[conn_id];
     s.loopback_peer[conn_id] = -1;
-    *s.tcp_conns.as_mut_ptr().add(conn_id) = tcp::TcpConn::new();
+    conn_reset(s, conn_id);
     let _ = net_send_closed(s, conn_id as u16);
     if peer >= 0 {
         let pi = peer as usize;
         s.loopback_peer[pi] = -1;
-        *s.tcp_conns.as_mut_ptr().add(pi) = tcp::TcpConn::new();
+        conn_reset(s, pi);
         let _ = net_send_closed(s, peer as u16);
     }
 }
@@ -4581,8 +5853,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
         }
         tcp::TcpState::Listen => {
             // Close a listening socket
-            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
-            *conn = tcp::TcpConn::new();
+            conn_reset(s, conn_id);
             net_send_closed(s, conn_id as u16);
             true
         }
@@ -4592,8 +5863,7 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
             if remote_ip != 0 {
                 arp::unpin(&mut s.arp_table, remote_ip);
             }
-            let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
-            *conn = tcp::TcpConn::new();
+            conn_reset(s, conn_id);
             net_send_closed(s, conn_id as u16);
             true
         }
@@ -4682,14 +5952,23 @@ unsafe fn try_send_cmd_payload(
 /// same-subnet gratuitous ARP on first insertion. owner_tag stamps the
 /// slot's owner and is enforced on bind (see `slot_for_owner` /
 /// `find_listener`).
-unsafe fn addr_ctl_add(s: &mut IpState, addr16: *const u8, prefix_len: u8, owner_tag: u16) {
+unsafe fn addr_ctl_add(
+    s: &mut IpState,
+    addr16: *const u8,
+    prefix_len: u8,
+    owner_tag: u16,
+    flags: u8,
+) {
     let ipv4 = u32::from_be_bytes([*addr16, *addr16.add(1), *addr16.add(2), *addr16.add(3)]);
     if ipv4 == 0 {
         return;
     }
+    let mut a16 = [0u8; 16];
+    core::ptr::copy_nonoverlapping(addr16, a16.as_mut_ptr(), 16);
     if let Some(slot) = local_slot_for_dst(s, ipv4) {
         // Already present. Slot 0 (primary) is off-limits to addr_ctl; a
-        // secondary just refreshes owner/prefix without re-announcing.
+        // secondary just refreshes owner/prefix without re-announcing and
+        // keeps its token, generation and emission state.
         if slot != 0 {
             let a = &mut s.local_addrs[slot as usize];
             a.prefix_len = prefix_len;
@@ -4700,20 +5979,38 @@ unsafe fn addr_ctl_add(s: &mut IpState, addr16: *const u8, prefix_len: u8, owner
     let mut i = 1;
     while i < MAX_LOCAL_ADDRS {
         if !s.local_addrs[i].is_active() {
+            // A token first: an install with no token would be one nobody
+            // could ever fence, so it is refused rather than made.
+            let Some(token) = mint_token(s) else {
+                log_info(s, b"[ip] addr_ctl add: no entropy for a token");
+                addr_evt_refused(s, &a16, IP_ADDR_ADD, netid::refusal::NO_ENTROPY);
+                return;
+            };
+            s.addr_generation = s.addr_generation.wrapping_add(1);
+            let generation = s.addr_generation;
+            let armed = flags & netid::install::DISARMED == 0;
             let a = &mut s.local_addrs[i];
-            let mut k = 0;
-            while k < 16 {
-                a.addr[k] = *addr16.add(k);
-                k += 1;
-            }
+            a.addr = a16;
+            a.token = token;
+            a.generation = generation;
             a.prefix_len = prefix_len;
             a.owner_tag = owner_tag;
-            a.flags = 0;
+            a.flags = if armed { ADDR_FLAG_ARMED } else { 0 };
+            let _ = index::insert(&mut s.addr_index, index::mix32(ipv4), i);
             log_info(s, b"[ip] addr_ctl add");
+            let mut p = [0u8; 36];
+            p[..16].copy_from_slice(&a16);
+            p[16..32].copy_from_slice(&token);
+            p[32..36].copy_from_slice(&generation.to_le_bytes());
+            addr_evt(s, netid::MSG_ADDR_ADDED, &p);
             // GARP only teaches the local segment, so announce same-subnet
-            // additions only (§3.3). Off-segment addresses rely on upstream
-            // routing.
-            if s.netmask != 0 && s.local_ip != 0 && (ipv4 & s.netmask) == (s.local_ip & s.netmask) {
+            // additions only (§3.3), and only an armed one — a disarmed
+            // install says nothing until it is armed.
+            if armed
+                && s.netmask != 0
+                && s.local_ip != 0
+                && (ipv4 & s.netmask) == (s.local_ip & s.netmask)
+            {
                 send_gratuitous_arp(s, ipv4);
             }
             return;
@@ -4721,6 +6018,7 @@ unsafe fn addr_ctl_add(s: &mut IpState, addr16: *const u8, prefix_len: u8, owner
         i += 1;
     }
     log_info(s, b"[ip] addr_ctl add: table full");
+    addr_evt_refused(s, &a16, IP_ADDR_ADD, netid::refusal::TABLE_FULL);
 }
 
 /// Remove a secondary local address (`IP_ADDR_DEL`). The slot ages out
@@ -4733,6 +6031,7 @@ unsafe fn addr_ctl_del(s: &mut IpState, ipv4: u32) {
     }
     match local_slot_for_dst(s, ipv4) {
         Some(slot) if slot != 0 => {
+            let _ = index::remove(&mut s.addr_index, index::mix32(ipv4), slot as usize);
             s.local_addrs[slot as usize] = LocalAddr::empty();
             log_info(s, b"[ip] addr_ctl del");
         }
@@ -4760,14 +6059,31 @@ unsafe fn service_addr_ctl(s: &mut IpState) {
         }
         let plen = payload_len as usize;
         match msg_type {
-            // [addr:16][prefix_len:1][owner_tag:2 LE]
+            // [addr:16][prefix_len:1][owner_tag:2 LE][flags:1]?
             IP_ADDR_ADD if plen >= netid::ADDR_ADD_PAYLOAD_LEN => {
                 let prefix_len = *buf.as_ptr().add(netid::ADD_PREFIX_LEN_OFF);
                 let owner_tag = u16::from_le_bytes([
                     *buf.as_ptr().add(netid::ADD_OWNER_TAG_OFF),
                     *buf.as_ptr().add(netid::ADD_OWNER_TAG_OFF + 1),
                 ]);
-                addr_ctl_add(s, buf.as_ptr(), prefix_len, owner_tag);
+                let flags = if plen > netid::ADD_FLAGS_OFF {
+                    *buf.as_ptr().add(netid::ADD_FLAGS_OFF)
+                } else {
+                    0
+                };
+                addr_ctl_add(s, buf.as_ptr(), prefix_len, owner_tag, flags);
+            }
+            // [addr:16][token:16]
+            IP_ADDR_ARM | IP_ADDR_FENCE if plen >= netid::ADDR_TOKEN_PAYLOAD_LEN => {
+                let mut a16 = [0u8; 16];
+                let mut token = [0u8; 16];
+                a16.copy_from_slice(&buf[..16]);
+                token.copy_from_slice(&buf[netid::TOKEN_OFF..netid::TOKEN_OFF + 16]);
+                if msg_type == IP_ADDR_ARM {
+                    addr_ctl_arm(s, &a16, &token);
+                } else {
+                    addr_ctl_fence(s, &a16, &token);
+                }
             }
             // [addr:16]
             IP_ADDR_DEL if plen >= netid::ADDR_DEL_PAYLOAD_LEN => {
@@ -4908,20 +6224,24 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     // listener every cycle and exhaust MAX_TCP_CONNS. The slot
                     // axis is part of the key so the same port bound at two
                     // owned addresses stays two distinct listeners.
+                    // The listener list is the whole search space, and
+                    // datagram endpoints are never on it, so a UDP slot on
+                    // the same port cannot satisfy a TCP bind.
                     let mut existing: Option<usize> = None;
                     let mut li = 0;
-                    while li < tcp::MAX_TCP_CONNS {
-                        let conn = &*s.tcp_conns.as_ptr().add(li);
-                        // `tcp::find_listener` excludes datagram
-                        // slots, so a UDP slot on the same port must
-                        // not satisfy a TCP bind here either.
-                        if conn.state == tcp::TcpState::Listen
-                            && !conn.is_datagram
-                            && conn.local_port == port
-                            && conn.local_slot == target_slot
-                        {
-                            existing = Some(li);
-                            break;
+                    while li < MAX_LISTENERS {
+                        let e = s.listeners[li];
+                        if e != 0 {
+                            let idx = (e - 1) as usize;
+                            let conn = &*s.tcp_conns.as_ptr().add(idx);
+                            if conn.state == tcp::TcpState::Listen
+                                && !conn.is_datagram
+                                && conn.local_port == port
+                                && conn.local_slot == target_slot
+                            {
+                                existing = Some(idx);
+                                break;
+                            }
                         }
                         li += 1;
                     }
@@ -4929,26 +6249,19 @@ unsafe fn service_net_channels(s: &mut IpState) {
                         log_info(s, b"[ip] net bind: existing listener");
                         net_send_bound(s, idx as u16, port);
                     } else {
-                        let mut found = false;
-                        let mut ci = 0;
-                        while ci < tcp::MAX_TCP_CONNS {
+                        let found = alloc_free_slot(s);
+                        if let Some(ci) = found {
                             let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
-                            if slot_is_free(conn) {
-                                conn.state = tcp::TcpState::Listen;
-                                conn.local_port = port;
-                                conn.remote_ip = 0;
-                                conn.remote_port = 0;
-                                conn.retransmit_timer = 0;
-                                // Wildcard (host) or the owner's own slot.
-                                // Reset explicitly — this path reuses a slot
-                                // without a full `TcpConn::new()`.
-                                conn.local_slot = target_slot;
-                                found = true;
-                                break;
-                            }
-                            ci += 1;
-                        }
-                        if found {
+                            conn.state = tcp::TcpState::Listen;
+                            conn.local_port = port;
+                            conn.remote_ip = 0;
+                            conn.remote_port = 0;
+                            conn.retransmit_timer = 0;
+                            // Wildcard (host) or the owner's own slot.
+                            // Reset explicitly — this path reuses a slot
+                            // without a full `TcpConn::new()`.
+                            conn.local_slot = target_slot;
+                            conn_index_insert(s, ci);
                             log_info(s, b"[ip] net bind");
                             net_send_bound(s, ci as u16, port);
                         } else {
@@ -4989,16 +6302,10 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             continue;
                         }
 
-                        let mut conn_id: i32 = -1;
-                        let mut ci = 0;
-                        while ci < tcp::MAX_TCP_CONNS {
-                            let conn = &*s.tcp_conns.as_ptr().add(ci);
-                            if slot_is_free(conn) {
-                                conn_id = ci as i32;
-                                break;
-                            }
-                            ci += 1;
-                        }
+                        let conn_id: i32 = match alloc_free_slot(s) {
+                            Some(i) => i as i32,
+                            None => -1,
+                        };
 
                         if conn_id < 0 {
                             net_send_error(s, 0, -12, requester_tag); // ENOMEM
@@ -5027,6 +6334,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             conn.snd_una = iss;
                             conn.rcv_wnd = 512;
                             conn.retransmit_timer = 0;
+                            conn_index_insert(s, ci);
 
                             send_tcp_control(s, ci, tcp::SYN, false);
                         } else {
@@ -5183,6 +6491,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             // secondaries (see `process_udp_packet`).
                             conn.local_slot = target_slot;
                             conn.owner_tag = owner_tag;
+                            conn_index_insert(s, ci);
                             log_info(s, b"[ip] dg bind");
                             dg_send_bound(s, ci as u8, port);
                         }
@@ -5204,7 +6513,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 if plen >= dest_off + DG_V4_DEST_LEN {
                     let ep_id = *bp as usize;
                     let af = *bp.add(dest_off);
-                    if af == DG_AF_INET && ep_id < tcp::MAX_TCP_CONNS {
+                    if af == DG_AF_INET && ep_id < MAX_DG_ENDPOINTS {
                         let conn = &*s.tcp_conns.as_ptr().add(ep_id);
                         if !(conn.is_datagram && conn.state == tcp::TcpState::Listen) {
                             // The slot exists but holds no live datagram
@@ -5244,14 +6553,13 @@ unsafe fn service_net_channels(s: &mut IpState) {
                     let bp = buf.as_ptr();
                     let ep_id = *bp as usize;
                     let (claimed_tag, _) = dg_decode_owner_tag(bp, plen);
-                    let live = ep_id < tcp::MAX_TCP_CONNS && {
+                    let live = ep_id < MAX_DG_ENDPOINTS && {
                         let conn = &*s.tcp_conns.as_ptr().add(ep_id);
                         conn.is_datagram && conn.state == tcp::TcpState::Listen
                     };
                     let owned = live && (*s.tcp_conns.as_ptr().add(ep_id)).owner_tag == claimed_tag;
                     if owned {
-                        let conn = &mut *s.tcp_conns.as_mut_ptr().add(ep_id);
-                        *conn = tcp::TcpConn::new();
+                        conn_reset(s, ep_id);
                         dg_send_closed(s, ep_id as u8);
                     } else if live {
                         s.drops.dg_ep_perm = s.drops.dg_ep_perm.wrapping_add(1);
@@ -5293,28 +6601,63 @@ fn is_syn_retransmit_tick(timer: u16) -> bool {
     matches!(timer, 10 | 30 | 70 | 150)
 }
 
+/// Advance every connection's TCP timers once per `TCP_SWEEP_WINDOW_MS`
+/// window, in slices spread across the window in proportion to elapsed
+/// time — so a full table costs one pass per window whatever the tick,
+/// and no single step walks more of it than its share of the window.
+/// After a stall the pass catches up in one step, which is the bounded
+/// worst case: one pass.
 unsafe fn step_tcp_timers(s: &mut IpState) {
-    // Refill the challenge-ACK buckets once per ≈1 s window. Refilling to a
-    // fixed ceiling rather than accumulating tokens keeps the burst bound and
-    // the long-run rate the same number, which is what makes the defence
-    // non-amplifying under a sustained flood.
-    s.chal_refill_ticks = s.chal_refill_ticks.saturating_add(1);
-    if s.chal_refill_ticks >= tcp::CHALLENGE_ACK_REFILL_TICKS {
-        s.chal_refill_ticks = 0;
-        s.chal_ack_budget = tcp::CHALLENGE_ACK_GLOBAL_BUDGET;
-        let mut ci = 0;
-        while ci < tcp::MAX_TCP_CONNS {
-            (*s.tcp_conns.as_mut_ptr().add(ci)).chal_budget = tcp::CHALLENGE_ACK_PEER_BUDGET;
-            ci += 1;
+    let now = dev_millis(&*s.syscalls) as u32;
+    let elapsed = now.wrapping_sub(s.sweep_window_ms);
+    let n = tcp::MAX_TCP_CONNS;
+    let target = if elapsed >= TCP_SWEEP_WINDOW_MS {
+        n
+    } else {
+        ((n as u64 * u64::from(elapsed)) / u64::from(TCP_SWEEP_WINDOW_MS)) as usize
+    };
+    let start = s.sweep_cursor as usize;
+    if target <= start {
+        return;
+    }
+    if start == 0 {
+        // Once per window: the challenge-ACK refill clock. Refilling to a
+        // fixed ceiling rather than accumulating tokens keeps the burst
+        // bound and the long-run rate the same number, which is what
+        // makes the defence non-amplifying under a sustained flood. The
+        // per-connection buckets refill as the sweep reaches them.
+        s.chal_refill_ticks = s.chal_refill_ticks.saturating_add(1);
+        if s.chal_refill_ticks >= tcp::CHALLENGE_ACK_REFILL_TICKS {
+            s.chal_refill_ticks = 0;
+            s.chal_ack_budget = tcp::CHALLENGE_ACK_GLOBAL_BUDGET;
+            s.chal_epoch = s.chal_epoch.wrapping_add(1);
         }
     }
+    sweep_range(s, start, target);
+    if target >= n {
+        s.sweep_cursor = 0;
+        // The next window starts where this one should have ended; after
+        // a stall longer than a window it starts now, so a pass is never
+        // owed twice for one stretch of missed time.
+        let next = s.sweep_window_ms.wrapping_add(TCP_SWEEP_WINDOW_MS);
+        s.sweep_window_ms = if now.wrapping_sub(next) < TCP_SWEEP_WINDOW_MS {
+            next
+        } else {
+            now
+        };
+    } else {
+        s.sweep_cursor = target as u32;
+    }
+}
 
+/// One slice of the timer sweep: connections `start..end`.
+unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
     // Reopen a receive window that consumer backpressure closed. Without
     // this the admissibility gate — which refuses every data segment while
     // `rcv_wnd == 0` — would have no path back once the consumer drained.
     {
-        let mut ci = 0;
-        while ci < tcp::MAX_TCP_CONNS {
+        let mut ci = start;
+        while ci < end {
             let c = &*s.tcp_conns.as_ptr().add(ci);
             if c.rcv_wnd == 0
                 && matches!(
@@ -5335,8 +6678,8 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
     // is dropped without disturbing TCP state — the slot frees
     // naturally when the local side closes.
     {
-        let mut i = 0;
-        while i < tcp::MAX_TCP_CONNS {
+        let mut i = start;
+        while i < end {
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
             let kind = conn.pending_close_notify;
             let tag = conn.connect_tag;
@@ -5355,7 +6698,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                         if remote_ip != 0 {
                             arp::unpin(&mut s.arp_table, remote_ip);
                         }
-                        *conn = tcp::TcpConn::new();
+                        conn_reset(s, i);
                     } else {
                         conn.pending_close_notify = NOTIFY_NONE;
                     }
@@ -5365,9 +6708,15 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
         }
     }
 
-    let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
+    let mut i = start;
+    while i < end {
         let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
+        // Challenge-ACK refill lands on a connection when the sweep
+        // reaches it, once per refill epoch.
+        if conn.chal_epoch != s.chal_epoch {
+            conn.chal_epoch = s.chal_epoch;
+            conn.chal_budget = tcp::CHALLENGE_ACK_PEER_BUDGET;
+        }
         match conn.state {
             tcp::TcpState::SynSent => {
                 conn.retransmit_timer += 1;
@@ -5391,7 +6740,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                     // Free on delivery; else latch (Closed + retry) so the
                     // requester always gets exactly one tagged terminal result.
                     if net_send_error(s, i as u16, -110, tag) {
-                        *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                        conn_reset(s, i);
                     } else {
                         let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
                         conn.state = tcp::TcpState::Closed;
@@ -5412,7 +6761,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                 }
                 // Timeout after ~15 seconds — free the slot.
                 if conn.retransmit_timer >= 300 {
-                    *conn = tcp::TcpConn::new();
+                    conn_reset(s, i);
                 }
             }
             tcp::TcpState::CloseWait => {
@@ -5444,7 +6793,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                         if remote_ip != 0 {
                             arp::unpin(&mut s.arp_table, remote_ip);
                         }
-                        *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                        conn_reset(s, i);
                     }
                 }
             }
@@ -5460,7 +6809,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
                         if remote_ip != 0 {
                             arp::unpin(&mut s.arp_table, remote_ip);
                         }
-                        *s.tcp_conns.as_mut_ptr().add(i) = tcp::TcpConn::new();
+                        conn_reset(s, i);
                     }
                 }
             }
@@ -5584,11 +6933,115 @@ pub mod test_helpers {
         (*(state as *const IpState)).drops
     }
 
+    /// The first slot a TCP connection is allocated from: TCP prefers the
+    /// slots beyond the datagram window (`alloc_free_slot`), so on a profile
+    /// whose table is larger than the window the first connect lands here.
+    pub const TCP_SLOT_BASE: usize = if super::MAX_DG_ENDPOINTS < tcp::MAX_TCP_CONNS {
+        super::MAX_DG_ENDPOINTS
+    } else {
+        0
+    };
+
+    /// Probes a destination-address demux costs: `(slot, probes)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn addr_lookup_probes(state: *const u8, dst: u32) -> (Option<usize>, usize) {
+        let s = &*(state as *const IpState);
+        super::index::lookup_counted(&s.addr_index, super::index::mix32(dst), |i| {
+            i != 0 && i < super::MAX_LOCAL_ADDRS && {
+                let a = &s.local_addrs[i];
+                a.is_active() && a.ipv4() == dst
+            }
+        })
+    }
+
+    /// Probes a connection lookup costs for `(remote_ip, remote_port,
+    /// local_port, local_slot)`: `(slot, probes)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn conn_lookup_probes(
+        state: *const u8,
+        remote_ip: u32,
+        remote_port: u16,
+        local_port: u16,
+        local_slot: u16,
+    ) -> (Option<usize>, usize) {
+        let s = &*(state as *const IpState);
+        let key = super::index::ConnKey {
+            remote_ip,
+            remote_port,
+            local_port,
+            local_slot,
+        };
+        let conns = s.tcp_conns.as_ptr();
+        super::index::lookup_counted(&s.conn_index, key.hash(), |slot| {
+            let c = &*conns.add(slot);
+            c.is_active()
+                && c.remote_ip == remote_ip
+                && c.remote_port == remote_port
+                && c.local_port == local_port
+                && c.local_slot == local_slot
+        })
+    }
+
+    /// Where the timer sweep stands in its window: `(cursor, table)`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn sweep_position(state: *const u8) -> (usize, usize) {
+        let s = &*(state as *const IpState);
+        (s.sweep_cursor as usize, tcp::MAX_TCP_CONNS)
+    }
+
+    /// Half-open sources the table could not track.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn half_open_untracked(state: *const u8) -> u32 {
+        (*(state as *const IpState)).ho_src_untracked
+    }
+
+    /// Frames refused at the emission gate.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn tx_fenced(state: *const u8) -> u32 {
+        (*(state as *const IpState)).tx_fenced
+    }
+
+    /// Whether a local address is armed (`None` when not ours).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn addr_armed(state: *const u8, ip: u32) -> Option<bool> {
+        let s = &*(state as *const IpState);
+        super::local_slot_for_dst(s, ip)
+            .map(|slot| s.local_addrs[slot as usize].flags & super::ADDR_FLAG_ARMED != 0)
+    }
+
+    /// Decision-seam counters.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn pkt_stats(state: *const u8) -> super::PktSeamStats {
+        (*(state as *const IpState)).pkt_stats
+    }
+
+    /// Packets currently held at the decision seam.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn pkt_held(state: *const u8) -> usize {
+        (*(state as *const IpState)).pkt_held as usize
+    }
+
     /// Half-open gauges: `(current, max, per_source_max, refused)`.
     ///
     /// # Safety
     /// `state` must point to an initialised `IpState`.
-    pub unsafe fn half_open(state: *const u8) -> (u16, u16, u16, u32) {
+    pub unsafe fn half_open(state: *const u8) -> (u32, u32, u32, u32) {
         let s = &*(state as *const IpState);
         (
             s.tcp_half_open,
@@ -5652,7 +7105,7 @@ pub mod test_helpers {
         pub dup_ack_count: u8,
         pub chal_budget: u8,
         pub is_datagram: bool,
-        pub local_slot: u8,
+        pub local_slot: u16,
         pub owner_tag: u16,
     }
 
@@ -5842,7 +7295,7 @@ pub mod test_helpers {
     ///
     /// # Safety
     /// `state` must point to an initialised `IpState`.
-    pub unsafe fn local_slot_for_dst(state: *const u8, dst: u32) -> Option<u8> {
+    pub unsafe fn local_slot_for_dst(state: *const u8, dst: u32) -> Option<u16> {
         super::local_slot_for_dst(&*(state as *const IpState), dst)
     }
 
@@ -5850,7 +7303,7 @@ pub mod test_helpers {
     ///
     /// # Safety
     /// `state` must point to an initialised `IpState`.
-    pub unsafe fn conn_local_slot(state: *const u8, idx: usize) -> u8 {
+    pub unsafe fn conn_local_slot(state: *const u8, idx: usize) -> u16 {
         (*(state as *const IpState)).tcp_conns[idx].local_slot
     }
 

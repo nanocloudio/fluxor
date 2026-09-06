@@ -2794,8 +2794,29 @@ unsafe fn peer_cert_reason(s: &TlsState, is_server: bool, hs_body: &[u8]) -> u32
     } else {
         EKU_SERVER_AUTH
     };
-    let now = div_u64(dev_unix_millis(&*s.syscalls), 1000);
+    let now = trusted_now_secs(&*s.syscalls);
     verify_chain(hs_body, &chain_policy(s, require_eku, now))
+}
+
+/// The calendar time a certificate lifetime may be checked against, or 0
+/// when there is none worth checking against.
+///
+/// Read from `TRUSTED_UNIX`, not `UNIX_MILLIS`: the bare reading cannot say
+/// whether anyone synchronised the clock, and a certificate accepted against
+/// a clock nobody vouches for is accepted against a guess. Only a reading
+/// the platform marks `TRUSTED` is returned; everything else — no clock, a
+/// free-running counter, an RTC never checked against a source — is 0,
+/// which `check_validity` treats as `CERT_ERR_NO_CLOCK` under
+/// `clock_policy = require`. Under `unchecked` the value is not consulted.
+unsafe fn trusted_now_secs(sys: &SyscallTable) -> u64 {
+    use abi::kernel_abi::trusted_time as tt;
+    let rec = dev_trusted_unix(sys);
+    if rec[tt::OFF_FLAGS] & tt::flags::TRUSTED == 0 {
+        return 0;
+    }
+    let mut secs = [0u8; 8];
+    secs.copy_from_slice(&rec[tt::OFF_UNIX_SECONDS..tt::OFF_UNIX_SECONDS + 8]);
+    u64::from_le_bytes(secs)
 }
 
 /// Bind the accepted leaf's subject public key to `driver`.

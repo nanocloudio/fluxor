@@ -1,0 +1,39 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+# Answers each decision record in the step it arrives; no tick-based timing.
+timer_class = "agnostic"
+
+# Fixture director for the ip module's pre-transport decision seam
+# (`modules/sdk/contracts/net/packet.rs` §decision seam). Disposes every
+# packet from a port table — LOCAL by default, DROP / REJECT / TUNNEL / DSR
+# for the destination ports its parameters name, and never for `hold_port`
+# so the hold deadline is exercised — and drains whatever ip forwards to
+# it. It carries no policy worth the name: it exists so the seam can be
+# proven on a rig against real traffic, and so the harness has one
+# director to drive.
+#
+#   ip.packet_out  → decide_in
+#   dispose_out    → ip.packet_in
+#   ip.packet_fwd  → fwd_in
+
+[[ports]]
+name = "decide_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+
+[[ports]]
+name = "fwd_in"
+direction = "input"
+index = 1
+content_type = "NetProto"
+
+[[ports]]
+name = "dispose_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "seam fixture; the packets it disposes are counted by ip's seam gauges (held/expired/decided per disposition), which are the observable"

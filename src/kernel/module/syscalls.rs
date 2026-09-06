@@ -1334,6 +1334,25 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 }
             };
 
+            // Which clock this reading belongs to. The ledger compares it
+            // against the previous reading through the monotonic counter
+            // read at the same instant, so a step or a resynchronisation
+            // moves the epoch and a backward step raises the flag — the
+            // two things a consumer holding a cached decision needs and
+            // that the reading alone can never carry.
+            let synced = sync.map(|(s, _)| s);
+            let obs = crate::kernel::sys::wall_clock::observe(
+                unix_ms,
+                monotonic_us,
+                synced,
+                uncertainty_ms,
+            );
+            let flags = if obs.rollback_suspect {
+                flags | tt::flags::ROLLBACK_SUSPECT
+            } else {
+                flags
+            };
+
             let mut rec = [0u8; tt::LEN];
             rec[tt::OFF_UNIX_SECONDS..tt::OFF_UNIX_SECONDS + 8]
                 .copy_from_slice(&(unix_ms / 1000).to_le_bytes());
@@ -1349,13 +1368,8 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 .copy_from_slice(&uncertainty_ms.to_le_bytes());
             rec[tt::OFF_MONOTONIC_US..tt::OFF_MONOTONIC_US + 8]
                 .copy_from_slice(&monotonic_us.to_le_bytes());
-            // No epoch tracking yet: a source that never claims to be
-            // synchronised cannot claim to have resynchronised either.
-            // Consumers must treat a constant epoch as "no rollback
-            // information", which combined with `TRUSTED` being unset means
-            // they refuse rather than trust it.
             rec[tt::OFF_SOURCE_EPOCH..tt::OFF_SOURCE_EPOCH + 8]
-                .copy_from_slice(&0u64.to_le_bytes());
+                .copy_from_slice(&obs.epoch.to_le_bytes());
             rec[tt::OFF_SOURCE_CLASS] = source_class;
             rec[tt::OFF_FLAGS] = flags;
             core::ptr::copy_nonoverlapping(rec.as_ptr(), arg, tt::LEN);
@@ -1781,13 +1795,26 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
     use crate::abi::internal::monitor::ISR_METRICS;
     use crate::abi::kernel_abi::event::BIND_IRQ;
     use crate::abi::kernel_abi::{
-        ARENA_GET, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE, MODULE_FLOW_BUDGET,
-        MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, RANDOM_FILL, REPORT_LATENCY,
-        REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE,
+        ARENA_GET, BOOT_INCARNATION, GET_HW_ETHERNET_MAC, HANDLE_POLL, LOG_WRITE,
+        MODULE_FLOW_BUDGET, MODULE_INSTANCE_PARAMS, NET_IDENT_PROVIDER, OWNER_TAG, RANDOM_FILL,
+        REPORT_LATENCY, REPORT_STEP_EFFECT, SELF_INDEX, SERIAL_WRITE,
     };
     use crate::kernel::exec::scheduler;
     match opcode {
         SELF_INDEX => scheduler::current_module_index() as i32,
+        BOOT_INCARNATION => {
+            if arg.is_null() || arg_len < 16 {
+                return E_INVAL;
+            }
+            let v = crate::kernel::sys::incarnation::get();
+            core::ptr::copy_nonoverlapping(v.as_ptr(), arg, 16);
+            if v == [0u8; 16] {
+                // The entropy source has not answered: no incarnation yet,
+                // and a consumer must not mint against zeros.
+                return errno::EAGAIN;
+            }
+            0
+        }
         // The calling module's owner slot (`owner_tag`). `apply_add` stamps
         // every module of a `net=own` workload with its owner post-alloc
         // (`set_module_owner`), so a bind-emitting module reads its owner here

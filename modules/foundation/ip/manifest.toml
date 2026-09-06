@@ -3,6 +3,13 @@ version = "1.0.0"
 timer_class = "wall_clock"
 hardware_targets = ["rp2350", "bcm2712"]
 
+# The emission fence (`ADDR_FENCE` on `addr_ctl`): a provable cutoff for a
+# local address, reported as the frame counter at the ring hand-off.
+capabilities = ["fence.enforceable"]
+
+[capability_facts."fence.enforceable"]
+cutoff = "ring_handoff"
+
 [[ports]]
 name = "frames_rx"
 direction = "input"
@@ -43,6 +50,51 @@ direction = "input"
 index = 2
 content_type = "NetProto"
 buffer_size = { default = 512, bcm2712 = 512 }
+
+# Emission events back to the address-control writer (out[5]): the token
+# minted at each install (`MSG_ADDR_ADDED`), arm and fence outcomes, and
+# refusals. An address installs armed unless the writer asks otherwise;
+# `ADDR_ARM` / `ADDR_FENCE` present the token. A fence closes the emission
+# gate in `send_frame` — no frame sourced from the address is handed to the
+# driver ring after `MSG_ADDR_FENCED`, which carries the frame counter at
+# the cutoff. That boundary is the ring hand-off, and the capability fact
+# says so: a driver that can prove the wire declares `cutoff = "wire"`.
+[[ports]]
+name = "addr_evt"
+direction = "output"
+index = 5
+content_type = "NetProto"
+buffer_size = { default = 512, bcm2712 = 1024 }
+
+# Pre-transport decision seam (in[3] / out[3] / out[4]), on only when
+# `packet_decision = pre_transport`: every validated inbound IPv4 packet is
+# described to a director on `packet_out` and held until the director's
+# disposition arrives on `packet_in`; a TUNNEL or DSR disposition hands the
+# whole frame over on `packet_fwd`. Wire contract:
+# `modules/sdk/contracts/net/packet.rs` (`MSG_PKT_DECIDE`,
+# `CMD_PKT_DISPOSE`, `MSG_PKT_FORWARD`). Unwired means the seam does not
+# exist at runtime; wiring it with the parameter off is refused at
+# construct, as is the parameter on without the ports.
+[[ports]]
+name = "packet_in"
+direction = "input"
+index = 3
+content_type = "NetProto"
+buffer_size = { default = 512, bcm2712 = 2048 }
+
+[[ports]]
+name = "packet_out"
+direction = "output"
+index = 3
+content_type = "NetProto"
+buffer_size = { default = 512, bcm2712 = 2048 }
+
+[[ports]]
+name = "packet_fwd"
+direction = "output"
+index = 4
+content_type = "NetProto"
+buffer_size = { default = 4096, bcm2712 = 32768 }
 
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits

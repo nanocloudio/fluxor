@@ -64,6 +64,12 @@ A module's `manifest.toml` separates four concerns into four fields:
 - `[requires]` — target CPU features. A module that declares
   `requires.fpu = true` is rejected at build time from a target without
   hardware floating point.
+- `[[requires_when]]` — a target-provided capability (see
+  [Target-Provided Capabilities](#target-provided-capabilities)) the module
+  needs only under one of its own parameter values: `param`, `equals`,
+  `capability`. The composer resolves the parameter from the graph (or the
+  schema default) and refuses placement on a target that cannot provide the
+  capability when the value matches.
 
 Examples from shipped manifests:
 
@@ -263,12 +269,18 @@ model these support):
 | `transport.anchor.mux` | Stable multiplexed-session anchor |
 | `session.worker` | Movable session / application worker |
 | `session.directory` | Placement and continuity metadata service |
-| `session.resume` | Resumable session state support |
+| `session.resume` | Resumable session state support. Facts `scope` (`local`: the ticket names state only the minting host holds; `fleet`: the ticket is the state, sealed under a vault key any admitted host with that generation opens) and `early_data` (`off`, or `local_single_use` against the minting host's single-use record). quic declares `fleet` / `local_single_use` |
 | `session.handoff` | Opaque export / import handoff support |
 | `session.reservation` | Durable, quorum-committed reservation of nonce / sequence blocks, so a taken-over sender never reuses AEAD nonces |
 | `security.key_wrap` | Session-key custody wrapped under a KEK the storage layer cannot read |
-| `fence.enforceable` | Out-of-band emission fence: node power cutoff or fabric egress cutoff that guarantees a deposed anchor stops transmitting |
+| `fence.enforceable` | Emission fence for a local address: after the fence answers, nothing sourced from the address is handed onward, and ARP for it is not answered. Fact `cutoff`: `ring_handoff` (the ip module's boundary — frames already in the driver ring may still leave) or `wire` (a driver that drains and reports its completed transmit index). Provided by `ip` over the `net::identity` `ADDR_FENCE` verb with a per-install token minted from the CSPRNG and the boot incarnation |
 | `durable.rpo_zero` | Synchronous quorum-durable-before-acknowledge write path for security-relevant session state |
+
+Target-provided:
+
+| Capability | Meaning |
+|------------|---------|
+| `time.wall` | Calendar time (seconds since the Unix epoch) the platform can vouch for, as `timer::TRUSTED_UNIX` reports it. Fact `source`: `rtc`, `network_sync` or `signed_authority` — the strongest class the HAL reports `TRUSTED` for |
 
 Replication and streaming:
 
@@ -310,6 +322,41 @@ graphs wire a surface's ports explicitly, and substrate stacks are injected
 by platform stack expansion. Continuity roles do not consume bits in the
 `required_caps` device-class mask; they live in the manifest vocabulary
 alongside `audio.sample`.
+
+### Target-Provided Capabilities
+
+Source: `contracts/src/vocabulary.rs` (`TARGET_CAPABILITIES`),
+`tools/src/target_facts.rs`.
+
+A few capabilities are properties of the platform rather than of any
+module: no manifest declares them, no graph wires them, and the kernel's
+HAL is what answers them at runtime. The composer answers them per target
+from the target-facts table, which also carries the vault's suite set and
+custody-tier ceiling for the same reason — the vault is a kernel contract
+class, per target, not a module.
+
+Today the one such capability is `time.wall`. At runtime the kernel's
+`timer::TRUSTED_UNIX` record says whether a reading is `TRUSTED` (backed by
+synchronisation evidence), which epoch it belongs to, and whether the clock
+is suspected of having rolled back; a consumer making a validity decision
+reads that record and refuses on an untrusted reading. At compose time the
+same fact is admissible: a module that fails closed without a trusted clock
+under some configuration binds that configuration with `[[requires_when]]`,
+so a graph that would only ever refuse handshakes is refused before it is
+built. The `tls` module does this for `clock_policy = require`:
+
+```toml
+[[requires_when]]
+param      = "clock_policy"
+equals     = "require"
+capability = "time.wall"
+```
+
+Which targets provide `time.wall` follows the HAL: a hosted Linux runtime
+queries `adjtimex(2)` and reports `network_sync`; the bare-metal and
+browser platforms have no synchronisation evidence and provide nothing. A
+target that gains a time source gains the row, and the table is pinned
+against the platform HALs by `tools/tests/target_facts.rs`.
 
 ## Provider Contracts and Surfaces
 

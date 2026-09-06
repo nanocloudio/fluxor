@@ -11,7 +11,7 @@ pub const TCP_HEADER_LEN: usize = 20;
 /// Listeners and datagram endpoints carry this so they are reachable at
 /// every configured local address; accepted/connected conns latch a
 /// concrete slot instead.
-pub const LOCAL_SLOT_ANY: u8 = 0xFF;
+pub const LOCAL_SLOT_ANY: u16 = 0xFFFF;
 
 /// TCP flags
 pub const FIN: u8 = 0x01;
@@ -121,8 +121,7 @@ pub struct TcpConn {
     /// (wildcard — reachable at every local address). The tuple match
     /// (`find_conn`) gains this axis so the same port at two addresses is two
     /// distinct listeners.
-    pub local_slot: u8,
-    pub _slot_pad: u8,
+    pub local_slot: u16,
 
     /// Owner stamped on this endpoint at bind. `0` is the host wildcard. Part
     /// of the datagram bind identity: a second bind of the same `(local_port,
@@ -134,7 +133,12 @@ pub struct TcpConn {
     /// uses `MSG_DG_RX_FROM` framing (opcodes 0x40..0x43). Always false
     /// for TCP conns.
     pub is_datagram: bool,
-    pub _dg_pad: [u8; 3],
+    /// Counted in the half-open gauge (`SynReceived`); cleared when it
+    /// completes or is released, so the gauge never drifts.
+    pub half_open_counted: bool,
+    /// Challenge-ACK refill epoch last applied to `chal_budget`.
+    pub chal_epoch: u8,
+    pub _dg_pad: [u8; 1],
 
     // Send sequence variables
     pub snd_una: u32, // oldest unacknowledged
@@ -238,10 +242,11 @@ impl TcpConn {
             remote_port: 0,
             remote_ip: 0,
             local_slot: LOCAL_SLOT_ANY,
-            _slot_pad: 0,
             owner_tag: 0,
             is_datagram: false,
-            _dg_pad: [0; 3],
+            half_open_counted: false,
+            chal_epoch: 0,
+            _dg_pad: [0; 1],
             snd_una: 0,
             snd_nxt: 0,
             snd_wnd: 0,
@@ -438,7 +443,7 @@ pub unsafe fn find_conn(
     remote_ip: u32,
     remote_port: u16,
     local_port: u16,
-    local_slot: u8,
+    local_slot: u16,
 ) -> Option<usize> {
     let mut i = 0;
     while i < MAX_TCP_CONNS {
@@ -473,7 +478,7 @@ pub unsafe fn find_conn(
 pub unsafe fn find_listener(
     conns: &[TcpConn; MAX_TCP_CONNS],
     local_port: u16,
-    local_slot: u8,
+    local_slot: u16,
     dst_owned: bool,
 ) -> Option<usize> {
     let mut i = 0;

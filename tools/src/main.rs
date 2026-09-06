@@ -68,6 +68,7 @@ mod schema;
 mod stack_expand;
 mod store_cli;
 pub mod target;
+mod target_facts;
 mod text_distance;
 mod uf2;
 mod up;

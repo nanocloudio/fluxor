@@ -14,6 +14,18 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # tls-fronted edge whose anchor wants `transport.anchor.stream.secure`.
 capabilities = ["transport.anchor.stream.secure"]
 
+# An instance that validates a peer's chain (a CA profile) checks the
+# leaf's lifetime against the kernel's trusted clock (`timer::TRUSTED_UNIX`),
+# and under `clock_policy = require` — the default — a clock the platform
+# does not vouch for fails the handshake closed. A target with no such
+# clock therefore cannot run that posture; the honest configuration there
+# is `clock_policy = unchecked`, and the wrong one is refused at compose
+# rather than at the first handshake. A plain server, or a pinned peer,
+# checks no lifetime and needs no clock.
+[[requires_when]]
+capability = "time.wall"
+when       = { peer_auth = ["ca_dns", "ca_uri"], clock_policy = "require" }
+
 [[ports]]
 name = "cipher_in"
 direction = "input"

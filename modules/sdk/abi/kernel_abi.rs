@@ -621,6 +621,14 @@ pub const OWNER_TAG: u32 = 0x0C4B;
 /// `ENOSYS` on single-tenant builds (no workload backend to serve).
 pub const NET_IDENT_PROVIDER: u32 = 0x0C4C;
 
+/// This boot's incarnation: 16 bytes drawn from the kernel CSPRNG once per
+/// boot, the same for every module that asks. What it is for: anything
+/// minted during a boot — an emission token, a fence epoch, a directory
+/// entry — mixes it in, so a value from a previous life of this host is
+/// structurally unmatchable rather than merely unlikely. Ungated self-query.
+/// `handle = -1`, `arg` receives 16 bytes.
+pub const BOOT_INCARNATION: u32 = 0x0C4D;
+
 /// Per-step flow-budget grant for one of the calling module's ports.
 /// `arg[0] = port index`; optional `arg[1] = direction` (`0` output,
 /// `1` input). Input requests may carry the raw channel descriptor in

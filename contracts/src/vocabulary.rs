@@ -87,6 +87,14 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "security.key_wrap",
     "fence.enforceable",
     "durable.rpo_zero",
+    // Calendar time — seconds since the Unix epoch — with evidence of
+    // synchronisation, as the kernel's `timer::TRUSTED_UNIX` reports it.
+    // Provided by the TARGET, not by a module: it is a property of the
+    // platform's HAL, answered per target in the composer's target-facts
+    // table, and a manifest names it in `[[requires_when]]` to be refused
+    // at compose on a target that cannot back it. Distinct from
+    // `timer_class = "wall_clock"`, which is about monotonic elapsed time.
+    "time.wall",
     "replication.state_machine",
     // The ordered-ack exchange surface (`modules/sdk/contracts/exchange.rs`):
     // ordered publishes in, durable acks out, and — for a provider that
@@ -229,7 +237,44 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
         "request.record",
         &[("txn", &["yes", "no"]), ("max_payload", FACT_NUMERIC)],
     ),
+    (
+        // How a resumable session resumes. `scope`: `local` — the ticket
+        // names state only the minting host holds; `fleet` — the ticket IS
+        // the state, sealed under a vault-held key any admitted host with
+        // that key generation can open. `early_data`: `off` — 0-RTT is
+        // never accepted, every resumption is a full round trip with a
+        // fresh key share; `local_single_use` — 0-RTT only against the
+        // minting host's single-use record.
+        "session.resume",
+        &[
+            ("scope", &["local", "fleet"]),
+            ("early_data", &["off", "local_single_use"]),
+        ],
+    ),
+    (
+        // What a fence's cutoff boundary is worth. `ring_handoff`: nothing
+        // sourced from the fenced address is handed to the driver ring
+        // after the fence answers, but frames already in the ring may still
+        // leave — what an IP stack alone can prove. `wire`: a driver that
+        // drains and reports its completed transmit index proves no later
+        // frame left the NIC.
+        "fence.enforceable",
+        &[("cutoff", &["ring_handoff", "wire"])],
+    ),
+    (
+        // Where a target's calendar time comes from — the strongest source
+        // class its HAL can report `TRUSTED`, in `trusted_time::source`
+        // terms. A target with none does not carry the capability at all.
+        "time.wall",
+        &[("source", &["rtc", "network_sync", "signed_authority"])],
+    ),
 ];
+
+/// Capabilities a TARGET provides rather than a module: properties of the
+/// platform HAL that a manifest can require but nothing in a graph declares.
+/// Answered per target by the composer's target-facts table; a
+/// `[[requires_when]]` naming any other capability is a manifest error.
+pub const TARGET_CAPABILITIES: &[&str] = &["time.wall"];
 
 /// Marker for a fact whose value is a `u32` rather than one of an
 /// enumerated set. Compared by identity of the empty slice's contents, so a

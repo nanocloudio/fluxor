@@ -1,3 +1,7 @@
+/// Longest resumption ticket the client echoes as a PSK identity: a
+/// vault-sealed ticket is ~104 bytes (`pump::emit_new_session_ticket`).
+pub const MAX_TICKET_LEN: usize = 160;
+
 // QUIC v1 connection state (RFC 9000 + RFC 9001).
 //
 // Each connection holds three packet number spaces (Initial,
@@ -812,7 +816,7 @@ pub struct QuicConnection {
     /// Identity bytes the client placed in / server selected from the
     /// PSK extension (used to look up the server's stored RMS for
     /// resumption + recompute the binder).
-    pub psk_identity: [u8; 32],
+    pub psk_identity: [u8; MAX_TICKET_LEN],
     pub psk_identity_len: u8,
     /// Whether the client offered 0-RTT in its CH and the server has
     /// accepted (EE has early_data ext). False for both sides until
@@ -1114,7 +1118,7 @@ impl QuicConnection {
             largest_acked_one_rtt_seen: false,
             psk: [0; 48],
             psk_len: 0,
-            psk_identity: [0; 32],
+            psk_identity: [0; MAX_TICKET_LEN],
             psk_identity_len: 0,
             zero_rtt_accepted: false,
             zero_rtt_offered: false,

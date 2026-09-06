@@ -165,34 +165,20 @@ const MAX_KEY_LEN: usize = 160;
 const NET_BUF_SIZE: usize = 1600;
 const MAX_TICKETS: usize = 4;
 
-/// Server-side ticket cache entry. Stores the resumption_master_secret
-/// the server gave the client plus a fresh ticket nonce. On resumption
-/// the server looks up by the `psk_identity` the client echoes back.
-///
-/// Tickets are single-use as a 0-RTT replay defense (RFC 8446 §8 +
-/// RFC 9001 §9.2): the first successful resumption sets `consumed`
-/// and any later attempt with the same identity is rejected.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ServerTicketEntry {
-    used: bool,
-    consumed: bool,
-    /// Opaque PSK identity the client echoes back; we use this index
-    /// (encoded as 4 BE bytes) plus a 16-byte random tag for unguessability.
-    /// Layout: [u32 BE: index][u8;16: random_tag] = 20 bytes.
-    identity: [u8; 20],
-    /// Resumption master secret (TLS 1.3 §7.1, hash_len bytes).
-    rms: [u8; 48],
-    rms_len: u8,
-    /// Cipher suite the original handshake negotiated.
-    suite_id: u16,
-    /// Issue time in millis (for expiry / ticket_age_add).
-    issue_ms: u64,
-    /// Random additive added to the ticket_age (RFC 8446 §4.6.1).
-    ticket_age_add: u32,
-    /// Lifetime in seconds.
-    lifetime_s: u32,
-}
+/// Resumption tickets are stateless: the ticket IS the session state,
+/// sealed under a vault-held key (`KEY_VAULT::AEAD_SEAL`) that never
+/// leaves the vault. Two labelled keys alternate by parity so a rotation
+/// leaves the previous generation openable until its tickets age out; a
+/// ticket names the parity that sealed it. Replay is refused against a
+/// bounded ring of recently accepted ticket digests — single-use is
+/// server-side state, kept small on purpose (RFC 8446 §8, RFC 9001 §9.2).
+const TICKET_AAD: &[u8] = b"quic-ticket-v1";
+const TICKET_LABEL: [&[u8]; 2] = [b"quic-resume-0", b"quic-resume-1"];
+/// Recently accepted tickets, by digest, for replay refusal.
+const TICKET_SEEN: usize = 16;
+/// Sealed ticket plaintext: suite(2) rms_len(1) rms(48) age_add(4)
+/// issue_ms(8) lifetime_s(4) nonce(8).
+const TICKET_PT_LEN: usize = 2 + 1 + 48 + 4 + 8 + 4 + 8;
 
 /// Client-side ticket cache entry. Stored after receiving
 /// NewSessionTicket; used to populate `pre_shared_key` extension on
@@ -207,7 +193,7 @@ struct ClientTicketEntry {
     peer_port: u16,
     /// Opaque ticket bytes received from the server (we echo as PSK
     /// identity).
-    ticket: [u8; 32],
+    ticket: [u8; MAX_TICKET_LEN],
     ticket_len: u8,
     /// Resumption master secret (RFC 8446 §7.1).
     rms: [u8; 48],
@@ -266,12 +252,19 @@ pub(crate) struct QuicState {
     enable_0rtt: u8,
     /// Server: HMAC key for retry tokens. Generated at boot.
     retry_secret: [u8; 32],
-    /// Server: key for ticket encryption. Generated at boot;
-    /// production deployments rotate periodically.
-    ticket_secret: [u8; 32],
-    /// Server-side ticket cache.
-    server_tickets: [ServerTicketEntry; MAX_TICKETS],
-    server_ticket_next: u32,
+    /// Server: the vault handles of the two ticket-sealing key
+    /// generations, by parity; -1 when the vault refused (no tickets
+    /// are issued then, and every handshake is a full one).
+    ticket_key: [i32; 2],
+    /// Parity of the generation sealing new tickets.
+    ticket_parity: u8,
+    ticket_vault_warned: bool,
+    /// Seconds between key rotations; 0 = never.
+    ticket_rotate_s: u32,
+    ticket_rotated_ms: u64,
+    /// Digests of recently accepted tickets (replay refusal).
+    ticket_seen: [[u8; 16]; TICKET_SEEN],
+    ticket_seen_next: u8,
     /// Client-side ticket cache (per-peer).
     client_tickets: [ClientTicketEntry; MAX_TICKETS],
     /// Set after the client kicks off a 0-RTT resumption attempt so
@@ -375,6 +368,12 @@ define_params! {
     12, disable_migration, u8, 0
         => |s, d, len| { s.disable_migration = p_u8(d, len, 0, 0); };
 
+    // Seconds between rotations of the ticket-sealing key. Each rotation
+    // is a new key generation; the previous stays openable until its
+    // tickets age out. 0 = never rotate.
+    16, ticket_rotate_s, u32, 3600
+        => |s, d, len| { s.ticket_rotate_s = p_u32(d, len, 0, 3600); };
+
     // Ladder bits per step for the two P-256 scalar multiplications in the
     // handshake. Clamped to [1, 256]: 0 would stall the ladder forever, and
     // above 256 is a whole ladder anyway.
@@ -430,27 +429,22 @@ pub unsafe extern "C" fn module_new(
     s.verify_peer = 0;
     s.trust_cert_len = 0;
     s.verify_hostname_len = 0;
-    s.server_ticket_next = 0;
+    s.ticket_key = [-1, -1];
+    s.ticket_parity = 0;
+    s.ticket_vault_warned = false;
+    s.ticket_rotate_s = 3600;
+    s.ticket_rotated_ms = 0;
+    s.ticket_seen = [[0u8; 16]; TICKET_SEEN];
+    s.ticket_seen_next = 0;
     s.pending_resumption_test = false;
     s.alpn_cfg_len = 0;
     let mut t = 0;
     while t < MAX_TICKETS {
-        s.server_tickets[t] = ServerTicketEntry {
-            used: false,
-            consumed: false,
-            identity: [0; 20],
-            rms: [0; 48],
-            rms_len: 0,
-            suite_id: 0,
-            issue_ms: 0,
-            ticket_age_add: 0,
-            lifetime_s: 0,
-        };
         s.client_tickets[t] = ClientTicketEntry {
             used: false,
             peer_ip: [0; 4],
             peer_port: 0,
-            ticket: [0; 32],
+            ticket: [0; MAX_TICKET_LEN],
             ticket_len: 0,
             rms: [0; 48],
             rms_len: 0,
@@ -504,13 +498,13 @@ pub unsafe extern "C" fn module_new(
         }
     }
 
-    // Initialise per-server retry + ticket secrets from the CSPRNG.
+    // Initialise the per-server retry secret from the CSPRNG.
     if dev_csprng_fill(sys, s.retry_secret.as_mut_ptr(), 32) < 0 {
         return -1;
     }
-    if dev_csprng_fill(sys, s.ticket_secret.as_mut_ptr(), 32) < 0 {
-        return -1;
-    }
+    // The ticket-sealing keys live in the vault; without them no ticket
+    // is issued and every handshake is a full one.
+    ticket_keys_open(s);
 
     // Pre-compute ECDH keys for each connection slot.
     let mut i = 0;
@@ -751,6 +745,163 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
     }
 }
 
+// ── Stateless resumption tickets ────────────────────────────────────
+//
+// The vault holds the sealing key; this module holds two handles and a
+// parity. `KEY_VAULT` is a kernel contract class every module may call.
+
+/// `OPEN_OR_GENERATE` an AEAD key under `label`; the handle, or -1.
+unsafe fn vault_open_or_generate_aead(sys: &SyscallTable, label: &[u8]) -> i32 {
+    let mut arg = [0u8; 8 + 64 + 12];
+    arg[0..2].copy_from_slice(&8u16.to_le_bytes()); // suite::AEAD_KEY
+    let usage: u32 = (1 << 6) | (1 << 7) | (1 << 4) | (1 << 5); // SEAL|OPEN|PERSIST|WRAP
+    arg[2..6].copy_from_slice(&usage.to_le_bytes());
+    arg[6] = 0;
+    arg[7] = label.len() as u8;
+    arg[8..8 + label.len()].copy_from_slice(label);
+    let n = 8 + label.len() + 12;
+    let rc = (sys.provider_call)(-1, 0x1009, arg.as_mut_ptr(), n);
+    if rc < 0 {
+        -1
+    } else {
+        rc
+    }
+}
+
+unsafe fn vault_destroy_by_label(sys: &SyscallTable, label: &[u8]) {
+    let mut arg = [0u8; 1 + 64];
+    arg[0] = label.len() as u8;
+    arg[1..1 + label.len()].copy_from_slice(label);
+    let _ = (sys.provider_call)(-1, 0x100B, arg.as_mut_ptr(), 1 + label.len());
+}
+
+/// `AEAD_SEAL` `pt` under `handle` with `aad`; bytes written to `out`, or 0.
+unsafe fn vault_seal(
+    sys: &SyscallTable,
+    handle: i32,
+    aad: &[u8],
+    pt: &[u8],
+    out: &mut [u8],
+) -> usize {
+    let mut arg = [0u8; 2 + 32 + 2 + TICKET_PT_LEN + 12];
+    let mut p = 0;
+    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
+    p += 2;
+    arg[p..p + aad.len()].copy_from_slice(aad);
+    p += aad.len();
+    arg[p..p + 2].copy_from_slice(&(pt.len() as u16).to_le_bytes());
+    p += 2;
+    arg[p..p + pt.len()].copy_from_slice(pt);
+    p += pt.len();
+    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
+    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
+    let rc = (sys.provider_call)(handle, 0x1012, arg.as_mut_ptr(), p + 12);
+    if rc < 0 {
+        return 0;
+    }
+    u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize
+}
+
+/// `AEAD_OPEN` `blob` under `handle` with `aad`; bytes written to `out`, or 0.
+unsafe fn vault_open(
+    sys: &SyscallTable,
+    handle: i32,
+    aad: &[u8],
+    blob: &[u8],
+    out: &mut [u8],
+) -> usize {
+    let mut arg = [0u8; 2 + 32 + 2 + MAX_TICKET_LEN + 12];
+    let mut p = 0;
+    arg[p..p + 2].copy_from_slice(&(aad.len() as u16).to_le_bytes());
+    p += 2;
+    arg[p..p + aad.len()].copy_from_slice(aad);
+    p += aad.len();
+    arg[p..p + 2].copy_from_slice(&(blob.len() as u16).to_le_bytes());
+    p += 2;
+    arg[p..p + blob.len()].copy_from_slice(blob);
+    p += blob.len();
+    arg[p..p + 8].copy_from_slice(&(out.as_mut_ptr() as u64).to_le_bytes());
+    arg[p + 8..p + 10].copy_from_slice(&(out.len() as u16).to_le_bytes());
+    let rc = (sys.provider_call)(handle, 0x1013, arg.as_mut_ptr(), p + 12);
+    if rc < 0 {
+        return 0;
+    }
+    u16::from_le_bytes([arg[p + 10], arg[p + 11]]) as usize
+}
+
+/// Open both ticket-key generations. Without a vault no ticket is ever
+/// issued: resumption that cannot be sealed is not offered.
+unsafe fn ticket_keys_open(s: &mut QuicState) {
+    if s.mode != 1 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    s.ticket_key[0] = vault_open_or_generate_aead(sys, TICKET_LABEL[0]);
+    s.ticket_key[1] = vault_open_or_generate_aead(sys, TICKET_LABEL[1]);
+    s.ticket_rotated_ms = dev_millis(sys);
+    if s.ticket_key[0] < 0 || s.ticket_key[1] < 0 {
+        s.ticket_key = [-1, -1];
+        if !s.ticket_vault_warned {
+            s.ticket_vault_warned = true;
+            let msg = b"[quic] no vault ticket key: resumption not offered";
+            dev_log(sys, 2, msg.as_ptr(), msg.len());
+        }
+    }
+}
+
+/// Rotate the sealing key when due: the other parity gets a fresh key
+/// and becomes current; tickets under the old current stay openable.
+unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
+    if s.mode != 1 || s.ticket_rotate_s == 0 || s.ticket_key[0] < 0 {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let now = dev_millis(sys);
+    if now.saturating_sub(s.ticket_rotated_ms) < u64::from(s.ticket_rotate_s) * 1000 {
+        return;
+    }
+    let next = (s.ticket_parity ^ 1) as usize;
+    vault_destroy_by_label(sys, TICKET_LABEL[next]);
+    let h = vault_open_or_generate_aead(sys, TICKET_LABEL[next]);
+    if h < 0 {
+        return;
+    }
+    s.ticket_key[next] = h;
+    s.ticket_parity = next as u8;
+    s.ticket_rotated_ms = now;
+    let msg = b"[quic] ticket key rotated";
+    dev_log(sys, 3, msg.as_ptr(), msg.len());
+}
+
+/// First 16 bytes of SHA-256 over a ticket: what the replay ring holds.
+fn ticket_digest(identity: &[u8]) -> [u8; 16] {
+    let mut h = Sha256::new();
+    h.update(identity);
+    let d = h.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d[..16]);
+    out
+}
+
+/// Whether `digest` is in the replay ring. Takes the ring itself so the
+/// borrow stays disjoint from a connection being driven.
+fn ticket_seen(ring: &[[u8; 16]; TICKET_SEEN], digest: &[u8; 16]) -> bool {
+    let mut i = 0;
+    while i < TICKET_SEEN {
+        if ring[i] == *digest {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn ticket_mark_seen(ring: &mut [[u8; 16]; TICKET_SEEN], next: &mut u8, digest: [u8; 16]) {
+    let i = *next as usize % TICKET_SEEN;
+    ring[i] = digest;
+    *next = ((i + 1) % TICKET_SEEN) as u8;
+}
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = &mut *(state as *mut QuicState);
@@ -759,6 +910,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // Module-scope metrics (~5s cadence): a bounded log beat always, plus the
     // telemetry-port counters when that port is wired.
     maybe_emit_telemetry(s);
+    ticket_rotate_if_due(s);
 
     // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,
     // with backoff/retry. MSG_DG_BOUND is consumed in the recv loop below.
@@ -1176,7 +1328,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             used: true,
                             peer_ip: s.conns[i].peer.ip,
                             peer_port: s.conns[i].peer.port,
-                            ticket: [0; 32],
+                            ticket: [0; MAX_TICKET_LEN],
                             ticket_len: psk_id_len as u8,
                             rms: [0; 48],
                             rms_len: s.conns[i].psk_len,

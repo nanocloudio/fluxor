@@ -10,6 +10,7 @@
 //! is gated on `host-linux`.
 
 pub mod builtin_params;
+pub mod clock;
 pub mod host_backend;
 #[cfg(feature = "host-hsm")]
 pub mod hsm_key_vault;
