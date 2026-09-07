@@ -156,6 +156,7 @@ use fluxor::platform::linux::builtin_params::*;
 include!("linux/cli_io.rs");
 include!("linux/host_asset_source.rs");
 include!("linux/host_asset_index.rs");
+include!("linux/linux_gpu.rs");
 include!("linux/linux_display.rs");
 include!("linux/linux_audio.rs");
 include!("linux/host_image_codec.rs");
@@ -298,6 +299,13 @@ fn build_graph_linux() -> (usize, usize) {
 
         if entry.name_hash == HOST_ASSET_INDEX_HASH {
             let m = build_host_asset_index(module_idx, entry.params());
+            scheduler::store_builtin_module(module_idx, m);
+            loaded_count += 1;
+            continue;
+        }
+
+        if entry.name_hash == LINUX_GPU_HASH {
+            let m = build_linux_gpu(module_idx, entry.params());
             scheduler::store_builtin_module(module_idx, m);
             loaded_count += 1;
             continue;

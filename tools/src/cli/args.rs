@@ -347,6 +347,17 @@ enum Commands {
         action: ModulesAction,
     },
 
+    /// Offline GPU program packs: build, inspect, validate.
+    ///
+    /// A pack is the only way an executable reaches a GPU provider, and a
+    /// provider refuses one whose identity, target, bindings or requirements
+    /// it cannot honour. These verbs move that refusal from load time on a
+    /// device to build time on a host.
+    Gpu {
+        #[command(subcommand)]
+        action: GpuAction,
+    },
+
     /// Full CI gate. Runs in order: fmt-check, clippy, workspace-lint
     /// opt-in audit, hygiene scan, observability + presentation lints,
     /// template render, version-skew check, lockfile consistency,
@@ -551,6 +562,95 @@ enum PublishAction {
         /// Annotate provenance=published instead of local-build.
         #[arg(long)]
         published: bool,
+    },
+}
+
+/// Offline GPU program packs (`modules/sdk/cores/gpu_pack.rs`).
+///
+/// Shares the device's own decoder, so a pack this accepts is a pack that
+/// provider accepts — not one that passes a second implementation of the
+/// same rules.
+#[derive(Subcommand)]
+enum GpuAction {
+    /// Build a program pack from a compiled artifact and a manifest.
+    ///
+    /// The manifest is the point: the artifact bytes alone say nothing about
+    /// which ISA they are, what bindings they expect, or what they cost. A
+    /// provider refuses a pack whose declarations it cannot honour, and
+    /// declaring them here is what makes that refusal a build-time answer.
+    Pack {
+        /// Compiled artifact — WGSL source, a SPIR-V module, a QPU pack.
+        artifact: PathBuf,
+        /// Output pack path.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Entry-point name inside the artifact.
+        #[arg(short, long, default_value = "main")]
+        entry: String,
+        /// Target ISA: wgsl|spirv|v3d|replay.
+        #[arg(short, long, default_value = "wgsl")]
+        target: String,
+        /// Target revision the artifact was built for (e.g. 0x0701 for V3D
+        /// 7.1). Zero means "any revision the device accepts".
+        #[arg(long, default_value_t = 0)]
+        target_rev: u32,
+        /// Toolchain identity: 32 hex characters, or a version string to be
+        /// hashed into one. Recorded so a pack can be traced to the compiler
+        /// that produced it.
+        #[arg(long)]
+        toolchain: Option<String>,
+        /// Workgroup shape, e.g. `64x1x1`.
+        #[arg(long, default_value = "64x1x1")]
+        workgroup: String,
+        /// Alignment every bound view's offset must satisfy.
+        #[arg(long, default_value_t = 64)]
+        min_align: u32,
+        /// A declared binding: `slot:kind:access:min_size:align`, where kind
+        /// is storage|uniform|texture|sampler|vertex|index and access is
+        /// r|w|rw. Repeat per binding.
+        #[arg(short, long = "binding")]
+        bindings: Vec<String>,
+        /// Resident bytes the program needs.
+        #[arg(long, default_value_t = 0)]
+        budget_resident: u64,
+        /// Scratch bytes the program needs.
+        #[arg(long, default_value_t = 0)]
+        budget_scratch: u64,
+    },
+    /// Print a pack's manifest: target, entry, bindings, budgets, and both
+    /// digests — the artifact's content identity and the whole-manifest
+    /// identity a pipeline cache is keyed on.
+    Inspect {
+        /// Pack to read.
+        pack: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a provider's capability record to a file.
+    ///
+    /// `validate` needs a device's published facts, and the null/replay
+    /// provider is the one device every checkout has. For any other backend,
+    /// capture the `OUT_CAPS` record it answers with.
+    Caps {
+        /// Provider whose facts to emit. Only `replay` can be stated without
+        /// a device present.
+        #[arg(long, default_value = "replay")]
+        provider: String,
+        /// Output path for the capability record.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Check a pack against a device's published capability record.
+    ///
+    /// `--caps` takes the 152 bytes a provider answers `QUERY_CAPS` with, so
+    /// the check is against facts the device published rather than against a
+    /// hand-written description of it that has gone stale.
+    Validate {
+        /// Pack to check.
+        pack: PathBuf,
+        /// File holding the device's capability record.
+        #[arg(long)]
+        caps: PathBuf,
     },
 }
 

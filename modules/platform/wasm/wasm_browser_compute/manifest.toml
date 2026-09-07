@@ -2,29 +2,46 @@ version = "1.0.0"
 hardware_targets = ["wasm"]
 builtin = true
 
-# Generic GPU compute (GPGPU) backend — the compute sibling of
-# `wasm_browser_gpu`. Consumes an application-supplied compute command stream on
-# the input port (CREATE_PIPELINE with app WGSL/SPIR-V shaders, CREATE_BUFFER,
-# UPLOAD_BUFFER, SUBMIT dispatch lists, PRESENT) and executes it via WebGPU
-# compute through the backend-agnostic `host_gpu_compute_*` imports. Holds ZERO
-# application knowledge; a Vulkan or bare-metal driver implements the same
-# imports so a graph wired to this module runs unchanged on any backend.
+# Generic GPU provider on WebGPU.
+#
+# Same contract, same shared cores and same lifetime corpus as the `gpu_null`
+# and `linux_gpu` providers: admission, opaque generational handles, bounded
+# views, immutable sealing, residency, dependency-ordered fences,
+# candidate-output commit, cancellation, drain and device epochs are all
+# `modules/sdk/cores/gpu_*.rs`. Only the device objects behind the slot numbers
+# differ.
+#
+# It draws from the page's ONE adapter and device, shared with the raster shim.
+# WebGPU resources belong to the device that created them, so a second device
+# would be a disjoint resource world: a compute output could not be bound as
+# raster geometry without a CPU round trip at every hand-off.
+#
+# Nothing here blocks: adapter acquisition, pipeline compilation, submission
+# completion and buffer mapping are polled across steps, because a cooperative
+# step cannot wait for a driver and a synchronous pipeline create would stall
+# the shared device's whole timeline behind one compile.
 
-capabilities = ["gpu.compute", "display.scanout"]
+capabilities = ["gpu.compute"]
+
+[capability_facts."gpu.compute"]
+backend  = "webgpu"
+readback = "yes"
+# No device-resident surface is handed to a sink from here: presenting without
+# a readback is the raster half's work, and this provider is the compute half.
+# Declaring otherwise would be a capability nothing honours.
+shared_surface = "no"
 
 [[ports]]
 name = "commands"
 direction = "input"
-content_type = "OctetStream"
+content_type = "GpuCommand"
 required = true
 
-# Optional: READBACK results (compute → CPU) are written here. Leave unwired if
-# the graph only renders/presents.
 [[ports]]
-name = "readback"
+name = "outcomes"
 direction = "output"
-content_type = "OctetStream"
-required = false
+content_type = "GpuOutcome"
+required = true
 
 [observability]
-exempt = "browser-API shim (wasm) — observed via browser devtools"
+exempt = "browser-API shim (wasm) — the provider's facts are its outcome records, and the device side is observed via browser devtools"

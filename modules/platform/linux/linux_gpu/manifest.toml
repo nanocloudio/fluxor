@@ -1,0 +1,63 @@
+version = "1.0.0"
+hardware_targets = ["linux"]
+builtin = true
+
+# Native GPU compute over wgpu/Vulkan, headless.
+#
+# The generic GPU contract (`modules/sdk/wire/gpu_wire.rs`) on a real
+# device, with no display, no swapchain and no window: a compute graph builds
+# and runs here on a Pi 5's V3D exactly as it does on a discrete card, because
+# nothing in the path touches presentation.
+#
+# Validation, handles, views, sealing, residency, fences, dependency order,
+# candidate-output commit and epochs are the shared cores — the same code the
+# `gpu_null` provider runs, so both answer one lifetime corpus. This built-in
+# owns only what wgpu owns: adapters, buffers, shader modules, pipelines,
+# encoders and mapped memory, all on a dedicated thread so adapter creation and
+# shader compilation never land in a cooperative step.
+#
+# Requires `--features host-gpu`. Built without it the module still loads and
+# still frames the protocol, answering every request with a rejection rather
+# than accepting work nothing will run or discarding it silently.
+
+capabilities = ["gpu.compute"]
+
+[capability_facts."gpu.compute"]
+backend  = "wgpu_native"
+readback = "yes"
+# No device-resident surface is handed to a sink. Importing one needs
+# dma-buf export and format/modifier negotiation this provider has not
+# demonstrated, and wgpu's availability is not evidence of either.
+shared_surface = "no"
+
+[[ports]]
+name = "commands"
+direction = "input"
+content_type = "GpuCommand"
+required = true
+
+[[ports]]
+name = "outcomes"
+direction = "output"
+content_type = "GpuOutcome"
+required = true
+
+# Memory budgets are a deployment decision, not an adapter fact: an adapter
+# will happily let a graph allocate until the host dies, so the ceiling that
+# admission enforces is configured here.
+[[params]]
+name = "resident_mb"
+tag = 10
+type = "u32"
+default = 256
+range = [1, 65536]
+
+[[params]]
+name = "staging_kb"
+tag = 11
+type = "u32"
+default = 16384
+range = [64, 1048576]
+
+[observability]
+exempt = "the provider's facts are its outcome records — every rejection reason, fence disposition, transfer byte count and epoch change a consumer needs is already on the wire; a parallel metric stream would restate the contract"

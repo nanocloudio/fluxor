@@ -100,7 +100,7 @@ graphs.
 capability entries delegate through the registry, loading the script
 lazily on first use (`importScripts` in a Worker, `<script>` injection
 on the page). The registry currently has no in-tree clients: app-domain
-GPU work goes through the generic `wasm_browser_compute` driver instead
+GPU work goes through the generic `wasm_browser_compute` provider instead
 (pipelines, buffers and dispatch lists arrive as channel data, so no
 host-side executor is needed).
 

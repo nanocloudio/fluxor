@@ -1,0 +1,50 @@
+version = "1.0.0"
+hardware_targets = ["bcm2712", "linux", "wasm"]
+
+# Null/replay GPU provider — the GPU contract with no GPU.
+#
+# It executes the entire contract (`modules/sdk/wire/gpu_wire.rs`): admission,
+# opaque generational handles, bounded views, immutable sealing, residency,
+# dependency-ordered fences, candidate-output commit, cancellation, drain and
+# device epochs. What it does not do is run shaders. A dispatch performs a
+# fixture transformation over a byte arena — add the program's identity
+# constant to each byte it moves — which is deterministic, order-sensitive and
+# trivially mirrored by a CPU oracle.
+#
+# Two jobs:
+#
+#   * the correctness oracle every other backend is held to. The same lifetime
+#     and fault corpus runs here with no driver and no asynchronous callbacks,
+#     so a failure is a contract bug rather than a hardware one;
+#   * a composition that builds and runs on targets with no GPU at all, so a
+#     consumer can develop and regression-test its request/result lifecycle
+#     before any silicon exists.
+#
+# Not shipped as a stand-in for a real device: it advertises only
+# `TARGET_REPLAY` packs, so a WGSL, SPIR-V or QPU artifact is refused rather
+# than pretended at.
+
+capabilities = ["gpu.compute"]
+
+[capability_facts."gpu.compute"]
+backend  = "replay"
+# Results come back to the CPU — a headless compute graph that could not read
+# its own output would be a composition error worth catching at build time.
+readback = "yes"
+# No device-resident surface can be handed to a sink: there is no device.
+shared_surface = "no"
+
+[[ports]]
+name = "commands"
+direction = "input"
+content_type = "GpuCommand"
+required = true
+
+[[ports]]
+name = "outcomes"
+direction = "output"
+content_type = "GpuOutcome"
+required = true
+
+[observability]
+exempt = "conformance and development provider — its facts are the outcome records themselves, which carry every rejection reason, fence disposition and epoch change a consumer needs; a parallel metric stream would restate the contract"

@@ -29,6 +29,8 @@ mod ci;
 mod config;
 mod crypto;
 mod error;
+mod gpu_contract;
+mod gpu_pack;
 mod hash;
 mod hygiene;
 mod manifest;
@@ -298,6 +300,36 @@ fn main() {
                 cmd_sign(&input, &key, output.as_deref(), verbose)
             }
             ModulesAction::Keygen { key, force } => cmd_keygen(&key, force),
+        },
+        Commands::Gpu { action } => match action {
+            GpuAction::Pack {
+                artifact,
+                output,
+                entry,
+                target,
+                target_rev,
+                toolchain,
+                workgroup,
+                min_align,
+                bindings,
+                budget_resident,
+                budget_scratch,
+            } => gpu_pack::cmd_pack(
+                &artifact,
+                &output,
+                &entry,
+                &target,
+                target_rev,
+                toolchain.as_deref(),
+                &workgroup,
+                min_align,
+                &bindings,
+                budget_resident,
+                budget_scratch,
+            ),
+            GpuAction::Caps { provider, output } => gpu_pack::cmd_caps(&provider, &output),
+            GpuAction::Inspect { pack, json } => gpu_pack::cmd_inspect(&pack, json),
+            GpuAction::Validate { pack, caps } => gpu_pack::cmd_validate(&pack, &caps),
         },
         Commands::Publish {
             action,

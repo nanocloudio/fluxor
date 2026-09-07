@@ -11,6 +11,10 @@
 
 pub mod builtin_params;
 pub mod clock;
+/// Native GPU compute over wgpu/Vulkan, headless — the provider behind the
+/// `linux_gpu` built-in. In the library, not only the binary, so the host test
+/// harness can drive it against a real adapter.
+pub mod gpu;
 pub mod host_backend;
 #[cfg(feature = "host-hsm")]
 pub mod hsm_key_vault;

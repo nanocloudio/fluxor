@@ -3686,6 +3686,11 @@ scratch = 512
         ("linux_display", "height", "u32", 13),
         ("linux_display", "scale", "u32", 14),
         ("linux_display", "header", "u32", 15),
+        // Memory budgets are a deployment decision, not an adapter fact: an
+        // adapter will let a graph allocate until the host dies, so the
+        // ceiling admission enforces is configured rather than discovered.
+        ("linux_gpu", "resident_mb", "u32", 10),
+        ("linux_gpu", "staging_kb", "u32", 11),
         ("linux_net", "max_conns", "u32", 10),
         ("linux_net", "write_buf_kib", "u32", 11),
         ("linux_net", "listen_backlog", "u32", 12),

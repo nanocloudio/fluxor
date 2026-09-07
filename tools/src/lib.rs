@@ -31,6 +31,8 @@ pub mod ci_schema;
 pub mod compose;
 pub mod error;
 pub mod genstore;
+pub mod gpu_contract;
+pub mod gpu_pack;
 pub mod hash;
 pub mod hygiene;
 // `fluxor build|test|lint|clean` — the lifecycle verbs, plus the

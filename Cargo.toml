@@ -93,6 +93,16 @@ softbuffer = { version = "0.4", optional = true }
 # dep-free.
 cpal = { version = "0.15", optional = true }
 
+# ── host-gpu: linux_gpu native compute backend ─────────────────────────
+# wgpu on Vulkan, compute only. `default-features = false` drops every
+# backend but Vulkan and every shader front end but WGSL: the provider
+# advertises WGSL as its one program target, so compiling SPIR-V or GLSL
+# support in would be weight behind a door it keeps shut. `pollster`
+# blocks the dedicated GPU thread on wgpu's async calls — never the
+# cooperative step, which is the whole reason that thread exists.
+wgpu = { version = "26", default-features = false, features = ["vulkan", "wgsl"], optional = true }
+pollster = { version = "0.4", optional = true }
+
 # ── host-hsm: PKCS#11 key_vault backend ────────────────────────────────
 # Hardware binding for the key_vault contract (rfc_crypto_extensions
 # §4.3): the cryptoki dependency lives here in fluxor's Linux platform,
@@ -218,6 +228,14 @@ host-window = ["host-linux", "winit", "softbuffer"]
 # device via CPAL. Off by default; wav + raw + null capture always
 # available.
 host-playback = ["host-linux", "cpal"]
+
+# Native GPU compute provider (`linux_gpu`). Off by default: wgpu is a
+# large dependency, and a headless server build that never opens an
+# adapter should not carry it. Without the feature the module still
+# loads and still frames the v1 protocol — it refuses every request with
+# a reason, which is a fact a graph can act on, rather than silently
+# accepting work nothing will run.
+host-gpu = ["host-linux", "wgpu", "pollster"]
 
 # PKCS#11 `key_vault` backend: overrides the kernel software vault with
 # an HSM/token (SoftHSM2 in tests) when FLUXOR_HSM_PKCS11_MODULE + token

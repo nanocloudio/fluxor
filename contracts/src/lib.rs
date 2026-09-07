@@ -177,6 +177,19 @@ pub const CONTENT_TYPES: &[&str] = &[
     // routes on this byte to tell a store change from every other event
     // sharing its sink.
     "NamespaceChange",
+    // Generic GPU work — the request stream of `modules/sdk/wire/gpu_wire.rs`
+    // (query, resource, program, transfer, submission, fence, control and
+    // surface records) flowing from a producer to a GPU provider.
+    //
+    // A distinct type rather than `OctetStream` because what a port speaks is
+    // decided at graph construction, never by sniffing bytes: a port carrying
+    // this stream is typed for it, and the record header's magic is then a
+    // framing check rather than a discriminator.
+    "GpuCommand",
+    // Generic GPU outcomes — the reply half: acceptance, handles,
+    // capabilities, readback bytes, surface leases and exactly one terminal
+    // outcome per accepted request.
+    "GpuOutcome",
 ];
 
 // ── Rate classes ────────────────────────────────────────────────────────────
@@ -302,6 +315,11 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     Control, // HttpResponse
     // One record per key mutation — bursty control traffic, not a stream.
     Control, // NamespaceChange
+    // Bulk by nature: uploads and readbacks move in runs of 64 KiB chunks, so
+    // an edge provisioned for control traffic would throttle the transfer path
+    // that the contract's bounded-chunk design exists to keep fast.
+    Video, // GpuCommand
+    Video, // GpuOutcome
 ];
 
 const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
@@ -372,6 +390,12 @@ pub const CONTENT_FRAMING: &[Framing] = &[
     // One record per key mutation, inside a mesh Event envelope — a reader
     // that was handed half of one could not tell which key changed.
     Framed, // NamespaceChange
+    // Streamed, deliberately. Every record declares its own length in a
+    // fixed 16-byte header and the decoder buffers a partial one, so a split
+    // is recoverable — which is what lets a 64 KiB upload chunk cross a
+    // smaller ring instead of demanding one sized for the largest record.
+    Streamed, // GpuCommand
+    Streamed, // GpuOutcome
 ];
 
 const _: () = assert!(CONTENT_FRAMING.len() == CONTENT_TYPES.len());

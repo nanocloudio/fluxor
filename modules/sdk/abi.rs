@@ -126,6 +126,30 @@ pub mod contracts {
     pub mod resource {
         include!("contracts/resource.rs");
     }
+    /// The generic GPU contract: the record envelope, the program-pack
+    /// envelope, the portable device model every backend shares, the provider
+    /// pump, the producer-side client and the deterministic null/replay
+    /// backend.
+    ///
+    /// One namespace rather than six, because they are one contract — the pack
+    /// validator reads the envelope's target and arithmetic facts, the device
+    /// model reads the pack's bindings, and the pump drives the device. Mounted
+    /// flat exactly as a PIC provider mounts them, so the kernel side and a
+    /// module see the same items.
+    #[allow(
+        dead_code,
+        reason = "one contract shared by producers, providers and tooling; \
+                  no single consumer uses every constant"
+    )]
+    pub mod gpu {
+        include!("crypto/sha256.rs");
+        include!("wire/gpu_wire.rs");
+        include!("cores/gpu_pack.rs");
+        include!("cores/gpu_device.rs");
+        include!("cores/gpu_pump.rs");
+        include!("cores/gpu_client.rs");
+        include!("cores/gpu_replay.rs");
+    }
     /// Generic stream-clock capability (audio/media clock query).
     pub mod stream_clock {
         include!("contracts/stream_clock.rs");

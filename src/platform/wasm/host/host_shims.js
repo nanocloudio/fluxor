@@ -1589,20 +1589,35 @@ registerProcessor('pcm-ring', PcmRing);
     };
 
     const canvasShim = {
-      host_canvas_present: (ptr, len, width, height) => {
+      // `format`: 0 = RGB565-LE (two bytes per pixel, what every producer
+      // predating the field emits), 1 = RGBA8888-LE (`r | g<<8 | b<<16`,
+      // alpha ignored). A producer whose source is already 8 bits per channel
+      // sends the second: narrowing to RGB565 on the way to a canvas that
+      // immediately widens it again throws away three bits for nothing.
+      // `format` is the SRF1 `fmt` byte from `src/platform/wasm/canvas.rs`:
+      // 0 = RGB565 little-endian, 1 = RGBA8888 in byte order. Anything else
+      // reads as RGB565, matching the Rust side's default.
+      host_canvas_present: (ptr, len, width, height, format) => {
         ensureCanvas(width, height);
         const src = kview(ptr, len);
         const dst = canvasImage.data;
         const pixels = width * height;
-        for (let i = 0; i < pixels; i++) {
-          const lo = src[i * 2];
-          const hi = src[i * 2 + 1];
-          const v = (hi << 8) | lo;
-          const r = ((v >> 11) & 0x1F) * 255 / 31;
-          const g = ((v >> 5) & 0x3F) * 255 / 63;
-          const b = (v & 0x1F) * 255 / 31;
-          const o = i * 4;
-          dst[o] = r; dst[o + 1] = g; dst[o + 2] = b; dst[o + 3] = 255;
+        if (format === 1) {
+          for (let i = 0; i < pixels; i++) {
+            const o = i * 4;
+            dst[o] = src[o]; dst[o + 1] = src[o + 1]; dst[o + 2] = src[o + 2]; dst[o + 3] = 255;
+          }
+        } else {
+          for (let i = 0; i < pixels; i++) {
+            const lo = src[i * 2];
+            const hi = src[i * 2 + 1];
+            const v = (hi << 8) | lo;
+            const r = ((v >> 11) & 0x1F) * 255 / 31;
+            const g = ((v >> 5) & 0x3F) * 255 / 63;
+            const b = (v & 0x1F) * 255 / 31;
+            const o = i * 4;
+            dst[o] = r; dst[o + 1] = g; dst[o + 2] = b; dst[o + 3] = 255;
+          }
         }
         canvasCtx.putImageData(canvasImage, 0, 0);
         onCanvasFrame(width, height);
@@ -2096,6 +2111,72 @@ registerProcessor('pcm-ring', PcmRing);
       host_destroy_module: (handle) => moduleInstances.delete(handle) ? 0 : -1,
     };
 
+    // ── Shared GPU device service ────────────────────────────────────
+    //
+    // ONE adapter and ONE device for the whole page, shared by every GPU
+    // surface on it: the raster driver and the generic compute provider.
+    //
+    // WebGPU resources belong to the device that created them, so a second
+    // device would be a disjoint resource world: a buffer a compute shader
+    // wrote could not be bound as raster geometry without a CPU round trip at
+    // every hand-off. Sharing a device does not merge the surfaces'
+    // capabilities or oblige either to have a swapchain; it only makes the
+    // hand-off expressible.
+    //
+    // Ownership is centralised here rather than spread across the shims
+    // because GPU objects do not transfer across workers: whoever creates the
+    // device must be the one that owns everything made from it.
+    const gpuService = {
+      adapter: null,
+      device: null,
+      status: GPU_INIT_NOT_STARTED,
+      // Bumped on every device loss. A handle minted under an older epoch is
+      // dead, and the consumers watch this to know their world ended.
+      epoch: 1,
+      lostReason: '',
+      onLost: [],
+
+      // Start acquisition once. Answers the current status; the caller polls.
+      ensure() {
+        if (this.device) return GPU_INIT_READY;
+        if (this.status === GPU_INIT_PENDING) return GPU_INIT_PENDING;
+        if (!navigator.gpu) {
+          console.error('[gpu] WebGPU unavailable — isSecureContext:',
+            typeof window !== 'undefined' ? window.isSecureContext : 'n/a');
+          this.status = -1;
+          return -1;
+        }
+        this.status = GPU_INIT_PENDING;
+        (async () => {
+          try {
+            this.adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+            if (!this.adapter) throw new Error('no adapter');
+            this.device = await this.adapter.requestDevice();
+            this.device.lost.then((info) => {
+              // A lost device invalidates every object made from it. Bumping
+              // the epoch and telling each consumer is the whole recovery
+              // contract: nothing minted before this is valid after it.
+              console.error('[gpu] device lost (' + info.reason + '):', info.message);
+              this.device = null;
+              this.status = GPU_INIT_NOT_STARTED;
+              this.lostReason = info.message || String(info.reason);
+              this.epoch = (this.epoch + 1) >>> 0 || 1;
+              for (const cb of this.onLost) { try { cb(); } catch (e) { console.error(e); } }
+            });
+            this.device.onuncapturederror = (e) => {
+              console.error('[gpu] uncaptured:', e.error.message);
+            };
+            this.status = GPU_INIT_READY;
+            console.log('[gpu] device ready (shared by every GPU surface on the page)');
+          } catch (e) {
+            console.error('[gpu] init failed:', e.message);
+            this.status = -3;
+          }
+        })();
+        return GPU_INIT_PENDING;
+      },
+    };
+
     // ── Generic GPU raster shim (wasm_browser_gpu) ───────────────────
     //
     // Backend driver for the generic 3D raster capability surface. Holds ZERO
@@ -2264,24 +2345,22 @@ registerProcessor('pcm-ring', PcmRing);
         gpuInitStatus = GPU_INIT_PENDING;
         (async () => {
         try {
-          console.log('[webgpu] requesting adapter...');
-          const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-          if (!adapter) {
-            console.error('[webgpu] No adapter found');
-            gpuInitStatus = -2;
+          // The shared device, not one of its own: a compute output can only
+          // be bound as raster geometry if both surfaces are on one device.
+          gpuService.ensure();
+          while (gpuService.status === GPU_INIT_PENDING) {
+            await new Promise((r) => setTimeout(r, 4));
+          }
+          if (!gpuService.device) {
+            gpuInitStatus = gpuService.status < 0 ? gpuService.status : -2;
             return;
           }
-          console.log('[webgpu] adapter found, requesting device...');
-          gpuDevice = await adapter.requestDevice();
-          console.log('[webgpu] device acquired');
-          gpuDevice.lost.then((info) => {
-            console.error('[webgpu] Device lost (' + info.reason + '):', info.message);
+          gpuDevice = gpuService.device;
+          gpuService.onLost.push(() => {
             gpuInitialized = false;
+            gpuDevice = null;
             gpuInitStatus = GPU_INIT_NOT_STARTED;
           });
-          gpuDevice.onuncapturederror = (e) => {
-            console.error('[webgpu] uncaptured error:', e.error.message);
-          };
 
           // Find or create canvas
           gpuCanvas = canvasContainer
@@ -2796,231 +2875,303 @@ registerProcessor('pcm-ring', PcmRing);
     };
 
 
-    // ── Generic GPU compute surface (host_gpu_compute_*) ──────────────
-    // Backend-agnostic GPGPU driver, the compute sibling of webgpuShim. The app
-    // supplies compute shaders + buffers + dispatch lists as data; this shim
-    // holds ZERO application knowledge (no baked pipelines, no pixel formats).
-    // WebGPU backend today; a Vulkan or bare-metal driver implements the same
-    // host_gpu_compute_* surface and the module above is unchanged.
-    let cpDevice = null;
-    let cpInitStatus = GPU_INIT_NOT_STARTED;
-    const cpPipelines = new Map(); // id -> GPUComputePipeline
-    const cpBuffers = new Map(); // id -> { buf, size }
-    let cpCanvas = null, cpCtx = null, cpImage = null;
-    let cpRead = null, cpReadN = 0, cpReadBusy = false;
-    let cpRb = null; // pending readback: { staging, ready } (one outstanding)
-    let cpPresentLogged = false, cpMapLogged = false;
+    // ── Generic GPU backend (host_gpu_service_*) ─────────────────────
+    //
+    // The device half of the GPU contract, and only that. Every rule — handle
+    // validity, view bounds, alignment, usage, rights, sealing, residency,
+    // fence order, output commit, epochs — is enforced by the shared cores on
+    // the wasm side before a single call reaches here. What arrives is
+    // already-proved work addressed by table slot, so this shim validates
+    // nothing and decides nothing.
+    //
+    // That is why it is short. A backend that re-checked the contract would be
+    // a second implementation of it, and the two would disagree.
+    const svcBuffers = new Map();   // slot -> GPUBuffer
+    const svcModules = new Map();   // slot -> { module, entry }
+    const svcPipelines = new Map(); // slot -> { pipeline | null, state }
+    const svcTickets = new Map();   // ticket -> { state, error }
+    const svcReads = new Map();     // ticket -> { staging, span, lead, len, state }
+    // 0 pending, 1 done, <0 failed — the same three answers everywhere here,
+    // so a poller has one thing to understand.
+    const SVC_PENDING = 0, SVC_DONE = 1;
 
-    function cpEnsureCanvas(w, h) {
-      if (cpCanvas && cpCanvas.width === w && cpCanvas.height === h) return;
-      if (offscreenSurface) {
-        // Worker mode: draw into the OffscreenCanvas transferred from the page —
-        // the ONLY surface that composites here. A Worker's `document` is a stub,
-        // so a `createElement('canvas')` would be detached and never visible.
-        cpCanvas = offscreenSurface;
-        if (cpCanvas.width !== w) cpCanvas.width = w;
-        if (cpCanvas.height !== h) cpCanvas.height = h;
-      } else {
-        cpCanvas = document.createElement('canvas');
-        cpCanvas.width = w; cpCanvas.height = h;
-        cpCanvas.style.maxWidth = '100%';
-        cpCanvas.style.height = 'auto';
-        cpCanvas.style.imageRendering = 'pixelated';
-        if (canvasContainer) canvasContainer.replaceChildren(cpCanvas);
-        else document.body.appendChild(cpCanvas);
-      }
-      cpCtx = cpCanvas.getContext('2d');
-      cpImage = cpCtx.createImageData(w, h);
+    function svcReset() {
+      svcBuffers.clear();
+      svcModules.clear();
+      svcPipelines.clear();
+      svcTickets.clear();
+      svcReads.clear();
     }
 
-    const computeShim = {
-      // Kick off async device acquire; returns PENDING. Module polls poll_init.
-      host_gpu_compute_init: () => {
-        if (cpDevice) return GPU_INIT_READY;
-        if (cpInitStatus === GPU_INIT_PENDING) return GPU_INIT_PENDING;
-        if (!navigator.gpu) { console.error('[compute] no WebGPU'); cpInitStatus = -1; return -1; }
-        cpInitStatus = GPU_INIT_PENDING;
-        (async () => {
-          try {
-            const adapter = await navigator.gpu.requestAdapter();
-            if (!adapter) throw new Error('no adapter');
-            cpDevice = await adapter.requestDevice();
-            cpDevice.lost.then((info) => {
-              console.error('[compute] device lost:', info.message);
-              cpDevice = null; cpPipelines.clear(); cpBuffers.clear();
-              cpRead = null; cpReadN = 0; cpReadBusy = false; cpRb = null;
-              cpInitStatus = GPU_INIT_NOT_STARTED;
-            });
-            cpInitStatus = GPU_INIT_READY;
-            console.log('[compute] ready (WebGPU compute)');
-          } catch (e) { console.error('[compute] init failed:', e.message); cpInitStatus = -3; }
-        })();
-        return GPU_INIT_PENDING;
+    const gpuServiceShim = {
+      host_gpu_service_init: () => {
+        const status = gpuService.ensure();
+        if (status === GPU_INIT_READY && !gpuServiceShim._hooked) {
+          gpuServiceShim._hooked = true;
+          gpuService.onLost.push(svcReset);
+        }
+        return status;
       },
-      host_gpu_compute_poll_init: () => cpInitStatus,
-
-      // Create/replace compute pipeline `id`. shader_fmt: 0=WGSL utf8,
-      // 1=SPIR-V (a native backend's job — the browser takes WGSL only).
-      host_gpu_compute_pipeline: (id, fmt, entryPtr, entryLen, shaderPtr, shaderLen) => {
-        if (!cpDevice) return -1;
-        if (fmt !== 0) { console.error('[compute] unsupported shader_fmt', fmt); return -2; }
-        try {
-          const entry = kstr(entryPtr, entryLen);
-          const wgsl = kstr(shaderPtr, shaderLen);
-          const module = cpDevice.createShaderModule({ code: wgsl });
-          // ASYNC creation: a synchronous createComputePipeline stalls the
-          // whole device timeline while the backend compiles (minutes for a
-          // large kernel on a software adapter) — every later submit,
-          // present readback and map queues behind it. Async keeps the
-          // device live; DISPATCHes naming a still-compiling pipeline are
-          // skipped (drop-until-ready is the app contract during init).
-          cpPipelines.delete(id >>> 0);
-          cpDevice.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: entry } })
-            .then((pipeline) => {
-              cpPipelines.set(id >>> 0, pipeline);
-              console.log('[compute] pipeline', id, '(' + entry + ', ' + wgsl.length + ' B) ready');
-            })
-            .catch((e) => console.error('[compute] pipeline', id, '(' + entry + ') failed:', e.message));
-          return 0;
-        } catch (e) { console.error('[compute] pipeline', id, 'failed:', e.message); return -3; }
+      host_gpu_service_poll_init: () => {
+        if (gpuService.device && !gpuServiceShim._hooked) {
+          gpuServiceShim._hooked = true;
+          gpuService.onLost.push(svcReset);
+        }
+        return gpuService.status;
       },
 
-      // Allocate buffer `id`. usage bitmask: 1=storage 2=uniform 4=copy-src
-      // 8=copy-dst 16=map-read. COPY_DST is always set so UPLOAD_BUFFER works.
-      host_gpu_compute_buffer: (id, size, usage) => {
-        if (!cpDevice) return -1;
+      // Report the adapter's own limits. Read off the device rather than
+      // assumed from the backend's name: what the provider advertises is what
+      // this call answers, and nothing else.
+      host_gpu_service_facts: (outPtr) => {
+        const d = gpuService.device;
+        if (!d) return -1;
+        const l = d.limits;
+        const dv = new DataView(getKernel().exports.memory.buffer, outPtr, 40);
+        const align = Math.max(
+          l.minStorageBufferOffsetAlignment || 256,
+          l.minUniformBufferOffsetAlignment || 256);
+        dv.setUint32(0, align, true);
+        dv.setUint32(4, l.maxBindingsPerBindGroup || 8, true);
+        dv.setUint32(8, l.maxComputeWorkgroupSizeX || 64, true);
+        dv.setUint32(12, l.maxComputeWorkgroupSizeY || 1, true);
+        dv.setUint32(16, l.maxComputeWorkgroupSizeZ || 1, true);
+        dv.setUint32(20, l.maxComputeInvocationsPerWorkgroup || 64, true);
+        dv.setUint32(24, l.maxComputeWorkgroupsPerDimension || 65535, true);
+        let flags = 0;
+        if (d.features && d.features.has('shader-f16')) flags |= 1;
+        if (d.features && d.features.has('timestamp-query')) flags |= 2;
+        dv.setUint32(28, flags, true);
+        const maxBuf = Math.min(
+          Number(l.maxBufferSize || 0x10000000),
+          Number(l.maxStorageBufferBindingSize || 0x8000000));
+        dv.setBigUint64(32, BigInt(maxBuf), true);
+        return 0;
+      },
+
+      host_gpu_service_create_buffer: (slot, size, usage) => {
+        const d = gpuService.device;
+        if (!d) return -1;
         try {
           let u = GPUBufferUsage.COPY_DST;
           if (usage & 1) u |= GPUBufferUsage.STORAGE;
           if (usage & 2) u |= GPUBufferUsage.UNIFORM;
-          if (usage & 4) u |= GPUBufferUsage.COPY_SRC;
-          if (usage & 16) u |= GPUBufferUsage.MAP_READ;
-          const existing = cpBuffers.get(id >>> 0);
-          if (existing) existing.buf.destroy();
-          const buf = cpDevice.createBuffer({ size: Math.max(size >>> 0, 16), usage: u });
-          cpBuffers.set(id >>> 0, { buf, size: size >>> 0 });
+          if (usage & 4) u |= GPUBufferUsage.VERTEX;
+          if (usage & 8) u |= GPUBufferUsage.INDEX;
+          if (usage & 16) u |= GPUBufferUsage.INDIRECT;
+          if (usage & (32 | 128)) u |= GPUBufferUsage.COPY_SRC;
+          if (usage & 128) u |= GPUBufferUsage.MAP_READ;
+          const existing = svcBuffers.get(slot >>> 0);
+          if (existing) existing.destroy();
+          svcBuffers.set(slot >>> 0, d.createBuffer({ size: Math.max(size >>> 0, 4), usage: u }));
           return 0;
-        } catch (e) { console.error('[compute] buffer', id, 'failed:', e.message); return -3; }
+        } catch (e) { console.error('[gpu.service] buffer', slot, e.message); return -3; }
       },
 
-      host_gpu_compute_upload: (id, offset, ptr, len) => {
-        if (!cpDevice) return -1;
-        const e = cpBuffers.get(id >>> 0);
-        if (!e) return -1;
-        // Copy out of wasm memory: writeBuffer needs a source that isn't a live
-        // view onto the module's (movable) memory.
-        const data = kview(ptr, len).slice();
-        cpDevice.queue.writeBuffer(e.buf, offset >>> 0, data);
+      host_gpu_service_destroy: (slot) => {
+        const b = svcBuffers.get(slot >>> 0);
+        if (b) { b.destroy(); svcBuffers.delete(slot >>> 0); }
         return 0;
       },
 
-      // Decode + execute the DISPATCH/COPY sub-command list in one encoder.
-      host_gpu_compute_submit: (listPtr, listLen) => {
-        if (!cpDevice) return -1;
+      host_gpu_service_upload: (slot, offset, ptr, len) => {
+        const d = gpuService.device;
+        const b = svcBuffers.get(slot >>> 0);
+        if (!d || !b) return -1;
+        // Copied out of wasm memory: `writeBuffer` must not hold a view onto
+        // a heap the module can grow underneath it.
+        d.queue.writeBuffer(b, Number(offset), kview(ptr, len).slice());
+        return 0;
+      },
+
+      host_gpu_service_program: (slot, srcPtr, srcLen, entryPtr, entryLen) => {
+        const d = gpuService.device;
+        if (!d) return -1;
+        try {
+          const code = kstr(srcPtr, srcLen);
+          const entry = kstr(entryPtr, entryLen);
+          svcModules.set(slot >>> 0, { module: d.createShaderModule({ code }), entry });
+          return 0;
+        } catch (e) { console.error('[gpu.service] program', slot, e.message); return -3; }
+      },
+
+      // Compilation is asynchronous — a synchronous create stalls the whole
+      // device timeline while the backend compiles, queueing every later
+      // submit and map behind it. The provider polls; a dispatch against a
+      // pipeline that is not ready is REFUSED by the contract core, never
+      // skipped and reported as success.
+      host_gpu_service_pipeline: (slot, programSlot) => {
+        const d = gpuService.device;
+        const m = svcModules.get(programSlot >>> 0);
+        if (!d || !m) return -1;
+        const key = slot >>> 0;
+        svcPipelines.set(key, { pipeline: null, state: SVC_PENDING });
+        d.createComputePipelineAsync({
+          layout: 'auto',
+          compute: { module: m.module, entryPoint: m.entry },
+        }).then((pipeline) => {
+          svcPipelines.set(key, { pipeline, state: SVC_DONE });
+        }).catch((e) => {
+          console.error('[gpu.service] pipeline', key, 'failed:', e.message);
+          svcPipelines.set(key, { pipeline: null, state: -3 });
+        });
+        return 0;
+      },
+      host_gpu_service_poll_pipeline: (slot) => {
+        const e = svcPipelines.get(slot >>> 0);
+        return e ? e.state : -1;
+      },
+      host_gpu_service_release_pipeline: (slot) => { svcPipelines.delete(slot >>> 0); return 0; },
+      host_gpu_service_release_program: (slot) => { svcModules.delete(slot >>> 0); return 0; },
+
+      // Record and submit one already-validated item list. Sub-opcodes and
+      // field offsets are pinned against modules/sdk/wire/gpu_exec_wire.rs by
+      // tests/harness/tests/gpu_backend_wire.rs.
+      host_gpu_service_submit: (ticket, listPtr, listLen) => {
+        const d = gpuService.device;
+        if (!d) return -1;
         const view = kview(listPtr, listLen);
         const dv = new DataView(view.buffer, view.byteOffset, listLen);
-        const enc = cpDevice.createCommandEncoder();
+        const enc = d.createCommandEncoder();
         let off = 0, pass = null;
         try {
           while (off < listLen) {
-            const sub = dv.getUint8(off); off += 1;
-            if (sub === 0x01) { // DISPATCH
-              const pipeId = dv.getUint32(off, true); off += 4;
-              const nbind = dv.getUint32(off, true); off += 4;
+            const op = dv.getUint8(off); off += 1;
+            if (op === 0x01) { // DISPATCH
+              const pipeSlot = dv.getUint16(off, true); off += 2;
+              const nbind = dv.getUint16(off, true); off += 2;
               const entries = [];
               for (let i = 0; i < nbind; i++) {
                 const binding = dv.getUint32(off, true); off += 4;
-                const bufId = dv.getUint32(off, true); off += 4;
-                const be = cpBuffers.get(bufId >>> 0);
-                if (be) entries.push({ binding, resource: { buffer: be.buf } });
+                const bufSlot = dv.getUint16(off, true); off += 2;
+                off += 2; // pad
+                const boff = Number(dv.getBigUint64(off, true)); off += 8;
+                const bsize = Number(dv.getBigUint64(off, true)); off += 8;
+                const b = svcBuffers.get(bufSlot);
+                if (!b) throw new Error('unknown buffer slot ' + bufSlot);
+                entries.push({ binding, resource: { buffer: b, offset: boff, size: bsize } });
               }
               const gx = dv.getUint32(off, true); off += 4;
               const gy = dv.getUint32(off, true); off += 4;
               const gz = dv.getUint32(off, true); off += 4;
-              const pipe = cpPipelines.get(pipeId >>> 0);
-              if (!pipe) continue; // unknown pipeline; framing already advanced
-              const bg = cpDevice.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+              const pe = svcPipelines.get(pipeSlot);
+              if (!pe || !pe.pipeline) throw new Error('pipeline ' + pipeSlot + ' not ready');
+              const bg = d.createBindGroup({ layout: pe.pipeline.getBindGroupLayout(0), entries });
               if (!pass) pass = enc.beginComputePass();
-              pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+              pass.setPipeline(pe.pipeline);
+              pass.setBindGroup(0, bg);
               pass.dispatchWorkgroups(gx, gy, gz);
-            } else if (sub === 0x02) { // COPY (outside any compute pass)
-              const src = dv.getUint32(off, true); off += 4;
-              const srcOff = dv.getUint32(off, true); off += 4;
-              const dst = dv.getUint32(off, true); off += 4;
-              const dstOff = dv.getUint32(off, true); off += 4;
-              const len = dv.getUint32(off, true); off += 4;
+            } else if (op === 0x02) { // COPY
+              const src = dv.getUint16(off, true); off += 2;
+              const dst = dv.getUint16(off, true); off += 2;
+              const so = Number(dv.getBigUint64(off, true)); off += 8;
+              const dof = Number(dv.getBigUint64(off, true)); off += 8;
+              const len = Number(dv.getBigUint64(off, true)); off += 8;
+              // A copy is not a pass operation; close the open pass so the
+              // encoder can take it, preserving the caller's item order.
               if (pass) { pass.end(); pass = null; }
-              const s = cpBuffers.get(src >>> 0), d = cpBuffers.get(dst >>> 0);
-              if (s && d) enc.copyBufferToBuffer(s.buf, srcOff >>> 0, d.buf, dstOff >>> 0, len >>> 0);
-            } else { console.error('[compute] bad sub-op', sub, 'at', off - 1); break; }
+              const s = svcBuffers.get(src), t = svcBuffers.get(dst);
+              if (!s || !t) throw new Error('unknown copy slot');
+              enc.copyBufferToBuffer(s, so, t, dof, len);
+            } else {
+              throw new Error('bad exec op ' + op);
+            }
           }
           if (pass) pass.end();
-          cpDevice.queue.submit([enc.finish()]);
-          return 0;
-        } catch (e) { console.error('[compute] submit failed:', e.message); return -3; }
-      },
-
-      // Blit buffer `id` (w*h u32, r|g<<8|b<<16) to the canvas via readback.
-      host_gpu_compute_present: (bufId, w, h) => {
-        if (!cpDevice) return -1;
-        const e = cpBuffers.get(bufId >>> 0);
-        if (!cpPresentLogged) { cpPresentLogged = true; console.log('[compute] first present buf=' + bufId + ' ' + w + 'x' + h + (e ? '' : ' (UNKNOWN BUFFER)')); }
-        if (!e) return -1;
-        const n = (w >>> 0) * (h >>> 0);
-        if (n === 0) return -1;
-        if (cpReadBusy) return 0; // drop a frame while a readback is in flight
-        if (!cpRead || cpReadN < n) {
-          if (cpRead) cpRead.destroy();
-          cpRead = cpDevice.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-          cpReadN = n;
+          d.queue.submit([enc.finish()]);
+        } catch (e) {
+          console.error('[gpu.service] submit', ticket, 'failed:', e.message);
+          svcTickets.set(ticket >>> 0, { state: -3 });
+          return -3;
         }
-        cpReadBusy = true;
-        const enc = cpDevice.createCommandEncoder();
-        enc.copyBufferToBuffer(e.buf, 0, cpRead, 0, n * 4);
-        cpDevice.queue.submit([enc.finish()]);
-        cpRead.mapAsync(GPUMapMode.READ, 0, n * 4).then(() => {
-          const got = new Uint32Array(cpRead.getMappedRange(0, n * 4));
-          if (!cpMapLogged) { cpMapLogged = true; console.log('[compute] first present mapped (' + w + 'x' + h + ')'); }
-          cpEnsureCanvas(w, h);
-          const dst = cpImage.data;
-          for (let i = 0; i < n; i++) { const v = got[i]; const o = i * 4; dst[o] = v & 0xff; dst[o + 1] = (v >> 8) & 0xff; dst[o + 2] = (v >> 16) & 0xff; dst[o + 3] = 255; }
-          cpCtx.putImageData(cpImage, 0, 0);
-          cpRead.unmap();
-          cpReadBusy = false;
-        }).catch((err) => { console.error('[compute] present readback:', err.message); cpReadBusy = false; });
+        const key = ticket >>> 0;
+        svcTickets.set(key, { state: SVC_PENDING });
+        // Conservative queue completion: the fence answers when the queue has
+        // drained, which is a fact the API gives. A per-submit GPU timestamp
+        // is not available here, and the provider's outcome says so rather
+        // than reporting a CPU reading as one.
+        d.queue.onSubmittedWorkDone().then(() => {
+          const t = svcTickets.get(key);
+          if (t && t.state === SVC_PENDING) t.state = SVC_DONE;
+        }).catch(() => { svcTickets.set(key, { state: -3 }); });
         return 0;
       },
+      host_gpu_service_poll_submit: (ticket) => {
+        const t = svcTickets.get(ticket >>> 0);
+        return t ? t.state : -1;
+      },
+      host_gpu_service_release_ticket: (ticket) => { svcTickets.delete(ticket >>> 0); return 0; },
 
-      // Read `len` bytes from buffer `bufId` at `offset` back to the CPU. Async:
-      // the first call kicks off copy+map and returns -1 (pending); a later call
-      // with the mapped result copies into out_ptr and returns `len`. One
-      // outstanding at a time (a new request while busy stays pending).
-      host_gpu_compute_readback: (bufId, offset, outPtr, len) => {
-        if (!cpDevice) return -1;
+      // Async readback. The first call for a ticket starts copy+map and
+      // answers PENDING; a later one, once mapped, copies into `outPtr` and
+      // answers the byte count. Never blocks, because a blocking map here
+      // would stall every other consumer of the shared device.
+      host_gpu_service_readback: (ticket, slot, offset, outPtr, len) => {
+        const d = gpuService.device;
+        if (!d) return -1;
+        const key = ticket >>> 0;
         len = len >>> 0;
-        if (cpRb && cpRb.ready) {
+        const existing = svcReads.get(key);
+        if (existing) {
+          if (existing.state === SVC_PENDING) return -1;
+          if (existing.state < 0) { svcReads.delete(key); return -3; }
           try {
-            const src = new Uint8Array(cpRb.staging.getMappedRange(0, len));
-            kview(outPtr, len).set(src.subarray(0, len));
-          } catch (e) { console.error('[compute] readback copy:', e.message); }
-          cpRb.staging.unmap();
-          cpRb.staging.destroy();
-          cpRb = null;
+            const src = new Uint8Array(
+              existing.staging.getMappedRange(0, existing.span));
+            kview(outPtr, len).set(src.subarray(existing.lead, existing.lead + len));
+          } catch (e) {
+            console.error('[gpu.service] readback copy:', e.message);
+            svcReads.delete(key);
+            return -3;
+          }
+          existing.staging.unmap();
+          existing.staging.destroy();
+          svcReads.delete(key);
           return len;
         }
-        if (cpRb) return -1; // in flight
-        const e = cpBuffers.get(bufId >>> 0);
-        if (!e || len === 0) return -1;
-        const staging = cpDevice.createBuffer({ size: len, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-        const enc = cpDevice.createCommandEncoder();
-        enc.copyBufferToBuffer(e.buf, offset >>> 0, staging, 0, len);
-        cpDevice.queue.submit([enc.finish()]);
-        cpRb = { staging, ready: false };
-        staging.mapAsync(GPUMapMode.READ, 0, len)
-          .then(() => { if (cpRb) cpRb.ready = true; })
-          .catch((err) => { console.error('[compute] readback map:', err.message); if (cpRb) { cpRb.staging.destroy(); cpRb = null; } });
+        const b = svcBuffers.get(slot >>> 0);
+        if (!b || len === 0) return -3;
+        // Copy offsets and sizes are 4-aligned in WebGPU; round the window out
+        // and trim, so a byte-granular request still works.
+        const start = Number(offset) & ~3;
+        const lead = Number(offset) - start;
+        const span = Math.ceil((lead + len) / 4) * 4;
+        const staging = d.createBuffer({
+          size: span,
+          usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        const enc = d.createCommandEncoder();
+        enc.copyBufferToBuffer(b, start, staging, 0, span);
+        d.queue.submit([enc.finish()]);
+        const entry = { staging, span, lead, len, state: SVC_PENDING };
+        svcReads.set(key, entry);
+        staging.mapAsync(GPUMapMode.READ, 0, span)
+          .then(() => { entry.state = SVC_DONE; })
+          .catch((err) => {
+            console.error('[gpu.service] readback map:', err.message);
+            entry.state = -3;
+          });
         return -1;
       },
+
+      // Physical quiescence: the queue has drained, which is what a drain
+      // must wait for. An empty channel proves nothing about a device.
+      host_gpu_service_drain: (ticket) => {
+        const d = gpuService.device;
+        if (!d) return -1;
+        const key = ticket >>> 0;
+        if (svcTickets.has(key)) return svcTickets.get(key).state;
+        svcTickets.set(key, { state: SVC_PENDING });
+        d.queue.onSubmittedWorkDone()
+          .then(() => { const t = svcTickets.get(key); if (t) t.state = SVC_DONE; })
+          .catch(() => { svcTickets.set(key, { state: -3 }); });
+        return SVC_PENDING;
+      },
+
+      // The device epoch. A bump means every handle minted before it is dead;
+      // the provider watches this so a loss is reported rather than silently
+      // producing work against objects that no longer exist.
+      host_gpu_service_epoch: () => gpuService.epoch >>> 0,
     };
 
     return {
@@ -3047,7 +3198,7 @@ registerProcessor('pcm-ring', PcmRing);
         imageShim,
         moduleShim,
         webgpuShim,
-        computeShim
+        gpuServiceShim
       ),
     };
   }

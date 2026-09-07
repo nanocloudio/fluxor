@@ -262,6 +262,45 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
         &[("cutoff", &["ring_handoff", "wire"])],
     ),
     (
+        // What a GPU provider offers, on terms a composer can check before
+        // anything runs. Deliberately NOT the numeric capability record —
+        // allocation limits, workgroup shapes and per-type arithmetic are
+        // runtime facts a provider answers to `QUERY_CAPS`, and a compose-time
+        // copy of them would be a second source of truth that drifts. These
+        // three are the ones that decide whether a graph can be built at all.
+        //
+        // Declared on the parent, so `gpu.compute` and `gpu.render` share one
+        // schema through the parent walk rather than repeating it: a device
+        // that does both declares both names on the same terms, because it is
+        // one device.
+        "gpu",
+        &[
+            (
+                // Which implementation answers. Reported so a measurement can
+                // name its provider, never requested — a consumer that needs
+                // a property asks for the property.
+                "backend",
+                &["null", "replay", "webgpu", "wgpu_native", "v3d_direct"],
+            ),
+            // Whether results can come back to the CPU at all. A headless
+            // compute graph that cannot read its own output is a composition
+            // error worth catching at build time.
+            ("readback", &["yes", "no"]),
+            // Whether a device-resident resource can be handed to a sink
+            // without a CPU round trip.
+            ("shared_surface", &["yes", "no"]),
+        ],
+    ),
+    (
+        // What a scanout surface actually costs to hand on. A zero-copy claim
+        // is a measurement, so `unproven` is the honest default and the only
+        // value a provider may declare before it has one — the alternative is
+        // a graph composed on the belief that a copy it is paying for is not
+        // happening.
+        "video.scanout",
+        &[("transfer", &["zero_copy", "readback_copy", "unproven"])],
+    ),
+    (
         // Where a target's calendar time comes from — the strongest source
         // class its HAL can report `TRUSTED`, in `trusted_time::source`
         // terms. A target with none does not carry the capability at all.

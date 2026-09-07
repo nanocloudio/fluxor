@@ -98,8 +98,9 @@ mod audio;
 #[path = "wasm/gpu.rs"]
 mod gpu;
 
-#[path = "wasm/compute.rs"]
-mod compute;
+// The generic GPU provider, on the page's one shared WebGPU device.
+#[path = "wasm/gpu_compute.rs"]
+mod gpu_compute;
 
 #[path = "wasm/websocket.rs"]
 mod websocket;
@@ -1187,13 +1188,13 @@ unsafe fn load_embedded_modules() -> usize {
             continue;
         }
 
-        // Generic GPU compute driver — the compute sibling of wasm_browser_gpu.
-        // Consumes an app-supplied compute command stream (pipelines, buffers,
-        // dispatch lists, present) on the input port and forwards it to the
-        // backend-agnostic host_gpu_compute_* surface. Holds no application
-        // knowledge; a Vulkan or bare-metal backend implements the same imports.
+        // Generic GPU provider. The same contract and the same shared cores
+        // as the null/replay and native providers; only the device objects
+        // behind the slot numbers differ. Draws from the page's one WebGPU
+        // device, so a compute output can be handed to raster without a CPU
+        // round trip.
         if entry.name_hash == WASM_BROWSER_COMPUTE_HASH {
-            let heap_bytes = compute::heap_size_for();
+            let heap_bytes = gpu_compute::heap_size_for();
             if !init_builtin_heap_sized(module_idx, heap_bytes) {
                 log_fmt2(
                     3,
@@ -1205,9 +1206,8 @@ unsafe fn load_embedded_modules() -> usize {
                 continue;
             }
             let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-            // Optional output port (index 0) for READBACK results; -1 if unwired.
             let out_chan = scheduler::get_module_port(module_idx, 1, 0);
-            let m = compute::build(in_chan, out_chan);
+            let m = gpu_compute::build(in_chan, out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
             log_fmt2(

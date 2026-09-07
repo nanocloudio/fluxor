@@ -145,9 +145,9 @@ host_image_decode_open / host_image_decode_url /
 host_image_decode_size / host_image_decode_recv /
 host_image_decode_close
 
-// Generic GPU surfaces (§4.4).
+// Generic GPU surfaces (§4.4). One adapter and one device serve both.
 host_gpu_raster_*                          // pipelines, buffers, passes, draw, frame
-host_gpu_compute_*                         // pipelines, buffers, submit, present, readback
+host_gpu_service_*                         // the GPU contract's device half
 
 // Camera capture and decoded-scan display.
 host_camera_frame(buf, len) -> i32         // [w:u16][h:u16][luma w*h] frames
@@ -213,7 +213,7 @@ Media, transport, and diagnostics:
 | `wasm_browser_canvas`   | `pixels` in (`VideoRaster`) | §4.2 |
 | `wasm_browser_image_codec` | `encoded` in (`OctetStream`) → `pixels` out (`VideoRaster`) | §4.3 |
 | `wasm_browser_gpu`      | `commands` in (`OctetStream`) | §4.4 |
-| `wasm_browser_compute`  | `commands` in, `readback` out (`OctetStream`) | §4.4 |
+| `wasm_browser_compute`  | `commands` in (`GpuCommand`), `outcomes` out (`GpuOutcome`) | §4.4 |
 | `wasm_browser_websocket`| `tx` in / `rx` out (`OctetStream`) | §4.5 |
 | `wasm_browser_ws_source`| `bytes` out (`VideoRaster`) | §4.5 |
 | `host_browser_fetch`    | `bytes` out (`OctetStream`) | §4.6 |
@@ -275,38 +275,41 @@ RGB565 `VideoRaster` out, with the decode delegated to the browser via
 
 ### 4.4 `wasm_browser_gpu` / `wasm_browser_compute` — generic GPU surfaces
 
-Source: `src/platform/wasm/gpu.rs`, `src/platform/wasm/compute.rs`.
+Source: `src/platform/wasm/gpu.rs`, `src/platform/wasm/gpu_compute.rs`.
 
-Backend-agnostic GPU drivers. Both modules hold no application
-knowledge: no shaders, no vertex or pixel semantics. The application
-ships its shaders as data on the input channel and describes the work
-as a command stream; the driver frames the stream and forwards it to
-the backend imports:
+Backend-agnostic GPU drivers. Neither holds application knowledge: no
+shaders, no vertex or pixel semantics. The application ships its
+shaders as data and describes the work as a command stream.
 
 - **Raster** (`wasm_browser_gpu`, `capabilities = ["gpu.render",
   "display.scanout"]`) → `host_gpu_raster_*`: app-supplied render
-  pipelines (WGSL, with SPIR-V as the declared format for non-browser
-  backends), vertex / index / uniform buffers (single-shot or
+  pipelines (WGSL), vertex / index / uniform buffers (single-shot or
   streamed), draw calls, and frame lifecycle, presenting to a canvas.
   The command byte layout is documented in the module doc-comment in
-  `src/platform/wasm/gpu.rs`.
+  `src/platform/wasm/gpu.rs`. Present timing is the application's
+  decision — pace it on the audio `STREAM_TIME` clock for A/V sync.
 - **Compute** (`wasm_browser_compute`, `capabilities =
-  ["gpu.compute", "display.scanout"]`) → `host_gpu_compute_*`:
-  app-supplied compute pipelines, storage / uniform buffers, dispatch
-  command lists (a whole frame's dispatches in one `SUBMIT`), present
-  of a result buffer, and optional readback to the output channel.
-  Opcodes and byte layout are defined in
-  `src/platform/wasm/compute.rs`, which producers include so the two
-  sides cannot drift.
+  ["gpu.compute"]`) → `host_gpu_service_*`: the generic GPU contract
+  (`docs/architecture/gpu_contract.md`) — program packs, buffers and
+  bounded views, dependency-ordered submissions, fences, structured
+  outcomes and readback. Validation, handles, sealing, residency,
+  output commit and epochs are the shared cores; the JavaScript half
+  owns device objects and nothing else.
 
-The browser backend is WebGPU. The import surfaces are backend-neutral
-by name: another platform can implement the same `host_gpu_raster_*` /
-`host_gpu_compute_*` imports against a different API, and a graph
-wired to these modules runs unchanged, shipping the shader variant the
-backend needs. Domain-specific GPU pipelines (a console rasteriser, a
-scientific kernel) are applications that consume these surfaces; they
-live out of tree. Present timing is the application's decision — pace
-it on the audio `STREAM_TIME` clock for A/V sync.
+Both draw from **one adapter and one device** for the whole page.
+WebGPU resources belong to the device that created them, so a second
+device would be a disjoint resource world: a buffer a compute shader
+wrote could not be bound as raster geometry without a CPU round trip at
+every hand-off. Sharing a device does not merge the surfaces'
+capabilities or oblige either to own a swapchain — it only makes the
+hand-off expressible.
+
+The browser backend is WebGPU. The compute surface's contract is the
+same one the native (`linux_gpu`) and null/replay (`gpu_null`)
+providers implement, so a graph wired to it runs unchanged on any of
+them, shipping the program pack the target accepts. Domain-specific
+GPU pipelines (a console rasteriser, a scientific kernel) are
+applications that consume these surfaces; they live out of tree.
 
 ### 4.5 WebSocket built-ins
 
