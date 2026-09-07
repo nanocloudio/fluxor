@@ -146,8 +146,14 @@ The director answers with one `CMD_PKT_DISPOSE` (0x53) on `packet_in`:
 
 Ownership follows the disposition: a buffer has one owner at a time and
 a second disposition for the same `pkt_id` is stale — `pkt_id` is
-`[slot][generation]`, so a released or reused slot cannot be acted on
-twice. `CMD_PKT_CLONE` (0x54) holds a second copy under a new id
+`[slot:8][generation:24]`, so a released or reused slot cannot be acted
+on twice. The split is lopsided deliberately: the slot takes the bits it
+needs and the generation takes the rest, because a generation coming all
+the way round while one disposition is still in flight is the only way a
+stale id could match a live hold. Twenty-four bits is 16.7 million
+intakes against a hold the deadline already bounds — a generation narrow
+enough for a line-rate burst to wrap would put that match back within
+reach. `CMD_PKT_CLONE` (0x54) holds a second copy under a new id
 (`MSG_PKT_CLONED` 0x66) for a director that mirrors.
 
 The hold is bounded twice. `abi::config::ip::MAX_PACKET_HOLD` slots
@@ -158,6 +164,18 @@ reported (`MSG_PKT_EXPIRED` 0x67). A forward that does not fit the
 forward ring stays held with its disposition pending and is retried each
 step until it goes or expires.
 
+Those two bounds are what a director is sized against. The slots are the
+in-flight decision window, so a director answering in `t` sustains an
+offered rate of at most `MAX_PACKET_HOLD / t` decidable packets per
+second before arrivals start being refused; `packet_hold_ms` is the hard
+ceiling on any single decision, past which the packet is released whether
+the director has answered or not. Both are arithmetic over declared
+constants and hold regardless of hardware. What is NOT declared here is
+the seam's own per-packet cost — the frame copy into the slot and the
+round trip to the director — which is a measured quantity per platform
+and profile, not a property of the contract. A director design that
+depends on it needs that measurement, not this relation.
+
 The seam is wholly present or wholly absent: `packet_decision = off`
 (the default) with the ports unwired is byte-identical to a stack without
 it, and either half without the other is refused at construct. Tables,
@@ -165,6 +183,17 @@ affinity, health and policy are the director's; `ip` supplies the
 validated headers, the buffer, and the ownership rules.
 `modules/fixtures/packet_echo_director` is the reference director for
 the harness and the rig.
+
+`MSG_PKT_FORWARD` hands the whole frame to whatever consumes `packet_fwd`,
+and that consumer does the wire work a TUNNEL or DSR disposition implies:
+encapsulation, address and MAC rewrite, egress, and the return path. That
+work is a fluxor capability rather than a director's, by the same test
+every contract here answers to — encapsulating a frame means the same
+thing on bare metal and on a host stack, it is a primitive rather than a
+policy, and it is consumed across tenants. The director chooses WHICH
+attachment or endpoint; it does not put bytes on the wire. Nothing in the
+tree consumes `packet_fwd` beyond the harness fixture, so a composition
+using TUNNEL or DSR supplies that consumer itself.
 
 ### Multiplexed Session Surface
 

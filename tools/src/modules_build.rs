@@ -250,6 +250,9 @@ struct VariantRaw {
     #[serde(default)]
     #[allow(dead_code, reason = "consumed by Manifest::apply_variant at pack time")]
     omit_ports: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code, reason = "validated and applied at manifest packing")]
+    omit_capabilities: Vec<String>,
 }
 
 /// Editions `rustc` accepts today. Kept explicit so a manifest typo

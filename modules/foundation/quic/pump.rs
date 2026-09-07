@@ -185,10 +185,10 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                     let digest = ticket_digest(id_bytes);
                     let now_ms = dev_millis(sys);
                     // A ticket opens only under the key that sealed it and
-                    // the incarnation of the boot that minted it, so both
-                    // must be in hand before there is anything to open.
+                    // the replay domain it was minted in, so both must be
+                    // in hand before there is anything to open.
                     let sealing = if key >= 0 {
-                        dev_boot_incarnation(sys)
+                        replay_domain(&mut s.replay_domain, sys)
                     } else {
                         None
                     };
@@ -200,8 +200,8 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                         // handshake continues as a full one.
                         let msg = b"[quic] ticket replay rejected";
                         dev_log(sys, 2, msg.as_ptr(), msg.len());
-                    } else if let Some(incarnation) = sealing {
-                        let aad = ticket_aad(parity as u8, &incarnation);
+                    } else if let Some(domain) = sealing {
+                        let aad = ticket_aad(parity as u8, &domain);
                         let mut pt = [0u8; TICKET_PT_LEN];
                         let n = vault_open(sys, key, &aad, &id_bytes[1..], &mut pt);
                         if n == TICKET_PT_LEN {
@@ -214,9 +214,9 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                             ]);
                             let lifetime_s = u32::from_le_bytes([pt[63], pt[64], pt[65], pt[66]]);
                             // RFC 8446 §4.6.1 — ticket lifetime check.
-                            // `issue_ms` is this boot's uptime reading, and
-                            // the AAD has already established that the
-                            // ticket belongs to this boot, so the two
+                            // `issue_ms` is this instance's uptime
+                            // reading, and the AAD has already established
+                            // that the ticket was minted here, so the two
                             // readings are on one timeline.
                             let elapsed_ms = now_ms.saturating_sub(issue_ms);
                             let lifetime_ok = elapsed_ms <= (lifetime_s as u64) * 1000;
@@ -941,15 +941,15 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
         return;
     }
     // Resumption that cannot be sealed is not offered, and the handshake
-    // stays a full one. That needs both a key and an incarnation: a ticket
-    // outliving its host's memory of issuing it is a replay held open by a
-    // restart.
+    // stays a full one. That needs both a key and a replay domain: a
+    // ticket outliving the store that records its use is a replay waiting
+    // for the next restart.
     let parity = s.ticket_parity as usize;
     let key = s.ticket_key[parity];
     if key < 0 {
         return;
     }
-    let Some(incarnation) = dev_boot_incarnation(sys) else {
+    let Some(domain) = replay_domain(&mut s.replay_domain, sys) else {
         return;
     };
     // Random ticket_age_add + 8-byte nonce.
@@ -974,7 +974,7 @@ unsafe fn emit_new_session_ticket(s: &mut QuicState, idx: usize) {
     pt[55..63].copy_from_slice(&now_ms.to_le_bytes());
     pt[63..67].copy_from_slice(&lifetime_s.to_le_bytes());
     pt[67..75].copy_from_slice(&nonce);
-    let aad = ticket_aad(parity as u8, &incarnation);
+    let aad = ticket_aad(parity as u8, &domain);
     let mut ticket_bytes = [0u8; MAX_TICKET_LEN];
     ticket_bytes[0] = parity as u8;
     let sealed = vault_seal(sys, key, &aad, &pt, &mut ticket_bytes[1..]);

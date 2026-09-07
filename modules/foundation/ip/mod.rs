@@ -760,7 +760,7 @@ pub struct HeldPacket {
     local_slot: u16,
     /// Generation stamped into the `pkt_id`; a disposition naming another
     /// generation is stale.
-    gen: u16,
+    gen: u32,
     len: u16,
     l3_off: u16,
     deadline_ms: u32,
@@ -902,7 +902,7 @@ struct IpState {
     /// How long a packet is held awaiting disposition before release.
     pkt_hold_ms: u16,
     /// Generation stamped into the next hold; never 0.
-    pkt_gen: u16,
+    pkt_gen: u32,
     /// Hold slots in use — the seam's live gauge.
     pkt_held: u16,
     pkt_stats: PktSeamStats,
@@ -3411,16 +3411,36 @@ unsafe fn hold_free(s: &mut IpState, slot: usize) {
     }
 }
 
+/// Every hold slot has to be nameable in the slot field the contract
+/// declares.
+const _: () =
+    assert!(MAX_PACKET_HOLD <= (1usize << abi::contracts::net::packet::PKT_SLOT_BITS));
+
 /// `pkt_id` for a slot under its current generation.
-fn hold_id(slot: usize, gen: u16) -> u32 {
-    (slot as u32) | ((gen as u32) << 16)
+fn hold_id(slot: usize, gen: u32) -> u32 {
+    abi::contracts::net::packet::pkt_id(slot, gen)
+}
+
+/// Move to the generation the next hold is stamped with.
+///
+/// Wraps to one rather than zero: a `pkt_id` of all zeroes is what an
+/// uninitialised field looks like, and it names no hold at any slot.
+/// Wrapping at all is what a late disposition would have to outlive to
+/// match a slot since reused, which is why the generation gets every bit
+/// the slot does not need.
+fn hold_bump_gen(s: &mut IpState) {
+    s.pkt_gen = if s.pkt_gen + 1 >= abi::contracts::net::packet::PKT_GEN_MODULUS {
+        1
+    } else {
+        s.pkt_gen + 1
+    };
 }
 
 /// The live slot a `pkt_id` names, or `None` when it names a released or
 /// reused one.
 unsafe fn hold_lookup(s: &IpState, pkt_id: u32) -> Option<usize> {
-    let slot = (pkt_id & 0xFFFF) as usize;
-    let gen = (pkt_id >> 16) as u16;
+    let slot = abi::contracts::net::packet::pkt_slot(pkt_id);
+    let gen = abi::contracts::net::packet::pkt_generation(pkt_id);
     if slot >= MAX_PACKET_HOLD {
         return None;
     }
@@ -3508,11 +3528,7 @@ unsafe fn seam_intake(
     h.deadline_ms = (now_ms as u32).wrapping_add(u32::from(hold_ms));
     h.pending_fwd[0] = 0xFF;
     core::ptr::copy_nonoverlapping(s.rx_frame.as_ptr(), h.frame.as_mut_ptr(), frame_len);
-    s.pkt_gen = if s.pkt_gen == u16::MAX {
-        1
-    } else {
-        s.pkt_gen + 1
-    };
+    hold_bump_gen(s);
     s.pkt_held += 1;
     s.pkt_stats.decided = s.pkt_stats.decided.wrapping_add(1);
 }
@@ -3760,11 +3776,7 @@ unsafe fn clone_held(s: &mut IpState, pkt_id: u32) {
                 core::ptr::copy_nonoverlapping(from, to, 1);
                 (*to).gen = gen;
                 (*to).pending_fwd[0] = 0xFF;
-                s.pkt_gen = if s.pkt_gen == u16::MAX {
-                    1
-                } else {
-                    s.pkt_gen + 1
-                };
+                hold_bump_gen(s);
                 s.pkt_held += 1;
                 s.pkt_stats.cloned = s.pkt_stats.cloned.wrapping_add(1);
                 hold_id(dst, gen)

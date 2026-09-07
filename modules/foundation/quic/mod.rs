@@ -172,18 +172,25 @@ const MAX_TICKETS: usize = 4;
 /// leaves the previous generation openable until its tickets age out; a
 /// ticket names the parity that sealed it.
 ///
-/// A ticket may not outlive the boot that minted it, and nothing else here
-/// enforces that: the sealing key is persistent, the replay store is RAM
-/// that a restart clears, and `issue_ms` is an uptime reading that a
-/// restart moves backwards — which pins `elapsed` at zero and satisfies
-/// the lifetime check for good. So this boot's incarnation is part of the AAD, and a
-/// ticket from another boot does not fail a check: it does not open
-/// (RFC 8446 §8, RFC 9001 §9.2).
+/// A ticket may not outlive the replay store that enforces its single use,
+/// and nothing else here enforces that: the sealing key is persistent
+/// across both a restart and a re-instantiation, while the store is RAM
+/// that starts empty. `issue_ms` does not cover the gap either — it is an
+/// uptime reading a restart moves backwards, which pins `elapsed` at zero
+/// and satisfies the lifetime check for good.
+///
+/// So the AAD carries this instance's replay domain, drawn once from the
+/// CSPRNG and living exactly as long as the store beside it. A ticket
+/// minted under any other domain — another boot, or another instance in
+/// this one — does not fail a check: it does not open. Anything longer
+/// lived than the store would not do: a value scoped to the boot, say,
+/// survives a re-instantiation and would let the replacement re-open every
+/// ticket its predecessor had already spent (RFC 8446 §8, RFC 9001 §9.2).
 const TICKET_AAD: &[u8] = b"quic-ticket-v1";
 const TICKET_LABEL: [&[u8]; 2] = [b"quic-resume-0", b"quic-resume-1"];
-/// `TICKET_AAD` + parity + this boot's incarnation. Derived from the label
-/// so that changing the label cannot leave a stale length that still
-/// compiles.
+/// `TICKET_AAD` + parity + this instance's replay domain. Derived from the
+/// label rather than written out, so changing the label cannot leave a
+/// stale length behind that still compiles.
 const TICKET_AAD_LEN: usize = TICKET_AAD.len() + 1 + 16;
 /// Tickets claimed against replay, held for the claim's whole acceptance
 /// window and never reclaimed under pressure — that window is precisely
@@ -288,6 +295,10 @@ pub(crate) struct QuicState {
     ticket_rotated_ms: u64,
     /// Accepted tickets held against replay for their acceptance window.
     ticket_seen: [TicketClaim; TICKET_SEEN],
+    /// The domain the store above defends, mixed into every ticket's AAD.
+    /// Drawn on first use rather than at construction, since the entropy
+    /// source need not have answered by then; all-zero means undrawn.
+    replay_domain: [u8; 16],
     /// Client-side ticket cache (per-peer).
     client_tickets: [ClientTicketEntry; MAX_TICKETS],
     /// Set after the client kicks off a 0-RTT resumption attempt so
@@ -458,6 +469,7 @@ pub unsafe extern "C" fn module_new(
     s.ticket_rotate_s = 3600;
     s.ticket_rotated_ms = 0;
     s.ticket_seen = [TicketClaim::EMPTY; TICKET_SEEN];
+    s.replay_domain = [0u8; 16];
     s.pending_resumption_test = false;
     s.alpn_cfg_len = 0;
     let mut t = 0;
@@ -895,14 +907,34 @@ unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
     dev_log(sys, 3, msg.as_ptr(), msg.len());
 }
 
-/// The AAD both seal and open must agree on: label, parity, and the boot
-/// incarnation that binds a ticket to the life of the host that minted it.
-fn ticket_aad(parity: u8, incarnation: &[u8; 16]) -> [u8; TICKET_AAD_LEN] {
+/// The AAD both seal and open must agree on: label, parity, and the replay
+/// domain that ties a ticket to the store enforcing its single use.
+fn ticket_aad(parity: u8, domain: &[u8; 16]) -> [u8; TICKET_AAD_LEN] {
     let mut aad = [0u8; TICKET_AAD_LEN];
     aad[..TICKET_AAD.len()].copy_from_slice(TICKET_AAD);
     aad[TICKET_AAD.len()] = parity;
-    aad[TICKET_AAD.len() + 1..].copy_from_slice(incarnation);
+    aad[TICKET_AAD.len() + 1..].copy_from_slice(domain);
     aad
+}
+
+/// This instance's replay domain, drawn on first use. `None` while the
+/// entropy source has not answered: a domain of zeros is the absence of
+/// one, and issuing or accepting under it would let any instance open
+/// another's tickets.
+///
+/// Takes the domain itself rather than the state, so the borrow stays
+/// disjoint from a connection being driven — the same shape
+/// [`ticket_claim_held`] uses for the store beside it.
+unsafe fn replay_domain(domain: &mut [u8; 16], sys: &SyscallTable) -> Option<[u8; 16]> {
+    if *domain != [0u8; 16] {
+        return Some(*domain);
+    }
+    let mut v = [0u8; 16];
+    if dev_csprng_fill(sys, v.as_mut_ptr(), 16) < 0 || v == [0u8; 16] {
+        return None;
+    }
+    *domain = v;
+    Some(v)
 }
 
 /// First 16 bytes of SHA-256 over a ticket: what the replay store holds.

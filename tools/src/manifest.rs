@@ -682,6 +682,8 @@ pub struct VariantDecl {
     /// already-resolved indices (omission leaves holes, never shifts —
     /// module code addresses ports positionally).
     pub omit_ports: Vec<String>,
+    /// Provider capabilities absent from this artifact.
+    pub omit_capabilities: Vec<String>,
 }
 
 /// Fine-grained module permissions. Each category gates a specific
@@ -1659,6 +1661,10 @@ impl Manifest {
             }));
         };
         let omit = decl.omit_ports.clone();
+        let omitted_caps = decl.omit_capabilities.clone();
+        self.capabilities.retain(|c| !omitted_caps.contains(c));
+        self.capability_facts
+            .retain(|c, _| !omitted_caps.contains(c));
         self.ports.retain(|p| {
             p.name
                 .as_deref()
@@ -2101,6 +2107,14 @@ impl Manifest {
                 if v.default {
                     default_count += 1;
                 }
+                for capability in &v.omit_capabilities {
+                    if !capabilities.contains(capability) {
+                        return Err(Error::Module(format!(
+                            "variant '{}' omits unknown capability '{}'",
+                            v.name, capability
+                        )));
+                    }
+                }
                 for op in &v.omit_ports {
                     if !port_names.contains(op.as_str()) {
                         return Err(Error::Module(format!(
@@ -2126,6 +2140,7 @@ impl Manifest {
                     features: v.features.unwrap_or_default(),
                     default: v.default,
                     omit_ports: v.omit_ports,
+                    omit_capabilities: v.omit_capabilities,
                 })
                 .collect();
         }
@@ -2639,6 +2654,8 @@ struct TomlVariant {
     default: bool,
     #[serde(default)]
     omit_ports: Vec<String>,
+    #[serde(default)]
+    omit_capabilities: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]

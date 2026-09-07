@@ -134,9 +134,18 @@ pub const MSG_PKT_ERROR: u8 = 0x63;
 // this seam; those are the director's.
 //
 // Three ports carry it: decision records out, dispositions in, forwarded
-// frames out. `pkt_id` is `[slot:u16][generation:u16]`, so a disposition
-// for a packet already released — or for a reused slot — is refused as
-// stale rather than acted on.
+// frames out. `pkt_id` is `[slot][generation]`, split by [`PKT_SLOT_BITS`]
+// — a slot index needs only as many bits as there are slots, and the rest
+// go to the generation, which is what makes a disposition naming a reused
+// slot fail to match. A disposition for a packet already released — or for
+// a reused slot — is refused as stale rather than acted on.
+//
+// A director never has to take a `pkt_id` apart: it echoes the value back.
+// The split is declared here anyway, once, with accessors, because the
+// provider and its tests do take it apart, and a reader that counts bits
+// out of somebody else's field is invisible to both review and the
+// compiler — a split that moves breaks it silently, and the failure
+// surfaces as a wrong answer rather than a parse error.
 
 /// Consumer → provider: settle one held packet. Payload:
 /// `[pkt_id: u32 LE] [disposition: u8] [args...]` — see `DISP_*` for the
@@ -192,6 +201,37 @@ pub const DISP_ARGS_LEN: usize = 6;
 
 /// The `pkt_id` that names no packet.
 pub const PKT_ID_NONE: u32 = u32::MAX;
+
+/// Low bits of a `pkt_id` holding the hold-slot index; the rest are the
+/// generation. Eight is comfortably above any profile's hold depth, and
+/// every bit not spent on the slot buys time before the generation wraps
+/// — wrap being the one way a `pkt_id` held long enough could name a slot
+/// that has since been reused.
+pub const PKT_SLOT_BITS: u32 = 8;
+
+/// Generation values before the counter repeats one for a given slot.
+pub const PKT_GEN_MODULUS: u32 = 1 << (32 - PKT_SLOT_BITS);
+
+/// The hold slot a `pkt_id` names.
+#[inline]
+#[must_use]
+pub fn pkt_slot(id: u32) -> usize {
+    (id & ((1 << PKT_SLOT_BITS) - 1)) as usize
+}
+
+/// The generation a `pkt_id` names.
+#[inline]
+#[must_use]
+pub fn pkt_generation(id: u32) -> u32 {
+    id >> PKT_SLOT_BITS
+}
+
+/// The `pkt_id` naming `slot` under `generation`.
+#[inline]
+#[must_use]
+pub fn pkt_id(slot: usize, generation: u32) -> u32 {
+    (slot as u32) | (generation << PKT_SLOT_BITS)
+}
 
 /// Dispositions, and the argument bytes each carries.
 pub mod disposition {

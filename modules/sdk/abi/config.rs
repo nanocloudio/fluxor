@@ -166,11 +166,14 @@ mod profile_host {
         pub const LOG_RING_CAPACITY: usize = 65536;
         /// Kernel elastic region backing Tier B chunk grants
         /// (`resource::ELASTIC_ALLOC`).
-        /// 8 MiB: room for TLS-session growth to its compiled maximum
-        /// (~832 KiB) plus several workloads' worth of headroom, and
-        /// deliberately oversubscribable — Σ of pool maxima MAY exceed
+        /// 16 MiB: room for TLS-session growth to its compiled maximum
+        /// (~7.9 MiB at `tls::MAX_SESSIONS`, once 104 KiB chunks round up
+        /// to the quantum below) plus several workloads' worth of headroom,
+        /// and deliberately oversubscribable — Σ of pool maxima MAY exceed
         /// it; contention is a counted denial, mins are load-time.
-        pub const ELASTIC_REGION_SIZE: usize = 8 * 1024 * 1024;
+        /// Zero-initialised, so the size costs kernel `.bss` rather than
+        /// image.
+        pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
         /// Grant granularity: chunks are rounded up to this quantum
         /// (the 64 KiB platform quantum, §3.1).
         pub const ELASTIC_QUANTUM: usize = 64 * 1024;
@@ -302,18 +305,51 @@ mod profile_host {
         /// does NOT bound on its own: an accept the tls module cannot seat is
         /// closed before http ever sees it. Published here so a consumer reads
         /// the envelope it actually has rather than inferring one from the
-        /// HTTP number. Sixty-four sessions is ~830 KiB of elastic pool on
-        /// aarch64; the module grows it in 8-session chunks.
-        pub const MAX_SESSIONS: usize = 64;
+        /// HTTP number.
+        ///
+        /// A seat costs ~13 KiB, and ~12 KiB of that is handshake scratch:
+        /// a session embeds a `HandshakeDriver` by value, whose `in_buf`
+        /// (8 KiB) and `out_buf` (4 KiB) stay resident for the session's
+        /// whole life though only its handshake reads them. A seat is
+        /// therefore priced by the handshake it runs once, not by the
+        /// traffic it carries after.
+        ///
+        /// The ceiling is generous anyway because the pool is elastic:
+        /// `SESSION_CHUNK` seats are inline and the rest arrive in
+        /// 8-session chunks from `kernel::ELASTIC_REGION_SIZE` as they are
+        /// needed, so an idle stack pays for eight. A grant the region
+        /// denies is a counted refusal and the accept is closed, not a
+        /// fault.
+        ///
+        /// It bounds ONE instance, and instances do not add up the way the
+        /// number invites. A chunk asks 8 × ~13 KiB ≈ 104 KiB and rounds up
+        /// to the 64 KiB grant quantum, so it takes 128 KiB: 512 seats are
+        /// 63 granted chunks ≈ 7.9 MiB, and the 16 MiB region holds 128
+        /// chunks — the same depth as the kernel's chunk table — for about
+        /// 1,024 seats shared across every elastic pool on the host.
+        /// Multiplying this ceiling by the instance count therefore
+        /// overstates what a host can hold; two saturated instances are
+        /// already the region.
+        pub const MAX_SESSIONS: usize = 512;
     }
 
     pub mod quic {
         /// QUIC connection table. A connection carries ~58 KiB of state, so
-        /// the table is ~464 KiB — the dominant term in this module's
-        /// footprint, and why the ceiling is eight rather than a round
-        /// number. One past it is refused with a stateless
+        /// the table is ~3.6 MiB — the dominant term in this module's
+        /// footprint. One past the ceiling is refused with a stateless
         /// CONNECTION_REFUSED Initial.
-        pub const MAX_CONNS: usize = 8;
+        ///
+        /// Every seat is paid resident: the table is a field of the module
+        /// state, not an elastic pool like `tls::MAX_SESSIONS`, so the
+        /// ceiling costs its full width whether or not the connections
+        /// exist. Roughly 13 KiB of a seat is the embedded
+        /// `HandshakeDriver`, idle once the connection is established; the
+        /// remaining ~45 KiB is state a live connection genuinely needs —
+        /// stream buffers, ACK and loss tracking, per-level keys — so this
+        /// ceiling, unlike the TLS one, is not mostly scratch. Sixty-four
+        /// sits against the headroom `kernel::STATE_ARENA_SIZE` leaves
+        /// beside the connection table.
+        pub const MAX_CONNS: usize = 64;
     }
 
     pub mod h2 {
