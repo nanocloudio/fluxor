@@ -79,8 +79,7 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
     // The module directory and pin/pio bounds use the target's
     // declared geometry so a host-target validate doesn't try to
     // load .fmod files from an embedded target tree.
-    let modules_dir_default = format!("target/fluxor/{}/modules", target_desc.id);
-    let modules_dir = std::path::PathBuf::from(&modules_dir_default);
+    let modules_dir = crate::modules_build::modules_dir_for(&target_desc);
     let search_paths = crate::config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
     let dry_run_builder = ConfigBuilder::new();
@@ -1084,8 +1083,8 @@ fn cmd_diff(old_path: &PathBuf, new_path: &PathBuf, target_override: Option<&str
     let new_config: serde_json::Value = serde_yaml::from_str(&new_content)?;
 
     let target_desc = resolve_target(&new_config, target_override)?;
-    let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
-    let modules_dir = std::path::Path::new(&modules_dir_path);
+    let modules_dir = crate::modules_build::modules_dir_for(&target_desc);
+    let modules_dir = modules_dir.as_path();
 
     let plan = reconfigure::compute_transition_plan(&old_config, &new_config, modules_dir);
 

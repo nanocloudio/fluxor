@@ -186,6 +186,11 @@ enum Commands {
         #[arg(long, value_name = "DIR")]
         link: Option<PathBuf>,
     },
+    /// Installed applets: the runtime's log records from their runs.
+    Applet {
+        #[command(subcommand)]
+        action: AppletAction,
+    },
     /// Build and flash a config to hardware
     Flash {
         /// Config file (YAML)
@@ -682,6 +687,23 @@ enum WorkspaceAction {
     Rm {
         /// Path to the project checkout.
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AppletAction {
+    /// The runtime's log records from an applet's latest run: what the
+    /// kernel and platform said while the program ran, which never reaches
+    /// the program's own stderr (rfc_cli_execution.md §5.4).
+    Logs {
+        /// Applet name.
+        name: String,
+        /// Lines from the end of each run; 0 for the whole run.
+        #[arg(long, default_value = "50")]
+        tail: usize,
+        /// Every kept run, oldest first, rather than the latest.
+        #[arg(long)]
+        all: bool,
     },
 }
 

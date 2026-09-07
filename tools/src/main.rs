@@ -204,6 +204,9 @@ fn main() {
             }
         })(),
         Commands::Exec { name, args } => workload_src::exec_applet(&name, &args, verbose),
+        Commands::Applet { action } => match action {
+            AppletAction::Logs { name, tail, all } => workload_src::applet_logs(&name, tail, all),
+        },
         Commands::Install { bundle, name, link } => {
             workload_src::install_applet(&bundle, name.as_deref(), link.as_deref(), verbose)
         }

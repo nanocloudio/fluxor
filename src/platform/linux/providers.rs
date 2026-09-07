@@ -327,7 +327,7 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // write-side callers, but that silently 200-OK'd missing
             // files (a typo'd `GET /api/list/nope.png` would create
             // an empty file and persist it on disk). Now: if the
-            // file doesn't exist, return ENODEV → the http handler
+            // file doesn't exist, return ENOENT → the http handler
             // emits 404 cleanly. Future write-side callers can use
             // a new `FS_OPEN_CREATE` opcode or pass flags in the
             // path-extension slot once the ABI grows that knob.
@@ -338,7 +338,9 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 let fd_raw =
                     libc::open(path_buf.as_ptr() as *const libc::c_char, libc::O_RDONLY, 0);
                 if fd_raw < 0 {
-                    return errno::ENODEV;
+                    // Preserve absence versus permission/I/O failure: storage consumers
+                    // must not initialise a new world after a failed existing-file read.
+                    return -*libc::__errno_location();
                 }
                 files[slot_idx].fd = fd_raw;
                 files[slot_idx].in_use = true;

@@ -518,8 +518,8 @@ fn cmd_generate(
         }
         config["hardware"] = serde_json::Value::Object(merged);
     }
-    let modules_dir_default = format!("target/fluxor/{}/modules", target_desc.id);
-    let modules_dir = modules_dir_override.unwrap_or(std::path::Path::new(&modules_dir_default));
+    let modules_dir_default = crate::modules_build::modules_dir_for(&target_desc);
+    let modules_dir = modules_dir_override.unwrap_or(modules_dir_default.as_path());
 
     // Manifest search paths: explicit `module_search_paths:` from the
     // YAML plus the implicit <config-parent>/../modules default. See
@@ -684,8 +684,8 @@ fn cmd_combine(
     // `<config-parent>/../modules` default — same mechanism the linux build
     // path uses (`cmd_generate`). Without this, fan modules like
     // media_loader fail port-name resolution.
-    let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
-    let modules_dir = std::path::Path::new(&modules_dir_path);
+    let modules_dir_path = crate::modules_build::modules_dir_for(&target_desc);
+    let modules_dir = modules_dir_path.as_path();
     let search_paths = config::extract_module_search_paths(&config, config_path);
     let extra_dirs: Vec<&std::path::Path> = search_paths.iter().map(|p| p.as_path()).collect();
     // Config-anchored root so packaging reads the CONFIG's fluxor.lock pins,
@@ -1117,9 +1117,8 @@ fn cmd_graph_image(
         ));
     }
 
-    let modules_dir_path = format!("target/fluxor/{}/modules", target_desc.id);
-    let modules_dir =
-        modules_dir_override.unwrap_or_else(|| std::path::Path::new(&modules_dir_path));
+    let modules_dir_path = crate::modules_build::modules_dir_for(&target_desc);
+    let modules_dir = modules_dir_override.unwrap_or(modules_dir_path.as_path());
     let (modules_data, config_data) =
         build_packaged_blobs(
             &config,

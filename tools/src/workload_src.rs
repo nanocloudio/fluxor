@@ -452,6 +452,25 @@ pub fn run_bundle(path: &Path, verbose: bool) -> Result<()> {
 /// path (rfc_cli_execution.md §5.1): the runtime's own parser stops at `--`
 /// and the `cli_in` built-in reads the tail from the process argv.
 pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> Result<()> {
+    launch_bundle(path, app_args, None, None, verbose)
+}
+
+/// Where an applet's runtime binary lives relative to the project that
+/// built its bundle. Recorded in the catalogue at install time so `exec`
+/// runs the runtime the bundle was built against, wherever it is invoked.
+const RUNTIME_RELATIVE: &str = "target/aarch64-unknown-linux-gnu/release/fluxor-linux";
+
+/// Launch a bundle's linux implementation. `runtime` names the binary to
+/// run, else the project's staged one. `applet` marks an applet run
+/// (rfc_cli_execution.md §5.4): the runtime keeps its own log records out
+/// of the program's stderr and files them under the applet's name.
+fn launch_bundle(
+    path: &Path,
+    app_args: &[String],
+    runtime: Option<&Path>,
+    applet: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
     use fluxor_tools::workload::{parse_manifest, select_implementation};
 
     // A source manifest builds first; running is then resolving the fresh
@@ -507,8 +526,10 @@ pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> 
             )));
         }
     }
-    let linux_bin = crate::project::root_for_config(&dir)
-        .join("target/aarch64-unknown-linux-gnu/release/fluxor-linux");
+    let linux_bin = match runtime.filter(|r| r.exists()) {
+        Some(r) => r.to_path_buf(),
+        None => crate::project::root_for_config(&dir).join(RUNTIME_RELATIVE),
+    };
     if !linux_bin.exists() {
         return Err(Error::Config(format!(
             "Linux binary not found at {}. Run 'make build' first.",
@@ -516,15 +537,19 @@ pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> 
         )));
     }
 
-    eprintln!(
-        "Running bundle '{}' v{} ({}): {} --config {} --modules {}",
-        manifest.name,
-        manifest.version,
-        imp.target.family,
-        linux_bin.display(),
-        config_bin.display(),
-        modules_bin.display()
-    );
+    // A dev run says what it runs; an applet run is the program's, and says
+    // nothing of its own unless asked (`-v`).
+    if verbose || applet.is_none() {
+        eprintln!(
+            "Running bundle '{}' v{} ({}): {} --config {} --modules {}",
+            manifest.name,
+            manifest.version,
+            imp.target.family,
+            linux_bin.display(),
+            config_bin.display(),
+            modules_bin.display()
+        );
+    }
     let mut cmd = std::process::Command::new(&linux_bin);
     cmd.arg("--config")
         .arg(&config_bin)
@@ -532,6 +557,15 @@ pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> 
         .arg(&modules_bin);
     if !app_args.is_empty() {
         cmd.arg("--").args(app_args);
+    }
+    if let Some(name) = applet {
+        // Exec mode, as the runtime sees it: its log records go to the
+        // applet's log directory, and fd 2 stays the program's. `-v` mirrors
+        // every record to stderr as well.
+        cmd.env("FLUXOR_EXEC", name);
+        if verbose {
+            cmd.env("FLUXOR_EXEC_LOG_STDERR", "1");
+        }
     }
     // Die-with-parent (see `tie_to_parent`): a killed/timeouted `fluxor exec`
     // must not orphan a runtime that never exits on its own.
@@ -563,7 +597,15 @@ fn registry_path() -> PathBuf {
     PathBuf::from("applets.toml")
 }
 
-fn load_registry() -> Result<BTreeMap<String, PathBuf>> {
+/// One catalogue entry: the cached bundle, and the runtime it was built
+/// against when the installing project had one staged.
+#[derive(Clone, Debug)]
+pub struct AppletEntry {
+    pub bundle: PathBuf,
+    pub runtime: Option<PathBuf>,
+}
+
+fn load_registry() -> Result<BTreeMap<String, AppletEntry>> {
     let path = registry_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(BTreeMap::new()); // absent → empty catalogue
@@ -573,15 +615,30 @@ fn load_registry() -> Result<BTreeMap<String, PathBuf>> {
     let mut out = BTreeMap::new();
     if let Some(t) = doc.get("applets").and_then(|v| v.as_table()) {
         for (k, v) in t {
+            // A bare path is the older shape: the bundle alone.
             if let Some(p) = v.as_str() {
-                out.insert(k.clone(), PathBuf::from(p));
+                out.insert(
+                    k.clone(),
+                    AppletEntry {
+                        bundle: PathBuf::from(p),
+                        runtime: None,
+                    },
+                );
+            } else if let Some(bundle) = v.get("bundle").and_then(|b| b.as_str()) {
+                out.insert(
+                    k.clone(),
+                    AppletEntry {
+                        bundle: PathBuf::from(bundle),
+                        runtime: v.get("runtime").and_then(|r| r.as_str()).map(PathBuf::from),
+                    },
+                );
             }
         }
     }
     Ok(out)
 }
 
-fn save_registry(reg: &BTreeMap<String, PathBuf>) -> Result<()> {
+fn save_registry(reg: &BTreeMap<String, AppletEntry>) -> Result<()> {
     let path = registry_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -589,7 +646,19 @@ fn save_registry(reg: &BTreeMap<String, PathBuf>) -> Result<()> {
     let mut text =
         String::from("# fluxor applet registry (rfc_cli_execution.md §5.2)\n[applets]\n");
     for (k, v) in reg {
-        text.push_str(&format!("{} = {:?}\n", k, v.display().to_string()));
+        match &v.runtime {
+            Some(runtime) => text.push_str(&format!(
+                "{} = {{ bundle = {:?}, runtime = {:?} }}\n",
+                k,
+                v.bundle.display().to_string(),
+                runtime.display().to_string()
+            )),
+            None => text.push_str(&format!(
+                "{} = {{ bundle = {:?} }}\n",
+                k,
+                v.bundle.display().to_string()
+            )),
+        }
     }
     std::fs::write(&path, text)?;
     Ok(())
@@ -623,15 +692,36 @@ pub fn install_applet(
     let manifest = fluxor_tools::workload::parse_manifest(&manifest_text).map_err(Error::Config)?;
     let applet = name.unwrap_or(&manifest.name).to_string();
 
+    // The runtime the bundle was built against: the installing project's
+    // staged binary, recorded so `exec` runs it from any directory.
+    let runtime = crate::project::root_for_config(&dir).join(RUNTIME_RELATIVE);
+    let runtime = runtime
+        .exists()
+        .then(|| runtime.canonicalize().unwrap_or(runtime));
     let mut reg = load_registry()?;
-    reg.insert(applet.clone(), dir.clone());
+    reg.insert(
+        applet.clone(),
+        AppletEntry {
+            bundle: dir.clone(),
+            runtime,
+        },
+    );
     save_registry(&reg)?;
     println!("installed applet '{applet}' -> {}", dir.display());
 
     if let Some(bin_dir) = link {
         std::fs::create_dir_all(bin_dir)?;
-        let exe =
-            std::env::current_exe().map_err(|e| Error::Config(format!("current_exe: {e}")))?;
+        // Under the launcher this process is the CLI blob of the moment; the
+        // link must outlive the epoch, so it points at the launcher itself.
+        let exe = match std::env::var_os("FLUXOR_LAUNCHER")
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+        {
+            Some(launcher) => launcher,
+            None => {
+                std::env::current_exe().map_err(|e| Error::Config(format!("current_exe: {e}")))?
+            }
+        };
         let dest = bin_dir.join(&applet);
         let _ = std::fs::remove_file(&dest);
         std::os::unix::fs::symlink(&exe, &dest)
@@ -646,13 +736,19 @@ pub fn install_applet(
 /// compilation on the hot path: the cached bundle execs as-is.
 pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
     let reg = load_registry()?;
-    if let Some(dir) = reg.get(name) {
-        if dir.join("workload.json").is_file() {
-            return run_bundle_with_args(dir, args, verbose);
+    if let Some(entry) = reg.get(name) {
+        if entry.bundle.join("workload.json").is_file() {
+            return launch_bundle(
+                &entry.bundle,
+                args,
+                entry.runtime.as_deref(),
+                Some(name),
+                verbose,
+            );
         }
         return Err(Error::Config(format!(
             "applet '{name}' points at {} but no bundle is there — re-run `fluxor install`",
-            dir.display()
+            entry.bundle.display()
         )));
     }
     // Project-local fallback: a bundle built in this tree.
@@ -660,7 +756,7 @@ pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
         .join("target/fluxor")
         .join(name);
     if project.join("workload.json").is_file() {
-        return run_bundle_with_args(&project, args, verbose);
+        return launch_bundle(&project, args, None, Some(name), verbose);
     }
     let known: Vec<&str> = reg.keys().map(String::as_str).collect();
     Err(Error::Config(format!(
@@ -671,6 +767,67 @@ pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
             known.join(", ")
         }
     )))
+}
+
+/// Where the runtime files an applet's log records (rfc_cli_execution.md
+/// §5.4): `$XDG_STATE_HOME/fluxor/exec/<name>/`, else
+/// `~/.local/state/fluxor/exec/<name>/`. The runtime resolves it the same way.
+fn exec_logs_dir(name: &str) -> PathBuf {
+    let base = if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(xdg)
+    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        PathBuf::from(home).join(".local/state")
+    } else {
+        PathBuf::from(".")
+    };
+    base.join("fluxor").join("exec").join(name)
+}
+
+/// `fluxor applet logs <name>`: the runtime's records from the applet's
+/// latest run — or every kept run with `--all` — the last `tail` lines
+/// of each. Runs are files named by their start time and pid.
+pub fn applet_logs(name: &str, tail: usize, all: bool) -> Result<()> {
+    let dir = exec_logs_dir(name);
+    let mut runs: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "log"))
+                .collect()
+        })
+        .unwrap_or_default();
+    runs.sort();
+    if runs.is_empty() {
+        return Err(Error::Config(format!(
+            "no runs of applet '{name}' recorded under {}",
+            dir.display()
+        )));
+    }
+    let chosen: Vec<&PathBuf> = if all {
+        runs.iter().collect()
+    } else {
+        runs.iter().rev().take(1).collect()
+    };
+    for (index, run) in chosen.iter().enumerate() {
+        if all {
+            if index > 0 {
+                println!();
+            }
+            println!("== {}", run.display());
+        }
+        let text = std::fs::read_to_string(run)
+            .map_err(|e| Error::Config(format!("{}: {e}", run.display())))?;
+        let lines: Vec<&str> = text.lines().collect();
+        let skip = if tail == 0 {
+            0
+        } else {
+            lines.len().saturating_sub(tail)
+        };
+        for line in &lines[skip..] {
+            println!("{line}");
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a workload-bundle artifact from the local OCI store and

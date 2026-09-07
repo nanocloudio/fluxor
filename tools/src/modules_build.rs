@@ -1286,6 +1286,23 @@ pub struct ModuleSummary {
     pub builtin: bool,
 }
 
+/// The `target/fluxor/<silicon>/modules` directory whose artefacts a target
+/// LOADS, from a descriptor the caller already holds.
+///
+/// Takes the descriptor rather than a target name because the two differ
+/// exactly where it matters: a host target loads the artefacts of the silicon
+/// it runs on — `linux` loads `bcm2712`'s — and a directory named after the
+/// host has no artefact tree and never will. Every caller that needs .fmod
+/// bytes goes through here, so that rule is stated once instead of being
+/// rebuilt from `target_desc.id` at each call site, which is how a host
+/// target came to resolve to an empty directory and report every module as
+/// carrying no parameter schema.
+pub fn modules_dir_for(desc: &crate::target::TargetDescriptor) -> PathBuf {
+    PathBuf::from("target/fluxor")
+        .join(desc.module_silicon())
+        .join("modules")
+}
+
 /// `fluxor modules resolve` — print the resolved `target/.../modules`
 /// directory for a given target, honouring the dual-root resolution
 /// from standards/fluxor-modules.md §6.
@@ -1367,6 +1384,32 @@ mod tests {
             err.to_string().contains("[ci].targets"),
             "the diagnostic must name the missing key, not the symptom: {err}"
         );
+    }
+
+    /// `modules_dir_for` sends a HOST target to the silicon whose artefacts
+    /// it loads, not to a directory named after itself.
+    ///
+    /// The call sites that build a modules path from `target_desc.id` instead
+    /// gave `target/fluxor/linux/modules`, which is never created. Every .fmod
+    /// lookup under it missed, and a config check reported the modules as
+    /// carrying no parameter schema — a staleness-shaped message for a path
+    /// fault, which is the hardest kind to trace back.
+    #[test]
+    fn modules_dir_for_sends_a_host_target_to_its_silicon() {
+        let root = repo_root();
+        for (target, want) in [
+            ("linux", "bcm2712"),
+            ("bcm2712", "bcm2712"),
+            ("rp2350", "rp2350"),
+        ] {
+            let desc = crate::target::load_target(target, &root)
+                .unwrap_or_else(|e| panic!("{target} target loads: {e}"));
+            assert_eq!(
+                modules_dir_for(&desc),
+                PathBuf::from("target/fluxor").join(want).join("modules"),
+                "{target} must load {want}'s modules"
+            );
+        }
     }
 
     /// `resolve` answers for a BOARD, which `resolve_silicon` rejects.

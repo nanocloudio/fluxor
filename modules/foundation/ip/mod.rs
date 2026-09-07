@@ -3413,8 +3413,7 @@ unsafe fn hold_free(s: &mut IpState, slot: usize) {
 
 /// Every hold slot has to be nameable in the slot field the contract
 /// declares.
-const _: () =
-    assert!(MAX_PACKET_HOLD <= (1usize << abi::contracts::net::packet::PKT_SLOT_BITS));
+const _: () = assert!(MAX_PACKET_HOLD <= (1usize << abi::contracts::net::packet::PKT_SLOT_BITS));
 
 /// `pkt_id` for a slot under its current generation.
 fn hold_id(slot: usize, gen: u32) -> u32 {

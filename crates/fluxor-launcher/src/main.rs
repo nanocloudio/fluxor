@@ -84,7 +84,10 @@ fn main() {
         .collect();
     let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
     argv.push(std::ptr::null());
-    let env: Vec<std::ffi::CString> = std::env::vars_os()
+    // The CLI learns where the launcher is: a busybox link an applet
+    // install drops must point here, not at the blob of the moment.
+    let mut env: Vec<std::ffi::CString> = std::env::vars_os()
+        .filter(|(k, _)| k != "FLUXOR_LAUNCHER")
         .map(|(k, v)| {
             let mut s = k.into_encoded_bytes();
             s.push(b'=');
@@ -92,6 +95,13 @@ fn main() {
             std::ffi::CString::new(s).unwrap()
         })
         .collect();
+    if let Ok(me) = std::env::current_exe() {
+        let mut s = b"FLUXOR_LAUNCHER=".to_vec();
+        s.extend(me.into_os_string().into_encoded_bytes());
+        if let Ok(c) = std::ffi::CString::new(s) {
+            env.push(c);
+        }
+    }
     let mut envp: Vec<*const libc::c_char> = env.iter().map(|e| e.as_ptr()).collect();
     envp.push(std::ptr::null());
     // SAFETY: `argv` and `envp` are NUL-terminated arrays of pointers

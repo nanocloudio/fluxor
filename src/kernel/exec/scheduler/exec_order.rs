@@ -139,10 +139,11 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
     }
 
     // Cycle handling. Any module still unordered after BFS is in a cycle.
-    // Surface the cycle through both a loud log line (so it shows up in any
-    // host runtime's output) and a non-zero return value (so `prepare_graph`
-    // can decide between reject / accept-with-warning). Isolated modules
-    // never reach this branch — their `in_degree == 0` makes them BFS roots.
+    // The non-zero return value is what `prepare_graph` decides on — it logs
+    // the rejection as an error or the acceptance as a warning — so this
+    // line is a trace of the ordering, not a second verdict. Isolated
+    // modules never reach this branch — their `in_degree == 0` makes them
+    // BFS roots.
     let cycle_count = module_count - count;
     if cycle_count > 0 {
         let mut first_unordered: i32 = -1;
@@ -162,7 +163,7 @@ pub(crate) fn compute_exec_order(edges: &[Edge], edge_count: usize, module_count
                 count += 1;
             }
         }
-        log::error!(
+        log::debug!(
             "[scheduler] graph has {cycle_count} module(s) in a cycle (first unordered idx={first_unordered}); \
              v1 has no typed feedback edges — cycles are appended at the end in \
              declaration order, and `prepare_graph` decides whether to accept or \

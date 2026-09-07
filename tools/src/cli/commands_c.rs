@@ -1105,8 +1105,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 let modules_blob = out_dir.join("modules.bin");
 
                 let (config, target_desc) = load_config_with_defaults(config_path, verbose)?;
-                let modules_dir =
-                    PathBuf::from(format!("target/fluxor/{}/modules", target_desc.id));
+                let modules_dir = crate::modules_build::modules_dir_for(&target_desc);
                 if !modules_dir.exists() {
                     return Err(Error::Config(format!(
                         "Modules not found at {}. Run 'fluxor modules build --target {}' first.",

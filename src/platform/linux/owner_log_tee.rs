@@ -20,6 +20,12 @@
 
 /// The env_logger backend the tee delegates stderr to.
 static INNER: OnceLock<env_logger::Logger> = OnceLock::new();
+/// Exec mode (`FLUXOR_EXEC=<applet>`, set by `fluxor exec`): the file this
+/// run's records go to, so fd 2 stays the program's (rfc_cli_execution.md
+/// §5.4). `None` outside exec mode, or when the file could not be made.
+static EXEC_SINK: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+/// Exec mode: mirror every record to stderr as well (`fluxor exec -v`).
+static EXEC_MIRROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The scheduler (main) thread id — only records emitted here reach the rings.
 static SCHED_TID: OnceLock<std::thread::ThreadId> = OnceLock::new();
 /// Owner attribution consults the scheduler (`current_module_index` → HAL),
@@ -38,10 +44,30 @@ impl log::Log for TeeLogger {
 
     fn log(&self, record: &log::Record<'_>) {
         let Some(inner) = INNER.get() else { return };
-        // Preserve existing stderr behaviour exactly.
-        inner.log(record);
-        if !inner.enabled(record.metadata()) {
-            return;
+        match EXEC_SINK.get().and_then(|sink| sink.as_ref()) {
+            // An applet run: the record goes to the run's file, and reaches
+            // stderr only when it explains a non-zero status — an error —
+            // or when the person asked to see everything.
+            Some(file) => {
+                if !inner.enabled(record.metadata()) {
+                    return;
+                }
+                if let Ok(mut file) = file.lock() {
+                    use std::io::Write as _;
+                    let _ = writeln!(file, "{}", format_record(record));
+                }
+                if record.level() <= log::Level::Error
+                    || EXEC_MIRROR.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    inner.log(record);
+                }
+            }
+            None => {
+                inner.log(record);
+                if !inner.enabled(record.metadata()) {
+                    return;
+                }
+            }
         }
         // Ring routing is scheduler-thread-only (single writer). Off-thread
         // records are on stderr only; they are not ringed.
@@ -81,7 +107,79 @@ impl log::Log for TeeLogger {
         if let Some(inner) = INNER.get() {
             inner.flush();
         }
+        if let Some(Some(file)) = EXEC_SINK.get() {
+            if let Ok(mut file) = file.lock() {
+                use std::io::Write as _;
+                let _ = file.flush();
+            }
+        }
     }
+}
+
+/// One record as a line: the shape stderr has always had, so a run's file
+/// reads the same as a dev run's terminal.
+fn format_record(record: &log::Record<'_>) -> String {
+    format!(
+        "[{} {:<5} {}] {}",
+        now_unix_ms(),
+        record.level(),
+        record.target(),
+        record.args()
+    )
+}
+
+/// Runs an applet keeps: older files under its log directory are removed
+/// when a new run starts.
+const EXEC_RUNS_KEPT: usize = 10;
+
+/// Open this run's log file under the applet's directory:
+/// `$XDG_STATE_HOME/fluxor/exec/<applet>/<start-ms>-<pid>.log`, else the
+/// same under `~/.local/state`. `fluxor applet logs` resolves it the same
+/// way. Nothing here fails the run: a directory that cannot be made means
+/// the records go to stderr as they would outside exec mode.
+fn open_exec_sink(applet: &str) -> Option<std::sync::Mutex<std::fs::File>> {
+    let base = if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        std::path::PathBuf::from(xdg)
+    } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        std::path::PathBuf::from(home).join(".local/state")
+    } else {
+        return None;
+    };
+    // The applet name is a catalogue key, never a path: keep it to one
+    // component.
+    if applet.is_empty() || applet.contains(['/', '\\']) || applet == "." || applet == ".." {
+        return None;
+    }
+    let dir = base.join("fluxor").join("exec").join(applet);
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut runs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .collect();
+    runs.sort();
+    if runs.len() + 1 > EXEC_RUNS_KEPT {
+        for old in &runs[..runs.len() + 1 - EXEC_RUNS_KEPT] {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    let path = dir.join(format!("{:013}-{}.log", now_unix_ms(), std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    let argv: Vec<String> = std::env::args().collect();
+    use std::io::Write as _;
+    let _ = writeln!(
+        file,
+        "[{} INFO  fluxor_linux] [exec] applet '{}' pid {} argv {:?}",
+        now_unix_ms(),
+        applet,
+        std::process::id(),
+        argv
+    );
+    Some(std::sync::Mutex::new(file))
 }
 
 static TEE: TeeLogger = TeeLogger;
@@ -95,18 +193,21 @@ fn install_owner_log_tee() {
     let logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
             use std::io::Write;
-            writeln!(
-                buf,
-                "[{} {:<5} {}] {}",
-                now_unix_ms(),
-                record.level(),
-                record.target(),
-                record.args()
-            )
+            writeln!(buf, "{}", format_record(record))
         })
         .build();
     log::set_max_level(logger.filter());
     let _ = INNER.set(logger);
+    // Exec mode: `fluxor exec` names the applet; its records are filed
+    // under that name and fd 2 is left to the program.
+    let sink = std::env::var("FLUXOR_EXEC")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .and_then(|name| open_exec_sink(&name));
+    if std::env::var_os("FLUXOR_EXEC_LOG_STDERR").is_some_and(|v| !v.is_empty()) {
+        EXEC_MIRROR.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = EXEC_SINK.set(sink);
     // If another logger was already installed (e.g. a test harness), keep it and
     // fall back to plain stderr formatting rather than panicking.
     let _ = log::set_logger(&TEE);
