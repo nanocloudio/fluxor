@@ -11,7 +11,7 @@ builtin = true
 #
 # Validation, handles, views, sealing, residency, fences, dependency order,
 # candidate-output commit and epochs are the shared cores — the same code the
-# `gpu_null` provider runs, so both answer one lifetime corpus. This built-in
+# `gpu_replay` provider runs, so both answer one lifetime corpus. This built-in
 # owns only what wgpu owns: adapters, buffers, shader modules, pipelines,
 # encoders and mapped memory, all on a dedicated thread so adapter creation and
 # shader compilation never land in a cooperative step.

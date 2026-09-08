@@ -1,4 +1,4 @@
-//! Plan mode — the no-side-effect resolution of a run per RFC §10.4.
+//! Plan mode — the no-side-effect resolution of a run.
 //!
 //! Given a scenario, a target board descriptor, a private rig profile, and
 //! optionally a project descriptor, produce a [`Plan`] that names every
@@ -99,7 +99,7 @@ pub enum ArtifactPlan {
     /// see the rest of the resolved lifecycle.
     Unresolved { reason: String },
     File {
-        /// argv of the build command. Per RFC §15.3 it is executed with
+        /// argv of the build command. Executed with
         /// `project_root` as the working directory.
         command: Vec<String>,
         project_root: PathBuf,

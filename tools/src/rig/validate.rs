@@ -1,6 +1,6 @@
 //! Cross-schema validator: scenario requirements vs. the target board's
-//! declared rig capabilities. RFC §7.1 final paragraph — "fail at parse/plan
-//! time, not after starting orchestration."
+//! declared rig capabilities. Every failure is raised at parse and plan
+//! time, never after orchestration has started.
 
 use crate::rig::board::BoardRig;
 use crate::rig::matcher::supports_rule_source;
@@ -75,8 +75,8 @@ pub fn validate_scenario_against_board(s: &Scenario, board: &BoardRig) -> RigVal
 }
 
 /// Cross-check rig tags declared by the scenario against tags declared by a
-/// rig profile. RFC §8: "a scenario that asks for ['nvme'] must not silently
-/// fall onto a rig that lacks that tag."
+/// rig profile: a scenario that asks for `['nvme']` must not silently fall
+/// onto a rig that lacks that tag.
 ///
 /// Omitting requires_tags (empty list) means any rig is eligible.
 pub fn validate_tags(s: &Scenario, rig_tags: &[String]) -> RigValidation {

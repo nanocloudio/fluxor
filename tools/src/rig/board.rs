@@ -1,6 +1,6 @@
 //! Public board contract — the `[rig]` section of a board descriptor.
 //!
-//! RFC §7. Lives in `targets/boards/{id}.toml`. Every field is public
+//! Lives in `targets/boards/{id}.toml`. Every field is public
 //! (board-level facts, never bench-level facts). The loader enforces that
 //! capability-valued fields use the exact vocabulary from `rig::vocab` and
 //! that `preferred_*` selections are members of the matching list.
@@ -132,7 +132,7 @@ impl BoardSource {
     }
 }
 
-/// Resolve a board id through the RFC §15.1 layered lookup:
+/// Resolve a board id through the layered lookup:
 ///
 ///   1. user override at `$XDG_CONFIG_HOME/fluxor/boards/<id>.toml`
 ///      (falling back to `$HOME/.config/fluxor/boards/<id>.toml`),

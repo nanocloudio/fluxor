@@ -2940,7 +2940,8 @@ registerProcessor('pcm-ring', PcmRing);
         dv.setUint32(24, l.maxComputeWorkgroupsPerDimension || 65535, true);
         let flags = 0;
         if (d.features && d.features.has('shader-f16')) flags |= 1;
-        if (d.features && d.features.has('timestamp-query')) flags |= 2;
+        // Bit 1 is unassigned: no provider here implements timestamp queries,
+        // so the adapter's support for them has no reader.
         dv.setUint32(28, flags, true);
         const maxBuf = Math.min(
           Number(l.maxBufferSize || 0x10000000),
@@ -2959,8 +2960,13 @@ registerProcessor('pcm-ring', PcmRing);
           if (usage & 4) u |= GPUBufferUsage.VERTEX;
           if (usage & 8) u |= GPUBufferUsage.INDEX;
           if (usage & 16) u |= GPUBufferUsage.INDIRECT;
+          // MAP_READ is deliberately not set. WebGPU admits it only
+          // alongside COPY_DST and nothing else, so a buffer declared
+          // readable AND storage — the ordinary shape for a compute output
+          // — would be refused outright. Readback copies through a staging
+          // buffer instead, which is what host_gpu_service_readback does
+          // and what the native provider does for the same reason.
           if (usage & (32 | 128)) u |= GPUBufferUsage.COPY_SRC;
-          if (usage & 128) u |= GPUBufferUsage.MAP_READ;
           const existing = svcBuffers.get(slot >>> 0);
           if (existing) existing.destroy();
           svcBuffers.set(slot >>> 0, d.createBuffer({ size: Math.max(size >>> 0, 4), usage: u }));

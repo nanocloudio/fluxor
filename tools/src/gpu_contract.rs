@@ -17,7 +17,7 @@ include!("../../modules/sdk/cores/gpu_pack.rs");
 include!("../../modules/sdk/cores/gpu_device.rs");
 include!("../../modules/sdk/cores/gpu_replay.rs");
 
-/// The null/replay provider's capability record, built from the same
+/// The replay provider's capability record, built from the same
 /// `encode_caps` the running provider answers with, over the same profile it
 /// is composed with — so a pack validated against this record is validated
 /// against the device a graph would actually get.

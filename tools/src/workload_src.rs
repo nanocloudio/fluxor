@@ -526,8 +526,22 @@ fn launch_bundle(
             )));
         }
     }
-    let linux_bin = match runtime.filter(|r| r.exists()) {
-        Some(r) => r.to_path_buf(),
+    // A recorded runtime is the one this bundle's modules were packed
+    // against. If it has gone, say so and name it: quietly running the
+    // bundle against whatever binary the current directory happens to
+    // resolve to substitutes a different ABI for the one it was built
+    // with, and the mismatch surfaces as a module refusing to load rather
+    // than as the missing binary it actually is.
+    let linux_bin = match runtime {
+        Some(r) if r.exists() => r.to_path_buf(),
+        Some(r) => {
+            return Err(Error::Config(format!(
+                "the runtime this applet was installed against is gone: {}\n\
+                 Reinstall it (`fluxor applet install`) so it records the \
+                 runtime it should run on.",
+                r.display()
+            )));
+        }
         None => crate::project::root_for_config(&dir).join(RUNTIME_RELATIVE),
     };
     if !linux_bin.exists() {
@@ -615,16 +629,7 @@ fn load_registry() -> Result<BTreeMap<String, AppletEntry>> {
     let mut out = BTreeMap::new();
     if let Some(t) = doc.get("applets").and_then(|v| v.as_table()) {
         for (k, v) in t {
-            // A bare path is the older shape: the bundle alone.
-            if let Some(p) = v.as_str() {
-                out.insert(
-                    k.clone(),
-                    AppletEntry {
-                        bundle: PathBuf::from(p),
-                        runtime: None,
-                    },
-                );
-            } else if let Some(bundle) = v.get("bundle").and_then(|b| b.as_str()) {
+            if let Some(bundle) = v.get("bundle").and_then(|b| b.as_str()) {
                 out.insert(
                     k.clone(),
                     AppletEntry {

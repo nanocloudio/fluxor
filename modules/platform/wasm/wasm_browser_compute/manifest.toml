@@ -4,7 +4,7 @@ builtin = true
 
 # Generic GPU provider on WebGPU.
 #
-# Same contract, same shared cores and same lifetime corpus as the `gpu_null`
+# Same contract, same shared cores and same lifetime corpus as the `gpu_replay`
 # and `linux_gpu` providers: admission, opaque generational handles, bounded
 # views, immutable sealing, residency, dependency-ordered fences,
 # candidate-output commit, cancellation, drain and device epochs are all

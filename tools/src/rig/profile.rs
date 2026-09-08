@@ -1,13 +1,12 @@
 //! Private rig profile — `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`.
 //!
-//! RFC §9. Site-specific binding between the public contract (capabilities
+//! Site-specific binding between the public contract (capabilities
 //! declared on a board) and one physical bench (which TTY, which smart
 //! plug, which TFTP root). Never checked in.
 //!
 //! The loader eagerly resolves every string field through [`secret::resolve`]
 //! so `${env:…}` and `${file:…}` indirections are bound before a plan or
-//! run is constructed. Unresolved references are fatal at load time —
-//! matching the "unresolved references are fatal" invariant in §9.
+//! run is constructed. Unresolved references are fatal at load time.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -275,7 +274,7 @@ fn type_of(v: &toml::Value) -> &'static str {
 }
 
 /// Compute the canonical directory a profile would live under, given the
-/// active lab namespace and rig id. RFC §9.
+/// active lab namespace and rig id.
 pub fn default_profile_path(lab: &str, rig_id: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(
@@ -289,8 +288,8 @@ pub fn default_profile_path(lab: &str, rig_id: &str) -> Option<PathBuf> {
 }
 
 /// Enumerate available labs under `~/.config/fluxor/labs/`. A lab is
-/// any subdirectory containing a `rigs/` folder (the convention from
-/// RFC §9). Returns lab names sorted alphabetically; an empty list
+/// any subdirectory containing a `rigs/` folder (the convention that marks
+/// a lab). Returns lab names sorted alphabetically; an empty list
 /// when the labs directory doesn't exist (a fresh install has no
 /// configured labs). Used by `fluxor inspect` to surface what's
 /// available without requiring the user to know the directory
@@ -326,7 +325,7 @@ pub fn enumerate_labs() -> Result<Vec<String>> {
 }
 
 /// Walk a directory and return candidate rig ids — for "when exactly one rig
-/// is configured, `--rig` is optional" per §10.2.
+/// is configured, `--rig` is optional".
 pub fn enumerate_rigs(lab: &str) -> Result<Vec<String>> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Ok(Vec::new());

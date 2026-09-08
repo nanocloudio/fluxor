@@ -305,7 +305,7 @@ capabilities or oblige either to own a swapchain — it only makes the
 hand-off expressible.
 
 The browser backend is WebGPU. The compute surface's contract is the
-same one the native (`linux_gpu`) and null/replay (`gpu_null`)
+same one the native (`linux_gpu`) and replay (`gpu_replay`)
 providers implement, so a graph wired to it runs unchanged on any of
 them, shipping the program pack the target accepts. Domain-specific
 GPU pipelines (a console rasteriser, a scientific kernel) are

@@ -1,8 +1,8 @@
 // Generic GPU wire contract — the ONE definition of the request envelope,
 // operation numbers, opaque handles, outcome records, capability facts and
 // reject reasons that a GPU producer, the driver that decodes the stream, and
-// every backend (WebGPU, native wgpu/Vulkan, direct V3D, the null/replay
-// provider) must agree on.
+// every backend (WebGPU, native wgpu/Vulkan, the replay provider) must agree
+// on.
 //
 // There is one contract and it is this one. No version field, no negotiation,
 // no compatibility layer: a stream that does not decode here is not this
@@ -582,11 +582,9 @@ pub const QUEUE_COUNT: usize = 3;
 // needs a property asks for the property, and provider selection is explicit
 // graph composition.
 
-pub const BACKEND_NULL: u32 = 1;
-pub const BACKEND_REPLAY: u32 = 2;
-pub const BACKEND_WEBGPU: u32 = 3;
-pub const BACKEND_WGPU_NATIVE: u32 = 4;
-pub const BACKEND_V3D_DIRECT: u32 = 5;
+pub const BACKEND_REPLAY: u32 = 1;
+pub const BACKEND_WEBGPU: u32 = 2;
+pub const BACKEND_WGPU_NATIVE: u32 = 3;
 
 // ── Capability features ─────────────────────────────────────────────────
 //
@@ -714,7 +712,7 @@ pub const TARGET_NONE: u32 = 0;
 pub const TARGET_WGSL: u32 = 1;
 pub const TARGET_SPIRV: u32 = 2;
 pub const TARGET_V3D_QPU: u32 = 3;
-/// A fixture artifact the null/replay provider interprets. Deterministic and
+/// A fixture artifact the replay provider interprets. Deterministic and
 /// hardware-free; it is a validation oracle, not evidence any GPU ran.
 pub const TARGET_REPLAY: u32 = 4;
 
@@ -1045,6 +1043,10 @@ pub fn req_create_pipeline(
     let p = &mut out[HEADER_LEN..n];
     put_u64(p, 0, program);
     p[8] = kind;
+    // Padding is written, not left as whatever the caller's buffer held. The
+    // same request must encode to the same bytes every time, or a record can
+    // neither be compared nor attested.
+    p[9..12].fill(0);
     put_u32(p, 12, state.len() as u32);
     p[16..].copy_from_slice(state);
     Some(n)
@@ -1068,6 +1070,8 @@ pub fn req_upload(
     put_u64(p, 0, view);
     put_u64(p, 8, offset);
     put_u32(p, 16, bytes.len() as u32);
+    // As above: the declared padding is part of the record, so it is written.
+    p[20..24].fill(0);
     p[24..].copy_from_slice(bytes);
     Some(n)
 }
@@ -1103,8 +1107,13 @@ pub fn req_submit(
     }
     out[..HEADER_LEN].copy_from_slice(&Header::new(OP_SUBMIT, body as u32, corr).encode());
     let p = &mut out[HEADER_LEN..n];
+    // Every byte of the fixed head is written, reserved fields included.
+    // `out` is the caller's buffer and is routinely reused, so a field left
+    // alone is not zero — it is the previous request's bytes, put on the
+    // wire and read as meaning by the first reader that consults it.
     p[0] = queue;
     p[1] = waits.len() as u8;
+    put_u16(p, 2, 0);
     put_u32(p, 4, items.len() as u32);
     for (i, w) in waits.iter().enumerate() {
         put_u64(p, 8 + i * 8, *w);

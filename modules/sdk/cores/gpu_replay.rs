@@ -460,8 +460,14 @@ pub fn push_readback(
     let mut sent = len as u64 - dev.result_outstanding(fence);
     while sent < len as u64 {
         let remaining = len as u64 - sent;
-        // One record's payload, minus its fixed fields.
-        let chunk = remaining.min(MAX_PAYLOAD as u64 - 24);
+        // Sized to what the ring will take now. A chunk it cannot hold is
+        // re-offered unchanged next step, so guessing here would stall the
+        // readback rather than pace it.
+        let room = dev.max_result_chunk();
+        if room == 0 {
+            return Executed::Pending;
+        }
+        let chunk = remaining.min(room as u64);
         let Some(bytes) = store.read(resource, offset + sent, chunk) else {
             dev.fail(fence, REASON_BAD_RANGE, 0);
             return Executed::Failed(REASON_BAD_RANGE);

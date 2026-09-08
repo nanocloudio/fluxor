@@ -20,9 +20,28 @@
 
 /// The env_logger backend the tee delegates stderr to.
 static INNER: OnceLock<env_logger::Logger> = OnceLock::new();
+/// Whether the process that writes `path` is still running.
+///
+/// The pid is the filename's second field (`<ms>-<pid>.log`). A name that
+/// does not parse is treated as live — retention declining to act on a file
+/// it cannot identify is the safe direction, since the cost is an extra
+/// file and the alternative is deleting a running applet's records.
+fn writer_is_live(path: &std::path::Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return true;
+    };
+    let Some((_, pid)) = stem.rsplit_once('-') else {
+        return true;
+    };
+    let Ok(pid) = pid.parse::<u32>() else {
+        return true;
+    };
+    std::path::Path::new(&format!("/proc/{pid}")).is_dir()
+}
+
 /// Exec mode (`FLUXOR_EXEC=<applet>`, set by `fluxor exec`): the file this
-/// run's records go to, so fd 2 stays the program's (rfc_cli_execution.md
-/// §5.4). `None` outside exec mode, or when the file could not be made.
+/// run's records go to, so fd 2 stays the program's. `None` outside exec
+/// mode, or when the file could not be made.
 static EXEC_SINK: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
 /// Exec mode: mirror every record to stderr as well (`fluxor exec -v`).
 static EXEC_MIRROR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -151,11 +170,24 @@ fn open_exec_sink(applet: &str) -> Option<std::sync::Mutex<std::fs::File>> {
         return None;
     }
     let dir = base.join("fluxor").join("exec").join(applet);
-    std::fs::create_dir_all(&dir).ok()?;
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+    // Retention only ever reclaims runs that have ENDED. A file names the
+    // pid that writes it, and a live writer holds it open: unlinking that
+    // one does not free anything — the inode stays until the process exits
+    // — and it takes the run's records out of `applet logs` while the run
+    // is still producing them. So a still-running pid is skipped, and a
+    // long-lived applet cannot be pruned out from under itself by ten short
+    // runs beside it.
     let mut runs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .filter(|p| !writer_is_live(p))
         .collect();
     runs.sort();
     if runs.len() + 1 > EXEC_RUNS_KEPT {
@@ -163,10 +195,15 @@ fn open_exec_sink(applet: &str) -> Option<std::sync::Mutex<std::fs::File>> {
             let _ = std::fs::remove_file(old);
         }
     }
+    use std::os::unix::fs::OpenOptionsExt as _;
     let path = dir.join(format!("{:013}-{}.log", now_unix_ms(), std::process::id()));
+    // The first line of this file is the run's argv, so it is the invoker's
+    // to read and nobody else's: 0600 on the file and 0700 on the directory
+    // above it, rather than whatever the umask happens to allow.
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
         .append(true)
+        .mode(0o600)
         .open(path)
         .ok()?;
     let argv: Vec<String> = std::env::args().collect();

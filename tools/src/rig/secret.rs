@@ -1,4 +1,4 @@
-//! Secret indirection for private rig profiles — RFC §9.
+//! Secret indirection for private rig profiles.
 //!
 //! Any string field in a profile may use one of three indirection forms
 //! instead of embedding the value directly:
@@ -44,7 +44,7 @@ impl Secret {
         matches!(self, Self::Resolved(_))
     }
 
-    /// Value to use in hashes and serialized records per RFC §10.6 —
+    /// Value to use in hashes and serialized records:
     /// secrets are replaced by the sentinel so a profile with a removed
     /// secret does not hash-equal one with a secret still present.
     pub fn for_hash(&self) -> &str {

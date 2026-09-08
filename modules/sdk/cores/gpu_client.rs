@@ -72,6 +72,10 @@ pub struct ClientProgram {
     /// a shader that does not compile will not compile on the next frame
     /// either, and a consumer that kept resubmitting would hide the fault.
     pub failed: bool,
+    /// The consumer asked for this name back. Its handles are released in the
+    /// order the provider requires — the pipeline first, because a program a
+    /// live pipeline still names cannot be released.
+    pub retiring: bool,
 }
 
 impl ClientProgram {
@@ -82,6 +86,7 @@ impl ClientProgram {
         pipeline: HANDLE_NONE,
         ready: false,
         failed: false,
+        retiring: false,
     };
 }
 
@@ -106,6 +111,9 @@ pub const PEND_PIPELINE: u8 = 4;
 pub const PEND_WORK: u8 = 5;
 /// A readback, whose result bytes the caller collects.
 pub const PEND_READ: u8 = 6;
+/// One of a retiring program's two handle releases. One kind, not two: the
+/// slot's own handles say which record is still owed.
+pub const PEND_RETIRE: u8 = 7;
 
 /// One outstanding request.
 #[derive(Clone, Copy, Debug)]
@@ -226,6 +234,21 @@ impl GpuClient<'_> {
         self.resources.iter().any(|r| r.live && r.name == name)
     }
 
+    /// Whether a named program still holds provider handles.
+    ///
+    /// A load under this name is refused until [`Self::release_program`] has
+    /// retired it. That refusal is permanent, which a bare `None` would
+    /// otherwise read as the backpressure every other refusal here means — so
+    /// a consumer that could spin asks this instead.
+    #[must_use]
+    pub fn program_claimed(&self, name: u32) -> bool {
+        self.programs.iter().any(|p| {
+            p.live
+                && p.name == name
+                && (p.retiring || p.program != HANDLE_NONE || p.pipeline != HANDLE_NONE)
+        })
+    }
+
     /// Whether a named program failed to build.
     #[must_use]
     pub fn program_failed(&self, name: u32) -> bool {
@@ -273,6 +296,17 @@ impl GpuClient<'_> {
 
     fn program_slot(&mut self, name: u32) -> Option<usize> {
         if let Some(i) = self.programs.iter().position(|p| p.live && p.name == name) {
+            // A slot still holding provider handles is not free to reuse.
+            // Overwriting it in place would strand a program and a pipeline
+            // that nothing can name again, and the provider's tables would
+            // fill one reload at a time until every load is refused. The
+            // consumer retires the name first; `program_claimed` says so.
+            let p = self.programs[i];
+            if p.retiring || p.program != HANDLE_NONE || p.pipeline != HANDLE_NONE {
+                return None;
+            }
+            // A load still in flight, or one whose pack was refused, holds
+            // nothing — reusing that slot is how a fixed pack is retried.
             self.programs[i] = ClientProgram {
                 name,
                 live: true,
@@ -294,6 +328,12 @@ impl GpuClient<'_> {
     // Each writes one record and answers its length, or `None` when `out` is
     // too small or the client has no room to track another outstanding
     // request. `None` is backpressure: the caller retries next step.
+    //
+    // Two refusals are permanent rather than backpressure, and each has a
+    // predicate that says so: `load_program` refuses a name whose provider
+    // handles are still held (`program_claimed`), and `create_pipeline`
+    // refuses a program that already has one or that failed
+    // (`program_failed`). A consumer that would otherwise spin asks.
 
     /// Ask for the device's facts. A consumer sends this once, first: a pack
     /// built before the answer arrives is built against a guessed alignment.
@@ -369,6 +409,36 @@ impl GpuClient<'_> {
         self.arm(corr, PEND_PROGRAM, slot as u16, name).then_some(n)
     }
 
+    /// Retire a named program and the pipeline built from it.
+    ///
+    /// Two provider handles, so two records, in the order the provider
+    /// requires: releasing a program is refused while a live pipeline still
+    /// names it. This writes the first; the second follows from its
+    /// completion, so a consumer asks once and the ordering is not its
+    /// problem.
+    ///
+    /// `Some(0)` means the name held nothing and is free already.
+    pub fn release_program(&mut self, out: &mut [u8], name: u32) -> Option<usize> {
+        let slot = self.programs.iter().position(|p| p.live && p.name == name)?;
+        let p = self.programs[slot];
+        let (op, handle) = if p.pipeline != HANDLE_NONE {
+            (OP_RELEASE_PIPELINE, p.pipeline)
+        } else if p.program != HANDLE_NONE {
+            (OP_RELEASE_PROGRAM, p.program)
+        } else {
+            self.programs[slot] = ClientProgram::EMPTY;
+            return Some(0);
+        };
+        let corr = self.corr();
+        let n = req_handle_op(out, corr, op, handle)?;
+        if !self.arm(corr, PEND_RETIRE, slot as u16, name) {
+            return None;
+        }
+        self.programs[slot].retiring = true;
+        self.programs[slot].ready = false;
+        Some(n)
+    }
+
     /// Build the pipeline for a named program whose load completed.
     pub fn create_pipeline(&mut self, out: &mut [u8], name: u32) -> Option<usize> {
         // A program that failed is not buildable. Its handle may well have
@@ -376,8 +446,16 @@ impl GpuClient<'_> {
         // question — and a client that kept offering pipelines for a shader
         // that will not compile would hide the fault behind a graph that
         // merely produces nothing.
+        // A program that already has a pipeline is not built twice: the second
+        // build allocates another provider slot and overwrites the handle to
+        // the first, which then pins its program against release forever.
         let slot = self.programs.iter().position(|p| {
-            p.live && p.name == name && p.program != HANDLE_NONE && !p.failed
+            p.live
+                && p.name == name
+                && p.program != HANDLE_NONE
+                && p.pipeline == HANDLE_NONE
+                && !p.failed
+                && !p.retiring
         })?;
         let program = self.programs[slot].program;
         let corr = self.corr();
@@ -581,6 +659,33 @@ impl GpuClient<'_> {
                         )
                     }
                     PEND_VIEW | PEND_BUFFER => (ClientEvent::Quiet, 0),
+                    PEND_RETIRE => {
+                        let slot = p.slot as usize;
+                        // Clear the handle this release just returned, then
+                        // owe the next one. The provider refuses to release a
+                        // program while a pipeline names it, so the pipeline
+                        // is always the one that went first.
+                        if self.programs[slot].pipeline != HANDLE_NONE {
+                            self.programs[slot].pipeline = HANDLE_NONE;
+                        } else {
+                            self.programs[slot].program = HANDLE_NONE;
+                        }
+                        let program = self.programs[slot].program;
+                        if program == HANDLE_NONE {
+                            self.programs[slot] = ClientProgram::EMPTY;
+                            return (ClientEvent::Finished { tag: p.tag }, 0);
+                        }
+                        let corr = self.corr();
+                        if let Some(n) = req_handle_op(out, corr, OP_RELEASE_PROGRAM, program) {
+                            if self.arm(corr, PEND_RETIRE, slot as u16, p.tag) {
+                                return (ClientEvent::Quiet, n);
+                            }
+                        }
+                        // No room to track the second release. The slot stays
+                        // retiring and keeps the program handle, so asking
+                        // again resumes from exactly here.
+                        (ClientEvent::Quiet, 0)
+                    }
                     _ => (ClientEvent::Finished { tag: p.tag }, 0),
                 }
             }
@@ -613,6 +718,12 @@ impl GpuClient<'_> {
                         // a consumer that kept resubmitting would hide it.
                         self.programs[p.slot as usize].failed = true;
                         self.programs[p.slot as usize].ready = false;
+                    }
+                    PEND_RETIRE => {
+                        // The handle is still the provider's, so the slot
+                        // keeps it and stays retiring. Forgetting it here
+                        // would drop the one number that can still reach the
+                        // thing this call exists to release.
                     }
                     _ => {}
                 }

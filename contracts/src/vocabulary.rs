@@ -280,7 +280,7 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
                 // name its provider, never requested — a consumer that needs
                 // a property asks for the property.
                 "backend",
-                &["null", "replay", "webgpu", "wgpu_native", "v3d_direct"],
+                &["replay", "webgpu", "wgpu_native"],
             ),
             // Whether results can come back to the CPU at all. A headless
             // compute graph that cannot read its own output is a composition

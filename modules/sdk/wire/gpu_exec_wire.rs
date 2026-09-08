@@ -121,5 +121,7 @@ pub const FACT_LEN: usize = 40;
 /// The adapter reports native f16 arithmetic. Absent, the provider declares
 /// f16 unsupported rather than emulated — there is no emulation path here.
 pub const FACT_HAS_F16: u32 = 1 << 0;
-/// The adapter can time GPU work.
-pub const FACT_HAS_TIMESTAMP: u32 = 1 << 1;
+// Bit 1 is unassigned. It carried the adapter's timestamp-query support, which
+// nothing read: no provider here implements timestamp queries, so every
+// completion is queue-timed and says so. A fact reported to no reader is one
+// that rots — it comes back when a provider actually times GPU work.

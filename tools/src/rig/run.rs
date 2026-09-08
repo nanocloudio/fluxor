@@ -1,4 +1,4 @@
-//! Orchestrator — the single canonical run lifecycle per RFC §10.1.
+//! Orchestrator — the single canonical run lifecycle.
 //!
 //!   1. claim the rig
 //!   2. resolve scenario + board contract              [done upstream, via Plan]
@@ -421,7 +421,7 @@ fn run_build(plan: &Plan, options: &RunOptions) -> Result<Option<ArtifactOutput>
     );
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
-    // §15.3: project build commands run with the project root as CWD so
+    // Project build commands run with the project root as CWD so
     // relative paths in the recipe resolve against the same anchor as the
     // artifact output.
     cmd.current_dir(project_root);

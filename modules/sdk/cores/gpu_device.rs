@@ -453,6 +453,11 @@ pub struct DeviceStats {
     /// Times the outcome ring lacked room and the caller was asked to drain
     /// before more input was read. Backpressure, not loss.
     pub output_stalls: u64,
+    /// Terminal records re-attempted because the ring could not take them
+    /// when their fence finished. Every accepted request reserves room for
+    /// its own terminal record, so this stays zero unless that reservation
+    /// has been undermined — a non-zero value is a defect signal, not load.
+    pub terminal_retries: u64,
     pub peak_resident_bytes: u64,
     pub peak_staging_bytes: u64,
     pub peak_fences: u16,
@@ -558,6 +563,36 @@ pub enum Work {
         slot: u16,
     },
 }
+impl Work {
+    /// The fence this work settles, or `None` for [`Work::None`], which
+    /// names no outstanding fence because the request is already terminal.
+    ///
+    /// Every other variant carries one, and a provider holding state
+    /// alongside a fence needs it without matching all fourteen — a match
+    /// each provider writes for itself is a match each provider can miss a
+    /// variant in.
+    #[must_use]
+    pub fn fence(&self) -> Option<u16> {
+        match *self {
+            Work::None => None,
+            Work::CreateBuffer { fence, .. }
+            | Work::CreateTexture { fence, .. }
+            | Work::DestroyResource { fence, .. }
+            | Work::LoadProgram { fence, .. }
+            | Work::CreatePipeline { fence, .. }
+            | Work::ReleaseProgram { fence, .. }
+            | Work::ReleasePipeline { fence, .. }
+            | Work::Upload { fence, .. }
+            | Work::Readback { fence, .. }
+            | Work::Submit { fence, .. }
+            | Work::Cancel { fence, .. }
+            | Work::Drain { fence, .. }
+            | Work::Reset { fence, .. }
+            | Work::ExportSurface { fence, .. } => Some(fence),
+        }
+    }
+}
+
 
 /// The result of offering bytes to [`GpuDevice::admit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -622,6 +657,10 @@ const RESERVE_REJECT: usize = HEADER_LEN + 8;
 /// record plus one request's full set of answers. A smaller ring could not
 /// answer `QUERY_CAPS` at all.
 pub const MIN_RING_BYTES: usize = HEADER_LEN + CAPS_LEN + RESERVE_BASE;
+
+/// Fixed fields ahead of the bytes in an `OUT_RESULT` record: fence handle,
+/// offset, length.
+const RESULT_PREFIX: usize = 24;
 
 /// The device state that does not live in the caller's tables.
 ///
@@ -2457,7 +2496,7 @@ impl<'a> GpuDevice<'a> {
         // fence's own record still stands against the original correlation;
         // polling is a read, not an acknowledgement.
         let corr = hdr.corr;
-        self.emit_terminal_record(idx, corr, 0);
+        self.emit_terminal_record(idx, corr);
         Ok(Work::None)
     }
 
@@ -2600,17 +2639,29 @@ impl<'a> GpuDevice<'a> {
         if !res.live || res.generation != v.resource_gen {
             return Err((REASON_BAD_HANDLE, 0));
         }
+        // A sink scans out of this memory directly, so it must actually be
+        // there. Every other path that hands a resource to hardware checks
+        // this; leaving it out here would let a lease name storage the device
+        // has evicted, and the sink would read whatever now occupies it.
+        if res.residency != RESIDENCY_RESIDENT {
+            return Err((REASON_RESIDENCY, res.residency as u32));
+        }
         // A frame that has not been committed is not presentable, for the
         // same reason it is not readable.
         if res.usage & USAGE_CANDIDATE != 0 && !res.published {
             return Err((REASON_NOT_READY, 0));
         }
-        let stride = (width as u64)
-            .checked_mul(4)
-            .ok_or((REASON_BAD_RANGE, 0))? as u32;
-        let need = (stride as u64)
+        // The whole span stays in `u64`. Narrowing the stride first would
+        // put the overflow in the cast rather than the multiply, where no
+        // `checked_` can see it: a width of 0x4000_0000 gives a stride of
+        // zero, and a zero stride passes every length check there is.
+        let stride = (width as u64).checked_mul(4).ok_or((REASON_BAD_RANGE, 0))?;
+        let need = stride
             .checked_mul(height as u64)
             .ok_or((REASON_BAD_RANGE, 0))?;
+        // Narrowed only once the span is known to fit, and refused rather
+        // than truncated if it does not.
+        let stride_u32 = u32::try_from(stride).map_err(|_| (REASON_BAD_RANGE, 0))?;
         if need > v.length {
             return Err((REASON_BAD_RANGE, 0));
         }
@@ -2635,7 +2686,7 @@ impl<'a> GpuDevice<'a> {
             s.producer_fence = fence_handle;
             s.width = width;
             s.height = height;
-            s.stride = stride;
+            s.stride = stride_u32;
             s.format = format;
             s.colour_space = colour;
             s.sequence = sequence;
@@ -2758,11 +2809,15 @@ impl<'a> GpuDevice<'a> {
             return false;
         }
         let corr = f.corr;
-        let need = HEADER_LEN + 24 + bytes.len();
-        if bytes.len() > (MAX_PAYLOAD as usize - 24) {
+        let need = HEADER_LEN + RESULT_PREFIX + bytes.len();
+        if bytes.len() > (MAX_PAYLOAD as usize - RESULT_PREFIX) {
             return false;
         }
-        if self.t.outcomes.len() - self.out_len < need {
+        // Result bytes are unreserved, so they draw on free space only —
+        // never on the room another fence is holding for its terminal record.
+        // Spending that would trade a stall this caller retries for an
+        // outcome some other request could never deliver.
+        if self.ring_free() < need {
             self.stats.output_stalls += 1;
             return false;
         }
@@ -2770,10 +2825,12 @@ impl<'a> GpuDevice<'a> {
         // Build the record in place: header, then the fixed fields, then the
         // bytes — no intermediate copy of a payload that may be 64 KiB.
         let start = self.out_len;
-        let total = HEADER_LEN + 24 + bytes.len();
+        let total = HEADER_LEN + RESULT_PREFIX + bytes.len();
         let out = &mut self.t.outcomes[start..start + total];
         out[..HEADER_LEN]
-            .copy_from_slice(&Header::new(OUT_RESULT, (24 + bytes.len()) as u32, corr).encode());
+            .copy_from_slice(
+                &Header::new(OUT_RESULT, (RESULT_PREFIX + bytes.len()) as u32, corr).encode(),
+            );
         let body = &mut out[HEADER_LEN..];
         put_u64(body, 0, fh);
         put_u64(body, 8, offset);
@@ -2784,6 +2841,21 @@ impl<'a> GpuDevice<'a> {
         let f = &mut self.t.fences[fence as usize];
         f.result_sent = f.result_sent.saturating_add(bytes.len() as u64);
         true
+    }
+
+    /// The largest result payload [`Self::push_result`] would accept now.
+    ///
+    /// A backend sizes its chunk from this rather than from a constant. The
+    /// ring's free space is the device's to know, and it moves: a fixed chunk
+    /// is either smaller than the ring could have taken, or refused outright
+    /// and re-offered at the same size next step, which is how a readback
+    /// stops making progress rather than merely slowing down. Zero means the
+    /// ring has no room at all right now; drain and ask again.
+    #[must_use]
+    pub fn max_result_chunk(&self) -> usize {
+        self.ring_free()
+            .saturating_sub(HEADER_LEN + RESULT_PREFIX)
+            .min(MAX_PAYLOAD as usize - RESULT_PREFIX)
     }
 
     /// Whether `fence` still owes result bytes.
@@ -2897,11 +2969,18 @@ impl<'a> GpuDevice<'a> {
         }
 
         let corr = self.t.fences[fence as usize].corr;
-        let reserved = self.t.fences[fence as usize].ring_reserved as usize;
-        self.emit_terminal_record(fence, corr, reserved);
+        self.emit_terminal_record(fence, corr);
     }
 
-    fn emit_terminal_record(&mut self, fence: u16, corr: u64, from_reserved: usize) {
+    /// Write the fence's terminal record against `corr`.
+    ///
+    /// The draw on the outcome ring is decided here rather than by the
+    /// caller, because only one of the two callers is delivering: `finish`
+    /// spends the reservation taken for this record at admission, while a
+    /// poll re-reads an outcome already delivered and draws on the free
+    /// space admission proved was there. A caller that passed the wrong one
+    /// would either double-spend the reservation or strand it forever.
+    fn emit_terminal_record(&mut self, fence: u16, corr: u64) {
         let f = self.t.fences[fence as usize];
         let fh = self.handle_for(KIND_FENCE, fence, f.generation);
         let mut payload = [0u8; 24];
@@ -2928,6 +3007,11 @@ impl<'a> GpuDevice<'a> {
             }
             _ => return,
         };
+        let from_reserved = if f.delivered {
+            0
+        } else {
+            f.ring_reserved as usize
+        };
         if self.emit(f.outcome, corr, &payload[..len], from_reserved) {
             self.t.fences[fence as usize].delivered = true;
             self.t.fences[fence as usize].ring_reserved = 0;
@@ -2937,9 +3021,15 @@ impl<'a> GpuDevice<'a> {
     fn release_fence_slot(&mut self, idx: u16) {
         let f = &mut self.t.fences[idx as usize];
         let reserved = f.ring_reserved as usize;
-        f.state = FENCE_FREE;
-        f.ring_reserved = 0;
-        f.delivered = false;
+        // Cleared, not merely marked free. Every other field is still read by
+        // passes that scan the whole table, and `op` in particular decides
+        // whether a slot is treated as a drain — so a freed slot that kept its
+        // last life's `op` would be picked up as live work it never was.
+        // The generation survives: it is what makes a handle to the old fence
+        // refusable rather than a handle to whatever lands here next.
+        let generation = f.generation;
+        *f = FenceSlot::EMPTY;
+        f.generation = generation;
         self.out_reserved = self.out_reserved.saturating_sub(reserved);
     }
 
@@ -2952,6 +3042,19 @@ impl<'a> GpuDevice<'a> {
     /// promotes satisfied waits to `READY`, and completes a drain once the
     /// device has nothing left in flight.
     pub fn advance(&mut self) {
+        // A terminal record the ring could not take is owed, not lost. The
+        // fence stays unreleasable until its outcome reaches the consumer, so
+        // without a retry it would never be released at all — the slot, and
+        // the reservation with it, would be gone for the life of the device.
+        for idx in 0..self.t.fences.len() {
+            let f = self.t.fences[idx];
+            if f.state == FENCE_TERMINAL && !f.delivered {
+                self.stats.terminal_retries += 1;
+                let corr = f.corr;
+                self.emit_terminal_record(idx as u16, corr);
+            }
+        }
+
         // Propagate failures and cancellations down the wait graph. Bounded:
         // one pass per call, and a chain of N fences resolves in N calls,
         // which keeps a step's work independent of graph depth.
@@ -3015,7 +3118,13 @@ impl<'a> GpuDevice<'a> {
         // and the backend still gates on physical quiescence before calling
         // `complete`.
         for idx in 0..self.t.fences.len() {
-            if self.t.fences[idx].op != OP_DRAIN || self.t.fences[idx].state == FENCE_TERMINAL {
+            // `op` means nothing on a slot that holds no request, so state is
+            // read first: a free slot is not a drain, whatever it last was.
+            if !matches!(
+                self.t.fences[idx].state,
+                FENCE_WAITING | FENCE_READY | FENCE_RUNNING
+            ) || self.t.fences[idx].op != OP_DRAIN
+            {
                 continue;
             }
             let busy = self.t.fences.iter().enumerate().any(|(j, f)| {

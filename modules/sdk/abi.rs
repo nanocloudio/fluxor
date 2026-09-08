@@ -128,7 +128,7 @@ pub mod contracts {
     }
     /// The generic GPU contract: the record envelope, the program-pack
     /// envelope, the portable device model every backend shares, the provider
-    /// pump, the producer-side client and the deterministic null/replay
+    /// pump, the producer-side client and the deterministic replay
     /// backend.
     ///
     /// One namespace rather than six, because they are one contract — the pack

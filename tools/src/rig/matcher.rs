@@ -1,4 +1,4 @@
-//! Observation matcher — RFC §8.1.
+//! Observation matcher.
 //!
 //! Consumes [`RunEvent`]s produced by the other adapters and evaluates the
 //! scenario's pass/fail rules. Semantics:
@@ -102,7 +102,8 @@ pub enum MatcherOutcome {
 
 pub struct Matcher {
     rules: Vec<CompiledRule>,
-    /// Indices of pass rules that have already matched. Sticky per §8.1.
+    /// Indices of pass rules that have already matched. Sticky: a rule that
+    /// has matched stays matched.
     pass_hits: HashSet<usize>,
     /// Pass-rule indices in the order they first matched. `last()` is the
     /// rule whose match completed the pass set; that's the rule cited in
@@ -221,8 +222,8 @@ impl Matcher {
         };
         let text = String::from_utf8_lossy(buf);
 
-        // Fail rules first — §8.1 "fail wins". Only rules naming *this*
-        // source are considered.
+        // Fail rules first: a fail beats any number of passes. Only rules
+        // naming *this* source are considered.
         if self.fail_hit.is_none() {
             for (idx, rule) in self.rules.iter().enumerate() {
                 if rule.kind != RuleKind::Fail {

@@ -169,10 +169,6 @@ fn access_name(access: u8) -> &'static str {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Parse a 16-byte toolchain identity from hex, or hash a free-text label
 /// into one.
 ///
@@ -276,15 +272,18 @@ pub fn cmd_pack(
 
     std::fs::write(output, &out)?;
     println!("wrote {} ({} bytes)", output.display(), out.len());
-    println!("  artifact digest {}", hex(&pack.artifact_digest));
-    println!("  pack identity   {}", hex(&pack.identity()));
+    println!(
+        "  artifact digest {}",
+        crate::hash::hex(&pack.artifact_digest)
+    );
+    println!("  pack identity   {}", crate::hash::hex(&pack.identity()));
     Ok(())
 }
 
 /// `fluxor gpu caps` — write the capability record of a provider that is
 /// always available.
 ///
-/// Validating a pack needs a device's published facts, and the null/replay
+/// Validating a pack needs a device's published facts, and the replay
 /// provider is the one device every checkout has. Emitting its record lets a
 /// build gate check every pack it produces without a GPU — and, because the
 /// record comes from the same `encode_caps` the running provider answers
@@ -340,9 +339,9 @@ pub fn cmd_inspect(path: &Path, json: bool) -> Result<()> {
                 "target_rev": pack.target_rev,
                 "entry": String::from_utf8_lossy(pack.entry()),
                 "artifact_bytes": pack.artifact().len(),
-                "artifact_digest": hex(&pack.artifact_digest),
-                "pack_identity": hex(&pack.identity()),
-                "toolchain": hex(&pack.toolchain),
+                "artifact_digest": crate::hash::hex(&pack.artifact_digest),
+                "pack_identity": crate::hash::hex(&pack.identity()),
+                "toolchain": crate::hash::hex(&pack.toolchain),
                 "workgroup": pack.workgroup,
                 "min_align": pack.min_align,
                 "feature_req": pack.feature_req,
@@ -365,12 +364,15 @@ pub fn cmd_inspect(path: &Path, json: bool) -> Result<()> {
     );
     println!("  entry         {}", String::from_utf8_lossy(pack.entry()));
     println!("  artifact      {} bytes", pack.artifact().len());
-    println!("  digest        {}", hex(&pack.artifact_digest));
+    println!(
+        "  digest        {}",
+        crate::hash::hex(&pack.artifact_digest)
+    );
     // Two digests, never one: the artifact digest is content identity, the
     // pack identity is what a pipeline cache is keyed on. Packs sharing bytes
     // but declaring different binding access are different programs.
-    println!("  identity      {}", hex(&pack.identity()));
-    println!("  toolchain     {}", hex(&pack.toolchain));
+    println!("  identity      {}", crate::hash::hex(&pack.identity()));
+    println!("  toolchain     {}", crate::hash::hex(&pack.toolchain));
     println!(
         "  workgroup     {}x{}x{}  align {}",
         pack.workgroup[0], pack.workgroup[1], pack.workgroup[2], pack.min_align

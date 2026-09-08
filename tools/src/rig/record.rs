@@ -1,8 +1,8 @@
-//! Run record — RFC §10.6.
+//! Run record.
 //!
-//! Every rig run should produce a reproducibility-grade identity manifest:
-//! hashes of the artifact bundle, scenario file, and rig profile (with
-//! secrets redacted), plus verdict and timing.
+//! Every rig run produces a reproducibility-grade identity manifest: hashes of
+//! the artifact bundle, scenario file, and rig profile (with secrets
+//! redacted), plus verdict and timing.
 //!
 //! Records are written under
 //! `~/.local/state/fluxor/labs/<lab>/rigs/<rig>/runs/<timestamp>/manifest.json`.
@@ -104,13 +104,17 @@ pub fn hash_artifact_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hex_digest(&hasher.finalize()))
+    Ok(crate::hash::hex(&hasher.finalize()))
 }
 
-/// Artifact digest for a multi-file bundle. Deterministic under the RFC-§10.6
-/// canonicalisation: entries sorted by path relative to the bundle root,
-/// each emitted as `len(path)||path||len(content)||content`, concatenated
-/// and SHA-256'd.
+/// Artifact digest for a multi-file bundle.
+///
+/// Deterministic because the bundle is canonicalised before it is hashed:
+/// entries sorted by path relative to the bundle root, each emitted as
+/// `len(path)||path||len(content)||content`, concatenated and SHA-256'd. The
+/// lengths are what stop two different bundles colliding — without them,
+/// moving a byte from the end of a path to the start of its content would
+/// hash identically.
 ///
 /// Only regular files are included; symlinks, directories, and sockets are
 /// ignored. Directory traversal is depth-first.
@@ -140,7 +144,7 @@ pub fn hash_artifact_bundle(root: &Path) -> Result<String> {
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(&bytes);
     }
-    Ok(hex_digest(&hasher.finalize()))
+    Ok(crate::hash::hex(&hasher.finalize()))
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
@@ -190,7 +194,7 @@ fn hash_scenario_file(scenario: &Scenario) -> Result<String> {
     hasher.update(scenario.target.as_bytes());
     hasher.update(b"|config:");
     hasher.update(scenario.config.to_string_lossy().as_bytes());
-    Ok(hex_digest(&hasher.finalize()))
+    Ok(crate::hash::hex(&hasher.finalize()))
 }
 
 fn hash_file_bytes(path: &Path) -> Result<String> {
@@ -207,7 +211,7 @@ fn hash_file_bytes(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hex_digest(&hasher.finalize()))
+    Ok(crate::hash::hex(&hasher.finalize()))
 }
 
 /// Canonicalise a profile for hashing: every string value is reduced via
@@ -263,15 +267,7 @@ pub fn hash_profile(profile: &RigProfile) -> String {
     let canonical = canonical_profile(profile);
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
-    hex_digest(&hasher.finalize())
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    crate::hash::hex(&hasher.finalize())
 }
 
 fn now_unix_secs_and_nanos() -> (u64, u32) {
@@ -325,7 +321,7 @@ regex = "kernel\\.img$"
         let expected = {
             let mut h = sha2::Sha256::new();
             h.update(body.as_bytes());
-            hex_digest(&h.finalize())
+            crate::hash::hex(&h.finalize())
         };
         assert_eq!(hash_a, expected);
 

@@ -633,7 +633,7 @@ enum GpuAction {
     },
     /// Write a provider's capability record to a file.
     ///
-    /// `validate` needs a device's published facts, and the null/replay
+    /// `validate` needs a device's published facts, and the replay
     /// provider is the one device every checkout has. For any other backend,
     /// capture the `OUT_CAPS` record it answers with.
     Caps {

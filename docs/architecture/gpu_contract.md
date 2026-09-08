@@ -60,15 +60,15 @@ debug with one.
 
 | Provider | Where | Backend | Advertises |
 |---|---|---|---|
-| `gpu_null` | `modules/foundation/gpu_null` | Byte arena, fixture transformation | compute, readback, device reset |
-| `linux_gpu` | `src/platform/linux/gpu.rs` (`--features host-gpu`) | wgpu on Vulkan, headless | compute, readback, timestamps where the adapter has them |
+| `gpu_replay` | `modules/foundation/gpu_replay` | Byte arena, fixture transformation | compute, readback, device reset |
+| `linux_gpu` | `src/platform/linux/gpu.rs` (`--features host-gpu`) | wgpu on Vulkan, headless | compute, readback |
 | `wasm_browser_compute` | `src/platform/wasm/gpu_compute.rs` | WebGPU, shared page device | compute, readback |
 
 None of them advertises raster, shared surfaces or preemption, because none
 implements them. A capability record is worth nothing if it reports the union
 of what some backend could manage.
 
-`gpu_null` exists for two reasons. It is the correctness oracle every other
+`gpu_replay` exists for two reasons. It is the correctness oracle every other
 backend is held to — the same lifetime and fault corpus runs there with no
 driver and no asynchronous callbacks, so a failure is a contract bug rather
 than a hardware one. And it is a composition that builds on targets with no
@@ -272,7 +272,7 @@ A drain completes on physical quiescence, never on an empty channel. A reset
 terminates every outstanding request with `DEVICE_LOST`, bumps the device
 epoch, invalidates every handle, fence, surface and pipeline-cache reference,
 and only then reclaims memory — a timeout alone frees nothing. Reset is
-advertised only where it has been demonstrated: `gpu_null` clears a byte
+advertised only where it has been demonstrated: `gpu_replay` clears a byte
 arena, which is verified quiescence; the native and browser providers do not
 claim it, because recreating an adapter is not a proof.
 

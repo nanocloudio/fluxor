@@ -3,7 +3,7 @@
 // Between the wire contract and a backend's device objects sits a channel
 // pump: read command bytes, admit one record at a time, execute what admission
 // produced, push outcome records back. The shape is the same for the
-// null/replay provider, the browser one and the native one, and so are the
+// replay provider, the browser one and the native one, and so are the
 // four decisions inside it that are easy to get wrong in different ways in
 // each copy:
 //

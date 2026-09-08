@@ -1276,11 +1276,10 @@ unsafe fn timer_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             //
             // `now_unix_millis` alone cannot answer this and never could: a
             // nonzero reading from a clock nobody synchronised looks exactly
-            // like a good one. So the provider used to stop at `RTC` and
-            // never set `TRUSTED`, and every credential-validity decision in
-            // the ecosystem waited on a time source that could say more.
+            // like a good one, so a reading on its own can never be more
+            // than `RTC`.
             //
-            // `hal::clock_sync_status` is that source. An operating system
+            // `hal::clock_sync_status` is what says more. An operating system
             // running a time protocol tracks whether its clock has been
             // disciplined and by how much it may be off, and asking it is
             // evidence rather than assumption. Three distinguishable answers,

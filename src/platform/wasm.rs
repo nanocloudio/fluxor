@@ -1189,7 +1189,7 @@ unsafe fn load_embedded_modules() -> usize {
         }
 
         // Generic GPU provider. The same contract and the same shared cores
-        // as the null/replay and native providers; only the device objects
+        // as the replay and native providers; only the device objects
         // behind the slot numbers differ. Draws from the page's one WebGPU
         // device, so a compute output can be handed to raster without a CPU
         // round trip.

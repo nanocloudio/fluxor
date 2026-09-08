@@ -280,7 +280,8 @@ mod profile_host {
         /// is ~137 MiB and is what `kernel::STATE_ARENA_SIZE` is sized
         /// around. Lookup is by hash index (`ip/index.rs`), never a scan,
         /// and the timer sweep is sliced across the 50 ms window, so the
-        /// size costs nothing per packet or per step.
+        /// a packet pays for the cluster it lands in rather than for the
+        /// table, and a step for its slice rather than the whole sweep.
         /// At least `http::MAX_CONCURRENT_CONNS` (compile-time invariant).
         pub const MAX_TCP_CONNS: usize = 65536;
         /// Datagram endpoints carry a u8 `ep_id` on the wire, so they are
@@ -290,7 +291,8 @@ mod profile_host {
         /// Multi-homing address-table size. Slot 0 is the primary
         /// (DHCP-managed); slots 1.. are secondaries added at runtime via
         /// the ip module's `addr_ctl` port. Demuxed through a hash index
-        /// on the RX path, so the size costs nothing per frame.
+        /// on the RX path, so a frame pays for the cluster it lands in
+        /// rather than for the table.
         pub const MAX_LOCAL_ADDRS: usize = 4096;
         /// Packets the pre-transport decision seam may hold awaiting a
         /// director's disposition. One full frame each, so this is the

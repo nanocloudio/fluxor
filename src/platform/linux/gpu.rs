@@ -10,7 +10,7 @@
 //!
 //! Validation, handles, views, sealing, residency, fences, dependency order,
 //! candidate-output commit and epochs are the shared cores
-//! (`modules/sdk/cores/gpu_*.rs`) — the same code the `gpu_null` provider runs,
+//! (`modules/sdk/cores/gpu_*.rs`) — the same code the `gpu_replay` provider runs,
 //! so both are held to one lifetime corpus. This file owns exactly what wgpu
 //! owns: adapters, buffers, shader modules, pipelines, encoders and mapped
 //! memory.
@@ -748,15 +748,14 @@ mod worker {
         l.arith_types = arith;
         l.arith_ops = w::AOP_FMA_F32 | w::AOP_ATOMIC_I32;
 
-        let mut features_out = w::FEATURE_COMPUTE | w::FEATURE_READBACK;
-        if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
-            // The adapter can time work. This provider does not yet place
-            // timestamp queries, so the fact is advertised and every
-            // completion still flags itself queue-timed until it does.
-            features_out |= w::FEATURE_TIMESTAMP;
-        }
+        let features_out = w::FEATURE_COMPUTE | w::FEATURE_READBACK;
         // Not advertised, because not implemented here: raster, shared
-        // surfaces, indirect dispatch, subgroups, preemption — and device
+        // surfaces, indirect dispatch, subgroups, preemption, timestamps —
+        // the adapter may carry `TIMESTAMP_QUERY`, but this provider places
+        // no query and every completion reports `gpu_nanos` of zero, and a
+        // capability record that reports what a backend could manage rather
+        // than what this one does is worth nothing to the consumer reading
+        // it — and device
         // reset, which needs demonstrated quiescence rather than a hope that
         // recreating an adapter is enough.
         l.features = features_out;
@@ -1151,7 +1150,14 @@ fn drain_pending_bytes(
         let (fence, offset, bytes, sent) = &mut pending[i];
         let mut progressed = true;
         while *sent < bytes.len() && progressed {
-            let chunk = (bytes.len() - *sent).min(gpu_wire::MAX_PAYLOAD as usize - 24);
+            // Sized to what the ring will take now, not to a constant: a chunk
+            // the ring cannot hold is re-offered at the same size next step,
+            // so a fixed chunk turns a slow readback into a stalled one.
+            let room = dev.max_result_chunk();
+            if room == 0 {
+                break;
+            }
+            let chunk = (bytes.len() - *sent).min(room);
             progressed =
                 dev.push_result(*fence, *offset + *sent as u64, &bytes[*sent..*sent + chunk]);
             if progressed {
@@ -1193,6 +1199,15 @@ fn translate(
     work: gpu_wire::Work,
 ) -> bool {
     use gpu_wire::Work;
+    // A fence slot is reused as soon as it is released, and a plan left
+    // under its index outlives it: the fence that never reached
+    // `next_ready` — cancelled, or poisoned by a dependency — left one
+    // behind, and the next fence at that index would find it and submit
+    // another request's work. So the index is cleared the moment it names
+    // something new, before the arms below put anything under it.
+    if let Some(fence) = work.fence() {
+        deferred.remove(&fence);
+    }
     let send = |dev: &mut gpu_wire::GpuDevice<'_>, fence: u16, job: Job| {
         dev.mark_running(fence);
         if to_worker.send(job).is_err() {

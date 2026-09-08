@@ -1,4 +1,4 @@
-//! Null/replay GPU provider — the GPU contract with no GPU.
+//! Replay GPU provider — the GPU contract with no GPU.
 //!
 //! A thin pump. Everything that decides anything lives in the shared cores:
 //! [`gpu_wire`](../../sdk/wire/gpu_wire.rs) is the contract,
@@ -334,6 +334,12 @@ fn step(s: &mut GpuNullState) {
             // admitting more work now could accept a submission whose
             // dependency has not settled.
             //
+            // Advance even though no new work was admitted: it is what
+            // re-attempts a terminal record the ring could not take, and a
+            // readback owing bytes is exactly when the ring is fullest.
+            // Returning without it would leave that fence undeliverable for
+            // as long as the readback lasts.
+            dev.advance();
             // Flush BEFORE saving: draining moves the ring's cursor, and
             // saving the pre-drain value would roll it back and re-emit every
             // record on the next step.

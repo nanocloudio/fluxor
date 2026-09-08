@@ -1,4 +1,4 @@
-//! Rig lockfile — RFC §10.5.
+//! Rig lockfile.
 //!
 //! A single physical rig is a serialisable resource: only one orchestrated
 //! run should touch it at once. V1 uses a local lockfile with atomic
@@ -30,7 +30,7 @@ pub struct LockOwner {
     pub task: String,
     /// Seconds since Unix epoch.
     pub started_at: u64,
-    /// Effective timeout governing stale-lock detection per §10.5:
+    /// Effective timeout governing stale-lock detection:
     /// scenario `timeout_s` when present, else board `default_timeout_s`,
     /// else a sensible fallback.
     pub effective_timeout_s: u32,
@@ -48,7 +48,7 @@ impl LockOwner {
         }
     }
 
-    /// Stale threshold per RFC §10.5: max(2 × effective_timeout_s, 60s).
+    /// Stale threshold: max(2 × effective_timeout_s, 60s).
     pub fn stale_threshold_s(&self) -> u64 {
         std::cmp::max(2 * self.effective_timeout_s as u64, 60)
     }

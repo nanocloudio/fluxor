@@ -232,7 +232,7 @@ host-playback = ["host-linux", "cpal"]
 # Native GPU compute provider (`linux_gpu`). Off by default: wgpu is a
 # large dependency, and a headless server build that never opens an
 # adapter should not carry it. Without the feature the module still
-# loads and still frames the v1 protocol — it refuses every request with
+# loads and still frames the protocol — it refuses every request with
 # a reason, which is a fact a graph can act on, rather than silently
 # accepting work nothing will run.
 host-gpu = ["host-linux", "wgpu", "pollster"]

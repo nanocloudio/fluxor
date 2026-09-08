@@ -1,17 +1,17 @@
 //! Rig capability vocabulary — the canonical list of surfaces and capability
-//! names from the hardware-rig RFC §6.
+//! names for a hardware rig.
 //!
 //! Boards declare which capabilities they can support; scenarios declare which
 //! capabilities they require. The vocabulary is fixed: adding a new capability
 //! is a vocabulary change, not a user-extensible plugin.
 //!
-//! Per RFC §7, capability-valued fields use fully qualified names everywhere
+//! Capability-valued fields use fully qualified names everywhere
 //! (`deploy.netboot_tftp`, `console.serial`, `power.cycle`). No alias mapping,
 //! no fuzzy matching — validation is exact string membership.
 
 use crate::error::{Error, Result};
 
-/// Rig surfaces per RFC §6. Three kinds:
+/// Rig surfaces. Three kinds:
 ///   - actuation / transport: power, deploy, console, telemetry
 ///   - evaluation:            observe
 ///   - coordination:          rig (rig.claim / rig.release / rig.lock)
@@ -49,7 +49,7 @@ impl Surface {
         }
     }
 
-    /// Capabilities defined under this surface. RFC §6.1–6.6.
+    /// Capabilities defined under this surface.
     pub fn capabilities(self) -> &'static [&'static str] {
         match self {
             Self::Power => &["power.on", "power.off", "power.cycle"],
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn no_fuzzy_match() {
-        // RFC §7: no alias mapping. 'uart' is not 'console.serial'.
+        // No alias mapping: 'uart' is not 'console.serial'.
         assert!(Capability::parse("console.uart").is_err());
         assert!(Capability::parse("uart").is_err());
     }

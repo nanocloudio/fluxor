@@ -1,7 +1,7 @@
 //! Project build descriptor — maps a board id to the command that
 //! produces its artifact and the path to the artifact on disk.
 //!
-//! RFC §15.2. Build knowledge only: serial paths, smart-plug identities,
+//! Build knowledge only: serial paths, smart-plug identities,
 //! TFTP roots, and rig-lock state live in the private rig profile under
 //! `~/.config/fluxor/labs/`.
 //!

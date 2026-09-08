@@ -1,5 +1,5 @@
 //! Hardware-rig contract — types, parsers, validators, and the backend
-//! subprocess dispatcher per `.context/rfc_hardware_rig.md`.
+//! subprocess dispatcher.
 //!
 //! Layout:
 //!

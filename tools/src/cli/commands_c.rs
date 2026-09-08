@@ -1562,13 +1562,7 @@ fn cmd_sign(
     fs::write(out_path, &out_bytes)
         .map_err(|e| Error::Module(format!("write {}: {}", out_path.display(), e)))?;
 
-    fn hex(b: &[u8]) -> String {
-        let mut s = String::with_capacity(b.len() * 2);
-        for &x in b {
-            s.push_str(&format!("{x:02x}"));
-        }
-        s
-    }
+    use fluxor_tools::hash::hex;
 
     if verbose {
         println!("Signed {} ({} bytes)", out_path.display(), out_bytes.len());

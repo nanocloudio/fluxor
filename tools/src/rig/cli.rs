@@ -263,7 +263,7 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     })?;
     let scenario = load_scenario(&scenario_path)?;
 
-    // Board descriptor: RFC §15.1 layered lookup. User override wins
+    // Board descriptor: layered lookup. User override wins
     // over a project-local `targets/boards/` (when one exists upward
     // from the scenario), which in turn wins over the defaults embedded
     // in fluxor-tools. This lets the harness run from a sibling project
@@ -284,7 +284,7 @@ fn cmd_test(args: TestArgs) -> Result<()> {
     };
     eprintln!("[rig] board descriptor: {}", board_source.display());
 
-    // 1. Validate scenario against board (fail fast at plan time per §7.1).
+    // 1. Validate scenario against board (fail fast at plan time).
     let v = validate_scenario_against_board(&scenario, &board);
     for w in &v.warnings {
         eprintln!("warning: {w}");
@@ -325,8 +325,8 @@ fn cmd_test(args: TestArgs) -> Result<()> {
         .ok_or_else(|| Error::Config("rig test: cannot resolve $HOME for profile lookup".into()))?;
     if !profile_path.is_file() {
         return Err(Error::Config(format!(
-            "rig test: profile not found at {} — create one per RFC §9 \
-             (see .context/rfc_hardware_rig.md)",
+            "rig test: profile not found at {} — a rig profile binds this \
+             lab's capabilities to one physical bench and is never checked in",
             profile_path.display()
         )));
     }
@@ -588,7 +588,7 @@ fn validate_power_verb_on_board(
     Ok(())
 }
 
-/// Resolve the active lab namespace per RFC §10.2:
+/// Resolve the active lab namespace:
 /// `--lab` flag > `FLUXOR_LAB` env > `default`.
 fn resolve_lab(flag: Option<&str>) -> String {
     if let Some(l) = flag {

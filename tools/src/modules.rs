@@ -354,8 +354,8 @@ fn verify_module_abi_surface(info: &ModuleInfo, path: &Path) -> Result<()> {
              {}, current is {}) — rebuild it with `fluxor modules build`. \
              See docs/architecture/abi_surface.md",
             path.display(),
-            hex12(&packed),
-            hex12(&current),
+            crate::hash::hex(&packed[..6]),
+            crate::hash::hex(&current[..6]),
         ))),
         None => Err(Error::Module(format!(
             "{}: carries no ABI-surface attestation — rebuild it with \
@@ -363,10 +363,6 @@ fn verify_module_abi_surface(info: &ModuleInfo, path: &Path) -> Result<()> {
             path.display(),
         ))),
     }
-}
-
-fn hex12(d: &[u8; 32]) -> String {
-    d.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 /// Parse modules from config YAML/JSON, resolving each `.fmod` against
@@ -1232,8 +1228,8 @@ pub fn pack_fmod(
                 "{}: compiled against a different ABI surface (module embeds {}, \
                  current is {}) — {}",
                 input.display(),
-                hex12(&embedded),
-                hex12(&current_surface),
+                crate::hash::hex(&embedded[..6]),
+                crate::hash::hex(&current_surface[..6]),
                 hint,
             )));
         }
@@ -1477,7 +1473,7 @@ pub fn pack_fmod_wasm(
             "{}: wasm module does not embed the current ABI surface ({}) — \
              built against a different SDK; rebuild from source with `fluxor modules build`",
             input.display(),
-            hex12(&current_surface),
+            crate::hash::hex(&current_surface[..6]),
         )));
     }
     module_manifest.abi_surface = Some(current_surface);

@@ -554,25 +554,6 @@ pub struct NodeStatus {
     pub pods: Vec<PodStatus>,
 }
 
-/// Lowercase hex of a 16-byte pod UID (the status join key encoding).
-fn uid16_hex(d: &[u8; 16]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(32);
-    for b in d {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-fn hex32(d: &[u8; 32]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(64);
-    for b in d {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 /// Derive the node's per-pod status from the store: desired set joined with
 /// the committed plan's owner assignments. Read-only; safe to run while the
 /// runtime is live (the store is only ever appended by commit).
@@ -581,7 +562,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
     let plan = load_committed_plan(store);
     let committed = store.committed();
     let generation = committed.as_ref().map(|g| g.id);
-    let committed_abi_surface = committed.as_ref().map(|g| hex32(&g.abi_surface));
+    let committed_abi_surface = committed.as_ref().map(|g| crate::hash::hex(&g.abi_surface));
     let mut pods: Vec<PodStatus> = desired
         .iter()
         .map(|p| {
@@ -650,7 +631,7 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
     pods.sort_by(|a, b| a.pod_uid_hex.cmp(&b.pod_uid_hex));
     Ok(NodeStatus {
         generation,
-        abi_surface: hex32(&crate::hash::abi_surface_digest()),
+        abi_surface: crate::hash::hex(&crate::hash::abi_surface_digest()),
         committed_abi_surface,
         pods,
     })
@@ -685,7 +666,7 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
                 }) {
                     let declared = desired
                         .iter()
-                        .find(|d| uid16_hex(&d.pod_uid) == pod.pod_uid_hex)
+                        .find(|d| crate::hash::hex(&d.pod_uid) == pod.pod_uid_hex)
                         .map(|d| d.exports.as_slice())
                         .unwrap_or(&[]);
                     let bound = entry.runtime.bound_endpoints.as_deref().unwrap_or(&[]);

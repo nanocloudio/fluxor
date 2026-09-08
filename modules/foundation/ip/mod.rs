@@ -224,7 +224,22 @@ const MAX_LISTENERS: usize = if tcp::MAX_TCP_CONNS < 1024 {
 /// the small profiles keep the scan.
 const PORT_REF_ENTRIES: usize = if tcp::MAX_TCP_CONNS >= 4096 { 65536 } else { 1 };
 /// Sources whose half-open count is tracked individually.
-const HO_SRC_ENTRIES: usize = if tcp::MAX_TCP_CONNS >= 4096 { 1024 } else { 16 };
+///
+/// Sized against the half-open ceiling rather than a round number, at the
+/// same 2:1 the connection index keeps, because the entries are consumed
+/// by DISTINCT sources and a flood is distinct sources by definition. A
+/// table smaller than the ceiling fills, and a full table has no free
+/// entry to stop a probe at: `source_enter` then walks the whole thing and
+/// reports nothing, so the per-source gauge goes blind during exactly the
+/// flood it exists to measure. Eight bytes an entry, against a connection
+/// table three orders larger.
+const HO_SRC_ENTRIES: usize = if tcp::MAX_TCP_CONNS >= 4096 {
+    tcp::MAX_TCP_CONNS
+} else {
+    16
+};
+const _: () = assert!(HO_SRC_ENTRIES >= tcp::SYN_COOKIE_WATERMARK as usize * 2);
+const _: () = assert!(HO_SRC_ENTRIES.is_power_of_two());
 /// The TCP timer window: every connection's timers advance once per
 /// window, in slices spread across it.
 const TCP_SWEEP_WINDOW_MS: u32 = 50;
@@ -380,6 +395,14 @@ fn slot_is_free(conn: &tcp::TcpConn) -> bool {
 
 /// A connection's index key.
 #[inline]
+/// The key a connection is indexed under.
+///
+/// Every field here is immutable for as long as the slot is indexed:
+/// `conn_index_insert` runs after they are set and `conn_reset` computes
+/// the hash before it clears them, and the removal path rehashes the
+/// entries it shifts. A field changed in between would give a different
+/// bucket than the one the entry sits in, and the entry would be moved off
+/// its own chain rather than found.
 fn conn_key_of(c: &tcp::TcpConn) -> index::ConnKey {
     index::ConnKey {
         remote_ip: c.remote_ip,
@@ -395,6 +418,14 @@ fn conn_key_of(c: &tcp::TcpConn) -> index::ConnKey {
 fn conn_is_keyed(c: &tcp::TcpConn) -> bool {
     !c.is_datagram && c.remote_ip != 0 && c.state != tcp::TcpState::Listen
 }
+
+/// Every connection on one listener holds a reference to that listener's
+/// port, so a single port's count reaches the whole connection table plus
+/// the listener itself. The counter is wider than that sum can be: a
+/// saturating add that clamped would lose a reference, and the matching
+/// subtractions would then take a port to zero while something was still
+/// bound to it — which reads as free.
+const _: () = assert!(tcp::MAX_TCP_CONNS < u32::MAX as usize);
 
 #[inline]
 unsafe fn port_ref_inc(s: &mut IpState, port: u16) {
@@ -464,7 +495,7 @@ unsafe fn conn_index_insert(s: &mut IpState, idx: usize) {
         let c = &*s.tcp_conns.as_ptr().add(idx);
         (
             conn_is_keyed(c),
-            conn_key_of(c).hash(),
+            conn_key_of(c).hash(s.index_seed),
             c.state == tcp::TcpState::Listen && !c.is_datagram,
             c.local_port,
             c.state == tcp::TcpState::SynReceived && !c.half_open_counted,
@@ -506,12 +537,20 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
             c.is_datagram,
             c.remote_ip,
             c.local_port,
-            conn_key_of(c).hash(),
+            conn_key_of(c).hash(s.index_seed),
             c.half_open_counted,
         )
     };
     if !is_datagram && remote_ip != 0 {
-        let _ = index::remove(&mut s.conn_index, hash, idx);
+        // The shift needs each moved entry's own bucket, and the entries
+        // are slots — so the table is read through a raw pointer taken
+        // before the index is borrowed. The two do not overlap: the index
+        // holds slot numbers, never connections.
+        let conns = s.tcp_conns.as_ptr();
+        let seed = s.index_seed;
+        let _ = index::remove(&mut s.conn_index, hash, idx, |slot| {
+            conn_key_of(&*conns.add(slot)).hash(seed)
+        });
     }
     if !is_datagram && local_port != 0 {
         listener_remove(s, idx);
@@ -581,13 +620,16 @@ unsafe fn find_conn_indexed(
             && c.local_port == local_port
             && c.local_slot == want_slot
     };
+    let seed = s.index_seed;
     let key = index::ConnKey {
         remote_ip,
         remote_port,
         local_port,
         local_slot,
     };
-    if let Some(i) = index::lookup(&s.conn_index, key.hash(), |slot| matches(slot, local_slot)) {
+    if let Some(i) = index::lookup(&s.conn_index, key.hash(seed), |slot| {
+        matches(slot, local_slot)
+    }) {
         return Some(i);
     }
     if local_slot == LOCAL_SLOT_ANY {
@@ -597,7 +639,7 @@ unsafe fn find_conn_indexed(
         local_slot: LOCAL_SLOT_ANY,
         ..key
     };
-    index::lookup(&s.conn_index, any.hash(), |slot| {
+    index::lookup(&s.conn_index, any.hash(seed), |slot| {
         matches(slot, LOCAL_SLOT_ANY)
     })
 }
@@ -858,7 +900,14 @@ struct IpState {
     addr_index: [u32; ADDR_INDEX_SIZE],
     /// Listening (non-datagram) slots, `slot + 1`; 0 = empty.
     listeners: [u32; MAX_LISTENERS],
-    port_ref: [u16; PORT_REF_ENTRIES],
+    port_ref: [u32; PORT_REF_ENTRIES],
+    /// Seeds both index hashes, so which tuples share a cluster is this
+    /// instance's secret rather than a published function. Drawn once at
+    /// construction and never changed: an index is built under the seed it
+    /// is later searched with, so a seed that moved would strand every
+    /// entry inserted before it. Zero when the entropy source could not
+    /// answer — no worse than an unseeded hash, and still consistent.
+    index_seed: u32,
     ho_src: [index::SourceCount; HO_SRC_ENTRIES],
     /// Half-open connections whose source the table had no room to track.
     ho_src_untracked: u32,
@@ -1228,7 +1277,7 @@ fn local_ip_for_slot(s: &IpState, slot: u16) -> u32 {
 /// Resolve an inbound destination IP to a local-address slot. `Some(0)` =
 /// primary; `Some(i)` = secondary `i`; `None` = not one of ours. The
 /// primary is one compare; secondaries go through the address index, so
-/// the table's size costs nothing per frame.
+/// a frame pays for the cluster it lands in rather than for the table.
 #[inline]
 fn local_slot_for_dst(s: &IpState, dst: u32) -> Option<u16> {
     if s.local_ip != 0 && dst == s.local_ip {
@@ -1239,7 +1288,7 @@ fn local_slot_for_dst(s: &IpState, dst: u32) -> Option<u16> {
     }
     // SAFETY: the index is a power-of-two length by construction.
     unsafe {
-        index::lookup(&s.addr_index, index::mix32(dst), |i| {
+        index::lookup(&s.addr_index, index::mix32(dst ^ s.index_seed), |i| {
             i != 0 && i < MAX_LOCAL_ADDRS && {
                 let a = &s.local_addrs[i];
                 a.is_active() && a.ipv4() == dst
@@ -2546,6 +2595,31 @@ pub unsafe extern "C" fn module_new(
         }
         index::clear(&mut s.conn_index);
         index::clear(&mut s.addr_index);
+        // Taken here and nowhere else: both indexes are searched under the
+        // seed they were built with, so a seed established later — after an
+        // address is already indexed, say — would strand every entry that
+        // came before it.
+        //
+        // Folded from the boot incarnation rather than drawn from the
+        // module's own CSPRNG. The incarnation is already unpredictable to
+        // anyone off the host and costs no entropy to read, whereas a draw
+        // here would consume from the same stream the ISNs and ephemeral
+        // ports come out of — moving every later value and making this
+        // module's randomness depend on how many seeds it happened to take.
+        // Zero when the incarnation is not up yet: no worse than an
+        // unseeded hash, and still one value for the module's whole life.
+        s.index_seed = match dev_boot_incarnation(&*s.syscalls) {
+            Some(inc) => {
+                let mut v = 0u32;
+                let mut b = 0;
+                while b < 16 {
+                    v ^= u32::from(inc[b]) << ((b % 4) * 8);
+                    b += 1;
+                }
+                v
+            }
+            None => 0,
+        };
         i = 0;
         while i < MAX_LISTENERS {
             s.listeners[i] = 0;
@@ -5804,6 +5878,20 @@ unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
         v.connect_tag = 0;
         v.retransmit_timer = 0;
     }
+    // Both slots go through the same admission `conn_reset` undoes. A
+    // loopback pair is not keyed (`remote_ip == 0`), does not listen and is
+    // not half-open, so the only thing this does is take the port
+    // references teardown gives back — and taking them anywhere else would
+    // put the two halves out of step, which reads as a listener's port
+    // falling to zero while the listener is still bound.
+    // Both slots go through the same admission `conn_reset` undoes. A
+    // loopback pair is not keyed (`remote_ip == 0`), does not listen and is
+    // not half-open, so the only thing this does is take the port
+    // references teardown gives back — and taking them anywhere else would
+    // put the two halves out of step, which reads as a listener's port
+    // falling to zero while the listener is still bound.
+    conn_index_insert(s, ci);
+    conn_index_insert(s, si);
     s.loopback_peer[ci] = si as i32;
     s.loopback_peer[si] = ci as i32;
 
@@ -6007,7 +6095,7 @@ unsafe fn addr_ctl_add(
             a.prefix_len = prefix_len;
             a.owner_tag = owner_tag;
             a.flags = if armed { ADDR_FLAG_ARMED } else { 0 };
-            let _ = index::insert(&mut s.addr_index, index::mix32(ipv4), i);
+            let _ = index::insert(&mut s.addr_index, index::mix32(ipv4 ^ s.index_seed), i);
             log_info(s, b"[ip] addr_ctl add");
             let mut p = [0u8; 36];
             p[..16].copy_from_slice(&a16);
@@ -6042,7 +6130,14 @@ unsafe fn addr_ctl_del(s: &mut IpState, ipv4: u32) {
     }
     match local_slot_for_dst(s, ipv4) {
         Some(slot) if slot != 0 => {
-            let _ = index::remove(&mut s.addr_index, index::mix32(ipv4), slot as usize);
+            let addrs = s.local_addrs.as_ptr();
+            let seed = s.index_seed;
+            let _ = index::remove(
+                &mut s.addr_index,
+                index::mix32(ipv4 ^ seed),
+                slot as usize,
+                |i| index::mix32((*addrs.add(i)).ipv4() ^ seed),
+            );
             s.local_addrs[slot as usize] = LocalAddr::empty();
             log_info(s, b"[ip] addr_ctl del");
         }
@@ -6885,6 +6980,56 @@ pub mod test_helpers {
 
     use super::{arp, tcp, IpDrops, IpState};
 
+    /// How many entries of the connection index are occupied.
+    ///
+    /// A removal that closes its hole leaves this equal to the number of
+    /// indexed connections; one that only marks its entry leaves it
+    /// higher, and the difference is the count that never comes back.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    #[must_use]
+    pub unsafe fn conn_index_occupancy(state: *const u8) -> usize {
+        let s = &*(state as *const IpState);
+        s.conn_index
+            .iter()
+            .filter(|e| **e != super::index::EMPTY)
+            .count()
+    }
+
+    /// How many connection slots are currently indexed — keyed, and so
+    /// expected to hold exactly one index entry each.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    #[must_use]
+    pub unsafe fn keyed_conn_count(state: *const u8) -> usize {
+        let s = &*(state as *const IpState);
+        (0..tcp::MAX_TCP_CONNS)
+            .filter(|i| {
+                let c = &*s.tcp_conns.as_ptr().add(*i);
+                c.is_active() && super::conn_is_keyed(c)
+            })
+            .count()
+    }
+
+    /// The reference count held on `port`. Setup and teardown must move it
+    /// by the same amount: a port whose count reaches zero while something
+    /// is still bound to it reads as free, and `next_port` will hand it out
+    /// as an ephemeral source.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    #[must_use]
+    pub unsafe fn port_ref(state: *const u8, port: u16) -> u32 {
+        let s = &*(state as *const IpState);
+        if super::PORT_REF_ENTRIES > 1 {
+            *s.port_ref.as_ptr().add(port as usize)
+        } else {
+            0
+        }
+    }
+
     /// Install a fixed ISN secret so a test can assert an exact sequence
     /// number without depending on the harness CSPRNG. Production seeds this
     /// from the kernel CSPRNG and refuses to open connections without it.
@@ -6959,12 +7104,16 @@ pub mod test_helpers {
     /// `state` must point to an initialised `IpState`.
     pub unsafe fn addr_lookup_probes(state: *const u8, dst: u32) -> (Option<usize>, usize) {
         let s = &*(state as *const IpState);
-        super::index::lookup_counted(&s.addr_index, super::index::mix32(dst), |i| {
-            i != 0 && i < super::MAX_LOCAL_ADDRS && {
-                let a = &s.local_addrs[i];
-                a.is_active() && a.ipv4() == dst
-            }
-        })
+        super::index::lookup_counted(
+            &s.addr_index,
+            super::index::mix32(dst ^ s.index_seed),
+            |i| {
+                i != 0 && i < super::MAX_LOCAL_ADDRS && {
+                    let a = &s.local_addrs[i];
+                    a.is_active() && a.ipv4() == dst
+                }
+            },
+        )
     }
 
     /// Probes a connection lookup costs for `(remote_ip, remote_port,
@@ -6987,7 +7136,7 @@ pub mod test_helpers {
             local_slot,
         };
         let conns = s.tcp_conns.as_ptr();
-        super::index::lookup_counted(&s.conn_index, key.hash(), |slot| {
+        super::index::lookup_counted(&s.conn_index, key.hash(s.index_seed), |slot| {
             let c = &*conns.add(slot);
             c.is_active()
                 && c.remote_ip == remote_ip

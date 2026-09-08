@@ -1,7 +1,7 @@
 //! `wasm_browser_compute` built-in — the generic GPU contract on WebGPU.
 //!
 //! Same contract, same shared cores and same lifetime corpus as the
-//! null/replay provider and the native Linux one; the only thing that differs
+//! replay provider and the native Linux one; the only thing that differs
 //! is which device objects sit behind the slot numbers.
 //!
 //! ## The split
@@ -392,12 +392,13 @@ fn limits_from(facts: &[u8; exec::FACT_LEN]) -> gw::DeviceLimits {
     l.arith_types = arith;
     l.arith_ops = gw::AOP_FMA_F32 | gw::AOP_ATOMIC_I32;
 
-    let mut features = gw::FEATURE_COMPUTE | gw::FEATURE_READBACK;
-    if flags & exec::FACT_HAS_TIMESTAMP != 0 {
-        features |= gw::FEATURE_TIMESTAMP;
-    }
-    // Raster, shared surfaces, indirect dispatch, subgroups, preemption and
-    // device reset are not implemented in this provider, so none is claimed.
+    let features = gw::FEATURE_COMPUTE | gw::FEATURE_READBACK;
+    // Raster, shared surfaces, indirect dispatch, subgroups, preemption,
+    // timestamps and device reset are not implemented in this provider, so
+    // none is claimed. The host may report a timestamp capability, but this
+    // provider places no query and every completion reports `gpu_nanos` of
+    // zero — advertising what the host could manage rather than what this
+    // provider does would make the record worthless to the consumer.
     l.features = features;
     l.targets = [
         gw::TARGET_WGSL,
@@ -469,6 +470,13 @@ unsafe fn step(st: &mut GpuComputeState) {
         for a in awaiting.iter_mut() {
             *a = Await::Idle;
         }
+        // The replacement device is a different device, and its limits are
+        // its own. Standing down here sends the next step back through
+        // `acquire`, which reads the new adapter's facts — continuing on the
+        // old ones would advertise a workgroup size or an alignment this
+        // device never claimed, which is the one thing a capability record
+        // must never do.
+        st.live = false;
     }
 
     let out_chan = st.out_chan;
@@ -573,9 +581,14 @@ unsafe fn poll_backend(dev: &mut gw::GpuDevice<'_>, awaiting: &mut [Await], rb: 
                     dev.complete(slot as u16, 0);
                     continue;
                 }
-                let want = (remaining as usize)
-                    .min(rb.len())
-                    .min(gw::MAX_PAYLOAD as usize - 24);
+                // Sized to what the ring will take now: reading a window the
+                // ring cannot hold would map the same bytes again next step
+                // and never place them.
+                let room = dev.max_result_chunk();
+                if room == 0 {
+                    continue;
+                }
+                let want = (remaining as usize).min(rb.len()).min(room);
                 let sent = offset;
                 let got = host_gpu_service_readback(
                     slot as u32,

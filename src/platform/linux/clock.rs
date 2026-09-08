@@ -17,11 +17,14 @@
 /// Returns `(synchronised, max_error_us)`. `synchronised: false` is a real
 /// answer — the kernel can tell, and the answer is no.
 pub fn sync_status() -> Option<(bool, u64)> {
-    // `struct timex` is large and its layout is arch-specific, so it is
-    // zeroed and only the two fields read that are at fixed offsets across
-    // every Linux ABI: `modes` (0) is written, `maxerror` and `status` are
-    // read back. Rather than hand-declare it, the two values come from
-    // `/proc` where the layout question does not arise.
+    // `struct timex` is declared here rather than linked, so its layout is
+    // this file's responsibility: the kernel writes the whole struct back,
+    // and a field read at the wrong offset would be indistinguishable from
+    // a real answer. The declaration below is the LP64 shape — `int`
+    // followed by explicit padding to align each `__kernel_long_t` — and
+    // the assertion under it refuses to build anywhere that shape is not
+    // the right one, because the failure it prevents is a garbage `status`
+    // read as "synchronised" and a clock promoted to TRUSTED on it.
     //
     // `adjtimex` with `modes = 0` is a pure query and needs no privilege.
     #[repr(C)]
@@ -53,6 +56,14 @@ pub fn sync_status() -> Option<(bool, u64)> {
         tai: i32,
         _reserved: [i32; 11],
     }
+
+    // The layout above is LP64's. On any other pointer width the padding
+    // and the `__kernel_long_t` width both differ, and every field past
+    // `modes` would be read from the wrong place.
+    const _: () = assert!(
+        core::mem::size_of::<usize>() == 8,
+        "struct timex is declared for LP64; a 32-bit target needs its own shape"
+    );
 
     unsafe extern "C" {
         fn adjtimex(buf: *mut core::ffi::c_void) -> i32;

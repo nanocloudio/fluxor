@@ -1,8 +1,8 @@
 //! Public scenario contract — `tests/hardware/*.toml`.
 //!
-//! RFC §8. A scenario describes validation intent (what board under test,
+//! A scenario describes validation intent (what board under test,
 //! what config, which capabilities it needs, and the pass/fail rules). Paths
-//! inside a scenario are anchored to the scenario file's directory per §15.3,
+//! inside a scenario are anchored to the scenario file's directory,
 //! so scenarios are portable across projects that share the rig harness.
 
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ pub struct Scenario {
     pub source_path: Option<PathBuf>,
 }
 
-/// Per RFC §8.1: every rule names a transport `source` and a match condition.
+/// Every rule names a transport `source` and a match condition.
 ///
 /// V1 supports regex matching. The schema deliberately leaves room for other
 /// match kinds (deployment-transport confirmation, USB enumeration) without
@@ -84,7 +84,7 @@ pub fn load_scenario(path: &Path) -> Result<Scenario> {
 pub fn parse_scenario_str(raw: &str, scenario_dir: &Path, ctx: &str) -> Result<Scenario> {
     let s: ScenarioFile = toml::from_str(raw)?;
 
-    // §15.3: scenario-relative paths are anchored to the scenario file's
+    // Scenario-relative paths are anchored to the scenario file's
     // directory. Absolute paths pass through unchanged.
     let config_path = PathBuf::from(&s.config);
     let config = if config_path.is_absolute() {

@@ -155,6 +155,43 @@ pub struct PackBinding {
     pub align: u32,
 }
 
+/// The structural rules one binding must satisfy.
+///
+/// One definition, applied when a pack is built and again when one is
+/// decoded. Two copies of these rules would drift, and the direction they
+/// drift in is a builder that emits packs its own decoder refuses — which
+/// makes every round-trip test vacuous.
+///
+/// A uniform, sampler, vertex or index binding declared writable is a
+/// manifest error rather than something for a device to discover: nothing in
+/// any shading language this pack can carry writes through one.
+#[must_use]
+pub fn binding_ok(b: &PackBinding) -> bool {
+    matches!(
+        b.kind,
+        BIND_STORAGE | BIND_UNIFORM | BIND_TEXTURE | BIND_SAMPLER | BIND_VERTEX | BIND_INDEX
+    ) && b.access != 0
+        && b.access & !(BIND_ACCESS_READ | BIND_ACCESS_WRITE) == 0
+        && b.align != 0
+        && b.align.is_power_of_two()
+        && !(matches!(
+            b.kind,
+            BIND_UNIFORM | BIND_SAMPLER | BIND_VERTEX | BIND_INDEX
+        ) && b.access & BIND_ACCESS_WRITE != 0)
+}
+
+/// Whether an entry-point name is one every shading language this pack can
+/// carry would accept: ASCII alphanumerics and underscore. Stricter than
+/// "valid UTF-8", and applicable by a `no_std` provider without `core::str`.
+#[must_use]
+pub fn entry_name_ok(entry: &[u8]) -> bool {
+    !entry.is_empty()
+        && entry.len() <= MAX_ENTRY_LEN
+        && entry
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
 /// A pack whose header, sections, digest and requirements all checked out.
 /// Holding one is the evidence — every field below was validated, and the
 /// offsets are known to be in bounds of the slice it was decoded from.
@@ -325,9 +362,14 @@ pub fn decode(pack: &[u8]) -> Result<Pack<'_>, u16> {
         off >= PACK_HEADER_LEN && off.checked_add(len).is_some_and(|end| end <= pack.len())
     };
     let binding_bytes = binding_count * PACK_BINDING_LEN;
+    // The binding offset is checked whether or not there are bindings to
+    // read. A zero-length section still names a position, `identity` hashes
+    // `bytes[off..off + 0]`, and a range whose start is past the end is a
+    // panic rather than an empty slice — so an unchecked offset on the
+    // count-zero path is a trap reachable from the wire.
     if !section_ok(entry_off, entry_len)
         || !section_ok(artifact_off, artifact_len)
-        || (binding_count > 0 && !section_ok(binding_off, binding_bytes))
+        || !section_ok(binding_off, binding_bytes)
     {
         return Err(PACK_MALFORMED);
     }
@@ -338,10 +380,7 @@ pub fn decode(pack: &[u8]) -> Result<Pack<'_>, u16> {
     // can carry, so hold it to that: ASCII alphanumerics and underscore. A
     // stricter rule than "valid UTF-8", and one a `no_std` provider can apply
     // without linking `core::str`.
-    if !pack[entry_off..entry_off + entry_len]
-        .iter()
-        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-    {
+    if !entry_name_ok(&pack[entry_off..entry_off + entry_len]) {
         return Err(PACK_MALFORMED);
     }
 
@@ -380,30 +419,14 @@ pub fn decode(pack: &[u8]) -> Result<Pack<'_>, u16> {
         toolchain,
     };
 
-    // Bindings: slots unique, kinds known, access non-empty, alignment a
-    // power of two. Duplicated slots are rejected rather than
-    // last-one-wins — a program with two claims on one slot has no single
-    // meaning, and picking one silently would bind the wrong buffer.
+    // Bindings: each structurally sound, and slots unique. Duplicated slots
+    // are rejected rather than last-one-wins — a program with two claims on
+    // one slot has no single meaning, and picking one silently would bind the
+    // wrong buffer.
     let mut i = 0;
     while i < binding_count {
         let b = decoded.binding(i).ok_or(PACK_MALFORMED)?;
-        if !matches!(
-            b.kind,
-            BIND_STORAGE | BIND_UNIFORM | BIND_TEXTURE | BIND_SAMPLER | BIND_VERTEX | BIND_INDEX
-        ) {
-            return Err(PACK_BAD_BINDING);
-        }
-        if b.access & !(BIND_ACCESS_READ | BIND_ACCESS_WRITE) != 0 || b.access == 0 {
-            return Err(PACK_BAD_BINDING);
-        }
-        if b.align == 0 || !b.align.is_power_of_two() {
-            return Err(PACK_BAD_BINDING);
-        }
-        // A uniform or sampler binding a program declares writable is a
-        // manifest error, not something for the device to discover.
-        if matches!(b.kind, BIND_UNIFORM | BIND_SAMPLER | BIND_VERTEX | BIND_INDEX)
-            && b.access & BIND_ACCESS_WRITE != 0
-        {
+        if !binding_ok(&b) {
             return Err(PACK_BAD_BINDING);
         }
         let mut j = 0;
@@ -635,11 +658,7 @@ pub fn encode(
     bindings: &[PackBinding],
     artifact: &[u8],
 ) -> Option<usize> {
-    if entry.is_empty()
-        || entry.len() > MAX_ENTRY_LEN
-        || bindings.len() > MAX_BINDINGS
-        || artifact.is_empty()
-    {
+    if !entry_name_ok(entry.as_bytes()) || bindings.len() > MAX_BINDINGS || artifact.is_empty() {
         return None;
     }
     if spec.min_align == 0 || !spec.min_align.is_power_of_two() {
@@ -647,6 +666,15 @@ pub fn encode(
     }
     if spec.workgroup.contains(&0) {
         return None;
+    }
+    // The decoder's own binding rules, applied before anything is written.
+    // Emitting a pack that will not decode turns a manifest error into a
+    // failure at load time on a device, which is the expensive place to find
+    // it — and the one place the builder was supposed to prevent.
+    for (i, b) in bindings.iter().enumerate() {
+        if !binding_ok(b) || bindings[..i].iter().any(|o| o.slot == b.slot) {
+            return None;
+        }
     }
     let binding_off = PACK_HEADER_LEN;
     let binding_bytes = bindings.len() * PACK_BINDING_LEN;

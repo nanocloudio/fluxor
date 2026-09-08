@@ -15,6 +15,21 @@ use crate::error::Result;
 
 pub use crate::wire::fnv1a32 as fnv1a_hash;
 
+/// Render bytes as lower-case hex.
+///
+/// The one renderer for every digest the tools print. Callers that want a
+/// short form slice first — `hex(&digest[..6])` — so the truncation is
+/// visible at the call site rather than buried in a second helper.
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// sha256 of the canonical ABI wire-surface stream (`abi_surface`): the
 /// digest that pins a graph generation / slot image to the kernel surface
 /// it was built against. Equality = wire-compatible; no version windows.
@@ -239,7 +254,7 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "773b6d61bda5c825b7adc8f6584ed3e099129ad1a2266bfc91f9c94c3afc298e",
+            hex, "0ba7320a8f37ed5041633ea1390ead00607e1b843481e26b0257478884a52a3c",
             "ABI wire-surface changed — this is a deliberate wire break or it is \
              a mistake; see docs/architecture/abi_surface.md before updating"
         );
