@@ -44,6 +44,18 @@ pub(crate) static CLI_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 pub(crate) static CLI_EXIT_LATCHED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Set once cli_out itself has retired: the applet is finished and its last
+/// bytes are on the fd. A plain run ends there.
+///
+/// The all-modules-done rule alone is not enough for an applet that wires a
+/// platform provider. A provider like `linux_net` serves whoever asks and has
+/// no notion of being finished, so it never retires and a graph containing one
+/// would run until it was killed. The CLI sink does know: nothing can produce
+/// output after it retires, so the run is over whatever else is still willing
+/// to be asked.
+pub(crate) static CLI_RUN_COMPLETE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // ── Interactive terminal (raw stdin) ────────────────────────────────────────
 //
 // When cli_in owns a TTY stdin, disable canonical mode + local echo so an
@@ -412,6 +424,7 @@ fn cli_out_step(state: *mut u8) -> i32 {
     let flushed = st.stdout_bridge.as_ref().is_none_or(|b| b.is_empty())
         && st.stderr_bridge.as_ref().is_none_or(|b| b.is_empty());
     if flushed && (st.exited || upstream_done) {
+        CLI_RUN_COMPLETE.store(true, Ordering::Release);
         return 1;
     }
     0

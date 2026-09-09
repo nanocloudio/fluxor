@@ -762,7 +762,13 @@ fn main() {
         let (result, sleep_us) =
             scheduler::step_resident_graphs_flat(&mut sched.modules, module_count);
 
-        if matches!(result, fluxor::kernel::exec::scheduler::StepResult::Done) {
+        // A plain run ends when every module is done, or when the CLI sink
+        // has retired with its output flushed. The second is what lets an
+        // applet wire a platform provider: a provider serves on request and
+        // never declares itself finished, so waiting for one is waiting for
+        // ever. Node-agent mode owns its own lifetime and is excluded below.
+        let cli_done = CLI_RUN_COMPLETE.load(Ordering::Acquire);
+        if cli_done || matches!(result, fluxor::kernel::exec::scheduler::StepResult::Done) {
             // Node-agent mode (FLUXOR_PLAN set): the runtime is the node's
             // persistent substrate — workloads come and go via plan reloads, so an
             // all-done/empty graph idles awaiting SIGHUP instead of exiting.
