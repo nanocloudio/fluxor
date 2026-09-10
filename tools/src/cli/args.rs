@@ -151,8 +151,8 @@ enum Commands {
         #[arg(short = 'b', long, default_value = "9090")]
         base_port: u16,
         /// Replica mode: offset added to `LISTEN_PORT` to derive
-        /// `HTTP_PORT`. Default 10000 matches the clustor
-        /// diagnostic-surface convention.
+        /// `HTTP_PORT`. Default 10000 matches the diagnostic-surface
+        /// convention.
         #[arg(long, default_value = "10000")]
         http_offset: u16,
         /// Replica mode: extra `KEY=VALUE` placeholder substitutions,

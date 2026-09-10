@@ -331,8 +331,8 @@ The transport providers here — `ip` for TCP, `tls` for the record
 layer, `quic` for the mux — answer the session-control contract's
 transport-continuity commands (`network.md` §Transport Continuity);
 `ip` provides `fence.enforceable`. The directory, reservation, key-wrap
-and durable providers are Clustor's `session_directory`, and the
-out-of-band fence agent is Wormhole's.
+and durable providers, and the out-of-band fence agent, are composed into
+the graph from outside — a graph that lacks any of them is refused.
 
 ## Architectural Roles
 

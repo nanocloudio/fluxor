@@ -2399,9 +2399,9 @@ mod rate_class_resolution_tests {
 
     #[test]
     fn producer_rate_class_default_used_when_consumer_declares_none() {
-        // Mirrors Clustor's `http_ingress.net_out → linux_net.net_in`:
-        // the consumer (a fluxor builtin) declares no default, so the
-        // producer's own `rate_class_default` is what applies.
+        // An `http_ingress.net_out → linux_net.net_in` edge: the consumer
+        // (a fluxor builtin) declares no default, so the producer's own
+        // `rate_class_default` is what applies.
         let from = with_default(port("NetProto"), fluxor_contracts::RateClass::Transaction);
         let to = port("NetProto"); // no rate_class_default — e.g. linux_net.net_in
         let class = resolve_edge_rate_class(None, Some(&from), Some(&to)).unwrap();

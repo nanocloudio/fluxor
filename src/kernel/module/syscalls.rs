@@ -579,8 +579,9 @@ static FS_VTABLE: crate::kernel::module::provider::ProviderVTable =
     };
 
 // STORAGE_NAMESPACE / STORAGE_OBJECT vtables. Same shape as FS: the
-// kernel ships no built-in provider; a PIC module (loam, clustor,
-// the s3-adapter) registers via `module_provides_contract` and is
+// kernel ships no built-in provider; a PIC module (a local store, a
+// cluster store, an object-store adapter) registers via
+// `module_provides_contract` and is
 // routed through the class-byte dispatch chain. The vtable carries
 // `default_close_op` so `provider_close` releases tracked handles
 // uniformly.

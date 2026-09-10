@@ -13,7 +13,7 @@
 //     sync.
 //   - A FAT32 driver over an SD card returns "ok" once the FAT block
 //     has been flushed — local durability against a specific device.
-//   - A Clustor-replicated put returns "ok" once a quorum has
+//   - A quorum-replicated put returns "ok" once a quorum has
 //     accepted a particular log position — durability against a
 //     configured cluster.
 //   - A content-addressed read returns the exact bytes whose hash is
@@ -60,8 +60,8 @@
 
 use core::cmp::Ordering;
 
-/// Opaque cluster witness blob set by the replicating provider
-/// (Clustor or equivalent). 32 bytes accommodates a SHA-256
+/// Opaque cluster witness blob set by the replicating provider.
+/// 32 bytes accommodates a SHA-256
 /// commitment, a serialized lease id, or a short signature digest
 /// while staying `Copy` so `Fence` can live on the stack of any
 /// storage op return path.
@@ -168,9 +168,8 @@ pub enum Fence {
     /// Content-addressed integrity. The bytes returned (or written)
     /// hash to `digest` under `algorithm`. Durability is the hash
     /// itself — as long as anyone holds bytes that satisfy
-    /// `(algorithm, digest)`, the fence is met. The shape CAS
-    /// stores (Loam-local, Loam-distributed, content trees)
-    /// advertise.
+    /// `(algorithm, digest)`, the fence is met. The shape a
+    /// content-addressed store advertises.
     ContentHashed {
         algorithm: HashAlg,
         digest: Digest32,
@@ -181,8 +180,9 @@ pub enum Fence {
     /// (typically the event-log root); `revision` is its sequence
     /// number. Two `RevisionMonotone` results with the same
     /// `source` are totally ordered by `revision`. Event-log
-    /// providers (Loam WAL, Clustor log, generic append logs) emit
-    /// this once a write is committed to a particular position.
+    /// providers (write-ahead logs, replicated logs, generic append
+    /// logs) emit this once a write is committed to a particular
+    /// position.
     RevisionMonotone { source: ObjectId, revision: u64 },
 
     /// View-consistent read against a named source. The read

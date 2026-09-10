@@ -42,6 +42,7 @@ pub enum Rule {
     ShadowGuard,
     SdkMount,
     RepoFiles,
+    ConsumerNaming,
 }
 
 impl Rule {
@@ -53,6 +54,7 @@ impl Rule {
             Rule::ShadowGuard => "shadow-guard",
             Rule::SdkMount => "sdk-mount",
             Rule::RepoFiles => "repo-files",
+            Rule::ConsumerNaming => "consumer-naming",
         }
     }
 }
@@ -238,6 +240,11 @@ pub fn scan(project_root: &Path, config: &Config) -> Result<Report, ScanError> {
             tier
         };
         let mut file_violations = scan_file(&rel, &content, tier, config);
+        // Only in the repo that OWNS the SDK: a consumer's vendored copy
+        // is not its to rename.
+        if sdk_owner {
+            file_violations.extend(scan_consumer_naming(&rel, &content));
+        }
         if !sdk_owner {
             file_violations.extend(scan_sdk_mounts(&rel, &content));
         }
@@ -721,6 +728,84 @@ fn scan_sdk_mounts(rel: &Path, src: &str) -> Vec<Violation> {
 /// absent: no standard states whether a project carries them, so the
 /// spread across the ecosystem is an open owner decision, not a
 /// violation. See standards/lints.md §6.1.
+/// Sibling projects that consume this SDK. Names, not common words: a
+/// list that included `wave` or `sector` would fire on ordinary prose.
+const CONSUMER_PROJECTS: &[&str] = &[
+    "ceptra",
+    "clustor",
+    "dreamcatcher",
+    "filament",
+    "grove",
+    "loam",
+    "spectra",
+    "truffle",
+    "wormhole",
+    "zedex",
+];
+
+/// Whether `rel` is part of the normative surface — the contracts and SDK
+/// a consumer compiles against.
+fn is_normative_surface(rel: &Path) -> bool {
+    let p = rel.to_string_lossy().replace('\\', "/");
+    p.starts_with("contracts/src/") || p.starts_with("modules/sdk/")
+}
+
+/// A contract must not be defined by naming the consumer that happens to
+/// implement it.
+///
+/// Fluxor's contracts and SDK are what a consumer compiles against, so a
+/// comment there saying a record *is* some project's record inverts the
+/// ownership: it makes fluxor's surface read as an implementation of a
+/// downstream artefact, and leaves the next reader unsure which side is
+/// normative. Name the role — "a reservation provider", "a log-structured
+/// store" — and the contract stands on its own.
+///
+/// Deliberately scoped to the normative surface. A guide pointing a reader
+/// at the repository where audio codecs live is orienting them, not
+/// defining a contract, and is fine.
+fn scan_consumer_naming(rel: &Path, src: &str) -> Vec<Violation> {
+    if !is_normative_surface(rel) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, line) in src.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        for name in CONSUMER_PROJECTS {
+            if !word_appears(&lower, name) {
+                continue;
+            }
+            out.push(Violation {
+                path: rel.to_path_buf(),
+                line: i + 1,
+                rule: Rule::ConsumerNaming,
+                message: format!(
+                    "names the consumer project `{name}` in the normative surface — a contract \
+                     defined by reference to one of its implementers inverts the ownership; name \
+                     the role it plays instead"
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// Whether `needle` appears in `hay` as a whole word.
+fn word_appears(hay: &str, needle: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(needle) {
+        let at = from + rel;
+        let before_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        let end = at + needle.len();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + needle.len();
+    }
+    false
+}
+
 fn scan_repo_files(project_root: &Path, report: &mut Report) {
     let root_manifest = project_root.join("Cargo.toml");
     let Ok(manifest) = fs::read_to_string(&root_manifest) else {
@@ -1614,7 +1699,7 @@ include!("../../../deps/fluxor/modules/sdk/runtime.rs");
 
     #[test]
     fn sdk_mount_flags_sibling_common_tree() {
-        let src = "#[path = \"../../../deps/clustor/modules/common/kv.rs\"]\nmod kv;\n";
+        let src = "#[path = \"../../../deps/sibling/modules/common/kv.rs\"]\nmod kv;\n";
         let v = scan_sdk_mounts(Path::new("modules/app/x/mod.rs"), src);
         assert_eq!(v.len(), 1, "got: {v:?}");
         assert!(v[0].message.contains("<project>-common"));

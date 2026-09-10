@@ -721,7 +721,8 @@ pub mod query_key {
 //
 // The kernel resolves `(handle) -> contract_id` from the tag rather
 // than from a shared lookup table — contract handle-spaces are
-// disjoint by bit pattern. PIC module providers (fat32, loam, …)
+// disjoint by bit pattern. PIC module providers (fat32, a
+// log-structured store, …)
 // self-tag the handles they return from open-style ops; the
 // kernel-side `fd.rs` re-exports from this module so the bit layout
 // has a single source of truth.

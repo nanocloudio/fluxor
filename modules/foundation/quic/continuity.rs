@@ -95,19 +95,10 @@ pub const CONT_SECRET_PT_MAX: usize = 4 * 48
 /// Record magic.
 const CONT_MAGIC: [u8; 4] = *b"QKR1";
 
-/// A durable reservation grant carried on `cont_in` in Clustor's grant
-/// wire record verbatim: the 38-byte `SessionReply` for an `SR_OP_RESERVE`
-/// (`[op:1][status:1][sid:16][epoch:4][start:8][len:8]`) prefixed with the
-/// 16-byte `flow_id` it applies to. Documented in the manifest `cont_in`
-/// port comment. This is the reservation authority's grant consumed as-is
-/// rather than a second record invented here.
+/// A durable reservation grant carried on `cont_in`: the flow it applies
+/// to, then the grant record. Both are laid out in
+/// `contracts/net/session_ctrl.rs`.
 pub const CONT_RESERVATION_GRANT: u8 = sc::CMD_SC_RESERVATION_GRANT;
-/// Length of a Clustor `SessionReply` record (see clustor
-/// `session_registry::SR_REPLY_LEN`).
-pub const SR_REPLY_LEN: usize = 1 + 1 + 16 + 4 + 8 + 8;
-/// Clustor `SR_OP_RESERVE` opcode and `SR_ST_OK` status.
-const SR_OP_RESERVE: u8 = 3;
-const SR_ST_OK: u8 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -1909,13 +1900,14 @@ unsafe fn cont_apply_retire(s: &mut QuicState, payload: &[u8]) {
     cont_reply(s, &flow, epoch, sc::CR_RETIRED, sc::STATUS_OK, &[]);
 }
 
-/// Install a durable reservation grant from the directory (Clustor record).
+/// Install a durable reservation grant from a `session.reservation`
+/// provider.
 unsafe fn cont_apply_grant(s: &mut QuicState, payload: &[u8]) {
-    if payload.len() < CONT_FLOW_ID_BYTES + SR_REPLY_LEN {
+    if payload.len() < CONT_FLOW_ID_BYTES + sc::GRANT_LEN {
         return;
     }
     let flow = &payload[..CONT_FLOW_ID_BYTES];
-    let rec = &payload[CONT_FLOW_ID_BYTES..CONT_FLOW_ID_BYTES + SR_REPLY_LEN];
+    let rec = &payload[CONT_FLOW_ID_BYTES..CONT_FLOW_ID_BYTES + sc::GRANT_LEN];
     let op = rec[0];
     let status = rec[1];
     let epoch = u32::from_le_bytes([rec[18], rec[19], rec[20], rec[21]]);
@@ -1925,7 +1917,7 @@ unsafe fn cont_apply_grant(s: &mut QuicState, payload: &[u8]) {
     let len = u64::from_le_bytes([
         rec[30], rec[31], rec[32], rec[33], rec[34], rec[35], rec[36], rec[37],
     ]);
-    if op != SR_OP_RESERVE || status != SR_ST_OK {
+    if op != sc::GRANT_OP_RESERVE || status != sc::GRANT_STATUS_OK {
         return;
     }
     // Apply to a matching live connection.

@@ -676,8 +676,9 @@ consumer event — and zeroizes its secrets. The peer never sees the move.
 
 What the ip and tls modules own here is the codec, the horizons and the
 local gate; committed ownership epochs, reservations
-(`CMD_SC_RESERVATION_GRANT` carries the directory's grant to the quic
-packet-number space) and the out-of-band fence are Clustor's and
-Wormhole's, and admission (`capability_surface.md` §Continuity
-Validation) refuses a graph that lacks them.
+(`CMD_SC_RESERVATION_GRANT` carries a grant to the quic packet-number
+space) and the out-of-band fence belong to the `session.reservation`,
+`durable.rpo_zero` and `fence.enforceable` providers a graph composes,
+and admission (`capability_surface.md` §Continuity Validation) refuses a
+graph that lacks them.
 

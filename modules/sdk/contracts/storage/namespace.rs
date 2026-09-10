@@ -10,8 +10,8 @@
 // address. A provider that publishes `storage.namespace` typically
 // also publishes `storage.object` or `file.data` so consumers can
 // fetch entry contents; the two are kept separate so pure index
-// providers (HTTP listings, S3 ListBucket, Loam directory, Clustor
-// metadata) need not hold byte data themselves.
+// providers (HTTP listings, S3 ListBucket, object-store directories,
+// cluster metadata) need not hold byte data themselves.
 //
 // ## Handle identity
 //
@@ -53,8 +53,8 @@
 //               op that MINTS a name; without it the surface is
 //               read-mostly by construction and every provider
 //               invents a private creation vocabulary (fat32's
-//               naming ops welded into `fs` 0x09__, loam's
-//               project-local OP_BIND).
+//               naming ops welded into `fs` 0x09__, a log-structured
+//               store's project-local bind op).
 //   RENAME    — rename or move an entry within the namespace.
 //               Atomic within a single provider; cross-provider
 //               renames are out of scope for this surface.

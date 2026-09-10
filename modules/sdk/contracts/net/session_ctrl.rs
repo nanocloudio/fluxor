@@ -268,8 +268,8 @@ pub const MSG_SC_RELOCATED: u8 = 0x99;
 //
 // The checkpoint, delta and cut-over surface a transport provider
 // (ip for TCP, tls for the record layer, quic for the mux) answers on
-// its `cont_in` / `cont_out` port pair. Wormhole's `transport_mirror`
-// and `failover_coordinator` drive it; the provider owns the codec, the
+// its `cont_in` / `cont_out` port pair. A mirror and a failover
+// coordinator drive it; the provider owns the codec, the
 // buffers, the vault bridge and the emission gate. Key bytes never
 // cross this surface: a checkpoint carries vault-sealed continuity
 // objects, and only a vault that holds the same labelled sealing key
@@ -507,14 +507,34 @@ pub const CMD_SC_RETIRE: u8 = 0x86;
 ///   [reason:        1]                 ABORT_*
 pub const CMD_SC_ABORT: u8 = 0x87;
 
-/// A reservation grant from the directory (`session.reservation`) for a
-/// flow's egress counter — Clustor's `SessionReply` record carried
-/// verbatim after the flow it applies to, so the transport consumes the
-/// authority's grant rather than a second shape.
+/// A reservation grant from a `session.reservation` provider for a flow's
+/// egress counter: a block of counter values the transport may emit from.
+///
+/// The grant is what makes a takeover safe. A transport emits only values
+/// from a block it holds, and a takeover resumes past the end of every
+/// block the dead host was ever granted — so no counter value is ever put
+/// on the wire twice under one key. Making a grant durable across hosts is
+/// the provider's job; the record below is all the transport needs to see.
+///
 /// Payload:
 ///   [flow_id:      16 BE]
-///   [reply: ...]                       the directory's reply record
+///   [grant:        38]                 the record below
+///
+/// Grant record:
+///   [op:            1]                 GRANT_OP_RESERVE
+///   [status:        1]                 GRANT_STATUS_OK, or a refusal
+///   [session_id:   16]                 the provider's name for the flow
+///   [epoch:         4 LE]              fencing epoch; only ever advances
+///   [start:         8 LE]              first counter value in the block
+///   [len:           8 LE]              values in the block
 pub const CMD_SC_RESERVATION_GRANT: u8 = 0x88;
+
+/// Bytes in a reservation-grant record.
+pub const GRANT_LEN: usize = 1 + 1 + 16 + 4 + 8 + 8;
+/// Grant opcode: a block of counter values reserved for one flow.
+pub const GRANT_OP_RESERVE: u8 = 3;
+/// Grant status: the block that follows is the caller's to emit from.
+pub const GRANT_STATUS_OK: u8 = 0;
 
 /// Every continuity reply. The reply space has five opcodes left, so
 /// one carries a discriminated record.

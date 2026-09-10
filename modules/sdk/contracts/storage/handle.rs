@@ -14,9 +14,9 @@
 //
 // A storage handle is a leased mesh Handle parameterised by the
 // surface that issued it (namespace, object, stream). One revocable
-// identity primitive serves every storage provider — FAT32,
-// Loam-local, Loam-distributed, HTTP-as-FS, S3 adapter — without
-// each growing its own FD shape.
+// identity primitive serves every storage provider — FAT32, a local
+// or distributed log-structured store, HTTP-as-FS, an S3 adapter —
+// without each growing its own FD shape.
 //
 // ## Lifecycle
 //
@@ -28,7 +28,7 @@
 //   - `not_after` is an absolute monotonic timestamp (kernel
 //     `time_ns`). Providers refuse ops with `now >= not_after` and
 //     free the slot.
-//   - Revocation is provider-driven: a FAT32 unmount, a Clustor
+//   - Revocation is provider-driven: a FAT32 unmount, a cluster
 //     reconfiguration, or an explicit `revoke` from the issuer
 //     flips `revoked` and frees the slot. Callers see the next op
 //     fail with `EACCES` (capability invalidated) or `ENODEV` (slot

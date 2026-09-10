@@ -741,7 +741,7 @@ mod tests {
     fn a_mount_counts_only_when_it_lands_in_this_checkouts_staged_tree() {
         let root = Path::new("/p");
         let staged = root.join("target/fluxor");
-        // clustor's `tests/wal_scan.rs` shape — one level up into target/.
+        // A consumer's `tests/` mount — one level up into target/.
         assert!(lexical_join(
             &root.join("tests"),
             "../target/fluxor/fluxor-abi/sdk/abi.rs"

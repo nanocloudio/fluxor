@@ -309,8 +309,8 @@ unadmitted values are rejected at manifest parse.
 read / write / durability surfaces: its index echo, snapshot callbacks, and
 reset signal have no equivalent in the `storage.namespace` + `event.log`
 pattern (see `storage_capability_surface.md` §4), which stays at the storage
-layer. The full contract lives with its provider (clustor); only the surface
-name is canonical here, so a manifest can declare it typo-checked.
+layer. The full contract lives with whichever module provides it; only the
+surface name is canonical here, so a manifest can declare it typo-checked.
 
 ### What consumes the registry
 

@@ -77,11 +77,10 @@ content_type = "OctetStream"
 # `cont_in` (in[2]) carries the SessionCtrlV1 continuity commands
 # (0x7A..0x87: PAIR_PREPARE / CHECKPOINT_* / DELTA_* / QUIESCE_* /
 # CUT_* / EMISSION_ARM / ACTIVATE / RETIRE / ABORT) driving a shadow
-# takeover, AND durable 1-RTT send-packet-number reservation grants. A
-# grant reuses Clustor's reservation record VERBATIM: msg_type 0x88, body
-# = `flow_id[16]` ‖ the 38-byte `SessionReply` for an `SR_OP_RESERVE`
-# (`[op:1][status:1][sid:16][epoch:4][start:8][len:8]`). The directory's
-# grant is consumed as-is rather than re-encoded here.
+# takeover, AND durable 1-RTT send-packet-number reservation grants: msg
+# type 0x88, body = `flow_id[16]` ‖ the 38-byte grant record
+# (`[op:1][status:1][session_id:16][epoch:4][start:8][len:8]`) that
+# `contracts/net/session_ctrl.rs` lays out.
 [[ports]]
 name = "cont_in"
 direction = "input"

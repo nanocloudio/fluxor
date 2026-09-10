@@ -777,9 +777,8 @@ fn workspace_package_set(project_root: &Path) -> std::collections::HashSet<Strin
 /// (kernel + tools + foundation modules) rather than a downstream
 /// consumer. The discriminator is the workspace including the
 /// `fluxor-tools` package — that name is unique to fluxor's source
-/// tree. Downstream consumers like clustor/quantum vendor fluxor
-/// via `deps/fluxor` but don't list `fluxor-tools` in their
-/// workspace members.
+/// tree. A downstream consumer vendors fluxor via `deps/fluxor` but
+/// does not list `fluxor-tools` in its workspace members.
 fn is_fluxor_kernel_workspace(project_root: &Path) -> bool {
     let pkgs = workspace_package_set(project_root);
     pkgs.contains("fluxor-tools")

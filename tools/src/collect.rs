@@ -8,9 +8,9 @@
 //! table, and renders two outputs:
 //!
 //!   * Prometheus text exposition (`render_prometheus`) — the pull surface
-//!     served on `GET /metrics` by the `fluxor-collect` bin (OQ2: served
-//!     directly; the latest-value table exists anyway, and the pull
-//!     surface must exist before clustor's binary `/metrics` can retire).
+//!     served on `GET /metrics` by the `fluxor-collect` bin. Served
+//!     directly: the latest-value table exists anyway, and a consumer
+//!     retiring its own `/metrics` binary needs this surface first.
 //!   * OTLP/JSON metrics documents (`render_otlp_json`) — the push surface
 //!     POSTed to an OTel collector's `/v1/metrics`.
 //!

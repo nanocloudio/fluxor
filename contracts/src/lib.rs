@@ -2,8 +2,8 @@
 //!
 //! Fluxor owns the storage-surface vocabulary, the typed `Fence` enum
 //! that operations return, and the wire-byte content-type table used
-//! by every module manifest. Downstream implementers (Loam, FAT32-backed
-//! providers, sibling projects authoring module manifests) depend on
+//! by every module manifest. Downstream implementers — storage
+//! providers, sibling projects authoring module manifests — depend on
 //! this crate and use these names directly instead of duplicating
 //! string constants.
 //!
@@ -430,7 +430,7 @@ pub enum Fence {
     ReplicatedDurable {
         quorum: u32,
         epoch: u64,
-        witness: ClustorFenceWitness,
+        witness: FenceWitness,
     },
     ContentHashed {
         algo: HashAlgo,
@@ -453,19 +453,19 @@ pub enum HashAlgo {
 }
 
 /// Externally observable proof that a replicated-durable fence
-/// completed. Constructed by the Clustor binding the operation went
-/// through; carried on `Fence::ReplicatedDurable` so downstream
+/// completed. Constructed by the replicating provider the operation
+/// went through; carried on `Fence::ReplicatedDurable` so downstream
 /// consumers can verify the fence was real.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct ClustorFenceWitness {
+pub struct FenceWitness {
     pub fence_epoch: u64,
     pub manifest_id: String,
     pub quorum: u32,
     pub acked_participants: Vec<String>,
 }
 
-impl ClustorFenceWitness {
+impl FenceWitness {
     pub fn new(
         fence_epoch: u64,
         manifest_id: impl Into<String>,

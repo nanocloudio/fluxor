@@ -193,7 +193,7 @@ pub const READDIR: u32 = 0x0908;
 /// Distinct from `OPEN` so the existing "no auto-create" policy on
 /// `OPEN` stays loud about typo'd paths (`OPEN /api/nope.png`
 /// should 404, not 200-create-empty). Callers that legitimately
-/// need to create a file on first boot (e.g. Loam's per-PIC WAL,
+/// need to create a file on first boot (a per-PIC write-ahead log,
 /// content-addressed body files) opt into `OPEN_CREATE` explicitly.
 ///
 /// # Capability discovery — query `CAPS` first

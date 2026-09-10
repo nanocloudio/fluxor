@@ -1429,7 +1429,7 @@ impl QuicConnection {
         let _ = self.send_pn_res.next_value();
     }
 
-    /// Install a durable reservation grant (Clustor record shape) for the
+    /// Install a durable reservation grant for the
     /// 1-RTT send space: a lower epoch is refused (stale), a higher epoch
     /// fences outstanding blocks, and the send counter resumes at or above
     /// the block start so no value is ever re-emitted. Once a
