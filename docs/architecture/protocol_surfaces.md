@@ -21,7 +21,7 @@ Source: `modules/sdk/contracts/net/`.
 | `datagram.rs` | datagram | `0x20..0x43` | live: `ip`, `linux_net`, `dns`, `log_net`, `quic`, `tls` (DTLS mode) |
 | `packet.rs` | packet | `0x50..0x63` | reserved: envelope defined, no consumer |
 | `identity.rs` | address control | `0x60..0x61` | live: net identity self-registration |
-| `session_ctrl.rs` | session control | `0x70..0x9F` | live: `echo_anchor` / `echo_worker` fixtures |
+| `session_ctrl.rs` | session control | `0x70..0x9F` | live: `echo_anchor` / `echo_worker` fixtures; downstream `http` as a multi-session anchor with `ws_echo_worker` behind it |
 | `mux.rs` | multiplexed session | `0xB0..0xCF` | live: `quic`, `mux_echo` fixture |
 | `../exchange.rs` | ordered-ack record exchange | `0xED..0xEF` | live: downstream broker, queue and table sinks, and the producers that feed them |
 
@@ -425,6 +425,12 @@ vocabulary; current manifests type their net ports as `NetProto` or
 
 Source: `modules/sdk/contracts/net/session_ctrl.rs`.
 
+The session-scoped layouts are read and written through the contract's
+typed accessors (`session_id`, `epoch`, `status`, `export_cursors`,
+`put_session_header`, `put_attach`, …), never by literal offset: a
+consumer that hand-rolls `from_le_bytes` against an offset is invisible
+to review when a field widens.
+
 Commands (anchor/directory → worker):
 
 | Opcode | Name | Payload after `[session_id: 16 BE]` |
@@ -520,13 +526,20 @@ none of the named front-door modules exist in this repository.
 ## Delivery Cursors
 
 The exported blob is opaque, but its position in the session is not.
-`CMD_SC_EXPORT_BEGIN` carries two session-scoped counters — inbound
-bytes the blob accounts for, and outbound bytes it has already emitted
-toward the client — and the anchor keeps the same pair for the worker
-it is feeding. At export the two must agree exactly.
+`CMD_SC_EXPORT_BEGIN` carries two session-scoped counters — inbound the
+blob accounts for, and outbound it has already emitted toward the
+client — and the anchor keeps the same pair for the worker it is
+feeding. At export the two must agree exactly.
+
+What they count is the anchor's own transfer unit, fixed by the
+binding: bytes of the client stream for an anchor that forwards a
+stream, whole envelopes for one that forwards records. The contract
+only ever compares the two numbers, so what matters is that an anchor
+and its workers count the same thing. A pairing that does not agree
+fails at the equality test rather than losing anything.
 
 Equality is what makes a handoff lossless: it says the blob accounts
-for every byte the anchor delivered and claims none it did not, and it
+for everything the anchor delivered and claims nothing it did not, and it
 hands the importing worker the offsets to resume from. Disagreement is
 a fault, not a race — a short inbound cursor means the worker exported
 before its inbound tail ran dry and those bytes are in no blob; an
@@ -542,6 +555,36 @@ obligation: the anchor holds new client bytes from the moment it
 issues `DRAIN`, and the worker consumes its inbound tail to dry before
 it declares `DRAINED`. The cursors are how that obligation is checked
 rather than assumed.
+
+### Refused handoffs
+
+Leaving the session on the exporting worker has a wire shape, because
+a worker that declared `DRAINED` consumes nothing until told to. The
+anchor detaches the standby, which discards whatever it half-imported,
+and sends the exporting worker `CMD_SC_RESUME` at the session's
+*current* epoch: no blob was committed anywhere, so nothing advanced,
+and the worker still holds the state it exported. It answers
+`MSG_SC_RESUMED` at that epoch and resumes consuming from where the
+drain left it; only then does the anchor release the ingress it held.
+The same return path serves a drain that outlives the deadline `DRAIN`
+carried, an import the standby rejected, and a worker error mid-swap.
+The client observes a pause bounded by the deadline and nothing else.
+`echo_anchor` and `echo_worker` exercise it.
+
+### Many sessions on one control channel
+
+Every session-scoped message names its session, so one anchor–worker
+channel pair carries as many sessions as the anchor serves, each
+attached, drained, exported and resumed on its own under its own
+epoch. What the contract does not carry is the data-plane address:
+`CMD_SC_ATTACH` has no field for the connection an envelope will name.
+A multi-session anchor therefore mints `session_id` so the correlation
+is recoverable from the identity itself — the fixtures use
+`[anchor_id:8][counter:8]`; a connection-addressed anchor puts its
+connection id and a generation in the low bytes — and a worker keeps
+the map from data-plane address to session, rebuilt from the
+identities it imports. The fixtures are single-session by choice, not
+by contract.
 
 ## Handoff and Reconfigure Integration
 

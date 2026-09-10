@@ -2,23 +2,24 @@
 //
 // Layer: contracts/net (public, stable).
 //
-// See docs/architecture/protocol_surfaces.md §Session Control Metadata.
+// See docs/architecture/protocol_surfaces.md §Session Control Sideband.
 //
 // SessionCtrlV1 is the control-plane sideband exchanged between
 // **transport anchors**, **session workers**, and **session
 // directories** to coordinate session attach, detach, drain,
 // export/import handoff, resume, epoch advancement, worker
 // relocation, and — for the transport providers — checkpoint, delta
-// and cut-over of the transport itself (§Transport continuity). It is the scaffolding that continuity classes above
-// `drain_only` (see protocol_surfaces.md §Continuity Classes) rely on.
+// and cut-over of the transport itself (§Transport continuity). It is
+// the scaffolding every continuity class above `drain_only` rests on
+// (see protocol_surfaces.md §Continuity Classes).
 //
 // Status: LIVE. Consumers: `echo_anchor` + `echo_worker` exercise the
 // full surface — HELLO/ATTACH/DETACH/DRAIN plus the handoff half
 // (EXPORT_BEGIN/CHUNK/END → IMPORT_BEGIN/END → RESUME/RESUMED with
-// epoch bump). Wiring the anchor with an active + standby worker pair
-// gives an anchor-preserved worker swap on a live TCP session.
-// The chunking/CRC logic is the
-// reusable `session_handoff` core in `modules/sdk/cores/`.
+// epoch bump). An anchor wired to an active and a standby worker gives
+// an anchor-preserved worker swap on a live TCP session. The chunking
+// and CRC logic is the reusable `session_handoff` core in
+// `modules/sdk/cores/`.
 //
 // Frames use the same [msg_type: u8] [len: u16 LE] [payload...] TLV
 // header as net_proto, datagram, and packet so the shared SDK
@@ -65,13 +66,21 @@
 // ─── Delivery cursors ─────────────────────────────────────────────
 //
 // A worker's exported state is opaque, but its *position* is not. Two
-// counters place the blob in the session's byte streams, both counted
-// from the session's first byte and carried on EXPORT_BEGIN:
+// counters place the blob in the session's streams, both counted from
+// the session's first unit and carried on EXPORT_BEGIN:
 //
-//   in_consumed    inbound bytes the anchor forwarded that the blob
-//                  accounts for
-//   out_produced   outbound bytes the blob has already emitted toward
-//                  the client
+//   in_consumed    inbound the anchor forwarded that the blob accounts
+//                  for
+//   out_produced   outbound the blob has already emitted toward the
+//                  client
+//
+// The unit is the anchor's, fixed by the binding rather than by this
+// contract, and an anchor and its workers must agree on it: bytes of the
+// client stream where the anchor forwards a stream, whole envelopes
+// where it forwards records. What the contract requires is that both
+// sides count the same thing, because all it does with the numbers is
+// compare them. A pairing that disagrees does not corrupt a session — it
+// fails every handoff at the equality test, which is the safe direction.
 //
 // The anchor keeps the same two counters for the worker it is feeding:
 // what it has forwarded, and what it has relayed onto the client
@@ -99,6 +108,33 @@
 // the moment it issues DRAIN, and the worker consuming its inbound tail
 // to dry before it declares DRAINED — is the anchor's and worker's
 // side of the same obligation.
+//
+// "Leaves the session on the exporting worker" has a wire shape. A
+// worker that has declared DRAINED consumes nothing until told to; the
+// anchor returns it to service with CMD_SC_RESUME carrying the
+// session's CURRENT epoch. No blob was committed anywhere, so nothing
+// advanced, and the worker still holds the state it exported: it
+// answers MSG_SC_RESUMED at that epoch and resumes consuming from where
+// the drain left it. The standby that half-imported is detached and
+// discards the partial blob. The same return path serves a drain that
+// outlives the deadline DRAIN carried and an import the standby
+// rejected. A RESUME at an epoch that is neither the current one (a
+// refusal) nor above the imported one (a handoff) is refused
+// STATUS_STALE_EPOCH.
+//
+// ─── Many sessions, one control channel ──────────────────────────
+//
+// Every session-scoped message names its session, so one anchor↔worker
+// channel pair carries as many sessions as the anchor serves; each is
+// attached, drained, exported and resumed on its own, under its own
+// epoch. What the contract does not carry is the data-plane address:
+// CMD_SC_ATTACH has no field for the connection an envelope will name.
+// An anchor serving many sessions therefore mints `session_id` so that
+// correlation is recoverable from the identity itself (the fixtures
+// use `[anchor_id:8][counter:8]`; a connection-addressed anchor puts
+// its connection id and a generation in the low bytes), and a worker
+// keeps the map from data-plane address to session, rebuilt from the
+// identities it imports.
 
 /// Frame header size (msg_type + len).
 pub const FRAME_HDR: usize = 3;
@@ -169,7 +205,7 @@ pub const STATUS_CURSOR_MISMATCH: u8 = 7;
 /// Role discovery handshake. Payload:
 ///   [role: u8] [self_id: 8 bytes] [flags: u8]
 /// Where `self_id` is the sender's `anchor_id` / `worker_id` depending
-/// on role. `flags` is reserved (must be 0 on the wire today).
+/// on role. `flags` is reserved and must be 0 on the wire.
 pub const CMD_SC_HELLO: u8 = 0x70;
 
 /// Anchor → directory (or anchor → worker) attach notification.
@@ -229,6 +265,11 @@ pub const CMD_SC_EXPORT_END: u8 = 0x76;
 /// Mark a new worker ready to take over. Paired with the directory
 /// advancing the session binding. Anchor flips its forwarding target
 /// to the new worker after MSG_SC_RESUMED is received.
+///
+/// Sent to the EXPORTING worker at the session's current epoch, it
+/// instead returns that worker to service after a refused handoff
+/// (§Delivery cursors): the worker leaves its drained state and resumes
+/// consuming, and MSG_SC_RESUMED echoes the unchanged epoch.
 /// Payload:
 ///   [session_id: 16 BE]
 ///   [new_epoch:   4 LE]
@@ -677,3 +718,158 @@ pub const EPOCH_BUMP_PAYLOAD_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES + EPOCH
 
 /// Fixed-size RELOCATE payload length: session_id + epoch + new_worker_id.
 pub const RELOCATE_PAYLOAD_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES + WORKER_ID_BYTES;
+
+// ─── Typed accessors ───────────────────────────────────────────────
+//
+// The one place the session-scoped layouts are decoded and encoded. A
+// consumer that hand-rolls `from_le_bytes` against a literal offset is
+// invisible to review when a field widens, so anchors and workers read
+// and write these fields through the contract, never by offset. Every
+// accessor is bounds-checked: a short payload reads as zero, and a
+// short output buffer writes nothing.
+
+/// The `session_id` at the head of any session-scoped payload.
+#[inline]
+pub fn session_id(payload: &[u8]) -> &[u8] {
+    if payload.len() < SESSION_ID_BYTES {
+        &payload[..0]
+    } else {
+        &payload[..SESSION_ID_BYTES]
+    }
+}
+
+/// The epoch that follows the session id (`new_epoch` on RESUME).
+#[inline]
+pub fn epoch(payload: &[u8]) -> u32 {
+    if payload.len() < SESSION_HEADER {
+        return 0;
+    }
+    u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]])
+}
+
+/// The status byte on ATTACHED / IMPORT_BEGIN / IMPORT_END / RELOCATED /
+/// ERROR, or `STATUS_OK` on a payload too short to carry one.
+#[inline]
+pub fn status(payload: &[u8]) -> u8 {
+    if payload.len() <= SESSION_HEADER {
+        STATUS_OK
+    } else {
+        payload[SESSION_HEADER]
+    }
+}
+
+/// The epoch ATTACH carries, after the anchor id.
+#[inline]
+pub fn attach_epoch(payload: &[u8]) -> u32 {
+    let at = SESSION_ID_BYTES + ANCHOR_ID_BYTES;
+    if payload.len() < at + EPOCH_BYTES {
+        return 0;
+    }
+    u32::from_le_bytes([payload[at], payload[at + 1], payload[at + 2], payload[at + 3]])
+}
+
+/// The anchor id ATTACH carries.
+#[inline]
+pub fn attach_anchor_id(payload: &[u8]) -> &[u8] {
+    if payload.len() < SESSION_ID_BYTES + ANCHOR_ID_BYTES {
+        &payload[..0]
+    } else {
+        &payload[SESSION_ID_BYTES..SESSION_ID_BYTES + ANCHOR_ID_BYTES]
+    }
+}
+
+/// The `u32 LE` field after the session header: `total_len` on
+/// EXPORT_BEGIN, `offset` on EXPORT_CHUNK, `crc32` on EXPORT_END,
+/// `deadline_ms` on DRAIN.
+#[inline]
+pub fn u32_after_header(payload: &[u8]) -> u32 {
+    let at = SESSION_HEADER;
+    if payload.len() < at + 4 {
+        return 0;
+    }
+    u32::from_le_bytes([payload[at], payload[at + 1], payload[at + 2], payload[at + 3]])
+}
+
+/// The delivery cursors on EXPORT_BEGIN as their wire bytes (16, in
+/// field order), or `None` on a payload too short to carry them.
+#[inline]
+pub fn export_cursors(payload: &[u8]) -> Option<&[u8]> {
+    let at = SESSION_HEADER + 4;
+    if payload.len() < at + CURSOR_BYTES * 2 {
+        None
+    } else {
+        Some(&payload[at..at + CURSOR_BYTES * 2])
+    }
+}
+
+/// The chunk bytes on EXPORT_CHUNK.
+#[inline]
+pub fn export_chunk_data(payload: &[u8]) -> &[u8] {
+    let at = SESSION_HEADER + 4;
+    if payload.len() < at {
+        &payload[..0]
+    } else {
+        &payload[at..]
+    }
+}
+
+/// Write `[session_id:16][epoch:4 LE]` at the head of `out`. Returns the
+/// bytes written: `SESSION_HEADER`, or 0 when `out` is too short.
+#[inline]
+pub fn put_session_header(out: &mut [u8], session_id: &[u8; SESSION_ID_BYTES], epoch: u32) -> usize {
+    if out.len() < SESSION_HEADER {
+        return 0;
+    }
+    out[..SESSION_ID_BYTES].copy_from_slice(session_id);
+    out[SESSION_ID_BYTES..SESSION_HEADER].copy_from_slice(&epoch.to_le_bytes());
+    SESSION_HEADER
+}
+
+/// Write a `u32 LE` field after the session header (see `u32_after_header`).
+/// Returns the total payload length, or 0 when `out` is too short.
+#[inline]
+pub fn put_u32_after_header(out: &mut [u8], value: u32) -> usize {
+    let at = SESSION_HEADER;
+    if out.len() < at + 4 {
+        return 0;
+    }
+    out[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    at + 4
+}
+
+/// Write a status byte after the session header. Returns the total
+/// payload length, or 0 when `out` is too short.
+#[inline]
+pub fn put_status(out: &mut [u8], status: u8) -> usize {
+    if out.len() <= SESSION_HEADER {
+        return 0;
+    }
+    out[SESSION_HEADER] = status;
+    SESSION_HEADER + 1
+}
+
+/// Write a complete ATTACH payload. Returns `ATTACH_PAYLOAD_LEN`, or 0
+/// when `out` is too short.
+#[inline]
+pub fn put_attach(
+    out: &mut [u8],
+    session_id: &[u8; SESSION_ID_BYTES],
+    anchor_id: &[u8; ANCHOR_ID_BYTES],
+    epoch: u32,
+    cc: u8,
+    worker_hint: &[u8; WORKER_ID_BYTES],
+) -> usize {
+    if out.len() < ATTACH_PAYLOAD_LEN {
+        return 0;
+    }
+    out[..SESSION_ID_BYTES].copy_from_slice(session_id);
+    let mut at = SESSION_ID_BYTES;
+    out[at..at + ANCHOR_ID_BYTES].copy_from_slice(anchor_id);
+    at += ANCHOR_ID_BYTES;
+    out[at..at + EPOCH_BYTES].copy_from_slice(&epoch.to_le_bytes());
+    at += EPOCH_BYTES;
+    out[at] = cc;
+    at += 1;
+    out[at..at + WORKER_ID_BYTES].copy_from_slice(worker_hint);
+    ATTACH_PAYLOAD_LEN
+}

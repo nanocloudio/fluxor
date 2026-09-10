@@ -48,6 +48,15 @@
 //!     anchor → worker : CMD_SC_RESUME (new_epoch)
 //!     worker → anchor : MSG_SC_RESUMED
 //!
+//!   REFUSED handoff (the anchor found the cursors disagreeing, the
+//!   import failed, or the drain deadline passed): the session stays
+//!   on the outgoing worker, which is returned to service in place —
+//!     anchor → worker : CMD_SC_RESUME (the session's CURRENT epoch)
+//!     worker → anchor : MSG_SC_RESUMED
+//!   A draining worker still holds its state, so nothing is imported;
+//!   it simply resumes consuming. The standby that half-imported is
+//!   detached and discards the partial blob.
+//!
 //! The exported blob is opaque to the anchor and the kernel (§13.2):
 //! `[magic "EWS1":4][bytes_processed:4 LE][origin worker_id:8][pad:4]`,
 //! chunked at 8 bytes so the demo exercises real multi-chunk reassembly.
@@ -58,7 +67,7 @@
 //! bytes big-endian; anchor_id / worker_id are 8 bytes big-endian;
 //! session_epoch is 4 bytes little-endian.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -114,6 +123,11 @@ const SESSION_ID_BYTES: usize = 16;
 const ANCHOR_ID_BYTES: usize = 8;
 const WORKER_ID_BYTES: usize = 8;
 const EPOCH_BYTES: usize = 4;
+
+/// Shortest HELLO we act on: `[role: u8][peer_id: 8 BE]`. The trailing
+/// flags byte is optional, so a HELLO one byte shorter than the
+/// contract's nominal layout still names its sender.
+const HELLO_MIN_LEN: usize = 1 + ANCHOR_ID_BYTES;
 
 /// Fixed worker identifier. A real worker would take this from a
 /// manifest parameter or a cluster directory assignment.
@@ -395,7 +409,7 @@ unsafe fn handle_ctrl(s: &mut WorkerState) {
             // Payload: [role: u8] [peer_id: 8 BE] [flags: u8]. We only
             // care that the anchor has pinged us — reply with
             // HELLO_ACK and transition to Idle.
-            if payload_len >= 1 + ANCHOR_ID_BYTES {
+            if payload_len >= HELLO_MIN_LEN {
                 if s.phase == WorkerPhase::Dormant {
                     s.phase = WorkerPhase::Idle;
                 }
@@ -446,14 +460,29 @@ unsafe fn handle_ctrl(s: &mut WorkerState) {
             }
         }
         SC_CMD_DETACH => {
-            // Detach: clear state, back to Idle.
-            if s.phase == WorkerPhase::Active || s.phase == WorkerPhase::Draining {
-                send_session_event(s, SC_MSG_DETACHED, false, 0);
-                mon_emit(s, MON_EV_DETACHED, b"normal", b"");
-                s.session_id = [0; SESSION_ID_BYTES];
-                s.anchor_id = [0; ANCHOR_ID_BYTES];
-                s.session_epoch = 0;
-                s.phase = WorkerPhase::Idle;
+            // Detach: clear state, back to Idle. A standby detached
+            // mid-import (the anchor refused the handoff) discards the
+            // partial blob the same way — it was never the session's.
+            match s.phase {
+                WorkerPhase::Active | WorkerPhase::Draining => {
+                    send_session_event(s, SC_MSG_DETACHED, false, 0);
+                    mon_emit(s, MON_EV_DETACHED, b"normal", b"");
+                    s.session_id = [0; SESSION_ID_BYTES];
+                    s.anchor_id = [0; ANCHOR_ID_BYTES];
+                    s.session_epoch = 0;
+                    s.drained_sent = 0;
+                    s.phase = WorkerPhase::Idle;
+                }
+                WorkerPhase::Importing | WorkerPhase::Imported => {
+                    send_session_event(s, SC_MSG_DETACHED, false, 0);
+                    mon_emit(s, MON_EV_DETACHED, b"normal", b"");
+                    s.import.reset();
+                    s.session_id = [0; SESSION_ID_BYTES];
+                    s.session_epoch = 0;
+                    s.import_epoch = 0;
+                    s.phase = WorkerPhase::Idle;
+                }
+                _ => {}
             }
         }
         SC_CMD_EXPORT_BEGIN => {
@@ -557,11 +586,43 @@ unsafe fn handle_ctrl(s: &mut WorkerState) {
             }
         }
         SC_CMD_RESUME => {
-            // Payload: [sid:16][new_epoch:4 LE]. Only honored after a
-            // committed import; the new epoch must advance past the
-            // imported one (stale-epoch rejection, §10.2).
+            // Payload: [sid:16][new_epoch:4 LE]. Two meanings, told
+            // apart by the phase the worker is in:
+            //
+            //   Imported — the normal handoff. The new epoch must
+            //   advance past the imported one (stale-epoch rejection,
+            //   §10.2).
+            //
+            //   Draining — the anchor refused or timed out the
+            //   handoff and is returning this worker to service. The
+            //   epoch must be the session's CURRENT one: nothing was
+            //   imported anywhere, so nothing advanced. The state this
+            //   worker exported is still its own; it resumes consuming
+            //   from where the drain left it.
             let expected = SESSION_ID_BYTES + EPOCH_BYTES;
-            if payload_len >= expected && s.phase == WorkerPhase::Imported {
+            if payload_len >= expected && s.phase == WorkerPhase::Draining {
+                let p = buf.add(NET_FRAME_HDR);
+                let epoch = u32::from_le_bytes([
+                    *p.add(SESSION_ID_BYTES),
+                    *p.add(SESSION_ID_BYTES + 1),
+                    *p.add(SESSION_ID_BYTES + 2),
+                    *p.add(SESSION_ID_BYTES + 3),
+                ]);
+                if epoch == s.session_epoch {
+                    s.phase = WorkerPhase::Active;
+                    s.drained_sent = 0;
+                    send_session_event(s, SC_MSG_RESUMED, false, 0);
+                    mon_emit(s, MON_EV_RESUMED, b"", b"ok");
+                } else {
+                    let mut payload = [0u8; SESSION_ID_BYTES + EPOCH_BYTES + 1];
+                    payload[..SESSION_ID_BYTES].copy_from_slice(&s.session_id);
+                    payload[SESSION_ID_BYTES..SESSION_ID_BYTES + EPOCH_BYTES]
+                        .copy_from_slice(&epoch.to_le_bytes());
+                    payload[SESSION_ID_BYTES + EPOCH_BYTES] = SC_STATUS_STALE_EPOCH;
+                    sc_write(s, SC_MSG_ERROR, payload.as_ptr(), payload.len());
+                    mon_emit(s, MON_EV_REJECTED, b"stale_epoch", b"");
+                }
+            } else if payload_len >= expected && s.phase == WorkerPhase::Imported {
                 let p = buf.add(NET_FRAME_HDR);
                 let new_epoch = u32::from_le_bytes([
                     *p.add(SESSION_ID_BYTES),
@@ -614,14 +675,20 @@ unsafe fn handle_data(s: &mut WorkerState) {
     let data_out = s.data_out;
 
     if s.phase == WorkerPhase::Draining {
+        // DRAINED means "no new frames until resume": once declared, the
+        // exported blob accounts for everything consumed, and consuming
+        // more would advance the inbound cursor past it — the anchor
+        // would then refuse the handoff for a disagreement this worker
+        // caused. Bytes that arrive now wait for RESUME or DETACH.
+        if s.drained_sent != 0 {
+            return;
+        }
         let pending = ((*sys_ptr).channel_poll)(data_in, POLL_IN);
         if pending <= 0 || ((pending as u32) & POLL_IN) == 0 {
-            if s.drained_sent == 0 {
-                s.drained_sent = 1;
-                send_session_event(s, SC_MSG_DRAINED, false, 0);
-                mon_emit(s, MON_EV_DRAINED, b"", b"");
-                export_state(s);
-            }
+            s.drained_sent = 1;
+            send_session_event(s, SC_MSG_DRAINED, false, 0);
+            mon_emit(s, MON_EV_DRAINED, b"", b"");
+            export_state(s);
             return;
         }
     }
@@ -649,8 +716,8 @@ unsafe fn handle_data(s: &mut WorkerState) {
     let mut i = 0;
     while i < n {
         let b = *buf.add(i);
-        if b >= b'a' && b <= b'z' {
-            *buf.add(i) = b - 32;
+        if b.is_ascii_lowercase() {
+            *buf.add(i) = b.to_ascii_uppercase();
         }
         i += 1;
     }
@@ -666,17 +733,17 @@ unsafe fn handle_data(s: &mut WorkerState) {
 // Module interface
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<WorkerState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -711,7 +778,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {

@@ -1543,7 +1543,12 @@ unsafe fn mint_token(s: &IpState) -> Option<[u8; 16]> {
     }
     let Some(inc) = dev_boot_incarnation(sys) else {
         let mut probe = [0u8; 16];
-        let rc = (sys.provider_call)(-1, abi::kernel_abi::BOOT_INCARNATION, probe.as_mut_ptr(), 16);
+        let rc = (sys.provider_call)(
+            -1,
+            abi::kernel_abi::BOOT_INCARNATION,
+            probe.as_mut_ptr(),
+            16,
+        );
         let mut line = *b"[ip] token: no boot incarnation rc=-000";
         let e = rc.unsigned_abs();
         line[36] = b'0' + ((e / 100) % 10) as u8;
@@ -3525,8 +3530,8 @@ unsafe fn retry_unsent_handshake(s: &mut IpState, resolved_ip: u32) {
             let conn = &*s.tcp_conns.as_ptr().add(i);
             (conn.state, conn.snd_nxt == conn.iss, conn.remote_ip)
         };
-        let waiting = unsent
-            && matches!(state, tcp::TcpState::SynReceived | tcp::TcpState::SynSent);
+        let waiting =
+            unsent && matches!(state, tcp::TcpState::SynReceived | tcp::TcpState::SynSent);
         if !waiting {
             k += 1;
             continue;
@@ -3641,13 +3646,15 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
 
 /// Traffic the stack answers for itself, never described to a director:
 /// ICMP, and DHCP server-to-client datagrams (the lease exchange).
-unsafe fn stack_own_traffic(ip_hdr: &ipv4::Ipv4Header, proto_data: *const u8, proto_len: usize) -> bool {
+unsafe fn stack_own_traffic(
+    ip_hdr: &ipv4::Ipv4Header,
+    proto_data: *const u8,
+    proto_len: usize,
+) -> bool {
     match ip_hdr.protocol {
         ipv4::PROTO_ICMP => true,
         ipv4::PROTO_UDP => match udp::parse_udp(proto_data, proto_len) {
-            Some(h) => {
-                h.src_port == dhcp::DHCP_SERVER_PORT && h.dst_port == dhcp::DHCP_CLIENT_PORT
-            }
+            Some(h) => h.src_port == dhcp::DHCP_SERVER_PORT && h.dst_port == dhcp::DHCP_CLIENT_PORT,
             None => false,
         },
         _ => false,

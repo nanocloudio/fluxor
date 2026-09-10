@@ -51,6 +51,17 @@
 //! the explicit rebinding buffer §11.2 requires anchors to declare
 //! (`HOLD_BUF_SIZE`; overflow is dropped with a log line).
 //!
+//! A handoff the anchor cannot make safe is REFUSED, not turned into a
+//! client-visible failure: cursors that disagree, an import the standby
+//! rejects, a worker error mid-handoff, or a drain that outlives
+//! `DRAIN_DEADLINE_MS` all leave the session on the exporting worker.
+//! The anchor detaches the standby, sends the exporting worker
+//! CMD_SC_RESUME at the session's CURRENT epoch (nothing advanced — no
+//! blob was committed anywhere), waits for its MSG_SC_RESUMED, and only
+//! then releases the held ingress. The client saw a pause bounded by the
+//! deadline and nothing else. Refusing costs a maintenance window;
+//! proceeding would cost the client bytes nobody would learn were lost.
+//!
 //! # Parameters (TLV v2)
 //!
 //! | Tag | Name                | Type | Default | Description                          |
@@ -63,7 +74,7 @@
 //! See `modules/sdk/contracts/net/session_ctrl.rs` for SessionCtrlV1
 //! and `modules/sdk/contracts/net/net_proto.rs` for Stream Surface v1.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
     unused_imports,
@@ -130,6 +141,10 @@ const SESSION_ID_BYTES: usize = 16;
 const ANCHOR_ID_BYTES: usize = 8;
 const WORKER_ID_BYTES: usize = 8;
 const EPOCH_BYTES: usize = 4;
+
+/// Shortest status-carrying reply we act on:
+/// `[session_id:16][epoch:4][status:1]`.
+const STATUS_REPLY_MIN_LEN: usize = SESSION_ID_BYTES + EPOCH_BYTES + 1;
 
 /// Fixed anchor identifier. A real deployment sets this from a
 /// manifest parameter or cluster-assigned value; hardcoding here keeps
@@ -213,6 +228,11 @@ enum HandoffPhase {
     /// output whenever the new worker occupies a lower slot index
     /// (client-visible stream reordering under backpressure).
     RetireDrain = 4,
+    /// The handoff was refused (cursors, import, error, deadline):
+    /// standby detached, CMD_SC_RESUME at the CURRENT epoch sent to the
+    /// exporting worker; waiting for its MSG_SC_RESUMED before the held
+    /// ingress is released back to it.
+    RefuseWait = 5,
 }
 
 #[repr(C)]
@@ -248,10 +268,16 @@ struct AnchorState {
     relayed: u64,
     /// Client bytes forwarded since the last swap.
     bytes_since_handoff: u32,
+    /// `dev_millis` when the current handoff's DRAIN was sent; the
+    /// deadline handed to the worker is enforced against it.
+    handoff_started_ms: u64,
     /// Set while the old worker's MSG_SC_DETACHED (post-swap) is
     /// outstanding, so it is not mistaken for session-ending detach.
     detach_old_pending: bool,
-    _pad0: [u8; 3],
+    /// Set when a refusal's CMD_SC_RESUME could not be written (ctrl_out
+    /// full); the step loop retries it.
+    refuse_resume_pending: bool,
+    _pad0: [u8; 2],
 
     /// Rebinding hold buffer (§11.2) + fill level.
     hold_len: u16,
@@ -301,8 +327,10 @@ impl AnchorState {
         self.handoff = HandoffPhase::Idle;
         self.handoff_after_bytes = 0;
         self.bytes_since_handoff = 0;
+        self.handoff_started_ms = 0;
         self.detach_old_pending = false;
-        self._pad0 = [0; 3];
+        self.refuse_resume_pending = false;
+        self._pad0 = [0; 2];
         self.hold_len = 0;
         self._pad3 = [0; 2];
         self.server_conn_id = 0;
@@ -713,20 +741,33 @@ unsafe fn flush_hold(s: &mut AnchorState) {
     s.hold_len = 0;
 }
 
-/// Abort a failed handoff: the demo treats a corrupt import or a
-/// worker error mid-handoff as a session error — detach everything
-/// and drop the client rather than risk split session state.
-unsafe fn handoff_abort(s: &mut AnchorState) {
+/// Refuse a handoff that cannot be made safe, leaving the session on
+/// the exporting worker (§Delivery cursors: "refuses the handoff ...
+/// and leaves the session on the exporting worker").
+///
+/// The standby is detached (it discards whatever it half-imported) and
+/// the exporting worker is returned to service with CMD_SC_RESUME at
+/// the session's CURRENT epoch — no blob was committed anywhere, so
+/// nothing advanced. Held ingress stays held until that worker answers
+/// MSG_SC_RESUMED; the client sees a pause bounded by the deadline and
+/// nothing else. `status` names the cause on the MON_SESSION line.
+unsafe fn handoff_refuse(s: &mut AnchorState, status: &[u8]) {
     let sys_ptr = s.syscalls;
-    dev_log(&*sys_ptr, 1, b"[echo_anc] handoff failed".as_ptr(), 25);
+    dev_log(&*sys_ptr, 1, b"[echo_anc] handoff refused".as_ptr(), 26);
     let standby = s.standby_w();
     sc_send_detach(s, standby, SC_DETACH_NORMAL);
-    s.handoff = HandoffPhase::Idle;
-    s.hold_len = 0;
-    if s.client_conn_id != NO_CONN {
-        net_send_close(s, s.client_conn_id);
+    mon_emit(s, MON_EV_ERROR, b"", status);
+    let aw = s.active_w as usize;
+    let epoch = s.session_epoch;
+    if sc_send_resume(s, aw, epoch) {
+        s.handoff = HandoffPhase::RefuseWait;
+        mon_emit(s, MON_EV_RESUME_REQ, b"", b"");
+    } else {
+        // ctrl_out full: retry from the step loop until it takes.
+        s.handoff = HandoffPhase::RefuseWait;
+        s.detach_old_pending = false;
+        s.refuse_resume_pending = true;
     }
-    s.phase = AnchorPhase::Detaching;
 }
 
 /// Drain one SessionCtrlV1 frame from worker slot `w`.
@@ -747,7 +788,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
         SC_MSG_ATTACHED => {
             // [session_id:16][epoch:4][status:1]. Only go Active on status=OK
             // AND session_id matches.
-            if payload_len >= SESSION_ID_BYTES + EPOCH_BYTES + 1
+            if payload_len >= STATUS_REPLY_MIN_LEN
                 && s.phase == AnchorPhase::WaitAttached
                 && is_active
             {
@@ -810,7 +851,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                     if admit != HANDOFF_OK {
                         dev_log(&*sys_ptr, 1,
                             b"[echo_anc] export cursors disagree".as_ptr(), 34);
-                        handoff_abort(s);
+                        handoff_refuse(s, b"cursor_mismatch");
                         return;
                     }
                 }
@@ -823,7 +864,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
             if !is_active && s.handoff == HandoffPhase::ImportWait && payload_len > SESSION_ID_BYTES + EPOCH_BYTES {
                 let status = *buf.add(NET_FRAME_HDR + SESSION_ID_BYTES + EPOCH_BYTES);
                 if status != SC_STATUS_OK {
-                    handoff_abort(s);
+                    handoff_refuse(s, b"no_capacity");
                 }
             }
         }
@@ -837,14 +878,25 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                         s.handoff = HandoffPhase::ResumeWait;
                         mon_emit(s, MON_EV_RESUME_REQ, b"", b"");
                     } else {
-                        handoff_abort(s);
+                        handoff_refuse(s, b"not_ready");
                     }
                 } else {
-                    handoff_abort(s);
+                    handoff_refuse(s, b"corrupt");
                 }
             }
         }
         SC_MSG_RESUMED => {
+            // A refused handoff's RESUMED comes from the ACTIVE worker,
+            // at the unchanged epoch: it is back in service, so the held
+            // ingress goes to it and the session carries on as if the
+            // swap had never been attempted.
+            if is_active && s.handoff == HandoffPhase::RefuseWait {
+                s.handoff = HandoffPhase::Idle;
+                s.bytes_since_handoff = 0;
+                flush_hold(s);
+                dev_log(&*sys_ptr, 3, b"[echo_anc] handoff refused, session kept".as_ptr(), 39);
+                return;
+            }
             // Swap recorded: bump the epoch, flip the forwarding
             // target, detach the old worker. The hold buffer is NOT
             // flushed yet — the retiring worker's output channel may
@@ -870,6 +922,9 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                 // Post-swap detach of the OLD worker — the session
                 // itself continues on the new active worker.
                 s.detach_old_pending = false;
+            } else if !is_active && s.handoff == HandoffPhase::RefuseWait {
+                // The standby acknowledging a refusal's detach: the
+                // session never left the active worker.
             } else if payload_len >= SESSION_ID_BYTES + EPOCH_BYTES {
                 // Session-ending detach. Close client if still open
                 // and return to Listening; the IP module preserves the
@@ -886,8 +941,17 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
         }
         SC_MSG_ERROR => {
             dev_log(&*sys_ptr, 1, b"[echo_anc] worker error".as_ptr(), 23);
-            if s.handoff != HandoffPhase::Idle {
-                handoff_abort(s);
+            if s.handoff != HandoffPhase::Idle && s.handoff != HandoffPhase::RefuseWait {
+                handoff_refuse(s, b"error");
+            } else if s.handoff == HandoffPhase::RefuseWait {
+                // The exporting worker refused to resume: the session is
+                // unrecoverable on either side, so this IS the end of it.
+                s.handoff = HandoffPhase::Idle;
+                s.hold_len = 0;
+                if s.client_conn_id != NO_CONN {
+                    net_send_close(s, s.client_conn_id);
+                }
+                s.phase = AnchorPhase::Detaching;
             } else {
                 if s.client_conn_id != NO_CONN {
                     net_send_close(s, s.client_conn_id);
@@ -980,9 +1044,40 @@ unsafe fn maybe_start_handoff(s: &mut AnchorState) {
     let aw = s.active_w as usize;
     if sc_send_drain(s, aw) {
         s.handoff = HandoffPhase::DrainWait;
-        mon_emit(s, MON_EV_EXPORT_REQ, b"", b"");
         let sys_ptr = s.syscalls;
+        s.handoff_started_ms = dev_millis(&*sys_ptr);
+        mon_emit(s, MON_EV_EXPORT_REQ, b"", b"");
         dev_log(&*sys_ptr, 3, b"[echo_anc] handoff: drain sent".as_ptr(), 30);
+    }
+}
+
+/// Enforce the deadline the DRAIN carried. A swap still short of
+/// RESUMED when `DRAIN_DEADLINE_MS` has passed since the DRAIN is
+/// refused: the session stays on the exporting worker rather than
+/// holding the client's bytes for as long as a slow standby likes.
+/// Also retries a refusal's CMD_SC_RESUME that ctrl_out refused.
+unsafe fn enforce_handoff_deadline(s: &mut AnchorState) {
+    let sys_ptr = s.syscalls;
+    if s.handoff == HandoffPhase::RefuseWait && s.refuse_resume_pending {
+        let aw = s.active_w as usize;
+        let epoch = s.session_epoch;
+        if sc_send_resume(s, aw, epoch) {
+            s.refuse_resume_pending = false;
+            mon_emit(s, MON_EV_RESUME_REQ, b"", b"");
+        }
+        return;
+    }
+    let in_flight = matches!(
+        s.handoff,
+        HandoffPhase::DrainWait | HandoffPhase::ImportWait | HandoffPhase::ResumeWait
+    );
+    if !in_flight {
+        return;
+    }
+    let now = dev_millis(&*sys_ptr);
+    if now.saturating_sub(s.handoff_started_ms) > DRAIN_DEADLINE_MS as u64 {
+        dev_log(&*sys_ptr, 1, b"[echo_anc] handoff deadline".as_ptr(), 27);
+        handoff_refuse(s, b"drain_timeout");
     }
 }
 
@@ -990,17 +1085,17 @@ unsafe fn maybe_start_handoff(s: &mut AnchorState) {
 // Module interface
 // ============================================================================
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<AnchorState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -1050,7 +1145,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
@@ -1090,6 +1185,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 poll_net_in(s);
                 poll_ctrl_all(s);
                 poll_data_in(s);
+                enforce_handoff_deadline(s);
                 maybe_start_handoff(s);
             }
             AnchorPhase::Detaching => {
