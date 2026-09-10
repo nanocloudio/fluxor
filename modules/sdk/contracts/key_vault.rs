@@ -85,6 +85,8 @@ pub const ECDH: u32 = 0x1002;
 ///   The 64-byte low-s `r‖s` output is exactly the JWS ES256 segment.
 /// - Ed25519: `RAW` over the full message (RFC 8032 is not prehashed).
 ///   Output is the 64-byte `R‖S`, deterministic by spec on every backend.
+/// - HMAC-SHA256: `RAW` over the full message; the 32-byte output is the
+///   RFC 2104 tag. Deterministic, and the only thing the key ever yields.
 /// - ML-DSA: `RAW` over the full message. The pure FIPS 204 variant is not
 ///   prehashed — HashML-DSA is a different algorithm, not a mode of this
 ///   one — and `PREHASH` is refused rather than answered with it. The
@@ -98,6 +100,14 @@ pub const SIGN: u32 = 0x1003;
 ///             [hash_bytes[hash_len]][sig_bytes[sig_len]][pub_bytes[pub_len]]
 /// - sig_len must be 64 (raw r‖s); pub_len >= 64 (SEC1 uncompressed,
 ///   with or without the leading 0x04 byte).
+///
+/// With a slot handle instead of -1 the slot must hold an
+/// [`suite::HMAC_SHA256`] key permitting [`usage::VERIFY`], and the same
+/// layout carries the message in the hash field, the 32-byte tag in the
+/// signature field and `pub_len = 0`; the backend recomputes the tag and
+/// compares in constant time. The tag is checked inside the backend rather
+/// than handed to the caller to compare, so the comparison cannot be
+/// written wrong at any of the places it would otherwise be written.
 ///
 /// Returns 1 if valid, 0 if invalid, negative errno on malformed input.
 pub const VERIFY: u32 = 0x1004;
@@ -174,9 +184,14 @@ pub mod suite {
     /// the shape a resumption-ticket key or any other sealing key takes.
     /// It signs nothing and has no public half.
     pub const AEAD_KEY: u16 = 8;
+    /// A 32-byte HMAC-SHA256 key (RFC 2104): a shared secret whose tag is
+    /// produced by [`SIGN`] and checked by [`VERIFY`] against the slot.
+    /// The shape a TSIG key (RFC 8945) takes. It has no public half and is
+    /// never readable back: the only answers a holder gets are tags.
+    pub const HMAC_SHA256: u16 = 9;
 
     /// Highest id this registry defines.
-    pub const MAX_ID: u16 = AEAD_KEY;
+    pub const MAX_ID: u16 = HMAC_SHA256;
 }
 
 /// How [`SIGN`] should treat the bytes it is given.

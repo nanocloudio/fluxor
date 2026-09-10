@@ -362,6 +362,40 @@ graph, for example one bound to an Ethernet driver and another to a WiFi
 driver. Each has its own connection table and its own channel pair, and
 consumers wire to whichever instance they belong to.
 
+### Table-sized work
+
+Nothing on the ip module's step is allowed to grow with the connection
+table. Lookups go through the hash indexes (`ip/index.rs`); the timer
+sweep walks a slice proportional to the time elapsed in its 50 ms
+window and never more than `SWEEP_SLICE_MAX` records in one step, so a
+window owed after a stall is repaid over several steps rather than as
+one multi-millisecond walk; a handshake held back by neighbour
+resolution is remembered in a bounded list (`ARP_WAIT_MAX`) that an ARP
+reply retries, with the sweep's per-tick retry covering a full list;
+a slot is allocated by popping a free stack that every release pushes,
+and when the stack is empty — the table is full — one bounded slice
+(`ALLOC_SCAN_SLICE`) per step rebuilds it and the arrival is refused, so
+a SYN flood at the ceiling never walks the table per SYN; loopback pairs
+take their slots from the same allocator as accepted connections. The
+step guard is what makes this a correctness rule rather than a
+preference: a step that walks the whole table on a 65,536-record profile
+ends the module. (Hardware pass: the first 65,535-connection rung on the
+Pi 5 ended the board at ~63,000 connections — the free-slot cursor scan
+degenerates to a full walk per SYN as the table fills.)
+
+The same rule reaches the wiring around the module. A consumer port
+shared by two readers — `debug: to: net` puts `log_net` beside the
+application on `net_out` and `net_in` — is served by a kernel fan
+(`_tee` on the way out, `_merge` on the way in), and what the fan moves
+per step is then the ceiling on every accept, delivery and send. A fan
+moves whole frames, up to `FAN_FRAMES_PER_STEP` of them per step, and
+consumes nothing while any reader's ring is full, so every reader on a
+fanned port must drain what it does not want (`log_net` discards up to
+its own per-step budget) or the port stalls for all of them. Nor does
+the module log per connection: the `[ip] hb` and `[ip] drop` lines carry
+the counts, and a line per handshake at 8,192 handshakes a second is a
+log storm through the same NIC the handshakes need.
+
 ## Hosted Linux: linux_net
 
 Source: `modules/platform/linux/linux_net/`.
@@ -421,6 +455,62 @@ Each opens a channel pair to the network provider (or to TLS) in its
 config wiring and exchanges contract frames. None of them call a
 "socket" syscall, and none know what hardware provides the network
 underneath.
+
+### DNS64 and authoritative update
+
+Source: `modules/foundation/dns/mod.rs`; gates `tests/harness/tests/dns64.rs`,
+`tests/harness/tests/dns_update.rs`; rigs `tests/host/dns64_stock_client.sh`,
+`tests/host/dns_update_nsupdate.sh`.
+
+Both are off unless their manifest parameter is set.
+
+**DNS64** (`dns64_prefix`, RFC 6147 / RFC 6052, /96 only) is a
+*non-validating* forwarding profile. A native AAAA answer is always relayed
+as received. A forwarded AAAA whose answer is a complete, correlated
+NOERROR/NODATA — never NXDOMAIN, an error rcode, a referral, a truncated or
+a malformed answer — starts one follow-up A query for the terminal owner in
+the same pending slot, in a second phase, against the deadline the query was
+accepted with; the slot table never grows for it. CNAME chains are followed
+under `MAX_CNAME_HOPS` / `MAX_CHAIN_BYTES` with loop detection, the chain is
+preserved and only the terminal owner's A RRset is translated; a DNAME in
+the answer is refused SERVFAIL. The synthesized TTL is `min(remaining A TTL,
+negative-AAAA SOA minimum)`, or the remaining A TTL capped at 600 s without
+a SOA, with the time spent resolving deducted. A locally configured A is
+synthesized at the local TTL. Non-global IPv4 is excluded by default and
+always under the well-known prefix `64:ff9b::/96`; a network-specific prefix
+with an explicit `dns64_exclude` list translates exactly what the list
+leaves. Each prefix/exclusion publication is a generation, and a query keeps
+the generation it was accepted under.
+
+The DNSSEC profile is the conservative one: a query with DO or CD set is
+forwarded unchanged and never synthesized, so the caller's validation is
+preserved; a synthesized answer clears AD and never carries an RRSIG. This
+is not a validating DNS64 and does not claim one. There is no TCP surface in
+the module, so a TC answer is relayed with TC set and the client retries
+over TCP with its own resolver.
+
+**Dynamic update** (`update_zone`, RFC 2136 with RFC 8945 TSIG) makes the
+module the authoritative speaker for one zone, held as immutable
+generations of at most `MAX_ZONE_RRS` records and served with AA. Every
+UPDATE must carry an `hmac-sha256` TSIG under a key named in
+`update_allow` (`"keyname=name-suffix,TYPE,..."`); the key is a vault
+`HMAC_SHA256` key under the label `dns/tsig/<keyname>`, opened — never
+generated — at construct, and the MAC is checked inside the vault. Unsigned
+requests are REFUSED; a bad key, signature or time is NOTAUTH with the TSIG
+error (BADKEY / BADSIG / BADTIME), and the time check reads the kernel's
+trusted calendar clock under a `MAX_TSIG_FUDGE_S` window, failing closed
+when the clock is untrusted (`[[requires_when]] time.wall`). All five RFC
+2136 prerequisite forms are evaluated against the current generation; the
+update section is prescanned, permission-checked against the key's
+name-suffix and types, and applied to a candidate copy, so any refusal —
+format, scope, permission, capacity — leaves the current generation as it
+was. `update_durability` is mandatory: `volatile` acknowledges at once and
+logs that the zone is lost on restart; `durable` commits the candidate
+through the `fs` contract (temp → write → fsync → close → rename) before
+acknowledging and recovers the last complete committed generation at
+construct. A repeated authenticated transaction (same key and MAC) inside
+`TXN_RETAIN_MS` is answered from the retained response. Messages are UDP,
+at most 512 bytes.
 
 ## Platform Stack Expansion
 
@@ -510,15 +600,84 @@ The fence closes one gate, the hand-off to the driver ring in `send_frame`,
 so it holds for every path that builds a frame: data, SYN-ACKs, RSTs, ARP
 replies and the defence of the address against a competing claim (a fenced
 address is not defended — its next owner may claim it). `MSG_ADDR_FENCED`
-reports the frame counter at the cutoff and what the boundary is worth:
-`cutoff::RING_HANDOFF` is what the ip module can prove on its own — a
-frame already in the driver ring may still leave — and a driver able to
-drain and report its completed transmit index would declare `wire`. The
-primary address is always armed and cannot be fenced. Refused frames are
-counted (`fenced=` on the `[ip] drop` line) so a fence that is doing its
-job is visible.
+reports the cutoff index and what the boundary is worth. After closing
+the gate the module asks the frame channel's reader — the NIC driver —
+to drain, over the `tx_drain` channel ioctl (`net::identity::tx_drain`):
+a driver that owns its transmit ring answers `EAGAIN` while any frame
+handed over is unread on the channel or unused by the hardware, then `0`
+with its completed transmit count, and the event goes out with
+`cutoff::WIRE` and that count. The event is held while the driver drains,
+bounded by `FENCE_WIRE_WAIT_MS`; past the wait, or on a channel whose
+reader registers no handler, it goes out at once with
+`cutoff::RING_HANDOFF` and the module's frame counter — what the ip module
+can prove on its own, a frame already in the ring may still leave. The
+rp1_gem driver answers the query (bcm2712); the hosted stack's wire is its
+host kernel's and does not. The primary address is always armed and
+cannot be fenced. Refused frames are counted (`fenced=` on the `[ip] drop`
+line) so a fence that is doing its job is visible.
 
-This is the `fence.enforceable` capability with `cutoff = "ring_handoff"`
-in the ip manifest. IPv6 neighbour advertisement is not part of it: the
-stack is IPv4-only, so there is no IPv6 address to announce or fence.
+This is the `fence.enforceable` capability. The ip manifest declares
+`cutoff = "ring_handoff"`, the floor it can promise everywhere; the
+composer raises it to `wire` from the target facts
+(`tools/src/target_facts.rs`, `nic_tx_drain`) where the driver drains on
+request, which is what a strict continuity profile is admitted against.
+IPv6 neighbour advertisement is not part of it: the stack is IPv4-only,
+so there is no IPv6 address to announce or fence.
+
+## Transport Continuity
+
+Contract: `modules/sdk/contracts/net/session_ctrl.rs` §Transport
+continuity. Providers: `modules/foundation/ip` (`continuity.rs`, TCP),
+`modules/foundation/tls` (`continuity.rs`, the record layer),
+`modules/foundation/quic` (`continuity.rs`, the mux). Each answers the
+same command set on a `cont_in` / `cont_out` port pair: `PAIR_PREPARE`,
+`CHECKPOINT_BEGIN / NEXT / COMMIT`, `DELTA_APPLY / DELTA_ACK`,
+`QUIESCE_BEGIN / STATUS`, `CUT_EXPORT / CUT_IMPORT`, `EMISSION_ARM`,
+`ACTIVATE`, `RETIRE`, `ABORT`, with every reply a `MSG_SC_CONTINUITY`
+record. A coordinator (Wormhole's `failover_coordinator`) drives the
+lifecycle and relays checkpoint chunks and deltas between the primary's
+`cont_out` and the standby's `cont_in`; the provider owns the codec, the
+buffers and the emission gate.
+
+A **checkpoint** is a canonical record, never a memory dump: for TCP the
+tuple, sequence variables, windows, congestion and RTT state, timers as
+remaining durations, and the reorder buffer (`TCP_RECORD_MAX`); for TLS
+the epochs, record counters, partial inbound record, retained outbound
+ciphertext and the secret set sealed by the vault under a labelled key;
+for QUIC the packet-number spaces, streams, flow control, CIDs
+(preserved verbatim) and the sealed secrets. Secrets never cross the
+port in the clear — a standby whose vault holds the same labelled key
+(`security.key_wrap`) opens them. A record is chunked with CRC32 and
+bound by a SHA-256 manifest; the standby validates it whole in a shadow
+slot (`MAX_TCP_SHADOWS`, `MAX_TLS_SHADOWS`, quic `MAX_SHADOW_SLOTS`) and
+refuses gaps, conflicting duplicates, impossible relations and unknown
+layouts before anything is mutated. Only synchronised connections and
+established TLS 1.3 sessions are admitted; a handshake in progress is
+refused `ABORT_UNSUPPORTED_STATE`.
+
+Two **profiles**. `PROFILE_PLANNED`: deltas are asynchronous and the cut
+at `CUT_EXPORT`, taken after `QUIESCE_BEGIN` closed the receive window
+and drained what was in flight, is what makes the standby exact.
+`PROFILE_CRASH_CONTINUOUS`: every externally visible transition waits
+for its `DELTA_ACK` — the acknowledgement the TCP peer is shown never
+runs ahead of the receive horizon the standby confirmed, a data segment,
+FIN, TLS record or QUIC packet is not handed to the wire before its send
+delta is confirmed, and a key update is a barrier. The wait is bounded
+by the peer's window, never by a queue.
+
+**Activation** turns a validated, armed shadow into the live connection
+under a strictly higher epoch and a non-zero fence generation: timers
+are converted from their remaining durations with the transfer age
+charged, expired ones fire on the next sweep, congestion restarts
+conservatively (window capped at the initial window, recovery cleared),
+and the TCP side reports the live conn id the TLS side binds to. The old
+anchor's `RETIRE` drops the connection silently — no FIN, no RST, no
+consumer event — and zeroizes its secrets. The peer never sees the move.
+
+What the ip and tls modules own here is the codec, the horizons and the
+local gate; committed ownership epochs, reservations
+(`CMD_SC_RESERVATION_GRANT` carries the directory's grant to the quic
+packet-number space) and the out-of-band fence are Clustor's and
+Wormhole's, and admission (`capability_surface.md` §Continuity
+Validation) refuses a graph that lacks them.
 

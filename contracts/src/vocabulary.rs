@@ -62,8 +62,7 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "midi.output",
     // Transport surfaces + continuity roles (protocol_surfaces.md,
     // capability_surface.md §Transport Surface / §Continuity Role;
-    // validated as graph structure by the `continuity` config block,
-    // rfc_protocols.md §7.3 / §9).
+    // validated as graph structure by the `continuity` config block).
     "transport.stream",
     "transport.stream.tcp",
     "transport.stream.secure",

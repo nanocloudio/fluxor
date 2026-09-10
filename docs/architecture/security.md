@@ -177,6 +177,20 @@ handle, and then wipes the in-module key bytes with volatile writes, so
 path is retained only as the explicit not-present fallback — a module
 arena dump on a vault-enabled build does not reveal the identity key.
 
+## Entropy
+
+Every random byte the kernel hands out — ISNs, tokens, the boot
+incarnation, vault keys — comes from `hal::csprng_fill`. On the Pi 5 that
+is the iproc-rng200 block (`src/platform/bcm2712.rs`): the generator is
+enabled through `RNG_CTRL`, words are taken from its output FIFO only when
+its count register says one is waiting, a master-fail lockout or a run of
+zero words restarts the block through its soft resets, and a source that
+yields nothing but zeros is refused. A zero word is never entropy, and a
+successful return code is not either: consumers that mint identity from
+randomness (the emission token, the incarnation) refuse an all-zero
+result. The register map is pinned by `tools/tests/target_facts.rs`, and
+the fence rig scenario exercises the whole path on the silicon.
+
 ## Network Hardening
 
 ### conn_guard — TCP-SYN admission

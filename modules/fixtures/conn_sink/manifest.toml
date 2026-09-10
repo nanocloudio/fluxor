@@ -1,0 +1,37 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+# Counts connections as they arrive; no tick-based timing.
+timer_class = "agnostic"
+
+# Fixture consumer for the ip module's connection-table ladders: binds one
+# port, accepts every connection it is offered, holds each open, and echoes
+# whatever arrives on it. Its own state per connection is one bit, so the
+# table it exercises is the transport's, not its own — which is the point
+# of the ladder. The heartbeat line
+#
+#   [sink] conns=<open> peak=<high water> accepted=<total> bytes=<echoed> refused=<n> bound=<0|1>
+#
+# is what a rig reads: `peak` at the rung the driver opened is the claim
+# under test.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+buffer_size = { default = 4096, bcm2712 = 65536 }
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+buffer_size = { default = 4096, bcm2712 = 65536 }
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "capacity-ladder fixture; the `[sink]` heartbeat carries its counters, and the transport it exercises (ip) is the instrumented surface"

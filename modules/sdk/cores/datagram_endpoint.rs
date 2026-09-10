@@ -307,12 +307,25 @@ impl DatagramEndpoint {
         }
         self.poll_bind(sys, net_out, bind_port, scratch, scratch_max);
         if net_in >= 0 && (self.phase == BindPhase::WaitBound || self.phase == BindPhase::Backoff) {
-            if let Some(ev) = dg_recv(sys, net_in, scratch, scratch_max) {
-                match ev {
-                    DgEvent::Bound { ep_id, .. } => self.on_bound(ep_id),
-                    DgEvent::Err { .. } => self.on_error(sys),
-                    // An RX before we're bound (shouldn't happen on a dedicated
-                    // channel) — ignore and stay waiting.
+            // `net_in` may be one reader of a fanned port, carrying another
+            // consumer's traffic ahead of this endpoint's own reply. Read
+            // through it, up to a step's budget, so the bound reply is found
+            // behind whatever precedes it and the fan is never held by a
+            // reader that has not bound yet.
+            let mut budget = BIND_WAIT_DRAIN;
+            while budget > 0 && net_in_readable(sys, net_in) {
+                budget -= 1;
+                match dg_recv(sys, net_in, scratch, scratch_max) {
+                    Some(DgEvent::Bound { ep_id, .. }) => {
+                        self.on_bound(ep_id);
+                        break;
+                    }
+                    Some(DgEvent::Err { .. }) => {
+                        self.on_error(sys);
+                        break;
+                    }
+                    // Another consumer's frame, or an RX before we're bound:
+                    // not ours, discarded.
                     _ => {}
                 }
             }
@@ -379,17 +392,27 @@ impl DatagramEndpoint {
     dead_code,
     reason = "shared datagram-endpoint core; each including module uses a subset"
 )]
+/// Frames read through while waiting for the bound reply, per step. Matches
+/// the kernel fan's own per-step budget (`FAN_FRAMES_PER_STEP`), so a fanned
+/// input never gains on an endpoint that is still binding.
+const BIND_WAIT_DRAIN: usize = 64;
+
+/// Is there a frame to read on `net_in`?
+unsafe fn net_in_readable(sys: &SyscallTable, net_in: i32) -> bool {
+    if net_in < 0 {
+        return false;
+    }
+    let poll = (sys.channel_poll)(net_in, 0x01 /* POLL_IN */);
+    poll > 0 && (poll & 0x01) != 0
+}
+
 unsafe fn dg_recv(
     sys: &SyscallTable,
     net_in: i32,
     scratch: *mut u8,
     scratch_max: usize,
 ) -> Option<DgEvent> {
-    if net_in < 0 {
-        return None;
-    }
-    let poll = (sys.channel_poll)(net_in, 0x01 /* POLL_IN */);
-    if poll <= 0 || (poll & 0x01) == 0 {
+    if !net_in_readable(sys, net_in) {
         return None;
     }
     let (msg_type, payload_len) = net_read_frame(sys, net_in, scratch, scratch_max);

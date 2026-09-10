@@ -167,17 +167,33 @@ unsafe fn emit_datagram(s: &mut LogNetState, payload: *const u8, payload_len: us
     }
 }
 
-/// Drain any inbound frame on net_in and discard. The IP module may
+/// Frames drained from `net_in` per step. This port is one reader of a
+/// fanned `ip.net_out`, so every frame ip hands its other consumer lands
+/// here too and the fan stalls the moment this ring is full: the drain
+/// must keep pace with the fan's own per-step budget, not with the
+/// handful of datagram events the endpoint itself expects.
+const DISCARD_PER_STEP: usize = 128;
+
+/// Drain inbound frames on net_in and discard them. The IP module may
 /// publish MSG_DG_RX_FROM for our bound endpoint — we don't act on
-/// remote control input.
+/// remote control input — and a fanned port carries the other
+/// consumer's traffic as well.
 unsafe fn discard_net_in(s: &mut LogNetState) {
     if s.net_in_chan < 0 { return; }
     let sys_ptr = s.syscalls;
     let chan = s.net_in_chan;
-    let poll = ((*sys_ptr).channel_poll)(chan, 0x01 /* POLL_IN */);
-    if poll > 0 && (poll & 0x01) != 0 {
-        let buf = s.net_buf.as_mut_ptr();
-        let _ = net_read_frame(&*sys_ptr, chan, buf, NET_BUF_SIZE);
+    let buf = s.net_buf.as_mut_ptr();
+    let mut n = 0;
+    while n < DISCARD_PER_STEP {
+        let poll = ((*sys_ptr).channel_poll)(chan, 0x01 /* POLL_IN */);
+        if poll <= 0 || (poll & 0x01) == 0 {
+            break;
+        }
+        let (msg, _) = net_read_frame(&*sys_ptr, chan, buf, NET_BUF_SIZE);
+        if msg == 0 {
+            break;
+        }
+        n += 1;
     }
 }
 
@@ -259,11 +275,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.disabled_warned = 1;
         }
         if !ready {
+            // The endpoint's own poll reads through net_in while it binds.
             return 0;
         }
 
         // ── Serving: forward the log ring over the bound endpoint ──
-        // Always drain any inbound data to keep net_in from backing up.
+        // Always drain inbound data: net_in is one reader of a fanned port,
+        // and a reader that stops draining stops the fan for every reader.
         discard_net_in(s);
 
         // If a previous chunk couldn't be sent (channel full), retry

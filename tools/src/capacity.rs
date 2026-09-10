@@ -55,7 +55,7 @@ pub fn kernel_pool_static_cap(target: &str, pool: &str) -> Option<u64> {
         "owners" => Some(if host { 64 } else { 1 }),
         // Arch-profile arenas (abi/config.rs). RP arenas come from the
         // silicon TOML — not mirrored here; kernel clamps at boot.
-        "state_arena" if host || wasm => Some(96 * 1024 * 1024),
+        "state_arena" if host || wasm => Some(256 * 1024 * 1024),
         "buffer_arena" if host || wasm => Some(8 * 1024 * 1024),
         "config_arena" if host => Some(256 * 1024),
         "config_arena" if wasm => Some(32 * 1024),

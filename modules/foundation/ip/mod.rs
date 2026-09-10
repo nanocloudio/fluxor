@@ -73,12 +73,17 @@ use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
+// SHA-256 and the chunked-handoff core, for transport-continuity records.
+include!("../../sdk/crypto/sha256.rs");
+include!("../../sdk/cores/session_handoff.rs");
 
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
 )]
 mod arp;
+/// TCP transport continuity: checkpoint codec, mirror stream, cut-over.
+pub mod continuity;
 #[allow(
     dead_code,
     reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
@@ -243,6 +248,19 @@ const _: () = assert!(HO_SRC_ENTRIES.is_power_of_two());
 /// The TCP timer window: every connection's timers advance once per
 /// window, in slices spread across it.
 const TCP_SWEEP_WINDOW_MS: u32 = 50;
+/// Most connections one step's slice of the timer sweep visits. The
+/// proportional slice normally visits a few hundred; this is the ceiling
+/// it meets after a stall, when the whole window is owed at once — a
+/// full table in one step is a multi-millisecond step on a table whose
+/// records are cache misses, and the step guard would end the module for
+/// it. The sweep lags a stall by at most `MAX_TCP_CONNS / SWEEP_SLICE_MAX`
+/// steps instead.
+const SWEEP_SLICE_MAX: usize = 1024;
+/// Handshakes held back by neighbour resolution, remembered so an ARP
+/// reply retries exactly those rather than walking the table. The timer
+/// sweep retries an unsent handshake every tick regardless, so a full
+/// list costs latency, never correctness.
+const ARP_WAIT_MAX: usize = 64;
 
 /// Wildcard local-address slot — re-exported from `tcp` so the two modules
 /// agree on the sentinel used by `TcpConn::local_slot` / `find_conn`.
@@ -349,7 +367,10 @@ const PKT_DECISION_PRE_TRANSPORT: u8 = 1;
 /// largest short frame `net_send_*` produces (MSG_RETRANSMIT /
 /// MSG_ACK at 8 bytes). MSG_DATA goes through its own per-conn
 /// backpressure path.
-const NET_OUT_FRAME_MAX: usize = 8;
+/// Largest control frame the fallback queue holds: the 3-byte header, a
+/// u16 connection id and a u32 sequence number (`MSG_RETRANSMIT`,
+/// `MSG_ACK`).
+const NET_OUT_FRAME_MAX: usize = 9;
 const NET_OUT_QUEUE_SLOTS: usize = 32;
 
 /// `TcpConn::pending_close_notify` codes — non-zero values identify
@@ -561,43 +582,99 @@ unsafe fn conn_reset(s: &mut IpState, idx: usize) {
     if half_open {
         half_open_leave(s, remote_ip);
     }
+    continuity::on_conn_released(s, idx);
     *s.tcp_conns.as_mut_ptr().add(idx) = tcp::TcpConn::new();
+    free_push(s, idx);
 }
 
-/// A free connection slot for TCP, searched from where the last search
-/// stopped so allocation is amortised constant rather than a scan from
-/// zero.
-///
-/// The first `MAX_DG_ENDPOINTS` slots are the only ones a datagram endpoint
-/// can take (its `ep_id` is a u8), so TCP prefers the slots beyond that
-/// window and falls back into it only when the rest is full — otherwise a
-/// SYN flood, or simply a busy server, would leave no endpoint bindable.
-/// On a profile whose table is no larger than the window there is no
-/// "beyond", and the search is the whole table as before.
-unsafe fn alloc_free_slot(s: &mut IpState) -> Option<usize> {
-    let lo = if MAX_DG_ENDPOINTS < tcp::MAX_TCP_CONNS {
+/// Slots examined by one rebuild slice of the free stack. A step of this
+/// module must not grow with the table (see `SWEEP_SLICE_MAX`): when the
+/// stack is empty — the table is full, or a slot was released by a path
+/// that did not push it — one slice per step rebuilds it, and an
+/// allocation that finds nothing in the slice is refused for this step.
+const ALLOC_SCAN_SLICE: usize = 256;
+
+/// The first slot TCP takes. The first `MAX_DG_ENDPOINTS` slots are the
+/// only ones a datagram endpoint can take (its `ep_id` is a u8), so TCP
+/// prefers the slots beyond that window and falls back into it only when
+/// the rest is full — otherwise a SYN flood, or simply a busy server, would
+/// leave no endpoint bindable. On a profile whose table is no larger than
+/// the window there is no "beyond".
+const fn tcp_slot_lo() -> usize {
+    if MAX_DG_ENDPOINTS < tcp::MAX_TCP_CONNS {
         MAX_DG_ENDPOINTS
     } else {
         0
-    };
+    }
+}
+
+/// Return a released TCP slot to the free stack.
+unsafe fn free_push(s: &mut IpState, idx: usize) {
+    if idx < tcp_slot_lo() || idx >= tcp::MAX_TCP_CONNS {
+        return;
+    }
+    let top = s.free_top as usize;
+    if top < tcp::MAX_TCP_CONNS {
+        *s.free_slots.as_mut_ptr().add(top) = idx as u16;
+        s.free_top = (top + 1) as u32;
+    }
+}
+
+/// Pop free slots until one is actually free. A stale entry — a slot the
+/// stack names that something else has since taken — is skipped.
+unsafe fn free_pop(s: &mut IpState) -> Option<usize> {
+    while s.free_top > 0 {
+        s.free_top -= 1;
+        let idx = *s.free_slots.as_ptr().add(s.free_top as usize) as usize;
+        if idx < tcp::MAX_TCP_CONNS && slot_is_free(&*s.tcp_conns.as_ptr().add(idx)) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// A free connection slot for TCP, in constant time: the free stack is
+/// popped, and only when it is empty does one bounded slice of the table
+/// get scanned — once per step — to rebuild it. A full table refuses
+/// every arrival at the cost of that one slice, never a walk of the table
+/// per SYN; a walk per SYN at the ceiling is a multi-millisecond step the
+/// guard would end the module for.
+unsafe fn alloc_free_slot(s: &mut IpState) -> Option<usize> {
+    if let Some(i) = free_pop(s) {
+        return Some(i);
+    }
+    if s.alloc_scan_step == s.step_count {
+        return None;
+    }
+    s.alloc_scan_step = s.step_count;
+    let lo = tcp_slot_lo();
     let span = tcp::MAX_TCP_CONNS - lo;
-    let mut n = 0;
-    let start = s.free_cursor as usize % span;
-    while n < span {
-        let i = lo + (start + n) % span;
-        if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
-            s.free_cursor = ((start + n + 1) % span) as u32;
+    if span > 0 {
+        let start = s.alloc_scan_cursor as usize % span;
+        let mut n = 0;
+        while n < ALLOC_SCAN_SLICE.min(span) {
+            let i = lo + (start + n) % span;
+            if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
+                free_push(s, i);
+            }
+            n += 1;
+        }
+        s.alloc_scan_cursor = ((start + n) % span) as u32;
+        s.alloc_scanned = s.alloc_scanned.wrapping_add(n as u32);
+        if let Some(i) = free_pop(s) {
             return Some(i);
         }
-        n += 1;
     }
+    // The datagram window, last.
     let mut i = 0;
     while i < lo {
         if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
+            s.alloc_scanned = s.alloc_scanned.wrapping_add(i as u32 + 1);
             return Some(i);
         }
         i += 1;
     }
+    s.alloc_scanned = s.alloc_scanned.wrapping_add(lo as u32);
     None
 }
 
@@ -911,8 +988,16 @@ struct IpState {
     ho_src: [index::SourceCount; HO_SRC_ENTRIES],
     /// Half-open connections whose source the table had no room to track.
     ho_src_untracked: u32,
-    /// Where the next free-slot search starts; amortises allocation.
-    free_cursor: u32,
+    /// Free TCP slots, as a stack: a release pushes, an allocation pops.
+    /// Holds only slots at or beyond the datagram window.
+    free_slots: [u16; tcp::MAX_TCP_CONNS],
+    free_top: u32,
+    /// Where the next rebuild slice starts when the stack is empty.
+    alloc_scan_cursor: u32,
+    /// The step in which the last rebuild slice ran: one slice per step.
+    alloc_scan_step: u32,
+    /// Slots examined by rebuild and window scans, for the tests.
+    alloc_scanned: u32,
     /// Timer sweep position within the current window (0 = at the start).
     sweep_cursor: u32,
     /// When the current sweep window began.
@@ -940,6 +1025,19 @@ struct IpState {
     /// Frames refused at the emission gate because their source address is
     /// fenced. A non-zero delta after a fence is the fence doing its job.
     tx_fenced: u32,
+    /// A fence whose `MSG_ADDR_FENCED` waits for the driver to report the
+    /// wire quiet: the slot, its generation, the address, whether the
+    /// staged frame was discarded, and the step-clock deadline after which
+    /// the event goes out at the ring hand-off instead. `0xFFFF` = none.
+    fence_wait_slot: u16,
+    fence_wait_discarded: u8,
+    _fw_pad: u8,
+    fence_wait_gen: u32,
+    fence_wait_deadline_ms: u32,
+    fence_wait_addr: [u8; 16],
+    /// Fences answered at the ring hand-off because the driver could not
+    /// confirm the wire in time.
+    fence_ring_handoff: u32,
 
     // Pre-transport decision seam (in[3], out[3], out[4]); -1 when unwired.
     pkt_in_chan: i32,
@@ -956,6 +1054,9 @@ struct IpState {
     pkt_held: u16,
     pkt_stats: PktSeamStats,
     pkt_hold: [HeldPacket; MAX_PACKET_HOLD],
+
+    // Transport continuity (in[4] / out[6]); ports -1 when unwired.
+    cont: continuity::Continuity,
 
     // Net protocol scratch buffer: NET_FRAME_HDR(3) + conn_id(1) + TCP payload.
     net_scratch: [u8; 1600],
@@ -988,6 +1089,12 @@ struct IpState {
     /// Both slots sit in the ordinary conn table as `Established`
     /// with empty send queues, which the timer scan ignores.
     loopback_peer: [i32; tcp::MAX_TCP_CONNS],
+
+    /// Connections whose SYN or SYN-ACK is waiting on an ARP reply.
+    arp_wait: [u32; ARP_WAIT_MAX],
+    arp_wait_len: u8,
+    _aw_pad: [u8; 3],
+    arp_wait_overflow: u32,
 
     /// Stash for a CMD_SEND tail that couldn't be drained in one tick
     /// (peer window closed mid-frame, or NIC out_chan rejected a
@@ -1431,9 +1538,20 @@ unsafe fn mint_token(s: &IpState) -> Option<[u8; 16]> {
     let sys = &*s.syscalls;
     let mut t = [0u8; 16];
     if dev_csprng_fill(sys, t.as_mut_ptr(), 16) < 0 {
+        log_info(s, b"[ip] token: no entropy");
         return None;
     }
-    let inc = dev_boot_incarnation(sys)?;
+    let Some(inc) = dev_boot_incarnation(sys) else {
+        let mut probe = [0u8; 16];
+        let rc = (sys.provider_call)(-1, abi::kernel_abi::BOOT_INCARNATION, probe.as_mut_ptr(), 16);
+        let mut line = *b"[ip] token: no boot incarnation rc=-000";
+        let e = rc.unsigned_abs();
+        line[36] = b'0' + ((e / 100) % 10) as u8;
+        line[37] = b'0' + ((e / 10) % 10) as u8;
+        line[38] = b'0' + (e % 10) as u8;
+        log_info(s, &line);
+        return None;
+    };
     let mut i = 0;
     while i < 16 {
         t[i] ^= inc[i];
@@ -1512,16 +1630,116 @@ unsafe fn addr_ctl_fence(s: &mut IpState, addr16: &[u8; 16], token: &[u8; 16]) {
             discarded = 1;
         }
     }
-    let cutoff = u64::from(s.tx_frame_count);
+    let _ = ipv4;
+    // The gate is closed. Whether the answer can say "wire" depends on
+    // the driver: ask it to drain and, while it is still draining, hold
+    // the event — bounded, so an unanswered drain still yields a truthful
+    // ring hand-off answer.
+    match driver_tx_drained(s) {
+        DrainAnswer::Drained(index) => {
+            emit_fenced(s, addr16, generation, index, netid::cutoff::WIRE, discarded);
+        }
+        DrainAnswer::Draining if s.fence_wait_slot == 0xFFFF => {
+            s.fence_wait_slot = slot as u16;
+            s.fence_wait_gen = generation;
+            s.fence_wait_discarded = discarded;
+            s.fence_wait_addr = *addr16;
+            s.fence_wait_deadline_ms = (dev_millis(&*s.syscalls) as u32)
+                .wrapping_add(FENCE_WIRE_WAIT_MS)
+                .max(1);
+        }
+        _ => {
+            let index = u64::from(s.tx_frame_count);
+            s.fence_ring_handoff = s.fence_ring_handoff.wrapping_add(1);
+            emit_fenced(
+                s,
+                addr16,
+                generation,
+                index,
+                netid::cutoff::RING_HANDOFF,
+                discarded,
+            );
+        }
+    }
+}
+
+/// How long a fence waits for the driver's drain answer before the event
+/// goes out at the ring hand-off.
+const FENCE_WIRE_WAIT_MS: u32 = 500;
+
+enum DrainAnswer {
+    /// The driver reports the wire quiet; the completed transmit count.
+    Drained(u64),
+    /// Frames are still leaving.
+    Draining,
+    /// No driver answers the query on this channel.
+    Unsupported,
+}
+
+/// Ask the frame channel's reader whether everything handed over has left
+/// the NIC (`net::identity::tx_drain`).
+unsafe fn driver_tx_drained(s: &mut IpState) -> DrainAnswer {
+    if s.out_chan < 0 {
+        return DrainAnswer::Unsupported;
+    }
+    let sys = &*s.syscalls;
+    let mut arg = [0u8; netid::tx_drain::ARG_LEN];
+    let rc = dev_channel_ioctl(
+        sys,
+        s.out_chan,
+        netid::tx_drain::IOCTL,
+        arg.as_mut_ptr(),
+        arg.len(),
+    );
+    if rc == 0 {
+        DrainAnswer::Drained(u64::from(u32::from_le_bytes(arg)))
+    } else if rc == abi::kernel_abi::errno::EAGAIN {
+        DrainAnswer::Draining
+    } else {
+        DrainAnswer::Unsupported
+    }
+}
+
+unsafe fn emit_fenced(
+    s: &mut IpState,
+    addr16: &[u8; 16],
+    generation: u32,
+    index: u64,
+    cutoff: u8,
+    discarded: u8,
+) {
     log_info(s, b"[ip] addr fenced");
     let mut p = [0u8; 30];
     p[..16].copy_from_slice(addr16);
     p[16..20].copy_from_slice(&generation.to_le_bytes());
-    p[20..28].copy_from_slice(&cutoff.to_le_bytes());
-    p[28] = netid::cutoff::RING_HANDOFF;
+    p[20..28].copy_from_slice(&index.to_le_bytes());
+    p[28] = cutoff;
     p[29] = discarded;
     addr_evt(s, netid::MSG_ADDR_FENCED, &p);
-    let _ = ipv4;
+}
+
+/// A fence waiting for the wire: answered when the driver reports it
+/// quiet, or at the ring hand-off once the wait is exhausted.
+unsafe fn step_fence_wait(s: &mut IpState) {
+    if s.fence_wait_slot == 0xFFFF {
+        return;
+    }
+    let now = dev_millis(&*s.syscalls) as u32;
+    let expired = now.wrapping_sub(s.fence_wait_deadline_ms) < 0x8000_0000;
+    let answer = driver_tx_drained(s);
+    let (index, cutoff) = match answer {
+        DrainAnswer::Drained(i) => (i, netid::cutoff::WIRE),
+        DrainAnswer::Draining if !expired => return,
+        _ => {
+            s.fence_ring_handoff = s.fence_ring_handoff.wrapping_add(1);
+            (u64::from(s.tx_frame_count), netid::cutoff::RING_HANDOFF)
+        }
+    };
+    let addr = s.fence_wait_addr;
+    let generation = s.fence_wait_gen;
+    let discarded = s.fence_wait_discarded;
+    s.fence_wait_slot = 0xFFFF;
+    emit_fenced(s, &addr, generation, index, cutoff, discarded);
 }
 
 /// Broadcast a gratuitous ARP (L2-broadcast ARP reply) claiming `addr` for our
@@ -2060,7 +2278,8 @@ unsafe fn update_rcv_wnd(s: &mut IpState, conn_idx: usize) {
     }
     let in_flight = conn.delivered_bytes.wrapping_sub(conn.consumed_bytes);
     let avail = (tcp::MAX_RCV_WND as u32).saturating_sub(in_flight) as u16;
-    conn.rcv_wnd = core::cmp::min(avail, tcp::MAX_RCV_WND);
+    let wnd = core::cmp::min(avail, tcp::MAX_RCV_WND);
+    conn.rcv_wnd = continuity::rcv_wnd_exposed(s, conn_idx, wnd);
 }
 
 /// Unchecked TCP conn access (avoids bounds check panic in PIC).
@@ -2575,6 +2794,8 @@ pub unsafe extern "C" fn module_new(
             s.loopback_peer[li] = -1;
             li += 1;
         }
+        s.arp_wait_len = 0;
+        s.arp_wait_overflow = 0;
 
         // Initialize ARP table
         let mut i = 0;
@@ -2636,7 +2857,20 @@ pub unsafe extern "C" fn module_new(
             i += 1;
         }
         s.ho_src_untracked = 0;
-        s.free_cursor = 0;
+        s.free_top = 0;
+        s.alloc_scan_cursor = 0;
+        s.alloc_scan_step = u32::MAX;
+        s.alloc_scanned = 0;
+        {
+            // Pushed high to low so allocation hands out the lowest slot
+            // first.
+            let lo = tcp_slot_lo();
+            let mut i = tcp::MAX_TCP_CONNS;
+            while i > lo {
+                i -= 1;
+                free_push(s, i);
+            }
+        }
         s.sweep_cursor = 0;
         s.sweep_window_ms = dev_millis(&*s.syscalls) as u32;
         s.chal_epoch = 0;
@@ -2661,9 +2895,17 @@ pub unsafe extern "C" fn module_new(
         s.addr_evt_chan = dev_channel_port(sys, 1, ADDR_EVT_PORT); // out[5]: emission events (optional)
         s.addr_generation = 0;
         s.tx_fenced = 0;
+        s.fence_wait_slot = 0xFFFF;
+        s.fence_wait_discarded = 0;
+        s.fence_wait_gen = 0;
+        s.fence_wait_deadline_ms = 0;
+        s.fence_wait_addr = [0; 16];
+        s.fence_ring_handoff = 0;
         s.pkt_in_chan = dev_channel_port(sys, 0, PACKET_IN_PORT); // in[3]: dispositions (optional)
         s.pkt_out_chan = dev_channel_port(sys, 1, PACKET_OUT_PORT); // out[3]: decision records
         s.pkt_fwd_chan = dev_channel_port(sys, 1, PACKET_FWD_PORT); // out[4]: forwarded frames
+        continuity::init(s); // in[4] / out[6]: transport continuity (optional)
+        let sys = &*s.syscalls;
 
         // Decision seam starts empty; generation 1 so a zero `pkt_id` never
         // names a live hold.
@@ -2897,6 +3139,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // consumer command that binds/sends on it. No-op when the port is unwired.
     // channel_poll verified working from PIC on aarch64 after u8→u32 widening
     service_addr_ctl(s);
+    continuity::service(s);
     service_net_channels(s);
 
     // 4. Periodic ARP maintenance
@@ -2907,6 +3150,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // 5. TCP timers — wallclock-driven so the 50 ms-tick thresholds
     // hold across schedulers with different `tick_us`.
     step_tcp_timers(s);
+    continuity::step(s);
+    step_fence_wait(s);
 
     // Tally idle steps and emit the periodic `[ip] tlm …` line.
     // "Idle" excludes back-pressure steps (so idle + bp + active = dt)
@@ -3268,25 +3513,57 @@ unsafe fn process_arp(s: &mut IpState, data: *const u8, len: usize) {
 /// marker: `send_tcp_control` credits the sequence byte only once the frame
 /// is queued, so a connection still sitting at its ISS never reached the wire.
 unsafe fn retry_unsent_handshake(s: &mut IpState, resolved_ip: u32) {
-    let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
-        let conn = &*s.tcp_conns.as_ptr().add(i);
-        let state = conn.state;
-        let unsent = conn.snd_nxt == conn.iss;
-        let hop = next_hop(s, conn.remote_ip);
-        if unsent && hop == Some(resolved_ip) {
-            match state {
-                tcp::TcpState::SynReceived => {
-                    send_tcp_control(s, i, tcp::SYN | tcp::ACK, true);
-                }
-                tcp::TcpState::SynSent => {
-                    send_tcp_control(s, i, tcp::SYN, true);
-                }
-                _ => {}
+    // Walk the waiting list once; an entry that is no longer waiting on
+    // a neighbour — sent, or past its handshake — leaves the list, and one
+    // waiting on a different neighbour stays.
+    let n = s.arp_wait_len as usize;
+    let mut kept = 0usize;
+    let mut k = 0;
+    while k < n {
+        let i = s.arp_wait[k] as usize;
+        let (state, unsent, remote_ip) = {
+            let conn = &*s.tcp_conns.as_ptr().add(i);
+            (conn.state, conn.snd_nxt == conn.iss, conn.remote_ip)
+        };
+        let waiting = unsent
+            && matches!(state, tcp::TcpState::SynReceived | tcp::TcpState::SynSent);
+        if !waiting {
+            k += 1;
+            continue;
+        }
+        if next_hop(s, remote_ip) == Some(resolved_ip) {
+            let sent = match state {
+                tcp::TcpState::SynReceived => send_tcp_control(s, i, tcp::SYN | tcp::ACK, true),
+                _ => send_tcp_control(s, i, tcp::SYN, true),
+            };
+            if sent {
+                k += 1;
+                continue;
             }
         }
-        i += 1;
+        s.arp_wait[kept] = i as u32;
+        kept += 1;
+        k += 1;
     }
+    s.arp_wait_len = kept as u8;
+}
+
+/// Remember that connection `idx`'s handshake is waiting on a neighbour.
+unsafe fn arp_wait_push(s: &mut IpState, idx: usize) {
+    let n = s.arp_wait_len as usize;
+    let mut k = 0;
+    while k < n {
+        if s.arp_wait[k] as usize == idx {
+            return;
+        }
+        k += 1;
+    }
+    if n >= ARP_WAIT_MAX {
+        s.arp_wait_overflow = s.arp_wait_overflow.wrapping_add(1);
+        return;
+    }
+    s.arp_wait[n] = idx as u32;
+    s.arp_wait_len = (n + 1) as u8;
 }
 
 /// Process an IPv4 packet.
@@ -3347,14 +3624,34 @@ unsafe fn process_ipv4(s: &mut IpState, data: *const u8, len: usize) {
 
     // The decision seam sits exactly here: after the packet is known to be
     // whole, checksummed at L3 and addressed to us, and before any
-    // transport state can be created for it. ICMP stays local — it is
-    // this stack's own control traffic, not a flow anyone directs.
-    if s.pkt_decision == PKT_DECISION_PRE_TRANSPORT && ip_hdr.protocol != ipv4::PROTO_ICMP {
+    // transport state can be created for it. The stack's own control
+    // traffic stays local — ICMP, and the DHCP replies that give the stack
+    // its address. Neither is a flow anyone directs, and a director that
+    // could hold the lease exchange would decide whether the host exists on
+    // the network at all.
+    if s.pkt_decision == PKT_DECISION_PRE_TRANSPORT
+        && !stack_own_traffic(&ip_hdr, proto_data, proto_len)
+    {
         seam_intake(s, &ip_hdr, proto_data, proto_len, local_slot);
         return;
     }
 
     dispatch_l4(s, &ip_hdr, proto_data, proto_len, local_slot, reply_src);
+}
+
+/// Traffic the stack answers for itself, never described to a director:
+/// ICMP, and DHCP server-to-client datagrams (the lease exchange).
+unsafe fn stack_own_traffic(ip_hdr: &ipv4::Ipv4Header, proto_data: *const u8, proto_len: usize) -> bool {
+    match ip_hdr.protocol {
+        ipv4::PROTO_ICMP => true,
+        ipv4::PROTO_UDP => match udp::parse_udp(proto_data, proto_len) {
+            Some(h) => {
+                h.src_port == dhcp::DHCP_SERVER_PORT && h.dst_port == dhcp::DHCP_CLIENT_PORT
+            }
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// Hand a validated IPv4 packet to its transport.
@@ -4189,10 +4486,8 @@ unsafe fn process_tcp_segment(
                         // No free slot — drop the SYN silently and let
                         // the client retransmit.
                         s.tcp_half_open_refused = s.tcp_half_open_refused.wrapping_add(1);
-                        log_info(s, b"[ip] tcp syn DROP no_slot");
                         return;
                     }
-                    log_info(s, b"[ip] tcp syn received");
                     let idx = accept_idx as usize;
                     let listener_port = (*s.tcp_conns.as_ptr().add(li)).local_port;
                     let iss = compute_iss(
@@ -4252,6 +4547,12 @@ unsafe fn process_tcp_segment(
             }
         }
     };
+
+    let (state_before, rcv_before) = {
+        let c = &*s.tcp_conns.as_ptr().add(conn_idx);
+        (c.state, c.rcv_nxt)
+    };
+    let mut acked_new = false;
 
     // One admissibility decision, ahead of every state branch.
     let ack_usable = match admit_tcp_segment(s, conn_idx, &tcp_hdr) {
@@ -4340,6 +4641,7 @@ unsafe fn process_tcp_segment(
                         }
                         if conn.snd_una != prev_una {
                             // New data acknowledged.
+                            acked_new = true;
                             tcp::on_new_ack(conn);
                             tcp::rtt_ack(conn, tcp_hdr.ack_num, s.step_count as u16);
                         } else if tcp_hdr.ack_num == prev_una && tcp_hdr.payload_len == 0 {
@@ -4494,7 +4796,6 @@ unsafe fn process_tcp_segment(
                         conn.state = tcp::TcpState::Established;
                         conn.retransmit_timer = 0;
                         action = ACTION_COMPLETE_ACCEPT;
-                        log_info(s, b"[ip] tcp established");
                         // Handle piggybacked data (ACK + request in same segment)
                         if tcp_hdr.payload_len > 0 && tcp_hdr.seq_num == conn.rcv_nxt {
                             rx_payload_offset = tcp_hdr.payload_offset;
@@ -4573,6 +4874,7 @@ unsafe fn process_tcp_segment(
                 let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
                 conn.rcv_wnd = 0;
                 send_tcp_control(s, conn_idx, tcp::ACK, false);
+                continuity::after_segment(s, conn_idx, state_before, rcv_before, acked_new);
                 return;
             }
             {
@@ -4663,6 +4965,11 @@ unsafe fn process_tcp_segment(
         let payload = data.add(reorder_offset);
         let conn = &mut *s.tcp_conns.as_mut_ptr().add(conn_idx);
         tcp::reorder_insert(conn, reorder_seq, payload, reorder_len);
+    }
+
+    // A mirrored flow reports what this segment changed.
+    if (*s.tcp_conns.as_ptr().add(conn_idx)).is_active() {
+        continuity::after_segment(s, conn_idx, state_before, rcv_before, acked_new);
     }
 
     // Fast retransmit — signal the consumer to resend from `snd_una`.
@@ -5129,8 +5436,11 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
     let remote_ip = conn.remote_ip;
     let local_port = conn.local_port;
     let remote_port = conn.remote_port;
-    let rcv_nxt = conn.rcv_nxt;
-    let rcv_wnd = conn.rcv_wnd;
+    // What the peer is shown: under a strict mirror the acknowledgement
+    // stops at the confirmed horizon, and a quiescing flow advertises a
+    // closed window.
+    let rcv_nxt = continuity::ack_exposed(s, conn_idx, conn.rcv_nxt);
+    let rcv_wnd = continuity::rcv_wnd_exposed(s, conn_idx, conn.rcv_wnd);
     // Source from the conn's bound local address. Slot 0 / unbound →
     // `local_ip`, so a single-address configuration is unaffected.
     let local_src = local_ip_for_slot(s, conn.local_slot);
@@ -5146,6 +5456,9 @@ unsafe fn send_tcp_control(s: &mut IpState, conn_idx: usize, flags: u8, retransm
         Some(m) => m,
         None => {
             log_info(s, b"[ip] tcp ctrl: arp pending");
+            if (flags & tcp::SYN) != 0 {
+                arp_wait_push(s, conn_idx);
+            }
             return false;
         }
     };
@@ -5230,7 +5543,9 @@ unsafe fn send_tcp_data(
     let remote_port = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).remote_port;
     let snd_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).snd_nxt;
     let rcv_nxt = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_nxt;
+    let rcv_nxt = continuity::ack_exposed(s, conn_idx, rcv_nxt);
     let rcv_wnd = (*s.tcp_conns.as_mut_ptr().add(conn_idx)).rcv_wnd;
+    let rcv_wnd = continuity::rcv_wnd_exposed(s, conn_idx, rcv_wnd);
     let local_slot = (*s.tcp_conns.as_ptr().add(conn_idx)).local_slot;
     let local_src = local_ip_for_slot(s, local_slot);
 
@@ -5812,35 +6127,19 @@ fn state_allows_send(state: tcp::TcpState) -> bool {
 /// is full — a consumer cannot tell the fastpath from a real connect.
 unsafe fn connect_loopback(s: &mut IpState, port: u16, requester_tag: u8) {
     // A listener must exist BEFORE the pair is allocated.
-    let mut listener = false;
-    let mut li = 0;
-    while li < tcp::MAX_TCP_CONNS {
-        let conn = &*s.tcp_conns.as_ptr().add(li);
-        if conn.state == tcp::TcpState::Listen && !conn.is_datagram && conn.local_port == port {
-            listener = true;
-            break;
-        }
-        li += 1;
-    }
-    if !listener {
+    if find_listener_indexed(s, port, tcp::LOCAL_SLOT_ANY, false).is_none() {
         let _ = net_send_error(s, 0, -111, requester_tag); // ECONNREFUSED
         return;
     }
 
     // Two free slots: the connector's and the accepted side's.
-    let mut ci: i32 = -1;
-    let mut si: i32 = -1;
-    let mut i = 0;
-    while i < tcp::MAX_TCP_CONNS {
-        if slot_is_free(&*s.tcp_conns.as_ptr().add(i)) {
-            if ci < 0 {
-                ci = i as i32;
-            } else {
-                si = i as i32;
-                break;
-            }
+    let ci: i32 = alloc_free_slot(s).map(|i| i as i32).unwrap_or(-1);
+    let mut si: i32 = alloc_free_slot(s).map(|i| i as i32).unwrap_or(-1);
+    if si == ci {
+        si = alloc_free_slot(s).map(|i| i as i32).unwrap_or(-1);
+        if si == ci {
+            si = -1;
         }
-        i += 1;
     }
     if ci < 0 || si < 0 {
         let _ = net_send_error(s, 0, -12, requester_tag); // ENOMEM
@@ -5937,17 +6236,27 @@ unsafe fn process_cmd_close(s: &mut IpState, conn_id: usize) -> bool {
     let conn_state = (*s.tcp_conns.as_ptr().add(conn_id)).state;
     match conn_state {
         tcp::TcpState::Established => {
-            if !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false) {
+            let seq = (*s.tcp_conns.as_ptr().add(conn_id)).snd_nxt;
+            if !continuity::fin_gate(s, conn_id)
+                || !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false)
+            {
                 return false;
             }
             (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::FinWait1;
+            continuity::on_sent(s, conn_id, seq, 0, true);
+            continuity::on_state(s, conn_id);
             true
         }
         tcp::TcpState::CloseWait => {
-            if !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false) {
+            let seq = (*s.tcp_conns.as_ptr().add(conn_id)).snd_nxt;
+            if !continuity::fin_gate(s, conn_id)
+                || !send_tcp_control(s, conn_id, tcp::FIN | tcp::ACK, false)
+            {
                 return false;
             }
             (*s.tcp_conns.as_mut_ptr().add(conn_id)).state = tcp::TcpState::LastAck;
+            continuity::on_sent(s, conn_id, seq, 0, true);
+            continuity::on_state(s, conn_id);
             true
         }
         tcp::TcpState::Listen => {
@@ -6032,12 +6341,17 @@ unsafe fn try_send_cmd_payload(
         }
         let seq = conn.snd_nxt;
         let tick = s.step_count as u16;
+        // A strict mirror sees the allocation before the wire does.
+        if !continuity::send_gate(s, conn_id, seq, chunk as u16) {
+            return data_off;
+        }
         let ok = send_tcp_data(s, conn_id, payload.add(data_off), chunk);
         if !ok {
             // NIC out_chan full or ARP miss. snd_nxt was NOT advanced —
             // stash the unsent tail and retry next tick.
             return data_off;
         }
+        continuity::on_sent(s, conn_id, seq, chunk as u16, false);
         let conn2 = &mut *s.tcp_conns.as_mut_ptr().add(conn_id);
         tcp::rtt_arm(conn2, seq, tick);
         data_off += chunk;
@@ -6726,6 +7040,7 @@ unsafe fn step_tcp_timers(s: &mut IpState) {
     if target <= start {
         return;
     }
+    let target = target.min(start + SWEEP_SLICE_MAX);
     if start == 0 {
         // Once per window: the challenge-ACK refill clock. Refilling to a
         // fixed ceiling rather than accumulating tokens keeps the burst
@@ -6789,7 +7104,7 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
             let conn = &mut *s.tcp_conns.as_mut_ptr().add(i);
             let kind = conn.pending_close_notify;
             let tag = conn.connect_tag;
-            if kind != NOTIFY_NONE {
+            if kind != NOTIFY_NONE && kind != continuity::NOTIFY_SHADOW_RESERVED {
                 let delivered = match kind {
                     NOTIFY_CLOSED => net_send_closed(s, i as u16),
                     NOTIFY_ERROR_REFUSED => net_send_error(s, i as u16, -111i8, tag),
@@ -7269,6 +7584,148 @@ pub mod test_helpers {
         pub owner_tag: u16,
     }
 
+    /// Handshakes waiting on a neighbour: (listed, overflowed).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn arp_wait(state: *const u8) -> (usize, u32) {
+        let s = &*(state as *const IpState);
+        (s.arp_wait_len as usize, s.arp_wait_overflow)
+    }
+
+    /// Continuity counters.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn cont_stats(state: *const u8) -> super::continuity::ContStats {
+        (*(state as *const IpState)).cont.stats
+    }
+
+    /// The flow identity of connection `idx`, as a coordinator names it.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn flow_id(state: *const u8, idx: usize) -> [u8; 16] {
+        super::continuity::flow_id_of(&*(state as *const IpState), idx)
+    }
+
+    /// The checkpoint layout digest `PAIR_PREPARE` must carry.
+    pub fn codec_digest() -> [u8; 32] {
+        super::continuity::codec_digest()
+    }
+
+    /// Phase of shadow `i` (0 = empty).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn shadow_phase(state: *const u8, i: usize) -> u8 {
+        let s = &*(state as *const IpState);
+        if s.cont.shadows[i].in_use == 0 {
+            0
+        } else {
+            s.cont.shadows[i].phase
+        }
+    }
+
+    /// Mirror `i`: (in_use, live, profile, delta_no, recv_horizon).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn mirror_view(state: *const u8, i: usize) -> (bool, bool, u8, u32, u32) {
+        let m = &(*(state as *const IpState)).cont.mirrors[i];
+        (
+            m.in_use != 0,
+            m.live != 0,
+            m.profile,
+            m.delta_no,
+            m.recv_horizon,
+        )
+    }
+
+    /// `TcpState` discriminants a test compares `ConnView::state` against.
+    pub const STATE_ESTABLISHED: u8 = tcp::TcpState::Established as u8;
+    pub const STATE_FIN_WAIT1: u8 = tcp::TcpState::FinWait1 as u8;
+
+    /// The congestion window a takeover restarts at.
+    pub fn initial_cwnd() -> u16 {
+        tcp::INITIAL_CWND
+    }
+
+    /// Force congestion state on `idx`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn set_congestion(
+        state: *mut u8,
+        idx: usize,
+        cwnd: u16,
+        ssthresh: u16,
+        in_recovery: bool,
+    ) {
+        let c = &mut (*(state as *mut IpState)).tcp_conns[idx];
+        c.cwnd = cwnd;
+        c.ssthresh = ssthresh;
+        c.in_recovery = in_recovery;
+    }
+
+    /// Force the retransmit timer of `idx`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn set_retransmit_timer(state: *mut u8, idx: usize, ticks: u16) {
+        (*(state as *mut IpState)).tcp_conns[idx].retransmit_timer = ticks;
+    }
+
+    /// The decoded connection held by shadow `i`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn shadow_conn_view(state: *const u8, i: usize) -> ConnView {
+        let c = &(*(state as *const IpState)).cont.shadows[i].conn;
+        ConnView {
+            state: c.state as u8,
+            local_port: c.local_port,
+            remote_port: c.remote_port,
+            snd_una: c.snd_una,
+            snd_nxt: c.snd_nxt,
+            snd_wnd: c.snd_wnd,
+            snd_wl1: c.snd_wl1,
+            snd_wl2: c.snd_wl2,
+            rcv_nxt: c.rcv_nxt,
+            rcv_wnd: c.rcv_wnd,
+            dup_ack_count: c.dup_ack_count,
+            chal_budget: c.chal_budget,
+            is_datagram: c.is_datagram,
+            local_slot: c.local_slot,
+            owner_tag: c.owner_tag,
+        }
+    }
+
+    /// Connection slots reserved for shadows.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn reserved_slots(state: *const u8) -> usize {
+        let s = &*(state as *const IpState);
+        s.tcp_conns
+            .iter()
+            .filter(|c| {
+                c.state == tcp::TcpState::Closed
+                    && c.pending_close_notify == super::continuity::NOTIFY_SHADOW_RESERVED
+            })
+            .count()
+    }
+
+    /// Congestion and timer fields of connection `idx`:
+    /// (cwnd, ssthresh, in_recovery, retransmit_timer, rto).
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `IpState`.
+    pub unsafe fn conn_timers(state: *const u8, idx: usize) -> (u16, u16, bool, u16, u16) {
+        let c = &(*(state as *const IpState)).tcp_conns[idx];
+        (c.cwnd, c.ssthresh, c.in_recovery, c.retransmit_timer, c.rto)
+    }
+
     /// Read one connection slot.
     ///
     /// # Safety
@@ -7481,6 +7938,16 @@ pub mod test_helpers {
     /// # Safety
     /// `state` must point to an initialised `IpState`. The borrow lives
     /// only for the call; tests run single-threaded so no aliasing.
+    /// Free slots the allocator's stack currently names.
+    pub unsafe fn free_stack_len(state: *const u8) -> usize {
+        (*(state as *const IpState)).free_top as usize
+    }
+
+    /// Slots examined by the allocator's rebuild and window scans so far.
+    pub unsafe fn alloc_scanned(state: *const u8) -> u32 {
+        (*(state as *const IpState)).alloc_scanned
+    }
+
     pub unsafe fn conn_count(state: *const u8) -> (usize, usize) {
         let s = &*(state as *const IpState);
         let mut used = 0;

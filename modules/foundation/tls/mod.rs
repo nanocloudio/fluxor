@@ -6,6 +6,13 @@
 //!
 //! Cipher suites: TLS_CHACHA20_POLY1305_SHA256 (preferred),
 //!                TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384
+//!
+//! Ports: `cipher_in` in[0], `clear_in` in[1], `cont_in` in[2];
+//! `cipher_out` out[0], `clear_out` out[1], `peer_identity` out[2],
+//! `cont_out` out[3]. `cont_in` / `cont_out` carry the transport
+//! continuity surface (checkpoint, mirror, cut-over of an established
+//! session; `continuity.rs`) and are optional — unwired, the record path
+//! is unchanged.
 
 // `no_std` / `no_main` are stripped under EITHER the host-test
 // feature (the explicit "build me as a host rlib" knob) OR
@@ -69,6 +76,10 @@ include!("handshake_driver.rs");
 include!("handshake_pump.rs");
 include!("dtls_record.rs");
 include!("dtls_state.rs");
+// Checkpoint chunking and CRC32, shared with the session-handoff surface.
+include!("../../sdk/cores/session_handoff.rs");
+// Transport continuity: CT_TLS codec, shadow lifecycle, emission horizons.
+include!("continuity.rs");
 
 // ============================================================================
 // Module constants
@@ -391,6 +402,13 @@ struct TlsSession {
     retx_base_seq: u32,
     retx_seq_anchored: bool,
 
+    /// Traffic epochs: key updates applied per direction since the
+    /// application keys were installed.
+    read_epoch: u32,
+    write_epoch: u32,
+    /// Transport-continuity state for this connection (continuity.rs).
+    cont: SessionContinuity,
+
     /// Compatibility ChangeCipherSpec records consumed from this
     /// peer, capped at `MAX_COMPAT_CCS`.
     ccs_seen: u8,
@@ -462,6 +480,9 @@ impl TlsSession {
             retx_len: 0,
             retx_base_seq: 0,
             retx_seq_anchored: false,
+            read_epoch: 0,
+            write_epoch: 0,
+            cont: SessionContinuity::empty(),
             ccs_seen: 0,
             pending_ccs: false,
             pending_ccs_client: false,
@@ -499,6 +520,9 @@ impl TlsSession {
         self.retx_len = 0;
         self.retx_base_seq = 0;
         self.retx_seq_anchored = false;
+        self.read_epoch = 0;
+        self.write_epoch = 0;
+        self.cont.reset();
         self.ccs_seen = 0;
         self.pending_ccs = false;
         self.pending_ccs_client = false;
@@ -663,6 +687,21 @@ struct TlsState {
     /// consumer needs it; -1 when the port is unwired makes the
     /// emit a no-op. Channel slot: out[2].
     peer_identity: i32,
+    /// Transport-continuity control ports, in[2] / out[3]; -1 when
+    /// unwired, which makes the whole surface a no-op.
+    cont_in: i32,
+    cont_out: i32,
+    /// Vault handle of the `tls-continuity` sealing key; -1 until opened.
+    cont_vault_handle: i32,
+    /// Standby shadows a checkpoint imports into (continuity.rs).
+    shadows: [TlsShadow; MAX_TLS_SHADOWS],
+    /// Frame assembly for everything the continuity surface emits.
+    cont_scratch: [u8; CONT_SCRATCH_SIZE],
+    /// The command being handled. Separate from the assembly scratch: a
+    /// handler reads its command while it emits frames.
+    cont_inbox: [u8; CONT_SCRATCH_SIZE],
+    /// One checkpoint record under construction at CUT_EXPORT.
+    cont_record: [u8; TLS_CKPT_RECORD_MAX],
 
     // Pre-computed ephemeral ECDH key pairs (one per session, computed in module_new)
     eph_private: [[u8; 32]; MAX_SESSIONS],
@@ -1108,6 +1147,14 @@ pub unsafe extern "C" fn module_new(
     s.cipher_out = dev_channel_port(sys, 1, 0);
     s.clear_out = dev_channel_port(sys, 1, 1);
     s.peer_identity = dev_channel_port(sys, 1, 2);
+    s.cont_in = dev_channel_port(sys, 0, 2);
+    s.cont_out = dev_channel_port(sys, 1, 3);
+    s.cont_vault_handle = -1;
+    let mut i = 0;
+    while i < MAX_TLS_SHADOWS {
+        s.shadows[i] = TlsShadow::empty();
+        i += 1;
+    }
 
     // Initialize the inline session chunk; elastic chunks are
     // slot-initialised by `SessionArena::grow` at grant time.
@@ -1368,6 +1415,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // of the ~900 µs synchronous keygen once the initial pool is drained.
     pump_ecdh_refill(s);
 
+    // Transport continuity: acknowledgements are taken first, so a
+    // horizon the standby confirms is crossed in this same step.
+    if continuity_step(s) {
+        did_work = true;
+    }
+
     // `[tls] hb` heartbeat. 5000 steps to genuinely match `[ip] tlm` /
     // `[http] tlm` — the comment here claimed parity while the constant was
     // 50_000, i.e. a 5 s window against their 0.5 s one at `tick_us: 100`.
@@ -1620,8 +1673,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let t1 = if diag_on { dev_micros(sys) } else { 0 };
 
     // ── Phase 2: Read from cipher_in (downstream: IP → TLS) ──
+    //
+    // Frozen while a mirrored transition awaits the standby: the record
+    // it covers stays where it is and the producer, not a queue, absorbs
+    // the wait (continuity.rs).
+    let cipher_in_frozen = continuity_gate_cipher_in(s);
     let mut ci_drained = 0u32;
-    while ci_drained < TLS_INBOUND_DRAIN_BUDGET {
+    while !cipher_in_frozen && ci_drained < TLS_INBOUND_DRAIN_BUDGET {
         let poll_ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
         if poll_ci <= 0 || (poll_ci as u32 & POLL_IN) == 0 {
             break;
@@ -1867,6 +1925,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     #[expect(clippy::cast_sign_loss, reason = "guarded > 0 above")]
                                     let n = got as usize;
                                     s.sessions[idx].recv_len += n;
+                                    continuity_after_recv_append(s, idx);
                                 }
                             }
                             if data_len > to_read {
@@ -1897,6 +1956,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     );
                                     s.sessions[idx].recv_len += to_read;
                                     remaining -= to_read;
+                                    continuity_after_recv_append(s, idx);
                                 }
                                 // Drain every complete record currently
                                 // buffered (one per call).
@@ -2061,6 +2121,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let si = find_session_by_conn_id(s, conn_id);
                     if si >= 0 {
                         retx_ack(&mut s.sessions[si as usize], acked_seq);
+                        continuity_after_retx_ack(s, si as usize, acked_seq);
                     }
                 }
             }
@@ -2132,8 +2193,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let t2 = if diag_on { dev_micros(sys) } else { 0 };
 
     // ── Phase 3: Read from clear_in (upstream: HTTP → TLS) ──
+    let clear_in_frozen = continuity_gate_clear_in(s);
     let mut cl_drained = 0u32;
-    while cl_drained < TLS_INBOUND_DRAIN_BUDGET {
+    while !clear_in_frozen && cl_drained < TLS_INBOUND_DRAIN_BUDGET {
         let poll_cl = (sys.channel_poll)(s.clear_in, POLL_IN);
         if poll_cl <= 0 || (poll_cl as u32 & POLL_IN) == 0 {
             break;
@@ -2232,28 +2294,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // The AEAD seq has already advanced;
                                 // dropping this record would desync
                                 // the peer permanently. Fail the
-                                // session loudly instead.
-                                let sent = tls_write_frame(
-                                    sys,
-                                    s.cipher_out,
-                                    NET_CMD_SEND,
-                                    conn_id,
-                                    rec.as_ptr(),
-                                    total as u16,
-                                    &mut s.net_scratch,
-                                );
-                                if sent {
-                                    // Encrypted application records —
-                                    // the response path, and the bulk of
-                                    // cipher_out under keepalive load.
-                                    s.tlm.bytes_out =
-                                        s.tlm.bytes_out.wrapping_add(4 + total as u32);
-                                }
-                                if !sent {
+                                // session loudly instead. Under a
+                                // mirrored strict profile the record
+                                // is held for its send horizon and
+                                // written when the standby confirms.
+                                if emit_record(s, idx, rec.as_ptr(), total) == EmitOutcome::Failed {
                                     let msg: &[u8] =
                                         b"[tls] cipher_out full mid-record; session->Error";
                                     dev_log(sys, 3, msg.as_ptr(), msg.len());
-                                    s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
                                     s.sessions[idx].state = SessionState::Error;
                                     s.last_err_site = 3;
                                     if remaining > rd {
@@ -2265,7 +2313,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     }
                                     break;
                                 }
-                                retx_push(&mut s.sessions[idx], rec.as_ptr(), total as u16);
                                 remaining -= rd;
                             }
                         } else {
@@ -2300,6 +2347,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if si >= 0 {
                     let idx = si as usize;
                     if s.sessions[idx].state == SessionState::Ready {
+                        // A closing session ends its pair first: a strict
+                        // horizon would otherwise hold the alert, and the
+                        // reset below would then wipe it unsent.
+                        // A mirrored session reaching close has already
+                        // cleared its horizon: the close command only got
+                        // here because the inputs were ungated, which for a
+                        // held session happens when its mirror is abandoned
+                        // and the hold flushed. So the alert is emittable.
+                        if s.sessions[idx].cont.mirror {
+                            mirror_abandon(s, idx);
+                        }
                         send_alert(s, idx, ALERT_CLOSE_NOTIFY);
                     }
                     s.free_cmd_close = s.free_cmd_close.wrapping_add(1);
@@ -4821,8 +4879,10 @@ unsafe fn rotate_traffic_keys(sess: &mut TlsSession, inbound: bool) -> bool {
     let fresh = TrafficKeys::from_secret(suite, &secret[..hl]);
     if inbound {
         sess.read_keys = fresh;
+        sess.read_epoch = sess.read_epoch.wrapping_add(1);
     } else {
         sess.write_keys = fresh;
+        sess.write_epoch = sess.write_epoch.wrapping_add(1);
     }
     true
 }
@@ -4853,18 +4913,18 @@ unsafe fn send_key_update(s: &mut TlsState, idx: usize, request_update: u8) -> b
     rec[3] = (enc_len >> 8) as u8;
     rec[4] = enc_len as u8;
     let total = 5 + enc_len;
-    let cipher_chan = s.cipher_out;
-    if !tls_write_or_count(
-        s,
-        cipher_chan,
-        NET_CMD_SEND,
-        conn_id,
-        rec.as_ptr(),
-        total as u16,
-    ) {
+    let _ = conn_id;
+    if emit_record(s, idx, rec.as_ptr(), total) == EmitOutcome::Failed {
         return false;
     }
-    rotate_traffic_keys(&mut s.sessions[idx], false)
+    // The retired epoch's keys outlive the rotation until the barrier
+    // covering their last record is acknowledged.
+    retain_retired_write_keys(&mut s.sessions[idx]);
+    if !rotate_traffic_keys(&mut s.sessions[idx], false) {
+        return false;
+    }
+    continuity_after_key_rotation(s, idx, false);
+    true
 }
 
 /// Consume post-handshake handshake messages queued in the driver's
@@ -4909,6 +4969,7 @@ unsafe fn drive_post_handshake(s: &mut TlsState, idx: usize) {
                     s.last_err_site = 39;
                     return;
                 }
+                continuity_after_key_rotation(s, idx, true);
                 if request == KEY_UPDATE_REQUESTED
                     && !send_key_update(s, idx, KEY_UPDATE_NOT_REQUESTED)
                 {
@@ -4970,15 +5031,8 @@ unsafe fn send_alert(s: &mut TlsState, idx: usize, description: u8) {
 
     let total = 5 + enc_len;
     // Alerts are advisory (RFC 8446 §6) — best-effort is fine.
-    let cipher_chan = s.cipher_out;
-    let _ = tls_write_or_count(
-        s,
-        cipher_chan,
-        NET_CMD_SEND,
-        conn_id,
-        rec.as_ptr(),
-        total as u16,
-    );
+    let _ = conn_id;
+    let _ = emit_record(s, idx, rec.as_ptr(), total);
 }
 
 // ============================================================================
@@ -5073,40 +5127,21 @@ unsafe fn tls_write_or_count(
 /// Overflow is ignored — the record has already been emitted, so TCP's ARQ
 /// still delivers the stream; only the retransmit fast-path degrades.
 unsafe fn retx_push(sess: &mut TlsSession, rec: *const u8, n: u16) {
-    let free = RETX_BUF_SIZE - sess.retx_len as usize;
-    if (n as usize) <= free {
-        core::ptr::copy_nonoverlapping(
-            rec,
-            sess.retx_buf.as_mut_ptr().add(sess.retx_len as usize),
-            n as usize,
-        );
-        sess.retx_len = sess.retx_len.wrapping_add(n);
-    }
+    let rec = core::slice::from_raw_parts(rec, usize::from(n));
+    retx_push_window(&mut sess.retx_buf, &mut sess.retx_len, &mut sess.retx_base_seq, rec);
 }
 
 /// Drop bytes up to `acked_seq` from the session's retransmit buffer.
 /// Anchors `retx_base_seq` to `acked_seq - retx_len` on the first ACK for
 /// this connection — IP supplies the absolute TCP sequence number.
 unsafe fn retx_ack(sess: &mut TlsSession, acked_seq: u32) {
-    if !sess.retx_seq_anchored {
-        sess.retx_base_seq = acked_seq.wrapping_sub(sess.retx_len as u32);
-        sess.retx_seq_anchored = true;
-    }
-    let delta = acked_seq.wrapping_sub(sess.retx_base_seq);
-    if delta == 0 || delta > sess.retx_len as u32 {
-        return;
-    }
-    let d = delta as usize;
-    let remain = sess.retx_len as usize - d;
-    if remain > 0 {
-        core::ptr::copy(
-            sess.retx_buf.as_ptr().add(d),
-            sess.retx_buf.as_mut_ptr(),
-            remain,
-        );
-    }
-    sess.retx_len = remain as u16;
-    sess.retx_base_seq = acked_seq;
+    retx_slide(
+        &mut sess.retx_buf,
+        &mut sess.retx_len,
+        &mut sess.retx_base_seq,
+        &mut sess.retx_seq_anchored,
+        acked_seq,
+    );
 }
 
 /// Replay retained ciphertext from `from_seq` to end of retx buffer.
@@ -5213,6 +5248,14 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
         s.last_err_site = 43;
         return;
     }
+
+    // Receive horizon: the record is consumed only once the standby
+    // holds its consumption. Until then it stays at the head of the
+    // buffer and no sequence state moves.
+    if !continuity_rx_gate(s, idx, rec_len) {
+        return;
+    }
+    let sess = &mut s.sessions[idx];
 
     // Copy header + ciphertext into the state-resident decrypt scratch:
     // a full record does not fit on the kernel stack.
@@ -5337,6 +5380,8 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
                     dev_log(sys, 1, msg.as_ptr(), msg.len());
                     s.sessions[idx].state = SessionState::Error;
                     s.last_err_site = 48;
+                } else {
+                    note_delivered(&mut s.sessions[idx]);
                 }
             }
         }
@@ -5366,7 +5411,36 @@ include!("../../sdk/runtime/wasm_entry.rs");
 pub mod test_helpers {
     //! Host-side introspection for the harness. Not compiled into PIC firmware.
 
-    use super::{SessionState, TlsState};
+    use super::{find_session_by_conn_id, SessionState, TlsState};
+
+    /// Whether the session's mirror was abandoned and the abort is still
+    /// owed on `cont_out`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `TlsState`.
+    pub unsafe fn cont_abandon_pending(state: *const u8, conn_id: u16) -> bool {
+        let s = &*(state as *const TlsState);
+        let i = find_session_by_conn_id(s, conn_id);
+        i >= 0 && s.sessions[i as usize].cont.abandon_pending
+    }
+
+    /// Whether the session is still mirroring.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `TlsState`.
+    pub unsafe fn cont_mirroring(state: *const u8, conn_id: u16) -> bool {
+        let s = &*(state as *const TlsState);
+        let i = find_session_by_conn_id(s, conn_id);
+        i >= 0 && s.sessions[i as usize].cont.mirror
+    }
+
+    /// Frames this instance failed to write to a full channel.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `TlsState`.
+    pub unsafe fn frame_write_dropped(state: *const u8) -> u32 {
+        (*(state as *const TlsState)).frame_write_dropped
+    }
 
     /// Count sessions that are not Idle — i.e. allocated for a connection.
     /// A claimed `MSG_ACCEPTED` / `MSG_CONNECTED` allocates one; an ignored
@@ -5531,5 +5605,116 @@ pub mod test_helpers {
     pub unsafe fn aes_variable_time_selected(state: *const u8) -> u32 {
         let s = &*(state as *const TlsState);
         s.aes_variable_time_selected
+    }
+
+    // ── Transport continuity ──────────────────────────────────────
+
+    /// The `codec_digest` a PAIR_PREPARE for this transport must carry.
+    pub fn codec_digest() -> [u8; 32] {
+        super::tls_codec_digest()
+    }
+
+    /// Largest CT_TLS record this build accepts.
+    pub fn checkpoint_record_max() -> usize {
+        super::TLS_CKPT_RECORD_MAX
+    }
+
+    /// `(read_seq, write_seq, read_epoch, write_epoch)` of the session
+    /// bound to `conn_id`.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn session_counters(state: *const u8, conn_id: u16) -> Option<(u64, u64, u32, u32)> {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .find(|sess| sess.state != SessionState::Idle && sess.conn_id == conn_id)
+            .map(|sess| {
+                (
+                    sess.read_keys.seq,
+                    sess.write_keys.seq,
+                    sess.read_epoch,
+                    sess.write_epoch,
+                )
+            })
+    }
+
+    /// The ciphertext the session bound to `conn_id` retains for
+    /// retransmission.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn retained_ciphertext(state: *const u8, conn_id: u16) -> Vec<u8> {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .find(|sess| sess.state != SessionState::Idle && sess.conn_id == conn_id)
+            .map(|sess| sess.retx_buf[..sess.retx_len as usize].to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Ownership epoch of the session bound to `conn_id`, once bound.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn session_flow_epoch(state: *const u8, conn_id: u16) -> Option<u32> {
+        let s = &*(state as *const TlsState);
+        s.sessions
+            .iter()
+            .find(|sess| sess.state != SessionState::Idle && sess.conn_id == conn_id)
+            .filter(|sess| sess.cont.flow_bound)
+            .map(|sess| sess.cont.epoch)
+    }
+
+    /// Shadows holding a reservation or an import.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn shadow_count(state: *const u8) -> usize {
+        let s = &*(state as *const TlsState);
+        s.shadows
+            .iter()
+            .filter(|sh| sh.phase != super::ShadowPhase::Idle)
+            .count()
+    }
+
+    /// True when no session slot and no shadow holds a secret or a
+    /// buffered byte — the post-RETIRE condition.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn secrets_zeroized(state: *const u8) -> bool {
+        let s = &*(state as *const TlsState);
+        let sessions_clean = s.sessions.iter().all(|sess| {
+            sess.state == SessionState::Idle
+                && sess.read_keys.key.iter().all(|&b| b == 0)
+                && sess.write_keys.key.iter().all(|&b| b == 0)
+                && sess.driver.key_schedule.is_none()
+                && sess.recv_buf.iter().all(|&b| b == 0)
+                && sess.retx_buf.iter().all(|&b| b == 0)
+                && sess.cont.tx_hold.iter().all(|&b| b == 0)
+        });
+        let shadows_clean = s.shadows.iter().all(|sh| {
+            sh.phase == super::ShadowPhase::Idle
+                && sh.ck.secrets.client_app.iter().all(|&b| b == 0)
+                && sh.ck.secrets.read_key.iter().all(|&b| b == 0)
+                && sh.ck.recv.iter().all(|&b| b == 0)
+                && sh.ck.retx.iter().all(|&b| b == 0)
+        });
+        sessions_clean && shadows_clean
+    }
+
+    /// Emit a KeyUpdate asking the peer to update too, and rotate this
+    /// side's write keys behind it.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn request_key_update(state: *mut u8, conn_id: u16) -> bool {
+        let s = &mut *(state as *mut TlsState);
+        let si = super::find_session_by_conn_id(s, conn_id);
+        if si < 0 || s.sessions[si as usize].state != SessionState::Ready {
+            return false;
+        }
+        super::send_key_update(s, si as usize, super::KEY_UPDATE_REQUESTED)
     }
 }

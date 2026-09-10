@@ -108,6 +108,7 @@ const FLAG_PERSISTED: u8 = 0x02;
 pub const MAX_LABEL: usize = 64;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Slot {
     flags: u8,
     key_len: u8,
@@ -494,6 +495,8 @@ const fn suite_private_len(suite: u16) -> usize {
         dev_key_vault::suite::P256 | dev_key_vault::suite::ED25519 => 32,
         // A sealing key: 32 bytes of ChaCha20-Poly1305 key, no public half.
         dev_key_vault::suite::AEAD_KEY => 32,
+        // An HMAC key: 32 bytes of shared secret, no public half.
+        dev_key_vault::suite::HMAC_SHA256 => 32,
         // The ML-DSA private key this backend holds is the 32-byte FIPS
         // 204 seed, not the 2560/4032/4896-byte encoded key. KeyGen is a
         // deterministic function of that seed, so the seed IS the key: it
@@ -528,6 +531,8 @@ const fn suite_public_len(suite: u16) -> usize {
 const fn suite_signature_len(suite: u16) -> usize {
     match suite {
         dev_key_vault::suite::P256 | dev_key_vault::suite::ED25519 => 64,
+        // The RFC 2104 tag.
+        dev_key_vault::suite::HMAC_SHA256 => 32,
         _ => match ml_dsa_set_for(suite) {
             Some(set) => set.params().sig_len,
             None => 0,
@@ -559,6 +564,15 @@ const fn suite_usage(suite: u16) -> u32 {
                 | dev_key_vault::usage::PERSIST
                 | dev_key_vault::usage::WRAP
         }
+        // A MAC key tags and checks tags. No `EXPORT_PUBLIC`: there is no
+        // public half, and the mask is what keeps `PUBLIC` from ever
+        // answering with the secret.
+        dev_key_vault::suite::HMAC_SHA256 => {
+            dev_key_vault::usage::SIGN
+                | dev_key_vault::usage::VERIFY
+                | dev_key_vault::usage::PERSIST
+                | dev_key_vault::usage::WRAP
+        }
         // ML-DSA signs and nothing else. No `AGREE`: a signature scheme
         // has no key-agreement half, and the post-quantum one that does is
         // ML-KEM, which is a different suite with a different key.
@@ -582,8 +596,8 @@ const fn suite_usage(suite: u16) -> u32 {
 /// Kernel context; `out` must be `suite_private_len(suite)` bytes.
 unsafe fn generate_into(suite: u16, out: &mut [u8]) -> bool {
     match suite {
-        // A sealing key is any 32 random bytes.
-        dev_key_vault::suite::AEAD_KEY => {
+        // A sealing key or a MAC key is any 32 random bytes.
+        dev_key_vault::suite::AEAD_KEY | dev_key_vault::suite::HMAC_SHA256 => {
             out.len() == 32 && crate::kernel::sys::hal::csprng_fill(out.as_mut_ptr(), 32) == 0
         }
         dev_key_vault::suite::P256 => {
@@ -630,8 +644,11 @@ unsafe fn generate_into(suite: u16, out: &mut [u8]) -> bool {
 /// `pub_len` must be `suite_public_len` of the slot's suite.
 unsafe fn write_public(idx: usize, out_ptr: *mut u8, pub_len: usize) -> bool {
     let slot = &SLOTS[idx];
-    // A sealing key has no public half: nothing to write is success.
-    if slot.suite == dev_key_vault::suite::AEAD_KEY {
+    // A sealing key or a MAC key has no public half: nothing to write is
+    // success.
+    if slot.suite == dev_key_vault::suite::AEAD_KEY
+        || slot.suite == dev_key_vault::suite::HMAC_SHA256
+    {
         return pub_len == 0;
     }
     let mut priv_key = [0u8; 32];
@@ -708,6 +725,97 @@ pub unsafe fn forget_persisted_for_test() {
         *entry = Persisted::empty();
     }
 }
+/// One vault's in-RAM state — the open slots and the sealed-at-rest
+/// table — as a value.
+///
+/// Test-only, like [`forget_persisted_for_test`]. The tables are process
+/// statics, so a harness that needs two independent vaults — one per host
+/// of a continuity pair — holds one image per host and swaps it in around
+/// each call. Opaque on purpose: a test moves a key between images by
+/// label and never handles the bytes.
+///
+/// This covers only what this file owns. A labelled key the RAM tables lack
+/// is rehydrated from the platform's durable store, so a harness modelling
+/// a second host must isolate that store as well, or the second host reads
+/// what the first wrote and the two are one vault after all.
+pub struct VaultImage {
+    slots: [Slot; MAX_SLOTS],
+    persisted: [Persisted; MAX_PERSISTED],
+}
+
+impl VaultImage {
+    /// A vault that has never held a key.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            slots: [Slot::empty(); MAX_SLOTS],
+            persisted: [Persisted::empty(); MAX_PERSISTED],
+        }
+    }
+
+    /// Copy the key filed under `label` — its open slot and its sealed
+    /// entry, whichever `other` holds — into this image, replacing any entry
+    /// already filed under that label. Answers whether `other` held one.
+    ///
+    /// This is out-of-band provisioning: the only way a key reaches a host
+    /// that did not generate it.
+    pub fn copy_labelled_from(&mut self, other: &VaultImage, label: &[u8]) -> bool {
+        let mut found = false;
+        if let Some(src) = other
+            .slots
+            .iter()
+            .find(|s| (s.flags & FLAG_IN_USE) != 0 && s.label_bytes() == label)
+        {
+            let dst = self
+                .slots
+                .iter()
+                .position(|s| (s.flags & FLAG_IN_USE) != 0 && s.label_bytes() == label)
+                .or_else(|| self.slots.iter().position(|s| (s.flags & FLAG_IN_USE) == 0));
+            if let Some(i) = dst {
+                self.slots[i] = *src;
+                found = true;
+            }
+        }
+        if let Some(src) = other
+            .persisted
+            .iter()
+            .find(|e| e.live && e.label[..e.label_len as usize] == *label)
+        {
+            let dst = self
+                .persisted
+                .iter()
+                .position(|e| e.live && e.label[..e.label_len as usize] == *label)
+                .or_else(|| self.persisted.iter().position(|e| !e.live));
+            if let Some(i) = dst {
+                self.persisted[i] = *src;
+                found = true;
+            }
+        }
+        found
+    }
+}
+
+/// Snapshot the live tables into an image.
+///
+/// # Safety
+/// Kernel context, exclusive access to `SLOTS` and `PERSISTED`.
+pub unsafe fn capture_for_test() -> VaultImage {
+    VaultImage {
+        slots: core::ptr::read(&raw const SLOTS),
+        persisted: core::ptr::read(&raw const PERSISTED),
+    }
+}
+
+/// Make `image` the live tables, replacing whatever they held.
+///
+/// # Safety
+/// Kernel context, exclusive access to `SLOTS` and `PERSISTED`; no module
+/// mid-`provider_dispatch`.
+pub unsafe fn restore_for_test(image: &VaultImage) {
+    core::ptr::write(&raw mut SLOTS, image.slots);
+    core::ptr::write(&raw mut PERSISTED, image.persisted);
+}
+
 /// True iff `k` (big-endian) is a valid P-256 scalar: 1 <= k < n.
 fn p256_scalar_in_range(k: &[u8; 32]) -> bool {
     // Big-endian compare against the group order: first differing
@@ -891,11 +999,27 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let want_mode = match slot.suite {
                 dev_key_vault::suite::P256 => dev_key_vault::sign_mode::DIGEST,
                 dev_key_vault::suite::ED25519 => dev_key_vault::sign_mode::RAW,
+                dev_key_vault::suite::HMAC_SHA256 => dev_key_vault::sign_mode::RAW,
                 _ if ml_dsa_set_for(slot.suite).is_some() => dev_key_vault::sign_mode::RAW,
                 _ => return ENOSYS,
             };
             if mode != want_mode {
                 return EINVAL;
+            }
+
+            // An HMAC tag is 32 bytes and takes the whole message; it
+            // answers here so the 64-byte signature path below stays the
+            // asymmetric one.
+            if slot.suite == dev_key_vault::suite::HMAC_SHA256 {
+                let msg = core::slice::from_raw_parts(arg.add(6), input_len);
+                let mut tag = hmac_sha256(&slot.data[..32], &[msg]);
+                if !sig_ptr.is_null() {
+                    core::ptr::copy_nonoverlapping(tag.as_ptr(), sig_ptr, 32);
+                }
+                zeroize(&mut tag);
+                let wrote = 32u16.to_le_bytes();
+                core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
+                return 0;
             }
 
             // ML-DSA's signature does not fit the fixed 64-byte path
@@ -1022,17 +1146,48 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
         }
         dev_key_vault::VERIFY => {
-            // VERIFY is independent of the stored key — it takes a
-            // caller-supplied public key in the peer field of the argument.
-            // Layout: `[hash_len:u16][sig_len:u16][pub_len:u16][pad:u16]
-            // [hash][sig][pub]`. v1 has only this shape; shorter
-            // payloads are rejected as EINVAL.
+            // With handle=-1, VERIFY is independent of the stored keys — it
+            // takes a caller-supplied public key in the peer field of the
+            // argument. Layout: `[hash_len:u16][sig_len:u16][pub_len:u16]
+            // [pad:u16][hash][sig][pub]`; shorter payloads are rejected as
+            // EINVAL. With a slot handle the slot must hold an HMAC key,
+            // the hash field is the message, the sig field the tag, and
+            // the comparison happens here in constant time.
             if arg.is_null() || arg_len < 8 {
                 return EINVAL;
             }
             let hash_len = u16::from_le_bytes([*arg, *arg.add(1)]) as usize;
             let sig_len = u16::from_le_bytes([*arg.add(2), *arg.add(3)]) as usize;
             let pub_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]) as usize;
+            if handle >= 0 {
+                let (tag, slot_idx) = fd::untag_fd(handle);
+                if tag != fd::FD_TAG_KEY_VAULT || slot_idx < 0 || slot_idx as usize >= MAX_SLOTS {
+                    return EINVAL;
+                }
+                let slot = &SLOTS[slot_idx as usize];
+                if (slot.flags & FLAG_IN_USE) == 0
+                    || slot.suite != dev_key_vault::suite::HMAC_SHA256
+                {
+                    return EINVAL;
+                }
+                if !slot.permits(dev_key_vault::usage::VERIFY) {
+                    return EACCES;
+                }
+                if hash_len == 0 || sig_len != 32 || pub_len != 0 || 8 + hash_len + 32 > arg_len {
+                    return EINVAL;
+                }
+                let msg = core::slice::from_raw_parts(arg.add(8), hash_len);
+                let presented = core::slice::from_raw_parts(arg.add(8 + hash_len), 32);
+                let mut expect = hmac_sha256(&slot.data[..32], &[msg]);
+                // Every byte is visited whatever the first mismatch, so the
+                // time taken says nothing about where the tag went wrong.
+                let mut diff: u8 = 0;
+                for (a, b) in expect.iter().zip(presented) {
+                    diff |= a ^ b;
+                }
+                zeroize(&mut expect);
+                return i32::from(diff == 0);
+            }
             if hash_len == 0
                 || sig_len != 64
                 || pub_len < 64

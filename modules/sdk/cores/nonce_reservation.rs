@@ -1,5 +1,5 @@
 // nonce_reservation_core — windowed egress-counter reservation with
-// epoch fencing ( §13.7.6 R2).
+// epoch fencing.
 //
 // Shared by any datagram anchor doing platform-replicated-state
 // `transport_migratable` migration, and by the session directory that
@@ -16,18 +16,18 @@
 //   - **Identity space never re-handed out.** A grant must start at or
 //     above the high-water mark of every block ever installed here.
 //     The unused tail of an abandoned block is *wasted, not reused* —
-//     that waste is the price of takeover safety (§13.7.2).
+//     that waste is the price of takeover safety.
 //   - **Unsafe recovery voids outstanding blocks (R2).** After
 //     `void_outstanding` (forced/unsafe quorum recovery), emission
 //     stops and only a grant with a *strictly higher* epoch is
 //     accepted.
-//   - **Refill-ahead (double-buffer, §13.7.7).** One pending block may
+//   - **Refill-ahead.** One pending block may
 //     be installed while the current block drains, so block
 //     exhaustion mid-stream (`Exhausted` from `next_value` — the
 //     `reservation_exhausted_stall` telemetry event) is rare rather
 //     than periodic.
 //
-// The same reserve-ahead discipline covers all three §13.7.1 tier-3
+// The same reserve-ahead discipline covers all three tier-3
 // counters (egress AEAD nonce, reliable-ordered send index, outbound
 // datagram sequence): instantiate one `NonceReservation` per counter.
 //
@@ -95,7 +95,7 @@ impl NonceReservation {
         }
     }
 
-    /// Takeover path (§13.7.4 step 3): resume on a new host strictly
+    /// Takeover path: resume on a new host strictly
     /// ahead of anything the dead host could have emitted. `floor` is
     /// the exclusive end of the last quorum-committed grant for this
     /// counter — the dead host cannot have emitted at or beyond it.
@@ -129,7 +129,7 @@ impl NonceReservation {
     /// reservation authority: no pending block is staged and the
     /// active block has fewer than `low_water` values left. Refilling
     /// ahead of exhaustion keeps the quorum round-trip off the emit
-    /// path (§13.7.7).
+    /// path.
     pub fn needs_refill(&self, low_water: u64) -> bool {
         !self.voided
             && self.next_start == self.next_end
@@ -221,5 +221,14 @@ impl NonceReservation {
     #[inline]
     pub fn is_voided(&self) -> bool {
         self.voided
+    }
+
+    /// The exclusive end of every block ever installed here — the first
+    /// value this reservation could not have emitted under any grant it
+    /// holds. This, not the next value to send, is the floor a takeover
+    /// resumes from: the holder may still emit anything below it.
+    #[inline]
+    pub fn high_water(&self) -> u64 {
+        self.high_water
     }
 }

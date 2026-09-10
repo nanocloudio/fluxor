@@ -370,6 +370,21 @@ fn generate_config_impl(
             .map(|d| d.module_silicon().to_string())
             .unwrap_or_else(|_| t.to_string())
     });
+    // Target-provided facts are keyed by the platform the kernel runs on,
+    // not by the silicon its modules are compiled for: a hosted target
+    // (`linux`, `wasm`) shares bcm2712's module builds but has its own
+    // clock, vault and driver rows.
+    let facts_owned = target_opt.map(|t| {
+        crate::target::load_target(t, &crate::project::root())
+            .map(|d| {
+                if d.is_host() {
+                    d.id.clone()
+                } else {
+                    d.module_silicon().to_string()
+                }
+            })
+            .unwrap_or_else(|_| t.to_string())
+    });
     if let Some(silicon) = silicon_owned.as_deref() {
         // Cover base AND pod modules — a pod module runs on the same silicon and
         // must satisfy the same `[requires]` (FPU/NEON/MMU).
@@ -393,7 +408,8 @@ fn generate_config_impl(
                 if !manifest.requires_when.is_empty() {
                     let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
                     let param_schema = schema::load_schema_for_module(mtype, modules_dir)?;
-                    let facts = crate::target_facts::TargetFacts::for_silicon(silicon);
+                    let facts_key = facts_owned.as_deref().unwrap_or(silicon);
+                    let facts = crate::target_facts::TargetFacts::for_silicon(facts_key);
                     for rw in &manifest.requires_when {
                         let resolutions: Vec<crate::target_facts::ParamResolution> = rw
                             .when
@@ -474,9 +490,12 @@ fn generate_config_impl(
     validate_presentation_groups(config, &module_names, &manifests)?;
 
     // Session continuity classes as a validated graph property
-    // (rfc_protocols.md §7.3). Graphs without a `continuity` block are
+    // Graphs without a `continuity` block are
     // unaffected.
-    validate_continuity(config, &module_names, &manifests)?;
+    validate_continuity_on(config, &module_names, &manifests, resolved_target)?;
+    // Execution-envelope claim. Graphs without an
+    // `execution.profile` claim nothing and are unaffected.
+    validate_execution_profile(config, &module_names, &manifests, resolved_target)?;
     validate_port_capabilities(config, &manifests)?;
 
     // Single-provider-per-contract. Providers auto-register in

@@ -1855,7 +1855,7 @@ mod module_discovery_tests {
 
 #[cfg(test)]
 mod continuity_tests {
-    //! Tests for the `continuity` block validator (rfc_protocols.md
+    //! Tests for the `continuity` block validator
     //! §7.3): continuity classes as a validated graph property.
 
     use super::*;
@@ -2162,12 +2162,23 @@ mod continuity_tests {
         validate_continuity(&cfg, &names(&["quic"]), &m2).unwrap();
     }
 
-    /// Full platform-replicated-state graph with every R1–R5 provider.
-    fn prs_graph() -> (Vec<String>, HashMap<String, Manifest>) {
+    /// A manifest declaring capabilities and one `capability_facts` row.
+    fn man_facts(caps: &[&str], cap: &str, fact: &str, value: &str) -> Manifest {
+        let mut m = man(caps);
+        let mut row = std::collections::BTreeMap::new();
+        row.insert(fact.to_string(), value.to_string());
+        m.capability_facts.insert(cap.to_string(), row);
+        m
+    }
+
+    /// Full platform-replicated-state graph with every R1–R5 provider:
+    /// the ip stack (local fence, reach decided by the target) and an
+    /// out-of-band fence agent declaring the wire.
+    fn prs_graph_with(anchor_cap: &str) -> (Vec<String>, HashMap<String, Manifest>) {
         let mut manifests = HashMap::new();
         manifests.insert(
             "anc".to_string(),
-            man(&["transport.anchor.datagram", "session.reservation"]),
+            man(&[anchor_cap, "session.reservation"]),
         );
         manifests.insert(
             "wkr".to_string(),
@@ -2177,8 +2188,19 @@ mod continuity_tests {
             "dir".to_string(),
             man(&["session.directory", "security.key_wrap", "durable.rpo_zero"]),
         );
-        manifests.insert("pdu".to_string(), man(&["fence.enforceable"]));
-        (names(&["anc", "wkr", "dir", "pdu"]), manifests)
+        manifests.insert(
+            "ip".to_string(),
+            man_facts(&["fence.enforceable"], "fence.enforceable", "cutoff", "ring_handoff"),
+        );
+        manifests.insert(
+            "pdu".to_string(),
+            man_facts(&["fence.enforceable"], "fence.enforceable", "cutoff", "wire"),
+        );
+        (names(&["anc", "wkr", "dir", "ip", "pdu"]), manifests)
+    }
+
+    fn prs_graph() -> (Vec<String>, HashMap<String, Manifest>) {
+        prs_graph_with("transport.anchor.datagram")
     }
 
     fn prs_entry() -> serde_json::Value {
@@ -2189,11 +2211,66 @@ mod continuity_tests {
                "failover_budget_ms": 8000, "client_keepalive_ms": 20000})
     }
 
+    /// The config the graph above is declared in: instance types are what
+    /// the validator identifies the ip stack by.
+    fn prs_cfg(entry: serde_json::Value) -> serde_json::Value {
+        json!({"modules": [
+            {"name": "anc", "type": "anchor"},
+            {"name": "wkr", "type": "worker"},
+            {"name": "dir", "type": "session_directory"},
+            {"name": "ip", "type": "ip"},
+            {"name": "pdu", "type": "fence_agent"}],
+            "continuity": [entry]})
+    }
+
     #[test]
     fn continuity_platform_replicated_state_full_graph_passes() {
         let (n, m) = prs_graph();
-        let cfg = json!({"continuity": [prs_entry()]});
-        validate_continuity(&cfg, &n, &m).unwrap();
+        let cfg = prs_cfg(prs_entry());
+        validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
+    }
+
+    #[test]
+    fn continuity_prs_stream_anchor_is_bare_metal_only() {
+        // A TLS-terminating anchor owns its transport on bcm2712 …
+        let (n, m) = prs_graph_with("transport.anchor.stream.secure");
+        let cfg = prs_cfg(prs_entry());
+        validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
+        // … and not on a hosted platform, where TCP is the host kernel's.
+        let e = validate_continuity_on(&cfg, &n, &m, Some("linux")).unwrap_err();
+        assert!(format!("{e:?}").contains("bare-metal"), "got: {e:?}");
+        // Without a target the ownership cannot be proven.
+        let e = validate_continuity_on(&cfg, &n, &m, None).unwrap_err();
+        assert!(format!("{e:?}").contains("resolved target"), "got: {e:?}");
+        // A mux anchor follows the same rule.
+        let (n, m) = prs_graph_with("transport.anchor.mux");
+        validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
+        // A plain stream anchor is not a transport Fluxor may migrate.
+        let (n, m) = prs_graph_with("transport.anchor.stream");
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("declares none of"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_fence_needs_both_halves() {
+        // The ip module's reach is a target fact: rp2350's driver does not
+        // drain on request, so its fence stops at the ring hand-off.
+        let (n, m) = prs_graph();
+        let cfg = prs_cfg(prs_entry());
+        let e = validate_continuity_on(&cfg, &n, &m, Some("rp2350")).unwrap_err();
+        assert!(format!("{e:?}").contains("wire"), "got: {e:?}");
+        assert!(format!("{e:?}").contains("rp2350"), "got: {e:?}");
+        // Local evidence alone is never enough.
+        let (n, mut m) = prs_graph();
+        m.insert("pdu".to_string(), man(&["session.worker"]));
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("out-of-band"), "got: {e:?}");
+        // An out-of-band provider that does not declare its cutoff is not
+        // evidence either.
+        let (n, mut m) = prs_graph();
+        m.insert("pdu".to_string(), man(&["fence.enforceable"]));
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("out-of-band"), "got: {e:?}");
     }
 
     #[test]
@@ -2203,8 +2280,8 @@ mod continuity_tests {
         let (n, m) = prs_graph();
         let mut entry = prs_entry();
         entry["aead"] = json!("implicit_counter");
-        let cfg = json!({"continuity": [entry]});
-        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        let cfg = prs_cfg(entry);
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
         assert!(format!("{e:?}").contains("resumable"), "got: {e:?}");
     }
 
@@ -2214,9 +2291,10 @@ mod continuity_tests {
         // capability named.
         let (n, mut m) = prs_graph();
         m.remove("pdu");
-        let n: Vec<String> = n.into_iter().filter(|x| x != "pdu").collect();
-        let cfg = json!({"continuity": [prs_entry()]});
-        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        m.remove("ip");
+        let n: Vec<String> = n.into_iter().filter(|x| x != "pdu" && x != "ip").collect();
+        let cfg = prs_cfg(prs_entry());
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
         assert!(format!("{e:?}").contains("fence.enforceable"), "got: {e:?}");
     }
 
@@ -2228,8 +2306,8 @@ mod continuity_tests {
             "dir".to_string(),
             man(&["security.key_wrap", "durable.rpo_zero"]),
         );
-        let cfg = json!({"continuity": [prs_entry()]});
-        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        let cfg = prs_cfg(prs_entry());
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
         assert!(format!("{e:?}").contains("session.directory"), "got: {e:?}");
     }
 
@@ -2238,8 +2316,8 @@ mod continuity_tests {
         let (n, m) = prs_graph();
         let mut entry = prs_entry();
         entry["failover_budget_ms"] = json!(20000);
-        let cfg = json!({"continuity": [entry]});
-        let e = validate_continuity(&cfg, &n, &m).unwrap_err();
+        let cfg = prs_cfg(entry);
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
         assert!(format!("{e:?}").contains("strictly below"), "got: {e:?}");
     }
 

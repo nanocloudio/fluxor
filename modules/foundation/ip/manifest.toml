@@ -96,6 +96,28 @@ index = 4
 content_type = "NetProto"
 buffer_size = { default = 4096, bcm2712 = 32768 }
 
+# Transport continuity (in[4] / out[6]), the `session_ctrl` §Transport
+# continuity surface for the TCP connections this module owns: a
+# coordinator's PAIR_PREPARE / CHECKPOINT / DELTA / QUIESCE / CUT / ARM /
+# ACTIVATE / RETIRE / ABORT commands arrive on `cont_in`; replies
+# (`MSG_SC_CONTINUITY`), checkpoint chunks and deltas leave on `cont_out`.
+# Unwired means no connection here can be mirrored or imported. The flow
+# identity is the tuple: [local_ip:4][remote_ip:4][local_port:2]
+# [remote_port:2][0;4], all big-endian.
+[[ports]]
+name = "cont_in"
+direction = "input"
+index = 4
+content_type = "OctetStream"
+buffer_size = { default = 2048, bcm2712 = 8192 }
+
+[[ports]]
+name = "cont_out"
+direction = "output"
+index = 6
+content_type = "OctetStream"
+buffer_size = { default = 4096, bcm2712 = 16384 }
+
 # Module-scope observability. Optional 3rd output (out[2]); wired to
 # `observe.telemetry` when the debug stack's observe overlay is on. Emits
 # cumulative counters; no-op when unwired. See standards/observability.md.
@@ -105,3 +127,17 @@ metrics = ["bytes_in", "bytes_out"]
 # the ingress root of a trace. Emitted on the same telemetry port; minted only
 # when wired (zero-cost otherwise).
 spans = ["tcp.connection"]
+
+# Execution envelope, measured profile. The numbers
+# are this module's thread-CPU-time maxima under the mixed TCP / ARP / UDP
+# load of the evidence gate, on an aarch64 Linux host (Pi 5) that was also
+# running concurrent builds: observed max_step 28-168 us (p50 0.7 us, p99
+# 14-17 us) and max_dispatch 24-68 us across runs. Each declaration is the
+# largest observed maximum times a safety factor of 3, rounded. A step
+# excludes the synchronous dispatches it makes (TIMER::MILLIS,
+# RANDOM_FILL), which `max_dispatch_us` bounds per call.
+[execution]
+max_step_us = 500
+max_dispatch_us = 200
+profile = "measured_envelope"
+evidence = "tests/harness/tests/execution_envelope_ip.rs"

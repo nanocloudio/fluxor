@@ -199,7 +199,7 @@ fn cap_satisfies(declared: &str, wanted: &str) -> bool {
 }
 
 /// Validate the optional top-level `continuity` block — session
-/// continuity classes as a validated graph property (rfc_protocols.md
+/// continuity classes as a validated graph property
 /// §7.3; `protocol_surfaces.md` §Continuity Classes). Compile-time
 /// only; no binary representation in the compiled config.
 ///
@@ -224,10 +224,46 @@ fn cap_satisfies(declared: &str, wanted: &str) -> bool {
 /// measured/tested gate, not a static one. The validator still rejects
 /// a declared budget that is not below the declared keepalive, since a
 /// declaration that fails on its own constants cannot pass measurement.
+#[cfg(test)]
 pub fn validate_continuity(
     config: &Value,
     module_names: &[String],
     manifests: &HashMap<String, Manifest>,
+) -> Result<()> {
+    validate_continuity_on(config, module_names, manifests, None)
+}
+
+/// Anchor capabilities under which a transport's whole state machine is
+/// Fluxor's to checkpoint: a datagram
+/// transport behind a stable address, a TLS 1.3 stream terminated by the
+/// bare-metal ip stack, or a QUIC mux.
+const PRS_ANCHOR_CAPS: &[&str] = &[
+    "transport.anchor.datagram",
+    "transport.anchor.stream.secure",
+    "transport.anchor.mux",
+];
+
+/// The type an instance was declared with (`modules[].type`), or its
+/// name when the config names none — the convention the loader uses.
+fn instance_type(config: &Value, instance: &str) -> String {
+    config
+        .get("modules")
+        .and_then(|m| m.as_array())
+        .and_then(|list| {
+            list.iter().find(|m| m.get("name").and_then(|n| n.as_str()) == Some(instance))
+        })
+        .and_then(|m| m.get("type").and_then(|t| t.as_str()).map(|t| t.to_string()))
+        .unwrap_or_else(|| instance.to_string())
+}
+
+/// `validate_continuity` against a resolved target, which is what decides
+/// whether a stream anchor's transport is Fluxor's own and how far the ip
+/// module's fence reaches (`target_facts`).
+pub fn validate_continuity_on(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    target: Option<&str>,
 ) -> Result<()> {
     let block = match config.get("continuity") {
         Some(v) => v,
@@ -415,7 +451,7 @@ pub fn validate_continuity(
                             return Err(err(
                                 "aead implicit_counter cannot reach transport_migratable: \
                                  an implicit-contiguous AEAD counter cannot skip forward on \
-                                 takeover (rfc_protocols.md §13.7.2). Declare class \
+                                 takeover. Declare class \
                                  `resumable` — seamless-state resume is this transport's \
                                  honest ceiling"
                                     .into(),
@@ -423,16 +459,93 @@ pub fn validate_continuity(
                         }
 
                         // Anchor + single-writer directory are the
-                        // mechanism's backbone.
+                        // mechanism's backbone. The anchor's transport must
+                        // be one Fluxor owns end to end.
                         let a = anchor.ok_or_else(|| {
                             err("platform_replicated_state requires an `anchor` module".into())
                         })?;
-                        if !module_has(a, "transport.anchor.datagram") {
+                        let anchor_cap = PRS_ANCHOR_CAPS.iter().find(|c| module_has(a, c));
+                        let Some(anchor_cap) = anchor_cap else {
                             return Err(err(format!(
-                                "anchor `{a}` does not declare `transport.anchor.datagram` \
-                                 (platform-replicated-state migration is defined for \
-                                 fully-owned datagram transports)"
+                                "anchor `{a}` declares none of {} (platform-replicated-state \
+                                 migration is defined for transports Fluxor owns end to end)",
+                                PRS_ANCHOR_CAPS.join(" | ")
                             )));
+                        };
+                        // A stream or mux anchor owns its transport only on
+                        // bare metal: on a hosted platform TCP lives in the
+                        // host kernel and no checkpoint can capture it
+                        // host kernel, and no checkpoint can capture it.
+                        if *anchor_cap != "transport.anchor.datagram" {
+                            match target {
+                                Some(t) if crate::target_facts::TargetFacts::owns_transport(t) => {}
+                                Some(t) => {
+                                    return Err(err(format!(
+                                        "anchor `{a}` ({anchor_cap}) cannot claim \
+                                         transport_migratable on `{t}`: stream continuity is a \
+                                         bare-metal capability — the transport there belongs \
+                                         to the host kernel. Declare class resumable"
+                                    )));
+                                }
+                                None => {
+                                    return Err(err(format!(
+                                        "anchor `{a}` ({anchor_cap}) needs a resolved target \
+                                         to prove Fluxor owns the transport; compose against \
+                                         one"
+                                    )));
+                                }
+                            }
+                        }
+                        // Cutoff evidence in two halves: the
+                        // local cutoff evidence — the ip module's fence,
+                        // whose reach is a target fact — and an out-of-band
+                        // fence outside the failure domain, declaring
+                        // `cutoff = "wire"` for itself. Neither alone
+                        // satisfies a strict profile.
+                        let cutoff_of = |name: &str| -> Option<String> {
+                            let ty = instance_type(config, name);
+                            if ty == "ip" {
+                                return target.map(|t| {
+                                    crate::target_facts::TargetFacts::for_silicon(t)
+                                        .ip_fence_cutoff()
+                                        .to_string()
+                                });
+                            }
+                            manifests
+                                .get(name)
+                                .and_then(|m| m.capability_facts.get("fence.enforceable"))
+                                .and_then(|f| f.get("cutoff").cloned())
+                        };
+                        let fence_providers: Vec<&String> = module_names
+                            .iter()
+                            .filter(|m| module_has(m, "fence.enforceable"))
+                            .collect();
+                        let local_wire = fence_providers.iter().any(|m| {
+                            instance_type(config, m) == "ip"
+                                && cutoff_of(m).as_deref() == Some("wire")
+                        });
+                        let out_of_band_wire = fence_providers.iter().any(|m| {
+                            instance_type(config, m) != "ip"
+                                && cutoff_of(m).as_deref() == Some("wire")
+                        });
+                        if !local_wire {
+                            return Err(err(format!(
+                                "platform_replicated_state requires the ip module's \
+                                 `fence.enforceable` to reach `cutoff = \"wire\"` on the \
+                                 target{} — a fence whose boundary is the ring hand-off \
+                                 cannot confirm the old emitter is quiet",
+                                target.map(|t| format!(" (`{t}` does not)")).unwrap_or_default()
+                            )));
+                        }
+                        if !out_of_band_wire {
+                            return Err(err(
+                                "platform_replicated_state requires an out-of-band \
+                                 `fence.enforceable` provider (a fence agent outside the \
+                                 failure domain) declaring [capability_facts.\"fence.enforceable\"] \
+                                 cutoff = \"wire\"; a local cutoff alone is never enough — the host \
+                                 that must be proved quiet is the one that may have failed"
+                                    .into(),
+                            ));
                         }
                         let d = directory.ok_or_else(|| {
                             err("platform_replicated_state requires a `directory` module \
@@ -445,12 +558,12 @@ pub fn validate_continuity(
                             )));
                         }
 
-                        // §9.2 / §13.7.6 structural requirements R1–R5.
+                        // The providers a replicated-state class cannot work without.
                         for cap in PRS_REQUIRED_CAPS {
                             if !graph_has(cap) {
                                 return Err(err(format!(
                                     "platform_replicated_state requires a `{cap}` provider \
-                                     in the graph (rfc_protocols.md §13.7.6); without it the \
+                                     in the graph; without it the \
                                      honest class is resumable"
                                 )));
                             }
@@ -1301,4 +1414,17 @@ pub fn validate_port_capabilities(
         }
     }
     Ok(())
+}
+
+/// Admit the graph's execution-envelope claim
+/// against what its modules declare. The rule is judged beside the target
+/// facts it depends on, in `target_facts::admit_execution_profile`; this is
+/// its place in the compose pipeline.
+pub fn validate_execution_profile(
+    config: &Value,
+    module_names: &[String],
+    manifests: &HashMap<String, Manifest>,
+    target: Option<&str>,
+) -> Result<()> {
+    crate::target_facts::admit_execution_profile(config, module_names, manifests, target)
 }

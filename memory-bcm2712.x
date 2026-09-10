@@ -12,13 +12,14 @@ ENTRY(_start)
 EXTERN(_start)
 
 /* LENGTH must hold .bss, which is dominated by the profile_host arenas
- * (abi::config::kernel: STATE_ARENA_SIZE 96M + BUFFER_ARENA_SIZE 8M) plus
- * the fixed tables/pools. 192M leaves headroom and both backings cover it:
- * QEMU virt runs with -m 256M (origin 0x4008_0000 → region ends 0x4C08_0000,
- * ~63M left for the relocated package payload above __end_block_addr) and
- * Pi 5 has 8 GiB. */
+ * (abi::config::kernel: STATE_ARENA_SIZE 256M + BUFFER_ARENA_SIZE 8M — the
+ * state arena is sized around the ip module's 65,536-slot connection
+ * table) plus the fixed tables/pools and the 16M-aligned .bss window. 512M
+ * leaves headroom and both backings cover it: QEMU virt runs with -m 1G
+ * (origin 0x4008_0000 → region ends 0x6008_0000, ~511M left for the
+ * relocated package payload above __end_block_addr) and Pi 5 has 8 GiB. */
 MEMORY {
-    RAM : ORIGIN = RAM_ORIGIN, LENGTH = 192M
+    RAM : ORIGIN = RAM_ORIGIN, LENGTH = 512M
 }
 
 SECTIONS {
@@ -62,7 +63,7 @@ SECTIONS {
      * deliberate ~13 MiB, so the real bound is the loader's designed
      * MAX_MODULES_BLOB_SIZE (8 MiB) rather than a layout artifact.
      * Costs nothing: .bss is NOLOAD, so the gap is unused address space,
-     * not image bytes, and the region below (192M) still holds everything.
+     * not image bytes, and the region below (512M) still holds everything.
      */
     .bss (NOLOAD) : ALIGN(0x1000000) {
         __bss_start = .;

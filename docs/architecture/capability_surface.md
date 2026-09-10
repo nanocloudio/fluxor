@@ -273,7 +273,7 @@ model these support):
 | `session.handoff` | Opaque export / import handoff support |
 | `session.reservation` | Durable, quorum-committed reservation of nonce / sequence blocks, so a taken-over sender never reuses AEAD nonces |
 | `security.key_wrap` | Session-key custody wrapped under a KEK the storage layer cannot read |
-| `fence.enforceable` | Emission fence for a local address: after the fence answers, nothing sourced from the address is handed onward, and ARP for it is not answered. Fact `cutoff`: `ring_handoff` (the ip module's boundary — frames already in the driver ring may still leave) or `wire` (a driver that drains and reports its completed transmit index). Provided by `ip` over the `net::identity` `ADDR_FENCE` verb with a per-install token minted from the CSPRNG and the boot incarnation |
+| `fence.enforceable` | Emission fence for a local address: after the fence answers, nothing sourced from the address is handed onward, and ARP for it is not answered. Fact `cutoff`: `ring_handoff` (the ip module's boundary — frames already in the driver ring may still leave) or `wire` (the driver drained on request and reported its completed transmit count). Provided by `ip` over the `net::identity` `ADDR_FENCE` verb with a per-install token minted from the CSPRNG and the boot incarnation; the manifest declares `ring_handoff` and the composer raises it to `wire` on a target whose NIC driver answers the `tx_drain` query (bcm2712). An out-of-band fence agent declares `wire` for itself |
 | `durable.rpo_zero` | Synchronous quorum-durable-before-acknowledge write path for security-relevant session state |
 
 Target-provided:
@@ -357,6 +357,65 @@ queries `adjtimex(2)` and reports `network_sync`; the bare-metal and
 browser platforms have no synchronisation evidence and provide nothing. A
 target that gains a time source gains the row, and the table is pinned
 against the platform HALs by `tools/tests/target_facts.rs`.
+
+### Execution envelope
+
+Source: `tools/src/manifest.rs` (`ExecutionEnvelope`),
+`tools/src/target_facts.rs` (`admit_execution_profile`,
+`TargetFacts::step_budget_us`), `tools/src/config/validate.rs`.
+
+Cooperative budgets say what a step MAY take; they are not evidence of
+what it DOES take. A module states that evidence in its manifest as two
+facts and the profile they hold under:
+
+```toml
+[execution]
+max_step_us     = 120   # exclusive CPU time of one module_step
+max_dispatch_us = 40    # bounded cost of one synchronous provider dispatch
+profile         = "measured_envelope"
+evidence        = "tests/harness/tests/execution_envelope_ip.rs"
+```
+
+`max_step_us` is the step's own CPU time; the synchronous provider calls it
+makes are charged separately through `max_dispatch_us` and their bounded
+count, so a provider shared by several callers is counted once. There are
+two profiles and they are not interchangeable:
+
+- `analytical_bound` — the numbers rest on a reviewed derivation over
+  bounded code paths, named by `evidence` (required). Only bare metal can
+  honour a bound claim.
+- `measured_envelope` — the numbers are observed maxima under a stated
+  workload on a stated host, with a safety factor over the observation. A
+  percentile, not a guarantee. Linux and wasm publish this profile only:
+  a hosted runtime's latency tail belongs to the host scheduler.
+
+The manifest parser checks that both facts are present and positive, that
+the profile is one of the two, that an analytical bound names its
+evidence, and that `max_step_us` fits the step budget of every silicon in
+`hardware_targets` — one default scheduler pass, from the target-facts
+table and pinned against the kernel by `tools/tests/target_facts.rs`.
+
+A graph claims a profile for itself at compose:
+
+```yaml
+execution:
+  profile: measured_envelope   # or analytical_bound
+```
+
+A graph that names none claims nothing. With a claim, admission is per
+instantiated module and names every offender: `analytical_bound` needs
+every member to declare `analytical_bound` and the target to be bare
+metal; `measured_envelope` needs every member to declare `[execution]` at
+all, since a module with no facts cannot be part of a measured claim.
+
+What passes here is the presence and kind of each member's evidence. The
+graph arithmetic — summing admitted quanta and dispatch costs into a
+scheduler round, composing a service curve with an arrival envelope,
+checking each edge's backlog and deadline — is not part of the claim, and
+an admitted graph holds no derived end-to-end latency bound. `ip` is the
+measured module: its envelope is the maximum step time its harness gate
+observes under a mixed TCP / ARP / UDP load, times the safety factor
+recorded beside the number.
 
 ## Provider Contracts and Surfaces
 
@@ -449,13 +508,22 @@ as graph structure:
   in the graph must provide a `transport.mux.*` transport, since the wire
   protocol itself carries the migration.
 - `transport_migratable` with mechanism `platform_replicated_state` — the
-  declaration must name an `anchor` carrying `transport.anchor.datagram`
-  and a `directory` carrying `session.directory`, declare its AEAD class
-  and a failover budget, and the graph must resolve providers for all four
-  of `session.reservation`, `security.key_wrap`, `fence.enforceable`, and
-  `durable.rpo_zero`. An `implicit_counter` AEAD class is rejected
-  outright: an implicit-contiguous AEAD counter cannot skip forward on
-  takeover, so that transport's honest ceiling is `resumable`.
+  declaration must name an `anchor` carrying `transport.anchor.datagram`,
+  `transport.anchor.stream.secure` or `transport.anchor.mux` and a
+  `directory` carrying `session.directory`, declare its AEAD class and a
+  failover budget, and the graph must resolve providers for all four of
+  `session.reservation`, `security.key_wrap`, `fence.enforceable`, and
+  `durable.rpo_zero`. A stream or mux anchor is admitted only on a target
+  where Fluxor owns the transport (`TargetFacts::owns_transport`: the
+  bare-metal silicons, never `linux` or `wasm`). The fence is checked in
+  two halves: the ip module's `fence.enforceable` must reach
+  `cutoff = "wire"` on the target (`TargetFacts::nic_tx_drain`), and an
+  out-of-band `fence.enforceable` provider must declare
+  `[capability_facts."fence.enforceable"] cutoff = "wire"` for itself —
+  a local cutoff alone never confirms a hung host quiet. An
+  `implicit_counter` AEAD class is rejected outright: an
+  implicit-contiguous AEAD counter cannot skip forward on takeover, so
+  that transport's honest ceiling is `resumable`.
 
 These checks establish the presence of a capability, not its correctness
 under fault. Mechanism and AEAD fields are only valid on

@@ -288,6 +288,10 @@ mod profile_host {
         /// allocated only from the first `MAX_DG_ENDPOINTS` connection
         /// slots — the id space binds the endpoint count, not the table.
         pub const MAX_DG_ENDPOINTS: usize = 256;
+        /// Connections a transport-continuity pair may hold in flight at
+        /// once: shadows staged for import plus flows being mirrored out.
+        /// A shadow is one connection record plus its checkpoint bytes.
+        pub const MAX_TCP_SHADOWS: usize = 8;
         /// Multi-homing address-table size. Slot 0 is the primary
         /// (DHCP-managed); slots 1.. are secondaries added at runtime via
         /// the ip module's `addr_ctl` port. Demuxed through a hash index
@@ -429,6 +433,8 @@ mod profile_wasm {
         pub const MAX_TCP_CONNS: usize = 256;
         /// Datagram endpoints; see profile_host.
         pub const MAX_DG_ENDPOINTS: usize = 256;
+        /// Transport-continuity shadows; see profile_host.
+        pub const MAX_TCP_SHADOWS: usize = 2;
         /// Multi-homing address-table size.
         pub const MAX_LOCAL_ADDRS: usize = 8;
         /// Pre-transport decision hold slots; see profile_host.
@@ -512,6 +518,8 @@ mod profile_embedded {
         pub const MAX_TCP_CONNS: usize = 16;
         /// Datagram endpoints; see profile_host.
         pub const MAX_DG_ENDPOINTS: usize = 16;
+        /// Transport-continuity shadows; see profile_host.
+        pub const MAX_TCP_SHADOWS: usize = 1;
         /// Multi-homing address-table size.
         pub const MAX_LOCAL_ADDRS: usize = 8;
         /// Pre-transport decision hold slots; see profile_host.

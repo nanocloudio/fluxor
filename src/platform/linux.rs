@@ -43,8 +43,99 @@ struct CliArgs {
     modules_path: String,
 }
 
+/// `fluxor-linux vault-import --label <label> --suite <hmac-sha256|aead-key>
+/// --key-hex <64 hex>`: provision one symmetric key into this host's durable
+/// vault, sealed exactly as the kernel vault seals a key it generated, so a
+/// later `OPEN` by label finds it. The consumer that needs a shared secret
+/// provisioned out of band — a TSIG key for the dns module — has no other
+/// path to one: `OPEN_OR_GENERATE` would mint a key nobody else holds.
+///
+/// Needs `FLUXOR_SEAL_KEY` and `FLUXOR_VAULT_DIR` (or `FLUXOR_STORE_DIR`),
+/// the same two the runtime unseals with. The key is 32 bytes; the label is
+/// at most 64 bytes. Exits 0 on success, 1 otherwise.
+fn vault_import(args: &[String]) -> ! {
+    use fluxor::abi::contracts::key_vault as kv;
+    let mut label = String::new();
+    let mut suite = String::new();
+    let mut key_hex = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        let next = args.get(i + 1).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--label" => label = next,
+            "--suite" => suite = next,
+            "--key-hex" => key_hex = next,
+            other => {
+                eprintln!("error: vault-import: unknown argument: {other}");
+                process::exit(1);
+            }
+        }
+        i += 2;
+    }
+    let (suite_id, usage) = match suite.as_str() {
+        "hmac-sha256" => (
+            kv::suite::HMAC_SHA256,
+            kv::usage::SIGN | kv::usage::VERIFY | kv::usage::PERSIST,
+        ),
+        "aead-key" => (
+            kv::suite::AEAD_KEY,
+            kv::usage::SEAL | kv::usage::OPEN | kv::usage::PERSIST,
+        ),
+        _ => {
+            eprintln!("error: vault-import: --suite must be hmac-sha256 or aead-key");
+            process::exit(1);
+        }
+    };
+    if label.is_empty() || label.len() > kv::MAX_LABEL {
+        eprintln!(
+            "error: vault-import: --label must be 1..={} bytes",
+            kv::MAX_LABEL
+        );
+        process::exit(1);
+    }
+    let key: Option<Vec<u8>> = if key_hex.len() == 64 {
+        (0..32)
+            .map(|k| u8::from_str_radix(&key_hex[2 * k..2 * k + 2], 16).ok())
+            .collect()
+    } else {
+        None
+    };
+    let Some(mut key) = key else {
+        eprintln!("error: vault-import: --key-hex must be 64 hex characters (32 bytes)");
+        process::exit(1);
+    };
+    fluxor::kernel::boot(&LINUX_HAL_OPS);
+    // The kernel vault's record: `[suite:u16][usage:u32][sealed]`, with the
+    // sealed part the HAL's own seal of the raw key — what `persist_key`
+    // writes and `rehydrate_persisted` reads.
+    let mut sealed = [0u8; 32 + 12 + 16];
+    let Some(n) = fluxor::kernel::sys::hal::seal(&key, &mut sealed) else {
+        eprintln!("error: vault-import: this host cannot seal (set FLUXOR_SEAL_KEY, 64 hex)");
+        process::exit(1);
+    };
+    for b in key.iter_mut() {
+        // SAFETY: `b` is a live, exclusively-borrowed byte.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    let mut record = Vec::with_capacity(6 + n);
+    record.extend_from_slice(&suite_id.to_le_bytes());
+    record.extend_from_slice(&usage.to_le_bytes());
+    record.extend_from_slice(&sealed[..n]);
+    if !fluxor::kernel::sys::hal::seal_blob_write(label.as_bytes(), &record) {
+        eprintln!(
+            "error: vault-import: no durable vault (set FLUXOR_VAULT_DIR or FLUXOR_STORE_DIR)"
+        );
+        process::exit(1);
+    }
+    println!("vault-import: {label} ({suite}) sealed");
+    process::exit(0);
+}
+
 fn parse_args() -> CliArgs {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("vault-import") {
+        vault_import(&args[2..]);
+    }
     let mut config_path = String::new();
     let mut modules_path = String::new();
 
@@ -71,6 +162,7 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 eprintln!("Usage: fluxor-linux --config <config.bin> --modules <modules.bin>");
+                eprintln!("       fluxor-linux vault-import --label <label> --suite <hmac-sha256|aead-key> --key-hex <64 hex>");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -c, --config <path>   Path to config.bin");

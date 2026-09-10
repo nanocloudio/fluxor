@@ -123,7 +123,10 @@ available, but it remains a channel contract.
 The same contract carries a second family of verbs, consumed by the `ip`
 module with `packet_decision = pre_transport`: a point between L3
 validation and transport demux where a director settles every inbound
-IPv4 packet before any connection state exists for it.
+IPv4 packet before any connection state exists for it. The stack's own
+control traffic never reaches it: ICMP, and the DHCP server-to-client
+replies that give the stack its address, are answered locally, so a
+director decides flows and never whether the host is on the network.
 
 `ip` parses and validates each packet once — whole (fragments are
 refused before the seam and counted), L3 checksum, addressed to one of
@@ -244,7 +247,10 @@ The control plane between transport anchors, session workers, and
 session directories: attach/detach, drain, chunked opaque state
 export/import with CRC32 integrity, resume, epoch bump, relocation,
 and a hello handshake carrying role constants (`ROLE_ANCHOR` 1,
-`ROLE_WORKER` 2, `ROLE_DIRECTORY` 3).
+`ROLE_WORKER` 2, `ROLE_DIRECTORY` 3). The same framing carries the
+transport-continuity commands (`0x7A..0x88`, one reply opcode `0x9A`
+with a record type) a transport provider answers for the connections
+it owns — see `network.md` §Transport Continuity.
 
 ## The Five Continuity Classes
 
@@ -300,11 +306,17 @@ one of:
 - `native_primitive` — the graph contains a `transport.mux.*`
   provider (a transport whose connection model supports migration,
   such as QUIC).
-- `platform_replicated_state` — the anchor must provide
-  `transport.anchor.datagram`; a `directory` member must provide
-  `session.directory`; the graph must contain providers for
-  `session.reservation`, `security.key_wrap`, `fence.enforceable`,
-  and `durable.rpo_zero`; the declared `aead` class must be
+- `platform_replicated_state` — the anchor must provide one of
+  `transport.anchor.datagram`, `transport.anchor.stream.secure` or
+  `transport.anchor.mux`, and a stream or mux anchor is admitted only on
+  a bare-metal target, where Fluxor owns the whole transport (on a
+  hosted target TCP belongs to the host kernel and cannot be
+  checkpointed); a `directory` member must provide `session.directory`;
+  the graph must contain providers for `session.reservation`,
+  `security.key_wrap`, `fence.enforceable`, and `durable.rpo_zero`, and
+  the fence in two halves — the ip module's, whose `cutoff` reaches
+  `wire` on the target, and an out-of-band fence agent declaring
+  `cutoff = "wire"` for itself; the declared `aead` class must be
   `on_wire_sequence` or `unencrypted` (`implicit_counter` is rejected
   outright: a transport whose AEAD nonces cannot survive an anchor
   move honestly tops out at `resumable`); and the declared
@@ -312,14 +324,15 @@ one of:
 
 Declaring `mechanism` or `aead` under any other class is a hard
 error. The validator checks structure only (the presence of the
-declared providers and the budget inequality), not behaviour under
-fault.
+declared providers, the target facts and the budget inequality), not
+behaviour under fault.
 
-No module in this repository currently declares `session.directory`,
-`session.reservation`, `security.key_wrap`, `fence.enforceable`, or
-`durable.rpo_zero`, so a `platform_replicated_state` graph is a design
-target here: the vocabulary and validation exist, the providers do
-not.
+The transport providers here — `ip` for TCP, `tls` for the record
+layer, `quic` for the mux — answer the session-control contract's
+transport-continuity commands (`network.md` §Transport Continuity);
+`ip` provides `fence.enforceable`. The directory, reservation, key-wrap
+and durable providers are Clustor's `session_directory`, and the
+out-of-band fence agent is Wormhole's.
 
 ## Architectural Roles
 

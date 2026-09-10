@@ -77,7 +77,12 @@ unsafe fn pump_session_inner(s: &mut QuicState, idx: usize, st: HandshakeState) 
             }
             conn.phase = ConnPhase::Established;
             let sys = &*s.syscalls;
-            dev_log(sys, 3, b"[quic] handshake complete".as_ptr(), b"[quic] handshake complete".len());
+            dev_log(
+                sys,
+                3,
+                b"[quic] handshake complete".as_ptr(),
+                b"[quic] handshake complete".len(),
+            );
             true
         }
         HandshakeState::Error => {
@@ -160,8 +165,7 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
         && ch.psk_dhe_offered
         && ch.psk_binders_off.is_some()
     {
-        if let (Some(psk_ext), Some(binders_off_in_body)) =
-            (ch.pre_shared_key, ch.psk_binders_off)
+        if let (Some(psk_ext), Some(binders_off_in_body)) = (ch.pre_shared_key, ch.psk_binders_off)
         {
             // The first identity in OfferedPsks is the only one we
             // try to match. Walk the identities iterator + corresponding
@@ -262,8 +266,7 @@ unsafe fn pump_recv_client_hello(s: &mut QuicState, idx: usize) -> bool {
                                             && ticket_claim(
                                                 &mut s.ticket_seen[..],
                                                 digest,
-                                                issue_ms
-                                                    .saturating_add((lifetime_s as u64) * 1000),
+                                                issue_ms.saturating_add((lifetime_s as u64) * 1000),
                                                 now_ms,
                                             )
                                         {
@@ -619,7 +622,11 @@ unsafe fn pump_send_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
     let mut tp = [0u8; TP_BUF_LEN];
     let scid_len = s.conns[idx].our_cid_len as usize;
     let mut scid_buf = [0u8; MAX_CID_LEN];
-    core::ptr::copy_nonoverlapping(s.conns[idx].our_cid.as_ptr(), scid_buf.as_mut_ptr(), scid_len);
+    core::ptr::copy_nonoverlapping(
+        s.conns[idx].our_cid.as_ptr(),
+        scid_buf.as_mut_ptr(),
+        scid_len,
+    );
     let orig_dcid_len = s.conns[idx].original_dcid_len as usize;
     let mut orig_buf = [0u8; MAX_CID_LEN];
     core::ptr::copy_nonoverlapping(
@@ -643,7 +650,11 @@ unsafe fn pump_send_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
             rsc_len,
         );
     }
-    let rsc_opt = if used_retry { Some(&rsc_buf[..rsc_len]) } else { None };
+    let rsc_opt = if used_retry {
+        Some(&rsc_buf[..rsc_len])
+    } else {
+        None
+    };
     let tp_len = build_transport_params_server(
         &scid_buf[..scid_len],
         &orig_buf[..orig_dcid_len],
@@ -689,7 +700,11 @@ unsafe fn pump_send_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
 }
 
 unsafe fn pump_send_certificate(s: &mut QuicState, idx: usize) -> bool {
-    let cert_len = if s.cert_len <= MAX_CERT_LEN { s.cert_len } else { 0 };
+    let cert_len = if s.cert_len <= MAX_CERT_LEN {
+        s.cert_len
+    } else {
+        0
+    };
     let cert = core::slice::from_raw_parts(s.cert.as_ptr(), cert_len);
     let driver = &mut s.conns[idx].driver;
     let msg_len = build_certificate(cert, &mut driver.scratch);
@@ -750,8 +765,7 @@ unsafe fn pump_send_certificate_verify(s: &mut QuicState, idx: usize) -> bool {
         };
         let context = b"TLS 1.3, server CertificateVerify";
         let mut verify_content = [0u8; 200];
-        let vc_len =
-            build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
+        let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
         let vc_hash = sha256(&verify_content[..vc_len]);
 
         let mut priv_key = [0u8; 32];
@@ -1023,7 +1037,11 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
     let mut tp = [0u8; TP_BUF_LEN];
     let scid_len = s.conns[idx].our_cid_len as usize;
     let mut scid_buf = [0u8; MAX_CID_LEN];
-    core::ptr::copy_nonoverlapping(s.conns[idx].our_cid.as_ptr(), scid_buf.as_mut_ptr(), scid_len);
+    core::ptr::copy_nonoverlapping(
+        s.conns[idx].our_cid.as_ptr(),
+        scid_buf.as_mut_ptr(),
+        scid_len,
+    );
     let tp_len =
         build_transport_params_client(&scid_buf[..scid_len], s.disable_migration != 0, &mut tp);
 
@@ -1291,7 +1309,11 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
             rsc_len,
         );
     }
-    let rsc_opt = if used_retry { Some(&rsc_buf[..rsc_len]) } else { None };
+    let rsc_opt = if used_retry {
+        Some(&rsc_buf[..rsc_len])
+    } else {
+        None
+    };
     if !validate_transport_params(
         tp,
         &peer_cid_buf[..peer_cid_len],
@@ -1314,8 +1336,7 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
         // server selects a protocol the client did not offer (or one
         // that doesn't fit our fixed store) — never silently adopt an
         // unrequested protocol.
-        if proto.len() > MAX_ALPN
-            || !alpn_offered_contains(&offered_cfg[..offered_cfg_len], proto)
+        if proto.len() > MAX_ALPN || !alpn_offered_contains(&offered_cfg[..offered_cfg_len], proto)
         {
             conn.driver.hs_state = HandshakeState::Error;
             return true;
@@ -1355,7 +1376,11 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
     let trust_ptr = s.trust_cert.as_ptr();
     let trust_len = if verify_peer { s.trust_cert_len } else { 0 };
     let host_ptr = s.verify_hostname.as_ptr();
-    let host_len = if verify_peer { s.verify_hostname_len } else { 0 };
+    let host_len = if verify_peer {
+        s.verify_hostname_len
+    } else {
+        0
+    };
     let sys_ptr = s.syscalls;
 
     let conn = &mut s.conns[idx];
@@ -1392,7 +1417,10 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
             let mut buf = [0u8; 48];
             let prefix = b"[quic] cert chain FAIL rc=";
             let mut p = 0;
-            while p < prefix.len() { buf[p] = prefix[p]; p += 1; }
+            while p < prefix.len() {
+                buf[p] = prefix[p];
+                p += 1;
+            }
             let mut rc_v = rc;
             let mut digits = [0u8; 10];
             let mut nd = 0;
@@ -1432,16 +1460,14 @@ unsafe fn extract_peer_cert_pubkey_quic(body: &[u8], driver: &mut HandshakeDrive
         return false;
     }
     let mut pos = 1 + ctx_len;
-    let list_len = ((body[pos] as usize) << 16)
-        | ((body[pos + 1] as usize) << 8)
-        | (body[pos + 2] as usize);
+    let list_len =
+        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
     pos += 3;
     if pos + list_len > body.len() || list_len < 3 {
         return false;
     }
-    let cert_len = ((body[pos] as usize) << 16)
-        | ((body[pos + 1] as usize) << 8)
-        | (body[pos + 2] as usize);
+    let cert_len =
+        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
     pos += 3;
     if pos + cert_len > body.len() {
         return false;
@@ -1450,11 +1476,7 @@ unsafe fn extract_peer_cert_pubkey_quic(body: &[u8], driver: &mut HandshakeDrive
     if let Some(parsed) = parse_certificate(cert_der) {
         let pk = parsed.public_key;
         let n = if pk.len() <= 65 { pk.len() } else { 65 };
-        core::ptr::copy_nonoverlapping(
-            pk.as_ptr(),
-            driver.peer_cert_pubkey.as_mut_ptr(),
-            n,
-        );
+        core::ptr::copy_nonoverlapping(pk.as_ptr(), driver.peer_cert_pubkey.as_mut_ptr(), n);
         driver.peer_cert_pubkey_len = n as u8;
         true
     } else {
@@ -1637,7 +1659,15 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                     mark_inbound_consumed(&mut s.conns[idx]);
                     return false;
                 }
-                InitialAction::Proceed { used_retry, odcid_for_tp, odcid_len_for_tp, dcid_buf, dcid_len, scid_buf, scid_len } => {
+                InitialAction::Proceed {
+                    used_retry,
+                    odcid_for_tp,
+                    odcid_len_for_tp,
+                    dcid_buf,
+                    dcid_len,
+                    scid_buf,
+                    scid_len,
+                } => {
                     let conn = &mut s.conns[idx];
                     if used_retry {
                         // Retry-bound second Initial. ODCID for TP is
@@ -1656,8 +1686,7 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                         // client used in this Initial.
                         conn.our_cid[..dcid_len].copy_from_slice(&dcid_buf[..dcid_len]);
                         conn.our_cid_len = dcid_len as u8;
-                        conn.retry_source_cid[..dcid_len]
-                            .copy_from_slice(&dcid_buf[..dcid_len]);
+                        conn.retry_source_cid[..dcid_len].copy_from_slice(&dcid_buf[..dcid_len]);
                         conn.retry_source_cid_len = dcid_len as u8;
                     } else {
                         conn.original_dcid[..dcid_len].copy_from_slice(&dcid_buf[..dcid_len]);
@@ -1695,7 +1724,8 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
             pkt_copy.as_mut_ptr(),
             avail,
         );
-        let parsed = match parse_long_packet(&read_keys, &hp, largest_recv, &mut pkt_copy[..avail]) {
+        let parsed = match parse_long_packet(&read_keys, &hp, largest_recv, &mut pkt_copy[..avail])
+        {
             Some(p) => p,
             None => {
                 mark_inbound_consumed(conn);
@@ -1716,7 +1746,11 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         if !conn.is_server && pkt_type == PKT_INITIAL && parsed.scid_len > 0 {
             let scid_off = parsed.scid_off;
             let scid_len = parsed.scid_len;
-            let n = if scid_len <= MAX_CID_LEN { scid_len } else { MAX_CID_LEN };
+            let n = if scid_len <= MAX_CID_LEN {
+                scid_len
+            } else {
+                MAX_CID_LEN
+            };
             core::ptr::copy_nonoverlapping(
                 pkt_copy.as_ptr().add(scid_off),
                 conn.peer_cid.as_mut_ptr(),
@@ -1795,6 +1829,30 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                 rotated = true;
             }
         }
+        // RFC 9001 §6.5 — a packet reordered from the previous phase still
+        // decrypts under the retained old read keys within the retention
+        // window. This is NOT a rotation.
+        if decrypt_result.is_none() && conn.one_rtt.prev_read_valid {
+            let now_ms = dev_millis(&*s.syscalls);
+            if now_ms.saturating_sub(conn.one_rtt.prev_read_since_ms) <= KEY_UPDATE_RETENTION_MS {
+                core::ptr::copy_nonoverlapping(
+                    conn.inbound.as_ptr().add(off),
+                    pkt_copy.as_mut_ptr(),
+                    avail,
+                );
+                let prev_keys = conn.one_rtt.prev_read_keys;
+                let prev_hp = Aes128Hp::new(&conn.one_rtt.prev_read_keys.hp);
+                decrypt_result = parse_one_rtt_packet(
+                    &prev_keys,
+                    &prev_hp,
+                    dcid_len,
+                    largest_recv,
+                    &mut pkt_copy[..avail],
+                );
+            } else {
+                conn.one_rtt.prev_read_valid = false;
+            }
+        }
         let (body_off, body_len, pn) = match decrypt_result {
             Some(t) => t,
             None => {
@@ -1808,6 +1866,10 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
             // an updated read phase) and pre-derive a fresh next
             // phase for the following rotation.
             let hl = conn.one_rtt.secret_len as usize;
+            // Retain the outgoing read phase for reordered packets.
+            conn.one_rtt.prev_read_keys = conn.one_rtt.read_keys;
+            conn.one_rtt.prev_read_valid = true;
+            conn.one_rtt.prev_read_since_ms = dev_millis(&*s.syscalls);
             conn.one_rtt.read_keys = conn.one_rtt.next_read_keys;
             let next_secret = conn.one_rtt.next_read_secret;
             conn.one_rtt.read_secret[..hl].copy_from_slice(&next_secret[..hl]);
@@ -1828,14 +1890,21 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
             let sys = &*s.syscalls;
             let msg = b"[quic] key update accepted";
             dev_log(sys, 3, msg.as_ptr(), msg.len());
+            if conn.cont_mirror && mirror_key_phase(sys, s.cont_out, conn) == 0 {
+                mirror_abandon(sys, s.cont_out, conn);
+            }
         }
         conn.one_rtt.largest_recv_pn = if pn > conn.one_rtt.largest_recv_pn {
             pn
         } else {
             conn.one_rtt.largest_recv_pn
         };
-        conn.one_rtt.ack_pending = true;
-        conn.one_rtt.ack_tracker.record(pn, 0);
+        // Acknowledged to the peer now, unless the mirror holds it until
+        // the standby has confirmed the number.
+        if !on_one_rtt_received(&*s.syscalls, s.cont_out, conn, pn) {
+            conn.one_rtt.ack_pending = true;
+            conn.one_rtt.ack_tracker.record(pn, 0);
+        }
         // Server: receipt of an ack-eliciting 1-RTT packet confirms
         // the handshake (RFC 9001 §4.1.2).
         if conn.is_server {
@@ -1880,9 +1949,8 @@ pub(crate) unsafe fn arm_migration_if_new_path(
     {
         return;
     }
-    let already = conn.path_validating
-        && conn.cand_ip == conn.recv_ip
-        && conn.cand_port == conn.recv_port;
+    let already =
+        conn.path_validating && conn.cand_ip == conn.recv_ip && conn.cand_port == conn.recv_port;
     if !already {
         // New candidate: fresh challenge bytes.
         conn.cand_ip = conn.recv_ip;
@@ -1907,7 +1975,10 @@ fn mark_inbound_consumed(conn: &mut QuicConnection) {
 // Retry plumbing (RFC 9000 §17.2.5 + §8.1.2 + RFC 9001 §5.8).
 // ---------------------------------------------------------------------
 
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 enum InitialAction {
     IssueRetry {
         dcid: [u8; MAX_CID_LEN],
@@ -1943,11 +2014,7 @@ unsafe fn peek_initial_for_retry(
         return InitialAction::Reject;
     }
     let mut dcid_buf = [0u8; MAX_CID_LEN];
-    core::ptr::copy_nonoverlapping(
-        inb.as_ptr().add(off + 6),
-        dcid_buf.as_mut_ptr(),
-        dcid_len,
-    );
+    core::ptr::copy_nonoverlapping(inb.as_ptr().add(off + 6), dcid_buf.as_mut_ptr(), dcid_len);
     let scid_len_off = 6 + dcid_len;
     let scid_len = inb[off + scid_len_off] as usize;
     if scid_len_off + 1 + scid_len > avail || scid_len > MAX_CID_LEN {
@@ -2062,11 +2129,7 @@ unsafe fn emit_retry(
     if dcid_len > MAX_CID_LEN {
         return;
     }
-    core::ptr::copy_nonoverlapping(
-        inb.as_ptr().add(off + 6),
-        odcid.as_mut_ptr(),
-        dcid_len,
-    );
+    core::ptr::copy_nonoverlapping(inb.as_ptr().add(off + 6), odcid.as_mut_ptr(), dcid_len);
     let scid_len_off = 6 + dcid_len;
     let scid_len = inb[off + scid_len_off] as usize;
     if scid_len > MAX_CID_LEN {
@@ -2097,8 +2160,20 @@ unsafe fn emit_retry(
     }
     let sys = &*s.syscalls;
     let peer = s.conns[idx].peer;
-    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..n], &mut s.net_scratch);
-    dev_log(sys, 3, b"[quic] retry sent".as_ptr(), b"[quic] retry sent".len());
+    let _ = send_datagram(
+        sys,
+        s.net_out,
+        &s.endpoint,
+        &peer,
+        &pkt[..n],
+        &mut s.net_scratch,
+    );
+    dev_log(
+        sys,
+        3,
+        b"[quic] retry sent".as_ptr(),
+        b"[quic] retry sent".len(),
+    );
 }
 
 /// Client: handle a freshly-arrived Retry packet. Validates the
@@ -2118,12 +2193,12 @@ unsafe fn handle_retry(s: &mut QuicState, idx: usize, off: usize, avail: usize) 
         return false;
     }
     let mut pkt = [0u8; QUIC_DGRAM_MAX];
-    let n = if avail < QUIC_DGRAM_MAX { avail } else { QUIC_DGRAM_MAX };
-    core::ptr::copy_nonoverlapping(
-        s.conns[idx].inbound.as_ptr().add(off),
-        pkt.as_mut_ptr(),
-        n,
-    );
+    let n = if avail < QUIC_DGRAM_MAX {
+        avail
+    } else {
+        QUIC_DGRAM_MAX
+    };
+    core::ptr::copy_nonoverlapping(s.conns[idx].inbound.as_ptr().add(off), pkt.as_mut_ptr(), n);
     let odcid_len = s.conns[idx].original_dcid_len as usize;
     let mut odcid_buf = [0u8; MAX_CID_LEN];
     core::ptr::copy_nonoverlapping(
@@ -2195,7 +2270,12 @@ unsafe fn handle_retry(s: &mut QuicState, idx: usize, off: usize, avail: usize) 
 
     mark_inbound_consumed(conn);
     let sys = &*s.syscalls;
-    dev_log(sys, 3, b"[quic] retry recv'd".as_ptr(), b"[quic] retry recv'd".len());
+    dev_log(
+        sys,
+        3,
+        b"[quic] retry recv'd".as_ptr(),
+        b"[quic] retry recv'd".len(),
+    );
     true
 }
 
@@ -2219,8 +2299,16 @@ unsafe fn emit_version_negotiation(s: &mut QuicState, idx: usize, off: usize, av
     // Mirror DCID/SCID — peer's SCID becomes our DCID and vice versa.
     let mut peer_dcid = [0u8; MAX_CID_LEN];
     let mut peer_scid = [0u8; MAX_CID_LEN];
-    let dn = if dcid_len <= MAX_CID_LEN { dcid_len } else { MAX_CID_LEN };
-    let sn = if scid_len <= MAX_CID_LEN { scid_len } else { MAX_CID_LEN };
+    let dn = if dcid_len <= MAX_CID_LEN {
+        dcid_len
+    } else {
+        MAX_CID_LEN
+    };
+    let sn = if scid_len <= MAX_CID_LEN {
+        scid_len
+    } else {
+        MAX_CID_LEN
+    };
     core::ptr::copy_nonoverlapping(
         s.conns[idx].inbound.as_ptr().add(off + 6),
         peer_dcid.as_mut_ptr(),
@@ -2238,7 +2326,14 @@ unsafe fn emit_version_negotiation(s: &mut QuicState, idx: usize, off: usize, av
     }
     let sys = &*s.syscalls;
     let peer = s.conns[idx].peer;
-    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..n], &mut s.net_scratch);
+    let _ = send_datagram(
+        sys,
+        s.net_out,
+        &s.endpoint,
+        &peer,
+        &pkt[..n],
+        &mut s.net_scratch,
+    );
 }
 
 /// Walk and dispatch every frame in a decrypted packet payload. Sets
@@ -2424,6 +2519,16 @@ unsafe fn process_frames(
                 if let Some(sample) = new_rtt_sample {
                     conn.rtt.update(sample);
                 }
+                // RFC 9001 §6.1: a locally-initiated key update is
+                // confirmed once the peer acknowledges a packet sent in the
+                // new phase. Only then may another update begin.
+                if matches!(level, EncLevel::OneRtt)
+                    && conn.key_update_awaiting_ack
+                    && conn.one_rtt.peer_acked_seen
+                    && conn.one_rtt.peer_acked_largest >= conn.key_update_first_pn
+                {
+                    conn.key_update_awaiting_ack = false;
+                }
                 // Drive NewReno (RFC 9002 §B.5). `cc_on_ack` decrements
                 // bytes_in_flight + grows the window via slow-start or
                 // congestion-avoidance depending on cwnd vs ssthresh.
@@ -2457,7 +2562,8 @@ unsafe fn process_frames(
                         if space.peer_acked_seen && p.pn <= pkt_threshold {
                             lost = true;
                         }
-                        if !lost && time_threshold_ms > 0
+                        if !lost
+                            && time_threshold_ms > 0
                             && p.sent_ms > 0
                             && now_ms.saturating_sub(p.sent_ms) > time_threshold_ms
                         {
@@ -2737,10 +2843,7 @@ unsafe fn process_frames(
                 pos += 8;
                 let on_candidate_path =
                     conn.recv_ip == conn.cand_ip && conn.recv_port == conn.cand_port;
-                if conn.path_validating
-                    && data == conn.path_challenge_data
-                    && on_candidate_path
-                {
+                if conn.path_validating && data == conn.path_challenge_data && on_candidate_path {
                     conn.peer = PeerAddr {
                         ip: conn.cand_ip,
                         port: conn.cand_port,
@@ -2821,7 +2924,9 @@ unsafe fn handle_stream_frame(conn: &mut QuicConnection, sf: &StreamFrame<'_>) {
         }
         core::ptr::copy_nonoverlapping(
             data_slice.as_ptr(),
-            conn.stream_recv_buf.as_mut_ptr().add(conn.stream_recv_buf_len),
+            conn.stream_recv_buf
+                .as_mut_ptr()
+                .add(conn.stream_recv_buf_len),
             n,
         );
         conn.stream_recv_buf_len += n;
@@ -3016,11 +3121,7 @@ unsafe fn handle_crypto_frame(
     // Snapshot the contiguous bytes out of the hold buffer so we can
     // shift before feeding the driver (avoids overlapping borrows).
     let mut tmp = [0u8; CRYPTO_HOLD_LEN];
-    core::ptr::copy_nonoverlapping(
-        space.reassembler.buf.as_ptr(),
-        tmp.as_mut_ptr(),
-        high,
-    );
+    core::ptr::copy_nonoverlapping(space.reassembler.buf.as_ptr(), tmp.as_mut_ptr(), high);
     space.reassembler.shift(high);
     space.crypto_recv_offset += high as u64;
 
@@ -3043,26 +3144,26 @@ unsafe fn handle_post_handshake_crypto(conn: &mut QuicConnection, mut data: &[u8
     // walk them. Each starts with a 4-byte handshake header.
     while data.len() >= 4 {
         let msg_type = data[0];
-        let body_len = ((data[1] as usize) << 16)
-            | ((data[2] as usize) << 8)
-            | (data[3] as usize);
+        let body_len = ((data[1] as usize) << 16) | ((data[2] as usize) << 8) | (data[3] as usize);
         if 4 + body_len > data.len() {
             break;
         }
         let body = &data[4..4 + body_len];
-        if msg_type == 4 /* HT_NEW_SESSION_TICKET */ {
+        if msg_type == 4
+        /* HT_NEW_SESSION_TICKET */
+        {
             if let Some(parsed) = parse_new_session_ticket(body) {
                 let _ = parsed.lifetime_s;
                 let _ = parsed; // surfaced via the conn-level callback
-                // Derive the per-ticket PSK = HKDF-Expand-Label(
-                //   resumption_master_secret, "resumption", ticket_nonce, hash_len
-                // ). For that we need the RMS — derive it now from
-                // master_secret + client Finished hash if not already.
-                // The client uses its own server_finished_hash plus the
-                // post-finished transcript update — for simplicity we
-                // re-derive RMS using the current transcript hash
-                // (which on the client at this point includes its own
-                // Finished, equivalent to the server's view).
+                                // Derive the per-ticket PSK = HKDF-Expand-Label(
+                                //   resumption_master_secret, "resumption", ticket_nonce, hash_len
+                                // ). For that we need the RMS — derive it now from
+                                // master_secret + client Finished hash if not already.
+                                // The client uses its own server_finished_hash plus the
+                                // post-finished transcript update — for simplicity we
+                                // re-derive RMS using the current transcript hash
+                                // (which on the client at this point includes its own
+                                // Finished, equivalent to the server's view).
                 conn.session_ticket_handled = true;
                 // Stash identity + parsed bytes on the conn for the
                 // outer pump to copy into the client_tickets cache.
@@ -3221,8 +3322,7 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
             let one_rtt_crypto_pending = level_at_one_rtt && conn.driver.out_len > 0;
             let one_rtt_data_pending =
                 one_rtt_crypto_pending || (level_at_one_rtt && one_rtt_ack_eliciting_pending);
-            let one_rtt_cc_blocked = one_rtt_data_pending
-                && !conn.cc_can_send(MAX_DATAGRAM_SIZE);
+            let one_rtt_cc_blocked = one_rtt_data_pending && !conn.cc_can_send(MAX_DATAGRAM_SIZE);
 
             // ACKs are not congestion-controlled (RFC 9002 §A.1, §7),
             // so a CC-blocked 1-RTT path must NOT suppress pending
@@ -3377,6 +3477,61 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
 /// All other connection-state mutations (PN advance, ack_pending,
 /// pending_handshake_done, per-stream send buffers) are deferred to
 /// the success path so a build failure leaves no "sent" residue.
+/// RFC 9001 §6 key update — INITIATION. The responder path (flipping on
+/// receipt of a new peer phase) lives in `drain_inbound_one`. Initiation is
+/// a protocol exchange with prerequisites: only after handshake
+/// confirmation, only when any prior update has been acknowledged, and only
+/// when the operational knob asks for it. It flips the phase, promotes the
+/// pre-derived next-phase keys to current, retains the previous read keys
+/// for the reordering window, and pre-derives the following
+/// generation. The packet-number reservation is NOT reset.
+unsafe fn maybe_initiate_key_update(conn: &mut QuicConnection, now_ms: u64, threshold: u32) {
+    if threshold == 0
+        || !conn.handshake_confirmed
+        || !conn.one_rtt.keys_set
+        || !conn.one_rtt.next_keys_ready
+        || conn.key_update_awaiting_ack
+        || conn.one_rtt_pkts_since_phase < threshold
+    {
+        return;
+    }
+    let hl = conn.one_rtt.secret_len as usize;
+    if hl == 0 {
+        return;
+    }
+    // Retain the outgoing read phase so a reordered packet still encrypted
+    // under it decrypts within the retention window.
+    conn.one_rtt.prev_read_keys = conn.one_rtt.read_keys;
+    conn.one_rtt.prev_read_valid = true;
+    conn.one_rtt.prev_read_since_ms = now_ms;
+    // Promote the pre-derived next phase to current, both directions.
+    conn.one_rtt.read_keys = conn.one_rtt.next_read_keys;
+    let nr = conn.one_rtt.next_read_secret;
+    conn.one_rtt.read_secret[..hl].copy_from_slice(&nr[..hl]);
+    conn.one_rtt.write_keys = conn.one_rtt.next_write_keys;
+    let nw = conn.one_rtt.next_write_secret;
+    conn.one_rtt.write_secret[..hl].copy_from_slice(&nw[..hl]);
+    conn.one_rtt.key_phase ^= 1;
+    // Pre-derive the following generation so the next flip is a swap.
+    let mut new_next_r = [0u8; 48];
+    next_traffic_secret(&conn.one_rtt.read_secret[..hl], &mut new_next_r[..hl]);
+    let mut new_next_w = [0u8; 48];
+    next_traffic_secret(&conn.one_rtt.write_secret[..hl], &mut new_next_w[..hl]);
+    conn.one_rtt.next_read_secret[..hl].copy_from_slice(&new_next_r[..hl]);
+    conn.one_rtt.next_write_secret[..hl].copy_from_slice(&new_next_w[..hl]);
+    let prev_read_hp = conn.one_rtt.read_keys.hp;
+    let prev_write_hp = conn.one_rtt.write_keys.hp;
+    conn.one_rtt.next_read_keys = next_keys(&new_next_r[..hl], prev_read_hp);
+    conn.one_rtt.next_write_keys = next_keys(&new_next_w[..hl], prev_write_hp);
+    // The update is in flight: a packet in the new phase must be
+    // acknowledged before another may begin.
+    conn.key_update_awaiting_ack = true;
+    conn.key_update_first_pn = conn.one_rtt.next_send_pn;
+    conn.one_rtt_pkts_since_phase = 0;
+    let msg = b"[quic] key update initiated";
+    let _ = msg;
+}
+
 unsafe fn emit_crypto_packet(
     s: &mut QuicState,
     idx: usize,
@@ -3385,6 +3540,35 @@ unsafe fn emit_crypto_packet(
     ack_only_mode: bool,
 ) -> (bool, usize) {
     let sys = &*s.syscalls;
+
+    // 1-RTT emission is gated by the send packet-number reservation and is
+    // where a key update is initiated (both RFC 9001 §6 and §13.7.2 apply
+    // only to the 1-RTT space). Initiation happens before the packet is
+    // built so it goes out under the new phase; the reservation gate holds
+    // emission when the granted blocks are spent rather than reusing a
+    // number.
+    if matches!(level, EncLevel::OneRtt) {
+        // Strict-profile send horizon: a mirrored flow in
+        // crash-continuous profile withholds the packet until its
+        // DELTA_ACK returns, so a takeover retransmits identical
+        // ciphertext rather than emitting bytes the standby never saw.
+        if s.conns[idx].cont_emission_held {
+            return (false, 0);
+        }
+        let now_ms = dev_millis(sys);
+        let phase_before = s.conns[idx].one_rtt.key_phase;
+        maybe_initiate_key_update(&mut s.conns[idx], now_ms, s.key_update_pkts);
+        if s.conns[idx].one_rtt.key_phase != phase_before && s.conns[idx].cont_mirror {
+            let cont_out = s.cont_out;
+            if mirror_key_phase(sys, cont_out, &mut s.conns[idx]) == 0 {
+                mirror_abandon(sys, cont_out, &mut s.conns[idx]);
+            }
+        }
+        if !s.conns[idx].one_rtt_pn_ok() {
+            s.reservation_exhausted_stall = s.reservation_exhausted_stall.wrapping_add(1);
+            return (false, 0);
+        }
+    }
 
     // Snapshot necessary fields out of the connection so we can build
     // payloads without holding a borrow on the conn during send.
@@ -3495,8 +3679,7 @@ unsafe fn emit_crypto_packet(
                 // should make this unreachable).
                 return (false, 0);
             }
-            payload[payload_len..payload_len + frame_len]
-                .copy_from_slice(&frame_buf[..frame_len]);
+            payload[payload_len..payload_len + frame_len].copy_from_slice(&frame_buf[..frame_len]);
             payload_len += frame_len;
             crypto_packed = send_now;
         }
@@ -3507,11 +3690,12 @@ unsafe fn emit_crypto_packet(
     if matches!(level, EncLevel::OneRtt)
         && !ack_only_mode
         && s.conns[idx].pending_handshake_done
-        && payload_len < payload.len() {
-            payload[payload_len] = FRAME_HANDSHAKE_DONE;
-            payload_len += 1;
-            had_handshake_done = true;
-        }
+        && payload_len < payload.len()
+    {
+        payload[payload_len] = FRAME_HANDSHAKE_DONE;
+        payload_len += 1;
+        had_handshake_done = true;
+    }
 
     // STREAM frames. On the transparent surface there is one stream and
     // it lives in the legacy buffer; on the framed mux surface every
@@ -3665,8 +3849,7 @@ unsafe fn emit_crypto_packet(
             }
             if slot.flow.send_blocked_pending {
                 let mut fb = [0u8; 24];
-                let n =
-                    build_stream_data_blocked(slot.stream_id, slot.flow.send_max_data, &mut fb);
+                let n = build_stream_data_blocked(slot.stream_id, slot.flow.send_max_data, &mut fb);
                 if n > 0 && payload_len + n <= payload.len() {
                     payload[payload_len..payload_len + n].copy_from_slice(&fb[..n]);
                     payload_len += n;
@@ -3699,10 +3882,7 @@ unsafe fn emit_crypto_packet(
             if !slot.allocated {
                 continue;
             }
-            if slot.locally_initiated
-                && slot.abort.reset_pending
-                && !slot.abort.reset_emitted
-            {
+            if slot.locally_initiated && slot.abort.reset_pending && !slot.abort.reset_emitted {
                 let mut fb = [0u8; 32];
                 let n = build_reset_stream(
                     slot.stream_id,
@@ -3717,10 +3897,7 @@ unsafe fn emit_crypto_packet(
                 }
                 continue;
             }
-            if !slot.locally_initiated
-                && slot.abort.stop_pending
-                && !slot.abort.stop_emitted
-            {
+            if !slot.locally_initiated && slot.abort.stop_pending && !slot.abort.stop_emitted {
                 let mut fb = [0u8; 32];
                 let n = build_stop_sending(slot.stream_id, slot.abort.stop_error, &mut fb);
                 if n > 0 && payload_len + n <= payload.len() {
@@ -3739,8 +3916,7 @@ unsafe fn emit_crypto_packet(
                 }
             }
             if slot.locally_initiated
-                && (slot.send_buf_len > 0
-                    || (slot.send_fin_pending && !slot.send_fin_emitted))
+                && (slot.send_buf_len > 0 || (slot.send_fin_pending && !slot.send_fin_emitted))
             {
                 let mut frame_buf = [0u8; 384];
                 let n = build_stream(
@@ -3831,14 +4007,12 @@ unsafe fn emit_crypto_packet(
     // Pre-compute total length to decide padding for Initial.
     // Token-length varint + token bytes need to be accounted for if
     // the client carries a Retry token.
-    let token_inline_len = if matches!(level, EncLevel::Initial)
-        && !is_server
-        && s.conns[idx].retry_token_len > 0
-    {
-        s.conns[idx].retry_token_len
-    } else {
-        0
-    };
+    let token_inline_len =
+        if matches!(level, EncLevel::Initial) && !is_server && s.conns[idx].retry_token_len > 0 {
+            s.conns[idx].retry_token_len
+        } else {
+            0
+        };
     if pad_to_min_initial {
         // RFC 9000 §14.1 cuts both ways: a client MUST expand a datagram
         // carrying an Initial to at least 1200 bytes, and a server MUST DISCARD
@@ -3853,8 +4027,15 @@ unsafe fn emit_crypto_packet(
         // estimation error can only add padding.
         let token_len_size = 1;
         let est_length_size = 1;
-        let hdr = 1 + 4 + 1 + dcid.len() + 1 + scid.len()
-            + token_len_size + token_inline_len + est_length_size;
+        let hdr = 1
+            + 4
+            + 1
+            + dcid.len()
+            + 1
+            + scid.len()
+            + token_len_size
+            + token_inline_len
+            + est_length_size;
         let aead = pn_len + payload_len + 16;
         let total = hdr + aead;
         if total < INITIAL_MIN_DATAGRAM_LEN {
@@ -3900,21 +4081,42 @@ unsafe fn emit_crypto_packet(
         && s.conns[idx].retry_token_len > 0
     {
         let t_len = s.conns[idx].retry_token_len;
-        token_buf[..t_len]
-            .copy_from_slice(&s.conns[idx].retry_token[..t_len]);
+        token_buf[..t_len].copy_from_slice(&s.conns[idx].retry_token[..t_len]);
         &token_buf[..t_len]
     } else {
         &[]
     };
     let n = match level {
         EncLevel::Initial => build_initial_packet(
-            &keys, &hp, pn, pn_len, dcid, scid, token, &payload[..payload_len], &mut pkt,
+            &keys,
+            &hp,
+            pn,
+            pn_len,
+            dcid,
+            scid,
+            token,
+            &payload[..payload_len],
+            &mut pkt,
         ),
         EncLevel::Handshake => build_handshake_packet(
-            &keys, &hp, pn, pn_len, dcid, scid, &payload[..payload_len], &mut pkt,
+            &keys,
+            &hp,
+            pn,
+            pn_len,
+            dcid,
+            scid,
+            &payload[..payload_len],
+            &mut pkt,
         ),
         EncLevel::OneRtt => build_one_rtt_packet(
-            &keys, &hp, pn, pn_len, key_phase, dcid, &payload[..payload_len], &mut pkt,
+            &keys,
+            &hp,
+            pn,
+            pn_len,
+            key_phase,
+            dcid,
+            &payload[..payload_len],
+            &mut pkt,
         ),
     };
     if n == 0 {
@@ -3926,7 +4128,35 @@ unsafe fn emit_crypto_packet(
         return (false, 0);
     }
 
-    if !send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..n], &mut s.net_scratch) {
+    // Mirror a 1-RTT packet before it can reach the wire. Under the strict
+    // profile it then stays off the wire until the standby confirms the
+    // delta: the number is consumed and the ciphertext fixed here, and
+    // `release_held` sends exactly these bytes later, so a takeover in
+    // between retransmits what the peer may hold rather than something it
+    // never saw. A mirror the channel cannot carry is abandoned, and the
+    // packet goes out unmirrored.
+    let mut held = false;
+    if matches!(level, EncLevel::OneRtt) && s.conns[idx].cont_mirror {
+        let cont_out = s.cont_out;
+        let no = mirror_send(sys, cont_out, &mut s.conns[idx], pn, &pkt[..n]);
+        if no == 0 {
+            mirror_abandon(sys, cont_out, &mut s.conns[idx]);
+        } else if mirror_strict(&s.conns[idx]) {
+            s.conns[idx].cont_emission_held = true;
+            s.conns[idx].cont_held_delta = no;
+            held = true;
+        }
+    }
+    if !held
+        && !send_datagram(
+            sys,
+            s.net_out,
+            &s.endpoint,
+            &peer,
+            &pkt[..n],
+            &mut s.net_scratch,
+        )
+    {
         // Channel backpressure — the packet did NOT make it onto the
         // wire. Leave every per-conn field intact (PN, crypto offset,
         // ack_pending, pending_handshake_done, stream send buffers,
@@ -4039,6 +4269,13 @@ unsafe fn emit_crypto_packet(
             space.ack_pending = false;
         }
     }
+    // Advance the 1-RTT reservation in lockstep with the emitted packet and
+    // count it toward the current key phase (the key-update trigger).
+    if matches!(level, EncLevel::OneRtt) {
+        let c = &mut s.conns[idx];
+        c.one_rtt_pn_commit();
+        c.one_rtt_pkts_since_phase = c.one_rtt_pkts_since_phase.saturating_add(1);
+    }
 
     // Retx tracking — stash the emitted bytes so a timer expiry can
     // resend them. If `last_emitted_len` is already nonzero we
@@ -4106,13 +4343,9 @@ unsafe fn emit_crypto_packet(
     // the small `sent_packets` ring would evict still-unacked
     // ack-eliciting entries — leaving their bytes_in_flight stranded
     // when the corresponding ACK can no longer find them.
-    if ack_eliciting {
+    if ack_eliciting || held {
         if n <= space.last_emitted.len() {
-            core::ptr::copy_nonoverlapping(
-                pkt.as_ptr(),
-                space.last_emitted.as_mut_ptr(),
-                n,
-            );
+            core::ptr::copy_nonoverlapping(pkt.as_ptr(), space.last_emitted.as_mut_ptr(), n);
             space.last_emitted_len = n;
             space.last_emitted_pn = pn;
             space.last_emitted_ms = now_ms;
@@ -4204,14 +4437,41 @@ pub(crate) unsafe fn emit_connection_close(
             0
         };
     }
+    // A 1-RTT close draws its number from the reservation like every other
+    // 1-RTT packet: emitting past the granted block is exactly the number
+    // a takeover host may be handed next.
+    if matches!(level, EncLevel::OneRtt) && !s.conns[idx].one_rtt_pn_ok() {
+        return;
+    }
     let hp = Aes128Hp::new(&hp_key);
     let mut pkt = [0u8; QUIC_DGRAM_MAX];
     let dcid = &peer_cid[..peer_cid_len];
     let scid = &our_cid[..our_cid_len];
     let pkt_len = match level {
-        EncLevel::Initial => build_initial_packet(&keys, &hp, pn, pn_len, dcid, scid, &[], &payload[..n], &mut pkt),
-        EncLevel::Handshake => build_handshake_packet(&keys, &hp, pn, pn_len, dcid, scid, &payload[..n], &mut pkt),
-        EncLevel::OneRtt => build_one_rtt_packet(&keys, &hp, pn, pn_len, key_phase, dcid, &payload[..n], &mut pkt),
+        EncLevel::Initial => build_initial_packet(
+            &keys,
+            &hp,
+            pn,
+            pn_len,
+            dcid,
+            scid,
+            &[],
+            &payload[..n],
+            &mut pkt,
+        ),
+        EncLevel::Handshake => {
+            build_handshake_packet(&keys, &hp, pn, pn_len, dcid, scid, &payload[..n], &mut pkt)
+        }
+        EncLevel::OneRtt => build_one_rtt_packet(
+            &keys,
+            &hp,
+            pn,
+            pn_len,
+            key_phase,
+            dcid,
+            &payload[..n],
+            &mut pkt,
+        ),
     };
     if pkt_len == 0 {
         return;
@@ -4227,8 +4487,18 @@ pub(crate) unsafe fn emit_connection_close(
         };
         space.next_send_pn = pn + 1;
     }
+    if matches!(level, EncLevel::OneRtt) {
+        s.conns[idx].one_rtt_pn_commit();
+    }
     let sys = &*s.syscalls;
-    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..pkt_len], &mut s.net_scratch);
+    let _ = send_datagram(
+        sys,
+        s.net_out,
+        &s.endpoint,
+        &peer,
+        &pkt[..pkt_len],
+        &mut s.net_scratch,
+    );
     let msg = b"[quic] CONNECTION_CLOSE sent";
     dev_log(sys, 3, msg.as_ptr(), msg.len());
 }
@@ -4264,7 +4534,16 @@ pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
     let hp = Aes128Hp::new(&hp_key);
     let mut pkt = [0u8; QUIC_DGRAM_MAX];
     let dcid = &peer_cid[..peer_cid_len];
-    let pkt_len = build_one_rtt_packet(&keys, &hp, pn, 4, key_phase, dcid, &frame_buf[..n], &mut pkt);
+    let pkt_len = build_one_rtt_packet(
+        &keys,
+        &hp,
+        pn,
+        4,
+        key_phase,
+        dcid,
+        &frame_buf[..n],
+        &mut pkt,
+    );
     if pkt_len == 0 {
         return;
     }
@@ -4273,8 +4552,16 @@ pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
     // probe is actually accepted by the channel. On backpressure we
     // leave both intact so drain_outbound re-emits the SAME challenge
     // (same bytes, same PN-to-be) next tick rather than dropping it.
-    if send_datagram(sys, s.net_out, &s.endpoint, &cand, &pkt[..pkt_len], &mut s.net_scratch) {
+    if send_datagram(
+        sys,
+        s.net_out,
+        &s.endpoint,
+        &cand,
+        &pkt[..pkt_len],
+        &mut s.net_scratch,
+    ) {
         s.conns[idx].one_rtt.next_send_pn = pn + 1;
+        s.conns[idx].one_rtt_pn_commit();
         s.conns[idx].path_challenge_tx_pending = false;
         // Stamp the probe so quic_pto_check can retransmit it on timeout
         // (RFC 9000 §8.1 / §9.3.3) even if the peer stops sending — these
@@ -4314,13 +4601,30 @@ pub(crate) unsafe fn emit_path_response(s: &mut QuicState, idx: usize) {
     let hp = Aes128Hp::new(&hp_key);
     let mut pkt = [0u8; QUIC_DGRAM_MAX];
     let dcid = &peer_cid[..peer_cid_len];
-    let pkt_len = build_one_rtt_packet(&keys, &hp, pn, 4, key_phase, dcid, &frame_buf[..n], &mut pkt);
+    let pkt_len = build_one_rtt_packet(
+        &keys,
+        &hp,
+        pn,
+        4,
+        key_phase,
+        dcid,
+        &frame_buf[..n],
+        &mut pkt,
+    );
     if pkt_len == 0 {
         return;
     }
     let sys = &*s.syscalls;
-    if send_datagram(sys, s.net_out, &s.endpoint, &dest, &pkt[..pkt_len], &mut s.net_scratch) {
+    if send_datagram(
+        sys,
+        s.net_out,
+        &s.endpoint,
+        &dest,
+        &pkt[..pkt_len],
+        &mut s.net_scratch,
+    ) {
         s.conns[idx].one_rtt.next_send_pn = pn + 1;
+        s.conns[idx].one_rtt_pn_commit();
         s.conns[idx].path_response_tx_pending = false;
     }
 }
@@ -4334,6 +4638,9 @@ pub(crate) unsafe fn emit_reset_stream(
     error_code: u64,
     final_size: u64,
 ) {
+    if !s.conns[idx].one_rtt_pn_ok() {
+        return;
+    }
     let conn = &s.conns[idx];
     if !conn.one_rtt.keys_set {
         return;
@@ -4365,7 +4672,14 @@ pub(crate) unsafe fn emit_reset_stream(
     let dcid = &peer_cid[..peer_cid_len];
     let _ = our_cid;
     let pkt_len = build_one_rtt_packet(
-        &keys, &hp, pn, 4, key_phase, dcid, &frame_buf[..n], &mut pkt,
+        &keys,
+        &hp,
+        pn,
+        4,
+        key_phase,
+        dcid,
+        &frame_buf[..n],
+        &mut pkt,
     );
     if pkt_len == 0 {
         return;
@@ -4373,9 +4687,17 @@ pub(crate) unsafe fn emit_reset_stream(
     {
         let conn = &mut s.conns[idx];
         conn.one_rtt.next_send_pn = pn + 1;
+        conn.one_rtt_pn_commit();
     }
     let sys = &*s.syscalls;
-    let _ = send_datagram(sys, s.net_out, &s.endpoint, &peer, &pkt[..pkt_len], &mut s.net_scratch);
+    let _ = send_datagram(
+        sys,
+        s.net_out,
+        &s.endpoint,
+        &peer,
+        &pkt[..pkt_len],
+        &mut s.net_scratch,
+    );
 }
 
 /// Probe-Timeout (RFC 9002 §6.2) check — replay the saved packet for

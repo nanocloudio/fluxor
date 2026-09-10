@@ -54,11 +54,26 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         {
             result.add_error(e.to_string());
         }
-        // Session continuity classes (rfc_protocols.md §7.3) — same
+        // Session continuity classes — same
         // dual-path treatment as presentation groups so `fluxor
         // validate` catches missing anchors / roles / R1–R5 capability
         // providers without compiling.
-        if let Err(e) = crate::config::validate_continuity(&config, &module_names, &manifests) {
+        if let Err(e) = crate::config::validate_continuity_on(
+            &config,
+            &module_names,
+            &manifests,
+            Some(&target_desc.id),
+        ) {
+            result.add_error(e.to_string());
+        }
+        // Execution-envelope claim: a graph that
+        // names a profile is admitted against every member's facts.
+        if let Err(e) = crate::config::validate_execution_profile(
+            &config,
+            &module_names,
+            &manifests,
+            Some(&target_desc.id),
+        ) {
             result.add_error(e.to_string());
         }
         // Resume-style fault recovery needs a manifest attestation; report

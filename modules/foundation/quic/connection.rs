@@ -20,6 +20,20 @@ pub const QUIC_DGRAM_MAX: usize = 1500;
 pub const INITIAL_MIN_DATAGRAM_LEN: usize = 1200;
 pub const QUIC_CRYPTO_BUF: usize = 4096;
 
+/// How long the previous key phase's read keys are retained after a key
+/// update so a reordered packet still encrypted under the old phase
+/// decrypts (RFC 9001 §6.5). Sized well above a plausible reordering
+/// window without holding an old key indefinitely.
+pub const KEY_UPDATE_RETENTION_MS: u64 = 3_000;
+
+/// Local self-grant block size for the 1-RTT send packet-number
+/// reservation (matches the directory's smoke-path block). Chosen so
+/// block exhaustion is off the emit path in local mode.
+pub const LOCAL_PN_BLOCK: u64 = 4096;
+/// Refill the local self-grant when this few values remain, keeping a
+/// value always available in local mode.
+pub const LOCAL_PN_REFILL_LOW: u64 = 512;
+
 /// Maximum Retry token length we'll ever emit / accept. Our token
 /// format (see `mod.rs::build_retry_token`) packs an 8-byte expiry,
 /// 4-byte peer IPv4, 2-byte port, ODCID-len + ODCID (≤20), and a
@@ -150,7 +164,11 @@ impl CryptoReassembler {
         if n == 0 {
             return;
         }
-        let n = if n > CRYPTO_HOLD_LEN { CRYPTO_HOLD_LEN } else { n };
+        let n = if n > CRYPTO_HOLD_LEN {
+            CRYPTO_HOLD_LEN
+        } else {
+            n
+        };
         unsafe {
             core::ptr::copy(
                 self.buf.as_ptr().add(n),
@@ -505,6 +523,15 @@ pub struct PnSpace {
     pub next_read_secret: [u8; 48],
     pub next_write_secret: [u8; 48],
     pub next_keys_ready: bool,
+
+    /// Previous-phase read keys retained across a key update so a
+    /// reordered packet still encrypted under the old phase decrypts
+    /// within the retention window (RFC 9001 §6.5).
+    pub prev_read_keys: QuicKeys,
+    pub prev_read_valid: bool,
+    /// Wall-clock millis the previous phase was retired at; the retention
+    /// window closes `KEY_UPDATE_RETENTION_MS` after it.
+    pub prev_read_since_ms: u64,
 }
 
 impl Default for PnSpace {
@@ -543,6 +570,9 @@ impl PnSpace {
             next_read_secret: [0; 48],
             next_write_secret: [0; 48],
             next_keys_ready: false,
+            prev_read_keys: QuicKeys::empty(),
+            prev_read_valid: false,
+            prev_read_since_ms: 0,
         }
     }
 
@@ -623,7 +653,10 @@ pub struct PeerAddr {
 
 impl PeerAddr {
     pub const fn unset() -> Self {
-        Self { ip: [0; 4], port: 0 }
+        Self {
+            ip: [0; 4],
+            port: 0,
+        }
     }
     pub fn matches(&self, ip: &[u8; 4], port: u16) -> bool {
         self.ip[0] == ip[0]
@@ -699,7 +732,9 @@ impl RttSample {
         const K_GRANULARITY: u32 = 1;
         const MAX_ACK_DELAY: u32 = 25;
         let var_term = (4u32 * self.rttvar).max(K_GRANULARITY);
-        self.smoothed_rtt.saturating_add(var_term).saturating_add(MAX_ACK_DELAY)
+        self.smoothed_rtt
+            .saturating_add(var_term)
+            .saturating_add(MAX_ACK_DELAY)
     }
 }
 
@@ -1066,7 +1101,72 @@ pub struct QuicConnection {
     pub alt_cid_issued: bool,
     /// A NEW_CONNECTION_ID frame for `alt_cid` is queued for emission.
     pub new_cid_tx_pending: bool,
+
+    // ── 1-RTT send packet-number reservation ──────
+    /// Windowed reservation the 1-RTT `next_send_pn` is drawn from. With
+    /// no durable grant installed the connection self-grants blocks
+    /// locally (the honest local, non-durable mode); once a grant arrives
+    /// on `cont_in` only granted values emit and exhaustion stalls.
+    pub send_pn_res: NonceReservation,
+    /// True once a durable grant from the directory has been installed —
+    /// self-granting stops and emission is bounded by the granted blocks.
+    pub pn_res_durable: bool,
+    /// End of the identity space self-granted locally so far (local
+    /// The module's 16-byte name for this connection on the continuity /
+    /// reservation surface (`cont_in` / `cont_out`).
+    pub cont_flow_id: [u8; CONT_FLOW_ID_BYTES],
+    /// Ownership epoch this connection emits under (reservation +
+    /// continuity fencing). Advances only through an ACTIVATE takeover.
+    pub cont_epoch: u32,
+
+    // ── Key update initiation (RFC 9001 §6) ────────────────────────
+    /// 1-RTT packets emitted in the current key phase.
+    pub one_rtt_pkts_since_phase: u32,
+    /// A locally-initiated key update is awaiting confirmation: a packet
+    /// sent in the new phase must be acknowledged before another update
+    /// may begin (RFC 9001 §6.1).
+    pub key_update_awaiting_ack: bool,
+    /// The first packet number emitted in the current phase; the update
+    /// is confirmed once the peer acknowledges a packet at or above it.
+    pub key_update_first_pn: u64,
+
+    // ── Continuity mirroring ────────────────────────────────
+    /// Continuity profile for a mirrored flow (`sc::PROFILE_*`); 0 = not
+    /// mirrored.
+    pub cont_profile: u8,
+    /// Strict-profile send horizon: in `PROFILE_CRASH_CONTINUOUS` a 1-RTT
+    /// packet is withheld from `net_out` until the DELTA_ACK covering it
+    /// returns. Set when a delta is outstanding, cleared on its ack.
+    pub cont_emission_held: bool,
+    /// Ordered delta number last emitted / applied on this flow.
+    pub cont_delta_no: u32,
+    /// The standby holds a committed checkpoint: every 1-RTT transition
+    /// from here is mirrored as a delta. Set when the relayed
+    /// CHECKPOINT_COMMITTED arrives, cleared when the mirror is abandoned.
+    pub cont_mirror: bool,
+    /// Generation of the checkpoint the delta chain hangs off.
+    pub cont_ckpt_gen: u32,
+    /// Digest of the last delta's data: the chain link the next one
+    /// carries as `prev_digest`.
+    pub cont_last_digest: [u8; 32],
+    /// Delta whose DELTA_ACK releases the held 1-RTT packet.
+    pub cont_held_delta: u32,
+    /// The mirror was abandoned and the abort has not yet left `cont_out`.
+    pub cont_abandon_pending: bool,
+    /// Inbound 1-RTT packet numbers whose receipt is mirrored but not yet
+    /// confirmed, with the delta each rides on. Under the strict profile
+    /// a number is not acknowledged to the peer until the standby has
+    /// confirmed it, so the acknowledgement shown to the peer never runs
+    /// ahead of what a takeover could honour.
+    pub cont_recv_hold: [(u64, u32); CONT_RECV_HOLD],
+    pub cont_recv_hold_len: u8,
 }
+
+/// Inbound packets the strict receive horizon may hold at once. A burst
+/// beyond this is not a loss: the mirror is abandoned, which the
+/// coordinator learns of, rather than the horizon silently dropping a
+/// number.
+pub const CONT_RECV_HOLD: usize = 16;
 
 impl Default for QuicConnection {
     fn default() -> Self {
@@ -1198,6 +1298,23 @@ impl QuicConnection {
             alt_cid_reset_token: [0; 16],
             alt_cid_issued: false,
             new_cid_tx_pending: false,
+            send_pn_res: NonceReservation::new(),
+            pn_res_durable: false,
+            cont_flow_id: [0; CONT_FLOW_ID_BYTES],
+            cont_epoch: 0,
+            one_rtt_pkts_since_phase: 0,
+            key_update_awaiting_ack: false,
+            key_update_first_pn: 0,
+            cont_profile: 0,
+            cont_emission_held: false,
+            cont_mirror: false,
+            cont_ckpt_gen: 0,
+            cont_last_digest: [0; 32],
+            cont_held_delta: 0,
+            cont_abandon_pending: false,
+            cont_recv_hold: [(0, 0); CONT_RECV_HOLD],
+            cont_recv_hold_len: 0,
+            cont_delta_no: 0,
         }
     }
 
@@ -1227,7 +1344,8 @@ impl QuicConnection {
             // Congestion avoidance: cwnd += MAX_DATAGRAM * acked / cwnd.
             // u32 division avoids `__aeabi_uldivmod`, which the PIC-only
             // crt on thumbv8m doesn't provide.
-            let num = (MAX_DATAGRAM_SIZE as u32).saturating_mul(acked_bytes.min(u32::MAX as u64) as u32);
+            let num =
+                (MAX_DATAGRAM_SIZE as u32).saturating_mul(acked_bytes.min(u32::MAX as u64) as u32);
             let denom = self.congestion_window.min(u32::MAX as u64).max(1) as u32;
             let inc = (num / denom).max(1) as u64;
             self.congestion_window = self.congestion_window.saturating_add(inc);
@@ -1279,6 +1397,58 @@ impl QuicConnection {
             return true;
         }
         self.bytes_in_flight.saturating_add(size) <= self.congestion_window
+    }
+
+    /// Whether a 1-RTT packet-number value is available to emit next
+    ///. In local mode a self-grant block is refilled
+    /// ahead of exhaustion so the gate never blocks a healthy sender; in
+    /// durable mode `false` means the directory's granted blocks are spent
+    /// and emission must stall (`reservation_exhausted_stall`) rather than
+    /// reuse a number. Reservations are NOT reset on key update.
+    pub fn one_rtt_pn_ok(&mut self) -> bool {
+        if !self.pn_res_durable && self.send_pn_res.needs_refill(LOCAL_PN_REFILL_LOW) {
+            // A self-granted block starts where the last one ended. The
+            // reservation refuses anything lower, so this is the one start
+            // it can accept; `next_send_pn` covers a counter advanced past
+            // the block by a path that did not draw on it.
+            let start = self
+                .send_pn_res
+                .high_water()
+                .max(self.one_rtt.next_send_pn);
+            let _ = self
+                .send_pn_res
+                .grant(self.cont_epoch, start, LOCAL_PN_BLOCK);
+        }
+        self.send_pn_res.remaining() > 0 && !self.send_pn_res.is_voided()
+    }
+
+    /// Advance the reservation in lockstep with a 1-RTT packet that has
+    /// been committed to the wire, so the reserved window always reflects
+    /// how many more values may still emit.
+    pub fn one_rtt_pn_commit(&mut self) {
+        let _ = self.send_pn_res.next_value();
+    }
+
+    /// Install a durable reservation grant (Clustor record shape) for the
+    /// 1-RTT send space: a lower epoch is refused (stale), a higher epoch
+    /// fences outstanding blocks, and the send counter resumes at or above
+    /// the block start so no value is ever re-emitted. Once a
+    /// grant lands the connection leaves local self-grant mode.
+    pub fn install_pn_grant(
+        &mut self,
+        epoch: u32,
+        start: u64,
+        len: u64,
+    ) -> Result<(), ReservationError> {
+        self.send_pn_res.grant(epoch, start, len)?;
+        self.pn_res_durable = true;
+        if epoch > self.cont_epoch {
+            self.cont_epoch = epoch;
+        }
+        if self.one_rtt.next_send_pn < start {
+            self.one_rtt.next_send_pn = start;
+        }
+        Ok(())
     }
 }
 
@@ -1540,11 +1710,7 @@ unsafe fn tp_put_bytes(out: &mut [u8], pos: &mut usize, id: u64, value: &[u8]) {
     );
     *pos += n;
     if !value.is_empty() {
-        core::ptr::copy_nonoverlapping(
-            value.as_ptr(),
-            out.as_mut_ptr().add(*pos),
-            value.len(),
-        );
+        core::ptr::copy_nonoverlapping(value.as_ptr(), out.as_mut_ptr().add(*pos), value.len());
         *pos += value.len();
     }
 }
@@ -1554,11 +1720,7 @@ unsafe fn tp_put_int(out: &mut [u8], pos: &mut usize, id: u64, value: u64) {
     let n = varint_encode(out.as_mut_ptr().add(*pos), out.len() - *pos, id);
     *pos += n;
     let v_size = varint_size(value);
-    let n = varint_encode(
-        out.as_mut_ptr().add(*pos),
-        out.len() - *pos,
-        v_size as u64,
-    );
+    let n = varint_encode(out.as_mut_ptr().add(*pos), out.len() - *pos, v_size as u64);
     *pos += n;
     let n = varint_encode(out.as_mut_ptr().add(*pos), out.len() - *pos, value);
     *pos += n;
@@ -1578,15 +1740,40 @@ pub unsafe fn build_transport_params_client(
     tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, 30_000);
     tp_put_int(out, &mut pos, TP_MAX_UDP_PAYLOAD_SIZE, 1500);
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, LOCAL_CONN_WINDOW);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, LOCAL_STREAM_WINDOW);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, LOCAL_STREAM_WINDOW);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_UNI, LOCAL_STREAM_WINDOW);
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+        LOCAL_STREAM_WINDOW,
+    );
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+        LOCAL_STREAM_WINDOW,
+    );
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAM_DATA_UNI,
+        LOCAL_STREAM_WINDOW,
+    );
     // Advertised from the fixed pools, not a round number. Advertising
     // more than we can hold means a peer opens a stream we then have
     // nowhere to put, and its bytes are dropped with no error on either
     // side — which is indistinguishable from a slow application.
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, MAX_BIDI_STREAMS as u64);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, MAX_UNI_STREAMS as u64);
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAMS_BIDI,
+        MAX_BIDI_STREAMS as u64,
+    );
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAMS_UNI,
+        MAX_UNI_STREAMS as u64,
+    );
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
     // RFC 9221 §3: advertise our inbound DATAGRAM capacity so the peer
     // may send unreliable datagrams up to this size.
@@ -1626,15 +1813,40 @@ pub unsafe fn build_transport_params_server(
     tp_put_int(out, &mut pos, TP_MAX_IDLE_TIMEOUT, 30_000);
     tp_put_int(out, &mut pos, TP_MAX_UDP_PAYLOAD_SIZE, 1500);
     tp_put_int(out, &mut pos, TP_INITIAL_MAX_DATA, LOCAL_CONN_WINDOW);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, LOCAL_STREAM_WINDOW);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, LOCAL_STREAM_WINDOW);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAM_DATA_UNI, LOCAL_STREAM_WINDOW);
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+        LOCAL_STREAM_WINDOW,
+    );
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+        LOCAL_STREAM_WINDOW,
+    );
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAM_DATA_UNI,
+        LOCAL_STREAM_WINDOW,
+    );
     // Advertised from the fixed pools, not a round number. Advertising
     // more than we can hold means a peer opens a stream we then have
     // nowhere to put, and its bytes are dropped with no error on either
     // side — which is indistinguishable from a slow application.
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_BIDI, MAX_BIDI_STREAMS as u64);
-    tp_put_int(out, &mut pos, TP_INITIAL_MAX_STREAMS_UNI, MAX_UNI_STREAMS as u64);
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAMS_BIDI,
+        MAX_BIDI_STREAMS as u64,
+    );
+    tp_put_int(
+        out,
+        &mut pos,
+        TP_INITIAL_MAX_STREAMS_UNI,
+        MAX_UNI_STREAMS as u64,
+    );
     tp_put_int(out, &mut pos, TP_ACTIVE_CONNECTION_ID_LIMIT, 2);
     // RFC 9221 §3: advertise our inbound DATAGRAM capacity.
     tp_put_int(

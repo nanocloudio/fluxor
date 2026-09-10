@@ -956,9 +956,9 @@ fn validate_wiring_types(
 const CUTOVER_POLICIES: &[&str] = &["boundary_cut", "resumable", "anchor_preserved"];
 const CONTINUITY_POLICIES: &[&str] = &["drain", "anchor_preserved"];
 
-/// The five session continuity classes (rfc_protocols.md §7.1,
-/// `protocol_surfaces.md`). Distinct from the AV `continuity_policy`
-/// enum above, which governs presentation-group cutover only.
+/// The five session continuity classes (`protocol_surfaces.md`). Distinct
+/// from the AV `continuity_policy` enum above, which governs
+/// presentation-group cutover only.
 const CONTINUITY_CLASSES: &[&str] = &[
     "reroutable",
     "drain_only",
@@ -967,11 +967,11 @@ const CONTINUITY_CLASSES: &[&str] = &[
     "transport_migratable",
 ];
 
-/// `transport_migratable` migration mechanisms (rfc_protocols.md §7.1).
+/// `transport_migratable` migration mechanisms.
 const MIGRATION_MECHANISMS: &[&str] = &["native_primitive", "platform_replicated_state"];
 
 /// AEAD classes for platform-replicated-state migration
-/// (rfc_protocols.md §13.7.2).
+/// mechanism.
 const AEAD_CLASSES: &[&str] = &["on_wire_sequence", "implicit_counter", "unencrypted"];
 
 /// Capabilities every platform-replicated-state `transport_migratable`

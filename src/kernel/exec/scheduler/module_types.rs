@@ -64,6 +64,15 @@ const FAN_BUF_SIZE: usize = 2048;
 const FAN_BUF_SIZE: usize = 8192;
 static mut FAN_BUFS: [[u8; FAN_BUF_SIZE]; MAX_DOMAINS] = [[0u8; FAN_BUF_SIZE]; MAX_DOMAINS];
 
+/// Whole frames a framed tee or merge moves in one step. A fan module sits
+/// between a producer and its consumers, so what it moves per tick is the
+/// ceiling on every fanned port: an `ip` module with its consumer ports
+/// fanned to a second reader (`debug: to: net` does this) can hand its
+/// consumer no more accepts, deliveries or sends per second than the fan
+/// moves. Sixty-four is the ip module's own per-step frame burst twice
+/// over, and a full step's worth is a handful of microseconds.
+pub const FAN_FRAMES_PER_STEP: usize = 64;
+
 // ============================================================================
 // ModuleSlot
 // ============================================================================
@@ -267,7 +276,7 @@ pub struct TeeModule {
 }
 
 impl TeeModule {
-    pub(super) fn new(
+    pub fn new(
         in_chan: i32,
         out_chans: &[i32; MAX_CHANNELS],
         out_count: usize,
@@ -371,10 +380,25 @@ impl TeeModule {
     /// domain `FAN_BUFS` scratch is only ever used within a single
     /// step — no stash race between fans in the same domain.
     unsafe fn step_framed(&mut self) -> Result<StepOutcome, i32> {
+        for _ in 0..FAN_FRAMES_PER_STEP {
+            // SAFETY: `move_one_frame` touches `FAN_BUFS` via raw pointers;
+            // the scheduler serialises calls per `self.domain`, so the
+            // scratch buffer is exclusive for the whole step.
+            if !unsafe { self.move_one_frame()? } {
+                break;
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// Move one whole frame from the input to every output. `Ok(false)`
+    /// means nothing moved — no complete frame waiting, or an output
+    /// without room for it — and nothing was consumed.
+    unsafe fn move_one_frame(&mut self) -> Result<bool, i32> {
         let avail = channel::channel_readable_bytes(self.in_chan);
         let hdr_len = frame_kind_hdr_len(self.frame_kind);
         if avail < hdr_len {
-            return Ok(StepOutcome::Continue);
+            return Ok(false);
         }
 
         // Peek just enough bytes to read the length field — no
@@ -421,11 +445,11 @@ impl TeeModule {
         // consuming — the input bytes stay in the ring for the next
         // tick to retry.
         if avail < total {
-            return Ok(StepOutcome::Continue);
+            return Ok(false);
         }
         for idx in 0..self.out_count {
             if channel::channel_writable_bytes(self.out_chans[idx]) < total {
-                return Ok(StepOutcome::Continue);
+                return Ok(false);
             }
         }
 
@@ -444,7 +468,7 @@ impl TeeModule {
                 return Err(-2);
             }
         }
-        Ok(StepOutcome::Continue)
+        Ok(true)
     }
 }
 
@@ -496,7 +520,7 @@ pub struct MergeModule {
 }
 
 impl MergeModule {
-    pub(super) fn new(
+    pub fn new(
         in_chans: &[i32; MAX_CHANNELS],
         in_count: usize,
         out_chan: i32,
@@ -615,6 +639,19 @@ impl MergeModule {
     /// so the per-domain `FAN_BUFS` scratch is never held across
     /// step calls.
     unsafe fn step_framed(&mut self) -> Result<StepOutcome, i32> {
+        for _ in 0..FAN_FRAMES_PER_STEP {
+            // SAFETY: as for `TeeModule::step_framed` — `FAN_BUFS[domain]`
+            // is exclusive to this step under the per-domain serialisation.
+            if !unsafe { self.move_one_frame()? } {
+                break;
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// One round-robin pass over the inputs, moving the first whole frame
+    /// that fits the output. `Ok(false)` means the pass moved nothing.
+    unsafe fn move_one_frame(&mut self) -> Result<bool, i32> {
         // SAFETY: `FAN_BUFS[domain]` is the per-domain fan-out scratch;
         // the scheduler serialises calls per domain, so this reborrow is
         // unique for the lifetime of the step.
@@ -670,9 +707,9 @@ impl MergeModule {
             if wrote != total as i32 {
                 return Err(-2);
             }
-            return Ok(StepOutcome::Continue);
+            return Ok(true);
         }
 
-        Ok(StepOutcome::Continue)
+        Ok(false)
     }
 }

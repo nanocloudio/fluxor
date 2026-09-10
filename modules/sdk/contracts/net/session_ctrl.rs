@@ -7,8 +7,9 @@
 // SessionCtrlV1 is the control-plane sideband exchanged between
 // **transport anchors**, **session workers**, and **session
 // directories** to coordinate session attach, detach, drain,
-// export/import handoff, resume, epoch advancement, and worker
-// relocation. It is the scaffolding that continuity classes above
+// export/import handoff, resume, epoch advancement, worker
+// relocation, and — for the transport providers — checkpoint, delta
+// and cut-over of the transport itself (§Transport continuity). It is the scaffolding that continuity classes above
 // `drain_only` (see protocol_surfaces.md §Continuity Classes) rely on.
 //
 // Status: LIVE. Consumers: `echo_anchor` + `echo_worker` exercise the
@@ -113,6 +114,10 @@ pub const STATUS_UNKNOWN_SESSION: u8 = 2;
 pub const STATUS_NO_CAPACITY: u8 = 3;
 pub const STATUS_CORRUPT: u8 = 4;
 pub const STATUS_NOT_READY: u8 = 5;
+/// The provider cannot offer what was asked on this composition — a
+/// profile it cannot make safe here, as opposed to one it cannot make
+/// safe yet. Retrying does not change the answer.
+pub const STATUS_UNSUPPORTED: u8 = 6;
 
 // ─── Opcodes: commands (peer → peer) ───────────────────────────────
 
@@ -258,6 +263,313 @@ pub const MSG_SC_EPOCH_CONFIRMED: u8 = 0x98;
 ///   [epoch:       4 LE]
 ///   [status:      1]                  STATUS_*
 pub const MSG_SC_RELOCATED: u8 = 0x99;
+
+// ─── Transport continuity (TRANSPORT_CONTINUITY) ──────────────────
+//
+// The checkpoint, delta and cut-over surface a transport provider
+// (ip for TCP, tls for the record layer, quic for the mux) answers on
+// its `cont_in` / `cont_out` port pair. Wormhole's `transport_mirror`
+// and `failover_coordinator` drive it; the provider owns the codec, the
+// buffers, the vault bridge and the emission gate. Key bytes never
+// cross this surface: a checkpoint carries vault-sealed continuity
+// objects, and only a vault that holds the same labelled sealing key
+// (`security.key_wrap`) opens them.
+//
+// Every message names the flow (16-byte opaque `flow_id`, the
+// provider's identity for one connection) and the ownership epoch it
+// was issued under. A command carrying an epoch below the provider's
+// current one is refused `STATUS_STALE_EPOCH`; a future epoch is
+// refused too — epochs advance only through ACTIVATE.
+//
+// Records and deltas bind: flow, epoch, checkpoint generation, ordered
+// delta number, previous digest, length and a content digest (CRC32 on
+// the chunk stream, SHA-256 over the whole record in the manifest). A
+// retry of an identical record is idempotent; a gap, a conflicting
+// duplicate, an oversized record or an unsupported layout is refused
+// before anything is mutated. Import stages into a non-emitting shadow
+// and becomes eligible atomically at CUT_IMPORT; EMISSION_ARM proves
+// the shadow is ready and leaves transmission disabled; ACTIVATE
+// requires a strictly higher epoch and a fence generation.
+//
+// Lifecycle (planned migration):
+//
+//   PAIR_PREPARE(standby)      → CONTINUITY{PAIR_PREPARED}
+//   QUIESCE_BEGIN(primary)     → CONTINUITY{QUIESCED} when drained
+//   CUT_EXPORT(primary)        → primary emits CHECKPOINT_BEGIN /
+//                                CHECKPOINT_NEXT* / CHECKPOINT_COMMIT
+//                                on cont_out, then CONTINUITY{CUT}
+//   (coordinator relays the checkpoint frames to the standby's cont_in;
+//    the standby answers CONTINUITY{CHECKPOINT_ACK|CHECKPOINT_COMMITTED})
+//   CUT_IMPORT(standby)        → CONTINUITY{IMPORTED}: the shadow is
+//                                validated and published, still silent
+//   EMISSION_ARM(standby)      → CONTINUITY{ARMED}
+//   fence the primary (net::identity ADDR_FENCE, or RETIRE)
+//   ACTIVATE(standby, epoch+1, fence_gen) → CONTINUITY{ACTIVATED}
+//   RETIRE(primary)            → CONTINUITY{RETIRED}: keys and buffers
+//                                destroyed
+//
+// Mirroring (between checkpoint and cut): the primary emits DELTA_APPLY
+// on cont_out for every externally visible transition; the standby
+// applies it into the shadow and answers DELTA_ACK. In the strict
+// (crash-continuous) profile the primary withholds the transition —
+// the TCP ACK advance, the TLS record hand-off, the QUIC packet — until
+// the DELTA_ACK covering it has returned; that is the receive / send
+// horizon. In the planned profile deltas are asynchronous and the
+// synchronous cut at CUT_EXPORT is what makes the standby exact.
+
+/// Transport codes carried by PAIR_PREPARE and the checkpoint manifest.
+pub const CT_TCP: u8 = 1;
+pub const CT_TLS: u8 = 2;
+pub const CT_QUIC: u8 = 3;
+
+/// Continuity profile carried by PAIR_PREPARE.
+/// Deltas are asynchronous; the cut at CUT_EXPORT is exact.
+pub const PROFILE_PLANNED: u8 = 1;
+/// Every externally visible transition waits for its DELTA_ACK.
+pub const PROFILE_CRASH_CONTINUOUS: u8 = 2;
+
+/// Delta kinds (`DELTA_APPLY` `kind`).
+/// TCP: a send-side transition — bytes allocated to sequence space,
+/// with the segment bytes so retransmission is byte-identical.
+pub const DELTA_TCP_SEND: u8 = 1;
+/// TCP: a receive-side transition — bytes accepted in order, and the
+/// acknowledgement the peer is about to be shown.
+pub const DELTA_TCP_RECV: u8 = 2;
+/// TCP: acknowledgement from the peer reclaimed send bytes / window.
+pub const DELTA_TCP_ACKED: u8 = 3;
+/// TCP: timer or congestion-state change without bytes.
+pub const DELTA_TCP_TIMERS: u8 = 4;
+/// TLS: a record is about to be handed to the transport — its
+/// ciphertext, write epoch and sequence, so the standby retransmits the
+/// same bytes and never re-encrypts under the same counter.
+pub const DELTA_TLS_RECORD_OUT: u8 = 5;
+/// TLS: inbound record consumed — read sequence advanced, partial
+/// record bytes retained.
+pub const DELTA_TLS_RECORD_IN: u8 = 6;
+/// TLS: key update barrier — new secret installed (sealed) and the
+/// counters reset; the primary does not emit in the new epoch until
+/// this is acknowledged.
+pub const DELTA_TLS_KEY_UPDATE: u8 = 7;
+/// QUIC: packet-number allocation from the reservation and the
+/// packet's ciphertext.
+pub const DELTA_QUIC_SEND: u8 = 8;
+/// QUIC: inbound packet consumed — ACK state, stream offsets, flow
+/// control credit.
+pub const DELTA_QUIC_RECV: u8 = 9;
+/// QUIC: key-phase flip (RFC 9001 §6) — barrier like the TLS one.
+pub const DELTA_QUIC_KEY_PHASE: u8 = 10;
+/// TLS: the peer acknowledged the primary's TCP stream up to a sequence,
+/// so the retransmit window slid. Mirrored so the standby's window is the
+/// primary's and a replay after takeover sends the right bytes.
+///   [acked_seq: 4 LE]
+pub const DELTA_TLS_RETX_ACK: u8 = 11;
+/// TLS, strict profile: inbound bytes received but not yet forming a whole
+/// record. Mirrored on arrival so a takeover between two records does not
+/// lose the head of the next one.
+///   [recv_len: 4 LE][bytes: recv_len]
+pub const DELTA_TLS_RECV_BYTES: u8 = 12;
+
+/// Abort reasons (`ABORT` `reason`, `CONTINUITY{ABORTED}` body).
+pub const ABORT_COORDINATOR: u8 = 1;
+pub const ABORT_IMPORT_FAILED: u8 = 2;
+pub const ABORT_MIRROR_LOST: u8 = 3;
+pub const ABORT_UNSUPPORTED_STATE: u8 = 4;
+
+/// Prepare a standby slot for `flow_id` — reserves the shadow and its
+/// buffers before the connection is promised migration. Refused
+/// `STATUS_NO_CAPACITY` when no shadow slot is free.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [transport:     1]                 CT_*
+///   [profile:       1]                 PROFILE_*
+///   [codec_digest: 32]                 SHA-256 of the codec layout the
+///                                      primary will emit; mismatch is
+///                                      refused before any bytes move
+pub const CMD_SC_PAIR_PREPARE: u8 = 0x7A;
+
+/// Open a checkpoint transfer into a prepared shadow. A generation the
+/// shadow already holds is idempotent; a lower generation is refused.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]              checkpoint generation
+///   [total_len:     4 LE]              record bytes to follow
+///   [record_digest:32]                 SHA-256 of the whole record
+pub const CMD_SC_CHECKPOINT_BEGIN: u8 = 0x7B;
+
+/// One chunk of the checkpoint record, in offset order.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [offset:        4 LE]
+///   [data: ...]
+pub const CMD_SC_CHECKPOINT_NEXT: u8 = 0x7C;
+
+/// Close the checkpoint transfer. The shadow verifies length, CRC32 and
+/// the record digest, decodes the record, opens the sealed continuity
+/// objects and answers `CHECKPOINT_COMMITTED` — or `STATUS_CORRUPT`, in
+/// which case the shadow is discarded whole.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [crc32:         4 LE]
+pub const CMD_SC_CHECKPOINT_COMMIT: u8 = 0x7D;
+
+/// Ordered delta against a committed checkpoint.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [delta_no:      4 LE]              1-based, strictly consecutive
+///   [prev_digest:  32]                 SHA-256 of the previous delta
+///                                      (zero for delta 1)
+///   [kind:          1]                 DELTA_*
+///   [data: ...]
+pub const CMD_SC_DELTA_APPLY: u8 = 0x7E;
+
+/// The standby has applied `delta_no` into the shadow — the horizon
+/// the primary may now cross.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [delta_no:      4 LE]
+pub const CMD_SC_DELTA_ACK: u8 = 0x7F;
+
+/// Stop admitting new application delivery on the primary and drain
+/// in-flight work so a byte-exact cut can be taken.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [deadline_ms:   4 LE]
+pub const CMD_SC_QUIESCE_BEGIN: u8 = 0x80;
+
+/// Ask whether the quiesce has completed.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub const CMD_SC_QUIESCE_STATUS: u8 = 0x81;
+
+/// Produce the full checkpoint now. The provider emits
+/// CHECKPOINT_BEGIN / NEXT* / COMMIT on `cont_out`, then
+/// `CONTINUITY{CUT}` carrying the manifest.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub const CMD_SC_CUT_EXPORT: u8 = 0x82;
+
+/// Publish the committed shadow as the eligible import for `flow_id`:
+/// the manifest digest must match what CHECKPOINT_COMMIT verified.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [ckpt_gen:      4 LE]
+///   [manifest_digest: 32]
+pub const CMD_SC_CUT_IMPORT: u8 = 0x83;
+
+/// Prove the import is ready to emit — timers converted, secrets
+/// open, route identity present — without enabling transmission.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub const CMD_SC_EMISSION_ARM: u8 = 0x84;
+
+/// Make the armed shadow the live connection under a strictly higher
+/// epoch. `fence_gen` is the fence generation the coordinator observed
+/// confirmed for the old emitter; zero is refused.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [new_epoch:     4 LE]
+///   [fence_gen:     4 LE]
+///   [conn_id:       2 LE]              optional: the live connection id
+///                                      a layered provider (tls over the
+///                                      standby's ip) binds the imported
+///                                      session to — the id the lower
+///                                      provider reported in its own
+///                                      CR_ACTIVATED. Absent, the id the
+///                                      checkpoint was taken under.
+pub const CMD_SC_ACTIVATE: u8 = 0x85;
+
+/// Destroy the old connection's keys and replicated buffers after the
+/// new anchor's stability horizon.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+pub const CMD_SC_RETIRE: u8 = 0x86;
+
+/// Discard a shadow or an in-progress export.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [reason:        1]                 ABORT_*
+pub const CMD_SC_ABORT: u8 = 0x87;
+
+/// A reservation grant from the directory (`session.reservation`) for a
+/// flow's egress counter — Clustor's `SessionReply` record carried
+/// verbatim after the flow it applies to, so the transport consumes the
+/// authority's grant rather than a second shape.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [reply: ...]                       the directory's reply record
+pub const CMD_SC_RESERVATION_GRANT: u8 = 0x88;
+
+/// Every continuity reply. The reply space has five opcodes left, so
+/// one carries a discriminated record.
+/// Payload:
+///   [flow_id:      16 BE]
+///   [epoch:         4 LE]
+///   [record:        1]                 CR_*
+///   [status:        1]                 STATUS_*
+///   [body: ...]                        per record type, below
+pub const MSG_SC_CONTINUITY: u8 = 0x9A;
+
+/// `CONTINUITY` record types and their bodies.
+/// Body: [transport:1][profile:1][shadow_slot:2 LE]
+pub const CR_PAIR_PREPARED: u8 = 1;
+/// Body: [ckpt_gen:4 LE][offset:4 LE] — bytes accepted so far.
+pub const CR_CHECKPOINT_ACK: u8 = 2;
+/// Body: [ckpt_gen:4 LE][record_digest:32]
+pub const CR_CHECKPOINT_COMMITTED: u8 = 3;
+/// Body: [ckpt_gen:4 LE][delta_no:4 LE] — the shadow's horizon.
+pub const CR_DELTA_APPLIED: u8 = 4;
+/// Body: [drained:1][pending_out:4 LE][pending_in:4 LE]
+pub const CR_QUIESCED: u8 = 5;
+/// Body — the cut manifest:
+///   [ckpt_gen:4 LE][record_len:4 LE][record_digest:32]
+///   [transport:1][sealed_len:2 LE][sealed: ...]
+/// where `sealed` is the vault-sealed continuity object (the traffic
+/// secrets) the record refers to, never the secrets themselves.
+pub const CR_CUT: u8 = 6;
+/// Body: [ckpt_gen:4 LE][delta_no:4 LE] — the generation published.
+pub const CR_IMPORTED: u8 = 7;
+/// Body: [expired_timers:1]
+pub const CR_ARMED: u8 = 8;
+/// Body: [new_epoch:4 LE][conn_id:2 LE] — the live connection id.
+pub const CR_ACTIVATED: u8 = 9;
+/// Body: empty.
+pub const CR_RETIRED: u8 = 10;
+/// Body: [reason:1]
+pub const CR_ABORTED: u8 = 11;
+
+/// Fixed-size continuity payload lengths.
+pub const FLOW_ID_BYTES: usize = 16;
+pub const PAIR_PREPARE_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 1 + 1 + 32;
+pub const CHECKPOINT_BEGIN_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4 + 32;
+pub const CHECKPOINT_NEXT_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4;
+pub const CHECKPOINT_COMMIT_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4;
+pub const DELTA_APPLY_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4 + 32 + 1;
+pub const DELTA_ACK_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 4;
+pub const QUIESCE_BEGIN_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4;
+pub const FLOW_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES;
+pub const CUT_IMPORT_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4 + 32;
+pub const ACTIVATE_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 4;
+pub const ABORT_PAYLOAD_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 1;
+pub const CONTINUITY_HEADER_LEN: usize = FLOW_ID_BYTES + EPOCH_BYTES + 1 + 1;
+/// Largest checkpoint chunk a provider emits on `cont_out`.
+pub const CHECKPOINT_CHUNK_MAX: usize = 1024;
 
 /// Generic session-scoped error. Mirror of MSG_DG_ERROR for the
 /// control-plane surface.

@@ -722,7 +722,10 @@ impl NameArena {
 // ============================================================================
 
 pub mod module_types;
-pub use module_types::{BuiltInModule, DummyModule, MergeModule, ModuleSlot, TeeModule};
+pub use module_types::{
+    BuiltInModule, DummyModule, MergeModule, ModuleSlot, TeeModule, FAN_FRAMES_PER_STEP,
+    FRAME_KIND_NET,
+};
 
 /// Live graph mutation (add owner / free owner). Multi-tenant only —
 /// bare-metal single-tenant targets compile it out at zero cost.

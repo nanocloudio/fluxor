@@ -97,6 +97,14 @@ const NWCTRL_MDIO_EN: u32 = 1 << 4;
 const NWCTRL_CLRSTAT: u32 = 1 << 5;
 const NWCTRL_STARTTX: u32 = 1 << 9;
 
+/// TX polls with frames queued and nothing completing before the
+/// transmitter is restarted. A full ring of maximum frames leaves the
+/// wire in under a millisecond; a queue that has not moved in this many
+/// steps is a halted DMA, not a slow one.
+const TX_STALL_STEPS: u16 = 200;
+/// Transmit status bits on which the DMA halts and the frame is lost.
+const TXSR_HALT: u32 = TXSR_RLE | TXSR_HRESP | TXSR_URUN | TXSR_LCOL;
+
 // DMA config bits
 const DMACFG_RXBUF_SIZE_SHIFT: u32 = 16;
 const DMACFG_ADDR64: u32 = 1 << 30;     // 64-bit address bus
@@ -136,14 +144,22 @@ const TX_DESC_LAST: u32 = 1 << 15;      // last buffer of frame
 const TX_DESC_WRAP: u32 = 1 << 30;      // last descriptor in ring
 const TX_DESC_USED: u32 = 1 << 31;      // set by GEM when TX complete
 
+mod ring;
+
 // ============================================================================
 // Constants
 // ============================================================================
 
-const RX_DESC_COUNT: u16 = 64;
+/// RX descriptors: the burst the MAC can absorb between two driver steps.
+/// A step drains the whole ring, so at a 100 µs tick this is the number
+/// of back-to-back minimum-size frames (each ~0.7 µs on the wire) that
+/// arrive faster than the ring is emptied before the MAC counts a
+/// buffer-not-available drop. The platform's DMA arena holds 256 buffers
+/// (`MAX_BUFS`), shared with TX.
+const RX_DESC_COUNT: u16 = 192;
 const TX_DESC_COUNT: u16 = 64;
 const BUF_SIZE: u16 = 2048;
-const BUF_COUNT: u16 = 128; // 64 RX + 64 TX
+const BUF_COUNT: u16 = 256; // 192 RX + 64 TX
 
 /// Maximum Ethernet frame size (MTU 1500 + headers).
 const MAX_FRAME: usize = 1514;
@@ -200,9 +216,21 @@ struct GemState {
     rx_resource_total: u32,
     /// Cumulative RX overrun errors.
     rx_overrun_total: u32,
+    /// Consecutive RX polls that drained nothing while the MAC reported
+    /// a buffer-not-available condition; two in a row is a halted receiver.
+    rx_stall_polls: u8,
+    /// Receiver restarts (`restart_rx`), on the heartbeat as `rxrs=`.
+    rx_restarts: u32,
+    /// Consecutive TX polls with frames queued and no completion.
+    tx_stall_steps: u16,
+    /// Transmitter restarts (`restart_tx`), on the heartbeat as `txrs=`.
+    tx_restarts: u32,
     /// Cumulative RX frames at hardware level (may exceed
     /// `rx_packets` if some frames couldn't be forwarded upstream).
     rx_frames_hw_total: u32,
+    /// Transmit descriptors the GEM has reported complete (reclaimed at
+    /// `poll_tx`). What the drain query reports as the wire index.
+    tx_completed: u32,
     /// Cumulative TX frames at the hardware level (`GEM_FRAMES_TX`).
     /// `tx_packets - tx_frames_hw_total` is the silent-loss count —
     /// frames the driver queued but the MAC never emitted.
@@ -270,8 +298,8 @@ unsafe fn append_hex32_field(p: *mut u8, pos: &mut usize, tag: &[u8], val: u32) 
 
 /// Periodic heartbeat (~5 s). Emits two lines:
 ///
-///   `[rp1_gem] rx=N tx=M rsr=0xHH bna=K ovr=J hwrx=H hwtx=T`
-///   `[rp1_gem] th=H tt=T u=U rfb=F shr=S txsr=0xHH txstk=0xHH`
+///   `[rp1_gem] rx=N tx=M rsr=0xHH bna=K ovr=J hwrx=H hwtx=T cdr=C rxrs=R`
+///   `[rp1_gem] th=H tt=T u=U rfb=F shr=S txsr=0xHH txstk=0xHH txrs=R`
 ///
 /// `tx` vs `hwtx` is the silent-loss signal: every frame the driver
 /// counted as queued (`tx_packets`) but the MAC never emitted
@@ -296,7 +324,7 @@ unsafe fn heartbeat(s: &mut GemState) {
     s.tx_frames_hw_total = s.tx_frames_hw_total.wrapping_add(gem_read(base, GEM_FRAMES_TX));
 
     {
-        let mut msg = [0u8; 96];
+        let mut msg = [0u8; 128];
         let p = msg.as_mut_ptr();
         let prefix = b"[rp1_gem] rx=";
         core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
@@ -309,23 +337,25 @@ unsafe fn heartbeat(s: &mut GemState) {
         append_dec_field(p, &mut pos, b" hwrx=", s.rx_frames_hw_total);
         append_dec_field(p, &mut pos, b" hwtx=", s.tx_frames_hw_total);
         append_dec_field(p, &mut pos, b" cdr=", s.rx_chan_drops);
+        append_dec_field(p, &mut pos, b" rxrs=", s.rx_restarts);
         dev_log(&*s.syscalls, 3, p, pos);
     }
 
     {
-        let mut msg = [0u8; 96];
+        let mut msg = [0u8; 128];
         let p = msg.as_mut_ptr();
         let prefix = b"[rp1_gem] th=";
         core::ptr::copy_nonoverlapping(prefix.as_ptr(), p, prefix.len());
         let mut pos = prefix.len();
         pos += fmt_u32_raw(p.add(pos), s.tx_head as u32);
         append_dec_field(p, &mut pos, b" tt=", s.tx_tail as u32);
-        let used = s.tx_head.wrapping_sub(s.tx_tail) as u32;
+        let used = ring::used(s.tx_head, s.tx_tail, s.tx_desc_count) as u32;
         append_dec_field(p, &mut pos, b" u=", used);
         append_dec_field(p, &mut pos, b" rfb=", s.tx_ring_full_breaks);
         append_dec_field(p, &mut pos, b" shr=", s.tx_short_reads);
         append_hex32_field(p, &mut pos, b" txsr=0x", txsr);
         append_hex32_field(p, &mut pos, b" txstk=0x", s.txsr_sticky);
+        append_dec_field(p, &mut pos, b" txrs=", s.tx_restarts);
         dev_log(&*s.syscalls, 3, p, pos);
     }
 
@@ -672,7 +702,7 @@ unsafe fn poll_rx(s: &mut GemState) -> u32 {
 
     let mut processed = 0u32;
     while processed < s.rx_desc_count as u32 {
-        let idx = (s.rx_tail % s.rx_desc_count) as usize;
+        let idx = ring::index(s.rx_tail, s.rx_desc_count);
         let desc_base = s.rx_desc_addr as usize + idx * 16;
 
         // Word 0: bit 0 = ownership. 1 = GEM has written a frame (SW-owned).
@@ -718,10 +748,65 @@ unsafe fn poll_rx(s: &mut GemState) -> u32 {
         write_volatile(desc_base as *mut u32, new_word0);
         write_volatile((desc_base + 4) as *mut u32, 0); // clear status
         write_volatile((desc_base + 8) as *mut u32, (buf_dma >> 32) as u32); // addr high
-        s.rx_tail = s.rx_tail.wrapping_add(1);
+        s.rx_tail = ring::next(s.rx_tail, s.rx_desc_count);
         processed += 1;
     }
+
+    // The receiver halts on a buffer-not-available condition: once the DMA
+    // has read a descriptor it does not own it drops frames until receive
+    // is re-enabled, and handing the descriptors back is not enough. A
+    // stall is the MAC reporting the condition twice while this driver
+    // found nothing to drain — every descriptor is the MAC's and it is
+    // still not receiving. The recovery re-arms the ring from its base
+    // and toggles receive enable, as the MAC's own driver does; the frames
+    // in the ring at that point were already lost to the overflow.
+    let rsr = gem_read(s.gem_base, GEM_RXSTATUS);
+    if rsr & (RSR_BNA | RSR_RXOVR) != 0 {
+        gem_write(s.gem_base, GEM_RXSTATUS, rsr & (RSR_BNA | RSR_RXOVR));
+        if processed == 0 {
+            s.rx_stall_polls = s.rx_stall_polls.saturating_add(1);
+            if s.rx_stall_polls >= 2 {
+                restart_rx(s);
+                s.rx_stall_polls = 0;
+            }
+        } else {
+            s.rx_stall_polls = 0;
+        }
+    } else if processed > 0 {
+        s.rx_stall_polls = 0;
+    }
     processed
+}
+
+/// Re-arm the receive ring from its base and re-enable the receiver.
+unsafe fn restart_rx(s: &mut GemState) {
+    let base = s.gem_base;
+    let ctrl = gem_read(base, GEM_NWCTRL);
+    gem_write(base, GEM_NWCTRL, ctrl & !NWCTRL_RXEN);
+    init_rx_descriptors(s);
+    s.rx_tail = 0;
+    let rx_dma = s.rx_desc_addr + DMA_OFFSET;
+    gem_write(base, GEM_RBQPH, (rx_dma >> 32) as u32);
+    gem_write(base, GEM_RXQBASE, rx_dma as u32);
+    gem_write(base, GEM_NWCTRL, ctrl | NWCTRL_RXEN);
+    s.rx_restarts = s.rx_restarts.wrapping_add(1);
+}
+
+/// Re-arm the transmit ring from its base and re-enable the transmitter.
+/// Every frame in the ring is dropped.
+unsafe fn restart_tx(s: &mut GemState) {
+    let base = s.gem_base;
+    let ctrl = gem_read(base, GEM_NWCTRL);
+    gem_write(base, GEM_NWCTRL, ctrl & !NWCTRL_TXEN);
+    init_tx_descriptors(s);
+    s.tx_head = 0;
+    s.tx_tail = 0;
+    let tx_dma = s.tx_desc_addr + DMA_OFFSET;
+    gem_write(base, GEM_TBQPH, (tx_dma >> 32) as u32);
+    gem_write(base, GEM_TXQBASE, tx_dma as u32);
+    gem_write(base, GEM_TXSTATUS, TXSR_HALT | TXSR_USED | TXSR_COL | TXSR_TXCOMPL);
+    gem_write(base, GEM_NWCTRL, ctrl | NWCTRL_TXEN);
+    s.tx_restarts = s.tx_restarts.wrapping_add(1);
 }
 
 unsafe fn poll_tx(s: &mut GemState) {
@@ -730,15 +815,49 @@ unsafe fn poll_tx(s: &mut GemState) {
 
     // Reclaim completed TX descriptors. Single pass at the top of
     // the step covers descriptors retired since last poll.
+    let mut reclaimed = 0u32;
     while s.tx_tail != s.tx_head {
-        let idx = (s.tx_tail % s.tx_desc_count) as usize;
+        let idx = ring::index(s.tx_tail, s.tx_desc_count);
         let desc_base = s.tx_desc_addr as usize + idx * 16;
         let word1 = read_volatile((desc_base + 4) as *const u32);
         // TX: used bit (31) set by GEM when transmission complete
         if word1 & TX_DESC_USED == 0 {
             break; // Not yet completed by GEM
         }
-        s.tx_tail = s.tx_tail.wrapping_add(1);
+        s.tx_tail = ring::next(s.tx_tail, s.tx_desc_count);
+        s.tx_completed = s.tx_completed.wrapping_add(1);
+        reclaimed += 1;
+    }
+
+    // The transmitter halts on a DMA or line error and the frame is lost;
+    // it also stops whenever it reads a descriptor it has already used,
+    // and only a start kick moves it again. A queue that neither drains
+    // nor errs for `TX_STALL_STEPS` is a halted DMA. Recovery follows the
+    // MAC's own driver: disable, re-arm the ring, enable; the frames in
+    // the ring are lost and TCP retransmits them.
+    {
+        let base = s.gem_base;
+        let txsr = gem_read(base, GEM_TXSTATUS);
+        if txsr & TXSR_HALT != 0 {
+            s.txsr_sticky |= txsr;
+            gem_write(base, GEM_TXSTATUS, txsr & TXSR_HALT);
+            restart_tx(s);
+            s.tx_stall_steps = 0;
+        } else if s.tx_tail != s.tx_head && reclaimed == 0 {
+            s.tx_stall_steps = s.tx_stall_steps.saturating_add(1);
+            if s.tx_stall_steps >= TX_STALL_STEPS {
+                restart_tx(s);
+                s.tx_stall_steps = 0;
+            } else if txsr & TXSR_USED != 0 {
+                // Stopped on a used descriptor with frames still queued
+                // behind it: kick it on from where it stands.
+                gem_write(base, GEM_TXSTATUS, TXSR_USED);
+                let ctrl = gem_read(base, GEM_NWCTRL);
+                gem_write(base, GEM_NWCTRL, ctrl | NWCTRL_STARTTX);
+            }
+        } else {
+            s.tx_stall_steps = 0;
+        }
     }
 
     // Submit new TX frames in a tight loop — one frame per descriptor
@@ -754,13 +873,13 @@ unsafe fn poll_tx(s: &mut GemState) {
         // tx_head can outpace tx_tail by at most tx_desc_count - 1
         // before a wraparound would clobber a slot the GEM still
         // owns; re-check on every iteration.
-        let used = s.tx_head.wrapping_sub(s.tx_tail);
+        let used = ring::used(s.tx_head, s.tx_tail, s.tx_desc_count);
         if used >= s.tx_desc_count {
             s.tx_ring_full_breaks = s.tx_ring_full_breaks.wrapping_add(1);
             break;
         }
 
-        let idx = (s.tx_head % s.tx_desc_count) as usize;
+        let idx = ring::index(s.tx_head, s.tx_desc_count);
         let buf_idx = s.rx_desc_count as usize + idx;
         if buf_idx >= s.buf_count as usize { break; }
         let buf_arm = s.buf_pool_addr as usize + buf_idx * s.buf_size as usize;
@@ -799,7 +918,7 @@ unsafe fn poll_tx(s: &mut GemState) {
         }
         write_volatile((desc_base + 4) as *mut u32, word1);
 
-        s.tx_head = s.tx_head.wrapping_add(1);
+        s.tx_head = ring::next(s.tx_head, s.tx_desc_count);
         s.tx_packets = s.tx_packets.wrapping_add(1);
         emitted += 1;
         started = true;
@@ -877,10 +996,64 @@ pub extern "C" fn module_new(
     s.step_count = 0;
     s.rx_packets = 0;
     s.tx_packets = 0;
+    s.tx_completed = 0;
+    s.link_poll_counter = 0;
+    // The frame channel's reader answers the transmit-drain query, so a
+    // fence upstream can learn when the wire is quiet.
+    if in_chan >= 0 {
+        let mut reg = [0u8; 16];
+        reg[..8].copy_from_slice(&(state as u64).to_le_bytes());
+        reg[8..16].copy_from_slice(&(gem_tx_drain_ioctl as usize as u64).to_le_bytes());
+        // SAFETY: `syscalls` is the kernel table handed to `module_new`;
+        // the registration payload is the 16-byte layout `REGISTER_IOCTL`
+        // documents.
+        let _ = unsafe { ((*syscalls).provider_call)(in_chan, 0x0507, reg.as_mut_ptr(), 16) };
+    }
     s.link_poll_counter = 0;
     s.rx_resource_total = 0;
     s.rx_overrun_total = 0;
     s.rx_frames_hw_total = 0;
+    s.rx_stall_polls = 0;
+    s.rx_restarts = 0;
+    s.tx_stall_steps = 0;
+    s.tx_restarts = 0;
+    0
+}
+
+/// `net::identity::tx_drain::IOCTL` on the frame channel: `0` with the
+/// completed count once no frame is unread on the channel and every
+/// submitted descriptor has been used by the GEM; `EAGAIN` until then.
+unsafe extern "C" fn gem_tx_drain_ioctl(state: *mut c_void, cmd: u32, arg: *mut u8) -> i32 {
+    const IOCTL_TX_DRAIN: u32 = 0x0010;
+    const E_NOSYS: i32 = -38;
+    const E_AGAIN: i32 = -11;
+    const E_INVAL: i32 = -22;
+    if state.is_null() {
+        return E_INVAL;
+    }
+    if cmd != IOCTL_TX_DRAIN {
+        return E_NOSYS;
+    }
+    let s = &mut *(state as *mut GemState);
+    let sys = &*s.syscalls;
+    // Reclaim what the GEM has finished since the last step.
+    while s.tx_tail != s.tx_head && s.tx_desc_count != 0 {
+        let idx = ring::index(s.tx_tail, s.tx_desc_count);
+        let desc_base = s.tx_desc_addr as usize + idx * 16;
+        let word1 = read_volatile((desc_base + 4) as *const u32);
+        if word1 & TX_DESC_USED == 0 {
+            break;
+        }
+        s.tx_tail = ring::next(s.tx_tail, s.tx_desc_count);
+        s.tx_completed = s.tx_completed.wrapping_add(1);
+    }
+    if !arg.is_null() {
+        core::ptr::copy_nonoverlapping(s.tx_completed.to_le_bytes().as_ptr(), arg, 4);
+    }
+    let unread = (sys.channel_poll)(s.in_chan, POLL_IN);
+    if (unread > 0 && (unread as u32 & POLL_IN) != 0) || s.tx_tail != s.tx_head {
+        return E_AGAIN;
+    }
     0
 }
 

@@ -909,6 +909,62 @@ impl TimerClass {
     }
 }
 
+/// Which kind of execution claim a module's `[execution]` facts make
+/// Declared in the manifest as
+/// `profile = "..."`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionProfile {
+    /// The numbers rest on an auditable execution model: every code path a
+    /// step can take is bounded and the derivation is on file at
+    /// `evidence`. Only a bare-metal target can honour a bound claim.
+    AnalyticalBound,
+    /// The numbers are observed maxima under a stated workload on a stated
+    /// host. A percentile, not a guarantee; what Linux always publishes.
+    MeasuredEnvelope,
+}
+
+impl ExecutionProfile {
+    /// The manifest and config spellings.
+    pub const NAMES: [&'static str; 2] = ["analytical_bound", "measured_envelope"];
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "analytical_bound" => Some(Self::AnalyticalBound),
+            "measured_envelope" => Some(Self::MeasuredEnvelope),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AnalyticalBound => "analytical_bound",
+            Self::MeasuredEnvelope => "measured_envelope",
+        }
+    }
+}
+
+/// A module's `[execution]` facts — the two universal timing declarations
+/// of the envelope and the profile they are made under.
+/// TOML-only, never serialized to the binary manifest: the facts are what
+/// the composer admits a graph against, and a binary-loaded manifest makes
+/// no timing claim at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionEnvelope {
+    /// Exclusive local CPU time of one `module_step`, in microseconds, on
+    /// the profile's stated host. Synchronous provider dispatches the step
+    /// makes are NOT inside this number — they are charged separately by
+    /// `max_dispatch_us` and the dispatch count, so a provider shared by
+    /// several callers is accounted once.
+    pub max_step_us: u32,
+    /// Bounded cost of one synchronous provider dispatch the module makes,
+    /// in microseconds.
+    pub max_dispatch_us: u32,
+    pub profile: ExecutionProfile,
+    /// Where the numbers come from: the gate that measures them or the
+    /// derivation that bounds them. Required for `analytical_bound`.
+    pub evidence: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub module_version: u16,
@@ -1048,6 +1104,11 @@ pub struct Manifest {
     /// module is on a mechanism-(b) domain unless it attests `wall_clock`.
     /// Wired into header byte 1 by `pack_fmod`/`pack_fmod_wasm`.
     pub step_period_ticks: u8,
+    /// `[execution]` — the module's step and dispatch cost facts and the
+    /// profile they hold under. `None` when the module declares nothing;
+    /// the composer's `validate_execution_profile` treats an undeclared
+    /// module as one that can be part of no envelope claim.
+    pub execution: Option<ExecutionEnvelope>,
 }
 
 impl Default for Manifest {
@@ -1081,6 +1142,7 @@ impl Default for Manifest {
             params: Vec::new(),
             timer_class: TimerClass::Unattested,
             step_period_ticks: 0,
+            execution: None,
         }
     }
 }
@@ -1698,10 +1760,12 @@ impl Manifest {
         let (major, minor, patch) = parse_semver(&toml_val.version)?;
         let module_version = encode_semver(major, minor, patch);
 
-        let hardware_targets = toml_val
-            .hardware_targets
-            .map(|t| hardware_targets_from_list(&t))
-            .unwrap_or(0x01);
+        let hardware_target_names: Vec<String> = toml_val.hardware_targets.unwrap_or_default();
+        let hardware_targets = if hardware_target_names.is_empty() {
+            0x01
+        } else {
+            hardware_targets_from_list(&hardware_target_names)
+        };
 
         let state_size_hint = toml_val.state_size_hint.unwrap_or(0);
 
@@ -2068,6 +2132,11 @@ impl Manifest {
             }
         };
 
+        let execution = match toml_val.execution {
+            None => None,
+            Some(e) => Some(e.validate(&hardware_target_names)?),
+        };
+
         // `[[variant]]` table. Validated here so a malformed table fails
         // the build loudly rather than surfacing as a missing artifact at
         // packaging.
@@ -2191,6 +2260,7 @@ impl Manifest {
             params,
             timer_class,
             step_period_ticks,
+            execution,
         })
     }
 
@@ -2535,6 +2605,9 @@ impl Manifest {
             // step_period_ticks lives in the module ABI HEADER (byte 1), not the
             // manifest binary parsed here; a manifest-only load defaults to 0.
             step_period_ticks: 0,
+            // Timing facts are compose-time evidence, TOML-only: a
+            // binary-loaded manifest claims no envelope.
+            execution: None,
         })
     }
 
@@ -2767,6 +2840,75 @@ struct TomlManifest {
     step_period_ticks: Option<u64>,
     /// `[build]` table — per-module build knobs.
     build: Option<TomlBuild>,
+    /// `[execution]` table — step / dispatch cost facts and their profile.
+    /// See `ExecutionEnvelope`.
+    execution: Option<TomlExecution>,
+}
+
+/// `[execution]` manifest table as written. Every field is optional at the
+/// TOML layer so the validator, not serde, names what is missing.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlExecution {
+    max_step_us: Option<u64>,
+    max_dispatch_us: Option<u64>,
+    profile: Option<String>,
+    evidence: Option<String>,
+}
+
+impl TomlExecution {
+    /// Check the block against its contract and the step budget of every
+    /// silicon the module targets (`target_facts::TargetFacts::step_budget_us`).
+    fn validate(self, hardware_targets: &[String]) -> Result<ExecutionEnvelope> {
+        let err = |msg: String| Error::Module(format!("manifest [execution]: {msg}"));
+        let positive = |name: &str, v: Option<u64>| -> Result<u32> {
+            match v {
+                None => Err(err(format!("required field `{name}` missing"))),
+                Some(0) => Err(err(format!(
+                    "`{name}` must be greater than 0 — a zero-cost step is not a fact"
+                ))),
+                Some(n) => {
+                    u32::try_from(n).map_err(|_| err(format!("`{name}` = {n} does not fit a u32")))
+                }
+            }
+        };
+        let max_step_us = positive("max_step_us", self.max_step_us)?;
+        let max_dispatch_us = positive("max_dispatch_us", self.max_dispatch_us)?;
+        let profile = match self.profile.as_deref() {
+            None => return Err(err("required field `profile` missing".into())),
+            Some(p) => ExecutionProfile::from_str_opt(p).ok_or_else(|| {
+                err(format!(
+                    "profile=\"{p}\" is invalid; expected one of {}",
+                    ExecutionProfile::NAMES.join(" | ")
+                ))
+            })?,
+        };
+        let evidence = self.evidence.filter(|e| !e.trim().is_empty());
+        if profile == ExecutionProfile::AnalyticalBound && evidence.is_none() {
+            return Err(err(
+                "profile = \"analytical_bound\" requires `evidence` naming the reviewed \
+                 derivation; a bound nobody can audit is a measurement, so declare \
+                 `measured_envelope` instead"
+                    .into(),
+            ));
+        }
+        for silicon in hardware_targets {
+            let budget = crate::target_facts::TargetFacts::for_silicon(silicon).step_budget_us;
+            if max_step_us > budget {
+                return Err(err(format!(
+                    "max_step_us = {max_step_us} exceeds the {budget} us step budget of \
+                     hardware target `{silicon}`; a step that cannot fit one scheduler \
+                     pass there has no envelope on that silicon"
+                )));
+            }
+        }
+        Ok(ExecutionEnvelope {
+            max_step_us,
+            max_dispatch_us,
+            profile,
+            evidence,
+        })
+    }
 }
 
 /// `[build]` manifest table: per-module build configuration.

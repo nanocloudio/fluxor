@@ -1,0 +1,56 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+# Reconnect backoff is wall-clock; everything else is per-frame.
+timer_class = "wall_clock"
+
+# One TCP connection as a raw byte stream: the adapter that gives
+# `remote_channel` a transport over the Stream Surface. In `listen` mode
+# it binds `port` and adopts the first connection accepted; in `connect`
+# mode it dials `peer_ip:port` (`peer_ip` is the IPv4 address as a number,
+# 192.168.1.10 = 0xC0A8010A) and redials after a close. Bytes arriving
+# on the connection go out on `bytes_out`; bytes on `bytes_in` are sent
+# on the connection. Exactly one connection at a time; a second accept
+# is closed at once.
+#
+#   ip.net_out / linux_net.net_out  → net_in
+#   net_out                         → ip.net_in / linux_net.net_in
+#   remote_channel.transport_tx     → bytes_in
+#   bytes_out                       → remote_channel.transport_rx
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+buffer_size = { default = 4096, bcm2712 = 16384 }
+
+[[ports]]
+name = "bytes_in"
+direction = "input"
+index = 1
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 4096, bcm2712 = 16384 }
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+buffer_size = { default = 4096, bcm2712 = 16384 }
+
+[[ports]]
+name = "bytes_out"
+direction = "output"
+index = 1
+content_type = "OctetStream"
+required = true
+buffer_size = { default = 4096, bcm2712 = 16384 }
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "byte-stream adapter fixture; throughput is observed at the transport it rides (ip / linux_net)"

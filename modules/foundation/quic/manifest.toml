@@ -6,6 +6,14 @@ hardware_targets = ["bcm2712"]
 # A stable multiplexed-session anchor (`protocol_surfaces.md` §Continuity),
 # and resumable sessions whose tickets are the session state sealed under a
 # vault-held key.
+#
+# `transport.anchor.mux` is the anchor set a mux transport widens
+# to admit CT_QUIC replicated-anchor continuity (§8.3): a QUIC anchor that
+# survives its own host's death is on-wire-sequence AEAD failover, driven by
+# the checkpoint/delta/cut-over surface on `cont_in` / `cont_out`. No new
+# capability is added — the continuity gates prove only what these two
+# already claim, plus `session.resume`'s sealed-secret custody reused for
+# the `quic-continuity` sealing key.
 capabilities = ["transport.anchor.mux", "session.resume"]
 
 # `scope = local`: the sealing key is opened per instance from this host's
@@ -25,6 +33,23 @@ early_data = "local_single_use"
 # `HandshakeDriver` the TLS / DTLS modules use, with QUIC's CRYPTO
 # frames instead of records. RFC 9001 §A.1 Initial-keys derivation
 # is self-checked at module_new and logged on success/failure.
+#
+# ─── Parameters (TLV) ──────────────────────────────────────────────────
+# | Tag | Name               | Type | Default | Description                    |
+# |-----|--------------------|------|---------|--------------------------------|
+# | 1   | port               | u16  | 4443    | UDP port to bind.              |
+# | 2   | mode               | u8   | 1       | 0 = client, 1 = server.        |
+# | 3   | peer_ip            | u32  | 127.0.0.1 | Client-mode peer IPv4 (LE).  |
+# | 4   | peer_port          | u16  | 4443    | Client-mode peer port.         |
+# | 5   | require_retry      | u8   | 0       | Server: demand a Retry token.  |
+# | 6   | enable_0rtt        | u8   | 0       | 0-RTT resumption + early data. |
+# | 9   | verify_peer        | u8   | 0       | Validate the peer cert chain.  |
+# | 11  | trace_sample_permille | u16 | tier  | Span head-sampling rate (‰).   |
+# | 12  | disable_migration  | u8   | 0       | Advertise disable_active_migration. |
+# | 14  | alpn               | str  | —       | Comma-separated ALPN tokens.   |
+# | 15  | ecdh_bits_per_step | u16  | 256     | P-256 ladder chunk per step.   |
+# | 16  | ticket_rotate_s    | u32  | 3600    | Ticket-sealing key rotation.   |
+# | 17  | key_update_pkts    | u32  | 0       | RFC 9001 §6 key-update knob: initiate a 1-RTT key update after this many packets in the current phase (0 = never), once the handshake is confirmed and any prior update is acknowledged. Reservations are not reset on key update (§8.3). |
 
 [[ports]]
 name = "net_in"
@@ -46,9 +71,34 @@ name = "app_out"
 direction = "output"
 content_type = "OctetStream"
 
-# Module-scope observability. Optional 3rd output (out[2]); wired to
-# `observe.telemetry` when the debug stack's observe overlay is on. Emits
-# cumulative byte counters; no-op when unwired. See standards/observability.md.
+# Transport-continuity control (CT_QUIC). Both
+# optional (-1 when unwired → local self-grant mode, no directory).
+#
+# `cont_in` (in[2]) carries the SessionCtrlV1 continuity commands
+# (0x7A..0x87: PAIR_PREPARE / CHECKPOINT_* / DELTA_* / QUIESCE_* /
+# CUT_* / EMISSION_ARM / ACTIVATE / RETIRE / ABORT) driving a shadow
+# takeover, AND durable 1-RTT send-packet-number reservation grants. A
+# grant reuses Clustor's reservation record VERBATIM: msg_type 0x88, body
+# = `flow_id[16]` ‖ the 38-byte `SessionReply` for an `SR_OP_RESERVE`
+# (`[op:1][status:1][sid:16][epoch:4][start:8][len:8]`). The directory's
+# grant is consumed as-is rather than re-encoded here.
+[[ports]]
+name = "cont_in"
+direction = "input"
+content_type = "OctetStream"
+
+# `cont_out` (out[2]) emits the `MSG_SC_CONTINUITY` (0x9A) replies with
+# their `CR_*` record bodies, the primary's CHECKPOINT_BEGIN/NEXT*/COMMIT
+# stream on CUT_EXPORT, and the mirror `DELTA_APPLY` frames.
+[[ports]]
+name = "cont_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Module-scope observability. Optional output appended after the declared
+# ports (out[3]); wired to `observe.telemetry` when the debug stack's
+# observe overlay is on. Emits cumulative byte counters; no-op when
+# unwired. See standards/observability.md.
 [observability]
 # Application-stream bytes carried by QUIC (excludes handshake/ack overhead):
 # bytes_in  = stream data delivered inbound to app_out (peer → app)

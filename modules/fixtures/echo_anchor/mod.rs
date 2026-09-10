@@ -134,6 +134,14 @@ const ANCHOR_ID: [u8; ANCHOR_ID_BYTES] = *b"DEMO-A01";
 
 /// Max net_proto frame we handle (3-byte header + up to 1024 payload).
 const NET_BUF_SIZE: usize = 1 + 1024 + 16;
+/// No accepted client.
+const NO_CONN: u16 = 0xFFFF;
+
+/// The `conn_id` at the head of a net_proto payload (`u16 LE`).
+#[inline(always)]
+unsafe fn conn_id_at(p: *const u8) -> u16 {
+    (*p as u16) | ((*p.add(1) as u16) << 8)
+}
 
 /// Max SessionCtrlV1 frame (identity + a few fields).
 const CTRL_BUF_SIZE: usize = 128;
@@ -238,10 +246,9 @@ struct AnchorState {
     // net_proto state
     /// Server (listener) conn_id assigned by IP module. Only meaningful
     /// once we've seen MSG_BOUND.
-    server_conn_id: u8,
-    /// Accepted-client conn_id (0xFF = no active client).
-    client_conn_id: u8,
-    _pad1: [u8; 2],
+    server_conn_id: u16,
+    /// Accepted-client conn_id (`NO_CONN` = no active client).
+    client_conn_id: u16,
 
     // Session identity
     session_id: [u8; SESSION_ID_BYTES],
@@ -283,8 +290,7 @@ impl AnchorState {
         self.hold_len = 0;
         self._pad3 = [0; 2];
         self.server_conn_id = 0;
-        self.client_conn_id = 0xFF;
-        self._pad1 = [0; 2];
+        self.client_conn_id = NO_CONN;
         self.session_id = [0; SESSION_ID_BYTES];
         self.session_epoch = 0;
         self.session_counter = 0;
@@ -365,34 +371,36 @@ unsafe fn net_send_bind(s: &mut AnchorState) -> bool {
     wrote > 0
 }
 
-/// Emit CMD_SEND. Payload: `[conn_id:1][data:n]`.
-unsafe fn net_send_data(s: &mut AnchorState, conn_id: u8, data: *const u8, data_len: usize) -> bool {
+/// Emit CMD_SEND. Payload: `[conn_id:2 LE][data:n]`.
+unsafe fn net_send_data(s: &mut AnchorState, conn_id: u16, data: *const u8, data_len: usize) -> bool {
     let sys_ptr = s.syscalls;
     let out_chan = s.net_out;
-    if out_chan < 0 || data_len + 1 + NET_FRAME_HDR > NET_BUF_SIZE {
+    if out_chan < 0 || data_len + 2 + NET_FRAME_HDR > NET_BUF_SIZE {
         return false;
     }
     let scratch = s.net_buf.as_mut_ptr();
-    let payload_len = 1 + data_len;
+    let payload_len = 2 + data_len;
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = (payload_len & 0xFF) as u8;
     *scratch.add(2) = ((payload_len >> 8) & 0xFF) as u8;
-    *scratch.add(NET_FRAME_HDR) = conn_id;
-    core::ptr::copy_nonoverlapping(data, scratch.add(NET_FRAME_HDR + 1), data_len);
+    let cb = conn_id.to_le_bytes();
+    *scratch.add(NET_FRAME_HDR) = cb[0];
+    *scratch.add(NET_FRAME_HDR + 1) = cb[1];
+    core::ptr::copy_nonoverlapping(data, scratch.add(NET_FRAME_HDR + 2), data_len);
     let total = NET_FRAME_HDR + payload_len;
     let wrote = ((*sys_ptr).channel_write)(out_chan, scratch, total);
     wrote > 0
 }
 
-unsafe fn net_send_close(s: &mut AnchorState, conn_id: u8) {
+unsafe fn net_send_close(s: &mut AnchorState, conn_id: u16) {
     let sys_ptr = s.syscalls;
     let out_chan = s.net_out;
     if out_chan < 0 { return; }
-    let payload = [conn_id];
+    let payload = conn_id.to_le_bytes();
     let scratch = s.net_buf.as_mut_ptr();
     net_write_frame(
         &*sys_ptr, out_chan, NET_CMD_CLOSE,
-        payload.as_ptr(), 1,
+        payload.as_ptr(), 2,
         scratch, NET_BUF_SIZE,
     );
 }
@@ -537,7 +545,7 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
 
     match msg_type {
         NET_MSG_BOUND => {
-            // net_proto MSG_BOUND: `[conn_id:1][local_port:2 LE]`. The
+            // net_proto MSG_BOUND: `[conn_id:2 LE][local_port:2 LE]`. The
             // `local_port` echoes our CMD_BIND port (the IP module and the
             // Linux host adapter both carry it now). On a fanned `net_out`
             // we claim ONLY the bound for our own `listen_port`, so a
@@ -545,14 +553,14 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             // Listening. A port-less (legacy) frame is accepted as
             // sole-consumer.
             if s.phase == AnchorPhase::WaitBoundNet {
-                let ours = payload_len < 3 || {
-                    let lo = *buf.add(NET_FRAME_HDR + 1);
-                    let hi = *buf.add(NET_FRAME_HDR + 2);
+                let ours = payload_len < 4 || {
+                    let lo = *buf.add(NET_FRAME_HDR + 2);
+                    let hi = *buf.add(NET_FRAME_HDR + 3);
                     ((lo as u16) | ((hi as u16) << 8)) == s.listen_port
                 };
                 if ours {
-                    if payload_len >= 1 {
-                        s.server_conn_id = *buf.add(NET_FRAME_HDR);
+                    if payload_len >= 2 {
+                        s.server_conn_id = conn_id_at(buf.add(NET_FRAME_HDR));
                     }
                     s.phase = AnchorPhase::Listening;
                     dev_log(&*sys_ptr, 3, b"[echo_anc] bound".as_ptr(), 16);
@@ -560,20 +568,20 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             }
         }
         NET_MSG_ACCEPTED => {
-            // `[conn_id:1][local_port:2 LE]`. Multi-anchor demux: claim
-            // only accepts on our `listen_port` (a port-less legacy frame
-            // is accepted). An accept on another anchor's port belongs to
+            // `[conn_id:2 LE][local_port:2 LE]`. Multi-anchor demux: claim
+            // only accepts on our `listen_port` (a port-less frame is
+            // accepted). An accept on another anchor's port belongs to
             // that anchor — ignore it (do NOT close it).
-            if payload_len >= 1 {
-                let new_id = *buf.add(NET_FRAME_HDR);
-                let ours = payload_len < 3 || {
-                    let lo = *buf.add(NET_FRAME_HDR + 1);
-                    let hi = *buf.add(NET_FRAME_HDR + 2);
+            if payload_len >= 2 {
+                let new_id = conn_id_at(buf.add(NET_FRAME_HDR));
+                let ours = payload_len < 4 || {
+                    let lo = *buf.add(NET_FRAME_HDR + 2);
+                    let hi = *buf.add(NET_FRAME_HDR + 3);
                     ((lo as u16) | ((hi as u16) << 8)) == s.listen_port
                 };
                 if !ours {
                     // Not for this anchor — leave it for the owning anchor.
-                } else if s.client_conn_id == 0xFF && s.phase == AnchorPhase::Listening {
+                } else if s.client_conn_id == NO_CONN && s.phase == AnchorPhase::Listening {
                     s.client_conn_id = new_id;
                     mint_session_id(s);
                     s.phase = AnchorPhase::Attaching;
@@ -593,11 +601,11 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             // hold buffer (§11.2), flushed when the worker is live.
             let attach_window = s.phase == AnchorPhase::Attaching
                 || s.phase == AnchorPhase::WaitAttached;
-            if payload_len >= 2 && (s.phase == AnchorPhase::Active || attach_window) {
-                let id = *buf.add(NET_FRAME_HDR);
+            if payload_len >= 3 && (s.phase == AnchorPhase::Active || attach_window) {
+                let id = conn_id_at(buf.add(NET_FRAME_HDR));
                 if id == s.client_conn_id {
-                    let data_len = payload_len - 1;
-                    let data = buf.add(NET_FRAME_HDR + 1);
+                    let data_len = payload_len - 2;
+                    let data = buf.add(NET_FRAME_HDR + 2);
                     if s.phase == AnchorPhase::Active && s.handoff == HandoffPhase::Idle {
                         let out = s.data_out[s.active_w as usize];
                         // Best-effort forward — drop on data_out full.
@@ -629,9 +637,9 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             }
         }
         NET_MSG_CLOSED => {
-            // [conn_id:1]. Client gone → detach worker, return to Listening.
-            if payload_len >= 1 {
-                let id = *buf.add(NET_FRAME_HDR);
+            // [conn_id:2 LE]. Client gone → detach worker, return to Listening.
+            if payload_len >= 2 {
+                let id = conn_id_at(buf.add(NET_FRAME_HDR));
                 if id == s.client_conn_id {
                     match s.phase {
                         AnchorPhase::Active
@@ -651,7 +659,7 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
                             mon_emit(s, MON_EV_DETACH_REQ, b"client_gone", b"");
                         }
                         _ => {
-                            s.client_conn_id = 0xFF;
+                            s.client_conn_id = NO_CONN;
                             s.phase = AnchorPhase::Listening;
                         }
                     }
@@ -693,7 +701,7 @@ unsafe fn handoff_abort(s: &mut AnchorState) {
     sc_send_detach(s, standby, SC_DETACH_NORMAL);
     s.handoff = HandoffPhase::Idle;
     s.hold_len = 0;
-    if s.client_conn_id != 0xFF {
+    if s.client_conn_id != NO_CONN {
         net_send_close(s, s.client_conn_id);
     }
     s.phase = AnchorPhase::Detaching;
@@ -737,7 +745,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                     dev_log(&*sys_ptr, 3, b"[echo_anc] active".as_ptr(), 17);
                 } else {
                     // Worker refused or session mismatch — drop the client.
-                    if s.client_conn_id != 0xFF {
+                    if s.client_conn_id != NO_CONN {
                         net_send_close(s, s.client_conn_id);
                     }
                     s.phase = AnchorPhase::Detaching;
@@ -818,9 +826,9 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                 // Session-ending detach. Close client if still open
                 // and return to Listening; the IP module preserves the
                 // listener slot across accepted connections.
-                if s.client_conn_id != 0xFF {
+                if s.client_conn_id != NO_CONN {
                     net_send_close(s, s.client_conn_id);
-                    s.client_conn_id = 0xFF;
+                    s.client_conn_id = NO_CONN;
                 }
                 s.session_id = [0; SESSION_ID_BYTES];
                 s.session_epoch = 0;
@@ -833,7 +841,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
             if s.handoff != HandoffPhase::Idle {
                 handoff_abort(s);
             } else {
-                if s.client_conn_id != 0xFF {
+                if s.client_conn_id != NO_CONN {
                     net_send_close(s, s.client_conn_id);
                 }
                 s.phase = AnchorPhase::Detaching;
@@ -859,7 +867,7 @@ unsafe fn poll_ctrl_all(s: &mut AnchorState) {
 /// retire, both slots are polled (a draining worker still flushes
 /// trailing output while the standby imports).
 unsafe fn poll_data_in(s: &mut AnchorState) {
-    if s.phase != AnchorPhase::Active || s.client_conn_id == 0xFF {
+    if s.phase != AnchorPhase::Active || s.client_conn_id == NO_CONN {
         return;
     }
     let sys_ptr = s.syscalls;

@@ -114,8 +114,30 @@ pub const MSG_ADDR_FENCED: u8 = 0x72;
 /// `reason` per `refusal`.
 pub const MSG_ADDR_REFUSED: u8 = 0x73;
 
+/// The transmit-drain query a NIC driver answers on the frame channel it
+/// reads from the ip module, over `channel_ioctl` (`dev_channel_ioctl`
+/// with `handle = ip's frames_tx channel`). This is how a fence reaches
+/// the wire: after closing its gate the ip module asks the driver whether
+/// every frame handed over before the fence has left the NIC.
+///
+/// Answer: `0` when the driver holds no unread frame on that channel and
+/// every submitted transmit descriptor is reported complete by the
+/// hardware, with `arg[0..4]` set to the driver's completed transmit count
+/// (LE); `EAGAIN` while either is still pending; `ENOSYS` from a channel
+/// whose reader registers no handler — a driver that cannot prove the wire,
+/// so the fence reports `cutoff::RING_HANDOFF`.
+pub mod tx_drain {
+    /// The ioctl command, outside the kernel's built-in set (1..4).
+    pub const IOCTL: u32 = 0x0010;
+    /// Bytes `arg` carries: the completed transmit count.
+    pub const ARG_LEN: usize = 4;
+}
+
 /// What a fence's cutoff boundary is worth — the `fence.enforceable`
 /// capability's `cutoff` fact, carried on every `MSG_ADDR_FENCED`.
+/// `MSG_ADDR_FENCED`'s 8-byte cutoff index is the ip module's frame
+/// counter at the hand-off under `RING_HANDOFF`, and the driver's
+/// completed transmit count under `WIRE`.
 pub mod cutoff {
     /// The boundary is the hand-off to the driver's ring: nothing from the
     /// address is handed over after it, but frames already in the ring may

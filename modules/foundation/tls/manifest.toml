@@ -8,10 +8,16 @@ timer_class = "wall_clock"
 hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # Ingress anchor role for the tls-fronted 443 edge (rfc_workload_ingress
-# §2/§4.1, rfc_protocols.md §8.1): tls terminates the client-visible
-# secure stream in front of the http proxy anchor. Declared so the
-# `continuity` config validator (class edge_anchored) accepts a
-# tls-fronted edge whose anchor wants `transport.anchor.stream.secure`.
+# tls terminates the client-visible
+# secure stream in front of the http proxy anchor, so it is the module
+# that owns the secure attachment a client sees — the record keys, the
+# record counters and the ciphertext the peer has been shown. That is
+# what `transport.anchor.stream.secure` names, and it is also the state
+# the `cont_in` / `cont_out` surface below checkpoints and mirrors
+# Whether a graph reaches stream
+# continuity is decided by the validator from the whole path — the ip
+# module must own TCP on the target (`fence.enforceable` is ip's fact,
+# not this module's) — so nothing more is claimed here.
 capabilities = ["transport.anchor.stream.secure"]
 
 # An instance that validates a peer's chain (a CA profile) checks the
@@ -64,7 +70,38 @@ name = "peer_identity"
 direction = "output"
 content_type = "OctetStream"
 
-# Module-scope observability (out[3], optional); wired to observe.telemetry.
+# Transport-continuity control (in[2] / out[3]), the TRANSPORT_CONTINUITY
+# surface of contracts/net/session_ctrl.rs for transport CT_TLS. Driven by
+# the failover coordinator: PAIR_PREPARE / CHECKPOINT_* / DELTA_* /
+# QUIESCE_* / CUT_* / EMISSION_ARM / ACTIVATE / RETIRE / ABORT arrive on
+# `cont_in`; checkpoint chunks, deltas, DELTA_ACKs and CONTINUITY replies
+# leave on `cont_out`. Unwired means the surface does not exist at runtime
+# and the record path is byte-identical. The codec, the shadow lifecycle,
+# the vault sealing of the traffic secrets (label `tls-continuity`) and
+# the strict-profile send / receive horizons are documented at the top of
+# modules/foundation/tls/continuity.rs; ACTIVATE takes an optional trailing
+# `[conn_id:2 LE]` naming the connection the imported session binds to.
+#
+# `cont_out` must take one whole checkpoint in a single step: the record
+# is at most TLS_CKPT_RECORD_MAX bytes (about 21 KiB where the receive
+# buffer is 16 KiB, about 9 KiB on the 4 KiB-buffer targets) in 1 KiB
+# chunks plus the CUT manifest, and a chunk that does not fit fails the
+# export as STATUS_NO_CAPACITY rather than leaving a partial transfer.
+[[ports]]
+name = "cont_in"
+direction = "input"
+index = 2
+content_type = "OctetStream"
+buffer_size = { default = 32768, rp2350 = 16384, bcm2712 = 65536 }
+
+[[ports]]
+name = "cont_out"
+direction = "output"
+index = 3
+content_type = "OctetStream"
+buffer_size = { default = 65536, rp2350 = 16384, bcm2712 = 65536 }
+
+# Module-scope observability (optional); wired to observe.telemetry.
 [observability]
 # `bytes_in` / `bytes_out` are the cipher-side (ip seam) byte counters that
 # standards/observability.md §6 requires of a data-moving module; tls carried

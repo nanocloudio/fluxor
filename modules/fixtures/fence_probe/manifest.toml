@@ -1,0 +1,39 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+# Its schedule is wall-clock seconds after boot.
+timer_class = "wall_clock"
+
+# Fixture writer for the ip module's address-control port: installs one
+# secondary address armed, waits `fence_after_s`, then fences it with the
+# token the install minted. Everything it does is logged so a packet
+# capture can be aligned against it:
+#
+#   [fence_probe] installed <ip>            the address answers from now
+#   [fence_probe] fence requested           the gate closes here
+#   [fence_probe] fenced cutoff=<kind> index=<n>
+#
+# `cutoff` is `wire` when the NIC driver confirmed the drain and
+# `ring_handoff` otherwise. The pass rule for the capture is that no frame
+# sourced from `<ip>` appears after the `fence requested` line.
+
+[[ports]]
+name = "addr_ctl_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+buffer_size = 512
+
+[[ports]]
+name = "addr_evt_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+buffer_size = 512
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "fence fixture; its log lines are the observable a packet capture is aligned against"

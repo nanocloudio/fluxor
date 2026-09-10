@@ -55,6 +55,11 @@ include!("../../sdk/runtime/params.rs");
 // inbound path; the core owns bind + send only.
 include!("../../sdk/cores/datagram_endpoint.rs");
 include!("../../sdk/cores/ticket_replay.rs");
+// Windowed 1-RTT send packet-number reservation with epoch fencing
+//: QUIC is this core's first on-wire-sequence consumer.
+include!("../../sdk/cores/nonce_reservation.rs");
+// CRC32 chunking reused for continuity checkpoint chunks.
+include!("../../sdk/cores/session_handoff.rs");
 include!("../../sdk/wire/varint.rs");
 
 // Crypto primitives (also used by tls/dtls modules — duplicated PIC
@@ -86,6 +91,9 @@ include!("keys.rs");
 include!("connection.rs");
 include!("wire.rs");
 include!("pump.rs");
+// Transport continuity (CT_QUIC): checkpoint/delta codec + shadow takeover
+// state machine on the cont_in / cont_out ports.
+include!("continuity.rs");
 
 // Concurrent connections this endpoint will hold. Per-connection state is
 // ~20 KB — dominated by the datagram/stream buffers and the TLS handshake
@@ -245,6 +253,11 @@ pub(crate) struct QuicState {
     /// the attempt bound. Reported as `cidfail=` in the heartbeat; non-zero
     /// means a CID was declined rather than emitted zero.
     rng_cid_fail: u32,
+    /// Times a 1-RTT emit stalled because the send packet-number
+    /// reservation had no granted value left. Non-zero means
+    /// the directory's grants ran dry and emission held rather than
+    /// reusing a number. Reported as `rstall=` in the heartbeat.
+    reservation_exhausted_stall: u32,
     /// Longest single handshake-pump step since boot, in microseconds, and
     /// the `HandshakeState` it ran (first-contact attribution; see
     /// `pump::pump_session`). Reported as `fcs=`/`fcu=` in the heartbeat.
@@ -258,6 +271,21 @@ pub(crate) struct QuicState {
     net_out: i32,
     app_in: i32,
     app_out: i32,
+    /// Transport-continuity control ports. `cont_in` receives
+    /// checkpoint/delta/cut-over commands and durable reservation grants;
+    /// `cont_out` emits `MSG_SC_CONTINUITY` replies and mirror deltas.
+    /// Both -1 when unwired — the module then runs in local self-grant
+    /// mode and never stalls emission on a missing directory.
+    cont_in: i32,
+    cont_out: i32,
+    /// Shadow slots + in-flight checkpoint/delta state for CT_QUIC takeover.
+    continuity: ContinuityState,
+    /// Vault handle for the labelled `quic-continuity` sealing key; -1
+    /// until first use (opened lazily, like the ticket keys).
+    cont_vault_key: i32,
+    /// Operational key-rotation knob (RFC 9001 §6): initiate a 1-RTT key
+    /// update after this many packets sent in the current phase. 0 = never.
+    key_update_pkts: u32,
     /// Single bound UDP endpoint (shared `datagram_endpoint` core) for all QUIC
     /// connections; they are demuxed above it by connection id.
     endpoint: DatagramEndpoint,
@@ -418,6 +446,14 @@ define_params! {
             let v = p_u16(d, len, 0, 256);
             s.ecdh_bits_per_step = if v == 0 { 1 } else if v > 256 { 256 } else { v };
         };
+
+    // Operational key-rotation knob (RFC 9001 §6) and the key-update test
+    // hook. 0 (default) = never initiate; N>0 = after N 1-RTT packets sent
+    // in the current phase, initiate a key update — provided the handshake
+    // is confirmed and any prior update has been acknowledged. Reservations
+    // are not reset on key update.
+    17, key_update_pkts, u32, 0
+        => |s, d, len| { s.key_update_pkts = p_u32(d, len, 0, 0); };
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -457,6 +493,7 @@ pub unsafe extern "C" fn module_new(
     s.require_retry = 0;
     s.enable_0rtt = 0;
     s.ecdh_bits_per_step = 256;
+    s.key_update_pkts = 0;
     s.verify_peer = 0;
     s.trust_cert_len = 0;
     s.verify_hostname_len = 0;
@@ -495,11 +532,17 @@ pub unsafe extern "C" fn module_new(
     s.app_in = dev_channel_port(sys, 0, 1);
     s.net_out = dev_channel_port(sys, 1, 0);
     s.app_out = dev_channel_port(sys, 1, 1);
-    // out[2] = optional module-scope telemetry (-1 when unwired).
+    // in[2] / out[2] = continuity control (-1 when unwired). Optional
+    // module-scope telemetry is auto-appended after these, at out[3].
+    s.cont_in = dev_channel_port(sys, 0, 2);
+    s.cont_out = dev_channel_port(sys, 1, 2);
+    continuity_init(s);
+    s.cont_vault_key = -1;
     s.tlm = TlmCounters::new();
     s.tlm_last_ms = 0;
     s.refused_conns = 0;
     s.rng_cid_fail = 0;
+    s.reservation_exhausted_stall = 0;
     // `sample_permille` resolved after param parsing below (set_defaults would
     // clobber a value set here) via the `trace_sample_permille` 0xFFFF sentinel.
 
@@ -956,6 +999,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // telemetry-port counters when that port is wired.
     maybe_emit_telemetry(s);
     ticket_rotate_if_due(s);
+    // Drain any transport-continuity control commands (checkpoint / delta /
+    // cut-over / reservation grants) on `cont_in`; no-op when unwired.
+    cont_pump(s);
 
     // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,
     // with backoff/retry. MSG_DG_BOUND is consumed in the recv loop below.
@@ -2674,6 +2720,9 @@ unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
         l[pos..pos + 5].copy_from_slice(b" fcd=");
         pos += 5;
         pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.fc_max_drain_us);
+        l[pos..pos + 8].copy_from_slice(b" rstall=");
+        pos += 8;
+        pos += fmt_u32_raw(l.as_mut_ptr().add(pos), s.reservation_exhausted_stall);
         dev_log(sys, 3, l.as_ptr(), pos);
     }
     if !dev_telemetry_enabled(sys) {
@@ -3154,7 +3203,8 @@ pub mod test_helpers {
     //! (`cfg(feature = "host-test")`). They let a test observe and drive the
     //! connection lifecycle without standing up a full QUIC crypto handshake.
 
-    use super::{ConnPhase, QuicState, MAX_CONNS};
+    use super::{
+        promote_key_phase, drain_inbound_one, emit_connection_close, BidiStream, MAX_BIDI_STREAMS,ConnPhase, QuicState, MAX_CONNS};
 
     /// Run the server admission decision for one inbound datagram, exactly
     /// as the RX path does: match by DCID, else allocate, else emit the
@@ -3578,6 +3628,539 @@ pub mod test_helpers {
             return 255;
         }
         s.conns[idx].driver.hs_state as u8
+    }
+
+    // ── Reservation + continuity helpers ──────────────
+    use super::{
+        activate_shadow, import_checkpoint, next_keys, next_traffic_secret, parse_one_rtt_packet,
+        retire_connection, secret_to_keys, serialize_checkpoint, Aes128Hp, NonceReservation,
+        CONT_FLOW_ID_BYTES,
+    };
+
+    /// Configure connection `idx` as a post-handshake 1-RTT peer with real,
+    /// deterministic mirrored traffic secrets and preserved CIDs — enough
+    /// for a real packet-protection round trip across a takeover without a
+    /// live handshake. `c2s` is the client→server secret, `s2c` the
+    /// reverse; a server reads `c2s` and writes `s2c`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a test helper that installs every half of a keyed connection at once; the arguments are the record's fields"
+    )]
+    pub unsafe fn cont_setup_keyed(
+        state: *mut u8,
+        idx: usize,
+        is_server: bool,
+        c2s: &[u8; 32],
+        s2c: &[u8; 32],
+        our_cid: &[u8],
+        peer_cid: &[u8],
+        odcid: &[u8],
+        flow: &[u8; CONT_FLOW_ID_BYTES],
+        epoch: u32,
+        peer_ip: [u8; 4],
+        peer_port: u16,
+    ) {
+        let s = &mut *(state as *mut QuicState);
+        let c = &mut s.conns[idx];
+        c.reset();
+        c.phase = ConnPhase::Established;
+        c.is_server = is_server;
+        c.handshake_confirmed = true;
+        c.framed_app_surface = true;
+        c.peer = PeerAddr {
+            ip: peer_ip,
+            port: peer_port,
+        };
+        c.recv_ip = peer_ip;
+        c.recv_port = peer_port;
+        let on = our_cid.len().min(super::MAX_CID_LEN);
+        c.our_cid[..on].copy_from_slice(&our_cid[..on]);
+        c.our_cid_len = on as u8;
+        let pnn = peer_cid.len().min(super::MAX_CID_LEN);
+        c.peer_cid[..pnn].copy_from_slice(&peer_cid[..pnn]);
+        c.peer_cid_len = pnn as u8;
+        let od = odcid.len().min(super::MAX_CID_LEN);
+        c.original_dcid[..od].copy_from_slice(&odcid[..od]);
+        c.original_dcid_len = od as u8;
+        let (rd, wr): (&[u8; 32], &[u8; 32]) = if is_server { (c2s, s2c) } else { (s2c, c2s) };
+        c.one_rtt.read_secret[..32].copy_from_slice(rd);
+        c.one_rtt.write_secret[..32].copy_from_slice(wr);
+        c.one_rtt.secret_len = 32;
+        c.one_rtt.read_keys = secret_to_keys(&rd[..]);
+        c.one_rtt.write_keys = secret_to_keys(&wr[..]);
+        c.one_rtt.keys_set = true;
+        c.one_rtt.key_phase = 0;
+        let mut nr = [0u8; 48];
+        next_traffic_secret(&rd[..], &mut nr[..32]);
+        let mut nw = [0u8; 48];
+        next_traffic_secret(&wr[..], &mut nw[..32]);
+        c.one_rtt.next_read_secret[..32].copy_from_slice(&nr[..32]);
+        c.one_rtt.next_write_secret[..32].copy_from_slice(&nw[..32]);
+        c.one_rtt.next_read_keys = next_keys(&nr[..32], c.one_rtt.read_keys.hp);
+        c.one_rtt.next_write_keys = next_keys(&nw[..32], c.one_rtt.write_keys.hp);
+        c.one_rtt.next_keys_ready = true;
+        c.cont_flow_id = *flow;
+        c.cont_epoch = epoch;
+        c.idle_timeout_ms = 0;
+        c.last_activity_ms = 1;
+    }
+
+    /// Attempt to emit one 1-RTT packet through the reservation gate.
+    /// Returns the packet number allocated, or -1 when emission stalled
+    /// (durable mode with the granted blocks spent).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn res_try_emit(state: *mut u8, idx: usize) -> i64 {
+        let s = &mut *(state as *mut QuicState);
+        if !s.conns[idx].one_rtt_pn_ok() {
+            s.reservation_exhausted_stall = s.reservation_exhausted_stall.wrapping_add(1);
+            return -1;
+        }
+        let pn = s.conns[idx].one_rtt.next_send_pn;
+        s.conns[idx].one_rtt.next_send_pn = pn + 1;
+        s.conns[idx].one_rtt_pn_commit();
+        pn as i64
+    }
+
+    /// Put connection `idx` into durable-grant mode (a `cont_in` port is
+    /// wired): self-granting stops and emission needs directory grants.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn res_set_durable(state: *mut u8, idx: usize, durable: bool) {
+        let s = &mut *(state as *mut QuicState);
+        s.conns[idx].pn_res_durable = durable;
+    }
+
+    /// Install a durable reservation grant directly (bypassing the wire),
+    /// returning 0 on success or a non-zero `ReservationError` discriminant
+    /// (1 = stale epoch, 5 = epoch not bumped after void).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn res_install_grant(
+        state: *mut u8,
+        idx: usize,
+        epoch: u32,
+        start: u64,
+        len: u64,
+    ) -> i32 {
+        let s = &mut *(state as *mut QuicState);
+        match s.conns[idx].install_pn_grant(epoch, start, len) {
+            Ok(()) => 0,
+            Err(super::ReservationError::StaleEpoch) => 1,
+            Err(super::ReservationError::Overlap) => 2,
+            Err(super::ReservationError::ZeroLen) => 3,
+            Err(super::ReservationError::Busy) => 4,
+            Err(super::ReservationError::EpochNotBumped) => 5,
+            Err(super::ReservationError::SpaceExhausted) => 6,
+        }
+    }
+
+    /// Invalidate outstanding blocks (unsafe-recovery void, R2).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn res_void(state: *mut u8, idx: usize) {
+        let s = &mut *(state as *mut QuicState);
+        s.conns[idx].send_pn_res.void_outstanding();
+    }
+
+    /// The cumulative reservation-exhaustion stall count.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn res_stall_count(state: *const u8) -> u32 {
+        (*(state as *const QuicState)).reservation_exhausted_stall
+    }
+
+    /// The current 1-RTT next-send packet number.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn res_next_pn(state: *const u8, idx: usize) -> u64 {
+        (*(state as *const QuicState)).conns[idx]
+            .one_rtt
+            .next_send_pn
+    }
+
+    /// Bind a continuity flow id + epoch onto a live connection.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_bind_flow(
+        state: *mut u8,
+        idx: usize,
+        flow: &[u8; CONT_FLOW_ID_BYTES],
+        epoch: u32,
+    ) {
+        let s = &mut *(state as *mut QuicState);
+        s.conns[idx].cont_flow_id = *flow;
+        s.conns[idx].cont_epoch = epoch;
+    }
+
+    /// Feed one framed continuity command through the real dispatcher
+    /// (`cont_apply`), as the `cont_in` pump would.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn cont_feed(state: *mut u8, msg_type: u8, payload: &[u8]) {
+        let s = &mut *(state as *mut QuicState);
+        super::cont_apply(s, msg_type, payload);
+    }
+
+    /// Serialize connection `idx`'s checkpoint record into `out`, returning
+    /// its length (0 = refused, e.g. a non-established state).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `out` valid for `cap`.
+    pub unsafe fn cont_serialize(
+        state: *mut u8,
+        idx: usize,
+        flow: &[u8; CONT_FLOW_ID_BYTES],
+        epoch: u32,
+        out: *mut u8,
+        cap: usize,
+    ) -> usize {
+        let s = &mut *(state as *mut QuicState);
+        let buf = core::slice::from_raw_parts_mut(out, cap);
+        serialize_checkpoint(s, idx, flow, epoch, buf)
+    }
+
+    /// Import a checkpoint record into connection slot `idx`, leaving it a
+    /// NON-EMITTING shadow (phase Idle) with keys installed. Returns the
+    /// `sc::STATUS_*` code.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_import_to_slot(
+        state: *mut u8,
+        idx: usize,
+        flow: &[u8; CONT_FLOW_ID_BYTES],
+        epoch: u32,
+        record: &[u8],
+    ) -> u8 {
+        let s = &mut *(state as *mut QuicState);
+        let mut staged = super::QuicConnection::new();
+        let st = import_checkpoint(s, &mut staged, flow, epoch, record);
+        if st == 0 {
+            s.conns[idx] = staged;
+            s.conns[idx].phase = ConnPhase::Idle; // shadow: never emits
+        }
+        st
+    }
+
+    /// Promote the imported shadow at slot `idx` to live under `new_epoch`
+    /// with `fence_gen`. Returns true on success; false if refused (fence 0,
+    /// non-increasing epoch).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_activate_slot(
+        state: *mut u8,
+        idx: usize,
+        new_epoch: u32,
+        fence_gen: u32,
+        prior_epoch: u32,
+    ) -> bool {
+        let s = &mut *(state as *mut QuicState);
+        if fence_gen == 0 || new_epoch <= prior_epoch {
+            return false;
+        }
+        let floor = s.conns[idx]
+            .send_pn_res
+            .high_water()
+            .max(s.conns[idx].one_rtt.next_send_pn);
+        let c = &mut s.conns[idx];
+        c.phase = ConnPhase::Established;
+        c.cont_epoch = new_epoch;
+        c.send_pn_res = NonceReservation::resume(new_epoch, floor);
+        c.pn_res_durable = false;
+        c.bytes_in_flight = 0;
+        c.last_activity_ms = 1;
+        true
+    }
+
+    /// The move-a-shadow-into-a-free-slot activate path, driven directly
+    /// (the ACTIVATE opcode uses this). Returns the new live index or -1.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn cont_activate_move(
+        state: *mut u8,
+        src_idx: usize,
+        new_epoch: u32,
+        fence_gen: u32,
+        prior_epoch: u32,
+    ) -> i32 {
+        let s = &mut *(state as *mut QuicState);
+        let mut moved = super::QuicConnection::new();
+        core::mem::swap(&mut moved, &mut s.conns[src_idx]);
+        activate_shadow(s, moved, new_epoch, fence_gen, prior_epoch)
+    }
+
+    /// Build a 1-RTT PING packet from connection `idx` (advancing its send
+    /// pn), returning `(bytes, len, pn)`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_build_ping(state: *mut u8, idx: usize) -> ([u8; 1500], usize, u64) {
+        let s = &mut *(state as *mut QuicState);
+        let c = &mut s.conns[idx];
+        let keys = c.one_rtt.write_keys;
+        let hp = Aes128Hp::new(&c.one_rtt.write_keys.hp);
+        let pn = c.one_rtt.next_send_pn;
+        let kp = c.one_rtt.key_phase;
+        let pcl = c.peer_cid_len as usize;
+        let mut dcid = [0u8; super::MAX_CID_LEN];
+        dcid[..pcl].copy_from_slice(&c.peer_cid[..pcl]);
+        let payload = [0x01u8]; // PING
+        let mut pkt = [0u8; 1500];
+        let n =
+            super::build_one_rtt_packet(&keys, &hp, pn, 4, kp, &dcid[..pcl], &payload, &mut pkt);
+        c.one_rtt.next_send_pn = pn + 1;
+        c.one_rtt_pn_commit();
+        (pkt, n, pn)
+    }
+
+    /// Parse/decrypt a 1-RTT packet at connection `idx`. Returns the packet
+    /// number on success, or -1 on AEAD failure (keys did not survive the
+    /// takeover).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_parse_1rtt(state: *mut u8, idx: usize, dgram: &[u8]) -> i64 {
+        let s = &mut *(state as *mut QuicState);
+        let c = &mut s.conns[idx];
+        let dcid_len = c.our_cid_len as usize;
+        let keys = c.one_rtt.read_keys;
+        let hp = Aes128Hp::new(&c.one_rtt.read_keys.hp);
+        let mut copy = [0u8; 1500];
+        let n = dgram.len().min(copy.len());
+        copy[..n].copy_from_slice(&dgram[..n]);
+        match parse_one_rtt_packet(
+            &keys,
+            &hp,
+            dcid_len,
+            c.one_rtt.largest_recv_pn,
+            &mut copy[..n],
+        ) {
+            Some((_, _, pn)) => pn as i64,
+            None => -1,
+        }
+    }
+
+    /// The connection's key phase.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_key_phase(state: *const u8, idx: usize) -> u8 {
+        (*(state as *const QuicState)).conns[idx].one_rtt.key_phase
+    }
+
+    /// Copy connection `idx`'s CIDs out for an unchanged-across-takeover
+    /// assertion: `(our_cid_bytes, peer_cid_bytes, odcid_bytes)`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_cids(state: *const u8, idx: usize) -> ([u8; 20], [u8; 20], [u8; 20]) {
+        let c = &(*(state as *const QuicState)).conns[idx];
+        (c.our_cid, c.peer_cid, c.original_dcid)
+    }
+
+    /// RETIRE connection `idx`, zeroizing its secrets.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_retire(state: *mut u8, idx: usize) {
+        let s = &mut *(state as *mut QuicState);
+        retire_connection(&mut s.conns[idx]);
+    }
+
+    /// True iff every 1-RTT traffic secret at connection `idx` is zero.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_secrets_zeroed(state: *const u8, idx: usize) -> bool {
+        let c = &(*(state as *const QuicState)).conns[idx];
+        c.one_rtt.read_secret.iter().all(|&b| b == 0)
+            && c.one_rtt.write_secret.iter().all(|&b| b == 0)
+            && c.one_rtt.next_read_secret.iter().all(|&b| b == 0)
+            && c.one_rtt.next_write_secret.iter().all(|&b| b == 0)
+            && c.psk.iter().all(|&b| b == 0)
+    }
+
+    /// Queue application bytes on connection `idx`'s transparent stream, so
+    /// the next step builds and emits a real 1-RTT packet through the
+    /// pump — the path the mirror hooks into.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_queue_app_data(state: *mut u8, idx: usize, bytes: &[u8]) -> bool {
+        let s = &mut *(state as *mut QuicState);
+        let c = &mut s.conns[idx];
+        // A framed surface sends from the stream pool, never the transparent
+        // stream: queue on a locally-initiated bidirectional stream, or on
+        // one already open.
+        let mut k = 0;
+        while k < MAX_BIDI_STREAMS {
+            let st = &mut c.bidi_streams[k];
+            if st.allocated && st.locally_initiated && st.send_buf_len == 0 {
+                break;
+            }
+            if !st.allocated {
+                *st = BidiStream::empty();
+                st.allocated = true;
+                st.locally_initiated = true;
+                st.stream_id = (k as u64) * 4 + 1;
+                st.app.open_sent = true;
+                break;
+            }
+            k += 1;
+        }
+        if k == MAX_BIDI_STREAMS {
+            return false;
+        }
+        let st = &mut c.bidi_streams[k];
+        if bytes.len() > st.send_buf.len() {
+            return false;
+        }
+        st.send_buf[..bytes.len()].copy_from_slice(bytes);
+        st.send_buf_len = bytes.len();
+        true
+    }
+
+    /// Hand a datagram to connection `idx` as the pump would after the RX
+    /// demux, and consume it through the real 1-RTT receive path — the
+    /// path the mirror hooks into. Answers whether a packet was consumed.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_feed_datagram(state: *mut u8, idx: usize, dgram: &[u8]) -> bool {
+        let s = &mut *(state as *mut QuicState);
+        {
+            let c = &mut s.conns[idx];
+            if dgram.len() > c.inbound.len() {
+                return false;
+            }
+            c.inbound[..dgram.len()].copy_from_slice(dgram);
+            c.inbound_len = dgram.len();
+            c.inbound_off = 0;
+            c.recv_ip = c.peer.ip;
+            c.recv_port = c.peer.port;
+        }
+        drain_inbound_one(s, idx)
+    }
+
+    /// Bytes still queued on connection `idx`'s transparent stream.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_app_queued(state: *const u8, idx: usize) -> usize {
+        let c = &(*(state as *const QuicState)).conns[idx];
+        let mut n = 0;
+        let mut k = 0;
+        while k < MAX_BIDI_STREAMS {
+            if c.bidi_streams[k].allocated {
+                n += c.bidi_streams[k].send_buf_len;
+            }
+            k += 1;
+        }
+        n
+    }
+
+    /// Largest 1-RTT packet number connection `idx` has received.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_largest_recv_pn(state: *const u8, idx: usize) -> u64 {
+        (*(state as *const QuicState)).conns[idx].one_rtt.largest_recv_pn
+    }
+
+    /// Continuity profile connection `idx` was paired under (0 = none).
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_profile(state: *const u8, idx: usize) -> u8 {
+        (*(state as *const QuicState)).conns[idx].cont_profile
+    }
+
+    /// Whether connection `idx` has a key update awaiting the peer's
+    /// acknowledgement.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_key_update_awaiting(state: *const u8, idx: usize) -> bool {
+        (*(state as *const QuicState)).conns[idx].key_update_awaiting_ack
+    }
+
+    /// Whether connection `idx` still holds its previous read phase's keys.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_prev_read_valid(state: *const u8, idx: usize) -> bool {
+        (*(state as *const QuicState)).conns[idx].one_rtt.prev_read_valid
+    }
+
+    /// Emit a CONNECTION_CLOSE for connection `idx` through the real emit
+    /// path, so a test can see whether the close draws on the reservation.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_emit_close(state: *mut u8, idx: usize) {
+        let s = &mut *(state as *mut QuicState);
+        emit_connection_close(s, idx, 0x00, 0, b"closing");
+    }
+
+    /// Whether connection `idx` is mirroring to a standby.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_mirroring(state: *const u8, idx: usize) -> bool {
+        (*(state as *const QuicState)).conns[idx].cont_mirror
+    }
+
+    /// Inbound packet numbers the strict receive horizon is holding back
+    /// from acknowledgement on connection `idx`.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_recv_held(state: *const u8, idx: usize) -> usize {
+        (*(state as *const QuicState)).conns[idx].cont_recv_hold_len as usize
+    }
+
+    /// Whether connection `idx`'s 1-RTT emission is currently held.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_emission_held(state: *const u8, idx: usize) -> bool {
+        (*(state as *const QuicState)).conns[idx].cont_emission_held
+    }
+
+    /// The exact predicate `emit_crypto_packet` uses to decide whether a
+    /// 1-RTT packet may go out this tick: not held by a strict-profile
+    /// horizon, and a reservation value is available.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_would_emit(state: *mut u8, idx: usize) -> bool {
+        let s = &mut *(state as *mut QuicState);
+        !s.conns[idx].cont_emission_held && s.conns[idx].one_rtt_pn_ok()
+    }
+
+    /// Promote connection `idx` to the next 1-RTT key phase (the local half
+    /// of an RFC 9001 §6 key update), so a test can checkpoint a connection
+    /// that is already in phase 1.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
+    pub unsafe fn cont_promote_key_phase(state: *mut u8, idx: usize) {
+        let s = &mut *(state as *mut QuicState);
+        promote_key_phase(&mut s.conns[idx]);
     }
 }
 

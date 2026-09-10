@@ -77,9 +77,9 @@ use uart::*;
 // file). The constants stay name-identical so existing references in
 // the boot path resolve through the glob import unchanged.
 #[cfg(not(feature = "board-pi5"))]
-const QEMU_CONFIG_BLOB_ADDR: usize = 0x4C00_0000;
+const QEMU_CONFIG_BLOB_ADDR: usize = 0x6100_0000;
 #[cfg(not(feature = "board-pi5"))]
-const QEMU_MODULES_BLOB_ADDR: usize = 0x4D00_0000;
+const QEMU_MODULES_BLOB_ADDR: usize = 0x6200_0000;
 
 global_asm!(
     ".section .layout_header,\"a\"",
@@ -3138,26 +3138,59 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
 };
 
 // iproc-rng200 registers (BCM2712 / Pi 5). DT: soc@107c000000/rng@7d208000
-// with ranges <0x0 0x10_0000_0000 0x8000_0000>.
+// with ranges <0x0 0x10_0000_0000 0x8000_0000>. The block's map, as its
+// Linux driver (`iproc-rng200`) programs it: control, the two soft resets,
+// the interrupt status word, and the output FIFO with its count register.
 #[cfg(feature = "board-pi5")]
 const RNG200_BASE: usize = 0x10_7d20_8000;
 #[cfg(feature = "board-pi5")]
 const RNG200_CTRL: *mut u32 = RNG200_BASE as *mut u32;
 #[cfg(feature = "board-pi5")]
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-const RNG200_STATUS: *const u32 = (RNG200_BASE + 0x04) as *const u32;
+const RNG200_RNG_SOFT_RESET: *mut u32 = (RNG200_BASE + 0x04) as *mut u32;
 #[cfg(feature = "board-pi5")]
-const RNG200_DATA: *const u32 = (RNG200_BASE + 0x08) as *const u32;
+const RNG200_RBG_SOFT_RESET: *mut u32 = (RNG200_BASE + 0x08) as *mut u32;
 #[cfg(feature = "board-pi5")]
-const RNG200_COUNT: *const u32 = (RNG200_BASE + 0x0C) as *const u32;
+const RNG200_INT_STATUS: *mut u32 = (RNG200_BASE + 0x18) as *mut u32;
+#[cfg(feature = "board-pi5")]
+const RNG200_FIFO_DATA: *const u32 = (RNG200_BASE + 0x20) as *const u32;
+#[cfg(feature = "board-pi5")]
+const RNG200_FIFO_COUNT: *const u32 = (RNG200_BASE + 0x24) as *const u32;
+/// `RNG_CTRL` generator-enable field.
+#[cfg(feature = "board-pi5")]
+const RNG200_RBGEN_MASK: u32 = 0x1FFF;
+#[cfg(feature = "board-pi5")]
+const RNG200_RBGEN_ENABLE: u32 = 0x1;
+/// `RNG_INT_STATUS`: the generator locked itself out after a health-test
+/// failure and produces nothing until reset.
+#[cfg(feature = "board-pi5")]
+const RNG200_MASTER_FAIL_LOCKOUT: u32 = 1 << 31;
+/// `RNG_FIFO_COUNT`: words waiting in the output FIFO.
+#[cfg(feature = "board-pi5")]
+const RNG200_FIFO_COUNT_MASK: u32 = 0xFF;
+
+/// Bring the generator to a known-running state: generator off, both
+/// soft resets pulsed, interrupt status cleared, generator on.
+#[cfg(feature = "board-pi5")]
+unsafe fn rng200_restart() {
+    let ctrl = core::ptr::read_volatile(RNG200_CTRL) & !RNG200_RBGEN_MASK;
+    core::ptr::write_volatile(RNG200_CTRL, ctrl);
+    core::ptr::write_volatile(RNG200_RNG_SOFT_RESET, 1);
+    core::ptr::write_volatile(RNG200_RNG_SOFT_RESET, 0);
+    core::ptr::write_volatile(RNG200_RBG_SOFT_RESET, 1);
+    core::ptr::write_volatile(RNG200_RBG_SOFT_RESET, 0);
+    let pending = core::ptr::read_volatile(RNG200_INT_STATUS);
+    core::ptr::write_volatile(RNG200_INT_STATUS, pending);
+    core::ptr::write_volatile(RNG200_CTRL, ctrl | RNG200_RBGEN_ENABLE);
+}
 
 /// Fill buffer with hardware random bytes.
 ///
-/// Pi 5 (board-pi5): Uses iproc-rng200 hardware TRNG at 0x10_7d20_8000.
-/// QEMU virt: Uses CNTPCT_EL0 counter jitter with LCG mixing (weak).
+/// Pi 5 (board-pi5): the iproc-rng200 TRNG at 0x10_7d20_8000. A word is
+/// taken only from a running generator's FIFO, and a zero word is never
+/// entropy: the source presents zeros while unseeded or locked out, so
+/// zeros are discarded, a run of them restarts the block, and a run that
+/// outlasts the restart is a dead source, refused rather than handed out.
+/// QEMU virt: CNTPCT_EL0 counter jitter with LCG mixing (weak).
 ///
 /// Returns 0 on success, -1 if the hardware failed to produce entropy —
 /// the [`HalOps::csprng_fill`] contract. A byte count is not a success
@@ -3172,80 +3205,46 @@ fn bcm_csprng_fill(buf: *mut u8, len: usize) -> i32 {
     unsafe {
         #[cfg(feature = "board-pi5")]
         {
-            // Enable RNG if not already running.
-            //
-            // The waits below are TIME-bounded, not iteration-bounded. The
-            // old spin (`wait < 1_000_000` iterations, ~0.4 ms at these
-            // clocks) sat under the FIFO's refill rate for anything past
-            // the words already buffered: an 8-byte read rode the FIFO and
-            // succeeded while a 32-byte key-generation fill starved on its
-            // later words and failed — so the vault could not open ANY key
-            // on this silicon while the RANDOM_FILL syscall looked healthy.
-            // Found by kagi's suite_bench probe beat (rng=8 beside five
-            // keygen-failed suites). 20 ms per word is orders of magnitude
-            // above the block's refill time and still small enough that a
-            // failure is a real hardware fault rather than a tight race.
+            // The waits are time-bounded: the FIFO refills in microseconds,
+            // so a wait this long is a hardware fault, not a race.
             const WORD_WAIT_US: u64 = 1_000_000;
+            const ZERO_RUN_RESTART: u32 = 64;
+            const ZERO_RUN_FATAL: u32 = 4096;
+            let status = core::ptr::read_volatile(RNG200_INT_STATUS);
             let ctrl = core::ptr::read_volatile(RNG200_CTRL);
-            if ctrl & 1 == 0 {
-                core::ptr::write_volatile(RNG200_CTRL, ctrl | 1);
-                let deadline = bcm_now_micros() + WORD_WAIT_US;
-                while core::ptr::read_volatile(RNG200_COUNT) == 0 && bcm_now_micros() < deadline {
-                    core::hint::spin_loop();
-                }
-                if core::ptr::read_volatile(RNG200_COUNT) == 0 {
-                    uart_puts(b"[rng200] FATAL: no entropy after enable\r\n");
-                    return -1;
-                }
-                // Warm-up discard. From a COLD enable the ring-oscillator
-                // source has not seeded and the FIFO presents zero words with
-                // COUNT already non-zero — the count says a word is ready
-                // before the source is random. Discard until a non-zero word
-                // appears so the first fill after boot is real entropy, not
-                // zeros. Bounded by COUNT (not the wall clock — this runs
-                // during early boot where the timer may not be advancing, so a
-                // time bound could hang); the measured cold burst cleared in
-                // tens of words, and a run past this bound is a dead source.
-                // This seeds the source for the FIRST read; mid-run reseeds
-                // that briefly re-present zeros are handled by the consumer
-                // (quic re-fills a zero connection ID rather than using it).
-                let mut warm = 0u32;
-                loop {
-                    if core::ptr::read_volatile(RNG200_COUNT) == 0 {
-                        let d = bcm_now_micros() + WORD_WAIT_US;
-                        while core::ptr::read_volatile(RNG200_COUNT) == 0
-                            && bcm_now_micros() < d
-                        {
-                            core::hint::spin_loop();
-                        }
-                        if core::ptr::read_volatile(RNG200_COUNT) == 0 {
-                            uart_puts(b"[rng200] FATAL: entropy timeout (warm-up)\r\n");
-                            return -1;
-                        }
-                    }
-                    if core::ptr::read_volatile(RNG200_DATA) != 0 {
-                        break;
-                    }
-                    warm += 1;
-                    if warm >= 4096 {
-                        uart_puts(b"[rng200] FATAL: only zero words after enable\r\n");
-                        return -1;
-                    }
-                }
+            if status & RNG200_MASTER_FAIL_LOCKOUT != 0
+                || ctrl & RNG200_RBGEN_MASK != RNG200_RBGEN_ENABLE
+            {
+                rng200_restart();
             }
-
+            let mut zero_run = 0u32;
+            let mut restarted = false;
             let mut i = 0usize;
             while i < len {
-                // Wait for data available.
                 let deadline = bcm_now_micros() + WORD_WAIT_US;
-                while core::ptr::read_volatile(RNG200_COUNT) == 0 && bcm_now_micros() < deadline {
+                while core::ptr::read_volatile(RNG200_FIFO_COUNT) & RNG200_FIFO_COUNT_MASK == 0
+                    && bcm_now_micros() < deadline
+                {
                     core::hint::spin_loop();
                 }
-                if core::ptr::read_volatile(RNG200_COUNT) == 0 {
+                if core::ptr::read_volatile(RNG200_FIFO_COUNT) & RNG200_FIFO_COUNT_MASK == 0 {
                     uart_puts(b"[rng200] FATAL: entropy timeout\r\n");
                     return -1;
                 }
-                let word = core::ptr::read_volatile(RNG200_DATA);
+                let word = core::ptr::read_volatile(RNG200_FIFO_DATA);
+                if word == 0 {
+                    zero_run += 1;
+                    if zero_run == ZERO_RUN_RESTART && !restarted {
+                        rng200_restart();
+                        restarted = true;
+                    }
+                    if zero_run >= ZERO_RUN_FATAL {
+                        uart_puts(b"[rng200] FATAL: only zero words\r\n");
+                        return -1;
+                    }
+                    continue;
+                }
+                zero_run = 0;
                 let bytes = word.to_le_bytes();
                 let mut j = 0;
                 while j < 4 && i < len {

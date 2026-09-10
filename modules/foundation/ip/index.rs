@@ -270,7 +270,9 @@ pub unsafe fn source_leave(table: &mut [SourceCount], ip: u32) {
                 // Keep later entries on this chain reachable: pull the
                 // chain back over the hole (backward-shift deletion).
                 let mut j = (i + 1) & mask;
-                loop {
+                let mut shifted = 0;
+                while shifted < table.len() {
+                    shifted += 1;
                     let f = *table.as_ptr().add(j);
                     if f.count == 0 {
                         break;

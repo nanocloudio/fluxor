@@ -1,5 +1,5 @@
 //! Host mount + tests for the reusable continuity/protocol cores
-//! (rfc_protocols.md §15.1). The core sources live in
+//! The core sources live in
 //! `modules/sdk/cores/` and are `include!`d by modules; path-mounting
 //! them here means the host tests exercise byte-for-byte the same
 //! logic the device runs — the same pattern as `wire.rs` /

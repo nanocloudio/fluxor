@@ -28,3 +28,21 @@ spans = ["dns.query"]
 [[resources]]
 requires_contract = "channel"
 access = "read"
+
+# Durable dynamic update (`update_durability = "durable"`) commits each zone
+# generation through the fs contract: temp → write → fsync → rename. The
+# grant is unconditional because a resource claim cannot be conditioned on
+# a parameter; the module refuses durable updates until the provider
+# answers `CAPS` with the write tier, and volatile mode never calls it.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+# TSIG validity (RFC 8945 §5.2.3) is a calendar-time decision: a signed
+# UPDATE is accepted only inside its fudge window against the kernel's
+# trusted clock, and fails closed without one. Any update zone needs it —
+# `update_durability` is the parameter that is set exactly when
+# `update_zone` is.
+[[requires_when]]
+capability = "time.wall"
+when       = { update_durability = ["volatile", "durable"] }
