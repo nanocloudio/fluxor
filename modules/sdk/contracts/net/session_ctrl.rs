@@ -61,6 +61,44 @@
 // comparison matches the cluster's canonical identity representation.
 // Ports / lengths / status codes remain little-endian for consistency
 // with the other net contracts.
+//
+// ─── Delivery cursors ─────────────────────────────────────────────
+//
+// A worker's exported state is opaque, but its *position* is not. Two
+// counters place the blob in the session's byte streams, both counted
+// from the session's first byte and carried on EXPORT_BEGIN:
+//
+//   in_consumed    inbound bytes the anchor forwarded that the blob
+//                  accounts for
+//   out_produced   outbound bytes the blob has already emitted toward
+//                  the client
+//
+// The anchor keeps the same two counters for the worker it is feeding:
+// what it has forwarded, and what it has relayed onto the client
+// transport. At export both pairs must be equal. Equality is what makes
+// a handoff lossless — it says the blob accounts for every byte the
+// anchor delivered and claims no byte it did not, and it gives the
+// importing worker the exact offsets to resume from.
+//
+// Inequality is a real fault, not a race to retry:
+//
+//   in_consumed < forwarded    the worker exported before its inbound
+//                              tail ran dry; those bytes are in no blob
+//   in_consumed > forwarded    the worker is accounting for a stream it
+//                              was not fed — a misbound session
+//   out_produced != relayed    the drain did not finish; the client has
+//                              seen a different prefix than the blob
+//                              believes
+//
+// So an anchor validates the cursors on the EXPORT_BEGIN it relays and,
+// on any mismatch, refuses the handoff with STATUS_CURSOR_MISMATCH and
+// leaves the session on the exporting worker. Refusing costs a
+// maintenance window; proceeding costs the client bytes it will never
+// learn were dropped, or a request served twice. The sequencing that
+// keeps the cursors equal — the anchor holding new client bytes from
+// the moment it issues DRAIN, and the worker consuming its inbound tail
+// to dry before it declares DRAINED — is the anchor's and worker's
+// side of the same obligation.
 
 /// Frame header size (msg_type + len).
 pub const FRAME_HDR: usize = 3;
@@ -75,6 +113,8 @@ pub const ANCHOR_ID_BYTES: usize = 8;
 pub const WORKER_ID_BYTES: usize = 8;
 /// Bytes of `session_epoch` (little-endian u32).
 pub const EPOCH_BYTES: usize = 4;
+/// Bytes of a delivery cursor (little-endian u64).
+pub const CURSOR_BYTES: usize = 8;
 
 // ─── Roles (HELLO) ─────────────────────────────────────────────────
 
@@ -118,6 +158,11 @@ pub const STATUS_NOT_READY: u8 = 5;
 /// profile it cannot make safe here, as opposed to one it cannot make
 /// safe yet. Retrying does not change the answer.
 pub const STATUS_UNSUPPORTED: u8 = 6;
+/// The exported state does not account for exactly what the anchor
+/// delivered: the cursors on EXPORT_BEGIN disagree with the anchor's
+/// own counters (see §Delivery cursors). The handoff is refused and the
+/// session stays on the exporting worker.
+pub const STATUS_CURSOR_MISMATCH: u8 = 7;
 
 // ─── Opcodes: commands (peer → peer) ───────────────────────────────
 
@@ -152,12 +197,19 @@ pub const CMD_SC_DETACH: u8 = 0x72;
 pub const CMD_SC_DRAIN: u8 = 0x73;
 
 /// Begin opaque state export. Starts a multi-chunk transfer of worker-
-/// owned session state for handoff.
+/// owned session state for handoff, and states where in the session's
+/// two byte streams that state sits (§Delivery cursors).
 /// Payload:
-///   [session_id: 16 BE]
-///   [epoch:       4 LE]
-///   [total_len:   4 LE]               total bytes to follow
+///   [session_id:   16 BE]
+///   [epoch:         4 LE]
+///   [total_len:     4 LE]             total blob bytes to follow
+///   [in_consumed:   8 LE]             inbound bytes folded into the blob
+///   [out_produced:  8 LE]             outbound bytes the blob has emitted
 pub const CMD_SC_EXPORT_BEGIN: u8 = 0x74;
+
+/// Payload bytes of CMD_SC_EXPORT_BEGIN.
+pub const EXPORT_BEGIN_LEN: usize =
+    SESSION_ID_BYTES + EPOCH_BYTES + 4 + CURSOR_BYTES + CURSOR_BYTES;
 
 /// A single chunk of exported state.
 /// Payload:

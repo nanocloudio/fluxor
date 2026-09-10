@@ -433,7 +433,7 @@ Commands (anchor/directory → worker):
 | `0x71` | `CMD_SC_ATTACH` | `[anchor_id: 8 BE][epoch: u32 LE][cc: u8][worker_id: 8 BE or zero]` |
 | `0x72` | `CMD_SC_DETACH` | `[epoch: u32 LE][reason: u8]` |
 | `0x73` | `CMD_SC_DRAIN` | `[epoch: u32 LE][deadline_ms: u32 LE]` |
-| `0x74` | `CMD_SC_EXPORT_BEGIN` | `[epoch: u32 LE][total_len: u32 LE]` |
+| `0x74` | `CMD_SC_EXPORT_BEGIN` | `[epoch: u32 LE][total_len: u32 LE][in_consumed: u64 LE][out_produced: u64 LE]` |
 | `0x75` | `CMD_SC_EXPORT_CHUNK` | `[epoch: u32 LE][offset: u32 LE][data…]` |
 | `0x76` | `CMD_SC_EXPORT_END` | `[epoch: u32 LE][crc32: u32 LE]` |
 | `0x77` | `CMD_SC_RESUME` | `[new_epoch: u32 LE]` |
@@ -517,6 +517,32 @@ none of the named front-door modules exist in this repository.
   over the datagram surface; its connection model is designed for
   path movement.
 
+## Delivery Cursors
+
+The exported blob is opaque, but its position in the session is not.
+`CMD_SC_EXPORT_BEGIN` carries two session-scoped counters — inbound
+bytes the blob accounts for, and outbound bytes it has already emitted
+toward the client — and the anchor keeps the same pair for the worker
+it is feeding. At export the two must agree exactly.
+
+Equality is what makes a handoff lossless: it says the blob accounts
+for every byte the anchor delivered and claims none it did not, and it
+hands the importing worker the offsets to resume from. Disagreement is
+a fault, not a race — a short inbound cursor means the worker exported
+before its inbound tail ran dry and those bytes are in no blob; an
+over-claimed one means a misbound session; an outbound mismatch means
+the drain never finished and the client has seen a different prefix
+than the blob believes. The anchor refuses such a handoff with
+`STATUS_CURSOR_MISMATCH` and leaves the session on the exporting
+worker, because a refused handoff costs a maintenance window while an
+admitted one costs bytes nobody will ever learn were dropped.
+
+The sequencing that keeps the cursors equal is the two halves of one
+obligation: the anchor holds new client bytes from the moment it
+issues `DRAIN`, and the worker consumes its inbound tail to dry before
+it declares `DRAINED`. The cursors are how that obligation is checked
+rather than assumed.
+
 ## Handoff and Reconfigure Integration
 
 Drain-first reconfigure is necessary but not sufficient for classes
@@ -570,8 +596,11 @@ Reusable continuity logic lives in cores that modules mount with
 `include!`:
 
 - `session_handoff.rs` — opaque export/import chunking with
-  incremental CRC32 (`HandoffExport` / `HandoffImport`); consumed by
-  `echo_worker` for the anchor-preserved swap.
+  incremental CRC32 (`HandoffExport` / `HandoffImport`), plus the
+  delivery cursors that place a blob in the session's byte streams
+  (`SessionCursors` / `cursors_admit`, §Delivery Cursors); consumed by
+  `echo_worker` for the anchor-preserved swap and by `echo_anchor` to
+  admit it.
 - `nonce_reservation.rs` — windowed egress-counter reservation with
   epoch fencing (`NonceReservation`): the holder never emits a counter
   value it has not been granted, grants are refused across an epoch

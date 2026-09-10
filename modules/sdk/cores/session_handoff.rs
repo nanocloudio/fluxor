@@ -70,6 +70,7 @@ pub const HANDOFF_OK: u8 = 0; // STATUS_OK
 pub const HANDOFF_NO_CAPACITY: u8 = 3; // STATUS_NO_CAPACITY
 pub const HANDOFF_CORRUPT: u8 = 4; // STATUS_CORRUPT
 pub const HANDOFF_NOT_READY: u8 = 5; // STATUS_NOT_READY
+pub const HANDOFF_CURSOR_MISMATCH: u8 = 7; // STATUS_CURSOR_MISMATCH
 
 // ── Exporter ───────────────────────────────────────────────────────
 
@@ -256,5 +257,69 @@ impl HandoffImport {
         self.total_len = 0;
         self.received = 0;
         self.crc = HandoffCrc32::new();
+    }
+}
+
+// ── Delivery cursors ───────────────────────────────────────────────
+
+/// Where an exported blob sits in the session's two byte streams, both
+/// counted from the session's first byte (see `contracts/net/session_ctrl.rs`
+/// §Delivery cursors). The exporting worker fills these in; the anchor
+/// checks them against its own counters; the importing worker resumes
+/// from them.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct SessionCursors {
+    /// Inbound bytes the anchor forwarded that the blob accounts for.
+    pub in_consumed: u64,
+    /// Outbound bytes the blob has already emitted toward the client.
+    pub out_produced: u64,
+}
+
+/// Bytes a cursor pair occupies on the wire.
+pub const CURSOR_PAIR_LEN: usize = 16;
+
+impl SessionCursors {
+    pub const fn new(in_consumed: u64, out_produced: u64) -> Self {
+        SessionCursors {
+            in_consumed,
+            out_produced,
+        }
+    }
+
+    /// Little-endian pair, in EXPORT_BEGIN field order.
+    pub fn encode(&self, out: &mut [u8; CURSOR_PAIR_LEN]) {
+        out[0..8].copy_from_slice(&self.in_consumed.to_le_bytes());
+        out[8..16].copy_from_slice(&self.out_produced.to_le_bytes());
+    }
+
+    /// Inverse of `encode`. `None` if the field is short.
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() < CURSOR_PAIR_LEN {
+            return None;
+        }
+        let mut a = [0u8; 8];
+        let mut b = [0u8; 8];
+        a.copy_from_slice(&src[0..8]);
+        b.copy_from_slice(&src[8..16]);
+        Some(SessionCursors {
+            in_consumed: u64::from_le_bytes(a),
+            out_produced: u64::from_le_bytes(b),
+        })
+    }
+}
+
+/// Anchor-side check of an EXPORT_BEGIN's cursors against what this
+/// anchor actually delivered to and relayed from the exporting worker.
+///
+/// `HANDOFF_OK` only when both agree exactly. Any disagreement means the
+/// blob and the client have seen different prefixes of the session, so
+/// the caller must refuse the handoff and leave the session where it is
+/// — see the fault table in `contracts/net/session_ctrl.rs`.
+pub fn cursors_admit(exported: &SessionCursors, forwarded: u64, relayed: u64) -> u8 {
+    if exported.in_consumed == forwarded && exported.out_produced == relayed {
+        HANDOFF_OK
+    } else {
+        HANDOFF_CURSOR_MISMATCH
     }
 }

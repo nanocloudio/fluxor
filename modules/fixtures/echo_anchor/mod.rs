@@ -35,8 +35,12 @@
 //!
 //!   1. CMD_SC_DRAIN → active worker (it stops consuming; in this demo
 //!      drain implies handoff-export)
-//!   2. relay the old worker's CMD_SC_EXPORT_BEGIN/CHUNK…/END frames
-//!      verbatim to the standby worker (the blob stays opaque, §13.2)
+//!   2. check EXPORT_BEGIN's delivery cursors against what this anchor
+//!      forwarded and relayed — a disagreement means the blob and the
+//!      client have seen different prefixes of the session, so the swap
+//!      is refused and the session stays put — then relay the
+//!      CMD_SC_EXPORT_BEGIN/CHUNK…/END frames verbatim to the standby
+//!      worker (the blob itself stays opaque, §13.2)
 //!   3. standby replies MSG_SC_IMPORT_BEGIN / MSG_SC_IMPORT_END
 //!   4. CMD_SC_RESUME(epoch+1) → standby; MSG_SC_RESUMED flips the
 //!      anchor's forwarding target and bumps `session_epoch`
@@ -73,6 +77,10 @@ use core::ffi::c_void;
 #[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
+
+// Delivery-cursor admission (§Delivery cursors). The anchor mounts the
+// handoff core for this alone — the blob itself stays opaque to it.
+include!("../../sdk/cores/session_handoff.rs");
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
@@ -232,6 +240,12 @@ struct AnchorState {
     /// Swap workers every N forwarded client bytes (0 = never).
     /// Parameter tag 2; needs the second worker pair wired.
     handoff_after_bytes: u32,
+    /// Session-scoped delivery cursors (§Delivery cursors): client
+    /// bytes handed to the serving worker, and worker bytes put on the
+    /// client transport. They count the session, not the worker, so a
+    /// handoff carries them across unchanged.
+    forwarded: u64,
+    relayed: u64,
     /// Client bytes forwarded since the last swap.
     bytes_since_handoff: u32,
     /// Set while the old worker's MSG_SC_DETACHED (post-swap) is
@@ -279,6 +293,8 @@ impl AnchorState {
         self.ctrl_out = [-1; 2];
         self.data_in = [-1; 2];
         self.data_out = [-1; 2];
+        self.forwarded = 0;
+        self.relayed = 0;
         self.listen_port = 9000;
         self.phase = AnchorPhase::Init;
         self.active_w = 0;
@@ -611,7 +627,10 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
                         // Best-effort forward — drop on data_out full.
                         // A real anchor would buffer; this is a demo.
                         if out >= 0 {
-                            let _ = ((*sys_ptr).channel_write)(out, data, data_len);
+                            let wrote = ((*sys_ptr).channel_write)(out, data, data_len);
+                            if wrote > 0 {
+                                s.forwarded = s.forwarded.wrapping_add(wrote as u64);
+                            }
                         }
                         s.bytes_since_handoff =
                             s.bytes_since_handoff.wrapping_add(data_len as u32);
@@ -685,7 +704,10 @@ unsafe fn flush_hold(s: &mut AnchorState) {
     let out = s.data_out[s.active_w as usize];
     if out >= 0 {
         let held = s.hold_buf.as_ptr();
-        let _ = ((*sys_ptr).channel_write)(out, held, s.hold_len as usize);
+        let wrote = ((*sys_ptr).channel_write)(out, held, s.hold_len as usize);
+        if wrote > 0 {
+            s.forwarded = s.forwarded.wrapping_add(wrote as u64);
+        }
         s.bytes_since_handoff = s.bytes_since_handoff.wrapping_add(s.hold_len as u32);
     }
     s.hold_len = 0;
@@ -761,11 +783,37 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
         }
         SC_CMD_EXPORT_BEGIN | SC_CMD_EXPORT_CHUNK | SC_CMD_EXPORT_END => {
             // Relay the opaque export verbatim to the standby worker
-            // (§13.2 — the anchor never interprets the blob).
+            // (§13.2 — the anchor never interprets the blob). The
+            // cursors on EXPORT_BEGIN are the one part the anchor does
+            // read: they must match what it delivered to and relayed
+            // from this worker, or the blob and the client have seen
+            // different prefixes of the session and the handoff is not
+            // safe to make.
             if is_active
                 && (s.handoff == HandoffPhase::DrainWait
                     || s.handoff == HandoffPhase::ImportWait)
             {
+                if msg_type == SC_CMD_EXPORT_BEGIN {
+                    let off = SESSION_ID_BYTES + EPOCH_BYTES + 4;
+                    let cursors = if payload_len >= off + CURSOR_PAIR_LEN {
+                        SessionCursors::decode(core::slice::from_raw_parts(
+                            buf.add(NET_FRAME_HDR + off),
+                            CURSOR_PAIR_LEN,
+                        ))
+                    } else {
+                        None
+                    };
+                    let admit = match cursors {
+                        Some(c) => cursors_admit(&c, s.forwarded, s.relayed),
+                        None => HANDOFF_CURSOR_MISMATCH,
+                    };
+                    if admit != HANDOFF_OK {
+                        dev_log(&*sys_ptr, 1,
+                            b"[echo_anc] export cursors disagree".as_ptr(), 34);
+                        handoff_abort(s);
+                        return;
+                    }
+                }
                 let standby = s.standby_w();
                 sc_relay_frame(s, standby, msg_type, payload_len);
             }
@@ -884,6 +932,7 @@ unsafe fn poll_data_in(s: &mut AnchorState) {
                 if read > 0 {
                     let client = s.client_conn_id;
                     net_send_data(s, client, buf, read as usize);
+                    s.relayed = s.relayed.wrapping_add(read as u64);
                 }
                 // More may remain — keep retiring next step.
                 return;

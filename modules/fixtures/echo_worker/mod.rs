@@ -37,7 +37,8 @@
 //!   a real deployment may gate export on directory policy):
 //!     anchor → worker : CMD_SC_DRAIN
 //!     worker → anchor : MSG_SC_DRAINED, then
-//!     worker → anchor : CMD_SC_EXPORT_BEGIN / CHUNK… / END (CRC32)
+//!     worker → anchor : CMD_SC_EXPORT_BEGIN (blob length + the
+//!                       session's delivery cursors) / CHUNK… / END (CRC32)
 //!     anchor → worker : CMD_SC_DETACH   (after the peer resumed)
 //!     worker → anchor : MSG_SC_DETACHED
 //!
@@ -171,6 +172,12 @@ struct WorkerState {
     /// Statistics (readable via memory dump). Survives handoff via the
     /// exported blob — the importing worker resumes the count.
     bytes_processed: u32,
+    /// Session-scoped delivery cursors (§Delivery cursors): inbound
+    /// bytes this worker has consumed, and outbound bytes it has
+    /// emitted. They travel on EXPORT_BEGIN so the anchor can confirm
+    /// the exported state accounts for exactly what it delivered.
+    in_consumed: u64,
+    out_produced: u64,
 
     /// Cached scheduler index from `dev_self_index` for MON_SESSION
     /// emission. `0xFF` until first resolved (we lazy-resolve on the
@@ -208,6 +215,8 @@ impl WorkerState {
         self.anchor_id = [0; ANCHOR_ID_BYTES];
         self.session_epoch = 0;
         self.bytes_processed = 0;
+        self.in_consumed = 0;
+        self.out_produced = 0;
         self.self_idx = 0xFF;
         self.drained_sent = 0;
         self._pad1 = [0; 2];
@@ -329,11 +338,14 @@ unsafe fn export_state(s: &mut WorkerState) {
             .copy_from_slice(&s.session_epoch.to_le_bytes());
     };
 
-    // EXPORT_BEGIN: [sid:16][epoch:4][total_len:4 LE]
-    let mut begin = [0u8; SESSION_ID_BYTES + EPOCH_BYTES + 4];
+    // EXPORT_BEGIN: [sid:16][epoch:4][total_len:4 LE][cursors:16]
+    let mut begin = [0u8; SESSION_ID_BYTES + EPOCH_BYTES + 4 + CURSOR_PAIR_LEN];
     sid_epoch(s, &mut begin);
-    begin[SESSION_ID_BYTES + EPOCH_BYTES..]
-        .copy_from_slice(&(BLOB_LEN as u32).to_le_bytes());
+    let len_at = SESSION_ID_BYTES + EPOCH_BYTES;
+    begin[len_at..len_at + 4].copy_from_slice(&(BLOB_LEN as u32).to_le_bytes());
+    let mut cursors = [0u8; CURSOR_PAIR_LEN];
+    SessionCursors::new(s.in_consumed, s.out_produced).encode(&mut cursors);
+    begin[len_at + 4..].copy_from_slice(&cursors);
     sc_write(s, SC_CMD_EXPORT_BEGIN, begin.as_ptr(), begin.len());
 
     // EXPORT_CHUNK: [sid:16][epoch:4][offset:4 LE][data...]
@@ -448,7 +460,7 @@ unsafe fn handle_ctrl(s: &mut WorkerState) {
             // Import IS the attach for the incoming worker: accept a
             // relayed export from Dormant / Idle.
             // Payload: [sid:16][epoch:4 LE][total_len:4 LE].
-            let expected = SESSION_ID_BYTES + EPOCH_BYTES + 4;
+            let expected = SESSION_ID_BYTES + EPOCH_BYTES + 4 + CURSOR_PAIR_LEN;
             let can_import = s.phase == WorkerPhase::Dormant || s.phase == WorkerPhase::Idle;
             if payload_len >= expected && can_import {
                 let p = buf.add(NET_FRAME_HDR);
@@ -469,6 +481,17 @@ unsafe fn handle_ctrl(s: &mut WorkerState) {
                     *p.add(SESSION_ID_BYTES + EPOCH_BYTES + 2),
                     *p.add(SESSION_ID_BYTES + EPOCH_BYTES + 3),
                 ]);
+                // Resume the session's cursors where the exporting
+                // worker left them; the anchor has already confirmed
+                // they match what it delivered.
+                let cur_at = SESSION_ID_BYTES + EPOCH_BYTES + 4;
+                if let Some(c) = SessionCursors::decode(core::slice::from_raw_parts(
+                    p.add(cur_at),
+                    CURSOR_PAIR_LEN,
+                )) {
+                    s.in_consumed = c.in_consumed;
+                    s.out_produced = c.out_produced;
+                }
                 let status = s.import.begin(total, BLOB_LEN as u32);
                 if status == HANDOFF_OK {
                     s.phase = WorkerPhase::Importing;
@@ -620,6 +643,7 @@ unsafe fn handle_data(s: &mut WorkerState) {
         return;
     }
     let n = read as usize;
+    s.in_consumed = s.in_consumed.wrapping_add(n as u64);
 
     // In-place ASCII upper-case.
     let mut i = 0;
@@ -634,6 +658,7 @@ unsafe fn handle_data(s: &mut WorkerState) {
     let written = ((*sys_ptr).channel_write)(data_out, buf, n);
     if written > 0 {
         s.bytes_processed = s.bytes_processed.wrapping_add(written as u32);
+        s.out_produced = s.out_produced.wrapping_add(written as u64);
     }
 }
 
