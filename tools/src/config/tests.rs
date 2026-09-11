@@ -2212,15 +2212,62 @@ mod continuity_tests {
     }
 
     /// The config the graph above is declared in: instance types are what
-    /// the validator identifies the ip stack by.
+    /// the validator identifies the ip stack by, and `node` is what places
+    /// the fence agent outside the anchor's failure domain.
     fn prs_cfg(entry: serde_json::Value) -> serde_json::Value {
         json!({"modules": [
             {"name": "anc", "type": "anchor"},
             {"name": "wkr", "type": "worker"},
-            {"name": "dir", "type": "session_directory"},
+            {"name": "dir", "type": "session_directory", "node": "cluster"},
             {"name": "ip", "type": "ip"},
-            {"name": "pdu", "type": "fence_agent"}],
+            {"name": "pdu", "type": "fence_agent", "node": "bench"}],
             "continuity": [entry]})
+    }
+
+    /// The same graph with the fence agent instantiated on the anchor's own
+    /// node.
+    fn prs_cfg_fence_on_node(entry: serde_json::Value) -> serde_json::Value {
+        let mut cfg = prs_cfg(entry);
+        cfg["modules"][4] = json!({"name": "pdu", "type": "fence_agent"});
+        cfg
+    }
+
+    #[test]
+    fn continuity_prs_out_of_band_fence_must_be_placed_off_node() {
+        // A module declaring `cutoff = "wire"` on the anchor's own node is
+        // inside the failure domain: it cannot prove that node quiet, so
+        // it is not out-of-band evidence, however it labels itself.
+        let (n, m) = prs_graph();
+        let cfg = prs_cfg_fence_on_node(prs_entry());
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(msg.contains("failure domain"), "got: {msg}");
+        assert!(msg.contains("`pdu`"), "got: {msg}");
+        assert!(msg.contains("node"), "got: {msg}");
+    }
+
+    #[test]
+    fn continuity_prs_places_only_the_fence_of_necessity() {
+        // A directory is usually a cluster service, but a graph that
+        // resolves one locally satisfies the class just as well: it is
+        // the fence, and only the fence, whose evidence depends on being
+        // somewhere else.
+        let (n, m) = prs_graph();
+        let mut cfg = prs_cfg(prs_entry());
+        cfg["modules"][2] = json!({"name": "dir", "type": "session_directory"});
+        validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
+    }
+
+    #[test]
+    fn continuity_prs_anchor_is_never_remote() {
+        // The anchor owns this node's transport; a placement elsewhere is
+        // a declaration about a graph the validator is not looking at.
+        let (n, m) = prs_graph();
+        let mut cfg = prs_cfg(prs_entry());
+        cfg["modules"][0] = json!({"name": "anc", "type": "anchor", "node": "elsewhere"});
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("anchor"), "got: {e:?}");
+        assert!(format!("{e:?}").contains("node"), "got: {e:?}");
     }
 
     #[test]

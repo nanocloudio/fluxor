@@ -35,13 +35,13 @@ pub const EVENT_SIZE: usize = 4;
 // so a fused byte stream cannot accidentally be misread. The
 // producer decodes the status byte into a kind + channel pair.
 
-pub const KIND_NOTE_OFF: u8         = 0x01;
-pub const KIND_NOTE_ON: u8          = 0x02;
-pub const KIND_POLY_PRESSURE: u8    = 0x03;
-pub const KIND_CONTROL_CHANGE: u8   = 0x04;
-pub const KIND_PROGRAM_CHANGE: u8   = 0x05;
+pub const KIND_NOTE_OFF: u8 = 0x01;
+pub const KIND_NOTE_ON: u8 = 0x02;
+pub const KIND_POLY_PRESSURE: u8 = 0x03;
+pub const KIND_CONTROL_CHANGE: u8 = 0x04;
+pub const KIND_PROGRAM_CHANGE: u8 = 0x05;
 pub const KIND_CHANNEL_PRESSURE: u8 = 0x06;
-pub const KIND_PITCH_BEND: u8       = 0x07;
+pub const KIND_PITCH_BEND: u8 = 0x07;
 
 // ── Payload conventions ─────────────────────────────────────────────
 //

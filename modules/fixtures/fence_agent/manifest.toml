@@ -1,0 +1,96 @@
+version = "1.0.0"
+# A hosted node, because the cut is a host command: the `proc` executor
+# that runs it belongs to a host platform. `bcm2712` is here because that
+# is the silicon a hosted aarch64 node's PIC modules are compiled for, not
+# a claim that the agent has anything to drive on a bare-metal board.
+hardware_targets = ["bcm2712", "linux"]
+# Its only timing is the wall-clock poll of a running actuator and the
+# hold-up it waits out after a cut.
+timer_class = "wall_clock"
+
+# The reference out-of-band fence agent: `fence.enforceable` answered from
+# OUTSIDE the failure domain it fences. It speaks the net-identity
+# address-control surface (`modules/sdk/contracts/net/identity.rs` §Two
+# providers, one surface) on `addr_ctl_in` / `addr_evt_out` — the same
+# verbs the ip module answers — and its cut is a host command run through
+# the `proc` executor.
+#
+#   ADDR_ADD    take custody of the host owning the address; mints a token
+#   ADDR_FENCE  run `fence_cmd`; then, `quiet_after_ms` after that command
+#               exits 0, MSG_ADDR_FENCED (cutoff = wire, cutoff index = this
+#               agent's fence count, generation = the custody generation)
+#   ADDR_ARM    run `restore_cmd`; MSG_ADDR_ARMED once it exits 0
+#   ADDR_DEL    release custody
+#
+# One host per instance: the commands name the host they act on, so a
+# bench that fences two hosts composes two agents. A second address is
+# refused `TABLE_FULL`.
+#
+# The default commands are the rig's power backend — `fluxor rig power off`
+# and `on` — so on a bench the cut is the smart plug opening and the host
+# genuinely loses power. Any command will do: a PDU client, a fabric-port
+# script, a BMC call.
+#
+# `quiet_after_ms` is the fenced host's hold-up. A board goes on running
+# from what its supply holds after the relay opens, and a capture taken at
+# the bench shows frames sourced from it past the plug's own confirmation:
+# a Raspberry Pi 5 on a switched mains socket keeps emitting for 110-140 ms.
+# So the plug confirms the cut and the fence is confirmed only once the
+# hold-up has also passed, because a coordinator that activated a standby
+# on the relay's word would be activating against a host still on the
+# wire. The default of 2000 ms is an order of magnitude clear of that
+# measurement, which costs only failover latency — and the latency is
+# already declared, since the hold-up is part of the fence a graph's
+# `failover_budget_ms` covers. A bench that has measured its own hardware
+# sets the value from that.
+#
+# A command that cannot be spawned or that exits non-zero is refused
+# `refusal::ACTUATOR`: the host's state is then unknown, and nothing may be
+# activated on its behalf. One actuation runs at a time, its hold-up
+# included.
+#
+# A graph declaring `transport_migratable` over `platform_replicated_state`
+# names this module as a member placed on another node (`node:`); the
+# `cutoff = "wire"` below is admitted only from such a placement.
+#
+# Log lines, for aligning a packet capture against the cut:
+#
+#   [fence_agent] custody <ip> gen=<n>
+#   [fence_agent] cutting <ip>                     the command was started
+#   [fence_agent] cut <ip> holding <ms>ms          it exited 0
+#   [fence_agent] fenced <ip> gen=<n> count=<c>    the hold-up has passed
+#   [fence_agent] restoring <ip> / restored <ip>
+#   [fence_agent] actuator not spawned rc=-<errno>
+#   [fence_agent] refused <ip> op=<op> reason=<r>
+
+capabilities = ["fence.enforceable"]
+
+[capability_facts."fence.enforceable"]
+cutoff = "wire"
+
+# Address control is a few frames per fence, not a stream: the control
+# rate class, so the small rings below satisfy the flow budget at any tick.
+[[ports]]
+name = "addr_ctl_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+buffer_size = 512
+rate_class_default = "control"
+
+[[ports]]
+name = "addr_evt_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+buffer_size = 512
+rate_class_default = "control"
+
+# The host process executor that runs the actuator command.
+[[resources]]
+requires_contract = "proc"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "fence fixture; its log lines and the actuator it drives are the observables a packet capture is aligned against"

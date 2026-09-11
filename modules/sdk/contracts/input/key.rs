@@ -33,7 +33,7 @@ pub const MSG_EVENT: u8 = 0x01;
 // ── Event kinds (msg.event_kind byte) ────────────────────────────────
 
 pub const KIND_DOWN: u8 = 1;
-pub const KIND_UP: u8   = 2;
+pub const KIND_UP: u8 = 2;
 
 // ── Modifier bitfield (msg.modifiers) ────────────────────────────────
 // Same numeric layout as input::pointer::MOD_* so a single
@@ -41,6 +41,6 @@ pub const KIND_UP: u8   = 2;
 // pointer + key state.
 
 pub const MOD_SHIFT: u8 = 0x01;
-pub const MOD_CTRL: u8  = 0x02;
-pub const MOD_ALT: u8   = 0x04;
-pub const MOD_META: u8  = 0x08;
+pub const MOD_CTRL: u8 = 0x02;
+pub const MOD_ALT: u8 = 0x04;
+pub const MOD_META: u8 = 0x08;

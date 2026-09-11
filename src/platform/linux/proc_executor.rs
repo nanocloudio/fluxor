@@ -197,6 +197,21 @@ impl ProcExecutor {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// The child's exit code once it has exited: the code it returned, or
+    /// `128 + signal` when a signal ended it. `None` while it runs.
+    pub fn exit_code(&mut self) -> Option<i32> {
+        use std::os::unix::process::ExitStatusExt;
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(
+                status
+                    .code()
+                    .or_else(|| status.signal().map(|s| 128 + s))
+                    .unwrap_or(-1),
+            ),
+            _ => None,
+        }
+    }
+
     /// The reader thread has finished — the child's stdout hit EOF, so no more
     /// frames will ever be pushed to the inbound bridge. Combined with an empty
     /// bridge this is the race-free "output complete" signal a consumer needs

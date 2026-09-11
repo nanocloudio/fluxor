@@ -624,6 +624,32 @@ request, which is what a strict continuity profile is admitted against.
 IPv6 neighbour advertisement is not part of it: the stack is IPv4-only,
 so there is no IPv6 address to announce or fence.
 
+The same surface has a second kind of provider, the **out-of-band fence
+agent** (`identity.rs` §Two providers, one surface). The ip module's fence
+is what a host can prove about its own emission; an agent's fence is what
+another host can prove about it, by cutting the whole failure domain from
+outside — power, or the fabric port. It is therefore a member of the graph
+placed on another node (`protocol_surfaces.md` §Remote Channels and
+Placement), and it answers the same verbs: `ADDR_ADD` takes custody of the
+host owning the address and mints a token, `ADDR_FENCE` cuts, and
+`ADDR_ARM` restores.
+
+`MSG_ADDR_FENCED` follows a cut only once the actuator has reported
+success **and** the fenced host's hold-up has passed — a board goes on
+running from what its supply holds after the relay opens, and a
+coordinator that activated a standby on the relay's word would be
+activating against a host still on the wire. It carries `cutoff::WIRE`,
+the agent's own fence count as the cutoff index, and the custody
+generation, which is the `fence_gen` a coordinator presents on
+`CMD_SC_ACTIVATE`. An actuator that does not confirm is refused
+`refusal::ACTUATOR`, leaving the host's state unknown and the standby
+unactivated. The reference agent is `modules/fixtures/fence_agent/`: its
+actuator is a command run on its own node through the `proc` executor,
+by default the rig's power backend (`fluxor rig power off` / `on`), so a
+fence at the bench is the plug opening. A `platform_replicated_state`
+declaration needs both providers, and the agent's `cutoff = "wire"` counts
+only from a placed member.
+
 ## Transport Continuity
 
 Contract: `modules/sdk/contracts/net/session_ctrl.rs` §Transport
@@ -634,10 +660,11 @@ same command set on a `cont_in` / `cont_out` port pair: `PAIR_PREPARE`,
 `CHECKPOINT_BEGIN / NEXT / COMMIT`, `DELTA_APPLY / DELTA_ACK`,
 `QUIESCE_BEGIN / STATUS`, `CUT_EXPORT / CUT_IMPORT`, `EMISSION_ARM`,
 `ACTIVATE`, `RETIRE`, `ABORT`, with every reply a `MSG_SC_CONTINUITY`
-record. A coordinator (Wormhole's `failover_coordinator`) drives the
-lifecycle and relays checkpoint chunks and deltas between the primary's
-`cont_out` and the standby's `cont_in`; the provider owns the codec, the
-buffers and the emission gate.
+record. A failover coordinator drives the lifecycle and relays checkpoint
+chunks and deltas between the primary's `cont_out` and the standby's
+`cont_in`; the provider owns the codec, the buffers and the emission gate.
+The coordinator is a role a deployment fills rather than a module Fluxor
+ships: what is published here is the surface it drives.
 
 A **checkpoint** is a canonical record, never a memory dump: for TCP the
 tuple, sequence variables, windows, congestion and RTT state, timers as

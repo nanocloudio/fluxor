@@ -273,7 +273,7 @@ model these support):
 | `session.handoff` | Opaque export / import handoff support |
 | `session.reservation` | Durable, quorum-committed reservation of nonce / sequence blocks, so a taken-over sender never reuses AEAD nonces |
 | `security.key_wrap` | Session-key custody wrapped under a KEK the storage layer cannot read |
-| `fence.enforceable` | Emission fence for a local address: after the fence answers, nothing sourced from the address is handed onward, and ARP for it is not answered. Fact `cutoff`: `ring_handoff` (the ip module's boundary — frames already in the driver ring may still leave) or `wire` (the driver drained on request and reported its completed transmit count). Provided by `ip` over the `net::identity` `ADDR_FENCE` verb with a per-install token minted from the CSPRNG and the boot incarnation; the manifest declares `ring_handoff` and the composer raises it to `wire` on a target whose NIC driver answers the `tx_drain` query (bcm2712). An out-of-band fence agent declares `wire` for itself |
+| `fence.enforceable` | Emission fence for a local address: after the fence answers, nothing sourced from the address is handed onward, and ARP for it is not answered. Fact `cutoff`: `ring_handoff` (the ip module's boundary — frames already in the driver ring may still leave) or `wire` (the driver drained on request and reported its completed transmit count). Provided by `ip` over the `net::identity` `ADDR_FENCE` verb with a per-install token minted from the CSPRNG and the boot incarnation; the manifest declares `ring_handoff` and the composer raises it to `wire` on a target whose NIC driver answers the `tx_drain` query (bcm2712). An out-of-band fence agent — a member placed on another node whose cut is power or the fabric port, `modules/fixtures/fence_agent/` being the reference — answers the same verbs and declares `wire` for itself |
 | `durable.rpo_zero` | Synchronous quorum-durable-before-acknowledge write path for security-relevant session state |
 
 Target-provided:
@@ -519,8 +519,12 @@ as graph structure:
   two halves: the ip module's `fence.enforceable` must reach
   `cutoff = "wire"` on the target (`TargetFacts::nic_tx_drain`), and an
   out-of-band `fence.enforceable` provider must declare
-  `[capability_facts."fence.enforceable"] cutoff = "wire"` for itself —
-  a local cutoff alone never confirms a hung host quiet. An
+  `[capability_facts."fence.enforceable"] cutoff = "wire"` for itself
+  and be a member placed on another node (`modules[].node`,
+  `protocol_surfaces.md` §Remote Channels and Placement) — a local
+  cutoff alone never confirms a hung host quiet, and a module on this
+  node declaring `wire` is refused by name. The anchor is never a placed
+  member. An
   `implicit_counter` AEAD class is rejected outright: an
   implicit-contiguous AEAD counter cannot skip forward on takeover, so
   that transport's honest ceiling is `resumable`.

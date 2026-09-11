@@ -631,12 +631,12 @@ pub mod caps {
     // ── Handle-acquisition tier ─────────────────────────────
     // Opcodes called with handle = -1 that return a new FD.
     /// [`OPEN`] (0x0900) — read-only file open by path.
-    pub const OPEN:           u32 = 1 << 0;
+    pub const OPEN: u32 = 1 << 0;
     /// [`OPENDIR`] (0x0907) — open a directory for iteration.
     /// Implies the returned FD supports `READDIR`.
-    pub const OPENDIR:        u32 = 1 << 1;
+    pub const OPENDIR: u32 = 1 << 1;
     /// [`OPEN_CREATE`] (0x0909) — open with O_CREAT semantics.
-    pub const OPEN_CREATE:    u32 = 1 << 2;
+    pub const OPEN_CREATE: u32 = 1 << 2;
 
     // ── Write tier (mutate state through an existing FD) ────
     /// [`WRITE`] (0x0906) — write bytes through an FD. The
@@ -644,55 +644,55 @@ pub mod caps {
     /// distinguish read-only providers (e.g. FAT32 v1, wasm
     /// fetch) from writable ones (linux) without trial-and-
     /// error.
-    pub const WRITE:          u32 = 1 << 3;
+    pub const WRITE: u32 = 1 << 3;
     /// [`FSYNC`] (0x0905) — durability fence on an FD. As with
     /// `WRITE`, the opcode predates the capability bitmap and
     /// the bit is the discovery channel.
-    pub const FSYNC:          u32 = 1 << 4;
+    pub const FSYNC: u32 = 1 << 4;
 
     // Unimplemented capability bits remain clear until their opcode and
     // provider implementations land in lockstep.
     /// [`UNLINK`] (0x090A) — remove a file by path.
-    pub const UNLINK:         u32 = 1 << 5;
+    pub const UNLINK: u32 = 1 << 5;
     /// [`TRUNCATE`] (0x090C) — shrink a file, releasing the storage past
     /// the new end.
-    pub const TRUNCATE:       u32 = 1 << 6;
+    pub const TRUNCATE: u32 = 1 << 6;
     /// [`MKDIR`] (0x090B) — create one directory by path.
-    pub const MKDIR:          u32 = 1 << 7;
+    pub const MKDIR: u32 = 1 << 7;
     /// [`RENAME`] (0x090D) — atomic, durably published rename.
-    pub const RENAME:         u32 = 1 << 8;
+    pub const RENAME: u32 = 1 << 8;
     /// [`PREALLOCATE`] (0x090E) — physically reserve fixed file capacity and
     /// leave its descriptor positioned at byte zero.
-    pub const PREALLOCATE:    u32 = 1 << 9;
+    pub const PREALLOCATE: u32 = 1 << 9;
     /// [`WRITE_ASYNC`] (0x090F) + [`FSYNC_SUBMIT`]/[`FSYNC_POLL`]
     /// (0x0910/0x0911) — the pipelined async durable-write tier. Set iff
     /// the provider (and its block source) implement submit-now /
     /// fence-later durability; callers fall back to `WRITE`+`FSYNC` when
     /// clear.
-    pub const FSYNC_ASYNC:    u32 = 1 << 10;
+    pub const FSYNC_ASYNC: u32 = 1 << 10;
     /// [`FSYNC_NAME`] (0x0912) — durable publication of a parent-directory
     /// entry. Set iff the provider can prove a name reaches non-volatile
     /// media independently of the file's own bytes.
-    pub const FSYNC_NAME:     u32 = 1 << 11;
+    pub const FSYNC_NAME: u32 = 1 << 11;
 
     // ── Object-model tier ───────────────────────────────────
     // What an inode-based filesystem carries and FAT32 does not. A provider
     // whose format has no answer clears the bit rather than fabricating one.
     /// [`STAT`]'s 48-byte form is served — `ino`, `nlink`, `mode`, `uid`,
     /// `gid` in addition to size and mtime.
-    pub const STAT_OBJECT:    u32 = 1 << 12;
+    pub const STAT_OBJECT: u32 = 1 << 12;
     /// `uid`/`gid`/`mode` describe a real permission model rather than the
     /// mount's declared defaults. Reporting only; enforcement needs an owner
     /// identity on the dispatch, which `provider_call` does not carry.
-    pub const OWNERSHIP:      u32 = 1 << 13;
+    pub const OWNERSHIP: u32 = 1 << 13;
     /// A name can be added to an existing file, and `nlink` counts names.
-    pub const LINK:           u32 = 1 << 14;
+    pub const LINK: u32 = 1 << 14;
     /// [`RMDIR`] (0x0915) — remove an empty directory by path.
-    pub const RMDIR:          u32 = 1 << 16;
+    pub const RMDIR: u32 = 1 << 16;
     /// Symbolic links exist on this volume and `READLINK` resolves one.
     /// Resolution stays in the consumer: a provider that silently follows
     /// links makes `O_NOFOLLOW` inexpressible and turns a symlink into a
     /// confused-deputy primitive on a system where a path is often the whole
     /// of an authority check.
-    pub const SYMLINK:        u32 = 1 << 15;
+    pub const SYMLINK: u32 = 1 << 15;
 }

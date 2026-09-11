@@ -396,7 +396,10 @@ pub const MSG_SC_RELOCATED: u8 = 0x99;
 //   CUT_IMPORT(standby)        → CONTINUITY{IMPORTED}: the shadow is
 //                                validated and published, still silent
 //   EMISSION_ARM(standby)      → CONTINUITY{ARMED}
-//   fence the primary (net::identity ADDR_FENCE, or RETIRE)
+//   fence the primary: ADDR_FENCE on the out-of-band fence agent
+//     (net::identity §Two providers, one surface), whose MSG_ADDR_FENCED
+//     generation is `fence_gen` below — or RETIRE, when the primary is
+//     reachable and cooperating
 //   ACTIVATE(standby, epoch+1, fence_gen) → CONTINUITY{ACTIVATED}
 //   RETIRE(primary)            → CONTINUITY{RETIRED}: keys and buffers
 //                                destroyed
@@ -765,7 +768,12 @@ pub fn attach_epoch(payload: &[u8]) -> u32 {
     if payload.len() < at + EPOCH_BYTES {
         return 0;
     }
-    u32::from_le_bytes([payload[at], payload[at + 1], payload[at + 2], payload[at + 3]])
+    u32::from_le_bytes([
+        payload[at],
+        payload[at + 1],
+        payload[at + 2],
+        payload[at + 3],
+    ])
 }
 
 /// The anchor id ATTACH carries.
@@ -787,7 +795,12 @@ pub fn u32_after_header(payload: &[u8]) -> u32 {
     if payload.len() < at + 4 {
         return 0;
     }
-    u32::from_le_bytes([payload[at], payload[at + 1], payload[at + 2], payload[at + 3]])
+    u32::from_le_bytes([
+        payload[at],
+        payload[at + 1],
+        payload[at + 2],
+        payload[at + 3],
+    ])
 }
 
 /// The delivery cursors on EXPORT_BEGIN as their wire bytes (16, in
@@ -816,7 +829,11 @@ pub fn export_chunk_data(payload: &[u8]) -> &[u8] {
 /// Write `[session_id:16][epoch:4 LE]` at the head of `out`. Returns the
 /// bytes written: `SESSION_HEADER`, or 0 when `out` is too short.
 #[inline]
-pub fn put_session_header(out: &mut [u8], session_id: &[u8; SESSION_ID_BYTES], epoch: u32) -> usize {
+pub fn put_session_header(
+    out: &mut [u8],
+    session_id: &[u8; SESSION_ID_BYTES],
+    epoch: u32,
+) -> usize {
     if out.len() < SESSION_HEADER {
         return 0;
     }

@@ -243,17 +243,33 @@ const PRS_ANCHOR_CAPS: &[&str] = &[
     "transport.anchor.mux",
 ];
 
+/// The entry declared under `instance`: a `modules[]` entry, or a member
+/// placed on another node (lifted into `remote_members`).
+fn instance_entry<'a>(config: &'a Value, instance: &str) -> Option<&'a Value> {
+    ["modules", REMOTE_MEMBERS_KEY].iter().find_map(|key| {
+        config.get(key).and_then(|m| m.as_array()).and_then(|list| {
+            list.iter().find(|m| m.get("name").and_then(|n| n.as_str()) == Some(instance))
+        })
+    })
+}
+
 /// The type an instance was declared with (`modules[].type`), or its
 /// name when the config names none — the convention the loader uses.
 fn instance_type(config: &Value, instance: &str) -> String {
-    config
-        .get("modules")
-        .and_then(|m| m.as_array())
-        .and_then(|list| {
-            list.iter().find(|m| m.get("name").and_then(|n| n.as_str()) == Some(instance))
-        })
+    instance_entry(config, instance)
         .and_then(|m| m.get("type").and_then(|t| t.as_str()).map(|t| t.to_string()))
         .unwrap_or_else(|| instance.to_string())
+}
+
+/// The node an instance is placed on (`modules[].node`), or `None` for a
+/// member instantiated by this graph. A placed member is composed from
+/// another node: the composer loads its manifest so a continuity
+/// declaration can count on it, and instantiates nothing here.
+pub fn instance_node(config: &Value, instance: &str) -> Option<String> {
+    instance_entry(config, instance)
+        .and_then(|m| m.get("node").and_then(|n| n.as_str()))
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
 }
 
 /// `validate_continuity` against a resolved target, which is what decides
@@ -320,6 +336,17 @@ pub fn validate_continuity_on(
         for m in anchor.iter().chain(directory.iter()).chain(workers.iter()) {
             if !module_names.iter().any(|n| n == m) {
                 return Err(err(format!("unknown module `{m}`")));
+            }
+        }
+        // The anchor owns THIS node's client-visible transport. Placed on
+        // another node it would be a claim about a graph this validator is
+        // not looking at.
+        if let Some(a) = anchor {
+            if let Some(node) = instance_node(config, a) {
+                return Err(err(format!(
+                    "anchor `{a}` is placed on node `{node}`; the anchor is the member that owns \
+                     this graph's transport and is always instantiated here — drop its `node`"
+                )));
             }
         }
 
@@ -501,7 +528,11 @@ pub fn validate_continuity_on(
                         // whose reach is a target fact — and an out-of-band
                         // fence outside the failure domain, declaring
                         // `cutoff = "wire"` for itself. Neither alone
-                        // satisfies a strict profile.
+                        // satisfies a strict profile. Outside the failure
+                        // domain is a placement, not a label: only a member
+                        // composed from another node (`node:`) can prove
+                        // this one quiet, because this one is the node that
+                        // may have failed.
                         let cutoff_of = |name: &str| -> Option<String> {
                             let ty = instance_type(config, name);
                             if ty == "ip" {
@@ -524,10 +555,19 @@ pub fn validate_continuity_on(
                             instance_type(config, m) == "ip"
                                 && cutoff_of(m).as_deref() == Some("wire")
                         });
-                        let out_of_band_wire = fence_providers.iter().any(|m| {
-                            instance_type(config, m) != "ip"
-                                && cutoff_of(m).as_deref() == Some("wire")
-                        });
+                        let wire_agents: Vec<&&String> = fence_providers
+                            .iter()
+                            .filter(|m| {
+                                instance_type(config, m) != "ip"
+                                    && cutoff_of(m).as_deref() == Some("wire")
+                            })
+                            .collect();
+                        let out_of_band_wire = wire_agents
+                            .iter()
+                            .any(|m| instance_node(config, m).is_some());
+                        let on_node_agent = wire_agents
+                            .iter()
+                            .find(|m| instance_node(config, m).is_none());
                         if !local_wire {
                             return Err(err(format!(
                                 "platform_replicated_state requires the ip module's \
@@ -538,12 +578,21 @@ pub fn validate_continuity_on(
                             )));
                         }
                         if !out_of_band_wire {
+                            if let Some(m) = on_node_agent {
+                                return Err(err(format!(
+                                    "fence agent `{m}` declares cutoff = \"wire\" but is \
+                                     instantiated on this node, inside the failure domain it \
+                                     would have to prove quiet; an out-of-band fence is a member \
+                                     composed from another node — declare it with `node: <name>`"
+                                )));
+                            }
                             return Err(err(
                                 "platform_replicated_state requires an out-of-band \
                                  `fence.enforceable` provider (a fence agent outside the \
-                                 failure domain) declaring [capability_facts.\"fence.enforceable\"] \
-                                 cutoff = \"wire\"; a local cutoff alone is never enough — the host \
-                                 that must be proved quiet is the one that may have failed"
+                                 failure domain, a member placed with `node:`) declaring \
+                                 [capability_facts.\"fence.enforceable\"] cutoff = \"wire\"; a \
+                                 local cutoff alone is never enough — the host that must be \
+                                 proved quiet is the one that may have failed"
                                     .into(),
                             ));
                         }

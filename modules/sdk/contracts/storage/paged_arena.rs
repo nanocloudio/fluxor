@@ -47,4 +47,4 @@ pub const ARENA_FLUSH: u32 = 0x0CFF;
 /// Returns 0 or errno.
 pub const ARENA_BULK: u32 = 0x0CE9;
 pub const ARENA_BULK_OP_WRITE: u8 = 0;
-pub const ARENA_BULK_OP_READ:  u8 = 1;
+pub const ARENA_BULK_OP_READ: u8 = 1;

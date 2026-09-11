@@ -32,12 +32,12 @@ pub const MSG_EVENT: u8 = 0x01;
 
 // ── Event kinds (msg.event_kind byte) ────────────────────────────────
 
-pub const KIND_DOWN: u8   = 1;
-pub const KIND_UP: u8     = 2;
-pub const KIND_MOVE: u8   = 3;
+pub const KIND_DOWN: u8 = 1;
+pub const KIND_UP: u8 = 2;
+pub const KIND_MOVE: u8 = 3;
 pub const KIND_CANCEL: u8 = 4;
-pub const KIND_ENTER: u8  = 5;
-pub const KIND_LEAVE: u8  = 6;
+pub const KIND_ENTER: u8 = 5;
+pub const KIND_LEAVE: u8 = 6;
 /// Relative motion (pointer-lock / captured-mouse): `x`/`y` carry signed
 /// per-event deltas instead of absolute coordinates. Producers emit this
 /// while a lock is active (e.g. browser Pointer Lock API); consumers that
@@ -46,18 +46,18 @@ pub const KIND_MOVE_REL: u8 = 7;
 
 // ── Button bitfield (msg.buttons) ────────────────────────────────────
 
-pub const BTN_PRIMARY: u8   = 0x01;  // left mouse, primary touch contact
-pub const BTN_SECONDARY: u8 = 0x02;  // right mouse, two-finger touch
-pub const BTN_TERTIARY: u8  = 0x04;  // middle mouse
-pub const BTN_BACK: u8      = 0x08;
-pub const BTN_FORWARD: u8   = 0x10;
+pub const BTN_PRIMARY: u8 = 0x01; // left mouse, primary touch contact
+pub const BTN_SECONDARY: u8 = 0x02; // right mouse, two-finger touch
+pub const BTN_TERTIARY: u8 = 0x04; // middle mouse
+pub const BTN_BACK: u8 = 0x08;
+pub const BTN_FORWARD: u8 = 0x10;
 
 // ── Modifier bitfield (msg.modifiers) ────────────────────────────────
 
 pub const MOD_SHIFT: u8 = 0x01;
-pub const MOD_CTRL: u8  = 0x02;
-pub const MOD_ALT: u8   = 0x04;
-pub const MOD_META: u8  = 0x08;
+pub const MOD_CTRL: u8 = 0x02;
+pub const MOD_ALT: u8 = 0x04;
+pub const MOD_META: u8 = 0x08;
 
 /// Pressure scale: 0..1023 corresponds to W3C 0.0..1.0. Producers
 /// that don't report pressure (regular mouse) emit 511 for "down"

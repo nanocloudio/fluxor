@@ -436,6 +436,9 @@ fn generate_config_impl(
         }
     }
 
+    // A member placed on another node has no instance here for a wire to
+    // land on; say so before the generic unknown-module lookup would.
+    refuse_wiring_to_remote(config)?;
     let (edges, force_flags, from_specs, to_specs) = if config.get("wiring").is_some() {
         parse_wiring_edges(&config["wiring"], &module_names, &manifests)?
     } else {
@@ -489,10 +492,38 @@ fn generate_config_impl(
 
     validate_presentation_groups(config, &module_names, &manifests)?;
 
-    // Session continuity classes as a validated graph property
-    // Graphs without a `continuity` block are
-    // unaffected.
-    validate_continuity_on(config, &module_names, &manifests, resolved_target)?;
+    // Session continuity classes as a validated graph property. Graphs
+    // without a `continuity` block are unaffected. Members placed on
+    // another node count here and nowhere else: their manifests are
+    // resolved for their capabilities and facts, against no target, since
+    // the silicon they run on is their own graph's business.
+    let remote_list = Value::Array(remote_members(config));
+    let remote_manifests = load_module_manifests_with_extra_for_target(
+        &remote_list,
+        extra_module_dirs,
+        None,
+        project_root,
+    );
+    for name in remote_member_names(config) {
+        if !remote_manifests.contains_key(&name) {
+            let node = instance_node(config, &name).unwrap_or_default();
+            return Err(Error::Config(format!(
+                "module `{name}` is placed on node `{node}` but its manifest cannot be \
+                 resolved; a placed member is admitted on its manifest's capabilities and \
+                 facts, and a member with none is not evidence of anything"
+            )));
+        }
+    }
+    let mut continuity_names = module_names.clone();
+    continuity_names.extend(remote_member_names(config));
+    let mut continuity_manifests = manifests.clone();
+    continuity_manifests.extend(remote_manifests);
+    validate_continuity_on(
+        config,
+        &continuity_names,
+        &continuity_manifests,
+        resolved_target,
+    )?;
     // Execution-envelope claim. Graphs without an
     // `execution.profile` claim nothing and are unaffected.
     validate_execution_profile(config, &module_names, &manifests, resolved_target)?;

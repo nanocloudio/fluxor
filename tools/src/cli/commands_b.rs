@@ -57,11 +57,22 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         // Session continuity classes — same
         // dual-path treatment as presentation groups so `fluxor
         // validate` catches missing anchors / roles / R1–R5 capability
-        // providers without compiling.
+        // providers without compiling. Members placed on another node
+        // are part of the declaration and are resolved against no target.
+        let remote_list = serde_json::Value::Array(crate::config::remote_members(&config));
+        let remote_manifests = crate::config::load_module_manifests_with_extra(
+            &remote_list,
+            &extra_dirs,
+            &cfg_root,
+        );
+        let mut continuity_names = module_names.clone();
+        continuity_names.extend(crate::config::remote_member_names(&config));
+        let mut continuity_manifests = manifests.clone();
+        continuity_manifests.extend(remote_manifests);
         if let Err(e) = crate::config::validate_continuity_on(
             &config,
-            &module_names,
-            &manifests,
+            &continuity_names,
+            &continuity_manifests,
             Some(&target_desc.id),
         ) {
             result.add_error(e.to_string());

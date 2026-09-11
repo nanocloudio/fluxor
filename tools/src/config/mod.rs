@@ -1189,5 +1189,6 @@ impl ConfigBuilder {
 include!("builder.rs"); // ConfigBuilder + graph-config generation
 include!("manifest.rs"); // module search paths + manifest loading
 include!("validate.rs"); // presentation-group + continuity validators
+include!("placement.rs"); // members composed from another node
 include!("generate.rs"); // FXWR encode, ModuleCaps, generate_config_ext
 include!("tests.rs"); // #[cfg(test)] suites

@@ -1069,25 +1069,35 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             if slot >= MAX_PROCS || !procs[slot].in_use {
                 return errno::EINVAL;
             }
-            // Timeout: past the deadline, kill the child and report done — a
-            // runaway build can't wedge the pipe (bounds the blast radius).
+            // Past the deadline, kill the child — a runaway build can't wedge
+            // the pipe (bounds the blast radius). The kill is reported through
+            // the same completion answer as a natural exit, so the code below
+            // carries `128 + SIGKILL` rather than a success a caller would act
+            // on.
             let timed_out = procs[slot]
                 .deadline
                 .is_some_and(|dl| std::time::Instant::now() >= dl);
-            if timed_out {
-                if let Some(e) = procs[slot].exec.as_mut() {
-                    e.shutdown(std::time::Duration::from_millis(50));
-                }
-                return 0;
-            }
             let e = match procs[slot].exec.as_mut() {
                 Some(e) => e,
                 None => return errno::EINVAL,
             };
+            if timed_out {
+                e.shutdown(std::time::Duration::from_millis(50));
+            }
             // Done only when the child has exited AND both reader threads finished
             // AND the inbound bridge is drained — otherwise a final in-flight chunk
             // would be lost. 1 = more may come; 0 = truly done.
-            let running = e.alive() || !e.reader_finished() || e.stdout_pending() > 0;
+            let running =
+                !timed_out && (e.alive() || !e.reader_finished() || e.stdout_pending() > 0);
+            // Every answer that says done carries how the command ended:
+            // `arg` (LE i32) is its exit code, `128 + signal` when a signal
+            // ended it, and -1 when the status could not be read at all. A
+            // caller acting on the command's success — a fence agent on a
+            // power cut — reads it; one that only waits ignores it.
+            if !running && !arg.is_null() && arg_len >= 4 {
+                let code = e.exit_code().unwrap_or(-1);
+                core::ptr::copy_nonoverlapping(code.to_le_bytes().as_ptr(), arg, 4);
+            }
             i32::from(running)
         }
         PROC_CLOSE => {

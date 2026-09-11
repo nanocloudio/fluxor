@@ -331,8 +331,29 @@ The transport providers here — `ip` for TCP, `tls` for the record
 layer, `quic` for the mux — answer the session-control contract's
 transport-continuity commands (`network.md` §Transport Continuity);
 `ip` provides `fence.enforceable`. The directory, reservation, key-wrap
-and durable providers, and the out-of-band fence agent, are composed into
-the graph from outside — a graph that lacks any of them is refused.
+and durable providers are usually cluster services rather than modules of
+this graph, and are declared as members placed on their own node with
+`node: <name>` (§Remote Channels and Placement); a graph that resolves
+them locally satisfies the class just as well, and one that lacks them
+entirely is refused.
+
+The out-of-band fence is the exception that must be placed. Its
+`cutoff = "wire"` counts only from a member on another node, because a
+module inside the failure domain cannot be the evidence that the domain
+is quiet — a same-node module declaring the wire is refused by name.
+
+A worked composition is `examples/test_harness/pi5/transport_migratable.yaml`:
+on Pi 5 the `tls` module is the anchor — it owns the secure attachment the
+client sees — over the `ip` module's TCP, with the session directory and
+the fence agent placed on a second node, where
+`examples/test_harness/linux/fence/fence_agent_bench.yaml` instantiates
+them. The fence agent is the reference out-of-band provider
+(`modules/fixtures/fence_agent/`): it answers the same address-control
+verbs as `ip` (`network.md` §Emission Control), and its cut is a command
+run on that node — at the reference bench, the smart plug the board is
+wired to. `tests/hardware/pi5_transport_migratable.toml` boots the graph,
+and its driver fences the board under a live TLS session and reads the
+capture for anything the board sourced after the cut.
 
 ## Architectural Roles
 
@@ -630,6 +651,36 @@ the remote-channel transport must provide mutual authentication,
 integrity protection, and encryption. Continuity expectations differ
 per edge: internal cluster streams may be `resumable` while external
 client sessions are `edge_anchored`.
+
+A graph is instantiated on one node, but a continuity declaration may
+name members that live on others. Such a member is declared in
+`modules[]` with a placement:
+
+```yaml
+modules:
+  - name: directory
+    type: directory_stand_in
+    node: bench
+  - name: fence_agent
+    node: bench
+```
+
+A placed member carries its name, type, node and `variant` and nothing
+else — its parameters and its wiring belong to the graph that instantiates
+it. The composer lifts it out of the module list as the graph is
+normalised, so every pass that reads that list sees only what this node
+runs, and then resolves its manifest against no target: the declaration is
+admitted on the capabilities and facts the member really publishes, and
+the member is never held to this node's silicon, its scheduling or its
+buffer budget. Nothing is emitted for it, and a wire that names it is
+refused, there being no local instance for the wire to land on; the graph
+reaches it over a remote channel it wires explicitly.
+
+The anchor is the one member never placed elsewhere: it owns this node's
+transport, and a claim about a transport somewhere else is a claim about a
+graph this one cannot see. Placement is also what makes "out-of-band"
+checkable rather than asserted — the fence agent that proves this node
+quiet is admitted only when it is declared on another one.
 
 ## Shared Continuity Cores
 

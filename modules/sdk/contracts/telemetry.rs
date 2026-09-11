@@ -292,7 +292,13 @@ pub const ENCODING_FXTL_COMPACT: u8 = 2;
 
 /// Write the 12-byte header into `buf`. Returns the header length, or `None`
 /// if `buf` is too small.
-pub fn write_header(buf: &mut [u8], signal: u8, kind: u8, module: u16, t_micros: u64) -> Option<usize> {
+pub fn write_header(
+    buf: &mut [u8],
+    signal: u8,
+    kind: u8,
+    module: u16,
+    t_micros: u64,
+) -> Option<usize> {
     if buf.len() < HEADER_SIZE {
         return None;
     }

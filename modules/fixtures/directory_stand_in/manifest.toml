@@ -1,0 +1,57 @@
+version = "1.0.0"
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+timer_class = "agnostic"
+
+# A stand-in for the session-directory side of a continuity declaration,
+# at fixture scale: one instance, in memory, on a node of its own. It
+# answers the directory's SessionCtrlV1 verbs on `ctrl_in` / `ctrl_out` —
+# HELLO as `ROLE_DIRECTORY`, ATTACH / DETACH / RELOCATE / EPOCH_BUMP under
+# single-writer authority per (session_id, session_epoch): a binding only
+# ever moves to a higher epoch, and a command carrying a lower one is
+# refused `STATUS_STALE_EPOCH` — and it grants each attached session a
+# block of egress-counter values (`CMD_SC_RESERVATION_GRANT`) that never
+# overlaps a block it granted before.
+#
+# The capabilities below are the four a `platform_replicated_state`
+# declaration resolves on the directory side. This module provides them as
+# one node holds them: authority and grants are durable for as long as
+# this instance lives, and a sealing key it hands out is the vault's. It is
+# what lets a graph in this repository be composed and its fence exercised
+# on a rig without a consensus cluster beside it; a deployment brings its
+# quorum-backed directory in its place. A fixture never ships in a bundle.
+#
+# Log lines:
+#
+#   [directory] hello role=<r>
+#   [directory] bound <n> epoch=<e>
+#   [directory] stale epoch=<e> held=<h>
+#   [directory] granted start=<s> len=<l>
+
+capabilities = [
+  "session.directory",
+  "session.reservation",
+  "security.key_wrap",
+  "durable.rpo_zero",
+]
+
+# SessionCtrlV1 commands from an anchor or a coordinator.
+[[ports]]
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# SessionCtrlV1 replies and reservation grants.
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "directory fixture; its log lines are the observable a harness test and a rig read"

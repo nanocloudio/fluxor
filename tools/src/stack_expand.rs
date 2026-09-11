@@ -258,6 +258,11 @@ pub fn expand_platform_stacks(
 ) -> Result<Vec<String>> {
     let mut auto_added = Vec::new();
 
+    // Members placed on another node (`modules[].node`) are lifted out of
+    // the module list first, so every reader from here on — stack
+    // injection included — sees only what this node instantiates.
+    crate::config::lift_remote_members(config)?;
+
     let platform = match config.get("platform") {
         Some(p) => p.clone(),
         None => return Ok(auto_added),

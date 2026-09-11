@@ -336,7 +336,11 @@ pub mod range {
         }
         // `offset < object_size`, so the subtraction can't underflow.
         let max_avail = object_size - offset;
-        let count = if length > max_avail { max_avail } else { length };
+        let count = if length > max_avail {
+            max_avail
+        } else {
+            length
+        };
         Resolved {
             start: offset,
             count,

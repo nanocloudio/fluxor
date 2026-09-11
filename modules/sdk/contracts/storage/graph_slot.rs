@@ -41,19 +41,19 @@
 /// | CFG     | XIP absolute address of live config blob, -1 if no live |
 pub mod channel {
     /// Erase the inactive slot's 128 sectors in one pass. Payload: empty.
-    pub const REQ_ERASE: u32    = super::fnv1a_const(b"gs.erase");
+    pub const REQ_ERASE: u32 = super::fnv1a_const(b"gs.erase");
     /// Program one 256-byte page into the inactive slot.
     /// Payload: `[offset_in_slot: u32 LE][page: 256 bytes]` (260 bytes).
-    pub const REQ_WRITE: u32    = super::fnv1a_const(b"gs.write");
+    pub const REQ_WRITE: u32 = super::fnv1a_const(b"gs.write");
     /// Validate the candidate slot's SHA-256 and (if valid) promote it.
     /// Payload: empty.
     pub const REQ_ACTIVATE: u32 = super::fnv1a_const(b"gs.activate");
     /// Query which slot is currently live. Payload: empty.
-    pub const REQ_ACTIVE: u32   = super::fnv1a_const(b"gs.query_active");
+    pub const REQ_ACTIVE: u32 = super::fnv1a_const(b"gs.query_active");
     /// Query the XIP address of the live slot's config blob. Payload: empty.
-    pub const REQ_CFG: u32      = super::fnv1a_const(b"gs.query_cfg");
+    pub const REQ_CFG: u32 = super::fnv1a_const(b"gs.query_cfg");
     /// Response frame type. Payload: `[req_type: u32 LE][value: i32 LE]`.
-    pub const RESP_RESULT: u32  = super::fnv1a_const(b"gs.result");
+    pub const RESP_RESULT: u32 = super::fnv1a_const(b"gs.result");
 
     /// Frame header size (type + len fields).
     pub const FRAME_HDR: usize = 6;

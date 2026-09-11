@@ -72,5 +72,7 @@ preferred_telemetry = "telemetry.monitor_udp"
 # because the two answer different questions — when an h3 scenario fails,
 # only a transport-only run can say which half is at fault.
 observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load", "observe.proto_load", "observe.quic_mux"]
-power = ["power.cycle"]
+# `power.off` / `power.on` are the halves of the cycle: an out-of-band fence
+# agent cuts the board with `off` and a bench restores it with `on`.
+power = ["power.cycle", "power.off", "power.on"]
 default_timeout_s = 30

@@ -74,22 +74,22 @@ pub const CMD_RUMBLE: u8 = 0x80;
 // mapping byte-for-byte so wasm_browser_gamepad can blit the
 // browser's button array directly.
 
-pub const BTN_A: u8           = 0;   // bottom face button
-pub const BTN_B: u8           = 1;   // right face button
-pub const BTN_X: u8           = 2;   // left face button
-pub const BTN_Y: u8           = 3;   // top face button
-pub const BTN_L1: u8          = 4;   // left shoulder
-pub const BTN_R1: u8          = 5;   // right shoulder
-pub const BTN_L2: u8          = 6;   // left trigger (digital threshold)
-pub const BTN_R2: u8          = 7;   // right trigger (digital threshold)
-pub const BTN_SELECT: u8      = 8;   // back / select
-pub const BTN_START: u8       = 9;   // start / pause
-pub const BTN_L3: u8          = 10;  // left stick click
-pub const BTN_R3: u8          = 11;  // right stick click
-pub const BTN_DPAD_UP: u8     = 12;
-pub const BTN_DPAD_DOWN: u8   = 13;
-pub const BTN_DPAD_LEFT: u8   = 14;
-pub const BTN_DPAD_RIGHT: u8  = 15;
+pub const BTN_A: u8 = 0; // bottom face button
+pub const BTN_B: u8 = 1; // right face button
+pub const BTN_X: u8 = 2; // left face button
+pub const BTN_Y: u8 = 3; // top face button
+pub const BTN_L1: u8 = 4; // left shoulder
+pub const BTN_R1: u8 = 5; // right shoulder
+pub const BTN_L2: u8 = 6; // left trigger (digital threshold)
+pub const BTN_R2: u8 = 7; // right trigger (digital threshold)
+pub const BTN_SELECT: u8 = 8; // back / select
+pub const BTN_START: u8 = 9; // start / pause
+pub const BTN_L3: u8 = 10; // left stick click
+pub const BTN_R3: u8 = 11; // right stick click
+pub const BTN_DPAD_UP: u8 = 12;
+pub const BTN_DPAD_DOWN: u8 = 13;
+pub const BTN_DPAD_LEFT: u8 = 14;
+pub const BTN_DPAD_RIGHT: u8 = 15;
 
 // ── Producer capacity ────────────────────────────────────────────────
 
@@ -102,4 +102,4 @@ pub const MAX_GAMEPADS: usize = 4;
 // ── Mapping kinds (MSG_CONNECTION.mapping) ───────────────────────────
 
 pub const MAPPING_STANDARD: u8 = 0;
-pub const MAPPING_LEGACY: u8   = 1;
+pub const MAPPING_LEGACY: u8 = 1;

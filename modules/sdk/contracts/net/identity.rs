@@ -85,6 +85,66 @@ pub const ADDR_ARM: u8 = 0x62;
 /// be fenced.
 pub const ADDR_FENCE: u8 = 0x63;
 
+// ─── Two providers, one surface ─────────────────────────────────────
+//
+// `fence.enforceable` is answered on this port pair by two kinds of
+// provider, and a continuity declaration needs both
+// (`protocol_surfaces.md` §transport_migratable):
+//
+//   * the **net-identity provider** (`ip`), whose fence closes its own
+//     emission gate — a cutoff at the ring hand-off, or at the wire where
+//     the NIC driver drains on request. It proves what this host has
+//     stopped sending. It cannot prove anything about a host that has
+//     failed, because it is that host.
+//
+//   * an **out-of-band fence agent**, a member of the graph composed from
+//     another node (`modules[].node`), whose fence cuts the whole failure
+//     domain from outside — power, or the fabric port. It answers the same
+//     verbs with these meanings:
+//
+//       `ADDR_ADD`     take custody of the host that owns `addr`, which
+//                      is the only field of the payload an agent reads —
+//                      it binds an actuator to a host, not a route, so
+//                      `prefix_len` and `owner_tag` carry nothing here.
+//                      The token minted on `MSG_ADDR_ADDED` is fresh per
+//                      custody and per boot of the agent, as it is for an
+//                      install, and re-taking custody of a held host mints
+//                      a new one: a coordinator that has taken over cannot
+//                      be fenced by its predecessor's token.
+//       `ADDR_FENCE`   cut. The agent drives its actuator and answers
+//                      `MSG_ADDR_FENCED` only after the actuator confirmed
+//                      the cut AND the domain's hold-up time has passed —
+//                      never on dispatch, and never on the actuator's
+//                      word alone: a host runs on for what its supply
+//                      holds after the relay opens, and a coordinator
+//                      that activated on the relay's word would be
+//                      activating against a host still on the wire.
+//                      `cutoff_kind` is
+//                      `cutoff::WIRE`: a host with no power puts nothing on
+//                      the wire. `cutoff` is the agent's own fence count,
+//                      monotonic for the agent's life, and `generation` is
+//                      the custody generation — the `fence_gen` a failover
+//                      coordinator carries on `CMD_SC_ACTIVATE`. An
+//                      actuator that does not confirm is refused
+//                      `refusal::ACTUATOR`, and the coordinator must not
+//                      activate.
+//       `ADDR_ARM`     restore (power the host back on), or
+//                      `refusal::ACTUATOR` when the actuator cannot.
+//       `ADDR_DEL`     release custody.
+//
+//     An agent's actuator names the host it acts on, so one agent holds
+//     one host and a deployment that fences several composes one per host;
+//     a second address is refused `TABLE_FULL`.
+//
+//     A fence agent declares `cutoff = "wire"` in its manifest's
+//     `[capability_facts."fence.enforceable"]`; the composer admits that
+//     fact only from a member placed on another node, because a cutoff
+//     claimed from inside the failure domain is not evidence about it.
+//
+// A failover coordinator therefore holds one `addr_ctl` / `addr_evt` pair
+// to each provider: it fences the primary's address on the agent, takes
+// the confirmed generation, and only then activates the standby.
+
 /// `ADDR_ADD` flags byte (optional, at `ADD_FLAGS_OFF`).
 pub mod install {
     /// Install fenced; `ADDR_ARM` is required before the address emits.
@@ -102,11 +162,14 @@ pub const MSG_ADDR_ARMED: u8 = 0x71;
 
 /// Emission is fenced. Payload: `[addr: 16][generation: u32 LE]
 /// [cutoff: u64 LE][cutoff_kind: u8][pending_discarded: u8]`. `cutoff` is
-/// the provider's frame counter at the fence: frames numbered below it
-/// were handed to the driver before the fence, none sourced from the
-/// address is handed after. `cutoff_kind` says what the boundary is worth
-/// (see `cutoff`); `pending_discarded` is 1 when a frame from the address
-/// staged for the ring was discarded rather than sent.
+/// the provider's own monotonic index for this fence, so two fences of an
+/// address are distinguishable and ordered: the ip module counts the
+/// frames it has handed over, and nothing sourced from the address is
+/// handed over after the index the fence reports; an out-of-band agent
+/// counts the cuts it has made. `cutoff_kind` says what the boundary is
+/// worth (see `cutoff`); `pending_discarded` is 1 when a frame from the
+/// address staged for the ring was discarded rather than sent, and 0 from
+/// a provider with no ring to stage into.
 pub const MSG_ADDR_FENCED: u8 = 0x72;
 
 /// An install, arm or fence was refused.
@@ -135,16 +198,15 @@ pub mod tx_drain {
 
 /// What a fence's cutoff boundary is worth — the `fence.enforceable`
 /// capability's `cutoff` fact, carried on every `MSG_ADDR_FENCED`.
-/// `MSG_ADDR_FENCED`'s 8-byte cutoff index is the ip module's frame
-/// counter at the hand-off under `RING_HANDOFF`, and the driver's
-/// completed transmit count under `WIRE`.
 pub mod cutoff {
     /// The boundary is the hand-off to the driver's ring: nothing from the
     /// address is handed over after it, but frames already in the ring may
     /// still leave. What the ip module alone can prove.
     pub const RING_HANDOFF: u8 = 0;
-    /// The boundary is the wire: a driver that drains and reports its
-    /// completed transmit index proves no later frame left the NIC.
+    /// The boundary is the wire. A driver that drains on request and
+    /// reports its completed transmit index proves no later frame left the
+    /// NIC; an out-of-band agent proves it by cutting the host, which puts
+    /// nothing on the wire at all.
     pub const WIRE: u8 = 1;
 }
 
@@ -161,6 +223,10 @@ pub mod refusal {
     pub const NO_ENTROPY: u8 = 4;
     /// The address table is full.
     pub const TABLE_FULL: u8 = 5;
+    /// An out-of-band fence agent's actuator did not confirm the cut (or
+    /// the restore): the host's state is unknown, and a coordinator must
+    /// not activate a standby on it.
+    pub const ACTUATOR: u8 = 6;
 }
 
 // ─── Payload layout ─────────────────────────────────────────────────

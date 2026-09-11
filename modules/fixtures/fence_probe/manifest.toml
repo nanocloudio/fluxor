@@ -3,18 +3,33 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 # Its schedule is wall-clock seconds after boot.
 timer_class = "wall_clock"
 
-# Fixture writer for the ip module's address-control port: installs one
-# secondary address armed, waits `fence_after_s`, then fences it with the
-# token the install minted. Everything it does is logged so a packet
-# capture can be aligned against it:
+# Fixture writer for the address-control surface
+# (`modules/sdk/contracts/net/identity.rs`): it claims one address,
+# waits `fence_after_s`, then fences it with the token the claim minted.
+# Either provider of that surface answers it — the ip module, where the
+# claim installs a secondary local address on this host, or an out-of-band
+# fence agent, where it takes custody of the host that owns the address —
+# so the same probe drives a local emission fence and a power cut.
 #
-#   [fence_probe] installed <ip>            the address answers from now
-#   [fence_probe] fence requested           the gate closes here
+# Everything it does is logged, so a packet capture can be aligned against
+# it:
+#
+#   [fence_probe] installed <ip>            the address is claimed
+#   [fence_probe] fence requested           the fence was asked for
 #   [fence_probe] fenced cutoff=<kind> index=<n>
+#   [fence_probe] refused reason=<r>
 #
-# `cutoff` is `wire` when the NIC driver confirmed the drain and
-# `ring_handoff` otherwise. The pass rule for the capture is that no frame
-# sourced from `<ip>` appears after the `fence requested` line.
+# `cutoff` is `wire` where the provider can prove the wire — the NIC
+# driver confirmed its transmit drain, or the agent's actuator cut the
+# host — and `ring_handoff` where the ip module can only promise its own
+# hand-off to the driver ring.
+#
+# The `fenced` line is the cutoff a capture is read against: no frame
+# sourced from `<ip>` may follow it. How long it trails the request is the
+# provider's business — the ip module closes its gate as it takes the
+# request and holds the event only while the driver drains, while an agent
+# answers once its actuator has cut the host and the host's hold-up has
+# passed.
 
 [[ports]]
 name = "addr_ctl_out"
