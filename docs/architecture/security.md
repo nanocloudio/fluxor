@@ -336,9 +336,7 @@ a disagreement between signer and verifier over FIPS 204 or FIPS 202 is not
 expressible. Both files derive their constants — Keccak's round constants
 and rho offsets from the FIPS 202 recurrences, the NTT twiddles from
 ζ = 1753 — instead of shipping the tables a reference implementation would,
-because a position-independent module cannot relocate an absolute address in
-`.rodata`. See `modules/sdk/crypto/p256.rs` for the same constraint solved
-the same way.
+so the definitions in the standard are what the code runs.
 
 ## Related Documentation
 

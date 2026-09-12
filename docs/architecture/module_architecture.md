@@ -263,6 +263,20 @@ The runtime loader enforces a concrete module binary contract:
   [network_boot.md](network_boot.md) for the deployment-time use of the
   same signing key.
 
+#### Position-independent data
+
+A module image is placed at a load-time address and the loader applies
+no relocations, so the image may contain no absolute address. Scalar
+data is safe: a `static` or `const` table of integers or bytes lives in
+`.rodata` and is reached PC-relative (`adrp` plus page offset on
+aarch64, a PC-relative literal on thumb, a fixed linear-memory offset
+on wasm32). The packer keeps every module's code page-aligned so the
+`adrp` pair resolves at any load address. What is not safe is a table
+that *contains* addresses: a `const` array of `&[u8]` or function
+pointers materialises absolute addresses that are never fixed up, and
+LLVM's switch-table dispatch has the same shape. Return such references
+from a `fn` with a `match` instead, so the address is computed in code.
+
 Module sources include the SDK via the standard pattern:
 
 ```rust

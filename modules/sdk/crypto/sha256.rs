@@ -1,92 +1,33 @@
-// SHA-256 implementation (FIPS 180-4)
-// Pure Rust, no_std, no heap. Round constants are materialised on the stack
-// via per-word volatile stores; PIC aarch64 modules cannot rely on
-// ADRP-based loads from .rodata for a `const [u32; 64]` array.
+// SHA-256 (FIPS 180-4). Pure Rust, no_std, no heap, no panic path.
+//
+// The round constants are a static table. A position-independent module
+// reaches it PC-relative on every target (`adrp` + page offset on
+// aarch64, a PC-relative literal on thumb, a fixed data-segment offset
+// on wasm32), so the table needs no relocation and costs nothing per
+// block. The module packer keeps module code page-aligned, which is the
+// one placement guarantee `adrp` addressing depends on.
+//
+// Compression runs on the ARMv8 SHA-256 instructions when the compiling
+// unit has `target_feature = "sha2"` — the bcm2712 module build passes
+// it, as do the aarch64 kernel builds — and on the scalar rounds
+// everywhere else. The gate is the feature, not the architecture: an
+// aarch64 build without the extension compiles the scalar path rather
+// than an instruction the core may not have.
+//
+// The hasher is incremental and resumable: `update` may be called across
+// bounded module steps, and `Clone` snapshots a running hash.
 
-/// Load SHA-256 round constants into a stack buffer via per-word volatile
-/// writes. Each store goes through `k256_store` (`#[inline(never)]`) so
-/// LLVM cannot batch them into a NEON literal-pool load.
-#[inline(never)]
-fn load_k256() -> [u32; 64] {
-    let mut k = [0u32; 64];
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    unsafe {
-        let p = k.as_mut_ptr();
-        k256_store(p, 0, 0x428a2f98);
-        k256_store(p, 1, 0x71374491);
-        k256_store(p, 2, 0xb5c0fbcf);
-        k256_store(p, 3, 0xe9b5dba5);
-        k256_store(p, 4, 0x3956c25b);
-        k256_store(p, 5, 0x59f111f1);
-        k256_store(p, 6, 0x923f82a4);
-        k256_store(p, 7, 0xab1c5ed5);
-        k256_store(p, 8, 0xd807aa98);
-        k256_store(p, 9, 0x12835b01);
-        k256_store(p, 10, 0x243185be);
-        k256_store(p, 11, 0x550c7dc3);
-        k256_store(p, 12, 0x72be5d74);
-        k256_store(p, 13, 0x80deb1fe);
-        k256_store(p, 14, 0x9bdc06a7);
-        k256_store(p, 15, 0xc19bf174);
-        k256_store(p, 16, 0xe49b69c1);
-        k256_store(p, 17, 0xefbe4786);
-        k256_store(p, 18, 0x0fc19dc6);
-        k256_store(p, 19, 0x240ca1cc);
-        k256_store(p, 20, 0x2de92c6f);
-        k256_store(p, 21, 0x4a7484aa);
-        k256_store(p, 22, 0x5cb0a9dc);
-        k256_store(p, 23, 0x76f988da);
-        k256_store(p, 24, 0x983e5152);
-        k256_store(p, 25, 0xa831c66d);
-        k256_store(p, 26, 0xb00327c8);
-        k256_store(p, 27, 0xbf597fc7);
-        k256_store(p, 28, 0xc6e00bf3);
-        k256_store(p, 29, 0xd5a79147);
-        k256_store(p, 30, 0x06ca6351);
-        k256_store(p, 31, 0x14292967);
-        k256_store(p, 32, 0x27b70a85);
-        k256_store(p, 33, 0x2e1b2138);
-        k256_store(p, 34, 0x4d2c6dfc);
-        k256_store(p, 35, 0x53380d13);
-        k256_store(p, 36, 0x650a7354);
-        k256_store(p, 37, 0x766a0abb);
-        k256_store(p, 38, 0x81c2c92e);
-        k256_store(p, 39, 0x92722c85);
-        k256_store(p, 40, 0xa2bfe8a1);
-        k256_store(p, 41, 0xa81a664b);
-        k256_store(p, 42, 0xc24b8b70);
-        k256_store(p, 43, 0xc76c51a3);
-        k256_store(p, 44, 0xd192e819);
-        k256_store(p, 45, 0xd6990624);
-        k256_store(p, 46, 0xf40e3585);
-        k256_store(p, 47, 0x106aa070);
-        k256_store(p, 48, 0x19a4c116);
-        k256_store(p, 49, 0x1e376c08);
-        k256_store(p, 50, 0x2748774c);
-        k256_store(p, 51, 0x34b0bcb5);
-        k256_store(p, 52, 0x391c0cb3);
-        k256_store(p, 53, 0x4ed8aa4a);
-        k256_store(p, 54, 0x5b9cca4f);
-        k256_store(p, 55, 0x682e6ff3);
-        k256_store(p, 56, 0x748f82ee);
-        k256_store(p, 57, 0x78a5636f);
-        k256_store(p, 58, 0x84c87814);
-        k256_store(p, 59, 0x8cc70208);
-        k256_store(p, 60, 0x90befffa);
-        k256_store(p, 61, 0xa4506ceb);
-        k256_store(p, 62, 0xbef9a3f7);
-        k256_store(p, 63, 0xc67178f2);
-    }
-    k
-}
-
-/// Single u32 volatile store. `#[inline(never)]` keeps LLVM from batching
-/// adjacent stores into a NEON literal load.
-#[inline(never)]
-unsafe fn k256_store(base: *mut u32, idx: usize, val: u32) {
-    core::ptr::write_volatile(base.add(idx), val);
-}
+#[rustfmt::skip]
+static K256: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
 
 #[derive(Clone)]
 pub struct Sha256 {
@@ -122,9 +63,10 @@ impl Default for Sha256 {
 impl Sha256 {
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
-        self.total_len += data.len() as u64;
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
 
-        // Fill buffer if partially full
+        // Top up a partial block first. `buf_len` is below 64 between
+        // calls, so `space` is at least 1.
         if self.buf_len > 0 {
             let space = 64 - self.buf_len;
             let take = if data.len() < space {
@@ -132,12 +74,15 @@ impl Sha256 {
             } else {
                 space
             };
-            let dst = self.buf.as_mut_ptr();
-            let src = data.as_ptr();
-            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-            // loop invariant `i < N` keeps offsets in range.
+            // SAFETY: `take <= space = 64 - buf_len`, so the destination
+            // range stays inside `buf`; `take <= data.len()` bounds the
+            // source; the two buffers are distinct allocations.
             unsafe {
-                core::ptr::copy_nonoverlapping(src, dst.add(self.buf_len), take);
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    self.buf.as_mut_ptr().add(self.buf_len),
+                    take,
+                );
             }
             self.buf_len += take;
             offset = take;
@@ -149,11 +94,11 @@ impl Sha256 {
             }
         }
 
-        // Process full blocks
+        // Whole blocks straight from the input.
         while offset + 64 <= data.len() {
             let mut block = [0u8; 64];
-            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-            // loop invariant `i < N` keeps offsets in range.
+            // SAFETY: `offset + 64 <= data.len()` bounds the source; the
+            // destination is a fresh 64-byte stack array.
             unsafe {
                 core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), 64);
             }
@@ -161,11 +106,11 @@ impl Sha256 {
             offset += 64;
         }
 
-        // Buffer remainder
+        // Hold the tail, which is shorter than a block.
         let remain = data.len() - offset;
         if remain > 0 {
-            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-            // loop invariant `i < N` keeps offsets in range.
+            // SAFETY: `remain < 64` fits `buf`, which is empty here;
+            // `offset + remain == data.len()` bounds the source.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     data.as_ptr().add(offset),
@@ -178,22 +123,23 @@ impl Sha256 {
     }
 
     pub fn finalize(mut self) -> [u8; 32] {
-        let bit_len = self.total_len * 8;
+        let bit_len = self.total_len.wrapping_mul(8);
 
-        // Padding
-        self.buf[self.buf_len] = 0x80;
+        // Padding: a 1 bit, zeros to 56 mod 64, then the bit length.
+        // `buf_len < 64` on entry, so the marker always fits.
+        let p = self.buf.as_mut_ptr();
+        // SAFETY: `buf_len < 64` keeps the write inside `buf`.
+        unsafe {
+            *p.add(self.buf_len) = 0x80;
+        }
         self.buf_len += 1;
 
         if self.buf_len > 56 {
-            // Zero rest of current block
-            let dst = self.buf.as_mut_ptr();
-            // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-            // loop invariant `i < N` keeps offsets in range.
+            // SAFETY: zeroes `buf[buf_len..64]`, inside `buf`.
             unsafe {
-                let p = dst.add(self.buf_len);
                 let n = 64 - self.buf_len;
                 for i in 0..n {
-                    core::ptr::write_volatile(p.add(i), 0);
+                    *p.add(self.buf_len + i) = 0;
                 }
             }
             let block = self.buf;
@@ -201,28 +147,22 @@ impl Sha256 {
             self.buf_len = 0;
         }
 
-        // Zero up to length field
-        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-        // loop invariant `i < N` keeps offsets in range.
+        // SAFETY: zeroes `buf[buf_len..56]`; `buf_len <= 56` here.
         unsafe {
-            let p = self.buf.as_mut_ptr().add(self.buf_len);
             let n = 56 - self.buf_len;
             for i in 0..n {
-                core::ptr::write_volatile(p.add(i), 0);
+                *p.add(self.buf_len + i) = 0;
             }
         }
 
-        // Append bit length (big-endian)
         let len_bytes = bit_len.to_be_bytes();
-        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-        // loop invariant `i < N` keeps offsets in range.
+        // SAFETY: writes `buf[56..64]` from an 8-byte source.
         unsafe {
-            core::ptr::copy_nonoverlapping(len_bytes.as_ptr(), self.buf.as_mut_ptr().add(56), 8);
+            core::ptr::copy_nonoverlapping(len_bytes.as_ptr(), p.add(56), 8);
         }
         let block = self.buf;
         compress(&mut self.state, &block);
 
-        // Output
         let mut out = [0u8; 32];
         let mut i = 0;
         while i < 8 {
@@ -242,45 +182,41 @@ impl Sha256 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
-    // SAFETY: `compress_neon` is gated on `target_feature = "sha2"`,
-    // which the pi5 board (Cortex-A76) provides.
-    unsafe { compress_neon(state, block) };
+    // SAFETY: this arm exists only when the unit is compiled with the
+    // `sha2` feature, so the core the build targets has the
+    // instructions `compress_sha2` is specialised on.
+    unsafe { compress_sha2(state, block) }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
-    compress_scalar(state, block);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "sha2")]
-#[inline]
-unsafe fn compress_neon(state: &mut [u32; 8], block: &[u8; 64]) {
+// The attribute is what lets the intrinsics be called as plain
+// instructions. What stays unsafe inside is the raw-pointer traffic,
+// bounded as noted at each use.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
+#[target_feature(enable = "sha2,neon")]
+unsafe fn compress_sha2(state: &mut [u32; 8], block: &[u8; 64]) {
     use core::arch::aarch64::{
         uint32x4_t, vaddq_u32, vld1q_u32, vld1q_u8, vreinterpretq_u32_u8, vrev32q_u8,
         vsha256h2q_u32, vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
     };
-    // Round constants packed into 16 vectors of 4 u32 each.
-    // Loaded onto the stack so PIC modules don't need ADRP-based
-    // .rodata access (the scalar path's reasoning applies here too).
-    let k_raw = load_k256();
-    let kp = k_raw.as_ptr();
-    let kv = |i: usize| vld1q_u32(kp.add(i * 4));
 
-    // Initial hash state.
+    let kp = K256.as_ptr();
+    // SAFETY: `i < 16`, so `i * 4 + 3 < 64` stays inside `K256`.
+    let kv = |i: usize| unsafe { vld1q_u32(kp.add(i * 4)) };
+
     let sp = state.as_ptr();
-    let mut abcd: uint32x4_t = vld1q_u32(sp);
-    let mut efgh: uint32x4_t = vld1q_u32(sp.add(4));
+    // SAFETY: two 4-lane loads cover exactly the 8 words of `state`.
+    let (mut abcd, mut efgh): (uint32x4_t, uint32x4_t) =
+        unsafe { (vld1q_u32(sp), vld1q_u32(sp.add(4))) };
     let abcd_save = abcd;
     let efgh_save = efgh;
 
-    // Load message block, byte-swap each u32 (the FIPS schedule is
-    // big-endian; `vrev32q_u8` reverses within each u32 lane).
+    // The schedule is big-endian; `vrev32q_u8` swaps within each lane.
     let bp = block.as_ptr();
     let load_be = |off: usize| -> uint32x4_t {
-        let v = vld1q_u8(bp.add(off));
+        // SAFETY: `off` is one of 0, 16, 32, 48, so `off + 15 < 64`.
+        let v = unsafe { vld1q_u8(bp.add(off)) };
         vreinterpretq_u32_u8(vrev32q_u8(v))
     };
     let mut w0 = load_be(0);
@@ -288,10 +224,9 @@ unsafe fn compress_neon(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w2 = load_be(32);
     let mut w3 = load_be(48);
 
-    // 16 quarter-rounds = 64 SHA-256 rounds. Each iteration does 4
-    // rounds via the SHA-2 intrinsics (vsha256hq + vsha256h2q) and
-    // updates the message schedule for the next 4-round window
-    // (vsha256su0q + vsha256su1q) until the last 4 rounds.
+    // 16 quarter-rounds of 4 rounds each. Every iteration runs the two
+    // hash instructions and extends the schedule for the window four
+    // rounds ahead, until the last three windows need no extension.
     let mut prev: uint32x4_t;
 
     // Rounds 0-3
@@ -387,8 +322,7 @@ unsafe fn compress_neon(state: &mut [u32; 8], block: &[u8; 64]) {
     w1 = vsha256su1q_u32(w1, w3, w0);
     w2 = vsha256su0q_u32(w2, w3);
 
-    // Rounds 48-51 (no more schedule updates needed; last 4
-    // 4-round chunks use the already-extended w0..w3).
+    // Rounds 48-51
     msg = vaddq_u32(w0, kv(12));
     prev = abcd;
     abcd = vsha256hq_u32(abcd, efgh, msg);
@@ -415,26 +349,27 @@ unsafe fn compress_neon(state: &mut [u32; 8], block: &[u8; 64]) {
     abcd = vsha256hq_u32(abcd, efgh, msg);
     efgh = vsha256h2q_u32(efgh, prev, msg);
 
-    // Fold into the original state and write back.
     abcd = vaddq_u32(abcd, abcd_save);
     efgh = vaddq_u32(efgh, efgh_save);
     let smp = state.as_mut_ptr();
-    vst1q_u32(smp, abcd);
-    vst1q_u32(smp.add(4), efgh);
+    // SAFETY: two 4-lane stores cover exactly the 8 words of `state`.
+    unsafe {
+        vst1q_u32(smp, abcd);
+        vst1q_u32(smp.add(4), efgh);
+    }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn compress_scalar(state: &mut [u32; 8], block: &[u8; 64]) {
-    let k = load_k256();
+#[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
 
-    // Load message schedule via pointer arithmetic (no bounds checks).
+    // Message schedule, big-endian words.
     let mut i = 0;
     let bp = block.as_ptr();
     let wp = w.as_mut_ptr();
     while i < 16 {
-        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-        // loop invariant `i < N` keeps offsets in range.
+        // SAFETY: `i < 16`, so `i * 4 + 3 < 64` reads inside `block`
+        // and `i < 64` writes inside `w`.
         unsafe {
             let off = i * 4;
             let b0 = *bp.add(off) as u32;
@@ -446,10 +381,9 @@ fn compress_scalar(state: &mut [u32; 8], block: &[u8; 64]) {
         i += 1;
     }
 
-    // Extend.
     while i < 64 {
-        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-        // loop invariant `i < N` keeps offsets in range.
+        // SAFETY: `16 <= i < 64`, so every index `i - 16 ..= i` is
+        // inside `w`.
         unsafe {
             let w15 = *wp.add(i - 15);
             let w2 = *wp.add(i - 2);
@@ -462,41 +396,20 @@ fn compress_scalar(state: &mut [u32; 8], block: &[u8; 64]) {
         i += 1;
     }
 
-    let sp = state.as_ptr();
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut a = unsafe { *sp.add(0) };
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut b = unsafe { *sp.add(1) };
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut c = unsafe { *sp.add(2) };
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut d = unsafe { *sp.add(3) };
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut e = unsafe { *sp.add(4) };
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut f = unsafe { *sp.add(5) };
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut g = unsafe { *sp.add(6) };
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    let mut h = unsafe { *sp.add(7) };
+    let mut a = state[0];
+    let mut b = state[1];
+    let mut c = state[2];
+    let mut d = state[3];
+    let mut e = state[4];
+    let mut f = state[5];
+    let mut g = state[6];
+    let mut h = state[7];
 
-    let kp = k.as_ptr();
+    let kp = K256.as_ptr();
     i = 0;
     while i < 64 {
-        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-        // loop invariant `i < N` keeps offsets in range.
-        let ki = unsafe { *kp.add(i) };
-        // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-        // loop invariant `i < N` keeps offsets in range.
-        let wi = unsafe { *wp.add(i) };
+        // SAFETY: `i < 64` indexes inside both `K256` and `w`.
+        let (ki, wi) = unsafe { (*kp.add(i), *wp.add(i)) };
         let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
         let ch = (e & f) ^ ((!e) & g);
         let temp1 = h
@@ -519,19 +432,14 @@ fn compress_scalar(state: &mut [u32; 8], block: &[u8; 64]) {
         i += 1;
     }
 
-    let smp = state.as_mut_ptr();
-    // SAFETY: pointer arithmetic over fixed-size stack-local arrays;
-    // loop invariant `i < N` keeps offsets in range.
-    unsafe {
-        *smp.add(0) = (*smp.add(0)).wrapping_add(a);
-        *smp.add(1) = (*smp.add(1)).wrapping_add(b);
-        *smp.add(2) = (*smp.add(2)).wrapping_add(c);
-        *smp.add(3) = (*smp.add(3)).wrapping_add(d);
-        *smp.add(4) = (*smp.add(4)).wrapping_add(e);
-        *smp.add(5) = (*smp.add(5)).wrapping_add(f);
-        *smp.add(6) = (*smp.add(6)).wrapping_add(g);
-        *smp.add(7) = (*smp.add(7)).wrapping_add(h);
-    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
 }
 
 /// Compute SHA-256 hash of data in one shot.

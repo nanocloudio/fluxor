@@ -22,6 +22,14 @@ SHELL       := /bin/bash
 HOST_TRIPLE := $(shell rustc -vV | sed -n 's/^host: //p')
 HOST_DIR    := target/$(HOST_TRIPLE)/release
 LAUNCHER    ?= $(HOST_DIR)/fluxor-launcher
+# The aarch64 host kernel is compiled with the same ARMv8 crypto
+# extensions as the bcm2712 modules it loads (targets/host/linux.toml).
+# RUSTFLAGS reaches the kernel library crate as well as the binary, and
+# cargo keys the artefact set on it, so the tools build is undisturbed.
+# Set only on aarch64 hosts: an empty RUSTFLAGS would replace the
+# per-target flags in `.cargo/config.toml`.
+comma := ,
+KERNEL_RUSTFLAGS := $(if $(findstring aarch64,$(HOST_TRIPLE)),RUSTFLAGS="-C target-feature=+aes$(comma)+sha2$(comma)+neon",)
 BINDIR      ?= $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)/bin
 TARGET      ?= rp2350
 
@@ -83,7 +91,7 @@ clean:
 # rebuild is picked up with no re-install.
 install:
 	cargo build --release -p fluxor-tools -p fluxor-launcher --target $(HOST_TRIPLE)
-	cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback,host-hsm --target $(HOST_TRIPLE)
+	$(KERNEL_RUSTFLAGS) cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback,host-hsm --target $(HOST_TRIPLE)
 	$(HOST_DIR)/fluxor publish --only runtime
 	install -D -m755 $(LAUNCHER) $(BINDIR)/fluxor
 	@mkdir -p $(RIG_BACKEND_DIR)

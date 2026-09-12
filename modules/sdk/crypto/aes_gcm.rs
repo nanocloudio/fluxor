@@ -28,12 +28,13 @@
 // PMULL implementation — but scalar here means branchless, not
 // variable-time.
 //
-// `target_feature = "aes"` is set only for the bcm2712 module build
+// `target_feature = "aes"` is set for the bcm2712 module build
 // (`tools/src/modules_build.rs` appends `-C
-// target-feature=+aes,+sha2,+neon`). Every other build — the Linux
-// host build including on aarch64 hosts, wasm32, rp2040, rp2350 —
-// compiles the scalar path, because rustc does not infer the build
-// host's CPU features without `-C target-cpu=native`.
+// target-feature=+aes,+sha2,+neon`) and for the aarch64 kernel builds,
+// which do not compile this file. Every other build — the host test
+// harness including on aarch64 hosts, wasm32, rp2040, rp2350 — compiles
+// the scalar path, because rustc does not infer the build host's CPU
+// features without `-C target-cpu=native`.
 //
 // Callers that need a portable AEAD with no key-dependent memory
 // addressing and no key-dependent branches should select
@@ -174,16 +175,15 @@ impl AesKey {
         // and every Pi-class A-core ships +crypto; the gate keeps
         // QEMU-unknown / older Cortex-A53 hosts honest.
         //
-        // The feature is set for exactly one build: the bcm2712 PIC
-        // module build, whose RUSTFLAGS carry `-C
-        // target-feature=+aes`. It is NOT set for the Linux host
-        // build even on a Pi 5, because rustc reports only the
+        // The feature is set for one build that compiles this file:
+        // the bcm2712 PIC module build, whose RUSTFLAGS carry `-C
+        // target-feature=+aes`. It is NOT set for the host test
+        // harness even on a Pi 5, because rustc reports only the
         // target triple's baseline features (aarch64 baseline is
-        // `neon` alone) unless `-C target-cpu=native` is given, and
-        // no build in this tree gives it. Host tests, wasm32,
-        // rp2040 and rp2350 therefore all execute the scalar path,
-        // with the S-box cache-timing exposure documented at the top
-        // of this file.
+        // `neon` alone) unless a build asks for more, and the
+        // harness does not. Host tests, wasm32, rp2040 and rp2350
+        // therefore all execute the scalar path, with the S-box
+        // cache-timing exposure documented at the top of this file.
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         unsafe {
             encrypt_block_aarch64_aes(block, &self.round_keys, self.rounds);
@@ -505,9 +505,9 @@ pub const GCM_TAG_LEN: usize = 16;
 /// key-dependent byte. GHASH is branchless regardless, so this
 /// constant describes the block cipher only.
 ///
-/// True for exactly one build: the bcm2712 PIC module build. The
-/// Linux host build (including on a Pi 5), wasm32, rp2040 and rp2350
-/// are all false.
+/// True for exactly one build of this file: the bcm2712 PIC module
+/// build. The host test harness (including on a Pi 5), wasm32, rp2040
+/// and rp2350 are all false.
 pub const AES_IS_CONSTANT_TIME: bool =
     cfg!(all(target_arch = "aarch64", target_feature = "aes"));
 

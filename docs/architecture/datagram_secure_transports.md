@@ -68,9 +68,13 @@ include!("../../sdk/crypto/aes_gcm.rs");
 include!("../../sdk/crypto/hmac.rs");
 ```
 
-Every primitive uses raw-pointer writes or `write_volatile` to avoid
-ADRP-based const loads that miscompile on PIC aarch64, and callers
-follow the same discipline in code that touches crypto state.
+Every primitive is `no_std` and allocation-free, and the signing,
+key-agreement and AEAD primitives zeroise their intermediate secrets
+with `write_volatile` before returning; callers follow the same
+discipline in code that touches crypto state. Constant tables are plain
+`static` data: a module reaches them PC-relative, so they need no
+relocation (see [module_architecture.md](module_architecture.md),
+"Position-independent data").
 
 `modules/sdk/wire/varint.rs` implements RFC 9000 §16 variable-length
 integers (1, 2, 4, or 8 bytes; maximum value 2^62 − 1). The same

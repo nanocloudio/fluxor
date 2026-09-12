@@ -69,9 +69,8 @@
 // signatures to low-s form. Intermediate secrets are zeroised via
 // volatile writes before returning from each primitive.
 //
-// Curve constants are loaded via `pic_u256` (u32 immediates assembled on
-// the stack). PIC aarch64 modules cannot use ADRP-based literal pool
-// loads, so `const [u64; 4]` arrays in .rodata miscompile.
+// Curve constants are assembled on the stack from u32 immediates by
+// `pic_u256`, one `load_*` call per use.
 
 /// Load P-256 prime.
 #[inline(never)]

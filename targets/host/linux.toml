@@ -1,6 +1,10 @@
 # Linux host — fluxor as a userspace process on aarch64 Linux.
 # Host-level target: not a silicon, not a board (targets/host/).
 # No real hardware peripherals; modules communicate via kernel channels.
+#
+# The host CPU must carry the ARMv8 Cryptography Extension (FEAT_AES,
+# FEAT_SHA256): the bcm2712 modules this host loads and its own kernel
+# binary are compiled with `+aes,+sha2,+neon`.
 
 [target]
 id = "linux"

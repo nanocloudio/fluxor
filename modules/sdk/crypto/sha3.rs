@@ -16,11 +16,8 @@
 // where the last stopped.
 //
 // NO CONSTANT TABLES. Keccak's round constants and rotation offsets are
-// normally shipped as `const [u64; 24]` / `const [u32; 24]` arrays, and
-// PIC aarch64 modules cannot use ADRP-based literal pool loads, so those
-// arrays miscompile in .rodata — the same constraint that makes p256.rs
-// assemble its curve constants with `pic_u256`. Here the constants are
-// not assembled but DERIVED, because FIPS 202 defines them by
+// normally shipped as `const [u64; 24]` / `const [u32; 24]` arrays. Here
+// the constants are DERIVED instead, because FIPS 202 defines them by
 // construction rather than by table:
 //
 //   - round constants come from the §3.2.5 LFSR (x^8+x^6+x^5+x^4+1),
@@ -29,8 +26,7 @@
 //     (x, y) -> (y, 2x+3y), both walked by the §3.2.2/§3.2.3 recurrence
 //     from lane (1, 0).
 //
-// So the definitions in the standard are what the code runs, and there is
-// nothing in .rodata to relocate.
+// So the definitions in the standard are what the code runs.
 //
 // Endianness: FIPS 202 lanes are little-endian, which is what the target
 // is, so absorb/squeeze go through `u64::from_le_bytes` / `to_le_bytes`

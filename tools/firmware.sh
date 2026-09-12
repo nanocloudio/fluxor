@@ -38,6 +38,16 @@ if [[ "$TARGET" == wasm ]]; then
     exit 0
 fi
 
+# The aarch64 kernel is compiled with the same ARMv8 crypto extensions
+# as the bcm2712 modules it loads (`tools/src/modules_build.rs`): the
+# silicon is a Cortex-A76, and the SDK primitives select their SHA-256
+# and AES instruction paths on `target_feature`, not on the architecture.
+# RUSTFLAGS is set only for aarch64: even an empty RUSTFLAGS replaces
+# the per-target flags in `.cargo/config.toml`, which the rp kernels
+# link with.
+case "$RUST_TARGET" in
+  aarch64-*) export RUSTFLAGS="-C target-feature=+aes,+sha2,+neon" ;;
+esac
 cargo build --release --target "$RUST_TARGET" --no-default-features --features "$FEATURES"
 
 case "$TARGET" in

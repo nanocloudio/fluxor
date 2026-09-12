@@ -1,6 +1,10 @@
 # BCM2712 — Raspberry Pi 5 / Compute Module 5
 # Quad Cortex-A76 @ 2.4 GHz, aarch64
 #
+# The core carries the ARMv8 Cryptography Extension (FEAT_AES, FEAT_SHA256);
+# modules and the kernel are compiled with `+aes,+sha2,+neon` and the SDK's
+# AES and SHA-256 select their instruction paths on those features.
+#
 # Silicon-level facts only. The concrete memory map is a board/emulator fact
 # and lives in the board overlay (`targets/boards/qemu-virt.toml` carries the
 # QEMU virt RAM map; a real board's RAM origin is selected by its `board-*`
