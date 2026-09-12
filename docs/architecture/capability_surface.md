@@ -264,9 +264,9 @@ model these support):
 | Capability | Meaning |
 |------------|---------|
 | `transport.anchor.stream` | Stable stream-facing transport anchor |
-| `transport.anchor.stream.secure` | Stable secure stream-facing anchor |
+| `transport.anchor.stream.secure` | Stable secure stream-facing anchor. tls declares `aead = "implicit_counter"` with `horizon = "exact"` |
 | `transport.anchor.datagram` | Stable datagram-facing anchor |
-| `transport.anchor.mux` | Stable multiplexed-session anchor |
+| `transport.anchor.mux` | Stable multiplexed-session anchor. quic declares `aead = "on_wire_sequence"` |
 | `session.worker` | Movable session / application worker |
 | `session.directory` | Placement and continuity metadata service |
 | `session.resume` | Resumable session state support. Facts `scope` (`local`: the ticket names state only the minting host holds; `fleet`: the ticket is the state, sealed under a vault key any admitted host with that generation opens) and `early_data` (`off`, or `local_single_use` against the minting host's single-use record). quic declares `local` / `local_single_use` |
@@ -275,6 +275,19 @@ model these support):
 | `security.key_wrap` | Session-key custody wrapped under a KEK the storage layer cannot read |
 | `fence.enforceable` | Emission fence for a local address: after the fence answers, nothing sourced from the address is handed onward, and ARP for it is not answered. Fact `cutoff`: `ring_handoff` (the ip module's boundary — frames already in the driver ring may still leave) or `wire` (the driver drained on request and reported its completed transmit count). Provided by `ip` over the `net::identity` `ADDR_FENCE` verb with a per-install token minted from the CSPRNG and the boot incarnation; the manifest declares `ring_handoff` and the composer raises it to `wire` on a target whose NIC driver answers the `tx_drain` query (bcm2712). An out-of-band fence agent — a member placed on another node whose cut is power or the fabric port, `modules/fixtures/fence_agent/` being the reference — answers the same verbs and declares `wire` for itself |
 | `durable.rpo_zero` | Synchronous quorum-durable-before-acknowledge write path for security-relevant session state |
+
+The anchor roles share one fact schema, declared on the
+`transport.anchor` parent they descend from rather than repeated on each.
+`aead` states what protects the records the peer is shown, and so whether a
+taken-over sender may skip its counter forward: `on_wire_sequence`, where
+the peer reads each record's sequence from the record itself and a skip is
+legal; `implicit_counter`, where both peers count in lockstep and a skip
+fails the peer's decrypt; or `unencrypted`, where there is no counter to
+protect. `horizon` is what an implicit-counter anchor must state to reach
+replicated-anchor continuity at all: `exact`, where nothing is shown to the
+peer until the standby has confirmed it holds that transition, so a
+takeover resumes on the counter the peer is actually at; or `cut`, where
+only the checkpoint cut is exact and the mirror runs behind it.
 
 Target-provided:
 
@@ -524,10 +537,14 @@ as graph structure:
   `protocol_surfaces.md` §Remote Channels and Placement) — a local
   cutoff alone never confirms a hung host quiet, and a module on this
   node declaring `wire` is refused by name. The anchor is never a placed
-  member. An
-  `implicit_counter` AEAD class is rejected outright: an
-  implicit-contiguous AEAD counter cannot skip forward on takeover, so
-  that transport's honest ceiling is `resumable`.
+  member. The declared `aead` must equal the anchor's own
+  `transport.anchor` `aead` fact — the declaration names the anchor's
+  AEAD class, it does not choose it, and an anchor stating none is
+  refused. `implicit_counter` is admitted only through an anchor
+  declaring `horizon = "exact"`: an implicit-contiguous AEAD counter
+  cannot skip forward on takeover, so without a mirror that holds each
+  record before the peer is shown it, that transport's honest ceiling
+  is `resumable`.
 
 These checks establish the presence of a capability, not its correctness
 under fault. Mechanism and AEAD fields are only valid on

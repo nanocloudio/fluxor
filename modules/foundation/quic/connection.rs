@@ -1151,6 +1151,16 @@ pub struct QuicConnection {
     pub cont_last_digest: [u8; 32],
     /// Delta whose DELTA_ACK releases the held 1-RTT packet.
     pub cont_held_delta: u32,
+    /// The held packet may go: its delta is confirmed, or the mirror ended
+    /// under it. Held bytes are never dropped — a packet number was spent
+    /// on them — so this survives a wire that is momentarily full and the
+    /// per-step service retries until it takes them.
+    pub cont_held_confirmed: bool,
+    /// Steps a strict horizon has been outstanding. A horizon is a promise
+    /// the standby will answer; one that never does would otherwise hold
+    /// the connection silent for ever, so past `CONT_HORIZON_STEPS` the
+    /// mirror is abandoned and the connection carries on unmirrored.
+    pub cont_horizon_steps: u32,
     /// The mirror was abandoned and the abort has not yet left `cont_out`.
     pub cont_abandon_pending: bool,
     /// Inbound 1-RTT packet numbers whose receipt is mirrored but not yet
@@ -1167,6 +1177,12 @@ pub struct QuicConnection {
 /// coordinator learns of, rather than the horizon silently dropping a
 /// number.
 pub const CONT_RECV_HOLD: usize = 16;
+
+/// Steps a strict horizon may stay unconfirmed before the mirror is
+/// abandoned. The inputs are one channel for every connection, so a
+/// horizon is counted in steps rather than milliseconds: it is the
+/// standby's turn that is missing, not a wall-clock deadline.
+pub const CONT_HORIZON_STEPS: u32 = 2000;
 
 impl Default for QuicConnection {
     fn default() -> Self {
@@ -1311,6 +1327,8 @@ impl QuicConnection {
             cont_ckpt_gen: 0,
             cont_last_digest: [0; 32],
             cont_held_delta: 0,
+            cont_held_confirmed: false,
+            cont_horizon_steps: 0,
             cont_abandon_pending: false,
             cont_recv_hold: [(0, 0); CONT_RECV_HOLD],
             cont_recv_hold_len: 0,

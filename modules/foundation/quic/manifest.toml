@@ -7,13 +7,11 @@ hardware_targets = ["bcm2712"]
 # and resumable sessions whose tickets are the session state sealed under a
 # vault-held key.
 #
-# `transport.anchor.mux` is the anchor set a mux transport widens
-# to admit CT_QUIC replicated-anchor continuity (§8.3): a QUIC anchor that
-# survives its own host's death is on-wire-sequence AEAD failover, driven by
-# the checkpoint/delta/cut-over surface on `cont_in` / `cont_out`. No new
-# capability is added — the continuity gates prove only what these two
-# already claim, plus `session.resume`'s sealed-secret custody reused for
-# the `quic-continuity` sealing key.
+# A QUIC anchor that survives its own host's death is driven by the
+# checkpoint / delta / cut-over surface on `cont_in` / `cont_out`. No third
+# capability is declared for it: the continuity gates prove only what these
+# two already claim, plus `session.resume`'s sealed-secret custody, reused
+# for the `quic-continuity` sealing key.
 capabilities = ["transport.anchor.mux", "session.resume"]
 
 # `scope = local`: the sealing key is opened per instance from this host's
@@ -28,6 +26,17 @@ capabilities = ["transport.anchor.mux", "session.resume"]
 [capability_facts."session.resume"]
 scope      = "local"
 early_data = "local_single_use"
+
+# The terms the anchor is carried on. A QUIC packet carries its packet
+# number on the wire, so the peer reads each packet's sequence from the
+# packet itself and a taken-over sender may resume above every number it
+# was ever granted rather than at the one after its last send — which is
+# what the packet-number reservation is for, and what lets the standby
+# emit without ever repeating a number under the same key. No `horizon` is
+# stated: that term is what an implicit-counter anchor is admitted on, and
+# this one skips forward instead.
+[capability_facts."transport.anchor.mux"]
+aead = "on_wire_sequence"
 
 # QUIC v1 (RFC 9000 + RFC 9001). Drives the same TLS 1.3
 # `HandshakeDriver` the TLS / DTLS modules use, with QUIC's CRYPTO

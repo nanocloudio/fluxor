@@ -4629,77 +4629,6 @@ pub(crate) unsafe fn emit_path_response(s: &mut QuicState, idx: usize) {
     }
 }
 
-/// Emit a RESET_STREAM frame on the 1-RTT level for the given stream.
-/// RFC 9000 §19.4 — abruptly terminates a stream's send side.
-pub(crate) unsafe fn emit_reset_stream(
-    s: &mut QuicState,
-    idx: usize,
-    stream_id: u64,
-    error_code: u64,
-    final_size: u64,
-) {
-    if !s.conns[idx].one_rtt_pn_ok() {
-        return;
-    }
-    let conn = &s.conns[idx];
-    if !conn.one_rtt.keys_set {
-        return;
-    }
-    let mut frame_buf = [0u8; 32];
-    let n = build_reset_stream(stream_id, error_code, final_size, &mut frame_buf);
-    if n == 0 {
-        return;
-    }
-    let our_cid_len = conn.our_cid_len as usize;
-    let peer_cid_len = conn.peer_cid_len as usize;
-    let our_cid = conn.our_cid;
-    let peer_cid = conn.peer_cid;
-    let peer = conn.peer;
-    let keys: QuicKeys;
-    let hp_key: [u8; QUIC_HP_KEY_LEN];
-    let pn: u64;
-    let key_phase: u8;
-    {
-        let conn = &s.conns[idx];
-        keys = conn.one_rtt.write_keys;
-        hp_key = conn.one_rtt.write_keys.hp;
-        pn = conn.one_rtt.next_send_pn;
-        key_phase = conn.one_rtt.key_phase;
-    }
-    let _ = our_cid_len;
-    let hp = Aes128Hp::new(&hp_key);
-    let mut pkt = [0u8; QUIC_DGRAM_MAX];
-    let dcid = &peer_cid[..peer_cid_len];
-    let _ = our_cid;
-    let pkt_len = build_one_rtt_packet(
-        &keys,
-        &hp,
-        pn,
-        4,
-        key_phase,
-        dcid,
-        &frame_buf[..n],
-        &mut pkt,
-    );
-    if pkt_len == 0 {
-        return;
-    }
-    {
-        let conn = &mut s.conns[idx];
-        conn.one_rtt.next_send_pn = pn + 1;
-        conn.one_rtt_pn_commit();
-    }
-    let sys = &*s.syscalls;
-    let _ = send_datagram(
-        sys,
-        s.net_out,
-        &s.endpoint,
-        &peer,
-        &pkt[..pkt_len],
-        &mut s.net_scratch,
-    );
-}
-
 /// Probe-Timeout (RFC 9002 §6.2) check — replay the saved packet for
 /// any space whose oldest unacked send is older than the connection's
 /// computed PTO. PTO is `smoothed_rtt + max(4*rttvar, granularity) +
@@ -4728,6 +4657,15 @@ pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
                 EncLevel::OneRtt => &mut conn.one_rtt,
             };
             if space.last_emitted_len == 0 || space.last_emitted_ms == 0 {
+                continue;
+            }
+            // A withheld packet has not been shown to the peer, so it
+            // cannot have been lost. Replaying it here would put its
+            // packet number on the wire twice — once now and once when
+            // the horizon releases the same bytes — and would show the
+            // peer a transition the standby has not confirmed, which is
+            // the whole of what the horizon prevents.
+            if matches!(level, EncLevel::OneRtt) && conn.cont_emission_held {
                 continue;
             }
             if now_ms.wrapping_sub(space.last_emitted_ms) < pto_threshold {

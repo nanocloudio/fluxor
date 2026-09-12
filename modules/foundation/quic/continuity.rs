@@ -1,11 +1,33 @@
 // Transport continuity for QUIC (CT_QUIC) — checkpoint / delta codec and
-// the shadow-takeover state machine on the `cont_in` / `cont_out` ports
-//. QUIC is a replicated-anchor
-// continuity class, not `native_primitive`: a server host that dies takes
-// the userspace flow with it, so it is a replicated-anchor class. Because QUIC
+// the shadow-takeover state machine on the `cont_in` / `cont_out` ports.
+//
+// QUIC is a replicated-anchor continuity class rather than
+// `native_primitive`: the wire protocol migrates paths, not hosts, and a
+// server host that dies takes the userspace flow with it. Because QUIC
 // carries its packet number on the wire it is an on-wire-sequence AEAD, so
 // the 1-RTT send space is drawn from `nonce_reservation` and a takeover
 // resumes strictly ahead of anything the dead host could have emitted.
+//
+// ─── What the strict horizon covers ───────────────────────────────────
+//
+// Under PROFILE_CRASH_CONTINUOUS every 1-RTT packet the send pump builds
+// is mirrored and withheld until the standby acknowledges it, and an
+// inbound packet is not acknowledged to the peer until the standby holds
+// its receipt. The probe timeout leaves a withheld packet alone: it has
+// not been shown to the peer, so it cannot have been lost, and replaying
+// it would put its packet number on the wire twice.
+//
+// Path validation and connection close sit outside the horizon, and
+// deliberately. A PATH_CHALLENGE or PATH_RESPONSE is about the path this
+// host is on, which a standby does not inherit — it validates its own —
+// and a CONNECTION_CLOSE ends the flow, after which there is nothing to
+// take over. Holding either would stall a liveness check behind a standby
+// that may be the reason the path is in doubt.
+//
+// A standby that stops answering does not hold the connection silent for
+// ever: past `CONT_HORIZON_STEPS` the mirror is abandoned, the coordinator
+// is told, and the packet the horizon was holding still goes to the peer,
+// a packet number having been spent on it.
 //
 // ─── Canonical checkpoint record (CT_QUIC) ─────────────────────────────
 //
@@ -1586,7 +1608,11 @@ pub unsafe fn on_one_rtt_received(
 /// refused a delta, so it is marked and sent from the step until it goes.
 pub unsafe fn mirror_abandon(sys: &SyscallTable, cont_out: i32, conn: &mut QuicConnection) {
     conn.cont_mirror = false;
-    conn.cont_emission_held = false;
+    conn.cont_horizon_steps = 0;
+    // A held packet spent a packet number, so it is owed to the peer
+    // whatever became of the mirror: nothing confirms it now, which is
+    // itself the confirmation. The per-step service puts it on the wire.
+    conn.cont_held_confirmed = conn.cont_emission_held;
     let n = conn.cont_recv_hold_len as usize;
     let mut i = 0;
     while i < n {
@@ -1636,6 +1662,9 @@ unsafe fn release_held(s: &mut QuicState, idx: usize) -> bool {
     if !s.conns[idx].cont_emission_held {
         return true;
     }
+    if !s.conns[idx].cont_held_confirmed {
+        return false;
+    }
     let sys = &*s.syscalls;
     let len = s.conns[idx].one_rtt.last_emitted_len;
     let sent = send_datagram(
@@ -1648,13 +1677,15 @@ unsafe fn release_held(s: &mut QuicState, idx: usize) -> bool {
     );
     if sent {
         s.conns[idx].cont_emission_held = false;
+        s.conns[idx].cont_held_confirmed = false;
+        s.conns[idx].cont_horizon_steps = 0;
         s.conns[idx].last_activity_ms = dev_millis(sys);
     }
     sent
 }
 
-/// Per-step service for mirrored connections: owed aborts, and held
-/// packets whose release bounced on a full wire.
+/// Per-step service for mirrored connections: owed aborts, held packets
+/// whose release is due, and horizons the standby has stopped answering.
 unsafe fn cont_service(s: &mut QuicState) {
     let sys = &*s.syscalls;
     let cont_out = s.cont_out;
@@ -1664,12 +1695,29 @@ unsafe fn cont_service(s: &mut QuicState) {
             if s.conns[i].cont_abandon_pending {
                 let _ = flush_abandon(sys, cont_out, &mut s.conns[i]);
             }
-            if s.conns[i].cont_emission_held
-                && !s.conns[i].cont_mirror
-            {
-                // The mirror ended while a packet was held: nothing
-                // confirms it now, and nothing is served by holding it.
+            // A confirmed hold is owed to the peer, whether its delta was
+            // acknowledged or the mirror ended under it. The release is
+            // retried here rather than only on the acknowledgement, since
+            // a full wire would otherwise strand the packet: emission is
+            // gated behind it, so no further delta — and no further
+            // acknowledgement — could come to try again.
+            if s.conns[i].cont_emission_held && s.conns[i].cont_held_confirmed {
                 let _ = release_held(s, i);
+            }
+            // A horizon the standby stops answering would hold the
+            // connection silent for ever. Past the limit the mirror is
+            // abandoned: the coordinator is told, the shadow is dropped,
+            // and the connection carries on unmirrored rather than mute.
+            let waiting = (s.conns[i].cont_emission_held && !s.conns[i].cont_held_confirmed)
+                || s.conns[i].cont_recv_hold_len != 0;
+            if mirror_strict(&s.conns[i]) && waiting {
+                s.conns[i].cont_horizon_steps = s.conns[i].cont_horizon_steps.saturating_add(1);
+                if s.conns[i].cont_horizon_steps > CONT_HORIZON_STEPS {
+                    mirror_abandon(sys, cont_out, &mut s.conns[i]);
+                    let _ = release_held(s, i);
+                }
+            } else {
+                s.conns[i].cont_horizon_steps = 0;
             }
         }
         i += 1;
@@ -1882,6 +1930,7 @@ unsafe fn cont_apply_delta_ack(s: &mut QuicState, payload: &[u8]) {
         c.cont_recv_hold_len = kept as u8;
     }
     if s.conns[idx].cont_emission_held && s.conns[idx].cont_held_delta <= delta_no {
+        s.conns[idx].cont_held_confirmed = true;
         let _ = release_held(s, idx);
     }
 }

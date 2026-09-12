@@ -7,18 +7,37 @@ timer_class = "wall_clock"
 # deployment, and a consumer cannot wire a module its target list excludes.
 hardware_targets = ["rp2350", "bcm2712", "linux"]
 
-# Ingress anchor role for the tls-fronted 443 edge (rfc_workload_ingress
-# tls terminates the client-visible
-# secure stream in front of the http proxy anchor, so it is the module
-# that owns the secure attachment a client sees — the record keys, the
-# record counters and the ciphertext the peer has been shown. That is
-# what `transport.anchor.stream.secure` names, and it is also the state
-# the `cont_in` / `cont_out` surface below checkpoints and mirrors
-# Whether a graph reaches stream
-# continuity is decided by the validator from the whole path — the ip
-# module must own TCP on the target (`fence.enforceable` is ip's fact,
-# not this module's) — so nothing more is claimed here.
+# Ingress anchor role: tls terminates the client-visible secure stream in
+# front of the consumer it serves, so it owns the attachment a client sees
+# — the record keys, the record counters, and the ciphertext the peer has
+# been shown. That is what `transport.anchor.stream.secure` names, and it
+# is the state the `cont_in` / `cont_out` surface below checkpoints and
+# mirrors. Whether a graph reaches stream continuity is decided by the
+# validator from the whole path — the ip module must own TCP on the target
+# (`fence.enforceable` is ip's fact, not this module's) — so nothing more
+# is claimed here.
 capabilities = ["transport.anchor.stream.secure"]
+
+# The terms the anchor is carried on.
+#
+# TLS 1.3 protects every record under an implicit counter: the sequence
+# never appears on the wire, both peers count in lockstep, and a taken-over
+# sender that skipped forward would fail the peer's decrypt. A counter
+# reservation cannot rescue that — it makes a skip safe, not a resume.
+#
+# What carries the anchor anyway is the horizon `continuity.rs` keeps for a
+# mirroring pair under PROFILE_CRASH_CONTINUOUS: an outbound record is held
+# rather than written, and an inbound record is held rather than decrypted
+# and delivered, until the standby has acknowledged that exact transition,
+# with a write-side key update a barrier on the same footing. The standby
+# therefore holds the counter the peer is actually at, and a takeover
+# retransmits identical ciphertext. A standby that stops answering, or a
+# mirror channel that fails, ends the pair instead of stalling the
+# connection: the coordinator is told, the shadow is dropped, and what was
+# held is written unmirrored.
+[capability_facts."transport.anchor.stream.secure"]
+aead    = "implicit_counter"
+horizon = "exact"
 
 # An instance that validates a peer's chain (a CA profile) checks the
 # leaf's lifetime against the kernel's trusted clock (`timer::TRUSTED_UNIX`),

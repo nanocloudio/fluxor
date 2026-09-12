@@ -2175,11 +2175,36 @@ mod continuity_tests {
     /// the ip stack (local fence, reach decided by the target) and an
     /// out-of-band fence agent declaring the wire.
     fn prs_graph_with(anchor_cap: &str) -> (Vec<String>, HashMap<String, Manifest>) {
+        prs_graph_with_terms(anchor_cap, &[("aead", aead_of(anchor_cap)), ("horizon", "exact")])
+    }
+
+    /// The AEAD class each anchor role is carried on, as its manifest would
+    /// state it: TLS records count in lockstep; datagram and mux anchors
+    /// carry their sequence on the wire.
+    fn aead_of(anchor_cap: &str) -> &'static str {
+        if anchor_cap == "transport.anchor.stream.secure" {
+            "implicit_counter"
+        } else {
+            "on_wire_sequence"
+        }
+    }
+
+    /// `prs_graph_with`, the anchor declaring exactly `terms` as its
+    /// `transport.anchor` facts.
+    fn prs_graph_with_terms(
+        anchor_cap: &str,
+        terms: &[(&str, &str)],
+    ) -> (Vec<String>, HashMap<String, Manifest>) {
         let mut manifests = HashMap::new();
-        manifests.insert(
-            "anc".to_string(),
-            man(&[anchor_cap, "session.reservation"]),
-        );
+        let mut anc = man(&[anchor_cap, "session.reservation"]);
+        if !terms.is_empty() {
+            let row: std::collections::BTreeMap<String, String> = terms
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            anc.capability_facts.insert(anchor_cap.to_string(), row);
+        }
+        manifests.insert("anc".to_string(), anc);
         manifests.insert(
             "wkr".to_string(),
             man(&["session.worker", "session.handoff"]),
@@ -2281,7 +2306,9 @@ mod continuity_tests {
     fn continuity_prs_stream_anchor_is_bare_metal_only() {
         // A TLS-terminating anchor owns its transport on bcm2712 …
         let (n, m) = prs_graph_with("transport.anchor.stream.secure");
-        let cfg = prs_cfg(prs_entry());
+        let mut entry = prs_entry();
+        entry["aead"] = json!("implicit_counter");
+        let cfg = prs_cfg(entry);
         validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
         // … and not on a hosted platform, where TCP is the host kernel's.
         let e = validate_continuity_on(&cfg, &n, &m, Some("linux")).unwrap_err();
@@ -2291,6 +2318,7 @@ mod continuity_tests {
         assert!(format!("{e:?}").contains("resolved target"), "got: {e:?}");
         // A mux anchor follows the same rule.
         let (n, m) = prs_graph_with("transport.anchor.mux");
+        let cfg = prs_cfg(prs_entry());
         validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
         // A plain stream anchor is not a transport Fluxor may migrate.
         let (n, m) = prs_graph_with("transport.anchor.stream");
@@ -2321,15 +2349,56 @@ mod continuity_tests {
     }
 
     #[test]
-    fn continuity_prs_rejects_implicit_counter_aead() {
-        // §13.7.2: an implicit-contiguous AEAD counter cannot reach
-        // transport_migratable — honest ceiling is resumable.
+    fn continuity_prs_implicit_counter_needs_an_exact_horizon() {
+        // An implicit-contiguous AEAD counter cannot skip forward, so it
+        // reaches transport_migratable only through an anchor whose mirror
+        // keeps an exact horizon. Without that term the honest ceiling is
+        // resumable …
+        let cap = "transport.anchor.stream.secure";
+        let mut entry = prs_entry();
+        entry["aead"] = json!("implicit_counter");
+        let cfg = prs_cfg(entry);
+        for terms in [
+            &[("aead", "implicit_counter")][..],
+            &[("aead", "implicit_counter"), ("horizon", "cut")][..],
+        ] {
+            let (n, m) = prs_graph_with_terms(cap, terms);
+            let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+            assert!(format!("{e:?}").contains("resumable"), "terms {terms:?}: got {e:?}");
+            assert!(format!("{e:?}").contains("exact"), "terms {terms:?}: got {e:?}");
+        }
+        // … and with it the class is admitted.
+        let (n, m) = prs_graph_with_terms(cap, &[("aead", "implicit_counter"), ("horizon", "exact")]);
+        validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap();
+    }
+
+    #[test]
+    fn continuity_prs_aead_must_match_the_anchors_terms() {
+        // The declaration names the anchor's AEAD class; it does not choose
+        // it. A TLS anchor declared on_wire_sequence is a misstatement …
+        let cap = "transport.anchor.stream.secure";
+        let (n, m) = prs_graph_with(cap);
+        let cfg = prs_cfg(prs_entry());
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("misdeclares"), "got: {e:?}");
+        assert!(format!("{e:?}").contains("implicit_counter"), "got: {e:?}");
+        // … and so is a datagram anchor declared implicit_counter.
         let (n, m) = prs_graph();
         let mut entry = prs_entry();
         entry["aead"] = json!("implicit_counter");
         let cfg = prs_cfg(entry);
         let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
-        assert!(format!("{e:?}").contains("resumable"), "got: {e:?}");
+        assert!(format!("{e:?}").contains("misdeclares"), "got: {e:?}");
+    }
+
+    #[test]
+    fn continuity_prs_anchor_must_state_its_aead() {
+        // An anchor with no `aead` fact offers no terms to admit the class
+        // on; the manifest must say what protects its records.
+        let (n, m) = prs_graph_with_terms("transport.anchor.datagram", &[]);
+        let cfg = prs_cfg(prs_entry());
+        let e = validate_continuity_on(&cfg, &n, &m, Some("bcm2712")).unwrap_err();
+        assert!(format!("{e:?}").contains("declares no `aead` fact"), "got: {e:?}");
     }
 
     #[test]

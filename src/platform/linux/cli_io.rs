@@ -53,6 +53,10 @@ pub(crate) static CLI_EXIT_LATCHED: core::sync::atomic::AtomicBool =
 /// would run until it was killed. The CLI sink does know: nothing can produce
 /// output after it retires, so the run is over whatever else is still willing
 /// to be asked.
+///
+/// Set by a wired sink only. `cli` is a platform stanza, so a graph that names
+/// it for its stdin alone still gets a `cli_out`; one that nothing feeds never
+/// retires, having no output that could be over.
 pub(crate) static CLI_RUN_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -423,7 +427,16 @@ fn cli_out_step(state: *mut u8) -> i32 {
     let upstream_done = scheduler::module_completion_predecessors_finished(st.module_idx);
     let flushed = st.stdout_bridge.as_ref().is_none_or(|b| b.is_empty())
         && st.stderr_bridge.as_ref().is_none_or(|b| b.is_empty());
-    if flushed && (st.exited || upstream_done) {
+    // A sink nothing feeds carries no such claim. `cli` is a platform
+    // stanza, so a graph that names it for its stdin alone still gets a
+    // `cli_out`, and an unwired one has no predecessors at all —
+    // `upstream_done` is vacuously true of it. Retiring on that would end
+    // the run at its first step, cutting off a graph whose work is outbound
+    // rather than printed: one that publishes to a broker would die before
+    // its connect completed. Only a fed sink falling quiet means the output
+    // is over.
+    let wired = st.bytes_in >= 0 || st.err_in >= 0 || st.exit_in >= 0;
+    if wired && flushed && (st.exited || upstream_done) {
         CLI_RUN_COMPLETE.store(true, Ordering::Release);
         return 1;
     }

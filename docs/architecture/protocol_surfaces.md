@@ -316,11 +316,16 @@ one of:
   `security.key_wrap`, `fence.enforceable`, and `durable.rpo_zero`, and
   the fence in two halves — the ip module's, whose `cutoff` reaches
   `wire` on the target, and an out-of-band fence agent declaring
-  `cutoff = "wire"` for itself; the declared `aead` class must be
-  `on_wire_sequence` or `unencrypted` (`implicit_counter` is rejected
-  outright: a transport whose AEAD nonces cannot survive an anchor
-  move honestly tops out at `resumable`); and the declared
-  `failover_budget_ms` must be strictly below `client_keepalive_ms`.
+  `cutoff = "wire"` for itself; the declared `aead` class must equal
+  the anchor's own `transport.anchor` `aead` fact — the declaration
+  names the anchor's AEAD class rather than choosing it, and tls states
+  `implicit_counter` where quic states `on_wire_sequence` — and an
+  `implicit_counter` anchor is admitted only where it also states
+  `horizon = "exact"`, a counter that cannot skip forward on takeover
+  reaching the class only where the standby holds each record before the
+  peer is shown it, and otherwise topping out honestly at `resumable`;
+  and the declared `failover_budget_ms` must be strictly below
+  `client_keepalive_ms`.
 
 Declaring `mechanism` or `aead` under any other class is a hard
 error. The validator checks structure only (the presence of the

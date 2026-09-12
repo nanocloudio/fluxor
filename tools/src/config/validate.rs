@@ -456,10 +456,11 @@ pub fn validate_continuity_on(
                         }
                     }
                     "platform_replicated_state" => {
-                        // AEAD class decides whether the class is even
-                        // reachable (§13.7.2): implicit-contiguous
-                        // counters cannot skip forward — their honest
-                        // ceiling is resumable-with-seamless-state.
+                        // The AEAD class decides whether the class is even
+                        // reachable, and it is a property of the anchor's
+                        // transport rather than of the declaration: the
+                        // anchor's manifest states it as a fact, and the
+                        // declaration must agree with what it states.
                         let ac = aead.ok_or_else(|| {
                             err(format!(
                                 "mechanism platform_replicated_state requires `aead` \
@@ -473,16 +474,6 @@ pub fn validate_continuity_on(
                                 ac,
                                 AEAD_CLASSES.join(" | ")
                             )));
-                        }
-                        if ac == "implicit_counter" {
-                            return Err(err(
-                                "aead implicit_counter cannot reach transport_migratable: \
-                                 an implicit-contiguous AEAD counter cannot skip forward on \
-                                 takeover. Declare class \
-                                 `resumable` — seamless-state resume is this transport's \
-                                 honest ceiling"
-                                    .into(),
-                            ));
                         }
 
                         // Anchor + single-writer directory are the
@@ -499,6 +490,51 @@ pub fn validate_continuity_on(
                                 PRS_ANCHOR_CAPS.join(" | ")
                             )));
                         };
+                        // The anchor's own terms (`transport.anchor`
+                        // facts): what protects its records, and how exactly
+                        // its mirror tracks them. A role may state them on
+                        // its own table or on the parent the schema belongs
+                        // to, and may split them across both, so each fact
+                        // is resolved along the chain in its own right.
+                        let anchor_fact = |fact: &str| -> Option<String> {
+                            let m = manifests.get(a)?;
+                            fluxor_contracts::vocabulary::capability_and_parents(anchor_cap)
+                                .filter_map(|cap| m.capability_facts.get(cap))
+                                .find_map(|table| table.get(fact).cloned())
+                        };
+                        let Some(anchor_aead) = anchor_fact("aead") else {
+                            return Err(err(format!(
+                                "anchor `{a}` ({anchor_cap}) declares no `aead` fact; \
+                                 platform-replicated-state migration is admitted on the \
+                                 anchor's own terms — its manifest must state \
+                                 [capability_facts.\"{anchor_cap}\"] aead = <class>"
+                            )));
+                        };
+                        if anchor_aead != ac {
+                            return Err(err(format!(
+                                "aead `{ac}` misdeclares anchor `{a}` ({anchor_cap}), whose \
+                                 manifest states `{anchor_aead}`; the declaration names the \
+                                 anchor's AEAD class, it does not choose it"
+                            )));
+                        }
+                        // An implicit-contiguous counter cannot skip
+                        // forward on takeover, so a reservation alone leaves
+                        // that transport at `resumable`. It reaches this
+                        // class only where the anchor keeps an exact
+                        // horizon: the standby holds each record before the
+                        // peer is shown it, so a takeover resumes on the
+                        // counter the peer is actually at.
+                        let exact_horizon = anchor_fact("horizon").as_deref() == Some("exact");
+                        if ac == "implicit_counter" && !exact_horizon {
+                            return Err(err(format!(
+                                "aead implicit_counter cannot reach transport_migratable \
+                                 through anchor `{a}`: an implicit-contiguous AEAD counter \
+                                 cannot skip forward on takeover, and the anchor does not \
+                                 declare an exact mirror horizon (`horizon = \"exact\"`). \
+                                 Declare class `resumable` — seamless-state resume is this \
+                                 transport's honest ceiling"
+                            )));
+                        }
                         // A stream or mux anchor owns its transport only on
                         // bare metal: on a hosted platform TCP lives in the
                         // host kernel and no checkpoint can capture it

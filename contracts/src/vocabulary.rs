@@ -251,6 +251,35 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
         ],
     ),
     (
+        // The terms an anchor's transport is carried on across a takeover.
+        // Declared on the parent, so the anchor roles share one schema
+        // rather than repeating it.
+        //
+        // `aead` — what protects the records the peer is shown, and so
+        // whether a taken-over sender may skip its counter forward:
+        // `on_wire_sequence`, the peer reads each record's sequence from
+        // the record itself and a skip is legal (a QUIC packet number);
+        // `implicit_counter`, both peers count in lockstep and the counter
+        // never appears on the wire, so a skip fails the peer's decrypt (a
+        // TLS 1.3 record); `unencrypted`, no counter to protect.
+        //
+        // `horizon` — what an implicit-counter anchor must state to reach
+        // replicated-anchor continuity at all, a reservation being able to
+        // make a skip safe but never a lockstep resume. `exact`: while the
+        // pair is mirroring, nothing is shown to the peer until the standby
+        // has confirmed it holds that transition, so a takeover resumes on
+        // the counter the peer is actually at. `cut`: only the checkpoint
+        // cut is exact, and the mirror runs behind it.
+        "transport.anchor",
+        &[
+            (
+                "aead",
+                &["on_wire_sequence", "implicit_counter", "unencrypted"],
+            ),
+            ("horizon", &["exact", "cut"]),
+        ],
+    ),
+    (
         // What a fence's cutoff boundary is worth. `ring_handoff`: nothing
         // sourced from the fenced address is handed to the driver ring
         // after the fence answers, but frames already in the ring may still

@@ -1,9 +1,27 @@
 // Transport continuity for the TLS record layer: the CT_TLS checkpoint
-// codec, the shadow import lifecycle and the mirrored emission horizon
-// on the `cont_in` / `cont_out` port pair. The wire contract is
-// `contracts/net/session_ctrl.rs` §Transport continuity; the horizons
-// horizons hold the acknowledgement shown to the peer to what the standby
-// has confirmed.
+// codec, the shadow import lifecycle and the mirrored emission horizon on
+// the `cont_in` / `cont_out` port pair. The wire contract is
+// `contracts/net/session_ctrl.rs` §Transport continuity.
+//
+// ── What the strict horizon covers ──────────────────────────────────
+//
+// A TLS 1.3 record is sealed under a counter neither peer puts on the
+// wire, so a takeover cannot skip forward the way an on-wire-sequence
+// transport can: it has to resume on the counter the peer is actually at.
+// That is what the horizon is for. Under PROFILE_CRASH_CONTINUOUS an
+// outbound record is held rather than written, and an inbound record is
+// held rather than decrypted and delivered, until the standby has
+// acknowledged that exact transition; a write-side key update is a
+// barrier on the same footing. What the peer has seen is therefore never
+// ahead of what the standby holds.
+//
+// A standby that stops answering does not hold the connection silent for
+// ever. Past `CONT_HORIZON_STEPS` the pair is abandoned — but what the
+// horizon was holding is ordered behind the abort that tells the
+// coordinator so, because a coordinator that has not been told may still
+// activate the shadow, and those records are exactly what it would be
+// missing. Only when the abort is away, or its own budget has run out
+// too, do they go to the peer.
 //
 // ── Canonical record (CT_TLS, layout 1) ─────────────────────────────
 //
@@ -1383,21 +1401,31 @@ unsafe fn delta_finish(s: &mut TlsState, idx: usize, payload_len: usize) -> bool
     true
 }
 
-/// Mirroring stopped: the standby no longer tracks this session. Holds
-/// are released so the connection continues without the promise.
 /// The mirror could not carry a transition. From here the primary runs
 /// unmirrored, and the standby's shadow is stale from this record on: a
 /// takeover onto it would resume at counters the peer has already seen.
-/// So the pair is over. The abort is owed to the coordinator whatever the
-/// channel's state — it is the very channel that just refused a delta — so
-/// it is marked and sent from the step until it goes.
+/// So the pair is over, and the abort is owed to the coordinator whatever
+/// the channel's state — it is the very channel that just refused a delta
+/// — so it is marked and sent from the step until it goes.
+///
+/// What the horizons hold is not let go until that abort is away. A
+/// coordinator that has not been told the pair is over may still fence and
+/// activate the shadow, and records shown to the peer in the meantime are
+/// exactly the ones the shadow would then be missing. Ordering the abort
+/// ahead of them leaves the coordinator no window in which it could
+/// believe the shadow current.
 unsafe fn mirror_abandon(s: &mut TlsState, idx: usize) {
     mirror_lost(s, idx);
     s.sessions[idx].cont.abandon_pending = true;
+    // Delivering the abort is a promise of its own, and gets its own
+    // budget: a horizon that has just run out must not spend the abort's
+    // as well, or the records it is ordered ahead of would go at once.
+    s.sessions[idx].cont.horizon_steps = 0;
     flush_abandon(s, idx);
 }
 
 /// Send the owed abort for an abandoned mirror; answers whether it went.
+/// Its departure is what releases the holds.
 unsafe fn flush_abandon(s: &mut TlsState, idx: usize) -> bool {
     if !s.sessions[idx].cont.abandon_pending {
         return true;
@@ -1415,9 +1443,21 @@ unsafe fn flush_abandon(s: &mut TlsState, idx: usize) -> bool {
         &[sc::ABORT_MIRROR_LOST],
     ) {
         s.sessions[idx].cont.abandon_pending = false;
+        release_after_abort(s, idx);
         true
     } else {
         false
+    }
+}
+
+/// Let go of what the horizons were holding, the pair being over and the
+/// coordinator told. Idempotent: a hold already released stays released.
+unsafe fn release_after_abort(s: &mut TlsState, idx: usize) {
+    let c = &mut s.sessions[idx].cont;
+    c.rx_released = c.rx_released || c.rx_hold_delta != 0;
+    if c.tx_hold_len != 0 {
+        c.tx_hold_mirrored = c.tx_hold_len;
+        c.tx_hold_released = true;
     }
 }
 
@@ -1429,12 +1469,7 @@ unsafe fn mirror_lost(s: &mut TlsState, idx: usize) {
     c.mirror = false;
     c.cut_pending = false;
     c.rx_hold_pending = false;
-    c.rx_released = c.rx_released || c.rx_hold_delta != 0;
     c.write_barrier_pending = false;
-    if c.tx_hold_len != 0 {
-        c.tx_hold_mirrored = c.tx_hold_len;
-        c.tx_hold_released = true;
-    }
     if c.retired_pending {
         cont_wipe(&mut c.retired_write.key);
         cont_wipe(&mut c.retired_write.iv);
@@ -3083,14 +3118,34 @@ unsafe fn continuity_step(s: &mut TlsState) -> bool {
         }
         {
             let c = &mut s.sessions[i].cont;
-            if c.mirror && c.strict() && c.horizon_outstanding() {
+            // Two promises are counted on the same budget: a horizon the
+            // standby has not answered, and an abort the coordinator has
+            // not taken.
+            let waiting =
+                (c.mirror && c.strict() && c.horizon_outstanding()) || c.abandon_pending;
+            if waiting {
                 c.horizon_steps = c.horizon_steps.saturating_add(1);
             } else {
                 c.horizon_steps = 0;
             }
         }
         if s.sessions[i].cont.horizon_steps > CONT_HORIZON_STEPS {
-            mirror_abandon(s, i);
+            if s.sessions[i].cont.abandon_pending {
+                // The abort cannot reach the coordinator and the records
+                // cannot wait on it for ever. They go, and the log says
+                // what a takeover would be resuming behind. The abort
+                // stays owed, and the step keeps offering it.
+                if !s.sessions[i].cont.tx_hold_released {
+                    let sys = &*s.syscalls;
+                    let msg: &[u8] =
+                        b"[tls] continuity abort undeliverable; releasing held records,                           any shadow is now behind the peer";
+                    dev_log(sys, 1, msg.as_ptr(), msg.len());
+                }
+                release_after_abort(s, i);
+                s.sessions[i].cont.horizon_steps = 0;
+            } else {
+                mirror_abandon(s, i);
+            }
             did_work = true;
         }
         i += 1;
