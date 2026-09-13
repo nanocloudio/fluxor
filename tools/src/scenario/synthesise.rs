@@ -1378,9 +1378,9 @@ pub fn validate_module_targets(scenario: &Scenario, scenario_path: &Path) -> Res
                 Err(_) => continue, // unparseable manifest — build path will report.
             };
             // Empty hardware_targets in the manifest is permissive
-            // ("works everywhere") — historically used by a few
-            // built-ins.  Don't reject; the build path will catch any
-            // real mismatch.
+            // ("works everywhere"), which some built-ins rely on.
+            // Don't reject; the build path will catch any real
+            // mismatch.
             if manifest_targets.is_empty() {
                 continue;
             }

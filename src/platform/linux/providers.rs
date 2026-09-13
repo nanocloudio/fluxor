@@ -2285,13 +2285,14 @@ unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
 unsafe fn linux_net_poll_accept(st: &mut LinuxNetState) -> bool {
     let mut had_work = false;
 
-    // Per-listener accept budget. Drain up to N pending connections
-    // per listener per tick rather than the historical 1/tick — at
-    // 1/tick a 32-client connect burst took 32 ticks (32 ms at the
-    // default 1 ms scheduler tick) to fully accept, and clients
-    // timed out their initial HTTP/2 handshake. 32 keeps the worst-
-    // case per-tick cost bounded (~32 × per-socket setsockopt
-    // overhead ≈ a few hundred µs).
+    // Per-listener accept budget: pending connections drained per
+    // listener per tick. The number binds in both directions. Accept one
+    // per tick and a 32-client connect burst needs 32 ticks (32 ms at the
+    // default 1 ms scheduler tick) before the last client is accepted,
+    // which outlasts a client's initial HTTP/2 handshake timeout. Accept
+    // without a bound and one burst owns the tick. 32 clears a full burst
+    // in a single pass while keeping the worst-case per-tick cost bounded
+    // (~32 × per-socket setsockopt overhead ≈ a few hundred µs).
     const PER_TICK_ACCEPT_BUDGET: u32 = 32;
 
     for k in 0..st.ready_len {

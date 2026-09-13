@@ -41,7 +41,15 @@ use toml::Value;
 /// from this table is a typo doing nothing — the failure mode the phase
 /// exists to end — so the list is the schema, not a hint.
 const ALLOWED: &[(&str, &[&str])] = &[
-    ("ci", &["targets", "live_staleness"]),
+    (
+        "ci",
+        &[
+            "targets",
+            "live_staleness",
+            "limit_register",
+            "limit_register_coverage",
+        ],
+    ),
     ("ci.cargo", &["host_tools_crate"]),
     (
         "ci.hygiene",

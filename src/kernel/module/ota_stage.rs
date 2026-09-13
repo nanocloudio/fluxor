@@ -36,8 +36,9 @@ pub const STAGE_CAPACITY: usize = 8 * 1024 * 1024;
 // pack tool emits (`fluxor build --emit=image`, tools/src/cli/
 // commands_a.rs::cmd_graph_image) and the RP boot slot selector reads
 // (`modules/sdk/platform/rp/flash_layout.rs` — an RP flash A/B slot
-// holds exactly this image format; the "FXSL" magic mnemonic is
-// historical). The constants are restated here because this surface
+// holds exactly this image format; "FXSL" is a fixed on-disk constant
+// and its mnemonic does not describe the format). The constants are
+// restated here because this surface
 // compiles on targets that do not mount the RP platform tables.
 const IMAGE_MAGIC: u32 = 0x4C53_5846; // "FXSL"
 const IMAGE_VERSION: u8 = 1;

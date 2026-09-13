@@ -1170,16 +1170,14 @@ mod scheduler_validation_tests {
 
     #[test]
     fn admission_rejects_tier_1b_module_with_no_resolvable_manifest() {
-        // Regression: an ISR-tier module that does not resolve to a
-        // manifest (typo in `type:`, missing module dir, build-tree
-        // not on the search path, etc.) used to be skipped silently
-        // in `validate_isr_tier_admission` on the assumption that
-        // `validate_wiring_types` would catch it. That assumption
-        // is wrong — `validate_wiring_types` only enforces content
-        // types when **both** endpoints have manifests, so a Tier 1b
-        // module with no edges (or bare/default ports) can land in
-        // the graph without ever running through the `isr_safe`
-        // check or the NEON-import lint.
+        // An ISR-tier module that does not resolve to a manifest (typo
+        // in `type:`, missing module dir, build-tree not on the search
+        // path) must be refused by `validate_isr_tier_admission` itself,
+        // not left to `validate_wiring_types`. That validator enforces
+        // content types only when **both** endpoints have manifests, so
+        // a Tier 1b module with no edges (or bare/default ports) passes
+        // it untouched and lands in the graph without ever running
+        // through the `isr_safe` check or the NEON-import lint.
         //
         // Hard-error here so the operator gets a single, focused
         // diagnostic naming the unresolved module rather than a
@@ -1205,17 +1203,16 @@ mod scheduler_validation_tests {
 
     #[test]
     fn admission_priority_module_search_paths_extra_dir_shadows_standard_tree() {
-        // Regression: `extract_module_search_paths` documents the
-        // returned list as *priority-ordered*, with explicit YAML
-        // `module_search_paths:` entries first. But the manifest
-        // loader (`load_module_manifests_with_extra`) and the
-        // ISR NEON-lint used to search `standard_module_dirs()`
-        // *first*, then extras. If a config-declared override
-        // collided with a bundled module of the same `type:`,
-        // ISR admission would read `isr_safe` and scan source
-        // from the bundled copy — silently admitting a module the
-        // operator had explicitly redirected to a vetted vendor
-        // tree.
+        // `extract_module_search_paths` returns a *priority-ordered*
+        // list with explicit YAML `module_search_paths:` entries
+        // first, and the manifest loader
+        // (`load_module_manifests_with_extra`) and the ISR NEON-lint
+        // must both honour that order. Were either to search
+        // `standard_module_dirs()` first, a config-declared override
+        // colliding with a bundled module of the same `type:` would
+        // have ISR admission read `isr_safe` and scan source from the
+        // bundled copy — silently admitting a module the operator had
+        // explicitly redirected to a vetted vendor tree.
         //
         // This test plants the *same* type name twice:
         //   - standard tree (`<project>/modules/foundation/coll/`)
@@ -1389,12 +1386,12 @@ mod scheduler_validation_tests {
 
     #[test]
     fn admission_neon_lint_finds_standard_tree_modules_too() {
-        // Regression: the NEON-import lint used to search only
-        // `modules_dir + extra_module_dirs` for the module's src
-        // root. A module under `modules/drivers/<name>` (resolved
-        // via `standard_module_dirs()` for the manifest) would
-        // pass admission silently without ever running
-        // `check_isr_safe_no_neon`. This test plants an
+        // The NEON-import lint must find a module's src root wherever
+        // its manifest resolved from, `standard_module_dirs()`
+        // included. A lint searching only `modules_dir +
+        // extra_module_dirs` would never run `check_isr_safe_no_neon`
+        // against a module under `modules/drivers/<name>`, which would
+        // then pass admission silently. This test plants an
         // `isr_safe = true` module with a NEON import in a fake
         // project root and asserts the lint catches it.
         let project = tempfile::tempdir().expect("tempdir");
@@ -1445,13 +1442,13 @@ mod scheduler_validation_tests {
 
     #[test]
     fn build_module_entry_emits_pre_tick_bit_from_extra_dir_manifest() {
-        // Regression: an earlier version of `build_module_entry`
-        // called `Manifest::from_source_tree`, which searches a
-        // hard-coded `SOURCE_DIRS` list relative to the process
-        // cwd. A manifest living in `extra_module_dirs` (e.g. an
-        // installed driver) could pass validation but emit a
-        // config blob with byte-9 bit 4 clear — silently demoting
-        // the module out of `domain_pre_tick_order`.
+        // `build_module_entry` must read the manifest it was given,
+        // not re-find one. Resolving through `Manifest::from_source_tree`
+        // — which searches a hard-coded `SOURCE_DIRS` list relative to
+        // the process cwd — would let a manifest living in
+        // `extra_module_dirs` (an installed driver, say) pass validation
+        // and still emit a config blob with byte-9 bit 4 clear, silently
+        // demoting the module out of `domain_pre_tick_order`.
         //
         // This test plants a `pre_tick_drain = true` manifest in a
         // tempdir, feeds the dir as an extra, and asserts the bit

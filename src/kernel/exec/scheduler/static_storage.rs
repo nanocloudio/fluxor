@@ -82,13 +82,13 @@ pub unsafe fn install_static_config(cfg: Config) {
 /// until module instantiation completes. After this returns `Ok`,
 /// `prepare_graph()` is the next step.
 ///
-/// **Length-aware variant**: callers that know the config blob length
-/// (hosted targets reading from a file, wasm reading from a static
-/// `[u8; N]` blob) should prefer [`populate_static_state_with_len`] so
-/// the parser can reject sections that would extend past the mapped
-/// range. The pointer-only entry continues to delegate to a strict
-/// path internally with a 32 KiB upper bound — the historical
-/// `MAX_CONFIG_SIZE`.
+/// **Length-aware variant**: callers that also know the module-table
+/// length (hosted targets reading from a file, wasm reading from a
+/// static `[u8; N]` blob) should prefer
+/// [`populate_static_state_with_len`], which bounds that region too, so
+/// a table header claiming a body larger than the mapping fails
+/// deterministically. This entry bounds only the config blob, through
+/// `config_len`, and trusts the module table's own length fields.
 ///
 /// # Safety
 /// `config_ptr` and `modules_ptr` must each point at a valid blob whose

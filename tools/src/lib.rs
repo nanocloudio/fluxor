@@ -40,6 +40,7 @@ pub mod hygiene;
 // so it can reach `ci`'s own phase runners rather than re-implementing
 // them; the bin dispatches to it.
 pub mod lifecycle;
+pub mod limit_register;
 pub mod lockfile;
 // `standards/make.md` as checkable text: preamble, target set, the
 // canonical lifecycle recipe bodies, and §3 recipe complexity. Driven

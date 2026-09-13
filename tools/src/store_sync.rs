@@ -23,9 +23,47 @@ use crate::store_resolve::{
     sort_entries, write_store_lock, Artifact,
 };
 
-/// Stamp file inside an extracted source tree: contains the artifact
-/// digest the tree was materialised from. Matching stamp = skip.
+/// Stamp file inside an extracted source tree, recording what the tree
+/// was materialised from and what it held when it was written:
+///
+/// ```text
+/// sha256:<artifact digest>      // which revision — matches fluxor.lock
+/// content:<hex>                 // what the tree held — token-canonical
+/// ```
+///
+/// The two lines answer different questions, and only the second is
+/// checkable. `sha256:` names a revision — a claim about where the bytes came
+/// from, which an edit inside the tree leaves standing, so on its own it lets
+/// a consumer diverge from its own pin with nothing able to notice.
+/// `content:` is the bytes themselves, recomputed from the tree on demand by
+/// [`crate::store_publish::tree_content_digest`] with no store access and no
+/// network, so a consumer can verify itself offline. It is the same
+/// token-canonical walk the publisher hashes, so the value also equals the
+/// artifact's published input digest.
+///
+/// A stamp carrying no `content:` line states nothing verifiable about the
+/// tree, so the tree is treated as unverified and re-materialised. The reader
+/// accepts the shorter shape rather than rejecting it: re-extraction is cheap
+/// and leaves the tree correct either way.
 const SYNC_STAMP: &str = ".fluxor-sync-stamp";
+
+/// What a sync stamp records. `content` is `None` when the stamp carries no
+/// content line, which makes the tree unverifiable rather than wrong.
+#[derive(Debug, Clone)]
+pub struct SyncStamp {
+    pub digest: String,
+    pub content: Option<String>,
+}
+
+/// Parse a stamp file. Line 1 is the artifact digest; a later `content:<hex>`
+/// line carries the tree digest.
+pub fn read_sync_stamp(tree: &Path) -> Option<SyncStamp> {
+    let text = fs::read_to_string(tree.join(SYNC_STAMP)).ok()?;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let digest = lines.next()?.to_string();
+    let content = lines.find_map(|l| l.strip_prefix("content:").map(str::to_string));
+    Some(SyncStamp { digest, content })
+}
 
 /// What one `sync_project` run did (or, dry-run, would do).
 #[derive(Debug, Default)]
@@ -288,9 +326,19 @@ fn materialize_artifact(store: &OciStore, project_root: &Path, e: &Artifact) -> 
                 .find(|l| l.media_type == MT_FLUXOR_SOURCE)
                 .ok_or_else(|| missing_layer_err(e))?;
             let dest = project_root.join("target/fluxor").join(&e.name);
-            let stamp = dest.join(SYNC_STAMP);
-            if fs::read_to_string(&stamp).is_ok_and(|s| s.trim() == e.digest) {
-                return Ok(format!("source {} up to date ({})", e.name, dest.display()));
+            // Skip only when the stamp names this revision AND the tree
+            // still holds the bytes that revision published. Re-extraction
+            // is the one thing that puts an edited tree right, so gating it
+            // on the revision alone would make an edited tree permanent:
+            // the stamp still names the pinned revision, and every sync
+            // after the edit short-circuits on that.
+            if let Some(stamp) = read_sync_stamp(&dest) {
+                if stamp.digest == e.digest
+                    && stamp.content.as_deref()
+                        == Some(crate::store_publish::tree_content_digest(&dest)?.as_str())
+                {
+                    return Ok(format!("source {} up to date ({})", e.name, dest.display()));
+                }
             }
             let tar = read_manifest_layer_blob(store, &e.name, &e.digest, &layer.digest)?;
             extract_tree_atomic(&tar, &dest, &e.digest)?;
@@ -375,7 +423,13 @@ fn extract_tree_atomic(tar: &[u8], dest: &Path, digest: &str) -> Result<()> {
         let _ = fs::remove_dir_all(&tmp);
         return Err(err);
     }
-    fs::write(tmp.join(SYNC_STAMP), format!("{digest}\n"))?;
+    // Digest the tree before the stamp joins it (dotfiles are skipped by
+    // `collect_tree`, so the order is belt-and-braces rather than load-bearing).
+    let content = crate::store_publish::tree_content_digest(&tmp)?;
+    fs::write(
+        tmp.join(SYNC_STAMP),
+        format!("{digest}\ncontent:{content}\n"),
+    )?;
     if dest.exists() {
         fs::rename(dest, &old)?;
     }
@@ -808,6 +862,114 @@ pub fn live_staleness_report(project_root: &Path) -> Result<Option<Vec<String>>>
     Ok(Some(findings))
 }
 
+/// Findings about materialised source trees, split by what is known, because
+/// the two states demand different answers.
+///
+/// `drift` is a tree that disagrees with a recorded fact — known wrong, and a
+/// failure. `unverifiable` is a tree whose bytes cannot be checked at all;
+/// nothing is known to be wrong, so it is reported rather than failed, but it
+/// is reported, because an unverifiable tree is exactly where drift goes
+/// unseen.
+#[derive(Debug, Default)]
+pub struct MaterialisationReport {
+    pub drift: Vec<String>,
+    pub unverifiable: Vec<String>,
+}
+
+impl MaterialisationReport {
+    pub fn is_clean(&self) -> bool {
+        self.drift.is_empty() && self.unverifiable.is_empty()
+    }
+}
+
+/// Verify every materialised SOURCE tree against the pin this project itself
+/// recorded. `Ok(None)` when the project pins no source artifact.
+///
+/// Two independent claims are checked, and they fail for different reasons:
+///
+/// - **stamp vs lockfile** — the tree was materialised from a revision the
+///   project does not pin. A hand-edited `fluxor.lock`, or a sync interrupted
+///   between extraction and the lockfile write.
+/// - **tree vs stamp** — the tree does not hold the bytes it was materialised
+///   from. An edit inside `target/fluxor/<artifact>/`, which is generated and
+///   is nobody's to edit.
+///
+/// What this deliberately does NOT ask is whether the pinned revision is the
+/// newest one upstream published. That is `live-staleness`'s question, and it
+/// is a judgement: building what you pinned while upstream moves on is a
+/// defensible state. This question is not a judgement — a project whose disk
+/// disagrees with its own lockfile is incoherent whatever upstream is doing —
+/// so it can be answered absolutely without that absoluteness reaching
+/// upstream. Editing the SDK in the producing project fails no consumer's CI.
+/// Half-updating a consumer does.
+pub fn materialisation_report(project_root: &Path) -> Result<Option<MaterialisationReport>> {
+    let Some(lock) = read_store_lock(project_root)? else {
+        return Ok(None);
+    };
+    let sources: Vec<&Artifact> = lock
+        .artifacts
+        .iter()
+        .filter(|a| a.kind == "source")
+        .collect();
+    if sources.is_empty() {
+        return Ok(None);
+    }
+    let mut r = MaterialisationReport::default();
+    // Every unverifiable tree has the same cause and the same one-command
+    // answer, so they are named together on one line. Repeating the sentence
+    // per artifact buries the cause — which is the part that says what to do
+    // — under its own restatements (same reasoning as `describe_stale`).
+    let mut unverifiable: Vec<&str> = Vec::new();
+    for e in sources {
+        let dest = project_root.join("target/fluxor").join(&e.name);
+        if !dest.is_dir() {
+            r.drift.push(format!(
+                "source '{}' is pinned in fluxor.lock but not materialised at {} — run `fluxor sync`",
+                e.name,
+                dest.display()
+            ));
+            continue;
+        }
+        let Some(stamp) = read_sync_stamp(&dest) else {
+            unverifiable.push(&e.name);
+            continue;
+        };
+        if stamp.digest != e.digest {
+            r.drift.push(format!(
+                "source '{}' was materialised from {} but fluxor.lock pins {} — run `fluxor sync`",
+                e.name, stamp.digest, e.digest
+            ));
+            continue;
+        }
+        let actual = crate::store_publish::tree_content_digest(&dest)?;
+        match stamp.content.as_deref() {
+            Some(recorded) if recorded == actual => {}
+            // Drift is named one tree at a time: each carries its own two
+            // digests, and those are what a reader acts on.
+            Some(recorded) => r.drift.push(format!(
+                "source '{}' at {} does not hold the bytes it was materialised from: \
+                 expected content {recorded}, found {actual}. This tree is generated — \
+                 revert the edit in the project that publishes '{}', republish, then run \
+                 `fluxor sync`",
+                e.name,
+                dest.display(),
+                e.name
+            )),
+            None => unverifiable.push(&e.name),
+        }
+    }
+    if !unverifiable.is_empty() {
+        r.unverifiable.push(format!(
+            "{} source tree(s) under target/fluxor ({}) have no content digest recorded, so \
+             their bytes cannot be verified against the revisions fluxor.lock pins — run \
+             `fluxor sync` to re-materialise them",
+            unverifiable.len(),
+            unverifiable.join(", ")
+        ));
+    }
+    Ok(Some(r))
+}
+
 /// Run one member's module build: the current process's own project
 /// goes through the lib fns; other checkouts spawn the installed
 /// `fluxor` CLI so their build resolves against their own tree.
@@ -954,17 +1116,23 @@ mod tests {
         let lock = read_store_lock(&consumer).unwrap().unwrap();
         assert_eq!(lock.artifacts, report.entries);
 
-        // Tree extracted byte-for-byte, stamp = artifact digest.
+        // Tree extracted byte-for-byte; stamp records BOTH which revision
+        // was extracted and what the tree held when it was written.
         let tree = consumer.join("target/fluxor/producer-common");
         assert_eq!(
             std::fs::read_to_string(tree.join("core.rs")).unwrap(),
             "pub fn forty_two() -> u32 { 42 }\n"
         );
+        let stamp = read_sync_stamp(&tree).unwrap();
+        assert_eq!(stamp.digest, entry.digest);
         assert_eq!(
-            std::fs::read_to_string(tree.join(SYNC_STAMP))
-                .unwrap()
-                .trim(),
-            entry.digest
+            stamp.content.as_deref(),
+            Some(
+                crate::store_publish::tree_content_digest(&tree)
+                    .unwrap()
+                    .as_str()
+            ),
+            "the recorded content digest must be recomputable from the tree"
         );
 
         // Second sync: stamp short-circuits the extraction.
@@ -974,6 +1142,32 @@ mod tests {
             "{:?}",
             again.materialized
         );
+
+        // …but only while the tree still holds those bytes. An edit inside
+        // a generated tree is the drift this stamp exists to catch: the
+        // artifact digest still matches, so a digest-only check would
+        // short-circuit on it forever.
+        std::fs::write(tree.join("core.rs"), "pub fn forty_two() -> u32 { 43 }\n").unwrap();
+        let report = materialisation_report(&consumer).unwrap().unwrap();
+        assert_eq!(report.drift.len(), 1, "{report:?}");
+        assert!(
+            report.drift[0].contains("does not hold the bytes"),
+            "{report:?}"
+        );
+        let healed = sync_project(&consumer, false).unwrap();
+        assert!(
+            !healed.materialized[0].contains("up to date"),
+            "a modified tree must be re-extracted, got {:?}",
+            healed.materialized
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join("core.rs")).unwrap(),
+            "pub fn forty_two() -> u32 { 42 }\n"
+        );
+        assert!(materialisation_report(&consumer)
+            .unwrap()
+            .unwrap()
+            .is_clean());
 
         // ensure_synced replays without re-resolving and stays green.
         let replayed = ensure_synced(&consumer).unwrap();
@@ -1299,9 +1493,11 @@ mod tests {
     }
 
     /// An artifact whose sources are untouched but whose published epoch
-    /// differs is stale for a DIFFERENT reason, and says so. This is the
-    /// case that used to be indistinguishable from an edit, because the
-    /// epoch was concatenated into the input digest.
+    /// differs is stale for a DIFFERENT reason, and says so. The two are
+    /// separable only because the epoch is its own annotation rather than a
+    /// term in the input digest: folded in, an ABI-surface move would be
+    /// indistinguishable from an edit, and a whole project's worth of
+    /// modules would each report a source change nobody made.
     #[test]
     fn epoch_drift_is_a_distinct_reason_from_an_edit() {
         let published = |input: &str, epoch: &str| {

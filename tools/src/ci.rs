@@ -255,6 +255,57 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         check_lockfile_consistency(project_root)
     }));
 
+    // ───── Phase 1.72: SDK materialisation ──────────────────────────
+    //
+    // The lockfile NAMES the SDK revision a project compiles against, but
+    // the compiler reads the materialised tree under `target/fluxor/`, and
+    // nothing downstream of the extraction consults the lockfile again. So
+    // the pin is worth something only while the tree on disk is that pin,
+    // which is what this asserts.
+    //
+    // Hard-fails rather than warns: unlike live-staleness, which reports a
+    // defensible state (you build what you pinned, upstream moved on),
+    // there is no reading under which a tree that disagrees with its own
+    // stamp is intended.
+    {
+        if verbose {
+            eprintln!("[ci] running phase: sdk-materialisation");
+        }
+        let start = Instant::now();
+        let outcome = crate::store_sync::materialisation_report(project_root);
+        let elapsed_ms = start.elapsed().as_millis();
+        results.push(match outcome {
+            Ok(None) => skipped("sdk-materialisation"),
+            Ok(Some(r)) if r.is_clean() => PhaseResult {
+                name: "sdk-materialisation",
+                status: PhaseStatus::Ok,
+                elapsed_ms,
+                message: "every materialised source tree holds the bytes its pin names".to_string(),
+            },
+            Ok(Some(r)) => {
+                let status = if r.drift.is_empty() {
+                    PhaseStatus::Warned
+                } else {
+                    PhaseStatus::Failed
+                };
+                let mut parts = r.drift;
+                parts.extend(r.unverifiable);
+                PhaseResult {
+                    name: "sdk-materialisation",
+                    status,
+                    elapsed_ms,
+                    message: parts.join("; "),
+                }
+            }
+            Err(e) => PhaseResult {
+                name: "sdk-materialisation",
+                status: PhaseStatus::Failed,
+                elapsed_ms,
+                message: e.to_string(),
+            },
+        });
+    }
+
     // ───── Phase 1.75: live staleness ───────────────────────────────
     //
     // Reports when a workspace-member DEPENDENCY has work it has not
@@ -286,6 +337,81 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
             }
             Err(e) => PhaseResult {
                 name: "live-staleness",
+                status: PhaseStatus::Failed,
+                elapsed_ms,
+                message: e.to_string(),
+            },
+        });
+    }
+
+    // ───── Phase 1.78: limit register ───────────────────────────────
+    //
+    // The register of deliberate ceilings, checked against the source it
+    // describes. Fluxor's register states "an id-shaped ceiling found in
+    // source but absent here is a bug" — a rule that is true only while
+    // something checks it, which is what this phase is.
+    //
+    // Omitted entirely for a project with no register: not yet having
+    // written one is not a failure of the gate over it.
+    {
+        let register_rel = limit_register_path(project_root);
+        let coverage_fails = limit_register_coverage_fails(project_root);
+        if verbose {
+            eprintln!("[ci] running phase: limit-register");
+        }
+        let start = Instant::now();
+        let outcome = crate::limit_register::check(project_root, &register_rel);
+        let elapsed_ms = start.elapsed().as_millis();
+        results.push(match outcome {
+            Ok(None) => skipped("limit-register"),
+            Ok(Some(r)) => {
+                let uncovered = r.uncovered.len();
+                let (status, message) = if !r.failures.is_empty() {
+                    (PhaseStatus::Failed, r.failures.join("; "))
+                } else if uncovered > 0 && coverage_fails {
+                    (
+                        PhaseStatus::Failed,
+                        format!(
+                            "{} ceiling(s) over {} row(s) match their source, but {uncovered} \
+                             ceiling-shaped const(s) in register-named files are neither \
+                             registered nor exempt: {}",
+                            r.checked,
+                            r.rows,
+                            preview(&r.uncovered)
+                        ),
+                    )
+                } else if uncovered > 0 {
+                    (
+                        PhaseStatus::Warned,
+                        format!(
+                            "{} ceiling(s) over {} row(s) match their source; {uncovered} \
+                             ceiling-shaped const(s) in register-named files are unregistered \
+                             ({}) — register or exempt them, or set \
+                             `[ci] limit_register_coverage = \"fail\"` once the list is empty",
+                            r.checked,
+                            r.rows,
+                            preview(&r.uncovered)
+                        ),
+                    )
+                } else {
+                    (
+                        PhaseStatus::Ok,
+                        format!(
+                            "{} ceiling(s) over {} row(s) match their source; no unregistered \
+                             ceiling in a register-named file",
+                            r.checked, r.rows
+                        ),
+                    )
+                };
+                PhaseResult {
+                    name: "limit-register",
+                    status,
+                    elapsed_ms,
+                    message,
+                }
+            }
+            Err(e) => PhaseResult {
+                name: "limit-register",
                 status: PhaseStatus::Failed,
                 elapsed_ms,
                 message: e.to_string(),
@@ -1831,10 +1957,12 @@ fn module_manifest_count(project_root: &Path) -> usize {
 /// The vacuity rule, in one place: **a phase that consumed nothing
 /// while its inputs exist is a failure, not a pass.**
 ///
-/// Green-and-empty is the failure mode that survived the last sweep —
-/// `built 0 of 0` in 0 ms, a cargo phase that executed no test, an e2e
-/// phase whose globs matched no file. Each read as a pass because
-/// nothing asserted otherwise. A repo that genuinely has no modules, no
+/// Green-and-empty is the hardest failure to notice, because it looks
+/// exactly like success and costs less time — `built 0 of 0` in 0 ms, a
+/// cargo phase that executed no test, an e2e phase whose globs matched no
+/// file. Nothing in the output distinguishes "checked everything and found
+/// it good" from "checked nothing", so the distinction has to be asserted
+/// here or it is not made at all. A repo that genuinely has no modules, no
 /// tests, or no scripts still passes: `inputs == 0` is not a failure,
 /// `inputs > 0 && consumed == 0` is.
 fn vacuity(
@@ -1963,6 +2091,43 @@ pub fn all_ok(results: &[PhaseResult]) -> bool {
 // import live even when no other path operations land in this file.
 #[allow(dead_code, reason = "imported for the public signature of `run`")]
 type _PathBufRef = PathBuf;
+
+/// Register location, from `[ci] limit_register`, defaulting to the
+/// standard path. A project keeping its register elsewhere says so once.
+fn limit_register_path(project_root: &Path) -> String {
+    read_ci_string(project_root, "limit_register")
+        .unwrap_or_else(|| crate::limit_register::DEFAULT_REGISTER.to_string())
+}
+
+/// Whether unregistered ceilings fail rather than warn
+/// (`[ci] limit_register_coverage = "fail"`). Opt-in: a project promotes the
+/// report to a gate once it has worked its list to zero, so the ratchet is
+/// deliberate rather than a wall a project meets on upgrade.
+fn limit_register_coverage_fails(project_root: &Path) -> bool {
+    read_ci_string(project_root, "limit_register_coverage").as_deref() == Some("fail")
+}
+
+/// One `[ci]` string key out of `fluxor.toml`. A missing file, an
+/// unparseable one, or an absent key all read as unset — the schema phase
+/// is what reports a malformed manifest, not every reader of it.
+fn read_ci_string(project_root: &Path, key: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(project_root.join("fluxor.toml")).ok()?;
+    let doc: toml::Value = toml::from_str(&raw).ok()?;
+    doc.get("ci")?.get(key)?.as_str().map(str::to_string)
+}
+
+/// A few entries plus a count — enough to act on, short enough to read.
+fn preview(items: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if items.len() <= SHOWN {
+        return items.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        items[..SHOWN].join(", "),
+        items.len() - SHOWN
+    )
+}
 
 #[cfg(test)]
 mod tests {

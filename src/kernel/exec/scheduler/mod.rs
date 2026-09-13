@@ -451,9 +451,10 @@ pub fn open_channels(edges: &mut [Edge]) -> i32 {
             {
                 const MAX_CHAN_BYTES: u32 = 4 * 1024 * 1024;
                 if buf_size > MAX_CHAN_BYTES {
-                    // A request above the channel ceiling used to be
-                    // silently clamped — the producer then believed it
-                    // had headroom it didn't. Loud beats wedged.
+                    // Refuse loudly rather than clamp to the ceiling: a
+                    // clamped producer believes it has headroom it does
+                    // not, and discovers otherwise as a wedge under load
+                    // rather than as a config error at graph build.
                     log::error!(
                         "[graph] edge {}→{}: requested buffer {} exceeds the \
                          channel ceiling {} — lower the request or split the stream.",

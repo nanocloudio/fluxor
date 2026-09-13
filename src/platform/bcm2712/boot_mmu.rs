@@ -181,9 +181,9 @@ mod pi5_impl {
         table[3] = dram_block(0x0_C000_0000);
 
         // 0x1_0000_0000 .. 0x1_3FFF_FFFF: real DRAM on 8/16 GB Pi 5
-        // boards. No longer used as DMA target (see PCIE1_DMA_ARENA
-        // comment in bcm2712/net.rs) — mapped as regular cacheable
-        // DRAM in case a future consumer wants it.
+        // boards. Not a DMA target (see the PCIE1_DMA_ARENA comment in
+        // bcm2712/net.rs) — mapped as regular cacheable DRAM so a
+        // consumer that wants plain memory here has it.
         table[4] = dram_block(0x1_0000_0000);
         // 0x1_4000_0000 .. 0x1_7FFF_FFFF: more PCIe space (device)
         table[5] = device_block(0x1_4000_0000);

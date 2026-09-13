@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 /// directories — no symlink dereference is needed. The result
 /// satisfies `canonical_tar`'s ordering contract and reproduces the
 /// shape `fluxor sync` extracts.
-fn collect_tree(root: &Path, prefix: Option<&str>) -> Result<Vec<(String, Vec<u8>)>> {
+pub(crate) fn collect_tree(root: &Path, prefix: Option<&str>) -> Result<Vec<(String, Vec<u8>)>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -60,7 +60,7 @@ fn collect_tree(root: &Path, prefix: Option<&str>) -> Result<Vec<(String, Vec<u8
 /// their canonicalized token stream (comment/format churn is
 /// digest-neutral, same property as the srcpin), everything else by
 /// raw bytes; each entry folds its path so renames move the digest.
-fn input_digest_hex(files: &[(String, Vec<u8>)]) -> String {
+pub(crate) fn input_digest_hex(files: &[(String, Vec<u8>)]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for (path, bytes) in files {
@@ -79,6 +79,23 @@ fn input_digest_hex(files: &[(String, Vec<u8>)]) -> String {
     }
     let d = h.finalize();
     d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Token-canonical content digest of a MATERIALISED source tree, computed
+/// the same way `input_digest_hex` computes a publisher's.
+///
+/// The publish side walks `modules/sdk` under the `sdk` tar prefix; the
+/// consumer side walks the extracted `target/fluxor/fluxor-abi/`, whose
+/// entries already carry that prefix. Both therefore present the same
+/// `(rel_path, bytes)` set, so the two digests are equal exactly when the
+/// extracted tree still holds the bytes that were published. Dotfiles are
+/// skipped by `collect_tree`, so the stamp does not hash itself.
+///
+/// This is what makes the sync stamp a CHECKABLE claim rather than an
+/// assertion: a hand-edit inside an extracted tree moves this digest while
+/// leaving the recorded artifact digest untouched.
+pub(crate) fn tree_content_digest(root: &Path) -> Result<String> {
+    Ok(input_digest_hex(&collect_tree(root, None)?))
 }
 
 /// Where `fluxor ci` records the input digests it went green on:
@@ -221,12 +238,14 @@ pub fn publish_project_to_store(
     // Retire tags for modules this project no longer has, BEFORE opening
     // the publish transaction.
     //
-    // Publishing only ever ADDED tags, so a module deleted from the source
-    // tree kept its artefact in the store forever — at whatever ABI epoch it
-    // was last built against. Every consumer resolving this project then saw
-    // a mixed-epoch set and refused to sync, naming a module nobody could
-    // rebuild because its source was gone. `fluxor update` cannot fix that:
-    // there is nothing left to advance it to.
+    // A publish that only ever ADDED tags would leave a module deleted from
+    // the source tree holding its artefact in the store forever, at whatever
+    // ABI epoch it was last built against. Every consumer resolving this
+    // project would then see a mixed-epoch set and refuse to sync, naming a
+    // module nobody can rebuild because its source is gone — and `fluxor
+    // update` cannot resolve that, since there is nothing left to advance it
+    // to. Retirement is what keeps the published set a function of the
+    // current tree rather than of every tree there has ever been.
     //
     // Before the transaction rather than after, for two reasons. `remove`
     // takes the same store lock `begin_publish` holds, so doing it inside

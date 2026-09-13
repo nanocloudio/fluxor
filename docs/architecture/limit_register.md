@@ -55,7 +55,7 @@ means editing its row here in the same change.
 | HTTP route table | `MAX_ROUTES` | modules/sdk/abi/config.rs | 8 | Policy: a config declaring more routes is a compose-time error |
 | Provider chain depth per contract | `MAX_CHAIN_DEPTH` | src/kernel/module/provider.rs | — | Policy, per-profile (3 RP2040 / 4 RP2350 / 8 aarch64-host); registration past the ceiling is refused EBUSY |
 | KEY_VAULT key slots | `MAX_SLOTS` | src/kernel/security/key_vault.rs | 8 | Policy: generate/import with no free slot is refused ENOMEM |
-| fat32 open files | `MAX_OPEN_FILES` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (32 aarch64 / 8 elsewhere): a multi-tenant node runs several independent consumers against one volume at once, where a microcontroller's consumer set is fixed and each handle costs a scratch buffer. An open past the table is refused ENFILE, with a log line naming the handles that hold it. The `max_open_per_owner` parameter adds a per-owner ceiling on top, refusing the owner that is over its share while the table still has room, so the failure lands on the workload at fault rather than on whoever asks next |
+| fat32 open files | `MAX_OPEN_FILES` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (256 aarch64 / 8 elsewhere): a multi-tenant node runs several independent consumers against one volume at once, where a microcontroller's consumer set is fixed and each handle costs a scratch buffer. An open past the table is refused ENFILE, with a log line naming the handles that hold it. The `max_open_per_owner` parameter adds a per-owner ceiling on top, refusing the owner that is over its share while the table still has room, so the failure lands on the workload at fault rather than on whoever asks next |
 | fat32 directory-walk budget | `DIR_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: directory sectors one `provider_call` reads before returning EAGAIN with its position saved. A directory with thousands of entries is not exotic — a WAL that segments per snapshot fills one — so an unbounded walk is a latent stall of every module sharing the lane, not a slow path |
 | fat32 long-name length | `LFN_MAX_CHARS` | modules/foundation/fat32/mod.rs | 64 | Policy: the format allows 255, but a buffer for that is carried in the directory cursor and in every wanted-name argument, on a board whose whole module state is measured against a 256 KiB arena. A longer name is refused at creation, not clipped. Names longer than this that were written elsewhere are still preserved and retired correctly — preservation walks the companion run without decoding it, so only matching and generation are bounded |
 | fat32 free-cluster scan | `FAT_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: FAT sectors one `provider_call` reads looking for a free cluster before returning EAGAIN with its cursor saved. Matches `DIR_SCAN_BUDGET_SECTORS` for the same reason — a synchronous device read inside a dispatch is charged to the cooperative step budget, and the FAT of a large volume is far too big to walk in one |
@@ -97,3 +97,127 @@ means editing its row here in the same change.
 | TLS strict-profile send hold | `TX_HOLD_SIZE` | modules/foundation/tls/continuity.rs | — | Derived, not chosen: every record one `CMD_SEND` (`MAX_CMD_DATA` bytes) can produce, since the clear-side frame is consumed whole and each of its records must wait for its own send horizon — six records of `WIRE_RECORD_MAX`, about 9.3 KiB per session, paid in every session slot whether or not it is mirrored. A producer that exceeds the contract's frame ceiling fills the hold and the session fails rather than the record being dropped |
 | QUIC 1-RTT self-grant block | `LOCAL_PN_BLOCK` | modules/foundation/quic/connection.rs | 4096 | Policy: the send packet-number block a connection self-grants in local (non-durable) mode, refilled `LOCAL_PN_REFILL_LOW` (512) values ahead of exhaustion so the reservation never stalls a healthy sender. Matches the directory's smoke-path reserve size; in durable mode the directory chooses the block |
 | declared step cost (`[execution] max_step_us`) | `STEP_BUDGET_DEFAULT_TICK_US` | tools/src/target_facts.rs | 1000 | Policy: the scheduler's default pass budget (`DEFAULT_TICK_US`, one tick) on every silicon; a manifest whose step cannot fit one default pass on a target it names is refused at parse. Per-target in shape so a slower part can publish a smaller budget |
+
+## Machine-checked block
+
+The tables above carry the reasoning; prose is not parseable, so the same
+ceilings are restated here in the form `fluxor ci`'s `limit-register` phase
+reads: `NAME | source path | right-hand side`. The right-hand side is
+compared textually after whitespace normalisation, so a row records what the
+source says rather than an evaluated number — `8 * 1024 * 1024` stays
+`8 * 1024 * 1024`.
+
+A constant declared once per `cfg` profile gets one row per profile, and the
+gate compares the whole set: a profile added, removed, or retuned is drift.
+Matching a single declaration would leave every profile the register does not
+happen to quote free to move — the per-profile constants here span three
+deployment classes, so that is most of them.
+
+Editing a constant means editing its row. The gate also requires every name
+here to appear in the prose above, so the two halves cannot diverge into two
+registers, and reports ceiling-shaped constants in these files that no row
+covers — which is what makes "an id-shaped ceiling found in source but absent
+here is a bug" a measured number rather than a sentence.
+
+```limit-register
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 256
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 16
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 256
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 16
+MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 4096
+MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8
+MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 32
+MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 8
+MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 4
+MAX_CONTRACTS | src/kernel/module/provider.rs | 64
+CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 28
+MAX_MODULES | modules/sdk/abi/config.rs | 192
+MAX_MODULES | modules/sdk/abi/config.rs | 48
+MAX_MODULES | modules/sdk/abi/config.rs | 32
+MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | 256
+MAX_OWNERS | src/kernel/workload/owner.rs | 64
+MAX_OWNERS | src/kernel/workload/owner.rs | 1
+MAX_PATH | modules/sdk/abi/config.rs | 200
+MAX_PATH | modules/sdk/abi/config.rs | 32
+PAYLOAD_MAX | modules/sdk/contracts/exchange.rs | 8192
+KEY_MAX | modules/sdk/contracts/exchange.rs | 512
+PUBLISH_FRAME_MAX | modules/sdk/contracts/exchange.rs | PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX
+REPLY_FRAME_MAX | modules/sdk/contracts/exchange.rs | REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX
+CAPACITY | src/kernel/sys/telemetry_ring.rs | 4096
+CAPACITY | src/kernel/sys/telemetry_ring.rs | 8192
+CAPACITY | src/kernel/sys/telemetry_ring.rs | 32768
+RING_CONSUMERS | modules/sdk/contracts/telemetry.rs | 4
+TELEMETRY_MAX_RECORD | src/kernel/exec/scheduler/module_types.rs | 144
+DIM_MAX_PRODUCT | modules/sdk/contracts/telemetry.rs | 65534
+MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 1024 * 1024
+MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 384 * 1024
+MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024
+MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 256 * 1024
+MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 32 * 1024
+STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024 * 1024
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 96 * 1024 * 1024
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024
+MAX_CHAN_BYTES | src/kernel/ipc/channel.rs | 4 * 1024 * 1024
+MAX_CONNS | modules/sdk/abi/config.rs | 64
+MAX_CONNS | modules/sdk/abi/config.rs | 8
+MAX_CONNS | modules/sdk/abi/config.rs | 2
+MAX_SESSIONS | modules/sdk/abi/config.rs | 512
+MAX_SESSIONS | modules/sdk/abi/config.rs | 64
+MAX_SESSIONS | modules/sdk/abi/config.rs | 4
+MAX_STREAMS | modules/sdk/abi/config.rs | 4
+MAX_ROUTES | modules/sdk/abi/config.rs | 8
+MAX_ROUTES | modules/sdk/abi/config.rs | 4
+MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 3
+MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 4
+MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 8
+MAX_SLOTS | src/kernel/security/key_vault.rs | 8
+MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 256
+MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8
+DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32
+LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64
+FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32
+MAX_FENCES | modules/foundation/fat32/mod.rs | MAX_OPEN_FILES
+MAX_PENDING | modules/foundation/dns/mod.rs | 8
+MAX_HOSTS | modules/foundation/dns/mod.rs | 16
+MAX_NAME_LEN | modules/foundation/dns/mod.rs | 255
+MAX_NAME_PTR_HOPS | modules/foundation/dns/mod.rs | 16
+MAX_SECTION_RRS | modules/foundation/dns/mod.rs | 32
+MAX_CNAME_HOPS | modules/foundation/dns/mod.rs | 4
+MAX_CHAIN_BYTES | modules/foundation/dns/mod.rs | 384
+MAX_SYNTH_ADDRS | modules/foundation/dns/mod.rs | 8
+MAX_DNS64_EXCLUDES | modules/foundation/dns/mod.rs | 16
+DNS64_TTL_CAP_S | modules/foundation/dns/mod.rs | 600
+MAX_ZONE_RRS | modules/foundation/dns/mod.rs | 64
+MAX_ZONE_RRS | modules/foundation/dns/mod.rs | 16
+MAX_UPDATE_RRS | modules/foundation/dns/mod.rs | 32
+MAX_ZONE_NAME | modules/foundation/dns/mod.rs | 128
+MAX_ZONE_RDATA | modules/foundation/dns/mod.rs | 128
+MAX_UPDATE_KEYS | modules/foundation/dns/mod.rs | 4
+MAX_TSIG_FUDGE_S | modules/foundation/dns/mod.rs | 300
+MAX_TXN_CACHE | modules/foundation/dns/mod.rs | 4
+TXN_RETAIN_MS | modules/foundation/dns/mod.rs | 30000
+MAX_COMMIT_WRITES | modules/foundation/dns/mod.rs | 64
+MAX_OPEN | modules/foundation/mount/mod.rs | 64
+MAX_LAYERS | modules/foundation/ota_registry/mod.rs | 48
+MAX_DMA_MAPS | modules/foundation/smmu/mod.rs | 32
+MAX_SHADOW_SLOTS | modules/foundation/quic/continuity.rs | 2
+CHECKPOINT_RECORD_MAX | modules/foundation/quic/continuity.rs | 16384
+ARP_WAIT_MAX | modules/foundation/ip/mod.rs | 64
+RX_DESC_COUNT | modules/drivers/rp1_gem/mod.rs | 192
+FAN_FRAMES_PER_STEP | src/kernel/exec/scheduler/module_types.rs | 64
+ALLOC_SCAN_SLICE | modules/foundation/ip/mod.rs | 256
+SWEEP_SLICE_MAX | modules/foundation/ip/mod.rs | 1024
+MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 8
+MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 2
+MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 1
+FENCE_WIRE_WAIT_MS | modules/foundation/ip/mod.rs | 500
+NET_OUT_FRAME_MAX | modules/foundation/ip/mod.rs | 9
+MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 2
+MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 1
+TLS_CKPT_RECORD_MAX | modules/foundation/tls/continuity.rs | CKPT_FIXED_LEN + RECV_BUF_SIZE + RETX_BUF_SIZE + TLS_SEALED_LEN
+TX_HOLD_SIZE | modules/foundation/tls/continuity.rs | TX_HOLD_RECORDS * WIRE_RECORD_MAX
+LOCAL_PN_BLOCK | modules/foundation/quic/connection.rs | 4096
+STEP_BUDGET_DEFAULT_TICK_US | tools/src/target_facts.rs | 1000
+```

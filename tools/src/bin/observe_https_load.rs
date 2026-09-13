@@ -296,8 +296,8 @@ struct Config {
     concurrent_reqs: u64,
     stability_s: u64,
     stability_qps: u64,
-    /// Optional override of the diag sample count. When unset, the
-    /// historical default `DIAG_SAMPLE_COUNT = 30` is used.
+    /// Optional override of the diag sample count. When unset,
+    /// `DIAG_SAMPLE_COUNT = 30` is used.
     /// Documented mostly so the ECDH-pool cliff at handshake #17 can
     /// be exercised by running 80–128 fresh handshakes per slot in a
     /// single rig run without restarting the kernel.
@@ -314,9 +314,8 @@ struct Config {
     /// the rig tears down cleanly. Per-request samples include the
     /// handshake cost ONLY on request 0 of each session, so the
     /// aggregate p50 reflects steady-state per-request cost.
-    /// Default 0 keeps the historical fresh-handshake-per-request
-    /// shape (matches the rig's http module before HTTP/1.1
-    /// keep-alive landed in commit bdde108).
+    /// Default 0 gives a fresh handshake per request, which measures
+    /// handshake cost rather than steady-state request cost.
     keepalive_requests_per_conn: u64,
 }
 
@@ -536,23 +535,23 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
 
     // ── Diagnostic phase: per-stage latency breakdown ──
     //
-    // The reqwest-based phases 0–3 used to dominate every request
-    // with ~60 ms of client-side overhead (pool bookkeeping, fresh
-    // Client::new() in the handshake phase, hyper cold-start). To
-    // stop that hiding what Fluxor is actually doing, every phase
-    // below now drives `tokio::net::TcpStream` + `tokio_rustls`
-    // directly via `timed_request` / `manual_request_with_timeout`.
-    // This phase emits the per-stage breakdown that named the
-    // overhead in the first place — kept as the first signal so
-    // the operator sees it before the aggregate numbers.
+    // A general-purpose HTTP client costs ~60 ms per request here in
+    // its own overhead — pool bookkeeping, `Client::new()`, hyper
+    // cold-start — which is far more than the server under test
+    // spends, so it would swamp the measurement rather than colour
+    // it. Every phase below therefore drives
+    // `tokio::net::TcpStream` + `tokio_rustls` directly via
+    // `timed_request` / `manual_request_with_timeout`. This phase
+    // breaks one request into its per-stage costs, and runs first so
+    // the operator can confirm the client side is absent from the
+    // aggregate numbers that follow rather than assuming it.
     run_diag_phase(&target, tls_config.clone(), cfg.diag_samples).await;
 
     // ── Phase 0: handshake rate ──
     // Every iteration drives a fresh TCP + TLS handshake + HTTP GET
     // via the manual rustls path so the measured rate reflects the
-    // rig's actual capacity (rather than reqwest::Client::new() +
-    // hyper-pool cold-start overhead, which we measured at ~60 ms
-    // per request in the previous iteration of this probe).
+    // rig's actual capacity rather than client-side setup cost
+    // (~60 ms per request through a pooled general-purpose client).
     let t0 = Instant::now();
     let mut hs_ok: u64 = 0;
     let mut hs_errs = ErrorTally::default();
@@ -582,12 +581,11 @@ async fn attach(invocation: &Value) -> Result<(), u8> {
     // ── Phase 1: throughput (sequential, single-stream) ──
     // Two modes, picked by `keepalive_requests_per_conn` in the
     // binding:
-    //   ≤ 1 (default): historical fresh-handshake-per-request
-    //                  shape. Every request pays a full TCP+TLS
-    //                  cycle (the http module honors the probe's
-    //                  `Connection: close`). This was the shape
-    //                  before the keep-alive work landed; useful
-    //                  as a handshake-stress measurement.
+    //   ≤ 1 (default): fresh handshake per request. Every request
+    //                  pays a full TCP+TLS cycle (the http module
+    //                  honors the probe's `Connection: close`), so
+    //                  the phase measures handshake cost under
+    //                  stress rather than steady-state throughput.
     //   > 1:           keep-alive shape. Each TCP+TLS session
     //                  serves N requests with `Connection: keep-
     //                  alive` (the last one in each session sends

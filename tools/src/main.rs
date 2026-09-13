@@ -53,6 +53,10 @@ pub(crate) use fluxor_tools::presentation_resolver;
 // store flow as `crate::store_resolve` / `crate::store_sync`; re-export
 // the lib's single copies here so both compile contexts resolve them
 // (same pattern as observability above).
+// `ci.rs` runs the limit-register gate as `crate::limit_register`; it is
+// lib-only (pure text analysis over the register and its sources), so the
+// bin reaches the lib's single copy rather than mounting it twice.
+pub(crate) use fluxor_tools::limit_register;
 pub(crate) use fluxor_tools::store_resolve;
 pub(crate) use fluxor_tools::store_sync;
 // `ci.rs` runs the `fluxor.toml` schema and Makefile-conformance
