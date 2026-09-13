@@ -2224,7 +2224,7 @@ mod bcm2712_impl {
             //   11=lowerEL FIQ, 12=lowerEL SError.
             ".global fluxor_el1_catch",
             ".global fluxor_el1_sync_vec",
-            "fluxor_el1_sync_vec:", // back-compat alias: EL1h sync
+            "fluxor_el1_sync_vec:", // named entry for the EL1h sync slot
             "mov   w17, #3",
             "fluxor_el1_catch:",
             // Regardless of whether an EL0 step is active, this is a kernel-side

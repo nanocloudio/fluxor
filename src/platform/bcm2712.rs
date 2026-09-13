@@ -428,19 +428,13 @@ global_asm!(
 fn instantiate_and_activate(
     module_list: &[Option<fluxor::kernel::boot::config::ModuleEntry>],
     module_count: usize,
-) -> usize {
+) -> Result<usize, usize> {
     // Mask IRQs during module instantiation
     let _inst_guard = fluxor::kernel::sys::guard::KernelGuard::acquire();
 
-    // Establish plan ownership BEFORE instantiation: the caller's prepare_graph
-    // reset every module to the system owner, and module_new (in the loop below)
-    // records provider handles under the module's owner at open time — so
-    // ownership must be live first, or those handles are permanently
-    // system-owned and bypass tenant isolation. Also re-applies the retained
-    // plan on a rebuild (an ordinary rebuild must not drop isolation). Fail
-    // closed: a staged-but-invalid plan rejects the graph rather than running it
-    // system-owned (which would disable ownership isolation).
-    if let Err(e) = fluxor::kernel::workload::owner_plan::apply_staged() {
+    // Ownership must be live before any provider handle is opened. See `kernel::exec::bare_metal` for why the
+    // ordering is load-bearing and why this fails closed.
+    if let Err(e) = fluxor::kernel::exec::bare_metal::apply_owner_plan() {
         panic!("[owner] staged plan invalid ({e:?}); refusing to run the graph with ownership isolation disabled");
     }
 
@@ -449,6 +443,7 @@ fn instantiate_and_activate(
     // SAFETY: scheduler-thread mutable access during graph instantiation.
     let sched = unsafe { scheduler::sched_mut() };
     let mut total_mods = 0usize;
+    let mut failed = 0usize;
     for (module_idx, slot) in module_list.iter().enumerate().take(module_count) {
         let entry = match slot {
             Some(e) => e,
@@ -502,9 +497,19 @@ fn instantiate_and_activate(
                     uart_puts(b"[inst] module ");
                     uart_put_u32(module_idx as u32);
                     uart_puts(b" pending timeout\r\n");
+                    failed += 1;
                 }
             }
-            scheduler::InstantiateResult::Error(_) => {}
+            scheduler::InstantiateResult::Error(e) => {
+                // Was an empty arm: a module could fail to load and leave no
+                // trace. See `bare_metal::instantiation_is_fail_closed`.
+                uart_puts(b"[inst] module ");
+                uart_put_u32(module_idx as u32);
+                uart_puts(b" failed rc=");
+                uart_put_u32(e as u32);
+                uart_puts(b"\r\n");
+                failed += 1;
+            }
         }
     }
 
@@ -565,7 +570,14 @@ fn instantiate_and_activate(
     }
 
     drop(_inst_guard);
-    total_mods
+    // Fail closed: a module that did not instantiate leaves its ports
+    // unwired, so the graph that would run is not the graph that was asked
+    // for. `Err` carries the failure count; the caller decides how loudly to
+    // refuse. See `bare_metal::instantiation_is_fail_closed`.
+    if failed > 0 && fluxor::kernel::exec::bare_metal::instantiation_is_fail_closed() {
+        return Err(failed);
+    }
+    Ok(total_mods)
 }
 
 /// Number of domains that have at least one module in the compiled graph.
@@ -640,9 +652,9 @@ fn bridge_cross_domain_edges() -> Result<usize, &'static str> {
         // a FIFO ring, the consumer's next `channel_read` returns
         // multiple envelopes coalesced, and only the first parses
         // cleanly. POLL_IN also stays latched on the leftover bytes,
-        // driving the consumer module to spin on phantom reads. See
-        // `tests/ws.rs::cross_domain_pump_*` for the host-side
-        // regression coverage.
+        // driving the consumer module to spin on phantom reads.
+        // `tests/ws.rs::cross_domain_pump_*` covers this seam on
+        // the host.
         if channel::channel_is_mailbox(edge_snapshot.channel) {
             channel::channel_set_mailbox(in_ch);
         }
@@ -769,12 +781,22 @@ fn poll_rebuild_bridge(domain_id: usize) {
             // exec mode — changing tiers needs a reboot-class system update.
             match bridge_cross_domain_edges() {
                 Ok(bridges) => {
-                    let n = instantiate_and_activate(&module_list, module_count);
-                    let domains = active_domain_count();
-                    log::warn!(
-                        "[reconfigure] rebuilt graph: {n} modules, {domains} domain(s), \
-                         {bridges} cross-domain bridge(s)"
-                    );
+                    match instantiate_and_activate(&module_list, module_count) {
+                        Ok(n) => {
+                            let domains = active_domain_count();
+                            log::warn!(
+                                "[reconfigure] rebuilt graph: {n} modules, {domains} domain(s), \
+                                 {bridges} cross-domain bridge(s)"
+                            );
+                        }
+                        // A rebuild that cannot instantiate is refused, not
+                        // run partially. The node stays up with the graph it
+                        // has rather than silently becoming a different one.
+                        Err(failed) => log::error!(
+                            "[reconfigure] rebuild refused: {failed} module(s) failed to \
+                             instantiate; the graph would run with unwired ports"
+                        ),
+                    }
                 }
                 Err(msg) => {
                     log::error!("[reconfigure] {msg}; graph left idle");
@@ -875,8 +897,8 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     rp1::cooling_full_on();
 
     // PCIe1 bring-up: stages 1 + 2a + 2b (reset/RESCAL + RC-wide regs
-    // + MDIO tuning). Stage 2c onwards (SerDes/PERST#/link) is deferred
-    // pending cold-boot stability work.
+    // + MDIO tuning). Stage 2c onwards (SerDes/PERST#/link) is not driven
+    // from here.
     {
         let n = fluxor::platform::pcie::enumerate();
         log::info!("[pcie] bus1 devices={n}");
@@ -1109,7 +1131,22 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     }
 
     // Instantiate + activate the compiled graph (shared with live rebuild).
-    let total_mods = instantiate_and_activate(&module_list, module_count);
+    let total_mods = match instantiate_and_activate(&module_list, module_count) {
+        Ok(n) => n,
+        Err(failed) => {
+            // Fail closed at boot. Running a graph whose modules did not all
+            // load converts a loud, local failure into a silent one that
+            // surfaces later as missing data, far from the cause.
+            uart_puts(b"[inst] REFUSING GRAPH: ");
+            uart_put_u32(failed as u32);
+            uart_puts(b" module(s) failed to instantiate\r\n");
+            loop {
+                // SAFETY: WFI is a hint to halt the core; the same fail-stop
+                // this file already uses for a failed config parse.
+                unsafe { core::arch::asm!("wfi") };
+            }
+        }
+    };
 
     uart_puts(b"[inst] ");
     uart_put_u32(total_mods as u32);
@@ -1199,8 +1236,8 @@ impl DomainMetrics {
 static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
     [const { DomainMetrics::new() }; multicore::MAX_DOMAINS];
 
-/// Arm this core's next Tier-0 deadline from the pass just finished (RFC
-/// adaptive_tick §5.5 arm-after-step). The kernel pacer chooses the next-pass
+/// Arm this core's next Tier-0 deadline from the pass just finished. The
+/// kernel pacer chooses the next-pass
 /// period (µs) from the domain's busy/idle + worst-step signals; we convert to
 /// generic-timer ticks and write this core's `NEXT_DEADLINE_TICKS` slot, which
 /// the `TIMER_PPI` handler reloads on the next fire. The IRQ-driven reload means
@@ -1211,10 +1248,10 @@ static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
 /// the pacer, so the slot keeps its boot-seeded value and cadence is
 /// byte-identical to the non-adaptive kernel. Variable cadence (mechanisms
 /// (a)/(b)) becomes active only when a domain sets adaptive flags; on bcm2712
-/// multicore it also relies on the §5.4 SEV/WFI wake bound and the §5.1
+/// multicore it also relies on the SEV/WFI wake bound described below and the
 /// per-domain wake mask.
 ///
-/// §5.4 SEV-vs-WFI bound: the Tier-0 loop idles on `WFI`, broken only by an IRQ.
+/// SEV-vs-WFI bound: the Tier-0 loop idles on `WFI`, broken only by an IRQ.
 /// IRQ-backed wakes (device interrupts) break it immediately, but a
 /// cross-domain / software wake only sets `EVENT_WAKE_PENDING` — it does NOT
 /// raise an IRQ, so it cannot cut short a widened idle `WFI`; that wake is
@@ -1224,8 +1261,8 @@ static mut DOMAIN_METRICS: [DomainMetrics; multicore::MAX_DOMAINS] =
 /// directly is the measured alternative). The clamp only bites when the pacer
 /// relaxes past it (idle (a) → tick_max, or (b) near tick_max); busy passes
 /// return ≤ the nominal tick, far below it, so steady-state and the
-/// non-adaptive default are untouched. Rig-tunable (AC1 idle-wakeup vs AC2
-/// wake-latency trade-off).
+/// non-adaptive default are untouched. Rig-tunable: it trades idle wakeups
+/// against worst-case software-wake latency.
 const BCM_IDLE_DEADLINE_CLAMP_US: u32 = 4_000;
 
 /// Most-relaxed deadline (µs) core 0's pacer chose since the last `[therm]`
@@ -1237,7 +1274,7 @@ static DL0_MAX_US: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 
 /// Per-domain next-deadline (µs) produced by the most recent `domain_step_all`
 /// (the resident-graph runner / single-graph pacer). `arm_next_deadline` reads
-/// it instead of re-querying the pacer, so a multi-graph domain arms the §7.2
+/// it instead of re-querying the pacer, so a multi-graph domain arms the
 /// merged deadline rather than the per-domain single-graph one. Always written
 /// by `domain_step_all` before `arm_next_deadline` runs in the same loop body.
 static DOMAIN_RUNNER_DEADLINE_US: [core::sync::atomic::AtomicU32; multicore::MAX_DOMAINS] =
@@ -1246,21 +1283,21 @@ static DOMAIN_RUNNER_DEADLINE_US: [core::sync::atomic::AtomicU32; multicore::MAX
 #[inline]
 fn arm_next_deadline(domain_id: usize, core_id: usize) {
     // The runner already chose this domain's next deadline during the preceding
-    // `domain_step_all` (resident-graph §7.2 merge, or the single-graph pacer).
+    // `domain_step_all` (the resident-graph merge, or the single-graph pacer).
     let raw_us = if domain_id < multicore::MAX_DOMAINS {
         DOMAIN_RUNNER_DEADLINE_US[domain_id].load(Ordering::Relaxed)
     } else {
         scheduler::pacer_next_deadline_us(domain_id)
     };
-    // The §5.4 software-wake latency clamp applies ONLY to an adaptive relaxed
+    // The software-wake latency clamp applies ONLY to an adaptive relaxed
     // deadline. A fixed domain (adaptive_flags == 0) gets `domain_tick_us`
     // verbatim from the pacer and must keep it — clamping a 10 ms fixed tick to
     // 4 ms would silently re-pace it and break the byte-identical non-adaptive
     // cadence guarantee. Only mechanisms (a)/(b) can relax past the clamp.
     let next_us = if scheduler::domain_adaptive_flags(domain_id) != 0 {
-        // The clamp must NOT undercut the §5.3 floor. The pacer never returns
-        // below `floor = max(tick_min_us, worst_step × MARGIN)`; arming below it
-        // (e.g. tick_min_us > 4 ms, or a live worst-step floor > 4 ms) would run
+        // The clamp must NOT undercut the pacer's floor: the pacer never
+        // returns below `floor = max(tick_min_us, worst_step × MARGIN)`; arming
+        // below it (e.g. tick_min_us > 4 ms, or a live worst-step floor > 4 ms) would run
         // the domain faster than its worst-step budget admits — a budget/floor
         // contract break. Cap relaxation at `max(CLAMP, floor)`: the clamp still
         // bounds software-wake latency when the floor is under it; a domain that
@@ -1593,8 +1630,8 @@ fn run_domain_loop(domain_id: usize) -> ! {
                 // live-rebuild bridge (cooperative / Tier 0 primary).
                 poll_rebuild_bridge(domain_id);
                 // Arm-after-step: pick the next deadline from this pass and
-                // write the per-core slot before looping back to WFI (RFC
-                // adaptive_tick §5.5 vii). Byte-identical when adaptive_flags==0.
+                // write the per-core slot before looping back to WFI.
+                // Byte-identical when adaptive_flags==0.
                 arm_next_deadline(domain_id, core_id);
             }
         }
@@ -1611,7 +1648,7 @@ fn domain_step_all(domain_id: usize) {
     // SAFETY: per-domain pump runs on the domain's owning core.
     let sched = unsafe { scheduler::sched_mut() };
     // Multi-graph runtime: with more than one resident graph in this domain,
-    // steps each owner independently, skips idle owners, and returns the §7.2
+    // steps each owner independently, skips idle owners, and returns the
     // merged deadline. Byte-identical to `step_domain_modules` +
     // `pacer_next_deadline_us(domain)` with one resident graph. The deadline
     // is stashed for the arm-after-step write below.
@@ -1825,8 +1862,8 @@ fn secondary_core_main(domain_id: usize) -> ! {
     // may run faster than the global tick; a Tier-0 lane domain may run
     // slower. Storing the domain's tick into THIS core's deadline slot is
     // what makes the rate stick: the TIMER_PPI handler reloads from the
-    // per-core slot, so the rate is no longer clobbered by a shared global on
-    // the first IRQ.
+    // per-core slot, so the domain's rate survives the first IRQ rather than
+    // being taken from a shared global.
     let domain_tick = scheduler::domain_tick_us(domain_id);
     let freq = timer::timer_freq();
     let ticks_for_domain = if freq > 0 {
@@ -1930,28 +1967,27 @@ fn bcm_restore_interrupts(saved: u32) {
 }
 
 /// WFI wake-doorbell toggle. Default OFF: the wake path emits only `SEV`,
-/// paired with the `tick_max_us` idle clamp (mitigation 1). When ON, the wake
+/// paired with the `tick_max_us` idle clamp. When ON, the wake
 /// path also broadcasts a GIC SGI so a WFI-parked Tier-0/1a core wakes
 /// immediately rather than waiting for the backstop — at the cost of an MMIO
-/// write on the hot `event_signal` / cross-domain SPSC-push paths. This is a
-/// measured option: enable only if AC1/AC2 show the clamp's
-/// first-request-after-idle latency is insufficient ("demoted to a measured
-/// option").
+/// write on the hot `event_signal` / cross-domain SPSC-push paths. Enable it
+/// only where the clamp's first-request-after-idle latency is measured to be
+/// insufficient.
 static WAKE_DOORBELL: AtomicBool = AtomicBool::new(false);
 
-/// Enable/disable the §5.4 SGI wake doorbell at runtime (default off).
+/// Enable/disable the SGI wake doorbell at runtime (default off).
 pub fn set_wake_doorbell(on: bool) {
     WAKE_DOORBELL.store(on, Ordering::Relaxed);
 }
 
-/// Enable/disable the §7.1a absolute (`cntp_cval`) timer re-arm at runtime
+/// Enable/disable the absolute (`cntp_cval`) timer re-arm at runtime
 /// (default off — the relative `cntp_tval` path is the default). See
 /// `exception::ABSOLUTE_REARM`.
 pub fn set_absolute_rearm(on: bool) {
     exception::ABSOLUTE_REARM.store(on, Ordering::Relaxed);
 }
 
-/// Broadcast the §5.4 wake doorbell SGI to all cores, IFF the doorbell is
+/// Broadcast the wake doorbell SGI to all cores, IFF the doorbell is
 /// enabled. Called alongside `SEV` on every wake path so a WFI-parked core
 /// (which `SEV` cannot break) also wakes. No-op (one relaxed load) when off.
 #[inline(always)]
@@ -1968,14 +2004,14 @@ pub fn wake_doorbell() {
 fn bcm_wake_scheduler() {
     // SAFETY: SEV broadcasts an event to wake WFE-parked cores; hint-only.
     unsafe { core::arch::asm!("sev") };
-    // SEV does NOT break WFI (Tier 0/1a idle posture). When the §5.4 doorbell
+    // SEV does NOT break WFI (Tier 0/1a idle posture). When the doorbell
     // is enabled, also send an SGI so a WFI-parked core wakes immediately.
     wake_doorbell();
 }
 
-/// Portable `sleep_until`. The per-core periodic timer (the §5.1 idle
-/// backstop, ≤ `tick_max_us`) is already armed, and any bound IRQ — plus the
-/// §5.4 wake doorbell SGI — breaks WFI. So a single WFI blocks until the next
+/// Portable `sleep_until`. The per-core periodic timer (the idle backstop,
+/// ≤ `tick_max_us`) is already armed, and any bound IRQ — plus the wake
+/// doorbell SGI — breaks WFI. So a single WFI blocks until the next
 /// wake without programming a separate one-shot (which would race the
 /// IRQ-handler's per-core deadline reload). Returns UNKNOWN: WFI cannot
 /// report its wake source, so the caller must re-check its work/deadline
@@ -2064,7 +2100,7 @@ pub fn soc_temp_mc() -> Option<i32> {
 /// Emit the SoC die temperature to the log/telemetry stream on a ~5 s
 /// wall-clock cadence (core 0 only). This is the direct signal that the active
 /// cooler is working — the DUT should cool under a sustained load instead of
-/// throttling — and the measurement AC7 (thermal floor decay) consumes.
+/// throttling — and it is what the thermal floor-decay measurement consumes.
 fn maybe_emit_soc_temp(core_id: usize) {
     if core_id != 0 {
         return;
@@ -2079,8 +2115,8 @@ fn maybe_emit_soc_temp(core_id: usize) {
     }
     LAST_TEMP_MS.store(now, Ordering::Relaxed);
     let ct0 = exception::CORE_TICKS[0].load(Ordering::Relaxed);
-    // irq_hz = the actual timer-IRQ (wakeup) RATE over the last interval — the
-    // RFC AC1 metric. With mechanism (a) on an idle domain this falls far below
+    // irq_hz = the actual timer-IRQ (wakeup) RATE over the last interval.
+    // With mechanism (a) on an idle domain this falls far below
     // the nominal `1e6/tick_us`. This is the SAMPLING-ROBUST idle signal: unlike
     // the instantaneous dl0_us below, it averages over the whole interval, so it
     // isn't skewed by the fact that the emit pass itself is busy.
@@ -2101,9 +2137,9 @@ fn maybe_emit_soc_temp(core_id: usize) {
     };
     let dl0_us = to_us(exception::NEXT_DEADLINE_TICKS[0].load(Ordering::Relaxed) as u64);
     let dl0_max_us = DL0_MAX_US.swap(0, Ordering::Relaxed);
-    // worst_us = the §5.3 floor input (decaying peak-hold step time); ovr =
-    // per-domain budget overruns. AC3 (no overrun) + AC7 (floor rises on load,
-    // decays on cool-down) are read from these.
+    // worst_us = the pacer floor's input (decaying peak-hold step time); ovr =
+    // per-domain budget overruns. Together they show whether the domain stays
+    // inside budget and whether the floor rises on load and decays on cool-down.
     let worst_us = scheduler::domain_worst_step_us(0);
     let ovr = scheduler::domain_budget_overruns(0);
     // Surface the Tier-2 IRQ-dispatch count on the reliable core-0 cadence so a

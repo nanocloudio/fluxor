@@ -2,31 +2,31 @@
 //!
 //! A *scenario* is a YAML manifest that describes which Fluxor graphs
 //! participate in a deployment, on which runtimes they run, and how they
-//! bind to each other. See `.context/rfc_deployment_scenarios.md` for the
-//! full design.
+//! bind to each other.
 //!
-//! This module implements **PRs 1–2** of the RFC's five-PR rollout:
-//!   - Serde structs mirroring the §5 schema.
+//! What this module does:
+//!   - Serde structs for the scenario schema (components, host knobs,
+//!     bindings).
 //!   - Path resolution + structural validation.
-//!   - Component-graph reachability + runtime_override sanity checks
-//!     (no module-mask check yet — that lands in PR 5 alongside the
-//!     auto-rebuild path).
-//!   - **PR 2** Real synthesiser: builds a `serde_json::Value` graph
-//!     that the existing `tools::board::validate_config` accepts as
-//!     a hand-written linux YAML.
-//!   - **PR 2** Binding route merger: reads each component's graph,
-//!     mutates the named http module's `routes:` array, detects
-//!     conflicts on `path:`, cites the offending file (line numbers
-//!     deferred — serde_yaml does not surface them for `Value` reads).
-//!   - **PR 2** Re-validation of the merged config via
+//!   - Component-graph reachability + `runtime_override` sanity checks.
+//!   - Synthesiser: builds a `serde_json::Value` graph that the existing
+//!     `tools::board::validate_config` accepts as a hand-written linux
+//!     YAML.
+//!   - Binding route merger: reads each component's graph, mutates the
+//!     named http module's `routes:` array, detects conflicts on `path:`
+//!     and cites the offending file (no line numbers — serde_yaml does
+//!     not surface them for `Value` reads).
+//!   - Re-validation of the merged config via
 //!     `tools::board::validate_config`.
 //!   - `--list` scenario discovery in a directory.
 //!   - `--print-synthesised`, `--print-merged`, `--graph` dumps.
 //!
-//! Out of scope here (deferred to later PRs):
-//!   - Process orchestration / spawning (PRs 3–4).
-//!   - `runtime_override:` auto-rebuild (PR 5).
-//!   - Scenario nesting (§16 Q5; later PR).
+//! Not implemented:
+//!   - Process orchestration / spawning.
+//!   - Checking a `runtime_override:` against the target's module mask,
+//!     and rebuilding the runtime to match.
+//!   - Scenario nesting (a component naming another scenario instead of
+//!     a graph): the schema accepts the shape, the validator rejects it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -42,10 +42,10 @@ use crate::error::{Error, Result};
 
 /// Top-level scenario document.
 ///
-/// Mirrors the §5 RFC schema. `kind: scenario` is required (sniffed by
-/// the dispatcher before this struct is deserialised; the field is kept
-/// in the struct so a stray graph YAML with `kind: scenario` round-trips
-/// rather than silently mis-parses).
+/// `kind: scenario` is required (sniffed by the dispatcher before this
+/// struct is deserialised; the field is kept in the struct so a stray
+/// graph YAML with `kind: scenario` round-trips rather than silently
+/// mis-parses).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scenario {
@@ -63,8 +63,9 @@ pub struct Scenario {
 /// One component inside a scenario.
 ///
 /// Exactly one of `graph` or `scenario` must be set (mutual exclusion
-/// is checked in [`validate`]). The `scenario` variant is reserved for
-/// nesting (§16 Q5) and rejected with a clear message in PR 1.
+/// is checked in [`validate`]). The `scenario` variant names a nested
+/// scenario; the shape parses, but [`validate`] rejects it with a clear
+/// message because nesting is not implemented.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentSpec {
@@ -78,10 +79,9 @@ pub struct ComponentSpec {
     pub host_page: Option<PathBuf>,
     #[serde(default)]
     pub duration: Option<u32>,
-    /// Per-module scalar overrides applied at deploy time.  Parsed
-    /// here so PR 1's validator can reject malformed shapes early; the
-    /// actual deploy-time merge lives in the route-merger / spawn path
-    /// (PRs 2–4).
+    /// Per-module scalar overrides applied at deploy time. Parsed here
+    /// so [`validate`] can reject malformed shapes early; the actual
+    /// deploy-time merge lives in the route-merger / spawn path.
     #[serde(default)]
     #[allow(
         dead_code,
@@ -100,9 +100,8 @@ pub struct HostSpec {
 
 /// Cross-component plumbing. Tagged-by-presence rather than by an
 /// explicit `kind:` field so the YAML stays uncluttered for one-line
-/// bindings (`- serve: viewer`). The choice is bikeshed-worthy (§16
-/// open question, deferred); we keep `serve:` / `list:` as siblings
-/// today.
+/// bindings (`- serve: viewer`): `serve:` and `list:` are siblings, and
+/// which key is present selects the variant.
 #[derive(Debug, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Binding {

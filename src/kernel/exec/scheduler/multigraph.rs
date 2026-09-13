@@ -10,24 +10,24 @@ use super::*;
 // Multi-graph runtime (the resident-graph runner)
 // ===========================================================================
 //
-// The §7 graph-local pacer surface above is keyed by `(graph_slot, generation,
-// domain)` and was built single-graph-degenerate. This section is the runtime
-// that admits and concurrently runs MORE THAN ONE resident graph, so the pacer
-// surface becomes live: each resident graph is an `owner::OwnerHandle{slot,
-// generation}` (the system graph is `OWNER_SYSTEM`, slot 0; workload graphs are
-// admitted as owners 1..N via `live::apply_add`). On a shared cooperative runner
-// the runner steps each owner's modules independently, skips an idle owner
-// (§6.5/§7.2), and arms the physical sleep as the §7.2 deadline-merge minimum.
+// The graph-local pacer surface above is keyed by `(graph_slot, generation,
+// domain)`. This section is the runtime that admits and concurrently runs MORE
+// THAN ONE resident graph, so that pacer surface is live: each resident graph is
+// an `owner::OwnerHandle{slot, generation}` (the system graph is `OWNER_SYSTEM`,
+// slot 0; workload graphs are admitted as owners 1..N via `live::apply_add`). On
+// a shared cooperative runner the runner steps each owner's modules
+// independently, skips an idle owner, and arms the physical sleep as the
+// deadline-merge minimum.
 //
-// Static-bounded (§7.5): the resident-graph index is a bounded table built at
-// admission/finalize time, NOT scanned per pass (§7.6). The graph→domain→pacer
+// The resident-graph index is a bounded table built at admission/finalize time,
+// NOT scanned per pass. The graph→domain→pacer
 // keys are resolved into `RESIDENT_GRAPHS` once; a live pass only reads it.
 
 /// One resident `(graph, domain)` the runner multiplexes. `mask` is the cached
 /// set of module slots this graph owns *in this domain* (built at finalize so
 /// `take_wake_in_mask` is an `EVENT_WAKE ∩ mask` intersection, never a scan).
 /// `primed` forces the first pass after (re)build to step the graph at least
-/// once so the steady-state §6.5 predicate has prior-pass signals to read.
+/// once so the steady-state runnable predicate has prior-pass signals to read.
 #[cfg(feature = "multitenant")]
 #[derive(Clone, Copy)]
 struct ResidentGraph {
@@ -37,7 +37,7 @@ struct ResidentGraph {
     mask: ModuleMask,
     primed: bool,
     /// Last logged runnable state — drives the transition-only `MON_GRAPH_PACER`
-    /// line (§12: per-pass logs must be rate-limited / transition-only).
+    /// line — per-pass logs must be rate-limited or transition-only.
     last_runnable: bool,
     /// Modules with `step_period > 1`. Each carries its OWN absolute next-due in
     /// `SchedulerState::module_next_due_us` and its own period
@@ -46,7 +46,7 @@ struct ResidentGraph {
     /// `event_wake`), never the whole set at the shortest period.
     periodic_mask: ModuleMask,
     /// True iff EVERY owned module is idle-safe attested — the precondition for
-    /// fully parking the graph when idle (§6.5). When false the graph is
+    /// fully parking the graph when idle. When false the graph is
     /// fail-closed: never parked, only relaxed to the `tick_max` backstop.
     idle_safe: bool,
     /// Absolute wall-clock deadline (µs) for the next backstop liveness step of a
@@ -78,7 +78,7 @@ static mut RESIDENT_GRAPH_COUNT: usize = 0;
 
 /// Rebuild the bounded resident-graph index from the live module set. Called at
 /// boot after all admission `apply_add`s and on every reconfigure / `free_owner`
-/// (§7.1: a reused slot is a *new* generation, so its pacer is reset and its
+/// (a reused slot is a *new* generation, so its pacer is reset and its
 /// `primed` flag re-armed). One bounded pass over module slots — never on the
 /// hot path. No-op (single-graph degenerate) on non-multitenant builds.
 pub fn rebuild_resident_graph_index() {
@@ -150,12 +150,12 @@ pub fn rebuild_resident_graph_index() {
                 table[i].idle_safe = false;
             }
         }
-        // Reconcile the §7 pacer table (`GRAPH_PACERS`) against the rebuilt
+        // Reconcile the graph-local pacer table (`GRAPH_PACERS`) against the rebuilt
         // resident keys. A pacer whose (slot, generation, domain) no longer
         // appears belongs to a freed / reconfigured owner; left active it keeps
         // occupying a slot, so repeated owner churn across domains would exhaust
         // the bounded 16-slot table despite few LIVE graphs. Bounded (16×16) and
-        // rebuild-time only — never on the hot path. (§7.1: a reused slot is a new
+        // rebuild-time only — never on the hot path. (A reused slot is a new
         // generation, so a stale-generation pacer is also released here.)
         // SAFETY: same single-mutator (scheduler-thread-exclusive) context.
         let pacers = unsafe { &mut *core::ptr::addr_of_mut!(GRAPH_PACERS) };
@@ -420,6 +420,7 @@ fn step_graph_owner(
     let mut hard_break = false;
     loop {
         BURST_SEEN_THIS_PASS[domain].store(false, Ordering::Relaxed);
+        let pass_start_us = sched.domain_budget_us_consumed[domain];
         for i in 0..n {
             let pos = if n > 0 { (i + dom_offset) % n } else { i };
             let module_idx = sched.exec_order[pos] as usize;
@@ -443,12 +444,12 @@ fn step_graph_owner(
             if sched.pre_tick_drain[module_idx] {
                 continue;
             }
-            // §6.5 event-wake: a module woken this pass steps with `event_wake =
+            // Event-wake: a module woken this pass steps with `event_wake =
             // true`, which bypasses step-period gating (the wake overrides the
             // period) exactly as `step_woken_modules` does — so a targeted wake is
             // honoured even when the module's period is not due this tick.
             let event_wake = woken.test(module_idx);
-            // §7 absolute periodic scheduling: a period-gated module fires ONLY on
+            // Absolute periodic scheduling: a period-gated module fires ONLY on
             // its own next-due (signalled via `woken`/`event_wake` by the runner)
             // or a direct event wake. Otherwise it is SUPPRESSED here — not run and
             // its tick counter NOT advanced — so a pass triggered by a sibling's
@@ -485,7 +486,7 @@ fn step_graph_owner(
         if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
             break;
         }
-        if domain_budget_exhausted(sched, domain) {
+        if !domain_budget_admits_repass(sched, domain, pass_start_us) {
             break;
         }
         // Device input may have arrived while this graph pass ran. Refill only
@@ -507,18 +508,18 @@ fn step_graph_owner(
     (work, burst)
 }
 
-/// §6.5 timer-due predicate for a resident graph. v1: wall-clock timers signal
+/// Timer-due predicate for a resident graph. v1: wall-clock timers signal
 /// through the event path, so a due timer surfaces as a targeted wake
 /// (`owner_wake_pending`); this returns `false` and the wake carries it. A
 /// future per-owner timer wheel can make this precise; until then a graph with
-/// no targeted wake and no prior-pass work is treated idle (the AC1/AC2 case).
+/// no targeted wake and no prior-pass work is treated idle.
 #[cfg(feature = "multitenant")]
 #[inline]
 fn owner_timer_due(_slot: u16, _generation: u32, _domain: usize) -> bool {
     false
 }
 
-/// §3.2 pause predicate for a resident graph: true iff the owning slot is
+/// Pause predicate for a resident graph: true iff the owning slot is
 /// `Paused` at this generation. Callers MUST short-circuit behind
 /// `event::paused_owners_present()` so the unused path stays a single
 /// relaxed load (default-off discipline).
@@ -534,7 +535,7 @@ fn owner_graph_paused(sched: &SchedulerState, slot: u16, generation: u32) -> boo
 
 /// True iff any resident graph in `domain` belongs to a paused owner. Used
 /// by `step_resident_graphs_domain` to route a single-paused-graph domain
-/// through the multi-graph runner (whose §3.2 skip is the only paused-aware
+/// through the multi-graph runner (whose pause skip is the only paused-aware
 /// stepping path) instead of the pause-blind fast path. Bounded scan of the
 /// resident-graph index; callers short-circuit behind
 /// `event::paused_owners_present()`.
@@ -552,21 +553,21 @@ fn domain_has_paused_graph(domain: usize) -> bool {
         .any(|e| e.domain as usize == domain && owner_graph_paused(sched, e.slot, e.generation))
 }
 
-/// §6.5 readable-channel term: does any edge whose CONSUMER belongs to
+/// Readable-channel term: does any edge whose CONSUMER belongs to
 /// this graph — and whose PRODUCER does not — hold readable bytes? Without
 /// this term, data written into a skipped graph's inbound channel (a
 /// cross-owner `apply_add` edge, or a system-graph producer) waits for the
 /// graph's backstop cadence: under demand-driven idle that is
-/// `tick_max_us` per hop, which is exactly the multi-workload latency term
-/// the RFC exists to remove. The check adds a wake REASON evaluated at the
+/// `tick_max_us` per hop — the multi-workload latency term this runner
+/// exists to remove. The check adds a wake REASON evaluated at the
 /// runner's existing cadence — not a wake source — so there is no storm
 /// surface and no ordering change.
 ///
 /// Cost: O(edges) per otherwise-idle graph per pass, one lock-guarded
 /// `channel_poll` per cross-graph edge (POLL_IN covers both FIFO fill and
 /// mailbox READY). Callers short-circuit it behind every cheaper runnable
-/// term. If graph counts ever make the scan measurable, the RFC's O1
-/// refinement is a per-graph dirty bit set inside `channel_write` — decide
+/// term. If graph counts ever make the scan measurable, the refinement is
+/// a per-graph dirty bit set inside `channel_write` — decide
 /// from density-scenario profiling, not up front.
 ///
 /// Intra-graph edges are deliberately excluded: data on them can only have
@@ -609,7 +610,7 @@ fn graph_inbound_readable(sched: &SchedulerState, mask: &ModuleMask, out: &mut M
 }
 
 /// The shared-cooperative-runner core. Steps every resident graph in `domain`
-/// independently, skips idle graphs (§6.5), and returns the merged
+/// independently, skips idle graphs, and returns the merged
 /// physical-sleep deadline (µs). Mirrors the once-per-tick housekeeping of
 /// `step_domain_modules` (tick advance, drain timeout, budget reset,
 /// worst-step decay, Tier-1c pre-tick, ISR-bridge pump) but runs the
@@ -643,7 +644,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
         }
     }
     let mut not_ready = ModuleMask::new();
-    // §6.5 fail-closed "must tick" set: modules that MUST be stepped regardless of
+    // Fail-closed "must tick" set: modules that MUST be stepped regardless of
     // work/wake or the idle predicate, because skipping them stalls forward
     // progress — a deferred-ready module still initialising (never reaches Ready)
     // or a faulting/recovering module whose restart backoff only decrements when
@@ -667,7 +668,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
             must_tick_mask.set(i);
         }
     }
-    // Once-per-tick budget reset + §5.3 worst-step decay for this domain.
+    // Once-per-tick budget reset + adaptive-tick worst-step decay for this domain.
     sched.domain_budget_us_consumed[domain] = 0;
     let w = sched.domain_worst_step_us[domain];
     if w > 0 {
@@ -680,7 +681,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
 
     let flags = domain_adaptive_flags(domain);
     let adaptive = flags != 0;
-    // Idle-skip (§6.5) is gated SPECIFICALLY on mechanism (a). A cadence-only or
+    // Idle-skip is gated SPECIFICALLY on mechanism (a). A cadence-only or
     // thermal domain (e.g. `ADAPTIVE_FLAG_CADENCE` without `ADAPTIVE_FLAG_IDLE`)
     // adjusts the tick RATE but must still step every resident graph every pass —
     // skipping there would freeze a workload's period-gated step counters and
@@ -693,7 +694,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
 
     // SAFETY: scheduler-thread read of a bounded counter.
     let rc = unsafe { RESIDENT_GRAPH_COUNT };
-    // §7.2 deadline merge, computed INLINE (no `keys` array) so the runner's
+    // Deadline merge, computed INLINE (no `keys` array) so the runner's
     // stack frame stays small — it runs on top of the deepest module-step call
     // chain (the system net stack) on a bounded bare-metal per-core stack.
     let mut min_runnable = u32::MAX;
@@ -721,10 +722,10 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
         if gdomain != domain {
             continue;
         }
-        // §3.2 pause skip: a paused owner's
+        // Pause skip: a paused owner's
         // graph is not-runnable REGARDLESS of wakes, due periodic modules,
         // backstop, must-tick, or readable inbound — evaluated before every
-        // §6.5 term so none of them can step it. Wake bits that latched
+        // runnable term so none of them can step it. Wake bits that latched
         // before the pause mask became visible (the mask-then-check race)
         // are swept into the deferred store here, pass by pass, so a paused
         // owner's stragglers can't keep `domain_wake_pending` asserted and
@@ -750,12 +751,12 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
         let timer_due = owner_timer_due(slot, generation, domain);
         let is_system = slot == 0;
 
-        // §7 PER-MODULE absolute schedule: each period-gated module fires exactly
+        // PER-MODULE absolute schedule: each period-gated module fires exactly
         // when wall-clock reaches ITS OWN `module_next_due_us`, so distinct periods
         // and phase offsets are preserved and a sibling's pass rate never advances
         // it. Build the individually-due set and track the soonest pending due (for
         // the deadline merge). Bounded by the periodic module count, not all
-        // modules (§7.6).
+        // modules.
         let mut due_mask = ModuleMask::new();
         let mut min_due_us = u32::MAX;
         for idx in periodic_mask.iter_set() {
@@ -768,7 +769,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
         }
         let any_due = !due_mask.is_empty();
 
-        // §6.5 runnable predicate. The SYSTEM graph (slot 0) is NEVER skipped (it
+        // Runnable predicate. The SYSTEM graph (slot 0) is NEVER skipped (it
         // owns polled device I/O + telemetry — "platform maintenance work assigned
         // to that graph"). `any_due` is the per-module periodic schedule; `wake` a
         // targeted event; `must_tick` the fail-closed init/fault-recovery term;
@@ -867,11 +868,11 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
             (false, false)
         };
 
-        // Feed the §7 pacer instance: this drives both next-tick runnability and
+        // Feed the graph-local pacer instance: this drives both next-tick runnability and
         // the deadline-merge below.
         graph_pacer_set_signals(slot, generation, domain as u8, work, burst, wake, timer_due);
 
-        // §12 observability: transition-only `MON_GRAPH_PACER` so a per-graph
+        // Observability: transition-only `MON_GRAPH_PACER` so a per-graph
         // idle↔busy change is visible (per-pass logging would defeat the
         // efficiency gain). `busy` here is the post-step pacer signal.
         let busy = work || burst || wake || timer_due;
@@ -887,7 +888,7 @@ fn multi_graph_runner(modules: &mut [ModuleSlot; MAX_MODULES], domain: usize) ->
             set_last_runnable(gi, busy);
         }
 
-        // §7.2 merge, inline: an idle instance still bounds the wait via its
+        // Deadline merge, inline: an idle instance still bounds the wait via its
         // relaxed deadline if nothing is runnable, but only runnable instances
         // tighten it.
         let d = graph_pacer_deadline(slot, generation, domain as u8, tmin, tmax, floor, now);
@@ -960,7 +961,7 @@ fn set_last_runnable(gi: usize, v: bool) {
     table[gi].last_runnable = v;
 }
 
-/// Read a §7 pacer instance's stored §6.5 runnability without mutating it (the
+/// Read a graph-local pacer instance's stored runnability without mutating it (the
 /// merge/deadline path re-reads it; this is the pre-step "did the prior pass
 /// leave it runnable?" query).
 #[cfg(feature = "multitenant")]
@@ -1027,7 +1028,7 @@ pub fn step_resident_graphs_domain(
     // domain's drain can't consume a sibling domain's wakes;
     // `step_woken_modules` applies the woken-path budget bound. The
     // WFI-latency caveat is unchanged: a software wake is serviced on
-    // the next timer pass (§5.4 clamp), not mid-sleep — this drain is
+    // the next timer pass, not mid-sleep — this drain is
     // what performs that service.
     {
         // SAFETY: scheduler-thread context — sole stepper for this domain.

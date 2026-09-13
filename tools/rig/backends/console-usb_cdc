@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""console-usb_cdc — stream a board's USB CDC console, across its reboots.
+
+Verb:
+  attach   (transport) — open the CDC tty and stream chunks on stdout as
+                         NDJSON `{"kind":"bytes","data":"..."}` (base64).
+
+Binding fields:
+  serial   (str, optional)  the board's USB serial (the chip's unique ID);
+                            selects `/dev/serial/by-id/usb-*_<serial>-if00`
+                            so two boards on one host are two consoles.
+                            Without it, the first `/dev/ttyACM*` is used.
+
+A CDC console is not a UART: the tty exists only while the device is
+enumerated, and every reboot the rig asks for — a deploy, a power cycle —
+removes it and creates it again. This backend therefore reopens the tty
+whenever it comes back and reports each open and loss as a `note`, so a
+run's log shows the reboots as reboots rather than as silence.
+
+Opening the tty asserts DTR, which is what the board keys its log stream on;
+the boot log accumulated before the open is delivered on the open.
+"""
+import base64
+import glob
+import json
+import os
+import signal
+import sys
+import termios
+import time
+
+STOP = False
+
+
+def _emit(event):
+    try:
+        sys.stdout.write(json.dumps(event) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        raise SystemExit(0)
+
+
+def _note(text):
+    _emit({"kind": "note", "message": f"console-usb_cdc: {text}"})
+
+
+def _find_port(serial):
+    if serial:
+        hits = glob.glob(f"/dev/serial/by-id/usb-*_{serial}-if00")
+        return hits[0] if hits else None
+    ports = sorted(glob.glob("/dev/ttyACM*"))
+    return ports[0] if ports else None
+
+
+def _open(port):
+    fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    attr = termios.tcgetattr(fd)
+    attr[0] = attr[1] = attr[3] = 0
+    attr[2] = attr[2] | termios.CLOCAL | termios.CREAD
+    termios.tcsetattr(fd, termios.TCSANOW, attr)
+    return fd
+
+
+def main():
+    global STOP
+    raw = sys.stdin.read()
+    inv = json.loads(raw) if raw.strip() else {}
+    binding = inv.get("binding", {}) or {}
+    serial = str(binding.get("serial", "") or "")
+
+    def on_term(_sig, _frm):
+        global STOP
+        STOP = True
+
+    signal.signal(signal.SIGTERM, on_term)
+    _emit({"kind": "ready"})
+    announced_wait = False
+    while not STOP:
+        port = _find_port(serial)
+        if not port:
+            if not announced_wait:
+                _note("waiting for the console to enumerate" + (f" (serial {serial})" if serial else ""))
+                announced_wait = True
+            time.sleep(0.2)
+            continue
+        announced_wait = False
+        fd = None
+        try:
+            fd = _open(port)
+            _note(f"open {os.path.realpath(port)}")
+            while not STOP:
+                try:
+                    data = os.read(fd, 4096)
+                except BlockingIOError:
+                    data = None
+                if data:
+                    _emit({"kind": "bytes", "data": base64.b64encode(data).decode()})
+                    continue
+                if data == b"" or not os.path.exists(port):
+                    raise OSError("device gone")
+                time.sleep(0.02)
+        except OSError as exc:
+            _note(f"lost {port}: {exc}")
+            time.sleep(0.3)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

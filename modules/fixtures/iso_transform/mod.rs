@@ -231,7 +231,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Attempt the first write now; whatever the downstream cannot accept
         // stays staged and is retried in Phase 1 on subsequent ticks. The
         // write returns bytes written (0 under full backpressure) or <0 errno.
-        let w = svc1(SYS_CHANNEL_WRITE, s.out_chan, s.out_buf.as_mut_ptr(), s.out_len);
+        let w = svc1(
+            SYS_CHANNEL_WRITE,
+            s.out_chan,
+            s.out_buf.as_mut_ptr(),
+            s.out_len,
+        );
         if w == E_AGAIN {
             // Downstream FIFO full — keep the freshly-staged result
             // (out_head=0, out_len=n) and retry in Phase 1 next tick.

@@ -343,8 +343,8 @@ fn cmd_run_inline_scenario(
     spawn_scenario(&s, host_path, flags, verbose)
 }
 
-/// Scenario dispatcher.  PR 1 implements the dump-only flags and
-/// validation; spawning lands in PR 3.
+/// Scenario dispatcher: the dump-only flags and `--validate` return
+/// early; anything else spawns the scenario.
 fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> Result<()> {
     let s = scenario::parse(scenario_path)?;
     scenario::validate(&s, scenario_path)?;
@@ -388,18 +388,17 @@ fn cmd_run_scenario(scenario_path: &Path, flags: &RunFlags, _verbose: bool) -> R
         return Ok(());
     }
 
-    // Real spawn (PR 3 single-component + PR 4 multi-component &
-    // sequential mode).
+    // Real spawn: single-component, multi-component, or sequential mode.
     spawn_scenario(&s, scenario_path, flags, _verbose)
 }
 
-/// PR 3 + PR 4: spawn a scenario.
+/// Spawn a scenario.
 ///
 /// Single-component scenarios (`is_single_component` true) take the
-/// PR 3 path: build component → write synth host → build host → spawn
+/// single-component path: build component → write synth host → build host → spawn
 /// fluxor-linux → readiness probe → wait → propagate exit.
 ///
-/// Multi-component scenarios take the PR 4 path: build every wasm
+/// Multi-component scenarios take the multi-component path: build every wasm
 /// component (passive — bundles served as static artefacts) and every
 /// non-wasm component (active — gets a fluxor-linux process each),
 /// plus the synth host if `host:` is declared. Then:
@@ -475,8 +474,8 @@ fn spawn_scenario(
         let build = build_one(&merged_yaml, None, verbose)?;
         if build.family != "linux" {
             return Err(Error::Config(format!(
-                "scenario {}: component `{}` built for family {:?}; PR 3-4 only spawn linux \
-                 components (use `runtime_override: linux` for pi5 graphs).",
+                "scenario {}: component `{}` built for family {:?}; only linux components \
+                 are spawned (use `runtime_override: linux` for pi5 graphs).",
                 scenario_path.display(),
                 comp_name,
                 build.family
@@ -778,7 +777,7 @@ enum DurationOutcome {
 }
 
 fn synthetic_success_exit_status() -> std::process::ExitStatus {
-    // Build a "exit 0" ExitStatus.  Unix-only; PR 3+4 spawn paths are
+    // Build a "exit 0" ExitStatus.  Unix-only; the spawn paths are
     // Linux/macOS only by construction.
     #[cfg(unix)]
     {
@@ -954,13 +953,13 @@ enum ReadyOutcome {
 ///     kernel logs in real time), and signals "ready" the first time
 ///     it sees `[linux_net] listening on port <PORT>`.
 ///
-/// PR 3 deliberately drops the port-poll fallback referenced in RFC
-/// §9 — TCP connect-success false-positives when another process
-/// already holds the port (e.g. a stale `python3 -m http.server`
-/// from a prior debugging session).  The kernel's
-/// `linux_net::cmd_bind` log line is reliable, so the stderr signal
-/// is sufficient on its own.  Re-introduce the fallback only if we
-/// hit a runtime where stderr is muted by default.
+/// Readiness is taken from that log line alone, never from polling the
+/// port: a TCP connect succeeds against any other process already
+/// holding it (a stale `python3 -m http.server`, say), which reads as
+/// ready when the scenario has not even bound.  The kernel's
+/// `linux_net::cmd_bind` log line is reliable, so the stderr signal is
+/// sufficient on its own; a port poll would only be needed on a runtime
+/// where stderr is muted by default.
 mod scenario_readiness_probe {
     use std::io::{BufRead, BufReader, Read};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1095,7 +1094,7 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
                 let elf_path = PathBuf::from("target/aarch64-unknown-none/release/fluxor");
                 if !elf_path.exists() {
                     return Err(Error::Config(format!(
-                        "Firmware ELF not found at {}. Run 'make firmware TARGET=bcm2712' first.",
+                        "Firmware ELF not found at {}. Run 'make firmware TARGET=qemu-virt' first.",
                         elf_path.display()
                     )));
                 }

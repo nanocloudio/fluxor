@@ -6,7 +6,6 @@ pub mod gpio {
     //! Trades compile-time pin types for runtime handles using AnyPin.
     //! Allows full GPIO configuration from config without hard-coded pin types.
 
-    use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pull};
     use portable_atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
     use crate::kernel::sys::errno;
@@ -29,6 +28,13 @@ pub mod gpio {
         RUNTIME_MAX_GPIO.load(Ordering::Acquire)
     }
 
+    use crate::platform::rp_gpio_regs as gpio_regs;
+
+    /// IO_BANK0 `FUNCSEL` for software control of a pin (SIO).
+    const FUNCSEL_SIO: u32 = 5;
+    /// `FUNCSEL` 31 releases the pin from every peripheral.
+    const FUNCSEL_NONE: u32 = 31;
+
     /// Pin mode/direction
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(u8)]
@@ -48,33 +54,32 @@ pub mod gpio {
         Down = 2,
     }
 
-    impl From<PinPull> for Pull {
-        fn from(p: PinPull) -> Pull {
-            match p {
-                PinPull::None => Pull::None,
-                PinPull::Up => Pull::Up,
-                PinPull::Down => Pull::Down,
-            }
+    impl PinPull {
+        /// Apply this pull to a pad configuration.
+        ///
+        /// Both bits set is a pad pulled in two directions at once — the
+        /// hardware permits it and the result is a weak divider rather than
+        /// a defined level, so the two are set from one choice.
+        fn apply(self, cfg: gpio_regs::PadConfig) -> gpio_regs::PadConfig {
+            cfg.pull_up(matches!(self, PinPull::Up))
+                .pull_down(matches!(self, PinPull::Down))
         }
     }
 
-    /// A GPIO slot holding runtime pin state
+    /// A GPIO slot holding runtime pin state.
+    ///
+    /// Holds the pin's *configuration*, not a handle to it: ownership is
+    /// `CLAIMED`, and nothing else needs to duplicate it.
     struct GpioSlot {
-        /// Pin wrapper for output mode
-        output: Option<Output<'static>>,
-        /// Pin wrapper for input mode
-        input: Option<Input<'static>>,
-        /// Current mode
+        /// Current mode.
         mode: PinMode,
-        /// Current pull setting (for inputs)
+        /// Current pull setting.
         pull: PinPull,
     }
 
     impl GpioSlot {
         const fn new() -> Self {
             Self {
-                output: None,
-                input: None,
                 mode: PinMode::Unconfigured,
                 pull: PinPull::None,
             }
@@ -101,8 +106,8 @@ pub mod gpio {
     /// # Safety
     ///
     /// `static mut` is technically UB for shared access under Rust's memory model.
-    /// This is sound here because embassy on RP2350 is a single-core cooperative
-    /// executor: syscalls run synchronously inside the scheduler tick and cannot
+    /// This is sound here because the platform is single-core and synchronous:
+    /// syscalls run inside the scheduler tick and cannot
     /// preempt each other.  Each slot is further guarded by `CLAIMED`, ensuring
     /// only one logical owner accesses a slot at a time.  If the executor ever
     /// becomes multi-core or preemptive, these must be wrapped in
@@ -166,8 +171,7 @@ pub mod gpio {
         // SAFETY: SLOTS is mutated only by claim/release helpers under the
         // CLAIMED atomic guard; `idx` is range-checked above.
         unsafe {
-            SLOTS[idx].output = None;
-            SLOTS[idx].input = None;
+            SLOTS[idx].mode = PinMode::Unconfigured;
             SLOTS[idx].mode = PinMode::Unconfigured;
         }
 
@@ -224,8 +228,7 @@ pub mod gpio {
                 // SAFETY: SLOTS[i] mutated only while CLAIMED guard is true;
                 // `i` is bounded by the MAX_GPIO loop.
                 unsafe {
-                    SLOTS[i].output = None;
-                    SLOTS[i].input = None;
+                    SLOTS[i].mode = PinMode::Unconfigured;
                     SLOTS[i].mode = PinMode::Unconfigured;
                 }
                 CLAIMED[i].store(false, Ordering::Release);
@@ -256,7 +259,6 @@ pub mod gpio {
 
     /// Set pin mode (input/output).
     ///
-    /// Creates appropriate embassy wrapper using AnyPin::steal.
     /// For `Input` and `Unconfigured` modes, `initial_level` is ignored.
     ///
     /// Returns 0 on success, or:
@@ -273,30 +275,34 @@ pub mod gpio {
             }
         };
 
-        // Drop existing wrappers first
-        slot.output = None;
-        slot.input = None;
-
-        match mode {
-            PinMode::Output => {
-                // SAFETY: pin is claimed (CLAIMED guard); we hold the only
-                // wrapper for it via SLOTS[idx].
-                let pin = unsafe { AnyPin::steal(idx as u8) };
-                let level = if initial_level {
-                    Level::High
-                } else {
-                    Level::Low
-                };
-                slot.output = Some(Output::new(pin, level));
-            }
-            PinMode::Input => {
-                // SAFETY: pin is claimed (CLAIMED guard); we hold the only
-                // wrapper for it via SLOTS[idx].
-                let pin = unsafe { AnyPin::steal(idx as u8) };
-                slot.input = Some(Input::new(pin, slot.pull.into()));
-            }
-            PinMode::Unconfigured => {
-                // Just leave both None
+        let pin = idx as u8;
+        // SAFETY: the pin is claimed (CLAIMED guard) and this is the only
+        // path that configures it.
+        unsafe {
+            match mode {
+                PinMode::Output => {
+                    // Level before output-enable, so the pin never briefly
+                    // drives the wrong value at whatever is attached.
+                    gpio_regs::set_function(pin, FUNCSEL_SIO);
+                    gpio_regs::set_pad_output(pin, gpio_regs::Drive::Ma4);
+                    gpio_regs::set_level(pin, initial_level);
+                    gpio_regs::set_output_enable(pin, true);
+                }
+                PinMode::Input => {
+                    gpio_regs::set_function(pin, FUNCSEL_SIO);
+                    let cfg = slot
+                        .pull
+                        .apply(gpio_regs::PadConfig::default().input_enable(true));
+                    gpio_regs::write_pad(pin, cfg);
+                    gpio_regs::set_output_enable(pin, false);
+                }
+                PinMode::Unconfigured => {
+                    // Stop driving before anything else: a pin left as an
+                    // output while its function changes can contend with
+                    // whatever the new function drives.
+                    gpio_regs::set_output_enable(pin, false);
+                    gpio_regs::set_function(pin, FUNCSEL_NONE);
+                }
             }
         }
 
@@ -306,9 +312,9 @@ pub mod gpio {
 
     /// Set pull configuration.
     ///
-    /// Stores the pull setting. If the pin is already in input mode, recreates
-    /// the input wrapper with the new pull. Otherwise the setting takes effect
-    /// on the next `gpio_set_mode(..., Input, ...)` call.
+    /// Stores the pull setting. If the pin is already an input, the pad is
+    /// rewritten immediately; otherwise the setting takes effect on the next
+    /// `gpio_set_mode(..., Input, ...)` call.
     ///
     /// Returns 0 on success, `ERROR` if invalid handle, `EAGAIN` if not claimed.
     pub fn gpio_set_pull(handle: i32, pull: PinPull) -> i32 {
@@ -320,12 +326,12 @@ pub mod gpio {
 
         slot.pull = pull;
 
-        // If already in input mode, recreate with new pull
+        // Already an input: rewrite the pad now. Otherwise the stored
+        // setting is applied the next time the pin becomes one.
         if slot.mode == PinMode::Input {
-            slot.input = None;
-            // SAFETY: pin is claimed; we hold the only wrapper via SLOTS[idx].
-            let pin = unsafe { AnyPin::steal(idx as u8) };
-            slot.input = Some(Input::new(pin, pull.into()));
+            let cfg = pull.apply(gpio_regs::PadConfig::default().input_enable(true));
+            // SAFETY: the pin is claimed and currently an input.
+            unsafe { gpio_regs::write_pad(idx as u8, cfg) };
         }
 
         0
@@ -337,17 +343,14 @@ pub mod gpio {
     /// `ENOTSUP` if not in output mode.
     pub fn gpio_set_level(handle: i32, high: bool) -> i32 {
         // SAFETY: handle validated by claimed_slot_mut.
-        let (_idx, slot) = match unsafe { claimed_slot_mut(handle) } {
+        let (idx, slot) = match unsafe { claimed_slot_mut(handle) } {
             Ok(v) => v,
             Err(e) => return e,
         };
 
-        if let Some(ref mut output) = slot.output {
-            if high {
-                output.set_high();
-            } else {
-                output.set_low();
-            }
+        if slot.mode == PinMode::Output {
+            // SAFETY: the pin is claimed and configured as an output.
+            unsafe { gpio_regs::set_level(idx as u8, high) };
             0
         } else {
             errno::ENOTSUP // Not in output mode
@@ -362,13 +365,14 @@ pub mod gpio {
     /// - `ENOTSUP` if not in input mode
     pub fn gpio_get_level(handle: i32) -> i32 {
         // SAFETY: handle validated by claimed_slot_mut.
-        let (_idx, slot) = match unsafe { claimed_slot_mut(handle) } {
+        let (idx, slot) = match unsafe { claimed_slot_mut(handle) } {
             Ok(v) => v,
             Err(e) => return e,
         };
 
-        if let Some(ref input) = slot.input {
-            if input.is_high() {
+        if slot.mode == PinMode::Input {
+            // SAFETY: the pin is claimed and configured as an input.
+            if unsafe { gpio_regs::read_level(idx as u8) } {
                 1
             } else {
                 0
@@ -558,14 +562,16 @@ pub mod gpio {
     /// Returns 0 or 1.
     unsafe fn read_pin_level(idx: usize) -> u8 {
         let slot = &SLOTS[idx];
-        if let Some(ref input) = slot.input {
-            if input.is_high() {
+        if slot.mode == PinMode::Input {
+            // SAFETY: the pin is claimed and configured as an input.
+            if unsafe { gpio_regs::read_level(idx as u8) } {
                 1
             } else {
                 0
             }
-        } else if let Some(ref output) = slot.output {
-            if output.is_set_high() {
+        } else if slot.mode == PinMode::Output {
+            // SAFETY: as above; reports what the pin is driven to.
+            if unsafe { gpio_regs::read_driven_level(idx as u8) } {
                 1
             } else {
                 0
@@ -736,11 +742,10 @@ pub mod gpio {
 pub mod pio {
     //! PIO utility functions for register bridges and pin setup.
     //!
-    //! Extracted from the old embassy PIO subsystem. These are used by the
+    //! These are used by the
     //! PIO register bridges (0x0C70-0x0C7B) in providers.rs and by
     //! boot-time PIO pin configuration.
 
-    use embassy_rp::pac;
     use portable_atomic::{AtomicU32, Ordering};
 
     // ============================================================================
@@ -750,12 +755,6 @@ pub mod pio {
     /// Bitmap of used PIO instruction memory slots per PIO block.
     pub static PIO_INSTRUCTIONS_USED: [AtomicU32; 3] =
         [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
-
-    /// Get PAC PIO instance by block index (0, 1, 2).
-    #[inline]
-    pub fn pio_pac(pio_num: u8) -> pac::pio::Pio {
-        crate::platform::chip::pio_pac(pio_num)
-    }
 
     /// Allocate contiguous instruction slots in a PIO block.
     ///
@@ -795,7 +794,7 @@ pub mod pio {
     }
 
     // ============================================================================
-    // Config-Driven Pin Setup (bypasses Embassy typed pins)
+    // Config-Driven Pin Setup
     // ============================================================================
 
     /// Pull resistor configuration for PIO pins.
@@ -805,32 +804,37 @@ pub mod pio {
         PullDown,
         /// Pull-up enabled (default for general data/clock pins).
         PullUp,
-        /// No pull resistor (matches Embassy's Pull::None for gSPI DIO/CLK).
+        /// No pull resistor (gSPI DIO/CLK).
         None,
     }
 
-    /// Configure a GPIO pin for PIO use via direct PAC register writes.
+    /// IO_BANK0 `FUNCSEL` for PIO0; PIO1 and PIO2 follow consecutively.
+    const PIO0_FUNCSEL: u32 = 6;
+
+    /// Configure a GPIO pin for PIO use.
     ///
-    /// Equivalent to Embassy's `make_pio_pin` but accepts a runtime pin number.
-    /// FUNCSEL values: PIO0=6, PIO1=7, PIO2=8.
+    /// Accepts a runtime pin number, which is why it writes the registers
+    /// rather than going through a typed pin.
     pub fn setup_pio_pin(pin: u8, pio_num: u8, pull: PioPull) {
         debug_assert!(
             pin < crate::platform::rp_io::gpio::runtime_max_gpio(),
             "PIO pin out of range"
         );
-        let funcsel = 6 + pio_num;
-        pac::IO_BANK0.gpio(pin as usize).ctrl().write(|w| {
-            w.set_funcsel(funcsel as _);
-        });
-        pac::PADS_BANK0.gpio(pin as usize).write(|w| {
-            crate::platform::chip::pad_set_iso_false!(w);
-            w.set_schmitt(true);
-            w.set_slewfast(true);
-            w.set_ie(true);
-            w.set_od(false);
-            w.set_pue(matches!(pull, PioPull::PullUp));
-            w.set_pde(matches!(pull, PioPull::PullDown));
-            w.set_drive(pac::pads::vals::Drive::_12M_A);
-        });
+        use crate::platform::rp_gpio_regs as gpio_regs;
+
+        let funcsel = PIO0_FUNCSEL + pio_num as u32;
+        let cfg = gpio_regs::PadConfig::default()
+            .schmitt(true)
+            .slew_fast(true)
+            .input_enable(true)
+            .pull_up(matches!(pull, PioPull::PullUp))
+            .pull_down(matches!(pull, PioPull::PullDown))
+            .drive(gpio_regs::Drive::Ma12);
+        // SAFETY: `pin` is within the runtime GPIO range (asserted above) and
+        // is being claimed for this PIO by the caller.
+        unsafe {
+            gpio_regs::set_function(pin, funcsel);
+            gpio_regs::write_pad(pin, cfg);
+        }
     }
 }

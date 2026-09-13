@@ -1,8 +1,8 @@
 // I2S parameter definitions (single source of truth).
 
 use super::I2sState;
-use super::{p_u8, p_u32};
 use super::SCHEMA_MAX;
+use super::{p_u32, p_u8};
 
 define_params! {
     I2sState;

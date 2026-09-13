@@ -97,12 +97,11 @@ enum Commands {
     /// side-by-side (local multi-replica bring-up: Raft clusters,
     /// partition experiments, …).
     ///
-    /// Scenario flags (see `.context/rfc_deployment_scenarios.md`):
+    /// Scenario flags:
     ///   --print-synthesised      dump the synthesised host graph YAML
     ///                            and exit (no spawning).
     ///   --print-merged <comp>    dump the binding-augmented config
-    ///                            for the named component and exit
-    ///                            (PR 2; reports not-yet-impl in PR 1).
+    ///                            for the named component and exit.
     ///   --validate-only          parse, validate, exit (CI-friendly).
     ///   --list [dir]             enumerate scenario files in `dir`
     ///                            (or CWD) and exit. `<config>` may be
@@ -123,7 +122,7 @@ enum Commands {
         #[arg(long)]
         print_synthesised: bool,
         /// Scenario only: dump the binding-augmented config for the
-        /// named component and exit (PR 2; PR 1 errors not-yet-impl).
+        /// named component and exit.
         #[arg(long, value_name = "COMPONENT")]
         print_merged: Option<String>,
         /// Scenario only: parse + validate the scenario, exit without
@@ -225,9 +224,11 @@ enum Commands {
     /// Node-agent operations (reconcile/commit/publish plans)
     Agent(agent_cli::AgentArgs),
     /// Hardware-rig orchestration (`rig test --scenario …`, `rig power`,
-    /// `rig monitor`, …) with a board-agnostic contract. See
-    /// `.context/rfc_hardware_rig.md` for the model; scenarios live in
-    /// `tests/hardware/`, rig profiles live outside the repo in
+    /// `rig monitor`, …). The contract is board-agnostic: a board declares
+    /// which deploy, console, observe and power capabilities it offers, a
+    /// scenario asks for the ones it needs, and backends on the discovery
+    /// path supply them. Which board is attached and how it is reached is a
+    /// rig profile, held outside the repository in
     /// `~/.config/fluxor/labs/<lab>/rigs/<rig>.toml`.
     #[command(subcommand_value_name = "RIG_SUBCOMMAND")]
     Rig(rig::cli::RigArgs),
@@ -693,8 +694,9 @@ enum WorkspaceAction {
 #[derive(Subcommand)]
 pub enum AppletAction {
     /// The runtime's log records from an applet's latest run: what the
-    /// kernel and platform said while the program ran, which never reaches
-    /// the program's own stderr (rfc_cli_execution.md §5.4).
+    /// kernel and platform said while the program ran. These records go to
+    /// the runtime's own log store, never to the program's stderr, so the
+    /// applet's output stays exactly what the applet itself wrote.
     Logs {
         /// Applet name.
         name: String,
@@ -769,10 +771,10 @@ enum ModulesAction {
         #[arg(long, conflicts_with = "target")]
         all: bool,
         /// Output root for `<silicon>/modules/<name>.fmod`. Defaults
-        /// to `target/fluxor` per the standard's §2 path. Pass
-        /// `--out target` to land artefacts at the legacy
-        /// `target/<silicon>/modules/` layout the existing combine /
-        /// run tooling expects.
+        /// to `target/fluxor` (standards/fluxor-modules.md §2). Pass
+        /// `--out target` for the alternate
+        /// `target/<silicon>/modules/` layout the combine / run
+        /// tooling also accepts.
         #[arg(long, default_value = "target/fluxor")]
         out: PathBuf,
         /// `rustc -D warnings` mode. Required for `fluxor ci`.

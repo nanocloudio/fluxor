@@ -31,7 +31,9 @@ use crate::kernel::exec::step_guard::{
     self, fault_type, FaultPolicy, FaultRecord, FaultState, FaultStats, ModuleFaultInfo,
 };
 use crate::kernel::ipc::channel;
-use crate::kernel::ipc::channel::{channel_set_flags, channel_set_mailbox, POLL_ERR, POLL_HUP};
+use crate::kernel::ipc::channel::{
+    channel_set_flags, channel_set_mailbox, channel_set_reader_gone, POLL_ERR, POLL_HUP,
+};
 use crate::kernel::module::loader::{
     find_hint_for_port, reset_state_arena, ChannelHint, DynamicModule, ModuleLoader, StartNewResult,
 };
@@ -116,8 +118,8 @@ const MAX_BURST_STEPS: usize = 16384;
 /// Measured against `hal::now_millis()` (via `last_fault_ms`) rather
 /// than a tick count: a fixed tick window silently shrinks/grows the
 /// real coincidence window the moment mechanism (b) varies the tick
-/// period, and stalls entirely under mechanism (a) idle-sleep — a
-/// correctness regression for this safety decision.
+/// period, and stalls entirely under mechanism (a) idle-sleep — either
+/// way the safety decision would be made on a wrong window.
 const QUARANTINE_WINDOW_MS: u64 = 100;
 
 /// Hard kernel ceiling on `Draining` phase duration, in scheduler
@@ -146,12 +148,12 @@ pub const MAX_DOMAINS: usize = 4;
 /// Default tick period in microseconds (1ms).
 pub const DEFAULT_TICK_US: u32 = 1000;
 
-/// Per-pass exponential-decay shift for `domain_worst_step_us` (the §5.3
-/// adaptive-tick floor input). Each pass removes `1/2^SHIFT` of the retained
-/// peak, so a one-off spike ages out in ~`SHIFT × ln(spike/steady)` passes
-/// (~0.4 s at a 1 ms tick for SHIFT=8) and the floor relaxes on cool-down
-/// (AC7). Exact value is rig-tuned (OQ1); the decay couples weakly to pass
-/// rate under variable tick (a documented second-order effect — relaxation
+/// Per-pass exponential-decay shift for `domain_worst_step_us`, the input to
+/// the adaptive-tick per-domain floor. Each pass removes `1/2^SHIFT` of the
+/// retained peak, so a one-off spike ages out in ~`SHIFT × ln(spike/steady)`
+/// passes (~0.4 s at a 1 ms tick for SHIFT=8) and the floor relaxes on
+/// cool-down. The exact value is rig-tuned; the decay couples weakly to pass
+/// rate under variable tick (a second-order effect — relaxation
 /// speed, not correctness). The per-step peak-hold re-raises it to the live
 /// worst, so steady-state tracks the current worst and only stale spikes decay.
 pub const WORST_STEP_DECAY_SHIFT: u32 = 8;

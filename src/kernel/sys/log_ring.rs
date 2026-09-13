@@ -33,13 +33,11 @@
 //! (ISRs, cross-core) later.
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 /// Ring capacity. Must be a power of two; sized to cover early boot until the
-/// log_net module is up (~a few seconds of chatty logging). Smaller on RP2040
-/// (264 KB total SRAM — a 64 KB ring is 25% of DRAM and pushes .bss past
-/// the region when combined with STATE_ARENA / BUFFER_ARENA).
-#[cfg(feature = "chip-rp2040")]
-const CAPACITY: usize = 4096;
-#[cfg(not(feature = "chip-rp2040"))]
-const CAPACITY: usize = 65536;
+/// log_net module is up (~a few seconds of chatty logging). Per-silicon,
+/// through the kernel's capacity seam: a host-class 64 KiB ring pushes
+/// .bss past the linker's RAM region on both RP parts once STATE_ARENA
+/// and BUFFER_ARENA are placed beside it.
+const CAPACITY: usize = crate::kernel::config::LOG_RING_CAPACITY;
 const MASK: usize = CAPACITY - 1;
 static mut BUF: [u8; CAPACITY] = [0; CAPACITY];
 static HEAD: AtomicU32 = AtomicU32::new(0);
@@ -68,6 +66,25 @@ pub fn activate_local() {
     if !LOCAL_ACTIVE.load(Ordering::Acquire) {
         let head = HEAD.load(Ordering::Acquire);
         TAIL_LOCAL.store(head, Ordering::Release);
+        LOCAL_ACTIVE.store(true, Ordering::Release);
+    }
+}
+/// Activate the local consumer **with** its backlog.
+///
+/// As [`activate_local`], but the tail is seeded to the oldest byte the ring
+/// still holds rather than to `HEAD`, so whatever accumulated before a
+/// reader arrived is delivered first. For a console that is opened after
+/// the board booted, that is the boot log — which is the part a person
+/// opening the console is usually looking for. Idempotent once active.
+///
+/// The ring only ever holds the last `CAPACITY` bytes: with no consumer
+/// active the producer overwrites freely, so the backlog is bounded by the
+/// ring, not by how long the board has been up.
+pub fn activate_local_from_backlog() {
+    if !LOCAL_ACTIVE.load(Ordering::Acquire) {
+        let head = HEAD.load(Ordering::Acquire);
+        let retained = core::cmp::min(head as usize, CAPACITY) as u32;
+        TAIL_LOCAL.store(head.wrapping_sub(retained), Ordering::Release);
         LOCAL_ACTIVE.store(true, Ordering::Release);
     }
 }

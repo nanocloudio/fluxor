@@ -3,14 +3,18 @@ hardware_targets = ["bcm2712"]
 permissions = ["platform_raw"]
 
 # Tier-2 (IRQ-owned) validation probe. `isr_safe` attests the step/ISR body
-# never calls a forbidden syscall from interrupt context (RFC
-# rfc_isr_tier_surface §D7) — required for admission to a `tier: 2` domain.
+# never calls a forbidden syscall from interrupt context — no heap
+# allocation, no provider_call, no channel_read/channel_write, and
+# bounded execution. Required for admission to a `tier: 2` domain; the
+# author owns the claim and the runtime backstops it by returning EACCES
+# on any barred syscall.
 # `module_isr_entry` (exported in mod.rs) is what the IRQ dispatches into; the
 # packer sets the isr_module header bit when it sees that symbol.
 isr_safe = true
 
 # Cadence-independent: it does no tick-based timekeeping. Lets it sit on an
-# adaptive domain too if desired (RFC adaptive_tick §8 rule 2).
+# adaptive (mechanism-(b)) domain too if desired — an absent declaration is
+# unattested and is blocked there.
 timer_class = "agnostic"
 
 [[ports]]

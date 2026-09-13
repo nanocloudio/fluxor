@@ -2,13 +2,14 @@ version = "1.0.0"
 hardware_targets = ["wasm"]
 builtin = true
 
-# Demo consumer of the Surface Traits surface (.context/rfc_surface_traits.md).
-# Reads `input::surface_traits::MSG_TRAITS` records from its input port and
+# Demo consumer of the Surface Traits surface. Reads
+# `input::surface_traits::MSG_TRAITS` records from its input port and
 # logs the decoded fields (viewport / orientation / size class / modalities /
-# epoch) to the kernel log ring, so the full A-0 round-trip is observable in
+# epoch) to the kernel log ring, so the full round-trip is observable in
 # the DOM terminal: browser publisher → host queue → wasm_browser_surface_traits
-# → channel → this probe. Not a production module — it is the live acceptance
-# check (criterion 1). Resize / rotate the window and watch the records flow.
+# → channel → this probe. Not a production module — it is the live check that
+# the surface works end to end. Resize / rotate the window and watch the
+# records flow.
 
 [[ports]]
 name = "events"

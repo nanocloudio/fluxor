@@ -39,8 +39,8 @@ fn linux_restore_interrupts(_state: u32) {}
 /// Main-loop thread handle, captured before stepping starts.
 /// `linux_wake_scheduler` clones and unparks it so an event signaled
 /// from any thread (or from an ISR-equivalent callback) can interrupt
-/// the runtime's `park_timeout` and run woken modules in the same way
-/// RP breaks out of `embassy_futures::select` on a SIGNAL fire.
+/// the runtime's `park_timeout` and run woken modules — the host analogue
+/// of RP's `WakeLatch` + `SEV` breaking it out of `WFE`.
 static LINUX_MAIN_THREAD: OnceLock<thread::Thread> = OnceLock::new();
 
 /// Capture the current thread as the wake target. Call once, before

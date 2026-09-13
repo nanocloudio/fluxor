@@ -1,6 +1,7 @@
-//! Node-agent reconcile → stage → commit orchestration (rfc_k8s.md §6.7, §11,
-//! §12), tying together composition, the binary plan codec, and the durable
-//! generation store.
+//! Node-agent reconcile → stage → commit orchestration: the device-side control
+//! loop that turns one node's desired pod set into a single durably committed
+//! graph generation, tying together composition, the binary plan codec, and the
+//! durable generation store.
 //!
 //! `reconcile_and_commit` is the trusted host-side step that turns a desired
 //! device state into a durably committed graph generation: compose the
@@ -150,13 +151,14 @@ const DESIRED_KEY: &str = "desired.pods";
 /// runtime's status surface.
 const PUBLISH_PATH_KEY: &str = "publish.path";
 /// Key holding the per-slot high-water owner generation. Slot generations must
-/// survive a slot going empty (rfc_k8s.md §11: reuse always issues a strictly
-/// higher generation, so a deleted pod's stale handles can never match), and
-/// the committed plan only records currently-occupied slots.
+/// survive a slot going empty — reusing a slot must always issue a STRICTLY
+/// higher owner generation, so a deleted pod's stale handles can never match —
+/// and the committed plan only records currently-occupied slots.
 const SLOT_GENS_KEY: &str = "slot.generations";
 /// Key holding the node policy the orchestrator supplies out-of-band of any
-/// one pod (rfc_endpoint_lease.md §5.2): today the reserved-port set that
-/// exported endpoints must not intersect. Persisted so EVERY recompose —
+/// one pod: today the reserved-port set that exported endpoints must not
+/// intersect. It is node-scoped, never a per-pod manifest field, because the
+/// ports it protects belong to the orchestrator itself. Persisted so EVERY recompose —
 /// commit or remove, whoever triggers it — composes against the same policy.
 const NODE_POLICY_KEY: &str = "node.policy";
 
@@ -172,7 +174,8 @@ pub struct NodePolicy {
     /// The node substrate's platform-module prefix: platform stacks PREPEND
     /// their modules (linux_net et al.), so compiled indices [0, N) are
     /// system infrastructure and pod module ranges must start past them
-    /// (rfc_system_services.md §1.1). 0 = no platform modules (a substrate
+    /// — the node's own system services are not ownable by a workload.
+    /// 0 = no platform modules (a substrate
     /// whose module list is entirely ownable).
     #[serde(default)]
     pub system_modules: u16,
@@ -256,8 +259,9 @@ fn save_desired<S: Storage>(
 }
 
 /// Owner snapshot derived from the committed plan: the plan IS the record of
-/// which pod holds which slot at which generation (rfc_k8s.md §11 input), so
-/// recomposition keeps resident pods' slots/generations stable.
+/// which pod holds which slot at which generation — the input the next slot and
+/// generation allocation is computed against — so recomposition keeps resident
+/// pods' slots/generations stable.
 fn snapshot_from_committed<S: Storage>(
     store: &GenStore<S>,
     max_owners: u16,
@@ -305,8 +309,9 @@ pub fn record_publish_path<S: Storage>(
 }
 
 /// Directory the runtime writes its sidecars into — `owner_status.json` and the
-/// per-owner `logs/` ring directory (`rfc_owner_drain_and_logs.md` §4.3) — which
-/// is the parent of the recorded publish path. `None` when nothing has been
+/// per-owner `logs/` ring directory (one ring file per owner UID, named
+/// `<owner_uid>.<slot>.<owner_generation>.ring`) — which is the parent of the
+/// recorded publish path. `None` when nothing has been
 /// published yet. Shared by `agent status` and `agent logs` so both resolve the
 /// sidecars the same way.
 pub fn published_sidecar_dir<S: Storage>(store: &GenStore<S>) -> Option<std::path::PathBuf> {
@@ -314,10 +319,12 @@ pub fn published_sidecar_dir<S: Storage>(store: &GenStore<S>) -> Option<std::pat
     Some(std::path::Path::new(&publish).parent()?.to_path_buf())
 }
 
-// ── Live runtime status (rfc_k8s.md §7.2 vocabulary) ────────────────────────
+// ── Live runtime status (the closed pod-status vocabulary) ──────────────────
 //
 // These types mirror what the node runtime writes into `owner_status.json`.
-// The reason/phase enums ARE the fixed §7.2 vocabulary: deserialization
+// The reason/phase enums ARE the closed vocabulary — the complete, fixed set of
+// phase, terminated-reason and waiting-reason strings a pod status may carry,
+// and nothing outside it is a valid value: deserialization
 // rejects anything outside the set, so a runtime emitting an unknown reason
 // can never leak it into the orchestrator-facing JSON (nanocloud matches on
 // these strings and rejects others).
@@ -330,7 +337,8 @@ pub enum RuntimePhase {
     Terminated,
 }
 
-/// §7.2 `state.terminated.reason` vocabulary.
+/// The closed `state.terminated.reason` vocabulary: the complete set of reasons
+/// a terminated owner may report. Nothing outside these six is valid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TerminatedReason {
     Completed,
@@ -341,7 +349,7 @@ pub enum TerminatedReason {
     FluxorReservationInvalid,
 }
 
-/// §7.2 waiting reasons only the runtime can know (`FluxorStaging` /
+/// The waiting reasons only the runtime can know (`FluxorStaging` /
 /// `FluxorActivating` are inferred by the orchestrator from committed state
 /// plus liveness and are deliberately absent here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -362,8 +370,8 @@ pub struct TerminatedState {
     pub finished_at: String,
 }
 
-/// One pod's LIVE runtime status, §7.2-shaped. Joined into [`PodStatus`] by
-/// pod UID; absent entirely when the runtime isn't up.
+/// One pod's LIVE runtime status, in the closed status vocabulary above. Joined
+/// into [`PodStatus`] by pod UID; absent entirely when the runtime isn't up.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PodRuntimeStatus {
     pub phase: RuntimePhase,
@@ -382,8 +390,9 @@ pub struct PodRuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<WaitingReason>,
     /// Owner lifecycle state; `Some("Draining")` during a graceful drain, absent
-    /// when running normally (rfc_owner_drain_and_logs.md §3.7). A free-form
-    /// string, not an enum, so a future state never trips the strict reader.
+    /// when running normally. A free-form string, not an enum, so an owner
+    /// lifecycle state this reader does not know never trips the strict parse
+    /// that guards the closed phase/reason vocabulary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_state: Option<String>,
     /// Wall-clock second the drain forfeits its grace (present while draining).
@@ -393,12 +402,13 @@ pub struct PodRuntimeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_remaining_secs: Option<u32>,
     /// How a completed drain window closed (present on drained-owner
-    /// terminal records; rfc_owner_drain_and_logs.md §3.7).
+    /// terminal records).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain: Option<DrainDetail>,
     /// The runtime's RAW bound-endpoint report — which (protocol, port) pairs
-    /// are actually listening for this owner (rfc_endpoint_lease.md §4.3).
-    /// Declarations are joined by the agent, not the runtime.
+    /// are actually listening for this owner. The runtime reports ONLY what it
+    /// observed binding; matching those against the pod's declared exports is
+    /// the agent's job, never the runtime's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_endpoints: Option<Vec<BoundEndpoint>>,
 }
@@ -410,10 +420,10 @@ pub struct BoundEndpoint {
     pub port: u16,
 }
 
-/// The agent's declared⇄bound join for one endpoint
-/// (rfc_endpoint_lease.md §4.3 doc 2): one entry per declared export
-/// (`bound` = a matching listener is live) plus any observed undeclared bind
-/// (`declared: false` — report-only until Part B enforces).
+/// The agent's declared⇄bound join for one endpoint: one entry per declared
+/// export (`bound` = a matching listener is live) plus any observed bind that
+/// no export declared (`declared: false`). An undeclared bind is reported, not
+/// refused — the join surfaces the discrepancy, it does not police it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct EndpointStatus {
     pub protocol: String,
@@ -456,15 +466,16 @@ pub fn join_endpoints(
     out
 }
 
-/// Terminal drain detail. Bool fields, not an enum, so a future
-/// distinction never trips the strict status reader (fields-not-enums,
-/// rfc_owner_drain_and_logs.md §3.7).
+/// Terminal drain detail: how a completed drain window closed. Independent
+/// bool fields rather than an enum, so a drain outcome this reader does not
+/// know about arrives as an unset field instead of failing the strict parse.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DrainDetail {
     /// The grace deadline lapsed before the owner reached quiescence.
     #[serde(default)]
     pub timed_out: bool,
-    /// A runtime restart forfeited the remainder of the window (§3.6).
+    /// A runtime restart forfeited the remainder of the window: a drain does
+    /// not resume across a restart, the grace is simply lost.
     #[serde(default)]
     pub by_restart: bool,
 }
@@ -490,17 +501,17 @@ struct RuntimeStatusFile {
 #[derive(Debug, serde::Deserialize)]
 struct RuntimeStatusPod {
     pod_uid_hex: String,
-    /// Owner slot + generation — with the pod UID, the §17.2 join key. Both
-    /// must match the committed assignment for the join to attach.
+    /// Owner slot + generation — with the pod UID, the full join key. ALL
+    /// three must match the committed assignment for the join to attach.
     slot: u16,
     owner_generation: u32,
     runtime: PodRuntimeStatus,
 }
 
 /// One pod's surfaced status: the owner-tagged join of the persisted desired
-/// state and the committed plan (rfc_k8s.md §17.2 — pod UID + slot +
-/// generation is the join key between orchestrator status and device
-/// telemetry). `slot`/`owner_generation`/allocation fields are present only
+/// state and the committed plan. Pod UID + owner slot + owner generation is
+/// the join key between orchestrator-facing status and device telemetry; a
+/// partial match is not a match. `slot`/`owner_generation`/allocation fields are present only
 /// when the pod is in the committed generation.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PodStatus {
@@ -521,12 +532,12 @@ pub struct PodStatus {
     pub state_cap: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_cap: Option<u32>,
-    /// LIVE per-pod runtime status (§7.2-shaped), joined from the runtime's
-    /// `owner_status.json` by pod UID. Absent when the runtime isn't up —
+    /// LIVE per-pod runtime status (in the closed status vocabulary), joined
+    /// from the runtime's `owner_status.json` by pod UID. Absent when the runtime isn't up —
     /// additive: existing consumers of the durable fields are unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<PodRuntimeStatus>,
-    /// Declared⇄bound endpoint join (rfc_endpoint_lease.md §4.3): present only
+    /// Declared⇄bound endpoint join: present only
     /// when live runtime state is attached — an absent runtime means "unknown",
     /// never a claimed `bound:false`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -594,8 +605,8 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
     // Departing pods stay observable for the whole drain window: a removed
     // pod is gone from desired state immediately, but its revocation record
     // rides the committed plan until retention lapses
-    // (rfc_owner_drain_and_logs.md §3.7). Synthesize a row from each
-    // revocation whose UID no longer has a desired row, so `status` keeps
+    // until its retention lapses. Synthesize a row from each revocation whose
+    // UID no longer has a desired row, so `status` keeps
     // showing the owner (and, via the runtime join, its Draining/Terminated
     // state) instead of the pod silently vanishing mid-drain. Namespace and
     // name left empty — the desired record that carried them is gone; the
@@ -639,8 +650,8 @@ pub fn node_status<S: Storage>(store: &GenStore<S>) -> Result<NodeStatus, StoreE
 
 /// `node_status` plus the LIVE per-pod runtime join: read the runtime's
 /// `owner_status.json` (located beside the plan file recorded by
-/// [`record_publish_path`]) and attach each pod's §7.2-shaped `runtime`
-/// object by the full §17.2 join key — pod UID + slot + owner generation,
+/// [`record_publish_path`]) and attach each pod's `runtime` object by the full
+/// join key — pod UID + owner slot + owner generation,
 /// scoped to the committed plan generation. Best-effort and fail-absent: a
 /// missing/garbled/out-of-vocabulary file, a writer process that is no
 /// longer alive (or is a recycled PID), a file from a different plan
@@ -655,8 +666,8 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
         // must not be joined to the new durable records.
         if Some(file.plan_generation) == st.generation {
             // Declared exports per pod, for the declared⇄bound endpoint join
-            // (rfc_endpoint_lease.md §4.3 doc 2 — the agent owns this join;
-            // the runtime reported only raw binds).
+            // (the agent owns this join; the runtime reported only the raw
+            // binds it observed, with no notion of what was declared).
             let desired = load_desired(store)?;
             for pod in &mut st.pods {
                 if let Some(entry) = file.pods.iter().find(|p| {
@@ -677,7 +688,7 @@ pub fn node_status_with_runtime<S: Storage>(store: &GenStore<S>) -> Result<NodeS
             // Runtime entries with no durable row left — a departed owner
             // whose revocation already aged out of the plan but whose
             // terminal record is still inside the runtime's retention
-            // window (§3.7). Surface them as runtime-only rows rather than
+            // window. Surface them as runtime-only rows rather than
             // dropping the terminal state.
             for entry in &file.pods {
                 if st.pods.iter().any(|p| p.pod_uid_hex == entry.pod_uid_hex) {
@@ -744,13 +755,14 @@ fn proc_start_ticks(pid: u32) -> Option<u64> {
     if fields.next()? == "Z" {
         return None;
     }
-    // `state` was field 3; `starttime` is field 22.
+    // The field just consumed is field 3 (`state`); `starttime` is field 22.
     fields.nth(18)?.parse().ok()
 }
 
 /// Upsert `pod` into the node's persisted desired state and recompose ALL
-/// running pods into the next generation (rfc_k8s.md §6.3: one device, one
-/// composed graph). Resident pods keep their slots/generations via the
+/// running pods into the next generation — one device runs exactly ONE
+/// composed graph, so every resident pod is recomposed together, never patched
+/// in individually. Resident pods keep their slots/generations via the
 /// committed-plan snapshot. Returns the committed plan and its generation id.
 pub fn upsert_pod_and_commit<S: Storage>(
     store: &mut GenStore<S>,
@@ -766,8 +778,8 @@ pub fn upsert_pod_and_commit<S: Storage>(
 /// Remove a pod from the desired state and recompose the remainder. With a
 /// non-zero `grace_secs` the departing pod leaves through a bounded drain
 /// window: its revocation record (deadline = now + grace) rides the same single
-/// generation, and the runtime drains-then-revokes against it
-/// (rfc_owner_drain_and_logs.md §3.2). `grace_secs == 0` revokes immediately —
+/// generation, and the runtime drains-then-revokes against it.
+/// `grace_secs == 0` revokes immediately —
 /// the same code path, with an already-past deadline.
 pub fn remove_pod_and_commit<S: Storage>(
     store: &mut GenStore<S>,
@@ -799,8 +811,8 @@ fn recompose<S: Storage>(
     };
     let prior = snapshot_from_committed(store, cap.max_owners).map_err(AgentError::Store)?;
     let policy = load_node_policy(store).map_err(AgentError::Store)?;
-    // Wall clock is consulted ONLY here, at publish (rfc_owner_drain_and_logs.md
-    // §3.2): revocation deadlines are stamped into the plan; every later check
+    // Wall clock is consulted ONLY here, at publish: revocation deadlines are
+    // stamped as absolute seconds into the plan; every later check
     // (agent expiry, runtime drain) evaluates the stamped value.
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1062,7 +1074,7 @@ mod tests {
 
         // Remove A → ONE generation: A moves to the revocation section (its
         // last assignment verbatim, deadline stamped), B untouched in slot 2
-        // (rfc_owner_drain_and_logs.md §3.2). B's record is byte-identical.
+        // B's record is byte-identical.
         let (p3, g3) = remove_pod_and_commit(&mut store, uid(1), 0, &cap()).unwrap();
         assert_eq!(g3, 3);
         assert_eq!(p3.assignments.len(), 1);
@@ -1283,7 +1295,7 @@ mod tests {
         assert_eq!(t.signal, None);
 
         // The JSON stays additive: durable fields unchanged, `runtime` is a
-        // nested optional object with the exact §7.2 field names.
+        // nested optional object with the exact status-vocabulary field names.
         let v = serde_json::to_value(&st).unwrap();
         let pj = &v["pods"][0];
         assert_eq!(pj["pod_uid_hex"], UID1_HEX);
@@ -1397,7 +1409,7 @@ mod tests {
         )
         .unwrap();
 
-        // §7.2: reasons outside the fixed set are never emitted — a file
+        // Reasons outside the closed set are never emitted — a file
         // carrying one fails strict parse and the join is dropped.
         let st = node_status_with_runtime(&store).unwrap();
         assert!(st.pods[0].runtime.is_none());

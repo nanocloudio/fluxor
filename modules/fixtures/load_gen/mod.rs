@@ -151,7 +151,9 @@ fn tiny_work(s: &mut LoadGenState) {
     let mut acc = s.work_acc;
     let mut i = 0u32;
     while i < s.heavy_iters {
-        acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        acc = acc
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         i += 1;
     }
     s.work_acc = acc;
@@ -193,10 +195,8 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut LoadGenState);
         s.init(syscalls as *const SyscallTable);
 
-        let is_tlv = !params.is_null()
-            && params_len >= 4
-            && *params == 0xFE
-            && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {

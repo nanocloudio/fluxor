@@ -7,14 +7,14 @@
 /// Mirrors `kernel::config::GRAPH_EDGE_SIZE`; the layout is
 /// documented there.
 const GRAPH_EDGE_SIZE: usize = 12;
-/// Maximum number of graph edges. Raised from 64 to 128 to fit the
-/// Quantum graph (114 edges).
+/// Maximum number of graph edges. 128 is sized to hold the Quantum
+/// graph (114 edges) with headroom.
 const MAX_GRAPH_EDGES: usize = 128;
 /// Per-domain metadata: 4 domains × DOMAIN_META_ENTRY_SIZE.
 /// Entry = `tick_us:u16 | exec_mode:u8 | adaptive_flags:u8` = 4 bytes. The
 /// adaptive-tick `tick_min_us`/`tick_max_us` bounds are NOT in this entry; they
 /// live in the unchecksummed post-body tail (see ADAPTIVE_POST_SIZE) so the
-/// checksummed `body_size` is unchanged (RFC adaptive_tick §8). Mirrors
+/// checksummed `body_size` is unchanged. Mirrors
 /// `kernel::config::{DOMAIN_META_ENTRY_SIZE, DOMAIN_META_SIZE}`.
 const DOMAIN_META_ENTRY_SIZE: usize = 4;
 const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
@@ -23,7 +23,7 @@ const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN
 
 
 /// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + reserved:u8).
-/// entry_length widened to u32 so a single module's params can exceed
+/// `entry_length` is a u32 so a single module's params can exceed
 /// 64 KiB — needed by synth host's http module when both halves of a
 /// split scenario inline the canonical wasm shell as body routes
 /// (~95 KiB combined). Coordinated with `src/kernel/boot/config.rs`'s
@@ -35,7 +35,7 @@ const MODULE_ENTRY_HEADER_SIZE: usize = 10;
 /// canonical browser shell (runtime.html ~83 KiB after scenario
 /// substitution + host_shims.js ~56 KiB + scenario.json) as `body:`
 /// routes per the shared-infra-in-orchestrator partition principle.
-/// At 128 KiB the later route bodies were silently truncated (clipped
+/// A 128 KiB cap truncates the later route bodies silently (clipped
 /// JS / empty scenario.json in the browser). Kept in lockstep with the
 /// runtime `MAX_CONFIG_SIZE` / http `DEFAULT_BODY_POOL_SIZE` host caps.
 /// Generation runs host-side, so this is a sanity bound, not a memory
@@ -103,9 +103,9 @@ const DEFAULT_STEP_DEADLINE_US: u32 = 2000;
 /// together.
 const MAX_DOMAINS: usize = 4;
 
-/// Bounded graph/domain pacer-instance table size (RFC adaptive_tick_extra
-/// §7.5). One pacer per (graph_instance, domain); with a single resident graph
-/// this equals `MAX_DOMAINS`. The build rejects adaptive configs that would
+/// Bounded graph/domain pacer-instance table size. One pacer per
+/// (graph_instance, domain); with a single resident graph this equals
+/// `MAX_DOMAINS`. The build rejects adaptive configs that would
 /// need more resident pacer instances than this — the scheduler never allocates
 /// pacer state on a hot path.
 const MAX_PACER_INSTANCES: usize = MAX_DOMAINS;
@@ -114,7 +114,7 @@ const MAX_PACER_INSTANCES: usize = MAX_DOMAINS;
 /// `scheduler::MAX_GRAPH_PACERS`. When more than one resident graph is admitted
 /// (a base graph plus `pods:`), the live pacer instances are the
 /// `(graph_instance, domain)` pairs across all resident graphs, capped by this
-/// static table (RFC adaptive_tick_extra §7.5 / §13).
+/// static table.
 const MAX_GRAPH_PACER_INSTANCES: usize = 16;
 
 /// Burst-mode deadline multiplier — mirrors
@@ -122,7 +122,7 @@ const MAX_GRAPH_PACER_INSTANCES: usize = 16;
 const BURST_DEADLINE_MULTIPLIER: u32 = 8;
 
 /// Adaptive-tick per-domain enable bits — mirror
-/// `kernel::scheduler::ADAPTIVE_FLAG_{IDLE,CADENCE}` (RFC adaptive_tick §8).
+/// `kernel::scheduler::ADAPTIVE_FLAG_{IDLE,CADENCE}`.
 const ADAPTIVE_FLAG_IDLE: u8 = 0x01;
 const ADAPTIVE_FLAG_CADENCE: u8 = 0x02;
 /// Valid per-domain tick bounds (µs), mirrors the kernel `tick_us` range.
@@ -337,25 +337,25 @@ fn validate_scheduler_budgets(
     Ok(())
 }
 
-/// Validate the adaptive-tick per-domain config (RFC adaptive_tick §8, D8/D9/D10).
+/// Validate the adaptive-tick per-domain config.
 ///
 /// Runs only when at least one domain sets `adaptive_flags` — an unconfigured
 /// graph is untouched (byte-identical). Enforces:
 ///   * **Range**: per adaptive domain, non-zero `tick_min_us`/`tick_max_us` ∈
 ///     `[100, 50000]` and `tick_min ≤ tick_max` (0 = "use tick_us"). Warns when
 ///     `tick_min == tick_max` (adaptive enabled but no range ⇒ no-op).
-///   * **Burst-at-floor (D8)**: for a mechanism-(b) domain, each module's
+///   * **Burst-at-floor**: for a mechanism-(b) domain, each module's
 ///     `step_deadline_us × BURST` must fit `16 × tick_min_us` — the smallest
-///     cadence the domain can reach (evidence #4/#5).
-///   * **Liveness (D9)**: demand-driven idle (bit 0) on a domain hosting a
+///     cadence the domain can reach.
+///   * **Liveness**: demand-driven idle (bit 0) on a domain hosting a
 ///     liveness module (`raft_engine`) requires `tick_max_us <
 ///     heartbeat_interval_ms × 1000`, else an idle leader misses heartbeats →
 ///     spurious elections.
-///   * **Multi-node raft (D10)**: a `raft_engine` on an adaptive domain in a
+///   * **Multi-node raft**: a `raft_engine` on an adaptive domain in a
 ///     multi-node cluster (`voter_count`/`peer_count > 1`) is rejected — the
 ///     raft-owning domain must be fixed cadence (both mechanisms off).
 ///
-///   * **Timer-class (D8, RFC §8 rules 1-2)**: on a mechanism-(b) domain every
+///   * **Timer-class attestation**: on a mechanism-(b) domain every
 ///     admitted module must POSITIVELY attest cadence tolerance (`wall_clock` or
 ///     explicit `agnostic`); an unattested module (no `timer_class` / no
 ///     manifest) defaults to step_counted and is blocked (fail closed). A
@@ -363,29 +363,30 @@ fn validate_scheduler_budgets(
 ///     (b) unless `wall_clock`. On an (a)-only domain the gate is lenient (only
 ///     `tick_counted`/`guaranteed` rejected).
 ///
-///   * **Replicated-clock (D8 rule 4, §7.3)**: a `replicated_clock`-class module
-///     (ttl/lease) is blocked on (b) unless the domain asserts
+///   * **Replicated-clock**: a `replicated_clock`-class module (ttl/lease) is
+///     blocked on (b) unless the domain asserts
 ///     `replica_agreed_cadence: true` (and never on a multi-node cluster);
 ///     mechanism (a) idle is clamped so `tick_max_us` stays below the tick
 ///     emission interval.
-///   * **Guaranteed-tier WCET (D8 rule 6, §11)**: a `guaranteed`-class module is
-///     blocked on (b) unless the domain asserts `guaranteed_wcet_revalidated:
-///     true` (the operator re-ran WCET/budget schedulability at `tick_min_us`).
-///   * **Domain-0 `DBG_TICK` rate-coupling (D8 rule 7, §7.1)**: on a DBG_TICK-
-///     backed target with ≥2 domains, an adaptive domain 0 must set a finite
-///     `tick_max_us` so its variable pacing can't stall sibling-domain
-///     `tick_count()` reads (the `*-TICKS` windows are already wall-clocked,
-///     remedy iii).
-///   * **`tick_count()`-as-ms (D8 rule 8, §7.6)**: resolved at the source — the
-///     bcm2712/Linux HAL `tick_count` is now wall-clock-backed (remedy i) and
-///     timer FDs already use `hal::now_millis`; a module that counts ticks as
-///     time is `tick_counted` and is rejected by the timer-class gate above.
+///   * **Guaranteed-tier WCET**: a `guaranteed`-class module is blocked on (b)
+///     unless the domain asserts `guaranteed_wcet_revalidated: true` (the
+///     operator re-ran WCET/budget schedulability at `tick_min_us`).
+///   * **Domain-0 `DBG_TICK` rate-coupling**: on a DBG_TICK-backed target with
+///     ≥2 domains, an adaptive domain 0 must set a finite `tick_max_us` so its
+///     variable pacing can't stall sibling-domain `tick_count()` reads (the
+///     `*-TICKS` drain/quarantine/backoff windows are wall-clocked, so only the
+///     DBG_TICK advance rate couples the domains).
+///   * **`tick_count()`-as-milliseconds**: no gate is needed here — the
+///     bcm2712/Linux HAL `tick_count` is wall-clock-backed and timer FDs use
+///     `hal::now_millis`; a module that counts ticks as time declares
+///     `tick_counted` and is rejected by the timer-class gate above.
 ///
 /// Read a numeric module param from EITHER the top-level entry (`voter_count: 3`)
 /// OR a nested `params:` map (`params: { voter_count: 3 }`). The TLV packer
-/// accepts both styles (schema.rs:298-335), so the D9/D10 raft gates must too —
-/// otherwise the normal top-level style silently bypasses them.
-/// §7.5/§13 resident-graph (pod) pacer-table admission. Counts the base graph's
+/// accepts both styles (schema.rs:298-335), so the raft liveness and multi-node
+/// gates must read both too — otherwise the normal top-level style silently
+/// bypasses them.
+/// Resident-graph (pod) pacer-table admission. Counts the base graph's
 /// domains plus each `pods:` entry's distinct module domains and rejects configs
 /// that would exceed the kernel's static `GRAPH_PACERS` table. Runs regardless of
 /// `adaptive_flags` — the runtime keys/steps the resident-graph table for ANY
@@ -423,7 +424,7 @@ fn validate_resident_workload_table(config: &Value, domain_count: usize) -> Resu
              exceeding the kernel's static pacer table ({MAX_GRAPH_PACER_INSTANCES}, \
              scheduler::MAX_GRAPH_PACERS). The runtime never allocates pacer state on \
              a hot path, so resident graphs are statically capped. Reduce the number \
-             of pods/domains (RFC adaptive_tick_extra §7.5 / §13).",
+             of pods, or the number of distinct domains they place modules in.",
             pods.len() + 1
         )));
     }
@@ -459,25 +460,24 @@ fn validate_adaptive_tick(
     let mut flags = [0u64; MAX_DOMAINS];
     let mut tmin = [0u64; MAX_DOMAINS];
     let mut tmax = [0u64; MAX_DOMAINS];
-    // Per-domain operator attestations for the §11 / §7.3 escape hatches:
+    // Per-domain operator attestations, the two escape hatches:
     //  * `guaranteed_wcet_revalidated` — the operator asserts the domain's
     //    WCET/budget schedulability was re-run at `tick_min_us`, permitting a
-    //    `guaranteed`-class module on a mechanism-(b) domain (D8 rule 6).
+    //    `guaranteed`-class module on a mechanism-(b) domain.
     //  * `replica_agreed_cadence` — the operator asserts every replica paces
     //    the replicated-tick emission identically, permitting a
-    //    `replicated_clock`-class module on a (single-node) (b) domain
-    //    (D8 rule 4).
+    //    `replicated_clock`-class module on a (single-node) (b) domain.
     let mut guar_reval = [false; MAX_DOMAINS];
     let mut replica_agreed = [false; MAX_DOMAINS];
-    // Per-domain core bitmask (§9.2 shared-runner detection). A domain that
+    // Per-domain core bitmask (shared-runner detection). A domain that
     // pins `cores: [N, ...]` runs on those cores; a domain with no `cores`
     // shares the cooperative runner (modelled as core 0 — true on single-core
     // Linux/rp/wasm, and the default lane on bcm2712). Two domains whose
     // bitmasks overlap share a physical runner.
     let mut core_mask = [0u64; MAX_DOMAINS];
     // Per-domain "hosts a timing-strict module" (Guaranteed WCET, replicated
-    // clock, or raft liveness) — the §9.2 / §9.4 shared-runner co-residency
-    // check rejects an adaptive domain sharing a runner with one of these.
+    // clock, or raft liveness) — the shared-runner co-residency check rejects an
+    // adaptive domain sharing a runner with one of these.
     let mut has_strict = [false; MAX_DOMAINS];
     let mut domain_count = 0usize;
     if let Some(domains) = config
@@ -512,7 +512,7 @@ fn validate_adaptive_tick(
                 // No (or empty) `cores` ⇒ the shared cooperative runner (core 0).
                 _ => core_mask[i] = 1,
             }
-            // §8.4 Tier-0-vs-Tier-3 warning: adaptive cadence (a Tier-0
+            // Tier-0-vs-Tier-3 warning: adaptive cadence (a Tier-0
             // latency/efficiency mode) on a domain explicitly declared poll-mode
             // (Tier 3 = continuous stepping, no relaxation) is contradictory —
             // Tier 3 is the "use the whole core" mode. Recommend picking one.
@@ -525,8 +525,7 @@ fn validate_adaptive_tick(
                          Tier 3 / poll-mode. Tier 0 adaptive reduces idle work; Tier 3 \
                          saturates the core continuously — they are mutually exclusive \
                          intents. Use Tier 3 for full-CPU/poll workloads and drop \
-                         adaptive_flags, or use Tier 0 adaptive and drop the poll tier \
-                         (RFC adaptive_tick_extra §8.4).",
+                         adaptive_flags, or use Tier 0 adaptive and drop the poll tier.",
                         dom.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
                         flags[i]
                     );
@@ -534,9 +533,9 @@ fn validate_adaptive_tick(
             }
         }
     }
-    // Multi-graph pacer-table admission (RFC adaptive_tick_extra §7.5 / §13) runs
-    // BEFORE the adaptive-only early return: resident pods are admitted and the
-    // resident-graph table is keyed/stepped regardless of `adaptive_flags`
+    // Multi-graph pacer-table admission runs BEFORE the adaptive-only early
+    // return: resident pods are admitted and the resident-graph table is
+    // keyed/stepped regardless of `adaptive_flags`
     // (fixed-tick multi-graph still uses it), so an overflowing `pods:` set must
     // be rejected at build time even with no adaptive domain — otherwise a
     // graph/domain instance would just be silently dropped at runtime.
@@ -547,10 +546,11 @@ fn validate_adaptive_tick(
         return Ok(());
     }
 
-    // D8 rules 7-8 are scoped to platforms whose HAL `tick_count` is
-    // `DBG_TICK`-backed — bcm2712 and Linux. rp2350/pico read `tick_count`
-    // from a wall-clock `Instant` and drive timer FDs off `hal::now_millis`,
-    // so they are immune (RFC adaptive_tick §7.6, D8 rule 8 scoping).
+    // The domain-0 coupling rule below is scoped to platforms whose HAL
+    // `tick_count` is `DBG_TICK`-backed — bcm2712 and Linux. rp2350/pico read
+    // `tick_count` from a wall-clock `Instant` and drive timer FDs off
+    // `hal::now_millis`, so nothing on those targets reads a shared tick
+    // counter for time and they are immune.
     let silicon = resolved_target.or_else(|| config.get("target").and_then(|t| t.as_str()));
     let dbg_tick_backed = silicon.is_none_or(|s| {
         let s = s.to_ascii_lowercase();
@@ -609,13 +609,12 @@ fn validate_adaptive_tick(
         }
     }
 
-    // D8 rule 7 (§7.1): domain-0 DBG_TICK rate-coupling on a multi-domain
-    // bcm2712 node. `DBG_TICK` is advanced ONLY by domain 0, and every domain
+    // Domain-0 DBG_TICK rate-coupling on a multi-domain bcm2712 node.
+    // `DBG_TICK` is advanced ONLY by domain 0, and every domain
     // reads it for `tick_count()`. If domain 0 paces variably (b) or idle-sleeps
     // to tick_max_us (a), the shared logical clock re-times for ALL domains.
-    // The `*-TICKS` drain/quarantine/backoff windows are wall-clocked
-    // (RFC §7.6), so they are immune. The residual coupling is the DBG_TICK
-    // *advance rate* feeding
+    // The `*-TICKS` drain/quarantine/backoff windows are wall-clocked, so they
+    // are immune. The residual coupling is the DBG_TICK *advance rate* feeding
     // sibling-domain `tick_count()` reads: bound it by requiring domain 0 to
     // declare a finite `tick_max_us` (no unbounded idle widen) whenever it
     // enables adaptive tick alongside sibling domains. An unbounded
@@ -630,7 +629,7 @@ fn validate_adaptive_tick(
              DBG_TICK that every sibling domain reads via tick_count(); an unbounded \
              idle/cadence widen on domain 0 stalls sibling-domain timing. Set an \
              explicit tick_max_us on domain 0 to bound the coupling, or disable \
-             adaptive tick on domain 0 (RFC adaptive_tick §7.1 / D8 rule 7).",
+             adaptive tick on domain 0.",
             label(0),
             flags[0],
             domain_count,
@@ -638,8 +637,8 @@ fn validate_adaptive_tick(
         )));
     }
 
-    // Bounded pacer-table admission (RFC adaptive_tick_extra §7.5 / §13). Each
-    // (graph_instance, domain) owns one pacer instance; the target declares a
+    // Bounded pacer-table admission. Each (graph_instance, domain) owns one
+    // pacer instance; the target declares a
     // static maximum and the build rejects configs that exceed it (no scheduler
     // hot path may allocate or resize pacer state). With a single resident
     // graph the instance count is the number of adaptive execution domains and
@@ -651,17 +650,17 @@ fn validate_adaptive_tick(
              exceeding the target's bounded pacer table ({MAX_PACER_INSTANCES} \
              graph/domain pacer instances). The scheduler never allocates pacer \
              state on a hot path, so the resident pacer count is statically capped. \
-             Reduce the domain count or raise the target's pacer-table bound \
-             (RFC adaptive_tick_extra §7.5)."
+             Reduce the domain count or raise the target's pacer-table bound."
         )));
     }
 
-    // §10 BCM2712 wake-policy declaration (required statement). On bcm2712 (pi5),
+    // BCM2712 wake-policy declaration (required statement). On bcm2712 (pi5),
     // demand-driven idle (mechanism (a), bit 0) is NOT fully event-driven —
     // Tier-0/1a idle uses WFI, which software SEV does not break — so every
     // adaptive-idle config MUST declare how it bounds first-wake latency:
-    // `clamp` (the default), `doorbell` (the §5.4 SGI, opt-in), or
-    // `wfe` (only where the platform contract proves it safe). The declaration
+    // `clamp` (the default), `doorbell` (a software-generated inter-processor
+    // interrupt that kicks the idle core, opt-in), or `wfe` (only where the
+    // platform contract proves it safe). The declaration
     // forces the deployment to acknowledge "bounded idle polling", not
     // "event-driven idle". rp/Linux/wasm are event-driven and exempt.
     // Registry-resolved: bcm2712 silicon (pi5, qemu-virt, raw bcm2712),
@@ -681,7 +680,7 @@ fn validate_adaptive_tick(
                 return Err(Error::Config(format!(
                     "execution.bcm_wake_policy = \"{other}\" is not recognised; bcm2712 \
                      adaptive idle must declare one of \"clamp\", \"doorbell\", or \
-                     \"wfe\" (RFC adaptive_tick_extra §10)."
+                     \"wfe\"."
                 )));
             }
             None => {
@@ -690,8 +689,9 @@ fn validate_adaptive_tick(
                      explicit `execution.bcm_wake_policy` of \"clamp\", \"doorbell\", \
                      or \"wfe\". bcm2712 idle is WFI-based and not fully event-driven, \
                      so the deployment must declare how first-wake latency is bounded \
-                     (clamp = bounded idle polling, the default; doorbell = §5.4 SGI; \
-                     wfe = only where proven safe) (RFC adaptive_tick_extra §10)."
+                     (clamp = bounded idle polling, the default; doorbell = a \
+                     software-generated inter-processor interrupt that kicks the idle \
+                     core; wfe = only where proven safe)."
                         .to_string(),
                 ));
             }
@@ -718,15 +718,15 @@ fn validate_adaptive_tick(
             continue;
         }
 
-        // D8 timer-class attestation (AC5b): a module that counts scheduler
-        // ticks as time (`tick_counted`) or needs a fixed-cadence WCET
+        // Timer-class attestation: a module that counts scheduler ticks as
+        // time (`tick_counted`) or needs a fixed-cadence WCET
         // (`guaranteed`) cannot run on an adaptive-tick domain — a variable
         // cadence warps its timers / breaks its real-time guarantee. We read from
         // the RESOLVED manifest map (`load_module_manifests_with_extra`, keyed by
         // instance name, incl. extra_module_dirs) — NOT the narrower
         // `from_source_tree`, which would miss external/project modules.
         //
-        // The policy is SCOPED TO THE MECHANISM (RFC adaptive_tick §8 rules 1-2):
+        // The policy is SCOPED TO THE MECHANISM:
         //  * Mechanism (b) (variable cadence): every admitted module must
         //    POSITIVELY attest cadence tolerance (`wall_clock` or explicit
         //    `agnostic`). An Unattested module (no timer_class / no manifest)
@@ -734,14 +734,15 @@ fn validate_adaptive_tick(
         //    A non-zero `step_period_ticks` is also blocked unless `wall_clock`.
         //  * Mechanism (a)-only: the lenient gate — only the hard-unsafe classes
         //    (`tick_counted`/`guaranteed`) are rejected; idle-relax alone doesn't
-        //    warp a running module, and the §7.2/§7.3 type-specific gates cover it.
+        //    warp a running module, and the type-specific gates below (the
+        //    replicated-clock and raft heartbeat idle clamps) cover it.
         let cadence = flags[d] & ADAPTIVE_FLAG_CADENCE as u64 != 0;
         let idle = flags[d] & ADAPTIVE_FLAG_IDLE as u64 != 0;
         if let Some(man) = manifests.get(mname) {
-            // D8 rule 4 (§7.3), mechanism (a): demand-driven idle must not stall
-            // the committed-tick emitter long enough to delay replicated expiry.
-            // Same backstop clamp as the D9 liveness gate — applies whenever idle
-            // is enabled, independent of the cadence flag.
+            // Replicated clock under mechanism (a): demand-driven idle must not
+            // stall the committed-tick emitter long enough to delay replicated
+            // expiry. Same clamp as the raft liveness gate below — it applies
+            // whenever idle is enabled, independent of the cadence flag.
             if idle && man.timer_class.is_replicated_clock() {
                 let interval_ms = module_param_u64(m, "tick_interval_ms")
                     .or_else(|| module_param_u64(m, "heartbeat_interval_ms"))
@@ -756,15 +757,15 @@ fn validate_adaptive_tick(
                          = {interval_us} us). An idle domain would stop stepping the \
                          tick emitter, so committed/replicated expiry stalls until the \
                          backstop fires. Set tick_max_us < {interval_us}, or clear \
-                         bit 0 on this domain (RFC adaptive_tick §7.3 / D8 rule 4).",
+                         bit 0 on this domain.",
                         label(d),
                     )));
                 }
             }
             if cadence {
-                // D8 rule 4 (§7.3), mechanism (b): a replicated/committed clock
-                // self-reads wall-clock time (so it passes the rule-2 attestation
-                // gate), but varying the *emission cadence* shifts expiry timing.
+                // Replicated clock under mechanism (b): a committed clock
+                // self-reads wall-clock time (so it passes the attestation gate
+                // above), but varying the *emission cadence* shifts expiry timing.
                 // Independent per-node pacing cannot agree, so it is blocked
                 // outright on a multi-node cluster; on a single node it is allowed
                 // only when the operator asserts replica-agreed emission cadence.
@@ -776,8 +777,7 @@ fn validate_adaptive_tick(
                              (voter_count/peer_count > 1): independent per-node pacing \
                              changes the replicated-tick emission rate, so replicas \
                              diverge on expiry order. Pin the replicated-clock-owning \
-                             domain to fixed cadence (clear adaptive_flags bit 1) \
-                             (RFC adaptive_tick §7.3/§7.4 / D8 rule 4).",
+                             domain to fixed cadence (clear adaptive_flags bit 1).",
                             label(d),
                         )));
                     }
@@ -788,13 +788,13 @@ fn validate_adaptive_tick(
                              config asserts that all replicas pace the replicated-tick \
                              emission identically. Set `replica_agreed_cadence: true` on \
                              the domain only if that holds, else pin the domain to fixed \
-                             cadence (RFC adaptive_tick §7.3 / D8 rule 4).",
+                             cadence.",
                             label(d),
                         )));
                     }
                 } else if man.timer_class == TimerClass::Guaranteed {
-                    // D8 rule 6 (§11, service tier): (b) lowers the tick and the
-                    // domain budget IS the tick, so a guaranteed-WCET module's
+                    // Guaranteed WCET under mechanism (b): (b) lowers the tick
+                    // and the domain budget IS the tick, so the module's
                     // schedulability — proven at a fixed tick — can be silently
                     // shrunk. Allowed only when the operator asserts the WCET/budget
                     // schedulability was re-validated at the worst-case `tick_min_us`.
@@ -809,8 +809,7 @@ fn validate_adaptive_tick(
                              budget below the value its WCET schedulability was proven \
                              at. Re-validate the domain's WCET/budget schedulability at \
                              tick_min_us and set `guaranteed_wcet_revalidated: true`, or \
-                             move it to a fixed-cadence domain (RFC adaptive_tick §11 / \
-                             D8 rule 6).",
+                             move it to a fixed-cadence domain.",
                             label(d),
                         )));
                     }
@@ -820,13 +819,12 @@ fn validate_adaptive_tick(
                          (variable-cadence) domain '{}': it must positively attest \
                          `timer_class = \"wall_clock\"` (or `\"agnostic\"` if it is \
                          genuinely cadence-independent). An unattested module defaults \
-                         to step_counted and is blocked on (b) until attested \
-                         (RFC adaptive_tick §8 rule 2).",
+                         to step_counted and is blocked on (b) until attested.",
                         man.timer_class.as_str(),
                         label(d),
                     )));
                 }
-                // RFC §8 rule 1: a coarse step period counts TICKS, so the
+                // A coarse step period counts TICKS, so the
                 // wall-clock period (step_period_ticks × domain_tick_us) warps as
                 // the pacer moves — blocked unless the module reads real time.
                 if man.step_period_ticks != 0 && man.timer_class != TimerClass::WallClock {
@@ -836,29 +834,28 @@ fn validate_adaptive_tick(
                          so the wall-clock cadence (step_period_ticks × domain_tick_us) \
                          warps as the pacer moves. Declare `timer_class = \"wall_clock\"` \
                          only if it re-derives its period from real time, else move it \
-                         to a fixed-cadence domain (RFC adaptive_tick §8 rule 1).",
+                         to a fixed-cadence domain.",
                         man.step_period_ticks,
                         label(d),
                     )));
                 }
-                // D8 rule 8 (§7.6) — `tick_count()`-as-milliseconds — is resolved
-                // at the source: on the DBG_TICK-backed HALs (bcm2712/Linux) the
-                // HAL `tick_count` op is wall-clock-backed
+                // `tick_count()`-as-milliseconds needs no gate of its own: on
+                // the DBG_TICK-backed HALs (bcm2712/Linux) the HAL
+                // `tick_count` op is wall-clock-backed
                 // (`bcm_now_millis`/`elapsed_micros`), matching rp's `Instant` HAL,
                 // and timer FDs derive deadlines from `hal::now_millis`
                 // (`fd.rs`). A module that *itself* counts scheduler ticks as time
-                // is `tick_counted` and is already rejected above by rule 2, on
-                // every platform. So there is no residual graph-shape for the
-                // validator to gate here beyond that rule (RFC adaptive_tick §7.6 /
-                // D8 rule 8). `dbg_tick_backed`/`silicon` remain in scope for the
-                // rule-7 domain-0 gate above.
+                // declares `tick_counted` and is already rejected above by the
+                // attestation gate, on every platform. So no residual graph shape
+                // is left for the validator to reject here.
+                // `dbg_tick_backed`/`silicon` remain in scope for the domain-0
+                // DBG_TICK gate above.
             } else if man.timer_class.forbids_adaptive() {
                 return Err(Error::Config(format!(
                     "module '{mname}' (timer_class={}) cannot run on adaptive-tick \
                      domain '{}': a {} module's timekeeping does not tolerate a \
-                     variable scheduler cadence (RFC adaptive_tick D8/AC5b). Move it \
-                     to a fixed-cadence domain (adaptive_flags=0) or correct its \
-                     timer_class.",
+                     variable scheduler cadence. Move it to a fixed-cadence \
+                     domain (adaptive_flags=0) or correct its timer_class.",
                     man.timer_class.as_str(),
                     label(d),
                     man.timer_class.as_str(),
@@ -878,7 +875,7 @@ fn validate_adaptive_tick(
                          its manifest {} failed to parse, so its timer_class cannot \
                          be verified: {e}. Fix the manifest — a malformed \
                          timer_class must not silently downgrade to 'no manifest' \
-                         and pass adaptive admission (RFC adaptive_tick D8/AC5b).",
+                         and pass adaptive admission.",
                         label(d),
                         manifest_path.display(),
                     )));
@@ -893,7 +890,7 @@ fn validate_adaptive_tick(
                      timer_class, and an unattested module cannot run on \
                      mechanism-(b) (variable-cadence) domain '{}'. Add a manifest \
                      declaring `timer_class = \"wall_clock\"` or `\"agnostic\"`, or \
-                     move it to a fixed-cadence domain (RFC adaptive_tick §8 rule 2).",
+                     move it to a fixed-cadence domain.",
                     label(d),
                 )));
             }
@@ -902,20 +899,20 @@ fn validate_adaptive_tick(
             return Err(Error::Config(format!(
                 "module '{mname}' could not be resolved to a manifest, so its \
                  timer_class cannot be verified; an unattested module cannot run on \
-                 mechanism-(b) domain '{}' (RFC adaptive_tick §8 rule 2).",
+                 mechanism-(b) domain '{}'.",
                 label(d),
             )));
         }
 
-        // D8 burst-at-floor: for a (b) domain, the burst deadline must fit the
+        // Burst-at-floor: for a (b) domain, the burst deadline must fit the
         // SMALLEST cadence the domain can reach (tick_min).
         if flags[d] & ADAPTIVE_FLAG_CADENCE as u64 != 0 {
             if let Some(dl) = m.get("step_deadline_us").and_then(|v| v.as_u64()) {
                 // Match validate_module_step_deadlines and the runtime: an
                 // explicit burst ceiling overrides the multiplier-derived
-                // default. Ignoring it here made an otherwise valid adaptive
-                // graph impossible to express (and produced contradictory
-                // verdicts from the two validators).
+                // default. Ignoring it here would make an otherwise valid
+                // adaptive graph impossible to express, and would let the two
+                // validators reach contradictory verdicts.
                 let burst = m
                     .get("step_deadline_burst_us")
                     .and_then(|v| v.as_u64())
@@ -940,18 +937,18 @@ fn validate_adaptive_tick(
         if mtype != "raft_engine" {
             continue;
         }
-        // D10: a raft-owning domain on a multi-node cluster must be fixed.
+        // A raft-owning domain on a multi-node cluster must be fixed cadence.
         if multi_node {
             return Err(Error::Config(format!(
                 "raft_engine '{mname}' is on adaptive domain '{}' of a multi-node cluster \
                  (voter_count/peer_count > 1). Per-node-variable pacing de-syncs heartbeat/\
                  election timing across nodes → cross election timeouts. Pin the raft-owning \
-                 domain to fixed cadence (remove adaptive_flags), or satisfy the §7.2 \
-                 heartbeat clamp on every node (D10).",
+                 domain to fixed cadence (remove adaptive_flags) — every node must pace \
+                 heartbeat and election timing identically.",
                 label(d)
             )));
         }
-        // D9: demand-driven idle on a liveness domain requires the backstop to
+        // Demand-driven idle on a liveness domain requires the backstop to
         // fire before a heartbeat is due.
         if flags[d] & ADAPTIVE_FLAG_IDLE as u64 != 0 {
             let hb_ms =
@@ -965,15 +962,15 @@ fn validate_adaptive_tick(
                      ({hb_ms} ms = {hb_us} us). An idle leader would stop emitting heartbeats \
                      for up to tick_max_us while followers count toward election timeout → \
                      spurious elections. Set tick_max_us < {hb_us}, or clear bit 0 on this \
-                     domain (D9).",
+                     domain.",
                     label(d)
                 )));
             }
         }
     }
 
-    // §9.2 / §9.4 shared-runner co-residency gate (reject-by-default). Populate
-    // `has_strict` across ALL domains — a timing-strict module (Guaranteed WCET,
+    // Shared-runner co-residency gate (reject-by-default). Populate `has_strict`
+    // across ALL domains — a timing-strict module (Guaranteed WCET,
     // replicated clock, raft liveness) usually sits on a NON-adaptive domain, so
     // the adaptive-only module loop above doesn't see it.
     for m in module_list {
@@ -1004,8 +1001,9 @@ fn validate_adaptive_tick(
     // An adaptive domain sharing a physical runner (overlapping core mask) with
     // a timing-strict domain is rejected: a variable-cadence sibling can delay
     // the strict domain's deadline/emission/wake, and proving the bound under
-    // worst-case adaptive load is intractable (§9.2 reject-by-default). The fix
-    // is placement — a dedicated runner / ISR tier — not a schedulability proof.
+    // worst-case adaptive load is intractable, so the gate rejects by default.
+    // The fix is placement — a dedicated runner / ISR tier — not a
+    // schedulability proof.
     for a in 0..MAX_DOMAINS {
         if flags[a] == 0 {
             continue; // `a` is not adaptive
@@ -1022,7 +1020,7 @@ fn validate_adaptive_tick(
                      the strict domain's deadline/emission/wake, and the bound cannot \
                      be proven under worst-case adaptive load. Pin the strict domain \
                      to its own core or an ISR tier, or remove adaptive_flags from \
-                     '{}' (RFC adaptive_tick_extra §9.2/§9.4).",
+                     '{}'.",
                     label(a),
                     label(b),
                     label(a),
@@ -1056,7 +1054,7 @@ fn validate_adaptive_tick(
 ///    (`scheduler::wire_isr_bridges` + `pump_isr_bridges`) and the
 ///    module-facing surface (`bridge::SELF_BRIDGES` enumerates a
 ///    module's own bridge fds; the bridge `WRITE`/`READ`/`POLL`/`INFO`
-///    ops are exempt from the §D7 ISR syscall deny, being lock-free
+///    ops are exempt from the ISR syscall deny-list, being lock-free
 ///    rings) both exist, but the end-to-end YAML-edge → bridge-fd
 ///    wiring is not silicon-validated, so the edge gate stays strict:
 ///    admitting a config that might silently mis-wire at runtime is
@@ -1118,8 +1116,7 @@ fn validate_isr_tier_admission(
     // `DynamicModule::isr_entry_fn()` and routed through
     // `register_tier2_module`). Rules 1/3 below require every Tier 2
     // module to declare `isr_safe = true`, an `irq:` field, and an
-    // actual `module_isr_entry` export in its source. See
-    // `.context/rfc_isr_tier_surface.md` §D5/§D7.
+    // actual `module_isr_entry` export in its source.
 
     // Helper: does this exec_mode require ISR-safe modules?
     let is_isr_tier = |m: u8| -> bool { m == 2 || m == 4 };
@@ -1238,8 +1235,7 @@ fn validate_isr_tier_admission(
                      ISR-tier admission requires a manifest declaring `isr_safe = true`; \
                      add `manifest.toml` under the module's source tree (`modules/<area>/<type>/`) \
                      or list a containing directory in the config's top-level \
-                     `module_search_paths:`. Run `fluxor inspect` to see the active search list. \
-                     See .context/rfc_isr_tier_surface.md §D7.",
+                     `module_search_paths:`. Run `fluxor inspect` to see the active search list.",
                     tier = tier_label(exec_mode)
                 )));
             }
@@ -1250,7 +1246,7 @@ fn validate_isr_tier_admission(
                 "module '{name}' (type '{module_type}') is assigned to domain '{domain_label}' \
                  (tier {tier}) but its manifest does not declare `isr_safe = true`. \
                  Add `isr_safe = true` to the module's manifest.toml, or move the module \
-                 to a cooperative domain. See .context/rfc_isr_tier_surface.md §D7.",
+                 to a cooperative domain.",
                 tier = tier_label(exec_mode)
             )));
         }
@@ -1298,7 +1294,7 @@ fn validate_isr_tier_admission(
                          '{domain_label}' (tier {tier}) but {e}. A Tier 2 module must \
                          export `module_isr_entry` (an `extern \"C\" fn(*mut u8) -> i32`) \
                          — the hardware IRQ dispatches into it, not the cooperative \
-                         `module_step`. See .context/rfc_isr_tier_surface.md §D7.",
+                         `module_step`.",
                         tier = tier_label(exec_mode)
                     )));
                 }
@@ -1312,8 +1308,8 @@ fn validate_isr_tier_admission(
             return Err(Error::Config(format!(
                 "module '{name}' (type '{module_type}') is assigned to a Tier 2 \
                  (isr_owned) domain but its source tree could not be resolved to \
-                 verify the required `module_isr_entry` export. See \
-                 .context/rfc_isr_tier_surface.md §D7."
+                 verify the required `module_isr_entry` export. Place the module's \
+                 `src/` tree alongside its manifest, or move it to a cooperative domain."
             )));
         }
     }
@@ -1349,7 +1345,7 @@ fn validate_isr_tier_admission(
                     "module '{name}' is in a Tier 2 (isr_owned) domain but does not \
                      declare an `irq:` field (or its value is out of u16 range). Add \
                      `irq: N` on the module, where N is the hardware IRQ number the \
-                     module owns. See .context/rfc_isr_tier_surface.md §D5."
+                     module owns."
                 )));
             }
         };
@@ -1367,11 +1363,11 @@ fn validate_isr_tier_admission(
 
     // ── Rule 2: edges touching ISR-tier modules are rejected ────
     //
-    // v1 reality (2026-05-26): the kernel-side bridge wiring works
-    // — `wire_isr_bridges` + `pump_isr_bridges` shuttle bytes
+    // v1 reality: the kernel-side bridge wiring works — `wire_isr_bridges`
+    // + `pump_isr_bridges` shuttle bytes
     // between cooperative PIPE channels and bridge rings — but PIC
     // modules have NO documented way to read their own bridge slot
-    // indices from inside `module_step`, and the §D7 syscall gate
+    // indices from inside `module_step`, and the ISR syscall gate
     // denies `provider_call` (which the SDK's `bridge_dispatch`
     // helper rides on). So an ISR-endpoint edge would get a bridge
     // slot allocated, the kernel would drain bytes into the ring,
@@ -1479,8 +1475,9 @@ fn validate_isr_tier_admission(
 /// would either run it from interrupt context (where its
 /// `provider_call`/heap usage is undefined) or never run it at all
 /// (Tier 3 has no `domain_exec_order` to inject the pre-tick slot
-/// into). See `.context/rfc_isr_tier_surface.md` §D8 for the
-/// contract this validator enforces.
+/// into). A module declares `pre_tick_drain = true` in its
+/// manifest; this validator is what keeps that declaration and the
+/// domain's tier consistent.
 fn validate_pre_tick_drain_admission(
     config: &Value,
     module_list: &[Value],
@@ -1546,8 +1543,7 @@ fn validate_pre_tick_drain_admission(
                  (tier {tier_name}). Pre-tick modules run cooperatively at the start \
                  of every scheduler pass — they must live in a Tier 0 or Tier 1a \
                  domain. Move the module to a cooperative domain, or drop \
-                 `pre_tick_drain` from its manifest. See \
-                 .context/rfc_isr_tier_surface.md §D8."
+                 `pre_tick_drain` from its manifest."
             )));
         }
     }
@@ -1557,14 +1553,13 @@ fn validate_pre_tick_drain_admission(
 
 /// Translate a domain's YAML tier specifier into the kernel's
 /// `domain_exec_mode` wire byte. Accepts the preferred friendly form
-/// (`tier: 1a`) and the legacy `exec_mode:` synonym for backward
-/// compatibility. Returns `None` when both fields are absent so the
-/// caller can default to Tier 0 (cooperative) without confusing
+/// (`tier: 1a`) and the `exec_mode:` alias, which spells the same
+/// tiers by their long names. Returns `None` when both fields are
+/// absent so the caller can default to Tier 0 (cooperative) without confusing
 /// "tier omitted" with "tier explicitly set to 0".
 ///
-/// Wire encoding (kept stable — adding a tier here MUST keep the
-/// existing values intact so older `.cfg.bin` blobs continue to
-/// parse correctly):
+/// Wire encoding (fixed — adding a tier here MUST keep the existing
+/// values intact; this byte is what every `.cfg.bin` blob carries):
 ///
 /// | Tier (friendly)       | exec_mode byte |
 /// |-----------------------|----------------|
@@ -1574,17 +1569,17 @@ fn validate_pre_tick_drain_admission(
 /// | `3` / `poll`          | 3              |
 /// | `2` / `isr_owned`     | 4 (Tier 2)     |
 ///
-/// The Tier 1b → 2 / Tier 2 → 4 mapping is asymmetric because
-/// `domain_exec_mode` values {0, 1, 3} were allocated before Tier 1b
-/// and Tier 2 were introduced. Reshuffling would break already-built
-/// `.cfg.bin` blobs.
+/// The Tier 1b → 2 / Tier 2 → 4 mapping is asymmetric: the wire byte
+/// is an opaque encoding, not the tier's name, and {0, 1, 3} are taken
+/// by Tier 0 / 1a / 3. Reshuffling it would invalidate every built
+/// `.cfg.bin` blob.
 ///
 /// **Returned `Err` only on explicit unknown values** — silently
 /// dropping a typo'd tier (e.g. `tier: 1c`) would route the domain
-/// to Tier 0 cooperative without warning. See
-/// `.context/rfc_isr_tier_surface.md` §D5 for the design rationale.
+/// to Tier 0 cooperative without warning: an ISR-tier module would
+/// then run cooperatively with none of the ISR gates applied.
 pub(crate) fn parse_domain_tier_to_exec_mode(domain: &Value) -> Option<u8> {
-    // `tier:` is the preferred friendly form per the RFC.
+    // `tier:` is the preferred friendly form.
     if let Some(raw) = domain.get("tier") {
         if let Some(s) = raw.as_str() {
             return match s {
@@ -1606,8 +1601,8 @@ pub(crate) fn parse_domain_tier_to_exec_mode(domain: &Value) -> Option<u8> {
             };
         }
     }
-    // Legacy `exec_mode:` synonym — kept so existing configs (e.g.
-    // `examples/log_net/pi5*` exercising Tier 1a) build unchanged.
+    // `exec_mode:` is an accepted alias for `tier:`, taking the long
+    // names only (no `1a`/`1b` short forms).
     if let Some(m) = domain.get("exec_mode").and_then(|m| m.as_str()) {
         return match m {
             "cooperative" => Some(0),
@@ -1709,9 +1704,9 @@ fn load_builtin_param_schema(
 const NON_PARAM_KEYS: &[&str] = &[
     "name",
     "type",
-    // `[[variant]]` selection (RFC module_variants) — consumed by fmod
-    // resolution (`parse_modules_from_config_multi`) and the manifest
-    // loader, never a wire param.
+    // `[[variant]]` selection — consumed by fmod resolution
+    // (`parse_modules_from_config_multi`) and the manifest loader,
+    // never a wire param.
     "variant",
     "wiring",
     "preset",
@@ -2656,9 +2651,9 @@ fn build_module_entry(
     }
 
     // Tag 0xFB: isr_budget_cycles (u32 LE, 4 bytes). Per-module
-    // Tier 1b/2 cycle budget override. Default `0` falls back to the
-    // kernel's `DEFAULT_ISR_BUDGET_CYCLES`. See
-    // `.context/rfc_isr_tier_surface.md` §D7.
+    // Tier 1b/2 cycle budget override: the ISR budget guard trips a
+    // module whose handler exceeds it. Default `0` falls back to the
+    // kernel's `DEFAULT_ISR_BUDGET_CYCLES`.
     if let Some(v) = module.get("isr_budget_cycles") {
         if !v.is_null() {
             let cycles = match v.as_u64() {

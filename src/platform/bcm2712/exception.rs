@@ -298,15 +298,14 @@ pub static CORE_LAST_ELR: [AtomicU64; 4] = [
 /// re-arms with the relative `cntp_tval` down-counter (`timer_set`). When ON,
 /// the IRQ handler re-arms an ABSOLUTE compare relative to the *previous*
 /// programmed deadline, eliminating the per-tick IRQ-entry-latency drift that
-/// makes the §7.1 cross-domain skew bound optimistic under variable cadence —
-/// with a resync guard so a deadline that fell into the past during a long ISR
-/// snaps to `now + period` instead of emitting a catch-up burst of immediate
-/// IRQs.
+/// otherwise accumulates into the cross-domain skew bound under variable
+/// cadence — with a resync guard so a deadline that fell into the past during
+/// a long ISR snaps to `now + period` instead of emitting a catch-up burst of
+/// immediate IRQs.
 ///
-/// This is an opt-in measured option: it changes the most timing-critical
-/// path and MUST be validated on the rig (AC5b: long-run accumulated
-/// cross-domain skew) before it is enabled by default. Toggle via
-/// `bcm2712::set_absolute_rearm`.
+/// Opt-in, because it changes the most timing-critical path: enable it only
+/// where accumulated cross-domain skew has been measured over a long run on
+/// the hardware it will run on. Toggle via `bcm2712::set_absolute_rearm`.
 pub static ABSOLUTE_REARM: AtomicBool = AtomicBool::new(false);
 
 /// Per-core last ABSOLUTE deadline programmed into `cntp_cval`, in counter

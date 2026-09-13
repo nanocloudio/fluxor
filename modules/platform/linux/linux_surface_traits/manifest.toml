@@ -3,7 +3,8 @@ hardware_targets = ["linux"]
 builtin = true
 
 # Linux Surface Traits authority — the Linux implementation of the runtime
-# environment plane (.context/rfc_surface_traits.md). Emits 24-byte
+# environment plane, publishing the same wire shape as the bare-metal panel
+# and browser authorities. Emits 24-byte
 # `input::surface_traits::MSG_TRAITS` records on the output port: a baseline at
 # startup, then one per change. Orientation / size class derive from the
 # configured width/height; input modalities are scanned from

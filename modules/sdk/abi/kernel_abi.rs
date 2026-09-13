@@ -534,8 +534,8 @@ pub const DOWNSTREAM_LATENCY: u32 = 0x0C33;
 /// Report module's own processing latency in frames. handle=-1, arg[0..4]=frames (u32 LE).
 pub const REPORT_LATENCY: u32 = 0x0C50;
 
-/// Report this module's `StepEffect` for the current scheduler pass (RFC
-/// adaptive_tick_extra §6.1). handle=-1, arg[0]=effect code (u8):
+/// Report this module's `StepEffect` for the current scheduler pass.
+/// handle=-1, arg[0]=effect code (u8):
 ///   0=Idle, 1=Waiting, 2=WorkDone, 3=RunnableBacklog, 4=Burst.
 /// WorkDone/RunnableBacklog/Burst keep the adaptive pacer hot WITHOUT
 /// authorising an immediate same-module re-step (that stays `StepOutcome::Burst`

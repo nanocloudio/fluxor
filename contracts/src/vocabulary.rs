@@ -479,15 +479,16 @@ impl RenameKind {
     }
 }
 
-/// One legacy→canonical vocabulary rename, the per-entry schema of the
-/// machine-readable migration map (`.context/rfc_capability_refinement.md`
-/// §8.7). Siblings consume the generated `contracts/vocabulary_map.toml`
-/// instead of hand-copying constant lists; this slice is its source of
-/// truth, drift-guarded by `tools/tests/vocabulary_map_drift.rs`.
+/// One old→canonical vocabulary rename, the per-entry schema of the
+/// machine-readable migration map. Siblings consume the generated
+/// `contracts/vocabulary_map.toml` instead of hand-copying constant lists;
+/// this slice is its source of truth, drift-guarded by
+/// `tools/tests/vocabulary_map_drift.rs`.
 ///
-/// Per decision 16 this is a *rename* map — there are no alias or
-/// deprecation-window fields. `mechanical = false` flags entries that
-/// are not a blind 1:1 rewrite and need per-site judgement.
+/// This is a *rename* map: a name has exactly one canonical spelling and
+/// the old one is not also admitted, so there are no alias or
+/// grace-window fields. `mechanical = false` flags entries that are not a
+/// blind 1:1 rewrite and need per-site judgement.
 pub struct RenameEntry {
     /// The old spelling to find and rewrite.
     pub legacy: &'static str,
@@ -507,12 +508,15 @@ pub struct RenameEntry {
 /// The canonical vocabulary migration map. Rendered verbatim into
 /// `contracts/vocabulary_map.toml`; never hand-edit the `.toml`.
 ///
-/// Coverage mirrors `.context/rfc_capability_refinement.md` §8.1–§8.6.
+/// The map covers graph capability names, the surface/role spellings that
+/// replaced them, documentation-only wire-name corrections, ABI-expansion
+/// naming refinements and provider-contract spelling normalization.
 /// The append-only `CONTENT_TYPES` wire table is intentionally absent —
 /// its byte positions stay locked by `content_type_byte_positions.rs`.
-/// The names in §8.5 ("should not change") are likewise absent.
+/// Names that are already correct are absent too: an entry here means a
+/// spelling changes, never that one was reviewed and kept.
 pub const RENAME_MAP: &[RenameEntry] = &[
-    // ── §8.1 Graph capability renames ───────────────────────────────
+    // ── Graph capability renames ────────────────────────────────────
     e(
         "frame",
         "net.frame",
@@ -625,7 +629,7 @@ pub const RENAME_MAP: &[RenameEntry] = &[
         RenameKind::Rename,
         true,
     ),
-    // ── §8.2 Legacy name replacement ────────────────────────────────
+    // ── Imprecise names replaced by the surface they mean ───────────
     // `socket` is the one rename that cannot be a blind codemod: each
     // site reclassifies to the transport it actually is. The canonical
     // here is the representative default; mechanical = false gates it.
@@ -675,7 +679,7 @@ pub const RENAME_MAP: &[RenameEntry] = &[
         RenameKind::Rename,
         false,
     ),
-    // ── §8.3 Documentation-only wire-name corrections ───────────────
+    // ── Documentation-only wire-name corrections ────────────────────
     e(
         "audio.pcm",
         "AudioSample",
@@ -767,7 +771,7 @@ pub const RENAME_MAP: &[RenameEntry] = &[
         RenameKind::DocOnly,
         true,
     ),
-    // ── §8.4 ABI-expansion naming refinements ───────────────────────
+    // ── ABI-expansion naming refinements ────────────────────────────
     e(
         "storage.block.v1",
         "storage.block",
@@ -810,7 +814,7 @@ pub const RENAME_MAP: &[RenameEntry] = &[
         RenameKind::Rename,
         true,
     ),
-    // ── §8.6 Provider-contract spelling normalization ───────────────
+    // ── Provider-contract spelling normalization ────────────────────
     e(
         "namespace",
         "storage.namespace",

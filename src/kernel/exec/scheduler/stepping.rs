@@ -547,10 +547,12 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     // need every bucket cleared — resetting only domain 0 would
     // leak time into the wrong accumulator when a non-default-domain
     // module is stepped.
+    sched.pass_module_us = [0; MAX_MODULES];
+    sched.pass_module_steps = [0; MAX_MODULES];
     for d in 0..MAX_DOMAINS {
         sched.domain_budget_us_consumed[d] = 0;
-        // Decay the §5.3 floor's worst-step peak-hold once per pass so a stale
-        // spike ages out (AC7). step_one_module re-raises it to the live worst.
+        // Decay the adaptive-tick floor's worst-step peak-hold once per pass so
+        // a stale spike ages out. step_one_module re-raises it to the live worst.
         // The decrement is `max(v >> shift, 1)` for any non-zero value: a pure
         // `v >> 8` stalls at 0 once v < 256, so a stale sub-256 µs spike would
         // never fully age out and would hold the floor (and tick_min) up.
@@ -611,7 +613,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
     for b in PACER_BURST_TICK.iter() {
         b.store(false, Ordering::Relaxed);
     }
-    // §6 work signal: reset on the same per-tick cadence as the burst
+    // Useful-work signal: reset on the same per-tick cadence as the burst
     // accumulator.
     for b in PACER_WORK_TICK.iter() {
         b.store(false, Ordering::Relaxed);
@@ -625,6 +627,7 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         for b in BURST_SEEN_THIS_PASS.iter() {
             b.store(false, Ordering::Relaxed);
         }
+        let pass_start_us = sched.domain_budget_us_consumed;
         for order_pos in 0..n {
             let rotated_pos = if exec_count > 0 {
                 (order_pos + offset) % exec_count
@@ -676,8 +679,9 @@ pub fn step_modules(modules: &mut [ModuleSlot; MAX_MODULES], count: usize) -> St
         if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
             break;
         }
-        // Domain 0 (the only domain on single-domain targets) out of budget.
-        if domain_budget_exhausted(sched, 0) {
+        // A domain that cannot afford another pass ends the tick's passes
+        // for every domain: the flat path steps them all together.
+        if (0..MAX_DOMAINS).any(|d| !domain_budget_admits_repass(sched, d, pass_start_us[d])) {
             break;
         }
         let mut refilled = false;
@@ -797,8 +801,8 @@ pub(crate) static BURST_SEEN_THIS_PASS: [AtomicBool; MAX_DOMAINS] =
 pub(crate) static PACER_BURST_TICK: [AtomicBool; MAX_DOMAINS] =
     [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
-/// Per-domain "a module reported useful work this outer tick" — the §6 work
-/// signal. Set by the `REPORT_STEP_EFFECT` syscall when a module reports
+/// Per-domain "a module reported useful work this outer tick" — the pacer's
+/// work signal. Set by the `REPORT_STEP_EFFECT` syscall when a module reports
 /// `WorkDone`/`RunnableBacklog`/`Burst`; reset once per outer tick alongside
 /// `PACER_BURST_TICK`. Read by `pacer_next_deadline_us` so a graph that does
 /// useful work WITHOUT returning `StepOutcome::Burst` (e.g. the IP forwarding

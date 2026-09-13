@@ -4,10 +4,10 @@
 # Regenerate after editing the map with:
 #   REGEN_VOCABULARY_MAP=1 cargo test -p fluxor-tools --test vocabulary_map_drift
 #
-# Machine-readable capability/surface migration map
-# (.context/rfc_capability_refinement.md §8.7). Siblings consume this
-# file instead of hand-copying vocabulary constants. Per decision 16 it
-# is a *rename* map: there are no alias or deprecation-window fields.
+# Machine-readable capability/surface migration map. Siblings consume
+# this file instead of hand-copying vocabulary constants. It is a
+# *rename* map: a name has exactly one canonical spelling and the old one
+# is not also admitted, so there are no alias or grace-window fields.
 #
 # Schema per entry: legacy, canonical, layer
 # (wire_content | surface | role | provider | fact), kind

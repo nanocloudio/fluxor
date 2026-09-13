@@ -32,7 +32,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -86,6 +85,13 @@ struct LogNetState {
     /// channel-full retries — if emit_datagram fails, we keep the bytes and
     /// try again next tick instead of losing them.
     pending_len: u16,
+    /// Wall clock at which an unbound endpoint reports itself again, and
+    /// whether the last step was bound. Together they make the module say
+    /// why the collector is receiving nothing: an endpoint that never binds
+    /// and a ring with nothing in it are otherwise indistinguishable from
+    /// the collector's end, which sees silence either way.
+    next_status_ms: u32,
+    was_ready: bool,
 
     /// Stats (informational; readable via memory dump if needed).
     datagrams_sent: u32,
@@ -110,6 +116,8 @@ impl LogNetState {
         self.endpoint = DatagramEndpoint::new();
         self.disabled_warned = 0;
         self.pending_len = 0;
+        self.next_status_ms = 0;
+        self.was_ready = false;
         self.datagrams_sent = 0;
         self.bytes_forwarded = 0;
     }
@@ -120,9 +128,9 @@ impl LogNetState {
 // ============================================================================
 
 mod params_def {
-    use super::LogNetState;
     use super::p_u16;
     use super::p_u32;
+    use super::LogNetState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -167,6 +175,49 @@ unsafe fn emit_datagram(s: &mut LogNetState, payload: *const u8, payload_len: us
     }
 }
 
+/// How often an endpoint that is not forwarding repeats why. Wall clock,
+/// so the cadence does not change with the scheduler's tick, and far apart
+/// enough that the report costs a negligible share of the ring it shares
+/// with the logs it exists to explain.
+const STATUS_PERIOD_MS: u32 = 5_000;
+
+/// Say whether the forwarder is carrying logs, and keep saying so while it
+/// is not.
+///
+/// Both of this module's failures are silent at the collector: an endpoint
+/// that never binds and a ring that yields nothing both present as no
+/// datagrams arriving. So the state that separates them is reported on
+/// every transition, and repeated while the endpoint is unbound — the state
+/// someone is waiting on. A forwarder that is working says so once and then
+/// leaves the ring to the logs.
+unsafe fn report_status(s: &mut LogNetState, sys: &SyscallTable, ready: bool) {
+    let now = dev_millis(sys) as u32;
+    let changed = ready != s.was_ready;
+    let due = !ready && now.wrapping_sub(s.next_status_ms) < 0x8000_0000;
+    if !changed && !due {
+        return;
+    }
+    s.was_ready = ready;
+    s.next_status_ms = now.wrapping_add(STATUS_PERIOD_MS);
+
+    let mut buf = [0u8; 64];
+    let p = buf.as_mut_ptr();
+    let mut i = 0usize;
+    let head: &[u8] = if ready {
+        b"[log_net] forwarding sent="
+    } else if s.endpoint.is_disabled() {
+        b"[log_net] disabled sent="
+    } else {
+        b"[log_net] binding sent="
+    };
+    while i < head.len() {
+        *p.add(i) = head[i];
+        i += 1;
+    }
+    i += fmt_u32_raw(p.add(i), s.datagrams_sent);
+    dev_log(sys, 3, p, i);
+}
+
 /// Frames drained from `net_in` per step. This port is one reader of a
 /// fanned `ip.net_out`, so every frame ip hands its other consumer lands
 /// here too and the fan stalls the moment this ring is full: the drain
@@ -179,7 +230,9 @@ const DISCARD_PER_STEP: usize = 128;
 /// remote control input — and a fanned port carries the other
 /// consumer's traffic as well.
 unsafe fn discard_net_in(s: &mut LogNetState) {
-    if s.net_in_chan < 0 { return; }
+    if s.net_in_chan < 0 {
+        return;
+    }
     let sys_ptr = s.syscalls;
     let chan = s.net_in_chan;
     let buf = s.net_buf.as_mut_ptr();
@@ -224,17 +277,23 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() { return -5; }
-        if state_size < core::mem::size_of::<LogNetState>() { return -6; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() {
+            return -5;
+        }
+        if state_size < core::mem::size_of::<LogNetState>() {
+            return -6;
+        }
 
         let s = &mut *(state as *mut LogNetState);
         s.init(syscalls as *const SyscallTable);
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -249,9 +308,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut LogNetState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
 
         let sys = &*s.syscalls;
         // Drive the shared datagram-endpoint lifecycle (bind handshake + backoff);
@@ -274,6 +337,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_log(sys, 2, msg.as_ptr(), msg.len());
             s.disabled_warned = 1;
         }
+        report_status(s, sys, ready);
+
         if !ready {
             // The endpoint's own poll reads through net_in while it binds.
             return 0;

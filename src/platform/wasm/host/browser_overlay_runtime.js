@@ -1,7 +1,7 @@
 // browser_overlay_runtime.js — Fluxor generic browser-overlay renderer.
 //
-// Implements the renderer half of `.context/rfc_browser_overlay.md`
-// §6.3 (`browser_overlay_runtime` + the input-normalizer seam). It
+// The renderer half of the browser overlay: this file and the
+// input-normalizer seam beside it. It
 // turns a host-neutral `presentation.shell` descriptor (+ optional
 // `presentation.browser_overlay` policy) into DOM controls, lays them
 // out responsively around the content so persistent controls never
@@ -937,7 +937,7 @@
     '.fx-list-badge{font-size:0.72em;opacity:0.6;align-self:flex-end;}',
   ].join('');
 
-  // ── Surface Traits publisher (rfc_surface_traits.md) ──────────
+  // ── Surface Traits publisher ──────────────────────────
   //
   // The browser is the trait *authority*: it owns viewport geometry,
   // orientation, the coarse size class, which input modalities are

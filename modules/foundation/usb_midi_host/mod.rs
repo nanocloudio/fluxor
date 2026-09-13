@@ -10,23 +10,32 @@
 //! `stacks/midi.toml` selects this module on pico2w / picow / pi5
 //! targets via `platform.midi: {direction: ...}`.
 //!
-//! Status: **scaffold only**. The module compiles, packs to `.fmod`,
-//! loads cleanly, and validates against the `usb_host` contract — but
-//! the runtime is a no-op. Real implementation requires:
+//! Status: **scaffold**. The module compiles, packs to `.fmod`, loads
+//! cleanly, and validates against the `usb_host` contract — but the
+//! runtime is a no-op because no USB *host* controller exists yet on
+//! either target. What remains:
 //!
-//!   1. A USB host controller driver on the target silicon (the
-//!      RP2350 has an OTG controller exposed via embassy-rp's device
-//!      side; the host side does not exist yet. BCM2712 / Pi 5 uses
-//!      DesignWare DWC2 — also absent.).
+//!   1. A USB host controller driver on the target silicon. RP2350's
+//!      controller can do host or device and only the device side
+//!      exists. Pi 5's USB is two xHCI controllers behind RP1 on PCIe —
+//!      a different driver with a different topology model.
 //!   2. Kernel-side `provider::contract::USB_HOST` vtable wiring
 //!      `BIND` / `OPEN_ENDPOINT` / `BULK_READ` / `BULK_WRITE` /
 //!      `INTERRUPT_POLL` / `RELEASE` (constant is allocated; no
 //!      handlers registered).
-//!   3. The actual MIDI Streaming class enumerator + USB-MIDI event-
-//!      packet (`[cable<<4 | CIN] [status] [d1] [d2]`) → input::midi
-//!      4-byte frame translator. Lucky alignment: the USB-MIDI wire
-//!      shape is one byte different from `input::midi`'s — see
-//!      `frame_from_usb_midi_packet` (TODO).
+//!   3. The MIDI Streaming class enumerator. The packet translator it
+//!      needs is **done**, in `kernel::usb::midi` — shared rather than
+//!      local because the same module must work over RP2 and xHCI, and
+//!      a translator per controller is two translators that will
+//!      disagree.
+//!
+//!      The two wire shapes are not interchangeable: `input::midi`'s
+//!      channel is 1-based where the wire's is 0-based, its event kinds
+//!      are deliberately not the status nibble, a NoteOn at velocity
+//!      zero has to be normalised to NoteOff by the producer, and the
+//!      CIN rather than the status byte gives the packet length. Copying
+//!      a byte across would put every event one channel low and leave
+//!      notes sounding forever.
 //!
 //! **Params** (declared via `define_params!` below — PIC modules
 //! embed schema in Rust, not TOML `[[params]]`):
@@ -44,7 +53,6 @@
     unreachable_patterns,
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
-
 
 use core::ffi::c_void;
 
@@ -91,10 +99,10 @@ struct UsbMidiHostState {
 // ============================================================================
 
 mod params_def {
+    use super::p_u8;
     use super::UsbMidiHostState;
     use super::MAX_DEVICE_FILTER;
     use super::SCHEMA_MAX;
-    use super::p_u8;
 
     define_params! {
         UsbMidiHostState;
@@ -186,7 +194,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // a user running `examples/midi_echo/pico2w.yaml` (or any
         // graph wiring `usb_midi_host`) sees the unimplemented state.
         if s.warned == 0 {
-            let msg = b"[usb_midi_host] STUB - USB host stack not yet implemented; module is a no-op";
+            let msg =
+                b"[usb_midi_host] STUB - USB host stack not yet implemented; module is a no-op";
             dev_log(sys, 3, msg.as_ptr(), msg.len());
             s.warned = 1;
         }

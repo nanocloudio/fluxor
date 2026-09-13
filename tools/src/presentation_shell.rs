@@ -1,6 +1,5 @@
 //! Build-time validator for the `presentation.shell` /
-//! `presentation.browser_overlay` descriptors (RFC browser_overlay §19,
-//! §A.7).
+//! `presentation.browser_overlay` descriptors.
 //!
 //! Kept as a standalone, dependency-light module (only `serde_json`) so
 //! it is unit-testable directly with synthetic configs — no module
@@ -20,7 +19,7 @@
 
 use serde_json::Value;
 
-/// Canonical control kinds (RFC §7.3, §A: `select`/`checkbox`).
+/// Canonical control kinds. A control declaring any other `kind` is rejected.
 pub const CONTROL_KINDS: &[&str] = &[
     "button",
     "button_cluster",
@@ -43,7 +42,8 @@ pub const CONTROL_KINDS: &[&str] = &[
 /// device legends, so the validator rejects names over this length.
 pub const BIND_PHYSICAL_MAX: usize = 24;
 
-/// Semantic placement groups (RFC §7.2).
+/// Semantic placement groups a control's `placement` may name. A placement
+/// outside this set is rejected.
 pub const PLACEMENTS: &[&str] = &[
     "primary_start",
     "primary_end",
@@ -54,9 +54,9 @@ pub const PLACEMENTS: &[&str] = &[
     "debug",
 ];
 
-/// Named superimposed-overlay regions (RFC §11.3 `overlay_regions`). MUST match
-/// the `OVERLAY_REGION` map in `browser_overlay_runtime.js` (pinned by
-/// `tools/tests/browser_overlay_runtime_surface.rs`) — an unknown name would
+/// Named superimposed-overlay regions a control's `overlay_regions` may name.
+/// MUST match the `OVERLAY_REGION` map in `browser_overlay_runtime.js` (pinned
+/// by `tools/tests/browser_overlay_runtime_surface.rs`) — an unknown name would
 /// silently default to a corner at runtime, so the validator rejects it.
 pub const OVERLAY_REGIONS: &[&str] = &[
     "left_third",
@@ -69,7 +69,8 @@ pub const OVERLAY_REGIONS: &[&str] = &[
     "bottom_center",
 ];
 
-/// Media profiles (RFC §16).
+/// Well-known `media_profile` values. Advisory only: the field is an
+/// app-supplied hint, so any non-empty string is accepted (see `validate`).
 pub const MEDIA_PROFILES: &[&str] = &[
     "game",
     "music",
@@ -80,12 +81,13 @@ pub const MEDIA_PROFILES: &[&str] = &[
     "custom",
 ];
 
-/// Activity contexts (RFC §7.5).
+/// Activity contexts a shell's `context` may name. A closed set — unlike
+/// `media_profile`, an unrecognized context is rejected.
 pub const CONTEXTS: &[&str] = &["preview", "launching", "active", "background", "spectator"];
 
-// ── Control-intent metadata (rfc_adaptive_presentation.md §9) ──
+// ── Control-intent metadata ──────────────────────────────────────────
 // Optional per-control fields that drive the placement resolver. All are
-// additive: a control omitting them keeps the existing chrome behaviour.
+// additive: a control omitting them keeps the default chrome behaviour.
 
 /// `plane_affinity`: ordered preference of render planes. `bound`/`hidden` are
 /// resolver *outcomes*, not requestable affinities — a control reaches `bound`
@@ -121,8 +123,8 @@ pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
     let shell = match presentation.get("shell") {
         Some(s) => s,
         None => {
-            // A browser_overlay without a shell is invalid (§5.5: the
-            // overlay is the browser adapter *for* the shell).
+            // A browser_overlay without a shell is invalid: the overlay is the
+            // browser adapter *for* a shell, so there is nothing to adapt.
             if presentation.get("browser_overlay").is_some() {
                 return Err(
                     "presentation.browser_overlay present without presentation.shell".to_string(),
@@ -132,12 +134,12 @@ pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
         }
     };
 
-    // §18.6 / §19.1: version must be exactly 1.
+    // The shell descriptor version must be exactly 1.
     if shell.get("version").and_then(|v| v.as_u64()) != Some(1) {
         return Err("presentation.shell.version must be 1".to_string());
     }
 
-    // §19.1: media_profile is an APP-SUPPLIED hint, not a Fluxor taxonomy —
+    // media_profile is an APP-SUPPLIED hint, not a Fluxor taxonomy —
     // a resolver/renderer may use it to tune layout, but the substrate does
     // not enumerate app domains. Any non-empty string is accepted;
     // `MEDIA_PROFILES` lists the well-known values a media app is likely to
@@ -159,7 +161,8 @@ pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
         }
     }
 
-    // §19.1: surface ids unique; referenced modules resolve.
+    // Surface ids must be unique, and every `module` a surface names must be
+    // one of the declared module instances.
     if let Some(surfaces) = presentation.get("surfaces").and_then(|v| v.as_array()) {
         let mut seen_ids: Vec<&str> = Vec::new();
         for (i, surf) in surfaces.iter().enumerate() {
@@ -215,11 +218,10 @@ pub fn validate(config: &Value, module_names: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate one shell control (§19.2, §19.4, §A.7).
-/// Validate the optional control-intent fields
-/// (`rfc_adaptive_presentation.md` §9): `plane_affinity`, `priority`,
+/// Validate the optional control-intent fields: `plane_affinity`, `priority`,
 /// `min_size_class`, `suppress_if`, `bind_physical`, `overlay`,
-/// `overlay_regions`. All are additive — a control omitting them is unchanged.
+/// `overlay_regions`. All are additive — a control omitting them takes the
+/// defaults: chrome affinity, `standard` priority, no binding, no suppression.
 fn validate_intent(ctl: &Value, id: &str) -> Result<(), String> {
     if let Some(v) = ctl.get("plane_affinity") {
         let arr = v.as_array().ok_or_else(|| {
@@ -414,7 +416,7 @@ fn validate_control(
             }
         }
         // A `list` is the browsable, rich-row sibling of `select`. It is
-        // feed-backed via a declared `list:` (RFC §17.3) OR carries an
+        // feed-backed via a declared `list:` OR carries an
         // inline `options:` array for static collections; at least one
         // must be present. Picking a row emits the selection `action`.
         "list" => {

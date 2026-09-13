@@ -149,7 +149,7 @@ Endpoint input maps onto the input surface family in
 |-----------------------|----------------|
 | keyboard              | `KeyEvents`                               |
 | pointer / mouse / stylus | `PointerEvents`                        |
-| touch contacts        | `PointerEvents` (`InputEvent` on the legacy gt911 path) |
+| touch contacts        | `PointerEvents` (`InputEvent` from the gt911 driver, which emits its own record shape) |
 | gamepad / controller  | `GamepadEvents`                           |
 | virtual control       | `InputBinaryState`                        |
 | application command   | action commands (`FmpMessage`)            |

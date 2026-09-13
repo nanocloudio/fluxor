@@ -902,10 +902,10 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
 // READ/STATUS/CLOSE carry that handle back. Completion is the real process exit
 // (STATUS=0 once exited AND drained) — never a quiescence guess.
 //
-// GRANT (MVP): a hardcoded executable allowlist. The allowlist is hygiene +
+// GRANT: a hardcoded executable allowlist. The allowlist is hygiene +
 // accident-prevention, NOT a sandbox (any dev tool is RCE-equivalent — the node
-// is the boundary). Config-driven root/env/timeout scoping + OS sandboxing are
-// the documented hardening follow-ups (sector architecture §5).
+// is the boundary). Config-driven root/env/timeout scoping and OS sandboxing
+// are not applied here.
 
 const PROC_SPAWN: u32 = 0x1600;
 const PROC_READ: u32 = 0x1601;
@@ -1303,6 +1303,16 @@ pub struct LinuxNetState {
     cmd_buf: [u8; 49152],
     msg_buf: [u8; 16384],
     recv_buf: [u8; 16384],
+    /// The part of `recv_buf` a full channel left un-forwarded, and the
+    /// slot it came from. A frame write is all-or-nothing, so a short
+    /// write leaves bytes read from the socket but not yet delivered;
+    /// they are already out of the kernel's buffer, so the only place
+    /// they can be re-offered from is here. While a tail is held no
+    /// socket is read, because `recv_buf` is the one place to read into
+    /// and overwriting it is how those bytes would be lost.
+    hold_slot: i32,
+    hold_off: usize,
+    hold_len: usize,
     /// Next slot to consider when allocating a connection. Used to
     /// allocate round-robin instead of "first free", so a slot freed
     /// in step T isn't immediately reused in step T+1 — that race lets
@@ -1357,6 +1367,9 @@ impl LinuxNetState {
             cmd_buf: [0u8; 49152],
             msg_buf: [0u8; 16384],
             recv_buf: [0u8; 16384],
+            hold_slot: -1,
+            hold_off: 0,
+            hold_len: 0,
             // Skip slot 0 in initial rotation — it's almost always the
             // TCP listener bound by the first CMD_BIND.
             next_alloc: 1,
@@ -2454,8 +2467,62 @@ unsafe fn accept_one_client(
     log::info!("[linux_net] accepted conn_id={idx}");
 }
 
+/// Write `recv_buf[from..total]` to the consumer channel as MSG_DATA frames,
+/// returning where it got to.
+///
+/// A frame write is all-or-nothing, so this stops at the first one that does
+/// not fit rather than splitting it. What it returns is the caller's business:
+/// the bytes past it have left the kernel's buffer and exist nowhere else.
+unsafe fn forward_chunks(st: &mut LinuxNetState, slot: usize, from: usize, total: usize) -> usize {
+    const MAX_DATA_FRAGMENT: usize = 1460; // mirrors net_proto::MAX_DATA_FRAGMENT
+    let mut off = from;
+    while off < total {
+        let chunk = (total - off).min(MAX_DATA_FRAGMENT);
+        let payload_len = 2 + chunk;
+        let frame_len = 3 + payload_len;
+        if frame_len > st.msg_buf.len() {
+            break;
+        }
+        st.msg_buf[0] = MSG_DATA;
+        st.msg_buf[1] = payload_len as u8;
+        st.msg_buf[2] = (payload_len >> 8) as u8;
+        let cb = (slot as u16).to_le_bytes();
+        st.msg_buf[3] = cb[0];
+        st.msg_buf[4] = cb[1];
+        core::ptr::copy_nonoverlapping(
+            st.recv_buf.as_ptr().add(off),
+            st.msg_buf.as_mut_ptr().add(5),
+            chunk,
+        );
+        let wrote = channel::channel_write(st.net_out, st.msg_buf.as_ptr(), frame_len);
+        if wrote < frame_len as i32 {
+            break;
+        }
+        off += chunk;
+    }
+    off
+}
+
 unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
     let mut had_work = false;
+
+    // A tail held from a previous step goes first, and nothing is read until
+    // it has gone: `recv_buf` is the only place a read lands, so reading over
+    // a tail is how those bytes would be lost. This is the case the whole
+    // hold exists for -- a consumer that fell behind, which is every consumer
+    // eventually.
+    if st.hold_slot >= 0 {
+        let slot = st.hold_slot as usize;
+        let off = forward_chunks(st, slot, st.hold_off, st.hold_len);
+        if off < st.hold_len {
+            st.hold_off = off;
+            return true; // still blocked — keep getting scheduled
+        }
+        st.hold_slot = -1;
+        st.hold_off = 0;
+        st.hold_len = 0;
+        had_work = true;
+    }
 
     for k in 0..st.ready_len {
         let Some(i) = st.ready_slot(k) else {
@@ -2511,7 +2578,6 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
         // Reading more and dropping the overflow would silently corrupt the
         // stream. Bound the recv to the writable space minus chunk-framing
         // overhead (≤5 B per ≤MSS fragment).
-        const MAX_DATA_FRAGMENT: usize = 1460; // mirrors net_proto::MAX_DATA_FRAGMENT
         let room = if st.net_out >= 0 {
             channel::channel_writable_bytes(st.net_out)
         } else {
@@ -2521,7 +2587,15 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
         // case for a full recv_buf (≤12 fragments → ≤60 B).
         let cap = st.recv_buf.len().min(room.saturating_sub(64));
         if cap == 0 {
-            continue; // channel full — don't read; let TCP backpressure the peer.
+            // Channel full — don't read; let TCP backpressure the peer. But
+            // this is work pending, not work finished: the socket is readable
+            // and stays readable, and nothing wakes this module when the
+            // consumer drains the channel, because a module is scheduled by
+            // its inputs and the room here appears on an output. Reporting
+            // idle would end the transfer wherever the consumer first fell
+            // behind — the bytes already sent arrive, and the rest never do.
+            had_work = true; // still blocked — keep getting scheduled
+            continue;
         }
         let n = libc::recv(
             st.conns[i].fd,
@@ -2530,35 +2604,18 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
             0,
         );
         if n > 0 {
-            // CHUNK the read into ≤MAX_DATA_FRAGMENT frames (the recv was bounded
-            // so every chunk is guaranteed to fit the channel — no drops).
+            // CHUNK the read into ≤MAX_DATA_FRAGMENT frames. The recv was
+            // bounded by the room, so every chunk should fit; a short write
+            // anyway leaves a tail to re-offer rather than bytes to drop.
             let total = n as usize;
-            let mut off = 0usize;
-            while off < total {
-                let chunk = (total - off).min(MAX_DATA_FRAGMENT);
-                let payload_len = 2 + chunk;
-                let frame_len = 3 + payload_len;
-                if frame_len > st.msg_buf.len() {
-                    break;
-                }
-                st.msg_buf[0] = MSG_DATA;
-                st.msg_buf[1] = payload_len as u8;
-                st.msg_buf[2] = (payload_len >> 8) as u8;
-                let cb = (i as u16).to_le_bytes();
-                st.msg_buf[3] = cb[0];
-                st.msg_buf[4] = cb[1];
-                core::ptr::copy_nonoverlapping(
-                    st.recv_buf.as_ptr().add(off),
-                    st.msg_buf.as_mut_ptr().add(5),
-                    chunk,
-                );
-                let wrote = channel::channel_write(st.net_out, st.msg_buf.as_ptr(), frame_len);
-                if wrote < frame_len as i32 {
-                    // Shouldn't happen (recv was bounded) — but never advance past
-                    // an unwritten chunk; stop and retry next step.
-                    break;
-                }
-                off += chunk;
+            let off = forward_chunks(st, i, 0, total);
+            if off < total {
+                st.hold_slot = i as i32;
+                st.hold_off = off;
+                st.hold_len = total;
+                // Every connection shares `recv_buf`, so no other one may be
+                // read while a tail is held in it.
+                return true;
             }
             had_work = true;
         } else if n == 0 {

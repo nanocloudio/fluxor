@@ -25,7 +25,6 @@ pub static FLUXOR_ABI_SURFACE: [u8; 32] = abi::abi_surface::ABI_SURFACE_DIGEST;
 // kernel reaches the same values via `abi::wire::*`.
 include!("wire/wire.rs");
 
-
 // ── Runtime split into responsibility files (F8) ──
 include!("runtime/intrinsics.rs");
 include!("runtime/consts.rs");

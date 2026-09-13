@@ -552,8 +552,7 @@ unsafe fn pump_send_server_hello_core(driver: &mut HandshakeDriver) -> bool {
 /// synthetic `message_hash(CH1)` per RFC 8446 §4.4.1, and transition
 /// to RecvSecondClientHello.
 unsafe fn pump_send_hello_retry_core(driver: &mut HandshakeDriver) -> bool {
-    let msg_len =
-        build_hello_retry_request(
+    let msg_len = build_hello_retry_request(
         &driver.peer_session_id[..driver.peer_session_id_len as usize],
         driver.suite,
         &mut driver.scratch,

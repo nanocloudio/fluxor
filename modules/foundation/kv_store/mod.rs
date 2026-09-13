@@ -34,7 +34,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -170,10 +169,7 @@ unsafe fn kv_lookup(state: &State, key: *const u8, key_len: usize) -> u32 {
         let e_key_len = core::ptr::read_volatile(arena.add(off)) as usize;
         let e_flags = core::ptr::read_volatile(arena.add(off + 2));
 
-        if (e_flags & FLAG_USED) != 0
-            && (e_flags & FLAG_DELETED) == 0
-            && e_key_len == key_len
-        {
+        if (e_flags & FLAG_USED) != 0 && (e_flags & FLAG_DELETED) == 0 && e_key_len == key_len {
             // Compare keys byte by byte (no indexing — pointer arithmetic)
             let mut match_ok = true;
             let mut k = 0;
@@ -210,7 +206,13 @@ unsafe fn kv_alloc_entry(state: &mut State) -> u32 {
 }
 
 /// SET operation.
-unsafe fn kv_set(state: &mut State, key: *const u8, key_len: usize, val: *const u8, val_len: usize) -> bool {
+unsafe fn kv_set(
+    state: &mut State,
+    key: *const u8,
+    key_len: usize,
+    val: *const u8,
+    val_len: usize,
+) -> bool {
     if key_len > ENTRY_KEY_MAX || val_len > ENTRY_VAL_MAX {
         return false;
     }

@@ -185,7 +185,7 @@ it, and either half without the other is refused at construct. Tables,
 affinity, health and policy are the director's; `ip` supplies the
 validated headers, the buffer, and the ownership rules.
 `modules/fixtures/packet_echo_director` is the reference director for
-the harness and the rig.
+this surface.
 
 `MSG_PKT_FORWARD` hands the whole frame to whatever consumes `packet_fwd`,
 and that consumer does the wire work a TUNNEL or DSR disposition implies:
@@ -195,8 +195,8 @@ every contract here answers to — encapsulating a frame means the same
 thing on bare metal and on a host stack, it is a primitive rather than a
 policy, and it is consumed across tenants. The director chooses WHICH
 attachment or endpoint; it does not put bytes on the wire. Nothing in the
-tree consumes `packet_fwd` beyond the harness fixture, so a composition
-using TUNNEL or DSR supplies that consumer itself.
+tree consumes `packet_fwd`, so a composition using TUNNEL or DSR supplies
+that consumer itself.
 
 ### Multiplexed Session Surface
 
@@ -347,18 +347,17 @@ The out-of-band fence is the exception that must be placed. Its
 module inside the failure domain cannot be the evidence that the domain
 is quiet — a same-node module declaring the wire is refused by name.
 
-A worked composition is `examples/test_harness/pi5/transport_migratable.yaml`:
-on Pi 5 the `tls` module is the anchor — it owns the secure attachment the
-client sees — over the `ip` module's TCP, with the session directory and
-the fence agent placed on a second node, where
-`examples/test_harness/linux/fence/fence_agent_bench.yaml` instantiates
-them. The fence agent is the reference out-of-band provider
-(`modules/fixtures/fence_agent/`): it answers the same address-control
-verbs as `ip` (`network.md` §Emission Control), and its cut is a command
-run on that node — at the reference bench, the smart plug the board is
-wired to. `tests/hardware/pi5_transport_migratable.toml` boots the graph,
-and its driver fences the board under a live TLS session and reads the
-capture for anything the board sourced after the cut.
+A composition of this class takes the shape: on a Pi 5 the `tls` module is
+the anchor — it owns the secure attachment the client sees — over the `ip`
+module's TCP, with the session directory and the fence agent declared as
+members placed on a second node. The fence agent is the reference
+out-of-band provider (`modules/fixtures/fence_agent/`): it answers the same
+address-control verbs as `ip` (`network.md` §Emission Control), and its cut
+is a command run on that node — at the reference bench, the smart plug the
+board is wired to. A cut host keeps running on what its supply holds, so
+the agent reports the fence only once a declared hold-up has elapsed on top
+of the command's own success, and a command that cannot be spawned or exits
+non-zero is refused rather than reported as a fence.
 
 ## Architectural Roles
 

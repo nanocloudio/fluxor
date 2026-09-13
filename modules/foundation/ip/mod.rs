@@ -47,9 +47,15 @@
 //!
 //! # Config Parameters
 //!
-//! | Tag | Name     | Type | Default | Description                |
-//! |-----|----------|------|---------|----------------------------|
-//! | 1   | use_dhcp | u8   | 1       | Enable DHCP (1=yes, 0=no) |
+//! | Tag | Name            | Type | Default | Description                |
+//! |-----|-----------------|------|---------|----------------------------|
+//! | 1   | use_dhcp        | u8   | 1       | Enable DHCP (1=yes, 0=no) |
+//! | 8   | static_ip       | u32  | 0       | Address to use when `use_dhcp=0` |
+//! | 9   | static_netmask  | u32  | 0       | Netmask for `static_ip` |
+//! | 10  | static_gateway  | u32  | 0       | Default gateway for `static_ip` |
+//!
+//! `use_dhcp=0` without a `static_ip` leaves the stack with no address and
+//! nothing it can send: the two go together.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -337,8 +343,8 @@ impl LocalAddr {
 /// `addr_ctl` port opcodes — the shared `net::identity` control contract
 /// (`modules/sdk/contracts/net/identity.rs`). This module is one *provider* of
 /// that contract; the workload backend is its writer. Both sides reference these
-/// same constants, so the opcodes/payload layout have a single source of truth
-/// (they were previously duplicated here and in the kernel, hand-synced).
+/// same constants, so the opcodes and payload layout have a single source of
+/// truth rather than one copy per side to keep in step by hand.
 ///   ADDR_ADD payload: [addr:16][prefix_len:1][owner_tag:2 LE]
 ///   ADDR_DEL payload: [addr:16]
 use abi::contracts::net::identity as netid;
@@ -350,10 +356,11 @@ const IP_ADDR_FENCE: u8 = netid::ADDR_FENCE;
 const ADDR_EVT_PORT: u8 = 5;
 /// THIS module's input-port indices, declared to the kernel at init via the
 /// `NET_IDENT_PROVIDER` self-registration (module-local facts, matching
-/// `manifest.toml` — no longer part of the shared contract).
+/// `manifest.toml`).
 const NET_IN_PORT: u8 = 1;
 const ADDR_CTL_PORT: u8 = 2;
-/// Pre-transport decision seam ports (`packet.rs` §decision seam):
+/// Pre-transport decision-seam ports of the packet contract
+/// (`modules/sdk/contracts/net/packet.rs`):
 /// dispositions in, decision records out, forwarded frames out.
 const PACKET_IN_PORT: u8 = 3;
 const PACKET_OUT_PORT: u8 = 3;
@@ -802,6 +809,25 @@ pub struct IpDrops {
     pub udp_oversize: u32,
     /// Sends refused because the destination is off-subnet with no gateway.
     pub route_unreachable: u32,
+    /// Pending ARP resolutions abandoned because no correlated reply
+    /// arrived before the resolution's deadline. The slot is freed for the
+    /// next request, so a climbing count means replies are being lost
+    /// rather than that resolution is wedged.
+    pub arp_timeout: u32,
+    /// Datagram sends refused because the next hop was unresolved when the
+    /// send was made. A resolution is outstanding by the time this counts,
+    /// so the consumer's retry is what completes the send.
+    pub udp_noresolve: u32,
+    /// `DG_CMD_SEND_TO` commands accepted from consumers. The denominator
+    /// for every other datagram disposition on this line.
+    pub dg_cmd_rx: u32,
+    /// Datagram sends refused for an empty payload.
+    pub udp_empty: u32,
+    /// UDP frames the driver channel accepted.
+    pub udp_sent: u32,
+    /// UDP frames `send_frame` could not hand over: the driver channel was
+    /// full, or the source address is fenced.
+    pub udp_send_fail: u32,
     /// Passive or active opens refused because no ISN secret could be
     /// established (the CSPRNG was unavailable).
     pub entropy_unavailable: u32,
@@ -853,6 +879,12 @@ impl IpDrops {
             dhcp_uncorrelated: 0,
             udp_oversize: 0,
             route_unreachable: 0,
+            arp_timeout: 0,
+            udp_noresolve: 0,
+            dg_cmd_rx: 0,
+            udp_empty: 0,
+            udp_sent: 0,
+            udp_send_fail: 0,
             entropy_unavailable: 0,
             port_exhausted: 0,
             tcp_unacceptable: 0,
@@ -949,10 +981,19 @@ struct IpState {
     netmask: u32,
     gateway: u32,
     dns_server: u32,
+    /// Address to adopt when DHCP is off. Held separately from `local_ip`
+    /// because parameters arrive before the link does, and the identity is
+    /// only applied once the MAC is known — a stack that claims an address
+    /// before it can answer ARP for it is unreachable at that address.
+    static_ip: u32,
+    /// Netmask paired with `static_ip`.
+    static_netmask: u32,
+    /// Default gateway paired with `static_ip`.
+    static_gateway: u32,
     /// Multi-homing address table. Slot 0 is the primary (mirrors `local_ip`,
     /// `flags.PRIMARY`, `owner_tag=0`); slots 1.. are secondaries added via
-    /// `addr_ctl`. One gateway / netmask / segment for all addresses in v1
-    /// (§5) — those stay scalar fields above.
+    /// `addr_ctl`. One gateway / netmask / segment serves every address, so
+    /// those stay scalar fields above.
     local_addrs: [LocalAddr; MAX_LOCAL_ADDRS],
     ip_configured: bool,
     signaled_ready: bool,
@@ -961,9 +1002,11 @@ struct IpState {
     // ARP table
     arp_table: [arp::ArpEntry; arp::ARP_TABLE_SIZE],
     arp_pending_ip: u32,
+    /// Wall clock at which the outstanding resolution stops being waited
+    /// for. Meaningless unless `arp_pending_state` is `ARP_PENDING_WAITING`.
+    arp_pending_deadline_ms: u32,
     arp_pending_state: u8,
-    arp_pending_timer: u8,
-    _arp_pad: [u8; 2],
+    _arp_pad: [u8; 3],
 
     // DHCP client
     dhcp: dhcp::DhcpClient,
@@ -1166,6 +1209,8 @@ struct IpState {
     tlm: TlmCounters,
     /// One-line scratch for the tlm emit, sized at `TLM_LINE_BUF_SIZE`.
     tlm_scratch: [u8; TLM_LINE_BUF_SIZE],
+    /// Which line of the periodic report the next step writes; 0 when none.
+    report_line: u8,
 
     /// Lifetime duplicate SYNs received for a slot already in
     /// `SynReceived`. Non-zero means the peer retransmitted SYN —
@@ -1251,6 +1296,8 @@ struct IpState {
     /// with frames waiting. Sustained non-zero means the 32-frame drain
     /// budget is the binding constraint.
     pend_rx_steps: u32,
+    /// Length prefixes refused on the NIC channel, reported for the first few.
+    bad_prefix_seen: u32,
     /// Steps that returned early from `service_net_channels` because
     /// outbound headroom was low (`NET_OUT_QUEUE_SLOTS` pressure) — the
     /// module refusing new commands rather than being idle.
@@ -1314,6 +1361,15 @@ mod params_def {
         // released and reported (`MSG_PKT_EXPIRED`). Clamped to >= 1: a
         // packet released before the director can answer is a seam that
         // does nothing.
+        // Static addressing, for a link with no DHCP server and for bring-up,
+        // where the stack must be able to speak before anything that could
+        // assign it an address is known to work.
+        8, static_ip, u32, 0
+            => |s, d, len| { s.static_ip = p_u32(d, len, 0, 0); };
+        9, static_netmask, u32, 0
+            => |s, d, len| { s.static_netmask = p_u32(d, len, 0, 0); };
+        10, static_gateway, u32, 0
+            => |s, d, len| { s.static_gateway = p_u32(d, len, 0, 0); };
         7, packet_hold_ms, u16, 50
             => |s, d, len| {
                 let v = p_u16(d, len, 0, 50);
@@ -3134,9 +3190,17 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
 
-    // 2. Run DHCP state machine (if enabled and not yet configured)
-    if s.use_dhcp != 0 && !s.ip_configured {
-        step_dhcp(s);
+    // 2. Acquire an address: DHCP, or the statically configured one.
+    //
+    // The static path waits for the MAC for the reason DHCP does — the
+    // stack has to be able to answer ARP for an address at the moment it
+    // starts claiming it.
+    if !s.ip_configured {
+        if s.use_dhcp != 0 {
+            step_dhcp(s);
+        } else if s.static_ip != 0 && s.mac_valid {
+            apply_static_address(s);
+        }
     }
 
     // 3. Address control (in[2]) then net protocol channels (consumer ↔ IP).
@@ -3183,130 +3247,18 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         );
     }
 
-    // `[ip] hb …` — counters that don't fit dev_tlm_maybe_emit's
-    // fixed shape. Same cadence as `[ip] tlm`.
+    // `[ip] hb …` and the lines after it: counters that don't fit
+    // dev_tlm_maybe_emit's fixed shape, on the same cadence as `[ip] tlm`.
+    // One line per step: the report is six lines, and a step that writes
+    // all six is the longest step this module takes by a wide margin.
     if s.step_count.is_multiple_of(IP_TLM_PERIOD) {
-        let sys = &*s.syscalls;
-        let buf = s.tlm_scratch.as_mut_ptr();
-        let buf_max = s.tlm_scratch.len();
-        let mut pos = 0usize;
-        let emit = |bytes: &[u8], pos: &mut usize| {
-            let mut k = 0;
-            while k < bytes.len() && *pos < buf_max {
-                *buf.add(*pos) = bytes[k];
-                *pos += 1;
-                k += 1;
-            }
-        };
-        emit(b"[ip] hb dupSYN=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_dup_syn_rx, buf.add(pos));
-        emit(b" adv=", &mut pos);
-        pos += fmt_u32_dec(s.adv_rx_frames, buf.add(pos));
-        emit(b" pendrx=", &mut pos);
-        pos += fmt_u32_dec(s.pend_rx_steps, buf.add(pos));
-        emit(b" pendtxq=", &mut pos);
-        pos += fmt_u32_dec(s.pend_txq_steps, buf.add(pos));
-        emit(b" out=", &mut pos);
-        pos += fmt_u32_dec(s.out_items, buf.add(pos));
-        emit(b" txcmd=", &mut pos);
-        pos += fmt_u32_dec(s.tx_cmd_items, buf.add(pos));
-        emit(b" pendcmd=", &mut pos);
-        pos += fmt_u32_dec(s.pend_cmd_steps, buf.add(pos));
-        dev_log(sys, 3, buf, pos);
-
-        // Ingress refusals and half-open pressure. Separate line: these are
-        // lifetime counters, not per-window rates, and are not reset below.
-        pos = 0;
-        emit(b"[ip] drop cksum=", &mut pos);
-        pos += fmt_u32_dec(
-            s.drops
-                .cksum_tcp
-                .wrapping_add(s.drops.cksum_udp)
-                .wrapping_add(s.drops.cksum_icmp),
-            buf.add(pos),
-        );
-        emit(b" frag=", &mut pos);
-        pos += fmt_u32_dec(s.drops.frag, buf.add(pos));
-        emit(b" udplen=", &mut pos);
-        pos += fmt_u32_dec(s.drops.udp_len, buf.add(pos));
-        emit(b" arp=", &mut pos);
-        pos += fmt_u32_dec(
-            s.drops.arp_from_ipv4.wrapping_add(s.drops.arp_uncorrelated),
-            buf.add(pos),
-        );
-        emit(b" pinrej=", &mut pos);
-        pos += fmt_u32_dec(s.drops.arp_pin_reject, buf.add(pos));
-        emit(b" pinreval=", &mut pos);
-        pos += fmt_u32_dec(s.drops.arp_pin_revalidate, buf.add(pos));
-        emit(b" dhcp=", &mut pos);
-        pos += fmt_u32_dec(s.drops.dhcp_uncorrelated, buf.add(pos));
-        emit(b" unreach=", &mut pos);
-        pos += fmt_u32_dec(s.drops.route_unreachable, buf.add(pos));
-        emit(b" fenced=", &mut pos);
-        pos += fmt_u32_dec(s.tx_fenced, buf.add(pos));
-        emit(b" halfopen=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_half_open, buf.add(pos));
-        emit(b"/", &mut pos);
-        pos += fmt_u32_dec(s.tcp_half_open_max, buf.add(pos));
-        emit(b" hosrc=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_half_open_src_max, buf.add(pos));
-        dev_log(sys, 3, buf, pos);
-
-        // Decision seam, only when it exists.
-        if s.pkt_decision != PKT_DECISION_OFF {
-            pos = 0;
-            emit(b"[ip] pkt held=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_held as u32, buf.add(pos));
-            emit(b" decided=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.decided, buf.add(pos));
-            emit(b" refused=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.hold_refused, buf.add(pos));
-            emit(b" expired=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.hold_expired, buf.add(pos));
-            emit(b" stale=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.stale_disposition, buf.add(pos));
-            emit(b" local=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.local, buf.add(pos));
-            emit(b" drop=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.dropped, buf.add(pos));
-            emit(b" reject=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.rejected, buf.add(pos));
-            emit(b" fwd=", &mut pos);
-            pos += fmt_u32_dec(s.pkt_stats.forwarded, buf.add(pos));
-            dev_log(sys, 3, buf, pos);
-        }
-
-        // SYN-cookie pressure. Its own line: these are lifetime counters and
-        // the drop line above has no room left for four more u32 fields.
-        // `sent > 0` says the deployment crossed the watermark at all.
-        pos = 0;
-        emit(b"[ip] cookie sent=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_syn_cookie_sent, buf.add(pos));
-        emit(b" ok=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_syn_cookie_ok, buf.add(pos));
-        emit(b" bad=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_syn_cookie_bad, buf.add(pos));
-        emit(b" optref=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_syn_option_refused, buf.add(pos));
-        emit(b" horef=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_half_open_refused, buf.add(pos));
-        emit(b" idlec=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_idle_closed, buf.add(pos));
-        emit(b" cwexp=", &mut pos);
-        pos += fmt_u32_dec(s.tcp_closewait_expired, buf.add(pos));
-        dev_log(sys, 3, buf, pos);
-        s.adv_rx_frames = 0;
-        s.pend_rx_steps = 0;
-        s.pend_txq_steps = 0;
-        s.out_items = 0;
-        s.tx_cmd_items = 0;
-        s.pend_cmd_steps = 0;
-        s.out_items = 0;
-        s.tx_cmd_items = 0;
-        s.pend_cmd_steps = 0;
+        s.report_line = 1;
+    }
+    if s.report_line != 0 {
+        emit_report_line(s);
     }
 
-    // §6 work signal: if data moved this step but we didn't take the
+    // Work signal: if data moved this step but we didn't take the
     // RunnableBacklog yield above, report WorkDone — keeps the pacer hot for
     // an active data path without an immediate same-module re-step.
     if moved_bytes {
@@ -3322,10 +3274,198 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     0
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_in_place_safe"]
-pub extern "C" fn module_in_place_safe() -> u32 {
-    0
+/// One line of the periodic `[ip]` report, and which one is `s.report_line`.
+///
+/// # Safety
+/// `s.syscalls` must be valid.
+unsafe fn emit_report_line(s: &mut IpState) {
+    let sys = &*s.syscalls;
+    let buf = s.tlm_scratch.as_mut_ptr();
+    let buf_max = s.tlm_scratch.len();
+    let mut pos = 0usize;
+    let emit = |bytes: &[u8], pos: &mut usize| {
+        let mut k = 0;
+        while k < bytes.len() && *pos < buf_max {
+            *buf.add(*pos) = bytes[k];
+            *pos += 1;
+            k += 1;
+        }
+    };
+    // A u32 renders to at most ten digits, and the formatter writes
+    // unbounded. Reserving those ten drops a field that would not fit
+    // rather than writing past the line.
+    let num = |v: u32, pos: &mut usize| {
+        if *pos + 10 <= buf_max {
+            *pos += fmt_u32_dec(v, buf.add(*pos));
+        }
+    };
+    match s.report_line {
+        1 => {
+            emit(b"[ip] hb dupSYN=", &mut pos);
+            num(s.tcp_dup_syn_rx, &mut pos);
+            emit(b" adv=", &mut pos);
+            num(s.adv_rx_frames, &mut pos);
+            emit(b" pendrx=", &mut pos);
+            num(s.pend_rx_steps, &mut pos);
+            emit(b" pendtxq=", &mut pos);
+            num(s.pend_txq_steps, &mut pos);
+            emit(b" out=", &mut pos);
+            num(s.out_items, &mut pos);
+            emit(b" txcmd=", &mut pos);
+            num(s.tx_cmd_items, &mut pos);
+            emit(b" pendcmd=", &mut pos);
+            num(s.pend_cmd_steps, &mut pos);
+            dev_log(sys, 3, buf, pos);
+        }
+        2 => {
+            // Address resolution. A send whose next hop is unresolved returns
+            // quietly at the send site, so the state that decides it is
+            // reported here: whether a resolution is outstanding and for what,
+            // how many have expired, and how many sends they cost.
+            pos = 0;
+            emit(b"[ip] arp pend=", &mut pos);
+            emit(
+                if s.arp_pending_state == arp::ARP_PENDING_WAITING {
+                    b"1"
+                } else {
+                    b"0"
+                },
+                &mut pos,
+            );
+            emit(b" ip=", &mut pos);
+            pos += fmt_ip_raw(buf.add(pos), s.arp_pending_ip);
+            emit(b" gwpin=", &mut pos);
+            emit(if s.gw_pin_pending { b"1" } else { b"0" }, &mut pos);
+            emit(b" tmo=", &mut pos);
+            num(s.drops.arp_timeout, &mut pos);
+            emit(b" nores=", &mut pos);
+            num(s.drops.udp_noresolve, &mut pos);
+            emit(b" live=", &mut pos);
+            num(arp::live_entries(&s.arp_table), &mut pos);
+            dev_log(sys, 3, buf, pos);
+        }
+        3 => {
+            // The datagram send path, branch by branch, on its own line: these
+            // are the dispositions a consumer's `DG_CMD_SEND_TO` can reach, and
+            // one line per concern keeps each readable on an 80-column terminal.
+            pos = 0;
+            emit(b"[ip] dg rx=", &mut pos);
+            num(s.drops.dg_cmd_rx, &mut pos);
+            emit(b" empty=", &mut pos);
+            num(s.drops.udp_empty, &mut pos);
+            emit(b" sent=", &mut pos);
+            num(s.drops.udp_sent, &mut pos);
+            emit(b" sfail=", &mut pos);
+            num(s.drops.udp_send_fail, &mut pos);
+            emit(b" unown=", &mut pos);
+            num(s.drops.dg_ep_unowned, &mut pos);
+            emit(b" perm=", &mut pos);
+            num(s.drops.dg_ep_perm, &mut pos);
+            emit(b" fenced=", &mut pos);
+            num(s.tx_fenced, &mut pos);
+            dev_log(sys, 3, buf, pos);
+        }
+        4 => {
+            // Ingress refusals and half-open pressure. Separate line: these are
+            // lifetime counters, not per-window rates, and are not reset below.
+            pos = 0;
+            emit(b"[ip] drop cksum=", &mut pos);
+            pos += fmt_u32_dec(
+                s.drops
+                    .cksum_tcp
+                    .wrapping_add(s.drops.cksum_udp)
+                    .wrapping_add(s.drops.cksum_icmp),
+                buf.add(pos),
+            );
+            emit(b" frag=", &mut pos);
+            pos += fmt_u32_dec(s.drops.frag, buf.add(pos));
+            emit(b" udplen=", &mut pos);
+            pos += fmt_u32_dec(s.drops.udp_len, buf.add(pos));
+            emit(b" arp=", &mut pos);
+            pos += fmt_u32_dec(
+                s.drops.arp_from_ipv4.wrapping_add(s.drops.arp_uncorrelated),
+                buf.add(pos),
+            );
+            emit(b" pinrej=", &mut pos);
+            pos += fmt_u32_dec(s.drops.arp_pin_reject, buf.add(pos));
+            emit(b" pinreval=", &mut pos);
+            pos += fmt_u32_dec(s.drops.arp_pin_revalidate, buf.add(pos));
+            emit(b" dhcp=", &mut pos);
+            pos += fmt_u32_dec(s.drops.dhcp_uncorrelated, buf.add(pos));
+            emit(b" unreach=", &mut pos);
+            pos += fmt_u32_dec(s.drops.route_unreachable, buf.add(pos));
+            emit(b" fenced=", &mut pos);
+            pos += fmt_u32_dec(s.tx_fenced, buf.add(pos));
+            emit(b" halfopen=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_half_open, buf.add(pos));
+            emit(b"/", &mut pos);
+            pos += fmt_u32_dec(s.tcp_half_open_max, buf.add(pos));
+            emit(b" hosrc=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_half_open_src_max, buf.add(pos));
+            dev_log(sys, 3, buf, pos);
+        }
+        5 => {
+            // Decision seam, only when it exists.
+            if s.pkt_decision != PKT_DECISION_OFF {
+                pos = 0;
+                emit(b"[ip] pkt held=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_held as u32, buf.add(pos));
+                emit(b" decided=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.decided, buf.add(pos));
+                emit(b" refused=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.hold_refused, buf.add(pos));
+                emit(b" expired=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.hold_expired, buf.add(pos));
+                emit(b" stale=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.stale_disposition, buf.add(pos));
+                emit(b" local=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.local, buf.add(pos));
+                emit(b" drop=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.dropped, buf.add(pos));
+                emit(b" reject=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.rejected, buf.add(pos));
+                emit(b" fwd=", &mut pos);
+                pos += fmt_u32_dec(s.pkt_stats.forwarded, buf.add(pos));
+                dev_log(sys, 3, buf, pos);
+            }
+        }
+        6 => {
+            // SYN-cookie pressure. Its own line: these are lifetime counters and
+            // the drop line above has no room left for four more u32 fields.
+            // `sent > 0` says the deployment crossed the watermark at all.
+            pos = 0;
+            emit(b"[ip] cookie sent=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_syn_cookie_sent, buf.add(pos));
+            emit(b" ok=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_syn_cookie_ok, buf.add(pos));
+            emit(b" bad=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_syn_cookie_bad, buf.add(pos));
+            emit(b" optref=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_syn_option_refused, buf.add(pos));
+            emit(b" horef=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_half_open_refused, buf.add(pos));
+            emit(b" idlec=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_idle_closed, buf.add(pos));
+            emit(b" cwexp=", &mut pos);
+            pos += fmt_u32_dec(s.tcp_closewait_expired, buf.add(pos));
+            dev_log(sys, 3, buf, pos);
+            s.adv_rx_frames = 0;
+            s.pend_rx_steps = 0;
+            s.pend_txq_steps = 0;
+            s.out_items = 0;
+            s.tx_cmd_items = 0;
+            s.pend_cmd_steps = 0;
+            s.out_items = 0;
+            s.tx_cmd_items = 0;
+            s.pend_cmd_steps = 0;
+        }
+        _ => {}
+    }
+    s.report_line = if s.report_line >= 6 {
+        0
+    } else {
+        s.report_line + 1
+    };
 }
 
 // ============================================================================
@@ -3364,15 +3504,69 @@ unsafe fn process_rx_frames(s: &mut IpState) {
         let mut hdr = [0u8; 2];
         let hn = (sys.channel_read)(s.in_chan, hdr.as_mut_ptr(), 2);
         if hn < 2 {
+            if s.bad_prefix_seen < 3 {
+                s.bad_prefix_seen += 1;
+                let mut buf = [0u8; 48];
+                let bp = buf.as_mut_ptr();
+                let prefix = b"[ip] header read short rc=";
+                let mut i = 0;
+                while i < prefix.len() {
+                    *bp.add(i) = prefix[i];
+                    i += 1;
+                }
+                if hn < 0 {
+                    *bp.add(i) = b'-';
+                    i += 1;
+                    i += fmt_u32_raw(bp.add(i), (-hn) as u32);
+                } else {
+                    i += fmt_u32_raw(bp.add(i), hn as u32);
+                }
+                log_error(s, core::slice::from_raw_parts(bp, i));
+            }
             break;
         }
         let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
         if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+            // The two header bytes are consumed and the rest of the record
+            // is not, so from here the stream is misaligned; say so with the
+            // value, the first few times.
+            if s.bad_prefix_seen < 3 {
+                s.bad_prefix_seen += 1;
+                let mut buf = [0u8; 40];
+                let bp = buf.as_mut_ptr();
+                let prefix = b"[ip] bad frame prefix len=";
+                let mut i = 0;
+                while i < prefix.len() {
+                    *bp.add(i) = prefix[i];
+                    i += 1;
+                }
+                i += fmt_u32_raw(bp.add(i), frame_len as u32);
+                log_error(s, core::slice::from_raw_parts(bp, i));
+            }
             break;
         }
 
         let r = (sys.channel_read)(s.in_chan, s.rx_frame.as_mut_ptr(), frame_len);
         if r <= 0 {
+            if s.bad_prefix_seen < 3 {
+                s.bad_prefix_seen += 1;
+                let mut buf = [0u8; 48];
+                let bp = buf.as_mut_ptr();
+                let prefix = b"[ip] body read failed rc=";
+                let mut i = 0;
+                while i < prefix.len() {
+                    *bp.add(i) = prefix[i];
+                    i += 1;
+                }
+                if r < 0 {
+                    *bp.add(i) = b'-';
+                    i += 1;
+                    i += fmt_u32_raw(bp.add(i), (-r) as u32);
+                } else {
+                    i += fmt_u32_raw(bp.add(i), r as u32);
+                }
+                log_error(s, core::slice::from_raw_parts(bp, i));
+            }
             break;
         }
 
@@ -5665,6 +5859,9 @@ unsafe fn send_udp_data(
     }
 
     if !s.mac_valid || s.local_ip == 0 || payload_len == 0 {
+        if payload_len == 0 {
+            s.drops.udp_empty = s.drops.udp_empty.wrapping_add(1);
+        }
         return 0;
     }
 
@@ -5686,7 +5883,10 @@ unsafe fn send_udp_data(
     let dst_mac = resolve_mac(s, dst_ip);
     let dst_mac = match dst_mac {
         Some(m) => m,
-        None => return 0,
+        None => {
+            s.drops.udp_noresolve = s.drops.udp_noresolve.wrapping_add(1);
+            return 0;
+        }
     };
 
     let hdr_offset = eth::ETH_HEADER_LEN + ipv4::IPV4_HEADER_LEN;
@@ -5730,7 +5930,11 @@ unsafe fn send_udp_data(
     );
 
     let total = eth::ETH_HEADER_LEN + ip_total as usize;
-    send_frame(s, s.tx_frame.as_ptr(), total);
+    if send_frame(s, s.tx_frame.as_ptr(), total) {
+        s.drops.udp_sent = s.drops.udp_sent.wrapping_add(1);
+    } else {
+        s.drops.udp_send_fail = s.drops.udp_send_fail.wrapping_add(1);
+    }
     0
 }
 
@@ -5748,9 +5952,31 @@ unsafe fn arm_gateway_pin(s: &mut IpState, gw: u32) {
     let _ = resolve_mac(s, gw);
 }
 
-/// Periodic ARP upkeep: age the table, account permanent-pin revalidations,
-/// and drive an outstanding gateway pin to completion.
+/// How long an address resolution is waited for before the pending slot is
+/// released. Wall clock, like every other network timer here, so the wait
+/// does not stretch or shrink with the scheduler's tick; maintenance runs
+/// periodically, so the deadline is a floor and the slot is reclaimed on the
+/// first pass after it. One second is far longer than a link-local round
+/// trip and short enough that a request lost to a link flap costs a retry
+/// rather than a boot.
+const ARP_PENDING_TIMEOUT_MS: u32 = 1000;
+
+/// Periodic ARP upkeep: expire an unanswered resolution, age the table,
+/// account permanent-pin revalidations, and drive an outstanding gateway pin
+/// to completion.
 unsafe fn step_arp_maintenance(s: &mut IpState) {
+    // There is one pending slot and `resolve_mac` issues no new request
+    // while it is held, so the slot has to be reclaimable without a reply:
+    // a request lost in transit would otherwise refuse every later
+    // resolution for the life of the module.
+    if s.arp_pending_state == arp::ARP_PENDING_WAITING {
+        let now = dev_millis(&*s.syscalls) as u32;
+        if now.wrapping_sub(s.arp_pending_deadline_ms) < 0x8000_0000 {
+            s.arp_pending_state = arp::ARP_PENDING_NONE;
+            s.drops.arp_timeout = s.drops.arp_timeout.wrapping_add(1);
+        }
+    }
+
     let revalidations = arp::age_entries(&mut s.arp_table);
     if revalidations > 0 {
         s.drops.arp_pin_revalidate = s.drops.arp_pin_revalidate.wrapping_add(revalidations);
@@ -5822,7 +6048,8 @@ unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
     if s.arp_pending_state == arp::ARP_PENDING_NONE && s.mac_valid && s.local_ip != 0 {
         s.arp_pending_ip = target_ip;
         s.arp_pending_state = arp::ARP_PENDING_WAITING;
-        s.arp_pending_timer = 0;
+        s.arp_pending_deadline_ms =
+            (dev_millis(&*s.syscalls) as u32).wrapping_add(ARP_PENDING_TIMEOUT_MS);
 
         let frame_len = arp::build_arp(
             s.tx_frame.as_mut_ptr(),
@@ -5841,6 +6068,62 @@ unsafe fn resolve_mac(s: &mut IpState, ip: u32) -> Option<[u8; 6]> {
 // ============================================================================
 // DHCP
 // ============================================================================
+
+/// Adopt the statically configured identity.
+///
+/// Runs once: `ip_configured` is what stops it, the same flag that stops the
+/// DHCP machine. The gateway is pinned exactly as it is on a DHCP bind, so
+/// off-link traffic resolves through the same path whichever way the address
+/// arrived.
+///
+/// # Safety
+/// `s` must be a fully-initialised `IpState` with a valid MAC.
+unsafe fn apply_static_address(s: &mut IpState) {
+    s.local_ip = s.static_ip;
+    s.netmask = s.static_netmask;
+    s.gateway = s.static_gateway;
+    sync_primary_slot(s);
+    s.ip_configured = true;
+
+    if s.gateway != 0 {
+        let gw = s.gateway;
+        arm_gateway_pin(s, gw);
+    }
+
+    // Tell the segment we are here. A statically addressed host that never
+    // announces itself is invisible to every peer's ARP cache until it
+    // speaks first, and a duplicate address goes unnoticed entirely.
+    let ip = s.local_ip;
+    send_gratuitous_arp(s, ip);
+
+    let mut buf = [0u8; 96];
+    let bp = buf.as_mut_ptr();
+    let prefix = b"[ip] static ";
+    let mut i = 0;
+    while i < prefix.len() {
+        *bp.add(i) = prefix[i];
+        i += 1;
+    }
+    i += fmt_ip_raw(bp.add(i), s.local_ip);
+    let mid = b" mask=";
+    let mut m = 0;
+    while m < mid.len() {
+        *bp.add(i) = mid[m];
+        i += 1;
+        m += 1;
+    }
+    i += fmt_ip_raw(bp.add(i), s.netmask);
+    let mid = b" gw=";
+    let mut m = 0;
+    while m < mid.len() {
+        *bp.add(i) = mid[m];
+        i += 1;
+        m += 1;
+    }
+    i += fmt_ip_raw(bp.add(i), s.gateway);
+    let sl = core::slice::from_raw_parts(bp, i);
+    log_info(s, sl);
+}
 
 /// Drive the DHCP state machine.
 unsafe fn step_dhcp(s: &mut IpState) {
@@ -6069,7 +6352,7 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                 {
                     let sys = &*s.syscalls;
                     let ms = dev_millis(sys);
-                    let mut buf = [0u8; 50];
+                    let mut buf = [0u8; 96];
                     let bp = buf.as_mut_ptr();
                     let prefix = b"[ip] dhcp bound ";
                     let mut i = 0;
@@ -6090,6 +6373,25 @@ unsafe fn process_dhcp_reply(s: &mut IpState, data: *const u8, len: usize) {
                     i += 1;
                     *bp.add(i) = b's';
                     i += 1;
+                    // The lease's mask and gateway decide whether a
+                    // destination is ARPed for directly or routed, which is
+                    // the first question when a unicast never leaves.
+                    let tail = b" mask=";
+                    let mut t = 0;
+                    while t < tail.len() {
+                        *bp.add(i) = tail[t];
+                        i += 1;
+                        t += 1;
+                    }
+                    i += fmt_ip_raw(bp.add(i), s.netmask);
+                    let tail2 = b" gw=";
+                    t = 0;
+                    while t < tail2.len() {
+                        *bp.add(i) = tail2[t];
+                        i += 1;
+                        t += 1;
+                    }
+                    i += fmt_ip_raw(bp.add(i), s.gateway);
                     dev_log(sys, 1, bp, i);
                 }
             }
@@ -6424,7 +6726,7 @@ unsafe fn addr_ctl_add(
             p[32..36].copy_from_slice(&generation.to_le_bytes());
             addr_evt(s, netid::MSG_ADDR_ADDED, &p);
             // GARP only teaches the local segment, so announce same-subnet
-            // additions only (§3.3), and only an armed one — a disarmed
+            // additions only, and only an armed one — a disarmed
             // install says nothing until it is armed.
             if armed
                 && s.netmask != 0
@@ -6930,6 +7232,7 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 }
             }
             DG_CMD_SEND_TO => {
+                s.drops.dg_cmd_rx = s.drops.dg_cmd_rx.wrapping_add(1);
                 // datagram send. IPv4 payload:
                 //   [ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]
                 // Owner-tagged form inserts [MARK][owner_tag:2 LE] between

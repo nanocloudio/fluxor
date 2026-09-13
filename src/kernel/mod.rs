@@ -8,8 +8,10 @@ pub mod exec; // scheduler run loop, ISR tiers, step guard
 pub mod ipc; // channels, ring buffers, buffer pool, events, fd
 pub mod mem; // heap, page pool
 pub mod module; // loader, provider, syscalls, el0 gateway
+pub mod pcie; // PCIe ownership: BAR aperture claims
 pub mod security; // crypto + key vault
 pub mod sys; // HAL seam, guard, errno, log ring
+pub mod usb; // common USB semantic core: descriptors, transfer identity
 pub mod workload; // owners, plans, metal 0x1A backend, bitmask, ext bridge
 
 /// Bring up the platform-agnostic kernel services: HAL ops table,

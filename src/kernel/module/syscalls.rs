@@ -105,7 +105,7 @@ unsafe extern "C" fn syscall_channel_peek(handle: i32, buf: *mut u8, len: usize)
 // privileged-op gate, or the contract dispatch. Without this
 // ordering, an ISR-tier module calling `provider_open` on a
 // contract it has no permission for would receive `ENOSYS` (the
-// permission gate's reject) rather than `EACCES` (the §D7 ISR
+// permission gate's reject) rather than `EACCES` (the ISR-tier
 // gate's reject), and a future loader bug could ride that path
 // silently. The inner `provider::*` functions also gate as
 // defense in depth.
@@ -138,7 +138,7 @@ unsafe extern "C" fn syscall_provider_open(
     if let Some(rc) = check_privileged_internal_op(open_op) {
         return rc;
     }
-    // Every provider_open mints a new held resource — §3.5 admission.
+    // Every provider_open mints a new held resource, so it is admission-gated.
     if admission_closed("provider_open") {
         return crate::kernel::sys::errno::EACCES;
     }
@@ -174,7 +174,7 @@ unsafe extern "C" fn syscall_provider_call(
     if let Some(rc) = check_privileged_internal_op(op) {
         return rc;
     }
-    // §3.5 admission gate on the open/create/accept/arm-class opcodes —
+    // Admission gate on the open/create/accept/arm-class opcodes —
     // use-style ops on established handles stay state-blind so a
     // draining owner can flush in-flight work.
     if admission_class_op(op) && admission_closed("provider_call") {
@@ -316,10 +316,9 @@ unsafe extern "C" fn syscall_channel_port(port_type: u8, index: u8) -> i32 {
 /// work. Admission closes the moment a drain begins; existing-handle use
 /// stays state-blind (`authorize_use` semantics), which is what lets
 /// in-flight work run dry. System-owned modules always pass. Every
-/// module-facing create/open/accept/allocate/arm path consults this — the
-/// §3.5 checklist: provider open/bind, `channel_open`, open-style
-/// `provider_call` ops (`admission_class_op`), event create, heap allocation,
-/// timer arm.
+/// module-facing create/open/accept/allocate/arm path consults this: provider
+/// open/bind, `channel_open`, open-style `provider_call` ops
+/// (`admission_class_op`), event create, heap allocation, timer arm.
 fn admission_closed(surface: &'static str) -> bool {
     let owner = crate::kernel::exec::scheduler::module_owner(
         crate::kernel::exec::scheduler::current_module_index(),
@@ -335,7 +334,7 @@ fn admission_closed(surface: &'static str) -> bool {
 }
 
 /// Open-style / arm-style `provider_call` opcodes that CREATE new work or
-/// resources and therefore fall under the §3.5 admission gate. Use-style ops
+/// resources and therefore fall under the admission gate. Use-style ops
 /// on established handles (read/write/poll/fsync/close/cancel/destroy/
 /// buffer-acquire on open channels) are deliberately absent: a draining
 /// owner must still flush in-flight work to completion.
@@ -347,7 +346,7 @@ fn admission_class_op(op: u32) -> bool {
         // New channels / endpoints (accept = new connection admission).
         channel::OPEN | channel::CONNECT | channel::BIND | channel::LISTEN | channel::ACCEPT
         // Timer create + arm: cancelling timers plus this gate is the
-        // operational definition of "autonomous producers stop" (§3.5).
+        // operational definition of "autonomous producers stop".
         | timer::CREATE | timer::SET
         // New wake sources.
         | event::CREATE | event::BIND_IRQ
@@ -794,11 +793,11 @@ const STORAGE_FAMILY: u64 = (1u64
 /// (PLATFORM_NIC_RING, PLATFORM_DMA, PLATFORM_DMA_FD, PCIE_DEVICE,
 /// USB_HOST) are permitted at every service tier so a driver's
 /// `[[resources]]` declaration is what actually grants access; the
-/// `platform_raw` permission then gates the individual opcodes on top.
-/// USB_HOST is a scaffold — the bit is reserved so a future driver
-/// landing only needs to register handlers, not amend this mask. This is
-/// a ceiling, NOT a grant: `check_contract_grant`'s manifest gate still
-/// requires each non-infra contract to be declared.
+/// per-opcode permission then gates the individual ops on top —
+/// `platform_raw` for the raw register surfaces, and `usb_host` for the
+/// kernel-mediated USB host ops, which carry their own grant.
+/// This is a ceiling, NOT a grant: `check_contract_grant`'s manifest gate
+/// still requires each non-infra contract to be declared.
 ///
 /// `pub` so the cap-class policy can be pinned by an out-of-tree harness
 /// test (`tests/harness/tests/kernel_permissions.rs`) — production `src/`
@@ -920,6 +919,15 @@ pub mod permission {
     /// Read-only telemetry-ring drain (`TLM_SUBSCRIBE`/`DRAIN`/`STATS`). Strictly
     /// read-only — deliberately NOT `monitor`, which also grants `FAULT_RAISE`.
     pub const OBSERVE: u16 = 1 << 8;
+    /// Kernel-mediated USB host binding (`BIND`, `OPEN_ENDPOINT`, the transfer
+    /// ops, `RELEASE`) on a validated controller handle.
+    ///
+    /// Deliberately distinct from `platform_raw`.
+    /// A USB host driver needs a controller handle the kernel validated, not
+    /// the ability to poke arbitrary MMIO — and granting the latter to get the
+    /// former hands every such driver the whole address space. The same
+    /// separation `pcie_device` already makes.
+    pub const USB_HOST: u16 = 1 << 9;
 
     pub fn name(bit: u16) -> &'static str {
         match bit {
@@ -932,6 +940,7 @@ pub mod permission {
             PCIE_DEVICE => "pcie_device",
             DMA => "dma",
             OBSERVE => "observe",
+            USB_HOST => "usb_host",
             _ => "<unknown>",
         }
     }
@@ -945,23 +954,16 @@ pub mod permission {
 /// restrictive, avoiding accidental privilege leakage).
 fn privileged_op_permission(op: u32) -> Option<u16> {
     use permission::*;
-    // USB host (0x15xx) — scaffold contract. The kernel-side vtable
-    // is unimplemented; once it lands, every USB host op (BIND,
-    // OPEN_ENDPOINT, BULK_READ/WRITE, INTERRUPT_POLL, RELEASE) is
-    // expected to live in this opcode class and require `platform_raw`
-    // like the other kernel-mediated controller bindings. Gating here
-    // — rather than at the contract level — keeps the model consistent
-    // with how PCIE_DEVICE / PLATFORM_DMA / NIC_RING enforce their
-    // privileged ops (all of which live in the 0x0Cxx bucket but the
-    // pattern is identical). A future driver that picks a 0x15xx
-    // opcode for a non-privileged op (none planned) would need to add
-    // a fine-grained match arm here.
-    // USB host ops are kernel-mediated (a bound controller handle), so when the
-    // stack lands they should gate on a dedicated `usb_host` grant like
-    // PCIE_DEVICE — not this `platform_raw` fallback. The permission bitmap is a
-    // u16 with bits 9.. free, so that grant costs nothing but the arm.
+    // USB host (0x15xx). These are kernel-mediated ops on a controller
+    // handle the kernel validated — BIND, OPEN_ENDPOINT, the transfer ops,
+    // RELEASE — so they carry their own grant rather than falling through to
+    // `platform_raw`.
+    // A `platform_raw` fallback would be too wide: a USB host driver needs a
+    // validated handle, not arbitrary MMIO, and granting the latter to obtain
+    // the former hands every such driver the entire address space.
+    // `pcie_device` already draws this line for the same reason.
     if (0x1500..=0x15FF).contains(&op) {
-        return Some(PLATFORM_RAW);
+        return Some(USB_HOST);
     }
     // Isolated-workload surface (workload, 0x1Axx) — spawning owner-bound
     // isolated workloads is privileged; gated by the same
@@ -1609,8 +1611,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         // extension. They live in the 0x0C47..=0x0C4A live-mutation block
         // (well clear of the peripheral register-bridge range), so on an rp
         // build 0x0C49/0x0C4A reach the platform extension and are simply
-        // unknown there — no longer shadowing the rp PIO SM_READ_REG/SM_ENABLE
-        // bridges at 0x0C72/0x0C73.
+        // unknown there, clear of the rp PIO SM_READ_REG/SM_ENABLE bridges at
+        // 0x0C72/0x0C73.
         #[cfg(feature = "multitenant")]
         reconfigure::OWNER_PAUSE => {
             // SAFETY: `arg`/`arg_len` describe a readable handle record.
@@ -1746,7 +1748,7 @@ unsafe fn handle_telemetry_op(handle: i32, opcode: u32, arg: *mut u8, arg_len: u
             } else {
                 tlm::FILTER_ALL
             };
-            // Optional trailing 8-byte LE PSTATUS cadence (§5.3): the collector
+            // Optional trailing 8-byte LE PSTATUS cadence: the collector
             // declares how often it wants the kernel to push its step-histogram
             // / arena round. Absent (4-byte arg) → keep the kernel default.
             let off = tlm::SUBSCRIBE_INTERVAL_OFFSET;
@@ -1974,7 +1976,7 @@ unsafe fn handle_core_primitive(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             0
         }
         REPORT_STEP_EFFECT => {
-            // §6.1 work signal: one byte of StepEffect. Heats the adaptive pacer
+            // Work signal: one byte of StepEffect. Heats the adaptive pacer
             // for WorkDone/RunnableBacklog/Burst; never authorises re-step.
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
@@ -2711,7 +2713,7 @@ unsafe extern "C" fn syscall_heap_alloc(size: u32) -> *mut u8 {
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("heap_alloc") {
         return core::ptr::null_mut();
     }
-    // §3.5 admission gate: heap growth is new allocation. Frees (and
+    // Admission gate: heap growth is new allocation. Frees (and
     // in-place use of existing allocations) stay state-blind.
     if admission_closed("heap_alloc") {
         return core::ptr::null_mut();
@@ -2734,7 +2736,7 @@ unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u
     if crate::kernel::exec::scheduler::deny_isr_tier_syscall("heap_realloc") {
         return core::ptr::null_mut();
     }
-    // §3.5 admission gate: realloc can grow — new allocation.
+    // Admission gate: realloc can grow — new allocation.
     if admission_closed("heap_realloc") {
         return core::ptr::null_mut();
     }
@@ -2742,8 +2744,8 @@ unsafe extern "C" fn syscall_heap_realloc(ptr: *mut u8, new_size: u32) -> *mut u
     crate::kernel::mem::heap::heap_realloc(idx, ptr, new_size as usize)
 }
 
-// RP platform providers are now registered via HAL (init_providers / release_module_handles).
-// The rp/providers.rs file is included from the RP platform entrypoint instead.
+// RP platform providers are registered via HAL (init_providers / release_module_handles);
+// rp/providers.rs is included from the RP platform entrypoint.
 //
 // The cap-class grant policy (`CAP_CONTRACT_MASK`) is pinned by an out-of-tree
 // test — `service_tiers_admit_storage_family_like_fs` in

@@ -145,7 +145,11 @@ unsafe fn witness_counts(sys: &SyscallTable, s: &mut State) -> (u32, u32) {
             return 0;
         }
         let n = list_count(sys, pfx, &mut scratch);
-        if n > 0 { n as u32 } else { 0 }
+        if n > 0 {
+            n as u32
+        } else {
+            0
+        }
     };
     let a = one(&s.wit_a_pfx[..s.wit_a_len as usize]);
     let b = one(&s.wit_b_pfx[..s.wit_b_len as usize]);

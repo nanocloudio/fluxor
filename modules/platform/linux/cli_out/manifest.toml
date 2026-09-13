@@ -2,7 +2,7 @@ version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
 
-# Host stdout/stderr sink + exit-code latch (rfc_cli_execution.md §4.1).
+# Host stdout/stderr sink + exit-code latch.
 # exit_in takes [code: i32 LE]; absent wiring means exit 0 on completion.
 [[ports]]
 name = "bytes_in"

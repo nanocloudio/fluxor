@@ -30,7 +30,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -57,20 +56,20 @@ const CTRL_PCIE2: u8 = 0;
 const CTRL_PCIE1: u8 = 1;
 
 /// PCIe2 (RP1, x4) — VPU-exposed fallback routing.
-const ECAM_BASE_PCIE2: u64       = 0xFD50_0000;
-const PCIE_MMIO_BASE_PCIE2: u64  = 0x1F_0000_0000;
+const ECAM_BASE_PCIE2: u64 = 0xFD50_0000;
+const PCIE_MMIO_BASE_PCIE2: u64 = 0x1F_0000_0000;
 
 /// PCIe1 (external x1 / NVMe HAT+) — verified against the Pi 5 base
 /// board 6.12 rpt kernel (dmesg 2026-04-16): controller at
 /// `0x10_0011_0000`, outbound MMIO window `0x18_0000_0000..0x1B_FFFF_FFFF`.
 /// Requires `dtparam=pciex1` (no `=on`) in `config.txt`.
-const ECAM_BASE_PCIE1: u64       = 0x10_0011_0000;
-const PCIE_MMIO_BASE_PCIE1: u64  = 0x18_0000_0000;
+const ECAM_BASE_PCIE1: u64 = 0x10_0011_0000;
+const PCIE_MMIO_BASE_PCIE1: u64 = 0x18_0000_0000;
 
 /// QEMU virt stub: no real ECAM; synthesise a fake RP1 so higher layers
 /// have something to wire against.
-const ECAM_BASE_QEMU: u64        = 0;
-const PCIE_MMIO_BASE_QEMU: u64   = 0x4000_0000;
+const ECAM_BASE_QEMU: u64 = 0;
+const PCIE_MMIO_BASE_QEMU: u64 = 0x4000_0000;
 
 const MAX_DEVICES: usize = 8;
 const MAX_BARS: usize = 6;
@@ -130,8 +129,8 @@ struct PcieScanState {
 // ============================================================================
 
 mod params_def {
-    use super::PcieScanState;
     use super::p_u8;
+    use super::PcieScanState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -150,10 +149,18 @@ unsafe fn mmio_read32(sys: &SyscallTable, addr: u64) -> u32 {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
     let ab = addr.to_le_bytes();
-    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
-    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    *bp = ab[0];
+    *bp.add(1) = ab[1];
+    *bp.add(2) = ab[2];
+    *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4];
+    *bp.add(5) = ab[5];
+    *bp.add(6) = ab[6];
+    *bp.add(7) = ab[7];
     let rc = (sys.provider_call)(-1, MMIO_READ32, bp, 12);
-    if rc < 0 { return 0xFFFF_FFFF; }
+    if rc < 0 {
+        return 0xFFFF_FFFF;
+    }
     u32::from_le_bytes([*bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11)])
 }
 
@@ -161,10 +168,19 @@ unsafe fn mmio_write32(sys: &SyscallTable, addr: u64, val: u32) {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
     let ab = addr.to_le_bytes();
-    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
-    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    *bp = ab[0];
+    *bp.add(1) = ab[1];
+    *bp.add(2) = ab[2];
+    *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4];
+    *bp.add(5) = ab[5];
+    *bp.add(6) = ab[6];
+    *bp.add(7) = ab[7];
     let vb = val.to_le_bytes();
-    *bp.add(8) = vb[0]; *bp.add(9) = vb[1]; *bp.add(10) = vb[2]; *bp.add(11) = vb[3];
+    *bp.add(8) = vb[0];
+    *bp.add(9) = vb[1];
+    *bp.add(10) = vb[2];
+    *bp.add(11) = vb[3];
     (sys.provider_call)(-1, MMIO_WRITE32, bp, 12);
 }
 
@@ -173,16 +189,33 @@ unsafe fn mmio_write32(sys: &SyscallTable, addr: u64, val: u32) {
 // ============================================================================
 
 unsafe fn ecam_addr(base: u64, bus: u8, dev: u8, func: u8, offset: u16) -> u64 {
-    base + ((bus as u64) << 20) + ((dev as u64) << 15)
-        + ((func as u64) << 12) + ((offset & 0xFFC) as u64)
+    base + ((bus as u64) << 20)
+        + ((dev as u64) << 15)
+        + ((func as u64) << 12)
+        + ((offset & 0xFFC) as u64)
 }
 
-unsafe fn ecam_read32(sys: &SyscallTable, base: u64, bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
+unsafe fn ecam_read32(
+    sys: &SyscallTable,
+    base: u64,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    offset: u16,
+) -> u32 {
     let addr = ecam_addr(base, bus, dev, func, offset);
     mmio_read32(sys, addr)
 }
 
-unsafe fn ecam_write32(sys: &SyscallTable, base: u64, bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
+unsafe fn ecam_write32(
+    sys: &SyscallTable,
+    base: u64,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    offset: u16,
+    val: u32,
+) {
     let addr = ecam_addr(base, bus, dev, func, offset);
     mmio_write32(sys, addr, val);
 }
@@ -193,11 +226,17 @@ unsafe fn ecam_write32(sys: &SyscallTable, base: u64, bus: u8, dev: u8, func: u8
 
 fn identify_nic(vendor: u16, device: u16) -> u8 {
     // RP1 on Pi 5: vendor 0x1de4, device 0x0001
-    if vendor == 0x1de4 && device == 0x0001 { return NIC_RP1_GEM; }
+    if vendor == 0x1de4 && device == 0x0001 {
+        return NIC_RP1_GEM;
+    }
     // Intel E810 100GbE
-    if vendor == 0x8086 && (device == 0x1592 || device == 0x1593) { return NIC_E810; }
+    if vendor == 0x8086 && (device == 0x1592 || device == 0x1593) {
+        return NIC_E810;
+    }
     // Mellanox ConnectX-5
-    if vendor == 0x15B3 && (device == 0x1017 || device == 0x1019) { return NIC_CX5; }
+    if vendor == 0x15B3 && (device == 0x1017 || device == 0x1019) {
+        return NIC_CX5;
+    }
     NIC_UNKNOWN
 }
 
@@ -321,7 +360,13 @@ unsafe fn enumerate(s: &mut PcieScanState) {
 // BAR mapping
 // ============================================================================
 
-unsafe fn bar_map(s: &mut PcieScanState, dev_idx: u8, bar_idx: u8, arg: *mut u8, arg_len: usize) -> i32 {
+unsafe fn bar_map(
+    s: &mut PcieScanState,
+    dev_idx: u8,
+    bar_idx: u8,
+    arg: *mut u8,
+    arg_len: usize,
+) -> i32 {
     if dev_idx as usize >= s.device_count as usize || bar_idx as usize >= MAX_BARS {
         return -22; // EINVAL
     }
@@ -361,8 +406,14 @@ unsafe fn bar_map(s: &mut PcieScanState, dev_idx: u8, bar_idx: u8, arg: *mut u8,
     // Write full 64-bit address to arg buffer if space allows
     if !arg.is_null() && arg_len >= 10 {
         let ab = virt.to_le_bytes();
-        *arg.add(2) = ab[0]; *arg.add(3) = ab[1]; *arg.add(4) = ab[2]; *arg.add(5) = ab[3];
-        *arg.add(6) = ab[4]; *arg.add(7) = ab[5]; *arg.add(8) = ab[6]; *arg.add(9) = ab[7];
+        *arg.add(2) = ab[0];
+        *arg.add(3) = ab[1];
+        *arg.add(4) = ab[2];
+        *arg.add(5) = ab[3];
+        *arg.add(6) = ab[4];
+        *arg.add(7) = ab[5];
+        *arg.add(8) = ab[6];
+        *arg.add(9) = ab[7];
     }
 
     virt as i32
@@ -373,8 +424,14 @@ unsafe fn bar_unmap(s: &mut PcieScanState, arg: *mut u8, arg_len: usize) -> i32 
         return -22; // EINVAL
     }
     let virt = u64::from_le_bytes([
-        *arg, *arg.add(1), *arg.add(2), *arg.add(3),
-        *arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7),
+        *arg,
+        *arg.add(1),
+        *arg.add(2),
+        *arg.add(3),
+        *arg.add(4),
+        *arg.add(5),
+        *arg.add(6),
+        *arg.add(7),
     ]);
 
     let mut i = 0usize;
@@ -407,14 +464,14 @@ pub unsafe extern "C" fn pcie_scan_dispatch(
 
     match opcode {
         NIC_BAR_MAP => {
-            if arg.is_null() || arg_len < 2 { return -22; }
+            if arg.is_null() || arg_len < 2 {
+                return -22;
+            }
             let dev_idx = *arg;
             let bar_idx = *arg.add(1);
             bar_map(s, dev_idx, bar_idx, arg, arg_len)
         }
-        NIC_BAR_UNMAP => {
-            bar_unmap(s, arg, arg_len)
-        }
+        NIC_BAR_UNMAP => bar_unmap(s, arg, arg_len),
         _ => -38, // ENOSYS
     }
 }
@@ -425,7 +482,9 @@ pub unsafe extern "C" fn pcie_scan_dispatch(
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -440,21 +499,29 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 unsafe fn bases_for_controller(ctrl: u8) -> (u64, u64) {
     match ctrl {
         CTRL_PCIE1 => (ECAM_BASE_PCIE1, PCIE_MMIO_BASE_PCIE1),
-        _          => (ECAM_BASE_PCIE2, PCIE_MMIO_BASE_PCIE2),
+        _ => (ECAM_BASE_PCIE2, PCIE_MMIO_BASE_PCIE2),
     }
 }
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize,
+    in_chan: i32,
+    out_chan: i32,
+    ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<PcieScanState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<PcieScanState>() {
+            return -2;
+        }
 
         let s = &mut *(state as *mut PcieScanState);
         s.syscalls = syscalls as *const SyscallTable;
@@ -468,8 +535,8 @@ pub extern "C" fn module_new(
         let sys = &*s.syscalls;
 
         // Parse TLV params (controller selector).
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -481,7 +548,12 @@ pub extern "C" fn module_new(
         s.mmio_base = mmio;
 
         if s.controller == CTRL_PCIE1 {
-            dev_log(sys, 3, b"[pcie_scan] controller=PCIe1 (external)\0".as_ptr(), 37);
+            dev_log(
+                sys,
+                3,
+                b"[pcie_scan] controller=PCIe1 (external)\0".as_ptr(),
+                37,
+            );
         } else {
             dev_log(sys, 3, b"[pcie_scan] controller=PCIe2 (RP1)\0".as_ptr(), 33);
         }
@@ -494,7 +566,12 @@ pub extern "C" fn module_new(
         let probe = mmio_read32(sys, s.ecam_base);
         if probe == 0xFFFF_FFFF || probe == 0 {
             if s.controller == CTRL_PCIE1 {
-                dev_log(sys, 2, b"[pcie_scan] PCIe1 ECAM unreadable (pciex1 enabled?)\0".as_ptr(), 51);
+                dev_log(
+                    sys,
+                    2,
+                    b"[pcie_scan] PCIe1 ECAM unreadable (pciex1 enabled?)\0".as_ptr(),
+                    51,
+                );
                 // Leave device_count = 0; do NOT fabricate QEMU stub.
                 s.ecam_base = 0xFFFF_FFFF_FFFF_FFFF; // suppress enumerate()
             } else {
@@ -536,14 +613,22 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 *mp.add(2) = (*dp).func;
                 *mp.add(3) = (*dp).nic_type;
                 let vid = (*dp).vendor_id.to_le_bytes();
-                *mp.add(4) = vid[0]; *mp.add(5) = vid[1];
+                *mp.add(4) = vid[0];
+                *mp.add(5) = vid[1];
                 let did = (*dp).device_id.to_le_bytes();
-                *mp.add(6) = did[0]; *mp.add(7) = did[1];
+                *mp.add(6) = did[0];
+                *mp.add(7) = did[1];
                 let bar0 = (*dp).bars[0];
                 let bl = (bar0 as u32).to_le_bytes();
-                *mp.add(8) = bl[0]; *mp.add(9) = bl[1]; *mp.add(10) = bl[2]; *mp.add(11) = bl[3];
+                *mp.add(8) = bl[0];
+                *mp.add(9) = bl[1];
+                *mp.add(10) = bl[2];
+                *mp.add(11) = bl[3];
                 let bh = ((bar0 >> 32) as u32).to_le_bytes();
-                *mp.add(12) = bh[0]; *mp.add(13) = bh[1]; *mp.add(14) = bh[2]; *mp.add(15) = bh[3];
+                *mp.add(12) = bh[0];
+                *mp.add(13) = bh[1];
+                *mp.add(14) = bh[2];
+                *mp.add(15) = bh[3];
                 (sys.channel_write)(s.out_chan, mp, 16);
                 i += 1;
             }

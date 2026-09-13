@@ -45,7 +45,7 @@ buffer_size = 16384
 max_record = 8600
 required = true
 
-# Optional signed-directive input (rfc_oci_distribution.md §7.2): FMP
+# Optional signed-directive input: FMP
 # frames whose payload is `[0x44][counter u64 LE][tag_len u8][tag]
 # [Ed25519 sig 64]`, verified against the `directive_pubkey` param.
 # Transport-agnostic by design — wire any byte transport here (a UDP

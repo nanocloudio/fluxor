@@ -1,7 +1,9 @@
 //! `fluxor agent` — the narrow local protocol a host orchestrator (nanocloud's
 //! `FluxorGraphWorkloadRuntime`) drives instead of linking fluxor-tools as a
-//! library (rfc_k8s.md §18.3 / Q12: "a neutral OCI execution library **or a
-//! narrow local service protocol**"). One verb for now:
+//! library. The orchestrator talks to fluxor over a narrow local command
+//! protocol — process boundary, stable argv and stdout — rather than embedding
+//! fluxor's composition code or a general OCI execution library in its own
+//! address space. One verb for now:
 //!
 //! `fluxor agent commit` — reconcile a single-pod desired state into a durable
 //! generation store and publish the committed plan blob for the Linux
@@ -39,12 +41,12 @@ pub enum AgentCommand {
     /// Remove a pod from the desired state, recompose, and publish.
     Remove(RemoveArgs),
     /// Report the node's committed generation and per-pod status
-    /// (owner-tagged: pod UID + owner slot + generation, rfc_k8s.md §17.2).
+    /// (owner-tagged by the full join key: pod UID + owner slot + generation).
     Status(StatusArgs),
-    /// Stream an owner's per-owner log ring (rfc_owner_drain_and_logs.md §4.5).
+    /// Stream an owner's per-owner log ring.
     Logs(LogsArgs),
     /// Read or set the node policy composition consults on every commit/remove
-    /// (rfc_endpoint_lease.md §5.2): today the reserved-port set.
+    /// — node-scoped, never per-pod: today the reserved-port set.
     Policy(PolicyArgs),
 }
 
@@ -108,8 +110,7 @@ pub struct RemoveArgs {
     pub pod_uid: String,
     /// Grace window in seconds: the owner drains (admission closed, in-flight
     /// work runs, readiness withdrawn) and is revoked at quiescence or this
-    /// deadline, whichever comes first (rfc_owner_drain_and_logs.md §3.1).
-    /// 0 = revoke immediately.
+    /// deadline, whichever comes first. 0 = revoke immediately.
     #[arg(long, default_value_t = 0)]
     pub grace: u16,
     /// Target capacity profile (linux | pi5 | bcm2712) — sets the kernel
@@ -193,7 +194,7 @@ fn verify_artifact(bytes: &[u8], declared: &str, what: &str) -> Result<()> {
 /// validation, lacks a linux implementation, or whose artifacts don't match the
 /// manifest's pinned digests is rejected before anything is committed.
 ///
-/// This is the local-orchestrator trust model (rfc_k8s.md §18.3): the manifest
+/// This is the local-orchestrator trust model: the manifest
 /// arrives from the trusted local host, and the artifacts (`resources.json`,
 /// `graph.yaml`) are verified against the digests it pins — a modified artifact
 /// fails. (Verifying a *signature over the manifest itself* is the untrusted-
@@ -243,7 +244,7 @@ fn resolve_bundle(
     // specific workload rather than a zeroed placeholder.
     let workload_digest = sha256_bytes(manifest_json.as_bytes());
     // Declared exports travel with the desired pod so `agent status` can join
-    // them against the runtime's bound report (rfc_endpoint_lease.md §4.3).
+    // them against the runtime's report of what actually bound.
     let exports = manifest
         .contract
         .exports
@@ -552,7 +553,7 @@ fn commit(c: CommitArgs) -> Result<()> {
     // it, just without live state.
     let _ = record_publish_path(&mut store, &c.publish);
 
-    // The workload handle the orchestrator tracks (rfc_k8s.md §7.2).
+    // The workload handle the orchestrator tracks: `fluxor://<uid-hex>/<gen>`.
     println!(
         "fluxor://{}/{}",
         c.pod_uid.chars().filter(|c| *c != '-').collect::<String>(),

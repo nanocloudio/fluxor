@@ -355,8 +355,8 @@ mod rp2350_impl {
             core::ptr::write_volatile(MPU_CTRL, CTRL_ENABLE | CTRL_PRIVDEFENA | CTRL_HFNMIENA);
 
             // Barriers
-            cortex_m::asm::dsb();
-            cortex_m::asm::isb();
+            crate::arch::cortex_m::dsb();
+            crate::arch::cortex_m::isb();
 
             ISOLATION_ENABLED = true;
             log::info!("[mpu] initialized, {num_regions} regions");
@@ -486,8 +486,8 @@ mod rp2350_impl {
             core::ptr::write_volatile(MPU_CTRL, ctrl);
 
             // Barriers after region update
-            cortex_m::asm::dsb();
-            cortex_m::asm::isb();
+            crate::arch::cortex_m::dsb();
+            crate::arch::cortex_m::isb();
         }
     }
 
@@ -757,8 +757,8 @@ mod rp2350_impl {
         core::ptr::write_volatile((psp as *mut u32).add(0), (-14i32) as u32); // EFAULT
 
         // DSB + ISB before return
-        cortex_m::asm::dsb();
-        cortex_m::asm::isb();
+        crate::arch::cortex_m::dsb();
+        crate::arch::cortex_m::isb();
 
         // Exception return will restore from PSP and jump to fault_trampoline
     }
@@ -800,16 +800,16 @@ mod rp2350_impl {
         // but the function pointers in the SyscallTable are in a region
         // marked RO for unprivileged access.
         //
-        // Full SVC gateway (each syscall traps to kernel) is deferred
-        // to a follow-up — the MPU + privilege split already prevents
-        // direct kernel memory access, which is the primary isolation goal.
+        // There is no full SVC gateway (each syscall trapping to the kernel):
+        // the MPU + privilege split already prevents direct kernel memory
+        // access, which is the primary isolation goal.
         //
         // Null the telemetry-enabled pointer for the isolated table: it points
         // at kernel .bss the MPU does not expose to unprivileged reads, so a
         // module dereferencing it would fault. Null means "cannot check" — the
         // SDK then emits unconditionally (the ring still drops when no consumer
-        // is subscribed). The zero-cost gate for isolated modules arrives with
-        // the EL0/MPU read-only telemetry page (§5.1, follow-up).
+        // is subscribed). A zero-cost gate for an isolated module would need
+        // the flag on a page the MPU exposes read-only to unprivileged reads.
         let mut t = *crate::kernel::module::syscalls::get_syscall_table();
         t.telemetry_enabled = core::ptr::null();
         t

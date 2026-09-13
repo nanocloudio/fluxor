@@ -1,22 +1,23 @@
 //! Local OCI image-layout content store for `.fmod` modules and workload
-//! bundles (`.context/fmod_registry_plan.md` P1).
+//! bundles.
 //!
 //! Layout is the standard OCI image layout: `oci-layout` marker,
 //! `blobs/sha256/<hex>` content-addressed blobs, and `index.json` holding one
 //! descriptor per tagged artifact. Artifacts are OCI image manifests whose
-//! `artifactType` is a fluxor media type (rfc_k8s.md §9); provenance is an
+//! `artifactType` is a fluxor media type (one per artifact kind, spelled
+//! `application/vnd.nanocloud.fluxor.<kind>.v1`); provenance is an
 //! annotation (`io.fluxor.provenance = local-build | published`, plus
 //! `io.fluxor.source-rev` on local builds), so "just-built sibling repo" vs
 //! "published release" is queryable, not guessed.
 //!
 //! Offline-first invariant: nothing in this module touches the network.
-//! Publishing writes only into the local store; consumption (P2) reads only
+//! Publishing writes only into the local store; consumption reads only
 //! from it. Identical bytes hash to identical digests and are stored once.
 //!
 //! Determinism: manifest JSON is serialized from field-ordered structs (no
 //! timestamps), so re-publishing unchanged content yields byte-identical
-//! manifests and therefore identical digests — the P5 promotion property
-//! (re-tag, never rebuild) falls out of this.
+//! manifests and therefore identical digests, so promotion between
+//! environments is a re-tag of an existing digest and never a rebuild.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -27,7 +28,13 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
-// ── Media types (rfc_k8s.md §9) ───────────────────────────────────────
+// ── Media types ──────────────────────────────────────────────────────
+//
+// Every fluxor artifact kind has exactly one media type, spelled
+// `application/vnd.nanocloud.fluxor.<kind>.v1` plus an optional encoding
+// suffix (`+json`, `+yaml`, `+toml`, `+tar`, `+bin`). A manifest's
+// `artifactType` is the media type of what it delivers, so a consumer
+// can admit or reject an artifact from the manifest alone.
 
 pub const MT_OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub const MT_OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
@@ -55,9 +62,9 @@ pub const MT_FLUXOR_FIRMWARE: &str = "application/vnd.nanocloud.fluxor.firmware.
 /// compiled config (`MT_FLUXOR_CONFIG_BIN`), each carrying an
 /// `io.fluxor.image.offset` annotation; a consumer reassembles the
 /// byte-exact image by placing blobs at their offsets and zero-filling
-/// the deterministic alignment gaps (rfc_oci_distribution.md §7.1).
+/// the deterministic alignment gaps.
 pub const MT_FLUXOR_IMAGE_SKELETON: &str = "application/vnd.nanocloud.fluxor.image.skeleton.v1";
-/// Compiled binary graph config (rfc_k8s.md §9).
+/// Compiled binary graph config.
 pub const MT_FLUXOR_CONFIG_BIN: &str = "application/vnd.nanocloud.fluxor.config.v1+bin";
 /// Byte offset of a layer within its reassembled graph image (decimal).
 pub const ANN_IMAGE_OFFSET: &str = "io.fluxor.image.offset";
@@ -731,7 +738,8 @@ pub fn explode_image(image: &[u8]) -> Result<Vec<ImageLayer<'_>>> {
 }
 
 /// Publish a LAYERED graph image: skeleton + per-fmod + config
-/// layers, offsets annotated (rfc_oci_distribution.md §7.1). Fmod
+/// layers, each layer annotated with its byte offset in the
+/// reassembled image so a consumer can rebuild the exact bytes. Fmod
 /// layer blobs are byte-identical to individually published module
 /// artifacts, so the store (and any registry) deduplicates them.
 pub fn publish_layered_image(
@@ -977,7 +985,7 @@ pub fn publish_bundle(store: &OciStore, b: &BundlePublish<'_>) -> Result<Descrip
 
 // ── Source / runtime artifacts + transactional batch publish ─────────
 //
-// The consolidated publish path (registry_consolidation.md P1): every
+// The consolidated publish path: every
 // artifact kind is prepared (blobs staged, manifest built) and then a
 // whole publish commits in ONE locked index write — partial publish is
 // impossible by construction. Each artifact is tagged both `name:ver`

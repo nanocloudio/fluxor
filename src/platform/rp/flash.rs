@@ -442,6 +442,8 @@ pub mod store {
         false
     }
 
+    use crate::platform::rp_bootrom as bootrom;
+
     /// Erase a 4KB sector. Validates the offset is sector-aligned and falls
     /// within a known writable region (`is_writable_sector`).
     pub fn raw_erase(offset: u32) -> i32 {
@@ -451,10 +453,17 @@ pub mod store {
         if !is_writable_sector(offset, SECTOR_SIZE as u32) {
             return crate::kernel::sys::errno::EINVAL;
         }
+        // Resolve the bootrom entry points while flash is still up. Walking
+        // the ROM table needs no flash, but doing it here means a bootrom
+        // that does not publish one of these fails before anything is
+        // disconnected, rather than after.
+        let (Some(rom), Some(erase)) = (bootrom::FlashRom::resolve(), bootrom::erase_fn()) else {
+            return crate::kernel::sys::errno::ENOSYS;
+        };
         // SAFETY: offset alignment + writable-region check above; with_flash_op
         // disables IRQs and detaches XIP across the ROM-bootloader call.
         unsafe {
-            match with_flash_op(|| flash_erase_sector(offset)) {
+            match with_flash_op(|| flash_erase_sector(&rom, erase, offset)) {
                 Ok(()) => 0,
                 Err(()) => crate::kernel::sys::errno::ERROR,
             }
@@ -467,12 +476,17 @@ pub mod store {
         if !is_writable_sector(offset, PAGE_SIZE as u32) {
             return crate::kernel::sys::errno::EINVAL;
         }
+        // As `raw_erase`: resolved before anything is disconnected.
+        let (Some(rom), Some(program)) = (bootrom::FlashRom::resolve(), bootrom::program_fn())
+        else {
+            return crate::kernel::sys::errno::ENOSYS;
+        };
         // SAFETY: writable-region check above; with_flash_op disables IRQs
         // and detaches XIP. Caller must ensure `data` points to a readable
         // PAGE_SIZE buffer (raw_program is itself a syscall surface that
         // already validates `data`).
         unsafe {
-            match with_flash_op(|| flash_program_page(offset, data)) {
+            match with_flash_op(|| flash_program_page(&rom, program, offset, data)) {
                 Ok(()) => 0,
                 Err(()) => crate::kernel::sys::errno::ERROR,
             }
@@ -488,24 +502,18 @@ pub mod store {
     /// Acquires exclusive flash access, disables interrupts, waits for all
     /// DMA channels reading from flash to complete, then runs the operation.
     unsafe fn with_flash_op<F: FnOnce()>(op: F) -> Result<(), ()> {
-        use embassy_rp::pac;
+        use crate::platform::rp_dma::{quiesce_flash_readers, QUIESCE_LIMIT};
 
-        cortex_m::interrupt::free(|_| {
-            // Wait for all DMA channels reading from flash to finish
-            const SRAM_LOWER: u32 = 0x2000_0000;
-            for n in 0..16 {
-                let ch = pac::DMA.ch(n);
-                if ch.read_addr().read() < SRAM_LOWER && ch.ctrl_trig().read().busy() {
-                    while ch.read_addr().read() < SRAM_LOWER && ch.ctrl_trig().read().busy() {}
-                }
+        crate::arch::cortex_m::interrupt_free(|| {
+            if !quiesce_flash_readers(QUIESCE_LIMIT) {
+                // Refuse rather than erase underneath a live read. The
+                // wait is bounded so a stuck channel is reported here rather
+                // than presenting as a hang.
+                return Err(());
             }
-            // Wait for XIP stream completion
-            while pac::XIP_CTRL.stream_ctr().read().0 > 0 {}
-
             op();
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Copy boot2 into a RAM buffer and return a callable function pointer.
@@ -530,24 +538,29 @@ pub mod store {
     /// Must be called within `with_flash_op` (interrupts disabled, DMA idle).
     #[inline(never)]
     #[link_section = ".data.ram_func"]
-    unsafe fn flash_erase_sector(offset: u32) {
-        use embassy_rp::rom_data;
-
+    unsafe fn flash_erase_sector(rom: &bootrom::FlashRom, erase: bootrom::EraseFn, offset: u32) {
         let mut boot2 = [0u32; 256 / 4];
-        let boot2_fn = copy_boot2(&mut boot2);
+        // SAFETY: RP2040 must copy boot2 out of flash before flash goes away;
+        // RP2350 reads it from BOOTRAM. Either way it happens first.
+        let boot2_fn = unsafe { copy_boot2(&mut boot2) };
 
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        (rom_data::connect_internal_flash::ptr())();
-        (rom_data::flash_exit_xip::ptr())();
-        (rom_data::flash_range_erase::ptr())(
-            offset,
-            SECTOR_SIZE,
-            crate::platform::chip::FLASH_ERASE_BLOCK_SIZE,
-            crate::platform::chip::FLASH_ERASE_CMD,
-        );
-        (rom_data::flash_flush_cache::ptr())();
-        boot2_fn();
+        // SAFETY: every pointer here was resolved before flash was
+        // disconnected, and this function is in RAM (`.data.ram_func`), so it
+        // remains executable while XIP is down. boot2_fn restores XIP.
+        unsafe {
+            (rom.connect)();
+            (rom.exit_xip)();
+            erase(
+                offset,
+                SECTOR_SIZE,
+                crate::platform::chip::FLASH_ERASE_BLOCK_SIZE,
+                crate::platform::chip::FLASH_ERASE_CMD,
+            );
+            (rom.flush_cache)();
+            boot2_fn();
+        }
     }
 
     /// Program one 256-byte page at the given flash offset.
@@ -558,19 +571,27 @@ pub mod store {
     /// Must be called within `with_flash_op` (interrupts disabled, DMA idle).
     #[inline(never)]
     #[link_section = ".data.ram_func"]
-    unsafe fn flash_program_page(offset: u32, data: *const u8) {
-        use embassy_rp::rom_data;
-
+    unsafe fn flash_program_page(
+        rom: &bootrom::FlashRom,
+        program: bootrom::ProgramFn,
+        offset: u32,
+        data: *const u8,
+    ) {
         let mut boot2 = [0u32; 256 / 4];
-        let boot2_fn = copy_boot2(&mut boot2);
+        // SAFETY: as `flash_erase_sector`.
+        let boot2_fn = unsafe { copy_boot2(&mut boot2) };
 
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
-        (rom_data::connect_internal_flash::ptr())();
-        (rom_data::flash_exit_xip::ptr())();
-        (rom_data::flash_range_program::ptr())(offset, data, PAGE_SIZE);
-        (rom_data::flash_flush_cache::ptr())();
-        boot2_fn();
+        // SAFETY: as `flash_erase_sector`; `data` is a caller-validated
+        // PAGE_SIZE buffer in SRAM, which it must be — it cannot be in flash.
+        unsafe {
+            (rom.connect)();
+            (rom.exit_xip)();
+            program(offset, data, PAGE_SIZE);
+            (rom.flush_cache)();
+            boot2_fn();
+        }
     }
 
     // ============================================================================
@@ -596,7 +617,7 @@ pub mod xip_lock {
     //! Flash sideband operations (e.g., BOOTSEL button read) use an atomic
     //! lock-read-unlock pattern: acquire FLASH_XIP, perform the operation with
     //! interrupts disabled, release. The QSPI CS read technique follows the
-    //! same approach as embassy-rp's bootsel module.
+    //! same approach as the pico-sdk.
 
     use crate::kernel::sys::errno;
     use portable_atomic::{AtomicU32, AtomicU8, Ordering};
@@ -737,21 +758,16 @@ pub mod xip_lock {
     /// Returns 0 (not pressed) or 1 (pressed).
     fn read_bootsel() -> i32 {
         use crate::platform::chip;
-        use embassy_rp::pac;
+        use crate::platform::rp_dma::{quiesce_flash_readers, QUIESCE_LIMIT};
 
         let mut sio_hi_sample: u32 = 0;
+        let mut quiesced = false;
 
-        cortex_m::interrupt::free(|_| {
-            // Wait for all DMA channels reading from flash to finish.
-            const SRAM_LOWER: u32 = 0x2000_0000;
-            for n in 0..chip::BOOTSEL_DMA_CH_COUNT {
-                let ch = pac::DMA.ch(n);
-                if ch.read_addr().read() < SRAM_LOWER && ch.ctrl_trig().read().busy() {
-                    while ch.read_addr().read() < SRAM_LOWER && ch.ctrl_trig().read().busy() {}
-                }
+        crate::arch::cortex_m::interrupt_free(|| {
+            if !quiesce_flash_readers(QUIESCE_LIMIT) {
+                return;
             }
-            // Wait for any XIP streaming to complete
-            while pac::XIP_CTRL.stream_ctr().read().0 > 0 {}
+            quiesced = true;
 
             // SAFETY: called inside interrupt-free, IO-quiesced critical
             // section; the RAM-resident routine briefly detaches flash to
@@ -759,6 +775,12 @@ pub mod xip_lock {
             let (_status, sio) = unsafe { read_bootsel_io_qspi() };
             sio_hi_sample = sio;
         });
+
+        // A read that never ran samples nothing; reporting "not pressed" is
+        // the safe answer, since the alternative is a spurious BOOTSEL entry.
+        if !quiesced {
+            return 0;
+        }
 
         // BOOTSEL is active-low: pressed when the QSPI SS bit is LOW.
         if (sio_hi_sample >> chip::BOOTSEL_QSPI_SS_BIT) & 1 == 0 {

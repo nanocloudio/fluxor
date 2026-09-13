@@ -458,9 +458,7 @@ underneath.
 
 ### DNS64 and authoritative update
 
-Source: `modules/foundation/dns/mod.rs`; gates `tests/harness/tests/dns64.rs`,
-`tests/harness/tests/dns_update.rs`; rigs `tests/host/dns64_stock_client.sh`,
-`tests/host/dns_update_nsupdate.sh`.
+Source: `modules/foundation/dns/mod.rs`.
 
 Both are off unless their manifest parameter is set.
 

@@ -357,7 +357,7 @@ fn build_graph_linux() -> (usize, usize) {
                 listen_backlog.min(i32::MAX as u32) as i32,
             );
             // Register for the platform-side endpoint report, the owner
-            // teardown hook, and the rebuild fd close-out (§4.3–§4.5).
+            // teardown hook, and the rebuild fd close-out.
             linux_net_register_state(&*state as *const LinuxNetState as *mut LinuxNetState);
             install_state(&mut m, state);
             scheduler::store_builtin_module(module_idx, m);
@@ -641,7 +641,7 @@ fn main() {
     }
     // Node-agent mode also PUBLISHES per-owner live status next to the plan
     // it consumes (`owner_status.json`, atomic replace) so `fluxor agent
-    // status` can report truthful per-workload §7.2 state. Absent file / absent
+    // status` can report truthful per-workload state. Absent file / absent
     // FLUXOR_PLAN ⇒ no runtime status surfaced.
     let mut owner_status = plan_path
         .as_deref()
@@ -671,8 +671,8 @@ fn main() {
     // A revocation the just-applied plan still lists, naming an owner that was
     // NOT reinstalled, was mid-drain when the previous process died: the drain
     // is forfeited and recorded as drain-timeout-by-restart — unless the
-    // previous process already persisted that workload's terminal outcome (
-    // §3.7 writer seeding).
+    // previous process already persisted that workload's terminal outcome,
+    // which the status writer seeds from the file it finds at startup.
     synthesize_restart_terminals(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -737,8 +737,9 @@ fn main() {
 
     // Capture the runtime thread so `linux_wake_scheduler` (called via
     // `hal::wake_scheduler` from `event_signal` / `event_signal_from_isr`)
-    // can `unpark()` us out of `park_timeout` between ticks. Matches RP's
-    // SIGNAL-races-Timer pattern in `embassy_futures::select`.
+    // can `unpark()` us out of `park_timeout` between ticks. Same shape as
+    // RP's wake latch: the producer records the wake and then pokes the
+    // consumer, and the consumer re-checks rather than trusting the poke.
     linux_install_wake_thread();
 
     loop {
@@ -848,7 +849,7 @@ fn main() {
         let sched = unsafe { scheduler::sched_mut() };
         // Multi-graph runtime: when more than one resident graph is admitted
         // this steps each owner independently, skips idle owners, and returns
-        // the §7.2 merged sleep deadline. With one resident graph it is
+        // the merged sleep deadline. With one resident graph it is
         // byte-identical to `step_modules` + `pacer_next_deadline_us(0)` (the
         // fast path inside the call).
         let (result, sleep_us) =
@@ -907,9 +908,8 @@ fn main() {
         //                       `unpark` from `linux_wake_scheduler`
         //                       returns immediately so the next
         //                       iteration's drain runs the woken module.
-        // `sleep_us` was chosen above by the resident-graph runner (RFC
-        // adaptive_tick §5.1 / adaptive_tick_extra §7.2). With no adaptive flag
-        // set it returns the domain's nominal tick, so `sleep_us == tick_us`
+        // `sleep_us` was chosen above by the resident-graph runner. With no
+        // adaptive flag set it returns the domain's nominal tick, so `sleep_us == tick_us`
         // every iteration and the bands below are byte-identical to the
         // fixed-tick loop. With mechanism (a) enabled and an idle pass it returns
         // `tick_max_us`; `park_timeout` stays interruptible by `unpark` from

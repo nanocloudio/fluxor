@@ -24,7 +24,7 @@ pub struct HalOps {
     pub disable_interrupts: fn() -> u32,
     /// Restore interrupt state from a previous `disable_interrupts`.
     pub restore_interrupts: fn(u32),
-    /// Wake the scheduler from its idle sleep (Embassy signal / SEV).
+    /// Wake the scheduler from its idle sleep (SEV).
     pub wake_scheduler: fn(),
 
     // ── Timer ─────────────────────────────────────────────────────────
@@ -178,7 +178,7 @@ pub struct HalOps {
     /// Block until the absolute `deadline_us` (microseconds since boot) OR an
     /// event/IRQ wakes the scheduler, whichever comes first; returns a
     /// `WOKEN_*` reason. The portable unification of the per-platform split
-    /// wake arms: platform loops may keep using their native arms (Embassy
+    /// wake arms: platform loops may keep using their own arms (
     /// select, thread park, WFI/WFE), and this field provides the single
     /// portable primitive a loop can adopt instead, without per-platform
     /// `#[cfg]` branching. Supplied on every platform.
@@ -340,14 +340,24 @@ pub fn stack_canary_reinit() {
     (ops().stack_canary_reinit)()
 }
 
+// `sleep_until`'s wake reason. **Bit flags, not an enumeration**: a deadline
+// and an event can land in the same instant, and a platform that can tell
+// them apart should be able to say so. An enumeration cannot express the
+// combination — the two would have to collapse into one, and whichever lost
+// would vanish silently.
+
 /// `sleep_until` returned because its programmed deadline elapsed.
-pub const WOKEN_DEADLINE: u32 = 0;
+pub const WOKEN_DEADLINE: u32 = 1 << 0;
 /// `sleep_until` returned because an event/IRQ woke the scheduler early.
-pub const WOKEN_EVENT: u32 = 1;
+pub const WOKEN_EVENT: u32 = 1 << 1;
 /// `sleep_until` returned for an indeterminate reason (e.g. a bare WFI that
 /// cannot distinguish the wake source). The caller must re-check its own
 /// wake/work state — `sleep_until` is a hint, never an authority on readiness.
-pub const WOKEN_UNKNOWN: u32 = 2;
+///
+/// Deliberately its own bit rather than the absence of the others: "I do not
+/// know" and "neither happened" are different claims, and a caller that
+/// cannot tell them apart will treat a broken platform as an idle one.
+pub const WOKEN_UNKNOWN: u32 = 1 << 2;
 
 /// Global HAL operations table. Set once at boot by `init()`.
 static mut HAL_OPS: Option<&'static HalOps> = None;
@@ -437,9 +447,9 @@ pub fn clock_sync_status() -> Option<(bool, u64)> {
 //
 // Beside the kernel, NOT under `modules/sdk/`. The crypto cores live there
 // because modules include them, and anything under `modules/sdk/` is part
-// of the ABI surface — putting this there advanced the surface digest and
-// would have forced every consumer through a migration for a rule no module
-// calls. Placement is an interface decision, not a filing one.
+// of the ABI surface — putting this there would advance the surface digest
+// and force every consumer through a rebuild for a rule no module calls.
+// Placement is an interface decision, not a filing one.
 include!("seal_provenance.rs");
 
 // The VideoCore property-mailbox MESSAGE format, mounted beside the

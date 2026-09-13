@@ -237,8 +237,7 @@ impl ParamSchema {
 pub(crate) const SKIP_KEYS: &[&str] = &[
     "name",
     "type",
-    // `[[variant]]` selection (RFC module_variants) — resolution input,
-    // never a wire param.
+    // `[[variant]]` selection — resolution input, never a wire param.
     "variant",
     "wiring",
     "preset",
@@ -719,6 +718,12 @@ fn resolve_u32(value: &Value, param: &SchemaParam) -> u32 {
         }
         if let Ok(n) = s.parse::<u32>() {
             return n;
+        }
+        // Hex literal ("0xC0A8010A"); a number, never a name to hash.
+        if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            if let Ok(n) = u32::from_str_radix(h, 16) {
+                return n;
+            }
         }
         // Try dotted-decimal IPv4 (e.g. "192.168.1.1" → network byte order u32)
         if s.contains('.') {
@@ -1674,5 +1679,39 @@ mod requires_when_resolution {
             one_of(&m, &s, "clock_policy", &["require", "sometimes"]),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod resolve_u32_forms {
+    use super::*;
+
+    fn param() -> SchemaParam {
+        SchemaParam {
+            tag: 0,
+            ptype: ParamType::U32,
+            name: String::from("dst_ip"),
+            default: 0,
+            enums: HashMap::new(),
+        }
+    }
+
+    /// A hex literal is a number, not a name to hash.
+    #[test]
+    fn hex_is_parsed_not_hashed() {
+        let v = serde_json::json!("0xC0A8010A");
+        assert_eq!(resolve_u32(&v, &param()), 0xC0A8_010A);
+    }
+
+    /// Dotted quad and decimal remain the readable forms.
+    #[test]
+    fn dotted_quad_and_decimal_agree() {
+        let p = param();
+        let a = resolve_u32(&serde_json::json!("192.168.1.10"), &p);
+        let b = resolve_u32(&serde_json::json!("3232235786"), &p);
+        let c = resolve_u32(&serde_json::json!(3232235786u64), &p);
+        assert_eq!(a, 0xC0A8_010A);
+        assert_eq!(a, b);
+        assert_eq!(a, c);
     }
 }

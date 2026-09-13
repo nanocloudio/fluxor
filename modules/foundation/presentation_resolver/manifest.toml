@@ -1,7 +1,7 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350", "wasm"]
 
-# On-device placement resolver (.context/rfc_adaptive_presentation.md §10). Maps
+# On-device placement resolver. Maps
 # a stream of `input::surface_traits` records onto a `presentation.layout` — the
 # per-control disposition (chrome / content / bound / hidden) + physical-button
 # legend — so a Linux-display or bare-metal-panel surface adapts its UI without a

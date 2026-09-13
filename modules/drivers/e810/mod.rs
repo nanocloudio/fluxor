@@ -23,7 +23,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
@@ -38,32 +37,32 @@ include!("../../sdk/runtime.rs");
 // ============================================================================
 
 // General registers
-const E810_PFGEN_CTRL: usize = 0x0091_0000;    // PF General Control
-const E810_PFGEN_STATUS: usize = 0x0091_0004;  // PF General Status
-const E810_GLGEN_STAT: usize = 0x000B_612C;    // Global Status
+const E810_PFGEN_CTRL: usize = 0x0091_0000; // PF General Control
+const E810_PFGEN_STATUS: usize = 0x0091_0004; // PF General Status
+const E810_GLGEN_STAT: usize = 0x000B_612C; // Global Status
 
 // Admin queue
-const E810_PF_ATQBAL: usize = 0x0008_0000;     // Admin TX Queue Base Low
-const E810_PF_ATQBAH: usize = 0x0008_0100;     // Admin TX Queue Base High
-const E810_PF_ATQLEN: usize = 0x0008_0200;     // Admin TX Queue Length
-const E810_PF_ATQH: usize = 0x0008_0300;       // Admin TX Queue Head
-const E810_PF_ATQT: usize = 0x0008_0400;       // Admin TX Queue Tail
-const E810_PF_ARQBAL: usize = 0x0008_0080;     // Admin RX Queue Base Low
-const E810_PF_ARQBAH: usize = 0x0008_0180;     // Admin RX Queue Base High
-const E810_PF_ARQLEN: usize = 0x0008_0280;     // Admin RX Queue Length
-const E810_PF_ARQH: usize = 0x0008_0380;       // Admin RX Queue Head
-const E810_PF_ARQT: usize = 0x0008_0480;       // Admin RX Queue Tail
+const E810_PF_ATQBAL: usize = 0x0008_0000; // Admin TX Queue Base Low
+const E810_PF_ATQBAH: usize = 0x0008_0100; // Admin TX Queue Base High
+const E810_PF_ATQLEN: usize = 0x0008_0200; // Admin TX Queue Length
+const E810_PF_ATQH: usize = 0x0008_0300; // Admin TX Queue Head
+const E810_PF_ATQT: usize = 0x0008_0400; // Admin TX Queue Tail
+const E810_PF_ARQBAL: usize = 0x0008_0080; // Admin RX Queue Base Low
+const E810_PF_ARQBAH: usize = 0x0008_0180; // Admin RX Queue Base High
+const E810_PF_ARQLEN: usize = 0x0008_0280; // Admin RX Queue Length
+const E810_PF_ARQH: usize = 0x0008_0380; // Admin RX Queue Head
+const E810_PF_ARQT: usize = 0x0008_0480; // Admin RX Queue Tail
 
 // TX/RX queue registers
 const E810_QTX_COMM_DBELL: usize = 0x0010_0000; // TX doorbell (per-queue stride 4)
-const E810_QRX_TAIL: usize = 0x0012_0000;       // RX tail (per-queue stride 4)
+const E810_QRX_TAIL: usize = 0x0012_0000; // RX tail (per-queue stride 4)
 
 // LAN TX queue context
-const E810_QINT_TQCTL: usize = 0x0014_0000;     // TX Queue Interrupt Cause Control
-const E810_QINT_RQCTL: usize = 0x0015_0000;     // RX Queue Interrupt Cause Control
+const E810_QINT_TQCTL: usize = 0x0014_0000; // TX Queue Interrupt Cause Control
+const E810_QINT_RQCTL: usize = 0x0015_0000; // RX Queue Interrupt Cause Control
 
 // Link status
-const E810_PRTMAC_LINK: usize = 0x001E_2040;    // MAC link status (simplified)
+const E810_PRTMAC_LINK: usize = 0x001E_2040; // MAC link status (simplified)
 
 // NIC syscall opcodes
 const NIC_BAR_MAP: u32 = 0x0CF0;
@@ -147,8 +146,14 @@ unsafe fn init_e810(s: &mut E810State) -> bool {
         return false;
     }
     let addr_bytes: [u8; 8] = [
-        *bp.add(2), *bp.add(3), *bp.add(4), *bp.add(5),
-        *bp.add(6), *bp.add(7), *bp.add(8), *bp.add(9),
+        *bp.add(2),
+        *bp.add(3),
+        *bp.add(4),
+        *bp.add(5),
+        *bp.add(6),
+        *bp.add(7),
+        *bp.add(8),
+        *bp.add(9),
     ];
     s.bar_base = u64::from_le_bytes(addr_bytes) as usize;
 
@@ -177,14 +182,38 @@ unsafe fn init_e810(s: &mut E810State) -> bool {
         return false;
     }
     let ip = info.as_ptr();
-    s.rx_desc_addr = u64::from_le_bytes([*ip, *ip.add(1), *ip.add(2), *ip.add(3),
-                                          *ip.add(4), *ip.add(5), *ip.add(6), *ip.add(7)]);
+    s.rx_desc_addr = u64::from_le_bytes([
+        *ip,
+        *ip.add(1),
+        *ip.add(2),
+        *ip.add(3),
+        *ip.add(4),
+        *ip.add(5),
+        *ip.add(6),
+        *ip.add(7),
+    ]);
     s.rx_desc_count = u16::from_le_bytes([*ip.add(8), *ip.add(9)]);
-    s.tx_desc_addr = u64::from_le_bytes([*ip.add(10), *ip.add(11), *ip.add(12), *ip.add(13),
-                                          *ip.add(14), *ip.add(15), *ip.add(16), *ip.add(17)]);
+    s.tx_desc_addr = u64::from_le_bytes([
+        *ip.add(10),
+        *ip.add(11),
+        *ip.add(12),
+        *ip.add(13),
+        *ip.add(14),
+        *ip.add(15),
+        *ip.add(16),
+        *ip.add(17),
+    ]);
     s.tx_desc_count = u16::from_le_bytes([*ip.add(18), *ip.add(19)]);
-    s.buf_pool_addr = u64::from_le_bytes([*ip.add(20), *ip.add(21), *ip.add(22), *ip.add(23),
-                                           *ip.add(24), *ip.add(25), *ip.add(26), *ip.add(27)]);
+    s.buf_pool_addr = u64::from_le_bytes([
+        *ip.add(20),
+        *ip.add(21),
+        *ip.add(22),
+        *ip.add(23),
+        *ip.add(24),
+        *ip.add(25),
+        *ip.add(26),
+        *ip.add(27),
+    ]);
     s.buf_size = u16::from_le_bytes([*ip.add(28), *ip.add(29)]);
     s.buf_count = u16::from_le_bytes([*ip.add(30), *ip.add(31)]);
 
@@ -230,11 +259,15 @@ unsafe fn poll_tx(s: &mut E810State) {
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { STATE_SIZE }
+pub extern "C" fn module_state_size() -> usize {
+    STATE_SIZE
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]

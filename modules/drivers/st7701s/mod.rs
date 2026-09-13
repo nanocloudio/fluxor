@@ -27,7 +27,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -154,9 +153,9 @@ struct St7701sState {
     vsync_pin: u8,
     pclk_pin: u8,
     data0_pin: u8,
-    pio_sync: u8,  // PIO block for sync SMs (default 1)
-    pio_data: u8,  // PIO block for data SMs (default 2)
-    mirror_x: u8,  // 1=flip source scan direction (SDIR), panel-dependent
+    pio_sync: u8, // PIO block for sync SMs (default 1)
+    pio_data: u8, // PIO block for data SMs (default 2)
+    mirror_x: u8, // 1=flip source scan direction (SDIR), panel-dependent
     _pad_cfg: u8,
     width: u16,
     height: u16,
@@ -177,25 +176,25 @@ struct St7701sState {
     rgb_origin: u8,
 
     // Source image info (from params)
-    src_rows: u16,       // source image rows (≤MAX_CACHED_ROWS), default 32
+    src_rows: u16, // source image rows (≤MAX_CACHED_ROWS), default 32
 
     // Runtime geometry — computed from width/height in module_new.
-    line_words: u16,     // = width >> 1  (u32 words per decoded line)
-    line_bytes: u16,     // = line_words << 2 (bytes per decoded line = width*2)
+    line_words: u16, // = width >> 1  (u32 words per decoded line)
+    line_bytes: u16, // = line_words << 2 (bytes per decoded line = width*2)
     _pad_geo: u16,
-    stripe_pixels: u32,  // = width * STRIPE_LINES (u16 DMA transfers per stripe; DMA is 16-bit)
-    stripe_count: u8,    // stripes per frame (height / STRIPE_LINES)
+    stripe_pixels: u32, // = width * STRIPE_LINES (u16 DMA transfers per stripe; DMA is 16-bit)
+    stripe_count: u8,   // stripes per frame (height / STRIPE_LINES)
 
     // Stripe DMA state
-    current_stripe: u8,  // 0..stripe_count-1, counts DOWN
-    back_is_b: u8,       // 0: back=stripe_a, 1: back=stripe_b
-    frame_loaded: u8,    // 0: first frame still loading, 1: backlight on
+    current_stripe: u8, // 0..stripe_count-1, counts DOWN
+    back_is_b: u8,      // 0: back=stripe_a, 1: back=stripe_b
+    frame_loaded: u8,   // 0: first frame still loading, 1: backlight on
 
     // Cache display state
     // row_lookup[d] → cache slot index for display line d.
     // fill_stripe_from_row_cache regenerates any stripe from the active line cache.
-    has_line_cache: u8,  // 0=no cache (test pattern mode), 1=front cache valid
-    active_cache_b: u8,  // 0=display from line_cache, 1=display from line_cache_back
+    has_line_cache: u8, // 0=no cache (test pattern mode), 1=front cache valid
+    active_cache_b: u8, // 0=display from line_cache, 1=display from line_cache_back
 
     // Background loading state (subsequent frames load while DMA runs)
     is_loading: u8,      // 1=currently loading into line_cache_back
@@ -252,8 +251,8 @@ impl St7701sState {
 
 mod params_def {
     use super::St7701sState;
-    use super::{p_u8, p_u16};
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u8};
 
     define_params! {
         St7701sState;
@@ -361,7 +360,7 @@ unsafe fn spi9_cs_set(s: &St7701sState, level: u8) {
 
 // Contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const TIMER_CONTRACT:    u32 = 0x0006;
+const TIMER_CONTRACT: u32 = 0x0006;
 
 unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
@@ -458,14 +457,20 @@ unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
     (sys.provider_open)(PLATFORM_DMA_FD, dma_fd::CREATE, core::ptr::null(), 0)
 }
 
-unsafe fn dma_fd_start(sys: &SyscallTable, fd: i32, read_addr: u32, write_addr: u32, count: u32, dreq: u8, flags: u8) -> i32 {
+unsafe fn dma_fd_start(
+    sys: &SyscallTable,
+    fd: i32,
+    read_addr: u32,
+    write_addr: u32,
+    count: u32,
+    dreq: u8,
+    flags: u8,
+) -> i32 {
     let ra = read_addr.to_le_bytes();
     let wa = write_addr.to_le_bytes();
     let cnt = count.to_le_bytes();
     let mut arg = [
-        ra[0], ra[1], ra[2], ra[3],
-        wa[0], wa[1], wa[2], wa[3],
-        cnt[0], cnt[1], cnt[2], cnt[3],
+        ra[0], ra[1], ra[2], ra[3], wa[0], wa[1], wa[2], wa[3], cnt[0], cnt[1], cnt[2], cnt[3],
         dreq, flags,
     ];
     (sys.provider_call)(fd, dma_fd::START, arg.as_mut_ptr(), 14)
@@ -474,10 +479,7 @@ unsafe fn dma_fd_start(sys: &SyscallTable, fd: i32, read_addr: u32, write_addr: 
 unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, read_addr: u32, count: u32) -> i32 {
     let ra = read_addr.to_le_bytes();
     let cnt = count.to_le_bytes();
-    let mut arg = [
-        ra[0], ra[1], ra[2], ra[3],
-        cnt[0], cnt[1], cnt[2], cnt[3],
-    ];
+    let mut arg = [ra[0], ra[1], ra[2], ra[3], cnt[0], cnt[1], cnt[2], cnt[3]];
     (sys.provider_call)(fd, dma_fd::QUEUE, arg.as_mut_ptr(), 8)
 }
 
@@ -503,7 +505,9 @@ fn relocate_instr(instr: u16, origin: u8) -> u16 {
 unsafe fn load_program(sys: &SyscallTable, pio: u8, program: &[u16], mask_out: &mut u32) -> i32 {
     let len = program.len();
     let origin = pio_instr_alloc(sys, pio, len as u8, mask_out);
-    if origin < 0 { return origin; }
+    if origin < 0 {
+        return origin;
+    }
     let base = origin as u8;
     let mut i = 0usize;
     while i < len {
@@ -531,16 +535,23 @@ fn build_execctrl(wrap_bottom: u8, wrap_top: u8, side_en: bool, side_pindir: boo
     let mut val: u32 = 0;
     val |= (wrap_bottom as u32 & 0x1F) << 7;
     val |= (wrap_top as u32 & 0x1F) << 12;
-    if side_en { val |= 1 << 30; }
-    if side_pindir { val |= 1 << 29; }
+    if side_en {
+        val |= 1 << 30;
+    }
+    if side_pindir {
+        val |= 1 << 29;
+    }
     val
 }
 
 /// Build PINCTRL register value.
 fn build_pinctrl(
-    out_base: u8, out_count: u8,
-    set_base: u8, set_count: u8,
-    sideset_base: u8, sideset_count: u8,
+    out_base: u8,
+    out_count: u8,
+    set_base: u8,
+    set_count: u8,
+    sideset_base: u8,
+    sideset_count: u8,
     in_base: u8,
 ) -> u32 {
     // PINCTRL layout:
@@ -564,10 +575,14 @@ fn build_pinctrl(
 
 /// Build SHIFTCTRL register value.
 fn build_shiftctrl(
-    autopull: bool, autopush: bool,
-    pull_thresh: u8, push_thresh: u8,
-    out_shiftdir: bool, in_shiftdir: bool,
-    fjoin_tx: bool, fjoin_rx: bool,
+    autopull: bool,
+    autopush: bool,
+    pull_thresh: u8,
+    push_thresh: u8,
+    out_shiftdir: bool,
+    in_shiftdir: bool,
+    fjoin_tx: bool,
+    fjoin_rx: bool,
 ) -> u32 {
     // SHIFTCTRL layout:
     // [15:0]  _reserved
@@ -580,14 +595,26 @@ fn build_shiftctrl(
     // [30]    FJOIN_TX
     // [31]    FJOIN_RX
     let mut val: u32 = 0;
-    if autopush { val |= 1 << 16; }
-    if autopull { val |= 1 << 17; }
-    if in_shiftdir { val |= 1 << 18; }
-    if out_shiftdir { val |= 1 << 19; }
+    if autopush {
+        val |= 1 << 16;
+    }
+    if autopull {
+        val |= 1 << 17;
+    }
+    if in_shiftdir {
+        val |= 1 << 18;
+    }
+    if out_shiftdir {
+        val |= 1 << 19;
+    }
     val |= ((push_thresh as u32) & 0x1F) << 20;
     val |= ((pull_thresh as u32) & 0x1F) << 25;
-    if fjoin_tx { val |= 1 << 30; }
-    if fjoin_rx { val |= 1 << 31; }
+    if fjoin_tx {
+        val |= 1 << 30;
+    }
+    if fjoin_rx {
+        val |= 1 << 31;
+    }
     val
 }
 
@@ -600,8 +627,7 @@ fn build_shiftctrl(
 /// creating a diagonal colour pattern across the display.
 unsafe fn fill_vertical_stripes(buf: *mut u32, width: u16, stripe_idx: u8) {
     const COLORS: [u16; 8] = [
-        0xF800, 0x07E0, 0x001F, 0x07FF,
-        0xF81F, 0xFFE0, 0x0000, 0xFFFF,
+        0xF800, 0x07E0, 0x001F, 0x07FF, 0xF81F, 0xFFE0, 0x0000, 0xFFFF,
     ];
     let rot = (stripe_idx as usize) & 7;
     let words_per_line = (width >> 1) as usize;
@@ -672,7 +698,8 @@ unsafe fn fill_stripe_from_row_cache(
     let stripe_lines = STRIPE_LINES as usize;
     let mut d = 0usize;
     while d < stripe_lines {
-        let src_row = core::ptr::read_volatile(row_lookup.add(base_line + stripe_lines - 1 - d)) as usize;
+        let src_row =
+            core::ptr::read_volatile(row_lookup.add(base_line + stripe_lines - 1 - d)) as usize;
         let cache_src = line_cache.add(src_row * line_words);
         let dst = buf.add(d * line_words);
         let mut w = 0usize;
@@ -733,7 +760,7 @@ pub extern "C" fn module_new(
         s.stripe_count = match s.height {
             240 => 4,
             360 => 6,
-            _   => 8, // 480 and any other value
+            _ => 8, // 480 and any other value
         };
         // Build row_lookup: maps each display line to its source cache slot.
         // Must be called after params so src_rows and height are final.
@@ -761,12 +788,16 @@ pub extern "C" fn module_new(
         let sys = &*s.syscalls;
 
         s.timer_fd = (sys.provider_open)(TIMER_CONTRACT, 0x0604, core::ptr::null_mut(), 0);
-        if s.timer_fd < 0 { return -12; }
+        if s.timer_fd < 0 {
+            return -12;
+        }
 
         // BL pin still needs GPIO claim (stays as SIO output after SPI init)
         s.bl_handle = claim_gpio_output(sys, s.bl_pin);
-        if s.bl_handle < 0 { return s.bl_handle; }
-        gpio_set(sys, s.bl_handle, 1);  // BL off (active-low)
+        if s.bl_handle < 0 {
+            return s.bl_handle;
+        }
+        gpio_set(sys, s.bl_handle, 1); // BL off (active-low)
 
         // Kernel-level reset: configures SIO pins + RST high→low→high (~240ms blocking)
         spi9_reset(s);
@@ -782,7 +813,7 @@ pub extern "C" fn module_new(
         // SDIR: source scan direction (panel-dependent, configurable via mirror_x param)
         if s.mirror_x != 0 {
             spi9_send(s, 0xFF, &[0x77, 0x01, 0x00, 0x00, 0x10]); // CMD2 Bank 0
-            spi9_send(s, 0xC7, &[0x04]);                          // SDIR: mirror source
+            spi9_send(s, 0xC7, &[0x04]); // SDIR: mirror source
             spi9_send(s, 0xFF, &[0x77, 0x01, 0x00, 0x00, 0x00]); // back to CMD1
         }
 
@@ -803,7 +834,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     match s.phase {
         Phase::InitSeq => {
             // SLEEP_OUT timer (set in module_new after SPI init)
-            if !unsafe { timer_expired(sys, s.timer_fd) } { return 0; }
+            if !unsafe { timer_expired(sys, s.timer_fd) } {
+                return 0;
+            }
             unsafe {
                 // Raise CS from SLEEP_OUT hold, then send DISPLAY_ON with CS hold
                 spi9_cs_set(s, 1);
@@ -817,9 +850,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         Phase::SleepOut => {
             // DISPLAY_ON timer
-            if !unsafe { timer_expired(sys, s.timer_fd) } { return 0; }
+            if !unsafe { timer_expired(sys, s.timer_fd) } {
+                return 0;
+            }
             unsafe {
-                spi9_cs_set(s, 1);  // Raise CS from DISPLAY_ON hold
+                spi9_cs_set(s, 1); // Raise CS from DISPLAY_ON hold
                 dev_log(sys, 3, b"[lcd] display on".as_ptr(), 16);
             }
             s.phase = Phase::AllocDmaFd;
@@ -835,7 +870,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         Phase::AllocDmaFd => {
             let fd = unsafe { dma_fd_create(sys) };
             if fd < 0 {
-                unsafe { dev_log(sys, 1, b"[lcd] DMA FD alloc fail".as_ptr(), 23); }
+                unsafe {
+                    dev_log(sys, 1, b"[lcd] DMA FD alloc fail".as_ptr(), 23);
+                }
                 s.phase = Phase::Error;
                 return fd;
             }
@@ -861,7 +898,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 pio_sm_enable(sys, pio, 0x0F, 0);
 
                 // Load hsync program → SM0
-                let origin = load_program(sys, pio, &pio_programs::HSYNC_PROGRAM, &mut s.sync_hsync_mask);
+                let origin = load_program(
+                    sys,
+                    pio,
+                    &pio_programs::HSYNC_PROGRAM,
+                    &mut s.sync_hsync_mask,
+                );
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] hsync load fail".as_ptr(), 21);
                     s.phase = Phase::Error;
@@ -870,7 +912,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.hsync_origin = origin as u8;
 
                 // Load vsync program → SM1
-                let origin = load_program(sys, pio, &pio_programs::VSYNC_PROGRAM, &mut s.sync_vsync_mask);
+                let origin = load_program(
+                    sys,
+                    pio,
+                    &pio_programs::VSYNC_PROGRAM,
+                    &mut s.sync_vsync_mask,
+                );
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] vsync load fail".as_ptr(), 21);
                     s.phase = Phase::Error;
@@ -881,66 +928,126 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Configure SM0 (hsync): sideset 2 opt (PCLK+HSYNC)
                 let h_wrap_bot = s.hsync_origin + pio_programs::HSYNC_WRAP_TARGET;
                 let h_wrap_top = s.hsync_origin + pio_programs::HSYNC_WRAP;
-                pio_sm_write_reg(sys, pio, 0, REG_EXECCTRL,
-                    build_execctrl(h_wrap_bot, h_wrap_top, pio_programs::HSYNC_SIDESET_OPT, false));
-                pio_sm_write_reg(sys, pio, 0, REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_hsync, 3, 0));
-                    // sideset_count=3 for 2-bit opt sideset (2 value + 1 enable)
-                    // sideset_base = hsync pin (PIO-relative), pclk = hsync+1
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_EXECCTRL,
+                    build_execctrl(
+                        h_wrap_bot,
+                        h_wrap_top,
+                        pio_programs::HSYNC_SIDESET_OPT,
+                        false,
+                    ),
+                );
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, 0, 0, pio_hsync, 3, 0),
+                );
+                // sideset_count=3 for 2-bit opt sideset (2 value + 1 enable)
+                // sideset_base = hsync pin (PIO-relative), pclk = hsync+1
 
                 // HSYNC SM clock divider: sys_clk / (pclk_freq * 2)
                 // 240MHz / (16MHz * 2) = 7.5 → Q16.16 = 0x0007_8000
                 let hsync_clkdiv: u32 = 0x0007_8000;
 
                 pio_sm_write_reg(sys, pio, 0, REG_CLKDIV, hsync_clkdiv);
-                pio_sm_write_reg(sys, pio, 0, REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false));
-                    // fjoin_tx=true for 8-deep TX FIFO
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_SHIFTCTRL,
+                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                );
+                // fjoin_tx=true for 8-deep TX FIFO
 
                 // Configure SM1 (vsync): sideset 1 opt (VSYNC)
                 let v_wrap_bot = s.vsync_origin + pio_programs::VSYNC_WRAP_TARGET;
                 let v_wrap_top = s.vsync_origin + pio_programs::VSYNC_WRAP;
-                pio_sm_write_reg(sys, pio, 1, REG_EXECCTRL,
-                    build_execctrl(v_wrap_bot, v_wrap_top, pio_programs::VSYNC_SIDESET_OPT, false));
-                pio_sm_write_reg(sys, pio, 1, REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_vsync, 2, 0));
-                    // sideset_count=2 for 1-bit opt sideset (1 value + 1 enable)
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_EXECCTRL,
+                    build_execctrl(
+                        v_wrap_bot,
+                        v_wrap_top,
+                        pio_programs::VSYNC_SIDESET_OPT,
+                        false,
+                    ),
+                );
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, 0, 0, pio_vsync, 2, 0),
+                );
+                // sideset_count=2 for 1-bit opt sideset (1 value + 1 enable)
                 // VSYNC SM runs at full sysclk (div 1.0)
                 pio_sm_write_reg(sys, pio, 1, REG_CLKDIV, 1 << 16);
-                pio_sm_write_reg(sys, pio, 1, REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false));
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_SHIFTCTRL,
+                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                );
 
                 // Setup pin funcsel for PIO
-                pio_pin_setup(sys, s.hsync_pin, pio, 0);  // pull=none
+                pio_pin_setup(sys, s.hsync_pin, pio, 0); // pull=none
                 pio_pin_setup(sys, s.pclk_pin, pio, 0);
                 pio_pin_setup(sys, s.vsync_pin, pio, 0);
 
                 // Set sideset pins as outputs via SET PINDIRS
                 // HSYNC SM0: 2 sideset pins (hsync, pclk)
                 let _set_pindirs_2 = 0xE082u16; // set pindirs, 2 (binary: 00010)...
-                // Actually: set pindirs, 0b11 = set pindirs, 3 — but set only has 5 bits for data.
-                // We need SET PINDIRS, with count matching sideset_count-1 pins.
-                // Better approach: temporarily set SET_BASE and SET_COUNT to the sideset pins.
-                // Then execute SET PINDIRS, <mask>.
-                // For hsync SM: sideset pins are hsync_pin and hsync_pin+1 (pclk).
-                // set_base = pio_hsync, set_count = 2, then SET PINDIRS, 0b11 (=3)
-                // First save and restore pinctrl.
-                pio_sm_write_reg(sys, pio, 0, REG_PINCTRL,
-                    build_pinctrl(0, 0, pio_hsync, 2, pio_hsync, 3, 0));
+                                                // Actually: set pindirs, 0b11 = set pindirs, 3 — but set only has 5 bits for data.
+                                                // We need SET PINDIRS, with count matching sideset_count-1 pins.
+                                                // Better approach: temporarily set SET_BASE and SET_COUNT to the sideset pins.
+                                                // Then execute SET PINDIRS, <mask>.
+                                                // For hsync SM: sideset pins are hsync_pin and hsync_pin+1 (pclk).
+                                                // set_base = pio_hsync, set_count = 2, then SET PINDIRS, 0b11 (=3)
+                                                // First save and restore pinctrl.
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, pio_hsync, 2, pio_hsync, 3, 0),
+                );
                 pio_sm_exec(sys, pio, 0, 0xE083); // set pindirs, 3 (both bits = output)
 
                 // Restore SM0 pinctrl for normal operation
-                pio_sm_write_reg(sys, pio, 0, REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_hsync, 3, 0));
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, 0, 0, pio_hsync, 3, 0),
+                );
 
                 // VSYNC SM1: 1 sideset pin
-                pio_sm_write_reg(sys, pio, 1, REG_PINCTRL,
-                    build_pinctrl(0, 0, pio_vsync, 1, pio_vsync, 2, 0));
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, pio_vsync, 1, pio_vsync, 2, 0),
+                );
                 pio_sm_exec(sys, pio, 1, 0xE081); // set pindirs, 1
 
                 // Restore SM1 pinctrl
-                pio_sm_write_reg(sys, pio, 1, REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_vsync, 2, 0));
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, 0, 0, pio_vsync, 2, 0),
+                );
 
                 // Push initial values to TX FIFOs
                 // HSYNC SM0 gets width-1 (stored in Y via bootstrap)
@@ -971,7 +1078,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 pio_sm_enable(sys, pio, 0x0F, 0);
 
                 // Load rgb_de program → SM0
-                let origin = load_program(sys, pio, &pio_programs::RGB_DE_PROGRAM, &mut s.data_de_mask);
+                let origin =
+                    load_program(sys, pio, &pio_programs::RGB_DE_PROGRAM, &mut s.data_de_mask);
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] rgb_de load fail".as_ptr(), 22);
                     s.phase = Phase::Error;
@@ -980,7 +1088,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.de_origin = origin as u8;
 
                 // Load rgb program → SM1
-                let origin = load_program(sys, pio, &pio_programs::RGB_PROGRAM, &mut s.data_rgb_mask);
+                let origin =
+                    load_program(sys, pio, &pio_programs::RGB_PROGRAM, &mut s.data_rgb_mask);
                 if origin < 0 {
                     dev_log(sys, 1, b"[lcd] rgb load fail".as_ptr(), 19);
                     s.phase = Phase::Error;
@@ -991,27 +1100,62 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Configure SM0 (rgb_de): sideset 1 opt (DE)
                 let de_wrap_bot = s.de_origin + pio_programs::RGB_DE_WRAP_TARGET;
                 let de_wrap_top = s.de_origin + pio_programs::RGB_DE_WRAP;
-                pio_sm_write_reg(sys, pio, 0, REG_EXECCTRL,
-                    build_execctrl(de_wrap_bot, de_wrap_top, pio_programs::RGB_DE_SIDESET_OPT, false));
-                pio_sm_write_reg(sys, pio, 0, REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_de, 2, 0));
-                    // sideset_count=2 for 1-bit opt (1 value + 1 enable), in_base=0 (wait pin N = PIO pin N)
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_EXECCTRL,
+                    build_execctrl(
+                        de_wrap_bot,
+                        de_wrap_top,
+                        pio_programs::RGB_DE_SIDESET_OPT,
+                        false,
+                    ),
+                );
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, 0, 0, pio_de, 2, 0),
+                );
+                // sideset_count=2 for 1-bit opt (1 value + 1 enable), in_base=0 (wait pin N = PIO pin N)
                 pio_sm_write_reg(sys, pio, 0, REG_CLKDIV, 1 << 16); // full speed
-                pio_sm_write_reg(sys, pio, 0, REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false));
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_SHIFTCTRL,
+                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                );
 
                 // Configure SM1 (rgb): no sideset, OUT 16 pins
                 let rgb_wrap_bot = s.rgb_origin + pio_programs::RGB_WRAP_TARGET;
                 let rgb_wrap_top = s.rgb_origin + pio_programs::RGB_WRAP;
-                pio_sm_write_reg(sys, pio, 1, REG_EXECCTRL,
-                    build_execctrl(rgb_wrap_bot, rgb_wrap_top, false, false));
-                pio_sm_write_reg(sys, pio, 1, REG_PINCTRL,
-                    build_pinctrl(pio_data0, 16, 0, 0, 0, 0, 0));
-                    // out_base=data0, out_count=16, in_base=0 (wait pin N = PIO pin N)
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_EXECCTRL,
+                    build_execctrl(rgb_wrap_bot, rgb_wrap_top, false, false),
+                );
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_PINCTRL,
+                    build_pinctrl(pio_data0, 16, 0, 0, 0, 0, 0),
+                );
+                // out_base=data0, out_count=16, in_base=0 (wait pin N = PIO pin N)
                 pio_sm_write_reg(sys, pio, 1, REG_CLKDIV, 1 << 16); // full speed
-                pio_sm_write_reg(sys, pio, 1, REG_SHIFTCTRL,
-                    build_shiftctrl(false, false, 0, 0, false, false, true, false));
-                    // autopull=false, pull_thresh=0(default), out_shiftdir=LEFT/MSB(vendor default), fjoin_tx=true
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_SHIFTCTRL,
+                    build_shiftctrl(false, false, 0, 0, false, false, true, false),
+                );
+                // autopull=false, pull_thresh=0(default), out_shiftdir=LEFT/MSB(vendor default), fjoin_tx=true
 
                 // Setup data pins for PIO
                 let mut i = 0u8;
@@ -1029,24 +1173,44 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 while remaining > 0 {
                     let count = if remaining > 5 { 5 } else { remaining };
                     let mask = (1u8 << count) - 1;
-                    pio_sm_write_reg(sys, pio, 1, REG_PINCTRL,
-                        build_pinctrl(pio_data0, 16, pin, count, 0, 0, pio_de));
+                    pio_sm_write_reg(
+                        sys,
+                        pio,
+                        1,
+                        REG_PINCTRL,
+                        build_pinctrl(pio_data0, 16, pin, count, 0, 0, pio_de),
+                    );
                     pio_sm_exec(sys, pio, 1, 0xE080 | mask as u16); // set pindirs, mask
                     pin += count;
                     remaining -= count;
                 }
 
                 // Set DE pin as output via SM0
-                pio_sm_write_reg(sys, pio, 0, REG_PINCTRL,
-                    build_pinctrl(0, 0, pio_de, 1, pio_de, 2, pio_de));
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, pio_de, 1, pio_de, 2, pio_de),
+                );
                 pio_sm_exec(sys, pio, 0, 0xE081); // set pindirs, 1
 
                 // Restore pinctrl for both SMs
                 // in_base=0 so `wait N pin M` maps directly to PIO-relative pin M
-                pio_sm_write_reg(sys, pio, 0, REG_PINCTRL,
-                    build_pinctrl(0, 0, 0, 0, pio_de, 2, 0));
-                pio_sm_write_reg(sys, pio, 1, REG_PINCTRL,
-                    build_pinctrl(pio_data0, 16, 0, 0, 0, 0, 0));
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    0,
+                    REG_PINCTRL,
+                    build_pinctrl(0, 0, 0, 0, pio_de, 2, 0),
+                );
+                pio_sm_write_reg(
+                    sys,
+                    pio,
+                    1,
+                    REG_PINCTRL,
+                    build_pinctrl(pio_data0, 16, 0, 0, 0, 0, 0),
+                );
 
                 // Push initial values
                 // rgb_de SM0 gets height-1
@@ -1078,7 +1242,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.active_cache_b = 0;
                 s.is_loading = 0;
                 s.back_ready = 0;
-                unsafe { dev_log(sys, 3, b"[lcd] loading from channel".as_ptr(), 26); }
+                unsafe {
+                    dev_log(sys, 3, b"[lcd] loading from channel".as_ptr(), 26);
+                }
                 s.phase = Phase::Loading;
                 return 2;
             }
@@ -1108,19 +1274,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let dreq = (s.pio_data * 8) + 1;
 
             let rc = unsafe {
-                dma_fd_start(sys, s.dma_fd, s.stripe_a.as_ptr() as u32, write_addr, s.stripe_pixels, dreq, 0x01)
+                dma_fd_start(
+                    sys,
+                    s.dma_fd,
+                    s.stripe_a.as_ptr() as u32,
+                    write_addr,
+                    s.stripe_pixels,
+                    dreq,
+                    0x01,
+                )
             };
             if rc < 0 {
-                unsafe { dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20); }
+                unsafe {
+                    dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
+                }
                 s.phase = Phase::Error;
                 return rc;
             }
 
-            let rc = unsafe {
-                dma_fd_queue(sys, s.dma_fd, s.stripe_b.as_ptr() as u32, s.stripe_pixels)
-            };
+            let rc =
+                unsafe { dma_fd_queue(sys, s.dma_fd, s.stripe_b.as_ptr() as u32, s.stripe_pixels) };
             if rc < 0 {
-                unsafe { dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20); }
+                unsafe {
+                    dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
+                }
                 s.phase = Phase::Error;
                 return rc;
             }
@@ -1173,8 +1350,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Populate stripe_a (stripe sc-1) and stripe_b (stripe sc-2) from cache.
             // DMA sends them first; descending order means sc-1 → 0, so stripe 0 is last = top.
             unsafe {
-                fill_stripe_from_row_cache(s.stripe_a.as_mut_ptr(), s.row_lookup.as_ptr(), s.line_cache.as_ptr(), sc - 1, lw);
-                fill_stripe_from_row_cache(s.stripe_b.as_mut_ptr(), s.row_lookup.as_ptr(), s.line_cache.as_ptr(), sc - 2, lw);
+                fill_stripe_from_row_cache(
+                    s.stripe_a.as_mut_ptr(),
+                    s.row_lookup.as_ptr(),
+                    s.line_cache.as_ptr(),
+                    sc - 1,
+                    lw,
+                );
+                fill_stripe_from_row_cache(
+                    s.stripe_b.as_mut_ptr(),
+                    s.row_lookup.as_ptr(),
+                    s.line_cache.as_ptr(),
+                    sc - 2,
+                    lw,
+                );
             }
 
             // Start all 4 PIO SMs with bootstrap values pushed into TX FIFOs.
@@ -1185,12 +1374,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 pio_sm_restart(sys, s.pio_sync, 0x03);
 
                 pio_txf_write(sys, s.pio_data, 0, (s.height - 1) as u32);
-                pio_txf_write(sys, s.pio_data, 1, (s.width  - 1) as u32);
-                pio_txf_write(sys, s.pio_sync, 0, (s.width  - 1) as u32);
+                pio_txf_write(sys, s.pio_data, 1, (s.width - 1) as u32);
+                pio_txf_write(sys, s.pio_sync, 0, (s.width - 1) as u32);
                 pio_txf_write(sys, s.pio_sync, 1, (s.height - 1) as u32);
 
-                pio_sm_exec(sys, s.pio_data, 0, s.de_origin    as u16);
-                pio_sm_exec(sys, s.pio_data, 1, s.rgb_origin   as u16);
+                pio_sm_exec(sys, s.pio_data, 0, s.de_origin as u16);
+                pio_sm_exec(sys, s.pio_data, 1, s.rgb_origin as u16);
                 pio_sm_exec(sys, s.pio_sync, 0, s.hsync_origin as u16);
                 pio_sm_exec(sys, s.pio_sync, 1, s.vsync_origin as u16);
 
@@ -1203,29 +1392,44 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let dreq = (s.pio_data * 8) + 1;
 
             let rc = unsafe {
-                dma_fd_start(sys, s.dma_fd, s.stripe_a.as_ptr() as u32, write_addr, s.stripe_pixels, dreq, 0x01)
+                dma_fd_start(
+                    sys,
+                    s.dma_fd,
+                    s.stripe_a.as_ptr() as u32,
+                    write_addr,
+                    s.stripe_pixels,
+                    dreq,
+                    0x01,
+                )
             };
             if rc < 0 {
-                unsafe { dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20); }
+                unsafe {
+                    dev_log(sys, 1, b"[lcd] DMA start fail".as_ptr(), 20);
+                }
                 s.phase = Phase::Error;
                 return rc;
             }
-            let rc = unsafe {
-                dma_fd_queue(sys, s.dma_fd, s.stripe_b.as_ptr() as u32, s.stripe_pixels)
-            };
+            let rc =
+                unsafe { dma_fd_queue(sys, s.dma_fd, s.stripe_b.as_ptr() as u32, s.stripe_pixels) };
             if rc < 0 {
-                unsafe { dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20); }
+                unsafe {
+                    dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
+                }
                 s.phase = Phase::Error;
                 return rc;
             }
 
             if s.frame_loaded == 0 {
                 s.frame_loaded = 1;
-                unsafe { gpio_set(sys, s.bl_handle, 0); }
+                unsafe {
+                    gpio_set(sys, s.bl_handle, 0);
+                }
             }
             s.current_stripe = sc - 3; // sc-1 and sc-2 already queued; next fill is sc-3
             s.back_is_b = 0;
-            unsafe { dev_log(sys, 3, b"[lcd] cached, go".as_ptr(), 16); }
+            unsafe {
+                dev_log(sys, 3, b"[lcd] cached, go".as_ptr(), 16);
+            }
             s.phase = Phase::DmaWait;
             0
         }
@@ -1255,16 +1459,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 };
 
                 if s.has_line_cache != 0 {
-                    unsafe { fill_stripe_from_row_cache(s.back_buf_ptr(), s.row_lookup.as_ptr(), cache_ptr, s.current_stripe, lw); }
+                    unsafe {
+                        fill_stripe_from_row_cache(
+                            s.back_buf_ptr(),
+                            s.row_lookup.as_ptr(),
+                            cache_ptr,
+                            s.current_stripe,
+                            lw,
+                        );
+                    }
                 } else {
-                    unsafe { fill_vertical_stripes(s.back_buf_ptr(), s.width, s.current_stripe); }
+                    unsafe {
+                        fill_vertical_stripes(s.back_buf_ptr(), s.width, s.current_stripe);
+                    }
                 }
 
                 let rc = unsafe {
                     dma_fd_queue(sys, s.dma_fd, s.back_buf_ptr() as u32, s.stripe_pixels)
                 };
                 if rc < 0 {
-                    unsafe { dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20); }
+                    unsafe {
+                        dev_log(sys, 1, b"[lcd] DMA queue fail".as_ptr(), 20);
+                    }
                     s.phase = Phase::Error;
                     return rc;
                 }
@@ -1304,13 +1520,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                 // Drain as much channel data as available into the back cache.
                 loop {
-                    if (s.load_row as usize) >= src_rows { break; }
+                    if (s.load_row as usize) >= src_rows {
+                        break;
+                    }
                     let chan_poll = unsafe { (sys.channel_poll)(s.in_chan, POLL_IN) };
-                    if chan_poll & (POLL_IN as i32) == 0 { break; }
+                    if chan_poll & (POLL_IN as i32) == 0 {
+                        break;
+                    }
                     let remaining = lb - s.load_row_off as usize;
                     let dst = unsafe { dst_base.add(s.load_cache_off as usize) };
                     let read = unsafe { (sys.channel_read)(s.in_chan, dst, remaining) };
-                    if read <= 0 { break; }
+                    if read <= 0 {
+                        break;
+                    }
                     let r = read as u16;
                     s.load_row_off += r;
                     s.load_cache_off += r as u32;

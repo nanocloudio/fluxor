@@ -2378,7 +2378,14 @@ unsafe fn handle_abort(s: &mut TlsState, p: &[u8]) {
         if s.shadows[sh].epoch != epoch {
             // A delayed abort from a superseded epoch must not tear down
             // the standby a later pairing armed.
-            cont_reply(s, flow, epoch, sc::CR_ABORTED, sc::STATUS_STALE_EPOCH, &[reason]);
+            cont_reply(
+                s,
+                flow,
+                epoch,
+                sc::CR_ABORTED,
+                sc::STATUS_STALE_EPOCH,
+                &[reason],
+            );
             return;
         }
         s.shadows[sh].release();
@@ -3121,8 +3128,7 @@ unsafe fn continuity_step(s: &mut TlsState) -> bool {
             // Two promises are counted on the same budget: a horizon the
             // standby has not answered, and an abort the coordinator has
             // not taken.
-            let waiting =
-                (c.mirror && c.strict() && c.horizon_outstanding()) || c.abandon_pending;
+            let waiting = (c.mirror && c.strict() && c.horizon_outstanding()) || c.abandon_pending;
             if waiting {
                 c.horizon_steps = c.horizon_steps.saturating_add(1);
             } else {

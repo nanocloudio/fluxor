@@ -1,12 +1,17 @@
-//! Dev-facing bundle source (rfc_system_services.md §10).
+//! Dev-facing bundle source.
 //!
 //! A thin TOML source manifest — non-derivable fields only — from which
-//! `fluxor build <app.fluxor.toml>` emits the EXISTING committed-bundle
-//! format the agent consumes (`workload.json` + `resources.json` +
-//! `graph.yaml`), plus the per-target `config.bin`/`modules.bin` the run
-//! path consumes (§10.3: `build_one` builds them anyway). No new format,
-//! no new command, no merge semantic: the manifest REFERENCES whole
-//! per-target graph files (§10.1).
+//! `fluxor build <app.fluxor.toml>` emits the committed-bundle format the
+//! agent consumes (`workload.json` + `resources.json` + `graph.yaml`),
+//! plus the per-target `config.bin`/`modules.bin` the run path consumes.
+//! Those blobs are not an extra step: emitting a bundle calls the same
+//! `build_one` a plain `fluxor build <graph>` calls, so a bundle's blobs
+//! are byte-for-byte what building the graph directly produces.
+//!
+//! Bundle-layout rule: the source manifest REFERENCES a whole per-target
+//! graph file, one per implementation. It never merges, patches or
+//! synthesises graph fragments — a target's graph is exactly the file
+//! checked in for it, so what shipped can be read as-is.
 //!
 //! Layout emitted under `target/fluxor/<name>/`:
 //!
@@ -18,8 +23,11 @@
 //! ```
 //!
 //! `workload.json` is duplicated into each target dir so that dir is
-//! directly consumable by `fluxor agent commit --bundle` (which expects the
-//! flat triple; the agent path is unchanged, §10.4).
+//! directly consumable by `fluxor agent commit --bundle`, which expects the
+//! flat triple in one directory. Artifact discipline: the emitter and the
+//! agent are different consumers of one trust model — the bundle pins each
+//! artifact by sha256 in `workload.json`, and every consumer re-hashes the
+//! files it reads and refuses a mismatch.
 //!
 //! `linux`-family targets are emitted; other implementations are listed but
 //! skipped with a notice.
@@ -39,10 +47,11 @@ use fluxor_tools::workload::{
 // Source manifest (TOML)
 // ============================================================================
 
-/// `[workload]` — identity + role (§10.2): `service` implementations carry the
+/// `[workload]` — identity + role. `service` implementations carry the
 /// health/update contract and the lease/drain machinery; `cli` carries the
-/// stdio/exit surface (rfc_cli_execution.md). Named `role`, not `kind` — `kind`
-/// means `scenario`.
+/// stdio/exit surface (argv after `--`, stdout/stderr, exit code). The field
+/// is named `role`, not `kind`, because `kind` already means "scenario"
+/// everywhere else in fluxor; `role` accepts only `service` or `cli`.
 #[derive(Debug, Deserialize)]
 struct WorkloadTable {
     name: String,
@@ -55,8 +64,8 @@ fn default_role() -> String {
     "service".to_string()
 }
 
-/// `[[implementation]]` — one existing per-target graph file, referenced,
-/// never merged (§10.1).
+/// `[[implementation]]` — one per-target graph file, referenced whole and
+/// never merged with anything.
 #[derive(Debug, Deserialize)]
 struct ImplementationTable {
     target: String,
@@ -251,8 +260,9 @@ pub fn emit_bundle(manifest_path: &Path, verbose: bool) -> Result<PathBuf> {
             serde_json::to_vec_pretty(&resources).map_err(|e| Error::Config(e.to_string()))?;
         std::fs::write(target_dir.join("resources.json"), &resources_bytes)?;
 
-        // Per-target blobs: the run path's artifacts, built exactly as
-        // `fluxor build <graph>` would (§10.3 — it builds them anyway).
+        // Per-target blobs: the run path's artifacts, built by the same
+        // `build_one` a plain `fluxor build <graph>` calls, so a bundle's
+        // blobs are identical to building the graph on its own.
         crate::build_one(&graph_path, Some(&target_dir.join("config.bin")), verbose)?;
 
         // Module refs pin the REAL built artifacts: read each .fmod from
@@ -393,7 +403,7 @@ pub fn emit_bundle(manifest_path: &Path, verbose: bool) -> Result<PathBuf> {
     std::fs::create_dir_all(&bundle_root)?;
     std::fs::write(bundle_root.join("workload.json"), &manifest_bytes)?;
     // Duplicate into each target dir: the agent consumes a FLAT triple
-    // (workload.json beside graph.yaml + resources.json), unchanged (§10.4).
+    // (workload.json beside graph.yaml + resources.json) from one directory.
     for (_, dir) in &emitted_targets {
         std::fs::write(dir.join("workload.json"), &manifest_bytes)?;
     }
@@ -439,7 +449,7 @@ pub fn is_source_manifest(path: &Path) -> bool {
             .is_some_and(|v| v.get("workload").is_some_and(toml::Value::is_table))
 }
 
-/// `fluxor run <bundle>` (rfc_system_services.md §10.4): resolve a target
+/// `fluxor run <bundle>`: resolve a target
 /// from `workload.json` with the SAME resolver the agent uses
 /// (`select_implementation`), verify the pinned artifacts, and exec the
 /// implementation's built blobs. Accepts a source manifest (emits first —
@@ -449,8 +459,9 @@ pub fn run_bundle(path: &Path, verbose: bool) -> Result<()> {
 }
 
 /// `run_bundle` with app argv appended after `--` — the `fluxor exec` data
-/// path (rfc_cli_execution.md §5.1): the runtime's own parser stops at `--`
-/// and the `cli_in` built-in reads the tail from the process argv.
+/// path. The runtime's own option parser stops at the first `--`, so
+/// everything after it belongs to the program: the `cli_in` built-in reads
+/// that tail straight from the process argv.
 pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> Result<()> {
     launch_bundle(path, app_args, None, None, verbose)
 }
@@ -461,9 +472,10 @@ pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> 
 const RUNTIME_RELATIVE: &str = "target/aarch64-unknown-linux-gnu/release/fluxor-linux";
 
 /// Launch a bundle's linux implementation. `runtime` names the binary to
-/// run, else the project's staged one. `applet` marks an applet run
-/// (rfc_cli_execution.md §5.4): the runtime keeps its own log records out
-/// of the program's stderr and files them under the applet's name.
+/// run, else the project's staged one. `applet` marks an applet run: the
+/// runtime keeps its own log records out of the program's stderr — fd 2 is
+/// the program's alone — and files them under the applet's name instead, so
+/// a CLI bundle's output is only what the program itself wrote.
 fn launch_bundle(
     path: &Path,
     app_args: &[String],
@@ -499,9 +511,9 @@ fn launch_bundle(
         dir.join(&imp.target.family)
     };
 
-    // Same artifact discipline as the agent (§10.4: different consumers, one
-    // trust model): the graph and resources bytes must hash to the digests
-    // the manifest pins.
+    // Same artifact discipline as the agent — different consumers, one trust
+    // model: the graph and resources bytes must hash to the digests the
+    // manifest pins, and a mismatch refuses the run rather than warning.
     for (file, pinned) in [
         ("graph.yaml", &imp.graph.digest),
         ("resources.json", &imp.resources.digest),
@@ -584,18 +596,22 @@ fn launch_bundle(
     // Die-with-parent (see `tie_to_parent`): a killed/timeouted `fluxor exec`
     // must not orphan a runtime that never exits on its own.
     let status = crate::tie_to_parent(&mut cmd).status()?;
-    // A CLI bundle's exit code IS the deliverable (rfc_cli_execution.md §6):
-    // propagate it verbatim rather than wrapping it in a tool error.
+    // A CLI bundle's exit code IS the deliverable: propagate it verbatim
+    // rather than wrapping a non-zero status in a tool error, so a shell
+    // sees what the program returned.
     std::process::exit(status.code().unwrap_or(1));
 }
 
 // ============================================================================
-// Applet registry + exec (rfc_cli_execution.md §5)
+// Applet registry + exec
 // ============================================================================
 
 /// The on-disk applet catalogue: `[applets]` name → absolute bundle path.
-/// Deliberately separate from the `cli` stack — the stack is the harness,
-/// this is the catalogue (§5.2). Same root discipline as the OCI store:
+/// Deliberately separate from the `cli` stack: the stack is the harness a
+/// CLI bundle is built against, the catalogue is the per-user record of
+/// which built bundles are installed under which names. Installing or
+/// removing an applet must never edit a stack. Same root discipline as the
+/// OCI store:
 /// `$FLUXOR_APPLETS` override, else `$XDG_DATA_HOME/fluxor/applets.toml`,
 /// else `~/.local/share/fluxor/applets.toml`.
 fn registry_path() -> PathBuf {
@@ -648,8 +664,7 @@ fn save_registry(reg: &BTreeMap<String, AppletEntry>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut text =
-        String::from("# fluxor applet registry (rfc_cli_execution.md §5.2)\n[applets]\n");
+    let mut text = String::from("# fluxor applet registry: name -> installed bundle\n[applets]\n");
     for (k, v) in reg {
         match &v.runtime {
             Some(runtime) => text.push_str(&format!(
@@ -682,8 +697,8 @@ pub fn install_applet(
     let dir = if bundle.extension().is_some_and(|e| e == "toml") {
         emit_bundle(bundle, verbose)?
     } else if !bundle.exists() {
-        // Not a path: a store reference (P10 — sibling CLIs are
-        // artifacts, not checkouts). Resolve the workload bundle from
+        // Not a path: a store reference — a sibling CLI is consumed as a
+        // published artifact, never as a checkout. Resolve the bundle from
         // the OCI store and materialise it into the applet cache.
         materialize_bundle_from_store(&bundle.to_string_lossy(), verbose)?
     } else {
@@ -736,9 +751,11 @@ pub fn install_applet(
     Ok(())
 }
 
-/// `fluxor exec <name> [-- args…]` (§5.1): registry exact match → project
-/// bundle (`target/fluxor/<name>/`) → error listing known applets. No
-/// compilation on the hot path: the cached bundle execs as-is.
+/// `fluxor exec <name> [-- args…]`. Resolution order, first match wins:
+/// an exact name in the applet registry, then a bundle built in this
+/// project (`target/fluxor/<name>/`), else an error listing the applets
+/// that ARE known. No compilation on the hot path: the cached bundle
+/// execs as-is.
 pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
     let reg = load_registry()?;
     if let Some(entry) = reg.get(name) {
@@ -774,8 +791,8 @@ pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
     )))
 }
 
-/// Where the runtime files an applet's log records (rfc_cli_execution.md
-/// §5.4): `$XDG_STATE_HOME/fluxor/exec/<name>/`, else
+/// Where the runtime files an applet's log records, kept out of the
+/// program's own stderr: `$XDG_STATE_HOME/fluxor/exec/<name>/`, else
 /// `~/.local/state/fluxor/exec/<name>/`. The runtime resolves it the same way.
 fn exec_logs_dir(name: &str) -> PathBuf {
     let base = if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
@@ -897,7 +914,7 @@ fn materialize_bundle_from_store(reference: &str, verbose: bool) -> Result<PathB
         std::fs::write(target_dir.join("workload.json"), &workload_json)?;
         std::fs::write(target_dir.join("graph.yaml"), &graph_yaml)?;
         std::fs::write(target_dir.join("resources.json"), &resources_json)?;
-        // Blobs: same synthesis as `fluxor build <graph>` (§10.3).
+        // Blobs: same synthesis as `fluxor build <graph>`.
         crate::build_one(
             &target_dir.join("graph.yaml"),
             Some(&target_dir.join("config.bin")),
@@ -952,7 +969,8 @@ buffer_bytes = 32768
 
     #[test]
     fn role_is_service_or_cli_and_kind_is_not_accepted() {
-        // `role`, not `kind` (§10.2: `kind` means scenario in fluxor).
+        // `role`, not `kind` — `kind` means scenario in fluxor — and the
+        // only accepted roles are `service` and `cli`.
         let bad = MANIFEST.replace("role = \"service\"", "role = \"daemon\"");
         assert!(parse_source_manifest(&bad).is_err());
         let cli = MANIFEST.replace("role = \"service\"", "role = \"cli\"");

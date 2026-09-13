@@ -111,11 +111,9 @@ pub struct CryptoFrame<'a> {
 /// and the number of bytes consumed (the two varints + the data),
 /// or None on truncation / malformed varints.
 pub fn parse_crypto(body: &[u8]) -> Option<(CryptoFrame<'_>, usize)> {
-    let (offset, off_len) =
-        unsafe { varint_decode(body.as_ptr(), body.len()) }?;
+    let (offset, off_len) = unsafe { varint_decode(body.as_ptr(), body.len()) }?;
     let after_off = &body[off_len..];
-    let (length, len_len) =
-        unsafe { varint_decode(after_off.as_ptr(), after_off.len()) }?;
+    let (length, len_len) = unsafe { varint_decode(after_off.as_ptr(), after_off.len()) }?;
     let length = length as usize;
     let data_off = off_len + len_len;
     if body.len() < data_off + length {
@@ -150,14 +148,12 @@ pub fn parse_stream(type_byte: u8, body: &[u8]) -> Option<(StreamFrame<'_>, usiz
     let has_len = type_byte & STREAM_FLAG_LEN != 0;
     let fin = type_byte & STREAM_FLAG_FIN != 0;
 
-    let (stream_id, sid_len) =
-        unsafe { varint_decode(body.as_ptr(), body.len()) }?;
+    let (stream_id, sid_len) = unsafe { varint_decode(body.as_ptr(), body.len()) }?;
     let mut cursor = sid_len;
 
     let offset = if has_off {
         let after = &body[cursor..];
-        let (v, n) =
-            unsafe { varint_decode(after.as_ptr(), after.len()) }?;
+        let (v, n) = unsafe { varint_decode(after.as_ptr(), after.len()) }?;
         cursor += n;
         v
     } else {
@@ -166,8 +162,7 @@ pub fn parse_stream(type_byte: u8, body: &[u8]) -> Option<(StreamFrame<'_>, usiz
 
     let length = if has_len {
         let after = &body[cursor..];
-        let (v, n) =
-            unsafe { varint_decode(after.as_ptr(), after.len()) }?;
+        let (v, n) = unsafe { varint_decode(after.as_ptr(), after.len()) }?;
         cursor += n;
         v as usize
     } else {
@@ -220,8 +215,13 @@ pub fn encode_datagram(payload: &[u8], out: &mut [u8]) -> usize {
     let mut pos = 0;
     out[pos] = FRAME_DATAGRAM_LEN;
     pos += 1;
-    let nb =
-        unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, payload.len() as u64) };
+    let nb = unsafe {
+        varint_encode(
+            out.as_mut_ptr().add(pos),
+            out.len() - pos,
+            payload.len() as u64,
+        )
+    };
     if nb == 0 {
         return 0;
     }
@@ -231,11 +231,7 @@ pub fn encode_datagram(payload: &[u8], out: &mut [u8]) -> usize {
     }
     // copy_nonoverlapping with verified bounds (module convention).
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            out.as_mut_ptr().add(pos),
-            payload.len(),
-        );
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), out.as_mut_ptr().add(pos), payload.len());
     }
     pos + payload.len()
 }
@@ -291,7 +287,11 @@ pub fn build_ack_frame(tracker: &AckTracker, ack_delay: u64, out: &mut [u8]) -> 
     }
     pos += nb;
     let nb = unsafe {
-        varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, extra_range_count)
+        varint_encode(
+            out.as_mut_ptr().add(pos),
+            out.len() - pos,
+            extra_range_count,
+        )
     };
     if nb == 0 {
         return 0;
@@ -344,15 +344,25 @@ pub fn build_stream(stream_id: u64, offset: u64, fin: bool, data: &[u8], out: &m
     out[0] = type_byte;
     let mut pos = 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, stream_id) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, offset) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe {
-        varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, data.len() as u64)
+        varint_encode(
+            out.as_mut_ptr().add(pos),
+            out.len() - pos,
+            data.len() as u64,
+        )
     };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     out[pos..pos + data.len()].copy_from_slice(data);
     pos + data.len()
@@ -372,16 +382,24 @@ pub fn build_new_connection_id(
         return 0;
     }
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_NEW_CONNECTION_ID;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, sequence) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, retire_prior_to) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
-    if pos + 1 + cid.len() + 16 > out.len() { return 0; }
+    if pos + 1 + cid.len() + 16 > out.len() {
+        return 0;
+    }
     out[pos] = cid.len() as u8;
     pos += 1;
     out[pos..pos + cid.len()].copy_from_slice(cid);
@@ -428,11 +446,15 @@ pub fn parse_path_data(body: &[u8]) -> Option<[u8; 8]> {
 /// Build a RETIRE_CONNECTION_ID frame (RFC 9000 §19.16).
 pub fn build_retire_connection_id(sequence: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_RETIRE_CONNECTION_ID;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, sequence) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -440,11 +462,15 @@ pub fn build_retire_connection_id(sequence: u64, out: &mut [u8]) -> usize {
 /// flow-control credit the peer may consume.
 pub fn build_max_data(maximum_data: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_MAX_DATA;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_data) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -460,11 +486,15 @@ pub fn build_max_data(maximum_data: u64, out: &mut [u8]) -> usize {
 /// is silent on both sides: the peer simply stops opening streams.
 pub fn build_max_streams_bidi(maximum_streams: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_MAX_STREAMS_BIDI;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_streams) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -478,11 +508,15 @@ pub fn build_max_streams_bidi(maximum_streams: u64, out: &mut [u8]) -> usize {
 /// side.
 pub fn build_max_streams_uni(maximum_streams: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_MAX_STREAMS_UNI;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_streams) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -491,7 +525,9 @@ pub fn build_max_streams_uni(maximum_streams: u64, out: &mut [u8]) -> usize {
 /// limit rather than leaving us stalled silently.
 pub fn build_streams_blocked(bidi: bool, maximum_streams: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = if bidi {
         FRAME_STREAMS_BLOCKED_BIDI
     } else {
@@ -499,7 +535,9 @@ pub fn build_streams_blocked(bidi: bool, maximum_streams: u64, out: &mut [u8]) -
     };
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_streams) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -507,14 +545,20 @@ pub fn build_streams_blocked(bidi: bool, maximum_streams: u64, out: &mut [u8]) -
 /// counterpart of DATA_BLOCKED.
 pub fn build_stream_data_blocked(stream_id: u64, maximum: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_STREAM_DATA_BLOCKED;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, stream_id) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -525,14 +569,20 @@ pub fn build_stream_data_blocked(stream_id: u64, maximum: u64, out: &mut [u8]) -
 /// transport neither assigns nor interprets it.
 pub fn build_stop_sending(stream_id: u64, error_code: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_STOP_SENDING;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, stream_id) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, error_code) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -540,14 +590,20 @@ pub fn build_stop_sending(stream_id: u64, error_code: u64, out: &mut [u8]) -> us
 /// per-stream send window for `stream_id`.
 pub fn build_max_stream_data(stream_id: u64, maximum: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_MAX_STREAM_DATA;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, stream_id) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -555,11 +611,15 @@ pub fn build_max_stream_data(stream_id: u64, maximum: u64, out: &mut [u8]) -> us
 /// signal it would have written more but for the connection-level cap.
 pub fn build_data_blocked(maximum_data: u64, out: &mut [u8]) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_DATA_BLOCKED;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, maximum_data) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -582,24 +642,37 @@ pub fn build_connection_close(
     };
     let mut pos = 0;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, frame_type) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, error_code) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     if !app_layer {
-        let n = unsafe {
-            varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, frame_type_cause)
-        };
-        if n == 0 { return 0; }
+        let n =
+            unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, frame_type_cause) };
+        if n == 0 {
+            return 0;
+        }
         pos += n;
     }
     let n = unsafe {
-        varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, reason.len() as u64)
+        varint_encode(
+            out.as_mut_ptr().add(pos),
+            out.len() - pos,
+            reason.len() as u64,
+        )
     };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
-    if pos + reason.len() > out.len() { return 0; }
+    if pos + reason.len() > out.len() {
+        return 0;
+    }
     out[pos..pos + reason.len()].copy_from_slice(reason);
     pos + reason.len()
 }
@@ -614,17 +687,25 @@ pub fn build_reset_stream(
     out: &mut [u8],
 ) -> usize {
     let mut pos = 0;
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     out[pos] = FRAME_RESET_STREAM;
     pos += 1;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, stream_id) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, error_code) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos += n;
     let n = unsafe { varint_encode(out.as_mut_ptr().add(pos), out.len() - pos, final_size) };
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     pos + n
 }
 
@@ -639,9 +720,7 @@ pub fn build_crypto(offset: u64, data: &[u8], out: &mut [u8]) -> usize {
     }
     out[0] = FRAME_CRYPTO;
     let mut cursor = 1;
-    let n = unsafe {
-        varint_encode(out.as_mut_ptr().add(cursor), out.len() - cursor, offset)
-    };
+    let n = unsafe { varint_encode(out.as_mut_ptr().add(cursor), out.len() - cursor, offset) };
     if n == 0 {
         return 0;
     }

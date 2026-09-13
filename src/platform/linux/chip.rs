@@ -5,5 +5,6 @@
 //! shim so platform code can keep its existing import paths.
 
 pub use crate::abi::config::kernel::{
-    BUFFER_ARENA_SIZE, CONFIG_ARENA_SIZE, MAX_MODULE_CONFIG_SIZE, STATE_ARENA_SIZE,
+    BUFFER_ARENA_SIZE, CONFIG_ARENA_SIZE, LOG_RING_CAPACITY, MAX_MODULE_CONFIG_SIZE,
+    STATE_ARENA_SIZE,
 };

@@ -140,13 +140,17 @@ impl Transcript {
                 let h = self.sha256.clone().finalize();
                 // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
                 // checked against the message length before each deref.
-                unsafe { core::ptr::copy_nonoverlapping(h.as_ptr(), out.as_mut_ptr(), 32); }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(h.as_ptr(), out.as_mut_ptr(), 32);
+                }
             }
             HashAlg::Sha384 => {
                 let h = self.sha384.clone().finalize();
                 // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
                 // checked against the message length before each deref.
-                unsafe { core::ptr::copy_nonoverlapping(h.as_ptr(), out.as_mut_ptr(), 48); }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(h.as_ptr(), out.as_mut_ptr(), 48);
+                }
             }
         }
         out
@@ -204,7 +208,7 @@ fn write_cipher_suites(out: &mut [u8], mut pos: usize, suites: &[u16]) -> usize 
 pub fn build_client_hello(
     random: &[u8; 32],
     session_id: &[u8; 32],
-    pub_key: &[u8; P256_SHARE_LEN],  // uncompressed P-256 public key
+    pub_key: &[u8; P256_SHARE_LEN], // uncompressed P-256 public key
     x25519_pub: Option<&[u8; X25519_SHARE_LEN]>,
     out: &mut [u8],
 ) -> usize {
@@ -226,7 +230,10 @@ pub fn build_client_hello(
 /// parameters varint TLV list per RFC 9000 §18); the function wraps
 /// it in the [type(2)][length(2)][data] extension envelope. An
 /// empty `quic_tp` is equivalent to `build_client_hello`.
-#[allow(clippy::too_many_arguments, reason = "one ClientHello extension per argument; grouping them into a struct would move the same fields behind a name that adds nothing")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one ClientHello extension per argument; grouping them into a struct would move the same fields behind a name that adds nothing"
+)]
 pub fn build_client_hello_ext(
     random: &[u8; 32],
     session_id: &[u8; 32],
@@ -238,7 +245,15 @@ pub fn build_client_hello_ext(
     out: &mut [u8],
 ) -> usize {
     build_client_hello_sni(
-        random, session_id, pub_key, x25519_pub, quic_tp, alpn, &[], suites, out,
+        random,
+        session_id,
+        pub_key,
+        x25519_pub,
+        quic_tp,
+        alpn,
+        &[],
+        suites,
+        out,
     )
 }
 
@@ -249,7 +264,10 @@ pub fn build_client_hello_ext(
 /// certificate. Emitting a name selects which certificate a multi-tenant
 /// peer returns, so a client that sends one it does not then require would
 /// hold a handshake with a service it never asked to reach.
-#[allow(clippy::too_many_arguments, reason = "one ClientHello extension per argument; grouping them into a struct would move the same fields behind a name that adds nothing")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one ClientHello extension per argument; grouping them into a struct would move the same fields behind a name that adds nothing"
+)]
 pub fn build_client_hello_sni(
     random: &[u8; 32],
     session_id: &[u8; 32],
@@ -264,25 +282,37 @@ pub fn build_client_hello_sni(
     let mut pos = 0;
 
     // Handshake header: type(1) + length(3) — we'll fill length later
-    out[pos] = HT_CLIENT_HELLO; pos += 1;
-    let len_pos = pos; pos += 3;
+    out[pos] = HT_CLIENT_HELLO;
+    pos += 1;
+    let len_pos = pos;
+    pos += 3;
 
     // ClientHello body
-    out[pos] = 0x03; out[pos + 1] = 0x03; pos += 2;
+    out[pos] = 0x03;
+    out[pos + 1] = 0x03;
+    pos += 2;
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
-    unsafe { core::ptr::copy_nonoverlapping(random.as_ptr(), out.as_mut_ptr().add(pos), 32); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(random.as_ptr(), out.as_mut_ptr().add(pos), 32);
+    }
     pos += 32;
-    out[pos] = 32; pos += 1;
+    out[pos] = 32;
+    pos += 1;
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
-    unsafe { core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(session_id.as_ptr(), out.as_mut_ptr().add(pos), 32);
+    }
     pos += 32;
     pos = write_cipher_suites(out, pos, suites);
-    out[pos] = 1; pos += 1;
-    out[pos] = 0; pos += 1;
+    out[pos] = 1;
+    pos += 1;
+    out[pos] = 0;
+    pos += 1;
 
-    let ext_len_pos = pos; pos += 2;
+    let ext_len_pos = pos;
+    pos += 2;
     let ext_start = pos;
     pos = write_ext_server_name(out, pos, sni);
     pos = write_ext_supported_versions(out, pos);
@@ -291,8 +321,10 @@ pub fn build_client_hello_sni(
     pos = write_ext_signature_algorithms(out, pos);
     pos = write_ext_alpn_client(out, pos, alpn);
     if !quic_tp.is_empty() {
-        put_u16(out, pos, EXT_QUIC_TRANSPORT_PARAMETERS); pos += 2;
-        put_u16(out, pos, quic_tp.len() as u16); pos += 2;
+        put_u16(out, pos, EXT_QUIC_TRANSPORT_PARAMETERS);
+        pos += 2;
+        put_u16(out, pos, quic_tp.len() as u16);
+        pos += 2;
         // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
         // checked against the message length before each deref.
         unsafe {
@@ -336,11 +368,15 @@ pub fn build_server_hello(
         let p = out.as_mut_ptr();
         let mut pos: usize = 0;
 
-        wv(p.add(pos), HT_SERVER_HELLO); pos += 1;
-        let len_pos = pos; pos += 3;
+        wv(p.add(pos), HT_SERVER_HELLO);
+        pos += 1;
+        let len_pos = pos;
+        pos += 3;
 
         // legacy_version
-        wv(p.add(pos), 0x03u8); wv(p.add(pos + 1), 0x03u8); pos += 2;
+        wv(p.add(pos), 0x03u8);
+        wv(p.add(pos + 1), 0x03u8);
+        pos += 2;
         // random
         core::ptr::copy_nonoverlapping(random.as_ptr(), p.add(pos), 32);
         pos += 32;
@@ -351,17 +387,22 @@ pub fn build_server_hello(
         // lenient stacks ever completed a handshake against it. TCP TLS
         // never noticed because those clients send a 32-byte compat id.
         let sid_len = session_id.len().min(32);
-        wv(p.add(pos), sid_len as u8); pos += 1;
+        wv(p.add(pos), sid_len as u8);
+        pos += 1;
         core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), sid_len);
         pos += sid_len;
         // cipher_suite
         let sid = suite.id();
-        wv(p.add(pos), (sid >> 8) as u8); wv(p.add(pos + 1), sid as u8); pos += 2;
+        wv(p.add(pos), (sid >> 8) as u8);
+        wv(p.add(pos + 1), sid as u8);
+        pos += 2;
         // compression_method
-        wv(p.add(pos), 0u8); pos += 1;
+        wv(p.add(pos), 0u8);
+        pos += 1;
 
         // Extensions
-        let ext_len_pos = pos; pos += 2;
+        let ext_len_pos = pos;
+        pos += 2;
         let ext_start = pos;
 
         // supported_versions (TLS 1.3)
@@ -413,11 +454,7 @@ const HRR_RANDOM: [u8; 32] = [
 
 /// Build HelloRetryRequest (special ServerHello requesting P-256 key share).
 /// Uses raw pointer writes throughout for PIC aarch64 safety.
-pub fn build_hello_retry_request(
-    session_id: &[u8],
-    suite: CipherSuite,
-    out: &mut [u8],
-) -> usize {
+pub fn build_hello_retry_request(session_id: &[u8], suite: CipherSuite, out: &mut [u8]) -> usize {
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
     unsafe {
@@ -427,45 +464,70 @@ pub fn build_hello_retry_request(
 
         // Use write_volatile for ALL stores to prevent dead-store elimination
         // and ensure correct codegen on PIC aarch64
-        wv(p.add(pos), HT_SERVER_HELLO); pos += 1;
-        let len_pos = pos; pos += 3;
+        wv(p.add(pos), HT_SERVER_HELLO);
+        pos += 1;
+        let len_pos = pos;
+        pos += 3;
 
         // legacy_version
-        wv(p.add(pos), 0x03u8); wv(p.add(pos + 1), 0x03u8); pos += 2;
+        wv(p.add(pos), 0x03u8);
+        wv(p.add(pos + 1), 0x03u8);
+        pos += 2;
         // HRR magic random — write each byte individually with write_volatile
         // to prevent LLVM from using ADRP-based const loading (broken in PIC)
-        wv(p.add(pos), 0xCFu8); wv(p.add(pos+1), 0x21u8);
-        wv(p.add(pos+2), 0xADu8); wv(p.add(pos+3), 0x74u8);
-        wv(p.add(pos+4), 0xE5u8); wv(p.add(pos+5), 0x9Au8);
-        wv(p.add(pos+6), 0x61u8); wv(p.add(pos+7), 0x11u8);
-        wv(p.add(pos+8), 0xBEu8); wv(p.add(pos+9), 0x1Du8);
-        wv(p.add(pos+10), 0x8Cu8); wv(p.add(pos+11), 0x02u8);
-        wv(p.add(pos+12), 0x1Eu8); wv(p.add(pos+13), 0x65u8);
-        wv(p.add(pos+14), 0xB8u8); wv(p.add(pos+15), 0x91u8);
-        wv(p.add(pos+16), 0xC2u8); wv(p.add(pos+17), 0xA2u8);
-        wv(p.add(pos+18), 0x11u8); wv(p.add(pos+19), 0x16u8);
-        wv(p.add(pos+20), 0x7Au8); wv(p.add(pos+21), 0xBBu8);
-        wv(p.add(pos+22), 0x8Cu8); wv(p.add(pos+23), 0x5Eu8);
-        wv(p.add(pos+24), 0x07u8); wv(p.add(pos+25), 0x9Eu8);
-        wv(p.add(pos+26), 0x09u8); wv(p.add(pos+27), 0xE2u8);
-        wv(p.add(pos+28), 0xC8u8); wv(p.add(pos+29), 0xA8u8);
-        wv(p.add(pos+30), 0x33u8); wv(p.add(pos+31), 0x9Cu8);
+        wv(p.add(pos), 0xCFu8);
+        wv(p.add(pos + 1), 0x21u8);
+        wv(p.add(pos + 2), 0xADu8);
+        wv(p.add(pos + 3), 0x74u8);
+        wv(p.add(pos + 4), 0xE5u8);
+        wv(p.add(pos + 5), 0x9Au8);
+        wv(p.add(pos + 6), 0x61u8);
+        wv(p.add(pos + 7), 0x11u8);
+        wv(p.add(pos + 8), 0xBEu8);
+        wv(p.add(pos + 9), 0x1Du8);
+        wv(p.add(pos + 10), 0x8Cu8);
+        wv(p.add(pos + 11), 0x02u8);
+        wv(p.add(pos + 12), 0x1Eu8);
+        wv(p.add(pos + 13), 0x65u8);
+        wv(p.add(pos + 14), 0xB8u8);
+        wv(p.add(pos + 15), 0x91u8);
+        wv(p.add(pos + 16), 0xC2u8);
+        wv(p.add(pos + 17), 0xA2u8);
+        wv(p.add(pos + 18), 0x11u8);
+        wv(p.add(pos + 19), 0x16u8);
+        wv(p.add(pos + 20), 0x7Au8);
+        wv(p.add(pos + 21), 0xBBu8);
+        wv(p.add(pos + 22), 0x8Cu8);
+        wv(p.add(pos + 23), 0x5Eu8);
+        wv(p.add(pos + 24), 0x07u8);
+        wv(p.add(pos + 25), 0x9Eu8);
+        wv(p.add(pos + 26), 0x09u8);
+        wv(p.add(pos + 27), 0xE2u8);
+        wv(p.add(pos + 28), 0xC8u8);
+        wv(p.add(pos + 29), 0xA8u8);
+        wv(p.add(pos + 30), 0x33u8);
+        wv(p.add(pos + 31), 0x9Cu8);
         pos += 32;
         // session_id: echo EXACTLY what the client sent — see
         // build_server_hello; a fixed 32-byte echo of a QUIC client's empty
         // session id was a DECODE_ERROR to every strict TLS stack.
         let sid_len = session_id.len().min(32);
-        wv(p.add(pos), sid_len as u8); pos += 1;
+        wv(p.add(pos), sid_len as u8);
+        pos += 1;
         core::ptr::copy_nonoverlapping(session_id.as_ptr(), p.add(pos), sid_len);
         pos += sid_len;
         // cipher_suite
         let sid = suite.id();
-        *p.add(pos) = (sid >> 8) as u8; *p.add(pos + 1) = sid as u8; pos += 2;
+        *p.add(pos) = (sid >> 8) as u8;
+        *p.add(pos + 1) = sid as u8;
+        pos += 2;
         // compression
-        *p.add(pos) = 0; pos += 1;
+        *p.add(pos) = 0;
+        pos += 1;
 
         // Extensions
-        let ext_len_pos = pos; pos += 2;
+        let ext_len_pos = pos;
+        pos += 2;
         let ext_start = pos;
 
         // supported_versions (TLS 1.3)
@@ -497,12 +559,16 @@ pub fn build_certificate_request(out: &mut [u8]) -> usize {
     unsafe {
         let p = out.as_mut_ptr();
         let mut pos = 0;
-        *p.add(pos) = HT_CERTIFICATE_REQUEST; pos += 1;
-        let len_pos = pos; pos += 3;
+        *p.add(pos) = HT_CERTIFICATE_REQUEST;
+        pos += 1;
+        let len_pos = pos;
+        pos += 3;
 
-        *p.add(pos) = 0; pos += 1; // empty context
+        *p.add(pos) = 0;
+        pos += 1; // empty context
 
-        let ext_len_pos = pos; pos += 2;
+        let ext_len_pos = pos;
+        pos += 2;
         let ext_start = pos;
         pu16(p, &mut pos, EXT_SIGNATURE_ALGORITHMS);
         pu16(p, &mut pos, 4);
@@ -635,11 +701,14 @@ pub fn build_certificate(chain: &[u8], out: &mut [u8]) -> usize {
         let p = out.as_mut_ptr();
         let mut pos = 0;
 
-        *p.add(pos) = HT_CERTIFICATE; pos += 1;
-        let len_pos = pos; pos += 3;
+        *p.add(pos) = HT_CERTIFICATE;
+        pos += 1;
+        let len_pos = pos;
+        pos += 3;
 
         // certificate_request_context (empty)
-        *p.add(pos) = 0; pos += 1;
+        *p.add(pos) = 0;
+        pos += 1;
 
         // certificate_list length
         *p.add(pos) = (list_len >> 16) as u8;
@@ -658,7 +727,9 @@ pub fn build_certificate(chain: &[u8], out: &mut [u8]) -> usize {
             core::ptr::copy_nonoverlapping(chain.as_ptr().add(starts[i]), p.add(pos), n);
             pos += n;
             // extensions (empty)
-            *p.add(pos) = 0; *p.add(pos + 1) = 0; pos += 2;
+            *p.add(pos) = 0;
+            *p.add(pos + 1) = 0;
+            pos += 2;
         }
 
         let body_len = pos - len_pos - 3;
@@ -671,18 +742,15 @@ pub fn build_certificate(chain: &[u8], out: &mut [u8]) -> usize {
 }
 
 /// Build CertificateVerify message (raw pointer writes for PIC safety)
-pub fn build_certificate_verify(
-    signature_der: &[u8],
-    sig_len: usize,
-    out: &mut [u8],
-) -> usize {
+pub fn build_certificate_verify(signature_der: &[u8], sig_len: usize, out: &mut [u8]) -> usize {
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
     unsafe {
         let p = out.as_mut_ptr();
         let mut pos = 0;
 
-        *p.add(pos) = HT_CERTIFICATE_VERIFY; pos += 1;
+        *p.add(pos) = HT_CERTIFICATE_VERIFY;
+        pos += 1;
         let body_len = 2 + 2 + sig_len;
         *p.add(pos) = (body_len >> 16) as u8;
         *p.add(pos + 1) = (body_len >> 8) as u8;
@@ -721,9 +789,9 @@ pub fn build_finished(verify_data: &[u8], hash_len: usize, out: &mut [u8]) -> us
 
 /// Parsed ClientHello
 pub struct ClientHello<'a> {
-    pub random: &'a [u8],     // 32 bytes
-    pub session_id: &'a [u8], // 0-32 bytes
-    pub cipher_suites: &'a [u8], // raw bytes
+    pub random: &'a [u8],                   // 32 bytes
+    pub session_id: &'a [u8],               // 0-32 bytes
+    pub cipher_suites: &'a [u8],            // raw bytes
     pub key_share: Option<(u16, &'a [u8])>, // (group, key_exchange)
     /// The client's X25519 share, when it offered one. Kept separate
     /// from `key_share` so a consumer that only completes P-256 keeps
@@ -798,7 +866,9 @@ impl<'a> Iterator for AlpnIter<'a> {
 /// Uses raw pointer reads to avoid array-indexing bounds checks that
 /// miscompile on PIC aarch64.
 pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
-    if data.len() < 38 { return None; }
+    if data.len() < 38 {
+        return None;
+    }
     let dlen = data.len();
     let dp = data.as_ptr();
     let mut pos: usize = 0;
@@ -809,19 +879,33 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
         // legacy_version (skip)
         pos += 2;
         // random
-        let random = core::slice::from_raw_parts(dp.add(pos), 32); pos += 32;
+        let random = core::slice::from_raw_parts(dp.add(pos), 32);
+        pos += 32;
         // session_id
-        let sid_len = *dp.add(pos) as usize; pos += 1;
-        if pos + sid_len > dlen { return None; }
-        let session_id = core::slice::from_raw_parts(dp.add(pos), sid_len); pos += sid_len;
+        let sid_len = *dp.add(pos) as usize;
+        pos += 1;
+        if pos + sid_len > dlen {
+            return None;
+        }
+        let session_id = core::slice::from_raw_parts(dp.add(pos), sid_len);
+        pos += sid_len;
         // cipher_suites
-        if pos + 2 > dlen { return None; }
-        let cs_len = get_u16(data, pos) as usize; pos += 2;
-        if pos + cs_len > dlen { return None; }
-        let cipher_suites = core::slice::from_raw_parts(dp.add(pos), cs_len); pos += cs_len;
+        if pos + 2 > dlen {
+            return None;
+        }
+        let cs_len = get_u16(data, pos) as usize;
+        pos += 2;
+        if pos + cs_len > dlen {
+            return None;
+        }
+        let cipher_suites = core::slice::from_raw_parts(dp.add(pos), cs_len);
+        pos += cs_len;
         // compression_methods (skip)
-        if pos >= dlen { return None; }
-        let comp_len = *dp.add(pos) as usize; pos += 1;
+        if pos >= dlen {
+            return None;
+        }
+        let comp_len = *dp.add(pos) as usize;
+        pos += 1;
         pos += comp_len;
 
         // Extensions
@@ -836,12 +920,17 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
         let mut early_data = false;
 
         if pos + 2 <= dlen {
-            let ext_len = get_u16(data, pos) as usize; pos += 2;
+            let ext_len = get_u16(data, pos) as usize;
+            pos += 2;
             let ext_end = pos + ext_len;
             while pos + 4 <= ext_end {
-                let ext_type = get_u16(data, pos); pos += 2;
-                let ext_data_len = get_u16(data, pos) as usize; pos += 2;
-                if pos + ext_data_len > ext_end { break; }
+                let ext_type = get_u16(data, pos);
+                pos += 2;
+                let ext_data_len = get_u16(data, pos) as usize;
+                pos += 2;
+                if pos + ext_data_len > ext_end {
+                    break;
+                }
                 let ext_data = core::slice::from_raw_parts(dp.add(pos), ext_data_len);
 
                 match ext_type {
@@ -898,14 +987,26 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
                             let mut spos = 2usize;
                             let send = 2 + shares_len;
                             while spos + 4 <= send && spos + 4 <= ext_data_len {
-                                let group = get_u16(ext_data, spos); spos += 2;
-                                let klen = get_u16(ext_data, spos) as usize; spos += 2;
-                                if spos + klen > ext_data_len { break; }
+                                let group = get_u16(ext_data, spos);
+                                spos += 2;
+                                let klen = get_u16(ext_data, spos) as usize;
+                                spos += 2;
+                                if spos + klen > ext_data_len {
+                                    break;
+                                }
                                 if group == GROUP_SECP256R1 && klen == P256_SHARE_LEN {
-                                    key_share = Some((group, core::slice::from_raw_parts(ext_data.as_ptr().add(spos), klen)));
+                                    key_share = Some((
+                                        group,
+                                        core::slice::from_raw_parts(
+                                            ext_data.as_ptr().add(spos),
+                                            klen,
+                                        ),
+                                    ));
                                 } else if group == GROUP_X25519 && klen == X25519_SHARE_LEN {
-                                    key_share_x25519 =
-                                        Some(core::slice::from_raw_parts(ext_data.as_ptr().add(spos), klen));
+                                    key_share_x25519 = Some(core::slice::from_raw_parts(
+                                        ext_data.as_ptr().add(spos),
+                                        klen,
+                                    ));
                                 }
                                 spos += klen;
                             }
@@ -946,13 +1047,23 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHello<'_>> {
 /// tuple. Returns (identity_bytes, age) or empty if the payload is
 /// malformed.
 pub fn psk_identity_iter(offered: &[u8]) -> impl Iterator<Item = (&[u8], u32)> {
-    PskIdentityIter { buf: offered, off: 0, end: 0, init: false }
+    PskIdentityIter {
+        buf: offered,
+        off: 0,
+        end: 0,
+        init: false,
+    }
 }
 
 /// Walk the binders portion of an OfferedPsks payload (the part after
 /// `identities`). Yields each binder slice in order.
 pub fn psk_binder_iter(binders: &[u8]) -> impl Iterator<Item = &[u8]> {
-    PskBinderIter { buf: binders, off: 0, end: 0, init: false }
+    PskBinderIter {
+        buf: binders,
+        off: 0,
+        end: 0,
+        init: false,
+    }
 }
 
 pub struct PskIdentityIter<'a> {
@@ -1041,16 +1152,26 @@ pub struct ServerHello<'a> {
 
 /// Parse ServerHello
 pub fn parse_server_hello(data: &[u8]) -> Option<ServerHello<'_>> {
-    if data.len() < 38 { return None; }
+    if data.len() < 38 {
+        return None;
+    }
     let mut pos = 0;
 
     pos += 2; // legacy_version
-    let random = &data[pos..pos + 32]; pos += 32;
-    let sid_len = data[pos] as usize; pos += 1;
-    if pos + sid_len > data.len() { return None; }
-    let session_id = &data[pos..pos + sid_len]; pos += sid_len;
-    if pos + 3 > data.len() { return None; }
-    let cipher_suite = get_u16(data, pos); pos += 2;
+    let random = &data[pos..pos + 32];
+    pos += 32;
+    let sid_len = data[pos] as usize;
+    pos += 1;
+    if pos + sid_len > data.len() {
+        return None;
+    }
+    let session_id = &data[pos..pos + sid_len];
+    pos += sid_len;
+    if pos + 3 > data.len() {
+        return None;
+    }
+    let cipher_suite = get_u16(data, pos);
+    pos += 2;
     pos += 1; // compression
 
     let mut key_share = None;
@@ -1059,12 +1180,17 @@ pub fn parse_server_hello(data: &[u8]) -> Option<ServerHello<'_>> {
     let mut psk_identity = None;
 
     if pos + 2 <= data.len() {
-        let ext_len = get_u16(data, pos) as usize; pos += 2;
+        let ext_len = get_u16(data, pos) as usize;
+        pos += 2;
         let ext_end = pos + ext_len;
         while pos + 4 <= ext_end {
-            let ext_type = get_u16(data, pos); pos += 2;
-            let ext_data_len = get_u16(data, pos) as usize; pos += 2;
-            if pos + ext_data_len > ext_end { break; }
+            let ext_type = get_u16(data, pos);
+            pos += 2;
+            let ext_data_len = get_u16(data, pos) as usize;
+            pos += 2;
+            if pos + ext_data_len > ext_end {
+                break;
+            }
             let ext_data = &data[pos..pos + ext_data_len];
 
             match ext_type {
@@ -1206,8 +1332,12 @@ pub fn select_cipher_suite(client_suites: &[u8]) -> Option<CipherSuite> {
         if cs == 0x1303 {
             return Some(CipherSuite::ChaCha20Poly1305);
         }
-        if cs == 0x1301 { found_aes128 = true; }
-        if cs == 0x1302 { found_aes256 = true; }
+        if cs == 0x1301 {
+            found_aes128 = true;
+        }
+        if cs == 0x1302 {
+            found_aes256 = true;
+        }
         i += 2;
     }
     if !AES_GCM_SUITES_ENABLED {
@@ -1215,23 +1345,39 @@ pub fn select_cipher_suite(client_suites: &[u8]) -> Option<CipherSuite> {
         // select what this endpoint declined to advertise.
         return None;
     }
-    if found_aes128 { return Some(CipherSuite::Aes128Gcm); }
-    if found_aes256 { return Some(CipherSuite::Aes256Gcm); }
+    if found_aes128 {
+        return Some(CipherSuite::Aes128Gcm);
+    }
+    if found_aes256 {
+        return Some(CipherSuite::Aes256Gcm);
+    }
     None
 }
 
 /// Parse Certificate message body
 pub fn parse_certificate_msg(data: &[u8]) -> Option<&[u8]> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let ctx_len = data[0] as usize;
     let mut pos = 1 + ctx_len;
-    if pos + 3 > data.len() { return None; }
-    let list_len = get_u24(data, pos); pos += 3;
-    if pos + list_len > data.len() { return None; }
+    if pos + 3 > data.len() {
+        return None;
+    }
+    let list_len = get_u24(data, pos);
+    pos += 3;
+    if pos + list_len > data.len() {
+        return None;
+    }
     // First CertificateEntry
-    if list_len < 3 { return None; }
-    let cert_len = get_u24(data, pos); pos += 3;
-    if pos + cert_len > data.len() { return None; }
+    if list_len < 3 {
+        return None;
+    }
+    let cert_len = get_u24(data, pos);
+    pos += 3;
+    if pos + cert_len > data.len() {
+        return None;
+    }
     Some(&data[pos..pos + cert_len])
 }
 
@@ -1239,10 +1385,14 @@ pub fn parse_certificate_msg(data: &[u8]) -> Option<&[u8]> {
 /// The signature must fill the message exactly — trailing bytes would
 /// be data the transcript covers but no field names.
 pub fn parse_certificate_verify(data: &[u8]) -> Option<(u16, &[u8])> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
     let scheme = get_u16(data, 0);
     let sig_len = get_u16(data, 2) as usize;
-    if 4 + sig_len != data.len() { return None; }
+    if 4 + sig_len != data.len() {
+        return None;
+    }
     Some((scheme, &data[4..4 + sig_len]))
 }
 
@@ -1267,7 +1417,9 @@ pub fn parse_certificate_verify_expecting(data: &[u8], expected: u16) -> Option<
 /// or pad: the reassembler only guarantees the peer-declared message
 /// length, not that it matches the suite.
 pub fn parse_finished(data: &[u8], expected_len: usize) -> Option<&[u8]> {
-    if data.len() != expected_len { return None; }
+    if data.len() != expected_len {
+        return None;
+    }
     Some(data)
 }
 
@@ -1329,19 +1481,37 @@ pub fn parse_new_session_ticket_is_well_formed(body: &[u8]) -> bool {
 
 /// Build CertificateVerify signing content
 /// context_string: "TLS 1.3, server CertificateVerify" or "TLS 1.3, client CertificateVerify"
-pub fn build_verify_content(context: &[u8], transcript_hash: &[u8], hash_len: usize, out: &mut [u8]) -> usize {
+pub fn build_verify_content(
+    context: &[u8],
+    transcript_hash: &[u8],
+    hash_len: usize,
+    out: &mut [u8],
+) -> usize {
     // 64 spaces + context_string + 0x00 + transcript_hash
     let mut pos = 0;
     let mut i = 0;
-    while i < 64 { out[pos] = 0x20; pos += 1; i += 1; }
+    while i < 64 {
+        out[pos] = 0x20;
+        pos += 1;
+        i += 1;
+    }
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
-    unsafe { core::ptr::copy_nonoverlapping(context.as_ptr(), out.as_mut_ptr().add(pos), context.len()); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(context.as_ptr(), out.as_mut_ptr().add(pos), context.len());
+    }
     pos += context.len();
-    out[pos] = 0x00; pos += 1;
+    out[pos] = 0x00;
+    pos += 1;
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
-    unsafe { core::ptr::copy_nonoverlapping(transcript_hash.as_ptr(), out.as_mut_ptr().add(pos), hash_len); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            transcript_hash.as_ptr(),
+            out.as_mut_ptr().add(pos),
+            hash_len,
+        );
+    }
     pos += hash_len;
     pos
 }
@@ -1351,10 +1521,14 @@ pub fn build_verify_content(context: &[u8], transcript_hash: &[u8], hash_len: us
 // ============================================================================
 
 fn write_ext_supported_versions(out: &mut [u8], mut pos: usize) -> usize {
-    put_u16(out, pos, EXT_SUPPORTED_VERSIONS); pos += 2;
-    put_u16(out, pos, 3); pos += 2; // ext data length
-    out[pos] = 2; pos += 1; // list length
-    put_u16(out, pos, TLS13_VERSION); pos += 2;
+    put_u16(out, pos, EXT_SUPPORTED_VERSIONS);
+    pos += 2;
+    put_u16(out, pos, 3);
+    pos += 2; // ext data length
+    out[pos] = 2;
+    pos += 1; // list length
+    put_u16(out, pos, TLS13_VERSION);
+    pos += 2;
     pos
 }
 
@@ -1371,43 +1545,46 @@ fn write_ext_key_share_client(
     if x25519_pub.is_some() {
         shares_len += 2 + 2 + X25519_SHARE_LEN;
     }
-    put_u16(out, pos, EXT_KEY_SHARE); pos += 2;
-    put_u16(out, pos, (2 + shares_len) as u16); pos += 2; // ext data length
-    put_u16(out, pos, shares_len as u16); pos += 2; // client_shares length
+    put_u16(out, pos, EXT_KEY_SHARE);
+    pos += 2;
+    put_u16(out, pos, (2 + shares_len) as u16);
+    pos += 2; // ext data length
+    put_u16(out, pos, shares_len as u16);
+    pos += 2; // client_shares length
     if let Some(x) = x25519_pub {
-        put_u16(out, pos, GROUP_X25519); pos += 2;
-        put_u16(out, pos, X25519_SHARE_LEN as u16); pos += 2;
+        put_u16(out, pos, GROUP_X25519);
+        pos += 2;
+        put_u16(out, pos, X25519_SHARE_LEN as u16);
+        pos += 2;
         // SAFETY: pointer arithmetic over the handshake-state buffer;
         // bounds checked against the message length before each deref.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                x.as_ptr(),
-                out.as_mut_ptr().add(pos),
-                X25519_SHARE_LEN,
-            );
+            core::ptr::copy_nonoverlapping(x.as_ptr(), out.as_mut_ptr().add(pos), X25519_SHARE_LEN);
         }
         pos += X25519_SHARE_LEN;
     }
-    put_u16(out, pos, GROUP_SECP256R1); pos += 2;
-    put_u16(out, pos, P256_SHARE_LEN as u16); pos += 2;
+    put_u16(out, pos, GROUP_SECP256R1);
+    pos += 2;
+    put_u16(out, pos, P256_SHARE_LEN as u16);
+    pos += 2;
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            pub_key.as_ptr(),
-            out.as_mut_ptr().add(pos),
-            P256_SHARE_LEN,
-        );
+        core::ptr::copy_nonoverlapping(pub_key.as_ptr(), out.as_mut_ptr().add(pos), P256_SHARE_LEN);
     }
     pos += P256_SHARE_LEN;
     pos
 }
 
 fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
-    put_u16(out, pos, EXT_SIGNATURE_ALGORITHMS); pos += 2;
-    put_u16(out, pos, 4); pos += 2; // ext data length
-    put_u16(out, pos, 2); pos += 2; // list length
-    put_u16(out, pos, SIG_ECDSA_SECP256R1_SHA256); pos += 2;
+    put_u16(out, pos, EXT_SIGNATURE_ALGORITHMS);
+    pos += 2;
+    put_u16(out, pos, 4);
+    pos += 2; // ext data length
+    put_u16(out, pos, 2);
+    pos += 2; // list length
+    put_u16(out, pos, SIG_ECDSA_SECP256R1_SHA256);
+    pos += 2;
     pos
 }
 
@@ -1419,13 +1596,18 @@ fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
 /// HelloRetryRequest it would have to fail.
 fn write_ext_supported_groups(out: &mut [u8], mut pos: usize, x25519: bool) -> usize {
     let count: usize = if x25519 { 2 } else { 1 };
-    put_u16(out, pos, EXT_SUPPORTED_GROUPS); pos += 2;
-    put_u16(out, pos, (2 + count * 2) as u16); pos += 2; // ext data length
-    put_u16(out, pos, (count * 2) as u16); pos += 2; // named_group_list length
+    put_u16(out, pos, EXT_SUPPORTED_GROUPS);
+    pos += 2;
+    put_u16(out, pos, (2 + count * 2) as u16);
+    pos += 2; // ext data length
+    put_u16(out, pos, (count * 2) as u16);
+    pos += 2; // named_group_list length
     if x25519 {
-        put_u16(out, pos, GROUP_X25519); pos += 2;
+        put_u16(out, pos, GROUP_X25519);
+        pos += 2;
     }
-    put_u16(out, pos, GROUP_SECP256R1); pos += 2;
+    put_u16(out, pos, GROUP_SECP256R1);
+    pos += 2;
     pos
 }
 
@@ -1624,11 +1806,7 @@ pub fn build_new_session_ticket(
         // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
         // checked against the message length before each deref.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                nonce.as_ptr(),
-                out.as_mut_ptr().add(pos),
-                nonce.len(),
-            );
+            core::ptr::copy_nonoverlapping(nonce.as_ptr(), out.as_mut_ptr().add(pos), nonce.len());
         }
         pos += nonce.len();
     }

@@ -1,8 +1,9 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712", "rp2350"]
 
-# Bare-metal Surface Traits authority for fixed-function panels
-# (.context/rfc_surface_traits.md). Emits one 24-byte
+# Bare-metal Surface Traits authority for fixed-function panels — the
+# bare-metal implementation of the runtime environment plane, publishing the
+# same wire shape as the Linux and browser authorities. Emits one 24-byte
 # `input::surface_traits::MSG_TRAITS` record describing the statically-declared
 # panel surface — viewport (width/height), derived orientation + size class, the
 # wired input modalities (a MODALITY_* bitmask), and gamepad count — so an app

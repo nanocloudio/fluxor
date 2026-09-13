@@ -100,7 +100,15 @@ unsafe fn send_install(s: &mut ProbeState) {
     payload[netid::ADD_OWNER_TAG_OFF] = 0;
     payload[netid::ADD_OWNER_TAG_OFF + 1] = 0;
     payload[netid::ADD_FLAGS_OFF] = 0;
-    net_write_frame(sys, s.addr_ctl, netid::ADDR_ADD, payload.as_ptr(), payload.len(), s.buf.as_mut_ptr(), 64);
+    net_write_frame(
+        sys,
+        s.addr_ctl,
+        netid::ADDR_ADD,
+        payload.as_ptr(),
+        payload.len(),
+        s.buf.as_mut_ptr(),
+        64,
+    );
 }
 
 unsafe fn send_fence(s: &mut ProbeState) {
@@ -108,7 +116,15 @@ unsafe fn send_fence(s: &mut ProbeState) {
     let mut payload = [0u8; netid::ADDR_TOKEN_PAYLOAD_LEN];
     payload[..16].copy_from_slice(&addr16(s.vip));
     payload[netid::TOKEN_OFF..netid::TOKEN_OFF + 16].copy_from_slice(&s.token);
-    net_write_frame(sys, s.addr_ctl, netid::ADDR_FENCE, payload.as_ptr(), payload.len(), s.buf.as_mut_ptr(), 64);
+    net_write_frame(
+        sys,
+        s.addr_ctl,
+        netid::ADDR_FENCE,
+        payload.as_ptr(),
+        payload.len(),
+        s.buf.as_mut_ptr(),
+        64,
+    );
 }
 
 unsafe fn service_events(s: &mut ProbeState) {
@@ -146,20 +162,41 @@ unsafe fn service_events(s: &mut ProbeState) {
             }
             netid::MSG_ADDR_FENCED if ours && plen >= 30 => {
                 s.cutoff_index = u64::from_le_bytes([
-                    *p.add(20), *p.add(21), *p.add(22), *p.add(23),
-                    *p.add(24), *p.add(25), *p.add(26), *p.add(27),
+                    *p.add(20),
+                    *p.add(21),
+                    *p.add(22),
+                    *p.add(23),
+                    *p.add(24),
+                    *p.add(25),
+                    *p.add(26),
+                    *p.add(27),
                 ]);
                 s.cutoff_kind = *p.add(28);
                 s.phase = PHASE_DONE;
-                let kind: &[u8] = if s.cutoff_kind == netid::cutoff::WIRE { b"wire" } else { b"ring_handoff" };
+                let kind: &[u8] = if s.cutoff_kind == netid::cutoff::WIRE {
+                    b"wire"
+                } else {
+                    b"ring_handoff"
+                };
                 let mut t = [0u8; 12];
                 let idx = s.cutoff_index as u32;
-                log_line(s, &[b"[fence_probe] fenced cutoff=", kind, b" index=", fmt_u32(idx, &mut t)]);
+                log_line(
+                    s,
+                    &[
+                        b"[fence_probe] fenced cutoff=",
+                        kind,
+                        b" index=",
+                        fmt_u32(idx, &mut t),
+                    ],
+                );
             }
             netid::MSG_ADDR_REFUSED if ours && plen >= 18 => {
                 let mut t = [0u8; 12];
                 let reason = u32::from(*p.add(17));
-                log_line(s, &[b"[fence_probe] refused reason=", fmt_u32(reason, &mut t)]);
+                log_line(
+                    s,
+                    &[b"[fence_probe] refused reason=", fmt_u32(reason, &mut t)],
+                );
             }
             _ => {}
         }
@@ -231,7 +268,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 if s.token == [0; 16] {
                     send_install(s);
                     // One request per two-second window.
-                    s.boot_ms = now.wrapping_sub(s.install_after_s * 1000).wrapping_add(1000);
+                    s.boot_ms = now
+                        .wrapping_sub(s.install_after_s * 1000)
+                        .wrapping_add(1000);
                 }
             }
         }

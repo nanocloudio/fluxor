@@ -80,9 +80,9 @@ pub fn legacy_version_ok(v: &[u8; 2]) -> bool {
 /// Cipher suite parameters
 #[derive(Clone, Copy, PartialEq)]
 pub enum CipherSuite {
-    Aes128Gcm,       // 0x1301
+    Aes128Gcm,        // 0x1301
     ChaCha20Poly1305, // 0x1303
-    Aes256Gcm,       // 0x1302
+    Aes256Gcm,        // 0x1302
 }
 
 impl CipherSuite {
@@ -102,8 +102,12 @@ impl CipherSuite {
         }
     }
 
-    pub const fn iv_len(self) -> usize { 12 }
-    pub const fn tag_len(self) -> usize { 16 }
+    pub const fn iv_len(self) -> usize {
+        12
+    }
+    pub const fn tag_len(self) -> usize {
+        16
+    }
 
     pub const fn hash_alg(self) -> HashAlg {
         match self {
@@ -133,7 +137,7 @@ impl CipherSuite {
 
 /// Per-direction traffic keys
 pub struct TrafficKeys {
-    pub key: [u8; 32],   // max key length
+    pub key: [u8; 32], // max key length
     pub iv: [u8; 12],
     pub key_len: usize,
     pub seq: u64,
@@ -164,10 +168,14 @@ impl TrafficKeys {
         let mut n = self.iv;
         let seq_bytes = self.seq.to_be_bytes();
         // XOR sequence number into last 8 bytes of IV
-        n[4] ^= seq_bytes[0]; n[5] ^= seq_bytes[1];
-        n[6] ^= seq_bytes[2]; n[7] ^= seq_bytes[3];
-        n[8] ^= seq_bytes[4]; n[9] ^= seq_bytes[5];
-        n[10] ^= seq_bytes[6]; n[11] ^= seq_bytes[7];
+        n[4] ^= seq_bytes[0];
+        n[5] ^= seq_bytes[1];
+        n[6] ^= seq_bytes[2];
+        n[7] ^= seq_bytes[3];
+        n[8] ^= seq_bytes[4];
+        n[9] ^= seq_bytes[5];
+        n[10] ^= seq_bytes[6];
+        n[11] ^= seq_bytes[7];
         n
     }
 
@@ -182,7 +190,9 @@ impl TrafficKeys {
     /// defence against a torn implementation reusing nonces.
     #[must_use]
     pub fn advance_seq(&mut self) -> bool {
-        if self.seq == u64::MAX { return false; }
+        if self.seq == u64::MAX {
+            return false;
+        }
         self.seq += 1;
         true
     }
@@ -287,30 +297,42 @@ pub fn encrypt_record_in_place(
         CipherSuite::ChaCha20Poly1305 => {
             let mut key = [0u8; 32];
             // SAFETY: keys.key is a 32-byte array; copying fixed length.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
+            }
             let tag = chacha20_poly1305_encrypt(&key, &nonce, &aad, &mut buf[..data_len]);
             // SAFETY: bounds check at function entry guarantees data_len + 16 ≤ buf.len().
-            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16);
+            }
             zeroize(&mut key);
         }
         CipherSuite::Aes128Gcm => {
             let mut key = [0u8; 16];
             // SAFETY: keys.key holds the AES-128-GCM key in its first 16 bytes.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16);
+            }
             let gcm = AesGcm::new_128(&key);
             let tag = gcm.encrypt(&nonce, &aad, &mut buf[..data_len]);
             // SAFETY: bounds check at function entry guarantees data_len + 16 ≤ buf.len().
-            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16);
+            }
             zeroize(&mut key);
         }
         CipherSuite::Aes256Gcm => {
             let mut key = [0u8; 32];
             // SAFETY: keys.key is a 32-byte array.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
+            }
             let gcm = AesGcm::new_256(&key);
             let tag = gcm.encrypt(&nonce, &aad, &mut buf[..data_len]);
             // SAFETY: bounds check at function entry guarantees data_len + 16 ≤ buf.len().
-            unsafe { core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.as_mut_ptr().add(data_len), 16);
+            }
             zeroize(&mut key);
         }
     }
@@ -362,13 +384,17 @@ pub fn decrypt_record(
     record_header: &[u8; 5],
     ciphertext: &mut [u8],
 ) -> Option<(usize, u8)> {
-    if ciphertext.len() < 17 { return None; } // at least 1 byte content_type + 16 byte tag
+    if ciphertext.len() < 17 {
+        return None;
+    } // at least 1 byte content_type + 16 byte tag
 
     let tag_start = ciphertext.len() - 16;
     let mut tag = [0u8; 16];
     // SAFETY: pointer arithmetic over the TLS record buffer; bounds
     // checked against record length before each deref.
-    unsafe { core::ptr::copy_nonoverlapping(ciphertext.as_ptr().add(tag_start), tag.as_mut_ptr(), 16); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(ciphertext.as_ptr().add(tag_start), tag.as_mut_ptr(), 16);
+    }
 
     let data = &mut ciphertext[..tag_start];
     let nonce = keys.nonce();
@@ -379,7 +405,9 @@ pub fn decrypt_record(
             let mut key = [0u8; 32];
             // SAFETY: pointer arithmetic over the TLS record buffer; bounds
             // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
+            }
             let r = chacha20_poly1305_decrypt(&key, &nonce, record_header, data, &tag);
             zeroize(&mut key);
             r
@@ -388,7 +416,9 @@ pub fn decrypt_record(
             let mut key = [0u8; 16];
             // SAFETY: pointer arithmetic over the TLS record buffer; bounds
             // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 16);
+            }
             let gcm = AesGcm::new_128(&key);
             let r = gcm.decrypt(&nonce, record_header, data, &tag);
             zeroize(&mut key);
@@ -398,7 +428,9 @@ pub fn decrypt_record(
             let mut key = [0u8; 32];
             // SAFETY: pointer arithmetic over the TLS record buffer; bounds
             // checked against record length before each deref.
-            unsafe { core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(keys.key.as_ptr(), key.as_mut_ptr(), 32);
+            }
             let gcm = AesGcm::new_256(&key);
             let r = gcm.decrypt(&nonce, record_header, data, &tag);
             zeroize(&mut key);
@@ -408,27 +440,35 @@ pub fn decrypt_record(
 
     zeroize(&mut tag);
 
-    if !ok { return None; }
+    if !ok {
+        return None;
+    }
 
     // MAC verified — now advance sequence counter. RFC 8446 §5.3:
     // refuse to decrypt past 2^64-1; signal to the caller (None ≡
     // bad MAC) so the session is torn down rather than reusing
     // a nonce.
-    if !keys.advance_seq() { return None; }
+    if !keys.advance_seq() {
+        return None;
+    }
 
     // Find inner content type (last non-zero byte of decrypted data)
     let mut pt_len = data.len();
     while pt_len > 0 && data[pt_len - 1] == 0 {
         pt_len -= 1;
     }
-    if pt_len == 0 { return None; }
+    if pt_len == 0 {
+        return None;
+    }
     pt_len -= 1;
     let inner_type = data[pt_len];
     // Wipe the inner-type byte — it is copied into the return value, and
     // leaving it in the scratch buffer leaks across record reuses.
     // SAFETY: pointer arithmetic over the TLS record buffer; bounds
     // checked against record length before each deref.
-    unsafe { core::ptr::write_volatile(data.as_mut_ptr().add(pt_len), 0u8); }
+    unsafe {
+        core::ptr::write_volatile(data.as_mut_ptr().add(pt_len), 0u8);
+    }
 
     Some((pt_len, inner_type))
 }

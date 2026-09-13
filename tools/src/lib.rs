@@ -58,8 +58,8 @@ pub mod modules_build;
 pub mod monitor;
 pub mod observability;
 // Local OCI image-layout content store for `.fmod` modules and workload
-// bundles (`.context/fmod_registry_plan.md` P1/P2). Offline-first: publish
-// and consume both touch only the local store.
+// bundles. Offline-first: publish and consume both touch only the
+// local store.
 pub mod oci_store;
 // Standalone, unit-testable validator for `presentation.shell` /
 // `presentation.browser_overlay` descriptors. Dependency-light
@@ -107,8 +107,10 @@ pub mod abi_surface;
 
 /// Reusable continuity/protocol cores — path-mounted from
 /// `modules/sdk/cores/` so the host test suite exercises the exact
-/// logic modules `include!`. `nonce_reservation` carries the Phase-7
-/// R2 fencing semantics; its tests are the executable,
-/// state-machine-level form of the §18 "R2 nonce non-reuse under
-/// forced recovery" verification gate.
+/// logic modules `include!`. `nonce_reservation` carries the epoch
+/// fencing rule that no egress counter value is ever emitted twice
+/// across a takeover: a forced (unsafe) quorum recovery voids every
+/// outstanding block, and emission may resume only under a strictly
+/// higher epoch. Its tests are the executable, state-machine-level
+/// form of that non-reuse guarantee.
 pub mod continuity_cores;

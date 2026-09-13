@@ -20,16 +20,6 @@ curl -L -o firmware/43439A0_clm.bin \
   https://github.com/raspberrypi/pico-sdk/raw/master/lib/cyw43-driver/firmware/43439A0_clm.bin
 ```
 
-Or use the alternative embassy repository:
-
-```bash
-curl -L -o firmware/43439A0.bin \
-  https://github.com/embassy-rs/embassy/raw/main/cyw43-firmware/43439A0.bin
-
-curl -L -o firmware/43439A0_clm.bin \
-  https://github.com/embassy-rs/embassy/raw/main/cyw43-firmware/43439A0_clm.bin
-```
-
 ## Verification
 
 After downloading, verify the files:

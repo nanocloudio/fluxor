@@ -13,7 +13,10 @@
 /// (RFC 9000 §17.1 + Appendix A.2). Always returns 4 — the longest
 /// form — since loss recovery here is conservative and the extra
 /// bytes don't matter at our throughput.
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 pub fn pick_pn_len(_next: u64, _largest_acked: u64) -> usize {
     4
 }
@@ -54,22 +57,17 @@ pub const PKT_RETRY: u8 = 3;
 /// AES-128-GCM with fixed key + nonce, AAD = Retry Pseudo-Packet,
 /// plaintext = empty. The tag is appended to the Retry packet bytes.
 pub const QUIC_V1_RETRY_INTEGRITY_KEY: [u8; 16] = [
-    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
-    0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
 ];
 pub const QUIC_V1_RETRY_INTEGRITY_NONCE: [u8; 12] = [
-    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
-    0x23, 0x98, 0x25, 0xbb,
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
 
 /// Compute the 16-byte Retry Integrity Tag for the supplied Retry
 /// Pseudo-Packet (RFC 9000 §17.2.5.1). Pseudo-packet = 1-byte ODCID
 /// length + ODCID + the entire Retry packet up to (but not including)
 /// the integrity tag.
-pub unsafe fn compute_retry_integrity_tag(
-    odcid: &[u8],
-    retry_packet_no_tag: &[u8],
-) -> [u8; 16] {
+pub unsafe fn compute_retry_integrity_tag(odcid: &[u8], retry_packet_no_tag: &[u8]) -> [u8; 16] {
     // Build the pseudo-packet AAD into a stack buffer.
     let mut aad = [0u8; 256];
     let mut p = 0;
@@ -158,10 +156,7 @@ pub struct ParsedRetry {
 /// (`expected_odcid`). On success returns offsets/lengths into `pkt`
 /// for the DCID, SCID, and Retry Token. Verifies the integrity tag
 /// (RFC 9001 §5.8) using AES-128-GCM with the fixed key/nonce.
-pub unsafe fn parse_retry_packet(
-    pkt: &[u8],
-    expected_odcid: &[u8],
-) -> Option<ParsedRetry> {
+pub unsafe fn parse_retry_packet(pkt: &[u8], expected_odcid: &[u8]) -> Option<ParsedRetry> {
     if pkt.len() < 1 + 4 + 1 + 1 + 16 {
         return None;
     }
@@ -197,11 +192,7 @@ pub unsafe fn parse_retry_packet(
 
     // Verify integrity tag.
     let mut expected = [0u8; 16];
-    core::ptr::copy_nonoverlapping(
-        pkt.as_ptr().add(no_tag_len),
-        expected.as_mut_ptr(),
-        16,
-    );
+    core::ptr::copy_nonoverlapping(pkt.as_ptr().add(no_tag_len), expected.as_mut_ptr(), 16);
     let actual = compute_retry_integrity_tag(expected_odcid, &pkt[..no_tag_len]);
     let mut diff = 0u8;
     let mut i = 0;
@@ -235,11 +226,7 @@ pub unsafe fn parse_retry_packet(
 /// We list QUIC v1 (`0x00000001`) plus one reserved-greasing version
 /// (RFC 9000 §6.3) so an implementation that mirrors back the
 /// negotiated set sees that we'd accept v1.
-pub unsafe fn build_version_negotiation(
-    dcid: &[u8],
-    scid: &[u8],
-    out: &mut [u8],
-) -> usize {
+pub unsafe fn build_version_negotiation(dcid: &[u8], scid: &[u8], out: &mut [u8]) -> usize {
     let total = 1 + 4 + 1 + dcid.len() + 1 + scid.len() + 4 + 4;
     if out.len() < total {
         return 0;
@@ -294,7 +281,18 @@ pub unsafe fn build_initial_packet(
     payload: &[u8],
     out: &mut [u8],
 ) -> usize {
-    build_long_packet(keys, hp, pn, pn_len, PKT_INITIAL, dcid, scid, Some(token), payload, out)
+    build_long_packet(
+        keys,
+        hp,
+        pn,
+        pn_len,
+        PKT_INITIAL,
+        dcid,
+        scid,
+        Some(token),
+        payload,
+        out,
+    )
 }
 
 #[allow(
@@ -311,7 +309,18 @@ pub unsafe fn build_handshake_packet(
     payload: &[u8],
     out: &mut [u8],
 ) -> usize {
-    build_long_packet(keys, hp, pn, pn_len, PKT_HANDSHAKE, dcid, scid, None, payload, out)
+    build_long_packet(
+        keys,
+        hp,
+        pn,
+        pn_len,
+        PKT_HANDSHAKE,
+        dcid,
+        scid,
+        None,
+        payload,
+        out,
+    )
 }
 
 #[allow(
@@ -384,11 +393,7 @@ unsafe fn build_long_packet(
     p += pn_len;
     // Payload (cleartext — AEAD applied next).
     if !payload.is_empty() {
-        core::ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            out.as_mut_ptr().add(p),
-            payload.len(),
-        );
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), out.as_mut_ptr().add(p), payload.len());
     }
     p += payload.len();
     // Tag (filled by AEAD).
@@ -546,11 +551,7 @@ pub unsafe fn parse_long_packet(
     core::ptr::copy_nonoverlapping(pkt.as_ptr(), aad.as_mut_ptr(), aad_end);
 
     let mut tag = [0u8; 16];
-    core::ptr::copy_nonoverlapping(
-        pkt.as_ptr().add(body_off + body_len),
-        tag.as_mut_ptr(),
-        16,
-    );
+    core::ptr::copy_nonoverlapping(pkt.as_ptr().add(body_off + body_len), tag.as_mut_ptr(), 16);
 
     if !quic_decrypt_payload(
         keys,
@@ -617,11 +618,7 @@ pub unsafe fn build_one_rtt_packet(
     encode_pn(&mut out[pn_offset..pn_offset + pn_len], pn, pn_len);
     p += pn_len;
     if !payload.is_empty() {
-        core::ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            out.as_mut_ptr().add(p),
-            payload.len(),
-        );
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), out.as_mut_ptr().add(p), payload.len());
     }
     p += payload.len();
     p += 16;
@@ -688,11 +685,7 @@ pub unsafe fn parse_one_rtt_packet(
     }
     core::ptr::copy_nonoverlapping(pkt.as_ptr(), aad.as_mut_ptr(), aad_end);
     let mut tag = [0u8; 16];
-    core::ptr::copy_nonoverlapping(
-        pkt.as_ptr().add(body_off + body_len),
-        tag.as_mut_ptr(),
-        16,
-    );
+    core::ptr::copy_nonoverlapping(pkt.as_ptr().add(body_off + body_len), tag.as_mut_ptr(), 16);
     if !quic_decrypt_payload(
         keys,
         pn,

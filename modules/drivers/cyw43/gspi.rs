@@ -10,15 +10,15 @@
 //! 3. Receive response data via PIO DMA (if read command)
 //! 4. CS deassert (GPIO high)
 //!
-//! txn_write/txn_read execute the full transfer inline. For backward
-//! compatibility with existing callers, they set txn_step = WaitPio and
-//! return 0. txn_poll then returns the result immediately (no kernel call).
+//! txn_write/txn_read execute the full transfer inline, then leave the
+//! transaction at txn_step = WaitPio so every caller finishes the same way:
+//! txn_poll reports the already-known result without a further kernel call.
 
-use super::constants::*;
-use super::Cyw43State;
-use super::abi::platform::rp::pio::CmdTransferArgs as PioCmdTransferArgs;
 use super::abi::contracts::hal::gpio as dev_gpio;
 use super::abi::platform::rp::pio as dev_pio;
+use super::abi::platform::rp::pio::CmdTransferArgs as PioCmdTransferArgs;
+use super::constants::*;
+use super::Cyw43State;
 
 // ============================================================================
 // PIO Word Byte Swap
@@ -27,7 +27,7 @@ use super::abi::platform::rp::pio as dev_pio;
 /// Swap the two 16-bit halves of a u32.
 /// Required for all gSPI accesses BEFORE 32-bit word mode is configured.
 /// The CYW43 chip starts in 16-bit word mode and reassembles two 16-bit
-/// halves with swapped order. Embassy calls this `swap16()`.
+/// halves with swapped order.
 #[inline]
 pub fn swap16(x: u32) -> u32 {
     x.rotate_left(16)
@@ -94,14 +94,9 @@ pub enum TxnStep {
 ///
 /// TX buffer layout: [tx_words(4)] [cmd(4)] [data(padded)] [rx_words=0(4)]
 ///
-/// Sets txn_step = WaitPio for backward compat; call `txn_poll()` to
-/// retrieve the result (returns immediately, no kernel call).
-pub unsafe fn txn_write(
-    s: &mut Cyw43State,
-    function: u32,
-    address: u32,
-    data: &[u8],
-) -> i32 {
+/// Leaves txn_step = WaitPio; call `txn_poll()` to retrieve the result
+/// (it returns immediately, with no kernel call).
+pub unsafe fn txn_write(s: &mut Cyw43State, function: u32, address: u32, data: &[u8]) -> i32 {
     let sys = &*s.syscalls;
 
     if s.txn_step != TxnStep::Idle {
@@ -151,7 +146,7 @@ pub unsafe fn txn_write(
     // No byte-swap needed: PIO shifts each u32 MSB first, and the chip
     // reassembles the same 32-bit value. For 8-bit writes, the data byte
     // sits in bits[7:0] of the u32 (native LE position), which is where
-    // the chip expects it. Embassy/pico-sdk also send raw u32 without swap.
+    // the chip expects it; the pico-sdk sends the raw u32 without a swap too.
 
     // Append rx_words = 0 (no RX phase for writes)
     // Use raw pointer to avoid bounds-check panic in PIC
@@ -166,7 +161,10 @@ pub unsafe fn txn_write(
     let tx_bytes = rx_off + 4;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    {
+        let mut _l = [0u8];
+        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+    }
 
     // Start PIO transfer (TX only, no RX)
     let transfer_args = PioCmdTransferArgs {
@@ -183,9 +181,12 @@ pub unsafe fn txn_write(
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
-
     if result < 0 {
+        // Not started: nothing is on the bus, so release it now.
+        {
+            let mut _l = [1u8];
+            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        }
         return result;
     }
 
@@ -207,14 +208,9 @@ pub unsafe fn txn_write(
 ///   - Bus/WLAN reads: rx_words = 1 (response) + payload_words
 ///   - Backplane reads: rx_words = 2 (response + pad) + payload_words
 ///
-/// Sets txn_step = WaitPio for backward compat; call `txn_poll()` to
-/// retrieve the result. Read payload via `rxn_u32()` / `rxn_payload_ptr()`.
-pub unsafe fn txn_read(
-    s: &mut Cyw43State,
-    function: u32,
-    address: u32,
-    read_len: usize,
-) -> i32 {
+/// Leaves txn_step = WaitPio; call `txn_poll()` to retrieve the result.
+/// Read payload via `rxn_u32()` / `rxn_payload_ptr()`.
+pub unsafe fn txn_read(s: &mut Cyw43State, function: u32, address: u32, read_len: usize) -> i32 {
     let sys = &*s.syscalls;
 
     if s.txn_step != TxnStep::Idle {
@@ -232,7 +228,7 @@ pub unsafe fn txn_read(
     // With RESPONSE_DELAY=4, all functions have a padding word before payload.
     // Backplane always has 1 padding word. Bus/WLAN skip depends on RESPONSE_DELAY.
     let skip_words: usize = if function == FUNC_BACKPLANE {
-        1  // backplane always has 1 padding word
+        1 // backplane always has 1 padding word
     } else if function == FUNC_BUS {
         GSPI_SKIP_WORDS_BUS
     } else {
@@ -272,7 +268,10 @@ pub unsafe fn txn_read(
     s.txn_rx_payload_len = read_len as u16;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    {
+        let mut _l = [0u8];
+        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+    }
 
     // Start PIO transfer (TX cmd+rx_count, RX response+payload)
     let transfer_args = PioCmdTransferArgs {
@@ -289,9 +288,12 @@ pub unsafe fn txn_read(
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
-
     if result < 0 {
+        // Not started: nothing is on the bus, so release it now.
+        {
+            let mut _l = [1u8];
+            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        }
         return result;
     }
 
@@ -300,24 +302,79 @@ pub unsafe fn txn_read(
     0
 }
 
-/// Complete a gSPI transaction.
+/// Advance a gSPI transaction in flight.
 ///
-/// Transfer already completed synchronously in txn_write/txn_read.
-/// Returns the byte count immediately (no kernel call).
+/// Returns 0 while the transfer is still running — call again next step —
+/// the byte count once it has completed, and a negative value if it
+/// failed. CS is held low from start to completion, because the chip's
+/// transaction ends when CS rises; releasing it before the DMA has finished
+/// ends the transaction with data still in flight.
 pub unsafe fn txn_poll(s: &mut Cyw43State) -> i32 {
+    const EAGAIN: i32 = -11;
     if s.txn_step != TxnStep::WaitPio {
         return -1;
     }
-
+    let sys = &*s.syscalls;
+    let rc = (sys.provider_call)(s.pio_handle, dev_pio::CMD_POLL, core::ptr::null_mut(), 0);
+    if rc == EAGAIN {
+        return 0;
+    }
+    {
+        let mut _l = [1u8];
+        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+    }
     s.txn_step = TxnStep::Idle;
+    if rc < 0 {
+        // The one place a bus error surfaces; every phase above turns it
+        // into a silent halt, so it is named here.
+        let mut line = *b"[cyw43] txn fail rc=-000 len=00000";
+        let mag = (-rc) as u32;
+        line[21] = b'0' + ((mag / 100) % 10) as u8;
+        line[22] = b'0' + ((mag / 10) % 10) as u8;
+        line[23] = b'0' + (mag % 10) as u8;
+        let l = s.txn_len as u32;
+        line[29] = b'0' + ((l / 10000) % 10) as u8;
+        line[30] = b'0' + ((l / 1000) % 10) as u8;
+        line[31] = b'0' + ((l / 100) % 10) as u8;
+        line[32] = b'0' + ((l / 10) % 10) as u8;
+        line[33] = b'0' + (l % 10) as u8;
+        super::log_error(s, &line);
+        return rc;
+    }
     s.txn_len as i32
+}
+
+/// Run a transaction in flight to completion.
+///
+/// For bring-up, where the caller has nothing else to do and a bounded spin
+/// is simpler than a state machine: firmware upload, backplane windows,
+/// the ioctls that configure association. The bound is generous against
+/// the longest frame and exists so that a transfer the kernel has given up
+/// on cannot hold the step for ever.
+pub unsafe fn txn_wait(s: &mut Cyw43State) -> i32 {
+    let mut spins = 0u32;
+    loop {
+        let r = txn_poll(s);
+        if r != 0 {
+            return r;
+        }
+        spins += 1;
+        if spins > 2_000_000 {
+            super::log_error(s, b"[cyw43] txn wait: gave up");
+            txn_reset(s);
+            return -1;
+        }
+    }
 }
 
 /// Reset transaction state (e.g., after error).
 pub unsafe fn txn_reset(s: &mut Cyw43State) {
     let sys = &*s.syscalls;
     // Ensure CS is high
-    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    {
+        let mut _l = [1u8];
+        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+    }
     s.txn_step = TxnStep::Idle;
     s.txn_len = 0;
 }
@@ -349,7 +406,7 @@ pub unsafe fn bus_write8_start(s: &mut Cyw43State, addr: u32, value: u8) -> i32 
 }
 
 /// Write a 32-bit value with swap16 on both cmd and data (pre-init, 16-bit mode).
-/// Embassy uses this for bus config before 32-bit word mode is active.
+/// Used for bus config before 32-bit word mode is active.
 pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u32) -> i32 {
     let sys = &*s.syscalls;
 
@@ -362,19 +419,34 @@ pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u3
     let tx_words: u32 = 2; // cmd + data
 
     let tw = tx_words.to_le_bytes();
-    s.txn_buf[0] = tw[0]; s.txn_buf[1] = tw[1]; s.txn_buf[2] = tw[2]; s.txn_buf[3] = tw[3];
+    s.txn_buf[0] = tw[0];
+    s.txn_buf[1] = tw[1];
+    s.txn_buf[2] = tw[2];
+    s.txn_buf[3] = tw[3];
 
     let cb = cmd.to_le_bytes();
-    s.txn_buf[4] = cb[0]; s.txn_buf[5] = cb[1]; s.txn_buf[6] = cb[2]; s.txn_buf[7] = cb[3];
+    s.txn_buf[4] = cb[0];
+    s.txn_buf[5] = cb[1];
+    s.txn_buf[6] = cb[2];
+    s.txn_buf[7] = cb[3];
 
     let db = data.to_le_bytes();
-    s.txn_buf[8] = db[0]; s.txn_buf[9] = db[1]; s.txn_buf[10] = db[2]; s.txn_buf[11] = db[3];
+    s.txn_buf[8] = db[0];
+    s.txn_buf[9] = db[1];
+    s.txn_buf[10] = db[2];
+    s.txn_buf[11] = db[3];
 
     // rx_words = 0
-    s.txn_buf[12] = 0; s.txn_buf[13] = 0; s.txn_buf[14] = 0; s.txn_buf[15] = 0;
+    s.txn_buf[12] = 0;
+    s.txn_buf[13] = 0;
+    s.txn_buf[14] = 0;
+    s.txn_buf[15] = 0;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    {
+        let mut _l = [0u8];
+        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+    }
 
     let transfer_args = PioCmdTransferArgs {
         tx_ptr: s.txn_buf.as_ptr(),
@@ -390,9 +462,12 @@ pub unsafe fn bus_write32_swapped_start(s: &mut Cyw43State, addr: u32, value: u3
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
-
     if result < 0 {
+        // Not started: nothing is on the bus, so release it now.
+        {
+            let mut _l = [1u8];
+            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        }
         return result;
     }
 
@@ -416,19 +491,31 @@ pub unsafe fn bus_read32_swapped_start(s: &mut Cyw43State, addr: u32) -> i32 {
     let rx_words: u32 = 2; // payload + status (no skip for bus)
 
     let tw = tx_words.to_le_bytes();
-    s.txn_buf[0] = tw[0]; s.txn_buf[1] = tw[1]; s.txn_buf[2] = tw[2]; s.txn_buf[3] = tw[3];
+    s.txn_buf[0] = tw[0];
+    s.txn_buf[1] = tw[1];
+    s.txn_buf[2] = tw[2];
+    s.txn_buf[3] = tw[3];
 
     let cb = cmd.to_le_bytes();
-    s.txn_buf[4] = cb[0]; s.txn_buf[5] = cb[1]; s.txn_buf[6] = cb[2]; s.txn_buf[7] = cb[3];
+    s.txn_buf[4] = cb[0];
+    s.txn_buf[5] = cb[1];
+    s.txn_buf[6] = cb[2];
+    s.txn_buf[7] = cb[3];
 
     let rw = rx_words.to_le_bytes();
-    s.txn_buf[8] = rw[0]; s.txn_buf[9] = rw[1]; s.txn_buf[10] = rw[2]; s.txn_buf[11] = rw[3];
+    s.txn_buf[8] = rw[0];
+    s.txn_buf[9] = rw[1];
+    s.txn_buf[10] = rw[2];
+    s.txn_buf[11] = rw[3];
 
     s.txn_rx_skip_words = 0;
     s.txn_rx_payload_len = 4;
 
     // Assert CS
-    { let mut _l = [0u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
+    {
+        let mut _l = [0u8];
+        (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+    }
 
     let transfer_args = PioCmdTransferArgs {
         tx_ptr: s.txn_buf.as_ptr(),
@@ -444,9 +531,12 @@ pub unsafe fn bus_read32_swapped_start(s: &mut Cyw43State, addr: u32) -> i32 {
     );
 
     // Deassert CS — transfer completes synchronously
-    { let mut _l = [1u8]; (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1); }
-
     if result < 0 {
+        // Not started: nothing is on the bus, so release it now.
+        {
+            let mut _l = [1u8];
+            (sys.provider_call)(s.cs_handle, dev_gpio::SET_LEVEL, _l.as_mut_ptr(), 1);
+        }
         return result;
     }
 
@@ -467,18 +557,20 @@ pub fn rxn_payload_ptr(s: &Cyw43State) -> *const u8 {
     unsafe { s.rxn_buf.as_ptr().add(skip) }
 }
 
+/// The same payload, writable, for the one caller that edits a parsed
+/// header in place rather than staging a copy of the frame behind it.
+/// Taking it from `&mut Cyw43State` is what gives the write provenance for
+/// the buffer; casting the read pointer above would not.
+pub fn rxn_payload_ptr_mut(s: &mut Cyw43State) -> *mut u8 {
+    let skip = s.txn_rx_skip_words as usize * 4;
+    unsafe { s.rxn_buf.as_mut_ptr().add(skip) }
+}
+
 /// Get the u32 result from the RX buffer after a completed read.
 /// Skips response/pad words to read actual payload.
 pub fn rxn_u32(s: &Cyw43State) -> u32 {
     let p = rxn_payload_ptr(s);
-    unsafe {
-        u32::from_le_bytes([
-            *p,
-            *p.add(1),
-            *p.add(2),
-            *p.add(3),
-        ])
-    }
+    unsafe { u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]) }
 }
 
 /// Get the u8 result from the RX buffer after a completed read.
@@ -496,14 +588,7 @@ pub fn rxn_raw_u32(s: &Cyw43State, word_idx: usize) -> u32 {
         return 0;
     }
     let p = unsafe { s.rxn_buf.as_ptr().add(off) };
-    unsafe {
-        u32::from_le_bytes([
-            *p,
-            *p.add(1),
-            *p.add(2),
-            *p.add(3),
-        ])
-    }
+    unsafe { u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]) }
 }
 
 // ============================================================================
@@ -529,7 +614,9 @@ pub unsafe fn bp_set_window(s: &mut Cyw43State, addr: u32) -> i32 {
         ((window >> 24) & 0xFF) as u8,
     ];
     let r = txn_write(s, FUNC_BACKPLANE, REG_BP_WIN, &win_bytes);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
     1 // Transaction started, caller must poll then call bp_window_done
 }
 
@@ -562,16 +649,21 @@ pub unsafe fn wrapper_write8_start(s: &mut Cyw43State, addr: u32, value: u8) -> 
 }
 
 /// Start a backplane read (32-bit).
-/// Embassy ORs BP_32BIT_FLAG (0x8000) into the address for 32-bit backplane reads.
+/// BP_32BIT_FLAG (0x8000) is ORed into the address for 32-bit backplane reads.
 pub unsafe fn bp_read32_start(s: &mut Cyw43State, addr: u32) -> i32 {
     txn_read(s, FUNC_BACKPLANE, (addr & BP_WIN_MASK) | BP_32BIT_FLAG, 4)
 }
 
 /// Start a backplane write (32-bit).
-/// Embassy ORs BP_32BIT_FLAG (0x8000) into the address for 32-bit backplane writes.
+/// BP_32BIT_FLAG (0x8000) is ORed into the address for 32-bit backplane writes.
 pub unsafe fn bp_write32_start(s: &mut Cyw43State, addr: u32, value: u32) -> i32 {
     let data = value.to_le_bytes();
-    txn_write(s, FUNC_BACKPLANE, (addr & BP_WIN_MASK) | BP_32BIT_FLAG, &data)
+    txn_write(
+        s,
+        FUNC_BACKPLANE,
+        (addr & BP_WIN_MASK) | BP_32BIT_FLAG,
+        &data,
+    )
 }
 
 /// Start a backplane block write (for firmware/NVRAM upload).
@@ -592,15 +684,12 @@ pub unsafe fn bp_write_block_start(
 
 /// Synchronous gSPI write — txn_write + txn_poll in one call.
 /// Returns >0 on success, <0 on error. Leaves txn in Idle state.
-pub unsafe fn txn_write_sync(
-    s: &mut Cyw43State,
-    function: u32,
-    address: u32,
-    data: &[u8],
-) -> i32 {
+pub unsafe fn txn_write_sync(s: &mut Cyw43State, function: u32, address: u32, data: &[u8]) -> i32 {
     let r = txn_write(s, function, address, data);
-    if r < 0 { return r; }
-    txn_poll(s)
+    if r < 0 {
+        return r;
+    }
+    txn_wait(s)
 }
 
 /// Synchronous gSPI read — txn_read + txn_poll in one call.
@@ -613,8 +702,10 @@ pub unsafe fn txn_read_sync(
     read_len: usize,
 ) -> i32 {
     let r = txn_read(s, function, address, read_len);
-    if r < 0 { return r; }
-    txn_poll(s)
+    if r < 0 {
+        return r;
+    }
+    txn_wait(s)
 }
 
 /// Synchronous backplane window set.
@@ -630,7 +721,9 @@ pub unsafe fn bp_set_window_sync(s: &mut Cyw43State, addr: u32) -> i32 {
         ((window >> 24) & 0xFF) as u8,
     ];
     let r = txn_write_sync(s, FUNC_BACKPLANE, REG_BP_WIN, &win_bytes);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
     s.bp_window = window;
     1
 }
@@ -644,7 +737,9 @@ pub unsafe fn bp_write_block_sync(
     len: usize,
 ) -> i32 {
     let r = bp_set_window_sync(s, addr);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
 
     let slice = core::slice::from_raw_parts(data, len);
     txn_write_sync(s, FUNC_BACKPLANE, addr & BP_WIN_MASK, slice)
@@ -655,11 +750,7 @@ pub unsafe fn bp_write_block_sync(
 // ============================================================================
 
 /// Start a WLAN frame write (function 2).
-pub unsafe fn wlan_write_start(
-    s: &mut Cyw43State,
-    data: *const u8,
-    len: usize,
-) -> i32 {
+pub unsafe fn wlan_write_start(s: &mut Cyw43State, data: *const u8, len: usize) -> i32 {
     if len > MAX_FRAME_SIZE {
         return -2;
     }
@@ -678,11 +769,7 @@ pub unsafe fn wlan_read_start(s: &mut Cyw43State, len: usize) -> i32 {
 // ============================================================================
 
 /// Start a BT frame write (function 3, HCI commands to chip).
-pub unsafe fn bt_write_start(
-    s: &mut Cyw43State,
-    data: *const u8,
-    len: usize,
-) -> i32 {
+pub unsafe fn bt_write_start(s: &mut Cyw43State, data: *const u8, len: usize) -> i32 {
     if len > MAX_FRAME_SIZE {
         return -2;
     }

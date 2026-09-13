@@ -1,16 +1,18 @@
-//! Placement resolver — the pure, deterministic core
-//! (`.context/rfc_adaptive_presentation.md` §9/§10).
+//! Placement resolver — the pure, deterministic core that turns declared
+//! control intent into a concrete on-screen (or on-button) layout.
 //!
 //! `resolve(intents, surface)` maps each control's declared *intent* onto a
 //! concrete *disposition* (chrome / content / bound / hidden) given the runtime
 //! `SurfaceTraits`. It is a pure function — same inputs, same output — so it is
-//! unit-tested here host-side with no browser and no device (RFC acceptance
-//! criterion #4). This is the canonical reference implementation; the on-device
+//! unit-tested here host-side with no browser and no device: the tests drive
+//! `resolve` with synthetic `SurfaceTraits` and assert the disposition of every
+//! control, so the placement rules are proven without any hardware or renderer
+//! in the loop. This is the canonical reference implementation; the on-device
 //! `presentation.resolver` PIC module mirrors this algorithm (with fixed-size
 //! arrays instead of `Vec`), and the `resolve→hidden` build lint runs
 //! this same function against a config's declared surfaces.
 //!
-//! Algorithm (RFC §10.2), strictly one-directional (surface in, layout out):
+//! Algorithm, strictly one-directional (surface in, layout out):
 //!   1. **size filter** — a control below its `min_size_class` can't render.
 //!   2. **physical binding** — a control with `bind_physical` claims a free
 //!      hardware button (when the surface has physical buttons). The action is
@@ -67,7 +69,7 @@ pub enum SizeClass {
 }
 
 /// One control's declared intent (the resolver-relevant subset of a
-/// `presentation.shell` control + its §9 metadata).
+/// `presentation.shell` control plus its control-intent metadata).
 #[derive(Clone, Debug)]
 pub struct ControlIntent {
     pub id: String,
@@ -146,7 +148,8 @@ pub struct LayoutEntry {
 pub struct LayoutResolution {
     pub entries: Vec<LayoutEntry>,
     /// Physical-button → action(control id) map for `Bound` controls (the
-    /// legend an audio-less / chrome-less surface still needs, RFC §14).
+    /// legend an audio-less / chrome-less surface still needs, since a bound
+    /// control draws nothing of its own).
     pub legend: Vec<(String, String)>,
 }
 
@@ -357,8 +360,9 @@ fn plane_code(p: Option<Plane>) -> u8 {
 }
 
 /// Encode a resolution to the `presentation.layout` wire record. `epoch` is the
-/// `SurfaceTraits.epoch` this layout was resolved from (stamped so a consumer
-/// can detect a stale layout — RFC §12).
+/// `SurfaceTraits.epoch` this layout was resolved from, stamped so a consumer
+/// can tell a layout resolved against older traits from a current one and
+/// discard the stale record.
 pub fn encode(res: &LayoutResolution, epoch: u32) -> Vec<u8> {
     // The wire format counts entries, legend entries, and name lengths in single
     // bytes (`LEGEND_NONE` = 0xFF also reserves the top legend index). Clamp to
@@ -599,7 +603,7 @@ pub fn decode(buf: &[u8]) -> Option<WireLayout> {
     Some(WireLayout { epoch, entries })
 }
 
-// ── Build-time lint (resolve→hidden, rfc_adaptive_presentation.md §9) ──
+// ── Build-time lint (resolve→hidden) ────────────────────────────────
 //
 // Runs the resolver against a config's declared surface and reports any
 // `essential` control that cannot be surfaced there (`unplaceable`). This is

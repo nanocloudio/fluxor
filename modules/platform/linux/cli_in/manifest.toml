@@ -2,7 +2,7 @@ version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
 
-# Host argv + stdin source (rfc_cli_execution.md §4.1). argv is one record —
+# Host argv + stdin source. argv is one record —
 # everything after `--` in the process's own argv, NUL-separated. stdin bytes
 # stream on stdin_out; the module returns Done at EOF once fully forwarded.
 [[ports]]

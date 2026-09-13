@@ -35,7 +35,7 @@ shape regardless of which producer is on the other end:
 | `FmpMessage`        | Semantic commands after mapping              | `foundation/gesture`, `wasm_browser_action`                    |
 | `SurfaceTraits`     | Environment-plane snapshots (viewport, modality, audio config) | `wasm_browser_surface_traits`, `linux_surface_traits` |
 | `InputBinaryState`  | Keyboard-state snapshots on a single port    | `wasm_browser_dom_input`                                       |
-| `InputEvent`        | Legacy generic input surface                 | `gt911` touch driver                                           |
+| `InputEvent`        | Generic surface: a driver's own record shape, for a device that fits none of the per-class surfaces | `gt911` touch driver             |
 | `GestureMatch`      | Recognised gesture pattern                   | gesture recognisers                                            |
 
 Wiring edges that mismatch surfaces fail the build with a content-type

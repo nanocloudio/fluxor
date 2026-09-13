@@ -17,8 +17,8 @@
 
 /// QUIC v1 initial salt (RFC 9001 §5.2).
 pub const QUIC_V1_INITIAL_SALT: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
-    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
+    0xcc, 0xbb, 0x7f, 0x0a,
 ];
 
 pub const QUIC_KEY_LEN: usize = 16; // AES-128-GCM
@@ -47,7 +47,12 @@ impl QuicKeys {
 /// Initial packet's DCID field). Returns (client_initial, server_initial).
 pub unsafe fn derive_initial_keys(dcid: &[u8]) -> (QuicKeys, QuicKeys) {
     let mut initial_secret = [0u8; 32];
-    hkdf_extract(HashAlg::Sha256, &QUIC_V1_INITIAL_SALT, dcid, &mut initial_secret);
+    hkdf_extract(
+        HashAlg::Sha256,
+        &QUIC_V1_INITIAL_SALT,
+        dcid,
+        &mut initial_secret,
+    );
 
     let mut client_secret = [0u8; 32];
     hkdf_expand_label(
@@ -97,7 +102,13 @@ pub unsafe fn next_traffic_secret(current: &[u8], out: &mut [u8]) {
 /// `prev_hp` per RFC 9001 §6.1.
 pub unsafe fn next_keys(next_secret: &[u8], prev_hp: [u8; QUIC_HP_KEY_LEN]) -> QuicKeys {
     let mut keys = QuicKeys::empty();
-    hkdf_expand_label(HashAlg::Sha256, next_secret, b"quic key", &[], &mut keys.key);
+    hkdf_expand_label(
+        HashAlg::Sha256,
+        next_secret,
+        b"quic key",
+        &[],
+        &mut keys.key,
+    );
     hkdf_expand_label(HashAlg::Sha256, next_secret, b"quic iv", &[], &mut keys.iv);
     keys.hp = prev_hp;
     keys
@@ -131,14 +142,14 @@ pub unsafe fn apply_header_protection(
         return;
     }
     let mut sample = [0u8; 16];
-    core::ptr::copy_nonoverlapping(
-        pkt.as_ptr().add(pn_offset + 4),
-        sample.as_mut_ptr(),
-        16,
-    );
+    core::ptr::copy_nonoverlapping(pkt.as_ptr().add(pn_offset + 4), sample.as_mut_ptr(), 16);
     hp.encrypt_block(&mut sample);
 
-    let first_mask = if is_long { sample[0] & 0x0f } else { sample[0] & 0x1f };
+    let first_mask = if is_long {
+        sample[0] & 0x0f
+    } else {
+        sample[0] & 0x1f
+    };
     pkt[0] ^= first_mask;
     let mut i = 0;
     while i < pn_len {
@@ -160,14 +171,14 @@ pub unsafe fn remove_header_protection(
         return 0;
     }
     let mut sample = [0u8; 16];
-    core::ptr::copy_nonoverlapping(
-        pkt.as_ptr().add(pn_offset + 4),
-        sample.as_mut_ptr(),
-        16,
-    );
+    core::ptr::copy_nonoverlapping(pkt.as_ptr().add(pn_offset + 4), sample.as_mut_ptr(), 16);
     hp.encrypt_block(&mut sample);
 
-    let first_mask = if is_long { sample[0] & 0x0f } else { sample[0] & 0x1f };
+    let first_mask = if is_long {
+        sample[0] & 0x0f
+    } else {
+        sample[0] & 0x1f
+    };
     pkt[0] ^= first_mask;
     let pn_len = 1 + ((pkt[0] & 0x03) as usize);
     let mut i = 0;
@@ -253,34 +264,35 @@ pub fn quic_decrypt_payload(
 /// the public surface; it isn't called from the live module path so
 /// it gets dead-stripped, but the compiler validates that the API
 /// surface is consistent.
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 unsafe fn rfc9001_a1_self_check() -> bool {
     let dcid: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
     let (client, server) = derive_initial_keys(&dcid);
 
     let expected_client_key: [u8; 16] = [
-        0x1f, 0x36, 0x96, 0x13, 0xdd, 0x76, 0xd5, 0x46, 0x77, 0x30,
-        0xef, 0xcb, 0xe3, 0xb1, 0xa2, 0x2d,
+        0x1f, 0x36, 0x96, 0x13, 0xdd, 0x76, 0xd5, 0x46, 0x77, 0x30, 0xef, 0xcb, 0xe3, 0xb1, 0xa2,
+        0x2d,
     ];
     let expected_client_iv: [u8; 12] = [
-        0xfa, 0x04, 0x4b, 0x2f, 0x42, 0xa3, 0xfd, 0x3b, 0x46, 0xfb,
-        0x25, 0x5c,
+        0xfa, 0x04, 0x4b, 0x2f, 0x42, 0xa3, 0xfd, 0x3b, 0x46, 0xfb, 0x25, 0x5c,
     ];
     let expected_client_hp: [u8; 16] = [
-        0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a,
-        0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2,
+        0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed,
+        0xd2,
     ];
     let expected_server_key: [u8; 16] = [
-        0xcf, 0x3a, 0x53, 0x31, 0x65, 0x3c, 0x36, 0x4c, 0x88, 0xf0,
-        0xf3, 0x79, 0xb6, 0x06, 0x7e, 0x37,
+        0xcf, 0x3a, 0x53, 0x31, 0x65, 0x3c, 0x36, 0x4c, 0x88, 0xf0, 0xf3, 0x79, 0xb6, 0x06, 0x7e,
+        0x37,
     ];
     let expected_server_iv: [u8; 12] = [
-        0x0a, 0xc1, 0x49, 0x3c, 0xa1, 0x90, 0x58, 0x53, 0xb0, 0xbb,
-        0xa0, 0x3e,
+        0x0a, 0xc1, 0x49, 0x3c, 0xa1, 0x90, 0x58, 0x53, 0xb0, 0xbb, 0xa0, 0x3e,
     ];
     let expected_server_hp: [u8; 16] = [
-        0xc2, 0x06, 0xb8, 0xd9, 0xb9, 0xf0, 0xf3, 0x76, 0x44, 0x43,
-        0x0b, 0x49, 0x0e, 0xea, 0xa3, 0x14,
+        0xc2, 0x06, 0xb8, 0xd9, 0xb9, 0xf0, 0xf3, 0x76, 0x44, 0x43, 0x0b, 0x49, 0x0e, 0xea, 0xa3,
+        0x14,
     ];
 
     bytes_eq(&client.key, &expected_client_key)
@@ -291,7 +303,10 @@ unsafe fn rfc9001_a1_self_check() -> bool {
         && bytes_eq(&server.hp, &expected_server_hp)
 }
 
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

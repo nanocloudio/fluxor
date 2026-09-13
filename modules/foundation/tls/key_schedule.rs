@@ -42,11 +42,7 @@ impl KeySchedule {
 
     /// Derive handshake secrets from ECDH shared secret and transcript hash
     /// (hash of ClientHello..ServerHello)
-    pub fn derive_handshake_secrets(
-        &mut self,
-        ecdh_shared: &[u8; 32],
-        transcript_hash: &[u8],
-    ) {
+    pub fn derive_handshake_secrets(&mut self, ecdh_shared: &[u8; 32], transcript_hash: &[u8]) {
         let hl = self.hash_len;
         let alg = self.alg;
 
@@ -55,10 +51,21 @@ impl KeySchedule {
         hash_empty(alg, &mut empty_hash[..hl]);
 
         let mut derived = [0u8; 48];
-        derive_secret(alg, &self.early_secret[..hl], b"derived", &empty_hash[..hl], &mut derived[..hl]);
+        derive_secret(
+            alg,
+            &self.early_secret[..hl],
+            b"derived",
+            &empty_hash[..hl],
+            &mut derived[..hl],
+        );
 
         // Handshake Secret = HKDF-Extract(Derived, ECDH)
-        hkdf_extract(alg, &derived[..hl], ecdh_shared, &mut self.handshake_secret[..hl]);
+        hkdf_extract(
+            alg,
+            &derived[..hl],
+            ecdh_shared,
+            &mut self.handshake_secret[..hl],
+        );
 
         // The early secret and the intermediate HKDF derivation are no
         // longer needed once the handshake secret has been extracted.
@@ -66,8 +73,20 @@ impl KeySchedule {
         zeroize(&mut derived);
 
         // client/server handshake traffic secrets
-        derive_secret(alg, &self.handshake_secret[..hl], b"c hs traffic", transcript_hash, &mut self.client_hs_secret[..hl]);
-        derive_secret(alg, &self.handshake_secret[..hl], b"s hs traffic", transcript_hash, &mut self.server_hs_secret[..hl]);
+        derive_secret(
+            alg,
+            &self.handshake_secret[..hl],
+            b"c hs traffic",
+            transcript_hash,
+            &mut self.client_hs_secret[..hl],
+        );
+        derive_secret(
+            alg,
+            &self.handshake_secret[..hl],
+            b"s hs traffic",
+            transcript_hash,
+            &mut self.server_hs_secret[..hl],
+        );
     }
 
     /// Derive application traffic secrets from transcript hash
@@ -81,17 +100,40 @@ impl KeySchedule {
         hash_empty(alg, &mut empty_hash[..hl]);
 
         let mut derived = [0u8; 48];
-        derive_secret(alg, &self.handshake_secret[..hl], b"derived", &empty_hash[..hl], &mut derived[..hl]);
+        derive_secret(
+            alg,
+            &self.handshake_secret[..hl],
+            b"derived",
+            &empty_hash[..hl],
+            &mut derived[..hl],
+        );
 
         // Master Secret = HKDF-Extract(Derived, 0)
         let zero = [0u8; 48];
-        hkdf_extract(alg, &derived[..hl], &zero[..hl], &mut self.master_secret[..hl]);
+        hkdf_extract(
+            alg,
+            &derived[..hl],
+            &zero[..hl],
+            &mut self.master_secret[..hl],
+        );
 
         zeroize(&mut derived);
 
         // Application traffic secrets
-        derive_secret(alg, &self.master_secret[..hl], b"c ap traffic", transcript_hash, &mut self.client_app_secret[..hl]);
-        derive_secret(alg, &self.master_secret[..hl], b"s ap traffic", transcript_hash, &mut self.server_app_secret[..hl]);
+        derive_secret(
+            alg,
+            &self.master_secret[..hl],
+            b"c ap traffic",
+            transcript_hash,
+            &mut self.client_app_secret[..hl],
+        );
+        derive_secret(
+            alg,
+            &self.master_secret[..hl],
+            b"s ap traffic",
+            transcript_hash,
+            &mut self.server_app_secret[..hl],
+        );
     }
 
     /// Compute Finished verify_data
@@ -101,7 +143,13 @@ impl KeySchedule {
 
         // finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
         let mut finished_key = [0u8; 48];
-        hkdf_expand_label(alg, &base_key[..hl], b"finished", &[], &mut finished_key[..hl]);
+        hkdf_expand_label(
+            alg,
+            &base_key[..hl],
+            b"finished",
+            &[],
+            &mut finished_key[..hl],
+        );
 
         // Return the finished_key — the actual verify_data is HMAC(finished_key, transcript_hash)
         // computed by caller with the current transcript hash
@@ -112,7 +160,12 @@ impl KeySchedule {
     pub fn finished_verify_data(&self, finished_key: &[u8], transcript_hash: &[u8]) -> [u8; 48] {
         let hl = self.hash_len;
         let mut out = [0u8; 48];
-        hmac(self.alg, &finished_key[..hl], transcript_hash, &mut out[..hl]);
+        hmac(
+            self.alg,
+            &finished_key[..hl],
+            transcript_hash,
+            &mut out[..hl],
+        );
         out
     }
 }
@@ -136,14 +189,16 @@ impl KeySchedule {
     /// Derive `client_early_traffic_secret` from the early secret +
     /// transcript hash through the truncated ClientHello (i.e. up to
     /// but not including the binders array, RFC 8446 §4.2.11.2).
-    pub fn derive_client_early_traffic(
-        &self,
-        ch_truncated_hash: &[u8],
-        out: &mut [u8],
-    ) {
+    pub fn derive_client_early_traffic(&self, ch_truncated_hash: &[u8], out: &mut [u8]) {
         let alg = self.alg;
         let hl = self.hash_len;
-        derive_secret(alg, &self.early_secret[..hl], b"c e traffic", ch_truncated_hash, &mut out[..hl]);
+        derive_secret(
+            alg,
+            &self.early_secret[..hl],
+            b"c e traffic",
+            ch_truncated_hash,
+            &mut out[..hl],
+        );
     }
 
     /// Compute the PSK binder. binder = HMAC(finished_key,
@@ -156,9 +211,21 @@ impl KeySchedule {
         let mut empty_hash = [0u8; 48];
         hash_empty(alg, &mut empty_hash[..hl]);
         let mut binder_key = [0u8; 48];
-        derive_secret(alg, &self.early_secret[..hl], b"res binder", &empty_hash[..hl], &mut binder_key[..hl]);
+        derive_secret(
+            alg,
+            &self.early_secret[..hl],
+            b"res binder",
+            &empty_hash[..hl],
+            &mut binder_key[..hl],
+        );
         let mut finished_key = [0u8; 48];
-        hkdf_expand_label(alg, &binder_key[..hl], b"finished", &[], &mut finished_key[..hl]);
+        hkdf_expand_label(
+            alg,
+            &binder_key[..hl],
+            b"finished",
+            &[],
+            &mut finished_key[..hl],
+        );
         let mut out = [0u8; 48];
         hmac(alg, &finished_key[..hl], ch_truncated_hash, &mut out[..hl]);
         out
@@ -169,7 +236,13 @@ impl KeySchedule {
     pub fn derive_resumption_master(&self, transcript_hash: &[u8], out: &mut [u8]) {
         let alg = self.alg;
         let hl = self.hash_len;
-        derive_secret(alg, &self.master_secret[..hl], b"res master", transcript_hash, &mut out[..hl]);
+        derive_secret(
+            alg,
+            &self.master_secret[..hl],
+            b"res master",
+            transcript_hash,
+            &mut out[..hl],
+        );
     }
 
     /// Derive a PSK from RMS + ticket_nonce (RFC 8446 §4.6.1):
@@ -194,7 +267,13 @@ impl KeySchedule {
 /// borrow of the single secret being advanced.
 pub fn advance_traffic_secret(alg: HashAlg, hash_len: usize, secret: &mut [u8; 48]) {
     let mut next = [0u8; 48];
-    hkdf_expand_label(alg, &secret[..hash_len], b"traffic upd", &[], &mut next[..hash_len]);
+    hkdf_expand_label(
+        alg,
+        &secret[..hash_len],
+        b"traffic upd",
+        &[],
+        &mut next[..hash_len],
+    );
     *secret = next;
     zeroize(&mut next);
 }
@@ -208,7 +287,9 @@ fn hash_empty(alg: HashAlg, out: &mut [u8]) {
             let n = if out.len() < 32 { out.len() } else { 32 };
             // SAFETY: pointer arithmetic over fixed-size key-schedule scalars
             // (HKDF output, traffic secret slots).
-            unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n);
+            }
         }
         HashAlg::Sha384 => {
             let h = Sha384::new();
@@ -216,7 +297,9 @@ fn hash_empty(alg: HashAlg, out: &mut [u8]) {
             let n = if out.len() < 48 { out.len() } else { 48 };
             // SAFETY: pointer arithmetic over fixed-size key-schedule scalars
             // (HKDF output, traffic secret slots).
-            unsafe { core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(digest.as_ptr(), out.as_mut_ptr(), n);
+            }
         }
     }
 }

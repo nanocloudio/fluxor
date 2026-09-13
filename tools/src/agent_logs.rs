@@ -1,4 +1,5 @@
-//! `fluxor agent logs` reader core (`rfc_owner_drain_and_logs.md` §4.5).
+//! `fluxor agent logs` reader core — the owner-filtered log stream the CLI
+//! prints.
 //!
 //! Locates an owner's per-owner log ring file(s) under the runtime's `logs/`
 //! sidecar directory, decodes them through the shared
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use fluxor_contracts::log_ring::{read_ring_records, GapCursor, LogRecord, RingHeader, HEADER_LEN};
 
 /// The all-zero UID names owner 0 (platform / system records), addressed on the
-/// CLI by the reserved literal `system` (§4.2). A workload UID is never all-zero
+/// CLI by the reserved literal `system`. A workload UID is never all-zero
 /// (validation rejects it), so this is unambiguous.
 pub const SYSTEM_UID: [u8; 16] = [0u8; 16];
 
@@ -46,7 +47,8 @@ pub fn uid_hex(uid: &[u8; 16]) -> String {
 
 /// Ring files under `logs_dir` belonging to `uid`, i.e. named
 /// `<uid_hex>.<slot>.<gen>.ring`. There is at most one live plus one retained
-/// file per UID (§4.4), but the reader tolerates any number.
+/// file per UID — the current generation's ring plus the retained previous
+/// one — but the reader tolerates any number.
 pub fn ring_files_for(logs_dir: &Path, uid: &[u8; 16]) -> Vec<PathBuf> {
     let prefix = format!("{}.", uid_hex(uid));
     let mut files = Vec::new();
@@ -132,8 +134,9 @@ pub fn apply_filter(records: &[LogRecord], filter: &LogFilter) -> Vec<LogRecord>
 }
 
 /// Persistent line renderer: synthesizes a `[LogsTruncated dropped=N]` line
-/// whenever a `seq` gap appears **within a generation** (a gap is per-cursor
-/// per §4.3; generation boundaries are not gaps). Holds its gap state across
+/// whenever a `seq` gap appears **within a generation**. Gaps are tracked per
+/// cursor, and `seq` restarts at each new owner generation, so a generation
+/// boundary is a fresh sequence — never a gap. Holds its gap state across
 /// calls so follow-mode polls form ONE continuous stream — a wrap between two
 /// polls is still reported exactly once.
 #[derive(Debug, Default)]

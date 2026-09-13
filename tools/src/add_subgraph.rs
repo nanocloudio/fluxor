@@ -1,6 +1,12 @@
 //! Host-side encoder for the on-device `AddSubgraph` wire format and the
-//! resident-pod config section (RFC adaptive_tick_extra §7 — the production
-//! `combine <two-graph.yaml>` / `pods:` path).
+//! resident-pod config section.
+//!
+//! A RESIDENT POD is a workload-owned subgraph declared in a graph YAML's
+//! `pods:` section and admitted by the kernel at boot, alongside the base
+//! graph rather than inside it. Each pod gets its own owner handle, its own
+//! state/buffer caps, and is scheduled as an independent resident graph — so
+//! a workload can be added, paced and parked without touching the base
+//! graph's wiring or its compiled body.
 //!
 //! The `AddSubgraph` (FLXA) blob produced here is byte-compatible with the
 //! kernel decoder `kernel::scheduler::live::apply_add_encoded`: big-endian,
@@ -12,10 +18,12 @@
 //! kernel reads it in `kernel::config::read_config_from_slice` and admits each
 //! pod at boot via `apply_add_encoded` + `finalize_resident_graphs`.
 //!
-//! v1 scope (matches the strict-isolation decision): pods are self-contained
-//! subgraphs — intra-pod edges only (`New → New`); module params are the inline
-//! TLV produced by `schema::build_params_from_schema` (no `data:`-section blob
-//! references — those are a documented follow-up).
+//! Scope: pods are self-contained subgraphs — intra-pod edges only
+//! (`New → New`), and those edges must stay inside one domain, because a
+//! cross-domain edge needs the SPSC bridge that boot provisions for base
+//! edges and `apply_add` does not open. Module params are the inline TLV
+//! produced by `schema::build_params_from_schema`; a pod module cannot
+//! reference a `data:`-section blob.
 
 /// Wire magic for an `AddSubgraph` blob: "FLXA". Mirrors
 /// `kernel::scheduler::live::ADD_MAGIC`.
@@ -62,11 +70,14 @@ pub struct Pod {
     pub buffer_cap: u32,
     pub modules: Vec<PodModule>,
     pub edges: Vec<PodEdge>,
-    /// Idle-safe attestation (RFC adaptive_tick_extra §6.5): the operator/tooling
-    /// asserts every module in this pod is demand-driven (event/periodic-woken)
-    /// and may be fully parked when idle. Carried in the FXPD per-pod flags byte;
-    /// the kernel fail-closes an UNATTESTED pod to the `tick_max` backstop cadence
-    /// rather than parking it.
+    /// Idle-safe attestation (graph YAML `idle_safe: true` on the pod): the
+    /// operator asserts every module in this pod is demand-driven — it makes
+    /// progress only when an event or its own periodic schedule wakes it, and
+    /// never relies on being stepped to notice anything. Carried in the FXPD
+    /// per-pod flags byte. The scheduler ANDs the attestation across every
+    /// module the owner holds and parks the whole graph when idle only if all
+    /// of them attest; an UNATTESTED pod is fail-closed — never parked, only
+    /// relaxed to a liveness step every `tick_max`.
     pub idle_safe: bool,
 }
 

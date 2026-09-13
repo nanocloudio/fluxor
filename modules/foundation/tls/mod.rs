@@ -827,12 +827,12 @@ struct TlsState {
     /// demux). Learned from the `local_port` in the `MSG_BOUND` whose port
     /// matches [`Self::bind_port`] — i.e. the bind THIS instance issued,
     /// not a neighbour's on a shared fan. 0 = unknown → claim every accept
-    /// (single-anchor / legacy producer without the port).
+    /// (single-anchor, or a producer that forwards no port).
     accept_port: u16,
     /// Port from the `CMD_BIND` this TLS instance forwarded downstream
     /// (toward IP). Used to recognise our own `MSG_BOUND` on a shared
     /// `cipher_in` fan and ignore bounds belonging to other anchors.
-    /// 0 = no bind forwarded yet (accept any bound, legacy behaviour).
+    /// 0 = no bind forwarded yet (accept any bound).
     bind_port: u16,
     /// DTLS listener socket (shared `datagram_endpoint` core): one bound UDP
     /// endpoint for all peers, demuxed above by 4-tuple. Owns the bind
@@ -877,12 +877,12 @@ struct TlsState {
 
     // ── Hot-path telemetry (standards/observability.md §6) ─────────────
     //
-    // TLS sat between two instrumented modules and reported neither
-    // throughput nor idleness: `ip` and `http` both emit `[<mod>] tlm`,
-    // `tls` emitted only crypto-pool counters. That left the single most
-    // expensive layer in the stack — 76 % of a fresh connection on the
-    // 2026-07-26 rig baseline — as the one place you could not tell a
-    // compute-bound step from a back-pressured or an idle one.
+    // TLS is the most expensive layer in the stack — the bulk of the cost
+    // of a fresh connection — and it sits between two instrumented
+    // modules. Without throughput and idleness counters of its own it is
+    // the one place you cannot tell a compute-bound step from a
+    // back-pressured or an idle one, because `ip` and `http` both emit
+    // `[<mod>] tlm` and crypto-pool counters alone answer neither.
     //
     // `tlm` covers the CIPHER side (the `ip` seam) so `[tls] tlm rx/tx`
     // lines up directly against `[ip] tlm tx/rx` and a byte shortfall
@@ -1040,7 +1040,7 @@ define_params! {
 
     // Restrict the server's ALPN advertisement to `http/1.1` only. 0 keeps the
     // historic `h2` > `http/1.1` preference; 1 steers dual-offering clients to
-    // HTTP/1.1 so an h1-only proxy edge never negotiates h2 (workload_ingress §3).
+    // HTTP/1.1 so an h1-only proxy edge never negotiates h2.
     10, alpn_h1_only, u8, 0
         => |s, d, len| { s.alpn_h1_only = p_u8(d, len, 0, 0); };
 
@@ -1721,7 +1721,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // tag after the conn id. When `ip.net_out` is fanned to TLS plus
                 // another stream consumer (e.g. an OTLP exporter), claim an
                 // outbound connect ONLY if its tag is ours (or untagged, for
-                // single-consumer / legacy graphs) — otherwise it belongs to
+                // a single-consumer graph) — otherwise it belongs to
                 // the other consumer and starting a handshake on its plaintext
                 // socket would corrupt it. Inbound accepts (MSG_ACCEPTED) are
                 // unaffected: TLS is the sole accept-claimant on its channel.
@@ -1744,7 +1744,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // Server-mode inbound accept. Multi-anchor demux: when
                     // the frame carries a listener port (pl >= 3) and we've
                     // learned our bound port, claim only our port's accepts.
-                    // A port-less frame (legacy) or unknown bound port →
+                    // A port-less frame or an unknown bound port →
                     // claim (sole-consumer behaviour).
                     if pl >= CONN_ID_LEN + 2 && s.accept_port != 0 {
                         // `[conn_id u16 LE][local_port u16 LE]`, as MSG_BOUND.
@@ -1755,7 +1755,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         true
                     }
                 };
-                // Cleartext passthrough (workload_ingress §5): a SERVER-mode
+                // Cleartext passthrough: a SERVER-mode
                 // TLS instance's clear-side consumer (an h1 proxy relay) dialed
                 // a cleartext backend via CMD_CONNECT. `pending_connect_active`
                 // in server mode is set ONLY by a clear-side CMD_CONNECT (there
@@ -1880,7 +1880,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let data_len = pl - 2;
                     if is_passthrough(s, conn_id) {
                         // Cleartext backend → clear side, RAW. No session, no
-                        // decryption (workload_ingress §5).
+                        // decryption.
                         passthrough_relay(
                             s,
                             s.cipher_in,
@@ -2015,7 +2015,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 };
                 // Clean up session (or drop a passthrough conn's mark). A
                 // passthrough conn has no session, so `find_session` is -1;
-                // clearing the bit lets the id be reused (workload_ingress §5).
+                // clearing the bit lets the id be reused.
                 clear_passthrough(s, conn_id);
                 let si = find_session_by_conn_id(s, conn_id);
                 if si >= 0 {
@@ -2053,8 +2053,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // matches the bind THIS instance forwarded
                 // (`bind_port`). A non-matching bound belongs to
                 // another anchor — don't latch it and don't forward it
-                // to our downstream. A port-less (legacy) bound or an
-                // unknown `bind_port` is accepted as before.
+                // to our downstream. A port-less bound or an unknown
+                // `bind_port` is accepted unconditionally.
                 let mut bound_is_ours = true;
                 if t == NET_MSG_BOUND && rd >= CONN_ID_LEN + 2 {
                     // `[conn_id u16 LE][local_port u16 LE]` — the port follows
@@ -2224,7 +2224,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let data_len = pl - 2;
                     if is_passthrough(s, conn_id) {
                         // Clear side → cleartext backend, RAW. No session, no
-                        // encryption (workload_ingress §5).
+                        // encryption.
                         passthrough_relay(
                             s,
                             s.clear_in,
@@ -2339,7 +2339,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     0
                 };
                 // Drop any passthrough mark (no session, no close_notify — the
-                // backend hop is cleartext; workload_ingress §5). The raw
+                // backend hop is cleartext). The raw
                 // CMD_CLOSE forward below tears the backend TCP conn down.
                 clear_passthrough(s, conn_id);
                 // Send close_notify alert if session is ready
@@ -2675,7 +2675,7 @@ fn find_session_by_conn_id(s: &TlsState, conn_id: u16) -> i32 {
     -1
 }
 
-// ── Cleartext-passthrough conn tracking (workload_ingress §5) ────────────────
+// ── Cleartext-passthrough conn tracking ────────────────
 // A passthrough conn is NOT a session: no crypto state, no slot. These helpers
 // index a 256-bit bitmap by conn_id so the relay branches (added before every
 // `find_session_by_conn_id` on the data path) are O(1) and never disturb the
@@ -3751,7 +3751,7 @@ unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
 unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     // Captured before the `sess` borrow so the ALPN selection below can consult
-    // it without re-borrowing `s` (workload_ingress §3 ALPN restriction).
+    // it without re-borrowing `s`.
     let alpn_h1_only = s.alpn_h1_only != 0;
     let sess = &mut s.sessions[idx];
 
@@ -3824,7 +3824,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // extension overlaps with that list, we record the chosen
     // protocol so the EncryptedExtensions builder can echo it back.
     // When `alpn_h1_only` is set the server advertises only `http/1.1`,
-    // so a dual-offering client is steered to HTTP/1.1 (workload_ingress §3).
+    // so a dual-offering client is steered to HTTP/1.1.
     sess.driver.alpn_selected_len = 0;
     if let Some(list) = ch.alpn_protos {
         for offered in alpn_iter(list) {
@@ -4269,7 +4269,7 @@ unsafe fn forward_held_completion(s: &mut TlsState, idx: usize) {
             // MSG_ACCEPTED) so a fanned clear-side consumer can demux by
             // port — matching the port-qualified accepts TLS itself
             // consumes. A port-less form is forwarded only when we never
-            // learned our bound port (legacy / sole-consumer graph).
+            // learned our bound port (a sole-consumer graph).
             if s.accept_port != 0 {
                 let port = [(s.accept_port & 0xFF) as u8, (s.accept_port >> 8) as u8];
                 tls_write_or_count(s, s.clear_out, held, conn_id, port.as_ptr(), 2)
@@ -5128,7 +5128,12 @@ unsafe fn tls_write_or_count(
 /// still delivers the stream; only the retransmit fast-path degrades.
 unsafe fn retx_push(sess: &mut TlsSession, rec: *const u8, n: u16) {
     let rec = core::slice::from_raw_parts(rec, usize::from(n));
-    retx_push_window(&mut sess.retx_buf, &mut sess.retx_len, &mut sess.retx_base_seq, rec);
+    retx_push_window(
+        &mut sess.retx_buf,
+        &mut sess.retx_len,
+        &mut sess.retx_base_seq,
+        rec,
+    );
 }
 
 /// Drop bytes up to `acked_seq` from the session's retransmit buffer.

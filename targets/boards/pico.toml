@@ -6,10 +6,26 @@ id = "pico"
 silicon = "rp2040"
 description = "Raspberry Pi Pico"
 
+# Crystal frequency -- a BOARD fact, not silicon: the die takes whatever
+# crystal the board fits. Every RP board in this tree fits 12 MHz, which is
+# what the Pico family schematic specifies. clk_ref runs from XOSC undivided
+# after clock init, so this is also clk_ref.
+# Fallback console pins -- a BOARD fact: which header pins carry UART0 is
+# wiring, not silicon. GP0/GP1 on the Pico family, which is where a USB-serial
+# adapter goes. This is the log path that survives a USB stack that will not
+# enumerate, so it exists to make that failure diagnosable.
+[hardware.console_uart]
+tx_pin = 0
+rx_pin = 1
+baud = 115200
+
+[hardware.xosc]
+hz = 12000000
+
 [gpio]
 reserved_pins = []
 
-# Public hardware-rig contract (see .context/rfc_hardware_rig.md §7).
+# Public hardware-rig contract.
 [rig]
 artifact = "uf2"
 deploy = ["deploy.uf2_mount", "deploy.picotool", "deploy.swd"]

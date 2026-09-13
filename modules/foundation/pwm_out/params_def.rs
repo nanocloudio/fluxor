@@ -1,5 +1,5 @@
-use super::PwmOutState;
 use super::p_u8;
+use super::PwmOutState;
 use super::SCHEMA_MAX;
 
 define_params! {

@@ -45,10 +45,10 @@ aliases = [
     { name = "rp1", root = "pcie2", bus = 1, dev = 0, func = 0 },
 ]
 
-# Public hardware-rig contract (see .context/rfc_hardware_rig.md §7).
+# Public hardware-rig contract.
 # Board-level facts only — bench-specific bindings live in private rig
 # profiles under ~/.config/fluxor/labs/. Capability strings are the fully
-# qualified vocabulary from RFC §6 and are matched exactly (no aliases).
+# qualified vocabulary and are matched exactly (no aliases).
 [rig]
 artifact = "kernel8_img"
 deploy = ["deploy.netboot_tftp", "deploy.bootfs_copy", "deploy.sd_image_writer"]

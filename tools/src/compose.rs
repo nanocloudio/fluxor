@@ -1,12 +1,11 @@
-//! Deterministic device-graph composition and reservation
-//! (rfc_k8s.md §6.7, §11).
+//! Deterministic device-graph composition and reservation.
 //!
 //! This is the trusted, host-side core of the node agent: it turns a
 //! `DeviceDesiredState` plus the node's capacity facts and prior owner-table
 //! snapshot into a `CompositionPlan` with deterministic owner-slot, generation,
 //! and module/edge index assignments, and a content digest over the result.
 //!
-//! Determinism is a hard contract (rfc_k8s.md §11): identical
+//! Determinism is a hard contract: identical
 //! `(desired, capacity, snapshot)` inputs must produce a byte-identical plan
 //! and the same `plan_digest`, so any node — or offline tooling — composes the
 //! same answer. The rules enforced here:
@@ -19,7 +18,7 @@
 //!     order.
 //!
 //! Artifact resolution, signature verification, and graph expansion (the rest
-//! of the §11 reconcile) layer on top of this module, which owns the
+//! of the reconcile) layer on top of this module, which owns the
 //! allocation/determinism and reservation invariants.
 
 use serde::{Deserialize, Serialize};
@@ -49,7 +48,7 @@ pub struct ResourceProfile {
 
 /// One declared network export of an admitted workload (mirrors the workload
 /// manifest's `Export`, minus the name — the agent joins the runtime's bound
-/// report against these; rfc_endpoint_lease.md §4.3). Persisted with the
+/// report against these). Persisted with the
 /// desired pod; `#[serde(default)]` tolerates a desired pod that declares none.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportDecl {
@@ -73,7 +72,7 @@ pub struct PodDesired {
     pub exports: Vec<ExportDecl>,
 }
 
-/// Whole-device desired state (rfc_k8s.md §11).
+/// Whole-device desired state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceDesiredState {
     pub generation: u64,
@@ -120,7 +119,7 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
     }
 }
 
-/// State of one owner slot in the prior owner table (rfc_k8s.md §11 input).
+/// State of one owner slot in the prior owner table (an input to composition).
 /// `generation` is the slot's persistent monotonic counter — it survives free,
 /// so reuse always issues a strictly higher generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,9 +137,8 @@ impl SlotState {
 
 /// Snapshot of the owner table, indexed by slot (slot 0 = system), plus the
 /// committed plan's records: prior assignments (so resident pods retain their
-/// module/edge ranges verbatim across membership changes —
-/// rfc_owner_drain_and_logs.md §3.3) and prior revocations (carried forward
-/// until expiry, §3.2).
+/// module/edge ranges verbatim across membership changes) and prior
+/// revocations (carried forward until expiry).
 #[derive(Clone, Debug, Default)]
 pub struct OwnerSnapshot {
     pub slots: Vec<SlotState>,
@@ -192,7 +190,7 @@ pub struct OwnerAssignment {
 }
 
 /// One departing owner: its last assignment record verbatim, plus the grace
-/// window (rfc_owner_drain_and_logs.md §3.2). Removal is ONE generation: the
+/// window. Removal is ONE generation: the
 /// record moves from the assignment section to the revocation section, carrying
 /// `deadline_unix = wallclock_at_publish + grace_secs` stamped by the agent.
 /// While live (deadline not yet passed + settle margin) it occupies its slot
@@ -206,8 +204,7 @@ pub struct PlanRevocation {
 }
 
 /// Settle margin added to a revocation's deadline before the agent drops the
-/// record on recompose — absorbs clock skew between agent invocations
-/// (rfc_owner_drain_and_logs.md §6.1).
+/// record on recompose — absorbs clock skew between agent invocations.
 pub const REVOCATION_SETTLE_SECS: u64 = 5;
 
 impl PlanRevocation {
@@ -226,7 +223,7 @@ pub struct CompositionPlan {
     /// Owners departing under a drain window, in ascending slot order. Usually
     /// empty; the revocation section is omitted from the encoding when empty.
     pub revocations: Vec<PlanRevocation>,
-    /// Granted endpoint leases (rfc_endpoint_lease.md §5.1), ordered by
+    /// Granted endpoint leases, ordered by
     /// (slot, protocol, port), empty when the workload declares no exports. The
     /// lease section is always encoded — its presence marks the plan lease-aware
     /// and makes bind-gate enforcement mandatory.
@@ -235,13 +232,13 @@ pub struct CompositionPlan {
 }
 
 /// One granted endpoint lease: owner `(slot, generation)` may bind
-/// `(protocol, port)` (rfc_endpoint_lease.md §5.1). Composed from the admitted
+/// `(protocol, port)`. Composed from the admitted
 /// workload's declared exports; the runtime's bind gate enforces it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanLease {
     pub slot: u16,
     pub generation: u32,
-    /// 1 = tcp, 2 = udp (rfc_endpoint_lease.md §7.3).
+    /// 1 = tcp, 2 = udp.
     pub protocol: u8,
     pub port: u16,
 }
@@ -262,12 +259,12 @@ pub fn lease_protocol(protocol: &str) -> Option<u8> {
     }
 }
 
-/// Why composition failed admission (rfc_k8s.md §12.1 static capacity).
+/// Why composition failed admission against the node's static capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComposeError {
     OwnerSlotsExhausted,
     /// Two owners were granted the same (protocol, port), or a lease intersects
-    /// the node's reserved-port set (rfc_endpoint_lease.md §5.2) — caught at
+    /// the node's reserved-port set — caught at
     /// commit, before anything runs.
     EndpointConflict,
     ModulesExceeded,
@@ -283,7 +280,7 @@ type Interval = (u32, u32); // (base, count)
 
 /// First-fit `count` into the space `[0, max)` avoiding `occupied` (sorted by
 /// base). Returns the base, or None when no gap holds it (free-but-fragmented
-/// space is reported honestly as exhaustion — rfc_owner_drain_and_logs.md §3.3).
+/// space is reported honestly as exhaustion).
 fn first_fit(occupied: &[Interval], count: u32, max: u32) -> Option<u32> {
     if count == 0 {
         return Some(0);
@@ -313,7 +310,7 @@ fn insert_interval(occupied: &mut Vec<Interval>, base: u32, count: u32) {
 /// `(desired, cap, prior, revoke_graces, now_unix)` — the clock is an input,
 /// stamped by the agent at publish, never read here.
 ///
-/// Revocation lifecycle (rfc_owner_drain_and_logs.md §3.2–§3.3): prior
+/// Revocation lifecycle: prior
 /// revocations are carried forward until expiry; a prior occupant absent from
 /// the new running set departs as a NEW revocation record (its last assignment
 /// verbatim + `deadline_unix = now + grace`); live revocations occupy their
@@ -402,14 +399,14 @@ pub fn compose(
         }
     }
 
-    // 4. Range layout (§3.3): live revocations hold their ranges; resident pods
+    // 4. Range layout: live revocations hold their ranges; resident pods
     //    whose profile still matches retain their prior ranges VERBATIM; new or
     //    resized pods first-fit into the gaps. Aggregate capacity charges
     //    running pods plus live revocations (the draining owner really is still
     //    holding modules/state/buffers).
     let mut module_occ: Vec<Interval> = Vec::new();
     let mut edge_occ: Vec<Interval> = Vec::new();
-    // The node substrate's platform prefix (rfc_system_services.md §1.1):
+    // The node substrate's platform prefix:
     // platform stacks PREPEND their modules (linux_net et al. at the low
     // indices), so the ownable range starts past them. Occupied, never
     // charged — system modules belong to no workload.
@@ -515,7 +512,7 @@ pub fn compose(
             buffer_cap: p.profile.buffer_bytes,
         });
 
-        // Endpoint leases (rfc_endpoint_lease.md §5.2): one per declared
+        // Endpoint leases: one per declared
         // tcp/udp export, charged against the pod's admitted endpoint count;
         // duplicates across owners and reserved-port intersections are
         // admission-time errors — a bind race between co-resident pods (or
@@ -569,11 +566,11 @@ pub fn compose(
 const ASSIGN_REC_LEN: usize = 16 + 2 + 4 + 2 + 2 + 2 + 2 + 4 + 4;
 
 /// Per-revocation fixed record width: an assignment record verbatim plus
-/// grace_secs(2) + deadline_unix(8) (rfc_owner_drain_and_logs.md §3.2).
+/// grace_secs(2) + deadline_unix(8).
 const REVOKE_REC_LEN: usize = ASSIGN_REC_LEN + 2 + 8;
 /// Per-lease fixed record width: slot(2) + generation(4) + protocol(1) + port(2).
 const LEASE_REC_LEN: usize = 2 + 4 + 1 + 2;
-/// Opens the lease section (rfc_endpoint_lease.md §5.1): an IMPOSSIBLE
+/// Opens the lease section: an IMPOSSIBLE
 /// revocation count (counts are capped at MAX_PLAN_ASSIGNMENTS), so the first
 /// u32 of the tail deterministically discriminates the sections — no length
 /// arithmetic is trusted for discrimination (48-byte revocation and 9-byte
@@ -630,7 +627,7 @@ fn plan_body(
             buf.extend_from_slice(&r.deadline_unix.to_be_bytes());
         }
     }
-    // Lease section (rfc_endpoint_lease.md §5.1): marker + count + records,
+    // Lease section: marker + count + records,
     // fixed order revocations-before-leases. The section is always emitted, even
     // with zero grants: its presence is the integrity-protected signal that the
     // plan is lease-aware, and the kernel bind gate enforces it mandatorily (an
@@ -668,8 +665,8 @@ fn digest_plan(
 }
 
 // ============================================================================
-// Binary plan codec (rfc_k8s.md §11: "the kernel consumes a validated bounded
-// binary plan; it does not parse Kubernetes objects, OCI manifests, or YAML")
+// Binary plan codec. The kernel consumes a validated, bounded binary plan; it
+// never parses Kubernetes objects, OCI manifests, or YAML.
 // ============================================================================
 
 /// Magic for an encoded device-graph plan: "FLXP".
@@ -741,7 +738,7 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
     }
     // Optional revocation section: present iff bytes remain between the
     // assignments and the digest (an empty revocation section is not encoded).
-    // Tail grammar (rfc_endpoint_lease.md §5.1): [rev_section] [lease_section],
+    // Tail grammar: [rev_section] [lease_section],
     // fixed order, each omitted when empty. The first u32 of the surplus
     // discriminates deterministically: LEASE_SECTION_MARKER (an impossible
     // revocation count) opens a lease section; a valid count (1..=cap) opens
@@ -864,7 +861,7 @@ pub fn decode_plan(bytes: &[u8]) -> Result<CompositionPlan, PlanDecodeError> {
 }
 
 // ============================================================================
-// Reservation protocol (rfc_k8s.md §6.7, §12.4)
+// Reservation protocol
 // ============================================================================
 
 /// A single-use placement reservation. Bound to the pod, the workload and plan
@@ -880,7 +877,8 @@ pub struct ReservationToken {
 /// Why staging a reservation was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReserveError {
-    /// The token's node epoch no longer matches — issued before a crash/recover.
+    /// The token's node epoch does not match the node's current one — it was
+    /// issued before a crash/recover.
     StaleEpoch,
     /// The token was already consumed (single-use violation).
     AlreadyConsumed,
@@ -888,7 +886,7 @@ pub enum ReserveError {
 
 /// Tracks the node epoch and consumed tokens so each reservation stages exactly
 /// once. A crash before commit is modelled by [`recover`](Self::recover), which
-/// bumps the epoch and invalidates every outstanding token (rfc_k8s.md §12.4).
+/// bumps the epoch and invalidates every outstanding token.
 #[derive(Clone, Debug)]
 pub struct Reservations {
     node_epoch: u64,
@@ -941,7 +939,7 @@ impl Reservations {
 
     /// Recover after a crash before commit: a fresh epoch invalidates every
     /// outstanding token, so a spent-but-uncommitted reservation can never
-    /// re-activate a candidate (rfc_k8s.md §12.4).
+    /// re-activate a candidate.
     pub fn recover(&mut self) {
         self.node_epoch = self.node_epoch.wrapping_add(1);
         self.consumed.clear();
@@ -1214,7 +1212,7 @@ mod tests {
         assert_eq!(decoded.leases, lease_only.leases);
         assert!(decoded.revocations.is_empty());
 
-        // THE COLLISION PAIR (rfc_endpoint_lease.md §5.1): 3 revocations and 16
+        // THE COLLISION PAIR: 3 revocations and 16
         // leases both occupy 148 tail bytes. Each decodes to its own section.
         let committed = sample_plan();
         let snap = snap_from(&committed, 16);
@@ -1254,7 +1252,7 @@ mod tests {
         );
         let rev_bytes = encode_plan(&with_revs);
         let lease_bytes = encode_plan(&sixteen_leases);
-        // The pre-marker ambiguity (rfc §5.1): under count-only framing, a
+        // The ambiguity the marker removes: under count-only framing, a
         // 3-revocation tail and a 16-lease tail would both be 148 bytes —
         // undecidable by length. The marker adds 4 bytes to the lease section
         // precisely to make the first u32 discriminate instead.
@@ -1481,7 +1479,7 @@ mod tests {
             pods: vec![pod(2, DesiredPhase::Running, profile(8, 10))],
         };
         let plan = compose(&ds, &cap(), &snap, &[(uid(1), 60)], 1000, &[], 0).unwrap();
-        // §3.3: the survivor's record is BYTE-identical (slot, gen, ranges).
+        // The survivor's record is BYTE-identical (slot, gen, ranges).
         assert_eq!(plan.assignments, vec![survivor]);
         // The departed owner's ranges are still held by its revocation.
         assert_eq!(plan.revocations[0].assignment, departed);
@@ -1668,21 +1666,6 @@ mod tests {
 
         // All three per-profile MAX_MODULES values, in declaration order
         // (host, wasm, embedded) — pins `kernel_max_modules` too.
-        fn extract_nth(src: &str, name: &str, n: usize) -> u64 {
-            let pat = format!("pub const {name}: usize = ");
-            let mut from = 0;
-            for _ in 0..n {
-                let at = src[from..]
-                    .find(&pat)
-                    .unwrap_or_else(|| panic!("{name} occurrence {n} not found"));
-                from += at + pat.len();
-            }
-            let rest = &src[from..];
-            rest[..rest.find(';').expect("terminator")]
-                .split('*')
-                .map(|t| t.trim().parse::<u64>().expect("integer term"))
-                .product()
-        }
         use crate::capacity::kernel_max_modules;
         assert_eq!(
             kernel_max_modules("linux") as u64,
@@ -1716,5 +1699,72 @@ mod tests {
             capacity_for_profile("rp2350").is_none(),
             "single-tenant target has no agent profile"
         );
+    }
+
+    /// The `n`th (1-based) `pub const <name>: usize = …;` in `src`, its
+    /// right-hand side evaluated as a product of integer terms.
+    ///
+    /// Per-profile constants are declared once each in host, wasm, embedded
+    /// order, so the occurrence index selects the profile. Textual because
+    /// the kernel cannot import a profile from behind its target cfg, which
+    /// is the same reason these guards exist at all.
+    fn extract_nth(src: &str, name: &str, n: usize) -> u64 {
+        let pat = format!("pub const {name}: usize = ");
+        let mut from = 0;
+        for _ in 0..n {
+            let at = src[from..]
+                .find(&pat)
+                .unwrap_or_else(|| panic!("{name} occurrence {n} not found"));
+            from += at + pat.len();
+        }
+        let rest = &src[from..];
+        rest[..rest.find(';').expect("terminator")]
+            .split('*')
+            .map(|t| t.trim().parse::<u64>().expect("integer term"))
+            .product()
+    }
+
+    /// Drift guard: the RP kernels size their log ring from the silicon
+    /// TOML (`[kernel] log_ring_kb` → `build.rs` → `chip_generated.rs`),
+    /// while `profile_embedded` publishes the same ceiling to the SDK and
+    /// composer. One number with two sources, so they are pinned to each
+    /// other here.
+    ///
+    /// What it prevents: an RP target taking the host-class 64 KiB ring,
+    /// which overflows `.bss` past the linker's RAM region on both parts
+    /// and surfaces as a link error naming no constant.
+    #[test]
+    fn log_ring_toml_mirrors_embedded_profile() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let sdk =
+            std::fs::read_to_string(repo.join("modules/sdk/abi/config.rs")).expect("sdk config");
+        let embedded = extract_nth(&sdk, "LOG_RING_CAPACITY", 3);
+
+        for silicon in ["rp2040", "rp2350"] {
+            let toml =
+                std::fs::read_to_string(repo.join(format!("targets/silicon/{silicon}.toml")))
+                    .expect("silicon toml");
+            let line = toml
+                .lines()
+                .find(|l| l.trim_start().starts_with("log_ring_kb"))
+                .unwrap_or_else(|| panic!("{silicon}: no log_ring_kb"));
+            let kb: u64 = line
+                .split('=')
+                .nth(1)
+                .expect("value")
+                .trim()
+                .parse()
+                .expect("integer");
+            assert_eq!(
+                kb * 1024,
+                embedded,
+                "{silicon} log_ring_kb ({kb} KiB) disagrees with \
+                 profile_embedded LOG_RING_CAPACITY ({embedded} bytes)"
+            );
+            assert!(
+                (kb * 1024).is_power_of_two(),
+                "{silicon} log ring must be a power of two (MASK indexing)"
+            );
+        }
     }
 }

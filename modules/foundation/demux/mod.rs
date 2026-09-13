@@ -21,7 +21,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -52,17 +51,29 @@ const STATE_SIZE: usize = core::mem::size_of::<DemuxState>();
 /// Pick a lane index (0 or 1) based on the IPv4/TCP 4-tuple, or None for
 /// non-TCP/IPv4 frames.
 unsafe fn classify_lane(frame: *const u8, len: usize) -> Option<u8> {
-    if len < 14 + 20 { return None; }
+    if len < 14 + 20 {
+        return None;
+    }
     let et = ((*frame.add(12) as u16) << 8) | (*frame.add(13) as u16);
-    if et != ETHERTYPE_IPV4 { return None; }
+    if et != ETHERTYPE_IPV4 {
+        return None;
+    }
     let ipv4 = frame.add(14);
     let vihl = *ipv4;
-    if (vihl >> 4) != 4 { return None; }
+    if (vihl >> 4) != 4 {
+        return None;
+    }
     let ihl_words = (vihl & 0x0F) as usize;
-    if ihl_words < 5 { return None; }
+    if ihl_words < 5 {
+        return None;
+    }
     let ip_hdr_len = ihl_words * 4;
-    if len < 14 + ip_hdr_len + 4 { return None; }
-    if *ipv4.add(9) != IPPROTO_TCP { return None; }
+    if len < 14 + ip_hdr_len + 4 {
+        return None;
+    }
+    if *ipv4.add(9) != IPPROTO_TCP {
+        return None;
+    }
 
     let src_ip = ((*ipv4.add(12) as u32) << 24)
         | ((*ipv4.add(13) as u32) << 16)
@@ -85,20 +96,28 @@ unsafe fn classify_lane(frame: *const u8, len: usize) -> Option<u8> {
 }
 
 unsafe fn write_framed(sys: &SyscallTable, chan: i32, buf: *const u8, total: usize) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     let poll = (sys.channel_poll)(chan, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return false;
+    }
     (sys.channel_write)(chan, buf, total);
     true
 }
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { STATE_SIZE }
+pub extern "C" fn module_state_size() -> usize {
+    STATE_SIZE
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 { 0 }
+pub extern "C" fn module_arena_size() -> u32 {
+    0
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
@@ -140,19 +159,29 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let s = &mut *(state as *mut DemuxState);
     let sys = &*s.syscalls;
 
-    if s.in_chan < 0 { return 0; }
+    if s.in_chan < 0 {
+        return 0;
+    }
 
     let poll = (sys.channel_poll)(s.in_chan, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 { return 0; }
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return 0;
+    }
 
     let buf = s.frame_buf.as_mut_ptr();
     let hn = (sys.channel_read)(s.in_chan, buf, 2);
-    if hn < 2 { return 0; }
+    if hn < 2 {
+        return 0;
+    }
     let frame_len = (*buf as usize) | ((*buf.add(1) as usize) << 8);
-    if frame_len == 0 || frame_len > MAX_FRAME { return 0; }
+    if frame_len == 0 || frame_len > MAX_FRAME {
+        return 0;
+    }
 
     let r = (sys.channel_read)(s.in_chan, buf.add(2), frame_len);
-    if r < frame_len as i32 { return 0; }
+    if r < frame_len as i32 {
+        return 0;
+    }
 
     let total = 2 + frame_len;
     let frame_ptr = buf.add(2) as *const u8;
@@ -171,7 +200,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             // Broadcast: control-plane traffic reaches both IP instances.
             let a = write_framed(sys, s.lane0_chan, buf as *const u8, total);
             let b = write_framed(sys, s.lane1_chan, buf as *const u8, total);
-            if a || b { s.broadcast = s.broadcast.wrapping_add(1); }
+            if a || b {
+                s.broadcast = s.broadcast.wrapping_add(1);
+            }
         }
     }
 

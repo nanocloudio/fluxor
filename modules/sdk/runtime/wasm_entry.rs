@@ -70,8 +70,7 @@ mod __wasm_entry {
         // so each call below transmutes through a fn-pointer of the
         // canonical shape.
         let state_size = unsafe {
-            let f: extern "C" fn() -> u32 =
-                core::mem::transmute(module_state_size as *const ());
+            let f: extern "C" fn() -> u32 = core::mem::transmute(module_state_size as *const ());
             f() as usize
         };
 
@@ -83,17 +82,15 @@ mod __wasm_entry {
         // pull into the buffer. MODULE_INSTANCE_PARAMS is dispatched
         // through `handle_core_primitive`, so it goes through
         // `provider_call` rather than the read-only query path.
-        let params_size = unsafe {
-            (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, core::ptr::null_mut(), 0)
-        };
+        let params_size =
+            unsafe { (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, core::ptr::null_mut(), 0) };
         let (params_ptr, params_len): (*const u8, usize) = if params_size > 0 {
             let n = params_size as usize;
             let buf = unsafe { (sys.heap_alloc)(params_size as u32) };
             if buf.is_null() {
                 return -1;
             }
-            let got =
-                unsafe { (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, buf, n) };
+            let got = unsafe { (sys.provider_call)(-1, OP_MODULE_INSTANCE_PARAMS, buf, n) };
             if got < 0 || (got as usize) != n {
                 return -1;
             }

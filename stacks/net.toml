@@ -3,9 +3,14 @@ name = "net"
 
 [[variant]]
 match = { board = "qemu-virt", phy = "ethernet", nic = "virtio" }
+# A NIC and the IP stack exchange frames in both directions, which the
+# scheduler sees as a cycle. Without this the graph is rejected at
+# `prepare_graph` and the board boots with no network — silently, since
+# the netconsole that would have reported it is on that network.
+accept_cycles = true
 modules = [
   { name = "virtio_net" },
-  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
+  { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [
   "virtio_net.frames_rx -> ip.frames_rx",
@@ -14,10 +19,15 @@ wiring = [
 
 [[variant]]
 match = { board = "pico2w", phy = "wifi", nic = "cyw43" }
+# A NIC and the IP stack exchange frames in both directions, which the
+# scheduler sees as a cycle. Without this the graph is rejected at
+# `prepare_graph` and the board boots with no network — silently, since
+# the netconsole that would have reported it is on that network.
+accept_cycles = true
 modules = [
   { name = "cyw43" },
   { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
-  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
+  { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [
   "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
@@ -29,10 +39,15 @@ wiring = [
 
 [[variant]]
 match = { board = "picow", phy = "wifi", nic = "cyw43" }
+# A NIC and the IP stack exchange frames in both directions, which the
+# scheduler sees as a cycle. Without this the graph is rejected at
+# `prepare_graph` and the board boots with no network — silently, since
+# the netconsole that would have reported it is on that network.
+accept_cycles = true
 modules = [
   { name = "cyw43" },
   { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
-  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
+  { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [
   "wifi.wifi_ctrl -> cyw43.wifi_ctrl",
@@ -44,10 +59,15 @@ wiring = [
 
 [[variant]]
 match = { board = "pi5", phy = "ethernet", nic = "rp1-gem" }
+# A NIC and the IP stack exchange frames in both directions, which the
+# scheduler sees as a cycle. Without this the graph is rejected at
+# `prepare_graph` and the board boots with no network — silently, since
+# the netconsole that would have reported it is on that network.
+accept_cycles = true
 modules = [
   { name = "rp1_gem" },
   { name = "conn_guard" },
-  { name = "ip", params = { use_dhcp = "1", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
+  { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 # RX path passes through conn_guard for SYN-flood admission control.
 # TX path goes direct from ip back to the NIC (no per-egress filtering).
@@ -59,6 +79,11 @@ wiring = [
 
 [[variant]]
 match = { family = "linux" }
+# A NIC and the IP stack exchange frames in both directions, which the
+# scheduler sees as a cycle. Without this the graph is rejected at
+# `prepare_graph` and the board boots with no network — silently, since
+# the netconsole that would have reported it is on that network.
+accept_cycles = true
 modules = [
   { name = "linux_net", params = { max_conns = "user:max_conns|128", write_buf_kib = "user:write_buf_kib|128", listen_backlog = "user:listen_backlog|128" } },
 ]

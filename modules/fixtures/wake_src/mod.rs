@@ -43,9 +43,9 @@ struct State {
 }
 
 mod params_def {
+    use super::p_u32;
     use super::State;
     use super::SCHEMA_MAX;
-    use super::p_u32;
 
     define_params! {
         State;

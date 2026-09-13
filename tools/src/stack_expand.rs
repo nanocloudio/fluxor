@@ -28,7 +28,52 @@
 //! default.
 //! Example:  `dst_ip = "user:dst_ip|host:debug.collector_ip|required"`.
 //!
-//! See `.context/platform_stacks.md` for the full specification.
+//! The full expansion rules, as implemented here:
+//!
+//! 1. **Stack lookup.** Each key under `platform:` names a stack file.
+//!    `<project>/stacks/<name>.toml` wins; otherwise the install root's
+//!    copy is used, so a user project can override one bundled stack and
+//!    inherit the rest. An unknown name errors with a Levenshtein
+//!    "did you mean…?" drawn from both roots.
+//! 2. **Field merge.** The stack's fields are the board's
+//!    `platform_defaults.<stack>` overlaid with the user's own fields.
+//!    Setting `phy` without `driver`/`nic` clears the board's driver and
+//!    NIC facts, because those are phy-specific. `board`, `family` and
+//!    `silicon` are then written from the resolved target
+//!    AUTHORITATIVELY — a user value for them is overwritten, so match
+//!    predicates can never be steered away from the real hardware.
+//! 3. **Match predicates.** A `match` key holds when the merged field
+//!    equals it exactly, or when the predicate value is `"*"` and the
+//!    field is set at all (`""`, `"false"` and `"0"` read as unset).
+//! 4. **Variant selection.** Every matching `[[variant]]` is scored by
+//!    specificity — `board` 3, `family` 2, any other key 1 — and the
+//!    single highest scorer is applied. No match, or a tie at the top
+//!    score, is a config error.
+//! 5. **Overlays.** Every `[[overlay]]` whose predicate holds applies.
+//!    A user-written field that appears only in overlay predicates must
+//!    select at least one overlay; a stale or typo'd value that selects
+//!    nothing is a config error listing the accepted values, because the
+//!    capability it names would otherwise silently never materialize.
+//! 6. **Two passes.** Pass 1 injects every stack's modules; pass 2 then
+//!    injects every stack's wiring and services. Splitting them lets a
+//!    wire added by one stack see modules — and skips — contributed by a
+//!    stack that sorts after it.
+//! 7. **Dedup.** A stack module whose NAME already exists is skipped and
+//!    the user's declaration stands (the wiring still applies, the name
+//!    being valid either way). A stack module whose effective TYPE
+//!    (`type:` if present, else the name) already exists is skipped too,
+//!    and every wire touching it is dropped with it. `require_distinct`
+//!    opts out of the type skip: a second instance of the same build is
+//!    injected, and only a variant mismatch is a hard error.
+//! 8. **Placement.** Injected modules are prepended, giving them lower
+//!    ids and therefore earlier instantiation. Injected params are
+//!    coerced to integers/booleans where they parse as such.
+//! 9. **Cycles.** An injection that knowingly wires a feedback pair sets
+//!    `accept_cycles` on the expanded config, since the scheduler
+//!    otherwise rejects a cyclic graph.
+//! 10. **Finally** `platform:` is removed from the config, and a graph
+//!     carrying the `otel` engine gets the build-time id-table digest and
+//!     histogram bounds injected unless the user supplied them.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -207,9 +252,10 @@ struct StackInjection {
     /// rejects cyclic graphs unless `scheduler.accept_cycles` is set, so an
     /// injection that knowingly creates a feedback pair sets that flag on the
     /// expanded config — otherwise every `debug: to: net` graph is rejected
-    /// at `prepare_graph` and boots with no working graph (the pi5 "low-module
-    /// boot wedge" was this: small configs lacked an unrelated http<->ws cycle
-    /// that would have set the flag for them).
+    /// at `prepare_graph` and boots with no working graph. The flag must come
+    /// from the injection itself: a small config has no other cycle (a larger
+    /// one may happen to carry an unrelated http<->ws pair) and so would
+    /// never acquire the flag by accident.
     #[serde(default)]
     accept_cycles: bool,
 }
@@ -233,10 +279,11 @@ struct StackModule {
     /// (below) exists for infrastructure singletons like `ip`, and would
     /// otherwise SILENTLY skip this module and drop its wiring. With this
     /// set, a type collision is a hard config error naming the conflict,
-    /// never a silent skip: fail-loud is the whole point (rfc
-    /// observability_surface §12.7 — a graph that already serves `http`
-    /// cannot also carry the exchange-variant client, because one image
-    /// carries one build of a type).
+    /// never a silent skip: fail-loud is the whole point. A graph that
+    /// already serves `http` therefore cannot also carry the exchange-
+    /// variant `http` client — one image holds exactly one build of a
+    /// module type, so the two variants cannot coexist and the conflict
+    /// must be reported rather than resolved by dropping one.
     #[serde(default)]
     require_distinct: bool,
     #[serde(default)]
@@ -249,8 +296,13 @@ struct StackModule {
 
 /// Expand all `platform:` stacks into concrete modules, wiring, and services.
 ///
-/// Must be called AFTER `resolve_target` (needs board_id/family) and AFTER
-/// `translate_legacy_hardware_network`, but BEFORE config generation.
+/// Ordering is fixed by what this pass reads and writes. It needs the
+/// resolved target's `board_id`/`family`/`silicon` for match predicates, so
+/// it runs after `resolve_target`; it matches and injects against the
+/// canonical `modules:`/`wiring:` lists, so it runs after
+/// `translate_legacy_hardware_network` has folded the shorthand
+/// `hardware:`/`network:` form into those lists; and it runs before config
+/// generation, which consumes the expanded lists.
 pub fn expand_platform_stacks(
     config: &mut Value,
     target: &TargetDescriptor,
@@ -288,8 +340,8 @@ pub fn expand_platform_stacks(
     // referencing `ip` before net had a chance to add (or skip) it,
     // and the cross-stack dedup case (e.g. multilane skipping ip via
     // type-collision with ip_0/ip_1) would never propagate to debug's
-    // wires. The single-pass design was the source of the multilane
-    // dangling-wire bug.
+    // wires — debug would then keep a wire to a module that never
+    // exists.
     let mut globally_skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Resolve each stack file + matching variants/overlays up front
@@ -755,8 +807,8 @@ fn inject_modules(
 
     // Collect existing module names + types for dedup. Two distinct
     // dedup paths:
-    //   * **by name** — the original behavior. A user yaml that re-
-    //     declares a stack-named module overrides the default.
+    //   * **by name** — a user yaml that re-declares a stack-named
+    //     module overrides the stack's default for it.
     //   * **by type** — when a stack module's effective type matches
     //     an existing user module's effective type (e.g. stack wants
     //     `{name:"ip", type:"ip"}` and the user has `ip_0`/`ip_1` with
@@ -798,8 +850,8 @@ fn inject_modules(
             if sm.require_distinct {
                 // Same type, SAME variant → two instances of one build, which
                 // is ordinary graph composition — inject alongside. Only a
-                // variant mismatch is irreconcilable (one image carries one
-                // build of a type — module_variants §4.3), and a silent skip
+                // variant mismatch is irreconcilable — one image carries one
+                // build of a given module type — and a silent skip
                 // would silently kill the stack's feature, so that case is a
                 // hard error naming the ways out.
                 let existing_variant = config
@@ -1201,7 +1253,8 @@ mod tests {
     /// `debug: to: net` injects a `log_net <-> ip` feedback 2-cycle. An
     /// injection with `accept_cycles = true` must set
     /// `scheduler.accept_cycles` on the expanded config so `prepare_graph`
-    /// doesn't reject the graph (the pi5 low-module boot wedge). A user's
+    /// doesn't reject the graph, since no other cycle in a small graph would
+    /// set it. A user's
     /// explicit value is preserved (`.or_insert`).
     #[test]
     fn accept_cycles_injection_sets_scheduler_flag() {

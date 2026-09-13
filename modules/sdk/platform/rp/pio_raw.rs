@@ -53,3 +53,9 @@ pub const INPUT_SYNC_BYPASS: u32 = 0x0C7C;
 /// SET PINDIRS=1, JMP origin, arm DMA, enable SM, wait completion.
 /// Returns total bytes transferred or negative errno.
 pub const CMD_TRANSFER: u32 = 0x0C7D;
+/// Completion of a `CMD_TRANSFER` started earlier: 1 busy, 0 done.
+pub const CMD_POLL: u32 = 0x0C7E;
+/// The input level of a pin set up for PIO: 1 high, 0 low.
+/// handle=-1, arg=[pin:u8] (1 byte). A peripheral that signals pending
+/// work on its data line between transfers is read here without a transfer.
+pub const PIN_LEVEL: u32 = 0x0C7F;

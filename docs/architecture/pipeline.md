@@ -187,7 +187,7 @@ The "sleep until tick or event" step differs by target:
 
 | Target | Sleep mechanism |
 |--------|----------------|
-| RP2040, RP2350 | Embassy timer select against the `SCHEDULER_WAKE` signal (WFE, woken by SEV) |
+| RP2040, RP2350 | Deadline alarm against the scheduler wake (WFE, woken by SEV) via `wait_for_wake` |
 | BCM2712 (Pi 5) | Synchronous wait on the chip's monotonic timer with interrupt unmasking |
 
 In both cases an event signal from an ISR or another module wakes the
@@ -486,8 +486,8 @@ workloads:
 - Long critical sections in hot paths are avoided to protect scheduler latency
 - Stream interfaces return promptly when data or capacity is unavailable
 
-These rules apply to kernel HAL code (Embassy tasks on RP, polled DMA
-on aarch64) and to PIC modules. They are the contract that makes the
+These rules apply to kernel HAL code and to PIC modules alike, whatever
+the underlying wait mechanism. They are the contract that makes the
 single-tick execution model work.
 
 ## Loader

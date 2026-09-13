@@ -30,7 +30,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -74,8 +73,8 @@ struct ButtonState {
 // ============================================================================
 
 mod params_def {
-    use super::ButtonState;
     use super::p_u8;
+    use super::ButtonState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -140,8 +139,8 @@ pub extern "C" fn module_new(
         s.state_processed = 1;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -161,12 +160,7 @@ pub extern "C" fn module_new(
         // handle rather than opcode class byte.
         let sys = &*s.syscalls;
         let mut gpio_arg = [s.pin, s.pull];
-        let handle = (sys.provider_open)(
-            GPIO_CONTRACT,
-            GPIO_SET_INPUT,
-            gpio_arg.as_mut_ptr(),
-            2,
-        );
+        let handle = (sys.provider_open)(GPIO_CONTRACT, GPIO_SET_INPUT, gpio_arg.as_mut_ptr(), 2);
         if handle < 0 {
             return -4;
         }
@@ -179,7 +173,7 @@ pub extern "C" fn module_new(
 // Contract id + opcodes mirror `abi::kernel::module::provider::contract::HAL_GPIO`
 // and `abi::contracts::hal::gpio::*`. Pinned here to keep the PIC
 // module self-contained (no imports into kernel paths).
-const GPIO_CONTRACT:  u32 = 0x0001;
+const GPIO_CONTRACT: u32 = 0x0001;
 const GPIO_SET_INPUT: u32 = 0x0107;
 const GPIO_GET_LEVEL: u32 = 0x0105;
 
@@ -205,7 +199,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0; // GPIO error, skip
         }
 
-        let pressed = if s.active_low != 0 { level == 0 } else { level != 0 };
+        let pressed = if s.active_low != 0 {
+            level == 0
+        } else {
+            level != 0
+        };
         let raw_state = if pressed { 1u8 } else { 0u8 };
 
         if raw_state != s.last_raw {

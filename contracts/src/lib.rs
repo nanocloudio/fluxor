@@ -117,10 +117,11 @@ pub const CONTENT_TYPES: &[&str] = &[
     // Per-class input event surfaces (see
     // docs/architecture/input_capability_surface.md). Each carries a
     // packed C-repr record on the wire — pointer/key/gamepad shapes
-    // documented in `modules/sdk/contracts/input/*.rs`. The legacy
-    // generic "InputEvent" stays in the table for back-compat with
-    // older modules, but new graphs wire one of the per-class names
-    // below so the kernel and shell stay narrow.
+    // documented in `modules/sdk/contracts/input/*.rs`. The generic
+    // "InputEvent" carries a driver's own record shape for a device
+    // whose events fit none of the per-class surfaces; a graph wires
+    // one of the per-class names below wherever one applies, so the
+    // kernel and shell stay narrow.
     "PointerEvents",
     "KeyEvents",
     "GamepadEvents",
@@ -140,14 +141,16 @@ pub const CONTENT_TYPES: &[&str] = &[
     // host platform adapter publishes viewport / orientation / size-class
     // / input-modality / audio-config snapshots on this content type; a
     // module that wants to adapt to its surface wires an input port to
-    // it. See `.context/rfc_surface_traits.md`.
+    // it. A module that ignores the stream keeps its static-config
+    // behaviour, so the surface is purely additive.
     "SurfaceTraits",
     // Resolved presentation layout — the `presentation.layout` record per
     // `tools/src/presentation_resolver.rs`: per-control disposition (chrome /
     // content / bound / hidden), plane, flags, and a physical-button legend.
     // The `presentation_resolver` module emits it from a SurfaceTraits stream;
-    // chrome/content renderers consume it. See
-    // `.context/rfc_adaptive_presentation.md`.
+    // chrome/content renderers consume it. One record is written atomically:
+    // a consumer applies a whole layout or none of it, never a mixture of
+    // two surface states.
     "PresentationLayout",
     // HTTP application fan-out surface — the request half. Header
     // `{conn_id u16, stream_id u16, method u8, flags u8, path_len u16,

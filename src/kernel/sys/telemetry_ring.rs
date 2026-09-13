@@ -25,7 +25,7 @@ pub const CONSUMERS: usize = 4;
 
 // Capacity per target family, power of two. Telemetry records are denser than
 // log text, so this sits below the log ring's 4/64 KiB split. The `rp` MCUs
-// are RAM-constrained (embassy-usb/net + kernel share ~256/520 KiB), so they get
+// are RAM-constrained (the USB and network stacks + kernel share ~256/520 KiB), so they get
 // a modest ring; only the bcm2712 application processor gets the full 32 KiB.
 #[cfg(feature = "chip-rp2040")]
 const CAPACITY: usize = 4096;
@@ -97,8 +97,8 @@ static LOCK: AtomicBool = AtomicBool::new(false);
 /// Producer-side enabled gate (10):
 /// non-zero when at least one consumer is subscribed, so the SDK can skip
 /// building a record when nothing would consume it. Published to modules via the
-/// `SyscallTable.telemetry_enabled` pointer (EL1/host) and, in a later step, an
-/// EL0 read-only page. A benign racy single-word read on the producer side.
+/// `SyscallTable.telemetry_enabled` pointer (EL1/host). A benign racy
+/// single-word read on the producer side.
 static ENABLED: AtomicU32 = AtomicU32::new(0);
 
 fn refresh_enabled() {

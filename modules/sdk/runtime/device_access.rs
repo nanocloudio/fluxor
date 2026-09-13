@@ -7,7 +7,6 @@
 // storage/NIC drivers (NVMe, rp1_gem) via the flattened `runtime` namespace.
 // Kept out of `telemetry.rs` — device access is not telemetry.
 
-
 /// Allocate `size` bytes of DMA-coherent memory with `align`-byte alignment
 /// from the kernel's non-cacheable DMA arena. Returns the physical address
 /// (== virtual address under identity mapping) or 0 on failure.
@@ -184,12 +183,7 @@ unsafe fn dev_pcie_device_cfg_read32(sys: &SyscallTable, handle: i32, offset: u1
     let ob = offset.to_le_bytes();
     *bp = ob[0];
     *bp.add(1) = ob[1];
-    let rc = (sys.provider_call)(
-        handle,
-        abi::contracts::hal::pcie_device::CFG_READ32,
-        bp,
-        8,
-    );
+    let rc = (sys.provider_call)(handle, abi::contracts::hal::pcie_device::CFG_READ32, bp, 8);
     if rc != 0 {
         return 0xFFFF_FFFF;
     }
@@ -220,12 +214,7 @@ unsafe fn dev_pcie_device_cfg_write32(
     for (i, b) in vb.iter().enumerate() {
         *bp.add(4 + i) = *b;
     }
-    (sys.provider_call)(
-        handle,
-        abi::contracts::hal::pcie_device::CFG_WRITE32,
-        bp,
-        8,
-    )
+    (sys.provider_call)(handle, abi::contracts::hal::pcie_device::CFG_WRITE32, bp, 8)
 }
 
 /// PCIE_DEVICE contract: map BAR `bar_idx` for the bound handle,
@@ -276,12 +265,7 @@ unsafe fn dev_pcie_device_msi_alloc(
     for (i, b) in eb.iter().enumerate() {
         *bp.add(i) = *b;
     }
-    let rc = (sys.provider_call)(
-        handle,
-        abi::contracts::hal::pcie_device::MSI_ALLOC,
-        bp,
-        20,
-    );
+    let rc = (sys.provider_call)(handle, abi::contracts::hal::pcie_device::MSI_ALLOC, bp, 20);
     if rc != 0 {
         return None;
     }

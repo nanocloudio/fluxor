@@ -34,51 +34,28 @@ crate-type = ["rlib"]
 # Shared, dependency-free contracts: the storage-surface vocabulary and the
 # per-owner log ring format/algorithm (no_std, no serde in this build).
 fluxor-contracts = { path = "contracts", default-features = false }
-# --- RP-family dependencies (Cortex-M targets) ---
-# Async executor for main task and logger task.
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"], optional = true }
-# Timers for async delays between SD reads.
-embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"], optional = true }
-# RP2350 HAL (SPI, GPIO, USB, DMA, clocks).
-# Chip variant (rp235xa or rp235xb) selected via features below.
-embassy-rp = { version = "0.10.0", features = ["defmt", "time-driver", "critical-section-impl", "rt", "unstable-pac"], optional = true }
-# `fixed` is pulled in transitively via embassy-rp. The lockfile
-# pins it to 1.29.0 because 1.31.0+ requires rustc 1.93, while the
-# installed toolchain is 1.92. `cargo update fixed` will try to bump
-# to 1.31 — keep it at 1.29 (or whatever is the latest version
-# supporting the installed toolchain) until either rustc moves to
-# 1.93+ or embassy-rp's MSRV-floor catches up.
-# USB device stack for CDC logging.
-embassy-usb = { version = "0.6.0", features = ["defmt"], optional = true }
-# USB serial logger implementation.
-embassy-usb-logger = { version = "0.6.0", optional = true }
-# Minimal async yield helper for syscall polling loops.
-embassy-futures = { version = "0.1.2", optional = true }
-# Async primitives (signals, channels, mutexes).
-embassy-sync = { version = "0.8.0", optional = true }
-# Cortex-M core utilities (used for low-level delays).
-cortex-m = { version = "0.7.7", optional = true }
-# Cortex-M runtime and startup.
-cortex-m-rt = { version = "0.7.5", optional = true }
-# Static initialization for shared peripherals.
-static_cell = { version = "2.1.1", optional = true }
-# Structured logging facade used by embassy-usb-logger.
+# RP2040's second-stage bootloader: a 256-byte SPI-flash setup blob with the
+# bootrom's checksum over it. The chip will not run an image without one.
+#
+# A data dependency rather than a runtime one: it supplies a verified blob
+# and no control flow. Writing our own would mean hand-assembling a flash
+# command sequence whose only test is a board that either boots or does not.
+rp2040-boot2 = { version = "0.3.0", optional = true }
+# Structured logging facade.
 log = "0.4.29"
-# defmt logging backend (required by selected embassy features).
-defmt = { version = "1.0.1", optional = true }
-# RTT logger for early debug output.
-defmt-rtt = { version = "1.1.0", optional = true }
-# Panic handler with defmt output.
-panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 # default-features off drops jiff (timestamps — we format our own via
 # `now_unix_ms`), anstream/anstyle (color), and the regex RUST_LOG tree;
 # `env_filter` still does level + exact-module filtering.
 env_logger = { version = "0.11", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
-embedded-io-async = { version = "0.7.0", optional = true }
 # Portable atomics with CAS emulation for thumbv6m (RP2040 Cortex-M0+).
 # On thumbv8m (RP2350) this is a zero-cost pass-through.
 portable-atomic = { version = "1.13.1", default-features = false, optional = true }
+# The critical-section implementation `portable_atomic::AtomicU64` needs on a
+# part with no native 64-bit atomics. Declared directly so the 64-bit atomics
+# have a named owner rather than arriving as a side effect of some other
+# dependency's feature selection.
+critical-section = { version = "1.2.0", optional = true }
 
 # ── host-window: linux_display interactive backend ─────────────────────
 # Pure-Rust window stack: winit owns the OS surface, softbuffer blits a
@@ -104,8 +81,8 @@ wgpu = { version = "26", default-features = false, features = ["vulkan", "wgsl"]
 pollster = { version = "0.4", optional = true }
 
 # ── host-hsm: PKCS#11 key_vault backend ────────────────────────────────
-# Hardware binding for the key_vault contract (rfc_crypto_extensions
-# §4.3): the cryptoki dependency lives here in fluxor's Linux platform,
+# Hardware binding for the key_vault contract: the cryptoki dependency
+# lives here in fluxor's Linux platform,
 # never in a consumer. It resolves its PKCS#11 module by path at
 # runtime, so it links no token library and costs nothing until one is
 # configured — which is why the published runtime carries it.
@@ -118,13 +95,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 
 [features]
 default = ["chip-rp2350b"]
-
 # Umbrella feature pulled in by every embedded chip feature; gates the
 # `#![no_std]` `fluxor` binary so hosted builds can compile against the
 # lib alone.
 embedded-platform = []
 
-# Multi-Pod workload ownership (rfc_k8s.md §6.4, §19.2).
+# Multi-Pod workload ownership.
 # When OFF, `MAX_OWNERS == 1`, the owner table collapses to a single system
 # slot, owner fields on graph objects compile out, and the authorization
 # helpers become no-ops — so single-tenant bare-metal targets (rp*) carry no
@@ -140,20 +116,44 @@ test-rebuild = []
 # apply path (per-Pod ownership) can be observed on hardware. Never shipped.
 test-plan = []
 
-# RP-family shared dependencies (pulled in by any chip-rp* feature)
+# RP-family silicon support: register layers, generated facts, the boot
+# artefacts, the USB device stack and the step loop that runs the graph.
 rp = [
-    "embassy-executor", "embassy-time", "embassy-rp", "embassy-usb",
-    "embassy-usb-logger", "embassy-futures", "embassy-sync",
-    "cortex-m", "cortex-m-rt", "static_cell",
-    "defmt", "defmt-rtt", "panic-probe", "embedded-io-async",
     "portable-atomic",
+    # `fallback` supplies AtomicU64 on a 32-bit part, which the scheduler's
+    # monotonic time and the log ring both require.
+    "portable-atomic/fallback",
+]
+
+# How `portable-atomic`'s fallback is made atomic, on ARMv8-M.
+#
+# Not in `rp`, because the two RP chips solve this differently and the
+# solutions are mutually exclusive: RP2040 sets
+# `portable_atomic_unsafe_assume_single_core` through rustflags in
+# `.cargo/config.toml`, which masks interrupts directly, and enabling
+# `critical-section` alongside it is a compile error in portable-atomic
+# itself. So ARMv8-M takes the critical section and ARMv6-M keeps the cfg it
+# already had.
+rp-critical-section = [
+    "portable-atomic/critical-section",
+    "critical-section",
+    # The restore-state width is a global property of the critical section:
+    # every crate in the build must agree on it.
+    "critical-section/restore-state-u8",
 ]
 
 # Single binary for both RP2350A and RP2350B. Always compile with B (superset).
 # Runtime silicon detection (SYSINFO.package_sel) gates pin availability.
-chip-rp2350b = ["rp", "embassy-rp/rp235xb", "embedded-platform"]
+chip-rp2350b = ["rp", "rp-critical-section", "embedded-platform"]
 # RP2040 (Cortex-M0+, 30 GPIO, no PIO2). Requires target thumbv6m-none-eabi.
-chip-rp2040 = ["rp", "embassy-rp/rp2040", "embedded-platform"]
+chip-rp2040 = ["rp", "rp2040-boot2", "embedded-platform"]
+
+# Non-production RP overclock. Selects the silicon's declared
+# `overclock_sys_hz` instead of its production `sys_hz`; a silicon that
+# declares no overclock profile fails the build rather than silently
+# running the default. Never enabled for a shipped image — the point of
+# the flag is that the overclock is opt-in and visible in the build line.
+rp-overclock = []
 
 # Kernel hardware CAPABILITIES (what a platform can do, not which chip it is).
 # The kernel branches on these, never on chip identity; a chip feature turns on
@@ -178,7 +178,7 @@ dtb = []
 pq-vault = []
 
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
-# Minimal — no embassy, no cortex-m. Bare-metal from scratch.
+# Bare-metal from scratch.
 chip-bcm2712 = [
     "portable-atomic",
     "embedded-platform",
@@ -194,10 +194,10 @@ chip-bcm2712 = [
 # Without board-pi5: QEMU virt machine (kernel loaded at 0x40080000).
 board-pi5 = ["chip-bcm2712"]
 
-# Rig-validation opt-in: enables the deferred adaptive-tick mechanisms (the
-# §5.4 SGI wake doorbell + §7.1a absolute cntp_cval re-arm) at boot on
-# bcm2712. OFF by default and never in production — purely a build flag so the
-# pi5 rig can exercise these measured-option paths on silicon (RFC adaptive_tick).
+# Rig-validation opt-in: enables the optional adaptive-tick mechanisms — the
+# SGI wake doorbell and the absolute `cntp_cval` re-arm — at boot on bcm2712.
+# OFF by default and never in production; purely a build flag so the pi5 rig
+# can exercise these paths on silicon.
 adaptive_deferred_rig = []
 
 # Rig-validation opt-in: from core 0, periodically fire SGI 15 at core 1 (the
@@ -206,7 +206,7 @@ adaptive_deferred_rig = []
 # `tier2_probe` module. Validates the Tier-2 dispatch path end-to-end on hardware.
 test_tier2_sgi = []
 
-# Linux hosted (aarch64 userspace). Uses std — no embassy, no cortex-m.
+# Linux hosted (aarch64 userspace). Uses std.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
 host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault"]
 

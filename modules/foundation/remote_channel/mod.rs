@@ -29,7 +29,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -160,9 +159,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             };
             if written > 0 {
                 let w = (written as usize).min(s.out_pending_len);
-                s.out_pending_len = unsafe {
-                    shift_consume(s.out_pending.as_mut_ptr(), s.out_pending_len, w)
-                };
+                s.out_pending_len =
+                    unsafe { shift_consume(s.out_pending.as_mut_ptr(), s.out_pending_len, w) };
             }
         }
         // Round-robin scan local inputs only when pending drained.
@@ -189,9 +187,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.out_pending[2] = (n & 0xFF) as u8;
                 s.out_pending[3] = ((n >> 8) & 0xFF) as u8;
                 let total = HEADER_BYTES + n;
-                let written = unsafe {
-                    (sys.channel_write)(transport_tx, s.out_pending.as_ptr(), total)
-                };
+                let written =
+                    unsafe { (sys.channel_write)(transport_tx, s.out_pending.as_ptr(), total) };
                 // CHAN_EAGAIN (negative return) is back-pressure, not
                 // an error: the bytes have already been pulled from
                 // `in_chan`, so dropping them would shred the framed
@@ -203,9 +200,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     0
                 };
                 if w < total {
-                    s.out_pending_len = unsafe {
-                        shift_consume(s.out_pending.as_mut_ptr(), total, w)
-                    };
+                    s.out_pending_len =
+                        unsafe { shift_consume(s.out_pending.as_mut_ptr(), total, w) };
                     s.rr_start = ((ch as usize + 1) % N_CHANNELS) as u8;
                     break;
                 }
@@ -264,9 +260,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     start += 1;
                 }
                 if start > 0 {
-                    s.parse_len = unsafe {
-                        shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, start)
-                    };
+                    s.parse_len =
+                        unsafe { shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, start) };
                 }
                 if s.parse_len < HEADER_BYTES {
                     break;
@@ -274,9 +269,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let ch = s.parse_buf[1] as usize;
                 let len = (s.parse_buf[2] as usize) | ((s.parse_buf[3] as usize) << 8);
                 if len > MAX_PAYLOAD || ch >= N_CHANNELS {
-                    s.parse_len = unsafe {
-                        shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, 1)
-                    };
+                    s.parse_len =
+                        unsafe { shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, 1) };
                     continue;
                 }
                 let total = HEADER_BYTES + len;
@@ -289,9 +283,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // a stray `0xFC` byte inside payload data doesn't
                 // latch as a header and corrupt the parse stream.
                 if s.parse_len > total && s.parse_buf[total] != FRAME_MAGIC {
-                    s.parse_len = unsafe {
-                        shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, 1)
-                    };
+                    s.parse_len =
+                        unsafe { shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, 1) };
                     continue;
                 }
 
@@ -299,13 +292,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let out = s.out_chans[ch];
                     if out >= 0 {
                         let written = unsafe {
-                            (sys.channel_write)(
-                                out,
-                                s.parse_buf.as_ptr().add(HEADER_BYTES),
-                                len,
-                            )
+                            (sys.channel_write)(out, s.parse_buf.as_ptr().add(HEADER_BYTES), len)
                         };
-                        let w = if written > 0 { (written as usize).min(len) } else { 0 };
+                        let w = if written > 0 {
+                            (written as usize).min(len)
+                        } else {
+                            0
+                        };
                         if w < len {
                             // Stash unwritten tail into in_pending; consume the
                             // frame from parse_buf either way.
@@ -327,9 +320,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
                 // Frame fully delivered (or dropped for invalid ch).
-                s.parse_len = unsafe {
-                    shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, total)
-                };
+                s.parse_len =
+                    unsafe { shift_consume(s.parse_buf.as_mut_ptr(), s.parse_len, total) };
             }
         }
     }

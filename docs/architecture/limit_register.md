@@ -23,7 +23,7 @@ means editing its row here in the same change.
 | local-address slot (`TcpConn::local_slot`) | u16 | 65535 | `MAX_LOCAL_ADDRS` | modules/sdk/abi/config.rs | 4096 | `0xFFFF` is the wildcard slot. Demux is by hash index; 8 on wasm and embedded |
 | decision-seam hold (`pkt_id` slot) | u16 | 65535 | `MAX_PACKET_HOLD` | modules/sdk/abi/config.rs | 32 | One full frame per slot; an arrival past it is refused and counted, never displaces a held packet. 8 on wasm, 4 on embedded |
 | contract class (`required_caps` bitmask, fmod header) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the header's `required_caps`. Registration past the ceiling is refused EINVAL, and a dispatch id at or past it is refused ENOSYS by `check_contract_grant` before either capability gate |
-| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 28 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `STREAM_CLOCK` = 0x1C, leaving 0x1D–0x3F (35 positions) free. The inventory is pinned by `tools/tests/contract_id_inventory.rs`, which also asserts the tools-side mirror `CONTRACT_ID_SPACE` equals `MAX_CONTRACTS` |
+| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 28 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `STREAM_CLOCK` = 0x1C, leaving 0x1D–0x3F (35 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
 | module index (exec_order, fault ids) | u8 | 256 | `MAX_MODULES` | modules/sdk/abi/config.rs | 192 | Deliberate keep at u8; the aarch64 profile sits at 192 of the 256 the width admits. Dual asserts: `src/kernel/boot/config.rs`, `src/kernel/exec/scheduler/mod.rs` |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | 256 | The buffer arena binds first by orders of magnitude |
@@ -85,8 +85,8 @@ means editing its row here in the same change.
 | QUIC continuity shadow slots | `MAX_SHADOW_SLOTS` | modules/foundation/quic/continuity.rs | 2 | Policy: connections under CT_QUIC takeover at once, one per slot. Continuity is a control-plane event, not steady state, and each shadow stages a whole connection's worth of state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
 | QUIC continuity checkpoint record | `CHECKPOINT_RECORD_MAX` | modules/foundation/quic/continuity.rs | 16384 | Sized, not chosen: holds the full serialized connection state — three bidi (1200+1500) and six uni (256+256) stream buffers, the retained last-emitted packet, the sealed secret set, and the fixed header, with headroom. A checkpoint whose `total_len` exceeds it is refused `STATUS_NO_CAPACITY` at CHECKPOINT_BEGIN and the shadow is discarded |
 | ARP-wait handshake list | `ARP_WAIT_MAX` | modules/foundation/ip/mod.rs | 64 | Policy: handshakes remembered as waiting on neighbour resolution, so an ARP reply retries exactly those rather than walking the connection table. A full list only defers the retry to the timer sweep's next slice |
-| GEM RX descriptors | `RX_DESC_COUNT` | modules/drivers/rp1_gem/mod.rs | 192 | Policy: the burst the Pi 5 MAC absorbs between two driver steps; a step drains the whole ring. The platform DMA arena holds 256 buffers shared with the 64 TX descriptors. Ring positions wrap at a multiple of the ring size (`rp1_gem/ring.rs`, pinned by `tests/harness/tests/gem_ring.rs`), so a size that does not divide 65,536 is safe |
-| fan frames per step | `FAN_FRAMES_PER_STEP` | src/kernel/exec/scheduler/module_types.rs | 64 | Policy: whole frames a framed `_tee` or `_merge` moves in one step. A fan sits between a producer and its consumers, so this times the tick rate is the ceiling on every fanned port — `debug: to: net` fans the ip module's consumer ports, and every accept, delivery and send on that graph crosses one. Pinned by `tests/harness/tests/fan_throughput.rs` |
+| GEM RX descriptors | `RX_DESC_COUNT` | modules/drivers/rp1_gem/mod.rs | 192 | Policy: the burst the Pi 5 MAC absorbs between two driver steps; a step drains the whole ring. The platform DMA arena holds 256 buffers shared with the 64 TX descriptors. The rings are walked with free-running `u16` positions under a `position % count` index, and those positions wrap at the largest multiple of the ring size a `u16` holds rather than at 65,536 (`rp1_gem/ring.rs`), so the index stays continuous across the wrap and a size that does not divide 65,536 is safe |
+| fan frames per step | `FAN_FRAMES_PER_STEP` | src/kernel/exec/scheduler/module_types.rs | 64 | Policy: whole frames a framed `_tee` or `_merge` moves in one step. A fan sits between a producer and its consumers, so this times the tick rate is the ceiling on every fanned port — `debug: to: net` fans the ip module's consumer ports, and every accept, delivery and send on that graph crosses one |
 | free-slot rebuild slice | `ALLOC_SCAN_SLICE` | modules/foundation/ip/mod.rs | 256 | Policy: slots one step examines to rebuild the free stack when it is empty — the table is full, or a slot was released by a path that did not push it. Allocation is a pop; a SYN at the ceiling costs this slice once per step and is refused, never a walk of the table per SYN |
 | timer-sweep slice | `SWEEP_SLICE_MAX` | modules/foundation/ip/mod.rs | 1024 | Policy: most connections one step of the sliced TCP timer sweep visits. The proportional slice visits a few hundred; after a stall the whole window is owed and this is the ceiling it meets — a full 65,536-record sweep in one step is a multi-millisecond, cache-missing step the guard would end the module for. The sweep lags a stall by at most 64 steps, and needs that many steps per 50 ms window to keep the timers on time: a tick of 780 µs or faster on the 65,536-record profile (the Pi 5 runs 100 µs) |
 | TCP continuity shadow slots | `MAX_TCP_SHADOWS` | modules/sdk/abi/config.rs | 8 | Policy: connections a transport-continuity pair holds in flight on one ip instance — shadows staged for import plus flows being mirrored out. Each shadow is a connection record plus its checkpoint bytes, and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY`. 2 on wasm, 1 on embedded |
@@ -97,6 +97,60 @@ means editing its row here in the same change.
 | TLS strict-profile send hold | `TX_HOLD_SIZE` | modules/foundation/tls/continuity.rs | — | Derived, not chosen: every record one `CMD_SEND` (`MAX_CMD_DATA` bytes) can produce, since the clear-side frame is consumed whole and each of its records must wait for its own send horizon — six records of `WIRE_RECORD_MAX`, about 9.3 KiB per session, paid in every session slot whether or not it is mirrored. A producer that exceeds the contract's frame ceiling fills the hold and the session fails rather than the record being dropped |
 | QUIC 1-RTT self-grant block | `LOCAL_PN_BLOCK` | modules/foundation/quic/connection.rs | 4096 | Policy: the send packet-number block a connection self-grants in local (non-durable) mode, refilled `LOCAL_PN_REFILL_LOW` (512) values ahead of exhaustion so the reservation never stalls a healthy sender. Matches the directory's smoke-path reserve size; in durable mode the directory chooses the block |
 | declared step cost (`[execution] max_step_us`) | `STEP_BUDGET_DEFAULT_TICK_US` | tools/src/target_facts.rs | 1000 | Policy: the scheduler's default pass budget (`DEFAULT_TICK_US`, one tick) on every silicon; a manifest whose step cannot fit one default pass on a target it names is refused at parse. Per-target in shape so a slower part can publish a smaller budget |
+| early-boot log ring | `LOG_RING_CAPACITY` | modules/sdk/abi/config.rs | 65536 | Sized to cover boot until `log_net` is up (~a few seconds of chatty logging), then per-profile because the ring is static `.bss` charged against the whole SRAM: 16 KiB on wasm, 4 KiB on the RP parts, where a host-class ring is a quarter of an RP2040's linker RAM region and an eighth of an RP2350's, and on both pushes `.bss` past that region once the state and buffer arenas are placed beside it. The RP kernels take the figure from their silicon TOML (`[kernel] log_ring_kb`), and that figure and the embedded profile's constant must state the same size. A full ring drops new records rather than overwriting unread ones, and counts the drops |
+
+## Tables, arenas and budgets
+
+Fixed-size tables and arenas whose size is a resource decision, and the
+per-step budgets that keep one module's work from becoming another's
+latency. Per-profile values are listed host / wasm / embedded where a
+constant is declared once per profile.
+
+| Cap | Symbol | Source | Value | Reason |
+|---|---|---|---|---|
+| Channel buffer arena | `BUFFER_ARENA_SIZE` | modules/sdk/abi/config.rs | 8 MiB / 8 MiB / 64 KiB | Sized: the largest host graph's channels at 16–64 KiB each under gigabit-class load; the wasm arena is paged lazily by `memory.grow` so it costs nothing until used. Exhaustion refuses the channel open at compose time, never at runtime |
+| Tier B elastic region | `ELASTIC_REGION_SIZE` | modules/sdk/abi/config.rs | 16 MiB / 2 MiB / 0 | Policy: the oversubscribable region every elastic pool draws 64 KiB-quantum chunks from; 128 chunks on the host, which is the same depth as the kernel's chunk table. Zero on MCU-class targets, where `ELASTIC_ALLOC` denies and elasticity compiles out |
+| Config arena | `CONFIG_ARENA_SIZE` | modules/sdk/abi/config.rs | 256 KiB / 32 KiB / 16 KiB | Sized against the largest per-module params section (~95 KiB for an http module on the host) with headroom for the rest of the graph. A packed config larger than this is refused at boot |
+| One module's params section | `MAX_MODULE_CONFIG_SIZE` | modules/sdk/abi/config.rs | 256 KiB / 16 KiB / 4 KiB | Sanity bound on one module's slice of the config arena; kept in lockstep with the kernel's `MAX_MODULE_SECTION` and the CLI's params cap so the three refuse the same blob |
+| Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 256 KiB / 32 KiB | The kernel-side twin of `MAX_MODULE_CONFIG_SIZE` (linux + wasm / bare metal): a section past it is refused while parsing, before any module is instantiated. Registered separately so the pair cannot drift apart unnoticed |
+| HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 / 256 / 4 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 4-session TLS table and the 16-slot TCP table in that profile |
+| HTTP per-connection receive buffer | `RECV_BUF_SIZE` | modules/sdk/abi/config.rs | 8192 / 4096 / 2048 | Policy: a whole request line, headers and a small body in one read; a request that does not fit is refused 431, not spilled |
+| HTTP per-connection send buffer | `SEND_BUF_SIZE` | modules/sdk/abi/config.rs | 4100 | Policy, deliberately 4 KiB + 4: a WebSocket frame of exactly 4096 bytes of payload plus its header fits in one write, so the RFC 6455 fragmentation path is taken only by frames that genuinely exceed it |
+| Dynamic routes | `MAX_DYN_ROUTES` | modules/sdk/abi/config.rs | 64 / 8 / 8 | Policy: the dynamic-route arena an ingress fills at runtime; a route past the ceiling is refused and counted in `http.routes.dropped` |
+| Backends per route | `MAX_ROUTE_BACKENDS` | modules/sdk/abi/config.rs | 8 / 4 / 4 | Policy: an oversized backend set is truncated by weight order and the overflow is counted, so the route keeps serving from its heaviest members |
+| Route filesystem path | `MAX_FS_PATH` | modules/sdk/abi/config.rs | 256 / 64 / 64 | Policy: host routes point into deep on-disk trees; embedded and wasm routes are short on-flash paths like `/web/INDEX.HTM`, and a longer path is refused at compose time |
+| Body pool default | `DEFAULT_BODY_POOL_SIZE` | modules/sdk/abi/config.rs | 256 KiB / 32 KiB / 48 KiB | Policy: the request-body pool an http module gets when its config names none; a body that does not fit is refused 413 |
+| Fan-in/fan-out buffer | `FAN_BUF_SIZE` | src/kernel/exec/scheduler/module_types.rs | 32768 / 2048 / 8192 | Sized per target family (aarch64 / RP / other): the ring behind each expanded fan edge, taken from the channel arena; a frame larger than it cannot cross a fan edge |
+| Config graph edges | `MAX_GRAPH_EDGES` | src/kernel/boot/config.rs | 128 | Id width: the edge index is a byte in the packed graph section, and every channel table (`MAX_CHANNELS`) is sized from it. A graph with more edges is refused by the tools before it is packed |
+| Channels | `MAX_CHANNELS` | src/kernel/ipc/channel.rs | `MAX_GRAPH_EDGES` | Derived, not chosen: one channel per edge, fan expansion included, so the two move together |
+| Hardware sections: SPI / I2C / UART buses | `MAX_SPI_BUSES`, `MAX_I2C_BUSES`, `MAX_UART_BUSES` | src/kernel/boot/config.rs | 2 | Policy: the packed hardware section carries fixed tables; a board declaring more buses of a kind is refused by the tools |
+| Hardware sections: PIO instances | `MAX_PIO_CONFIGS` | src/kernel/boot/config.rs | 3 | Policy: RP2350B has three PIO blocks, the widest of the RP family |
+| Hardware sections: GPIO pins | `MAX_GPIO_CONFIGS` | src/kernel/boot/config.rs | 8 | Policy: pins configured from the config blob; a driver claims the rest at runtime |
+| Resident-workload section | `MAX_WORKLOAD_SECTION_BYTES` | src/kernel/boot/config.rs | 8 KiB | Sanity bound on a torn or hostile config tail; sized for a handful of workloads with room |
+| Tick period ceiling | `TICK_BOUND_MAX` | src/kernel/boot/config.rs | 50000 | Policy: the longest tick (µs) a config may ask for; above it the adaptive tick has nothing left to adapt and a stuck graph looks like a slow one |
+| Free-region list | `MAX_FREE_REGIONS` | src/kernel/module/loader.rs | 32 | Deliberate cap with a stated degradation: when the list is full a freed region is leaked until the next full arena reset, which is what a reconfigure does anyway |
+| Isolated-image arena | `ISO_ARENA_SIZE` | src/kernel/module/loader.rs | 2 MiB | Policy (`kernel-vm`): all isolated module state and heap of one image; exhaustion refuses the load |
+| Tracked provider handles | `MAX_TRACKED` | src/kernel/module/provider.rs | 128 | Policy: handle-to-owner bindings the kernel keeps for cross-owner checks; an open past it is refused, and the table is scanned on every provider call, so it is kept small on purpose |
+| Provider vtables | `MAX_PROVIDERS` | src/kernel/module/provider.rs | `MAX_CONTRACTS` | Derived, not chosen: one vtable slot per contract id, so a contract registerable in one and not the other is impossible by construction |
+| Dynamic tag routes | `MAX_DYN_TAG_ROUTES` | src/kernel/module/provider.rs | 4 | Policy: keyed provider routes a policy module may add at runtime |
+| Key material per vault slot | `MAX_KEY_BYTES` | src/kernel/security/key_vault.rs | 64 | Policy: a P-256 scalar is 32; the doubled width admits larger keying material without a header change |
+| Vault label | `MAX_LABEL` | src/kernel/security/key_vault.rs | 64 | Policy, wire-visible: the label is how a module names a key; the contract's `MAX_LABEL` mirrors it |
+| Persisted vault keys | `MAX_PERSISTED` | src/kernel/security/key_vault.rs | 8 | Policy: a deployment needing more persisted keys than this needs a real HSM, which is the tier the policy would already be asking for |
+| One AEAD seal/open | `MAX_SEAL_BYTES` | src/kernel/security/key_vault.rs | 2048 | Policy: a resumption ticket or a checkpoint chunk in one call, never a bulk stream; a larger plaintext is refused EINVAL |
+| Parameter tag space | `PARAM_TAG_MAX` | tools/src/manifest.rs | 0xEF | Id width: a module parameter is addressed by a byte tag, and 0xF0–0xFF are reserved for protection and policy metadata (voice-preset blobs, TLV magic, the terminator among them) |
+| Transmit-side ethernet frame | `MAX_FRAME_SIZE` | modules/foundation/ip/mod.rs | 1536 | Policy: the frame ceiling every NIC driver and `ip` size their staging to — MTU plus headers, rounded to a 32-byte multiple. Every transmit-payload ceiling in `ip` derives from it |
+| Listening TCP sockets | `MAX_LISTENERS` | modules/foundation/ip/mod.rs | — | Policy, per-profile (derived from `MAX_TCP_CONNS`): a SYN is matched against the listener list, never the whole table |
+| Outbound net queue | `NET_OUT_QUEUE_SLOTS` | modules/foundation/ip/mod.rs | 32 | Policy: frames `ip` holds for a consumer that is not draining; the receive loop stops reading the NIC when fewer than the headroom remain, so back-pressure reaches the wire instead of dropping on the floor |
+| DNS record types per allow entry | `MAX_ALLOW_TYPES` | modules/foundation/dns/mod.rs | 8 | Policy: one `update_allow` entry lists the types a signer may update; more than eight is a policy written in the wrong place |
+| fat32 enumeration | `MAX_FILES` | modules/foundation/fat32/mod.rs | 128 | Policy: entries one LIST returns; a larger directory is paged by the caller |
+| fat32 unlink free-list | `UNLINK_FREE_SLOTS` | modules/foundation/fat32/mod.rs | 8 | Deliberate cap with a stated degradation: sized for WAL segment compaction retiring a handful of segments per snapshot; overflow degrades to orphaning clusters, which fsck reclaims |
+| fat32 directory chain | `MAX_DIR_CLUSTERS` | modules/foundation/fat32/mod.rs | 65536 | Sanity bound: far past any real directory and far short of walking a cyclic chain for ever |
+| Mounts | `MAX_MOUNTS` | modules/foundation/mount/mod.rs | 8 | Policy: volumes one mount module routes; a backend registering past it fails EBUSY and its mounts resolve ENODEV |
+| QUIC streams per connection | `MAX_UNI_STREAMS`, `MAX_BIDI_STREAMS` | modules/foundation/quic/connection.rs | 6, 3 | Policy, advertised to the peer as transport parameters: the stream state is a field of the fixed-size connection struct, so the numbers are what the module can hold, not what QUIC allows |
+| QUIC datagram ceilings | `QUIC_DGRAM_MAX`, `QUIC_MAX_DATAGRAM_SIZE` | modules/foundation/quic/connection.rs | 1500, 1200 | Policy: the wire layer caps UDP datagrams at one Ethernet MTU; the DATAGRAM frame ceiling (advertised as `max_datagram_frame_size`) is one 1-RTT packet's payload so an inbound datagram is staged whole |
+| SMMU stream ids | `MAX_STREAM_IDS` | modules/foundation/smmu/mod.rs | 8 | Policy: stream-id table entries one SMMU module programs; a device past it is refused |
+| TLS checkpoint SNI and ALPN | `CKPT_SNI_MAX`, `CKPT_ALPN_MAX` | modules/foundation/tls/continuity.rs | 64, 16 | Policy, wire-visible in the checkpoint record: a session whose server name or protocol name is longer cannot be checkpointed and is left to close normally |
+| TLS continuity drain | `CONT_DRAIN_BUDGET` | modules/foundation/tls/continuity.rs | 8 | Policy: continuity frames drained per step, so a burst of deltas cannot take a step past the tick |
 
 ## Machine-checked block
 
@@ -120,6 +174,9 @@ covers — which is what makes "an id-shaped ceiling found in source but absent
 here is a bug" a measured number rather than a sentence.
 
 ```limit-register
+LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 65536
+LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 16384
+LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 4096
 MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536
 MAX_TCP_CONNS | modules/sdk/abi/config.rs | 256
 MAX_TCP_CONNS | modules/sdk/abi/config.rs | 16
@@ -220,4 +277,162 @@ TLS_CKPT_RECORD_MAX | modules/foundation/tls/continuity.rs | CKPT_FIXED_LEN + RE
 TX_HOLD_SIZE | modules/foundation/tls/continuity.rs | TX_HOLD_RECORDS * WIRE_RECORD_MAX
 LOCAL_PN_BLOCK | modules/foundation/quic/connection.rs | 4096
 STEP_BUDGET_DEFAULT_TICK_US | tools/src/target_facts.rs | 1000
+MAX_FRAME_SIZE | modules/foundation/ip/mod.rs | 1536
+MAX_LISTENERS | modules/foundation/ip/mod.rs | -
+NET_OUT_QUEUE_SLOTS | modules/foundation/ip/mod.rs | 32
+MAX_ALLOW_TYPES | modules/foundation/dns/mod.rs | 8
+MAX_FILES | modules/foundation/fat32/mod.rs | 128
+UNLINK_FREE_SLOTS | modules/foundation/fat32/mod.rs | 8
+MAX_DIR_CLUSTERS | modules/foundation/fat32/mod.rs | 65_536
+MAX_MOUNTS | modules/foundation/mount/mod.rs | 8
+MAX_UNI_STREAMS | modules/foundation/quic/connection.rs | 6
+MAX_BIDI_STREAMS | modules/foundation/quic/connection.rs | 3
+QUIC_DGRAM_MAX | modules/foundation/quic/connection.rs | 1500
+QUIC_MAX_DATAGRAM_SIZE | modules/foundation/quic/connection.rs | 1200
+MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8
+CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64
+CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16
+CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 * 1024
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024
+ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 16 * 1024 * 1024
+ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 2 * 1024 * 1024
+ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 0
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 32 * 1024
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024
+MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 256 * 1024
+MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 16 * 1024
+MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 4 * 1024
+MAX_MODULE_SECTION | src/kernel/boot/config.rs | 256 * 1024
+MAX_MODULE_SECTION | src/kernel/boot/config.rs | 32 * 1024
+MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256
+MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 4
+RECV_BUF_SIZE | modules/sdk/abi/config.rs | 8192
+RECV_BUF_SIZE | modules/sdk/abi/config.rs | 4096
+RECV_BUF_SIZE | modules/sdk/abi/config.rs | 2048
+SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100
+MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 64
+MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 8
+MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 8
+MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 4
+MAX_FS_PATH | modules/sdk/abi/config.rs | 256
+MAX_FS_PATH | modules/sdk/abi/config.rs | 64
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 256 * 1024
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 32 * 1024
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 48 * 1024
+FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 32768
+FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 2048
+FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 8192
+MAX_GRAPH_EDGES | src/kernel/boot/config.rs | 128
+MAX_CHANNELS | src/kernel/ipc/channel.rs | MAX_GRAPH_EDGES
+MAX_SPI_BUSES | src/kernel/boot/config.rs | 2
+MAX_I2C_BUSES | src/kernel/boot/config.rs | 2
+MAX_UART_BUSES | src/kernel/boot/config.rs | 2
+MAX_PIO_CONFIGS | src/kernel/boot/config.rs | 3
+MAX_GPIO_CONFIGS | src/kernel/boot/config.rs | 8
+MAX_WORKLOAD_SECTION_BYTES | src/kernel/boot/config.rs | 8 * 1024
+TICK_BOUND_MAX | src/kernel/boot/config.rs | 50_000
+MAX_FREE_REGIONS | src/kernel/module/loader.rs | 32
+ISO_ARENA_SIZE | src/kernel/module/loader.rs | 2 * 1024 * 1024
+MAX_TRACKED | src/kernel/module/provider.rs | 128
+MAX_PROVIDERS | src/kernel/module/provider.rs | MAX_CONTRACTS
+MAX_DYN_TAG_ROUTES | src/kernel/module/provider.rs | 4
+MAX_KEY_BYTES | src/kernel/security/key_vault.rs | 64
+MAX_LABEL | src/kernel/security/key_vault.rs | 64
+MAX_PERSISTED | src/kernel/security/key_vault.rs | 8
+MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048
+PARAM_TAG_MAX | tools/src/manifest.rs | 0xEF
+```
+
+Constants in these files that are shaped like ceilings but are not
+resource decisions — record layouts, scratch sized from a ceiling above,
+protocol constants, mirrors of a registered symbol — are retired from
+the coverage report here, each with the reason it is not a row.
+
+```limit-register-exempt
+BUF_SIZE | modules/drivers/rp1_gem/mod.rs | DMA scratch sized by the ring, not a policy ceiling
+MAX_FRAME | modules/drivers/rp1_gem/mod.rs | Ethernet frame size, a protocol constant (MTU + headers)
+STATE_SIZE | modules/drivers/rp1_gem/mod.rs | size_of the driver state, not a ceiling
+NET_BUF_SIZE | modules/foundation/dns/mod.rs | scratch: one net frame around one DNS packet
+MAX_LABEL_LEN | modules/foundation/dns/mod.rs | RFC 1035 label length, a protocol constant
+MAX_ZONE_PATH | modules/foundation/dns/mod.rs | path scratch for the committed-generation file name
+ZONE_RECORD_MAX | modules/foundation/dns/mod.rs | derived from the registered zone name and rdata ceilings
+MAX_ZONE_FILE | modules/foundation/dns/mod.rs | derived from ZONE_RECORD_MAX and the registered record count
+MAX_VAULT_LABEL | modules/foundation/dns/mod.rs | mirror of key_vault::MAX_LABEL
+MAC_INPUT_MAX | modules/foundation/dns/mod.rs | TSIG scratch derived from the packet and name ceilings
+BLOCK_SIZE | modules/foundation/fat32/mod.rs | the FAT/SD sector size, a format constant
+MAX_WRITE_NLB | modules/foundation/fat32/mod.rs | write chunking so a write fits any channel without hints, not a ceiling
+DIR_ENTRY_SIZE | modules/foundation/fat32/mod.rs | on-disk directory entry size, a format constant
+MAX_TX_FRAME_PAYLOAD | modules/foundation/ip/mod.rs | derived: MAX_FRAME_SIZE less the length prefix
+MAX_UDP_TX_PAYLOAD | modules/foundation/ip/mod.rs | derived from MAX_TX_FRAME_PAYLOAD and the header lengths
+MAX_TCP_TX_PAYLOAD | modules/foundation/ip/mod.rs | derived from MAX_TX_FRAME_PAYLOAD and the header lengths
+MAX_ICMP_TX_LEN | modules/foundation/ip/mod.rs | derived from MAX_TX_FRAME_PAYLOAD and the header lengths
+PENDING_CMD_BUF_SIZE | modules/foundation/ip/mod.rs | staging for a partially read command, sized to the largest command
+CONN_INDEX_SIZE | modules/foundation/ip/mod.rs | derived: the hash index is twice MAX_TCP_CONNS
+ADDR_INDEX_SIZE | modules/foundation/ip/mod.rs | derived: the hash index is four times MAX_LOCAL_ADDRS
+EPHEMERAL_SCAN_MAX | modules/foundation/ip/mod.rs | derived: a port scan bounded by twice MAX_TCP_CONNS
+PREFIX_MAX | modules/foundation/mount/mod.rs | control-message field width, bounded by its u8 length prefix
+VOLUME_MAX | modules/foundation/mount/mod.rs | control-message field width, bounded by its u8 length prefix
+PATH_MAX | modules/foundation/mount/mod.rs | path scratch for prefix rewriting
+CTL_MSG_MAX | modules/foundation/mount/mod.rs | derived from the control-message field widths
+NET_BUF_SIZE | modules/foundation/ota_registry/mod.rs | scratch: one MSG_DATA fragment plus its framing
+HDR_BUF_SIZE | modules/foundation/ota_registry/mod.rs | HTTP response header accumulator scratch
+MANIFEST_BUF_SIZE | modules/foundation/ota_registry/mod.rs | manifest accumulator scratch, sized to a 30-module graph
+TX_BUF_SIZE | modules/foundation/ota_registry/mod.rs | request builder scratch
+STAGE_ARG_SIZE | modules/foundation/ota_registry/mod.rs | derived: an OTA_STAGE_WRITE arg is an offset plus one fragment
+MAX_HOST_LEN | modules/foundation/ota_registry/mod.rs | parameter string width
+MAX_REPO_LEN | modules/foundation/ota_registry/mod.rs | parameter string width
+MAX_TAG_LEN | modules/foundation/ota_registry/mod.rs | parameter string width
+MAX_TICKET_LEN | modules/foundation/quic/connection.rs | scratch sized to the vault-sealed ticket the client echoes
+MAX_RETRY_TOKEN_LEN | modules/foundation/quic/connection.rs | scratch sized to the retry token layout, rounded up
+MAX_ALPN | modules/foundation/quic/connection.rs | protocol-name field width in the connection struct
+MAX_DATAGRAM_SIZE | modules/foundation/quic/connection.rs | the congestion controller's datagram unit, mirroring QUIC_DGRAM_MAX
+MAX_ACK_DELAY | modules/foundation/quic/connection.rs | the RFC 9000 default ack delay in ms, a protocol constant
+TP_MAX_UDP_PAYLOAD_SIZE | modules/foundation/quic/connection.rs | transport-parameter wire id, named after the parameter
+TP_ACTIVE_CONNECTION_ID_LIMIT | modules/foundation/quic/connection.rs | transport-parameter wire id, named after the parameter
+TP_MAX_DATAGRAM_FRAME_SIZE | modules/foundation/quic/connection.rs | transport-parameter wire id, named after the parameter
+CONT_SECRET_PT_MAX | modules/foundation/quic/continuity.rs | derived: the secret record's plaintext layout
+MIRROR_DELTA_MAX | modules/foundation/quic/continuity.rs | derived: a delta header, a packet number and one packet
+DELTA_PAYLOAD_MAX | modules/foundation/tls/continuity.rs | derived from RECV_BUF_SIZE and the delta header
+CONT_SCRATCH_SIZE | modules/foundation/tls/continuity.rs | derived assembly scratch
+REPLY_MAX | modules/foundation/tls/continuity.rs | derived reply assembly scratch
+MAX_ID | modules/sdk/abi/config.rs | the highest vocabulary id, a marker rather than a cap
+MAX_CONTENT_TYPE | modules/sdk/abi/config.rs | content-type string width
+MAX_VARS | modules/sdk/abi/config.rs | template variable table, a tuning knob
+MAX_VAR_VALUE | modules/sdk/abi/config.rs | template variable width, a tuning knob
+MAX_CACHE | modules/sdk/abi/config.rs | template cache slots, a tuning knob
+HEADER_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+METRIC_SCALAR_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+METRIC_HIST_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+METRIC_HIST16_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+SPAN_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+PSTATUS_STEP_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+PSTATUS_RES_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+PSTATUS_POOL_SIZE | modules/sdk/contracts/telemetry.rs | record layout
+MAX_RECORD_SIZE | modules/sdk/contracts/telemetry.rs | mirror of TELEMETRY_MAX_RECORD, pinned by test
+BATCH_HEADER_SIZE | modules/sdk/contracts/telemetry.rs | batch envelope layout
+SPI_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
+I2C_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
+UART_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
+GPIO_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
+PIO_CONFIG_BIN_SIZE | src/kernel/boot/config.rs | packed hardware-section layout
+GRAPH_EDGE_SIZE | src/kernel/boot/config.rs | packed graph-section layout
+DOMAIN_META_ENTRY_SIZE | src/kernel/boot/config.rs | packed graph-section layout
+DOMAIN_META_SIZE | src/kernel/boot/config.rs | packed graph-section layout
+ADAPTIVE_POST_SIZE | src/kernel/boot/config.rs | packed graph-section layout
+GRAPH_SECTION_SIZE | src/kernel/boot/config.rs | derived from MAX_GRAPH_EDGES and the layout sizes
+HEADER_SIZE | src/kernel/boot/config.rs | config blob header layout
+CONFIG_ARENA_SIZE | src/kernel/boot/config.rs | mirror of the platform config's CONFIG_ARENA_SIZE
+BUFFER_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of CHANNEL_BUFFER_SIZE
+BUFFER_ARENA_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of the platform config's BUFFER_ARENA_SIZE
+MODULE_STATE_SIZE | src/kernel/module/loader.rs | a parameter-name hash, not a size
+MODULE_ARENA_SIZE | src/kernel/module/loader.rs | a parameter-name hash, not a size
+STATE_CANARY_SIZE | src/kernel/module/loader.rs | canary layout
+IMAGE_HEADER_SIZE | src/kernel/module/ota_stage.rs | staged-image header layout
+MAX_SEALED | src/kernel/security/key_vault.rs | derived: MAX_KEY_BYTES plus the AEAD nonce and tag
+MAX_ATTEST_RECORD | src/kernel/security/key_vault.rs | scratch derived from the host profile's table sizes
+MAX_RECORD | src/kernel/sys/telemetry_ring.rs | mirror of TELEMETRY_MAX_RECORD
+MANIFEST_HEADER_SIZE | tools/src/manifest.rs | manifest layout
+SIGNATURE_BLOCK_SIZE | tools/src/manifest.rs | signature block layout
 ```

@@ -450,7 +450,8 @@ const SHADOW_TIERS: [&str; 5] = ["tests", "benches", "examples", "fixtures", "fu
 ///   shadow repo versions nothing);
 /// - a repo with no shadow repo must not gitignore the tier — a
 ///   gitignored-only tier exists on exactly one machine and has no
-///   recovery path (§1's explicit failure mode).
+///   recovery path (the explicit failure mode named in
+///   standards/test-tracking.md §1).
 fn scan_shadow_guard(project_root: &Path, report: &mut Report) {
     let shadow_dir = project_root.join(".git-shadow");
     let has_shadow = shadow_dir.is_dir();

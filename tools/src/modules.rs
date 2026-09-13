@@ -212,7 +212,8 @@ pub fn build_module_table(modules: &[ModuleInfo]) -> Result<Vec<u8>> {
     result.extend_from_slice(&MODULE_TABLE_MAGIC.to_le_bytes());
     result.push(TABLE_VERSION);
     result.push(modules.len() as u8);
-    // total_size as u32 split across u16 lo + u16 hi (backward compatible)
+    // total_size is a u32 written as two little-endian u16 fields: the low
+    // half first, then the high half, followed by 6 reserved bytes.
     result.extend_from_slice(&((total_size & 0xFFFF) as u16).to_le_bytes());
     result.extend_from_slice(&(((total_size >> 16) & 0xFFFF) as u16).to_le_bytes());
     result.extend_from_slice(&[0u8; 6]); // remaining reserved
@@ -382,8 +383,7 @@ pub fn parse_modules_from_config_multi(
     // Dedup by module TYPE (one FXMT entry per name_hash) while
     // remembering which VARIANT was selected: two nodes of one type
     // naming different variants cannot share the single table entry, so
-    // that's a hard config error rather than a silent first-wins
-    // (RFC module_variants §4.3).
+    // that's a hard config error rather than a silent first-wins.
     let mut loaded_variants: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
     let mut check_dedup = |module_type: &str, variant: Option<&str>| -> Result<bool> {
@@ -527,9 +527,10 @@ pub fn parse_modules_from_config_multi(
         }
     }
 
-    // Resident-pod module types (RFC adaptive_tick_extra §7): pods admitted at
-    // boot via `apply_add` reference PIC modules by `name_hash`, so their .fmod
-    // must be in the module table too. Scan `pods:[*].modules:[*].type` and load
+    // Resident-pod module types: a pod is admitted at boot via `apply_add` and
+    // references its PIC modules by `name_hash`, which resolves only against
+    // the module table — so a pod's .fmod must be packed into that table even
+    // though the pod is not part of the base graph. Scan `pods:[*].modules:[*].type` and load
     // any type not already present (dedup against the base graph's modules).
     if let Some(pods) = config["pods"].as_array() {
         let mut loaded_types: std::collections::HashSet<String> =
@@ -548,7 +549,7 @@ pub fn parse_modules_from_config_multi(
                 // naming a different variant than the base graph (or an
                 // earlier pod) loaded must fail, not silently ride on
                 // whichever build got there first — same rule as the
-                // base graph (RFC module_variants §4.3).
+                // base graph: one FXMT entry per type, so one build.
                 match loaded_variants.entry(module_type.to_string()) {
                     std::collections::hash_map::Entry::Occupied(e) => {
                         if e.get().as_deref() != pod_variant {
@@ -1198,7 +1199,7 @@ pub fn pack_fmod(
         }
     };
 
-    // Variant specialization (RFC module_variants): the manifest this
+    // Variant specialization: the manifest this
     // fmod embeds is the VARIANT's manifest — omitted ports filtered
     // out, retained ports keeping their indices — so the artifact's
     // advertised port surface matches what was actually compiled in.
@@ -1344,8 +1345,12 @@ pub fn pack_fmod(
     }
     // byte 1: step_period_ticks (0 = every tick). Sourced from the manifest
     // (`step_period_ticks = N`) — this is the producer the loader/scheduler ABI
-    // (loader.rs:846) reads back. The adaptive validator gates a non-zero value
-    // on mechanism-(b) domains (RFC §8 rule 1).
+    // (loader.rs:846) reads back. A non-zero value counts SCHEDULER TICKS, so
+    // on a mechanism-(b) domain — one whose tick cadence the pacer varies — the
+    // wall-clock period it implies (step_period_ticks × domain_tick_us) warps.
+    // The adaptive validator therefore rejects a non-zero value on such a
+    // domain unless the module declares `timer_class = "wall_clock"`, i.e.
+    // re-derives its period from real time.
     reserved[1] = module_manifest.step_period_ticks;
     reserved[2..4].copy_from_slice(&(schema_size as u16).to_le_bytes());
     reserved[4..6].copy_from_slice(&(manifest_size as u16).to_le_bytes());
@@ -1645,8 +1650,8 @@ fn validate_param_schema(data: &[u8], start: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// RFC module_variants §4.3: two module entries of one type naming
-    /// different variants is a hard config error — the image carries
+    /// Two module entries of one type naming different variants is a
+    /// hard config error — the image carries
     /// one FXMT entry per name_hash, so silent first-wins would ship
     /// whichever variant parsed first. Uses a builtin type so the
     /// first entry needs no .fmod on disk.

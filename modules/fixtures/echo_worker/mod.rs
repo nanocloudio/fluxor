@@ -75,7 +75,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -261,9 +260,13 @@ unsafe fn sc_write(s: &mut WorkerState, msg_type: u8, payload: *const u8, payloa
     let out_chan = s.ctrl_out;
     let scratch = s.ctrl_buf.as_mut_ptr();
     net_write_frame(
-        &*sys_ptr, out_chan, msg_type,
-        payload, payload_len,
-        scratch, CTRL_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        msg_type,
+        payload,
+        payload_len,
+        scratch,
+        CTRL_BUF_SIZE,
     );
 }
 
@@ -273,7 +276,9 @@ unsafe fn mon_emit(s: &mut WorkerState, event: u8, reason: &[u8], status: &[u8])
     let sys_ptr = s.syscalls;
     if s.self_idx == 0xFF {
         let idx = dev_self_index(&*sys_ptr);
-        if idx >= 0 { s.self_idx = idx as u8; }
+        if idx >= 0 {
+            s.self_idx = idx as u8;
+        }
     }
     let mon_ptr = s.mon_buf.as_mut_ptr();
     let session_ptr = s.session_id.as_ptr();
@@ -281,11 +286,16 @@ unsafe fn mon_emit(s: &mut WorkerState, event: u8, reason: &[u8], status: &[u8])
     let worker_ptr = WORKER_ID.as_ptr();
     let _ = dev_mon_session(
         &*sys_ptr,
-        s.self_idx, event,
-        session_ptr, s.session_epoch,
-        anchor_ptr, worker_ptr,
-        reason, status,
-        mon_ptr, MON_BUF_SIZE,
+        s.self_idx,
+        event,
+        session_ptr,
+        s.session_epoch,
+        anchor_ptr,
+        worker_ptr,
+        reason,
+        status,
+        mon_ptr,
+        MON_BUF_SIZE,
     );
 }
 
@@ -301,12 +311,7 @@ unsafe fn send_hello_ack(s: &mut WorkerState) {
 /// Emit MSG_SC_ATTACHED / MSG_SC_DETACHED / MSG_SC_DRAINED.
 /// All three share the shape [session_id: 16 BE][epoch: 4 LE][...],
 /// with an optional trailing status byte for ATTACHED.
-unsafe fn send_session_event(
-    s: &mut WorkerState,
-    msg_type: u8,
-    include_status: bool,
-    status: u8,
-) {
+unsafe fn send_session_event(s: &mut WorkerState, msg_type: u8, include_status: bool, status: u8) {
     let base = SESSION_ID_BYTES + EPOCH_BYTES;
     let total = if include_status { base + 1 } else { base };
     let mut payload = [0u8; SESSION_ID_BYTES + EPOCH_BYTES + 1];
@@ -370,8 +375,7 @@ unsafe fn export_state(s: &mut WorkerState) {
         chunk[SESSION_ID_BYTES + EPOCH_BYTES..SESSION_ID_BYTES + EPOCH_BYTES + 4]
             .copy_from_slice(&off.to_le_bytes());
         let base = SESSION_ID_BYTES + EPOCH_BYTES + 4;
-        chunk[base..base + len as usize]
-            .copy_from_slice(&blob[off as usize..(off + len) as usize]);
+        chunk[base..base + len as usize].copy_from_slice(&blob[off as usize..(off + len) as usize]);
         sc_write(s, SC_CMD_EXPORT_CHUNK, chunk.as_ptr(), base + len as usize);
         exp.advance(len);
     }
@@ -379,8 +383,7 @@ unsafe fn export_state(s: &mut WorkerState) {
     // EXPORT_END: [sid:16][epoch:4][crc32:4 LE]
     let mut end = [0u8; SESSION_ID_BYTES + EPOCH_BYTES + 4];
     sid_epoch(s, &mut end);
-    end[SESSION_ID_BYTES + EPOCH_BYTES..]
-        .copy_from_slice(&handoff_crc32(&blob).to_le_bytes());
+    end[SESSION_ID_BYTES + EPOCH_BYTES..].copy_from_slice(&handoff_crc32(&blob).to_le_bytes());
     sc_write(s, SC_CMD_EXPORT_END, end.as_ptr(), end.len());
 
     mon_emit(s, MON_EV_EXPORTED, b"", b"");
@@ -579,7 +582,11 @@ unsafe fn handle_ctrl(s: &mut WorkerState) {
                     mon_emit(s, MON_EV_IMPORTED, b"", b"ok");
                 } else {
                     s.phase = WorkerPhase::Idle;
-                    let st = if status == HANDOFF_OK { HANDOFF_CORRUPT } else { status };
+                    let st = if status == HANDOFF_OK {
+                        HANDOFF_CORRUPT
+                    } else {
+                        status
+                    };
                     send_import_event(s, SC_MSG_IMPORT_END, st);
                     mon_emit(s, MON_EV_IMPORTED, b"", b"corrupt");
                 }
@@ -756,9 +763,15 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() { return -5; }
-        if state_size < core::mem::size_of::<WorkerState>() { return -6; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() {
+            return -5;
+        }
+        if state_size < core::mem::size_of::<WorkerState>() {
+            return -6;
+        }
 
         let s = &mut *(state as *mut WorkerState);
         s.init(syscalls as *const SyscallTable);
@@ -769,9 +782,13 @@ pub extern "C" fn module_new(
         s.ctrl_out = out_chan;
         let sys_ptr = s.syscalls;
         let data_in = dev_channel_port(&*sys_ptr, 0, 1);
-        if data_in >= 0 { s.data_in = data_in; }
+        if data_in >= 0 {
+            s.data_in = data_in;
+        }
         let data_out = dev_channel_port(&*sys_ptr, 1, 1);
-        if data_out >= 0 { s.data_out = data_out; }
+        if data_out >= 0 {
+            s.data_out = data_out;
+        }
 
         dev_log(&*sys_ptr, 3, b"[echo_wkr] init".as_ptr(), 15);
         0
@@ -782,9 +799,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut WorkerState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
 
         handle_ctrl(s);
         handle_data(s);

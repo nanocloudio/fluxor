@@ -43,17 +43,15 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
-use abi::SyscallTable;
-use abi::platform::rp::flash_layout::GRAPH_SLOT_SIZE as SLOT_SIZE;
 use abi::contracts::storage::graph_slot::channel::{
-    REQ_ERASE, REQ_WRITE, REQ_ACTIVATE, RESP_RESULT,
-    FRAME_HDR, RESP_PAYLOAD, RESP_FRAME_LEN,
+    FRAME_HDR, REQ_ACTIVATE, REQ_ERASE, REQ_WRITE, RESP_FRAME_LEN, RESP_PAYLOAD, RESP_RESULT,
 };
+use abi::platform::rp::flash_layout::GRAPH_SLOT_SIZE as SLOT_SIZE;
+use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
 
@@ -67,23 +65,23 @@ const CONTINUE: i32 = 0;
 const READY: i32 = 3;
 
 // Extra port indices (primary in/out are index 0).
-const PORT_IN_GS_RESP: u32 = 1;   // graph_slot response channel
-const PORT_OUT_GS_REQ: u32 = 1;   // graph_slot request channel
+const PORT_IN_GS_RESP: u32 = 1; // graph_slot response channel
+const PORT_OUT_GS_REQ: u32 = 1; // graph_slot request channel
 
 // Status record kinds.
-const STATUS_ERASED: u8   = 0x01;
-const STATUS_WRITTEN: u8  = 0x02;
+const STATUS_ERASED: u8 = 0x01;
+const STATUS_WRITTEN: u8 = 0x02;
 const STATUS_ACTIVATED: u8 = 0x03;
-const STATUS_FAILED: u8   = 0xFF;
+const STATUS_FAILED: u8 = 0xFF;
 const STATUS_RECORD_SIZE: usize = 4;
 
 // Ingest state machine.
-const ST_IDLE: u8          = 0;  // waiting for first input byte
-const ST_AWAIT_ERASE: u8   = 1;  // erase request sent, awaiting response
-const ST_STREAMING: u8     = 2;  // accepting input, writing pages
-const ST_AWAIT_WRITE: u8   = 3;  // write request sent, awaiting response
+const ST_IDLE: u8 = 0; // waiting for first input byte
+const ST_AWAIT_ERASE: u8 = 1; // erase request sent, awaiting response
+const ST_STREAMING: u8 = 2; // accepting input, writing pages
+const ST_AWAIT_WRITE: u8 = 3; // write request sent, awaiting response
 const ST_AWAIT_ACTIVATE: u8 = 4; // activate request sent, awaiting response
-const ST_FAILED: u8        = 0xFF;
+const ST_FAILED: u8 = 0xFF;
 
 /// Full WRITE request frame: 6 header + 260 payload = 266.
 const REQ_WRITE_FRAME_LEN: usize = FRAME_HDR + 4 + PAGE_SIZE;
@@ -122,7 +120,7 @@ struct State {
 
 fn write_u32_le(dst: &mut [u8], offset: usize, value: u32) {
     let b = value.to_le_bytes();
-    dst[offset]     = b[0];
+    dst[offset] = b[0];
     dst[offset + 1] = b[1];
     dst[offset + 2] = b[2];
     dst[offset + 3] = b[3];
@@ -130,7 +128,7 @@ fn write_u32_le(dst: &mut [u8], offset: usize, value: u32) {
 
 fn write_u16_le(dst: &mut [u8], offset: usize, value: u16) {
     let b = value.to_le_bytes();
-    dst[offset]     = b[0];
+    dst[offset] = b[0];
     dst[offset + 1] = b[1];
 }
 
@@ -142,7 +140,9 @@ unsafe fn read_u32_le(p: *const u8) -> u32 {
 }
 
 unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, rc: i32) {
-    if s.status_chan < 0 { return; }
+    if s.status_chan < 0 {
+        return;
+    }
     let mut rec = [0u8; STATUS_RECORD_SIZE];
     let p = rec.as_mut_ptr();
     core::ptr::write_volatile(p.add(0), kind);
@@ -154,7 +154,9 @@ unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, rc: i32) {
 }
 
 unsafe fn send_bare_request(s: &State, sys: &SyscallTable, req_type: u32) -> bool {
-    if s.gs_req_chan < 0 { return false; }
+    if s.gs_req_chan < 0 {
+        return false;
+    }
     let mut frame = [0u8; REQ_BARE_FRAME_LEN];
     write_u32_le(&mut frame, 0, req_type);
     write_u16_le(&mut frame, 4, 0);
@@ -163,7 +165,9 @@ unsafe fn send_bare_request(s: &State, sys: &SyscallTable, req_type: u32) -> boo
 }
 
 unsafe fn send_write_request(s: &State, sys: &SyscallTable, offset: u32) -> bool {
-    if s.gs_req_chan < 0 { return false; }
+    if s.gs_req_chan < 0 {
+        return false;
+    }
     let mut frame = [0u8; REQ_WRITE_FRAME_LEN];
     write_u32_le(&mut frame, 0, REQ_WRITE);
     write_u16_le(&mut frame, 4, (4 + PAGE_SIZE) as u16);
@@ -182,7 +186,9 @@ unsafe fn send_write_request(s: &State, sys: &SyscallTable, offset: u32) -> bool
 /// `Some((echoed_req_type, value))` when a full frame is available,
 /// `None` otherwise.
 unsafe fn poll_response(s: &mut State, sys: &SyscallTable) -> Option<(u32, i32)> {
-    if s.gs_resp_chan < 0 { return None; }
+    if s.gs_resp_chan < 0 {
+        return None;
+    }
     let room = RESP_FRAME_LEN - s.resp_fill as usize;
     if room > 0 {
         let tail = s.resp_buf.as_mut_ptr().add(s.resp_fill as usize);
@@ -191,7 +197,9 @@ unsafe fn poll_response(s: &mut State, sys: &SyscallTable) -> Option<(u32, i32)>
             s.resp_fill += n as u16;
         }
     }
-    if (s.resp_fill as usize) < RESP_FRAME_LEN { return None; }
+    if (s.resp_fill as usize) < RESP_FRAME_LEN {
+        return None;
+    }
     // Validate the frame.
     let ty = read_u32_le(s.resp_buf.as_ptr());
     let len = u16::from_le_bytes([s.resp_buf[4], s.resp_buf[5]]) as usize;
@@ -215,7 +223,9 @@ fn reset_ingest(s: &mut State) {
 }
 
 fn fail(s: &mut State, sys: &SyscallTable, rc: i32) {
-    unsafe { emit_status(s, sys, STATUS_FAILED, rc); }
+    unsafe {
+        emit_status(s, sys, STATUS_FAILED, rc);
+    }
     reset_ingest(s);
     s.state = ST_FAILED;
 }
@@ -248,12 +258,16 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
 
     match s.state {
         ST_IDLE => {
-            if s.in_chan < 0 { return CONTINUE; }
+            if s.in_chan < 0 {
+                return CONTINUE;
+            }
             // On the first byte, send ERASE and transition.
             if s.page_fill == 0 {
                 let mut peek = [0u8; 1];
                 let n = (sys.channel_read)(s.in_chan, peek.as_mut_ptr(), 1);
-                if n <= 0 { return CONTINUE; }
+                if n <= 0 {
+                    return CONTINUE;
+                }
                 core::ptr::write_volatile(s.page.as_mut_ptr(), peek[0]);
                 s.page_fill = 1;
                 s.byte_count = 1;
@@ -267,8 +281,13 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
         }
         ST_AWAIT_ERASE => {
             if let Some((echoed, rc)) = poll_response(s, sys) {
-                if echoed != REQ_ERASE { return CONTINUE; }
-                if rc < 0 { fail(s, sys, rc); return CONTINUE; }
+                if echoed != REQ_ERASE {
+                    return CONTINUE;
+                }
+                if rc < 0 {
+                    fail(s, sys, rc);
+                    return CONTINUE;
+                }
                 emit_status(s, sys, STATUS_ERASED, 0);
                 s.state = ST_STREAMING;
             }
@@ -305,8 +324,13 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
         }
         ST_AWAIT_WRITE => {
             if let Some((echoed, rc)) = poll_response(s, sys) {
-                if echoed != REQ_WRITE { return CONTINUE; }
-                if rc < 0 { fail(s, sys, rc); return CONTINUE; }
+                if echoed != REQ_WRITE {
+                    return CONTINUE;
+                }
+                if rc < 0 {
+                    fail(s, sys, rc);
+                    return CONTINUE;
+                }
                 s.write_offset += PAGE_SIZE as u32;
                 s.page_fill = 0;
                 if s.write_offset & 0x3FFF == 0 {
@@ -326,10 +350,17 @@ unsafe fn pump(s: &mut State, sys: &SyscallTable) -> i32 {
         }
         ST_AWAIT_ACTIVATE => {
             if let Some((echoed, rc)) = poll_response(s, sys) {
-                if echoed != REQ_ACTIVATE { return CONTINUE; }
+                if echoed != REQ_ACTIVATE {
+                    return CONTINUE;
+                }
                 emit_status(
-                    s, sys,
-                    if rc == 0 { STATUS_ACTIVATED } else { STATUS_FAILED },
+                    s,
+                    sys,
+                    if rc == 0 {
+                        STATUS_ACTIVATED
+                    } else {
+                        STATUS_FAILED
+                    },
                     rc,
                 );
                 reset_ingest(s);
@@ -367,8 +398,12 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<State>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<State>() {
+            return -2;
+        }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
         s.in_chan = in_chan;
@@ -390,9 +425,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut State);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
         let sys = &*s.syscalls;
 
         if s.signaled_ready == 0 {

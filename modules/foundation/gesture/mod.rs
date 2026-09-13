@@ -33,7 +33,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -116,10 +115,10 @@ struct GestureState {
 
 mod params_def {
     use super::GestureState;
-    use super::{p_u8, p_u16, p_u32};
-    use super::{DEFAULT_CLICK, DEFAULT_DOUBLE, DEFAULT_TRIPLE, DEFAULT_LONG_PRESS};
-    use super::{DEFAULT_MULTI_CLICK_MS, DEFAULT_LONG_PRESS_MS};
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u32, p_u8};
+    use super::{DEFAULT_CLICK, DEFAULT_DOUBLE, DEFAULT_LONG_PRESS, DEFAULT_TRIPLE};
+    use super::{DEFAULT_LONG_PRESS_MS, DEFAULT_MULTI_CLICK_MS};
 
     define_params! {
         GestureState;
@@ -214,8 +213,8 @@ pub extern "C" fn module_new(
         s.map_long_press = DEFAULT_LONG_PRESS;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -258,27 +257,51 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let pfx = b"[gesture] hb in=";
             let mut q = 0usize;
             let mut t = 0;
-            while t < pfx.len() { *p.add(q) = pfx[t]; q += 1; t += 1; }
+            while t < pfx.len() {
+                *p.add(q) = pfx[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), s.in_chan as u32);
             let oc = b" out=";
             let mut t = 0;
-            while t < oc.len() { *p.add(q) = oc[t]; q += 1; t += 1; }
+            while t < oc.len() {
+                *p.add(q) = oc[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), s.out_chan as u32);
             let by = b" bytes_in=";
             let mut t = 0;
-            while t < by.len() { *p.add(q) = by[t]; q += 1; t += 1; }
+            while t < by.len() {
+                *p.add(q) = by[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), s.total_bytes_seen);
             let em = b" emits=";
             let mut t = 0;
-            while t < em.len() { *p.add(q) = em[t]; q += 1; t += 1; }
+            while t < em.len() {
+                *p.add(q) = em[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), s.total_emits as u32);
             let dt = b" detect=";
             let mut t = 0;
-            while t < dt.len() { *p.add(q) = dt[t]; q += 1; t += 1; }
+            while t < dt.len() {
+                *p.add(q) = dt[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), s.detect as u32);
             let cc = b" cc=";
             let mut t = 0;
-            while t < cc.len() { *p.add(q) = cc[t]; q += 1; t += 1; }
+            while t < cc.len() {
+                *p.add(q) = cc[t];
+                q += 1;
+                t += 1;
+            }
             q += fmt_u32_raw(p.add(q), s.click_count as u32);
             dev_log(sys, 3, p, q);
         }

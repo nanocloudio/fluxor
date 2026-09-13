@@ -1,8 +1,8 @@
 version = "1.0.0"
 hardware_targets = ["bcm2712"]
 
-# Resident-pod counter for the owner-pause silicon AC
-# (rfc_workload_lifecycle.md §3.2 P4). Logs `[pprobe] c=<n> ms=<t>`
+# Resident-pod counter proving owner-pause on silicon. Logs
+# `[pprobe] c=<n> ms=<t>`
 # periodically and `[pprobe] gap_ms=<g>` when the wall-clock gap between
 # two of its OWN consecutive steps exceeds gap_min_ms — the pod-side
 # proof that the pause froze it for exactly the driver's window.

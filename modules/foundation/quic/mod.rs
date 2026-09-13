@@ -3204,7 +3204,9 @@ pub mod test_helpers {
     //! connection lifecycle without standing up a full QUIC crypto handshake.
 
     use super::{
-        promote_key_phase, drain_inbound_one, emit_connection_close, BidiStream, MAX_BIDI_STREAMS,ConnPhase, QuicState, MAX_CONNS};
+        drain_inbound_one, emit_connection_close, promote_key_phase, BidiStream, ConnPhase,
+        QuicState, MAX_BIDI_STREAMS, MAX_CONNS,
+    };
 
     /// Run the server admission decision for one inbound datagram, exactly
     /// as the RX path does: match by DCID, else allocate, else emit the
@@ -4078,7 +4080,9 @@ pub mod test_helpers {
     /// # Safety
     /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
     pub unsafe fn cont_largest_recv_pn(state: *const u8, idx: usize) -> u64 {
-        (*(state as *const QuicState)).conns[idx].one_rtt.largest_recv_pn
+        (*(state as *const QuicState)).conns[idx]
+            .one_rtt
+            .largest_recv_pn
     }
 
     /// Continuity profile connection `idx` was paired under (0 = none).
@@ -4103,7 +4107,9 @@ pub mod test_helpers {
     /// # Safety
     /// `state` points to an initialised `QuicState`; `idx < MAX_CONNS`.
     pub unsafe fn cont_prev_read_valid(state: *const u8, idx: usize) -> bool {
-        (*(state as *const QuicState)).conns[idx].one_rtt.prev_read_valid
+        (*(state as *const QuicState)).conns[idx]
+            .one_rtt
+            .prev_read_valid
     }
 
     /// Emit a CONNECTION_CLOSE for connection `idx` through the real emit

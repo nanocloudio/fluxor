@@ -27,7 +27,7 @@ pub struct ModuleCaps {
 /// `[requires]` hardware-capability check honour the actual build
 /// target rather than a stale YAML default. `None` means fall back to
 /// the YAML's literal value, which is the documented opt-in behaviour
-/// for legacy configs / fixtures with no declared target.
+/// for configs and fixtures that declare no target.
 #[expect(
     clippy::too_many_arguments,
     reason = "ABI-shaped function; argument list mirrors the syscall / register signature"
@@ -163,7 +163,7 @@ fn generate_config_impl(
         );
     }
 
-    // Resident-pod modules (RFC adaptive_tick_extra §7) are admitted into REAL
+    // Resident-pod modules are admitted into REAL
     // execution domains and share their domain's runner, budget, and timing/ISR
     // constraints, so they must pass the SAME admission checks as base modules —
     // not a weaker pod-only path. Build an augmented list (base + every pod's
@@ -260,9 +260,8 @@ fn generate_config_impl(
     // ISR-tier admission: every module routed to a Tier 1b/2 domain
     // must declare `isr_safe = true` in its manifest, and the wiring
     // touching it cannot use an edge class incompatible with bridge
-    // routing. The build-time gate is half of D6 — the runtime
-    // routing in `channel_open` is the other half. See
-    // `.context/rfc_isr_tier_surface.md` for the full contract.
+    // routing. This build-time gate is one half of the contract; the
+    // runtime routing in `channel_open` is the other.
     validate_isr_tier_admission(
         config,
         validation_list,
@@ -279,8 +278,7 @@ fn generate_config_impl(
     // through `step_one_module` which assumes cooperative context.
     // Placement in Tier 1b/2/3 domains is rejected here so the
     // misconfiguration surfaces at build time rather than as silent
-    // misbehaviour at runtime. See `.context/rfc_isr_tier_surface.md`
-    // §D8 for the contract.
+    // misbehaviour at runtime.
     validate_pre_tick_drain_admission(config, validation_list, extra_module_dirs, project_root)?;
 
     // Inject graph sample_rate into modules that don't declare their own
@@ -321,7 +319,7 @@ fn generate_config_impl(
         project_root,
     );
 
-    // Adaptive-tick validation (range/D8/D9/D10 + timer-class gate). Run here,
+    // Adaptive-tick validation (range checks + timer-class gate). Run here,
     // after the full manifest map exists, so the timer-class gate resolves
     // external/project modules via the same resolver (not the narrower
     // from_source_tree) — closing the fail-open for non-bundled modules.
@@ -357,8 +355,8 @@ fn generate_config_impl(
     //
     // The CLI-resolved target wins over any literal `target:` in the
     // YAML — that's the contract that lets `--target` override a
-    // checked-in default. Legacy fixtures without either omit the
-    // check entirely; that's by design, since the default `requires`
+    // checked-in default. A config with neither omits the check
+    // entirely; that's by design, since the default `requires`
     // is all-false and satisfies every silicon.
     // YAML `target:` carries a board or host token; capability lookup is
     // silicon-keyed, so resolve through the registry first. Falls back to
@@ -543,8 +541,8 @@ fn generate_config_impl(
     // is safe, so the module must attest it in its manifest.
     validate_fault_policy(config, &module_names, &manifests)?;
 
-    // Presentation-shell / browser-overlay descriptor validation
-    // (RFC browser_overlay §19). Scenarios without a `presentation.shell`
+    // Presentation-shell / browser-overlay descriptor validation.
+    // Scenarios without a `presentation.shell`
     // block are unaffected. Lives in a standalone, unit-testable module.
     crate::presentation_shell::validate(config, &module_names).map_err(Error::Config)?;
 
@@ -685,7 +683,7 @@ fn generate_config_impl(
     // Parallel array; entries default to 0 ("use module hints").
     let edge_buffer_bytes = resolve_edge_buffer_bytes(config);
 
-    // Per-edge wake-on-write (`wake: true`, RFC idle_skip_wake):
+    // Per-edge wake-on-write (`wake: true`):
     // channel_write on the flagged edge latches the consumer's
     // event-wake bit and rings the scheduler doorbell, cutting the idle
     // sleep short. Restricted to control/transaction rate classes as
@@ -746,8 +744,8 @@ fn generate_config_impl(
     //              override or the consumer/producer port's content-
     //              type default. Consumed by the kernel's
     //              MODULE_FLOW_BUDGET query.
-    //   byte 9:    bit 0 = wake_on_write (`wake: true`, RFC idle_skip_wake
-    //              — control/transaction classes only); bits 1-7 reserved
+    //   byte 9:    bit 0 = wake_on_write (`wake: true` — control and
+    //              transaction classes only); bits 1-7 reserved
     //   bytes 10-11: reserved (0)
     //
     // Both ports get 4 bits; the runtime cap is `MAX_PORTS=16`. The
@@ -779,7 +777,7 @@ fn generate_config_impl(
         graph_section.push(((from_port_index & 0x0F) << 4) | (to_port_index & 0x0F));
         graph_section.extend_from_slice(&buffer_bytes.to_le_bytes());
         graph_section.push(edge_rate_classes.get(i).copied().unwrap_or(0));
-        // byte 9: bit 0 = wake_on_write (RFC idle_skip_wake); bits 1-7
+        // byte 9: bit 0 = wake_on_write; bits 1-7
         // reserved. bytes 10-11 reserved.
         graph_section.push(edge_wake_flags.get(i).copied().unwrap_or(0) & 0x01);
         graph_section.extend_from_slice(&[0u8; 2]);
@@ -803,7 +801,7 @@ fn generate_config_impl(
         let mode = dom
             .map(|x| parse_domain_tier_to_exec_mode(x).unwrap_or(0))
             .unwrap_or(0);
-        // Adaptive-tick per-domain config (RFC adaptive_tick §8), all optional.
+        // Adaptive-tick per-domain config, all optional.
         // 0 ⇒ adaptive off / "use tick_us" (the kernel parser default-fills
         // tick_min/tick_max to the domain's tick), so a domain that sets none
         // of these is byte-identical in behaviour to today's fixed tick.
@@ -863,7 +861,7 @@ fn generate_config_impl(
         result.extend_from_slice(&tmax.to_le_bytes());
     }
 
-    // Resident-pod section (RFC adaptive_tick_extra §7): each top-level `pods:`
+    // Resident-pod section: each top-level `pods:`
     // entry becomes a self-contained `AddSubgraph` (FLXA) blob the kernel admits
     // at boot via `apply_add`. Appended right AFTER the 16-byte adaptive post-body
     // (so the kernel reads it at `total_size + ADAPTIVE_POST_SIZE`), also PAST the
@@ -872,7 +870,7 @@ fn generate_config_impl(
     let pod_section = build_pod_section(config, modules_dir, extra_module_dirs)?;
     result.extend_from_slice(&pod_section);
 
-    // Capacity-envelope section (`rfc_resource_model.md` §3 Tier A): the
+    // Capacity-envelope section (compose-time Tier A sizing): the
     // optional top-level `capacity:` map becomes an FXEV post-body section
     // installing per-deployment enforced pool capacities. Same additive
     // discipline as the sections above. Absent `capacity:` ⇒ no section ⇒
@@ -918,7 +916,7 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
                 return Err(Error::Config(format!(
                     "capacity: '{name}' = {n} exceeds the {target} kernel's compiled \
                      capacity {static_cap} — the envelope can only size DOWN from the \
-                     compiled tables (rfc_resource_model.md §3)"
+                     compiled tables"
                 )));
             }
             Some(static_cap) => {
@@ -940,7 +938,7 @@ fn build_capacity_envelope(config: &Value, resolved_target: Option<&str>) -> Res
 }
 
 /// Build the resident-pod config section from the optional top-level `pods:`
-/// list (RFC adaptive_tick_extra §7). Each pod is a self-contained subgraph:
+/// list. Each pod is a self-contained subgraph:
 /// modules referenced by `name_hash` (FNV-1a of type) with inline-TLV params (the
 /// same `build_params_from_schema` packing base modules use), and optional
 /// intra-pod `wiring:` (`from`/`to` by pod-local module name). Cross-pod edges
@@ -1138,7 +1136,7 @@ fn build_pod_section(
             .get("buffer_cap")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        // §6.5 idle-safe attestation: the operator asserts (pod-level
+        // Idle-safe attestation: the operator asserts (pod-level
         // `idle_safe: true`) that this pod is demand-driven and may be parked when
         // idle. Absent/false ⇒ fail-closed: the kernel relaxes it to the `tick_max`
         // backstop cadence rather than parking it.
@@ -1192,23 +1190,26 @@ fn assign_buffer_groups(
             .any(|c| &c.name == name && c.mailbox_safe && c.in_place_writer)
     };
 
-    // Count data edges per module (only data edges, to_port == 0)
+    // Count data edges per module. An edge is a data edge when it lands on
+    // a data input (`to_port == 0`); the same edge is the producer's data
+    // output. A control or status edge leaving a module is not a second
+    // data output, so it must not stop that module from being a chain
+    // interior — and, equally, wiring an unrelated consumer to a module's
+    // status port must not change how its data edges are aliased.
     let num_modules = module_names.len();
     let mut data_in_count = vec![0u8; num_modules];
     let mut data_out_count = vec![0u8; num_modules];
-    for (_, to_id, to_port, _, _) in edges {
-        if *to_port == 0 {
-            let idx = *to_id as usize;
-            if idx < num_modules {
-                data_in_count[idx] += 1;
-            }
+    for (from_id, to_id, to_port, _, _) in edges {
+        if *to_port != 0 {
+            continue;
         }
-        // All edges have an implicit "from out" so count from_id outputs
-    }
-    for (from_id, _, _, _, _) in edges {
-        let idx = *from_id as usize;
-        if idx < num_modules {
-            data_out_count[idx] += 1;
+        let to = *to_id as usize;
+        if to < num_modules {
+            data_in_count[to] = data_in_count[to].saturating_add(1);
+        }
+        let from = *from_id as usize;
+        if from < num_modules {
+            data_out_count[from] = data_out_count[from].saturating_add(1);
         }
     }
 
@@ -1222,11 +1223,11 @@ fn assign_buffer_groups(
             && is_chain_interior_capable(module_id)
     };
 
-    // Find the single data-out edge index for a module
+    // Find the single data-out edge of a module.
     let find_out_edge = |module_id: u8| -> Option<usize> {
         edges
             .iter()
-            .position(|(from_id, _, _, _, _)| *from_id == module_id)
+            .position(|(from_id, _, to_port, _, _)| *from_id == module_id && *to_port == 0)
     };
 
     let mut next_group: u8 = 1;
@@ -1408,7 +1409,7 @@ fn validate_services(
                 )));
             }
         }
-        // If no manifest found, skip the provides check (backward compat)
+        // A module with no manifest has no `provides` list to check against.
     }
 
     Ok(())
@@ -1430,3 +1431,66 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
     crc
 }
 
+
+#[cfg(test)]
+mod buffer_group_tests {
+    use super::*;
+
+    fn caps(name: &str, in_place: bool) -> ModuleCaps {
+        ModuleCaps {
+            name: name.into(),
+            mailbox_safe: in_place,
+            in_place_writer: in_place,
+            manifest: crate::manifest::Manifest::default(),
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// src → filter → sink, with `filter` in-place: both data edges alias.
+    #[test]
+    fn a_one_in_one_out_in_place_module_aliases_its_edges() {
+        let names = names(&["src", "filter", "sink"]);
+        let caps = vec![caps("src", false), caps("filter", true), caps("sink", false)];
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0)];
+        let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
+        assert_eq!(groups, vec![1, 1]);
+    }
+
+    /// A status edge leaving the in-place module is not a second data
+    /// output: the data edges still alias, and the status edge does not.
+    #[test]
+    fn a_control_edge_out_of_the_interior_does_not_break_the_chain() {
+        let names = names(&["src", "filter", "sink", "monitor"]);
+        let caps = vec![
+            caps("src", false),
+            caps("filter", true),
+            caps("sink", false),
+            caps("monitor", false),
+        ];
+        let edges = [
+            (1u8, 3u8, 1u8, 1u8, 0u8),
+            (0, 1, 0, 0, 0),
+            (1, 2, 0, 0, 0),
+        ];
+        let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
+        assert_eq!(groups, vec![0, 1, 1]);
+    }
+
+    /// Two data outputs is a fan-out, never an in-place interior.
+    #[test]
+    fn a_second_data_output_disqualifies_the_interior() {
+        let names = names(&["src", "filter", "a", "b"]);
+        let caps = vec![
+            caps("src", false),
+            caps("filter", true),
+            caps("a", false),
+            caps("b", false),
+        ];
+        let edges = [(0u8, 1u8, 0u8, 0u8, 0u8), (1, 2, 0, 0, 0), (1, 3, 0, 1, 0)];
+        let groups = assign_buffer_groups(&edges, &names, &caps).unwrap();
+        assert_eq!(groups, vec![0, 0, 0]);
+    }
+}

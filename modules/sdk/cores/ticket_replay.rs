@@ -77,12 +77,7 @@ pub fn ticket_claim_held(store: &[TicketClaim], digest: &[u8; 16], now: u64) -> 
 /// recoverable, and it is not — both mean this acceptance would be
 /// unprotected.
 #[must_use]
-pub fn ticket_claim(
-    store: &mut [TicketClaim],
-    digest: [u8; 16],
-    expiry: u64,
-    now: u64,
-) -> bool {
+pub fn ticket_claim(store: &mut [TicketClaim], digest: [u8; 16], expiry: u64, now: u64) -> bool {
     if expiry <= now {
         return false;
     }

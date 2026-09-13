@@ -14,7 +14,10 @@
 /// `Handshaking` and `Ready` peers are "live" and must NOT be
 /// overwritten by a new session for a different 4-tuple.
 fn dtls_slot_reusable(phase: DtlsPhase) -> bool {
-    matches!(phase, DtlsPhase::Idle | DtlsPhase::Errored | DtlsPhase::Closed)
+    matches!(
+        phase,
+        DtlsPhase::Idle | DtlsPhase::Errored | DtlsPhase::Closed
+    )
 }
 
 fn dtls_find_session(s: &TlsState, ip: &[u8; 4], port: u16) -> i32 {
@@ -47,8 +50,7 @@ unsafe fn dtls_alloc_session(s: &mut TlsState, ip: &[u8; 4], port: u16) -> Optio
     // any reusable slot.
     let mut i = 0;
     while i < MAX_PEERS {
-        if dtls_slot_reusable(s.peer_sessions[i].phase)
-            && s.peer_sessions[i].peer.matches(ip, port)
+        if dtls_slot_reusable(s.peer_sessions[i].phase) && s.peer_sessions[i].peer.matches(ip, port)
         {
             return Some(dtls_init_server_session(s, i, ip, port));
         }
@@ -64,12 +66,7 @@ unsafe fn dtls_alloc_session(s: &mut TlsState, ip: &[u8; 4], port: u16) -> Optio
     None
 }
 
-unsafe fn dtls_init_server_session(
-    s: &mut TlsState,
-    i: usize,
-    ip: &[u8; 4],
-    port: u16,
-) -> usize {
+unsafe fn dtls_init_server_session(s: &mut TlsState, i: usize, ip: &[u8; 4], port: u16) -> usize {
     let sys = &*s.syscalls;
     {
         let sess = &mut s.peer_sessions[i];
@@ -102,18 +99,13 @@ unsafe fn dtls_init_server_session(
     i
 }
 
-unsafe fn dtls_alloc_client_session(
-    s: &mut TlsState,
-    ip: &[u8; 4],
-    port: u16,
-) -> Option<usize> {
+unsafe fn dtls_alloc_client_session(s: &mut TlsState, ip: &[u8; 4], port: u16) -> Option<usize> {
     // Same two-pass strategy as the server-side allocator: prefer
     // overwriting a same-tuple tombstone (handshake-timeout retry
     // is the common case), then fall back to any reusable slot.
     let mut i = 0;
     while i < MAX_PEERS {
-        if dtls_slot_reusable(s.peer_sessions[i].phase)
-            && s.peer_sessions[i].peer.matches(ip, port)
+        if dtls_slot_reusable(s.peer_sessions[i].phase) && s.peer_sessions[i].peer.matches(ip, port)
         {
             return Some(dtls_init_client_session(s, i, ip, port));
         }
@@ -129,12 +121,7 @@ unsafe fn dtls_alloc_client_session(
     None
 }
 
-unsafe fn dtls_init_client_session(
-    s: &mut TlsState,
-    i: usize,
-    ip: &[u8; 4],
-    port: u16,
-) -> usize {
+unsafe fn dtls_init_client_session(s: &mut TlsState, i: usize, ip: &[u8; 4], port: u16) -> usize {
     let sys = &*s.syscalls;
     {
         let sess = &mut s.peer_sessions[i];
@@ -182,7 +169,11 @@ unsafe fn dtls_pump_session(s: &mut TlsState, idx: usize) -> bool {
         HandshakeState::DeriveHandshakeKeys => dtls_pump_derive_handshake_keys(s, idx),
         HandshakeState::SendEncryptedExtensions => dtls_pump_send_encrypted_extensions(s, idx),
         HandshakeState::SendCertificate => {
-            let cert_len = if s.cert_len <= MAX_CERT_CHAIN_BYTES { s.cert_len } else { 0 };
+            let cert_len = if s.cert_len <= MAX_CERT_CHAIN_BYTES {
+                s.cert_len
+            } else {
+                0
+            };
             let cert = core::slice::from_raw_parts(s.cert.as_ptr(), cert_len);
             pump_send_certificate_core(&mut s.peer_sessions[idx].endpoint.driver, cert)
         }
@@ -213,7 +204,12 @@ unsafe fn dtls_pump_session(s: &mut TlsState, idx: usize) -> bool {
         HandshakeState::ClientDeriveAppKeys => dtls_pump_derive_app_keys(s, idx),
         HandshakeState::Complete => {
             s.peer_sessions[idx].phase = DtlsPhase::Ready;
-            dev_log(sys, 3, b"[dtls] handshake complete".as_ptr(), b"[dtls] handshake complete".len());
+            dev_log(
+                sys,
+                3,
+                b"[dtls] handshake complete".as_ptr(),
+                b"[dtls] handshake complete".len(),
+            );
             // Symmetry with TCP-TLS: emit MSG_PEER_IDENTITY for
             // the DTLS peer so RBAC / peer_router consumers see
             // the same envelope regardless of transport. The
@@ -392,7 +388,12 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
         let sig_ptr = raw_sig.as_mut_ptr() as u64;
         sign_arg[38..46].copy_from_slice(&sig_ptr.to_le_bytes());
         sign_arg[46..48].copy_from_slice(&64u16.to_le_bytes());
-        let rc = (sys.provider_call)(s.key_vault_handle, KV_SIGN, sign_arg.as_mut_ptr(), sign_arg.len());
+        let rc = (sys.provider_call)(
+            s.key_vault_handle,
+            KV_SIGN,
+            sign_arg.as_mut_ptr(),
+            sign_arg.len(),
+        );
         if rc == 0 {
             signed_via_vault = true;
         }
@@ -635,8 +636,7 @@ unsafe fn dtls_drain_inbound(s: &mut TlsState, idx: usize) {
         // path. The ACK-specific disarm logic below handles
         // CT_DTLS_ACK on its own merits.
         let driver_grew = endpoint.driver.in_len > in_len_before;
-        let reassembler_newly_active =
-            endpoint.reassembler.active && !reassembler_active_before;
+        let reassembler_newly_active = endpoint.reassembler.active && !reassembler_active_before;
         let progress = driver_grew || reassembler_newly_active;
         match result {
             Some((ct, seq, pt_len)) => (progress, Some(ct), Some(seq), pt_len),
@@ -652,11 +652,14 @@ unsafe fn dtls_drain_inbound(s: &mut TlsState, idx: usize) {
     // that didn't actually acknowledge anything (including a 0-
     // entry ACK or one with bogus tuples).
     if matches!(inner_ct, Some(ct) if ct == CT_DTLS_ACK) {
-        let body =
-            &datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN + plaintext_len];
+        let body = &datagram[DTLS_UNIFIED_HDR_LEN..DTLS_UNIFIED_HDR_LEN + plaintext_len];
         let mut tuples = [(0u64, 0u64); 8];
         if let Some(count) = parse_dtls_ack_body(body, &mut tuples) {
-            let n = if count < tuples.len() { count } else { tuples.len() };
+            let n = if count < tuples.len() {
+                count
+            } else {
+                tuples.len()
+            };
             // Match against our last flight. With `last_flight_record_count`
             // tracking the count of records in the current flight and
             // their seqs running [send_seq - count .. send_seq), we
@@ -713,8 +716,7 @@ unsafe fn dtls_drain_inbound(s: &mut TlsState, idx: usize) {
     //   - the record didn't drive the handshake forward, but the
     //     peer should still be told their record landed so they
     //     stop retransmitting it.
-    let should_ack = !is_initial
-        && matches!(inner_ct, Some(ct) if ct == 22u8); // CT_HANDSHAKE
+    let should_ack = !is_initial && matches!(inner_ct, Some(ct) if ct == 22u8); // CT_HANDSHAKE
     if should_ack {
         if let Some(seq) = recv_seq {
             dtls_emit_ack(s, idx, (recv_epoch, seq));
@@ -770,7 +772,9 @@ unsafe fn dtls_emit_ack(s: &mut TlsState, idx: usize, acked: (u64, u64)) {
 /// envelope's `conn_id` byte carries the DTLS peer-slot index
 /// (0..MAX_PEERS-1) since DTLS has no IP-module conn_id.
 unsafe fn emit_peer_identity_dtls(s: &mut TlsState, idx: usize) {
-    if s.peer_identity < 0 { return; }
+    if s.peer_identity < 0 {
+        return;
+    }
     let pk_len = s.peer_sessions[idx].endpoint.driver.peer_cert_pubkey_len as usize;
     let mut fp_buf = [0u8; PEER_IDENTITY_MAX_FINGERPRINT];
     let fingerprint: &[u8] = if pk_len > 0 {
@@ -815,12 +819,18 @@ unsafe fn emit_peer_identity_dtls(s: &mut TlsState, idx: usize) {
 
 /// Attempt one write of any pending DTLS peer-identity envelope.
 unsafe fn try_drain_pending_peer_identity_dtls(s: &mut TlsState, idx: usize) {
-    if s.peer_identity < 0 { return; }
+    if s.peer_identity < 0 {
+        return;
+    }
     let len = s.peer_sessions[idx].pending_peer_identity_len as usize;
-    if len == 0 { return; }
+    if len == 0 {
+        return;
+    }
     let sys = &*s.syscalls;
     let poll = (sys.channel_poll)(s.peer_identity, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return;
+    }
     let ptr = s.peer_sessions[idx].pending_peer_identity.as_ptr();
     let written = (sys.channel_write)(s.peer_identity, ptr, len);
     if written == len as i32 {
@@ -833,7 +843,9 @@ unsafe fn try_drain_pending_peer_identity_dtls(s: &mut TlsState, idx: usize) {
 /// for the TCP-TLS path; called once at the top of
 /// `dtls_module_step`.
 unsafe fn service_pending_peer_identity_dtls(s: &mut TlsState) {
-    if s.peer_identity < 0 { return; }
+    if s.peer_identity < 0 {
+        return;
+    }
     let mut i = 0;
     while i < MAX_PEERS {
         if s.peer_sessions[i].pending_peer_identity_len > 0 {
@@ -957,8 +969,13 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
 
     // Drive the bind handshake (shared core): emits CMD_DG_BIND while unbound,
     // with backoff/retry. MSG_DG_BOUND is consumed in the recv loop below.
-    s.dtls_endpoint
-        .poll_bind(sys, s.cipher_out, s.dtls_port, s.net_scratch.as_mut_ptr(), NET_SCRATCH_SIZE);
+    s.dtls_endpoint.poll_bind(
+        sys,
+        s.cipher_out,
+        s.dtls_port,
+        s.net_scratch.as_mut_ptr(),
+        NET_SCRATCH_SIZE,
+    );
 
     // Retry any DTLS peer-identity envelopes that couldn't ship
     // at handshake completion because the consumer was backed
@@ -1122,8 +1139,16 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
                             }
                             if idx >= 0 {
                                 let sess = &mut s.peer_sessions[idx as usize];
-                                let want = if dgram_len < DGRAM_MAX { dgram_len } else { DGRAM_MAX };
-                                (sys.channel_read)(s.cipher_in, sess.inbound_buf.as_mut_ptr(), want);
+                                let want = if dgram_len < DGRAM_MAX {
+                                    dgram_len
+                                } else {
+                                    DGRAM_MAX
+                                };
+                                (sys.channel_read)(
+                                    s.cipher_in,
+                                    sess.inbound_buf.as_mut_ptr(),
+                                    want,
+                                );
                                 sess.inbound_len = want;
                                 if dgram_len > want {
                                     dtls_discard_bytes(sys, s.cipher_in, dgram_len - want);
@@ -1147,8 +1172,7 @@ unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
 
     let mut i = 0;
     while i < MAX_PEERS {
-        if s.peer_sessions[i].phase == DtlsPhase::Handshaking
-            && s.peer_sessions[i].inbound_len > 0
+        if s.peer_sessions[i].phase == DtlsPhase::Handshaking && s.peer_sessions[i].inbound_len > 0
         {
             let mut steps = 0;
             while steps < 64 && s.peer_sessions[i].phase == DtlsPhase::Handshaking {

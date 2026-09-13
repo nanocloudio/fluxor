@@ -25,6 +25,9 @@ pub const CONFIG_ARENA_SIZE: usize = crate::platform::chip::CONFIG_ARENA_SIZE;
 /// Maximum size of a single module's config-blob section.
 pub const MAX_MODULE_CONFIG_SIZE: usize = crate::platform::chip::MAX_MODULE_CONFIG_SIZE;
 
+/// Bytes of the early-boot log ring. Must be a power of two.
+pub const LOG_RING_CAPACITY: usize = crate::platform::chip::LOG_RING_CAPACITY;
+
 /// Bytes of the Tier B elastic region and its grant quantum. Taken
 /// from the arch profile directly rather than through
 /// `platform::chip`: the values are profile-selected by target arch

@@ -21,12 +21,146 @@ spi_count = 2
 i2c_count = 2
 uart_count = 2
 adc_channels = 4
-pwm_slices = 8
+pwm_slices = 12
 pio_count = 3
 pio_state_machines = 4
 dma_channels = 16
 
+# The DMA CTRL_TRIG BUSY flag is NOT at the same bit on both chips:
+# RP2040 bit 24, RP2350 bit 26. Flash erase quiesces DMA readers by
+# polling it, so a transcribed constant would silently poll a reserved
+# bit that reads zero -- 'no channel is busy' -- and erase under a live
+# read. Generated per silicon so the two cannot drift.
+dma_base = "0x50000000"
+dma_chan_abort_offset = "0x464"
+# RP2350 alone splits TRANS_COUNT into MODE (bits 28-31) and COUNT.
+# Absent on RP2040, where the register is a plain 32-bit count.
+dma_trans_count_mode = [28, 4]
+xip_ctrl_base = "0x400c8000"
+
 # SPI valid pin combinations: [miso, mosi, sck]
+
+# GPIO register blocks.
+#
+# SIO's two GPIO banks are laid out differently on the two chips, not merely
+# relocated. RP2040 keeps each bank as a contiguous block (OUT, SET, CLR, XOR
+# then the high bank 0x20 later); RP2350 interleaves them (OUT, HI_OUT,
+# OUT_SET, HI_OUT_SET, ...). So the bank stride is 0x20 on one part and 0x04
+# on the other, and the register stride is 0x04 against 0x08. Assuming either
+# layout on the other chip drives a pin in the wrong bank, or an OE register
+# where an OUT was meant.
+#
+#   addr = sio_gpio_{out,oe}_base + index * sio_reg_stride + bank * sio_bank_stride
+# The reset controller differs on both counts: base address and which bit
+# holds each peripheral. USBCTRL is bit 24 on RP2040 and bit 28 on RP2350, so
+# a transcribed constant releases some other peripheral's reset and leaves USB
+# held -- a controller that reads as all-zero rather than failing.
+uart0_base = "0x40070000"
+# UART0's reset bit moves with everything else in RESETS: bit 22 on RP2040,
+# bit 26 on RP2350.
+resets_uart0_bit = 26
+# The GPIO banks, released by whatever first drives a pin rather than
+# waited for at boot. A pad and its function select are configuration
+# writes like any other: made while the bank is in reset they are
+# swallowed, and the pin keeps its default function with nothing to
+# say so.
+resets_io_bank0_bit = 6
+resets_pads_bank0_bit = 9
+# Which peripherals the boot releases from reset.
+#
+# Everything on an RP part comes out of power-on held in reset, and a
+# peripheral in reset accepts every configuration write while keeping its
+# reset values. The failure is therefore never an error: it is a driver that
+# configures nothing and a board that does nothing.
+#
+# Excluded, each for a reason that bites: IO_QSPI and PADS_QSPI (the flash
+# this code is executing from), PLL_SYS and PLL_USB (they clock us, and
+# `start_pll` releases them itself in the right order), USBCTRL (the device
+# stack owns its own reset) and SYSCFG.
+resets_release_mask = "0x0fef3b7f"
+# Which of the released peripherals the boot waits for.
+#
+# Releasing a reset is free; *waiting* for RESET_DONE is a claim that the
+# peripheral can complete one, and that is not true of every bit in the
+# release mask. ADC and HSTX have their own clock generators, which this
+# bring-up does not configure, and JTAG, SHA256, SYSINFO, TBMAN and TRNG are
+# not driven at all -- waiting on any of them turns an unrelated peripheral
+# into a boot failure. UART1 is released for whatever the graph wires but is
+# not part of bring-up, so it is not waited for either. Release broadly,
+# require narrowly: this is the set the boot itself configures.
+resets_required_mask = "0x058d3a76"
+# The PLLs are held in reset out of power-on like everything else, and a PLL
+# in reset keeps its reset values however its CS/FBDIV/PWR registers are
+# written: LOCK never asserts and the wait times out, reporting "no lock"
+# for a PLL that was never asked to try. Like every other RESETS bit these
+# move between the chips: 12/13 on RP2040, 14/15 here.
+resets_pll_sys_bit = 14
+resets_pll_usb_bit = 15
+# How many external interrupt vectors this silicon's NVIC dispatches.
+#
+# A vector table shorter than this is not a smaller table: it is a table
+# whose tail is whatever bytes follow it in flash. The IMAGE_DEF sits
+# immediately after the table, so an IRQ with no entry would branch into it
+# and fault before any handler exists to say so.
+irq_count = 52
+resets_base = "0x40020000"
+resets_usbctrl_bit = 28
+rosc_base = "0x400e8000"
+# ROSC RANDOMBIT is at a different offset on the two chips.
+rosc_randombit_offset = "0x20"
+# RP2350 alone has a real hardware TRNG with health checks.
+# Absent on RP2040, so code that needs one cannot be built for it.
+trng_base = "0x400f0000"
+pio0_base = "0x50200000"
+xosc_base = "0x40048000"
+pll_sys_base = "0x40050000"
+pll_usb_base = "0x40058000"
+# CLK_USB_CTRL sits at a different offset within CLOCKS on the two chips
+# (0x54 against 0x60) while every other clock control register matches.
+clocks_clk_usb_ctrl_offset = "0x60"
+clocks_base = "0x40010000"
+# The FC0 frequency-counter block sits at a different offset within CLOCKS on
+# the two chips (RP2040 0x80, RP2350 0x8c); its registers are laid out the
+# same way from there.
+clocks_fc0_offset = "0x8c"
+pwm_base = "0x400a8000"
+io_bank0_base = "0x40028000"
+pads_bank0_base = "0x40038000"
+sio_gpio_out_base = "0x10"
+sio_gpio_oe_base = "0x30"
+sio_reg_stride = "0x08"
+sio_bank_stride = "0x04"
+
+# DMA CTRL_TRIG field layout, transcribed from the datasheet register map.
+#
+# The two chips do NOT share this layout. RP2350 added INCR_READ_REV and
+# INCR_WRITE_REV at bits 5 and 7, which pushes every field above bit 4 up by
+# two. Nothing about a wrong position faults -- the write lands in a
+# neighbouring field, so a misplaced TREQ_SEL silently selects the wrong
+# request source and the transfer just never completes.
+#
+# Each entry is [lsb, width]. Fields a chip does not have are absent rather
+# than zero, so referring to one that does not exist fails to build.
+[peripherals.dma_ctrl_trig]
+en = [0, 1]
+high_priority = [1, 1]
+data_size = [2, 2]
+incr_read = [4, 1]
+incr_read_rev = [5, 1]
+incr_write = [6, 1]
+incr_write_rev = [7, 1]
+ring_size = [8, 4]
+ring_sel = [12, 1]
+chain_to = [13, 4]
+treq_sel = [17, 6]
+irq_quiet = [23, 1]
+bswap = [24, 1]
+sniff_en = [25, 1]
+busy = [26, 1]
+write_error = [29, 1]
+read_error = [30, 1]
+ahb_error = [31, 1]
+
 [peripherals.spi0]
 valid_pins = [
     [0,3,2], [4,7,6], [16,19,18], [20,23,22],
@@ -63,16 +197,43 @@ mpu_regions = 8
 
 [kernel]
 watchdog_ctrl = "0x400D8000"
+# PSM watchdog-select register and the mask that puts every block but the
+# oscillators under the watchdog, so a watchdog trigger is a whole-chip reset.
+psm_wdsel = "0x40018008"
+psm_wdsel_mask = "0x01fffffc"
 boot2_src = "0x400e0000"
-state_arena_kb = 256
-buffer_arena_kb = 32
+# The split between the two arenas is set by what a networked graph asks
+# for. Channel buffers are the scarce half: a four-module graph carrying the
+# ip stack wants sixteen of them and does not fit in 32 KiB, while its
+# module state sits well inside 224 KiB. Their sum is what the die can
+# spare, so the two move against each other; `ram_static_max_kb` below binds
+# the sum, not either half.
+state_arena_kb = 224
+buffer_arena_kb = 64
 config_buffer_kb = 16
 config_arena_kb = 16
+# Early-boot log ring. Sized to cover boot until log_net is up; the
+# host-class 64 KiB ring is an eighth of this die's 512 KiB and does
+# not fit beside the state and buffer arenas.
+log_ring_kb = 4
+# Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
+# out of the linker's 512 KiB RAM region. What is left over is the
+# stack, which grows down from the top of that region.
+# The linker already refuses an image that cannot fit at all; this
+# binds earlier, so steady creep fails a gate instead of arriving
+# as a link error nobody can attribute.
+ram_static_max_kb = 472
+# Clock profile. The production system clock is the datasheet default;
+# `overclock_sys_hz` is a non-production profile selected by the
+# `rp-overclock` cargo feature and is never what a shipped image runs.
+# USB needs exactly 48 MHz whichever system clock is in force.
+sys_hz = 150000000
+overclock_sys_hz = 240000000
+usb_hz = 48000000
 flash_erase_block_size = "0x80000000"
 flash_erase_cmd = "0x00"
 
 [kernel.bootsel]
-dma_ch_count = 16
 qspi_ss_bit = 27
 flash_release_addr = "0x400D0000"
 flash_release_value = "0x01"
@@ -82,3 +243,37 @@ ctrl_addr = "0x4003000C"
 ctrl_value = "0x8005"
 status_addr = "0x40030008"
 gpio_hi_addr = "0xD0000008"
+
+# Timer ownership ledger. Every alarm on the monotonic instance
+# has exactly one named owner, and the build rejects overlap — including
+# overlap with the external time driver's reservation below.
+[kernel.timers]
+# Instance read for 64-bit monotonic time and owning fluxor's alarms.
+monotonic = "TIMER1"
+# Peripheral bases for the typed register layer. Generated into
+# `chip::*_BASE` so a driver names a fact rather than a literal, and so the
+# RP2040/RP2350 difference lives in target data instead of a `cfg` in every
+# caller.
+monotonic_base = "0x400B8000"
+# TIMER interrupt-register offsets. NOT the same across the family: RP2350
+# inserts registers ahead of these, so INTR/INTE sit 8 bytes further out than
+# on RP2040 while TIMELR, ALARM(n) and TIMERAW* are identical. Writing INTE at
+# the RP2040 offset on an RP2350 lands on INTF -- the force-interrupt
+# register -- which fires the handler instead of enabling it.
+timer_intr_offset = "0x3C"
+timer_inte_offset = "0x40"
+ticks_base = "0x40108000"
+# Alarms this kernel owns, with the NVIC line each raises.
+alarms = [
+    { index = 0, owner = "step_guard", irq = 4 },
+    { index = 1, owner = "tier1b", irq = 5 },
+    { index = 2, owner = "scheduler", irq = 6 },
+]
+# Alarms on `monotonic` left free for the timer provider.
+provider_alarms = [3]
+# The external time driver's reservation. Measured, not assumed:
+# Alarm 0 of TIMER0 is the conventional system-tick alarm
+# only. Declaring it is what lets the build prove the two do not collide,
+# for as long as a runtime here uses that driver.
+foreign_instance = "TIMER0"
+foreign_alarms = [0]

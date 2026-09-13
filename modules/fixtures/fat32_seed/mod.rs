@@ -64,14 +64,7 @@ const PH_CLOSE: u8 = 3;
 const PH_PUBLISH: u8 = 4;
 const PH_DONE: u8 = 5;
 
-const PHASE_NAMES: [&[u8]; 6] = [
-    b"create",
-    b"write",
-    b"fsync",
-    b"close",
-    b"publish",
-    b"done",
-];
+const PHASE_NAMES: [&[u8]; 6] = [b"create", b"write", b"fsync", b"close", b"publish", b"done"];
 
 /// Steps between heartbeats — roughly five seconds at a 1 ms tick, matching
 /// every other module on the lane.
@@ -284,12 +277,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
     match s.phase {
         PH_CREATE => {
-            let rc = (sys.provider_call)(
-                -1,
-                FS_OPEN_CREATE,
-                path.as_ptr().cast_mut(),
-                path.len(),
-            );
+            let rc = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr().cast_mut(), path.len());
             if rc == -11 {
                 return 0;
             }
@@ -309,7 +297,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 s.phase = PH_FSYNC;
                 return 0;
             }
-            let n = if total - off > CHUNK { CHUNK } else { total - off };
+            let n = if total - off > CHUNK {
+                CHUNK
+            } else {
+                total - off
+            };
             let mut chunk = [0u8; CHUNK];
             let mut i = 0usize;
             while i < n {
@@ -363,12 +355,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         PH_PUBLISH => {
             // The bytes are durable; the NAME that finds them is not until
             // this fence lands.
-            let rc = (sys.provider_call)(
-                -1,
-                FS_FSYNC_NAME,
-                path.as_ptr().cast_mut(),
-                path.len(),
-            );
+            let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_ptr().cast_mut(), path.len());
             if rc == -11 {
                 return 0;
             }

@@ -4,11 +4,11 @@
 //! of gSPI ioctl commands. These are driven by the main `module_step()` loop
 //! when the module is in `PHASE_RUNNING`.
 
+use super::abi::kernel_abi::timer as dev_timer;
 use super::constants::*;
 use super::gspi;
 use super::Cyw43State;
 use super::SyscallTable;
-use super::abi::kernel_abi::timer as dev_timer;
 
 /// Get monotonic time in milliseconds via provider_call.
 unsafe fn get_millis(s: &Cyw43State) -> u64 {
@@ -36,22 +36,22 @@ pub enum WifiOp {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ConnectStep {
-    SetInfra = 0,       // Entry: ampdu_ba_wsize
-    SetAuth = 2,        // SET_AUTH
-    SetWsec = 4,        // SET_WSEC
+    SetInfra = 0, // Entry: ampdu_ba_wsize
+    SetAuth = 2,  // SET_AUTH
+    SetWsec = 4,  // SET_WSEC
     // WPA2 path
-    SetWpaAuth = 6,     // SET_WPA_AUTH (PSK)
-    SetPmk = 8,         // SET_WSEC_PMK
-    SetSsid = 10,       // SET_SSID (triggers association)
+    SetWpaAuth = 6, // SET_WPA_AUTH (PSK)
+    SetPmk = 8,     // SET_WSEC_PMK
+    SetSsid = 10,   // SET_SSID (triggers association)
     Done = 12,
     // WPA3 path
-    SetMfp = 13,        // MFP (management frame protection)
-    SetWpaAuthSae = 15, // SET_WPA_AUTH (SAE)
+    SetMfp = 13,         // MFP (management frame protection)
+    SetWpaAuthSae = 15,  // SET_WPA_AUTH (SAE)
     SetSaePassword = 17, // sae_password
     // Internal supplicant enable (for both WPA2 and WPA3)
-    SetSupWpa = 19,     // sup_wpa
+    SetSupWpa = 19,        // sup_wpa
     SetSupWpa2Eapver = 21, // sup_wpa2_eapver
-    SetSupWpaTmo = 23,  // sup_wpa_tmo
+    SetSupWpaTmo = 23,     // sup_wpa_tmo
     // Delay before credentials (firmware needs time to apply supplicant config)
     DelaySaePassword = 25,
     // SET_INFRA before association (after security config)
@@ -70,21 +70,13 @@ pub enum ConnectStep {
 
 /// Send an ioctl SET command with a u32 payload.
 /// Builds SDPCM + CDC frame and sends via WLAN function.
-pub unsafe fn ioctl_set_u32(
-    s: &mut Cyw43State,
-    cmd: u32,
-    value: u32,
-) -> i32 {
+pub unsafe fn ioctl_set_u32(s: &mut Cyw43State, cmd: u32, value: u32) -> i32 {
     let payload = value.to_le_bytes();
     ioctl_set(s, cmd, &payload)
 }
 
 /// Send an ioctl SET command with arbitrary payload.
-pub unsafe fn ioctl_set(
-    s: &mut Cyw43State,
-    cmd: u32,
-    payload: &[u8],
-) -> i32 {
+pub unsafe fn ioctl_set(s: &mut Cyw43State, cmd: u32, payload: &[u8]) -> i32 {
     let hdr_len = gspi::build_ioctl_header(
         &mut s.frame_buf,
         SDPCM_CHAN_CONTROL,
@@ -113,11 +105,7 @@ pub unsafe fn ioctl_set(
 }
 
 /// Send an ioctl SET_VAR command (set an iovar by name).
-pub unsafe fn ioctl_set_var(
-    s: &mut Cyw43State,
-    name: &[u8],
-    value: &[u8],
-) -> i32 {
+pub unsafe fn ioctl_set_var(s: &mut Cyw43State, name: &[u8], value: &[u8]) -> i32 {
     // Build payload: name (null-terminated) + value
     let name_len = name.len();
     let payload_len = name_len + value.len();
@@ -162,39 +150,45 @@ pub unsafe fn ioctl_set_var(
 
 /// Synchronous ioctl SET: send + complete gSPI transaction.
 /// Returns 0 on success, negative on SPI error.
-pub unsafe fn ioctl_set_sync(
-    s: &mut Cyw43State,
-    cmd: u32,
-    payload: &[u8],
-) -> i32 {
+pub unsafe fn ioctl_set_sync(s: &mut Cyw43State, cmd: u32, payload: &[u8]) -> i32 {
     let r = ioctl_set(s, cmd, payload);
-    if r < 0 { return r; }
-    gspi::txn_poll(s);
-    0
+    if r < 0 {
+        return r;
+    }
+    let r = gspi::txn_wait(s);
+    if r < 0 {
+        r
+    } else {
+        0
+    }
 }
 
 /// Synchronous ioctl SET_VAR: send + complete gSPI transaction.
-pub unsafe fn ioctl_set_var_sync(
-    s: &mut Cyw43State,
-    name: &[u8],
-    value: &[u8],
-) -> i32 {
+pub unsafe fn ioctl_set_var_sync(s: &mut Cyw43State, name: &[u8], value: &[u8]) -> i32 {
     let r = ioctl_set_var(s, name, value);
-    if r < 0 { return r; }
-    gspi::txn_poll(s);
-    0
+    if r < 0 {
+        return r;
+    }
+    let r = gspi::txn_wait(s);
+    if r < 0 {
+        r
+    } else {
+        0
+    }
 }
 
 /// Synchronous ioctl SET u32: send + complete gSPI transaction.
-pub unsafe fn ioctl_set_u32_sync(
-    s: &mut Cyw43State,
-    cmd: u32,
-    value: u32,
-) -> i32 {
+pub unsafe fn ioctl_set_u32_sync(s: &mut Cyw43State, cmd: u32, value: u32) -> i32 {
     let r = ioctl_set_u32(s, cmd, value);
-    if r < 0 { return r; }
-    gspi::txn_poll(s);
-    0
+    if r < 0 {
+        return r;
+    }
+    let r = gspi::txn_wait(s);
+    if r < 0 {
+        r
+    } else {
+        0
+    }
 }
 
 // ============================================================================
@@ -204,14 +198,14 @@ pub unsafe fn ioctl_set_u32_sync(
 /// Send an ioctl GET_VAR command (read an iovar by name).
 /// The variable name is sent as payload; the firmware returns the value
 /// in the F2 response frame's CDC payload.
-pub unsafe fn ioctl_get_var(
-    s: &mut Cyw43State,
-    name: &[u8],
-    buf_len: usize,
-) -> i32 {
+pub unsafe fn ioctl_get_var(s: &mut Cyw43State, name: &[u8], buf_len: usize) -> i32 {
     // For GET, payload_len should be max(name.len(), expected response size)
     // The firmware uses the same buffer for response data.
-    let payload_len = if name.len() > buf_len { name.len() } else { buf_len };
+    let payload_len = if name.len() > buf_len {
+        name.len()
+    } else {
+        buf_len
+    };
 
     let hdr_len = gspi::build_ioctl_header_get(
         &mut s.frame_buf,
@@ -250,7 +244,7 @@ pub unsafe fn ioctl_get_var(
 
 /// Drive the WiFi connect sequence.
 ///
-/// Matches Embassy cyw43 ioctl ordering exactly:
+/// The cyw43-driver's ioctl ordering:
 ///   Common:  WSEC → sup_wpa → sup_wpa2_eapver → sup_wpa_tmo → [100ms]
 ///   WPA3:    sae_password
 ///   WPA2:    PMK
@@ -262,7 +256,7 @@ pub unsafe fn ioctl_get_var(
 ///   <0 = error
 pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
     match ConnectStep::from_u8(s.wifi_substep) {
-        // ── Entry point: ampdu_ba_wsize=8 (Embassy sets this first) ──
+        // ── Entry point: ampdu_ba_wsize=8 ──
         ConnectStep::SetInfra => {
             if s.security == SECURITY_OPEN {
                 // Open network connect path not yet implemented
@@ -274,7 +268,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
             s.ioctl_error_seen = false;
             s.comeback_ms = 0;
             let r = ioctl_set_var_sync(s, IOVAR_AMPDU_BA_WSIZE, &8u32.to_le_bytes());
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetWsec as u8;
             0
         }
@@ -282,7 +278,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         // ── 1. SET_WSEC (encryption type) ───────────────────────────
         ConnectStep::SetWsec => {
             let r = ioctl_set_u32_sync(s, WLC_SET_WSEC, WSEC_AES);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetSupWpa as u8;
             0
         }
@@ -293,7 +291,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
             // iface_idx = 0, value = 1 (enable)
             val[4] = 1;
             let r = ioctl_set_var_sync(s, IOVAR_BSSCFG_SUP_WPA, &val);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetSupWpa2Eapver as u8;
             0
         }
@@ -302,9 +302,14 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         ConnectStep::SetSupWpa2Eapver => {
             let mut val = [0u8; 8];
             // iface_idx = 0, value = 0xFFFFFFFF (-1, auto)
-            val[4] = 0xFF; val[5] = 0xFF; val[6] = 0xFF; val[7] = 0xFF;
+            val[4] = 0xFF;
+            val[5] = 0xFF;
+            val[6] = 0xFF;
+            val[7] = 0xFF;
             let r = ioctl_set_var_sync(s, IOVAR_BSSCFG_SUP_WPA2_EAPVER, &val);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetSupWpaTmo as u8;
             0
         }
@@ -313,9 +318,12 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         ConnectStep::SetSupWpaTmo => {
             let mut val = [0u8; 8];
             // iface_idx = 0, value = 2500ms (0x09C4)
-            val[4] = 0xC4; val[5] = 0x09;
+            val[4] = 0xC4;
+            val[5] = 0x09;
             let r = ioctl_set_var_sync(s, IOVAR_BSSCFG_SUP_WPA_TMO, &val);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::DelaySaePassword as u8;
             s.delay_start = get_millis(s);
             0
@@ -354,7 +362,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
                 i += 1;
             }
             let r = ioctl_set_var_sync(s, IOVAR_SAE_PASSWORD, &pfi);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetInfraPost as u8;
             0
         }
@@ -372,7 +382,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
                 i += 1;
             }
             let r = ioctl_set_sync(s, WLC_SET_WSEC_PMK, &pmk);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetInfraPost as u8;
             0
         }
@@ -381,16 +393,24 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         // SET_INFRA — set station (infrastructure) mode
         ConnectStep::SetInfraPost => {
             let r = ioctl_set_u32_sync(s, WLC_SET_INFRA, INFRA_STA);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetAuth as u8;
             0
         }
 
         // ── 8. SET_AUTH ─────────────────────────────────────────────
         ConnectStep::SetAuth => {
-            let auth = if s.security == SECURITY_WPA3 { AUTH_SAE } else { AUTH_OPEN };
+            let auth = if s.security == SECURITY_WPA3 {
+                AUTH_SAE
+            } else {
+                AUTH_OPEN
+            };
             let r = ioctl_set_u32_sync(s, WLC_SET_AUTH, auth);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetMfp as u8;
             0
         }
@@ -398,9 +418,15 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         // ── 9. MFP (Management Frame Protection) ────────────────────
         ConnectStep::SetMfp => {
             // WPA3: MFP_REQUIRED (2), WPA2: MFP_CAPABLE (1)
-            let mfp = if s.security == SECURITY_WPA3 { MFP_REQUIRED } else { MFP_CAPABLE };
+            let mfp = if s.security == SECURITY_WPA3 {
+                MFP_REQUIRED
+            } else {
+                MFP_CAPABLE
+            };
             let r = ioctl_set_var_sync(s, IOVAR_MFP, &mfp.to_le_bytes());
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             // Branch by security type
             if s.security == SECURITY_WPA3 {
                 s.wifi_substep = ConnectStep::SetWpaAuthSae as u8;
@@ -413,7 +439,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         // ── 10a. WPA3: SET_WPA_AUTH (SAE flag) ──────────────────────
         ConnectStep::SetWpaAuthSae => {
             let r = ioctl_set_var_sync(s, IOVAR_WPA_AUTH, &WPA3_AUTH_SAE.to_le_bytes());
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetAssocRetry as u8;
             0
         }
@@ -421,7 +449,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         // ── 10b. WPA2: SET_WPA_AUTH (PSK flag) ──────────────────────
         ConnectStep::SetWpaAuth => {
             let r = ioctl_set_u32_sync(s, WLC_SET_WPA_AUTH, WPA2_AUTH_PSK);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::SetAssocRetry as u8;
             0
         }
@@ -429,7 +459,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         // ── Limit firmware association retries to 1 ─────────────
         ConnectStep::SetAssocRetry => {
             let r = ioctl_set_var_sync(s, IOVAR_ASSOC_RETRY_MAX, &1u32.to_le_bytes());
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::WaitIoctlBarrier as u8;
             0
         }
@@ -465,7 +497,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
                 i += 1;
             }
             let r = ioctl_set_sync(s, WLC_SET_SSID, &ssid_param);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ConnectStep::Done as u8;
             1 // Connect sequence complete (association in progress)
         }
@@ -473,25 +507,25 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
         ConnectStep::Done => 1,
 
         // ── Comeback backoff: AP sent Timeout Interval IE ────────
-        // Phase 1 (delay_start==0): send DISASSOC to abort firmware retries
-        // Phase 2 (delay_start!=0): wait comeback_ms + margin, then restart
+        // Wait out the AP's comeback window, then abort the firmware's own
+        // retries with DISASSOC and restart the association from SetInfra.
         ConnectStep::WaitComeback => {
-            if s.delay_start == 0 {
-                // Send DISASSOC to stop firmware's internal retry storm
-                let r = ioctl_set_u32(s, WLC_DISASSOC, 0);
-                if r < 0 { return r; }
-                s.delay_start = get_millis(s);
-                return 0;
-            }
-            // Drain DISASSOC txn (don't care about result)
-            let _ = gspi::txn_poll(s);
+            // The window is the AP's comeback time plus a margin (TUs are
+            // ~1.024 ms). While it runs the firmware is retrying on its own;
+            // if it succeeds, the link event cancels this op before it gets
+            // here again. Only once the window has closed with no link is
+            // the association abandoned and restarted — and the DISASSOC is
+            // sent then, to a firmware that is genuinely stuck, not to one
+            // that was about to succeed.
             let now = get_millis(s);
-            // Wait comeback_ms + 200ms margin (TU≈1.024ms, so add margin)
             let wait = (s.comeback_ms as u64) + 200;
             if now.wrapping_sub(s.delay_start) < wait {
-                return 0; // Keep waiting
+                return 0;
             }
-            // Backoff complete — restart connect from beginning
+            let r = ioctl_set_u32_sync(s, WLC_DISASSOC, 0);
+            if r < 0 {
+                return r;
+            }
             s.comeback_ms = 0;
             s.delay_start = 0;
             s.wifi_substep = ConnectStep::SetInfra as u8;
@@ -508,7 +542,9 @@ pub unsafe fn step_connect(s: &mut Cyw43State) -> i32 {
 ///   <0 = error
 pub unsafe fn step_disconnect(s: &mut Cyw43State) -> i32 {
     let r = ioctl_set_u32_sync(s, WLC_DISASSOC, 0);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
     1 // Disconnect complete
 }
 
@@ -549,7 +585,9 @@ pub unsafe fn step_scan(s: &mut Cyw43State) -> i32 {
         ScanStep::SetPassiveScan => {
             // Active scan (passive = 0)
             let r = ioctl_set_u32_sync(s, WLC_SET_PASSIVE_SCAN, 0);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.wifi_substep = ScanStep::SendEscan as u8;
             0
         }
@@ -622,7 +660,9 @@ pub unsafe fn step_scan(s: &mut Cyw43State) -> i32 {
             // channel_num = 0 (all channels) — already zero
 
             let r = ioctl_set_var_sync(s, IOVAR_ESCAN, &params);
-            if r < 0 { return r; }
+            if r < 0 {
+                return r;
+            }
             s.scan_active = true;
             s.scan_count = 0;
 

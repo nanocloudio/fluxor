@@ -87,18 +87,18 @@ const BULK_PAGES: usize = 128;
 const BULK_WORDS: usize = BULK_PAGES * PAGE_WORDS;
 
 const BACKING_EXTERNAL: u8 = 2;
-const WB_DEFERRED:  u8 = 0;
+const WB_DEFERRED: u8 = 0;
 
 // Phase identifiers — keep in sync with the `phase=` value in
 // each emitted perf line and the regex gates in the hw fixture.
-const PHASE_SEQ_W32:   u8 = 0;
-const PHASE_SEQ_R32:   u8 = 1;
-const PHASE_SEQ_W128:  u8 = 2;
-const PHASE_SEQ_R128:  u8 = 3;
-const PHASE_RAND_W:    u8 = 4;
-const PHASE_RAND_R:    u8 = 5;
-const PHASE_DONE:      u8 = 6;
-const PHASE_ERR:       u8 = 0xFF;
+const PHASE_SEQ_W32: u8 = 0;
+const PHASE_SEQ_R32: u8 = 1;
+const PHASE_SEQ_W128: u8 = 2;
+const PHASE_SEQ_R128: u8 = 3;
+const PHASE_RAND_W: u8 = 4;
+const PHASE_RAND_R: u8 = 5;
+const PHASE_DONE: u8 = 6;
+const PHASE_ERR: u8 = 0xFF;
 
 // ---------------------------------------------------------------------------
 // State
@@ -133,10 +133,10 @@ struct NppState {
     /// Per-phase elapsed time, bytes, and mbps — captured during the
     /// active run and re-emitted from PHASE_DONE so a viewer that
     /// joins after the workload completes still sees every phase.
-    phase_us:    [u32; 6],
+    phase_us: [u32; 6],
     phase_bytes: [u32; 6],
-    phase_mbps:  [u32; 6],
-    phase_done:  [u8; 6],
+    phase_mbps: [u32; 6],
+    phase_done: [u8; 6],
 
     /// 1 once the probe has verified the seq-w/seq-r round trip;
     /// a bad pass is fatal — random phases assume the device is
@@ -160,8 +160,8 @@ struct NppState {
 mod params_def {
     use super::NppState;
     use super::BULK_PAGES;
-    use super::{p_u8, p_u16};
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u8};
 
     define_params! {
         NppState;
@@ -246,7 +246,9 @@ unsafe fn verify_scratch(s: &NppState, vpage_base: u32, count: u32) -> u32 {
             }
             w += 1;
         }
-        if ok { matched += 1; }
+        if ok {
+            matched += 1;
+        }
         p += 1;
     }
     matched
@@ -258,16 +260,24 @@ unsafe fn verify_scratch(s: &NppState, vpage_base: u32, count: u32) -> u32 {
 
 fn write_dec(out: *mut u8, pos: &mut usize, mut v: u32) {
     if v == 0 {
-        unsafe { *out.add(*pos) = b'0'; }
+        unsafe {
+            *out.add(*pos) = b'0';
+        }
         *pos += 1;
         return;
     }
     let mut d = [0u8; 10];
     let mut n = 0usize;
-    while v > 0 { d[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+    while v > 0 {
+        d[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
     while n > 0 {
         n -= 1;
-        unsafe { *out.add(*pos) = d[n]; }
+        unsafe {
+            *out.add(*pos) = d[n];
+        }
         *pos += 1;
     }
 }
@@ -486,8 +496,12 @@ unsafe fn run_rand_write(s: &mut NppState) -> (u32, u32, i32) {
             chunk,
             s.scratch.as_ptr() as *const u8,
         );
-        if rc == -11 { continue; }
-        if rc < 0 { return (0, 0, rc); }
+        if rc == -11 {
+            continue;
+        }
+        if rc < 0 {
+            return (0, 0, rc);
+        }
         i += 1;
         s.cursor = i;
     }
@@ -527,8 +541,12 @@ unsafe fn run_rand_read(s: &mut NppState) -> (u32, u32, i32, u32) {
             chunk,
             s.scratch.as_mut_ptr() as *mut u8,
         );
-        if rc == -11 { continue; }
-        if rc < 0 { return (0, 0, rc, verified); }
+        if rc == -11 {
+            continue;
+        }
+        if rc < 0 {
+            return (0, 0, rc, verified);
+        }
         verified += verify_scratch(s, vpage, chunk);
         i += 1;
         s.cursor = i;
@@ -540,7 +558,9 @@ unsafe fn run_rand_read(s: &mut NppState) -> (u32, u32, i32, u32) {
 
 #[inline(always)]
 fn mbps_from(us: u32, bytes: u32) -> u32 {
-    if us == 0 { return 0; }
+    if us == 0 {
+        return 0;
+    }
     // bytes / us == MB/s (since both 1e6-scaled by μs and Mega).
     // Use u64 intermediate to avoid overflow on large transfers.
     ((bytes as u64) / (us as u64)) as u32
@@ -552,7 +572,9 @@ fn mbps_from(us: u32, bytes: u32) -> u32 {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
@@ -567,21 +589,33 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    _in_chan: i32, _out_chan: i32, _ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize,
+    _in_chan: i32,
+    _out_chan: i32,
+    _ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<NppState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<NppState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut NppState);
-        core::ptr::write_bytes(s as *mut NppState as *mut u8, 0, core::mem::size_of::<NppState>());
+        core::ptr::write_bytes(
+            s as *mut NppState as *mut u8,
+            0,
+            core::mem::size_of::<NppState>(),
+        );
         s.syscalls = syscalls as *const SyscallTable;
         s.phase = PHASE_SEQ_W32;
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -633,7 +667,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         if rc < 0 {
             // ENODEV (-19): backing provider not yet exporting the
             // dispatch — retry next tick. Anything else is fatal.
-            if rc == -19 { return 0; }
+            if rc == -19 {
+                return 0;
+            }
             s.err = rc;
             s.phase = PHASE_ERR;
             dev_log(sys, 1, b"[npp] arena register failed\0".as_ptr(), 27);
@@ -655,8 +691,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         PHASE_SEQ_W32 => {
             let (us, bytes, rc) = run_seq_write(s, 32);
             if rc != 0 {
-                if rc == -19 { return 0; } // ENODEV — provider not ready, retry
-                s.err = rc; s.phase = PHASE_ERR; return 0;
+                if rc == -19 {
+                    return 0;
+                } // ENODEV — provider not ready, retry
+                s.err = rc;
+                s.phase = PHASE_ERR;
+                return 0;
             }
             let m = mbps_from(us, bytes);
             record_phase(s, phase, us, bytes, m);
@@ -666,8 +706,12 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         PHASE_SEQ_R32 => {
             let (us, bytes, rc, verified) = run_seq_read(s, 32);
             if rc != 0 {
-                if rc == -19 { return 0; }
-                s.err = rc; s.phase = PHASE_ERR; return 0;
+                if rc == -19 {
+                    return 0;
+                }
+                s.err = rc;
+                s.phase = PHASE_ERR;
+                return 0;
             }
             if verified != s.pages as u32 {
                 s.err = -5; // EIO
@@ -683,7 +727,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
         PHASE_SEQ_W128 => {
             let (us, bytes, rc) = run_seq_write(s, 128);
-            if rc != 0 { s.err = rc; s.phase = PHASE_ERR; return 0; }
+            if rc != 0 {
+                s.err = rc;
+                s.phase = PHASE_ERR;
+                return 0;
+            }
             let m = mbps_from(us, bytes);
             record_phase(s, phase, us, bytes, m);
             s.phase = PHASE_SEQ_R128;
@@ -691,7 +739,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
         PHASE_SEQ_R128 => {
             let (us, bytes, rc, verified) = run_seq_read(s, 128);
-            if rc != 0 { s.err = rc; s.phase = PHASE_ERR; return 0; }
+            if rc != 0 {
+                s.err = rc;
+                s.phase = PHASE_ERR;
+                return 0;
+            }
             if verified != s.pages as u32 {
                 s.err = -5;
                 s.phase = PHASE_ERR;
@@ -705,7 +757,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
         PHASE_RAND_W => {
             let (us, bytes, rc) = run_rand_write(s);
-            if rc != 0 { s.err = rc; s.phase = PHASE_ERR; return 0; }
+            if rc != 0 {
+                s.err = rc;
+                s.phase = PHASE_ERR;
+                return 0;
+            }
             let m = mbps_from(us, bytes);
             record_phase(s, phase, us, bytes, m);
             s.phase = PHASE_RAND_R;
@@ -713,7 +769,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
         PHASE_RAND_R => {
             let (us, bytes, rc, verified) = run_rand_read(s);
-            if rc != 0 { s.err = rc; s.phase = PHASE_ERR; return 0; }
+            if rc != 0 {
+                s.err = rc;
+                s.phase = PHASE_ERR;
+                return 0;
+            }
             let expected = (s.random_iterations as u32) * (s.random_chunk as u32);
             if verified < expected {
                 s.err = -5;

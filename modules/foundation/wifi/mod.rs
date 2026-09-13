@@ -33,7 +33,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -100,15 +99,15 @@ struct ScanEntry {
 #[repr(C)]
 struct WifiConnectState {
     syscalls: *const SyscallTable,
-    in_chan: i32,        // in[0]: status events from cyw43
-    out_chan: i32,       // out[0]: commands to cyw43.ctrl
-    scan_chan: i32,      // in[1]: binary scan results from cyw43
+    in_chan: i32,          // in[0]: status events from cyw43
+    out_chan: i32,         // out[0]: commands to cyw43.ctrl
+    scan_chan: i32,        // in[1]: binary scan results from cyw43
     netif_state_chan: i32, // in[2]: netif state transitions from cyw43
-    last_netif_state: u8, // latest MSG_NETIF_STATE payload (0xFF = unseen)
+    last_netif_state: u8,  // latest MSG_NETIF_STATE payload (0xFF = unseen)
     phase: WifiPhase,
     retry_count: u8,
     radio_ready: bool,
-    security: u8,   // 0=WPA2, 1=WPA3, 2=Open
+    security: u8, // 0=WPA2, 1=WPA3, 2=Open
     _pad_hdr: u8,
     last_time_ms: u64,
     assoc_buf: [u8; ASSOC_BUF_SIZE],
@@ -282,7 +281,13 @@ unsafe fn send_connect(s: &mut WifiConnectState) -> bool {
         i += 1;
     }
 
-    let r = msg_write(sys, s.out_chan, MSG_CONNECT, cmd.as_ptr(), payload_len as u16);
+    let r = msg_write(
+        sys,
+        s.out_chan,
+        MSG_CONNECT,
+        cmd.as_ptr(),
+        payload_len as u16,
+    );
     r >= 0
 }
 
@@ -324,8 +329,8 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut WifiConnectState);
 
         s.syscalls = syscalls as *const SyscallTable;
-        s.in_chan = in_chan;          // in[0]: status events
-        s.out_chan = out_chan;        // out[0]: commands → cyw43.ctrl
+        s.in_chan = in_chan; // in[0]: status events
+        s.out_chan = out_chan; // out[0]: commands → cyw43.ctrl
         s.last_netif_state = 0xFF;
         s.phase = WifiPhase::Init;
 

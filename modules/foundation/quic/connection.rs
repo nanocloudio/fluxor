@@ -1429,10 +1429,7 @@ impl QuicConnection {
             // reservation refuses anything lower, so this is the one start
             // it can accept; `next_send_pn` covers a counter advanced past
             // the block by a path that did not draw on it.
-            let start = self
-                .send_pn_res
-                .high_water()
-                .max(self.one_rtt.next_send_pn);
+            let start = self.send_pn_res.high_water().max(self.one_rtt.next_send_pn);
             let _ = self
                 .send_pn_res
                 .grant(self.cont_epoch, start, LOCAL_PN_BLOCK);

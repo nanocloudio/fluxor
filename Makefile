@@ -31,7 +31,10 @@ LAUNCHER    ?= $(HOST_DIR)/fluxor-launcher
 comma := ,
 KERNEL_RUSTFLAGS := $(if $(findstring aarch64,$(HOST_TRIPLE)),RUSTFLAGS="-C target-feature=+aes$(comma)+sha2$(comma)+neon",)
 BINDIR      ?= $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)/bin
-TARGET      ?= rp2350
+# A BOARD id from targets/boards/, or a host token. Firmware is built per
+# board — a board fixes the link origin, the pin map and the rig contract,
+# and several boards share one die — so a silicon id is refused here.
+TARGET      ?= pico2w
 
 .DEFAULT_GOAL := build
 
@@ -67,15 +70,14 @@ clean:
 # (§3): the per-target dispatch and the sign loop live in the scripts,
 # where a conditional is allowed to live.
 
-# What lives on PATH is the resolving LAUNCHER (Decision 8,
-# registry_consolidation.md): every invocation resolves the CLI's
-# `:latest` store artifact and execs its blob, so an installed copy can
+# What lives on PATH is the resolving LAUNCHER: every invocation
+# resolves the CLI's `:latest` store artifact and execs its blob, so an installed copy can
 # never lag a publish. The only failure mode left is the launcher being
 # absent entirely — `make install` is the fix. CLI changes go live via
 # `fluxor publish --only runtime` (or `fluxor workspace publish`), not
 # reinstall.
 #
-# Bootstrap ONLY (Decision 8) — first build on an empty-store machine:
+# Bootstrap ONLY — first build on an empty-store machine:
 # build the tools CLI, the linux runtime, and the launcher; publish the
 # CLI + fluxor-linux into the local OCI store with the freshly built
 # tools binary (publish auto-includes the CLI for fluxor); install the
@@ -86,7 +88,7 @@ clean:
 # either uplifting over the other.
 #
 # The `ln -snf` lines put the rig backends on the `fluxor rig` discovery
-# path (dependencies.md §10a: one invariant artefact set — install
+# path (standards/dependencies.md §10a: one invariant artefact set — install
 # always installs them). They point at the build outputs, so a later
 # rebuild is picked up with no re-install.
 install:
@@ -98,6 +100,10 @@ install:
 	ln -snf $(CURDIR)/$(HOST_DIR)/telemetry-monitor_udp $(RIG_BACKEND_DIR)/telemetry-monitor_udp
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-https_load   $(RIG_BACKEND_DIR)/observe-https_load
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-udp_capture  $(RIG_BACKEND_DIR)/observe-udp_capture
+	ln -snf $(CURDIR)/tools/rig/backends/observe-quic_mux  $(RIG_BACKEND_DIR)/observe-quic_mux
+	ln -snf $(CURDIR)/tools/rig/backends/console-usb_cdc   $(RIG_BACKEND_DIR)/console-usb_cdc
+	ln -snf $(CURDIR)/tools/rig/backends/deploy-picotool   $(RIG_BACKEND_DIR)/deploy-picotool
+	ln -snf $(CURDIR)/tools/rig/backends/power-picotool    $(RIG_BACKEND_DIR)/power-picotool
 
 RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/fluxor/backends
 
@@ -113,6 +119,6 @@ shadow-add:
 	@git shadow add -f -- tests tools/tests examples ':(exclude)**/target/**'
 
 # One kernel: build + objcopy to a raw boot image.
-#   make firmware TARGET=rp2040   # rp2350 | rp2040 | qemu-virt | pi5 | wasm
+#   make firmware TARGET=pico2w   # a BOARD id (targets/boards/), or a host token
 firmware:
 	@tools/firmware.sh $(TARGET)

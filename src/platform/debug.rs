@@ -94,7 +94,7 @@ impl<const N: usize> DebugDrain<N> {
     ///
     /// Caller supplies the sink so the drain state can be static and
     /// distinct from the sink's own state (which often needs a different
-    /// lifetime, e.g. a board-held UART handle or an Embassy pipe ref).
+    /// lifetime, e.g. a board-held UART handle).
     pub fn poll<T: DebugTx + ?Sized>(&mut self, sink: &mut T) {
         if self.pending_len > 0 {
             let start = self.pending_off as usize;

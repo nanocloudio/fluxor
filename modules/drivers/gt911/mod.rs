@@ -23,7 +23,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -37,7 +36,7 @@ include!("../../sdk/runtime/params.rs");
 // Constants
 // ============================================================================
 
-const GT911_ADDR_LOW: u8 = 0x5D;  // INT low during reset → 0x5D
+const GT911_ADDR_LOW: u8 = 0x5D; // INT low during reset → 0x5D
 
 // GT911 registers
 const REG_PRODUCT_ID: u16 = 0x8140;
@@ -76,7 +75,7 @@ enum Gt911Phase {
 struct TouchEvent {
     x: u16,
     y: u16,
-    event_type: u8,   // 1=press, 2=release, 3=move
+    event_type: u8, // 1=press, 2=release, 3=move
     touch_count: u8,
     pressure: u16,
 }
@@ -129,8 +128,8 @@ impl Gt911State {
 // ============================================================================
 
 mod params_def {
-    use super::Gt911State;
     use super::p_u8;
+    use super::Gt911State;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -158,7 +157,7 @@ unsafe fn setup_write_read(s: &mut Gt911State, reg: u16, rx_len: usize) -> usize
     let tx_len: u16 = 2; // 2 bytes register address
     s.xfer_buf[0] = (tx_len & 0xFF) as u8;
     s.xfer_buf[1] = (tx_len >> 8) as u8;
-    s.xfer_buf[2] = (reg >> 8) as u8;   // Register address MSB first
+    s.xfer_buf[2] = (reg >> 8) as u8; // Register address MSB first
     s.xfer_buf[3] = (reg & 0xFF) as u8;
     2 + 2 + rx_len // tx_len header + tx data + rx space
 }
@@ -182,9 +181,9 @@ unsafe fn setup_write(s: &mut Gt911State, reg: u16, data: &[u8]) -> usize {
 
 // Provider contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_I2C_CONTRACT:  u32 = 0x0003;
-const TIMER_CONTRACT:    u32 = 0x0006;
-const EVENT_CONTRACT:    u32 = 0x000B;
+const HAL_I2C_CONTRACT: u32 = 0x0003;
+const TIMER_CONTRACT: u32 = 0x0006;
+const EVENT_CONTRACT: u32 = 0x000B;
 
 unsafe fn claim_gpio_output(sys: &SyscallTable, pin: u8) -> i32 {
     let mut arg = [pin];
@@ -289,10 +288,14 @@ pub extern "C" fn module_new(
         // 3. Wait 10ms
 
         s.int_handle = claim_gpio_output(sys, s.int_pin);
-        if s.int_handle < 0 { return s.int_handle; }
+        if s.int_handle < 0 {
+            return s.int_handle;
+        }
 
         s.rst_handle = claim_gpio_output(sys, s.rst_pin);
-        if s.rst_handle < 0 { return s.rst_handle; }
+        if s.rst_handle < 0 {
+            return s.rst_handle;
+        }
 
         // INT low → selects addr 0x5D
         gpio_set(sys, s.int_handle, 0);
@@ -364,7 +367,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             arg[6] = fb[3];
 
             let handle = unsafe {
-                (sys.provider_open)(HAL_I2C_CONTRACT, 0x0300, arg.as_mut_ptr(), 7) // I2C_OPEN
+                (sys.provider_open)(HAL_I2C_CONTRACT, 0x0300, arg.as_mut_ptr(), 7)
+                // I2C_OPEN
             };
             if handle < 0 {
                 s.phase = Gt911Phase::Error;
@@ -386,7 +390,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     arg_len,
                 )
             };
-            if rc < 0 && rc != E_INPROGRESS { // EINPROGRESS is expected
+            if rc < 0 && rc != E_INPROGRESS {
+                // EINPROGRESS is expected
                 s.phase = Gt911Phase::Error;
                 return rc;
             }
@@ -457,7 +462,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             // Consume the event signal
             unsafe {
-                (sys.provider_call)(s.event_fd, 0x0B02, core::ptr::null_mut(), 0); // EVENT_POLL (clears)
+                (sys.provider_call)(s.event_fd, 0x0B02, core::ptr::null_mut(), 0);
+                // EVENT_POLL (clears)
             }
             // Read status register
             s.phase = Gt911Phase::ReadStatusStart;
@@ -470,7 +476,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = unsafe {
                 (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
             };
-            if rc < 0 && rc != E_INPROGRESS { return rc; }
+            if rc < 0 && rc != E_INPROGRESS {
+                return rc;
+            }
             s.phase = Gt911Phase::ReadStatusPoll;
             0
         }
@@ -480,7 +488,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = unsafe {
                 (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
             };
-            if rc == 0 { return 0; }
+            if rc == 0 {
+                return 0;
+            }
             if rc < 0 {
                 // I2C error — go back to waiting
                 s.phase = Gt911Phase::Running;
@@ -531,7 +541,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = unsafe {
                 (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
             };
-            if rc < 0 && rc != E_INPROGRESS { return rc; }
+            if rc < 0 && rc != E_INPROGRESS {
+                return rc;
+            }
             s.phase = Gt911Phase::ReadPointsPoll;
             0
         }
@@ -542,7 +554,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = unsafe {
                 (sys.provider_call)(s.i2c_handle, 0x0304, s.xfer_buf.as_mut_ptr(), arg_len)
             };
-            if rc == 0 { return 0; }
+            if rc == 0 {
+                return 0;
+            }
             if rc < 0 {
                 s.phase = Gt911Phase::ClearStatusStart;
                 return 2;
@@ -550,12 +564,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             // Parse first touch point (offset 4 after tx_len header + tx data)
             let base = 4; // 2 tx_len + 2 reg addr
-            // GT911 point format: tracking_id(1), x_lo(1), x_hi(1), y_lo(1), y_hi(1), size_lo(1), size_hi(1), reserved(1)
+                          // GT911 point format: tracking_id(1), x_lo(1), x_hi(1), y_lo(1), y_hi(1), size_lo(1), size_hi(1), reserved(1)
             let x = (s.xfer_buf[base + 1] as u16) | ((s.xfer_buf[base + 2] as u16) << 8);
             let y = (s.xfer_buf[base + 3] as u16) | ((s.xfer_buf[base + 4] as u16) << 8);
             let size = (s.xfer_buf[base + 5] as u16) | ((s.xfer_buf[base + 6] as u16) << 8);
 
-            let event_type = if s.was_touching != 0 { TOUCH_MOVE } else { TOUCH_PRESS };
+            let event_type = if s.was_touching != 0 {
+                TOUCH_MOVE
+            } else {
+                TOUCH_PRESS
+            };
             s.was_touching = 1;
 
             let evt = TouchEvent {
@@ -584,9 +602,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Write 0 to status register (0x814E) to acknowledge
             let arg_len = unsafe { setup_write(s, REG_STATUS, &[0x00]) };
             let rc = unsafe {
-                (sys.provider_call)(s.i2c_handle, 0x0302, s.xfer_buf.as_mut_ptr(), arg_len) // I2C_WRITE
+                (sys.provider_call)(s.i2c_handle, 0x0302, s.xfer_buf.as_mut_ptr(), arg_len)
+                // I2C_WRITE
             };
-            if rc < 0 && rc != E_INPROGRESS { return rc; }
+            if rc < 0 && rc != E_INPROGRESS {
+                return rc;
+            }
             s.phase = Gt911Phase::ClearStatusPoll;
             0
         }
@@ -596,7 +617,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let rc = unsafe {
                 (sys.provider_call)(s.i2c_handle, 0x0302, s.xfer_buf.as_mut_ptr(), arg_len)
             };
-            if rc == 0 { return 0; }
+            if rc == 0 {
+                return 0;
+            }
             // Done or error — return to waiting
             s.phase = Gt911Phase::Running;
             0

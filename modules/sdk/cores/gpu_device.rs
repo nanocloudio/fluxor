@@ -593,7 +593,6 @@ impl Work {
     }
 }
 
-
 /// The result of offering bytes to [`GpuDevice::admit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admit {
@@ -829,11 +828,19 @@ impl<'a> GpuDevice<'a> {
         let gen = handle_generation(h);
         let (live, slot_gen, slot_owner) = match kind {
             KIND_BUFFER | KIND_TEXTURE | KIND_SAMPLER => {
-                let s = self.t.resources.get(idx as usize).ok_or(REASON_BAD_HANDLE)?;
+                let s = self
+                    .t
+                    .resources
+                    .get(idx as usize)
+                    .ok_or(REASON_BAD_HANDLE)?;
                 // A retired-but-retained slot is not reachable: the handle is
                 // dead the moment destroy is accepted, even though the bytes
                 // survive until quiescence.
-                (s.live && !s.retiring && s.kind == kind, s.generation, s.owner)
+                (
+                    s.live && !s.retiring && s.kind == kind,
+                    s.generation,
+                    s.owner,
+                )
             }
             KIND_VIEW => {
                 let s = self.t.views.get(idx as usize).ok_or(REASON_BAD_HANDLE)?;
@@ -844,7 +851,11 @@ impl<'a> GpuDevice<'a> {
                 (s.live, s.generation, s.owner)
             }
             KIND_PIPELINE => {
-                let s = self.t.pipelines.get(idx as usize).ok_or(REASON_BAD_HANDLE)?;
+                let s = self
+                    .t
+                    .pipelines
+                    .get(idx as usize)
+                    .ok_or(REASON_BAD_HANDLE)?;
                 (s.live, s.generation, s.owner)
             }
             KIND_FENCE => {
@@ -950,11 +961,7 @@ impl<'a> GpuDevice<'a> {
     /// record was both delivered and acknowledged. Reclaiming one earlier is
     /// how a completed result silently disappears.
     fn alloc_fence(&mut self, owner: u16, op: u16, corr: u64, queue: u8) -> Option<u16> {
-        let idx = self
-            .t
-            .fences
-            .iter()
-            .position(|s| s.state == FENCE_FREE)? as u16;
+        let idx = self.t.fences.iter().position(|s| s.state == FENCE_FREE)? as u16;
         let s = &mut self.t.fences[idx as usize];
         let g = next_gen(s.generation);
         *s = FenceSlot::EMPTY;
@@ -972,7 +979,11 @@ impl<'a> GpuDevice<'a> {
     }
 
     fn live_fences(&self) -> u16 {
-        self.t.fences.iter().filter(|f| f.state != FENCE_FREE).count() as u16
+        self.t
+            .fences
+            .iter()
+            .filter(|f| f.state != FENCE_FREE)
+            .count() as u16
     }
 
     // ── Outcome ring ────────────────────────────────────────────────────
@@ -1181,7 +1192,12 @@ impl<'a> GpuDevice<'a> {
 
     // ── Operations ──────────────────────────────────────────────────────
 
-    fn op_query_caps(&mut self, owner: u16, hdr: &Header, reserve: usize) -> Result<Work, (u16, u32)> {
+    fn op_query_caps(
+        &mut self,
+        owner: u16,
+        hdr: &Header,
+        reserve: usize,
+    ) -> Result<Work, (u16, u32)> {
         let fence = self
             .alloc_fence(owner, hdr.op, hdr.corr, QUEUE_COMPUTE)
             .ok_or((REASON_FENCE_EXHAUSTED, 0))?;
@@ -1212,7 +1228,11 @@ impl<'a> GpuDevice<'a> {
         put_u32(&mut c, CAPS_MAX_PROGRAMS, self.t.programs.len() as u32);
         put_u32(&mut c, CAPS_MAX_PIPELINES, self.t.pipelines.len() as u32);
         put_u32(&mut c, CAPS_MAX_FENCES, self.t.fences.len() as u32);
-        put_u32(&mut c, CAPS_MAX_QUEUE_DEPTH, self.limits.max_queue_depth as u32);
+        put_u32(
+            &mut c,
+            CAPS_MAX_QUEUE_DEPTH,
+            self.limits.max_queue_depth as u32,
+        );
         put_u32(&mut c, CAPS_MAX_BINDINGS, self.limits.max_bindings);
         put_u32(&mut c, CAPS_MIN_ALIGN, self.limits.min_align);
         put_u32(&mut c, CAPS_MAX_WORKGROUP_X, self.limits.max_workgroup[0]);
@@ -1233,8 +1253,16 @@ impl<'a> GpuDevice<'a> {
             CAPS_MAX_RESIDENT_BYTES,
             self.limits.max_resident_bytes,
         );
-        put_u64(&mut c, CAPS_MAX_STAGING_BYTES, self.limits.max_staging_bytes);
-        put_u64(&mut c, CAPS_MAX_SCRATCH_BYTES, self.limits.max_scratch_bytes);
+        put_u64(
+            &mut c,
+            CAPS_MAX_STAGING_BYTES,
+            self.limits.max_staging_bytes,
+        );
+        put_u64(
+            &mut c,
+            CAPS_MAX_SCRATCH_BYTES,
+            self.limits.max_scratch_bytes,
+        );
         for (i, t) in self.limits.targets.iter().enumerate() {
             put_u32(&mut c, CAPS_TARGETS + i * 4, *t);
         }
@@ -2009,7 +2037,9 @@ impl<'a> GpuDevice<'a> {
         offset: u64,
         len: u64,
     ) -> Result<(u16, u64), (u16, u32)> {
-        let vidx = self.check_handle(vh, KIND_VIEW, owner).map_err(|r| (r, 0))?;
+        let vidx = self
+            .check_handle(vh, KIND_VIEW, owner)
+            .map_err(|r| (r, 0))?;
         let v = self.t.views[vidx as usize];
         if v.rights & RIGHT_WRITE == 0 {
             return Err((REASON_ACCESS_DENIED, RIGHT_WRITE));
@@ -2038,7 +2068,9 @@ impl<'a> GpuDevice<'a> {
         offset: u64,
         len: u64,
     ) -> Result<(u16, u64), (u16, u32)> {
-        let vidx = self.check_handle(vh, KIND_VIEW, owner).map_err(|r| (r, 0))?;
+        let vidx = self
+            .check_handle(vh, KIND_VIEW, owner)
+            .map_err(|r| (r, 0))?;
         let v = self.t.views[vidx as usize];
         if v.rights & RIGHT_READ == 0 {
             return Err((REASON_ACCESS_DENIED, RIGHT_READ));
@@ -2156,7 +2188,9 @@ impl<'a> GpuDevice<'a> {
         let mut wait_gens = [0u16; MAX_WAITS];
         for i in 0..wait_count {
             let h = get_u64(p, waits_off + i * 8).ok_or((REASON_MALFORMED, 0))?;
-            let idx = self.check_handle(h, KIND_FENCE, owner).map_err(|r| (r, 0))?;
+            let idx = self
+                .check_handle(h, KIND_FENCE, owner)
+                .map_err(|r| (r, 0))?;
             waits[i] = idx;
             wait_gens[i] = handle_generation(h);
         }
@@ -2395,7 +2429,9 @@ impl<'a> GpuDevice<'a> {
                 .map(|k| prog.bindings[k])
                 .find(|b| b.slot == slot)
                 .ok_or((REASON_MALFORMED, slot as u32))?;
-            let vidx = self.check_handle(vh, KIND_VIEW, owner).map_err(|r| (r, 0))?;
+            let vidx = self
+                .check_handle(vh, KIND_VIEW, owner)
+                .map_err(|r| (r, 0))?;
             let v = self.t.views[vidx as usize];
             let res = &self.t.resources[v.resource as usize];
             if !res.live || res.generation != v.resource_gen {
@@ -2465,7 +2501,9 @@ impl<'a> GpuDevice<'a> {
     }
 
     fn check_geometry(&self, vh: u64, owner: u16, usage: u32) -> Result<u16, (u16, u32)> {
-        let vidx = self.check_handle(vh, KIND_VIEW, owner).map_err(|r| (r, 0))?;
+        let vidx = self
+            .check_handle(vh, KIND_VIEW, owner)
+            .map_err(|r| (r, 0))?;
         let v = self.t.views[vidx as usize];
         if v.usage & usage == 0 {
             return Err((REASON_USAGE_DENIED, usage));
@@ -2487,7 +2525,9 @@ impl<'a> GpuDevice<'a> {
 
     fn op_poll_fence(&mut self, owner: u16, hdr: &Header, p: &[u8]) -> Result<Work, (u16, u32)> {
         let h = get_u64(p, 0).ok_or((REASON_MALFORMED, 0))?;
-        let idx = self.check_handle(h, KIND_FENCE, owner).map_err(|r| (r, 0))?;
+        let idx = self
+            .check_handle(h, KIND_FENCE, owner)
+            .map_err(|r| (r, 0))?;
         let f = self.t.fences[idx as usize];
         if f.state != FENCE_TERMINAL {
             return Err((REASON_NOT_READY, 0));
@@ -2508,7 +2548,9 @@ impl<'a> GpuDevice<'a> {
         reserve: usize,
     ) -> Result<Work, (u16, u32)> {
         let h = get_u64(p, 0).ok_or((REASON_MALFORMED, 0))?;
-        let idx = self.check_handle(h, KIND_FENCE, owner).map_err(|r| (r, 0))?;
+        let idx = self
+            .check_handle(h, KIND_FENCE, owner)
+            .map_err(|r| (r, 0))?;
         let f = self.t.fences[idx as usize];
         if f.state != FENCE_TERMINAL {
             return Err((REASON_IN_FLIGHT, 0));
@@ -2538,7 +2580,9 @@ impl<'a> GpuDevice<'a> {
         reserve: usize,
     ) -> Result<Work, (u16, u32)> {
         let h = get_u64(p, 0).ok_or((REASON_MALFORMED, 0))?;
-        let target = self.check_handle(h, KIND_FENCE, owner).map_err(|r| (r, 0))?;
+        let target = self
+            .check_handle(h, KIND_FENCE, owner)
+            .map_err(|r| (r, 0))?;
         let ack = self
             .alloc_fence(owner, hdr.op, hdr.corr, QUEUE_TRANSFER)
             .ok_or((REASON_FENCE_EXHAUSTED, 0))?;
@@ -2548,14 +2592,7 @@ impl<'a> GpuDevice<'a> {
             FENCE_WAITING | FENCE_READY => {
                 // Not yet handed to the device: the reservation really can be
                 // released and nothing ran.
-                self.finish(
-                    target,
-                    OUT_CANCELLED,
-                    0,
-                    0,
-                    CANCEL_PRE_DISPATCH,
-                    0,
-                );
+                self.finish(target, OUT_CANCELLED, 0, 0, CANCEL_PRE_DISPATCH, 0);
                 self.settle_now(ack);
                 Ok(Work::None)
             }
@@ -2627,7 +2664,9 @@ impl<'a> GpuDevice<'a> {
         if width == 0 || height == 0 {
             return Err((REASON_MALFORMED, 0));
         }
-        let vidx = self.check_handle(vh, KIND_VIEW, owner).map_err(|r| (r, 0))?;
+        let vidx = self
+            .check_handle(vh, KIND_VIEW, owner)
+            .map_err(|r| (r, 0))?;
         let v = self.t.views[vidx as usize];
         if v.usage & USAGE_SCANOUT == 0 {
             return Err((REASON_USAGE_DENIED, USAGE_SCANOUT));
@@ -2677,7 +2716,8 @@ impl<'a> GpuDevice<'a> {
         };
         self.surface_sequence = self.surface_sequence.wrapping_add(1);
         let sequence = self.surface_sequence;
-        let fence_handle = self.handle_for(KIND_FENCE, fence, self.t.fences[fence as usize].generation);
+        let fence_handle =
+            self.handle_for(KIND_FENCE, fence, self.t.fences[fence as usize].generation);
         {
             let s = &mut self.t.surfaces[slot as usize];
             s.owner = owner;
@@ -2697,7 +2737,11 @@ impl<'a> GpuDevice<'a> {
         }
         self.retain(fence, v.resource);
         self.accept(fence, reserve);
-        let handle = self.handle_for(KIND_SURFACE, slot, self.t.surfaces[slot as usize].generation);
+        let handle = self.handle_for(
+            KIND_SURFACE,
+            slot,
+            self.t.surfaces[slot as usize].generation,
+        );
         self.emit_handle(fence, handle);
         let desc = self.encode_surface(slot);
         self.emit(OUT_SURFACE, hdr.corr, &desc, HEADER_LEN + SURFACE_LEN);
@@ -2713,7 +2757,11 @@ impl<'a> GpuDevice<'a> {
     pub fn encode_surface(&self, slot: u16) -> [u8; SURFACE_LEN] {
         let mut d = [0u8; SURFACE_LEN];
         let s = self.t.surfaces[slot as usize];
-        put_u64(&mut d, SURFACE_HANDLE, self.handle_for(KIND_SURFACE, slot, s.generation));
+        put_u64(
+            &mut d,
+            SURFACE_HANDLE,
+            self.handle_for(KIND_SURFACE, slot, s.generation),
+        );
         put_u32(&mut d, SURFACE_PROVIDER_EPOCH, self.provider_epoch);
         put_u32(&mut d, SURFACE_DEVICE_EPOCH, self.epoch as u32);
         put_u64(
@@ -2827,10 +2875,9 @@ impl<'a> GpuDevice<'a> {
         let start = self.out_len;
         let total = HEADER_LEN + RESULT_PREFIX + bytes.len();
         let out = &mut self.t.outcomes[start..start + total];
-        out[..HEADER_LEN]
-            .copy_from_slice(
-                &Header::new(OUT_RESULT, (RESULT_PREFIX + bytes.len()) as u32, corr).encode(),
-            );
+        out[..HEADER_LEN].copy_from_slice(
+            &Header::new(OUT_RESULT, (RESULT_PREFIX + bytes.len()) as u32, corr).encode(),
+        );
         let body = &mut out[HEADER_LEN..];
         put_u64(body, 0, fh);
         put_u64(body, 8, offset);
@@ -3474,7 +3521,11 @@ impl Iterator for ItemWalk<'_> {
                 let n = get_u16(b, o + 8)? as usize;
                 let binds_offset = o + 12;
                 let next = binds_offset + n * BIND_ENTRY_LEN;
-                let groups = [get_u32(b, next)?, get_u32(b, next + 4)?, get_u32(b, next + 8)?];
+                let groups = [
+                    get_u32(b, next)?,
+                    get_u32(b, next + 4)?,
+                    get_u32(b, next + 8)?,
+                ];
                 self.off = next + 12;
                 SubmitItem::Dispatch {
                     pipeline,

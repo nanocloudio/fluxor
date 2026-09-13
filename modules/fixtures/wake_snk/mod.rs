@@ -138,11 +138,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             msg[len] = digits[d];
             len += 1;
         }
-        let tail: &[u8] = if dt < FAST_MS {
-            b" fast=1"
-        } else {
-            b" fast=0"
-        };
+        let tail: &[u8] = if dt < FAST_MS { b" fast=1" } else { b" fast=0" };
         msg[len..len + tail.len()].copy_from_slice(tail);
         len += tail.len();
         dev_log(sys, 3, msg.as_ptr(), len);

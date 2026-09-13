@@ -21,7 +21,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -35,15 +34,11 @@ include!("../../sdk/runtime.rs");
 // ============================================================================
 
 use abi::internal::reconfigure::{
-    SELF_INDEX as SYS_RECONFIG_SELF_INDEX,
-    SET_PHASE as SYS_RECONFIG_SET_PHASE,
-    CALL_DRAIN as SYS_RECONFIG_CALL_DRAIN,
-    MARK_FINISHED as SYS_RECONFIG_MARK_FINISHED,
-    MODULE_COUNT as SYS_RECONFIG_MODULE_COUNT,
-    MODULE_INFO as SYS_RECONFIG_MODULE_INFO,
+    CALL_DRAIN as SYS_RECONFIG_CALL_DRAIN, MARK_FINISHED as SYS_RECONFIG_MARK_FINISHED,
+    MODULE_COUNT as SYS_RECONFIG_MODULE_COUNT, MODULE_DONE as SYS_RECONFIG_MODULE_DONE,
+    MODULE_INFO as SYS_RECONFIG_MODULE_INFO, MODULE_UPSTREAM as SYS_RECONFIG_MODULE_UPSTREAM,
+    SELF_INDEX as SYS_RECONFIG_SELF_INDEX, SET_PHASE as SYS_RECONFIG_SET_PHASE,
     TRIGGER_REBUILD as SYS_RECONFIG_TRIGGER_REBUILD,
-    MODULE_UPSTREAM as SYS_RECONFIG_MODULE_UPSTREAM,
-    MODULE_DONE as SYS_RECONFIG_MODULE_DONE,
 };
 
 // Optional graph_slot integration. When a graph_slot provider is
@@ -53,23 +48,23 @@ use abi::internal::reconfigure::{
 // config. The activation is fire-and-forget; if graph_slot is not
 // wired or the staged slot fails SHA-256 validation, the rebuild
 // falls back to the current STATIC_CONFIG, which is idempotent.
-use abi::contracts::storage::graph_slot::channel::{REQ_ACTIVATE, FRAME_HDR as GS_FRAME_HDR};
+use abi::contracts::storage::graph_slot::channel::{FRAME_HDR as GS_FRAME_HDR, REQ_ACTIVATE};
 
 // Fault monitor integration. Raise a fault against a module whose drain
 // exceeded its deadline so the unified fault pipeline (monitor CLI,
 // metrics sinks) records it alongside step-guard and MPU faults.
 use abi::internal::monitor::FAULT_RAISE as SYS_FAULT_RAISE;
-const FAULT_KIND_DRAIN_TIMEOUT: u8      = 5;
+const FAULT_KIND_DRAIN_TIMEOUT: u8 = 5;
 
 // Phase values mirror scheduler::ReconfigurePhase.
-const PHASE_RUNNING: u8   = 0;
-const PHASE_DRAINING: u8  = 1;
+const PHASE_RUNNING: u8 = 0;
+const PHASE_DRAINING: u8 = 1;
 const PHASE_MIGRATING: u8 = 2;
 
 // Per-module drain classification (local bookkeeping).
-const DS_SURVIVING: u8         = 0;
-const DS_DRAINING: u8          = 1;
-const DS_DRAINED: u8           = 2;
+const DS_SURVIVING: u8 = 0;
+const DS_DRAINING: u8 = 1;
+const DS_DRAINED: u8 = 2;
 const DS_PENDING_TERMINATE: u8 = 3;
 
 // Bits returned by RECONFIGURE_MODULE_INFO.
@@ -83,18 +78,18 @@ const MAX_TRACKED_MODULES: usize = 32;
 
 // StepOutcome return values.
 const CONTINUE: i32 = 0;
-const READY: i32    = 3;
+const READY: i32 = 3;
 
 // Sentinel for "self index not yet resolved".
 const SELF_IDX_UNKNOWN: u8 = 0xFF;
 
 // Status event kinds emitted on the output channel. Each record is
 // 8 bytes: `[kind:u8, module_idx:u8, extra:u16 LE, tick:u32 LE]`.
-const STATUS_DRAINING_ENTERED: u8   = 0x01;
-const STATUS_MODULE_DRAINED: u8     = 0x02;
-const STATUS_MODULE_FORCED: u8      = 0x03;
-const STATUS_MIGRATING_ENTERED: u8  = 0x04;
-const STATUS_RECORD_SIZE: usize     = 8;
+const STATUS_DRAINING_ENTERED: u8 = 0x01;
+const STATUS_MODULE_DRAINED: u8 = 0x02;
+const STATUS_MODULE_FORCED: u8 = 0x03;
+const STATUS_MIGRATING_ENTERED: u8 = 0x04;
+const STATUS_RECORD_SIZE: usize = 8;
 
 // ============================================================================
 // State
@@ -150,7 +145,9 @@ unsafe fn sys_fault_raise(sys: &SyscallTable, idx: u8, kind: u8) {
 /// Write a single 8-byte status record to the output channel. Silently
 /// drops the event if the channel is not wired or the ring is full.
 unsafe fn emit_status(s: &State, sys: &SyscallTable, kind: u8, module_idx: u8, extra: u16) {
-    if s.status_chan < 0 { return; }
+    if s.status_chan < 0 {
+        return;
+    }
     let mut rec = [0u8; STATUS_RECORD_SIZE];
     let p = rec.as_mut_ptr();
     core::ptr::write_volatile(p.add(0), kind);
@@ -173,7 +170,11 @@ unsafe fn sys_module_count(sys: &SyscallTable) -> i32 {
 unsafe fn sys_module_info(sys: &SyscallTable, idx: u8) -> u32 {
     let mut arg = [idx];
     let rc = (sys.provider_call)(-1, SYS_RECONFIG_MODULE_INFO, arg.as_mut_ptr(), 1);
-    if rc < 0 { 0 } else { rc as u32 }
+    if rc < 0 {
+        0
+    } else {
+        rc as u32
+    }
 }
 
 /// Upstream-mask words per the `MODULE_UPSTREAM` wire contract: 4 × u64
@@ -234,12 +235,16 @@ unsafe fn sys_trigger_rebuild(sys: &SyscallTable, ptr: usize, len: usize) {
 // ============================================================================
 
 unsafe fn ds_get(s: &State, i: usize) -> u8 {
-    if i >= MAX_TRACKED_MODULES { return DS_SURVIVING; }
+    if i >= MAX_TRACKED_MODULES {
+        return DS_SURVIVING;
+    }
     core::ptr::read(s.drain_state.as_ptr().add(i))
 }
 
 unsafe fn ds_set(s: &mut State, i: usize, v: u8) {
-    if i >= MAX_TRACKED_MODULES { return; }
+    if i >= MAX_TRACKED_MODULES {
+        return;
+    }
     core::ptr::write_volatile(s.drain_state.as_mut_ptr().add(i), v);
 }
 
@@ -249,9 +254,15 @@ unsafe fn ds_set(s: &mut State, i: usize, v: u8) {
 
 unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
     let count = sys_module_count(sys);
-    if count <= 0 { return; }
+    if count <= 0 {
+        return;
+    }
     let count = count as usize;
-    let count = if count > MAX_TRACKED_MODULES { MAX_TRACKED_MODULES } else { count };
+    let count = if count > MAX_TRACKED_MODULES {
+        MAX_TRACKED_MODULES
+    } else {
+        count
+    };
 
     sys_set_phase(sys, PHASE_DRAINING);
     s.phase = PHASE_DRAINING;
@@ -298,9 +309,15 @@ unsafe fn begin_draining(s: &mut State, sys: &SyscallTable) {
 /// PendingTerminate.
 unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
     let count = sys_module_count(sys);
-    if count <= 0 { return true; }
+    if count <= 0 {
+        return true;
+    }
     let count = count as usize;
-    let count = if count > MAX_TRACKED_MODULES { MAX_TRACKED_MODULES } else { count };
+    let count = if count > MAX_TRACKED_MODULES {
+        MAX_TRACKED_MODULES
+    } else {
+        count
+    };
 
     let elapsed = s.tick_count.wrapping_sub(s.drain_start_tick);
     let timed_out = elapsed >= s.drain_timeout_ms;
@@ -316,10 +333,7 @@ unsafe fn check_drain(s: &mut State, sys: &SyscallTable) -> bool {
                 let mut upstream_ok = true;
                 let mut j = 0;
                 while j < count {
-                    if j != i
-                        && upstream_bit(&upstream, j)
-                        && ds_get(s, j) == DS_DRAINING
-                    {
+                    if j != i && upstream_bit(&upstream, j) && ds_get(s, j) == DS_DRAINING {
                         upstream_ok = false;
                         break;
                     }
@@ -354,7 +368,11 @@ unsafe fn begin_migrating(s: &mut State, sys: &SyscallTable) {
     sys_set_phase(sys, PHASE_MIGRATING);
     s.phase = PHASE_MIGRATING;
     let elapsed = s.tick_count.wrapping_sub(s.drain_start_tick);
-    let elapsed_u16 = if elapsed > u16::MAX as u32 { u16::MAX } else { elapsed as u16 };
+    let elapsed_u16 = if elapsed > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        elapsed as u16
+    };
     emit_status(s, sys, STATUS_MIGRATING_ENTERED, 0, elapsed_u16);
     // If graph_slot is wired and an activation succeeds, the kernel's
     // boot-time layout scan will pick the newly-live slot on the next
@@ -412,7 +430,7 @@ pub extern "C" fn module_new(
         s.syscalls = syscalls as *const SyscallTable;
         s.ctrl_chan = ctrl_chan;
         s.status_chan = out_chan;
-        s.gs_req_chan = -1;  // resolved in module_step once syscalls are live
+        s.gs_req_chan = -1; // resolved in module_step once syscalls are live
         s.phase = PHASE_RUNNING;
         s.self_idx = SELF_IDX_UNKNOWN;
         s.signaled_ready = 0;
@@ -427,7 +445,9 @@ pub extern "C" fn module_new(
                 let tag = *params.add(off);
                 let len = *params.add(off + 1) as usize;
                 off += 2;
-                if off + len > params_len { break; }
+                if off + len > params_len {
+                    break;
+                }
                 if tag == 1 && len == 4 {
                     let mut v = 0u32;
                     let mut i = 0;
@@ -448,9 +468,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut State);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
         let sys = &*s.syscalls;
 
         s.tick_count = s.tick_count.wrapping_add(1);
@@ -507,7 +531,9 @@ pub extern "C" fn module_drain(_state: *mut u8) -> i32 {
 
 #[no_mangle]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> i32 { 1 }
+pub extern "C" fn module_deferred_ready() -> i32 {
+    1
+}
 
 // ============================================================================
 // Panic handler

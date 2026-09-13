@@ -17,7 +17,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -113,10 +112,18 @@ unsafe fn mmio_read32(sys: &SyscallTable, addr: u64) -> u32 {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
     let ab = addr.to_le_bytes();
-    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
-    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    *bp = ab[0];
+    *bp.add(1) = ab[1];
+    *bp.add(2) = ab[2];
+    *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4];
+    *bp.add(5) = ab[5];
+    *bp.add(6) = ab[6];
+    *bp.add(7) = ab[7];
     let rc = (sys.provider_call)(-1, MMIO_READ32, bp, 12);
-    if rc < 0 { return 0; }
+    if rc < 0 {
+        return 0;
+    }
     u32::from_le_bytes([*bp.add(8), *bp.add(9), *bp.add(10), *bp.add(11)])
 }
 
@@ -124,10 +131,19 @@ unsafe fn mmio_write32(sys: &SyscallTable, addr: u64, val: u32) {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
     let ab = addr.to_le_bytes();
-    *bp = ab[0]; *bp.add(1) = ab[1]; *bp.add(2) = ab[2]; *bp.add(3) = ab[3];
-    *bp.add(4) = ab[4]; *bp.add(5) = ab[5]; *bp.add(6) = ab[6]; *bp.add(7) = ab[7];
+    *bp = ab[0];
+    *bp.add(1) = ab[1];
+    *bp.add(2) = ab[2];
+    *bp.add(3) = ab[3];
+    *bp.add(4) = ab[4];
+    *bp.add(5) = ab[5];
+    *bp.add(6) = ab[6];
+    *bp.add(7) = ab[7];
     let vb = val.to_le_bytes();
-    *bp.add(8) = vb[0]; *bp.add(9) = vb[1]; *bp.add(10) = vb[2]; *bp.add(11) = vb[3];
+    *bp.add(8) = vb[0];
+    *bp.add(9) = vb[1];
+    *bp.add(10) = vb[2];
+    *bp.add(11) = vb[3];
     (sys.provider_call)(-1, MMIO_WRITE32, bp, 12);
 }
 
@@ -160,7 +176,11 @@ unsafe fn smmu_init(s: &mut SmmuCfgState) {
     mmio_write32(sys, SMMU_BASE + SCR0, scr0);
 
     // Default all stream mapping entries to fault
-    let max_entries = if (s.num_smrg as usize) < 128 { s.num_smrg as usize } else { 128 };
+    let max_entries = if (s.num_smrg as usize) < 128 {
+        s.num_smrg as usize
+    } else {
+        128
+    };
     let mut i = 0usize;
     while i < max_entries {
         mmio_write32(sys, SMMU_BASE + S2CR_BASE + (i as u64) * 4, S2CR_TYPE_FAULT);
@@ -203,7 +223,11 @@ unsafe fn map_dma(s: &mut SmmuCfgState, stream_id: u16, iova: u64, phys: u64, si
         mmio_write32(sys, SMMU_BASE + SMR_BASE + (stream_id as u64) * 4, smr_val);
 
         // S2CR: translate using context bank 0
-        mmio_write32(sys, SMMU_BASE + S2CR_BASE + (stream_id as u64) * 4, S2CR_TYPE_TRANS);
+        mmio_write32(
+            sys,
+            SMMU_BASE + S2CR_BASE + (stream_id as u64) * 4,
+            S2CR_TYPE_TRANS,
+        );
 
         // Setup context bank 0 with identity mapping
         let cb_base = SMMU_BASE + CB_BASE;
@@ -212,7 +236,11 @@ unsafe fn map_dma(s: &mut SmmuCfgState, stream_id: u16, iova: u64, phys: u64, si
         // MAIR0: Normal WB-WA + Device-nGnRnE
         mmio_write32(sys, cb_base + CB_MAIR0, 0x0000_00FF);
         // TCR: 4KB granule, 39-bit VA (T0SZ=25)
-        mmio_write32(sys, cb_base + CB_TCR, 25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12));
+        mmio_write32(
+            sys,
+            cb_base + CB_TCR,
+            25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12),
+        );
         // SCTLR: enable
         mmio_write32(sys, cb_base + CB_SCTLR, 1);
     }
@@ -255,11 +283,15 @@ unsafe fn unmap_dma(s: &mut SmmuCfgState, stream_id: u16, iova: u64, size: u64) 
 }
 
 unsafe fn check_faults(s: &mut SmmuCfgState) {
-    if s.is_qemu != 0 { return; }
+    if s.is_qemu != 0 {
+        return;
+    }
     let sys = &*s.syscalls;
 
     let gfsr_val = mmio_read32(sys, SMMU_BASE + GFSR);
-    if gfsr_val == 0 { return; }
+    if gfsr_val == 0 {
+        return;
+    }
 
     // Read fault address and syndrome for logging
     let _far_lo = mmio_read32(sys, SMMU_BASE + GFAR_LO);
@@ -289,33 +321,67 @@ pub unsafe extern "C" fn smmu_cfg_dispatch(
     match opcode {
         SMMU_MAP_DMA => {
             // arg=[stream_id:u16 LE, iova:u64 LE, phys:u64 LE, size:u64 LE] (26 bytes)
-            if arg.is_null() || arg_len < 26 { return -22; }
+            if arg.is_null() || arg_len < 26 {
+                return -22;
+            }
             let stream_id = u16::from_le_bytes([*arg, *arg.add(1)]);
             let iova = u64::from_le_bytes([
-                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
-                *arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
+                *arg.add(8),
+                *arg.add(9),
             ]);
             let phys = u64::from_le_bytes([
-                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
-                *arg.add(14), *arg.add(15), *arg.add(16), *arg.add(17),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
+                *arg.add(14),
+                *arg.add(15),
+                *arg.add(16),
+                *arg.add(17),
             ]);
             let size = u64::from_le_bytes([
-                *arg.add(18), *arg.add(19), *arg.add(20), *arg.add(21),
-                *arg.add(22), *arg.add(23), *arg.add(24), *arg.add(25),
+                *arg.add(18),
+                *arg.add(19),
+                *arg.add(20),
+                *arg.add(21),
+                *arg.add(22),
+                *arg.add(23),
+                *arg.add(24),
+                *arg.add(25),
             ]);
             map_dma(s, stream_id, iova, phys, size)
         }
         SMMU_UNMAP_DMA => {
             // arg=[stream_id:u16 LE, iova:u64 LE, size:u64 LE] (18 bytes)
-            if arg.is_null() || arg_len < 18 { return -22; }
+            if arg.is_null() || arg_len < 18 {
+                return -22;
+            }
             let stream_id = u16::from_le_bytes([*arg, *arg.add(1)]);
             let iova = u64::from_le_bytes([
-                *arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5),
-                *arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9),
+                *arg.add(2),
+                *arg.add(3),
+                *arg.add(4),
+                *arg.add(5),
+                *arg.add(6),
+                *arg.add(7),
+                *arg.add(8),
+                *arg.add(9),
             ]);
             let size = u64::from_le_bytes([
-                *arg.add(10), *arg.add(11), *arg.add(12), *arg.add(13),
-                *arg.add(14), *arg.add(15), *arg.add(16), *arg.add(17),
+                *arg.add(10),
+                *arg.add(11),
+                *arg.add(12),
+                *arg.add(13),
+                *arg.add(14),
+                *arg.add(15),
+                *arg.add(16),
+                *arg.add(17),
             ]);
             unmap_dma(s, stream_id, iova, size)
         }
@@ -333,7 +399,9 @@ pub unsafe extern "C" fn smmu_cfg_dispatch(
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -348,14 +416,22 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize,
+    in_chan: i32,
+    out_chan: i32,
+    ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<SmmuCfgState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<SmmuCfgState>() {
+            return -2;
+        }
 
         let s = &mut *(state as *mut SmmuCfgState);
         s.syscalls = syscalls as *const SyscallTable;

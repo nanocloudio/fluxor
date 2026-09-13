@@ -191,4 +191,3 @@ unsafe fn dev_paged_arena_prefault(sys: &SyscallTable, offset: u32, count: u32) 
         0
     }
 }
-

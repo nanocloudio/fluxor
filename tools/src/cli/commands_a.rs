@@ -172,10 +172,18 @@ fn cmd_info(file: &PathBuf) -> Result<()> {
                 header_data[2],
                 header_data[3],
             ]);
-            if magic == config::MAGIC_CONFIG {
-                println!("  Config magic: Valid (0x{magic:08x})");
-            } else {
-                println!("  Config magic: Invalid (0x{magic:08x})");
+            // Both magics are live, and the names invite the wrong
+            // conclusion: the constants here are the TOOLS' pair, where
+            // `MAGIC_CONFIG` is FXCF (pointer-based) and `MAGIC_LEGACY` is
+            // FXWR. The KERNEL has its own `MAGIC_CONFIG`
+            // (`src/kernel/boot/config.rs`) and it is FXWR — so the magic
+            // called legacy here is the one a booting image carries.
+            // Reporting either as invalid tells bring-up that a bootable
+            // image is broken.
+            match magic {
+                config::MAGIC_CONFIG => println!("  Config magic: Valid (0x{magic:08x}, FXCF)"),
+                config::MAGIC_LEGACY => println!("  Config magic: Valid (0x{magic:08x}, FXWR)"),
+                _ => println!("  Config magic: Invalid (0x{magic:08x})"),
             }
         }
 
@@ -548,7 +556,10 @@ fn cmd_generate(
             println!("Wrote binary config to {}", output_path.display());
         } else {
             return Err(error::Error::Config(
-                "Standalone config UF2 no longer supported. Use 'combine' command instead.".into(),
+                "A config UF2 is only produced combined with a firmware image: \
+                 use `--emit=combined --firmware <UF2>`, or `--emit=bin` for the \
+                 raw config binary."
+                    .into(),
             ));
         }
     } else {

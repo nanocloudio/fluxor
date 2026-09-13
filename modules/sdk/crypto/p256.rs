@@ -75,36 +75,46 @@
 /// Load P-256 prime.
 #[inline(never)]
 fn load_p() -> U256 {
-    pic_u256(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
-             0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF)
+    pic_u256(
+        0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
+        0xFFFFFFFF,
+    )
 }
 
 /// Load P-256 order n.
 #[inline(never)]
 fn load_n() -> U256 {
-    pic_u256(0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD,
-             0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0xFFFFFFFF)
+    pic_u256(
+        0xFC632551, 0xF3B9CAC2, 0xA7179E84, 0xBCE6FAAD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
+        0xFFFFFFFF,
+    )
 }
 
 /// Load generator point Gx.
 #[inline(never)]
 fn load_gx() -> U256 {
-    pic_u256(0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81,
-             0x63A440F2, 0xF8BCE6E5, 0xE12C4247, 0x6B17D1F2)
+    pic_u256(
+        0xD898C296, 0xF4A13945, 0x2DEB33A0, 0x77037D81, 0x63A440F2, 0xF8BCE6E5, 0xE12C4247,
+        0x6B17D1F2,
+    )
 }
 
 /// Load generator point Gy.
 #[inline(never)]
 fn load_gy() -> U256 {
-    pic_u256(0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357,
-             0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B, 0x4FE342E2)
+    pic_u256(
+        0x37BF51F5, 0xCBB64068, 0x6B315ECE, 0x2BCE3357, 0x7C0F9E16, 0x8EE7EB4A, 0xFE1A7F9B,
+        0x4FE342E2,
+    )
 }
 
 /// Load N/2 for low-s normalisation.
 #[inline(never)]
 fn load_n_half() -> U256 {
-    pic_u256(0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737556,
-             0xFFFFFFFF, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF)
+    pic_u256(
+        0x7E3192A8, 0x79DCE561, 0xD38BCF42, 0xDE737556, 0xFFFFFFFF, 0xFFFFFFFF, 0x80000000,
+        0x7FFFFFFF,
+    )
 }
 
 /// Load curve constant b for the short-Weierstrass form
@@ -113,8 +123,10 @@ fn load_n_half() -> U256 {
 /// `pic_u256` packs `(lo, hi)` per u64 limb, limb 0 being the LSBs.
 #[inline(never)]
 fn load_b() -> U256 {
-    pic_u256(0x27D2604B, 0x3BCE3C3E, 0xCC53B0F6, 0x651D06B0,
-             0x769886BC, 0xB3EBBD55, 0xAA3A93E7, 0x5AC635D8)
+    pic_u256(
+        0x27D2604B, 0x3BCE3C3E, 0xCC53B0F6, 0x651D06B0, 0x769886BC, 0xB3EBBD55, 0xAA3A93E7,
+        0x5AC635D8,
+    )
 }
 
 // ============================================================================
@@ -147,8 +159,22 @@ fn pic_u64(lo: u32, hi: u32) -> u64 {
     clippy::too_many_arguments,
     reason = "U256 construction wire-shape: 4 limbs × {lo, hi} u32 halves, mirroring the ABI emitted by the PIC build for unaligned 64-bit literals"
 )]
-fn pic_u256(lo0: u32, hi0: u32, lo1: u32, hi1: u32, lo2: u32, hi2: u32, lo3: u32, hi3: u32) -> U256 {
-    [pic_u64(lo0, hi0), pic_u64(lo1, hi1), pic_u64(lo2, hi2), pic_u64(lo3, hi3)]
+fn pic_u256(
+    lo0: u32,
+    hi0: u32,
+    lo1: u32,
+    hi1: u32,
+    lo2: u32,
+    hi2: u32,
+    lo3: u32,
+    hi3: u32,
+) -> U256 {
+    [
+        pic_u64(lo0, hi0),
+        pic_u64(lo1, hi1),
+        pic_u64(lo2, hi2),
+        pic_u64(lo3, hi3),
+    ]
 }
 
 /// a + b, returns (result, carry)
@@ -175,7 +201,9 @@ fn u256_sub(a: &U256, b: &U256) -> (U256, u64) {
     let mut borrow = 0u64;
     let mut i = 0;
     while i < 4 {
-        let diff = (a[i] as u128).wrapping_sub(b[i] as u128).wrapping_sub(borrow as u128);
+        let diff = (a[i] as u128)
+            .wrapping_sub(b[i] as u128)
+            .wrapping_sub(borrow as u128);
         r[i] = diff as u64;
         borrow = ((diff >> 64) & 1) as u64;
         i += 1;
@@ -312,10 +340,14 @@ fn fp_reduce(t: &[u64; 8]) -> U256 {
     let mut acc = [0i64; 8];
 
     // s1
-    acc[0] += s[0] as i64; acc[1] += s[1] as i64;
-    acc[2] += s[2] as i64; acc[3] += s[3] as i64;
-    acc[4] += s[4] as i64; acc[5] += s[5] as i64;
-    acc[6] += s[6] as i64; acc[7] += s[7] as i64;
+    acc[0] += s[0] as i64;
+    acc[1] += s[1] as i64;
+    acc[2] += s[2] as i64;
+    acc[3] += s[3] as i64;
+    acc[4] += s[4] as i64;
+    acc[5] += s[5] as i64;
+    acc[6] += s[6] as i64;
+    acc[7] += s[7] as i64;
 
     // s2 * 2: (s15, s14, s13, s12, s11, 0, 0, 0)
     acc[3] += 2 * s[11] as i64;
@@ -531,8 +563,8 @@ fn fp_inv(a: &U256) -> U256 {
 
     // Simple right-to-left binary method on p-2
     let p_minus_2 = pic_u256(
-        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000,
-        0x00000000, 0x00000000, 0x00000001, 0xFFFFFFFF,
+        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
+        0xFFFFFFFF,
     );
 
     let mut i = 0;
@@ -598,14 +630,16 @@ fn fn_reduce_wide(t: &[u64; 8]) -> U256 {
     // Reduce 512-bit value t mod n using iterative: t_hi * R + t_lo
     // R = 2^256 - n (small, ~128 bits)
     let r_mod = pic_u256(
-        0x039CDAAF, 0x0C46353D, 0x58E8617B, 0x43190552,
-        0x00000000, 0x00000000, 0xFFFFFFFF, 0x00000000,
+        0x039CDAAF, 0x0C46353D, 0x58E8617B, 0x43190552, 0x00000000, 0x00000000, 0xFFFFFFFF,
+        0x00000000,
     );
 
     let mut acc = [0u64; 8];
     // SAFETY: pointer arithmetic over fixed-size P-256 field elements
     // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-    unsafe { core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(t.as_ptr(), acc.as_mut_ptr(), 8);
+    }
 
     // Each iteration: acc = acc_lo + acc_hi * R.
     //
@@ -650,12 +684,7 @@ fn fn_inv(a: &U256) -> U256 {
     let mut base = *a;
 
     let n = load_n();
-    let n_minus_2: U256 = [
-        n[0] - 2,
-        n[1],
-        n[2],
-        n[3],
-    ];
+    let n_minus_2: U256 = [n[0] - 2, n[1], n[2], n[3]];
 
     let mut i = 0;
     while i < 4 {
@@ -687,7 +716,9 @@ fn zeroize(buf: &mut [u8]) {
     while i < buf.len() {
         // SAFETY: pointer arithmetic over fixed-size P-256 field elements
         // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-        unsafe { core::ptr::write_volatile(buf.as_mut_ptr().add(i), 0); }
+        unsafe {
+            core::ptr::write_volatile(buf.as_mut_ptr().add(i), 0);
+        }
         i += 1;
     }
 }
@@ -699,7 +730,9 @@ fn zeroize_u256(v: &mut U256) {
     while i < 4 {
         // SAFETY: pointer arithmetic over fixed-size P-256 field elements
         // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-        unsafe { core::ptr::write_volatile(v.as_mut_ptr().add(i), 0); }
+        unsafe {
+            core::ptr::write_volatile(v.as_mut_ptr().add(i), 0);
+        }
         i += 1;
     }
 }
@@ -735,7 +768,11 @@ fn ct_swap(a: &mut JacobianPoint, b: &mut JacobianPoint, condition: u8) {
 
 impl JacobianPoint {
     const fn identity() -> Self {
-        Self { x: ZERO, y: ONE, z: ZERO }
+        Self {
+            x: ZERO,
+            y: ONE,
+            z: ZERO,
+        }
     }
 
     fn is_identity(&self) -> bool {
@@ -743,7 +780,11 @@ impl JacobianPoint {
     }
 
     fn from_affine(x: &U256, y: &U256) -> Self {
-        Self { x: *x, y: *y, z: ONE }
+        Self {
+            x: *x,
+            y: *y,
+            z: ONE,
+        }
     }
 
     fn to_affine(&self) -> (U256, U256) {
@@ -772,7 +813,7 @@ impl JacobianPoint {
         let s = fp_mul(&self.y, &self.y);
         let mut m = fp_mul(&self.x, &self.x);
         m = fp_add(&fp_add(&m, &m), &m); // 3 * x^2
-        // For P-256, a = -3, so add a*z^4
+                                         // For P-256, a = -3, so add a*z^4
         let z2 = fp_sqr(&self.z);
         let z4 = fp_sqr(&z2);
         // -3 * z^4 = p - 3*z^4
@@ -781,19 +822,23 @@ impl JacobianPoint {
 
         let xy2 = fp_mul(&self.x, &s);
         let t = fp_add(&xy2, &xy2); // 2 * x * y^2
-        let t2 = fp_add(&t, &t);    // 4 * x * y^2
+        let t2 = fp_add(&t, &t); // 4 * x * y^2
 
         let x3 = fp_sub(&fp_sqr(&m), &fp_add(&t2, &t2)); // m^2 - 8*x*y^2
 
-        let y2_4 = fp_add(&s, &s);  // 2*y^2
-        let y4_8 = fp_sqr(&y2_4);   // 4*y^4
+        let y2_4 = fp_add(&s, &s); // 2*y^2
+        let y4_8 = fp_sqr(&y2_4); // 4*y^4
         let y4_8_2 = fp_add(&y4_8, &y4_8); // 8*y^4
 
         let y3 = fp_sub(&fp_mul(&m, &fp_sub(&t2, &x3)), &y4_8_2);
 
         let z3 = fp_mul(&fp_add(&self.y, &self.y), &self.z);
 
-        JacobianPoint { x: x3, y: y3, z: z3 }
+        JacobianPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
     }
 
     /// Point addition (mixed: Q is affine with Z=1).
@@ -825,7 +870,11 @@ impl JacobianPoint {
         let x3 = fp_sub(&fp_sub(&fp_sqr(&r), &hhh), &fp_add(&v, &v));
         let y3 = fp_sub(&fp_mul(&r, &fp_sub(&v, &x3)), &fp_mul(&self.y, &hhh));
         let z3 = fp_mul(&self.z, &h);
-        let generic = JacobianPoint { x: x3, y: y3, z: z3 };
+        let generic = JacobianPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        };
 
         let h_zero = ct_is_zero_u256(&h);
         let r_zero = ct_is_zero_u256(&r);
@@ -870,7 +919,11 @@ impl JacobianPoint {
         let x3 = fp_sub(&fp_sub(&fp_sqr(&r), &hhh), &fp_add(&v, &v));
         let y3 = fp_sub(&fp_mul(&r, &fp_sub(&v, &x3)), &fp_mul(&s1, &hhh));
         let z3 = fp_mul(&fp_mul(&self.z, &other.z), &h);
-        let generic = JacobianPoint { x: x3, y: y3, z: z3 };
+        let generic = JacobianPoint {
+            x: x3,
+            y: y3,
+            z: z3,
+        };
 
         let h_zero = ct_is_zero_u256(&h);
         let r_zero = ct_is_zero_u256(&r);
@@ -953,7 +1006,11 @@ fn ct_lookup_table_16(table: &[JacobianPoint; 16], idx: usize) -> JacobianPoint 
         out_z = ct_select_u256(&out_z, &entry.z, mask);
         i += 1;
     }
-    JacobianPoint { x: out_x, y: out_y, z: out_z }
+    JacobianPoint {
+        x: out_x,
+        y: out_y,
+        z: out_z,
+    }
 }
 
 /// Scalar multiplication via fixed-window w=4 with constant-time
@@ -1008,17 +1065,28 @@ fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
     // table[2k+1] = table[2k] + P
     let p_jac = JacobianPoint::from_affine(px, py);
     let id = JacobianPoint::identity();
-    let p_clone = JacobianPoint { x: p_jac.x, y: p_jac.y, z: p_jac.z };
+    let p_clone = JacobianPoint {
+        x: p_jac.x,
+        y: p_jac.y,
+        z: p_jac.z,
+    };
     let mut table: [JacobianPoint; 16] = [
         id,
         p_clone,
-        JacobianPoint::identity(), JacobianPoint::identity(),
-        JacobianPoint::identity(), JacobianPoint::identity(),
-        JacobianPoint::identity(), JacobianPoint::identity(),
-        JacobianPoint::identity(), JacobianPoint::identity(),
-        JacobianPoint::identity(), JacobianPoint::identity(),
-        JacobianPoint::identity(), JacobianPoint::identity(),
-        JacobianPoint::identity(), JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
+        JacobianPoint::identity(),
     ];
     let mut i = 2;
     while i < 16 {
@@ -1103,8 +1171,16 @@ pub struct ScalarMulState {
 impl ScalarMulState {
     pub const fn empty() -> Self {
         Self {
-            r0: JacobianPoint { x: ZERO, y: ZERO, z: ZERO },
-            r1: JacobianPoint { x: ZERO, y: ZERO, z: ZERO },
+            r0: JacobianPoint {
+                x: ZERO,
+                y: ZERO,
+                z: ZERO,
+            },
+            r1: JacobianPoint {
+                x: ZERO,
+                y: ZERO,
+                z: ZERO,
+            },
             k: ZERO,
             bit_index: -1,
             bits_per_step: 0,
@@ -1119,7 +1195,11 @@ impl ScalarMulState {
         let p_jac = JacobianPoint::from_affine(px, py);
         Self {
             r0: JacobianPoint::identity(),
-            r1: JacobianPoint { x: p_jac.x, y: p_jac.y, z: p_jac.z },
+            r1: JacobianPoint {
+                x: p_jac.x,
+                y: p_jac.y,
+                z: p_jac.z,
+            },
             k: *k,
             bit_index: 255,
             bits_per_step,
@@ -1128,7 +1208,10 @@ impl ScalarMulState {
     }
 
     /// Initialise for `k * G`.
-    #[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+    #[allow(
+        dead_code,
+        reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+    )]
     pub fn new_base(k: &U256, bits_per_step: u8) -> Self {
         let gx = load_gx();
         let gy = load_gy();
@@ -1179,7 +1262,11 @@ impl ScalarMulState {
         reason = "p256.rs is path-mounted into PIC modules; private JacobianPoint matches the file's internal-only consumers"
     )]
     pub fn result(&self) -> JacobianPoint {
-        JacobianPoint { x: self.r0.x, y: self.r0.y, z: self.r0.z }
+        JacobianPoint {
+            x: self.r0.x,
+            y: self.r0.y,
+            z: self.r0.z,
+        }
     }
 
     /// Zeroise the secret scalar via volatile writes. Call once the result
@@ -1361,14 +1448,18 @@ pub fn ecdsa_sign_finalise(mut state: EcdsaSignState) -> [u8; 64] {
 fn u256_from_be(bytes: &[u8]) -> U256 {
     // Input: 32 bytes big-endian
     let mut r = [0u64; 4];
-    r[3] = u64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                bytes[4], bytes[5], bytes[6], bytes[7]]);
-    r[2] = u64::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11],
-                                bytes[12], bytes[13], bytes[14], bytes[15]]);
-    r[1] = u64::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19],
-                                bytes[20], bytes[21], bytes[22], bytes[23]]);
-    r[0] = u64::from_be_bytes([bytes[24], bytes[25], bytes[26], bytes[27],
-                                bytes[28], bytes[29], bytes[30], bytes[31]]);
+    r[3] = u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    r[2] = u64::from_be_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+    ]);
+    r[1] = u64::from_be_bytes([
+        bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+    ]);
+    r[0] = u64::from_be_bytes([
+        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+    ]);
     r
 }
 
@@ -1609,12 +1700,16 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
     if hash.len() >= 32 {
         // SAFETY: pointer arithmetic over fixed-size P-256 field elements
         // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr(), 32); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr(), 32);
+        }
     } else {
         let offset = 32 - hash.len();
         // SAFETY: pointer arithmetic over fixed-size P-256 field elements
         // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr().add(offset), hash.len()); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(hash.as_ptr(), h1.as_mut_ptr().add(offset), hash.len());
+        }
     }
 
     // Step a: h1 = Hash(message) — already have it
@@ -1625,8 +1720,8 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
 
     // Step d: K = HMAC(K, V || 0x00 || private_key || h1)
     let mut msg_d = [0u8; 32 + 1 + 32 + 32]; // V(32) + 0x00(1) + x(32) + h1(32) = 97
-    // SAFETY: pointer arithmetic over fixed-size P-256 field elements
-    // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
+                                             // SAFETY: pointer arithmetic over fixed-size P-256 field elements
+                                             // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
         core::ptr::copy_nonoverlapping(v.as_ptr(), msg_d.as_mut_ptr(), 32);
     }
@@ -1692,7 +1787,9 @@ fn rfc6979_nonce(private_key: &[u8; 32], hash: &[u8]) -> U256 {
         let mut retry = [0u8; 33];
         // SAFETY: pointer arithmetic over fixed-size P-256 field elements
         // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-        unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), retry.as_mut_ptr(), 32); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(v.as_ptr(), retry.as_mut_ptr(), 32);
+        }
         retry[32] = 0x00;
         {
             let mut tmp = [0u8; 32];
@@ -1731,7 +1828,13 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
         let mut buf = [0u8; 32];
         // SAFETY: pointer arithmetic over fixed-size P-256 field elements
         // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), buf.as_mut_ptr().add(32 - hash.len()), hash.len()); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                hash.as_ptr(),
+                buf.as_mut_ptr().add(32 - hash.len()),
+                hash.len(),
+            );
+        }
         u256_from_be(&buf)
     };
     let z = mod_n_reduce(&z);
@@ -1767,7 +1870,9 @@ pub fn ecdsa_sign(private_key: &[u8; 32], hash: &[u8], _random_k: &[u8; 32]) -> 
 /// ECDSA verify: check (r, s) over message hash with public key
 /// sig: 64 bytes (r || s), pub_key: 65 bytes (0x04 || X || Y)
 pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
-    if sig.len() < 64 { return false; }
+    if sig.len() < 64 {
+        return false;
+    }
     // The public point is an untrusted input here exactly as it is in
     // ECDH: an off-curve Q makes `scalar_mul` operate in a group that
     // is not P-256, and the verification equation can then be
@@ -1782,9 +1887,15 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
 
     // Check r, s in [1, n-1]
     let n = load_n();
-    if u256_is_zero(&r) || u256_is_zero(&s) { return false; }
-    if u256_gte(&r, &n) != 0 { return false; }
-    if u256_gte(&s, &n) != 0 { return false; }
+    if u256_is_zero(&r) || u256_is_zero(&s) {
+        return false;
+    }
+    if u256_gte(&r, &n) != 0 {
+        return false;
+    }
+    if u256_gte(&s, &n) != 0 {
+        return false;
+    }
 
     let z = if hash.len() >= 32 {
         u256_from_be(&hash[..32])
@@ -1792,7 +1903,13 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
         let mut buf = [0u8; 32];
         // SAFETY: pointer arithmetic over fixed-size P-256 field elements
         // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-        unsafe { core::ptr::copy_nonoverlapping(hash.as_ptr(), buf.as_mut_ptr().add(32 - hash.len()), hash.len()); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                hash.as_ptr(),
+                buf.as_mut_ptr().add(32 - hash.len()),
+                hash.len(),
+            );
+        }
         u256_from_be(&buf)
     };
     let z = mod_n_reduce(&z);
@@ -1809,7 +1926,9 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     let (p2x, p2y) = p2.to_affine();
     let sum = p1.add_affine(&p2x, &p2y);
 
-    if sum.is_identity() { return false; }
+    if sum.is_identity() {
+        return false;
+    }
     let (rx, _) = sum.to_affine();
     let rx_mod_n = mod_n_reduce(&rx);
 
@@ -1834,17 +1953,27 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
 /// parser hands an attacker a family of distinct byte strings for one
 /// signature.
 pub fn parse_der_signature(der: &[u8]) -> Option<[u8; 64]> {
-    if der.len() < 8 { return None; }
-    if der[0] != 0x30 { return None; }
+    if der.len() < 8 {
+        return None;
+    }
+    if der[0] != 0x30 {
+        return None;
+    }
     let seq_len = der[1] as usize;
-    if seq_len >= 0x80 { return None; } // long form is never minimal here
-    if 2 + seq_len != der.len() { return None; } // trailing bytes
+    if seq_len >= 0x80 {
+        return None;
+    } // long form is never minimal here
+    if 2 + seq_len != der.len() {
+        return None;
+    } // trailing bytes
 
     let mut pos = 2;
 
     let r_bytes = parse_der_positive_int(der, &mut pos)?;
     let s_bytes = parse_der_positive_int(der, &mut pos)?;
-    if pos != der.len() { return None; } // extra SEQUENCE members
+    if pos != der.len() {
+        return None;
+    } // extra SEQUENCE members
 
     // Convert to fixed 32-byte big-endian
     let mut sig = [0u8; 64];
@@ -1855,18 +1984,30 @@ pub fn parse_der_signature(der: &[u8]) -> Option<[u8; 64]> {
 
 /// Read one minimally encoded, positive DER INTEGER, advancing `pos`.
 fn parse_der_positive_int<'a>(der: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
-    if *pos + 2 > der.len() || der[*pos] != 0x02 { return None; }
+    if *pos + 2 > der.len() || der[*pos] != 0x02 {
+        return None;
+    }
     let len = der[*pos + 1] as usize;
-    if len == 0 || len >= 0x80 { return None; }
+    if len == 0 || len >= 0x80 {
+        return None;
+    }
     let start = *pos + 2;
-    if start + len > der.len() { return None; }
+    if start + len > der.len() {
+        return None;
+    }
     let body = &der[start..start + len];
     // Negative values are not valid for r or s.
-    if body[0] & 0x80 != 0 { return None; }
+    if body[0] & 0x80 != 0 {
+        return None;
+    }
     // A leading zero is permitted only to clear the next byte's sign bit.
-    if len > 1 && body[0] == 0 && body[1] & 0x80 == 0 { return None; }
+    if len > 1 && body[0] == 0 && body[1] & 0x80 == 0 {
+        return None;
+    }
     // r and s are at most 32 bytes, plus one optional sign byte.
-    if len > 33 { return None; }
+    if len > 33 {
+        return None;
+    }
     *pos = start + len;
     Some(body)
 }
@@ -1879,15 +2020,24 @@ fn copy_be_padded(src: &[u8], dst: &mut [u8]) {
         start += 1;
     }
     let effective = &src[start..];
-    if effective.len() > dst.len() { return; }
+    if effective.len() > dst.len() {
+        return;
+    }
     let offset = dst.len() - effective.len();
     // Zero-fill prefix
     let mut i = 0;
-    while i < offset { dst[i] = 0; i += 1; }
+    while i < offset {
+        dst[i] = 0;
+        i += 1;
+    }
     // SAFETY: pointer arithmetic over fixed-size P-256 field elements
     // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
     unsafe {
-        core::ptr::copy_nonoverlapping(effective.as_ptr(), dst.as_mut_ptr().add(offset), effective.len());
+        core::ptr::copy_nonoverlapping(
+            effective.as_ptr(),
+            dst.as_mut_ptr().add(offset),
+            effective.len(),
+        );
     }
 }
 
@@ -1896,33 +2046,49 @@ pub fn encode_der_signature(sig: &[u8; 64]) -> ([u8; 72], usize) {
     let mut out = [0u8; 72];
     let mut pos = 0;
 
-    out[pos] = 0x30; pos += 1; // SEQUENCE
-    let len_pos = pos; pos += 1; // length placeholder
+    out[pos] = 0x30;
+    pos += 1; // SEQUENCE
+    let len_pos = pos;
+    pos += 1; // length placeholder
 
     // Encode r
-    out[pos] = 0x02; pos += 1; // INTEGER
+    out[pos] = 0x02;
+    pos += 1; // INTEGER
     let r_start = skip_leading_zeros(&sig[..32]);
     let r_data = &sig[r_start..32];
     let needs_pad_r = !r_data.is_empty() && r_data[0] >= 0x80;
     let r_enc_len = r_data.len() + if needs_pad_r { 1 } else { 0 };
-    out[pos] = r_enc_len as u8; pos += 1;
-    if needs_pad_r { out[pos] = 0; pos += 1; }
+    out[pos] = r_enc_len as u8;
+    pos += 1;
+    if needs_pad_r {
+        out[pos] = 0;
+        pos += 1;
+    }
     // SAFETY: pointer arithmetic over fixed-size P-256 field elements
     // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-    unsafe { core::ptr::copy_nonoverlapping(r_data.as_ptr(), out.as_mut_ptr().add(pos), r_data.len()); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(r_data.as_ptr(), out.as_mut_ptr().add(pos), r_data.len());
+    }
     pos += r_data.len();
 
     // Encode s
-    out[pos] = 0x02; pos += 1;
+    out[pos] = 0x02;
+    pos += 1;
     let s_start = skip_leading_zeros(&sig[32..64]);
     let s_data = &sig[32 + s_start..64];
     let needs_pad_s = !s_data.is_empty() && s_data[0] >= 0x80;
     let s_enc_len = s_data.len() + if needs_pad_s { 1 } else { 0 };
-    out[pos] = s_enc_len as u8; pos += 1;
-    if needs_pad_s { out[pos] = 0; pos += 1; }
+    out[pos] = s_enc_len as u8;
+    pos += 1;
+    if needs_pad_s {
+        out[pos] = 0;
+        pos += 1;
+    }
     // SAFETY: pointer arithmetic over fixed-size P-256 field elements
     // (32 bytes / 8 u32 limbs); offsets bounded by loop invariant.
-    unsafe { core::ptr::copy_nonoverlapping(s_data.as_ptr(), out.as_mut_ptr().add(pos), s_data.len()); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(s_data.as_ptr(), out.as_mut_ptr().add(pos), s_data.len());
+    }
     pos += s_data.len();
 
     out[len_pos] = (pos - 2) as u8;
@@ -1931,6 +2097,8 @@ pub fn encode_der_signature(sig: &[u8; 64]) -> ([u8; 72], usize) {
 
 fn skip_leading_zeros(data: &[u8]) -> usize {
     let mut i = 0;
-    while i < data.len() - 1 && data[i] == 0 { i += 1; }
+    while i < data.len() - 1 && data[i] == 0 {
+        i += 1;
+    }
     i
 }

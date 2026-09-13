@@ -12,17 +12,17 @@ pub const CMD_PREFIX: [u8; 2] = [0x57, 0xAB];
 // Configuration command codes (sent after CMD_PREFIX)
 pub const CMD_GET_VERSION: u8 = 0x01;
 pub const CMD_RESET: u8 = 0x02;
-pub const CMD_SET_MODE: u8 = 0x10;       // arg: 1 byte (0-3)
-pub const CMD_SET_LOCAL_IP: u8 = 0x11;    // arg: 4 bytes
-pub const CMD_SET_SUBNET: u8 = 0x12;      // arg: 4 bytes
-pub const CMD_SET_GATEWAY: u8 = 0x13;     // arg: 4 bytes
-pub const CMD_SET_LOCAL_PORT: u8 = 0x14;  // arg: 2 bytes LE
-pub const CMD_SET_DEST_IP: u8 = 0x15;     // arg: 4 bytes
-pub const CMD_SET_DEST_PORT: u8 = 0x16;   // arg: 2 bytes LE
-pub const CMD_SET_BAUD: u8 = 0x21;        // arg: 4 bytes LE
-pub const CMD_SET_DHCP: u8 = 0x33;        // arg: 1 byte (0=off, 1=on)
-pub const CMD_SAVE: u8 = 0x0D;            // Save params to EEPROM
-pub const CMD_EXEC: u8 = 0x0E;            // Execute config and soft-reset
+pub const CMD_SET_MODE: u8 = 0x10; // arg: 1 byte (0-3)
+pub const CMD_SET_LOCAL_IP: u8 = 0x11; // arg: 4 bytes
+pub const CMD_SET_SUBNET: u8 = 0x12; // arg: 4 bytes
+pub const CMD_SET_GATEWAY: u8 = 0x13; // arg: 4 bytes
+pub const CMD_SET_LOCAL_PORT: u8 = 0x14; // arg: 2 bytes LE
+pub const CMD_SET_DEST_IP: u8 = 0x15; // arg: 4 bytes
+pub const CMD_SET_DEST_PORT: u8 = 0x16; // arg: 2 bytes LE
+pub const CMD_SET_BAUD: u8 = 0x21; // arg: 4 bytes LE
+pub const CMD_SET_DHCP: u8 = 0x33; // arg: 1 byte (0=off, 1=on)
+pub const CMD_SAVE: u8 = 0x0D; // Save params to EEPROM
+pub const CMD_EXEC: u8 = 0x0E; // Execute config and soft-reset
 
 // ============================================================================
 // Network Mode Values

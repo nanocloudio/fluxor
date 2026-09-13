@@ -75,7 +75,6 @@ mod mux;
 /// fits and a short read can never present as a truncated message.
 const BUF: usize = 8192;
 
-
 /// Answer accepted streams.
 const ROLE_ECHO: u8 = 0;
 /// Open a stream, probe it, and verify the reply.
@@ -348,7 +347,6 @@ unsafe fn echo_stream(s: &mut EchoState, body: usize, plen: usize) {
     dev_log(sys, 3, line.as_ptr(), 18 + n);
 }
 
-
 // ── Driver role ────────────────────────────────────────────────────────────
 
 /// Ask the transport for a stream, then keep asking until it answers.
@@ -380,8 +378,7 @@ unsafe fn drive(s: &mut EchoState) {
 /// Handle a frame in driver role: latch the stream id, then check the echo.
 unsafe fn driver_frame(s: &mut EchoState, t: u8, body: usize, plen: usize) {
     let sys = &*s.syscalls;
-    if t == mux::MSG_MUX_STREAM_OPENED
-        && plen >= mux::STREAM_DATA_PREFIX + mux::STREAM_OPENED_BODY
+    if t == mux::MSG_MUX_STREAM_OPENED && plen >= mux::STREAM_DATA_PREFIX + mux::STREAM_OPENED_BODY
     {
         // A refused open is answered too, with STATUS_NO_CAPACITY and no
         // usable handle. Treating that as success would write the probe

@@ -1,4 +1,4 @@
-# The `cli` stack (rfc_cli_execution.md §4.3): one line — `platform: { cli: {} }`
+# The `cli` stack: one line — `platform: { cli: {} }`
 # — turns a graph into a CLI on Linux. Injects the built-in host I/O surface;
 # the app graph wires whichever ports it uses (unused wires drop in the
 # two-pass expansion):

@@ -3,8 +3,7 @@
 //! References:
 //!   - CYW43439 datasheet (Infineon)
 //!   - gSPI Application Note (AN214654)
-//!   - cyw43 crate (embassy-rs) for register map
-
+//!   - the cyw43-driver (Georgerobotics) for the register map
 
 // ============================================================================
 // gSPI Command Word
@@ -68,7 +67,7 @@ pub const BUS_CTRL_WAKE_UP: u32 = 0x80;
 /// Combined bus config for init (written as 32-bit to addr 0 in 16-bit swapped mode).
 /// byte0 = CTRL (0xB1: 32bit + HS + int_polarity_high + wake)
 /// byte1 = RESPONSE_DELAY (0x04)
-/// byte2 = STATUS_ENABLE (0x03 = status_enable + intr_with_status) — matches Embassy exactly
+/// byte2 = STATUS_ENABLE (0x03 = status_enable + intr_with_status)
 /// byte3 = 0x00
 pub const BUS_CONFIG_INIT: u32 = 0x000304B1;
 
@@ -97,7 +96,7 @@ pub const STATUS_F2_PKT_LEN_MASK: u32 = 0x7FF;
 
 /// F3 (BT) packet status — mirrors F2 layout in upper half of status register
 pub const STATUS_F3_PKT_AVAILABLE: u32 = 0x00100000; // bit 20
-pub const STATUS_F3_PKT_LEN_SHIFT: u32 = 21;         // bits [31:21]
+pub const STATUS_F3_PKT_LEN_SHIFT: u32 = 21; // bits [31:21]
 pub const STATUS_F3_PKT_LEN_MASK: u32 = 0x7FF;
 
 // ============================================================================
@@ -109,7 +108,7 @@ pub const REG_BP_WIN: u32 = 0x1000A;
 /// Backplane window mask (windows are 32KB aligned)
 pub const BP_WIN_MASK: u32 = 0x7FFF;
 pub const BP_WIN_SIZE: u32 = 0x8000;
-/// Flag OR'd into backplane address for 32-bit reads (Embassy: BACKPLANE_32BIT_FLAG)
+/// Flag OR'd into backplane address for 32-bit reads
 pub const BP_32BIT_FLAG: u32 = 0x8000;
 
 /// ALP (Active Low Power) clock enable
@@ -168,13 +167,13 @@ pub const AI_RESETCTRL_OFFSET: u32 = 0x800;
 
 /// AI IOCTRL register bits
 pub const AI_IOCTRL_BIT_CLOCK_EN: u8 = 0x01;
-pub const AI_IOCTRL_BIT_FGC: u8 = 0x02;      // Force Gated Clocks
+pub const AI_IOCTRL_BIT_FGC: u8 = 0x02; // Force Gated Clocks
 
 /// AI RESETCTRL register bits
 pub const AI_RESETCTRL_BIT_RESET: u8 = 0x01;
 
 /// Wrapper base addresses (core base + WRAPPER_REGISTER_OFFSET)
-/// These are what Embassy uses for core_disable / core_reset operations.
+/// Used for core_disable / core_reset operations.
 pub const WLAN_WRAPPER_BASE: u32 = ARMCM3_BASE + WRAPPER_REGISTER_OFFSET; // 0x18103000
 pub const SOCSRAM_WRAPPER_BASE: u32 = SOCSRAM_BASE + WRAPPER_REGISTER_OFFSET; // 0x18104000
 
@@ -299,15 +298,15 @@ pub const SCAN_RESULT_SIZE: usize = 36;
 pub const ESCAN_RESULT_HDR_LEN: usize = 12;
 
 /// wl_bss_info_t field offsets (from start of bss_info, after escan header)
-/// Layout matches Embassy BssInfo (#[repr(C, packed(2))]):
+/// Layout of the firmware's BSS info record (packed to 2):
 ///   version(u32)=0, length(u32)=4, bssid([u8;6])=8, beacon_period(u16)=14,
 ///   capability(u16)=16, ssid_len(u8)=18, ssid([u8;32])=19, reserved1(1)=51,
 ///   rateset_count(u32)=52, rates([u8;16])=56, chanspec(u16)=72,
 ///   atim_window(u16)=74, dtim_period(u8)=76, reserved2(1)=77, rssi(i16)=78
-pub const BSS_SSID_LEN_OFF: usize = 18;   // u8
-pub const BSS_SSID_OFF: usize = 19;       // [u8; 32]
-pub const BSS_CHANSPEC_OFF: usize = 72;   // u16 LE (channel = lower byte)
-pub const BSS_RSSI_OFF: usize = 78;       // i16 LE
+pub const BSS_SSID_LEN_OFF: usize = 18; // u8
+pub const BSS_SSID_OFF: usize = 19; // [u8; 32]
+pub const BSS_CHANSPEC_OFF: usize = 72; // u16 LE (channel = lower byte)
+pub const BSS_RSSI_OFF: usize = 78; // i16 LE
 
 // ============================================================================
 // Firmware Constants
@@ -332,7 +331,7 @@ pub const CLM_CHUNK_LEN_MAX: usize = 1400;
 
 /// PIO program for CYW43 gSPI half-duplex communication.
 ///
-/// Bit-level TX then bit-level RX, matching Embassy's cyw43-pio low-speed
+/// Bit-level TX then bit-level RX, mirroring the pico-sdk's low-speed gSPI
 /// program exactly. The host controls each transfer via forced instructions:
 ///   - set_x(write_bits): total TX bits - 1
 ///   - set_y(read_bits): total RX bits - 1
@@ -354,20 +353,13 @@ pub const CLM_CHUNK_LEN_MAX: usize = 1400;
 pub const GSPI_PIO_PROGRAM: [u16; 8] = [
     // .wrap_target
     //  0: out pins, 1    side 0       ; shift out 1 TX bit, CLK low
-    0x6001,
-    //  1: jmp x-- 0      side 1       ; CLK high, loop X+1 times
-    0x1040,
-    //  2: set pindirs, 0 side 0       ; turnaround — DIO input
-    0xE080,
-    //  3: nop            side 0       ; turnaround delay
-    0xA042,
-    //  4: in pins, 1     side 1       ; sample 1 RX bit, CLK high
-    0x5001,
-    //  5: jmp y-- 4      side 0       ; CLK low, loop Y+1 times
-    0x0084,
-    //  6: wait 1 pin 0   side 0       ; wait for CYW43 event on DIO
-    0x2080,
-    //  7: irq 0          side 0       ; signal host
+    0x6001, //  1: jmp x-- 0      side 1       ; CLK high, loop X+1 times
+    0x1040, //  2: set pindirs, 0 side 0       ; turnaround — DIO input
+    0xE080, //  3: nop            side 0       ; turnaround delay
+    0xA042, //  4: in pins, 1     side 1       ; sample 1 RX bit, CLK high
+    0x5001, //  5: jmp y-- 4      side 0       ; CLK low, loop Y+1 times
+    0x0084, //  6: wait 1 pin 0   side 0       ; wait for CYW43 event on DIO
+    0x2080, //  7: irq 0          side 0       ; signal host
     0xC000,
     // .wrap
 ];
@@ -451,7 +443,7 @@ pub const WLC_E_ESCAN_RESULT: u32 = 69;
 ///                  + event_type(4 BE) + flags(2 BE) + status(4 BE) + reason(4 BE)
 pub const EVT_ETH_HDR_LEN: usize = 14;
 pub const EVT_MSG_PREAMBLE: usize = 10; // bytes before event_type field
-pub const EVT_MSG_MIN_LEN: usize = 48;  // full EventMessage struct
+pub const EVT_MSG_MIN_LEN: usize = 48; // full EventMessage struct
 
 // ============================================================================
 // Netif Constants
@@ -477,7 +469,7 @@ pub const GSPI_RESPONSE_DELAY: u32 = 4;
 pub const GSPI_SKIP_WORDS_BUS: usize = 1;
 pub const GSPI_SKIP_WORDS_WLAN: usize = 0;
 
-/// Extra status word appended after payload (always 1, matching Embassy).
+/// Extra status word appended after payload (always 1).
 pub const GSPI_STATUS_WORDS: usize = 1;
 
 /// Maximum frame size
@@ -485,7 +477,7 @@ pub const MAX_FRAME_SIZE: usize = 1536;
 
 /// Clock divider for 25MHz gSPI (system clock 150MHz / 3 = 50MHz PIO, 2 PIO cycles/bit)
 /// 8.8 fixed-point format: 3.0 = 0x0300
-/// Matches Embassy's RM2_CLOCK_DIVIDER.
+/// The divider for the RM2 module's gSPI clock.
 /// PIO infrastructure shifts left 8 to build register value.
 pub const DEFAULT_CLOCK_DIV: u32 = 0x0300;
 
@@ -495,7 +487,7 @@ pub const DEFAULT_CLOCK_DIV: u32 = 0x0300;
 
 /// NVRAM key=value pairs for the CYW43439 firmware.
 /// Null-separated entries, double-null terminated.
-/// Matches Embassy's cyw43/src/nvram.rs exactly.
+/// The Pico W / Pico 2 W NVRAM, as the pico-sdk ships it.
 pub static NVRAM: &[u8] = b"\
 NVRAMRev=$Rev$\x00\
 manfid=0x2d0\x00\

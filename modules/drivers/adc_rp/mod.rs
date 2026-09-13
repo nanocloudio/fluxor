@@ -12,7 +12,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -63,14 +62,17 @@ struct AdcState {
     step_count: u32,
 }
 
-use abi::platform::rp::adc_raw::{REG_WRITE as ADC_REG_WRITE, REG_READ as ADC_REG_READ};
+use abi::platform::rp::adc_raw::{REG_READ as ADC_REG_READ, REG_WRITE as ADC_REG_WRITE};
 
 unsafe fn adc_reg_write(sys: &SyscallTable, offset: u8, val: u32) {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
     let v = val.to_le_bytes();
-    *bp.add(1) = v[0]; *bp.add(2) = v[1]; *bp.add(3) = v[2]; *bp.add(4) = v[3];
+    *bp.add(1) = v[0];
+    *bp.add(2) = v[1];
+    *bp.add(3) = v[2];
+    *bp.add(4) = v[3];
     (sys.provider_call)(-1, ADC_REG_WRITE, bp, 5);
 }
 
@@ -97,7 +99,11 @@ const ADC_POLL: u32 = 0x0E03;
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn adc_dispatch(
-    state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize,
+    state: *mut u8,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
 ) -> i32 {
     let s = &mut *(state as *mut AdcState);
     let sys = &*s.syscalls;
@@ -105,9 +111,13 @@ pub unsafe extern "C" fn adc_dispatch(
     match opcode {
         ADC_OPEN => {
             // arg=[channel:u8] (1 byte). Channel 0-3=GPIO26-29, 4=temp sensor.
-            if arg.is_null() || arg_len < 1 { return -22; }
+            if arg.is_null() || arg_len < 1 {
+                return -22;
+            }
             let ch = *arg;
-            if ch > 4 { return -22; }
+            if ch > 4 {
+                return -22;
+            }
 
             // Init ADC hardware on first open
             if s.initialized == 0 {
@@ -118,7 +128,12 @@ pub unsafe extern "C" fn adc_dispatch(
             // Init pin for GPIO channels
             if ch < 4 {
                 let mut pin_buf = [26 + ch];
-                (sys.provider_call)(-1, abi::platform::rp::adc_raw::PIN_INIT, pin_buf.as_mut_ptr(), 1);
+                (sys.provider_call)(
+                    -1,
+                    abi::platform::rp::adc_raw::PIN_INIT,
+                    pin_buf.as_mut_ptr(),
+                    1,
+                );
             }
 
             let mut i = 0usize;
@@ -137,16 +152,22 @@ pub unsafe extern "C" fn adc_dispatch(
         }
         ADC_CLOSE => {
             let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if idx >= MAX_HANDLES {
+                return -22;
+            }
             (*s.handles.as_mut_ptr().add(idx)).in_use = 0;
             0
         }
         ADC_READ => {
             // Start single-shot conversion
             let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if idx >= MAX_HANDLES {
+                return -22;
+            }
             let tp = s.transfers.as_mut_ptr().add(idx);
-            if (*tp).active != 0 { return -16; }
+            if (*tp).active != 0 {
+                return -16;
+            }
 
             let ch = (*s.handles.as_ptr().add(idx)).channel;
             // Select channel and start conversion
@@ -158,9 +179,13 @@ pub unsafe extern "C" fn adc_dispatch(
         }
         ADC_POLL => {
             let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if idx >= MAX_HANDLES {
+                return -22;
+            }
             let tp = s.transfers.as_mut_ptr().add(idx);
-            if (*tp).active == 0 { return (*tp).result; }
+            if (*tp).active == 0 {
+                return (*tp).result;
+            }
 
             // Check if conversion is done
             let cs = adc_reg_read(sys, ADC_CS);
@@ -178,11 +203,15 @@ pub unsafe extern "C" fn adc_dispatch(
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { core::mem::size_of::<AdcState>() }
+pub extern "C" fn module_state_size() -> usize {
+    core::mem::size_of::<AdcState>()
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
@@ -191,16 +220,27 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+    in_chan: i32,
+    out_chan: i32,
+    ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<AdcState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<AdcState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut AdcState);
         s.syscalls = syscalls as *const SyscallTable;
-        s.in_chan = in_chan; s.out_chan = out_chan; s.ctrl_chan = ctrl_chan;
+        s.in_chan = in_chan;
+        s.out_chan = out_chan;
+        s.ctrl_chan = ctrl_chan;
 
         let sys = &*s.syscalls;
         dev_log(sys, 3, b"[adc] ready".as_ptr(), 10);

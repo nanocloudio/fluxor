@@ -181,4 +181,3 @@ unsafe extern "C" fn wasm_provider_call_sel(
 // passes `&WASM_SYSCALLS` to the module's `module_new`. On native
 // targets the kernel passes its own `SyscallTable` pointer. Same
 // source on both targets.
-

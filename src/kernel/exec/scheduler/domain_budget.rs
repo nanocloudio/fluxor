@@ -6,8 +6,8 @@
 )]
 use super::*;
 
-/// Whether a module in `domain_id` reported useful work this outer tick (§6
-/// work signal). Read by the pacer's busy rule and exposed for observability /
+/// Whether a module in `domain_id` reported useful work this outer tick (the
+/// pacer's work signal). Read by the pacer's busy rule and exposed for observability /
 /// conformance tests. Resets once per outer tick.
 pub fn domain_pacer_work_pending(domain_id: usize) -> bool {
     PACER_WORK_TICK
@@ -81,6 +81,33 @@ const BUDGET_HARD_BREAK_MULTIPLIER: u64 = 10;
 /// module can't spin the tick.
 pub(crate) const MAX_PIPELINE_PASSES: u32 = 12;
 
+/// Whether a domain can afford another pipeline pass this tick.
+///
+/// A pass is re-run while modules report backlog, and a re-run costs about
+/// what the pass before it did. Starting one with less than that left
+/// overruns the budget by construction: the overrun is then charged to
+/// whichever module closed the pass, but the cause was admitting the pass.
+/// So a pass is admitted only when another of the same cost still fits.
+/// `pass_start_us` is the domain's consumption when the pass just finished
+/// began.
+#[inline]
+pub(crate) fn domain_budget_admits_repass(
+    sched: &SchedulerState,
+    domain_id: usize,
+    pass_start_us: u64,
+) -> bool {
+    if domain_id >= MAX_DOMAINS {
+        return true;
+    }
+    let limit = sched.domain_budget_us_limit[domain_id] as u64;
+    if limit == 0 {
+        return true;
+    }
+    let consumed = sched.domain_budget_us_consumed[domain_id];
+    let last_pass = consumed.saturating_sub(pass_start_us);
+    consumed.saturating_add(last_pass) <= limit
+}
+
 #[inline]
 pub(crate) fn domain_budget_hard_overrun(sched: &SchedulerState, domain_id: usize) -> bool {
     if domain_id >= MAX_DOMAINS {
@@ -115,13 +142,48 @@ pub(crate) fn record_domain_budget_overrun(
             core::ptr::addr_of_mut!(MON_OVERRUN_SUP),
         )
     } {
+        // The three modules of this domain that consumed the most of the
+        // pass, as `index:µs/steps`.
+        const TOP: usize = 3;
+        let mut top = [(u32::MAX, 0u32, 0u16); TOP];
+        for i in 0..MAX_MODULES {
+            let us = sched.pass_module_us[i];
+            if us == 0 || sched.domain_id[i] as usize != domain_id {
+                continue;
+            }
+            let entry = (i as u32, us, sched.pass_module_steps[i]);
+            for slot in 0..TOP {
+                if top[slot].0 == u32::MAX || us > top[slot].1 {
+                    top.copy_within(slot..TOP - 1, slot + 1);
+                    top[slot] = entry;
+                    break;
+                }
+            }
+        }
+        let cell = |t: (u32, u32, u16)| {
+            if t.0 == u32::MAX {
+                (0u32, 0u32, 0u16)
+            } else {
+                t
+            }
+        };
+        let (a, b, c) = (cell(top[0]), cell(top[1]), cell(top[2]));
         log::warn!(
             "MON_BUDGET_OVERRUN domain={} consumed_us={} limit_us={} \
-             last_mod={} overrun_count={} tick={} suppressed={}",
+             last_mod={} top={}:{}/{},{}:{}/{},{}:{}/{} overrun_count={} tick={} suppressed={}",
             domain_id,
             sched.domain_budget_us_consumed[domain_id],
             sched.domain_budget_us_limit[domain_id],
             last_module_idx,
+            a.0,
+            a.1,
+            a.2,
+            b.0,
+            b.1,
+            b.2,
+            c.0,
+            c.1,
+            c.2,
             sched.domain_budget_overruns[domain_id],
             // SAFETY: DBG_TICK aligned u32 read.
             unsafe { DBG_TICK },
@@ -155,7 +217,7 @@ pub fn domain_pre_tick_overruns(domain_id: usize) -> u32 {
 /// Diagnostic accessor — number of Tier 1c pre-tick modules
 /// currently assigned to `domain_id`. Returns 0 for invalid
 /// `domain_id`. Used by `tools/tests/scheduler_pre_tick_slot.rs`
-/// (the Step 4-7 drift guard) to confirm `pre_tick_drain` modules
+/// (the pre-tick slot drift guard) to confirm `pre_tick_drain` modules
 /// route to the pre-tick list and not to `domain_exec_order`.
 pub fn domain_pre_tick_count(domain_id: usize) -> usize {
     if domain_id >= MAX_DOMAINS {
@@ -167,7 +229,7 @@ pub fn domain_pre_tick_count(domain_id: usize) -> usize {
 
 /// Diagnostic accessor — Tier 1c pre-tick module index at `pos`
 /// within `domain_id`. Returns `None` for invalid `domain_id` or
-/// `pos` past the populated count. Used by the Step 4-7 drift guard.
+/// `pos` past the populated count. Used by the pre-tick slot drift guard.
 pub fn domain_pre_tick_at(domain_id: usize, pos: usize) -> Option<usize> {
     if domain_id >= MAX_DOMAINS {
         return None;
@@ -218,7 +280,7 @@ pub fn step_domain_modules(
     // (before any sub-pass or pre-tick step). `BURST_SEEN_THIS_PASS` is reset
     // per sub-pass for drain-detection and can't serve the pacer's "tick busy?".
     PACER_BURST_TICK[domain_id].store(false, Ordering::Relaxed);
-    // §6 work signal: same per-tick reset cadence.
+    // Useful-work signal: same per-tick reset cadence.
     PACER_WORK_TICK[domain_id].store(false, Ordering::Relaxed);
     // SAFETY: scheduler-thread context — multi-domain platform's caller
     // (BCM2712 core pump) is the sole stepper for this domain.
@@ -277,8 +339,14 @@ pub fn step_domain_modules(
     // the cyclic shift on soft overruns so operators see them
     // without losing the rest of the pass.
     sched.domain_budget_us_consumed[domain_id] = 0;
-    // Decay this domain's §5.3 floor worst-step peak-hold once per pass so a
-    // stale spike ages out (AC7); step_one_module re-raises it to the live worst.
+    for i in 0..sched.active_module_count {
+        if sched.domain_id[i] as usize == domain_id {
+            sched.pass_module_us[i] = 0;
+            sched.pass_module_steps[i] = 0;
+        }
+    }
+    // Decay this domain's adaptive-tick floor worst-step peak-hold once per pass
+    // so a stale spike ages out; step_one_module re-raises it to the live worst.
     // `max(v >> shift, 1)` for non-zero v — a pure `v >> 8` stalls at 0 once
     // v < 256, leaving a sub-256 µs spike to pin the floor (and tick_min) forever.
     let w = sched.domain_worst_step_us[domain_id];
@@ -315,6 +383,7 @@ pub fn step_domain_modules(
     let mut hard_break = false;
     loop {
         BURST_SEEN_THIS_PASS[domain_id].store(false, Ordering::Relaxed);
+        let pass_start_us = sched.domain_budget_us_consumed[domain_id];
         for pos in 0..n {
             let rotated = if n > 0 { (pos + dom_offset) % n } else { pos };
             let module_idx = sched.domain_exec_order[domain_id][rotated] as usize;
@@ -349,8 +418,9 @@ pub fn step_domain_modules(
         if hard_break || tick_pass >= MAX_PIPELINE_PASSES {
             break;
         }
-        // Out of tick budget → let the next tick continue draining.
-        if domain_budget_exhausted(sched, domain_id) {
+        // Another pass would not fit the tick budget: let the next tick
+        // continue draining.
+        if !domain_budget_admits_repass(sched, domain_id, pass_start_us) {
             break;
         }
         let refilled = step_domain_pipeline_refill(modules, sched, domain_id, &mut active_count);
@@ -415,7 +485,7 @@ pub(crate) fn step_domain_pre_tick(
         if module_idx >= active_module_count {
             continue;
         }
-        // §3.2 pause guard: pre-tick drain is domain-global (not per-graph),
+        // Pause guard: pre-tick drain is domain-global (not per-graph),
         // so a paused owner's Tier-1c module must be skipped here explicitly.
         // Default-off: one relaxed load when nothing is paused.
         if crate::kernel::ipc::event::paused_owners_present()
@@ -475,7 +545,7 @@ pub(crate) fn step_domain_pipeline_refill(
         {
             continue;
         }
-        // §3.2 pause guard — same rationale as `step_domain_pre_tick`.
+        // Pause guard — same rationale as `step_domain_pre_tick`.
         if crate::kernel::ipc::event::paused_owners_present()
             && crate::kernel::ipc::event::module_wake_masked(module_idx)
         {
@@ -1021,15 +1091,18 @@ pub(crate) fn step_one_module(
         if d < MAX_DOMAINS {
             sched.domain_budget_us_consumed[d] =
                 sched.domain_budget_us_consumed[d].saturating_add(elapsed);
-            // Peak-hold the per-domain worst single-step (µs) for the §5.3
+            // Peak-hold the per-domain worst single-step (µs) for the
             // adaptive-tick floor. Decayed once per pass (see the per-pass
             // budget reset) so it relaxes after a spike — a decaying peak-hold,
-            // not a monotonic max (AC7). u32 µs is ample: a step over ~4 ms
+            // not a monotonic max. u32 µs is ample: a step over ~4 ms
             // already trips the budget at any sane tick.
             let e = elapsed.min(u32::MAX as u64) as u32;
             if e > sched.domain_worst_step_us[d] {
                 sched.domain_worst_step_us[d] = e;
             }
+            sched.pass_module_us[module_idx] = sched.pass_module_us[module_idx].saturating_add(e);
+            sched.pass_module_steps[module_idx] =
+                sched.pass_module_steps[module_idx].saturating_add(1);
         }
         // Name the module that actually consumed the time — the
         // overrun line names whichever finished *last*, which is a
@@ -1115,7 +1188,7 @@ pub fn step_woken_modules(
         if !wake_bits.test(module_idx) {
             continue;
         }
-        // §3.2 pause guard: a wake bit that escaped the pause-time sweep
+        // Pause guard: a wake bit that escaped the pause-time sweep
         // (latched between the mask write and the sweep, then taken by a
         // GLOBAL `take_wake_pending` drain — the Linux/rp platform loops)
         // must not step a paused owner's module; defer it so `owner_resume`

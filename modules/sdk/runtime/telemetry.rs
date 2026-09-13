@@ -64,7 +64,10 @@ unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
 /// word (the wasm host, an isolated module whose protection domain does not
 /// map kernel memory) emits unconditionally and the ring drops when no
 /// consumer is active.
-#[allow(dead_code, reason = "emit-side helper; invoked only by instrumented modules")]
+#[allow(
+    dead_code,
+    reason = "emit-side helper; invoked only by instrumented modules"
+)]
 #[inline(always)]
 unsafe fn dev_telemetry_enabled(sys: &SyscallTable) -> bool {
     sys.telemetry_enabled.is_null() || *sys.telemetry_enabled != 0
@@ -952,4 +955,3 @@ unsafe fn dev_backing_arena_bulk(
     *bp.add(17) = pb[7];
     (sys.provider_call)(-1, 0x0CE9, bp, 18)
 }
-

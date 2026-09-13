@@ -18,7 +18,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -120,8 +119,8 @@ impl MicState {
 
 mod params_def {
     use super::MicState;
-    use super::{p_u8, p_u32};
     use super::SCHEMA_MAX;
+    use super::{p_u32, p_u8};
 
     define_params! {
         MicState;
@@ -185,8 +184,8 @@ pub extern "C" fn module_new(
         s.out_chan = out_chan;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -216,7 +215,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         match s.phase {
             MicPhase::Init => {
                 let r = step_init(s);
-                if r < 0 { return r; }
+                if r < 0 {
+                    return r;
+                }
                 step_running(s)
             }
             MicPhase::Running => step_running(s),
@@ -237,7 +238,10 @@ unsafe fn step_init(s: &mut MicState) -> i32 {
 
     // Allocate PIO RX stream — tracked against HAL_PIO contract.
     let handle = (provider_open)(
-        HAL_PIO_CONTRACT, DEV_PIO_RX_STREAM_ALLOC, core::ptr::null_mut(), 0,
+        HAL_PIO_CONTRACT,
+        DEV_PIO_RX_STREAM_ALLOC,
+        core::ptr::null_mut(),
+        0,
     );
     if handle < 0 {
         dev_log(sys, 1, b"[mic] alloc fail".as_ptr(), 16);
@@ -313,7 +317,13 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
     let rx_handle = s.rx_handle;
 
     // Drain any pending output from previous step
-    if !drain_pending(sys, out_chan, s.io_buf.as_ptr(), &mut s.pending_out, &mut s.pending_offset) {
+    if !drain_pending(
+        sys,
+        out_chan,
+        s.io_buf.as_ptr(),
+        &mut s.pending_out,
+        &mut s.pending_offset,
+    ) {
         return 0;
     }
 
@@ -324,7 +334,12 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
     }
 
     // Check if RX buffer is ready
-    let can_pull = (provider_call)(rx_handle, DEV_PIO_RX_STREAM_CAN_PULL, core::ptr::null_mut(), 0);
+    let can_pull = (provider_call)(
+        rx_handle,
+        DEV_PIO_RX_STREAM_CAN_PULL,
+        core::ptr::null_mut(),
+        0,
+    );
     if can_pull <= 0 {
         return 0;
     }
@@ -342,14 +357,14 @@ unsafe fn step_running(s: &mut MicState) -> i32 {
     }
 
     let byte_count = (words as usize) * 4;
-    let copy_len = if byte_count > OUT_BUF_SIZE { OUT_BUF_SIZE } else { byte_count };
+    let copy_len = if byte_count > OUT_BUF_SIZE {
+        OUT_BUF_SIZE
+    } else {
+        byte_count
+    };
 
     // Copy from RX buffer to io_buf
-    __aeabi_memcpy(
-        s.io_buf.as_mut_ptr(),
-        buf_ptr as *const u8,
-        copy_len,
-    );
+    __aeabi_memcpy(s.io_buf.as_mut_ptr(), buf_ptr as *const u8, copy_len);
 
     // Acknowledge the pull (release buffer for DMA reuse)
     (provider_call)(rx_handle, DEV_PIO_RX_STREAM_PULL, core::ptr::null_mut(), 0);

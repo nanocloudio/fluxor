@@ -1,17 +1,17 @@
-//! Workload signing trust + revocation policy (rfc_k8s.md §23.1).
+//! Workload signing trust + revocation policy.
 //!
 //! System and workload-publisher signing authorities are **separate trust
 //! roots** with independent rotation — overlapping validity is just multiple
 //! keys per root, so a successor key can be trusted before its predecessor is
 //! retired. **Revocation is first-class**: an artifact signed only by a revoked
-//! key fails admission even if the key would otherwise be trusted (§23.1).
+//! key fails admission even if the key would otherwise be trusted.
 //!
 //! The Ed25519 signature check itself is [`crate::crypto::verify`] (the same
 //! verify path the kernel loader runs); the node agent verifies a signature to
 //! establish the signer key, then consults this policy for the trust/revocation
 //! *decision*. Keeping the decision separate from the crypto keeps it
-//! exhaustively testable and matches the §23.1 split of "signature establishes
-//! identity, not correctness".
+//! exhaustively testable, and keeps the two questions apart: a valid signature
+//! establishes only *who* signed, never that the signer is allowed to.
 
 /// An Ed25519 public key identifies a signing authority.
 pub type KeyId = [u8; 32];
@@ -48,7 +48,7 @@ impl TrustPolicy {
 
     /// Decide admission for a signer whose signature has already been verified.
     /// Revocation is checked first so a compromised key is refused regardless of
-    /// trust-root membership (rfc_k8s.md §23.1).
+    /// trust-root membership.
     pub fn admit(&self, signer: &KeyId, role: SignerRole) -> Admission {
         if self.revoked.iter().any(|k| k == signer) {
             return Admission::RejectRevoked;
@@ -66,7 +66,7 @@ impl TrustPolicy {
 
     /// Add a key to the revocation list (idempotent). Future admission of any
     /// artifact signed only by this key fails; a running workload is not torn
-    /// down here — that is the caller's restart-eligibility decision (§23.1).
+    /// down here — that is the caller's restart-eligibility decision.
     pub fn revoke(&mut self, key: KeyId) {
         if !self.revoked.contains(&key) {
             self.revoked.push(key);

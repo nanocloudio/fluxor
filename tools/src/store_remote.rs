@@ -2,11 +2,10 @@
 //! local store and a registry (e.g. `registry.nanocloud.io`).
 //!
 //! This is the ONE place in the tools tree that touches the network for
-//! artifacts: the offline-first invariant (`standards/dependencies.md`,
-//! `.context/fmod_registry_plan.md` §1) holds because every consume path
-//! reads only the local store — network happens exclusively in the
-//! explicit `fluxor store push` / `fluxor store pull` verbs that call
-//! into this module.
+//! artifacts: the offline-first invariant (`standards/dependencies.md`)
+//! holds because every consume path reads only the local store — network
+//! happens exclusively in the explicit `fluxor store push` / `fluxor
+//! store pull` verbs that call into this module.
 //!
 //! Wire model: plain distribution-spec v2 against a stock registry —
 //! `GET/HEAD /v2/<repo>/manifests/<ref>`, `GET/HEAD /v2/<repo>/blobs/<digest>`,

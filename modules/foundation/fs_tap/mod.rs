@@ -17,7 +17,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -32,33 +31,33 @@ const LINE_MAX: usize = 128;
 /// Maximum path length accepted by the `path` param.
 const MAX_PATH_LEN: usize = 96;
 
-const FS_OPEN:  u32 = 0x0900;
-const FS_READ:  u32 = 0x0901;
+const FS_OPEN: u32 = 0x0900;
+const FS_READ: u32 = 0x0901;
 const FS_CLOSE: u32 = 0x0903;
 
 #[repr(C)]
 struct FsTapState {
-    syscalls:    *const SyscallTable,
+    syscalls: *const SyscallTable,
     /// FS_CONTRACT handle for the open file (-1 between opens / after close).
-    fs_fd:       i32,
+    fs_fd: i32,
     /// Bytes accumulated in `line_buf` since the last flush.
-    fill:        u16,
+    fill: u16,
     /// 1 = `path` configured, 0 = nothing to do.
-    have_path:   u8,
+    have_path: u8,
     /// 1 = file exhausted (FS_CLOSE issued, no further reads).
-    done:        u8,
+    done: u8,
 
     /// Tick counter for the periodic flush + heartbeat path.
-    step_count:  u32,
+    step_count: u32,
 
     /// Length of `path` in bytes.
-    path_len:    u8,
-    _pad0:       [u8; 3],
+    path_len: u8,
+    _pad0: [u8; 3],
     /// Absolute path passed to FS_OPEN at first step.
-    path:        [u8; MAX_PATH_LEN],
+    path: [u8; MAX_PATH_LEN],
 
     /// Line accumulator.
-    line_buf:    [u8; LINE_MAX],
+    line_buf: [u8; LINE_MAX],
 }
 
 mod params_def {
@@ -84,7 +83,9 @@ mod params_def {
 }
 
 unsafe fn flush_line(s: &mut FsTapState) {
-    if s.fill == 0 { return; }
+    if s.fill == 0 {
+        return;
+    }
     let mut out = [0u8; LINE_MAX + 16];
     let prefix = b"[fs_tap] ";
     let mut pos = 0usize;
@@ -93,8 +94,7 @@ unsafe fn flush_line(s: &mut FsTapState) {
     let mut i = 0usize;
     while i < s.fill as usize {
         let b = *s.line_buf.as_ptr().add(i);
-        *out.as_mut_ptr().add(pos) =
-            if (0x20..=0x7e).contains(&b) { b } else { b'.' };
+        *out.as_mut_ptr().add(pos) = if (0x20..=0x7e).contains(&b) { b } else { b'.' };
         pos += 1;
         i += 1;
     }
@@ -115,21 +115,33 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    _in_chan: i32, _out_chan: i32, _ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize,
+    _in_chan: i32,
+    _out_chan: i32,
+    _ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<FsTapState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<FsTapState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut FsTapState);
-        core::ptr::write_bytes(s as *mut FsTapState as *mut u8, 0, core::mem::size_of::<FsTapState>());
+        core::ptr::write_bytes(
+            s as *mut FsTapState as *mut u8,
+            0,
+            core::mem::size_of::<FsTapState>(),
+        );
         s.syscalls = syscalls as *const SyscallTable;
         s.fs_fd = -1;
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -166,7 +178,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         dev_log(sys, 3, msg.as_ptr(), msg.len());
     }
 
-    if s.have_path == 0 || s.done != 0 { return 0; }
+    if s.have_path == 0 || s.done != 0 {
+        return 0;
+    }
 
     // First step (or after a transient FS_OPEN failure): try to open
     // the configured path. Failure is non-fatal — we'll retry on the
@@ -176,7 +190,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         let n = s.path_len as usize;
         path[..n].copy_from_slice(&s.path[..n]);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), n);
-        if fd < 0 { return 0; }
+        if fd < 0 {
+            return 0;
+        }
         s.fs_fd = fd;
     }
 
@@ -213,10 +229,15 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         let mut i = 0usize;
         let mut found = usize::MAX;
         while i < end {
-            if *s.line_buf.as_ptr().add(i) == b'\n' { found = i; break; }
+            if *s.line_buf.as_ptr().add(i) == b'\n' {
+                found = i;
+                break;
+            }
             i += 1;
         }
-        if found == usize::MAX { break; }
+        if found == usize::MAX {
+            break;
+        }
         s.fill = found as u16;
         flush_line(s);
         let tail = end - (found + 1);

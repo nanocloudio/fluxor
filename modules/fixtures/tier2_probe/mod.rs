@@ -113,8 +113,7 @@ pub extern "C" fn module_isr_entry(state: *mut u8) -> i32 {
         if !s.syscalls.is_null() {
             let sys = &*s.syscalls;
             let mut buf = [0u8; 36]; // SELF_BRIDGES_BUF_LEN = 4 + 8*4
-            s.self_bridges_rc =
-                (sys.provider_call)(-1, SELF_BRIDGES, buf.as_mut_ptr(), buf.len());
+            s.self_bridges_rc = (sys.provider_call)(-1, SELF_BRIDGES, buf.as_mut_ptr(), buf.len());
             s.in_count = buf[0];
             s.out_count = buf[1];
         }

@@ -33,7 +33,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
@@ -60,7 +59,7 @@ const BULK_PAGES: usize = 32;
 const BULK_WORDS: usize = BULK_PAGES * PAGE_WORDS;
 
 const BACKING_EXTERNAL: u8 = 2;
-const WB_DEFERRED:  u8 = 0;
+const WB_DEFERRED: u8 = 0;
 
 /// Arena LBA base the kernel carves for the FIRST NVMe-backed arena.
 /// Mirrors `NVME_ARENA_LBA_BASE` in `src/platform/bcm2712/memory.rs`. We
@@ -72,31 +71,31 @@ const NVME_ARENA_LBA_BASE: u64 = 0x0020_0000;
 // State
 // ---------------------------------------------------------------------------
 
-const ST_INIT:   u8 = 0;
-const ST_WRITE:  u8 = 1;
-const ST_FLUSH:  u8 = 2;
+const ST_INIT: u8 = 0;
+const ST_WRITE: u8 = 1;
+const ST_FLUSH: u8 = 2;
 const ST_VERIFY: u8 = 3;
-const ST_DONE:   u8 = 4;
-const ST_ERR:    u8 = 0xFF;
+const ST_DONE: u8 = 4;
+const ST_ERR: u8 = 0xFF;
 
 #[repr(C)]
 struct NapState {
     syscalls: *const SyscallTable,
 
     pages: u16,
-    seed:  u16,
+    seed: u16,
 
     state: u8,
-    pass:  u8,
+    pass: u8,
     arena_id: u8,
     _pad0: u8,
 
     /// Current vpage being written or verified.
-    cursor:     u16,
+    cursor: u16,
     /// Count of pages that came back byte-equal to what we wrote.
-    verify_ok:  u16,
+    verify_ok: u16,
     /// Last errno from a failed kernel call (0 = none).
-    err:        i32,
+    err: i32,
 
     /// Tick counter for heartbeat cadence.
     step_count: u32,
@@ -105,10 +104,10 @@ struct NapState {
     /// write and verify phases (`dev_micros`). The DONE perf line
     /// emits the deltas so the host parser can compute throughput
     /// as `pages × 4096 / elapsed` per phase.
-    write_start_ms:  u64,
+    write_start_ms: u64,
     verify_start_ms: u64,
-    write_done_ms:   u64,
-    verify_done_ms:  u64,
+    write_done_ms: u64,
+    verify_done_ms: u64,
 
     /// Bulk-sized scratch buffer (`BULK_PAGES × 4 KB`). Filled with
     /// the deterministic pattern for the next batch of vpages and
@@ -119,8 +118,8 @@ struct NapState {
 }
 
 mod params_def {
+    use super::p_u16;
     use super::NapState;
-    use super::{p_u16};
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -177,23 +176,33 @@ fn write_hex32(out: *mut u8, pos: &mut usize, v: u32) {
     for i in 0..8 {
         let n = ((v >> (28 - i * 4)) & 0xF) as u8;
         let c = if n < 10 { b'0' + n } else { b'a' + (n - 10) };
-        unsafe { *out.add(*pos) = c; }
+        unsafe {
+            *out.add(*pos) = c;
+        }
         *pos += 1;
     }
 }
 
 fn write_dec(out: *mut u8, pos: &mut usize, mut v: u32) {
     if v == 0 {
-        unsafe { *out.add(*pos) = b'0'; }
+        unsafe {
+            *out.add(*pos) = b'0';
+        }
         *pos += 1;
         return;
     }
     let mut d = [0u8; 10];
     let mut n = 0usize;
-    while v > 0 { d[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+    while v > 0 {
+        d[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
     while n > 0 {
         n -= 1;
-        unsafe { *out.add(*pos) = d[n]; }
+        unsafe {
+            *out.add(*pos) = d[n];
+        }
         *pos += 1;
     }
 }
@@ -280,7 +289,9 @@ unsafe fn emit_heartbeat(s: &NapState) {
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -295,21 +306,33 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    _in_chan: i32, _out_chan: i32, _ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize,
+    _in_chan: i32,
+    _out_chan: i32,
+    _ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<NapState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<NapState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut NapState);
-        core::ptr::write_bytes(s as *mut NapState as *mut u8, 0, core::mem::size_of::<NapState>());
+        core::ptr::write_bytes(
+            s as *mut NapState as *mut u8,
+            0,
+            core::mem::size_of::<NapState>(),
+        );
         s.syscalls = syscalls as *const SyscallTable;
         s.state = ST_INIT;
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -383,7 +406,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 return 2;
             }
             let remaining = (s.pages - s.cursor) as usize;
-            let chunk = if remaining < BULK_PAGES { remaining } else { BULK_PAGES };
+            let chunk = if remaining < BULK_PAGES {
+                remaining
+            } else {
+                BULK_PAGES
+            };
             // Fill all slots for this batch with the deterministic pattern.
             let mut slot = 0usize;
             while slot < chunk {
@@ -456,7 +483,11 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 return 3; // Ready — downstream may now use us
             }
             let remaining = (s.pages - s.cursor) as usize;
-            let chunk = if remaining < BULK_PAGES { remaining } else { BULK_PAGES };
+            let chunk = if remaining < BULK_PAGES {
+                remaining
+            } else {
+                BULK_PAGES
+            };
             // Pre-zero the slice we'll read into so a partial fill is
             // visible as a verify miss rather than masquerading as success.
             let mut i = 0usize;

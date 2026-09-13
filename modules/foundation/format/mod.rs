@@ -21,7 +21,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -87,8 +86,8 @@ struct AudioFormatState {
 
 mod params_def {
     use super::AudioFormatState;
-    use super::{p_u8, p_u32};
     use super::SCHEMA_MAX;
+    use super::{p_u32, p_u8};
 
     define_params! {
         AudioFormatState;
@@ -123,7 +122,11 @@ mod params_def {
 #[inline]
 fn compute_step(input_rate: u32, output_rate: u32) -> u32 {
     if output_rate > 0 && input_rate > 0 {
-        let safe_input = if input_rate > 65535 { 65535 } else { input_rate };
+        let safe_input = if input_rate > 65535 {
+            65535
+        } else {
+            input_rate
+        };
         (safe_input << 16) / output_rate
     } else {
         1 << 16 // 1.0 (no resampling)
@@ -209,7 +212,11 @@ unsafe fn process_samples(s: &mut AudioFormatState, in_count: usize) -> usize {
 
     // No resampling case (step == 1.0)
     if s.step == (1 << 16) {
-        let pairs = if in_count < max_out_pairs { in_count } else { max_out_pairs };
+        let pairs = if in_count < max_out_pairs {
+            in_count
+        } else {
+            max_out_pairs
+        };
         let mut i = 0;
         while i < pairs {
             let mut sample = u8_to_i16(*in_ptr.add(i));
@@ -306,7 +313,11 @@ unsafe fn process_samples_16(s: &mut AudioFormatState, in_bytes: usize) -> usize
 
     // No resampling case (step == 1.0)
     if s.step == (1 << 16) {
-        let pairs = if in_count < max_out_pairs { in_count } else { max_out_pairs };
+        let pairs = if in_count < max_out_pairs {
+            in_count
+        } else {
+            max_out_pairs
+        };
         let mut i = 0;
         while i < pairs {
             let sample = read_frame_16(in_ptr, i, bytes_per_frame, stereo_in);
@@ -399,8 +410,8 @@ pub extern "C" fn module_new(
         s.out_chan = out_chan;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -444,7 +455,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let in_chan = s.in_chan;
         let out_chan = s.out_chan;
 
-        if !drain_pending(syscalls, out_chan, s.out_buf.as_ptr(), &mut s.pending_out, &mut s.pending_offset) {
+        if !drain_pending(
+            syscalls,
+            out_chan,
+            s.out_buf.as_ptr(),
+            &mut s.pending_out,
+            &mut s.pending_offset,
+        ) {
             return 0;
         }
 
@@ -477,11 +494,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         };
 
         // Read input (capped to what we can actually convert)
-        let read = (channel_read)(
-            in_chan,
-            s.in_buf.as_mut_ptr(),
-            max_in,
-        );
+        let read = (channel_read)(in_chan, s.in_buf.as_mut_ptr(), max_in);
         if read == E_AGAIN || read == 0 {
             return 0;
         }
@@ -504,17 +517,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let out_bytes = out_pairs * 4;
 
-        let written = (channel_write)(
-            out_chan,
-            s.out_buf.as_ptr(),
-            out_bytes,
-        );
+        let written = (channel_write)(out_chan, s.out_buf.as_ptr(), out_bytes);
         if written < 0 && written != E_AGAIN {
             dev_log(syscalls, 1, b"[fmt] write err".as_ptr(), 15);
             return -1;
         }
 
-        track_pending(written, out_bytes, &mut s.pending_out, &mut s.pending_offset);
+        track_pending(
+            written,
+            out_bytes,
+            &mut s.pending_out,
+            &mut s.pending_offset,
+        );
 
         0
     }

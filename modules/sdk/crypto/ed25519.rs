@@ -124,30 +124,38 @@ fn ed_load_by() -> Fe {
 /// as a `U256` (p256.rs limb layout: little-endian u64 limbs).
 #[inline(never)]
 fn ed_load_l() -> U256 {
-    pic_u256(0x5CF5D3ED, 0x5812631A, 0xA2F79CD6, 0x14DEF9DE,
-             0x00000000, 0x00000000, 0x00000000, 0x10000000)
+    pic_u256(
+        0x5CF5D3ED, 0x5812631A, 0xA2F79CD6, 0x14DEF9DE, 0x00000000, 0x00000000, 0x00000000,
+        0x10000000,
+    )
 }
 
 /// Load p = 2^255 - 19 as a `U256` (canonical-encoding check in decode).
 #[inline(never)]
 fn ed_load_p() -> U256 {
-    pic_u256(0xFFFFFFED, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-             0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF)
+    pic_u256(
+        0xFFFFFFED, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+        0x7FFFFFFF,
+    )
 }
 
 /// Load p - 2 = 2^255 - 21 as exponent limbs for Fermat inversion.
 #[inline(never)]
 fn ed_load_p_minus_2() -> U256 {
-    pic_u256(0xFFFFFFEB, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-             0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF)
+    pic_u256(
+        0xFFFFFFEB, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+        0x7FFFFFFF,
+    )
 }
 
 /// Load (p - 5) / 8 = 2^252 - 3 as exponent limbs for the decompression
 /// square-root candidate x = u·v³·(u·v⁷)^((p-5)/8).
 #[inline(never)]
 fn ed_load_p58() -> U256 {
-    pic_u256(0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-             0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x0FFFFFFF)
+    pic_u256(
+        0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+        0x0FFFFFFF,
+    )
 }
 
 // ============================================================================
@@ -160,17 +168,33 @@ fn ed_load_p58() -> U256 {
 fn fe_carry(h: &mut Fe) {
     let mut pass = 0;
     while pass < 2 {
-        let mut c = h[0] >> 51; h[0] &= MASK51; h[1] += c;
-        c = h[1] >> 51; h[1] &= MASK51; h[2] += c;
-        c = h[2] >> 51; h[2] &= MASK51; h[3] += c;
-        c = h[3] >> 51; h[3] &= MASK51; h[4] += c;
-        c = h[4] >> 51; h[4] &= MASK51; h[0] += c * 19;
+        let mut c = h[0] >> 51;
+        h[0] &= MASK51;
+        h[1] += c;
+        c = h[1] >> 51;
+        h[1] &= MASK51;
+        h[2] += c;
+        c = h[2] >> 51;
+        h[2] &= MASK51;
+        h[3] += c;
+        c = h[3] >> 51;
+        h[3] &= MASK51;
+        h[4] += c;
+        c = h[4] >> 51;
+        h[4] &= MASK51;
+        h[0] += c * 19;
         pass += 1;
     }
 }
 
 fn fe_add(a: &Fe, b: &Fe) -> Fe {
-    let mut r = [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3], a[4] + b[4]];
+    let mut r = [
+        a[0] + b[0],
+        a[1] + b[1],
+        a[2] + b[2],
+        a[3] + b[3],
+        a[4] + b[4],
+    ];
     fe_carry(&mut r);
     r
 }
@@ -198,10 +222,16 @@ fn fe_neg(a: &Fe) -> Fe {
 /// the column sums (2^255 ≡ 19 mod p). u128 accumulators: worst-case
 /// column < 5 · 19 · 2^54 · 2^54 < 2^116.
 fn fe_mul(a: &Fe, b: &Fe) -> Fe {
-    let a0 = a[0] as u128; let a1 = a[1] as u128; let a2 = a[2] as u128;
-    let a3 = a[3] as u128; let a4 = a[4] as u128;
-    let b0 = b[0] as u128; let b1 = b[1] as u128; let b2 = b[2] as u128;
-    let b3 = b[3] as u128; let b4 = b[4] as u128;
+    let a0 = a[0] as u128;
+    let a1 = a[1] as u128;
+    let a2 = a[2] as u128;
+    let a3 = a[3] as u128;
+    let a4 = a[4] as u128;
+    let b0 = b[0] as u128;
+    let b1 = b[1] as u128;
+    let b2 = b[2] as u128;
+    let b3 = b[3] as u128;
+    let b4 = b[4] as u128;
 
     let t0 = a0 * b0 + 19 * (a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1);
     let mut t1 = a0 * b1 + a1 * b0 + 19 * (a2 * b4 + a3 * b3 + a4 * b2);
@@ -210,13 +240,20 @@ fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     let mut t4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0;
 
     // Carry chain in u128, then fold the top carry back through ·19.
-    t1 += t0 >> 51; let r0 = (t0 as u64) & MASK51;
-    t2 += t1 >> 51; let r1 = (t1 as u64) & MASK51;
-    t3 += t2 >> 51; let r2 = (t2 as u64) & MASK51;
-    t4 += t3 >> 51; let r3 = (t3 as u64) & MASK51;
-    let carry = (t4 >> 51) as u64; let r4 = (t4 as u64) & MASK51;
+    t1 += t0 >> 51;
+    let r0 = (t0 as u64) & MASK51;
+    t2 += t1 >> 51;
+    let r1 = (t1 as u64) & MASK51;
+    t3 += t2 >> 51;
+    let r2 = (t2 as u64) & MASK51;
+    t4 += t3 >> 51;
+    let r3 = (t3 as u64) & MASK51;
+    let carry = (t4 >> 51) as u64;
+    let r4 = (t4 as u64) & MASK51;
     let mut r = [r0 + carry * 19, r1, r2, r3, r4];
-    let c = r[0] >> 51; r[0] &= MASK51; r[1] += c;
+    let c = r[0] >> 51;
+    r[0] &= MASK51;
+    r[1] += c;
     r
 }
 
@@ -265,10 +302,18 @@ fn fe_tobytes(h: &Fe) -> [u8; 32] {
 
     // t += 19·q, then mask to 255 bits: subtracts q·p in one move.
     t[0] += 19 * q;
-    let mut c = t[0] >> 51; t[0] &= MASK51; t[1] += c;
-    c = t[1] >> 51; t[1] &= MASK51; t[2] += c;
-    c = t[2] >> 51; t[2] &= MASK51; t[3] += c;
-    c = t[3] >> 51; t[3] &= MASK51; t[4] += c;
+    let mut c = t[0] >> 51;
+    t[0] &= MASK51;
+    t[1] += c;
+    c = t[1] >> 51;
+    t[1] &= MASK51;
+    t[2] += c;
+    c = t[2] >> 51;
+    t[2] &= MASK51;
+    t[3] += c;
+    c = t[3] >> 51;
+    t[3] &= MASK51;
+    t[4] += c;
     t[4] &= MASK51; // drops the 2^255 bit
 
     let w0 = t[0] | (t[1] << 51);
@@ -291,8 +336,14 @@ fn fe_frombytes(s: &[u8; 32]) -> Fe {
     let mut i = 0;
     while i < 4 {
         w[i] = u64::from_le_bytes([
-            s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
-            s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+            s[i * 8],
+            s[i * 8 + 1],
+            s[i * 8 + 2],
+            s[i * 8 + 3],
+            s[i * 8 + 4],
+            s[i * 8 + 5],
+            s[i * 8 + 6],
+            s[i * 8 + 7],
         ]);
         i += 1;
     }
@@ -352,11 +403,21 @@ struct GeP3 {
 
 impl GeP3 {
     const fn identity() -> Self {
-        Self { x: FE_ZERO, y: FE_ONE, z: FE_ONE, t: FE_ZERO }
+        Self {
+            x: FE_ZERO,
+            y: FE_ONE,
+            z: FE_ONE,
+            t: FE_ZERO,
+        }
     }
 
     fn copy(&self) -> Self {
-        Self { x: self.x, y: self.y, z: self.z, t: self.t }
+        Self {
+            x: self.x,
+            y: self.y,
+            z: self.z,
+            t: self.t,
+        }
     }
 }
 
@@ -394,8 +455,8 @@ fn ge_double(p: &GeP3) -> GeP3 {
         let xy2 = fe_sq(&xy);
         fe_sub(&fe_sub(&xy2, &a), &b)
     };
-    let g = fe_sub(&b, &a);          // G = D + B = B - A
-    let f = fe_sub(&g, &c);          // F = G - C
+    let g = fe_sub(&b, &a); // G = D + B = B - A
+    let f = fe_sub(&g, &c); // F = G - C
     let h = fe_neg(&fe_add(&a, &b)); // H = D - B = -(A + B)
     GeP3 {
         x: fe_mul(&e, &f),
@@ -409,7 +470,12 @@ fn ge_double(p: &GeP3) -> GeP3 {
 /// `ct_lookup_table_16`): scans every entry, selecting via arithmetic
 /// mask — no secret-indexed memory access.
 fn ge_ct_lookup(table: &[GeP3; 16], idx: usize) -> GeP3 {
-    let mut out = GeP3 { x: FE_ZERO, y: FE_ZERO, z: FE_ZERO, t: FE_ZERO };
+    let mut out = GeP3 {
+        x: FE_ZERO,
+        y: FE_ZERO,
+        z: FE_ZERO,
+        t: FE_ZERO,
+    };
     let mut i = 0u64;
     while i < 16 {
         let mask = ct_eq_u64(i, idx as u64);
@@ -433,14 +499,22 @@ fn ge_ct_lookup(table: &[GeP3; 16], idx: usize) -> GeP3 {
 fn ge_scalar_mul_ct(k: &[u8; 32], p: &GeP3) -> GeP3 {
     // table[i] = i · P, i ∈ 0..16
     let mut table: [GeP3; 16] = [
-        GeP3::identity(), p.copy(),
-        GeP3::identity(), GeP3::identity(),
-        GeP3::identity(), GeP3::identity(),
-        GeP3::identity(), GeP3::identity(),
-        GeP3::identity(), GeP3::identity(),
-        GeP3::identity(), GeP3::identity(),
-        GeP3::identity(), GeP3::identity(),
-        GeP3::identity(), GeP3::identity(),
+        GeP3::identity(),
+        p.copy(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
+        GeP3::identity(),
     ];
     let mut i = 2;
     while i < 16 {
@@ -470,7 +544,12 @@ fn ge_scalar_mul_ct(k: &[u8; 32], p: &GeP3) -> GeP3 {
 fn ge_scalar_mul_base(k: &[u8; 32]) -> GeP3 {
     let bx = ed_load_bx();
     let by = ed_load_by();
-    let b = GeP3 { x: bx, y: by, z: FE_ONE, t: fe_mul(&bx, &by) };
+    let b = GeP3 {
+        x: bx,
+        y: by,
+        z: FE_ONE,
+        t: fe_mul(&bx, &by),
+    };
     ge_scalar_mul_ct(k, &b)
 }
 
@@ -496,8 +575,14 @@ fn ge_frombytes_vartime(s: &[u8; 32]) -> Option<GeP3> {
     let mut i = 0;
     while i < 4 {
         y_limbs[i] = u64::from_le_bytes([
-            s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
-            s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+            s[i * 8],
+            s[i * 8 + 1],
+            s[i * 8 + 2],
+            s[i * 8 + 3],
+            s[i * 8 + 4],
+            s[i * 8 + 5],
+            s[i * 8 + 6],
+            s[i * 8 + 7],
         ]);
         i += 1;
     }
@@ -510,7 +595,7 @@ fn ge_frombytes_vartime(s: &[u8; 32]) -> Option<GeP3> {
 
     let y = fe_frombytes(s);
     let yy = fe_sq(&y);
-    let u = fe_sub(&yy, &FE_ONE);            // y² - 1
+    let u = fe_sub(&yy, &FE_ONE); // y² - 1
     let d = ed_load_d();
     let v = fe_add(&fe_mul(&d, &yy), &FE_ONE); // d·y² + 1
 
@@ -562,8 +647,14 @@ fn sc_from_bytes_le(s: &[u8; 32]) -> U256 {
     let mut i = 0;
     while i < 4 {
         r[i] = u64::from_le_bytes([
-            s[i * 8], s[i * 8 + 1], s[i * 8 + 2], s[i * 8 + 3],
-            s[i * 8 + 4], s[i * 8 + 5], s[i * 8 + 6], s[i * 8 + 7],
+            s[i * 8],
+            s[i * 8 + 1],
+            s[i * 8 + 2],
+            s[i * 8 + 3],
+            s[i * 8 + 4],
+            s[i * 8 + 5],
+            s[i * 8 + 6],
+            s[i * 8 + 7],
         ]);
         i += 1;
     }
@@ -645,8 +736,14 @@ fn sc_from_hash(h: &[u8; 64]) -> U256 {
     let mut i = 0;
     while i < 8 {
         wide[i] = u64::from_le_bytes([
-            h[i * 8], h[i * 8 + 1], h[i * 8 + 2], h[i * 8 + 3],
-            h[i * 8 + 4], h[i * 8 + 5], h[i * 8 + 6], h[i * 8 + 7],
+            h[i * 8],
+            h[i * 8 + 1],
+            h[i * 8 + 2],
+            h[i * 8 + 3],
+            h[i * 8 + 4],
+            h[i * 8 + 5],
+            h[i * 8 + 6],
+            h[i * 8 + 7],
         ]);
         i += 1;
     }
@@ -840,7 +937,10 @@ fn x25519_ladder(k: &[u8; 32], u: &Fe) -> Fe {
         let nx3 = fe_select(&x3, &x2, mask);
         let nz2 = fe_select(&z2, &z3, mask);
         let nz3 = fe_select(&z3, &z2, mask);
-        x2 = nx2; x3 = nx3; z2 = nz2; z3 = nz3;
+        x2 = nx2;
+        x3 = nx3;
+        z2 = nz2;
+        z3 = nz3;
         swap = bit;
 
         let a = fe_add(&x2, &z2);

@@ -1451,7 +1451,14 @@ pub fn verify_cert_signature(
             // which certificate arrived is the one that can be checked
             // against the module's stack. 13 KB, of the 64 KB it gets.
             let mut ws: VerifyWorkspace<L_MAX> = VerifyWorkspace::new();
-            ml_dsa_verify(set, issuer_pubkey, &[], cert.tbs_raw, cert.signature, &mut ws)
+            ml_dsa_verify(
+                set,
+                issuer_pubkey,
+                &[],
+                cert.tbs_raw,
+                cert.signature,
+                &mut ws,
+            )
         }
         _ => false,
     }

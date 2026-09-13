@@ -197,11 +197,16 @@ so a bare `make` does the same.
 
 ### 3. Build one piece at a time
 
-A single kernel target (the Makefile selector is `TARGET`):
+A single board's kernel image (the Makefile selector is `TARGET`, and it
+takes a **board** id — firmware is built per board, modules per silicon):
 
 ```bash
-make firmware TARGET=rp2040    # also: rp2350 | qemu-virt | pi5 | wasm
+make firmware TARGET=pico2w    # boards: pico | picow | pico2w | waveshare-lcd4 | qemu-virt | pi5
+make firmware TARGET=wasm      # hosts:  linux | wasm
 ```
+
+An RP image resolves no third-party runtime crate; the firmware build checks
+the dependency closure before the image is written out.
 
 PIC modules, in the target layout consumed by `fluxor build` and
 `fluxor run`:

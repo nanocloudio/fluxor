@@ -1,4 +1,4 @@
-//! Owner-scoped log ring file format (`rfc_owner_drain_and_logs.md` §4.2–4.3).
+//! Owner-scoped log ring file format.
 //!
 //! Dependency-free framing for the per-owner log ring the Linux runtime writes
 //! (`logs/<owner_uid>.<slot>.<owner_generation>.ring`) and the `fluxor agent
@@ -100,7 +100,7 @@ impl RingHeader {
     }
 }
 
-/// One owner-attributed log record (`rfc_owner_drain_and_logs.md` §4.2). The
+/// One owner-attributed log record. The
 /// captured identity is the `(owner_uid, owner_generation)` pair plus the
 /// committed `plan_generation` at emit; `module` is present only for on-step
 /// records (off-step emitters have none). `message` is the already-formatted
@@ -222,8 +222,7 @@ pub struct LogsTruncated {
 }
 
 /// Per-reader cursor that turns a monotone `seq` stream into gap markers. A gap
-/// is a property of the *cursor*, so independent readers each compute their own
-/// (`rfc_owner_drain_and_logs.md` §4.3).
+/// is a property of the *cursor*, so independent readers each compute their own.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GapCursor {
     /// `seq` of the last record handed to the consumer, plus one; `None` before
@@ -268,7 +267,7 @@ impl GapCursor {
 }
 
 /// In-memory circular record ring with **drop-oldest** eviction, operating over
-/// a caller-owned byte buffer (`rfc_owner_drain_and_logs.md` §4.3). The
+/// a caller-owned byte buffer. The
 /// algorithm lives here — dependency-free, `unsafe`-free, host-tested — so the
 /// intricate wrap and eviction arithmetic is exercised without the kernel's
 /// static `[MAX_OWNERS] × LOG_RING_CAPACITY` storage. The kernel owns only the
@@ -823,11 +822,10 @@ mod tests {
 
     #[test]
     fn header_reader_stays_consistent_after_oversized_drop_mid_stream() {
-        // Regression: an oversized push into a NON-EMPTY ring must leave the
-        // persisted header view identical to the live view — previously it
-        // advanced next_seq without storing a frame, so read_ring_records
-        // walked one frame too far and could return stale CRC-valid bytes
-        // from a previous lap at the tail.
+        // An oversized push into a NON-EMPTY ring must leave the persisted
+        // header view identical to the live view. Advancing next_seq without
+        // storing a frame would make read_ring_records walk one frame too far
+        // and return stale CRC-valid bytes from an earlier lap at the tail.
         let frame_len = framed(0, &[b'x'; 20]).len();
         let cap = frame_len * 3 + 4;
         let mut buf = vec![0u8; cap];

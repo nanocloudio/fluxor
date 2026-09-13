@@ -31,7 +31,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -101,14 +100,18 @@ struct FilterState {
 // ============================================================================
 
 unsafe fn parse_params(s: &mut FilterState, params: *const u8, params_len: usize) {
-    if params.is_null() || params_len == 0 { return; }
+    if params.is_null() || params_len == 0 {
+        return;
+    }
 
     let mut off = 0usize;
     while off + 2 <= params_len {
         let tag = *params.add(off);
         let len = *params.add(off + 1) as usize;
         off += 2;
-        if off + len > params_len { break; }
+        if off + len > params_len {
+            break;
+        }
         let val = params.add(off);
 
         match tag {
@@ -166,8 +169,8 @@ unsafe fn evaluate(s: &FilterState, meta: &[u8; META_SIZE]) -> bool {
         let proto_ok = rule.proto_match == 0 || rule.proto_match == ip_proto;
 
         // Port match
-        let port_ok = rule.dst_port_lo == 0
-            || (dst_port >= rule.dst_port_lo && dst_port <= rule.dst_port_hi);
+        let port_ok =
+            rule.dst_port_lo == 0 || (dst_port >= rule.dst_port_lo && dst_port <= rule.dst_port_hi);
 
         if proto_ok && port_ok {
             return rule.action == ACTION_ACCEPT;
@@ -185,7 +188,9 @@ unsafe fn evaluate(s: &FilterState, meta: &[u8; META_SIZE]) -> bool {
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { STATE_SIZE }
+pub extern "C" fn module_state_size() -> usize {
+    STATE_SIZE
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
@@ -216,11 +221,15 @@ pub extern "C" fn module_new(
     let mut i = 0;
     while i < MAX_RULES {
         let rp = unsafe { s.rules.as_mut_ptr().add(i) };
-        unsafe { *rp = FilterRule::empty(); }
+        unsafe {
+            *rp = FilterRule::empty();
+        }
         i += 1;
     }
 
-    unsafe { parse_params(s, params, params_len); }
+    unsafe {
+        parse_params(s, params, params_len);
+    }
     0
 }
 

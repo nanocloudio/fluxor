@@ -69,8 +69,8 @@ impl ObserveState {
 }
 
 mod params_def {
-    use super::ObserveState;
     use super::p_u32;
+    use super::ObserveState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -322,10 +322,8 @@ pub extern "C" fn module_new(
         let _ = in_chan;
         let sys = &*s.syscalls;
 
-        let is_tlv = !params.is_null()
-            && params_len >= 4
-            && *params == 0xFE
-            && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -338,7 +336,8 @@ pub extern "C" fn module_new(
         // collector's `interval_ms` sets that emit rate.
         let mut sub = [0u8; tlm::SUBSCRIBE_INTERVAL_OFFSET + 8];
         sub[..4].copy_from_slice(&tlm::FILTER_ALL.to_le_bytes());
-        sub[tlm::SUBSCRIBE_INTERVAL_OFFSET..].copy_from_slice(&(s.interval_ms as u64).to_le_bytes());
+        sub[tlm::SUBSCRIBE_INTERVAL_OFFSET..]
+            .copy_from_slice(&(s.interval_ms as u64).to_le_bytes());
         s.tlm_slot = (sys.provider_call)(-1, tlm::TLM_SUBSCRIBE, sub.as_mut_ptr(), sub.len());
 
         0

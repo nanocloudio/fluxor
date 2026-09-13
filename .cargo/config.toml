@@ -7,11 +7,8 @@ rustflags = [
     "--cfg", "portable_atomic_unsafe_assume_single_core",
 ]
 
-[target.'cfg(all(target_arch = "arm", target_os = "none"))']
-rustflags = [
-    "-C", "link-arg=-Tlink.x",
-    "-C", "link-arg=-Tdefmt.x",
-]
+# The linker script is emitted by build.rs, which knows the target; this
+# file cannot see Cargo features.
 
 [build]
 target = "thumbv8m.main-none-eabihf"

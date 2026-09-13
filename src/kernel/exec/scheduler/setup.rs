@@ -426,7 +426,7 @@ pub fn prepare_graph() -> Result<([Option<ModuleEntry>; MAX_MODULES], usize), i3
     // Compute upstream dependency masks for ready-signal gating
     compute_upstream_mask(edges, runtime_edge_count);
 
-    // Partition modules by domain (E4-S4) and validate (E4-S5)
+    // Partition modules by domain and validate the partitioning.
     // These use the global SCHED directly to avoid borrow conflicts with `edges`.
     compute_domain_exec_orders_static(module_count);
     validate_domains_static(module_count, runtime_edge_count);
@@ -820,8 +820,7 @@ unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
 /// Returns the number of modules registered. A return of `0` means
 /// no Tier 1b modules are present and the timer was not started.
 ///
-/// Bridge-channel wiring from YAML edges is **partially wired** as
-/// of 2026-05-26:
+/// Bridge-channel wiring from YAML edges is **partially wired**:
 ///   * `wire_isr_bridges` allocates a `RingBridge` slot for every
 ///     edge with at least one ISR-tier endpoint; the slot index
 ///     lands in `Edge::bridge_slot`.
@@ -835,8 +834,8 @@ unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
 /// **Module-facing gap (v1):** PIC modules have no documented SDK
 /// surface to read/write their bridge slots from inside
 /// `module_step`. The SDK's `bridge_dispatch` helper rides
-/// `provider_call`, which the §D7 syscall gate denies for
-/// ISR-tier callers. The build-time validator now rejects any
+/// `provider_call`, which the syscall gate denies for
+/// ISR-tier callers. The build-time validator rejects any
 /// YAML edge touching an ISR-tier endpoint to prevent silently-
 /// broken admission; production Tier 1b step bodies do
 /// private-state work only. See
@@ -1030,6 +1029,6 @@ pub fn log_arena_summary() {
 }
 
 // Async graph setup (setup_graph_async) and run_main_loop are in
-// src/platform/rp.rs — they use embassy async/await which is RP-only.
+// src/platform/rp.rs.
 // Sync variants (setup_graph_sync, run_main_loop_sync) are in
 // src/platform/bcm2712.rs.

@@ -9,7 +9,13 @@ use portable_atomic::{compiler_fence, AtomicU16, Ordering};
 use crate::kernel::ipc::fd;
 use crate::kernel::module::syscalls::{register_dev_query_extension, register_system_extension};
 use crate::kernel::sys::errno;
+use crate::platform::chip::PWM_BASE;
+use crate::platform::rp_dma as dma;
+use crate::platform::rp_gpio_regs as gpio_regs;
 use crate::platform::rp_io::gpio;
+use crate::platform::rp_pio_regs as pio_regs;
+use crate::platform::rp_pio_regs::addr::SmReg;
+use crate::platform::rp_regs::{read32, write32};
 
 const E_INVAL: i32 = errno::EINVAL;
 const E_NOSYS: i32 = errno::ENOSYS;
@@ -22,10 +28,29 @@ const E_NOMEM: i32 = errno::ENOMEM;
 /// Bitmap of allocated DMA channels. CH0-CH7 pre-marked at boot.
 static DMA_CHANNELS_USED: AtomicU16 = AtomicU16::new(0x00FF); // CH0-CH7 reserved
 
+/// Channels this silicon actually implements, as a mask.
+///
+/// RP2350 has 16 DMA channels and RP2040 has 12, so the allocatable set is
+/// not the same on both. The previous literal `0xFF00` offered channels 8-15
+/// unconditionally, which on RP2040 hands out 12-15 — registers that die does
+/// not implement. Deriving the mask from the generated count makes the
+/// difference a declared fact rather than something the allocator assumes.
+const fn implemented_channel_mask() -> u16 {
+    let n = crate::platform::chip::DMA_CHANNELS as u32;
+    if n >= 16 {
+        u16::MAX
+    } else {
+        ((1u32 << n) - 1) as u16
+    }
+}
+
 pub(crate) fn dma_alloc_channel() -> i32 {
     loop {
         let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
-        let free_mask = !used & 0xFF00;
+        // `!used` alone would offer the reserved low channels back; masking
+        // to implemented channels keeps the 0-7 reservation and drops any
+        // channel this die lacks.
+        let free_mask = !used & implemented_channel_mask() & 0xFF00;
         if free_mask == 0 {
             return E_NOMEM;
         }
@@ -62,7 +87,7 @@ pub(crate) unsafe fn dma_start_raw(
     dreq: u8,
     flags: u8,
 ) -> i32 {
-    if ch > 15 {
+    if !dma::is_implemented(ch) {
         return E_INVAL;
     }
     let used = DMA_CHANNELS_USED.load(Ordering::Acquire);
@@ -70,64 +95,90 @@ pub(crate) unsafe fn dma_start_raw(
         return E_INVAL;
     }
 
-    use embassy_rp::pac;
-    let dma_ch = pac::DMA.ch(ch as usize);
-    dma_ch.read_addr().write_value(read_addr);
-    dma_ch.write_addr().write_value(write_addr);
-    crate::platform::chip::dma_write_trans_count(&dma_ch, count);
-    compiler_fence(Ordering::SeqCst);
-
-    let incr_read = flags & 0x01 != 0;
-    let incr_write = flags & 0x02 != 0;
-    let data_size = if flags & 0x04 != 0 {
-        pac::dma::vals::DataSize::SIZE_WORD
-    } else {
-        pac::dma::vals::DataSize::SIZE_HALFWORD
-    };
-
-    dma_ch.ctrl_trig().write(|w| {
-        w.set_treq_sel(pac::dma::vals::TreqSel::from(dreq));
-        w.set_data_size(data_size);
-        w.set_incr_read(incr_read);
-        w.set_incr_write(incr_write);
-        w.set_chain_to(ch);
-        w.set_en(true);
-    });
+    let c = ch as usize;
+    // SAFETY: `ch` is an implemented, allocated channel, so every address
+    // below is inside this silicon's DMA block.
+    unsafe {
+        write32(chan(c, dma::addr::READ_ADDR), read_addr);
+        write32(chan(c, dma::addr::WRITE_ADDR), write_addr);
+        write32(chan(c, dma::addr::TRANS_COUNT), dma::trans_count(count));
+        compiler_fence(Ordering::SeqCst);
+        // CTRL_TRIG last: writing it starts the transfer.
+        write32(chan(c, dma::addr::CTRL_TRIG), ctrl_for(ch, dreq, flags).0);
+    }
     compiler_fence(Ordering::SeqCst);
     0
 }
 
+/// The shared `CTRL_TRIG` value for a channel configured from the syscall's
+/// `flags` byte. One definition for the three call sites that build it.
+fn ctrl_for(ch: u8, dreq: u8, flags: u8) -> dma::CtrlTrig {
+    let data_size = if flags & 0x04 != 0 {
+        dma::DataSize::Word
+    } else {
+        dma::DataSize::HalfWord
+    };
+    dma::CtrlTrig::default()
+        .enable(true)
+        .incr_read(flags & 0x01 != 0)
+        .incr_write(flags & 0x02 != 0)
+        .data_size(data_size)
+        .treq_sel(dreq)
+        .chain_to(ch)
+}
+
+/// Address of channel `ch`'s register at `reg`.
+#[inline]
+fn chan(ch: usize, reg: usize) -> usize {
+    dma::addr::channel_reg(crate::platform::chip::DMA_BASE as usize, ch, reg)
+}
+
 fn dma_busy(ch: u8) -> i32 {
-    if ch > 15 {
+    if !dma::is_implemented(ch) {
         return E_INVAL;
     }
-    use embassy_rp::pac;
-    if pac::DMA.ch(ch as usize).ctrl_trig().read().busy() {
+    // SAFETY: `ch` is implemented on this silicon.
+    if channel_is_busy(ch) {
         1
     } else {
         0
     }
 }
 
-pub(crate) fn dma_abort(ch: u8) -> i32 {
-    if ch > 15 {
-        return E_INVAL;
-    }
-    use embassy_rp::pac;
-    pac::DMA.chan_abort().write(|w| w.0 = 1u32 << ch);
-    while pac::DMA.ch(ch as usize).ctrl_trig().read().busy() {}
-    0
+/// Whether a channel is mid-transfer.
+fn channel_is_busy(ch: u8) -> bool {
+    // SAFETY: callers check `is_implemented` first.
+    dma::CtrlTrig(unsafe { read32(chan(ch as usize, dma::addr::CTRL_TRIG)) }).busy()
 }
 
-pub(crate) unsafe fn dma_restart_raw(ch: u8, read_addr: u32, count: u32) -> i32 {
-    if ch > 15 {
+pub(crate) fn dma_abort(ch: u8) -> i32 {
+    if !dma::is_implemented(ch) {
         return E_INVAL;
     }
-    use embassy_rp::pac;
-    let dma_ch = pac::DMA.ch(ch as usize);
+    // Bounded: the previous spin on BUSY never gave up, so a channel that did
+    // not acknowledge the abort hung whoever asked.
+    if dma::abort(ch, DMA_ABORT_LIMIT) {
+        0
+    } else {
+        crate::kernel::sys::errno::ERROR
+    }
+}
+
+/// Spin budget for a channel to acknowledge an abort, in poll iterations.
+const DMA_ABORT_LIMIT: u32 = 100_000;
+
+pub(crate) unsafe fn dma_restart_raw(ch: u8, read_addr: u32, count: u32) -> i32 {
+    if !dma::is_implemented(ch) {
+        return E_INVAL;
+    }
+    let c = ch as usize;
     compiler_fence(Ordering::SeqCst);
-    dma_ch.al3_trans_count().write_value(count);
-    dma_ch.al3_read_addr_trig().write_value(read_addr);
+    // SAFETY: `ch` is implemented. AL3_READ_ADDR_TRIG is written last because
+    // writing it re-triggers the channel.
+    unsafe {
+        write32(chan(c, dma::addr::AL3_TRANS_COUNT), dma::trans_count(count));
+        write32(chan(c, dma::addr::AL3_READ_ADDR_TRIG), read_addr);
+    }
     compiler_fence(Ordering::SeqCst);
     0
 }
@@ -246,24 +297,17 @@ pub fn dma_fd_start(
 }
 
 unsafe fn dma_preconfigure_inactive(ch: u8, write_addr: u32, dreq: u8, flags: u8) {
-    use embassy_rp::pac;
-    let dma_ch = pac::DMA.ch(ch as usize);
-    dma_ch.write_addr().write_value(write_addr);
-    let incr_read = flags & 0x01 != 0;
-    let incr_write = flags & 0x02 != 0;
-    let data_size = if flags & 0x04 != 0 {
-        pac::dma::vals::DataSize::SIZE_WORD
-    } else {
-        pac::dma::vals::DataSize::SIZE_HALFWORD
-    };
-    let mut ctrl = pac::dma::regs::CtrlTrig(0);
-    ctrl.set_en(true);
-    ctrl.set_incr_read(incr_read);
-    ctrl.set_incr_write(incr_write);
-    ctrl.set_data_size(data_size);
-    ctrl.set_treq_sel(pac::dma::vals::TreqSel::from(dreq));
-    ctrl.set_chain_to(ch);
-    dma_ch.al1_ctrl().write_value(ctrl.0);
+    let c = ch as usize;
+    // AL1_CTRL, not CTRL_TRIG: this channel must be configured without being
+    // started, since the point is for the active channel to chain into it.
+    //
+    // SAFETY: the caller's contract is that `ch` is an allocated channel of
+    // this fd's ping-pong pair, so both addresses are inside this silicon's
+    // DMA block and no other owner is writing them.
+    unsafe {
+        write32(chan(c, dma::addr::WRITE_ADDR), write_addr);
+        write32(chan(c, dma::addr::AL1_CTRL), ctrl_for(ch, dreq, flags).0);
+    }
 }
 
 pub fn dma_fd_queue(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
@@ -278,23 +322,27 @@ pub fn dma_fd_queue(fd_handle: i32, read_addr: u32, count: u32) -> i32 {
     let active = dma.active_ch();
     let inactive = dma.inactive_ch();
     {
-        use embassy_rp::pac;
-        let inactive_ch = pac::DMA.ch(inactive as usize);
-        let active_ch = pac::DMA.ch(active as usize);
-        inactive_ch.read_addr().write_value(read_addr);
-        crate::platform::chip::dma_write_trans_count(&inactive_ch, count);
-        compiler_fence(Ordering::SeqCst);
-        let mut ctrl = pac::dma::regs::CtrlTrig(active_ch.al1_ctrl().read());
-        ctrl.set_chain_to(inactive);
-        active_ch.al1_ctrl().write_value(ctrl.0);
-        compiler_fence(Ordering::SeqCst);
-        if !active_ch.ctrl_trig().read().busy() {
-            inactive_ch.al3_trans_count().write_value(count);
-            inactive_ch.al3_read_addr_trig().write_value(read_addr);
-            ctrl.set_chain_to(active);
-            active_ch.al1_ctrl().write_value(ctrl.0);
-            dma.active_is_b
-                .store(!dma.active_is_b.load(Ordering::Acquire), Ordering::Release);
+        let (a, i) = (active as usize, inactive as usize);
+        // SAFETY: both channels belong to this fd's allocated ping-pong pair,
+        // so both are implemented and owned here.
+        unsafe {
+            write32(chan(i, dma::addr::READ_ADDR), read_addr);
+            write32(chan(i, dma::addr::TRANS_COUNT), dma::trans_count(count));
+            compiler_fence(Ordering::SeqCst);
+            // Point the running channel at the one just loaded, editing
+            // through AL1_CTRL so the edit does not itself re-trigger it.
+            let ctrl = dma::CtrlTrig(read32(chan(a, dma::addr::AL1_CTRL)));
+            write32(chan(a, dma::addr::AL1_CTRL), ctrl.chain_to(inactive).0);
+            compiler_fence(Ordering::SeqCst);
+            if !channel_is_busy(active) {
+                // The active channel finished before the chain was armed, so
+                // nothing will follow it; start the loaded channel directly.
+                write32(chan(i, dma::addr::AL3_TRANS_COUNT), dma::trans_count(count));
+                write32(chan(i, dma::addr::AL3_READ_ADDR_TRIG), read_addr);
+                write32(chan(a, dma::addr::AL1_CTRL), ctrl.chain_to(active).0);
+                dma.active_is_b
+                    .store(!dma.active_is_b.load(Ordering::Acquire), Ordering::Release);
+            }
         }
     }
     dma.pending.store(true, Ordering::Release);
@@ -348,15 +396,16 @@ fn dma_fd_poll_ready(slot: i32) -> bool {
         return false;
     }
     let active = dma.active_ch();
-    use embassy_rp::pac;
-    if pac::DMA.ch(active as usize).ctrl_trig().read().busy() {
+    if channel_is_busy(active) {
         return false;
     }
     if dma.pending.load(Ordering::Acquire) {
-        let dma_ch = pac::DMA.ch(active as usize);
-        let mut ctrl = pac::dma::regs::CtrlTrig(dma_ch.al1_ctrl().read());
-        ctrl.set_chain_to(active);
-        dma_ch.al1_ctrl().write_value(ctrl.0);
+        let a = active as usize;
+        // SAFETY: `active` is this fd's allocated channel.
+        unsafe {
+            let ctrl = dma::CtrlTrig(read32(chan(a, dma::addr::AL1_CTRL)));
+            write32(chan(a, dma::addr::AL1_CTRL), ctrl.chain_to(active).0);
+        }
         dma.active_is_b
             .store(!dma.active_is_b.load(Ordering::Acquire), Ordering::Release);
         dma.pending.store(false, Ordering::Release);
@@ -597,51 +646,88 @@ unsafe fn gpio_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len
 // ============================================================================
 
 /// Set a pin as SIO output with initial level.
-unsafe fn spi9_pac_gpio_init(pin: u8, high: bool) {
-    use embassy_rp::pac;
-    pac::IO_BANK0
-        .gpio(pin as usize)
-        .ctrl()
-        .write(|w| w.set_funcsel(5));
-    pac::PADS_BANK0.gpio(pin as usize).write(|w| {
-        crate::platform::chip::pad_set_iso_false!(w);
-        w.set_schmitt(false);
-        w.set_slewfast(false);
-        w.set_ie(true);
-        w.set_od(false);
-        w.set_pue(false);
-        w.set_pde(false);
-        w.set_drive(pac::pads::vals::Drive::_4M_A);
-    });
-    let bank = (pin >> 5) as usize;
-    let bit = 1u32 << (pin & 31);
-    if high {
-        pac::SIO.gpio_out(bank).value_set().write_value(bit);
-    } else {
-        pac::SIO.gpio_out(bank).value_clr().write_value(bit);
+unsafe fn spi9_gpio_init(pin: u8, high: bool) {
+    use crate::platform::rp_gpio_regs as gpio_regs;
+
+    // SAFETY: the caller owns `pin` for the duration of the bit-banged
+    // transfer. Level before output-enable, so the pin never briefly drives
+    // the wrong value at the display.
+    unsafe {
+        gpio_regs::set_function(pin, SPI9_FUNCSEL_SIO);
+        gpio_regs::set_pad_output(pin, gpio_regs::Drive::Ma4);
+        gpio_regs::set_level(pin, high);
+        gpio_regs::set_output_enable(pin, true);
     }
-    pac::SIO.gpio_oe(bank).value_set().write_value(bit);
+}
+
+/// IO_BANK0 `FUNCSEL` for software control of a pin (SIO).
+const SPI9_FUNCSEL_SIO: u32 = 5;
+
+/// `FUNCSEL` for the PWM peripheral.
+const PWM_FUNCSEL: u32 = 4;
+
+/// `FUNCSEL` 31 is "no peripheral", which releases the pin.
+const FUNCSEL_NONE: u32 = 31;
+
+/// `OUT X, 32` — consume a FIFO word into the X scratch register.
+const PIO_OUT_X_32: u32 = 0x6020;
+/// `OUT Y, 32`.
+const PIO_OUT_Y_32: u32 = 0x6040;
+/// `SET PINDIRS, 1` — drive the pin.
+const PIO_SET_PINDIRS_1: u32 = 0xE081;
+
+/// Longest a single gSPI transfer may run before `CMD_POLL` gives up on it.
+///
+/// A full frame at the slowest configured clock is well under a
+/// millisecond; this is two orders of magnitude clear of that, so it only
+/// fires for a transfer that has genuinely stopped.
+const XFER_LIMIT_US: u64 = 50_000;
+
+/// When each channel's current transfer started, for the timeout.
+static mut XFER_STARTED_US: [u64; 16] = [0; 16];
+
+fn xfer_note_started(ch: u8) {
+    if (ch as usize) < 16 {
+        // SAFETY: single writer, the syscall path, on a single core.
+        unsafe { XFER_STARTED_US[ch as usize] = crate::platform::rp_timer::now_us() };
+    }
+}
+
+fn xfer_elapsed_us(ch: u8) -> u64 {
+    if (ch as usize) >= 16 {
+        return 0;
+    }
+    // SAFETY: as `xfer_note_started`.
+    let t0 = unsafe { XFER_STARTED_US[ch as usize] };
+    crate::platform::rp_timer::now_us().wrapping_sub(t0)
+}
+
+/// Set bits in a register that has no atomic alias.
+///
+/// # Safety
+/// As [`crate::platform::rp_regs::modify32`]: the register must not be
+/// write-one-to-clear.
+#[inline]
+unsafe fn set_bits_rmw(addr: usize, bits: u32) {
+    // SAFETY: the caller's contract — a plain read/write register it owns.
+    unsafe { crate::platform::rp_regs::modify32(addr, |v| v | bits) };
 }
 
 /// Set a SIO output pin level.
 #[inline(always)]
-unsafe fn spi9_pac_pin_set(pin: u8, high: bool) {
-    use embassy_rp::pac;
-    let bank = (pin >> 5) as usize;
-    let bit = 1u32 << (pin & 31);
-    if high {
-        pac::SIO.gpio_out(bank).value_set().write_value(bit);
-    } else {
-        pac::SIO.gpio_out(bank).value_clr().write_value(bit);
-    }
+unsafe fn spi9_pin_set(pin: u8, high: bool) {
+    // SAFETY: as `spi9_gpio_init`; the pin is already configured as an output.
+    unsafe { crate::platform::rp_gpio_regs::set_level(pin, high) };
 }
 
 /// Busy-wait for `us` microseconds using the RP hardware TIMER.
 #[inline(always)]
 unsafe fn spi9_timer_us(us: u32) {
-    let timer = crate::platform::chip::timer();
-    let t0 = timer.timerawl().read();
-    while timer.timerawl().read().wrapping_sub(t0) < us {}
+    // The monotonic clock, not a private read of the timer block: one source
+    // for every timestamp in the kernel, so this cannot drift from what the
+    // scheduler believes the time is.
+    let t0 = crate::platform::rp_timer::now_us();
+    while crate::platform::rp_timer::now_us().wrapping_sub(t0) < us as u64 {}
 }
 
 /// Busy-wait ~100 us using hardware TIMER.
@@ -659,11 +745,11 @@ unsafe fn spi9_pac_delay_ms(ms: u32) {
 /// Send one 9-bit SPI word. Clock idle low, data on rising edge, MSB first.
 unsafe fn spi9_pac_write_word(sck: u8, sda: u8, word: u16) {
     for i in (0..=8i32).rev() {
-        spi9_pac_pin_set(sda, (word & (1u16 << i as u32)) != 0);
+        spi9_pin_set(sda, (word & (1u16 << i as u32)) != 0);
         spi9_timer_us(10); // Data setup time before rising edge
-        spi9_pac_pin_set(sck, true);
+        spi9_pin_set(sck, true);
         spi9_pac_delay(); // 100 us SCK high time
-        spi9_pac_pin_set(sck, false);
+        spi9_pin_set(sck, false);
         spi9_pac_delay(); // 100 us SCK low time
     }
 }
@@ -678,7 +764,7 @@ unsafe fn spi9_pac_send(
     data_len: usize,
     hold_cs: bool,
 ) {
-    spi9_pac_pin_set(cs, false);
+    spi9_pin_set(cs, false);
     spi9_timer_us(5); // CS setup time before first clock
     spi9_pac_write_word(sck, sda, cmd as u16); // DC=0 for command
     for i in 0..data_len {
@@ -686,22 +772,22 @@ unsafe fn spi9_pac_send(
     }
     if !hold_cs {
         spi9_timer_us(5); // CS hold time after last clock
-        spi9_pac_pin_set(cs, true);
+        spi9_pin_set(cs, true);
     }
 }
 
 /// Reset sequence + SIO pin init for 9-bit SPI.
 unsafe fn spi9_pac_reset(rst: u8, cs: u8, sck: u8, sda: u8) {
-    spi9_pac_gpio_init(cs, true);
-    spi9_pac_gpio_init(sck, false);
-    spi9_pac_gpio_init(sda, false);
-    spi9_pac_gpio_init(rst, true);
+    spi9_gpio_init(cs, true);
+    spi9_gpio_init(sck, false);
+    spi9_gpio_init(sda, false);
+    spi9_gpio_init(rst, true);
 
-    spi9_pac_pin_set(rst, true);
+    spi9_pin_set(rst, true);
     spi9_pac_delay_ms(20);
-    spi9_pac_pin_set(rst, false);
+    spi9_pin_set(rst, false);
     spi9_pac_delay_ms(20);
-    spi9_pac_pin_set(rst, true);
+    spi9_pin_set(rst, true);
     spi9_pac_delay_ms(200);
 }
 
@@ -717,7 +803,7 @@ unsafe fn spi9_pac_reset(rst: u8, cs: u8, sck: u8, sda: u8) {
 /// `PLATFORM_DMA_FD` (FD_TAG_DMA-tagged fd, from `fd::CREATE`).
 /// The two families have disjoint tag values; handlers reject a
 /// wrong-family handle with EINVAL. A raw untagged slot (tag 0) is
-/// accepted for legacy callers that bypass `provider_open`.
+/// accepted from callers that bypass `provider_open`.
 #[inline]
 fn is_dma_channel_handle(h: i32) -> bool {
     if h < 0 {
@@ -759,13 +845,11 @@ unsafe fn rp_system_extension_dispatch(
             if pin >= gpio::runtime_max_gpio() as usize {
                 return E_INVAL;
             }
-            use embassy_rp::pac;
-            pac::IO_BANK0.gpio(pin).ctrl().write(|w| w.set_funcsel(4));
-            pac::PADS_BANK0.gpio(pin).modify(|w| {
-                w.set_ie(false);
-                w.set_od(false);
-                crate::platform::chip::pad_set_iso_false!(w);
-            });
+            // SAFETY: `pin` is bounded by the runtime GPIO count above.
+            unsafe {
+                gpio_regs::set_function(pin as u8, PWM_FUNCSEL);
+                gpio_regs::set_pad_output(pin as u8, gpio_regs::Drive::Ma4);
+            }
             0
         }
         pwm_raw::PIN_DISABLE => {
@@ -776,8 +860,8 @@ unsafe fn rp_system_extension_dispatch(
             if pin >= gpio::runtime_max_gpio() as usize {
                 return E_INVAL;
             }
-            use embassy_rp::pac;
-            pac::IO_BANK0.gpio(pin).ctrl().write(|w| w.set_funcsel(31));
+            // SAFETY: as PIN_ENABLE.
+            unsafe { gpio_regs::set_function(pin as u8, FUNCSEL_NONE) };
             0
         }
         pwm_raw::SLICE_WRITE => {
@@ -787,19 +871,15 @@ unsafe fn rp_system_extension_dispatch(
             let slice = *arg as usize;
             let reg = *arg.add(1);
             let value = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            if slice >= 12 {
+            if slice >= crate::platform::chip::PWM_SLICES as usize {
                 return E_INVAL;
             }
-            use embassy_rp::pac;
-            let ch = pac::PWM.ch(slice);
-            match reg {
-                0 => ch.csr().write(|w| w.0 = value),
-                1 => ch.div().write(|w| w.0 = value),
-                2 => ch.ctr().write(|w| w.0 = value),
-                3 => ch.cc().write(|w| w.0 = value),
-                4 => ch.top().write(|w| w.0 = value),
-                _ => return E_INVAL,
-            }
+            let Some(addr) = gpio_regs::pwm::reg(PWM_BASE as usize, slice, reg) else {
+                return E_INVAL;
+            };
+            // SAFETY: `slice` is below this silicon's slice count and `reg` is
+            // one of the five the block defines, so the address is inside it.
+            unsafe { write32(addr, value) };
             0
         }
         pwm_raw::SLICE_READ => {
@@ -808,96 +888,83 @@ unsafe fn rp_system_extension_dispatch(
             }
             let slice = *arg as usize;
             let reg = *arg.add(1);
-            if slice >= 12 {
+            if slice >= crate::platform::chip::PWM_SLICES as usize {
                 return E_INVAL;
             }
-            use embassy_rp::pac;
-            let ch = pac::PWM.ch(slice);
-            match reg {
-                0 => ch.csr().read().0 as i32,
-                1 => ch.div().read().0 as i32,
-                2 => ch.ctr().read().0 as i32,
-                3 => ch.cc().read().0 as i32,
-                4 => ch.top().read().0 as i32,
-                _ => E_INVAL,
-            }
+            let Some(addr) = gpio_regs::pwm::reg(PWM_BASE as usize, slice, reg) else {
+                return E_INVAL;
+            };
+            // SAFETY: as SLICE_WRITE.
+            unsafe { read32(addr) as i32 }
         }
         // ── Raw PIO register bridge ───────────────────────────────────
         pio_raw::SM_EXEC => {
             if arg.is_null() || arg_len < 4 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
             let sm = *arg.add(1);
-            if pio_num > 2 || sm > 3 {
+            let Some(base) = pio_regs::instance(*arg) else {
+                return E_INVAL;
+            };
+            if !pio_regs::is_state_machine(sm) {
                 return E_INVAL;
             }
             let instr = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
-            pio_util::pio_pac(pio_num)
-                .sm(sm as usize)
-                .instr()
-                .write(|w| w.set_instr(instr));
+            // SAFETY: `base` is an implemented instance and `sm` a real
+            // state machine, both checked above.
+            unsafe { pio_regs::write_sm_reg(base, sm, SmReg::Instr, instr as u32) };
             0
         }
         pio_raw::SM_WRITE_REG => {
             if arg.is_null() || arg_len < 7 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
             let sm_idx = *arg.add(1);
-            let reg = *arg.add(2);
-            if pio_num > 2 || sm_idx > 3 {
+            let Some(base) = pio_regs::instance(*arg) else {
+                return E_INVAL;
+            };
+            if !pio_regs::is_state_machine(sm_idx) {
                 return E_INVAL;
             }
+            // ADDR is read-only, so it is not writable even though
+            // SM_READ_REG names it.
+            let reg = match SmReg::from_syscall(*arg.add(2)) {
+                Some(SmReg::Addr) | None => return E_INVAL,
+                Some(r) => r,
+            };
             let value = u32::from_le_bytes([*arg.add(3), *arg.add(4), *arg.add(5), *arg.add(6)]);
-            let sm = pio_util::pio_pac(pio_num).sm(sm_idx as usize);
-            match reg {
-                0 => sm.clkdiv().write(|w| w.0 = value),
-                1 => sm.execctrl().write(|w| w.0 = value),
-                2 => sm.shiftctrl().write(|w| w.0 = value),
-                3 => sm.pinctrl().write(|w| w.0 = value),
-                _ => return E_INVAL,
-            }
+            // SAFETY: checked instance and state machine, as SM_EXEC.
+            unsafe { pio_regs::write_sm_reg(base, sm_idx, reg, value) };
             0
         }
         pio_raw::SM_READ_REG => {
             if arg.is_null() || arg_len < 3 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
             let sm_idx = *arg.add(1);
-            let reg = *arg.add(2);
-            if pio_num > 2 || sm_idx > 3 {
+            let Some(base) = pio_regs::instance(*arg) else {
+                return E_INVAL;
+            };
+            if !pio_regs::is_state_machine(sm_idx) {
                 return E_INVAL;
             }
-            let sm = pio_util::pio_pac(pio_num).sm(sm_idx as usize);
-            match reg {
-                0 => sm.clkdiv().read().0 as i32,
-                1 => sm.execctrl().read().0 as i32,
-                2 => sm.shiftctrl().read().0 as i32,
-                3 => sm.pinctrl().read().0 as i32,
-                4 => sm.addr().read().addr() as i32,
-                _ => E_INVAL,
-            }
+            let Some(reg) = SmReg::from_syscall(*arg.add(2)) else {
+                return E_INVAL;
+            };
+            // SAFETY: checked instance and state machine, as SM_EXEC.
+            unsafe { pio_regs::read_sm_reg(base, sm_idx, reg) as i32 }
         }
         pio_raw::SM_ENABLE => {
             if arg.is_null() || arg_len < 3 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
             let mask = *arg.add(1) & 0x0F;
             let enable = *arg.add(2);
-            if pio_num > 2 {
+            let Some(base) = pio_regs::instance(*arg) else {
                 return E_INVAL;
-            }
-            let p = pio_util::pio_pac(pio_num);
-            p.ctrl().modify(|w| {
-                if enable != 0 {
-                    w.set_sm_enable(w.sm_enable() | mask);
-                } else {
-                    w.set_sm_enable(w.sm_enable() & !mask);
-                }
-            });
+            };
+            // SAFETY: `base` is an implemented instance.
+            unsafe { pio_regs::set_enabled(base, mask, enable != 0) };
             0
         }
         pio_raw::INSTR_ALLOC => {
@@ -906,7 +973,7 @@ unsafe fn rp_system_extension_dispatch(
             }
             let pio_num = *arg;
             let count = *arg.add(1);
-            if pio_num > 2 || count == 0 || count > 32 {
+            if pio_regs::instance(pio_num).is_none() || count == 0 || count > 32 {
                 return E_INVAL;
             }
             match pio_util::alloc_instruction_slots(pio_num, count as usize) {
@@ -928,15 +995,16 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 4 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
-            let addr = *arg.add(1);
-            if pio_num > 2 || addr > 31 {
+            let slot = *arg.add(1);
+            let Some(base) = pio_regs::instance(*arg) else {
+                return E_INVAL;
+            };
+            if !pio_regs::is_instr_slot(slot) {
                 return E_INVAL;
             }
             let instr = u16::from_le_bytes([*arg.add(2), *arg.add(3)]);
-            pio_util::pio_pac(pio_num)
-                .instr_mem(addr as usize)
-                .write(|w| w.0 = instr as u32);
+            // SAFETY: checked instance and instruction slot.
+            unsafe { write32(pio_regs::addr::instr_mem(base, slot as usize), instr as u32) };
             0
         }
         pio_raw::INSTR_FREE => {
@@ -944,7 +1012,7 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let pio_num = *arg;
-            if pio_num > 2 {
+            if pio_regs::instance(pio_num).is_none() {
                 return E_INVAL;
             }
             let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
@@ -958,7 +1026,9 @@ unsafe fn rp_system_extension_dispatch(
             let pin = *arg;
             let pio_num = *arg.add(1);
             let pull = *arg.add(2);
-            if pio_num > 2 || pin as usize >= gpio::runtime_max_gpio() as usize {
+            if pio_regs::instance(pio_num).is_none()
+                || pin as usize >= gpio::runtime_max_gpio() as usize
+            {
                 return E_INVAL;
             }
             let pio_pull = match pull {
@@ -970,6 +1040,18 @@ unsafe fn rp_system_extension_dispatch(
             pio_util::setup_pio_pin(pin, pio_num, pio_pull);
             0
         }
+        pio_raw::PIN_LEVEL => {
+            if arg.is_null() || arg_len < 1 {
+                return E_INVAL;
+            }
+            let pin = *arg;
+            if pin as usize >= gpio::runtime_max_gpio() as usize {
+                return E_INVAL;
+            }
+            // SAFETY: a pin the caller set up for PIO; the pad's input
+            // buffer is enabled by that setup, so the level is real.
+            i32::from(unsafe { gpio_regs::read_level(pin) })
+        }
         pio_raw::GPIOBASE => {
             // PIO GPIOBASE: RP2350 only (register absent on RP2040 PAC)
             #[cfg(not(feature = "chip-rp2040"))]
@@ -977,14 +1059,13 @@ unsafe fn rp_system_extension_dispatch(
                 if arg.is_null() || arg_len < 2 {
                     return E_INVAL;
                 }
-                let pio_num = *arg;
                 let base16 = *arg.add(1);
-                if pio_num > 2 {
+                let Some(base) = pio_regs::instance(*arg) else {
                     return E_INVAL;
-                }
-                pio_util::pio_pac(pio_num)
-                    .gpiobase()
-                    .write(|w| w.set_gpiobase(base16 != 0));
+                };
+                // SAFETY: `base` is an implemented instance, and GPIOBASE
+                // exists on this silicon (the cfg around this arm).
+                unsafe { write32(base + pio_regs::addr::GPIOBASE, u32::from(base16 != 0)) };
                 0
             }
             #[cfg(feature = "chip-rp2040")]
@@ -996,41 +1077,38 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 6 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
             let sm = *arg.add(1);
-            if pio_num > 2 || sm > 3 {
+            let Some(base) = pio_regs::instance(*arg) else {
+                return E_INVAL;
+            };
+            if !pio_regs::is_state_machine(sm) {
                 return E_INVAL;
             }
             let value = u32::from_le_bytes([*arg.add(2), *arg.add(3), *arg.add(4), *arg.add(5)]);
-            pio_util::pio_pac(pio_num)
-                .txf(sm as usize)
-                .write_value(value);
+            // SAFETY: checked instance and state machine.
+            unsafe { write32(pio_regs::addr::txf(base, sm as usize), value) };
             0
         }
         pio_raw::FSTAT_READ => {
             if arg.is_null() || arg_len < 1 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
-            if pio_num > 2 {
+            let Some(base) = pio_regs::instance(*arg) else {
                 return E_INVAL;
-            }
-            pio_util::pio_pac(pio_num).fstat().read().0 as i32
+            };
+            // SAFETY: `base` is an implemented instance.
+            unsafe { read32(base + pio_regs::addr::FSTAT) as i32 }
         }
         pio_raw::SM_RESTART => {
             if arg.is_null() || arg_len < 2 {
                 return E_INVAL;
             }
-            let pio_num = *arg;
             let mask = *arg.add(1) & 0x0F;
-            if pio_num > 2 {
+            let Some(base) = pio_regs::instance(*arg) else {
                 return E_INVAL;
-            }
-            let p = pio_util::pio_pac(pio_num);
-            p.ctrl().modify(|w| {
-                w.set_sm_restart(mask);
-                w.set_clkdiv_restart(mask);
-            });
+            };
+            // SAFETY: `base` is an implemented instance.
+            unsafe { pio_regs::restart(base, mask) };
             0
         }
         pio_raw::INPUT_SYNC_BYPASS => {
@@ -1038,12 +1116,15 @@ unsafe fn rp_system_extension_dispatch(
                 return E_INVAL;
             }
             let pio_num = *arg;
-            if pio_num > 2 {
+            if pio_regs::instance(pio_num).is_none() {
                 return E_INVAL;
             }
             let mask = u32::from_le_bytes([*arg.add(1), *arg.add(2), *arg.add(3), *arg.add(4)]);
-            let p = pio_util::pio_pac(pio_num);
-            p.input_sync_bypass().modify(|w| *w |= mask);
+            let Some(base) = pio_regs::instance(pio_num) else {
+                return E_INVAL;
+            };
+            // SAFETY: `base` is an implemented instance.
+            unsafe { set_bits_rmw(base + pio_regs::addr::INPUT_SYNC_BYPASS, mask) };
             0
         }
         pio_raw::CMD_TRANSFER => {
@@ -1059,7 +1140,7 @@ unsafe fn rp_system_extension_dispatch(
             let pio_num = *arg;
             let sm_num = *arg.add(1) as usize;
             let origin = *arg.add(2);
-            if pio_num > 2 || sm_num > 3 {
+            if pio_regs::instance(pio_num).is_none() || sm_num >= pio_regs::STATE_MACHINES {
                 return E_INVAL;
             }
 
@@ -1076,43 +1157,51 @@ unsafe fn rp_system_extension_dispatch(
             let ch_tx = *arg.add(24);
             let _ch_rx = *arg.add(25);
 
-            let pio = pio_util::pio_pac(pio_num);
-            let sm = pio.sm(sm_num);
+            // Checked above; `sm_num` is a real state machine.
+            let Some(base) = pio_regs::instance(pio_num) else {
+                return E_INVAL;
+            };
+            let sm = sm_num as u8;
             let sm_mask = 1u8 << sm_num;
 
-            // Disable SM
-            pio.ctrl()
-                .modify(|w| w.set_sm_enable(w.sm_enable() & !sm_mask));
+            // SAFETY: checked instance and state machine throughout this
+            // block; `origin` is an instruction-memory address the caller
+            // obtained from INSTR_ALLOC.
+            let (txf_addr, rxf_addr) = unsafe {
+                pio_regs::set_enabled(base, sm_mask, false);
 
-            // Set X = write_bits via TXF + forced OUT X,32
-            pio.txf(sm_num).write_value(write_bits);
-            sm.instr().write(|w| w.set_instr(0x6020)); // OUT X, 32
-            cortex_m::asm::delay(10);
+                // Seed X with write_bits, then Y with read_bits, by pushing
+                // each through the TX FIFO and forcing an OUT that consumes
+                // it. The delays let the forced instruction retire before
+                // the next is written.
+                write32(pio_regs::addr::txf(base, sm_num), write_bits);
+                pio_regs::write_sm_reg(base, sm, SmReg::Instr, PIO_OUT_X_32);
+                crate::arch::cortex_m::delay(10);
 
-            // Set Y = read_bits via TXF + forced OUT Y,32
-            pio.txf(sm_num).write_value(read_bits);
-            sm.instr().write(|w| w.set_instr(0x6040)); // OUT Y, 32
-            cortex_m::asm::delay(10);
+                write32(pio_regs::addr::txf(base, sm_num), read_bits);
+                pio_regs::write_sm_reg(base, sm, SmReg::Instr, PIO_OUT_Y_32);
+                crate::arch::cortex_m::delay(10);
 
-            // SET PINDIRS, 1 (output for TX phase)
-            sm.instr().write(|w| w.set_instr(0xE081));
-            cortex_m::asm::delay(10);
+                // Drive the pin for the TX phase, then jump to the program.
+                pio_regs::write_sm_reg(base, sm, SmReg::Instr, PIO_SET_PINDIRS_1);
+                crate::arch::cortex_m::delay(10);
 
-            // JMP origin
-            sm.instr().write(|w| w.set_instr(origin as u16));
-            cortex_m::asm::delay(10);
+                pio_regs::write_sm_reg(base, sm, SmReg::Instr, origin as u32);
+                crate::arch::cortex_m::delay(10);
 
-            compiler_fence(Ordering::SeqCst);
+                compiler_fence(Ordering::SeqCst);
+
+                let txf = pio_regs::addr::txf(base, sm_num) as u32;
+                let rxf = pio_regs::addr::rxf(base, sm_num) as u32;
+
+                // Enable the state machine before DMA so the PIO FIFOs drain
+                // as transfers land.
+                pio_regs::set_enabled(base, sm_mask, true);
+                (txf, rxf)
+            };
 
             let tx_dreq = (pio_num << 3) + sm_num as u8;
             let rx_dreq = tx_dreq + 4;
-            let txf_addr = pio.txf(sm_num).as_ptr() as u32;
-            let rxf_addr = pio.rxf(sm_num).as_ptr() as u32;
-
-            // Enable the state machine before DMA so the PIO FIFOs drain
-            // as transfers land.
-            pio.ctrl()
-                .modify(|w| w.set_sm_enable(w.sm_enable() | sm_mask));
 
             compiler_fence(Ordering::SeqCst);
 
@@ -1125,25 +1214,59 @@ unsafe fn rp_system_extension_dispatch(
                 1
             };
 
-            // TX DMA blocking
+            // Both directions at once, on their own channels, and return.
+            //
+            // The transfer used to run to completion inside this call: TX,
+            // spin, RX, spin. At 25 MHz a full gSPI frame is half a
+            // millisecond of the core doing nothing, and the module calling
+            // this does several per step during association — steps of
+            // 1-1.6 ms, over the scheduler's budget at the default tick.
+            // The caller already has the shape for waiting (its
+            // `TxnStep::WaitPio`); this makes the wait real. RX is armed
+            // first so its DREQ is watching the FIFO before TX fills it.
+            let ch_rx = _ch_rx;
+            crate::platform::rp_providers::dma_start_raw(
+                ch_rx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06,
+            );
+            compiler_fence(Ordering::SeqCst);
             if tx_words > 0 {
                 crate::platform::rp_providers::dma_start_raw(
                     ch_tx, tx_addr, txf_addr, tx_words, tx_dreq, 0x05,
                 );
                 compiler_fence(Ordering::SeqCst);
-                while crate::platform::rp_providers::dma_busy(ch_tx) != 0 {}
-                compiler_fence(Ordering::SeqCst);
             }
-
-            // RX DMA blocking (always — PIO needs full TX→RX cycle)
-            crate::platform::rp_providers::dma_start_raw(
-                ch_tx, rxf_addr, rx_addr, rx_words, rx_dreq, 0x06,
-            );
-            compiler_fence(Ordering::SeqCst);
-            while crate::platform::rp_providers::dma_busy(ch_tx) != 0 {}
-            compiler_fence(Ordering::SeqCst);
-
-            (tx_words * 4 + rx_words * 4) as i32
+            xfer_note_started(ch_tx);
+            0
+        }
+        pio_raw::CMD_POLL => {
+            // Completion of a transfer started above: `arg` is the two
+            // channel numbers. 1 while either is still moving, 0 when both
+            // have stopped. A transfer that has run longer than any frame
+            // can take is aborted and reported, rather than polled for ever
+            // by a caller that has no other way to know.
+            if arg.is_null() || arg_len < 2 {
+                return E_INVAL;
+            }
+            let ch_tx = *arg;
+            let ch_rx = *arg.add(1);
+            let busy = dma_busy(ch_tx) == 1 || dma_busy(ch_rx) == 1;
+            if !busy {
+                compiler_fence(Ordering::SeqCst);
+                return 0;
+            }
+            if xfer_elapsed_us(ch_tx) > XFER_LIMIT_US {
+                log::warn!(
+                    "[pio] transfer timed out: tx ch{} busy={} rx ch{} busy={}",
+                    ch_tx,
+                    dma_busy(ch_tx),
+                    ch_rx,
+                    dma_busy(ch_rx)
+                );
+                let _ = dma_abort(ch_tx);
+                let _ = dma_abort(ch_rx);
+                return crate::kernel::sys::errno::ERROR;
+            }
+            1
         }
         // ── PLATFORM_DMA: channel family ──────────────────────────────
         //
@@ -1231,7 +1354,7 @@ unsafe fn rp_system_extension_dispatch(
             }
             let cs = *arg;
             let level = *arg.add(1) != 0;
-            spi9_pac_pin_set(cs, level);
+            spi9_pin_set(cs, level);
             0
         }
         // ── Raw SPI peripheral bridge ─────────────────────────────────
@@ -1289,7 +1412,9 @@ unsafe fn rp_system_extension_dispatch(
             let dr_addr: u32 = if bus == 0 { 0x4008_0008 } else { 0x4009_0008 };
             let tx_dreq: u8 = if bus == 0 { 16 } else { 18 };
             let rx_dreq: u8 = if bus == 0 { 17 } else { 19 };
-            let max_freq: u32 = 150_000_000 / 2; // SPI max = Fsys/2 (default 150MHz)
+            // SPI's ceiling is Fsys/2, so it moves with the system clock
+            // rather than with a literal that happens to match today's.
+            let max_freq: u32 = crate::platform::chip::SYS_CLK_HZ / 2;
             let dr = dr_addr.to_le_bytes();
             *arg = dr[0];
             *arg.add(1) = dr[1];
@@ -1739,7 +1864,7 @@ unsafe fn rp_system_extension_dispatch(
             if arg.is_null() || arg_len < 4 {
                 return E_INVAL;
             }
-            *(arg as *mut u32) = embassy_rp::clocks::clk_sys_freq();
+            *(arg as *mut u32) = crate::platform::rp_clocks::measured_sys_hz();
             0
         }
         _ => E_NOSYS,
@@ -1770,7 +1895,7 @@ unsafe fn rp_dev_query_extension(handle: i32, key: u32, out: *mut u8, out_len: u
                 if out.is_null() || out_len < 4 {
                     return E_INVAL;
                 }
-                *(out as *mut u32) = embassy_rp::clocks::clk_sys_freq();
+                *(out as *mut u32) = crate::platform::rp_clocks::measured_sys_hz();
                 0
             }
             _ => E_NOSYS,

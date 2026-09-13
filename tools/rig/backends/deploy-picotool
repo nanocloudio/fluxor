@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""deploy-picotool — flash a running board over USB with picotool.
+
+Verb:
+  stage   (actuator) — `picotool load -f <artifact>`: the board's reset
+                       interface takes it into BOOTSEL, the image is written,
+                       and it reboots into the application. No button, no
+                       drive, nobody at the bench.
+
+Binding fields:
+  serial      (str, optional)  the board's USB serial; passed as `--ser` so
+                               the right board is flashed when several are
+                               attached.
+  picotool    (str, optional)  path to the picotool binary (default: on PATH).
+  settle_s    (int, optional)  seconds to wait for the console to re-enumerate
+                               after the reboot before reporting (default 8).
+
+Requires the board to run firmware that carries the reset interface and the
+pico-sdk USB identity, which every native RP image does; and a udev rule
+that lets an unprivileged user open Raspberry Pi USB devices.
+"""
+import glob
+import json
+import subprocess
+import sys
+import time
+
+
+def main():
+    raw = sys.stdin.read()
+    inv = json.loads(raw) if raw.strip() else {}
+    verb = sys.argv[1] if len(sys.argv) > 1 else ""
+    if verb == "watch":
+        # The orchestrator attaches every deploy backend as a transport too.
+        # There is nothing to watch here — picotool reports synchronously —
+        # so this is a transport that says it is ready and waits to be told
+        # to stop.
+        import signal
+        stop = {"now": False}
+        signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__("now", True))
+        sys.stdout.write(json.dumps({"kind": "ready"}) + "\n")
+        sys.stdout.flush()
+        while not stop["now"]:
+            time.sleep(0.2)
+        return 0
+    if verb != "stage":
+        print(f"deploy-picotool: unknown verb {verb!r}", file=sys.stderr)
+        return 2
+    binding = inv.get("binding", {}) or {}
+    artifact = inv.get("artifact") or {}
+    path = artifact.get("path")
+    if artifact.get("kind") != "file" or not path:
+        print("deploy-picotool: a single-file uf2 artifact is required", file=sys.stderr)
+        return 2
+    serial = str(binding.get("serial", "") or "")
+    tool = str(binding.get("picotool", "picotool"))
+    settle = int(binding.get("settle_s", 8))
+
+    cmd = [tool, "load", path, "-f"]
+    if serial:
+        cmd += ["--ser", serial]
+    t0 = time.monotonic()
+    run = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if run.returncode != 0:
+        sys.stderr.write(run.stdout[-2000:] + run.stderr[-2000:])
+        print(f"deploy-picotool: `{' '.join(cmd)}` exited {run.returncode}", file=sys.stderr)
+        return 1
+
+    # Back as a running application: the CDC console is the sign.
+    pattern = f"/dev/serial/by-id/usb-*_{serial}-if00" if serial else "/dev/ttyACM*"
+    deadline = time.monotonic() + settle + 10
+    while time.monotonic() < deadline and not glob.glob(pattern):
+        time.sleep(0.2)
+    back = bool(glob.glob(pattern))
+    elapsed = time.monotonic() - t0
+    info = f"flashed {path} via picotool in {elapsed:.1f}s; console {'back' if back else 'NOT back'}"
+    json.dump({"ok": back, "info": info, "detail": {"serial": serial, "seconds": round(elapsed, 1)}}, sys.stdout)
+    return 0 if back else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

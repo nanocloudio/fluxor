@@ -239,8 +239,7 @@ mismatch reports what is on the device against what was expected.
   namespace a sector write becomes a read-modify-write of the enclosing
   4 KiB block, silently merging eight sectors into one failure unit and
   taking with it the independence two directory entries in different sectors
-  are supposed to have. Refusing is the honest answer — see
-  `.context/rfc_fs_block_geometry.md`.
+  are supposed to have. Refusing is the honest answer.
 - **Long names are ASCII-only.** Decoding UTF-8 into the UTF-16 the format
   stores means surrogate handling in a module that cannot afford to get it
   subtly wrong, and a mangled name is worse than a refused one.
@@ -296,16 +295,20 @@ that reports durable over those passes a visible-image check trivially.
 
 ## If you are adding ext2/3/4
 
-Two RFCs settle the questions that must be answered before ext code exists,
-because a provider written against the current stack would answer them by
-accident and the answer would then be the seam:
+Two questions must be answered before ext code exists, because a provider
+written against the current stack would answer them by accident and the
+accident would then be the seam:
 
-- `.context/rfc_fs_block_geometry.md` — the filesystem block, the device
-  logical block and the staging buffer are three different sizes, and which
-  layer owns each.
-- `.context/rfc_fs_object_model.md` — what the `fs` contract says about
-  ownership, hard links, symlinks and inode identity, so ext does not grow a
-  private side channel and stop being comparable to this provider.
+- **Block geometry.** The filesystem block, the device logical block and the
+  staging buffer are three different sizes. Decide which layer owns each
+  conversion before any of them is hard-coded: this provider only ever
+  refuses a device whose logical block is not 512, which is a legitimate
+  answer for FAT and not one ext can reuse.
+- **Object model.** Settle what the `fs` contract says about ownership, hard
+  links, symlinks and inode identity — concepts FAT has no representation for
+  and therefore never forced the contract to name. If ext answers them
+  privately it grows a side channel and stops being comparable to this
+  provider.
 
 What is worth reusing from here is the *lower* half — the sector cache and
 its write chokepoints, the bounded resumable-scan shape, the fence and

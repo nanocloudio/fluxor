@@ -26,7 +26,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
@@ -84,12 +83,12 @@ const VRING_DESC_F_WRITE: u16 = 2;
 //   Descriptors: 16 * 16 = 256 bytes (16-aligned)
 //   Driver (avail) ring: 6 + 2*16 = 38 bytes (2-aligned)
 //   Device (used) ring: 6 + 8*16 = 134 bytes (4-aligned)
-const VQ_DESC_SIZE: usize = QUEUE_SIZE * 16;  // 256
-const VQ_AVAIL_SIZE: usize = 6 + 2 * QUEUE_SIZE;  // 38
-const VQ_USED_SIZE: usize = 6 + 8 * QUEUE_SIZE;  // 134
-// Per virtqueue (v1 legacy): page-aligned, desc+avail in first page, used at +4096.
-// Needs 4096 + VQ_USED_SIZE = 4230 bytes, plus page-alignment overhead (~4096).
-// v2 modern: desc + avail + used contiguous, much smaller. We size for v1 (worst case).
+const VQ_DESC_SIZE: usize = QUEUE_SIZE * 16; // 256
+const VQ_AVAIL_SIZE: usize = 6 + 2 * QUEUE_SIZE; // 38
+const VQ_USED_SIZE: usize = 6 + 8 * QUEUE_SIZE; // 134
+                                                // Per virtqueue (v1 legacy): page-aligned, desc+avail in first page, used at +4096.
+                                                // Needs 4096 + VQ_USED_SIZE = 4230 bytes, plus page-alignment overhead (~4096).
+                                                // v2 modern: desc + avail + used contiguous, much smaller. We size for v1 (worst case).
 const VQ_LEGACY_SIZE: usize = 4096 + VQ_USED_SIZE; // 4230
 
 // State layout offsets (computed in module_new for alignment)
@@ -99,7 +98,8 @@ const RX_BUFS_TOTAL: usize = QUEUE_SIZE * BUF_SIZE; // 16 * 1524 = 24384
 const TX_BUF_TOTAL: usize = BUF_SIZE; // 1524
 
 // Total state: metadata + 2 queues (page-aligned) + buffers + alignment slack
-const STATE_SIZE: usize = META_SIZE + 4096 + VQ_LEGACY_SIZE + 4096 + VQ_LEGACY_SIZE + RX_BUFS_TOTAL + TX_BUF_TOTAL;
+const STATE_SIZE: usize =
+    META_SIZE + 4096 + VQ_LEGACY_SIZE + 4096 + VQ_LEGACY_SIZE + RX_BUFS_TOTAL + TX_BUF_TOTAL;
 
 // ============================================================================
 // State (in metadata region)
@@ -107,10 +107,10 @@ const STATE_SIZE: usize = META_SIZE + 4096 + VQ_LEGACY_SIZE + 4096 + VQ_LEGACY_S
 
 #[repr(C)]
 struct VirtQueue {
-    desc: usize,    // descriptor table base
-    avail: usize,   // driver (available) ring base
-    used: usize,    // device (used) ring base
-    last_used: u16, // driver-side tracking
+    desc: usize,     // descriptor table base
+    avail: usize,    // driver (available) ring base
+    used: usize,     // device (used) ring base
+    last_used: u16,  // driver-side tracking
     next_avail: u16, // driver-side avail index tracking
 }
 
@@ -206,7 +206,9 @@ unsafe fn find_net_device() -> usize {
 unsafe fn setup_queue_v2(base: usize, queue_idx: u32, vq: &VirtQueue) -> bool {
     mmio_write(base, QUEUE_SEL, queue_idx);
     let max = mmio_read(base, QUEUE_NUM_MAX);
-    if max == 0 || (max as usize) < QUEUE_SIZE { return false; }
+    if max == 0 || (max as usize) < QUEUE_SIZE {
+        return false;
+    }
     mmio_write(base, QUEUE_NUM, QUEUE_SIZE as u32);
 
     let desc = vq.desc as u64;
@@ -229,7 +231,9 @@ unsafe fn setup_queue_v2(base: usize, queue_idx: u32, vq: &VirtQueue) -> bool {
 unsafe fn setup_queue_v1(base: usize, queue_idx: u32, vq: &mut VirtQueue, page_buf: usize) -> bool {
     mmio_write(base, QUEUE_SEL, queue_idx);
     let max = mmio_read(base, QUEUE_NUM_MAX);
-    if max == 0 || (max as usize) < QUEUE_SIZE { return false; }
+    if max == 0 || (max as usize) < QUEUE_SIZE {
+        return false;
+    }
     mmio_write(base, QUEUE_NUM, QUEUE_SIZE as u32);
     mmio_write(base, QUEUE_ALIGN_REG, 4096);
     mmio_write(base, QUEUE_PFN, (page_buf as u64 / 4096) as u32);
@@ -243,11 +247,15 @@ unsafe fn setup_queue_v1(base: usize, queue_idx: u32, vq: &mut VirtQueue, page_b
 
 unsafe fn init_device(s: &mut VirtioNetState) -> bool {
     let base = find_net_device();
-    if base == 0 { return false; }
+    if base == 0 {
+        return false;
+    }
     s.device_base = base;
 
     let ver = mmio_read(base, VERSION);
-    if ver != 1 && ver != 2 { return false; }
+    if ver != 1 && ver != 2 {
+        return false;
+    }
 
     // Reset + handshake
     mmio_write(base, STATUS_REG, 0);
@@ -269,9 +277,15 @@ unsafe fn init_device(s: &mut VirtioNetState) -> bool {
         mmio_write(base, GUEST_PAGE_SIZE, 4096);
     } else {
         // Modern: FEATURES_OK step
-        mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
+        mmio_write(
+            base,
+            STATUS_REG,
+            STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK,
+        );
         let status = mmio_read(base, STATUS_REG);
-        if status & STATUS_FEATURES_OK == 0 { return false; }
+        if status & STATUS_FEATURES_OK == 0 {
+            return false;
+        }
     }
 
     // Setup queues — v1 needs page-aligned contiguous buffers, v2 uses split addresses
@@ -279,19 +293,33 @@ unsafe fn init_device(s: &mut VirtioNetState) -> bool {
         // For v1, we need page-aligned buffers for the legacy PFN layout.
         // Recompute: desc+avail in first page, used starts at +4096.
         let rxq_page = (s.rxq.desc + 4095) & !4095; // page-align
-        if !setup_queue_v1(base, 0, &mut s.rxq, rxq_page) { return false; }
+        if !setup_queue_v1(base, 0, &mut s.rxq, rxq_page) {
+            return false;
+        }
         let txq_page = (s.txq.desc + 4095) & !4095;
-        if !setup_queue_v1(base, 1, &mut s.txq, txq_page) { return false; }
+        if !setup_queue_v1(base, 1, &mut s.txq, txq_page) {
+            return false;
+        }
     } else {
-        if !setup_queue_v2(base, 0, &s.rxq) { return false; }
-        if !setup_queue_v2(base, 1, &s.txq) { return false; }
+        if !setup_queue_v2(base, 0, &s.rxq) {
+            return false;
+        }
+        if !setup_queue_v2(base, 1, &s.txq) {
+            return false;
+        }
     }
 
     // Pre-fill RX descriptors
     let mut i = 0usize;
     while i < QUEUE_SIZE {
         let buf_addr = s.rx_bufs_ptr + i * BUF_SIZE;
-        desc_set(s.rxq.desc, i, buf_addr as u64, BUF_SIZE as u32, VRING_DESC_F_WRITE);
+        desc_set(
+            s.rxq.desc,
+            i,
+            buf_addr as u64,
+            BUF_SIZE as u32,
+            VRING_DESC_F_WRITE,
+        );
         avail_ring_set(s.rxq.avail, i, i as u16);
         i += 1;
     }
@@ -312,9 +340,17 @@ unsafe fn init_device(s: &mut VirtioNetState) -> bool {
 
     // Driver OK
     if ver == 1 {
-        mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK);
+        mmio_write(
+            base,
+            STATUS_REG,
+            STATUS_ACK | STATUS_DRIVER | STATUS_DRIVER_OK,
+        );
     } else {
-        mmio_write(base, STATUS_REG, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+        mmio_write(
+            base,
+            STATUS_REG,
+            STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+        );
     }
 
     // Notify RX queue that buffers are available
@@ -329,14 +365,18 @@ unsafe fn init_device(s: &mut VirtioNetState) -> bool {
 // ============================================================================
 
 unsafe fn poll_rx(s: &mut VirtioNetState) {
-    if s.initialized == 0 || s.out_chan < 0 { return; }
+    if s.initialized == 0 || s.out_chan < 0 {
+        return;
+    }
     let sys = &*s.syscalls;
 
     let mut count = 0;
     while count < 4 {
         let ui = used_idx(s.rxq.used);
         let lu = s.rxq.last_used;
-        if lu == ui { break; }
+        if lu == ui {
+            break;
+        }
 
         let slot = (lu as usize) % QUEUE_SIZE;
         let desc_idx = used_ring_id(s.rxq.used, slot) as usize;
@@ -366,12 +406,16 @@ unsafe fn poll_rx(s: &mut VirtioNetState) {
 }
 
 unsafe fn poll_tx(s: &mut VirtioNetState) {
-    if s.initialized == 0 || s.in_chan < 0 { return; }
+    if s.initialized == 0 || s.in_chan < 0 {
+        return;
+    }
     let sys = &*s.syscalls;
 
     // Read one frame from in_chan and transmit
     let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-    if poll <= 0 || (poll as u32 & POLL_IN) == 0 { return; }
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+        return;
+    }
 
     let tx_buf = s.tx_buf_ptr as *mut u8;
     // Zero virtio-net header
@@ -382,7 +426,9 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
     }
     // Read frame after header
     let r = (sys.channel_read)(s.in_chan, tx_buf.add(NET_HDR_SIZE), MAX_FRAME_SIZE);
-    if r <= 0 { return; }
+    if r <= 0 {
+        return;
+    }
 
     let total = NET_HDR_SIZE + r as usize;
 
@@ -421,11 +467,15 @@ unsafe fn poll_tx(s: &mut VirtioNetState) {
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { STATE_SIZE }
+pub extern "C" fn module_state_size() -> usize {
+    STATE_SIZE
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
@@ -444,8 +494,12 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < STATE_SIZE { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < STATE_SIZE {
+            return -2;
+        }
 
         let s = &mut *(state as *mut VirtioNetState);
         s.syscalls = syscalls as *const SyscallTable;
@@ -528,8 +582,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
             let mut m = 0usize;
             while m < 6 {
                 let b = *mac.add(m);
-                *fp.add(m) = b;       // dst = our MAC
-                *fp.add(6 + m) = b;   // src = our MAC
+                *fp.add(m) = b; // dst = our MAC
+                *fp.add(6 + m) = b; // src = our MAC
                 m += 1;
             }
             // EtherType 0x0000 = MAC announcement (bytes 12-13 already zero)

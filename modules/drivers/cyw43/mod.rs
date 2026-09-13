@@ -41,7 +41,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -51,11 +50,20 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod constants;
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod gspi;
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 mod wifi_ops;
 
 use constants::*;
@@ -65,7 +73,7 @@ use abi::platform::rp::pio as dev_pio;
 
 // Provider contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_PIO_CONTRACT:  u32 = 0x0004;
+const HAL_PIO_CONTRACT: u32 = 0x0004;
 
 // ============================================================================
 // Firmware Blobs (in .rodata, read from flash XIP)
@@ -137,7 +145,7 @@ pub struct Cyw43State {
     pub ssid_len: u8,
     pub password: [u8; MAX_PASS_LEN],
     pub pass_len: u8,
-    pub security: u8, // 0=WPA2, 1=WPA3
+    pub security: u8,      // 0=WPA2, 1=WPA3
     pub mac_retries: u8,   // MAC read + ctrl frame retries (limit 50/30)
     pub assoc_retries: u8, // WiFi association retries (limit 3)
 
@@ -155,6 +163,25 @@ pub struct Cyw43State {
     // Association Comeback: AP sent Timeout Interval IE (0x38 type 3)
     // Value in ms (or TUs, ~1ms each). 0 = no comeback requested.
     pub comeback_ms: u32,
+    /// A MAC announcement to `ip` is owed (set on link up, cleared when it
+    /// has actually been written to the channel).
+    pub mac_announce_due: u8,
+    /// Last time the wait-ready phase reported its position.
+    pub wait_report_ms: u64,
+    /// Transactions completed by `step_rx` on behalf of a caller that
+    /// abandoned them. Non-zero means a start-and-forget somewhere.
+    pub orphan_txns: u32,
+    /// Status reads the bus refused to start, and the last refusal.
+    pub status_start_fail: u32,
+    pub status_start_rc: i32,
+    /// F2 packets announced with a length this driver cannot read.
+    pub rx_len_bad: u32,
+    /// Consecutive `Burst` returns without a transaction completing.
+    pub burst_idle: u32,
+    /// When the burst-without-progress state was last reported.
+    pub burst_report_ms: u64,
+    /// Events traced so far this boot (the first few are logged).
+    pub evt_trace: u32,
 
     // Netif state output channel (out[5]) — emits MSG_NETIF_STATE frames
     // on state transitions. Consumers (wifi, ip) read from their wired
@@ -165,8 +192,44 @@ pub struct Cyw43State {
     pub frame_buf: [u8; MAX_FRAME_SIZE],
     pub frame_len: u16,
     pub frame_pending_tx: bool,
+    /// A frame is waiting in `in_chan` this step.
+    pub tx_waiting: bool,
     pub frame_pending_rx: bool,
     pub out_stalled: bool,
+    /// TX path counters, read by inspecting module state. Every stage
+    /// between `ip`'s channel and the radio is counted separately, because
+    /// a frame that vanishes leaves nothing else behind: no error, no
+    /// event, and `ip` has already counted it as sent. They are not logged
+    /// on a cadence — this driver carries the log transport, so a periodic
+    /// line about the TX path would itself become TX traffic.
+    pub tx_frames_read: u32,
+    pub tx_write_ok: u32,
+    pub tx_write_fail: u32,
+    pub tx_done: u32,
+    /// Steps on which a frame was waiting in `in_chan` but the TX gate
+    /// (a previous TX still pending, or RX pending on F2/F3) held it.
+    pub tx_gate_blocked: u32,
+    /// Length-prefixed records that could not be read whole: a short
+    /// prefix, a length too large to be an ethernet frame, or a body that
+    /// had not arrived. Nothing is transmitted from one, because the
+    /// stream's record alignment is no longer known.
+    pub tx_frame_malformed: u32,
+    /// Received frames the channel to `ip` accepted only in part. The
+    /// record `ip` then reads is truncated, so this counts a resynchronise
+    /// it has to recover from rather than a frame merely lost.
+    pub rx_frame_truncated: u32,
+    /// Steps on which a frame was ready to send but the bus status did not
+    /// show `F2_RX_READY`. The gSPI contract requires that bit before every
+    /// F2 write; a write made without it is discarded by the chip and
+    /// reported as nothing at all.
+    pub tx_f2_notready: u32,
+    /// SDPCM flow-control and bus-credit bytes from the most recent RX
+    /// frame. The TX path does not gate on them — the bus status bit is
+    /// what it waits for — so they are carried for inspection: read beside
+    /// the TX sequence number they say whether the chip is withholding
+    /// credit.
+    pub last_flow: u8,
+    pub last_credit: u8,
 
     // Status register cache
     pub last_status: u32,
@@ -180,32 +243,31 @@ pub struct Cyw43State {
     pub scan_active: bool,
     pub scan_count: u8,
     pub scan_sync_id: u16,
-    pub scan_out_chan: i32,       // out[1]: scan results (text)
-    pub scan_bin_chan: i32,       // out[2]: scan results (binary, 36B records)
-    pub status_chan: i32,         // out[3]: status events
+    pub scan_out_chan: i32, // out[1]: scan results (text)
+    pub scan_bin_chan: i32, // out[2]: scan results (binary, 36B records)
+    pub status_chan: i32,   // out[3]: status events
 
     // LED control
-    pub led_chan: i32,           // in[1]: LED FMP commands
-    pub led_state: u8,          // cached LED level (0=off, 1=on)
-    pub led_gpio_ready: bool,   // CYW43 GPIO0 configured as output
-    pub wifi_active: bool,      // true when WiFi output is wired
-    pub led_op: u8,             // LED state machine: 0=idle, 1-6=init, 7=send
+    pub led_chan: i32,        // in[1]: LED FMP commands
+    pub led_state: u8,        // cached LED level (0=off, 1=on)
+    pub led_gpio_ready: bool, // CYW43 GPIO0 configured as output
+    pub wifi_active: bool,    // true when WiFi output is wired
+    pub led_op: u8,           // LED state machine: 0=idle, 1-6=init, 7=send
 
-    pub led_brightness: u8,     // target brightness 0-255 (software PWM)
-    pub poll_turn: u8,          // alternating F2/F3 priority (0 or 1)
-    pub led_pwm_counter: u8,    // PWM cycle position
-    pub led_pwm_period: u8,     // PWM period in steps (default 20 = 50Hz)
+    pub led_brightness: u8,  // target brightness 0-255 (software PWM)
+    pub poll_turn: u8,       // alternating F2/F3 priority (0 or 1)
+    pub led_pwm_counter: u8, // PWM cycle position
+    pub led_pwm_period: u8,  // PWM period in steps (default 20 = 50Hz)
 
     // BT transport (groundwork — not yet active)
-    pub bt_in_chan: i32,         // in[2]: HCI commands from host
-    pub bt_out_chan: i32,        // out[4]: HCI events/data to host
+    pub bt_in_chan: i32,           // in[2]: HCI commands from host
+    pub bt_out_chan: i32,          // out[4]: HCI events/data to host
     pub frame_pending_bt_rx: bool, // F3 read in progress
     _pad7: [u8; 3],
 
     // Ioctl response tracking
     pub pending_ioctl_id: u16,     // CDC id of last sent ioctl
     pub pending_ioctl_status: i16, // CDC status from response (-1 = no response yet)
-
 }
 
 // ============================================================================
@@ -239,6 +301,20 @@ mod params_def {
 // Helpers
 // ============================================================================
 
+// Elapsed-time computations throughout this module use `saturating_sub`
+// rather than plain subtraction. They compare `now` against a mark taken
+// earlier, and an unchecked `u64` subtraction underflows to ~1.8e19 the
+// instant `now` reads back lower than the mark — which collapses every
+// retry window to zero and sends the phase machine straight to `Error` on
+// its first attempt. `Error` is terminal, so the module then never drains
+// its input again and the failure presents as a driver that was simply
+// never there.
+//
+// Saturating is the fail-safe direction for all three shapes used here: a
+// "wait for delay" keeps waiting, a "fail after timeout" keeps retrying, and
+// a bounded retry window stays open. None of them can be made to fire early
+// by a clock that momentarily disagrees with itself.
+
 unsafe fn log_error(s: &Cyw43State, msg: &[u8]) {
     let sys = &*s.syscalls;
     dev_log(sys, 1, msg.as_ptr(), msg.len());
@@ -271,16 +347,29 @@ unsafe fn fmt_hex32(dst: *mut u8, val: u32) -> usize {
 // Init: WINDOW → CONTROL → OUTEN → OUT → ready (4 steps)
 // Runtime: WINDOW (if needed) → READ → WRITE (read-modify-write, 1-3 steps)
 const LED_OP_IDLE: u8 = 0;
-const LED_OP_INIT_WINDOW: u8 = 1;   // Set backplane window to CHIPCOMMON_BASE
-const LED_OP_INIT_CONTROL: u8 = 2;  // Clear GPIO_CONTROL bit 0 (GPIO mode, not peripheral)
-const LED_OP_INIT_OUTEN: u8 = 3;    // Set GPIO_OUTPUT_EN bit 0 (output enable)
-const LED_OP_INIT_OUT: u8 = 4;      // Clear GPIO_OUTPUT bit 0 (LED off)
-const LED_OP_SEND_WINDOW: u8 = 5;   // Set backplane window (if needed)
-const LED_OP_SEND_WRITE: u8 = 6;    // Write GPIO_OUTPUT bit 0
+const LED_OP_INIT_WINDOW: u8 = 1; // Set backplane window to CHIPCOMMON_BASE
+const LED_OP_INIT_CONTROL: u8 = 2; // Clear GPIO_CONTROL bit 0 (GPIO mode, not peripheral)
+const LED_OP_INIT_OUTEN: u8 = 3; // Set GPIO_OUTPUT_EN bit 0 (output enable)
+const LED_OP_INIT_OUT: u8 = 4; // Clear GPIO_OUTPUT bit 0 (LED off)
+const LED_OP_SEND_WINDOW: u8 = 5; // Set backplane window (if needed)
+const LED_OP_SEND_WRITE: u8 = 6; // Write GPIO_OUTPUT bit 0
 
 /// Maximum firmware chunks per step() call. At 64B/chunk and ~50µs/chunk,
 /// 32 chunks ≈ 1.6ms per step, completing 230KB FW upload in ~115 steps.
-const FW_CHUNKS_PER_STEP: u32 = 32;
+/// Backplane chunks uploaded per `module_step` call during firmware load.
+///
+/// Each chunk is a **synchronous** 64-byte gSPI backplane write preceded by a
+/// window set, so this number directly sets how long one step takes. At 32 it
+/// exceeded `DEFAULT_STEP_DEADLINE_US` (2 ms) and the step guard terminated
+/// the module on its first firmware step — which went unnoticed for as long
+/// as it did only because the RP2350 step guard could not fire at all
+/// (its TIMER1 had no tick), so nothing was measuring this.
+///
+/// Eight keeps a step comfortably inside the deadline with margin for a slow
+/// gSPI response, at the cost of more scheduler passes to move the same
+/// firmware — which is the correct trade for a cooperative scheduler: the
+/// work is bounded per pass rather than fast and occasionally fatal.
+const FW_CHUNKS_PER_STEP: u32 = 8;
 
 // ============================================================================
 // Module API
@@ -288,7 +377,9 @@ const FW_CHUNKS_PER_STEP: u32 = 32;
 
 #[no_mangle]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
@@ -337,13 +428,13 @@ pub extern "C" fn module_new(
             log_info(s, b"[cyw43] led_chan wired");
         }
         s.led_pwm_period = 20; // 50Hz software PWM at 1ms step rate
-        s.bt_in_chan = dev_channel_port(&*s.syscalls, 0, 2);  // in[2]: BT HCI commands
+        s.bt_in_chan = dev_channel_port(&*s.syscalls, 0, 2); // in[2]: BT HCI commands
 
         // Discover secondary output ports
         s.scan_out_chan = dev_channel_port(&*s.syscalls, 1, 1); // out[1]: scan text
         s.scan_bin_chan = dev_channel_port(&*s.syscalls, 1, 2); // out[2]: scan binary
-        s.status_chan = dev_channel_port(&*s.syscalls, 1, 3);   // out[3]: status events
-        s.bt_out_chan = dev_channel_port(&*s.syscalls, 1, 4);   // out[4]: BT HCI events
+        s.status_chan = dev_channel_port(&*s.syscalls, 1, 3); // out[3]: status events
+        s.bt_out_chan = dev_channel_port(&*s.syscalls, 1, 4); // out[4]: BT HCI events
         s.netif_state_chan = dev_channel_port(&*s.syscalls, 1, 5); // out[5]: netif state
 
         // Parse TLV params (sets defaults from schema if not in config)
@@ -378,7 +469,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // ════════════════════════════════════════════════════════════════
-        // CYW43 Phase Transitions (CYW43439 gSPI init sequence)
+        // CYW43439 bring-up phases (gSPI init sequence)
         // ════════════════════════════════════════════════════════════════
         //
         // Phase          | Trigger                  | Next            | Notes
@@ -395,10 +486,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Running        | (steady state)           | —               | event/frame loop
         // Error          | (terminal)               | —               | returns -1
         //
-        // All phases → Error on any failed substep (r < 0).
-        // substep: u8 counter within each phase (sequential, not named states).
+        // Every phase → Error on any failed substep (r < 0).
+        // substep: u8 counter within a phase (sequential, not named states).
         //
-        match s.phase {
+        let phase_before = s.phase;
+        let substep_before = s.substep;
+        let r = match s.phase {
             Cyw43Phase::Init => step_init(s),
             Cyw43Phase::PowerOn => step_power_on(s),
             Cyw43Phase::GspiInit => step_gspi_init(s),
@@ -415,15 +508,62 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.phase = Cyw43Phase::Error;
                 -1
             }
+        };
+        // A halt says where it happened. Every phase turns a failed substep
+        // into `Error` and `-1`, and a module that returns `-1` is retired
+        // by the scheduler without a word; the phase and substep it was in
+        // are the only clue there is, and they are gone with it.
+        if r < 0 && phase_before as u8 != Cyw43Phase::Error as u8 {
+            let mut line = *b"[cyw43] halt phase=00 substep=000";
+            let ph = phase_before as u8 as u32;
+            line[19] = b'0' + ((ph / 10) % 10) as u8;
+            line[20] = b'0' + (ph % 10) as u8;
+            let sub = substep_before as u32;
+            line[30] = b'0' + ((sub / 100) % 10) as u8;
+            line[31] = b'0' + ((sub / 10) % 10) as u8;
+            line[32] = b'0' + (sub % 10) as u8;
+            log_error(s, &line);
         }
+        // Until the driver is running, say where bring-up is once a second:
+        // a wait that never ends is otherwise indistinguishable from one
+        // that has not started, and most waits here have no timeout.
+        if phase_before as u8 != Cyw43Phase::Running as u8 {
+            let sys = &*s.syscalls;
+            let now = dev_millis(sys);
+            if now.saturating_sub(s.wait_report_ms) >= 1000 {
+                s.wait_report_ms = now;
+                let mut line = *b"[cyw43] bringup phase=00 substep=000 txn=0 status=00000000";
+                let ph = s.phase as u8 as u32;
+                line[22] = b'0' + ((ph / 10) % 10) as u8;
+                line[23] = b'0' + (ph % 10) as u8;
+                let sub = s.substep as u32;
+                line[33] = b'0' + ((sub / 100) % 10) as u8;
+                line[34] = b'0' + ((sub / 10) % 10) as u8;
+                line[35] = b'0' + (sub % 10) as u8;
+                line[41] = b'0' + (s.txn_step as u8);
+                let st = s.last_status;
+                let mut k = 0;
+                while k < 8 {
+                    let nib = ((st >> (28 - 4 * k)) & 0xF) as u8;
+                    line[50 + k] = if nib < 10 {
+                        b'0' + nib
+                    } else {
+                        b'a' + nib - 10
+                    };
+                    k += 1;
+                }
+                log_info(s, &line);
+            }
+        }
+        r
     }
 }
 
 // ============================================================================
-// Phase Implementations
+// Bring-up steps
 // ============================================================================
 
-/// Phase 0: Initialize hardware handles
+/// Acquire the hardware handles the rest of bring-up drives.
 unsafe fn step_init(s: &mut Cyw43State) -> i32 {
     let sys = &*s.syscalls;
 
@@ -431,7 +571,12 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
         0 => {
             // Claim power pin (output, initially low = off)
             let mut pwr_arg = [s.pwr_pin];
-            let h = (sys.provider_open)(HAL_GPIO_CONTRACT, dev_gpio::SET_OUTPUT, pwr_arg.as_mut_ptr(), 1);
+            let h = (sys.provider_open)(
+                HAL_GPIO_CONTRACT,
+                dev_gpio::SET_OUTPUT,
+                pwr_arg.as_mut_ptr(),
+                1,
+            );
             if h < 0 {
                 log_error(s, b"[cyw43] pwr pin fail");
                 s.phase = Cyw43Phase::Error;
@@ -443,7 +588,12 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
 
             // Claim CS pin (output, initially high = deasserted)
             let mut cs_arg = [s.cs_pin];
-            let h = (sys.provider_open)(HAL_GPIO_CONTRACT, dev_gpio::SET_OUTPUT, cs_arg.as_mut_ptr(), 1);
+            let h = (sys.provider_open)(
+                HAL_GPIO_CONTRACT,
+                dev_gpio::SET_OUTPUT,
+                cs_arg.as_mut_ptr(),
+                1,
+            );
             if h < 0 {
                 log_error(s, b"[cyw43] cs pin fail");
                 s.phase = Cyw43Phase::Error;
@@ -455,7 +605,12 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
 
             // Allocate PIO command slot — tracked against HAL_PIO.
             let mut alloc_arg = [s.pio_idx, 0u8];
-            let h = (sys.provider_open)(HAL_PIO_CONTRACT, dev_pio::CMD_ALLOC, alloc_arg.as_mut_ptr(), 2);
+            let h = (sys.provider_open)(
+                HAL_PIO_CONTRACT,
+                dev_pio::CMD_ALLOC,
+                alloc_arg.as_mut_ptr(),
+                2,
+            );
             if h < 0 {
                 log_error(s, b"[cyw43] pio alloc fail");
                 s.phase = Cyw43Phase::Error;
@@ -520,7 +675,7 @@ unsafe fn step_init(s: &mut Cyw43State) -> i32 {
     }
 }
 
-/// Phase 1: Power on the chip and wait for startup
+/// Power the chip on and wait out its startup time.
 unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
     let sys = &*s.syscalls;
 
@@ -536,7 +691,7 @@ unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
         1 => {
             // Wait for power-on delay
             let now = dev_millis(sys);
-            if now - s.last_time_ms >= POWER_ON_DELAY_MS {
+            if now.saturating_sub(s.last_time_ms) >= POWER_ON_DELAY_MS {
                 log_info(s, b"[cyw43] pwr delay done, gspi init");
                 s.phase = Cyw43Phase::GspiInit;
                 s.substep = 0;
@@ -550,9 +705,9 @@ unsafe fn step_power_on(s: &mut Cyw43State) -> i32 {
     }
 }
 
-/// Phase 2: Initialize gSPI bus and verify communication
+/// Bring up the gSPI bus and confirm the chip answers on it.
 ///
-/// Sequence (matching Embassy cyw43-pio init_bus):
+/// Sequence (the cyw43-driver's init_bus):
 ///   0-1: Read TEST_RO with swap16 until FEEDBEAD (chip ready, still in 16-bit mode)
 ///   2-3: Write combined bus config (BUS_CONFIG_INIT) with swap16 (sets 32-bit mode)
 ///   4-5: Write F1 response delay = 4 (now in 32-bit mode, normal write)
@@ -571,14 +726,22 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
         1 => {
             // Read TEST_RO with swap16 (chip still in 16-bit word mode)
             let r = gspi::bus_read32_swapped_start(s, REG_BUS_TEST_RO);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 2;
             0
         }
         2 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             let test_val = gspi::rxn_u32_swapped(s);
             if test_val == TEST_PATTERN {
@@ -588,7 +751,7 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             }
 
             // Retry until timeout
-            let elapsed = dev_millis(sys) - s.last_time_ms;
+            let elapsed = dev_millis(sys).saturating_sub(s.last_time_ms);
             if elapsed < 1000 {
                 s.substep = 1; // retry
                 return 0;
@@ -613,8 +776,13 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
         }
         4 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 5;
             0
         }
@@ -623,14 +791,22 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
         5 => {
             // Chip is now in 32-bit word mode; use normal (unswapped) writes
             let r = gspi::bus_write8_start(s, REG_BUS_RESP_DELAY_F1, GSPI_RESPONSE_DELAY as u8);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 6;
             0
         }
         6 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 7;
             0
         }
@@ -638,14 +814,22 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
         // ---- Step 7-8: Verify TEST_RO in normal 32-bit mode ----
         7 => {
             let r = gspi::bus_read32_start(s, REG_BUS_TEST_RO);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 8;
             0
         }
         8 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             let test_val = gspi::rxn_u32(s);
             if test_val != TEST_PATTERN {
@@ -657,18 +841,26 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             0
         }
 
-        // ---- Step 9+: ALP clock, interrupts (same as before, renumbered) ----
+        // ---- Step 9+: ALP clock, interrupts ----
         9 => {
             // Enable ALP clock
             let r = gspi::wrapper_write8_start(s, REG_BP_CHIP_CLOCK_CSR, BP_CLK_ALP_REQUEST as u8);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 10;
             0
         }
         10 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.last_time_ms = dev_millis(sys);
             s.substep = 11;
             0
@@ -676,21 +868,29 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
         11 => {
             // Poll for ALP clock available
             let r = gspi::wrapper_read8_start(s, REG_BP_CHIP_CLOCK_CSR);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 12;
             0
         }
         12 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             let clk = gspi::rxn_u8(s) as u32;
             if clk & BP_CLK_ALP_AVAILABLE != 0 {
                 s.substep = 13;
             } else {
                 let now = dev_millis(sys);
-                if now - s.last_time_ms > ALP_TIMEOUT_MS {
+                if now.saturating_sub(s.last_time_ms) > ALP_TIMEOUT_MS {
                     log_error(s, b"[cyw43] alp timeout");
                     s.phase = Cyw43Phase::Error;
                     return -1;
@@ -702,14 +902,22 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
         13 => {
             // Clear ALP request, force ALP (required before backplane access)
             let r = gspi::wrapper_write8_start(s, REG_BP_CHIP_CLOCK_CSR, BP_CLK_FORCE_ALP as u8);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 14;
             0
         }
         14 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 15;
             0
         }
@@ -717,14 +925,22 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             // Enable F2 packet available interrupt
             let irq_en = IRQ_F2_PACKET_AVAILABLE | IRQ_DATA_UNAVAILABLE;
             let r = gspi::bus_write32_start(s, REG_BUS_INTERRUPT_ENABLE, irq_en);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 16;
             0
         }
         16 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             // Always proceed to ChipPrep → firmware loading.
             // CYW43 GPIO needs firmware + HT clock to drive physical pins.
@@ -734,13 +950,16 @@ unsafe fn step_gspi_init(s: &mut Cyw43State) -> i32 {
             0
         }
 
-        _ => { s.substep = 0; 0 }
+        _ => {
+            s.substep = 0;
+            0
+        }
     }
 }
 
-/// Phase 3: Chip preparation — disable WLAN core, reset SOCSRAM, configure remap.
+/// Prepare the chip: disable the WLAN core, reset SOCSRAM, configure remap.
 ///
-/// Matches Embassy's init sequence before firmware upload:
+/// The init sequence before firmware upload:
 ///   core_disable(WLAN)      — ensure ARM core is stopped
 ///   core_disable(SOCSRAM)   — stop SOCSRAM
 ///   core_reset(SOCSRAM)     — bring SOCSRAM out of reset with clocks
@@ -762,99 +981,180 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
         // Set window for WLAN wrapper registers
         0 => {
             let r = gspi::bp_set_window(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            if r > 0 { s.substep = 1; return 0; }
-            s.substep = 2; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            if r > 0 {
+                s.substep = 1;
+                return 0;
+            }
+            s.substep = 2;
+            0
         }
         1 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             gspi::bp_window_done(s);
-            s.substep = 2; 0
+            s.substep = 2;
+            0
         }
         // Dummy read of RESETCTRL
         2 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 3; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 3;
+            0
         }
         3 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 4; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 4;
+            0
         }
         // Read RESETCTRL — check if already in reset
         4 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 5; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 5;
+            0
         }
         5 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             let val = gspi::rxn_u8(s);
             if val & AI_RESETCTRL_BIT_RESET != 0 {
                 // Already in reset — skip to core_disable(SOCSRAM)
-                s.substep = 16; return 0;
+                s.substep = 16;
+                return 0;
             }
-            s.substep = 6; 0
+            s.substep = 6;
+            0
         }
         // Write 0 to IOCTRL (disable clocks)
         6 => {
             let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 7; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 7;
+            0
         }
         7 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 8; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 8;
+            0
         }
         // Readback IOCTRL
         8 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 9; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 9;
+            0
         }
         9 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
-            s.substep = 10; 0
+            s.substep = 10;
+            0
         }
         10 => {
-            if dev_millis(sys) - s.last_time_ms < 1 { return 0; }
-            s.substep = 11; 0
+            if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
+                return 0;
+            }
+            s.substep = 11;
+            0
         }
         // Assert reset
         11 => {
-            let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET, AI_RESETCTRL_BIT_RESET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 12; 0
+            let r = gspi::bp_write8_start(
+                s,
+                WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET,
+                AI_RESETCTRL_BIT_RESET,
+            );
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 12;
+            0
         }
         12 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 13; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 13;
+            0
         }
         // Readback RESETCTRL
         13 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 14; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 14;
+            0
         }
         14 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 16; 0 // Skip 15, fall through to SOCSRAM
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 16;
+            0 // Skip 15, fall through to SOCSRAM
         }
 
         // ================================================================
@@ -867,98 +1167,179 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
         // Set window for SOCSRAM wrapper registers
         16 => {
             let r = gspi::bp_set_window(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            if r > 0 { s.substep = 17; return 0; }
-            s.substep = 18; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            if r > 0 {
+                s.substep = 17;
+                return 0;
+            }
+            s.substep = 18;
+            0
         }
         17 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             gspi::bp_window_done(s);
-            s.substep = 18; 0
+            s.substep = 18;
+            0
         }
         // Dummy read RESETCTRL
         18 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 19; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 19;
+            0
         }
         19 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 20; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 20;
+            0
         }
         // Read RESETCTRL — check if already in reset
         20 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 21; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 21;
+            0
         }
         21 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             let val = gspi::rxn_u8(s);
             if val & AI_RESETCTRL_BIT_RESET != 0 {
                 // Already in reset — skip to core_reset enable part
-                s.substep = 32; return 0;
+                s.substep = 32;
+                return 0;
             }
-            s.substep = 22; 0
+            s.substep = 22;
+            0
         }
         // Write 0 to IOCTRL
         22 => {
             let r = gspi::bp_write8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 23; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 23;
+            0
         }
         23 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 24; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 24;
+            0
         }
         // Readback IOCTRL
         24 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 25; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 25;
+            0
         }
         25 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.last_time_ms = dev_millis(sys);
-            s.substep = 26; 0
+            s.substep = 26;
+            0
         }
         26 => {
-            if dev_millis(sys) - s.last_time_ms < 1 { return 0; }
-            s.substep = 27; 0
+            if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
+                return 0;
+            }
+            s.substep = 27;
+            0
         }
         // Assert reset
         27 => {
-            let r = gspi::bp_write8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET, AI_RESETCTRL_BIT_RESET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 28; 0
+            let r = gspi::bp_write8_start(
+                s,
+                SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET,
+                AI_RESETCTRL_BIT_RESET,
+            );
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 28;
+            0
         }
         28 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 29; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 29;
+            0
         }
         // Readback RESETCTRL
         29 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 30; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 30;
+            0
         }
         30 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 32; 0 // Skip 31, fall through to core_reset enable
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 32;
+            0 // Skip 31, fall through to core_reset enable
         }
 
         // ================================================================
@@ -968,77 +1349,139 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
 
         // Write FGC | CLOCK_EN to IOCTRL
         32 => {
-            let r = gspi::bp_write8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET,
-                AI_IOCTRL_BIT_FGC | AI_IOCTRL_BIT_CLOCK_EN);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 33; 0
+            let r = gspi::bp_write8_start(
+                s,
+                SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET,
+                AI_IOCTRL_BIT_FGC | AI_IOCTRL_BIT_CLOCK_EN,
+            );
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 33;
+            0
         }
         33 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 34; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 34;
+            0
         }
         // Readback IOCTRL
         34 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 35; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 35;
+            0
         }
         35 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 36; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 36;
+            0
         }
         // Deassert reset
         36 => {
             let r = gspi::bp_write8_start(s, SOCSRAM_WRAPPER_BASE + AI_RESETCTRL_OFFSET, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 37; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 37;
+            0
         }
         37 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
-            s.substep = 38; 0
+            s.substep = 38;
+            0
         }
         38 => {
-            if dev_millis(sys) - s.last_time_ms < 1 { return 0; }
-            s.substep = 39; 0
+            if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
+                return 0;
+            }
+            s.substep = 39;
+            0
         }
         // Remove force-clock, keep clock-enable
         39 => {
-            let r = gspi::bp_write8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET,
-                AI_IOCTRL_BIT_CLOCK_EN);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 40; 0
+            let r = gspi::bp_write8_start(
+                s,
+                SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET,
+                AI_IOCTRL_BIT_CLOCK_EN,
+            );
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 40;
+            0
         }
         40 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 41; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 41;
+            0
         }
         // Readback IOCTRL
         41 => {
             let r = gspi::bp_read8_start(s, SOCSRAM_WRAPPER_BASE + AI_IOCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 42; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 42;
+            0
         }
         42 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
-            s.substep = 43; 0
+            s.substep = 43;
+            0
         }
         43 => {
-            if dev_millis(sys) - s.last_time_ms < 1 { return 0; }
-            s.substep = 44; 0
+            if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
+                return 0;
+            }
+            s.substep = 44;
+            0
         }
 
         // ================================================================
@@ -1051,39 +1494,71 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
         // Set window for SOCSRAM core registers
         44 => {
             let r = gspi::bp_set_window(s, SOCSRAM_BASE + SOCSRAM_BANKX_INDEX);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            if r > 0 { s.substep = 45; return 0; }
-            s.substep = 46; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            if r > 0 {
+                s.substep = 45;
+                return 0;
+            }
+            s.substep = 46;
+            0
         }
         45 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             gspi::bp_window_done(s);
-            s.substep = 46; 0
+            s.substep = 46;
+            0
         }
         // Write BANKX_INDEX = 3
         46 => {
             let r = gspi::bp_write32_start(s, SOCSRAM_BASE + SOCSRAM_BANKX_INDEX, 3);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 47; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 47;
+            0
         }
         47 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 48; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 48;
+            0
         }
         // Write BANKX_PDA = 0
         48 => {
             let r = gspi::bp_write32_start(s, SOCSRAM_BASE + SOCSRAM_BANKX_PDA, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 49; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 49;
+            0
         }
         49 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             log_info(s, b"[cyw43] chip prep done, loading fw");
             s.phase = Cyw43Phase::LoadFw;
@@ -1091,11 +1566,14 @@ unsafe fn step_chip_prep(s: &mut Cyw43State) -> i32 {
             s.fw_offset = 0;
             0
         }
-        _ => { s.substep = 0; 0 }
+        _ => {
+            s.substep = 0;
+            0
+        }
     }
 }
 
-/// Phase 4: Upload firmware to chip ATCM RAM
+/// Upload firmware into the chip's ATCM RAM.
 unsafe fn step_load_fw(s: &mut Cyw43State) -> i32 {
     let fw = FIRMWARE;
     let fw_len = fw.len() as u32;
@@ -1114,7 +1592,10 @@ unsafe fn step_load_fw(s: &mut Cyw43State) -> i32 {
         };
         let fw_ptr = fw.as_ptr().add(s.fw_offset as usize);
         let r = gspi::bp_write_block_sync(s, addr, fw_ptr, chunk);
-        if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+        if r < 0 {
+            s.phase = Cyw43Phase::Error;
+            return -1;
+        }
         s.fw_offset += chunk as u32;
         chunks_done += 1;
     }
@@ -1128,7 +1609,7 @@ unsafe fn step_load_fw(s: &mut Cyw43State) -> i32 {
     0
 }
 
-/// Phase 5: Upload NVRAM data to end of chip RAM + write length magic word.
+/// Upload NVRAM to the end of chip RAM and write its length magic word.
 /// Same loop-optimized state machine as step_load_fw.
 unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
     let nvram = NVRAM;
@@ -1153,7 +1634,10 @@ unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
             let zeros = [0u8; 4];
             gspi::bp_write_block_sync(s, addr, zeros.as_ptr(), chunk)
         };
-        if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+        if r < 0 {
+            s.phase = Cyw43Phase::Error;
+            return -1;
+        }
         s.fw_offset += chunk as u32;
         chunks_done += 1;
     }
@@ -1168,11 +1652,17 @@ unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
     let magic = (!nvram_len_words << 16) | nvram_len_words;
 
     let r = gspi::bp_set_window_sync(s, magic_addr);
-    if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+    if r < 0 {
+        s.phase = Cyw43Phase::Error;
+        return -1;
+    }
 
     let magic_data = magic.to_le_bytes();
     let r = gspi::txn_write_sync(s, FUNC_BACKPLANE, magic_addr & BP_WIN_MASK, &magic_data);
-    if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+    if r < 0 {
+        s.phase = Cyw43Phase::Error;
+        return -1;
+    }
 
     log_info(s, b"[cyw43] nvram done, wait ready");
     s.phase = Cyw43Phase::WaitReady;
@@ -1181,7 +1671,7 @@ unsafe fn step_load_nvram(s: &mut Cyw43State) -> i32 {
     0
 }
 
-/// Phase 7: Upload CLM blob via iovar
+/// Upload the CLM blob through an iovar.
 unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
     let clm = CLM;
     let clm_len = clm.len() as u32;
@@ -1206,10 +1696,14 @@ unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
             };
 
             // CLM download header (12 bytes): flag(u16), type(u16), len(u32), crc(u32)
-            // Embassy: flag always includes DOWNLOAD_FLAG_HANDLER_VER (0x1000)
+            // The flag always includes DOWNLOAD_FLAG_HANDLER_VER (0x1000)
             let mut flag: u16 = 0x1000; // HANDLER_VER
-            if s.fw_offset == 0 { flag |= 0x0002; } // DL_BEGIN
-            if s.fw_offset + chunk as u32 >= clm_len { flag |= 0x0004; } // DL_END
+            if s.fw_offset == 0 {
+                flag |= 0x0002;
+            } // DL_BEGIN
+            if s.fw_offset + chunk as u32 >= clm_len {
+                flag |= 0x0004;
+            } // DL_END
 
             let iovar_name = b"clmload\0";
             let hdr_len = iovar_name.len() + 12 + chunk;
@@ -1272,8 +1766,13 @@ unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
         }
         1 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             let remaining = clm_len - s.fw_offset;
             let chunk = if remaining > CLM_CHUNK_SIZE as u32 {
@@ -1285,13 +1784,16 @@ unsafe fn step_load_clm(s: &mut Cyw43State) -> i32 {
             s.substep = 0;
             0
         }
-        _ => { s.substep = 0; 0 }
+        _ => {
+            s.substep = 0;
+            0
+        }
     }
 }
 
-/// Phase 6: core_reset(WLAN) + wait for HT clock + F2 ready.
+/// Reset the WLAN core, then wait for the HT clock and F2 to come ready.
 ///
-/// Matches Embassy's sequence exactly:
+/// The sequence:
 ///   1. core_disable(WLAN) via wrapper registers at 0x18103000
 ///   2. Enable WLAN core (FGC|CLOCK_EN → deassert reset → 1ms → CLOCK_EN → 1ms)
 ///   3. Poll HT_AVAILABLE in chip clock CSR (firmware brings this up, ~29ms)
@@ -1309,98 +1811,179 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
         // Set window for WLAN wrapper
         0 => {
             let r = gspi::bp_set_window(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            if r > 0 { s.substep = 1; return 0; }
-            s.substep = 2; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            if r > 0 {
+                s.substep = 1;
+                return 0;
+            }
+            s.substep = 2;
+            0
         }
         1 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             gspi::bp_window_done(s);
-            s.substep = 2; 0
+            s.substep = 2;
+            0
         }
         // Dummy read RESETCTRL
         2 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 3; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 3;
+            0
         }
         3 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 4; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 4;
+            0
         }
         // Read RESETCTRL — check if already in reset
         4 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 5; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 5;
+            0
         }
         5 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             let val = gspi::rxn_u8(s);
             if val & AI_RESETCTRL_BIT_RESET != 0 {
                 // Already in reset — skip to core_reset enable part
-                s.substep = 16; return 0;
+                s.substep = 16;
+                return 0;
             }
-            s.substep = 6; 0
+            s.substep = 6;
+            0
         }
         // Write 0 to IOCTRL (disable clocks)
         6 => {
             let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 7; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 7;
+            0
         }
         7 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 8; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 8;
+            0
         }
         // Readback IOCTRL
         8 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 9; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 9;
+            0
         }
         9 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.last_time_ms = dev_millis(sys);
-            s.substep = 10; 0
+            s.substep = 10;
+            0
         }
         10 => {
-            if dev_millis(sys) - s.last_time_ms < 1 { return 0; }
-            s.substep = 11; 0
+            if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
+                return 0;
+            }
+            s.substep = 11;
+            0
         }
         // Assert reset
         11 => {
-            let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET, AI_RESETCTRL_BIT_RESET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 12; 0
+            let r = gspi::bp_write8_start(
+                s,
+                WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET,
+                AI_RESETCTRL_BIT_RESET,
+            );
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 12;
+            0
         }
         12 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 13; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 13;
+            0
         }
         // Readback RESETCTRL
         13 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 14; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 14;
+            0
         }
         14 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 16; 0 // Fall through to enable
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 16;
+            0 // Fall through to enable
         }
 
         // ================================================================
@@ -1410,77 +1993,139 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
 
         // Write FGC | CLOCK_EN to IOCTRL
         16 => {
-            let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET,
-                AI_IOCTRL_BIT_FGC | AI_IOCTRL_BIT_CLOCK_EN);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 17; 0
+            let r = gspi::bp_write8_start(
+                s,
+                WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET,
+                AI_IOCTRL_BIT_FGC | AI_IOCTRL_BIT_CLOCK_EN,
+            );
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 17;
+            0
         }
         17 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 18; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 18;
+            0
         }
         // Readback IOCTRL
         18 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 19; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 19;
+            0
         }
         19 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 20; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 20;
+            0
         }
         // Deassert reset
         20 => {
             let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_RESETCTRL_OFFSET, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 21; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 21;
+            0
         }
         21 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
-            s.substep = 22; 0
+            s.substep = 22;
+            0
         }
         22 => {
-            if dev_millis(sys) - s.last_time_ms < 1 { return 0; }
-            s.substep = 23; 0
+            if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
+                return 0;
+            }
+            s.substep = 23;
+            0
         }
         // Remove force-clock, keep clock-enable
         23 => {
-            let r = gspi::bp_write8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET,
-                AI_IOCTRL_BIT_CLOCK_EN);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 24; 0
+            let r = gspi::bp_write8_start(
+                s,
+                WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET,
+                AI_IOCTRL_BIT_CLOCK_EN,
+            );
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 24;
+            0
         }
         24 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 25; 0
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 25;
+            0
         }
         // Readback IOCTRL
         25 => {
             let r = gspi::bp_read8_start(s, WLAN_WRAPPER_BASE + AI_IOCTRL_OFFSET);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 26; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 26;
+            0
         }
         26 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             // 1ms delay
             s.last_time_ms = dev_millis(sys);
-            s.substep = 27; 0
+            s.substep = 27;
+            0
         }
         27 => {
-            if dev_millis(sys) - s.last_time_ms < 1 { return 0; }
-            s.substep = 28; 0
+            if dev_millis(sys).saturating_sub(s.last_time_ms) < 1 {
+                return 0;
+            }
+            s.substep = 28;
+            0
         }
 
         // ================================================================
@@ -1488,24 +2133,34 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
         // ================================================================
         28 => {
             s.last_time_ms = dev_millis(sys);
-            s.substep = 29; 0
+            s.substep = 29;
+            0
         }
         29 => {
             let r = gspi::wrapper_read8_start(s, REG_BP_CHIP_CLOCK_CSR);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 30; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 30;
+            0
         }
         30 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             let clk = gspi::rxn_u8(s) as u32;
             if clk & BP_CLK_HT_AVAILABLE != 0 {
                 s.substep = 31;
             } else {
                 let now = dev_millis(sys);
-                if now - s.last_time_ms > HT_TIMEOUT_MS {
+                if now.saturating_sub(s.last_time_ms) > HT_TIMEOUT_MS {
                     log_error(s, b"[cyw43] ht timeout");
                     s.phase = Cyw43Phase::Error;
                     return -1;
@@ -1520,17 +2175,27 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
         // ================================================================
         31 => {
             s.last_time_ms = dev_millis(sys);
-            s.substep = 32; 0
+            s.substep = 32;
+            0
         }
         32 => {
             let r = gspi::bus_read32_start(s, REG_BUS_STATUS);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
-            s.substep = 33; 0
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            s.substep = 33;
+            0
         }
         33 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
 
             let status = gspi::rxn_u32(s);
             if status & STATUS_F2_RX_READY != 0 {
@@ -1547,7 +2212,7 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
                 }
             } else {
                 let now = dev_millis(sys);
-                if now - s.last_time_ms > FW_READY_TIMEOUT_MS {
+                if now.saturating_sub(s.last_time_ms) > FW_READY_TIMEOUT_MS {
                     log_error(s, b"[cyw43] fw timeout");
                     s.phase = Cyw43Phase::Error;
                     return -1;
@@ -1556,13 +2221,16 @@ unsafe fn step_wait_ready(s: &mut Cyw43State) -> i32 {
             }
             0
         }
-        _ => { s.substep = 0; 0 }
+        _ => {
+            s.substep = 0;
+            0
+        }
     }
 }
 
-/// Phase 6: Initialize WiFi subsystem
+/// Initialise the wifi subsystem.
 ///
-/// Matches Embassy cyw43 init sequence:
+/// The cyw43-driver's init sequence:
 ///   bus:txglom=0 → country → ampdu_ba_wsize=8 → ampdu_mpdu=4
 ///   → event_msgs → WLC_UP → PM=0 → GMode=1
 unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
@@ -1570,61 +2238,93 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
         // ── bus:txglom=0 (disable TX glomming) ──────────────────
         0 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BUS_TXGLOM, &0u32.to_le_bytes());
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 1;
             0
         }
         1 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 2;
             0
         }
         // ── country=XX ──────────────────────────────────────────
         2 => {
             let country = [
-                b'X', b'X', 0, 0,        // country_abbrev
-                b'X', b'X', 0, 0,        // country_code
-                0xFF, 0xFF, 0xFF, 0xFF,   // rev = -1 (i32 LE)
+                b'X', b'X', 0, 0, // country_abbrev
+                b'X', b'X', 0, 0, // country_code
+                0xFF, 0xFF, 0xFF, 0xFF, // rev = -1 (i32 LE)
             ];
             let r = wifi_ops::ioctl_set_var(s, IOVAR_COUNTRY, &country);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 3;
             0
         }
         3 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 4;
             0
         }
         // ── ampdu_ba_wsize=8 (AMPDU block-ack window) ───────────
         4 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_AMPDU_BA_WSIZE, &8u32.to_le_bytes());
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 5;
             0
         }
         5 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 6;
             0
         }
         // ── ampdu_mpdu=4 (max MPDUs per AMPDU) ──────────────────
         6 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_AMPDU_MPDU, &4u32.to_le_bytes());
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 7;
             0
         }
         7 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 8;
             0
         }
@@ -1638,35 +2338,51 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
                 evtmask[i] = 0xFF;
                 i += 1;
             }
-            evtmask[4 + 19/8] &= !(1u8 << (19 % 8)); // ROAM
-            evtmask[4 + 40/8] &= !(1u8 << (40 % 8)); // RADIO
-            evtmask[4 + 44/8] &= !(1u8 << (44 % 8)); // PROBREQ_MSG
-            evtmask[4 + 54/8] &= !(1u8 << (54 % 8)); // IF
-            evtmask[4 + 71/8] &= !(1u8 << (71 % 8)); // PROBRESP_MSG
-            evtmask[4 + 137/8] &= !(1u8 << (137 % 8)); // PROBREQ_MSG_RX
+            evtmask[4 + 19 / 8] &= !(1u8 << (19 % 8)); // ROAM
+            evtmask[4 + 40 / 8] &= !(1u8 << (40 % 8)); // RADIO
+            evtmask[4 + 44 / 8] &= !(1u8 << (44 % 8)); // PROBREQ_MSG
+            evtmask[4 + 54 / 8] &= !(1u8 << (54 % 8)); // IF
+            evtmask[4 + 71 / 8] &= !(1u8 << (71 % 8)); // PROBRESP_MSG
+            evtmask[4 + 137 / 8] &= !(1u8 << (137 % 8)); // PROBREQ_MSG_RX
             let r = wifi_ops::ioctl_set_var(s, IOVAR_EVT_MASK, &evtmask);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 9;
             0
         }
         9 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 10;
             0
         }
         // ── WLC_UP ──────────────────────────────────────────────
         10 => {
             let r = wifi_ops::ioctl_set_u32(s, WLC_UP, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 11;
             0
         }
         11 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 12;
             0
         }
@@ -1675,116 +2391,184 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             let mut val = [0u8; 8];
             val[4] = 1; // iface_idx=0, value=1 (enable)
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BSSCFG_SUP_WPA, &val);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 13;
             0
         }
         13 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 14;
             0
         }
         // ── sup_wpa2_eapver=-1 (accept any EAP version) ─────────
         14 => {
             let mut val = [0u8; 8];
-            val[4] = 0xFF; val[5] = 0xFF; val[6] = 0xFF; val[7] = 0xFF;
+            val[4] = 0xFF;
+            val[5] = 0xFF;
+            val[6] = 0xFF;
+            val[7] = 0xFF;
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BSSCFG_SUP_WPA2_EAPVER, &val);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 15;
             0
         }
         15 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 16;
             0
         }
         // ── sup_wpa_tmo=2500 (WPA handshake timeout) ────────────
         16 => {
             let mut val = [0u8; 8];
-            val[4] = 0xC4; val[5] = 0x09; // iface_idx=0, value=2500
+            val[4] = 0xC4;
+            val[5] = 0x09; // iface_idx=0, value=2500
             let r = wifi_ops::ioctl_set_var(s, IOVAR_BSSCFG_SUP_WPA_TMO, &val);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 17;
             0
         }
         17 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 18;
             0
         }
         // ── PM=0 (disable power management) ─────────────────────
         18 => {
             let r = wifi_ops::ioctl_set_u32(s, WLC_SET_PM, 0);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 19;
             0
         }
         19 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 20;
             0
         }
         // ── GMode=1 (auto) ──────────────────────────────────────
         20 => {
             let r = wifi_ops::ioctl_set_u32(s, WLC_SET_GMODE, 1);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 21;
             0
         }
         21 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 22;
             0
         }
         // ── arp_ol=0 (disable ARP offloading) ────────────────────
         22 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_ARP_OL, &0u32.to_le_bytes());
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 23;
             0
         }
         23 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 24;
             0
         }
         // ── arp_version=0 ────────────────────────────────────────
         24 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_ARP_VERSION, &0u32.to_le_bytes());
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 25;
             0
         }
         25 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 26;
             0
         }
         // ── allmulti=1 (receive all multicast/broadcast frames) ──
         26 => {
             let r = wifi_ops::ioctl_set_var(s, IOVAR_ALLMULTI, &1u32.to_le_bytes());
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 27;
             0
         }
         27 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 28;
             0
         }
@@ -1792,55 +2576,89 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
         28 => {
             let name = b"cur_etheraddr\0";
             let r = wifi_ops::ioctl_get_var(s, name, 6);
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.substep = 29;
             0
         }
         29 => {
             let r = gspi::txn_poll(s);
-            if r == 0 { return 0; }
-            if r < 0 { s.phase = Cyw43Phase::Error; return -1; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             s.mac_retries = 0;
             s.substep = 30;
             0
         }
         // Poll for ioctl response containing MAC
         30 => {
-            // Read bus status
-            let r = gspi::bus_read32_start(s, REG_BUS_STATUS);
-            if r < 0 { return 0; }
+            // One transaction per step: start the status read, and read it
+            // back on a later step once it has completed. A start and a
+            // poll in the same step only ever worked while the transfer
+            // finished inside the start; with the bus asynchronous, the
+            // poll finds it in flight, the next step's start finds it
+            // still in flight, and nothing ever polls it again.
+            if s.txn_step == gspi::TxnStep::Idle {
+                let r = gspi::bus_read32_start(s, REG_BUS_STATUS);
+                if r < 0 {
+                    s.phase = Cyw43Phase::Error;
+                    return -1;
+                }
+                return 0;
+            }
             let r = gspi::txn_poll(s);
-            if r <= 0 { return 0; }
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
             let status = gspi::rxn_u32(s);
+            s.last_status = status;
             if status & STATUS_F2_PKT_AVAILABLE == 0 {
-                // No packet yet — check retry limit
                 s.mac_retries += 1;
                 if s.mac_retries > 50 {
-                    // Give up, continue with zeroed MAC
                     s.phase = Cyw43Phase::RegisterNetif;
                     s.substep = 0;
                     s.wifi_state = Cyw43WifiState::Ready;
                 }
                 return 0;
             }
-            let pkt_len = ((status >> STATUS_F2_PKT_LEN_SHIFT)
-                & STATUS_F2_PKT_LEN_MASK) as usize;
+            let pkt_len = ((status >> STATUS_F2_PKT_LEN_SHIFT) & STATUS_F2_PKT_LEN_MASK) as usize;
             if pkt_len == 0 || pkt_len > 1500 {
                 return 0;
             }
-            // Read the frame
             let r = gspi::wlan_read_start(s, pkt_len);
-            if r < 0 { return 0; }
+            if r < 0 {
+                return 0;
+            }
+            s.frame_len = pkt_len as u16;
+            s.substep = 31;
+            0
+        }
+        31 => {
             let r = gspi::txn_poll(s);
-            if r <= 0 { return 0; }
-
-            // Parse SDPCM header
+            if r == 0 {
+                return 0;
+            }
+            if r < 0 {
+                s.phase = Cyw43Phase::Error;
+                return -1;
+            }
+            let pkt_len = s.frame_len as usize;
             let payload = gspi::rxn_payload_ptr(s);
-            let (channel, data_offset, data_len) =
-                gspi::parse_sdpcm_header(payload, pkt_len);
+            let (channel, data_offset, data_len) = gspi::parse_sdpcm_header(payload, pkt_len);
             if channel != SDPCM_CHAN_CONTROL as i8 || data_len < CDC_HEADER_LEN + 6 {
                 // Not a control response or too small — discard and retry
                 s.mac_retries += 1;
+                s.substep = 30;
                 if s.mac_retries > 30 {
                     s.phase = Cyw43Phase::RegisterNetif;
                     s.substep = 0;
@@ -1854,6 +2672,7 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             if cmd != WLC_GET_VAR {
                 // Stale ioctl response (SET_VAR etc.) — discard and retry
                 s.mac_retries += 1;
+                s.substep = 30;
                 if s.mac_retries > 30 {
                     s.phase = Cyw43Phase::RegisterNetif;
                     s.substep = 0;
@@ -1876,14 +2695,20 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
                 let mut buf = [0u8; 36];
                 let prefix = b"[cyw43] mac=";
                 let mut p = 0usize;
-                while p < prefix.len() { buf[p] = prefix[p]; p += 1; }
+                while p < prefix.len() {
+                    buf[p] = prefix[p];
+                    p += 1;
+                }
                 let hex = b"0123456789abcdef";
                 m = 0;
                 while m < 6 {
                     buf[p] = hex[(s.mac_addr[m] >> 4) as usize];
                     buf[p + 1] = hex[(s.mac_addr[m] & 0x0F) as usize];
                     p += 2;
-                    if m < 5 { buf[p] = b':'; p += 1; }
+                    if m < 5 {
+                        buf[p] = b':';
+                        p += 1;
+                    }
                     m += 1;
                 }
                 dev_log(sys, 1, buf.as_ptr(), p);
@@ -1894,11 +2719,14 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
             s.wifi_state = Cyw43WifiState::Ready;
             0
         }
-        _ => { s.substep = 0; 0 }
+        _ => {
+            s.substep = 0;
+            0
+        }
     }
 }
 
-/// Phase 7: Signal radio-ready state and transition to Running.
+/// Signal the radio ready and move to the running state.
 unsafe fn step_register_netif(s: &mut Cyw43State) -> i32 {
     let sys = &*s.syscalls;
 
@@ -1916,41 +2744,80 @@ unsafe fn step_register_netif(s: &mut Cyw43State) -> i32 {
                 let bp = buf.as_mut_ptr();
                 let prefix = b"[cyw43] ready t+";
                 let mut p = 0;
-                while p < prefix.len() { *bp.add(p) = *prefix.as_ptr().add(p); p += 1; }
+                while p < prefix.len() {
+                    *bp.add(p) = *prefix.as_ptr().add(p);
+                    p += 1;
+                }
                 p += fmt_u32_raw(buf.as_mut_ptr().add(p), ms as u32);
-                *bp.add(p) = b'm'; p += 1;
-                *bp.add(p) = b's'; p += 1;
+                *bp.add(p) = b'm';
+                p += 1;
+                *bp.add(p) = b's';
+                p += 1;
                 dev_log(sys, 1, bp, p);
             }
             emit_status_event(s, MSG_RADIO_READY, &[]);
             3 // StepOutcome::Ready
         }
-        _ => { s.substep = 0; 0 }
+        _ => {
+            s.substep = 0;
+            0
+        }
     }
 }
 
-/// Phase 8: Running — poll for events, handle frame I/O, service WiFi ops.
+/// Running: poll for events, carry frames, and service wifi operations.
 ///
 /// Architecture: Each section performs at most one gSPI transaction per step()
 /// call. F2 polling runs unconditionally (needed for ioctl responses even in
 /// LED-only mode). LED operations are a state machine interleaved with WiFi I/O.
 ///
-/// frame_buf contention (Issue #4): frame_buf is a staging buffer for building
-/// SDPCM frames. txn_write() copies data into txn_buf before the synchronous
-/// PIO DMA transfer, so frame_buf is immediately reusable. No actual contention
-/// exists between TX frames and ioctl commands.
+/// `frame_buf` is a staging buffer for building SDPCM frames. `txn_write()`
+/// copies data into `txn_buf` before the synchronous PIO DMA transfer, so
+/// `frame_buf` is free again the moment the call returns: TX frames and ioctl
+/// commands never contend for it.
 ///
-/// CDC id matching (Issue #5): Ioctl responses are counted via ioctl_recv_count
-/// in process_rx_frame. Since only one ioctl is in flight at a time (enforced by
-/// txn_step == Idle gating), sequential count matching is sufficient. CDC id
-/// field matching can be added when concurrent ioctl support (Issue #13) is needed.
+/// Ioctl responses are counted via `ioctl_recv_count` in `process_rx_frame`.
+/// Only one ioctl is ever in flight (the `txn_step == Idle` gate enforces it),
+/// so matching responses to requests by sequential count is sufficient;
+/// matching on the CDC id field is what concurrent ioctls would require.
 /// Poll chip status, start F2/F3 reads, handle read completions.
 unsafe fn step_rx(s: &mut Cyw43State) {
     // Poll chip status for incoming frames (only when no txn in progress)
+    // A transaction nobody is waiting for — started by a path that assumed
+    // it would finish inside the start — would otherwise hold the bus for
+    // ever: nothing polls it, so it never completes, so nothing else can
+    // start. Finish it here and discard the result; the caller that
+    // abandoned it has already moved on.
+    if s.txn_step == gspi::TxnStep::WaitPio && !s.frame_pending_rx && s.substep == 0 {
+        let r = gspi::txn_poll(s);
+        if r == 0 {
+            return;
+        }
+        if r > 0 {
+            s.orphan_txns = s.orphan_txns.wrapping_add(1);
+        }
+    }
     if s.txn_step == gspi::TxnStep::Idle && !s.frame_pending_rx && s.substep == 0 {
-        let r = gspi::bus_read32_start(s, REG_BUS_STATUS);
-        if r >= 0 {
-            s.frame_pending_rx = true;
+        // The chip raises its data line between transfers when it has a
+        // packet for us (`REG_BUS_INTERRUPT_ENABLE`, set during bring-up).
+        // With the line low, no packet known to be waiting, and nothing of
+        // ours to send, the status register has nothing to say, and reading
+        // it is a full bus transaction — four provider calls and a DMA
+        // round trip — spent on every idle step.
+        let idle_line = !s.tx_waiting
+            && s.last_status & (STATUS_F2_PKT_AVAILABLE | STATUS_F3_PKT_AVAILABLE) == 0
+            && {
+                let sys = &*s.syscalls;
+                (sys.provider_call)(s.pio_handle, dev_pio::CMD_LEVEL, core::ptr::null_mut(), 0) == 0
+            };
+        if !idle_line {
+            let r = gspi::bus_read32_start(s, REG_BUS_STATUS);
+            if r >= 0 {
+                s.frame_pending_rx = true;
+            } else {
+                s.status_start_fail = s.status_start_fail.wrapping_add(1);
+                s.status_start_rc = r;
+            }
         }
     }
 
@@ -2035,7 +2902,24 @@ unsafe fn step_wifi_ops(s: &mut Cyw43State) {
     }
 
     // Drive pending WiFi operation
-    if s.pending_wifi_op != wifi_ops::WifiOp::None {
+    // An op runs only on an idle bus. `step_rx` may have a status read in
+    // flight from this very step, and an op's first ioctl would be refused
+    // a start — which read as the op failing. `step_tx` keeps the same
+    // rule; the op waits a step, the read completes, and it has the bus.
+    // A comeback wait is over the moment the link comes up: the firmware's
+    // own retry succeeded, and re-associating on top of it would only tear
+    // it down.
+    if s.pending_wifi_op == wifi_ops::WifiOp::Connect
+        && s.wifi_substep == wifi_ops::ConnectStep::WaitComeback as u8
+        && s.wifi_state == Cyw43WifiState::Connected
+    {
+        s.pending_wifi_op = wifi_ops::WifiOp::None;
+        s.wifi_substep = 0;
+        s.comeback_ms = 0;
+        s.delay_start = 0;
+        log_info(s, b"[cyw43] comeback: link up, wait over");
+    }
+    if s.pending_wifi_op != wifi_ops::WifiOp::None && s.txn_step == gspi::TxnStep::Idle {
         let result = match s.pending_wifi_op {
             wifi_ops::WifiOp::Connect => wifi_ops::step_connect(s),
             wifi_ops::WifiOp::Disconnect => wifi_ops::step_disconnect(s),
@@ -2076,23 +2960,61 @@ unsafe fn step_wifi_ops(s: &mut Cyw43State) {
 unsafe fn step_tx(s: &mut Cyw43State) {
     let sys = &*s.syscalls;
 
+    // Asked once per step by the caller, whatever the gate says: the answer
+    // is wanted either way, to send or to record that frames are queueing
+    // behind a gate that is shut.
+    let waiting = s.tx_waiting;
+
     // TX fairness: defer TX when F2/F3 RX packets are pending.
-    if s.in_chan >= 0
-        && s.txn_step == gspi::TxnStep::Idle
+    let gate_open = s.txn_step == gspi::TxnStep::Idle
         && !s.frame_pending_tx
         && s.substep == 0
-        && (s.last_status & (STATUS_F2_PKT_AVAILABLE | STATUS_F3_PKT_AVAILABLE)) == 0
-    {
-        let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
-        if poll > 0 && (poll as u32 & POLL_IN) != 0 {
-            let r = (sys.channel_read)(
-                s.in_chan,
-                s.frame_buf.as_mut_ptr(),
-                MAX_FRAME_SIZE,
-            );
-            if r > 0 {
+        && (s.last_status & (STATUS_F2_PKT_AVAILABLE | STATUS_F3_PKT_AVAILABLE)) == 0;
+
+    if waiting && !gate_open {
+        s.tx_gate_blocked = s.tx_gate_blocked.wrapping_add(1);
+    } else if waiting {
+        if (s.last_status & STATUS_F2_RX_READY) == 0 {
+            // A frame is waiting but the chip is not ready to take an F2
+            // write. Leave it in the channel for the next step: writing now
+            // would be discarded silently.
+            s.tx_f2_notready = s.tx_f2_notready.wrapping_add(1);
+        } else {
+            // Frames cross this channel length-prefixed in both directions:
+            // `ip` writes a 2-byte little-endian length ahead of each frame
+            // and every driver reads it the same way (`rp1_gem` is the other
+            // implementation). The prefix is not part of the ethernet frame,
+            // so it is consumed here and only the frame itself is given a
+            // SDPCM header.
+            //
+            // The channel is a byte stream, so a read that does not yield a
+            // whole record leaves the rest of it behind and every later
+            // read is one frame out of step. A length this buffer cannot
+            // hold, or a body shorter than its prefix promised, is therefore
+            // counted and dropped rather than partially consumed.
+            let hdr_len = SDPCM_HEADER_LEN + BDC_HEADER_LEN;
+            let mut fhdr = [0u8; 2];
+            let hn = (sys.channel_read)(s.in_chan, fhdr.as_mut_ptr(), 2);
+            let want = if hn == 2 {
+                (fhdr[0] as usize) | ((fhdr[1] as usize) << 8)
+            } else {
+                0
+            };
+            let readable = want > 0 && want <= MAX_FRAME_SIZE - hdr_len;
+            let r = if readable {
+                (sys.channel_read)(s.in_chan, s.frame_buf.as_mut_ptr(), want)
+            } else {
+                0
+            };
+            if hn != 0 && (!readable || r as usize != want) {
+                // A short header, a length no ethernet frame can have, or a
+                // body that had not arrived whole. Any of the three means
+                // the stream is no longer aligned to a record boundary, and
+                // a frame built from it would be noise on the air.
+                s.tx_frame_malformed = s.tx_frame_malformed.wrapping_add(1);
+            } else if r > 0 {
+                s.tx_frames_read = s.tx_frames_read.wrapping_add(1);
                 let eth_len = r as usize;
-                let hdr_len = SDPCM_HEADER_LEN + BDC_HEADER_LEN;
                 let fb = s.frame_buf.as_mut_ptr();
                 let mut i = eth_len;
                 while i > 0 {
@@ -2105,6 +3027,9 @@ unsafe fn step_tx(s: &mut Cyw43State) {
                 let r = gspi::wlan_write_start(s, s.frame_buf.as_ptr(), total);
                 if r >= 0 {
                     s.frame_pending_tx = true;
+                    s.tx_write_ok = s.tx_write_ok.wrapping_add(1);
+                } else {
+                    s.tx_write_fail = s.tx_write_fail.wrapping_add(1);
                 }
             }
         }
@@ -2115,6 +3040,7 @@ unsafe fn step_tx(s: &mut Cyw43State) {
         let r = gspi::txn_poll(s);
         if r != 0 {
             s.frame_pending_tx = false;
+            s.tx_done = s.tx_done.wrapping_add(1);
         }
     }
 }
@@ -2141,7 +3067,7 @@ unsafe fn step_led(s: &mut Cyw43State) {
             if s.txn_step == gspi::TxnStep::Idle {
                 let r = gspi::bp_set_window(s, CHIPCOMMON_GPIO_CONTROL);
                 if r > 0 {
-                    gspi::txn_poll(s);
+                    gspi::txn_wait(s);
                     gspi::bp_window_done(s);
                     s.led_op = LED_OP_INIT_CONTROL;
                 } else if r == 0 {
@@ -2155,7 +3081,7 @@ unsafe fn step_led(s: &mut Cyw43State) {
             if s.txn_step == gspi::TxnStep::Idle {
                 let r = gspi::bp_write32_start(s, CHIPCOMMON_GPIO_CONTROL, 0);
                 if r >= 0 {
-                    gspi::txn_poll(s);
+                    gspi::txn_wait(s);
                     s.led_op = LED_OP_INIT_OUTEN;
                 } else {
                     s.led_op = LED_OP_IDLE;
@@ -2166,7 +3092,7 @@ unsafe fn step_led(s: &mut Cyw43State) {
             if s.txn_step == gspi::TxnStep::Idle {
                 let r = gspi::bp_write32_start(s, CHIPCOMMON_GPIO_OUTPUT_EN, 1);
                 if r >= 0 {
-                    gspi::txn_poll(s);
+                    gspi::txn_wait(s);
                     s.led_op = LED_OP_INIT_OUT;
                 } else {
                     s.led_op = LED_OP_IDLE;
@@ -2177,11 +3103,13 @@ unsafe fn step_led(s: &mut Cyw43State) {
             if s.txn_step == gspi::TxnStep::Idle {
                 let r = gspi::bp_write32_start(s, CHIPCOMMON_GPIO_OUTPUT, 0);
                 if r >= 0 {
-                    gspi::txn_poll(s);
+                    gspi::txn_wait(s);
                     s.led_gpio_ready = true;
                     s.led_state = 0;
                     s.led_pwm_counter = 0;
-                    if s.led_pwm_period == 0 { s.led_pwm_period = 20; }
+                    if s.led_pwm_period == 0 {
+                        s.led_pwm_period = 20;
+                    }
                     log_info(s, b"[cyw43] led bp ready");
                 }
                 s.led_op = LED_OP_IDLE;
@@ -2191,7 +3119,7 @@ unsafe fn step_led(s: &mut Cyw43State) {
             if s.txn_step == gspi::TxnStep::Idle {
                 let r = gspi::bp_set_window(s, CHIPCOMMON_GPIO_OUTPUT);
                 if r > 0 {
-                    gspi::txn_poll(s);
+                    gspi::txn_wait(s);
                     gspi::bp_window_done(s);
                     s.led_op = LED_OP_SEND_WRITE;
                 } else if r == 0 {
@@ -2210,13 +3138,15 @@ unsafe fn step_led(s: &mut Cyw43State) {
                 let val: u32 = if target_on { 1 } else { 0 };
                 let r = gspi::bp_write32_start(s, CHIPCOMMON_GPIO_OUTPUT, val);
                 if r >= 0 {
-                    gspi::txn_poll(s);
+                    gspi::txn_wait(s);
                     s.led_state = val as u8;
                 }
                 s.led_op = LED_OP_IDLE;
             }
         }
-        _ => { s.led_op = LED_OP_IDLE; }
+        _ => {
+            s.led_op = LED_OP_IDLE;
+        }
     }
 
     // --- Read LED channel input ---
@@ -2233,10 +3163,12 @@ unsafe fn step_led(s: &mut Cyw43State) {
                     let ty = u32::from_le_bytes([led_buf[0], led_buf[1], led_buf[2], led_buf[3]]);
                     match ty {
                         MSG_ON => {
-                            s.led_brightness = 255; handled = true;
+                            s.led_brightness = 255;
+                            handled = true;
                         }
                         MSG_OFF => {
-                            s.led_brightness = 0; handled = true;
+                            s.led_brightness = 0;
+                            handled = true;
                         }
                         MSG_TOGGLE => {
                             s.led_brightness = if s.led_brightness > 0 { 0 } else { 255 };
@@ -2277,8 +3209,48 @@ unsafe fn step_led(s: &mut Cyw43State) {
     }
 }
 
+/// Deliver the MAC announcement to `ip`: a 14-byte Ethernet header with
+/// EtherType 0x0000, dst and src both our address, length-prefixed like
+/// every other frame on the channel. Returns whether it went.
+unsafe fn announce_mac(s: &mut Cyw43State) -> bool {
+    if s.out_chan < 0 || s.mac_addr[0] == 0 {
+        return false;
+    }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
+    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 {
+        return false;
+    }
+    let mut mac_frame = [0u8; 16];
+    mac_frame[0] = 14;
+    mac_frame[1] = 0;
+    let mut m = 0;
+    while m < 6 {
+        mac_frame[2 + m] = s.mac_addr[m];
+        mac_frame[8 + m] = s.mac_addr[m];
+        m += 1;
+    }
+    mac_frame[14] = 0;
+    mac_frame[15] = 0;
+    (sys.channel_write)(s.out_chan, mac_frame.as_ptr(), 16) >= 0
+}
+
 unsafe fn step_running(s: &mut Cyw43State) -> i32 {
     s.out_stalled = false;
+
+    if s.mac_announce_due != 0 && announce_mac(s) {
+        s.mac_announce_due = 0;
+        log_info(s, b"[cyw43] mac announced");
+    }
+
+    // Whether a frame is waiting to go out is asked once per step: `step_rx`
+    // needs it to decide whether the chip's status is worth reading, and
+    // `step_tx` to decide whether to send.
+    s.tx_waiting = s.in_chan >= 0 && {
+        let sys = &*s.syscalls;
+        let poll = (sys.channel_poll)(s.in_chan, POLL_IN);
+        poll > 0 && (poll as u32 & POLL_IN) != 0
+    };
 
     step_rx(s);
 
@@ -2291,11 +3263,55 @@ unsafe fn step_running(s: &mut Cyw43State) -> i32 {
 
     // Burst: if more F2/F3 packets available, re-step immediately.
     // But if the output channel is full, yield so downstream (ip) can drain.
+    // Burst means "more I can start now". With a transfer in flight there
+    // is nothing to start — re-stepping would only poll it again — and a
+    // burst loop that polls spends the domain's whole budget waiting on
+    // DMA. Continue instead; the next tick finds the transfer complete.
     if !s.out_stalled
+        && s.txn_step == gspi::TxnStep::Idle
         && s.last_status & (STATUS_F2_PKT_AVAILABLE | STATUS_F3_PKT_AVAILABLE) != 0
     {
+        // A burst that never gets a transaction onto the bus is a loop: the
+        // status says a packet is waiting, nothing reads it, and the
+        // scheduler re-steps until the tick's budget is gone. Say what the
+        // driver was looking at, once every few seconds, so the loop has a
+        // description and not only a budget line.
+        s.burst_idle = s.burst_idle.wrapping_add(1);
+        if s.burst_idle >= 64 {
+            let now = dev_millis(&*s.syscalls);
+            if now.wrapping_sub(s.burst_report_ms) >= 5000 {
+                s.burst_report_ms = now;
+                let mut line =
+                    *b"[cyw43] burst idle st=00000000 sub=000 op=0 ws=0 sf=00000 rc=-000 lb=00000";
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for i in 0..8 {
+                    line[22 + i] = HEX[((s.last_status >> (28 - 4 * i)) & 0xf) as usize];
+                }
+                let sub = s.substep as u32;
+                line[35] = b'0' + ((sub / 100) % 10) as u8;
+                line[36] = b'0' + ((sub / 10) % 10) as u8;
+                line[37] = b'0' + (sub % 10) as u8;
+                line[42] = b'0' + (s.pending_wifi_op as u8 % 10);
+                line[47] = b'0' + (s.wifi_state as u8 % 10);
+                const DIV: [u32; 5] = [10000, 1000, 100, 10, 1];
+                let sf = s.status_start_fail;
+                for i in 0..5 {
+                    line[52 + i] = b'0' + ((sf / DIV[i]) % 10) as u8;
+                }
+                let mag = s.status_start_rc.unsigned_abs();
+                line[62] = b'0' + ((mag / 100) % 10) as u8;
+                line[63] = b'0' + ((mag / 10) % 10) as u8;
+                line[64] = b'0' + (mag % 10) as u8;
+                let lb = s.rx_len_bad;
+                for i in 0..5 {
+                    line[69 + i] = b'0' + ((lb / DIV[i]) % 10) as u8;
+                }
+                log_error(s, &line);
+            }
+        }
         return 2;
     }
+    s.burst_idle = 0;
     0
 }
 
@@ -2305,8 +3321,7 @@ unsafe fn step_running(s: &mut Cyw43State) -> i32 {
 
 /// Try to start an F2 (WiFi) frame read. Returns true if read was started.
 unsafe fn try_start_f2_read(s: &mut Cyw43State, status: u32) -> bool {
-    let pkt_len = ((status >> STATUS_F2_PKT_LEN_SHIFT)
-        & STATUS_F2_PKT_LEN_MASK) as usize;
+    let pkt_len = ((status >> STATUS_F2_PKT_LEN_SHIFT) & STATUS_F2_PKT_LEN_MASK) as usize;
     if pkt_len > 0 && pkt_len <= 1500 {
         let r = gspi::wlan_read_start(s, pkt_len);
         if r >= 0 {
@@ -2314,14 +3329,15 @@ unsafe fn try_start_f2_read(s: &mut Cyw43State, status: u32) -> bool {
             s.substep = 10; // F2 frame read in progress
             return true;
         }
+    } else {
+        s.rx_len_bad = s.rx_len_bad.wrapping_add(1);
     }
     false
 }
 
 /// Try to start an F3 (BT) frame read. Returns true if read was started.
 unsafe fn try_start_f3_read(s: &mut Cyw43State, status: u32) -> bool {
-    let pkt_len = ((status >> STATUS_F3_PKT_LEN_SHIFT)
-        & STATUS_F3_PKT_LEN_MASK) as usize;
+    let pkt_len = ((status >> STATUS_F3_PKT_LEN_SHIFT) & STATUS_F3_PKT_LEN_MASK) as usize;
     if pkt_len > 0 && pkt_len <= 1500 {
         let r = gspi::bt_read_start(s, pkt_len);
         if r >= 0 {
@@ -2406,7 +3422,11 @@ unsafe fn format_scan_result(
         line[pos] = b'-';
         pos += 1;
     }
-    let abs_rssi = if rssi < 0 { (-rssi) as u16 } else { rssi as u16 };
+    let abs_rssi = if rssi < 0 {
+        (-rssi) as u16
+    } else {
+        rssi as u16
+    };
     if abs_rssi >= 100 {
         line[pos] = b'0' + ((abs_rssi / 100) % 10) as u8;
         pos += 1;
@@ -2456,7 +3476,9 @@ unsafe fn emit_scan_result_binary(
     let mut i = 0;
     while i < slen {
         let b = *ssid_ptr.add(i);
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         rec[1 + i] = b;
         i += 1;
     }
@@ -2468,7 +3490,13 @@ unsafe fn emit_scan_result_binary(
     // mark as 0 (open) — the wifi module can refine this later
     rec[35] = 0;
 
-    msg_write(sys, s.scan_bin_chan, MSG_SCAN_RESULT, rec.as_ptr(), SCAN_RESULT_SIZE as u16);
+    msg_write(
+        sys,
+        s.scan_bin_chan,
+        MSG_SCAN_RESULT,
+        rec.as_ptr(),
+        SCAN_RESULT_SIZE as u16,
+    );
 }
 
 /// Emit an FMP status event on status_chan (out[3]).
@@ -2483,7 +3511,13 @@ unsafe fn emit_status_event(s: &mut Cyw43State, msg_type: u32, payload: &[u8]) {
         return;
     }
 
-    msg_write(sys, s.status_chan, msg_type, payload.as_ptr(), payload.len() as u16);
+    msg_write(
+        sys,
+        s.status_chan,
+        msg_type,
+        payload.as_ptr(),
+        payload.len() as u16,
+    );
 }
 
 /// Emit an MSG_NETIF_STATE frame on netif_state_chan (out[5]).
@@ -2499,9 +3533,14 @@ unsafe fn emit_netif_state(s: &Cyw43State, state: u8) {
         return;
     }
     let payload = [state];
-    msg_write(sys, s.netif_state_chan, MSG_NETIF_STATE, payload.as_ptr(), 1);
+    msg_write(
+        sys,
+        s.netif_state_chan,
+        MSG_NETIF_STATE,
+        payload.as_ptr(),
+        1,
+    );
 }
-
 
 // ============================================================================
 // Frame Processing
@@ -2518,11 +3557,14 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
 
     let payload = gspi::rxn_payload_ptr(s);
 
+    // SDPCM header bytes 8 and 9: flow control and bus data credit.
+    if frame_len >= SDPCM_HEADER_LEN {
+        s.last_flow = *payload.add(8);
+        s.last_credit = *payload.add(9);
+    }
+
     // Parse SDPCM header
-    let (channel, data_offset, data_len) = gspi::parse_sdpcm_header(
-        payload,
-        frame_len,
-    );
+    let (channel, data_offset, data_len) = gspi::parse_sdpcm_header(payload, frame_len);
     if channel < 0 {
         return;
     }
@@ -2537,7 +3579,7 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                 let cdc = payload.add(data_offset);
                 let flags = (*cdc.add(8) as u16) | ((*cdc.add(9) as u16) << 8);
 
-                // CDC id matching (Issue #13b): verify response matches request
+                // Verify the CDC id matches the request this ioctl is waiting on
                 let resp_id = (*cdc.add(10) as u16) | ((*cdc.add(11) as u16) << 8);
                 if resp_id == s.pending_ioctl_id {
                     // Matched: store status (0 = success, or error code)
@@ -2552,22 +3594,32 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                 if flags & 0x01 != 0 {
                     // CDCF_IOC_ERROR — firmware rejected the ioctl
                     s.ioctl_error_seen = true;
-                    let status = (*cdc.add(12) as u32) | ((*cdc.add(13) as u32) << 8)
-                        | ((*cdc.add(14) as u32) << 16) | ((*cdc.add(15) as u32) << 24);
-                    let cmd = (*cdc as u32) | ((*cdc.add(1) as u32) << 8)
-                        | ((*cdc.add(2) as u32) << 16) | ((*cdc.add(3) as u32) << 24);
+                    let status = (*cdc.add(12) as u32)
+                        | ((*cdc.add(13) as u32) << 8)
+                        | ((*cdc.add(14) as u32) << 16)
+                        | ((*cdc.add(15) as u32) << 24);
+                    let cmd = (*cdc as u32)
+                        | ((*cdc.add(1) as u32) << 8)
+                        | ((*cdc.add(2) as u32) << 16)
+                        | ((*cdc.add(3) as u32) << 24);
                     // Log: "ioctl err C=cmd S=status"
                     let sys = &*s.syscalls;
                     let mut buf = [0u8; 50];
                     let p = buf.as_mut_ptr();
                     let prefix = b"[cyw43] ioctl err cmd=";
                     let mut i = 0;
-                    while i < prefix.len() { *p.add(i) = *prefix.as_ptr().add(i); i += 1; }
+                    while i < prefix.len() {
+                        *p.add(i) = *prefix.as_ptr().add(i);
+                        i += 1;
+                    }
                     let mut pos = prefix.len();
                     pos += fmt_u32_raw(buf.as_mut_ptr().add(pos), cmd);
                     let mid = b" S=";
                     i = 0;
-                    while i < mid.len() { *p.add(pos + i) = *mid.as_ptr().add(i); i += 1; }
+                    while i < mid.len() {
+                        *p.add(pos + i) = *mid.as_ptr().add(i);
+                        i += 1;
+                    }
                     pos += mid.len();
                     pos += fmt_u32_raw(buf.as_mut_ptr().add(pos), status);
                     dev_log(sys, 1, buf.as_ptr(), pos);
@@ -2576,7 +3628,7 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
         }
         SDPCM_CHAN_EVENT => {
             // BDC header at SDPCM data_offset
-            // Embassy uses data_offset directly (no version check):
+            // data_offset is used directly (no version check):
             //   packet_start = 4 * bdc_header.data_offset
             let bdc_start = payload.add(data_offset);
             let bdc_data_off = *bdc_start.add(3) as usize;
@@ -2611,10 +3663,27 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                     | (*st.add(3) as u32);
                 // Parse reason code (at offset +12 after preamble: version(2)+flags(2)+event_type(4)+status(4))
                 let rp = evt.add(EVT_MSG_PREAMBLE + 12);
-                let _reason = ((*rp as u32) << 24)
+                let reason = ((*rp as u32) << 24)
                     | ((*rp.add(1) as u32) << 16)
                     | ((*rp.add(2) as u32) << 8)
                     | (*rp.add(3) as u32);
+                // The first events of a boot, with their status and reason
+                // codes: what the firmware and the AP said, not what the
+                // driver made of it. A deauth's reason code is the only
+                // thing that says whether the AP or this station ended it.
+                if s.evt_trace < 24 {
+                    s.evt_trace += 1;
+                    let mut line = *b"[cyw43] evt t=000 st=000 rsn=000";
+                    let mut put = |at: usize, v: u32| {
+                        line[at] = b'0' + ((v / 100) % 10) as u8;
+                        line[at + 1] = b'0' + ((v / 10) % 10) as u8;
+                        line[at + 2] = b'0' + (v % 10) as u8;
+                    };
+                    put(14, event_type.min(999));
+                    put(21, status.min(999));
+                    put(29, reason.min(999));
+                    log_info(s, &line);
+                }
 
                 // Parse IE88 (ASSOC_RESP_IE) for Timeout Interval IE (tag 0x38)
                 // When AP sends Association Comeback (type 3), extract the backoff time.
@@ -2625,16 +3694,22 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                         | ((*dl.add(2) as u32) << 8)
                         | (*dl.add(3) as u32);
                     let evt_data = evt.add(EVT_MSG_PREAMBLE + EVT_MSG_MIN_LEN);
-                    let avail = if data_len > bdc_total + EVT_ETH_HDR_LEN + EVT_MSG_PREAMBLE + EVT_MSG_MIN_LEN {
+                    let avail = if data_len
+                        > bdc_total + EVT_ETH_HDR_LEN + EVT_MSG_PREAMBLE + EVT_MSG_MIN_LEN
+                    {
                         data_len - bdc_total - EVT_ETH_HDR_LEN - EVT_MSG_PREAMBLE - EVT_MSG_MIN_LEN
-                    } else { 0 };
+                    } else {
+                        0
+                    };
                     let ie_len = (datalen as usize).min(avail);
                     // Walk IE TLVs: tag(1) + len(1) + data(len)
                     let mut off = 0usize;
                     while off + 2 <= ie_len {
                         let tag = *evt_data.add(off);
                         let tlen = *evt_data.add(off + 1) as usize;
-                        if off + 2 + tlen > ie_len { break; }
+                        if off + 2 + tlen > ie_len {
+                            break;
+                        }
                         // Timeout Interval IE: tag=0x38 (56), len=5, type(1)+value(4)
                         if tag == 0x38 && tlen == 5 {
                             let tie_type = *evt_data.add(off + 2);
@@ -2654,7 +3729,14 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                                     s.wifi_state = Cyw43WifiState::Retrying;
                                     s.pending_wifi_op = wifi_ops::WifiOp::Connect;
                                     s.wifi_substep = wifi_ops::ConnectStep::WaitComeback as u8;
-                                    s.delay_start = 0;
+                                    // Nothing is sent. The firmware retries the
+                                    // comeback on its own and usually succeeds within
+                                    // the window; a DISASSOC from here lands on that
+                                    // new association and the AP then deauths every
+                                    // frame after it (reason 7). The op only waits,
+                                    // and re-associates if no link has come up by the
+                                    // time the window closes.
+                                    s.delay_start = dev_millis(&*s.syscalls);
                                 }
                             }
                         }
@@ -2665,7 +3747,8 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                 match event_type {
                     WLC_E_SET_SSID => {
                         if status != WLC_E_STATUS_SUCCESS
-                            && (s.wifi_state == Cyw43WifiState::Connecting || s.wifi_state == Cyw43WifiState::Retrying)
+                            && (s.wifi_state == Cyw43WifiState::Connecting
+                                || s.wifi_state == Cyw43WifiState::Retrying)
                             && s.assoc_retries < 3
                         {
                             s.assoc_retries += 1;
@@ -2692,35 +3775,23 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                             // Send MAC to IP module via out_chan as a special frame:
                             // 14-byte Ethernet header with EtherType=0x0000 (MAC announcement)
                             // dst=our MAC, src=our MAC, type=0x0000
-                            if s.out_chan >= 0 && s.mac_addr[0] != 0 {
-                                let mut mac_frame = [0u8; 14];
-                                let mut m = 0;
-                                while m < 6 {
-                                    mac_frame[m] = s.mac_addr[m];     // dst = our MAC
-                                    mac_frame[6 + m] = s.mac_addr[m]; // src = our MAC
-                                    m += 1;
-                                }
-                                // EtherType 0x0000 = MAC announcement (not a real EtherType)
-                                mac_frame[12] = 0;
-                                mac_frame[13] = 0;
-                                let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
-                                if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-                                    (sys.channel_write)(
-                                        s.out_chan,
-                                        mac_frame.as_ptr(),
-                                        14,
-                                    );
-                                }
-                            }
+                            // Owed until delivered, not attempted once: the
+                            // channel to `ip` may already be full of the
+                            // segment's broadcast traffic when the link
+                            // event arrives, and an announcement dropped
+                            // here leaves `ip` waiting for a MAC that never
+                            // comes while frames pile up behind it.
+                            s.mac_announce_due = 1;
+                            let _ = sys;
 
                             emit_status_event(s, MSG_CONNECTED, &[]);
                         }
                     }
-                    WLC_E_DEAUTH | WLC_E_DEAUTH_IND
-                    | WLC_E_DISASSOC | WLC_E_DISASSOC_IND => {
+                    WLC_E_DEAUTH | WLC_E_DEAUTH_IND | WLC_E_DISASSOC | WLC_E_DISASSOC_IND => {
                         if s.wifi_state == Cyw43WifiState::Retrying {
                             // Stale deauth from previous attempt — ignore
-                        } else if s.wifi_state == Cyw43WifiState::Connecting && s.assoc_retries < 3 {
+                        } else if s.wifi_state == Cyw43WifiState::Connecting && s.assoc_retries < 3
+                        {
                             s.assoc_retries += 1;
                             s.wifi_state = Cyw43WifiState::Retrying;
                             s.pending_wifi_op = wifi_ops::WifiOp::Connect;
@@ -2743,16 +3814,26 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                             if status == WLC_E_STATUS_PARTIAL {
                                 // Parse BSS info from escan result
                                 // Event msg fixed fields: preamble(10) + event_type(4) + flags(2) + status(4) + reason(4) + addr(6) + datalen(4) = 34
-                                let evt_data_start = data_offset + bdc_total + EVT_ETH_HDR_LEN + EVT_MSG_PREAMBLE + EVT_MSG_MIN_LEN;
-                                let remaining = if frame_len > evt_data_start { frame_len - evt_data_start } else { 0 };
+                                let evt_data_start = data_offset
+                                    + bdc_total
+                                    + EVT_ETH_HDR_LEN
+                                    + EVT_MSG_PREAMBLE
+                                    + EVT_MSG_MIN_LEN;
+                                let remaining = if frame_len > evt_data_start {
+                                    frame_len - evt_data_start
+                                } else {
+                                    0
+                                };
 
                                 if remaining >= ESCAN_RESULT_HDR_LEN + BSS_RSSI_OFF + 2 {
                                     let erp = payload.add(evt_data_start);
-                                    let bss_count = (*erp.add(8) as u16) | ((*erp.add(9) as u16) << 8);
+                                    let bss_count =
+                                        (*erp.add(8) as u16) | ((*erp.add(9) as u16) << 8);
 
                                     if bss_count > 0 {
                                         let bss = erp.add(ESCAN_RESULT_HDR_LEN);
-                                        let ssid_len = (*bss.add(BSS_SSID_LEN_OFF) as usize).min(32);
+                                        let ssid_len =
+                                            (*bss.add(BSS_SSID_LEN_OFF) as usize).min(32);
 
                                         let rssi = (*bss.add(BSS_RSSI_OFF) as i16)
                                             | ((*bss.add(BSS_RSSI_OFF + 1) as i16) << 8);
@@ -2761,8 +3842,21 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                                             | ((*bss.add(BSS_CHANSPEC_OFF + 1) as u16) << 8);
                                         let channel = chanspec & 0xFF;
 
-                                        format_scan_result(s, bss.add(BSS_SSID_OFF), ssid_len, channel, rssi);
-                                        emit_scan_result_binary(s, bss.add(BSS_SSID_OFF), ssid_len, channel, rssi, chanspec);
+                                        format_scan_result(
+                                            s,
+                                            bss.add(BSS_SSID_OFF),
+                                            ssid_len,
+                                            channel,
+                                            rssi,
+                                        );
+                                        emit_scan_result_binary(
+                                            s,
+                                            bss.add(BSS_SSID_OFF),
+                                            ssid_len,
+                                            channel,
+                                            rssi,
+                                            chanspec,
+                                        );
                                         s.scan_count += 1;
                                     }
                                 }
@@ -2796,21 +3890,46 @@ unsafe fn process_rx_frame(s: &mut Cyw43State) {
                         let p = buf.as_mut_ptr();
                         let prefix = b"[cyw43] eapol rx len=";
                         let mut i = 0;
-                        while i < prefix.len() { *p.add(i) = *prefix.as_ptr().add(i); i += 1; }
-                        let pos = prefix.len() + fmt_u32_raw(buf.as_mut_ptr().add(prefix.len()), eth_len as u32);
+                        while i < prefix.len() {
+                            *p.add(i) = *prefix.as_ptr().add(i);
+                            i += 1;
+                        }
+                        let pos = prefix.len()
+                            + fmt_u32_raw(buf.as_mut_ptr().add(prefix.len()), eth_len as u32);
                         dev_log(sys, 1, buf.as_ptr(), pos);
                     }
                 }
 
-                if s.out_chan >= 0 {
+                if s.out_chan >= 0 && eth_start >= 2 {
                     let sys = &*s.syscalls;
                     let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
                     if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-                            (sys.channel_write)(
-                            s.out_chan,
-                            payload.add(eth_start),
-                            eth_len,
-                        );
+                        // The channel to `ip` is a byte stream, so each frame
+                        // carries its own 2-byte little-endian length and
+                        // `ip` reads that before reading the frame. Every
+                        // driver on this surface stages the same shape;
+                        // `rp1_gem` is the other one.
+                        //
+                        // The two bytes immediately before the ethernet
+                        // frame are the tail of the BDC header, already
+                        // parsed, so the prefix goes there rather than into
+                        // a staging copy.
+                        //
+                        // SAFETY: `rxn_payload_ptr_mut` re-derives the
+                        // staging buffer from the state that owns it, so the
+                        // write has provenance for the region; `eth_start >=
+                        // 2` and `eth_start + eth_len` lies within the frame
+                        // the header described.
+                        let sp = gspi::rxn_payload_ptr_mut(s).add(eth_start - 2);
+                        core::ptr::write_volatile(sp, eth_len as u8);
+                        core::ptr::write_volatile(sp.add(1), (eth_len >> 8) as u8);
+                        let n = (sys.channel_write)(s.out_chan, sp as *const u8, 2 + eth_len);
+                        if n as usize != 2 + eth_len {
+                            // A partial write leaves a truncated record that
+                            // `ip` would read as a length, so the stream is
+                            // no longer trustworthy for it.
+                            s.rx_frame_truncated = s.rx_frame_truncated.wrapping_add(1);
+                        }
                     } else {
                         // Channel full — stop bursting so downstream can drain
                         s.out_stalled = true;

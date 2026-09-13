@@ -199,9 +199,9 @@ struct State {
 }
 
 mod params_def {
-    use super::ptr_copy;
     use super::p_u16;
     use super::p_u32;
+    use super::ptr_copy;
     use super::State;
     use super::SCHEMA_MAX;
     use super::{MAX_HOST_LEN, MAX_REPO_LEN, MAX_TAG_LEN};
@@ -270,7 +270,12 @@ mod params_def {
 /// Returns -1 if unwired.
 unsafe fn channel_port_in(sys: &SyscallTable, index: u32) -> i32 {
     let mut arg = [0u8, index as u8]; // 0 = in
-    (sys.provider_call)(-1, abi::kernel_abi::channel::PORT, arg.as_mut_ptr(), arg.len())
+    (sys.provider_call)(
+        -1,
+        abi::kernel_abi::channel::PORT,
+        arg.as_mut_ptr(),
+        arg.len(),
+    )
 }
 
 #[inline(always)]
@@ -715,13 +720,8 @@ unsafe fn parse_manifest(s: &mut State) -> bool {
 unsafe fn parse_response_header(s: &mut State, header_end: usize) -> bool {
     let h = &s.hdr_buf[..header_end];
     // Status line: "HTTP/1.1 NNN ..."
-    let (status, _) = if h.len() > 9 {
-        parse_dec(h, 9)
-    } else {
-        (0, 0)
-    };
-    let resumed =
-        s.fetching == FETCH_BLOB && (cur_fetch_pos(s) > 0 || s.chunk_bytes > 0);
+    let (status, _) = if h.len() > 9 { parse_dec(h, 9) } else { (0, 0) };
+    let resumed = s.fetching == FETCH_BLOB && (cur_fetch_pos(s) > 0 || s.chunk_bytes > 0);
     let ok_status = if resumed { 206 } else { 200 };
     if status != ok_status {
         // A server that ignores Range answers 200 with the full body;
@@ -807,12 +807,7 @@ unsafe fn body_bytes(s: &mut State, data: &[u8]) -> bool {
             let chunk = (data.len() - off).min(STAGE_ARG_SIZE - 4);
             s.stage_arg[..4].copy_from_slice(&s.stage_offset.to_le_bytes());
             s.stage_arg[4..4 + chunk].copy_from_slice(&data[off..off + chunk]);
-            let rc = (sys.provider_call)(
-                -1,
-                OTA_STAGE_WRITE,
-                s.stage_arg.as_mut_ptr(),
-                4 + chunk,
-            );
+            let rc = (sys.provider_call)(-1, OTA_STAGE_WRITE, s.stage_arg.as_mut_ptr(), 4 + chunk);
             if rc < 0 {
                 log_msg_num(s, b"[ota_reg] stage write failed rc=-", (-rc) as u64);
                 return false;
@@ -990,9 +985,8 @@ unsafe fn pump_net(s: &mut State) -> bool {
                     let body_in_hdr_len = s.hdr_fill as usize - body_in_hdr_start;
                     if body_in_hdr_len > 0 {
                         let mut tmp = [0u8; HDR_BUF_SIZE];
-                        tmp[..body_in_hdr_len].copy_from_slice(
-                            &s.hdr_buf[body_in_hdr_start..s.hdr_fill as usize],
-                        );
+                        tmp[..body_in_hdr_len]
+                            .copy_from_slice(&s.hdr_buf[body_in_hdr_start..s.hdr_fill as usize]);
                         if !body_bytes(s, &tmp[..body_in_hdr_len]) {
                             enter_backoff(s);
                             return true;

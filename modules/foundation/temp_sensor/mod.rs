@@ -18,7 +18,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -55,8 +54,8 @@ struct TempState {
 // ============================================================================
 
 mod params_def {
-    use super::TempState;
     use super::p_u32;
+    use super::TempState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -124,8 +123,8 @@ pub extern "C" fn module_new(
         s.initialized = false;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -157,18 +156,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !s.initialized {
             // Open ADC channel 4 (temp sensor)
             let mut ch = [TEMP_CHANNEL];
-            let handle = (sys.provider_open)(
-                HAL_ADC_CONTRACT, ADC_OPEN, ch.as_mut_ptr(), 1,
-            );
+            let handle = (sys.provider_open)(HAL_ADC_CONTRACT, ADC_OPEN, ch.as_mut_ptr(), 1);
             if handle < 0 {
                 return -3;
             }
             s.adc_handle = handle;
 
             // Create timer fd
-            let timer_fd = (sys.provider_open)(
-                TIMER_CONTRACT, TIMER_CREATE, core::ptr::null_mut(), 0,
-            );
+            let timer_fd =
+                (sys.provider_open)(TIMER_CONTRACT, TIMER_CREATE, core::ptr::null_mut(), 0);
             if timer_fd < 0 {
                 return -4;
             }
@@ -221,11 +217,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
 // Contract ids + opcodes (mirror kernel::module::provider::contract + abi paths).
 const HAL_ADC_CONTRACT: u32 = 0x000E;
-const TIMER_CONTRACT:   u32 = 0x0006;
-const ADC_OPEN:     u32 = 0x0E00;
-const ADC_READ:     u32 = 0x0E02;
+const TIMER_CONTRACT: u32 = 0x0006;
+const ADC_OPEN: u32 = 0x0E00;
+const ADC_READ: u32 = 0x0E02;
 const TIMER_CREATE: u32 = 0x0604;
-const TIMER_SET:    u32 = 0x0605;
+const TIMER_SET: u32 = 0x0605;
 
 // ============================================================================
 // Panic Handler

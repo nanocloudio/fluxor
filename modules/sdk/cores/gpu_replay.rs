@@ -223,13 +223,7 @@ impl<'a> ReplayStore<'a> {
     /// because Rust will not hand out two mutable views into one slice and the
     /// alternative — a second buffer sized to the transfer — would put a
     /// megabyte on a cooperative step's stack.
-    fn transform(
-        &mut self,
-        src: (u16, u64),
-        dst: (u16, u64),
-        len: u64,
-        k: u8,
-    ) -> bool {
+    fn transform(&mut self, src: (u16, u64), dst: (u16, u64), len: u64, k: u8) -> bool {
         let Some((sat, _)) = self.range(src.0, src.1, len) else {
             return false;
         };
@@ -409,7 +403,16 @@ pub fn execute(
             queue,
             items_offset,
             items_len,
-        } => run_submission(dev, store, owner, record, fence, queue, items_offset, items_len),
+        } => run_submission(
+            dev,
+            store,
+            owner,
+            record,
+            fence,
+            queue,
+            items_offset,
+            items_len,
+        ),
 
         Work::Cancel { fence, .. } => {
             // The device already decided and reported the disposition; there

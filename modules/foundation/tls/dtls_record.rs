@@ -155,7 +155,12 @@ pub fn parse_dtls_ack_body(body: &[u8], out: &mut [(u64, u64)]) -> Option<usize>
 /// Build the 5-byte DTLS 1.3 unified header for `seq` / `epoch` /
 /// `enc_len` (encrypted_record length = plaintext + content_type + tag).
 /// `out` MUST be at least `DTLS_UNIFIED_HDR_LEN` bytes.
-pub fn build_dtls_header(epoch: u16, seq: u64, enc_len: usize, out: &mut [u8; DTLS_UNIFIED_HDR_LEN]) {
+pub fn build_dtls_header(
+    epoch: u16,
+    seq: u64,
+    enc_len: usize,
+    out: &mut [u8; DTLS_UNIFIED_HDR_LEN],
+) {
     // First byte: fixed 0b001 prefix | C=0 | S=1 | L=1 | epoch low 2 bits
     out[0] = 0b0010_1100u8 | ((epoch & 0x0003) as u8);
     let seq16 = (seq & 0xFFFF) as u16;
@@ -393,11 +398,7 @@ pub fn decrypt_dtls_record(
     // SAFETY: pointer arithmetic over the DTLS record buffer; bounds
     // checked against record length before each deref.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            record.as_ptr().add(tag_start),
-            tag.as_mut_ptr(),
-            16,
-        );
+        core::ptr::copy_nonoverlapping(record.as_ptr().add(tag_start), tag.as_mut_ptr(), 16);
     }
 
     let ok = match suite {
@@ -552,13 +553,11 @@ impl DtlsHandshakeReassembler {
             return false;
         }
         let msg_type = fragment[0];
-        let length = ((fragment[1] as usize) << 16)
-            | ((fragment[2] as usize) << 8)
-            | (fragment[3] as usize);
+        let length =
+            ((fragment[1] as usize) << 16) | ((fragment[2] as usize) << 8) | (fragment[3] as usize);
         let message_seq = ((fragment[4] as u16) << 8) | (fragment[5] as u16);
-        let frag_off = ((fragment[6] as usize) << 16)
-            | ((fragment[7] as usize) << 8)
-            | (fragment[8] as usize);
+        let frag_off =
+            ((fragment[6] as usize) << 16) | ((fragment[7] as usize) << 8) | (fragment[8] as usize);
         let frag_len = ((fragment[9] as usize) << 16)
             | ((fragment[10] as usize) << 8)
             | (fragment[11] as usize);
@@ -761,8 +760,7 @@ pub unsafe fn dtls_recv_into_driver(
         }
         (body_len, seq)
     } else {
-        let (pt_len, inner_type, seq) =
-            decrypt_dtls_record(suite, read_keys, state, datagram)?;
+        let (pt_len, inner_type, seq) = decrypt_dtls_record(suite, read_keys, state, datagram)?;
         if inner_type != 22u8 {
             // CT_HANDSHAKE = 22. Other inner types (alerts, app
             // data, RFC 9147 §7 ACK records) are returned to
@@ -1033,4 +1031,3 @@ impl DtlsEndpoint {
 // (RFC 9146) is a follow-up; without CIDs, peer-addr matching
 // suffices for typical NAT-stable clients.
 // ----------------------------------------------------------------------
-

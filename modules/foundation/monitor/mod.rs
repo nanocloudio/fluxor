@@ -23,7 +23,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -63,8 +62,8 @@ impl MonitorState {
 }
 
 mod params_def {
-    use super::MonitorState;
     use super::p_u32;
+    use super::MonitorState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -85,8 +84,16 @@ mod params_def {
 // powers of 10 avoids any `/` or `%` operators.
 
 const POW10: [u32; 10] = [
-    1_000_000_000, 100_000_000, 10_000_000, 1_000_000,
-    100_000, 10_000, 1_000, 100, 10, 1,
+    1_000_000_000,
+    100_000_000,
+    10_000_000,
+    1_000_000,
+    100_000,
+    10_000,
+    1_000,
+    100,
+    10,
+    1,
 ];
 
 fn emit_decimal(val: u32, out: &mut [u8], pos: &mut usize) {
@@ -126,11 +133,7 @@ fn emit_bytes(s: &[u8], out: &mut [u8], pos: &mut usize) {
 
 /// Build one MON_HIST line for module `mod_idx` into `out`. Returns bytes
 /// written, or 0 if the query failed (caller should skip this module).
-unsafe fn build_mon_hist(
-    sys: &SyscallTable,
-    mod_idx: u8,
-    out: &mut [u8],
-) -> usize {
+unsafe fn build_mon_hist(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> usize {
     let mut buckets = [0u32; 8];
     let bp = buckets.as_mut_ptr() as *mut u8;
     let rc = (sys.provider_call)(mod_idx as i32, STEP_HISTOGRAM_QUERY, bp, 32);
@@ -183,15 +186,21 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() { return -5; }
-        if state_size < core::mem::size_of::<MonitorState>() { return -6; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() {
+            return -5;
+        }
+        if state_size < core::mem::size_of::<MonitorState>() {
+            return -6;
+        }
 
         let s = &mut *(state as *mut MonitorState);
         s.init(syscalls as *const SyscallTable);
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -217,9 +226,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut MonitorState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
 
         if s.countdown_ticks > 0 {
             s.countdown_ticks -= 1;
@@ -228,8 +241,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.countdown_ticks = s.round_ticks;
 
         let sys_ptr = s.syscalls;
-        let count = (((*sys_ptr).provider_call)(-1, RECONFIGURE_MODULE_COUNT,
-                                           core::ptr::null_mut(), 0)) as i32;
+        let count =
+            (((*sys_ptr).provider_call)(-1, RECONFIGURE_MODULE_COUNT, core::ptr::null_mut(), 0))
+                as i32;
         if count <= 0 {
             return 0;
         }

@@ -37,7 +37,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -47,8 +46,8 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
-mod pio;
 mod params_def;
+mod pio;
 
 // ============================================================================
 // Provider contract id + PIO opcodes (mirror
@@ -220,8 +219,8 @@ pub extern "C" fn module_new(
         s.init(syscalls as *const SyscallTable);
         s.in_chan = in_chan;
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -267,7 +266,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
                 let r = step_init(s);
-                if r < 0 { return r; }
+                if r < 0 {
+                    return r;
+                }
                 step_running(s)
             }
             I2sPhase::WaitRate => {
@@ -294,7 +295,10 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
     // Open PIO stream handle — tracked against HAL_PIO contract.
     let mut alloc_arg = (pio::PIO_BUFFER_WORDS as u32).to_le_bytes();
     let handle = (provider_open)(
-        HAL_PIO_CONTRACT, DEV_PIO_STREAM_ALLOC, alloc_arg.as_mut_ptr(), 4,
+        HAL_PIO_CONTRACT,
+        DEV_PIO_STREAM_ALLOC,
+        alloc_arg.as_mut_ptr(),
+        4,
     );
     if handle < 0 {
         dev_log(sys, 1, b"[i2s] alloc fail".as_ptr(), 16);
@@ -362,10 +366,16 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
         let tag = b"[i2s] @";
         let mut p = 0usize;
         let mut t = 0usize;
-        while t < tag.len() { *bp.add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
+        while t < tag.len() {
+            *bp.add(p) = *tag.as_ptr().add(t);
+            p += 1;
+            t += 1;
+        }
         p += fmt_u32_raw(bp.add(p), s.sample_rate);
-        *bp.add(p) = b'H'; p += 1;
-        *bp.add(p) = b'z'; p += 1;
+        *bp.add(p) = b'H';
+        p += 1;
+        *bp.add(p) = b'z';
+        p += 1;
         dev_log(sys, 3, bp, p);
     }
     0
@@ -373,7 +383,10 @@ unsafe fn step_init(s: &mut I2sState) -> i32 {
 
 /// Get PIO stream buffer via provider_query.
 #[inline(always)]
-unsafe fn pio_get_buffer(provider_query: unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32, handle: i32) -> *mut u32 {
+unsafe fn pio_get_buffer(
+    provider_query: unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32,
+    handle: i32,
+) -> *mut u32 {
     let mut buf_ptr: *mut u32 = core::ptr::null_mut();
     (provider_query)(
         handle,
@@ -422,7 +435,12 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
 
     let mut buffers_filled = 0;
     while buffers_filled < 2 {
-        let can_push = (provider_call)(stream_handle, DEV_PIO_STREAM_CAN_PUSH, core::ptr::null_mut(), 0);
+        let can_push = (provider_call)(
+            stream_handle,
+            DEV_PIO_STREAM_CAN_PUSH,
+            core::ptr::null_mut(),
+            0,
+        );
         if can_push == 0 {
             break;
         }
@@ -455,7 +473,7 @@ unsafe fn step_running(s: &mut I2sState) -> i32 {
         }
 
         // Full PIO buffer accumulated — process and push
-        let sample_pairs = pio::PIO_BUFFER_WORDS;  // total / 4, always == PIO_BUFFER_WORDS
+        let sample_pairs = pio::PIO_BUFFER_WORDS; // total / 4, always == PIO_BUFFER_WORDS
         let used_bytes = sample_pairs * 4;
         let trailing = total - used_bytes;
 

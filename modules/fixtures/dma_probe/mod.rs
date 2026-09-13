@@ -21,7 +21,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -44,8 +43,8 @@ struct DmaProbeState {
 }
 
 mod params_def {
-    use super::DmaProbeState;
     use super::p_u32;
+    use super::DmaProbeState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -60,7 +59,11 @@ mod params_def {
 }
 
 fn hexdigit(n: u8) -> u8 {
-    if n < 10 { b'0' + n } else { b'a' + (n - 10) }
+    if n < 10 {
+        b'0' + n
+    } else {
+        b'a' + (n - 10)
+    }
 }
 
 fn fmt_hex64(v: u64, out: &mut [u8; 18]) {
@@ -98,22 +101,30 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[no_mangle]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    _in_chan: i32, _out_chan: i32, _ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize,
+    _in_chan: i32,
+    _out_chan: i32,
+    _ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() || state_size < core::mem::size_of::<DmaProbeState>() { return -3; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() || state_size < core::mem::size_of::<DmaProbeState>() {
+            return -3;
+        }
 
         let s = &mut *(state as *mut DmaProbeState);
         s.syscalls = syscalls as *const SyscallTable;
         s.done = 0;
         s.phys = 0;
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -128,7 +139,9 @@ pub extern "C" fn module_new(
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut DmaProbeState);
-        if s.done != 0 { return 1; } // Done
+        if s.done != 0 {
+            return 1;
+        } // Done
         s.done = 1;
 
         let sys = &*s.syscalls;

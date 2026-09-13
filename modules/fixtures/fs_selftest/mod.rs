@@ -597,9 +597,7 @@ unsafe fn verify(s: &mut SelfTestState, path: &[u8], len: usize) -> i32 {
         if rc < 0 {
             return fail(s, rc);
         }
-        let size = u64::from_le_bytes([
-            st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7],
-        ]);
+        let size = u64::from_le_bytes([st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]]);
         if size != len as u64 {
             return fail(s, -75); // EOVERFLOW — the entry describes another file
         }

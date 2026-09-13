@@ -16,6 +16,13 @@
 ))]
 #[path = "../modules/sdk/abi.rs"]
 pub mod abi;
+
+/// Architecture primitives (barriers, interrupt masks, NVIC). Cortex-M
+/// only today; see `arch/mod.rs` for why AArch64 has not moved yet.
+///
+/// Unconditional so that `arch::nvic`'s arithmetic is compiled — and its
+/// tests run — on host builds too. The asm-bearing half is ARM-gated inside.
+pub mod arch;
 #[cfg(any(
     feature = "rp",
     feature = "chip-bcm2712",

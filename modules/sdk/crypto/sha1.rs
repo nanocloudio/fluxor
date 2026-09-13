@@ -9,7 +9,12 @@ fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
     let mut w = [0u32; 80];
     let mut t = 0;
     while t < 16 {
-        w[t] = u32::from_be_bytes([block[t * 4], block[t * 4 + 1], block[t * 4 + 2], block[t * 4 + 3]]);
+        w[t] = u32::from_be_bytes([
+            block[t * 4],
+            block[t * 4 + 1],
+            block[t * 4 + 2],
+            block[t * 4 + 3],
+        ]);
         t += 1;
     }
     while t < 80 {
@@ -51,7 +56,13 @@ fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
 /// One-shot SHA-1. Inputs here are small (≤40 bytes), so a two-block scratch
 /// suffices for the padded final block.
 pub fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h = [0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut h = [
+        0x67452301u32,
+        0xEFCDAB89,
+        0x98BADCFE,
+        0x10325476,
+        0xC3D2E1F0,
+    ];
     let mut i = 0;
     while i + 64 <= data.len() {
         sha1_block(&mut h, &data[i..i + 64]);

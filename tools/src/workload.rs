@@ -1,5 +1,5 @@
 //! Fluxor workload-bundle manifest: parse, validate, target-select, and extract
-//! the resource footprint (rfc_k8s.md §8, §9, §19.1).
+//! the resource footprint.
 //!
 //! The manifest (`application/vnd.nanocloud.fluxor.workload.v1+json`) separates a
 //! portable **contract** (typed imports/exports, config schema, health/lifecycle
@@ -7,10 +7,10 @@
 //! resource profile, optional OCI-backed external nodes, and the bindings that
 //! wire the contract to that implementation's graph).
 //!
-//! Validation enforces the §9 rules: every required import, export, and
-//! health signal is bound exactly once in each implementation; OCI-backed
-//! external-node ports correspond to a declared export and the image is
-//! digest-pinned; every digest field is well-formed. The resource footprint that
+//! Validation enforces the manifest contract rules: every required import,
+//! export, and health signal is bound exactly once in each implementation;
+//! OCI-backed external-node ports correspond to a declared export and the image
+//! is digest-pinned; every digest field is well-formed. The resource footprint that
 //! feeds the scheduler reservation (`compose::ResourceProfile`) is extracted from
 //! the implementation's signed resource profile, never trusted from handwriting.
 
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::compose::{PodUid, ResourceProfile};
 
 // ============================================================================
-// Manifest types (rfc_k8s.md §9 shape)
+// Manifest types
 // ============================================================================
 
 /// A `sha256:<hex>` content reference.
@@ -60,8 +60,9 @@ pub struct Health {
     pub liveness: String,
 }
 
-/// Update/drain policy. `state_policy` is `preserve-compatible` | `discard`
-/// (rfc_k8s.md §12.2).
+/// Update/drain policy. `state_policy` is `preserve-compatible` (carry module
+/// state across an update when its state-schema digest is unchanged) or
+/// `discard` (start the new generation from empty state).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePolicy {
@@ -86,7 +87,7 @@ pub struct Contract {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Target {
-    /// Silicon or host token from the closed §2 set
+    /// Silicon or host token from the closed set
     /// (standards/target_consolidation.md): `bcm2712`, `rp2040`,
     /// `rp2350`, `esp32s3`, `linux`, `wasm`. Never a board id.
     pub family: String,
@@ -110,8 +111,8 @@ pub struct InterfaceBinding {
     pub container_port: u16,
 }
 
-/// A Linux OCI-backed graph node (rfc_k8s.md §6.8, §9). `execution_class` is
-/// `external-hosted`; `image` must be digest-pinned.
+/// A Linux OCI-backed graph node. `execution_class` is `external-hosted`;
+/// `image` must be digest-pinned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalNode {
@@ -163,7 +164,9 @@ pub struct WorkloadManifest {
 
 /// The resource-footprint document referenced by an implementation's
 /// `resources` digest (`application/vnd.nanocloud.fluxor.resources.v1+json`).
-/// Generated/measured by the build tool, never handwritten (rfc_k8s.md §9).
+/// Generated/measured by the build tool, never handwritten: the numbers here
+/// are what the scheduler reserves, so a hand-tuned value would reserve a
+/// footprint the graph does not actually have.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceProfileDoc {
@@ -175,7 +178,9 @@ pub struct ResourceProfileDoc {
     pub endpoints: u16,
     #[serde(default)]
     pub domains: u8,
-    /// Per-module state-schema digests used for change classification (§12.2).
+    /// Per-module state-schema digests. An update compares them per module to
+    /// classify the change: an unchanged digest lets `preserve-compatible`
+    /// carry that module's state forward, a changed one forces it discarded.
     #[serde(default)]
     pub state_schemas: BTreeMap<String, String>,
 }
@@ -213,7 +218,8 @@ pub fn parse_resource_profile(json: &str) -> Result<ResourceProfileDoc, String> 
 // ============================================================================
 
 /// Outcome of validating a manifest: a list of human-readable problems, each
-/// naming the offending field path (rfc_k8s.md §7.1 "exact field paths").
+/// naming the exact offending field path (e.g. `implementations[0].graph.digest`)
+/// rather than a summary, so the author can go straight to the field.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ValidationReport {
     pub errors: Vec<String>,
@@ -243,8 +249,14 @@ fn is_digest_pinned_image(image: &str) -> bool {
     }
 }
 
-/// Validate a manifest against the §9 contract rules. Returns a report; empty
-/// `errors` means valid.
+/// Validate a manifest against the contract rules: `schemaVersion` is 1 and the
+/// name non-empty; every digest field is a well-formed `sha256:<64 hex>`; both
+/// health signals are non-empty and bound in every implementation; every
+/// declared import and export is bound exactly once per implementation, with no
+/// binding that matches no declaration; `statePolicy` is one of the two known
+/// values; at least one implementation exists; and every OCI-backed external
+/// node is `external-hosted`, digest-pinned, and bridges only declared exports
+/// over a known bridge kind. Returns a report; empty `errors` means valid.
 pub fn validate(m: &WorkloadManifest) -> ValidationReport {
     let mut r = ValidationReport::default();
 
@@ -382,7 +394,8 @@ fn validate_implementation(
 }
 
 // ============================================================================
-// Target selection (rfc_k8s.md §8)
+// Target selection: an implementation is chosen by exact match on the full
+// target triple, never by fallback or nearest fit
 // ============================================================================
 
 /// Select the implementation matching `(family, architecture, fluxor_abi)`.
@@ -400,7 +413,8 @@ pub fn select_implementation<'a>(
 }
 
 // ============================================================================
-// Deterministic subgraph namespacing (rfc_k8s.md §10.2)
+// Deterministic subgraph namespacing: each pod's modules are qualified into a
+// per-pod namespace before they join the single device graph
 // ============================================================================
 
 /// Qualify a pod-local module name into its globally-unique composed-graph name
@@ -433,8 +447,9 @@ pub fn qualify_implementation_modules(
 mod tests {
     use super::*;
 
-    /// A Quantum-shaped bundle mirroring rfc_k8s.md §9 (digests truncated to
-    /// valid 64-hex form; the linux impl carries an OCI-backed broker node).
+    /// A Quantum-shaped bundle exercising the full manifest shape (digests are
+    /// synthetic but valid 64-hex; the linux impl carries an OCI-backed broker
+    /// node).
     fn quantum_manifest_json() -> String {
         let d = format!("sha256:{}", "ab".repeat(32)); // 64 hex
         format!(

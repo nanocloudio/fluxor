@@ -32,7 +32,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -158,11 +157,15 @@ unsafe fn cobs_decode(src: *const u8, src_len: usize, dst: *mut u8) -> usize {
     while read_idx < src_len {
         let code = *src.add(read_idx);
         read_idx += 1;
-        if code == 0 { return 0; }
+        if code == 0 {
+            return 0;
+        }
 
         let mut i = 1u8;
         while i < code {
-            if read_idx >= src_len { return 0; }
+            if read_idx >= src_len {
+                return 0;
+            }
             *dst.add(write_idx) = *src.add(read_idx);
             write_idx += 1;
             read_idx += 1;
@@ -196,13 +199,20 @@ struct LinkFrameHeader {
 
 #[inline(never)]
 unsafe fn link_frame_encode(
-    msg_type: u8, flags: u8, seq: u16, frame_id: u32,
-    payload: *const u8, payload_len: u16,
-    wire_buf: *mut u8, wire_buf_cap: usize,
+    msg_type: u8,
+    flags: u8,
+    seq: u16,
+    frame_id: u32,
+    payload: *const u8,
+    payload_len: u16,
+    wire_buf: *mut u8,
+    wire_buf_cap: usize,
 ) -> usize {
     let raw_len = LINK_HDR_SIZE + payload_len as usize + LINK_CRC_SIZE;
     let cobs_needed = cobs_max_encoded(raw_len) + 2;
-    if wire_buf_cap < cobs_needed { return 0; }
+    if wire_buf_cap < cobs_needed {
+        return 0;
+    }
 
     let raw_offset = wire_buf_cap - raw_len;
     let raw = wire_buf.add(raw_offset);
@@ -210,12 +220,16 @@ unsafe fn link_frame_encode(
     *raw.add(0) = msg_type;
     *raw.add(1) = flags;
     let sb = seq.to_le_bytes();
-    *raw.add(2) = sb[0]; *raw.add(3) = sb[1];
+    *raw.add(2) = sb[0];
+    *raw.add(3) = sb[1];
     let fb = frame_id.to_le_bytes();
-    *raw.add(4) = fb[0]; *raw.add(5) = fb[1];
-    *raw.add(6) = fb[2]; *raw.add(7) = fb[3];
+    *raw.add(4) = fb[0];
+    *raw.add(5) = fb[1];
+    *raw.add(6) = fb[2];
+    *raw.add(7) = fb[3];
     let lb = payload_len.to_le_bytes();
-    *raw.add(8) = lb[0]; *raw.add(9) = lb[1];
+    *raw.add(8) = lb[0];
+    *raw.add(9) = lb[1];
 
     if payload_len > 0 && !payload.is_null() {
         let mut i = 0usize;
@@ -238,30 +252,40 @@ unsafe fn link_frame_encode(
 
 #[inline(never)]
 unsafe fn link_frame_decode(
-    cobs_data: *const u8, cobs_len: usize,
-    decoded_buf: *mut u8, decoded_cap: usize,
+    cobs_data: *const u8,
+    cobs_len: usize,
+    decoded_buf: *mut u8,
+    decoded_cap: usize,
     header_out: *mut LinkFrameHeader,
 ) -> usize {
     let decoded_len = cobs_decode(cobs_data, cobs_len, decoded_buf);
-    if decoded_len < LINK_HDR_SIZE + LINK_CRC_SIZE { return 0; }
-    if decoded_len > decoded_cap { return 0; }
+    if decoded_len < LINK_HDR_SIZE + LINK_CRC_SIZE {
+        return 0;
+    }
+    if decoded_len > decoded_cap {
+        return 0;
+    }
 
     let data_len = decoded_len - LINK_CRC_SIZE;
     let computed = crc16_block(decoded_buf, data_len);
-    let received = u16::from_le_bytes([
-        *decoded_buf.add(data_len), *decoded_buf.add(data_len + 1),
-    ]);
-    if computed != received { return 0; }
+    let received = u16::from_le_bytes([*decoded_buf.add(data_len), *decoded_buf.add(data_len + 1)]);
+    if computed != received {
+        return 0;
+    }
 
     let payload_len = u16::from_le_bytes([*decoded_buf.add(8), *decoded_buf.add(9)]);
-    if LINK_HDR_SIZE + payload_len as usize + LINK_CRC_SIZE != decoded_len { return 0; }
+    if LINK_HDR_SIZE + payload_len as usize + LINK_CRC_SIZE != decoded_len {
+        return 0;
+    }
 
     (*header_out).msg_type = *decoded_buf.add(0);
     (*header_out).flags = *decoded_buf.add(1);
     (*header_out).seq = u16::from_le_bytes([*decoded_buf.add(2), *decoded_buf.add(3)]);
     (*header_out).frame_id = u32::from_le_bytes([
-        *decoded_buf.add(4), *decoded_buf.add(5),
-        *decoded_buf.add(6), *decoded_buf.add(7),
+        *decoded_buf.add(4),
+        *decoded_buf.add(5),
+        *decoded_buf.add(6),
+        *decoded_buf.add(7),
     ]);
     (*header_out).payload_len = payload_len;
     LINK_HDR_SIZE
@@ -272,38 +296,56 @@ unsafe fn link_frame_decode(
 // ============================================================================
 
 #[inline(always)]
-unsafe fn sync_beacon_encode(
-    buf: *mut u8, consumed: u64, queued: u32, rate_q16: u32, micros: u64,
-) {
+unsafe fn sync_beacon_encode(buf: *mut u8, consumed: u64, queued: u32, rate_q16: u32, micros: u64) {
     let cb = consumed.to_le_bytes();
     let mut i = 0usize;
-    while i < 8 { *buf.add(i) = cb[i]; i += 1; }
+    while i < 8 {
+        *buf.add(i) = cb[i];
+        i += 1;
+    }
     let qb = queued.to_le_bytes();
     i = 0;
-    while i < 4 { *buf.add(8 + i) = qb[i]; i += 1; }
+    while i < 4 {
+        *buf.add(8 + i) = qb[i];
+        i += 1;
+    }
     let rb = rate_q16.to_le_bytes();
     i = 0;
-    while i < 4 { *buf.add(12 + i) = rb[i]; i += 1; }
+    while i < 4 {
+        *buf.add(12 + i) = rb[i];
+        i += 1;
+    }
     let mb = micros.to_le_bytes();
     i = 0;
-    while i < 8 { *buf.add(16 + i) = mb[i]; i += 1; }
+    while i < 8 {
+        *buf.add(16 + i) = mb[i];
+        i += 1;
+    }
 }
 
 #[inline(always)]
 unsafe fn sync_beacon_decode(buf: *const u8) -> (u64, u32, u32, u64) {
     let consumed = u64::from_le_bytes([
-        *buf, *buf.add(1), *buf.add(2), *buf.add(3),
-        *buf.add(4), *buf.add(5), *buf.add(6), *buf.add(7),
+        *buf,
+        *buf.add(1),
+        *buf.add(2),
+        *buf.add(3),
+        *buf.add(4),
+        *buf.add(5),
+        *buf.add(6),
+        *buf.add(7),
     ]);
-    let queued = u32::from_le_bytes([
-        *buf.add(8), *buf.add(9), *buf.add(10), *buf.add(11),
-    ]);
-    let rate_q16 = u32::from_le_bytes([
-        *buf.add(12), *buf.add(13), *buf.add(14), *buf.add(15),
-    ]);
+    let queued = u32::from_le_bytes([*buf.add(8), *buf.add(9), *buf.add(10), *buf.add(11)]);
+    let rate_q16 = u32::from_le_bytes([*buf.add(12), *buf.add(13), *buf.add(14), *buf.add(15)]);
     let micros = u64::from_le_bytes([
-        *buf.add(16), *buf.add(17), *buf.add(18), *buf.add(19),
-        *buf.add(20), *buf.add(21), *buf.add(22), *buf.add(23),
+        *buf.add(16),
+        *buf.add(17),
+        *buf.add(18),
+        *buf.add(19),
+        *buf.add(20),
+        *buf.add(21),
+        *buf.add(22),
+        *buf.add(23),
     ]);
     (consumed, queued, rate_q16, micros)
 }
@@ -342,7 +384,7 @@ const BEACON_INTERVAL_MS: u64 = 10;
 enum Phase {
     Init = 0,
     WaitUart = 1,
-    Filling = 2,   // RX: filling jitter buffer
+    Filling = 2, // RX: filling jitter buffer
     Running = 3,
     Error = 4,
 }
@@ -431,8 +473,12 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<LinkState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<LinkState>() {
+            return -2;
+        }
 
         let s = &mut *(state as *mut LinkState);
         s.syscalls = syscalls as *const SyscallTable;
@@ -444,8 +490,8 @@ pub extern "C" fn module_new(
         s.uart_rx_handle = -1;
         s.phase = Phase::Init;
 
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -469,9 +515,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut LinkState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
 
         match s.phase {
             Phase::Init => step_init(s),
@@ -527,7 +577,11 @@ unsafe fn step_init(s: &mut LinkState) -> i32 {
 }
 
 unsafe fn step_wait_uart(s: &mut LinkState) -> i32 {
-    s.phase = if s.mode == MODE_TX { Phase::Running } else { Phase::Filling };
+    s.phase = if s.mode == MODE_TX {
+        Phase::Running
+    } else {
+        Phase::Filling
+    };
     0
 }
 
@@ -580,7 +634,8 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
         if s.wire_pending_len > 0 {
             let uart_tx = s.uart_tx_handle;
             let result = (dev_call)(
-                uart_tx, 0x0D02,
+                uart_tx,
+                0x0D02,
                 s.wire_buf.as_mut_ptr().add(s.wire_pending_offset as usize),
                 s.wire_pending_len as usize,
             );
@@ -608,16 +663,20 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
             if in_poll > 0 && ((in_poll as u32) & POLL_IN) != 0 {
                 // Try mailbox
                 let mut mailbox_len: u32 = 0;
-                let mailbox_ptr = (dev_call)(
-                    in_chan, 0x0A02,
-                    &mut mailbox_len as *mut u32 as *mut u8, 4,
-                ) as *const u8;
+                let mailbox_ptr =
+                    (dev_call)(in_chan, 0x0A02, &mut mailbox_len as *mut u32 as *mut u8, 4)
+                        as *const u8;
                 if !mailbox_ptr.is_null() && mailbox_len >= block_bytes as u32 {
                     let frame_id = compute_frame_id(s, dev_call);
                     let wire_len = link_frame_encode(
-                        LINK_MSG_AUDIO, 0, s.tx_seq, frame_id,
-                        mailbox_ptr, block_bytes as u16,
-                        s.wire_buf.as_mut_ptr(), MAX_WIRE_BUF,
+                        LINK_MSG_AUDIO,
+                        0,
+                        s.tx_seq,
+                        frame_id,
+                        mailbox_ptr,
+                        block_bytes as u16,
+                        s.wire_buf.as_mut_ptr(),
+                        MAX_WIRE_BUF,
                     );
                     (dev_call)(in_chan, 0x0A03, core::ptr::null_mut(), 0);
                     s.tx_seq = s.tx_seq.wrapping_add(1);
@@ -635,9 +694,14 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                     if read >= block_bytes as i32 {
                         let frame_id = compute_frame_id(s, dev_call);
                         let wire_len = link_frame_encode(
-                            LINK_MSG_AUDIO, 0, s.tx_seq, frame_id,
-                            audio_buf, read as u16,
-                            s.wire_buf.as_mut_ptr(), audio_offset,
+                            LINK_MSG_AUDIO,
+                            0,
+                            s.tx_seq,
+                            frame_id,
+                            audio_buf,
+                            read as u16,
+                            s.wire_buf.as_mut_ptr(),
+                            audio_offset,
                         );
                         s.tx_seq = s.tx_seq.wrapping_add(1);
                         if wire_len > 0 {
@@ -663,8 +727,10 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
                     let fmp_payload_len = u16::from_le_bytes([hdr[4], hdr[5]]);
 
                     let tb = fmp_type.to_le_bytes();
-                    *ctrl_buf = tb[0]; *ctrl_buf.add(1) = tb[1];
-                    *ctrl_buf.add(2) = tb[2]; *ctrl_buf.add(3) = tb[3];
+                    *ctrl_buf = tb[0];
+                    *ctrl_buf.add(1) = tb[1];
+                    *ctrl_buf.add(2) = tb[2];
+                    *ctrl_buf.add(3) = tb[3];
 
                     if fmp_payload_len > 0 {
                         let to_read = (fmp_payload_len as usize).min(250);
@@ -673,9 +739,14 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
 
                     let total = 4 + fmp_payload_len as usize;
                     let wire_len = link_frame_encode(
-                        LINK_MSG_CONTROL, 0, s.tx_seq, 0,
-                        ctrl_buf, total as u16,
-                        s.wire_buf.as_mut_ptr(), ctrl_offset,
+                        LINK_MSG_CONTROL,
+                        0,
+                        s.tx_seq,
+                        0,
+                        ctrl_buf,
+                        total as u16,
+                        s.wire_buf.as_mut_ptr(),
+                        ctrl_offset,
                     );
                     s.tx_seq = s.tx_seq.wrapping_add(1);
                     if wire_len > 0 {
@@ -700,7 +771,8 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
             if sp.valid && sp.frame_id == s.playout_frame_id {
                 // Mailbox write
                 let mut cap: u32 = 0;
-                let mbuf = (dev_call)(out_chan, 0x0A00, &mut cap as *mut u32 as *mut u8, 4) as *mut u8;
+                let mbuf =
+                    (dev_call)(out_chan, 0x0A00, &mut cap as *mut u32 as *mut u8, 4) as *mut u8;
                 if !mbuf.is_null() && cap >= block_bytes as u32 {
                     let src = s.jitter_data.as_ptr().add(slot_idx * MAX_BLOCK_BYTES);
                     let mut j = 0usize;
@@ -723,7 +795,8 @@ unsafe fn step_running(s: &mut LinkState) -> i32 {
             } else {
                 // Missing block — output silence
                 let mut cap: u32 = 0;
-                let mbuf = (dev_call)(out_chan, 0x0A00, &mut cap as *mut u32 as *mut u8, 4) as *mut u8;
+                let mbuf =
+                    (dev_call)(out_chan, 0x0A00, &mut cap as *mut u32 as *mut u8, 4) as *mut u8;
                 if !mbuf.is_null() && cap >= block_bytes as u32 {
                     let mut j = 0usize;
                     while j < block_bytes {
@@ -784,7 +857,9 @@ unsafe fn compute_frame_id(s: &LinkState, dev_call: DevCallFn) -> u32 {
         let frames_elapsed = if rate > 0 {
             let product = (elapsed_us as u64).wrapping_mul(rate as u64);
             (((product >> 16).wrapping_mul(4295)) >> 16) as u32
-        } else { 0 };
+        } else {
+            0
+        };
         let current = s.master_consumed.wrapping_add(frames_elapsed as u64);
         current.wrapping_add(s.pipeline_latency as u64) as u32
     } else {
@@ -805,18 +880,23 @@ unsafe fn poll_uart_rx(s: &mut LinkState, dev_call: DevCallFn) {
     }
 
     let result = (dev_call)(
-        s.uart_rx_handle, 0x0D03,
+        s.uart_rx_handle,
+        0x0D03,
         s.rx_accum.as_mut_ptr().add(s.rx_accum_len as usize),
         space,
     );
 
     let bytes = if result == 0 {
         let poll = (dev_call)(s.uart_rx_handle, 0x0D04, core::ptr::null_mut(), 0);
-        if poll <= 0 { return; }
+        if poll <= 0 {
+            return;
+        }
         poll as usize
     } else if result > 0 {
         result as usize
-    } else { return; };
+    } else {
+        return;
+    };
 
     let start = s.rx_accum_len as usize;
     let end = start + bytes;
@@ -855,7 +935,11 @@ unsafe fn decode_frame(s: &mut LinkState, frame_end: usize) {
     let cobs_len = frame_end;
 
     let mut header = LinkFrameHeader {
-        msg_type: 0, flags: 0, seq: 0, frame_id: 0, payload_len: 0,
+        msg_type: 0,
+        flags: 0,
+        seq: 0,
+        frame_id: 0,
+        payload_len: 0,
     };
 
     // Decode into scratch at end of jitter_data
@@ -863,13 +947,11 @@ unsafe fn decode_frame(s: &mut LinkState, frame_end: usize) {
     let scratch_offset = MAX_JITTER_BLOCKS * MAX_BLOCK_BYTES - max_decoded;
     let decode_buf = s.jitter_data.as_mut_ptr().add(scratch_offset);
 
-    let payload_off = link_frame_decode(
-        cobs_data, cobs_len,
-        decode_buf, max_decoded,
-        &mut header,
-    );
+    let payload_off = link_frame_decode(cobs_data, cobs_len, decode_buf, max_decoded, &mut header);
 
-    if payload_off == 0 { return; }
+    if payload_off == 0 {
+        return;
+    }
 
     match header.msg_type {
         LINK_MSG_AUDIO => {
@@ -895,7 +977,9 @@ unsafe fn handle_audio(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const
     let depth = s.jitter_depth as usize;
     let block_bytes = (s.block_size as usize) * 2;
 
-    if (hdr.payload_len as usize) < block_bytes { return; }
+    if (hdr.payload_len as usize) < block_bytes {
+        return;
+    }
 
     let slot_idx = mod_small(hdr.frame_id as usize, depth);
     let slot = &mut *s.jitter_slots.as_mut_ptr().add(slot_idx);
@@ -915,7 +999,9 @@ unsafe fn handle_audio(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const
 }
 
 unsafe fn handle_sync(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const u8) {
-    if (hdr.payload_len as usize) < SYNC_PAYLOAD_SIZE { return; }
+    if (hdr.payload_len as usize) < SYNC_PAYLOAD_SIZE {
+        return;
+    }
 
     let dev_call = (*s.syscalls).provider_call;
     let (consumed, _queued, rate_q16, micros) = sync_beacon_decode(payload);
@@ -930,21 +1016,28 @@ unsafe fn handle_sync(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const 
 }
 
 unsafe fn handle_control(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *const u8) {
-    if s.ctrl_out_chan < 0 { return; }
-    if (hdr.payload_len as usize) < 4 { return; }
+    if s.ctrl_out_chan < 0 {
+        return;
+    }
+    if (hdr.payload_len as usize) < 4 {
+        return;
+    }
 
     let channel_write = (*s.syscalls).channel_write;
 
-    let fmp_type = u32::from_le_bytes([
-        *payload, *payload.add(1), *payload.add(2), *payload.add(3),
-    ]);
+    let fmp_type =
+        u32::from_le_bytes([*payload, *payload.add(1), *payload.add(2), *payload.add(3)]);
     let fmp_payload_len = hdr.payload_len.wrapping_sub(4);
 
     let mut fmp_hdr = [0u8; 6];
     let tb = fmp_type.to_le_bytes();
-    fmp_hdr[0] = tb[0]; fmp_hdr[1] = tb[1]; fmp_hdr[2] = tb[2]; fmp_hdr[3] = tb[3];
+    fmp_hdr[0] = tb[0];
+    fmp_hdr[1] = tb[1];
+    fmp_hdr[2] = tb[2];
+    fmp_hdr[3] = tb[3];
     let lb = fmp_payload_len.to_le_bytes();
-    fmp_hdr[4] = lb[0]; fmp_hdr[5] = lb[1];
+    fmp_hdr[4] = lb[0];
+    fmp_hdr[5] = lb[1];
     (channel_write)(s.ctrl_out_chan, fmp_hdr.as_ptr(), 6);
 
     if fmp_payload_len > 0 {
@@ -957,33 +1050,47 @@ unsafe fn handle_control(s: &mut LinkState, hdr: &LinkFrameHeader, payload: *con
 // ============================================================================
 
 unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
-    if s.mode == MODE_TX { return; }
+    if s.mode == MODE_TX {
+        return;
+    }
 
     let mut milli_buf = [0u8; 8];
-    (dev_call)(-1, abi::kernel_abi::timer::MILLIS, milli_buf.as_mut_ptr(), 8);
+    (dev_call)(
+        -1,
+        abi::kernel_abi::timer::MILLIS,
+        milli_buf.as_mut_ptr(),
+        8,
+    );
     let now_ms = u64::from_le_bytes(milli_buf);
 
-    if now_ms.wrapping_sub(s.last_beacon_ms) < BEACON_INTERVAL_MS { return; }
+    if now_ms.wrapping_sub(s.last_beacon_ms) < BEACON_INTERVAL_MS {
+        return;
+    }
 
     if s.beacon_pending {
         let poll = (dev_call)(s.uart_tx_handle, 0x0D04, core::ptr::null_mut(), 0);
-        if poll == 0 { return; }
+        if poll == 0 {
+            return;
+        }
         s.beacon_pending = false;
     }
 
     let dev_query = (*s.syscalls).provider_query;
     let mut st_buf = [0u8; 24];
     let r = (dev_query)(-1, 0x0C30, st_buf.as_mut_ptr(), 24);
-    if r < 0 { return; }
+    if r < 0 {
+        return;
+    }
 
     let consumed = u64::from_le_bytes([
-        st_buf[0], st_buf[1], st_buf[2], st_buf[3],
-        st_buf[4], st_buf[5], st_buf[6], st_buf[7],
+        st_buf[0], st_buf[1], st_buf[2], st_buf[3], st_buf[4], st_buf[5], st_buf[6], st_buf[7],
     ]);
     let queued = u32::from_le_bytes([st_buf[8], st_buf[9], st_buf[10], st_buf[11]]);
     let rate_q16 = u32::from_le_bytes([st_buf[12], st_buf[13], st_buf[14], st_buf[15]]);
 
-    if rate_q16 == 0 { return; }
+    if rate_q16 == 0 {
+        return;
+    }
 
     let mut us_buf = [0u8; 8];
     (dev_call)(-1, 0x0602, us_buf.as_mut_ptr(), 8);
@@ -993,14 +1100,23 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
     sync_beacon_encode(payload.as_mut_ptr(), consumed, queued, rate_q16, now_us);
 
     let wire_len = link_frame_encode(
-        LINK_MSG_SYNC, 0, 0,
+        LINK_MSG_SYNC,
+        0,
+        0,
         consumed as u32,
-        payload.as_ptr(), SYNC_PAYLOAD_SIZE as u16,
-        s.beacon_wire.as_mut_ptr(), BEACON_WIRE_SIZE,
+        payload.as_ptr(),
+        SYNC_PAYLOAD_SIZE as u16,
+        s.beacon_wire.as_mut_ptr(),
+        BEACON_WIRE_SIZE,
     );
 
     if wire_len > 0 {
-        let result = (dev_call)(s.uart_tx_handle, 0x0D02, s.beacon_wire.as_mut_ptr(), wire_len);
+        let result = (dev_call)(
+            s.uart_tx_handle,
+            0x0D02,
+            s.beacon_wire.as_mut_ptr(),
+            wire_len,
+        );
         if result == 0 {
             s.beacon_pending = true;
         }
@@ -1010,11 +1126,15 @@ unsafe fn maybe_send_beacon(s: &mut LinkState, dev_call: DevCallFn) {
 
 #[no_mangle]
 #[link_section = ".text.module_mailbox_safe"]
-pub extern "C" fn module_mailbox_safe() -> i32 { 1 }
+pub extern "C" fn module_mailbox_safe() -> i32 {
+    1
+}
 
 #[no_mangle]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> i32 { 1 }
+pub extern "C" fn module_deferred_ready() -> i32 {
+    1
+}
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /

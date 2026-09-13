@@ -181,6 +181,15 @@ struct ChannelSlot {
     lock: AtomicBool,
     /// HUP flag (producer signals end-of-stream / completion)
     hup_flag: AtomicBool,
+    /// The consumer has finished: nothing will read this channel again.
+    /// Set by the scheduler when it retires a module, for every channel
+    /// that module read from. A finished reader's ring would otherwise
+    /// fill and stay full, and back-pressure is transitive -- through a
+    /// tee it stops the producer for every OTHER consumer too, so one
+    /// module ending turns into a graph that stops. A channel in this
+    /// state accepts and discards instead: there is no one to deliver to
+    /// and no one to wait for.
+    reader_gone: AtomicBool,
     /// Channel is in mailbox mode (zero-copy buffer handoff).
     /// Set by the scheduler for aliased channels (buffer_group != 0).
     /// When false, buffer_acquire_write returns null, forcing FIFO mode.
@@ -237,6 +246,7 @@ impl ChannelSlot {
             sticky_events: AtomicU8::new(0),
             lock: AtomicBool::new(false),
             hup_flag: AtomicBool::new(false),
+            reader_gone: AtomicBool::new(false),
             mailbox: AtomicBool::new(false),
             aux_u32: AtomicU32::new(NO_AUX_PENDING),
             buffer_slot: AtomicI16::new(-1),
@@ -295,6 +305,7 @@ impl ChannelSlot {
         self.chan_type.store(0, Ordering::Release);
         self.sticky_events.store(0, Ordering::Release);
         self.hup_flag.store(false, Ordering::Release);
+        self.reader_gone.store(false, Ordering::Release);
         self.mailbox.store(false, Ordering::Release);
         self.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
         self.wake_module.store(-1, Ordering::Release);
@@ -724,6 +735,13 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     if !slot.is_pipe() {
         return CHAN_EINVAL;
     }
+    if slot.reader_gone.load(Ordering::Acquire) {
+        // Written to a consumer that has finished. Reporting the write done
+        // is the truth available: it will never be read, and the alternative
+        // -- reporting it blocked -- asks the producer to wait for a reader
+        // that is not coming.
+        return len as i32;
+    }
     if slot.mailbox.load(Ordering::Acquire) {
         // Mailbox channel: acquire → copy from caller's buffer → release.
         // Unlike FIFO, mailbox release publishes the entire payload atomically —
@@ -1093,6 +1111,13 @@ pub fn channel_writable_bytes(handle: i32) -> usize {
     if !slot.is_pipe() {
         return 0;
     }
+    if slot.reader_gone.load(Ordering::Acquire) {
+        // A finished consumer never runs out of room, because nothing is
+        // kept. Answering with the ring's capacity rather than something
+        // unbounded keeps every caller that sizes a read by this answer
+        // inside the bounds it was written for.
+        return slot.with_lock(|fifo, _| fifo.capacity());
+    }
     if slot.mailbox.load(Ordering::Acquire) {
         return 0;
     }
@@ -1129,6 +1154,21 @@ pub fn channel_set_flags(handle: i32, flags: u8) {
     let slot = &CHANNELS[idx];
     // Atomically OR the new flags with existing flags
     slot.sticky_events.fetch_or(flags, Ordering::Release);
+}
+
+/// Mark a channel as one whose consumer has finished.
+///
+/// From here on it accepts and discards: see `reader_gone`. The scheduler
+/// calls this for every input channel of a module it retires.
+pub fn channel_set_reader_gone(handle: i32) {
+    if handle < 0 {
+        return;
+    }
+    let idx = handle as usize;
+    if idx >= MAX_CHANNELS {
+        return;
+    }
+    CHANNELS[idx].reader_gone.store(true, Ordering::Release);
 }
 
 // ============================================================================

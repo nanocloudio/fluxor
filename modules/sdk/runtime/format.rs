@@ -154,4 +154,3 @@ pub fn track_pending(written: i32, total: usize, pending_out: &mut u16, pending_
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
-

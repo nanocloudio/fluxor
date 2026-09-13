@@ -87,7 +87,15 @@ unsafe fn log_line(s: &DirState, parts: &[&[u8]]) {
 
 unsafe fn reply(s: &mut DirState, msg: u8, payload: &[u8]) {
     let sys = &*s.syscalls;
-    net_write_frame(sys, s.ctrl_out, msg, payload.as_ptr(), payload.len(), s.out.as_mut_ptr(), 128);
+    net_write_frame(
+        sys,
+        s.ctrl_out,
+        msg,
+        payload.as_ptr(),
+        payload.len(),
+        s.out.as_mut_ptr(),
+        128,
+    );
 }
 
 fn find(s: &DirState, session_id: &[u8]) -> Option<usize> {
@@ -174,7 +182,13 @@ unsafe fn on_attach(s: &mut DirState, p: &[u8]) {
             // A rebind is authoritative only at a higher generation.
             if epoch <= s.bindings[i].epoch {
                 log_stale(s, epoch, s.bindings[i].epoch);
-                reply_status(s, sc::MSG_SC_ATTACHED, &session_id, epoch, sc::STATUS_STALE_EPOCH);
+                reply_status(
+                    s,
+                    sc::MSG_SC_ATTACHED,
+                    &session_id,
+                    epoch,
+                    sc::STATUS_STALE_EPOCH,
+                );
                 return;
             }
             i
@@ -185,7 +199,13 @@ unsafe fn on_attach(s: &mut DirState, p: &[u8]) {
                 i
             }
             None => {
-                reply_status(s, sc::MSG_SC_ATTACHED, &session_id, epoch, sc::STATUS_NO_CAPACITY);
+                reply_status(
+                    s,
+                    sc::MSG_SC_ATTACHED,
+                    &session_id,
+                    epoch,
+                    sc::STATUS_NO_CAPACITY,
+                );
                 return;
             }
         },
@@ -210,12 +230,24 @@ unsafe fn on_detach(s: &mut DirState, p: &[u8]) {
     session_id.copy_from_slice(sc::session_id(p));
     let epoch = sc::epoch(p);
     let Some(i) = find(s, &session_id) else {
-        reply_status(s, sc::MSG_SC_ERROR, &session_id, epoch, sc::STATUS_UNKNOWN_SESSION);
+        reply_status(
+            s,
+            sc::MSG_SC_ERROR,
+            &session_id,
+            epoch,
+            sc::STATUS_UNKNOWN_SESSION,
+        );
         return;
     };
     if epoch < s.bindings[i].epoch {
         log_stale(s, epoch, s.bindings[i].epoch);
-        reply_status(s, sc::MSG_SC_ERROR, &session_id, epoch, sc::STATUS_STALE_EPOCH);
+        reply_status(
+            s,
+            sc::MSG_SC_ERROR,
+            &session_id,
+            epoch,
+            sc::STATUS_STALE_EPOCH,
+        );
         return;
     }
     s.bindings[i] = NO_BINDING;
@@ -235,12 +267,24 @@ unsafe fn on_epoch_bump(s: &mut DirState, p: &[u8]) {
     let old = sc::epoch(p);
     let new = sc::u32_after_header(p);
     let Some(i) = find(s, &session_id) else {
-        reply_status(s, sc::MSG_SC_ERROR, &session_id, old, sc::STATUS_UNKNOWN_SESSION);
+        reply_status(
+            s,
+            sc::MSG_SC_ERROR,
+            &session_id,
+            old,
+            sc::STATUS_UNKNOWN_SESSION,
+        );
         return;
     };
     if old != s.bindings[i].epoch || new <= old {
         log_stale(s, old, s.bindings[i].epoch);
-        reply_status(s, sc::MSG_SC_ERROR, &session_id, old, sc::STATUS_STALE_EPOCH);
+        reply_status(
+            s,
+            sc::MSG_SC_ERROR,
+            &session_id,
+            old,
+            sc::STATUS_STALE_EPOCH,
+        );
         return;
     }
     s.bindings[i].epoch = new;
@@ -261,16 +305,30 @@ unsafe fn on_relocate(s: &mut DirState, p: &[u8]) {
     session_id.copy_from_slice(sc::session_id(p));
     let epoch = sc::epoch(p);
     let Some(i) = find(s, &session_id) else {
-        reply_status(s, sc::MSG_SC_RELOCATED, &session_id, epoch, sc::STATUS_UNKNOWN_SESSION);
+        reply_status(
+            s,
+            sc::MSG_SC_RELOCATED,
+            &session_id,
+            epoch,
+            sc::STATUS_UNKNOWN_SESSION,
+        );
         return;
     };
     if epoch != s.bindings[i].epoch {
         log_stale(s, epoch, s.bindings[i].epoch);
-        reply_status(s, sc::MSG_SC_RELOCATED, &session_id, epoch, sc::STATUS_STALE_EPOCH);
+        reply_status(
+            s,
+            sc::MSG_SC_RELOCATED,
+            &session_id,
+            epoch,
+            sc::STATUS_STALE_EPOCH,
+        );
         return;
     }
     let at = sc::SESSION_HEADER;
-    s.bindings[i].worker_id.copy_from_slice(&p[at..at + sc::WORKER_ID_BYTES]);
+    s.bindings[i]
+        .worker_id
+        .copy_from_slice(&p[at..at + sc::WORKER_ID_BYTES]);
     reply_status(s, sc::MSG_SC_RELOCATED, &session_id, epoch, sc::STATUS_OK);
 }
 

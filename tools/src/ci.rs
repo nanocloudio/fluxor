@@ -52,6 +52,7 @@ pub struct SkipSet {
     pub lint: bool,
     pub hygiene: bool,
     pub templates: bool,
+    pub kernel: bool,
 }
 
 impl SkipSet {
@@ -66,6 +67,7 @@ impl SkipSet {
                     "lint" => s.lint = true,
                     "hygiene" => s.hygiene = true,
                     "templates" => s.templates = true,
+                    "kernel" => s.kernel = true,
                     other => return Err(format!("unknown --skip phase: {other}")),
                 }
             }
@@ -79,7 +81,14 @@ impl SkipSet {
 /// phase passed).
 pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<PhaseResult>> {
     let in_ci = std::env::var_os("CI").is_some();
-    if in_ci && (skip.cargo || skip.modules || skip.lint || skip.hygiene || skip.templates) {
+    if in_ci
+        && (skip.cargo
+            || skip.modules
+            || skip.lint
+            || skip.hygiene
+            || skip.templates
+            || skip.kernel)
+    {
         return Err(Error::Config(
             "`--skip` is rejected when $CI is set; CI must run the full pipeline".to_string(),
         ));
@@ -179,7 +188,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── Phase 1.46: presentation placement ───────────────────────
     //
-    // Enforce rfc_adaptive_presentation.md §9: run the placement resolver
+    // Run the placement resolver
     // over every config's `presentation.shell` against the surface it
     // targets, and fail on any `essential` control that can't be surfaced
     // there (no plane + no `bind_physical`). Stops a control going silently
@@ -192,8 +201,8 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── Phase 1.47: tracked examples build-check ─────────────────
     //
-    // `examples/` is the front door, and a graph naming a module the repo no
-    // longer contains still *reads* fine — it only fails when someone runs it.
+    // `examples/` is the front door, and a graph naming a module the repo does
+    // not contain still *reads* fine — it only fails when someone runs it.
     // Every module extraction and every domain/tier rule change can strand one
     // silently. Build-check each tracked example so that lands here, on the
     // day, rather than in a downstream clone.
@@ -208,11 +217,10 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── Phase 1.48: Makefile standard ────────────────────────────
     //
-    // `standards/make.md` was written, every repo was swept to it, and the
-    // repos drifted again — because nothing checked. A CLI verb that moves
-    // strands the help text and scripts naming it in nineteen checkouts, and
-    // each is found by hand, one annoyed session at a time. This phase reads
-    // the live CLI, so the standard is enforced where it is violated.
+    // Holds this project's Makefile to `standards/make.md`. A CLI verb that
+    // moves strands the help text and the scripts naming it across every
+    // checkout, and each one is then found by hand. This phase reads the live
+    // CLI, so the standard is enforced where it is violated.
     results.push(if skip.lint {
         skipped("makefile")
     } else {
@@ -221,11 +229,11 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // ───── Phase 1.49: fluxor.toml schema ───────────────────────────
     //
-    // The config every other phase reads was itself unchecked, so a
-    // key naming a directory that does not exist, or a table at a
-    // placement nothing reads, cost nothing and stayed. Runs
-    // unconditionally: it is a file read, and a project whose config is
-    // wrong cannot trust the phases configured by it.
+    // The config every other phase reads is itself checked: a key
+    // naming a directory that does not exist, or a table at a placement
+    // nothing reads, is an error here. Runs unconditionally: it is a
+    // file read, and a project whose config is wrong cannot trust the
+    // phases configured by it.
     if project_root.join("fluxor.toml").is_file() {
         results.push(run_step("fluxor-toml-schema", verbose, || {
             crate::ci_schema::check(project_root)
@@ -489,6 +497,28 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         })
     });
 
+    // ───── Phase 3.2: kernel link + static-RAM budget ───────────────
+    //
+    // Clippy type-checks the rp kernels but stops before the linker, and
+    // a static-RAM overflow is invisible to a type-check. So this links
+    // the real image rather than checking the crate: a target whose only
+    // coverage is a type-check is a target whose image nothing builds.
+    //
+    // It also holds each image under the static-RAM ceiling its silicon
+    // declares (`[kernel] ram_static_max_kb`). The linker already refuses
+    // an image that cannot fit at all; the budget binds earlier, so a few
+    // KiB of creep per month fails here with a number attached instead of
+    // arriving one day as a link error at the cliff.
+    results.push(
+        if skip.kernel || !is_fluxor_kernel_workspace(project_root) {
+            skipped("kernel-link (rp)")
+        } else {
+            run_step("kernel-link (rp)", verbose, || {
+                run_kernel_link_budget(project_root, verbose)
+            })
+        },
+    );
+
     // ───── Phase 3.5: project test scripts (E2E gate) ───────────────
     //
     // A fmod-only project has no cargo tests — its behaviour is proven by
@@ -652,7 +682,18 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: Some("host-linux"),
             package_gate: None,
         },
-        // RP2350 firmware (chip-rp2350b is the superset chip feature).
+        // RP firmware, once per silicon per runtime.
+        //
+        // A chip feature alone names silicon, not a firmware: it selects
+        // register bases and nothing that boots. The binary needs a runtime
+        // for its reset vector and panic handler, and there are two: the
+        // Both RP chips, so a construct that is fine on ARMv8-M and not on
+        // ARMv6-M is caught here rather than on a board.
+        //
+        // Neither job sets `FLUXOR_BOARD`, so both are silicon-level: board
+        // facts (console pins, crystal) are absent and the code that reads
+        // them must be gated accordingly. That is the point of the pass, not
+        // an omission.
         ClippyJob {
             label: "kernel rp2350",
             cwd: "",
@@ -671,7 +712,6 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: Some("chip-rp2350b"),
             package_gate: None,
         },
-        // RP2040 firmware.
         ClippyJob {
             label: "kernel rp2040",
             cwd: "",
@@ -754,9 +794,9 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
         // The harness sub-workspace `#[path]`-mounts every foundation
         // module core under the host-test feature, exercising the same
         // code that ships as `.fmod` blobs on hardware. One clippy pass
-        // there covers all mounted cores' host-test cfg branches —
-        // strictly wider than the per-crate jobs it replaced (module
-        // directories carry no crates; standards/fluxor-modules.md §0).
+        // there covers all mounted cores' host-test cfg branches, which
+        // no per-crate job could: module directories carry no crates
+        // (standards/fluxor-modules.md §0).
         // Skipped naturally when `tests/harness/` doesn't exist.
         ClippyJob {
             label: "harness (module cores, host-test)",
@@ -808,7 +848,7 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
         // Each clippy invocation in this matrix touches src/lib.rs to
         // invalidate the incremental cache — otherwise sibling-target
         // runs see "no source changed since last lint" and skip,
-        // hiding any cross-feature regressions.
+        // hiding any cross-feature breakage.
         let _ = std::fs::OpenOptions::new()
             .append(true)
             .open(project_root.join("src/lib.rs"))
@@ -1094,8 +1134,8 @@ fn run_examples(project_root: &Path) -> std::result::Result<(), String> {
     // Versioned examples, from BOTH repos: a project may keep its
     // examples in the primary repo, shadow-track them
     // (standards/test-tracking.md), or be mid-move between the two.
-    // Enumerating one repo silently gates a subset — this phase checked
-    // 7 of 40 graphs while every one of them was on disk.
+    // Enumerating one repo silently gates a subset: the graphs tracked in
+    // the other repo are on disk and never checked.
     let mut listing: BTreeSet<String> = BTreeSet::new();
     for git_dir in [None, Some(project_root.join(".git-shadow"))] {
         let mut cmd = Command::new("git");
@@ -1603,10 +1643,10 @@ fn check_abi_pin(project_root: &Path) -> std::result::Result<(), String> {
 /// Lockfile-consistency phase over the uniform `[[artifact]]` lockfile.
 ///
 /// Cheap by design: the lockfile must be present (when `[dependencies]`
-/// exist), parseable, non-legacy-shape, and carry at least one pin for
+/// exist), parse in the uniform shape, and carry at least one pin for
 /// every declared dependency. There is no live-mode skip — sync
 /// write-through-resolves workspace members through the same lockfile,
-/// so the file is authoritative for everyone (Decision 1). Digest/epoch
+/// so the file is authoritative for everyone. Digest/epoch
 /// verification against the store happens at sync/materialise time,
 /// not here.
 fn check_lockfile_consistency(project_root: &Path) -> std::result::Result<(), String> {
@@ -1680,7 +1720,7 @@ fn check_version_skew(project_root: &Path) -> std::result::Result<(), String> {
     let Some(required_rev) = pin.rev else {
         return Ok(());
     };
-    // Legacy rev pin. Read current HEAD of the *fluxor source
+    // A `rev` pin. Read current HEAD of the *fluxor source
     // checkout*. On a downstream project that's `deps/fluxor/`; on
     // fluxor itself there is no deps/fluxor, so fall back to the
     // project root's git SHA. Crucially: never fall back to
@@ -1903,6 +1943,127 @@ pub(crate) fn run_test_scripts(
     }
 }
 
+/// Build (and therefore link) each RP board's kernel image, then hold its
+/// static RAM against the ceiling its silicon declares.
+///
+/// The build goes through `tools/firmware.sh` on purpose: per-board feature
+/// and triple resolution lives there, and a gate that reimplemented it would
+/// be gating a build nobody ships. Boards come from the target registry, so
+/// a new RP board is covered by adding its TOML and nothing here.
+fn run_kernel_link_budget(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
+    // Every RP board, not one per silicon. A board may carry its own
+    // `[build] cargo_features`, and a different feature set is a different
+    // image with different statics — so linking one board per die would
+    // leave the others unbuilt while looking like coverage. The ceiling is
+    // declared per silicon; boards sharing a die are each held to it.
+    let mut boards: Vec<crate::target::TargetDescriptor> =
+        crate::target::list_targets(project_root)
+            .into_iter()
+            .filter_map(|name| crate::target::load_target(&name, project_root).ok())
+            .filter(|t| t.kind == crate::target::TargetKind::Board && t.id.starts_with("rp"))
+            .collect();
+    boards.sort_by(|a, b| a.board_id.cmp(&b.board_id));
+    if boards.is_empty() {
+        return Err("no RP boards in the target registry".into());
+    }
+
+    let mut failures = Vec::new();
+    for target in &boards {
+        let board = target.board_id.as_deref().unwrap_or(&target.id);
+        let silicon = &target.id;
+        let out = Command::new("tools/firmware.sh")
+            .arg(board)
+            .current_dir(project_root)
+            .output()
+            .map_err(|e| format!("firmware.sh {board}: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let tail: Vec<&str> = err.lines().rev().take(12).collect();
+            failures.push(format!(
+                "{board} ({silicon}): kernel image build failed (link, or the \
+                 objcopy that follows it)\n    {}",
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n    ")
+            ));
+            continue;
+        }
+
+        let Some(max_kb) = target.ram_static_max_kb else {
+            failures.push(format!(
+                "{silicon}: no [kernel] ram_static_max_kb — every linked silicon \
+                 declares its static-RAM ceiling"
+            ));
+            continue;
+        };
+        let Some(_build) = target.build.as_ref() else {
+            failures.push(format!("{silicon}: no [build] section, so nothing links"));
+            continue;
+        };
+        // The board-scoped copy `firmware.sh` writes, never cargo's per-triple
+        // path: two boards over one triple overwrite each other there, so that
+        // ELF belongs to whichever built last. Benign for the RP boards today
+        // (pico2w and waveshare-lcd4 compile identical features), and a
+        // wrong-board measurement the moment they diverge — which is exactly
+        // what pi5 and qemu-virt already do on aarch64-unknown-none.
+        let elf = project_root.join(format!("target/{board}/firmware.elf"));
+
+        let used = static_ram_bytes(&elf)?;
+        let budget = u64::from(max_kb) * 1024;
+        if verbose {
+            let slack = budget as i64 - used as i64;
+            println!("  {board} ({silicon}): {used} of {budget} bytes static RAM, {slack:+} slack");
+        }
+        if used > budget {
+            failures.push(format!(
+                "{board} ({silicon}): static RAM {used} B exceeds the declared \
+                 ceiling {budget} B ({max_kb} KiB) by {} B. Either the growth is \
+                 wanted — raise ram_static_max_kb and say why — or it is the \
+                 creep this gate is here to catch.",
+                used - budget
+            ));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n  "))
+    }
+}
+
+/// Static RAM an image occupies: `.data` (copied to RAM at boot) plus
+/// `.bss` and `.uninit` (reserved in RAM, absent from flash). Read via
+/// `size -A`, the same figure the linker checks its region against.
+fn static_ram_bytes(elf: &Path) -> std::result::Result<u64, String> {
+    let out = Command::new("arm-none-eabi-size")
+        .arg("-A")
+        .arg(elf)
+        .output()
+        .map_err(|e| format!("arm-none-eabi-size: {e} (needed to check the RAM budget)"))?;
+    if !out.status.success() {
+        return Err(format!("arm-none-eabi-size failed on {}", elf.display()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut total = 0u64;
+    let mut seen = false;
+    for line in text.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(name), Some(size)) = (f.next(), f.next()) else {
+            continue;
+        };
+        if matches!(name, ".data" | ".bss" | ".uninit") {
+            total += size.parse::<u64>().map_err(|e| format!("{name}: {e}"))?;
+            seen = true;
+        }
+    }
+    if !seen {
+        return Err(format!(
+            "{}: no .data/.bss/.uninit sections — wrong ELF?",
+            elf.display()
+        ));
+    }
+    Ok(total)
+}
+
 fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
     let opts = modules_build::BuildOpts {
         project_root: project_root.to_path_buf(),
@@ -1939,8 +2100,8 @@ fn run_modules_build_strict(project_root: &Path, verbose: bool) -> std::result::
 /// Deliberately *not* the tier walk: the point of the count is to
 /// notice modules the tier walk cannot see. A repo with 36 modules in a
 /// layout the builder does not discover reported `built 0 of 0` in 0 ms
-/// and passed — that is the shape of an unmigrated repo, and it must
-/// read as a failure, not as "no modules".
+/// and passed — that is the shape of a repo whose modules sit outside
+/// the tiers, and it must read as a failure, not as "no modules".
 fn module_manifest_count(project_root: &Path) -> usize {
     let root = project_root.join("modules");
     if !root.is_dir() {
@@ -2233,6 +2394,20 @@ mod tests {
     fn skipset_rejects_unknown_phase() {
         let err = SkipSet::from_strs(&["bogus".into()]).unwrap_err();
         assert!(err.contains("bogus"));
+    }
+
+    /// The link gate has its own skip key rather than riding the test
+    /// key: `--skip cargo` means "not the tests", and it must not quietly
+    /// take the only phase that builds a kernel image with it.
+    #[test]
+    fn skipping_tests_does_not_skip_the_kernel_link_gate() {
+        let s = SkipSet::from_strs(&["cargo".into()]).unwrap();
+        assert!(s.cargo);
+        assert!(!s.kernel, "--skip cargo must leave kernel-link running");
+
+        let s = SkipSet::from_strs(&["kernel".into()]).unwrap();
+        assert!(s.kernel);
+        assert!(!s.cargo);
     }
 
     #[test]

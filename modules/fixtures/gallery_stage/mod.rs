@@ -231,8 +231,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // staging attempt — if it survives, bank streams it
                     // first and the codec dies on it.
                     path[..STALE_PATH.len()].copy_from_slice(STALE_PATH);
-                    let stale_rc =
-                        call(sys, -1, fs::UNLINK, path.as_mut_ptr(), STALE_PATH.len());
+                    let stale_rc = call(sys, -1, fs::UNLINK, path.as_mut_ptr(), STALE_PATH.len());
                     if stale_rc == E_AGAIN {
                         return 0; // fat32 still mounting — retry whole phase
                     }

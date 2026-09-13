@@ -1,7 +1,7 @@
-//! Content-plane control renderer — the in-raster widget backend
-//! (`.context/rfc_adaptive_presentation.md` §11.3). When a control resolves to
-//! the `content` plane (a bare-metal panel that owns its framebuffer, no host
-//! chrome), it is drawn *into the app's raster* rather than as DOM chrome. This
+//! Content-plane control renderer — the in-raster widget backend. When a
+//! control resolves to the `content` plane (a bare-metal panel that owns its
+//! framebuffer, no host chrome), it is drawn *into the app's raster* rather
+//! than as DOM chrome. This
 //! is the reusable renderer for that: it lays controls out in a grid, draws each
 //! as a labelled/iconned button into an RGB565 buffer, and returns hit regions
 //! so touch input maps back to a control.
@@ -312,7 +312,7 @@ pub fn hit_test(rects: &[Rect], x: u16, y: u16) -> Option<usize> {
     })
 }
 
-/// One legend entry: a physical button and the action it drives (RFC §14). On a
+/// One legend entry: a physical button and the action it drives. On a
 /// surface with physical buttons + a display, the `bound` controls' legend is
 /// drawn so the user knows what each button does.
 #[derive(Clone, Copy, Debug)]

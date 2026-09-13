@@ -82,7 +82,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -360,18 +359,25 @@ unsafe fn mon_emit(s: &mut AnchorState, event: u8, reason: &[u8], status: &[u8])
     let sys_ptr = s.syscalls;
     if s.self_idx == 0xFF {
         let idx = dev_self_index(&*sys_ptr);
-        if idx >= 0 { s.self_idx = idx as u8; }
+        if idx >= 0 {
+            s.self_idx = idx as u8;
+        }
     }
     let mon_ptr = s.mon_buf.as_mut_ptr();
     let session_ptr = s.session_id.as_ptr();
     let anchor_ptr = ANCHOR_ID.as_ptr();
     let _ = dev_mon_session(
         &*sys_ptr,
-        s.self_idx, event,
-        session_ptr, s.session_epoch,
-        anchor_ptr, core::ptr::null(), // worker_id unknown to anchor
-        reason, status,
-        mon_ptr, MON_BUF_SIZE,
+        s.self_idx,
+        event,
+        session_ptr,
+        s.session_epoch,
+        anchor_ptr,
+        core::ptr::null(), // worker_id unknown to anchor
+        reason,
+        status,
+        mon_ptr,
+        MON_BUF_SIZE,
     );
 }
 
@@ -380,9 +386,9 @@ unsafe fn mon_emit(s: &mut AnchorState, event: u8, reason: &[u8], status: &[u8])
 // ============================================================================
 
 mod params_def {
-    use super::AnchorState;
     use super::p_u16;
     use super::p_u32;
+    use super::AnchorState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -403,20 +409,31 @@ mod params_def {
 unsafe fn net_send_bind(s: &mut AnchorState) -> bool {
     let sys_ptr = s.syscalls;
     let out_chan = s.net_out;
-    if out_chan < 0 { return false; }
+    if out_chan < 0 {
+        return false;
+    }
     let port = s.listen_port.to_le_bytes();
     let payload = [port[0], port[1]];
     let scratch = s.net_buf.as_mut_ptr();
     let wrote = net_write_frame(
-        &*sys_ptr, out_chan, NET_CMD_BIND,
-        payload.as_ptr(), 2,
-        scratch, NET_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        NET_CMD_BIND,
+        payload.as_ptr(),
+        2,
+        scratch,
+        NET_BUF_SIZE,
     );
     wrote > 0
 }
 
 /// Emit CMD_SEND. Payload: `[conn_id:2 LE][data:n]`.
-unsafe fn net_send_data(s: &mut AnchorState, conn_id: u16, data: *const u8, data_len: usize) -> bool {
+unsafe fn net_send_data(
+    s: &mut AnchorState,
+    conn_id: u16,
+    data: *const u8,
+    data_len: usize,
+) -> bool {
     let sys_ptr = s.syscalls;
     let out_chan = s.net_out;
     if out_chan < 0 || data_len + 2 + NET_FRAME_HDR > NET_BUF_SIZE {
@@ -439,13 +456,19 @@ unsafe fn net_send_data(s: &mut AnchorState, conn_id: u16, data: *const u8, data
 unsafe fn net_send_close(s: &mut AnchorState, conn_id: u16) {
     let sys_ptr = s.syscalls;
     let out_chan = s.net_out;
-    if out_chan < 0 { return; }
+    if out_chan < 0 {
+        return;
+    }
     let payload = conn_id.to_le_bytes();
     let scratch = s.net_buf.as_mut_ptr();
     net_write_frame(
-        &*sys_ptr, out_chan, NET_CMD_CLOSE,
-        payload.as_ptr(), 2,
-        scratch, NET_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        NET_CMD_CLOSE,
+        payload.as_ptr(),
+        2,
+        scratch,
+        NET_BUF_SIZE,
     );
 }
 
@@ -472,23 +495,26 @@ unsafe fn mint_session_id(s: &mut AnchorState) {
 unsafe fn sc_send_attach(s: &mut AnchorState, w: usize) -> bool {
     let sys_ptr = s.syscalls;
     let out_chan = s.ctrl_out[w];
-    if out_chan < 0 { return false; }
-    let mut payload = [0u8;
-        SESSION_ID_BYTES + ANCHOR_ID_BYTES + EPOCH_BYTES + 1 + WORKER_ID_BYTES];
+    if out_chan < 0 {
+        return false;
+    }
+    let mut payload = [0u8; SESSION_ID_BYTES + ANCHOR_ID_BYTES + EPOCH_BYTES + 1 + WORKER_ID_BYTES];
     payload[..SESSION_ID_BYTES].copy_from_slice(&s.session_id);
-    payload[SESSION_ID_BYTES..SESSION_ID_BYTES + ANCHOR_ID_BYTES]
-        .copy_from_slice(&ANCHOR_ID);
+    payload[SESSION_ID_BYTES..SESSION_ID_BYTES + ANCHOR_ID_BYTES].copy_from_slice(&ANCHOR_ID);
     let epoch_le = s.session_epoch.to_le_bytes();
-    payload[SESSION_ID_BYTES + ANCHOR_ID_BYTES
-        ..SESSION_ID_BYTES + ANCHOR_ID_BYTES + EPOCH_BYTES]
+    payload[SESSION_ID_BYTES + ANCHOR_ID_BYTES..SESSION_ID_BYTES + ANCHOR_ID_BYTES + EPOCH_BYTES]
         .copy_from_slice(&epoch_le);
     payload[SESSION_ID_BYTES + ANCHOR_ID_BYTES + EPOCH_BYTES] = SC_CC_EDGE_ANCHORED;
     // worker_hint left all-zero — "let the worker accept"
     let scratch = s.ctrl_buf.as_mut_ptr();
     let wrote = net_write_frame(
-        &*sys_ptr, out_chan, SC_CMD_ATTACH,
-        payload.as_ptr(), payload.len(),
-        scratch, CTRL_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        SC_CMD_ATTACH,
+        payload.as_ptr(),
+        payload.len(),
+        scratch,
+        CTRL_BUF_SIZE,
     );
     wrote > 0
 }
@@ -498,7 +524,9 @@ unsafe fn sc_send_attach(s: &mut AnchorState, w: usize) -> bool {
 unsafe fn sc_send_detach(s: &mut AnchorState, w: usize, reason: u8) -> bool {
     let sys_ptr = s.syscalls;
     let out_chan = s.ctrl_out[w];
-    if out_chan < 0 { return false; }
+    if out_chan < 0 {
+        return false;
+    }
     let mut payload = [0u8; SESSION_ID_BYTES + EPOCH_BYTES + 1];
     payload[..SESSION_ID_BYTES].copy_from_slice(&s.session_id);
     let epoch_le = s.session_epoch.to_le_bytes();
@@ -506,9 +534,13 @@ unsafe fn sc_send_detach(s: &mut AnchorState, w: usize, reason: u8) -> bool {
     payload[SESSION_ID_BYTES + EPOCH_BYTES] = reason;
     let scratch = s.ctrl_buf.as_mut_ptr();
     let wrote = net_write_frame(
-        &*sys_ptr, out_chan, SC_CMD_DETACH,
-        payload.as_ptr(), payload.len(),
-        scratch, CTRL_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        SC_CMD_DETACH,
+        payload.as_ptr(),
+        payload.len(),
+        scratch,
+        CTRL_BUF_SIZE,
     );
     wrote > 0
 }
@@ -518,18 +550,23 @@ unsafe fn sc_send_detach(s: &mut AnchorState, w: usize, reason: u8) -> bool {
 unsafe fn sc_send_drain(s: &mut AnchorState, w: usize) -> bool {
     let sys_ptr = s.syscalls;
     let out_chan = s.ctrl_out[w];
-    if out_chan < 0 { return false; }
+    if out_chan < 0 {
+        return false;
+    }
     let mut payload = [0u8; SESSION_ID_BYTES + EPOCH_BYTES + 4];
     payload[..SESSION_ID_BYTES].copy_from_slice(&s.session_id);
     payload[SESSION_ID_BYTES..SESSION_ID_BYTES + EPOCH_BYTES]
         .copy_from_slice(&s.session_epoch.to_le_bytes());
-    payload[SESSION_ID_BYTES + EPOCH_BYTES..]
-        .copy_from_slice(&DRAIN_DEADLINE_MS.to_le_bytes());
+    payload[SESSION_ID_BYTES + EPOCH_BYTES..].copy_from_slice(&DRAIN_DEADLINE_MS.to_le_bytes());
     let scratch = s.ctrl_buf.as_mut_ptr();
     let wrote = net_write_frame(
-        &*sys_ptr, out_chan, SC_CMD_DRAIN,
-        payload.as_ptr(), payload.len(),
-        scratch, CTRL_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        SC_CMD_DRAIN,
+        payload.as_ptr(),
+        payload.len(),
+        scratch,
+        CTRL_BUF_SIZE,
     );
     wrote > 0
 }
@@ -539,15 +576,21 @@ unsafe fn sc_send_drain(s: &mut AnchorState, w: usize) -> bool {
 unsafe fn sc_send_resume(s: &mut AnchorState, w: usize, new_epoch: u32) -> bool {
     let sys_ptr = s.syscalls;
     let out_chan = s.ctrl_out[w];
-    if out_chan < 0 { return false; }
+    if out_chan < 0 {
+        return false;
+    }
     let mut payload = [0u8; SESSION_ID_BYTES + EPOCH_BYTES];
     payload[..SESSION_ID_BYTES].copy_from_slice(&s.session_id);
     payload[SESSION_ID_BYTES..].copy_from_slice(&new_epoch.to_le_bytes());
     let scratch = s.ctrl_buf.as_mut_ptr();
     let wrote = net_write_frame(
-        &*sys_ptr, out_chan, SC_CMD_RESUME,
-        payload.as_ptr(), payload.len(),
-        scratch, CTRL_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        SC_CMD_RESUME,
+        payload.as_ptr(),
+        payload.len(),
+        scratch,
+        CTRL_BUF_SIZE,
     );
     wrote > 0
 }
@@ -564,9 +607,13 @@ unsafe fn sc_relay_frame(s: &mut AnchorState, w: usize, msg_type: u8, payload_le
     let src = s.ctrl_buf.as_ptr().add(NET_FRAME_HDR);
     let scratch = s.relay_buf.as_mut_ptr();
     net_write_frame(
-        &*sys_ptr, out_chan, msg_type,
-        src, payload_len,
-        scratch, RELAY_BUF_SIZE,
+        &*sys_ptr,
+        out_chan,
+        msg_type,
+        src,
+        payload_len,
+        scratch,
+        RELAY_BUF_SIZE,
     );
 }
 
@@ -576,7 +623,9 @@ unsafe fn sc_relay_frame(s: &mut AnchorState, w: usize, msg_type: u8, payload_le
 
 /// Drain one net_proto frame. Updates phase and session state.
 unsafe fn poll_net_in(s: &mut AnchorState) {
-    if s.net_in < 0 { return; }
+    if s.net_in < 0 {
+        return;
+    }
     let sys_ptr = s.syscalls;
     let chan = s.net_in;
     let poll = ((*sys_ptr).channel_poll)(chan, POLL_IN);
@@ -634,7 +683,12 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
                     // Already serving a client — reject the new one by
                     // immediately closing it.
                     net_send_close(s, new_id);
-                    dev_log(&*sys_ptr, 2, b"[echo_anc] busy: closed new client".as_ptr(), 33);
+                    dev_log(
+                        &*sys_ptr,
+                        2,
+                        b"[echo_anc] busy: closed new client".as_ptr(),
+                        33,
+                    );
                 }
             }
         }
@@ -643,8 +697,8 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
             // worker's data_out — or, while the session is still
             // attaching or a handoff is rebinding, into the bounded
             // hold buffer (§11.2), flushed when the worker is live.
-            let attach_window = s.phase == AnchorPhase::Attaching
-                || s.phase == AnchorPhase::WaitAttached;
+            let attach_window =
+                s.phase == AnchorPhase::Attaching || s.phase == AnchorPhase::WaitAttached;
             if payload_len >= 3 && (s.phase == AnchorPhase::Active || attach_window) {
                 let id = conn_id_at(buf.add(NET_FRAME_HDR));
                 if id == s.client_conn_id {
@@ -660,8 +714,7 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
                                 s.forwarded = s.forwarded.wrapping_add(wrote as u64);
                             }
                         }
-                        s.bytes_since_handoff =
-                            s.bytes_since_handoff.wrapping_add(data_len as u32);
+                        s.bytes_since_handoff = s.bytes_since_handoff.wrapping_add(data_len as u32);
                     } else {
                         // Attach or rebinding window: hold, flush once
                         // the (new) worker is live.
@@ -676,8 +729,12 @@ unsafe fn poll_net_in(s: &mut AnchorState) {
                             s.hold_len += take as u16;
                         }
                         if take < data_len {
-                            dev_log(&*sys_ptr, 2,
-                                b"[echo_anc] hold overflow: dropped".as_ptr(), 33);
+                            dev_log(
+                                &*sys_ptr,
+                                2,
+                                b"[echo_anc] hold overflow: dropped".as_ptr(),
+                                33,
+                            );
                         }
                     }
                 }
@@ -773,7 +830,9 @@ unsafe fn handoff_refuse(s: &mut AnchorState, status: &[u8]) {
 /// Drain one SessionCtrlV1 frame from worker slot `w`.
 unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
     let chan = s.ctrl_in[w];
-    if chan < 0 { return; }
+    if chan < 0 {
+        return;
+    }
     let sys_ptr = s.syscalls;
     let poll = ((*sys_ptr).channel_poll)(chan, POLL_IN);
     if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
@@ -798,7 +857,10 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                 let mut i = 0;
                 let mut match_ok = true;
                 while i < SESSION_ID_BYTES {
-                    if *p.add(i) != s.session_id[i] { match_ok = false; break; }
+                    if *p.add(i) != s.session_id[i] {
+                        match_ok = false;
+                        break;
+                    }
                     i += 1;
                 }
                 let status = *p.add(SESSION_ID_BYTES + EPOCH_BYTES);
@@ -831,8 +893,7 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
             // different prefixes of the session and the handoff is not
             // safe to make.
             if is_active
-                && (s.handoff == HandoffPhase::DrainWait
-                    || s.handoff == HandoffPhase::ImportWait)
+                && (s.handoff == HandoffPhase::DrainWait || s.handoff == HandoffPhase::ImportWait)
             {
                 if msg_type == SC_CMD_EXPORT_BEGIN {
                     let off = SESSION_ID_BYTES + EPOCH_BYTES + 4;
@@ -849,8 +910,12 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                         None => HANDOFF_CURSOR_MISMATCH,
                     };
                     if admit != HANDOFF_OK {
-                        dev_log(&*sys_ptr, 1,
-                            b"[echo_anc] export cursors disagree".as_ptr(), 34);
+                        dev_log(
+                            &*sys_ptr,
+                            1,
+                            b"[echo_anc] export cursors disagree".as_ptr(),
+                            34,
+                        );
                         handoff_refuse(s, b"cursor_mismatch");
                         return;
                     }
@@ -861,7 +926,10 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
         }
         SC_MSG_IMPORT_BEGIN => {
             // [sid:16][epoch:4][status:1] from the standby worker.
-            if !is_active && s.handoff == HandoffPhase::ImportWait && payload_len > SESSION_ID_BYTES + EPOCH_BYTES {
+            if !is_active
+                && s.handoff == HandoffPhase::ImportWait
+                && payload_len > SESSION_ID_BYTES + EPOCH_BYTES
+            {
                 let status = *buf.add(NET_FRAME_HDR + SESSION_ID_BYTES + EPOCH_BYTES);
                 if status != SC_STATUS_OK {
                     handoff_refuse(s, b"no_capacity");
@@ -870,7 +938,10 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
         }
         SC_MSG_IMPORT_END => {
             // Standby committed (or rejected) the imported state.
-            if !is_active && s.handoff == HandoffPhase::ImportWait && payload_len > SESSION_ID_BYTES + EPOCH_BYTES {
+            if !is_active
+                && s.handoff == HandoffPhase::ImportWait
+                && payload_len > SESSION_ID_BYTES + EPOCH_BYTES
+            {
                 let status = *buf.add(NET_FRAME_HDR + SESSION_ID_BYTES + EPOCH_BYTES);
                 if status == SC_STATUS_OK {
                     let new_epoch = s.session_epoch + 1;
@@ -894,7 +965,12 @@ unsafe fn poll_ctrl_in(s: &mut AnchorState, w: usize) {
                 s.handoff = HandoffPhase::Idle;
                 s.bytes_since_handoff = 0;
                 flush_hold(s);
-                dev_log(&*sys_ptr, 3, b"[echo_anc] handoff refused, session kept".as_ptr(), 39);
+                dev_log(
+                    &*sys_ptr,
+                    3,
+                    b"[echo_anc] handoff refused, session kept".as_ptr(),
+                    39,
+                );
                 return;
             }
             // Swap recorded: bump the epoch, flip the forwarding
@@ -1108,9 +1184,15 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() { return -5; }
-        if state_size < core::mem::size_of::<AnchorState>() { return -6; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() {
+            return -5;
+        }
+        if state_size < core::mem::size_of::<AnchorState>() {
+            return -6;
+        }
 
         let s = &mut *(state as *mut AnchorState);
         s.init(syscalls as *const SyscallTable);
@@ -1132,8 +1214,8 @@ pub extern "C" fn module_new(
         s.data_out[1] = dev_channel_port(&*sys_ptr, 1, 4);
 
         // Parse TLV params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
         } else {
@@ -1149,9 +1231,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut AnchorState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
 
         match s.phase {
             AnchorPhase::Init => {

@@ -19,6 +19,22 @@ data_pin = 28
 clk_pin = 26
 extra_pin = 27
 
+# Crystal frequency -- a BOARD fact, not silicon: the die takes whatever
+# crystal the board fits. Every RP board in this tree fits 12 MHz, which is
+# what the Pico family schematic specifies. clk_ref runs from XOSC undivided
+# after clock init, so this is also clk_ref.
+# Fallback console pins -- a BOARD fact: which header pins carry UART0 is
+# wiring, not silicon. GP0/GP1 on the Pico family, which is where a USB-serial
+# adapter goes. This is the log path that survives a USB stack that will not
+# enumerate, so it exists to make that failure diagnosable.
+[hardware.console_uart]
+tx_pin = 0
+rx_pin = 1
+baud = 115200
+
+[hardware.xosc]
+hz = 12000000
+
 [gpio]
 # QFN-60 package: GPIO 0-29 only (silicon pin tables are QFN-80).
 max_pin = 29
@@ -34,11 +50,18 @@ reserved_pins = [23, 24, 25, 29]
 phy = "wifi"
 nic = "cyw43"
 
-# Public hardware-rig contract (see .context/rfc_hardware_rig.md §7).
+# Public hardware-rig contract. Board-level facts only — which board is
+# attached and how it is reached is a private rig profile.
+#
+# All three deploy routes are physically available, but only picotool
+# needs nobody at the bench: it takes a running board into BOOTSEL over
+# the reset interface, writes the image and reboots it. Mounting the UF2
+# drive means holding the button, and SWD means a second board wired as a
+# probe, so an unattended run prefers picotool.
 [rig]
 artifact = "uf2"
 deploy = ["deploy.uf2_mount", "deploy.picotool", "deploy.swd"]
-preferred_deploy = "deploy.uf2_mount"
+preferred_deploy = "deploy.picotool"
 console = ["console.usb_cdc", "console.serial"]
 preferred_console = "console.usb_cdc"
 observe = ["observe.console_regex", "observe.usb_enumeration"]

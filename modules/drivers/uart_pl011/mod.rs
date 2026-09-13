@@ -12,7 +12,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -72,14 +71,17 @@ struct UartState {
     _pad: [u8; 3],
 }
 
-use abi::platform::rp::uart_raw::{REG_WRITE as UART_REG_WRITE, REG_READ as UART_REG_READ};
+use abi::platform::rp::uart_raw::{REG_READ as UART_REG_READ, REG_WRITE as UART_REG_WRITE};
 
 unsafe fn uart_reg_write(sys: &SyscallTable, bus: u8, offset: u8, val: u32) {
     let mut buf = [0u8; 5];
     let bp = buf.as_mut_ptr();
     *bp = offset;
     let v = val.to_le_bytes();
-    *bp.add(1) = v[0]; *bp.add(2) = v[1]; *bp.add(3) = v[2]; *bp.add(4) = v[3];
+    *bp.add(1) = v[0];
+    *bp.add(2) = v[1];
+    *bp.add(3) = v[2];
+    *bp.add(4) = v[3];
     (sys.provider_call)(bus as i32, UART_REG_WRITE, bp, 5);
 }
 
@@ -99,14 +101,20 @@ unsafe fn configure_uart(sys: &SyscallTable, bus: u8, baud: u32) {
     // Use shift-based division to avoid panic_const_div_by_zero in PIC
     let fsys = 150_000_000u32;
     let divisor = baud << 4; // baud * 16
-    // Integer division via repeated subtraction (baud rates are small)
+                             // Integer division via repeated subtraction (baud rates are small)
     let mut ibrd = 0u32;
     let mut rem = fsys;
-    while rem >= divisor { rem -= divisor; ibrd += 1; }
+    while rem >= divisor {
+        rem -= divisor;
+        ibrd += 1;
+    }
     // Fractional: (rem * 64) / divisor
     let mut fbrd = 0u32;
     let mut frac_rem = rem << 6; // rem * 64
-    while frac_rem >= divisor { frac_rem -= divisor; fbrd += 1; }
+    while frac_rem >= divisor {
+        frac_rem -= divisor;
+        fbrd += 1;
+    }
     uart_reg_write(sys, bus, UARTIBRD, ibrd);
     uart_reg_write(sys, bus, UARTFBRD, fbrd);
 
@@ -124,7 +132,9 @@ unsafe fn configure_uart(sys: &SyscallTable, bus: u8, baud: u32) {
 unsafe fn poll_uart_transfer(s: &mut UartState, idx: usize) {
     let sys = &*s.syscalls;
     let tp = s.transfers.as_mut_ptr().add(idx);
-    if (*tp).active == 0 { return; }
+    if (*tp).active == 0 {
+        return;
+    }
 
     let bus = (*s.handles.as_ptr().add(idx)).bus_id;
     let fr = uart_reg_read(sys, bus, UARTFR);
@@ -149,7 +159,9 @@ unsafe fn poll_uart_transfer(s: &mut UartState, idx: usize) {
         if (fr & FR_TXFF) == 0 && pos < len {
             let byte = if (*tp).buf_ptr != 0 {
                 *(((*tp).buf_ptr as usize + pos) as *const u8)
-            } else { 0 };
+            } else {
+                0
+            };
             uart_reg_write(sys, bus, UARTDR, byte as u32);
             (*tp).pos = (pos + 1) as u16;
         }
@@ -170,15 +182,23 @@ const UART_CONFIGURE: u32 = 0x0D05;
 #[link_section = ".text.module_provider_dispatch"]
 #[export_name = "module_provider_dispatch"]
 pub unsafe extern "C" fn uart_dispatch(
-    state: *mut u8, handle: i32, opcode: u32, arg: *mut u8, arg_len: usize,
+    state: *mut u8,
+    handle: i32,
+    opcode: u32,
+    arg: *mut u8,
+    arg_len: usize,
 ) -> i32 {
     let s = &mut *(state as *mut UartState);
 
     match opcode {
         UART_OPEN => {
-            if arg.is_null() || arg_len < 1 { return -22; }
+            if arg.is_null() || arg_len < 1 {
+                return -22;
+            }
             let bus = *arg;
-            if bus as usize >= MAX_BUSES { return -22; }
+            if bus as usize >= MAX_BUSES {
+                return -22;
+            }
             let mut i = 0usize;
             while i < MAX_HANDLES {
                 let idx = (s.next_handle as usize + i) % MAX_HANDLES;
@@ -195,17 +215,25 @@ pub unsafe extern "C" fn uart_dispatch(
         }
         UART_CLOSE => {
             let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if idx >= MAX_HANDLES {
+                return -22;
+            }
             (*s.handles.as_mut_ptr().add(idx)).in_use = 0;
             0
         }
         UART_WRITE | UART_READ => {
             // arg=[buf_ptr:u32, len:u16] (6 bytes)
-            if arg.is_null() || arg_len < 6 { return -22; }
+            if arg.is_null() || arg_len < 6 {
+                return -22;
+            }
             let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if idx >= MAX_HANDLES {
+                return -22;
+            }
             let tp = s.transfers.as_mut_ptr().add(idx);
-            if (*tp).active != 0 { return -16; }
+            if (*tp).active != 0 {
+                return -16;
+            }
             (*tp).buf_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             (*tp).buf_len = u16::from_le_bytes([*arg.add(4), *arg.add(5)]);
             (*tp).pos = 0;
@@ -217,16 +245,24 @@ pub unsafe extern "C" fn uart_dispatch(
         }
         UART_POLL => {
             let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if idx >= MAX_HANDLES {
+                return -22;
+            }
             let tp = s.transfers.as_ptr().add(idx);
-            if (*tp).active != 0 { return 0; }
+            if (*tp).active != 0 {
+                return 0;
+            }
             (*tp).result
         }
         UART_CONFIGURE => {
             // arg=[baud:u32 LE] (4 bytes)
-            if arg.is_null() || arg_len < 4 { return -22; }
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
             let idx = handle as usize;
-            if idx >= MAX_HANDLES { return -22; }
+            if idx >= MAX_HANDLES {
+                return -22;
+            }
             let bus = (*s.handles.as_ptr().add(idx)).bus_id;
             let baud = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let sys = &*s.syscalls;
@@ -239,11 +275,15 @@ pub unsafe extern "C" fn uart_dispatch(
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { core::mem::size_of::<UartState>() }
+pub extern "C" fn module_state_size() -> usize {
+    core::mem::size_of::<UartState>()
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
@@ -252,16 +292,27 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+    in_chan: i32,
+    out_chan: i32,
+    ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<UartState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<UartState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut UartState);
         s.syscalls = syscalls as *const SyscallTable;
-        s.in_chan = in_chan; s.out_chan = out_chan; s.ctrl_chan = ctrl_chan;
+        s.in_chan = in_chan;
+        s.out_chan = out_chan;
+        s.ctrl_chan = ctrl_chan;
 
         let sys = &*s.syscalls;
         dev_log(sys, 3, b"[uart] ready".as_ptr(), 11);
@@ -282,7 +333,9 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     let mut i = 0usize;
     while i < MAX_HANDLES {
         let tp = s.transfers.as_ptr().add(i);
-        if (*tp).active != 0 { poll_uart_transfer(s, i); }
+        if (*tp).active != 0 {
+            poll_uart_transfer(s, i);
+        }
         i += 1;
     }
     0

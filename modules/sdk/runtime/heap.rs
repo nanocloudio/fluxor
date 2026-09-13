@@ -115,4 +115,3 @@ pub unsafe fn heap_stats(sys: &SyscallTable) -> (u32, u32, u16, u16, u32, u16, u
         largest_free,
     )
 }
-

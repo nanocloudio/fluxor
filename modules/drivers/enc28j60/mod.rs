@@ -26,13 +26,14 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
+use abi::contracts::hal::spi::{
+    OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs,
+};
 use abi::SyscallTable;
-use abi::contracts::hal::spi::{OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs};
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
@@ -110,8 +111,8 @@ impl Enc28State {
 // ============================================================================
 
 mod params_def {
-    use super::Enc28State;
     use super::p_u8;
+    use super::Enc28State;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -135,7 +136,7 @@ mod params_def {
 // ============================================================================
 
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_SPI_CONTRACT:  u32 = 0x0002;
+const HAL_SPI_CONTRACT: u32 = 0x0002;
 
 /// Claim a GPIO pin via provider_open(HAL_GPIO, CLAIM).
 unsafe fn dev_gpio_claim(sys: &SyscallTable, pin: u8) -> i32 {
@@ -164,9 +165,12 @@ unsafe fn dev_spi_open(sys: &SyscallTable, bus: u8, cs_handle: i32, freq_hz: u32
         mode,
         _pad: [0; 2],
     };
-    (sys.provider_open)(HAL_SPI_CONTRACT, DEV_SPI_OPEN,
+    (sys.provider_open)(
+        HAL_SPI_CONTRACT,
+        DEV_SPI_OPEN,
         &mut args as *mut _ as *mut u8,
-        core::mem::size_of::<SpiOpenArgs>())
+        core::mem::size_of::<SpiOpenArgs>(),
+    )
 }
 
 /// Start SPI transfer.
@@ -185,8 +189,12 @@ unsafe fn dev_spi_transfer_start(
         fill,
         _pad: [0; 3],
     };
-    (sys.provider_call)(handle, DEV_SPI_TRANSFER_START, &mut args as *mut _ as *mut u8,
-        core::mem::size_of::<SpiTransferStartArgs>())
+    (sys.provider_call)(
+        handle,
+        DEV_SPI_TRANSFER_START,
+        &mut args as *mut _ as *mut u8,
+        core::mem::size_of::<SpiTransferStartArgs>(),
+    )
 }
 
 /// Poll SPI transfer.
@@ -216,14 +224,25 @@ unsafe fn cs_high(s: &Enc28State) {
 /// Write a single byte via SPI (blocking)
 unsafe fn spi_write_byte(s: &Enc28State, byte: u8) -> i32 {
     let tx = [byte];
-    let result = dev_spi_transfer_start(s.sys(), s.spi_handle, tx.as_ptr(), core::ptr::null_mut(), 1, 0xFF);
+    let result = dev_spi_transfer_start(
+        s.sys(),
+        s.spi_handle,
+        tx.as_ptr(),
+        core::ptr::null_mut(),
+        1,
+        0xFF,
+    );
     if result < 0 {
         return result;
     }
     loop {
         let poll = dev_spi_transfer_poll(s.sys(), s.spi_handle);
-        if poll > 0 { return 0; }
-        if poll < 0 { return poll; }
+        if poll > 0 {
+            return 0;
+        }
+        if poll < 0 {
+            return poll;
+        }
     }
 }
 
@@ -235,12 +254,25 @@ unsafe fn spi_read_byte(s: &Enc28State) -> i32 {
         return (result - 0x100) as i32;
     }
     if result == 0 {
-        let r = dev_spi_transfer_start(sys, s.spi_handle, core::ptr::null(), core::ptr::null_mut(), 1, 0xFF);
-        if r < 0 { return r; }
+        let r = dev_spi_transfer_start(
+            sys,
+            s.spi_handle,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+            1,
+            0xFF,
+        );
+        if r < 0 {
+            return r;
+        }
         loop {
             let poll = dev_spi_poll_byte(sys, s.spi_handle);
-            if poll >= 0x100 { return (poll - 0x100) as i32; }
-            if poll < 0 { return poll; }
+            if poll >= 0x100 {
+                return (poll - 0x100) as i32;
+            }
+            if poll < 0 {
+                return poll;
+            }
         }
     }
     result
@@ -310,8 +342,8 @@ pub extern "C" fn module_new(
         s.out_chan = out_chan;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -379,7 +411,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.config_step += 1;
                 if s.config_step >= 10 {
                     s.phase = Phase::Running;
-                    dev_log(sys, 3, b"[enc28j60] ready".as_ptr(), b"[enc28j60] ready".len());
+                    dev_log(
+                        sys,
+                        3,
+                        b"[enc28j60] ready".as_ptr(),
+                        b"[enc28j60] ready".len(),
+                    );
                 }
             }
 

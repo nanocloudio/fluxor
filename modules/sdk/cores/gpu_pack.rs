@@ -281,7 +281,9 @@ impl<'a> Pack<'a> {
         let mut h = Sha256::new();
         h.update(&self.bytes[..PACK_HEADER_LEN]);
         h.update(&self.bytes[self.entry_off..self.entry_off + self.entry_len]);
-        h.update(&self.bytes[self.binding_off..self.binding_off + self.binding_count * PACK_BINDING_LEN]);
+        h.update(
+            &self.bytes[self.binding_off..self.binding_off + self.binding_count * PACK_BINDING_LEN],
+        );
         h.finalize()
     }
 }
@@ -309,7 +311,6 @@ pub struct PackLimits {
     pub max_resident_bytes: u64,
     pub max_scratch_bytes: u64,
 }
-
 
 // ── Decode and validate ─────────────────────────────────────────────────
 
@@ -341,7 +342,10 @@ pub fn decode(pack: &[u8]) -> Result<Pack<'_>, u16> {
     }
     // Reserved bytes must be zero: a future field written by a newer producer
     // must fail loudly here rather than be ignored into a wrong answer.
-    if pack[PACK_RESERVED_OFF..PACK_HEADER_LEN].iter().any(|&b| b != 0) {
+    if pack[PACK_RESERVED_OFF..PACK_HEADER_LEN]
+        .iter()
+        .any(|&b| b != 0)
+    {
         return Err(PACK_MALFORMED);
     }
 
@@ -686,8 +690,10 @@ pub fn encode(
     }
 
     out[..total].fill(0);
-    let put32 = |out: &mut [u8], off: usize, v: u32| out[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    let put64 = |out: &mut [u8], off: usize, v: u64| out[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    let put32 =
+        |out: &mut [u8], off: usize, v: u32| out[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |out: &mut [u8], off: usize, v: u64| out[off..off + 8].copy_from_slice(&v.to_le_bytes());
 
     put32(out, PACK_MAGIC_OFF, PACK_MAGIC);
     put32(out, PACK_TARGET_ISA_OFF, spec.target_isa);
@@ -708,8 +714,7 @@ pub fn encode(
     put32(out, PACK_MIN_ALIGN_OFF, spec.min_align);
     put64(out, PACK_BUDGET_RESIDENT_OFF, spec.budget_resident);
     put64(out, PACK_BUDGET_SCRATCH_OFF, spec.budget_scratch);
-    out[PACK_ARTIFACT_DIGEST_OFF..PACK_ARTIFACT_DIGEST_OFF + 32]
-        .copy_from_slice(&sha256(artifact));
+    out[PACK_ARTIFACT_DIGEST_OFF..PACK_ARTIFACT_DIGEST_OFF + 32].copy_from_slice(&sha256(artifact));
     out[PACK_TOOLCHAIN_OFF..PACK_TOOLCHAIN_OFF + 16].copy_from_slice(&spec.toolchain);
 
     for (i, b) in bindings.iter().enumerate() {

@@ -359,6 +359,26 @@ pub fn age_entries(table: &mut [ArpEntry; ARP_TABLE_SIZE]) -> u32 {
     revalidations
 }
 
+/// How many table slots hold a live mapping. What a unicast send resolves
+/// against comes from this table and nowhere else, so its occupancy is the
+/// one number that separates "nothing has been learned" from "the wrong
+/// thing was learned".
+pub fn live_entries(table: &[ArpEntry; ARP_TABLE_SIZE]) -> u32 {
+    let mut live = 0u32;
+    // SAFETY: `i < ARP_TABLE_SIZE` bounds every `add(i)` into the
+    // fixed-size array.
+    unsafe {
+        let mut i = 0;
+        while i < ARP_TABLE_SIZE {
+            if (*table.as_ptr().add(i)).valid {
+                live += 1;
+            }
+            i += 1;
+        }
+    }
+    live
+}
+
 /// A parsed ARP packet. `target_mac` is retained because correlating a reply
 /// needs the whole addressing quad, not just the sender's claim.
 pub struct ArpPacket {

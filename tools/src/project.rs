@@ -2,12 +2,11 @@
 //!
 //! Almost every subcommand needs a "project root" to find the
 //! `stacks/`, `targets/`, and (by default) `modules/` directories
-//! that drive a build. Before this module existed, ten different
-//! sites in `main.rs` and `scenario.rs` hardcoded
-//! `std::env::current_dir().unwrap_or_default()` — which works only
-//! when the operator runs `fluxor` from the source tree's top
-//! directory. Running from a subdirectory, an external user project,
-//! or via a packaged install path broke discovery silently.
+//! that drive a build. Discovery lives here and nowhere else: a
+//! command that reaches for `current_dir()` itself works only when
+//! the operator happens to stand in the tree's top directory, and
+//! fails silently from a subdirectory, from an external user
+//! project, or from a packaged install.
 //!
 //! ## Resolution order
 //!
@@ -23,11 +22,33 @@
 //!      file).
 //!
 //!    The first match wins; the walk stops at the filesystem root.
-//! 3. **CWD as a fallback** — preserves the pre-`fluxor_tools::project`
-//!    behaviour for callers that don't care.
+//! 3. **CWD as a fallback** — for callers that don't care where the
+//!    root really is.
 //!
-//! See `.context/rfc_fluxor_project_surface_discipline.md` for the
-//! broader project-surface design this helper supports.
+//! ## Project-surface discipline
+//!
+//! The surface this implements, which the rest of the CLI relies on:
+//!
+//! - A project declares itself on disk. Either the operator opts in
+//!   with a `.fluxor` marker file, or the tree is self-evidently a
+//!   fluxor project because it carries both `targets/` and `stacks/`.
+//!   Nothing is inferred from a name, a parent directory, or an
+//!   assumption about where the operator is standing.
+//! - The project root and the install root are two different things.
+//!   The project root holds what the operator owns and edits; the
+//!   install root holds the catalogs shipped with the fluxor
+//!   distribution. A resource is resolved against the project root
+//!   first and the install root second ([`find_resource`]), so a
+//!   project can override any shipped stack or target by placing its
+//!   own file at the same relative path without copying the rest.
+//! - Every discovery records HOW it resolved ([`DiscoverySource`],
+//!   [`InstallDiscoverySource`]) so `fluxor inspect` can tell the
+//!   operator which tree a build is actually reading, instead of
+//!   leaving a wrong-directory build to fail further downstream.
+//! - `fluxor.toml` at the project root carries the project's identity
+//!   and its declared dependencies; it is read lazily and its absence
+//!   is not an error, because a project root is defined by its
+//!   directory layout, not by that file.
 
 use std::path::{Path, PathBuf};
 

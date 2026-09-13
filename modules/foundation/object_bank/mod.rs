@@ -283,7 +283,12 @@ unsafe fn backend_stream(s: &mut BankState) -> ReadOutcome {
         if written > 0 {
             s.total_bytes_emitted = s.total_bytes_emitted.saturating_add(written as u32);
         }
-        track_pending(written, n as usize, &mut s.pending_out, &mut s.pending_offset);
+        track_pending(
+            written,
+            n as usize,
+            &mut s.pending_out,
+            &mut s.pending_offset,
+        );
         return ReadOutcome::Yield(2); // Burst — keep stepping while there's data.
     }
     // EAGAIN: provider has no bytes ready but the file isn't finished

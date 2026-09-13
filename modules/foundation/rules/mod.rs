@@ -20,7 +20,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -102,8 +101,8 @@ struct RulesState {
 
 mod params_def {
     use super::RulesState;
-    use super::{p_u16, MAX_TOPIC_LEN};
     use super::SCHEMA_MAX;
+    use super::{p_u16, MAX_TOPIC_LEN};
 
     define_params! {
         RulesState;
@@ -194,7 +193,9 @@ unsafe fn build_rules(s: &mut RulesState) {
     let prefix_len = s.topic_prefix_len as usize;
     let suffix = b"/alert";
     let mut topic_len = prefix_len + suffix.len();
-    if topic_len > MAX_TOPIC_LEN { topic_len = MAX_TOPIC_LEN; }
+    if topic_len > MAX_TOPIC_LEN {
+        topic_len = MAX_TOPIC_LEN;
+    }
 
     let mut topic = [0u8; MAX_TOPIC_LEN];
     let tp = topic.as_mut_ptr();
@@ -294,8 +295,8 @@ pub extern "C" fn module_new(
         __aeabi_memclr(s.topic_prefix.as_mut_ptr(), MAX_TOPIC_LEN);
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);

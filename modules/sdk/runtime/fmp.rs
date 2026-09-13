@@ -180,4 +180,3 @@ pub unsafe fn p_u32(params: *const u8, len: usize, offset: usize, default: u32) 
         default
     }
 }
-

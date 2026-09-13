@@ -127,8 +127,8 @@ mod scheduler_validation_tests {
                 .expect_err("D10 must reject multi-node raft on an adaptive domain");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("multi-node") && msg.contains("D10"),
-            "expected D10 multi-node rejection, got: {msg}"
+            msg.contains("multi-node") && msg.contains("raft_engine"),
+            "expected the multi-node raft rejection, got: {msg}"
         );
     }
 
@@ -179,9 +179,9 @@ mod scheduler_validation_tests {
     fn manifestless_module_passes_on_idle_a_domain_but_blocks_on_cadence_b() {
         // (a)-only domain (flags=1): a genuinely manifest-less module is ADMITTED
         // — the lenient gate, since idle-relax alone doesn't warp a running module
-        // (the §7.2/§7.3 type-specific gates cover (a)'s hazards). (b) domain
-        // (flags=3): the SAME module is BLOCKED — unattested defaults to
-        // step_counted (RFC adaptive_tick §8 rule 2, fail closed).
+        // (the per-timer-class gates below cover (a)'s hazards). (b) domain
+        // (flags=3): the SAME module is BLOCKED — a module with no attested
+        // timer class defaults to step_counted, which (b) would warp.
         let dir = tempfile::tempdir().expect("tempdir");
         // A resolvable module DIRECTORY with NO manifest.toml — the realistic
         // "genuinely manifest-less" case.
@@ -288,8 +288,9 @@ mod scheduler_validation_tests {
 
     #[test]
     fn step_period_ticks_blocked_on_cadence_b_unless_wallclock() {
-        // RFC §8 rule 1: a non-zero step_period_ticks is tick-counted → blocked on
-        // a (b) domain unless wall_clock (agnostic does NOT override it).
+        // A non-zero step_period_ticks is tick-counted, so it is blocked on a
+        // (b) domain unless the module is wall_clock (agnostic does NOT
+        // override it).
         let cfg = json!({"execution": {"domains": [
             {"name": "main", "cores": [0], "adaptive_flags": 3,
              "tick_min_us": 100, "tick_max_us": 8000}]}});
@@ -327,8 +328,8 @@ mod scheduler_validation_tests {
 
     #[test]
     fn replicated_clock_blocked_on_cadence_b_without_replica_agreement() {
-        // D8 rule 4 (§7.3): a replicated_clock module self-reads wall-clock time
-        // (so it passes the rule-2 attestation gate), but mechanism (b) changing
+        // A replicated_clock module self-reads wall-clock time
+        // (so it passes the timer-class attestation gate), but mechanism (b) changing
         // the emission cadence shifts replicated expiry. Blocked on (b) unless the
         // domain asserts replica-agreed emission cadence.
         let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler"})];
@@ -349,8 +350,10 @@ mod scheduler_validation_tests {
             validate_adaptive_tick(&cfg, &modules, 100, &names, &ticks, &manifests, &[], None)
                 .expect_err("replicated_clock on (b) must be blocked without replica agreement");
         assert!(
-            format!("{err:?}").contains("replica") && format!("{err:?}").contains("rule 4"),
-            "expected replicated-clock rule-4 diagnostic, got: {err:?}"
+            format!("{err:?}").contains("replicated_clock")
+                && format!("{err:?}").contains("replica_agreed_cadence"),
+            "expected the replicated-clock diagnostic naming the field that admits it, \
+             got: {err:?}"
         );
 
         // With replica_agreed_cadence: true → passes (single node).
@@ -372,7 +375,7 @@ mod scheduler_validation_tests {
 
     #[test]
     fn replicated_clock_multi_node_blocked_even_with_assertion() {
-        // D8 rule 4: a multi-node cluster cannot agree on emission rate under
+        // A multi-node cluster cannot agree on emission rate under
         // independent per-node pacing — blocked on (b) regardless of the assertion.
         let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler", "voter_count": 3})];
         let names = vec!["main".to_string()];
@@ -397,8 +400,8 @@ mod scheduler_validation_tests {
 
     #[test]
     fn multi_graph_pods_exceeding_pacer_table_rejected() {
-        // RFC adaptive_tick_extra §7.5/§13: resident graphs (base + `pods:`) ×
-        // domains must fit the kernel's static GRAPH_PACERS table (16). A base
+        // Resident graphs (base + `pods:`) × domains must fit the kernel's
+        // static GRAPH_PACERS table (16 slots). A base
         // graph (1 domain) plus 16 single-domain pods = 17 instances → reject.
         let modules = vec![json!({"name": "m", "type": "passthrough"})];
         let names = vec!["main".to_string()];
@@ -428,7 +431,7 @@ mod scheduler_validation_tests {
         assert!(
             format!("{err:?}").contains("pacer table")
                 && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
-            "expected the §7.5 pacer-table overflow diagnostic, got: {err:?}"
+            "expected the pacer-table overflow diagnostic, got: {err:?}"
         );
 
         // 3 pods → 1 (base) + 3 = 4 instances → fits.
@@ -479,7 +482,8 @@ mod scheduler_validation_tests {
         assert!(
             format!("{err:?}").contains("pacer table")
                 && format!("{err:?}").contains("MAX_GRAPH_PACERS"),
-            "expected the §7.5 overflow diagnostic even with no adaptive flags, got: {err:?}"
+            "expected the pacer-table overflow diagnostic even with no adaptive \
+             flags, got: {err:?}"
         );
 
         // 2 fixed-tick pods → 1 + 2 = 3 instances → fits.
@@ -555,7 +559,7 @@ mod scheduler_validation_tests {
 
     #[test]
     fn replicated_clock_idle_clamp_enforced() {
-        // D8 rule 4 (a): demand-driven idle must not widen tick_max_us past the
+        // Demand-driven idle must not widen tick_max_us past the
         // tick emission interval, else committed expiry stalls.
         let modules = vec![json!({"name": "ttl", "type": "ttl_scheduler", "tick_interval_ms": 50})];
         let names = vec!["main".to_string()];
@@ -598,7 +602,7 @@ mod scheduler_validation_tests {
 
     #[test]
     fn guaranteed_blocked_on_cadence_b_unless_revalidated() {
-        // D8 rule 6 (§11): a guaranteed-WCET module's budget shrinks when (b)
+        // A guaranteed-WCET module's budget shrinks when (b)
         // lowers the tick — blocked unless the domain asserts WCET re-validation
         // at tick_min_us.
         let modules = vec![json!({"name": "ctl", "type": "ctl", "step_deadline_us": 50})];
@@ -620,7 +624,7 @@ mod scheduler_validation_tests {
                 .expect_err("guaranteed on (b) must be blocked without WCET re-validation");
         assert!(
             format!("{err:?}").contains("guaranteed_wcet_revalidated"),
-            "expected rule-6 re-validation diagnostic, got: {err:?}"
+            "expected the WCET re-validation diagnostic, got: {err:?}"
         );
 
         // With the assertion → passes (burst-at-floor still enforced: 50×8=400 ≤ 16×1000).
@@ -642,7 +646,7 @@ mod scheduler_validation_tests {
 
     #[test]
     fn domain0_unbounded_tick_max_blocked_in_multi_domain() {
-        // D8 rule 7 (§7.1): domain 0 alone advances the shared DBG_TICK; in a
+        // Domain 0 alone advances the shared DBG_TICK; in a
         // multi-domain config on a DBG_TICK-backed target, an unbounded
         // (tick_max_us=0) adaptive domain 0 stalls sibling-domain tick reads.
         let modules = vec![json!({"name": "m", "type": "m"})];
@@ -666,12 +670,12 @@ mod scheduler_validation_tests {
         )
         .expect_err("unbounded domain-0 adaptive in a multi-domain bcm2712 config must be blocked");
         assert!(
-            format!("{err:?}").contains("rule 7") && format!("{err:?}").contains("tick_max_us"),
-            "expected rule-7 domain-0 diagnostic, got: {err:?}"
+            format!("{err:?}").contains("domain 0") && format!("{err:?}").contains("tick_max_us"),
+            "expected the unbounded domain-0 diagnostic, got: {err:?}"
         );
 
         // Bounded tick_max_us on domain 0 → passes.
-        // bcm idle requires the §10 wake-policy declaration (execution-level).
+        // bcm idle requires an execution-level `bcm_wake_policy` declaration.
         let cfg_ok = json!({"execution": {
             "bcm_wake_policy": "clamp",
             "domains": [
@@ -706,8 +710,9 @@ mod scheduler_validation_tests {
 
     #[test]
     fn adaptive_domain_sharing_runner_with_strict_domain_is_rejected() {
-        // §9.2/§9.4: an adaptive domain sharing a core with a timing-strict
-        // domain (here raft liveness) is rejected reject-by-default.
+        // An adaptive domain sharing a core with a timing-strict domain (here
+        // raft liveness) is rejected: the adaptive domain's pacing would warp
+        // the strict domain's cadence, so sharing a runner is refused.
         let names = vec!["main".to_string(), "rt".to_string()];
         let ticks = vec![100u16, 100u16];
         let manifests = std::collections::HashMap::new();
@@ -886,8 +891,7 @@ mod scheduler_validation_tests {
     #[test]
     fn tier_friendly_strings_map_to_exec_mode_bytes() {
         // The byte mapping is wire-stable — adding tiers must preserve
-        // existing values. This test pins the {0,1,2,3,4} table from
-        // .context/rfc_isr_tier_surface.md §D5.
+        // existing values. This test pins the {0,1,2,3,4} table.
         assert_eq!(
             parse_domain_tier_to_exec_mode(&json!({"tier": "cooperative"})),
             Some(0)
@@ -899,7 +903,7 @@ mod scheduler_validation_tests {
         assert_eq!(
             parse_domain_tier_to_exec_mode(&json!({"tier": "1b"})),
             Some(2),
-            "Tier 1b → exec_mode 2 (the new admission target)"
+            "Tier 1b → exec_mode 2"
         );
         assert_eq!(
             parse_domain_tier_to_exec_mode(&json!({"tier": "3"})),
@@ -908,16 +912,16 @@ mod scheduler_validation_tests {
         assert_eq!(
             parse_domain_tier_to_exec_mode(&json!({"tier": "2"})),
             Some(4),
-            "Tier 2 → exec_mode 4 (asymmetric because the byte was \
-             allocated after 1a/3)"
+            "Tier 2 → exec_mode 4 — the byte order deliberately does not \
+             follow the tier names"
         );
     }
 
     #[test]
     fn legacy_exec_mode_field_still_parses() {
-        // Pre-RFC configs use `exec_mode: tier1a`. The parser must
-        // keep accepting these so `examples/*/pi5.yaml` and other live
-        // configs build unchanged.
+        // `exec_mode:` is an accepted alias spelling of `tier:`, with its
+        // own synonym set (`tier1a`, `high_rate`, `poll`, …). Both keys
+        // resolve to the same exec_mode bytes.
         assert_eq!(
             parse_domain_tier_to_exec_mode(&json!({"exec_mode": "tier1a"})),
             Some(1)
@@ -948,13 +952,12 @@ mod scheduler_validation_tests {
 
     #[test]
     fn exec_mode_wire_bytes_locked_against_rfc_d5_table() {
-        // FULL `(string → byte)` mapping pinned verbatim against the
-        // §D5 table in `.context/rfc_isr_tier_surface.md`. Any change
-        // here is a wire-format break (older `.cfg.bin` blobs with
-        // the previous mapping would silently mis-route domains).
-        // Failing this test means either the table changed or a
-        // synonym was renamed — both require coordinated kernel +
-        // tools + docs updates.
+        // The FULL `(string → byte)` mapping, pinned. These bytes are a
+        // wire contract: a `.cfg.bin` blob carries the byte, and the kernel
+        // reads it back through `scheduler::exec_mode::*`, so a changed
+        // mapping silently mis-routes domains. Failing this test means the
+        // table or one of its synonyms moved, which needs a coordinated
+        // kernel + tools + docs change.
         let pairs: &[(&str, u8)] = &[
             ("cooperative", 0),
             ("0", 0),
@@ -975,10 +978,10 @@ mod scheduler_validation_tests {
             assert_eq!(
                 parse_domain_tier_to_exec_mode(&json!({"tier": s})),
                 Some(*expected),
-                "WIRE-FORMAT BREAK: tier `{s}` no longer maps to byte \
-                 {expected}. Update `.context/rfc_isr_tier_surface.md` \
-                 §D5 + the kernel-side `scheduler::exec_mode::*` \
-                 constants together."
+                "WIRE-FORMAT BREAK: tier `{s}` must map to byte \
+                 {expected}. These bytes are a locked wire contract and \
+                 can only be changed in lockstep with the kernel-side \
+                 `scheduler::exec_mode::*` constants."
             );
         }
     }
@@ -1852,8 +1855,8 @@ mod module_discovery_tests {
 
 #[cfg(test)]
 mod continuity_tests {
-    //! Tests for the `continuity` block validator
-    //! §7.3): continuity classes as a validated graph property.
+    //! Tests for the `continuity` block validator: continuity classes as
+    //! a validated graph property.
 
     use super::*;
 
@@ -2447,8 +2450,8 @@ mod continuity_tests {
     }
 }
 
-/// Coverage for `resolve_edge_rate_class`'s priority order
-/// (`rfc_flow_budgets.md` §3.2): per-edge `rate:` override, else
+/// Coverage for `resolve_edge_rate_class`'s priority order:
+/// per-edge `rate:` override, else
 /// consumer's `rate_class_default`, else producer's
 /// `rate_class_default`, else consumer's content-type default, else
 /// producer's, else `control`.

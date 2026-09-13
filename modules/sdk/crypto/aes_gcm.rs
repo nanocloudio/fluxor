@@ -60,7 +60,9 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-const RCON: [u8; 11] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+const RCON: [u8; 11] = [
+    0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36,
+];
 
 // ============================================================================
 // AES core. SubBytes is a secret-indexed lookup into the `.rodata`
@@ -80,10 +82,14 @@ fn gmul(mut a: u8, mut b: u8) -> u8 {
     let mut p = 0u8;
     let mut i = 0;
     while i < 8 {
-        if b & 1 != 0 { p ^= a; }
+        if b & 1 != 0 {
+            p ^= a;
+        }
         let hi = a & 0x80;
         a <<= 1;
-        if hi != 0 { a ^= 0x1b; }
+        if hi != 0 {
+            a ^= 0x1b;
+        }
         b >>= 1;
         i += 1;
     }
@@ -101,7 +107,9 @@ impl AesKey {
         let mut rk = [[0u8; 16]; 15];
         // SAFETY: pointer arithmetic over the AES round-key state and the
         // GHASH accumulator; both are fixed-size structs.
-        unsafe { core::ptr::copy_nonoverlapping(key.as_ptr(), rk[0].as_mut_ptr(), 16); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(key.as_ptr(), rk[0].as_mut_ptr(), 16);
+        }
 
         let mut i = 1;
         while i <= 10 {
@@ -118,7 +126,10 @@ impl AesKey {
             }
             i += 1;
         }
-        Self { round_keys: rk, rounds: 10 }
+        Self {
+            round_keys: rk,
+            rounds: 10,
+        }
     }
 
     fn expand_256(key: &[u8; 32]) -> Self {
@@ -164,7 +175,10 @@ impl AesKey {
             }
             i += 1;
         }
-        Self { round_keys: rk, rounds: 14 }
+        Self {
+            round_keys: rk,
+            rounds: 14,
+        }
     }
 
     fn encrypt_block(&self, block: &mut [u8; 16]) {
@@ -230,11 +244,7 @@ impl AesKey {
 /// hosts fall back to the scalar SBOX path in `encrypt_block`.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(never)]
-unsafe fn encrypt_block_aarch64_aes(
-    block: &mut [u8; 16],
-    rks: &[[u8; 16]; 15],
-    rounds: usize,
-) {
+unsafe fn encrypt_block_aarch64_aes(block: &mut [u8; 16], rks: &[[u8; 16]; 15], rounds: usize) {
     // `aese` consumes v1; we need a fresh round-key register for
     // each round so we load them all upfront into v1..v15 then
     // pipeline AESE/AESMC against the contiguous register file.
@@ -316,7 +326,10 @@ unsafe fn encrypt_block_aarch64_aes(
 #[inline(always)]
 fn xor_block(a: &mut [u8; 16], b: &[u8; 16]) {
     let mut i = 0;
-    while i < 16 { a[i] ^= b[i]; i += 1; }
+    while i < 16 {
+        a[i] ^= b[i];
+        i += 1;
+    }
 }
 
 /// SubBytes. The index is a byte of the AES state and therefore
@@ -333,19 +346,35 @@ fn sub_bytes(block: &mut [u8; 16]) {
 
 fn shift_rows(s: &mut [u8; 16]) {
     // Row 1: shift left 1
-    let t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+    let t = s[1];
+    s[1] = s[5];
+    s[5] = s[9];
+    s[9] = s[13];
+    s[13] = t;
     // Row 2: shift left 2
-    let t0 = s[2]; let t1 = s[6]; s[2] = s[10]; s[6] = s[14]; s[10] = t0; s[14] = t1;
+    let t0 = s[2];
+    let t1 = s[6];
+    s[2] = s[10];
+    s[6] = s[14];
+    s[10] = t0;
+    s[14] = t1;
     // Row 3: shift left 3 (= right 1)
-    let t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+    let t = s[15];
+    s[15] = s[11];
+    s[11] = s[7];
+    s[7] = s[3];
+    s[3] = t;
 }
 
 fn mix_columns(s: &mut [u8; 16]) {
     let mut i = 0;
     while i < 16 {
-        let a0 = s[i]; let a1 = s[i + 1]; let a2 = s[i + 2]; let a3 = s[i + 3];
+        let a0 = s[i];
+        let a1 = s[i + 1];
+        let a2 = s[i + 2];
+        let a3 = s[i + 3];
         let t = a0 ^ a1 ^ a2 ^ a3;
-        s[i]     = a0 ^ xtime(a0 ^ a1) ^ t;
+        s[i] = a0 ^ xtime(a0 ^ a1) ^ t;
         s[i + 1] = a1 ^ xtime(a1 ^ a2) ^ t;
         s[i + 2] = a2 ^ xtime(a2 ^ a3) ^ t;
         s[i + 3] = a3 ^ xtime(a3 ^ a0) ^ t;
@@ -432,10 +461,12 @@ impl GHash {
     }
 
     fn update_block(&mut self, block: &[u8; 16]) {
-        self.y_hi ^= u64::from_be_bytes([block[0], block[1], block[2], block[3],
-                                          block[4], block[5], block[6], block[7]]);
-        self.y_lo ^= u64::from_be_bytes([block[8], block[9], block[10], block[11],
-                                          block[12], block[13], block[14], block[15]]);
+        self.y_hi ^= u64::from_be_bytes([
+            block[0], block[1], block[2], block[3], block[4], block[5], block[6], block[7],
+        ]);
+        self.y_lo ^= u64::from_be_bytes([
+            block[8], block[9], block[10], block[11], block[12], block[13], block[14], block[15],
+        ]);
         self.gf_mul();
     }
 
@@ -445,7 +476,9 @@ impl GHash {
             let mut block = [0u8; 16];
             // SAFETY: pointer arithmetic over the AES round-key state and the
             // GHASH accumulator; both are fixed-size structs.
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), 16); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), 16);
+            }
             self.update_block(&block);
             offset += 16;
         }
@@ -454,7 +487,13 @@ impl GHash {
             let remain = data.len() - offset;
             // SAFETY: pointer arithmetic over the AES round-key state and the
             // GHASH accumulator; both are fixed-size structs.
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(offset), block.as_mut_ptr(), remain); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(offset),
+                    block.as_mut_ptr(),
+                    remain,
+                );
+            }
             self.update_block(&block);
         }
     }
@@ -508,8 +547,7 @@ pub const GCM_TAG_LEN: usize = 16;
 /// True for exactly one build of this file: the bcm2712 PIC module
 /// build. The host test harness (including on a Pi 5), wasm32, rp2040
 /// and rp2350 are all false.
-pub const AES_IS_CONSTANT_TIME: bool =
-    cfg!(all(target_arch = "aarch64", target_feature = "aes"));
+pub const AES_IS_CONSTANT_TIME: bool = cfg!(all(target_arch = "aarch64", target_feature = "aes"));
 
 /// Whether AES-GCM cipher suites may be offered or accepted by suite
 /// selection on this target. Consulted by the TLS suite tables; this
@@ -536,13 +574,12 @@ pub const AES_IS_CONSTANT_TIME: bool =
 ///     peers, and a node that cannot speak `TLS_AES_128_GCM_SHA256`
 ///     is not a TLS 1.3 implementation. The default is therefore on
 ///     and the exposure is accepted, not absent.
-pub const AES_GCM_SUITES_ENABLED: bool =
-    !cfg!(any(target_arch = "arm", target_arch = "wasm32"));
+pub const AES_GCM_SUITES_ENABLED: bool = !cfg!(any(target_arch = "arm", target_arch = "wasm32"));
 
 /// AES-GCM context with expanded key and H (for GHASH)
 pub struct AesGcm {
     aes: AesKey,
-    h: [u8; 16],  // GHASH subkey = AES_K(0^128)
+    h: [u8; 16], // GHASH subkey = AES_K(0^128)
 }
 
 impl Drop for AesKey {
@@ -561,7 +598,10 @@ impl Drop for AesKey {
 /// The function inlines the round-key expansion each call; callers
 /// who do header protection per-packet should cache the expanded key
 /// in `Aes128Hp` instead.
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 pub fn aes128_ecb_encrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
     let aes = AesKey::expand_128(key);
     aes.encrypt_block(block);
@@ -574,10 +614,15 @@ pub struct Aes128Hp {
     aes: AesKey,
 }
 
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 impl Aes128Hp {
     pub fn new(key: &[u8; 16]) -> Self {
-        Self { aes: AesKey::expand_128(key) }
+        Self {
+            aes: AesKey::expand_128(key),
+        }
     }
 
     /// Encrypt one 16-byte block in place. Used to compute the
@@ -613,7 +658,9 @@ impl AesGcm {
         let mut j0 = [0u8; 16];
         // SAFETY: pointer arithmetic over the AES round-key state and the
         // GHASH accumulator; both are fixed-size structs.
-        unsafe { core::ptr::copy_nonoverlapping(nonce.as_ptr(), j0.as_mut_ptr(), 12); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(nonce.as_ptr(), j0.as_mut_ptr(), 12);
+        }
         j0[15] = 1; // Initial counter = 1
         j0
     }
@@ -624,7 +671,9 @@ impl AesGcm {
         let b = c.to_be_bytes();
         // SAFETY: pointer arithmetic over the AES round-key state and the
         // GHASH accumulator; both are fixed-size structs.
-        unsafe { core::ptr::copy_nonoverlapping(b.as_ptr(), ctr.as_mut_ptr().add(12), 4); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(b.as_ptr(), ctr.as_mut_ptr().add(12), 4);
+        }
     }
 
     /// Encrypt data in-place and return tag.
@@ -654,7 +703,10 @@ impl AesGcm {
         let mut tag = ghash.finalize_tag(aad.len(), data.len());
         // XOR with encrypted J0
         let mut i = 0;
-        while i < 16 { tag[i] ^= tag_mask[i]; i += 1; }
+        while i < 16 {
+            tag[i] ^= tag_mask[i];
+            i += 1;
+        }
         zeroize(&mut tag_mask);
         zeroize(&mut ctr);
         tag
@@ -678,7 +730,10 @@ impl AesGcm {
         ghash.update(data);
         let mut computed_tag = ghash.finalize_tag(aad.len(), data.len());
         let mut i = 0;
-        while i < 16 { computed_tag[i] ^= tag_mask[i]; i += 1; }
+        while i < 16 {
+            computed_tag[i] ^= tag_mask[i];
+            i += 1;
+        }
 
         // Tag comparison is constant-time in the tag: all 16 bytes are
         // folded into `diff` before any branch, so neither the number
@@ -688,7 +743,10 @@ impl AesGcm {
         // carry the exposures documented at the top of this file.
         let mut diff = 0u8;
         i = 0;
-        while i < 16 { diff |= computed_tag[i] ^ tag[i]; i += 1; }
+        while i < 16 {
+            diff |= computed_tag[i] ^ tag[i];
+            i += 1;
+        }
 
         if diff != 0 {
             zeroize(&mut tag_mask);

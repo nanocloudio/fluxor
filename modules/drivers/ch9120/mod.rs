@@ -35,7 +35,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -172,8 +171,8 @@ impl Ch9120State {
 
 mod params_def {
     use super::Ch9120State;
-    use super::{p_u8, p_u16, p_u32};
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u32, p_u8};
 
     define_params! {
         Ch9120State;
@@ -283,7 +282,13 @@ unsafe fn emit_netif_state(s: &Ch9120State, state: u8) {
         return;
     }
     let payload = [state];
-    msg_write(sys, s.netif_state_chan, MSG_NETIF_STATE, payload.as_ptr(), 1);
+    msg_write(
+        sys,
+        s.netif_state_chan,
+        MSG_NETIF_STATE,
+        payload.as_ptr(),
+        1,
+    );
 }
 
 // ============================================================================
@@ -627,7 +632,11 @@ unsafe fn step_running(s: &mut Ch9120State) -> i32 {
         }
     }
 
-    if did_work { 2 } else { 0 }
+    if did_work {
+        2
+    } else {
+        0
+    }
 }
 
 // ============================================================================
@@ -678,8 +687,8 @@ pub extern "C" fn module_new(
         s.phase = Ch9120Phase::Init;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -722,11 +731,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn module_drop(
-    state: *mut u8,
-    _state_size: usize,
-    _syscalls: *const c_void,
-) {
+pub extern "C" fn module_drop(state: *mut u8, _state_size: usize, _syscalls: *const c_void) {
     // Kernel's release_module_handles() cleans up UART and GPIO handles
     // automatically on module finish. Nothing extra needed here.
     if state.is_null() {

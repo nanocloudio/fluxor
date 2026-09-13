@@ -120,16 +120,12 @@ impl AckTracker {
         // so `ranges[idx + 1]` is the *lower* neighbor and
         // `ranges[idx - 1]` is the *higher* neighbor.
         let n = self.count as usize;
-        if idx + 1 < n
-            && self.ranges[idx + 1].high.wrapping_add(1) == self.ranges[idx].low
-        {
+        if idx + 1 < n && self.ranges[idx + 1].high.wrapping_add(1) == self.ranges[idx].low {
             // Lower neighbor's high abuts our low → fold it into us.
             self.ranges[idx].low = self.ranges[idx + 1].low;
             self.remove_at(idx + 1);
         }
-        if idx > 0
-            && self.ranges[idx].high.wrapping_add(1) == self.ranges[idx - 1].low
-        {
+        if idx > 0 && self.ranges[idx].high.wrapping_add(1) == self.ranges[idx - 1].low {
             // Our high abuts higher neighbor's low → fold us into it.
             self.ranges[idx - 1].low = self.ranges[idx].low;
             self.remove_at(idx);

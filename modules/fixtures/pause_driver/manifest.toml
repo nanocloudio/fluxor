@@ -2,8 +2,8 @@ version = "1.0.0"
 hardware_targets = ["bcm2712"]
 permissions = ["platform_raw"]
 
-# System-graph driver for the owner-pause silicon AC
-# (rfc_workload_lifecycle.md §3.2 P4): issues OWNER_PAUSE (0x0C49) /
+# System-graph driver proving owner-pause on silicon: issues
+# OWNER_PAUSE (0x0C49) /
 # OWNER_RESUME (0x0C4A) against a resident pod's owner handle on a
 # wall-clock schedule and logs `[pdrv] pause/resume ms=<t> rc=<rc>`,
 # plus a `[pdrv] hb` heartbeat proving the system graph keeps stepping

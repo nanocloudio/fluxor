@@ -38,6 +38,7 @@ struct TomlSiliconFile {
 #[derive(Deserialize, Default)]
 struct TomlKernelConfig {
     state_arena_kb: Option<u32>,
+    ram_static_max_kb: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -213,6 +214,11 @@ pub struct TargetDescriptor {
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// State arena size in KB (from [kernel] section, default 256)
     pub state_arena_kb: u32,
+    /// Ceiling on the kernel image's static RAM — `.data` + `.bss` +
+    /// `.uninit` — in KiB (`[kernel] ram_static_max_kb`). `None` where the
+    /// silicon declares none, which is every target whose image is not
+    /// linked against a fixed RAM region.
+    pub ram_static_max_kb: Option<u32>,
     /// Number of MPU regions available (0 = no MPU, e.g. Cortex-M0+)
     pub mpu_regions: u8,
     /// Whether the target has an MMU (for full page-table isolation)
@@ -555,6 +561,7 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
             .as_ref()
             .and_then(|k| k.state_arena_kb)
             .unwrap_or(256),
+        ram_static_max_kb: silicon.kernel.as_ref().and_then(|k| k.ram_static_max_kb),
         mpu_regions: silicon
             .isolation
             .as_ref()

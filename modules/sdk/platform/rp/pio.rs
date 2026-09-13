@@ -39,6 +39,11 @@ pub const CMD_CONFIGURE: u32 = 0x0412;
 pub const CMD_TRANSFER: u32 = 0x0413;
 pub const CMD_POLL: u32 = 0x0414;
 pub const CMD_FREE: u32 = 0x0415;
+/// The slot's data pin level while no transfer is in flight: 1 high,
+/// 0 low, `EBUSY` during a transfer. A bus peripheral that raises its
+/// data line when it has something to say is asked this before it is
+/// asked anything over the bus.
+pub const CMD_LEVEL: u32 = 0x0416;
 
 // RX Stream (unidirectional input, continuous DMA capture — mic, ADC streams, etc.)
 pub const RX_STREAM_ALLOC: u32 = 0x0420;

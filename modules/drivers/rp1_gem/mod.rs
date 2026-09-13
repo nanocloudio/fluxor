@@ -27,7 +27,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 use core::ptr::{read_volatile, write_volatile};
 
@@ -42,53 +41,53 @@ include!("../../sdk/runtime.rs");
 // ============================================================================
 
 // Network control/config
-const GEM_NWCTRL: usize = 0x000;        // Network control
-const GEM_NWCFG: usize = 0x004;         // Network config
-const GEM_NWSR: usize = 0x008;          // Network status
-const GEM_DMACFG: usize = 0x010;        // DMA config
-const GEM_TXSTATUS: usize = 0x014;      // TX status
-const GEM_RXQBASE: usize = 0x018;       // RX queue base addr
-const GEM_TXQBASE: usize = 0x01C;       // TX queue base addr
-const GEM_RXSTATUS: usize = 0x020;      // RX status (RSR): BNA/RXREC/RXOVR
-const GEM_ISR: usize = 0x024;           // Interrupt status
-const GEM_IDR: usize = 0x02C;           // Interrupt disable
-const GEM_PHYMGMT: usize = 0x034;       // PHY management
-const GEM_HASHBOT: usize = 0x080;       // Hash register bottom
-const GEM_HASHTOP: usize = 0x084;       // Hash register top
-const GEM_SA1B: usize = 0x088;          // Specific addr 1 bottom (MAC lo)
-const GEM_SA1T: usize = 0x08C;          // Specific addr 1 top (MAC hi)
-const GEM_USRIO: usize = 0x0C0;         // User IO (RGMII mode select)
-const GEM_MID: usize = 0x0FC;           // Module ID (RO)
-const GEM_DCFG1: usize = 0x280;         // Design config 1
-const GEM_DCFG2: usize = 0x284;         // Design config 2
+const GEM_NWCTRL: usize = 0x000; // Network control
+const GEM_NWCFG: usize = 0x004; // Network config
+const GEM_NWSR: usize = 0x008; // Network status
+const GEM_DMACFG: usize = 0x010; // DMA config
+const GEM_TXSTATUS: usize = 0x014; // TX status
+const GEM_RXQBASE: usize = 0x018; // RX queue base addr
+const GEM_TXQBASE: usize = 0x01C; // TX queue base addr
+const GEM_RXSTATUS: usize = 0x020; // RX status (RSR): BNA/RXREC/RXOVR
+const GEM_ISR: usize = 0x024; // Interrupt status
+const GEM_IDR: usize = 0x02C; // Interrupt disable
+const GEM_PHYMGMT: usize = 0x034; // PHY management
+const GEM_HASHBOT: usize = 0x080; // Hash register bottom
+const GEM_HASHTOP: usize = 0x084; // Hash register top
+const GEM_SA1B: usize = 0x088; // Specific addr 1 bottom (MAC lo)
+const GEM_SA1T: usize = 0x08C; // Specific addr 1 top (MAC hi)
+const GEM_USRIO: usize = 0x0C0; // User IO (RGMII mode select)
+const GEM_MID: usize = 0x0FC; // Module ID (RO)
+const GEM_DCFG1: usize = 0x280; // Design config 1
+const GEM_DCFG2: usize = 0x284; // Design config 2
 
 // Hardware statistics counters. Each is RW1C (read, auto-clear) on
 // most Cadence GEM revisions; treat reads as monotonic deltas between
 // heartbeats without assuming persistence across reads.
-const GEM_FRAMES_RX:     usize = 0x0158; // frames received OK
-const GEM_FRAMES_TX:     usize = 0x0108; // frames transmitted OK
-const GEM_RX_RESOURCE:   usize = 0x01A0; // RX resource errors (BNA)
-const GEM_RX_OVERRUN:    usize = 0x01A4; // RX overrun errors
+const GEM_FRAMES_RX: usize = 0x0158; // frames received OK
+const GEM_FRAMES_TX: usize = 0x0108; // frames transmitted OK
+const GEM_RX_RESOURCE: usize = 0x01A0; // RX resource errors (BNA)
+const GEM_RX_OVERRUN: usize = 0x01A4; // RX overrun errors
 
 // Network / RX status register bits (RSR @ 0x020):
-const RSR_BNA:           u32 = 1 << 0;   // buffer not available on RX
-const RSR_FRMREC:        u32 = 1 << 1;   // frame received
-const RSR_RXOVR:         u32 = 1 << 2;   // RX overrun
+const RSR_BNA: u32 = 1 << 0; // buffer not available on RX
+const RSR_FRMREC: u32 = 1 << 1; // frame received
+const RSR_RXOVR: u32 = 1 << 2; // RX overrun
 
 // TX status register bits (TXSR @ 0x014). All sticky (RW1C). The
 // drop-causing bits (URUN/RLE/LCOL/HRESP) accumulate into
 // `txsr_sticky` so silent TX loss is visible in the heartbeat.
-const TXSR_USED:         u32 = 1 << 0;   // descriptor USED=1 (no work)
-const TXSR_COL:          u32 = 1 << 1;   // collision
-const TXSR_RLE:          u32 = 1 << 2;   // retry limit exceeded — frame DROPPED
-const TXSR_HRESP:        u32 = 1 << 4;   // AHB transfer error — frame DROPPED
-const TXSR_TXCOMPL:      u32 = 1 << 5;   // TX complete
-const TXSR_URUN:         u32 = 1 << 6;   // TX FIFO under-run — frame ABORTED
-const TXSR_LCOL:         u32 = 1 << 7;   // late collision — frame ABORTED
+const TXSR_USED: u32 = 1 << 0; // descriptor USED=1 (no work)
+const TXSR_COL: u32 = 1 << 1; // collision
+const TXSR_RLE: u32 = 1 << 2; // retry limit exceeded — frame DROPPED
+const TXSR_HRESP: u32 = 1 << 4; // AHB transfer error — frame DROPPED
+const TXSR_TXCOMPL: u32 = 1 << 5; // TX complete
+const TXSR_URUN: u32 = 1 << 6; // TX FIFO under-run — frame ABORTED
+const TXSR_LCOL: u32 = 1 << 7; // late collision — frame ABORTED
 
 // Upper base address registers (64-bit DMA)
-const GEM_RBQPH: usize = 0x04D4;        // RX queue base addr high
-const GEM_TBQPH: usize = 0x04C8;        // TX queue base addr high
+const GEM_RBQPH: usize = 0x04D4; // RX queue base addr high
+const GEM_TBQPH: usize = 0x04C8; // TX queue base addr high
 
 // Network control bits
 const NWCTRL_RXEN: u32 = 1 << 2;
@@ -107,7 +106,7 @@ const TXSR_HALT: u32 = TXSR_RLE | TXSR_HRESP | TXSR_URUN | TXSR_LCOL;
 
 // DMA config bits
 const DMACFG_RXBUF_SIZE_SHIFT: u32 = 16;
-const DMACFG_ADDR64: u32 = 1 << 30;     // 64-bit address bus
+const DMACFG_ADDR64: u32 = 1 << 30; // 64-bit address bus
 
 // NIC syscall opcodes
 const NIC_RING_CREATE: u32 = 0x0CF2;
@@ -125,9 +124,9 @@ const NIC_RING_INFO: u32 = 0x0CF4;
 //
 // Total: 16 bytes per descriptor, must be 16-byte aligned.
 
-const RX_DESC_OWNERSHIP: u32 = 1 << 0;  // set by GEM when frame stored
-const RX_DESC_WRAP: u32 = 1 << 1;       // last descriptor in ring
-const RX_DESC_LEN_MASK: u32 = 0x1FFF;   // bits [12:0] of word 1
+const RX_DESC_OWNERSHIP: u32 = 1 << 0; // set by GEM when frame stored
+const RX_DESC_WRAP: u32 = 1 << 1; // last descriptor in ring
+const RX_DESC_LEN_MASK: u32 = 0x1FFF; // bits [12:0] of word 1
 
 // ============================================================================
 // GEM TX descriptor (Cadence native, 64-bit addressing)
@@ -139,10 +138,10 @@ const RX_DESC_LEN_MASK: u32 = 0x1FFF;   // bits [12:0] of word 1
 // Word 2: [31:0] buffer address high
 // Word 3: reserved
 
-const TX_DESC_LEN_MASK: u32 = 0x3FFF;   // bits [13:0]
-const TX_DESC_LAST: u32 = 1 << 15;      // last buffer of frame
-const TX_DESC_WRAP: u32 = 1 << 30;      // last descriptor in ring
-const TX_DESC_USED: u32 = 1 << 31;      // set by GEM when TX complete
+const TX_DESC_LEN_MASK: u32 = 0x3FFF; // bits [13:0]
+const TX_DESC_LAST: u32 = 1 << 15; // last buffer of frame
+const TX_DESC_WRAP: u32 = 1 << 30; // last descriptor in ring
+const TX_DESC_USED: u32 = 1 << 31; // set by GEM when TX complete
 
 mod ring;
 
@@ -201,7 +200,7 @@ struct GemState {
     tx_head: u16,
     tx_tail: u16,
     mac: [u8; 6],
-    phase: u8,        // 0=init, 1=wait_link, 2=running
+    phase: u8, // 0=init, 1=wait_link, 2=running
     _pad: [u8; 3],
     step_count: u32,
     rx_packets: u32,
@@ -290,7 +289,11 @@ unsafe fn append_hex32_field(p: *mut u8, pos: &mut usize, tag: &[u8], val: u32) 
     let mut n = 0u32;
     while n < 8 {
         let nib = ((val >> (28 - n * 4)) & 0xF) as u8;
-        *p.add(*pos) = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        *p.add(*pos) = if nib < 10 {
+            b'0' + nib
+        } else {
+            b'a' + nib - 10
+        };
         *pos += 1;
         n += 1;
     }
@@ -318,10 +321,18 @@ unsafe fn heartbeat(s: &mut GemState) {
     // HW stat registers are RW1C on read (Cadence convention); each
     // read returns the delta since the last read. Sum into state so
     // the heartbeat shows a monotonic total over the run.
-    s.rx_resource_total  = s.rx_resource_total.wrapping_add(gem_read(base, GEM_RX_RESOURCE));
-    s.rx_overrun_total   = s.rx_overrun_total.wrapping_add(gem_read(base, GEM_RX_OVERRUN));
-    s.rx_frames_hw_total = s.rx_frames_hw_total.wrapping_add(gem_read(base, GEM_FRAMES_RX));
-    s.tx_frames_hw_total = s.tx_frames_hw_total.wrapping_add(gem_read(base, GEM_FRAMES_TX));
+    s.rx_resource_total = s
+        .rx_resource_total
+        .wrapping_add(gem_read(base, GEM_RX_RESOURCE));
+    s.rx_overrun_total = s
+        .rx_overrun_total
+        .wrapping_add(gem_read(base, GEM_RX_OVERRUN));
+    s.rx_frames_hw_total = s
+        .rx_frames_hw_total
+        .wrapping_add(gem_read(base, GEM_FRAMES_RX));
+    s.tx_frames_hw_total = s
+        .tx_frames_hw_total
+        .wrapping_add(gem_read(base, GEM_FRAMES_TX));
 
     {
         let mut msg = [0u8; 128];
@@ -332,8 +343,8 @@ unsafe fn heartbeat(s: &mut GemState) {
         pos += fmt_u32_raw(p.add(pos), s.rx_packets);
         append_dec_field(p, &mut pos, b" tx=", s.tx_packets);
         append_hex32_field(p, &mut pos, b" rsr=0x", rsr);
-        append_dec_field(p, &mut pos, b" bna=",  s.rx_resource_total);
-        append_dec_field(p, &mut pos, b" ovr=",  s.rx_overrun_total);
+        append_dec_field(p, &mut pos, b" bna=", s.rx_resource_total);
+        append_dec_field(p, &mut pos, b" ovr=", s.rx_overrun_total);
         append_dec_field(p, &mut pos, b" hwrx=", s.rx_frames_hw_total);
         append_dec_field(p, &mut pos, b" hwtx=", s.tx_frames_hw_total);
         append_dec_field(p, &mut pos, b" cdr=", s.rx_chan_drops);
@@ -362,8 +373,17 @@ unsafe fn heartbeat(s: &mut GemState) {
     // Write-1-clear the bits we interpret so the next heartbeat sees
     // a fresh window. Unrelated bits we don't touch stay as-is.
     gem_write(base, GEM_RXSTATUS, rsr & (RSR_BNA | RSR_FRMREC | RSR_RXOVR));
-    gem_write(base, GEM_TXSTATUS, txsr & (TXSR_USED | TXSR_COL | TXSR_RLE
-        | TXSR_HRESP | TXSR_TXCOMPL | TXSR_URUN | TXSR_LCOL));
+    gem_write(
+        base,
+        GEM_TXSTATUS,
+        txsr & (TXSR_USED
+            | TXSR_COL
+            | TXSR_RLE
+            | TXSR_HRESP
+            | TXSR_TXCOMPL
+            | TXSR_URUN
+            | TXSR_LCOL),
+    );
 }
 
 // ============================================================================
@@ -383,17 +403,21 @@ unsafe fn mdio_read(base: usize, phy_addr: u8, reg: u8) -> u16 {
     let val: u32 = (0b0110 << 28)        // SOF=01, RW=10 (read)
         | ((phy_addr as u32 & 0x1F) << 23)
         | ((reg as u32 & 0x1F) << 18)
-        | (0b10 << 16);                   // turnaround
+        | (0b10 << 16); // turnaround
     gem_write(base, GEM_PHYMGMT, val);
 
     // Wait for MDIO idle (NWSR bit 2)
     let mut timeout = 10000u32;
     while timeout > 0 {
         let nwsr = gem_read(base, GEM_NWSR);
-        if nwsr & (1 << 2) != 0 { break; }
+        if nwsr & (1 << 2) != 0 {
+            break;
+        }
         timeout -= 1;
     }
-    if timeout == 0 { return 0xFFFF; }
+    if timeout == 0 {
+        return 0xFFFF;
+    }
 
     (gem_read(base, GEM_PHYMGMT) & 0xFFFF) as u16
 }
@@ -410,7 +434,9 @@ unsafe fn mdio_write(base: usize, phy_addr: u8, reg: u8, data: u16) {
     let mut timeout = 10000u32;
     while timeout > 0 {
         let nwsr = gem_read(base, GEM_NWSR);
-        if nwsr & (1 << 2) != 0 { break; }
+        if nwsr & (1 << 2) != 0 {
+            break;
+        }
         timeout -= 1;
     }
 }
@@ -462,24 +488,36 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     }
     let ip = info.as_ptr();
     s.rx_desc_addr = u64::from_le_bytes([
-        read_volatile(ip), read_volatile(ip.add(1)),
-        read_volatile(ip.add(2)), read_volatile(ip.add(3)),
-        read_volatile(ip.add(4)), read_volatile(ip.add(5)),
-        read_volatile(ip.add(6)), read_volatile(ip.add(7)),
+        read_volatile(ip),
+        read_volatile(ip.add(1)),
+        read_volatile(ip.add(2)),
+        read_volatile(ip.add(3)),
+        read_volatile(ip.add(4)),
+        read_volatile(ip.add(5)),
+        read_volatile(ip.add(6)),
+        read_volatile(ip.add(7)),
     ]);
     s.rx_desc_count = u16::from_le_bytes([read_volatile(ip.add(8)), read_volatile(ip.add(9))]);
     s.tx_desc_addr = u64::from_le_bytes([
-        read_volatile(ip.add(10)), read_volatile(ip.add(11)),
-        read_volatile(ip.add(12)), read_volatile(ip.add(13)),
-        read_volatile(ip.add(14)), read_volatile(ip.add(15)),
-        read_volatile(ip.add(16)), read_volatile(ip.add(17)),
+        read_volatile(ip.add(10)),
+        read_volatile(ip.add(11)),
+        read_volatile(ip.add(12)),
+        read_volatile(ip.add(13)),
+        read_volatile(ip.add(14)),
+        read_volatile(ip.add(15)),
+        read_volatile(ip.add(16)),
+        read_volatile(ip.add(17)),
     ]);
     s.tx_desc_count = u16::from_le_bytes([read_volatile(ip.add(18)), read_volatile(ip.add(19))]);
     s.buf_pool_addr = u64::from_le_bytes([
-        read_volatile(ip.add(20)), read_volatile(ip.add(21)),
-        read_volatile(ip.add(22)), read_volatile(ip.add(23)),
-        read_volatile(ip.add(24)), read_volatile(ip.add(25)),
-        read_volatile(ip.add(26)), read_volatile(ip.add(27)),
+        read_volatile(ip.add(20)),
+        read_volatile(ip.add(21)),
+        read_volatile(ip.add(22)),
+        read_volatile(ip.add(23)),
+        read_volatile(ip.add(24)),
+        read_volatile(ip.add(25)),
+        read_volatile(ip.add(26)),
+        read_volatile(ip.add(27)),
     ]);
     s.buf_size = u16::from_le_bytes([read_volatile(ip.add(28)), read_volatile(ip.add(29))]);
     s.buf_count = u16::from_le_bytes([read_volatile(ip.add(30)), read_volatile(ip.add(31))]);
@@ -538,8 +576,10 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     } else {
         DEFAULT_MAC
     };
-    let mac_lo = (s.mac[0] as u32) | ((s.mac[1] as u32) << 8)
-        | ((s.mac[2] as u32) << 16) | ((s.mac[3] as u32) << 24);
+    let mac_lo = (s.mac[0] as u32)
+        | ((s.mac[1] as u32) << 8)
+        | ((s.mac[2] as u32) << 16)
+        | ((s.mac[3] as u32) << 24);
     let mac_hi = (s.mac[4] as u32) | ((s.mac[5] as u32) << 8);
     gem_write(base, GEM_SA1B, mac_lo);
     gem_write(base, GEM_SA1T, mac_hi);
@@ -584,10 +624,9 @@ unsafe fn init_gem(s: &mut GemState) -> bool {
     // CLKGEN register (offset 0x14) — RP1 datasheet section 7.1 Table 139:
     //   bit 7: ENABLE, bit 3: SPEED_OVERRIDE_EN, bits 1:0: SPEED_OVERRIDE
     // PHY provides TX and RX delays (rgmii-id) — TXCLKDELEN=0.
-    let cfg_clkgen_val: u32 =
-          (1 << 7)   // ENABLE: start clock generator
+    let cfg_clkgen_val: u32 = (1 << 7)   // ENABLE: start clock generator
         | (1 << 3)   // SPEED_OVERRIDE_EN: use our speed, not MAC auto
-        | 2;          // SPEED_OVERRIDE = 1000M (GbE)
+        | 2; // SPEED_OVERRIDE = 1000M (GbE)
     write_volatile((cfg_base + 0x14) as *mut u32, cfg_clkgen_val);
 
     // CLK2FC register (offset 0x18) — SEL = rgmii_tx_clk
@@ -697,7 +736,9 @@ unsafe fn init_tx_descriptors(s: &GemState) {
 // ============================================================================
 
 unsafe fn poll_rx(s: &mut GemState) -> u32 {
-    if s.out_chan < 0 || s.rx_desc_count == 0 { return 0; }
+    if s.out_chan < 0 || s.rx_desc_count == 0 {
+        return 0;
+    }
     let sys = &*s.syscalls;
 
     let mut processed = 0u32;
@@ -804,13 +845,19 @@ unsafe fn restart_tx(s: &mut GemState) {
     let tx_dma = s.tx_desc_addr + DMA_OFFSET;
     gem_write(base, GEM_TBQPH, (tx_dma >> 32) as u32);
     gem_write(base, GEM_TXQBASE, tx_dma as u32);
-    gem_write(base, GEM_TXSTATUS, TXSR_HALT | TXSR_USED | TXSR_COL | TXSR_TXCOMPL);
+    gem_write(
+        base,
+        GEM_TXSTATUS,
+        TXSR_HALT | TXSR_USED | TXSR_COL | TXSR_TXCOMPL,
+    );
     gem_write(base, GEM_NWCTRL, ctrl | NWCTRL_TXEN);
     s.tx_restarts = s.tx_restarts.wrapping_add(1);
 }
 
 unsafe fn poll_tx(s: &mut GemState) {
-    if s.in_chan < 0 || s.tx_desc_count == 0 { return; }
+    if s.in_chan < 0 || s.tx_desc_count == 0 {
+        return;
+    }
     let sys = &*s.syscalls;
 
     // Reclaim completed TX descriptors. Single pass at the top of
@@ -881,7 +928,9 @@ unsafe fn poll_tx(s: &mut GemState) {
 
         let idx = ring::index(s.tx_head, s.tx_desc_count);
         let buf_idx = s.rx_desc_count as usize + idx;
-        if buf_idx >= s.buf_count as usize { break; }
+        if buf_idx >= s.buf_count as usize {
+            break;
+        }
         let buf_arm = s.buf_pool_addr as usize + buf_idx * s.buf_size as usize;
         let buf_dma = buf_arm as u64 + DMA_OFFSET;
         let buf_ptr = buf_arm as *mut u8;
@@ -894,13 +943,19 @@ unsafe fn poll_tx(s: &mut GemState) {
         if hn < 2 {
             // Partial-header reads shouldn't happen (IP writes header
             // + body atomically); count any that do for diagnostics.
-            if hn > 0 { s.tx_short_reads = s.tx_short_reads.wrapping_add(1); }
+            if hn > 0 {
+                s.tx_short_reads = s.tx_short_reads.wrapping_add(1);
+            }
             break;
         }
         let frame_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8);
-        if frame_len == 0 || frame_len > MAX_FRAME { break; }
+        if frame_len == 0 || frame_len > MAX_FRAME {
+            break;
+        }
         let n = (sys.channel_read)(s.in_chan, buf_ptr, frame_len) as i32;
-        if n <= 0 { break; }
+        if n <= 0 {
+            break;
+        }
         if (n as usize) < frame_len {
             // Body shorter than the header advertised — make the
             // anomaly visible in the heartbeat. The descriptor still
@@ -960,11 +1015,15 @@ unsafe fn check_link(s: &mut GemState) -> bool {
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { STATE_SIZE }
+pub extern "C" fn module_state_size() -> usize {
+    STATE_SIZE
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]

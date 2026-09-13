@@ -26,8 +26,8 @@ use crate::hash::fnv1a_hash;
 /// validation, module tests — walks these and only these, so a tier
 /// that resolves is a tier that builds and is tested. There is no
 /// flat `modules/<name>/` entry: §0.1's table has none, so neither
-/// does this. A project with a flat layout is unmigrated, and its
-/// modules do not resolve until it moves them into tiers.
+/// does this. A project with a flat layout has no resolvable modules
+/// until it moves them into tiers.
 ///
 /// `modules/common/` holds shared sources rather than modules; it
 /// carries no `manifest.toml`, and every consumer keys discovery off
@@ -166,17 +166,16 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // it returns ENOSYS until a host-controller driver lands.
         "usb_host" => Ok(0x15),
         // Host process executor (the impure boundary). Host-linux only; a node
-        // without the `proc` grant ENOSYS-denies. See sector architecture §5.
+        // without the `proc` grant ENOSYS-denies.
         "proc" => Ok(0x16),
         // "keyspace" (0x17) is not accepted here — the keyspace surface
-        // lives in lattice (see .context/fluxor_nanocloud.md §3); the ID
-        // stays reserved.
+        // lives in lattice; the ID stays reserved.
         // "oci" (0x18) / "netfilter" (0x19) are not accepted — host
         // isolation is declared as "workload" (0x1A); their mechanism is
         // that contract's Linux backend. The IDs stay reserved.
         // Platform-neutral isolated-workload surface (workload). Host-linux;
         // class byte matches provider::contract::WORKLOAD. Also requires the
-        // platform_raw permission. See .context/fluxor_nanocloud.md.
+        // platform_raw permission.
         "workload" => Ok(0x1A),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
@@ -223,9 +222,9 @@ pub fn contract_name_to_str(class: u8) -> &'static str {
         0x12 => "pcie_device",
         // Storage capability surfaces — kept in sync with
         // `provider::contract::STORAGE_{NAMESPACE,OBJECT}` (kernel)
-        // and `contract_id_from_name` (this file). Missing these
-        // pre-2026-05-19 caused error messages quoting bit 0x13/0x14
-        // of a required-caps mask to render the byte as "unknown".
+        // and `contract_id_from_name` (this file). Without these rows
+        // an error quoting bit 0x13/0x14 of a required-caps mask would
+        // render the byte as "unknown".
         0x13 => "storage.namespace",
         0x14 => "storage.object",
         0x15 => "usb_host",
@@ -619,7 +618,7 @@ pub struct PortSpec {
     /// diverges from the generic content-type default declares it
     /// here once, instead of every consuming config repeating a
     /// per-edge `rate:` override. `None` = fall back to the
-    /// content-type default (§ `resolve_edge_rate_class`).
+    /// content-type default (see `resolve_edge_rate_class`).
     pub rate_class_default: Option<fluxor_contracts::RateClass>,
     /// The capability the module wired to this port must declare.
     ///
@@ -711,6 +710,7 @@ pub mod permission {
     pub const PCIE_DEVICE: u16 = 1 << 6; // kernel-mediated PCIe device bind/config/BAR/MSI
     pub const DMA: u16 = 1 << 7; // DMA-arena buffer alloc + cache maintenance
     pub const OBSERVE: u16 = 1 << 8; // read-only telemetry-ring drain (TLM_SUBSCRIBE/DRAIN/STATS)
+    pub const USB_HOST: u16 = 1 << 9; // kernel-mediated USB host controller bind + transfers
 
     pub fn from_name(s: &str) -> Option<u16> {
         match s {
@@ -723,6 +723,7 @@ pub mod permission {
             "pcie_device" => Some(PCIE_DEVICE),
             "dma" => Some(DMA),
             "observe" => Some(OBSERVE),
+            "usb_host" => Some(USB_HOST),
             _ => None,
         }
     }
@@ -755,6 +756,9 @@ pub mod permission {
         }
         if bits & OBSERVE != 0 {
             out.push("observe");
+        }
+        if bits & USB_HOST != 0 {
+            out.push("usb_host");
         }
         out
     }
@@ -812,17 +816,17 @@ pub struct ManifestParam {
 }
 
 /// How a module's notion of time relates to the scheduler tick — governs
-/// whether it tolerates the adaptive-tick variable cadence (RFC adaptive_tick
-/// §8 D8 / AC5b). Declared in the manifest as `timer_class = "..."`.
+/// whether it tolerates the adaptive-tick variable cadence. Declared in the
+/// manifest as `timer_class = "..."`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TimerClass {
     /// No `timer_class` declared (field absent, or the module has no manifest).
-    /// The SAFE default per RFC adaptive_tick §8 rule 2: an unattested module is
+    /// The SAFE default: an unattested module is
     /// assumed step-counted, so mechanism (b) (variable cadence, bit 1) is
     /// BLOCKED on any domain hosting it until it POSITIVELY attests
     /// `wall_clock` or `agnostic`. Mechanism (a)-only domains still admit it
-    /// (idle-relax alone doesn't warp a running module; the §7.2/§7.3
-    /// liveness/replicated-clock gates cover (a)'s hazards by module type). This
+    /// (idle-relax alone doesn't warp a running module; the liveness and
+    /// replicated-clock gates cover (a)'s hazards by module type). This
     /// is distinct from an EXPLICIT `agnostic` — the absence of a declaration is
     /// not an attestation.
     #[default]
@@ -838,7 +842,7 @@ pub enum TimerClass {
     WallClock,
     /// Counts scheduler ticks/passes as a time proxy — its sense of time warps
     /// when the cadence varies (a relaxed tick stretches its timers). UNSAFE on
-    /// an adaptive domain; the validator rejects it (AC5b).
+    /// an adaptive domain; the validator rejects it.
     TickCounted,
     /// Needs a fixed-cadence WCET guarantee (a control loop / hard-real-time
     /// step). UNSAFE on a mechanism-(b) (variable-cadence) domain UNLESS the
@@ -980,8 +984,8 @@ pub struct Manifest {
     /// 32-byte block in the binary). Packaging (slot-image, mktable,
     /// combine) rejects a module whose attestation differs from the
     /// current surface — a stale `.fmod` built before an ABI renumbering
-    /// can no longer ride into a new image. `None` on legacy modules
-    /// packed before attestation existed (accepted, unverifiable).
+    /// cannot ride into a new image. `None` on a module packed without an
+    /// attestation (accepted, unverifiable).
     pub abi_surface: Option<[u8; 32]>,
     /// Ed25519 signature over the integrity hash. Set by the `fluxor sign`
     /// subcommand; absent on unsigned (v1) manifests.
@@ -1034,9 +1038,9 @@ pub struct Manifest {
     /// tool does not statically verify it. The flag is mandatory for
     /// admission into a Tier 1b (`domain_exec_mode == 2`) or Tier 2
     /// (`domain_exec_mode == 4`) domain — modules without it are
-    /// rejected at build time. See
-    /// `.context/rfc_isr_tier_surface.md` §D7 for the contract this
-    /// flag attests to and §Step-3 for the validator that enforces it.
+    /// rejected at build time. The runtime backstop is the EACCES check
+    /// the scheduler applies to every syscall an ISR-tier module is
+    /// barred from making.
     pub isr_safe: bool,
     /// Module attests that it can resume after an arbitrary fault, and is
     /// therefore eligible for `fault_policy: restart`. That policy releases
@@ -1056,8 +1060,7 @@ pub struct Manifest {
     /// The author owns this claim; the tool does not statically verify it.
     /// Absent ⇒ `false`, and the config validator refuses the policy.
     /// TOML-only, never serialized to the binary manifest: the policy it
-    /// gates is itself a compose-time choice. See
-    /// `.context/rfc_fault_resume_contract.md`.
+    /// gates is itself a compose-time choice.
     pub resume_after_fault: bool,
     /// Module opts into the **Tier 1c pre-pass drain slot**. Pre-tick
     /// modules run cooperatively at the *start* of every scheduler
@@ -1068,9 +1071,7 @@ pub struct Manifest {
     /// (heap + `provider_call` + `channel_read`/`write`); the only
     /// new contract is a shared combined cycle budget across all
     /// pre-tick modules in a domain (kernel default
-    /// `MAX_PRE_TICK_BUDGET_US = 5`). See
-    /// `.context/rfc_isr_tier_surface.md` §D8 for the contract and
-    /// motivating measurement.
+    /// `MAX_PRE_TICK_BUDGET_US = 5`).
     pub pre_tick_drain: bool,
     /// Hardware-feature requirements declared by the module.
     /// Validated against the resolved target's silicon capability
@@ -1086,12 +1087,21 @@ pub struct Manifest {
     /// rustc `opt-level` for the wasm target. TOML-only, never
     /// serialized to the binary. `None` keeps the build default.
     pub wasm_opt_level: Option<String>,
+    /// `[build] opt_level = "0"|"1"|"2"|"3"|"s"|"z"` — per-module rustc
+    /// `opt-level` for a native target. TOML-only, never serialized.
+    /// `None` keeps the build default.
+    ///
+    /// The loader admits a bounded amount of code per module, and a module
+    /// that links a whole engine can reach it. Building that one for size
+    /// where the default builds for speed is the alternative to making every
+    /// module slower, or to leaving the one that is nearly over with no room.
+    pub opt_level: Option<String>,
     /// Built-in parameter declarations from `[[params]]` (toml-only).
     /// `.fmod` modules carry their schema embedded in the binary; built-ins
     /// declare it here so the config tool can validate YAML and pack TLV.
     pub params: Vec<ManifestParam>,
-    /// How the module's timekeeping relates to the scheduler tick (RFC
-    /// adaptive_tick §8 D8 / AC5b). Default `Unattested` (no declaration). The
+    /// How the module's timekeeping relates to the scheduler tick. Default
+    /// `Unattested` (no declaration). The
     /// config validator rejects `TickCounted`/`Guaranteed` on any adaptive
     /// domain, and on a mechanism-(b) domain requires a POSITIVE attestation
     /// (`wall_clock` or `agnostic`) — `Unattested` is fail-closed for (b).
@@ -1139,6 +1149,7 @@ impl Default for Manifest {
             requires: TomlRequires::default(),
             requires_when: Vec::new(),
             wasm_opt_level: None,
+            opt_level: None,
             params: Vec::new(),
             timer_class: TimerClass::Unattested,
             step_period_ticks: 0,
@@ -1164,7 +1175,7 @@ pub struct Observability {
     /// Per-instrument metadata (`[[observability.instrument]]`): kind,
     /// declared histogram bounds, and declared dimension domains. Optional
     /// per instrument — a name in `metrics` with no row here is a plain
-    /// dimensionless counter, which is what every pre-§12 manifest declares
+    /// dimensionless counter, which is what a name with no row declares
     /// implicitly.
     pub instruments: Vec<InstrumentDecl>,
 }
@@ -1367,7 +1378,7 @@ fn validate_instruments(obs: &Observability) -> Result<()> {
         }
         if product > DIM_MAX_PRODUCT as u64 {
             return Err(ctx(format!(
-                "declared dimension domains multiply to {product} series, over the                  {DIM_MAX_PRODUCT} the composite u16 index can carry (rfc §12.3);                  shrink a domain — cardinality is a declared resource bound"
+                "declared dimension domains multiply to {product} series, over the                  {DIM_MAX_PRODUCT} the composite u16 index can carry;                  shrink a domain — cardinality is a declared resource bound"
             )));
         }
     }
@@ -2223,13 +2234,12 @@ impl Manifest {
             capacities.insert(name, resolved);
         }
 
-        let wasm_opt_level = match toml_val.build.and_then(|b| b.wasm_opt_level) {
-            Some(level) => {
-                validate_wasm_opt_level(&level)?;
-                Some(level)
-            }
-            None => None,
-        };
+        let build = toml_val.build.unwrap_or_default();
+        let wasm_opt_level = build.wasm_opt_level;
+        let opt_level = build.opt_level;
+        for level in [&wasm_opt_level, &opt_level].into_iter().flatten() {
+            validate_wasm_opt_level(level)?;
+        }
 
         Ok(Manifest {
             module_version,
@@ -2257,6 +2267,7 @@ impl Manifest {
             requires: toml_val.requires,
             requires_when,
             wasm_opt_level,
+            opt_level,
             params,
             timer_class,
             step_period_ticks,
@@ -2322,13 +2333,12 @@ impl Manifest {
         //                  bit through `LoadedModule.manifest`, but
         //                  the loader does NOT currently re-check it
         //                  at instantiation — the runtime gate today
-        //                  is the §D7 EACCES check on every gated
+        //                  is the EACCES check on every gated
         //                  syscall (`scheduler::deny_isr_tier_syscall`).
         //                  A loader-side defense-in-depth check that
         //                  mirrors the build-time one would still be
         //                  worth adding for hand-rolled binaries.
-        //          bit 3 = pre_tick_drain (Tier 1c opt-in; see
-        //                  `.context/rfc_isr_tier_surface.md` §D8).
+        //          bit 3 = pre_tick_drain (Tier 1c opt-in).
         //                  Read by `prepare_graph` to populate
         //                  `domain_pre_tick_order` and exclude the
         //                  module from `domain_exec_order`.
@@ -2597,6 +2607,7 @@ impl Manifest {
             requires: TomlRequires::default(),
             requires_when: Vec::new(), // toml-only, not serialized
             wasm_opt_level: None,      // toml-only, not serialized
+            opt_level: None,           // toml-only, not serialized
             params: Vec::new(),        // toml-only, not serialized
             // timer_class is a TOML-only build-time concern (drives the config
             // validator's adaptive-tick gate); not serialized into the binary, so
@@ -2829,8 +2840,7 @@ struct TomlManifest {
     params: Option<Vec<TomlParam>>,
     /// `timer_class = "agnostic"|"wall_clock"|"tick_counted"|"guaranteed"` —
     /// how the module's timekeeping relates to the scheduler tick. Absent ⇒
-    /// `Unattested` (fail-closed on mechanism (b)). See `TimerClass`
-    /// (RFC adaptive_tick §8 D8 / AC5b).
+    /// `Unattested` (fail-closed on mechanism (b)). See `TimerClass`.
     timer_class: Option<String>,
     /// `step_period_ticks = N` — coarse-step period: run this module every N
     /// scheduler ticks (0/absent = every tick). Wired into ABI header byte 1.
@@ -2912,12 +2922,14 @@ impl TomlExecution {
 }
 
 /// `[build]` manifest table: per-module build configuration.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct TomlBuild {
     /// rustc `opt-level` for the wasm target (`"0"`–`"3"`, `"s"`,
     /// `"z"`). Absent keeps the build default.
     wasm_opt_level: Option<String>,
+    /// rustc `opt-level` for a native target. Absent keeps the default.
+    opt_level: Option<String>,
 }
 
 /// The accepted `wasm_opt_level` values — rustc's `opt-level` set.
@@ -3001,7 +3013,7 @@ pub struct TomlRequires {
     /// intrinsics simply don't exist (link error or panic at runtime).
     pub neon: bool,
     /// Memory-management unit with page-table isolation. Modules that
-    /// rely on `rfc_virtual_memory` paged arenas declare this; the
+    /// rely on paged arenas declare this; the
     /// build rejects placement on Cortex-M / Cortex-A targets without
     /// an MMU (RP2350 has an MPU but not an MMU).
     pub mmu: bool,
@@ -3104,7 +3116,7 @@ pub fn check_target_capabilities(manifest_requires: TomlRequires, silicon: &str)
         Err(Error::Module(format!(
             "module's `[requires]` declares {} but silicon `{}` does not provide them. \
              Either place this module on a target with those caps, or drop the requirement \
-             if it's no longer needed.",
+             if the module does not need it.",
             missing.join(", "),
             silicon,
         )))
@@ -3742,7 +3754,7 @@ required = true
     /// The ABI-surface attestation block must round-trip through the binary
     /// codec, coexist with integrity+signature blocks (it is appended LAST,
     /// so the kernel's offset math over earlier blocks is untouched), and
-    /// stay optional for legacy manifests.
+    /// stay optional for a manifest that carries no attestation.
     #[test]
     fn abi_surface_attestation_round_trips() {
         let mut m = Manifest {
@@ -3759,7 +3771,7 @@ required = true
         assert_eq!(back.signature, Some([0x22; 64]));
         assert_eq!(back.signer_fp, Some([0x33; 32]));
 
-        // Legacy manifest (no attestation) still round-trips as None.
+        // A manifest with no attestation round-trips as None.
         m.abi_surface = None;
         let back = Manifest::from_bytes(&m.to_bytes()).expect("decode legacy");
         assert_eq!(back.abi_surface, None);

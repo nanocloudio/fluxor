@@ -393,8 +393,7 @@ Ownership is *reported*, and enforcement of a per-owner policy is a separate
 question answered by `query_key::CALLER_OWNER`: the owner of the module that
 invoked the current provider frame. It is a query rather than an argument on
 `provider_call` because widening that signature is a positional-ABI flag day
-across every module for a fact the kernel already holds. See
-`.context/rfc_fs_object_model.md`.
+across every module for a fact the kernel already holds.
 
 Publication lives on the byte-tier surface rather than moving to
 `storage.namespace` because `OPEN_CREATE` and `MKDIR` are already the

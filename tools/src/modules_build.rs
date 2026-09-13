@@ -9,7 +9,7 @@
 //! <out>/<silicon>/modules/<name>.{wasm,fmod}       (wasm target)
 //! ```
 //!
-//! `<out>` defaults to `<project_root>/target/fluxor`. The legacy
+//! `<out>` defaults to `<project_root>/target/fluxor`. The flat
 //! `<project_root>/target/<silicon>/` layout is selected by passing
 //! `--out target`.
 
@@ -164,7 +164,7 @@ struct Candidate {
     name: String,
     /// Name embedded in the fmod header — always the base module type.
     /// Graphs bind by `fnv1a(type_name)`, so this must never carry a
-    /// variant suffix (RFC module_variants §4.2).
+    /// variant suffix.
     embed_name: String,
     dir: PathBuf,
     entry: PathBuf,
@@ -184,13 +184,16 @@ struct Candidate {
     /// feature cfg arguments at all.
     features: Vec<String>,
     /// Accepted values for `--check-cfg=cfg(feature, values(…))`: the
-    /// union of every variant's features plus the pre-existing
-    /// `host-test` cfg. Only populated (and only emitted) for variant
+    /// union of every variant's features plus the `host-test` cfg.
+    /// Only populated (and only emitted) for variant
     /// candidates.
     check_cfg_features: Vec<String>,
     /// `[build] wasm_opt_level` from the manifest — per-module rustc
     /// `opt-level` for the wasm target. `None` keeps the default.
     wasm_opt_level: Option<String>,
+    /// `[build] opt_level` from the manifest — per-module rustc
+    /// `opt-level` for a native target. `None` keeps the default.
+    opt_level: Option<String>,
     /// `builtin = true`: a declaration of a kernel-resident module.
     /// Inventoried, never built — it has no source of its own.
     builtin: bool,
@@ -227,10 +230,12 @@ struct ManifestRaw {
 /// Raw `[build]` table as discovery sees it — only the key the build
 /// itself consumes. Full validation shares
 /// `manifest::validate_wasm_opt_level` with the manifest parse.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct BuildRaw {
     #[serde(default)]
     wasm_opt_level: Option<String>,
+    #[serde(default)]
+    opt_level: Option<String>,
 }
 
 /// Raw `[[variant]]` row as discovery sees it. Full validation
@@ -317,8 +322,10 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                 )));
             }
             let hardware_targets = raw.hardware_targets.unwrap_or_default();
-            let wasm_opt_level = raw.build.and_then(|b| b.wasm_opt_level);
-            if let Some(level) = &wasm_opt_level {
+            let build = raw.build.unwrap_or_default();
+            let wasm_opt_level = build.wasm_opt_level;
+            let opt_level = build.opt_level;
+            for level in [&wasm_opt_level, &opt_level].into_iter().flatten() {
                 crate::manifest::validate_wasm_opt_level(level)
                     .map_err(|e| Error::Module(format!("{}: {e}", manifest.display())))?;
             }
@@ -336,6 +343,7 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                     features: Vec::new(),
                     check_cfg_features: Vec::new(),
                     wasm_opt_level: wasm_opt_level.clone(),
+                    opt_level: opt_level.clone(),
                     builtin,
                 }),
                 Some(variants) => {
@@ -351,8 +359,8 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                         )));
                     }
                     // `--check-cfg` accepted values: union of every
-                    // variant's features + the pre-existing `host-test`
-                    // cfg the SDK dual-build uses.
+                    // variant's features + the `host-test` cfg the SDK
+                    // dual-build uses.
                     let mut all: Vec<String> = variants
                         .iter()
                         .flat_map(|v| v.features.iter().cloned())
@@ -379,6 +387,7 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                             features: v.features.clone(),
                             check_cfg_features: all.clone(),
                             wasm_opt_level: wasm_opt_level.clone(),
+                            opt_level: opt_level.clone(),
                             builtin,
                         });
                     }
@@ -443,9 +452,10 @@ fn cfg_feature_args(cand: &Candidate) -> Vec<String> {
 /// Preference order:
 ///   1. Manifest `type = "Source"|"Transformer"|…|"Protocol"` —
 ///      authoritative when present.
-///   2. Legacy name table from the Makefile's `mod_type` macro,
-///      hardcoded here for byte-identical output with the shell
-///      loop. Migrate to manifest `type = "..."` to drop the row.
+///   2. Name table mirroring the Makefile's `mod_type` macro,
+///      hardcoded here so the output is byte-identical to the
+///      shell loop's. A module declaring `type = "..."` in its
+///      manifest needs no row.
 ///   3. Default `Transformer` (2).
 fn resolve_type_id(name: &str, manifest_type: Option<&str>) -> u8 {
     if let Some(t) = manifest_type {
@@ -1019,15 +1029,23 @@ fn compile_module_pic(
         .arg(&cand.edition)
         .arg("--target")
         .arg(spec.module_target)
-        .arg("-O")
+        .arg("-C")
+        .arg(format!(
+            "opt-level={}",
+            // `-O` is opt-level=2. A module that names its own takes it:
+            // one that links a whole engine may need the smaller code more
+            // than the faster code, and that is its own trade rather than
+            // every module's.
+            cand.opt_level.as_deref().unwrap_or("2")
+        ))
         .arg("-C")
         .arg("relocation-model=pic")
         .args(spec.extra_rustflags)
         .args(cfg_feature_args(cand));
     if opts.strict {
         // `-D warnings` upgrades unfulfilled `#[expect(...)]` and
-        // every other warning into a hard error, matching the
-        // standard's §4 strict mode.
+        // every other warning into a hard error, which is what a
+        // strict build means.
         rustc.arg("-D").arg("warnings");
     } else {
         rustc.arg("-W").arg("warnings");
@@ -1125,7 +1143,7 @@ fn compile_module_wasm(
             .collect::<Vec<_>>()
             .join(" | ");
         // A module that declares `wasm` in `hardware_targets` must compile for
-        // wasm, so a failure there is a real regression (an SDK ABI change, say)
+        // wasm, so a failure there is real breakage (an SDK ABI change, say)
         // and fails the build. A module that does not claim wasm is legitimately
         // not a wasm payload, and skipping it is correct.
         if cand.hardware_targets.iter().any(|t| t == "wasm") {
@@ -1467,9 +1485,9 @@ mod tests {
 
     #[test]
     fn resolve_type_id_falls_back_to_legacy_name_table() {
-        // Manifests today don't carry `type = "..."`; the Makefile's
-        // mod_type macro hardcodes these. Keeping byte-identical
-        // outputs prevents an .fmod regression on the swap.
+        // A manifest with no `type = "..."` falls back to the name
+        // table the Makefile's mod_type macro hardcodes; the two must
+        // agree byte for byte.
         assert_eq!(resolve_type_id("cyw43", None), 5);
         assert_eq!(resolve_type_id("enc28j60", None), 5);
         assert_eq!(resolve_type_id("i2s_pio", None), 3);
@@ -1546,6 +1564,7 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
             wasm_opt_level: None,
+            opt_level: None,
             builtin: false,
         };
         assert!(matches_target(&c, "rp2350", "rp2350"));
@@ -1567,6 +1586,7 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
             wasm_opt_level: None,
+            opt_level: None,
             builtin: false,
         };
         // Host target "linux" matches via its module silicon (bcm2712).
@@ -1590,6 +1610,7 @@ mod tests {
             features: Vec::new(),
             check_cfg_features: Vec::new(),
             wasm_opt_level: None,
+            opt_level: None,
             builtin: false,
         };
         // Manifest pinned to the raw host token — the target-string

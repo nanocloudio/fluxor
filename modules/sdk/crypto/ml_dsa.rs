@@ -442,8 +442,27 @@ fn make_hint(z: i32, r: i32, gamma2: i32) -> bool {
 
 /// UseHint: recover the signer's high bits from the verifier's
 /// approximation plus one bit.
+///
+/// `gamma2` is a FIPS 204 parameter-set constant and is always positive, but
+/// the compiler cannot see that through the parameter — so it emits the
+/// division-by-zero and remainder-overflow panic paths. In a PIC module those
+/// are undefined symbols at link time rather than a runtime abort, because
+/// `core::panicking` is not in the symbol set a module links against.
+///
+/// The guard below is therefore not defensive programming, it is what makes
+/// the function linkable: past it the compiler knows the divisor is positive,
+/// so neither panic path is generated. Returning zero for an impossible
+/// parameter set is the safe direction — it yields a wrong signature check,
+/// which fails closed, rather than a module that will not load at all.
 fn use_hint(hint: bool, r: i32, gamma2: i32) -> i32 {
-    let m = (Q - 1) / (2 * gamma2);
+    let two_gamma2 = 2 * gamma2;
+    if two_gamma2 <= 0 {
+        return 0;
+    }
+    let m = (Q - 1) / two_gamma2;
+    if m <= 0 {
+        return 0;
+    }
     let (r1, r0) = decompose(r, gamma2);
     if !hint {
         r1

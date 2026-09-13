@@ -502,10 +502,7 @@ unsafe fn serialize_checkpoint(
     // can still put on the wire: the same nonce under the same key. The
     // send counter is folded in only because two emit paths advance it
     // without drawing on the reservation.
-    let hw = c
-        .send_pn_res
-        .high_water()
-        .max(c.one_rtt.next_send_pn);
+    let hw = c.send_pn_res.high_water().max(c.one_rtt.next_send_pn);
     w.u64(hw);
     w.u64(c.one_rtt.largest_recv_pn);
     // Key-update progress, so a takeover mid-update neither starts a second
@@ -983,7 +980,16 @@ unsafe fn import_checkpoint(
         return sc::STATUS_CORRUPT;
     }
     let hl = secret_len as usize;
-    if n < 4 * hl + 2 * QUIC_HP_KEY_LEN + 1 + QUIC_KEY_LEN + QUIC_IV_LEN + QUIC_HP_KEY_LEN + 1 + 48 + 2 {
+    if n < 4 * hl
+        + 2 * QUIC_HP_KEY_LEN
+        + 1
+        + QUIC_KEY_LEN
+        + QUIC_IV_LEN
+        + QUIC_HP_KEY_LEN
+        + 1
+        + 48
+        + 2
+    {
         // Zeroize before bailing.
         let mut z = 0;
         while z < n {
@@ -1084,10 +1090,7 @@ unsafe fn activate_shadow(
     };
     // The floor the checkpoint carried, seeded into the shadow's reservation
     // at import; any delta since may have raised it.
-    let floor = conn
-        .send_pn_res
-        .high_water()
-        .max(conn.one_rtt.next_send_pn);
+    let floor = conn.send_pn_res.high_water().max(conn.one_rtt.next_send_pn);
     s.conns[idx] = conn;
     let c = &mut s.conns[idx];
     c.phase = ConnPhase::Established;
@@ -1481,7 +1484,10 @@ unsafe fn mirror_delta(
     kind: u8,
     data: &[u8],
 ) -> u32 {
-    if cont_out < 0 || !conn.cont_mirror || data.len() > MIRROR_DELTA_MAX - sc::DELTA_APPLY_HEADER_LEN {
+    if cont_out < 0
+        || !conn.cont_mirror
+        || data.len() > MIRROR_DELTA_MAX - sc::DELTA_APPLY_HEADER_LEN
+    {
         return 0;
     }
     let no = conn.cont_delta_no.wrapping_add(1);
@@ -2010,7 +2016,14 @@ unsafe fn cont_apply_pair_prepare(s: &mut QuicState, payload: &[u8]) {
             // A self-granted block can be refilled at will, so no floor
             // recorded here bounds what this host may still emit. Crash
             // continuity needs a reservation only a directory grants.
-            cont_reply(s, flow, epoch, sc::CR_PAIR_PREPARED, sc::STATUS_UNSUPPORTED, &[]);
+            cont_reply(
+                s,
+                flow,
+                epoch,
+                sc::CR_PAIR_PREPARED,
+                sc::STATUS_UNSUPPORTED,
+                &[],
+            );
             return;
         }
         s.conns[idx].cont_profile = profile;

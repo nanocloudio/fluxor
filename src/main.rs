@@ -17,7 +17,7 @@
     reason = "embedded firmware binary: boot/exception vectors, MMIO, and raw stack setup"
 )]
 
-// RP family (RP2040, RP2350A/B) — Cortex-M, embassy async runtime
+// RP family (RP2040, RP2350A/B) — Cortex-M; runtime selected by feature
 #[cfg(feature = "rp")]
 include!("platform/rp.rs");
 

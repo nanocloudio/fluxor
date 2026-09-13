@@ -11,12 +11,12 @@
 //! also carries a fenced machine-checked block naming, for each ceiling, the
 //! `const` and the source file it must still be declared in:
 //!
-//! ```text
+//! ````text
 //! ```limit-register
 //! MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536
 //! MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | -
 //! ```
-//! ```
+//! ````
 //!
 //! `NAME | source path | right-hand side`. The RHS is compared textually
 //! after whitespace normalisation, so `2 * MAX_SNAPSHOT` is checked as the

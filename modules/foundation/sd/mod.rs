@@ -39,20 +39,21 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 #[path = "../../sdk/abi.rs"]
 mod abi;
+use abi::contracts::hal::spi::{
+    OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs,
+};
 use abi::SyscallTable;
-use abi::contracts::hal::spi::{OpenArgs as SpiOpenArgs, TransferStartArgs as SpiTransferStartArgs};
 
 // Provider contract ids (mirror kernel::module::provider::contract::*).
 const HAL_GPIO_CONTRACT: u32 = 0x0001;
-const HAL_SPI_CONTRACT:  u32 = 0x0002;
-const TIMER_CONTRACT:    u32 = 0x0006;
+const HAL_SPI_CONTRACT: u32 = 0x0002;
+const TIMER_CONTRACT: u32 = 0x0006;
 
 // ============================================================================
 // Module Parameters
@@ -97,16 +98,15 @@ const TOKEN_DATA: u8 = 0xFE;
 /// Timeout for SPI bus claim
 const CLAIM_TIMEOUT_MS: u64 = 50;
 
-
 // SD Commands
-const CMD0: u8 = 0;    // GO_IDLE_STATE
-const CMD8: u8 = 8;    // SEND_IF_COND
-const CMD9: u8 = 9;    // SEND_CSD
-const CMD16: u8 = 16;  // SET_BLOCKLEN
-const CMD17: u8 = 17;  // READ_SINGLE_BLOCK
-const CMD55: u8 = 55;  // APP_CMD prefix
+const CMD0: u8 = 0; // GO_IDLE_STATE
+const CMD8: u8 = 8; // SEND_IF_COND
+const CMD9: u8 = 9; // SEND_CSD
+const CMD16: u8 = 16; // SET_BLOCKLEN
+const CMD17: u8 = 17; // READ_SINGLE_BLOCK
+const CMD55: u8 = 55; // APP_CMD prefix
 const ACMD41: u8 = 41; // SD_SEND_OP_COND (app command)
-const CMD58: u8 = 58;  // READ_OCR
+const CMD58: u8 = 58; // READ_OCR
 
 // R1 Response bits
 const R1_IDLE_STATE: u8 = 1 << 0;
@@ -121,7 +121,6 @@ const BLOCK_SIZE: usize = 512;
 //
 // Module-specific error codes returned by module_step().
 // Negative values indicate errors; the magnitude indicates the error type.
-
 
 /// Initialization failed
 const E_INIT_FAILED: i32 = -20;
@@ -403,8 +402,8 @@ impl SdState {
 
 mod params_def {
     use super::SdState;
-    use super::{p_u8, p_u32};
     use super::SCHEMA_MAX;
+    use super::{p_u32, p_u8};
 
     define_params! {
         SdState;
@@ -594,8 +593,13 @@ unsafe fn spi_transfer_start(s: &mut SdState, tx: *const u8, rx: *mut u8, len: u
         fill: 0xFF,
         _pad: [0; 3],
     };
-    if (s.sys().provider_call)(s.spi_handle, 0x0207, &mut args as *mut _ as *mut u8,
-        core::mem::size_of::<SpiTransferStartArgs>()) < 0 {
+    if (s.sys().provider_call)(
+        s.spi_handle,
+        0x0207,
+        &mut args as *mut _ as *mut u8,
+        core::mem::size_of::<SpiTransferStartArgs>(),
+    ) < 0
+    {
         return false;
     }
     s.spi_state = SpiXfer::Pending;
@@ -665,7 +669,14 @@ unsafe fn poll_or_start_byte(s: &mut SdState) -> i32 {
 // Command Layer (send_cmd)
 // ============================================================================
 
-unsafe fn send_cmd_start(s: &mut SdState, cmd: u8, arg: u32, crc: u8, release: bool, extra_bytes: u8) {
+unsafe fn send_cmd_start(
+    s: &mut SdState,
+    cmd: u8,
+    arg: u32,
+    crc: u8,
+    release: bool,
+    extra_bytes: u8,
+) {
     s.cmd_buf = [
         0x40 | cmd,
         (arg >> 24) as u8,
@@ -1099,9 +1110,11 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
             SdInitPhase::Claiming => {
                 let start_ms = load_ms(s.init_start_ms_lo, s.init_start_ms_hi);
                 let mut timeout = 0u32.to_le_bytes();
-                let claim_rc = (s.sys().provider_call)(s.spi_handle, 0x0205, timeout.as_mut_ptr(), 4);
+                let claim_rc =
+                    (s.sys().provider_call)(s.spi_handle, 0x0205, timeout.as_mut_ptr(), 4);
                 if claim_rc == 0 {
-                    let begin_rc = (s.sys().provider_call)(s.spi_handle, 0x0202, core::ptr::null_mut(), 0);
+                    let begin_rc =
+                        (s.sys().provider_call)(s.spi_handle, 0x0202, core::ptr::null_mut(), 0);
                     if begin_rc < 0 {
                         log_info(s, b"[sd] spi_begin failed");
                         fail!(s);
@@ -1218,7 +1231,15 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
 
             SdInitPhase::Acmd41v2Start => {
                 // HCS bit (0x40000000) indicates host supports SDHC
-                start_cmd!(s, ACMD41, 0x4000_0000, 0, true, 0, SdInitPhase::Acmd41v2Wait);
+                start_cmd!(
+                    s,
+                    ACMD41,
+                    0x4000_0000,
+                    0,
+                    true,
+                    0,
+                    SdInitPhase::Acmd41v2Wait
+                );
             }
 
             SdInitPhase::Acmd41v2Wait => {
@@ -1247,7 +1268,7 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
                 wait_cmd!(s, {
                     // CCS bit indicates SDHC (block addressing)
                     if s.cmd_extra[0] & 0x40 != 0 {
-                        s.cdv = 1;  // SDHC: address in blocks
+                        s.cdv = 1; // SDHC: address in blocks
                     } else {
                         s.cdv = 512; // Standard: address in bytes
                     }
@@ -1335,7 +1356,15 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
             // CMD16: Set block length to 512 bytes
             // ----------------------------------------------------------------
             SdInitPhase::Cmd16Start => {
-                start_cmd!(s, CMD16, BLOCK_SIZE as u32, 0, true, 0, SdInitPhase::Cmd16Wait);
+                start_cmd!(
+                    s,
+                    CMD16,
+                    BLOCK_SIZE as u32,
+                    0,
+                    true,
+                    0,
+                    SdInitPhase::Cmd16Wait
+                );
             }
 
             SdInitPhase::Cmd16Wait => {
@@ -1354,7 +1383,13 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
             // ----------------------------------------------------------------
             SdInitPhase::ConfigureDataFreq => {
                 let freq_bytes = DATA_FREQ.to_le_bytes();
-                let mut cfg_arg = [freq_bytes[0], freq_bytes[1], freq_bytes[2], freq_bytes[3], 0u8];
+                let mut cfg_arg = [
+                    freq_bytes[0],
+                    freq_bytes[1],
+                    freq_bytes[2],
+                    freq_bytes[3],
+                    0u8,
+                ];
                 let sys = &*s.syscalls;
                 let _ = (sys.provider_call)(s.spi_handle, 0x0206, cfg_arg.as_mut_ptr(), 5);
                 s.init_state = SdInitPhase::Done;
@@ -1395,9 +1430,15 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() { return -5; }
-        if state_size < core::mem::size_of::<SdState>() { return -6; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() {
+            return -5;
+        }
+        if state_size < core::mem::size_of::<SdState>() {
+            return -6;
+        }
 
         let s = &mut *(state as *mut SdState);
         s.init(syscalls as *const SyscallTable);
@@ -1405,8 +1446,8 @@ pub extern "C" fn module_new(
         s.out_chan = out_chan;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -1425,10 +1466,11 @@ pub extern "C" fn module_new(
         // Open a GPIO output handle for CS — tracked against HAL_GPIO.
         let cs_pin = s.cs_pin;
         let mut gpio_arg = [cs_pin];
-        let cs_handle = (s.sys().provider_open)(
-            HAL_GPIO_CONTRACT, 0x0106, gpio_arg.as_mut_ptr(), 1,
-        );
-        if cs_handle < 0 { return -10; }
+        let cs_handle =
+            (s.sys().provider_open)(HAL_GPIO_CONTRACT, 0x0106, gpio_arg.as_mut_ptr(), 1);
+        if cs_handle < 0 {
+            return -10;
+        }
         let mut lvl = [1u8];
         (s.sys().provider_call)(cs_handle, 0x0104, lvl.as_mut_ptr(), 1);
 
@@ -1442,17 +1484,20 @@ pub extern "C" fn module_new(
             _pad: [0; 2],
         };
         s.spi_handle = (s.sys().provider_open)(
-            HAL_SPI_CONTRACT, 0x0200,
+            HAL_SPI_CONTRACT,
+            0x0200,
             &mut spi_args as *mut _ as *mut u8,
             core::mem::size_of::<SpiOpenArgs>(),
         );
-        if s.spi_handle < 0 { return -12; }
+        if s.spi_handle < 0 {
+            return -12;
+        }
 
         // Open a timer fd for init retry delays (TIMER::CREATE = 0x0604).
-        s.timer_fd = (s.sys().provider_open)(
-            TIMER_CONTRACT, 0x0604, core::ptr::null_mut(), 0,
-        );
-        if s.timer_fd < 0 { return -13; }
+        s.timer_fd = (s.sys().provider_open)(TIMER_CONTRACT, 0x0604, core::ptr::null_mut(), 0);
+        if s.timer_fd < 0 {
+            return -13;
+        }
 
         s.init_state = SdInitPhase::Idle;
         s.mod_state = SdModPhase::Reading;
@@ -1483,11 +1528,7 @@ unsafe fn try_write_block(s: &mut SdState) -> WriteResult {
     let offset = s.pending_offset as usize;
     let remaining = BLOCK_SIZE - offset;
 
-    let written = (s.sys().channel_write)(
-        s.out_chan,
-        s.block_buf.as_ptr().add(offset),
-        remaining,
-    );
+    let written = (s.sys().channel_write)(s.out_chan, s.block_buf.as_ptr().add(offset), remaining);
 
     if written < 0 {
         if written == E_AGAIN {
@@ -1532,9 +1573,13 @@ unsafe fn check_seek_request(s: &SdState) -> u32 {
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut SdState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
 
         // Module-scope telemetry: emit cumulative blocks delivered on a slow
         // cadence (no-op when the telemetry port is unwired). id 0 = blocks_read.
@@ -1612,17 +1657,31 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let tag = b"[sd] E";
                     let mut p = 0usize;
                     let mut t = 0usize;
-                    while t < tag.len() { *lb.as_mut_ptr().add(p) = *tag.as_ptr().add(t); p += 1; t += 1; }
+                    while t < tag.len() {
+                        *lb.as_mut_ptr().add(p) = *tag.as_ptr().add(t);
+                        p += 1;
+                        t += 1;
+                    }
                     // Error code (negate to get positive)
                     let ecode = (0i32.wrapping_sub(res)) as u32;
                     p += fmt_u32_raw(lb.as_mut_ptr().add(p), ecode);
                     let at = b" @";
-                    t = 0; while t < at.len() { *lb.as_mut_ptr().add(p) = *at.as_ptr().add(t); p += 1; t += 1; }
+                    t = 0;
+                    while t < at.len() {
+                        *lb.as_mut_ptr().add(p) = *at.as_ptr().add(t);
+                        p += 1;
+                        t += 1;
+                    }
                     p += fmt_u32_raw(lb.as_mut_ptr().add(p), s.current_block);
                     if res == -6 {
                         // Also log R1 response byte
                         let r1t = b" R1=";
-                        t = 0; while t < r1t.len() { *lb.as_mut_ptr().add(p) = *r1t.as_ptr().add(t); p += 1; t += 1; }
+                        t = 0;
+                        while t < r1t.len() {
+                            *lb.as_mut_ptr().add(p) = *r1t.as_ptr().add(t);
+                            p += 1;
+                            t += 1;
+                        }
                         p += fmt_u32_raw(lb.as_mut_ptr().add(p), s.rb_attempts as u32);
                     }
                     dev_log(s.sys(), 3, lb.as_ptr(), p);

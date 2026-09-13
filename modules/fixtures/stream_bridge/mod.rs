@@ -97,7 +97,15 @@ unsafe fn send_bind(s: &mut BridgeState) {
     let sys = &*s.syscalls;
     let p = s.port.to_le_bytes();
     let mut scratch = [0u8; 8];
-    net_write_frame(sys, s.net_out, NET_CMD_BIND, p.as_ptr(), 2, scratch.as_mut_ptr(), 8);
+    net_write_frame(
+        sys,
+        s.net_out,
+        NET_CMD_BIND,
+        p.as_ptr(),
+        2,
+        scratch.as_mut_ptr(),
+        8,
+    );
 }
 
 unsafe fn send_connect(s: &mut BridgeState) {
@@ -108,14 +116,30 @@ unsafe fn send_connect(s: &mut BridgeState) {
     p[5..7].copy_from_slice(&s.port.to_le_bytes());
     p[7] = s.my_tag;
     let mut scratch = [0u8; 12];
-    net_write_frame(sys, s.net_out, NET_CMD_CONNECT, p.as_ptr(), 8, scratch.as_mut_ptr(), 12);
+    net_write_frame(
+        sys,
+        s.net_out,
+        NET_CMD_CONNECT,
+        p.as_ptr(),
+        8,
+        scratch.as_mut_ptr(),
+        12,
+    );
 }
 
 unsafe fn send_close(s: &mut BridgeState, conn: u16) {
     let sys = &*s.syscalls;
     let p = conn.to_le_bytes();
     let mut scratch = [0u8; 8];
-    net_write_frame(sys, s.net_out, NET_CMD_CLOSE, p.as_ptr(), 2, scratch.as_mut_ptr(), 8);
+    net_write_frame(
+        sys,
+        s.net_out,
+        NET_CMD_CLOSE,
+        p.as_ptr(),
+        2,
+        scratch.as_mut_ptr(),
+        8,
+    );
 }
 
 unsafe fn service_net(s: &mut BridgeState) {
@@ -127,7 +151,11 @@ unsafe fn service_net(s: &mut BridgeState) {
             break;
         }
         let p = s.buf.as_ptr().add(3);
-        let id = if plen >= 2 { (*p as u16) | ((*p.add(1) as u16) << 8) } else { NO_CONN };
+        let id = if plen >= 2 {
+            (*p as u16) | ((*p.add(1) as u16) << 8)
+        } else {
+            NO_CONN
+        };
         match msg {
             NET_MSG_BOUND if s.phase == PH_WAIT_BOUND => {
                 s.phase = PH_LISTENING;
@@ -178,7 +206,11 @@ unsafe fn service_net(s: &mut BridgeState) {
                         log(s, b"[bridge] closed");
                     }
                     s.conn = NO_CONN;
-                    s.phase = if s.mode == MODE_LISTEN { PH_LISTENING } else { PH_IDLE };
+                    s.phase = if s.mode == MODE_LISTEN {
+                        PH_LISTENING
+                    } else {
+                        PH_IDLE
+                    };
                     s.retry_at_ms = (dev_millis(sys) as u32).wrapping_add(RECONNECT_MS);
                 }
             }

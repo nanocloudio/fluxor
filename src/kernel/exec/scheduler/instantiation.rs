@@ -284,6 +284,19 @@ pub(crate) fn finalize_module(
         }
         p += 1;
     }
+    // The other side of the same fact: this module will not read again, so
+    // every channel it read from becomes a sink rather than a ring that
+    // fills and stays full. Back-pressure is transitive — through a tee, a
+    // retired consumer's full ring stops the producer for every other
+    // consumer of the same lane, and a graph loses a stream because an
+    // unrelated module finished.
+    let mut p = 0;
+    while p < ports.in_count as usize {
+        if ports.in_chans[p] >= 0 {
+            channel_set_reader_gone(ports.in_chans[p]);
+        }
+        p += 1;
+    }
     syscalls::release_module_handles(module_idx as u8);
     sched.finished[module_idx] = true;
 }
@@ -339,9 +352,7 @@ pub fn tick_count() -> u32 {
 
 /// Wallclock-paced scheduler heartbeat. Platforms call this once per
 /// tick from their outer loop; this is the single canonical emit
-/// point for `[sched] alive` across linux / wasm / rp / bcm — the
-/// per-platform and step_modules-internal copies that used to live
-/// here have all been collapsed into this function.
+/// point for `[sched] alive` across linux / wasm / rp / bcm.
 ///
 /// Cadence: every 30 wallclock seconds at the active `tick_us` for
 /// the given domain (or the global `tick_us` for the default domain
@@ -371,17 +382,58 @@ pub fn maybe_emit_alive(tick: u64, domain_id: Option<usize>) {
     // 1 ms, and stalls entirely when mechanism (a) idle-sleep stops advancing
     // the tick — so the heartbeat would no longer be ~30 s. Diagnostic-cadence
     // class: best-effort, no correctness impact. `LAST_ALIVE_MS` is 0 at boot,
-    // so the first heartbeat lands ~30 s in, matching the previous tick-count
-    // behaviour.
+    // so the first heartbeat lands ~30 s in.
     let last = LAST_ALIVE_MS[di].load(Ordering::Relaxed);
     if ms.wrapping_sub(last) < ALIVE_INTERVAL_MS {
         return;
     }
     LAST_ALIVE_MS[di].store(ms, Ordering::Relaxed);
-    match domain_id {
-        Some(d) => log::info!("[sched] alive t={tick} elapsed_ms={ms} domain={d}"),
-        None => log::info!("[sched] alive t={tick} elapsed_ms={ms}"),
+
+    // Count modules the scheduler has stopped running. A faulted or
+    // terminated module is skipped before its step function is called, so
+    // from outside it is indistinguishable from one that runs and does
+    // nothing: the graph keeps stepping, its queues back up, and nothing
+    // says it is gone. `MON_FAULT` records the moment it happened and then
+    // scrolls away, which leaves no way to learn it later — carrying the
+    // count on the heartbeat is what makes a dead module discoverable
+    // rather than something to be deduced from a silent symptom.
+    let (down, first_down) = down_module_summary();
+
+    match (domain_id, down) {
+        (Some(d), 0) => log::info!("[sched] alive t={tick} elapsed_ms={ms} domain={d}"),
+        (None, 0) => log::info!("[sched] alive t={tick} elapsed_ms={ms}"),
+        (Some(d), n) => log::warn!(
+            "[sched] alive t={tick} elapsed_ms={ms} domain={d} DOWN={n} first={first_down}"
+        ),
+        (None, n) => {
+            log::warn!("[sched] alive t={tick} elapsed_ms={ms} DOWN={n} first={first_down}")
+        }
     }
+}
+
+/// How many modules are faulted or terminated, and the index of the lowest
+/// such module (`u8::MAX` when none). Used by the heartbeat above.
+fn down_module_summary() -> (u32, u8) {
+    use crate::kernel::exec::step_guard::FaultState;
+    // SAFETY: scheduler-thread read.
+    let sched = unsafe {
+        let p = &raw const SCHED;
+        &*p
+    };
+    let mut down = 0u32;
+    let mut first = u8::MAX;
+    for i in 0..MAX_MODULES {
+        match sched.fault_info[i].state {
+            FaultState::Faulted | FaultState::Terminated => {
+                down += 1;
+                if first == u8::MAX {
+                    first = i as u8;
+                }
+            }
+            _ => {}
+        }
+    }
+    (down, first)
 }
 
 /// Flow-stall detector. Samples every classed (audio+) edge's ring
@@ -447,12 +499,12 @@ static LAST_FLOW_SAMPLE_MS: portable_atomic::AtomicU64 = portable_atomic::Atomic
 /// Wall-clock timestamp (ms) of the last PSTATUS cadence round.
 static LAST_PSTATUS_MS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 /// PSTATUS cadence interval (ms); a subscriber declares its own via the
-/// `TLM_SUBSCRIBE` interval field (§5.3). Default matches the observe/monitor
+/// `TLM_SUBSCRIBE` interval field. Default matches the observe/monitor
 /// console cadence.
 static PSTATUS_INTERVAL_MS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(5_000);
 
-/// Set the PSTATUS cadence interval, as declared by a `TLM_SUBSCRIBE` caller
-/// (§5.3). `0` leaves the default in place.
+/// Set the PSTATUS cadence interval, as declared by a `TLM_SUBSCRIBE` caller.
+/// `0` leaves the default in place.
 pub fn set_pstatus_interval_ms(ms: u64) {
     if ms != 0 {
         PSTATUS_INTERVAL_MS.store(ms, Ordering::Relaxed);
@@ -531,7 +583,7 @@ const ALIVE_INTERVAL_MS: u64 = 30_000;
 #[no_mangle]
 pub static mut DBG_STEP_MODULE: u8 = 0xFF;
 
-/// Crash data buffer in .uninit section — NOT zeroed by cortex-m-rt startup,
+/// Crash data buffer in .uninit section — NOT zeroed at startup,
 /// survives SYSRESETREQ software resets. Written by HardFault handler, read at tick 500.
 /// Layout: [0]=magic, [1]=PC, [2]=LR, [3]=module, [4]=tick, [5]=R0
 #[link_section = ".uninit.CRASH_DATA"]

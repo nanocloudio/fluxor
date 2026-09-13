@@ -85,19 +85,82 @@ pub mod mpu;
 #[cfg(feature = "rp")]
 #[path = "rp/config.rs"]
 pub mod planner;
+/// The reset vector and vector table.
+#[cfg(feature = "rp")]
+#[path = "rp/boot.rs"]
+pub mod rp_boot;
+/// RP bootrom function lookup. Declared unconditionally so the table-code
+/// packing is host-testable; the lookup itself is `rp`-gated.
+#[path = "rp/bootrom.rs"]
+pub mod rp_bootrom;
+/// RP clock measurement (FC0 frequency counter). Declared unconditionally so
+/// the result decoding is host-testable; the register reads are `rp`-gated.
+#[path = "rp/clocks.rs"]
+pub mod rp_clocks;
+/// RP DMA channel registers. Declared unconditionally so the channel address
+/// arithmetic is host-testable; the register reads are `rp`-gated.
+#[path = "rp/dma.rs"]
+pub mod rp_dma;
+/// RP entropy sources and their conditioning. Declared unconditionally so
+/// the register offsets and quality tiers are host-testable.
+#[path = "rp/entropy.rs"]
+pub mod rp_entropy;
 /// RP flash store + XIP lock. Kernel re-exports `flash_store`/`resource`.
 #[cfg(feature = "rp")]
 #[path = "rp/flash.rs"]
 pub mod rp_flash;
+/// RP GPIO registers (IO_BANK0/PADS_BANK0/SIO). Declared unconditionally so
+/// the bank-stride arithmetic is host-testable; the writes are `rp`-gated.
+#[path = "rp/gpio_regs.rs"]
+pub mod rp_gpio_regs;
+/// The RP2350 IMAGE_DEF block the bootrom requires. Declared unconditionally
+/// so the bitfield packing is host-testable.
+#[path = "rp/image_def.rs"]
+pub mod rp_image_def;
 /// RP GPIO + PIO helpers. Kernel re-exports `gpio`/`pio_util`.
 #[cfg(feature = "rp")]
 #[path = "rp/io.rs"]
 pub mod rp_io;
+/// RP PIO registers. Declared unconditionally so the instance and state
+/// machine addressing is host-testable; the register access is `rp`-gated.
+#[path = "rp/pio_regs.rs"]
+pub mod rp_pio_regs;
 /// RP platform provider registrations.
 #[cfg(feature = "rp")]
 #[path = "rp/providers.rs"]
 pub mod rp_providers;
+/// RP typed MMIO primitives. Declared unconditionally so the
+/// field-encoding arithmetic is host-testable; the volatile accessors are
+/// unsafe and address-checked by their callers.
+#[path = "rp/regs.rs"]
+pub mod rp_regs;
 /// RP step-guard (watchdog-backed step budget).
 #[cfg(feature = "rp")]
 #[path = "rp/step_guard.rs"]
 pub mod rp_step_guard;
+/// RP 64-bit monotonic time — the single source every `HalOps` time entry
+/// reads. Declared unconditionally so the wrap arithmetic is
+/// host-testable; the register reads inside are `rp`-gated.
+#[path = "rp/timer.rs"]
+pub mod rp_timer;
+/// RP fallback UART console — the log path that survives a USB stack that
+/// will not enumerate.
+#[cfg(feature = "rp")]
+#[path = "rp/uart.rs"]
+pub mod rp_uart;
+/// RP USB device controller bring-up and event drain.
+#[cfg(feature = "rp")]
+#[path = "rp/usb_device.rs"]
+pub mod rp_usb_device;
+/// RP USB controller registers and DPRAM allocation. Declared unconditionally
+/// so the allocator and word encodings are host-testable.
+#[path = "rp/usb_dpram.rs"]
+pub mod rp_usb_dpram;
+/// RP USB controller events and their interpretation. Declared
+/// unconditionally so the bitmap and buffer-direction rules are host-testable.
+#[path = "rp/usb_events.rs"]
+pub mod rp_usb_events;
+/// RP2 USB host-mode DPRAM layout. Declared unconditionally so the layout
+/// arithmetic is host-testable; role-exclusive from the device backend.
+#[path = "rp/usb_host.rs"]
+pub mod rp_usb_host;

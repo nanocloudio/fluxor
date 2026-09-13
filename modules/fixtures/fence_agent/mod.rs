@@ -467,9 +467,7 @@ unsafe fn service_ctl(s: &mut AgentState) {
                     s.token = [0; 16];
                 }
             }
-            netid::ADDR_FENCE | netid::ADDR_ARM
-                if copied >= netid::ADDR_TOKEN_PAYLOAD_LEN =>
-            {
+            netid::ADDR_FENCE | netid::ADDR_ARM if copied >= netid::ADDR_TOKEN_PAYLOAD_LEN => {
                 let mut token = [0u8; 16];
                 core::ptr::copy_nonoverlapping(p.add(netid::TOKEN_OFF), token.as_mut_ptr(), 16);
                 actuate(s, msg, &addr, &token);

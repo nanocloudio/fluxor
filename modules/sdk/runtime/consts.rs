@@ -225,4 +225,3 @@ pub const MSG_STATUS: u32 = fnv1a(b"status");
 pub const MSG_ON: u32 = fnv1a(b"on");
 pub const MSG_OFF: u32 = fnv1a(b"off");
 pub const MSG_BLINK: u32 = fnv1a(b"blink");
-

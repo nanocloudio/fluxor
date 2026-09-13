@@ -30,7 +30,7 @@ name = "debug"
 #     net: {}                        # required for `to: net`
 #     debug:
 #       to: net
-#       # dst_ip: "0xC0A80A0A"       # optional, destination for log_net
+#       # dst_ip: "192.168.10.10"    # optional, destination for log_net (dotted quad, decimal, or 0x-hex)
 #       # dst_port: 6666
 #       # bind_port: 6667
 #
@@ -220,7 +220,7 @@ wiring = []
 #   platform:
 #     debug:
 #       export_telemetry: udp
-#       # export_dst_ip: "0xC0A80A0A"   # else host.toml debug.collector_ip
+#       # export_dst_ip: "192.168.10.10" # else host.toml debug.collector_ip
 #       # export_flush_ms: 1000         # optional; max partial-batch latency
 [[overlay]]
 match = { export_telemetry = "udp", family = "rp2" }

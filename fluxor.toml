@@ -24,6 +24,9 @@ fluxor = { abi = 1 }
 # Module artefact build targets — `fluxor modules build --all`
 # iterates this list.
 targets = ["bcm2712", "rp2350", "rp2040", "wasm"]
+# Every ceiling-shaped constant in a register-named file is either a row
+# or an exemption; the list is empty, so a new one fails the gate.
+limit_register_coverage = "fail"
 
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal

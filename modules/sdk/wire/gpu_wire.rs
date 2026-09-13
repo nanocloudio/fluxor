@@ -1038,8 +1038,9 @@ pub fn req_create_pipeline(
     if out.len() < n || 16 + state.len() > MAX_PAYLOAD as usize {
         return None;
     }
-    out[..HEADER_LEN]
-        .copy_from_slice(&Header::new(OP_CREATE_PIPELINE, (16 + state.len()) as u32, corr).encode());
+    out[..HEADER_LEN].copy_from_slice(
+        &Header::new(OP_CREATE_PIPELINE, (16 + state.len()) as u32, corr).encode(),
+    );
     let p = &mut out[HEADER_LEN..n];
     put_u64(p, 0, program);
     p[8] = kind;
@@ -1273,16 +1274,57 @@ pub fn item_end_pass(out: &mut [u8]) -> Option<usize> {
 /// A decoded outcome record, as a consumer sees it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome<'a> {
-    Rejected { corr: u64, reason: u16, detail: u32 },
-    Accepted { corr: u64, fence: u64 },
-    Handle { corr: u64, handle: u64 },
-    Completed { corr: u64, fence: u64, flags: u32, gpu_nanos: u64 },
-    Failed { corr: u64, fence: u64, reason: u16, detail: u32 },
-    Cancelled { corr: u64, fence: u64, disposition: u8 },
-    DeviceLost { corr: u64, old_epoch: u32, new_epoch: u32, reason: u16, blast: u32 },
-    Caps { corr: u64, caps: &'a [u8] },
-    Result { corr: u64, fence: u64, offset: u64, bytes: &'a [u8] },
-    Surface { corr: u64, descriptor: &'a [u8] },
+    Rejected {
+        corr: u64,
+        reason: u16,
+        detail: u32,
+    },
+    Accepted {
+        corr: u64,
+        fence: u64,
+    },
+    Handle {
+        corr: u64,
+        handle: u64,
+    },
+    Completed {
+        corr: u64,
+        fence: u64,
+        flags: u32,
+        gpu_nanos: u64,
+    },
+    Failed {
+        corr: u64,
+        fence: u64,
+        reason: u16,
+        detail: u32,
+    },
+    Cancelled {
+        corr: u64,
+        fence: u64,
+        disposition: u8,
+    },
+    DeviceLost {
+        corr: u64,
+        old_epoch: u32,
+        new_epoch: u32,
+        reason: u16,
+        blast: u32,
+    },
+    Caps {
+        corr: u64,
+        caps: &'a [u8],
+    },
+    Result {
+        corr: u64,
+        fence: u64,
+        offset: u64,
+        bytes: &'a [u8],
+    },
+    Surface {
+        corr: u64,
+        descriptor: &'a [u8],
+    },
 }
 
 /// Decode one outcome record from the front of `bytes`.
@@ -1347,7 +1389,10 @@ pub fn decode_outcome(bytes: &[u8]) -> Result<Option<(Outcome<'_>, usize)>, u16>
             if p.len() < SURFACE_LEN {
                 return Err(REASON_MALFORMED);
             }
-            Outcome::Surface { corr, descriptor: p }
+            Outcome::Surface {
+                corr,
+                descriptor: p,
+            }
         }
         OUT_RESULT => {
             let len = get_u32(p, 16).ok_or(REASON_MALFORMED)? as usize;

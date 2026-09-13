@@ -4,8 +4,9 @@ hardware_targets = ["rp2350", "bcm2712"]
 # RAM-backed `storage.namespace` fixture provider — the contract-proving
 # provider for the namespace surface and the first implementor of BIND
 # (0x1308). Exists so the surface and the `mount` routing tier above it
-# are testable with no on-disk format in the loop
-# (rfc_storage_capability_symmetry §5). All fences are honestly Volatile.
+# are testable with no on-disk format in the loop. All fences are
+# honestly Volatile: the store is RAM, so nothing it reports as durable
+# would survive a reset.
 provides = ["storage.namespace"]
 
 

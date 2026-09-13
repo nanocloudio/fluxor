@@ -509,4 +509,3 @@ unsafe fn dev_provider_call_sel(
 ) -> i32 {
     (sys.provider_call_sel)(sel.as_ptr(), sel.len(), op_handle, op, arg, arg_len)
 }
-

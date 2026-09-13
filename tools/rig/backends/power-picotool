@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""power-picotool — "power" for a USB-powered board with no switched supply.
+
+The board cannot be unpowered, but it can be rebooted through its reset
+interface, which is what a scenario's `power.cycle` needs from it: a fresh
+boot of whatever is in flash.
+
+Verbs:
+  cycle   — `picotool reboot -f`: reboot into the application.
+  on      — nothing to do; the board is powered by the host.
+  off     — nothing to do, reported as such; a real power-off needs a
+            switched hub (`power-uhubctl`) or a smart plug.
+
+Binding fields:
+  serial      (str, optional)  the board's USB serial, passed as `--ser`.
+  picotool    (str, optional)  path to the picotool binary.
+  boot_delay_ms (int, optional) wait after the reboot before returning
+                               (default 3000): the console must have
+                               re-enumerated before observers expect it.
+"""
+import json
+import subprocess
+import sys
+import time
+
+
+def main():
+    raw = sys.stdin.read()
+    inv = json.loads(raw) if raw.strip() else {}
+    verb = sys.argv[1] if len(sys.argv) > 1 else ""
+    binding = inv.get("binding", {}) or {}
+    serial = str(binding.get("serial", "") or "")
+    tool = str(binding.get("picotool", "picotool"))
+    delay = int(binding.get("boot_delay_ms", 3000))
+
+    if verb in ("on", "off"):
+        json.dump({"ok": True, "info": f"power.{verb}: USB-powered board, nothing to switch"}, sys.stdout)
+        return 0
+    if verb != "cycle":
+        print(f"power-picotool: unknown verb {verb!r}", file=sys.stderr)
+        return 2
+    cmd = [tool, "reboot", "-f"]
+    if serial:
+        cmd += ["--ser", serial]
+    run = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if run.returncode != 0:
+        sys.stderr.write(run.stdout[-2000:] + run.stderr[-2000:])
+        print(f"power-picotool: `{' '.join(cmd)}` exited {run.returncode}", file=sys.stderr)
+        return 1
+    time.sleep(delay / 1000.0)
+    json.dump({"ok": True, "info": f"rebooted via picotool reset interface{' (serial ' + serial + ')' if serial else ''}"}, sys.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

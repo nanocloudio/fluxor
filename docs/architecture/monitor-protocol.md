@@ -74,8 +74,13 @@ Emitted (rate-limited) by the scheduler when an execution domain exhausts
 its per-tick step budget (`src/kernel/exec/scheduler/domain_budget.rs`):
 
 ```
-MON_BUDGET_OVERRUN domain=<d> consumed_us=<n> limit_us=<n> last_mod=<idx> overrun_count=<n> tick=<t> suppressed=<n>
+MON_BUDGET_OVERRUN domain=<d> consumed_us=<n> limit_us=<n> last_mod=<idx> top=<idx>:<us>/<steps>,<idx>:<us>/<steps>,<idx>:<us>/<steps> overrun_count=<n> tick=<t> suppressed=<n>
 ```
+
+`last_mod` is the module whose step closed the pass over budget; `top` lists
+the three modules of the domain that consumed the most of that pass, each
+with its microseconds and the number of times it was stepped (a bursting
+module is stepped many times in one pass). Unused slots read `0:0/0`.
 
 ### `MON_STATE`
 

@@ -86,7 +86,15 @@ unsafe fn send_bind(s: &mut SinkState) {
     let sys = &*s.syscalls;
     let payload = s.port.to_le_bytes();
     let mut scratch = [0u8; 8];
-    net_write_frame(sys, s.net_out, NET_CMD_BIND, payload.as_ptr(), 2, scratch.as_mut_ptr(), 8);
+    net_write_frame(
+        sys,
+        s.net_out,
+        NET_CMD_BIND,
+        payload.as_ptr(),
+        2,
+        scratch.as_mut_ptr(),
+        8,
+    );
 }
 
 unsafe fn log_counters(s: &mut SinkState) {
@@ -184,7 +192,15 @@ unsafe fn service(s: &mut SinkState) {
                     // The id is ours until we close it.
                     let payload = id.to_le_bytes();
                     let mut scratch = [0u8; 8];
-                    net_write_frame(sys, s.net_out, NET_CMD_CLOSE, payload.as_ptr(), 2, scratch.as_mut_ptr(), 8);
+                    net_write_frame(
+                        sys,
+                        s.net_out,
+                        NET_CMD_CLOSE,
+                        payload.as_ptr(),
+                        2,
+                        scratch.as_mut_ptr(),
+                        8,
+                    );
                 }
             }
             _ => {}

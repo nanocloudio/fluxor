@@ -50,7 +50,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -76,8 +75,7 @@ const PAGE_SIZE: usize = 256;
 
 // Raw flash bridge opcodes imported from the layered ABI.
 use abi::internal::flash::{
-    RAW_ERASE as SYS_FLASH_RAW_ERASE,
-    RAW_PROGRAM as SYS_FLASH_RAW_PROGRAM,
+    RAW_ERASE as SYS_FLASH_RAW_ERASE, RAW_PROGRAM as SYS_FLASH_RAW_PROGRAM,
 };
 
 const CONTINUE: i32 = 0;
@@ -88,8 +86,8 @@ const NO_LIVE_SLOT: i32 = -1;
 
 // Channel protocol — defined once in the public contract.
 use abi::contracts::storage::graph_slot::channel::{
-    REQ_ERASE, REQ_WRITE, REQ_ACTIVATE, REQ_ACTIVE, REQ_CFG, RESP_RESULT,
-    FRAME_HDR, REQ_MAX_PAYLOAD, RESP_PAYLOAD, RESP_FRAME_LEN,
+    FRAME_HDR, REQ_ACTIVATE, REQ_ACTIVE, REQ_CFG, REQ_ERASE, REQ_MAX_PAYLOAD, REQ_WRITE,
+    RESP_FRAME_LEN, RESP_PAYLOAD, RESP_RESULT,
 };
 /// Full request frame budget.
 const REQ_FRAME_MAX: usize = FRAME_HDR + REQ_MAX_PAYLOAD;
@@ -142,16 +140,24 @@ unsafe fn read_u64_le(p: *const u8) -> u64 {
 }
 
 unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
-    if read_u32_le(base_xip) != SLOT_MAGIC { return None; }
-    if core::ptr::read(base_xip.add(4)) != SLOT_VERSION { return None; }
+    if read_u32_le(base_xip) != SLOT_MAGIC {
+        return None;
+    }
+    if core::ptr::read(base_xip.add(4)) != SLOT_VERSION {
+        return None;
+    }
     let epoch = read_u64_le(base_xip.add(8));
     let modules_offset = read_u32_le(base_xip.add(16));
     let modules_size = read_u32_le(base_xip.add(20));
     let config_offset = read_u32_le(base_xip.add(24));
     let config_size = read_u32_le(base_xip.add(28));
 
-    if (modules_offset as u64) + (modules_size as u64) > SLOT_SIZE as u64 { return None; }
-    if (config_offset as u64) + (config_size as u64) > SLOT_SIZE as u64 { return None; }
+    if (modules_offset as u64) + (modules_size as u64) > SLOT_SIZE as u64 {
+        return None;
+    }
+    if (config_offset as u64) + (config_size as u64) > SLOT_SIZE as u64 {
+        return None;
+    }
 
     let mut sha = [0u8; 32];
     let mut i = 0;
@@ -161,7 +167,11 @@ unsafe fn decode_header(base_xip: *const u8) -> Option<HeaderFields> {
     }
 
     Some(HeaderFields {
-        epoch, modules_offset, modules_size, config_offset, config_size,
+        epoch,
+        modules_offset,
+        modules_size,
+        config_offset,
+        config_size,
         sha256: sha,
     })
 }
@@ -178,23 +188,42 @@ unsafe fn refresh_live(s: &mut State) {
     match (ha, hb) {
         (Some(ha), Some(hb)) => {
             if ha.epoch >= hb.epoch {
-                s.live_slot = 0; s.live_epoch = ha.epoch;
+                s.live_slot = 0;
+                s.live_epoch = ha.epoch;
             } else {
-                s.live_slot = 1; s.live_epoch = hb.epoch;
+                s.live_slot = 1;
+                s.live_epoch = hb.epoch;
             }
         }
-        (Some(ha), None) => { s.live_slot = 0; s.live_epoch = ha.epoch; }
-        (None, Some(hb)) => { s.live_slot = 1; s.live_epoch = hb.epoch; }
-        (None, None) => { s.live_slot = 0xFF; s.live_epoch = 0; }
+        (Some(ha), None) => {
+            s.live_slot = 0;
+            s.live_epoch = ha.epoch;
+        }
+        (None, Some(hb)) => {
+            s.live_slot = 1;
+            s.live_epoch = hb.epoch;
+        }
+        (None, None) => {
+            s.live_slot = 0xFF;
+            s.live_epoch = 0;
+        }
     }
 }
 
 fn slot_offset(idx: u8) -> u32 {
-    if idx == 0 { SLOT_A_OFFSET } else { SLOT_B_OFFSET }
+    if idx == 0 {
+        SLOT_A_OFFSET
+    } else {
+        SLOT_B_OFFSET
+    }
 }
 
 fn inactive_slot(live: u8) -> u8 {
-    if live == 1 { 0 } else { 1 }
+    if live == 1 {
+        0
+    } else {
+        1
+    }
 }
 
 // ============================================================================
@@ -234,17 +263,28 @@ unsafe fn do_erase(s: &mut State, sys: &SyscallTable) -> i32 {
     let end = target + SLOT_SIZE;
     while off < end {
         let rc = sys_erase_sector(sys, off);
-        if rc < 0 { return rc; }
+        if rc < 0 {
+            return rc;
+        }
         off += SECTOR_SIZE;
     }
     0
 }
 
-unsafe fn do_write(s: &mut State, sys: &SyscallTable, payload: *const u8, payload_len: usize) -> i32 {
-    if payload.is_null() || payload_len < 4 + PAGE_SIZE { return E_INVAL; }
+unsafe fn do_write(
+    s: &mut State,
+    sys: &SyscallTable,
+    payload: *const u8,
+    payload_len: usize,
+) -> i32 {
+    if payload.is_null() || payload_len < 4 + PAGE_SIZE {
+        return E_INVAL;
+    }
     refresh_live(s);
     let in_slot_off = read_u32_le(payload);
-    if in_slot_off + PAGE_SIZE as u32 > SLOT_SIZE { return E_INVAL; }
+    if in_slot_off + PAGE_SIZE as u32 > SLOT_SIZE {
+        return E_INVAL;
+    }
     let target = slot_offset(inactive_slot(s.live_slot)) + in_slot_off;
     sys_program_page(sys, target, payload.add(4))
 }
@@ -310,12 +350,18 @@ unsafe fn do_activate(s: &mut State) -> i32 {
 
 unsafe fn query_active(s: &mut State) -> i32 {
     refresh_live(s);
-    if s.live_slot > 1 { NO_LIVE_SLOT } else { s.live_slot as i32 }
+    if s.live_slot > 1 {
+        NO_LIVE_SLOT
+    } else {
+        s.live_slot as i32
+    }
 }
 
 unsafe fn query_cfg(s: &mut State) -> i32 {
     refresh_live(s);
-    if s.live_slot > 1 { return NO_LIVE_SLOT; }
+    if s.live_slot > 1 {
+        return NO_LIVE_SLOT;
+    }
     let base = XIP_BASE + slot_offset(s.live_slot);
     match decode_header(base as *const u8) {
         Some(h) => (base + h.config_offset) as i32,
@@ -342,7 +388,10 @@ unsafe fn hash_xip_range(hasher: &mut Sha256, base: *const u8, off: u32, size: u
         let n = core::cmp::min(remaining, CHUNK);
         let mut i = 0;
         while i < n {
-            core::ptr::write_volatile(buf.as_mut_ptr().add(i), core::ptr::read(base.add(cursor + i)));
+            core::ptr::write_volatile(
+                buf.as_mut_ptr().add(i),
+                core::ptr::read(base.add(cursor + i)),
+            );
             i += 1;
         }
         hasher.update(&buf[..n]);
@@ -359,7 +408,7 @@ unsafe fn hash_xip_range(hasher: &mut Sha256, base: *const u8, off: u32, size: u
 
 fn write_u32_le(dst: &mut [u8], offset: usize, value: u32) {
     let b = value.to_le_bytes();
-    dst[offset]     = b[0];
+    dst[offset] = b[0];
     dst[offset + 1] = b[1];
     dst[offset + 2] = b[2];
     dst[offset + 3] = b[3];
@@ -367,12 +416,14 @@ fn write_u32_le(dst: &mut [u8], offset: usize, value: u32) {
 
 fn write_u16_le(dst: &mut [u8], offset: usize, value: u16) {
     let b = value.to_le_bytes();
-    dst[offset]     = b[0];
+    dst[offset] = b[0];
     dst[offset + 1] = b[1];
 }
 
 unsafe fn emit_response(s: &State, sys: &SyscallTable, req_type: u32, value: i32) {
-    if s.out_chan < 0 { return; }
+    if s.out_chan < 0 {
+        return;
+    }
     let mut frame = [0u8; RESP_FRAME_LEN];
     write_u32_le(&mut frame, 0, RESP_RESULT);
     write_u16_le(&mut frame, 4, RESP_PAYLOAD as u16);
@@ -382,7 +433,9 @@ unsafe fn emit_response(s: &State, sys: &SyscallTable, req_type: u32, value: i32
 }
 
 unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
-    if s.in_chan < 0 { return CONTINUE; }
+    if s.in_chan < 0 {
+        return CONTINUE;
+    }
 
     // Best-effort fill of the request buffer.
     let room = REQ_FRAME_MAX - s.frame_fill as usize;
@@ -396,27 +449,29 @@ unsafe fn pump_requests(s: &mut State, sys: &SyscallTable) -> i32 {
 
     // Process as many complete frames as we have.
     loop {
-        if (s.frame_fill as usize) < FRAME_HDR { return CONTINUE; }
+        if (s.frame_fill as usize) < FRAME_HDR {
+            return CONTINUE;
+        }
         let ty = read_u32_le(s.frame_buf.as_ptr());
-        let len = u16::from_le_bytes([
-            s.frame_buf[4], s.frame_buf[5],
-        ]) as usize;
+        let len = u16::from_le_bytes([s.frame_buf[4], s.frame_buf[5]]) as usize;
         let total = FRAME_HDR + len;
         if total > REQ_FRAME_MAX {
             // Malformed frame — drop the buffer and resync on next fill.
             s.frame_fill = 0;
             return CONTINUE;
         }
-        if (s.frame_fill as usize) < total { return CONTINUE; }
+        if (s.frame_fill as usize) < total {
+            return CONTINUE;
+        }
 
         let payload_ptr = s.frame_buf.as_ptr().add(FRAME_HDR);
         let rc = match ty {
-            REQ_ERASE    => do_erase(s, sys),
-            REQ_WRITE    => do_write(s, sys, payload_ptr, len),
+            REQ_ERASE => do_erase(s, sys),
+            REQ_WRITE => do_write(s, sys, payload_ptr, len),
             REQ_ACTIVATE => do_activate(s),
-            REQ_ACTIVE   => query_active(s),
-            REQ_CFG      => query_cfg(s),
-            _            => E_INVAL,
+            REQ_ACTIVE => query_active(s),
+            REQ_CFG => query_cfg(s),
+            _ => E_INVAL,
         };
         emit_response(s, sys, ty, rc);
 
@@ -460,8 +515,12 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<State>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<State>() {
+            return -2;
+        }
         let s = &mut *(state as *mut State);
         s.syscalls = syscalls as *const SyscallTable;
         s.in_chan = in_chan;
@@ -481,9 +540,13 @@ pub extern "C" fn module_new(
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut State);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
         let sys = &*s.syscalls;
 
         if s.signaled_ready == 0 {
@@ -496,7 +559,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
 #[no_mangle]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> i32 { 1 }
+pub extern "C" fn module_deferred_ready() -> i32 {
+    1
+}
 
 // ============================================================================
 // Panic handler

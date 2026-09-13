@@ -148,7 +148,11 @@ pub enum ClientEvent<'a> {
     /// Work the consumer tagged finished.
     Finished { tag: u32 },
     /// Readback bytes for tagged work, at `offset` within the request.
-    Bytes { tag: u32, offset: u64, bytes: &'a [u8] },
+    Bytes {
+        tag: u32,
+        offset: u64,
+        bytes: &'a [u8],
+    },
     /// A request was refused or failed. `reason` is the contract's code.
     Failed { tag: u32, reason: u16 },
     /// The device epoch ended. Every handle this client holds is gone and its
@@ -371,7 +375,10 @@ impl GpuClient<'_> {
     /// provider keeps the storage until nothing in flight can reach it; that
     /// is its business, not the consumer's.
     pub fn destroy(&mut self, out: &mut [u8], name: u32) -> Option<usize> {
-        let slot = self.resources.iter().position(|r| r.live && r.name == name)?;
+        let slot = self
+            .resources
+            .iter()
+            .position(|r| r.live && r.name == name)?;
         let buffer = self.resources[slot].buffer;
         if buffer == HANDLE_NONE {
             // Never created, or its handle never arrived. Dropping the slot is
@@ -401,7 +408,9 @@ impl GpuClient<'_> {
         let slot = if chunk_offset == 0 {
             self.program_slot(name)?
         } else {
-            self.programs.iter().position(|p| p.live && p.name == name)?
+            self.programs
+                .iter()
+                .position(|p| p.live && p.name == name)?
         };
         let program = self.programs[slot].program;
         let corr = self.corr();
@@ -419,7 +428,10 @@ impl GpuClient<'_> {
     ///
     /// `Some(0)` means the name held nothing and is free already.
     pub fn release_program(&mut self, out: &mut [u8], name: u32) -> Option<usize> {
-        let slot = self.programs.iter().position(|p| p.live && p.name == name)?;
+        let slot = self
+            .programs
+            .iter()
+            .position(|p| p.live && p.name == name)?;
         let p = self.programs[slot];
         let (op, handle) = if p.pipeline != HANDLE_NONE {
             (OP_RELEASE_PIPELINE, p.pipeline)
@@ -460,7 +472,8 @@ impl GpuClient<'_> {
         let program = self.programs[slot].program;
         let corr = self.corr();
         let n = req_create_pipeline(out, corr, program, QUEUE_COMPUTE, &[])?;
-        self.arm(corr, PEND_PIPELINE, slot as u16, name).then_some(n)
+        self.arm(corr, PEND_PIPELINE, slot as u16, name)
+            .then_some(n)
     }
 
     /// Write bytes into a named resource. `bytes` must fit one record; a
@@ -510,7 +523,8 @@ impl GpuClient<'_> {
     /// the caller must not frame the record.
     pub fn reserve_upload(&mut self, tag: u32) -> Option<u64> {
         let corr = self.corr();
-        self.arm(corr, PEND_WORK, CLIENT_NO_SLOT, tag).then_some(corr)
+        self.arm(corr, PEND_WORK, CLIENT_NO_SLOT, tag)
+            .then_some(corr)
     }
 
     /// Submit an item list the caller built with the wire encoders.
@@ -690,7 +704,12 @@ impl GpuClient<'_> {
                 }
             }
 
-            Outcome::Result { corr, offset, bytes, .. } => {
+            Outcome::Result {
+                corr,
+                offset,
+                bytes,
+                ..
+            } => {
                 let Some(i) = self.find(corr) else {
                     return (ClientEvent::Quiet, 0);
                 };

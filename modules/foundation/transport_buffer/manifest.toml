@@ -3,8 +3,8 @@ hardware_targets = ["bcm2712", "rp2350", "rp2040"]
 permissions = ["platform_raw"]
 # Cadence-independent byte forwarder (framed payloads → a selected transport);
 # its emit cadence is cosmetic, not correctness-bearing. Explicit attestation to
-# run on a mechanism-(b) domain (RFC adaptive_tick §8 rule 2). Same shape as
-# `log_net`.
+# run on a mechanism-(b) domain, where an absent declaration is treated as
+# unattested and blocked. Same shape as `log_net`.
 timer_class = "agnostic"
 
 [[ports]]

@@ -18,7 +18,7 @@ Without events, modules poll for hardware changes every 1ms tick. This works but
 1. **Latency** — a GPIO edge that fires 0.5ms after a tick isn't seen until the next tick.
 2. **Wasted work** — modules that are waiting for hardware run `step()` every tick even when nothing happened.
 
-Events solve both: the scheduler only steps a module when its event fires, and the `select()` mechanism can break out of the 1ms sleep for sub-tick response.
+Events solve both: the scheduler only steps a module when its event fires, and a wake breaks out of the 1 ms sleep for sub-tick response.
 
 ## Architecture
 
@@ -49,7 +49,7 @@ event_signal_from_isr(handle)
     |
     sets signaled = true
     sets EVENT_WAKE_PENDING bit
-    signals SCHEDULER_WAKE  ──>  breaks select() sleep
+    signals SCHEDULER_WAKE  ──>  breaks the sleep early
                                       |
                                       v
                             step_woken_modules() runs immediately
@@ -143,7 +143,8 @@ unsubscribe opcode.
 
 ## Scheduler Wake Integration
 
-The main loop uses Embassy's `select()` to sleep efficiently:
+The main loop sleeps until the next deadline or a wake, whichever comes
+first:
 
 ```rust
 loop {
@@ -188,7 +189,7 @@ A lightweight variant of `step_modules` that:
 |--------|---------|-----------|
 | GPIO edge (software polled) | Same tick cycle (~0-1ms) | `poll_gpio_edges()` → `event_signal()` → `step_woken_modules()` |
 | Module-to-module signal | Same tick cycle | Module A signals → `step_woken_modules()` runs before sleep |
-| ISR sources | Sub-tick | ISR → `event_signal_from_isr()` → `SCHEDULER_WAKE` breaks `select()` |
+| ISR sources | Sub-tick | ISR → `event_signal_from_isr()` → `SCHEDULER_WAKE` breaks the sleep |
 
 ## ISR Safety Contract
 
@@ -199,22 +200,22 @@ A lightweight variant of `step_modules` that:
 3. A wake-latch RMW into the owner's `EVENT_WAKE_PENDING` word; if the
    owning module is paused, the wake is deferred and the doorbell
    suppressed
-4. `hal::wake_scheduler()` — on RP this signals the
-   `SCHEDULER_WAKE` Embassy signal (a brief critical section via
-   `CriticalSectionRawMutex`)
+4. `hal::wake_scheduler()` — on RP this sets the scheduler wake latch and
+   raises `SEV`, so a core parked in `WFE` returns and re-checks
 
 No validation beyond bounds. No allocation. No channel writes. No driver logic. Called at most once per ISR entry (coalesced), not per-pin.
 
 ## GPIO Event Binding Model
 
-On RP targets, embassy-rp owns the `IO_IRQ_BANK0` interrupt handler
-when its `rt` feature is enabled (required for the PIO and USB
-interrupt handlers), and its GPIO wakers are private to that crate, so
-the kernel cannot hook GPIO interrupts directly.
+GPIO event binding on RP targets uses software polling via
+`poll_gpio_edges()` (same-tick-cycle response, ~1 ms worst case). This model
+is suitable for buttons, sensors, and most GPIO-driven peripherals.
 
-GPIO event binding therefore uses software polling via `poll_gpio_edges()` (same-tick-cycle response, ~1ms worst case). This model is suitable for buttons, sensors, and most GPIO-driven peripherals.
+It is also the model the RP platform commits to: `IO_IRQ_BANK0` is not
+hooked, so GPIO edges are observed by the step loop rather than by an
+interrupt.
 
-For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` works directly from ISR context. The `select()` mechanism provides sub-tick wake for these sources.
+For non-GPIO ISR sources (DMA completion, timer), `event_signal_from_isr()` works directly from ISR context, giving these sources a sub-tick wake.
 
 ## Timers
 

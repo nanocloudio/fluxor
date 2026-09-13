@@ -1,7 +1,10 @@
 //! Shared ABI-surface pin computation — the single source of the checked-in
 //! pin values, used by both `fluxor abi-regen` (the writer) and the `fluxor ci`
-//! gate (the read-only `--check`). See `.context/fluxor_nanocloud.md` and the
-//! `abi_surface_srcpin.rs` header.
+//! gate (the read-only `--check`). The pin is the digest of the ABI wire
+//! surface folded with the hash of the contracts/platform sources; every
+//! checked-in copy of it must agree, or a graph could be admitted onto a
+//! substrate whose ABI it does not match. See the `abi_surface_srcpin.rs`
+//! header for the constants this writes.
 
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};

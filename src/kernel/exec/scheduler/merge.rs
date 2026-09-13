@@ -505,6 +505,11 @@ pub struct SchedulerState {
     /// `step_domain_modules_poll`; accumulated after every
     /// `step_one_module` return regardless of `StepOutcome`.
     pub(crate) domain_budget_us_consumed: [u64; MAX_DOMAINS],
+    /// Wall-clock each module consumed in the current pass, and how many
+    /// times it was stepped, so a budget overrun can name what actually
+    /// spent the budget rather than whichever module finished last.
+    pub(crate) pass_module_us: [u32; MAX_MODULES],
+    pub(crate) pass_module_steps: [u16; MAX_MODULES],
     /// Cumulative count of times the domain's pass was cut short
     /// because `consumed > limit`. Surfaced via `monitor` so operators
     /// see chronically over-subscribed domains without needing to
@@ -512,13 +517,13 @@ pub struct SchedulerState {
     pub(crate) domain_budget_overruns: [u32; MAX_DOMAINS],
     /// Per-domain worst-recent single-step time, microseconds. This is the
     /// adaptive-tick **floor input**: the pacer must never drive the tick
-    /// below `worst_step × margin` or it re-creates the `tick_us=500` budget
-    /// overrun (evidence #5). It is a **decaying peak-hold**, NOT a monotonic
-    /// max: `step_one_module` raises it to the live worst, and the per-pass
-    /// budget reset decays it by `>> WORST_STEP_DECAY_SHIFT`, so a one-off
-    /// (thermal) spike ages out and the floor relaxes on cool-down (AC7). A
+    /// below `worst_step × margin`, or a tick short enough to leave less than
+    /// one heavy step of budget overruns it. It is a **decaying peak-hold**, NOT
+    /// a monotonic max: `step_one_module` raises it to the live worst, and the
+    /// per-pass budget reset decays it by `>> WORST_STEP_DECAY_SHIFT`, so a
+    /// one-off (thermal) spike ages out and the floor relaxes on cool-down. A
     /// monotonic max would pin the floor high forever. Portable / measured on
-    /// every tier + platform — the only pre-existing worst-step
+    /// every tier + platform — the other worst-step measure
     /// (`DomainMetrics.worst_step_ticks`, bcm2712) is Tier-1a-only, in cycles,
     /// and monotonic, so it cannot serve here.
     pub(crate) domain_worst_step_us: [u32; MAX_DOMAINS],
@@ -646,6 +651,8 @@ impl SchedulerState {
             domain_tick_max_us: [0; MAX_DOMAINS],
             domain_budget_us_limit: [0; MAX_DOMAINS],
             domain_budget_us_consumed: [0; MAX_DOMAINS],
+            pass_module_us: [0; MAX_MODULES],
+            pass_module_steps: [0; MAX_MODULES],
             domain_budget_overruns: [0; MAX_DOMAINS],
             domain_worst_step_us: [0; MAX_DOMAINS],
             domain_module_mask: [ModuleMask::EMPTY; MAX_DOMAINS],
@@ -728,6 +735,8 @@ impl SchedulerState {
             self.domain_tick_max_us[d] = 0;
             self.domain_budget_us_limit[d] = 0;
             self.domain_budget_us_consumed[d] = 0;
+            self.pass_module_us = [0; MAX_MODULES];
+            self.pass_module_steps = [0; MAX_MODULES];
             self.domain_budget_overruns[d] = 0;
             self.domain_worst_step_us[d] = 0;
             self.domain_module_mask[d] = ModuleMask::EMPTY;
@@ -1320,9 +1329,9 @@ pub fn domain_tick_us(domain_id: usize) -> u32 {
 }
 
 /// Return the per-domain worst-recent single-step time in microseconds — the
-/// §5.3 adaptive-tick floor input (decaying peak-hold, NOT a monotonic max).
+/// adaptive-tick floor input (decaying peak-hold, NOT a monotonic max).
 /// The pacer clamps `tick_min_us` up by `worst × margin` so a shortened tick
-/// never shrinks the per-domain budget below one heavy step (evidence #5).
+/// never shrinks the per-domain budget below one heavy step.
 /// `0` until the domain has stepped at least once.
 pub fn domain_worst_step_us(domain_id: usize) -> u32 {
     if domain_id < MAX_DOMAINS {
@@ -1422,7 +1431,7 @@ pub fn set_step_period_for_test(slot: usize, period: u8) {
 }
 
 /// Test-only: put a module slot into (or out of) the "deferred-ready, still
-/// initialising" state the §6.5 fail-closed `must_tick` predicate keys on — a
+/// initialising" state the fail-closed `must_tick` predicate keys on — a
 /// deferred-ready module that has not reached Ready must keep stepping even when
 /// the graph is otherwise idle, or it could never finish initialising.
 pub fn set_module_init_state_for_test(slot: usize, initialising: bool) {
@@ -1471,22 +1480,22 @@ pub const ADAPTIVE_FLAG_IDLE: u8 = 0x01;
 pub const ADAPTIVE_FLAG_CADENCE: u8 = 0x02;
 
 // ── Mechanism (b) AIMD cadence tunables ──────── These are PLACEHOLDER
-// defaults — OQ1 marks the exact values as rig-tuned on the cooled Pi 5. The
-// locked design constraints they must respect: AIMD is asymmetric (fast
+// defaults — the exact values are rig-tuned on the cooled Pi 5. The design
+// constraints they must respect: AIMD is asymmetric (fast
 // multiplicative decrease on busy, slow additive increase on idle); the
 // minimum dwell must be ≥ the workload's burst inter-arrival or the cadence
-// sawtooths (§5.2); levels are discrete to bound step-counted rescaling and
+// sawtooths; levels are discrete to bound step-counted rescaling and
 // keep diagnostics legible.
 /// Floor margin: the pacer never drives the tick below `worst_step ×
-/// FLOOR_MARGIN` (so the per-domain budget always fits one heavy step —
-/// evidence #5). 2× leaves headroom for the rest of the pass.
+/// FLOOR_MARGIN`, so the per-domain budget always fits one heavy step.
+/// 2× leaves headroom for the rest of the pass.
 const FLOOR_MARGIN: u32 = 2;
 /// Consecutive busy passes required before stepping the cadence DOWN (faster).
 const PACER_BUSY_RUN_N: u16 = 2;
 /// Consecutive idle passes required before stepping the cadence UP (relax).
 const PACER_IDLE_RUN_M: u16 = 4;
 /// Minimum wall-clock dwell between cadence-level changes, µs. MUST be ≥ the
-/// expected burst inter-arrival for the workload (§5.2) — placeholder, rig-tuned.
+/// expected burst inter-arrival for the workload — placeholder, rig-tuned.
 const PACER_MIN_DWELL_US: u64 = 2_000;
 /// Max discrete level index (deadline = `tick_max >> idx`, clamped to floor).
 /// Caps the geometric ladder depth; the floor clamp usually bites first.
@@ -1496,7 +1505,7 @@ const PACER_MAX_LEVEL: u8 = 12;
 /// differs by more than `last >> PACER_DEADBAND_SHIFT` (≈6.25%), floored at
 /// `PACER_DEADBAND_MIN_US`. This suppresses sub-µs floor jitter from
 /// `domain_worst_step_us` measurement noise (e.g. 750↔752 → floor 1500↔1504),
-/// which would otherwise dither the cadence and spam `MON_PACER_LEVEL` (AC6).
+/// which would otherwise dither the cadence and spam `MON_PACER_LEVEL`.
 /// Real ladder steps (≥2×) and load/thermal floor moves always clear the band.
 const PACER_DEADBAND_SHIFT: u32 = 4;
 const PACER_DEADBAND_MIN_US: u32 = 16;
@@ -1539,8 +1548,8 @@ static PACER_IDLE_REPORTED: [AtomicBool; MAX_DOMAINS] =
 /// transition detector. An idle→busy edge arms the hot-start window.
 static PACER_WAS_IDLE: [AtomicBool; MAX_DOMAINS] = [const { AtomicBool::new(false) }; MAX_DOMAINS];
 
-/// Per-domain hot-start passes remaining (§6.6). After a wake-from-idle the
-/// pacer runs this many busy passes at the §5.3 floor (the tightest safe
+/// Per-domain hot-start passes remaining. After a wake-from-idle the
+/// pacer runs this many busy passes at the adaptive-tick floor (the tightest safe
 /// cadence) instead of slowly ramping down from the relaxed `tick_max`, so a
 /// request-response pipeline's return hops don't each wait a full `tick_max`
 /// gap. Bounded window; never bypasses Burst/budget/floor guards.
@@ -1569,12 +1578,12 @@ pub fn pacer_current_period_us(domain_id: usize) -> u32 {
     }
 }
 
-/// Hot-start window length in passes (§6.6). Matched to the bounded pipeline
+/// Hot-start window length in passes. Matched to the bounded pipeline
 /// hop budget so the first request after idle converges at the floor rather
 /// than the relaxed tick.
 const PACER_HOTSTART_PASSES: u8 = MAX_PIPELINE_PASSES as u8;
 
-/// Compute the §5.3 per-domain floor (µs): never below `tick_min_us`, raised by
+/// Compute the per-domain adaptive-tick floor (µs): never below `tick_min_us`, raised by
 /// the live decaying worst-step so a shortened tick can't shrink the budget
 /// below one heavy step. Clamped not to exceed `tick_max_us`.
 fn pacer_floor_us(domain_id: usize, tick_max: u32) -> u32 {
@@ -1585,7 +1594,7 @@ fn pacer_floor_us(domain_id: usize, tick_max: u32) -> u32 {
         .min(tick_max)
 }
 
-/// Public accessor: the live §5.3 effective floor (µs) for `domain_id` right now
+/// Public accessor: the live effective floor (µs) for `domain_id` right now
 /// — `max(tick_min_us, worst_step × FLOOR_MARGIN)`, clamped to `tick_max_us`.
 /// `pacer_next_deadline_us` never returns below this. A platform that further
 /// clamps the armed deadline (e.g. bcm2712's software-wake latency clamp) MUST
@@ -1621,7 +1630,7 @@ pub(crate) fn pacer_reset_all() {
         PACER_HOTSTART[d].store(0, Ordering::Relaxed);
         PACER_CURRENT_PERIOD_US[d].store(0, Ordering::Relaxed);
     }
-    // §7 graph-local pacer table — same reconfigure reset (a reused graph slot
+    // Graph-local pacer table — same reconfigure reset (a reused graph slot
     // must not inherit the prior graph's heat).
     graph_pacer_reset_all();
 }
@@ -1704,7 +1713,7 @@ fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
     let raw_deadline = (tick_max >> ps.level_idx.min(31)).max(floor).min(tick_max);
     // Deadband: hold the previously-applied deadline unless the change is
     // significant. Worst_step measurement jitter (±a few µs) would otherwise
-    // dither the floor (and thus the cadence) and spam MON_PACER_LEVEL (AC6);
+    // dither the floor (and thus the cadence) and spam MON_PACER_LEVEL;
     // ladder steps and real floor moves clear the band.
     let last = ps.last_reported_us;
     let band = (last >> PACER_DEADBAND_SHIFT).max(PACER_DEADBAND_MIN_US);
@@ -1742,14 +1751,14 @@ fn pacer_apply_cadence(domain_id: usize, idle: bool, tick_max: u32) -> u32 {
 /// pass was idle (no pending wake, no burst), relax the next sleep to
 /// `tick_max_us` — the platform sleeps in an event-interruptible posture, so a
 /// wake returns immediately; the backstop bounds worst-case re-evaluation and
-/// keeps step-counted timers advancing (always-armed-backstop invariant, D7).
+/// keeps step-counted timers advancing (the always-armed-backstop invariant).
 /// **Mechanism (b) adaptive cadence** (bit 1): AIMD toward `tick_min_us` on a
 /// busy pass / back off toward `tick_max_us` on an idle one, with hysteresis
-/// (deadband) and the §5.3 floor = `max(tick_min_us, worst_step × FLOOR_MARGIN)`
+/// (deadband) and the floor = `max(tick_min_us, worst_step × FLOOR_MARGIN)`
 /// so the chosen cadence never undershoots the live worst-step cost.
 ///
 /// An armed timer owned by this domain bounds whichever period the mechanisms
-/// choose, down to the §5.3 floor and no further: a module that arms 5 ms is
+/// choose, down to that floor and no further: a module that arms 5 ms is
 /// stepped at ~5 ms even on an idle domain relaxed to a 50 ms backstop, and a
 /// heavy domain still never runs faster than its worst-step budget admits.
 /// With no adaptive flag set and no timer armed this returns `domain_tick_us`
@@ -1770,7 +1779,7 @@ pub fn pacer_next_deadline_us(domain_id: usize) -> u32 {
     let Some(ms) = timer_ms else {
         return period;
     };
-    // Raised to the §5.3 floor before it is applied: an early timer may
+    // Raised to the adaptive-tick floor before it is applied: an early timer may
     // shorten the sleep, but not below one worst-case step, or the flow
     // budget this period governs would be smaller than a step it must pay
     // for.
@@ -1797,7 +1806,7 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
         .get(domain_id.min(MAX_DOMAINS - 1))
         .map(|b| b.load(Ordering::Relaxed))
         .unwrap_or(false);
-    // §6 work signal: a module that did useful work this tick
+    // Useful-work signal: a module that did useful work this tick
     // (WorkDone/RunnableBacklog/Burst, via REPORT_STEP_EFFECT) keeps the pacer
     // hot even if it returned `Continue` for fairness (the IP/NIC case).
     // Heat-only — re-step is still Burst-gated.
@@ -1807,7 +1816,7 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
         .unwrap_or(false);
     let idle = !burst && !work && !domain_wake_pending(domain_id);
     let tick_max = domain_tick_max_us(domain_id);
-    // §6.6 hot-start transition tracking: record idle→busy edges. On idle the
+    // Hot-start transition tracking: record idle→busy edges. On idle the
     // hot-start window resets; the edge (was_idle && now busy) arms it below.
     let hs_di = domain_id.min(MAX_DOMAINS - 1);
     let was_idle = PACER_WAS_IDLE[hs_di].swap(idle, Ordering::Relaxed);
@@ -1839,8 +1848,8 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
         }
         return record_pacer_period_us(domain_id, tick_max);
     }
-    // §6.6 hot-start (busy pass): on the idle→busy edge, arm a bounded window of
-    // `PACER_HOTSTART_PASSES` and return the §5.3 floor — the tightest safe
+    // Hot-start (busy pass): on the idle→busy edge, arm a bounded window of
+    // `PACER_HOTSTART_PASSES` and return the adaptive-tick floor — the tightest safe
     // cadence, which never undershoots the live worst-step — so a
     // request-response pipeline's return hops after idle don't each wait out
     // (b)'s slow AIMD ramp down from `tick_max`. The floor still respects
@@ -1885,7 +1894,7 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
             let _ = pacer_apply_cadence(domain_id, false, tick_max);
             return record_pacer_period_us(domain_id, floor);
         }
-        // (b) AIMD cadence between the §5.3 floor and tick_max.
+        // (b) AIMD cadence between the adaptive-tick floor and tick_max.
         let period = pacer_apply_cadence(domain_id, idle, tick_max);
         return record_pacer_period_us(domain_id, period);
     }
@@ -1894,21 +1903,21 @@ fn pacer_next_deadline_us_unbounded(domain_id: usize) -> u32 {
 }
 
 // ===========================================================================
-// §7 graph-local pacing
+// Graph-local pacing
 // ===========================================================================
 //
 // Per-`(graph_instance, domain)` pacer state, so a hot graph cannot pin an idle
 // graph's cadence and an idle graph cannot delay a hot one. Graph identity is
 // `owner::OwnerHandle{slot, generation}`. A multi-graph runner drives this
-// surface: the §7.2 shared-runner deadline-merge, the §6.5 skip-idle runnable
-// predicate, and §7.1 generation-reset on slot reuse. A single resident graph
-// reduces to the per-domain `pacer_next_deadline_us` path above. Bounded (§7.5),
-// no hot-path alloc (§7.6).
+// surface: the shared-runner deadline-merge, the skip-idle runnable
+// predicate, and the generation-reset on slot reuse. A single resident graph
+// reduces to the per-domain `pacer_next_deadline_us` path above. The table is
+// statically bounded and the hot path allocates nothing.
 //
 // Each instance carries its own AIMD `PacerState` and reuses the same ladder
 // constants as `pacer_apply_cadence`.
 
-/// Declared bounded graph/domain pacer-instance table size (§7.5). Sized for a
+/// Bounded graph/domain pacer-instance table size. Sized for a
 /// handful of resident graphs across the domains; admission rejects configs
 /// that would need more (the tools `MAX_PACER_INSTANCES` gate).
 pub const MAX_GRAPH_PACERS: usize = 16;
@@ -1955,7 +1964,7 @@ pub(crate) static mut GRAPH_PACERS: [GraphPacer; MAX_GRAPH_PACERS] =
 /// Resolve the bounded-table index for `(graph_slot, domain)`, allocating a
 /// free slot on first use. A generation mismatch (the owner slot was reused by
 /// a new graph) RESETS the instance so the new graph cannot inherit the old
-/// graph's heat/floor/dwell (§7.1). Returns `None` if the table is full
+/// graph's heat/floor/dwell. Returns `None` if the table is full
 /// (the build-time admission gate prevents this for valid configs). Not a
 /// hot-path scan in steady state — the runner caches the index at prepare time.
 pub(crate) fn graph_pacer_index(graph_slot: u16, generation: u32, domain: u8) -> Option<usize> {
@@ -1966,7 +1975,7 @@ pub(crate) fn graph_pacer_index(graph_slot: u16, generation: u32, domain: u8) ->
     for (i, p) in t.iter_mut().enumerate() {
         if p.active && p.graph_slot == graph_slot && p.domain == domain {
             if p.generation != generation {
-                // Slot reused by a new graph — reset (§7.1 generation guard).
+                // Slot reused by a new graph — reset (generation guard).
                 *p = GraphPacer::new();
                 p.active = true;
                 p.graph_slot = graph_slot;
@@ -2023,7 +2032,7 @@ fn graph_pacer_ladder(ps: &mut PacerState, idle: bool, tick_max: u32, floor: u32
     raw
 }
 
-/// §6.5 runnable predicate: is this graph/domain instance runnable this pass
+/// Runnable predicate: is this graph/domain instance runnable this pass
 /// (must be stepped), or may it be skipped on a shared runner? Runnable iff any
 /// of: prior-pass work/burst, a targeted wake, or a due timer/liveness
 /// deadline. Conservative — when in doubt the runner passes `timer_due=true`
@@ -2037,7 +2046,7 @@ pub(crate) fn graph_pacer_runnable(p: &GraphPacer) -> bool {
 #[allow(
     clippy::fn_params_excessive_bools,
     reason = "the four signals (work/burst/wake/timer_due) are the distinct \
-              §6.3 pacer busy inputs; a bitfield would obscure them at the \
+              pacer busy inputs; a bitfield would obscure them at the \
               call site for no safety gain"
 )]
 pub fn graph_pacer_set_signals(
@@ -2062,9 +2071,9 @@ pub fn graph_pacer_set_signals(
     true
 }
 
-/// §7.2 graph-local next deadline for one `(graph_slot, domain)` instance.
+/// Graph-local next deadline for one `(graph_slot, domain)` instance.
 /// Independent of every other instance: an idle instance relaxes to `tick_max`
-/// and a busy instance tightens toward `floor`, with the §6.6 hot-start jump on
+/// and a busy instance tightens toward `floor`, with the hot-start jump on
 /// the idle→busy edge. `floor`/`tick_min`/`tick_max` are the domain's bounds.
 pub fn graph_pacer_deadline(
     graph_slot: u16,
@@ -2094,7 +2103,7 @@ pub fn graph_pacer_deadline(
         let _ = graph_pacer_ladder(&mut p.state, true, tick_max_us, floor, now_us);
         return tick_max_us;
     }
-    // Busy: §6.6 hot-start on the idle→busy edge.
+    // Busy: hot-start on the idle→busy edge.
     if was_idle {
         p.hotstart = PACER_HOTSTART_PASSES;
     }
@@ -2106,7 +2115,7 @@ pub fn graph_pacer_deadline(
     graph_pacer_ladder(&mut p.state, false, tick_max_us, floor, now_us)
 }
 
-/// §7.2 shared-runner deadline merge: the physical wait is the minimum deadline
+/// Shared-runner deadline merge: the physical wait is the minimum deadline
 /// across the RUNNABLE instances in `keys` (each `(graph_slot, generation,
 /// domain, tick_min, tick_max, floor)`); idle instances are skipped (not
 /// stepped) but still bound the wait via their relaxed deadline if nothing is

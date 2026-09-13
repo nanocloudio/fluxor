@@ -78,15 +78,26 @@ Each silicon target has its own HAL implementation under `src/platform/`:
 
 | Target | Platform file | Runtime model |
 |--------|--------------|---------------|
-| RP2040 | `src/platform/rp.rs` | Embassy async (Cortex-M0+) |
-| RP2350 | `src/platform/rp.rs` | Embassy async (Cortex-M33) |
+| RP2040 | `src/platform/rp.rs` | Cortex-M0+; synchronous step loop |
+| RP2350 | `src/platform/rp.rs` | Cortex-M33; synchronous step loop |
 | BCM2712 | `src/platform/bcm2712.rs` | Synchronous polling (Cortex-A76, EL1) |
 | Pi 5 | `src/platform/bcm2712.rs` (board overlay) | Synchronous polling |
 
-The two RP families share `rp.rs` because both run Embassy on a Cortex-M
-core with the same peripheral families. The aarch64 targets share
-`bcm2712.rs` because both run on the same SoC; pi5 is a board overlay
-on top of the same chip support.
+The two RP families share `rp.rs` because both run on a Cortex-M core with
+the same peripheral families. The aarch64 targets share `bcm2712.rs` because
+both run on the same SoC; pi5 is a board overlay on top of the same chip
+support.
+
+### RP boot and runtime
+
+The reset path and vector table are this tree's own (`platform/rp/boot.rs`,
+`arch/vector.rs`), the graph runs in a synchronous loop that idles in `WFE`,
+and the USB device stack is `kernel/usb` over `platform/rp/usb_device.rs`.
+No third-party runtime crate is in the RP dependency closure: each RP
+configuration resolves to a fixed, declared set of crates, and building a
+firmware image checks the closure against Cargo's own resolution rather than
+against source imports, so a crate that is linked without being named
+anywhere fails the build.
 
 The kernel itself is mostly cfg-free. Per-silicon constants are generated
 at build time from `targets/silicon/*.toml` into `chip_generated.rs`,
@@ -131,9 +142,9 @@ let handle = (sys.provider_open)(HAL_SPI, spi::OPEN, &mut spi as *mut _ as *mut 
 ```
 
 Async transfers use start/poll: the module starts a DMA-backed transfer,
-the step returns, and a later step polls for completion. The HAL
-implementation may use Embassy async tasks (RP) or polled DMA descriptors
-(aarch64).
+the step returns, and a later step polls for completion. How the HAL waits
+underneath is its own — a polled DMA descriptor on RP, a completion queue
+elsewhere — but the module-facing contract is the same.
 
 ### I2C
 

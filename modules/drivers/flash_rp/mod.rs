@@ -32,7 +32,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -155,7 +154,7 @@ struct FlashState {
     stream_phase: StreamPhase,
     _blob_pad: u8,
     blob_write_pos: u16,
-    blob_remaining: u16,     // bytes remaining for current blob during TLV parsing
+    blob_remaining: u16, // bytes remaining for current blob during TLV parsing
     blob_storage_used: u16,
     blob_offsets: [u16; MAX_BLOBS],
     blob_lengths: [u16; MAX_BLOBS],
@@ -168,8 +167,8 @@ struct FlashState {
 
 mod params_def {
     use super::FlashState;
-    use super::{p_u8, p_u16};
     use super::SCHEMA_MAX;
+    use super::{p_u16, p_u8};
 
     define_params! {
         FlashState;
@@ -315,8 +314,8 @@ pub extern "C" fn module_new(
         s.blob_storage_used = 0;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -339,14 +338,16 @@ pub extern "C" fn module_new(
             let mut mi = 0usize;
             while mi < mid.len() {
                 *lb.as_mut_ptr().add(p) = *mid.as_ptr().add(mi);
-                p += 1; mi += 1;
+                p += 1;
+                mi += 1;
             }
             p += fmt_u32_raw(lb.as_mut_ptr().add(p), s.blob_storage_used as u32);
             let ch = b" ch=";
             let mut ci = 0usize;
             while ci < ch.len() {
                 *lb.as_mut_ptr().add(p) = *ch.as_ptr().add(ci);
-                p += 1; ci += 1;
+                p += 1;
+                ci += 1;
             }
             p += fmt_u32_raw(lb.as_mut_ptr().add(p), s.stream_chan as u32);
             dev_log(sys, 3, lb.as_ptr(), p);
@@ -422,10 +423,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut t = 0usize;
                 while t < tag.len() {
                     *bp.add(p) = *tag.as_ptr().add(t);
-                    p += 1; t += 1;
+                    p += 1;
+                    t += 1;
                 }
                 if level < 0 {
-                    *bp.add(p) = b'-'; p += 1;
+                    *bp.add(p) = b'-';
+                    p += 1;
                     p += fmt_u32_raw(bp.add(p), (0i32.wrapping_sub(level)) as u32);
                 } else {
                     p += fmt_u32_raw(bp.add(p), level as u32);
@@ -434,7 +437,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 t = 0;
                 while t < tag2.len() {
                     *bp.add(p) = *tag2.as_ptr().add(t);
-                    p += 1; t += 1;
+                    p += 1;
+                    t += 1;
                 }
                 p += fmt_u32_raw(bp.add(p), s.error_count);
                 dev_log(sys, 1, bp, p);
@@ -514,7 +518,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
                     // Write a chunk
                     let remaining = blob_len - pos;
-                    let chunk = if remaining < BLOB_CHUNK_SIZE { remaining } else { BLOB_CHUNK_SIZE };
+                    let chunk = if remaining < BLOB_CHUNK_SIZE {
+                        remaining
+                    } else {
+                        BLOB_CHUNK_SIZE
+                    };
                     let src = s.blob_storage.as_ptr().add(blob_off + pos);
                     let written = (sys.channel_write)(s.stream_chan, src, chunk);
                     if written > 0 {
@@ -564,21 +572,29 @@ pub unsafe extern "C" fn flash_store_dispatch(
     match opcode {
         PARAM_STORE_OP => {
             // arg = [module_id:u8, tag:u8, value_bytes...]
-            if arg.is_null() || arg_len < 2 { return -22; }
+            if arg.is_null() || arg_len < 2 {
+                return -22;
+            }
             let module_id = *arg;
             let tag = *arg.add(1);
             let value_len = arg_len - 2;
-            if value_len > MAX_VALUE_LEN { return -22; }
+            if value_len > MAX_VALUE_LEN {
+                return -22;
+            }
             store_param(s, sys, module_id, tag, arg.add(2), value_len)
         }
         PARAM_DELETE_OP => {
             // arg = [module_id:u8, tag:u8]
-            if arg.is_null() || arg_len < 2 { return -22; }
+            if arg.is_null() || arg_len < 2 {
+                return -22;
+            }
             delete_param(s, sys, *arg, *arg.add(1))
         }
         PARAM_CLEAR_ALL_OP => {
             // arg = [module_id:u8] or [0xFF] for factory reset
-            if arg.is_null() || arg_len < 1 { return -22; }
+            if arg.is_null() || arg_len < 1 {
+                return -22;
+            }
             if *arg == 0xFF {
                 erase_store(s, sys)
             } else {
@@ -595,8 +611,12 @@ pub unsafe extern "C" fn flash_store_dispatch(
 
 /// Store a parameter override for the given module.
 unsafe fn store_param(
-    s: &mut FlashState, sys: &SyscallTable,
-    module_id: u8, tag: u8, value: *const u8, value_len: usize,
+    s: &mut FlashState,
+    sys: &SyscallTable,
+    module_id: u8,
+    tag: u8,
+    value: *const u8,
+    value_len: usize,
 ) -> i32 {
     let entry_size = ENTRY_HEADER_SIZE + value_len;
 
@@ -628,10 +648,7 @@ unsafe fn store_param(
 }
 
 /// Append a tombstone for a specific tag.
-unsafe fn delete_param(
-    s: &mut FlashState, sys: &SyscallTable,
-    module_id: u8, tag: u8,
-) -> i32 {
+unsafe fn delete_param(s: &mut FlashState, sys: &SyscallTable, module_id: u8, tag: u8) -> i32 {
     let entry_size = ENTRY_HEADER_SIZE;
     if s.free_offset == 0 {
         return 0; // nothing to delete in virgin sector
@@ -649,10 +666,7 @@ unsafe fn delete_param(
 }
 
 /// Append a clear-all marker for a module.
-unsafe fn clear_all(
-    s: &mut FlashState, sys: &SyscallTable,
-    module_id: u8,
-) -> i32 {
+unsafe fn clear_all(s: &mut FlashState, sys: &SyscallTable, module_id: u8) -> i32 {
     let entry_size = ENTRY_HEADER_SIZE;
     if s.free_offset == 0 {
         return 0;
@@ -685,8 +699,13 @@ unsafe fn erase_store(s: &mut FlashState, sys: &SyscallTable) -> i32 {
 
 /// Write sector header + first entry to a virgin sector.
 unsafe fn write_header_and_entry(
-    _s: &mut FlashState, sys: &SyscallTable,
-    module_id: u8, tag: u8, flags: u8, value: *const u8, value_len: usize,
+    _s: &mut FlashState,
+    sys: &SyscallTable,
+    module_id: u8,
+    tag: u8,
+    flags: u8,
+    value: *const u8,
+    value_len: usize,
 ) -> i32 {
     let total = HEADER_SIZE + ENTRY_HEADER_SIZE + value_len;
     if total > SECTOR_SIZE {
@@ -722,11 +741,15 @@ unsafe fn write_header_and_entry(
 
     // Erase first (sector may have garbage)
     let r = raw_flash_erase(sys, STORE_OFFSET);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
 
     // Program first page
     let r = raw_flash_program(sys, STORE_OFFSET, pb);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
 
     // If entry spans into second page
     if total > PAGE_SIZE {
@@ -739,7 +762,9 @@ unsafe fn write_header_and_entry(
             j += 1;
         }
         let r = raw_flash_program(sys, STORE_OFFSET + PAGE_SIZE as u32, p2);
-        if r < 0 { return r; }
+        if r < 0 {
+            return r;
+        }
     }
 
     0
@@ -747,8 +772,13 @@ unsafe fn write_header_and_entry(
 
 /// Append an entry at free_offset.
 unsafe fn append_entry(
-    s: &mut FlashState, sys: &SyscallTable,
-    module_id: u8, tag: u8, flags: u8, value: *const u8, value_len: usize,
+    s: &mut FlashState,
+    sys: &SyscallTable,
+    module_id: u8,
+    tag: u8,
+    flags: u8,
+    value: *const u8,
+    value_len: usize,
 ) -> i32 {
     let start = s.free_offset as usize;
     let entry_size = ENTRY_HEADER_SIZE + value_len;
@@ -775,7 +805,11 @@ unsafe fn append_entry(
 
     // Write value (may partially fit in this page)
     let space_in_page = PAGE_SIZE - (entry_offset_in_page + ENTRY_HEADER_SIZE);
-    let first_chunk = if value_len < space_in_page { value_len } else { space_in_page };
+    let first_chunk = if value_len < space_in_page {
+        value_len
+    } else {
+        space_in_page
+    };
     let mut i = 0usize;
     while i < first_chunk {
         *pb.add(entry_offset_in_page + ENTRY_HEADER_SIZE + i) = *value.add(i);
@@ -783,7 +817,9 @@ unsafe fn append_entry(
     }
 
     let r = raw_flash_program(sys, STORE_OFFSET + page_start as u32, pb);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
 
     // If entry spans to next page
     if page_end_entry > page_start {
@@ -796,7 +832,9 @@ unsafe fn append_entry(
             j += 1;
         }
         let r = raw_flash_program(sys, STORE_OFFSET + page_end_entry as u32, p2);
-        if r < 0 { return r; }
+        if r < 0 {
+            return r;
+        }
     }
 
     0
@@ -824,12 +862,16 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
 
     while off + ENTRY_HEADER_SIZE <= SECTOR_SIZE {
         let mid = *sector.add(off);
-        if mid == 0xFF { break; }
+        if mid == 0xFF {
+            break;
+        }
         let tag = *sector.add(off + 1);
         let flags = *sector.add(off + 2);
         let vlen = *sector.add(off + 3) as usize;
 
-        if off + ENTRY_HEADER_SIZE + vlen > SECTOR_SIZE { break; }
+        if off + ENTRY_HEADER_SIZE + vlen > SECTOR_SIZE {
+            break;
+        }
 
         if flags & FLAG_CLEAR_ALL != 0 {
             // Remove all entries for this module
@@ -866,7 +908,9 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
         } else {
             // Copy value from XIP into compact_arena
             let arena_off = s.compact_arena_off as usize;
-            if arena_off + vlen > COMPACT_ARENA_SIZE { break; }
+            if arena_off + vlen > COMPACT_ARENA_SIZE {
+                break;
+            }
 
             let src = sector.add(off + ENTRY_HEADER_SIZE);
             let dst = s.compact_arena.as_mut_ptr().add(arena_off);
@@ -905,7 +949,9 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
 
     // Erase sector
     let r = raw_flash_erase(sys, STORE_OFFSET);
-    if r < 0 { return r; }
+    if r < 0 {
+        return r;
+    }
 
     let count = s.compact_count as usize;
 
@@ -936,7 +982,9 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
         let vlen = (*ep).value_len as usize;
         let entry_size = ENTRY_HEADER_SIZE + vlen;
 
-        if write_off + entry_size > SECTOR_SIZE { break; }
+        if write_off + entry_size > SECTOR_SIZE {
+            break;
+        }
 
         // Write entry byte-by-byte into page buffer
         let hdr = [mid, tag, 0u8, vlen as u8];
@@ -959,7 +1007,9 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
             if (write_off & (PAGE_SIZE - 1)) == 0 {
                 let page_off = write_off - PAGE_SIZE;
                 let r = raw_flash_program(sys, STORE_OFFSET + page_off as u32, pb);
-                if r < 0 { return r; }
+                if r < 0 {
+                    return r;
+                }
                 // Reset page buffer
                 let mut k = 0usize;
                 while k < PAGE_SIZE {
@@ -976,7 +1026,9 @@ unsafe fn compact(s: &mut FlashState, sys: &SyscallTable) -> i32 {
     if (write_off & (PAGE_SIZE - 1)) != 0 {
         let page_start = write_off & !(PAGE_SIZE - 1);
         let r = raw_flash_program(sys, STORE_OFFSET + page_start as u32, pb);
-        if r < 0 { return r; }
+        if r < 0 {
+            return r;
+        }
     }
 
     s.free_offset = write_off as u16;
@@ -1023,9 +1075,13 @@ unsafe fn init_free_offset(s: &mut FlashState) {
     let mut off = HEADER_SIZE;
     while off + ENTRY_HEADER_SIZE <= SECTOR_SIZE {
         let mid = *sector.add(off);
-        if mid == 0xFF { break; }
+        if mid == 0xFF {
+            break;
+        }
         let vlen = *sector.add(off + 3) as usize;
-        if off + ENTRY_HEADER_SIZE + vlen > SECTOR_SIZE { break; }
+        if off + ENTRY_HEADER_SIZE + vlen > SECTOR_SIZE {
+            break;
+        }
         off += ENTRY_HEADER_SIZE + vlen;
     }
     s.free_offset = off as u16;

@@ -368,8 +368,8 @@ capability = "time.wall"
 Which targets provide `time.wall` follows the HAL: a hosted Linux runtime
 queries `adjtimex(2)` and reports `network_sync`; the bare-metal and
 browser platforms have no synchronisation evidence and provide nothing. A
-target that gains a time source gains the row, and the table is pinned
-against the platform HALs by `tools/tests/target_facts.rs`.
+target that gains a time source gains the row, and the table states the
+same facts as the platform HALs it describes.
 
 ### Execution envelope
 
@@ -386,7 +386,7 @@ facts and the profile they hold under:
 max_step_us     = 120   # exclusive CPU time of one module_step
 max_dispatch_us = 40    # bounded cost of one synchronous provider dispatch
 profile         = "measured_envelope"
-evidence        = "tests/harness/tests/execution_envelope_ip.rs"
+evidence        = "observed maxima under mixed TCP / ARP / UDP load"
 ```
 
 `max_step_us` is the step's own CPU time; the synchronous provider calls it
@@ -405,8 +405,8 @@ two profiles and they are not interchangeable:
 The manifest parser checks that both facts are present and positive, that
 the profile is one of the two, that an analytical bound names its
 evidence, and that `max_step_us` fits the step budget of every silicon in
-`hardware_targets` — one default scheduler pass, from the target-facts
-table and pinned against the kernel by `tools/tests/target_facts.rs`.
+`hardware_targets` — one default scheduler pass, taken from the
+target-facts table, which carries the kernel's own budget for that silicon.
 
 A graph claims a profile for itself at compose:
 
@@ -426,9 +426,9 @@ graph arithmetic — summing admitted quanta and dispatch costs into a
 scheduler round, composing a service curve with an arrival envelope,
 checking each edge's backlog and deadline — is not part of the claim, and
 an admitted graph holds no derived end-to-end latency bound. `ip` is the
-measured module: its envelope is the maximum step time its harness gate
-observes under a mixed TCP / ARP / UDP load, times the safety factor
-recorded beside the number.
+measured module: its envelope is the maximum step time observed under a
+mixed TCP / ARP / UDP load, times the safety factor recorded beside the
+number.
 
 ## Provider Contracts and Surfaces
 

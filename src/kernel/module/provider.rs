@@ -764,7 +764,7 @@ const MAX_PROVIDERS: usize = MAX_CONTRACTS;
 /// `MAX_PROVIDERS × MAX_CHAIN_DEPTH`, so depth 8 costs ~12 KiB where depth 3
 /// costs ~4.6 KiB. An application processor can host a multi-drive carrier and
 /// has the RAM for it; the MCUs cannot and don't (rp2040 shares ~264 KiB with
-/// embassy-usb/net), so they keep the smaller table.
+/// the USB and network stacks), so they keep the smaller table.
 #[cfg(feature = "chip-rp2040")]
 pub const MAX_CHAIN_DEPTH: usize = 3;
 #[cfg(all(feature = "rp", not(feature = "chip-rp2040")))]

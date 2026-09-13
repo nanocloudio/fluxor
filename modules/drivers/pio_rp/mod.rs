@@ -1,4 +1,4 @@
-//! PIO Stream Provider — PIC module replacing Embassy async PIO system
+//! PIO Stream Provider — the PIC module that owns the PIO blocks
 //!
 //! Handles three PIO service modes via polling + kernel bridges:
 //!   - **TX Stream** (mode 0): double-buffered DMA to PIO TX FIFO
@@ -22,7 +22,6 @@
     unreachable_patterns,
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
-
 
 use core::ffi::c_void;
 
@@ -75,6 +74,7 @@ const CMD_CONFIGURE: u32 = 0x0412;
 const CMD_TRANSFER: u32 = 0x0413;
 const CMD_POLL: u32 = 0x0414;
 const CMD_FREE: u32 = 0x0415;
+const CMD_LEVEL: u32 = 0x0416;
 
 const RX_STREAM_ALLOC: u32 = 0x0420;
 const RX_STREAM_LOAD_PROGRAM: u32 = 0x0421;
@@ -86,34 +86,33 @@ const RX_STREAM_GET_BUFFER: u32 = 0x0426;
 const RX_STREAM_SET_RATE: u32 = 0x0427;
 
 // Kernel bridge opcodes imported from the layered ABI.
-use abi::platform::rp::pio_raw::{
-    SM_EXEC as PIO_SM_EXEC,
-    SM_WRITE_REG as PIO_SM_WRITE_REG,
-    SM_READ_REG as PIO_SM_READ_REG,
-    SM_ENABLE as PIO_SM_ENABLE,
-    INSTR_ALLOC as PIO_INSTR_ALLOC,
-    INSTR_WRITE as PIO_INSTR_WRITE,
-    INSTR_FREE as PIO_INSTR_FREE,
-    PIN_SETUP as PIO_PIN_SETUP,
-    TXF_WRITE as PIO_TXF_WRITE,
-    FSTAT_READ as PIO_FSTAT_READ,
-    SM_RESTART as PIO_SM_RESTART,
-    INPUT_SYNC_BYPASS as PIO_INPUT_SYNC_BYPASS,
-    CMD_TRANSFER as PIO_CMD_XFER,
-};
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 use abi::platform::rp::pio_raw::GPIOBASE as PIO_GPIOBASE;
+use abi::platform::rp::pio_raw::{
+    CMD_POLL as PIO_CMD_XFER_POLL, CMD_TRANSFER as PIO_CMD_XFER, FSTAT_READ as PIO_FSTAT_READ,
+    INPUT_SYNC_BYPASS as PIO_INPUT_SYNC_BYPASS, INSTR_ALLOC as PIO_INSTR_ALLOC,
+    INSTR_FREE as PIO_INSTR_FREE, INSTR_WRITE as PIO_INSTR_WRITE, PIN_LEVEL as PIO_PIN_LEVEL,
+    PIN_SETUP as PIO_PIN_SETUP, SM_ENABLE as PIO_SM_ENABLE, SM_EXEC as PIO_SM_EXEC,
+    SM_READ_REG as PIO_SM_READ_REG, SM_RESTART as PIO_SM_RESTART, SM_WRITE_REG as PIO_SM_WRITE_REG,
+    TXF_WRITE as PIO_TXF_WRITE,
+};
 // pio_rp uses BOTH DMA families:
 //   * `dma_fd::*` for stream transfers (ping-pong queued) — see the
 //     dma_fd_* helpers below.
 //   * `dma_channel::*` for CMD blocking transfers — see raw_dma_* helpers.
 // Both families live under the single PLATFORM_DMA contract.
-use abi::platform::rp::dma_raw::{channel as dma_channel, fd as dma_fd};
 use abi::kernel_abi::HANDLE_POLL as FD_POLL;
+use abi::platform::rp::dma_raw::{channel as dma_channel, fd as dma_fd};
 
 // DMA flags
 const DMA_FLAG_INCR_READ: u8 = 0x01;
-#[allow(dead_code, reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it")]
+#[allow(
+    dead_code,
+    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
+)]
 const DMA_FLAG_INCR_WRITE: u8 = 0x02;
 const DMA_FLAG_SIZE_32: u8 = 0x04;
 
@@ -155,13 +154,13 @@ struct PioProgram {
 struct StreamSlot {
     state: u8,
     pio_num: u8,
-    sm_num: u8,      // assigned at configure time via pio_num default 0
-    active_buf: u8,   // 0=A is front (DMA source), 1=B is front
+    sm_num: u8,     // assigned at configure time via pio_num default 0
+    active_buf: u8, // 0=A is front (DMA source), 1=B is front
     dma_fd: i32,
     push_pending: u8,
-    push_count: u16,  // words pending in back buffer
+    push_count: u16, // words pending in back buffer
     _pad0: u8,
-    instr_mask: u32,  // allocated instruction slots
+    instr_mask: u32, // allocated instruction slots
     instr_origin: u8,
     program_loaded: u8,
     program_status: u8, // 0=none, 1=pending, 2=loaded, 3=error
@@ -201,9 +200,14 @@ struct CmdSlot {
     clock_div: u32,
     instr_mask: u32,
     instr_origin: u8,
-    dma_ch_tx: u8,    // TX DMA channel (raw, blocking)
-    dma_ch_rx: u8,    // RX DMA channel (raw, blocking) — separate for full-duplex
+    dma_ch_tx: u8, // TX DMA channel
+    dma_ch_rx: u8, // RX DMA channel — separate, so both directions run at once
     _pad1: u8,
+    /// The transfer in flight: where its RX data goes when it completes.
+    xfer_rx_ptr: u32,
+    xfer_rx_len: u32,
+    xfer_rx_words: u32,
+    xfer_total: u32,
     program: PioProgram,
     scratch: [u32; CMD_SCRATCH_WORDS],
 }
@@ -217,15 +221,15 @@ struct RxSlot {
     state: u8,
     pio_num: u8,
     sm_num: u8,
-    active_buf: u8,   // which buffer DMA is filling (0=A, 1=B)
+    active_buf: u8, // which buffer DMA is filling (0=A, 1=B)
     dma_fd: i32,
     instr_mask: u32,
     instr_origin: u8,
     program_loaded: u8,
     program_status: u8,
     dma_active: u8,
-    pull_ready: u8,    // 1 = readable buffer available
-    pull_count: u16,   // words in readable buffer
+    pull_ready: u8,  // 1 = readable buffer available
+    pull_count: u16, // words in readable buffer
     in_pin: u8,
     sideset_base: u8,
     shift_bits: u8,
@@ -278,7 +282,10 @@ unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8, val
     *p.add(1) = sm;
     *p.add(2) = reg;
     let vb = value.to_le_bytes();
-    *p.add(3) = vb[0]; *p.add(4) = vb[1]; *p.add(5) = vb[2]; *p.add(6) = vb[3];
+    *p.add(3) = vb[0];
+    *p.add(4) = vb[1];
+    *p.add(5) = vb[2];
+    *p.add(6) = vb[3];
     (sys.provider_call)(-1, PIO_SM_WRITE_REG, p, 7);
 }
 
@@ -286,7 +293,11 @@ unsafe fn pio_sm_write_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8, val
 unsafe fn pio_sm_read_reg(sys: &SyscallTable, pio_num: u8, sm: u8, reg: u8) -> u32 {
     let mut buf = [pio_num, sm, reg, 0, 0, 0, 0];
     let r = (sys.provider_call)(-1, PIO_SM_READ_REG, buf.as_mut_ptr(), 7);
-    if r >= 0 { r as u32 } else { 0 }
+    if r >= 0 {
+        r as u32
+    } else {
+        0
+    }
 }
 
 #[inline(always)]
@@ -321,7 +332,10 @@ unsafe fn pio_instr_free(sys: &SyscallTable, pio_num: u8, mask: u32) {
     let p = buf.as_mut_ptr();
     *p = pio_num;
     let mb = mask.to_le_bytes();
-    *p.add(1) = mb[0]; *p.add(2) = mb[1]; *p.add(3) = mb[2]; *p.add(4) = mb[3];
+    *p.add(1) = mb[0];
+    *p.add(2) = mb[1];
+    *p.add(3) = mb[2];
+    *p.add(4) = mb[3];
     (sys.provider_call)(-1, PIO_INSTR_FREE, p, 5);
 }
 
@@ -346,7 +360,10 @@ unsafe fn pio_txf_write(sys: &SyscallTable, pio_num: u8, sm: u8, value: u32) {
     *p = pio_num;
     *p.add(1) = sm;
     let vb = value.to_le_bytes();
-    *p.add(2) = vb[0]; *p.add(3) = vb[1]; *p.add(4) = vb[2]; *p.add(5) = vb[3];
+    *p.add(2) = vb[0];
+    *p.add(3) = vb[1];
+    *p.add(4) = vb[2];
+    *p.add(5) = vb[3];
     (sys.provider_call)(-1, PIO_TXF_WRITE, p, 6);
 }
 
@@ -357,33 +374,49 @@ unsafe fn dma_fd_create(sys: &SyscallTable) -> i32 {
 }
 
 unsafe fn dma_fd_start(
-    sys: &SyscallTable, fd: i32,
-    read_addr: u32, write_addr: u32, count: u32,
-    dreq: u8, flags: u8,
+    sys: &SyscallTable,
+    fd: i32,
+    read_addr: u32,
+    write_addr: u32,
+    count: u32,
+    dreq: u8,
+    flags: u8,
 ) -> i32 {
     let mut buf = [0u8; 14];
     let p = buf.as_mut_ptr();
     let ra = read_addr.to_le_bytes();
-    *p = ra[0]; *p.add(1) = ra[1]; *p.add(2) = ra[2]; *p.add(3) = ra[3];
+    *p = ra[0];
+    *p.add(1) = ra[1];
+    *p.add(2) = ra[2];
+    *p.add(3) = ra[3];
     let wa = write_addr.to_le_bytes();
-    *p.add(4) = wa[0]; *p.add(5) = wa[1]; *p.add(6) = wa[2]; *p.add(7) = wa[3];
+    *p.add(4) = wa[0];
+    *p.add(5) = wa[1];
+    *p.add(6) = wa[2];
+    *p.add(7) = wa[3];
     let cb = count.to_le_bytes();
-    *p.add(8) = cb[0]; *p.add(9) = cb[1]; *p.add(10) = cb[2]; *p.add(11) = cb[3];
+    *p.add(8) = cb[0];
+    *p.add(9) = cb[1];
+    *p.add(10) = cb[2];
+    *p.add(11) = cb[3];
     *p.add(12) = dreq;
     *p.add(13) = flags;
     (sys.provider_call)(fd, dma_fd::START, p, 14)
 }
 
-unsafe fn dma_fd_queue(
-    sys: &SyscallTable, fd: i32,
-    read_addr: u32, count: u32,
-) -> i32 {
+unsafe fn dma_fd_queue(sys: &SyscallTable, fd: i32, read_addr: u32, count: u32) -> i32 {
     let mut buf = [0u8; 8];
     let p = buf.as_mut_ptr();
     let ra = read_addr.to_le_bytes();
-    *p = ra[0]; *p.add(1) = ra[1]; *p.add(2) = ra[2]; *p.add(3) = ra[3];
+    *p = ra[0];
+    *p.add(1) = ra[1];
+    *p.add(2) = ra[2];
+    *p.add(3) = ra[3];
     let cb = count.to_le_bytes();
-    *p.add(4) = cb[0]; *p.add(5) = cb[1]; *p.add(6) = cb[2]; *p.add(7) = cb[3];
+    *p.add(4) = cb[0];
+    *p.add(5) = cb[1];
+    *p.add(6) = cb[2];
+    *p.add(7) = cb[3];
     (sys.provider_call)(fd, dma_fd::QUEUE, p, 8)
 }
 
@@ -411,15 +444,32 @@ unsafe fn raw_dma_free(sys: &SyscallTable, ch: u8) {
     (sys.provider_call)(ch as i32, dma_channel::FREE, core::ptr::null_mut(), 0);
 }
 
-unsafe fn raw_dma_start(sys: &SyscallTable, ch: u8, read: u32, write: u32, count: u32, dreq: u8, flags: u8) -> i32 {
+unsafe fn raw_dma_start(
+    sys: &SyscallTable,
+    ch: u8,
+    read: u32,
+    write: u32,
+    count: u32,
+    dreq: u8,
+    flags: u8,
+) -> i32 {
     let mut buf = [0u8; 14];
     let p = buf.as_mut_ptr();
     let r = read.to_le_bytes();
-    *p = r[0]; *p.add(1) = r[1]; *p.add(2) = r[2]; *p.add(3) = r[3];
+    *p = r[0];
+    *p.add(1) = r[1];
+    *p.add(2) = r[2];
+    *p.add(3) = r[3];
     let w = write.to_le_bytes();
-    *p.add(4) = w[0]; *p.add(5) = w[1]; *p.add(6) = w[2]; *p.add(7) = w[3];
+    *p.add(4) = w[0];
+    *p.add(5) = w[1];
+    *p.add(6) = w[2];
+    *p.add(7) = w[3];
     let c = count.to_le_bytes();
-    *p.add(8) = c[0]; *p.add(9) = c[1]; *p.add(10) = c[2]; *p.add(11) = c[3];
+    *p.add(8) = c[0];
+    *p.add(9) = c[1];
+    *p.add(10) = c[2];
+    *p.add(11) = c[3];
     *p.add(12) = dreq;
     *p.add(13) = flags;
     (sys.provider_call)(ch as i32, dma_channel::START, p, 14)
@@ -462,11 +512,7 @@ unsafe fn load_program(
 }
 
 /// Configure SM for TX streaming (autopull, MSB-first, join TX FIFO)
-unsafe fn configure_stream_sm(
-    sys: &SyscallTable,
-    slot: &StreamSlot,
-    origin: u8,
-) {
+unsafe fn configure_stream_sm(sys: &SyscallTable, slot: &StreamSlot, origin: u8) {
     let pio_num = slot.pio_num;
     let sm = slot.sm_num;
     let sm_mask = 1u8 << sm;
@@ -483,8 +529,8 @@ unsafe fn configure_stream_sm(
     // Build execctrl value:
     // wrap_bottom[11:7], wrap_top[16:12], side_en[30], side_pindir[29]
     let mut execctrl: u32 = 0;
-    execctrl |= (wrap_bottom as u32) << 7;    // WRAP_BOTTOM
-    execctrl |= (wrap_top as u32) << 12;      // WRAP_TOP
+    execctrl |= (wrap_bottom as u32) << 7; // WRAP_BOTTOM
+    execctrl |= (wrap_top as u32) << 12; // WRAP_TOP
     if slot.program.sideset_optional != 0 {
         execctrl |= 1 << 30; // SIDE_EN
     }
@@ -502,12 +548,12 @@ unsafe fn configure_stream_sm(
     //  [28:26] = SET_COUNT
     //  [31:29] = SIDESET_COUNT
     let mut pinctrl: u32 = 0;
-    pinctrl |= slot.out_pin as u32;                         // [4:0] OUT_BASE
-    pinctrl |= (slot.out_pin as u32) << 5;                  // [9:5] SET_BASE
-    pinctrl |= (slot.sideset_base as u32) << 10;            // [14:10] SIDESET_BASE
-    pinctrl |= 1u32 << 20;                                  // [25:20] OUT_COUNT=1
-    pinctrl |= 1u32 << 26;                                  // [28:26] SET_COUNT=1
-    pinctrl |= (slot.program.sideset_bits as u32) << 29;    // [31:29] SIDESET_COUNT
+    pinctrl |= slot.out_pin as u32; // [4:0] OUT_BASE
+    pinctrl |= (slot.out_pin as u32) << 5; // [9:5] SET_BASE
+    pinctrl |= (slot.sideset_base as u32) << 10; // [14:10] SIDESET_BASE
+    pinctrl |= 1u32 << 20; // [25:20] OUT_COUNT=1
+    pinctrl |= 1u32 << 26; // [28:26] SET_COUNT=1
+    pinctrl |= (slot.program.sideset_bits as u32) << 29; // [31:29] SIDESET_COUNT
     pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
 
     // CLKDIV: integer part shifted left by 16, frac by 8
@@ -516,10 +562,10 @@ unsafe fn configure_stream_sm(
 
     // SHIFTCTRL: join TX, autopull, MSB-first, pull_thresh
     let mut shiftctrl: u32 = 0;
-    shiftctrl |= 1 << 30;  // FJOIN_TX
-    shiftctrl |= 1 << 17;  // AUTOPULL
-    // OUT_SHIFTDIR=0 (shift left = MSB first) — bit 19
-    // PULL_THRESH [24:20]
+    shiftctrl |= 1 << 30; // FJOIN_TX
+    shiftctrl |= 1 << 17; // AUTOPULL
+                          // OUT_SHIFTDIR=0 (shift left = MSB first) — bit 19
+                          // PULL_THRESH [24:20]
     shiftctrl |= (slot.shift_bits as u32 & 0x1F) << 20;
     pio_sm_write_reg(sys, pio_num, sm, REG_SHIFTCTRL, shiftctrl);
 
@@ -534,8 +580,7 @@ unsafe fn configure_stream_sm(
 
     // If sideset pins differ from out, set their directions too
     if slot.sideset_base != slot.out_pin && slot.program.sideset_bits > 0 {
-        let ss_pinctrl = (slot.sideset_base as u32) << 5
-            | (slot.program.sideset_bits as u32) << 26;
+        let ss_pinctrl = (slot.sideset_base as u32) << 5 | (slot.program.sideset_bits as u32) << 26;
         pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, ss_pinctrl);
         let ss_mask = (1u16 << slot.program.sideset_bits) - 1;
         pio_sm_exec(sys, pio_num, sm, 0xE080 | ss_mask); // SET PINDIRS, mask
@@ -553,11 +598,7 @@ unsafe fn configure_stream_sm(
 }
 
 /// Configure SM for CMD mode (bidirectional: autopull+autopush, MSB-first)
-unsafe fn configure_cmd_sm(
-    sys: &SyscallTable,
-    slot: &CmdSlot,
-    origin: u8,
-) {
+unsafe fn configure_cmd_sm(sys: &SyscallTable, slot: &CmdSlot, origin: u8) {
     let pio_num = slot.pio_num;
     let sm = slot.sm_num;
     let sm_mask = 1u8 << sm;
@@ -571,19 +612,23 @@ unsafe fn configure_cmd_sm(
     let mut execctrl: u32 = 0;
     execctrl |= (wrap_bottom as u32) << 7;
     execctrl |= (wrap_top as u32) << 12;
-    if slot.program.sideset_optional != 0 { execctrl |= 1 << 30; }
-    if slot.program.sideset_pindirs != 0 { execctrl |= 1 << 29; }
+    if slot.program.sideset_optional != 0 {
+        execctrl |= 1 << 30;
+    }
+    if slot.program.sideset_pindirs != 0 {
+        execctrl |= 1 << 29;
+    }
     pio_sm_write_reg(sys, pio_num, sm, REG_EXECCTRL, execctrl);
 
     // PINCTRL: out=data, in=data, set=data, sideset=clk
     let mut pinctrl: u32 = 0;
-    pinctrl |= slot.data_pin as u32;                         // [4:0] OUT_BASE
-    pinctrl |= (slot.data_pin as u32) << 5;                  // [9:5] SET_BASE
-    pinctrl |= (slot.clk_pin as u32) << 10;                  // [14:10] SIDESET_BASE
-    pinctrl |= (slot.data_pin as u32) << 15;                 // [19:15] IN_BASE
-    pinctrl |= 1u32 << 20;                                   // [25:20] OUT_COUNT=1
-    pinctrl |= 1u32 << 26;                                   // [28:26] SET_COUNT=1
-    pinctrl |= (slot.program.sideset_bits as u32) << 29;     // [31:29] SIDESET_COUNT
+    pinctrl |= slot.data_pin as u32; // [4:0] OUT_BASE
+    pinctrl |= (slot.data_pin as u32) << 5; // [9:5] SET_BASE
+    pinctrl |= (slot.clk_pin as u32) << 10; // [14:10] SIDESET_BASE
+    pinctrl |= (slot.data_pin as u32) << 15; // [19:15] IN_BASE
+    pinctrl |= 1u32 << 20; // [25:20] OUT_COUNT=1
+    pinctrl |= 1u32 << 26; // [28:26] SET_COUNT=1
+    pinctrl |= (slot.program.sideset_bits as u32) << 29; // [31:29] SIDESET_COUNT
     pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
 
     // CLKDIV
@@ -591,10 +636,10 @@ unsafe fn configure_cmd_sm(
 
     // SHIFTCTRL: autopull+autopush, MSB-first, 32-bit thresholds
     let mut shiftctrl: u32 = 0;
-    shiftctrl |= 1 << 17;  // AUTOPULL
-    shiftctrl |= 1 << 16;  // AUTOPUSH
-    // OUT_SHIFTDIR=0, IN_SHIFTDIR=0 (MSB first)
-    // PULL_THRESH=0 (=32), PUSH_THRESH=0 (=32)
+    shiftctrl |= 1 << 17; // AUTOPULL
+    shiftctrl |= 1 << 16; // AUTOPUSH
+                          // OUT_SHIFTDIR=0, IN_SHIFTDIR=0 (MSB first)
+                          // PULL_THRESH=0 (=32), PUSH_THRESH=0 (=32)
     pio_sm_write_reg(sys, pio_num, sm, REG_SHIFTCTRL, shiftctrl);
 
     // Force data+clk pins as output LOW
@@ -618,7 +663,13 @@ unsafe fn configure_cmd_sm(
     {
         let pin_mask = 1u32 << slot.data_pin;
         let mask_bytes = pin_mask.to_le_bytes();
-        let mut buf = [slot.pio_num, mask_bytes[0], mask_bytes[1], mask_bytes[2], mask_bytes[3]];
+        let mut buf = [
+            slot.pio_num,
+            mask_bytes[0],
+            mask_bytes[1],
+            mask_bytes[2],
+            mask_bytes[3],
+        ];
         (sys.provider_call)(-1, PIO_INPUT_SYNC_BYPASS, buf.as_mut_ptr(), 5);
     }
 
@@ -630,11 +681,7 @@ unsafe fn configure_cmd_sm(
 }
 
 /// Configure SM for RX streaming (autopush, MSB-first, join RX FIFO)
-unsafe fn configure_rx_sm(
-    sys: &SyscallTable,
-    slot: &RxSlot,
-    origin: u8,
-) {
+unsafe fn configure_rx_sm(sys: &SyscallTable, slot: &RxSlot, origin: u8) {
     let pio_num = slot.pio_num;
     let sm = slot.sm_num;
     let sm_mask = 1u8 << sm;
@@ -648,17 +695,21 @@ unsafe fn configure_rx_sm(
     let mut execctrl: u32 = 0;
     execctrl |= (wrap_bottom as u32) << 7;
     execctrl |= (wrap_top as u32) << 12;
-    if slot.program.sideset_optional != 0 { execctrl |= 1 << 30; }
-    if slot.program.sideset_pindirs != 0 { execctrl |= 1 << 29; }
+    if slot.program.sideset_optional != 0 {
+        execctrl |= 1 << 30;
+    }
+    if slot.program.sideset_pindirs != 0 {
+        execctrl |= 1 << 29;
+    }
     pio_sm_write_reg(sys, pio_num, sm, REG_EXECCTRL, execctrl);
 
     // PINCTRL: in=in_pin, sideset=sideset_base
     let mut pinctrl: u32 = 0;
-    pinctrl |= (slot.in_pin as u32) << 5;                    // [9:5] SET_BASE
-    pinctrl |= (slot.sideset_base as u32) << 10;             // [14:10] SIDESET_BASE
-    pinctrl |= (slot.in_pin as u32) << 15;                   // [19:15] IN_BASE
-    pinctrl |= 1u32 << 26;                                   // [28:26] SET_COUNT=1
-    pinctrl |= (slot.program.sideset_bits as u32) << 29;     // [31:29] SIDESET_COUNT
+    pinctrl |= (slot.in_pin as u32) << 5; // [9:5] SET_BASE
+    pinctrl |= (slot.sideset_base as u32) << 10; // [14:10] SIDESET_BASE
+    pinctrl |= (slot.in_pin as u32) << 15; // [19:15] IN_BASE
+    pinctrl |= 1u32 << 26; // [28:26] SET_COUNT=1
+    pinctrl |= (slot.program.sideset_bits as u32) << 29; // [31:29] SIDESET_COUNT
     pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, pinctrl);
 
     // CLKDIV
@@ -666,9 +717,9 @@ unsafe fn configure_rx_sm(
 
     // SHIFTCTRL: join RX, autopush, MSB-first, push_thresh
     let mut shiftctrl: u32 = 0;
-    shiftctrl |= 1 << 31;  // FJOIN_RX
-    shiftctrl |= 1 << 16;  // AUTOPUSH
-    // IN_SHIFTDIR=0 (shift left = MSB first) — bit 18
+    shiftctrl |= 1 << 31; // FJOIN_RX
+    shiftctrl |= 1 << 16; // AUTOPUSH
+                          // IN_SHIFTDIR=0 (shift left = MSB first) — bit 18
     shiftctrl |= (slot.shift_bits as u32 & 0x1F) << 20; // PUSH_THRESH [24:20]
     pio_sm_write_reg(sys, pio_num, sm, REG_SHIFTCTRL, shiftctrl);
 
@@ -679,7 +730,7 @@ unsafe fn configure_rx_sm(
         let mut n = 0u8;
         while n < slot.program.sideset_bits {
             pio_pin_setup(sys, ss_pin, pio_num, 2); // PullUp
-            // Set as output
+                                                    // Set as output
             let ss_pc = (ss_pin as u32) | ((ss_pin as u32) << 5) | (1u32 << 26);
             pio_sm_write_reg(sys, pio_num, sm, REG_PINCTRL, ss_pc);
             pio_sm_exec(sys, pio_num, sm, 0xE081); // SET PINDIRS, 1
@@ -709,23 +760,42 @@ unsafe fn configure_rx_sm(
 /// Parse load_program args: ptr to [program_ptr:u32, program_len:u32,
 ///   wrap_target:u8, wrap:u8, sideset_bits:u8, options:u8]
 /// This matches PioLoadProgramArgs layout.
-unsafe fn parse_load_program_args(arg: *const u8, arg_len: usize) -> Option<(*const u16, u8, u8, u8, u8, u8)> {
+unsafe fn parse_load_program_args(
+    arg: *const u8,
+    arg_len: usize,
+) -> Option<(*const u16, u8, u8, u8, u8, u8)> {
     // PioLoadProgramArgs is: *const u16 (4B on ARM), u32, u8, u8, u8, u8
-    if arg_len < 12 { return None; }
+    if arg_len < 12 {
+        return None;
+    }
     let prog_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as *const u16;
     let prog_len = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as u8;
     let wrap_target = *arg.add(8);
     let wrap = *arg.add(9);
     let sideset_bits = *arg.add(10);
     let options = *arg.add(11);
-    if prog_ptr.is_null() || prog_len == 0 || prog_len > 32 { return None; }
-    if wrap_target >= prog_len || wrap >= prog_len { return None; }
-    if sideset_bits > 5 { return None; }
+    if prog_ptr.is_null() || prog_len == 0 || prog_len > 32 {
+        return None;
+    }
+    if wrap_target >= prog_len || wrap >= prog_len {
+        return None;
+    }
+    if sideset_bits > 5 {
+        return None;
+    }
     Some((prog_ptr, prog_len, wrap_target, wrap, sideset_bits, options))
 }
 
 /// Copy program from caller's pointer into slot's PioProgram struct
-unsafe fn copy_program(prog: &mut PioProgram, src: *const u16, len: u8, wrap_target: u8, wrap: u8, sideset_bits: u8, options: u8) {
+unsafe fn copy_program(
+    prog: &mut PioProgram,
+    src: *const u16,
+    len: u8,
+    wrap_target: u8,
+    wrap: u8,
+    sideset_bits: u8,
+    options: u8,
+) {
     prog.length = len;
     prog.wrap_target = wrap_target;
     prog.wrap = wrap;
@@ -753,7 +823,9 @@ pub unsafe extern "C" fn pio_dispatch(
     arg: *mut u8,
     arg_len: usize,
 ) -> i32 {
-    if state.is_null() { return -22; }
+    if state.is_null() {
+        return -22;
+    }
     let s = &mut *(state as *mut PioState);
     let sys = &*s.syscalls;
 
@@ -787,24 +859,42 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         STREAM_LOAD_PROGRAM => {
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return -22; }
+            if idx >= MAX_STREAM_SLOTS {
+                return -22;
+            }
             let sp = s.streams.as_mut_ptr().add(idx);
-            if (*sp).state == SLOT_FREE || (*sp).state == SLOT_BUSY { return -16; }
+            if (*sp).state == SLOT_FREE || (*sp).state == SLOT_BUSY {
+                return -16;
+            }
             let args = match parse_load_program_args(arg, arg_len) {
                 Some(a) => a,
                 None => return -22,
             };
-            copy_program(&mut (*sp).program, args.0, args.1, args.2, args.3, args.4, args.5);
+            copy_program(
+                &mut (*sp).program,
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+            );
             (*sp).program_status = 1; // pending
             0
         }
         STREAM_CONFIGURE => {
             // PioConfigureArgs: clock_div:u32, data_pin:u8, clock_base:u8, shift_bits:u8, pad:u8
-            if arg.is_null() || arg_len < 8 { return -22; }
+            if arg.is_null() || arg_len < 8 {
+                return -22;
+            }
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return -22; }
+            if idx >= MAX_STREAM_SLOTS {
+                return -22;
+            }
             let sp = s.streams.as_mut_ptr().add(idx);
-            if (*sp).state == SLOT_FREE { return -5; }
+            if (*sp).state == SLOT_FREE {
+                return -5;
+            }
             (*sp).clock_div = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             (*sp).out_pin = *arg.add(4);
             (*sp).sideset_base = *arg.add(5);
@@ -814,7 +904,8 @@ pub unsafe extern "C" fn pio_dispatch(
             (*sp).state = SLOT_READY;
             // Try to load program now if pending
             if (*sp).program_status == 1 && (*sp).program.length > 0 {
-                let (origin, mask) = load_program(sys, (*sp).pio_num, &(*sp).program, (*sp).instr_mask);
+                let (origin, mask) =
+                    load_program(sys, (*sp).pio_num, &(*sp).program, (*sp).instr_mask);
                 if origin >= 0 {
                     (*sp).instr_mask = mask;
                     (*sp).instr_origin = origin as u8;
@@ -824,13 +915,18 @@ pub unsafe extern "C" fn pio_dispatch(
                         pio_pin_setup(sys, (*sp).sideset_base, (*sp).pio_num, 2);
                         // Also setup second sideset pin if sideset_bits > 1
                         if (*sp).program.sideset_bits > 1 {
-                            pio_pin_setup(sys, (*sp).sideset_base.wrapping_add(1), (*sp).pio_num, 2);
+                            pio_pin_setup(
+                                sys,
+                                (*sp).sideset_base.wrapping_add(1),
+                                (*sp).pio_num,
+                                2,
+                            );
                         }
                     }
                     configure_stream_sm(sys, &*sp, origin as u8);
                     (*sp).program_loaded = 1;
                     (*sp).program_status = 2; // loaded
-                    // Create DMA FD
+                                              // Create DMA FD
                     (*sp).dma_fd = dma_fd_create(sys);
                 } else {
                     (*sp).program_status = 3; // error
@@ -840,20 +936,38 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         STREAM_CAN_PUSH => {
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return 0; }
+            if idx >= MAX_STREAM_SLOTS {
+                return 0;
+            }
             let sp = s.streams.as_ptr().add(idx);
-            if (*sp).state == SLOT_FREE { return 0; }
-            if (*sp).push_pending != 0 { 0 } else { 1 }
+            if (*sp).state == SLOT_FREE {
+                return 0;
+            }
+            if (*sp).push_pending != 0 {
+                0
+            } else {
+                1
+            }
         }
         STREAM_PUSH => {
-            if arg.is_null() || arg_len < 4 { return -22; }
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
             let count = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as u16;
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return -22; }
+            if idx >= MAX_STREAM_SLOTS {
+                return -22;
+            }
             let sp = s.streams.as_mut_ptr().add(idx);
-            if (*sp).state != SLOT_READY && (*sp).state != SLOT_BUSY { return -5; }
-            if (*sp).push_pending != 0 { return -16; }
-            if count == 0 || count as usize > STREAM_BUF_WORDS { return -22; }
+            if (*sp).state != SLOT_READY && (*sp).state != SLOT_BUSY {
+                return -5;
+            }
+            if (*sp).push_pending != 0 {
+                return -16;
+            }
+            if count == 0 || count as usize > STREAM_BUF_WORDS {
+                return -22;
+            }
             // Capture t0 on first push
             if (*sp).t0_lo == 0 && (*sp).t0_hi == 0 {
                 // Get current micros via kernel_abi::timer::MICROS.
@@ -875,10 +989,16 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         STREAM_GET_BUFFER | DIRECT_BUFFER => {
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return 0; }
+            if idx >= MAX_STREAM_SLOTS {
+                return 0;
+            }
             let sp = s.streams.as_ptr().add(idx);
-            if (*sp).state == SLOT_FREE { return 0; }
-            if (*sp).push_pending != 0 { return 0; }
+            if (*sp).state == SLOT_FREE {
+                return 0;
+            }
+            if (*sp).push_pending != 0 {
+                return 0;
+            }
             // Return pointer to back buffer
             let buf_ptr = if (*sp).active_buf == 0 {
                 // A is front (DMA source), B is back (writable)
@@ -890,20 +1010,33 @@ pub unsafe extern "C" fn pio_dispatch(
                 // DIRECT_BUFFER: also write capacity to arg
                 if !arg.is_null() && arg_len >= 4 {
                     let cap = (STREAM_BUF_WORDS as u32).to_le_bytes();
-                    *arg = cap[0]; *arg.add(1) = cap[1]; *arg.add(2) = cap[2]; *arg.add(3) = cap[3];
+                    *arg = cap[0];
+                    *arg.add(1) = cap[1];
+                    *arg.add(2) = cap[2];
+                    *arg.add(3) = cap[3];
                 }
             }
             buf_ptr as i32
         }
         DIRECT_PUSH => {
-            if arg.is_null() || arg_len < 4 { return -22; }
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
             let words = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]) as u16;
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return -22; }
+            if idx >= MAX_STREAM_SLOTS {
+                return -22;
+            }
             let sp = s.streams.as_mut_ptr().add(idx);
-            if (*sp).state != SLOT_READY && (*sp).state != SLOT_BUSY { return -5; }
-            if (*sp).push_pending != 0 { return -16; }
-            if words == 0 || words as usize > STREAM_BUF_WORDS { return -22; }
+            if (*sp).state != SLOT_READY && (*sp).state != SLOT_BUSY {
+                return -5;
+            }
+            if (*sp).push_pending != 0 {
+                return -16;
+            }
+            if words == 0 || words as usize > STREAM_BUF_WORDS {
+                return -22;
+            }
             (*sp).queued_units = (*sp).queued_units.wrapping_add(words as u32);
             (*sp).push_pending = 1;
             (*sp).push_count = words;
@@ -911,9 +1044,13 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         STREAM_FREE => {
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return 0; }
+            if idx >= MAX_STREAM_SLOTS {
+                return 0;
+            }
             let sp = s.streams.as_mut_ptr().add(idx);
-            if (*sp).state == SLOT_FREE { return 0; }
+            if (*sp).state == SLOT_FREE {
+                return 0;
+            }
             // Stop SM
             pio_sm_enable(sys, (*sp).pio_num, 1 << (*sp).sm_num, false);
             // Free DMA FD
@@ -934,39 +1071,68 @@ pub unsafe extern "C" fn pio_dispatch(
             // handle < 0: caller doesn't own a stream, so return the
             // first active stream's time (documented "first active PIO
             // stream" path in kernel_abi::STREAM_TIME).
-            if arg.is_null() || arg_len < 24 { return -22; }
+            if arg.is_null() || arg_len < 24 {
+                return -22;
+            }
             let idx = if handle < 0 {
                 let mut found: usize = MAX_STREAM_SLOTS;
                 let mut i = 0usize;
                 while i < MAX_STREAM_SLOTS {
                     let sp = s.streams.as_ptr().add(i);
-                    if (*sp).state != SLOT_FREE { found = i; break; }
+                    if (*sp).state != SLOT_FREE {
+                        found = i;
+                        break;
+                    }
                     i += 1;
                 }
-                if found >= MAX_STREAM_SLOTS { return -19; } // ENODEV
+                if found >= MAX_STREAM_SLOTS {
+                    return -19;
+                } // ENODEV
                 found
             } else {
                 handle as usize
             };
-            if idx >= MAX_STREAM_SLOTS { return -22; }
+            if idx >= MAX_STREAM_SLOTS {
+                return -22;
+            }
             let sp = s.streams.as_ptr().add(idx);
-            if (*sp).state == SLOT_FREE { return -5; }
+            if (*sp).state == SLOT_FREE {
+                return -5;
+            }
             // consumed_units (u64 LE)
             let lo = (*sp).consumed_lo.to_le_bytes();
             let hi = (*sp).consumed_hi.to_le_bytes();
-            *arg = lo[0]; *arg.add(1) = lo[1]; *arg.add(2) = lo[2]; *arg.add(3) = lo[3];
-            *arg.add(4) = hi[0]; *arg.add(5) = hi[1]; *arg.add(6) = hi[2]; *arg.add(7) = hi[3];
+            *arg = lo[0];
+            *arg.add(1) = lo[1];
+            *arg.add(2) = lo[2];
+            *arg.add(3) = lo[3];
+            *arg.add(4) = hi[0];
+            *arg.add(5) = hi[1];
+            *arg.add(6) = hi[2];
+            *arg.add(7) = hi[3];
             // queued_units (u32 LE)
             let qb = (*sp).queued_units.to_le_bytes();
-            *arg.add(8) = qb[0]; *arg.add(9) = qb[1]; *arg.add(10) = qb[2]; *arg.add(11) = qb[3];
+            *arg.add(8) = qb[0];
+            *arg.add(9) = qb[1];
+            *arg.add(10) = qb[2];
+            *arg.add(11) = qb[3];
             // rate_q16 (u32 LE)
             let rb = (*sp).rate_q16.to_le_bytes();
-            *arg.add(12) = rb[0]; *arg.add(13) = rb[1]; *arg.add(14) = rb[2]; *arg.add(15) = rb[3];
+            *arg.add(12) = rb[0];
+            *arg.add(13) = rb[1];
+            *arg.add(14) = rb[2];
+            *arg.add(15) = rb[3];
             // t0_micros (u64 LE)
             let t0l = (*sp).t0_lo.to_le_bytes();
             let t0h = (*sp).t0_hi.to_le_bytes();
-            *arg.add(16) = t0l[0]; *arg.add(17) = t0l[1]; *arg.add(18) = t0l[2]; *arg.add(19) = t0l[3];
-            *arg.add(20) = t0h[0]; *arg.add(21) = t0h[1]; *arg.add(22) = t0h[2]; *arg.add(23) = t0h[3];
+            *arg.add(16) = t0l[0];
+            *arg.add(17) = t0l[1];
+            *arg.add(18) = t0l[2];
+            *arg.add(19) = t0l[3];
+            *arg.add(20) = t0h[0];
+            *arg.add(21) = t0h[1];
+            *arg.add(22) = t0h[2];
+            *arg.add(23) = t0h[3];
             0
         }
         PROGRAM_STATUS => {
@@ -981,10 +1147,14 @@ pub unsafe extern "C" fn pio_dispatch(
             -22
         }
         STREAM_SET_RATE => {
-            if arg.is_null() || arg_len < 4 { return -22; }
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
             let rate = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let idx = handle as usize;
-            if idx >= MAX_STREAM_SLOTS { return -22; }
+            if idx >= MAX_STREAM_SLOTS {
+                return -22;
+            }
             let sp = s.streams.as_mut_ptr().add(idx);
             (*sp).rate_q16 = rate;
             0
@@ -992,10 +1162,14 @@ pub unsafe extern "C" fn pio_dispatch(
 
         // ==== CMD ====
         CMD_ALLOC => {
-            if arg.is_null() || arg_len < 2 { return -22; }
+            if arg.is_null() || arg_len < 2 {
+                return -22;
+            }
             let pio_idx = *arg;
             let sm_idx = *arg.add(1);
-            if pio_idx > 2 || sm_idx > 3 { return -22; }
+            if pio_idx > 2 || sm_idx > 3 {
+                return -22;
+            }
             let mut i = 0usize;
             while i < MAX_CMD_SLOTS {
                 let cp = s.cmds.as_mut_ptr().add(i);
@@ -1006,7 +1180,8 @@ pub unsafe extern "C" fn pio_dispatch(
                     (*cp).program_loaded = 0;
                     (*cp).program_status = 0;
                     (*cp).instr_mask = 0;
-                    (*cp).dma_ch_tx = 0xFF; (*cp).dma_ch_rx = 0xFF;
+                    (*cp).dma_ch_tx = 0xFF;
+                    (*cp).dma_ch_rx = 0xFF;
                     return i as i32;
                 }
                 i += 1;
@@ -1015,31 +1190,51 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         CMD_LOAD_PROGRAM => {
             let idx = handle as usize;
-            if idx >= MAX_CMD_SLOTS { return -22; }
+            if idx >= MAX_CMD_SLOTS {
+                return -22;
+            }
             let cp = s.cmds.as_mut_ptr().add(idx);
-            if (*cp).state == SLOT_FREE || (*cp).state == SLOT_BUSY { return -16; }
+            if (*cp).state == SLOT_FREE || (*cp).state == SLOT_BUSY {
+                return -16;
+            }
             let args = match parse_load_program_args(arg, arg_len) {
                 Some(a) => a,
                 None => return -22,
             };
-            copy_program(&mut (*cp).program, args.0, args.1, args.2, args.3, args.4, args.5);
+            copy_program(
+                &mut (*cp).program,
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+            );
             (*cp).program_status = 1;
             0
         }
         CMD_CONFIGURE => {
             // PioCmdConfigureArgs: data_pin:u8, clk_pin:u8, pad:[u8;2], clock_div:u32
-            if arg.is_null() || arg_len < 8 { return -22; }
+            if arg.is_null() || arg_len < 8 {
+                return -22;
+            }
             let idx = handle as usize;
-            if idx >= MAX_CMD_SLOTS { return -22; }
+            if idx >= MAX_CMD_SLOTS {
+                return -22;
+            }
             let cp = s.cmds.as_mut_ptr().add(idx);
-            if (*cp).state == SLOT_FREE { return -5; }
+            if (*cp).state == SLOT_FREE {
+                return -5;
+            }
             (*cp).data_pin = *arg;
             (*cp).clk_pin = *arg.add(1);
-            (*cp).clock_div = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
+            (*cp).clock_div =
+                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]);
             (*cp).state = SLOT_READY;
             // Try program load
             if (*cp).program_status == 1 && (*cp).program.length > 0 {
-                let (origin, mask) = load_program(sys, (*cp).pio_num, &(*cp).program, (*cp).instr_mask);
+                let (origin, mask) =
+                    load_program(sys, (*cp).pio_num, &(*cp).program, (*cp).instr_mask);
                 if origin >= 0 {
                     (*cp).instr_mask = mask;
                     (*cp).instr_origin = origin as u8;
@@ -1050,8 +1245,12 @@ pub unsafe extern "C" fn pio_dispatch(
                     // Allocate two raw DMA channels (TX + RX for full-duplex gSPI)
                     let tx_ch = raw_dma_alloc(sys);
                     let rx_ch = raw_dma_alloc(sys);
-                    if tx_ch >= 0 { (*cp).dma_ch_tx = tx_ch as u8; }
-                    if rx_ch >= 0 { (*cp).dma_ch_rx = rx_ch as u8; }
+                    if tx_ch >= 0 {
+                        (*cp).dma_ch_tx = tx_ch as u8;
+                    }
+                    if rx_ch >= 0 {
+                        (*cp).dma_ch_rx = rx_ch as u8;
+                    }
                     (*cp).program_loaded = 1;
                     (*cp).program_status = 2;
                 } else {
@@ -1062,19 +1261,32 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         CMD_TRANSFER => {
             // PioCmdTransferArgs: tx_ptr:u32, tx_len:u32, rx_ptr:u32, rx_len:u32
-            if arg.is_null() || arg_len < 16 { return -22; }
+            if arg.is_null() || arg_len < 16 {
+                return -22;
+            }
             let idx = handle as usize;
-            if idx >= MAX_CMD_SLOTS { return -22; }
+            if idx >= MAX_CMD_SLOTS {
+                return -22;
+            }
             let cp = s.cmds.as_mut_ptr().add(idx);
-            if (*cp).state != SLOT_READY { return -16; }
-            if (*cp).program_loaded == 0 { return -5; }
+            if (*cp).state != SLOT_READY {
+                return -16;
+            }
+            if (*cp).program_loaded == 0 {
+                return -5;
+            }
 
             let tx_ptr = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
-            let tx_len = u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as usize;
+            let tx_len =
+                u32::from_le_bytes([*arg.add(4), *arg.add(5), *arg.add(6), *arg.add(7)]) as usize;
             let rx_ptr = u32::from_le_bytes([*arg.add(8), *arg.add(9), *arg.add(10), *arg.add(11)]);
-            let rx_len = u32::from_le_bytes([*arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15)]) as usize;
+            let rx_len =
+                u32::from_le_bytes([*arg.add(12), *arg.add(13), *arg.add(14), *arg.add(15)])
+                    as usize;
 
-            if tx_ptr == 0 || tx_len < 8 { return -22; }
+            if tx_ptr == 0 || tx_len < 8 {
+                return -22;
+            }
 
             // Read tx_words from first 4 bytes of tx buffer
             let tx_src = tx_ptr as *const u8;
@@ -1098,7 +1310,9 @@ pub unsafe extern "C" fn pio_dispatch(
                 0
             };
 
-            if tx_words > CMD_SCRATCH_WORDS { return -22; }
+            if tx_words > CMD_SCRATCH_WORDS {
+                return -22;
+            }
 
             // Copy TX data to aligned scratch
             let scratch = (*cp).scratch.as_mut_ptr();
@@ -1125,7 +1339,9 @@ pub unsafe extern "C" fn pio_dispatch(
             let sm_n = (*cp).sm_num;
             let dma_ch_tx = (*cp).dma_ch_tx;
             let dma_ch_rx = (*cp).dma_ch_rx;
-            if dma_ch_tx == 0xFF || dma_ch_rx == 0xFF { return -5; }
+            if dma_ch_tx == 0xFF || dma_ch_rx == 0xFF {
+                return -5;
+            }
 
             // RX writes to the second half of scratch to avoid clobbering TX data
             let rx_scratch = scratch.add(CMD_SCRATCH_WORDS >> 1);
@@ -1138,23 +1354,79 @@ pub unsafe extern "C" fn pio_dispatch(
             *xp.add(1) = sm_n;
             *xp.add(2) = origin;
             let wb = (write_bits as u32).to_le_bytes();
-            *xp.add(4) = wb[0]; *xp.add(5) = wb[1]; *xp.add(6) = wb[2]; *xp.add(7) = wb[3];
+            *xp.add(4) = wb[0];
+            *xp.add(5) = wb[1];
+            *xp.add(6) = wb[2];
+            *xp.add(7) = wb[3];
             let rb = (read_bits as u32).to_le_bytes();
-            *xp.add(8) = rb[0]; *xp.add(9) = rb[1]; *xp.add(10) = rb[2]; *xp.add(11) = rb[3];
+            *xp.add(8) = rb[0];
+            *xp.add(9) = rb[1];
+            *xp.add(10) = rb[2];
+            *xp.add(11) = rb[3];
             let ta = (scratch as u32).to_le_bytes();
-            *xp.add(12) = ta[0]; *xp.add(13) = ta[1]; *xp.add(14) = ta[2]; *xp.add(15) = ta[3];
+            *xp.add(12) = ta[0];
+            *xp.add(13) = ta[1];
+            *xp.add(14) = ta[2];
+            *xp.add(15) = ta[3];
             let tw = (tx_words as u32).to_le_bytes();
-            *xp.add(16) = tw[0]; *xp.add(17) = tw[1]; *xp.add(18) = tw[2]; *xp.add(19) = tw[3];
+            *xp.add(16) = tw[0];
+            *xp.add(17) = tw[1];
+            *xp.add(18) = tw[2];
+            *xp.add(19) = tw[3];
             let ra = (rx_scratch as u32).to_le_bytes();
-            *xp.add(20) = ra[0]; *xp.add(21) = ra[1]; *xp.add(22) = ra[2]; *xp.add(23) = ra[3];
+            *xp.add(20) = ra[0];
+            *xp.add(21) = ra[1];
+            *xp.add(22) = ra[2];
+            *xp.add(23) = ra[3];
             *xp.add(24) = dma_ch_tx;
             *xp.add(25) = dma_ch_rx;
-            (sys.provider_call)(-1, PIO_CMD_XFER, xp, 28);
-
-            // Copy RX to caller (from second half of scratch where RX DMA wrote)
-            let mut total_bytes = tx_len as i32;
+            let rc = (sys.provider_call)(-1, PIO_CMD_XFER, xp, 28);
+            if rc < 0 {
+                return rc;
+            }
+            // Started, not finished. RX lands in the second half of scratch
+            // as the transfer runs; `CMD_POLL` copies it out once both DMA
+            // channels have stopped.
+            (*cp).xfer_rx_ptr = rx_ptr;
+            (*cp).xfer_rx_len = rx_len as u32;
+            (*cp).xfer_rx_words = rx_words as u32;
+            (*cp).xfer_total = tx_len as u32 + ((rx_words as u32) << 2);
+            (*cp).state = SLOT_BUSY;
+            0
+        }
+        CMD_POLL => {
+            // Completion of the transfer started by `CMD_TRANSFER`: `EAGAIN`
+            // while it runs, the byte count once it has finished and its RX
+            // data has been copied to the caller, 0 when nothing is in
+            // flight, and the kernel's error if it gave up on the transfer.
+            const EAGAIN: i32 = -11;
+            let idx = handle as usize;
+            if idx >= MAX_CMD_SLOTS {
+                return -22;
+            }
+            let cp = s.cmds.as_mut_ptr().add(idx);
+            if (*cp).state != SLOT_BUSY {
+                return if (*cp).state == SLOT_READY { 0 } else { -5 };
+            }
+            let mut chans = [(*cp).dma_ch_tx, (*cp).dma_ch_rx];
+            let rc = (sys.provider_call)(-1, PIO_CMD_XFER_POLL, chans.as_mut_ptr(), 2);
+            if rc == 1 {
+                return EAGAIN;
+            }
+            (*cp).state = SLOT_READY;
+            if rc < 0 {
+                return rc;
+            }
+            let rx_words = (*cp).xfer_rx_words as usize;
+            let rx_ptr = (*cp).xfer_rx_ptr;
+            let rx_len = (*cp).xfer_rx_len as usize;
             if rx_words > 0 && rx_ptr != 0 && rx_len > 0 {
-                let copy_len = if (rx_words << 2) < rx_len { rx_words << 2 } else { rx_len };
+                let rx_scratch = (*cp).scratch.as_ptr().add(CMD_SCRATCH_WORDS >> 1);
+                let copy_len = if (rx_words << 2) < rx_len {
+                    rx_words << 2
+                } else {
+                    rx_len
+                };
                 let src = rx_scratch as *const u8;
                 let dst = rx_ptr as *mut u8;
                 let mut b = 0usize;
@@ -1162,22 +1434,33 @@ pub unsafe extern "C" fn pio_dispatch(
                     core::ptr::write_volatile(dst.add(b), core::ptr::read_volatile(src.add(b)));
                     b += 1;
                 }
-                total_bytes += rx_len as i32;
             }
-
-            total_bytes
+            (*cp).xfer_total as i32
         }
-        CMD_POLL => {
+        CMD_LEVEL => {
             let idx = handle as usize;
-            if idx >= MAX_CMD_SLOTS { return -22; }
-            let cp = s.cmds.as_ptr().add(idx);
-            if (*cp).state == SLOT_READY { 0 } else { -5 }
+            if idx >= MAX_CMD_SLOTS {
+                return -22;
+            }
+            let cp = s.cmds.as_mut_ptr().add(idx);
+            if (*cp).state == SLOT_BUSY {
+                return -16;
+            }
+            if (*cp).state != SLOT_READY {
+                return -5;
+            }
+            let mut pin = [(*cp).data_pin];
+            (sys.provider_call)(-1, PIO_PIN_LEVEL, pin.as_mut_ptr(), 1)
         }
         CMD_FREE => {
             let idx = handle as usize;
-            if idx >= MAX_CMD_SLOTS { return 0; }
+            if idx >= MAX_CMD_SLOTS {
+                return 0;
+            }
             let cp = s.cmds.as_mut_ptr().add(idx);
-            if (*cp).state == SLOT_FREE { return 0; }
+            if (*cp).state == SLOT_FREE {
+                return 0;
+            }
             pio_sm_enable(sys, (*cp).pio_num, 1 << (*cp).sm_num, false);
             if (*cp).dma_ch_tx != 0xFF {
                 raw_dma_free(sys, (*cp).dma_ch_tx);
@@ -1219,24 +1502,42 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         RX_STREAM_LOAD_PROGRAM => {
             let idx = handle as usize;
-            if idx >= MAX_RX_SLOTS { return -22; }
+            if idx >= MAX_RX_SLOTS {
+                return -22;
+            }
             let rp = s.rxs.as_mut_ptr().add(idx);
-            if (*rp).state == SLOT_FREE || (*rp).state == SLOT_BUSY { return -16; }
+            if (*rp).state == SLOT_FREE || (*rp).state == SLOT_BUSY {
+                return -16;
+            }
             let args = match parse_load_program_args(arg, arg_len) {
                 Some(a) => a,
                 None => return -22,
             };
-            copy_program(&mut (*rp).program, args.0, args.1, args.2, args.3, args.4, args.5);
+            copy_program(
+                &mut (*rp).program,
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+            );
             (*rp).program_status = 1;
             0
         }
         RX_STREAM_CONFIGURE => {
             // PioRxConfigureArgs: clock_div:u32, in_pin:u8, sideset_base:u8, shift_bits:u8, pad:u8
-            if arg.is_null() || arg_len < 8 { return -22; }
+            if arg.is_null() || arg_len < 8 {
+                return -22;
+            }
             let idx = handle as usize;
-            if idx >= MAX_RX_SLOTS { return -22; }
+            if idx >= MAX_RX_SLOTS {
+                return -22;
+            }
             let rp = s.rxs.as_mut_ptr().add(idx);
-            if (*rp).state == SLOT_FREE { return -5; }
+            if (*rp).state == SLOT_FREE {
+                return -5;
+            }
             (*rp).clock_div = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             (*rp).in_pin = *arg.add(4);
             (*rp).sideset_base = *arg.add(5);
@@ -1246,7 +1547,8 @@ pub unsafe extern "C" fn pio_dispatch(
             (*rp).state = SLOT_READY;
             // Try program load
             if (*rp).program_status == 1 && (*rp).program.length > 0 {
-                let (origin, mask) = load_program(sys, (*rp).pio_num, &(*rp).program, (*rp).instr_mask);
+                let (origin, mask) =
+                    load_program(sys, (*rp).pio_num, &(*rp).program, (*rp).instr_mask);
                 if origin >= 0 {
                     (*rp).instr_mask = mask;
                     (*rp).instr_origin = origin as u8;
@@ -1262,14 +1564,24 @@ pub unsafe extern "C" fn pio_dispatch(
         }
         RX_STREAM_CAN_PULL => {
             let idx = handle as usize;
-            if idx >= MAX_RX_SLOTS { return 0; }
+            if idx >= MAX_RX_SLOTS {
+                return 0;
+            }
             let rp = s.rxs.as_ptr().add(idx);
-            if (*rp).state == SLOT_FREE { return 0; }
-            if (*rp).pull_ready != 0 { 1 } else { 0 }
+            if (*rp).state == SLOT_FREE {
+                return 0;
+            }
+            if (*rp).pull_ready != 0 {
+                1
+            } else {
+                0
+            }
         }
         RX_STREAM_PULL => {
             let idx = handle as usize;
-            if idx >= MAX_RX_SLOTS { return -22; }
+            if idx >= MAX_RX_SLOTS {
+                return -22;
+            }
             let rp = s.rxs.as_mut_ptr().add(idx);
             if (*rp).pull_ready != 0 {
                 (*rp).pull_ready = 0;
@@ -1279,11 +1591,17 @@ pub unsafe extern "C" fn pio_dispatch(
             }
         }
         RX_STREAM_GET_BUFFER => {
-            if arg.is_null() || arg_len < 4 { return -22; }
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
             let idx = handle as usize;
-            if idx >= MAX_RX_SLOTS { return 0; }
+            if idx >= MAX_RX_SLOTS {
+                return 0;
+            }
             let rp = s.rxs.as_ptr().add(idx);
-            if (*rp).state == SLOT_FREE || (*rp).pull_ready == 0 { return 0; }
+            if (*rp).state == SLOT_FREE || (*rp).pull_ready == 0 {
+                return 0;
+            }
             // Return pointer to readable buffer (not the one DMA is filling)
             let buf_ptr = if (*rp).active_buf == 0 {
                 // DMA fills A, module reads B
@@ -1293,14 +1611,21 @@ pub unsafe extern "C" fn pio_dispatch(
             };
             // Write pointer to arg
             let pb = (buf_ptr as u32).to_le_bytes();
-            *arg = pb[0]; *arg.add(1) = pb[1]; *arg.add(2) = pb[2]; *arg.add(3) = pb[3];
+            *arg = pb[0];
+            *arg.add(1) = pb[1];
+            *arg.add(2) = pb[2];
+            *arg.add(3) = pb[3];
             RX_BUF_WORDS as i32
         }
         RX_STREAM_FREE => {
             let idx = handle as usize;
-            if idx >= MAX_RX_SLOTS { return 0; }
+            if idx >= MAX_RX_SLOTS {
+                return 0;
+            }
             let rp = s.rxs.as_mut_ptr().add(idx);
-            if (*rp).state == SLOT_FREE { return 0; }
+            if (*rp).state == SLOT_FREE {
+                return 0;
+            }
             pio_sm_enable(sys, (*rp).pio_num, 1 << (*rp).sm_num, false);
             if (*rp).dma_fd >= 0 {
                 dma_fd_free(sys, (*rp).dma_fd);
@@ -1314,10 +1639,14 @@ pub unsafe extern "C" fn pio_dispatch(
             0
         }
         RX_STREAM_SET_RATE => {
-            if arg.is_null() || arg_len < 4 { return -22; }
+            if arg.is_null() || arg_len < 4 {
+                return -22;
+            }
             let rate = u32::from_le_bytes([*arg, *arg.add(1), *arg.add(2), *arg.add(3)]);
             let idx = handle as usize;
-            if idx >= MAX_RX_SLOTS { return -22; }
+            if idx >= MAX_RX_SLOTS {
+                return -22;
+            }
             let rp = s.rxs.as_mut_ptr().add(idx);
             (*rp).rate_q16 = rate;
             0
@@ -1352,7 +1681,9 @@ fn pio_rxf_addr(pio_num: u8, sm: u8) -> u32 {
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
@@ -1367,14 +1698,22 @@ pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize,
+    in_chan: i32,
+    out_chan: i32,
+    ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<PioState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<PioState>() {
+            return -2;
+        }
 
         let s = &mut *(state as *mut PioState);
         s.syscalls = syscalls as *const SyscallTable;
@@ -1455,9 +1794,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 }
                 if (*sp).dma_fd >= 0 {
                     let rc = dma_fd_start(
-                        sys, (*sp).dma_fd,
-                        buf_ptr as u32, txf_addr, count,
-                        tx_dreq, DMA_FLAG_INCR_READ | DMA_FLAG_SIZE_32,
+                        sys,
+                        (*sp).dma_fd,
+                        buf_ptr as u32,
+                        txf_addr,
+                        count,
+                        tx_dreq,
+                        DMA_FLAG_INCR_READ | DMA_FLAG_SIZE_32,
                     );
                     if rc >= 0 {
                         (*sp).dma_active = 1;
@@ -1469,7 +1812,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
             // Try program load if pending and now configured
             if (*sp).program_status == 1 && (*sp).state >= SLOT_READY && (*sp).program.length > 0 {
-                let (origin, mask) = load_program(sys, (*sp).pio_num, &(*sp).program, (*sp).instr_mask);
+                let (origin, mask) =
+                    load_program(sys, (*sp).pio_num, &(*sp).program, (*sp).instr_mask);
                 if origin >= 0 {
                     (*sp).instr_mask = mask;
                     (*sp).instr_origin = origin as u8;
@@ -1529,9 +1873,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
                 let rxf_addr = pio_rxf_addr((*rp).pio_num, (*rp).sm_num);
                 let rx_dreq = ((*rp).pio_num << 3) + (*rp).sm_num + 4;
                 let rc = dma_fd_start(
-                    sys, (*rp).dma_fd,
-                    rxf_addr, fill_buf as u32, RX_BUF_WORDS as u32,
-                    rx_dreq, DMA_FLAG_INCR_WRITE | DMA_FLAG_SIZE_32,
+                    sys,
+                    (*rp).dma_fd,
+                    rxf_addr,
+                    fill_buf as u32,
+                    RX_BUF_WORDS as u32,
+                    rx_dreq,
+                    DMA_FLAG_INCR_WRITE | DMA_FLAG_SIZE_32,
                 );
                 if rc >= 0 {
                     (*rp).dma_active = 1;
@@ -1542,7 +1890,8 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
 
             // Try program load if pending
             if (*rp).program_status == 1 && (*rp).state >= SLOT_READY && (*rp).program.length > 0 {
-                let (origin, mask) = load_program(sys, (*rp).pio_num, &(*rp).program, (*rp).instr_mask);
+                let (origin, mask) =
+                    load_program(sys, (*rp).pio_num, &(*rp).program, (*rp).instr_mask);
                 if origin >= 0 {
                     (*rp).instr_mask = mask;
                     (*rp).instr_origin = origin as u8;
@@ -1561,9 +1910,13 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
         }
     }
 
-    // CMD slots don't need polling (transfers are synchronous)
+    // CMD slots are polled by their owners (`CMD_POLL`), not here.
 
-    if has_work { 2 } else { 0 } // 2=Burst, 0=Continue
+    if has_work {
+        2
+    } else {
+        0
+    } // 2=Burst, 0=Continue
 }
 
 // Wasm entry-point wrappers — no-op on non-wasm targets. See

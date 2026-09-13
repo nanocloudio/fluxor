@@ -32,7 +32,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../sdk/abi.rs"]
@@ -87,7 +86,9 @@ struct ParserState {
 // ============================================================================
 
 unsafe fn parse_and_forward(s: &mut ParserState, frame: *const u8, frame_len: usize) {
-    if frame_len < ETH_HLEN { return; }
+    if frame_len < ETH_HLEN {
+        return;
+    }
     let sys = &*s.syscalls;
 
     // Read ethertype (bytes 12-13, big-endian)
@@ -141,9 +142,11 @@ unsafe fn parse_and_forward(s: &mut ParserState, frame: *const u8, frame_len: us
                 flags |= FLAG_TCP;
                 if frame_len >= l4_offset + 4 {
                     let l4 = frame.add(l4_offset);
-                    *mp.add(11) = *l4.add(0); *mp.add(12) = *l4.add(1); // src port
-                    *mp.add(13) = *l4.add(2); *mp.add(14) = *l4.add(3); // dst port
-                    // TCP header length from data offset field
+                    *mp.add(11) = *l4.add(0);
+                    *mp.add(12) = *l4.add(1); // src port
+                    *mp.add(13) = *l4.add(2);
+                    *mp.add(14) = *l4.add(3); // dst port
+                                              // TCP header length from data offset field
                     if frame_len >= l4_offset + 13 {
                         let tcp_hlen = (((*l4.add(12)) >> 4) as usize) * 4;
                         payload_offset = (l4_offset + tcp_hlen) as u16;
@@ -158,8 +161,10 @@ unsafe fn parse_and_forward(s: &mut ParserState, frame: *const u8, frame_len: us
                 flags |= FLAG_UDP;
                 if frame_len >= l4_offset + 4 {
                     let l4 = frame.add(l4_offset);
-                    *mp.add(11) = *l4.add(0); *mp.add(12) = *l4.add(1);
-                    *mp.add(13) = *l4.add(2); *mp.add(14) = *l4.add(3);
+                    *mp.add(11) = *l4.add(0);
+                    *mp.add(12) = *l4.add(1);
+                    *mp.add(13) = *l4.add(2);
+                    *mp.add(14) = *l4.add(3);
                     payload_offset = (l4_offset + 8) as u16;
                     if frame_len >= l4_offset + 8 {
                         let udp_len = ((*l4.add(4) as u16) << 8) | (*l4.add(5) as u16);
@@ -203,7 +208,9 @@ unsafe fn parse_and_forward(s: &mut ParserState, frame: *const u8, frame_len: us
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> usize { STATE_SIZE }
+pub extern "C" fn module_state_size() -> usize {
+    STATE_SIZE
+}
 
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_init"]
