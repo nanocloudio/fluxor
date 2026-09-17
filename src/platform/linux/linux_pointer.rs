@@ -14,6 +14,7 @@ use fluxor::platform::builtin_param_tags::linux_pointer::{
     TAG_HEIGHT as POINTER_TAG_HEIGHT, TAG_PATH as POINTER_TAG_PATH, TAG_WIDTH as POINTER_TAG_WIDTH,
     TAG_X_MAX as POINTER_TAG_X_MAX, TAG_Y_MAX as POINTER_TAG_Y_MAX,
 };
+use fluxor::platform::builtin_param_tags::linux_pointer as pointer_tags;
 
 const LINUX_POINTER_HASH: u32 = 0xEEA3_12EF; // fnv1a32("linux_pointer")
 
@@ -225,7 +226,7 @@ fn build_linux_pointer(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
     });
 
     scheduler::set_current_module(module_idx);
-    let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+    let out_chan = scheduler::module_port(module_idx, pointer_tags::PORT_EVENTS);
     let mut m = scheduler::BuiltInModule::new("linux_pointer", linux_pointer_step);
     install_state(
         &mut m,

@@ -121,10 +121,27 @@ host_button_pop(buf, len) -> i32           // debounced button bytes
 host_action_pop(buf, len) -> i32           // FNV-hashed action records
 host_surface_traits_pop(buf, len) -> i32   // SurfaceTraits records
 
-// WebSocket transport.
+// WebSocket transport (byte tunnel).
 host_ws_open(url_ptr, url_len) -> i32      // handle; opens asynchronously
 host_ws_send(handle, data, len) -> i32     // bytes accepted (0 until open)
 host_ws_recv(handle, buf, len) -> i32      // bytes written
+
+// Addressed WebSocket links (§4.5): message boundaries and opcodes kept,
+// link events reported rather than inferred.
+host_ws_link_open(origin, origin_len, path, path_len) -> i32
+host_ws_link_event(handle) -> i32          // 0, or (kind << 16) | code
+host_ws_link_send(handle, opcode, data, len) -> i32
+host_ws_link_next(handle) -> i32           // -1, or (opcode << 24) | remaining
+host_ws_link_recv(handle, buf, len) -> i32 // bytes of the oldest message
+host_ws_link_close(handle, code) -> i32    // 0 = let go of an ended link
+
+// HTTP exchange (§4.6): one fetch() per request, status and head kept.
+host_http_open(method, method_len, origin, origin_len, path, path_len,
+               headers, headers_len, body, body_len) -> i32
+host_http_status(handle) -> i32            // -3 pending, -2 failed, else code
+host_http_head(handle, buf, len) -> i32    // CRLF field lines, whole or -2
+host_http_recv(handle, buf, len) -> i32    // bytes; 0 pending; -1 end; -2 failed
+host_http_close(handle) -> i32
 
 // HTTP fetch transport. Backs the `host_browser_fetch` channel source
 // and the wasm FS provider (§5).
@@ -216,7 +233,9 @@ Media, transport, and diagnostics:
 | `wasm_browser_compute`  | `commands` in (`GpuCommand`), `outcomes` out (`GpuOutcome`) | §4.4 |
 | `wasm_browser_websocket`| `tx` in / `rx` out (`OctetStream`) | §4.5 |
 | `wasm_browser_ws_source`| `bytes` out (`VideoRaster`) | §4.5 |
+| `wasm_browser_ws`       | `open_in` in, `ws_in` in (`WsFrame`), `ws_out` out (`WsFrame`), `event_out` out | §4.5 |
 | `host_browser_fetch`    | `bytes` out (`OctetStream`) | §4.6 |
+| `wasm_browser_http`     | `publish_in` in, `reply_out` out, `file_ctrl` out (`OctetStream`) | §4.6 |
 | `wasm_browser_camera`   | `frames` out (`OctetStream`) | luma frames from `getUserMedia`, for a downstream decoder |
 | `wasm_browser_display_capture` | `pixels` out (`VideoRaster`) | `SRF1` RGB565 frames of a surface the person chose to share, from `getDisplayMedia`; §4.7 |
 | `wasm_browser_scan_out` | `result` in (`OctetStream`) | surfaces a decoded byte result (e.g. a scanned token) in the page |
@@ -333,6 +352,24 @@ canvas over `/ws`. Swapping the decoder between the browser
 (`wasm_browser_image_codec`) and an upstream device is purely a
 graph-wiring change; the canvas and wire shape are identical.
 
+`wasm_browser_ws` (`src/platform/wasm/ws.rs`) is the addressed
+connector: the same four ports, records and link count
+(`ws_control::WS_LINKS`) a socket-backed WebSocket connector offers, so
+a consumer holding several links moves between the two by wiring
+alone. `open_in` carries `ws_control` open records (which link, which
+path), `ws_in` / `ws_out` carry `WsFrame` envelopes whose `conn` field
+is the link index, and `event_out` carries `ws_control` events: a link
+opened, ended with a close code, or never opened. A path names the
+resource; the `origin` param names where (empty means the page's
+origin over `ws:` or `wss:` to match how the page was served), and a
+path carrying its own scheme or host is answered FAILED. A browser
+sends and receives whole messages, so fragments arriving on `ws_in`
+are assembled until their final frame and sent as one, and a received
+message longer than one envelope leaves as fragments whose last
+carries `fin`. Backed by `host_ws_link_*`, which keeps message
+boundaries and opcodes and reports a close only after every message
+that preceded it has been taken.
+
 ### 4.6 `host_browser_fetch` — HTTP fetch source
 
 Source: `src/platform/wasm/fetch.rs`.
@@ -342,6 +379,27 @@ Streams one URL's response body into a `bytes` output port via
 a host-provided capability in the same family as the Linux host
 built-ins. One in-flight request per module instance; for parallel
 fetches, instantiate one module per URL.
+
+`wasm_browser_http` (`src/platform/wasm/http.rs`) is the browser as an
+HTTP exchange provider: the provider half of
+`stream.ordered_ack.exchange`, answering the same `http_exchange`
+records with the same replies and refusals a socket-backed HTTP client
+does, so a consumer moves between the two by wiring alone. A request
+arrives on `publish_in` as a `Publish` carrying a request record; the
+page's `fetch()` performs it; the `Reply` leaves on `reply_out` under
+the same correlation, echoing the request's key. A plain request is
+answered with the response body; an extended one (the verb's high bit)
+is answered with the status and header block, and its body streams on
+`file_ctrl` as length-framed chunks ending with an empty one. A path
+names the resource and the `origin` param names where (empty means the
+page's origin); a path with its own scheme or host, a broadcast, a
+CONNECT, or a failed fetch is refused UNROUTABLE, a request or body
+past the contract's ceiling is OVERSIZE, and with `surface_status` set
+a response of 400 or above is REFUSE_UPSTREAM carrying the code.
+Redirects are followed. One exchange is in flight at a time; a graph
+that wants concurrency instantiates more. Backed by `host_http_*`,
+kept apart from the fetch imports because those serve the written
+store and the asset bank ahead of the network and discard the status.
 
 ### 4.7 `wasm_browser_display_capture` — shared-surface source
 
@@ -484,7 +542,11 @@ A browser-host integration is healthy when:
   application code touches WebAudio.
 - Input identity is preserved end-to-end; the input built-ins emit
   source-domain records with no application mapping.
-- Every kernel-side wasm extern has a matching `host_*` shim entry.
+- Every kernel-side wasm extern has a matching `host_*` shim entry,
+  and the shims behave as the built-ins above rely on when driven from
+  a fake linear memory under `node` — the `wasm-host-shims (node)`
+  phase of `fluxor ci`, which reports itself skipped rather than
+  passed when no `node` is on the path.
 - Adding a new built-in requires a kernel-side step function, a
   manifest, and a shim implementation, with no kernel-ABI or
   platform-doc changes.

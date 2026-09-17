@@ -13,6 +13,7 @@ use fluxor::platform::builtin_param_tags::linux_gpu::{
     TAG_RESIDENT_MB as GPU_TAG_RESIDENT_MB, TAG_STAGING_KB as GPU_TAG_STAGING_KB,
 };
 use fluxor::platform::linux::gpu::GpuProvider;
+use fluxor::platform::builtin_param_tags::linux_gpu as gpu_tags;
 
 const LINUX_GPU_HASH: u32 = 0x0C49_64C4; // fnv1a32("linux_gpu")
 
@@ -121,8 +122,8 @@ fn build_linux_gpu(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModule
     });
 
     scheduler::set_current_module(module_idx);
-    let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-    let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+    let in_chan = scheduler::module_port(module_idx, gpu_tags::PORT_COMMANDS);
+    let out_chan = scheduler::module_port(module_idx, gpu_tags::PORT_OUTCOMES);
 
     // The device thread starts here and opens its adapter in the background:
     // adapter creation alone can take hundreds of milliseconds, and graph

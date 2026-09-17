@@ -6,6 +6,8 @@
 // production module — it is the live acceptance check (criterion 1) for the
 // Linux authority.
 
+use fluxor::platform::builtin_param_tags::linux_surface_traits_probe as surface_traits_probe_tags;
+
 const LINUX_SURFACE_TRAITS_PROBE_HASH: u32 = 0xFADF_1AC6; // fnv1a32("linux_surface_traits_probe")
 const PROBE_EVENT_RECORD: usize = 24;
 
@@ -46,7 +48,7 @@ fn linux_surface_traits_probe_step(state: *mut u8) -> i32 {
 
 fn build_linux_surface_traits_probe(module_idx: usize) -> scheduler::BuiltInModule {
     scheduler::set_current_module(module_idx);
-    let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+    let in_chan = scheduler::module_port(module_idx, surface_traits_probe_tags::PORT_EVENTS);
     let mut m = scheduler::BuiltInModule::new(
         "linux_surface_traits_probe",
         linux_surface_traits_probe_step,

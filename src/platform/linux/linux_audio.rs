@@ -156,6 +156,7 @@ use fluxor::platform::builtin_param_tags::linux_audio::{
     TAG_CHANNELS as AUDIO_TAG_CHANNELS, TAG_MODE as AUDIO_TAG_MODE, TAG_PATH as AUDIO_TAG_PATH,
     TAG_SAMPLE_RATE as AUDIO_TAG_SAMPLE_RATE,
 };
+use fluxor::platform::builtin_param_tags::linux_audio as audio_tags;
 
 const AUDIO_MODE_WAV: u8 = 0;
 const AUDIO_MODE_RAW: u8 = 1;
@@ -442,7 +443,7 @@ fn build_linux_audio(module_idx: usize, params: &[u8]) -> scheduler::BuiltInModu
     };
 
     scheduler::set_current_module(module_idx);
-    let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+    let in_chan = scheduler::module_port(module_idx, audio_tags::PORT_AUDIO);
     let mut m = scheduler::BuiltInModule::new("linux_audio", linux_audio_step);
     install_state(
         &mut m,

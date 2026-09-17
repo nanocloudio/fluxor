@@ -1,0 +1,63 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# The browser as an addressed WebSocket connector. A consumer holding
+# several links addresses them by index, and that index rides in `WsFrame`'s
+# `conn` field: `open_in` names which link to open on which resource,
+# `ws_in` carries messages to send, `ws_out` carries messages received, and
+# `event_out` says what became of a link. The same four ports, records and
+# link count (`ws_control::WS_LINKS`) a socket-backed connector offers, so a
+# consumer moves between the two by wiring alone.
+#
+# A path names the resource; `origin` names where. A consumer chooses what
+# to open, never where, and a path carrying its own scheme or host is
+# answered FAILED.
+#
+# A browser sends and receives whole messages. Fragments arriving on `ws_in`
+# are assembled until their final frame and sent as one; a received message
+# longer than one envelope leaves on `ws_out` as fragments whose last
+# carries `fin`, as RFC 6455 would deliver them.
+
+# `[conn: u8][path…]` — open that link on that resource.
+[[ports]]
+name = "open_in"
+direction = "input"
+content_type = "OctetStream"
+max_record = 129
+buffer_size = 1024
+required = true
+
+[[ports]]
+name = "ws_in"
+direction = "input"
+content_type = "WsFrame"
+buffer_size = 8192
+
+[[ports]]
+name = "ws_out"
+direction = "output"
+content_type = "WsFrame"
+buffer_size = 8192
+
+# `[conn: u8][event: u8][code: u16 LE]` — a link opened, ended, or never
+# opened. What a frame has no room to say.
+[[ports]]
+name = "event_out"
+direction = "output"
+content_type = "OctetStream"
+max_record = 4
+buffer_size = 256
+
+# Where paths resolve: a scheme and host such as `wss://api.example`.
+# Empty means the page's own origin over `ws:` or `wss:` to match how the
+# page was served.
+[[params]]
+name = "origin"
+tag = 10
+type = "str"
+default = ""
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; the page's network panel is the message stream"

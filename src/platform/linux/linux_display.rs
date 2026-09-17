@@ -253,6 +253,7 @@ use fluxor::platform::builtin_param_tags::linux_display::{
     TAG_MODE as DISPLAY_TAG_MODE, TAG_PATH as DISPLAY_TAG_PATH, TAG_SCALE as DISPLAY_TAG_SCALE,
     TAG_WIDTH as DISPLAY_TAG_WIDTH,
 };
+use fluxor::platform::builtin_param_tags::linux_display as display_tags;
 // When set, each frame on `pixels` is prefixed with a self-describing header and the
 // display takes its geometry from the STREAM, not the `width`/`height` config — so a
 // producer can resize without the two ends agreeing on a config. See
@@ -499,7 +500,7 @@ fn build_linux_display(module_idx: usize, params: &[u8]) -> scheduler::BuiltInMo
     };
 
     scheduler::set_current_module(module_idx);
-    let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+    let in_chan = scheduler::module_port(module_idx, display_tags::PORT_PIXELS);
     let mut m = scheduler::BuiltInModule::new("linux_display", linux_display_step);
     install_state(
         &mut m,

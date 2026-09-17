@@ -108,6 +108,12 @@ mod websocket;
 #[path = "wasm/fetch.rs"]
 mod fetch;
 
+#[path = "wasm/http.rs"]
+mod http;
+
+#[path = "wasm/ws.rs"]
+mod ws;
+
 #[path = "wasm/image_codec.rs"]
 mod image_codec;
 
@@ -127,10 +133,19 @@ mod stream_time;
 mod hal;
 
 use crate::platform::builtin_param_tags::{
-    host_browser_fetch as fetch_tags, wasm_browser_audio as audio_tags,
-    wasm_browser_canvas as canvas_tags, wasm_browser_display_capture as display_capture_tags,
-    wasm_browser_gpu as gpu_tags, wasm_browser_image_codec as image_codec_tags,
-    wasm_browser_websocket as websocket_tags, wasm_browser_ws_source as ws_source_tags,
+    host_browser_fetch as fetch_tags, wasm_browser_action as action_tags,
+    wasm_browser_audio as audio_tags, wasm_browser_button as button_tags,
+    wasm_browser_camera as camera_tags, wasm_browser_canvas as canvas_tags,
+    wasm_browser_compute as compute_tags, wasm_browser_display_capture as display_capture_tags,
+    wasm_browser_dom_input as dom_input_tags, wasm_browser_gamepad as gamepad_tags,
+    wasm_browser_gpu as gpu_tags, wasm_browser_http as http_tags,
+    wasm_browser_image_codec as image_codec_tags, wasm_browser_keyboard as keyboard_tags,
+    wasm_browser_midi_out as midi_out_tags, wasm_browser_pointer as pointer_tags,
+    wasm_browser_scan_out as scan_out_tags, wasm_browser_surface_traits as surface_traits_tags,
+    wasm_browser_surface_traits_probe as surface_traits_probe_tags,
+    wasm_browser_touch_gamepad_overlay as touch_gamepad_overlay_tags,
+    wasm_browser_websocket as websocket_tags, wasm_browser_ws as ws_tags,
+    wasm_browser_ws_source as ws_source_tags,
 };
 
 /// Lightweight TLV walker for built-in module params. Mirrors
@@ -138,9 +153,10 @@ use crate::platform::builtin_param_tags::{
 /// a per-instance TLV blob via `ModuleEntry::params()`; tags 10..0xEF
 /// are the manifest-declared params, tags 0xF0..0xFF are reserved.
 ///
-/// Each tag below comes from `crate::platform::builtin_param_tags`, which
-/// `build.rs` generates from the `[[params]]` tables of the wasm built-in
-/// manifests.
+/// Each tag below, and each port a built-in binds by name through
+/// `scheduler::module_port`, comes from `crate::platform::builtin_param_tags`,
+/// which `build.rs` generates from the `[[params]]` and `[[ports]]` tables of
+/// the wasm built-in manifests.
 fn walk_tlv<F: FnMut(u8, &[u8])>(blob: &[u8], mut f: F) {
     if blob.len() < 4 || blob[0] != 0xFE || blob[1] != 0x01 {
         return;
@@ -382,6 +398,8 @@ const WASM_BROWSER_AUDIO_HASH: u32 = fnv1a32(b"wasm_browser_audio");
 const WASM_BROWSER_WEBSOCKET_HASH: u32 = fnv1a32(b"wasm_browser_websocket");
 const WASM_BROWSER_WS_SOURCE_HASH: u32 = fnv1a32(b"wasm_browser_ws_source");
 const HOST_BROWSER_FETCH_HASH: u32 = fnv1a32(b"host_browser_fetch");
+const WASM_BROWSER_HTTP_HASH: u32 = fnv1a32(b"wasm_browser_http");
+const WASM_BROWSER_WS_HASH: u32 = fnv1a32(b"wasm_browser_ws");
 const WASM_BROWSER_IMAGE_CODEC_HASH: u32 = fnv1a32(b"wasm_browser_image_codec");
 const WASM_BROWSER_TERMINAL_HASH: u32 = fnv1a32(b"wasm_browser_terminal");
 const WASM_BROWSER_TOUCH_GAMEPAD_OVERLAY_HASH: u32 = fnv1a32(b"wasm_browser_touch_gamepad_overlay");
@@ -546,7 +564,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let in_chan = scheduler::module_port(module_idx, canvas_tags::PORT_PIXELS);
             let m = canvas::build(width, height, header, in_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -571,7 +589,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, dom_input_tags::PORT_EVENTS);
             let m = dom_input::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -598,7 +616,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, camera_tags::PORT_FRAMES);
             let m = camera::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -636,7 +654,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, display_capture_tags::PORT_PIXELS);
             let m = display_capture::build(width, height, header, out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -662,7 +680,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let in_chan = scheduler::module_port(module_idx, scan_out_tags::PORT_RESULT);
             let m = scan_out::build(in_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -691,7 +709,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, keyboard_tags::PORT_EVENTS);
             let m = keyboard::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -716,7 +734,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, pointer_tags::PORT_EVENTS);
             let m = pointer::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -741,7 +759,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, gamepad_tags::PORT_EVENTS);
             let m = gamepad::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -770,7 +788,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, surface_traits_tags::PORT_EVENTS);
             let m = surface_traits::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -797,7 +815,8 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let in_chan =
+                scheduler::module_port(module_idx, surface_traits_probe_tags::PORT_EVENTS);
             let m = surface_traits_probe::build(in_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -826,7 +845,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, button_tags::PORT_RAW);
             let m = button::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -856,7 +875,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, action_tags::PORT_COMMANDS);
             let m = action::build(out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -908,7 +927,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let events_in = scheduler::get_module_port(module_idx, 0, 0);
+            let events_in = scheduler::module_port(module_idx, midi_out_tags::PORT_EVENTS);
             let m = midi::build_out(events_in);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -937,7 +956,7 @@ unsafe fn load_embedded_modules() -> usize {
                 audio_tags::TAG_LEAD_MS => lead_ms = tlv_u32(value),
                 _ => {}
             });
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let in_chan = scheduler::module_port(module_idx, audio_tags::PORT_AUDIO);
             let m = audio::build(sample_rate, channels, lead_ms, in_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -971,8 +990,8 @@ unsafe fn load_embedded_modules() -> usize {
                     url_len = n;
                 }
             });
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let in_chan = scheduler::module_port(module_idx, websocket_tags::PORT_TX);
+            let out_chan = scheduler::module_port(module_idx, websocket_tags::PORT_RX);
             let m = websocket::build(&url_buf[..url_len], in_chan, out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -1008,7 +1027,7 @@ unsafe fn load_embedded_modules() -> usize {
             });
             // RX-only: no input port. Output port `bytes` is index 0
             // on direction=1 (output) by manifest declaration order.
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, ws_source_tags::PORT_BYTES);
             let m = ws_source::build(&url_buf[..url_len], out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -1017,6 +1036,88 @@ unsafe fn load_embedded_modules() -> usize {
                 "[wasm-kernel] module ",
                 module_idx as u64,
                 " = wasm_browser_ws_source (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_HTTP_HASH {
+            if !init_builtin_heap::<http::HttpState>(module_idx) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_http: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let mut origin_buf = [0u8; 256];
+            let mut origin_len = 0usize;
+            let mut surface_status = false;
+            walk_tlv(entry.params(), |tag, value| match tag {
+                http_tags::TAG_ORIGIN => {
+                    let n = value.len().min(origin_buf.len());
+                    origin_buf[..n].copy_from_slice(&value[..n]);
+                    origin_len = n;
+                }
+                http_tags::TAG_SURFACE_STATUS => surface_status = tlv_u32(value) != 0,
+                _ => {}
+            });
+            let publish_in = scheduler::module_port(module_idx, http_tags::PORT_PUBLISH_IN);
+            let reply_out = scheduler::module_port(module_idx, http_tags::PORT_REPLY_OUT);
+            let file_ctrl = scheduler::module_port(module_idx, http_tags::PORT_FILE_CTRL);
+            let m = http::build(
+                &origin_buf[..origin_len],
+                surface_status,
+                publish_in,
+                reply_out,
+                file_ctrl,
+            );
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_http (built-in)",
+                0,
+            );
+            continue;
+        }
+
+        if entry.name_hash == WASM_BROWSER_WS_HASH {
+            if !init_builtin_heap::<ws::WsState>(module_idx) {
+                log_fmt2(
+                    3,
+                    "[wasm-kernel] module ",
+                    module_idx as u64,
+                    " = wasm_browser_ws: STATE_ARENA full, skipping",
+                    0,
+                );
+                continue;
+            }
+            let mut origin_buf = [0u8; 256];
+            let mut origin_len = 0usize;
+            walk_tlv(entry.params(), |tag, value| {
+                if tag == ws_tags::TAG_ORIGIN {
+                    let n = value.len().min(origin_buf.len());
+                    origin_buf[..n].copy_from_slice(&value[..n]);
+                    origin_len = n;
+                }
+            });
+            let open_in = scheduler::module_port(module_idx, ws_tags::PORT_OPEN_IN);
+            let ws_in = scheduler::module_port(module_idx, ws_tags::PORT_WS_IN);
+            let ws_out = scheduler::module_port(module_idx, ws_tags::PORT_WS_OUT);
+            let event_out = scheduler::module_port(module_idx, ws_tags::PORT_EVENT_OUT);
+            let m = ws::build(&origin_buf[..origin_len], open_in, ws_in, ws_out, event_out);
+            scheduler::store_builtin_module(module_idx, m);
+            registered += 1;
+            log_fmt2(
+                2,
+                "[wasm-kernel] module ",
+                module_idx as u64,
+                " = wasm_browser_ws (built-in)",
                 0,
             );
             continue;
@@ -1042,7 +1143,7 @@ unsafe fn load_embedded_modules() -> usize {
                     url_len = n;
                 }
             });
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let out_chan = scheduler::module_port(module_idx, fetch_tags::PORT_BYTES);
             let m = fetch::build(&url_buf[..url_len], out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -1079,8 +1180,8 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let in_chan = scheduler::module_port(module_idx, image_codec_tags::PORT_ENCODED);
+            let out_chan = scheduler::module_port(module_idx, image_codec_tags::PORT_PIXELS);
             let m = image_codec::build(in_chan, out_chan, width, height, max_bytes);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -1138,8 +1239,10 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let in_chan =
+                scheduler::module_port(module_idx, touch_gamepad_overlay_tags::PORT_EVENTS_IN);
+            let out_chan =
+                scheduler::module_port(module_idx, touch_gamepad_overlay_tags::PORT_EVENTS_OUT);
             let m = touch_gamepad_overlay::build(in_chan, out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -1174,7 +1277,7 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
+            let in_chan = scheduler::module_port(module_idx, gpu_tags::PORT_COMMANDS);
             let m = gpu::build(width, height, in_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;
@@ -1205,8 +1308,8 @@ unsafe fn load_embedded_modules() -> usize {
                 );
                 continue;
             }
-            let in_chan = scheduler::get_module_port(module_idx, 0, 0);
-            let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+            let in_chan = scheduler::module_port(module_idx, compute_tags::PORT_COMMANDS);
+            let out_chan = scheduler::module_port(module_idx, compute_tags::PORT_OUTCOMES);
             let m = gpu_compute::build(in_chan, out_chan);
             scheduler::store_builtin_module(module_idx, m);
             registered += 1;

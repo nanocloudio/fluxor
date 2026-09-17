@@ -26,6 +26,8 @@ use fluxor::platform::builtin_param_tags::host_image_codec::{
     TAG_HEIGHT as IMG_TAG_HEIGHT, TAG_MAX_BYTES as IMG_TAG_MAX_BYTES,
     TAG_SCALE_MODE as IMG_TAG_SCALE_MODE, TAG_WIDTH as IMG_TAG_WIDTH,
 };
+#[cfg(feature = "host-image")]
+use fluxor::platform::builtin_param_tags::host_image_codec as image_codec_tags;
 
 #[cfg(feature = "host-image")]
 const IMG_SCALE_MODE_FIT: u8 = 0;
@@ -247,8 +249,8 @@ fn build_host_image_codec(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
     let scale_mode = resolve_scale_mode(scale_raw);
 
     scheduler::set_current_module(module_idx);
-    let in_ch = scheduler::get_module_port(module_idx, 0, 0);
-    let out_ch = scheduler::get_module_port(module_idx, 1, 0);
+    let in_ch = scheduler::module_port(module_idx, image_codec_tags::PORT_ENCODED);
+    let out_ch = scheduler::module_port(module_idx, image_codec_tags::PORT_PIXELS);
     let mut m = scheduler::BuiltInModule::new("host_image_codec", host_image_step);
     install_state(
         &mut m,

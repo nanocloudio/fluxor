@@ -24,6 +24,8 @@
 // realistic MIDI rates and bounds the CPU a runaway producer can
 // steal from other modules in the same domain.
 
+use fluxor::platform::builtin_param_tags::linux_alsa_midi as alsa_midi_tags;
+
 const LINUX_ALSA_MIDI_HASH: u32 = 0xC38E5605; // fnv1a32("linux_alsa_midi")
 
 struct LinuxAlsaMidiState {
@@ -49,9 +51,8 @@ fn linux_alsa_midi_step(state: *mut u8) -> i32 {
 
 fn build_linux_alsa_midi(module_idx: usize, _params: &[u8]) -> scheduler::BuiltInModule {
     scheduler::set_current_module(module_idx);
-    // `events_in` is the manifest's first input port. `get_module_port`
-    // returns -1 for unbound ports (mode=in graphs don't wire it).
-    let events_in = scheduler::get_module_port(module_idx, 0, 0);
+    // Unbound in mode=in graphs, where the handle is -1.
+    let events_in = scheduler::module_port(module_idx, alsa_midi_tags::PORT_EVENTS_IN);
     let mut m = scheduler::BuiltInModule::new("linux_alsa_midi", linux_alsa_midi_step);
     install_state(&mut m, Box::new(LinuxAlsaMidiState { events_in }));
     log::warn!(

@@ -15,6 +15,7 @@ const HOST_ASSET_SOURCE_HASH: u32 = 0x504EEEF0; // fnv1a32("host_asset_source")
 const CHUNK_SIZE: usize = 1024;
 
 use fluxor::platform::builtin_param_tags::host_asset_source::TAG_PATH as ASSET_TAG_PATH;
+use fluxor::platform::builtin_param_tags::host_asset_source as asset_source_tags;
 
 struct HostAssetState {
     out_chan: i32,
@@ -117,7 +118,7 @@ fn build_host_asset_source(module_idx: usize, params: &[u8]) -> scheduler::Built
     debug_assert!(!path.is_empty(), "host_asset_source: empty path");
 
     scheduler::set_current_module(module_idx);
-    let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+    let out_chan = scheduler::module_port(module_idx, asset_source_tags::PORT_STREAM);
 
     let (file, eof) = match File::open(&path) {
         Ok(f) => {

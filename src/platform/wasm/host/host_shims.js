@@ -1656,6 +1656,242 @@ registerProcessor('pcm-ring', PcmRing);
       },
     };
 
+    // ── HTTP exchange (wasm_browser_http) ────────────────────────────
+    //
+    // One `fetch()` per exchange, driven through the same open / poll /
+    // recv / close shape as the fetch shim but reporting what an exchange
+    // needs and a byte source does not: the status, the response's header
+    // block, and a failure the kernel can tell from an empty body. Kept
+    // apart from `fetchShim` on purpose — that one serves the written store
+    // and the asset bank before the network and discards the status, which
+    // is right for a file and wrong for a request.
+    //
+    // `host_http_status` is three-state on the fetch vocabulary: `-3` while
+    // the head has not arrived, `-2` when the transport failed, the code
+    // otherwise. A path resolves against the module's origin when it has
+    // one and the page's when it does not; the browser's cross-origin
+    // policy decides whether the page may make the request at all.
+    const httpExchanges = new Map();
+    let nextHttpHandle = 1;
+    const HTTP_PENDING = -3;
+    const HTTP_FAILED = -2;
+    const HTTP_QUEUE_MAX = 32 * 1024 * 1024;
+
+    const httpShim = {
+      host_http_open: (methodPtr, methodLen, originPtr, originLen, pathPtr, pathLen,
+                       headersPtr, headersLen, bodyPtr, bodyLen) => {
+        try {
+          const method = kstr(methodPtr, methodLen);
+          const origin = kstr(originPtr, originLen);
+          const path = kstr(pathPtr, pathLen);
+          const url = origin ? origin + path : path;
+          const headers = new Headers();
+          for (const line of kstr(headersPtr, headersLen).split('\r\n')) {
+            if (!line) continue;
+            const at = line.indexOf(':');
+            if (at > 0) headers.append(line.slice(0, at).trim(), line.slice(at + 1).trim());
+          }
+          // A GET or HEAD carries no body by definition; sending one is a
+          // TypeError in every browser.
+          const body = (bodyLen > 0 && method !== 'GET' && method !== 'HEAD')
+            ? kview(bodyPtr, bodyLen).slice()
+            : undefined;
+          const handle = nextHttpHandle++;
+          const entry = { status: HTTP_PENDING, head: '', queue: [], eof: false, failed: false,
+                          reader: null, bytes: 0, consumed: 0 };
+          httpExchanges.set(handle, entry);
+          fetch(url, { method, headers, body, redirect: 'follow' }).then(async (resp) => {
+            let block = '';
+            resp.headers.forEach((value, name) => { block += `${name}: ${value}\r\n`; });
+            entry.head = block;
+            entry.status = resp.status;
+            if (!resp.body) {
+              entry.eof = true;
+              return;
+            }
+            const reader = resp.body.getReader();
+            entry.reader = reader;
+            // Backpressure: the undelivered queue is capped so a large
+            // response never accumulates in tab memory faster than the
+            // kernel drains it.
+            while (true) {
+              while (entry.bytes - entry.consumed > HTTP_QUEUE_MAX) {
+                await new Promise((r) => setTimeout(r, 50));
+              }
+              const { done, value } = await reader.read();
+              if (done) {
+                entry.eof = true;
+                break;
+              }
+              entry.queue.push(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+              entry.bytes += value.byteLength;
+            }
+          }).catch((err) => {
+            // Before the head: the request never happened. After it: the
+            // body ended early, which the kernel learns once it has taken
+            // what did arrive.
+            if (entry.status === HTTP_PENDING) entry.status = HTTP_FAILED;
+            entry.failed = true;
+            entry.eof = true;
+            console.warn(`host_http: ${err.message} for ${method} ${url}`);
+          });
+          return handle;
+        } catch (err) {
+          console.error(`host_http_open threw: ${err.message}`);
+          return -1;
+        }
+      },
+      host_http_status: (handle) => {
+        const entry = httpExchanges.get(handle);
+        return entry ? entry.status : HTTP_FAILED;
+      },
+      host_http_head: (handle, bufPtr, bufLen) => {
+        const entry = httpExchanges.get(handle);
+        if (!entry || entry.status < 0) return HTTP_FAILED;
+        const bytes = new TextEncoder().encode(entry.head);
+        if (bytes.length > bufLen) return HTTP_FAILED;
+        kview(bufPtr, bytes.length).set(bytes);
+        return bytes.length;
+      },
+      host_http_recv: (handle, bufPtr, bufLen) => {
+        const entry = httpExchanges.get(handle);
+        if (!entry) return HTTP_FAILED;
+        if (entry.queue.length === 0) {
+          if (!entry.eof) return 0;
+          return entry.failed ? HTTP_FAILED : -1;
+        }
+        const chunk = entry.queue[0];
+        const n = Math.min(chunk.length, bufLen);
+        kview(bufPtr, n).set(chunk.subarray(0, n));
+        if (n >= chunk.length) entry.queue.shift();
+        else entry.queue[0] = chunk.subarray(n);
+        entry.consumed += n;
+        return n;
+      },
+      host_http_close: (handle) => {
+        const entry = httpExchanges.get(handle);
+        if (!entry) return 0;
+        if (entry.reader && !entry.eof) {
+          try { entry.reader.cancel().catch(() => {}); } catch (_) {}
+        }
+        httpExchanges.delete(handle);
+        return 0;
+      },
+    };
+
+    // ── Addressed WebSocket links (wasm_browser_ws) ──────────────────
+    //
+    // One socket per link, with what the tunnel shim above has no need
+    // of and a connector cannot do without: message boundaries and
+    // opcodes preserved on the way in, opcode chosen on the way out, and
+    // the link's open / close / failure reported as events rather than
+    // inferred from silence. A close is reported only after every message
+    // that preceded it has been taken, so a consumer never sees "ended"
+    // ahead of the last thing the peer said.
+    const wsLinks = new Map();
+    let nextWsLink = 1;
+    const WS_LINK_OPEN = 1;
+    const WS_LINK_CLOSED = 2;
+    const WS_LINK_FAILED = 3;
+    const WS_OP_TEXT = 1;
+    const WS_OP_BINARY = 2;
+
+    const wsLinkShim = {
+      host_ws_link_open: (originPtr, originLen, pathPtr, pathLen) => {
+        try {
+          const origin = kstr(originPtr, originLen);
+          const path = kstr(pathPtr, pathLen);
+          let url;
+          if (origin) {
+            url = origin + path;
+          } else {
+            // The page's own origin, over the socket scheme that matches
+            // how the page was served.
+            const loc = self.location;
+            const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+            url = `${proto}//${loc.host}${path}`;
+          }
+          const sock = new WebSocket(url);
+          sock.binaryType = 'arraybuffer';
+          const handle = nextWsLink++;
+          const entry = { socket: sock, rxQueue: [], events: [], opened: false };
+          wsLinks.set(handle, entry);
+          sock.addEventListener('open', () => {
+            entry.opened = true;
+            entry.events.push([WS_LINK_OPEN, 0]);
+          });
+          sock.addEventListener('close', (e) => {
+            // Which of the two it is turns on whether the link ever
+            // opened: one that did has ended, one that did not never
+            // opened, and a consumer waiting to send has to tell them
+            // apart. 1006 is what a transport that went without a close
+            // frame is called.
+            entry.events.push(entry.opened ? [WS_LINK_CLOSED, e.code || 1006] : [WS_LINK_FAILED, 0]);
+          });
+          sock.addEventListener('error', () => {
+            // A close event always follows; that is where it is reported.
+          });
+          sock.addEventListener('message', (e) => {
+            const binary = e.data instanceof ArrayBuffer;
+            const data = binary ? new Uint8Array(e.data) : new TextEncoder().encode(String(e.data));
+            entry.rxQueue.push({ opcode: binary ? WS_OP_BINARY : WS_OP_TEXT, data, at: 0 });
+          });
+          return handle;
+        } catch (err) {
+          console.error(`host_ws_link_open threw: ${err.message}`);
+          return -1;
+        }
+      },
+      host_ws_link_event: (handle) => {
+        const entry = wsLinks.get(handle);
+        if (!entry || entry.events.length === 0) return 0;
+        const [kind, code] = entry.events[0];
+        if (kind !== WS_LINK_OPEN && entry.rxQueue.length > 0) return 0;
+        entry.events.shift();
+        return ((kind << 16) | (code & 0xFFFF)) >>> 0;
+      },
+      host_ws_link_send: (handle, opcode, dataPtr, len) => {
+        const entry = wsLinks.get(handle);
+        if (!entry || !entry.opened) return -1;
+        try {
+          const bytes = kview(dataPtr, len).slice();
+          entry.socket.send(opcode === WS_OP_TEXT ? new TextDecoder().decode(bytes) : bytes);
+          return len;
+        } catch (err) {
+          console.error(`host_ws_link_send threw: ${err.message}`);
+          return -1;
+        }
+      },
+      host_ws_link_next: (handle) => {
+        const entry = wsLinks.get(handle);
+        if (!entry || entry.rxQueue.length === 0) return -1;
+        const msg = entry.rxQueue[0];
+        return ((msg.opcode << 24) | ((msg.data.length - msg.at) & 0xFFFFFF)) >>> 0;
+      },
+      host_ws_link_recv: (handle, bufPtr, bufLen) => {
+        const entry = wsLinks.get(handle);
+        if (!entry || entry.rxQueue.length === 0) return -1;
+        const msg = entry.rxQueue[0];
+        const n = Math.min(bufLen, msg.data.length - msg.at);
+        if (n > 0) kview(bufPtr, n).set(msg.data.subarray(msg.at, msg.at + n));
+        msg.at += n;
+        if (msg.at >= msg.data.length) entry.rxQueue.shift();
+        return n;
+      },
+      host_ws_link_close: (handle, code) => {
+        const entry = wsLinks.get(handle);
+        if (!entry) return 0;
+        try {
+          if (code) entry.socket.close(code);
+          else entry.socket.close();
+        } catch (_) {}
+        // Code 0 is the kernel letting go of a link it has been told is
+        // over; with a code the socket's own close event will say so.
+        if (!code) wsLinks.delete(handle);
+        return 0;
+      },
+    };
+
     // ── Audio sink (wasm_browser_audio) — delegates to the shared fixed-rate
     //    scheduler (createAudioScheduler, top of file). The Worker bridge reuses
     //    the SAME factory on the main thread so pacing never drifts between paths.
@@ -2249,6 +2485,19 @@ registerProcessor('pcm-ring', PcmRing);
       host_destroy_module: (handle) => moduleInstances.delete(handle) ? 0 : -1,
     };
 
+    // WebGPU init is asynchronous (adapter/device requests are Promises), but a
+    // Wasm import is synchronous — so `host_gpu_raster_init` cannot await and return
+    // the real result inline (the module would observe a coerced Promise and
+    // "succeed" before the device exists). Instead init kicks off the async work
+    // and records progress in `gpuInitStatus` below; the module polls
+    // `host_gpu_raster_poll_init`. Status: 0 = ready, 1 = pending, 2 = not
+    // started, <0 = error (-1 no WebGPU, -2 no adapter, -3 init threw).
+    // Declared ahead of the device service, which starts in the not-started
+    // state.
+    const GPU_INIT_READY = 0;
+    const GPU_INIT_PENDING = 1;
+    const GPU_INIT_NOT_STARTED = 2;
+
     // ── Shared GPU device service ────────────────────────────────────
     //
     // ONE adapter and ONE device for the whole page, shared by every GPU
@@ -2373,16 +2622,6 @@ registerProcessor('pcm-ring', PcmRing);
       gpuFrameSubmittedThisVsync = false;
       requestAnimationFrame(gpuVsyncPump);
     })();
-    // WebGPU init is asynchronous (adapter/device requests are Promises), but a
-    // Wasm import is synchronous — so `host_gpu_raster_init` cannot await and return
-    // the real result inline (the module would observe a coerced Promise and
-    // "succeed" before the device exists). Instead init kicks off the async work
-    // and records progress here; the module polls `host_gpu_raster_poll_init`.
-    // Status: 0 = ready, 1 = pending, 2 = not started, <0 = error (-1 no WebGPU,
-    // -2 no adapter, -3 init threw).
-    const GPU_INIT_READY = 0;
-    const GPU_INIT_PENDING = 1;
-    const GPU_INIT_NOT_STARTED = 2;
     let gpuInitStatus = GPU_INIT_NOT_STARTED;
     let gpuWidth = 0;
     let gpuHeight = 0;
@@ -3333,6 +3572,8 @@ registerProcessor('pcm-ring', PcmRing);
         actionShim,
         surfaceTraitsShim,
         wsShim,
+        httpShim,
+        wsLinkShim,
         audioShim,
         canvasShim,
         cameraShim,

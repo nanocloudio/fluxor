@@ -529,6 +529,22 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
+    // ───── Phase 2.5: wasm host-shim behaviour (node) ───────────────
+    //
+    // The browser host's import shims are JavaScript, so the only thing
+    // cargo can hold about them is that every extern has one (the parity
+    // guard in `tools/tests`). What they DO is held by `tests/host/*.test.js`
+    // on a fake linear memory, with `node` as the engine. A kernel
+    // workspace without `node` on the path reports the phase skipped
+    // rather than omitted, so the absence of the runtime is visible.
+    if kernel_workspace {
+        results.push(if skip.cargo {
+            skipped("wasm-host-shims (node)")
+        } else {
+            run_node_tests(project_root, verbose)
+        });
+    }
+
     // ───── Phase 3: modules build ───────────────────────────────────
     results.push(if skip.modules {
         skipped("modules-build (strict)")
@@ -634,6 +650,72 @@ where
             message: msg,
         },
     }
+}
+
+/// Run every `tests/host/*.test.js` under `node`. Skipped, with the reason
+/// in the message, when there is no `node` to run them or nothing to run.
+fn run_node_tests(project_root: &Path, verbose: bool) -> PhaseResult {
+    const NAME: &str = "wasm-host-shims (node)";
+    let mut tests = Vec::new();
+    expand_glob(project_root, "tests/host/*.test.js", &mut tests);
+    tests.sort();
+    if tests.is_empty() {
+        return PhaseResult {
+            name: NAME,
+            status: PhaseStatus::Skipped,
+            elapsed_ms: 0,
+            message: "no tests/host/*.test.js".to_string(),
+        };
+    }
+    let node_present = Command::new("node")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !node_present {
+        return PhaseResult {
+            name: NAME,
+            status: PhaseStatus::Skipped,
+            elapsed_ms: 0,
+            message: format!("node not on PATH; {} test file(s) not run", tests.len()),
+        };
+    }
+    run_step(NAME, verbose, || {
+        let mut failed = Vec::new();
+        for test in &tests {
+            let name = test
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            if verbose {
+                eprintln!("[ci] {NAME}: {name}");
+            }
+            let out = Command::new("node")
+                .arg(test)
+                .current_dir(project_root)
+                .output()
+                .map_err(|e| format!("node: spawn failed: {e}"))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let tail: Vec<&str> = stderr.lines().rev().take(12).collect();
+                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                failed.push(format!("{name}:\n    {}", tail.join("\n    ")));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} of {} node test file(s) failed:\n  {}",
+                failed.len(),
+                tests.len(),
+                failed.join("\n  ")
+            ))
+        }
+    })
 }
 
 fn skipped(name: &'static str) -> PhaseResult {

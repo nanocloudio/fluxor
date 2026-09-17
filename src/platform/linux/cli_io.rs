@@ -23,6 +23,8 @@
 use fluxor::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome};
 use portable_atomic::AtomicI32;
 use std::sync::Arc;
+use fluxor::platform::builtin_param_tags::cli_in as cli_in_tags;
+use fluxor::platform::builtin_param_tags::cli_out as cli_out_tags;
 
 const CLI_IN_HASH: u32 = 0x39EB09AD; // fnv1a32("cli_in")
 const CLI_OUT_HASH: u32 = 0xD0D89096; // fnv1a32("cli_out")
@@ -285,8 +287,8 @@ fn cli_in_step(state: *mut u8) -> i32 {
 /// pump thread is spawned only when `stdin_out` is wired.
 fn build_cli_in(module_idx: usize) -> scheduler::BuiltInModule {
     scheduler::set_current_module(module_idx);
-    let args_out = scheduler::get_module_port(module_idx, 1, 0);
-    let stdin_out = scheduler::get_module_port(module_idx, 1, 1);
+    let args_out = scheduler::module_port(module_idx, cli_in_tags::PORT_ARGS_OUT);
+    let stdin_out = scheduler::module_port(module_idx, cli_in_tags::PORT_STDIN_OUT);
 
     let eof = Arc::new(portable_atomic::AtomicBool::new(false));
     let bridge = if stdin_out >= 0 {
@@ -467,9 +469,9 @@ fn spawn_sink_worker<W: std::io::Write + Send + 'static>(
 /// Construct a `cli_out` built-in: own stdout/stderr and the exit-code latch.
 fn build_cli_out(module_idx: usize) -> scheduler::BuiltInModule {
     scheduler::set_current_module(module_idx);
-    let bytes_in = scheduler::get_module_port(module_idx, 0, 0);
-    let err_in = scheduler::get_module_port(module_idx, 0, 1);
-    let exit_in = scheduler::get_module_port(module_idx, 0, 2);
+    let bytes_in = scheduler::module_port(module_idx, cli_out_tags::PORT_BYTES_IN);
+    let err_in = scheduler::module_port(module_idx, cli_out_tags::PORT_ERR_IN);
+    let exit_in = scheduler::module_port(module_idx, cli_out_tags::PORT_EXIT_IN);
 
     let stdout_bridge = (bytes_in >= 0).then(|| {
         let b: Arc<ExtBridge<CLI_BRIDGE_CAP>> = Arc::new(ExtBridge::new(OverloadPolicy::Block));

@@ -221,8 +221,8 @@ fn parse_args() -> CliArgs {
 // into scope so the flat registration (`runtime.rs`) and boot/watch sites
 // (`linux.rs` body) resolve them by name.
 use fluxor::platform::builtin_param_tags::linux_net::{
-    TAG_LISTEN_BACKLOG as NET_TAG_LISTEN_BACKLOG, TAG_MAX_CONNS as NET_TAG_MAX_CONNS,
-    TAG_WRITE_BUF_KIB as NET_TAG_WRITE_BUF_KIB,
+    PORT_NET_IN, PORT_NET_OUT, TAG_LISTEN_BACKLOG as NET_TAG_LISTEN_BACKLOG,
+    TAG_MAX_CONNS as NET_TAG_MAX_CONNS, TAG_WRITE_BUF_KIB as NET_TAG_WRITE_BUF_KIB,
 };
 use fluxor::platform::linux::owner_drain::{arm_drains, drain_tick, synthesize_restart_terminals};
 use fluxor::platform::linux::owner_status::OwnerStatusWriter;
@@ -328,14 +328,15 @@ fn build_graph_linux() -> (usize, usize) {
                 [fluxor::kernel::workload::owner::OWNER_SYSTEM; LINUX_NET_MAX_INBOUND];
             let mut lane_count = 0usize;
             for (k, slot) in net_ins.iter_mut().enumerate() {
-                let ch = scheduler::get_module_port(module_idx, 0, k as u8);
+                let ch =
+                    scheduler::module_port(module_idx, (PORT_NET_IN.0, PORT_NET_IN.1 + k as u8));
                 *slot = ch;
                 if ch >= 0 {
                     lane_owners[k] = scheduler::channel_producer_owner(ch);
                     lane_count = k + 1;
                 }
             }
-            let net_out_ch = scheduler::get_module_port(module_idx, 1, 0);
+            let net_out_ch = scheduler::module_port(module_idx, PORT_NET_OUT);
             // Table and backlog sizing from the graph (`platform: net:`
             // fields); the manifest defaults apply when absent.
             let mut max_conns = LINUX_NET_MAX_CONNS_DEFAULT as u32;

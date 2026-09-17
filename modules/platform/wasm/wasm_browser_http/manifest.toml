@@ -1,0 +1,93 @@
+version = "1.0.0"
+hardware_targets = ["wasm"]
+builtin = true
+
+# The browser as an HTTP exchange provider: the page's `fetch()` behind the
+# provider half of `stream.ordered_ack.exchange`. A request arrives on
+# `publish_in` as an `http_exchange` record inside a `Publish`; the answer
+# leaves on `reply_out` under the same correlation, echoing the request's
+# key. An extended request is answered with the response head, and its body
+# streams on `file_ctrl` as length-framed chunks ending with an empty one —
+# the same records, ports and refusals a socket-backed HTTP client offers,
+# so a consumer moves between the two by wiring alone.
+#
+# A request names a path; `origin` names where. A path carrying its own
+# scheme or host is refused UNROUTABLE, so a program cannot reach a server
+# the graph did not name. The browser's cross-origin policy is the
+# enforcement behind that: a fetch the page may not make fails, and a failed
+# fetch is UNROUTABLE too. Redirects are followed, as the page's own fetches
+# are; a consumer that asked for the whole response sees the final one.
+#
+# One exchange is in flight at a time. A graph that wants concurrency
+# instantiates more of these, which is also how it gets more connections.
+
+capabilities = ["stream.ordered_ack.exchange"]
+
+[capability_facts."stream.ordered_ack.exchange"]
+# A 2xx means the origin accepted the request, not that anything was made
+# durable — HTTP has no durability contract to offer.
+ack         = "transport"
+# One request in flight, so ordering is trivially preserved: there is never
+# a second record to reorder against.
+ordering    = "single"
+# `FLAG_BROADCAST` is refused rather than ignored. This provider reaches one
+# origin, and acking a fan-out that reached one destination would report a
+# delivery that did not happen.
+broadcast   = "unsupported"
+max_payload = 8192
+
+# `max_record` is the contract's `PUBLISH_FRAME_MAX` / `REPLY_FRAME_MAX`
+# (13 overhead + 512 key + 8192 payload = 8717) plus the 3-byte channel
+# envelope the frames ride; the ring holds two, so a producer can write the
+# next while one is being performed.
+[[ports]]
+name = "publish_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 17440
+max_record = 8720
+required = true
+
+[[ports]]
+name = "reply_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 17440
+max_record = 8720
+required = true
+
+# The body of an extended response, as `http_exchange` chunks. Optional: a
+# graph that only asks for bodies wires nothing here, and an extended
+# request it sends anyway is refused rather than answered with a head whose
+# body was dropped.
+[[ports]]
+name = "file_ctrl"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 2048
+
+# Where paths resolve: a scheme and host such as `https://api.example`.
+# Empty means the page's own origin, which is what a bundle served beside
+# the service it talks to wants, and what its cross-origin policy permits
+# without any further arrangement.
+[[params]]
+name = "origin"
+tag = 10
+type = "str"
+default = ""
+
+# With status surfacing on, a response of 400 or above answers as a
+# `REFUSE_UPSTREAM` carrying the code, so a producer can tell a 503 worth
+# retrying from a 404 worth dropping without parsing a body. Off by
+# default: for most consumers an error body is the answer. An extended
+# reply carries the status anyway and is never surfaced.
+[[params]]
+name = "surface_status"
+tag = 11
+type = "u8"
+default = 0
+range = [0, 1]
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "browser-API shim (wasm) — observed via browser devtools; the page's network panel is the byte stream"

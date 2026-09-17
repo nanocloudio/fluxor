@@ -23,6 +23,7 @@
 const HOST_ASSET_INDEX_HASH: u32 = 0xFB4428B3; // fnv1a32("host_asset_index")
 
 use fluxor::platform::builtin_param_tags::host_asset_index::TAG_PATHS as ASSET_INDEX_TAG_PATHS;
+use fluxor::platform::builtin_param_tags::host_asset_index as asset_index_tags;
 
 struct HostAssetIndexState {
     out_chan: i32,
@@ -186,7 +187,7 @@ fn build_host_asset_index(module_idx: usize, params: &[u8]) -> scheduler::BuiltI
     debug_assert!(!paths.is_empty(), "host_asset_index: empty paths");
 
     scheduler::set_current_module(module_idx);
-    let out_chan = scheduler::get_module_port(module_idx, 1, 0);
+    let out_chan = scheduler::module_port(module_idx, asset_index_tags::PORT_STREAM);
 
     let mut m = scheduler::BuiltInModule::new("host_asset_index", host_asset_index_step);
     install_state(
