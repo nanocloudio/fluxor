@@ -117,6 +117,17 @@ pub mod contracts {
         pub mod ws_frame {
             include!("contracts/net/ws_frame.rs");
         }
+        /// The records an HTTP connector is asked through over
+        /// `stream.ordered_ack.exchange`: a request, a reply head, a body
+        /// chunk, and the method vocabulary they share.
+        pub mod http_exchange {
+            include!("contracts/net/http_exchange.rs");
+        }
+        /// The records that drive a WebSocket connector from outside it:
+        /// which resource to open on which link, and what became of it.
+        pub mod ws_control {
+            include!("contracts/net/ws_control.rs");
+        }
     }
     /// Observability telemetry envelope (metric / span signals).
     pub mod telemetry {
