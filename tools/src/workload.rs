@@ -160,6 +160,19 @@ pub struct WorkloadManifest {
     pub contract: Contract,
     #[serde(default)]
     pub implementations: Vec<Implementation>,
+    /// Where this workload's control-plane store lives, relative to the
+    /// bundle directory unless absolute.
+    ///
+    /// A workload that keeps state says where it keeps it, and what it
+    /// says beats `FLUXOR_STORE_DIR` in the launching process's
+    /// environment: the deployment knows what its own state is and the
+    /// caller does not. Left to the environment alone, an applet's
+    /// storage is whatever its caller happened to export, so the same
+    /// applet run from two shells reaches two different stores, or none,
+    /// with nothing reporting the difference. The variable remains for a
+    /// node-wide store no single workload owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_dir: Option<String>,
 }
 
 /// The resource-footprint document referenced by an implementation's

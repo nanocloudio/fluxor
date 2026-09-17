@@ -32,11 +32,19 @@
 //! pure SPMC pattern and survives being called from tighter contexts
 //! (ISRs, cross-core) later.
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
-/// Ring capacity. Must be a power of two; sized to cover early boot until the
-/// log_net module is up (~a few seconds of chatty logging). Per-silicon,
-/// through the kernel's capacity seam: a host-class 64 KiB ring pushes
-/// .bss past the linker's RAM region on both RP parts once STATE_ARENA
-/// and BUFFER_ARENA are placed beside it.
+/// Ring capacity. Must be a power of two; sized to cover early boot until
+/// a consumer can reach its transport. Per-silicon, through the kernel's
+/// capacity seam: a host-class ring pushes .bss past the linker's RAM
+/// region on both RP parts once STATE_ARENA and BUFFER_ARENA are placed
+/// beside it.
+///
+/// Raising it is not free, and not currently an improvement: the whole
+/// retained span is replayed in one burst when a consumer attaches, so
+/// the ring is also the size of that burst. On the Pi 5 rig a 256 KiB
+/// ring outran the collector, which received FEWER of the early records
+/// than a 64 KiB one — the oldest datagrams, the ones the replay exists
+/// to deliver, are the ones a socket buffer drops first. Pacing the
+/// replay is the prerequisite for a bigger ring.
 const CAPACITY: usize = crate::kernel::config::LOG_RING_CAPACITY;
 const MASK: usize = CAPACITY - 1;
 static mut BUF: [u8; CAPACITY] = [0; CAPACITY];
@@ -83,8 +91,7 @@ pub fn activate_local() {
 pub fn activate_local_from_backlog() {
     if !LOCAL_ACTIVE.load(Ordering::Acquire) {
         let head = HEAD.load(Ordering::Acquire);
-        let retained = core::cmp::min(head as usize, CAPACITY) as u32;
-        TAIL_LOCAL.store(head.wrapping_sub(retained), Ordering::Release);
+        TAIL_LOCAL.store(backlog_tail(head), Ordering::Release);
         LOCAL_ACTIVE.store(true, Ordering::Release);
     }
 }
@@ -178,17 +185,71 @@ pub fn drain_local(out: &mut [u8]) -> usize {
     drain_from(&TAIL_LOCAL, out)
 }
 /// Drain for the net-side consumer (`LOG_RING_DRAIN` syscall). Advances
-/// the net tail only. The first call activates the net consumer, seeding
-/// `TAIL_NET` to `HEAD` so the consumer starts from "now" and returning
-/// 0; subsequent calls copy bytes normally.
+/// the net tail only.
+///
+/// The first call activates the net consumer and seeds `TAIL_NET` to the
+/// OLDEST byte the ring still holds, not to `HEAD`, so the backlog that
+/// accumulated before the consumer could reach its transport is
+/// delivered first. This is [`activate_local_from_backlog`]'s rule on
+/// the net tail, for the same reason.
+///
+/// It matters more here than for a console, because the net consumer
+/// cannot start early even in principle: `log_net` forwards nothing
+/// until its endpoint is bound, and binding waits on DHCP. Seeding to
+/// `HEAD` therefore discarded exactly the window nothing else can see —
+/// instantiation, and any refusal during it — on a board whose only
+/// other transport is a serial line that may not be attached. The bytes
+/// were in the ring the whole time; the tail was simply placed past
+/// them.
+///
+/// The ring holds at most `CAPACITY` bytes, so the replay is bounded by
+/// the ring rather than by how long the board took to get an address.
 pub fn drain_net(out: &mut [u8]) -> usize {
     if !NET_ACTIVE.load(Ordering::Acquire) {
         let head = HEAD.load(Ordering::Acquire);
-        TAIL_NET.store(head, Ordering::Release);
+        TAIL_NET.store(backlog_tail(head), Ordering::Release);
         NET_ACTIVE.store(true, Ordering::Release);
-        return 0;
     }
     drain_from(&TAIL_NET, out)
+}
+
+/// The oldest byte a backlog replay should start at, given `head`.
+///
+/// The ring retains its last `CAPACITY` bytes, and that boundary falls
+/// wherever the producer happened to be — almost always inside a record.
+/// Starting exactly there emits a fragment as if it were a line: the
+/// first thing a reader sees is a truncated record with its tag missing,
+/// which reads as corruption and, worse, can partially match a pattern
+/// someone is grepping for.
+///
+/// So the tail advances past the first newline in the retained span, and
+/// the replay begins at the first WHOLE record. If the span holds no
+/// newline at all there is no record boundary to find and the raw tail
+/// stands, which is the best available answer rather than dropping the
+/// backlog entirely.
+fn backlog_tail(head: u32) -> u32 {
+    let retained = core::cmp::min(head as usize, CAPACITY);
+    let start = head.wrapping_sub(retained as u32);
+    // Only a WRAPPED ring can open mid-record. Before the first wrap the
+    // span starts at the very first byte ever logged, which is a record
+    // start by construction — skipping there would throw away a whole
+    // valid record, and if the log so far is one line it would throw
+    // away all of it.
+    if (head as usize) <= CAPACITY {
+        return start;
+    }
+    let mut i = 0usize;
+    while i < retained {
+        let idx = (start.wrapping_add(i as u32) as usize) & MASK;
+        // SAFETY: `idx & MASK` is in-bounds for `BUF`; single-byte
+        // volatile read of a byte the producer has already published.
+        let b = unsafe { core::ptr::read_volatile((&raw const BUF[0]).add(idx)) };
+        if b == b'\n' {
+            return start.wrapping_add(i as u32 + 1);
+        }
+        i += 1;
+    }
+    start
 }
 /// Atomically read and clear the local-tail dropped-byte counter.
 pub fn take_dropped_local() -> u32 {

@@ -57,6 +57,85 @@ pub struct Artifact {
 pub struct StoreLock {
     #[serde(default, rename = "artifact")]
     pub artifacts: Vec<Artifact>,
+    /// The catalog (`stacks/` + `targets/`) these pins were resolved
+    /// against.
+    ///
+    /// The catalog is the one input to a build that nothing pinned. It
+    /// is read live from the fluxor checkout while the modules it
+    /// configures come from the digests above, so the two move
+    /// independently: a stack edited in a sibling checkout changes every
+    /// downstream build immediately, with no publish, no `update`, and
+    /// no record anywhere that anything changed.
+    ///
+    /// That is not hypothetical. A commit that added parameters to a
+    /// module and referenced them from a stack was coherent in its own
+    /// tree and broke every consumer's networked build until each
+    /// rebuilt that target — and the failure named a parameter the
+    /// consumer's config had never mentioned.
+    ///
+    /// Recording the catalog here does not freeze it; it makes the drift
+    /// observable, which is what was missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Catalog>,
+}
+
+/// The catalog stamp recorded in `fluxor.lock`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Catalog {
+    /// Digest over every `stacks/*.toml` and `targets/**/*.toml` in the
+    /// install root, by sorted relative path.
+    pub digest: String,
+    /// Where that catalog was read from, for a reader diagnosing a
+    /// mismatch. Informational: the path is machine-local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Digest the catalog at `install_root` — every `stacks/*.toml` and
+/// `targets/**/*.toml`, hashed by sorted relative path so the result
+/// depends on content and naming and not on directory order.
+///
+/// Returns `None` when the root holds no catalog to digest.
+pub fn catalog_digest(install_root: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    fn collect(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, base, out);
+            } else if path.extension().is_some_and(|e| e == "toml") {
+                if let (Ok(rel), Ok(bytes)) = (path.strip_prefix(base), fs::read(&path)) {
+                    out.push((rel.to_string_lossy().replace('\\', "/"), bytes));
+                }
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(&install_root.join("stacks"), install_root, &mut files);
+    collect(&install_root.join("targets"), install_root, &mut files);
+    if files.is_empty() {
+        return None;
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (rel, bytes) in &files {
+        h.update(rel.as_bytes());
+        h.update([0u8]);
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    let out = h.finalize();
+    let mut s = String::from("sha256:");
+    for b in out {
+        s.push_str(&format!("{b:02x}"));
+    }
+    Some(s)
 }
 
 pub fn lockfile_path(project_root: &Path) -> PathBuf {
@@ -105,7 +184,16 @@ pub fn sort_entries(entries: &mut Vec<Artifact>) {
 pub fn write_store_lock(project_root: &Path, entries: &[Artifact]) -> Result<PathBuf> {
     let mut sorted = entries.to_vec();
     sort_entries(&mut sorted);
-    let lock = StoreLock { artifacts: sorted };
+    let catalog = crate::project::install_root().and_then(|r| {
+        catalog_digest(&r.path).map(|digest| Catalog {
+            digest,
+            source: Some(r.path.to_string_lossy().into_owned()),
+        })
+    });
+    let lock = StoreLock {
+        artifacts: sorted,
+        catalog,
+    };
     let path = lockfile_path(project_root);
     let mut body = String::new();
     body.push_str("# fluxor.lock — generated, edit via `fluxor update`\n");

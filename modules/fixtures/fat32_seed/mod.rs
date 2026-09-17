@@ -121,7 +121,7 @@ mod params_def {
         // Inline payload. The TLV encoder splits strings past 255 bytes into
         // repeated entries with the same tag, so this appends rather than
         // overwrites.
-        2, data, str, 0
+        2, data, str_chunked, 0
             => |s, d, len| {
                 let already = s.data_len as usize;
                 let room = super::MAX_DATA.saturating_sub(already);

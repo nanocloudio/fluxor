@@ -6,9 +6,12 @@
 //! so enabling this module is enough to feed the host-side dashboard
 //! over whichever log transports are active.
 //!
-//! `MON_STATE` emission is deferred until the kernel exposes module
-//! metadata (name / protection tier / state) through a query opcode —
-//! without those fields the line would be empty of useful content.
+//! `MON_STATE` reports each module's scheduler-visible state through
+//! `MODULE_STATE_QUERY`: whether the slot is present, whether the module
+//! has signalled ready, whether it has finished, its fault state, its
+//! step period, and how many consecutive ticks the readiness gate has
+//! been blocking it. Together those settle why a module is not being
+//! stepped, which absence from `MON_HIST` only ever hinted at.
 //!
 //! Parameters:
 //!   `interval_ms` — how often to emit a round of histograms (default
@@ -33,7 +36,10 @@ include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
 // Opcodes imported from the layered ABI — no hardcoded 0x0Cxx here.
-use abi::internal::monitor::STEP_HISTOGRAM_QUERY;
+use abi::internal::monitor::{
+    module_state_flags, MODULE_STATE_LEN, MODULE_STATE_MAX, MODULE_STATE_QUERY,
+    STEP_HISTOGRAM_QUERY,
+};
 use abi::internal::reconfigure::MODULE_COUNT as RECONFIGURE_MODULE_COUNT;
 use abi::kernel_abi::LOG_WRITE as SYSTEM_LOG;
 
@@ -159,6 +165,77 @@ unsafe fn build_mon_hist(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> usi
     pos
 }
 
+/// Build one MON_STATE line for module `mod_idx` into `out`. Returns
+/// bytes written, or 0 if the query failed (caller should skip).
+unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> usize {
+    let mut st = [0u8; MODULE_STATE_MAX];
+    let rc = (sys.provider_call)(
+        mod_idx as i32,
+        MODULE_STATE_QUERY,
+        st.as_mut_ptr(),
+        MODULE_STATE_MAX,
+    );
+    // The query answers with the width it wrote; anything short of the
+    // fixed header is not a record.
+    if rc < MODULE_STATE_LEN as i32 {
+        return 0;
+    }
+    let flags = st[1];
+    // An empty slot has no state worth a line; reporting one would make
+    // every unused slot look like a stalled module.
+    if flags & module_state_flags::PRESENT == 0 {
+        return 0;
+    }
+
+    let u16_at = |a: usize| -> u32 { (st[a] as u32) | ((st[a + 1] as u32) << 8) };
+    let u32_at = |a: usize| -> u32 {
+        (st[a] as u32)
+            | ((st[a + 1] as u32) << 8)
+            | ((st[a + 2] as u32) << 16)
+            | ((st[a + 3] as u32) << 24)
+    };
+    let bit = |m: u8| -> u32 { u32::from(flags & m != 0) };
+
+    let mut pos = 0usize;
+    emit_bytes(b"MON_STATE mod=", out, &mut pos);
+    emit_decimal(mod_idx as u32, out, &mut pos);
+    // `name` and `state` are the keys the host dashboard reads; the rest
+    // are the diagnostic fields, which it ignores as unknown keys.
+    let name_len = st[18] as usize;
+    if name_len > 0 && MODULE_STATE_LEN + name_len <= rc as usize {
+        emit_bytes(b" name=", out, &mut pos);
+        emit_bytes(&st[MODULE_STATE_LEN..MODULE_STATE_LEN + name_len], out, &mut pos);
+    }
+    emit_bytes(b" state=", out, &mut pos);
+    emit_bytes(
+        match st[2] {
+            0 => b"running".as_slice(),
+            1 => b"faulted".as_slice(),
+            2 => b"recovering".as_slice(),
+            _ => b"terminated".as_slice(),
+        },
+        out,
+        &mut pos,
+    );
+    emit_bytes(b" ready=", out, &mut pos);
+    emit_decimal(bit(module_state_flags::READY), out, &mut pos);
+    emit_bytes(b" finished=", out, &mut pos);
+    emit_decimal(bit(module_state_flags::FINISHED), out, &mut pos);
+    emit_bytes(b" restarts=", out, &mut pos);
+    emit_decimal(u16_at(8), out, &mut pos);
+    emit_bytes(b" domain=", out, &mut pos);
+    emit_decimal(st[7] as u32, out, &mut pos);
+    emit_bytes(b" period=", out, &mut pos);
+    emit_decimal(st[6] as u32, out, &mut pos);
+    // The field that answers "why is it not stepping": non-zero means
+    // the readiness gate has been refusing it for that many ticks.
+    emit_bytes(b" inactive=", out, &mut pos);
+    emit_decimal(u32_at(10), out, &mut pos);
+    emit_bytes(b" gen=", out, &mut pos);
+    emit_decimal(u32_at(14), out, &mut pos);
+    pos
+}
+
 // ============================================================================
 // Module interface
 // ============================================================================
@@ -256,6 +333,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Level 3 = info. LOG_WRITE routes through `syscall_log`
                 // which calls `log::info!` — bytes land in the ring and
                 // flow out the active transport overlay.
+                ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
+            }
+            let n = build_mon_state(&*sys_ptr, idx as u8, &mut line);
+            if n > 0 {
                 ((*sys_ptr).provider_call)(3, SYSTEM_LOG, line.as_mut_ptr(), n);
             }
             idx += 1;

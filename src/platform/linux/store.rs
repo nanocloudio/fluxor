@@ -1119,7 +1119,10 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
 
             let (items, watermark) = store.list(prefix);
             // entries: [name_len:u8][kind:u8][name] ; trailing
-            // [0xFF][cursor_len:u8][cursor] — cursor_len 0 means end of listing.
+            // [0xFF][0xFF][cursor_len:u8][cursor] — cursor_len 0 means end of
+            // listing. The second marker byte sits where an entry carries its
+            // `kind`, which is never 0xFF, so a 255-byte name (whose
+            // `name_len` IS 0xFF) cannot be read as the page end.
             //
             // A prefix holds an unbounded number of objects, so the reply
             // PAGES: fill the buffer, emit a cursor, let the caller ask
@@ -1129,16 +1132,18 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
             // entirely once its prefix outgrew that buffer, rather than
             // degrading.
             //
-            // Worst case the trailing record is 6 bytes (0xFF + len + 4-byte
-            // cursor); reserve that so a page can always be terminated.
-            const TRAILER_MAX: usize = 6;
+            // Worst case the trailing record is 7 bytes (two markers + len +
+            // 4-byte cursor); reserve that so a page can always be terminated.
+            const TRAILER_MAX: usize = 7;
             let mut buf = Vec::new();
             let mut next = start;
             for (k, _rev) in items.iter().skip(start) {
                 let name = k.as_bytes();
-                if name.len() > 255 {
-                    next += 1;
-                    continue; // unrepresentable name length — skip
+                if name.len() > ns_op::MAX_ENTRY_NAME_LEN {
+                    // `name_len` is a byte and this name does not fit one.
+                    // Refuse: skipping returns a page the caller has no way
+                    // to know is short.
+                    return errno::EOVERFLOW;
                 }
                 let need = 2 + name.len();
                 if out_buf != 0 && buf.len() + need + TRAILER_MAX > out_cap {
@@ -1149,7 +1154,8 @@ pub unsafe fn dispatch_namespace(handle: i32, opcode: u32, arg: *mut u8, arg_len
                 buf.extend_from_slice(name);
                 next += 1;
             }
-            buf.push(0xFF);
+            buf.push(ns_op::TRAILER_MARK);
+            buf.push(ns_op::TRAILER_MARK);
             if next < items.len() {
                 buf.push(4); // cursor_len
                 buf.extend_from_slice(&(next as u32).to_le_bytes());

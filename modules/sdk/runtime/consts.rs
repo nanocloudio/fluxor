@@ -7,6 +7,10 @@ pub const POLL_OUT: u32 = 0x02;
 pub const POLL_ERR: u32 = 0x04;
 pub const POLL_HUP: u32 = 0x08;
 pub const POLL_CONN: u32 = 0x10;
+/// The channel has carried at least one byte since its last flush.
+/// Poll for `POLL_HUP | POLL_WROTE` to tell a stream that ended from
+/// one that never started — `POLL_HUP` alone does not distinguish them.
+pub const POLL_WROTE: u32 = 0x20;
 
 // ============================================================================
 // Common Error Codes (from kernel errno)
@@ -225,3 +229,54 @@ pub const MSG_STATUS: u32 = fnv1a(b"status");
 pub const MSG_ON: u32 = fnv1a(b"on");
 pub const MSG_OFF: u32 = fnv1a(b"off");
 pub const MSG_BLINK: u32 = fnv1a(b"blink");
+
+// ============================================================================
+// Stream staging
+// ============================================================================
+
+/// What a channel being staged as a stream is currently saying.
+///
+/// `POLL_HUP` alone does not carry the distinction this enum makes, so a
+/// consumer deriving it by hand from that bit has to guess. This is the
+/// one place the derivation is written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamStatus {
+    /// The producer is still attached and has not hung up. Keep reading.
+    Open,
+    /// The producer hung up AFTER writing. This is end-of-stream: what
+    /// has been staged so far is the whole of it.
+    Ended,
+    /// The producer hung up having never written a byte.
+    ///
+    /// This is NOT an empty stream that completed. A producer that was
+    /// terminated, faulted, or retired before its first write hangs up
+    /// its outputs exactly as a finished one does, so this is the state
+    /// a consumer must not treat as a complete source. Wait, or fail
+    /// loudly — do not proceed as though zero bytes were the answer.
+    NeverStarted,
+}
+
+/// Classify a channel a consumer is staging as a stream.
+///
+/// Reads `POLL_HUP` and `POLL_WROTE` in one poll so the two cannot
+/// disagree across calls.
+///
+/// # Safety
+///
+/// `sys` must be the module's syscall table and `chan` one of its
+/// channel handles.
+#[allow(dead_code, reason = "SDK surface; most modules stage no streams")]
+pub unsafe fn stream_status(sys: &SyscallTable, chan: i32) -> StreamStatus {
+    let ready = (sys.channel_poll)(chan, POLL_HUP | POLL_WROTE);
+    if ready < 0 {
+        return StreamStatus::Open;
+    }
+    let ready = ready as u32;
+    if ready & POLL_HUP == 0 {
+        StreamStatus::Open
+    } else if ready & POLL_WROTE != 0 {
+        StreamStatus::Ended
+    } else {
+        StreamStatus::NeverStarted
+    }
+}

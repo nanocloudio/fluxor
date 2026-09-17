@@ -1543,7 +1543,8 @@ unsafe fn system_provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_l
         | monitor::FAULT_MONITOR_POP
         | monitor::FAULT_STATS_QUERY
         | monitor::FAULT_RAISE
-        | monitor::STEP_HISTOGRAM_QUERY => handle_fault_monitor_op(handle, opcode, arg, arg_len),
+        | monitor::STEP_HISTOGRAM_QUERY
+        | monitor::MODULE_STATE_QUERY => handle_fault_monitor_op(handle, opcode, arg, arg_len),
 
         // ── Live Reconfigure primitives (consumed by modules/reconfigure) ──
         reconfigure::SELF_INDEX
@@ -2207,6 +2208,12 @@ unsafe fn handle_fault_monitor_op(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 handle as usize
             };
             scheduler::query_step_histogram(idx, arg)
+        }
+        monitor::MODULE_STATE_QUERY => {
+            if arg.is_null() || arg_len < monitor::MODULE_STATE_LEN || handle < 0 {
+                return E_INVAL;
+            }
+            scheduler::query_module_state(handle as usize, arg, arg_len)
         }
         _ => E_NOSYS,
     }

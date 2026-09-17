@@ -37,9 +37,13 @@ fn fault_kind_str(k: u8) -> &'static str {
 #[derive(Default, Clone)]
 struct ModuleRow {
     name: String,
-    protection: String,
-    tier: String,
     state: String,
+    /// Consecutive ticks the readiness gate has blocked this module.
+    /// Zero after any successful step, so a climbing value is a dead
+    /// upstream edge — the field that says why a module is not running.
+    inactive: u32,
+    /// Ticks between steps; `0` means every tick.
+    period: u32,
     fault_count: u32,
     restart_count: u32,
     last_fault_kind: u8,
@@ -73,14 +77,14 @@ fn apply_line(rows: &mut BTreeMap<u8, ModuleRow>, line: &str) {
             if let Some(n) = kv.get("name") {
                 row.name = n.clone();
             }
-            if let Some(p) = kv.get("prot") {
-                row.protection = p.clone();
-            }
-            if let Some(t) = kv.get("tier") {
-                row.tier = t.clone();
-            }
             if let Some(s) = kv.get("state") {
                 row.state = s.clone();
+            }
+            if let Some(v) = kv.get("inactive").and_then(|s| s.parse::<u32>().ok()) {
+                row.inactive = v;
+            }
+            if let Some(v) = kv.get("period").and_then(|s| s.parse::<u32>().ok()) {
+                row.period = v;
             }
         }
         "MON_FAULT" => {
@@ -112,18 +116,18 @@ fn render(rows: &BTreeMap<u8, ModuleRow>) {
     println!("fluxor rig monitor  —  {} modules", rows.len());
     println!();
     println!(
-        "{:>3}  {:<16} {:<9} {:<9} {:<10} {:>6} {:>7} {:<9}   step-time buckets (us)",
-        "idx", "name", "prot", "tier", "state", "faults", "restart", "last-kind"
+        "{:>3}  {:<16} {:<10} {:>8} {:>6} {:>6} {:>7} {:<9}   step-time buckets (us)",
+        "idx", "name", "state", "inactive", "period", "faults", "restart", "last-kind"
     );
     println!("     buckets: <2 <4 <8 <16 <32 <64 <256 >=256");
     for (idx, row) in rows.iter() {
         println!(
-            "{:>3}  {:<16} {:<9} {:<9} {:<10} {:>6} {:>7} {:<9}   {} {} {} {} {} {} {} {}",
+            "{:>3}  {:<16} {:<10} {:>8} {:>6} {:>6} {:>7} {:<9}   {} {} {} {} {} {} {} {}",
             idx,
             truncate(&row.name, 16),
-            row.protection,
-            row.tier,
             row.state,
+            row.inactive,
+            row.period,
             row.fault_count,
             row.restart_count,
             fault_kind_str(row.last_fault_kind),
@@ -286,10 +290,13 @@ mod tests {
         let mut rows: BTreeMap<u8, ModuleRow> = BTreeMap::new();
         apply_line(
             &mut rows,
-            "MON_STATE mod=2 name=audio_out prot=isolated tier=verified state=running",
+            "MON_STATE mod=2 name=audio_out state=running ready=1 finished=0 \
+             restarts=0 domain=0 period=0 inactive=7 gen=1",
         );
         assert_eq!(rows[&2].name, "audio_out");
-        assert_eq!(rows[&2].protection, "isolated");
-        assert_eq!(rows[&2].tier, "verified");
+        assert_eq!(rows[&2].state, "running");
+        // The field that distinguishes a blocked module from a busy one.
+        assert_eq!(rows[&2].inactive, 7);
+        assert_eq!(rows[&2].period, 0);
     }
 }

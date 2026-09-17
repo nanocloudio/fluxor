@@ -49,6 +49,50 @@
 // Opcodes occupy 0x14__ — class byte 0x14 maps to
 // `kernel::module::provider::contract::STORAGE_OBJECT`. Distinct from FS
 // (0x09__), BUFFER (0x0A__), and namespace (0x13__).
+//
+// ## "Not yet" — the pending rule
+//
+// A dispatch has to RETURN now; it does not have to ANSWER now. A
+// provider whose backing fetch is still in flight has no answer to
+// give, and the two halves of this surface say so differently — the
+// read path has a code for it, the write path deliberately does not.
+//
+// ### Reads: `EAGAIN` means ask again
+//
+// `GET`, `HEAD` and `RANGE_GET` MAY return `EAGAIN` while the backing
+// fetch has not landed. Consumers accordingly MUST treat `EAGAIN` from
+// a read as "ask again", never as "capability absent" or "object
+// absent", and MUST hold the handle and the request that produced it
+// rather than re-issuing a new one — a retry that opens a second
+// request abandons the fetch already in flight and, against a provider
+// that serves one fetch per handle, never terminates.
+//
+// This mirrors `storage.fs`, which states the same MUST for the same
+// reason, and it is what the wasm provider already does.
+//
+// ### Writes: there is no pending, by construction
+//
+// `PUT`, `PUT_STREAMED_*` and `DELETE` MUST accept synchronously. A
+// provider MUST NOT report "not yet" from a write: it takes the bytes,
+// returns, and persists behind the call.
+//
+// This is a ruling, not an omission, and it rests on the fence. "Taken
+// but not yet durable" is already expressible, and precisely — a write
+// that has been staged and not persisted returns success carrying
+// `Fence::Volatile`, and advertises a stronger fence once it commits.
+// A caller that needs durability waits on the fence it was handed; it
+// does not retry the write. Retrying would be the wrong instrument
+// anyway: the bytes are already accepted, so a second `PUT` is a second
+// write, not a second look at the first one.
+//
+// The other half of the ruling is that `EAGAIN` on the write path is
+// already taken and keeps its single meaning. `precondition::ETAG`
+// answers `EAGAIN` when the etag moved, and a caller's correct response
+// there is to re-read and retry with the new etag — the opposite of
+// what it should do for a write still in flight. A provider that
+// overloaded `EAGAIN` with "not yet" would make a lost update and a
+// pending commit indistinguishable to every consumer that uses
+// conditional writes.
 
 /// Single-shot put of a complete blob.
 ///

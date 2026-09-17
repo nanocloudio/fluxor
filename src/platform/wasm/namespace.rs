@@ -89,7 +89,7 @@ extern "C" {
     /// page `cursor_idx` (0 = first page) into `out_ptr[..out_cap]`. The
     /// host renders the full contract page: zero or more
     /// `[name_len:u8][kind:u8][name]` entries followed by a trailing
-    /// `[0xFF][cursor_len:u8][cursor]` record — a 4-byte LE next-index
+    /// `[0xFF][0xFF][cursor_len:u8][cursor]` record — a 4-byte LE next-index
     /// cursor when more pages remain, or `cursor_len = 0` at end of
     /// listing. Returns bytes written, or a negative errno.
     fn host_ns_list(

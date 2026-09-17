@@ -7,11 +7,24 @@ permissions = ["platform_raw"]
 # blocked there.
 timer_class = "agnostic"
 
+# Both ports carry diagnostic log bytes, which is why they declare their
+# own rate class rather than inherit `NetProto`'s.
+#
+# The content-type default is audio, a reasonable middle for a type
+# shared by RTP media, DNS and HTTP admin traffic, and wrong for a
+# netconsole in a way that bit: audio's floor is 1 MiB/s, an 8 KiB ring
+# drained twenty times a second sustains 160 KiB/s, so `debug: { to: net
+# }` at `tick_us: 50000` refused to build — and it refused naming an
+# edge the graph never declared and could not name, because the debug
+# shorthand inserts it. Control means no sustained-throughput
+# guarantee, which is the truth about a best-effort log stream, and it
+# is what this pair has always actually been.
 [[ports]]
 name = "net_in"
 direction = "input"
 content_type = "NetProto"
 required = true
+rate_class_default = "control"
 buffer_size = { default = 2048, bcm2712 = 8192 }
 
 [[ports]]
@@ -19,6 +32,7 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 required = true
+rate_class_default = "control"
 buffer_size = { default = 2048, bcm2712 = 8192 }
 max_record = 2048
 

@@ -440,6 +440,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let ssid_len = s.assoc_buf[0] as usize;
 
                     if ssid_len == 0 {
+                        // No credentials — scan only. Say so, once and
+                        // plainly: this module will report networks and
+                        // never associate, so the driver never reaches
+                        // link up, never announces a MAC, and `ip` sits
+                        // at "waiting for mac" for the life of the
+                        // board. Every line in that chain is individually
+                        // unalarming, which is what makes the cause
+                        // expensive to find from the far end.
+                        log_msg(s, b"[wifi] no ssid configured - scan only, will not associate");
                         // No credentials — initiate scan via FMP
                         let r = msg_write_empty(sys, s.out_chan, MSG_SCAN);
                         if r < 0 {

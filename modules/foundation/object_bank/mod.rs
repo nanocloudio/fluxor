@@ -201,19 +201,25 @@ unsafe fn backend_scan(s: &mut BankState) {
         let n = n as usize;
 
         // Parse entries `[name_len:u8][kind:u8][name]` until the
-        // trailing `[0xFF][cursor_len:u8][cursor]` record.
+        // trailing `[0xFF][0xFF][cursor_len:u8][cursor]` record. BOTH
+        // marker bytes are checked: an entry whose name is exactly 255
+        // bytes carries 0xFF in its `name_len`, and testing only the
+        // first byte reads that entry as the end of the page and
+        // silently drops every entry behind it.
         let mut pos = 0usize;
         let mut next_cursor = [0u8; 4];
         let mut next_cursor_len = 0usize;
         let mut saw_cursor = false;
         while pos + 2 <= n {
-            if s.buf[pos] == 0xFF {
+            if s.buf[pos] == 0xFF && s.buf[pos + 1] == 0xFF {
                 saw_cursor = true;
-                let clen = s.buf[pos + 1] as usize;
-                let cl = if clen > 4 { 4 } else { clen };
-                if pos + 2 + clen <= n {
-                    next_cursor[..cl].copy_from_slice(&s.buf[pos + 2..pos + 2 + cl]);
-                    next_cursor_len = cl;
+                if pos + 3 <= n {
+                    let clen = s.buf[pos + 2] as usize;
+                    let cl = if clen > 4 { 4 } else { clen };
+                    if pos + 3 + clen <= n {
+                        next_cursor[..cl].copy_from_slice(&s.buf[pos + 3..pos + 3 + cl]);
+                        next_cursor_len = cl;
+                    }
                 }
                 break;
             }

@@ -101,6 +101,10 @@ struct LogNetState {
     net_buf: [u8; NET_BUF_SIZE],
     /// Scratch for log ring drain chunks.
     chunk: [u8; CHUNK_SIZE],
+    /// Steps between datagrams; see the `send_stride` param.
+    send_stride: u16,
+    /// Steps since the last datagram left.
+    since_send: u16,
 }
 
 impl LogNetState {
@@ -114,6 +118,8 @@ impl LogNetState {
         self.dst_port = 6666;
         self.bind_port = 6667;
         self.endpoint = DatagramEndpoint::new();
+        self.send_stride = 8;
+        self.since_send = 0;
         self.disabled_warned = 0;
         self.pending_len = 0;
         self.next_status_ms = 0;
@@ -144,6 +150,21 @@ mod params_def {
 
         3, bind_port, u16, 6667
             => |s, d, len| { s.bind_port = p_u16(d, len, 0, 6667); };
+
+        // Steps between datagrams. One datagram per step is a flood the
+        // moment there is a backlog to clear: the ring hands over its
+        // whole retained span when this module first attaches, which is
+        // tens of datagrams back to back, into an outbound queue of
+        // `NET_OUT_QUEUE_SLOTS`. A full queue drops the oldest of that
+        // burst, which is the boot window — the reason the replay exists
+        // — so delivery of exactly the records that matter becomes a
+        // matter of chance. Measured on the Pi 5 rig.
+        //
+        // Steady-state logging is nowhere near one datagram per step, so
+        // a stride costs live output nothing and paces only the
+        // catch-up. 0 disables it.
+        4, send_stride, u16, 8
+            => |s, d, len| { s.send_stride = p_u16(d, len, 0, 8); };
     }
 }
 
@@ -368,6 +389,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 dev_report_step_effect(&*s.syscalls, step_effect::WAITING);
                 return 0;
             }
+        }
+
+        // Pace. A step that is not due emits nothing and leaves the
+        // ring alone, so the backlog stays in the ring rather than
+        // being staged here and lost to a full outbound queue.
+        if s.send_stride > 0 {
+            if s.since_send < s.send_stride {
+                s.since_send += 1;
+                return 0;
+            }
+            s.since_send = 0;
         }
 
         // Drain up to CHUNK_SIZE bytes from the ring.

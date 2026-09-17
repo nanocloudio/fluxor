@@ -28,6 +28,24 @@ pub struct RigProfile {
     pub telemetry: BTreeMap<Capability, BindingTable>,
     pub observe: BTreeMap<Capability, BindingTable>,
     pub secrets: BindingTable,
+    /// Environment the scenario's BUILD command is given, from
+    /// `[build_env]`.
+    ///
+    /// Some boards cannot be built for without a fact that belongs to the
+    /// bench rather than to the repo — a Pico 2 W needs the SSID of the
+    /// network in this room, which no checked-in graph can name. Before
+    /// this, the only channel was whatever the operator happened to have
+    /// exported, so a rig run reproduced only in the shell that set it
+    /// up, and elsewhere produced an image that booted and could never
+    /// reach a network.
+    ///
+    /// Keys are environment variable names, used verbatim. Values go
+    /// through the same indirection as every other profile field, so a
+    /// password can be written `${env:…}` or `${file:…}` and never
+    /// appear in the profile at all — and a value that came from an
+    /// indirection is redacted in plan output, run records and profile
+    /// hashes like any other secret.
+    pub build_env: BindingTable,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +167,8 @@ struct ProfileFile {
     observe: toml::Table,
     #[serde(default)]
     secrets: toml::Table,
+    #[serde(default)]
+    build_env: toml::Table,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +205,7 @@ pub fn parse_profile_str(raw: &str, path: &Path) -> Result<RigProfile> {
     let telemetry = load_surface_map(f.telemetry, Surface::Telemetry, &ctx)?;
     let observe = load_surface_map(f.observe, Surface::Observe, &ctx)?;
     let secrets = load_binding(f.secrets, &format!("{ctx} [secrets]"))?;
+    let build_env = load_binding(f.build_env, &format!("{ctx} [build_env]"))?;
 
     Ok(RigProfile {
         path: path.to_path_buf(),
@@ -195,6 +216,7 @@ pub fn parse_profile_str(raw: &str, path: &Path) -> Result<RigProfile> {
         telemetry,
         observe,
         secrets,
+        build_env,
     })
 }
 
@@ -386,6 +408,9 @@ mod tests {
 
         [secrets]
         kasa_alias = "lamp-1"
+
+        [build_env]
+        WIFI_SSID = "bench-net"
     "#;
 
     #[test]
@@ -411,6 +436,50 @@ mod tests {
         assert_eq!(ser.require_int("baud", "console.serial").unwrap(), 115200);
 
         assert!(p.secrets.contains_key("kasa_alias"));
+    }
+
+    /// `[build_env]` reaches the profile, keyed by environment variable
+    /// name verbatim, and a value written as an indirection is a secret
+    /// like any other — so it is redacted in plan output, run records and
+    /// profile hashes, and only the build command ever sees it.
+    #[test]
+    fn build_env_carries_bench_facts_and_redacts_indirections() {
+        std::env::set_var("RIG_TEST_WIFI_PASSWORD", "not-a-real-password");
+        // An indirection lives here rather than in the shared fixture:
+        // an unresolved reference is fatal by design, so a fixture every
+        // other test parses must not depend on this test's environment.
+        // Appending a second `[build_env]` would be a duplicate key, so
+        // the password joins the table the fixture already opens.
+        let with_secret =
+            format!("{PROFILE}\n        WIFI_PASSWORD = \"${{env:RIG_TEST_WIFI_PASSWORD}}\"\n");
+        let p = parse_profile_str(&with_secret, Path::new("/tmp/pi5-a.toml")).unwrap();
+
+        // A plain literal stays a literal: an SSID is not a secret.
+        let ssid = p.build_env.get("WIFI_SSID").expect("WIFI_SSID present");
+        match ssid {
+            BindingValue::Secret(sec) => {
+                assert_eq!(sec.expose(), "bench-net");
+                assert!(!sec.is_secret(), "a plain literal is not redacted");
+            }
+            other => panic!("expected a string, got {other:?}"),
+        }
+
+        // An indirection resolves for the build and is redacted everywhere
+        // else — including the profile hash, so removing a secret does not
+        // hash-equal leaving it in place.
+        let pass = p
+            .build_env
+            .get("WIFI_PASSWORD")
+            .expect("WIFI_PASSWORD present");
+        match pass {
+            BindingValue::Secret(sec) => {
+                assert_eq!(sec.expose(), "not-a-real-password");
+                assert!(sec.is_secret(), "an indirection is redacted");
+                assert_ne!(sec.for_hash(), "not-a-real-password");
+            }
+            other => panic!("expected a string, got {other:?}"),
+        }
+        std::env::remove_var("RIG_TEST_WIFI_PASSWORD");
     }
 
     #[test]

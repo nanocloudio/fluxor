@@ -253,6 +253,12 @@ macro_rules! define_params {
     (@type_id str) => { 3u8 };
     (@type_id u16_array) => { 4u8 };
     (@type_id blob) => { 5u8 };
+    // A `str` whose handler APPENDS each chunk it is given. The packer
+    // splits a value longer than one TLV entry across several entries
+    // under the same tag; that only reassembles for a handler that
+    // appends, so a plain `str` is refused past one entry at build time
+    // and this type is the opt-in for the handlers that do accumulate.
+    (@type_id str_chunked) => { 6u8 };
 
     // ====================================================================
     // Helper: type size for set_defaults buffer (0 = skip for var-length)
@@ -263,6 +269,7 @@ macro_rules! define_params {
     (@type_size str) => { 0usize };
     (@type_size u16_array) => { 0usize };
     (@type_size blob) => { 0usize };
+    (@type_size str_chunked) => { 0usize };
 
     // ====================================================================
     // Helper: serialize enum entries to schema buffer (no enums)

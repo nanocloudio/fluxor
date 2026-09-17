@@ -1330,6 +1330,69 @@ pub unsafe fn query_step_histogram(module_idx: usize, out_buf: *mut u8) -> i32 {
     0
 }
 
+/// Serialise a module's scheduler-visible state for
+/// `monitor::MODULE_STATE_QUERY`.
+///
+/// Every field here is one `module_state_snapshot` already tracks. What
+/// this opcode adds is reach: without it a diagnostic can only infer a
+/// module's state from its absence in the step histogram, which answers
+/// a different question — whether it is being stepped, not why it is
+/// not running.
+///
+/// # Safety
+///
+/// `out_buf` must be valid for writes of
+/// `monitor::MODULE_STATE_LEN` bytes.
+pub unsafe fn query_module_state(module_idx: usize, out_buf: *mut u8, out_cap: usize) -> i32 {
+    use crate::abi::internal::monitor::{
+        module_state_flags as f, MODULE_STATE_LEN, MODULE_STATE_MAX, MODULE_STATE_NAME_MAX,
+    };
+
+    if module_idx >= MAX_MODULES || out_cap < MODULE_STATE_LEN {
+        return crate::kernel::sys::errno::EINVAL;
+    }
+    let s = module_state_snapshot(module_idx);
+
+    let mut buf = [0u8; MODULE_STATE_MAX];
+    buf[0] = s.idx;
+    buf[1] = (if s.present { f::PRESENT } else { 0 })
+        | (if s.ready { f::READY } else { 0 })
+        | (if s.finished { f::FINISHED } else { 0 });
+    buf[2] = s.fault_state as u8;
+    buf[3] = s.cap_class;
+    buf[4..6].copy_from_slice(&s.permissions.to_le_bytes());
+    buf[6] = s.step_period;
+    buf[7] = s.domain_id;
+    buf[8..10].copy_from_slice(&s.restart_count.to_le_bytes());
+    buf[10..14].copy_from_slice(&s.inactive_for_ticks.to_le_bytes());
+    buf[14..18].copy_from_slice(&s.slot_generation.to_le_bytes());
+
+    // The name goes in only if the caller left room for it; a caller
+    // that asked for the header alone gets `name_len = 0` rather than a
+    // truncated name it would have no way to recognise as truncated.
+    let mut written = MODULE_STATE_LEN;
+    if s.present && out_cap > MODULE_STATE_LEN {
+        // SAFETY: scheduler-thread-only read; module_idx bounded above.
+        let sched = unsafe {
+            let p = &raw const SCHED;
+            &*p
+        };
+        let name = sched.modules[module_idx].type_name().as_bytes();
+        let room = core::cmp::min(out_cap - MODULE_STATE_LEN, MODULE_STATE_NAME_MAX);
+        let n = core::cmp::min(name.len(), room);
+        buf[MODULE_STATE_LEN..MODULE_STATE_LEN + n].copy_from_slice(&name[..n]);
+        buf[18] = n as u8;
+        written += n;
+    }
+
+    // SAFETY: caller's contract — `out_buf` covers `out_cap` bytes, and
+    // `written` is bounded by it above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), out_buf, written);
+    }
+    written as i32
+}
+
 /// Get fault statistics for a module (for `provider_query` FAULT_STATS).
 pub fn get_fault_stats(module_idx: usize) -> FaultStats {
     if module_idx >= MAX_MODULES {

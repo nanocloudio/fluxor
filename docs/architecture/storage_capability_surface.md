@@ -605,6 +605,16 @@ a graph selects it by wiring, not by asking which platform it is on:
 - **Linux** — `src/platform/linux/store.rs`. When `FLUXOR_STORE_DIR` is
   set the two providers above route here instead of to HTTP and the host
   filesystem, backed by an append-only log the directory holds.
+
+  A workload names its own store with `store_dir` in the `[workload]`
+  table of its source manifest; it is carried into `workload.json` and
+  set for the runtime at launch, relative to the installed bundle unless
+  absolute. Declared there it wins over the caller's environment, which
+  is the point: an applet's state is a property of the applet, and while
+  the variable was the only way to say it, the same applet run from two
+  shells reached two different stores, or none, with nothing reporting
+  the difference. The variable remains for a node-wide store that no
+  single workload owns.
 - **bcm2712** — `src/platform/bcm2712/store.rs`, the same semantics and
   byte-identical wire over a fixed-capacity RAM store, because bare metal
   has no heap to grow one on. Its capacities (`MAX_OBJECTS`, `MAX_KEY`,

@@ -26,7 +26,29 @@ match = { board = "pico2w", phy = "wifi", nic = "cyw43" }
 accept_cycles = true
 modules = [
   { name = "cyw43" },
-  { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
+  # An SSID is REQUIRED, and its absence is a build failure rather than a
+  # default. Without one the wifi module never attempts association, so
+  # cyw43 never reaches link up, never announces its MAC, and `ip` sits
+  # at "waiting for mac" for ever — an image that boots, logs happily,
+  # and can never have a network, with nothing anywhere saying why.
+  # `password` and `security` stay soft: an open network legitimately
+  # has neither.
+  # The SSID is not a secret and may live in host config. Omitting it is
+  # LEGAL — the wifi module then scans instead of associating, which is a
+  # real mode — so this warns rather than refuses. But it warns, because
+  # the consequence surfaces far from the cause: without an SSID cyw43
+  # never reaches link up, never announces its MAC, and `ip` sits at
+  # "waiting for mac" for the life of the board. Every line in that chain
+  # is individually unalarming. The module says the same thing on its own
+  # console at runtime.
+  #
+  # The PASSWORD deliberately has no `host:` source. It is a secret, and
+  # a config-file lookup invites writing it to a plaintext file that is
+  # easy to copy, share or commit by accident. It comes from the
+  # environment, or from the graph when the author has chosen to put it
+  # there knowingly. `security` is soft too: an open network has
+  # neither password nor security.
+  { name = "wifi", params = { ssid = "user:ssid|env:WIFI_SSID|host:wifi.ssid|warn", password = "user:password|env:WIFI_PASSWORD", security = "user:security|env:WIFI_SECURITY|host:wifi.security" } },
   { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [
@@ -46,7 +68,29 @@ match = { board = "picow", phy = "wifi", nic = "cyw43" }
 accept_cycles = true
 modules = [
   { name = "cyw43" },
-  { name = "wifi", params = { ssid = "env:WIFI_SSID", password = "env:WIFI_PASSWORD", security = "env:WIFI_SECURITY" } },
+  # An SSID is REQUIRED, and its absence is a build failure rather than a
+  # default. Without one the wifi module never attempts association, so
+  # cyw43 never reaches link up, never announces its MAC, and `ip` sits
+  # at "waiting for mac" for ever — an image that boots, logs happily,
+  # and can never have a network, with nothing anywhere saying why.
+  # `password` and `security` stay soft: an open network legitimately
+  # has neither.
+  # The SSID is not a secret and may live in host config. Omitting it is
+  # LEGAL — the wifi module then scans instead of associating, which is a
+  # real mode — so this warns rather than refuses. But it warns, because
+  # the consequence surfaces far from the cause: without an SSID cyw43
+  # never reaches link up, never announces its MAC, and `ip` sits at
+  # "waiting for mac" for the life of the board. Every line in that chain
+  # is individually unalarming. The module says the same thing on its own
+  # console at runtime.
+  #
+  # The PASSWORD deliberately has no `host:` source. It is a secret, and
+  # a config-file lookup invites writing it to a plaintext file that is
+  # easy to copy, share or commit by accident. It comes from the
+  # environment, or from the graph when the author has chosen to put it
+  # there knowingly. `security` is soft too: an open network has
+  # neither password nor security.
+  { name = "wifi", params = { ssid = "user:ssid|env:WIFI_SSID|host:wifi.ssid|warn", password = "user:password|env:WIFI_PASSWORD", security = "user:security|env:WIFI_SECURITY|host:wifi.security" } },
   { name = "ip", params = { use_dhcp = "user:use_dhcp|1", static_ip = "user:static_ip|0", static_netmask = "user:static_netmask|0", static_gateway = "user:static_gateway|0", trace_sample_permille = "user:trace_sample_permille|host:observability.sample_permille" } },
 ]
 wiring = [

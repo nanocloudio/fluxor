@@ -103,6 +103,7 @@ pub use crate::abi::poll::ERR as POLL_ERR;
 pub use crate::abi::poll::HUP as POLL_HUP;
 pub use crate::abi::poll::IN as POLL_IN;
 pub use crate::abi::poll::OUT as POLL_OUT;
+pub use crate::abi::poll::WROTE as POLL_WROTE;
 
 // ============================================================================
 // Ioctl Commands (stable ABI values — modules hardcode these)
@@ -181,6 +182,18 @@ struct ChannelSlot {
     lock: AtomicBool,
     /// HUP flag (producer signals end-of-stream / completion)
     hup_flag: AtomicBool,
+    /// Set by the first successful write since the last flush, and
+    /// never cleared except by `IOCTL_FLUSH` / slot reset.
+    ///
+    /// `hup_flag` alone cannot tell a stream that ended from one that
+    /// never started: a producer terminated or retired before its first
+    /// write hangs up its outputs exactly as a finished one does. A
+    /// consumer staging a stream then reads "never started" as
+    /// "complete and empty", and since a module that retires hangs up
+    /// its own outputs, that misreading propagates down a chain.
+    /// Reported as `POLL_WROTE` so a consumer can pair it with
+    /// `POLL_HUP` and tell the two apart.
+    ever_written: AtomicBool,
     /// The consumer has finished: nothing will read this channel again.
     /// Set by the scheduler when it retires a module, for every channel
     /// that module read from. A finished reader's ring would otherwise
@@ -246,6 +259,7 @@ impl ChannelSlot {
             sticky_events: AtomicU8::new(0),
             lock: AtomicBool::new(false),
             hup_flag: AtomicBool::new(false),
+            ever_written: AtomicBool::new(false),
             reader_gone: AtomicBool::new(false),
             mailbox: AtomicBool::new(false),
             aux_u32: AtomicU32::new(NO_AUX_PENDING),
@@ -305,6 +319,7 @@ impl ChannelSlot {
         self.chan_type.store(0, Ordering::Release);
         self.sticky_events.store(0, Ordering::Release);
         self.hup_flag.store(false, Ordering::Release);
+        self.ever_written.store(false, Ordering::Release);
         self.reader_gone.store(false, Ordering::Release);
         self.mailbox.store(false, Ordering::Release);
         self.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
@@ -763,6 +778,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
         }
         core::ptr::copy_nonoverlapping(data, mbox_ptr, len);
         buffer_pool::mailbox_release_write(buf_slot, len as u32);
+        slot.ever_written.store(true, Ordering::Release);
         wake_consumer_if_flagged(slot);
         trace!("chan_write h={handle} mailbox len={len}");
         return len as i32;
@@ -778,6 +794,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     if written == 0 {
         CHAN_EAGAIN
     } else {
+        slot.ever_written.store(true, Ordering::Release);
         wake_consumer_if_flagged(slot);
         written
     }
@@ -880,6 +897,12 @@ pub fn channel_poll(handle: i32, events: u32) -> i32 {
     if (events & POLL_ERR) != 0 && (persistent & POLL_ERR) != 0 {
         ready |= POLL_ERR;
     }
+    // Sticky: whether this channel has ever carried a byte since its
+    // last flush. This is what makes POLL_HUP answerable — HUP with
+    // WROTE is a stream that ended, HUP without it never started.
+    if (events & POLL_WROTE) != 0 && slot.ever_written.load(Ordering::Acquire) {
+        ready |= POLL_WROTE;
+    }
     trace!("chan_poll h={handle} events=0x{events:02x} ready=0x{ready:02x}");
     ready as i32
 }
@@ -943,6 +966,9 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
                 });
             }
             slot.hup_flag.store(false, Ordering::Release);
+            // A flush starts a new stream, so "has anything been
+            // written" is asked again from zero.
+            slot.ever_written.store(false, Ordering::Release);
             slot.sticky_events.store(0, Ordering::Release);
             slot.aux_u32.store(NO_AUX_PENDING, Ordering::Release);
             debug!("chan_ioctl h={handle} FLUSH");

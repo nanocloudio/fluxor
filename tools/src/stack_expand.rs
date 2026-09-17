@@ -156,6 +156,7 @@ fn resolve_param_source(
     param: &str,
 ) -> Result<Option<String>> {
     let mut required = false;
+    let mut warn = false;
     let mut tried: Vec<String> = Vec::new();
     for raw in expr.split('|') {
         let src = raw.trim();
@@ -164,6 +165,16 @@ fn resolve_param_source(
         }
         if src == "required" {
             required = true;
+            continue;
+        }
+        // `warn`: legal to omit, but omitting it is usually a mistake and
+        // the consequence shows up far from the cause. For a value whose
+        // absence makes a graph merely DIFFERENT — a wifi module with no
+        // SSID scans instead of associating, which is a real mode — a
+        // hard refusal would declare valid configuration invalid. Saying
+        // so once at build time is the honest middle.
+        if src == "warn" {
+            warn = true;
             continue;
         }
         tried.push(src.to_string());
@@ -194,6 +205,15 @@ fn resolve_param_source(
         // Bare literal source — resolves unconditionally. Useful as a
         // terminal fallback: `"user:dst_ip|192.168.1.1"`.
         return Ok(Some(src.to_string()));
+    }
+    if warn {
+        eprintln!(
+            "warning: module '{module}' param '{param}' resolved from no source \
+             (tried: {}). The graph is still valid — the module runs with its \
+             own default — but check that is what you meant.",
+            tried.join(", "),
+        );
+        return Ok(None);
     }
     if required {
         let host_hint = host_config_path()
@@ -800,7 +820,7 @@ fn inject_modules(
     variant: &StackInjection,
     merged: &HashMap<String, String>,
     host: &HostConfig,
-    _stack_meta: &StackMeta,
+    stack_meta: &StackMeta,
     globally_skipped: &mut std::collections::HashSet<String>,
 ) -> Result<Vec<String>> {
     let mut added = Vec::new();
@@ -909,6 +929,8 @@ transport (e.g. `export_telemetry: udp` + fluxor-collect).",
             entry.insert("variant".into(), json!(v));
         }
 
+        let mut stack_params: Vec<String> = Vec::new();
+
         // Map params: module_param_name <- pipe-chained source list.
         // See `resolve_param_source` for the grammar.
         //
@@ -934,6 +956,19 @@ transport (e.g. `export_telemetry: udp` + fluxor-collect).",
                 }
             };
             entry.insert(module_key.clone(), coerced);
+            stack_params.push(module_key.clone());
+        }
+
+        // Which params this stack set, and which stack it was. A stack
+        // is read LIVE from the catalog while the module it configures
+        // is resolved from a pinned digest, so the two can disagree —
+        // and when they do, the param the module has never heard of was
+        // written in a file the author does not have and cannot edit.
+        // Recorded so the schema check can say that instead of blaming
+        // the graph. Stripped before emission.
+        if !stack_params.is_empty() {
+            entry.insert("_from_stack".into(), json!(&stack_meta.name));
+            entry.insert("_stack_params".into(), json!(stack_params));
         }
 
         to_prepend.push(Value::Object(entry));
@@ -985,7 +1020,16 @@ fn inject_wiring_and_services(
         }
         let key = format!("{from}->{to}");
         if !existing_edges.contains(&key) {
-            wiring_prepend.push(json!({"from": from, "to": to}));
+            // Record which stack inserted this edge. The user's YAML
+            // does not contain it and cannot name it, so a validator
+            // that refuses it must be able to say where it came from
+            // instead of telling the author to edit a line they never
+            // wrote. Stripped before the config is emitted.
+            wiring_prepend.push(json!({
+                "from": from,
+                "to": to,
+                "_from_stack": stack_meta.name,
+            }));
         }
     }
     if let Some(arr) = config["wiring"].as_array_mut() {

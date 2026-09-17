@@ -52,12 +52,54 @@ MON_HIST mod=<idx> b0=<n> b1=<n> b2=<n> b3=<n> b4=<n> b5=<n> b6=<n> b7=<n>
 Buckets, in microseconds: `<2`, `<4`, `<8`, `<16`, `<32`, `<64`, `<256`,
 `>=256` (`step_bucket` in `src/kernel/exec/scheduler/multigraph.rs`).
 
+Every step is counted, whatever it returned — `Continue`, `Ready`,
+`Burst`, `Done` or an error — and each iteration of a burst counts as the
+step it is. So the total across a module's buckets is the number of times
+the scheduler stepped it, and a module absent from the histogram is a
+module that is not being stepped.
+
+That distinction is the point of the field. Counting only one outcome
+would make a starved module and a busy module returning something else
+produce the same record — none — and the reading that matters most here
+is exactly the one between those two.
+
 The ladder is weighted below the tick budget on purpose: it exists to
 attribute a healthy graph's tick budget per module, so most of its
 resolution sits where healthy steps land. The heavy tail is reported
 exactly, per module, by `MON_HEAVY_STEP` (`elapsed_us` verbatim) and in
 aggregate by `MON_BUDGET_OVERRUN`; `b6`/`b7` retain enough of the top end
 to spot a heavy module without reading the fault stream.
+
+### `MON_STATE`
+
+A module's scheduler-visible state. Like `MON_HIST`, emitted by the
+on-device monitor module, which calls `MODULE_STATE_QUERY` per module.
+Slots the scheduler holds empty are skipped, so every line is a real
+module.
+
+```
+MON_STATE mod=<idx> name=<s> state=<s> ready=<0|1> finished=<0|1> restarts=<n> domain=<d> period=<n> inactive=<n> gen=<n>
+```
+
+- `name` — the module's type name. Omitted when the caller's buffer had
+  no room for it, which the query reports rather than truncating.
+- `state` — `running`, `faulted`, `recovering`, or `terminated`.
+- `ready` — the module has signalled `StepOutcome::Ready`.
+- `finished` — it has finalised, by `Done` or by termination.
+- `fault` — `0` running, `1` faulted, `2` recovering, `3` terminated.
+- `period` — ticks between steps; `0` means every tick.
+- `inactive` — consecutive ticks the readiness gate has blocked this
+  module from stepping. Zero after any successful step, so a climbing
+  value is a dead upstream edge and is the field that answers "why is
+  this module not running".
+- `gen` — per-slot generation, bumped on reset, restart and replacement.
+  Pair it across two reads: a change means the slot was reused and the
+  earlier line describes a different module.
+
+Protection level and trust tier are not reported: the scheduler tracks
+neither per module, so there is nothing to report them from. A field
+synthesised at the emitter would be a reading nobody could trust, which
+is worse than an absent column.
 
 ### `MON_HEAVY_STEP`
 
@@ -81,22 +123,6 @@ MON_BUDGET_OVERRUN domain=<d> consumed_us=<n> limit_us=<n> last_mod=<idx> top=<i
 the three modules of the domain that consumed the most of that pass, each
 with its microseconds and the number of times it was stepped (a bursting
 module is stepped many times in one pass). Unused slots read `0:0/0`.
-
-### `MON_STATE`
-
-One line per module at startup and on protection-level changes. Also
-requires a monitor module; the kernel does not emit it on its own.
-
-```
-MON_STATE mod=<idx> name=<s> prot=<p> tier=<t> state=<s>
-```
-
-| Field   | Meaning                                                                |
-|---------|------------------------------------------------------------------------|
-| `name`  | Module name (truncated to 16 chars by the host view).                  |
-| `prot`  | `none`, `guarded`, or `isolated`.                                      |
-| `tier`  | `platform`, `verified`, `community`, or `unsigned`.                    |
-| `state` | `running`, `faulted`, `recovering`, or `terminated`.                   |
 
 ### `MON_SESSION`
 

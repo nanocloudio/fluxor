@@ -140,6 +140,7 @@ pub const STAT: u32 = 0x1301;
 ///
 /// ```text
 ///   [0xFF]
+///   [0xFF]                        — not a valid `kind`; see below
 ///   [cursor_len: u8]              — 0 means END OF LISTING
 ///   [cursor: cursor_len bytes]    — opaque, echo to fetch the next page
 /// ```
@@ -148,6 +149,26 @@ pub const STAT: u32 = 0x1301;
 /// the request carries, and stated here because a consumer parses one shape
 /// and a provider that guesses the other width corrupts every page but the
 /// last.
+///
+/// ## Why the trailer is two bytes
+///
+/// A consumer tells an entry from the trailer by reading the record's first
+/// byte, so that byte has to mean one thing. It did not: an entry leads with
+/// `name_len`, and a name of exactly 255 bytes makes `name_len` equal the
+/// `0xFF` marker. Such an entry read as the end of the page, and every entry
+/// after it was lost with no error — the listing simply looked shorter than
+/// it was.
+///
+/// The second `0xFF` is what disambiguates, and it is free: the byte in that
+/// position is an entry's [`kind`], which has three valid values, so `0xFF`
+/// there can never begin an entry. A consumer MUST check both bytes. Checking
+/// only the first is the original defect.
+///
+/// A name of 255 bytes is therefore representable and MUST be listed. A name
+/// longer than 255 bytes cannot be expressed in `name_len` at all, and a
+/// provider that meets one MUST refuse the listing with `EOVERFLOW` rather
+/// than skip the entry: a short page a caller believes is complete is the
+/// same silent loss in a different place.
 ///
 /// A provider MUST page rather than refuse: fill the buffer, emit a cursor,
 /// and let the caller ask again. Answering ENOMEM because a whole listing
@@ -322,3 +343,41 @@ pub mod caps {
 pub const KIND_OBJECT: u8 = 0;
 pub const KIND_NAMESPACE: u8 = 1;
 pub const KIND_STREAM: u8 = 2;
+
+// ── LIST page framing ───────────────────────────────────────────────
+//
+// The one place the page framing is spelled out. A producer or consumer
+// that writes the trailer check by hand has to get a two-byte marker and
+// a reserved length right from prose, and both halves are easy to read
+// past.
+
+/// The byte that opens the trailing cursor record, in both of its
+/// positions. Not a valid [`KIND_OBJECT`] / [`KIND_NAMESPACE`] /
+/// [`KIND_STREAM`], which is what lets the second occurrence
+/// disambiguate a 255-byte name from the end of the page.
+pub const TRAILER_MARK: u8 = 0xFF;
+
+/// Bytes the trailing cursor record occupies before its cursor bytes:
+/// `[0xFF][0xFF][cursor_len]`.
+pub const TRAILER_HEADER_LEN: usize = 3;
+
+/// Worst-case trailing record: the header plus a 4-byte page cursor.
+/// A producer MUST keep this many bytes in reserve while filling a
+/// page, or it can emit entries it has no room to terminate.
+pub const TRAILER_MAX_LEN: usize = TRAILER_HEADER_LEN + 4;
+
+/// Longest name a `LIST` entry can carry. A provider that meets a
+/// longer one MUST refuse the listing rather than drop the entry.
+pub const MAX_ENTRY_NAME_LEN: usize = u8::MAX as usize;
+
+/// True when the record starting at `pos` is the trailing cursor
+/// record rather than an entry.
+///
+/// Both bytes are checked. An entry whose name is exactly 255 bytes
+/// carries `TRAILER_MARK` in its `name_len` position, so a consumer
+/// testing only the first byte reads that entry as the end of the
+/// page and silently loses every entry behind it.
+#[inline]
+pub fn is_trailer(page: &[u8], pos: usize) -> bool {
+    pos + 1 < page.len() && page[pos] == TRAILER_MARK && page[pos + 1] == TRAILER_MARK
+}

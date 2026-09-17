@@ -58,6 +58,13 @@ struct WorkloadTable {
     version: String,
     #[serde(default = "default_role")]
     role: String,
+    /// `store_dir = "state"` — where this workload's control-plane store
+    /// lives, relative to the installed bundle unless absolute. Carried
+    /// into `workload.json` and set for the runtime at launch, so an
+    /// applet's storage stops depending on the environment its caller
+    /// happened to export.
+    #[serde(default)]
+    store_dir: Option<String>,
 }
 
 fn default_role() -> String {
@@ -385,6 +392,7 @@ pub fn emit_bundle(manifest_path: &Path, verbose: bool) -> Result<PathBuf> {
             },
         },
         implementations,
+        store_dir: src.workload.store_dir.clone(),
     };
 
     // The emitted manifest MUST pass the same validation the agent applies
@@ -592,6 +600,29 @@ fn launch_bundle(
         if verbose {
             cmd.env("FLUXOR_EXEC_LOG_STDERR", "1");
         }
+    }
+    // A workload that declares where its store lives gets that store,
+    // whatever the caller exported. Without this the applet's storage was
+    // a property of the shell that launched it: the same applet run from
+    // two terminals reached two different stores, or none, and nothing
+    // reported the difference. Relative paths resolve against the bundle,
+    // so a bundle carries its own state with it.
+    if let Some(store_dir) = manifest.store_dir.as_deref() {
+        let resolved = {
+            let p = Path::new(store_dir);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                dir.join(p)
+            }
+        };
+        if verbose {
+            eprintln!(
+                "[exec] store dir from workload.json: {}",
+                resolved.display()
+            );
+        }
+        cmd.env("FLUXOR_STORE_DIR", &resolved);
     }
     // Die-with-parent (see `tie_to_parent`): a killed/timeouted `fluxor exec`
     // must not orphan a runtime that never exits on its own.

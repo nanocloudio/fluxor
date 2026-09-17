@@ -65,6 +65,20 @@ boot_delay_ms = 3000
 # causes, so a reboot shows up as a reboot rather than as silence.
 [console.usb_cdc]
 serial = "<chip-id>"
+
+# Facts the BUILD needs that the repo cannot carry. A Pico 2 W cannot be
+# built for without the SSID of the network in this room, and no
+# checked-in graph can name it. Keys are environment variable names, used
+# verbatim, and reach the scenario's build command and nothing else.
+#
+# Values take the same indirections as any other profile field, so a
+# password need not be written here at all — and a value that came from
+# an indirection is redacted in plan output, run records and profile
+# hashes.
+[build_env]
+WIFI_SSID = "<your-ssid>"
+WIFI_PASSWORD = "${env:WIFI_PASSWORD}"
+# WIFI_PASSWORD = "${file:/etc/fluxor/wifi.psk}"
 ```
 
 The project recipe (`~/.config/fluxor/projects/fluxor/rig.toml`) must
@@ -73,9 +87,19 @@ produce the *combined* image — kernel, trailer, modules and config — with
 kernel-only UF2 boots and then has nothing to load, which reads like a
 dead board.
 
-Wifi credentials come from the environment of the `fluxor rig` invocation
-(`WIFI_SSID`, `WIFI_PASSWORD`, `WIFI_SECURITY`), as they do for every wifi
-graph.
+Wifi credentials reach the build through `[build_env]` above. They can
+still come from the environment of the `fluxor rig` invocation, and a
+graph can name them directly, but the profile is where they belong: a
+run that depends on what the operator happened to have exported
+reproduces only in the shell that set it up.
+
+Omitting the SSID is legal — the wifi module then scans instead of
+associating, which is a real mode — but the build warns, naming every
+source it tried, and the module says the same thing on its own console.
+Without that, the consequence surfaced far from the cause: cyw43 never
+reaches link up, never announces its MAC, and `ip` sits at `[ip] waiting
+for mac` for the life of the board, with every line in that chain
+individually unalarming.
 
 What you cannot do over USB alone: cut power, or see the LED. A scenario
 that needs the LED observed needs a person, or a camera.

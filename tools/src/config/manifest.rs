@@ -888,17 +888,30 @@ fn validate_wiring_capacity(
         let Some(floor) = floor else { continue };
         let ring_rate_ceiling = granted as u64 * ticks_per_sec;
         if (floor as u64) > ring_rate_ceiling {
+            // An edge a stack inserted is not in the author's YAML, so
+            // telling them to raise `buffer_bytes` on it names a line
+            // they never wrote and cannot find. Say where it came from
+            // and what they can actually change.
+            let remedy = match entry.and_then(|e| e.get("_from_stack")).and_then(|v| v.as_str()) {
+                Some(stack) => format!(
+                    " The '{stack}' stack inserted this edge; it is not in this \
+                     config, so there is no buffer_bytes here to raise. Lower \
+                     tick_us, or give the producing port a rate_class_default \
+                     matching the traffic it really carries."
+                ),
+                None => " Raise buffer_bytes or lower the edge's rate class.".to_string(),
+            };
             return Err(Error::Config(format!(
                 "wiring[{i}] ({} → {}): rate class '{}' needs ≥ {} B/s but the \
-                 {}-byte ring at tick_us={} sustains at most {} B/s. Raise \
-                 buffer_bytes or lower the edge's rate class.",
+                 {}-byte ring at tick_us={} sustains at most {} B/s.{}",
                 from_specs[i],
                 to_specs[i],
                 class.as_str(),
                 floor,
                 granted,
                 tick_us,
-                ring_rate_ceiling
+                ring_rate_ceiling,
+                remedy
             )));
         }
     }

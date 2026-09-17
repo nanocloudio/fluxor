@@ -327,7 +327,9 @@ unsafe fn ns_stat(s: &MemNsState, handle: i32, arg: *mut u8, arg_len: usize) -> 
 /// LIST — `[prefix_len:u16][prefix][cursor_len:u16][cursor][out_buf:u64]
 /// [out_cap:u32][fence_out_ptr:u64][fence_out_cap:u16]`. Single page
 /// (the table is 64 entries); the trailing cursor record is always
-/// `[0xFF, 0]` — end of listing.
+/// `[0xFF, 0xFF, 0]` — end of listing. Two marker bytes: the second
+/// sits where an entry carries its `kind`, so a 255-byte name cannot
+/// be read as the end of the page.
 unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
     let Some(pl) = get_u16(a, 0).map(|v| v as usize) else {
         return E_INVAL;
@@ -363,7 +365,7 @@ unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
         let b = &s.bindings[i];
         if b.in_use != 0 && b.path[..b.path_len as usize].starts_with(prefix) {
             let need = 2 + b.path_len as usize;
-            if w + need + 2 > out_cap {
+            if w + need + 3 > out_cap {
                 return E_INVAL; // caller buffer too small for one page
             }
             out[w] = b.path_len;
@@ -374,9 +376,13 @@ unsafe fn ns_list(s: &MemNsState, a: &[u8]) -> i32 {
         i += 1;
     }
     // End-of-listing cursor record.
+    if w + 3 > out_cap {
+        return E_INVAL;
+    }
     out[w] = 0xFF;
-    out[w + 1] = 0;
-    w += 2;
+    out[w + 1] = 0xFF;
+    out[w + 2] = 0;
+    w += 3;
     w as i32
 }
 

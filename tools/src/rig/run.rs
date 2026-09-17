@@ -29,7 +29,7 @@ use crate::rig::events::{DeployEvent, RunEvent};
 use crate::rig::lock::{acquire as acquire_lock, AcquireOutcome, LockGuard, LockOwner};
 use crate::rig::matcher;
 use crate::rig::plan::{ArtifactPlan, Plan};
-use crate::rig::profile::{BindingTable, RigProfile};
+use crate::rig::profile::{BindingTable, BindingValue, RigProfile};
 use crate::rig::record::{hash_artifact_bundle, hash_artifact_file, RunRecord, Verdict};
 use crate::rig::vocab::{Capability, Surface};
 
@@ -145,7 +145,7 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
     })?;
 
     // Step 3 — build / resolve artifacts.
-    let artifact_path_for_record = run_build(plan, options)?;
+    let artifact_path_for_record = run_build(plan, profile, options)?;
 
     // One log file per byte-stream source the plan attached. File name
     // is `<capability>.log` (e.g. `console.serial.log`,
@@ -387,7 +387,11 @@ enum ArtifactOutput {
     Bundle(PathBuf),
 }
 
-fn run_build(plan: &Plan, options: &RunOptions) -> Result<Option<ArtifactOutput>> {
+fn run_build(
+    plan: &Plan,
+    profile: &RigProfile,
+    options: &RunOptions,
+) -> Result<Option<ArtifactOutput>> {
     if options.skip_build {
         return Ok(plan_artifact_to_output(plan));
     }
@@ -425,6 +429,33 @@ fn run_build(plan: &Plan, options: &RunOptions) -> Result<Option<ArtifactOutput>
     // relative paths in the recipe resolve against the same anchor as the
     // artifact output.
     cmd.current_dir(project_root);
+    // Bench facts the repo cannot carry. A Pico 2 W cannot be built for
+    // without the SSID of the network in this room, and no checked-in
+    // graph can name it; without a channel for that the build silently
+    // produced an image that boots and can never reach a network.
+    //
+    // Names are used verbatim so the profile says exactly what the build
+    // will see. Values are NOT logged here: a profile field written
+    // `${env:…}` or `${file:…}` is a secret to the rest of the rig, and
+    // printing it at the one place it is consumed would undo that.
+    if !profile.build_env.is_empty() {
+        let mut names: Vec<&str> = Vec::new();
+        for (name, value) in profile.build_env.iter() {
+            match value {
+                BindingValue::Secret(sec) => {
+                    cmd.env(name, sec.expose());
+                    names.push(name.as_str());
+                }
+                other => {
+                    return Err(Error::Config(format!(
+                        "profile: [build_env].{name} must be a string, got {other:?}"
+                    )));
+                }
+            }
+        }
+        names.sort_unstable();
+        eprintln!("[rig] build env from profile: {}", names.join(", "));
+    }
     let status = cmd
         .status()
         .map_err(|e| Error::Config(format!("rig run: spawning build `{}`: {e}", &command[0])))?;

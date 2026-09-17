@@ -599,8 +599,33 @@ registerProcessor('pcm-ring', PcmRing);
           let url = kstr(urlPtr, urlLen);
           if (fetchUrlOverride) url = fetchUrlOverride(url);
           const handle = nextFetchHandle++;
-          const entry = { reader: null, queue: [], eof: false, contentLength: -3, bytes: 0, consumed: 0 };
+          const entry = { reader: null, queue: [], eof: false, contentLength: -3, bytes: 0, consumed: 0, writeKey: null, staged: [] };
           fetches.set(handle, entry);
+
+          // The write tier comes first. `objStore` holds everything
+          // written through this shim (and everything hydrated from OPFS
+          // or IndexedDB at boot), so a path written in this session or a
+          // previous one reads back as itself rather than falling through
+          // to fetch() and 404ing. Without this, FS_WRITE would land
+          // somewhere no FS_READ could see it, which is a write that did
+          // not happen as far as any program can tell.
+          //
+          // The key is the path as given. `fs` paths and `storage.object`
+          // keys share one namespace here deliberately: they share one
+          // backing store, and two names for one byte range would be a
+          // way to write under one and fail to find it under the other.
+          {
+            const held = objStore.get(url);
+            if (held) {
+              entry.contentLength = held.byteLength;
+              entry.queue.push(held);
+              entry.eof = true;
+              entry.bytes = held.byteLength;
+              entry.writeKey = url;
+              return handle;
+            }
+          }
+          entry.writeKey = url;
 
           // `asset://<name>` — short-circuit window.fetch. Bytes
           // come from the bundle's `fluxor.assets` custom section,
@@ -680,11 +705,42 @@ registerProcessor('pcm-ring', PcmRing);
         const entry = fetches.get(handle);
         return entry ? entry.contentLength : -1;
       },
+      // Append `len` bytes to the handle's staged content. Staging rather
+      // than committing per call is what makes a sequence of writes one
+      // file: the bytes are joined and published once, at close, so a
+      // reader never observes a half-written file. Returns bytes taken.
+      host_fetch_write: (handle, bufPtr, len) => {
+        const entry = fetches.get(handle);
+        if (!entry) return -2;         // ENOENT — no such handle
+        if (!entry.writeKey) return -1;
+        try {
+          entry.staged.push(kview(bufPtr, len).slice());
+          return len;
+        } catch (err) {
+          console.error(`host_fetch_write threw: ${err.message}`);
+          return -1;
+        }
+      },
       host_fetch_close: (handle) => {
         const entry = fetches.get(handle);
         if (!entry) return 0;
         if (entry.reader && !entry.eof) {
           try { entry.reader.cancel().catch(() => {}); } catch (_) {}
+        }
+        // Publish staged writes as one file, then persist behind the
+        // call the way a PUT does.
+        if (entry.writeKey && entry.staged.length > 0) {
+          try {
+            let total = 0;
+            for (const c of entry.staged) total += c.length;
+            const joined = new Uint8Array(total);
+            let at = 0;
+            for (const c of entry.staged) { joined.set(c, at); at += c.length; }
+            objStore.set(entry.writeKey, joined);
+            opfsPersist(entry.writeKey, joined);
+          } catch (err) {
+            console.error(`host_fetch_close commit threw: ${err.message}`);
+          }
         }
         fetches.delete(handle);
         return 0;
@@ -752,6 +808,16 @@ registerProcessor('pcm-ring', PcmRing);
       try {
         const tx = db.transaction('blobs', 'readwrite');
         tx.objectStore('blobs').put(bytes, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+        tx.onabort = () => resolve();
+      } catch (_) { resolve(); }
+    }));
+    const idbForget = (key) => idbOpenP.then((db) => new Promise((resolve) => {
+      if (!db) return resolve();
+      try {
+        const tx = db.transaction('blobs', 'readwrite');
+        tx.objectStore('blobs').delete(key);
         tx.oncomplete = () => resolve();
         tx.onerror = () => resolve();
         tx.onabort = () => resolve();
@@ -833,6 +899,45 @@ registerProcessor('pcm-ring', PcmRing);
         }
       }).catch((err) => {
         console.warn(`host_object: OPFS persist failed for "${key}": ${err && err.message}`);
+      });
+    };
+
+    // Remove `key` from the persistent tier: the OPFS file and its entry
+    // in the key index, or the IDB record when OPFS is absent. Runs on the
+    // same chain as `opfsPersist` so a delete cannot race a write of the
+    // same key, and so the index read-modify-write stays serialized.
+    //
+    // Leaving the index entry behind would be worse than leaving the file:
+    // hydration resolves every listed key by name, and a listed key whose
+    // file is gone reappears as an empty object rather than as absent.
+    const opfsForget = (key) => {
+      opfsPersistChain = opfsPersistChain.then(async () => {
+        const root = await opfsRootP;
+        if (!root) { await idbForget(key); return; }
+        const parts = key.split('/').filter((t) => t.length > 0);
+        if (parts.length === 0) return;
+        let dir = root;
+        for (let i = 0; i < parts.length - 1; i++) {
+          dir = await dir.getDirectoryHandle(parts[i], { create: false });
+        }
+        try {
+          await dir.removeEntry(parts[parts.length - 1]);
+        } catch (_) { /* already absent — the desired end state */ }
+        const idxFh = await opfsResolveFile(OPFS_INDEX_KEY, false);
+        if (!idxFh) return;
+        let keys = [];
+        try {
+          const j = JSON.parse(await (await idxFh.getFile()).text());
+          if (Array.isArray(j)) keys = j.filter((k) => typeof k === 'string');
+        } catch (_) { return; }
+        const next = keys.filter((k) => k !== key);
+        if (next.length !== keys.length) {
+          const wi = await idxFh.createWritable();
+          await wi.write(JSON.stringify(next));
+          await wi.close();
+        }
+      }).catch((err) => {
+        console.warn(`host_object: OPFS delete failed for "${key}": ${err && err.message}`);
       });
     };
 
@@ -1199,6 +1304,32 @@ registerProcessor('pcm-ring', PcmRing);
           return -1;
         }
       },
+
+      // Remove a key from the write tier. Returns 0 when the key is gone
+      // (including when it was already absent — that is the state the
+      // caller asked for) or -2 ENOENT when the key never existed here,
+      // so a caller can tell "I removed something" from "there was
+      // nothing of mine to remove". Keys served only by the read tier
+      // (shipped content behind fetch) are not deletable and report
+      // ENOENT: this provider did not put them there.
+      host_object_delete: (keyPtr, keyLen) => {
+        try {
+          const key = kstr(keyPtr, keyLen);
+          if (key.length === 0) return -22; // EINVAL
+          const had = objStore.delete(key);
+          // Drop cached read handles for the key so a later read does
+          // not answer from a handle opened before the delete.
+          headByKey.delete(key);
+          for (const k of Array.from(rangeByKey.keys())) {
+            if (k.slice(0, k.indexOf('\0')) === key) rangeByKey.delete(k);
+          }
+          opfsForget(key);
+          return had ? 0 : -2; // ENOENT when this tier never held it
+        } catch (err) {
+          console.error(`host_object_delete threw: ${err.message}`);
+          return -22;
+        }
+      },
     };
 
     // storage.namespace host bindings — render the contract wire format
@@ -1229,8 +1360,8 @@ registerProcessor('pcm-ring', PcmRing);
       },
 
       // LIST one page: entries [name_len:u8][kind:u8][name] then a
-      // trailing [0xFF][cursor_len:u8][cursor] record — a 4-byte LE
-      // next-index when more remain, cursor_len=0 at end of listing.
+      // trailing [0xFF][0xFF][cursor_len:u8][cursor] record — a 4-byte
+      // LE next-index when more remain, cursor_len=0 at end of listing.
       host_ns_list: (prefixPtr, prefixLen, cursorIdx, outPtr, outCap) => {
         try {
           const children = nsListChildren(kstr(prefixPtr, prefixLen));
@@ -1239,10 +1370,13 @@ registerProcessor('pcm-ring', PcmRing);
           let i = cursorIdx >>> 0;
           for (; i < children.length; i++) {
             const name = new TextEncoder().encode(children[i][0]);
-            if (name.length > 255) continue; // unaddressable in [name_len:u8]
+            // `name_len` is one byte. A longer name is refused, not
+            // skipped: a short page the caller believes is complete is
+            // the same silent loss the two-byte trailer exists to stop.
+            if (name.length > 255) return -75; // EOVERFLOW
             const need = 2 + name.length;
-            // Always leave room for the worst-case trailing cursor (6 B).
-            if (w + need + 6 > outCap) break;
+            // Always leave room for the worst-case trailing cursor (7 B).
+            if (w + need + 7 > outCap) break;
             out[w++] = name.length;
             out[w++] = children[i][1] === 'namespace' ? NS_KIND_NAMESPACE : NS_KIND_OBJECT;
             out.set(name, w); w += name.length;
@@ -1261,10 +1395,14 @@ registerProcessor('pcm-ring', PcmRing);
           // (When the loop DID emit entries it already reserved 6 B.)
           const more = i < children.length;
           if (more) {
-            if (w === 0 || w + 6 > outCap) return -22; // EINVAL — buffer too small to page
-          } else if (w + 2 > outCap) {
+            if (w === 0 || w + 7 > outCap) return -22; // EINVAL — buffer too small to page
+          } else if (w + 3 > outCap) {
             return -22; // EINVAL — no room for end-of-listing marker
           }
+          // Two marker bytes. The second lands where an entry carries
+          // its `kind`, which is never 0xFF, so a 255-byte name can no
+          // longer be read as the end of the page.
+          out[w++] = 0xFF;
           out[w++] = 0xFF;
           if (more) {
             out[w++] = 4;

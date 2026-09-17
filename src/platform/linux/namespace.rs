@@ -82,8 +82,10 @@ fn ns_fs_path(key: &str) -> &str {
 /// ```
 ///
 /// Each entry is `[name_len:u8][kind:u8][name]`; the page ends with a
-/// `[0xFF][cursor_len:u8][cursor]` record (a 4-byte LE next-index cursor when
-/// more pages remain, `cursor_len = 0` at end of listing).
+/// `[0xFF][0xFF][cursor_len:u8][cursor]` record (a 4-byte LE next-index cursor
+/// when more pages remain, `cursor_len = 0` at end of listing). The second
+/// `0xFF` sits where an entry carries its `kind`, which is what keeps a
+/// 255-byte name from reading as the end of the page.
 unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
     if arg.is_null() || arg_len < 2 {
         return errno::EINVAL;
@@ -135,7 +137,7 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
     p += 8;
     let fence_out_cap = read_u16(p);
 
-    if out_ptr.is_null() || out_cap < 2 {
+    if out_ptr.is_null() || out_cap < dev_ns::TRAILER_HEADER_LEN {
         return errno::EINVAL;
     }
 
@@ -168,14 +170,15 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
     while idx < names.len() {
         let (name, is_dir) = &names[idx];
         let nb = name.as_bytes();
-        if nb.len() > u8::MAX as usize {
-            idx += 1;
-            continue; // unrepresentable name length — skip
+        if nb.len() > dev_ns::MAX_ENTRY_NAME_LEN {
+            // `name_len` is a byte and this name does not fit in one.
+            // Refusing is the contract's answer: skipping it returns a
+            // short page the caller has no way to know is short.
+            return errno::EOVERFLOW;
         }
         let need = 2 + nb.len();
-        // Leave room for the trailing end/cursor record (worst case 6 bytes:
-        // 0xFF + len + 4-byte cursor).
-        if w + need + 6 > out_cap {
+        // Leave room for the trailing end/cursor record.
+        if w + need + dev_ns::TRAILER_MAX_LEN > out_cap {
             break;
         }
         out[w] = nb.len() as u8;
@@ -188,16 +191,32 @@ unsafe fn ns_list(arg: *mut u8, arg_len: usize) -> i32 {
         w += need;
         idx += 1;
     }
-    // Trailing cursor record.
-    out[w] = 0xFF;
-    if idx < names.len() {
-        // More pages: encode the next start index as a 4-byte LE cursor.
-        out[w + 1] = 4;
-        out[w + 2..w + 6].copy_from_slice(&(idx as u32).to_le_bytes());
-        w += 6;
+    // Trailing cursor record. Two marker bytes: the second sits in an
+    // entry's `kind` position, where 0xFF is not a legal value, so a
+    // 255-byte name cannot be mistaken for the end of the page.
+    //
+    // The record is mandatory — a caller reads it to learn whether more
+    // pages follow — so a buffer with no room for it gets a refusal
+    // rather than a positive count over bytes that never received one.
+    let more = idx < names.len();
+    let trailer_len = if more {
+        dev_ns::TRAILER_MAX_LEN
     } else {
-        out[w + 1] = 0; // end of listing
-        w += 2;
+        dev_ns::TRAILER_HEADER_LEN
+    };
+    if w + trailer_len > out_cap {
+        return errno::EINVAL;
+    }
+    out[w] = dev_ns::TRAILER_MARK;
+    out[w + 1] = dev_ns::TRAILER_MARK;
+    if more {
+        // More pages: encode the next start index as a 4-byte LE cursor.
+        out[w + 2] = 4;
+        out[w + 3..w + 7].copy_from_slice(&(idx as u32).to_le_bytes());
+        w += dev_ns::TRAILER_MAX_LEN;
+    } else {
+        out[w + 2] = 0; // end of listing
+        w += dev_ns::TRAILER_HEADER_LEN;
     }
 
     if !fence_out_ptr.is_null() && fence_out_cap >= dev_fence::WIRE_MAX_LEN {

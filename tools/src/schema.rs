@@ -33,6 +33,15 @@ pub enum ParamType {
     Str = 3,
     U16Array = 4,
     Blob = 5,
+    /// A string param whose module ACCUMULATES the chunks it is sent.
+    ///
+    /// The packer splits a value longer than one TLV entry into several
+    /// entries under the same tag. That only produces the whole value
+    /// when the module's handler appends; a handler that assigns keeps
+    /// the LAST chunk and silently drops the rest, which is why plain
+    /// [`Str`] is refused past one entry rather than chunked. A module
+    /// declaring this type is asserting that its handler appends.
+    StrChunked = 6,
 }
 
 impl ParamType {
@@ -44,6 +53,7 @@ impl ParamType {
             3 => Some(Self::Str),
             4 => Some(Self::U16Array),
             5 => Some(Self::Blob),
+            6 => Some(Self::StrChunked),
             _ => None,
         }
     }
@@ -479,6 +489,7 @@ pub fn build_params_from_schema(
         }
 
         if let Some(value) = kv.get(&param.name) {
+            check_param_value_len(param, &param.name, value, data_section, module_name)?;
             pos = pack_param(schema, &param.name, value, entry, pos, data_section);
         }
     }
@@ -515,6 +526,52 @@ pub fn build_params_from_schema(
 }
 
 /// Pack a single param value into the TLV buffer.
+/// Maximum bytes a single TLV entry's value can carry — the entry's
+/// length is one byte (`[tag][len][value]`), so this is what fits.
+pub const MAX_TLV_VALUE_LEN: usize = u8::MAX as usize;
+
+/// Refuse a parameter value the module cannot receive intact.
+///
+/// A TLV entry's length is a single byte, so a longer value can only
+/// travel as several entries under one tag. That reassembles if and only
+/// if the module's handler APPENDS each chunk; a handler that assigns
+/// keeps the last one and drops the rest, leaving the module holding a
+/// truncated value with nothing to indicate it.
+///
+/// Such a truncation surfaces far from its cause — a fragment of a
+/// source file reaching a compiler, which refuses it, which empties a
+/// closure, which makes an isolate answer nothing, several modules from
+/// the graph line that was too long.
+///
+/// A plain `str` is therefore refused here, where the module and the
+/// field can still be named. A module whose handler does accumulate
+/// declares the param `str_chunked` and keeps the split.
+fn check_param_value_len(
+    param: &SchemaParam,
+    key: &str,
+    value: &Value,
+    data_section: Option<&Value>,
+    module_name: &str,
+) -> Result<(), String> {
+    if param.ptype != ParamType::Str {
+        return Ok(());
+    }
+    let Some(s) = value.as_str() else {
+        return Ok(());
+    };
+    let len = resolve_str_content(s, data_section).len();
+    if len <= MAX_TLV_VALUE_LEN {
+        return Ok(());
+    }
+    Err(format!(
+        "module '{module_name}': parameter '{key}' is {len} bytes, over the \
+         {MAX_TLV_VALUE_LEN}-byte limit for a single parameter entry — the \
+         module would receive only the tail of it. Shorten the value, move it \
+         to a file the module opens at runtime, or (only if the module's \
+         handler appends each chunk) declare the parameter `str_chunked`."
+    ))
+}
+
 fn pack_param(
     schema: &ParamSchema,
     key: &str,
@@ -572,13 +629,16 @@ fn pack_param(
                 pos += 1;
             }
         }
-        ParamType::Str => {
+        ParamType::Str | ParamType::StrChunked => {
             if let Some(s) = value.as_str() {
                 let resolved = resolve_str_content(s, data_section);
                 let bytes = resolved.as_bytes();
-                // Split into chunks of up to 255 bytes (same tag for each).
-                // Modules that expect large content (e.g. http body)
-                // append in their dispatch handler.
+                // A TLV entry carries its length in ONE byte. A longer
+                // value is split across several entries under the same
+                // tag, which reassembles only if the module's handler
+                // appends — so only `str_chunked` is split. A plain
+                // `str` is refused above, by `check_param_value_len`,
+                // where the graph and field can still be named.
                 let mut offset = 0;
                 loop {
                     let remaining = bytes.len() - offset;

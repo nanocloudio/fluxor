@@ -239,12 +239,15 @@ unsafe fn list_count(sys: &SyscallTable, prefix: &[u8], page: &mut [u8]) -> i32 
     if n < 0 {
         return n;
     }
-    // entries: [name_len:u8][kind:u8][name]… then 0xFF [cursor_len:u8][cursor]
+    // entries: [name_len:u8][kind:u8][name]… then the trailing record
+    // [0xFF][0xFF][cursor_len:u8][cursor]. Both marker bytes are
+    // checked: a 255-byte name puts 0xFF in `name_len`, so a one-byte
+    // test ends the page early and undercounts.
     let mut count = 0i32;
     let mut o = 0usize;
     let n = n as usize;
-    while o < n {
-        if page[o] == 0xFF {
+    while o + 1 < n {
+        if page[o] == 0xFF && page[o + 1] == 0xFF {
             break;
         }
         let l = page[o] as usize;

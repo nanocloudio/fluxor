@@ -1736,6 +1736,13 @@ const NON_PARAM_KEYS: &[&str] = &[
     "quarantine_partner_idx", // numeric form passed straight through
     "heap",                   // nested object: { zero_on_free,
                               //   alloc_failure_policy, canary_enabled }
+    // Provenance recorded by stack expansion, not authored and not
+    // emitted: which stack injected this module entry and which of its
+    // params that stack set. Read only to explain a catalog/module skew
+    // (see `stack_param_skew`) — a param a live stack asks for that a
+    // pinned module does not have.
+    "_from_stack",
+    "_stack_params",
 ];
 
 /// Reject any YAML key on a module entry that the schema doesn't know
@@ -1804,6 +1811,44 @@ fn validate_heap_subtree(module: &Value, module_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Explain an unknown param that a STACK put there, not the author.
+///
+/// `stacks/` and `targets/` are read live from the fluxor checkout, while
+/// the modules they configure are resolved from digests pinned in
+/// `fluxor.lock`. Nothing pins the catalog, so the two halves move
+/// independently: adding a parameter to a module and referencing it from
+/// a stack in the same commit is coherent in the source tree and
+/// incoherent for every consumer until that consumer rebuilds or
+/// republishes that target's modules.
+///
+/// When that happens the author is told their graph has an unknown
+/// param. Their graph does not mention it — the shorthand they wrote
+/// expands to it — so the message names a line they never wrote, in a
+/// file they may not have, about a module they did not pin by hand. Say
+/// what actually disagrees instead.
+fn stack_param_skew(module: &Value, module_name: &str, param: &str) -> Option<String> {
+    let obj = module.as_object()?;
+    let stack = obj.get("_from_stack")?.as_str()?;
+    let owned = obj
+        .get("_stack_params")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .any(|p| p == param || param.strip_prefix("params.") == Some(p));
+    if !owned {
+        return None;
+    }
+    Some(format!(
+        "module '{module_name}': the '{stack}' stack sets parameter '{param}', which \
+         this build's '{module_name}' does not have. This is a catalog/module skew, \
+         not an error in your config — the stack is read from the fluxor checkout \
+         while the module comes from the digest pinned in fluxor.lock, and nothing \
+         pins the two together. Rebuild this target's modules (`fluxor modules build \
+         --target <target>`), or if you consume fluxor as a dependency, republish and \
+         `fluxor update`."
+    ))
+}
+
 fn validate_yaml_params(
     module: &Value,
     schema: &schema::ParamSchema,
@@ -1846,6 +1891,9 @@ fn validate_yaml_params(
                     } else {
                         format!("{key}.{inner_key}")
                     };
+                    if let Some(msg) = stack_param_skew(module, module_name, &display) {
+                        return Err(Error::Config(msg));
+                    }
                     let suggestion = candidates
                         .iter()
                         .filter_map(|c| closest_param_name(c, schema))
@@ -1867,6 +1915,9 @@ fn validate_yaml_params(
             candidates.push(key.replace('.', "_"));
         }
         if !candidates.iter().any(|c| schema.find(c).is_some()) {
+            if let Some(msg) = stack_param_skew(module, module_name, key) {
+                return Err(Error::Config(msg));
+            }
             let suggestion = candidates
                 .iter()
                 .filter_map(|c| closest_param_name(c, schema))

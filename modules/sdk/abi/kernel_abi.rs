@@ -238,9 +238,32 @@ pub mod poll {
     /// Error condition.
     pub const ERR: u32 = 0x04;
     /// Hang-up (peer closed / end-of-stream).
+    ///
+    /// On its own this does NOT mean the stream carried anything. A
+    /// channel can report `HUP` before its producer has ever written —
+    /// a producer that is terminated, faulted, or retired before its
+    /// first write hangs up its outputs — and a consumer reading `HUP`
+    /// as "the stream is complete" then treats a stream that never
+    /// started as one that ended empty. Pair it with [`WROTE`].
     pub const HUP: u32 = 0x08;
     /// Connection established.
     pub const CONN: u32 = 0x10;
+    /// The channel has carried at least one byte since it was last
+    /// flushed. Sticky: once set it stays set until `IOCTL_FLUSH`
+    /// begins a new stream.
+    ///
+    /// This is what makes [`HUP`] answerable. `HUP | WROTE` is a stream
+    /// that ended; `HUP` without `WROTE` is a stream that never started,
+    /// and a consumer staging one should treat it as an empty source or
+    /// keep waiting, not as a complete one.
+    ///
+    /// The distinction carries across a whole graph, because a module
+    /// that retires hangs up its own outputs: a consumer that reads a
+    /// never-written hang-up as a complete stream stages nothing, fails,
+    /// and retires, which presents the next consumer downstream with the
+    /// same reading. One misread at the head of a chain retires all of
+    /// it, within a few steps of boot and with no error anywhere.
+    pub const WROTE: u32 = 0x20;
 }
 
 /// Standard error codes (negative errno values).

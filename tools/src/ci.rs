@@ -263,6 +263,47 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         check_lockfile_consistency(project_root)
     }));
 
+    // ───── Phase 1.71: catalog drift ────────────────────────────────
+    //
+    // `stacks/` and `targets/` are the one build input nothing pinned.
+    // They are read live from the fluxor checkout while the modules they
+    // configure come from digests in `fluxor.lock`, so a stack edited in
+    // a sibling checkout changes every downstream build at once — no
+    // publish, no `update`, and until now no record that anything moved.
+    // `fluxor update` stamps the catalog it resolved against; this
+    // reports when the live one has drifted from that stamp.
+    //
+    // Warns rather than fails, for the same reason live-staleness does:
+    // a catalog that has moved on is an ordinary state, not a defect.
+    // What was missing was any way to SEE it, which is what turned a
+    // one-line skew into an afternoon.
+    {
+        if verbose {
+            eprintln!("[ci] running phase: catalog-drift");
+        }
+        let start = Instant::now();
+        let outcome = check_catalog_drift(project_root);
+        let elapsed_ms = start.elapsed().as_millis();
+        results.push(match outcome {
+            Ok(()) => PhaseResult {
+                name: "catalog-drift",
+                status: PhaseStatus::Ok,
+                elapsed_ms,
+                message: String::new(),
+            },
+            // Warned, not Failed: a catalog that has moved on is an
+            // ordinary state. Failing here would make the phase
+            // something people route around, and the value of this
+            // signal is entirely that it gets read.
+            Err(msg) => PhaseResult {
+                name: "catalog-drift",
+                status: PhaseStatus::Warned,
+                elapsed_ms,
+                message: msg,
+            },
+        });
+    }
+
     // ───── Phase 1.72: SDK materialisation ──────────────────────────
     //
     // The lockfile NAMES the SDK revision a project compiles against, but
@@ -1649,6 +1690,42 @@ fn check_abi_pin(project_root: &Path) -> std::result::Result<(), String> {
 /// so the file is authoritative for everyone. Digest/epoch
 /// verification against the store happens at sync/materialise time,
 /// not here.
+/// Report when the live catalog differs from the one `fluxor update`
+/// resolved these pins against.
+///
+/// Skips cleanly with no lockfile, no stamp (a lock written before the
+/// stamp existed), or no resolvable install root — none of those are a
+/// drift, and failing on them would only teach people to ignore this.
+fn check_catalog_drift(project_root: &Path) -> std::result::Result<(), String> {
+    let lock = match crate::store_resolve::read_store_lock(project_root) {
+        Ok(Some(l)) => l,
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let Some(stamped) = lock.catalog else {
+        return Ok(());
+    };
+    let Some(root) = crate::project::install_root() else {
+        return Ok(());
+    };
+    let Some(live) = crate::store_resolve::catalog_digest(&root.path) else {
+        return Ok(());
+    };
+    if live == stamped.digest {
+        return Ok(());
+    }
+    Err(format!(
+        "the catalog (stacks/ + targets/) at {} has changed since these pins were \
+         resolved: lock stamps {}, live is {}. Stack expansion reads the live files \
+         while modules come from the pinned digests, so a graph can expand to a \
+         parameter or an edge the pinned module does not have. Re-run `fluxor \
+         update`, or rebuild this target's modules if you own the catalog.",
+        root.path.display(),
+        &stamped.digest[..stamped.digest.len().min(19)],
+        &live[..live.len().min(19)],
+    ))
+}
+
 fn check_lockfile_consistency(project_root: &Path) -> std::result::Result<(), String> {
     let deps = crate::project::dependencies(project_root)?;
     if deps.is_empty() {

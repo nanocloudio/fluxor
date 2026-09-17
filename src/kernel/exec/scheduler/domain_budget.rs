@@ -882,16 +882,27 @@ pub(crate) fn step_one_module(
         let step_t0 = crate::kernel::sys::hal::now_micros();
         // `module_t0` is the *whole-step* wall-clock anchor for the
         // per-domain budget accumulator. Distinct from `step_t0`
-        // (which the Continue arm uses to record per-module step
-        // time) because Burst's re-step loop should count toward the
-        // domain budget too — every iteration of the loop is real
+        // (which times the individual `step()` call recorded into the
+        // histogram) because Burst's re-step loop should count toward
+        // the domain budget too — every iteration of the loop is real
         // wall-clock the domain owes.
         let module_t0 = step_t0;
 
-        match m.step() {
+        // Every step is recorded, whatever it returned.
+        //
+        // Recording only one outcome would make a module that is not
+        // being stepped and a module being stepped but answering
+        // something other than `Continue` produce the identical record —
+        // none — and telling those two apart is the reading this
+        // histogram exists to support.
+        let outcome = m.step();
+        record_step_time(
+            module_idx,
+            (crate::kernel::sys::hal::now_micros() - step_t0) as u32,
+        );
+
+        match outcome {
             Ok(StepOutcome::Continue) => {
-                let elapsed = (crate::kernel::sys::hal::now_micros() - step_t0) as u32;
-                record_step_time(module_idx, elapsed);
                 // Run the post-step deadline check BEFORE disarming. The BCM
                 // (cooperative) guard's `post_step_check` early-returns when the
                 // guard is already disarmed, so the previous `disarm()`-first
@@ -1008,7 +1019,16 @@ pub(crate) fn step_one_module(
                         }
                     }
                     if let Some(m) = modules[module_idx].as_module_mut() {
-                        match m.step() {
+                        // Each burst iteration is another step, and is
+                        // recorded as one — the histogram counts steps
+                        // the scheduler performed, not passes it made.
+                        let burst_t0 = crate::kernel::sys::hal::now_micros();
+                        let burst_outcome = m.step();
+                        record_step_time(
+                            module_idx,
+                            (crate::kernel::sys::hal::now_micros() - burst_t0) as u32,
+                        );
+                        match burst_outcome {
                             Ok(StepOutcome::Burst) => continue,
                             Ok(StepOutcome::Continue) => break,
                             Ok(StepOutcome::Ready) => {

@@ -331,6 +331,10 @@ pub fn for_each_field(f: &mut impl FnMut(&str, i64)) {
         "monitor.STEP_HISTOGRAM_QUERY",
         int::monitor::STEP_HISTOGRAM_QUERY as i64,
     );
+    f(
+        "monitor.MODULE_STATE_QUERY",
+        int::monitor::MODULE_STATE_QUERY as i64,
+    );
     f("monitor.FAULT_RAISE", int::monitor::FAULT_RAISE as i64);
     f("monitor.ARENA_USAGE", int::monitor::ARENA_USAGE as i64);
     f(

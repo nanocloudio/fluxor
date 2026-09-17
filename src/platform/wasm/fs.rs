@@ -37,8 +37,17 @@
 //! mtime = 0 because `fetch()` doesn't reliably surface modification
 //! time.
 //!
-//! FS_SEEK, FS_FSYNC, FS_WRITE return ENOSYS — the streaming fetch
-//! model has no equivalent.
+//! FS_SEEK and FS_FSYNC return ENOSYS — the streaming fetch model has no
+//! equivalent.
+//!
+//! FS_WRITE is served, and not by fetch: writes stage against the handle
+//! and publish as one file at FS_CLOSE into the same persistent tier
+//! `storage.object` uses (OPFS, or IndexedDB where OPFS is absent — it
+//! needs a secure context). FS_OPEN consults that tier before reaching
+//! for the network, so a path written here reads back as itself, this
+//! session and the next. Until this existed the contract was half served
+//! on this target: a graph could be granted `fs` and then not write
+//! through it.
 //!
 //! FS_CLOSE calls `host_fetch_close`, cancelling any in-flight body
 //! reader and dropping the host-side handle entry.
@@ -83,6 +92,13 @@ extern "C" {
     /// handle returns 0. Returns negative errno only on a hard host
     /// failure (no expected callers act on the value).
     fn host_fetch_close(handle: i32) -> i32;
+
+    /// Append `len` bytes at `buf` to the handle's staged content.
+    /// Returns bytes taken, or a negative errno. The bytes are joined
+    /// and published as one file when the handle is closed, so a reader
+    /// never observes a partially-written file — and so a sequence of
+    /// writes is one file rather than a race between them.
+    fn host_fetch_write(handle: i32, buf: *const u8, len: usize) -> i32;
 
     /// Look up the response status / content length for a fetch
     /// handle. Four-state return — distinguishing "received but no
@@ -143,16 +159,26 @@ unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
     // Reports handle-acquisition / write-tier capability only;
     // per-FD ops (READ, STAT, CLOSE) are always supported on any
     // FD this provider hands back and aren't represented in the
-    // bitmap. The wasm backend offers OPEN against asset URLs;
-    // OPENDIR is not advertised (browsers don't expose a generic
-    // list-files primitive for arbitrary URL roots) and write
-    // ops are not implemented (the underlying browser-storage
-    // primitives are key-value, not file-by-path).
+    // bitmap. The wasm backend offers OPEN against asset URLs and
+    // WRITE against the persistent tier. OPENDIR is not advertised
+    // (browsers expose no generic list-files primitive for arbitrary
+    // URL roots); the browser's storage primitives are key-value, so a
+    // path is the key, which is why `fs` paths and `storage.object`
+    // keys deliberately share one namespace on this platform — two
+    // names for one byte range would let a program write under one and
+    // fail to find it under the other.
     if opcode == dev_fs::CAPS {
         if arg.is_null() || arg_len < 4 {
             return errno::EINVAL;
         }
-        let caps: u32 = dev_fs::caps::OPEN;
+        // WRITE is served now, so it is advertised. Before, this tier was
+        // read-only because its only backing was `fetch()` and an HTTP GET
+        // has nothing to write to — which left the `fs` contract half
+        // served here and made a read-only deployment the only honest one.
+        // Writes go to the same persistent tier `storage.object` uses
+        // (OPFS, IndexedDB where OPFS is absent), which is also what reads
+        // now consult first, so a path written here reads back as itself.
+        let caps: u32 = dev_fs::caps::OPEN | dev_fs::caps::WRITE;
         let bytes = caps.to_le_bytes();
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), arg, 4);
         return 4;
@@ -162,6 +188,7 @@ unsafe fn wasm_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usiz
         dev_fs::READ => fs_read(handle, arg, arg_len),
         dev_fs::CLOSE => fs_close(handle),
         dev_fs::STAT => fs_stat(handle, arg, arg_len),
+        dev_fs::WRITE => fs_write(handle, arg, arg_len),
         _ => errno::ENOSYS,
     }
 }
@@ -229,17 +256,57 @@ unsafe fn fs_stat(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
     if size < 0 {
         return errno::ENODEV;
     }
-    let size_u = size as u32;
-    let size_b = size_u.to_le_bytes();
-    *arg = size_b[0];
-    *arg.add(1) = size_b[1];
-    *arg.add(2) = size_b[2];
-    *arg.add(3) = size_b[3];
-    *arg.add(4) = 0;
-    *arg.add(5) = 0;
-    *arg.add(6) = 0;
-    *arg.add(7) = 0;
-    errno::OK
+    // The buffer's width selects the shape, and the RETURN VALUE is the
+    // width actually written — the contract makes that a MUST so a
+    // consumer learns what it got instead of assuming what it asked for.
+    // Answering `OK` and writing one fixed shape into whatever buffer
+    // arrived would leave a consumer asking with sixteen bytes unable to
+    // tell a narrow answer from a wide one, with nothing to do but guess
+    // which it got. A consumer that refuses to guess cannot use the
+    // member at all.
+    //
+    // This backing has no mtime (a fetched resource carries none it can
+    // vouch for), so mtime is reported as zero in whichever width the
+    // caller chose. Zero is the honest answer: it is not a timestamp
+    // that could be mistaken for a real one.
+    let size = size as u64;
+    if arg_len >= 16 {
+        core::ptr::copy_nonoverlapping(size.to_le_bytes().as_ptr(), arg, 8);
+        core::ptr::write_bytes(arg.add(8), 0, 8);
+        return 16;
+    }
+    // Narrow form. A size past what 32 bits can carry is refused rather
+    // than truncated — a wrong number here reads as a shorter file.
+    let Ok(size_u) = u32::try_from(size) else {
+        return errno::EOVERFLOW;
+    };
+    core::ptr::copy_nonoverlapping(size_u.to_le_bytes().as_ptr(), arg, 4);
+    core::ptr::write_bytes(arg.add(4), 0, 4);
+    8
+}
+
+/// `WRITE` — append `arg[..arg_len]` to the open handle.
+///
+/// Returns bytes written. The bytes are staged against the handle and
+/// published as one file at `CLOSE`, which is what makes several writes
+/// one file instead of a sequence a reader can catch halfway.
+unsafe fn fs_write(handle: i32, arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() {
+        return errno::EINVAL;
+    }
+    if arg_len == 0 {
+        return 0;
+    }
+    let slot_idx = handle as usize;
+    let files = &*core::ptr::addr_of!(FETCH_FILES);
+    if slot_idx >= MAX_OPEN_FILES || !files[slot_idx].in_use {
+        return errno::EINVAL;
+    }
+    let n = host_fetch_write(files[slot_idx].host_handle, arg as *const u8, arg_len);
+    if n < 0 {
+        return errno::ENODEV;
+    }
+    n
 }
 
 unsafe fn fs_close(handle: i32) -> i32 {

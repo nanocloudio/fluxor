@@ -130,6 +130,15 @@ extern "C" {
         body_len: usize,
     ) -> i32;
 
+    /// Remove `key_ptr[..key_len]` from the persistent (OPFS/IDB) write
+    /// tier. Returns `0` when the key is gone, `-2 ENOENT` when this
+    /// tier never held it — a key served only by the read tier
+    /// (shipped content behind `fetch`) is not this provider's to
+    /// delete. Acceptance is synchronous; the backing removal is
+    /// queued behind the same chain as `host_object_put`, so a delete
+    /// cannot race a write of the same key.
+    fn host_object_delete(key_ptr: *const u8, key_len: usize) -> i32;
+
     /// Range-fetch `url[..url_len]` (`Range: bytes=offset-…`) and decode
     /// the result to a `width`×`height` RGB565 buffer in the browser.
     /// Returns a non-negative job handle for `host_image_decode_recv` /
@@ -191,6 +200,7 @@ unsafe fn wasm_object_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: 
         dev_obj::GET => obj_get(arg, arg_len),
         dev_obj::HEAD => obj_head(arg, arg_len),
         dev_obj::RANGE_GET => obj_range_get(handle, arg, arg_len),
+        dev_obj::DELETE => obj_delete(arg, arg_len),
         dev_obj::CLOSE => obj_close(handle),
         dev_obj::IMG_DECODE => img_decode(arg, arg_len),
         dev_obj::IMG_RECV => img_recv(handle, arg, arg_len),
@@ -369,10 +379,7 @@ unsafe fn obj_put(arg: *mut u8, arg_len: usize) -> i32 {
 
     // PUT acceptance carries the strongest fence the commit achieved;
     // the browser write tier is best-effort, so that is Volatile.
-    if !fence_out_ptr.is_null() && fence_out_cap >= dev_fence::WIRE_MAX_LEN {
-        let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
-        let _ = dev_fence::Fence::Volatile.encode(fbuf);
-    }
+    write_fence_out(fence_out_ptr, fence_out_cap);
     errno::OK
 }
 
@@ -519,11 +526,110 @@ unsafe fn obj_head(arg: *mut u8, arg_len: usize) -> i32 {
         None => return errno::EINVAL,
     };
 
-    if !fence_out_ptr.is_null() && fence_out_cap >= dev_fence::WIRE_MAX_LEN {
-        let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
-        let _ = dev_fence::Fence::Volatile.encode(fbuf);
-    }
+    write_fence_out(fence_out_ptr, fence_out_cap);
     written as i32
+}
+
+/// True when `[ptr, ptr+len)` lies inside this module's linear memory.
+///
+/// Every pointer this provider writes through arrives inside a caller's
+/// argument buffer, and not all of them address the memory being
+/// written. Reached through the module bridge, `obj_put`'s
+/// `fence_out_ptr` is a CHILD-module address: the child and the kernel
+/// each own a separate linear memory, so the same integer names a
+/// different place in each. Writing the fence through it either corrupts
+/// unrelated kernel memory or, when the offset is past the kernel's own
+/// memory, traps — a small write at a modest offset of a large memory,
+/// failing for no reason visible at the call site.
+///
+/// Nothing routes that path today: `host_shims.js` services `OBJ_PUT`
+/// straight from child memory and never reaches here. This is the guard
+/// that keeps it a refusal rather than a trap if something ever does.
+#[inline]
+fn in_linear_memory(ptr: *const u8, len: usize) -> bool {
+    if ptr.is_null() || len == 0 {
+        return false;
+    }
+    // `memory_size` is in 64 KiB pages.
+    let bytes = core::arch::wasm32::memory_size(0).saturating_mul(64 * 1024);
+    let start = ptr as usize;
+    match start.checked_add(len) {
+        Some(end) => end <= bytes,
+        None => false,
+    }
+}
+
+/// Write `fence` into a caller-supplied buffer, if the buffer is one this
+/// memory actually has. A caller that supplied a pointer we cannot write
+/// gets no fence rather than a trap; the operation itself already
+/// succeeded and its result does not depend on the advertisement.
+#[inline]
+unsafe fn write_fence_out(fence_out_ptr: *mut u8, fence_out_cap: usize) {
+    if fence_out_cap < dev_fence::WIRE_MAX_LEN {
+        return;
+    }
+    if !in_linear_memory(fence_out_ptr as *const u8, dev_fence::WIRE_MAX_LEN) {
+        return;
+    }
+    let fbuf = core::slice::from_raw_parts_mut(fence_out_ptr, fence_out_cap);
+    let _ = dev_fence::Fence::Volatile.encode(fbuf);
+}
+
+/// `DELETE` — remove a key from the write tier.
+///
+/// `arg` is `[key_len:u16][key][precondition:u8][etag_len:u8][etag]
+/// [fence_out_ptr:u64][fence_out_cap:u16]`.
+///
+/// This arm did not exist: DELETE fell to the `ENOSYS` default, so
+/// `storage.object`'s delete member was advertised by the contract and
+/// answered by nothing on this platform.
+///
+/// Preconditions are REFUSED rather than ignored. This tier keys bytes
+/// and holds no etag to compare, and the contract is explicit that a
+/// provider which cannot offer a condition must refuse it with `ENOSYS`
+/// — silently downgrading a conditional delete to an unconditional one
+/// turns a refusal into a lost update.
+unsafe fn obj_delete(arg: *mut u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < 2 {
+        return errno::EINVAL;
+    }
+    let key_len = {
+        let mut b = [0u8; 2];
+        core::ptr::copy_nonoverlapping(arg, b.as_mut_ptr(), 2);
+        u16::from_le_bytes(b) as usize
+    };
+    if key_len == 0 || key_len > MAX_KEY_LEN {
+        return errno::EINVAL;
+    }
+    let mut p = 2 + key_len;
+    if arg_len < p + 2 {
+        return errno::EINVAL;
+    }
+    let precondition = *arg.add(p);
+    let etag_len = *arg.add(p + 1) as usize;
+    p += 2 + etag_len;
+    if precondition != dev_obj::precondition::ANY {
+        return errno::ENOSYS;
+    }
+    if arg_len < p + 8 + 2 {
+        return errno::EINVAL;
+    }
+    let fence_out_ptr = read_u64(arg, p) as usize as *mut u8;
+    let fence_out_cap = {
+        let mut b = [0u8; 2];
+        core::ptr::copy_nonoverlapping(arg.add(p + 8), b.as_mut_ptr(), 2);
+        u16::from_le_bytes(b) as usize
+    };
+
+    let rc = host_object_delete(arg.add(2) as *const u8, key_len);
+    if rc < 0 {
+        return rc;
+    }
+
+    // Volatile for the same reason PUT is: acceptance is synchronous and
+    // the backing removal commits behind the call.
+    write_fence_out(fence_out_ptr, fence_out_cap);
+    0
 }
 
 /// `CLOSE` — release any open stream and free the slot.
