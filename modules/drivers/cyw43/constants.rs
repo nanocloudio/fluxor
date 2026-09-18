@@ -472,8 +472,11 @@ pub const GSPI_SKIP_WORDS_WLAN: usize = 0;
 /// Extra status word appended after payload (always 1).
 pub const GSPI_STATUS_WORDS: usize = 1;
 
-/// Maximum frame size
-pub const MAX_FRAME_SIZE: usize = 1536;
+/// Largest F2/F3 packet the bus reads: the status register names a
+/// packet's length in an 11-bit field, so this is every length the chip
+/// can advertise. A packet the driver could not read would stay at the
+/// head of the chip's queue and be advertised again on every status read.
+pub const MAX_FRAME_SIZE: usize = 2048;
 
 /// Clock divider for 25MHz gSPI (system clock 150MHz / 3 = 50MHz PIO, 2 PIO cycles/bit)
 /// 8.8 fixed-point format: 3.0 = 0x0300

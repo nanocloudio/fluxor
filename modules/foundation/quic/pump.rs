@@ -32,9 +32,10 @@ unsafe fn pump_session(s: &mut QuicState, idx: usize) -> bool {
     let st = s.conns[idx].driver.hs_state;
     // First-contact attribution: the longest single handshake step since
     // boot, and which state it was, ride the `[quic] hb` beat (`fcs=`/`fcu=`).
-    // Added because the Pi 5 rig faults this module on its first contact
-    // (a >2 ms step against the 2 ms guard) and a one-shot log of the phase
-    // never survives the UDP telemetry attach; a beat does.
+    // The costliest step is a connection's first contact, which happens
+    // before telemetry has attached, so a one-shot log of the offending
+    // state is never seen off-board; keeping a running maximum and carrying
+    // it on a recurring beat makes it readable whenever a capture attaches.
     let t0 = dev_micros(&*s.syscalls);
     let progressed = pump_session_inner(s, idx, st);
     let dt = dev_micros(&*s.syscalls).wrapping_sub(t0) as u32;
@@ -66,6 +67,9 @@ unsafe fn pump_session_inner(s: &mut QuicState, idx: usize, st: HandshakeState) 
         HandshakeState::RecvEncryptedExtensions => pump_recv_encrypted_extensions(s, idx),
         HandshakeState::RecvCertificate => pump_recv_certificate(s, idx),
         HandshakeState::RecvCertificateVerify => pump_recv_certificate_verify(s, idx),
+        HandshakeState::VerifyChain | HandshakeState::VerifyPeerSignature => {
+            pump_rsa_verify(s, idx)
+        }
         HandshakeState::RecvFinished => pump_recv_server_finished(s, idx),
         HandshakeState::SendClientFinished => pump_send_client_finished(s, idx),
         HandshakeState::ClientDeriveAppKeys => pump_derive_app_keys(s, idx),
@@ -816,7 +820,12 @@ unsafe fn pump_send_certificate_verify(s: &mut QuicState, idx: usize) -> bool {
     let raw_sig = ecdsa_sign_finalise(state);
 
     let (der_sig, der_len) = encode_der_signature(&raw_sig);
-    let msg_len = build_certificate_verify(&der_sig, der_len, &mut driver.scratch);
+    let msg_len = build_certificate_verify(
+        SIG_ECDSA_SECP256R1_SHA256,
+        &der_sig,
+        der_len,
+        &mut driver.scratch,
+    );
     if let Some(ref mut t) = driver.transcript {
         t.update(&driver.scratch[..msg_len]);
     }
@@ -1396,7 +1405,14 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
         t.update(&data[..len]);
     }
     let body = &data[4..len];
-    if !extract_peer_cert_pubkey_quic(body, &mut conn.driver) {
+    let leaf_der = match parse_certificate_msg(body) {
+        Some(d) => d,
+        None => {
+            conn.driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+    };
+    if bind_peer_cert_key_core(&mut conn.driver, leaf_der) != CERT_OK {
         conn.driver.hs_state = HandshakeState::Error;
         return true;
     }
@@ -1412,7 +1428,10 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
         }
         let trust = core::slice::from_raw_parts(trust_ptr, trust_len);
         let host = core::slice::from_raw_parts(host_ptr, host_len);
-        let rc = verify_cert_chain(body, trust, host);
+        let mut deferred =
+            core::mem::replace(&mut conn.driver.deferred_links, DeferredLinks::empty());
+        let rc = verify_cert_chain_with(body, trust, host, Some(&mut deferred));
+        conn.driver.deferred_links = deferred;
         if rc != 0 {
             let mut buf = [0u8; 48];
             let prefix = b"[quic] cert chain FAIL rc=";
@@ -1447,91 +1466,57 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
         let msg = b"[quic] cert chain OK";
         dev_log(sys, 3, msg.as_ptr(), msg.len());
     }
-    conn.driver.hs_state = HandshakeState::RecvCertificateVerify;
+    // A chain whose RSA links were deferred is verified by the instance
+    // job before the CertificateVerify is read; the message is held for it.
+    if conn.driver.deferred_links.pending() {
+        conn.driver.scratch[..len].copy_from_slice(&data[..len]);
+        conn.driver.held_len = len as u16;
+        conn.driver.rsa_job_active = 0;
+        conn.driver.after_verify = HandshakeState::RecvCertificateVerify;
+        conn.driver.verify_steps = 0;
+        conn.driver.hs_state = HandshakeState::VerifyChain;
+    } else {
+        conn.driver.hs_state = HandshakeState::RecvCertificateVerify;
+    }
     true
 }
 
-unsafe fn extract_peer_cert_pubkey_quic(body: &[u8], driver: &mut HandshakeDriver) -> bool {
-    if body.len() < 4 {
+/// Drive the instance job for a connection in `VerifyChain` or
+/// `VerifyPeerSignature`.
+unsafe fn pump_rsa_verify(s: &mut QuicState, idx: usize) -> bool {
+    let owner = idx as i32;
+    if !(s.rsa_owner < 0 || s.rsa_owner == owner) {
         return false;
     }
-    let ctx_len = body[0] as usize;
-    if 1 + ctx_len + 3 > body.len() {
-        return false;
-    }
-    let mut pos = 1 + ctx_len;
-    let list_len =
-        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
-    pos += 3;
-    if pos + list_len > body.len() || list_len < 3 {
-        return false;
-    }
-    let cert_len =
-        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | (body[pos + 2] as usize);
-    pos += 3;
-    if pos + cert_len > body.len() {
-        return false;
-    }
-    let cert_der = &body[pos..pos + cert_len];
-    if let Some(parsed) = parse_certificate(cert_der) {
-        let pk = parsed.public_key;
-        let n = if pk.len() <= 65 { pk.len() } else { 65 };
-        core::ptr::copy_nonoverlapping(pk.as_ptr(), driver.peer_cert_pubkey.as_mut_ptr(), n);
-        driver.peer_cert_pubkey_len = n as u8;
-        true
+    s.rsa_owner = owner;
+    let rows = if s.rsa_rows_per_step == 0 {
+        usize::MAX
     } else {
-        false
+        s.rsa_rows_per_step as usize
+    };
+    let anchor = core::slice::from_raw_parts(s.trust_cert.as_ptr(), s.trust_cert_len);
+    let job: *mut RsaVerifyJob = &mut s.rsa_verify;
+    let ec_bits = ladder_bits_per_step(s);
+    let outcome = rsa_verify_pump_core(&mut s.conns[idx].driver, &mut *job, anchor, rows, ec_bits);
+    match outcome {
+        RsaPump::Progress => true,
+        RsaPump::Done => {
+            s.rsa_owner = -1;
+            true
+        }
+        RsaPump::Failed => {
+            s.rsa_owner = -1;
+            let sys = &*s.syscalls;
+            let msg = b"[quic] cert chain FAIL rsa signature";
+            dev_log(sys, 2, msg.as_ptr(), msg.len());
+            s.conns[idx].driver.hs_state = HandshakeState::Error;
+            true
+        }
     }
 }
 
 unsafe fn pump_recv_certificate_verify(s: &mut QuicState, idx: usize) -> bool {
-    let driver = &mut s.conns[idx].driver;
-    let (data, len, msg_type) = match driver.read_handshake_message() {
-        Some(t) => t,
-        None => return false,
-    };
-    if msg_type != HT_CERTIFICATE_VERIFY {
-        driver.hs_state = HandshakeState::Error;
-        return true;
-    }
-    if driver.peer_cert_pubkey_len == 0 {
-        driver.hs_state = HandshakeState::Error;
-        return true;
-    }
-    let hl = driver.suite.hash_len();
-    let transcript_hash = match &driver.transcript {
-        Some(t) => t.current_hash(),
-        None => {
-            driver.hs_state = HandshakeState::Error;
-            return true;
-        }
-    };
-    let context: &[u8] = b"TLS 1.3, server CertificateVerify";
-    let mut vc = [0u8; 200];
-    let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut vc);
-    let vc_hash = sha256(&vc[..vc_len]);
-    let cv_body = &data[4..len];
-    let ok = if let Some(sig_der) =
-        parse_certificate_verify_expecting(cv_body, SIG_ECDSA_SECP256R1_SHA256)
-    {
-        if let Some(raw_sig) = parse_der_signature(sig_der) {
-            let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
-            ecdsa_verify(pk, &vc_hash, &raw_sig)
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if !ok {
-        driver.hs_state = HandshakeState::Error;
-        return true;
-    }
-    if let Some(ref mut t) = driver.transcript {
-        t.update(&data[..len]);
-    }
-    driver.hs_state = HandshakeState::RecvFinished;
-    true
+    pump_recv_certificate_verify_core(&mut s.conns[idx].driver)
 }
 
 unsafe fn pump_recv_server_finished(s: &mut QuicState, idx: usize) -> bool {
@@ -2894,8 +2879,9 @@ unsafe fn process_frames(
 ///
 /// On the framed mux surface every stream — including client bidi stream
 /// 0 — is an ordinary pool slot, routed by the direction bit of its id
-/// (RFC 9000 §2.1). On the transparent surface there is only one stream
-/// and it lands in the legacy receive buffer.
+/// (RFC 9000 §2.1). On the transparent (no-ALPN) byte-stream surface there
+/// is only one stream, and it lands in the connection's single-stream
+/// receive buffer.
 ///
 /// Partial overlap is accepted; out-of-order arrivals are dropped and
 /// rely on the peer's retransmission.
@@ -3316,8 +3302,8 @@ unsafe fn drain_outbound(s: &mut QuicState, idx: usize) {
             //   • Other 1-RTT frames: STREAM, HANDSHAKE_DONE, h3
             //     extra-stream / bidi-extra-stream STREAMs.
             //
-            // Both categories must be CC-gated; previously only the
-            // second was, letting NewSessionTicket bypass cwnd.
+            // Both categories must be CC-gated: 1-RTT CRYPTO bytes left
+            // ungated would let a NewSessionTicket bypass cwnd.
             let level_at_one_rtt = matches!(lvl_now, EncLevel::OneRtt);
             let one_rtt_crypto_pending = level_at_one_rtt && conn.driver.out_len > 0;
             let one_rtt_data_pending =
@@ -3697,9 +3683,10 @@ unsafe fn emit_crypto_packet(
         had_handshake_done = true;
     }
 
-    // STREAM frames. On the transparent surface there is one stream and
-    // it lives in the legacy buffer; on the framed mux surface every
-    // stream is a pool slot and several may be packed into one packet.
+    // STREAM frames. On the transparent (no-ALPN) surface there is one
+    // stream, held in the connection's single-stream send buffer; on the
+    // framed mux surface every stream is a pool slot and several may be
+    // packed into one packet.
     //
     // Slots are visited round-robin from a rotating cursor rather than
     // always from index 0, so one busy stream cannot starve the others:

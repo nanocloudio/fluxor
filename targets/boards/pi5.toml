@@ -71,7 +71,10 @@ preferred_telemetry = "telemetry.monitor_udp"
 # carries no protocol at all. It is listed separately from `proto_load`
 # because the two answer different questions — when an h3 scenario fails,
 # only a transport-only run can say which half is at fault.
-observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load", "observe.proto_load", "observe.quic_mux"]
+# `observe.tls_load` is the tls anchor's probe on the same NIC: TLS 1.3
+# handshakes and an echo, so a server identity (P-256, RSA) is measured as
+# the handshake it changes.
+observe = ["observe.console_regex", "observe.netboot_fetch", "observe.monitor_stream", "observe.udp_capture", "observe.https_load", "observe.proto_load", "observe.quic_mux", "observe.tls_load"]
 # `power.off` / `power.on` are the halves of the cycle: an out-of-band fence
 # agent cuts the board with `off` and a bench restores it with `on`.
 power = ["power.cycle", "power.off", "power.on"]

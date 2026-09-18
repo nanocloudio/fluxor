@@ -217,9 +217,9 @@ pub mod caps {
 
     // `ops` bitmap — optional opcodes beyond the mandatory create/start/wait/
     // signal/destroy set. SIGNAL itself is mandatory to *accept*; its bit
-    // asserts real-signal delivery semantics. bits 0..2 reserved (formerly
-    // READ/EXEC/TTY — retired to the 0x1B host-process class; do not reuse
-    // the positions).
+    // asserts real-signal delivery semantics. Bits 0..2 are reserved and MUST
+    // NOT be allocated: those positions belong to the 0x1B host-process class,
+    // whose opcodes this contract also leaves unused.
     /// SIGNAL is delivered by the backend's real signal mechanism (§3.1),
     /// not merely recorded as a stop request.
     pub const SIGNAL: u16 = 1 << 3;

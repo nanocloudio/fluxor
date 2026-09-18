@@ -74,6 +74,9 @@ include!("../../sdk/crypto/sha3.rs");
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; x509.rs needs ml_dsa.rs for
 // post-quantum certificate suites. Order matters for all three.
 include!("../../sdk/crypto/ml_dsa.rs");
+include!("../../sdk/crypto/rsa.rs");
+// The handshake driver carries the X25519 ladder every transport shares.
+include!("../../sdk/crypto/ed25519.rs");
 
 // Shared TLS / DTLS source — QUIC drives the same TLS 1.3 handshake
 // state machine via CRYPTO frames instead of records.
@@ -170,7 +173,10 @@ const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 // net_proto MSG_DATA 0x02 framing and carries one raw byte stream.)
 use abi::contracts::net::mux;
 const MAX_CERT_LEN: usize = 1024;
-const MAX_KEY_LEN: usize = 160;
+/// Matches the tls module's ceiling so a `key_file` a graph shares between
+/// them packs identically; quic signs in-module with P-256 only, and any
+/// other key fails its CertificateVerify.
+const MAX_KEY_LEN: usize = 2400;
 const NET_BUF_SIZE: usize = 1600;
 const MAX_TICKETS: usize = 4;
 
@@ -386,6 +392,13 @@ pub(crate) struct QuicState {
     /// `ecdh_bits_per_step`, which exists for exactly this reason and
     /// which this module went without.
     ecdh_bits_per_step: u16,
+    /// Rows of an RSA product one step may spend on a deferred signature;
+    /// 0 means whole. See the tls module's key of the same name.
+    rsa_rows_per_step: u16,
+    /// The one RSA verify job this instance owns, shared by every
+    /// connection; `rsa_owner` is the connection holding it, or -1.
+    rsa_verify: RsaVerifyJob,
+    rsa_owner: i32,
     /// Connection-migration policy (RFC 9000 §9). 0 (default) = migration
     /// enabled: we do NOT advertise `disable_active_migration`, and we
     /// validate + switch to a new client 4-tuple via PATH_CHALLENGE /
@@ -441,6 +454,9 @@ define_params! {
     // above 256 is a whole ladder anyway.
     //
     // Tag 15 — 14 is the extended-TLV `alpn` key (see `parse_extended_params`).
+    18, rsa_rows_per_step, u16, 16
+        => |s, d, len| { s.rsa_rows_per_step = p_u16(d, len, 0, 16); };
+
     15, ecdh_bits_per_step, u16, 256
         => |s, d, len| {
             let v = p_u16(d, len, 0, 256);
@@ -493,6 +509,8 @@ pub unsafe extern "C" fn module_new(
     s.require_retry = 0;
     s.enable_0rtt = 0;
     s.ecdh_bits_per_step = 256;
+    s.rsa_rows_per_step = 16;
+    s.rsa_owner = -1;
     s.key_update_pkts = 0;
     s.verify_peer = 0;
     s.trust_cert_len = 0;
@@ -1481,31 +1499,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let conn = &mut s.conns[i];
                 // The spare CID and its stateless-reset token are minted from
                 // the CSPRNG, and BOTH fills must succeed before the frame is
-                // queued. On a platform whose entropy source can fail
-                // transiently under load (the Pi 5's RNG200 times out and
-                // returns an error), an unchecked fill leaves these buffers
-                // zero, and the server then emits a NEW_CONNECTION_ID carrying
-                // an all-zero CID and an all-zero reset token — which a
-                // conforming peer rejects with a FRAME_ENCODING_ERROR
-                // CONNECTION_CLOSE, killing a connection whose handshake had
-                // just completed (measured: quiche closes err=7 right after
-                // HANDSHAKE_DONE against the Pi 5 h3 server). When entropy is
-                // unavailable the spare CID is simply not issued this step and
-                // is retried on the next — the peer's active_connection_id_limit
-                // is an offer this endpoint may decline, so declining until the
-                // CSPRNG recovers is correct rather than sending zeros.
-                // One-shot per connection: `alt_cid_issued` latches whether it
-                // succeeds or not, so a connection whose spare CID cannot be
-                // minted does NOT re-attempt every step. Retrying forever is a
-                // hot loop — at a 50 us tick a single such connection burns
-                // ~20000 fills a second — and it starved h3 connection setup on
-                // the Pi 5, whose RNG200 re-presents zero words heavily
-                // (`cidfail=` counted 326538 declines in one load run before
-                // this). The spare CID is an offer the peer's
-                // active_connection_id_limit invites but does not require, so
-                // declining it for the connection's lifetime is correct; the
-                // fill already retried past a transient reseed-zero within the
-                // one attempt.
+                // queued. An unchecked fill on a platform whose entropy source
+                // can fail transiently under load leaves these buffers zero,
+                // and a NEW_CONNECTION_ID carrying an all-zero CID and an
+                // all-zero reset token is rejected by a conforming peer with a
+                // FRAME_ENCODING_ERROR CONNECTION_CLOSE — killing a connection
+                // whose handshake has just completed.
+                //
+                // On failure nothing is queued and `alt_cid_issued` still
+                // latches, so the attempt is one-shot per connection rather
+                // than repeated every step: at a 50 us tick a single retrying
+                // connection burns ~20000 fills a second and starves
+                // connection setup (declines are counted in the `cidfail=`
+                // beat field). `csprng_fill_nonzero` already retries past a
+                // transient reseed-zero inside the one attempt, and the
+                // spare CID is an offer the peer's active_connection_id_limit
+                // invites but does not require, so declining it for the
+                // connection's lifetime is correct.
                 let cid_ok = csprng_fill_nonzero(sys, conn.alt_cid.as_mut_ptr(), 8);
                 let tok_ok = csprng_fill_nonzero(sys, conn.alt_cid_reset_token.as_mut_ptr(), 16);
                 conn.alt_cid_issued = true;
@@ -2671,18 +2681,17 @@ unsafe fn discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 #[inline(never)]
 unsafe fn maybe_emit_telemetry(s: &mut QuicState) {
     let sys = &*s.syscalls;
-    // Ring-based emission (§5.2): zero-cost when no consumer is subscribed.
+    // Ring-based emission: zero-cost when no consumer is subscribed.
     let now = dev_millis(sys);
     if now.wrapping_sub(s.tlm_last_ms) < 5000 {
         return;
     }
     s.tlm_last_ms = now;
-    // Bounded state beat, telemetry-wired or not: one-shot records at
-    // module_new/bind are emitted before DHCP binds and never leave a board
-    // over UDP telemetry, so the evidence a rig capture keys on must RECUR
-    // (the SIP/RTP §4.2 lesson; the h3 rig regression sat undiagnosable for
-    // four days for want of exactly this line). Endpoint id, conn count,
-    // refusals, and the ingress counter only.
+    // Bounded state beat, telemetry-wired or not. Anything logged once at
+    // module_new/bind is written before DHCP has bound and so never leaves
+    // the board over UDP telemetry; only a RECURRING line is observable to
+    // an off-board capture, whenever it happens to attach. Endpoint id,
+    // conn count, refusals, and the ingress counter only.
     {
         let mut active: u32 = 0;
         let mut i = 0;
@@ -3577,8 +3586,9 @@ pub mod test_helpers {
     /// `Some(false)` once one is issued with a non-zero value. `alt_cid_issued`
     /// latches, so this is stable across steps (unlike the transient
     /// `new_cid_tx_pending`, cleared the moment the frame is sent). The
-    /// invariant the CSPRNG-failure regression asserts is that this is NEVER
-    /// `Some(true)`: a spare CID is issued only from a successful fill.
+    /// invariant is that this is NEVER `Some(true)`: a spare CID is issued
+    /// only from a successful CSPRNG fill, so a CSPRNG failure declines the
+    /// spare CID rather than offering an all-zero one.
     ///
     /// # Safety
     /// `state` points to an initialised `QuicState`.

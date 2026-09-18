@@ -8,8 +8,8 @@
 // module's `MAX_TCP_CONNS` is at least as large; the kernel's
 // `STATE_ARENA_SIZE` has to fit every loaded module's
 // `module_arena_size()`; `LOG_RING_CAPACITY` interacts with how
-// much trace volume the system can absorb under load. When these
-// lived in their owning modules, every change required a
+// much trace volume the system can absorb under load. Spread
+// across their owning modules, any one change becomes a
 // coordinated edit across the tree. Centralising them lets a
 // reviewer see the full envelope on one screen and lets the
 // compiler enforce cross-subsystem invariants.
@@ -143,6 +143,9 @@ mod profile_host {
         // the WAL. This is per-target (wasm32 48, Cortex-M 32 below), so the
         // scheduler's static tables grow on aarch64 only.
         pub const MAX_MODULES: usize = 192;
+        /// ISR-tier bridge slots: one per edge that crosses into an
+        /// ISR-tier domain, each holding its ring inline (~2 KiB).
+        pub const MAX_BRIDGES: usize = 16;
         /// Loader sanity ceiling for a single module's code segment.
         /// 1 MiB fits media modules (the unified codec's decoder plus
         /// its CAVLC/clip tables runs ~450 KiB) and protocol modules
@@ -175,7 +178,7 @@ mod profile_host {
         /// image.
         pub const ELASTIC_REGION_SIZE: usize = 16 * 1024 * 1024;
         /// Grant granularity: chunks are rounded up to this quantum
-        /// (the 64 KiB platform quantum, §3.1).
+        /// (the 64 KiB platform quantum).
         pub const ELASTIC_QUANTUM: usize = 64 * 1024;
     }
 
@@ -184,21 +187,19 @@ mod profile_host {
         /// server module instance. Slot table size on
         /// `ServerState`.
         ///
-        /// Capped at 256 because the net-protocol wire format
-        /// carries `conn_id` as a single byte (see
-        /// `modules/foundation/ip/mod.rs` accept/data/close paths
-        /// and `modules/foundation/http/server.rs::find_slot_by_conn_id`).
-        /// Allowing >256 here would let slots 256..N wrap modulo
-        /// 256 on the wire and collide with earlier slots' ids,
-        /// silently misrouting traffic. Lifting this requires
-        /// widening `conn_id` to `u16` end-to-end across IP +
-        /// HTTP + ws_stream — tracked as future work.
+        /// Bounded by the TCP connection table beneath it: this slot
+        /// count must not exceed `ip::MAX_TCP_CONNS`, since every HTTP
+        /// connection holds one, and a compile-time invariant in
+        /// `modules/sdk/config.rs` enforces that. Each slot also costs a
+        /// receive and a send buffer from the heap arena, so the figure
+        /// is a memory decision, not a wire one — `conn_id` is a `u16`
+        /// on the net-protocol wire and imposes no ceiling here.
         pub const MAX_CONCURRENT_CONNS: usize = 256;
         /// Peak active connections the heap arena is sized to
-        /// support simultaneously. With `MAX_CONCURRENT_CONNS`
-        /// pinned at the u8-conn-id ceiling, this matches it
-        /// 1:1 — the slot table and the arena are co-bounded by
-        /// the wire format.
+        /// support simultaneously. Matches `MAX_CONCURRENT_CONNS`
+        /// 1:1, so every admissible connection has its buffers:
+        /// a smaller figure would admit a connection the arena
+        /// cannot then serve.
         pub const ARENA_WORKING_SET_CONNS: usize = 256;
         /// Per-conn inbound buffer holding the HTTP request line,
         /// headers, and small request bodies. Heap-allocated on
@@ -219,8 +220,7 @@ mod profile_host {
         // content_type, fs_path, fs_list, fs_filter) at tag offsets
         // 10 + 10*i .. 10 + 10*(i+1). Bumping this ceiling REQUIRES
         // adding matching `define_params!` entries for the new
-        // routes; tools/tests/http_route_tlv_coverage.rs locks the
-        // invariant. The host profile is currently sized for 8
+        // routes. The host profile is sized for 8
         // routes (tags 10..89) — enough for the scenario synth host
         // (runtime.html, fluxor.wasm, host_shims.js, /scenario.json,
         // /api/list, plus 3 spare for user/scenario route merges).
@@ -231,11 +231,11 @@ mod profile_host {
         // the table_consumer helper, carry a host axis + weighted backend
         // set, and are NOT wired through `define_params!` — so this
         // ceiling is free to size for route×backend fanout without
-        // touching the TLV coverage lock. Host default 64; embedded/wasm
+        // touching the TLV parameter table. Host default 64; embedded/wasm
         // keep 8 (see the other profiles).
         pub const MAX_DYN_ROUTES: usize = 64;
         // Backends carried per dynamic route (the `be=` set). One PUT
-        // replaces the whole set atomically (§3.1); the compiler
+        // replaces the whole set atomically; the compiler
         // truncates oversized sets by weight order, and the edge counts
         // the overflow into `http.routes.dropped`.
         pub const MAX_ROUTE_BACKENDS: usize = 8;
@@ -387,20 +387,23 @@ mod profile_wasm {
         // Holds ALL channel ring buffers for the live graph. GPU-offload graphs
         // wire multi-MiB frame channels (a whole serialized frame — up to
         // ~1.57 MiB dense — must cross child->kernel in one ring fill)
-        // PLUS the small audio/input/command channels (~24 KiB). At 2 MiB the arena
-        // couldn't fit the 2 MiB channel alongside the others ("[buf] arena full
-        // need=2097152 used=24576") -> channel open failed -> the emulator would not
-        // start. Then 4 MiB for a 2 MiB channel + rest. Now 8 MiB: chunk's GPU
-        // command ring wants a 4 MiB channel (a chunk mesh + the far-terrain LOD ring
-        // in one step; channel sizes are powers of two, so 4 MiB is the next step
-        // above 2 MiB), which alone fills a 4 MiB arena — 8 MiB holds it + the rest.
+        // PLUS the small audio/input/command channels (~24 KiB). An arena that
+        // cannot fit a graph's largest channel alongside the rest fails the
+        // channel open ("[buf] arena full need=... used=..."), and the graph
+        // never starts. 8 MiB is sized for chunk's GPU command ring, which
+        // wants a 4 MiB channel (a chunk mesh + the far-terrain LOD ring in one
+        // step; channel sizes are powers of two, so 4 MiB is the next step
+        // above 2 MiB) and alone fills a 4 MiB arena — 8 MiB holds it + the rest.
         // Lazily paged by memory.grow, so it costs nothing until used.
         pub const BUFFER_ARENA_SIZE: usize = 8 * 1024 * 1024;
         // 48: a multi-emulator browser graph (music + Game Boy +
         // Spectrum chains) declares ~22 modules and the kernel inserts
-        // an internal tee/merge per fan — 32 left "No room for
-        // internal module" at prepare_graph.
+        // an internal tee/merge per fan, which 32 cannot hold — the
+        // shortfall surfaces as "No room for internal module" at
+        // prepare_graph.
         pub const MAX_MODULES: usize = 48;
+        /// ISR-tier bridge slots; see profile_host.
+        pub const MAX_BRIDGES: usize = 16;
         pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
         pub const CONFIG_ARENA_SIZE: usize = 32 * 1024;
         pub const LOG_RING_CAPACITY: usize = 16384;
@@ -480,6 +483,9 @@ mod profile_embedded {
         pub const MAX_MODULE_CODE_SIZE: usize = 384 * 1024;
         pub const BUFFER_ARENA_SIZE: usize = 64 * 1024;
         pub const MAX_MODULES: usize = 32;
+        /// ISR-tier bridge slots; see profile_host. Eight is the ISR edges
+        /// a graph of this size has, at ~2 KiB of static RAM each.
+        pub const MAX_BRIDGES: usize = 8;
         pub const MAX_MODULE_CONFIG_SIZE: usize = 4 * 1024;
         pub const CONFIG_ARENA_SIZE: usize = 16 * 1024;
         pub const LOG_RING_CAPACITY: usize = 4096;
@@ -494,7 +500,8 @@ mod profile_embedded {
         /// parallel, and a one-slot server closes all but the first, which
         /// presents as a page that half-loads. Four slots cost
         /// 4 × (2048 + 4100) ≈ 24 KiB of the 256 KiB arena, sized against the
-        /// 4-session TLS table and the 16-slot TCP table in this profile.
+        /// 16-slot TCP table in this profile; the one-session TLS table
+        /// beneath it bounds HTTPS, not this.
         pub const MAX_CONCURRENT_CONNS: usize = 4;
         pub const ARENA_WORKING_SET_CONNS: usize = 4;
         pub const RECV_BUF_SIZE: usize = 2048;
@@ -527,8 +534,12 @@ mod profile_embedded {
     }
 
     pub mod tls {
-        /// Whole pool inline (no elastic region on MCU-class targets).
-        pub const MAX_SESSIONS: usize = 4;
+        /// Whole pool inline (no elastic region on MCU-class targets). One
+        /// session is what the rp2350's state arena holds beside the wifi
+        /// stack: a session is ~37 KiB on a 32-bit core and the tls
+        /// instance around it (one DTLS peer, one continuity shadow, its
+        /// identity and anchor, the RSA job) another ~88 KiB.
+        pub const MAX_SESSIONS: usize = 1;
     }
 
     pub mod quic {

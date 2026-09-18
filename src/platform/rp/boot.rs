@@ -29,6 +29,8 @@ unsafe extern "C" {
     static mut __ebss: u32;
     /// The top of the stack, which the linker places at the end of RAM.
     static __stack_top: u32;
+    /// One past the last static byte; the stack must not grow below it.
+    static __stack_limit: u32;
 }
 
 /// RP2040's second-stage bootloader.
@@ -84,6 +86,19 @@ pub unsafe extern "C" fn Reset() -> ! {
         loop {
             crate::arch::cortex_m::nop();
         }
+    }
+
+    // The stack grows down from the end of RAM towards the statics. Without
+    // a limit an overflow overwrites whatever static sits highest and the
+    // board goes quiet; with one, the core takes a fault the trampoline
+    // reports with its status registers. ARMv8-M only: RP2040's M0+ has no
+    // stack-limit register.
+    #[cfg(not(feature = "chip-rp2040"))]
+    // SAFETY: MSPLIM is written once, before any deep call; the limit is the
+    // linker's own symbol, 8-byte aligned as the register requires.
+    unsafe {
+        let limit = &raw const __stack_limit as u32;
+        core::arch::asm!("msr MSPLIM, {0}", in(reg) limit, options(nomem, nostack, preserves_flags));
     }
 
     unsafe extern "C" {

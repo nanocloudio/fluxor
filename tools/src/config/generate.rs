@@ -239,9 +239,9 @@ fn generate_config_impl(
 
     // Budget validation: prove step_deadlines, burst budgets, and
     // per-domain tick budgets fit together before the kernel ever
-    // boots the graph. Until this lands, a config could declare
+    // boots the graph. Without this gate a config could declare
     // `step_deadline_us: 5000` on a module in a domain with
-    // `tick_us: 1000` and the deadline would silently force every
+    // `tick_us: 1000`, and the deadline would silently force every
     // step over budget — observable only as missed-deadline timeouts
     // at runtime.
     validate_scheduler_budgets(
@@ -392,6 +392,25 @@ fn generate_config_impl(
                 .and_then(|n| n.as_str())
                 .or_else(|| m.get("type").and_then(|n| n.as_str()))
                 .unwrap_or("?");
+            // An identity key the target cannot sign with is refused here,
+            // and a key file that cannot be read is too when the graph named
+            // one: an instance whose identity is missing is not an instance
+            // that will serve, and the composer is where that is cheapest to
+            // hear.
+            if let Some(key_path) = m.get("key_file").and_then(|v| v.as_str()) {
+                let der = std::fs::read(key_path).map_err(|e| {
+                    Error::Config(format!(
+                        "modules[{i}] ({name}): key_file '{key_path}' could not be read: {e}"
+                    ))
+                })?;
+                let facts_key = facts_owned.as_deref().unwrap_or(silicon);
+                let facts = crate::target_facts::TargetFacts::for_silicon(facts_key);
+                let key = crate::identity_key::classify(&der);
+                if let Err(e) = crate::identity_key::admit_identity(key, facts_key, facts.vault_suites)
+                {
+                    return Err(Error::Config(format!("modules[{i}] ({name}): {e}")));
+                }
+            }
             if let Some(manifest) = manifests.get(name) {
                 if let Err(e) =
                     crate::manifest::check_target_capabilities(manifest.requires, silicon)

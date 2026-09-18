@@ -1,13 +1,12 @@
 // TLS 1.3 Handshake State Machine (RFC 8446 Section 4)
 // Server and client handshake, message construction/parsing
 //
-// FUTURE — Phase A of docs/architecture/datagram_secure_transports.md
-// will extract a record-agnostic `HandshakeDriver` from this file (and
-// `mod.rs`) into `handshake_driver.rs`. The driver consumes plain
-// handshake bytes per `EncLevel { Initial, Handshake, OneRtt }` and
-// exposes `feed_handshake` / `poll_handshake` / `read_secret`, so DTLS
-// (Phase B) and QUIC (Phase C) can drive the same state machine via
-// their own record / CRYPTO-frame layers without forking this code.
+// The record-agnostic half of the state machine lives in
+// `handshake_driver.rs`: `HandshakeDriver` consumes plain handshake
+// bytes per `EncLevel { Initial, Handshake, OneRtt }` and exposes
+// `feed_handshake` / `poll_handshake` / `read_secret`. TLS-over-TCP,
+// DTLS and QUIC each drive that one state machine through their own
+// record / CRYPTO-frame layers, so none of them forks this code.
 
 /// Handshake message types
 const HT_CLIENT_HELLO: u8 = 1;
@@ -65,6 +64,51 @@ pub const P256_SHARE_LEN: usize = 65;
 
 /// Signature algorithm: ecdsa_secp256r1_sha256
 const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+/// rsa_pss_rsae_sha256: RSASSA-PSS under SHA-256 with an rsaEncryption key.
+const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
+/// rsa_pss_rsae_sha384.
+const SIG_RSA_PSS_RSAE_SHA384: u16 = 0x0805;
+/// rsa_pkcs1_sha256 and rsa_pkcs1_sha384: certificate signatures only in
+/// TLS 1.3 (RFC 8446 §4.2.3); advertised so a peer whose chain is
+/// PKCS#1-signed does not refuse us for omitting them, never accepted in
+/// a CertificateVerify.
+const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
+const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
+
+/// The schemes this build offers, in preference order.
+const OFFERED_SIGNATURE_SCHEMES: [u16; 5] = [
+    SIG_ECDSA_SECP256R1_SHA256,
+    SIG_RSA_PSS_RSAE_SHA256,
+    SIG_RSA_PSS_RSAE_SHA384,
+    SIG_RSA_PKCS1_SHA256,
+    SIG_RSA_PKCS1_SHA384,
+];
+
+/// The digest width a CertificateVerify scheme signs its content under.
+pub const fn scheme_hash_len(scheme: u16) -> usize {
+    match scheme {
+        SIG_RSA_PSS_RSAE_SHA384 => 48,
+        _ => 32,
+    }
+}
+
+/// The CertificateVerify scheme a peer key of `key_suite` may sign with,
+/// given the scheme it announced. `None` when the announced scheme is not
+/// one this build verifies under that key: verifying under a fixed
+/// algorithm while ignoring the announced one accepts a signature whose
+/// stated meaning differs from the check performed, and a scheme from
+/// another key family is that mismatch by construction.
+pub fn scheme_for_peer_key(key_suite: u16, scheme: u16) -> Option<u16> {
+    match key_suite {
+        suite::ECDSA_P256_SHA256 if scheme == SIG_ECDSA_SECP256R1_SHA256 => Some(scheme),
+        suite::RSA_2048 | suite::RSA_3072 | suite::RSA_4096
+            if scheme == SIG_RSA_PSS_RSAE_SHA256 || scheme == SIG_RSA_PSS_RSAE_SHA384 =>
+        {
+            Some(scheme)
+        }
+        _ => None,
+    }
+}
 
 /// TLS 1.3 version
 const TLS13_VERSION: u16 = 0x0304;
@@ -87,6 +131,12 @@ pub enum HandshakeState {
     RecvClientCertVerify,
     RecvClientFinished,
     DeriveAppKeys,
+
+    // Either role: the peer's chain or CertificateVerify carries an RSA
+    // signature, and the instance's stepped job is verifying it across
+    // ticks. `after_verify` on the driver says where to go when it is done.
+    VerifyChain,
+    VerifyPeerSignature,
 
     // Client states
     SendClientHello,
@@ -571,9 +621,14 @@ pub fn build_certificate_request(out: &mut [u8]) -> usize {
         pos += 2;
         let ext_start = pos;
         pu16(p, &mut pos, EXT_SIGNATURE_ALGORITHMS);
-        pu16(p, &mut pos, 4);
-        pu16(p, &mut pos, 2);
-        pu16(p, &mut pos, SIG_ECDSA_SECP256R1_SHA256);
+        let list_len = 2 * OFFERED_SIGNATURE_SCHEMES.len() as u16;
+        pu16(p, &mut pos, 2 + list_len);
+        pu16(p, &mut pos, list_len);
+        let mut k = 0;
+        while k < OFFERED_SIGNATURE_SCHEMES.len() {
+            pu16(p, &mut pos, OFFERED_SIGNATURE_SCHEMES[k]);
+            k += 1;
+        }
 
         let ext_len = (pos - ext_start) as u16;
         *p.add(ext_len_pos) = (ext_len >> 8) as u8;
@@ -741,8 +796,15 @@ pub fn build_certificate(chain: &[u8], out: &mut [u8]) -> usize {
     }
 }
 
-/// Build CertificateVerify message (raw pointer writes for PIC safety)
-pub fn build_certificate_verify(signature_der: &[u8], sig_len: usize, out: &mut [u8]) -> usize {
+/// Build CertificateVerify message (raw pointer writes for PIC safety).
+/// `signature` is as it goes on the wire: DER for ECDSA, the modulus-width
+/// integer for RSA-PSS.
+pub fn build_certificate_verify(
+    scheme: u16,
+    signature_der: &[u8],
+    sig_len: usize,
+    out: &mut [u8],
+) -> usize {
     // SAFETY: pointer arithmetic over the handshake-state buffer; bounds
     // checked against the message length before each deref.
     unsafe {
@@ -758,7 +820,7 @@ pub fn build_certificate_verify(signature_der: &[u8], sig_len: usize, out: &mut 
         pos += 3;
 
         // SignatureScheme
-        pu16(p, &mut pos, SIG_ECDSA_SECP256R1_SHA256);
+        pu16(p, &mut pos, scheme);
         // Signature
         pu16(p, &mut pos, sig_len as u16);
         core::ptr::copy_nonoverlapping(signature_der.as_ptr(), p.add(pos), sig_len);
@@ -1318,10 +1380,9 @@ pub fn parse_encrypted_extensions_alpn(body: &[u8]) -> Option<&[u8]> {
 
 /// Select best cipher suite from client's list. Preference order:
 /// ChaCha20-Poly1305 → AES-128-GCM → AES-256-GCM. The AES suites are
-/// PIC-safe now that `module.ld` funnels `.data.rel.ro*` (LLVM jump
-/// tables) into the loader-relocated `.rodata` output section; the
-/// AES SBOX itself is `const [u8; 256]` which has always landed in
-/// `.rodata` directly.
+/// PIC-safe: `module.ld` funnels `.data.rel.ro*` (LLVM jump tables)
+/// into the loader-relocated `.rodata` output section, and the AES
+/// SBOX is a `const [u8; 256]` that lands in `.rodata` directly.
 pub fn select_cipher_suite(client_suites: &[u8]) -> Option<CipherSuite> {
     let mut found_aes128 = false;
     let mut found_aes256 = false;
@@ -1577,14 +1638,19 @@ fn write_ext_key_share_client(
 }
 
 fn write_ext_signature_algorithms(out: &mut [u8], mut pos: usize) -> usize {
+    let list_len = 2 * OFFERED_SIGNATURE_SCHEMES.len() as u16;
     put_u16(out, pos, EXT_SIGNATURE_ALGORITHMS);
     pos += 2;
-    put_u16(out, pos, 4);
+    put_u16(out, pos, 2 + list_len);
     pos += 2; // ext data length
-    put_u16(out, pos, 2);
+    put_u16(out, pos, list_len);
     pos += 2; // list length
-    put_u16(out, pos, SIG_ECDSA_SECP256R1_SHA256);
-    pos += 2;
+    let mut k = 0;
+    while k < OFFERED_SIGNATURE_SCHEMES.len() {
+        put_u16(out, pos, OFFERED_SIGNATURE_SCHEMES[k]);
+        pos += 2;
+        k += 1;
+    }
     pos
 }
 

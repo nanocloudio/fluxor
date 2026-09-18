@@ -107,9 +107,9 @@ Source: `modules/sdk/contracts/key_vault.rs` (contract),
 `src/kernel/security/key_vault.rs` (software backend).
 
 A kernel-managed asymmetric-key store. Every slot names its **suite** —
-P-256, Ed25519, or one of the three ML-DSA parameter sets — and the suite
-decides what the key bytes mean, which operations the slot admits, and how
-big each answer is. Opcodes:
+P-256, Ed25519, one of the three ML-DSA parameter sets, or RSA at 2048,
+3072 or 4096 bits — and the suite decides what the key bytes mean, which
+operations the slot admits, and how big each answer is. Opcodes:
 
 | Opcode | Name | Semantics |
 |--------|------|-----------|
@@ -156,6 +156,25 @@ before it allocates rather than by storing a key the backend could not then
 sign with. Every length, usage mask and enumeration flows from one gate, so
 the suites cannot be half-present.
 
+RSA is the other per-target capability, the `rsa-vault` Cargo feature,
+enabled wherever `pq-vault` is. An RSA slot's key is a PKCS#1
+`RSAPrivateKey` with its CRT fields, held in one of two backend entries
+with the Montgomery constants of its three moduli — about 22 KB of
+`.bss` for both entries and the one signing job — and a slot names the
+entry it holds. `STORE` admits any DER up to the width's reported
+ceiling, checks `p·q = n` and the CRT fields, and prepares the moduli;
+`PUBLIC` answers the `RSAPublicKey` DER at its exact length; `GENERATE`
+is `ENOSYS` — the vault imports RSA keys and never mints them. `SIGN` is
+RSASSA-PSS-SHA256 over a 32-byte digest with a 32-byte salt from the
+kernel's entropy, and it is the vault's one resumable operation: a private
+operation is milliseconds on the fastest target and the call runs inside
+the caller's step, so the first `SIGN` starts a job and answers `EAGAIN`
+after a bounded number of Montgomery rows, each further `SIGN` with the
+same digest advances it, and the last answers the signature; another slot
+or digest meanwhile is `EBUSY`. `VERIFY` is not extended to RSA: the tls
+module verifies peers in-module and nothing calls the vault with a
+certificate key.
+
 The backend is platform-overridable: the Linux platform registers a
 PKCS#11 HSM backend (`src/platform/linux/hsm_key_vault.rs`) when
 `FLUXOR_HSM_PKCS11_MODULE` is set at platform boot. It is compiled into
@@ -176,6 +195,37 @@ handle, and then wipes the in-module key bytes with volatile writes, so
 `CertificateVerify` signs only through the vault (`SIGN`). The in-module
 path is retained only as the explicit not-present fallback — a module
 arena dump on a vault-enabled build does not reveal the identity key.
+
+An RSA identity always signs through the vault: the module carries no RSA
+signer of its own, so on a target whose vault holds no RSA suite the
+instance refuses to construct, and the composer refuses the graph first
+from the target's `vault_suites` facts. The module reads the key in either
+PKCS#1 or PKCS#8 form and stores the PKCS#1 body; its CertificateVerify is
+`rsa_pss_rsae_sha256`, driven across steps by the vault's `EAGAIN`
+protocol with the same digest each call.
+
+Peer verification is a stepped job in every transport (tls, dtls, quic):
+the chain walk records each RSA or ECDSA link it accepts on shape and
+policy, and the handshake pump verifies them one at a time from the held
+Certificate message — an RSA exponentiation `rsa_rows_per_step` Montgomery
+rows per step on one job the instance owns, an ECDSA verification
+`ecdh_bits_per_step` ladder bits per step on the session's own ladders —
+with the peer's CertificateVerify checked the same way. A signature that
+does not verify fails the session with `CERT_ERR_SIGNATURE` and a log line
+naming the stage. The key exchange is stepped at the same budget: the
+P-256 and X25519 ladders advance `ecdh_bits_per_step` bits per step, and
+the P-256 result's affine conversion is a Fermat inversion folded in
+behind the ladder rather than one call. Verification inverts only public
+values and uses a binary extended Euclid for them.
+
+The MCU-class targets run the embedded profile of the module: one session,
+one DTLS peer, no continuity shadow, and P-256 as the only key-exchange
+group offered. The X25519 implementation there is a single unsteppable
+call, long enough on a Cortex-M33 to overrun any step budget, so the group
+is not offered rather than offered and unable to complete. What bounds a
+handshake on such a target is its ladders, which is why the step budget is
+expressed in ladder bits. An RSA chain verifies faster than an ECDSA one
+on that core.
 
 ## Entropy
 
@@ -380,7 +430,7 @@ No surface ever carries the key in the clear.
 
 `AEAD_SEAL` / `AEAD_OPEN` on a `suite::AEAD_KEY` slot are the vault-held
 sealing primitive: a fresh CSPRNG nonce per call, the key never leaving.
-The quic module's resumption tickets are its first consumer — the ticket
+The quic module's resumption tickets are what use it — the ticket
 is the session state sealed under a labelled vault key, two generations
 alternating by parity so rotation never strands a live ticket. The AAD
 binds a ticket to the generation that sealed it and to this boot's

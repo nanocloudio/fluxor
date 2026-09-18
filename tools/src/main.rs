@@ -33,6 +33,7 @@ mod gpu_contract;
 mod gpu_pack;
 mod hash;
 mod hygiene;
+mod identity_key;
 mod manifest;
 mod modules;
 mod modules_build;
@@ -185,8 +186,8 @@ fn main() {
                 other => other,
             };
             match replicas {
-                // `--replicas` = the old `up`: render the template per
-                // replica and spawn them side-by-side.
+                // `--replicas` renders the template once per replica and
+                // spawns them side-by-side.
                 Some(n) => match config.as_ref() {
                     Some(template) => up::cmd_up(template, n, base_port, http_offset, &vars, None),
                     None => Err(Error::Config(

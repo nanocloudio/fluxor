@@ -907,65 +907,173 @@ fn x25519_clamp(k: &mut [u8; 32]) {
     k[31] |= 64;
 }
 
-/// The Montgomery ladder of RFC 7748 §5 over the radix-51 field.
+/// The Montgomery ladder of RFC 7748 §5 over the radix-51 field, held
+/// across steps.
 ///
-/// `k` is consumed already clamped. `u` is the affine u-coordinate; per
-/// §5 its bit 255 is ignored on decode, which `fe_frombytes` already
-/// does. Returns the u-coordinate of `[k]·U`.
-///
-/// Constant-time in `k` and `u`: 255 fixed iterations, masked swaps, no
-/// data-dependent branch or load address.
-fn x25519_ladder(k: &[u8; 32], u: &Fe) -> Fe {
-    // a24 = (A - 2)/4 = 121665 for A = 486662. Small enough to be
-    // materialised as immediates; no .rodata pointer is taken.
-    let a24: Fe = [121665, 0, 0, 0, 0];
+/// `k` is kept already clamped. `u` is the affine u-coordinate; per §5
+/// its bit 255 is ignored on decode, which `fe_frombytes` already does.
+/// The ladder is constant-time in `k` and `u`: 255 fixed iterations,
+/// masked swaps, no data-dependent branch or load address. How many of
+/// those iterations one `step` covers is the caller's `bits_per_step`,
+/// the same budget the P-256 ladder is driven at, so a key agreement
+/// fits a tick on any core rather than costing one call of whatever the
+/// core takes.
+pub struct X25519State {
+    k: [u8; 32],
+    x1: Fe,
+    x2: Fe,
+    z2: Fe,
+    x3: Fe,
+    z3: Fe,
+    swap: u64,
+    /// Next ladder bit, 254 down to 0; -1 = done.
+    t: i16,
+    bits_per_step: u8,
+    initialised: u8,
+}
 
-    let x1 = *u;
-    let mut x2 = FE_ONE;
-    let mut z2 = FE_ZERO;
-    let mut x3 = *u;
-    let mut z3 = FE_ONE;
-    let mut swap: u64 = 0;
-
-    let mut t: i32 = 254;
-    while t >= 0 {
-        let bit = ((k[(t as usize) >> 3] >> ((t as usize) & 7)) & 1) as u64;
-        // mask is all-ones exactly when the accumulated swap state
-        // differs from the previous iteration's.
-        let mask = (swap ^ bit).wrapping_neg();
-        let nx2 = fe_select(&x2, &x3, mask);
-        let nx3 = fe_select(&x3, &x2, mask);
-        let nz2 = fe_select(&z2, &z3, mask);
-        let nz3 = fe_select(&z3, &z2, mask);
-        x2 = nx2;
-        x3 = nx3;
-        z2 = nz2;
-        z3 = nz3;
-        swap = bit;
-
-        let a = fe_add(&x2, &z2);
-        let aa = fe_sq(&a);
-        let b = fe_sub(&x2, &z2);
-        let bb = fe_sq(&b);
-        let e = fe_sub(&aa, &bb);
-        let c = fe_add(&x3, &z3);
-        let d = fe_sub(&x3, &z3);
-        let da = fe_mul(&d, &a);
-        let cb = fe_mul(&c, &b);
-        x3 = fe_sq(&fe_add(&da, &cb));
-        z3 = fe_mul(&x1, &fe_sq(&fe_sub(&da, &cb)));
-        x2 = fe_mul(&aa, &bb);
-        z2 = fe_mul(&e, &fe_add(&aa, &fe_mul(&a24, &e)));
-
-        t -= 1;
+impl X25519State {
+    pub const fn empty() -> Self {
+        Self {
+            k: [0; 32],
+            x1: FE_ZERO,
+            x2: FE_ZERO,
+            z2: FE_ZERO,
+            x3: FE_ZERO,
+            z3: FE_ZERO,
+            swap: 0,
+            t: -1,
+            bits_per_step: 0,
+            initialised: 0,
+        }
     }
 
-    // Final conditional swap for the last processed bit.
-    let mask = swap.wrapping_neg();
-    let fx2 = fe_select(&x2, &x3, mask);
-    let fz2 = fe_select(&z2, &z3, mask);
+    /// `[scalar]·U` for the wire-encoded `u`. `bits_per_step == 0` runs
+    /// the whole ladder in one `step`.
+    pub fn new(scalar: &[u8; 32], u_in: &[u8; 32], bits_per_step: u8) -> Self {
+        let mut k = *scalar;
+        x25519_clamp(&mut k);
+        let u = fe_frombytes(u_in);
+        Self {
+            k,
+            x1: u,
+            x2: FE_ONE,
+            z2: FE_ZERO,
+            x3: u,
+            z3: FE_ONE,
+            swap: 0,
+            t: 254,
+            bits_per_step,
+            initialised: 1,
+        }
+    }
 
-    fe_mul(&fx2, &fe_invert(&fz2))
+    /// `[scalar]·9`: the public key of `scalar`.
+    pub fn new_base(scalar: &[u8; 32], bits_per_step: u8) -> Self {
+        let mut base = [0u8; 32];
+        base[0] = 9;
+        Self::new(scalar, &base, bits_per_step)
+    }
+
+    pub fn is_initialised(&self) -> bool {
+        self.initialised != 0
+    }
+
+    pub fn complete(&self) -> bool {
+        self.initialised != 0 && self.t < 0
+    }
+
+    /// Advance by up to `bits_per_step` ladder bits. True once complete.
+    pub fn step(&mut self) -> bool {
+        if self.initialised == 0 {
+            return false;
+        }
+        let a24: Fe = [121665, 0, 0, 0, 0];
+        let mut remaining: i16 = if self.bits_per_step == 0 {
+            i16::MAX
+        } else {
+            self.bits_per_step as i16
+        };
+        while remaining > 0 && self.t >= 0 {
+            let t = self.t as usize;
+            let bit = ((self.k[t >> 3] >> (t & 7)) & 1) as u64;
+            // mask is all-ones exactly when the accumulated swap state
+            // differs from the previous iteration's.
+            let mask = (self.swap ^ bit).wrapping_neg();
+            let nx2 = fe_select(&self.x2, &self.x3, mask);
+            let nx3 = fe_select(&self.x3, &self.x2, mask);
+            let nz2 = fe_select(&self.z2, &self.z3, mask);
+            let nz3 = fe_select(&self.z3, &self.z2, mask);
+            self.x2 = nx2;
+            self.x3 = nx3;
+            self.z2 = nz2;
+            self.z3 = nz3;
+            self.swap = bit;
+
+            let a = fe_add(&self.x2, &self.z2);
+            let aa = fe_sq(&a);
+            let b = fe_sub(&self.x2, &self.z2);
+            let bb = fe_sq(&b);
+            let e = fe_sub(&aa, &bb);
+            let c = fe_add(&self.x3, &self.z3);
+            let d = fe_sub(&self.x3, &self.z3);
+            let da = fe_mul(&d, &a);
+            let cb = fe_mul(&c, &b);
+            self.x3 = fe_sq(&fe_add(&da, &cb));
+            self.z3 = fe_mul(&self.x1, &fe_sq(&fe_sub(&da, &cb)));
+            self.x2 = fe_mul(&aa, &bb);
+            self.z2 = fe_mul(&e, &fe_add(&aa, &fe_mul(&a24, &e)));
+
+            self.t -= 1;
+            remaining -= 1;
+        }
+        self.complete()
+    }
+
+    /// The u-coordinate of the result, encoded. Meaningful once `complete()`.
+    pub fn result(&self) -> [u8; 32] {
+        let mask = self.swap.wrapping_neg();
+        let fx2 = fe_select(&self.x2, &self.x3, mask);
+        let fz2 = fe_select(&self.z2, &self.z3, mask);
+        fe_tobytes(&fe_mul(&fx2, &fe_invert(&fz2)))
+    }
+
+    /// The result as a shared secret, with the RFC 7748 §6.1 check: `None`
+    /// for the all-zero value, which is what a small-order peer point
+    /// yields and carries none of our scalar.
+    pub fn shared_secret(&self) -> Option<[u8; 32]> {
+        let mut out = self.result();
+        let mut acc = 0u8;
+        let mut i = 0;
+        while i < 32 {
+            acc |= out[i];
+            i += 1;
+        }
+        if acc == 0 {
+            zeroize(&mut out);
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Scrub the scalar and the ladder registers.
+    pub fn zeroise(&mut self) {
+        zeroize(&mut self.k);
+        let mut i = 0;
+        while i < 5 {
+            // SAFETY: volatile writes to the five limbs of each register.
+            unsafe {
+                core::ptr::write_volatile(&mut self.x1[i], 0);
+                core::ptr::write_volatile(&mut self.x2[i], 0);
+                core::ptr::write_volatile(&mut self.z2[i], 0);
+                core::ptr::write_volatile(&mut self.x3[i], 0);
+                core::ptr::write_volatile(&mut self.z3[i], 0);
+            }
+            i += 1;
+        }
+        self.initialised = 0;
+        self.t = -1;
+    }
 }
 
 /// RFC 7748 §5 `X25519(k, u)` over wire encodings, with no output
@@ -975,12 +1083,11 @@ fn x25519_ladder(k: &[u8; 32], u: &Fe) -> Fe {
 /// iterated test. Key agreement must use `x25519_shared_secret`, which
 /// adds the check RFC 7748 §6.1 requires.
 pub fn x25519(scalar: &[u8; 32], u_in: &[u8; 32]) -> [u8; 32] {
-    let mut k = *scalar;
-    x25519_clamp(&mut k);
-    let u = fe_frombytes(u_in);
-    let r = x25519_ladder(&k, &u);
-    zeroize(&mut k);
-    fe_tobytes(&r)
+    let mut st = X25519State::new(scalar, u_in, 0);
+    st.step();
+    let out = st.result();
+    st.zeroise();
+    out
 }
 
 /// X25519 public key: `X25519(scalar, 9)`, RFC 7748 §6.1.
@@ -1003,16 +1110,9 @@ pub fn x25519_public_key(scalar: &[u8; 32]) -> [u8; 32] {
 /// which byte differed; it does reveal that the output was zero, which
 /// is the answer the caller asked for.
 pub fn x25519_shared_secret(scalar: &[u8; 32], peer_u: &[u8; 32]) -> Option<[u8; 32]> {
-    let mut out = x25519(scalar, peer_u);
-    let mut acc = 0u8;
-    let mut i = 0;
-    while i < 32 {
-        acc |= out[i];
-        i += 1;
-    }
-    if acc == 0 {
-        zeroize(&mut out);
-        return None;
-    }
-    Some(out)
+    let mut st = X25519State::new(scalar, peer_u, 0);
+    st.step();
+    let out = st.shared_secret();
+    st.zeroise();
+    out
 }

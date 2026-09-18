@@ -100,19 +100,28 @@ unsafe fn pump_derive_handshake_keys_core(
     bits_per_step: u8,
 ) -> Option<(TrafficKeys, TrafficKeys)> {
     let shared = if driver.group == GROUP_X25519 {
-        // One constant-time ladder, cheap enough to finish inside a
-        // single tick — there is no partial state to carry.
+        // The agreement ladder, `bits_per_step` bits per call, like the
+        // P-256 ladder below.
         if driver.peer_key_share_len as usize != X25519_SHARE_LEN {
             driver.hs_state = HandshakeState::Error;
             return None;
         }
-        let mut peer_u = [0u8; X25519_SHARE_LEN];
-        core::ptr::copy_nonoverlapping(
-            driver.peer_key_share.as_ptr(),
-            peer_u.as_mut_ptr(),
-            X25519_SHARE_LEN,
-        );
-        match x25519_shared_secret(&driver.x25519_private, &peer_u) {
+        if !driver.x25519_state.is_initialised() {
+            let mut peer_u = [0u8; X25519_SHARE_LEN];
+            core::ptr::copy_nonoverlapping(
+                driver.peer_key_share.as_ptr(),
+                peer_u.as_mut_ptr(),
+                X25519_SHARE_LEN,
+            );
+            driver.x25519_state = X25519State::new(&driver.x25519_private, &peer_u, bits_per_step);
+            return None;
+        }
+        if !driver.x25519_state.step() {
+            return None;
+        }
+        let shared = driver.x25519_state.shared_secret();
+        driver.x25519_state.zeroise();
+        match shared {
             Some(v) => v,
             None => {
                 // RFC 7748 §6.1 contributory behaviour: an all-zero
@@ -261,71 +270,6 @@ unsafe fn pump_recv_server_hello_core(driver: &mut HandshakeDriver) -> bool {
         t.update(hs_data);
     }
     driver.hs_state = HandshakeState::ClientDeriveHandshakeKeys;
-    true
-}
-
-/// Verify a peer's CertificateVerify message against the captured
-/// peer cert public key, update the transcript, and advance to the
-/// next state. Server-side (mTLS, verifying the client) goes to
-/// RecvClientFinished; client-side (verifying the server) goes to
-/// RecvFinished. Caller picks the next state via `driver.is_server`
-/// implicitly.
-unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) -> bool {
-    let (data, len, msg_type) = match driver.read_handshake_message() {
-        Some(t) => t,
-        None => return false,
-    };
-    if msg_type != HT_CERTIFICATE_VERIFY {
-        driver.hs_state = HandshakeState::Error;
-        return true;
-    }
-    if driver.peer_cert_pubkey_len == 0 {
-        driver.hs_state = HandshakeState::Error;
-        return true;
-    }
-    let hl = driver.suite.hash_len();
-    let transcript_hash = match &driver.transcript {
-        Some(t) => t.current_hash(),
-        None => {
-            driver.hs_state = HandshakeState::Error;
-            return true;
-        }
-    };
-    // We're verifying the OTHER side's CV. As server we're checking
-    // a client cert (mTLS); as client we're checking the server.
-    let context: &[u8] = if driver.is_server {
-        b"TLS 1.3, client CertificateVerify"
-    } else {
-        b"TLS 1.3, server CertificateVerify"
-    };
-    let mut vc = [0u8; 200];
-    let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut vc);
-    let vc_hash = sha256(&vc[..vc_len]);
-    let cv_body = &data[4..len];
-    let ok = if let Some(sig_der) =
-        parse_certificate_verify_expecting(cv_body, SIG_ECDSA_SECP256R1_SHA256)
-    {
-        if let Some(raw_sig) = parse_der_signature(sig_der) {
-            let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
-            ecdsa_verify(pk, &vc_hash, &raw_sig)
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if !ok {
-        driver.hs_state = HandshakeState::Error;
-        return true;
-    }
-    if let Some(ref mut t) = driver.transcript {
-        t.update(&data[..len]);
-    }
-    driver.hs_state = if driver.is_server {
-        HandshakeState::RecvClientFinished
-    } else {
-        HandshakeState::RecvFinished
-    };
     true
 }
 

@@ -164,7 +164,14 @@ unsafe fn dtls_pump_session(s: &mut TlsState, idx: usize) -> bool {
             pump_send_hello_retry_core(&mut s.peer_sessions[idx].endpoint.driver)
         }
         HandshakeState::SendServerHello => {
-            pump_send_server_hello_core(&mut s.peer_sessions[idx].endpoint.driver)
+            let sys = &*s.syscalls;
+            let bits_per_step = ec_bits_per_step(s);
+            let driver = &mut s.peer_sessions[idx].endpoint.driver;
+            if driver.group == GROUP_X25519 && !x25519_keygen_step(sys, driver, bits_per_step) {
+                true
+            } else {
+                pump_send_server_hello_core(driver)
+            }
         }
         HandshakeState::DeriveHandshakeKeys => dtls_pump_derive_handshake_keys(s, idx),
         HandshakeState::SendEncryptedExtensions => dtls_pump_send_encrypted_extensions(s, idx),
@@ -194,6 +201,9 @@ unsafe fn dtls_pump_session(s: &mut TlsState, idx: usize) -> bool {
         HandshakeState::RecvCertificate => dtls_pump_recv_certificate(s, idx),
         HandshakeState::RecvCertificateVerify => {
             pump_recv_certificate_verify_core(&mut s.peer_sessions[idx].endpoint.driver)
+        }
+        HandshakeState::VerifyChain | HandshakeState::VerifyPeerSignature => {
+            dtls_pump_rsa_verify(s, idx)
         }
         HandshakeState::RecvFinished => {
             pump_recv_server_finished_core(&mut s.peer_sessions[idx].endpoint.driver)
@@ -280,7 +290,7 @@ unsafe fn dtls_pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // X25519 first, for the same reason as the TLS-over-TCP server: the
     // agreement scalar stays out of P-256's variable-time arithmetic.
     match (ch.key_share_x25519, ch.key_share) {
-        (Some(key_data), _) if key_data.len() == X25519_SHARE_LEN => {
+        (Some(key_data), _) if X25519_OFFERED && key_data.len() == X25519_SHARE_LEN => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 driver.peer_key_share.as_mut_ptr(),
@@ -288,10 +298,6 @@ unsafe fn dtls_pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
             );
             driver.peer_key_share_len = X25519_SHARE_LEN as u8;
             driver.group = GROUP_X25519;
-            if !driver_gen_x25519(sys, driver) {
-                driver.hs_state = HandshakeState::Error;
-                return true;
-            }
         }
         (_, Some((_, key_data))) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
@@ -374,6 +380,56 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
     // Sign via kernel KEY_VAULT when the identity key is held there; fall
     // back to the in-module signer on ENOSYS.
     const KV_SIGN: u32 = 0x1003;
+    if s.identity_rsa_suite != 0 {
+        // RSASSA-PSS-SHA256 from the vault's resumable job: the same digest
+        // each call until it answers, since the transcript does not move.
+        const SIGN_MODE_DIGEST: u8 = 1;
+        let mut sig = [0u8; RSA_BYTES_MAX];
+        let mut sign_arg = [0u8; 6 + 32 + 12];
+        sign_arg[0] = SIGN_MODE_DIGEST;
+        sign_arg[2..6].copy_from_slice(&32u32.to_le_bytes());
+        sign_arg[6..38].copy_from_slice(&vc_hash);
+        let sig_ptr = sig.as_mut_ptr() as u64;
+        sign_arg[38..46].copy_from_slice(&sig_ptr.to_le_bytes());
+        sign_arg[46..48].copy_from_slice(&(RSA_BYTES_MAX as u16).to_le_bytes());
+        let rc = if s.key_vault_handle >= 0 {
+            (sys.provider_call)(
+                s.key_vault_handle,
+                KV_SIGN,
+                sign_arg.as_mut_ptr(),
+                sign_arg.len(),
+            )
+        } else {
+            -1
+        };
+        if rc == abi::errno::EAGAIN || rc == abi::errno::EBUSY {
+            // In progress, or another peer's signature holds the vault's
+            // one job: either way, come back next step.
+            return true;
+        }
+        if rc != 0 {
+            s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+        let sig_len = u16::from_le_bytes([sign_arg[48], sign_arg[49]]) as usize;
+        let driver = &mut s.peer_sessions[idx].endpoint.driver;
+        let msg_len = build_certificate_verify(
+            SIG_RSA_PSS_RSAE_SHA256,
+            &sig[..sig_len],
+            sig_len,
+            &mut driver.scratch,
+        );
+        if let Some(ref mut t) = driver.transcript {
+            t.update(&driver.scratch[..msg_len]);
+        }
+        let mut local = [0u8; SCRATCH_SIZE];
+        core::ptr::copy_nonoverlapping(driver.scratch.as_ptr(), local.as_mut_ptr(), msg_len);
+        if !driver.write_handshake_message(&local[..msg_len]) {
+            return false;
+        }
+        driver.hs_state = HandshakeState::SendFinished;
+        return true;
+    }
     let mut raw_sig = [0u8; 64];
     let mut signed_via_vault = false;
     if s.key_vault_handle >= 0 {
@@ -428,7 +484,12 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
 
     let (der_sig, der_len) = encode_der_signature(&raw_sig);
     let driver = &mut s.peer_sessions[idx].endpoint.driver;
-    let msg_len = build_certificate_verify(&der_sig, der_len, &mut driver.scratch);
+    let msg_len = build_certificate_verify(
+        SIG_ECDSA_SECP256R1_SHA256,
+        &der_sig,
+        der_len,
+        &mut driver.scratch,
+    );
     if let Some(ref mut t) = driver.transcript {
         t.update(&driver.scratch[..msg_len]);
     }
@@ -468,6 +529,7 @@ unsafe fn dtls_pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     };
     let mut sni_buf = [0u8; MAX_EXPECTED_DNS];
     core::ptr::copy_nonoverlapping(s.expected_dns.as_ptr(), sni_buf.as_mut_ptr(), sni_len);
+    let bits_per_step = ec_bits_per_step(s);
     let driver = &mut s.peer_sessions[idx].endpoint.driver;
     let mut random = [0u8; 32];
     dev_csprng_fill(sys, random.as_mut_ptr(), 32);
@@ -476,15 +538,19 @@ unsafe fn dtls_pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     driver.peer_session_id = session_id;
     driver.peer_session_id_len = 32;
 
-    if !driver_gen_x25519(sys, driver) {
-        return false;
+    if X25519_OFFERED && !x25519_keygen_step(sys, driver, bits_per_step) {
+        return true;
     }
     let x25519_pub = driver.x25519_public;
     let msg_len = build_client_hello_sni(
         &random,
         &session_id,
         &driver.ecdh_public,
-        Some(&x25519_pub),
+        if X25519_OFFERED {
+            Some(&x25519_pub)
+        } else {
+            None
+        },
         &[],
         &[],
         &sni_buf[..sni_len],
@@ -541,7 +607,12 @@ unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
     // The same acceptance decision the TCP path makes, from the same module
     // policy: a datagram transport does not get a weaker peer identity.
     let body = &data[4..len];
-    let mut rc = peer_cert_reason(s, is_server, body);
+    let mut deferred = core::mem::replace(
+        &mut s.peer_sessions[idx].endpoint.driver.deferred_links,
+        DeferredLinks::empty(),
+    );
+    let mut rc = peer_cert_reason(s, is_server, body, Some(&mut deferred));
+    s.peer_sessions[idx].endpoint.driver.deferred_links = deferred;
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.peer_sessions[idx].endpoint.driver, body);
     }
@@ -553,8 +624,46 @@ unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
         return true;
     }
     s.last_peer_auth_error = CERT_OK;
-    s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::RecvCertificateVerify;
+    after_peer_cert(
+        &mut s.peer_sessions[idx].endpoint.driver,
+        &data[..len],
+        HandshakeState::RecvCertificateVerify,
+    );
     true
+}
+
+/// Drive the instance job for a DTLS peer in `VerifyChain` or
+/// `VerifyPeerSignature`.
+unsafe fn dtls_pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
+    let owner = RSA_OWNER_DTLS + idx as i32;
+    if !rsa_job_available(s, owner) {
+        return false;
+    }
+    s.rsa_owner = owner;
+    let rows = rsa_rows(s);
+    let anchor = core::slice::from_raw_parts(s.anchor.as_ptr(), s.anchor_len);
+    let job: *mut RsaVerifyJob = &mut s.rsa_verify;
+    let ec_bits = ec_bits_per_step(s);
+    let outcome = rsa_verify_pump_core(
+        &mut s.peer_sessions[idx].endpoint.driver,
+        &mut *job,
+        anchor,
+        rows,
+        ec_bits,
+    );
+    match outcome {
+        RsaPump::Progress => true,
+        RsaPump::Done => {
+            s.rsa_owner = -1;
+            true
+        }
+        RsaPump::Failed => {
+            s.rsa_owner = -1;
+            log_peer_auth_failure(s, idx as u16, CERT_ERR_SIGNATURE);
+            s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
+            true
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -749,12 +858,10 @@ unsafe fn dtls_emit_ack(s: &mut TlsState, idx: usize, acked: (u64, u64)) {
     if n == 0 {
         return;
     }
-    // `encrypt_dtls_record` advances `send_state.send_seq` for us;
-    // a manual bump here would double-count and emit the next
-    // outbound record with a seq one ahead of the unified-header
-    // value the peer just saw. Caught by the audit pass — first
-    // version had `send_state.send_seq += 1` here on top of the
-    // increment inside encrypt_dtls_record.
+    // `encrypt_dtls_record` advances `send_state.send_seq` for us, so
+    // there is deliberately no manual bump here: one would double-count
+    // and emit the next outbound record with a seq one ahead of the
+    // unified-header value the peer just saw.
     let peer = s.peer_sessions[idx].peer;
     dtls_send_datagram(
         sys,

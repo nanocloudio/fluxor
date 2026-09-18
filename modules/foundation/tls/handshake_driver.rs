@@ -1,5 +1,4 @@
-// Record-agnostic handshake driver (Phase A of
-// docs/architecture/datagram_secure_transports.md).
+// Record-agnostic handshake driver.
 //
 // Owns every piece of TLS 1.3 handshake state that does NOT depend on
 // the record layer: the state machine cursor, key schedule, transcript,
@@ -9,7 +8,7 @@
 // Excluded — and left in `TlsSession` — is everything record-coupled:
 // the inbound/outbound record buffers, the AEAD traffic keys (`read_keys`
 // / `write_keys`), the retx buffer, and the net_proto session state.
-// DTLS (Phase B) and QUIC (Phase C) reuse this driver verbatim and
+// TLS-over-TCP, DTLS-over-UDP and QUIC all drive this one driver and
 // supply their own record / packet protection layers.
 
 /// Encryption levels exposed by TLS 1.3 (RFC 8446 §7.1) and consumed by
@@ -49,6 +48,11 @@ pub const HS_IN_BUF_SIZE: usize = SCRATCH_SIZE + HS_RECORD_PLAINTEXT_MAX;
 /// queue only has to hold one message at a time.
 pub const HS_OUT_BUF_SIZE: usize = SCRATCH_SIZE;
 
+/// The widest peer subject key an implemented suite carries: an RSA-4096
+/// RSAPublicKey. Sized by the suite registry so a new suite cannot be
+/// admitted without room for its key.
+pub const PEER_KEY_MAX: usize = suite::max_public_key_len(suite::RSA_4096);
+
 const _: () = assert!(HS_IN_BUF_SIZE >= SCRATCH_SIZE + HS_RECORD_PLAINTEXT_MAX);
 const _: () = assert!(HS_OUT_BUF_SIZE >= SCRATCH_SIZE);
 
@@ -78,6 +82,12 @@ pub struct HandshakeDriver {
     /// pre-clamped copy would only give the same scalar two encodings.
     pub x25519_private: [u8; 32],
     pub x25519_public: [u8; 32],
+    /// The X25519 ladder in flight: the key pair before the hello that
+    /// carries the share, the agreement after the peer's. Stepped at the
+    /// same bit budget as the P-256 ladder.
+    pub x25519_state: X25519State,
+    /// Whether `x25519_public` holds the key pair this handshake offers.
+    pub x25519_pub_ready: u8,
 
     /// Negotiated named group — `GROUP_X25519` or `GROUP_SECP256R1`.
     /// Chosen by the server from what the client offered, echoed to the
@@ -94,8 +104,35 @@ pub struct HandshakeDriver {
     pub cert_verify_hash: [u8; 32],
     pub cert_verify_hash_ready: u8,
 
-    pub peer_cert_pubkey: [u8; 65],
-    pub peer_cert_pubkey_len: u8,
+    pub peer_cert_pubkey: [u8; PEER_KEY_MAX],
+    pub peer_cert_pubkey_len: u16,
+    /// The suite the peer's leaf key belongs to, which decides which
+    /// CertificateVerify schemes it may sign with and how its bytes are read.
+    pub peer_cert_key_suite: u16,
+
+    /// RSA signatures the chain walk deferred to the instance's stepped
+    /// job, and the CertificateVerify awaiting the same job. While either
+    /// is pending the received message is held in `scratch` (its length in
+    /// `held_len`), because the job reads the signature and the signed
+    /// bytes from there across ticks.
+    pub deferred_links: DeferredLinks,
+    /// The ECDSA half of the same job: per driver, since it is two ladder
+    /// states rather than kilobytes.
+    pub ecdsa_verify: EcdsaVerifyJob,
+    pub held_len: u16,
+    /// Whether the instance job currently holds this driver's work.
+    pub rsa_job_active: u8,
+    /// Pump calls the deferred verification has taken so far, for the
+    /// line that reports it.
+    pub verify_steps: u16,
+    /// The CertificateVerify scheme, signature span and content hash the
+    /// job verifies.
+    pub cv_scheme: u16,
+    pub cv_sig_off: u16,
+    pub cv_sig_len: u16,
+    pub cv_hash: [u8; 48],
+    /// Where the driver goes once the job is done.
+    pub after_verify: HandshakeState,
     pub peer_session_id: [u8; 32],
     pub peer_session_id_len: u8,
 
@@ -116,16 +153,20 @@ pub struct HandshakeDriver {
     pub hs_accum_len: usize,
     pub scratch: [u8; SCRATCH_SIZE],
 
-    /// Plaintext input queue — record/transport layer fills this with
+    /// Plaintext input queue — the record/transport layer fills this with
     /// post-decrypt handshake bytes (or pre-encryption plaintext for
-    /// Initial-level records). Driver consumes via `feed_handshake` /
-    /// `recv_handshake_message`. Reserved for Phase B (DTLS) / C (QUIC).
+    /// Initial-level records), and the driver consumes it via
+    /// `read_handshake_message`. This queue and `out_buf` are the only
+    /// handshake-driver entry points any transport sees: the TLS record
+    /// bridge, the DTLS record bridge and QUIC's CRYPTO frames all meet
+    /// the state machine here.
     pub in_buf: [u8; HS_IN_BUF_SIZE],
     pub in_len: usize,
 
-    /// Plaintext output queue — driver writes ready-to-emit handshake
-    /// bytes here; record/transport layer drains via `poll_handshake`.
-    /// Reserved for Phase B / C.
+    /// Plaintext output queue — the driver writes ready-to-emit handshake
+    /// bytes here via `write_handshake_message`, and the record/transport
+    /// layer drains whole messages from the head, fragmenting them to fit
+    /// its own records or packets.
     pub out_buf: [u8; HS_OUT_BUF_SIZE],
     pub out_len: usize,
 }
@@ -147,12 +188,25 @@ impl HandshakeDriver {
             peer_key_share_len: 0,
             x25519_private: [0; 32],
             x25519_public: [0; 32],
+            x25519_state: X25519State::empty(),
+            x25519_pub_ready: 0,
             group: GROUP_SECP256R1,
             ecdsa_sign_state: EcdsaSignState::empty(),
             cert_verify_hash: [0; 32],
             cert_verify_hash_ready: 0,
-            peer_cert_pubkey: [0; 65],
+            peer_cert_pubkey: [0; PEER_KEY_MAX],
             peer_cert_pubkey_len: 0,
+            peer_cert_key_suite: suite::UNKNOWN,
+            deferred_links: DeferredLinks::empty(),
+            ecdsa_verify: EcdsaVerifyJob::empty(),
+            held_len: 0,
+            rsa_job_active: 0,
+            verify_steps: 0,
+            cv_scheme: 0,
+            cv_sig_off: 0,
+            cv_sig_len: 0,
+            cv_hash: [0; 48],
+            after_verify: HandshakeState::Error,
             peer_session_id: [0; 32],
             peer_session_id_len: 0,
             server_random: [0; 32],
@@ -187,12 +241,24 @@ impl HandshakeDriver {
         self.peer_key_share_len = 0;
         self.group = GROUP_SECP256R1;
         self.peer_cert_pubkey_len = 0;
+        self.peer_cert_key_suite = suite::UNKNOWN;
+        self.deferred_links.clear();
+        self.ecdsa_verify = EcdsaVerifyJob::empty();
+        self.held_len = 0;
+        self.rsa_job_active = 0;
+        self.cv_scheme = 0;
+        self.cv_sig_off = 0;
+        self.cv_sig_len = 0;
+        self.after_verify = HandshakeState::Error;
         self.alpn_selected_len = 0;
         self.peer_session_id_len = 0;
         self.in_len = 0;
         self.out_len = 0;
         self.ecdh_state.zeroise_scalar();
         self.ecdh_state = ScalarMulState::empty();
+        self.x25519_state.zeroise();
+        self.x25519_state = X25519State::empty();
+        self.x25519_pub_ready = 0;
         self.ecdsa_sign_state.zeroise_secrets();
         self.ecdsa_sign_state = EcdsaSignState::empty();
         for byte in &mut self.cert_verify_hash {
@@ -211,9 +277,9 @@ impl HandshakeDriver {
     ///
     /// Returns the number of bytes accepted; on overflow returns less
     /// than `bytes.len()` and the caller is responsible for retrying.
-    /// Phase B (DTLS) is the first consumer; TLS-over-TCP currently
-    /// drives the handshake via the legacy `recv_buf` path inside
-    /// `recv_encrypted_handshake`.
+    /// The DTLS record bridge and QUIC's CRYPTO reassembler enter here;
+    /// the TLS-over-TCP bridge appends to `in_buf` directly, having
+    /// already settled capacity before it moved any AEAD sequence.
     pub fn feed_handshake(&mut self, _level: EncLevel, bytes: &[u8]) -> usize {
         let space = HS_IN_BUF_SIZE - self.in_len;
         let n = if bytes.len() < space {
@@ -240,8 +306,9 @@ impl HandshakeDriver {
     /// Drain up to `out.len()` ready-to-emit handshake bytes into `out`.
     /// Returns the number of bytes written. The level parameter is
     /// informational; the driver knows internally what level it is at.
-    /// Phase B / C consumer; the legacy TLS path emits records via
-    /// `send_encrypted_handshake` directly.
+    /// A copying drain for a transport that wants the bytes in its own
+    /// buffer; the TLS, DTLS and QUIC bridges instead frame messages in
+    /// place from the head of `out_buf`.
     pub fn poll_handshake(&mut self, _level: EncLevel, out: &mut [u8]) -> usize {
         if self.out_len == 0 {
             return 0;
@@ -393,5 +460,264 @@ impl HandshakeDriver {
         );
         self.out_len += msg.len();
         true
+    }
+}
+
+// ── Peer verification shared by every transport ──────────────────────
+//
+// tls, dtls and quic mount this file; the CertificateVerify check, the
+// peer-key binding and the stepped RSA pump live here so the three cannot
+// drift apart on what a peer has to prove.
+
+/// Verify a peer's CertificateVerify message against the captured
+/// peer cert public key, update the transcript, and advance to the
+/// next state. Server-side (mTLS, verifying the client) goes to
+/// RecvClientFinished; client-side (verifying the server) goes to
+/// RecvFinished. Caller picks the next state via `driver.is_server`
+/// implicitly.
+pub unsafe fn pump_recv_certificate_verify_core(driver: &mut HandshakeDriver) -> bool {
+    let (data, len, msg_type) = match driver.read_handshake_message() {
+        Some(t) => t,
+        None => return false,
+    };
+    if msg_type != HT_CERTIFICATE_VERIFY {
+        driver.hs_state = HandshakeState::Error;
+        return true;
+    }
+    if driver.peer_cert_pubkey_len == 0 {
+        driver.hs_state = HandshakeState::Error;
+        return true;
+    }
+    let hl = driver.suite.hash_len();
+    let transcript_hash = match &driver.transcript {
+        Some(t) => t.current_hash(),
+        None => {
+            driver.hs_state = HandshakeState::Error;
+            return true;
+        }
+    };
+    // We're verifying the OTHER side's CV. As server we're checking
+    // a client cert (mTLS); as client we're checking the server.
+    let context: &[u8] = if driver.is_server {
+        b"TLS 1.3, client CertificateVerify"
+    } else {
+        b"TLS 1.3, server CertificateVerify"
+    };
+    let mut vc = [0u8; 200];
+    let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut vc);
+    let cv_body = &data[4..len];
+    // The announced scheme must be one the peer's key may sign with; the
+    // content is hashed under that scheme's digest.
+    let Some((announced, sig)) = parse_certificate_verify(cv_body) else {
+        driver.hs_state = HandshakeState::Error;
+        return true;
+    };
+    let Some(scheme) = scheme_for_peer_key(driver.peer_cert_key_suite, announced) else {
+        driver.hs_state = HandshakeState::Error;
+        return true;
+    };
+    let next = if driver.is_server {
+        HandshakeState::RecvClientFinished
+    } else {
+        HandshakeState::RecvFinished
+    };
+    // The signature check is a stepped job — RSA-PSS on the instance's
+    // exponentiation, ECDSA on the driver's ladders — so the message is
+    // held in `scratch`: the job reads the signature from it and the
+    // transcript takes the message once it verifies.
+    if scheme_hash_len(scheme) == 48 {
+        driver.cv_hash[..48].copy_from_slice(&sha384(&vc[..vc_len]));
+    } else {
+        driver.cv_hash[..32].copy_from_slice(&sha256(&vc[..vc_len]));
+    }
+    let sig_off = 4 + (sig.as_ptr() as usize - cv_body.as_ptr() as usize);
+    driver.scratch[..len].copy_from_slice(&data[..len]);
+    driver.held_len = len as u16;
+    driver.cv_scheme = scheme;
+    driver.cv_sig_off = sig_off as u16;
+    driver.cv_sig_len = sig.len() as u16;
+    driver.rsa_job_active = 0;
+    driver.after_verify = next;
+    driver.verify_steps = 0;
+    driver.hs_state = HandshakeState::VerifyPeerSignature;
+    true
+}
+
+/// Bind the accepted leaf's subject public key and its suite to `driver`.
+/// Called only after the chain was accepted, so downstream code's use of
+/// `peer_cert_pubkey_len > 0` as the marker that a real identity was bound
+/// stays true.
+pub unsafe fn bind_peer_cert_key_core(driver: &mut HandshakeDriver, cert_der: &[u8]) -> u32 {
+    let cert = match parse_certificate(cert_der) {
+        Some(c) => c,
+        None => return CERT_ERR_MALFORMED,
+    };
+    let pk = cert.public_key;
+    if !key_is_valid(cert.key_suite, pk) || pk.len() > PEER_KEY_MAX {
+        return CERT_ERR_BAD_KEY;
+    }
+    driver.peer_cert_pubkey[..pk.len()].copy_from_slice(pk);
+    driver.peer_cert_pubkey_len = pk.len() as u16;
+    driver.peer_cert_key_suite = cert.key_suite;
+    CERT_OK
+}
+
+/// What one step of the instance job did for a driver.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RsaPump {
+    /// Still going, or waiting for the job.
+    Progress,
+    /// Every deferred signature verified; the driver has moved to
+    /// `after_verify`.
+    Done,
+    /// A signature did not verify.
+    Failed,
+}
+
+/// Drive the verify jobs for `driver`, which is in `VerifyChain`
+/// (deferred chain links, read from the held message and `anchor`) or
+/// `VerifyPeerSignature` (the held CertificateVerify). An RSA signature
+/// spends up to `rows` units of the instance job `job`; an ECDSA one spends
+/// one `ec_bits`-bit step of the driver's own ladders. The caller has
+/// already decided this driver may use the instance job.
+pub unsafe fn rsa_verify_pump_core(
+    driver: &mut HandshakeDriver,
+    job: &mut RsaVerifyJob,
+    anchor: &[u8],
+    rows: usize,
+    ec_bits: u8,
+) -> RsaPump {
+    let held = driver.held_len as usize;
+    if !(4..=SCRATCH_SIZE).contains(&held) {
+        return RsaPump::Failed;
+    }
+    driver.verify_steps = driver.verify_steps.wrapping_add(1);
+    match driver.hs_state {
+        HandshakeState::VerifyChain => {
+            if !driver.deferred_links.pending() {
+                driver.hs_state = driver.after_verify;
+                driver.held_len = 0;
+                return RsaPump::Done;
+            }
+            let link = driver.deferred_links.links[driver.deferred_links.next as usize];
+            let ecdsa = link.sig_suite == suite::ECDSA_P256_SHA256;
+            if driver.rsa_job_active == 0 {
+                let message = &driver.scratch[4..held];
+                let Some((tbs, sig, key_bytes)) = deferred_link_bytes(&link, message, anchor)
+                else {
+                    return RsaPump::Failed;
+                };
+                if ecdsa {
+                    let Some(raw) = parse_der_signature(sig) else {
+                        return RsaPump::Failed;
+                    };
+                    let Some(started) = ecdsa_verify_init(key_bytes, &sha256(tbs), &raw, ec_bits)
+                    else {
+                        return RsaPump::Failed;
+                    };
+                    driver.ecdsa_verify = started;
+                } else {
+                    let Some(key) = rsa_public_key_parse(key_bytes) else {
+                        return RsaPump::Failed;
+                    };
+                    if !job.start(key.n, key.e, sig) {
+                        return RsaPump::Failed;
+                    }
+                }
+                driver.rsa_job_active = 1;
+            }
+            let ok = if ecdsa {
+                if !driver.ecdsa_verify.step() {
+                    return RsaPump::Progress;
+                }
+                ecdsa_verify_finalise(&driver.ecdsa_verify)
+            } else {
+                if job.step(rows) == RsaStep::Pending {
+                    return RsaPump::Progress;
+                }
+                let message = &driver.scratch[4..held];
+                deferred_link_rsa_check(&link, message, job.encoded_message())
+            };
+            driver.rsa_job_active = 0;
+            if !ok {
+                return RsaPump::Failed;
+            }
+            driver.deferred_links.next += 1;
+            if driver.deferred_links.pending() {
+                return RsaPump::Progress;
+            }
+            driver.hs_state = driver.after_verify;
+            driver.held_len = 0;
+            RsaPump::Done
+        }
+        HandshakeState::VerifyPeerSignature => {
+            let ecdsa = driver.cv_scheme == SIG_ECDSA_SECP256R1_SHA256;
+            if driver.rsa_job_active == 0 {
+                let Some(sig) = driver.scratch.get(
+                    driver.cv_sig_off as usize..(driver.cv_sig_off + driver.cv_sig_len) as usize,
+                ) else {
+                    return RsaPump::Failed;
+                };
+                let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
+                if ecdsa {
+                    let Some(raw) = parse_der_signature(sig) else {
+                        return RsaPump::Failed;
+                    };
+                    let Some(started) = ecdsa_verify_init(pk, &driver.cv_hash[..32], &raw, ec_bits)
+                    else {
+                        return RsaPump::Failed;
+                    };
+                    driver.ecdsa_verify = started;
+                } else {
+                    let Some(key) = rsa_public_key_parse(pk) else {
+                        return RsaPump::Failed;
+                    };
+                    if !job.start(key.n, key.e, sig) {
+                        return RsaPump::Failed;
+                    }
+                }
+                driver.rsa_job_active = 1;
+            }
+            let ok = if ecdsa {
+                if !driver.ecdsa_verify.step() {
+                    return RsaPump::Progress;
+                }
+                ecdsa_verify_finalise(&driver.ecdsa_verify)
+            } else {
+                if job.step(rows) == RsaStep::Pending {
+                    return RsaPump::Progress;
+                }
+                let pk = &driver.peer_cert_pubkey[..driver.peer_cert_pubkey_len as usize];
+                let Some(key) = rsa_public_key_parse(pk) else {
+                    return RsaPump::Failed;
+                };
+                let hl = scheme_hash_len(driver.cv_scheme);
+                let hash = if hl == 48 {
+                    RsaHash::Sha384
+                } else {
+                    RsaHash::Sha256
+                };
+                rsa_pss_verify(
+                    hash,
+                    &driver.cv_hash[..hl],
+                    job.encoded_message(),
+                    rsa_public_key_bits(&key),
+                )
+            };
+            driver.rsa_job_active = 0;
+            if !ok {
+                return RsaPump::Failed;
+            }
+            // The message the transcript takes is the one that verified.
+            let mut held_msg = [0u8; SCRATCH_SIZE];
+            held_msg[..held].copy_from_slice(&driver.scratch[..held]);
+            if let Some(ref mut t) = driver.transcript {
+                t.update(&held_msg[..held]);
+            }
+            driver.hs_state = driver.after_verify;
+            driver.held_len = 0;
+            RsaPump::Done
+        }
+        _ => RsaPump::Failed,
     }
 }

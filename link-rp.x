@@ -3,12 +3,12 @@
  * The MEMORY block comes from the per-silicon `memory-rp*.x` that build.rs
  * emits as `memory.x`, so flash and RAM bounds stay in one place.
  *
- * # Validated, as far as a script can be without the real image
+ * # What the layout guarantees
  *
- * Linked against a stub object and checked: the entry point resolves to
- * `Reset`, vector 0 is an 8-byte-aligned stack pointer inside RAM, vector 1
- * carries its Thumb bit, and `__sdata`/`__edata`/`__sidata`/`__sbss`/`__ebss`
- * come out consistent. Those are exactly the properties
+ * The entry point resolves to `Reset`, vector 0 is an 8-byte-aligned stack
+ * pointer inside RAM, vector 1 carries its Thumb bit, and
+ * `__sdata`/`__edata`/`__sidata`/`__sbss`/`__ebss` come out consistent.
+ * Those are exactly the properties
  * `tools/img/verify_boot_image.py` checks in a built image, so the script and
  * the gate agree on what correct means.
  *
@@ -124,7 +124,9 @@ SECTIONS
     {
         . = ALIGN(4);
         *(.uninit .uninit.*);
-        . = ALIGN(4);
+        . = ALIGN(8);
+        /* One past the last static byte: where the stack may grow down to. */
+        __stack_limit = .;
     } > RAM
 
     /* The end marker the image tools look for. */

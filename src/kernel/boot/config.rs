@@ -399,10 +399,10 @@ unsafe fn decode_slot_header(base: *const u8, own_digest: &[u8; 32]) -> Option<S
     // An A/B slot always carries a real module-table length written by the
     // packer; the smallest possible table is its 16-byte header. A
     // `modules_size` below that is a torn/corrupt slot — reject it rather than
-    // letting `init()` treat 0 as the trailer's "legacy unknown length"
-    // sentinel and fall back to the MAX_MODULES_BLOB_SIZE bound, which would
-    // let a corrupt table escape the slot aperture. (The legacy trailer, which
-    // has no length field, keeps 0 = unknown — see read_layout_from_trailer.)
+    // letting `init()` treat 0 as the "length unknown" sentinel and fall back
+    // to the MAX_MODULES_BLOB_SIZE bound, which would let a corrupt table
+    // escape the slot aperture. (The firmware trailer carries no length
+    // field, so it keeps 0 = unknown — see read_layout_from_trailer.)
     if modules_size < 16 {
         return None;
     }
@@ -471,7 +471,7 @@ fn read_layout_from_trailer() -> Option<FlashLayout> {
 
         Some(FlashLayout {
             modules_addr,
-            // The legacy trailer has no module-table length field; 0 tells
+            // The firmware trailer carries no module-table length; 0 tells
             // the loader to fall back to the MAX_MODULES_BLOB_SIZE cap and
             // validate internal consistency against the table's own
             // total_size.

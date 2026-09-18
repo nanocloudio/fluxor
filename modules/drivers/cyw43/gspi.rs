@@ -217,7 +217,7 @@ pub unsafe fn txn_read(s: &mut Cyw43State, function: u32, address: u32, read_len
         return -1;
     }
 
-    if read_len > 1500 {
+    if read_len > MAX_FRAME_SIZE {
         return -2;
     }
 

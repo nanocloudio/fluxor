@@ -16,6 +16,8 @@ const TAG_BIT_STRING: u8 = 0x03;
 const TAG_OCTET_STRING: u8 = 0x04;
 const TAG_BOOLEAN: u8 = 0x01;
 const TAG_OID: u8 = 0x06;
+/// ASN.1 NULL, the explicit `parameters` of an RSA AlgorithmIdentifier.
+const TAG_NULL: u8 = 0x05;
 const TAG_UTC_TIME: u8 = 0x17;
 const TAG_GENERALIZED_TIME: u8 = 0x18;
 const TAG_CONTEXT_0: u8 = 0xA0;
@@ -63,6 +65,17 @@ const OID_ECDSA_SHA384: [u8; 8] = [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x0
 /// key and the signature — there is no separate hash to name.
 const OID_ED25519: [u8; 3] = [0x2B, 0x65, 0x70];
 
+/// OID for rsaEncryption: 1.2.840.113549.1.1.1. An RSA key's
+/// AlgorithmIdentifier carries an explicit NULL `parameters`.
+const OID_RSA_ENCRYPTION: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+/// OID for sha256WithRSAEncryption: 1.2.840.113549.1.1.11.
+const OID_SHA256_WITH_RSA: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B];
+/// OID for sha384WithRSAEncryption: 1.2.840.113549.1.1.12.
+const OID_SHA384_WITH_RSA: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C];
+/// OID for id-RSASSA-PSS: 1.2.840.113549.1.1.10. Named so the log can say
+/// what it met; not verified.
+const OID_RSASSA_PSS: [u8; 9] = [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A];
+
 /// OIDs for ML-DSA (FIPS 204), 2.16.840.1.101.3.4.3.17/18/19.
 const OID_ML_DSA_44: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11];
 const OID_ML_DSA_65: [u8; 9] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
@@ -96,9 +109,22 @@ pub mod suite {
     pub const ML_DSA_44: u16 = 4;
     pub const ML_DSA_65: u16 = 5;
     pub const ML_DSA_87: u16 = 6;
+    /// RSA KEYS, by modulus width. A key suite rather than a signature
+    /// suite: an RSA key signs under more than one hash, so the width is
+    /// what the key says and the hash is what the signature says.
+    pub const RSA_2048: u16 = 7;
+    pub const RSA_3072: u16 = 8;
+    pub const RSA_4096: u16 = 9;
+    /// RSA SIGNATURES: RSASSA-PKCS1-v1_5 under the named hash, made by a
+    /// key of any RSA width.
+    pub const RSA_PKCS1_SHA256: u16 = 10;
+    pub const RSA_PKCS1_SHA384: u16 = 11;
+    /// RSASSA-PSS as a certificate signature. Named, refused: no public
+    /// issuer signs certificates with it.
+    pub const RSA_PSS: u16 = 12;
 
     /// Highest suite id this registry defines.
-    pub const MAX_ID: u16 = ML_DSA_87;
+    pub const MAX_ID: u16 = RSA_PSS;
 
     /// Whether this build can actually verify a signature in `suite`.
     ///
@@ -109,7 +135,61 @@ pub mod suite {
     /// treating an unrecognised algorithm as an unchecked one.
     #[must_use]
     pub const fn is_implemented(suite: u16) -> bool {
-        matches!(suite, ECDSA_P256_SHA256 | ML_DSA_44 | ML_DSA_65 | ML_DSA_87)
+        matches!(
+            suite,
+            ECDSA_P256_SHA256
+                | ML_DSA_44
+                | ML_DSA_65
+                | ML_DSA_87
+                | RSA_2048
+                | RSA_3072
+                | RSA_4096
+                | RSA_PKCS1_SHA256
+                | RSA_PKCS1_SHA384
+        )
+    }
+
+    /// The algorithm family a suite belongs to, for the downgrade rule.
+    ///
+    /// A chain is only as strong as its weakest issuer, and within one
+    /// family a weaker issuer vouching for a stronger key is refused. Across
+    /// families the comparison is not made: the public web is built of
+    /// RSA-2048 intermediates issuing P-256 leaves, every root program
+    /// admits that shape, and the chain's strength is bounded by the anchor
+    /// the operator chose in any case. A suite this build cannot place in a
+    /// family compares against everything, so `UNKNOWN` stays the weaker
+    /// side of every comparison.
+    #[must_use]
+    pub const fn family(suite: u16) -> u8 {
+        match suite {
+            ECDSA_P256_SHA256 | ECDSA_P384_SHA384 => 1,
+            ED25519 => 2,
+            ML_DSA_44 | ML_DSA_65 | ML_DSA_87 => 3,
+            RSA_2048 | RSA_3072 | RSA_4096 | RSA_PKCS1_SHA256 | RSA_PKCS1_SHA384 | RSA_PSS => 4,
+            _ => 0,
+        }
+    }
+
+    /// Whether `issuer` vouching for `subject` is a downgrade: the issuer's
+    /// key is weaker than the key it signs, within one family (see
+    /// [`family`]).
+    #[must_use]
+    pub const fn is_downgrade(issuer: u16, subject: u16) -> bool {
+        let same_family = family(issuer) == family(subject) || family(issuer) == 0;
+        same_family && security_bits(issuer) < security_bits(subject)
+    }
+
+    /// Whether a key of `key_suite` is one that makes signatures of
+    /// `sig_suite`. For every suite but RSA the two are the same id; an
+    /// RSA key of any width signs PKCS#1 v1.5 under either hash.
+    #[must_use]
+    pub const fn key_signs(key_suite: u16, sig_suite: u16) -> bool {
+        match key_suite {
+            RSA_2048 | RSA_3072 | RSA_4096 => {
+                matches!(sig_suite, RSA_PKCS1_SHA256 | RSA_PKCS1_SHA384)
+            }
+            _ => key_suite == sig_suite && key_suite != UNKNOWN,
+        }
     }
 
     /// Classical-equivalent security level in bits. Used to detect a
@@ -121,6 +201,15 @@ pub mod suite {
             ECDSA_P256_SHA256 | ED25519 | ML_DSA_44 => 128,
             ECDSA_P384_SHA384 | ML_DSA_65 => 192,
             ML_DSA_87 => 256,
+            // SP 800-57 Part 1 tabulates 2048 → 112 and 3072 → 128 and does
+            // not list 4096; the conservative tabulated row is used rather
+            // than an interpolation.
+            RSA_2048 => 112,
+            RSA_3072 | RSA_4096 => 128,
+            // A signature suite's strength is its hash's; the key it was
+            // made with is the bound that matters and is compared as a key.
+            RSA_PKCS1_SHA256 | RSA_PSS => 128,
+            RSA_PKCS1_SHA384 => 192,
             // An unresolvable suite is worth nothing, so it can never be
             // the stronger side of a comparison.
             _ => 0,
@@ -137,6 +226,11 @@ pub mod suite {
             ML_DSA_44 => 1312,
             ML_DSA_65 => 1952,
             ML_DSA_87 => 2592,
+            // RSAPublicKey DER: SEQUENCE, INTEGER n with its sign octet,
+            // INTEGER e of up to four bytes.
+            RSA_2048 => 270,
+            RSA_3072 => 398,
+            RSA_4096 => 526,
             _ => 0,
         }
     }
@@ -152,6 +246,11 @@ pub mod suite {
             ML_DSA_44 => 2420,
             ML_DSA_65 => 3309,
             ML_DSA_87 => 4627,
+            RSA_2048 => 256,
+            RSA_3072 => 384,
+            // A PKCS#1 signature is the modulus width, so a signature suite
+            // is bounded by the widest key that may make one.
+            RSA_4096 | RSA_PKCS1_SHA256 | RSA_PKCS1_SHA384 | RSA_PSS => 512,
             _ => 0,
         }
     }
@@ -216,8 +315,27 @@ pub mod suite {
             ML_DSA_44 => b"ml-dsa-44",
             ML_DSA_65 => b"ml-dsa-65",
             ML_DSA_87 => b"ml-dsa-87",
+            RSA_2048 => b"rsa-2048",
+            RSA_3072 => b"rsa-3072",
+            RSA_4096 => b"rsa-4096",
+            RSA_PKCS1_SHA256 => b"rsa-pkcs1-sha256",
+            RSA_PKCS1_SHA384 => b"rsa-pkcs1-sha384",
+            RSA_PSS => b"rsa-pss",
             _ => b"unknown",
         }
+    }
+}
+
+/// The key suite an RSA modulus of `bits` belongs to, or `UNKNOWN` for a
+/// width this registry does not name. Widths between the named ones are
+/// keys no issuer mints and no size here is derived for.
+#[must_use]
+const fn rsa_key_suite_for_bits(bits: usize) -> u16 {
+    match bits {
+        2048 => suite::RSA_2048,
+        3072 => suite::RSA_3072,
+        4096 => suite::RSA_4096,
+        _ => suite::UNKNOWN,
     }
 }
 
@@ -240,6 +358,12 @@ fn suite_from_signature_oid(oid: &[u8]) -> u16 {
         suite::ML_DSA_65
     } else if oid == OID_ML_DSA_87 {
         suite::ML_DSA_87
+    } else if oid == OID_SHA256_WITH_RSA {
+        suite::RSA_PKCS1_SHA256
+    } else if oid == OID_SHA384_WITH_RSA {
+        suite::RSA_PKCS1_SHA384
+    } else if oid == OID_RSASSA_PSS {
+        suite::RSA_PSS
     } else {
         suite::UNKNOWN
     }
@@ -859,6 +983,16 @@ fn extract_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<(u1
         } else {
             suite::UNKNOWN
         }
+    } else if alg_oid == OID_RSA_ENCRYPTION {
+        // An RSA key's `parameters` is an explicit NULL (RFC 3279 §2.3.1):
+        // exactly `05 00`, and nothing else is admitted.
+        if ap + 2 > alg_end || cert[ap] != TAG_NULL || cert[ap + 1] != 0 {
+            return None;
+        }
+        ap += 2;
+        // The width is read from the key itself, below; the suite is
+        // settled once the BIT STRING is in hand.
+        suite::RSA_2048
     } else {
         // Everything else names the algorithm in one OID and takes no
         // parameters. An absent `parameters` is the point: a present one
@@ -893,6 +1027,18 @@ fn extract_pubkey(cert: &[u8], spki_start: usize, spki_len: usize) -> Option<(u1
         return None;
     } // SPKI has exactly two members
     let key_bytes = &cert[bs_start + 1..bs_start + bs_len];
+
+    // An RSA key's suite is its modulus width, which the RSAPublicKey
+    // inside the BIT STRING says. A width this registry does not name is
+    // an unknown suite, which the log names as such, not a corrupt file.
+    let key_suite = if alg_oid == OID_RSA_ENCRYPTION {
+        match rsa_public_key_parse(key_bytes) {
+            Some(k) => rsa_key_suite_for_bits(rsa_public_key_bits(&k)),
+            None => suite::UNKNOWN,
+        }
+    } else {
+        key_suite
+    };
 
     // A key longer than its suite can hold is not that suite's key. Checked
     // here so no downstream buffer is sized from a suite the bytes contradict.
@@ -1388,6 +1534,10 @@ fn ml_dsa_set_for(cert_suite: u16) -> Option<MlDsaSet> {
 pub fn key_is_valid(suite: u16, key: &[u8]) -> bool {
     match suite {
         suite::ECDSA_P256_SHA256 => public_point_is_valid(key),
+        suite::RSA_2048 | suite::RSA_3072 | suite::RSA_4096 => match rsa_public_key_parse(key) {
+            Some(k) => rsa_key_suite_for_bits(rsa_public_key_bits(&k)) == suite,
+            None => false,
+        },
         suite::ML_DSA_44 | suite::ML_DSA_65 | suite::ML_DSA_87 => {
             // A lattice public key has no structure to check beyond its
             // length: every byte string of the right size decodes, and
@@ -1416,7 +1566,9 @@ pub fn verify_cert_signature(
         Some(c) => c,
         None => return false,
     };
-    if cert.suite != issuer_key_suite || !key_is_valid(issuer_key_suite, issuer_pubkey) {
+    if !suite::key_signs(issuer_key_suite, cert.suite)
+        || !key_is_valid(issuer_key_suite, issuer_pubkey)
+    {
         return false;
     }
     match cert.suite {
@@ -1430,6 +1582,24 @@ pub fn verify_cert_signature(
                 None => return false,
             };
             ecdsa_verify(issuer_pubkey, &tbs_hash, &raw_sig)
+        }
+        suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => {
+            // The signature is the BIT STRING contents, the modulus width
+            // exactly; the digest is of tbsCertificate under the hash the
+            // signature suite names. The exponentiation runs whole here:
+            // this is the host's and the vault's path, and the handshake on
+            // a budgeted target verifies through its stepped job instead.
+            let Some(key) = rsa_public_key_parse(issuer_pubkey) else {
+                return false;
+            };
+            let mut job = RsaVerifyJob::new();
+            if cert.suite == suite::RSA_PKCS1_SHA256 {
+                let tbs_hash = sha256(cert.tbs_raw);
+                rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha256, &tbs_hash, cert.signature)
+            } else {
+                let tbs_hash = sha384(cert.tbs_raw);
+                rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha384, &tbs_hash, cert.signature)
+            }
         }
         suite::ML_DSA_44 | suite::ML_DSA_65 | suite::ML_DSA_87 => {
             // The signature is the BIT STRING contents as they stand: no
@@ -1561,6 +1731,216 @@ fn check_suites(cert: &X509Cert<'_>, policy: &ChainPolicy<'_>) -> u32 {
     CERT_OK
 }
 
+/// Where the bytes of a deferred RSA link live: in the Certificate
+/// message the peer sent, or in the configured anchor.
+pub const LINK_IN_MESSAGE: u8 = 0;
+pub const LINK_IN_ANCHOR: u8 = 1;
+
+/// One signature the chain walk left for a stepped job — RSA, or ECDSA
+/// P-256, which on the slowest target is the more expensive of the two:
+/// the certificate it is over, the key that made it, and the suite. Offsets
+/// rather than slices, because the job outlives the call that found them
+/// and the message buffer is the only place the bytes are.
+#[derive(Clone, Copy)]
+pub struct DeferredLink {
+    /// `LINK_IN_MESSAGE` for the subject certificate (always) and
+    /// where the issuer key is read from.
+    pub issuer_source: u8,
+    /// The signature suite (`RSA_PKCS1_SHA256` or `RSA_PKCS1_SHA384`).
+    pub sig_suite: u16,
+    /// `tbsCertificate` of the subject, within the message.
+    pub tbs_off: u16,
+    pub tbs_len: u16,
+    /// The signature's BIT STRING body, within the message.
+    pub sig_off: u16,
+    pub sig_len: u16,
+    /// The issuer's `subjectPublicKey` body, within `issuer_source`.
+    pub key_off: u16,
+    pub key_len: u16,
+}
+
+impl DeferredLink {
+    pub const EMPTY: DeferredLink = DeferredLink {
+        issuer_source: LINK_IN_MESSAGE,
+        sig_suite: 0,
+        tbs_off: 0,
+        tbs_len: 0,
+        sig_off: 0,
+        sig_len: 0,
+        key_off: 0,
+        key_len: 0,
+    };
+}
+
+/// The links a walk deferred, in chain order.
+pub struct DeferredLinks {
+    pub links: [DeferredLink; MAX_CHAIN_LEN],
+    pub len: u8,
+    /// The next link to verify.
+    pub next: u8,
+}
+
+impl DeferredLinks {
+    pub const fn empty() -> Self {
+        Self {
+            links: [DeferredLink::EMPTY; MAX_CHAIN_LEN],
+            len: 0,
+            next: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.next = 0;
+    }
+
+    pub fn pending(&self) -> bool {
+        self.next < self.len
+    }
+}
+
+/// Offset of `inner` within `outer`, both borrowed from the same buffer.
+fn span_of(outer: &[u8], inner: &[u8]) -> Option<(u16, u16)> {
+    let base = outer.as_ptr() as usize;
+    let at = inner.as_ptr() as usize;
+    if at < base || at + inner.len() > base + outer.len() {
+        return None;
+    }
+    let off = at - base;
+    if off > u16::MAX as usize || inner.len() > u16::MAX as usize {
+        return None;
+    }
+    Some((off as u16, inner.len() as u16))
+}
+
+/// What a link check may do with an RSA or ECDSA signature: verify it
+/// now, or record it for a stepped job. ML-DSA is verified now either way.
+struct LinkMode<'a> {
+    message: &'a [u8],
+    anchor: &'a [u8],
+    deferred: Option<&'a mut DeferredLinks>,
+}
+
+impl LinkMode<'_> {
+    /// Check `subject`'s signature under `issuer`, deferring an RSA one
+    /// when the mode asks for it. `issuer_source` says where the issuer's
+    /// bytes live.
+    fn signature(
+        &mut self,
+        subject: &X509Cert<'_>,
+        subject_der: &[u8],
+        issuer: &X509Cert<'_>,
+        issuer_source: u8,
+    ) -> u32 {
+        let steppable = matches!(
+            subject.suite,
+            suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 | suite::ECDSA_P256_SHA256
+        );
+        if !steppable || self.deferred.is_none() {
+            return if verify_cert_signature(subject_der, issuer.key_suite, issuer.public_key) {
+                CERT_OK
+            } else {
+                CERT_ERR_SIGNATURE
+            };
+        }
+        // Everything the job will not re-derive is checked here: the key
+        // is one that makes this signature, is well formed, and the
+        // signature is the key's width.
+        if !suite::key_signs(issuer.key_suite, subject.suite)
+            || !key_is_valid(issuer.key_suite, issuer.public_key)
+        {
+            return CERT_ERR_SIGNATURE;
+        }
+        let issuer_bytes = if issuer_source == LINK_IN_ANCHOR {
+            self.anchor
+        } else {
+            self.message
+        };
+        let (Some((tbs_off, tbs_len)), Some((sig_off, sig_len)), Some((key_off, key_len))) = (
+            span_of(self.message, subject.tbs_raw),
+            span_of(self.message, subject.signature),
+            span_of(issuer_bytes, issuer.public_key),
+        ) else {
+            return CERT_ERR_MALFORMED;
+        };
+        let Some(d) = self.deferred.as_deref_mut() else {
+            return CERT_ERR_SIGNATURE;
+        };
+        if d.len as usize >= MAX_CHAIN_LEN {
+            return CERT_ERR_CHAIN_TOO_LONG;
+        }
+        d.links[d.len as usize] = DeferredLink {
+            issuer_source,
+            sig_suite: subject.suite,
+            tbs_off,
+            tbs_len,
+            sig_off,
+            sig_len,
+            key_off,
+            key_len,
+        };
+        d.len += 1;
+        CERT_OK
+    }
+}
+
+/// The bytes a deferred link names: `(tbs, signature, issuer key)`.
+pub fn deferred_link_bytes<'a>(
+    link: &DeferredLink,
+    message: &'a [u8],
+    anchor: &'a [u8],
+) -> Option<(&'a [u8], &'a [u8], &'a [u8])> {
+    let issuer_bytes = if link.issuer_source == LINK_IN_ANCHOR {
+        anchor
+    } else {
+        message
+    };
+    Some((
+        message.get(link.tbs_off as usize..(link.tbs_off + link.tbs_len) as usize)?,
+        message.get(link.sig_off as usize..(link.sig_off + link.sig_len) as usize)?,
+        issuer_bytes.get(link.key_off as usize..(link.key_off + link.key_len) as usize)?,
+    ))
+}
+
+/// Verify one deferred link in full, for a caller with no step budget.
+pub fn verify_deferred_link(link: &DeferredLink, message: &[u8], anchor: &[u8]) -> bool {
+    let Some((tbs, sig, key)) = deferred_link_bytes(link, message, anchor) else {
+        return false;
+    };
+    match link.sig_suite {
+        suite::ECDSA_P256_SHA256 => match parse_der_signature(sig) {
+            Some(raw) => ecdsa_verify(key, &sha256(tbs), &raw),
+            None => false,
+        },
+        suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => {
+            let Some(key) = rsa_public_key_parse(key) else {
+                return false;
+            };
+            let mut job = RsaVerifyJob::new();
+            if link.sig_suite == suite::RSA_PKCS1_SHA256 {
+                rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha256, &sha256(tbs), sig)
+            } else {
+                rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha384, &sha384(tbs), sig)
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether a deferred link's recovered encoded message is the encoding of
+/// its subject's digest: the check a stepped job ends with.
+pub fn deferred_link_rsa_check(link: &DeferredLink, message: &[u8], em: &[u8]) -> bool {
+    let Some(tbs) = message.get(link.tbs_off as usize..(link.tbs_off + link.tbs_len) as usize)
+    else {
+        return false;
+    };
+    match link.sig_suite {
+        suite::RSA_PKCS1_SHA256 => rsa_pkcs1_v15_check(RsaHash::Sha256, &sha256(tbs), em),
+        suite::RSA_PKCS1_SHA384 => rsa_pkcs1_v15_check(RsaHash::Sha384, &sha384(tbs), em),
+        _ => false,
+    }
+}
+
 /// Validate a peer's Certificate message under `policy`. Returns
 /// [`CERT_OK`] or the reason code the failure is classified as.
 ///
@@ -1569,6 +1949,27 @@ fn check_suites(cert: &X509Cert<'_>, policy: &ChainPolicy<'_>) -> u32 {
 /// no alternative path is searched, so a peer cannot make the validator try
 /// again with a different arrangement of the same certificates.
 pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
+    verify_chain_with(cert_msg_body, policy, None)
+}
+
+/// As [`verify_chain`], but with `deferred` given, every RSA-signed link
+/// is recorded there instead of verified, and [`CERT_OK`] means "accepted
+/// once every deferred link verifies". Everything else — shape, names,
+/// policy, lifetimes, and every non-RSA signature — is decided here, so a
+/// caller stepping the deferred links has nothing left to check but them.
+pub fn verify_chain_with(
+    cert_msg_body: &[u8],
+    policy: &ChainPolicy<'_>,
+    deferred: Option<&mut DeferredLinks>,
+) -> u32 {
+    let mut mode = LinkMode {
+        message: cert_msg_body,
+        anchor: policy.anchor_der,
+        deferred,
+    };
+    if let Some(d) = mode.deferred.as_deref_mut() {
+        d.clear();
+    }
     if policy.profile == PROFILE_NONE {
         return CERT_ERR_NO_PROFILE;
     }
@@ -1673,10 +2074,10 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
         // being vouched for, not against `cur`'s own signature suite —
         // those are the same value here, but they will not be once a
         // chain can mix suites, and the key is the one that matters.
-        if suite::security_bits(issuer.key_suite) < suite::security_bits(cur.key_suite) {
+        if suite::is_downgrade(issuer.key_suite, cur.key_suite) {
             return CERT_ERR_DOWNGRADE;
         }
-        let rc = check_issuer(&issuer, issuer_der, &cur, cur_der, policy, depth);
+        let rc = check_issuer(&issuer, issuer_der, &cur, cur_der, policy, depth, &mut mode);
         if rc != CERT_OK {
             return rc;
         }
@@ -1698,15 +2099,16 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
         if rc != CERT_OK {
             return rc;
         }
-        if suite::security_bits(anchor.key_suite) < suite::security_bits(cur.key_suite) {
+        if suite::is_downgrade(anchor.key_suite, cur.key_suite) {
             return CERT_ERR_DOWNGRADE;
         }
         let rc = check_validity(&anchor, policy);
         if rc != CERT_OK {
             return rc;
         }
-        if !verify_cert_signature(cur_der, anchor.key_suite, anchor.public_key) {
-            return CERT_ERR_SIGNATURE;
+        let rc = mode.signature(&cur, cur_der, &anchor, LINK_IN_ANCHOR);
+        if rc != CERT_OK {
+            return rc;
         }
     }
 
@@ -1768,6 +2170,7 @@ fn check_issuer(
     subject_der: &[u8],
     policy: &ChainPolicy<'_>,
     depth: usize,
+    mode: &mut LinkMode<'_>,
 ) -> u32 {
     if !der_bytes_eq(subject.issuer_raw, issuer.subject_raw) {
         return CERT_ERR_ISSUER_MISMATCH;
@@ -1780,10 +2183,7 @@ fn check_issuer(
     if rc != CERT_OK {
         return rc;
     }
-    if !verify_cert_signature(subject_der, issuer.key_suite, issuer.public_key) {
-        return CERT_ERR_SIGNATURE;
-    }
-    CERT_OK
+    mode.signature(subject, subject_der, issuer, LINK_IN_MESSAGE)
 }
 
 /// A certificate used as an issuer must say it is one, must be permitted to
@@ -1885,7 +2285,17 @@ pub fn verify_cert_chain(
     trust_anchor_der: &[u8],
     expected_hostname: &[u8],
 ) -> u32 {
-    verify_chain(
+    verify_cert_chain_with(cert_msg_body, trust_anchor_der, expected_hostname, None)
+}
+
+/// As [`verify_cert_chain`], deferring RSA links (see [`verify_chain_with`]).
+pub fn verify_cert_chain_with(
+    cert_msg_body: &[u8],
+    trust_anchor_der: &[u8],
+    expected_hostname: &[u8],
+    deferred: Option<&mut DeferredLinks>,
+) -> u32 {
+    verify_chain_with(
         cert_msg_body,
         &ChainPolicy {
             profile: PROFILE_CA_DNS,
@@ -1897,6 +2307,7 @@ pub fn verify_cert_chain(
             require_clock: false,
             require_eku: EKU_SERVER_AUTH,
         },
+        deferred,
     )
 }
 

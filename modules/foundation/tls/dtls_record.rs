@@ -25,14 +25,11 @@
 // can't be used directly — different header / AAD) and the same
 // `TrafficKeys::nonce()` IV-XOR construction.
 //
-// Phase B status: record-layer primitives are live and exercised by a
-// self-test below (cargo unit tests are not wired into PIC modules; the
-// self-test is gated behind `cfg(test)`). Live wiring into a DTLS
-// server / client is deferred — it requires extending the `pump_*`
-// path in `mod.rs` to drive the handshake driver via the queue API
-// (`feed_handshake` / `poll_handshake`) instead of the current
-// `recv_buf` / `cipher_out` direct path. That refactor is the same
-// one Phase C (QUIC) needs, so doing it once unblocks both transports.
+// The record layer here is what a DTLS session runs on: the handshake
+// reaches the shared driver through the queue API (`feed_handshake`, and
+// `driver.out_buf` for the outbound side), with the fragmenting bridge
+// documented further down this file. Cargo unit tests are not wired into
+// PIC modules, so the primitives carry a `cfg(test)` self-test instead.
 
 /// Per-direction DTLS record-layer state.
 pub struct DtlsRecord {

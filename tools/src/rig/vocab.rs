@@ -71,9 +71,10 @@ impl Surface {
                 "observe.udp_capture",
                 "observe.usb_enumeration",
                 "observe.https_load",
-                // Protocol-agnostic successor to `observe.https_load`. The
-                // backend picks the protocol (h1 / h2c / ws / grpc, plaintext
-                // or TLS) from its profile binding, so a scenario can assert on
+                // The protocol-agnostic load probe, beside
+                // `observe.https_load`. The backend picks the protocol
+                // (h1 / h2c / ws / grpc, plaintext or TLS) from its
+                // profile binding, so a scenario can assert on
                 // any protocol a project owns without this vocabulary growing a
                 // name per protocol. The probe itself lives with whoever owns
                 // the protocols — Wave ships `observe-proto_load` — because a
@@ -89,6 +90,10 @@ impl Surface {
                 // application. Fluxor ships `observe-quic_mux`, because
                 // Fluxor owns the transport.
                 "observe.quic_mux",
+                // The tls anchor's own probe: TLS 1.3 handshakes and an echo
+                // above them, nothing else, so an RSA identity is measured as
+                // the handshake it changes. Fluxor ships `observe-tls_load`.
+                "observe.tls_load",
             ],
             Self::Rig => &["rig.claim", "rig.release", "rig.lock"],
         }

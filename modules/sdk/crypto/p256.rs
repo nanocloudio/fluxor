@@ -234,6 +234,79 @@ fn u256_is_zero(a: &U256) -> bool {
     a[0] | a[1] | a[2] | a[3] == 0
 }
 
+fn u256_is_one(a: &U256) -> bool {
+    a[0] == 1 && a[1] | a[2] | a[3] == 0
+}
+
+/// `a >> 1`, with `top` shifted into bit 255.
+fn u256_shr1(a: &U256, top: u64) -> U256 {
+    [
+        (a[0] >> 1) | (a[1] << 63),
+        (a[1] >> 1) | (a[2] << 63),
+        (a[2] >> 1) | (a[3] << 63),
+        (a[3] >> 1) | (top << 63),
+    ]
+}
+
+/// `a^-1 mod m` by the binary extended Euclidean algorithm, for odd `m`
+/// and `a` in `[1, m)` coprime to it; 0 for `a == 0`.
+///
+/// VARIABLE TIME in `a`: the trip counts follow its bits. It exists for
+/// the values a verifier is handed — a signature's `s`, the projective
+/// coordinates of public points — where there is nothing to hide, and it
+/// is about a hundredth of the Fermat chain on a core without a wide
+/// multiplier. It must never see a private scalar or a coordinate derived
+/// from one: those go through `fp_inv` / `fn_inv`, whose schedule is fixed.
+fn u256_inv_vartime(a: &U256, m: &U256) -> U256 {
+    if u256_is_zero(a) {
+        return ZERO;
+    }
+    let mut u = *a;
+    let mut v = *m;
+    let mut x1 = ONE;
+    let mut x2 = ZERO;
+    // x / 2 mod m: halve, adding m first when x is odd.
+    let half = |x: &U256| -> U256 {
+        if x[0] & 1 == 0 {
+            u256_shr1(x, 0)
+        } else {
+            let (sum, carry) = u256_add(x, m);
+            u256_shr1(&sum, carry)
+        }
+    };
+    // x - y mod m.
+    let sub_mod = |x: &U256, y: &U256| -> U256 {
+        let (d, borrow) = u256_sub(x, y);
+        if borrow != 0 {
+            u256_add(&d, m).0
+        } else {
+            d
+        }
+    };
+    while !u256_is_one(&u) && !u256_is_one(&v) {
+        while u[0] & 1 == 0 {
+            u = u256_shr1(&u, 0);
+            x1 = half(&x1);
+        }
+        while v[0] & 1 == 0 {
+            v = u256_shr1(&v, 0);
+            x2 = half(&x2);
+        }
+        if u256_gte(&u, &v) != 0 {
+            u = u256_sub(&u, &v).0;
+            x1 = sub_mod(&x1, &x2);
+        } else {
+            v = u256_sub(&v, &u).0;
+            x2 = sub_mod(&x2, &x1);
+        }
+    }
+    if u256_is_one(&u) {
+        x1
+    } else {
+        x2
+    }
+}
+
 // ============================================================================
 // Modular arithmetic mod p (P-256 prime).
 //
@@ -544,8 +617,7 @@ fn u256_sqr_wide(a: &U256) -> [u64; 8] {
 /// symmetry) rather than the general `u256_mul_wide` (16 multiplies). Squaring
 /// dominates Jacobian point doubling, which dominates the scalar multiplication
 /// on every ECDH agreement and ECDSA sign — so this ~1.6× cheaper wide product
-/// speeds the whole handshake crypto. Bit-identical to `fp_mul(a, a)`, gated by
-/// the ECDSA/ECDH KATs in `tests/harness/tests/tls_crypto_kat.rs`.
+/// speeds the whole handshake crypto. Bit-identical to `fp_mul(a, a)`.
 fn fp_sqr(a: &U256) -> U256 {
     fp_reduce(&u256_sqr_wide(a))
 }
@@ -580,6 +652,11 @@ fn fp_inv(a: &U256) -> U256 {
         i += 1;
     }
     result
+}
+
+/// `fp_inv` for a public coordinate; see `u256_inv_vartime`.
+fn fp_inv_vartime(a: &U256) -> U256 {
+    u256_inv_vartime(a, &load_p())
 }
 
 // ============================================================================
@@ -701,6 +778,11 @@ fn fn_inv(a: &U256) -> U256 {
     result
 }
 
+/// `fn_inv` for a signature's `s`; see `u256_inv_vartime`.
+fn fn_inv_vartime(a: &U256) -> U256 {
+    u256_inv_vartime(a, &load_n())
+}
+
 // ============================================================================
 // Branchless helpers. Each of these is individually free of
 // data-dependent branches and data-dependent memory addressing. They
@@ -791,7 +873,20 @@ impl JacobianPoint {
         if self.is_identity() {
             return (ZERO, ZERO);
         }
-        let z_inv = fp_inv(&self.z);
+        self.to_affine_with(&fp_inv(&self.z))
+    }
+
+    /// Affine coordinates of a PUBLIC point; see `u256_inv_vartime`.
+    fn to_affine_vartime(&self) -> (U256, U256) {
+        if self.is_identity() {
+            return (ZERO, ZERO);
+        }
+        self.to_affine_with(&fp_inv_vartime(&self.z))
+    }
+
+    /// Affine coordinates given `z^-1`, however it was computed.
+    fn to_affine_with(&self, z_inv: &U256) -> (U256, U256) {
+        let z_inv = *z_inv;
         let z_inv2 = fp_sqr(&z_inv);
         let z_inv3 = fp_mul(&z_inv2, &z_inv);
         let x = fp_mul(&self.x, &z_inv2);
@@ -897,10 +992,10 @@ impl JacobianPoint {
     /// Exception-free on the same terms as `add_affine`, with a second
     /// identity test on the right-hand operand. That operand matters:
     /// in `scalar_mul_ct` it is the table entry selected by a secret
-    /// scalar nibble and `table[0]` is the identity, so under the old
-    /// short-circuit the position of every zero nibble of the scalar
-    /// was visible in the timing profile. All five outcomes are now
-    /// computed and selected under masks.
+    /// scalar nibble and `table[0]` is the identity, so a short-circuit
+    /// on it would make the position of every zero nibble of the scalar
+    /// visible in the timing profile. All five outcomes are computed
+    /// and selected under masks.
     fn add_jacobian(&self, other: &JacobianPoint) -> Self {
         let z1z1 = fp_sqr(&self.z);
         let z2z2 = fp_sqr(&other.z);
@@ -1015,8 +1110,8 @@ fn ct_lookup_table_16(table: &[JacobianPoint; 16], idx: usize) -> JacobianPoint 
 
 /// Scalar multiplication via fixed-window w=4 with constant-time
 /// table lookup. Same shape as BoringSSL / ring / OpenSSL's
-/// `p256_scalar_mul`. Replaces the earlier Montgomery-ladder
-/// implementation:
+/// `p256_scalar_mul`. Chosen over a per-bit Montgomery ladder for the
+/// one-shot path:
 ///
 /// - Montgomery ladder: 256 doublings + 256 conditional swaps +
 ///   256 additions ≈ 768 field ops on the critical path.
@@ -1051,11 +1146,7 @@ fn ct_lookup_table_16(table: &[JacobianPoint; 16], idx: usize) -> JacobianPoint 
 ///
 /// What is still not covered: the compiler and the microarchitecture.
 /// This docstring states what the source does, not what a given
-/// optimiser emits, and no test in the tree measures cycle counts.
-///
-/// KATs in `tests/harness/tests/tls_crypto_kat.rs` gate
-/// correctness of the entire `(sign, verify, ECDH)` surface
-/// against RFC 6979 / RFC 5903 expected outputs.
+/// optimiser emits, and nothing in the tree measures cycle counts.
 fn scalar_mul_ct(k: &U256, px: &U256, py: &U256) -> JacobianPoint {
     // ── Precompute table[i] = i · P  for i ∈ 0..16 ─────────
     //
@@ -1166,7 +1257,27 @@ pub struct ScalarMulState {
     /// struct is in its kernel-zeroed initial state and must be (re)initialised
     /// before stepping.
     initialised: u8,
+    /// The affine conversion, stepped after the ladder. The result's `z`
+    /// depends on the scalar, so its inverse is the fixed-schedule Fermat
+    /// chain — 256 squarings and a multiplication per set bit of `p - 2` —
+    /// which is longer than the ladder's own steps on a core without a
+    /// wide multiplier. It is therefore advanced `FERMAT_BITS_PER_LADDER_BIT`
+    /// bits per ladder bit of the step budget, and `complete()` holds
+    /// until it is done. A caller that will convert a PUBLIC result its
+    /// own way opts out with `skip_affine`.
+    inv_result: U256,
+    inv_base: U256,
+    /// Next bit of `p - 2` to fold in; `INV_DONE` once all are.
+    inv_bit: u16,
+    want_affine: u8,
 }
+
+/// Fermat bits per ladder bit of a step: a ladder bit is an addition and
+/// a doubling, about thirty field multiplications; a Fermat bit is at
+/// most two, so four of them keep an inversion step well under a ladder
+/// step and the whole inversion inside sixty-four.
+const FERMAT_BITS_PER_LADDER_BIT: u16 = 4;
+const INV_DONE: u16 = 256;
 
 impl ScalarMulState {
     pub const fn empty() -> Self {
@@ -1185,6 +1296,10 @@ impl ScalarMulState {
             bit_index: -1,
             bits_per_step: 0,
             initialised: 0,
+            inv_result: ONE,
+            inv_base: ZERO,
+            inv_bit: 0,
+            want_affine: 0,
         }
     }
 
@@ -1204,7 +1319,18 @@ impl ScalarMulState {
             bit_index: 255,
             bits_per_step,
             initialised: 1,
+            inv_result: ONE,
+            inv_base: ZERO,
+            inv_bit: 0,
+            want_affine: 1,
         }
+    }
+
+    /// The result will be converted to affine by the caller, from public
+    /// values; the stepped inversion is skipped and `complete()` is the
+    /// ladder alone.
+    pub fn skip_affine(&mut self) {
+        self.want_affine = 0;
     }
 
     /// Initialise for `k * G`.
@@ -1219,7 +1345,9 @@ impl ScalarMulState {
     }
 
     pub fn complete(&self) -> bool {
-        self.initialised != 0 && self.bit_index < 0
+        self.initialised != 0
+            && self.bit_index < 0
+            && (self.want_affine == 0 || self.inv_bit >= INV_DONE)
     }
 
     /// True once `new`/`new_base` has populated the state; false when the
@@ -1231,7 +1359,11 @@ impl ScalarMulState {
     /// Advance the ladder by up to `bits_per_step` bits. Returns true when
     /// the multiplication is complete.
     pub fn step(&mut self) -> bool {
-        if self.initialised == 0 || self.bit_index < 0 {
+        if self.initialised == 0 {
+            return false;
+        }
+        if self.bit_index < 0 {
+            self.step_inverse();
             return self.complete();
         }
         // bits_per_step == 0 → run to completion in this call.
@@ -1251,7 +1383,53 @@ impl ScalarMulState {
             self.bit_index -= 1;
             remaining -= 1;
         }
+        if self.bit_index < 0 {
+            // The ladder is done: the inversion starts from its `z` on the
+            // next call, so a step is never a ladder bit and Fermat bits
+            // both — except in run-to-completion mode, whose one call is
+            // the whole computation.
+            self.inv_base = self.r0.z;
+            self.inv_result = ONE;
+            self.inv_bit = 0;
+            if self.bits_per_step == 0 {
+                self.step_inverse();
+            }
+        }
         self.complete()
+    }
+
+    /// Fold the next bits of `p - 2` into the inverse of the result's `z`.
+    fn step_inverse(&mut self) {
+        if self.want_affine == 0 || self.inv_bit >= INV_DONE {
+            return;
+        }
+        let mut remaining: u16 = if self.bits_per_step == 0 {
+            INV_DONE
+        } else {
+            (self.bits_per_step as u16).saturating_mul(FERMAT_BITS_PER_LADDER_BIT)
+        };
+        let p_minus_2 = pic_u256(
+            0xFFFFFFFD, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
+            0xFFFFFFFF,
+        );
+        while remaining > 0 && self.inv_bit < INV_DONE {
+            let j = self.inv_bit as usize;
+            if (p_minus_2[j >> 6] >> (j & 63)) & 1 == 1 {
+                self.inv_result = fp_mul(&self.inv_result, &self.inv_base);
+            }
+            self.inv_base = fp_sqr(&self.inv_base);
+            self.inv_bit += 1;
+            remaining -= 1;
+        }
+    }
+
+    /// The affine result, once `complete()`: `(0, 0)` for the identity.
+    /// Meaningful only for a state that did not `skip_affine`.
+    pub fn affine(&self) -> (U256, U256) {
+        if self.r0.is_identity() {
+            return (ZERO, ZERO);
+        }
+        self.r0.to_affine_with(&self.inv_result)
     }
 
     /// Extract the result. Caller must ensure `complete()` is true.
@@ -1273,6 +1451,8 @@ impl ScalarMulState {
     /// has been extracted to limit how long the private key sits in RAM.
     pub fn zeroise_scalar(&mut self) {
         zeroize_u256(&mut self.k);
+        zeroize_u256(&mut self.inv_base);
+        zeroize_u256(&mut self.inv_result);
     }
 }
 
@@ -1301,7 +1481,7 @@ pub fn ecdh_shared_secret_finalise(state: &ScalarMulState) -> Option<[u8; 32]> {
     if result.is_identity() {
         return None;
     }
-    let (x, _) = result.to_affine();
+    let (x, _) = state.affine();
     Some(u256_to_be(&x))
 }
 
@@ -1410,8 +1590,7 @@ pub fn ecdsa_sign_init(
 )]
 pub fn ecdsa_sign_finalise(mut state: EcdsaSignState) -> [u8; 64] {
     // r = (k * G).x mod n. `scalar_mul` already produced the point.
-    let point = state.scalar_mul.result();
-    let (rx, _) = point.to_affine();
+    let (rx, _) = state.scalar_mul.affine();
     let r = mod_n_reduce(&rx);
 
     // s = k^-1 * (z + r * d) mod n
@@ -1543,7 +1722,7 @@ pub fn ecdh_keygen_finalise(state: &ScalarMulState) -> Option<[u8; 65]> {
     if point.is_identity() {
         return None;
     }
-    let (x, y) = point.to_affine();
+    let (x, y) = state.affine();
     let mut pub_key = [0u8; 65];
     pub_key[0] = 0x04;
     let xb = u256_to_be(&x);
@@ -1914,7 +2093,7 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     };
     let z = mod_n_reduce(&z);
 
-    let s_inv = fn_inv(&s);
+    let s_inv = fn_inv_vartime(&s);
     let u1 = fn_mul(&z, &s_inv);
     let u2 = fn_mul(&r, &s_inv);
 
@@ -1923,17 +2102,125 @@ pub fn ecdsa_verify(pub_key: &[u8], hash: &[u8], sig: &[u8]) -> bool {
     let p2 = scalar_mul(&u2, &qx, &qy);
 
     // Add p1 + p2
-    let (p2x, p2y) = p2.to_affine();
+    let (p2x, p2y) = p2.to_affine_vartime();
     let sum = p1.add_affine(&p2x, &p2y);
 
     if sum.is_identity() {
         return false;
     }
-    let (rx, _) = sum.to_affine();
+    let (rx, _) = sum.to_affine_vartime();
     let rx_mod_n = mod_n_reduce(&rx);
 
     // Check r == rx mod n
     rx_mod_n == r
+}
+
+/// ECDSA verification as a job: the two scalar multiplications of
+/// `u1·G + u2·Q` run on the resumable ladder, `bits_per_step` bits per
+/// `step`, so a target whose step budget cannot hold a whole verification
+/// spreads it across ticks. The inputs are public, so nothing here needs
+/// the ladder's constant time; it is used because it is the shape that
+/// resumes.
+pub struct EcdsaVerifyJob {
+    s1: ScalarMulState,
+    s2: ScalarMulState,
+    r: U256,
+    initialised: u8,
+}
+
+impl EcdsaVerifyJob {
+    pub const fn empty() -> Self {
+        Self {
+            s1: ScalarMulState::empty(),
+            s2: ScalarMulState::empty(),
+            r: ZERO,
+            initialised: 0,
+        }
+    }
+
+    pub fn is_initialised(&self) -> bool {
+        self.initialised != 0
+    }
+
+    /// Advance by up to `bits_per_step` bits of one ladder. True once both
+    /// multiplications are complete.
+    pub fn step(&mut self) -> bool {
+        if self.initialised == 0 {
+            return false;
+        }
+        if !self.s1.complete() {
+            self.s1.step();
+            return false;
+        }
+        if !self.s2.complete() {
+            self.s2.step();
+            return false;
+        }
+        true
+    }
+
+    pub fn complete(&self) -> bool {
+        self.initialised != 0 && self.s1.complete() && self.s2.complete()
+    }
+}
+
+/// Begin verifying `sig` (raw `r || s`) over `hash` under `pub_key`, with
+/// exactly the admission `ecdsa_verify` applies: the point must be on the
+/// curve and `r`, `s` in `[1, n-1]`. `bits_per_step == 0` runs each ladder
+/// whole in one `step`.
+pub fn ecdsa_verify_init(
+    pub_key: &[u8],
+    hash: &[u8],
+    sig: &[u8],
+    bits_per_step: u8,
+) -> Option<EcdsaVerifyJob> {
+    if sig.len() < 64 {
+        return None;
+    }
+    let (qx, qy) = decode_public_point(pub_key)?;
+    let r = u256_from_be(&sig[..32]);
+    let s = u256_from_be(&sig[32..64]);
+    let n = load_n();
+    if u256_is_zero(&r) || u256_is_zero(&s) || u256_gte(&r, &n) != 0 || u256_gte(&s, &n) != 0 {
+        return None;
+    }
+    let z = if hash.len() >= 32 {
+        u256_from_be(&hash[..32])
+    } else {
+        let mut buf = [0u8; 32];
+        buf[32 - hash.len()..].copy_from_slice(hash);
+        u256_from_be(&buf)
+    };
+    let z = mod_n_reduce(&z);
+    let s_inv = fn_inv_vartime(&s);
+    let u1 = fn_mul(&z, &s_inv);
+    let u2 = fn_mul(&r, &s_inv);
+    let mut s1 = ScalarMulState::new_base(&u1, bits_per_step);
+    let mut s2 = ScalarMulState::new(&u2, &qx, &qy, bits_per_step);
+    s1.skip_affine();
+    s2.skip_affine();
+    Some(EcdsaVerifyJob {
+        s1,
+        s2,
+        r,
+        initialised: 1,
+    })
+}
+
+/// Finish a complete job: whether the signature verifies.
+pub fn ecdsa_verify_finalise(job: &EcdsaVerifyJob) -> bool {
+    if !job.complete() {
+        return false;
+    }
+    let p1 = job.s1.result();
+    let p2 = job.s2.result();
+    let (p2x, p2y) = p2.to_affine_vartime();
+    let sum = p1.add_affine(&p2x, &p2y);
+    if sum.is_identity() {
+        return false;
+    }
+    let (rx, _) = sum.to_affine_vartime();
+    mod_n_reduce(&rx) == job.r
 }
 
 /// Parse a canonical DER-encoded ECDSA signature into raw `r || s`.

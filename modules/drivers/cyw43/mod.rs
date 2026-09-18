@@ -2632,7 +2632,7 @@ unsafe fn step_init_wifi(s: &mut Cyw43State) -> i32 {
                 return 0;
             }
             let pkt_len = ((status >> STATUS_F2_PKT_LEN_SHIFT) & STATUS_F2_PKT_LEN_MASK) as usize;
-            if pkt_len == 0 || pkt_len > 1500 {
+            if pkt_len == 0 || pkt_len > MAX_FRAME_SIZE {
                 return 0;
             }
             let r = gspi::wlan_read_start(s, pkt_len);
@@ -3322,7 +3322,7 @@ unsafe fn step_running(s: &mut Cyw43State) -> i32 {
 /// Try to start an F2 (WiFi) frame read. Returns true if read was started.
 unsafe fn try_start_f2_read(s: &mut Cyw43State, status: u32) -> bool {
     let pkt_len = ((status >> STATUS_F2_PKT_LEN_SHIFT) & STATUS_F2_PKT_LEN_MASK) as usize;
-    if pkt_len > 0 && pkt_len <= 1500 {
+    if pkt_len > 0 && pkt_len <= MAX_FRAME_SIZE {
         let r = gspi::wlan_read_start(s, pkt_len);
         if r >= 0 {
             s.frame_len = pkt_len as u16;
@@ -3338,7 +3338,7 @@ unsafe fn try_start_f2_read(s: &mut Cyw43State, status: u32) -> bool {
 /// Try to start an F3 (BT) frame read. Returns true if read was started.
 unsafe fn try_start_f3_read(s: &mut Cyw43State, status: u32) -> bool {
     let pkt_len = ((status >> STATUS_F3_PKT_LEN_SHIFT) & STATUS_F3_PKT_LEN_MASK) as usize;
-    if pkt_len > 0 && pkt_len <= 1500 {
+    if pkt_len > 0 && pkt_len <= MAX_FRAME_SIZE {
         let r = gspi::bt_read_start(s, pkt_len);
         if r >= 0 {
             s.frame_len = pkt_len as u16;

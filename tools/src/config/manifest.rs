@@ -19,9 +19,9 @@
 ///
 /// 2. The implicit `<config-parent>/../modules` default (e.g.
 ///    `<app>/modules` for a config in `<app>/configs/*.yaml`).
-///    Kept for backward compatibility; new graphs should prefer the
-///    explicit `module_search_paths:` key so the substrate / app split
-///    is visible at the config layer.
+///    Still honoured, but new graphs name the explicit
+///    `module_search_paths:` key so the substrate / app split is visible
+///    at the config layer.
 ///
 /// Both manifest discovery (`load_module_manifests_with_extra`) and
 /// graph parsing should consult this list. Non-existent entries are

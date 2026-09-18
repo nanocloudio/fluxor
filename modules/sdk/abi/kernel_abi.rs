@@ -201,8 +201,8 @@ unsafe impl Sync for SyscallTable {}
 // function pointer). These asserts pin the layout so any such change fails
 // the build. New fields are only ever APPENDED at the end (never inserted or
 // reordered), so a module built against an older, shorter layout keeps every
-// offset it knows and simply never reaches the new tail slots — a
-// backward-compatible extension, not a version break. Layout is one `u32` slot
+// offset it knows and simply never reaches the new tail slots — an
+// extension, not a version break. Layout is one `u32` slot
 // (version, padded to pointer width), 11 function pointers, a telemetry gate
 // pointer, and 1 provider-instance routing pointer = 14 pointer-sized slots,
 // which holds on both 64-bit (native) and 32-bit wasm builds.

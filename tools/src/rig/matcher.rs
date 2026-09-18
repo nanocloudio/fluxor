@@ -38,7 +38,7 @@ use crate::rig::vocab::{Capability, Surface};
 ///     load probe against the rig's IP and emits NDJSON bytes; the
 ///     matcher evaluates regex rules against the same byte-stream path
 ///     it uses for console/telemetry)
-///   * `observe.proto_load` (the protocol-agnostic successor: same
+///   * `observe.proto_load` (the protocol-agnostic load probe: same
 ///     byte-stream path, but the backend chooses the protocol from its
 ///     binding rather than being HTTPS-only)
 ///   * `observe.quic_mux` (the TRANSPORT probe: drives QUIC streams
@@ -47,6 +47,8 @@ use crate::rig::vocab::{Capability, Surface};
 ///     because it carries no protocol — a failure there could be the
 ///     transport or the protocol above it, and this one cannot be the
 ///     latter)
+///   * `observe.tls_load` (the tls anchor's probe: handshakes and an echo,
+///     the same NDJSON byte stream)
 ///   * `observe.udp_capture` (generic UDP-datagram capture transport —
 ///     binds a configured port and streams each datagram as bytes; the
 ///     matcher evaluates regex rules against that per-source byte stream,
@@ -63,6 +65,7 @@ pub fn supports_rule_source(cap: Capability) -> bool {
         || cap.as_str() == "observe.https_load"
         || cap.as_str() == "observe.proto_load"
         || cap.as_str() == "observe.quic_mux"
+        || cap.as_str() == "observe.tls_load"
         || cap.as_str() == "observe.udp_capture"
 }
 

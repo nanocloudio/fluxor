@@ -204,11 +204,13 @@ psm_wdsel_mask = "0x01fffffc"
 boot2_src = "0x400e0000"
 # The split between the two arenas is set by what a networked graph asks
 # for. Channel buffers are the scarce half: a four-module graph carrying the
-# ip stack wants sixteen of them and does not fit in 32 KiB, while its
-# module state sits well inside 224 KiB. Their sum is what the die can
-# spare, so the two move against each other; `ram_static_max_kb` below binds
-# the sum, not either half.
-state_arena_kb = 224
+# ip stack wants sixteen of them and does not fit in 32 KiB. Module state
+# is sized by the same graph with tls on top: cyw43, wifi and ip take
+# ~104 KiB and a one-session tls instance ~125 KiB, so the arena has to
+# clear ~229 KiB. Their sum is what the die can spare, so the two move
+# against each other; `ram_static_max_kb` below binds the sum, not either
+# half.
+state_arena_kb = 240
 buffer_arena_kb = 64
 config_buffer_kb = 16
 config_arena_kb = 16
@@ -271,9 +273,9 @@ alarms = [
 ]
 # Alarms on `monotonic` left free for the timer provider.
 provider_alarms = [3]
-# The external time driver's reservation. Measured, not assumed:
-# Alarm 0 of TIMER0 is the conventional system-tick alarm
-# only. Declaring it is what lets the build prove the two do not collide,
-# for as long as a runtime here uses that driver.
+# The external time driver's reservation: alarm 0 of TIMER0, the
+# conventional system-tick alarm, and nothing else. Declaring it is what
+# lets the build prove the two do not collide, for as long as a runtime
+# here uses that driver.
 foreign_instance = "TIMER0"
 foreign_alarms = [0]

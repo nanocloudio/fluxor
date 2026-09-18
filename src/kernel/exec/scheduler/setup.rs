@@ -564,7 +564,7 @@ const ISR_BRIDGE_ELEM_SIZE: usize = 56;
 /// bytes between the two at every scheduler tick. Edges with both
 /// endpoints in cooperative tiers are skipped.
 ///
-/// `MAX_BRIDGES` (16) caps the total bridges. Exceeding it returns
+/// `MAX_BRIDGES` caps the total bridges. Exceeding it returns
 /// without crashing — the affected edges lose their ISR routing,
 /// the cooperative scheduler's runtime gate still rejects any
 /// channel I/O attempts from the ISR side, so the graph is dead
@@ -716,11 +716,11 @@ pub fn pump_isr_bridges() {
         }
         // ISR → cooperative: peek bridge → PIPE write → commit pop.
         //
-        // **Backpressure contract:** the previous version popped
-        // before writing, which discarded data on `channel_write`
-        // backpressure. Peek-then-commit holds the element in the
-        // ring head until the PIPE accepts the write; on EAGAIN
-        // the element stays put for the next pump pass.
+        // **Backpressure contract:** popping before writing would
+        // discard the element on `channel_write` backpressure.
+        // Peek-then-commit holds the element in the ring head until
+        // the PIPE accepts the write; on EAGAIN the element stays
+        // put for the next pump pass.
         if from_isr && !to_isr && edge.channel >= 0 {
             for _ in 0..MAX_DRAINS_PER_TICK {
                 let len = ring.peek_one(&mut buf);
@@ -831,7 +831,7 @@ unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
 ///     using the `is_full` + `peek_one` peek-then-commit pattern
 ///     so backpressure is non-lossy.
 ///
-/// **Module-facing gap (v1):** PIC modules have no documented SDK
+/// **Module-facing gap:** PIC modules have no documented SDK
 /// surface to read/write their bridge slots from inside
 /// `module_step`. The SDK's `bridge_dispatch` helper rides
 /// `provider_call`, which the syscall gate denies for
@@ -839,8 +839,7 @@ unsafe extern "C" fn builtin_tier1b_trampoline(state: *mut u8) -> i32 {
 /// YAML edge touching an ISR-tier endpoint to prevent silently-
 /// broken admission; production Tier 1b step bodies do
 /// private-state work only. See
-/// `docs/architecture/scheduler.md` §"ISR-tier I/O contract"
-/// for the planned lift.
+/// `docs/architecture/scheduler.md` §"ISR-tier I/O contract".
 pub fn register_isr_tier_modules_from_graph() -> usize {
     // SAFETY: caller runs on the scheduler thread during graph bring-
     // up; no concurrent observers of SCHED/ISR_SLOTS yet.

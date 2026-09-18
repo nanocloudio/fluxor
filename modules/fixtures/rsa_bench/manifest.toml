@@ -1,0 +1,19 @@
+version = "1.0.0"
+# Every target the tls module lists, so the numbers that size its RSA
+# steps are read from the silicon they apply to; `linux` for a sanity run.
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+
+# Reads the microsecond clock around each measurement; what it measures
+# does not depend on the cadence it is stepped at.
+timer_class = "wall_clock"
+
+# A measurement fixture for the SDK RSA core and, for comparison, the
+# P-256 verification the handshake already performs. One measurement per
+# step, each logged as `[rsa_bench] <name> us=<n>`; `[rsa_bench] done` when
+# the last is out. Some of its steps are long by design (a whole 4096-bit
+# exponentiation on a Cortex-M33), so a graph that boots it raises the
+# module's `step_deadline_us`.
+
+# Module-scope observability — exempt (see standards/observability.md §6).
+[observability]
+exempt = "measurement fixture — its findings are its log lines, not a data path"

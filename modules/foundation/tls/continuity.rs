@@ -119,8 +119,16 @@ use abi::contracts::net::session_ctrl as sc;
 /// decoded checkpoint — about twice the record maximum.
 #[cfg(target_arch = "aarch64")]
 const MAX_TLS_SHADOWS: usize = 2;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "wasm32")]
 const MAX_TLS_SHADOWS: usize = 1;
+/// The MCU-class targets hold no standby: a shadow is ~17 KiB of a state
+/// arena the one session and the wifi stack already fill, and no graph
+/// there runs the transport-continuity pair.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
+const MAX_TLS_SHADOWS: usize = 0;
+
+/// The empty shadow, copied in place (see `EMPTY_SESSION`).
+static EMPTY_SHADOW: TlsShadow = TlsShadow::empty();
 
 /// Record layout admitted by the codec.
 const TLS_CKPT_LAYOUT: u8 = 1;

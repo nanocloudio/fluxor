@@ -1,0 +1,41 @@
+version = "1.0.0"
+# Every target the tls module lists: the probe is how a TLS client
+# handshake is proven on a board.
+hardware_targets = ["rp2350", "bcm2712", "linux"]
+# Its retry backoff is wall-clock; everything else is per-frame.
+timer_class = "wall_clock"
+
+# A TLS client's proof of life. Behind a `tls` instance in client mode, it
+# connects to `peer_ip:port`, sends `ping`, expects `pong`, closes, and
+# repeats until `count` connections have succeeded:
+#
+#   [probe] tls ok n=<i> steps=<n> ms=<n>       one round trip; `steps` is
+#                                               the module steps from the
+#                                               connect to its completion
+#   [probe] tls FAIL n=<i> reason=<r>           the attempt failed; retried
+#                                               after a backoff
+#   [probe] done ok=<n> fail=<n> worst_ms=<n>   `count` successes reached
+#
+# `net_in` / `net_out` face the tls instance's clear side.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+required = true
+buffer_size = 2048
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+required = true
+buffer_size = 2048
+
+[[resources]]
+requires_contract = "channel"
+access = "read"
+
+# Module-scope observability — exempt (standards/observability.md §6).
+[observability]
+exempt = "handshake fixture; its log lines are the observable a rig reads"

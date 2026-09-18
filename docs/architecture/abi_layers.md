@@ -366,7 +366,7 @@ one of which is selected at compile time via `cfg(target_arch)`:
 
 On RP silicon the kernel's arena sizes are overridden per chip by the
 silicon TOMLs (`targets/silicon/rp2040.toml`: 64 KiB state / 16 KiB
-buffer; `targets/silicon/rp2350.toml`: 256 KiB / 32 KiB);
+buffer; `targets/silicon/rp2350.toml`: 240 KiB / 64 KiB);
 `profile_embedded`'s figures apply to thumbv targets with no TOML
 override.
 

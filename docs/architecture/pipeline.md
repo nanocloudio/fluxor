@@ -466,7 +466,7 @@ per-architecture profiles in `modules/sdk/abi/config.rs`:
 | Modules | `MAX_MODULES` | 32 (embedded profile), 48 (wasm), 128 (host/aarch64) |
 | Channel edges | `MAX_GRAPH_EDGES` | 128 (`src/kernel/boot/config.rs`) |
 | Event slots | `MAX_EVENTS` | 32 (`src/kernel/ipc/event.rs`) |
-| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 256 KiB (rp2350), 96 MiB (host/wasm profiles) |
+| State arena | `STATE_ARENA_SIZE` | 64 KiB (rp2040), 240 KiB (rp2350), 96 MiB (host/wasm profiles) |
 | Buffer arena | `BUFFER_ARENA_SIZE` | 16 KiB (rp2040), 32 KiB (rp2350), 8 MiB (host/wasm profiles) |
 | Buffer slots | `MAX_BUFFER_SLOTS` | 256 (`src/kernel/ipc/buffer_pool.rs`) |
 

@@ -65,6 +65,7 @@ include!("../../sdk/crypto/sha3.rs");
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; x509.rs needs ml_dsa.rs for
 // post-quantum certificate suites. Order matters for all three.
 include!("../../sdk/crypto/ml_dsa.rs");
+include!("../../sdk/crypto/rsa.rs");
 include!("x509.rs");
 
 // TLS protocol
@@ -98,13 +99,15 @@ include!("continuity.rs");
 /// ceiling ~4× (~832 KB state) while staying well within Pi 5 RAM.
 ///
 /// TARGET-SPECIFIC: 64 sessions × ~13 KB ⇒ a ~1.4 MB module state arena — far
-/// past the rp2350 / wasm32 budget (rp2350's state arena is only 256 KiB). The
-/// 64-session throughput win is for the Pi 5 bare-metal scenario only.
-/// Embedded (non-aarch64) targets get a small count that fits their arena; the
+/// past the rp2350 / wasm32 budget. The 64-session throughput win is for the
+/// Pi 5 bare-metal scenario only. Embedded (non-aarch64) targets get the
+/// count their arena holds beside the wifi stack: one session of ~37 KiB,
+/// with one DTLS peer and one continuity shadow, is ~125 KiB of the
+/// rp2350's 240 KiB arena after cyw43, wifi and ip have taken ~104 KiB. The
 /// `cfg(target_arch = "aarch64")` split mirrors `dtls_record::DTLS_HS_REASSEMBLY_BUF`.
 /// (aarch64 covers both the bcm2712 firmware build and host-test on the Pi.)
 // Published in the SDK profile (`abi::config::tls::MAX_SESSIONS`, 64 on
-// aarch64 / 4 embedded) rather than held here, so a consumer can read the
+// aarch64 / 1 embedded) rather than held here, so a consumer can read the
 // HTTPS envelope it actually has: this table, not http's slot table, bounds
 // concurrent TLS connections, and an accept it cannot seat is closed before
 // http ever sees it.
@@ -190,7 +193,7 @@ impl SessionArena {
         // temporary rides the kernel's full-size stack.
         for k in 0..SESSION_CHUNK {
             // SAFETY: the kernel granted `SESSION_CHUNK` sessions at `chunk`.
-            unsafe { core::ptr::write(chunk.add(k), TlsSession::empty()) };
+            unsafe { core::ptr::copy_nonoverlapping(&EMPTY_SESSION, chunk.add(k), 1) };
         }
         self.extra[next] = chunk;
         self.extra_allocated += 1;
@@ -247,14 +250,21 @@ const CLOCK_POLICY_REQUIRE: u8 = 0;
 
 /// `mode` values.
 const MODE_CLIENT: u8 = 0;
-const MAX_KEY_LEN: usize = 160;
+/// The longest identity key file: a PKCS#1 RSAPrivateKey of 4096 bits with
+/// its CRT fields is about 2.4 KB; a PKCS#8 P-256 key is under 200 bytes.
+const MAX_KEY_LEN: usize = 2400;
 
 /// `transport` parameter values selecting which I/O path runs.
 const TRANSPORT_TCP: u8 = 0; // TLS records over a net_proto stream channel.
 const TRANSPORT_UDP: u8 = 1; // DTLS records over a datagram channel (RFC 9147).
 
-/// Per-peer datagram session count (DTLS mode).
+/// Per-peer datagram session count (DTLS mode). A peer carries its own
+/// handshake driver and reassembly buffer, ~29 KiB on a 32-bit core; the
+/// embedded arena holds one beside the stream session.
+#[cfg(target_arch = "aarch64")]
 const MAX_PEERS: usize = 4;
+#[cfg(not(target_arch = "aarch64"))]
+const MAX_PEERS: usize = 1;
 /// Maximum DTLS datagram payload.
 const DGRAM_MAX: usize = 1500;
 /// TARGET-SPECIFIC (same split as `MAX_SESSIONS`): a TLS peer may send
@@ -374,12 +384,11 @@ struct TlsSession {
     conn_id: u16,      // net_proto connection ID
     held_msg_type: u8, // held ACCEPTED/CONNECTED msg type to forward after handshake
 
-    /// Record-agnostic handshake state machine (Phase A — extracted into
-    /// HandshakeDriver). Owns the key schedule, transcript, ECDH state,
-    /// peer key share, peer cert pubkey, server random, ALPN selection,
-    /// and handshake-message reassembly scratch. DTLS (Phase B) and
-    /// QUIC (Phase C) reuse it verbatim with their own record /
-    /// packet protection layers.
+    /// Record-agnostic handshake state machine. Owns the key schedule,
+    /// transcript, ECDH state, peer key share, peer cert pubkey, server
+    /// random, ALPN selection, and handshake-message reassembly scratch.
+    /// DTLS and QUIC drive the same `HandshakeDriver` with their own
+    /// record / packet protection layers.
     driver: HandshakeDriver,
 
     // Traffic keys (record-coupled — derived from `driver.key_schedule`
@@ -438,6 +447,8 @@ struct TlsSession {
     /// span, latched when the handshake begins and the telemetry port is wired
     /// (`0` = no span). See `standards/observability.md`.
     span_start_us: u64,
+    /// Steps this handshake has made no progress; see `hs_stall_note`.
+    hs_idle_steps: u16,
     /// Cross-module trace context. `trace_ctx_trace`/`trace_ctx_parent` are the
     /// trace id + IP's span id received via `MSG_TRACE_CTX` (all-zero trace =
     /// none → root). `span_id` is this session's own span id, minted at
@@ -464,6 +475,15 @@ struct TlsSession {
     span_id: [u8; 8],
 }
 
+/// Flash-resident prototypes of the empty slots. A session, a DTLS peer
+/// and a continuity shadow are tens of kilobytes each; built on the stack
+/// and moved into place, the three together are a frame larger than an
+/// embedded core's whole stack, so a slot is filled by copying its
+/// prototype in place instead. None of them holds a pointer, so the image
+/// needs no relocation for them.
+static EMPTY_SESSION: TlsSession = TlsSession::empty();
+static EMPTY_PEER: PeerSession = PeerSession::empty();
+
 impl TlsSession {
     const fn empty() -> Self {
         Self {
@@ -489,6 +509,7 @@ impl TlsSession {
             pending_peer_identity: [0; PEER_IDENTITY_MAX_TOTAL],
             pending_peer_identity_len: 0,
             span_start_us: 0,
+            hs_idle_steps: 0,
             trace_ctx_trace: [0; 16],
             trace_ctx_parent: [0; 8],
             trace_ctx_flags: 0,
@@ -654,26 +675,47 @@ struct TlsState {
     syscalls: *const SyscallTable,
     mode: u8, // 0=client, 1=server
     verify_peer: u8,
-    /// Bits of the P-256 ladder to process per pump tick. 256 runs the full
-    /// ladder in one call; smaller values yield between chunks so a second
-    /// concurrent handshake doesn't wait for the first to finish.
+    /// Bits of a key-exchange ladder — P-256's, X25519's, and the ECDSA
+    /// verification ladders — to process per pump tick. 256 runs a ladder
+    /// in one call; smaller values yield between chunks so a step fits the
+    /// tick and a second concurrent handshake doesn't wait for the first.
     ecdh_bits_per_step: u16,
+    /// Rows of an RSA Montgomery product (and units of a modulus
+    /// preparation) one step may spend on a deferred signature; 0 means
+    /// the whole exponentiation in one step.
+    rsa_rows_per_step: u16,
+    /// The one RSA verify job this instance owns, shared by every session
+    /// and by the DTLS peers: it is kilobytes, and a handshake that needs
+    /// it waits for the session holding it. `rsa_owner` is that session
+    /// (DTLS peers offset by `RSA_OWNER_DTLS`), or -1 when it is free.
+    rsa_verify: RsaVerifyJob,
+    rsa_owner: i32,
+    /// Vault calls the in-flight RSA CertificateVerify signature has taken.
+    rsa_sign_steps: u16,
+    /// The unread tail of a `MSG_DATA` frame for a handshaking session whose
+    /// record buffer was full: its connection and the bytes still in
+    /// `cipher_in`. Frames behind it wait until it has been absorbed, so
+    /// the stream keeps its order and nothing is dropped while the
+    /// handshake makes the room — a whole server flight can be a segment
+    /// longer than the buffer while the key exchange still runs.
+    hs_pending_conn: u16,
+    hs_pending_left: u32,
     /// Emit per-phase `[tls] heavy ...` timing. Adds five
     /// `dev_micros` syscalls per tick (~25 µs at default tick_us);
     /// leave off for perf runs, on only when triaging step costs.
     diag_phase_timing: u8,
     /// Handshake state transitions a session may take per tick.
-    /// 1 (the default, and the former hard-coded value) paces concurrent
-    /// connection setup at one leg per tick per session; raising it lets
+    /// 1 (the default) paces concurrent connection setup at one leg per
+    /// tick per session; raising it lets
     /// simultaneous handshakes overlap. See the use site for the starvation
     /// bound that makes a budget above one safe.
     handshake_pump_budget: u16,
     /// ALPN restriction for the server EncryptedExtensions selection.
-    /// 0 (default) offers the historic `h2` > `http/1.1` preference. 1
-    /// restricts the advertised set to `http/1.1` only, so a client that
-    /// offers both is steered to HTTP/1.1. An edge that fronts an h1-only
-    /// proxy relay (`workload_ingress` §3) sets this so h2 clients don't
-    /// negotiate a protocol the relay can't route.
+    /// 0 (default) offers the `h2` > `http/1.1` preference. 1 restricts
+    /// the advertised set to `http/1.1` only, so a client that offers
+    /// both is steered to HTTP/1.1. An edge whose clear-side consumer is
+    /// an h1-only proxy relay sets this: the relay can only route
+    /// HTTP/1.1, so h2 must never be the negotiated protocol.
     alpn_h1_only: u8,
 
     // Channel ports (4-port node: cipher side facing IP, clear side facing HTTP)
@@ -758,10 +800,10 @@ struct TlsState {
     pending_connect_active: bool,
 
     /// Cleartext-passthrough conn_id set (256-bit bitmap, conn_id → bit).
-    /// A NEW, additive conn class introduced for `workload_ingress` §5: when a
-    /// SERVER-mode TLS instance's clear-side consumer (an h1 proxy relay) dials
-    /// a cleartext backend, the resulting `MSG_CONNECTED` conn_id is marked here
-    /// instead of allocating a TLS session. Passthrough conns relay
+    /// When a SERVER-mode TLS instance's clear-side consumer (an h1 proxy
+    /// relay) dials a cleartext backend, the resulting `MSG_CONNECTED` conn_id
+    /// is marked here instead of allocating a TLS session. Passthrough conns
+    /// relay
     /// `MSG_CONNECTED` / `MSG_DATA` / `MSG_CLOSED` (cipher→clear) and clear-side
     /// `CMD_SEND` / `CMD_CLOSE` (clear→cipher) RAW — no session, no crypto, no
     /// ClientHello. Inbound-terminated TLS sessions never set a bit here, so the
@@ -774,6 +816,9 @@ struct TlsState {
     cert_len: usize,
     key: [u8; MAX_KEY_LEN],
     key_len: usize,
+    /// The vault suite of an RSA identity key, or 0 for a P-256 one: it
+    /// decides the CertificateVerify scheme this instance signs with.
+    identity_rsa_suite: u16,
 
     /// Selected peer-authentication profile. `PROFILE_NONE` is the
     /// absence of a profile, not a permissive one: a client instance
@@ -1038,8 +1083,14 @@ define_params! {
             s.handshake_pump_budget = if v == 0 { 1 } else { v };
         };
 
+    // Rows of an RSA product one step may spend verifying a deferred
+    // signature. 16 is a step of a few hundred microseconds on a Cortex-M33
+    // at 4096 bits, and a few microseconds on an A76; 0 means whole.
+    13, rsa_rows_per_step, u16, 16
+        => |s, d, len| { s.rsa_rows_per_step = p_u16(d, len, 0, 16); };
+
     // Restrict the server's ALPN advertisement to `http/1.1` only. 0 keeps the
-    // historic `h2` > `http/1.1` preference; 1 steers dual-offering clients to
+    // `h2` > `http/1.1` preference; 1 steers dual-offering clients to
     // HTTP/1.1 so an h1-only proxy edge never negotiates h2.
     10, alpn_h1_only, u8, 0
         => |s, d, len| { s.alpn_h1_only = p_u8(d, len, 0, 0); };
@@ -1063,11 +1114,6 @@ define_params! {
 #[no_mangle]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<TlsState>() as u32
-}
-
-#[no_mangle]
-pub extern "C" fn module_arena_size() -> u32 {
-    65536 // 64KB heap for handshake scratch
 }
 
 #[no_mangle]
@@ -1100,6 +1146,10 @@ pub unsafe extern "C" fn module_new(
     s.expected_uri_len = 0;
     s.last_peer_auth_error = 0;
     s.key_vault_handle = -1;
+    s.rsa_owner = -1;
+    s.rsa_sign_steps = 0;
+    s.hs_pending_conn = 0;
+    s.hs_pending_left = 0;
     s.ecdh_pool_hit = 0;
     s.ecdh_fallback_keygen = 0;
     s.frame_write_dropped = 0;
@@ -1133,7 +1183,7 @@ pub unsafe extern "C" fn module_new(
     s.pend_steps = 0;
     let mut i = 0;
     while i < MAX_PEERS {
-        s.peer_sessions[i] = PeerSession::empty();
+        core::ptr::copy_nonoverlapping(&EMPTY_PEER, &mut s.peer_sessions[i], 1);
         i += 1;
     }
 
@@ -1152,7 +1202,7 @@ pub unsafe extern "C" fn module_new(
     s.cont_vault_handle = -1;
     let mut i = 0;
     while i < MAX_TLS_SHADOWS {
-        s.shadows[i] = TlsShadow::empty();
+        core::ptr::copy_nonoverlapping(&EMPTY_SHADOW, &mut s.shadows[i], 1);
         i += 1;
     }
 
@@ -1160,7 +1210,7 @@ pub unsafe extern "C" fn module_new(
     // slot-initialised by `SessionArena::grow` at grant time.
     let mut i = 0;
     while i < s.sessions.len() {
-        s.sessions[i] = TlsSession::empty();
+        core::ptr::copy_nonoverlapping(&EMPTY_SESSION, &mut s.sessions[i], 1);
         i += 1;
     }
 
@@ -1222,6 +1272,49 @@ pub unsafe extern "C" fn module_new(
     // the in-module incremental signer the user opted into.
     const KV_PROBE: u32 = 0x1000;
     const KV_STORE: u32 = 0x1001;
+    // An RSA identity always signs through the vault: the module carries no
+    // in-module RSA signer, and the vault's is resumable. A target whose
+    // vault does not hold RSA refuses the key here, which the composer
+    // already did from the target's facts.
+    s.identity_rsa_suite = 0;
+    if s.key_len > 0 {
+        if let Some(suite) = rsa_identity_suite(&s.key[..s.key_len]) {
+            let present = (sys.provider_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
+            let mut handle = -1;
+            if present == 1 {
+                // STORE v1: [suite:u16][usage_mask:u32][key_len:u32][key]
+                const USAGE_SIGN: u32 = 1 << 0;
+                let mut store_arg = [0u8; 10 + MAX_KEY_LEN];
+                store_arg[0..2].copy_from_slice(&suite.to_le_bytes());
+                store_arg[2..6].copy_from_slice(&USAGE_SIGN.to_le_bytes());
+                // The vault takes the PKCS#1 form; a PKCS#8 wrapper is
+                // shed here, where the key was already read as one.
+                let pkcs1 = rsa_private_key_pkcs1(&s.key[..s.key_len]).unwrap_or(&[]);
+                let n = pkcs1.len();
+                store_arg[6..10].copy_from_slice(&(n as u32).to_le_bytes());
+                store_arg[10..10 + n].copy_from_slice(pkcs1);
+                handle = (sys.provider_call)(-1, KV_STORE, store_arg.as_mut_ptr(), 10 + n);
+                let mut j = 0;
+                while j < store_arg.len() {
+                    core::ptr::write_volatile(&mut store_arg[j], 0);
+                    j += 1;
+                }
+            }
+            let mut j = 0;
+            while j < s.key_len {
+                core::ptr::write_volatile(&mut s.key[j], 0);
+                j += 1;
+            }
+            s.key_len = 0;
+            if handle < 0 {
+                let msg = b"[tls] refusing to construct: RSA identity key, and this target's vault does not hold RSA";
+                dev_log(sys, 1, msg.as_ptr(), msg.len());
+                return -1;
+            }
+            s.key_vault_handle = handle;
+            s.identity_rsa_suite = suite;
+        }
+    }
     let use_vault = s.ecdh_bits_per_step >= 256;
     if use_vault && s.key_len >= 32 {
         let present = (sys.provider_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
@@ -1270,6 +1363,35 @@ pub unsafe extern "C" fn module_new(
     }
 
     0
+}
+
+/// The vault suite of a `key_file` that is a PKCS#1 RSAPrivateKey, or
+/// `None` for anything else (a P-256 key in either of its encodings). Read
+/// by parsing the key as the vault will, so what is stored is what was
+/// recognised.
+fn rsa_identity_suite(der: &[u8]) -> Option<u16> {
+    // A PKCS#1 key opens SEQUENCE, INTEGER 0, INTEGER n; a P-256 PKCS#8 or
+    // SEC1 key does not have that shape, and neither parses here.
+    if der.len() < 16 || der[0] != 0x30 {
+        return None;
+    }
+    let pkcs1 = rsa_private_key_pkcs1(der)?;
+    let mut key = RsaPrivateKey::empty();
+    if !key.load_pkcs1_der(pkcs1) {
+        return None;
+    }
+    let suite = match key.n.bits() {
+        2048 => 10,
+        3072 => 11,
+        4096 => 12,
+        _ => 0,
+    };
+    key.zeroize();
+    if suite == 0 {
+        None
+    } else {
+        Some(suite)
+    }
 }
 
 /// Parse extended TLV entries: `cert_file` (10), `key_file` (11),
@@ -1485,13 +1607,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // Session census: how many slots are live, and how many of those
         // are still mid-handshake.
         //
-        // Without it, a session that neither completes nor errors is
-        // invisible — the counters show bytes moving and nothing showing
-        // whether anything ever got past the handshake. That is the exact
-        // hole that made a control-plane transport bug unfalsifiable for a
-        // whole programme of work: `clr_rx > 0, clr_tx = 0` says data
-        // arrived and nothing came back, and says nothing at all about
-        // WHERE the sessions producing it got to.
+        // The census is what makes a session that neither completes nor
+        // errors visible: the byte counters alone show traffic moving
+        // without saying whether anything ever got past the handshake, so
+        // `clr_rx > 0, clr_tx = 0` would say data arrived and nothing came
+        // back while saying nothing about WHERE the sessions producing it
+        // got to.
         //
         // The bound is `sessions.len()` — GRANTED slots — and NOT
         // `MAX_SESSIONS`, which is the pool's maximum. On aarch64 the arena
@@ -1499,16 +1620,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // so `sessions[8]` before the first grant indexes `extra[0]`, which
         // is a NULL pointer in kernel-zeroed module state. `SessionArena`'s
         // `Index` guards that with a `debug_assert!`, which is compiled out
-        // of a release PIC build — so the read is an unchecked deref of
+        // of a release PIC build — so such a read is an unchecked deref of
         // null and the runtime takes SIGSEGV on the first heartbeat.
-        //
-        // That is not a hypothetical: this loop shipped with the wrong bound
-        // and crashed `fluxor-linux` on every aarch64 `tls` graph as soon as
-        // the heartbeat fired, which from a client is a socket that opens
-        // and goes quiet — indistinguishable from the transport defect this
-        // census was added to diagnose. Iterating a pool by its capacity
-        // instead of its occupancy is the bug the `iter()` helper exists to
-        // make unavailable, so this uses it.
+        // Iterating a pool by its capacity instead of its occupancy is the
+        // bug the `iter()` helper exists to make unavailable, so this
+        // uses it.
         let mut live = 0u32;
         let mut handshaking = 0u32;
         let mut ready = 0u32;
@@ -1649,8 +1765,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let progressed = pump_session(s, i);
                 record_drain_outbound(s, i);
                 if !drained && !progressed {
+                    hs_stall_note(s, i);
                     break;
                 }
+                s.sessions[i].hs_idle_steps = 0;
                 did_work = true;
                 steps += 1;
             }
@@ -1683,6 +1801,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         let poll_ci = (sys.channel_poll)(s.cipher_in, POLL_IN);
         if poll_ci <= 0 || (poll_ci as u32 & POLL_IN) == 0 {
             break;
+        }
+        if s.hs_pending_left > 0 {
+            if !absorb_pending_frame(s) {
+                break;
+            }
+            did_work = true;
         }
         let (msg_type, payload_len) = tls_read_header(sys, s.cipher_in);
         // A partial header means the producer is mid-write: no progress is
@@ -1895,41 +2019,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if si >= 0 {
                         let idx = si as usize;
                         if s.sessions[idx].state == SessionState::Handshaking {
-                            // Feed ciphertext into handshake recv_buf
-                            let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
-                            let to_read = if data_len < space { data_len } else { space };
-                            if to_read > 0 {
-                                let got = (sys.channel_read)(
-                                    s.cipher_in,
-                                    s.sessions[idx]
-                                        .recv_buf
-                                        .as_mut_ptr()
-                                        .add(s.sessions[idx].recv_len),
-                                    to_read,
-                                );
-                                // `channel_read` on a byte FIFO returns WHAT IS
-                                // AVAILABLE, up to `len`, so advance by what it
-                                // actually wrote. Advancing by what was ASKED
-                                // for would leave a hole of stale bytes in the
-                                // middle of the record stream, and every record
-                                // after it would fail to decrypt under a
-                                // perfectly good key.
-                                //
-                                // Measured as never firing on this path today
-                                // (the writer assembles each frame and writes it
-                                // in one call). Written this way anyway because
-                                // "never happens" here is a property of the
-                                // writer, not of this contract, and the failure
-                                // it would cause is silent.
-                                if got > 0 {
-                                    #[expect(clippy::cast_sign_loss, reason = "guarded > 0 above")]
-                                    let n = got as usize;
-                                    s.sessions[idx].recv_len += n;
-                                    continuity_after_recv_append(s, idx);
-                                }
-                            }
-                            if data_len > to_read {
-                                tls_discard(sys, s.cipher_in, data_len - to_read);
+                            // Feed ciphertext into the handshake recv_buf; what
+                            // does not fit stays in the channel as the pending
+                            // tail, absorbed once the handshake has drained a
+                            // record.
+                            let taken = hs_append_from_channel(s, idx, data_len);
+                            if taken < data_len {
+                                s.hs_pending_conn = conn_id;
+                                s.hs_pending_left = (data_len - taken) as u32;
+                                break;
                             }
                         } else if s.sessions[idx].state == SessionState::Ready {
                             // Feed ciphertext into recv_buf, decrypting +
@@ -2710,6 +2808,8 @@ fn clear_passthrough(s: &mut TlsState, conn_id: u16) {
 /// `net_scratch` used by `tls_write_or_count` (which the local read buffer must
 /// not alias, hence the stack buffer here). A dropped chunk is counted via
 /// `tls_write_or_count`; TCP's ARQ recovers on the wire side.
+// Its kilobytes of staging stay off the step's frame until it is called.
+#[inline(never)]
 unsafe fn passthrough_relay(
     s: &mut TlsState,
     from_chan: i32,
@@ -2734,39 +2834,6 @@ unsafe fn passthrough_relay(
 }
 
 // Peer certificate verification is deferred — requires larger module binary.
-/// Verify CertificateVerify signature from peer. Returns true on success.
-unsafe fn verify_peer_cert_verify(s: &TlsState, idx: usize, data: &[u8], len: usize) -> bool {
-    let sess = &s.sessions[idx];
-    // No peer cert means nothing to verify against. If mTLS is required
-    // (server with verify_peer=1, or client always), the caller must
-    // have already rejected an empty Certificate message — by the time
-    // we get here, a zero pubkey means the chain of trust is broken.
-    if sess.driver.peer_cert_pubkey_len == 0 {
-        return false;
-    }
-    let hl = sess.driver.suite.hash_len();
-    let transcript_hash = match &sess.driver.transcript {
-        Some(t) => t.current_hash(),
-        None => return false,
-    };
-    let context: &[u8] = if sess.driver.is_server {
-        b"TLS 1.3, client CertificateVerify"
-    } else {
-        b"TLS 1.3, server CertificateVerify"
-    };
-    let mut vc = [0u8; 200];
-    let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut vc);
-    let vc_hash = sha256(&vc[..vc_len]);
-    let cv_body = &data[4..len];
-    if let Some(sig_der) = parse_certificate_verify_expecting(cv_body, SIG_ECDSA_SECP256R1_SHA256) {
-        if let Some(raw_sig) = parse_der_signature(sig_der) {
-            let pk = &sess.driver.peer_cert_pubkey[..sess.driver.peer_cert_pubkey_len as usize];
-            return ecdsa_verify(pk, &vc_hash, &raw_sig);
-        }
-    }
-    false
-}
-
 /// Does this instance carry a complete peer-authentication profile for the
 /// role it is configured in?
 ///
@@ -2843,7 +2910,12 @@ fn chain_policy(s: &TlsState, require_eku: u8, now_unix_secs: u64) -> ChainPolic
 ///
 /// The single certificate-acceptance decision for every transport this
 /// module drives. Returns [`CERT_OK`] or the reason code.
-unsafe fn peer_cert_reason(s: &TlsState, is_server: bool, hs_body: &[u8]) -> u32 {
+unsafe fn peer_cert_reason(
+    s: &TlsState,
+    is_server: bool,
+    hs_body: &[u8],
+    deferred: Option<&mut DeferredLinks>,
+) -> u32 {
     // A server validates a client certificate and a client validates a
     // server's, so the purpose the leaf must be authorised for is the role
     // of the peer, not of this instance.
@@ -2853,7 +2925,7 @@ unsafe fn peer_cert_reason(s: &TlsState, is_server: bool, hs_body: &[u8]) -> u32
         EKU_SERVER_AUTH
     };
     let now = trusted_now_secs(&*s.syscalls);
-    verify_chain(hs_body, &chain_policy(s, require_eku, now))
+    verify_chain_with(hs_body, &chain_policy(s, require_eku, now), deferred)
 }
 
 /// The calendar time a certificate lifetime may be checked against, or 0
@@ -2887,24 +2959,19 @@ unsafe fn bind_peer_cert_key(driver: &mut HandshakeDriver, hs_body: &[u8]) -> u3
         Some(d) => d,
         None => return CERT_ERR_MSG_MALFORMED,
     };
-    let cert = match parse_certificate(cert_der) {
-        Some(c) => c,
-        None => return CERT_ERR_MALFORMED,
-    };
-    let pk = cert.public_key;
-    if !public_point_is_valid(pk) {
-        return CERT_ERR_BAD_KEY;
-    }
-    core::ptr::copy_nonoverlapping(pk.as_ptr(), driver.peer_cert_pubkey.as_mut_ptr(), pk.len());
-    driver.peer_cert_pubkey_len = pk.len() as u8;
-    CERT_OK
+    bind_peer_cert_key_core(driver, cert_der)
 }
 
 /// TCP-TLS adapter: validate, bind, and report. Returns false when the peer
 /// is refused, leaving the session for the caller to fail.
 unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8]) -> bool {
     let is_server = s.sessions[idx].driver.is_server;
-    let mut rc = peer_cert_reason(s, is_server, hs_body);
+    let mut deferred = core::mem::replace(
+        &mut s.sessions[idx].driver.deferred_links,
+        DeferredLinks::empty(),
+    );
+    let mut rc = peer_cert_reason(s, is_server, hs_body, Some(&mut deferred));
+    s.sessions[idx].driver.deferred_links = deferred;
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.sessions[idx].driver, hs_body);
     }
@@ -2916,6 +2983,145 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
     }
     s.last_peer_auth_error = CERT_OK;
     true
+}
+
+/// After a chain was accepted: either move to `next`, or — when the walk
+/// deferred RSA links — hold the message and go verify them first.
+unsafe fn after_peer_cert(driver: &mut HandshakeDriver, msg: &[u8], next: HandshakeState) {
+    if driver.deferred_links.pending() {
+        driver.scratch[..msg.len()].copy_from_slice(msg);
+        driver.held_len = msg.len() as u16;
+        driver.rsa_job_active = 0;
+        driver.after_verify = next;
+        driver.verify_steps = 0;
+        driver.hs_state = HandshakeState::VerifyChain;
+    } else {
+        driver.hs_state = next;
+    }
+}
+
+/// The DTLS peer slots share the instance job with the TCP sessions; their
+/// owner ids are offset so the two index spaces cannot collide.
+const RSA_OWNER_DTLS: i32 = 0x1000;
+
+/// Whether `owner` may use the instance job now: it holds it, or nobody
+/// does.
+fn rsa_job_available(s: &TlsState, owner: i32) -> bool {
+    s.rsa_owner < 0 || s.rsa_owner == owner
+}
+
+/// The ladder bits one step spends on an ECDSA verification: the same
+/// knob that paces the ECDH ladder, since both are the P-256 ladder.
+fn ec_bits_per_step(s: &TlsState) -> u8 {
+    if s.ecdh_bits_per_step >= 256 {
+        0
+    } else {
+        s.ecdh_bits_per_step as u8
+    }
+}
+
+fn rsa_rows(s: &TlsState) -> usize {
+    if s.rsa_rows_per_step == 0 {
+        usize::MAX
+    } else {
+        s.rsa_rows_per_step as usize
+    }
+}
+
+/// Drive the instance job for a TCP session in `VerifyChain` or
+/// `VerifyPeerSignature`.
+unsafe fn pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
+    let owner = idx as i32;
+    if !rsa_job_available(s, owner) {
+        return false;
+    }
+    s.rsa_owner = owner;
+    let rows = rsa_rows(s);
+    let anchor_len = s.anchor_len;
+    // The anchor and the job are disjoint fields of `s`; the driver is a
+    // third. Raw pointers keep the three borrows apart for the call.
+    let anchor = core::slice::from_raw_parts(s.anchor.as_ptr(), anchor_len);
+    let job: *mut RsaVerifyJob = &mut s.rsa_verify;
+    let ec_bits = ec_bits_per_step(s);
+    let stage_chain = s.sessions[idx].driver.hs_state == HandshakeState::VerifyChain;
+    let outcome = rsa_verify_pump_core(
+        &mut s.sessions[idx].driver,
+        &mut *job,
+        anchor,
+        rows,
+        ec_bits,
+    );
+    match outcome {
+        RsaPump::Progress => true,
+        RsaPump::Done => {
+            s.rsa_owner = -1;
+            if stage_chain {
+                log_chain_verified(s, idx);
+            }
+            true
+        }
+        RsaPump::Failed => {
+            s.rsa_owner = -1;
+            let conn_id = s.sessions[idx].conn_id;
+            // Which signature it was: a chain link or the peer's
+            // CertificateVerify. The reason code is the same; the stage is
+            // what an operator needs next.
+            let sys = &*s.syscalls;
+            let msg: &[u8] = if s.sessions[idx].driver.hs_state == HandshakeState::VerifyChain {
+                b"[tls] stepped verify FAIL stage=chain"
+            } else {
+                b"[tls] stepped verify FAIL stage=certificate_verify"
+            };
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            log_peer_auth_failure(s, conn_id, CERT_ERR_SIGNATURE);
+            send_alert(s, idx, cert_error_alert(CERT_ERR_SIGNATURE));
+            s.sessions[idx].driver.hs_state = HandshakeState::Error;
+            true
+        }
+    }
+}
+
+/// `[tls] chain verified suite=<leaf signature> links=<n> steps=<n>`: the
+/// deferred chain walk finished, with the pump calls it took. The suite
+/// name is written at each arm rather than returned from one: a `match`
+/// yielding one of several literals is a table of their addresses, which
+/// a flat module image never relocates.
+unsafe fn log_chain_verified(s: &mut TlsState, idx: usize) {
+    let d = &s.sessions[idx].driver;
+    let suite = if d.deferred_links.len > 0 {
+        d.deferred_links.links[0].sig_suite
+    } else {
+        suite::UNKNOWN
+    };
+    let links = d.deferred_links.len as u32;
+    let steps = d.verify_steps as u32;
+    s.sessions[idx].driver.verify_steps = 0;
+    if suite == suite::RSA_PKCS1_SHA256 || suite == suite::RSA_PKCS1_SHA384 {
+        log_chain_verified_line(s, b"[tls] chain verified suite=rsa_pkcs1", links, steps);
+    } else if suite == suite::RSA_PSS {
+        log_chain_verified_line(s, b"[tls] chain verified suite=rsa_pss", links, steps);
+    } else if suite == suite::ECDSA_P256_SHA256 {
+        log_chain_verified_line(s, b"[tls] chain verified suite=ecdsa_p256", links, steps);
+    } else {
+        log_chain_verified_line(s, b"[tls] chain verified suite=unknown", links, steps);
+    }
+}
+
+unsafe fn log_chain_verified_line(s: &TlsState, head: &[u8], links: u32, steps: u32) {
+    let sys = &*s.syscalls;
+    let mut buf = [0u8; 96];
+    let mut pos = put_text(&mut buf, 0, head);
+    pos = put_text(&mut buf, pos, b" links=");
+    pos += fmt_u32_dec(links, buf.as_mut_ptr().add(pos));
+    pos = put_text(&mut buf, pos, b" steps=");
+    pos += fmt_u32_dec(steps, buf.as_mut_ptr().add(pos));
+    dev_log(sys, 3, buf.as_ptr(), pos);
+}
+
+fn put_text(line: &mut [u8], at: usize, text: &[u8]) -> usize {
+    let n = text.len().min(line.len() - at);
+    line[at..at + n].copy_from_slice(&text[..n]);
+    at + n
 }
 
 /// Report a refusal at error level, naming the profile and the reason so an
@@ -3161,13 +3367,45 @@ unsafe fn assign_fresh_ecdh_key(
 /// a pre-clamped copy would give one scalar two encodings. There is no
 /// pool to draw from — a single ladder is cheap enough to run inline,
 /// which is also why it needs no resumable state.
-unsafe fn driver_gen_x25519(sys: &SyscallTable, driver: &mut HandshakeDriver) -> bool {
-    let mut random = [0u8; X25519_SHARE_LEN];
-    if dev_csprng_fill(sys, random.as_mut_ptr(), X25519_SHARE_LEN) < 0 {
+/// Whether this build offers and accepts X25519 key shares. The X25519
+/// ladder runs to completion in one call, which is a few hundred
+/// microseconds on an A76 and a few hundred milliseconds on a Cortex-M33,
+/// where it is longer than the step guard. Embedded builds negotiate
+/// P-256 only, whose ladders are stepped at `ecdh_bits_per_step`.
+const X25519_OFFERED: bool = cfg!(target_arch = "aarch64");
+
+/// Advance the X25519 key-pair generation for `driver`, `bits_per_step`
+/// ladder bits per call: true once `x25519_public` is ready. The scalar
+/// is drawn on the first call and the ladder runs over the following
+/// steps, so the hello that carries the share is built when it is.
+unsafe fn x25519_keygen_step(
+    sys: &SyscallTable,
+    driver: &mut HandshakeDriver,
+    bits_per_step: u8,
+) -> bool {
+    if driver.x25519_pub_ready != 0 {
+        return true;
+    }
+    if !driver.x25519_state.is_initialised() {
+        let mut random = [0u8; X25519_SHARE_LEN];
+        if dev_csprng_fill(sys, random.as_mut_ptr(), X25519_SHARE_LEN) < 0 {
+            return false;
+        }
+        driver.x25519_private = random;
+        driver.x25519_state = X25519State::new_base(&random, bits_per_step);
+        let mut i = 0;
+        while i < X25519_SHARE_LEN {
+            core::ptr::write_volatile(random.as_mut_ptr().add(i), 0);
+            i += 1;
+        }
         return false;
     }
-    driver.x25519_public = x25519_public_key(&random);
-    driver.x25519_private = random;
+    if !driver.x25519_state.step() {
+        return false;
+    }
+    driver.x25519_public = driver.x25519_state.result();
+    driver.x25519_state.zeroise();
+    driver.x25519_pub_ready = 1;
     true
 }
 
@@ -3235,9 +3473,9 @@ unsafe fn init_session_crypto(s: &mut TlsState, idx: usize) {
 // When `read_keys.key_len == 0` the inbound level is Initial (records
 // are plaintext CT_HANDSHAKE); otherwise records are
 // CT_APPLICATION_DATA and decrypt under `read_keys`. Symmetrically for
-// `write_keys` on the outbound side. DTLS (Phase B) and QUIC (Phase C)
-// reuse the same driver via their own bridges — the in/out queues are
-// the only handshake-driver entry points either transport sees.
+// `write_keys` on the outbound side. DTLS and QUIC drive the same
+// driver through bridges of their own — the in/out queues are the only
+// handshake-driver entry points any transport sees.
 // ============================================================================
 
 /// True if the inbound record level is Initial — i.e. read_keys haven't
@@ -3552,6 +3790,8 @@ unsafe fn record_drain_outbound(s: &mut TlsState, idx: usize) {
 /// message, the only one a pending compatibility ChangeCipherSpec may
 /// follow. Returns false once the session has been failed, which is the
 /// caller's signal to stop draining.
+// Its kilobytes of staging stay off the step's frame until it is called.
+#[inline(never)]
 unsafe fn record_emit_handshake_fragment(
     s: &mut TlsState,
     idx: usize,
@@ -3712,6 +3952,11 @@ unsafe fn pump_session(s: &mut TlsState, idx: usize) -> bool {
         HandshakeState::RecvClientFinished => pump_recv_client_finished(s, idx),
         HandshakeState::DeriveAppKeys => pump_derive_app_keys(s, idx),
 
+        // ── Either role: a deferred RSA signature ──
+        HandshakeState::VerifyChain | HandshakeState::VerifyPeerSignature => {
+            pump_rsa_verify(s, idx)
+        }
+
         // ── Client flow ──
         HandshakeState::SendClientHello => pump_send_client_hello(s, idx),
         HandshakeState::RecvServerHello => pump_recv_server_hello(s, idx),
@@ -3850,7 +4095,7 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
     // every 32-byte string is a legal `u` and the contributory-behaviour
     // test happens on the result (RFC 7748 §6.1).
     match (ch.key_share_x25519, ch.key_share) {
-        (Some(key_data), _) if key_data.len() == X25519_SHARE_LEN => {
+        (Some(key_data), _) if X25519_OFFERED && key_data.len() == X25519_SHARE_LEN => {
             core::ptr::copy_nonoverlapping(
                 key_data.as_ptr(),
                 sess.driver.peer_key_share.as_mut_ptr(),
@@ -3858,11 +4103,6 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
             );
             sess.driver.peer_key_share_len = X25519_SHARE_LEN as u8;
             sess.driver.group = GROUP_X25519;
-            if !driver_gen_x25519(sys, &mut sess.driver) {
-                sess.state = SessionState::Error;
-                s.last_err_site = 26;
-                return true;
-            }
         }
         (_, Some((_, key_data))) if public_point_is_valid(key_data) => {
             core::ptr::copy_nonoverlapping(
@@ -3905,7 +4145,16 @@ unsafe fn pump_recv_client_hello(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_send_server_hello(s: &mut TlsState, idx: usize) -> bool {
+    let sys = &*s.syscalls;
+    let bits_per_step = ec_bits_per_step(s);
     let sess = &mut s.sessions[idx];
+    // The share the hello echoes is generated first, over as many steps
+    // as its ladder takes.
+    if sess.driver.group == GROUP_X25519
+        && !x25519_keygen_step(sys, &mut sess.driver, bits_per_step)
+    {
+        return true;
+    }
     if !pump_send_server_hello_core(&mut sess.driver) {
         return false;
     }
@@ -3926,6 +4175,8 @@ unsafe fn pump_send_hello_retry(s: &mut TlsState, idx: usize) -> bool {
     true
 }
 
+// Its kilobytes of staging stay off the step's frame until it is called.
+#[inline(never)]
 unsafe fn pump_send_certificate_request(s: &mut TlsState, idx: usize) -> bool {
     let mut buf = [0u8; SCRATCH_SIZE];
     let msg_len;
@@ -3962,7 +4213,11 @@ unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
                 s.last_err_site = 30;
                 return true;
             }
-            s.sessions[idx].driver.hs_state = HandshakeState::RecvClientCertVerify;
+            after_peer_cert(
+                &mut s.sessions[idx].driver,
+                &data[..len],
+                HandshakeState::RecvClientCertVerify,
+            );
             true
         }
         None => false,
@@ -3970,26 +4225,15 @@ unsafe fn pump_recv_client_cert(s: &mut TlsState, idx: usize) -> bool {
 }
 
 unsafe fn pump_recv_client_cert_verify(s: &mut TlsState, idx: usize) -> bool {
-    match recv_encrypted_handshake(s, idx) {
-        Some((data, len, msg_type)) => {
-            if msg_type != 15 {
-                s.sessions[idx].state = SessionState::Error;
-                s.last_err_site = 31;
-                return true;
-            }
-            if !verify_peer_cert_verify(s, idx, &data, len) {
-                s.sessions[idx].state = SessionState::Error;
-                s.last_err_site = 32;
-                return true;
-            }
-            if let Some(ref mut t) = s.sessions[idx].driver.transcript {
-                t.update(&data[..len]);
-            }
-            s.sessions[idx].driver.hs_state = HandshakeState::RecvClientFinished;
-            true
-        }
-        None => false,
+    // The same check the client makes of a server, with the roles read
+    // from the driver: the core hashes under the announced scheme, verifies
+    // ECDSA in place and hands RSA-PSS to the instance job.
+    let r = pump_recv_certificate_verify_core(&mut s.sessions[idx].driver);
+    if s.sessions[idx].driver.is_handshake_error() {
+        s.sessions[idx].state = SessionState::Error;
+        s.last_err_site = 32;
     }
+    r
 }
 
 unsafe fn pump_derive_handshake_keys(s: &mut TlsState, idx: usize) -> bool {
@@ -4041,6 +4285,8 @@ unsafe fn note_aes_gcm_exposure(s: &mut TlsState, suite: CipherSuite) {
     }
 }
 
+// Its kilobytes of staging stay off the step's frame until it is called.
+#[inline(never)]
 unsafe fn pump_send_encrypted_extensions(s: &mut TlsState, idx: usize) -> bool {
     let mut buf = [0u8; SCRATCH_SIZE];
     let msg_len;
@@ -4080,6 +4326,9 @@ unsafe fn pump_send_certificate(s: &mut TlsState, idx: usize) -> bool {
 
 unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
+    if s.identity_rsa_suite != 0 {
+        return pump_send_certificate_verify_rsa(s, idx);
+    }
     let bits_per_step = if s.ecdh_bits_per_step >= 256 {
         0u8
     } else {
@@ -4205,15 +4454,136 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     finalise_certificate_verify(s, idx, &raw_sig)
 }
 
+/// Emit CertificateVerify under an RSA identity: RSASSA-PSS-SHA256 over the
+/// verify content's digest, signed by the vault's resumable job. The digest
+/// is recomputed from the transcript on every call — the transcript does
+/// not move until the message is appended, so the vault sees the same
+/// digest and continues the job it started — and `EAGAIN` means come back
+/// next step.
+unsafe fn pump_send_certificate_verify_rsa(s: &mut TlsState, idx: usize) -> bool {
+    let sys = &*s.syscalls;
+    let sess = &mut s.sessions[idx];
+    let hl = sess.driver.suite.hash_len();
+    let transcript_hash = match &sess.driver.transcript {
+        Some(t) => t.current_hash(),
+        None => {
+            sess.state = SessionState::Error;
+            s.last_err_site = 33;
+            return true;
+        }
+    };
+    let context: &[u8; 33] = if sess.driver.is_server {
+        b"TLS 1.3, server CertificateVerify"
+    } else {
+        b"TLS 1.3, client CertificateVerify"
+    };
+    let mut verify_content = [0u8; 200];
+    let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
+    let vc_hash = sha256(&verify_content[..vc_len]);
+    if s.key_vault_handle < 0 {
+        s.sessions[idx].driver.hs_state = HandshakeState::Error;
+        return true;
+    }
+    const KV_SIGN: u32 = 0x1003;
+    const SIGN_MODE_DIGEST: u8 = 1;
+    let mut sig = [0u8; RSA_BYTES_MAX];
+    let mut sign_arg = [0u8; 6 + 32 + 12];
+    sign_arg[0] = SIGN_MODE_DIGEST;
+    sign_arg[2..6].copy_from_slice(&32u32.to_le_bytes());
+    sign_arg[6..38].copy_from_slice(&vc_hash);
+    let sig_ptr = sig.as_mut_ptr() as u64;
+    sign_arg[38..46].copy_from_slice(&sig_ptr.to_le_bytes());
+    sign_arg[46..48].copy_from_slice(&(RSA_BYTES_MAX as u16).to_le_bytes());
+    let rc = (sys.provider_call)(
+        s.key_vault_handle,
+        KV_SIGN,
+        sign_arg.as_mut_ptr(),
+        sign_arg.len(),
+    );
+    if rc == abi::errno::EBUSY {
+        // The vault's one job is another session's signature; this one
+        // waits its turn.
+        return true;
+    }
+    s.rsa_sign_steps = s.rsa_sign_steps.wrapping_add(1);
+    if rc == abi::errno::EAGAIN {
+        return true;
+    }
+    if rc != 0 {
+        s.rsa_sign_steps = 0;
+        s.sessions[idx].driver.hs_state = HandshakeState::Error;
+        return true;
+    }
+    log_sign_steps(s);
+    let sig_len = u16::from_le_bytes([sign_arg[48], sign_arg[49]]) as usize;
+    finalise_certificate_verify_with(s, idx, SIG_RSA_PSS_RSAE_SHA256, &sig[..sig_len])
+}
+
+/// A handshake that has made no progress for two thousand steps, under
+/// `diag_phase_timing`: `[tls] hs stall st=<state> in=<in_len>
+/// rv=<recv_len> held=<held_len> job=<active> owner=<rsa_owner>`, the
+/// numbers an operator needs to tell a peer that stopped talking from a
+/// message the driver holds and cannot consume.
+unsafe fn hs_stall_note(s: &mut TlsState, idx: usize) {
+    let n = s.sessions[idx].hs_idle_steps.saturating_add(1);
+    s.sessions[idx].hs_idle_steps = n;
+    if s.diag_phase_timing == 0 || n < 2000 {
+        return;
+    }
+    s.sessions[idx].hs_idle_steps = 0;
+    let sess = &s.sessions[idx];
+    let fields: [(&[u8], u32); 6] = [
+        (b"[tls] hs stall st=", sess.driver.hs_state as u8 as u32),
+        (b" in=", sess.driver.in_len as u32),
+        (b" rv=", sess.recv_len as u32),
+        (b" held=", sess.driver.held_len as u32),
+        (b" job=", sess.driver.rsa_job_active as u32),
+        (b" owner=", s.rsa_owner as u32),
+    ];
+    let mut buf = [0u8; 96];
+    let mut pos = 0usize;
+    for (label, v) in fields {
+        pos = put_text(&mut buf, pos, label);
+        pos += fmt_u32_dec(v, buf.as_mut_ptr().add(pos));
+    }
+    let sys = &*s.syscalls;
+    dev_log(sys, 2, buf.as_ptr(), pos);
+}
+
+/// `[tls] sign steps=<n>`: the vault calls one RSA CertificateVerify took.
+unsafe fn log_sign_steps(s: &mut TlsState) {
+    let sys = &*s.syscalls;
+    let mut buf = [0u8; 40];
+    let head = b"[tls] sign steps=";
+    buf[..head.len()].copy_from_slice(head);
+    let n = head.len() + fmt_u32_dec(s.rsa_sign_steps as u32, buf.as_mut_ptr().add(head.len()));
+    s.rsa_sign_steps = 0;
+    dev_log(sys, 3, buf.as_ptr(), n);
+}
+
 /// Build the CertificateVerify message + update transcript + send.
 /// Shared by both the vault-sign and incremental-in-module paths in
 /// `pump_send_certificate_verify`. Returns true to signal handshake
 /// progress (transitions state to `SendFinished`).
 #[inline]
 unsafe fn finalise_certificate_verify(s: &mut TlsState, idx: usize, raw_sig: &[u8; 64]) -> bool {
-    let sess = &mut s.sessions[idx];
     let (der_sig, der_len) = encode_der_signature(raw_sig);
-    let msg_len = build_certificate_verify(&der_sig, der_len, &mut sess.driver.scratch);
+    finalise_certificate_verify_with(s, idx, SIG_ECDSA_SECP256R1_SHA256, &der_sig[..der_len])
+}
+
+/// The CertificateVerify message for `signature` as it goes on the wire
+/// under `scheme`, appended to the transcript and sent.
+// Its kilobytes of staging stay off the step's frame until it is called.
+#[inline(never)]
+unsafe fn finalise_certificate_verify_with(
+    s: &mut TlsState,
+    idx: usize,
+    scheme: u16,
+    signature: &[u8],
+) -> bool {
+    let sess = &mut s.sessions[idx];
+    let msg_len =
+        build_certificate_verify(scheme, signature, signature.len(), &mut sess.driver.scratch);
 
     if let Some(ref mut t) = sess.driver.transcript {
         t.update(&sess.driver.scratch[..msg_len]);
@@ -4678,6 +5048,8 @@ unsafe fn service_pending_peer_identity(s: &mut TlsState) {
 // Client handshake steps
 // ============================================================================
 
+// Its kilobytes of staging stay off the step's frame until it is called.
+#[inline(never)]
 unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     // `alpn_h1_only` governs BOTH directions: the server's
@@ -4698,7 +5070,11 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let mut sni_buf = [0u8; MAX_EXPECTED_DNS];
     core::ptr::copy_nonoverlapping(s.expected_dns.as_ptr(), sni_buf.as_mut_ptr(), sni_len);
     let sni = &sni_buf[..sni_len];
+    let bits_per_step = ec_bits_per_step(s);
     let sess = &mut s.sessions[idx];
+    if X25519_OFFERED && !x25519_keygen_step(sys, &mut sess.driver, bits_per_step) {
+        return true;
+    }
 
     let mut random = [0u8; 32];
     dev_csprng_fill(sys, random.as_mut_ptr(), 32);
@@ -4708,16 +5084,17 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     sess.driver.peer_session_id = session_id;
     sess.driver.peer_session_id_len = 32;
 
-    if !driver_gen_x25519(sys, &mut sess.driver) {
-        return false;
-    }
     let alpn: &[u8] = if alpn_h1_only { b"http/1.1" } else { &[] };
     let x25519_pub = sess.driver.x25519_public;
     let msg_len = build_client_hello_sni(
         &random,
         &session_id,
         &sess.driver.ecdh_public,
-        Some(&x25519_pub),
+        if X25519_OFFERED {
+            Some(&x25519_pub)
+        } else {
+            None
+        },
         &[],
         alpn,
         sni,
@@ -4796,7 +5173,11 @@ unsafe fn pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
                 s.last_err_site = 36;
                 return true;
             }
-            s.sessions[idx].driver.hs_state = HandshakeState::RecvCertificateVerify;
+            after_peer_cert(
+                &mut s.sessions[idx].driver,
+                &data[..len],
+                HandshakeState::RecvCertificateVerify,
+            );
             true
         }
         None => false,
@@ -5150,6 +5531,8 @@ unsafe fn retx_ack(sess: &mut TlsSession, acked_seq: u32) {
 }
 
 /// Replay retained ciphertext from `from_seq` to end of retx buffer.
+// Its kilobytes of staging stay off the step's frame until it is called.
+#[inline(never)]
 unsafe fn retx_replay(s: &mut TlsState, idx: usize, from_seq: u32) {
     let (offset, len) = {
         let sess = &s.sessions[idx];
@@ -5209,6 +5592,60 @@ unsafe fn tls_write_raw_frame(
 }
 
 /// Discard bytes from a channel.
+/// Append up to `len` bytes of the frame at the head of `cipher_in` to a
+/// handshaking session's record buffer. Returns the bytes taken, which is
+/// less than `len` only when the buffer is full.
+unsafe fn hs_append_from_channel(s: &mut TlsState, idx: usize, len: usize) -> usize {
+    let sys = &*s.syscalls;
+    let mut taken = 0usize;
+    while taken < len {
+        let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
+        if space == 0 {
+            break;
+        }
+        let want = if len - taken < space {
+            len - taken
+        } else {
+            space
+        };
+        let got = (sys.channel_read)(
+            s.cipher_in,
+            s.sessions[idx]
+                .recv_buf
+                .as_mut_ptr()
+                .add(s.sessions[idx].recv_len),
+            want,
+        );
+        // A byte FIFO returns what is available, up to `want`; advance by
+        // what it wrote.
+        if got <= 0 {
+            break;
+        }
+        #[expect(clippy::cast_sign_loss, reason = "guarded > 0 above")]
+        let n = got as usize;
+        s.sessions[idx].recv_len += n;
+        taken += n;
+        continuity_after_recv_append(s, idx);
+    }
+    taken
+}
+
+/// Absorb the pending frame tail. Returns true once it is gone — taken,
+/// or discarded because its session is no longer handshaking — and false
+/// while the record buffer is still full.
+unsafe fn absorb_pending_frame(s: &mut TlsState) -> bool {
+    let left = s.hs_pending_left as usize;
+    let si = find_session_by_conn_id(s, s.hs_pending_conn);
+    if si < 0 || s.sessions[si as usize].state != SessionState::Handshaking {
+        tls_discard(&*s.syscalls, s.cipher_in, left);
+        s.hs_pending_left = 0;
+        return true;
+    }
+    let taken = hs_append_from_channel(s, si as usize, left);
+    s.hs_pending_left = (left - taken) as u32;
+    s.hs_pending_left == 0
+}
+
 unsafe fn tls_discard(sys: &SyscallTable, chan: i32, mut count: usize) {
     let mut discard = [0u8; 64];
     while count > 0 {

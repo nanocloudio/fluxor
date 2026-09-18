@@ -171,7 +171,7 @@ sum(module_state_size[i] + heap_arena_size[i]) <= STATE_ARENA_SIZE
 | Target | STATE_ARENA | Typical Heap Budget |
 |--------|-------------|---------------------|
 | RP2040 | 64 KiB | 1-4 KiB per module |
-| RP2350 | 256 KiB | 4-32 KiB per module |
+| RP2350 | 240 KiB | 4-32 KiB per module |
 | BCM2712 | 96 MiB (host profile) | KiB to MiB per module |
 
 The heap is opt-in and bounded. Modules that do not use it pay

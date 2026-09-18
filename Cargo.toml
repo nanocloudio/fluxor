@@ -172,10 +172,17 @@ rp-overclock = []
 #              the ML-DSA suites as unsupported through SUITE_QUERY and omits
 #              them from SUITE_ENUM, rather than admitting a key it could not
 #              then sign with.
+#   rsa-vault: the key vault's RSA suites. Two CRT keys of up to 4096 bits
+#              with their Montgomery constants and one signing job are
+#              about 22 KB of kernel static, so like ML-DSA it is a
+#              capability a target has the RAM for or does not. A target
+#              without it reports the RSA suites unsupported and a graph
+#              naming an RSA identity there is refused at compose.
 kernel-vm = []
 smp = []
 dtb = []
 pq-vault = []
+rsa-vault = []
 
 # BCM2712 (Cortex-A76, aarch64). Requires target aarch64-unknown-none.
 # Bare-metal from scratch.
@@ -187,6 +194,7 @@ chip-bcm2712 = [
     "smp",
     "dtb",
     "pq-vault",
+    "rsa-vault",
 ]
 
 # Board-level selection for BCM2712 targets.
@@ -208,7 +216,7 @@ test_tier2_sgi = []
 
 # Linux hosted (aarch64 userspace). Uses std.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
-host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault"]
+host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault", "rsa-vault"]
 
 # WASM target. Builds the kernel as a wasm32-unknown-unknown library.
 # A small bootstrap shim (browser, wasmtime, edge) provides the host
@@ -217,7 +225,7 @@ host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault"
 # This feature gates the kernel into the same code paths as
 # `host-linux` for std/no-std purposes, except `no_std` and without
 # Linux-specific deps.
-host-wasm = ["portable-atomic", "pq-vault"]
+host-wasm = ["portable-atomic", "pq-vault", "rsa-vault"]
 
 # Optional `linux_display` backend: open a real window via winit and
 # blit each RGB565 frame through softbuffer. Off by default; file +

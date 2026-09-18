@@ -18,6 +18,8 @@
 //! host/kernel.
 use crate::abi::contracts::key_vault as dev_key_vault;
 use crate::abi::errno::{EACCES, EINVAL, ENOENT, ENOMEM, ENOSYS, ERANGE, ERROR};
+#[cfg(feature = "rsa-vault")]
+use crate::abi::errno::{EAGAIN, EBUSY};
 
 /// Read a little-endian `u64` from `p`.
 ///
@@ -31,6 +33,8 @@ unsafe fn read_u64(p: *const u8) -> u64 {
     u64::from_le_bytes(b)
 }
 use crate::kernel::ipc::fd;
+#[cfg(feature = "rsa-vault")]
+use crate::kernel::security::crypto::rsa;
 use crate::kernel::security::crypto::{ed25519, ml_dsa, p256};
 
 /// The ML-DSA parameter set a VAULT SUITE names, or `None` on a target
@@ -81,6 +85,68 @@ static mut ML_DSA_WS: ml_dsa::SignWorkspace<{ ml_dsa::K_MAX }, { ml_dsa::L_MAX }
 static mut ML_DSA_SIG: [u8; ml_dsa::SIG_MAX] = [0; ml_dsa::SIG_MAX];
 #[cfg(feature = "pq-vault")]
 static mut ML_DSA_PK: [u8; ml_dsa::PK_MAX] = [0; ml_dsa::PK_MAX];
+/// The RSA keys this backend holds, and the one signing job that runs
+/// over them.
+///
+/// A CRT key is kilobytes rather than the 64 bytes a slot carries, so an
+/// RSA slot's `data` names an entry here instead. Two entries: an identity
+/// and its successor during a rotation. Statics for the same reason as
+/// the ML-DSA workspace — no caller reaches this code on a stack that could
+/// hold them — and gated as a per-target capability for the same reason.
+///
+/// `RSA_JOB_SLOT` is the vault slot whose signature is in progress, or -1;
+/// `RSA_JOB_DIGEST` is what it is signing, so a `SIGN` that continues the
+/// job can be told from one that would start another.
+#[cfg(feature = "rsa-vault")]
+const RSA_ENTRIES: usize = 2;
+#[cfg(feature = "rsa-vault")]
+static mut RSA_KEYS: [rsa::RsaPrivateKey; RSA_ENTRIES] =
+    [rsa::RsaPrivateKey::empty(), rsa::RsaPrivateKey::empty()];
+#[cfg(feature = "rsa-vault")]
+static mut RSA_SIGN: rsa::RsaSignJob = rsa::RsaSignJob::new();
+#[cfg(feature = "rsa-vault")]
+static mut RSA_JOB_SLOT: i32 = -1;
+#[cfg(feature = "rsa-vault")]
+static mut RSA_JOB_DIGEST: [u8; 32] = [0; 32];
+/// Limb-rows of a Montgomery product one `SIGN` call advances a job by:
+/// a row of a half-modulus costs one pass over its limbs, so the budget
+/// is spent as 256 rows of a 2048-bit key's 16-limb halves or 128 rows
+/// of a 4096-bit key's. Either is about 25 µs on a Cortex-A76 with 64-bit
+/// limbs, which fits a 100 µs tick beside the caller's own work; a
+/// 2048-bit signature completes in about two hundred calls, a 4096-bit
+/// one in about eight hundred.
+#[cfg(feature = "rsa-vault")]
+const RSA_SIGN_LIMB_ROWS_PER_CALL: usize = 256 * 16;
+
+/// The rows one `SIGN` call advances `key` by; see
+/// `RSA_SIGN_LIMB_ROWS_PER_CALL`.
+#[cfg(feature = "rsa-vault")]
+fn rsa_sign_rows_per_call(key: &rsa::RsaPrivateKey) -> usize {
+    let limb_bits = core::mem::size_of::<rsa::RsaLimb>() * 8;
+    let half_limbs = (key.n.bits() / 2).div_ceil(limb_bits).max(1);
+    (RSA_SIGN_LIMB_ROWS_PER_CALL / half_limbs).max(1)
+}
+
+/// The RSA suite a modulus width belongs to.
+#[cfg(feature = "rsa-vault")]
+const fn rsa_suite_for_bits(bits: usize) -> u16 {
+    match bits {
+        2048 => dev_key_vault::suite::RSA_2048,
+        3072 => dev_key_vault::suite::RSA_3072,
+        4096 => dev_key_vault::suite::RSA_4096,
+        _ => dev_key_vault::suite::NONE,
+    }
+}
+
+const fn is_rsa_suite(suite: u16) -> bool {
+    matches!(
+        suite,
+        dev_key_vault::suite::RSA_2048
+            | dev_key_vault::suite::RSA_3072
+            | dev_key_vault::suite::RSA_4096
+    )
+}
+
 /// P-256 group order n (big-endian). Every P-256 scalar this vault
 /// holds must lie in [1, n-1]: GENERATE rejection-samples into that
 /// range and STORE refuses anything outside it. `d == 0` signs under
@@ -112,7 +178,7 @@ pub const MAX_LABEL: usize = 64;
 struct Slot {
     flags: u8,
     key_len: u8,
-    /// The key's suite (`key_vault::suite`), replacing `key_type: u8`.
+    /// The key's suite (`key_vault::suite`).
     suite: u16,
     /// Permitted uses, sealed at creation and checked per operation.
     ///
@@ -226,8 +292,8 @@ unsafe fn find_persisted(label: &[u8]) -> Option<usize> {
     }
     // Not in RAM — this may be a fresh process. Ask the platform whether it
     // kept one, which is what makes a labelled key survive a COLD restart
-    // rather than only a scheduler reset. Before this, an issuer re-keyed on
-    // every start and every credential it had signed stopped verifying,
+    // rather than only a scheduler reset. Without it an issuer would re-key
+    // on every start and every credential it had signed would stop verifying,
     // silently: a verifier just sees a bad signature.
     rehydrate_persisted(label)
 }
@@ -312,8 +378,8 @@ unsafe fn persist_key(label: &[u8], suite: u16, usage: u32, key: &[u8]) -> bool 
     // Write THROUGH to the platform's durable store, so the key outlives the
     // process and not merely the scheduler reset. `false` means this platform
     // has nowhere to put it, which is not an error: the in-RAM entry above
-    // still stands and the vault behaves exactly as it did before durable
-    // blobs existed.
+    // still stands, so the key serves this boot and every graph reconfigure
+    // in it, and does not come back after a restart.
     // `[suite:u16][usage:u32][sealed]` — the blob has to carry what the slot
     // was born with, or a rehydrated key would have to be told its own suite
     // and permitted uses by whoever opened it, which is exactly the widening
@@ -370,9 +436,13 @@ unsafe fn open_persisted(idx: usize) -> Option<usize> {
 const MAX_SEAL_BYTES: usize = 2048;
 /// Scratch for seal/open, a static so PIC callers' stacks stay small.
 static mut SEAL_SCRATCH: [u8; MAX_SEAL_BYTES] = [0; MAX_SEAL_BYTES];
-/// Scratch for the composition record: sized for the largest table the
-/// host profile admits (192 blobs and instances, 128 edges).
-const MAX_ATTEST_RECORD: usize = 4096 + 192 * 40 + 192 * 37 + 128 * 5;
+/// Scratch for the composition record: sized for the largest table this
+/// profile admits — one blob and one instance entry per module slot, and
+/// one entry per graph edge.
+const MAX_ATTEST_RECORD: usize = 4096
+    + crate::abi::config::kernel::MAX_MODULES * 40
+    + crate::abi::config::kernel::MAX_MODULES * 37
+    + crate::kernel::boot::config::MAX_GRAPH_EDGES * 5;
 static mut ATTEST_RECORD: [u8; MAX_ATTEST_RECORD] = [0; MAX_ATTEST_RECORD];
 
 #[inline]
@@ -508,15 +578,28 @@ const fn suite_private_len(suite: u16) -> usize {
         // an expanded key does not reduce back to a seed. `SUITE_QUERY`
         // reporting 32 is what tells that caller so, before it allocates.
         _ if ml_dsa_set_for(suite).is_some() => ml_dsa::SEED_LEN,
+        // The PKCS#1 RSAPrivateKey DER with CRT fields, at its ceiling for
+        // the width: the actual encoding is a few bytes shorter or longer
+        // by the sizes of its INTEGERs, and STORE admits any up to this.
+        #[cfg(feature = "rsa-vault")]
+        dev_key_vault::suite::RSA_2048 => 1216,
+        #[cfg(feature = "rsa-vault")]
+        dev_key_vault::suite::RSA_3072 => 1792,
+        #[cfg(feature = "rsa-vault")]
+        dev_key_vault::suite::RSA_4096 => 2368,
         _ => 0,
     }
 }
 
-/// Public-key length for a suite, or 0.
+/// Public-key length for a suite, or 0. For RSA this is the RSAPublicKey
+/// DER at its longest for the width; `PUBLIC` reports the exact length.
 const fn suite_public_len(suite: u16) -> usize {
     match suite {
         dev_key_vault::suite::P256 => 65,
         dev_key_vault::suite::ED25519 => 32,
+        dev_key_vault::suite::RSA_2048 => 270,
+        dev_key_vault::suite::RSA_3072 => 398,
+        dev_key_vault::suite::RSA_4096 => 526,
         // Sizes come from the primitive's own parameter table rather than
         // being repeated here, so the vault and the signer cannot come to
         // disagree about how big an answer is.
@@ -533,6 +616,10 @@ const fn suite_signature_len(suite: u16) -> usize {
         dev_key_vault::suite::P256 | dev_key_vault::suite::ED25519 => 64,
         // The RFC 2104 tag.
         dev_key_vault::suite::HMAC_SHA256 => 32,
+        // The modulus width.
+        dev_key_vault::suite::RSA_2048 => 256,
+        dev_key_vault::suite::RSA_3072 => 384,
+        dev_key_vault::suite::RSA_4096 => 512,
         _ => match ml_dsa_set_for(suite) {
             Some(set) => set.params().sig_len,
             None => 0,
@@ -543,6 +630,14 @@ const fn suite_signature_len(suite: u16) -> usize {
 /// What this backend permits for a suite it supports.
 const fn suite_usage(suite: u16) -> u32 {
     match suite {
+        // Signing and publishing the public half. Not PERSIST or WRAP: the
+        // sealed-blob store is sized for a 64-byte key, and an RSA key is
+        // minted and imported by an operator's tooling each boot.
+        dev_key_vault::suite::RSA_2048
+        | dev_key_vault::suite::RSA_3072
+        | dev_key_vault::suite::RSA_4096 => {
+            dev_key_vault::usage::SIGN | dev_key_vault::usage::EXPORT_PUBLIC
+        }
         dev_key_vault::suite::P256 => {
             dev_key_vault::usage::SIGN
                 | dev_key_vault::usage::VERIFY
@@ -837,6 +932,19 @@ unsafe fn zeroise_slot(i: usize) {
     if i >= MAX_SLOTS {
         return;
     }
+    #[cfg(feature = "rsa-vault")]
+    if is_rsa_suite(SLOTS[i].suite) && SLOTS[i].key_len == 1 {
+        let entry = SLOTS[i].data[0] as usize;
+        if entry < RSA_ENTRIES {
+            let keys = &raw mut RSA_KEYS;
+            (*keys)[entry].zeroize();
+        }
+        if RSA_JOB_SLOT == i as i32 {
+            let job = &raw mut RSA_SIGN;
+            (*job).zeroize();
+            RSA_JOB_SLOT = -1;
+        }
+    }
     // Volatile writes so the compiler doesn't optimise the wipe away.
     let p = (&raw mut SLOTS[i].data) as *mut u8;
     for j in 0..MAX_KEY_BYTES {
@@ -900,7 +1008,14 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let key_len =
                 u32::from_le_bytes([*arg.add(6), *arg.add(7), *arg.add(8), *arg.add(9)]) as usize;
             let want = suite_private_len(suite);
-            if want == 0 || key_len != want || 10 + key_len > arg_len {
+            // An RSA DER is variable-length up to its ceiling; every other
+            // suite's key is exactly the reported length.
+            let fits = if is_rsa_suite(suite) {
+                key_len > 0 && key_len <= want
+            } else {
+                key_len == want
+            };
+            if want == 0 || !fits || 10 + key_len > arg_len {
                 return EINVAL;
             }
             // A caller may not ask for a use the suite does not have — an
@@ -930,6 +1045,27 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             };
             SLOTS[idx].suite = suite;
             SLOTS[idx].usage = usage;
+            #[cfg(feature = "rsa-vault")]
+            if is_rsa_suite(suite) {
+                // The DER goes into an RSA entry, checked and prepared
+                // there; the slot names the entry. A key whose width is not
+                // the suite's is refused: the suite is what every later
+                // length is derived from.
+                let keys = &raw mut RSA_KEYS;
+                let Some(entry) = (*keys).iter().position(|k| !k.is_loaded()) else {
+                    return ENOMEM;
+                };
+                let der = core::slice::from_raw_parts(arg.add(10), key_len);
+                let key = &mut (*keys)[entry];
+                if !key.load_pkcs1_der(der) || rsa_suite_for_bits(key.n.bits()) != suite {
+                    key.zeroize();
+                    return EINVAL;
+                }
+                SLOTS[idx].key_len = 1;
+                core::ptr::write_volatile(&raw mut SLOTS[idx].data[0], entry as u8);
+                SLOTS[idx].flags = FLAG_IN_USE;
+                return fd::tag_fd(fd::FD_TAG_KEY_VAULT, idx as i32);
+            }
             SLOTS[idx].key_len = key_len as u8;
             let src = arg.add(10);
             for j in 0..key_len {
@@ -985,7 +1121,7 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // The mode must be the one the suite actually uses. A P-256
             // slot handed `RAW` would sign a message as though it were a
             // digest — a valid signature over the wrong thing, which is
-            // exactly the trap the inferred convention set.
+            // exactly the trap an inferred convention sets.
             //
             // ML-DSA takes the whole message, like Ed25519 — the pure
             // variant of FIPS 204 is not prehashed, and HashML-DSA is a
@@ -996,6 +1132,70 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // asking for something this wire cannot express, and answering
             // it with the empty context would produce a signature over a
             // different domain than the caller asked for.
+            // RSA: a resumable RSASSA-PSS-SHA256 over a 32-byte digest. The
+            // first call starts the job; each answers EAGAIN until the
+            // signature is complete, and a call for another slot or digest
+            // while one is in progress is EBUSY.
+            #[cfg(feature = "rsa-vault")]
+            if is_rsa_suite(slot.suite) {
+                if mode != dev_key_vault::sign_mode::DIGEST || input_len != 32 {
+                    return EINVAL;
+                }
+                let entry = slot.data[0] as usize;
+                if slot.key_len != 1 || entry >= RSA_ENTRIES {
+                    return EINVAL;
+                }
+                let keys = &raw const RSA_KEYS;
+                let key = &(*keys)[entry];
+                let job_ptr = &raw mut RSA_SIGN;
+                let job = &mut *job_ptr;
+                let digest = core::slice::from_raw_parts(arg.add(6), 32);
+                let held_ptr = &raw const RSA_JOB_DIGEST;
+                let held = &*held_ptr;
+                let mut same_digest = true;
+                for (k, byte) in digest.iter().enumerate() {
+                    same_digest &= held[k] == *byte;
+                }
+                if RSA_JOB_SLOT >= 0 && (RSA_JOB_SLOT != slot_handle || !same_digest) {
+                    return EBUSY;
+                }
+                if RSA_JOB_SLOT < 0 {
+                    let mut salt = [0u8; 32];
+                    if crate::kernel::sys::hal::csprng_fill(salt.as_mut_ptr(), 32) != 0 {
+                        return ERROR;
+                    }
+                    let k = key.n.byte_len();
+                    let mut em = [0u8; rsa::RSA_BYTES_MAX];
+                    if !rsa::rsa_pss_encode(
+                        rsa::RsaHash::Sha256,
+                        digest,
+                        &salt,
+                        &mut em[..k],
+                        key.n.bits(),
+                    ) || !job.start(key, &em[..k])
+                    {
+                        return ERROR;
+                    }
+                    core::ptr::copy_nonoverlapping(
+                        digest.as_ptr(),
+                        (&raw mut RSA_JOB_DIGEST) as *mut u8,
+                        32,
+                    );
+                    RSA_JOB_SLOT = slot_handle;
+                }
+                if job.step(key, rsa_sign_rows_per_call(key)) == rsa::RsaStep::Pending {
+                    return EAGAIN;
+                }
+                let signature = job.signature();
+                if !sig_ptr.is_null() {
+                    core::ptr::copy_nonoverlapping(signature.as_ptr(), sig_ptr, signature.len());
+                }
+                let wrote = (signature.len() as u16).to_le_bytes();
+                core::ptr::copy_nonoverlapping(wrote.as_ptr(), tail.add(10), 2);
+                job.zeroize();
+                RSA_JOB_SLOT = -1;
+                return 0;
+            }
             let want_mode = match slot.suite {
                 dev_key_vault::suite::P256 => dev_key_vault::sign_mode::DIGEST,
                 dev_key_vault::suite::ED25519 => dev_key_vault::sign_mode::RAW,
@@ -1215,7 +1415,10 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let flags = *arg.add(6);
             let priv_len = suite_private_len(suite);
             let pub_len = suite_public_len(suite);
-            if priv_len == 0 {
+            // RSA keys are imported, never minted here: prime generation is
+            // seconds of work no target's step can host, and an operator's
+            // tooling mints them anyway. The contract says so per suite.
+            if priv_len == 0 || is_rsa_suite(suite) {
                 return ENOSYS;
             }
             if usage == 0 || usage & !suite_usage(suite) != 0 {
@@ -1287,6 +1490,31 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             }
             let out_ptr = read_u64(arg) as *mut u8;
             let out_cap = u16::from_le_bytes([*arg.add(8), *arg.add(9)]) as usize;
+            #[cfg(feature = "rsa-vault")]
+            if is_rsa_suite(slot.suite) {
+                // The RSAPublicKey DER, at its exact length.
+                let entry = slot.data[0] as usize;
+                if slot.key_len != 1 || entry >= RSA_ENTRIES {
+                    return EINVAL;
+                }
+                let keys = &raw const RSA_KEYS;
+                let key = &(*keys)[entry];
+                let mut der = [0u8; 526];
+                let Some(n) = key.public_key_der(&mut der) else {
+                    return ERROR;
+                };
+                if out_cap < n {
+                    let need = (n as u16).to_le_bytes();
+                    core::ptr::copy_nonoverlapping(need.as_ptr(), arg.add(10), 2);
+                    return ERANGE;
+                }
+                if !out_ptr.is_null() {
+                    core::ptr::copy_nonoverlapping(der.as_ptr(), out_ptr, n);
+                }
+                let wrote = (n as u16).to_le_bytes();
+                core::ptr::copy_nonoverlapping(wrote.as_ptr(), arg.add(10), 2);
+                return 0;
+            }
             if out_cap < pub_len {
                 let need = (pub_len as u16).to_le_bytes();
                 core::ptr::copy_nonoverlapping(need.as_ptr(), arg.add(10), 2);
@@ -1689,8 +1917,8 @@ pub unsafe fn provider_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             // Isolation honesty, and the one place
             // persistence must NOT be allowed to speak.
             //
-            // This backend can now seal keys so they survive a restart —
-            // see `seal_slot`. That is durability, and durability is not
+            // This backend seals keys so they survive a restart — see
+            // `persist_key`. That is durability, and durability is not
             // isolation. The tier is derived from where the platform's
             // sealing key COMES FROM, never from whether sealing works:
             //

@@ -119,7 +119,8 @@ mod params_def {
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 /// Emit `[lg lN s########]` (lane id + low-32 step count, hex) every ~3 s so a
-/// rig can confirm each lane advances under load (AC9 fairness).
+/// rig can confirm each lane advances under load, which is what makes
+/// fairness between lanes observable rather than asserted.
 #[inline]
 unsafe fn maybe_log_progress(s: &mut LoadGenState) {
     // SAFETY: syscalls set in module_new; dev_millis/dev_log are side-effecting
@@ -227,14 +228,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 3; // StepOutcome::Ready
         }
 
-        // Count every step and periodically log this lane's progress (AC9).
+        // Count every step and periodically log this lane's progress.
         s.step_count = s.step_count.wrapping_add(1);
         maybe_log_progress(s);
 
         // Re-step within an in-progress busy tick: these carry the Burst
         // (busy) signal only — NO heavy work. Doing the heavy step just once
-        // per tick keeps per-tick cost ≈ one worst_step, so the §5.3 floor
-        // (worst × margin) covers it and the budget is not overrun (AC3).
+        // per tick keeps per-tick cost ≈ one worst_step, so the adaptive-tick
+        // floor (worst × margin) covers it and the budget is not overrun.
         if s.burst_remaining > 0 {
             s.burst_remaining -= 1;
             return if s.burst_remaining > 0 { 2 } else { 0 };

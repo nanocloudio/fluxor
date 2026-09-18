@@ -10,11 +10,10 @@
 //! parameter values says so and is refused at compose on a target that
 //! cannot back it, rather than at its first handshake.
 //!
-//! Values mirror kernel source and are pinned against it by
-//! `target_facts_mirror_kernel_sources` in `tools/tests/target_facts.rs`;
-//! every fact value is admitted by `CAPABILITY_FACTS` and pinned by the same
-//! test. Silicon keys match `manifest::TargetCapabilities::for_silicon` —
-//! board names resolve through the `targets/` registry before reaching here.
+//! Every value here mirrors the kernel source cited beside it, every fact
+//! value is one `CAPABILITY_FACTS` admits for its capability, and the silicon
+//! keys are those of `manifest::TargetCapabilities::for_silicon` — board names
+//! resolve through the `targets/` registry before reaching here.
 
 use fluxor_contracts::vocabulary::TARGET_CAPABILITIES;
 
@@ -31,6 +30,10 @@ pub mod vault_suite {
     /// A 32-byte ChaCha20-Poly1305 sealing key: no public half, signs
     /// nothing, and what a resumption ticket is sealed under.
     pub const AEAD_KEY: u16 = 8;
+    /// RSA keys by modulus width, signing RSASSA-PSS-SHA256.
+    pub const RSA_2048: u16 = 10;
+    pub const RSA_3072: u16 = 11;
+    pub const RSA_4096: u16 = 12;
 }
 
 /// Vault custody tiers, `modules/sdk/contracts/key_vault.rs::tier`.
@@ -48,7 +51,9 @@ const SUITES_BASE: &[u16] = &[
     vault_suite::ED25519,
     vault_suite::AEAD_KEY,
 ];
-/// Suites a kernel built with the `pq-vault` feature adds.
+/// Suites a kernel built with the `pq-vault` and `rsa-vault` features
+/// adds. The two are enabled together: both are a question of kernel
+/// static RAM, and every target with room for one has room for the other.
 const SUITES_PQ: &[u16] = &[
     vault_suite::P256,
     vault_suite::ED25519,
@@ -56,6 +61,9 @@ const SUITES_PQ: &[u16] = &[
     vault_suite::ML_DSA_44,
     vault_suite::ML_DSA_65,
     vault_suite::ML_DSA_87,
+    vault_suite::RSA_2048,
+    vault_suite::RSA_3072,
+    vault_suite::RSA_4096,
 ];
 
 /// The ip module's published ceilings on a target

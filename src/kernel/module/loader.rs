@@ -90,10 +90,10 @@ pub const MAX_MODULES_BLOB_SIZE: usize = 8 * 1024 * 1024;
 /// so this entire budget is available for module state.
 ///
 /// Module state arena size — from silicon TOML [kernel] section.
-/// RP2350: 256 KB, RP2040: 64 KB.
+/// RP2350: 240 KB, RP2040: 64 KB.
 const STATE_ARENA_SIZE: usize = crate::kernel::config::STATE_ARENA_SIZE;
-// MAX_PARAMS_SIZE removed — pending modules now store a pointer to the
-// static PARAM_BUFFER instead of copying, eliminating truncation.
+// Pending modules hold a pointer to the static PARAM_BUFFER rather than a
+// copy, so no parameter blob is truncated to a fixed bound.
 // ============================================================================
 // Error types
 // ============================================================================
@@ -315,8 +315,8 @@ impl ProviderAutoRegister {
         // path). Instance-keyed volume backends supply a non-zero selector
         // through the optional `module_provider_selector` export (called with
         // the module's state so it can derive the key from its `volume:`
-        // config); a module without it is the single default provider, exactly
-        // as before instance-keying existed.
+        // config); a module without it is the single default provider at
+        // selector 0.
         let selector = match self.selector_fn {
             Some(f) => f(state_ptr),
             None => 0u32,
@@ -1322,8 +1322,9 @@ impl ModuleLoader {
         // corrupted or torn staged flash image can't drive unchecked typed
         // reads through `module_count` / `entry.offset`. The bound is the
         // slot's known `modules_size` when the layout source carried one
-        // (flash A/B graph slots); legacy trailers expose no length, so we
-        // fall back to the hard cap and lean on the table's own `total_size`
+        // (flash A/B graph slots); the firmware trailer carries no length
+        // field, so we fall back to the hard cap and lean on the table's own
+        // `total_size`
         // for the internal-consistency checks. `total_size` is always
         // written by the pack tool (`tools/src/modules.rs`), so the same
         // `.fxmt` that loads from an embedded blob validates here too.
@@ -1762,9 +1763,9 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                             0
                         };
                     // 17 = MANIFEST_HEADER_SIZE (tools/src/manifest.rs):
-                    // the fixed head grew a byte when permissions widened
-                    // to u16 (bytes 15..17). Every offset here must track
-                    // that constant or integrity/signature reads shear.
+                    // the fixed head, ending in the u16 permissions bitmap
+                    // at bytes 15..17. Every offset here must track that
+                    // constant or integrity/signature reads shear.
                     let hash_offset = 17 + var_size;
                     if hash_offset + 32 > manifest_size {
                         log::error!("[loader] {name}: manifest hash out of range");
@@ -1874,10 +1875,10 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                             // Runtime ABI-surface enforcement (not just signature
                             // coverage): a validly-signed module built against a
                             // DIFFERENT surface than this kernel must be refused —
-                            // its hardcoded opcode/errno/flag numbers no longer
+                            // its hardcoded opcode/errno/flag numbers do not
                             // match. Compare the embedded attestation to the
                             // kernel's OWN surface digest, from the same canonical
-                            // stream the tools hash (lockstep-tested).
+                            // stream the tools hash.
                             let mut ks = Sha256::new();
                             crate::abi::abi_surface::write_surface(&mut |b| ks.update(b));
                             let kd = ks.finalize();
@@ -2405,9 +2406,9 @@ impl DynamicModule {
         // 4b. If module exports module_arena_size, allocate and init heap.
         // Failure here is a hard load error — a module that requested
         // an arena but didn't get one will fail every heap_alloc call,
-        // typically silently (the http multi-conn refactor learned this
-        // the hard way on pi5: 16+ MiB arena ask vs 4 MiB STATE_ARENA
-        // → arena alloc skipped → http silently never instantiated).
+        // typically silently: an arena ask larger than STATE_ARENA (a
+        // 16+ MiB request against 4 MiB on pi5) would otherwise skip the
+        // allocation and leave the module never instantiated, unreported.
         // Heap arena pointer/size captured for MMU-isolation region
         // registration below (null/0 when the module has no arena).
         let mut iso_heap_ptr: *mut u8 = core::ptr::null_mut();
@@ -2481,7 +2482,7 @@ impl DynamicModule {
         // Register the MMU-mapped footprints: `state_map_size`/`iso_heap_map_size`
         // are page-padded for isolated modules so the EL0 mapping covers only
         // pages this module owns (and `build_table`'s page-clean check passes).
-        // For non-isolated modules these equal the raw sizes (unchanged path).
+        // For non-isolated modules these equal the raw sizes.
         crate::kernel::sys::hal::protection_register_module(
             inst_idx,
             module.code_base() as usize,
@@ -2579,8 +2580,8 @@ impl Module for DynamicModule {
     fn step(&mut self) -> Result<StepOutcome, i32> {
         // Isolated modules drop to EL0 under their own page table via
         // `mmu::protected_step` (BCM2712). Everything else takes the
-        // unchanged direct EL1 call so `none`/`guarded` modules and the
-        // performance path are byte-for-byte as before. `protected_step`
+        // direct EL1 call, so `none`/`guarded` modules keep the plain
+        // dispatch on the performance path. `protected_step`
         // itself re-checks that an isolated table was built and falls back
         // to a direct call otherwise, so this branch is purely a fast gate.
         let result = if self.isolated {

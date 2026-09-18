@@ -99,6 +99,7 @@ install:
 	@mkdir -p $(RIG_BACKEND_DIR)
 	ln -snf $(CURDIR)/$(HOST_DIR)/telemetry-monitor_udp $(RIG_BACKEND_DIR)/telemetry-monitor_udp
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-https_load   $(RIG_BACKEND_DIR)/observe-https_load
+	ln -snf $(CURDIR)/$(HOST_DIR)/observe-tls_load     $(RIG_BACKEND_DIR)/observe-tls_load
 	ln -snf $(CURDIR)/$(HOST_DIR)/observe-udp_capture  $(RIG_BACKEND_DIR)/observe-udp_capture
 	ln -snf $(CURDIR)/tools/rig/backends/observe-quic_mux  $(RIG_BACKEND_DIR)/observe-quic_mux
 	ln -snf $(CURDIR)/tools/rig/backends/console-usb_cdc   $(RIG_BACKEND_DIR)/console-usb_cdc

@@ -189,9 +189,31 @@ pub mod suite {
     /// The shape a TSIG key (RFC 8945) takes. It has no public half and is
     /// never readable back: the only answers a holder gets are tags.
     pub const HMAC_SHA256: u16 = 9;
+    /// RSA keys by modulus width, for RSASSA-PSS-SHA256 signatures over a
+    /// caller-supplied SHA-256 digest ([`sign_mode::DIGEST`]) with a
+    /// 32-byte salt — the one encoding TLS 1.3 asks of an rsaEncryption
+    /// key. One suite per width because [`SUITE_QUERY`] reports fixed
+    /// lengths per suite. The private key a backend holds is the PKCS#1
+    /// `RSAPrivateKey` DER with its CRT fields; the reported private
+    /// length is the CEILING for the width, and [`STORE`] admits any DER
+    /// up to it. A signature is the modulus width; the public half is the
+    /// `RSAPublicKey` DER.
+    ///
+    /// A private operation is milliseconds on the fastest target this
+    /// runs on, and a [`SIGN`] runs inside the caller's step, so RSA
+    /// signing is RESUMABLE: the first `SIGN` on a slot starts the
+    /// operation and answers `EAGAIN` after a bounded amount of it; each
+    /// further `SIGN` with the same digest advances it and answers
+    /// `EAGAIN` until the last, which answers the signature. A `SIGN`
+    /// with another digest, or on another slot, while one is in progress
+    /// answers `EBUSY`. A backend that signs whole (a token) simply never
+    /// answers `EAGAIN`.
+    pub const RSA_2048: u16 = 10;
+    pub const RSA_3072: u16 = 11;
+    pub const RSA_4096: u16 = 12;
 
     /// Highest id this registry defines.
-    pub const MAX_ID: u16 = HMAC_SHA256;
+    pub const MAX_ID: u16 = RSA_4096;
 }
 
 /// How [`SIGN`] should treat the bytes it is given.

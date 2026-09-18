@@ -35,6 +35,7 @@ pub mod gpu_contract;
 pub mod gpu_pack;
 pub mod hash;
 pub mod hygiene;
+pub mod identity_key;
 // `fluxor build|test|lint|clean` — the lifecycle verbs, plus the
 // generated `make help` block (`fluxor help --make`). Lives in the lib
 // so it can reach `ci`'s own phase runners rather than re-implementing

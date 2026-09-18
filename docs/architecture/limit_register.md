@@ -47,14 +47,17 @@ means editing its row here in the same change.
 | Whole modules blob | `MAX_MODULES_BLOB_SIZE` | src/kernel/module/loader.rs | 8388608 | Sanity bound: a boot-image module table past this is refused at load |
 | Boot config blob | `MAX_CONFIG_SIZE` | src/kernel/boot/config.rs | 262144 | Sanity bound on the packed config (32 KiB on RP/wasm profiles); an oversize blob is refused as `TooLarge` |
 | OTA staging area (per A/B stage) | `STAGE_CAPACITY` | src/kernel/module/ota_stage.rs | 8388608 | Policy: a graph image larger than one stage is refused ENOSPC at stage write |
-| Module state arena | `STATE_ARENA_SIZE` | modules/sdk/abi/config.rs | 268435456 | Sized, not chosen: it must hold every module of the busiest graph at once. The `ip` connection table is the dominant term at ~137 MiB, and 256 MiB leaves ~117 MiB beside it — above the media-app host graph's 64 MiB peak. 256 KiB on embedded, where the whole envelope is different. Zero-initialised, so it costs kernel `.bss`, not image size. Exhaustion is refused at module load, not at the allocation that overruns |
+| Module state arena | `STATE_ARENA_SIZE` | modules/sdk/abi/config.rs | 268435456 | Sized, not chosen: it must hold every module of the busiest graph at once. The `ip` connection table is the dominant term at ~137 MiB, and 256 MiB leaves ~117 MiB beside it — above the media-app host graph's 64 MiB peak. 240 KiB on rp2350 and 64 KiB on rp2040, from the silicon TOML, where the whole envelope is different. Zero-initialised, so it costs kernel `.bss`, not image size. Exhaustion is refused at module load, not at the allocation that overruns |
 | Single channel ring | `MAX_CHAN_BYTES` | src/kernel/ipc/channel.rs | 4194304 | Sanity bound on one ring's share of the buffer arena |
 | QUIC endpoint connections | `MAX_CONNS` | modules/sdk/abi/config.rs | 64 | Policy: ~58 KiB of state per slot on a bcm2712-only module — ~3.6 MiB for the table, the dominant term in the module's footprint and paid resident, since the table is a field of the module state rather than an elastic pool. ~13 KiB of a slot is handshake scratch idle once the connection is established; the remaining ~45 KiB is state a live connection needs, so unlike the TLS ceiling this one is not mostly scratch. A connection past the ceiling receives a stateless CONNECTION_REFUSED so it fails in one round trip rather than hanging, and a Closed slot recycles with a fresh ephemeral |
-| TLS sessions | `MAX_SESSIONS` | modules/sdk/abi/config.rs | 512 | Policy: the ceiling on concurrent TLS connections and so on HTTPS concurrency — an accept the tls module cannot seat is closed before http sees it. A seat is ~13 KiB, of which ~12 KiB is handshake scratch resident for the session's whole life; 512 seats are 63 granted chunks ≈ 7.9 MiB, drawn in 8-session chunks from the oversubscribable elastic region, so an idle stack pays only for the inline chunk. 4 inline on embedded. This bounds ONE instance and instances do not add up the way the number invites: a chunk asks ~104 KiB and rounds up to the 64 KiB grant quantum, so it takes 128 KiB, and the 16 MiB region holds 128 chunks — the same depth as the kernel's chunk table — for about 1,024 seats shared across every elastic pool on the host. Two saturated instances are already the region. Published in the profile so a consumer reads the envelope it has; `tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS` is asserted at compile time |
+| TLS sessions | `MAX_SESSIONS` | modules/sdk/abi/config.rs | 512 | Policy: the ceiling on concurrent TLS connections and so on HTTPS concurrency — an accept the tls module cannot seat is closed before http sees it. A seat is ~13 KiB, of which ~12 KiB is handshake scratch resident for the session's whole life; 512 seats are 63 granted chunks ≈ 7.9 MiB, drawn in 8-session chunks from the oversubscribable elastic region, so an idle stack pays only for the inline chunk. 1 inline on embedded: what the rp2350 arena holds beside the wifi stack. This bounds ONE instance and instances do not add up the way the number invites: a chunk asks ~104 KiB and rounds up to the 64 KiB grant quantum, so it takes 128 KiB, and the 16 MiB region holds 128 chunks — the same depth as the kernel's chunk table — for about 1,024 seats shared across every elastic pool on the host. Two saturated instances are already the region. Published in the profile so a consumer reads the envelope it has; `tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS` is asserted at compile time |
 | HTTP/2 streams per conn | `MAX_STREAMS` | modules/sdk/abi/config.rs | 4 | Policy: bounds per-connection stream state on every profile |
 | HTTP route table | `MAX_ROUTES` | modules/sdk/abi/config.rs | 8 | Policy: a config declaring more routes is a compose-time error |
 | Provider chain depth per contract | `MAX_CHAIN_DEPTH` | src/kernel/module/provider.rs | — | Policy, per-profile (3 RP2040 / 4 RP2350 / 8 aarch64-host); registration past the ceiling is refused EBUSY |
 | KEY_VAULT key slots | `MAX_SLOTS` | src/kernel/security/key_vault.rs | 8 | Policy: generate/import with no free slot is refused ENOMEM |
+| KEY_VAULT RSA entries | `RSA_ENTRIES` | src/kernel/security/key_vault.rs | 2 | Policy: an RSA key is kilobytes of CRT material and Montgomery constants rather than the 64 bytes a slot carries, so RSA slots name one of two backend entries — an identity and its successor during a rotation. A third `STORE` is refused ENOMEM until one is destroyed. Behind the `rsa-vault` feature, about 22 KB of `.bss` with the signing job |
+| RSA modulus width | `RSA_MODULUS_BITS_MAX` | modules/sdk/crypto/rsa.rs | 4096 | Policy: the widest key the core verifies or signs with. It sizes every buffer in the core and every job's step cost; no public issuer signs with more, and 8192 would double both for a key nothing presents |
+| RSA public exponent width | `RSA_EXPONENT_BITS_MAX` | modules/sdk/crypto/rsa.rs | 32 | Policy: the exponent a public operation walks; 65537 needs 17 bits, and a key whose exponent is wider is refused rather than exponentiated at length |
 | fat32 open files | `MAX_OPEN_FILES` | modules/foundation/fat32/mod.rs | — | Policy, per-profile (256 aarch64 / 8 elsewhere): a multi-tenant node runs several independent consumers against one volume at once, where a microcontroller's consumer set is fixed and each handle costs a scratch buffer. An open past the table is refused ENFILE, with a log line naming the handles that hold it. The `max_open_per_owner` parameter adds a per-owner ceiling on top, refusing the owner that is over its share while the table still has room, so the failure lands on the workload at fault rather than on whoever asks next |
 | fat32 directory-walk budget | `DIR_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: directory sectors one `provider_call` reads before returning EAGAIN with its position saved. A directory with thousands of entries is not exotic — a WAL that segments per snapshot fills one — so an unbounded walk is a latent stall of every module sharing the lane, not a slow path |
 | fat32 long-name length | `LFN_MAX_CHARS` | modules/foundation/fat32/mod.rs | 64 | Policy: the format allows 255, but a buffer for that is carried in the directory cursor and in every wanted-name argument, on a board whose whole module state is measured against a 256 KiB arena. A longer name is refused at creation, not clipped. Names longer than this that were written elsewhere are still preserved and retired correctly — preservation walks the companion run without decoding it, so only matching and generation are bounded |
@@ -92,7 +95,8 @@ means editing its row here in the same change.
 | TCP continuity shadow slots | `MAX_TCP_SHADOWS` | modules/sdk/abi/config.rs | 8 | Policy: connections a transport-continuity pair holds in flight on one ip instance — shadows staged for import plus flows being mirrored out. Each shadow is a connection record plus its checkpoint bytes, and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY`. 2 on wasm, 1 on embedded |
 | fence wire wait | `FENCE_WIRE_WAIT_MS` | modules/foundation/ip/mod.rs | 500 | Policy: how long a fence holds its event for the driver's drain answer before reporting the ring hand-off instead. Longer than any transmit ring takes to empty at line rate; short enough that a coordinator waiting on the fence is not waiting on a hung driver |
 | queued control frame | `NET_OUT_FRAME_MAX` | modules/foundation/ip/mod.rs | 9 | Sanity bound: the largest frame the fallback queue holds — header, a u16 connection id and a u32 sequence (`MSG_RETRANSMIT`, `MSG_ACK`). A larger frame is refused, never truncated |
-| TLS continuity shadow slots | `MAX_TLS_SHADOWS` | modules/foundation/tls/continuity.rs | 2 | Policy: sessions under CT_TLS takeover at once on one instance, one per slot (1 on the embedded targets). A shadow is a staging record plus the decoded checkpoint — about twice `TLS_CKPT_RECORD_MAX`, resident in module state — and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
+| TLS continuity shadow slots | `MAX_TLS_SHADOWS` | modules/foundation/tls/continuity.rs | 2 | Policy: sessions under CT_TLS takeover at once on one instance, one per slot (1 on wasm, 0 on the MCU-class targets, which hold no standby). A shadow is a staging record plus the decoded checkpoint — about twice `TLS_CKPT_RECORD_MAX`, resident in module state — and takeover is a control-plane event, not steady state; a PAIR_PREPARE past the free slots is refused `STATUS_NO_CAPACITY` |
+| ISR bridge slots | `MAX_BRIDGES` | modules/sdk/abi/config.rs | 16 | Policy: edges that cross into an ISR-tier domain, one bridge slot each with its ring inline (~2 KiB of kernel static RAM per slot). An edge past the ceiling loses its ISR routing and the graph fails at setup rather than corrupting. 8 on embedded, where the die's stack is what the slots would take |
 | TLS continuity checkpoint record | `TLS_CKPT_RECORD_MAX` | modules/foundation/tls/continuity.rs | — | Derived, not chosen: the fixed header plus the whole partial-inbound buffer (`RECV_BUF_SIZE`), the whole retransmission window (`RETX_BUF_SIZE`) and the sealed secret set — about 21 KiB where the receive buffer is 16 KiB, about 9 KiB on the 4 KiB targets. A CHECKPOINT_BEGIN whose `total_len` exceeds it is refused `STATUS_NO_CAPACITY` before any byte moves; the record is never truncated |
 | TLS strict-profile send hold | `TX_HOLD_SIZE` | modules/foundation/tls/continuity.rs | — | Derived, not chosen: every record one `CMD_SEND` (`MAX_CMD_DATA` bytes) can produce, since the clear-side frame is consumed whole and each of its records must wait for its own send horizon — six records of `WIRE_RECORD_MAX`, about 9.3 KiB per session, paid in every session slot whether or not it is mirrored. A producer that exceeds the contract's frame ceiling fills the hold and the session fails rather than the record being dropped |
 | QUIC 1-RTT self-grant block | `LOCAL_PN_BLOCK` | modules/foundation/quic/connection.rs | 4096 | Policy: the send packet-number block a connection self-grants in local (non-durable) mode, refilled `LOCAL_PN_REFILL_LOW` (512) values ahead of exhaustion so the reservation never stalls a healthy sender. Matches the directory's smoke-path reserve size; in durable mode the directory chooses the block |
@@ -119,7 +123,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Config arena | `CONFIG_ARENA_SIZE` | modules/sdk/abi/config.rs | 262144 | Sized against the largest per-module params section (~95 KiB for an http module on the host) with headroom for the rest of the graph. A packed config larger than this is refused at boot 32 KiB on wasm, 16 KiB on embedded. |
 | One module's params section | `MAX_MODULE_CONFIG_SIZE` | modules/sdk/abi/config.rs | 262144 | Sanity bound on one module's slice of the config arena; kept in lockstep with the kernel's `MAX_MODULE_SECTION` and the CLI's params cap so the three refuse the same blob 16 KiB on wasm, 4 KiB on embedded. |
 | Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 262144 | The kernel-side twin of `MAX_MODULE_CONFIG_SIZE` (linux + wasm / bare metal): a section past it is refused while parsing, before any module is instantiated. Registered separately so the pair cannot drift apart unnoticed 32 KiB on bare metal. |
-| HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 4-session TLS table and the 16-slot TCP table in that profile 4 on embedded. |
+| HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 16-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
 | HTTP per-connection receive buffer | `RECV_BUF_SIZE` | modules/sdk/abi/config.rs | 8192 | Policy: a whole request line, headers and a small body in one read; a request that does not fit is refused 431, not spilled 4096 on wasm, 2048 on embedded. |
 | HTTP per-connection send buffer | `SEND_BUF_SIZE` | modules/sdk/abi/config.rs | 4100 | Policy, deliberately 4 KiB + 4: a WebSocket frame of exactly 4096 bytes of payload plus its header fits in one write, so the RFC 6455 fragmentation path is taken only by frames that genuinely exceed it |
 | Dynamic routes | `MAX_DYN_ROUTES` | modules/sdk/abi/config.rs | 64 | Policy: the dynamic-route arena an ingress fills at runtime; a route past the ceiling is refused and counted in `http.routes.dropped` 8 on wasm and embedded. |
@@ -203,6 +207,8 @@ CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 28
 MAX_MODULES | modules/sdk/abi/config.rs | 192
 MAX_MODULES | modules/sdk/abi/config.rs | 48
 MAX_MODULES | modules/sdk/abi/config.rs | 32
+MAX_BRIDGES | modules/sdk/abi/config.rs | 16
+MAX_BRIDGES | modules/sdk/abi/config.rs | 8
 MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | 256
 MAX_OWNERS | src/kernel/workload/owner.rs | 64
 MAX_OWNERS | src/kernel/workload/owner.rs | 1
@@ -233,7 +239,7 @@ MAX_CONNS | modules/sdk/abi/config.rs | 8
 MAX_CONNS | modules/sdk/abi/config.rs | 2
 MAX_SESSIONS | modules/sdk/abi/config.rs | 512
 MAX_SESSIONS | modules/sdk/abi/config.rs | 64
-MAX_SESSIONS | modules/sdk/abi/config.rs | 4
+MAX_SESSIONS | modules/sdk/abi/config.rs | 1
 MAX_STREAMS | modules/sdk/abi/config.rs | 4
 MAX_ROUTES | modules/sdk/abi/config.rs | 8
 MAX_ROUTES | modules/sdk/abi/config.rs | 4
@@ -241,6 +247,9 @@ MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 3
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 4
 MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 8
 MAX_SLOTS | src/kernel/security/key_vault.rs | 8
+RSA_ENTRIES | src/kernel/security/key_vault.rs | 2
+RSA_MODULUS_BITS_MAX | modules/sdk/crypto/rsa.rs | 4096
+RSA_EXPONENT_BITS_MAX | modules/sdk/crypto/rsa.rs | 32
 MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 256
 MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8
 DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32
@@ -284,6 +293,7 @@ FENCE_WIRE_WAIT_MS | modules/foundation/ip/mod.rs | 500
 NET_OUT_FRAME_MAX | modules/foundation/ip/mod.rs | 9
 MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 2
 MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 1
+MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 0
 TLS_CKPT_RECORD_MAX | modules/foundation/tls/continuity.rs | CKPT_FIXED_LEN + RECV_BUF_SIZE + RETX_BUF_SIZE + TLS_SEALED_LEN
 TX_HOLD_SIZE | modules/foundation/tls/continuity.rs | TX_HOLD_RECORDS * WIRE_RECORD_MAX
 LOCAL_PN_BLOCK | modules/foundation/quic/connection.rs | 4096
@@ -363,6 +373,9 @@ the coverage report here, each with the reason it is not a row.
 
 ```limit-register-exempt
 STATE_ARENA_SIZE | src/kernel/module/loader.rs | mirror of the registered modules/sdk/abi/config.rs ceiling, re-exported for the loader
+RSA_BYTES_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in bytes
+RSA_LIMBS_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in limbs of the target's word
+RSA_HALF_LIMBS_MAX | modules/sdk/crypto/rsa.rs | derived: a CRT prime is half the modulus
 BUF_SIZE | modules/drivers/rp1_gem/mod.rs | DMA scratch sized by the ring, not a policy ceiling
 MAX_FRAME | modules/drivers/rp1_gem/mod.rs | Ethernet frame size, a protocol constant (MTU + headers)
 STATE_SIZE | modules/drivers/rp1_gem/mod.rs | size_of the driver state, not a ceiling

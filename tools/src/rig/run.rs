@@ -292,8 +292,29 @@ pub fn execute_plan(plan: &Plan, profile: &RigProfile, options: &RunOptions) -> 
         );
     }
 
+    // Everything a console has said up to here is the previous image
+    // talking: a board still running whatever it booted last, including
+    // what that graph printed as it halted or as the reset took it. A
+    // scenario's rules describe THIS run, so those bytes go to the capture
+    // logs and are never shown to the matcher. Deploy progress is kept:
+    // a netboot fetch that raced the power action is this run's.
+    let mut early: Vec<RunEvent> = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match &event {
+            RunEvent::ConsoleBytes { source, bytes } => {
+                if let Some(f) = byte_logs.get_mut(source) {
+                    let _ = f.write_all(bytes);
+                }
+            }
+            _ => early.push(event),
+        }
+    }
+
     // Step 7 — wait for pass/fail/timeout.
     let mut m = matcher::Matcher::new(&plan.pass_rules, &plan.fail_rules)?;
+    for event in early {
+        let _ = m.observe(&event);
+    }
     let deadline = Instant::now() + Duration::from_secs(plan.effective_timeout_s as u64);
     let started_at = now_unix_secs();
 
