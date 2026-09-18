@@ -64,6 +64,8 @@ pub const P256_SHARE_LEN: usize = 65;
 
 /// Signature algorithm: ecdsa_secp256r1_sha256
 const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+/// ecdsa_secp384r1_sha384.
+const SIG_ECDSA_SECP384R1_SHA384: u16 = 0x0503;
 /// rsa_pss_rsae_sha256: RSASSA-PSS under SHA-256 with an rsaEncryption key.
 const SIG_RSA_PSS_RSAE_SHA256: u16 = 0x0804;
 /// rsa_pss_rsae_sha384.
@@ -76,8 +78,9 @@ const SIG_RSA_PKCS1_SHA256: u16 = 0x0401;
 const SIG_RSA_PKCS1_SHA384: u16 = 0x0501;
 
 /// The schemes this build offers, in preference order.
-const OFFERED_SIGNATURE_SCHEMES: [u16; 5] = [
+const OFFERED_SIGNATURE_SCHEMES: [u16; 6] = [
     SIG_ECDSA_SECP256R1_SHA256,
+    SIG_ECDSA_SECP384R1_SHA384,
     SIG_RSA_PSS_RSAE_SHA256,
     SIG_RSA_PSS_RSAE_SHA384,
     SIG_RSA_PKCS1_SHA256,
@@ -85,9 +88,17 @@ const OFFERED_SIGNATURE_SCHEMES: [u16; 5] = [
 ];
 
 /// The digest width a CertificateVerify scheme signs its content under.
+///
+/// The 32-byte fallback is safe because only a scheme `scheme_for_peer_key`
+/// admits ever reaches here, and that is the SHA-256 half of the set plus
+/// the two SHA-384 arms named below. The PKCS#1 v1.5 schemes are offered
+/// for certificates but never for CertificateVerify — TLS 1.3 forbids them
+/// there — so `rsa_pkcs1_sha384`, which does sign a 48-byte digest, cannot
+/// arrive and take the fallback. A caller outside that path would have to
+/// widen this match first.
 pub const fn scheme_hash_len(scheme: u16) -> usize {
     match scheme {
-        SIG_RSA_PSS_RSAE_SHA384 => 48,
+        SIG_RSA_PSS_RSAE_SHA384 | SIG_ECDSA_SECP384R1_SHA384 => 48,
         _ => 32,
     }
 }
@@ -101,6 +112,7 @@ pub const fn scheme_hash_len(scheme: u16) -> usize {
 pub fn scheme_for_peer_key(key_suite: u16, scheme: u16) -> Option<u16> {
     match key_suite {
         suite::ECDSA_P256_SHA256 if scheme == SIG_ECDSA_SECP256R1_SHA256 => Some(scheme),
+        suite::ECDSA_P384_SHA384 if scheme == SIG_ECDSA_SECP384R1_SHA384 => Some(scheme),
         suite::RSA_2048 | suite::RSA_3072 | suite::RSA_4096
             if scheme == SIG_RSA_PSS_RSAE_SHA256 || scheme == SIG_RSA_PSS_RSAE_SHA384 =>
         {

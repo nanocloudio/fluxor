@@ -60,6 +60,7 @@ include!("../../sdk/crypto/hmac.rs");
 include!("../../sdk/crypto/chacha20.rs");
 include!("../../sdk/crypto/aes_gcm.rs");
 include!("../../sdk/crypto/p256.rs");
+include!("../../sdk/crypto/p384.rs");
 include!("../../sdk/crypto/ed25519.rs");
 include!("../../sdk/crypto/sha3.rs");
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; x509.rs needs ml_dsa.rs for
@@ -1316,7 +1317,7 @@ pub unsafe extern "C" fn module_new(
         }
     }
     let use_vault = s.ecdh_bits_per_step >= 256;
-    if use_vault && s.key_len >= 32 {
+    if use_vault && s.key_len >= 32 && identity_is_p256(s) {
         let present = (sys.provider_call)(-1, KV_PROBE, core::ptr::null_mut(), 0);
         if present == 1 {
             let mut raw = [0u8; 32];
@@ -3102,6 +3103,8 @@ unsafe fn log_chain_verified(s: &mut TlsState, idx: usize) {
         log_chain_verified_line(s, b"[tls] chain verified suite=rsa_pss", links, steps);
     } else if suite == suite::ECDSA_P256_SHA256 {
         log_chain_verified_line(s, b"[tls] chain verified suite=ecdsa_p256", links, steps);
+    } else if suite == suite::ECDSA_P384_SHA384 {
+        log_chain_verified_line(s, b"[tls] chain verified suite=ecdsa_p384", links, steps);
     } else {
         log_chain_verified_line(s, b"[tls] chain verified suite=unknown", links, steps);
     }
@@ -4329,6 +4332,9 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     if s.identity_rsa_suite != 0 {
         return pump_send_certificate_verify_rsa(s, idx);
     }
+    if identity_is_p384(s) {
+        return pump_send_certificate_verify_p384(s, idx);
+    }
     let bits_per_step = if s.ecdh_bits_per_step >= 256 {
         0u8
     } else {
@@ -4452,6 +4458,84 @@ unsafe fn pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> bool {
     let state = core::mem::replace(&mut sess.driver.ecdsa_sign_state, EcdsaSignState::empty());
     let raw_sig = ecdsa_sign_finalise(state);
     finalise_certificate_verify(s, idx, &raw_sig)
+}
+
+/// Whether the identity key is a P-256 scalar (raw or DER).
+///
+/// Three identity kinds sign a CertificateVerify, and
+/// `pump_send_certificate_verify` tries them in this order: an RSA key
+/// through the vault, a P-384 key in the module under
+/// `SIG_ECDSA_SECP384R1_SHA384`, and a P-256 key in the module under
+/// `SIG_ECDSA_SECP256R1_SHA256` — this predicate being the test for the
+/// last. A key of any other shape signs nothing.
+unsafe fn identity_is_p256(s: &TlsState) -> bool {
+    let mut scalar = [0u8; 48];
+    let n = identity_ec_scalar(&s.key[..s.key_len], &mut scalar);
+    zeroize(&mut scalar);
+    n == 32
+}
+
+unsafe fn identity_is_p384(s: &TlsState) -> bool {
+    let mut scalar = [0u8; 48];
+    let n = identity_ec_scalar(&s.key[..s.key_len], &mut scalar);
+    zeroize(&mut scalar);
+    n == 48
+}
+
+/// Emit CertificateVerify under a P-384 identity: `ecdsa_secp384r1_sha384`
+/// over the verify content, signed in the module on the driver's stepped
+/// ladder — the shape of the P-256 signer, one width up.
+unsafe fn pump_send_certificate_verify_p384(s: &mut TlsState, idx: usize) -> bool {
+    let bits_per_step = ec_bits_per_step(s);
+    if !s.sessions[idx].driver.ecdsa_sign_state384.is_initialised() {
+        let sess = &mut s.sessions[idx];
+        let hl = sess.driver.suite.hash_len();
+        let transcript_hash = match &sess.driver.transcript {
+            Some(t) => t.current_hash(),
+            None => {
+                sess.state = SessionState::Error;
+                s.last_err_site = 33;
+                return true;
+            }
+        };
+        let context: &[u8; 33] = if sess.driver.is_server {
+            b"TLS 1.3, server CertificateVerify"
+        } else {
+            b"TLS 1.3, client CertificateVerify"
+        };
+        let mut verify_content = [0u8; 200];
+        let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
+        let vc_hash = sha384(&verify_content[..vc_len]);
+        let mut scalar = [0u8; 48];
+        let n = identity_ec_scalar(&s.key[..s.key_len], &mut scalar);
+        let started = if n == 48 {
+            ecdsa384_sign_init(&scalar, &vc_hash, bits_per_step)
+        } else {
+            None
+        };
+        zeroize(&mut scalar);
+        match started {
+            Some(st) => s.sessions[idx].driver.ecdsa_sign_state384 = st,
+            None => {
+                s.sessions[idx].driver.hs_state = HandshakeState::Error;
+            }
+        }
+        return true;
+    }
+    let sess = &mut s.sessions[idx];
+    if !sess.driver.ecdsa_sign_state384.scalar_mul.complete() {
+        sess.driver.ecdsa_sign_state384.scalar_mul.step();
+        if !sess.driver.ecdsa_sign_state384.scalar_mul.complete() {
+            return true;
+        }
+    }
+    let state = core::mem::replace(
+        &mut sess.driver.ecdsa_sign_state384,
+        Ecdsa384SignState::empty(),
+    );
+    let raw_sig = ecdsa384_sign_finalise(state);
+    let (der_sig, der_len) = encode_der_signature384(&raw_sig);
+    finalise_certificate_verify_with(s, idx, SIG_ECDSA_SECP384R1_SHA384, &der_sig[..der_len])
 }
 
 /// Emit CertificateVerify under an RSA identity: RSASSA-PSS-SHA256 over the

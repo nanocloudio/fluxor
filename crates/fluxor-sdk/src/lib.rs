@@ -62,6 +62,7 @@ mod sdk_flat {
     include!("../sdk/crypto/chacha20.rs");
     include!("../sdk/crypto/aes_gcm.rs");
     include!("../sdk/crypto/p256.rs");
+    include!("../sdk/crypto/p384.rs");
     // ed25519.rs references `Sha512` (sha384.rs) and the `pic_*`/`U256`/
     // `zeroize` helpers (p256.rs) by bare name — see its header for the
     // required include set. Keep it after both.

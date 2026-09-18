@@ -430,6 +430,44 @@ unsafe fn dtls_pump_send_certificate_verify(s: &mut TlsState, idx: usize) -> boo
         driver.hs_state = HandshakeState::SendFinished;
         return true;
     }
+    if identity_is_p384(s) {
+        // A P-384 identity signs in the module. Unlike the TLS path, which
+        // splits the ladder across steps at `ecdh_bits_per_step`, this runs
+        // `ecdsa384_sign` to completion in one call and does not consult
+        // that budget — so a DTLS handshake costs one long step wherever
+        // the ladder is slow, however small the configured budget is.
+        let vc_hash384 = sha384(&verify_content[..vc_len]);
+        let mut scalar = [0u8; 48];
+        let n = identity_ec_scalar(&s.key[..s.key_len], &mut scalar);
+        let signed = if n == 48 {
+            ecdsa384_sign(&scalar, &vc_hash384)
+        } else {
+            None
+        };
+        zeroize(&mut scalar);
+        let Some(sig) = signed else {
+            s.peer_sessions[idx].endpoint.driver.hs_state = HandshakeState::Error;
+            return true;
+        };
+        let (der_sig, der_len) = encode_der_signature384(&sig);
+        let driver = &mut s.peer_sessions[idx].endpoint.driver;
+        let msg_len = build_certificate_verify(
+            SIG_ECDSA_SECP384R1_SHA384,
+            &der_sig,
+            der_len,
+            &mut driver.scratch,
+        );
+        if let Some(ref mut t) = driver.transcript {
+            t.update(&driver.scratch[..msg_len]);
+        }
+        let mut local = [0u8; SCRATCH_SIZE];
+        core::ptr::copy_nonoverlapping(driver.scratch.as_ptr(), local.as_mut_ptr(), msg_len);
+        if !driver.write_handshake_message(&local[..msg_len]) {
+            return false;
+        }
+        driver.hs_state = HandshakeState::SendFinished;
+        return true;
+    }
     let mut raw_sig = [0u8; 64];
     let mut signed_via_vault = false;
     if s.key_vault_handle >= 0 {

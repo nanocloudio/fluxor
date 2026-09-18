@@ -99,6 +99,8 @@ pub struct HandshakeDriver {
     /// driven across ticks by `ecdh_bits_per_step` so concurrent
     /// handshakes don't stall on the P-256 ladder.
     pub ecdsa_sign_state: EcdsaSignState,
+    /// The same signer for a P-384 identity.
+    pub ecdsa_sign_state384: Ecdsa384SignState,
     /// Hash retained across the multi-tick signer; cleared once
     /// the signature is finalised.
     pub cert_verify_hash: [u8; 32],
@@ -119,6 +121,8 @@ pub struct HandshakeDriver {
     /// The ECDSA half of the same job: per driver, since it is two ladder
     /// states rather than kilobytes.
     pub ecdsa_verify: EcdsaVerifyJob,
+    /// The same for a P-384 signature.
+    pub ecdsa_verify384: Ecdsa384VerifyJob,
     pub held_len: u16,
     /// Whether the instance job currently holds this driver's work.
     pub rsa_job_active: u8,
@@ -192,6 +196,7 @@ impl HandshakeDriver {
             x25519_pub_ready: 0,
             group: GROUP_SECP256R1,
             ecdsa_sign_state: EcdsaSignState::empty(),
+            ecdsa_sign_state384: Ecdsa384SignState::empty(),
             cert_verify_hash: [0; 32],
             cert_verify_hash_ready: 0,
             peer_cert_pubkey: [0; PEER_KEY_MAX],
@@ -199,6 +204,7 @@ impl HandshakeDriver {
             peer_cert_key_suite: suite::UNKNOWN,
             deferred_links: DeferredLinks::empty(),
             ecdsa_verify: EcdsaVerifyJob::empty(),
+            ecdsa_verify384: Ecdsa384VerifyJob::empty(),
             held_len: 0,
             rsa_job_active: 0,
             verify_steps: 0,
@@ -244,6 +250,9 @@ impl HandshakeDriver {
         self.peer_cert_key_suite = suite::UNKNOWN;
         self.deferred_links.clear();
         self.ecdsa_verify = EcdsaVerifyJob::empty();
+        self.ecdsa_verify384 = Ecdsa384VerifyJob::empty();
+        self.ecdsa_sign_state384.zeroise_secrets();
+        self.ecdsa_sign_state384 = Ecdsa384SignState::empty();
         self.held_len = 0;
         self.rsa_job_active = 0;
         self.cv_scheme = 0;
@@ -601,6 +610,7 @@ pub unsafe fn rsa_verify_pump_core(
             }
             let link = driver.deferred_links.links[driver.deferred_links.next as usize];
             let ecdsa = link.sig_suite == suite::ECDSA_P256_SHA256;
+            let ecdsa384 = link.sig_suite == suite::ECDSA_P384_SHA384;
             if driver.rsa_job_active == 0 {
                 let message = &driver.scratch[4..held];
                 let Some((tbs, sig, key_bytes)) = deferred_link_bytes(&link, message, anchor)
@@ -616,6 +626,16 @@ pub unsafe fn rsa_verify_pump_core(
                         return RsaPump::Failed;
                     };
                     driver.ecdsa_verify = started;
+                } else if ecdsa384 {
+                    let Some(raw) = parse_der_signature384(sig) else {
+                        return RsaPump::Failed;
+                    };
+                    let Some(started) =
+                        ecdsa384_verify_init(key_bytes, &sha384(tbs), &raw, ec_bits)
+                    else {
+                        return RsaPump::Failed;
+                    };
+                    driver.ecdsa_verify384 = started;
                 } else {
                     let Some(key) = rsa_public_key_parse(key_bytes) else {
                         return RsaPump::Failed;
@@ -631,6 +651,11 @@ pub unsafe fn rsa_verify_pump_core(
                     return RsaPump::Progress;
                 }
                 ecdsa_verify_finalise(&driver.ecdsa_verify)
+            } else if ecdsa384 {
+                if !driver.ecdsa_verify384.step() {
+                    return RsaPump::Progress;
+                }
+                ecdsa384_verify_finalise(&driver.ecdsa_verify384)
             } else {
                 if job.step(rows) == RsaStep::Pending {
                     return RsaPump::Progress;
@@ -652,6 +677,7 @@ pub unsafe fn rsa_verify_pump_core(
         }
         HandshakeState::VerifyPeerSignature => {
             let ecdsa = driver.cv_scheme == SIG_ECDSA_SECP256R1_SHA256;
+            let ecdsa384 = driver.cv_scheme == SIG_ECDSA_SECP384R1_SHA384;
             if driver.rsa_job_active == 0 {
                 let Some(sig) = driver.scratch.get(
                     driver.cv_sig_off as usize..(driver.cv_sig_off + driver.cv_sig_len) as usize,
@@ -668,6 +694,16 @@ pub unsafe fn rsa_verify_pump_core(
                         return RsaPump::Failed;
                     };
                     driver.ecdsa_verify = started;
+                } else if ecdsa384 {
+                    let Some(raw) = parse_der_signature384(sig) else {
+                        return RsaPump::Failed;
+                    };
+                    let Some(started) =
+                        ecdsa384_verify_init(pk, &driver.cv_hash[..48], &raw, ec_bits)
+                    else {
+                        return RsaPump::Failed;
+                    };
+                    driver.ecdsa_verify384 = started;
                 } else {
                     let Some(key) = rsa_public_key_parse(pk) else {
                         return RsaPump::Failed;
@@ -683,6 +719,11 @@ pub unsafe fn rsa_verify_pump_core(
                     return RsaPump::Progress;
                 }
                 ecdsa_verify_finalise(&driver.ecdsa_verify)
+            } else if ecdsa384 {
+                if !driver.ecdsa_verify384.step() {
+                    return RsaPump::Progress;
+                }
+                ecdsa384_verify_finalise(&driver.ecdsa_verify384)
             } else {
                 if job.step(rows) == RsaStep::Pending {
                     return RsaPump::Progress;

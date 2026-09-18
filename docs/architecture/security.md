@@ -208,9 +208,13 @@ Peer verification is a stepped job in every transport (tls, dtls, quic):
 the chain walk records each RSA or ECDSA link it accepts on shape and
 policy, and the handshake pump verifies them one at a time from the held
 Certificate message — an RSA exponentiation `rsa_rows_per_step` Montgomery
-rows per step on one job the instance owns, an ECDSA verification
-`ecdh_bits_per_step` ladder bits per step on the session's own ladders —
-with the peer's CertificateVerify checked the same way. A signature that
+rows per step on one job the instance owns, an ECDSA verification, P-256
+or P-384, `ecdh_bits_per_step` ladder bits per step on the session's own
+ladders — with the peer's CertificateVerify checked the same way. A P-384
+identity signs `ecdsa_secp384r1_sha384` in the module on the same stepped
+ladder; an ECDSA suite is a curve with its hash, so a P-384 key signing
+under SHA-256 is refused as a signature the key does not make, and a
+P-256 authority over a P-384 subject as a downgrade. A signature that
 does not verify fails the session with `CERT_ERR_SIGNATURE` and a log line
 naming the stage. The key exchange is stepped at the same budget: the
 P-256 and X25519 ladders advance `ecdh_bits_per_step` bits per step, and

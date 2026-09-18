@@ -70,6 +70,7 @@ include!("../../sdk/crypto/hmac.rs");
 include!("../../sdk/crypto/aes_gcm.rs");
 include!("../../sdk/crypto/chacha20.rs");
 include!("../../sdk/crypto/p256.rs");
+include!("../../sdk/crypto/p384.rs");
 include!("../../sdk/crypto/sha3.rs");
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; x509.rs needs ml_dsa.rs for
 // post-quantum certificate suites. Order matters for all three.

@@ -128,16 +128,18 @@ pub mod suite {
 
     /// Whether this build can actually verify a signature in `suite`.
     ///
-    /// P-256 and the three ML-DSA parameter sets. P-384 and Ed25519 are
-    /// named but not verified here: the ids exist so sizes, policies and
-    /// error reporting are suite-shaped ahead of the primitives, and
-    /// `verify_chain` refuses anything this returns false for rather than
-    /// treating an unrecognised algorithm as an unchecked one.
+    /// Both ECDSA curves, the three ML-DSA parameter sets and the RSA
+    /// suites. Ed25519 and RSA-PSS are named but not verified here: the
+    /// ids exist so sizes, policies and error reporting are suite-shaped
+    /// ahead of the primitives, and `verify_chain` refuses anything this
+    /// returns false for rather than treating an unrecognised algorithm
+    /// as an unchecked one.
     #[must_use]
     pub const fn is_implemented(suite: u16) -> bool {
         matches!(
             suite,
             ECDSA_P256_SHA256
+                | ECDSA_P384_SHA384
                 | ML_DSA_44
                 | ML_DSA_65
                 | ML_DSA_87
@@ -673,8 +675,17 @@ pub fn parse_certificate(cert: &[u8]) -> Option<X509Cert<'_>> {
 
     // A signature longer than its suite allows is not that suite's
     // signature. Refused here so no verifier is handed a length its
-    // suite says cannot exist.
-    if sig_suite != suite::UNKNOWN && signature.len() > suite::max_signature_len(sig_suite) {
+    // suite says cannot exist. An ECDSA algorithm identifier names the
+    // hash and not the curve, so its bound is the larger curve's: the
+    // key-pairing rule, not the parser, refuses a curve signed under the
+    // other curve's hash.
+    let sig_bound = match sig_suite {
+        suite::ECDSA_P256_SHA256 | suite::ECDSA_P384_SHA384 => {
+            suite::max_signature_len(suite::ECDSA_P384_SHA384)
+        }
+        other => suite::max_signature_len(other),
+    };
+    if sig_suite != suite::UNKNOWN && signature.len() > sig_bound {
         return None;
     }
 
@@ -1534,6 +1545,7 @@ fn ml_dsa_set_for(cert_suite: u16) -> Option<MlDsaSet> {
 pub fn key_is_valid(suite: u16, key: &[u8]) -> bool {
     match suite {
         suite::ECDSA_P256_SHA256 => public_point_is_valid(key),
+        suite::ECDSA_P384_SHA384 => p384_public_point_is_valid(key),
         suite::RSA_2048 | suite::RSA_3072 | suite::RSA_4096 => match rsa_public_key_parse(key) {
             Some(k) => rsa_key_suite_for_bits(rsa_public_key_bits(&k)) == suite,
             None => false,
@@ -1582,6 +1594,17 @@ pub fn verify_cert_signature(
                 None => return false,
             };
             ecdsa_verify(issuer_pubkey, &tbs_hash, &raw_sig)
+        }
+        suite::ECDSA_P384_SHA384 => {
+            if cert.sig_alg != OID_ECDSA_SHA384 {
+                return false;
+            }
+            let tbs_hash = sha384(cert.tbs_raw);
+            let raw_sig = match parse_der_signature384(cert.signature) {
+                Some(s) => s,
+                None => return false,
+            };
+            ecdsa384_verify(issuer_pubkey, &tbs_hash, &raw_sig)
         }
         suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => {
             // The signature is the BIT STRING contents, the modulus width
@@ -1834,7 +1857,10 @@ impl LinkMode<'_> {
     ) -> u32 {
         let steppable = matches!(
             subject.suite,
-            suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 | suite::ECDSA_P256_SHA256
+            suite::RSA_PKCS1_SHA256
+                | suite::RSA_PKCS1_SHA384
+                | suite::ECDSA_P256_SHA256
+                | suite::ECDSA_P384_SHA384
         );
         if !steppable || self.deferred.is_none() {
             return if verify_cert_signature(subject_der, issuer.key_suite, issuer.public_key) {
@@ -1910,6 +1936,10 @@ pub fn verify_deferred_link(link: &DeferredLink, message: &[u8], anchor: &[u8]) 
     match link.sig_suite {
         suite::ECDSA_P256_SHA256 => match parse_der_signature(sig) {
             Some(raw) => ecdsa_verify(key, &sha256(tbs), &raw),
+            None => false,
+        },
+        suite::ECDSA_P384_SHA384 => match parse_der_signature384(sig) {
+            Some(raw) => ecdsa384_verify(key, &sha384(tbs), &raw),
             None => false,
         },
         suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => {
@@ -2312,33 +2342,61 @@ pub fn verify_cert_chain_with(
 }
 
 /// Extract a 32-byte P-256 scalar from a DER-encoded ECPrivateKey
-/// (SEC1 §C.4) or PKCS#8 PrivateKeyInfo wrapping it. Used by both
-/// the TLS module (server CertificateVerify) and the DTLS module.
-/// Writes the scalar bytes into `out`; on parse failure leaves `out`
-/// untouched.
+/// (SEC1 §C.4) or PKCS#8 PrivateKeyInfo wrapping it. Writes the scalar
+/// bytes into `out`; on parse failure, or a key of another width, leaves
+/// `out` untouched.
 ///
 /// # Safety
 /// `der` is a kernel-owned blob; the body bounds-checks every read
 /// against `der.len()` before indexing.
 pub unsafe fn extract_ec_private_key(der: &[u8], out: &mut [u8; 32]) {
+    let mut wide = [0u8; 48];
+    if extract_ec_private_key_len(der, &mut wide) == 32 {
+        out.copy_from_slice(&wide[..32]);
+    }
+}
+
+/// The identity's EC scalar, whatever form the key came in: a raw 32- or
+/// 48-byte scalar, or a SEC1 / PKCS#8 DER holding one. Returns the
+/// scalar's length — 32 for P-256, 48 for P-384 — written at the front of
+/// `out`, or 0 when the key is none of these.
+///
+/// # Safety
+/// `key` is a kernel-owned blob, read within its bounds.
+pub unsafe fn identity_ec_scalar(key: &[u8], out: &mut [u8; 48]) -> usize {
+    if key.len() == 32 || key.len() == 48 {
+        out[..key.len()].copy_from_slice(key);
+        return key.len();
+    }
+    extract_ec_private_key_len(key, out)
+}
+
+/// The scalar of a SEC1 ECPrivateKey or a PKCS#8 PrivateKeyInfo wrapping
+/// one, at the front of `out`; its length, 32 or 48, or 0 when the DER is
+/// neither or the scalar another width.
+///
+/// # Safety
+/// `der` is a kernel-owned blob; the body bounds-checks every read
+/// against `der.len()` before indexing.
+pub unsafe fn extract_ec_private_key_len(der: &[u8], out: &mut [u8; 48]) -> usize {
     if der.len() < 4 {
-        return;
+        return 0;
     }
     if der[0] != 0x30 {
-        return;
+        return 0;
     }
     let (seq_start, _seq_len, _) = match der_tlv(der, 0) {
         Some(v) => v,
-        None => return,
+        None => return 0,
     };
 
     let mut pos = seq_start;
     if pos >= der.len() || der[pos] != 0x02 {
-        return;
+        return 0;
     }
     let (int_start, int_len, int_total) = match der_tlv(der, pos) {
         Some(v) => v,
-        None => return,
+        None => return 0,
     };
     let version = if int_len == 1 { der[int_start] } else { 0xFF };
     pos += int_total;
@@ -2348,10 +2406,15 @@ pub unsafe fn extract_ec_private_key(der: &[u8], out: &mut [u8; 32]) {
         if pos < der.len() && der[pos] == 0x04 {
             let (os_start, os_len, _) = match der_tlv(der, pos) {
                 Some(v) => v,
-                None => return,
+                None => return 0,
             };
-            if os_len == 32 && os_start + 32 <= der.len() {
-                core::ptr::copy_nonoverlapping(der.as_ptr().add(os_start), out.as_mut_ptr(), 32);
+            if (os_len == 32 || os_len == 48) && os_start + os_len <= der.len() {
+                core::ptr::copy_nonoverlapping(
+                    der.as_ptr().add(os_start),
+                    out.as_mut_ptr(),
+                    os_len,
+                );
+                return os_len;
             }
         }
     } else if version == 0 {
@@ -2360,17 +2423,18 @@ pub unsafe fn extract_ec_private_key(der: &[u8], out: &mut [u8; 32]) {
         if pos < der.len() && der[pos] == 0x30 {
             let (_, _, alg_total) = match der_tlv(der, pos) {
                 Some(v) => v,
-                None => return,
+                None => return 0,
             };
             pos += alg_total;
         }
         if pos < der.len() && der[pos] == 0x04 {
             let (inner_start, inner_len, _) = match der_tlv(der, pos) {
                 Some(v) => v,
-                None => return,
+                None => return 0,
             };
             let inner = &der[inner_start..inner_start + inner_len];
-            extract_ec_private_key(inner, out);
+            return extract_ec_private_key_len(inner, out);
         }
     }
+    0
 }

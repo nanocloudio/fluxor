@@ -738,6 +738,69 @@ fn ladder_bits_per_step(s: &QuicState) -> u8 {
     }
 }
 
+/// The P-384 identity's CertificateVerify: `ecdsa_secp384r1_sha384` over
+/// the verify content, on the driver's stepped ladder.
+unsafe fn pump_send_certificate_verify_p384(
+    s: &mut QuicState,
+    idx: usize,
+    bits_per_step: u8,
+) -> bool {
+    if !s.conns[idx].driver.ecdsa_sign_state384.is_initialised() {
+        let driver = &mut s.conns[idx].driver;
+        let hl = driver.suite.hash_len();
+        let transcript_hash = match &driver.transcript {
+            Some(t) => t.current_hash(),
+            None => {
+                driver.hs_state = HandshakeState::Error;
+                return true;
+            }
+        };
+        let context = b"TLS 1.3, server CertificateVerify";
+        let mut verify_content = [0u8; 200];
+        let vc_len = build_verify_content(context, &transcript_hash[..hl], hl, &mut verify_content);
+        let vc_hash = sha384(&verify_content[..vc_len]);
+        let mut scalar = [0u8; 48];
+        let n = identity_ec_scalar(&s.key[..s.key_len], &mut scalar);
+        let started = if n == 48 {
+            ecdsa384_sign_init(&scalar, &vc_hash, bits_per_step)
+        } else {
+            None
+        };
+        zeroize(&mut scalar);
+        match started {
+            Some(st) => s.conns[idx].driver.ecdsa_sign_state384 = st,
+            None => s.conns[idx].driver.hs_state = HandshakeState::Error,
+        }
+        return true;
+    }
+    let driver = &mut s.conns[idx].driver;
+    if !driver.ecdsa_sign_state384.scalar_mul.complete() {
+        driver.ecdsa_sign_state384.scalar_mul.step();
+        if !driver.ecdsa_sign_state384.scalar_mul.complete() {
+            return true;
+        }
+    }
+    let state = core::mem::replace(&mut driver.ecdsa_sign_state384, Ecdsa384SignState::empty());
+    let raw_sig = ecdsa384_sign_finalise(state);
+    let (der_sig, der_len) = encode_der_signature384(&raw_sig);
+    let msg_len = build_certificate_verify(
+        SIG_ECDSA_SECP384R1_SHA384,
+        &der_sig,
+        der_len,
+        &mut driver.scratch,
+    );
+    if let Some(ref mut t) = driver.transcript {
+        t.update(&driver.scratch[..msg_len]);
+    }
+    let mut local = [0u8; SCRATCH_SIZE];
+    core::ptr::copy_nonoverlapping(driver.scratch.as_ptr(), local.as_mut_ptr(), msg_len);
+    if !driver.write_handshake_message(&local[..msg_len]) {
+        return false;
+    }
+    driver.hs_state = HandshakeState::SendFinished;
+    true
+}
+
 /// Emit CertificateVerify, driving the signature's scalar multiplication
 /// across as many steps as `ecdh_bits_per_step` calls for.
 ///
@@ -755,6 +818,14 @@ fn ladder_bits_per_step(s: &QuicState) -> u8 {
 unsafe fn pump_send_certificate_verify(s: &mut QuicState, idx: usize) -> bool {
     let sys = &*s.syscalls;
     let bits_per_step = ladder_bits_per_step(s);
+    {
+        let mut scalar = [0u8; 48];
+        let n = identity_ec_scalar(&s.key[..s.key_len], &mut scalar);
+        zeroize(&mut scalar);
+        if n == 48 {
+            return pump_send_certificate_verify_p384(s, idx, bits_per_step);
+        }
+    }
 
     // ── Stage 1 — initialise, once.
     if !s.conns[idx].driver.ecdsa_sign_state.is_initialised() {
