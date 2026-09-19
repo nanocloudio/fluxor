@@ -3,7 +3,7 @@
 Linux-only built-in network surface. Bridges the Stream Surface v1
 contract (`net_proto`) to host TCP/UDP sockets via `libc`.
 
-Implements the kernel-side dispatch for `CMD_BIND` / `CMD_CONNECT` /
+Implements the kernel-side dispatch for `CMD_BIND` / `CMD_CONNECT_TO` /
 `CMD_SEND` / `CMD_CLOSE` and emits `MSG_BOUND` / `MSG_ACCEPTED` /
 `MSG_DATA` / `MSG_CLOSED` / `MSG_ERROR` to anchor modules. It is the
 hosted-Linux counterpart of `rp1_gem` + `ip` on bare-metal Pi 5.

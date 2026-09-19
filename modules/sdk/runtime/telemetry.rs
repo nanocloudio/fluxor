@@ -41,7 +41,7 @@ unsafe fn dev_owner_tag(sys: &SyscallTable) -> u16 {
 
 /// Stream-surface requester tag for this module: `module index + 1`, so the
 /// "untagged" sentinel `REQUESTER_TAG_NONE` (0) never collides with a valid
-/// zero-based module index. Saturates at `u8::MAX`. Used to tag `CMD_CONNECT`
+/// zero-based module index. Saturates at `u8::MAX`. Used to tag `CMD_CONNECT_TO`
 /// and to recognise the matching `MSG_CONNECTED` when `ip.net_out` is fanned to
 /// several stream consumers. Returns 0 only if the index is unavailable.
 #[allow(

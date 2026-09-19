@@ -90,8 +90,13 @@ the pulled graph.
 
 The `tls` client needs an explicit peer-authentication profile, or it
 refuses to construct — `peer_auth: ca_dns` with the deployment CA in
-`trust` and the registry's name in `verify_hostname`, or
-`peer_auth: pinned` with the registry's own certificate in `trust`.
+`trust`, or `peer_auth: pinned` with the registry's own certificate in
+`trust`. Under `ca_dns` the name checked against the certificate is the
+one `ota_registry` dials: its `authority` names the registry, and `tls`
+reads that name off the connect record it forwards, so it is written
+once. `verify_hostname` is the override for a registry reached through
+a proxy or by a pinned address — set it only when the name to verify is
+not the one dialled.
 `trust` names its file as a source spec, `trust: "${file:pki/ca.der}"`,
 never as a bare path: the build reads the file and embeds its
 certificates, and a file that cannot be read or holds none fails the
@@ -99,11 +104,9 @@ build naming the file and the instance. The file may be a bundle —
 concatenated DER, or PEM with several `CERTIFICATE` blocks — of up to
 eight anchors, which is how a CA rotation is expressed: the outgoing and
 incoming authorities side by side, and a chain signed by either verifies.
-(`trust_cert_file` is also accepted, and names the same file; the build
-prints a deprecation line for it, and refuses a module that carries
-both.) A device with no
-synchronised wall clock must also choose `clock_policy: unchecked`, which
-states that certificate lifetimes are not enforced on it.
+A device with no synchronised wall clock must also choose
+`clock_policy: unchecked`, which states that certificate lifetimes are
+not enforced on it.
 
 On a Linux host, `fluxor run --ca <pem>` and `fluxor exec --ca <pem>`
 append the PEM's certificates to the anchors of every client-mode `tls`
@@ -120,11 +123,12 @@ Source: `modules/foundation/ota_registry/mod.rs` and its
 
 `ota_registry` is a PIC module that speaks HTTP/1.1 against the OCI
 distribution API over a `net_in` / `net_out` net_proto pair, wired
-through `tls`. Params (TLV tags): `registry_ip` (1), `registry_port`
-(2, default 5000), `host` (3), `repo` (4), `tag` (5), `poll_s` (6,
-0 = pull once), `boot_delay_ms` (7, default 2000), `chunk_bytes` (8,
-0 = whole blob), `directive_pubkey` (9, 64 hex chars of an Ed25519
-public key).
+through `tls`. Params (TLV tags): `authority` (10, `host[:port]`, port
+5000 when omitted — the registry as dialled and as sent in the HTTP
+`Host:` header), `repo` (4), `tag` (5), `poll_s` (6, 0 = pull once),
+`boot_delay_ms` (7, default 2000), `chunk_bytes` (8, 0 = whole blob),
+`directive_pubkey` (9, 64 hex chars of an Ed25519 public key). Tags 1,
+2 and 3 are retired.
 
 The pull cycle:
 

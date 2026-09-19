@@ -9,6 +9,12 @@
 //! (`Connection: close`), exponential backoff on any failure, and an
 //! optional re-poll interval for long-running graphs.
 //!
+//! The registry is named once, by `authority` (`host[:port]`, port 5000
+//! when omitted): its host is the `CMD_CONNECT_TO` target — a name the
+//! network provider resolves, or a literal — its port is the port dialled,
+//! and the string as written is the HTTP `Host:` header. Behind a `ca_dns`
+//! tls client the name is also what the certificate is checked against.
+//!
 //! HTTP subset: HTTP/1.1 responses framed by `Content-Length` (what the
 //! nanocloud registry serves). A chunked response is treated as an
 //! error and logged — not silently mis-read.
@@ -41,15 +47,14 @@ include!("../../sdk/crypto/hmac.rs");
 include!("../../sdk/crypto/p256.rs");
 include!("../../sdk/crypto/ed25519.rs");
 
-// ── net_proto vocabulary (contracts/net/net_proto.rs) ────────────────
-
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+#[path = "../../sdk/contracts/net/net_proto.rs"]
+mod net_proto;
+use net_proto::{
+    write_connect_to, Target, AF_INET, AF_INET6, CMD_CLOSE as NET_CMD_CLOSE,
+    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR,
+};
 
 // ── OTA_STAGE_CTRL commands (internal/reconfigure.rs) ────────────────
 
@@ -78,7 +83,11 @@ const TX_BUF_SIZE: usize = 512;
 /// `OTA_STAGE_WRITE` arg: 4-byte offset prefix + one fragment.
 const STAGE_ARG_SIZE: usize = 4 + 8192;
 
-const MAX_HOST_LEN: usize = 64;
+/// `authority` as written: `host[:port]`, sent verbatim as the HTTP
+/// `Host:` header.
+const MAX_AUTHORITY_LEN: usize = 128;
+/// Default registry port when `authority` names none.
+const DEFAULT_PORT: u16 = 5000;
 const MAX_REPO_LEN: usize = 64;
 const MAX_TAG_LEN: usize = 32;
 
@@ -92,7 +101,7 @@ const BACKOFF_MAX_MS: u64 = 60_000;
 enum Phase {
     /// Waiting out the boot delay (DHCP / TLS bring-up).
     Init = 0,
-    /// CMD_CONNECT queued for the current request.
+    /// CMD_CONNECT_TO queued for the current request.
     Connecting = 1,
     /// Waiting for MSG_CONNECTED with our requester tag.
     WaitConnect = 2,
@@ -117,17 +126,23 @@ struct State {
     net_out: i32,
 
     // Params.
-    registry_ip: u32,
-    registry_port: u16,
     poll_s: u16,
+    /// The registry's port: the authority's, or `DEFAULT_PORT`.
+    peer_port: u16,
     boot_delay_ms: u32,
     /// 0 = fetch the whole blob per connection; N = fetch N-byte Range
     /// chunks, one connection each. Bounds how much a single transport
     /// failure can cost, and keeps each transfer under stream-length
     /// limits of constrained bearers.
     chunk_bytes: u32,
-    host: [u8; MAX_HOST_LEN],
-    host_len: u8,
+    authority: [u8; MAX_AUTHORITY_LEN],
+    authority_len: u8,
+    /// The dial target parsed from `authority` once at construction:
+    /// `AF_INET` / `AF_INET6` with the address in `peer_addr`, or
+    /// `AF_NAME` with the name being `authority[..peer_host_len]`.
+    peer_af: u8,
+    peer_host_len: u8,
+    peer_addr: [u8; 16],
     repo: [u8; MAX_REPO_LEN],
     repo_len: u8,
     tag: [u8; MAX_TAG_LEN],
@@ -136,9 +151,8 @@ struct State {
     phase: Phase,
     fetching: u8,
     conn_id: u16,
-    /// The previously used conn id: late MSG_ERROR events from a
-    /// connection we already finished with must not abort the current
-    /// request (they cost a needless backoff + manifest refetch per
+    /// The id of the connection just finished with: its late MSG_ERROR
+    /// events must not abort the current request (they cost a needless backoff + manifest refetch per
     /// chunk on the chunked path).
     prev_conn_id: u16,
     conn_present: u8,
@@ -170,7 +184,8 @@ struct State {
 
     // Directive port (index 1, optional): signed tag re-point /
     // check-now commands. `directive_counter` is the anti-replay
-    // watermark (module state; see the RFC's recorded limitation).
+    // watermark, held in module state, so a restart accepts a counter it
+    // has already seen.
     directive_chan: i32,
     directive_ready: u8,
     directive_counter: u64,
@@ -204,23 +219,11 @@ mod params_def {
     use super::ptr_copy;
     use super::State;
     use super::SCHEMA_MAX;
-    use super::{MAX_HOST_LEN, MAX_REPO_LEN, MAX_TAG_LEN};
+    use super::{MAX_AUTHORITY_LEN, MAX_REPO_LEN, MAX_TAG_LEN};
 
+    // Tags 1, 2 and 3 are retired; the next allocation is 11.
     define_params! {
         State;
-
-        1, registry_ip, u32, 0
-            => |s, d, len| { s.registry_ip = p_u32(d, len, 0, 0); };
-
-        2, registry_port, u16, 5000
-            => |s, d, len| { s.registry_port = p_u16(d, len, 0, 5000); };
-
-        3, host, str, 0
-            => |s, d, len| {
-                let n = if len > MAX_HOST_LEN { MAX_HOST_LEN } else { len };
-                s.host_len = n as u8;
-                if n > 0 { ptr_copy(s.host.as_mut_ptr(), d, n); }
-            };
 
         4, repo, str, 0
             => |s, d, len| {
@@ -263,6 +266,55 @@ mod params_def {
                     s.directive_pubkey_len = if ok { 32 } else { 0 };
                 }
             };
+
+        10, authority, str, 0
+            => |s, d, len| {
+                // A value that does not fit is dropped rather than clipped:
+                // the first 128 bytes of a longer authority name a different
+                // registry, and the admission below refuses the instance.
+                if len == 0 || len > MAX_AUTHORITY_LEN {
+                    s.authority_len = 0;
+                } else {
+                    s.authority_len = len as u8;
+                    ptr_copy(s.authority.as_mut_ptr(), d, len);
+                }
+            };
+    }
+}
+
+/// Parse `authority` into the dial target the module keeps. `false`
+/// when it is absent or is not `host[:port]`.
+fn adopt_authority(s: &mut State) -> bool {
+    let n = s.authority_len as usize;
+    if n == 0 {
+        return false;
+    }
+    let mut copy = [0u8; MAX_AUTHORITY_LEN];
+    copy[..n].copy_from_slice(&s.authority[..n]);
+    let Some((target, port)) = Target::parse(&copy[..n]) else {
+        return false;
+    };
+    s.peer_port = port.unwrap_or(DEFAULT_PORT);
+    s.peer_af = target.af();
+    match target {
+        Target::V4(a) => s.peer_addr[..4].copy_from_slice(&a),
+        Target::V6(a) => s.peer_addr.copy_from_slice(&a),
+        Target::Name(name) => s.peer_host_len = name.len() as u8,
+    }
+    true
+}
+
+/// The target `adopt_authority` kept, borrowed for one dial.
+fn dial_target(s: &State) -> Target<'_> {
+    match s.peer_af {
+        AF_INET => Target::V4([
+            s.peer_addr[0],
+            s.peer_addr[1],
+            s.peer_addr[2],
+            s.peer_addr[3],
+        ]),
+        AF_INET6 => Target::V6(s.peer_addr),
+        _ => Target::Name(&s.authority[..s.peer_host_len as usize]),
     }
 }
 
@@ -424,7 +476,7 @@ unsafe fn enter_backoff(s: &mut State) {
     s.phase = Phase::Backoff;
 }
 
-/// Reset per-request parse state and queue the CMD_CONNECT.
+/// Reset per-request parse state and queue the dial.
 unsafe fn start_request(s: &mut State, fetching: u8) {
     s.fetching = fetching;
     s.hdr_fill = 0;
@@ -516,9 +568,9 @@ unsafe fn build_request(s: &mut State) -> usize {
         put(s, &hex);
     }
     put(s, b" HTTP/1.1\r\nHost: ");
-    let host_len = s.host_len as usize;
-    let host = s.host;
-    put(s, &host[..host_len]);
+    let authority_len = s.authority_len as usize;
+    let authority = s.authority;
+    put(s, &authority[..authority_len]);
     if s.fetching == FETCH_MANIFEST {
         put(s, b"\r\nAccept: application/vnd.oci.image.manifest.v1+json");
     } else if cur_fetch_pos(s) > 0 || s.chunk_bytes > 0 {
@@ -1162,17 +1214,21 @@ unsafe fn pump(s: &mut State) -> i32 {
             if s.net_out < 0 {
                 return 0;
             }
-            let mut payload = [0u8; 8];
-            payload[0] = SOCK_TYPE_STREAM;
-            payload[1..5].copy_from_slice(&s.registry_ip.to_le_bytes());
-            payload[5..7].copy_from_slice(&s.registry_port.to_le_bytes());
-            payload[7] = dev_requester_tag(sys);
+            let mut payload = [0u8; CONNECT_TO_MAX];
+            let tag = dev_requester_tag(sys);
+            let n = write_connect_to(
+                &mut payload,
+                SOCK_TYPE_STREAM,
+                s.peer_port,
+                &dial_target(s),
+                Some(tag),
+            );
             let wrote = net_write_frame(
                 sys,
                 s.net_out,
-                NET_CMD_CONNECT,
+                NET_CMD_CONNECT_TO,
                 payload.as_ptr(),
-                8,
+                n,
                 s.net_buf.as_mut_ptr(),
                 NET_BUF_SIZE,
             );
@@ -1254,6 +1310,13 @@ pub extern "C" fn module_new(
         s.directive_chan = -1;
         s.hasher = Sha256::new();
         params_def::parse_tlv(s, params, params_len);
+        if !adopt_authority(s) {
+            log_err(
+                s,
+                b"[ota_reg] refusing to construct: authority must be host[:port], at most 128 bytes",
+            );
+            return -22;
+        }
         0
     }
 }

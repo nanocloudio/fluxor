@@ -34,7 +34,9 @@
 //   [role:1]              1 = server, 0 = client
 //   [conn_id:2]           the primary's net_proto connection id
 //   [alpn_len:1][alpn:16] negotiated ALPN, zero-padded
-//   [sni_len:1][sni:64]   the DNS identity a client sent as SNI
+//   [sni_len:1][sni:64]   the identity a client session expects of its
+//                         peer: a DNS name, or an address (4 or 16 bytes)
+//                         when the length byte's high bit is set
 //   [peer_verified:1]     1 when the peer presented a credential that
 //                         the session's profile accepted
 //   [peer_profile:1]      the peer-authentication profile in force
@@ -159,6 +161,9 @@ const AAD_KIND_KEY_UPDATE: u8 = 2;
 /// ALPN and SNI fields.
 const CKPT_ALPN_MAX: usize = 16;
 const CKPT_SNI_MAX: usize = 64;
+/// High bit of the SNI length byte: the field holds the address the
+/// session expects as an `iPAddress` (4 or 16 bytes), not a name.
+const CKPT_SNI_IS_IP: u8 = 0x80;
 
 /// Fixed part of the record.
 const CKPT_FIXED_LEN: usize = 1
@@ -362,6 +367,7 @@ struct TlsCheckpoint {
     alpn_len: u8,
     sni: [u8; CKPT_SNI_MAX],
     sni_len: u8,
+    sni_is_ip: bool,
     peer_verified: u8,
     peer_profile: u8,
     exporter_ctx: [u8; 48],
@@ -392,6 +398,7 @@ impl TlsCheckpoint {
             alpn_len: 0,
             sni: [0; CKPT_SNI_MAX],
             sni_len: 0,
+            sni_is_ip: false,
             peer_verified: 0,
             peer_profile: 0,
             exporter_ctx: [0; 48],
@@ -1016,14 +1023,21 @@ unsafe fn encode_checkpoint(
     let mut alpn = [0u8; CKPT_ALPN_MAX];
     alpn[..alpn_len].copy_from_slice(&sess.driver.alpn_selected[..alpn_len]);
     e.bytes(&alpn);
+    // The session's expected peer identity: a name, or (high bit of the
+    // length) an address. A server session expects nothing.
     let sni_len = if sess.driver.is_server {
         0
     } else {
-        s.expected_dns_len.min(CKPT_SNI_MAX)
+        (sess.expected_len as usize).min(CKPT_SNI_MAX)
     };
-    e.u8(sni_len as u8);
+    let sni_kind = if sess.expected_is_ip && sni_len > 0 {
+        CKPT_SNI_IS_IP
+    } else {
+        0
+    };
+    e.u8(sni_len as u8 | sni_kind);
     let mut sni = [0u8; CKPT_SNI_MAX];
-    sni[..sni_len].copy_from_slice(&s.expected_dns[..sni_len]);
+    sni[..sni_len].copy_from_slice(&sess.expected[..sni_len]);
     e.bytes(&sni);
     e.u8((sess.driver.peer_cert_pubkey_len != 0) as u8);
     e.u8(s.peer_auth);
@@ -1102,8 +1116,10 @@ unsafe fn decode_into(
     if !d.take_into(&mut alpn) {
         return false;
     }
-    let sni_len = match d.u8() {
-        Some(n) if n as usize <= CKPT_SNI_MAX => n,
+    let (sni_len, sni_is_ip) = match d.u8() {
+        Some(n) if (n & !CKPT_SNI_IS_IP) as usize <= CKPT_SNI_MAX => {
+            (n & !CKPT_SNI_IS_IP, n & CKPT_SNI_IS_IP != 0)
+        }
         _ => return false,
     };
     let mut sni = [0u8; CKPT_SNI_MAX];
@@ -1200,6 +1216,7 @@ unsafe fn decode_into(
     ck.alpn_len = alpn_len;
     ck.sni = sni;
     ck.sni_len = sni_len;
+    ck.sni_is_ip = sni_is_ip;
     ck.peer_verified = peer_verified;
     ck.peer_profile = peer_profile;
     ck.exporter_ctx = exporter_ctx;
@@ -2971,6 +2988,10 @@ unsafe fn activate_shadow(s: &mut TlsState, sh: usize, new_epoch: u32, conn_id: 
     sess.driver.hs_state = HandshakeState::Complete;
     sess.driver.alpn_selected = ck.alpn;
     sess.driver.alpn_selected_len = ck.alpn_len;
+    sess.expected = [0; MAX_EXPECTED_DNS];
+    sess.expected[..ck.sni_len as usize].copy_from_slice(&ck.sni[..ck.sni_len as usize]);
+    sess.expected_len = ck.sni_len;
+    sess.expected_is_ip = ck.sni_is_ip;
     sess.driver.server_finished_hash = ck.exporter_ctx;
     let mut ks = KeySchedule::new(suite);
     ks.client_app_secret = ck.secrets.client_app;

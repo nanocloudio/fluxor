@@ -114,10 +114,11 @@ RIG_BACKEND_DIR := $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/
 # memorable (standards/test-tracking.md §8): without `-f` this stages
 # nothing, because `.gitignore` outranks `.git-shadow/info/exclude`;
 # without the pathspec `-f` overrides that exclude too and walks
-# `tests/harness/target` (42G). `git shadow status` / `log` are single
-# commands — type them.
+# `tests/harness/target` (42G). The same `-f` is why `__pycache__` needs
+# naming: `.gitignore` covers it for the parent repo and is outranked here.
+# `git shadow status` / `log` are single commands — type them.
 shadow-add:
-	@git shadow add -f -- tests tools/tests examples ':(exclude)**/target/**'
+	@git shadow add -f -- tests tools/tests examples ':(exclude)**/target/**' ':(exclude)**/__pycache__/**'
 
 # One kernel: build + objcopy to a raw boot image.
 #   make firmware TARGET=pico2w   # a BOARD id (targets/boards/), or a host token

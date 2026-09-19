@@ -11,9 +11,18 @@ permissions = ["platform_raw"]
 # artifact) from an OCI distribution registry and activates it through
 # the kernel's OTA RAM staging surface.
 #
+# The registry is one parameter, `authority` (`host[:port]`, port 5000
+# when omitted, at most 128 bytes): its host is the `CMD_CONNECT_TO`
+# target the network provider resolves, and the string as written is the
+# HTTP `Host:` header. The other params:
+# `repo`, `tag`, `poll_s` (0 = pull once), `boot_delay_ms`, `chunk_bytes`
+# (0 = whole blob), `directive_pubkey`.
+#
 # Wire path: this module speaks HTTP/1.1 + the distribution API on its
 # net pair; wiring the pair through the `tls` module (client mode, CA
-# pinned to the deployment CA) gives the transport TLS —
+# pinned to the deployment CA, and the registry's name checked against
+# its certificate because `authority` carries it) gives the transport
+# TLS —
 #
 #   ota_registry.net_out → tls.clear_in ; tls.clear_out → ota_registry.net_in
 #   tls.cipher_out → ip.in ; ip.out → tls.cipher_in

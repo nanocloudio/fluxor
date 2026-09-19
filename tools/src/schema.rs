@@ -490,6 +490,8 @@ pub fn build_params_from_schema(
 
         if let Some(value) = kv.get(&param.name) {
             check_param_value_len(param, &param.name, value, data_section, module_name)?;
+            check_param_value_dotted(module_name, &param.name, value, param)?;
+            check_param_value_enum(module_name, &param.name, value, param)?;
             pos = pack_param(schema, &param.name, value, entry, pos, data_section);
         }
     }
@@ -499,7 +501,7 @@ pub fn build_params_from_schema(
         for voice_ref in voice_refs {
             if let Some(voice_params) = resolve_voice_params(voice_ref, data_section, module_name) {
                 let mut inner = [0u8; 256];
-                let inner_len = pack_voice_inner(&voice_params, schema, &mut inner);
+                let inner_len = pack_voice_inner(&voice_params, schema, &mut inner, module_name)?;
                 if inner_len > 0 && pos + 2 + inner_len < entry.len() {
                     entry[pos] = 0xFD;
                     pos += 1;
@@ -569,6 +571,71 @@ fn check_param_value_len(
          module would receive only the tail of it. Shorten the value, move it \
          to a file the module opens at runtime, or (only if the module's \
          handler appends each chunk) declare the parameter `str_chunked`."
+    ))
+}
+
+/// A `u32` parameter takes a number, a hex literal or an IPv4 literal. A
+/// string with a dot that is not a dotted quad is a host name that landed
+/// on an address parameter; `resolve_u32` would hash it and the module
+/// would dial nonsense, so it is refused here, where the module and the
+/// field can still be named. A dotless string is left to `resolve_u32`,
+/// where an FMP message-type name is hashed by design.
+/// A parameter that declares named values takes one of them, a number, or
+/// a boolean word. Anything else is a name that means nothing here: the
+/// resolver would fall back to the default (`u8`) or hash the string
+/// (`u32`), and the module would run a policy the graph never asked for.
+/// Refused where the module, the key and the valid names can all be said.
+fn check_param_value_enum(
+    module_name: &str,
+    key: &str,
+    value: &Value,
+    param: &SchemaParam,
+) -> Result<(), String> {
+    if param.enums.is_empty() {
+        return Ok(());
+    }
+    let Some(s) = value.as_str() else {
+        return Ok(());
+    };
+    let lower = s.to_lowercase();
+    if param.enums.contains_key(s)
+        || param.enums.contains_key(&lower)
+        || s.parse::<u64>().is_ok()
+        || matches!(
+            lower.as_str(),
+            "true" | "on" | "yes" | "false" | "off" | "no"
+        )
+    {
+        return Ok(());
+    }
+    let mut names: Vec<&str> = param.enums.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    Err(format!(
+        "module '{module_name}': parameter '{key}' is '{s}', which is not one of \
+         its values: {}",
+        names.join(", ")
+    ))
+}
+
+fn check_param_value_dotted(
+    module_name: &str,
+    key: &str,
+    value: &Value,
+    param: &SchemaParam,
+) -> Result<(), String> {
+    if param.ptype != ParamType::U32 {
+        return Ok(());
+    }
+    let Some(s) = value.as_str() else {
+        return Ok(());
+    };
+    if !s.contains('.') || param.enums.contains_key(s) || parse_ipv4(s).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "module '{module_name}': parameter '{key}' is '{s}', which contains a dot \
+         but is not a dotted quad; a u32 parameter takes a number, a hex literal \
+         or an IPv4 literal — a host name belongs in `authority`"
     ))
 }
 
@@ -1017,7 +1084,12 @@ fn resolve_voice_params(
 /// Produces `[0xFE, 0x02, len_lo, len_hi, ...tag-len-value entries..., 0xFF, 0x00]`.
 /// This is stored inside the outer `0xFD` tag. When the module switches voices,
 /// it copies this blob into `params` and calls `apply_params`.
-fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 256]) -> usize {
+fn pack_voice_inner(
+    voice_params: &Value,
+    schema: &ParamSchema,
+    buf: &mut [u8; 256],
+    module_name: &str,
+) -> Result<usize, String> {
     let mut kv: HashMap<String, Value> = HashMap::new();
 
     // Flatten voice params into kv map (same logic as build_params_from_schema)
@@ -1070,6 +1142,8 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
             continue; // voices don't contain presets or blobs
         }
         if let Some(value) = kv.get(&param.name) {
+            check_param_value_dotted(module_name, &param.name, value, param)?;
+            check_param_value_enum(module_name, &param.name, value, param)?;
             pos = pack_param(schema, &param.name, value, buf, pos, None);
         }
     }
@@ -1084,7 +1158,7 @@ fn pack_voice_inner(voice_params: &Value, schema: &ParamSchema, buf: &mut [u8; 2
     let payload_len = (pos - payload_start) as u16;
     buf[len_pos..len_pos + 2].copy_from_slice(&payload_len.to_le_bytes());
 
-    pos
+    Ok(pos)
 }
 
 /// Load the param schema for a module type from its `.fmod`.

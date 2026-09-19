@@ -81,7 +81,7 @@
 //!   upstream DNS server; upstream responses arrive as `MSG_DG_RX_FROM`.
 //!
 //! Frames share the 3-byte TLV header with net_proto, but datagram
-//! opcodes (`0x20..0x43`) are disjoint from net_proto's (`0x01..0x13`) so
+//! opcodes (`0x20..0x43`) are disjoint from net_proto's (`0x01..0x14`) so
 //! a shared `net_out` channel can carry both contracts unambiguously.
 //!
 //! # Parameters
@@ -121,64 +121,15 @@ include!("../../sdk/runtime/params.rs");
 // transport_buffer / quic / dtls. dns composes two: server (port 53) + upstream
 // (ephemeral), demuxed by ep_id on one channel.
 include!("../../sdk/cores/datagram_endpoint.rs");
+// The DNS message codec — header, names, question, resource records —
+// shared with the `ip` stub resolver.
+#[path = "../../sdk/contracts/net/dns_wire.rs"]
+mod dns_wire;
+use dns_wire::*;
 
 // ============================================================================
 // Constants
 // ============================================================================
-
-/// DNS protocol constants
-const DNS_HEADER_LEN: usize = 12;
-const DNS_MAX_PACKET: usize = 512;
-
-/// DNS record types
-const QTYPE_A: u16 = 1;
-const QTYPE_NS: u16 = 2;
-const QTYPE_CNAME: u16 = 5;
-const QTYPE_SOA: u16 = 6;
-const QTYPE_PTR: u16 = 12;
-const QTYPE_MX: u16 = 15;
-const QTYPE_TXT: u16 = 16;
-const QTYPE_AAAA: u16 = 28;
-const QTYPE_DNAME: u16 = 39;
-const QTYPE_OPT: u16 = 41;
-const QTYPE_TSIG: u16 = 250;
-const QTYPE_ANY: u16 = 255;
-const QCLASS_IN: u16 = 1;
-const QCLASS_NONE: u16 = 254;
-const QCLASS_ANY: u16 = 255;
-
-/// DNS flags
-const FLAG_QR: u16 = 0x8000; // Response
-const FLAG_AA: u16 = 0x0400; // Authoritative
-const FLAG_TC: u16 = 0x0200; // Truncated
-const FLAG_RA: u16 = 0x0080; // Recursion available
-const FLAG_RD: u16 = 0x0100; // Recursion desired
-const FLAG_AD: u16 = 0x0020; // Authentic data
-const FLAG_CD: u16 = 0x0010; // Checking disabled
-const RCODE_MASK: u16 = 0x000F;
-const RCODE_NOERROR: u16 = 0x0000;
-const RCODE_FORMERR: u16 = 0x0001;
-const RCODE_SERVFAIL: u16 = 0x0002;
-const RCODE_NXDOMAIN: u16 = 0x0003;
-const RCODE_NOTIMP: u16 = 0x0004;
-const RCODE_REFUSED: u16 = 0x0005;
-const RCODE_YXDOMAIN: u16 = 0x0006;
-const RCODE_YXRRSET: u16 = 0x0007;
-const RCODE_NXRRSET: u16 = 0x0008;
-const RCODE_NOTAUTH: u16 = 0x0009;
-const RCODE_NOTZONE: u16 = 0x000A;
-
-/// The DO bit in an OPT record's extended flags (RFC 6891 §6.1.4).
-const EDNS_DO: u16 = 0x8000;
-
-/// Opcode field of the DNS header flags word (bits 11..14).
-const FLAG_OPCODE_MASK: u16 = 0x7800;
-const FLAG_OPCODE_SHIFT: u32 = 11;
-
-/// Opcode 0 (standard query) is served or forwarded; opcode 5 (UPDATE) is
-/// served when a zone is configured.
-const OPCODE_QUERY: u8 = 0;
-const OPCODE_UPDATE: u8 = 5;
 
 // datagram opcodes / DG_V4_PREFIX / DG_AF_INET come from
 // modules/sdk/runtime.rs (shared across consumers).
@@ -195,27 +146,10 @@ const MAX_PENDING: usize = 8;
 /// Pending query timeout (milliseconds)
 const PENDING_TIMEOUT_MS: u32 = 5000;
 
-/// Maximum dotted domain name length, in bytes. This is the DNS full-name
-/// ceiling (RFC 1035 §2.3.4), not the 63-byte per-label ceiling — a name of
-/// several ordinary labels must fit.
-const MAX_NAME_LEN: usize = 255;
-
-/// Maximum length of one wire-format label (RFC 1035 §2.3.4).
-const MAX_LABEL_LEN: usize = 63;
-
 /// Draws taken from the CSPRNG when allocating an upstream transaction id
 /// before the forward is refused. Each draw is rejected only on collision with
 /// a live pending slot, so the bound is reached with negligible probability.
 const UPSTREAM_ID_DRAWS: usize = 8;
-
-/// Compression-pointer hops followed while decoding one name before the
-/// packet is refused as malformed. A legal name needs far fewer; a pointer
-/// cycle needs the bound.
-const MAX_NAME_PTR_HOPS: usize = 16;
-
-/// Resource records examined in any one section of an upstream answer or an
-/// UPDATE message; a section claiming more is refused rather than walked.
-const MAX_SECTION_RRS: usize = 32;
 
 // ── DNS64 ────────────────────────────────────────────────────────────────
 
@@ -938,64 +872,6 @@ unsafe fn parse_ipv4(data: *const u8, len: usize) -> u32 {
         | (*op.add(3) as u32)
 }
 
-/// Extract QNAME from DNS question section. Converts wire format labels to
-/// dotted lowercase string. Returns name length, or 0 on error.
-/// Also advances `*offset` past the QNAME.
-unsafe fn extract_qname(
-    pkt: *const u8,
-    pkt_len: usize,
-    offset: &mut usize,
-    name_buf: *mut u8,
-) -> usize {
-    let mut name_pos = 0usize;
-    let mut off = *offset;
-
-    loop {
-        if off >= pkt_len {
-            return 0;
-        }
-        let label_len = *pkt.add(off) as usize;
-        off += 1;
-
-        if label_len == 0 {
-            break; // root label
-        }
-
-        // No compression pointer support needed for questions
-        if label_len > MAX_LABEL_LEN || off + label_len > pkt_len {
-            return 0;
-        }
-
-        // Add dot separator (not before first label)
-        if name_pos > 0 {
-            if name_pos >= MAX_NAME_LEN {
-                return 0;
-            }
-            *name_buf.add(name_pos) = b'.';
-            name_pos += 1;
-        }
-
-        // Copy label bytes, lowercased
-        let mut i = 0;
-        while i < label_len {
-            if name_pos >= MAX_NAME_LEN {
-                return 0;
-            }
-            let mut b = *pkt.add(off + i);
-            if b.is_ascii_uppercase() {
-                b += 32;
-            }
-            *name_buf.add(name_pos) = b;
-            name_pos += 1;
-            i += 1;
-        }
-        off += label_len;
-    }
-
-    *offset = off;
-    name_pos
-}
-
 /// Look up a hostname in the local host table. Insertion and lookup share the
 /// one `fnv1a_lower` invariant, so a caller that has not already lowercased its
 /// name still matches.
@@ -1088,38 +964,6 @@ unsafe fn lookup_ptr(s: &DnsState, name_ptr: *const u8, name_len: usize) -> Opti
         h += 1;
     }
     None
-}
-
-/// Encode a dotted name into DNS wire format labels at dst.
-/// Returns bytes written.
-unsafe fn encode_name(name: *const u8, name_len: usize, dst: *mut u8) -> usize {
-    let mut pos = 0usize;
-    let mut label_start = 0usize;
-
-    let mut i = 0;
-    while i <= name_len {
-        if i == name_len || *name.add(i) == b'.' {
-            let label_len = i - label_start;
-            if label_len == 0 || label_len > MAX_LABEL_LEN {
-                return 0;
-            }
-            *dst.add(pos) = label_len as u8;
-            pos += 1;
-            let mut j = label_start;
-            while j < i {
-                *dst.add(pos) = *name.add(j);
-                pos += 1;
-                j += 1;
-            }
-            label_start = i + 1;
-        }
-        i += 1;
-    }
-
-    // Root label terminator
-    *dst.add(pos) = 0;
-    pos += 1;
-    pos
 }
 
 /// Start a locally generated response: copy the query header and its FIRST
@@ -2109,160 +1953,6 @@ unsafe fn handle_upstream_response(
 // Wire helpers shared by DNS64 and UPDATE
 // ============================================================================
 
-/// Decode the name at `off`, following compression pointers under
-/// `MAX_NAME_PTR_HOPS`, into dotted lowercase `out` (at least
-/// `MAX_NAME_LEN + 1` bytes). Returns the dotted length and the offset just
-/// past the name's in-place bytes, or `None` when malformed. The root name
-/// decodes to length 0.
-unsafe fn read_name(
-    pkt: *const u8,
-    pkt_len: usize,
-    off: usize,
-    out: *mut u8,
-) -> Option<(usize, usize)> {
-    let mut pos = off;
-    let mut name_pos = 0usize;
-    let mut next: Option<usize> = None;
-    let mut hops = 0usize;
-    loop {
-        if pos >= pkt_len {
-            return None;
-        }
-        let b = *pkt.add(pos) as usize;
-        if b == 0 {
-            pos += 1;
-            break;
-        }
-        if b & 0xC0 == 0xC0 {
-            if pos + 1 >= pkt_len {
-                return None;
-            }
-            let target = ((b & 0x3F) << 8) | *pkt.add(pos + 1) as usize;
-            // A pointer only ever refers backwards, so a cycle needs the hop
-            // bound only as a second line.
-            if target >= pos || target < DNS_HEADER_LEN {
-                return None;
-            }
-            hops += 1;
-            if hops > MAX_NAME_PTR_HOPS {
-                return None;
-            }
-            if next.is_none() {
-                next = Some(pos + 2);
-            }
-            pos = target;
-            continue;
-        }
-        if b & 0xC0 != 0 || b > MAX_LABEL_LEN || pos + 1 + b > pkt_len {
-            return None;
-        }
-        if name_pos > 0 {
-            if name_pos >= MAX_NAME_LEN {
-                return None;
-            }
-            *out.add(name_pos) = b'.';
-            name_pos += 1;
-        }
-        let mut i = 0;
-        while i < b {
-            if name_pos >= MAX_NAME_LEN {
-                return None;
-            }
-            let mut c = *pkt.add(pos + 1 + i);
-            if c.is_ascii_uppercase() {
-                c += 32;
-            }
-            *out.add(name_pos) = c;
-            name_pos += 1;
-            i += 1;
-        }
-        pos += 1 + b;
-    }
-    Some((name_pos, next.unwrap_or(pos)))
-}
-
-/// One parsed resource record; `owner` was written to the caller's buffer.
-#[derive(Clone, Copy)]
-struct RrView {
-    owner_len: usize,
-    rtype: u16,
-    rclass: u16,
-    ttl: u32,
-    rdlen: usize,
-    /// Offset of the first RDATA byte.
-    rdata_off: usize,
-    /// Offset of the record's first byte.
-    start: usize,
-    /// Offset just past the record.
-    next: usize,
-}
-
-/// Parse the record at `off`; the owner goes to `name_buf`.
-unsafe fn parse_rr(
-    pkt: *const u8,
-    pkt_len: usize,
-    off: usize,
-    name_buf: *mut u8,
-) -> Option<RrView> {
-    let (owner_len, p) = read_name(pkt, pkt_len, off, name_buf)?;
-    if p + 10 > pkt_len {
-        return None;
-    }
-    let rtype = u16::from_be_bytes([*pkt.add(p), *pkt.add(p + 1)]);
-    let rclass = u16::from_be_bytes([*pkt.add(p + 2), *pkt.add(p + 3)]);
-    let ttl = u32::from_be_bytes([
-        *pkt.add(p + 4),
-        *pkt.add(p + 5),
-        *pkt.add(p + 6),
-        *pkt.add(p + 7),
-    ]);
-    let rdlen = u16::from_be_bytes([*pkt.add(p + 8), *pkt.add(p + 9)]) as usize;
-    if p + 10 + rdlen > pkt_len {
-        return None;
-    }
-    Some(RrView {
-        owner_len,
-        rtype,
-        rclass,
-        ttl,
-        rdlen,
-        rdata_off: p + 10,
-        start: off,
-        next: p + 10 + rdlen,
-    })
-}
-
-/// Skip `count` records starting at `off`, returning the offset past them.
-unsafe fn skip_rrs(pkt: *const u8, pkt_len: usize, off: usize, count: usize) -> Option<usize> {
-    if count > MAX_SECTION_RRS {
-        return None;
-    }
-    let mut scratch = [0u8; MAX_NAME_LEN + 1];
-    let mut pos = off;
-    let mut i = 0;
-    while i < count {
-        let rr = parse_rr(pkt, pkt_len, pos, scratch.as_mut_ptr())?;
-        pos = rr.next;
-        i += 1;
-    }
-    Some(pos)
-}
-
-/// Byte equality of two dotted lowercase names.
-unsafe fn names_equal(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
-    if a_len != b_len {
-        return false;
-    }
-    let mut i = 0;
-    while i < a_len {
-        if *a.add(i) != *b.add(i) {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 /// True when `name` equals `zone` or ends with `.zone`.
 unsafe fn name_within(name: *const u8, name_len: usize, zone: *const u8, zone_len: usize) -> bool {
     if zone_len == 0 {
@@ -2275,52 +1965,6 @@ unsafe fn name_within(name: *const u8, name_len: usize, zone: *const u8, zone_le
         return false;
     }
     names_equal(name.add(name_len - zone_len), zone_len, zone, zone_len)
-}
-
-/// Copy `n` bytes.
-#[inline(always)]
-unsafe fn copy_bytes(dst: *mut u8, src: *const u8, n: usize) {
-    let mut i = 0;
-    while i < n {
-        *dst.add(i) = *src.add(i);
-        i += 1;
-    }
-}
-
-/// Write a big-endian u16 / u32.
-#[inline(always)]
-unsafe fn put_u16(dst: *mut u8, v: u16) {
-    let b = v.to_be_bytes();
-    *dst = b[0];
-    *dst.add(1) = b[1];
-}
-
-#[inline(always)]
-unsafe fn put_u32(dst: *mut u8, v: u32) {
-    let b = v.to_be_bytes();
-    copy_bytes(dst, b.as_ptr(), 4);
-}
-
-/// Lowercase ASCII copy of `len` bytes, dropping one trailing dot. Returns
-/// the bytes written, or 0 when the name does not fit `cap`.
-unsafe fn copy_name_lower(dst: *mut u8, cap: usize, src: *const u8, len: usize) -> usize {
-    let mut n = len;
-    if n > 0 && *src.add(n - 1) == b'.' {
-        n -= 1;
-    }
-    if n == 0 || n > cap {
-        return 0;
-    }
-    let mut i = 0;
-    while i < n {
-        let mut c = *src.add(i);
-        if c.is_ascii_uppercase() {
-            c += 32;
-        }
-        *dst.add(i) = c;
-        i += 1;
-    }
-    n
 }
 
 /// Position of `needle` in `data[..len]`, or `len` when absent.

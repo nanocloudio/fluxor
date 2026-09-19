@@ -6,8 +6,9 @@ hardware_targets = ["rp2350", "bcm2712", "linux"]
 timer_class = "wall_clock"
 
 # A TLS client's proof of life. Behind a `tls` instance in client mode, it
-# connects to `peer_ip:port`, sends `ping`, expects `pong`, closes, and
-# repeats until `count` connections have succeeded:
+# connects to `authority` (`host[:port]`, port 8443 when omitted — a name
+# the network provider resolves, or a literal), sends `ping`, expects
+# `pong`, closes, and repeats until `count` connections have succeeded:
 #
 #   [probe] tls ok n=<i> steps=<n> ms=<n>       one round trip; `steps` is
 #                                               the module steps from the

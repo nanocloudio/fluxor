@@ -303,6 +303,13 @@ mod profile_host {
         /// seam's whole footprint (~48 KiB here); a packet arriving with
         /// every slot taken is refused and counted, never displaces one.
         pub const MAX_PACKET_HOLD: usize = 32;
+        /// Stub-resolver cache: names held with their address until the
+        /// answer's TTL runs out. One entry is a 64-byte name plus its
+        /// address and expiry (~76 B), so this is ~2.4 KiB.
+        pub const MAX_DNS_CACHE: usize = 32;
+        /// Dials parked on a name lookup in flight; one past it is refused
+        /// `EAGAIN` until an answer or timeout frees an entry.
+        pub const MAX_DNS_PENDING: usize = 8;
     }
 
     pub mod tls {
@@ -442,6 +449,10 @@ mod profile_wasm {
         pub const MAX_LOCAL_ADDRS: usize = 8;
         /// Pre-transport decision hold slots; see profile_host.
         pub const MAX_PACKET_HOLD: usize = 8;
+        /// Stub-resolver cache; see profile_host.
+        pub const MAX_DNS_CACHE: usize = 32;
+        /// Dials parked on a lookup in flight; see profile_host.
+        pub const MAX_DNS_PENDING: usize = 8;
     }
 
     pub mod tls {
@@ -531,6 +542,10 @@ mod profile_embedded {
         pub const MAX_LOCAL_ADDRS: usize = 8;
         /// Pre-transport decision hold slots; see profile_host.
         pub const MAX_PACKET_HOLD: usize = 4;
+        /// Stub-resolver cache; see profile_host. Four names is ~300 B.
+        pub const MAX_DNS_CACHE: usize = 4;
+        /// Dials parked on a lookup in flight; see profile_host.
+        pub const MAX_DNS_PENDING: usize = 4;
     }
 
     pub mod tls {

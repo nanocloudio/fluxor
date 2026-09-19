@@ -44,30 +44,98 @@ the index rewrite cover exactly what was published.
 Only fluxor publishes runtimes; the `fluxor/run/` namespace is
 reserved. A sibling "runtime" is a graph on `fluxor-linux`.
 
-## Annotations every publish stamps
+## What a manifest carries, and what it deliberately does not
+
+A manifest records facts **derived from the artefact**:
 
 - `io.fluxor.abi-surface` — the epoch. Consumers hard-fail on an
   artefact without it, so nothing consumable can skip a publish.
 - `io.fluxor.input-digest` — token-canonical digest of the
-  artefact's actual inputs (module source dir + SDK epoch for
-  fmods, the tree itself for source artefacts). This is what makes
-  downstream staleness advisories exact: comment and formatting
-  churn is digest-neutral.
-- `io.fluxor.ci-digest` — records whether the artefact was built
-  from a verified tree: publish annotates it when the artefact's
-  current input digest matches the last verification stamp under
-  `target/fluxor/`, and omits it otherwise. Information, never a
-  gate — publish does not refuse on its absence.
-- provenance (`local-build` vs `published`) and `source-rev` (plus
-  a dirty bit). `local-build` is ordinary dev flow: every publish
-  is a real, consumable store write, distinguished by annotation,
-  not by filename or a separate shelf. Runtimes' staleness signal
-  is rev-scoped (their inputs are effectively the whole kernel
-  tree).
+  artefact's actual inputs (module source dir for fmods, the tree
+  itself for source artefacts). This is what makes downstream
+  staleness advisories exact: comment and formatting churn is
+  digest-neutral. It is a *staleness* signal and not a content
+  address — it does not cover the toolchain or the catalog, so two
+  artefacts with different bytes can share one.
+- `io.fluxor.kind`, `io.fluxor.project`, `io.fluxor.module.name`,
+  `io.fluxor.module.target`.
 
-Every publish ends with a GC sweep: superseded blobs live until no
-tag, snapshot, or workspace member's `fluxor.lock` pins them, then
-go.
+Facts about the **publishing run** live beside the manifest, in the
+store's `provenance/` table: `local-build` vs `published`, the git
+revision, and the ci digest (recorded when the artefact's current
+input digest matches the last green verification stamp under
+`target/fluxor/` — information, never a gate). Read them with
+`fluxor store ls` or `fluxor inspect`.
+
+That split is what makes a publish cheap. Because the manifest is a
+pure function of content and identity, **re-publishing unchanged
+content produces a byte-identical manifest**: the digest does not
+move, nothing is displaced, no sweep runs, and no downstream
+`fluxor.lock` pin changes. `fluxor update` reports it as
+`0 changed`. Were `source-rev` carried *inside* the manifest instead,
+every publish would rewrite every manifest and strand every pin in
+every consumer, whether or not a single module had changed — which is
+why it is not.
+
+Promotion `local-build` → `published` is likewise a re-tag of an
+existing digest plus one more provenance row — never a rebuild.
+
+`local-build` is ordinary dev flow: every publish is a real,
+consumable store write, distinguished by its provenance record, not
+by filename or a separate shelf.
+
+## Who is holding what: the pin ledger
+
+A `fluxor.lock` pins a manifest digest precisely so it stops moving
+with the tag, which makes pins a garbage-collection root class the
+store cannot see by looking at itself. It keeps a **ledger** of
+them: `pins/<hash>.toml` in the store, one file per checkout,
+written whenever a checkout writes a lockfile or resolves a pin.
+Registration is automatic — there is no list to maintain.
+
+Anything any checkout pins is a root. Membership of
+`~/.fluxor/workspace.toml` decides who is epoch- and
+currency-checked; it has nothing to do with who is allowed to hold a
+digest, and using it as the root set meant a consumer nobody had
+remembered to add was unprotected by construction.
+
+Bootstrap a checkout that has not resolved anything since:
+
+```sh
+fluxor store adopt /path/to/checkout   # or, with no argument, this one
+```
+
+A publish that displaces a manifest another checkout still pins says
+so, naming the checkouts, **before it writes anything**:
+
+```sh
+fluxor publish --dry-run       # print the displacement report, write nothing
+fluxor publish --strict-pins   # refuse rather than leave anyone's pin stale
+```
+
+Symmetrically, `fluxor update` names the digests it stops holding
+that somebody else still does — the moment a consumer's own
+re-resolve stops being the thing keeping a manifest reachable.
+
+## Collection: quarantine, then `gc`
+
+A sweep can only prove it did not *find* a root, and the cost of
+being wrong is an artefact nobody can rebuild to the same digest.
+So a publish's sweep **moves** superseded blobs to `quarantine/`
+rather than deleting them, and any read brings them straight back.
+
+The publish sweep only ever looks at the manifest it just displaced,
+so it is not a collector. That is a separate, deliberate verb:
+
+```sh
+fluxor store gc --dry-run              # what is unreachable, and how much
+fluxor store gc                        # quarantine it; delete after 30 days
+fluxor store gc --retain-days 7
+fluxor store gc --forget-missing       # also drop ledger entries whose
+                                       # checkout is gone (an unmounted repo
+                                       # looks exactly like a deleted one, so
+                                       # this is never automatic)
+```
 
 ## First-time setup (per developer machine)
 
@@ -179,10 +247,20 @@ retained. A consumer restores one with
 ```sh
 fluxor store ls                # everything in the store
 fluxor inspect <ref>           # sha256:… or tag: kind, tags, epoch vs current
-                               # surface, input digest, provenance,
-                               # source rev, layers
+                               # surface, input digest, content address,
+                               # every provenance record, layers
+fluxor store fsck              # every pin every checkout holds: resolvable,
+                               # quarantined or dead; sole-held pins;
+                               # reclaimable bytes. Read-only, safe to run
+                               # while others publish. --repair restores
+                               # from quarantine and never deletes.
 fluxor workspace status        # members + per-artefact staleness
 ```
+
+`fsck` is the one to run when a build says an artefact is not in the
+store. A **dead** pin is a loss, not a repair job: rebuilding mints a
+different digest, so it is a re-pin rather than a recovery, and the
+report says so.
 
 The store is a real on-disk OCI image layout
 (`$XDG_DATA_HOME/fluxor/store`, typically

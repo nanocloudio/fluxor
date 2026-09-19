@@ -173,6 +173,7 @@ const PATH_VALIDATE_TIMEOUT_MS: u64 = 3_000;
 // different channel ENCODING, not a different protocol: it keeps its
 // net_proto MSG_DATA 0x02 framing and carries one raw byte stream.)
 use abi::contracts::net::mux;
+use abi::contracts::net::net_proto::Target;
 const MAX_CERT_LEN: usize = 1024;
 /// Matches the tls module's ceiling so a `key_file` a graph shares between
 /// them packs identically; quic signs in-module with P-256 only, and any
@@ -233,10 +234,12 @@ const TICKET_PT_LEN: usize = 2 + 1 + 48 + 4 + 8 + 4 + 8;
 #[derive(Clone, Copy)]
 struct ClientTicketEntry {
     used: bool,
-    /// Peer the ticket is bound to (RFC 8446 §4.6.1 — we only resume
-    /// to the exact same IP/port pair).
-    peer_ip: [u8; 4],
-    peer_port: u16,
+    /// The authority the ticket is bound to (RFC 8446 §4.6.1): a ticket
+    /// resumes only to the peer it was issued by, and a client knows that
+    /// peer by the authority it dialled, not by whatever address the name
+    /// resolved to at the time.
+    peer: [u8; MAX_AUTHORITY],
+    peer_len: u8,
     /// Opaque ticket bytes received from the server (we echo as PSK
     /// identity).
     ticket: [u8; MAX_TICKET_LEN],
@@ -297,9 +300,23 @@ pub(crate) struct QuicState {
     /// connections; they are demuxed above it by connection id.
     endpoint: DatagramEndpoint,
     port: u16,
-    mode: u8,       // 0 = client, 1 = server
-    peer_ip: u32,   // client mode: peer IPv4 (LE)
-    peer_port: u16, // client mode: peer port
+    mode: u8, // 0 = client, 1 = server
+    /// Client mode: the `authority` as configured (`host[:port]`), the one
+    /// value the peer is dialled, verified and resumed under.
+    authority: [u8; MAX_AUTHORITY],
+    authority_len: u8,
+    /// The authority's host when it is a DNS name; empty for a literal.
+    /// The datagram provider resolves it, and the connection's `peer`
+    /// carries the address it answers from once one is learned.
+    peer_name: [u8; MAX_PEER_NAME],
+    peer_name_len: u8,
+    /// The authority's host when it is a v4 literal; all-zero for a name.
+    peer_v4: [u8; 4],
+    /// The authority's port, or the protocol default when it names none.
+    peer_port: u16,
+    /// Why `authority` could not be taken, or `AUTHORITY_OK`; anything else
+    /// refuses construction.
+    authority_refused: u8,
     client_started: bool,
     cert: [u8; MAX_CERT_LEN],
     cert_len: usize,
@@ -341,8 +358,9 @@ pub(crate) struct QuicState {
     pending_resumption_test: bool,
     /// Client-side cert chain validation toggle (RFC 5280 + RFC 6125).
     /// 0 = parse the peer cert for its public key only; 1 = also
-    /// validate against the anchor table and require the leaf SAN/CN to
-    /// match `verify_hostname`.
+    /// validate against the anchor table and require the leaf to hold the
+    /// expected identity: `verify_hostname` when set, else the
+    /// `authority`'s name as a dNSName or its address as an iPAddress.
     verify_peer: u8,
     /// Trust anchors, DER, in configured order: the deployment's `trust`
     /// bundle first, then any the operator appended at launch. For a
@@ -361,11 +379,18 @@ pub(crate) struct QuicState {
     /// A configured anchor was refused — it did not parse, was over-long,
     /// or was the ninth — and the instance declines to construct.
     anchor_refused: bool,
-    /// Expected server hostname checked against the leaf's SAN
-    /// dNSName entries (with leftmost-wildcard support per RFC 6125
-    /// §6.4.3) or, as fallback, Subject CN (§6.4.4).
+    /// The override for the peer's expected name: when set it is the SNI
+    /// the ClientHello carries and the dNSName the leaf must hold (with
+    /// leftmost-wildcard support per RFC 6125 §6.4.3, or Subject CN as
+    /// fallback, §6.4.4) regardless of the `authority` — a proxy, or a
+    /// pinned host reached by address. Unset, the `authority` supplies
+    /// the identity.
     verify_hostname: [u8; 64],
     verify_hostname_len: usize,
+    /// A `verify_hostname` longer than the field holds was dropped and the
+    /// instance declines to construct: a truncated name authenticates a
+    /// different host.
+    verify_hostname_refused: bool,
     /// Optional telemetry output (out[2]) to the `observe` collector; -1 when
     /// unwired, so module-scope metrics are zero-cost when disabled.
     /// Cumulative application-stream byte counters + last-emit wallclock
@@ -430,19 +455,13 @@ define_params! {
     2, mode, u8, 1
         => |s, d, len| { s.mode = p_u8(d, len, 0, 1); };
 
-    3, peer_ip, u32, 0x0100007f
-        => |s, d, len| { s.peer_ip = p_u32(d, len, 0, 0x0100007f); };
-
-    4, peer_port, u16, 4443
-        => |s, d, len| { s.peer_port = p_u16(d, len, 0, 4443); };
-
     5, require_retry, u8, 0
         => |s, d, len| { s.require_retry = p_u8(d, len, 0, 0); };
 
     6, enable_0rtt, u8, 0
         => |s, d, len| { s.enable_0rtt = p_u8(d, len, 0, 0); };
 
-    // Tags 7, 8, 10 and 13 are RETIRED and must not be reused: a graph still
+    // Tags 3, 4, 7, 8, 10 and 13 are RETIRED and must not be reused: a graph still
     // naming a retired param gets a clean "unknown param" from the composer,
     // where a reused tag would silently bind it to an unrelated value.
     9, verify_peer, u8, 0
@@ -493,6 +512,87 @@ define_params! {
     // are not reset on key update.
     17, key_update_pkts, u32, 0
         => |s, d, len| { s.key_update_pkts = p_u32(d, len, 0, 0); };
+
+    // Client mode: the peer as `host[:port]` — a DNS name the datagram
+    // provider resolves, or a dotted-quad literal; the port defaults to
+    // 4443. The only address-bearing client parameter: it is where the
+    // datagrams go, the name the ClientHello carries, the identity the
+    // peer's certificate must hold, and the key a session ticket resumes
+    // under. Unset means `127.0.0.1:4443`.
+    20, authority, str, 0
+        => |s, d, len| { parse_authority(s, d, len); };
+}
+
+/// Longest `authority` accepted: a host of up to [`MAX_PEER_NAME`] bytes
+/// plus `:65535`.
+const MAX_AUTHORITY: usize = MAX_PEER_NAME + 6;
+/// Longest DNS name a peer may be dialled by. The datagram surface carries
+/// up to 253 bytes; the module keeps one name per instance and sizes it
+/// for the state budget rather than the wire.
+const MAX_PEER_NAME: usize = 64;
+/// The port `authority` takes when it names none.
+const DEFAULT_PEER_PORT: u16 = 4443;
+
+const AUTHORITY_OK: u8 = 0;
+const AUTHORITY_UNPARSABLE: u8 = 1;
+const AUTHORITY_V6: u8 = 2;
+const AUTHORITY_NAME_TOO_LONG: u8 = 3;
+
+/// Take the `authority` parameter: parse `host[:port]`, and keep the
+/// target by kind. An empty value is the default `127.0.0.1:4443`. A
+/// value that does not parse, names a v6 literal, or carries a name longer
+/// than the instance holds is recorded for `module_new` to refuse.
+///
+/// # Safety
+/// `d` is valid for `len` reads.
+unsafe fn parse_authority(s: &mut QuicState, d: *const u8, len: usize) {
+    s.authority_len = 0;
+    s.peer_name_len = 0;
+    s.peer_v4 = [0; 4];
+    s.peer_port = DEFAULT_PEER_PORT;
+    s.authority_refused = AUTHORITY_OK;
+    if len == 0 || d.is_null() {
+        let dflt = b"127.0.0.1:4443";
+        s.authority[..dflt.len()].copy_from_slice(dflt);
+        s.authority_len = dflt.len() as u8;
+        s.peer_v4 = [127, 0, 0, 1];
+        return;
+    }
+    if len > MAX_AUTHORITY {
+        s.authority_refused = AUTHORITY_NAME_TOO_LONG;
+        return;
+    }
+    let text = core::slice::from_raw_parts(d, len);
+    let (target, port) = match Target::parse(text) {
+        Some(t) => t,
+        None => {
+            s.authority_refused = AUTHORITY_UNPARSABLE;
+            return;
+        }
+    };
+    match target {
+        Target::V4(a) => s.peer_v4 = a,
+        Target::V6(_) => {
+            s.authority_refused = AUTHORITY_V6;
+            return;
+        }
+        Target::Name(name) => {
+            if name.len() > MAX_PEER_NAME {
+                s.authority_refused = AUTHORITY_NAME_TOO_LONG;
+                return;
+            }
+            s.peer_name[..name.len()].copy_from_slice(name);
+            s.peer_name_len = name.len() as u8;
+        }
+    }
+    s.peer_port = port.unwrap_or(DEFAULT_PEER_PORT);
+    s.authority[..len].copy_from_slice(text);
+    s.authority_len = len as u8;
+}
+
+/// The `authority` as configured, the ticket cache's key.
+fn authority_of(s: &QuicState) -> &[u8] {
+    &s.authority[..s.authority_len as usize]
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -526,8 +626,6 @@ pub unsafe extern "C" fn module_new(
     s.endpoint = DatagramEndpoint::new();
     s.port = 4443;
     s.mode = 1;
-    s.peer_ip = 0x0100007f;
-    s.peer_port = 4443;
     s.client_started = false;
     s.require_retry = 0;
     s.enable_0rtt = 0;
@@ -540,6 +638,7 @@ pub unsafe extern "C" fn module_new(
     s.anchor_operator = 0;
     s.anchor_refused = false;
     s.verify_hostname_len = 0;
+    s.verify_hostname_refused = false;
     s.ticket_key = [-1, -1];
     s.ticket_parity = 0;
     s.ticket_vault_warned = false;
@@ -553,8 +652,8 @@ pub unsafe extern "C" fn module_new(
     while t < MAX_TICKETS {
         s.client_tickets[t] = ClientTicketEntry {
             used: false,
-            peer_ip: [0; 4],
-            peer_port: 0,
+            peer: [0; MAX_AUTHORITY],
+            peer_len: 0,
             ticket: [0; MAX_TICKET_LEN],
             ticket_len: 0,
             rms: [0; 48],
@@ -604,6 +703,26 @@ pub unsafe extern "C" fn module_new(
     // given a trust set, and it either holds all of it or does not run.
     if s.anchor_refused {
         let msg = b"[quic] refusing to construct: a trust anchor does not parse, exceeds MAX_CERT_LEN, or the bundle exceeds MAX_ANCHORS";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
+    if s.verify_hostname_refused {
+        let msg = b"[quic] refusing to construct: `verify_hostname` exceeds 64 bytes; a truncated name authenticates a different host";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
+    // An authority the module cannot dial refuses the instance: the
+    // graph named a peer, and it either reaches that peer or does not run.
+    if s.authority_refused != AUTHORITY_OK {
+        let msg: &[u8] = match s.authority_refused {
+            AUTHORITY_V6 => {
+                b"[quic] refusing to construct: `authority` is a v6 literal; this module's datagram surface is v4-only, name the peer or give its v4 address"
+            }
+            AUTHORITY_NAME_TOO_LONG => {
+                b"[quic] refusing to construct: `authority` host exceeds 64 bytes"
+            }
+            _ => b"[quic] refusing to construct: `authority` is not host[:port] (a DNS name or dotted quad, optional :port)",
+        };
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
@@ -882,17 +1001,19 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
                     push_anchor_bundle(s, bundle, tag == 16);
                 }
                 13 => {
-                    let n = if len < s.verify_hostname.len() {
-                        len
-                    } else {
-                        s.verify_hostname.len()
-                    };
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(start),
-                        s.verify_hostname.as_mut_ptr(),
-                        n,
-                    );
-                    s.verify_hostname_len = n;
+                    // The expected-identity override. Truncating a name
+                    // would authenticate a different one, so an over-long
+                    // value is dropped and the instance refused.
+                    if len > 0 && len <= s.verify_hostname.len() {
+                        core::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(start),
+                            s.verify_hostname.as_mut_ptr(),
+                            len,
+                        );
+                        s.verify_hostname_len = len;
+                    } else if len > 0 {
+                        s.verify_hostname_refused = true;
+                    }
                 }
                 14 => {
                     // ALPN config list (RFC 7301): comma-separated raw
@@ -1114,8 +1235,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // queueing a ClientHello in driver.out_buf, and emitting the
     // first Initial packet.
     if s.mode == 0 && !s.client_started && s.endpoint.is_ready() {
-        let ip_bytes = s.peer_ip.to_le_bytes();
-        let ip = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
+        let ip = s.peer_v4;
         if let Some(idx) = alloc_client_connection(s, &ip, s.peer_port) {
             // Drive far enough to get the ClientHello queued.
             let mut steps = 0;
@@ -1463,9 +1583,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             k += 1;
         }
         if have_ticket && active_count == 1 && !s.pending_resumption_test {
-            let ip_bytes = s.peer_ip.to_le_bytes();
-            let ip = [ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
-            if let Some(idx) = alloc_resumption_connection(s, &ip, s.peer_port) {
+            if let Some(idx) = alloc_resumption_connection(s) {
                 s.pending_resumption_test = true;
                 let mut steps = 0;
                 let t_start = dev_micros(&*s.syscalls);
@@ -1499,9 +1617,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let mut already = false;
             let mut t = 0;
             while t < MAX_TICKETS {
-                if s.client_tickets[t].used
-                    && s.client_tickets[t].peer_ip == s.conns[i].peer.ip
-                    && s.client_tickets[t].peer_port == s.conns[i].peer.port
+                if s.client_tickets[t].used && ticket_is_for(&s.client_tickets[t], authority_of(s))
                 {
                     already = true;
                     break;
@@ -1514,8 +1630,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if !s.client_tickets[t].used {
                         let mut entry = ClientTicketEntry {
                             used: true,
-                            peer_ip: s.conns[i].peer.ip,
-                            peer_port: s.conns[i].peer.port,
+                            peer: s.authority,
+                            peer_len: s.authority_len,
                             ticket: [0; MAX_TICKET_LEN],
                             ticket_len: psk_id_len as u8,
                             rms: [0; 48],
@@ -2886,12 +3002,6 @@ unsafe fn emit_conn_span(s: &mut QuicState, idx: usize) {
     );
 }
 
-/// Emit one datagram (`CMD_DG_SEND_TO`) toward `peer` via the shared
-/// `datagram_endpoint` core. Returns `true` iff the whole frame was accepted
-/// (all-or-nothing write). Callers holding reliable control state
-/// (PATH_CHALLENGE / PATH_RESPONSE / NEW_CONNECTION_ID) MUST keep that state
-/// pending until this returns `true`, so a backpressured write is retried, not
-/// lost. No-ops (returns `false`) until the endpoint is bound.
 /// Server at capacity: answer a client Initial with a stateless
 /// CONNECTION_REFUSED close, sealed under the Initial keys every client can
 /// derive from its own DCID (RFC 9001 §5.2), holding no state. The refusal
@@ -2942,6 +3052,7 @@ unsafe fn emit_stateless_refusal(s: &mut QuicState, ip: &[u8; 4], port: u16, dgr
         sys,
         s.net_out,
         &s.endpoint,
+        &[],
         &peer,
         &pkt[..m],
         &mut s.net_scratch,
@@ -2954,15 +3065,41 @@ unsafe fn emit_stateless_refusal(s: &mut QuicState, ip: &[u8; 4], port: u16, dgr
     }
 }
 
+/// Emit one datagram (`CMD_DG_SEND_TO`) to `peer` via the shared
+/// `datagram_endpoint` core. A peer dialled by name has no address until
+/// it answers: until then the datagram goes out under the name and the
+/// provider resolves it (dropping the datagram while it does, which the
+/// Initial's retransmit covers); once the connection has learned the
+/// address its packets arrive from, that address is used. A server always
+/// answers an address it has, and passes no name.
+///
+/// Returns `true` iff the whole frame was accepted (all-or-nothing write),
+/// and `false` until the endpoint is bound. Callers holding reliable
+/// control state (PATH_CHALLENGE / PATH_RESPONSE / NEW_CONNECTION_ID) MUST
+/// keep that state pending until this returns `true`, so a backpressured
+/// write is retried, not lost.
 #[must_use]
 unsafe fn send_datagram(
     sys: &SyscallTable,
     net_out: i32,
     ep: &DatagramEndpoint,
+    peer_name: &[u8],
     peer: &PeerAddr,
     bytes: &[u8],
     scratch: &mut [u8; NET_BUF_SIZE],
 ) -> bool {
+    if !peer.has_address() && !peer_name.is_empty() {
+        return ep.send_to_name(
+            sys,
+            net_out,
+            peer_name,
+            peer.port,
+            bytes.as_ptr(),
+            bytes.len(),
+            scratch.as_mut_ptr(),
+            NET_BUF_SIZE,
+        ) != 0;
+    }
     // `peer.ip` is wire-order octets; `send_to` re-serialises via `to_be_bytes`.
     let dst_ip = u32::from_be_bytes(peer.ip);
     ep.send_to(
@@ -3137,20 +3274,24 @@ unsafe fn alloc_server_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) ->
     None
 }
 
+/// Whether a cached ticket was issued by `authority`.
+fn ticket_is_for(entry: &ClientTicketEntry, authority: &[u8]) -> bool {
+    &entry.peer[..entry.peer_len as usize] == authority
+}
+
 /// Allocate a fresh client connection seeded for a PSK resumption.
-/// Looks up the cached ticket for `(ip, port)`, copies the PSK +
-/// identity into the new conn, and stages a 0-RTT payload for
+/// Looks up the cached ticket for the configured authority, copies the
+/// PSK + identity into the new conn, and stages a 0-RTT payload for
 /// emission as soon as the early-traffic keys are installed.
-unsafe fn alloc_resumption_connection(s: &mut QuicState, ip: &[u8; 4], port: u16) -> Option<usize> {
+unsafe fn alloc_resumption_connection(s: &mut QuicState) -> Option<usize> {
     let framed = s.alpn_cfg_len > 0;
+    let ip = s.peer_v4;
+    let port = s.peer_port;
     // Find the matching client_ticket entry.
     let mut tix = MAX_TICKETS;
     let mut t = 0;
     while t < MAX_TICKETS {
-        if s.client_tickets[t].used
-            && s.client_tickets[t].peer_ip == *ip
-            && s.client_tickets[t].peer_port == port
-        {
+        if s.client_tickets[t].used && ticket_is_for(&s.client_tickets[t], authority_of(s)) {
             tix = t;
             break;
         }
@@ -3166,7 +3307,7 @@ unsafe fn alloc_resumption_connection(s: &mut QuicState, ip: &[u8; 4], port: u16
         if s.conns[i].phase == ConnPhase::Idle {
             let conn = &mut s.conns[i];
             conn.reset();
-            conn.peer.ip = *ip;
+            conn.peer.ip = ip;
             conn.peer.port = port;
             conn.phase = ConnPhase::Handshaking;
             conn.is_server = false;
@@ -3459,6 +3600,57 @@ pub mod test_helpers {
             return 0;
         }
         s.conns[idx].peer.port
+    }
+
+    /// The current peer address for connection `idx`; all-zero while a
+    /// peer dialled by name has not yet answered.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn peer_ip_of(state: *const u8, idx: usize) -> [u8; 4] {
+        let s = &*(state as *const QuicState);
+        if idx >= MAX_CONNS {
+            return [0; 4];
+        }
+        s.conns[idx].peer.ip
+    }
+
+    /// Mark the datagram endpoint bound (endpoint id 0) without a
+    /// provider, so a client instance dials on its next step.
+    ///
+    /// # Safety
+    /// `state` points to an initialised `QuicState`.
+    pub unsafe fn bind_static(state: *mut u8) {
+        let s = &mut *(state as *mut QuicState);
+        s.endpoint.bind_static(0);
+    }
+
+    /// Open a client Initial packet as the server would: derive the
+    /// Initial keys from its DCID (RFC 9001 §5.2), remove header
+    /// protection, decrypt, and copy the frame payload into `out`.
+    /// Returns the payload length, or 0 when the packet does not open.
+    ///
+    /// # Safety
+    /// `out` must hold at least `pkt.len()` bytes.
+    pub unsafe fn open_client_initial(pkt: &[u8], out: &mut [u8]) -> usize {
+        if pkt.len() < 7 || pkt.len() > super::QUIC_DGRAM_MAX {
+            return 0;
+        }
+        let dcid_len = pkt[5] as usize;
+        if dcid_len > super::MAX_CID_LEN || 6 + dcid_len > pkt.len() {
+            return 0;
+        }
+        let (client_keys, _server_keys) = super::derive_initial_keys(&pkt[6..6 + dcid_len]);
+        let hp = Aes128Hp::new(&client_keys.hp);
+        let mut copy = [0u8; super::QUIC_DGRAM_MAX];
+        copy[..pkt.len()].copy_from_slice(pkt);
+        let parsed = match super::parse_long_packet(&client_keys, &hp, 0, &mut copy[..pkt.len()]) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let n = parsed.payload_len.min(out.len());
+        out[..n].copy_from_slice(&copy[parsed.payload_off..parsed.payload_off + n]);
+        n
     }
 
     /// Whether connection `idx` is currently validating a migrated path

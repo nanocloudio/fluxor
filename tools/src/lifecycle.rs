@@ -325,9 +325,9 @@ pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
 /// need a build.
 ///
 /// `cargo fmt --all -- --check` and `cargo clippy … -D warnings` where a
-/// cargo tree exists, then `fluxor lint hygiene`, always. Module
-/// fmt/clippy stay `fluxor ci` phases: they compile PIC sources per
-/// target and belong to the gate, not the edit loop.
+/// cargo tree exists, then `fluxor lint hygiene`, always. The module
+/// fmt and clippy phases stay in `fluxor ci`: they walk every PIC source
+/// per target and belong to the gate, not the edit loop.
 pub fn lint(project_root: &Path) -> Result<()> {
     let s = shape(project_root);
 

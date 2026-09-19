@@ -377,6 +377,49 @@ impl DatagramEndpoint {
             0
         }
     }
+
+    /// Send one datagram to a NAMED destination. The provider resolves the
+    /// name; while it does, the datagram is dropped, so a caller retransmits
+    /// as it would on loss. Same return contract as [`send_to`](Self::send_to).
+    ///
+    /// # Safety
+    /// `data` valid for `len` reads; `scratch` valid for `scratch_max` writes.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "an addressed datagram send is destination plus payload plus scratch"
+    )]
+    pub unsafe fn send_to_name(
+        &self,
+        sys: &SyscallTable,
+        net_out: i32,
+        name: &[u8],
+        dst_port: u16,
+        data: *const u8,
+        len: usize,
+        scratch: *mut u8,
+        scratch_max: usize,
+    ) -> usize {
+        if self.phase != BindPhase::Bound || net_out < 0 || self.ep_id == 0xFF {
+            return 0;
+        }
+        let n = dev_dg_send_to_name_owned(
+            sys,
+            net_out,
+            self.ep_id,
+            self.owner_tag,
+            name,
+            dst_port,
+            data,
+            len,
+            scratch,
+            scratch_max,
+        );
+        if n > 0 {
+            len
+        } else {
+            0
+        }
+    }
 }
 
 /// Read and classify one inbound frame off the datagram surface `net_in`.

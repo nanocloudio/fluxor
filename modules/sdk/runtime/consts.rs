@@ -27,8 +27,8 @@ pub const E_CONNREFUSED: i32 = -111;
 // Socket Types (net_proto / Stream Surface v1)
 // ============================================================================
 
-/// Stream-oriented socket (TCP). Only valid SOCK_TYPE for NET_CMD_CONNECT
-/// now that datagram traffic has moved to the datagram surface.
+/// Stream-oriented socket (TCP). The only valid SOCK_TYPE for
+/// NET_CMD_CONNECT_TO; datagram traffic uses the datagram surface.
 pub const SOCK_TYPE_STREAM: u8 = 1;
 
 /// Flag ORed onto opcode to dispatch to the next provider below the caller.
@@ -71,8 +71,8 @@ pub const IOCTL_EOF: u32 = 4;
 ///
 /// These are constants rather than prose because the layout *is* the wire
 /// surface. A doc comment describing it is invisible to the ABI source pin,
-/// so widening a field here would not move the digest and every consumer
-/// built against the old layout would keep loading — reading a truncated LBA
+/// so widening a field here would not move the digest and a consumer
+/// built against a narrower layout would keep loading — reading a truncated LBA
 /// and a buffer pointer from the wrong offset. Naming the offsets puts the
 /// layout in the token stream the pin hashes.
 pub mod blk_arg {

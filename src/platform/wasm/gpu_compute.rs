@@ -85,7 +85,24 @@ extern "C" {
         entry_ptr: *const u8,
         entry_len: u32,
     ) -> i32;
+    fn host_gpu_service_create_texture(
+        slot: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        usage: u32,
+    ) -> i32;
     fn host_gpu_service_pipeline(slot: u32, program_slot: u32) -> i32;
+    /// A raster pipeline, built from the contract's own state descriptor.
+    /// The blob is passed through unparsed: the wire decoded and validated it
+    /// before it reached here, and a second decoder in JavaScript would be a
+    /// second thing to get wrong.
+    fn host_gpu_service_raster_pipeline(
+        slot: u32,
+        program_slot: u32,
+        state_ptr: *const u8,
+        state_len: u32,
+    ) -> i32;
     fn host_gpu_service_poll_pipeline(slot: u32) -> i32;
     fn host_gpu_service_release_pipeline(slot: u32) -> i32;
     fn host_gpu_service_release_program(slot: u32) -> i32;
@@ -392,10 +409,22 @@ fn limits_from(facts: &[u8; exec::FACT_LEN]) -> gw::DeviceLimits {
     l.arith_types = arith;
     l.arith_ops = gw::AOP_FMA_F32 | gw::AOP_ATOMIC_I32;
 
-    let features = gw::FEATURE_COMPUTE | gw::FEATURE_READBACK;
-    // Raster, shared surfaces, indirect dispatch, subgroups, preemption,
-    // timestamps and device reset are not implemented in this provider, so
-    // none is claimed. The host may report a timestamp capability, but this
+    // Raster is advertised because it is executed: textures, pipelines built
+    // from the contract's own state descriptor, passes with a colour and an
+    // optional depth attachment, and indexed and non-indexed draws.
+    //
+    // `COMPUTE_TO_RASTER` goes with it for the same reason it does natively:
+    // one page device owns every resource, so a buffer created with both
+    // `USAGE_STORAGE` and `USAGE_VERTEX` is one WebGPU buffer with both
+    // usages, and a dispatch writes the geometry a later draw reads with no
+    // CPU detour.
+    let features = gw::FEATURE_COMPUTE
+        | gw::FEATURE_RASTER
+        | gw::FEATURE_COMPUTE_TO_RASTER
+        | gw::FEATURE_READBACK;
+    // Shared surfaces, indirect dispatch, subgroups, preemption, timestamps
+    // and device reset are not implemented in this provider, so none is
+    // claimed. The host may report a timestamp capability, but this
     // provider places no query and every completion reports `gpu_nanos` of
     // zero — advertising what the host could manage rather than what this
     // provider does would make the record worthless to the consumer.
@@ -642,9 +671,22 @@ unsafe fn translate(
         gw::Work::None => true,
 
         gw::Work::CreateBuffer { fence, slot } | gw::Work::CreateTexture { fence, slot } => {
-            let (size, usage) = dev.resource(slot).map_or((0, 0), |r| (r.size, r.usage));
+            // The kind comes from the slot the core filled, not from which arm
+            // matched: a texture has to become a texture, because a buffer can
+            // be neither a render attachment nor sampled.
+            let Some(r) = dev.resource(slot) else {
+                dev.fail(fence, gw::REASON_BAD_HANDLE, slot as u32);
+                return true;
+            };
+            let (size, usage, kind) = (r.size, r.usage, r.kind);
+            let (width, height, format) = (r.width, r.height, r.format);
             dev.mark_running(fence);
-            if host_gpu_service_create_buffer(slot as u32, size as u32, usage) < 0 {
+            let rc = if kind == gw::KIND_TEXTURE {
+                host_gpu_service_create_texture(slot as u32, width, height, format, usage)
+            } else {
+                host_gpu_service_create_buffer(slot as u32, size as u32, usage)
+            };
+            if rc < 0 {
                 dev.fail(fence, gw::REASON_RESOURCE_EXHAUSTED, size as u32);
             } else {
                 dev.complete(fence, 0);
@@ -708,7 +750,24 @@ unsafe fn translate(
             program,
         } => {
             dev.mark_running(fence);
-            if host_gpu_service_pipeline(slot as u32, program as u32) < 0 {
+            // The pipeline kind and its state blob are read back out of the
+            // record. The core validated both and does not carry the state
+            // forward, because only a backend has any use for it.
+            let payload = &record[gw::HEADER_LEN..];
+            let kind = gw::get_u8(payload, 8).unwrap_or(gw::QUEUE_COMPUTE);
+            let rc = if kind == gw::QUEUE_RASTER {
+                let len = gw::get_u32(payload, 12).unwrap_or(0) as usize;
+                let state = payload.get(16..16 + len).unwrap_or(&[]);
+                host_gpu_service_raster_pipeline(
+                    slot as u32,
+                    program as u32,
+                    state.as_ptr(),
+                    state.len() as u32,
+                )
+            } else {
+                host_gpu_service_pipeline(slot as u32, program as u32)
+            };
+            if rc < 0 {
                 dev.mark_pipeline_ready(slot, false);
                 dev.fail(fence, gw::REASON_BAD_HANDLE, program as u32);
             } else {
@@ -861,9 +920,69 @@ fn encode_exec(
                 at +=
                     exec::exec_put_copy(&mut out[at..], src_slot, dst_slot, src_off, dst_off, len)?;
             }
-            // Raster items cannot be admitted: this provider does not
-            // advertise `FEATURE_RASTER`, so the queue check refuses them.
-            _ => return None,
+            gw::SubmitItem::BeginPass {
+                target,
+                flags,
+                clear,
+            } => {
+                // The pass target is a resource handle, not a view: a render
+                // attachment is the whole texture.
+                let slot = dev.slot_of(target, gw::KIND_TEXTURE, OWNER)?;
+                at += exec::exec_put_begin_pass(&mut out[at..], slot, flags, clear)?;
+            }
+            gw::SubmitItem::Draw {
+                pipeline,
+                binds_offset,
+                bind_count,
+                vertex,
+                index,
+                first,
+                count,
+                instances,
+            } => {
+                let pslot = dev.slot_of(pipeline, gw::KIND_PIPELINE, OWNER)?;
+                let mut off = at + exec::exec_put_draw(&mut out[at..], pslot, bind_count)?;
+                for i in 0..bind_count {
+                    let e = binds_offset + i * gw::BIND_ENTRY_LEN;
+                    let slot = gw::get_u16(bytes, e)?;
+                    let view = gw::get_u64(bytes, e + 4)?;
+                    let vslot = dev.slot_of(view, gw::KIND_VIEW, OWNER)?;
+                    let (res, offset, len) = dev.view_range(vslot)?;
+                    exec::exec_put_bind(out, off, u32::from(slot), res, offset, len);
+                    off += exec::EXEC_BIND_LEN;
+                }
+                let geometry = |h: u64| -> Option<(u16, u64, u64)> {
+                    let v = dev.slot_of(h, gw::KIND_VIEW, OWNER)?;
+                    dev.view_range(v)
+                };
+                let (vs, vo, vl) = geometry(vertex)?;
+                // A draw with no index buffer names the null handle, which is
+                // not a handle that failed to resolve.
+                let (is, io, il) = if index == gw::HANDLE_NONE {
+                    (exec::EXEC_NO_SLOT, 0, 0)
+                } else {
+                    geometry(index)?
+                };
+                exec::exec_put_geometry(
+                    out,
+                    off,
+                    &exec::ExecGeometry {
+                        vertex: vs,
+                        vertex_offset: vo,
+                        vertex_len: vl,
+                        index: is,
+                        index_offset: io,
+                        index_len: il,
+                        first,
+                        count,
+                        instances,
+                    },
+                );
+                at = off + exec::EXEC_DRAW_TAIL;
+            }
+            gw::SubmitItem::EndPass => {
+                at += exec::exec_put_end_pass(&mut out[at..])?;
+            }
         }
     }
     Some(at)

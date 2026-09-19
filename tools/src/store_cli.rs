@@ -17,8 +17,7 @@ use crate::error::{Error, Result};
 use crate::resolve_project_root;
 use fluxor_tools::oci_store::{
     self, git_source_rev, publish_bundle, sha256_hex_prefixed, BundlePublish, ImageManifest,
-    OciStore, ANN_KIND, ANN_PROVENANCE, ANN_REF_NAME, ANN_SOURCE_REV, ANN_TARGET, PROVENANCE_LOCAL,
-    PROVENANCE_PUBLISHED,
+    OciStore, ANN_KIND, ANN_REF_NAME, ANN_TARGET, PROVENANCE_LOCAL, PROVENANCE_PUBLISHED,
 };
 use fluxor_tools::store_remote;
 use fluxor_tools::store_resolve;
@@ -97,6 +96,65 @@ pub enum StoreCommand {
         /// webpki roots (e.g. the nanocloud deployment CA).
         #[arg(long)]
         ca: Option<PathBuf>,
+    },
+    /// Register a checkout's `fluxor.lock` pins with the store, so its
+    /// digests are garbage-collection roots.
+    ///
+    /// Every checkout registers itself the first time it resolves
+    /// anything; this is the bootstrap for one that has not, and the
+    /// answer to "my repo is not in workspace.toml". Membership is about
+    /// epoch and currency checking and has nothing to do with whether
+    /// somebody is holding a digest — treating it as the root set is
+    /// what destroyed artifacts belonging to checkouts nobody had
+    /// remembered to add.
+    Adopt {
+        /// Checkouts to register (default: the current project root).
+        checkouts: Vec<PathBuf>,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// Check every pin every checkout holds, and the store's own
+    /// integrity. Read-only, safe to run while others publish.
+    Fsck {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Restore quarantined blobs to `blobs/`. Never deletes.
+        #[arg(long)]
+        repair: bool,
+    },
+    /// Collect unreachable blobs: quarantine what no root reaches, then
+    /// delete what has sat in quarantine long enough.
+    ///
+    /// The ONLY verb that deletes bytes. The sweep a publish triggers
+    /// only ever looks at the manifest it just displaced, so a blob
+    /// spared once is never reconsidered; this is the whole-store pass
+    /// that actually reclaims anything.
+    Gc {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Days a quarantined blob must sit untouched before deletion.
+        #[arg(long, default_value_t = 30)]
+        retain_days: u64,
+        /// Also drop ledger entries whose checkout is no longer on disk.
+        /// Off by default: an unmounted repo looks exactly like a
+        /// deleted one.
+        #[arg(long)]
+        forget_missing: bool,
+        /// Report what would be collected and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move provenance out of every manifest, once.
+    ///
+    /// Manifests published before provenance moved to the store's side
+    /// table carry `io.fluxor.source-rev`, which changes on every
+    /// commit — so re-publishing unchanged content rewrites the manifest
+    /// and moves the digest every downstream lockfile pins. This is the
+    /// one-time migration that stops it. Every digest it moves is
+    /// recorded as an alias, so locks written beforehand keep resolving.
+    Restamp {
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
     /// Pin an artifact into `fluxor.lock` (`[[artifact]]`) so
     /// combine/packaging resolve its `.fmod` by digest from the store
@@ -279,7 +337,106 @@ pub fn dispatch_store(args: StoreArgs) -> Result<()> {
             store,
             project_root,
         } => cmd_store_pin(&reference, store.as_deref(), project_root.as_deref()),
+        StoreCommand::Adopt { checkouts, store } => cmd_store_adopt(&checkouts, store.as_deref()),
+        StoreCommand::Fsck { store, repair } => cmd_store_fsck(store.as_deref(), repair),
+        StoreCommand::Gc {
+            store,
+            retain_days,
+            forget_missing,
+            dry_run,
+        } => cmd_store_gc(store.as_deref(), retain_days, forget_missing, dry_run),
+        StoreCommand::Restamp { store } => cmd_store_restamp(store.as_deref()),
     }
+}
+
+fn cmd_store_adopt(checkouts: &[PathBuf], store_dir: Option<&Path>) -> Result<()> {
+    let store = open_store(store_dir)?;
+    let targets: Vec<PathBuf> = if checkouts.is_empty() {
+        vec![resolve_project_root(None)]
+    } else {
+        checkouts.to_vec()
+    };
+    for checkout in targets {
+        let n = fluxor_tools::store_pins::adopt(store.root(), &checkout)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        println!("adopted {} ({n} pin(s) now GC roots)", checkout.display());
+    }
+    Ok(())
+}
+
+fn cmd_store_fsck(store_dir: Option<&Path>, repair: bool) -> Result<()> {
+    let store = open_store(store_dir)?;
+    let report = fluxor_tools::store_maint::fsck(&store, repair)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    print!("{}", fluxor_tools::store_maint::render(&report));
+    let dead: usize = report
+        .checkouts
+        .iter()
+        .map(|c| c.notable.iter().filter(|(_, h)| h.is_fault()).count())
+        .sum();
+    if dead > 0 || !report.index_faults.is_empty() {
+        return Err(Error::Config(format!(
+            "fsck found {dead} unresolvable pin(s) and {} index fault(s)",
+            report.index_faults.len()
+        )));
+    }
+    println!(
+        "
+fsck: every pin resolves."
+    );
+    Ok(())
+}
+
+fn cmd_store_gc(
+    store_dir: Option<&Path>,
+    retain_days: u64,
+    forget_missing: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let store = open_store(store_dir)?;
+    if dry_run {
+        let report = fluxor_tools::store_maint::fsck(&store, false)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        println!(
+            "gc --dry-run: {} of {} blobs are unreachable from any root ({:.1} GiB);              {} already quarantined",
+            report.blobs_total - report.blobs_live,
+            report.blobs_total,
+            report.reclaimable as f64 / (1u64 << 30) as f64,
+            report.quarantined
+        );
+        return Ok(());
+    }
+    let report = store
+        .gc(retain_days, forget_missing)
+        .map_err(|e| Error::Config(e.to_string()))?;
+    println!(
+        "gc: {} blob(s) quarantined, {} deleted after {retain_days}d ({:.1} GiB freed),          {} still held",
+        report.quarantined.len(),
+        report.deleted.len(),
+        report.bytes_freed as f64 / (1u64 << 30) as f64,
+        report.held
+    );
+    for checkout in &report.forgotten {
+        println!("  forgot ledger entry for {}", checkout.display());
+    }
+    Ok(())
+}
+
+fn cmd_store_restamp(store_dir: Option<&Path>) -> Result<()> {
+    let store = open_store(store_dir)?;
+    let report = store.restamp().map_err(|e| Error::Config(e.to_string()))?;
+    println!(
+        "restamp: {} manifest(s) rewritten, {} already clean, {} provenance row(s) filed",
+        report.moved.len(),
+        report.already_clean,
+        report.rows_filed
+    );
+    if !report.moved.is_empty() {
+        println!(
+            "  Each rewritten digest is recorded as an alias, so lockfiles written \n             \x20 beforehand keep resolving. Run `fluxor update` in each consumer at \n             \x20 leisure; after this, a publish that changes nothing moves no pin."
+        );
+    }
+    Ok(())
 }
 
 fn cmd_store_push(
@@ -333,13 +490,14 @@ fn cmd_store_ls(store_dir: Option<&Path>, provenance: Option<&str>, json: bool) 
     let ann = |d: &oci_store::Descriptor, key: &str| -> String {
         d.annotations.get(key).cloned().unwrap_or_default()
     };
+    // Provenance lives beside the manifest, not inside it — so that
+    // re-stamping it cannot move the digest everything downstream pins.
+    // Reading it is one file open per artifact, against a local store.
+    let latest = |d: &oci_store::Descriptor| store.latest_provenance(&d.digest);
     let mut entries: Vec<&oci_store::Descriptor> = index
         .manifests
         .iter()
-        .filter(|d| {
-            provenance
-                .is_none_or(|p| d.annotations.get(ANN_PROVENANCE).map(String::as_str) == Some(p))
-        })
+        .filter(|d| provenance.is_none_or(|p| latest(d).is_some_and(|row| row.provenance == p)))
         .collect();
     entries.sort_by_key(|d| ann(d, ANN_REF_NAME));
 
@@ -359,13 +517,19 @@ fn cmd_store_ls(store_dir: Option<&Path>, provenance: Option<&str>, json: bool) 
             .chars()
             .take(12)
             .collect();
-        let rev: String = ann(d, ANN_SOURCE_REV).chars().take(12).collect();
+        let row = latest(d).unwrap_or_default();
+        let rev: String = row
+            .source_rev
+            .unwrap_or_default()
+            .chars()
+            .take(12)
+            .collect();
         println!(
             "{:<40} {:<7} {:<10} {:<12} {:<14} {digest12}",
             ann(d, ANN_REF_NAME),
             ann(d, ANN_KIND),
             ann(d, ANN_TARGET),
-            ann(d, ANN_PROVENANCE),
+            row.provenance,
             rev,
         );
     }
@@ -413,6 +577,11 @@ fn read_module_pins(project_root: &Path) -> Result<Option<Vec<ModulePin>>> {
     else {
         return Ok(None);
     };
+    // Reading a lockfile to build with it IS holding its pins, so this
+    // is where a consumer that has not run `fluxor update` since the
+    // ledger existed registers itself. Idempotent and cheap: an
+    // unchanged pin set rewrites nothing.
+    store_resolve::register_pins(project_root, &lock.artifacts);
     let pins: Vec<ModulePin> = lock
         .artifacts
         .into_iter()
@@ -518,7 +687,11 @@ pub fn lock_store_resolver(
         let Some(pin) = pins.iter().find(|p| p.name == name) else {
             return StorePin::NotPinned;
         };
-        let manifest_bytes = match store.read_blob(&pin.digest) {
+        // A pin written before provenance moved out of the manifest
+        // names a digest the store may no longer hold; the alias leads
+        // to the manifest that replaced it, byte-identical in layers.
+        let digest = store.resolve_pin(&pin.digest);
+        let manifest_bytes = match store.read_blob(&digest) {
             Ok(b) => b,
             Err(e) => return StorePin::Failed(e.to_string()),
         };
@@ -643,7 +816,7 @@ pub fn lock_store_manifest_resolver(
             }
         };
         let pin_id = format!("pin {} ({})", pin.reference, pin.digest);
-        let manifest_bytes = match store.read_blob(&pin.digest) {
+        let manifest_bytes = match store.read_blob(&store.resolve_pin(&pin.digest)) {
             Ok(b) => b,
             Err(e) => return ManifestPin::Failed(format!("{pin_id}: {e}")),
         };
@@ -699,8 +872,27 @@ mod tests {
     use super::*;
     use fluxor_tools::oci_store::{publish_module, ModulePublish, PROVENANCE_LOCAL};
 
+    /// Keep every unit test in this binary out of the developer's real
+    /// store.
+    ///
+    /// `pin_artifact` registers the checkout it just pinned into the
+    /// store's pin ledger, and it resolves the store from
+    /// `$FLUXOR_STORE` — not from the `--store` flag these tests pass.
+    /// Unset, that is `~/.local/share/fluxor/store`, so a test pinning
+    /// in a tempdir leaves a permanent ledger entry naming a directory
+    /// that no longer exists, which `fluxor store fsck` then correctly
+    /// reports as a dead pin. One throwaway store for the whole test
+    /// binary, pointed at before the first pin.
+    fn isolate_store() {
+        use std::sync::OnceLock;
+        static SCRATCH: OnceLock<tempfile::TempDir> = OnceLock::new();
+        let dir = SCRATCH.get_or_init(|| tempfile::tempdir().expect("scratch store"));
+        std::env::set_var("FLUXOR_STORE", dir.path().join("ledger-only"));
+    }
+
     /// Upsert one `[[artifact]]` module pin the way `store pin` does.
     fn pin_module(proj: &Path, name: &str, target: &str, digest: &str, reference: &str) {
+        isolate_store();
         store_resolve::pin_artifact(
             proj,
             &store_resolve::Artifact {
@@ -710,6 +902,7 @@ mod tests {
                 target: Some(target.into()),
                 digest: digest.into(),
                 reference: reference.into(),
+                content: None,
             },
         )
         .expect("pin");

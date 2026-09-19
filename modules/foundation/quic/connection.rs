@@ -668,6 +668,11 @@ impl PeerAddr {
     pub fn is_unset(&self) -> bool {
         self.port == 0
     }
+    /// Whether the peer's address is known. A peer dialled by name has
+    /// none until it answers.
+    pub fn has_address(&self) -> bool {
+        self.ip != [0; 4]
+    }
 }
 
 /// RTT estimator state per connection (RFC 9002 §5).

@@ -1129,6 +1129,11 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
     let psk_id_len = s.conns[idx].psk_identity_len as usize;
     let resumption = psk_len > 0 && psk_id_len > 0;
     let zero_rtt_offered = s.conns[idx].zero_rtt_offered;
+    // The name the ClientHello carries (RFC 6066 §3): the override when
+    // set, else the authority's name. A peer reached by address gets none.
+    let mut sni_buf = [0u8; 64];
+    let sni_len = expected_name(s, &mut sni_buf);
+    let sni = &sni_buf[..sni_len];
 
     let mut random = [0u8; 32];
     dev_csprng_fill(sys, random.as_mut_ptr(), 32);
@@ -1161,6 +1166,7 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
             hl,
             zero_rtt_offered,
             alpn,
+            sni,
             QUIC_PACKET_SUITES,
             &mut driver.scratch,
         );
@@ -1209,13 +1215,14 @@ unsafe fn pump_send_client_hello(s: &mut QuicState, idx: usize) -> bool {
     let driver = &mut s.conns[idx].driver;
     driver.peer_session_id = session_id;
     driver.peer_session_id_len = 32;
-    let msg_len = build_client_hello_ext(
+    let msg_len = build_client_hello_sni(
         &random,
         &session_id,
         &driver.ecdh_public,
         None,
         &tp[..tp_len],
         alpn,
+        sni,
         QUIC_PACKET_SUITES,
         &mut driver.scratch,
     );
@@ -1448,22 +1455,53 @@ unsafe fn pump_recv_encrypted_extensions(s: &mut QuicState, idx: usize) -> bool 
     true
 }
 
+/// The peer's expected DNS name, copied into `out`: `verify_hostname`
+/// when set, else the `authority`'s name. 0 for a peer reached by address
+/// with no override — such a peer is verified by its iPAddress instead.
+fn expected_name(s: &QuicState, out: &mut [u8; 64]) -> usize {
+    let src: &[u8] = if s.verify_hostname_len > 0 {
+        &s.verify_hostname[..s.verify_hostname_len]
+    } else {
+        &s.peer_name[..s.peer_name_len as usize]
+    };
+    let n = src.len().min(out.len());
+    out[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+/// A client dialled by name learns the peer's address from the first
+/// packet that authenticates; from then on its datagrams go to that
+/// address rather than through the resolver.
+fn learn_peer_address(conn: &mut QuicConnection) {
+    if !conn.is_server && !conn.peer.has_address() && conn.recv_ip != [0; 4] {
+        conn.peer.ip = conn.recv_ip;
+        conn.peer.port = conn.recv_port;
+    }
+}
+
 unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
-    // Capture verify-peer config as raw pointers before borrowing the
-    // connection mutably. QuicState lives in stable module storage so
-    // the pointers remain valid for the function's duration.
+    // Capture the verify-peer config before borrowing the connection
+    // mutably.
     let verify_peer = s.verify_peer != 0;
-    // The anchor table is read through a raw pointer for the same reason
-    // the hostname is: the connection is borrowed mutably below, and the
-    // table is a disjoint field of stable module storage.
+    // The anchor table is read through a raw pointer: the connection is
+    // borrowed mutably below, and the table is a disjoint field of stable
+    // module storage.
     let anchors = if verify_peer {
         anchor_set(&*(s as *const QuicState))
     } else {
         AnchorSet::empty()
     };
-    let host_ptr = s.verify_hostname.as_ptr();
+    // The identity the leaf must hold: a name (the override or the
+    // authority's), else the authority's address as an iPAddress SAN.
+    let mut host_buf = [0u8; 64];
     let host_len = if verify_peer {
-        s.verify_hostname_len
+        expected_name(s, &mut host_buf)
+    } else {
+        0
+    };
+    let expected_ip = s.peer_v4;
+    let ip_len = if verify_peer && host_len == 0 && expected_ip != [0; 4] {
+        4
     } else {
         0
     };
@@ -1495,18 +1533,24 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
     }
     if verify_peer {
         let sys = &*sys_ptr;
-        if anchors.is_empty() || host_len == 0 {
-            // verify_peer requested but trust anchor or hostname is
-            // absent — fail closed rather than silently skipping.
-            let msg = b"[quic] cert chain FAIL no trust anchor / hostname";
+        if anchors.is_empty() || (host_len == 0 && ip_len == 0) {
+            // verify_peer requested but there is no trust anchor, or no
+            // identity to require — fail closed rather than silently
+            // skipping.
+            let msg = b"[quic] cert chain FAIL no trust anchor / peer identity";
             dev_log(sys, 2, msg.as_ptr(), msg.len());
             conn.driver.hs_state = HandshakeState::Error;
             return true;
         }
-        let host = core::slice::from_raw_parts(host_ptr, host_len);
         let mut deferred =
             core::mem::replace(&mut conn.driver.deferred_links, DeferredLinks::empty());
-        let rc = verify_cert_chain_with(body, &anchors, host, Some(&mut deferred));
+        let rc = verify_cert_chain_with(
+            body,
+            &anchors,
+            &host_buf[..host_len],
+            &expected_ip[..ip_len],
+            Some(&mut deferred),
+        );
         conn.driver.deferred_links = deferred;
         if rc != 0 {
             let mut buf = [0u8; 48];
@@ -1806,6 +1850,7 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
         // Idle-timeout activity stamp (RFC 9000 §10.1).
         let now_ms = dev_millis(&*s.syscalls);
         conn.last_activity_ms = now_ms;
+        learn_peer_address(conn);
 
         if !conn.is_server && pkt_type == PKT_INITIAL && parsed.scid_len > 0 {
             let scid_off = parsed.scid_off;
@@ -1924,6 +1969,7 @@ unsafe fn drain_inbound_one(s: &mut QuicState, idx: usize) -> bool {
                 return false;
             }
         };
+        learn_peer_address(conn);
         if rotated {
             // Promote next-phase to current on both halves (RFC 9001
             // §6.1 mandates flipping the local sender on receipt of
@@ -2228,6 +2274,8 @@ unsafe fn emit_retry(
         sys,
         s.net_out,
         &s.endpoint,
+        // A server answers the address the packet came from.
+        &[],
         &peer,
         &pkt[..n],
         &mut s.net_scratch,
@@ -2394,6 +2442,8 @@ unsafe fn emit_version_negotiation(s: &mut QuicState, idx: usize, off: usize, av
         sys,
         s.net_out,
         &s.endpoint,
+        // A server answers the address the packet came from.
+        &[],
         &peer,
         &pkt[..n],
         &mut s.net_scratch,
@@ -4218,6 +4268,7 @@ unsafe fn emit_crypto_packet(
             sys,
             s.net_out,
             &s.endpoint,
+            &s.peer_name[..s.peer_name_len as usize],
             &peer,
             &pkt[..n],
             &mut s.net_scratch,
@@ -4561,6 +4612,7 @@ pub(crate) unsafe fn emit_connection_close(
         sys,
         s.net_out,
         &s.endpoint,
+        &s.peer_name[..s.peer_name_len as usize],
         &peer,
         &pkt[..pkt_len],
         &mut s.net_scratch,
@@ -4622,6 +4674,7 @@ pub(crate) unsafe fn emit_path_challenge(s: &mut QuicState, idx: usize) {
         sys,
         s.net_out,
         &s.endpoint,
+        &s.peer_name[..s.peer_name_len as usize],
         &cand,
         &pkt[..pkt_len],
         &mut s.net_scratch,
@@ -4685,6 +4738,7 @@ pub(crate) unsafe fn emit_path_response(s: &mut QuicState, idx: usize) {
         sys,
         s.net_out,
         &s.endpoint,
+        &s.peer_name[..s.peer_name_len as usize],
         &dest,
         &pkt[..pkt_len],
         &mut s.net_scratch,
@@ -4763,6 +4817,7 @@ pub(crate) unsafe fn quic_pto_check(s: &mut QuicState, idx: usize) {
             sys,
             s.net_out,
             &s.endpoint,
+            &s.peer_name[..s.peer_name_len as usize],
             &peer,
             &resend_bytes[..resend_len],
             &mut s.net_scratch,

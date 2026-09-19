@@ -99,12 +99,15 @@ pub fn compute(repo: &Path) -> Result<PinPlan> {
     })
 }
 
-/// Format 32 bytes as a `[u8; 32]` literal body in the checked-in 15/15/2
-/// layout (4-space indent).
+/// Format 32 bytes as a `[u8; 32]` literal body: two rows of sixteen at a
+/// 4-space indent, which is what rustfmt produces for this literal. The
+/// generated file is held to the same fmt gate as any other module source,
+/// so the writer emits the formatted shape rather than leaving it to be
+/// fixed by hand after every regen.
 fn fmt_u8_array(bytes: &[u8; 32]) -> String {
     let hexes: Vec<String> = bytes.iter().map(|b| format!("0x{b:02x}")).collect();
     let mut out = String::from("[\n");
-    for chunk in [&hexes[0..15], &hexes[15..30], &hexes[30..32]] {
+    for chunk in [&hexes[0..16], &hexes[16..32]] {
         out.push_str("    ");
         out.push_str(&chunk.join(", "));
         out.push_str(",\n");

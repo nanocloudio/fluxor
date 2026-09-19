@@ -353,7 +353,18 @@ fn main() {
             action,
             only,
             project_root,
-        } => cmd_publish(action, &only, project_root.as_deref(), verbose),
+            dry_run,
+            strict_pins,
+        } => cmd_publish(
+            action,
+            &only,
+            project_root.as_deref(),
+            verbose,
+            fluxor_tools::store_publish::PublishMode {
+                dry_run,
+                strict_pins,
+            },
+        ),
         Commands::Update { project_root, from } => {
             let pr = project_root.unwrap_or_else(crate::project::root);
             store_resolve::cmd_update(&pr, from.as_deref())
@@ -419,6 +430,7 @@ fn cmd_publish(
     only: &[String],
     project_root: Option<&Path>,
     verbose: bool,
+    mode: fluxor_tools::store_publish::PublishMode,
 ) -> Result<()> {
     // clap can't express subcommand-vs-flag conflicts (`conflicts_with`
     // only names sibling args), so enforce it here.
@@ -516,8 +528,11 @@ fn cmd_publish(
     let pr = sub_root
         .or_else(|| project_root.map(Path::to_path_buf))
         .unwrap_or_else(crate::project::root);
-    let tags = fluxor_tools::store_publish::publish_project_to_store(&pr, &kinds, verbose)
+    let tags = fluxor_tools::store_publish::publish_project_with_mode(&pr, &kinds, verbose, mode)
         .map_err(|e| Error::Config(e.to_string()))?;
+    if mode.dry_run {
+        return Ok(());
+    }
     for tag in &tags {
         println!("{tag}");
     }

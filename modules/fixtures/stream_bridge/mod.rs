@@ -2,9 +2,12 @@
 //! `remote_channel` multiplexes over.
 //!
 //! `mode = listen`: bind `port`, adopt the first accepted connection.
-//! `mode = connect`: dial `peer_ip:port`, redial `RECONNECT_MS` after a
-//! close or a failed dial. In both modes the connection's bytes flow to
-//! `bytes_out` and `bytes_in` flows to the connection in `CMD_SEND`
+//! `mode = connect`: dial `authority` (`host[:port]`, port 9100 when
+//! omitted — a name the network provider resolves, or a literal), redial
+//! `RECONNECT_MS` after a close or a refused dial, and `5 ×
+//! RECONNECT_MS` after one nothing answered. In both modes the
+//! connection's bytes flow to `bytes_out` and `bytes_in` flows to the
+//! connection in `CMD_SEND`
 //! frames of at most `CHUNK` bytes; a refused write leaves the bytes on
 //! `bytes_in` for the next step.
 
@@ -25,16 +28,20 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
-const NET_MSG_ACCEPTED: u8 = 0x01;
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_BOUND: u8 = 0x04;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-const NET_CMD_BIND: u8 = 0x10;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+#[path = "../../sdk/contracts/net/net_proto.rs"]
+mod net_proto;
+use net_proto::{
+    write_connect_to, Target, AF_INET, AF_INET6, CMD_BIND as NET_CMD_BIND,
+    CMD_CLOSE as NET_CMD_CLOSE, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND,
+    CONNECT_TO_MAX, MSG_ACCEPTED as NET_MSG_ACCEPTED, MSG_BOUND as NET_MSG_BOUND,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR,
+};
+
+/// `authority` as written: `host[:port]`.
+const MAX_AUTHORITY_LEN: usize = 128;
+/// The listener port, and the peer's port when `authority` names none.
+const DEFAULT_PORT: u16 = 9100;
 
 const MODE_LISTEN: u8 = 0;
 const MODE_CONNECT: u8 = 1;
@@ -66,12 +73,20 @@ pub struct BridgeState {
     mode: u8,
     phase: u8,
     conn: u16,
+    /// `listen`: the port bound.
     port: u16,
-    _pad: [u8; 2],
-    peer_ip: u32,
+    /// `connect`: the peer's port — the authority's, or `DEFAULT_PORT`.
+    peer_port: u16,
     retry_at_ms: u32,
     my_tag: u8,
-    _pad2: [u8; 3],
+    authority_len: u8,
+    /// The dial target parsed from `authority` once at construction:
+    /// `AF_INET` / `AF_INET6` with the address in `peer_addr`, or
+    /// `AF_NAME` with the name being `authority[..peer_host_len]`.
+    peer_af: u8,
+    peer_host_len: u8,
+    peer_addr: [u8; 16],
+    authority: [u8; MAX_AUTHORITY_LEN],
     pub bytes_up: u32,
     pub bytes_down: u32,
     pub connections: u32,
@@ -85,7 +100,55 @@ mod params_def {
         BridgeState;
         1, mode, u8, 0, enum { listen=0, connect=1 } => |s, d, len| { s.mode = p_u8(d, len, 0, 0); };
         2, port, u16, 9100 => |s, d, len| { s.port = p_u16(d, len, 0, 9100); };
-        3, peer_ip, u32, 0 => |s, d, len| { s.peer_ip = p_u32(d, len, 0, 0); };
+        // Tag 3 is retired; the next allocation is 5.
+        4, authority, str, 0 => |s, d, len| {
+            // An authority that does not fit is dropped rather than
+            // clipped: a prefix of a name is a different host, and the
+            // admission below refuses an instance without one.
+            let n = if len > MAX_AUTHORITY_LEN { 0 } else { len };
+            s.authority_len = n as u8;
+            let mut i = 0;
+            while i < n {
+                s.authority[i] = unsafe { *d.add(i) };
+                i += 1;
+            }
+        };
+    }
+}
+
+/// Parse `authority` into the dial target the bridge keeps. `false`
+/// when it is absent or is not `host[:port]`.
+fn adopt_authority(s: &mut BridgeState) -> bool {
+    let n = s.authority_len as usize;
+    if n == 0 {
+        return false;
+    }
+    let mut copy = [0u8; MAX_AUTHORITY_LEN];
+    copy[..n].copy_from_slice(&s.authority[..n]);
+    let Some((target, port)) = Target::parse(&copy[..n]) else {
+        return false;
+    };
+    s.peer_port = port.unwrap_or(DEFAULT_PORT);
+    s.peer_af = target.af();
+    match target {
+        Target::V4(a) => s.peer_addr[..4].copy_from_slice(&a),
+        Target::V6(a) => s.peer_addr.copy_from_slice(&a),
+        Target::Name(name) => s.peer_host_len = name.len() as u8,
+    }
+    true
+}
+
+/// The target `adopt_authority` kept, borrowed for one dial.
+fn dial_target(s: &BridgeState) -> Target<'_> {
+    match s.peer_af {
+        AF_INET => Target::V4([
+            s.peer_addr[0],
+            s.peer_addr[1],
+            s.peer_addr[2],
+            s.peer_addr[3],
+        ]),
+        AF_INET6 => Target::V6(s.peer_addr),
+        _ => Target::Name(&s.authority[..s.peer_host_len as usize]),
     }
 }
 
@@ -110,20 +173,23 @@ unsafe fn send_bind(s: &mut BridgeState) {
 
 unsafe fn send_connect(s: &mut BridgeState) {
     let sys = &*s.syscalls;
-    let mut p = [0u8; 8];
-    p[0] = SOCK_TYPE_STREAM;
-    p[1..5].copy_from_slice(&s.peer_ip.to_le_bytes());
-    p[5..7].copy_from_slice(&s.port.to_le_bytes());
-    p[7] = s.my_tag;
-    let mut scratch = [0u8; 12];
+    let mut p = [0u8; CONNECT_TO_MAX];
+    let n = write_connect_to(
+        &mut p,
+        SOCK_TYPE_STREAM,
+        s.peer_port,
+        &dial_target(s),
+        Some(s.my_tag),
+    );
+    let mut scratch = [0u8; 3 + CONNECT_TO_MAX];
     net_write_frame(
         sys,
         s.net_out,
-        NET_CMD_CONNECT,
+        NET_CMD_CONNECT_TO,
         p.as_ptr(),
-        8,
+        n,
         scratch.as_mut_ptr(),
-        12,
+        scratch.len(),
     );
 }
 
@@ -296,8 +362,13 @@ pub unsafe extern "C" fn module_new(
     s.mode = MODE_LISTEN;
     s.phase = PH_IDLE;
     s.conn = NO_CONN;
-    s.port = 9100;
-    s.peer_ip = 0;
+    s.port = DEFAULT_PORT;
+    s.peer_port = DEFAULT_PORT;
+    s.authority = [0u8; MAX_AUTHORITY_LEN];
+    s.authority_len = 0;
+    s.peer_af = 0;
+    s.peer_host_len = 0;
+    s.peer_addr = [0u8; 16];
     s.retry_at_ms = 0;
     s.my_tag = dev_requester_tag(sys);
     s.bytes_up = 0;
@@ -306,8 +377,8 @@ pub unsafe extern "C" fn module_new(
     if !params.is_null() && params_len > 0 {
         params_def::parse_tlv(s, params, params_len);
     }
-    if s.mode == MODE_CONNECT && s.peer_ip == 0 {
-        let m = b"[bridge] refusing to construct: connect mode needs peer_ip";
+    if s.mode == MODE_CONNECT && !adopt_authority(s) {
+        let m = b"[bridge] refusing to construct: connect mode needs authority (host[:port])";
         dev_log(sys, 1, m.as_ptr(), m.len());
         return -22;
     }

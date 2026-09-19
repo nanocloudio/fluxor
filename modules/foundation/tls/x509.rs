@@ -32,6 +32,10 @@ const TAG_SAN_DNS: u8 = 0x82;
 /// ([6] IMPLICIT IA5String). This is where a SPIFFE ID lives.
 const TAG_SAN_URI: u8 = 0x86;
 
+/// iPAddress inside a SAN GeneralName ([7] IMPLICIT OCTET STRING): 4 bytes
+/// for IPv4, 16 for IPv6, network order (RFC 5280 §4.2.1.6).
+const TAG_SAN_IP: u8 = 0x87;
+
 /// OID for SubjectAltName: 2.5.29.17
 const OID_SAN: [u8; 3] = [0x55, 0x1D, 0x11];
 /// OID for BasicConstraints: 2.5.29.19
@@ -1399,6 +1403,43 @@ fn walk_san_uri(
     any
 }
 
+/// Walk a SAN extension value yielding each `iPAddress` (4 or 16 bytes,
+/// network order). `callback` returning true stops the walk. Returns true
+/// if at least one `iPAddress` was present. An entry of any other length is
+/// not an address and is skipped.
+fn walk_san_ip(
+    cert: &[u8],
+    start: usize,
+    len: usize,
+    callback: &mut impl FnMut(&[u8]) -> bool,
+) -> bool {
+    if len == 0 || cert[start] != TAG_SEQUENCE {
+        return false;
+    }
+    let (s_start, s_len, _) = match der_tlv(cert, start) {
+        Some(v) => v,
+        None => return false,
+    };
+    let end = s_start + s_len;
+    let mut pos = s_start;
+    let mut any = false;
+    while pos < end {
+        let tag = cert[pos];
+        let (c_start, c_len, total) = match der_tlv(cert, pos) {
+            Some(v) => v,
+            None => break,
+        };
+        if tag == TAG_SAN_IP && (c_len == 4 || c_len == 16) {
+            any = true;
+            if callback(&cert[c_start..c_start + c_len]) {
+                return true;
+            }
+        }
+        pos += total;
+    }
+    any
+}
+
 impl X509Cert<'_> {
     /// Yield each `uniformResourceIdentifier` SAN in this certificate.
     ///
@@ -1771,8 +1812,14 @@ pub struct ChainPolicy<'a> {
     /// match rule; see [`verify_chain_with`].
     pub anchors: AnchorSet<'a>,
     /// Expected DNS name, for `PROFILE_CA_DNS`. Empty means "no name rule",
-    /// which is the mTLS server case.
+    /// which is the mTLS server case — unless `expected_ip` names one.
     pub expected_dns: &'a [u8],
+    /// Expected `iPAddress` SAN, for `PROFILE_CA_DNS` when the peer was
+    /// reached by address rather than by name (RFC 6125 §1.7.2): 4 or 16
+    /// bytes, network order, compared byte-for-byte — no wildcard, no
+    /// dNSName fallback. Empty means the DNS rule applies instead. A
+    /// policy naming both is refused: a connection is to one authority.
+    pub expected_ip: &'a [u8],
     /// Expected URI SAN, for `PROFILE_CA_URI`. Compared as bytes: a URI is
     /// not a hostname and admits no wildcard, no case folding and no
     /// trailing-dot equivalence.
@@ -2376,6 +2423,34 @@ fn verify_chain_against(
         if !matched {
             return CERT_ERR_NAME_MISMATCH;
         }
+    } else if !policy.expected_ip.is_empty() {
+        // Reached by address: only an `iPAddress` SAN equal to the address
+        // dialled satisfies the rule. A leaf carrying addresses but not this
+        // one is a name mismatch; a leaf carrying none — however many hosts
+        // it names — has no identity of this kind at all, and is absent.
+        if !policy.expected_dns.is_empty()
+            || (policy.expected_ip.len() != 4 && policy.expected_ip.len() != 16)
+        {
+            return CERT_ERR_NAME_ABSENT;
+        }
+        let (san_start, san_len) = match leaf_exts.san {
+            Some(v) => v,
+            None => return CERT_ERR_NAME_ABSENT,
+        };
+        let mut matched = false;
+        let any = walk_san_ip(leaf_der, san_start, san_len, &mut |ip| {
+            if ip == policy.expected_ip {
+                matched = true;
+                return true;
+            }
+            false
+        });
+        if !any {
+            return CERT_ERR_NAME_ABSENT;
+        }
+        if !matched {
+            return CERT_ERR_NAME_MISMATCH;
+        }
     } else if !policy.expected_dns.is_empty() {
         let (san_start, san_len) = match leaf_exts.san {
             Some(v) => v,
@@ -2523,14 +2598,17 @@ pub fn verify_cert_chain(
     anchors: &AnchorSet<'_>,
     expected_hostname: &[u8],
 ) -> u32 {
-    verify_cert_chain_with(cert_msg_body, anchors, expected_hostname, None)
+    verify_cert_chain_with(cert_msg_body, anchors, expected_hostname, &[], None)
 }
 
 /// As [`verify_cert_chain`], deferring RSA links (see [`verify_chain_with`]).
+/// `expected_hostname` is a DNS name; a peer reached by address passes the
+/// address bytes as `expected_ip` and an empty hostname.
 pub fn verify_cert_chain_with(
     cert_msg_body: &[u8],
     anchors: &AnchorSet<'_>,
     expected_hostname: &[u8],
+    expected_ip: &[u8],
     deferred: Option<&mut DeferredLinks>,
 ) -> u32 {
     verify_chain_with(
@@ -2539,6 +2617,7 @@ pub fn verify_cert_chain_with(
             profile: PROFILE_CA_DNS,
             anchors: *anchors,
             expected_dns: expected_hostname,
+            expected_ip,
             expected_uri: &[],
             allowed_suites: suite::IMPLEMENTED,
             now_unix_secs: 0,

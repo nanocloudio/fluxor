@@ -2008,6 +2008,7 @@ pub fn build_client_hello_psk(
     binder_len: usize,
     include_early_data: bool,
     alpn: &[u8],
+    sni: &[u8],
     suites: &[u16],
     out: &mut [u8],
 ) -> (usize, usize, usize) {
@@ -2049,6 +2050,7 @@ pub fn build_client_hello_psk(
     pos = write_ext_key_share_client(out, pos, pub_key, None);
     pos = write_ext_signature_algorithms(out, pos);
     pos = write_ext_alpn_client(out, pos, alpn);
+    pos = write_ext_server_name(out, pos, sni);
     if !quic_tp.is_empty() {
         put_u16(out, pos, EXT_QUIC_TRANSPORT_PARAMETERS);
         pos += 2;

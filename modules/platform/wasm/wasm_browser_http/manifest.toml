@@ -70,6 +70,13 @@ buffer_size = 2048
 # Empty means the page's own origin, which is what a bundle served beside
 # the service it talks to wants, and what its cross-origin policy permits
 # without any further arrangement.
+#
+# A request record may name its authority in its trailing field. With an
+# `origin` set, a record naming that origin's host is performed and one
+# naming another is refused as unroutable: a pinned connector is pinned.
+# With no `origin`, the record's authority is where the request goes, over
+# https — the connector is open, and the page's cross-origin policy is
+# still the enforcement behind it.
 [[params]]
 name = "origin"
 tag = 10

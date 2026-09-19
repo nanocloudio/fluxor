@@ -93,6 +93,11 @@ fn cmd_validate(config_path: &PathBuf, target_override: Option<&str>) -> Result<
         if let Err(e) = crate::config::validate_fault_policy(&config, &module_names, &manifests) {
             result.add_error(e.to_string());
         }
+        // Connector addressing: `authority` alone names a peer. The
+        // dry-run below prints the override warnings once.
+        if let Err(e) = crate::config::check_connector_addressing(&config) {
+            result.add_error(e.to_string());
+        }
     }
 
     // Dry-run the full config-generation pipeline so missing
@@ -607,12 +612,28 @@ fn config_inspection_json(config_path: &Path, project_root: &Path) -> serde_json
         .map(|p| p.display().to_string())
         .collect();
 
+    let connectors: Vec<serde_json::Value> = connector_views(&probe)
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "type": c.ty,
+                "authority": c.authority,
+                "wiring": c.wiring
+                    .iter()
+                    .map(|(port, to)| format!("{port} -> {to}"))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
     serde_json::json!({
         "path": config_path.display().to_string(),
         "declared_target": declared,
         "resolved_target": resolved,
         "expanded_stack_modules": expanded_stack_modules,
         "module_search_paths": search_paths,
+        "connectors": connectors,
     })
 }
 
@@ -935,6 +956,65 @@ fn format_install_source(source: &crate::project::InstallDiscoverySource) -> Str
     }
 }
 
+/// One line per connector: every module in the (stack-expanded) graph
+/// that carries an `authority`, with the wiring that leaves it. What the
+/// text `connectors:` block prints and the JSON `connectors` array carries.
+struct ConnectorView {
+    name: String,
+    ty: String,
+    authority: String,
+    wiring: Vec<(String, String)>,
+}
+
+fn connector_views(probe: &serde_json::Value) -> Vec<ConnectorView> {
+    let mut out = Vec::new();
+    let Some(modules) = probe.get("modules").and_then(|m| m.as_array()) else {
+        return out;
+    };
+    let wiring = probe
+        .get("wiring")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for module in modules {
+        let Some(name) = module.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(authority) = module
+            .get("authority")
+            .or_else(|| module.get("params").and_then(|p| p.get("authority")))
+        else {
+            continue;
+        };
+        let authority = match authority {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let ty = module
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or(name)
+            .to_string();
+        let prefix = format!("{name}.");
+        let edges = wiring
+            .iter()
+            .filter_map(|edge| {
+                let from = edge.get("from").and_then(|f| f.as_str())?;
+                let to = edge.get("to").and_then(|t| t.as_str())?;
+                let port = from.strip_prefix(&prefix)?;
+                Some((port.to_string(), to.to_string()))
+            })
+            .collect();
+        out.push(ConnectorView {
+            name: name.to_string(),
+            ty,
+            authority,
+            wiring: edges,
+        });
+    }
+    out
+}
+
 fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
     // Wrap the read with explicit path context so a missing file
     // (the common typo case for `fluxor inspect`) surfaces as
@@ -1021,6 +1101,18 @@ fn inspect_config(config_path: &Path, project_root: &Path) -> Result<()> {
             }
             Err(e) => {
                 println!("  expanded stacks:      <error: {e}>");
+            }
+        }
+    }
+
+    // Connectors: where the graph dials, beside the wiring that carries it.
+    let connectors = connector_views(&probe);
+    if !connectors.is_empty() {
+        println!("  connectors:");
+        for c in &connectors {
+            println!("    {} ({}) → {}", c.name, c.ty, c.authority);
+            for (port, to) in &c.wiring {
+                println!("      {port} -> {to}");
             }
         }
     }
@@ -1544,8 +1636,7 @@ fn cmd_inspect_dispatch(subject: Option<&str>, flags: InspectFlags) -> Result<()
 /// digest, provenance, source rev, and layers.
 fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
     use fluxor_tools::oci_store::{
-        OciStore, ANN_ABI_SURFACE, ANN_CI_DIGEST, ANN_INPUT_DIGEST, ANN_KIND, ANN_PROVENANCE,
-        ANN_REF_NAME, ANN_SOURCE_REV, MT_OCI_INDEX,
+        OciStore, ANN_ABI_SURFACE, ANN_INPUT_DIGEST, ANN_KIND, ANN_REF_NAME, MT_OCI_INDEX,
     };
     let store = OciStore::open(
         fluxor_tools::oci_store::store_root().map_err(|e| Error::Config(e.to_string()))?,
@@ -1642,9 +1733,26 @@ fn cmd_inspect_store_ref(reference: &str, json: bool) -> Result<()> {
     println!("tags:          {tags_line}");
     println!("epoch:         {epoch_line}");
     println!("input-digest:  {}", ann(ANN_INPUT_DIGEST).unwrap_or("(none)"));
-    println!("ci-digest:     {}", ann(ANN_CI_DIGEST).unwrap_or("(none)"));
-    println!("provenance:    {}", ann(ANN_PROVENANCE).unwrap_or("(none)"));
-    println!("source-rev:    {}", ann(ANN_SOURCE_REV).unwrap_or("(none)"));
+    println!("content:       {}", crate::store_resolve::content_digest(&manifest));
+    // Provenance is a fact about the publishing RUN, so it lives beside
+    // the manifest rather than inside it: an artifact re-published from
+    // a later commit is the SAME manifest with one more row filed
+    // against it, and the digest downstream lockfiles pin does not move.
+    // Several rows is the normal, healthy case.
+    let rows = store.provenance_of(&desc.digest);
+    if rows.is_empty() {
+        println!("provenance:    (none recorded)");
+    } else {
+        for (i, row) in rows.iter().enumerate() {
+            let label = if i == 0 { "provenance:" } else { "" };
+            println!(
+                "{label:<14} {:<12} rev {:<14} ci {}",
+                row.provenance,
+                row.source_rev.clone().unwrap_or_else(|| "-".into()),
+                row.ci_digest.clone().unwrap_or_else(|| "-".into())
+            );
+        }
+    }
     println!("layers:");
     for l in &manifest.layers {
         println!("  {:>9}  {}  {}", l.size, l.digest, l.media_type);

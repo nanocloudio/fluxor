@@ -1513,3 +1513,207 @@ pub fn validate_execution_profile(
 ) -> Result<()> {
     crate::target_facts::admit_execution_profile(config, module_names, manifests, target)
 }
+
+/// Parameters retired when a connector took its `authority`. A graph
+/// naming one is refused with the key named and what replaced it, which is
+/// more than "unknown param" says. Every one of these is gone from every
+/// module in the workspace: a connector states `authority`, a server states
+/// `port`, and nothing states an address twice.
+const RETIRED_ADDRESS_KEYS: &[&str] = &[
+    "host_ip",
+    "registry_ip",
+    "endpoint",
+    "peer_ip",
+    "peer_port",
+    "server_ip",
+    "server_port",
+];
+
+/// Retired on the types that took an `authority`, and ordinary parameters
+/// elsewhere: `host` is a field name a server module may keep.
+const RETIRED_ADDRESS_KEYS_BY_TYPE: &[(&str, &[&str])] = &[
+    ("ota_registry", &["host", "registry_port"]),
+    ("s3", &["host"]),
+    ("websocket", &["host"]),
+    (
+        "peer_router",
+        &[
+            "peer0_host", "peer0_port", "peer1_host", "peer1_port", "peer2_host", "peer2_port",
+            "peer3_host", "peer3_port", "peer4_host", "peer4_port",
+        ],
+    ),
+];
+
+/// A module's parameter, written at the top level or nested under
+/// `params:` — a graph may use either form, so every rule reads both.
+fn module_param<'a>(module: &'a Value, key: &str) -> Option<&'a Value> {
+    module
+        .get(key)
+        .or_else(|| module.get("params").and_then(|p| p.get(key)))
+}
+
+/// Every parameter key a module instance carries, in both forms.
+fn module_param_keys(module: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = module
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if let Some(inner) = module.get("params").and_then(|p| p.as_object()) {
+        keys.extend(inner.keys().map(String::as_str));
+    }
+    keys
+}
+
+/// Whether `key` is a retired address parameter on a module of type `ty`.
+fn is_retired_address_key(ty: &str, key: &str) -> bool {
+    RETIRED_ADDRESS_KEYS.contains(&key)
+        || RETIRED_ADDRESS_KEYS_BY_TYPE
+            .iter()
+            .any(|(t, keys)| *t == ty && keys.contains(&key))
+}
+
+/// The `mode` of an instance as text: a number or an enum name, `None`
+/// when the graph names none.
+fn instance_mode(module: &Value) -> Option<String> {
+    match module_param(module, "mode")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether an instance of `ty` takes its peer's port from `authority`, so a
+/// `port` beside it is a second spelling of one fact.
+///
+/// Only types whose `port` WAS the peer's are here. A `port` that binds is
+/// not an authority and stays: `quic` binds its local UDP port in both
+/// modes, and a `stream_bridge` in `listen` mode binds the port it accepts
+/// on.
+fn dials_in_client_mode(ty: &str, module: &Value) -> bool {
+    let mode = instance_mode(module);
+    let mode = mode.as_deref();
+    match ty {
+        "tls_probe" | "ota_registry" => true,
+        "http" => matches!(mode, Some("1") | Some("client")),
+        "stream_bridge" => matches!(mode, Some("1") | Some("connect")),
+        _ => false,
+    }
+}
+
+/// The host part of an `authority`: a bracketed v6 literal without its
+/// brackets, or everything before the one `:port`.
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
+}
+
+/// The warnings `validate_connector_addressing` prints: a client-mode
+/// `tls` instance whose `verify_hostname` is not the host of the
+/// `authority` on the connector wired into its `clear_in`. That is the
+/// override — a proxy, or a pinned host reached by address — and it is
+/// named so nobody mistakes a typo for one.
+fn connector_addressing_warnings(config: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(modules) = config.get("modules").and_then(|m| m.as_array()) else {
+        return out;
+    };
+    let wiring = config
+        .get("wiring")
+        .and_then(|w| w.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for module in modules {
+        let Some(name) = module.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if instance_type(config, name) != "tls" {
+            continue;
+        }
+        let mode = instance_mode(module);
+        if !matches!(mode.as_deref(), None | Some("0") | Some("client")) {
+            continue;
+        }
+        let Some(expected) = module_param(module, "verify_hostname").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let clear_in = format!("{name}.clear_in");
+        let connector = wiring.iter().find_map(|edge| {
+            let to = edge.get("to").and_then(|t| t.as_str())?;
+            if to != clear_in {
+                return None;
+            }
+            let from = edge.get("from").and_then(|f| f.as_str())?;
+            Some(from.split('.').next().unwrap_or(from).to_string())
+        });
+        let Some(connector) = connector else {
+            continue;
+        };
+        let Some(authority) = instance_entry(config, &connector)
+            .and_then(|m| module_param(m, "authority"))
+            .and_then(|a| a.as_str())
+        else {
+            continue;
+        };
+        let host = authority_host(authority);
+        if !host.eq_ignore_ascii_case(expected) {
+            out.push(format!(
+                "warning: tls '{name}' verifies '{expected}' but '{connector}' dials \
+                 authority '{authority}' (host '{host}'); `verify_hostname` is an override \
+                 for a proxy or a pinned host reached by address — drop it to verify the \
+                 name the connector dials"
+            ));
+        }
+    }
+    out
+}
+
+/// Connectors are addressed by `authority` alone. A module instance
+/// carrying another address-bearing parameter (`ADDRESS_PARAM_KEYS`, or
+/// `host` on `ota_registry`) is refused, as is a client-mode `port` beside
+/// an `authority`: the port lives inside the authority. A client-mode `tls`
+/// whose `verify_hostname` differs from the authority wired into it is a
+/// warning naming the override.
+pub fn validate_connector_addressing(config: &Value) -> Result<()> {
+    check_connector_addressing(config)?;
+    for warning in connector_addressing_warnings(config) {
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+/// The errors of `validate_connector_addressing`, without its warnings —
+/// for a caller that goes on to run the full pipeline, which prints them.
+pub fn check_connector_addressing(config: &Value) -> Result<()> {
+    if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
+        for module in modules {
+            let Some(name) = module.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let ty = instance_type(config, name);
+            for key in module_param_keys(module) {
+                if is_retired_address_key(&ty, key) {
+                    return Err(Error::Config(format!(
+                        "module '{name}' ({ty}): parameter '{key}' is not accepted; a \
+                         connector takes `authority` (`host[:port]`) — a name the network \
+                         provider resolves, or a literal"
+                    )));
+                }
+            }
+            if module_param(module, "authority").is_some()
+                && module_param(module, "port").is_some()
+                && dials_in_client_mode(&ty, module)
+            {
+                return Err(Error::Config(format!(
+                    "module '{name}' ({ty}): client-mode `port` beside `authority`: the port \
+                     lives inside the authority (`host:port`)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}

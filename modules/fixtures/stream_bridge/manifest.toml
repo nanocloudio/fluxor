@@ -6,11 +6,11 @@ timer_class = "wall_clock"
 # One TCP connection as a raw byte stream: the adapter that gives
 # `remote_channel` a transport over the Stream Surface. In `listen` mode
 # it binds `port` and adopts the first connection accepted; in `connect`
-# mode it dials `peer_ip:port` (`peer_ip` is the IPv4 address as a number,
-# 192.168.1.10 = 0xC0A8010A) and redials after a close. Bytes arriving
-# on the connection go out on `bytes_out`; bytes on `bytes_in` are sent
-# on the connection. Exactly one connection at a time; a second accept
-# is closed at once.
+# mode it dials `authority` (`host[:port]`, port 9100 when omitted — a
+# name the network provider resolves, or a literal) and redials after a
+# close. Bytes arriving on the connection go out on `bytes_out`; bytes on
+# `bytes_in` are sent on the connection. Exactly one connection at a time;
+# a second accept is closed at once.
 #
 #   ip.net_out / linux_net.net_out  → net_in
 #   net_out                         → ip.net_in / linux_net.net_in

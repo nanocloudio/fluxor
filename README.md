@@ -269,8 +269,8 @@ fluxor inspect <file.uf2> --emit-config
 fluxor inspect <new.yaml> --against <old.yaml>
 ```
 
-Publishing artefacts into the local OCI store, and consuming them from
-a downstream project, is covered in
+Publishing artefacts into the local OCI store, consuming them from a
+downstream project, and keeping the store itself are covered in
 [docs/guides/publishing.md](docs/guides/publishing.md).
 
 ## Repository Layout

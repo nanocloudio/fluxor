@@ -22,6 +22,8 @@ means editing its row here in the same change.
 | datagram/packet `ep_id` (DG/PKT wire) | u8 | 256 | `MAX_DG_ENDPOINTS` | modules/sdk/abi/config.rs | 256 | Endpoints are allocated only from the first `MAX_DG_ENDPOINTS` connection slots, so the u8 id binds the endpoint count, not the table. TCP prefers the slots beyond that window and takes it only when the rest is full |
 | local-address slot (`TcpConn::local_slot`) | u16 | 65535 | `MAX_LOCAL_ADDRS` | modules/sdk/abi/config.rs | 4096 | `0xFFFF` is the wildcard slot. Demux is by hash index; 8 on wasm and embedded |
 | decision-seam hold (`pkt_id` slot) | u16 | 65535 | `MAX_PACKET_HOLD` | modules/sdk/abi/config.rs | 32 | One full frame per slot; an arrival past it is refused and counted, never displaces a held packet. 8 on wasm, 4 on embedded |
+| resolver cache entry (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_CACHE` | modules/sdk/abi/config.rs | 32 | Names held with their address until the answer's TTL runs out; a full table replaces the entry nearest its expiry. One entry is a 64-byte name plus address and expiry (~76 B). 32 on wasm, 4 on embedded |
+| resolver pending dial (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_PENDING` | modules/sdk/abi/config.rs | 8 | Dials parked on a name lookup in flight; two dials of one name share one entry's query. One past the table is refused `EAGAIN` until an answer or timeout frees an entry. 8 on wasm, 4 on embedded |
 | contract class (`required_caps` bitmask, fmod header) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the header's `required_caps`. Registration past the ceiling is refused EINVAL, and a dispatch id at or past it is refused ENOSYS by `check_contract_grant` before either capability gate |
 | contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 28 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `STREAM_CLOCK` = 0x1C, leaving 0x1D–0x3F (35 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
@@ -63,11 +65,31 @@ means editing its row here in the same change.
 | fat32 long-name length | `LFN_MAX_CHARS` | modules/foundation/fat32/mod.rs | 64 | Policy: the format allows 255, but a buffer for that is carried in the directory cursor and in every wanted-name argument, on a board whose whole module state is measured against a 256 KiB arena. A longer name is refused at creation, not clipped. Names longer than this that were written elsewhere are still preserved and retired correctly — preservation walks the companion run without decoding it, so only matching and generation are bounded |
 | fat32 free-cluster scan | `FAT_SCAN_BUDGET_SECTORS` | modules/foundation/fat32/mod.rs | 32 | Policy: FAT sectors one `provider_call` reads looking for a free cluster before returning EAGAIN with its cursor saved. Matches `DIR_SCAN_BUDGET_SECTORS` for the same reason — a synchronous device read inside a dispatch is charged to the cooperative step budget, and the FAT of a large volume is far too big to walk in one |
 | fat32 outstanding fences | `MAX_FENCES` | modules/foundation/fat32/mod.rs | — | Policy: equals `MAX_OPEN_FILES`. A fence table smaller than the handle table would let a consumer open a handle it cannot fence, which reads as a durability failure rather than a resource limit. `FSYNC_SUBMIT` past the table is refused EAGAIN (backpressure) |
+| resolver name held | `DNS_NAME_CAP` | modules/foundation/ip/mod.rs | 64 | Policy: the longest name the stub resolver holds, in a cache entry and in a pending dial. It is what bounds those tables on an MCU-class profile, so a dial naming something longer is refused EINVAL rather than truncated to a name that resolves to somewhere else |
+| OTA registry authority | `MAX_AUTHORITY_LEN` | modules/foundation/ota_registry/mod.rs | 128 | Policy: the `host[:port]` the puller dials and sends as `Host:`. A longer one is refused at construction, naming the parameter — a truncated authority would dial a different registry |
+| TLS/DTLS peer certificate | `MAX_CERT_LEN` | modules/foundation/tls/mod.rs | 2048 | Policy: the longest single certificate the module retains — each trust anchor, and the leaf inside a configured chain. An anchor past it refuses the instance rather than being stored truncated, because a truncated certificate is one that verifies nothing |
+| TLS/DTLS presented chain | `MAX_CERT_CHAIN_BYTES` | modules/foundation/tls/mod.rs | 3072 | Policy: the leaf plus whatever issuers it needs to reach the peer's anchor, as concatenated DER. A bare leaf is the one-element case |
+| TLS/DTLS identity key | `MAX_KEY_LEN` | modules/foundation/tls/mod.rs | 2400 | Policy: a PKCS#1 RSAPrivateKey of 4096 bits with its CRT fields is about 2.4 KB, and a PKCS#8 P-256 key is under 200 bytes, so this admits the largest identity the module signs with |
+| TLS expected DNS identity | `MAX_EXPECTED_DNS` | modules/foundation/tls/mod.rs | 64 | Policy: a DNS name may be 253 octets, but this profile's names are service names in a configured deployment and the buffer is per-instance module state on targets that count kilobytes |
+| TLS expected URI SAN | `MAX_EXPECTED_URI` | modules/foundation/tls/mod.rs | 256 | Policy: a SPIFFE ID is a trust domain plus a path and runs longer than a hostname, so it gets its own bound rather than borrowing the DNS one and silently truncating |
+| DTLS client authority | `DTLS_AUTHORITY_MAX` | modules/foundation/tls/mod.rs | 64 | Policy: the `host[:port]` a DTLS client dials, held as text until construction judges it. Longer is refused with the parameter named, because a truncated authority is a different peer |
+| DTLS peer sessions | `MAX_PEERS` | modules/foundation/tls/mod.rs | 4 | Policy: a peer carries its own handshake driver and reassembly buffer, ~29 KiB on a 32-bit core; 1 on embedded, where the arena holds one beside the stream session |
+| DTLS datagram payload | `DGRAM_MAX` | modules/foundation/tls/mod.rs | 1500 | Policy: one link MTU, so a DTLS record the module emits never relies on IP fragmentation to arrive |
+| DTLS retransmit flight | `MAX_FLIGHT_RECORDS` | modules/foundation/tls/mod.rs | 8 | Policy: a full TLS 1.3 server flight is at most 5 records (ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished); 8 gives headroom for HelloRetryRequest and certificate-request flows |
+| TLS compatibility CCS per session | `MAX_COMPAT_CCS` | modules/foundation/tls/mod.rs | 2 | Policy: a TLS 1.3 peer sends at most one, immediately after its first flight, and the second is slack for a HelloRetryRequest exchange. Beyond that a ChangeCipherSpec stream is work an unauthenticated peer can ask for |
+| TLS inbound record buffer | `RECV_BUF_SIZE` | modules/foundation/tls/mod.rs | 16704 | Policy: a client-mode session pulling bulk data must buffer one full 16 KiB record or no record ever decrypts. 4096 on the small-SRAM targets, whose deployments are server-side with small inbound records |
+| TLS retransmission window | `RETX_BUF_SIZE` | modules/foundation/tls/mod.rs | 4096 | Policy: the encrypted frames TLS has written to `cipher_out`, retained so `MSG_RETRANSMIT` replays them without re-encryption |
+| TLS inbound frames per step | `TLS_INBOUND_DRAIN_BUDGET` | modules/foundation/tls/mod.rs | 8 | Policy: deliberately below `ip`'s 32 RX budget. A larger drain lengthens every step, which costs the latency-bound paths — single-connection keepalive throughput is 1/latency and handshakes are round-trip bound — and buys nothing once the queue is cleared each tick |
+| QUIC peer authority | `MAX_AUTHORITY` | modules/foundation/quic/mod.rs | — | Policy: `MAX_PEER_NAME` plus `:65535`. The instance keeps one peer authority; a longer one is refused at construction |
+| QUIC peer name | `MAX_PEER_NAME` | modules/foundation/quic/mod.rs | 64 | Policy: the longest DNS name a QUIC peer may be dialled by, and the SNI and `dNSName` the handshake checks. The datagram surface carries up to 253 bytes; the module sizes this for the state budget and refuses rather than truncates, because a clipped name verifies against the wrong certificate |
+| QUIC peer certificate | `MAX_CERT_LEN` | modules/foundation/quic/mod.rs | 1024 | Policy: the per-certificate ceiling for the configured leaf and each trust anchor. An anchor past it, or a ninth anchor, marks the table refused and the instance declines to construct |
+| QUIC configured ALPN list | `MAX_ALPN_CFG` | modules/foundation/quic/mod.rs | 64 | Policy: the comma-separated protocol tokens a graph configures (`mqtt,h3`); 64 bytes holds several names with their separators |
+| QUIC resumption tickets | `MAX_TICKETS` | modules/foundation/quic/mod.rs | 4 | Policy: the client-side ticket cache. Each entry is bound to the authority that issued it, so the table holds a handful of recently dialled peers and the oldest is displaced rather than grown |
 | DNS pending forwarded queries | `MAX_PENDING` | modules/foundation/dns/mod.rs | 8 | Policy: with every slot live and unexpired, a new query is answered SERVFAIL rather than displacing accepted work |
 | DNS configured host entries | `MAX_HOSTS` | modules/foundation/dns/mod.rs | 16 | Policy: `host=` parameters past the table are ignored at parse |
-| DNS domain name length | `MAX_NAME_LEN` | modules/foundation/dns/mod.rs | 255 | The RFC 1035 full-name ceiling; a longer QNAME is refused at parse. Distinct from the 63-byte per-label ceiling (`MAX_LABEL_LEN`) |
-| DNS compression-pointer hops per name | `MAX_NAME_PTR_HOPS` | modules/foundation/dns/mod.rs | 16 | Sanity: pointers must also point backwards, so a cycle is refused by direction first; the hop bound is the second line. A name past it is malformed |
-| DNS records examined per section | `MAX_SECTION_RRS` | modules/foundation/dns/mod.rs | 32 | Sanity: an upstream answer or UPDATE section claiming more is refused rather than walked |
+| DNS domain name length | `MAX_NAME_LEN` | modules/sdk/contracts/net/dns_wire.rs | 255 | The RFC 1035 full-name ceiling; a longer QNAME is refused at parse. Distinct from the 63-byte per-label ceiling (`MAX_LABEL_LEN`) |
+| DNS compression-pointer hops per name | `MAX_NAME_PTR_HOPS` | modules/sdk/contracts/net/dns_wire.rs | 16 | Sanity: pointers must also point backwards, so a cycle is refused by direction first; the hop bound is the second line. A name past it is malformed |
+| DNS records examined per section | `MAX_SECTION_RRS` | modules/sdk/contracts/net/dns_wire.rs | 32 | Sanity: an upstream answer or UPDATE section claiming more is refused rather than walked |
 | DNS64 alias hops | `MAX_CNAME_HOPS` | modules/foundation/dns/mod.rs | 4 | Policy: a CNAME chain past it is refused SERVFAIL; loops are detected within it |
 | DNS64 alias-chain bytes per pending slot | `MAX_CHAIN_BYTES` | modules/foundation/dns/mod.rs | 384 | Policy: the re-encoded chain preserved into the synthesized answer; a chain that does not fit is refused SERVFAIL |
 | DNS64 synthesized addresses per answer | `MAX_SYNTH_ADDRS` | modules/foundation/dns/mod.rs | 8 | Policy: A records of the terminal owner past it are not translated |
@@ -202,6 +224,10 @@ MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8
 MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 32
 MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 8
 MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 4
+MAX_DNS_CACHE | modules/sdk/abi/config.rs | 32
+MAX_DNS_CACHE | modules/sdk/abi/config.rs | 4
+MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8
+MAX_DNS_PENDING | modules/sdk/abi/config.rs | 4
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64
 CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 28
 MAX_MODULES | modules/sdk/abi/config.rs | 192
@@ -256,11 +282,33 @@ DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32
 LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64
 FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32
 MAX_FENCES | modules/foundation/fat32/mod.rs | MAX_OPEN_FILES
+DNS_NAME_CAP | modules/foundation/ip/mod.rs | 64
+MAX_AUTHORITY_LEN | modules/foundation/ota_registry/mod.rs | 128
+MAX_CERT_LEN | modules/foundation/tls/mod.rs | 2048
+MAX_CERT_CHAIN_BYTES | modules/foundation/tls/mod.rs | 3072
+MAX_KEY_LEN | modules/foundation/tls/mod.rs | 2400
+MAX_EXPECTED_DNS | modules/foundation/tls/mod.rs | 64
+MAX_EXPECTED_URI | modules/foundation/tls/mod.rs | 256
+DTLS_AUTHORITY_MAX | modules/foundation/tls/mod.rs | 64
+MAX_PEERS | modules/foundation/tls/mod.rs | 4
+MAX_PEERS | modules/foundation/tls/mod.rs | 1
+DGRAM_MAX | modules/foundation/tls/mod.rs | 1500
+MAX_FLIGHT_RECORDS | modules/foundation/tls/mod.rs | 8
+MAX_COMPAT_CCS | modules/foundation/tls/mod.rs | 2
+RECV_BUF_SIZE | modules/foundation/tls/mod.rs | 16704
+RECV_BUF_SIZE | modules/foundation/tls/mod.rs | 4096
+RETX_BUF_SIZE | modules/foundation/tls/mod.rs | 4096
+TLS_INBOUND_DRAIN_BUDGET | modules/foundation/tls/mod.rs | 8
+MAX_AUTHORITY | modules/foundation/quic/mod.rs | MAX_PEER_NAME + 6
+MAX_PEER_NAME | modules/foundation/quic/mod.rs | 64
+MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024
+MAX_ALPN_CFG | modules/foundation/quic/mod.rs | 64
+MAX_TICKETS | modules/foundation/quic/mod.rs | 4
 MAX_PENDING | modules/foundation/dns/mod.rs | 8
 MAX_HOSTS | modules/foundation/dns/mod.rs | 16
-MAX_NAME_LEN | modules/foundation/dns/mod.rs | 255
-MAX_NAME_PTR_HOPS | modules/foundation/dns/mod.rs | 16
-MAX_SECTION_RRS | modules/foundation/dns/mod.rs | 32
+MAX_NAME_LEN | modules/sdk/contracts/net/dns_wire.rs | 255
+MAX_NAME_PTR_HOPS | modules/sdk/contracts/net/dns_wire.rs | 16
+MAX_SECTION_RRS | modules/sdk/contracts/net/dns_wire.rs | 32
 MAX_CNAME_HOPS | modules/foundation/dns/mod.rs | 4
 MAX_CHAIN_BYTES | modules/foundation/dns/mod.rs | 384
 MAX_SYNTH_ADDRS | modules/foundation/dns/mod.rs | 8
@@ -372,6 +420,14 @@ protocol constants, mirrors of a registered symbol — are retired from
 the coverage report here, each with the reason it is not a row.
 
 ```limit-register-exempt
+NET_CMD_RECORD_CAPACITY | modules/foundation/tls/mod.rs | derived: the frame scratch less overhead, capped by net_proto MAX_CMD_DATA
+CLEAR_CHUNK_MAX | modules/foundation/tls/mod.rs | derived: the record payload budget of NET_CMD_RECORD_CAPACITY
+HS_FRAGMENT_MAX | modules/foundation/tls/mod.rs | derived: the same budget less the appended ChangeCipherSpec record
+WIRE_RECORD_MAX | modules/foundation/tls/mod.rs | derived: equals NET_CMD_RECORD_CAPACITY; sizes the record staging buffers
+NET_SCRATCH_SIZE | modules/foundation/tls/mod.rs | scratch: one net frame around one TLS record
+MAX_KEY_LEN | modules/foundation/quic/mod.rs | mirror of the registered tls MAX_KEY_LEN, so a key_file shared between them packs identically
+MUX_DATA_MAX | modules/foundation/quic/mod.rs | derived: mux::MUX_QUIC_STREAM_RX_MAX, the contract's published bound
+NET_BUF_SIZE | modules/foundation/quic/mod.rs | scratch: one net frame around one QUIC packet
 STATE_ARENA_SIZE | src/kernel/module/loader.rs | mirror of the registered modules/sdk/abi/config.rs ceiling, re-exported for the loader
 RSA_BYTES_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in bytes
 RSA_LIMBS_MAX | modules/sdk/crypto/rsa.rs | derived: RSA_MODULUS_BITS_MAX in limbs of the target's word
@@ -380,7 +436,7 @@ BUF_SIZE | modules/drivers/rp1_gem/mod.rs | DMA scratch sized by the ring, not a
 MAX_FRAME | modules/drivers/rp1_gem/mod.rs | Ethernet frame size, a protocol constant (MTU + headers)
 STATE_SIZE | modules/drivers/rp1_gem/mod.rs | size_of the driver state, not a ceiling
 NET_BUF_SIZE | modules/foundation/dns/mod.rs | scratch: one net frame around one DNS packet
-MAX_LABEL_LEN | modules/foundation/dns/mod.rs | RFC 1035 label length, a protocol constant
+MAX_LABEL_LEN | modules/sdk/contracts/net/dns_wire.rs | RFC 1035 label length, a protocol constant
 MAX_ZONE_PATH | modules/foundation/dns/mod.rs | path scratch for the committed-generation file name
 ZONE_RECORD_MAX | modules/foundation/dns/mod.rs | derived from the registered zone name and rdata ceilings
 MAX_ZONE_FILE | modules/foundation/dns/mod.rs | derived from ZONE_RECORD_MAX and the registered record count

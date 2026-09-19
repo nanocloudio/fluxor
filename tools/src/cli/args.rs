@@ -416,6 +416,16 @@ enum Commands {
         /// by `fluxor inspect`.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Print the displacement report — which manifests this publish
+        /// would move off their tags, and which checkouts on this
+        /// machine still pin them — and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Refuse the publish if it would displace a manifest another
+        /// checkout pins. Their pins stay resolvable either way; this is
+        /// for a release publish that wants no stale consumers at all.
+        #[arg(long)]
+        strict_pins: bool,
     },
 
     /// Advance `fluxor.lock` pins: resolve every declared

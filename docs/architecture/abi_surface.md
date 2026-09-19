@@ -132,12 +132,25 @@ different questions. Confusing two of them is the usual source of surprise:
 | ABI surface digest (`io.fluxor.abi-surface`, "the epoch") | Can these bytes interoperate? | the module↔kernel interface changes |
 | `CONTRACTS_PLATFORM_SRC_HASH` | — (an input to the epoch, never consulted alone) | any token under `modules/sdk/` or `contracts/src/` |
 | input digest (`io.fluxor.input-digest`) | Are these bytes current? | any source the artefact is built from changes |
-| provenance stamp (`io.fluxor.provenance`) | Where did these bytes come from? | set to `local-build` or `published` at publish; local builds also carry `io.fluxor.source-rev` |
+| content address (lock `content` field) | Do two manifests deliver the same artefact? | the layer bytes change |
+| provenance record (store `provenance/` table) | Where did these bytes come from? | never — it is appended to, and lives BESIDE the manifest so re-stamping it cannot move the digest |
 | blob digest (`sha256:…`) | Are these the bytes I asked for? | the bytes change (content addressing) |
 
 The input digest uses the same token-canonical hashing as the src pin, but
 over the artefact's own inputs; it is the per-artefact staleness signal and
-the `workspace publish` work-list key.
+the `workspace publish` work-list key. It is **not** a content address: it
+covers the artefact's declared sources, not the toolchain or the catalog,
+so two artefacts with different bytes can share one. When the question is
+"is this the same artefact?", the layer digests answer it and the input
+digest does not.
+
+Provenance (`local-build` vs `published`, the git revision, the ci digest)
+is a store-side table keyed by manifest digest, read by `fluxor store ls`
+and `fluxor inspect` — see `docs/guides/publishing.md`. It is deliberately
+not a manifest annotation: `source-rev` changes on every commit, so
+stamping it into the manifest would rewrite the manifest and move the
+digest every downstream `fluxor.lock` pins, whether or not a module had
+changed.
 
 ## How a change propagates
 

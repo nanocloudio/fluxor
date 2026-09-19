@@ -136,10 +136,17 @@ Source: `modules/foundation/tls/dtls_record.rs`,
 DTLS 1.3 (RFC 9147) is a mode of the `tls` module, not a separate
 module. The `transport` param (id 4) selects it: `0` runs TLS records
 over a stream channel, `1` runs DTLS records over a datagram channel.
-Companion params: `dtls_port` (id 5, default 4433), `dtls_peer_ip`
-(id 6), `dtls_peer_port` (id 7). Both roles are implemented: the
-server accepts sessions demultiplexed per peer 4-tuple, and the client
-dials `dtls_peer_ip:dtls_peer_port`.
+Companion params: `dtls_port` (id 5, default 4433) — the port the
+server binds — and `authority` (id 17), the peer a client dials,
+written `host[:port]` with port 4433 when it names none. It is a v4
+literal: a datagram session is keyed by the address its records arrive
+from, so a peer known only by name has nothing to key on until it
+answers, and `verify_hostname` is what names a peer reached by address.
+A stream instance (`transport: 0`) that names an `authority` is refused
+at construction: it takes each session's peer from the `CMD_CONNECT_TO`
+it forwards, so the parameter there would be a fact nothing reads.
+Both roles are implemented: the server accepts sessions demultiplexed
+per peer 4-tuple, and the client dials its authority.
 
 In DTLS mode the module keeps its `cipher_in` / `cipher_out` ports but
 speaks datagram-contract opcodes on them: it binds with `CMD_DG_BIND`

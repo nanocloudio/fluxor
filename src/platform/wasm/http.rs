@@ -156,6 +156,19 @@ unsafe fn alloc_state(
     raw
 }
 
+/// The `host[:port]` of an origin such as `https://api.example:8443`: what
+/// a record's trailing authority is compared against.
+fn origin_host(origin: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i + 2 < origin.len() {
+        if &origin[i..i + 3] == b"://" {
+            return &origin[i + 3..];
+        }
+        i += 1;
+    }
+    origin
+}
+
 /// Whether a path names a resource on the origin rather than a place of
 /// its own: it starts at the root and carries no scheme.
 fn path_ok(path: &[u8]) -> bool {
@@ -378,11 +391,36 @@ unsafe fn perform(st: &mut HttpState, total: usize) -> bool {
         return true;
     }
     st.extended = request.extended;
+    // Where the request goes. The record may name its authority in the
+    // trailing field: a connector whose `origin` is set dials that and
+    // refuses a record naming another host (a pinned client is pinned); a
+    // connector with no origin dials the record's, over https — the browser
+    // is the resolver, and the page's own cross-origin policy still applies.
+    let mut open_origin = [0u8; ORIGIN_MAX];
+    let (origin_ptr, origin_len) = if request.authority.is_empty() {
+        (st.origin.as_ptr(), st.origin_len as usize)
+    } else if st.origin_len > 0 {
+        if origin_host(&st.origin[..st.origin_len as usize]) != request.authority {
+            refuse(st, REFUSE_UNROUTABLE);
+            return true;
+        }
+        (st.origin.as_ptr(), st.origin_len as usize)
+    } else {
+        const SCHEME: &[u8] = b"https://";
+        let n = SCHEME.len() + request.authority.len();
+        if n > ORIGIN_MAX {
+            refuse(st, REFUSE_UNROUTABLE);
+            return true;
+        }
+        open_origin[..SCHEME.len()].copy_from_slice(SCHEME);
+        open_origin[SCHEME.len()..n].copy_from_slice(request.authority);
+        (open_origin.as_ptr(), n)
+    };
     let handle = host_http_open(
         method.as_ptr(),
         method.len(),
-        st.origin.as_ptr(),
-        st.origin_len as usize,
+        origin_ptr,
+        origin_len,
         request.path.as_ptr(),
         request.path.len(),
         request.headers.as_ptr(),

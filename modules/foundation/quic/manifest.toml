@@ -48,8 +48,6 @@ aead = "on_wire_sequence"
 # |-----|--------------------|------|---------|--------------------------------|
 # | 1   | port               | u16  | 4443    | UDP port to bind.              |
 # | 2   | mode               | u8   | 1       | 0 = client, 1 = server.        |
-# | 3   | peer_ip            | u32  | 127.0.0.1 | Client-mode peer IPv4 (LE).  |
-# | 4   | peer_port          | u16  | 4443    | Client-mode peer port.         |
 # | 5   | require_retry      | u8   | 0       | Server: demand a Retry token.  |
 # | 6   | enable_0rtt        | u8   | 0       | 0-RTT resumption + early data. |
 # | 9   | verify_peer        | u8   | 0       | Validate the peer cert chain.  |
@@ -59,6 +57,11 @@ aead = "on_wire_sequence"
 # | 15  | ecdh_bits_per_step | u16  | 256     | P-256 ladder chunk per step.   |
 # | 16  | ticket_rotate_s    | u32  | 3600    | Ticket-sealing key rotation.   |
 # | 17  | key_update_pkts    | u32  | 0       | RFC 9001 §6 key-update knob: initiate a 1-RTT key update after this many packets in the current phase (0 = never), once the handshake is confirmed and any prior update is acknowledged. Reservations are not reset on key update (§8.3). |
+# | 20  | authority          | str  | 127.0.0.1:4443 | Client-mode peer as `host[:port]`: a DNS name the datagram provider resolves, or a dotted-quad v4 literal; port defaults to 4443. The one address-bearing client parameter: where datagrams go, the SNI the ClientHello carries (a name only), the identity the peer's certificate must hold (dNSName for a name, iPAddress for a literal), and the key a session ticket resumes under. A v6 literal is refused at construction (the datagram surface is v4-only). |
+#
+# Extended tag 13 `verify_hostname` is the override: when set it is the SNI
+# and the expected dNSName regardless of `authority` (a proxy, or a pinned
+# host reached by address).
 
 [[ports]]
 name = "net_in"

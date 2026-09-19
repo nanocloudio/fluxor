@@ -309,8 +309,7 @@ wiring = [
 #   platform:
 #     debug:
 #       export_telemetry: otlp-http
-#       export_otlp_ip: 3232238090     # collector IPv4 as a decimal u32
-#       # export_otlp_port: 4318
+#       export_otlp_authority: collector.example:4318   # host[:port]; port 4318 when omitted
 #       # export_flush_ms: 1000
 [[overlay]]
 match = { export_telemetry = "otlp-http", family = "bcm" }
@@ -326,8 +325,7 @@ modules = [
   { name = "otlp_client", type = "http", variant = "exchange", require_distinct = true, params = {
       mode           = "1",
       protocol       = "0",
-      host_ip        = "user:export_otlp_ip|host:debug.otlp_ip|required",
-      port           = "user:export_otlp_port|host:debug.otlp_port|4318",
+      authority      = "user:export_otlp_authority|host:debug.otlp_authority|required",
       content_type   = "application/x-protobuf",
       surface_status = "1",
   } },
@@ -355,8 +353,7 @@ modules = [
   { name = "otlp_client", type = "http", variant = "exchange", require_distinct = true, params = {
       mode           = "1",
       protocol       = "0",
-      host_ip        = "user:export_otlp_ip|host:debug.otlp_ip|required",
-      port           = "user:export_otlp_port|host:debug.otlp_port|4318",
+      authority      = "user:export_otlp_authority|host:debug.otlp_authority|required",
       content_type   = "application/x-protobuf",
       surface_status = "1",
   } },

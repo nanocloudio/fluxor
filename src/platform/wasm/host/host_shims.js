@@ -3264,8 +3264,13 @@ registerProcessor('pcm-ring', PcmRing);
     // That is why it is short. A backend that re-checked the contract would be
     // a second implementation of it, and the two would disagree.
     const svcBuffers = new Map();   // slot -> GPUBuffer
+    const svcTextures = new Map();  // slot -> { texture, format, width, height }
+    // Depth attachments are pass-local: nothing outside a pass names, binds,
+    // copies or reads one back, so they are kept here by extent and reused
+    // rather than allocated per pass.
+    const svcDepths = new Map();    // "w,h" -> GPUTexture
     const svcModules = new Map();   // slot -> { module, entry }
-    const svcPipelines = new Map(); // slot -> { pipeline | null, state }
+    const svcPipelines = new Map(); // slot -> { pipeline | null, state, raster }
     const svcTickets = new Map();   // ticket -> { state, error }
     const svcReads = new Map();     // ticket -> { staging, span, lead, len, state }
     // 0 pending, 1 done, <0 failed — the same three answers everywhere here,
@@ -3351,9 +3356,48 @@ registerProcessor('pcm-ring', PcmRing);
         } catch (e) { console.error('[gpu.service] buffer', slot, e.message); return -3; }
       },
 
+      // A texture is a texture: a buffer can be neither a render attachment
+      // nor sampled, so a resource of texture kind gets a GPUTexture.
+      //
+      // The format numbers are the contract's FORMAT_* enumeration, not
+      // WebGPU's names: one allocation, so a consumer can target this backend
+      // and the native one with the same request.
+      host_gpu_service_create_texture: (slot, width, height, format, usage) => {
+        const d = gpuService.device;
+        if (!d) return -1;
+        const FORMATS = {
+          1: 'rgba8unorm', 2: 'rgba8unorm-srgb', 3: 'bgra8unorm',
+          4: 'bgra8unorm-srgb', 5: 'depth32float', 6: 'r32uint',
+        };
+        const fmt = FORMATS[format >>> 0];
+        // A format outside the contract's enumeration is refused with the
+        // number rather than substituted: a target silently created in
+        // another format draws the wrong colours and reads back wrong bytes.
+        if (!fmt) { console.error('[gpu.service] texture', slot, 'bad format', format); return -3; }
+        try {
+          let u = GPUTextureUsage.COPY_DST;
+          if (usage & 256) u |= GPUTextureUsage.TEXTURE_BINDING;
+          if (usage & 512) u |= GPUTextureUsage.RENDER_ATTACHMENT;
+          if (usage & 1) u |= GPUTextureUsage.STORAGE_BINDING;
+          if (usage & (32 | 128)) u |= GPUTextureUsage.COPY_SRC;
+          const existing = svcTextures.get(slot >>> 0);
+          if (existing) existing.texture.destroy();
+          const texture = d.createTexture({
+            size: { width: width >>> 0, height: height >>> 0, depthOrArrayLayers: 1 },
+            format: fmt, usage: u,
+          });
+          svcTextures.set(slot >>> 0, {
+            texture, format: fmt, width: width >>> 0, height: height >>> 0,
+          });
+          return 0;
+        } catch (e) { console.error('[gpu.service] texture', slot, e.message); return -3; }
+      },
+
       host_gpu_service_destroy: (slot) => {
         const b = svcBuffers.get(slot >>> 0);
         if (b) { b.destroy(); svcBuffers.delete(slot >>> 0); }
+        const t = svcTextures.get(slot >>> 0);
+        if (t) { t.texture.destroy(); svcTextures.delete(slot >>> 0); }
         return 0;
       },
 
@@ -3399,6 +3443,79 @@ registerProcessor('pcm-ring', PcmRing);
           svcPipelines.set(key, { pipeline: null, state: -3 });
         });
         return 0;
+      },
+      // A raster pipeline, from the contract's RasterState blob. The wire
+      // decoded and validated it before it got here — formats allocated,
+      // attributes inside the stride, no duplicate locations, depth state
+      // consistent with its attachment — so this reads it and does not
+      // re-check it. A second validator would be a second thing to get wrong.
+      host_gpu_service_raster_pipeline: (slot, programSlot, statePtr, stateLen) => {
+        const d = gpuService.device;
+        const m = svcModules.get(programSlot >>> 0);
+        if (!d || !m) return -1;
+        const key = slot >>> 0;
+        try {
+          const b = kview(statePtr, stateLen);
+          const dv = new DataView(b.buffer, b.byteOffset, stateLen);
+          const FORMATS = {
+            0: null, 1: 'rgba8unorm', 2: 'rgba8unorm-srgb', 3: 'bgra8unorm',
+            4: 'bgra8unorm-srgb', 5: 'depth32float', 6: 'r32uint',
+          };
+          const VATTR = {
+            1: 'float32', 2: 'float32x2', 3: 'float32x3', 4: 'float32x4',
+            5: 'uint32', 6: 'uint32x2', 7: 'uint32x4', 8: 'unorm8x4',
+          };
+          const colour = FORMATS[dv.getUint32(0, true)];
+          const depthFmt = FORMATS[dv.getUint32(4, true)];
+          const stride = dv.getUint32(8, true);
+          const topology = ['', 'triangle-list', 'triangle-strip', 'line-list', 'point-list'][dv.getUint8(12)];
+          const cull = ['none', 'back', 'front'][dv.getUint8(13)];
+          const front = dv.getUint8(14) === 1 ? 'cw' : 'ccw';
+          const blend = dv.getUint8(15) === 1 ? {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          } : undefined;
+          const compare = ['always', 'less', 'less-equal', 'greater'][dv.getUint8(16)];
+          const depthWrite = dv.getUint8(17) === 1;
+          const nattr = dv.getUint16(18, true);
+          const attributes = [];
+          for (let i = 0; i < nattr; i++) {
+            const at = 24 + i * 8;
+            attributes.push({
+              shaderLocation: dv.getUint16(at, true),
+              format: VATTR[dv.getUint16(at + 2, true)],
+              offset: dv.getUint32(at + 4, true),
+            });
+          }
+          // A pipeline with no attributes declares no vertex buffer at all,
+          // rather than one of stride zero, so a shader generating its own
+          // positions needs no dummy geometry bound.
+          const buffers = attributes.length
+            ? [{ arrayStride: stride, stepMode: 'vertex', attributes }] : [];
+          svcPipelines.set(key, { pipeline: null, state: SVC_PENDING, raster: true });
+          d.createRenderPipelineAsync({
+            layout: 'auto',
+            vertex: { module: m.module, entryPoint: m.entry, buffers },
+            primitive: { topology, cullMode: cull, frontFace: front },
+            depthStencil: depthFmt
+              ? { format: depthFmt, depthWriteEnabled: depthWrite, depthCompare: compare }
+              : undefined,
+            // The fragment entry shares the vertex entry's module and is
+            // found by being the only one: the contract's program envelope
+            // names a single entry point, and splitting it would need a
+            // second manifest field rather than a convention invented here.
+            fragment: { module: m.module, targets: [{ format: colour, blend }] },
+          }).then((pipeline) => {
+            svcPipelines.set(key, { pipeline, state: SVC_DONE, raster: true, colour, depth: !!depthFmt });
+          }).catch((e) => {
+            console.error('[gpu.service] raster pipeline', key, 'failed:', e.message);
+            svcPipelines.set(key, { pipeline: null, state: -3, raster: true });
+          });
+          return 0;
+        } catch (e) {
+          console.error('[gpu.service] raster pipeline', key, e.message);
+          return -3;
+        }
       },
       host_gpu_service_poll_pipeline: (slot) => {
         const e = svcPipelines.get(slot >>> 0);
@@ -3456,6 +3573,98 @@ registerProcessor('pcm-ring', PcmRing);
               const s = svcBuffers.get(src), t = svcBuffers.get(dst);
               if (!s || !t) throw new Error('unknown copy slot');
               enc.copyBufferToBuffer(s, so, t, dof, len);
+            } else if (op === 0x03) { // BEGIN_PASS
+              const target = dv.getUint16(off, true); off += 2;
+              const flags = dv.getUint32(off, true); off += 4;
+              const clear = dv.getUint32(off, true); off += 4;
+              if (pass) { pass.end(); pass = null; }
+              const t = svcTextures.get(target);
+              if (!t) throw new Error('unknown target slot ' + target);
+              // One RGBA8 texel, low byte red — the order FORMAT_RGBA8_UNORM
+              // names. No sRGB conversion here: the target format decides
+              // that, and applying it twice washes the clear out.
+              const ch = (sh) => ((clear >>> sh) & 0xFF) / 255;
+              let depthAttachment;
+              if (flags & 0x2) { // PASS_DEPTH
+                const dk = t.width + ',' + t.height;
+                let dtex = svcDepths.get(dk);
+                if (!dtex) {
+                  dtex = d.createTexture({
+                    size: { width: t.width, height: t.height, depthOrArrayLayers: 1 },
+                    format: 'depth32float',
+                    usage: GPUTextureUsage.RENDER_ATTACHMENT,
+                  });
+                  svcDepths.set(dk, dtex);
+                }
+                depthAttachment = {
+                  view: dtex.createView(),
+                  // Far plane. A reversed-Z consumer asks for DEPTH_GREATER
+                  // and clears to the same value; the comparison is the
+                  // caller's, the clear value is not.
+                  depthLoadOp: (flags & 0x4) ? 'clear' : 'load',
+                  depthClearValue: 1.0,
+                  depthStoreOp: 'store',
+                };
+              }
+              pass = enc.beginRenderPass({
+                colorAttachments: [{
+                  view: t.texture.createView(),
+                  loadOp: (flags & 0x1) ? 'clear' : 'load',
+                  clearValue: { r: ch(0), g: ch(8), b: ch(16), a: ch(24) },
+                  storeOp: 'store',
+                }],
+                depthStencilAttachment: depthAttachment,
+              });
+              pass.__raster = true;
+            } else if (op === 0x04) { // DRAW
+              const pipeSlot = dv.getUint16(off, true); off += 2;
+              const nbind = dv.getUint16(off, true); off += 2;
+              const entries = [];
+              for (let i = 0; i < nbind; i++) {
+                const binding = dv.getUint32(off, true); off += 4;
+                const bufSlot = dv.getUint16(off, true); off += 2;
+                off += 2; // pad
+                const boff = Number(dv.getBigUint64(off, true)); off += 8;
+                const bsize = Number(dv.getBigUint64(off, true)); off += 8;
+                const b = svcBuffers.get(bufSlot);
+                if (!b) throw new Error('unknown buffer slot ' + bufSlot);
+                entries.push({ binding, resource: { buffer: b, offset: boff, size: bsize } });
+              }
+              const vSlot = dv.getUint16(off, true); off += 2; off += 2;
+              const vOff = Number(dv.getBigUint64(off, true)); off += 8;
+              const vLen = Number(dv.getBigUint64(off, true)); off += 8;
+              const iSlot = dv.getUint16(off, true); off += 2; off += 2;
+              const iOff = Number(dv.getBigUint64(off, true)); off += 8;
+              const iLen = Number(dv.getBigUint64(off, true)); off += 8;
+              const first = dv.getUint32(off, true); off += 4;
+              const count = dv.getUint32(off, true); off += 4;
+              const instances = dv.getUint32(off, true); off += 4;
+              if (!pass || !pass.__raster) throw new Error('draw outside a render pass');
+              const pe = svcPipelines.get(pipeSlot);
+              if (!pe || !pe.pipeline) throw new Error('pipeline ' + pipeSlot + ' not ready');
+              pass.setPipeline(pe.pipeline);
+              if (entries.length) {
+                // A program declaring no bindings has no group 0, and asking
+                // for its layout is itself an error rather than a no-op.
+                pass.setBindGroup(0, d.createBindGroup({
+                  layout: pe.pipeline.getBindGroupLayout(0), entries,
+                }));
+              }
+              const vb = svcBuffers.get(vSlot);
+              if (!vb) throw new Error('unknown vertex slot ' + vSlot);
+              // Geometry a dispatch in an earlier submission wrote is bound
+              // here directly: one buffer, both usages, no CPU detour.
+              pass.setVertexBuffer(0, vb, vOff, vLen);
+              if (iSlot !== 0xFFFF) {
+                const ib = svcBuffers.get(iSlot);
+                if (!ib) throw new Error('unknown index slot ' + iSlot);
+                pass.setIndexBuffer(ib, 'uint32', iOff, iLen);
+                pass.drawIndexed(count, instances, first, 0, 0);
+              } else {
+                pass.draw(count, instances, first, 0);
+              }
+            } else if (op === 0x05) { // END_PASS
+              if (pass) { pass.end(); pass = null; }
             } else {
               throw new Error('bad exec op ' + op);
             }
@@ -3486,9 +3695,10 @@ registerProcessor('pcm-ring', PcmRing);
       host_gpu_service_release_ticket: (ticket) => { svcTickets.delete(ticket >>> 0); return 0; },
 
       // Async readback. The first call for a ticket starts copy+map and
-      // answers PENDING; a later one, once mapped, copies into `outPtr` and
-      // answers the byte count. Never blocks, because a blocking map here
-      // would stall every other consumer of the shared device.
+      // answers -1 — not SVC_PENDING, which is 0 and indistinguishable from
+      // a zero byte count; a later one, once mapped, copies into `outPtr`
+      // and answers the byte count. Never blocks, because a blocking map
+      // here would stall every other consumer of the shared device.
       host_gpu_service_readback: (ticket, slot, offset, outPtr, len) => {
         const d = gpuService.device;
         if (!d) return -1;

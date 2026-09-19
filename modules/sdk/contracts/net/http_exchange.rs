@@ -41,6 +41,16 @@
 //   reader cannot tell a pause from an ending.
 //     [len:u16][bytes…]
 //
+//   Either request form may carry ONE optional trailing field after its
+//   last counted byte, the authority the request is for:
+//     […request…][auth_len:u8][authority…]
+//   Every counted field keeps its offset, so a producer that names no
+//   authority composes exactly the records above, and a reader with no use
+//   for the field stops at the last counted byte. An absent field means
+//   "the connector's own authority". A connector whose `authority` parameter is
+//   set dials that and refuses a record naming another (a pinned client is
+//   pinned); a connector with none set dials the record's, and is open.
+//
 // `headers` in both directions is a block as it goes on the wire, each line
 // ending CRLF.
 
@@ -69,7 +79,13 @@ pub struct Request<'a> {
     pub path: &'a [u8],
     pub headers: &'a [u8],
     pub body: &'a [u8],
+    /// The trailing authority field, `host[:port]`; empty when the record
+    /// carries none and the connector's own applies.
+    pub authority: &'a [u8],
 }
+
+/// Longest authority the trailing field carries: its length is one byte.
+pub const AUTHORITY_MAX: usize = 255;
 
 /// The ceilings a request is held to. They belong to the module rather than
 /// to the layout -- a consumer with more room is not reading a different
@@ -126,9 +142,21 @@ pub fn parse_request<'a>(payload: &'a [u8], limits: &Limits) -> RequestParse<'a>
     let path_at = head;
     let headers_at = path_at + path_len;
     let body_at = headers_at + headers_len;
-    if path_len == 0 || body_at + body_len != payload.len() {
+    let body_end = body_at + body_len;
+    if path_len == 0 || body_end > payload.len() {
         return RequestParse::Malformed;
     }
+    // The optional tail: nothing, or exactly one length-prefixed authority.
+    let authority = match payload.get(body_end..) {
+        Some([]) | None => &payload[0..0],
+        Some(tail) => {
+            let len = usize::from(tail[0]);
+            if len == 0 || tail.len() != 1 + len || !authority_ok(&tail[1..]) {
+                return RequestParse::Malformed;
+            }
+            &tail[1..]
+        }
+    };
     let Some(headers) = payload.get(headers_at..body_at) else {
         return RequestParse::Malformed;
     };
@@ -153,13 +181,21 @@ pub fn parse_request<'a>(payload: &'a [u8], limits: &Limits) -> RequestParse<'a>
         path,
         headers,
         body,
+        authority,
     })
+}
+
+/// Whether bytes may travel as the trailing authority: printable ASCII with
+/// no space, so a `Host:` line spliced from it cannot carry a second field.
+pub fn authority_ok(a: &[u8]) -> bool {
+    !a.is_empty() && a.len() <= AUTHORITY_MAX && a.iter().all(|&c| c > 0x20 && c < 0x7F)
 }
 
 /// Compose a request record into `out`, answering its length.
 ///
 /// `None` when `out` cannot hold it, which is the only way this can fail:
-/// every field is already bounded by the lengths it writes.
+/// every field is already bounded by the lengths it writes. Composes no
+/// trailing authority; [`write_request_to`] does.
 pub fn write_request(
     method: u8,
     extended: bool,
@@ -168,12 +204,34 @@ pub fn write_request(
     body: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
+    write_request_to(method, extended, path, headers, body, &[], out)
+}
+
+/// Compose a request record naming the authority it is for, into `out`,
+/// answering its length. An empty `authority` composes the plain record;
+/// one that [`authority_ok`] refuses is `None`.
+pub fn write_request_to(
+    method: u8,
+    extended: bool,
+    path: &[u8],
+    headers: &[u8],
+    body: &[u8],
+    authority: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
     let head = if extended {
         REQ_HEAD_EXTENDED
     } else {
         REQ_HEAD
     };
-    let total = head + path.len() + if extended { headers.len() } else { 0 } + body.len();
+    let tail = if authority.is_empty() {
+        0
+    } else if authority_ok(authority) {
+        1 + authority.len()
+    } else {
+        return None;
+    };
+    let total = head + path.len() + if extended { headers.len() } else { 0 } + body.len() + tail;
     if total > out.len()
         || path.len() > u16::MAX as usize
         || headers.len() > u16::MAX as usize
@@ -202,6 +260,19 @@ pub fn write_request(
         let end = at + field.len();
         match out.get_mut(at..end) {
             Some(slot) => slot.copy_from_slice(field),
+            None => return None,
+        }
+        at = end;
+    }
+    if tail > 0 {
+        // Written through the same bounds-checked shape as the fields above:
+        // a copy whose lengths the compiler cannot prove equal carries a
+        // panic path, and a module image links none.
+        out[at] = authority.len() as u8;
+        at += 1;
+        let end = at + authority.len();
+        match out.get_mut(at..end) {
+            Some(slot) => slot.copy_from_slice(authority),
             None => return None,
         }
         at = end;

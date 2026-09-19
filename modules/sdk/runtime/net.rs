@@ -279,6 +279,11 @@ const DG_AF_INET: u8 = abi::contracts::net::datagram::AF_INET;
 const DG_AF_INET6: u8 = abi::contracts::net::datagram::AF_INET6;
 #[allow(
     dead_code,
+    reason = "shared SDK helper; each including module uses a subset"
+)]
+const DG_AF_NAME: u8 = abi::contracts::net::datagram::AF_NAME;
+#[allow(
+    dead_code,
     reason = "re-exported datagram surface; each consumer uses a subset"
 )]
 const DG_OWNER_TAG_MARK: u8 = abi::contracts::net::datagram::OWNER_TAG_MARK;
@@ -335,6 +340,76 @@ unsafe fn dev_dg_send_to_v4(
         scratch,
         scratch_max,
     )
+}
+
+/// Send one datagram to a NAMED destination on the datagram surface, owner
+/// tagged: `[ep_id]([MARK][owner_tag])?[af = 1][len][name…][port: u16 LE][data…]`.
+/// The provider resolves the name; a name it does not yet hold starts a
+/// lookup and drops this datagram, so callers retransmit as on loss.
+/// Returns the frame length written, or `0` when the name is not one the
+/// surface carries, the scratch is too small, or the channel refused.
+#[allow(
+    dead_code,
+    reason = "shared SDK helper; each including module uses a subset"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an addressed datagram send is destination plus payload plus scratch"
+)]
+unsafe fn dev_dg_send_to_name_owned(
+    sys: &SyscallTable,
+    chan: i32,
+    ep_id: u8,
+    owner_tag: u16,
+    name: &[u8],
+    dst_port: u16,
+    data: *const u8,
+    data_len: usize,
+    scratch: *mut u8,
+    scratch_max: usize,
+) -> usize {
+    if chan < 0 || ep_id == 0xFF || name.is_empty() || name.len() > 253 {
+        return 0;
+    }
+    let tag_len = if owner_tag == 0 {
+        0
+    } else {
+        DG_OWNER_TAG_FIELD
+    };
+    // [ep_id][af][len][name…][port:2]
+    let prefix = 1 + 1 + 1 + name.len() + 2;
+    let body_len = prefix + tag_len + data_len;
+    let total = NET_FRAME_HDR + body_len;
+    if total > scratch_max {
+        return 0;
+    }
+    *scratch = DG_CMD_SEND_TO;
+    let pl = (body_len as u16).to_le_bytes();
+    *scratch.add(1) = pl[0];
+    *scratch.add(2) = pl[1];
+    *scratch.add(3) = ep_id;
+    if tag_len != 0 {
+        let tb = owner_tag.to_le_bytes();
+        *scratch.add(4) = DG_OWNER_TAG_MARK;
+        *scratch.add(5) = tb[0];
+        *scratch.add(6) = tb[1];
+    }
+    let af_at = NET_FRAME_HDR + 1 + tag_len;
+    *scratch.add(af_at) = DG_AF_NAME;
+    *scratch.add(af_at + 1) = name.len() as u8;
+    core::ptr::copy_nonoverlapping(name.as_ptr(), scratch.add(af_at + 2), name.len());
+    let port_at = af_at + 2 + name.len();
+    let port_bytes = dst_port.to_le_bytes();
+    *scratch.add(port_at) = port_bytes[0];
+    *scratch.add(port_at + 1) = port_bytes[1];
+    if data_len > 0 && !data.is_null() {
+        core::ptr::copy_nonoverlapping(data, scratch.add(port_at + 2), data_len);
+    }
+    if (sys.channel_write)(chan, scratch, total) == total as i32 {
+        total
+    } else {
+        0
+    }
 }
 
 /// Owner-tag-carrying form of [`dev_dg_send_to_v4`]. `owner_tag` is the tag the

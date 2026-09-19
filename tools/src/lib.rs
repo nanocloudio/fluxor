@@ -76,6 +76,8 @@ pub mod render_template;
 // path), `store_resolve` (uniform `[[artifact]]` lockfile resolution),
 // and `store_sync` (the one-path materialiser + `workspace publish`).
 // Lib-only; the bin reaches them via `fluxor_tools::…`.
+pub mod store_maint;
+pub mod store_pins;
 pub mod store_publish;
 pub mod store_remote;
 pub mod store_resolve;

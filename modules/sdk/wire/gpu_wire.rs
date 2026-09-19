@@ -1328,7 +1328,9 @@ impl RasterState {
         }
         if !matches!(
             topology,
-            TOPOLOGY_TRIANGLE_LIST | TOPOLOGY_TRIANGLE_STRIP | TOPOLOGY_LINE_LIST
+            TOPOLOGY_TRIANGLE_LIST
+                | TOPOLOGY_TRIANGLE_STRIP
+                | TOPOLOGY_LINE_LIST
                 | TOPOLOGY_POINT_LIST
         ) || !matches!(cull, CULL_NONE | CULL_BACK | CULL_FRONT)
             || !matches!(front_face, FRONT_FACE_CCW | FRONT_FACE_CW)
@@ -1375,7 +1377,10 @@ impl RasterState {
             let width = vattr_bytes(format).ok_or(REASON_UNSUPPORTED_FEATURE)?;
             // An attribute that runs past the stride reads the next vertex.
             // The device would not fault; it would draw the wrong thing.
-            if offset.checked_add(width).is_none_or(|end| end > vertex_stride) {
+            if offset
+                .checked_add(width)
+                .is_none_or(|end| end > vertex_stride)
+            {
                 return Err(REASON_BAD_RANGE);
             }
             if st.attrs()[..i].iter().any(|a| a.location == location) {

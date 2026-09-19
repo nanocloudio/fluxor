@@ -45,6 +45,35 @@ pub struct Artifact {
     pub digest: String,
     /// The tag the pin was resolved from — informational.
     pub reference: String,
+    /// Content address of what the manifest DELIVERS: a digest over its
+    /// layer digests, in order.
+    ///
+    /// Recorded, never resolved by. The manifest digest stays the
+    /// identity, because it is what carries the artifact's target, epoch
+    /// and `manifest.toml` metadata, and resolving from a bare layer
+    /// would let ports and bytes drift apart. What this field buys is
+    /// diagnosis: `fluxor update` can say "77 pins moved, 0 changed"
+    /// instead of reporting churn as change, and `fluxor store fsck` can
+    /// tell a lost artifact from a renamed one — the difference between
+    /// a recoverable pin and a dead one.
+    ///
+    /// Not the input digest, which is NOT a content address: it hashes a
+    /// module's declared sources, not the toolchain or the catalog, and
+    /// two artifacts with different bytes can and do share one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// Content address of a manifest: a digest over its layer digests in
+/// manifest order. Stable across a provenance re-stamp by construction.
+pub fn content_digest(manifest: &ImageManifest) -> String {
+    let joined = manifest
+        .layers
+        .iter()
+        .map(|l| l.digest.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::oci_store::sha256_hex_prefixed(joined.as_bytes())
 }
 
 /// The whole `fluxor.lock`: one `[[artifact]]` list, nothing else.
@@ -86,9 +115,12 @@ pub struct Catalog {
     /// Digest over every `stacks/*.toml` and `targets/**/*.toml` in the
     /// install root, by sorted relative path.
     pub digest: String,
-    /// Where that catalog was read from, for a reader diagnosing a
-    /// mismatch. Informational: the path is machine-local.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Accepted from a lock written before the stamp dropped it, and never
+    /// written: it held the install root's absolute path, which is a fact
+    /// about one machine in a file every machine commits. Nothing read it —
+    /// the drift diagnostic names the root it just digested, which is the
+    /// one its reader can actually go and look at.
+    #[serde(default, skip_serializing)]
     pub source: Option<String>,
 }
 
@@ -184,12 +216,12 @@ pub fn sort_entries(entries: &mut Vec<Artifact>) {
 pub fn write_store_lock(project_root: &Path, entries: &[Artifact]) -> Result<PathBuf> {
     let mut sorted = entries.to_vec();
     sort_entries(&mut sorted);
-    let catalog = crate::project::install_root().and_then(|r| {
-        catalog_digest(&r.path).map(|digest| Catalog {
+    let catalog = crate::project::install_root()
+        .and_then(|r| catalog_digest(&r.path))
+        .map(|digest| Catalog {
             digest,
-            source: Some(r.path.to_string_lossy().into_owned()),
-        })
-    });
+            source: None,
+        });
     let lock = StoreLock {
         artifacts: sorted,
         catalog,
@@ -208,7 +240,49 @@ pub fn write_store_lock(project_root: &Path, entries: &[Artifact]) -> Result<Pat
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
+    register_pins(project_root, &lock.artifacts);
     Ok(path)
+}
+
+/// Tell the store which digests this checkout is now holding.
+///
+/// Every writer of a lockfile comes through here, so a checkout
+/// registers itself the first time it resolves anything — no list to
+/// maintain, and no way to be a consumer the collector cannot see.
+/// Registration never fails the caller: it is a liveness improvement,
+/// and a store whose ledger cannot be written is not a reason to fail an
+/// update.
+pub fn register_pins(project_root: &Path, artifacts: &[Artifact]) {
+    // A unit test writing a lockfile in a temp directory must not
+    // register that directory in the DEVELOPER's real store: without
+    // this, `store_root()` falls back to `~/.local/share/fluxor/store`
+    // and every such test leaves a permanent ledger entry naming a
+    // tempdir that no longer exists — which `fluxor store fsck` then
+    // correctly reports as a dead pin. A test that means to exercise
+    // registration opts in by setting `$FLUXOR_STORE`.
+    if cfg!(test) && std::env::var_os("FLUXOR_STORE").is_none() {
+        return;
+    }
+    let Ok(store_root) = crate::oci_store::store_root() else {
+        return;
+    };
+    let digests = artifacts.iter().map(|a| a.digest.clone()).collect();
+    crate::store_pins::register(&store_root, project_root, &digests);
+}
+
+/// Fill in each entry's content address from the manifest it pins.
+/// A pin whose manifest cannot be read keeps `None` — unknown is not
+/// the same claim as "no layers", and reporting must be able to tell
+/// them apart.
+fn fill_content(store: &OciStore, entries: &mut [Artifact]) {
+    for e in entries.iter_mut() {
+        let resolved = store.resolve_pin(&e.digest);
+        if let Ok(bytes) = store.read_blob(&resolved) {
+            if let Ok(m) = serde_json::from_slice::<ImageManifest>(&bytes) {
+                e.content = Some(content_digest(&m));
+            }
+        }
+    }
 }
 
 // ── Descriptor → Artifact extraction ──────────────────────────────────
@@ -243,6 +317,9 @@ pub fn artifact_from_descriptor(d: &Descriptor) -> Result<Option<Artifact>> {
             target: d.annotations.get(ANN_TARGET).cloned(),
             digest: d.digest.clone(),
             reference,
+            // Filled by `fill_content` where a store is in hand; this
+            // fn reads a descriptor alone.
+            content: None,
         },
         "source" => Artifact {
             kind: kind.clone(),
@@ -251,6 +328,9 @@ pub fn artifact_from_descriptor(d: &Descriptor) -> Result<Option<Artifact>> {
             target: None,
             digest: d.digest.clone(),
             reference,
+            // Filled by `fill_content` where a store is in hand; this
+            // fn reads a descriptor alone.
+            content: None,
         },
         "runtime" => {
             let triple = d.annotations.get(ANN_RUNTIME_TRIPLE).cloned();
@@ -267,6 +347,7 @@ pub fn artifact_from_descriptor(d: &Descriptor) -> Result<Option<Artifact>> {
                 target: triple,
                 digest: d.digest.clone(),
                 reference,
+                content: None,
             }
         }
         "bundle" => Artifact {
@@ -276,6 +357,9 @@ pub fn artifact_from_descriptor(d: &Descriptor) -> Result<Option<Artifact>> {
             target: None,
             digest: d.digest.clone(),
             reference,
+            // Filled by `fill_content` where a store is in hand; this
+            // fn reads a descriptor alone.
+            content: None,
         },
         _ => return Ok(None),
     };
@@ -368,6 +452,7 @@ pub(crate) fn resolve_dependency(
             _ => {}
         }
     }
+    fill_content(store, &mut out);
     Ok(out)
 }
 
@@ -411,13 +496,143 @@ pub fn cmd_update(project_root: &Path, from_snapshot: Option<&str>) -> Result<()
                 }
             }
             sort_entries(&mut out);
+            fill_content(&store, &mut out);
             out
         }
     };
     let _guard = crate::lockfile::lock_lockfile(project_root)?;
+    // Read for REPORTING only. `update` stays the verb that rewrites an
+    // unreadable lockfile, so a lock it cannot parse simply yields no
+    // comparison rather than an error.
+    let before = read_store_lock(project_root)
+        .ok()
+        .flatten()
+        .map(|l| l.artifacts)
+        .unwrap_or_default();
     let path = write_store_lock(project_root, &entries)?;
-    println!("wrote {} ({} artifact(s))", path.display(), entries.len());
+    println!(
+        "wrote {} ({} artifact(s): {})",
+        path.display(),
+        entries.len(),
+        describe_update(&before, &entries)
+    );
+    if let Some(note) = withdrawal_note(project_root, &before, &entries) {
+        eprintln!("{note}");
+    }
     Ok(())
+}
+
+/// How one pin changed across an update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinChange {
+    /// Same digest — the pin did not move at all.
+    Same,
+    /// The digest moved but the artifact did not: identical content
+    /// address. The churn this whole design exists to stop, and after
+    /// the restamp it should never be reported again.
+    Restamped,
+    /// The artifact changed.
+    Changed,
+}
+
+fn classify(old: &Artifact, new: &Artifact) -> PinChange {
+    if old.digest == new.digest {
+        return PinChange::Same;
+    }
+    match (&old.content, &new.content) {
+        // Same bytes under a new manifest digest. Whether to call that a
+        // re-stamp or a rebuild is not knowable from the content alone —
+        // both produce identical layers — so the honest label is the one
+        // that names the observable: the content did not move.
+        (Some(a), Some(b)) if a == b => PinChange::Restamped,
+        _ => PinChange::Changed,
+    }
+}
+
+/// One line describing what an update actually did.
+///
+/// `wrote fluxor.lock (77 artifact(s))` was true and useless: it could
+/// not distinguish 77 modules changing from a publish that changed
+/// nothing and merely re-stamped every manifest. Reporting `0 changed`
+/// for the second case is the difference between a treadmill and a
+/// signal — and a non-zero `re-stamped` count after the migration is the
+/// standing regression check that provenance is still outside the
+/// manifest.
+fn describe_update(before: &[Artifact], after: &[Artifact]) -> String {
+    if before.is_empty() {
+        return format!("{} new", after.len());
+    }
+    let key = |a: &Artifact| {
+        (
+            a.kind.clone(),
+            a.project.clone(),
+            a.name.clone(),
+            a.target.clone(),
+        )
+    };
+    let old: BTreeMap<_, _> = before.iter().map(|a| (key(a), a)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for a in after {
+        let label = match old.get(&key(a)).map(|o| classify(o, a)) {
+            None => "new",
+            Some(PinChange::Same) => "unchanged",
+            Some(PinChange::Restamped) => "re-stamped",
+            Some(PinChange::Changed) => "changed",
+        };
+        *counts.entry(label).or_default() += 1;
+    }
+    let retired = before.len()
+        - after
+            .iter()
+            .filter(|a| old.contains_key(&key(a)))
+            .count()
+            .min(before.len());
+    if retired > 0 {
+        counts.insert("retired", retired);
+    }
+    // Always name "changed", even at zero: its absence is the answer
+    // most of the time, and an omitted zero reads as an unanswered
+    // question.
+    counts.entry("changed").or_default();
+    counts
+        .iter()
+        .map(|(k, v)| format!("{v} {k}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Name the digests this update stops holding that somebody else still
+/// does — the withdrawal side of the pin ledger.
+///
+/// A consumer advancing its own pins is correct and unremarkable, and it
+/// is also the event that can leave another checkout's pin as the last
+/// thing keeping a manifest reachable. The store can see both sides; the
+/// checkout doing it could not, until now.
+fn withdrawal_note(project_root: &Path, before: &[Artifact], after: &[Artifact]) -> Option<String> {
+    let kept: BTreeSet<&str> = after.iter().map(|a| a.digest.as_str()).collect();
+    let dropped: Vec<&Artifact> = before
+        .iter()
+        .filter(|a| !kept.contains(a.digest.as_str()))
+        .collect();
+    if dropped.is_empty() {
+        return None;
+    }
+    let store_root = crate::oci_store::store_root().ok()?;
+    let holders = crate::store_pins::holders(&store_root).ok()?;
+    let mut lines = Vec::new();
+    for a in dropped {
+        let others = holders.others(&a.digest, project_root);
+        if others.is_empty() {
+            continue;
+        }
+        lines.push(format!(
+            "note: dropping {} {}; {} still pin it",
+            a.reference,
+            short_hex(a.digest.strip_prefix("sha256:").unwrap_or(&a.digest)),
+            others.join(" and ")
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The single ad-hoc pin writer (`fluxor store pin` calls this):
@@ -434,7 +649,13 @@ pub fn pin_artifact(project_root: &Path, artifact: &Artifact) -> Result<()> {
             && e.name == artifact.name
             && e.target == artifact.target)
     });
-    entries.push(artifact.clone());
+    let mut artifact = artifact.clone();
+    if artifact.content.is_none() {
+        if let Ok(store) = OciStore::open(crate::oci_store::store_root()?) {
+            fill_content(&store, std::slice::from_mut(&mut artifact));
+        }
+    }
+    entries.push(artifact);
     write_store_lock(project_root, &entries)?;
     Ok(())
 }
@@ -444,6 +665,11 @@ pub fn pin_artifact(project_root: &Path, artifact: &Artifact) -> Result<()> {
 /// Read a blob the lockfile pins, mapping absence onto the one
 /// recovery message every pin-follows-a-missing-blob path shares.
 pub(crate) fn read_pinned_blob(store: &OciStore, name: &str, digest: &str) -> Result<Vec<u8>> {
+    // A pin written before provenance moved out of the manifest names a
+    // digest the store may no longer hold; `resolve_pin` follows the
+    // restamp alias to the manifest that replaced it — same layers, same
+    // target, same epoch. It is a no-op for every other pin.
+    let digest = &store.resolve_pin(digest);
     store.read_blob(digest).map_err(|_| {
         Error::Config(format!(
             "artifact '{name}' ({digest}) no longer in store — run `fluxor update`"
@@ -592,6 +818,7 @@ mod tests {
             target: target.map(str::to_string),
             digest: format!("sha256:{}", "ab".repeat(32)),
             reference: format!("{project}/{name}:0.0.1"),
+            content: None,
         }
     }
 
@@ -642,5 +869,34 @@ mod tests {
         let lock = read_store_lock(dir.path()).unwrap().unwrap();
         assert_eq!(lock.artifacts.len(), 1, "upsert must replace, not append");
         assert_eq!(lock.artifacts[0].digest, b.digest);
+    }
+
+    /// A lock written while the stamp still carried the install root's
+    /// path still parses. Every repo holds one, and `deny_unknown_fields`
+    /// would otherwise turn dropping the field into a flag day: each lock
+    /// unreadable until someone regenerated it, which is the whole point
+    /// of keeping the field declared.
+    #[test]
+    fn a_catalog_stamp_carrying_the_old_source_field_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            lockfile_path(dir.path()),
+            "artifact = []\n\n[catalog]\ndigest = \"sha256:abc\"\n\
+             source = \"/home/someone/checkout\"\n",
+        )
+        .unwrap();
+        let lock = read_store_lock(dir.path()).unwrap().unwrap();
+        let catalog = lock.catalog.expect("the stamp parses");
+        assert_eq!(catalog.digest, "sha256:abc");
+    }
+
+    /// ...and writing it back leaves the path out, so the file stops
+    /// carrying one machine's layout into everyone else's tree.
+    #[test]
+    fn a_written_catalog_stamp_carries_no_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_store_lock(dir.path(), &[]).unwrap();
+        let text = std::fs::read_to_string(lockfile_path(dir.path())).unwrap();
+        assert!(!text.contains("source ="), "got:\n{text}");
     }
 }

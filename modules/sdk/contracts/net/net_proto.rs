@@ -40,7 +40,7 @@ pub fn put_conn_id(payload: &mut [u8], conn_id: u16) {
 
 /// Parts of a `MSG_CONNECTED` payload: `(conn_id, requester_tag)`.
 ///
-/// The legacy 2-byte form carries no tag and yields `REQUESTER_TAG_NONE`.
+/// The 2-byte form carries no tag and yields `REQUESTER_TAG_NONE`.
 /// Callers bounds-check `payload.len() >= CONN_ID_LEN` first (frame
 /// validation), as with `conn_id`.
 #[inline]
@@ -135,7 +135,7 @@ pub const CLOSED_ID_GRACE_MS: u32 = 5_000;
 /// `local_port` in subsequent `MSG_ACCEPTED` frames (see `MSG_ACCEPTED`).
 pub const MSG_BOUND: u8 = 0x04;
 /// Outbound connect completed. Payload: `[conn_id: u16 LE][requester_tag: u8]`.
-/// `requester_tag` echoes the tag the consumer put on its `CMD_CONNECT` (its
+/// `requester_tag` echoes the tag the consumer put on its `CMD_CONNECT_TO` (its
 /// module index **+ 1** — the `dev_requester_tag` wire encoding, NOT the raw
 /// index) so that when `ip.net_out` is fanned to several stream consumers (e.g.
 /// TLS + an OTLP exporter), each claims only the connections it opened. A
@@ -144,7 +144,7 @@ pub const MSG_BOUND: u8 = 0x04;
 pub const MSG_CONNECTED: u8 = 0x05;
 /// Error. Payload: `[conn_id: u16 LE][errno: i8][requester_tag: u8?]`. For a
 /// connect-phase failure the trailing `requester_tag` echoes the failing
-/// `CMD_CONNECT`'s tag so a consumer that has no conn_id yet can recognise its
+/// `CMD_CONNECT_TO`'s tag so a consumer that has no conn_id yet can recognise its
 /// own failure on a fanned `net_out`; established-connection errors carry the
 /// owning connection's conn_id (filter by that). 3-byte form = tag 0.
 /// On a connect-phase failure `conn_id` is MEANINGLESS — it is the id already
@@ -192,31 +192,485 @@ pub const MAX_CMD_DATA: usize = 8192;
 /// is still the consumer's — and a no-op on an id the transport has already
 /// released.
 pub const CMD_CLOSE: u8 = 0x12;
-/// Initiate outbound connection.
-/// Payload: `[sock_type: u8][ip: u32 LE][port: u16 LE][requester_tag: u8?]`.
-/// Only `SOCK_TYPE_STREAM` is accepted; other values fail with EINVAL. The
-/// trailing `requester_tag` is OPTIONAL (7-byte form = tag `0`); when present it
-/// is echoed back in `MSG_CONNECTED` so a consumer sharing `ip.net_out` with
-/// other stream consumers can recognise its own outbound connection. The wire
-/// tag is the requesting module's index **+ 1** (`dev_requester_tag`), NOT the
-/// raw index — so the untagged sentinel `REQUESTER_TAG_NONE` (0) never collides
-/// with module index 0.
+/// RETIRED. The 7/8-byte `[sock_type][ip: u32 LE][port: u16 LE][tag?]`
+/// dial. Every provider answers it with `MSG_ERROR` `ENOSYS` on the
+/// requester tag (byte 7 when present) and one log line naming
+/// [`CMD_CONNECT_TO`], so a stale emitter fails loudly on its first dial
+/// instead of dialling a garbage address: byte 1 of this payload is the
+/// address's last octet, which would alias `af` if the two shapes shared
+/// an opcode. One opcode dials; this one only says no.
 pub const CMD_CONNECT: u8 = 0x13;
 
-/// Only socket type accepted by `CMD_CONNECT` — this is a STREAM-only surface.
-/// Datagram traffic uses the `datagram` surface (`CMD_DG_BIND` /
-/// `CMD_DG_SEND_TO`); a `CMD_CONNECT` with any other `sock_type` fails EINVAL.
+/// Initiate an outbound connection to a target.
+/// Payload: `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u8?]`
+///
+/// - `af = AF_INET (4)`: `addr` is 4 bytes, network order.
+/// - `af = AF_INET6 (6)`: `addr` is 16 bytes, network order.
+/// - `af = AF_NAME (1)`: `addr` is `[len: u8][name: len bytes]`, a DNS name
+///   of 1..=[`MAX_NAME_LEN`] ASCII bytes with no NUL, resolved by the
+///   provider that receives the record: `linux_net` through the host's
+///   resolver, `ip` through its stub resolver. A provider may hold a
+///   narrower name ceiling than this one and refuse a longer name
+///   `EINVAL`.
+///
+/// `AF_INET` / `AF_INET6` are the datagram surface's values, so the two
+/// surfaces spell an address the same way. Only `SOCK_TYPE_STREAM` is
+/// accepted; any other `sock_type`, a name outside 1..=253 bytes, or an
+/// `af` the provider does not serve fails `EINVAL` synchronously on the
+/// requester tag. A failed resolution is `ENOENT` on the tag. The trailing
+/// `requester_tag` is optional; when present it is echoed in
+/// `MSG_CONNECTED` / `MSG_ERROR`, and it carries the requesting module's
+/// index **+ 1** (`dev_requester_tag`), never the raw index.
+///
+/// Emit with [`write_connect_to`], read with [`read_connect_to`]; parse a
+/// `host[:port]` authority with [`Target::parse`] so a literal is never
+/// mistaken for a name.
+pub const CMD_CONNECT_TO: u8 = 0x14;
+
+/// Address family on `CMD_CONNECT_TO`: a DNS name, `[len: u8][name…]`.
+pub const AF_NAME: u8 = 1;
+/// Address family on `CMD_CONNECT_TO`: IPv4, 4 bytes network order (the
+/// datagram surface's value).
+pub const AF_INET: u8 = 4;
+/// Address family on `CMD_CONNECT_TO`: IPv6, 16 bytes network order (the
+/// datagram surface's value).
+pub const AF_INET6: u8 = 6;
+/// Longest DNS name `AF_NAME` carries (RFC 1035 presentation form).
+pub const MAX_NAME_LEN: usize = 253;
+/// Bytes before `addr…` in a `CMD_CONNECT_TO` payload.
+pub const CONNECT_TO_HEAD: usize = 1 + 1 + 2;
+/// Largest `CMD_CONNECT_TO` payload: head, a name with its length, a tag.
+pub const CONNECT_TO_MAX: usize = CONNECT_TO_HEAD + 1 + MAX_NAME_LEN + 1;
+
+/// Where a connection is opened to. The name variant borrows the caller's
+/// bytes: nothing here allocates, and a provider that resolves copies the
+/// name into its own slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target<'a> {
+    V4([u8; 4]),
+    V6([u8; 16]),
+    Name(&'a [u8]),
+}
+
+impl<'a> Target<'a> {
+    /// The address family byte this target is carried under.
+    pub fn af(&self) -> u8 {
+        match self {
+            Target::V4(_) => AF_INET,
+            Target::V6(_) => AF_INET6,
+            Target::Name(_) => AF_NAME,
+        }
+    }
+
+    /// Bytes of `addr…` this target occupies on the wire.
+    pub fn wire_len(&self) -> usize {
+        match self {
+            Target::V4(_) => 4,
+            Target::V6(_) => 16,
+            Target::Name(n) => 1 + n.len(),
+        }
+    }
+
+    /// Parse an authority: `host[:port]`, where `host` is a DNS name, a
+    /// dotted quad, or a bracketed IPv6 literal (`[::1]:443`). The port,
+    /// when present, is decimal 1..=65535. Literals are recognised as
+    /// literals so no caller ever hashes or resolves one. `None` for
+    /// anything else: an empty host, a bare v6 literal without brackets,
+    /// a port of 0, a name over [`MAX_NAME_LEN`] bytes or with a byte a
+    /// hostname cannot hold.
+    pub fn parse(authority: &'a [u8]) -> Option<(Target<'a>, Option<u16>)> {
+        let (host, port_text) = split_authority(authority)?;
+        let port = match port_text {
+            Some(p) => Some(parse_port(p)?),
+            None => None,
+        };
+        if let Some(stripped) = strip_brackets(host) {
+            return Some((Target::V6(parse_v6(stripped)?), port));
+        }
+        if let Some(v4) = parse_v4(host) {
+            return Some((Target::V4(v4), port));
+        }
+        if !name_ok(host) {
+            return None;
+        }
+        Some((Target::Name(host), port))
+    }
+}
+
+/// `host` and the text after its port separator. A bracketed host keeps
+/// its brackets; a host with more than one bare `:` is not an authority.
+fn split_authority(a: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+    if a.is_empty() {
+        return None;
+    }
+    if a[0] == b'[' {
+        let close = a.iter().position(|&c| c == b']')?;
+        let host = &a[..=close];
+        let rest = &a[close + 1..];
+        return if rest.is_empty() {
+            Some((host, None))
+        } else if rest[0] == b':' {
+            Some((host, Some(&rest[1..])))
+        } else {
+            None
+        };
+    }
+    let mut colons = 0usize;
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < a.len() {
+        if a[i] == b':' {
+            colons += 1;
+            last = i;
+        }
+        i += 1;
+    }
+    match colons {
+        0 => Some((a, None)),
+        1 => Some((&a[..last], Some(&a[last + 1..]))),
+        _ => None,
+    }
+}
+
+fn strip_brackets(host: &[u8]) -> Option<&[u8]> {
+    if host.len() >= 2 && host[0] == b'[' && host[host.len() - 1] == b']' {
+        Some(&host[1..host.len() - 1])
+    } else {
+        None
+    }
+}
+
+fn parse_port(text: &[u8]) -> Option<u16> {
+    if text.is_empty() || text.len() > 5 {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for &c in text {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + u32::from(c - b'0');
+    }
+    if v == 0 || v > 0xFFFF {
+        return None;
+    }
+    Some(v as u16)
+}
+
+/// A decimal octet with no sign, no leading zeros beyond a lone `0`.
+fn parse_octet(text: &[u8]) -> Option<u8> {
+    if text.is_empty() || text.len() > 3 || (text.len() > 1 && text[0] == b'0') {
+        return None;
+    }
+    let mut v: u16 = 0;
+    for &c in text {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + u16::from(c - b'0');
+    }
+    if v > 255 {
+        return None;
+    }
+    Some(v as u8)
+}
+
+/// A dotted quad, exactly four octets. Anything else — including
+/// `10.1` or `1.2.3.4.5` — is not one, and is judged as a name instead.
+pub fn parse_v4(text: &[u8]) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut n = 0usize;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= text.len() {
+        if i == text.len() || text[i] == b'.' {
+            if n == 4 {
+                return None;
+            }
+            out[n] = parse_octet(&text[start..i])?;
+            n += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if n == 4 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn hex_val(c: u8) -> Option<u16> {
+    match c {
+        b'0'..=b'9' => Some(u16::from(c - b'0')),
+        b'a'..=b'f' => Some(u16::from(c - b'a') + 10),
+        b'A'..=b'F' => Some(u16::from(c - b'A') + 10),
+        _ => None,
+    }
+}
+
+fn parse_hextet(text: &[u8]) -> Option<u16> {
+    if text.is_empty() || text.len() > 4 {
+        return None;
+    }
+    let mut v: u16 = 0;
+    for &c in text {
+        v = (v << 4) | hex_val(c)?;
+    }
+    Some(v)
+}
+
+/// An IPv6 literal without brackets: up to eight hextets, one `::`
+/// compression, an optional dotted-quad tail (`::ffff:1.2.3.4`).
+pub fn parse_v6(text: &[u8]) -> Option<[u8; 16]> {
+    let mut groups = [0u16; 8];
+    let mut head = 0usize; // groups before `::`
+    let mut tail = [0u16; 8];
+    let mut tail_n = 0usize; // groups after `::`
+    let mut seen_gap = false;
+    let mut i = 0usize;
+    let mut start = 0usize;
+    // Groups are pushed to `head` until the gap, then to `tail`.
+    let mut push = |g: u16, gap: bool| -> bool {
+        if !gap {
+            if head == 8 {
+                return false;
+            }
+            groups[head] = g;
+            head += 1;
+        } else {
+            if head + tail_n == 8 {
+                return false;
+            }
+            tail[tail_n] = g;
+            tail_n += 1;
+        }
+        true
+    };
+    while i <= text.len() {
+        let at_end = i == text.len();
+        if at_end || text[i] == b':' {
+            let piece = &text[start..i];
+            if piece.is_empty() {
+                if at_end && start == 0 {
+                    return None; // empty literal
+                }
+                if !at_end && i + 1 < text.len() && text[i + 1] == b':' {
+                    if seen_gap {
+                        return None; // two `::`
+                    }
+                    seen_gap = true;
+                    i += 2;
+                    start = i;
+                    if i == text.len() {
+                        break; // trailing `::`
+                    }
+                    continue;
+                }
+                if at_end && seen_gap && start == i {
+                    break; // `…::` already consumed
+                }
+                return None; // a lone `:` at an edge or `:::`
+            }
+            // `[u8]::contains` lowers to `core::slice::memchr`, which a
+            // flat module image has no symbol for; the explicit walk is
+            // what links.
+            #[allow(clippy::manual_contains, reason = "memchr is not linkable here")]
+            let dotted = piece.iter().any(|&c| c == b'.');
+            if dotted {
+                // A dotted-quad tail is the last two groups.
+                if !at_end {
+                    return None;
+                }
+                let v4 = parse_v4(piece)?;
+                let a = u16::from_be_bytes([v4[0], v4[1]]);
+                let b = u16::from_be_bytes([v4[2], v4[3]]);
+                if !push(a, seen_gap) || !push(b, seen_gap) {
+                    return None;
+                }
+                break;
+            }
+            if !push(parse_hextet(piece)?, seen_gap) {
+                return None;
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if seen_gap {
+        if head + tail_n >= 8 {
+            return None; // `::` must stand for at least one group
+        }
+        let mut j = 0;
+        while j < tail_n {
+            groups[8 - tail_n + j] = tail[j];
+            j += 1;
+        }
+    } else if head != 8 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    let mut g = 0;
+    while g < 8 {
+        let b = groups[g].to_be_bytes();
+        out[2 * g] = b[0];
+        out[2 * g + 1] = b[1];
+        g += 1;
+    }
+    Some(out)
+}
+
+/// Whether `host` may travel as an `AF_NAME`: 1..=[`MAX_NAME_LEN`] bytes of
+/// letters, digits, `-`, `_` and `.`, with no empty label and no label over
+/// 63 bytes, and at least one letter somewhere — an all-digit host is a
+/// mistyped literal, not a name. A trailing dot is accepted and dropped by
+/// the resolver.
+pub fn name_ok(host: &[u8]) -> bool {
+    if host.is_empty() || host.len() > MAX_NAME_LEN {
+        return false;
+    }
+    let mut label = 0usize;
+    let mut letter = false;
+    let mut i = 0usize;
+    while i < host.len() {
+        let c = host[i];
+        if c == b'.' {
+            if label == 0 || (i + 1 == host.len() && i == 0) {
+                return false;
+            }
+            label = 0;
+        } else if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' {
+            letter |= c.is_ascii_alphabetic();
+            label += 1;
+            if label > 63 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        i += 1;
+    }
+    letter
+}
+
+/// Compose a `CMD_CONNECT_TO` payload into `buf`, answering its length,
+/// or `0` when `buf` cannot hold it or the name is not one `AF_NAME`
+/// carries. `port` is the connector's resolved port: the authority's when
+/// it named one, else the protocol default.
+pub fn write_connect_to(
+    buf: &mut [u8],
+    sock_type: u8,
+    port: u16,
+    t: &Target<'_>,
+    tag: Option<u8>,
+) -> usize {
+    let n = CONNECT_TO_HEAD + t.wire_len() + usize::from(tag.is_some());
+    if buf.len() < n {
+        return 0;
+    }
+    buf[0] = sock_type;
+    buf[1] = t.af();
+    buf[2..4].copy_from_slice(&port.to_le_bytes());
+    let mut at = CONNECT_TO_HEAD;
+    match t {
+        Target::V4(a) => {
+            buf[at..at + 4].copy_from_slice(a);
+            at += 4;
+        }
+        Target::V6(a) => {
+            buf[at..at + 16].copy_from_slice(a);
+            at += 16;
+        }
+        Target::Name(name) => {
+            if name.is_empty() || name.len() > MAX_NAME_LEN {
+                return 0;
+            }
+            buf[at] = name.len() as u8;
+            at += 1;
+            buf[at..at + name.len()].copy_from_slice(name);
+            at += name.len();
+        }
+    }
+    if let Some(tag) = tag {
+        buf[at] = tag;
+        at += 1;
+    }
+    at
+}
+
+/// Read a `CMD_CONNECT_TO` payload: `(sock_type, port, target, tag)`.
+/// `None` for a malformed record — a truncated address, an unknown `af`,
+/// a name of 0 or over 253 bytes or holding a NUL or a non-ASCII byte, or
+/// trailing bytes past the tag — which the provider answers `EINVAL` on
+/// the record's last byte, the one a tag would occupy: the emitter is
+/// broken either way, and that byte is the closest thing to its name.
+///
+/// The tag is `None` when the record carries none; a provider treats that
+/// as `REQUESTER_TAG_NONE`.
+pub fn read_connect_to(payload: &[u8]) -> Option<(u8, u16, Target<'_>, Option<u8>)> {
+    if payload.len() < CONNECT_TO_HEAD {
+        return None;
+    }
+    let sock_type = payload[0];
+    let af = payload[1];
+    let port = u16::from_le_bytes([payload[2], payload[3]]);
+    let rest = &payload[CONNECT_TO_HEAD..];
+    let (target, used) = match af {
+        AF_INET => {
+            let a = rest.get(..4)?;
+            (Target::V4([a[0], a[1], a[2], a[3]]), 4)
+        }
+        AF_INET6 => {
+            let a = rest.get(..16)?;
+            let mut v = [0u8; 16];
+            v.copy_from_slice(a);
+            (Target::V6(v), 16)
+        }
+        AF_NAME => {
+            let len = usize::from(*rest.first()?);
+            if len == 0 || len > MAX_NAME_LEN {
+                return None;
+            }
+            let name = rest.get(1..1 + len)?;
+            if name.iter().any(|&c| c == 0 || !c.is_ascii()) {
+                return None;
+            }
+            (Target::Name(name), 1 + len)
+        }
+        _ => return None,
+    };
+    let tag = match rest.len() - used {
+        0 => None,
+        1 => Some(rest[used]),
+        _ => return None,
+    };
+    Some((sock_type, port, target, tag))
+}
+
+/// The requester tag of a RETIRED [`CMD_CONNECT`] payload, so a provider
+/// can address its `ENOSYS` to the emitter that dialled. Byte 7 when the
+/// 8-byte form was sent; `REQUESTER_TAG_NONE` otherwise.
+pub fn retired_connect_tag(payload: &[u8]) -> u8 {
+    match payload.get(7) {
+        Some(&t) => t,
+        None => REQUESTER_TAG_NONE,
+    }
+}
+
+/// Only socket type accepted by `CMD_CONNECT_TO` — this is a STREAM-only
+/// surface. Datagram traffic uses the `datagram` surface (`CMD_DG_BIND` /
+/// `CMD_DG_SEND_TO`); a dial with any other `sock_type` fails EINVAL.
 pub const SOCK_TYPE_STREAM: u8 = 1;
 
-/// `requester_tag` value meaning "no routing tag" — the legacy 7-byte
-/// `CMD_CONNECT` and any consumer that doesn't tag its connects.
+/// `requester_tag` value meaning "no routing tag" — an untagged
+/// `CMD_CONNECT_TO` and any consumer that doesn't tag its connects.
 ///
 /// The wire tag is the requester's **module index + 1**, so `0` can never be a
 /// valid tag (module index `0` maps to wire tag `1`). This avoids the collision
 /// a raw zero-based index would have with this sentinel. Encode with
 /// `dev_requester_tag`; a filtering consumer claims a frame iff its tag equals
-/// the consumer's own `dev_requester_tag` OR is `REQUESTER_TAG_NONE` (legacy /
-/// sole-consumer graphs).
+/// the consumer's own `dev_requester_tag` OR is `REQUESTER_TAG_NONE`
+/// (sole-consumer graphs).
 pub const REQUESTER_TAG_NONE: u8 = 0;
 
 // Netif state propagation: drivers emit state transitions as

@@ -53,9 +53,28 @@
 //! | 8   | static_ip       | u32  | 0       | Address to use when `use_dhcp=0` |
 //! | 9   | static_netmask  | u32  | 0       | Netmask for `static_ip` |
 //! | 10  | static_gateway  | u32  | 0       | Default gateway for `static_ip` |
+//! | 11  | resolver        | u32  | 0       | DNS server for named dials (0 = the DHCP-supplied one) |
 //!
 //! `use_dhcp=0` without a `static_ip` leaves the stack with no address and
 //! nothing it can send: the two go together.
+//!
+//! # Connecting by name
+//!
+//! A consumer dials with `CMD_CONNECT_TO` (`net_proto`), which carries an
+//! address family: an IPv4 literal is dialled at once, an IPv6 literal is
+//! refused `EINVAL` (there is no v6 stack here), and a name is resolved by
+//! the stub resolver this module owns before the SYN goes out. The resolver
+//! sends one A query per name from an ephemeral port it holds for its
+//! lifetime, to `resolver` when set and otherwise to the DHCP lease's DNS
+//! server; a reply is demuxed by that port ahead of the datagram endpoints.
+//! Answers are cached by TTL (`MAX_DNS_CACHE` entries, 64-byte names) so a
+//! repeated dial pays no round trip; a name longer than 64 bytes is refused
+//! `EINVAL`. A query unanswered after 3 s is sent once more with a fresh id,
+//! then the dial fails `ENOENT` on its requester tag, as does a negative
+//! answer or a dial with no resolver known. `CMD_DG_SEND_TO` takes the same
+//! `AF_NAME`: a cached name sends at once; a name not in hand starts the
+//! lookup and drops that datagram, which a datagram sender retransmits.
+//! The retired `CMD_CONNECT` (0x13) is answered `MSG_ERROR ENOSYS`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -76,6 +95,10 @@ use core::ffi::c_void;
 #[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
+
+/// The DNS message codec, shared with the `dns` server.
+#[path = "../../sdk/contracts/net/dns_wire.rs"]
+mod dns_wire;
 
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
@@ -185,7 +208,11 @@ const NET_MSG_ACK: u8 = 0x08;
 const NET_CMD_BIND: u8 = 0x10;
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+/// Retired: answered `MSG_ERROR ENOSYS` on its tag so a stale emitter
+/// fails loudly on its first dial.
+const NET_CMD_CONNECT: u8 = abi::contracts::net::net_proto::CMD_CONNECT;
+/// Open a stream to a target carrying an address family (`net_proto`).
+const NET_CMD_CONNECT_TO: u8 = abi::contracts::net::net_proto::CMD_CONNECT_TO;
 
 // Datagram surface opcodes share the same `net_in` / `net_out` pair as
 // net_proto; the disjoint opcode ranges keep the contracts unambiguous.
@@ -216,6 +243,74 @@ pub use abi::config::ip::MAX_PACKET_HOLD;
 /// the wire's `ep_id` is a u8, so the id space binds the endpoint count,
 /// not the connection table.
 pub use abi::config::ip::MAX_DG_ENDPOINTS;
+
+/// Stub-resolver tables (`abi::config::ip`): names held with their address
+/// until the answer's TTL runs out, and dials parked on a query in flight.
+pub use abi::config::ip::{MAX_DNS_CACHE, MAX_DNS_PENDING};
+
+// ── Stub resolver ───────────────────────────────
+
+/// Longest name the resolver holds, per cache and pending entry. A dial
+/// naming something longer is refused `EINVAL`; the ceiling is what bounds
+/// the tables on an MCU-class profile.
+const DNS_NAME_CAP: usize = 64;
+/// How long one query waits for its answer before it is sent again or
+/// given up on.
+const DNS_QUERY_TIMEOUT_MS: u32 = 3000;
+/// Queries sent again after a timeout before the dial fails.
+const DNS_QUERY_RETRIES: u8 = 1;
+/// Answer TTL policy, in seconds: a zero TTL is held for `DNS_TTL_ZERO_S`,
+/// anything else for at least `DNS_TTL_MIN_S` and at most `DNS_TTL_MAX_S`.
+const DNS_TTL_ZERO_S: u32 = 60;
+const DNS_TTL_MIN_S: u32 = 1;
+const DNS_TTL_MAX_S: u32 = 3600;
+/// CSPRNG draws for a query id that collides with no query in flight.
+const DNS_ID_DRAWS: usize = 8;
+/// Scratch for one outbound query: header, a name in label form, the
+/// question tail.
+const DNS_QUERY_BUF: usize = dns_wire::DNS_HEADER_LEN + DNS_NAME_CAP + 2 + 4;
+
+/// `DnsPending::flags` bits.
+const DNS_PEND_ACTIVE: u8 = 0x01;
+/// The entry that sent the query and owns its retries; the others sharing
+/// its id are dials that joined a lookup already in flight.
+const DNS_PEND_LEADER: u8 = 0x02;
+/// A lookup that only warms the cache (a named datagram send): nothing is
+/// dialled and nothing is reported when it completes or fails.
+const DNS_PEND_CACHE_ONLY: u8 = 0x04;
+
+/// One resolved name.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnsCacheEntry {
+    name: [u8; DNS_NAME_CAP],
+    /// 0 = empty.
+    name_len: u8,
+    _pad: [u8; 3],
+    /// Host-order IPv4, as `remote_ip` holds it.
+    addr: u32,
+    /// Wall clock past which the entry is stale.
+    expires_ms: u32,
+}
+
+/// One dial (or cache warm) waiting on a query.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnsPending {
+    name: [u8; DNS_NAME_CAP],
+    name_len: u8,
+    flags: u8,
+    /// Requester tag the dial's `MSG_CONNECTED` / `MSG_ERROR` carries.
+    tag: u8,
+    /// Retransmissions the leader has made.
+    retries: u8,
+    /// Destination port of the dial.
+    port: u16,
+    /// Query id; every entry waiting on the same name shares it.
+    id: u16,
+    /// Wall clock at which the leader retransmits or gives up.
+    deadline_ms: u32,
+}
 
 /// Hash index over the connection table: twice the table, so chains stay
 /// short (`index.rs`).
@@ -862,6 +957,10 @@ pub struct IpDrops {
     /// the cross-consumer axis: a live slot reached by a consumer that does
     /// not own it.
     pub dg_ep_perm: u32,
+    /// Name lookups that ended without an address: a negative answer, a
+    /// timeout after the retry, or no resolver to ask. A dial counted here
+    /// was answered `ENOENT`; a named datagram send was dropped.
+    pub dns_unresolved: u32,
 }
 
 impl IpDrops {
@@ -896,6 +995,7 @@ impl IpDrops {
             dg_bind_conflict: 0,
             dg_ep_unowned: 0,
             dg_ep_perm: 0,
+            dns_unresolved: 0,
         }
     }
 }
@@ -981,6 +1081,9 @@ struct IpState {
     netmask: u32,
     gateway: u32,
     dns_server: u32,
+    /// `resolver` parameter: the DNS server named dials are resolved at;
+    /// 0 defers to `dns_server`.
+    resolver: u32,
     /// Address to adopt when DHCP is off. Held separately from `local_ip`
     /// because parameters arrive before the link does, and the identity is
     /// only applied once the MAC is known — a stack that claims an address
@@ -1118,7 +1221,7 @@ struct IpState {
     _ptx_pad: [u8; 2],
     pending_tx_buf: [u8; MAX_FRAME_SIZE + 2],
 
-    /// LOCAL-DELIVERY FASTPATH (loopback). A CMD_CONNECT whose
+    /// LOCAL-DELIVERY FASTPATH (loopback). A dial whose
     /// destination is this host's own address (or 127.0.0.1) never
     /// reaches TCP: it binds a PAIR of conn slots directly — the
     /// connector's and an accepted-side one for the local listener —
@@ -1318,6 +1421,17 @@ struct IpState {
     /// queue, so `pend=0`), no drop fires, and CPU stays low, because the
     /// module is deliberately declining work rather than failing to do it.
     pend_cmd_steps: u32,
+
+    // ── Stub resolver ─────────────────────────────────────────────────
+    /// Ephemeral port every query leaves from and every answer is demuxed
+    /// by; 0 until the first lookup allocates it. Held for the module's
+    /// lifetime and reserved against `next_port`.
+    resolver_port: u16,
+    /// Entries of `dns_pending` in use, so an idle step costs one compare.
+    dns_pending_live: u8,
+    _dns_pad: u8,
+    dns_cache: [DnsCacheEntry; MAX_DNS_CACHE],
+    dns_pending: [DnsPending; MAX_DNS_PENDING],
 }
 
 /// Cadence for the `[ip] tlm` line — every 5000 module steps.
@@ -1370,6 +1484,11 @@ mod params_def {
             => |s, d, len| { s.static_netmask = p_u32(d, len, 0, 0); };
         10, static_gateway, u32, 0
             => |s, d, len| { s.static_gateway = p_u32(d, len, 0, 0); };
+        // DNS server the stub resolver asks for named dials, encoded as
+        // `static_ip` is. 0 defers to the server the DHCP lease supplied;
+        // a static-IP deployment that dials names sets it.
+        11, resolver, u32, 0
+            => |s, d, len| { s.resolver = p_u32(d, len, 0, 0); };
         7, packet_hold_ms, u16, 50
             => |s, d, len| {
                 let v = p_u16(d, len, 0, 50);
@@ -2159,7 +2278,7 @@ unsafe fn net_send_bound(s: &mut IpState, conn_id: u16, local_port: u16) {
 #[must_use]
 unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
     // Payload `[conn_id:2 LE][requester_tag]` — the tag echoes the connecting
-    // module's CMD_CONNECT tag so a fanned net_out routes the event back to it.
+    // module's dial tag so a fanned net_out routes the event back to it.
     let tag = if (conn_id as usize) < tcp::MAX_TCP_CONNS {
         s.tcp_conns[conn_id as usize].connect_tag
     } else {
@@ -2182,7 +2301,7 @@ unsafe fn net_send_connected(s: &mut IpState, conn_id: u16) -> bool {
 #[inline(always)]
 unsafe fn net_send_error(s: &mut IpState, conn_id: u16, errno: i8, tag: u8) -> bool {
     // Payload `[conn_id:2 LE][errno][requester_tag]`. The tag echoes the
-    // failing CMD_CONNECT's tag so a consumer sharing a fanned net_out
+    // failing dial's tag so a consumer sharing a fanned net_out
     // attributes a connect failure to the right requester (it has no conn_id
     // yet). Errors not tied to an outbound connect pass tag 0 (untagged).
     let mut frame = [0u8; 7];
@@ -2482,6 +2601,11 @@ unsafe fn alloc_dg_slot(s: &mut IpState) -> Option<usize> {
 
 /// Is `port` already bound by a TCP connection or datagram endpoint?
 unsafe fn port_in_use(s: &IpState, port: u16) -> bool {
+    // The resolver's port is not in the connection table; it is held
+    // for the module's lifetime.
+    if port != 0 && port == s.resolver_port {
+        return true;
+    }
     if PORT_REF_ENTRIES > 1 {
         return *s.port_ref.as_ptr().add(port as usize) != 0;
     }
@@ -3219,6 +3343,7 @@ pub unsafe extern "C" fn module_step(state: *mut c_void) -> i32 {
     // 5. TCP timers — wallclock-driven so the 50 ms-tick thresholds
     // hold across schedulers with different `tick_us`.
     step_tcp_timers(s);
+    step_resolver(s);
     continuity::step(s);
     step_fence_wait(s);
 
@@ -4553,6 +4678,18 @@ unsafe fn process_udp_packet(
     if udp_hdr.dst_port == dhcp::DHCP_CLIENT_PORT && udp_hdr.src_port == dhcp::DHCP_SERVER_PORT {
         let dhcp_data = data.add(udp_hdr.payload_offset);
         process_dhcp_reply(s, dhcp_data, udp_hdr.payload_len);
+        return;
+    }
+
+    // The stub resolver's answers arrive on the port it holds, and are
+    // claimed ahead of the endpoint walk as DHCP's are: no consumer can
+    // bind that port, so nothing behind this line could want them.
+    if s.resolver_port != 0
+        && udp_hdr.dst_port == s.resolver_port
+        && udp_hdr.src_port == dns_wire::DNS_PORT
+        && ip_hdr.src_ip == resolver_server(s)
+    {
+        resolver_rx(s, data.add(udp_hdr.payload_offset), udp_hdr.payload_len);
         return;
     }
 
@@ -6429,7 +6566,7 @@ fn state_allows_send(state: tcp::TcpState) -> bool {
 /// close); from CloseWait → LAST_ACK (peer FIN'd first). State only
 /// advances on successful FIN queue, so a backpressured FIN doesn't
 /// strand the conn in FinWait1 with no frame on the wire.
-/// Serve a CMD_CONNECT addressed to this host (see `loopback_peer`):
+/// Serve a CMD_CONNECT_TO addressed to this host (see `loopback_peer`):
 /// find the local listener, bind a conn-slot PAIR as `Established`,
 /// and notify both consumers. Failure surfaces exactly like the TCP
 /// path's: ECONNREFUSED when nothing listens, ENOMEM when the table
@@ -7001,75 +7138,52 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 }
             }
             NET_CMD_CONNECT => {
-                // Stream Surface v1: open a TCP outbound connection.
-                // Payload: [sock_type: u8 = SOCK_TYPE_STREAM] [ip: u32 LE] [port: u16 LE].
+                // Retired. Fail the emitter loudly on its tag rather than
+                // dial whatever this payload's address bytes decode to.
+                let tag = abi::contracts::net::net_proto::retired_connect_tag(&buf[..plen]);
+                log_error(
+                    s,
+                    b"[ip] CMD_CONNECT (0x13) is retired; dial with CMD_CONNECT_TO (0x14)",
+                );
+                net_send_error(s, 0, -38, tag); // ENOSYS
+            }
+            NET_CMD_CONNECT_TO => {
+                // Stream Surface v1: open a TCP outbound connection to a
+                // target: `[sock_type][af][port: u16 LE][addr…][tag?]`.
                 // Only TCP is accepted here; UDP uses the `datagram`
                 // surface (`CMD_DG_BIND` + `CMD_DG_SEND_TO`).
-                if plen >= 7 {
-                    let bp = buf.as_ptr();
-                    let sock_type = *bp;
-                    // Optional trailing requester tag (8-byte form); echoed in
-                    // MSG_CONNECTED / connect-failure MSG_ERROR so a fanned
-                    // net_out routes the event back to the requester.
-                    let requester_tag = if plen >= 8 { *bp.add(7) } else { 0 };
-                    if sock_type != SOCK_TYPE_STREAM {
-                        net_send_error(s, 0, -22, requester_tag); // EINVAL
-                    } else {
-                        let ip =
-                            u32::from_le_bytes([*bp.add(1), *bp.add(2), *bp.add(3), *bp.add(4)]);
-                        let port = u16::from_le_bytes([*bp.add(5), *bp.add(6)]);
-
-                        // LOCAL-DELIVERY FASTPATH: a connect to this host's
-                        // own address (or 127.0.0.1) is served entirely
-                        // in-module — see `loopback_peer`. Consumers encode
-                        // the address bytes so this LE parse yields the same
-                        // numeric form `s.local_ip` holds (pg_client et al.
-                        // reverse the endpoint bytes into the payload).
-                        if ip == 0x7F00_0001 || (s.local_ip != 0 && ip == s.local_ip) {
-                            connect_loopback(s, port, requester_tag);
-                            count += 1;
-                            continue;
-                        }
-
-                        let conn_id: i32 = match alloc_free_slot(s) {
-                            Some(i) => i as i32,
-                            None => -1,
-                        };
-
-                        if conn_id < 0 {
-                            net_send_error(s, 0, -12, requester_tag); // ENOMEM
-                        } else if !ensure_isn_secret(s) {
-                            // EAGAIN — entropy may arrive later; the caller
-                            // may retry, but the stack will not substitute a
-                            // predictable sequence in the meantime.
-                            net_send_error(s, 0, -11, requester_tag);
-                        } else if let Some(local_port) = next_port(s) {
-                            let ci = conn_id as usize;
-                            let iss = compute_iss(s, s.local_ip, local_port, ip, port);
-
-                            let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
-                            conn.state = tcp::TcpState::SynSent;
-                            conn.remote_ip = ip;
-                            conn.remote_port = port;
-                            conn.local_port = local_port;
-                            // Outbound/host traffic sources from slot 0 in v1;
-                            // set it concretely so the peer's replies (dst =
-                            // local_ip → slot 0) match on the demux axis. Reset
-                            // explicitly — this path reuses a slot in place.
-                            conn.local_slot = 0;
-                            conn.connect_tag = requester_tag;
-                            conn.iss = iss;
-                            conn.snd_nxt = iss;
-                            conn.snd_una = iss;
-                            conn.rcv_wnd = 512;
-                            conn.retransmit_timer = 0;
-                            conn_index_insert(s, ci);
-
-                            send_tcp_control(s, ci, tcp::SYN, false);
+                use abi::contracts::net::net_proto::{read_connect_to, Target};
+                match read_connect_to(&buf[..plen]) {
+                    Some((sock_type, port, target, tag)) => {
+                        let requester_tag = tag.unwrap_or(REQUESTER_TAG_NONE);
+                        if sock_type != SOCK_TYPE_STREAM {
+                            net_send_error(s, 0, -22, requester_tag); // EINVAL
                         } else {
-                            // EADDRNOTAVAIL — no ephemeral port available.
-                            net_send_error(s, 0, -99, requester_tag);
+                            match target {
+                                Target::V4(a) => {
+                                    connect_v4(s, u32::from_be_bytes(a), port, requester_tag);
+                                }
+                                // No IPv6 stack: a v6 literal cannot be dialled.
+                                Target::V6(_) => {
+                                    net_send_error(s, 0, -22, requester_tag); // EINVAL
+                                }
+                                Target::Name(name) => {
+                                    connect_by_name(s, name, port, requester_tag);
+                                }
+                            }
                         }
+                    }
+                    None => {
+                        // Malformed: a truncated address, an unknown family,
+                        // a name past the ceiling. EINVAL goes to the
+                        // record's last byte — the one a tag would occupy —
+                        // as `read_connect_to` states.
+                        let tag = if plen > 0 {
+                            buf[plen - 1]
+                        } else {
+                            REQUESTER_TAG_NONE
+                        };
+                        net_send_error(s, 0, -22, tag);
                     }
                 }
             }
@@ -7235,15 +7349,24 @@ unsafe fn service_net_channels(s: &mut IpState) {
                 s.drops.dg_cmd_rx = s.drops.dg_cmd_rx.wrapping_add(1);
                 // datagram send. IPv4 payload:
                 //   [ep_id:1][af:1=4][dst_addr:4 BE][dst_port:2 LE][data...]
+                // Name payload:
+                //   [ep_id:1][af:1=1][len:1][name…][dst_port:2 LE][data...]
                 // Owner-tagged form inserts [MARK][owner_tag:2 LE] between
                 // `ep_id` and `af`, so the tag sits at a fixed offset ahead of
                 // the variable-length data rather than after it.
                 let bp = buf.as_ptr();
                 let (claimed_tag, dest_off) = dg_decode_owner_tag(bp, plen);
-                if plen >= dest_off + DG_V4_DEST_LEN {
+                if plen > dest_off {
                     let ep_id = *bp as usize;
                     let af = *bp.add(dest_off);
-                    if af == DG_AF_INET && ep_id < MAX_DG_ENDPOINTS {
+                    // The endpoint is admitted before the destination is
+                    // read: `ep_id` is an index, the tag is the authority,
+                    // and a consumer that does not hold the endpoint gets
+                    // neither a datagram out nor a name lookup out of it.
+                    let source_port = if ep_id >= MAX_DG_ENDPOINTS {
+                        dg_send_error(s, ep_id as u8, -97); // EAFNOSUPPORT
+                        None
+                    } else {
                         let conn = &*s.tcp_conns.as_ptr().add(ep_id);
                         if !(conn.is_datagram && conn.state == tcp::TcpState::Listen) {
                             // The slot exists but holds no live datagram
@@ -7251,28 +7374,62 @@ unsafe fn service_net_channels(s: &mut IpState) {
                             // closed, or a slot that was never bound.
                             s.drops.dg_ep_unowned = s.drops.dg_ep_unowned.wrapping_add(1);
                             dg_send_error(s, ep_id as u8, -88); // ENOTSOCK
+                            None
                         } else if conn.owner_tag != claimed_tag {
                             // A live endpoint reached by a consumer that does
-                            // not hold it. `ep_id` is an index; the tag is the
-                            // authority.
+                            // not hold it.
                             s.drops.dg_ep_perm = s.drops.dg_ep_perm.wrapping_add(1);
                             dg_send_error(s, ep_id as u8, -1); // EPERM
+                            None
                         } else {
+                            Some(conn.local_port)
+                        }
+                    };
+                    // Destination: `(host-order address, port, data offset)`, or
+                    // `None` when this datagram goes nowhere — an address family
+                    // this stack does not serve (answered EAFNOSUPPORT), a
+                    // truncated record, or a name not yet in hand (the lookup
+                    // starts and the datagram is dropped for the sender to
+                    // retransmit).
+                    let dest: Option<(u32, u16, usize)> = if source_port.is_none() {
+                        None
+                    } else if af == DG_AF_INET {
+                        if plen >= dest_off + DG_V4_DEST_LEN {
                             let ap = bp.add(dest_off + 1);
                             let dst_ip =
                                 u32::from_be_bytes([*ap, *ap.add(1), *ap.add(2), *ap.add(3)]);
                             let dst_port = u16::from_le_bytes([*ap.add(4), *ap.add(5)]);
-                            let udp_data = bp.add(dest_off + DG_V4_DEST_LEN);
-                            let udp_len = plen - dest_off - DG_V4_DEST_LEN;
-                            let local_port = conn.local_port;
-                            let rv =
-                                send_udp_data(s, dst_ip, dst_port, local_port, udp_data, udp_len);
-                            if rv != 0 {
-                                dg_send_error(s, ep_id as u8, rv);
-                            }
+                            Some((dst_ip, dst_port, dest_off + DG_V4_DEST_LEN))
+                        } else {
+                            None
+                        }
+                    } else if af == DG_AF_NAME {
+                        let name_len = if plen > dest_off + 1 {
+                            buf[dest_off + 1] as usize
+                        } else {
+                            0
+                        };
+                        let name_end = dest_off + 2 + name_len;
+                        if name_len == 0 || plen < name_end + 2 {
+                            None
+                        } else {
+                            let name = &buf[dest_off + 2..name_end];
+                            let dst_port = u16::from_le_bytes([buf[name_end], buf[name_end + 1]]);
+                            resolve_for_datagram(s, name).map(|ip| (ip, dst_port, name_end + 2))
                         }
                     } else {
                         dg_send_error(s, ep_id as u8, -97); // EAFNOSUPPORT
+                        None
+                    };
+                    if let (Some(local_port), Some((dst_ip, dst_port, data_off))) =
+                        (source_port, dest)
+                    {
+                        let udp_data = bp.add(data_off);
+                        let udp_len = plen - data_off;
+                        let rv = send_udp_data(s, dst_ip, dst_port, local_port, udp_data, udp_len);
+                        if rv != 0 {
+                            dg_send_error(s, ep_id as u8, rv);
+                        }
                     }
                 }
             }
@@ -7312,6 +7469,455 @@ unsafe fn service_net_channels(s: &mut IpState) {
 }
 
 // ============================================================================
+// Outbound connect and the stub resolver
+// ============================================================================
+
+/// No routing tag on a connect (`net_proto::REQUESTER_TAG_NONE`).
+const REQUESTER_TAG_NONE: u8 = abi::contracts::net::net_proto::REQUESTER_TAG_NONE;
+
+/// Open a TCP connection to a literal address (host order, as `remote_ip`
+/// holds it). A connect to this host's own address is served in-module by
+/// the local-delivery fastpath; anything else takes a slot, an ephemeral
+/// port and a SYN. Failure is reported as `MSG_ERROR` on `requester_tag`.
+unsafe fn connect_v4(s: &mut IpState, ip: u32, port: u16, requester_tag: u8) {
+    // LOCAL-DELIVERY FASTPATH: a connect to this host's own address (or
+    // 127.0.0.1) is served entirely in-module — see `loopback_peer`.
+    if ip == 0x7F00_0001 || (s.local_ip != 0 && ip == s.local_ip) {
+        connect_loopback(s, port, requester_tag);
+        return;
+    }
+
+    let Some(ci) = alloc_free_slot(s) else {
+        net_send_error(s, 0, -12, requester_tag); // ENOMEM
+        return;
+    };
+    if !ensure_isn_secret(s) {
+        // EAGAIN — entropy may arrive later; the caller may retry, but the
+        // stack will not substitute a predictable sequence in the meantime.
+        net_send_error(s, 0, -11, requester_tag);
+        return;
+    }
+    let Some(local_port) = next_port(s) else {
+        // EADDRNOTAVAIL — no ephemeral port available.
+        net_send_error(s, 0, -99, requester_tag);
+        return;
+    };
+    let iss = compute_iss(s, s.local_ip, local_port, ip, port);
+
+    let conn = &mut *s.tcp_conns.as_mut_ptr().add(ci);
+    conn.state = tcp::TcpState::SynSent;
+    conn.remote_ip = ip;
+    conn.remote_port = port;
+    conn.local_port = local_port;
+    // Outbound/host traffic sources from slot 0; set it concretely so the
+    // peer's replies (dst = local_ip → slot 0) match on the demux axis.
+    // Reset explicitly — this path reuses a slot in place.
+    conn.local_slot = 0;
+    conn.connect_tag = requester_tag;
+    conn.iss = iss;
+    conn.snd_nxt = iss;
+    conn.snd_una = iss;
+    conn.rcv_wnd = 512;
+    conn.retransmit_timer = 0;
+    conn_index_insert(s, ci);
+
+    send_tcp_control(s, ci, tcp::SYN, false);
+}
+
+/// True once `deadline_ms` has passed, wrap-safe over the 32-bit
+/// millisecond clock.
+#[inline(always)]
+fn deadline_passed(now_ms: u32, deadline_ms: u32) -> bool {
+    (now_ms.wrapping_sub(deadline_ms) as i32) >= 0
+}
+
+/// The server named dials are resolved at: `resolver` when set, otherwise
+/// the one the DHCP lease supplied. 0 when neither is known.
+#[inline(always)]
+fn resolver_server(s: &IpState) -> u32 {
+    if s.resolver != 0 {
+        s.resolver
+    } else {
+        s.dns_server
+    }
+}
+
+/// Bring a dialled name into the form the tables hold: lowercase, one
+/// trailing dot dropped, within `DNS_NAME_CAP`, and made of labels that
+/// encode. Returns the length in `out`, or 0 when the name is refused.
+unsafe fn resolver_normalise(name: &[u8], out: &mut [u8; DNS_NAME_CAP]) -> usize {
+    let n = dns_wire::copy_name_lower(out.as_mut_ptr(), DNS_NAME_CAP, name.as_ptr(), name.len());
+    if n == 0 {
+        return 0;
+    }
+    let mut labels = [0u8; DNS_NAME_CAP + 2];
+    if dns_wire::encode_name(out.as_ptr(), n, labels.as_mut_ptr()) == 0 {
+        return 0;
+    }
+    n
+}
+
+/// Byte equality of a table entry's name with `name`.
+#[inline(always)]
+fn entry_name_is(entry_name: &[u8; DNS_NAME_CAP], entry_len: u8, name: &[u8]) -> bool {
+    usize::from(entry_len) == name.len() && &entry_name[..name.len()] == name
+}
+
+/// The cached address for `name`, unless the entry has expired.
+unsafe fn dns_cache_get(s: &IpState, name: &[u8], now_ms: u32) -> Option<u32> {
+    let mut i = 0;
+    while i < MAX_DNS_CACHE {
+        let e = &*s.dns_cache.as_ptr().add(i);
+        if e.name_len != 0
+            && entry_name_is(&e.name, e.name_len, name)
+            && !deadline_passed(now_ms, e.expires_ms)
+        {
+            return Some(e.addr);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Record an answer. The name's own entry is refreshed if it has one;
+/// otherwise an empty or expired entry is taken, and failing that the
+/// entry nearest its expiry is replaced. The TTL is clamped by the policy
+/// constants: a zero TTL is still held briefly, a long one is bounded.
+unsafe fn dns_cache_put(s: &mut IpState, name: &[u8], addr: u32, ttl_s: u32, now_ms: u32) {
+    let ttl_s = if ttl_s == 0 {
+        DNS_TTL_ZERO_S
+    } else {
+        ttl_s.clamp(DNS_TTL_MIN_S, DNS_TTL_MAX_S)
+    };
+    let expires_ms = now_ms.wrapping_add(ttl_s.saturating_mul(1000));
+
+    let mut victim = 0usize;
+    let mut victim_left = u32::MAX;
+    let mut i = 0;
+    while i < MAX_DNS_CACHE {
+        let e = &*s.dns_cache.as_ptr().add(i);
+        if e.name_len == 0 || deadline_passed(now_ms, e.expires_ms) {
+            if victim_left != 0 {
+                victim = i;
+                victim_left = 0;
+            }
+        } else if entry_name_is(&e.name, e.name_len, name) {
+            victim = i;
+            break;
+        } else {
+            let left = e.expires_ms.wrapping_sub(now_ms);
+            if left < victim_left {
+                victim = i;
+                victim_left = left;
+            }
+        }
+        i += 1;
+    }
+    let e = &mut *s.dns_cache.as_mut_ptr().add(victim);
+    e.name = [0u8; DNS_NAME_CAP];
+    e.name[..name.len()].copy_from_slice(name);
+    e.name_len = name.len() as u8;
+    e.addr = addr;
+    e.expires_ms = expires_ms;
+}
+
+/// Dial a name: from the cache when it is in hand, otherwise parked on a
+/// lookup until the answer lands. Refusals and failures are reported as
+/// `MSG_ERROR` on `requester_tag`.
+unsafe fn connect_by_name(s: &mut IpState, name: &[u8], port: u16, requester_tag: u8) {
+    let mut held = [0u8; DNS_NAME_CAP];
+    let len = resolver_normalise(name, &mut held);
+    if len == 0 {
+        net_send_error(s, 0, -22, requester_tag); // EINVAL
+        return;
+    }
+    let now_ms = dev_millis(&*s.syscalls) as u32;
+    if let Some(ip) = dns_cache_get(s, &held[..len], now_ms) {
+        connect_v4(s, ip, port, requester_tag);
+        return;
+    }
+    if let Err(errno) = resolver_start(s, &held[..len], port, requester_tag, false, now_ms) {
+        s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
+        net_send_error(s, 0, errno, requester_tag);
+    }
+}
+
+/// The address a named datagram goes to, when the name is in hand. A name
+/// that is not starts a cache-only lookup and answers `None`: the datagram
+/// is dropped, and the sender's retransmit finds the answer in the cache.
+unsafe fn resolve_for_datagram(s: &mut IpState, name: &[u8]) -> Option<u32> {
+    let mut held = [0u8; DNS_NAME_CAP];
+    let len = resolver_normalise(name, &mut held);
+    if len == 0 {
+        return None;
+    }
+    let now_ms = dev_millis(&*s.syscalls) as u32;
+    if let Some(ip) = dns_cache_get(s, &held[..len], now_ms) {
+        return Some(ip);
+    }
+    if resolver_start(s, &held[..len], 0, REQUESTER_TAG_NONE, true, now_ms).is_err() {
+        s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
+    }
+    None
+}
+
+/// A query id that collides with no query in flight, from the CSPRNG. An
+/// off-path answer has to guess it as well as the port.
+unsafe fn resolver_draw_id(s: &mut IpState) -> Option<u16> {
+    let sys = &*s.syscalls;
+    let mut draw = 0;
+    while draw < DNS_ID_DRAWS {
+        let mut raw = [0u8; 2];
+        if dev_csprng_fill(sys, raw.as_mut_ptr(), 2) < 0 {
+            s.drops.entropy_unavailable = s.drops.entropy_unavailable.wrapping_add(1);
+            return None;
+        }
+        let id = u16::from_le_bytes(raw);
+        let mut taken = false;
+        let mut i = 0;
+        while i < MAX_DNS_PENDING {
+            let e = &*s.dns_pending.as_ptr().add(i);
+            if e.flags & DNS_PEND_ACTIVE != 0 && e.id == id {
+                taken = true;
+                break;
+            }
+            i += 1;
+        }
+        if !taken {
+            return Some(id);
+        }
+        draw += 1;
+    }
+    None
+}
+
+/// Send the A query for pending entry `slot` to the resolver. A negative
+/// errno means the datagram could not be staged at all (no route); a
+/// neighbour still resolving drops it silently, and the retry covers that.
+unsafe fn resolver_send(s: &mut IpState, slot: usize) -> i8 {
+    let (id, name, name_len) = {
+        let e = &*s.dns_pending.as_ptr().add(slot);
+        (e.id, e.name, usize::from(e.name_len))
+    };
+    let mut pkt = [0u8; DNS_QUERY_BUF];
+    let n = dns_wire::build_query(id, &name[..name_len], dns_wire::QTYPE_A, &mut pkt);
+    if n == 0 {
+        return -22; // EINVAL — the name was checked to encode at admission
+    }
+    let server = resolver_server(s);
+    let src_port = s.resolver_port;
+    send_udp_data(s, server, dns_wire::DNS_PORT, src_port, pkt.as_ptr(), n)
+}
+
+/// Park a dial (or a cache warm) on a lookup for `name`: it joins the
+/// query already in flight for that name, or becomes the leader of a new
+/// one and sends it. `Err` carries the errno the requester is answered
+/// with: `ENOENT` when there is no resolver to ask or no port to ask from,
+/// `EAGAIN` when the table or the entropy source has nothing to give.
+unsafe fn resolver_start(
+    s: &mut IpState,
+    name: &[u8],
+    port: u16,
+    tag: u8,
+    cache_only: bool,
+    now_ms: u32,
+) -> Result<(), i8> {
+    if resolver_server(s) == 0 {
+        return Err(-2); // ENOENT
+    }
+    if s.resolver_port == 0 {
+        match next_port(s) {
+            Some(p) => s.resolver_port = p,
+            None => return Err(-2), // ENOENT
+        }
+    }
+
+    let mut slot = MAX_DNS_PENDING;
+    let mut leader = MAX_DNS_PENDING;
+    let mut i = 0;
+    while i < MAX_DNS_PENDING {
+        let e = &*s.dns_pending.as_ptr().add(i);
+        if e.flags & DNS_PEND_ACTIVE == 0 {
+            if slot == MAX_DNS_PENDING {
+                slot = i;
+            }
+        } else if e.flags & DNS_PEND_LEADER != 0 && entry_name_is(&e.name, e.name_len, name) {
+            leader = i;
+        }
+        i += 1;
+    }
+    if slot == MAX_DNS_PENDING {
+        return Err(-11); // EAGAIN
+    }
+
+    let mut flags = DNS_PEND_ACTIVE;
+    if cache_only {
+        flags |= DNS_PEND_CACHE_ONLY;
+    }
+    let (id, deadline_ms) = if leader < MAX_DNS_PENDING {
+        let l = &*s.dns_pending.as_ptr().add(leader);
+        (l.id, l.deadline_ms)
+    } else {
+        flags |= DNS_PEND_LEADER;
+        let Some(id) = resolver_draw_id(s) else {
+            return Err(-11); // EAGAIN
+        };
+        (id, now_ms.wrapping_add(DNS_QUERY_TIMEOUT_MS))
+    };
+    {
+        let e = &mut *s.dns_pending.as_mut_ptr().add(slot);
+        e.name = [0u8; DNS_NAME_CAP];
+        e.name[..name.len()].copy_from_slice(name);
+        e.name_len = name.len() as u8;
+        e.flags = 0;
+        e.tag = tag;
+        e.retries = 0;
+        e.port = port;
+        e.id = id;
+        e.deadline_ms = deadline_ms;
+    }
+    if flags & DNS_PEND_LEADER != 0 {
+        let rv = resolver_send(s, slot);
+        if rv < 0 {
+            return Err(rv);
+        }
+    }
+    (*s.dns_pending.as_mut_ptr().add(slot)).flags = flags;
+    s.dns_pending_live = s.dns_pending_live.saturating_add(1);
+    Ok(())
+}
+
+/// Release pending entry `slot`.
+unsafe fn resolver_clear(s: &mut IpState, slot: usize) {
+    (*s.dns_pending.as_mut_ptr().add(slot)).flags = 0;
+    s.dns_pending_live = s.dns_pending_live.saturating_sub(1);
+}
+
+/// Complete every dial waiting on query `id` with `addr`, running the
+/// literal connect path for each so it reports exactly as a literal dial
+/// would.
+unsafe fn resolver_complete_group(s: &mut IpState, id: u16, addr: u32) {
+    let mut i = 0;
+    while i < MAX_DNS_PENDING {
+        let (flags, port, tag) = {
+            let e = &*s.dns_pending.as_ptr().add(i);
+            (e.flags, e.port, e.tag)
+        };
+        if flags & DNS_PEND_ACTIVE != 0 && (*s.dns_pending.as_ptr().add(i)).id == id {
+            resolver_clear(s, i);
+            if flags & DNS_PEND_CACHE_ONLY == 0 {
+                connect_v4(s, addr, port, tag);
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Fail every dial waiting on query `id` with `errno` on its tag.
+unsafe fn resolver_fail_group(s: &mut IpState, id: u16, errno: i8) {
+    let mut i = 0;
+    while i < MAX_DNS_PENDING {
+        let (flags, tag) = {
+            let e = &*s.dns_pending.as_ptr().add(i);
+            (e.flags, e.tag)
+        };
+        if flags & DNS_PEND_ACTIVE != 0 && (*s.dns_pending.as_ptr().add(i)).id == id {
+            resolver_clear(s, i);
+            s.drops.dns_unresolved = s.drops.dns_unresolved.wrapping_add(1);
+            if flags & DNS_PEND_CACHE_ONLY == 0 {
+                net_send_error(s, 0, errno, tag);
+            }
+        }
+        i += 1;
+    }
+}
+
+/// An answer on the resolver's port. It is matched to the query in flight
+/// by id and by the question it repeats; anything else is ignored.
+unsafe fn resolver_rx(s: &mut IpState, data: *const u8, len: usize) {
+    if len < dns_wire::DNS_HEADER_LEN {
+        return;
+    }
+    let id = u16::from_be_bytes([*data, *data.add(1)]);
+    let mut leader = MAX_DNS_PENDING;
+    let mut i = 0;
+    while i < MAX_DNS_PENDING {
+        let e = &*s.dns_pending.as_ptr().add(i);
+        if e.flags & (DNS_PEND_ACTIVE | DNS_PEND_LEADER) == (DNS_PEND_ACTIVE | DNS_PEND_LEADER)
+            && e.id == id
+        {
+            leader = i;
+            break;
+        }
+        i += 1;
+    }
+    if leader == MAX_DNS_PENDING {
+        return;
+    }
+    let (name, name_len) = {
+        let e = &*s.dns_pending.as_ptr().add(leader);
+        (e.name, usize::from(e.name_len))
+    };
+    let answer = {
+        let pkt = core::slice::from_raw_parts(data, len);
+        dns_wire::parse_answer_a(pkt, id, &name[..name_len])
+    };
+    match answer {
+        dns_wire::AnswerA::Address(a, ttl) => {
+            let addr = u32::from_be_bytes(a);
+            let now_ms = dev_millis(&*s.syscalls) as u32;
+            dns_cache_put(s, &name[..name_len], addr, ttl, now_ms);
+            resolver_complete_group(s, id, addr);
+        }
+        dns_wire::AnswerA::Negative => resolver_fail_group(s, id, -2), // ENOENT
+        dns_wire::AnswerA::Unrelated => {}
+    }
+}
+
+/// Retransmit or give up on queries whose deadline has passed. A retry
+/// carries a fresh id, which every entry waiting on the name takes up.
+unsafe fn step_resolver(s: &mut IpState) {
+    if s.dns_pending_live == 0 {
+        return;
+    }
+    let now_ms = dev_millis(&*s.syscalls) as u32;
+    let mut i = 0;
+    while i < MAX_DNS_PENDING {
+        let (flags, retries, id, deadline_ms) = {
+            let e = &*s.dns_pending.as_ptr().add(i);
+            (e.flags, e.retries, e.id, e.deadline_ms)
+        };
+        if flags & (DNS_PEND_ACTIVE | DNS_PEND_LEADER) == (DNS_PEND_ACTIVE | DNS_PEND_LEADER)
+            && deadline_passed(now_ms, deadline_ms)
+        {
+            if retries < DNS_QUERY_RETRIES {
+                let Some(new_id) = resolver_draw_id(s) else {
+                    resolver_fail_group(s, id, -11); // EAGAIN
+                    i += 1;
+                    continue;
+                };
+                let mut j = 0;
+                while j < MAX_DNS_PENDING {
+                    let e = &mut *s.dns_pending.as_mut_ptr().add(j);
+                    if e.flags & DNS_PEND_ACTIVE != 0 && e.id == id {
+                        e.id = new_id;
+                        e.deadline_ms = now_ms.wrapping_add(DNS_QUERY_TIMEOUT_MS);
+                    }
+                    j += 1;
+                }
+                (*s.dns_pending.as_mut_ptr().add(i)).retries = retries + 1;
+                if resolver_send(s, i) < 0 {
+                    resolver_fail_group(s, new_id, -2); // ENOENT
+                }
+            } else {
+                resolver_fail_group(s, id, -2); // ENOENT
+            }
+        }
+        i += 1;
+    }
+}
+
+// ============================================================================
 // TCP Timers
 // ============================================================================
 
@@ -7319,13 +7925,12 @@ unsafe fn service_net_channels(s: &mut IpState) {
 /// SYN / SYN-ACK retransmit schedule, in 50 ms timer ticks: fire at 0.5 s,
 /// 1.5 s, 3.5 s, 7.5 s (gaps 0.5/1/2/4 s — exponential backoff).
 ///
-/// The previous flat `timer % 60 == 0` retransmitted only every 3 s, so a
-/// single dropped SYN-ACK stalled a connection's establishment for a full 3 s.
-/// Under a lossy link or a connection burst that throttled *establishment*,
-/// which is the dominant achievable-throughput limiter (the server itself has
-/// CPU headroom at 10k+ rps; the ceiling is how fast connections come up). A
-/// faster first retransmit recovers a dropped SYN-ACK in 0.5 s instead of 3 s.
-/// The 15 s connect timeout (`>= 300`) is unchanged.
+/// Establishment, not service, is the dominant achievable-throughput
+/// limiter: the server has CPU headroom at 10k+ rps, so the ceiling is how
+/// fast connections come up. A first retransmit at 0.5 s therefore recovers
+/// a dropped SYN-ACK a whole backoff step sooner than a flat schedule would,
+/// which is what a lossy link or a connection burst is held back by. The
+/// connect timeout is 15 s (`>= 300`).
 #[inline]
 fn is_syn_retransmit_tick(timer: u16) -> bool {
     matches!(timer, 10 | 30 | 70 | 150)
@@ -7485,8 +8090,9 @@ unsafe fn sweep_range(s: &mut IpState, start: usize, end: usize) {
                 // resolution, not on the peer.
                 let unsent = conn.snd_nxt == conn.iss;
                 // Retransmit SYN-ACK on the exponential-backoff schedule
-                // (0.5/1.5/3.5/7.5 s) instead of the old flat 3 s — a dropped
-                // SYN-ACK was the main cause of slow connection establishment.
+                // (0.5/1.5/3.5/7.5 s): a dropped SYN-ACK otherwise stalls
+                // establishment for a whole flat retry interval, and the
+                // early attempts cost little.
                 if unsent || is_syn_retransmit_tick(conn.retransmit_timer) {
                     send_tcp_control(s, i, tcp::SYN | tcp::ACK, true);
                 }

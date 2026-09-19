@@ -1723,8 +1723,7 @@ const NON_PARAM_KEYS: &[&str] = &[
     "key_file",
     // `trust` is NOT here: it is a schema parameter of tls and quic (a
     // `${file:<path>}` source spec), validated like any other key and
-    // lifted out before packing by `lift_trust_source`. A
-    // `trust_cert_file` key is rewritten to it there.
+    // lifted out before packing by `lift_trust_source`.
     "verify_hostname",
     "verify_uri", // URI SAN required under peer_auth: ca_uri, extended TLV tag 15
     "alpn", // RFC 7301 ALPN list, emitted as extended TLV tag 14
@@ -2119,33 +2118,13 @@ fn closest_param_name<'a>(key: &str, schema: &'a schema::ParamSchema) -> Option<
 /// Returns the module as validated (with `trust` present, so the schema
 /// check sees it), the module as packed (with `trust` removed, so no string
 /// TLV is emitted for a value that is resolved to a bundle instead), and
-/// the spec itself. A `trust_cert_file: <path>` key is accepted as an alias
-/// for `trust: "${file:<path>}"` and reported as deprecated; carrying both
-/// is an error, since two spellings of one decision cannot both be the
-/// decision.
+/// the spec itself. A trust set is named one way: `trust`, holding a
+/// `${file:<path>}` source spec.
 fn lift_trust_source(name: &str, module: Value) -> Result<(Value, Value, Option<String>)> {
     let mut validated = module;
     let Some(obj) = validated.as_object_mut() else {
         return Ok((validated.clone(), validated, None));
     };
-    if let Some(legacy) = obj.remove("trust_cert_file") {
-        let Some(path) = legacy.as_str() else {
-            return Err(Error::Config(format!(
-                "module '{name}': trust_cert_file must be a path string"
-            )));
-        };
-        if obj.contains_key("trust") {
-            return Err(Error::Config(format!(
-                "module '{name}': carries both `trust` and its alias `trust_cert_file`; \
-                 keep `trust`"
-            )));
-        }
-        eprintln!(
-            "  deprecated: module '{name}': `trust_cert_file: \"{path}\"` is an alias — write \
-             `trust: \"${{file:{path}}}\"`"
-        );
-        obj.insert("trust".to_string(), json!(format!("${{file:{path}}}")));
-    }
     let trust_spec = match obj.get("trust") {
         None => None,
         Some(Value::String(spec)) => Some(spec.clone()),

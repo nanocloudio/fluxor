@@ -17,7 +17,7 @@ Source: `modules/sdk/contracts/net/`.
 
 | File | Surface | Opcodes | Status |
 |------|---------|---------|--------|
-| `net_proto.rs` | stream | `0x01..0x13` | live: `ip`, `tls`, `ota_registry`, `linux_net`, downstream `http` |
+| `net_proto.rs` | stream | `0x01..0x14` | live: `ip`, `tls`, `ota_registry`, `linux_net`, downstream `http` |
 | `datagram.rs` | datagram | `0x20..0x43` | live: `ip`, `linux_net`, `dns`, `log_net`, `quic`, `tls` (DTLS mode) |
 | `packet.rs` | packet | `0x50..0x63` | reserved: envelope defined, no consumer |
 | `identity.rs` | address control | `0x60..0x61` | live: net identity self-registration |
@@ -57,10 +57,21 @@ payload reference: `network.md`.
 Ordered byte streams: TCP, TLS-over-TCP, HTTP/1.x, MQTT, WebSocket
 after upgrade. Operations: bind/listen, connect, accept/connected,
 send, receive, close, error. The contract is stream-only: only
-`SOCK_TYPE_STREAM` (1) is accepted on `CMD_CONNECT`, and any other
+`SOCK_TYPE_STREAM` (1) is accepted on `CMD_CONNECT_TO`, and any other
 `sock_type` fails with EINVAL. The retransmit hints (`MSG_RETRANSMIT`
 0x07 / `MSG_ACK` 0x08) are reserved in the contract and defined
 privately by the `ip` module.
+
+Who resolves: the provider that receives the `CMD_CONNECT_TO` record.
+A target is an IPv4 or IPv6 literal, or a DNS name (`AF_NAME`), and a
+name is resolved by the network, never by the module that dials —
+`linux_net` through the host's `getaddrinfo` on a resolver thread with a
+60 s positive cache, `ip` through its stub resolver against the DHCP
+server's nameserver or the `resolver` param, the wasm host by URL. A
+provider that cannot resolve answers an `AF_NAME` target with EINVAL,
+and one with no IPv6 stack answers an `AF_INET6` literal the same way —
+`ip` refuses both. An IPv4 literal is the only target every provider
+dials.
 
 ### Datagram Surface
 

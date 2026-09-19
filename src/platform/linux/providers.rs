@@ -1144,7 +1144,17 @@ const MSG_BIND_REFUSED: u8 = 0x07;
 const CMD_BIND: u8 = 0x10;
 const CMD_SEND: u8 = 0x11;
 const CMD_CLOSE: u8 = 0x12;
+/// RETIRED dial (`[sock_type][ip u32 LE][port][tag?]`). Answered with
+/// `MSG_ERROR ENOSYS` on its tag so a stale emitter fails on its first dial
+/// rather than dialling the address its bytes would decode to under the
+/// live shape.
 const CMD_CONNECT: u8 = 0x13;
+/// The dial: `[sock_type][af][port u16 LE][addr…][tag?]`, decoded by the
+/// contract's `read_connect_to`. A name is resolved here — the provider is
+/// the resolver on every platform — through `getaddrinfo(3)` on a thread,
+/// so `/etc/hosts`, `resolv.conf`, nsswitch and systemd-resolved all apply
+/// and the scheduler never blocks on a lookup.
+const CMD_CONNECT_TO: u8 = 0x14;
 
 // Datagram surface (modules/sdk/contracts/net/datagram.rs, opcodes
 // 0x20..0x43). Disjoint from net_proto so the same channel can carry
@@ -1161,6 +1171,11 @@ const DG_MSG_CLOSED: u8 = 0x42;
 )]
 const DG_MSG_ERROR: u8 = 0x43;
 const DG_AF_INET: u8 = 4;
+/// Datagram destination given as a DNS name (`[len][name]`), resolved by
+/// this provider exactly as a stream dial is. A name not yet in the cache
+/// starts a lookup and the datagram is DROPPED: a datagram sender
+/// retransmits, and the next send after the answer lands goes out.
+const DG_AF_NAME: u8 = 1;
 /// Marker introducing the owner tag on `DG_CMD_SEND_TO` / `DG_CMD_CLOSE`. It
 /// sits at the offset that otherwise carries `af`, and is distinct from every
 /// defined address family, so the tagged and untagged shapes separate at a
@@ -1216,9 +1231,16 @@ struct LinuxNetConn {
     write_offset: u32,
     /// Total valid bytes in `write_buf` (drained slice is `[offset..len]`).
     write_len: u32,
-    /// Requester tag from `CMD_CONNECT`, echoed in `MSG_CONNECTED` /
+    /// Requester tag from `CMD_CONNECT_TO`, echoed in `MSG_CONNECTED` /
     /// connect-failure `MSG_ERROR` so a fanned net_out routes the event back.
     connect_tag: u8,
+    /// `state == 5` (resolving, no fd yet): the lookup this slot is waiting
+    /// on. A result whose id does not match is stale — the slot was revoked
+    /// and possibly retaken while the lookup ran — and is dropped.
+    resolve_id: u32,
+    /// `state == 5`: when the lookup was handed to the resolver thread, so a
+    /// resolver that never answers cannot pin the slot.
+    resolve_started: Option<std::time::Instant>,
     /// The COMMANDING owner — the owner of the module whose lane issued the
     /// bind/connect that created this slot (/// attribution is carried via the lane, never inferred from the executing
     /// module, which may be system-owned). Immutable for the life of the slot.
@@ -1238,6 +1260,13 @@ struct LinuxNetConn {
     /// that took the same index, and a consumer that never closes cannot
     /// pin the slot either.
     release_at: Option<std::time::Instant>,
+    /// `state == 1` (connecting): the addresses this name resolved to that
+    /// have not been tried yet, in the host's order. A refused or
+    /// unreachable connect moves to the next before it is reported, so a
+    /// name whose first address is dead — `localhost` on a dual-stack box
+    /// answering `::1` ahead of `127.0.0.1` — still reaches a service
+    /// listening on the other one.
+    alts: Vec<Resolved>,
 }
 
 impl LinuxNetConn {
@@ -1250,10 +1279,13 @@ impl LinuxNetConn {
             write_offset: 0,
             write_len: 0,
             connect_tag: 0,
+            resolve_id: 0,
+            resolve_started: None,
             release_at: None,
             owner: crate::kernel::workload::owner::OWNER_SYSTEM,
             dg_owner_tag: 0,
             write_buf: Vec::new(),
+            alts: Vec::new(),
         }
     }
 }
@@ -1325,9 +1357,227 @@ pub struct LinuxNetState {
     /// flush before each step. Bounded so a wedged consumer can't grow it without
     /// limit (oldest dropped past the cap).
     pending_ctrl: std::collections::VecDeque<([u8; 8], usize)>,
+    /// The resolver thread's queues, started on the first name this
+    /// instance is asked to dial. Everything crossing the thread boundary
+    /// is owned: a job carries its own copy of the name.
+    resolver: Option<Resolver>,
+    /// Ids handed to lookups, so a result can be matched to the slot that
+    /// is still waiting for it and no other.
+    resolve_seq: u32,
+    /// Slots in `resolving`, so a step with none pays nothing for the
+    /// guard sweep.
+    resolving: usize,
+    /// Names a cache-warming lookup (a named datagram destination) is in
+    /// flight for. A datagram sender retransmits while it waits, and
+    /// without this every retransmit would queue another identical job.
+    warming: Vec<String>,
+    /// Positive cache, consulted BEFORE a slot is taken: `getaddrinfo` has
+    /// no TTL to report, so entries live `DNS_CACHE_TTL`. It is what keeps
+    /// the common case out of the resolver thread — and out of tls's single
+    /// in-flight connect window, which a lookup would otherwise stretch to
+    /// a DNS round-trip.
+    dns_cache: Vec<DnsCacheEntry>,
+}
+
+/// One address a name resolved to, in network order as the socket wants it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resolved {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+struct DnsCacheEntry {
+    name: String,
+    /// Every candidate the host gave, in its order. Cached whole so a name
+    /// answered from cache falls back exactly as a freshly resolved one does.
+    addrs: Vec<Resolved>,
+    expires: std::time::Instant,
+}
+
+/// How many addresses one name may be dialled at, in the host's order. A
+/// name that resolves to more than this is not worth a longer ladder: the
+/// connect timeout bounds each rung, and a host with four dead addresses is
+/// down, not slow.
+const MAX_DIAL_CANDIDATES: usize = 4;
+
+/// Cache entries per instance; one slot per distinct name the graph dials.
+const DNS_CACHE_SLOTS: usize = 32;
+/// How long a positive answer is reused. `getaddrinfo` returns no TTL, so
+/// the contract's fallback applies.
+const DNS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// A resolving slot older than this is failed `ENOENT`: glibc's own retry
+/// ladder is shorter, so this only fires if the resolver thread is gone.
+const RESOLVE_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct ResolveJob {
+    id: u32,
+    /// The stream slot waiting on this lookup; `None` for a datagram
+    /// destination, which only warms the cache.
+    slot: Option<usize>,
+    name: String,
+    /// Datagram sockets here are `AF_INET`, so their lookups ask for v4.
+    v4_only: bool,
+}
+
+struct ResolveDone {
+    id: u32,
+    slot: Option<usize>,
+    name: String,
+    result: Result<Vec<Resolved>, i32>,
+}
+
+struct Resolver {
+    jobs: std::sync::mpsc::Sender<ResolveJob>,
+    done: std::sync::mpsc::Receiver<ResolveDone>,
+}
+
+impl Resolver {
+    fn start() -> Option<Self> {
+        let (jobs, job_rx) = std::sync::mpsc::channel::<ResolveJob>();
+        let (done_tx, done) = std::sync::mpsc::channel::<ResolveDone>();
+        let spawned = std::thread::Builder::new()
+            .name("fluxor-resolver".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let result = resolve_blocking(&job.name, job.v4_only);
+                    let reply = ResolveDone {
+                        id: job.id,
+                        slot: job.slot,
+                        name: job.name,
+                        result,
+                    };
+                    if done_tx.send(reply).is_err() {
+                        break;
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => Some(Self { jobs, done }),
+            Err(e) => {
+                log::error!("[linux_net] cannot start the resolver thread: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// `getaddrinfo(3)` with `AI_ADDRCONFIG`: the host's resolver, hosts file
+/// and nsswitch order, which is the order the candidates are returned in.
+/// The caller dials them in turn. Runs on the resolver thread only.
+fn resolve_blocking(name: &str, v4_only: bool) -> Result<Vec<Resolved>, i32> {
+    let cname = match std::ffi::CString::new(name) {
+        Ok(c) => c,
+        Err(_) => return Err(libc::EINVAL),
+    };
+    // SAFETY: `hints` is zeroed then filled; `cname` outlives the call; the
+    // result list is walked while owned and released with `freeaddrinfo`.
+    unsafe {
+        let mut hints: libc::addrinfo = core::mem::zeroed();
+        hints.ai_family = if v4_only {
+            libc::AF_INET
+        } else {
+            libc::AF_UNSPEC
+        };
+        hints.ai_socktype = libc::SOCK_STREAM;
+        hints.ai_flags = libc::AI_ADDRCONFIG;
+        let mut res: *mut libc::addrinfo = core::ptr::null_mut();
+        let rc = libc::getaddrinfo(cname.as_ptr(), core::ptr::null(), &hints, &mut res);
+        if rc != 0 {
+            let why = std::ffi::CStr::from_ptr(libc::gai_strerror(rc)).to_string_lossy();
+            log::warn!("[linux_net] resolve {name}: {why}");
+            return Err(libc::ENOENT);
+        }
+        let mut found: Vec<Resolved> = Vec::new();
+        let mut cur = res;
+        while !cur.is_null() && found.len() < MAX_DIAL_CANDIDATES {
+            let ai = &*cur;
+            if ai.ai_family == libc::AF_INET && !ai.ai_addr.is_null() {
+                let sa = &*(ai.ai_addr as *const libc::sockaddr_in);
+                found.push(Resolved::V4(sa.sin_addr.s_addr.to_ne_bytes()));
+            } else if ai.ai_family == libc::AF_INET6 && !ai.ai_addr.is_null() && !v4_only {
+                let sa = &*(ai.ai_addr as *const libc::sockaddr_in6);
+                found.push(Resolved::V6(sa.sin6_addr.s6_addr));
+            }
+            cur = ai.ai_next;
+        }
+        libc::freeaddrinfo(res);
+        if found.is_empty() {
+            Err(libc::ENOENT)
+        } else {
+            Ok(found)
+        }
+    }
 }
 
 impl LinuxNetState {
+    /// A cached, unexpired answer for `name`.
+    fn dns_cache_get(&self, name: &[u8]) -> Option<Vec<Resolved>> {
+        let now = std::time::Instant::now();
+        self.dns_cache
+            .iter()
+            .find(|e| e.name.as_bytes() == name && e.expires > now)
+            .map(|e| e.addrs.clone())
+    }
+
+    fn dns_cache_put(&mut self, name: String, addrs: Vec<Resolved>) {
+        let now = std::time::Instant::now();
+        let expires = now + DNS_CACHE_TTL;
+        if let Some(e) = self.dns_cache.iter_mut().find(|e| e.name == name) {
+            e.addrs = addrs;
+            e.expires = expires;
+            return;
+        }
+        if self.dns_cache.len() >= DNS_CACHE_SLOTS {
+            // Evict an expired entry if any, else the soonest to expire.
+            let victim = self
+                .dns_cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.expires)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.dns_cache.swap_remove(victim);
+        }
+        self.dns_cache.push(DnsCacheEntry {
+            name,
+            addrs,
+            expires,
+        });
+    }
+
+    /// Hand `name` to the resolver thread. `false` when the thread cannot
+    /// be started or has gone away, which the caller reports as `ENOENT`.
+    fn resolve_async(&mut self, name: &[u8], slot: Option<usize>, v4_only: bool) -> Option<u32> {
+        if slot.is_none() && self.warming.iter().any(|n| n.as_bytes() == name) {
+            return None; // already looking this one up
+        }
+        if self.resolver.is_none() {
+            self.resolver = Resolver::start();
+        }
+        let resolver = self.resolver.as_ref()?;
+        self.resolve_seq = self.resolve_seq.wrapping_add(1).max(1);
+        let id = self.resolve_seq;
+        let job = ResolveJob {
+            id,
+            slot,
+            name: String::from_utf8_lossy(name).into_owned(),
+            v4_only,
+        };
+        if resolver.jobs.send(job).is_err() {
+            log::error!("[linux_net] resolver thread is gone");
+            self.resolver = None;
+            // Nothing is in flight any more: the answers those names were
+            // waiting for died with the thread.
+            self.warming.clear();
+            return None;
+        }
+        if slot.is_none() {
+            self.warming
+                .push(String::from_utf8_lossy(name).into_owned());
+        }
+        Some(id)
+    }
+
     /// Build the per-instance state on the heap. The connection table is
     /// a `Vec` of small slot records; write backlogs are allocated per
     /// connection on first use, so the size of this struct does not
@@ -1374,6 +1624,11 @@ impl LinuxNetState {
             // TCP listener bound by the first CMD_BIND.
             next_alloc: 1,
             pending_ctrl: std::collections::VecDeque::new(),
+            resolver: None,
+            resolve_seq: 0,
+            warming: Vec::new(),
+            resolving: 0,
+            dns_cache: Vec::new(),
         })
     }
 
@@ -1499,6 +1754,7 @@ pub fn linux_net_close_all_and_clear_registry() {
                 }
                 *conn = LinuxNetConn::empty();
             }
+            st.resolving = 0;
         }
         (*reg).clear();
     }
@@ -1515,8 +1771,12 @@ pub fn linux_net_close_owner_conns(owner: crate::kernel::workload::owner::OwnerH
         let reg = &raw const LINUX_NET_REGISTRY;
         for &st_ptr in (*reg).iter() {
             let st = &mut *st_ptr;
+            let mut resolving_freed = 0usize;
             for (i, conn) in st.conns.iter_mut().enumerate() {
                 if conn.state != 0 && conn.owner == owner {
+                    if conn.state == 5 {
+                        resolving_freed += 1;
+                    }
                     if conn.fd >= 0 {
                         libc::close(conn.fd);
                         log::info!(
@@ -1527,6 +1787,7 @@ pub fn linux_net_close_owner_conns(owner: crate::kernel::workload::owner::OwnerH
                     *conn = LinuxNetConn::empty();
                 }
             }
+            st.resolving = st.resolving.saturating_sub(resolving_freed);
         }
     }
 }
@@ -1887,6 +2148,27 @@ unsafe fn linux_net_dg_cmd_bind(st: &mut LinuxNetState, port: u16, owner_tag: u1
     linux_net_send_msg(st, &msg);
 }
 
+/// Whether the consumer claiming `claimed_tag` may send on endpoint `ep`:
+/// the slot holds a live bound datagram endpoint and the tag recorded at
+/// bind is the one claimed. Answers `EPERM` on a live endpoint reached by
+/// a consumer that does not hold it, and nothing at all on a slot that
+/// holds no endpoint. Asked BEFORE the destination is read, so an
+/// unowned endpoint buys neither a datagram nor a name lookup.
+unsafe fn dg_endpoint_admits(st: &mut LinuxNetState, ep: i16, claimed_tag: u16) -> bool {
+    if ep < 0 || (ep as usize) >= st.conns.len() {
+        return false;
+    }
+    let c = &st.conns[ep as usize];
+    if c.state != 3 || c.conn_type != CONN_TYPE_UDP_BOUND || c.fd < 0 {
+        return false;
+    }
+    if c.dg_owner_tag != claimed_tag {
+        linux_net_send_dg_error(st, 1); // EPERM
+        return false;
+    }
+    true
+}
+
 unsafe fn linux_net_dg_cmd_send_to(
     st: &mut LinuxNetState,
     ep: i16,
@@ -2009,24 +2291,33 @@ unsafe fn linux_net_dg_poll_recv(st: &mut LinuxNetState) -> bool {
     had_work
 }
 
-unsafe fn linux_net_cmd_connect(
+/// The dial. Literals dial at once; a name is served from the cache or
+/// parked in a `resolving` slot (state 5, no fd) until the resolver thread
+/// answers, at which point it takes the same path a literal does.
+unsafe fn linux_net_cmd_connect_to(
     st: &mut LinuxNetState,
     sock_type: u8,
-    ip: u32,
     port: u16,
+    target: crate::abi::contracts::net::net_proto::Target<'_>,
     tag: u8,
     lane: usize,
 ) {
+    use crate::abi::contracts::net::net_proto::Target;
     // STREAM-only surface (net_proto Stream Surface v1). Datagram traffic uses
-    // the datagram surface (CMD_DG_BIND / CMD_DG_SEND_TO), not CMD_CONNECT, so a
-    // non-stream sock_type is rejected with EINVAL — matching the bare-metal IP
-    // module and the public contract.
+    // the datagram surface (CMD_DG_BIND / CMD_DG_SEND_TO), so a non-stream
+    // sock_type is rejected with EINVAL — matching the bare-metal IP module
+    // and the public contract.
     const SOCK_TYPE_STREAM: u8 = 1;
     if sock_type != SOCK_TYPE_STREAM {
         let msg = [MSG_ERROR, 0u8, 0u8, 22u8, tag]; // EINVAL, no slot allocated (conn 0, u16 LE)
         linux_net_send_msg(st, &msg);
         return;
     }
+    let addrs = match target {
+        Target::V4(a) => Some(vec![Resolved::V4(a)]),
+        Target::V6(a) => Some(vec![Resolved::V6(a)]),
+        Target::Name(name) => st.dns_cache_get(name),
+    };
     let slot = linux_net_alloc_conn(st);
     if slot < 0 {
         log::error!("[linux_net] no free connection slots");
@@ -2036,67 +2327,253 @@ unsafe fn linux_net_cmd_connect(
         return;
     }
     let idx = slot as usize;
+    let owner = st.lane_owners[lane];
+    match addrs {
+        Some(mut addrs) if !addrs.is_empty() => {
+            let first = addrs.remove(0);
+            let dial = Dial {
+                sock_type,
+                alts: addrs,
+                port,
+                tag,
+                owner,
+            };
+            linux_net_dial(st, idx, first, dial);
+        }
+        _ => {
+            let Target::Name(name) = target else {
+                unreachable!("a literal always has an address");
+            };
+            match st.resolve_async(name, Some(idx), false) {
+                Some(id) => {
+                    st.resolving += 1;
+                    st.conns[idx] = LinuxNetConn {
+                        fd: -1,
+                        conn_type: sock_type,
+                        state: 5,
+                        port,
+                        connect_tag: tag,
+                        resolve_id: id,
+                        resolve_started: Some(std::time::Instant::now()),
+                        owner,
+                        ..LinuxNetConn::empty()
+                    };
+                }
+                None => {
+                    st.conns[idx] = LinuxNetConn::empty();
+                    let msg = [MSG_ERROR, 0u8, 0u8, 2u8, tag]; // ENOENT
+                    linux_net_send_msg(st, &msg);
+                }
+            }
+        }
+    }
+}
 
-    let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+/// One posted result, or `None` when the queue is empty — or the thread is
+/// gone, in which case the queue is dropped with it.
+fn take_resolved(st: &mut LinuxNetState) -> Option<ResolveDone> {
+    match st.resolver.as_ref()?.done.try_recv() {
+        Ok(d) => Some(d),
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            st.resolver = None;
+            st.warming.clear();
+            None
+        }
+    }
+}
+
+/// Take the results the resolver thread has posted since the last step.
+/// A stream result lands in the slot that is still waiting on it (matched
+/// by id, so a revoked-and-retaken slot never receives someone else's
+/// address); a datagram result only warms the cache.
+unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
+    let mut had_work = false;
+    while let Some(done) = take_resolved(st) {
+        had_work = true;
+        if done.slot.is_none() {
+            st.warming.retain(|n| *n != done.name);
+        }
+        if let Ok(addrs) = &done.result {
+            st.dns_cache_put(done.name.clone(), addrs.clone());
+        }
+        let Some(idx) = done.slot else {
+            continue;
+        };
+        if idx >= st.conns.len() || st.conns[idx].state != 5 || st.conns[idx].resolve_id != done.id
+        {
+            continue; // stale: the slot was revoked while the lookup ran
+        }
+        st.resolving = st.resolving.saturating_sub(1);
+        let (sock_type, port, tag, owner) = {
+            let c = &st.conns[idx];
+            (c.conn_type, c.port, c.connect_tag, c.owner)
+        };
+        match done.result {
+            Ok(mut addrs) if !addrs.is_empty() => {
+                let first = addrs.remove(0);
+                let dial = Dial {
+                    sock_type,
+                    alts: addrs,
+                    port,
+                    tag,
+                    owner,
+                };
+                linux_net_dial(st, idx, first, dial);
+            }
+            Ok(_) => {
+                st.conns[idx] = LinuxNetConn::empty();
+                let msg = [MSG_ERROR, 0u8, 0u8, libc::ENOENT as u8, tag];
+                linux_net_send_msg(st, &msg);
+            }
+            Err(errno) => {
+                st.conns[idx] = LinuxNetConn::empty();
+                let msg = [MSG_ERROR, 0u8, 0u8, errno as u8, tag];
+                linux_net_send_msg(st, &msg);
+            }
+        }
+    }
+    // A slot the resolver never answered for: fail it rather than pin it.
+    if st.resolving == 0 {
+        return had_work;
+    }
+    let now = std::time::Instant::now();
+    for i in 0..st.conns.len() {
+        if st.conns[i].state != 5 {
+            continue;
+        }
+        let Some(started) = st.conns[i].resolve_started else {
+            continue;
+        };
+        if now.duration_since(started) > RESOLVE_GUARD {
+            let tag = st.conns[i].connect_tag;
+            st.conns[i] = LinuxNetConn::empty();
+            st.resolving = st.resolving.saturating_sub(1);
+            let msg = [MSG_ERROR, 0u8, 0u8, 2u8, tag]; // ENOENT
+            linux_net_send_msg(st, &msg);
+            had_work = true;
+        }
+    }
+    had_work
+}
+
+/// One outbound connect as this provider carries it: what the consumer
+/// asked for, who to answer, and the addresses the name resolved to that
+/// have not been tried yet. Passed whole down the dial ladder so a rung
+/// hands the next one everything it needs and nothing it does not.
+struct Dial {
+    sock_type: u8,
+    /// Addresses left to try after the one being dialled now.
+    alts: Vec<Resolved>,
+    port: u16,
+    /// The requester's tag, echoed on the single terminal result.
+    tag: u8,
+    owner: crate::kernel::workload::owner::OwnerHandle,
+}
+
+/// Open the socket for `addr` and start the non-blocking connect into slot
+/// `idx`, which the caller has reserved.
+///
+/// A failure here is not yet the connect's answer: `linux_net_dial_failed`
+/// takes the next candidate and only reports `MSG_ERROR` once none is left,
+/// so the requester sees one terminal result however many rungs were tried.
+unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dial: Dial) {
+    let family = match addr {
+        Resolved::V4(_) => libc::AF_INET,
+        Resolved::V6(_) => libc::AF_INET6,
+    };
+    let fd = libc::socket(family, libc::SOCK_STREAM, 0);
     if fd < 0 {
         log::error!("[linux_net] socket() failed for connect");
-        st.conns[idx] = LinuxNetConn::empty(); // release the slot we reserved
         let errno = *libc::__errno_location();
-        let cb = (idx as u16).to_le_bytes();
-        let msg = [MSG_ERROR, cb[0], cb[1], errno as u8, tag];
-        linux_net_send_msg(st, &msg);
+        linux_net_dial_failed(st, idx, dial, errno);
         return;
     }
 
     set_nonblocking(fd);
 
-    let mut addr: libc::sockaddr_in = core::mem::zeroed();
-    addr.sin_family = libc::AF_INET as u16;
-    addr.sin_port = port.to_be();
-    addr.sin_addr.s_addr = ip.to_be();
-
-    let ret = libc::connect(
-        fd,
-        &addr as *const libc::sockaddr_in as *const libc::sockaddr,
-        core::mem::size_of::<libc::sockaddr_in>() as u32,
-    );
+    let mut sa4: libc::sockaddr_in = core::mem::zeroed();
+    let mut sa6: libc::sockaddr_in6 = core::mem::zeroed();
+    let (sa_ptr, sa_len): (*const libc::sockaddr, u32) = match addr {
+        Resolved::V4(a) => {
+            sa4.sin_family = libc::AF_INET as u16;
+            sa4.sin_port = dial.port.to_be();
+            sa4.sin_addr.s_addr = u32::from_ne_bytes(a);
+            (
+                &sa4 as *const libc::sockaddr_in as *const libc::sockaddr,
+                core::mem::size_of::<libc::sockaddr_in>() as u32,
+            )
+        }
+        Resolved::V6(a) => {
+            sa6.sin6_family = libc::AF_INET6 as u16;
+            sa6.sin6_port = dial.port.to_be();
+            sa6.sin6_addr.s6_addr = a;
+            (
+                &sa6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                core::mem::size_of::<libc::sockaddr_in6>() as u32,
+            )
+        }
+    };
+    let ret = libc::connect(fd, sa_ptr, sa_len);
 
     if ret < 0 {
         let errno = *libc::__errno_location();
         if errno != libc::EINPROGRESS {
-            log::error!("[linux_net] connect() failed errno={errno}");
             libc::close(fd);
-            let cb = (idx as u16).to_le_bytes();
-            let msg = [MSG_ERROR, cb[0], cb[1], errno as u8, tag];
-            linux_net_send_msg(st, &msg);
+            linux_net_dial_failed(st, idx, dial, errno);
             return;
         }
         st.conns[idx] = LinuxNetConn {
             fd,
-            conn_type: sock_type,
+            conn_type: dial.sock_type,
             state: 1,
-            connect_tag: tag,
+            port: dial.port,
+            connect_tag: dial.tag,
+            alts: dial.alts,
             // Stamp the commanding owner so this outbound data conn is torn
             // down with its owner on drain/revoke; otherwise it stays
             // OWNER_SYSTEM and outlives revocation.
-            owner: st.lane_owners[lane],
+            owner: dial.owner,
             ..LinuxNetConn::empty()
         };
         st.watch(fd, idx, (libc::EPOLLOUT | libc::EPOLLIN) as u32);
     } else {
         st.conns[idx] = LinuxNetConn {
             fd,
-            conn_type: sock_type,
+            conn_type: dial.sock_type,
             state: 2,
-            connect_tag: tag,
-            owner: st.lane_owners[lane],
+            port: dial.port,
+            connect_tag: dial.tag,
+            owner: dial.owner,
             ..LinuxNetConn::empty()
         };
         st.watch(fd, idx, libc::EPOLLIN as u32);
         let cb = (idx as u16).to_le_bytes();
-        let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
+        let msg = [MSG_CONNECTED, cb[0], cb[1], dial.tag];
         linux_net_send_msg(st, &msg);
     }
+}
+
+/// One rung of the dial ladder failed. Take the next candidate if there is
+/// one; otherwise release the slot and give the requester the single
+/// terminal `MSG_ERROR` it is owed, carrying the errno of the last address
+/// tried. A ladder is invisible to the consumer: it asked for a name, not
+/// for an address, and what it gets back is whether the name was reached.
+unsafe fn linux_net_dial_failed(st: &mut LinuxNetState, idx: usize, mut dial: Dial, errno: i32) {
+    if !dial.alts.is_empty() {
+        let next = dial.alts.remove(0);
+        log::debug!(
+            "[linux_net] connect failed errno={errno}; {} candidate(s) left",
+            dial.alts.len()
+        );
+        linux_net_dial(st, idx, next, dial);
+        return;
+    }
+    log::error!("[linux_net] connect() failed errno={errno}");
+    st.conns[idx] = LinuxNetConn::empty();
+    let cb = (idx as u16).to_le_bytes();
+    let msg = [MSG_ERROR, cb[0], cb[1], errno as u8, dial.tag];
+    linux_net_send_msg(st, &msg);
 }
 
 /// Send `data` on `conn_id`. The fd is non-blocking, so libc::send may
@@ -2288,6 +2765,9 @@ unsafe fn linux_net_cmd_close(st: &mut LinuxNetState, conn_id: u16) {
     }
     if st.conns[idx].fd >= 0 {
         libc::close(st.conns[idx].fd);
+    }
+    if st.conns[idx].state == 5 {
+        st.resolving = st.resolving.saturating_sub(1);
     }
     st.conns[idx] = LinuxNetConn::empty();
     let cb = conn_id.to_le_bytes();
@@ -2555,17 +3035,32 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                     let tag = st.conns[i].connect_tag;
                     if err == 0 {
                         st.conns[i].state = 2;
+                        st.conns[i].alts.clear();
                         st.rewatch(st.conns[i].fd, i, libc::EPOLLIN as u32);
                         let cb = (i as u16).to_le_bytes();
                         let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
                         linux_net_send_msg(st, &msg);
                         had_work = true;
                     } else {
+                        // This address refused or was unreachable. The next
+                        // one the name resolved to gets its turn before the
+                        // requester hears anything.
+                        // Closing the fd is what drops it from epoll, as the
+                        // single-address path has always relied on.
                         libc::close(st.conns[i].fd);
+                        let dial = {
+                            let c = &mut st.conns[i];
+                            Dial {
+                                sock_type: c.conn_type,
+                                alts: core::mem::take(&mut c.alts),
+                                port: c.port,
+                                tag,
+                                owner: c.owner,
+                            }
+                        };
                         st.conns[i] = LinuxNetConn::empty();
-                        let cb = (i as u16).to_le_bytes();
-                        let msg = [MSG_ERROR, cb[0], cb[1], err as u8, tag];
-                        linux_net_send_msg(st, &msg);
+                        linux_net_dial_failed(st, i, dial, err);
+                        had_work = true;
                     }
                 }
             }
@@ -2660,6 +3155,9 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
         // buffer is the back-pressure point for `CMD_SEND`. Lighter
         // backlogs don't gate, so parallel `CMD_CLOSE` etc. still flow.
         sweep_held_slots(st);
+        if linux_net_drain_resolved(st) {
+            had_work = true;
+        }
         let heavy_pending = linux_net_drain_writes(st);
         if heavy_pending {
             had_work = true;
@@ -2711,19 +3209,51 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                             linux_net_cmd_bind(st, port, lane);
                             had_work = true;
                         }
-                        CMD_CONNECT if payload_len >= 7 => {
-                            let sock_type = st.cmd_buf[0];
-                            let ip = u32::from_le_bytes([
-                                st.cmd_buf[1],
-                                st.cmd_buf[2],
-                                st.cmd_buf[3],
-                                st.cmd_buf[4],
-                            ]);
-                            let port = u16::from_le_bytes([st.cmd_buf[5], st.cmd_buf[6]]);
-                            // Optional trailing requester tag (8-byte form), echoed in
-                            // MSG_CONNECTED / MSG_ERROR for fanned-net_out routing.
-                            let tag = if payload_len >= 8 { st.cmd_buf[7] } else { 0 };
-                            linux_net_cmd_connect(st, sock_type, ip, port, tag, lane);
+                        CMD_CONNECT => {
+                            // Retired. Fail the emitter loudly on its tag rather
+                            // than dial whatever its address bytes decode to.
+                            let tag = crate::abi::contracts::net::net_proto::retired_connect_tag(
+                                &st.cmd_buf[..payload_len],
+                            );
+                            log::warn!(
+                                "[linux_net] CMD_CONNECT (0x13) is retired; dial with CMD_CONNECT_TO (0x14) [tag {tag}]"
+                            );
+                            let msg = [MSG_ERROR, 0u8, 0u8, 38u8, tag]; // ENOSYS
+                            linux_net_send_msg(st, &msg);
+                            had_work = true;
+                        }
+                        CMD_CONNECT_TO => {
+                            use crate::abi::contracts::net::net_proto::read_connect_to;
+                            // Decode against a copy so the record's borrowed name does
+                            // not hold `cmd_buf` while the state is mutated.
+                            let mut rec =
+                                [0u8; crate::abi::contracts::net::net_proto::CONNECT_TO_MAX];
+                            let n = payload_len.min(rec.len());
+                            rec[..n].copy_from_slice(&st.cmd_buf[..n]);
+                            match read_connect_to(&rec[..n]) {
+                                Some((sock_type, port, target, tag)) if n == payload_len => {
+                                    let tag = tag.unwrap_or(0);
+                                    linux_net_cmd_connect_to(
+                                        st, sock_type, port, target, tag, lane,
+                                    );
+                                }
+                                _ => {
+                                    // Malformed: a name past 253 bytes, an unknown family,
+                                    // a truncated address. EINVAL goes to the record's last
+                                    // byte — the one a tag would occupy — as
+                                    // `read_connect_to` states.
+                                    let tag = if payload_len > 0 {
+                                        st.cmd_buf[payload_len - 1]
+                                    } else {
+                                        0
+                                    };
+                                    log::warn!(
+                                        "[linux_net] malformed CMD_CONNECT_TO ({payload_len} B)"
+                                    );
+                                    let msg = [MSG_ERROR, 0u8, 0u8, 22u8, tag];
+                                    linux_net_send_msg(st, &msg);
+                                }
+                            }
                             had_work = true;
                         }
                         CMD_SEND if payload_len >= 3 => {
@@ -2752,27 +3282,70 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                             linux_net_dg_cmd_bind(st, port, owner_tag, lane);
                             had_work = true;
                         }
-                        DG_CMD_SEND_TO if payload_len >= 8 => {
-                            // IPv4 payload (datagram contract):
+                        DG_CMD_SEND_TO if payload_len >= 4 => {
+                            // Datagram contract:
                             //   [ep_id:1][af:1=4][addr:4 BE][port:2 LE][data...]
+                            //   [ep_id:1][af:1=1][len:1][name…][port:2 LE][data...]
                             // The owner-tagged form inserts [MARK][owner_tag:2 LE]
                             // between `ep_id` and `af`.
                             let (claimed_tag, dest_off) =
                                 dg_claimed_owner_tag(&st.cmd_buf[..payload_len]);
-                            if payload_len < dest_off + 7 {
+                            let ep = st.cmd_buf[0] as i16;
+                            if !dg_endpoint_admits(st, ep, claimed_tag) {
                                 had_work = true;
                                 continue;
                             }
-                            let ep = st.cmd_buf[0] as i16;
+                            let af = if dest_off < payload_len {
+                                st.cmd_buf[dest_off]
+                            } else {
+                                0
+                            };
                             let ap = dest_off + 1;
-                            let ip = [
-                                st.cmd_buf[ap],
-                                st.cmd_buf[ap + 1],
-                                st.cmd_buf[ap + 2],
-                                st.cmd_buf[ap + 3],
-                            ];
-                            let port = u16::from_le_bytes([st.cmd_buf[ap + 4], st.cmd_buf[ap + 5]]);
-                            let data_off = dest_off + 7;
+                            let (ip, port_at) = match af {
+                                DG_AF_INET if payload_len >= ap + 6 => (
+                                    [
+                                        st.cmd_buf[ap],
+                                        st.cmd_buf[ap + 1],
+                                        st.cmd_buf[ap + 2],
+                                        st.cmd_buf[ap + 3],
+                                    ],
+                                    ap + 4,
+                                ),
+                                DG_AF_NAME if payload_len > ap => {
+                                    let len = st.cmd_buf[ap] as usize;
+                                    let name_end = ap + 1 + len;
+                                    if len == 0 || payload_len < name_end + 2 {
+                                        had_work = true;
+                                        continue;
+                                    }
+                                    let name = &st.cmd_buf[ap + 1..name_end];
+                                    match st.dns_cache_get(name).and_then(|addrs| {
+                                        addrs.into_iter().find_map(|a| match a {
+                                            Resolved::V4(v4) => Some(v4),
+                                            Resolved::V6(_) => None,
+                                        })
+                                    }) {
+                                        Some(a) => (a, name_end),
+                                        _ => {
+                                            // Not in hand: start the lookup and drop this
+                                            // datagram; the sender's retransmit finds the
+                                            // answer in the cache.
+                                            let name = name.to_vec();
+                                            let _ = st.resolve_async(&name, None, true);
+                                            had_work = true;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    linux_net_send_dg_error(st, 97); // EAFNOSUPPORT
+                                    had_work = true;
+                                    continue;
+                                }
+                            };
+                            let port =
+                                u16::from_le_bytes([st.cmd_buf[port_at], st.cmd_buf[port_at + 1]]);
+                            let data_off = port_at + 2;
                             let data_len = payload_len - data_off;
                             let data = core::slice::from_raw_parts(
                                 st.cmd_buf.as_ptr().add(data_off),

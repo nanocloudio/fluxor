@@ -1677,6 +1677,7 @@ unsafe fn release_held(s: &mut QuicState, idx: usize) -> bool {
         sys,
         s.net_out,
         &s.endpoint,
+        &s.peer_name[..s.peer_name_len as usize],
         &s.conns[idx].peer,
         &s.conns[idx].one_rtt.last_emitted[..len],
         &mut s.net_scratch,

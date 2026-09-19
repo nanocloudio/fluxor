@@ -448,7 +448,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // board. Every line in that chain is individually
                         // unalarming, which is what makes the cause
                         // expensive to find from the far end.
-                        log_msg(s, b"[wifi] no ssid configured - scan only, will not associate");
+                        log_msg(
+                            s,
+                            b"[wifi] no ssid configured - scan only, will not associate",
+                        );
                         // No credentials — initiate scan via FMP
                         let r = msg_write_empty(sys, s.out_chan, MSG_SCAN);
                         if r < 0 {

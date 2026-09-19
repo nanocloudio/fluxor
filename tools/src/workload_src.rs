@@ -795,7 +795,19 @@ pub fn install_applet(
 
     // The runtime the bundle was built against: the installing project's
     // staged binary, recorded so `exec` runs it from any directory.
-    let runtime = crate::project::root_for_config(&dir).join(RUNTIME_RELATIVE);
+    //
+    // Materialise what the lockfile names FIRST. `fluxor update` rewrites the
+    // lock without touching the tree, so the staged binary here can be an
+    // older kernel than the project is pinned to — and this used to record it
+    // anyway. Modules refresh on install, so a module fix appeared to land
+    // while a kernel fix silently did not, with the applet reporting nothing
+    // at all: the symptom is "my change had no effect", which is
+    // indistinguishable from the change being wrong.
+    let project_root = crate::project::root_for_config(&dir);
+    if let Err(e) = crate::store_sync::ensure_synced(&project_root) {
+        eprintln!("warning: could not sync the pinned artifacts before install: {e}");
+    }
+    let runtime = project_root.join(RUNTIME_RELATIVE);
     let runtime = runtime
         .exists()
         .then(|| runtime.canonicalize().unwrap_or(runtime));

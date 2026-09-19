@@ -55,7 +55,7 @@ How the system works. These are the authoritative references.
 How to build and run things with the system.
 
 - [guides/running.md](guides/running.md) — the simplest validated bring-up, config embedded
-- [guides/publishing.md](guides/publishing.md) — publishing artefacts into the local OCI store and consuming them downstream
+- [guides/publishing.md](guides/publishing.md) — publishing artefacts into the local OCI store, consuming them downstream, and keeping the store itself (pins, quarantine, collection)
 - [guides/foundation.md](guides/foundation.md) — foundation layer, driver/foundation boundary, contract patterns
 - [guides/audio.md](guides/audio.md) — audio pipeline architecture and format handling
 - [guides/music_player.md](guides/music_player.md) — music-player pipeline and track control model

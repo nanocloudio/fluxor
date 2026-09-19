@@ -6,6 +6,9 @@ DNS Server PIC Module
 
 - `manifest.toml`
 - `mod.rs`
+- `sdk/contracts/net/dns_wire.rs` (mounted) — the message codec: header,
+  names with compression, question, resource records. Shared with the `ip`
+  module's stub resolver; this module stays a server.
 
 ## Interface (manifest)
 
@@ -62,4 +65,4 @@ content_type = "NetProto"
 ## Notes
 
 - Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-08-20
+- Last refreshed: 2026-09-19

@@ -545,6 +545,7 @@ fn generate_config_impl(
     // `execution.profile` claim nothing and are unaffected.
     validate_execution_profile(config, &module_names, &manifests, resolved_target)?;
     validate_port_capabilities(config, &manifests)?;
+    validate_connector_addressing(config)?;
 
     // Single-provider-per-contract. Providers auto-register in
     // module-index order onto a bounded dispatch stack that returns the

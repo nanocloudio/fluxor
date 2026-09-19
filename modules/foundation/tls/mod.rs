@@ -45,6 +45,8 @@ use core::ffi::c_void;
 #[path = "../../sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
+#[path = "../../sdk/contracts/net/net_proto.rs"]
+mod net_proto;
 
 // PIC runtime (syscalls, helpers, intrinsics)
 include!("../../sdk/runtime.rs");
@@ -361,7 +363,76 @@ const NET_MSG_TRACE_CTX: u8 = 0x09;
 const NET_CMD_BIND: u8 = 0x10;
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+/// Retired dial; answered `ENOSYS` on its tag, never forwarded.
+const NET_CMD_CONNECT: u8 = net_proto::CMD_CONNECT;
+/// The dial: `[sock_type][af][port][addr…][tag?]`. Its target is what this
+/// client authenticates the peer as (a name → `dNSName`, sent as SNI under
+/// `ca_dns`; an address → `iPAddress`, no SNI), unless `verify_hostname`
+/// overrides it.
+const NET_CMD_CONNECT_TO: u8 = net_proto::CMD_CONNECT_TO;
+
+/// The port the DTLS client's `authority` takes when it names none.
+const DTLS_DEFAULT_PORT: u16 = 4433;
+
+/// Longest `authority` the DTLS client keeps — wider than any v4 literal
+/// with a port needs (`255.255.255.255:65535` is 21 bytes). A longer value
+/// is refused rather than truncated into a different host.
+const DTLS_AUTHORITY_MAX: usize = 64;
+
+/// The DTLS client's peer as configured, `host[:port]`.
+///
+/// Kept as text and parsed at construction so a value that is not an
+/// authority refuses the instance with a reason, rather than becoming a
+/// silent default nobody asked for.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DtlsAuthority {
+    text: [u8; DTLS_AUTHORITY_MAX],
+    len: u8,
+    /// The text offered was longer than the buffer; `adopt` refuses it.
+    overflow: u8,
+}
+
+impl DtlsAuthority {
+    const fn empty() -> Self {
+        DtlsAuthority {
+            text: [0; DTLS_AUTHORITY_MAX],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    fn set(&mut self, text: &[u8]) {
+        *self = DtlsAuthority::empty();
+        if text.len() > DTLS_AUTHORITY_MAX {
+            self.overflow = 1;
+            return;
+        }
+        self.text[..text.len()].copy_from_slice(text);
+        self.len = text.len() as u8;
+    }
+
+    /// Some text was offered, whether or not it fit.
+    fn offered(&self) -> bool {
+        self.len > 0 || self.overflow != 0
+    }
+
+    /// The peer as `(address, port)`, the address in the form
+    /// `dtls_peer_ip` holds (its little-endian bytes are network order).
+    /// `None` when nothing fit, nothing was offered, or the text is not a
+    /// v4-literal authority.
+    fn adopt(&self, default_port: u16) -> Option<(u32, u16)> {
+        if self.overflow != 0 || self.len == 0 {
+            return None;
+        }
+        let text = self.text;
+        let (target, port) = net_proto::Target::parse(&text[..self.len as usize])?;
+        match target {
+            net_proto::Target::V4(a) => Some((u32::from_le_bytes(a), port.unwrap_or(default_port))),
+            _ => None,
+        }
+    }
+}
 
 // ============================================================================
 // Session state
@@ -419,6 +490,17 @@ struct TlsSession {
     /// Transport-continuity state for this connection (continuity.rs).
     cont: SessionContinuity,
 
+    /// The identity this session expects of its peer: a DNS name,
+    /// required as the leaf's `dNSName` SAN and sent as SNI under
+    /// `ca_dns`, or (`expected_is_ip`) an address of 4 or 16 bytes,
+    /// required as the leaf's `iPAddress` SAN and never sent as SNI. Set
+    /// from the target of the `CMD_CONNECT_TO` the session was opened by —
+    /// or from `verify_hostname` when that override is configured — and
+    /// empty on a server session, which has no name to expect of a client.
+    expected: [u8; MAX_EXPECTED_DNS],
+    expected_len: u8,
+    expected_is_ip: bool,
+
     /// Compatibility ChangeCipherSpec records consumed from this
     /// peer, capped at `MAX_COMPAT_CCS`.
     ccs_seen: u8,
@@ -468,7 +550,7 @@ struct TlsSession {
     /// parent trace context (the Ready loop retries both together).
     trace_ctx_pending: bool,
     /// Original downstream requester tag for a TLS-mediated CLIENT connect — the
-    /// tag the clear-side consumer put on its `CMD_CONNECT` before TLS rewrote it
+    /// tag the clear-side consumer put on its `CMD_CONNECT_TO` before TLS rewrote it
     /// to TLS's own tag toward IP. Echoed when TLS forwards `MSG_CONNECTED`
     /// downstream so the original requester routes it on a fanned clear_out.
     /// `0` for inbound (server) sessions.
@@ -504,6 +586,9 @@ impl TlsSession {
             read_epoch: 0,
             write_epoch: 0,
             cont: SessionContinuity::empty(),
+            expected: [0; MAX_EXPECTED_DNS],
+            expected_len: 0,
+            expected_is_ip: false,
             ccs_seen: 0,
             pending_ccs: false,
             pending_ccs_client: false,
@@ -545,6 +630,9 @@ impl TlsSession {
         self.read_epoch = 0;
         self.write_epoch = 0;
         self.cont.reset();
+        self.expected = [0; MAX_EXPECTED_DNS];
+        self.expected_len = 0;
+        self.expected_is_ip = false;
         self.ccs_seen = 0;
         self.pending_ccs = false;
         self.pending_ccs_client = false;
@@ -794,11 +882,19 @@ struct TlsState {
     /// transferred to a session's `downstream_tag` on `MSG_CONNECTED` or used to
     /// translate a connect-failure `MSG_ERROR` back downstream.
     pending_downstream_tag: u8,
-    /// True while a clear-side `CMD_CONNECT` is forwarded but not yet completed
-    /// (`MSG_CONNECTED` or `MSG_ERROR`). TLS serialises outbound connects through
-    /// its single tag, so a SECOND concurrent connect is rejected with EAGAIN
-    /// (translated downstream) rather than silently overwriting the pending slot.
+    /// True while a clear-side `CMD_CONNECT_TO` is forwarded but not yet
+    /// completed (`MSG_CONNECTED` or `MSG_ERROR`). TLS serialises outbound
+    /// connects through its single tag, so a SECOND concurrent connect is
+    /// rejected with EAGAIN (translated downstream) rather than silently
+    /// overwriting the pending slot. The window is one dial: a TCP handshake,
+    /// and the provider's resolution when the target is a name. The
+    /// provider's positive cache is what keeps that short.
     pending_connect_active: bool,
+    /// The identity the in-flight connect's target names (see
+    /// `TlsSession::expected`), moved into the session on `MSG_CONNECTED`.
+    pending_expected: [u8; MAX_EXPECTED_DNS],
+    pending_expected_len: u8,
+    pending_expected_is_ip: bool,
 
     /// Cleartext-passthrough conn_id set (256-bit bitmap, conn_id → bit).
     /// When a SERVER-mode TLS instance's clear-side consumer (an h1 proxy
@@ -855,9 +951,13 @@ struct TlsState {
     /// it was given.
     anchor_refused: bool,
 
-    /// Expected DNS identity: the name sent as SNI and the name required of
-    /// the peer leaf's `dNSName` SAN. One parameter feeds both, so a
-    /// certificate selected by SNI is a certificate the name rule accepts.
+    /// `verify_hostname`: the OVERRIDE of the peer identity a client expects.
+    /// A stream session takes its name from the target of the
+    /// `CMD_CONNECT_TO` that opened it; when this is set it is the expected
+    /// name (SNI and `dNSName`) regardless of the target — a proxy, or a
+    /// pinned host reached by address. A DTLS client, which dials the
+    /// literal in its `authority`, has no named target and takes this or
+    /// the address.
     expected_dns: [u8; MAX_EXPECTED_DNS],
     expected_dns_len: usize,
 
@@ -904,9 +1004,15 @@ struct TlsState {
     dtls_endpoint: DatagramEndpoint,
     /// DTLS listening UDP port (server) or local source port (client).
     dtls_port: u16,
-    /// Client-mode peer IPv4 (LE) and UDP port.
+    /// The DTLS client's peer, adopted from `authority` at construction:
+    /// IPv4 in the little-endian form the datagram send path wants, and
+    /// the UDP port.
     dtls_peer_ip: u32,
     dtls_peer_port: u16,
+    /// `authority` as the graph wrote it. Held rather than parsed in the
+    /// parameter callback so construction, which knows the transport, is
+    /// what decides whether the value belongs here at all.
+    dtls_authority: DtlsAuthority,
     /// Client-mode flag: have we kicked off the first ClientHello yet?
     dtls_client_started: bool,
     /// Per-peer DTLS sessions.
@@ -916,13 +1022,12 @@ struct TlsState {
     net_scratch: [u8; NET_SCRATCH_SIZE],
     /// One inbound record's ciphertext, for the decrypt path.
     ///
-    /// In MODULE STATE, not on the stack. `record_drain_inbound_one` used
-    /// `let mut ct = [0u8; RECV_BUF_SIZE]` — 16704 bytes zero-initialised
+    /// In MODULE STATE, not on the stack. A `[0u8; RECV_BUF_SIZE]` local
+    /// in `record_drain_inbound_one` would be 16704 bytes zero-initialised
     /// into a PIC module stack frame on every inbound record, in a function
-    /// that also holds a session borrow. This module already moved its
-    /// ECDH pre-computation to `module_new` "to run on the full kernel
-    /// stack, avoiding PIC stack overflow"; a 16 KB frame on the per-record
-    /// path is the same hazard on the hot path rather than the cold one.
+    /// that also holds a session borrow — the hazard that keeps the ECDH
+    /// pre-computation in `module_new`, on the full kernel stack, moved
+    /// onto the per-record path.
     ///
     /// The copy itself cannot be avoided by decrypting in place:
     /// `decrypt_record` needs `&mut sess.read_keys` and `&mut ciphertext`
@@ -1038,9 +1143,10 @@ struct TlsState {
 const DTLS_HANDSHAKE_TIMEOUT_STEPS: u32 = 60_000;
 
 /// Cadence for `[tls] tlm` and `[tls] hb`, in module steps. Matches
-/// `IP_TLM_PERIOD` and `HTTP_TLM_PERIOD` so a window from any of the three
-/// modules on the ip→tls→http path covers the same interval and the byte
-/// counts either side of an edge can be differenced directly.
+/// `IP_TLM_PERIOD` and the http consumer's own cadence, so a window from
+/// any of the three modules on the ip→tls→http path covers the same
+/// interval and the byte counts either side of an edge can be differenced
+/// directly.
 const TLS_TLM_PERIOD: u32 = 5000;
 
 /// Inbound net_proto frames drained per side, per `module_step`.
@@ -1084,18 +1190,20 @@ define_params! {
     5, dtls_port, u16, 4433
         => |s, d, len| { s.dtls_port = p_u16(d, len, 0, 4433); };
 
-    6, dtls_peer_ip, u32, 0x0100007f
-        => |s, d, len| { s.dtls_peer_ip = p_u32(d, len, 0, 0x0100007f); };
-
-    7, dtls_peer_port, u16, 4433
-        => |s, d, len| { s.dtls_peer_port = p_u16(d, len, 0, 4433); };
+    // Tags 6 and 7 are retired; the next allocation is 18.
+    // The DTLS client's peer, `host[:port]` with port 4433 when it names
+    // none. A v4 literal: a datagram session is keyed by the address its
+    // records arrive from, so there is nothing to key on until a name
+    // resolves, and `verify_hostname` is what names a peer reached by
+    // address.
+    17, authority, str, 0
+        => |s, d, len| { s.dtls_authority.set(core::slice::from_raw_parts(d, len)); };
 
     8, diag_phase_timing, u8, 0
         => |s, d, len| { s.diag_phase_timing = p_u8(d, len, 0, 0); };
 
-    // Default 1 preserves the previous hard-coded pacing for every graph
-    // that does not set it. Clamped to >=1: 0 would stall every handshake
-    // forever rather than meaning "unlimited".
+    // Handshake messages pumped per session per step. Clamped to >=1: 0
+    // would stall every handshake forever rather than meaning "unlimited".
     9, handshake_pump_budget, u16, 1
         => |s, d, len| {
             let v = p_u16(d, len, 0, 1);
@@ -1190,6 +1298,9 @@ pub unsafe extern "C" fn module_new(
     s.aes_variable_time_selected = 0;
     s.pending_downstream_tag = 0;
     s.pending_connect_active = false;
+    s.pending_expected = [0; MAX_EXPECTED_DNS];
+    s.pending_expected_len = 0;
+    s.pending_expected_is_ip = false;
     s.passthrough_conns = [0u8; 32];
     s.transport = TRANSPORT_TCP;
     s.accept_port = 0;
@@ -1198,6 +1309,7 @@ pub unsafe extern "C" fn module_new(
     s.dtls_port = 4433;
     s.dtls_peer_ip = 0x0100007f;
     s.dtls_peer_port = 4433;
+    s.dtls_authority = DtlsAuthority::empty();
     s.dtls_client_started = false;
     s.step_count = 0;
     s.tlm = TlmCounters::new();
@@ -1269,8 +1381,31 @@ pub unsafe extern "C" fn module_new(
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
+    // The DTLS client's peer. A datagram session is keyed by the address
+    // its records arrive from, so this one is a literal; a peer known only
+    // by name has nothing to key on until it answers. A stream instance
+    // has no use for the parameter at all: it takes each session's peer
+    // from the `CMD_CONNECT_TO` it forwards.
+    if s.dtls_authority.offered() {
+        if s.transport != TRANSPORT_UDP {
+            let msg = b"[tls] refusing to construct: `authority` is the DTLS client's peer (transport: 1); a stream instance takes its peer from the CMD_CONNECT_TO it forwards";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            return -1;
+        }
+        match s.dtls_authority.adopt(DTLS_DEFAULT_PORT) {
+            Some((ip, port)) => {
+                s.dtls_peer_ip = ip;
+                s.dtls_peer_port = port;
+            }
+            None => {
+                let msg = b"[tls] refusing to construct: `authority` must be a v4 literal `host[:port]` of at most 64 bytes; a DTLS peer known only by name has no address to key its session by";
+                dev_log(sys, 1, msg.as_ptr(), msg.len());
+                return -1;
+            }
+        }
+    }
     if !peer_auth_admissible(s) {
-        let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust, and verify_hostname for ca_dns / verify_uri for ca_uri)";
+        let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust; verify_uri for ca_uri; a ca_dns client is named by each dial's authority, or by verify_hostname, which must be a name)";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
@@ -1503,9 +1638,10 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                     push_anchor_bundle(s, bundle, tag == 16);
                 }
                 13 => {
-                    // Expected DNS identity. Truncating a name would
-                    // authenticate a different one, so an over-long value is
-                    // dropped and the admission check refuses the instance.
+                    // `verify_hostname`, the expected-identity override.
+                    // Truncating a name would authenticate a different one,
+                    // so an over-long value is dropped and the admission
+                    // check refuses the instance.
                     if len > 0 && len <= MAX_EXPECTED_DNS {
                         core::ptr::copy_nonoverlapping(
                             data.as_ptr().add(data_start),
@@ -1955,6 +2091,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let dt = s.pending_downstream_tag;
                                 s.pending_downstream_tag = 0;
                                 s.pending_connect_active = false; // connect completed
+                                                                  // The dial's target is the identity this
+                                                                  // session authenticates its peer as; the
+                                                                  // override stands in when no dial named one.
+                                if s.pending_expected_len > 0 {
+                                    s.sessions[idx].expected = s.pending_expected;
+                                    s.sessions[idx].expected_len = s.pending_expected_len;
+                                    s.sessions[idx].expected_is_ip = s.pending_expected_is_ip;
+                                } else if s.expected_dns_len > 0 {
+                                    s.sessions[idx].expected = s.expected_dns;
+                                    s.sessions[idx].expected_len = s.expected_dns_len as u8;
+                                    s.sessions[idx].expected_is_ip = false;
+                                }
+                                s.pending_expected_len = 0;
+                                s.pending_expected_is_ip = false;
                                 dt
                             } else {
                                 0
@@ -2015,6 +2165,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let dtag = s.pending_downstream_tag;
                                 s.pending_connect_active = false;
                                 s.pending_downstream_tag = 0;
+                                s.pending_expected_len = 0;
                                 let err = [(-12i8) as u8, dtag]; // ENOMEM + tag
                                 let _ = tls_write_or_count(
                                     s,
@@ -2068,62 +2219,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 break;
                             }
                         } else if s.sessions[idx].state == SessionState::Ready {
-                            // Feed ciphertext into recv_buf, decrypting +
-                            // forwarding records as they complete so buffer
-                            // space frees mid-frame. A frame larger than the
-                            // remaining space is NOT silently truncated (the
-                            // old behaviour, which desynced the record stream
-                            // and lost bytes) — the loop drains it through
-                            // repeated decrypt passes; only a single record
-                            // that can never fit (> RECV_BUF_SIZE) fails the
-                            // session, loudly.
-                            let mut remaining = data_len;
-                            loop {
-                                let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
-                                let to_read = if remaining < space { remaining } else { space };
-                                if to_read > 0 {
-                                    (sys.channel_read)(
-                                        s.cipher_in,
-                                        s.sessions[idx]
-                                            .recv_buf
-                                            .as_mut_ptr()
-                                            .add(s.sessions[idx].recv_len),
-                                        to_read,
-                                    );
-                                    s.sessions[idx].recv_len += to_read;
-                                    remaining -= to_read;
-                                    continuity_after_recv_append(s, idx);
-                                }
-                                // Drain every complete record currently
-                                // buffered (one per call).
-                                loop {
-                                    let before = s.sessions[idx].recv_len;
-                                    try_decrypt_forward(s, idx);
-                                    if s.sessions[idx].recv_len == before
-                                        || s.sessions[idx].state != SessionState::Ready
-                                    {
-                                        break;
-                                    }
-                                }
-                                if remaining == 0 || s.sessions[idx].state != SessionState::Ready {
-                                    if remaining > 0 {
-                                        tls_discard(sys, s.cipher_in, remaining);
-                                    }
-                                    break;
-                                }
-                                if s.sessions[idx].recv_len == RECV_BUF_SIZE {
-                                    // No space freed: the buffered record
-                                    // exceeds RECV_BUF_SIZE and can never
-                                    // decrypt. Fail the session rather than
-                                    // corrupt the stream.
-                                    let msg: &[u8] =
-                                        b"[tls] record exceeds recv_buf; session->Error";
-                                    dev_log(sys, 1, msg.as_ptr(), msg.len());
-                                    tls_discard(sys, s.cipher_in, remaining);
-                                    s.sessions[idx].state = SessionState::Error;
-                                    s.last_err_site = 1;
-                                    break;
-                                }
+                            // Feed ciphertext into recv_buf, decrypting and
+                            // forwarding records as they complete. The same
+                            // path takes the tail of a frame the handshake
+                            // left behind, so both reach a Ready session
+                            // identically.
+                            // What the FIFO could not give yet stays in the
+                            // channel as the pending tail, exactly as a
+                            // handshake frame's does: consuming part of a
+                            // payload and then reading the next three bytes as
+                            // a frame header is what desyncs the stream.
+                            let taken = ready_feed_from_channel(s, idx, data_len);
+                            if taken < data_len {
+                                s.hs_pending_conn = conn_id;
+                                s.hs_pending_left = (data_len - taken) as u32;
+                                break;
                             }
                         } else {
                             tls_discard(sys, s.cipher_in, data_len);
@@ -2229,6 +2339,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.pending_connect_active = false;
                         s.net_scratch[3] = s.pending_downstream_tag;
                         s.pending_downstream_tag = 0;
+                        // The dial that named this identity failed; no later
+                        // session inherits it.
+                        s.pending_expected_len = 0;
                     } else {
                         // Another consumer's error on the shared fan, or an
                         // error for a conn we don't own — not for HTTP. Drop.
@@ -2509,12 +2622,38 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     0,
                 );
             }
-            t if t == NET_CMD_BIND || t == NET_CMD_CONNECT => {
-                // Forward to cipher_out (toward IP). For CMD_CONNECT, STAMP
-                // the requester tag (byte 7) with TLS's own module index so
-                // IP echoes it in MSG_CONNECTED and TLS — not a co-wired
-                // exporter sharing ip.net_out — claims the resulting outbound
-                // connection. CMD_BIND passes through unchanged.
+            NET_CMD_CONNECT => {
+                // Retired. Not forwarded: a record whose target this module
+                // cannot read is one whose peer it cannot authenticate.
+                let pl = payload_len as usize;
+                let rd = pl.min(NET_SCRATCH_SIZE);
+                if rd > 0 {
+                    (sys.channel_read)(s.clear_in, s.net_scratch.as_mut_ptr(), rd);
+                }
+                if pl > rd {
+                    tls_discard(sys, s.clear_in, pl - rd);
+                }
+                let tag = net_proto::retired_connect_tag(&s.net_scratch[..rd]);
+                let msg = b"[tls] CMD_CONNECT (0x13) is retired; dial with CMD_CONNECT_TO (0x14)";
+                dev_log(sys, 1, msg.as_ptr(), msg.len());
+                let err = [(-38i8) as u8, tag]; // ENOSYS + downstream tag
+                let _ = tls_write_or_count(
+                    s,
+                    s.clear_out,
+                    NET_MSG_ERROR,
+                    0,
+                    err.as_ptr(),
+                    err.len() as u16,
+                );
+            }
+            t if t == NET_CMD_BIND || t == NET_CMD_CONNECT_TO => {
+                // Forward to cipher_out (toward IP). For CMD_CONNECT_TO, STAMP
+                // the requester tag with TLS's own module index so IP echoes
+                // it in MSG_CONNECTED and TLS — not a co-wired exporter
+                // sharing ip.net_out — claims the resulting outbound
+                // connection, and take the target as the identity the
+                // session will expect of its peer. CMD_BIND passes through
+                // unchanged.
                 let pl = payload_len as usize;
                 let mut rd = if pl < NET_SCRATCH_SIZE {
                     pl
@@ -2528,58 +2667,92 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     tls_discard(sys, s.clear_in, pl - rd);
                 }
                 let mut forward = true;
-                // For a CMD_CONNECT we're about to forward: the downstream tag
-                // to latch, deferred until the upstream write actually lands.
+                // For a CMD_CONNECT_TO we're about to forward: the downstream
+                // tag to latch, deferred until the upstream write actually
+                // lands.
                 let mut arm_pending: Option<u8> = None;
-                // A second refusal behind `module_new`'s. Construction already
-                // rejects a client with no peer-authentication profile, so this
-                // cannot fire today; it is here so a future construction path
-                // cannot reopen the hole without also passing this gate.
-                if t == NET_CMD_CONNECT && !peer_auth_admissible(s) {
-                    let tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
-                    let err = [(-1i8) as u8, tag]; // EPERM + downstream tag
-                    let _ = tls_write_or_count(
-                        s,
-                        s.clear_out,
-                        NET_MSG_ERROR,
-                        0,
-                        err.as_ptr(),
-                        err.len() as u16,
-                    );
-                    forward = false;
-                } else if t == NET_CMD_CONNECT && (7..NET_SCRATCH_SIZE).contains(&rd) {
-                    let new_tag = if rd >= 8 { s.net_scratch[7] } else { 0 };
-                    if s.pending_connect_active {
-                        // SERIALIZE: a connect is already in flight and TLS
-                        // routes all mediated connects through its single tag,
-                        // so a second concurrent connect would clobber the
-                        // pending correlation. Reject it downstream with EAGAIN
-                        // (translated to the new request's tag) and DON'T
-                        // forward — the clear-side consumer retries.
-                        let err = [(-11i8) as u8, new_tag]; // EAGAIN + downstream tag
-                        let _ = tls_write_or_count(
-                            s,
-                            s.clear_out,
-                            NET_MSG_ERROR,
-                            0,
-                            err.as_ptr(),
-                            err.len() as u16,
-                        );
-                        forward = false;
+                if t == NET_CMD_CONNECT_TO {
+                    let decoded = if pl == rd {
+                        net_proto::read_connect_to(&s.net_scratch[..rd])
                     } else {
-                        // Remember the clear-side consumer's original tag, then
-                        // overwrite byte 7 with TLS's own tag so IP routes the
-                        // completion to TLS. Defer marking the connect pending
-                        // until the forward below actually succeeds.
-                        if rd == 7 {
-                            rd = 8;
+                        None
+                    };
+                    match decoded {
+                        None => {
+                            // Malformed: EINVAL goes to the record's last
+                            // byte — the one a tag would occupy — as
+                            // `read_connect_to` states.
+                            let tag = if rd > 0 { s.net_scratch[rd - 1] } else { 0 };
+                            let err = [(-22i8) as u8, tag]; // EINVAL + downstream tag
+                            let _ = tls_write_or_count(
+                                s,
+                                s.clear_out,
+                                NET_MSG_ERROR,
+                                0,
+                                err.as_ptr(),
+                                err.len() as u16,
+                            );
+                            forward = false;
                         }
-                        s.net_scratch[7] = dev_requester_tag(sys);
-                        arm_pending = Some(new_tag);
+                        Some((_, _, target, tag)) => {
+                            let new_tag = tag.unwrap_or(0);
+                            let tagged = tag.is_some();
+                            // What the session opened by this dial will
+                            // expect of its peer. The override wins; else the
+                            // target names it. A server-mode instance relays a
+                            // backend dial in cleartext and expects nothing.
+                            let (exp, exp_len, exp_ip) = connect_expected(s, &target);
+                            if !connect_admissible(s, exp_len) {
+                                let err = [(-1i8) as u8, new_tag]; // EPERM + downstream tag
+                                let _ = tls_write_or_count(
+                                    s,
+                                    s.clear_out,
+                                    NET_MSG_ERROR,
+                                    0,
+                                    err.as_ptr(),
+                                    err.len() as u16,
+                                );
+                                forward = false;
+                            } else if s.pending_connect_active {
+                                // SERIALIZE: a connect is already in flight and
+                                // TLS routes all mediated connects through its
+                                // single tag, so a second concurrent connect
+                                // would clobber the pending correlation. Reject
+                                // it downstream with EAGAIN (translated to the
+                                // new request's tag) and DON'T forward — the
+                                // clear-side consumer retries.
+                                let err = [(-11i8) as u8, new_tag]; // EAGAIN + downstream tag
+                                let _ = tls_write_or_count(
+                                    s,
+                                    s.clear_out,
+                                    NET_MSG_ERROR,
+                                    0,
+                                    err.as_ptr(),
+                                    err.len() as u16,
+                                );
+                                forward = false;
+                            } else if !tagged && rd + 1 > NET_SCRATCH_SIZE {
+                                forward = false;
+                            } else {
+                                // Remember the clear-side consumer's original
+                                // tag, then stamp TLS's own so IP routes the
+                                // completion to TLS. An untagged record grows
+                                // a tag byte. Defer marking the connect pending
+                                // until the forward below actually succeeds.
+                                if !tagged {
+                                    rd += 1;
+                                }
+                                s.net_scratch[rd - 1] = dev_requester_tag(sys);
+                                s.pending_expected = exp;
+                                s.pending_expected_len = exp_len;
+                                s.pending_expected_is_ip = exp_ip;
+                                arm_pending = Some(new_tag);
+                            }
+                        }
                     }
                 }
                 // Remember the port from OUR CMD_BIND so we can match
-                // the corresponding MSG_BOUND on a shared fan (F5).
+                // the corresponding MSG_BOUND on a shared fan.
                 if t == NET_CMD_BIND && rd >= 2 {
                     s.bind_port = (s.net_scratch[0] as u16) | ((s.net_scratch[1] as u16) << 8);
                 }
@@ -2951,11 +3124,12 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
             if s.anchor_count == 0 {
                 return false;
             }
-            // The mTLS server has no name to expect of a client; a client
-            // reaching a named service must have one, and it must be a name
-            // rather than an address (RFC 6066 §3).
-            if s.mode == MODE_CLIENT {
-                s.expected_dns_len > 0 && !is_ip_literal(&s.expected_dns[..s.expected_dns_len])
+            // The mTLS server has no name to expect of a client. A client
+            // takes the identity it expects from each dial's target; the
+            // override, when given, must be a name rather than an address
+            // (RFC 6066 §3) — an address is dialled, not overridden to.
+            if s.mode == MODE_CLIENT && s.expected_dns_len > 0 {
+                !is_ip_literal(&s.expected_dns[..s.expected_dns_len])
             } else {
                 true
             }
@@ -2965,22 +3139,93 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
     }
 }
 
+/// The identity a session opened by a dial to `target` expects of its
+/// peer: `(bytes, len, is_ip)`. The `verify_hostname` override wins; else a
+/// named target is expected as a `dNSName` and a literal as an `iPAddress`.
+/// A server-mode instance relays the dial in cleartext and expects nothing.
+/// A name the session cannot hold whole is not held at all: `len` is 0 and
+/// the CONNECT-time gate refuses the dial.
+fn connect_expected(
+    s: &TlsState,
+    target: &net_proto::Target<'_>,
+) -> ([u8; MAX_EXPECTED_DNS], u8, bool) {
+    let mut out = [0u8; MAX_EXPECTED_DNS];
+    if s.mode != MODE_CLIENT {
+        return (out, 0, false);
+    }
+    if s.expected_dns_len > 0 {
+        out[..s.expected_dns_len].copy_from_slice(&s.expected_dns[..s.expected_dns_len]);
+        return (out, s.expected_dns_len as u8, false);
+    }
+    match target {
+        net_proto::Target::Name(name) => {
+            // A trailing dot names the same host; the certificate does not
+            // carry it.
+            let name = match name.split_last() {
+                Some((b'.', rest)) if !rest.is_empty() => rest,
+                _ => name,
+            };
+            if name.is_empty() || name.len() > MAX_EXPECTED_DNS {
+                return (out, 0, false);
+            }
+            out[..name.len()].copy_from_slice(name);
+            (out, name.len() as u8, false)
+        }
+        net_proto::Target::V4(a) => {
+            out[..4].copy_from_slice(a);
+            (out, 4, true)
+        }
+        net_proto::Target::V6(a) => {
+            out[..16].copy_from_slice(a);
+            (out, 16, true)
+        }
+    }
+}
+
+/// Whether a dial whose session would expect `expected_len` bytes of peer
+/// identity may be forwarded. The gate `module_new` cannot apply — it has
+/// no dial yet — sits here: a `ca_dns` client authenticates a name or an
+/// address on every connect, and a dial that names neither (a name too long
+/// to hold) is refused `EPERM`, not forwarded unauthenticated.
+fn connect_admissible(s: &TlsState, expected_len: u8) -> bool {
+    if !peer_auth_admissible(s) {
+        return false;
+    }
+    if s.mode != MODE_CLIENT {
+        return true;
+    }
+    match s.peer_auth {
+        PROFILE_CA_DNS => expected_len > 0,
+        _ => true,
+    }
+}
+
 /// The policy every certificate acceptance in this module is decided under.
 /// Built from module state in one place so no call site can assemble a
 /// weaker one.
-fn chain_policy(s: &TlsState, require_eku: u8, now_unix_secs: u64) -> ChainPolicy<'_> {
-    // A server validating a client certificate has no DNS identity to
-    // expect: the name rule is the profile's, and mTLS clients are
-    // identified by their issuer, not by a hostname they do not serve.
-    let expected: &[u8] = if s.mode == MODE_CLIENT {
-        &s.expected_dns[..s.expected_dns_len]
+///
+/// `expected` is the identity the SESSION expects of its peer — a name, or
+/// (`expected_is_ip`) an address — which is empty for a server validating a
+/// client certificate: that has no DNS identity to expect, the name rule is
+/// the profile's, and mTLS clients are identified by their issuer, not by a
+/// hostname they do not serve.
+fn chain_policy<'a>(
+    s: &'a TlsState,
+    expected: &'a [u8],
+    expected_is_ip: bool,
+    require_eku: u8,
+    now_unix_secs: u64,
+) -> ChainPolicy<'a> {
+    let (expected_dns, expected_ip): (&[u8], &[u8]) = if expected_is_ip {
+        (&[], expected)
     } else {
-        &[]
+        (expected, &[])
     };
     ChainPolicy {
         profile: s.peer_auth,
         anchors: anchor_set(s),
-        expected_dns: expected,
+        expected_dns,
+        expected_ip,
         expected_uri: &s.expected_uri[..s.expected_uri_len],
         // Only what this build can actually verify. A configured subset is
         // a policy decision the graph does not express yet; when it does,
@@ -3005,6 +3250,8 @@ fn chain_policy(s: &TlsState, require_eku: u8, now_unix_secs: u64) -> ChainPolic
 unsafe fn peer_cert_reason(
     s: &TlsState,
     is_server: bool,
+    expected: &[u8],
+    expected_is_ip: bool,
     hs_body: &[u8],
     deferred: Option<&mut DeferredLinks>,
 ) -> u32 {
@@ -3017,7 +3264,11 @@ unsafe fn peer_cert_reason(
         EKU_SERVER_AUTH
     };
     let now = trusted_now_secs(&*s.syscalls);
-    verify_chain_with(hs_body, &chain_policy(s, require_eku, now), deferred)
+    verify_chain_with(
+        hs_body,
+        &chain_policy(s, expected, expected_is_ip, require_eku, now),
+        deferred,
+    )
 }
 
 /// The calendar time a certificate lifetime may be checked against, or 0
@@ -3065,7 +3316,24 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
         &mut s.sessions[idx].driver.deferred_links,
         DeferredLinks::empty(),
     );
-    let mut rc = peer_cert_reason(s, is_server, hs_body, Some(&mut deferred));
+    let expected = s.sessions[idx].expected;
+    let expected_len = s.sessions[idx].expected_len as usize;
+    let expected_is_ip = s.sessions[idx].expected_is_ip;
+    // A client under `ca_dns` authenticates a name or an address on every
+    // session. One that has neither was opened by no dial of ours, and is
+    // refused rather than verified against no name at all.
+    let mut rc = if !is_server && s.peer_auth == PROFILE_CA_DNS && expected_len == 0 {
+        CERT_ERR_NAME_ABSENT
+    } else {
+        peer_cert_reason(
+            s,
+            is_server,
+            &expected[..expected_len],
+            expected_is_ip,
+            hs_body,
+            Some(&mut deferred),
+        )
+    };
     s.sessions[idx].driver.deferred_links = deferred;
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.sessions[idx].driver, hs_body);
@@ -3686,15 +3954,14 @@ unsafe fn record_drain_inbound_one(s: &mut TlsState, idx: usize) -> bool {
     // SEVERAL handshake messages, and rustls uses that: the client's
     // Certificate, CertificateVerify and Finished arrive in a single record.
     // The pump reads one message per tick, so after the Certificate the
-    // driver still holds ~115 bytes — and the loop's next `drain` reached
-    // for the following record before the Finished had been processed. That
-    // record is the client's first APPLICATION-key record, and the server
-    // was still holding handshake keys.
+    // driver still holds ~115 bytes. Without this guard the loop's next
+    // `drain` takes the following record — the client's first
+    // APPLICATION-key record — while the server still holds handshake keys.
     //
-    // The result was a decrypt failure with a CORRECT key at a CORRECT
-    // sequence number, which is why it survived being checked against the
-    // key, the nonce, the sequence and the framing in turn. Deferring here
-    // is what makes the alternation actually alternate.
+    // That fails to decrypt under a CORRECT key at a CORRECT sequence
+    // number, so it survives being checked against the key, the nonce, the
+    // sequence and the framing in turn. Deferring here is what makes the
+    // alternation actually alternate.
     //
     // `false` means "no record taken", not "no progress": the caller's loop
     // continues while `pump_session` reports progress, so the buffered
@@ -5239,7 +5506,8 @@ unsafe fn try_drain_pending_peer_identity(s: &mut TlsState, idx: usize) {
 
 /// Sweep every Ready session and retry latched peer-identity
 /// envelopes. Called once per `module_step` after the handshake
-/// pump runs. O(MAX_SESSIONS) per tick — fine at MAX_SESSIONS=4.
+/// pump runs. One pass over the session table per tick, and each
+/// slot with nothing latched costs a length check.
 unsafe fn service_pending_peer_identity(s: &mut TlsState) {
     if s.peer_identity < 0 {
         return;
@@ -5270,14 +5538,14 @@ unsafe fn pump_send_client_hello(s: &mut TlsState, idx: usize) -> bool {
     let alpn_h1_only = s.alpn_h1_only != 0;
     // SNI is emitted only when a DNS identity is the thing being
     // authenticated. Under `pinned` there is no authenticated name, and
-    // disclosing an unauthenticated one would promise nothing.
-    let sni_len = if s.peer_auth == PROFILE_CA_DNS {
-        s.expected_dns_len
+    // disclosing an unauthenticated one would promise nothing; a peer
+    // reached by address has no name to send (RFC 6066 §3).
+    let sni_len = if s.peer_auth == PROFILE_CA_DNS && !s.sessions[idx].expected_is_ip {
+        s.sessions[idx].expected_len as usize
     } else {
         0
     };
-    let mut sni_buf = [0u8; MAX_EXPECTED_DNS];
-    core::ptr::copy_nonoverlapping(s.expected_dns.as_ptr(), sni_buf.as_mut_ptr(), sni_len);
+    let sni_buf = s.sessions[idx].expected;
     let sni = &sni_buf[..sni_len];
     let bits_per_step = ec_bits_per_step(s);
     let sess = &mut s.sessions[idx];
@@ -5845,14 +6113,39 @@ unsafe fn hs_append_from_channel(s: &mut TlsState, idx: usize, len: usize) -> us
 unsafe fn absorb_pending_frame(s: &mut TlsState) -> bool {
     let left = s.hs_pending_left as usize;
     let si = find_session_by_conn_id(s, s.hs_pending_conn);
-    if si < 0 || s.sessions[si as usize].state != SessionState::Handshaking {
+    if si < 0 {
         tls_discard(&*s.syscalls, s.cipher_in, left);
         s.hs_pending_left = 0;
         return true;
     }
-    let taken = hs_append_from_channel(s, si as usize, left);
-    s.hs_pending_left = (left - taken) as u32;
-    s.hs_pending_left == 0
+    let idx = si as usize;
+    match s.sessions[idx].state {
+        SessionState::Handshaking => {
+            let taken = hs_append_from_channel(s, idx, left);
+            s.hs_pending_left = (left - taken) as u32;
+            s.hs_pending_left == 0
+        }
+        // The handshake completed while its tail was still in the channel,
+        // so what is left is the first APPLICATION record and not handshake
+        // leftovers: a peer is free to put its last flight and its first
+        // response bytes in one segment, and they then arrive in one frame.
+        // Discarding them here drops the head of the response and desyncs
+        // every record after it — which surfaces as a decrypt failure on a
+        // connection that handshook cleanly, and only for responses large
+        // enough to have shared that frame.
+        SessionState::Ready => {
+            let taken = ready_feed_from_channel(s, idx, left);
+            s.hs_pending_left = (left - taken) as u32;
+            s.hs_pending_left == 0
+        }
+        // Closing, Closed, Error, or a slot that never reached the
+        // handshake: nothing can consume these bytes.
+        _ => {
+            tls_discard(&*s.syscalls, s.cipher_in, left);
+            s.hs_pending_left = 0;
+            true
+        }
+    }
 }
 
 unsafe fn tls_discard(sys: &SyscallTable, chan: i32, mut count: usize) {
@@ -5862,6 +6155,78 @@ unsafe fn tls_discard(sys: &SyscallTable, chan: i32, mut count: usize) {
         (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
         count -= chunk;
     }
+}
+
+/// Feed up to `len` ciphertext bytes waiting on `cipher_in` into a Ready
+/// session's `recv_buf`, decrypting and forwarding records as they complete so
+/// buffer space frees mid-frame. Answers how many bytes it actually consumed.
+///
+/// More bytes than the remaining space are NOT silently truncated (the old
+/// behaviour, which desynced the record stream and lost bytes) — the loop
+/// drains them through repeated decrypt passes; only a single record that can
+/// never fit (> `RECV_BUF_SIZE`) fails the session, loudly.
+///
+/// A byte FIFO returns what is available, up to what was asked for, so a
+/// producer caught mid-write yields a short read. The caller parks the
+/// difference as the pending tail rather than treating the frame as consumed:
+/// the bytes after a partial payload are the rest of that payload, and reading
+/// them as a frame header desyncs the channel for the life of the connection.
+unsafe fn ready_feed_from_channel(s: &mut TlsState, idx: usize, len: usize) -> usize {
+    let sys = &*s.syscalls;
+    let mut remaining = len;
+    loop {
+        let space = RECV_BUF_SIZE - s.sessions[idx].recv_len;
+        let to_read = if remaining < space { remaining } else { space };
+        let mut short = false;
+        if to_read > 0 {
+            let got = (sys.channel_read)(
+                s.cipher_in,
+                s.sessions[idx]
+                    .recv_buf
+                    .as_mut_ptr()
+                    .add(s.sessions[idx].recv_len),
+                to_read,
+            );
+            let got = if got > 0 { got as usize } else { 0 };
+            if got > 0 {
+                s.sessions[idx].recv_len += got;
+                remaining -= got;
+                continuity_after_recv_append(s, idx);
+            }
+            short = got < to_read;
+        }
+        // Drain every complete record currently buffered (one per call).
+        loop {
+            let before = s.sessions[idx].recv_len;
+            try_decrypt_forward(s, idx);
+            if s.sessions[idx].recv_len == before || s.sessions[idx].state != SessionState::Ready {
+                break;
+            }
+        }
+        if s.sessions[idx].state != SessionState::Ready {
+            if remaining > 0 {
+                tls_discard(sys, s.cipher_in, remaining);
+                remaining = 0;
+            }
+            break;
+        }
+        if remaining == 0 || short {
+            break;
+        }
+        if s.sessions[idx].recv_len == RECV_BUF_SIZE {
+            // No space freed: the buffered record exceeds RECV_BUF_SIZE and
+            // can never decrypt. Fail the session rather than corrupt the
+            // stream.
+            let msg: &[u8] = b"[tls] record exceeds recv_buf; session->Error";
+            dev_log(sys, 1, msg.as_ptr(), msg.len());
+            tls_discard(sys, s.cipher_in, remaining);
+            remaining = 0;
+            s.sessions[idx].state = SessionState::Error;
+            s.last_err_site = 1;
+            break;
+        }
+    }
+    len - remaining
 }
 
 /// Try to decrypt a complete TLS record from a Ready session's recv_buf

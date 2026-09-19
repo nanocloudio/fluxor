@@ -1,12 +1,15 @@
 //! tls_probe — a TLS client's proof of life: connect through `tls`, send
-//! `ping`, expect `pong`, close, repeat `count` times.
+//! `ping`, expect `pong`, close, and repeat until `count` connections
+//! have succeeded.
 //!
 //! The probe sits on the clear side of a client-mode `tls` instance, so
-//! its `CMD_CONNECT` completes only once the handshake has, and the
+//! its `CMD_CONNECT_TO` completes only once the handshake has, and the
 //! steps it counts between the two are the handshake's cost at the graph's
-//! tick. Each success is one `[probe] tls ok` line; the run ends with
-//! `[probe] done`. A failed attempt is logged and retried after a backoff,
-//! so a board whose network is still coming up is not a failure.
+//! tick. The peer is `authority` (`host[:port]`, port 8443 when omitted):
+//! a name the network provider resolves, or a literal. Each success is one
+//! `[probe] tls ok` line; the run ends with `[probe] done`. A failed
+//! attempt is logged and retried after a backoff, so a board whose network
+//! is still coming up is not a failure.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -25,13 +28,19 @@ use abi::SyscallTable;
 include!("../../sdk/runtime.rs");
 include!("../../sdk/runtime/params.rs");
 
-const NET_MSG_DATA: u8 = 0x02;
-const NET_MSG_CLOSED: u8 = 0x03;
-const NET_MSG_CONNECTED: u8 = 0x05;
-const NET_MSG_ERROR: u8 = 0x06;
-const NET_CMD_SEND: u8 = 0x11;
-const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+#[path = "../../sdk/contracts/net/net_proto.rs"]
+mod net_proto;
+use net_proto::{
+    write_connect_to, Target, AF_INET, AF_INET6, CMD_CLOSE as NET_CMD_CLOSE,
+    CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CMD_SEND as NET_CMD_SEND, CONNECT_TO_MAX,
+    MSG_CLOSED as NET_MSG_CLOSED, MSG_CONNECTED as NET_MSG_CONNECTED, MSG_DATA as NET_MSG_DATA,
+    MSG_ERROR as NET_MSG_ERROR,
+};
+
+/// `authority` as written: `host[:port]`.
+const MAX_AUTHORITY_LEN: usize = 128;
+/// The peer's port when `authority` names none.
+const DEFAULT_PORT: u16 = 8443;
 
 const NO_CONN: u16 = 0xFFFF;
 /// Largest inbound frame: header, conn id, one data fragment.
@@ -60,9 +69,17 @@ pub struct ProbeState {
     phase: u8,
     my_tag: u8,
     conn: u16,
+    /// The peer's port: the authority's, or `DEFAULT_PORT`.
     port: u16,
     count: u16,
-    peer_ip: u32,
+    authority: [u8; MAX_AUTHORITY_LEN],
+    authority_len: u8,
+    /// The dial target parsed from `authority` once at construction:
+    /// `AF_INET` / `AF_INET6` with the address in `peer_addr`, or
+    /// `AF_NAME` with the name being `authority[..peer_host_len]`.
+    peer_af: u8,
+    peer_host_len: u8,
+    peer_addr: [u8; 16],
     /// When the current phase may act next (idle: dial; dialing / waiting:
     /// give up).
     at_ms: u32,
@@ -76,11 +93,58 @@ pub struct ProbeState {
 
 mod params_def {
     use super::*;
+    // Tags 1 and 2 are retired; the next allocation is 5.
     define_params! {
         ProbeState;
-        1, peer_ip, u32, 0 => |s, d, len| { s.peer_ip = p_u32(d, len, 0, 0); };
-        2, port, u16, 8443 => |s, d, len| { s.port = p_u16(d, len, 0, 8443); };
         3, count, u16, 1 => |s, d, len| { s.count = p_u16(d, len, 0, 1); };
+        4, authority, str, 0 => |s, d, len| {
+            // An authority that does not fit is dropped rather than
+            // clipped: a prefix of a name is a different host, and the
+            // admission below refuses an instance without one.
+            let n = if len > MAX_AUTHORITY_LEN { 0 } else { len };
+            s.authority_len = n as u8;
+            let mut i = 0;
+            while i < n {
+                s.authority[i] = unsafe { *d.add(i) };
+                i += 1;
+            }
+        };
+    }
+}
+
+/// Parse `authority` into the dial target the probe keeps. `false`
+/// when it is absent or is not `host[:port]`.
+fn adopt_authority(s: &mut ProbeState) -> bool {
+    let n = s.authority_len as usize;
+    if n == 0 {
+        return false;
+    }
+    let mut copy = [0u8; MAX_AUTHORITY_LEN];
+    copy[..n].copy_from_slice(&s.authority[..n]);
+    let Some((target, port)) = Target::parse(&copy[..n]) else {
+        return false;
+    };
+    s.port = port.unwrap_or(DEFAULT_PORT);
+    s.peer_af = target.af();
+    match target {
+        Target::V4(a) => s.peer_addr[..4].copy_from_slice(&a),
+        Target::V6(a) => s.peer_addr.copy_from_slice(&a),
+        Target::Name(name) => s.peer_host_len = name.len() as u8,
+    }
+    true
+}
+
+/// The target `adopt_authority` kept, borrowed for one dial.
+fn dial_target(s: &ProbeState) -> Target<'_> {
+    match s.peer_af {
+        AF_INET => Target::V4([
+            s.peer_addr[0],
+            s.peer_addr[1],
+            s.peer_addr[2],
+            s.peer_addr[3],
+        ]),
+        AF_INET6 => Target::V6(s.peer_addr),
+        _ => Target::Name(&s.authority[..s.peer_host_len as usize]),
     }
 }
 
@@ -119,20 +183,23 @@ fn put_dec(line: &mut [u8], at: usize, v: u32) -> usize {
 
 unsafe fn send_connect(s: &mut ProbeState) {
     let sys = &*s.syscalls;
-    let mut p = [0u8; 8];
-    p[0] = SOCK_TYPE_STREAM;
-    p[1..5].copy_from_slice(&s.peer_ip.to_le_bytes());
-    p[5..7].copy_from_slice(&s.port.to_le_bytes());
-    p[7] = s.my_tag;
-    let mut scratch = [0u8; 12];
+    let mut p = [0u8; CONNECT_TO_MAX];
+    let n = write_connect_to(
+        &mut p,
+        SOCK_TYPE_STREAM,
+        s.port,
+        &dial_target(s),
+        Some(s.my_tag),
+    );
+    let mut scratch = [0u8; 3 + CONNECT_TO_MAX];
     net_write_frame(
         sys,
         s.net_out,
-        NET_CMD_CONNECT,
+        NET_CMD_CONNECT_TO,
         p.as_ptr(),
-        8,
+        n,
         scratch.as_mut_ptr(),
-        12,
+        scratch.len(),
     );
 }
 
@@ -308,9 +375,13 @@ pub unsafe extern "C" fn module_new(
     s.phase = PH_IDLE;
     s.my_tag = dev_requester_tag(sys);
     s.conn = NO_CONN;
-    s.port = 8443;
+    s.port = DEFAULT_PORT;
     s.count = 1;
-    s.peer_ip = 0;
+    s.authority = [0u8; MAX_AUTHORITY_LEN];
+    s.authority_len = 0;
+    s.peer_af = 0;
+    s.peer_host_len = 0;
+    s.peer_addr = [0u8; 16];
     s.at_ms = (dev_millis(sys) as u32).wrapping_add(RETRY_MS);
     s.started_ms = 0;
     s.steps = 0;
@@ -320,8 +391,12 @@ pub unsafe extern "C" fn module_new(
     if !params.is_null() && params_len > 0 {
         params_def::parse_tlv(s, params, params_len);
     }
-    if s.peer_ip == 0 {
-        log(s, 1, b"[probe] refusing to construct: peer_ip is required");
+    if !adopt_authority(s) {
+        log(
+            s,
+            1,
+            b"[probe] refusing to construct: authority (host[:port]) is required",
+        );
         return -22;
     }
     if s.count == 0 {

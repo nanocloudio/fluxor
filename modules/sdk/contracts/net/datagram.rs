@@ -62,6 +62,13 @@ pub const FRAME_HDR: usize = 3;
 pub const AF_INET: u8 = 4;
 /// Address family: IPv6 (16-byte address, big-endian).
 pub const AF_INET6: u8 = 6;
+/// Address family on `CMD_DG_SEND_TO`: a DNS name, `[len: u8][name…]`
+/// (1..=253 ASCII bytes), resolved by the provider exactly as a stream
+/// `CMD_CONNECT_TO` name is. A name the provider does not yet hold starts a
+/// lookup and the datagram is DROPPED; a datagram sender retransmits, and
+/// the next send after the answer lands goes out. A provider that cannot
+/// resolve answers `MSG_DG_ERROR` `EAFNOSUPPORT`; literals work everywhere.
+pub const AF_NAME: u8 = 1;
 
 /// CMD_DG_BIND flag: receive-only endpoint (no TX allowed). Advisory;
 /// providers may ignore. Reserved for future admission policy use.
@@ -82,6 +89,7 @@ pub const CMD_DG_BIND: u8 = 0x20;
 ///
 /// IPv4 payload: [ep_id: u8] [af: u8 = 4] [addr: 4 bytes BE] [port: u16 LE] [data...]
 /// IPv6 payload: [ep_id: u8] [af: u8 = 6] [addr: 16 bytes BE] [port: u16 LE] [data...]
+/// Name payload: [ep_id: u8] [af: u8 = 1] [len: u8] [name: len bytes] [port: u16 LE] [data...]
 ///
 /// Owner-tagged form — `OWNER_TAG_MARK` sits where `af` sits, so the two
 /// shapes are told apart at a fixed offset and the tag never has to be

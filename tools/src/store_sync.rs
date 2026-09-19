@@ -1613,6 +1613,7 @@ mod tests {
             target: Some("host-triple".into()),
             digest: refs[0].digest.clone(),
             reference: "fluxor/run/fluxor-host-triple:0.0.1".into(),
+            content: None,
         };
 
         assert!(!runtime_differs_from_build(&store, &entry, &member).unwrap());

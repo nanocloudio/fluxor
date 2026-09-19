@@ -97,27 +97,38 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
 
     // A fmod-only project (all PIC modules, no host crate) has no `Cargo.toml`,
     // so `cargo fmt` / `cargo clippy` have nothing to drive. Rather than skip
-    // the lint gate there, fmt-check and clippy run directly on the PIC module
-    // sources (rustfmt + clippy-driver with the strict-build target flags).
+    // the lint gate there, clippy runs directly on the PIC module sources
+    // (clippy-driver with the strict-build target flags).
     let has_cargo = project_root.join("Cargo.toml").is_file();
     let has_modules = project_root.join("modules").is_dir();
 
     // ───── Phase 1.1: fmt-check ─────────────────────────────────────
+    // Two phases, because they cover disjoint trees: `cargo fmt --all`
+    // reaches the workspace's members, and PIC module sources are not
+    // members of it. A project with both gets both, or the modules are
+    // the half nothing formats.
     results.push(if skip.lint {
         skipped("fmt-check")
-    } else if !has_cargo {
-        if has_modules {
-            run_step("fmt-check (modules)", verbose, || {
-                modules_fmt_check(project_root, verbose)
-            })
-        } else {
-            skipped("fmt-check")
-        }
-    } else {
+    } else if has_cargo {
         run_step("fmt-check", verbose, || {
             cargo_in(project_root, &["fmt", "--all", "--", "--check"])
         })
+    } else if has_modules {
+        run_step("fmt-check (modules)", verbose, || {
+            modules_fmt_check(project_root, verbose)
+        })
+    } else {
+        skipped("fmt-check")
     });
+    if has_cargo && has_modules {
+        results.push(if skip.lint {
+            skipped("fmt-check (modules)")
+        } else {
+            run_step("fmt-check (modules)", verbose, || {
+                modules_fmt_check(project_root, verbose)
+            })
+        });
+    }
 
     // ───── Phase 1.2: clippy ────────────────────────────────────────
     // The fluxor workspace mixes a host CLI with no_std embedded
@@ -2020,8 +2031,9 @@ fn git_short_sha(dir: &Path) -> Option<String> {
     Some(s.trim().to_string())
 }
 
-/// fmt-check phase for fmod-only projects: `rustfmt --check` every module
-/// source (there's no host crate for `cargo fmt`).
+/// fmt-check phase for PIC module sources: `rustfmt --check` each one.
+/// They are not cargo workspace members, so `cargo fmt --all` never
+/// reaches them whether or not the project also has a host crate.
 fn modules_fmt_check(project_root: &Path, verbose: bool) -> std::result::Result<(), String> {
     let report =
         modules_build::fmt_check_modules(project_root, verbose).map_err(|e| e.to_string())?;

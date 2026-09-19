@@ -649,7 +649,27 @@ unsafe fn dtls_pump_recv_certificate(s: &mut TlsState, idx: usize) -> bool {
         &mut s.peer_sessions[idx].endpoint.driver.deferred_links,
         DeferredLinks::empty(),
     );
-    let mut rc = peer_cert_reason(s, is_server, body, Some(&mut deferred));
+    // A DTLS client dials `dtls_peer_ip`; the identity it expects is
+    // `verify_hostname` when set, else the address it dialled, as an
+    // `iPAddress`.
+    let mut expected = [0u8; MAX_EXPECTED_DNS];
+    let (expected_len, expected_is_ip) = if is_server {
+        (0, false)
+    } else if s.expected_dns_len > 0 {
+        expected[..s.expected_dns_len].copy_from_slice(&s.expected_dns[..s.expected_dns_len]);
+        (s.expected_dns_len, false)
+    } else {
+        expected[..4].copy_from_slice(&s.dtls_peer_ip.to_le_bytes());
+        (4, true)
+    };
+    let mut rc = peer_cert_reason(
+        s,
+        is_server,
+        &expected[..expected_len],
+        expected_is_ip,
+        body,
+        Some(&mut deferred),
+    );
     s.peer_sessions[idx].endpoint.driver.deferred_links = deferred;
     if rc == CERT_OK {
         rc = bind_peer_cert_key(&mut s.peer_sessions[idx].endpoint.driver, body);

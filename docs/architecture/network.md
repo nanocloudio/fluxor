@@ -43,7 +43,7 @@ contracts without ambiguity.
 
 4. **Consumer modules speak net_proto, not sockets.** HTTP, DNS, MQTT,
    and TLS modules exchange typed framed messages (`CMD_BIND`,
-   `CMD_CONNECT`, `CMD_SEND` upstream; `MSG_DATA`, `MSG_ACCEPTED`,
+   `CMD_CONNECT_TO`, `CMD_SEND` upstream; `MSG_DATA`, `MSG_ACCEPTED`,
    `MSG_CLOSED` downstream) over a channel pair. There is no shared
    socket handle table.
 
@@ -125,12 +125,19 @@ so the stream stays frame-aligned.
 | `0x10` | `CMD_BIND` | `[port: u16 LE]` — open a listener |
 | `0x11` | `CMD_SEND` | `[conn_id: u16 LE][data…]` — send bytes on a connection |
 | `0x12` | `CMD_CLOSE` | `[conn_id: u16 LE]` — tear down a connection |
-| `0x13` | `CMD_CONNECT` | `[sock_type: u8][ip: u32 LE][port: u16 LE][requester_tag: u8?]` |
+| `0x13` | `CMD_CONNECT` | retired — every provider answers `MSG_ERROR` ENOSYS on the requester tag |
+| `0x14` | `CMD_CONNECT_TO` | `[sock_type: u8][af: u8][port: u16 LE][addr…][requester_tag: u8?]` |
 
-`CMD_CONNECT` accepts only `SOCK_TYPE_STREAM` (1); any other `sock_type`
-fails with EINVAL. The trailing `requester_tag` is optional (the 7-byte
-form means tag 0) and is echoed back in `MSG_CONNECTED`; see
-§Fan-out and filtering.
+`CMD_CONNECT_TO` carries one of three address families: `AF_INET` (4,
+`addr` is 4 bytes in network order), `AF_INET6` (6, 16 bytes), or
+`AF_NAME` (1, `[len: u8][name: len bytes]` — a DNS name of 1..=253 ASCII
+bytes, resolved by the provider). It accepts only `SOCK_TYPE_STREAM`
+(1); any other `sock_type`, a malformed name, or a family the provider
+does not serve fails with EINVAL on the requester tag, and a name that
+does not resolve fails with ENOENT. The trailing `requester_tag` is
+optional (absent means tag 0) and is echoed back in `MSG_CONNECTED`; see
+§Fan-out and filtering. See §Connecting by name for the parameter that
+feeds this record.
 
 The `data` portion of one `CMD_SEND` must not exceed `MAX_CMD_DATA`
 (8192 bytes); a consumer with more bytes issues multiple `CMD_SEND`s and
@@ -191,7 +198,7 @@ config fans `net_out` to each of them and every consumer filters:
 - **Inbound connections** carry `local_port` in `MSG_ACCEPTED`; each
   consumer claims only connections accepted on the port it bound.
 - **Outbound connections** are claimed by `requester_tag`: a consumer
-  tags its `CMD_CONNECT` with its module index plus one (the
+  tags its `CMD_CONNECT_TO` with its module index plus one (the
   `dev_requester_tag` encoding — the sentinel `REQUESTER_TAG_NONE` (0)
   therefore never collides with module index 0) and claims the
   `MSG_CONNECTED` or connect-phase `MSG_ERROR` echoing that tag. On a
@@ -199,6 +206,60 @@ config fans `net_out` to each of them and every consumer filters:
   matched on `requester_tag` alone.
 
 A sole consumer may ignore both fields.
+
+### Connecting by name
+
+A connection is opened to an authority, and the authority is one fact
+that flows down the stack. The connector states `nanocloud.io:443`; the
+`CMD_CONNECT_TO` record carries it; `tls`, which sits between the
+connector and the network and forwards the record, reads the name off
+it for SNI and the certificate check; the network provider resolves it,
+because resolution is the network's job and every platform has one way
+to do it. Nothing is written twice, so nothing can disagree.
+
+The parameter rule: `authority` is the only address-bearing parameter a
+connector takes. It is `host[:port]` — a DNS name, a dotted quad, or a
+bracketed IPv6 literal — and the port lives inside it; when omitted, the
+connector's protocol default applies. A server-mode instance keeps
+`port`, because a bind is not an authority. `tls.verify_hostname` is the
+one override: set it when the name to verify is not the one dialled (a
+proxy, or a pinned host reached by address), and the build warns when it
+differs from the authority wired into that `tls` instance so the
+override is a stated decision. The build refuses any other
+address-bearing key on a connector, and a `u32` parameter given a string
+with a dot that is not a dotted quad — a host name on an address field —
+is an error, never a hash.
+
+The wire record is `CMD_CONNECT_TO` (0x14) in the table above:
+`[sock_type][af][port][addr…][tag?]`, with `AF_INET`, `AF_INET6` and
+`AF_NAME`. The SDK's `Target::parse` turns an authority into the target
+and its port, recognising literals as literals, and `write_connect_to`
+composes the record.
+
+Who resolves: the provider that receives the record. `linux_net` calls
+the host's `getaddrinfo` on a resolver thread and keeps a 60 s positive
+cache; `ip` runs a stub resolver over UDP/53 against the `resolver`
+parameter when set and otherwise the nameserver DHCP handed it. In the
+browser there is no stream provider at all — the wasm host serves the
+HTTP exchange contract, and the browser resolves the URL's host. A
+provider that cannot resolve answers an `AF_NAME` target with EINVAL,
+and one with no IPv6 stack answers an `AF_INET6` literal the same way —
+`ip` refuses both. An IPv4 literal is the only target every provider
+dials.
+
+Errors are synchronous or tagged, never a timeout: a name over 253 bytes,
+a malformed record, or a family the provider does not serve is EINVAL at
+the connect; a name that does not resolve is ENOENT on the requester
+tag; the retired `CMD_CONNECT` (0x13) is ENOSYS. The `ip` stub resolver
+is narrower than the contract and holds names of at most 64 bytes, so it
+refuses a longer one EINVAL as well. A misconfigured graph fails its
+first dial with a reason.
+
+TLS names each session from the record it forwards. A name becomes the
+SNI extension and is matched against the certificate's dNSName entries;
+a literal sends no SNI and is matched against an iPAddress SAN. A
+certificate that carries only a dNSName does not verify a session dialled
+by address unless `verify_hostname` says which name to expect.
 
 ### Why two channels per consumer
 
@@ -338,7 +399,8 @@ Each step the IP module:
    state machines, and queues outbound frames.
 2. Writes outbound frames to `frames_tx` until the channel fills.
 3. Reads pending commands from `net_in` and handles them: `CMD_BIND`
-   allocates a listener, `CMD_CONNECT` opens an outbound socket,
+   allocates a listener, `CMD_CONNECT_TO` opens an outbound socket
+   (resolving a name first),
    `CMD_SEND` queues bytes for transmission, `CMD_CLOSE` tears down a
    connection.
 4. Writes `MSG_DATA` and state-transition notifications to `net_out`.
@@ -379,9 +441,9 @@ a SYN flood at the ceiling never walks the table per SYN; loopback pairs
 take their slots from the same allocator as accepted connections. The
 step guard is what makes this a correctness rule rather than a
 preference: a step that walks the whole table on a 65,536-record profile
-ends the module. (Hardware pass: the first 65,535-connection rung on the
-Pi 5 ended the board at ~63,000 connections — the free-slot cursor scan
-degenerates to a full walk per SYN as the table fills.)
+ends the module. (Measured on a Pi 5: a free-slot cursor scan degenerates
+to a full walk per SYN as the table fills, and the 65,535-connection rung
+ended the board at ~63,000 connections.)
 
 The same rule reaches the wiring around the module. A consumer port
 shared by two readers — `debug: to: net` puts `log_net` beside the

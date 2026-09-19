@@ -204,7 +204,11 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> us
     let name_len = st[18] as usize;
     if name_len > 0 && MODULE_STATE_LEN + name_len <= rc as usize {
         emit_bytes(b" name=", out, &mut pos);
-        emit_bytes(&st[MODULE_STATE_LEN..MODULE_STATE_LEN + name_len], out, &mut pos);
+        emit_bytes(
+            &st[MODULE_STATE_LEN..MODULE_STATE_LEN + name_len],
+            out,
+            &mut pos,
+        );
     }
     emit_bytes(b" state=", out, &mut pos);
     emit_bytes(

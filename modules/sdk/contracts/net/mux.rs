@@ -29,7 +29,7 @@
 // shared SDK helpers (net_read_frame, net_write_frame) work unchanged.
 // Opcode ranges are disjoint from the other four contracts:
 //
-//     net_proto     0x01..0x13   (Stream Surface v1)
+//     net_proto     0x01..0x14   (Stream Surface v1)
 //     datagram      0x20..0x43   (Datagram Surface v1)
 //     packet        0x50..0x63   (Packet Surface v1)
 //     session_ctrl  0x70..0x9F   (SessionCtrlV1 control sideband)

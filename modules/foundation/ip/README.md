@@ -41,6 +41,47 @@ required = true
 - `dhcp_compat` — admit BOOTP replies and an ACK with no preceding OFFER
   (default 0 = strict). Both accept an address assignment the client cannot
   correlate to a selection it made.
+- `static_ip`, `static_netmask`, `static_gateway` — the address to adopt
+  when `use_dhcp=0`.
+- `resolver` — the DNS server named dials are resolved at (default 0 = the
+  server the DHCP lease supplied). A static-IP deployment that dials names
+  sets it.
+
+## Connecting by name
+
+A consumer opens a stream with `CMD_CONNECT_TO` (`net_proto`, 0x14), whose
+target carries an address family: `AF_INET` dials the literal at once,
+`AF_INET6` is refused `EINVAL` (there is no IPv6 stack), and `AF_NAME` is
+resolved here before the SYN goes out. The retired `CMD_CONNECT` (0x13) is
+answered `MSG_ERROR ENOSYS` on its tag, with one log line naming the
+replacement, so a stale emitter fails on its first dial.
+
+The stub resolver is this module's: it owns the datagram path and the DHCP
+lease's DNS server, so resolution needs no sibling module and no contract of
+its own. One A query per name goes from an ephemeral port the resolver
+allocates on first use and holds for the module's lifetime (reserved against
+every later allocation), to `resolver` when set and otherwise to the lease's
+server; replies are demuxed by that port ahead of the datagram endpoints, as
+DHCP's are, and only from port 53 of that server. Two dials of one name in
+flight share one query. A query unanswered after 3 s is sent once more with a
+fresh CSPRNG-drawn id; a second silence, a negative answer (NXDOMAIN, an
+error code, NOERROR with no A record), or no resolver to ask fails the dial
+`ENOENT` on its requester tag. `EAGAIN` means every pending slot is taken,
+or the CSPRNG had no id to give.
+
+Answers are cached by TTL in a fixed table (`MAX_DNS_CACHE` entries per
+profile: 32 on aarch64, 4 on the embedded profile), so a repeated dial pays
+no round trip. A zero TTL is held for 60 s; others for 1..3600 s. Names are
+held lowercased and at most 64 bytes — a longer one is refused `EINVAL` at
+the dial, which is what bounds the tables on an MCU-class profile. The
+`dns` module is a server; it does not resolve for siblings, and the wire
+codec the two share is `sdk/contracts/net/dns_wire.rs`.
+
+`CMD_DG_SEND_TO` takes the same `AF_NAME`: a cached name sends at once; a
+name not in hand starts the lookup and the datagram is dropped without a
+report, because a datagram sender retransmits and the next send finds the
+answer. An address family other than `AF_INET` / `AF_NAME` is refused
+`EAFNOSUPPORT`.
 
 ## Supported profile
 
@@ -125,4 +166,4 @@ and the option refusal print on the `[ip] cookie` line.
 ## Notes
 
 - Keep this file aligned with `manifest.toml` and parameter definitions in source.
-- Last refreshed: 2026-08-21
+- Last refreshed: 2026-09-19

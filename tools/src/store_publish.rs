@@ -215,12 +215,38 @@ pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
+/// How a publish should treat manifests it displaces that other
+/// checkouts are still pinning.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublishMode {
+    /// Compute and print the displacement report, then stop without
+    /// writing anything. The report is a pure function of the prepared
+    /// manifests, the index and the pin ledger, so what it describes is
+    /// exactly what a real publish would then do.
+    pub dry_run: bool,
+    /// Refuse the publish if it would displace a manifest another
+    /// checkout pins. The right default for a release publish and the
+    /// wrong one for the fifteen local publishes a working session does,
+    /// which is why it is a flag and not a setting.
+    pub strict_pins: bool,
+}
+
 /// The whole-project publish onto the store. Returns the committed tag
 /// names. `only` filters kinds: empty = everything publishable.
 pub fn publish_project_to_store(
     project_root: &Path,
     only: &[&str],
     verbose: bool,
+) -> Result<Vec<String>> {
+    publish_project_with_mode(project_root, only, verbose, PublishMode::default())
+}
+
+/// `publish_project_to_store` with explicit displacement handling.
+pub fn publish_project_with_mode(
+    project_root: &Path,
+    only: &[&str],
+    verbose: bool,
+    mode: PublishMode,
 ) -> Result<Vec<String>> {
     let pr = project_root.to_path_buf();
     let identity = require_project_identity(&pr)?;
@@ -449,13 +475,63 @@ pub fn publish_project_to_store(
         .map(|d| d.name.clone())
         .collect::<Vec<_>>()
         .join(",");
-    let committed = store.commit_publish(
+    let deps = if deps.is_empty() { None } else { Some(deps) };
+
+    // The displacement report, before anything is written. Both the dry
+    // run and the strict gate read the SAME plan the commit will use, so
+    // neither can describe a publish other than the one that follows.
+    if mode.dry_run || mode.strict_pins {
+        let index = store.read_index()?;
+        let plan = store.plan_publish(
+            &index,
+            &identity.name,
+            &identity.version,
+            &prepared,
+            deps.as_deref(),
+        )?;
+        let report = store.displacement_report(&plan, &pr)?;
+        print!(
+            "\npublish {} {} — displacement report{}",
+            identity.name,
+            identity.version,
+            if report.is_empty() {
+                "\n\n  nothing another checkout pins is moving.\n".to_string()
+            } else {
+                crate::oci_store::render_displacement(&report)
+            }
+        );
+        if mode.strict_pins && !report.is_empty() {
+            return Err(Error::Config(format!(
+                "--strict-pins: this publish would displace {} manifest(s) that other \
+                 checkouts pin (listed above). Their pins stay resolvable — the ledger \
+                 keeps them live — but they will go stale. Re-run without --strict-pins \
+                 to proceed",
+                report.len()
+            )));
+        }
+        if mode.dry_run {
+            println!("\ndry run: nothing was written.");
+            return Ok(Vec::new());
+        }
+    }
+
+    let (committed, report) = store.commit_publish_reported(
         &txn,
         &identity.name,
         &identity.version,
         prepared,
-        if deps.is_empty() { None } else { Some(&deps) },
+        deps.as_deref(),
+        Some(&pr),
     )?;
+    if !report.is_empty() {
+        eprint!(
+            "\npublish {} {} — displacement report{}",
+            identity.name,
+            identity.version,
+            crate::oci_store::render_displacement(&report)
+        );
+        eprintln!("  Every pin above stays resolvable: the store's pin ledger holds them live.\n");
+    }
     let tags: Vec<String> = committed
         .iter()
         .filter_map(|d| d.annotations.get(crate::oci_store::ANN_REF_NAME).cloned())
