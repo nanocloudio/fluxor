@@ -105,6 +105,11 @@ const JSON_MAX: usize = FRAME_HDR + 4096;
 /// a histogram row carries 7 and zero-fills the rest).
 const BOUNDS_ROWS: usize = 8;
 const BOUNDS_MAX: usize = 15;
+/// Decoded bounds blob at full table capacity: `[count u8]` then per row
+/// `[module u16][id u16][nbounds u8][bound_us u32 × BOUNDS_MAX]`.
+const BOUNDS_BLOB_MAX: usize = 1 + BOUNDS_ROWS * (5 + 4 * BOUNDS_MAX);
+/// The blob's hex text, as the `bounds` param carries it.
+const BOUNDS_HEX_MAX: usize = 2 * BOUNDS_BLOB_MAX;
 
 #[repr(C)]
 struct OtelState {
@@ -160,6 +165,11 @@ struct OtelState {
     bounds_id: [u16; BOUNDS_ROWS],
     bounds_n: [u8; BOUNDS_ROWS],
     bounds_us: [[u32; BOUNDS_MAX]; BOUNDS_ROWS],
+    /// The `bounds` param's hex text as received. It arrives as TLV entries
+    /// of at most 255 bytes, so chunk boundaries fall mid-byte; the text is
+    /// kept whole and the table decoded from the start after each chunk.
+    bounds_hex: [u8; BOUNDS_HEX_MAX],
+    bounds_hex_len: u16,
     accum_len: u16,
     accum: [u8; ACCUM_MAX],
     out: [u8; OUT_MAX],
@@ -183,6 +193,7 @@ impl OtelState {
         self.bounds_id = [0; BOUNDS_ROWS];
         self.bounds_n = [0; BOUNDS_ROWS];
         self.bounds_us = [[0; BOUNDS_MAX]; BOUNDS_ROWS];
+        self.bounds_hex_len = 0;
         self.last_flush_micros = 0;
         self.encoding = tlm::ENCODING_FXTL_COMPACT;
         self.awaiting_ack = false;
@@ -205,17 +216,29 @@ mod params_def {
         5, table_digest, u32, 0 => |s, d, len| { s.table_digest = p_u32(d, len, 0, 0); };
         // Hex text of `[count u8]` then per row
         // `[module u16 LE][id u16 LE][nbounds u8][bound_us u32 LE × nbounds]`,
-        // injected by the config builder from the graph's id-table. A row that
-        // does not fit is dropped whole (the encoder then skips that
-        // instrument — degraded, never wrong).
-        6, bounds, str, 0 => |s, d, len| {
-            let mut raw =
-                [0u8; 1 + super::BOUNDS_ROWS * (5 + 4 * super::BOUNDS_MAX)];
+        // injected by the config builder from the graph's id-table. The
+        // builder splits it across TLV entries of at most 255 bytes under
+        // this tag; each chunk is appended and the whole text decoded again
+        // from the start, so a nibble straddling a chunk boundary completes
+        // when the next chunk lands. A row that does not fit is dropped
+        // whole (the encoder then skips that instrument — degraded, never
+        // wrong).
+        6, bounds, str_chunked, 0 => |s, d, len| {
+            let have = s.bounds_hex_len as usize;
+            let n = len.min(super::BOUNDS_HEX_MAX - have);
+            let mut i = 0usize;
+            while i < n {
+                s.bounds_hex[have + i] = *d.add(i);
+                i += 1;
+            }
+            s.bounds_hex_len = (have + n) as u16;
+
+            let mut raw = [0u8; super::BOUNDS_BLOB_MAX];
             let mut rn = 0usize;
             let mut i = 0usize;
-            while i + 1 < len && rn < raw.len() {
-                let hi = super::hex_nibble(*d.add(i));
-                let lo = super::hex_nibble(*d.add(i + 1));
+            while i + 1 < have + n {
+                let hi = super::hex_nibble(s.bounds_hex[i]);
+                let lo = super::hex_nibble(s.bounds_hex[i + 1]);
                 let (Some(hi), Some(lo)) = (hi, lo) else { break };
                 raw[rn] = (hi << 4) | lo;
                 rn += 1;
@@ -236,9 +259,11 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Decode the injected bounds blob into the state table. Malformed tails are
-/// dropped whole — a half-read row would attach wrong bounds to an id.
+/// Decode the injected bounds blob into the state table, rebuilding it from
+/// row 0. Malformed tails are dropped whole — a half-read row would attach
+/// wrong bounds to an id.
 fn parse_bounds_blob(s: &mut OtelState, raw: &[u8]) {
+    s.bounds_rows = 0;
     let Some(&count) = raw.first() else { return };
     let mut off = 1usize;
     let mut row = 0usize;

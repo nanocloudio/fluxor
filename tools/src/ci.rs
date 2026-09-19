@@ -494,38 +494,22 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // `cargo test` needs a cargo project. A crate-less fmod-only project
     // (no root `Cargo.toml`) with no host-tools crate has nothing here, so
     // the phase is omitted rather than perpetually listed as skipped.
-    let host_tools_crate = load_host_tools_crate(project_root);
-    let tools_path = host_tools_crate.as_ref().map(|c| project_root.join(c));
-    // A configured-but-missing crate still gets a phase entry so the
-    // misconfiguration surfaces as a skip message, never a silent omission.
-    // With no host-tools crate at all, a host-buildable root workspace runs
-    // the standard's phase-2 command directly (ci.md: `cargo test
-    // --workspace --lib --bins`) — the host-tools indirection exists only
-    // for kernel-rooted workspaces whose default features can't build on
-    // the host.
-    let tools_applicable = has_cargo || tools_path.is_some();
-    if tools_applicable {
+    // Resolved by `cargo_unit_site`, the same call `fluxor test` makes, so
+    // the gate and the verb cannot run different commands over one tree.
+    let unit_site = cargo_unit_site(project_root);
+    let unit_label = if cargo_host_tools_dir(project_root).is_some() {
+        "cargo-test (tools)"
+    } else {
+        "cargo-test (unit)"
+    };
+    if let Some((dir, args)) = unit_site {
         results.push(if skip.cargo {
-            skipped(if tools_path.is_some() {
-                "cargo-test (tools)"
-            } else {
-                "cargo-test (unit)"
-            })
+            skipped(unit_label)
         } else {
-            match tools_path.as_ref() {
-                Some(p) if p.is_dir() => run_step("cargo-test (tools)", verbose, || {
-                    cargo_test_phase(p, &["test", "--all-targets", "--all-features"])
-                }),
-                Some(p) => PhaseResult {
-                    name: "cargo-test (tools)",
-                    status: PhaseStatus::Skipped,
-                    elapsed_ms: 0,
-                    message: format!("no host-tools crate at {}", p.display()),
-                },
-                None => run_step("cargo-test (unit)", verbose, || {
-                    cargo_test_phase(project_root, &["test", "--workspace", "--lib", "--bins"])
-                }),
-            }
+            run_step(unit_label, verbose, || {
+                let argv: Vec<&str> = args.clone();
+                cargo_test_phase(&dir, &argv)
+            })
         });
     }
 
@@ -598,27 +582,28 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         Err(e) => results.push(run_step("project-e2e", verbose, move || Err(e))),
     }
 
-    // ───── Phase 4: cargo integration / harness tests ───────────────
+    // ───── Phase 4: cargo integration tests ─────────────────────────
     //
-    // The harness is a sub-workspace at `tests/harness/` — a fluxor-repo
-    // layout. Projects without one omit the phase entirely (their runtime
-    // gate is `[ci.test] scripts`, phase 3.5) rather than carrying a
-    // perpetual skip line that reads as an unmet obligation.
-    let harness_path = project_root.join("tests/harness");
-    if harness_path.exists() {
+    // Two sites, either of which may be absent: the `tests/harness/`
+    // sub-workspace, and the root package's own `tests/`. A project with
+    // neither omits the phase entirely (its runtime gate is `[ci.test]`
+    // scripts, phase 3.5) rather than carrying a perpetual skip line that
+    // reads as an unmet obligation.
+    //
+    // The root site matters because phase 2 selects target kinds
+    // (`--lib --bins`), and naming any target kind turns cargo's default
+    // selection off — so integration tests are excluded there by
+    // construction. Without this sweep a root `tests/*.rs` is run by
+    // `fluxor test` and by nothing in the gate.
+    //
+    // `cargo_integration_sites` is the same call `fluxor test` makes.
+    for (label, dir, args) in cargo_integration_sites(project_root) {
         results.push(if skip.cargo {
-            skipped("cargo-test (harness)")
+            skipped(label)
         } else {
-            run_step("cargo-test (harness)", verbose, || {
-                cargo_in(
-                    &harness_path,
-                    &[
-                        "test",
-                        "--target",
-                        "aarch64-unknown-linux-gnu",
-                        "--no-fail-fast",
-                    ],
-                )
+            run_step(label, verbose, || {
+                let argv: Vec<&str> = args.clone();
+                cargo_in(&dir, &argv)
             })
         });
     }
@@ -1159,6 +1144,121 @@ pub(crate) fn load_host_tools_crate(project_root: &Path) -> Option<String> {
         return Some("tools".to_string());
     }
     None
+}
+
+/// Where cargo runs for this project, resolved once.
+///
+/// `None` when the project has no cargo tree. `Some(dir)` is the directory
+/// cargo is invoked in, and the flag says whether that directory is the root
+/// of a workspace — a host-tools SUB-crate is one package and takes neither
+/// `--workspace` nor the root's integration sweep.
+///
+/// A `host_tools_crate` naming the root itself resolves to `None` here rather
+/// than to a second, subtly different root site: pointing the key at `.` says
+/// "the root is the host-tools crate", which is what not declaring it already
+/// means. Collapsing the two is what stops one command running at the root
+/// under `fluxor test` and a different one under `fluxor ci`.
+pub(crate) fn cargo_host_tools_dir(project_root: &Path) -> Option<PathBuf> {
+    let dir = project_root.join(load_host_tools_crate(project_root)?);
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let root = project_root
+        .canonicalize()
+        .unwrap_or(project_root.to_path_buf());
+    (dir != root && dir.join("Cargo.toml").is_file()).then_some(dir)
+}
+
+/// The UNIT-test invocation: `(directory, args)`, or `None` with no cargo tree.
+///
+/// One definition, read by `fluxor ci`'s phase 2 and by the `fluxor test`
+/// verb, so the gate and the verb cannot drift into running different
+/// commands over the same tree.
+/// Taking the facts as arguments rather than reading them keeps the rule
+/// testable against a layout that is described rather than built on disk, and
+/// lets a caller that has already resolved its shape pass what it knows.
+pub(crate) fn unit_site_for(
+    root: &Path,
+    host_tools: Option<&Path>,
+    has_cargo: bool,
+) -> Option<(PathBuf, Vec<&'static str>)> {
+    if let Some(dir) = host_tools {
+        // One package, every target kind: a host-tools crate exists because
+        // the workspace around it cannot build on the host, so there is no
+        // workspace sweep to do from here.
+        return Some((
+            dir.to_path_buf(),
+            vec!["test", "--all-targets", "--all-features"],
+        ));
+    }
+    has_cargo.then(|| {
+        (
+            root.to_path_buf(),
+            vec!["test", "--workspace", "--lib", "--bins"],
+        )
+    })
+}
+
+/// [`unit_site_for`] with the facts read off disk — `fluxor ci`'s entry.
+pub(crate) fn cargo_unit_site(project_root: &Path) -> Option<(PathBuf, Vec<&'static str>)> {
+    unit_site_for(
+        project_root,
+        cargo_host_tools_dir(project_root).as_deref(),
+        project_root.join("Cargo.toml").is_file(),
+    )
+}
+
+/// The INTEGRATION-test invocations, in the order they should run.
+///
+/// Two sites, either of which may be absent: the `tests/harness/`
+/// sub-workspace, and the root package's own `tests/`. The second exists
+/// because the unit site is deliberately `--lib --bins`, which selects target
+/// kinds and so excludes integration tests entirely — without a sweep for
+/// them, a root `tests/*.rs` is compiled by nothing the gate runs and its
+/// assertions are never executed.
+///
+/// The root sweep is skipped when a host-tools crate took the unit site: that
+/// crate exists precisely because the root cannot build on the host, and a
+/// sweep there would fail for that reason rather than for a test's.
+pub(crate) fn integration_sites_for(
+    root: &Path,
+    host_tools: Option<&Path>,
+    has_cargo: bool,
+    has_harness: bool,
+    has_root_tests: bool,
+) -> Vec<(&'static str, PathBuf, Vec<&'static str>)> {
+    let mut out = Vec::new();
+    if has_harness {
+        out.push((
+            "cargo-test (harness)",
+            root.join("tests/harness"),
+            vec![
+                "test",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--no-fail-fast",
+            ],
+        ));
+    }
+    if host_tools.is_none() && has_cargo && has_root_tests {
+        out.push((
+            "cargo-test (integration)",
+            root.to_path_buf(),
+            vec!["test", "--workspace", "--tests"],
+        ));
+    }
+    out
+}
+
+/// [`integration_sites_for`] with the facts read off disk — `fluxor ci`'s entry.
+pub(crate) fn cargo_integration_sites(
+    project_root: &Path,
+) -> Vec<(&'static str, PathBuf, Vec<&'static str>)> {
+    integration_sites_for(
+        project_root,
+        cargo_host_tools_dir(project_root).as_deref(),
+        project_root.join("Cargo.toml").is_file(),
+        project_root.join("tests/harness").exists(),
+        project_root.join("tests").is_dir(),
+    )
 }
 
 /// Hygiene phase wraps the scanner and reports any violation or stale

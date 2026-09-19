@@ -47,6 +47,10 @@ pub struct Shape {
     pub mounts_staged: bool,
     /// `[ci.test] scripts` globs — the project's runtime gate.
     pub test_scripts: Vec<String>,
+    /// A root `tests/` directory exists, so the root package may carry
+    /// integration tests. Phase 2 selects target kinds and therefore cannot
+    /// reach them; the integration lane is what does.
+    pub has_root_tests: bool,
     /// `tests/harness/` exists — a sub-workspace holding the project's
     /// integration suites, which `fluxor ci`'s phase 4 runs. Tracked here so
     /// the `test` VERB runs it too: a lane the gate covers and the verb skips
@@ -56,14 +60,38 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// Where cargo runs, and with which selector. `--workspace` at the
-    /// root; a host-tools sub-crate is one package and takes neither.
+    /// Where cargo runs for BUILD and CLIPPY, and whether that directory is a
+    /// workspace root.
+    ///
+    /// Resolved through `ci::cargo_host_tools_dir`, the same call the test
+    /// lanes make, so a `host_tools_crate` pointing at the root collapses to
+    /// the root site here too rather than selecting a second, subtly
+    /// different one.
     fn cargo_site(&self) -> Option<(PathBuf, bool)> {
         match self.host_tools.as_ref() {
-            Some(p) if p != &self.project_root => Some((p.clone(), false)),
-            _ if self.has_cargo => Some((self.project_root.clone(), true)),
-            _ => None,
+            Some(p) => Some((p.clone(), false)),
+            None => self.has_cargo.then(|| (self.project_root.clone(), true)),
         }
+    }
+
+    /// The unit lane, from this shape's own facts.
+    fn unit_site(&self) -> Option<(PathBuf, Vec<&'static str>)> {
+        ci::unit_site_for(
+            &self.project_root,
+            self.host_tools.as_deref(),
+            self.has_cargo,
+        )
+    }
+
+    /// The integration lanes, from this shape's own facts.
+    fn integration_sites(&self) -> Vec<(&'static str, PathBuf, Vec<&'static str>)> {
+        ci::integration_sites_for(
+            &self.project_root,
+            self.host_tools.as_deref(),
+            self.has_cargo,
+            self.has_harness_crate,
+            self.has_root_tests,
+        )
     }
 }
 
@@ -80,9 +108,9 @@ pub fn shape(project_root: &Path) -> Shape {
         })
         .unwrap_or_else(|| "project".to_string());
 
-    let host_tools = ci::load_host_tools_crate(project_root)
-        .map(|c| project_root.join(c))
-        .filter(|p| p.join("Cargo.toml").is_file());
+    // One resolver, so a `host_tools_crate` naming the root collapses to the
+    // root site here exactly as it does for the gate.
+    let host_tools = ci::cargo_host_tools_dir(project_root);
 
     Shape {
         project_root: project_root.to_path_buf(),
@@ -92,6 +120,7 @@ pub fn shape(project_root: &Path) -> Shape {
         has_modules: project_root.join("modules").is_dir() && !ci_targets(project_root).is_empty(),
         mounts_staged: mounts_staged_tree(project_root),
         test_scripts: ci::load_test_scripts(project_root).unwrap_or_default(),
+        has_root_tests: project_root.join("tests").is_dir(),
         has_harness_crate: project_root.join("tests/harness").exists(),
     }
 }
@@ -258,34 +287,22 @@ pub fn test(project_root: &Path, _verbose: bool) -> Result<()> {
     let s = shape(project_root);
     let mut did_something = false;
 
-    if let Some((dir, workspace)) = s.cargo_site() {
-        let args: &[&str] = if workspace {
-            &["test", "--workspace"]
-        } else {
-            &["test", "--all-targets", "--all-features"]
-        };
-        step(&cargo_label(&s, &dir, args));
-        ci::cargo_in(&dir, args).map_err(Error::Config)?;
+    // The unit half and the integration half both come from `ci`, which is
+    // where the gate reads them too. A lane the gate covers and this verb
+    // skips makes `make test` quietly weaker than `make ci`; a lane this verb
+    // covers and the gate skips is worse, because then the gate is the weaker
+    // of the two. One definition is what rules out both.
+    if let Some((dir, args)) = s.unit_site() {
+        let argv: Vec<&str> = args.clone();
+        step(&cargo_label(&s, &dir, &argv));
+        ci::cargo_in(&dir, &argv).map_err(Error::Config)?;
         did_something = true;
     }
 
-    // The integration harness at `tests/harness/` is its own sub-workspace, so
-    // `cargo_site()` above does not reach it — a project whose only cargo tree
-    // IS the harness (wave: no root manifest, host crates each declaring their
-    // own `[workspace]`) would otherwise have every one of its integration
-    // suites skipped by `fluxor test` while `fluxor ci` phase 4 ran them.
-    // `make test` reporting green over hundreds of unrun tests is exactly the
-    // failure the lifecycle verbs exist to prevent.
-    if s.has_harness_crate {
-        let dir = s.project_root.join("tests/harness");
-        let args: &[&str] = &[
-            "test",
-            "--target",
-            "aarch64-unknown-linux-gnu",
-            "--no-fail-fast",
-        ];
-        step("cargo test (tests/harness)");
-        ci::cargo_in(&dir, args).map_err(Error::Config)?;
+    for (label, dir, args) in s.integration_sites() {
+        let argv: Vec<&str> = args.clone();
+        step(label);
+        ci::cargo_in(&dir, &argv).map_err(Error::Config)?;
         did_something = true;
     }
 
@@ -605,11 +622,18 @@ fn describe_build(s: &Shape) -> String {
 
 fn describe_test(s: &Shape) -> String {
     let mut parts = Vec::new();
-    if s.cargo_site().is_some() {
+    if s.unit_site().is_some() {
         parts.push("cargo test".to_string());
     }
-    if s.has_harness_crate {
-        parts.push("tests/harness".to_string());
+    // Named by the tree each lane runs in, which is what a reader wants from
+    // `make help` — the phase label is the gate's vocabulary, not theirs.
+    for (_, dir, _) in s.integration_sites() {
+        let rel = dir.strip_prefix(&s.project_root).unwrap_or(&dir);
+        parts.push(if rel.as_os_str().is_empty() {
+            "tests/".to_string()
+        } else {
+            rel.display().to_string()
+        });
     }
     if !s.test_scripts.is_empty() {
         parts.push("e2e scripts".to_string());
@@ -763,6 +787,93 @@ mod tests {
         .starts_with(&staged));
     }
 
+    /// Every lane `fluxor test` runs, `fluxor ci` runs too.
+    ///
+    /// The two read one definition, so this holds by construction rather than
+    /// by both being edited together. It is asserted over the shapes the
+    /// fleet actually has, because the pairing used to differ per shape and
+    /// the differences were invisible from either side alone.
+    #[test]
+    fn the_test_verb_never_runs_a_lane_the_gate_skips() {
+        let root = PathBuf::from("/p");
+        let shapes = [
+            ("crate-less, harness only", false, None, true, false),
+            (
+                "root workspace with integration tests",
+                true,
+                None,
+                false,
+                true,
+            ),
+            ("root workspace, no tests dir", true, None, false, false),
+            (
+                "host-tools sub-crate",
+                true,
+                Some(root.join("tools")),
+                true,
+                true,
+            ),
+        ];
+        for (what, has_cargo, host_tools, has_harness, has_root_tests) in shapes {
+            let s = Shape {
+                project_root: root.clone(),
+                name: "p".into(),
+                has_cargo,
+                host_tools: host_tools.clone(),
+                has_modules: false,
+                mounts_staged: false,
+                test_scripts: Vec::new(),
+                has_root_tests,
+                has_harness_crate: has_harness,
+            };
+            assert_eq!(
+                s.unit_site(),
+                ci::unit_site_for(&root, host_tools.as_deref(), has_cargo),
+                "{what}: the verb's unit lane must be the gate's"
+            );
+            assert_eq!(
+                s.integration_sites(),
+                ci::integration_sites_for(
+                    &root,
+                    host_tools.as_deref(),
+                    has_cargo,
+                    has_harness,
+                    has_root_tests
+                ),
+                "{what}: the verb's integration lanes must be the gate's"
+            );
+        }
+    }
+
+    /// A root package's `tests/` is swept, because the unit lane cannot reach
+    /// it: naming `--lib --bins` turns cargo's default target selection off,
+    /// so integration tests are excluded there by construction.
+    #[test]
+    fn a_root_packages_integration_tests_are_swept_by_a_lane_of_their_own() {
+        let root = PathBuf::from("/p");
+        let unit = ci::unit_site_for(&root, None, true).expect("a cargo root has a unit lane");
+        assert!(
+            unit.1.contains(&"--lib") && unit.1.contains(&"--bins"),
+            "the unit lane selects target kinds, which is why the sweep exists"
+        );
+        let lanes = ci::integration_sites_for(&root, None, true, false, true);
+        assert_eq!(
+            lanes.len(),
+            1,
+            "a root `tests/` with no harness still needs one lane"
+        );
+        assert_eq!(lanes[0].1, root);
+        assert!(lanes[0].2.contains(&"--tests"));
+
+        // A host-tools crate means the root cannot build on the host, so
+        // sweeping it would fail for that reason rather than for a test's.
+        assert!(
+            ci::integration_sites_for(&root, Some(&root.join("tools")), true, false, true)
+                .is_empty(),
+            "the root sweep must not run when the root is not host-buildable"
+        );
+    }
+
     #[test]
     fn cargo_site_prefers_the_host_tools_crate_over_the_root() {
         let root = PathBuf::from("/p");
@@ -774,6 +885,7 @@ mod tests {
             has_modules: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
+            has_root_tests: false,
             has_harness_crate: false,
         };
         assert_eq!(s.cargo_site(), Some((root.join("tools"), false)));
@@ -790,6 +902,7 @@ mod tests {
             has_modules: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
+            has_root_tests: false,
             has_harness_crate: false,
         };
         assert_eq!(s.cargo_site(), Some((root, true)));
@@ -805,6 +918,7 @@ mod tests {
             has_modules: true,
             mounts_staged: false,
             test_scripts: vec!["tools/e2e/*.sh".into()],
+            has_root_tests: false,
             has_harness_crate: false,
         };
         assert_eq!(s.cargo_site(), None);
@@ -831,6 +945,7 @@ mod tests {
             has_modules: true,
             mounts_staged: false,
             test_scripts: Vec::new(),
+            has_root_tests: false,
             has_harness_crate: true,
         };
         assert_eq!(s.cargo_site(), None, "no cargo tree reaches the harness");
@@ -853,6 +968,7 @@ mod tests {
             has_modules: false,
             mounts_staged: false,
             test_scripts: Vec::new(),
+            has_root_tests: false,
             has_harness_crate: false,
         };
         assert_eq!(cargo_label(&s, &root, &["test"]), "cargo test");
