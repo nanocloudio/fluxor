@@ -679,7 +679,11 @@ unsafe fn dtls_pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
     }
     s.rsa_owner = owner;
     let rows = rsa_rows(s);
-    let anchor = core::slice::from_raw_parts(s.anchor.as_ptr(), s.anchor_len);
+    let selected = selected_anchor(
+        s,
+        s.peer_sessions[idx].endpoint.driver.deferred_links.anchor,
+    );
+    let anchor = core::slice::from_raw_parts(selected.as_ptr(), selected.len());
     let job: *mut RsaVerifyJob = &mut s.rsa_verify;
     let ec_bits = ec_bits_per_step(s);
     let outcome = rsa_verify_pump_core(

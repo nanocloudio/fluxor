@@ -17,7 +17,7 @@ use crate::uf2::extract_region;
 
 /// Magic numbers
 pub const MAGIC_CONFIG: u32 = 0x46435846; // "FXCF" (current format)
-pub const MAGIC_LEGACY: u32 = 0x52575846; // "FXWR" (legacy format)
+pub const MAGIC_LEGACY: u32 = crate::trust_anchors::FXWR_MAGIC; // "FXWR" (legacy format)
 
 /// Maximum counts
 const MAX_SOURCES: usize = 8;

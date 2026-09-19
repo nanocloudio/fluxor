@@ -97,6 +97,24 @@ enum ExecItem {
         dst_offset: u64,
         len: u64,
     },
+    BeginPass {
+        /// Texture slot of the colour attachment.
+        target: u16,
+        flags: u32,
+        clear: u32,
+    },
+    Draw {
+        pipeline: u16,
+        binds: Vec<(u32, u16, u64, u64)>,
+        /// `(buffer slot, byte offset, byte length)` of the vertex buffer.
+        vertex: (u16, u64, u64),
+        /// The same for the index buffer, or `None` for a non-indexed draw.
+        index: Option<(u16, u64, u64)>,
+        first: u32,
+        count: u32,
+        instances: u32,
+    },
+    EndPass,
 }
 
 #[cfg_attr(
@@ -109,13 +127,20 @@ enum ExecItem {
     )
 )]
 enum Job {
-    CreateBuffer {
+    CreateResource {
         fence: u16,
         slot: u16,
+        /// `KIND_BUFFER` or `KIND_TEXTURE`. A texture is a texture here: the
+        /// provider used to make every resource a buffer, which cannot be a
+        /// render target and cannot be sampled.
+        kind: u8,
         size: u64,
         usage: u32,
+        width: u32,
+        height: u32,
+        format: u32,
     },
-    DestroyBuffer {
+    DestroyResource {
         fence: u16,
         slot: u16,
     },
@@ -129,6 +154,9 @@ enum Job {
         fence: u16,
         slot: u16,
         program: u16,
+        /// `Some` for a raster pipeline, carrying everything a draw needs
+        /// that the program pack and the submission do not.
+        raster: Option<Box<gpu_wire::RasterState>>,
     },
     ReleaseProgram {
         fence: u16,
@@ -155,6 +183,10 @@ enum Job {
         len: u32,
     },
     Drain {
+        fence: u16,
+    },
+    /// Prove quiescence, then drop every device object of the old epoch.
+    Reset {
         fence: u16,
     },
 }
@@ -330,7 +362,16 @@ mod worker {
             log::error!("[linux_gpu] wgpu: {e}");
         }));
 
-        let limits = facts_from(&adapter_limits, features, resident_bytes, staging_bytes);
+        // The DEVICE's limits, not the adapter's. They are not the same
+        // thing: the adapter says what it could do, and the device says what
+        // it was created to enforce — asking for `downlevel_defaults` raises
+        // `min_uniform_buffer_offset_alignment` to 256 on hardware whose
+        // adapter reports 32. Publishing the adapter's number told consumers
+        // an alignment the device then refused, which is the union-of-
+        // backends mistake in miniature: a capability record has to describe
+        // the thing that will answer the requests.
+        let device_limits = device.limits();
+        let limits = facts_from(&device_limits, features, resident_bytes, staging_bytes);
         let _ = out.send(Done::Ready(Box::new(AdapterFacts {
             name: info.name.clone(),
             driver: format!("{} ({})", info.driver, info.driver_info),
@@ -338,17 +379,69 @@ mod worker {
         })));
 
         let mut buffers: HashMap<u16, wgpu::Buffer> = HashMap::new();
+        let mut textures: HashMap<u16, Target> = HashMap::new();
         let mut modules: HashMap<u16, (wgpu::ShaderModule, String)> = HashMap::new();
-        let mut pipelines: HashMap<u16, wgpu::ComputePipeline> = HashMap::new();
+        let mut pipelines: HashMap<u16, Pipe> = HashMap::new();
+        // Depth attachments are pass-local and nothing outside a pass can
+        // name one, so they are kept here keyed by extent and format and
+        // reused rather than allocated per pass.
+        let mut depths: HashMap<(u32, u32, u32), wgpu::Texture> = HashMap::new();
 
         while let Ok(job) = jobs.recv() {
             match job {
-                Job::CreateBuffer {
+                Job::CreateResource {
                     fence,
                     slot,
+                    kind,
                     size,
                     usage,
+                    width,
+                    height,
+                    format,
                 } => {
+                    if kind == w::KIND_TEXTURE {
+                        match texture_format(format) {
+                            Some(fmt) => {
+                                let tex = device.create_texture(&wgpu::TextureDescriptor {
+                                    label: None,
+                                    size: wgpu::Extent3d {
+                                        width,
+                                        height,
+                                        depth_or_array_layers: 1,
+                                    },
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: wgpu::TextureDimension::D2,
+                                    format: fmt,
+                                    usage: texture_usage(usage),
+                                    view_formats: &[],
+                                });
+                                textures.insert(
+                                    slot,
+                                    Target {
+                                        texture: tex,
+                                        format: fmt,
+                                        width,
+                                        height,
+                                    },
+                                );
+                                let _ = out.send(Done::Completed {
+                                    fence,
+                                    gpu_nanos: 0,
+                                });
+                            }
+                            // A format outside the contract's enumeration is
+                            // refused with the fact rather than substituted.
+                            None => {
+                                let _ = out.send(Done::Failed {
+                                    fence,
+                                    reason: w::REASON_UNSUPPORTED_FEATURE,
+                                    detail: format,
+                                });
+                            }
+                        }
+                        continue;
+                    }
                     let buf = device.create_buffer(&wgpu::BufferDescriptor {
                         label: None,
                         size: size.max(4),
@@ -362,9 +455,12 @@ mod worker {
                     });
                 }
 
-                Job::DestroyBuffer { fence, slot } => {
+                Job::DestroyResource { fence, slot } => {
                     if let Some(b) = buffers.remove(&slot) {
                         b.destroy();
+                    }
+                    if let Some(t) = textures.remove(&slot) {
+                        t.texture.destroy();
                     }
                     let _ = out.send(Done::Completed {
                         fence,
@@ -396,6 +492,7 @@ mod worker {
                     fence,
                     slot,
                     program,
+                    raster,
                 } => {
                     let Some((module, entry)) = modules.get(&program) else {
                         let _ = out.send(Done::Failed {
@@ -406,21 +503,37 @@ mod worker {
                         let _ = out.send(Done::PipelineReady { slot, ok: false });
                         continue;
                     };
+                    // Compilation errors arrive asynchronously, so the scope
+                    // is what turns them into this fence's failure instead of
+                    // a log line nobody correlates.
                     device.push_error_scope(wgpu::ErrorFilter::Validation);
-                    let pipeline =
-                        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                            label: None,
-                            layout: None,
-                            module,
-                            entry_point: Some(entry.as_str()),
-                            compilation_options: Default::default(),
-                            cache: None,
-                        });
+                    let built = match raster.as_deref() {
+                        Some(st) => {
+                            build_raster(&device, module, entry, st).map(|pipeline| Pipe::Raster {
+                                pipeline,
+                                colour: texture_format(st.colour_format)
+                                    .unwrap_or(wgpu::TextureFormat::Rgba8Unorm),
+                                depth: st.depth_format != w::FORMAT_NONE,
+                            })
+                        }
+                        None => Some(Pipe::Compute(device.create_compute_pipeline(
+                            &wgpu::ComputePipelineDescriptor {
+                                label: None,
+                                layout: None,
+                                module,
+                                entry_point: Some(entry.as_str()),
+                                compilation_options: Default::default(),
+                                cache: None,
+                            },
+                        ))),
+                    };
                     let err = pollster::block_on(device.pop_error_scope());
-                    if let Some(e) = err {
+                    let Some(pipeline) = built.filter(|_| err.is_none()) else {
                         // A shader that does not compile is a graph-visible
-                        // outcome, never a silently skipped dispatch.
-                        log::error!("[linux_gpu] pipeline {slot}: {e}");
+                        // outcome, never a silently skipped dispatch or draw.
+                        if let Some(e) = err {
+                            log::error!("[linux_gpu] pipeline {slot}: {e}");
+                        }
                         let _ = out.send(Done::Failed {
                             fence,
                             reason: w::REASON_BAD_PROGRAM,
@@ -428,7 +541,7 @@ mod worker {
                         });
                         let _ = out.send(Done::PipelineReady { slot, ok: false });
                         continue;
-                    }
+                    };
                     pipelines.insert(slot, pipeline);
                     let _ = out.send(Done::PipelineReady { slot, ok: true });
                     let _ = out.send(Done::Completed {
@@ -483,19 +596,46 @@ mod worker {
                 }
 
                 Job::Submit { fence, items } => {
-                    match record_and_submit(&device, &queue, &buffers, &pipelines, &items) {
+                    // Scoped, because wgpu reports encoder and bind-group
+                    // faults asynchronously. Without this a submission whose
+                    // bindings the device refused completes successfully and
+                    // draws nothing — the consumer is told its frame was
+                    // rendered and reads back an empty target.
+                    device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    match record_and_submit(
+                        &device,
+                        &queue,
+                        &buffers,
+                        &textures,
+                        &mut depths,
+                        &pipelines,
+                        &items,
+                    ) {
                         Ok(()) => {
                             // Conservative queue completion: the whole queue
                             // is drained before the fence is reported. Not a
                             // per-submit GPU timestamp, and the outcome says
                             // so rather than reporting a CPU reading as one.
                             let _ = device.poll(wgpu::PollType::Wait);
-                            let _ = out.send(Done::Completed {
-                                fence,
-                                gpu_nanos: 0,
-                            });
+                            match pollster::block_on(device.pop_error_scope()) {
+                                None => {
+                                    let _ = out.send(Done::Completed {
+                                        fence,
+                                        gpu_nanos: 0,
+                                    });
+                                }
+                                Some(e) => {
+                                    log::error!("[linux_gpu] submission {fence}: {e}");
+                                    let _ = out.send(Done::Failed {
+                                        fence,
+                                        reason: w::REASON_MALFORMED,
+                                        detail: 0,
+                                    });
+                                }
+                            }
                         }
                         Err((reason, detail)) => {
+                            let _ = pollster::block_on(device.pop_error_scope());
                             let _ = out.send(Done::Failed {
                                 fence,
                                 reason,
@@ -511,7 +651,7 @@ mod worker {
                     offset,
                     len,
                 } => {
-                    match readback(&device, &queue, &buffers, slot, offset, len) {
+                    match readback(&device, &queue, &buffers, &textures, slot, offset, len) {
                         // Bytes only. The fence completes when they have all
                         // reached the outcome ring, which the step decides —
                         // completing here would report a result the consumer
@@ -542,9 +682,234 @@ mod worker {
                         gpu_nanos: 0,
                     });
                 }
+
+                Job::Reset { fence } => {
+                    // Quiescence first, reclamation second, and in that order
+                    // for a reason: work still in flight can reach any of
+                    // these objects, so destroying them before the device has
+                    // finished would free memory the GPU is still reading. A
+                    // timeout on its own frees nothing precisely because it
+                    // proves nothing about this poll.
+                    let quiesced = device.poll(wgpu::PollType::Wait).is_ok();
+                    for (_, b) in buffers.drain() {
+                        b.destroy();
+                    }
+                    for (_, t) in textures.drain() {
+                        t.texture.destroy();
+                    }
+                    for (_, t) in depths.drain() {
+                        t.destroy();
+                    }
+                    // Pipelines and shader modules hold compiled code and a
+                    // pipeline cache keyed on the old epoch's identities.
+                    pipelines.clear();
+                    modules.clear();
+                    if quiesced {
+                        let _ = out.send(Done::Completed {
+                            fence,
+                            gpu_nanos: 0,
+                        });
+                    } else {
+                        // The device would not drain. Its memory stays
+                        // quarantined in the driver rather than being handed
+                        // back for reuse, and the caller is told the reset
+                        // did not happen.
+                        let _ = out.send(Done::Failed {
+                            fence,
+                            reason: w::REASON_DEVICE_LOST,
+                            detail: 0,
+                        });
+                    }
+                }
             }
         }
         let _ = timestamps;
+    }
+
+    /// A colour attachment or sampled texture, with the facts a pass needs
+    /// about it. The extent is kept because a render pass has to size its
+    /// depth attachment and its viewport from the target, and asking wgpu for
+    /// them per draw would be a call per draw.
+    pub struct Target {
+        pub texture: wgpu::Texture,
+        pub format: wgpu::TextureFormat,
+        pub width: u32,
+        pub height: u32,
+    }
+
+    /// One built pipeline. The two kinds cannot be interchanged: a draw
+    /// against a compute pipeline is a caller error the contract already
+    /// refuses, and this makes it unrepresentable here too.
+    pub enum Pipe {
+        Compute(wgpu::ComputePipeline),
+        Raster {
+            pipeline: wgpu::RenderPipeline,
+            /// The colour format the pipeline was built for, kept so a draw
+            /// into a target of a different format is refused with a reason
+            /// instead of becoming an asynchronous driver validation error
+            /// after the caller was told its pipeline was ready.
+            colour: wgpu::TextureFormat,
+            /// Whether it was built with a depth attachment. A pass that does
+            /// not provide one is refused for the same reason.
+            depth: bool,
+        },
+    }
+
+    /// Translate the contract's format enumeration into wgpu's.
+    ///
+    /// `None` for anything the contract does not allocate — refused with the
+    /// number rather than substituted, because a target silently created in
+    /// another format draws the wrong colours and reads back the wrong bytes.
+    fn texture_format(format: u32) -> Option<wgpu::TextureFormat> {
+        Some(match format {
+            w::FORMAT_RGBA8_UNORM => wgpu::TextureFormat::Rgba8Unorm,
+            w::FORMAT_RGBA8_UNORM_SRGB => wgpu::TextureFormat::Rgba8UnormSrgb,
+            w::FORMAT_BGRA8_UNORM => wgpu::TextureFormat::Bgra8Unorm,
+            w::FORMAT_BGRA8_UNORM_SRGB => wgpu::TextureFormat::Bgra8UnormSrgb,
+            w::FORMAT_DEPTH32_FLOAT => wgpu::TextureFormat::Depth32Float,
+            w::FORMAT_R32_UINT => wgpu::TextureFormat::R32Uint,
+            _ => return None,
+        })
+    }
+
+    /// Translate the contract's usage mask into wgpu's texture usages.
+    ///
+    /// `COPY_DST` is unconditional for the same reason it is on a buffer: a
+    /// texture nothing can put bytes into is not a resource any graph wants.
+    fn texture_usage(usage: u32) -> wgpu::TextureUsages {
+        let mut u = wgpu::TextureUsages::COPY_DST;
+        if usage & w::USAGE_TEXTURE_SAMPLE != 0 {
+            u |= wgpu::TextureUsages::TEXTURE_BINDING;
+        }
+        if usage & w::USAGE_RENDER_TARGET != 0 {
+            u |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        }
+        if usage & w::USAGE_STORAGE != 0 {
+            u |= wgpu::TextureUsages::STORAGE_BINDING;
+        }
+        if usage & (w::USAGE_COPY_SRC | w::USAGE_MAP_READ) != 0 {
+            u |= wgpu::TextureUsages::COPY_SRC;
+        }
+        u
+    }
+
+    fn vertex_format(format: u16) -> Option<wgpu::VertexFormat> {
+        Some(match format {
+            w::VATTR_F32 => wgpu::VertexFormat::Float32,
+            w::VATTR_F32X2 => wgpu::VertexFormat::Float32x2,
+            w::VATTR_F32X3 => wgpu::VertexFormat::Float32x3,
+            w::VATTR_F32X4 => wgpu::VertexFormat::Float32x4,
+            w::VATTR_U32 => wgpu::VertexFormat::Uint32,
+            w::VATTR_U32X2 => wgpu::VertexFormat::Uint32x2,
+            w::VATTR_U32X4 => wgpu::VertexFormat::Uint32x4,
+            w::VATTR_U8X4_UNORM => wgpu::VertexFormat::Unorm8x4,
+            _ => return None,
+        })
+    }
+
+    /// Build a render pipeline from the contract's state descriptor.
+    ///
+    /// The descriptor was validated by the wire decoder before it reached
+    /// here — formats allocated, attributes inside the stride, no duplicate
+    /// locations, depth state consistent with the attachment — so this is a
+    /// translation. `None` means a field the contract allocates has no wgpu
+    /// equivalent, which is a gap in this provider rather than a caller error.
+    fn build_raster(
+        device: &wgpu::Device,
+        module: &wgpu::ShaderModule,
+        entry: &str,
+        st: &w::RasterState,
+    ) -> Option<wgpu::RenderPipeline> {
+        let mut attrs: Vec<wgpu::VertexAttribute> = Vec::with_capacity(st.attrs().len());
+        for a in st.attrs() {
+            attrs.push(wgpu::VertexAttribute {
+                format: vertex_format(a.format)?,
+                offset: a.offset as u64,
+                shader_location: a.location as u32,
+            });
+        }
+        let colour = texture_format(st.colour_format)?;
+        let buffers: &[wgpu::VertexBufferLayout<'_>] = &[wgpu::VertexBufferLayout {
+            array_stride: st.vertex_stride as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &attrs,
+        }];
+        // A pipeline with no attributes declares no vertex buffer at all,
+        // rather than one of stride zero, so a shader that generates its own
+        // positions needs no dummy geometry bound.
+        let empty: &[wgpu::VertexBufferLayout<'_>] = &[];
+        let blend = match st.blend {
+            w::BLEND_ALPHA => Some(wgpu::BlendState::ALPHA_BLENDING),
+            _ => None,
+        };
+        let depth = if st.depth_format == w::FORMAT_NONE {
+            None
+        } else {
+            Some(wgpu::DepthStencilState {
+                format: texture_format(st.depth_format)?,
+                depth_write_enabled: st.depth_write,
+                depth_compare: match st.depth_compare {
+                    w::DEPTH_LESS => wgpu::CompareFunction::Less,
+                    w::DEPTH_LESS_EQUAL => wgpu::CompareFunction::LessEqual,
+                    w::DEPTH_GREATER => wgpu::CompareFunction::Greater,
+                    _ => wgpu::CompareFunction::Always,
+                },
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            })
+        };
+        Some(
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: None,
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    buffers: if attrs.is_empty() { empty } else { buffers },
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: match st.topology {
+                        w::TOPOLOGY_TRIANGLE_STRIP => wgpu::PrimitiveTopology::TriangleStrip,
+                        w::TOPOLOGY_LINE_LIST => wgpu::PrimitiveTopology::LineList,
+                        w::TOPOLOGY_POINT_LIST => wgpu::PrimitiveTopology::PointList,
+                        _ => wgpu::PrimitiveTopology::TriangleList,
+                    },
+                    strip_index_format: None,
+                    front_face: match st.front_face {
+                        w::FRONT_FACE_CW => wgpu::FrontFace::Cw,
+                        _ => wgpu::FrontFace::Ccw,
+                    },
+                    cull_mode: match st.cull {
+                        w::CULL_BACK => Some(wgpu::Face::Back),
+                        w::CULL_FRONT => Some(wgpu::Face::Front),
+                        _ => None,
+                    },
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: depth,
+                multisample: wgpu::MultisampleState::default(),
+                // The fragment entry point shares the vertex entry's name.
+                // One pack, one entry: the contract's program envelope names
+                // a single entry point, and splitting it would need a second
+                // field in the manifest rather than a convention invented
+                // here.
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: None,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: colour,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            }),
+        )
     }
 
     /// Translate the contract's usage mask into wgpu's.
@@ -575,52 +940,124 @@ mod worker {
         u
     }
 
+    /// Record one submission's items in the caller's declared order and hand
+    /// it to the queue.
+    ///
+    /// Order is the caller's, not an optimiser's: a provider that hoisted
+    /// every copy to the end would silently change what the work computes.
+    /// Compute passes open for each run of dispatches and close before a copy
+    /// or a render pass; a render pass is opened by its `BeginPass` and
+    /// closed by its `EndPass`, both of which the device core has already
+    /// checked are balanced and on the raster queue.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the worker's device objects live in separate maps because \
+                  they have separate lifetimes; boxing them together would \
+                  only move the destructuring into this function"
+    )]
     fn record_and_submit(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffers: &HashMap<u16, wgpu::Buffer>,
-        pipelines: &HashMap<u16, wgpu::ComputePipeline>,
+        textures: &HashMap<u16, Target>,
+        depths: &mut HashMap<(u32, u32, u32), wgpu::Texture>,
+        pipelines: &HashMap<u16, Pipe>,
         items: &[ExecItem],
     ) -> Result<(), (u16, u32)> {
-        let mut enc = device.create_command_encoder(&Default::default());
-        // Bind groups must outlive the pass that references them.
-        let mut groups = Vec::new();
+        // Everything a pass borrows has to be created before any pass is
+        // open: a bind group, a texture view or a depth attachment made
+        // inside the pass would not outlive it.
+        let mut groups = Vec::with_capacity(items.len());
         for item in items {
-            if let ExecItem::Dispatch {
-                pipeline, binds, ..
-            } = item
-            {
-                let p = pipelines
-                    .get(pipeline)
-                    .ok_or((w::REASON_BAD_HANDLE, *pipeline as u32))?;
-                let layout = p.get_bind_group_layout(0);
-                let mut entries = Vec::with_capacity(binds.len());
-                for (binding, slot, offset, size) in binds {
-                    let b = buffers
-                        .get(slot)
-                        .ok_or((w::REASON_BAD_HANDLE, *slot as u32))?;
-                    entries.push(wgpu::BindGroupEntry {
-                        binding: *binding,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: b,
-                            offset: *offset,
-                            size: std::num::NonZeroU64::new(*size),
-                        }),
-                    });
+            let (pipeline, binds) = match item {
+                ExecItem::Dispatch {
+                    pipeline, binds, ..
                 }
-                groups.push(Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &layout,
-                    entries: &entries,
-                })));
-            } else {
+                | ExecItem::Draw {
+                    pipeline, binds, ..
+                } => (pipeline, binds),
+                _ => {
+                    groups.push(None);
+                    continue;
+                }
+            };
+            // A program that declares no bindings has no group 0, so asking
+            // for its layout is itself a validation error — the question has
+            // to be skipped, not merely its answer discarded.
+            if binds.is_empty() {
                 groups.push(None);
+                continue;
             }
+            let layout = match pipelines
+                .get(pipeline)
+                .ok_or((w::REASON_BAD_HANDLE, *pipeline as u32))?
+            {
+                Pipe::Compute(p) => p.get_bind_group_layout(0),
+                Pipe::Raster { pipeline, .. } => pipeline.get_bind_group_layout(0),
+            };
+            let mut entries = Vec::with_capacity(binds.len());
+            for (binding, slot, offset, size) in binds {
+                let b = buffers
+                    .get(slot)
+                    .ok_or((w::REASON_BAD_HANDLE, *slot as u32))?;
+                entries.push(wgpu::BindGroupEntry {
+                    binding: *binding,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: b,
+                        offset: *offset,
+                        size: std::num::NonZeroU64::new(*size),
+                    }),
+                });
+            }
+            groups.push(Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &entries,
+            })));
         }
-        // Walk the items in order, opening a compute pass for each run of
-        // dispatches and closing it before a copy. Order inside a submission
-        // is the caller's declared order — a provider that hoisted every copy
-        // to the end would silently change what the work computes.
+
+        // Colour and depth attachment views, in the same index space.
+        let mut colour_views: Vec<Option<wgpu::TextureView>> = Vec::with_capacity(items.len());
+        let mut depth_views: Vec<Option<wgpu::TextureView>> = Vec::with_capacity(items.len());
+        for item in items {
+            let ExecItem::BeginPass { target, flags, .. } = item else {
+                colour_views.push(None);
+                depth_views.push(None);
+                continue;
+            };
+            let t = textures
+                .get(target)
+                .ok_or((w::REASON_BAD_HANDLE, *target as u32))?;
+            colour_views.push(Some(t.texture.create_view(&Default::default())));
+            if flags & w::PASS_DEPTH == 0 {
+                depth_views.push(None);
+                continue;
+            }
+            // Pass-local, so the provider owns it: nothing outside the pass
+            // can name, bind, copy or read it back. Keyed by extent and
+            // format and reused, because a depth texture per pass would
+            // allocate every frame.
+            let key = (t.width, t.height, w::FORMAT_DEPTH32_FLOAT);
+            let tex = depths.entry(key).or_insert_with(|| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("fluxor-gpu-depth"),
+                    size: wgpu::Extent3d {
+                        width: t.width,
+                        height: t.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            });
+            depth_views.push(Some(tex.create_view(&Default::default())));
+        }
+
+        let mut enc = device.create_command_encoder(&Default::default());
         let mut i = 0usize;
         while i < items.len() {
             match &items[i] {
@@ -632,12 +1069,13 @@ mod worker {
                         ..
                     }) = items.get(i)
                     {
-                        let p = pipelines
-                            .get(pipeline)
-                            .ok_or((w::REASON_BAD_HANDLE, *pipeline as u32))?;
-                        let bg = groups[i].as_ref().ok_or((w::REASON_BAD_HANDLE, 0))?;
+                        let Some(Pipe::Compute(p)) = pipelines.get(pipeline) else {
+                            return Err((w::REASON_BAD_HANDLE, *pipeline as u32));
+                        };
                         pass.set_pipeline(p);
-                        pass.set_bind_group(0, bg, &[]);
+                        if let Some(bg) = groups[i].as_ref() {
+                            pass.set_bind_group(0, bg, &[]);
+                        }
                         pass.dispatch_workgroups(g[0], g[1], g[2]);
                         i += 1;
                     }
@@ -658,20 +1096,160 @@ mod worker {
                     enc.copy_buffer_to_buffer(s, *src_offset, d, *dst_offset, *len);
                     i += 1;
                 }
+                ExecItem::BeginPass {
+                    target,
+                    flags,
+                    clear,
+                } => {
+                    let colour = colour_views[i].as_ref().ok_or((w::REASON_BAD_HANDLE, 0))?;
+                    let depth = depth_views[i].as_ref();
+                    let has_depth = depth.is_some();
+                    let target_format = textures
+                        .get(target)
+                        .ok_or((w::REASON_BAD_HANDLE, *target as u32))?
+                        .format;
+                    let load = if flags & w::PASS_CLEAR_COLOUR != 0 {
+                        wgpu::LoadOp::Clear(clear_colour(*clear))
+                    } else {
+                        wgpu::LoadOp::Load
+                    };
+                    let depth_attachment = depth.map(|v| wgpu::RenderPassDepthStencilAttachment {
+                        view: v,
+                        depth_ops: Some(wgpu::Operations {
+                            load: if flags & w::PASS_CLEAR_DEPTH != 0 {
+                                // Far plane. A reversed-Z consumer asks
+                                // for `DEPTH_GREATER` and clears to the
+                                // same value; the comparison is the
+                                // caller's, the clear value is not.
+                                wgpu::LoadOp::Clear(1.0)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    });
+                    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: colour,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: depth_attachment,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    i += 1;
+                    while let Some(item) = items.get(i) {
+                        let ExecItem::Draw {
+                            pipeline,
+                            vertex,
+                            index,
+                            first,
+                            count,
+                            instances,
+                            ..
+                        } = item
+                        else {
+                            break;
+                        };
+                        let Some(Pipe::Raster {
+                            pipeline: p,
+                            colour: want,
+                            depth: wants_depth,
+                        }) = pipelines.get(pipeline)
+                        else {
+                            return Err((w::REASON_BAD_HANDLE, *pipeline as u32));
+                        };
+                        // Attachment agreement, checked rather than assumed.
+                        // wgpu would raise this asynchronously, long after
+                        // this pipeline was reported ready.
+                        if *want != target_format {
+                            return Err((w::REASON_UNSUPPORTED_FEATURE, 0));
+                        }
+                        if *wants_depth != has_depth {
+                            return Err((w::REASON_MALFORMED, w::PASS_DEPTH));
+                        }
+                        pass.set_pipeline(p);
+                        if let Some(bg) = groups[i].as_ref() {
+                            pass.set_bind_group(0, bg, &[]);
+                        }
+                        let (vslot, voff, vlen) = *vertex;
+                        // Geometry a compute dispatch in this same submission
+                        // wrote is bound here directly. That is the whole
+                        // point of the usage mask: no CPU detour, no readback,
+                        // and the dependency is the submission's own order.
+                        let vb = buffers
+                            .get(&vslot)
+                            .ok_or((w::REASON_BAD_HANDLE, vslot as u32))?;
+                        pass.set_vertex_buffer(0, vb.slice(voff..voff + vlen));
+                        match index {
+                            Some((islot, ioff, ilen)) => {
+                                let ib = buffers
+                                    .get(islot)
+                                    .ok_or((w::REASON_BAD_HANDLE, *islot as u32))?;
+                                pass.set_index_buffer(
+                                    ib.slice(*ioff..*ioff + *ilen),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                pass.draw_indexed(*first..*first + *count, 0, 0..*instances);
+                            }
+                            None => pass.draw(*first..*first + *count, 0..*instances),
+                        }
+                        i += 1;
+                    }
+                    // The device core already proved the pass is closed; a
+                    // submission that ended inside one would not have been
+                    // admitted.
+                    if matches!(items.get(i), Some(ExecItem::EndPass)) {
+                        i += 1;
+                    }
+                }
+                // Reached only if a draw or an end-pass arrived outside a
+                // pass, which admission refuses. Failing here rather than
+                // ignoring it keeps the two layers' views of the submission
+                // from drifting apart silently.
+                ExecItem::Draw { .. } | ExecItem::EndPass => {
+                    return Err((w::REASON_MALFORMED, 0));
+                }
             }
         }
         queue.submit([enc.finish()]);
         Ok(())
     }
 
+    /// Unpack a pass's `clear_rgba` word into wgpu's linear clear colour.
+    ///
+    /// The word is one RGBA8 texel, low byte red, which is the order the
+    /// contract's `FORMAT_RGBA8_UNORM` names. No sRGB conversion: the target
+    /// format decides that, and applying it twice would wash the clear out.
+    fn clear_colour(rgba: u32) -> wgpu::Color {
+        let ch = |shift: u32| f64::from((rgba >> shift) & 0xFF) / 255.0;
+        wgpu::Color {
+            r: ch(0),
+            g: ch(8),
+            b: ch(16),
+            a: ch(24),
+        }
+    }
+
     fn readback(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffers: &HashMap<u16, wgpu::Buffer>,
+        textures: &HashMap<u16, Target>,
         slot: u16,
         offset: u64,
         len: u32,
     ) -> Result<Vec<u8>, (u16, u32)> {
+        if let Some(t) = textures.get(&slot) {
+            return readback_texture(device, queue, t, offset, len);
+        }
         let src = buffers
             .get(&slot)
             .ok_or((w::REASON_BAD_HANDLE, slot as u32))?;
@@ -708,6 +1286,84 @@ mod worker {
         staging.unmap();
         staging.destroy();
         Ok(bytes)
+    }
+
+    /// Read a rendered texture back, in the tightly packed layout the
+    /// contract's size accounting describes.
+    ///
+    /// wgpu requires a copy's rows to be 256-byte aligned, which the
+    /// contract's layout is not. The copy is made into a padded staging
+    /// buffer and the rows are compacted here, so a consumer sees
+    /// `width × 4` bytes per row and the padding never reaches the wire.
+    fn readback_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &Target,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, (u16, u32)> {
+        let texel = 4u32;
+        let row = target.width * texel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = row.div_ceil(align) * align;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(padded) * u64::from(target.height),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(target.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: target.width,
+                height: target.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([enc.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        if device.poll(wgpu::PollType::Wait).is_err() {
+            return Err((w::REASON_DEVICE_LOST, 0));
+        }
+        match rx.recv() {
+            Ok(Ok(())) => {}
+            _ => return Err((w::REASON_TIMEOUT, 0)),
+        }
+        let view = slice.get_mapped_range();
+        let mut packed = Vec::with_capacity((row as usize) * target.height as usize);
+        for y in 0..target.height as usize {
+            let at = y * padded as usize;
+            packed.extend_from_slice(&view[at..at + row as usize]);
+        }
+        drop(view);
+        staging.unmap();
+        staging.destroy();
+
+        let start = offset as usize;
+        let end = start.saturating_add(len as usize);
+        packed
+            .get(start..end)
+            .map(<[u8]>::to_vec)
+            .ok_or((w::REASON_BAD_RANGE, 0))
     }
 
     /// Build the contract's device facts from the adapter's own limits.
@@ -748,8 +1404,26 @@ mod worker {
         l.arith_types = arith;
         l.arith_ops = w::AOP_FMA_F32 | w::AOP_ATOMIC_I32;
 
-        let features_out = w::FEATURE_COMPUTE | w::FEATURE_READBACK;
-        // Not advertised, because not implemented here: raster, shared
+        // Raster is advertised because it is implemented: pipelines built
+        // from the contract's state descriptor, passes with a colour and an
+        // optional depth attachment, and indexed and non-indexed draws.
+        //
+        // `COMPUTE_TO_RASTER` goes with it. A buffer created with both
+        // `USAGE_STORAGE` and `USAGE_VERTEX` is one wgpu buffer with both
+        // usages, so a dispatch writes the geometry a later draw in the same
+        // submission reads, with no CPU detour and no readback — which is the
+        // fact the bit names rather than an aspiration.
+        let features_out = w::FEATURE_COMPUTE
+            | w::FEATURE_RASTER
+            | w::FEATURE_COMPUTE_TO_RASTER
+            | w::FEATURE_READBACK;
+        // Device reset is advertised because quiescence is demonstrated
+        // rather than hoped for: the reset polls the device to completion
+        // before it destroys anything, and only then is the old epoch's
+        // memory reclaimed. Recreating an adapter would not be a proof;
+        // `PollType::Wait` returning is.
+        let features_out = features_out | w::FEATURE_DEVICE_RESET;
+        // Still not advertised, because still not implemented here: shared
         // surfaces, indirect dispatch, subgroups, preemption, timestamps —
         // the adapter may carry `TIMESTAMP_QUERY`, but this provider places
         // no query and every completion reports `gpu_nanos` of zero, and a
@@ -1112,6 +1786,8 @@ impl GpuProvider {
                 to_worker.send(Job::Submit { fence, items }).is_ok()
             } else if op == gpu_wire::OP_DRAIN {
                 to_worker.send(Job::Drain { fence }).is_ok()
+            } else if op == gpu_wire::OP_RESET {
+                to_worker.send(Job::Reset { fence }).is_ok()
             } else if op == gpu_wire::OP_SUBMIT {
                 // A submission whose plan is gone cannot be reported as done: the
                 // work never reached the queue, and completing it here would be
@@ -1219,17 +1895,24 @@ fn translate(
         Work::None => true,
 
         Work::CreateBuffer { fence, slot } | Work::CreateTexture { fence, slot } => {
-            let (size, usage) = dev.resource(slot).map_or((0, 0), |r| (r.size, r.usage));
-            send(
-                dev,
+            // The kind comes from the slot the core filled, not from which
+            // arm matched: a texture has to become a texture, because a
+            // buffer cannot be a render attachment or be sampled.
+            let Some(r) = dev.resource(slot) else {
+                dev.fail(fence, gpu_wire::REASON_BAD_HANDLE, slot as u32);
+                return true;
+            };
+            let job = Job::CreateResource {
                 fence,
-                Job::CreateBuffer {
-                    fence,
-                    slot,
-                    size,
-                    usage,
-                },
-            );
+                slot,
+                kind: r.kind,
+                size: r.size,
+                usage: r.usage,
+                width: r.width,
+                height: r.height,
+                format: r.format,
+            };
+            send(dev, fence, job);
             true
         }
 
@@ -1237,7 +1920,7 @@ fn translate(
             // The handle is retired already; the object goes only once nothing
             // in flight can still reach it.
             if dev.resource_free_pending(slot) || dev.resource(slot).is_none_or(|r| !r.live) {
-                send(dev, fence, Job::DestroyBuffer { fence, slot });
+                send(dev, fence, Job::DestroyResource { fence, slot });
             } else {
                 dev.mark_running(fence);
                 dev.complete(fence, 0);
@@ -1304,19 +1987,42 @@ fn translate(
             slot,
             program,
         } => {
-            if program_source.contains_key(&program) {
-                send(
-                    dev,
-                    fence,
-                    Job::CreatePipeline {
-                        fence,
-                        slot,
-                        program,
-                    },
-                );
-            } else {
+            if !program_source.contains_key(&program) {
                 dev.fail(fence, gpu_wire::REASON_BAD_HANDLE, program as u32);
+                return true;
             }
+            // The pipeline kind and its state blob are read back out of the
+            // record. The core validated both and does not carry the state
+            // forward, because only a backend has any use for it.
+            let payload = &record[gpu_wire::HEADER_LEN..];
+            let kind = gpu_wire::get_u8(payload, 8).unwrap_or(gpu_wire::QUEUE_COMPUTE);
+            let raster = if kind == gpu_wire::QUEUE_RASTER {
+                let len = gpu_wire::get_u32(payload, 12).unwrap_or(0) as usize;
+                let state = payload.get(16..16 + len).unwrap_or(&[]);
+                match gpu_wire::RasterState::decode(state) {
+                    Ok(st) => Some(Box::new(st)),
+                    // The descriptor is refused here rather than at the first
+                    // draw, where the caller has already been told its
+                    // pipeline is ready.
+                    Err(reason) => {
+                        dev.fail(fence, reason, 0);
+                        dev.mark_pipeline_ready(slot, false);
+                        return true;
+                    }
+                }
+            } else {
+                None
+            };
+            send(
+                dev,
+                fence,
+                Job::CreatePipeline {
+                    fence,
+                    slot,
+                    program,
+                    raster,
+                },
+            );
             true
         }
 
@@ -1404,13 +2110,19 @@ fn translate(
         }
 
         Work::Reset { fence, .. } => {
-            // Reset is not advertised and admission refuses it; reaching here
-            // would mean the capability record and this file disagree.
-            dev.fail(
-                fence,
-                gpu_wire::REASON_UNSUPPORTED_FEATURE,
-                gpu_wire::FEATURE_DEVICE_RESET,
-            );
+            // The core has already terminated every other outstanding request
+            // with `DEVICE_LOST`, bumped the epoch and retired every handle.
+            // What is left is the physical half: drain the device and drop the
+            // objects the old epoch's handles named. Plans held for fences
+            // that will never run go with them — a fence slot reused in the
+            // new epoch must not find the old epoch's work under its index.
+            //
+            // Dispatched from the step's ready loop like a drain, not sent
+            // from here, so one place decides when a fence's work reaches the
+            // device.
+            let _ = fence;
+            deferred.clear();
+            program_source.clear();
             true
         }
 
@@ -1449,24 +2161,62 @@ fn plan_submission(
                 groups,
             } => {
                 let pslot = dev.slot_of(pipeline, gpu_wire::KIND_PIPELINE, OWNER)?;
-                let mut binds = Vec::with_capacity(bind_count);
-                for i in 0..bind_count {
-                    let e = binds_offset + i * gpu_wire::BIND_ENTRY_LEN;
-                    let slot = gpu_wire::get_u16(bytes, e)?;
-                    let view = gpu_wire::get_u64(bytes, e + 4)?;
-                    let vslot = dev.slot_of(view, gpu_wire::KIND_VIEW, OWNER)?;
-                    let (res, offset, len) = dev.view_range(vslot)?;
-                    // The pack's binding slot IS the shader's `@binding`
-                    // index: one number, declared once in the manifest and
-                    // used unchanged here.
-                    binds.push((slot as u32, res, offset, len));
-                }
+                let binds = resolve_binds(dev, bytes, binds_offset, bind_count)?;
                 out.push(ExecItem::Dispatch {
                     pipeline: pslot,
                     binds,
                     groups,
                 });
             }
+            gpu_wire::SubmitItem::BeginPass {
+                target,
+                flags,
+                clear,
+            } => {
+                // The pass target is a resource handle, not a view: a render
+                // attachment is the whole texture.
+                let slot = dev.slot_of(target, gpu_wire::KIND_TEXTURE, OWNER)?;
+                out.push(ExecItem::BeginPass {
+                    target: slot,
+                    flags,
+                    clear,
+                });
+            }
+            gpu_wire::SubmitItem::Draw {
+                pipeline,
+                binds_offset,
+                bind_count,
+                vertex,
+                index,
+                first,
+                count,
+                instances,
+            } => {
+                let pslot = dev.slot_of(pipeline, gpu_wire::KIND_PIPELINE, OWNER)?;
+                let binds = resolve_binds(dev, bytes, binds_offset, bind_count)?;
+                let geometry = |h: u64| -> Option<(u16, u64, u64)> {
+                    let v = dev.slot_of(h, gpu_wire::KIND_VIEW, OWNER)?;
+                    dev.view_range(v)
+                };
+                let vertex = geometry(vertex)?;
+                // A draw with no index buffer names the null handle, which is
+                // not a handle that failed to resolve.
+                let index = if index == gpu_wire::HANDLE_NONE {
+                    None
+                } else {
+                    Some(geometry(index)?)
+                };
+                out.push(ExecItem::Draw {
+                    pipeline: pslot,
+                    binds,
+                    vertex,
+                    index,
+                    first,
+                    count,
+                    instances,
+                });
+            }
+            gpu_wire::SubmitItem::EndPass => out.push(ExecItem::EndPass),
             gpu_wire::SubmitItem::Copy { src, dst, len } => {
                 let s = dev.slot_of(src, gpu_wire::KIND_VIEW, OWNER)?;
                 let d = dev.slot_of(dst, gpu_wire::KIND_VIEW, OWNER)?;
@@ -1480,10 +2230,30 @@ fn plan_submission(
                     len,
                 });
             }
-            // Raster items cannot be admitted: this provider does not
-            // advertise `FEATURE_RASTER`, so the queue check refuses them.
-            _ => return None,
         }
     }
     Some(out)
+}
+
+/// Resolve a submission item's bindings into slot-addressed buffer ranges.
+///
+/// The pack's binding slot IS the shader's `@binding` index: one number,
+/// declared once in the manifest and used unchanged here. Dispatches and
+/// draws bind identically, which is why they share this.
+fn resolve_binds(
+    dev: &gpu_wire::GpuDevice<'_>,
+    bytes: &[u8],
+    binds_offset: usize,
+    bind_count: usize,
+) -> Option<Vec<(u32, u16, u64, u64)>> {
+    let mut binds = Vec::with_capacity(bind_count);
+    for i in 0..bind_count {
+        let e = binds_offset + i * gpu_wire::BIND_ENTRY_LEN;
+        let slot = gpu_wire::get_u16(bytes, e)?;
+        let view = gpu_wire::get_u64(bytes, e + 4)?;
+        let vslot = dev.slot_of(view, gpu_wire::KIND_VIEW, OWNER)?;
+        let (res, offset, len) = dev.view_range(vslot)?;
+        binds.push((slot as u32, res, offset, len));
+    }
+    Some(binds)
 }

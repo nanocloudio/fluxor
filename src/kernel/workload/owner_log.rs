@@ -64,10 +64,10 @@ pub fn install_slot(slot: usize, uid: [u8; 16], generation: u32) {
 /// Append one attributed record to `slot`'s ring, assigning it the ring's next
 /// `seq`. Scheduler thread only.
 ///
-/// NOTE: v1 frames through an allocating [`LogRecord::encode`]. On Linux (the
-/// only caller in Phase 1) that is acceptable; an allocation-free
-/// frame-in-place path is a documented follow-up (§4.3 "no allocation on the
-/// log hot path") and does not change this signature.
+/// Framing goes through an allocating [`LogRecord::encode`]. Linux is the
+/// only caller, and allocates freely, so that is acceptable here; framing in
+/// place would keep allocation off the log hot path and would not change
+/// this signature.
 #[allow(
     clippy::too_many_arguments,
     reason = "attributed log record fields are passed positionally across the ABI boundary"

@@ -229,7 +229,7 @@ impl core::ops::IndexMut<usize> for SessionArena {
         }
     }
 }
-/// Longest single certificate this module retains — the trust anchor, and
+/// Longest single certificate this module retains — each trust anchor, and
 /// the leaf inside a configured chain.
 const MAX_CERT_LEN: usize = 2048;
 /// Longest certificate chain presented to a peer: the leaf followed by
@@ -830,12 +830,30 @@ struct TlsState {
     /// is the explicitly recorded posture for a target with no time source.
     clock_policy: u8,
 
-    /// Configured trust anchor, DER. Under `pinned` it is the certificate
-    /// whose subject public key is pinned; under `ca_dns` it is the
-    /// certificate authority. Retained whole because closing a path needs
-    /// the anchor's subject name as well as its key.
-    anchor: [u8; MAX_CERT_LEN],
-    anchor_len: usize,
+    /// Configured trust anchors, DER, in configured order: the
+    /// deployment's bundle (`trust`) first, then any the operator appended
+    /// at launch (`fluxor run --ca`). Under `pinned` each is a certificate
+    /// whose subject public key is pinned; under `ca_dns` / `ca_uri` each
+    /// is a certificate authority. Retained whole because closing a path
+    /// needs an anchor's subject name as well as its key. A handshake
+    /// selects one when its chain is walked and reads no other after.
+    /// Both origins are one table to the walk: whichever role a session
+    /// validates in — a client checking a server, or an mTLS server
+    /// checking a client — sees every anchor here. Confining the
+    /// operator's anchors to client-mode instances is done where the
+    /// config blob is sealed, not in this module.
+    anchors: [[u8; MAX_CERT_LEN]; MAX_ANCHORS],
+    anchor_lens: [u16; MAX_ANCHORS],
+    anchor_count: u8,
+    /// How many of `anchors`, counted from the tail, the operator
+    /// appended. Reported with every accepted chain so a log reader can
+    /// tell a deployment's trust from a launch-time widening.
+    anchor_operator: u8,
+    /// A configured anchor was refused — it did not parse under the
+    /// supported profile, was over-long, or was the ninth. The instance
+    /// then declines to construct rather than run with fewer anchors than
+    /// it was given.
+    anchor_refused: bool,
 
     /// Expected DNS identity: the name sent as SNI and the name required of
     /// the peer leaf's `dNSName` SAN. One parameter feeds both, so a
@@ -1106,6 +1124,18 @@ define_params! {
     // decision to run without lifetime containment.
     12, clock_policy, u8, 0, enum { require=0, unchecked=1 }
         => |s, d, len| { s.clock_policy = p_u8(d, len, 0, 0); };
+
+    // Trust anchors, as a `${file:<path>}` source spec naming one
+    // certificate or a bundle of up to MAX_ANCHORS (concatenated DER, or
+    // PEM). The build tool resolves the file and embeds its certificates
+    // as extended tag 12; the spec string itself never reaches the wire,
+    // so this arm reads nothing. It is declared so the parameter is in
+    // the schema, where `[[requires_when]]` can bind to it. The id is the
+    // one the extended `--ca` bundle also carries: plain and extended
+    // entries share the tag space and are told apart by the 0x00
+    // length-high byte, and this parameter emits neither.
+    16, trust, str, 0
+        => |_s, _d, _len| {};
 }
 
 // ============================================================================
@@ -1142,7 +1172,9 @@ pub unsafe extern "C" fn module_new(
     s.syscalls = syscalls;
     s.cert_len = 0;
     s.key_len = 0;
-    s.anchor_len = 0;
+    s.anchor_count = 0;
+    s.anchor_operator = 0;
+    s.anchor_refused = false;
     s.expected_dns_len = 0;
     s.expected_uri_len = 0;
     s.last_peer_auth_error = 0;
@@ -1229,9 +1261,16 @@ pub unsafe extern "C" fn module_new(
 
     // Peer authentication is admitted here, before any channel is serviced:
     // a client with no trust policy must fail before network readiness, not
-    // at its first byte.
+    // at its first byte. An anchor the module could not take is refused the
+    // same way: the instance was given a trust set, and it either holds all
+    // of it or does not run.
+    if s.anchor_refused {
+        let msg = b"[tls] refusing to construct: a trust anchor does not parse, exceeds MAX_CERT_LEN, or the bundle exceeds MAX_ANCHORS";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
     if !peer_auth_admissible(s) {
-        let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust_cert_file, and verify_hostname for ca_dns / verify_uri for ca_uri)";
+        let msg = b"[tls] refusing to construct: no peer-authentication profile (set peer_auth + trust, and verify_hostname for ca_dns / verify_uri for ca_uri)";
         dev_log(sys, 1, msg.as_ptr(), msg.len());
         return -1;
     }
@@ -1395,9 +1434,10 @@ fn rsa_identity_suite(der: &[u8]) -> Option<u16> {
     }
 }
 
-/// Parse extended TLV entries: `cert_file` (10), `key_file` (11),
-/// `trust_cert_file` (12), `verify_hostname` (13), `verify_uri` (15).
-/// Tag 14 is `alpn`, which this module does not consume.
+/// Parse extended TLV entries: `cert_file` (10), `key_file` (11), the
+/// deployment's `trust` bundle (12), `verify_hostname` (13), `verify_uri`
+/// (15), and the operator's `--ca` bundle (16). Tag 14 is `alpn`, which
+/// this module does not consume.
 /// Scans the entire params
 /// blob; extended entries use `tag + 0x00 + len_hi + len_lo`.
 unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len: usize) {
@@ -1422,7 +1462,7 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
     while pos + 4 <= end {
         let tag = data[pos];
-        let ext_tags = tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 15;
+        let ext_tags = tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 15 || tag == 16;
         if ext_tags && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let data_start = pos + 4;
@@ -1454,16 +1494,13 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                     );
                     s.key_len = n;
                 }
-                12 => {
-                    // Trust anchor, retained whole. An anchor that does not
-                    // parse under the supported profile is not stored, so
-                    // the admission check in `module_new` refuses the
-                    // instance rather than letting it run anchorless.
-                    let der = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
-                    if len <= MAX_CERT_LEN && parse_certificate(der).is_some() {
-                        core::ptr::copy_nonoverlapping(der.as_ptr(), s.anchor.as_mut_ptr(), len);
-                        s.anchor_len = len;
-                    }
+                12 | 16 => {
+                    // Trust anchors, one bundle per origin: the deployment's
+                    // under 12, the operator's under 16. Both feed the same
+                    // table through the same walk; only the provenance
+                    // count differs.
+                    let bundle = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
+                    push_anchor_bundle(s, bundle, tag == 16);
                 }
                 13 => {
                     // Expected DNS identity. Truncating a name would
@@ -2834,7 +2871,61 @@ unsafe fn passthrough_relay(
     }
 }
 
-// Peer certificate verification is deferred — requires larger module binary.
+/// Append every certificate in `bundle` — concatenated DER — to the anchor
+/// table. An entry that is not a DER SEQUENCE, does not parse under the
+/// supported profile, exceeds `MAX_CERT_LEN`, or would be the ninth marks
+/// the table refused, and `module_new` then declines to construct: an
+/// instance never runs with fewer anchors than it was given.
+fn push_anchor_bundle(s: &mut TlsState, bundle: &[u8], operator: bool) {
+    let mut pos = 0;
+    while pos < bundle.len() {
+        let Some((_, _, total)) = der_tlv(bundle, pos) else {
+            s.anchor_refused = true;
+            return;
+        };
+        let i = s.anchor_count as usize;
+        let der = &bundle[pos..pos + total];
+        if bundle[pos] != 0x30
+            || i >= MAX_ANCHORS
+            || total > MAX_CERT_LEN
+            || parse_certificate(der).is_none()
+        {
+            s.anchor_refused = true;
+            return;
+        }
+        s.anchors[i][..total].copy_from_slice(der);
+        s.anchor_lens[i] = total as u16;
+        s.anchor_count += 1;
+        if operator {
+            s.anchor_operator += 1;
+        }
+        pos += total;
+    }
+}
+
+/// The configured anchors as the verifier's set, in configured order.
+fn anchor_set(s: &TlsState) -> AnchorSet<'_> {
+    let mut set = AnchorSet::empty();
+    let mut i = 0;
+    while i < s.anchor_count as usize && i < MAX_ANCHORS {
+        set.push(&s.anchors[i][..s.anchor_lens[i] as usize]);
+        i += 1;
+    }
+    set
+}
+
+/// The anchor a walked chain was accepted under, for the stepped links
+/// that read their issuer key from it. Empty for an index the table does
+/// not hold, which the step then refuses as a signature failure.
+fn selected_anchor(s: &TlsState, index: u8) -> &[u8] {
+    let i = index as usize;
+    if i < s.anchor_count as usize && i < MAX_ANCHORS {
+        &s.anchors[i][..s.anchor_lens[i] as usize]
+    } else {
+        &[]
+    }
+}
+
 /// Does this instance carry a complete peer-authentication profile for the
 /// role it is configured in?
 ///
@@ -2849,15 +2940,15 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
         return true;
     }
     match s.peer_auth {
-        PROFILE_PINNED => s.anchor_len > 0,
+        PROFILE_PINNED => s.anchor_count > 0,
         // `ca_uri` demands the name on BOTH sides, unlike `ca_dns`: a
         // server under `ca_dns` legitimately has no name to expect of a
         // client, whereas under `ca_uri` the URI is the whole
         // authorisation and a policy that names none authorises everyone
         // the CA ever signed.
-        PROFILE_CA_URI => s.anchor_len > 0 && s.expected_uri_len > 0,
+        PROFILE_CA_URI => s.anchor_count > 0 && s.expected_uri_len > 0,
         PROFILE_CA_DNS => {
-            if s.anchor_len == 0 {
+            if s.anchor_count == 0 {
                 return false;
             }
             // The mTLS server has no name to expect of a client; a client
@@ -2888,7 +2979,7 @@ fn chain_policy(s: &TlsState, require_eku: u8, now_unix_secs: u64) -> ChainPolic
     };
     ChainPolicy {
         profile: s.peer_auth,
-        anchor_der: &s.anchor[..s.anchor_len],
+        anchors: anchor_set(s),
         expected_dns: expected,
         expected_uri: &s.expected_uri[..s.expected_uri_len],
         // Only what this build can actually verify. A configured subset is
@@ -2954,7 +3045,10 @@ unsafe fn trusted_now_secs(sys: &SyscallTable) -> u64 {
 ///
 /// Called only after [`peer_cert_reason`] returned [`CERT_OK`], so
 /// downstream code's use of `peer_cert_pubkey_len > 0` as the marker that a
-/// real identity was bound stays true.
+/// real identity was bound stays true. When the walk deferred RSA or ECDSA
+/// links the key is bound at that acceptance, while those links are still
+/// stepping; the session stays in `VerifyChain` until they verify, so no
+/// handshake completes on a key the chain has not yet proved.
 unsafe fn bind_peer_cert_key(driver: &mut HandshakeDriver, hs_body: &[u8]) -> u32 {
     let cert_der = match parse_certificate_msg(hs_body) {
         Some(d) => d,
@@ -2983,6 +3077,14 @@ unsafe fn session_verify_peer_cert(s: &mut TlsState, idx: usize, hs_body: &[u8])
         return false;
     }
     s.last_peer_auth_error = CERT_OK;
+    // A chain with no link left to step was verified whole just now; the
+    // stepped case reports when its last link lands.
+    if !s.sessions[idx].driver.deferred_links.pending() {
+        let suite = parse_certificate_msg(hs_body)
+            .and_then(parse_certificate)
+            .map_or(suite::UNKNOWN, |c| c.suite);
+        log_chain_verified(s, idx, suite);
+    }
     true
 }
 
@@ -3038,10 +3140,11 @@ unsafe fn pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
     }
     s.rsa_owner = owner;
     let rows = rsa_rows(s);
-    let anchor_len = s.anchor_len;
-    // The anchor and the job are disjoint fields of `s`; the driver is a
-    // third. Raw pointers keep the three borrows apart for the call.
-    let anchor = core::slice::from_raw_parts(s.anchor.as_ptr(), anchor_len);
+    // The anchor the walk selected for this session, read from the table
+    // by index: the job and the driver are the other two borrows, and raw
+    // pointers keep the three apart for the call.
+    let selected = selected_anchor(s, s.sessions[idx].driver.deferred_links.anchor);
+    let anchor = core::slice::from_raw_parts(selected.as_ptr(), selected.len());
     let job: *mut RsaVerifyJob = &mut s.rsa_verify;
     let ec_bits = ec_bits_per_step(s);
     let stage_chain = s.sessions[idx].driver.hs_state == HandshakeState::VerifyChain;
@@ -3057,7 +3160,13 @@ unsafe fn pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
         RsaPump::Done => {
             s.rsa_owner = -1;
             if stage_chain {
-                log_chain_verified(s, idx);
+                let d = &s.sessions[idx].driver;
+                let suite = if d.deferred_links.len > 0 {
+                    d.deferred_links.links[0].sig_suite
+                } else {
+                    suite::UNKNOWN
+                };
+                log_chain_verified(s, idx, suite);
             }
             true
         }
@@ -3082,18 +3191,21 @@ unsafe fn pump_rsa_verify(s: &mut TlsState, idx: usize) -> bool {
     }
 }
 
-/// `[tls] chain verified suite=<leaf signature> links=<n> steps=<n>`: the
-/// deferred chain walk finished, with the pump calls it took. The suite
-/// name is written at each arm rather than returned from one: a `match`
-/// yielding one of several literals is a table of their addresses, which
-/// a flat module image never relocates.
-unsafe fn log_chain_verified(s: &mut TlsState, idx: usize) {
+/// `[tls] chain verified suite=<signature> links=<n> steps=<n>
+/// anchors=<n> source=<origin>`: a peer's chain was accepted and every
+/// link it deferred has verified. `suite` is the leaf's signature
+/// algorithm for a chain verified whole and the first stepped link's for
+/// one that was not, with the stepped links and pump calls it took (both
+/// 0 for a chain verified whole), the size of the anchor table it was
+/// judged against — every anchor, not only the one it was accepted
+/// under — and where
+/// that table came from — `deployment` for the graph's `trust` alone,
+/// `deployment+operator` when `--ca` widened it, `operator` when `--ca`
+/// was the only source. The suite name is written at each arm rather than
+/// returned from one: a `match` yielding one of several literals is a
+/// table of their addresses, which a flat module image never relocates.
+unsafe fn log_chain_verified(s: &mut TlsState, idx: usize, suite: u16) {
     let d = &s.sessions[idx].driver;
-    let suite = if d.deferred_links.len > 0 {
-        d.deferred_links.links[0].sig_suite
-    } else {
-        suite::UNKNOWN
-    };
     let links = d.deferred_links.len as u32;
     let steps = d.verify_steps as u32;
     s.sessions[idx].driver.verify_steps = 0;
@@ -3112,12 +3224,25 @@ unsafe fn log_chain_verified(s: &mut TlsState, idx: usize) {
 
 unsafe fn log_chain_verified_line(s: &TlsState, head: &[u8], links: u32, steps: u32) {
     let sys = &*s.syscalls;
-    let mut buf = [0u8; 96];
+    let mut buf = [0u8; 128];
     let mut pos = put_text(&mut buf, 0, head);
     pos = put_text(&mut buf, pos, b" links=");
     pos += fmt_u32_dec(links, buf.as_mut_ptr().add(pos));
     pos = put_text(&mut buf, pos, b" steps=");
     pos += fmt_u32_dec(steps, buf.as_mut_ptr().add(pos));
+    pos = put_text(&mut buf, pos, b" anchors=");
+    pos += fmt_u32_dec(s.anchor_count as u32, buf.as_mut_ptr().add(pos));
+    pos = put_text(&mut buf, pos, b" source=");
+    let deployment = s.anchor_count > s.anchor_operator;
+    if deployment {
+        pos = put_text(&mut buf, pos, b"deployment");
+    }
+    if s.anchor_operator > 0 {
+        if deployment {
+            pos = put_text(&mut buf, pos, b"+");
+        }
+        pos = put_text(&mut buf, pos, b"operator");
+    }
     dev_log(sys, 3, buf.as_ptr(), pos);
 }
 
@@ -6055,15 +6180,25 @@ pub mod test_helpers {
         s.last_peer_auth_error
     }
 
-    /// The configured profile, anchor length, and expected DNS identity, so
-    /// a test can assert that configuration reached the module rather than
-    /// inferring it from behaviour.
+    /// The configured profile, anchor count, and expected DNS identity
+    /// length, so a test can assert that configuration reached the module
+    /// rather than inferring it from behaviour.
     ///
     /// # Safety
     /// `state` must point to an initialised `TlsState`.
     pub unsafe fn peer_auth_config(state: *const u8) -> (u8, usize, usize) {
         let s = &*(state as *const TlsState);
-        (s.peer_auth, s.anchor_len, s.expected_dns_len)
+        (s.peer_auth, s.anchor_count as usize, s.expected_dns_len)
+    }
+
+    /// How many anchors the instance holds, and how many of those the
+    /// operator appended.
+    ///
+    /// # Safety
+    /// `state` must point to an initialised `TlsState`.
+    pub unsafe fn anchor_provenance(state: *const u8) -> (usize, usize) {
+        let s = &*(state as *const TlsState);
+        (s.anchor_count as usize, s.anchor_operator as usize)
     }
 
     /// Largest handshake-message fragment one record carries, as the

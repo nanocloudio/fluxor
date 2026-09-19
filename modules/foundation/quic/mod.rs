@@ -341,13 +341,26 @@ pub(crate) struct QuicState {
     pending_resumption_test: bool,
     /// Client-side cert chain validation toggle (RFC 5280 + RFC 6125).
     /// 0 = parse the peer cert for its public key only; 1 = also
-    /// validate against `trust_cert` and require the leaf SAN/CN to
+    /// validate against the anchor table and require the leaf SAN/CN to
     /// match `verify_hostname`.
     verify_peer: u8,
-    /// Trust anchor DER. For self-signed deployments this is the
-    /// leaf; for CA-issued chains it's the root CA.
-    trust_cert: [u8; MAX_CERT_LEN],
-    trust_cert_len: usize,
+    /// Trust anchors, DER, in configured order: the deployment's `trust`
+    /// bundle first, then any the operator appended at launch. For a
+    /// self-signed deployment an anchor is the leaf; for a CA-issued chain
+    /// it is the authority. A handshake selects one when its chain is
+    /// walked and reads no other after. The table is read only where a
+    /// client validates a server's chain; this module never validates a
+    /// peer's client certificate, and confining the operator's anchors to
+    /// client-mode instances is done where the config blob is sealed.
+    anchors: [[u8; MAX_CERT_LEN]; MAX_ANCHORS],
+    anchor_lens: [u16; MAX_ANCHORS],
+    anchor_count: u8,
+    /// How many of `anchors`, counted from the tail, the operator
+    /// appended (`fluxor run --ca`).
+    anchor_operator: u8,
+    /// A configured anchor was refused — it did not parse, was over-long,
+    /// or was the ninth — and the instance declines to construct.
+    anchor_refused: bool,
     /// Expected server hostname checked against the leaf's SAN
     /// dNSName entries (with leftmost-wildcard support per RFC 6125
     /// §6.4.3) or, as fallback, Subject CN (§6.4.4).
@@ -458,6 +471,15 @@ define_params! {
     18, rsa_rows_per_step, u16, 16
         => |s, d, len| { s.rsa_rows_per_step = p_u16(d, len, 0, 16); };
 
+    // Trust anchors, as a `${file:<path>}` source spec naming one
+    // certificate or a bundle of up to MAX_ANCHORS (concatenated DER, or
+    // PEM). The build tool resolves the file and embeds its certificates
+    // as extended tag 12; the spec string itself never reaches the wire,
+    // so this arm reads nothing. Declared so the parameter is in the
+    // schema, where `[[requires_when]]` can bind to it.
+    19, trust, str, 0
+        => |_s, _d, _len| {};
+
     15, ecdh_bits_per_step, u16, 256
         => |s, d, len| {
             let v = p_u16(d, len, 0, 256);
@@ -514,10 +536,9 @@ pub unsafe extern "C" fn module_new(
     s.rsa_owner = -1;
     s.key_update_pkts = 0;
     s.verify_peer = 0;
-    s.trust_cert_len = 0;
-    s.verify_hostname_len = 0;
-    s.verify_peer = 0;
-    s.trust_cert_len = 0;
+    s.anchor_count = 0;
+    s.anchor_operator = 0;
+    s.anchor_refused = false;
     s.verify_hostname_len = 0;
     s.ticket_key = [-1, -1];
     s.ticket_parity = 0;
@@ -579,6 +600,13 @@ pub unsafe extern "C" fn module_new(
         }
     }
     parse_extended_params(s, params, params_len);
+    // An anchor the module could not take refuses the instance: it was
+    // given a trust set, and it either holds all of it or does not run.
+    if s.anchor_refused {
+        let msg = b"[quic] refusing to construct: a trust anchor does not parse, exceeds MAX_CERT_LEN, or the bundle exceeds MAX_ANCHORS";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return -1;
+    }
 
     // Resolve the target-tier head-sampling default only when
     // `trace_sample_permille` was not explicitly supplied (still the sentinel):
@@ -746,6 +774,62 @@ unsafe fn validate_retry_token(
     Some(odcid_len)
 }
 
+/// Append every certificate in `bundle` — concatenated DER — to the anchor
+/// table. An entry that is not a DER SEQUENCE, does not parse, exceeds
+/// `MAX_CERT_LEN`, or would be the ninth marks the table refused, and
+/// `module_new` then declines to construct. This module's per-anchor
+/// ceiling is the tighter one: a certificate between it and the build
+/// tool's is embedded and then refused here, at construction.
+fn push_anchor_bundle(s: &mut QuicState, bundle: &[u8], operator: bool) {
+    let mut pos = 0;
+    while pos < bundle.len() {
+        let Some((_, _, total)) = der_tlv(bundle, pos) else {
+            s.anchor_refused = true;
+            return;
+        };
+        let i = s.anchor_count as usize;
+        let der = &bundle[pos..pos + total];
+        if bundle[pos] != 0x30
+            || i >= MAX_ANCHORS
+            || total > MAX_CERT_LEN
+            || parse_certificate(der).is_none()
+        {
+            s.anchor_refused = true;
+            return;
+        }
+        s.anchors[i][..total].copy_from_slice(der);
+        s.anchor_lens[i] = total as u16;
+        s.anchor_count += 1;
+        if operator {
+            s.anchor_operator += 1;
+        }
+        pos += total;
+    }
+}
+
+/// The configured anchors as the verifier's set, in configured order.
+fn anchor_set(s: &QuicState) -> AnchorSet<'_> {
+    let mut set = AnchorSet::empty();
+    let mut i = 0;
+    while i < s.anchor_count as usize && i < MAX_ANCHORS {
+        set.push(&s.anchors[i][..s.anchor_lens[i] as usize]);
+        i += 1;
+    }
+    set
+}
+
+/// The anchor a walked chain was accepted under, for the stepped links
+/// that read their issuer key from it. Empty for an index the table does
+/// not hold, which the step then refuses as a signature failure.
+fn selected_anchor(s: &QuicState, index: u8) -> &[u8] {
+    let i = index as usize;
+    if i < s.anchor_count as usize && i < MAX_ANCHORS {
+        &s.anchors[i][..s.anchor_lens[i] as usize]
+    } else {
+        &[]
+    }
+}
+
 unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len: usize) {
     if params.is_null() || params_len < 4 {
         return;
@@ -764,7 +848,7 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
     }
     while pos + 4 <= params_len {
         let tag = data[pos];
-        let ext = tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 14;
+        let ext = tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 14 || tag == 16;
         if ext && pos + 4 <= params_len && data[pos + 1] == 0x00 {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let start = pos + 4;
@@ -790,18 +874,12 @@ unsafe fn parse_extended_params(s: &mut QuicState, params: *const u8, params_len
                     core::ptr::copy_nonoverlapping(data.as_ptr().add(start), s.key.as_mut_ptr(), n);
                     s.key_len = n;
                 }
-                12 => {
-                    let n = if len < MAX_CERT_LEN {
-                        len
-                    } else {
-                        MAX_CERT_LEN
-                    };
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(start),
-                        s.trust_cert.as_mut_ptr(),
-                        n,
-                    );
-                    s.trust_cert_len = n;
+                12 | 16 => {
+                    // Trust anchors, one bundle per origin: the deployment's
+                    // under 12, the operator's under 16. Both feed the same
+                    // table through the same walk.
+                    let bundle = core::slice::from_raw_parts(data.as_ptr().add(start), len);
+                    push_anchor_bundle(s, bundle, tag == 16);
                 }
                 13 => {
                     let n = if len < s.verify_hostname.len() {

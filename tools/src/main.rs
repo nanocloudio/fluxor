@@ -77,6 +77,7 @@ mod store_cli;
 pub mod target;
 mod target_facts;
 mod text_distance;
+mod trust_anchors;
 mod uf2;
 mod up;
 mod wasm_bundle;
@@ -129,7 +130,7 @@ fn main() {
     if let Some(stem) = argv0_stem {
         if stem != "fluxor" {
             let args: Vec<String> = std::env::args().skip(1).collect();
-            match workload_src::exec_applet(&stem, &args, false) {
+            match workload_src::exec_applet(&stem, &args, None, false) {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
                     eprintln!("\x1b[1;31mError:\x1b[0m {e}");
@@ -177,6 +178,7 @@ fn main() {
             base_port,
             http_offset,
             vars,
+            ca,
         } => (|| {
             // `-` reads the config from stdin into a scratch file, so a
             // heredoc can feed `fluxor run` (and `--replicas` templates)
@@ -185,6 +187,11 @@ fn main() {
                 Some(p) if p.as_os_str() == "-" => Some(stdin_config()?),
                 other => other,
             };
+            if ca.is_some() && replicas.is_some() {
+                return Err(Error::Config(
+                    "run --ca does not apply to --replicas templates".into(),
+                ));
+            }
             match replicas {
                 // `--replicas` renders the template once per replica and
                 // spawns them side-by-side.
@@ -203,12 +210,15 @@ fn main() {
                         graph,
                         list,
                         open,
+                        ca,
                     },
                     verbose,
                 ),
             }
         })(),
-        Commands::Exec { name, args } => workload_src::exec_applet(&name, &args, verbose),
+        Commands::Exec { name, ca, args } => {
+            workload_src::exec_applet(&name, &args, ca.as_deref(), verbose)
+        }
         Commands::Applet { action } => match action {
             AppletAction::Logs { name, tail, all } => workload_src::applet_logs(&name, tail, all),
         },

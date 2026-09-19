@@ -52,7 +52,11 @@
 pub const MAX_WAITS: usize = 8;
 /// Resources one accepted request may hold references on. Bounds both the
 /// retain/release bookkeeping and the candidate-publication list.
-pub const MAX_FENCE_REFS: usize = 16;
+/// Resources one fence remembers. The wire publishes this as
+/// [`MAX_SUBMISSION_RESOURCES`] because a producer has to batch against it;
+/// this is the same number, aliased rather than repeated so the two cannot
+/// drift apart.
+pub const MAX_FENCE_REFS: usize = MAX_SUBMISSION_RESOURCES;
 /// Bindings a loaded program may declare. Copied out of the pack at load so
 /// the program stays self-describing after the producer's bytes are gone.
 pub const MAX_PROGRAM_BINDINGS: usize = 16;
@@ -3227,6 +3231,19 @@ impl<'a> GpuDevice<'a> {
             ) {
                 blast += 1;
                 self.finish(idx as u16, OUT_DEVICE_LOST, REASON_DEVICE_LOST, 0, 0, 0);
+            }
+        }
+        // Every fence of the old epoch, including the ones that had already
+        // finished and were being retained for their results. Retention
+        // exists so a consumer can acknowledge a result rather than have it
+        // dropped — but a fence from a dead epoch cannot be acknowledged,
+        // because its handle no longer resolves. Left in place they are
+        // pool slots nothing can ever free, so a device reset twice would
+        // refuse all further work; a reset is supposed to reclaim, and this
+        // is part of what it reclaims.
+        for idx in 0..self.t.fences.len() {
+            if idx as u16 != keep && self.t.fences[idx].state != FENCE_FREE {
+                self.release_fence_slot(idx as u16);
             }
         }
         for r in self.t.resources.iter_mut() {

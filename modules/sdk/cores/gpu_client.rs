@@ -368,6 +368,33 @@ impl GpuClient<'_> {
         self.arm(corr, PEND_BUFFER, slot as u16, usage).then_some(n)
     }
 
+    /// Create a named texture. The matching whole-texture view is minted
+    /// automatically once the handle arrives, exactly as for a buffer.
+    ///
+    /// The bytes the view spans are the contract's own accounting — four per
+    /// texel, whatever the format's actual width — so a view over a narrower
+    /// format covers more bytes than its texels occupy. That is the device
+    /// model's assumption, restated here rather than a second one invented.
+    pub fn create_texture(
+        &mut self,
+        out: &mut [u8],
+        name: u32,
+        spec: &TextureSpec,
+    ) -> Option<usize> {
+        let size = u64::from(spec.width)
+            .checked_mul(u64::from(spec.height))?
+            .checked_mul(u64::from(spec.layers))?
+            .checked_mul(4)?;
+        let slot = self.resource_slot(name)?;
+        self.resources[slot].size = size;
+        self.resources[slot].buffer = HANDLE_NONE;
+        self.resources[slot].view = HANDLE_NONE;
+        let corr = self.corr();
+        let n = req_create_texture(out, corr, spec)?;
+        self.arm(corr, PEND_BUFFER, slot as u16, spec.usage)
+            .then_some(n)
+    }
+
     /// Retire a named resource.
     ///
     /// The name is free immediately, so a consumer can recreate it at a new
@@ -451,8 +478,29 @@ impl GpuClient<'_> {
         Some(n)
     }
 
+    /// Build a raster pipeline for a named program whose load completed.
+    ///
+    /// Separate from [`Self::create_pipeline`] rather than an argument on it:
+    /// a raster pipeline needs state a compute pipeline has no place for, and
+    /// a parameter that is meaningless in one of the two cases is a worse
+    /// interface than two calls.
+    pub fn create_raster_pipeline(
+        &mut self,
+        out: &mut [u8],
+        name: u32,
+        state: &RasterState,
+    ) -> Option<usize> {
+        let mut blob = [0u8; RASTER_STATE_HEAD + MAX_VERTEX_ATTRS * RASTER_ATTR_LEN];
+        let len = state.encode(&mut blob)?;
+        self.pipeline_for(out, name, QUEUE_RASTER, &blob[..len])
+    }
+
     /// Build the pipeline for a named program whose load completed.
     pub fn create_pipeline(&mut self, out: &mut [u8], name: u32) -> Option<usize> {
+        self.pipeline_for(out, name, QUEUE_COMPUTE, &[])
+    }
+
+    fn pipeline_for(&mut self, out: &mut [u8], name: u32, kind: u8, state: &[u8]) -> Option<usize> {
         // A program that failed is not buildable. Its handle may well have
         // arrived before the failure did, so the handle alone is not the
         // question — and a client that kept offering pipelines for a shader
@@ -471,7 +519,7 @@ impl GpuClient<'_> {
         })?;
         let program = self.programs[slot].program;
         let corr = self.corr();
-        let n = req_create_pipeline(out, corr, program, QUEUE_COMPUTE, &[])?;
+        let n = req_create_pipeline(out, corr, program, kind, state)?;
         self.arm(corr, PEND_PIPELINE, slot as u16, name)
             .then_some(n)
     }
@@ -535,8 +583,25 @@ impl GpuClient<'_> {
         items: &[u8],
         tag: u32,
     ) -> Option<usize> {
+        self.submit_on(out, QUEUE_COMPUTE, waits, items, tag)
+    }
+
+    /// Submit on a named queue.
+    ///
+    /// Dispatches and draws cannot share a submission — the device model
+    /// refuses a draw on the compute queue and a dispatch on the raster one —
+    /// so a consumer that does both says which each time, and the two are
+    /// ordered by a fence rather than by their position in one list.
+    pub fn submit_on(
+        &mut self,
+        out: &mut [u8],
+        queue: u8,
+        waits: &[u64],
+        items: &[u8],
+        tag: u32,
+    ) -> Option<usize> {
         let corr = self.corr();
-        let n = req_submit(out, corr, QUEUE_COMPUTE, waits, items)?;
+        let n = req_submit(out, corr, queue, waits, items)?;
         self.arm(corr, PEND_WORK, CLIENT_NO_SLOT, tag).then_some(n)
     }
 

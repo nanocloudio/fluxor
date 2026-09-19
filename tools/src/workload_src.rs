@@ -457,21 +457,51 @@ pub fn is_source_manifest(path: &Path) -> bool {
             .is_some_and(|v| v.get("workload").is_some_and(toml::Value::is_table))
 }
 
-/// `fluxor run <bundle>`: resolve a target
-/// from `workload.json` with the SAME resolver the agent uses
-/// (`select_implementation`), verify the pinned artifacts, and exec the
-/// implementation's built blobs. Accepts a source manifest (emits first —
-/// build-and-run), a bundle root, or a target subdir directly.
-pub fn run_bundle(path: &Path, verbose: bool) -> Result<()> {
-    run_bundle_with_args(path, &[], verbose)
+/// `fluxor run <bundle>`: exec a built bundle's blobs, with the operator's
+/// `--ca` anchors appended to its client-mode tls/quic instances for this
+/// run when given. `fluxor exec` is the applet form, see [`exec_applet`].
+pub fn run_bundle_with_ca(path: &Path, ca: Option<&Path>, verbose: bool) -> Result<()> {
+    launch_bundle(path, &[], None, None, ca, verbose)
 }
 
-/// `run_bundle` with app argv appended after `--` — the `fluxor exec` data
-/// path. The runtime's own option parser stops at the first `--`, so
-/// everything after it belongs to the program: the `cli_in` built-in reads
-/// that tail straight from the process argv.
-pub fn run_bundle_with_args(path: &Path, app_args: &[String], verbose: bool) -> Result<()> {
-    launch_bundle(path, app_args, None, None, verbose)
+/// Write `config_bin` to `out` with the certificates of `pem` appended to
+/// every client-mode tls/quic instance, and say what was widened. The
+/// operator channel reads PEM only (the build-time `trust` parameter is
+/// the one that also takes raw DER), and a block whose base64 does not
+/// decode is skipped rather than failing the run. A file that yields no
+/// certificate that way, more anchors than an instance holds or one over
+/// the DER ceiling, and an instance whose table would overflow, are each
+/// an error naming what failed; a graph with no client instance is
+/// reported, not an error, since the flag then has nothing to widen.
+pub fn write_widened_config(config_bin: &Path, out: &Path, pem: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(pem)
+        .map_err(|e| Error::Config(format!("--ca: could not read '{}': {e}", pem.display())))?;
+    let anchors = crate::trust_anchors::pem_certificates(&text);
+    if anchors.is_empty() {
+        return Err(Error::Config(format!(
+            "--ca: no CERTIFICATE block decodes in '{}'",
+            pem.display()
+        )));
+    }
+    let blob = std::fs::read(config_bin)?;
+    let (widened, report) = crate::trust_anchors::append_operator_anchors(&blob, &anchors)
+        .map_err(|e| Error::Config(format!("--ca: {e}")))?;
+    std::fs::write(out, &widened)?;
+    if report.instances.is_empty() {
+        eprintln!(
+            "  --ca: {} anchor(s) in '{}', but the graph has no client-mode tls/quic instance to widen",
+            anchors.len(),
+            pem.display()
+        );
+    } else {
+        eprintln!(
+            "  --ca: {} anchor(s) from '{}' appended to {} client instance(s)",
+            anchors.len(),
+            pem.display(),
+            report.instances.len()
+        );
+    }
+    Ok(())
 }
 
 /// Where an applet's runtime binary lives relative to the project that
@@ -489,6 +519,7 @@ fn launch_bundle(
     app_args: &[String],
     runtime: Option<&Path>,
     applet: Option<&str>,
+    ca: Option<&Path>,
     verbose: bool,
 ) -> Result<()> {
     use fluxor_tools::workload::{parse_manifest, select_implementation};
@@ -536,7 +567,7 @@ fn launch_bundle(
         }
     }
 
-    let config_bin = target_dir.join("config.bin");
+    let mut config_bin = target_dir.join("config.bin");
     let modules_bin = target_dir.join("modules.bin");
     for f in [&config_bin, &modules_bin] {
         if !f.is_file() {
@@ -546,6 +577,21 @@ fn launch_bundle(
             )));
         }
     }
+    // `--ca` widens a copy for this run only; the cached bundle is the
+    // publisher's and stays byte-identical.
+    let widened = match ca {
+        Some(pem) => {
+            let tmp = std::env::temp_dir().join(format!(
+                "fluxor-{}-{}-config.operator.bin",
+                manifest.name,
+                std::process::id()
+            ));
+            write_widened_config(&config_bin, &tmp, pem)?;
+            config_bin = tmp.clone();
+            Some(tmp)
+        }
+        None => None,
+    };
     // A recorded runtime is the one this bundle's modules were packed
     // against. If it has gone, say so and name it: quietly running the
     // bundle against whatever binary the current directory happens to
@@ -626,7 +672,11 @@ fn launch_bundle(
     }
     // Die-with-parent (see `tie_to_parent`): a killed/timeouted `fluxor exec`
     // must not orphan a runtime that never exits on its own.
-    let status = crate::tie_to_parent(&mut cmd).status()?;
+    let status = crate::tie_to_parent(&mut cmd).status();
+    if let Some(tmp) = widened {
+        let _ = std::fs::remove_file(tmp);
+    }
+    let status = status?;
     // A CLI bundle's exit code IS the deliverable: propagate it verbatim
     // rather than wrapping a non-zero status in a tool error, so a shell
     // sees what the program returned.
@@ -787,7 +837,7 @@ pub fn install_applet(
 /// project (`target/fluxor/<name>/`), else an error listing the applets
 /// that ARE known. No compilation on the hot path: the cached bundle
 /// execs as-is.
-pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
+pub fn exec_applet(name: &str, args: &[String], ca: Option<&Path>, verbose: bool) -> Result<()> {
     let reg = load_registry()?;
     if let Some(entry) = reg.get(name) {
         if entry.bundle.join("workload.json").is_file() {
@@ -796,6 +846,7 @@ pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
                 args,
                 entry.runtime.as_deref(),
                 Some(name),
+                ca,
                 verbose,
             );
         }
@@ -809,7 +860,7 @@ pub fn exec_applet(name: &str, args: &[String], verbose: bool) -> Result<()> {
         .join("target/fluxor")
         .join(name);
     if project.join("workload.json").is_file() {
-        return launch_bundle(&project, args, None, Some(name), verbose);
+        return launch_bundle(&project, args, None, Some(name), ca, verbose);
     }
     let known: Vec<&str> = reg.keys().map(String::as_str).collect();
     Err(Error::Config(format!(

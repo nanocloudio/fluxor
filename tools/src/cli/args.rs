@@ -158,6 +158,13 @@ enum Commands {
         /// applied uniformly to every replica. Repeat for multiple.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+        /// Append the certificates in this PEM file to the trust anchors
+        /// of every CLIENT-MODE `tls` / `quic` instance for this run. A
+        /// server instance is never widened, whether or not it verifies
+        /// its clients. A linux graph or a bundle only — not a scenario
+        /// and not `--replicas`; there is no environment-variable form.
+        #[arg(long, value_name = "PEM")]
+        ca: Option<PathBuf>,
     },
     /// Run an installed applet: resolve <NAME> through the applet catalogue
     /// (or the project's `target/fluxor/<NAME>/` bundle) and exec its
@@ -165,6 +172,12 @@ enum Commands {
     Exec {
         /// Applet name.
         name: String,
+        /// Append the certificates in this PEM file to the trust anchors
+        /// of every CLIENT-MODE `tls` / `quic` instance for this run. A
+        /// server instance is never widened. The cached bundle is not
+        /// modified.
+        #[arg(long, value_name = "PEM")]
+        ca: Option<PathBuf>,
         /// App argv, after `--`.
         #[arg(last = true)]
         args: Vec<String>,

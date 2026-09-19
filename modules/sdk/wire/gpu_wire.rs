@@ -228,6 +228,23 @@ pub const OP_UPLOAD: u16 = 0x0030;
 /// or more [`OUT_RESULT`] records before the fence's terminal outcome.
 pub const OP_READBACK: u16 = 0x0031;
 
+/// Distinct resources one submission may reference.
+///
+/// A fence remembers every resource its submission touched — to hold them
+/// against destruction while the work is in flight, to know which candidate
+/// outputs it publishes, and to refuse a read of something still uncommitted.
+/// That table is fixed, so the count is bounded, and a submission that
+/// exceeds it is refused with [`REASON_OVERSIZE`] and this number as its
+/// detail.
+///
+/// Published here because it is a **producer's** constraint, not only a
+/// provider's: a consumer with more resident geometry than this has to draw
+/// it in several submissions, and it cannot work out how to batch without
+/// knowing the ceiling. Bindings, vertex and index buffers, pass targets and
+/// copy endpoints all count, and each distinct resource counts once however
+/// many times it appears.
+pub const MAX_SUBMISSION_RESOURCES: usize = 16;
+
 /// Submit dependency-ordered work. Payload:
 /// `[queue u8][wait_count u8][flags u16][item_len u32]`
 /// `[wait fences u64 × wait_count][items…]`.
@@ -270,7 +287,31 @@ pub const ITEM_DISPATCH: u8 = 0x01;
 /// `[src view u64][dst view u64][length u64]` — device-to-device copy.
 pub const ITEM_COPY: u8 = 0x02;
 /// `[target u64][flags u32][clear_rgba u32]` — begin a render pass.
+/// `flags` is the `PASS_*` mask below; `clear_rgba` is one texel of the
+/// target's format, used only when `PASS_CLEAR_COLOUR` is set.
 pub const ITEM_BEGIN_PASS: u8 = 0x03;
+// ── Render pass flags ───────────────────────────────────────────────────
+//
+// The `flags` word of `ITEM_BEGIN_PASS`.
+
+/// Clear the colour attachment to the item's `clear_rgba` before drawing.
+/// Without it the pass loads what the target already held.
+pub const PASS_CLEAR_COLOUR: u32 = 1 << 0;
+/// The pass has a depth attachment, in the format the pipeline declared.
+///
+/// A depth attachment is pass-local: no consumer names it, binds it, copies
+/// it or reads it back, so it is the provider's to allocate against the
+/// target's extent rather than a resource the handle table carries. A
+/// provider that allocates one reports its bytes; one that cannot refuses the
+/// flag rather than drawing without a depth test.
+pub const PASS_DEPTH: u32 = 1 << 1;
+/// Clear that depth attachment to its far value before drawing. Requires
+/// [`PASS_DEPTH`].
+pub const PASS_CLEAR_DEPTH: u32 = 1 << 2;
+
+/// Every pass flag this contract allocates.
+pub const PASS_ALL: u32 = PASS_CLEAR_COLOUR | PASS_DEPTH | PASS_CLEAR_DEPTH;
+
 /// `[pipeline u64][bind_count u16][pad u16][(slot u16, pad u16, view u64) × n]`
 /// `[vertex u64][index u64][first u32][count u32][instances u32]`
 pub const ITEM_DRAW: u8 = 0x04;
@@ -543,6 +584,64 @@ pub const RIGHT_OWN: u32 = 1 << 5;
 
 pub const RIGHT_ALL: u32 =
     RIGHT_READ | RIGHT_WRITE | RIGHT_BIND | RIGHT_MAP | RIGHT_GRANT | RIGHT_OWN;
+
+// ── Texture formats ─────────────────────────────────────────────────────
+//
+// `format` on a texture, a view and a surface descriptor is one enumeration,
+// allocated here rather than left to each backend. It would otherwise be an
+// opaque u32 that a native provider and a browser provider each numbered for
+// themselves, and a consumer targeting both would have to know which one
+// answered — which is exactly the portability this contract exists to give.
+//
+// Deliberately small. These are the formats a provider here implements, not
+// every format a GPU API can spell; one more is a commit, and a request
+// naming a number outside this set is refused with the fact rather than
+// guessed at.
+
+/// No format. A buffer has none, and a zeroed descriptor is unambiguous.
+pub const FORMAT_NONE: u32 = 0;
+/// Eight bits per channel, RGBA order, unsigned normalised.
+pub const FORMAT_RGBA8_UNORM: u32 = 1;
+/// The same, sampled and blended as sRGB.
+pub const FORMAT_RGBA8_UNORM_SRGB: u32 = 2;
+/// Eight bits per channel, BGRA order — what most swapchains want.
+pub const FORMAT_BGRA8_UNORM: u32 = 3;
+/// The same, sRGB.
+pub const FORMAT_BGRA8_UNORM_SRGB: u32 = 4;
+/// 32-bit float depth. Depth only: no stencil, because no provider here
+/// implements stencil test and advertising one would be a claim.
+pub const FORMAT_DEPTH32_FLOAT: u32 = 5;
+/// One unsigned 32-bit integer per texel.
+pub const FORMAT_R32_UINT: u32 = 6;
+
+/// Highest format id this contract allocates.
+pub const FORMAT_MAX: u32 = FORMAT_R32_UINT;
+
+/// Bytes one texel of `format` occupies, or `None` for an unallocated id.
+///
+/// Separate from the resource-accounting assumption in the device core, which
+/// reserves four bytes per texel for every format. That over-reserves a
+/// narrower format and never under-reserves; this answers what a provider
+/// actually has to allocate and copy.
+#[must_use]
+pub const fn format_texel_bytes(format: u32) -> Option<u32> {
+    match format {
+        FORMAT_RGBA8_UNORM
+        | FORMAT_RGBA8_UNORM_SRGB
+        | FORMAT_BGRA8_UNORM
+        | FORMAT_BGRA8_UNORM_SRGB
+        | FORMAT_DEPTH32_FLOAT
+        | FORMAT_R32_UINT => Some(4),
+        _ => None,
+    }
+}
+
+/// Whether `format` is a depth format, and so belongs on a pass's depth
+/// attachment rather than its colour attachment.
+#[must_use]
+pub const fn format_is_depth(format: u32) -> bool {
+    matches!(format, FORMAT_DEPTH32_FLOAT)
+}
 
 // ── Residency ───────────────────────────────────────────────────────────
 //
@@ -1023,6 +1122,273 @@ pub fn req_load_program(
     put_u32(p, 12, total_len);
     p[16..].copy_from_slice(bytes);
     Some(n)
+}
+
+// ── Raster pipeline state ───────────────────────────────────────────────
+//
+// The `[backend state…]` tail of `OP_CREATE_PIPELINE` for a `QUEUE_RASTER`
+// pipeline. A compute pipeline carries no state and its tail is empty.
+//
+// Allocated here, in the contract, for the same reason the formats above are:
+// state that each backend defined for itself would make the raster half
+// unportable, and a consumer would need one encoding per provider to draw the
+// same scene twice. Everything a draw needs that is not in the program pack
+// or the submission is here, and nothing else is.
+//
+// ```text
+//   [0..4]   colour_format  u32  FORMAT_* of the pass's colour attachment
+//   [4..8]   depth_format   u32  FORMAT_* of its depth attachment, or NONE
+//   [8..12]  vertex_stride  u32  bytes between consecutive vertices
+//   [12]     topology       u8   TOPOLOGY_*
+//   [13]     cull           u8   CULL_*
+//   [14]     front_face     u8   FRONT_FACE_*
+//   [15]     blend          u8   BLEND_*
+//   [16]     depth_compare  u8   DEPTH_*
+//   [17]     depth_write    u8   0 or 1
+//   [18..20] attr_count     u16  vertex attributes that follow
+//   [20..24] reserved       u32  must be zero
+//   then attr_count × [location u16][format u16][offset u32]
+// ```
+
+/// Bytes of the fixed head of a raster pipeline state blob.
+pub const RASTER_STATE_HEAD: usize = 24;
+/// Bytes of one vertex attribute entry.
+pub const RASTER_ATTR_LEN: usize = 8;
+/// Most vertex attributes one pipeline may declare.
+pub const MAX_VERTEX_ATTRS: usize = 16;
+
+pub const TOPOLOGY_TRIANGLE_LIST: u8 = 1;
+pub const TOPOLOGY_TRIANGLE_STRIP: u8 = 2;
+pub const TOPOLOGY_LINE_LIST: u8 = 3;
+pub const TOPOLOGY_POINT_LIST: u8 = 4;
+
+pub const CULL_NONE: u8 = 0;
+pub const CULL_BACK: u8 = 1;
+pub const CULL_FRONT: u8 = 2;
+
+/// Counter-clockwise winding seen from outside is the front face.
+pub const FRONT_FACE_CCW: u8 = 0;
+pub const FRONT_FACE_CW: u8 = 1;
+
+/// Source replaces destination; no blending.
+pub const BLEND_REPLACE: u8 = 0;
+/// Straight (non-premultiplied) source-alpha over destination.
+pub const BLEND_ALPHA: u8 = 1;
+
+/// Depth test always passes. With `depth_write` clear this is "no depth".
+pub const DEPTH_ALWAYS: u8 = 0;
+pub const DEPTH_LESS: u8 = 1;
+pub const DEPTH_LESS_EQUAL: u8 = 2;
+pub const DEPTH_GREATER: u8 = 3;
+
+/// Vertex attribute component formats.
+pub const VATTR_F32: u16 = 1;
+pub const VATTR_F32X2: u16 = 2;
+pub const VATTR_F32X3: u16 = 3;
+pub const VATTR_F32X4: u16 = 4;
+pub const VATTR_U32: u16 = 5;
+pub const VATTR_U32X2: u16 = 6;
+pub const VATTR_U32X4: u16 = 7;
+/// Four unsigned bytes, normalised to 0.0..=1.0.
+pub const VATTR_U8X4_UNORM: u16 = 8;
+
+/// Bytes one attribute of `format` occupies, or `None` for an unallocated id.
+#[must_use]
+pub const fn vattr_bytes(format: u16) -> Option<u32> {
+    match format {
+        VATTR_F32 | VATTR_U32 | VATTR_U8X4_UNORM => Some(4),
+        VATTR_F32X2 | VATTR_U32X2 => Some(8),
+        VATTR_F32X3 => Some(12),
+        VATTR_F32X4 | VATTR_U32X4 => Some(16),
+        _ => None,
+    }
+}
+
+/// One vertex attribute: where the shader reads it, how it is encoded, and
+/// where it sits inside a vertex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VertexAttr {
+    /// The shader's `@location`.
+    pub location: u16,
+    /// `VATTR_*`.
+    pub format: u16,
+    /// Byte offset from the start of the vertex.
+    pub offset: u32,
+}
+
+/// Everything a raster pipeline needs that the program pack and the
+/// submission do not carry.
+#[derive(Clone, Copy, Debug)]
+pub struct RasterState {
+    pub colour_format: u32,
+    /// `FORMAT_NONE` for a pass with no depth attachment.
+    pub depth_format: u32,
+    pub vertex_stride: u32,
+    pub topology: u8,
+    pub cull: u8,
+    pub front_face: u8,
+    pub blend: u8,
+    pub depth_compare: u8,
+    pub depth_write: bool,
+    pub attr_count: u16,
+    pub attrs: [VertexAttr; MAX_VERTEX_ATTRS],
+}
+
+impl Default for RasterState {
+    fn default() -> Self {
+        Self {
+            colour_format: FORMAT_RGBA8_UNORM,
+            depth_format: FORMAT_NONE,
+            vertex_stride: 0,
+            topology: TOPOLOGY_TRIANGLE_LIST,
+            cull: CULL_NONE,
+            front_face: FRONT_FACE_CCW,
+            blend: BLEND_REPLACE,
+            depth_compare: DEPTH_ALWAYS,
+            depth_write: false,
+            attr_count: 0,
+            attrs: [VertexAttr {
+                location: 0,
+                format: 0,
+                offset: 0,
+            }; MAX_VERTEX_ATTRS],
+        }
+    }
+}
+
+impl RasterState {
+    /// The attributes actually declared.
+    #[must_use]
+    pub fn attrs(&self) -> &[VertexAttr] {
+        &self.attrs[..(self.attr_count as usize).min(MAX_VERTEX_ATTRS)]
+    }
+
+    /// Encoded length of this state.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        RASTER_STATE_HEAD + self.attrs().len() * RASTER_ATTR_LEN
+    }
+
+    /// Write the state into `out`, answering its length, or `None` when `out`
+    /// is too small — never a truncated blob.
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        let n = self.encoded_len();
+        if out.len() < n {
+            return None;
+        }
+        let p = &mut out[..n];
+        p.fill(0);
+        put_u32(p, 0, self.colour_format);
+        put_u32(p, 4, self.depth_format);
+        put_u32(p, 8, self.vertex_stride);
+        p[12] = self.topology;
+        p[13] = self.cull;
+        p[14] = self.front_face;
+        p[15] = self.blend;
+        p[16] = self.depth_compare;
+        p[17] = u8::from(self.depth_write);
+        put_u16(p, 18, self.attrs().len() as u16);
+        for (i, a) in self.attrs().iter().enumerate() {
+            let at = RASTER_STATE_HEAD + i * RASTER_ATTR_LEN;
+            put_u16(p, at, a.location);
+            put_u16(p, at + 2, a.format);
+            put_u32(p, at + 4, a.offset);
+        }
+        Some(n)
+    }
+
+    /// Decode a state blob, validating every field against what this contract
+    /// allocates.
+    ///
+    /// A provider that decoded leniently would accept a pipeline it cannot
+    /// build and fail later at draw time, where the caller has already been
+    /// told its pipeline is ready. Everything checkable is checked here.
+    pub fn decode(p: &[u8]) -> Result<Self, u16> {
+        if p.len() < RASTER_STATE_HEAD {
+            return Err(REASON_MALFORMED);
+        }
+        let colour_format = get_u32(p, 0).ok_or(REASON_MALFORMED)?;
+        let depth_format = get_u32(p, 4).ok_or(REASON_MALFORMED)?;
+        let vertex_stride = get_u32(p, 8).ok_or(REASON_MALFORMED)?;
+        let topology = p[12];
+        let cull = p[13];
+        let front_face = p[14];
+        let blend = p[15];
+        let depth_compare = p[16];
+        let depth_write = p[17];
+        let attr_count = get_u16(p, 18).ok_or(REASON_MALFORMED)?;
+        if get_u32(p, 20) != Some(0) {
+            return Err(REASON_MALFORMED);
+        }
+        if format_texel_bytes(colour_format).is_none() || format_is_depth(colour_format) {
+            return Err(REASON_UNSUPPORTED_FEATURE);
+        }
+        if depth_format != FORMAT_NONE && !format_is_depth(depth_format) {
+            return Err(REASON_UNSUPPORTED_FEATURE);
+        }
+        if !matches!(
+            topology,
+            TOPOLOGY_TRIANGLE_LIST | TOPOLOGY_TRIANGLE_STRIP | TOPOLOGY_LINE_LIST
+                | TOPOLOGY_POINT_LIST
+        ) || !matches!(cull, CULL_NONE | CULL_BACK | CULL_FRONT)
+            || !matches!(front_face, FRONT_FACE_CCW | FRONT_FACE_CW)
+            || !matches!(blend, BLEND_REPLACE | BLEND_ALPHA)
+            || !matches!(
+                depth_compare,
+                DEPTH_ALWAYS | DEPTH_LESS | DEPTH_LESS_EQUAL | DEPTH_GREATER
+            )
+            || depth_write > 1
+        {
+            return Err(REASON_MALFORMED);
+        }
+        // Depth state that names no attachment cannot be honoured, and a
+        // pipeline whose depth test silently did nothing is worse than one
+        // that was refused.
+        if depth_format == FORMAT_NONE && (depth_write == 1 || depth_compare != DEPTH_ALWAYS) {
+            return Err(REASON_MALFORMED);
+        }
+        if attr_count as usize > MAX_VERTEX_ATTRS {
+            return Err(REASON_OVERSIZE);
+        }
+        let want = RASTER_STATE_HEAD + attr_count as usize * RASTER_ATTR_LEN;
+        if p.len() < want {
+            return Err(REASON_MALFORMED);
+        }
+        let mut st = Self {
+            colour_format,
+            depth_format,
+            vertex_stride,
+            topology,
+            cull,
+            front_face,
+            blend,
+            depth_compare,
+            depth_write: depth_write == 1,
+            attr_count,
+            ..Self::default()
+        };
+        for i in 0..attr_count as usize {
+            let at = RASTER_STATE_HEAD + i * RASTER_ATTR_LEN;
+            let location = get_u16(p, at).ok_or(REASON_MALFORMED)?;
+            let format = get_u16(p, at + 2).ok_or(REASON_MALFORMED)?;
+            let offset = get_u32(p, at + 4).ok_or(REASON_MALFORMED)?;
+            let width = vattr_bytes(format).ok_or(REASON_UNSUPPORTED_FEATURE)?;
+            // An attribute that runs past the stride reads the next vertex.
+            // The device would not fault; it would draw the wrong thing.
+            if offset.checked_add(width).is_none_or(|end| end > vertex_stride) {
+                return Err(REASON_BAD_RANGE);
+            }
+            if st.attrs()[..i].iter().any(|a| a.location == location) {
+                return Err(REASON_MALFORMED);
+            }
+            st.attrs[i] = VertexAttr {
+                location,
+                format,
+                offset,
+            };
+        }
+        Ok(st)
+    }
 }
 
 /// `OP_CREATE_PIPELINE` —

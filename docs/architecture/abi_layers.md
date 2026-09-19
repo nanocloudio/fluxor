@@ -284,27 +284,31 @@ content_type = "VideoRaster"
 
 [[params]]
 name = "mode"
+tag = 10
 type = "enum"
 values = ["file", "null", "window"]
 default = "file"
 
 [[params]]
 name = "width"
+tag = 11
 type = "u32"
 default = 480
 range = [1, 4096]
 
 [[params]]
 name = "path"
+tag = 12
 type = "str"
 required = true
 ```
 
-Param types: `u8`, `u16`, `u32`, `str`, `enum`. Tags are auto-assigned
-in declaration order starting at 10, so declaration order is wire ABI:
-reordering `[[params]]` shifts every wire-side tag. The manifest and
-the matching tag constants in `src/platform/linux/<name>.rs` change
-together or not at all.
+Param types: `u8`, `u16`, `u32`, `str`, `enum`. Every param carries an
+explicit tag — `tag = N` in `[[params]]`, the leading literal in a
+module's `define_params!` — and the tag is the wire ABI: a param keeps
+its number for life, a retired one is never reused, and declaration
+order carries no meaning. The manifest and the matching tag constants
+in `src/platform/linux/<name>.rs` change together or not at all.
 
 Validation runs at config-build time (`fluxor build`):
 

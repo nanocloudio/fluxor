@@ -299,29 +299,7 @@ impl RemoteClient {
     }
 }
 
-/// Extract DER certificates from a PEM bundle. Anything outside
-/// `BEGIN/END CERTIFICATE` markers is ignored.
-fn pem_certificates(pem: &str) -> Vec<Vec<u8>> {
-    use base64::Engine;
-    let mut out = Vec::new();
-    let mut in_cert = false;
-    let mut b64 = String::new();
-    for line in pem.lines() {
-        let line = line.trim();
-        if line == "-----BEGIN CERTIFICATE-----" {
-            in_cert = true;
-            b64.clear();
-        } else if line == "-----END CERTIFICATE-----" {
-            if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(&b64) {
-                out.push(der);
-            }
-            in_cert = false;
-        } else if in_cert {
-            b64.push_str(line);
-        }
-    }
-    out
-}
+use crate::trust_anchors::pem_certificates;
 
 /// Read one HTTP/1.1 response. `head` suppresses body reading (HEAD
 /// responses carry Content-Length but no body).

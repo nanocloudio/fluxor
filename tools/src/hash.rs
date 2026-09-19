@@ -15,6 +15,26 @@ use crate::error::Result;
 
 pub use crate::wire::fnv1a32 as fnv1a_hash;
 
+/// CRC16-CCITT (poly 0x1021, init 0xFFFF), the checksum the FXWR config
+/// header carries over its body and every post-body section carries over
+/// its payload. One implementation for the writer and for the tools that
+/// re-seal a blob after editing it.
+#[must_use]
+pub fn crc16_ccitt(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
 /// Render bytes as lower-case hex.
 ///
 /// The one renderer for every digest the tools print. Callers that want a
@@ -254,7 +274,7 @@ mod tests {
         );
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "7d3ae2a120aba29b5745b5c5d35b2c4799d6add6ee8d80432c77aafb48746958",
+            hex, "8936cbe646a94d01a7a215fb82b58dcddc6df287c60fbc77aabe0f8e601ac671",
             "ABI wire-surface changed — this is a deliberate wire break or it is \
              a mistake; see docs/architecture/abi_surface.md before updating"
         );

@@ -1321,13 +1321,16 @@ fn build_one(
             // binary can't provide fails here with the matching
             // `cargo build` command in the error message.
             validate_linux_runtime_features(yaml_path)?;
-            cmd_mktable_config(yaml_path, &fmod_dirs, &modules_bin_path)?;
+            // The config first: a graph the builder refuses (an anchor file
+            // that does not load, say) then leaves nothing behind, rather
+            // than a modules table beside a missing config.
             cmd_generate(
                 yaml_path,
                 Some(config_bin_path.as_path()),
                 Some(modules_dir.as_path()),
                 true,
             )?;
+            cmd_mktable_config(yaml_path, &fmod_dirs, &modules_bin_path)?;
         }
         "wasm" => {
             // wasm produces one self-contained `.wasm` file: the

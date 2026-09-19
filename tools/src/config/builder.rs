@@ -1721,7 +1721,10 @@ const NON_PARAM_KEYS: &[&str] = &[
     "protection",
     "cert_file",
     "key_file",
-    "trust_cert_file",
+    // `trust` is NOT here: it is a schema parameter of tls and quic (a
+    // `${file:<path>}` source spec), validated like any other key and
+    // lifted out before packing by `lift_trust_source`. A
+    // `trust_cert_file` key is rewritten to it there.
     "verify_hostname",
     "verify_uri", // URI SAN required under peer_auth: ca_uri, extended TLV tag 15
     "alpn", // RFC 7301 ALPN list, emitted as extended TLV tag 14
@@ -2111,6 +2114,54 @@ fn closest_param_name<'a>(key: &str, schema: &'a schema::ParamSchema) -> Option<
     })
 }
 
+/// Separate the `trust` source spec from the keys that pack as TLVs.
+///
+/// Returns the module as validated (with `trust` present, so the schema
+/// check sees it), the module as packed (with `trust` removed, so no string
+/// TLV is emitted for a value that is resolved to a bundle instead), and
+/// the spec itself. A `trust_cert_file: <path>` key is accepted as an alias
+/// for `trust: "${file:<path>}"` and reported as deprecated; carrying both
+/// is an error, since two spellings of one decision cannot both be the
+/// decision.
+fn lift_trust_source(name: &str, module: Value) -> Result<(Value, Value, Option<String>)> {
+    let mut validated = module;
+    let Some(obj) = validated.as_object_mut() else {
+        return Ok((validated.clone(), validated, None));
+    };
+    if let Some(legacy) = obj.remove("trust_cert_file") {
+        let Some(path) = legacy.as_str() else {
+            return Err(Error::Config(format!(
+                "module '{name}': trust_cert_file must be a path string"
+            )));
+        };
+        if obj.contains_key("trust") {
+            return Err(Error::Config(format!(
+                "module '{name}': carries both `trust` and its alias `trust_cert_file`; \
+                 keep `trust`"
+            )));
+        }
+        eprintln!(
+            "  deprecated: module '{name}': `trust_cert_file: \"{path}\"` is an alias — write \
+             `trust: \"${{file:{path}}}\"`"
+        );
+        obj.insert("trust".to_string(), json!(format!("${{file:{path}}}")));
+    }
+    let trust_spec = match obj.get("trust") {
+        None => None,
+        Some(Value::String(spec)) => Some(spec.clone()),
+        Some(_) => {
+            return Err(Error::Config(format!(
+                "module '{name}': trust must be a `${{file:<path>}}` source spec string"
+            )));
+        }
+    };
+    let mut packed = validated.clone();
+    if let Some(p) = packed.as_object_mut() {
+        p.remove("trust");
+    }
+    Ok((validated, packed, trust_spec))
+}
+
 /// Expand compound YAML fields that don't map 1:1 to schema params,
 /// returning a clone with the flat fields in place. Pure YAML-level
 /// rewrite — schema lookup runs unchanged afterwards.
@@ -2220,15 +2271,6 @@ fn build_module_entry(
     // schema params (e.g. `broker: "host:port"` in mqtt). Expand them
     // into the flat fields the schema knows about before packing.
     let normalized_module = expand_compound_yaml_fields(type_name, module, config);
-    let module = &normalized_module;
-
-    // The `heap:` subtree is structurally orthogonal to the schema
-    // (it's emitted as protection TLV tags, not schema params), so
-    // its validator runs unconditionally — modules with no schema
-    // source must still surface a `heap.alloc_failure_policy` typo
-    // at build time rather than letting it silently drop at runtime.
-    validate_heap_subtree(module, type_name)?;
-
     // PIC modules embed their schema in the `.fmod`; built-ins declare
     // it in `modules/platform/<platform>/<name>/manifest.toml`. Both
     // paths produce a `ParamSchema` and feed the same TLV packer, so
@@ -2238,10 +2280,36 @@ fn build_module_entry(
     // error (sibling of `assert_pinned_manifests_resolvable`). "No `.fmod`
     // schema" stays `Ok(None)` and falls through to the built-in path — a
     // built-in is never pinned and has no `.fmod`.
-    if let Some(param_schema) = schema::load_schema_for_module(type_name, modules_dir)? {
+    let pic_schema = schema::load_schema_for_module(type_name, modules_dir)?;
+    // On a module whose schema declares `trust` (tls, quic) the key is a
+    // trust-anchor source spec: validated against the schema with the
+    // other keys, then lifted out, since its value is resolved to a bundle
+    // (extended tag 12 below) and never packed as a string TLV. On any
+    // other module `trust` keeps whatever meaning that module gives it —
+    // an ISR-tier module's `trust: platform` is a trust LEVEL, read by
+    // `board::validate_config`, and is left exactly as written.
+    let declares_trust = pic_schema
+        .as_ref()
+        .is_some_and(|s| s.find("trust").is_some());
+    let (normalized_module, packed_module, trust_spec) = if declares_trust {
+        lift_trust_source(name, normalized_module)?
+    } else {
+        (normalized_module.clone(), normalized_module, None)
+    };
+    let module = &normalized_module;
+    let packed_module = &packed_module;
+
+    // The `heap:` subtree is structurally orthogonal to the schema
+    // (it's emitted as protection TLV tags, not schema params), so
+    // its validator runs unconditionally — modules with no schema
+    // source must still surface a `heap.alloc_failure_policy` typo
+    // at build time rather than letting it silently drop at runtime.
+    validate_heap_subtree(module, type_name)?;
+
+    if let Some(param_schema) = pic_schema {
         validate_yaml_params(module, &param_schema, type_name)?;
         params_len = schema::build_params_from_schema(
-            module,
+            packed_module,
             &param_schema,
             &mut entry,
             P,
@@ -2257,7 +2325,7 @@ fn build_module_entry(
         // param produces a TLV entry. The built-in's step function
         // reads values straight off the wire, with no defaults
         // duplicated in Rust.
-        let module_with_defaults = inject_manifest_defaults(module, &manifest);
+        let module_with_defaults = inject_manifest_defaults(packed_module, &manifest);
         params_len = schema::build_params_from_schema(
             &module_with_defaults,
             &param_schema,
@@ -2840,23 +2908,33 @@ fn build_module_entry(
         }
     }
 
-    // Tag 12: trust_cert_file (DER blob, extended TLV).
-    if let Some(path) = module.get("trust_cert_file").and_then(|v| v.as_str()) {
-        match std::fs::read(path) {
-            Ok(data) => {
-                let n = data.len();
-                if n > 0 && base + extra_len + 4 + n < entry.len() {
-                    entry[base + extra_len] = 12;
-                    entry[base + extra_len + 1] = 0x00;
-                    entry[base + extra_len + 2] = (n >> 8) as u8;
-                    entry[base + extra_len + 3] = n as u8;
-                    entry[base + extra_len + 4..base + extra_len + 4 + n].copy_from_slice(&data);
-                    extra_len += 4 + n;
-                    eprintln!("  trust_cert_file: {path} ({n} bytes)");
-                }
-            }
-            Err(e) => eprintln!("  warn: trust_cert_file: could not read '{path}': {e}"),
+    // Tag 12: the deployment's trust anchors — `trust: "${file:<path>}"`,
+    // one certificate or a bundle, embedded as concatenated DER. A file
+    // that cannot be read, holds no certificate, or holds more than the
+    // module's table fails the build here, naming the file and the
+    // instance: an anchor set is a decision, and an instance is not run
+    // on a decision that did not load.
+    if let Some(spec) = trust_spec.as_deref() {
+        let path = crate::trust_anchors::file_source(spec).ok_or_else(|| {
+            Error::Config(format!(
+                "module '{name}': trust must be a `${{file:<path>}}` source spec, got '{spec}'"
+            ))
+        })?;
+        let anchors = crate::trust_anchors::load_bundle(Path::new(path))
+            .map_err(|e| Error::Config(format!("module '{name}': trust: {e}")))?;
+        let blob = crate::trust_anchors::encode_ext(crate::trust_anchors::TAG_TRUST, &anchors);
+        if base + extra_len + blob.len() >= entry.len() {
+            return Err(Error::Config(format!(
+                "module '{name}': trust bundle '{path}' does not fit in the module entry"
+            )));
         }
+        entry[base + extra_len..base + extra_len + blob.len()].copy_from_slice(&blob);
+        extra_len += blob.len();
+        eprintln!(
+            "  trust: {path} ({} anchor(s), {} bytes)",
+            anchors.len(),
+            blob.len() - 4
+        );
     }
 
     // Tag 13: verify_hostname (ASCII string, extended TLV).

@@ -51,6 +51,26 @@ horizon = "exact"
 capability = "time.wall"
 when       = { peer_auth = ["ca_dns", "ca_uri"], clock_policy = "require" }
 
+# Trust anchors are the `trust` parameter (see `define_params!` in mod.rs):
+# a `${file:<path>}` source spec the build resolves to one certificate or
+# a bundle of up to MAX_ANCHORS (concatenated DER, or PEM) and embeds as
+# extended tag 12. A bundle is how a rotation is expressed — the outgoing
+# and incoming authorities side by side — and a chain signed by either
+# verifies. `fluxor run --ca` / `fluxor exec --ca` append an operator's
+# anchors under tag 16 to CLIENT-MODE instances only; a `verify_peer`
+# server is never widened. Both feed one table through one walk, and the
+# accepted-chain log line reports the count and the origin. `trust` is a
+# declared schema parameter rather than an opaque blob, so a
+# `[[requires_when]]` clause can gate on it. A refusal's reason comes from
+# the anchor the chain MATCHES (its subject is the top-most sent
+# certificate's issuer); an anchor the chain never reaches is skipped
+# unjudged, and with no match the reason is `unknown-ca`.
+#
+# Known classification edge, deliberately left: a P-256 key signed with
+# ecdsa-with-SHA384 is legal (RFC 5480) but x509.rs maps that OID to the
+# ECDSA_P384_SHA384 suite, which a P-256 key cannot sign, so such a chain
+# fails as `signature`. No public issuer does this.
+
 [[ports]]
 name = "cipher_in"
 direction = "input"

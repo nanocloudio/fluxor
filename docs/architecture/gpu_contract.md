@@ -61,12 +61,23 @@ debug with one.
 | Provider | Where | Backend | Advertises |
 |---|---|---|---|
 | `gpu_replay` | `modules/foundation/gpu_replay` | Byte arena, fixture transformation | compute, readback, device reset |
-| `linux_gpu` | `src/platform/linux/gpu.rs` (`--features host-gpu`) | wgpu on Vulkan, headless | compute, readback |
+| `linux_gpu` | `src/platform/linux/gpu.rs` (`--features host-gpu`) | wgpu on Vulkan, headless | compute, raster, compute→raster, readback, device reset |
 | `wasm_browser_compute` | `src/platform/wasm/gpu_compute.rs` | WebGPU, shared page device | compute, readback |
 
-None of them advertises raster, shared surfaces or preemption, because none
-implements them. A capability record is worth nothing if it reports the union
-of what some backend could manage.
+None of them advertises shared surfaces or preemption, because none implements
+them. A capability record is worth nothing if it reports the union of what some
+backend could manage.
+
+`linux_gpu` advertises raster because it executes it: pipelines built from the
+raster state descriptor below, passes with a colour and an optional depth
+attachment, indexed and non-indexed draws, and texture readback in the packed
+layout the resource accounting describes. It advertises `COMPUTE_TO_RASTER`
+because one buffer carrying both `USAGE_STORAGE` and `USAGE_VERTEX` is one
+device buffer with both usages, so a dispatch writes the geometry a later draw
+reads with no CPU detour. It advertises `DEVICE_RESET` because the reset polls
+the device to quiescence before destroying anything, and reclaims the old
+epoch's memory only after that poll returns — which is a demonstration, where
+recreating an adapter would have been a hope.
 
 `gpu_replay` exists for two reasons. It is the correctness oracle every other
 backend is held to — the same lifetime and fault corpus runs there with no
@@ -191,6 +202,22 @@ sharing the device's own decoder, so a pack the tool accepts is a pack that
 provider accepts. `validate --caps` checks against a capability record the
 device actually published, not against a hand-written description of it.
 
+A raster pipeline's `[backend state…]` tail is the `RasterState` descriptor:
+colour and depth format, vertex stride, topology, cull mode, front face,
+blend, depth comparison and write, and up to sixteen vertex attributes. It is
+allocated in the contract rather than per backend for the same reason the
+`FORMAT_*` enumeration is — state each provider numbered for itself would make
+the raster half unportable, and a consumer could not draw one scene through
+two providers. Its decoder refuses what it can check: a depth format in the
+colour slot, depth state with no attachment to honour it, an attribute running
+past the stride, two attributes at one location, an unallocated format.
+
+A depth attachment is pass-local. Nothing outside a pass names, binds, copies
+or reads one back, so `PASS_DEPTH` asks the provider to supply one against the
+target's extent instead of the handle table carrying it. A provider that
+cannot refuses the flag rather than drawing with the depth test quietly
+absent.
+
 WGSL is the portable browser/Linux source path. SPIR-V is not accepted by any
 provider here — it needs an exact-version validation story none of them has,
 so it is refused rather than half-supported. A direct V3D provider would
@@ -292,9 +319,11 @@ per-type arithmetic would be a second source of truth that drifts.
 
 Named here so nothing above reads as more than it is.
 
-- **Raster and presentation sinks.** The contract carries raster pipelines,
-  passes, draws and surface leases, and the device model validates them. No
-  provider executes them.
+- **Presentation sinks.** The contract carries surface leases and the device
+  model validates them. No provider exports one.
+- **Browser raster.** `linux_gpu` executes the raster half; the browser
+  provider does not yet, so a consumer drawing through both needs the native
+  one today.
 - **Direct V3D.** Bare-metal V3D does not inherit Linux's GPU services.
   Selecting MMIO, interrupts, power/clock/reset, address translation and cache
   policy needs silicon evidence from pinned sources and a rig, and the kernel

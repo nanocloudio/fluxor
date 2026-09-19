@@ -217,6 +217,9 @@ struct RunFlags {
     /// `Some(dir)` if `--list[=DIR]` was set on the command line.
     list: Option<PathBuf>,
     open: bool,
+    /// `--ca <PEM>`: operator anchors for client-mode tls/quic instances.
+    /// A linux graph or a bundle only.
+    ca: Option<PathBuf>,
 }
 
 impl RunFlags {
@@ -263,7 +266,16 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
                 "fluxor run <bundle>: scenario-only flags do not apply to a workload bundle".into(),
             ));
         }
-        return workload_src::run_bundle(config_path, verbose);
+        return workload_src::run_bundle_with_ca(config_path, flags.ca.as_deref(), verbose);
+    }
+
+    if flags.ca.is_some()
+        && (scenario::is_scenario_file(config_path)
+            || scenario::synthesize_from_graph(config_path)?.is_some())
+    {
+        return Err(Error::Config(
+            "fluxor run --ca applies to a graph or a bundle, not a scenario".into(),
+        ));
     }
 
     if scenario::is_scenario_file(config_path) {
@@ -289,7 +301,7 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
         )));
     }
 
-    cmd_run(config_path, verbose)
+    cmd_run(config_path, flags.ca.as_deref(), verbose)
 }
 
 /// Scenario flow for an in-memory `Scenario` synthesised from a graph
@@ -1034,7 +1046,7 @@ mod scenario_readiness_probe {
     }
 }
 
-fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
+fn cmd_run(config_path: &PathBuf, ca: Option<&Path>, verbose: bool) -> Result<()> {
     const QEMU_CONFIG_BLOB_ADDR: u64 = 0x6100_0000;
     const QEMU_MODULES_BLOB_ADDR: u64 = 0x6200_0000;
 
@@ -1045,11 +1057,25 @@ fn cmd_run(config_path: &PathBuf, verbose: bool) -> Result<()> {
 
     let result = build_one(config_path, None, verbose)?;
 
+    if ca.is_some() && result.family != "linux" {
+        return Err(Error::Config(
+            "fluxor run --ca: operator anchors apply to linux runs only".into(),
+        ));
+    }
+
     match result.family.as_str() {
         "linux" => {
             let out_dir = result.output_path.parent().unwrap();
-            let config_bin = out_dir.join("config.bin");
+            let mut config_bin = out_dir.join("config.bin");
             let modules_bin = out_dir.join("modules.bin");
+            // Operator anchors are appended to a copy of the built blob,
+            // named for what it is, so the build product itself carries
+            // exactly what the graph said.
+            if let Some(pem) = ca {
+                let widened = out_dir.join("config.operator.bin");
+                workload_src::write_widened_config(&config_bin, &widened, pem)?;
+                config_bin = widened;
+            }
             // Anchor to the resolved project root so `fluxor run <config>` finds
             // the runtime binary regardless of the caller's cwd.
             let linux_bin = crate::project::root_for_config(config_path)

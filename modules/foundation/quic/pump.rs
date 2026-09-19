@@ -1453,8 +1453,14 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
     // connection mutably. QuicState lives in stable module storage so
     // the pointers remain valid for the function's duration.
     let verify_peer = s.verify_peer != 0;
-    let trust_ptr = s.trust_cert.as_ptr();
-    let trust_len = if verify_peer { s.trust_cert_len } else { 0 };
+    // The anchor table is read through a raw pointer for the same reason
+    // the hostname is: the connection is borrowed mutably below, and the
+    // table is a disjoint field of stable module storage.
+    let anchors = if verify_peer {
+        anchor_set(&*(s as *const QuicState))
+    } else {
+        AnchorSet::empty()
+    };
     let host_ptr = s.verify_hostname.as_ptr();
     let host_len = if verify_peer {
         s.verify_hostname_len
@@ -1489,7 +1495,7 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
     }
     if verify_peer {
         let sys = &*sys_ptr;
-        if trust_len == 0 || host_len == 0 {
+        if anchors.is_empty() || host_len == 0 {
             // verify_peer requested but trust anchor or hostname is
             // absent — fail closed rather than silently skipping.
             let msg = b"[quic] cert chain FAIL no trust anchor / hostname";
@@ -1497,11 +1503,10 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
             conn.driver.hs_state = HandshakeState::Error;
             return true;
         }
-        let trust = core::slice::from_raw_parts(trust_ptr, trust_len);
         let host = core::slice::from_raw_parts(host_ptr, host_len);
         let mut deferred =
             core::mem::replace(&mut conn.driver.deferred_links, DeferredLinks::empty());
-        let rc = verify_cert_chain_with(body, trust, host, Some(&mut deferred));
+        let rc = verify_cert_chain_with(body, &anchors, host, Some(&mut deferred));
         conn.driver.deferred_links = deferred;
         if rc != 0 {
             let mut buf = [0u8; 48];
@@ -1534,7 +1539,9 @@ unsafe fn pump_recv_certificate(s: &mut QuicState, idx: usize) -> bool {
             conn.driver.hs_state = HandshakeState::Error;
             return true;
         }
-        let msg = b"[quic] cert chain OK";
+        // The walk accepted the chain; any link it deferred is still to
+        // be stepped, and the handshake is held below until it is.
+        let msg = b"[quic] cert chain walk OK";
         dev_log(sys, 3, msg.as_ptr(), msg.len());
     }
     // A chain whose RSA links were deferred is verified by the instance
@@ -1565,7 +1572,8 @@ unsafe fn pump_rsa_verify(s: &mut QuicState, idx: usize) -> bool {
     } else {
         s.rsa_rows_per_step as usize
     };
-    let anchor = core::slice::from_raw_parts(s.trust_cert.as_ptr(), s.trust_cert_len);
+    let selected = selected_anchor(s, s.conns[idx].driver.deferred_links.anchor);
+    let anchor = core::slice::from_raw_parts(selected.as_ptr(), selected.len());
     let job: *mut RsaVerifyJob = &mut s.rsa_verify;
     let ec_bits = ladder_bits_per_step(s);
     let outcome = rsa_verify_pump_core(&mut s.conns[idx].driver, &mut *job, anchor, rows, ec_bits);

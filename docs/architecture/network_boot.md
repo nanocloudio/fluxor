@@ -90,11 +90,28 @@ the pulled graph.
 
 The `tls` client needs an explicit peer-authentication profile, or it
 refuses to construct — `peer_auth: ca_dns` with the deployment CA in
-`trust_cert_file` and the registry's name in `verify_hostname`, or
-`peer_auth: pinned` with the registry's own certificate in
-`trust_cert_file`. A device with no synchronised wall clock must also
-choose `clock_policy: unchecked`, which states that certificate
-lifetimes are not enforced on it.
+`trust` and the registry's name in `verify_hostname`, or
+`peer_auth: pinned` with the registry's own certificate in `trust`.
+`trust` names its file as a source spec, `trust: "${file:pki/ca.der}"`,
+never as a bare path: the build reads the file and embeds its
+certificates, and a file that cannot be read or holds none fails the
+build naming the file and the instance. The file may be a bundle —
+concatenated DER, or PEM with several `CERTIFICATE` blocks — of up to
+eight anchors, which is how a CA rotation is expressed: the outgoing and
+incoming authorities side by side, and a chain signed by either verifies.
+(`trust_cert_file` is also accepted, and names the same file; the build
+prints a deprecation line for it, and refuses a module that carries
+both.) A device with no
+synchronised wall clock must also choose `clock_policy: unchecked`, which
+states that certificate lifetimes are not enforced on it.
+
+On a Linux host, `fluxor run --ca <pem>` and `fluxor exec --ca <pem>`
+append the PEM's certificates to the anchors of every client-mode `tls`
+and `quic` instance for that run. A server instance is never widened,
+whether or not it verifies its clients; there is no environment-variable
+form. The `tls` line that reports an accepted chain says how many anchors
+the instance held and where they came from (`source=deployment`,
+`deployment+operator`, or `operator`).
 
 ## The Registry Puller: ota_registry
 

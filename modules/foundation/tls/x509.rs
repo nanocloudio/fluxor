@@ -1697,6 +1697,65 @@ pub const PROFILE_CA_DNS: u8 = 2;
 pub const PROFILE_CA_URI: u8 = 3;
 pub const PROFILE_INSECURE_NO_VERIFY: u8 = 255;
 
+/// Most anchors one policy carries. A private domain has one; a rotation
+/// has two. The bound is what keeps the anchor table a fixed-size field of
+/// module state, and it is mirrored by the build tool, which refuses a
+/// larger bundle before it reaches a module.
+pub const MAX_ANCHORS: usize = 8;
+
+/// The anchors a policy verifies against: up to [`MAX_ANCHORS`] DER
+/// certificates, in configured order. Held by value so a policy can be
+/// built from module state without a second borrow to keep alive.
+#[derive(Clone, Copy)]
+pub struct AnchorSet<'a> {
+    ders: [&'a [u8]; MAX_ANCHORS],
+    len: usize,
+}
+
+impl<'a> AnchorSet<'a> {
+    pub const fn empty() -> Self {
+        Self {
+            ders: [&[]; MAX_ANCHORS],
+            len: 0,
+        }
+    }
+
+    /// A set of exactly one anchor.
+    pub fn one(der: &'a [u8]) -> Self {
+        let mut set = Self::empty();
+        set.ders[0] = der;
+        set.len = 1;
+        set
+    }
+
+    /// Append an anchor; `false` when the set is full.
+    pub fn push(&mut self, der: &'a [u8]) -> bool {
+        if self.len >= MAX_ANCHORS {
+            return false;
+        }
+        self.ders[self.len] = der;
+        self.len += 1;
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The anchor at `i`; empty past the end.
+    pub fn get(&self, i: usize) -> &'a [u8] {
+        if i < self.len {
+            self.ders[i]
+        } else {
+            &[]
+        }
+    }
+}
+
 /// Required extended key usage on the end entity.
 pub const EKU_SERVER_AUTH: u8 = 0;
 pub const EKU_CLIENT_AUTH: u8 = 1;
@@ -1706,10 +1765,11 @@ pub const EKU_CLIENT_AUTH: u8 = 1;
 /// no name is refused, not silently downgraded.
 pub struct ChainPolicy<'a> {
     pub profile: u8,
-    /// DER of the configured anchor. Under `PROFILE_PINNED` this is the
-    /// certificate whose subject public key is pinned; under
-    /// `PROFILE_CA_DNS` it is the certificate authority.
-    pub anchor_der: &'a [u8],
+    /// The configured anchors, DER. Under `PROFILE_PINNED` each is a
+    /// certificate whose subject public key is pinned; under the CA
+    /// profiles each is a certificate authority. Tried in order under one
+    /// match rule; see [`verify_chain_with`].
+    pub anchors: AnchorSet<'a>,
     /// Expected DNS name, for `PROFILE_CA_DNS`. Empty means "no name rule",
     /// which is the mTLS server case.
     pub expected_dns: &'a [u8],
@@ -1759,17 +1819,18 @@ fn check_suites(cert: &X509Cert<'_>, policy: &ChainPolicy<'_>) -> u32 {
 pub const LINK_IN_MESSAGE: u8 = 0;
 pub const LINK_IN_ANCHOR: u8 = 1;
 
-/// One signature the chain walk left for a stepped job — RSA, or ECDSA
-/// P-256, which on the slowest target is the more expensive of the two:
-/// the certificate it is over, the key that made it, and the suite. Offsets
-/// rather than slices, because the job outlives the call that found them
-/// and the message buffer is the only place the bytes are.
+/// One signature the chain walk left for a stepped job — RSA PKCS#1 with
+/// SHA-256 or SHA-384, or ECDSA P-256 / P-384, the four suites the stepped
+/// verifier drives: the certificate it is over, the key that made it, and
+/// the suite. Offsets rather than slices, because the job outlives the call
+/// that found them and the message buffer is the only place the bytes are.
 #[derive(Clone, Copy)]
 pub struct DeferredLink {
     /// `LINK_IN_MESSAGE` for the subject certificate (always) and
     /// where the issuer key is read from.
     pub issuer_source: u8,
-    /// The signature suite (`RSA_PKCS1_SHA256` or `RSA_PKCS1_SHA384`).
+    /// The signature suite: `RSA_PKCS1_SHA256`, `RSA_PKCS1_SHA384`,
+    /// `ECDSA_P256_SHA256` or `ECDSA_P384_SHA384`.
     pub sig_suite: u16,
     /// `tbsCertificate` of the subject, within the message.
     pub tbs_off: u16,
@@ -1796,11 +1857,23 @@ impl DeferredLink {
 }
 
 /// The links a walk deferred, in chain order.
+///
+/// While [`pending`](Self::pending) is true the chain is accepted only
+/// conditionally: the walk decided everything but these signatures, and
+/// nothing the chain asserts holds until the last of them verifies. A
+/// caller that stops stepping, or that treats a stepped failure as
+/// anything but a refusal, has accepted an unverified chain.
 pub struct DeferredLinks {
     pub links: [DeferredLink; MAX_CHAIN_LEN],
     pub len: u8,
     /// The next link to verify.
     pub next: u8,
+    /// Index into the policy's [`AnchorSet`] of the anchor the chain was
+    /// accepted under. A link whose issuer is `LINK_IN_ANCHOR` reads its
+    /// key from that anchor and no other, so the choice is made once, when
+    /// the chain is walked, and held here for as long as the links are
+    /// stepped.
+    pub anchor: u8,
 }
 
 impl DeferredLinks {
@@ -1809,12 +1882,14 @@ impl DeferredLinks {
             links: [DeferredLink::EMPTY; MAX_CHAIN_LEN],
             len: 0,
             next: 0,
+            anchor: 0,
         }
     }
 
     pub fn clear(&mut self) {
         self.len = 0;
         self.next = 0;
+        self.anchor = 0;
     }
 
     pub fn pending(&self) -> bool {
@@ -1842,6 +1917,12 @@ struct LinkMode<'a> {
     message: &'a [u8],
     anchor: &'a [u8],
     deferred: Option<&'a mut DeferredLinks>,
+    /// Whether the link INTO the anchor may be deferred. It may not when
+    /// another anchor shares this one's subject: a deferred signature is
+    /// recorded against one key and verified later, so the walk could not
+    /// tell the two apart and would pick one blindly. Verifying that link
+    /// now is what lets the next candidate be tried.
+    defer_anchor_link: bool,
 }
 
 impl LinkMode<'_> {
@@ -1862,7 +1943,10 @@ impl LinkMode<'_> {
                 | suite::ECDSA_P256_SHA256
                 | suite::ECDSA_P384_SHA384
         );
-        if !steppable || self.deferred.is_none() {
+        let defer = steppable
+            && self.deferred.is_some()
+            && (issuer_source != LINK_IN_ANCHOR || self.defer_anchor_link);
+        if !defer {
             return if verify_cert_signature(subject_der, issuer.key_suite, issuer.public_key) {
                 CERT_OK
             } else {
@@ -1987,17 +2071,25 @@ pub fn verify_chain(cert_msg_body: &[u8], policy: &ChainPolicy<'_>) -> u32 {
 /// once every deferred link verifies". Everything else — shape, names,
 /// policy, lifetimes, and every non-RSA signature — is decided here, so a
 /// caller stepping the deferred links has nothing left to check but them.
+///
+/// Every anchor in the policy is tried under one rule, in configured
+/// order: the chain is anchored where a certificate the peer sent matches
+/// an anchor by public key AND subject, or else the top-most certificate
+/// it sent must name the anchor's subject as its issuer. An anchor the
+/// chain never reaches is not a candidate: it is skipped unjudged and
+/// decides no reason. A candidate the chain fails under decides the
+/// reason, unless a later candidate accepts it; with no candidate the
+/// reason is `unknown-ca`. That is what lets two anchors with one subject
+/// name — a key rollover, a cross-signed root — both work: the chain is
+/// accepted under whichever key signed it. On acceptance the index of the
+/// deciding anchor is recorded in `deferred`, so a stepped verifier reads
+/// the anchor the walk chose.
 pub fn verify_chain_with(
     cert_msg_body: &[u8],
     policy: &ChainPolicy<'_>,
-    deferred: Option<&mut DeferredLinks>,
+    mut deferred: Option<&mut DeferredLinks>,
 ) -> u32 {
-    let mut mode = LinkMode {
-        message: cert_msg_body,
-        anchor: policy.anchor_der,
-        deferred,
-    };
-    if let Some(d) = mode.deferred.as_deref_mut() {
+    if let Some(d) = deferred.as_deref_mut() {
         d.clear();
     }
     if policy.profile == PROFILE_NONE {
@@ -2006,6 +2098,122 @@ pub fn verify_chain_with(
     if policy.profile == PROFILE_INSECURE_NO_VERIFY {
         return CERT_OK;
     }
+    // Only a MATCHING anchor is a candidate, and only a candidate decides
+    // the reason. An anchor the chain never reaches is skipped before
+    // anything about it is judged: were it judged, an anchor of a suite
+    // this build cannot verify would report `unsupported-suite` for every
+    // refusal of a chain that was never its to refuse, a missing EKU and a
+    // wrong name included. With no candidate at all the reason is
+    // `unknown-ca`.
+    let mut reason = CERT_ERR_NO_ANCHOR;
+    let mut i = 0;
+    while i < policy.anchors.len() {
+        if !anchor_matches(cert_msg_body, policy.anchors.get(i), policy.profile) {
+            i += 1;
+            continue;
+        }
+        if let Some(d) = deferred.as_deref_mut() {
+            d.clear();
+        }
+        // The link into an anchor that shares its subject with another
+        // is verified now rather than deferred: deferred, it would be
+        // recorded against this key and fail later, after the walk had
+        // already committed to it.
+        let defer_anchor_link = same_subject_count(&policy.anchors, i) < 2;
+        let rc = verify_chain_against(
+            cert_msg_body,
+            policy,
+            policy.anchors.get(i),
+            defer_anchor_link,
+            deferred.as_deref_mut(),
+        );
+        if rc == CERT_OK {
+            if let Some(d) = deferred {
+                d.anchor = i as u8;
+            }
+            return CERT_OK;
+        }
+        reason = rc;
+        i += 1;
+    }
+    reason
+}
+
+/// Whether `anchor_der` is a candidate for the chain in `cert_msg_body`:
+/// the match rule of the walk, asked before the walk. Under a CA profile
+/// the peer either sent the anchor itself — a certificate whose public key
+/// AND subject equal the anchor's — or the top-most certificate it sent
+/// names the anchor's subject as its issuer. Under `PROFILE_PINNED` every
+/// anchor is a candidate: the pin comparison IS the verdict, and a key
+/// that matches no pin is refused as `pin-mismatch`, not as an unknown
+/// authority. A chain or an anchor that does not parse is left to the
+/// walk, which refuses it for what it is.
+fn anchor_matches(cert_msg_body: &[u8], anchor_der: &[u8], profile: u8) -> bool {
+    if profile == PROFILE_PINNED {
+        return true;
+    }
+    let mut chain: [&[u8]; MAX_CHAIN_LEN] = [&[]; MAX_CHAIN_LEN];
+    let n = match parse_cert_chain(cert_msg_body, &mut chain) {
+        Ok(n) if n > 0 => n,
+        _ => return true,
+    };
+    let Some(anchor) = parse_certificate(anchor_der) else {
+        return true;
+    };
+    let mut i = 0;
+    while i < n {
+        let Some(cert) = parse_certificate(chain[i]) else {
+            return true;
+        };
+        if pubkey_eq(cert.public_key, anchor.public_key)
+            && der_bytes_eq(cert.subject_raw, anchor.subject_raw)
+        {
+            return true;
+        }
+        if i + 1 == n {
+            return der_bytes_eq(cert.issuer_raw, anchor.subject_raw);
+        }
+        i += 1;
+    }
+    false
+}
+
+/// How many anchors in `set` carry the subject name of the one at `i`,
+/// itself included. An anchor that does not parse counts as itself only;
+/// the walk refuses it for that.
+fn same_subject_count(set: &AnchorSet<'_>, i: usize) -> usize {
+    let Some(this) = parse_certificate(set.get(i)) else {
+        return 1;
+    };
+    let mut n = 0;
+    let mut k = 0;
+    while k < set.len() {
+        if let Some(other) = parse_certificate(set.get(k)) {
+            if der_bytes_eq(other.subject_raw, this.subject_raw) {
+                n += 1;
+            }
+        }
+        k += 1;
+    }
+    n
+}
+
+/// [`verify_chain_with`] against one anchor. `CERT_ERR_NO_ANCHOR` means the
+/// chain never reached `anchor_der` under the match rule; every other code
+/// is a decision about a chain that did.
+fn verify_chain_against(
+    cert_msg_body: &[u8],
+    policy: &ChainPolicy<'_>,
+    anchor_der: &[u8],
+    defer_anchor_link: bool,
+    deferred: Option<&mut DeferredLinks>,
+) -> u32 {
+    let mut mode = LinkMode {
+        message: cert_msg_body,
+        anchor: anchor_der,
+        deferred,
+        defer_anchor_link,
+    };
 
     let mut chain: [&[u8]; MAX_CHAIN_LEN] = [&[]; MAX_CHAIN_LEN];
     let n = match parse_cert_chain(cert_msg_body, &mut chain) {
@@ -2016,7 +2224,7 @@ pub fn verify_chain_with(
         return CERT_ERR_EMPTY_CHAIN;
     }
 
-    let anchor = match parse_certificate(policy.anchor_der) {
+    let anchor = match parse_certificate(anchor_der) {
         Some(c) => c,
         None => return CERT_ERR_ANCHOR_MALFORMED,
     };
@@ -2125,7 +2333,7 @@ pub fn verify_chain_with(
         if !der_bytes_eq(cur.issuer_raw, anchor.subject_raw) {
             return CERT_ERR_NO_ANCHOR;
         }
-        let rc = check_ca_shape(&anchor, policy.anchor_der, depth);
+        let rc = check_ca_shape(&anchor, anchor_der, depth);
         if rc != CERT_OK {
             return rc;
         }
@@ -2312,16 +2520,16 @@ pub fn parse_cert_chain<'a>(
 /// with validity unchecked.
 pub fn verify_cert_chain(
     cert_msg_body: &[u8],
-    trust_anchor_der: &[u8],
+    anchors: &AnchorSet<'_>,
     expected_hostname: &[u8],
 ) -> u32 {
-    verify_cert_chain_with(cert_msg_body, trust_anchor_der, expected_hostname, None)
+    verify_cert_chain_with(cert_msg_body, anchors, expected_hostname, None)
 }
 
 /// As [`verify_cert_chain`], deferring RSA links (see [`verify_chain_with`]).
 pub fn verify_cert_chain_with(
     cert_msg_body: &[u8],
-    trust_anchor_der: &[u8],
+    anchors: &AnchorSet<'_>,
     expected_hostname: &[u8],
     deferred: Option<&mut DeferredLinks>,
 ) -> u32 {
@@ -2329,7 +2537,7 @@ pub fn verify_cert_chain_with(
         cert_msg_body,
         &ChainPolicy {
             profile: PROFILE_CA_DNS,
-            anchor_der: trust_anchor_der,
+            anchors: *anchors,
             expected_dns: expected_hostname,
             expected_uri: &[],
             allowed_suites: suite::IMPLEMENTED,

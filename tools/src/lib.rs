@@ -84,6 +84,7 @@ pub mod target;
 pub mod target_facts;
 pub mod text_distance;
 pub mod trust;
+pub mod trust_anchors;
 pub mod workload;
 pub mod workspace;
 

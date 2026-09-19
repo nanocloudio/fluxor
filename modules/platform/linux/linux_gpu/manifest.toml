@@ -2,12 +2,14 @@ version = "1.0.0"
 hardware_targets = ["linux"]
 builtin = true
 
-# Native GPU compute over wgpu/Vulkan, headless.
+# Native GPU compute and raster over wgpu/Vulkan, headless.
 #
 # The generic GPU contract (`modules/sdk/wire/gpu_wire.rs`) on a real
 # device, with no display, no swapchain and no window: a compute graph builds
 # and runs here on a Pi 5's V3D exactly as it does on a discrete card, because
-# nothing in the path touches presentation.
+# nothing in the path touches presentation. Raster runs the same way — a pass
+# draws into a texture this provider owns, and reading that texture back is a
+# consumer's choice rather than a step in the path.
 #
 # Validation, handles, views, sealing, residency, fences, dependency order,
 # candidate-output commit and epochs are the shared cores — the same code the
@@ -20,7 +22,7 @@ builtin = true
 # still frames the protocol, answering every request with a rejection rather
 # than accepting work nothing will run or discarding it silently.
 
-capabilities = ["gpu.compute"]
+capabilities = ["gpu.compute", "gpu.render"]
 
 [capability_facts."gpu.compute"]
 backend  = "wgpu_native"
@@ -28,6 +30,16 @@ readback = "yes"
 # No device-resident surface is handed to a sink. Importing one needs
 # dma-buf export and format/modifier negotiation this provider has not
 # demonstrated, and wgpu's availability is not evidence of either.
+shared_surface = "no"
+
+# Raster is composed independently of compute, so a graph that only draws and
+# a graph that only computes each get what they asked for and nothing else.
+# The same device backs both, which is what lets a compute output be bound as
+# geometry without a CPU detour; sharing a device does not merge the two
+# capabilities' facts.
+[capability_facts."gpu.render"]
+backend  = "wgpu_native"
+readback = "yes"
 shared_surface = "no"
 
 [[ports]]
