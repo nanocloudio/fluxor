@@ -49,7 +49,8 @@
 //!
 //! # DNS over TLS (RFC 7858)
 //!
-//! `upstream_tls = 1` forwards on the stream leg (`tls_in` / `tls_out`),
+//! `upstream_transport = tls | https` forwards on the stream leg (`tls_in` /
+//! `tls_out`),
 //! which a graph wires through a client-mode `tls`, instead of over UDP/53.
 //! `upstream_authority` — `host[:port]`, port 853 when it names none — is
 //! dialled with `CMD_CONNECT_TO` from the step rather than from a query, so
@@ -139,8 +140,11 @@
 //! | 10  | update_durability | u8 enum | (unset) | `volatile` or `durable`; required with `update_zone` |
 //! | 11  | update_allow | str | (none)  | `"keyname=name-suffix,TYPE,TYPE"` (repeatable, `MAX_UPDATE_KEYS`); `*` admits every type. The key is vault label `dns/tsig/<keyname>` |
 //! | 12  | update_path | str | dns_zone.fxz | File the durable generation is committed to through the `fs` contract |
-//! | 13  | upstream_tls | u8 | 0 | Forward over DNS-over-TLS on the stream leg instead of UDP/53 |
-//! | 14  | upstream_authority | str | (none) | DoT upstream, `host[:port]` (port 853 by default); required with `upstream_tls` |
+//! | 13  | upstream_transport | u8 | udp | `udp` \| `tls` (RFC 7858) \| `https` (RFC 8484) |
+//! | 14  | upstream_authority | str | (none) | Encrypted upstream, `host[:port]` (853 for tls, 443 for https); required for both |
+//! | 15  | upstream_path | str | /dns-query | DoH endpoint path (RFC 8484 makes it server-specific) |
+//! | 16  | dnssec | u8 enum | off | `off` \| `validate`; under `validate` an answer whose signature fails is refused with SERVFAIL |
+//! | 17  | dnssec_anchor | str | (none) | Trust anchor, `"<zone> <flags> <protocol> <algorithm> <base64 key>"` (repeatable, `MAX_ANCHORS`); the key must be the DNSKEY that signs the zone's answers |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -174,6 +178,19 @@ use dns_wire::*;
 #[path = "../../sdk/contracts/net/net_proto.rs"]
 mod net_proto;
 
+// DNSSEC validation. Mounted flat, as the crypto it calls is: the validator
+// answers a verdict and this module decides what to do about one.
+include!("../../sdk/crypto/b64.rs");
+include!("../../sdk/crypto/hmac.rs");
+include!("../../sdk/crypto/sha1.rs");
+include!("../../sdk/crypto/sha256.rs");
+include!("../../sdk/crypto/sha384.rs");
+include!("../../sdk/crypto/p256.rs");
+include!("../../sdk/crypto/p384.rs");
+include!("../../sdk/crypto/ed25519.rs");
+include!("../../sdk/crypto/rsa.rs");
+include!("../../sdk/contracts/net/dnssec.rs");
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -195,10 +212,50 @@ const UPSTREAM_AUTHORITY_MAX: usize = 64;
 /// The port RFC 7858 assigns DNS-over-TLS, used when the authority names
 /// none.
 const DOT_DEFAULT_PORT: u16 = 853;
+/// The port RFC 8484 uses, being ordinary HTTPS.
+const DOH_DEFAULT_PORT: u16 = 443;
+/// `upstream_transport` values.
+const TRANSPORT_UDP: u8 = 0;
+const TRANSPORT_TLS: u8 = 1;
+const TRANSPORT_HTTPS: u8 = 2;
+/// Longest DoH endpoint path.
+const UPSTREAM_PATH_MAX: usize = 64;
+/// Room for the byte string an RRSIG signs.
+const DNSSEC_SIGNED_MAX: usize = 4096;
+/// Trust anchors a deployment may configure.
+const MAX_ANCHORS: usize = 4;
+/// Longest DNSKEY RDATA an anchor may carry (flags/proto/alg + key).
+const MAX_ANCHOR_RDATA: usize = 1028;
+
+/// One configured trust anchor: the zone it speaks for, and the key.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TrustAnchor {
+    /// Canonical wire-form zone name.
+    zone: [u8; MAX_NAME_LEN + 1],
+    zone_len: u8,
+    rdata: [u8; MAX_ANCHOR_RDATA],
+    rdata_len: u16,
+}
+
+impl TrustAnchor {
+    const fn new() -> Self {
+        Self {
+            zone: [0; MAX_NAME_LEN + 1],
+            zone_len: 0,
+            rdata: [0; MAX_ANCHOR_RDATA],
+            rdata_len: 0,
+        }
+    }
+}
 /// Reassembly room for the stream leg: two whole messages and their length
 /// prefixes, so a frame carrying the tail of one and the head of the next
 /// never has to be refused.
-const DOT_RX_BYTES: usize = 2 * (DNS_MAX_PACKET + 2);
+const DOT_RX_BYTES: usize = 2 * (DNS_MAX_PACKET + 2) + DOH_HEAD_BYTES;
+/// Room for one HTTP response head. A DoH answer's head is small, but a
+/// server may send more headers than the minimum and the reassembly window
+/// has to hold a whole one before the body can be found.
+const DOH_HEAD_BYTES: usize = 1024;
 /// How long after a failed dial before another is attempted. A resolver
 /// that redialled every step would turn a refusing upstream into a flood.
 const DOT_REDIAL_MS: u32 = 1000;
@@ -403,18 +460,72 @@ mod params_def {
         // It is not DNSSEC. Whether the peer is also AUTHENTICATED is the
         // `tls` instance's `peer_auth` / `trust` configuration and not
         // something this module can see; encrypted is not authenticated.
-        13, upstream_tls, u8, 0
-            => |s, d, len| { s.upstream_tls = p_u8(d, len, 0, 0); };
+        // `https` (RFC 8484) is the same stream leg carrying one HTTP POST
+        // per query instead of a length prefix. One parameter and not a
+        // flag per transport: a flag each would let a deployment ask for
+        // two at once and mean nothing by it.
+        13, upstream_transport, u8, 0,
+            enum { udp=0, tls=1, https=2 }
+            => |s, d, len| { s.upstream_transport = p_u8(d, len, 0, 0); };
 
         // The upstream's authority, `host[:port]`, for the dial and
         // therefore for the identity the `tls` leg expects of its peer. A
         // name or an IP literal is accepted (`net_proto::Target::parse`
         // decides which); a name is resolved by the provider at the far end
-        // of the leg, not here. Required under `upstream_tls`, because a
+        // of the leg, not here. Required under either encrypted transport,
+        // because a
         // dial needs a destination — the check is that it is present, not
         // that it is a name.
         14, upstream_authority, str, 0
             => |s, d, len| { super::parse_upstream_authority(s, d, len); };
+
+        // The DoH endpoint's path. RFC 8484 makes this server-specific:
+        // `/dns-query` is what the well-known resolvers answer on and the
+        // default here, but it is not a constant anyone may assume.
+        15, upstream_path, str, 0
+            => |s, d, len| { super::parse_upstream_path(s, d, len); };
+
+        // Validate the DNSSEC signatures on forwarded answers.
+        //
+        // `validate` is fail-CLOSED for what it can judge: an answer whose
+        // signature fails against an anchored zone's key is SERVFAIL, never
+        // passed on. A validator that forwards what it could not verify
+        // produces the same logs as one that works, and tells an operator
+        // nothing.
+        //
+        // The other half is worth saying plainly: an answer this cannot
+        // judge — an unanchored signer, or one arriving with no signature
+        // at all — is relayed, without the AD bit. Nothing here detects an
+        // upstream that strips signatures from a zone it has no anchor
+        // for, because with no DS chain there is nothing to detect it
+        // with.
+        //
+        // What it can validate is bounded by `dnssec_anchor`: see there.
+        16, dnssec, u8, 0,
+            enum { off=0, validate=1 }
+            => |s, d, len| { s.dnssec = p_u8(d, len, 0, 0); };
+
+        // A zone's key, as an anchor. Repeatable; presentation format, the
+        // same text `dig DNSKEY` prints:
+        //
+        //     "example.com. 257 3 13 <base64 key>"
+        //
+        // An answer is validated when its signer is a zone anchored here.
+        // Signatures for any other zone are NOT validated and NOT claimed
+        // as validated — the answer goes through without the AD bit, which
+        // is what `Indeterminate` means on the wire.
+        //
+        // The key must be the one the zone SIGNS ITS ANSWERS with, because
+        // no DS or DNSKEY chain is walked: the anchor is used directly as
+        // the verifying key. A zone that signs with a separate ZSK is
+        // anchored by that ZSK, not by the KSK a DS points at. Anchoring
+        // the wrong key of a pair does not fail quietly — every answer for
+        // the zone becomes Bogus and is refused.
+        //
+        // One anchor per zone is consulted: the first that matches the
+        // signer. Two entries for one zone do not make a rollover work.
+        17, dnssec_anchor, str, 0
+            => |s, d, len| { super::parse_dnssec_anchor(s, d, len); };
     }
 }
 
@@ -713,12 +824,32 @@ struct DnsState {
     upstream_ep: DatagramEndpoint,
 
     // ── DNS over TLS (RFC 7858) ──
-    /// 1 when forwarding goes over the stream leg instead of UDP.
-    upstream_tls: u8,
+    /// How a forwarded query travels: `udp`, `tls` (RFC 7858) or `https`
+    /// (RFC 8484). The two encrypted modes share the stream leg.
+    upstream_transport: u8,
     /// The upstream's authority, `host[:port]` — a name or an IP literal —
     /// dialled on the stream leg. 853 is the port a value naming none gets.
     upstream_authority: [u8; UPSTREAM_AUTHORITY_MAX],
     upstream_authority_len: u8,
+    /// The DoH endpoint's path; empty means `/dns-query`.
+    upstream_path: [u8; UPSTREAM_PATH_MAX],
+    upstream_path_len: u8,
+
+    // ── DNSSEC ──
+    /// `off` or `validate`.
+    dnssec: u8,
+    /// Configured trust anchors: a zone name in canonical wire form and the
+    /// DNSKEY RDATA it is anchored by.
+    anchors: [TrustAnchor; MAX_ANCHORS],
+    anchor_count: u8,
+    /// Answers validated, and answers refused for failing validation. The
+    /// second is the one to alert on: it is a broken zone or an attack.
+    dnssec_secure: u32,
+    dnssec_bogus: u32,
+    /// A copy of an answer being refused, with the client's transaction id
+    /// stamped on. Separate from `tx_buf` because that is where the refusal
+    /// is BUILT, and a builder must not read from what it is writing to.
+    fail_buf: [u8; DNS_MAX_PACKET],
     /// The stream leg: a graph wires these through `tls` to the network.
     tls_in_chan: i32,
     tls_out_chan: i32,
@@ -822,8 +953,13 @@ impl DnsState {
         self.host_count = 0;
         self.server_ep = DatagramEndpoint::new();
         self.upstream_ep = DatagramEndpoint::new();
-        self.upstream_tls = 0;
+        self.upstream_transport = TRANSPORT_UDP;
         self.upstream_authority_len = 0;
+        self.upstream_path_len = 0;
+        self.dnssec = 0;
+        self.anchor_count = 0;
+        self.dnssec_secure = 0;
+        self.dnssec_bogus = 0;
         self.tls_in_chan = -1;
         self.tls_out_chan = -1;
         self.dot_conn_id = 0;
@@ -1519,6 +1655,255 @@ unsafe fn dot_pump(s: &mut DnsState) {
     }
 }
 
+/// Make sure the query in `buf` carries an OPT record with the DO bit.
+///
+/// Answers the new length. A query that already has an OPT has its DO bit
+/// set in place; one without gets an OPT appended. A query this cannot fit
+/// an OPT into is left exactly as it was, which is honest: the answer will
+/// then be unsigned and validation will say Indeterminate rather than
+/// claiming anything.
+///
+/// # Safety
+/// `buf` is writable for at least `DNS_MAX_PACKET` bytes and holds a query
+/// of `pkt_len` bytes whose question ends at `question_end`.
+unsafe fn ensure_do_bit(s: &DnsState, buf: *mut u8, pkt_len: usize, question_end: usize) -> usize {
+    let header = match read_header(core::slice::from_raw_parts(buf, pkt_len)) {
+        Some(h) => h,
+        None => return pkt_len,
+    };
+    // Walk the additional section for an existing OPT.
+    let skip = usize::from(header.ancount) + usize::from(header.nscount);
+    if let Some(mut at) = skip_rrs(buf, pkt_len, question_end, skip) {
+        let mut i = 0u16;
+        let mut name_buf = [0u8; MAX_NAME_LEN + 1];
+        while i < header.arcount && i < MAX_SECTION_RRS as u16 {
+            let Some(rr) = parse_rr(buf, pkt_len, at, name_buf.as_mut_ptr()) else {
+                break;
+            };
+            if rr.rtype == QTYPE_OPT {
+                // The flags are the low 16 bits of the TTL field, which
+                // starts 4 bytes before the RDLEN at `rdata_off - 2`.
+                let flags_at = rr.rdata_off - 4;
+                let flags = u16::from_be_bytes([*buf.add(flags_at), *buf.add(flags_at + 1)]);
+                let set = (flags | EDNS_DO).to_be_bytes();
+                *buf.add(flags_at) = set[0];
+                *buf.add(flags_at + 1) = set[1];
+                return pkt_len;
+            }
+            at = rr.next;
+            i += 1;
+        }
+    }
+    // No OPT: append one. `[root][type][class=udpsize][ttl][rdlen=0]`.
+    const OPT_LEN: usize = 11;
+    if pkt_len + OPT_LEN > DNS_MAX_PACKET {
+        let m: &[u8] = b"[dns] no room for an OPT record; forwarding without the DO bit";
+        dev_log(s.sys(), 1, m.as_ptr(), m.len());
+        return pkt_len;
+    }
+    let mut at = pkt_len;
+    *buf.add(at) = 0; // root owner
+    at += 1;
+    let t = QTYPE_OPT.to_be_bytes();
+    *buf.add(at) = t[0];
+    *buf.add(at + 1) = t[1];
+    at += 2;
+    // Class carries the advertised UDP payload size.
+    let size = (DNS_MAX_PACKET as u16).to_be_bytes();
+    *buf.add(at) = size[0];
+    *buf.add(at + 1) = size[1];
+    at += 2;
+    // TTL: extended rcode, version, then the flags with DO set.
+    *buf.add(at) = 0;
+    *buf.add(at + 1) = 0;
+    let flags = EDNS_DO.to_be_bytes();
+    *buf.add(at + 2) = flags[0];
+    *buf.add(at + 3) = flags[1];
+    at += 4;
+    *buf.add(at) = 0;
+    *buf.add(at + 1) = 0;
+    at += 2;
+    // One more record in the additional section.
+    let arcount = header.arcount.wrapping_add(1).to_be_bytes();
+    *buf.add(10) = arcount[0];
+    *buf.add(11) = arcount[1];
+    at
+}
+
+/// Parse one trust anchor in presentation format:
+/// `"<zone> <flags> <protocol> <algorithm> <base64 key>"`.
+///
+/// Anything malformed is DROPPED rather than stored. A half-read anchor is
+/// worse than none: it would make every answer for that zone Bogus, and the
+/// resolver would look broken rather than misconfigured. A missing field, a
+/// key that is not base64 and a zone that is not a name each say so in the
+/// log; a numeric field that is not a number, and a key too long for
+/// `MAX_ANCHOR_RDATA`, are dropped without one. The algorithm and protocol
+/// are read as decimal and kept as the low byte.
+unsafe fn parse_dnssec_anchor(s: &mut DnsState, d: *const u8, len: usize) {
+    if s.anchor_count as usize >= MAX_ANCHORS {
+        let m: &[u8] = b"[dns] more dnssec_anchor entries than this build holds; extra ignored";
+        dev_log(s.sys(), 1, m.as_ptr(), m.len());
+        return;
+    }
+    let text = core::slice::from_raw_parts(d, len);
+    let mut fields = [0usize; 5];
+    let mut ends = [0usize; 5];
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < text.len() && count < 5 {
+        while i < text.len() && text[i] == b' ' {
+            i += 1;
+        }
+        if i >= text.len() {
+            break;
+        }
+        fields[count] = i;
+        // The key is the last field and may itself contain spaces when a
+        // presentation-format record was wrapped; everything from here on
+        // is the key.
+        if count == 4 {
+            ends[count] = text.len();
+            count += 1;
+            break;
+        }
+        while i < text.len() && text[i] != b' ' {
+            i += 1;
+        }
+        ends[count] = i;
+        count += 1;
+    }
+    if count < 5 {
+        let m: &[u8] =
+            b"[dns] dnssec_anchor needs: <zone> <flags> <protocol> <algorithm> <base64 key>";
+        dev_log(s.sys(), 1, m.as_ptr(), m.len());
+        return;
+    }
+    let field = |n: usize| -> &[u8] { &text[fields[n]..ends[n]] };
+    let Some(flags) = decimal_u16(field(1)) else {
+        return;
+    };
+    let Some(protocol) = decimal_u16(field(2)) else {
+        return;
+    };
+    let Some(algorithm) = decimal_u16(field(3)) else {
+        return;
+    };
+    // Base64 with any embedded spaces removed, which a wrapped record has.
+    let mut packed = [0u8; MAX_ANCHOR_RDATA * 2];
+    let mut packed_len = 0usize;
+    for &b in field(4) {
+        if b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
+            continue;
+        }
+        if packed_len >= packed.len() {
+            return;
+        }
+        packed[packed_len] = b;
+        packed_len += 1;
+    }
+    let mut key = [0u8; MAX_ANCHOR_RDATA];
+    let Some(key_len) = b64_decode(&packed[..packed_len], &mut key) else {
+        let m: &[u8] = b"[dns] dnssec_anchor key is not base64";
+        dev_log(s.sys(), 1, m.as_ptr(), m.len());
+        return;
+    };
+    if 4 + key_len > MAX_ANCHOR_RDATA {
+        return;
+    }
+    let idx = s.anchor_count as usize;
+    let slot = &mut s.anchors[idx];
+    // The zone in canonical wire form, which is what a signer name is
+    // compared against.
+    let Some(zone_len) = dotted_to_canonical_wire(field(0), &mut slot.zone) else {
+        let m: &[u8] = b"[dns] dnssec_anchor zone is not a name";
+        dev_log(s.sys(), 1, m.as_ptr(), m.len());
+        return;
+    };
+    slot.zone_len = zone_len as u8;
+    slot.rdata[0..2].copy_from_slice(&flags.to_be_bytes());
+    slot.rdata[2] = protocol as u8;
+    slot.rdata[3] = algorithm as u8;
+    slot.rdata[4..4 + key_len].copy_from_slice(&key[..key_len]);
+    slot.rdata_len = (4 + key_len) as u16;
+    s.anchor_count += 1;
+}
+
+/// A decimal field, or `None` when it is not one.
+fn decimal_u16(text: &[u8]) -> Option<u16> {
+    if text.is_empty() || text.len() > 5 {
+        return None;
+    }
+    let mut v = 0u32;
+    for &b in text {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + u32::from(b - b'0');
+        if v > u32::from(u16::MAX) {
+            return None;
+        }
+    }
+    Some(v as u16)
+}
+
+/// `example.com.` or `example.com` to canonical wire form, lowercased.
+fn dotted_to_canonical_wire(text: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut at = 0usize;
+    let mut i = 0usize;
+    // The root is a single dot.
+    if text == b"." {
+        if out.is_empty() {
+            return None;
+        }
+        out[0] = 0;
+        return Some(1);
+    }
+    while i < text.len() {
+        let start = i;
+        while i < text.len() && text[i] != b'.' {
+            i += 1;
+        }
+        let label = &text[start..i];
+        if label.is_empty() {
+            // A trailing dot ends the name; an empty label anywhere else is
+            // malformed.
+            if i == text.len() - 1 || i == text.len() {
+                break;
+            }
+            return None;
+        }
+        if label.len() > 63 || at + 1 + label.len() >= out.len() {
+            return None;
+        }
+        out[at] = label.len() as u8;
+        at += 1;
+        for (k, &b) in label.iter().enumerate() {
+            out[at + k] = b.to_ascii_lowercase();
+        }
+        at += label.len();
+        if i < text.len() {
+            i += 1;
+        }
+    }
+    if at >= out.len() {
+        return None;
+    }
+    out[at] = 0;
+    Some(at + 1)
+}
+
+/// Record the DoH endpoint path from the parameter.
+unsafe fn parse_upstream_path(s: &mut DnsState, d: *const u8, len: usize) {
+    let n = len.min(UPSTREAM_PATH_MAX);
+    let mut i = 0usize;
+    while i < n {
+        s.upstream_path[i] = *d.add(i);
+        i += 1;
+    }
+    s.upstream_path_len = n as u8;
+}
+
 /// Record the upstream's authority from the parameter, truncated to
 /// `UPSTREAM_AUTHORITY_MAX` bytes. The shape is not judged here: a value
 /// `net_proto::Target::parse` cannot read simply never dials.
@@ -1540,7 +1925,7 @@ unsafe fn parse_upstream_authority(s: &mut DnsState, d: *const u8, len: usize) {
 /// `DOT_REDIAL_MS`: a resolver that redialled every step would answer a
 /// refusing upstream with a flood.
 unsafe fn dot_dial(s: &mut DnsState) {
-    if s.upstream_tls == 0 || s.dot_present != 0 || s.dot_connecting != 0 {
+    if s.upstream_transport == TRANSPORT_UDP || s.dot_present != 0 || s.dot_connecting != 0 {
         return;
     }
     if s.tls_out_chan < 0 || s.upstream_authority_len == 0 {
@@ -1559,7 +1944,11 @@ unsafe fn dot_dial(s: &mut DnsState) {
     let length = net_proto::write_connect_to(
         &mut payload,
         net_proto::SOCK_TYPE_STREAM,
-        port.unwrap_or(DOT_DEFAULT_PORT),
+        port.unwrap_or(if s.upstream_transport == TRANSPORT_HTTPS {
+            DOH_DEFAULT_PORT
+        } else {
+            DOT_DEFAULT_PORT
+        }),
         &target,
         Some(dev_requester_tag(s.sys())),
     );
@@ -1579,6 +1968,97 @@ unsafe fn dot_dial(s: &mut DnsState) {
     {
         s.dot_connecting = 1;
     }
+}
+
+/// Forward one query as an HTTP POST (RFC 8484).
+///
+/// The body is the same DNS message the other transports send; what changes
+/// is the envelope. `Content-Length` and not chunked, because a request
+/// whose length is known has no reason to be chunked and a server has no
+/// reason to expect one.
+///
+/// The head and the message travel as one frame, so their total has to fit
+/// `NET_BUF_SIZE`; a request that does not is refused rather than sent
+/// short.
+unsafe fn send_upstream_query_https(s: &mut DnsState, dns_data: *const u8, dns_len: usize) -> bool {
+    if s.dot_present == 0 || s.tls_out_chan < 0 || dns_len > DNS_MAX_PACKET {
+        return false;
+    }
+    let authority = &s.upstream_authority[..s.upstream_authority_len as usize];
+    // `Host:` is the configured authority verbatim, port and all: an
+    // authority written with its port is sent with it.
+    let path: &[u8] = if s.upstream_path_len == 0 {
+        b"/dns-query"
+    } else {
+        &s.upstream_path[..s.upstream_path_len as usize]
+    };
+    let mut head = [0u8; 256];
+    let mut at = 0usize;
+    let put = |bytes: &[u8], at: &mut usize, head: &mut [u8; 256]| -> bool {
+        if *at + bytes.len() > head.len() {
+            return false;
+        }
+        head[*at..*at + bytes.len()].copy_from_slice(bytes);
+        *at += bytes.len();
+        true
+    };
+    let mut length_text = [0u8; 8];
+    let mut length_len = 0usize;
+    {
+        let mut n = dns_len;
+        let mut digits = [0u8; 8];
+        let mut count = 0usize;
+        if n == 0 {
+            digits[0] = b'0';
+            count = 1;
+        }
+        while n > 0 && count < digits.len() {
+            digits[count] = b'0' + (n % 10) as u8;
+            n /= 10;
+            count += 1;
+        }
+        while count > 0 {
+            count -= 1;
+            length_text[length_len] = digits[count];
+            length_len += 1;
+        }
+    }
+    let ok = put(b"POST ", &mut at, &mut head)
+        && put(path, &mut at, &mut head)
+        && put(b" HTTP/1.1\r\nHost: ", &mut at, &mut head)
+        && put(authority, &mut at, &mut head)
+        && put(
+            b"\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nContent-Length: ",
+            &mut at,
+            &mut head,
+        )
+        && put(&length_text[..length_len], &mut at, &mut head)
+        && put(b"\r\n\r\n", &mut at, &mut head);
+    if !ok {
+        return false;
+    }
+    let mut payload = [0u8; net_proto::CONN_ID_LEN + 256 + DNS_MAX_PACKET];
+    net_proto::put_conn_id(&mut payload[..net_proto::CONN_ID_LEN], s.dot_conn_id);
+    let mut pos = net_proto::CONN_ID_LEN;
+    payload[pos..pos + at].copy_from_slice(&head[..at]);
+    pos += at;
+    core::ptr::copy_nonoverlapping(dns_data, payload.as_mut_ptr().add(pos), dns_len);
+    pos += dns_len;
+    let mut scratch = [0u8; NET_BUF_SIZE];
+    if net_write_frame(
+        s.sys(),
+        s.tls_out_chan,
+        net_proto::CMD_SEND,
+        payload.as_ptr(),
+        pos,
+        scratch.as_mut_ptr(),
+        NET_BUF_SIZE,
+    ) == 0
+    {
+        return false;
+    }
+    s.dot_sent = s.dot_sent.wrapping_add(1);
+    true
 }
 
 /// Forward one query over the stream leg, length-prefixed (RFC 1035 §4.2.2,
@@ -1615,8 +2095,130 @@ unsafe fn send_upstream_query_tls(s: &mut DnsState, dns_data: *const u8, dns_len
     true
 }
 
+/// Find `needle` in `hay`, case-insensitively for ASCII.
+fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let last = hay.len() - needle.len();
+    let mut i = 0usize;
+    while i <= last {
+        let mut j = 0usize;
+        while j < needle.len() && hay[i + j].to_ascii_lowercase() == needle[j].to_ascii_lowercase()
+        {
+            j += 1;
+        }
+        if j == needle.len() {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Take whole HTTP responses out of the stream accumulator (RFC 8484).
+///
+/// Only `Content-Length` is accepted. A DoH answer is a small message whose
+/// size the server knows, so a chunked one is a server doing something this
+/// path has no reason to expect; it is refused loudly rather than decoded on
+/// the chance it is benign.
+unsafe fn doh_drain_responses(s: &mut DnsState) {
+    loop {
+        let have = s.dot_rx_len as usize;
+        if have == 0 {
+            return;
+        }
+        let buf = &s.dot_rx[..have];
+        let Some(head_end) = find_ci(buf, b"\r\n\r\n") else {
+            // The head has not all arrived yet.
+            if have >= DOT_RX_BYTES {
+                doh_drop(s, b"[dns] upstream response head too large; reconnecting");
+            }
+            return;
+        };
+        let head = &buf[..head_end];
+        // The status line: `HTTP/1.1 200 OK`, of which only the code is
+        // read. Anything but 200 is the resolver declining, and a declined
+        // query has no answer to relay: the body is consumed and dropped,
+        // the connection kept, and the client's own deadline is what
+        // eventually refuses it.
+        let status_ok = head.len() >= 12 && &head[9..12] == b"200";
+        let Some(cl_at) = find_ci(head, b"content-length:") else {
+            doh_drop(
+                s,
+                b"[dns] upstream response has no Content-Length (chunked is not accepted); reconnecting",
+            );
+            return;
+        };
+        let mut i = cl_at + b"content-length:".len();
+        while i < head.len() && head[i] == b' ' {
+            i += 1;
+        }
+        let mut body_len = 0usize;
+        let mut digits = 0usize;
+        while i < head.len() && head[i].is_ascii_digit() {
+            body_len = body_len * 10 + usize::from(head[i] - b'0');
+            i += 1;
+            digits += 1;
+            if body_len > DNS_MAX_PACKET {
+                break;
+            }
+        }
+        if digits == 0 || body_len == 0 || body_len > DNS_MAX_PACKET {
+            doh_drop(
+                s,
+                b"[dns] upstream response body is not a DNS message; reconnecting",
+            );
+            return;
+        }
+        let total = head_end + 4 + body_len;
+        if have < total {
+            // The body is still arriving.
+            if have >= DOT_RX_BYTES {
+                doh_drop(
+                    s,
+                    b"[dns] upstream outran the reassembly buffer; reconnecting",
+                );
+            }
+            return;
+        }
+        let mut message = [0u8; DNS_MAX_PACKET];
+        core::ptr::copy_nonoverlapping(
+            s.dot_rx.as_ptr().add(head_end + 4),
+            message.as_mut_ptr(),
+            body_len,
+        );
+        // Consume before dispatch, as the length-prefixed path does.
+        let left = have - total;
+        if left > 0 {
+            core::ptr::copy(s.dot_rx.as_ptr().add(total), s.dot_rx.as_mut_ptr(), left);
+        }
+        s.dot_rx_len = left as u16;
+        if !status_ok {
+            let m: &[u8] = b"[dns] upstream answered a DoH query with a non-200 status";
+            dev_log(s.sys(), 1, m.as_ptr(), m.len());
+            s.upstream_drops = s.upstream_drops.wrapping_add(1);
+            continue;
+        }
+        let ip = s.upstream_ip;
+        let port = s.upstream_port;
+        s.dot_received = s.dot_received.wrapping_add(1);
+        handle_upstream_response(s, ip, port, message.as_ptr(), body_len);
+    }
+}
+
+/// Drop the DoH connection with a reason. The next step redials.
+unsafe fn doh_drop(s: &mut DnsState, message: &[u8]) {
+    s.dot_rx_len = 0;
+    s.dot_present = 0;
+    s.dot_conn_id = 0;
+    dev_log(s.sys(), 1, message.as_ptr(), message.len());
+}
+
 /// Take whole length-prefixed messages out of the stream accumulator and
-/// answer each as an upstream response.
+/// answer each as an upstream response. Under `https` the accumulator holds
+/// HTTP responses instead, and `doh_drain_responses` takes them; what
+/// follows holds for either envelope.
 ///
 /// A UDP answer is matched against the source address it claims; a stream
 /// answer has none, and the connection it arrived on stands in its place —
@@ -1625,6 +2227,10 @@ unsafe fn send_upstream_query_tls(s: &mut DnsState, dns_data: *const u8, dns_len
 /// are passed through so the pending-slot tuple matches as it always does;
 /// in this mode that half of the check compares a value with itself.
 unsafe fn dot_drain_messages(s: &mut DnsState) {
+    if s.upstream_transport == TRANSPORT_HTTPS {
+        doh_drain_responses(s);
+        return;
+    }
     loop {
         let have = s.dot_rx_len as usize;
         if have < 2 {
@@ -1667,11 +2273,15 @@ unsafe fn dot_drain_messages(s: &mut DnsState) {
 }
 
 /// Send a DNS query to the configured upstream resolver: over the stream
-/// leg under `upstream_tls`, otherwise from the upstream datagram endpoint
-/// to `upstream_ip:upstream_port`. There is no crossing between the two —
+/// leg under an encrypted transport, otherwise from the upstream datagram
+/// endpoint to `upstream_ip:upstream_port`. There is no crossing between
+/// the two —
 /// a TLS forward that cannot go is refused, never retried in the clear.
 unsafe fn send_upstream_query(state: *mut DnsState, dns_data: *const u8, dns_len: usize) -> bool {
-    if (*state).upstream_tls != 0 {
+    if (*state).upstream_transport == TRANSPORT_HTTPS {
+        return send_upstream_query_https(&mut *state, dns_data, dns_len);
+    }
+    if (*state).upstream_transport == TRANSPORT_TLS {
         return send_upstream_query_tls(&mut *state, dns_data, dns_len);
     }
     let upstream_ip = (*state).upstream_ip;
@@ -2150,6 +2760,16 @@ unsafe fn forward_to_upstream(
         now,
     );
 
+    // Ask for the signatures when this resolver validates. Without the DO
+    // bit an upstream strips every RRSIG and the answer arrives unsigned,
+    // which a validator cannot tell from a zone that is genuinely unsigned
+    // — so it would validate nothing and say so about everything.
+    let pkt_len = if s.dnssec != 0 {
+        ensure_do_bit(s, tx_ptr, pkt_len, question.end)
+    } else {
+        pkt_len
+    };
+
     // Send query to upstream via CMD_DG_SEND_TO on the upstream endpoint. A
     // rejected write means the query was never forwarded, so the slot is
     // released again and the client is refused rather than left to time out.
@@ -2203,6 +2823,181 @@ unsafe fn forward_dns64(
 /// Everything else — including a query arriving on the response port, a spoofed
 /// source, and a duplicate arriving after the first answer was consumed — is
 /// dropped and metered.
+/// Validate the answer RRset in `pkt` against the configured anchors.
+///
+/// Answers a verdict and nothing else: what a resolver does about one is
+/// the caller's. `Secure` is reached at one place only, the last line,
+/// after a signature verified against an anchored key. `Bogus` is what had
+/// an anchor and still did not verify: a bad signature, a key tag or
+/// algorithm the anchor does not match, a window the clock sits outside
+/// of. `Indeterminate` is everything this build cannot speak about — no
+/// anchor for the signer, no signature, an empty answer section, a type
+/// whose RDATA would need embedded names lowered, no trusted clock.
+///
+/// What is checked is narrower than "this answer is authentic", and a
+/// caller must not read more into `Secure` than it says:
+///
+/// - The anchor IS the signing key. No DS or DNSKEY chain is walked, so a
+///   zone has to be anchored by the very DNSKEY its answers are signed
+///   with; anchoring a KSK that only signs the DNSKEY RRset validates
+///   nothing.
+/// - Only the first anchor whose zone equals the signer is tried, and only
+///   the last RRSIG in the section covering the question's type. A zone
+///   publishing two signatures through a key rollover can land on the one
+///   the single anchor does not match, and that reads as `Bogus`.
+/// - The signer is NOT checked to be the owner's zone or an ancestor of it
+///   (RFC 4035 §5.3.1), and the owner is not checked against the question.
+///   An anchored zone's key therefore validates an RRset at any name.
+/// - An anchored zone signing with an algorithm that has no verifier here
+///   (RSASHA1, RSASHA512) is `Bogus` rather than `Indeterminate`: its
+///   answers are refused, not merely left unvalidated.
+/// - Denial of existence and wildcard expansion are not proved at all, so
+///   an answer with its signatures stripped is `Indeterminate` and goes on
+///   without the AD bit. Stripping is not detected; forgery is.
+///
+/// # Safety
+/// `pkt` is valid for `pkt_len` bytes.
+unsafe fn validate_answer(s: &mut DnsState, pkt: *const u8, pkt_len: usize) -> Verdict {
+    if s.dnssec == 0 || s.anchor_count == 0 {
+        return Verdict::Indeterminate;
+    }
+    let Some(header) = read_header(core::slice::from_raw_parts(pkt, pkt_len)) else {
+        return Verdict::Indeterminate;
+    };
+    if header.ancount == 0 {
+        // A negative answer is proved by NSEC/NSEC3, which this validator
+        // does not read. Nothing is claimed about it either way.
+        return Verdict::Indeterminate;
+    }
+    let mut scratch = [0u8; MAX_NAME_LEN + 1];
+    let Some((question, _)) = parse_question(pkt, pkt_len, scratch.as_mut_ptr()) else {
+        return Verdict::Indeterminate;
+    };
+    // Walk the answer section once: the RRset of the queried type, and the
+    // RRSIG covering it. Membership is by TYPE alone — the owner is not
+    // compared to the question or between members, so a record of the
+    // right type at another name joins the set and is signed over under
+    // the first member's owner. A section longer than `MAX_SECTION_RRS`,
+    // or an RRset longer than `MAX_RRSET`, is read only as far as those
+    // reach; what is missed cannot verify.
+    let mut members = [RrsetMember {
+        rdata_off: 0,
+        rdlen: 0,
+    }; MAX_RRSET];
+    let mut member_count = 0usize;
+    let mut owner_off = 0usize;
+    let mut sig: Option<RrsigView> = None;
+    let mut sig_rdata_off = 0usize;
+    let mut at = question.end;
+    let mut i = 0u16;
+    let mut name_buf = [0u8; MAX_NAME_LEN + 1];
+    while i < header.ancount && i < MAX_SECTION_RRS as u16 {
+        let Some(rr) = parse_rr(pkt, pkt_len, at, name_buf.as_mut_ptr()) else {
+            return Verdict::Indeterminate;
+        };
+        if rr.rtype == question.qtype {
+            if member_count == 0 {
+                owner_off = rr.start;
+            }
+            if member_count < MAX_RRSET {
+                members[member_count] = RrsetMember {
+                    rdata_off: rr.rdata_off,
+                    rdlen: rr.rdlen,
+                };
+                member_count += 1;
+            }
+        } else if rr.rtype == TYPE_RRSIG {
+            if let Some(view) = parse_rrsig(pkt, pkt_len, rr.rdata_off, rr.rdlen) {
+                if view.type_covered == question.qtype {
+                    sig = Some(view);
+                    sig_rdata_off = rr.rdata_off;
+                }
+            }
+        }
+        at = rr.next;
+        i += 1;
+    }
+    if member_count == 0 {
+        return Verdict::Indeterminate;
+    }
+    let Some(sig) = sig else {
+        // No signature. Whether that is an unsigned zone or a stripped
+        // signature cannot be told apart without the parent's DS, so it is
+        // Indeterminate rather than Insecure — and never Secure.
+        return Verdict::Indeterminate;
+    };
+    // RDATA carrying embedded names would need them lowercased for the
+    // signed form, which the canonical builder does not do.
+    if rdata_needs_name_lowering(question.qtype) {
+        return Verdict::Indeterminate;
+    }
+    // The anchor for this signer, if there is one.
+    let mut signer = [0u8; MAX_NAME_LEN + 1];
+    let Some(signer_len) = canonical_name(pkt, pkt_len, sig.signer_off, &mut signer) else {
+        return Verdict::Indeterminate;
+    };
+    let mut anchor: Option<usize> = None;
+    let mut a = 0usize;
+    while a < s.anchor_count as usize {
+        let slot = &s.anchors[a];
+        if usize::from(slot.zone_len) == signer_len
+            && slot.zone[..signer_len] == signer[..signer_len]
+        {
+            anchor = Some(a);
+            break;
+        }
+        a += 1;
+    }
+    let Some(anchor) = anchor else {
+        return Verdict::Indeterminate;
+    };
+    let key_rdata = {
+        let slot = &s.anchors[anchor];
+        &slot.rdata[..slot.rdata_len as usize]
+    };
+    // From here a failure is BOGUS, not indeterminate: an anchor covers
+    // this signer, so a signature that does not verify is one that should
+    // have.
+    if key_rdata.len() < 4 || key_rdata[3] != sig.algorithm {
+        return Verdict::Bogus;
+    }
+    if key_tag(key_rdata) != sig.key_tag {
+        return Verdict::Bogus;
+    }
+    // The same trusted clock TSIG uses: a reading the platform does not
+    // vouch for is no reading, and a signature window checked against a
+    // guess is not checked.
+    let now = trusted_now_secs(s.sys()) as u32;
+    if now == 0 {
+        // No trusted clock: a signature's window cannot be checked, and an
+        // expired signature is exactly what a replay looks like.
+        return Verdict::Indeterminate;
+    }
+    if !signature_time_ok(now, sig.sig_inception, sig.sig_expiration) {
+        return Verdict::Bogus;
+    }
+    let mut signed = [0u8; DNSSEC_SIGNED_MAX];
+    let Some(n) = rrsig_signed_data(
+        pkt,
+        pkt_len,
+        sig_rdata_off,
+        &sig,
+        owner_off,
+        question.qtype,
+        question.qclass,
+        &members[..member_count],
+        &mut signed,
+    ) else {
+        return Verdict::Bogus;
+    };
+    let signature = core::slice::from_raw_parts(pkt.add(sig.signature_off), sig.signature_len);
+    if verify_rrsig_with_key(sig.algorithm, key_rdata, &signed[..n], signature) {
+        Verdict::Secure
+    } else {
+        Verdict::Bogus
+    }
+}
+
 unsafe fn handle_upstream_response(
     s: &mut DnsState,
     src_ip: u32,
@@ -2288,6 +3083,45 @@ unsafe fn handle_upstream_response(
         }
     }
 
+    // What the signatures say, before anything is relayed.
+    //
+    // Fail CLOSED: an answer whose signature should have verified and did
+    // not is never passed on, whatever it says. The client is answered
+    // SERVFAIL, which is what a validating resolver owes it — a forged
+    // answer that reaches a program has defeated the entire point of
+    // asking.
+    //
+    // This is the plain relay path only. The DNS64 phases above answer
+    // from their own slot and return before reaching here, so a
+    // synthesised answer is neither validated nor claimed as validated.
+    let verdict = validate_answer(s, pkt, pkt_len);
+    if verdict == Verdict::Bogus {
+        s.dnssec_bogus = s.dnssec_bogus.wrapping_add(1);
+        let m: &[u8] = b"[dns] answer failed DNSSEC validation; refusing it";
+        dev_log(s.sys(), 1, m.as_ptr(), m.len());
+        // The refusal is built from the UPSTREAM's packet, which carries the
+        // upstream's transaction id. Stamp the client's back on first or the
+        // client discards the SERVFAIL as someone else's answer and waits out
+        // its own timeout — a fail-closed that looks exactly like a hang.
+        let fail_ptr = s.fail_buf.as_mut_ptr();
+        let mut i = 0usize;
+        while i < pkt_len && i < s.fail_buf.len() {
+            *fail_ptr.add(i) = *pkt.add(i);
+            i += 1;
+        }
+        let idb = client_id.to_be_bytes();
+        *fail_ptr = idb[0];
+        *fail_ptr.add(1) = idb[1];
+        refuse_with_servfail(
+            s,
+            client_ip,
+            client_port,
+            fail_ptr as *const u8,
+            question.end,
+        );
+        return;
+    }
+
     // Restore the client's own transaction id, then relay to the endpoint the
     // query was accepted from.
     let tx_ptr = s.tx_buf.as_mut_ptr();
@@ -2299,6 +3133,20 @@ unsafe fn handle_upstream_response(
     let idb = client_id.to_be_bytes();
     *tx_ptr = idb[0];
     *tx_ptr.add(1) = idb[1];
+
+    // AD says THIS resolver validated, so it is set only when this resolver
+    // did. An upstream's AD bit is its claim about its own work and is
+    // cleared: relaying it would pass off someone else's assurance as ours.
+    let flags = u16::from_be_bytes([*tx_ptr.add(2), *tx_ptr.add(3)]);
+    let flags = if verdict == Verdict::Secure {
+        s.dnssec_secure = s.dnssec_secure.wrapping_add(1);
+        flags | FLAG_AD
+    } else {
+        flags & !FLAG_AD
+    };
+    let fb = flags.to_be_bytes();
+    *tx_ptr.add(2) = fb[0];
+    *tx_ptr.add(3) = fb[1];
 
     send_server_reply(
         s as *mut DnsState,
@@ -4550,8 +5398,10 @@ pub extern "C" fn module_new(
         // Net channels: in[0] = net_in (from IP), out[0] = net_out (to IP)
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
-        // in[1] / out[1] = the stream leg for DNS over TLS. Negative when a
-        // graph did not wire them, which is what `upstream_tls` checks.
+        // in[1] / out[1] = the stream leg both encrypted transports use,
+        // `tls` (RFC 7858) and `https` (RFC 8484). Negative when a graph
+        // did not wire them, which is what the `upstream_transport` check
+        // at construct looks for.
         s.tls_in_chan = dev_channel_port(s.sys(), 0, 1);
         s.tls_out_chan = dev_channel_port(s.sys(), 1, 1);
 
@@ -4633,18 +5483,18 @@ pub extern "C" fn module_new(
         // forwards are private — refused here rather than discovered at
         // the first query. What this cannot check is the far end of the
         // leg: an instance that verifies no peer satisfies both tests.
-        if s.upstream_tls != 0 {
+        if s.upstream_transport != TRANSPORT_UDP {
             if s.upstream_authority_len == 0 {
                 log_info(
                     s,
-                    b"[dns] refusing to construct: upstream_tls needs upstream_authority (the host[:port] to dial)",
+                    b"[dns] refusing to construct: an encrypted upstream_transport needs upstream_authority (the host[:port] to dial)",
                 );
                 return -1;
             }
             if s.tls_in_chan < 0 || s.tls_out_chan < 0 {
                 log_info(
                     s,
-                    b"[dns] refusing to construct: upstream_tls needs tls_in / tls_out wired to a client-mode tls",
+                    b"[dns] refusing to construct: an encrypted upstream_transport needs tls_in / tls_out wired to a client-mode tls",
                 );
                 return -1;
             }
@@ -4709,7 +5559,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // The stream leg, when this deployment forwards over TLS: dial it,
         // and take whatever has come back. Driven before the datagram side
         // so a connection is up by the time a query needs it.
-        if s.upstream_tls != 0 {
+        if s.upstream_transport != TRANSPORT_UDP {
             dot_dial(s);
             dot_pump(s);
         }

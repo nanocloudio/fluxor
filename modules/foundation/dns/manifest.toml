@@ -13,9 +13,10 @@ name = "net_out"
 direction = "output"
 content_type = "NetProto"
 
-# The stream leg, for `upstream_tls = 1` (DNS over TLS, RFC 7858). A graph
-# wires these through a client-mode `tls` to the network; unwired they cost
-# nothing, and `upstream_tls` refuses to construct without them. Separate
+# The stream leg, for `upstream_transport = tls` (RFC 7858) or `https`
+# (RFC 8484). A graph wires these through a client-mode `tls` to the
+# network; unwired they cost nothing, and either encrypted transport
+# refuses to construct without them. Separate
 # from the datagram pair above because they are a different surface: this
 # one is connected and ordered, and the server side of this module keeps
 # answering UDP/53 while it is in use. What the leg is worth depends on the

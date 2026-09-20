@@ -64,7 +64,12 @@ deploy = ["deploy.uf2_mount", "deploy.picotool", "deploy.swd"]
 preferred_deploy = "deploy.picotool"
 console = ["console.usb_cdc", "console.serial"]
 preferred_console = "console.usb_cdc"
-observe = ["observe.console_regex", "observe.usb_enumeration"]
+# `observe.proto_load` drives traffic at the board over its own wireless
+# link, so it is available whenever the CYW43 has an address. It is a
+# BOARD fact rather than a rig one because the radio is soldered to the
+# board; which address the link gets, and from whom, belongs to the rig
+# profile.
+observe = ["observe.console_regex", "observe.usb_enumeration", "observe.proto_load"]
 power = ["power.cycle"]
 default_timeout_s = 20
 
