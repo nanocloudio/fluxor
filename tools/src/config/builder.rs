@@ -2130,7 +2130,7 @@ fn lift_trust_source(name: &str, module: Value) -> Result<(Value, Value, Option<
         Some(Value::String(spec)) => Some(spec.clone()),
         Some(_) => {
             return Err(Error::Config(format!(
-                "module '{name}': trust must be a `${{file:<path>}}` source spec string"
+                "module '{name}': trust must be `system` or a `${{file:<path>}}` source spec string"
             )));
         }
     };
@@ -2893,10 +2893,26 @@ fn build_module_entry(
     // module's table fails the build here, naming the file and the
     // instance: an anchor set is a decision, and an instance is not run
     // on a decision that did not load.
-    if let Some(spec) = trust_spec.as_deref() {
+    if trust_spec.as_deref() == Some(crate::trust_anchors::SYSTEM_SPEC) {
+        // `trust: "system"`: one byte saying so, and no anchors, because
+        // there are none to carry. The platform verifies and answers; the
+        // module asks it rather than holding a set of its own.
+        let blob = crate::trust_anchors::encode_ext(
+            crate::trust_anchors::TAG_TRUST_SYSTEM,
+            core::slice::from_ref(&vec![1u8]),
+        );
+        if base + extra_len + blob.len() >= entry.len() {
+            return Err(Error::Config(format!(
+                "module '{name}': trust marker does not fit in the module entry"
+            )));
+        }
+        entry[base + extra_len..base + extra_len + blob.len()].copy_from_slice(&blob);
+        extra_len += blob.len();
+        eprintln!("  trust: the platform's own store (verified by contract)");
+    } else if let Some(spec) = trust_spec.as_deref() {
         let path = crate::trust_anchors::file_source(spec).ok_or_else(|| {
             Error::Config(format!(
-                "module '{name}': trust must be a `${{file:<path>}}` source spec, got '{spec}'"
+                "module '{name}': trust must be `system` or a `${{file:<path>}}` source spec, got '{spec}'"
             ))
         })?;
         let anchors = crate::trust_anchors::load_bundle(Path::new(path))

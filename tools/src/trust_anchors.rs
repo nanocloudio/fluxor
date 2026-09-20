@@ -44,10 +44,23 @@ pub const TAG_TRUST: u8 = 12;
 /// Extended-TLV tag of the operator's anchors (`--ca`).
 pub const TAG_OPERATOR_TRUST: u8 = 16;
 
+/// Extended-TLV tag of `trust: "system"`: one byte, 1. It carries no
+/// anchors BECAUSE there are none to carry — the platform verifies and
+/// answers, and no anchor DER crosses the boundary. A module seeing this tag
+/// asks the `trust` contract instead of its own verifier.
+pub const TAG_TRUST_SYSTEM: u8 = 17;
+
+/// The value that names the platform's own trust store. Spelled `system`
+/// and not `platform`: `trust: "platform"` already means an ISR trust LEVEL
+/// on a module entry (`tools/src/board.rs`), and reusing the literal would
+/// make two unrelated things read the same in a graph.
+pub const SYSTEM_SPEC: &str = "system";
+
 /// The path a `${file:<path>}` source spec names; `None` for any other
-/// shape. The spec form is the only one accepted: a bare path in a
-/// checked-in graph states no indirection, and a bare keyword such as
-/// `platform` would name a different contract rather than a file.
+/// shape — including [`SYSTEM_SPEC`], which names the platform's verifier
+/// rather than a file and is handled before this is reached. The spec form
+/// is the only file shape accepted: a bare path in a checked-in graph states
+/// no indirection.
 pub fn file_source(spec: &str) -> Option<&str> {
     let inner = spec.strip_prefix("${file:")?.strip_suffix('}')?;
     if inner.is_empty() || inner.contains('}') {

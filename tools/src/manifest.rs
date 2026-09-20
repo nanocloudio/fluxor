@@ -177,6 +177,10 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // class byte matches provider::contract::WORKLOAD. Also requires the
         // platform_raw permission.
         "workload" => Ok(0x1A),
+        // The platform's verdict on a certificate chain. A module naming it
+        // is saying it will ASK rather than verify, which is the only thing
+        // this contract lets it do: no anchors cross it.
+        "trust" => Ok(0x1D),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.
@@ -190,7 +194,7 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
             "unknown contract name: {s} — expected one of: gpio, spi, i2c, pio, \
              uart, adc, pwm, fs, storage.namespace, storage.object, usb_host, \
              platform_nic_ring, platform_dma, platform_dma_fd, \
-             pcie_device (see docs/architecture/abi_layers.md)"
+             pcie_device, trust (see docs/architecture/abi_layers.md)"
         ))),
     }
 }

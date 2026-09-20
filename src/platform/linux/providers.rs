@@ -1267,6 +1267,14 @@ struct LinuxNetConn {
     /// answering `::1` ahead of `127.0.0.1` — still reaches a service
     /// listening on the other one.
     alts: Vec<Resolved>,
+    /// `state == 1`: when the attempt now in `fd` was started, so a family
+    /// that is black-holed rather than refusing does not hold the dial for
+    /// the whole connect timeout (RFC 8305 §5).
+    attempt_started: Option<std::time::Instant>,
+    /// `state == 1`: attempts started BEFORE the one in `fd` and still in
+    /// flight. The first of any of them to connect wins and the rest are
+    /// closed; a consumer never learns a race happened.
+    racing: Vec<i32>,
 }
 
 impl LinuxNetConn {
@@ -1286,6 +1294,8 @@ impl LinuxNetConn {
             dg_owner_tag: 0,
             write_buf: Vec::new(),
             alts: Vec::new(),
+            attempt_started: None,
+            racing: Vec::new(),
         }
     }
 }
@@ -2329,7 +2339,8 @@ unsafe fn linux_net_cmd_connect_to(
     let idx = slot as usize;
     let owner = st.lane_owners[lane];
     match addrs {
-        Some(mut addrs) if !addrs.is_empty() => {
+        Some(addrs) if !addrs.is_empty() => {
+            let mut addrs = interleave_families(addrs);
             let first = addrs.remove(0);
             let dial = Dial {
                 sock_type,
@@ -2337,6 +2348,7 @@ unsafe fn linux_net_cmd_connect_to(
                 port,
                 tag,
                 owner,
+                racing: Vec::new(),
             };
             linux_net_dial(st, idx, first, dial);
         }
@@ -2410,7 +2422,8 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
             (c.conn_type, c.port, c.connect_tag, c.owner)
         };
         match done.result {
-            Ok(mut addrs) if !addrs.is_empty() => {
+            Ok(addrs) if !addrs.is_empty() => {
+                let mut addrs = interleave_families(addrs);
                 let first = addrs.remove(0);
                 let dial = Dial {
                     sock_type,
@@ -2418,6 +2431,7 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
                     port,
                     tag,
                     owner,
+                    racing: Vec::new(),
                 };
                 linux_net_dial(st, idx, first, dial);
             }
@@ -2457,6 +2471,50 @@ unsafe fn linux_net_drain_resolved(st: &mut LinuxNetState) -> bool {
     had_work
 }
 
+/// Interleave the resolved addresses by family, first of each in turn
+/// (RFC 8305 §4).
+///
+/// `getaddrinfo` groups by family, so a host that answers with four IPv6
+/// addresses and one IPv4 would have the ladder spend all its patience on
+/// IPv6 before ever reaching the address that works. Alternating means the
+/// second rung is always the other family, which is where the answer is when
+/// a family is the thing that is broken.
+///
+/// The host's ordering WITHIN a family is preserved: that part encodes
+/// policy this provider has no better view of.
+fn interleave_families(addrs: Vec<Resolved>) -> Vec<Resolved> {
+    let mut first: Vec<Resolved> = Vec::with_capacity(addrs.len());
+    let mut second: Vec<Resolved> = Vec::new();
+    // Whichever family the host put first keeps the lead: its preference
+    // ordering is the one signal available about which is likelier to work.
+    let lead_is_v6 = matches!(addrs.first(), Some(Resolved::V6(_)));
+    for a in addrs {
+        let is_v6 = matches!(a, Resolved::V6(_));
+        if is_v6 == lead_is_v6 {
+            first.push(a);
+        } else {
+            second.push(a);
+        }
+    }
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    let mut a = first.into_iter();
+    let mut b = second.into_iter();
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => break,
+            (x, y) => {
+                if let Some(v) = x {
+                    out.push(v);
+                }
+                if let Some(v) = y {
+                    out.push(v);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One outbound connect as this provider carries it: what the consumer
 /// asked for, who to answer, and the addresses the name resolved to that
 /// have not been tried yet. Passed whole down the dial ladder so a rung
@@ -2469,6 +2527,66 @@ struct Dial {
     /// The requester's tag, echoed on the single terminal result.
     tag: u8,
     owner: crate::kernel::workload::owner::OwnerHandle,
+    /// Attempts already in flight, carried down the ladder so a rung
+    /// started on the attempt delay does not abandon the one before it.
+    racing: Vec<i32>,
+}
+
+/// How long one attempt is given before the next address is tried
+/// ALONGSIDE it rather than after it (RFC 8305 §5 calls this the Connection
+/// Attempt Delay and recommends 250 ms).
+///
+/// The sequential ladder alone handles an address that refuses, which is
+/// immediate. It does nothing for one that is black-holed — no RST, just
+/// silence — where the dial would wait out the whole connect timeout before
+/// trying the address that works. That is the case this exists for, and it
+/// is the common shape of a broken IPv6 path.
+const ATTEMPT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Open a socket and start a non-blocking connect to `addr`, answering the
+/// fd or `None` when even that could not be done.
+///
+/// No slot is touched: this is the part the dial ladder and the attempt-delay
+/// race both need, and the race needs it WITHOUT the slot bookkeeping because
+/// it is adding a second attempt to a slot that already has one.
+unsafe fn start_connect(addr: Resolved, port: u16) -> Option<i32> {
+    let family = match addr {
+        Resolved::V4(_) => libc::AF_INET,
+        Resolved::V6(_) => libc::AF_INET6,
+    };
+    let fd = libc::socket(family, libc::SOCK_STREAM, 0);
+    if fd < 0 {
+        return None;
+    }
+    set_nonblocking(fd);
+    let mut sa4: libc::sockaddr_in = core::mem::zeroed();
+    let mut sa6: libc::sockaddr_in6 = core::mem::zeroed();
+    let (sa_ptr, sa_len): (*const libc::sockaddr, u32) = match addr {
+        Resolved::V4(a) => {
+            sa4.sin_family = libc::AF_INET as u16;
+            sa4.sin_port = port.to_be();
+            sa4.sin_addr.s_addr = u32::from_ne_bytes(a);
+            (
+                &sa4 as *const libc::sockaddr_in as *const libc::sockaddr,
+                core::mem::size_of::<libc::sockaddr_in>() as u32,
+            )
+        }
+        Resolved::V6(a) => {
+            sa6.sin6_family = libc::AF_INET6 as u16;
+            sa6.sin6_port = port.to_be();
+            sa6.sin6_addr.s6_addr = a;
+            (
+                &sa6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                core::mem::size_of::<libc::sockaddr_in6>() as u32,
+            )
+        }
+    };
+    let ret = libc::connect(fd, sa_ptr, sa_len);
+    if ret < 0 && *libc::__errno_location() != libc::EINPROGRESS {
+        libc::close(fd);
+        return None;
+    }
+    Some(fd)
 }
 
 /// Open the socket for `addr` and start the non-blocking connect into slot
@@ -2530,6 +2648,8 @@ unsafe fn linux_net_dial(st: &mut LinuxNetState, idx: usize, addr: Resolved, dia
             port: dial.port,
             connect_tag: dial.tag,
             alts: dial.alts,
+            attempt_started: Some(std::time::Instant::now()),
+            racing: dial.racing,
             // Stamp the commanding owner so this outbound data conn is torn
             // down with its owner on drain/revoke; otherwise it stays
             // OWNER_SYSTEM and outlives revocation.
@@ -3017,37 +3137,76 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
 
         if st.conns[i].state != 2 {
             if st.conns[i].state == 1 {
-                let mut pfd = libc::pollfd {
-                    fd: st.conns[i].fd,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                if libc::poll(&mut pfd, 1, 0) > 0 && pfd.revents & libc::POLLOUT != 0 {
-                    let mut err: i32 = 0;
-                    let mut errlen: libc::socklen_t = 4;
-                    libc::getsockopt(
-                        st.conns[i].fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        &mut err as *mut i32 as *mut libc::c_void,
-                        &mut errlen,
-                    );
-                    let tag = st.conns[i].connect_tag;
-                    if err == 0 {
-                        st.conns[i].state = 2;
-                        st.conns[i].alts.clear();
-                        st.rewatch(st.conns[i].fd, i, libc::EPOLLIN as u32);
-                        let cb = (i as u16).to_le_bytes();
-                        let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
-                        linux_net_send_msg(st, &msg);
-                        had_work = true;
-                    } else {
-                        // This address refused or was unreachable. The next
-                        // one the name resolved to gets its turn before the
-                        // requester hears anything.
-                        // Closing the fd is what drops it from epoll, as the
-                        // single-address path has always relied on.
-                        libc::close(st.conns[i].fd);
+                // Every attempt in flight for this slot: the current one and
+                // any started earlier on the attempt delay. The first to
+                // connect wins and the others are closed, so what the
+                // consumer sees is one connect that either worked or did not.
+                let mut fds: Vec<i32> = Vec::with_capacity(1 + st.conns[i].racing.len());
+                fds.push(st.conns[i].fd);
+                fds.extend_from_slice(&st.conns[i].racing);
+                let mut polls: Vec<libc::pollfd> = fds
+                    .iter()
+                    .map(|&fd| libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    })
+                    .collect();
+                let ready = libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 0);
+                let mut winner: Option<i32> = None;
+                let mut last_err = 0i32;
+                let mut dead: Vec<i32> = Vec::new();
+                if ready > 0 {
+                    for p in &polls {
+                        if p.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) == 0 {
+                            continue;
+                        }
+                        let mut err: i32 = 0;
+                        let mut errlen: libc::socklen_t = 4;
+                        libc::getsockopt(
+                            p.fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_ERROR,
+                            &mut err as *mut i32 as *mut libc::c_void,
+                            &mut errlen,
+                        );
+                        if err == 0 && winner.is_none() {
+                            winner = Some(p.fd);
+                        } else if err != 0 {
+                            last_err = err;
+                            dead.push(p.fd);
+                        }
+                    }
+                }
+                let tag = st.conns[i].connect_tag;
+                if let Some(fd) = winner {
+                    // Close every attempt that did not win, the current one
+                    // included when an earlier rung answered first.
+                    for &other in &fds {
+                        if other != fd {
+                            libc::close(other);
+                        }
+                    }
+                    let c = &mut st.conns[i];
+                    c.fd = fd;
+                    c.state = 2;
+                    c.alts.clear();
+                    c.racing.clear();
+                    c.attempt_started = None;
+                    st.rewatch(fd, i, libc::EPOLLIN as u32);
+                    let cb = (i as u16).to_le_bytes();
+                    let msg = [MSG_CONNECTED, cb[0], cb[1], tag];
+                    linux_net_send_msg(st, &msg);
+                    had_work = true;
+                } else if !dead.is_empty() {
+                    // Drop the attempts that failed. The slot only falls to
+                    // the ladder when nothing is left in flight.
+                    for &fd in &dead {
+                        libc::close(fd);
+                    }
+                    let alive: Vec<i32> =
+                        fds.iter().copied().filter(|f| !dead.contains(f)).collect();
+                    if alive.is_empty() {
                         let dial = {
                             let c = &mut st.conns[i];
                             Dial {
@@ -3056,11 +3215,40 @@ unsafe fn linux_net_poll_recv(st: &mut LinuxNetState) -> bool {
                                 port: c.port,
                                 tag,
                                 owner: c.owner,
+                                racing: Vec::new(),
                             }
                         };
                         st.conns[i] = LinuxNetConn::empty();
-                        linux_net_dial_failed(st, i, dial, err);
-                        had_work = true;
+                        linux_net_dial_failed(st, i, dial, last_err);
+                    } else {
+                        let c = &mut st.conns[i];
+                        c.fd = alive[0];
+                        c.racing = alive[1..].to_vec();
+                    }
+                    had_work = true;
+                } else if st.conns[i]
+                    .attempt_started
+                    .is_some_and(|t| t.elapsed() >= ATTEMPT_DELAY)
+                    && !st.conns[i].alts.is_empty()
+                {
+                    // Nothing has answered and the delay has passed: try the
+                    // next address ALONGSIDE, rather than waiting out a path
+                    // that may never answer at all.
+                    let next = st.conns[i].alts.remove(0);
+                    match start_connect(next, st.conns[i].port) {
+                        Some(fd) => {
+                            let c = &mut st.conns[i];
+                            c.racing.push(c.fd);
+                            c.fd = fd;
+                            c.attempt_started = Some(std::time::Instant::now());
+                            st.watch(fd, i, (libc::EPOLLOUT | libc::EPOLLIN) as u32);
+                            had_work = true;
+                        }
+                        None => {
+                            // Could not even open the socket; the attempt
+                            // already running is still the live one.
+                            st.conns[i].attempt_started = Some(std::time::Instant::now());
+                        }
                     }
                 }
             }

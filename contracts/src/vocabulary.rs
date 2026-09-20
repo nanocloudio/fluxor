@@ -94,6 +94,16 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // at compose on a target that cannot back it. Distinct from
     // `timer_class = "wall_clock"`, which is about monotonic elapsed time.
     "time.wall",
+    // Whether the PLATFORM will verify a certificate chain and answer for
+    // it — the `trust` contract (class 0x1D). Like `time.wall` this is a
+    // property of the target rather than something a graph declares: the
+    // linux host registers a provider and `bcm2712`, `rp` and `wasm` do
+    // not, and a manifest names it in `[[requires_when]]` so
+    // `trust = "system"` is refused at compose where nothing can answer.
+    // True of the target, not of the machine: a linux host whose root
+    // bundle is missing still answers, by refusing every chain. It carries
+    // no facts: a verifier either answers or it does not.
+    "trust.system",
     "replication.state_machine",
     // The ordered-ack exchange surface (`modules/sdk/contracts/exchange.rs`):
     // ordered publishes in, durable acks out, and — for a provider that
@@ -341,7 +351,7 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
 /// platform HAL that a manifest can require but nothing in a graph declares.
 /// Answered per target by the composer's target-facts table; a
 /// `[[requires_when]]` naming any other capability is a manifest error.
-pub const TARGET_CAPABILITIES: &[&str] = &["time.wall"];
+pub const TARGET_CAPABILITIES: &[&str] = &["time.wall", "trust.system"];
 
 /// Marker for a fact whose value is a `u32` rather than one of an
 /// enumerated set. Compared by identity of the empty slice's contents, so a

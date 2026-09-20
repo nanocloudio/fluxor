@@ -259,6 +259,36 @@ include!("linux/linux_surface_traits_probe.rs");
 include!("linux/linux_pointer.rs");
 include!("linux/owner_log_tee.rs");
 
+/// Runtime parameter overrides, file-backed. Its own module so its parse and
+/// merge can be unit-tested without a graph.
+pub mod param_store {
+    include!("linux/param_store.rs");
+}
+
+/// The `trust` contract's Linux provider: the system store, with the
+/// platform's policy applied rather than reported.
+///
+/// On Linux there is no OS verification API to call. `rustls-platform-verifier`
+/// — the shape this contract was designed around — falls back to webpki over
+/// the system roots on this platform for exactly that reason, so what happens
+/// here IS the platform path and not a stand-in for one. macOS and Windows
+/// have real OS calls; when those targets exist, their providers call them and
+/// this file stays as it is.
+///
+/// What this applies that `tls`'s own verifier does not: path building through
+/// intermediates it may reorder or ignore, name constraints on the issuing
+/// chain, EKU for the purpose, and the full public root set as the platform
+/// maintains it. What it does NOT apply is revocation — and it says so, by
+/// leaving `check::REVOCATION` clear, which is the field's whole reason for
+/// existing.
+///
+/// Its own module rather than an inlined include: it pulls a verifier's worth
+/// of names into scope and none of them belong to the rest of the platform.
+#[cfg(feature = "trust-system")]
+pub mod trust_provider {
+    include!("linux/trust.rs");
+}
+
 // ============================================================================
 // Graph construction (shared by boot and live rebuild)
 // ============================================================================

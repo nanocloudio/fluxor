@@ -165,6 +165,12 @@ enum Commands {
         /// and not `--replicas`; there is no environment-variable form.
         #[arg(long, value_name = "PEM")]
         ca: Option<PathBuf>,
+        /// Program argv, after `--`. Forwarded to the graph's `cli_in`
+        /// exactly as `fluxor exec` forwards an applet's, so a graph that
+        /// takes arguments can be run from its source as well as from an
+        /// installed bundle. Linux graphs only: nothing else has an argv.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Run an installed applet: resolve <NAME> through the applet catalogue
     /// (or the project's `target/fluxor/<NAME>/` bundle) and exec its

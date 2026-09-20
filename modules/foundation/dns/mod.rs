@@ -47,6 +47,45 @@
 //! restart. A repeated authenticated transaction (same key and MAC) inside
 //! `TXN_RETAIN_MS` is answered from the cached response.
 //!
+//! # DNS over TLS (RFC 7858)
+//!
+//! `upstream_tls = 1` forwards on the stream leg (`tls_in` / `tls_out`),
+//! which a graph wires through a client-mode `tls`, instead of over UDP/53.
+//! `upstream_authority` — `host[:port]`, port 853 when it names none — is
+//! dialled with `CMD_CONNECT_TO` from the step rather than from a query, so
+//! the connection is up before the first query needs it and a drop is
+//! repaired without one; one dial is outstanding at a time and another
+//! follows a failure only after `DOT_REDIAL_MS`. Each message is
+//! length-prefixed (RFC 1035 §4.2.2, which RFC 7858 adopts unchanged) and
+//! one connection is reused across queries.
+//!
+//! What this protects is the QUERY, which UDP/53 protects not at all: on
+//! that path anyone between here and the resolver sees every name looked up
+//! and can forge the answer. It is not DNSSEC — the answer is worth what the
+//! resolver that gave it is worth.
+//!
+//! What it does not cover:
+//!
+//! - **The dial.** A named authority is resolved by whichever provider
+//!   terminates the leg (the host resolver under `linux_net`, the stub
+//!   resolver in `ip`), not here — in the clear on an ordinary graph. A
+//!   literal authority needs no such lookup and carries no SNI; either way
+//!   the destination address names the upstream to anyone watching.
+//! - **Authentication.** This module requires an authority and a wired leg
+//!   and refuses to construct without either, but WHETHER the peer is
+//!   verified — and against what — is the `tls` instance's `peer_auth` /
+//!   `trust` configuration, which is not visible from here. A leg wired to
+//!   an instance that verifies nothing is encrypted and unauthenticated, and
+//!   nothing in this module can tell.
+//!
+//! There is no fallback to UDP/53: with no connection up, a forward is
+//! refused and its client answered SERVFAIL. The server side keeps answering
+//! UDP/53 throughout, and locally configured names are answered as ever.
+//! A length of 0 or above `DNS_MAX_PACKET`, or a body with no room left in
+//! `DOT_RX_BYTES`, makes this module forget the connection and dial a fresh
+//! one. `DNS_MAX_PACKET` is 512 — the UDP ceiling — so a TCP answer larger
+//! than that, which RFC 7858 permits, is read here as lost framing.
+//!
 //! # Supported profile
 //!
 //! Exactly one question per query (`QDCOUNT == 1`), opcode 0. A local answer is
@@ -100,6 +139,8 @@
 //! | 10  | update_durability | u8 enum | (unset) | `volatile` or `durable`; required with `update_zone` |
 //! | 11  | update_allow | str | (none)  | `"keyname=name-suffix,TYPE,TYPE"` (repeatable, `MAX_UPDATE_KEYS`); `*` admits every type. The key is vault label `dns/tsig/<keyname>` |
 //! | 12  | update_path | str | dns_zone.fxz | File the durable generation is committed to through the `fs` contract |
+//! | 13  | upstream_tls | u8 | 0 | Forward over DNS-over-TLS on the stream leg instead of UDP/53 |
+//! | 14  | upstream_authority | str | (none) | DoT upstream, `host[:port]` (port 853 by default); required with `upstream_tls` |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -127,6 +168,12 @@ include!("../../sdk/cores/datagram_endpoint.rs");
 mod dns_wire;
 use dns_wire::*;
 
+// The stream surface, for DNS-over-TLS: the same `CMD_CONNECT_TO` every
+// other connector dials with, so a DoT upstream is named the way every
+// other upstream in the family is.
+#[path = "../../sdk/contracts/net/net_proto.rs"]
+mod net_proto;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -142,6 +189,19 @@ const MAX_HOSTS: usize = 16;
 
 /// Maximum pending upstream queries
 const MAX_PENDING: usize = 8;
+
+/// Longest upstream authority, `host[:port]`.
+const UPSTREAM_AUTHORITY_MAX: usize = 64;
+/// The port RFC 7858 assigns DNS-over-TLS, used when the authority names
+/// none.
+const DOT_DEFAULT_PORT: u16 = 853;
+/// Reassembly room for the stream leg: two whole messages and their length
+/// prefixes, so a frame carrying the tail of one and the head of the next
+/// never has to be refused.
+const DOT_RX_BYTES: usize = 2 * (DNS_MAX_PACKET + 2);
+/// How long after a failed dial before another is attempted. A resolver
+/// that redialled every step would turn a refusing upstream into a flood.
+const DOT_REDIAL_MS: u32 = 1000;
 
 /// Pending query timeout (milliseconds)
 const PENDING_TIMEOUT_MS: u32 = 5000;
@@ -330,6 +390,31 @@ mod params_def {
         // Committed-generation file for durable mode.
         12, update_path, str, 0
             => |s, d, len| { super::parse_update_path(s, d, len); };
+
+        // Forward over DNS-over-TLS (RFC 7858) instead of UDP/53: the
+        // upstream is dialled on the module's stream leg, which a graph
+        // wires through `tls`, and each message is length-prefixed. There is
+        // no fallback to UDP/53 — with no connection the forward is refused
+        // and the client answered SERVFAIL.
+        //
+        // What this buys is confidentiality and integrity of the QUERY,
+        // which UDP/53 has neither of: on that path anyone between here and
+        // the resolver sees every name looked up and can forge the answer.
+        // It is not DNSSEC. Whether the peer is also AUTHENTICATED is the
+        // `tls` instance's `peer_auth` / `trust` configuration and not
+        // something this module can see; encrypted is not authenticated.
+        13, upstream_tls, u8, 0
+            => |s, d, len| { s.upstream_tls = p_u8(d, len, 0, 0); };
+
+        // The upstream's authority, `host[:port]`, for the dial and
+        // therefore for the identity the `tls` leg expects of its peer. A
+        // name or an IP literal is accepted (`net_proto::Target::parse`
+        // decides which); a name is resolved by the provider at the far end
+        // of the leg, not here. Required under `upstream_tls`, because a
+        // dial needs a destination — the check is that it is present, not
+        // that it is a name.
+        14, upstream_authority, str, 0
+            => |s, d, len| { super::parse_upstream_authority(s, d, len); };
     }
 }
 
@@ -627,6 +712,33 @@ struct DnsState {
     server_ep: DatagramEndpoint,
     upstream_ep: DatagramEndpoint,
 
+    // ── DNS over TLS (RFC 7858) ──
+    /// 1 when forwarding goes over the stream leg instead of UDP.
+    upstream_tls: u8,
+    /// The upstream's authority, `host[:port]` — a name or an IP literal —
+    /// dialled on the stream leg. 853 is the port a value naming none gets.
+    upstream_authority: [u8; UPSTREAM_AUTHORITY_MAX],
+    upstream_authority_len: u8,
+    /// The stream leg: a graph wires these through `tls` to the network.
+    tls_in_chan: i32,
+    tls_out_chan: i32,
+    /// The connection to the upstream, when there is one.
+    dot_conn_id: u16,
+    dot_present: u8,
+    /// 1 while a CMD_CONNECT_TO is outstanding, so only one is issued.
+    dot_connecting: u8,
+    /// When the last dial was attempted, so a refused upstream is retried at
+    /// a distance rather than every step.
+    dot_attempt_ms: u32,
+    /// Length-prefixed bytes received but not yet a whole message. DoT is a
+    /// byte stream, so a message may arrive in pieces and two may arrive in
+    /// one frame.
+    dot_rx: [u8; DOT_RX_BYTES],
+    dot_rx_len: u16,
+    /// Queries sent and answers taken over the stream leg, for the heartbeat.
+    dot_sent: u32,
+    dot_received: u32,
+
     // ── DNS64 ──
     /// `1` when `dns64_prefix` is configured and valid.
     dns64_enabled: u8,
@@ -710,6 +822,17 @@ impl DnsState {
         self.host_count = 0;
         self.server_ep = DatagramEndpoint::new();
         self.upstream_ep = DatagramEndpoint::new();
+        self.upstream_tls = 0;
+        self.upstream_authority_len = 0;
+        self.tls_in_chan = -1;
+        self.tls_out_chan = -1;
+        self.dot_conn_id = 0;
+        self.dot_present = 0;
+        self.dot_connecting = 0;
+        self.dot_attempt_ms = 0;
+        self.dot_rx_len = 0;
+        self.dot_sent = 0;
+        self.dot_received = 0;
         self.queries_local = 0;
         self.queries_forwarded = 0;
         self.upstream_drops = 0;
@@ -1311,9 +1434,246 @@ unsafe fn send_server_reply(
     )
 }
 
-/// Send a DNS query from the upstream endpoint to the configured upstream
-/// DNS server.
+/// Take what the stream leg has: the connect result, data, and the close.
+///
+/// Bounded to eight frames per step like every other drain here — a busy
+/// upstream must not starve the server side, which is still answering
+/// UDP/53 while this runs.
+unsafe fn dot_pump(s: &mut DnsState) {
+    if s.tls_in_chan < 0 {
+        return;
+    }
+    // The syscall table, borrowed through the raw pointer rather than
+    // through `s`: everything below writes to the state while using it.
+    let sys = &*s.syscalls;
+    let mut taken = 0u32;
+    while taken < 8 {
+        taken += 1;
+        let mut frame = [0u8; NET_BUF_SIZE];
+        let (msg, len) = net_read_frame(sys, s.tls_in_chan, frame.as_mut_ptr(), NET_BUF_SIZE);
+        if msg == 0 {
+            return;
+        }
+        let payload = &frame[NET_FRAME_HDR..NET_FRAME_HDR + len.min(NET_BUF_SIZE - NET_FRAME_HDR)];
+        match msg {
+            net_proto::MSG_CONNECTED => {
+                if payload.len() >= net_proto::CONN_ID_LEN {
+                    let (cid, _tag) = net_proto::connected_parts(payload);
+                    s.dot_conn_id = cid;
+                    s.dot_present = 1;
+                    s.dot_connecting = 0;
+                    s.dot_rx_len = 0;
+                    let m: &[u8] = b"[dns] upstream connected over TLS";
+                    dev_log(sys, 3, m.as_ptr(), m.len());
+                }
+            }
+            net_proto::MSG_DATA => {
+                if payload.len() < net_proto::CONN_ID_LEN {
+                    continue;
+                }
+                let cid = net_proto::conn_id(payload);
+                if s.dot_present == 0 || cid != s.dot_conn_id {
+                    // Another consumer's connection on a shared lane.
+                    continue;
+                }
+                let body = &payload[net_proto::CONN_ID_LEN..];
+                let room = DOT_RX_BYTES - s.dot_rx_len as usize;
+                if body.len() > room {
+                    // `DOT_RX_BYTES` is two whole messages; more than that
+                    // unparsed means this module is not keeping up with its
+                    // own upstream, which it has no way to slow down.
+                    // Abandon the connection rather than silently lose the
+                    // middle of the stream: the state is cleared and the
+                    // next dial opens a new one. No `CMD_CLOSE` is sent, so
+                    // tearing the old one down is left to the leg and to
+                    // the peer, and any late frame on it no longer matches
+                    // `dot_conn_id`.
+                    s.dot_rx_len = 0;
+                    s.dot_present = 0;
+                    s.dot_conn_id = 0;
+                    let m: &[u8] = b"[dns] upstream outran the reassembly buffer; reconnecting";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                    continue;
+                }
+                core::ptr::copy_nonoverlapping(
+                    body.as_ptr(),
+                    s.dot_rx.as_mut_ptr().add(s.dot_rx_len as usize),
+                    body.len(),
+                );
+                s.dot_rx_len += body.len() as u16;
+                dot_drain_messages(s);
+            }
+            net_proto::MSG_CLOSED | net_proto::MSG_ERROR => {
+                // The peer finished with us, or the dial failed — a refused
+                // connection and a failed handshake both arrive here, and
+                // neither is distinguished from the other. A redial follows
+                // once `DOT_REDIAL_MS` has passed since the last attempt;
+                // until it connects, every forward is refused.
+                s.dot_present = 0;
+                s.dot_connecting = 0;
+                s.dot_conn_id = 0;
+                s.dot_rx_len = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Record the upstream's authority from the parameter, truncated to
+/// `UPSTREAM_AUTHORITY_MAX` bytes. The shape is not judged here: a value
+/// `net_proto::Target::parse` cannot read simply never dials.
+unsafe fn parse_upstream_authority(s: &mut DnsState, d: *const u8, len: usize) {
+    let n = len.min(UPSTREAM_AUTHORITY_MAX);
+    let mut i = 0usize;
+    while i < n {
+        s.upstream_authority[i] = *d.add(i);
+        i += 1;
+    }
+    s.upstream_authority_len = n as u8;
+}
+
+/// Dial the upstream on the stream leg, if it is time to.
+///
+/// Called from the step rather than from a query, so the connection is up
+/// before the first query needs it and a drop is repaired without one. Only
+/// one dial is outstanding at a time and a failed one waits
+/// `DOT_REDIAL_MS`: a resolver that redialled every step would answer a
+/// refusing upstream with a flood.
+unsafe fn dot_dial(s: &mut DnsState) {
+    if s.upstream_tls == 0 || s.dot_present != 0 || s.dot_connecting != 0 {
+        return;
+    }
+    if s.tls_out_chan < 0 || s.upstream_authority_len == 0 {
+        return;
+    }
+    let now = dev_millis(s.sys()) as u32;
+    if s.dot_attempt_ms != 0 && now.wrapping_sub(s.dot_attempt_ms) < DOT_REDIAL_MS {
+        return;
+    }
+    s.dot_attempt_ms = now;
+    let authority = &s.upstream_authority[..s.upstream_authority_len as usize];
+    let Some((target, port)) = net_proto::Target::parse(authority) else {
+        return;
+    };
+    let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
+    let length = net_proto::write_connect_to(
+        &mut payload,
+        net_proto::SOCK_TYPE_STREAM,
+        port.unwrap_or(DOT_DEFAULT_PORT),
+        &target,
+        Some(dev_requester_tag(s.sys())),
+    );
+    if length == 0 {
+        return;
+    }
+    let mut scratch = [0u8; NET_BUF_SIZE];
+    if net_write_frame(
+        s.sys(),
+        s.tls_out_chan,
+        net_proto::CMD_CONNECT_TO,
+        payload.as_ptr(),
+        length,
+        scratch.as_mut_ptr(),
+        NET_BUF_SIZE,
+    ) != 0
+    {
+        s.dot_connecting = 1;
+    }
+}
+
+/// Forward one query over the stream leg, length-prefixed (RFC 1035 §4.2.2,
+/// which RFC 7858 adopts unchanged).
+unsafe fn send_upstream_query_tls(s: &mut DnsState, dns_data: *const u8, dns_len: usize) -> bool {
+    if s.dot_present == 0 || s.tls_out_chan < 0 || dns_len > DNS_MAX_PACKET {
+        return false;
+    }
+    // `[conn_id][len:u16 BE][message]` — the conn id is net_proto's, the
+    // length prefix is DNS's, and they are different things that happen to
+    // sit next to each other.
+    let mut payload = [0u8; net_proto::CONN_ID_LEN + 2 + DNS_MAX_PACKET];
+    net_proto::put_conn_id(&mut payload[..net_proto::CONN_ID_LEN], s.dot_conn_id);
+    let at = net_proto::CONN_ID_LEN;
+    let be = (dns_len as u16).to_be_bytes();
+    payload[at] = be[0];
+    payload[at + 1] = be[1];
+    core::ptr::copy_nonoverlapping(dns_data, payload.as_mut_ptr().add(at + 2), dns_len);
+    let total = at + 2 + dns_len;
+    let mut scratch = [0u8; NET_BUF_SIZE];
+    let wrote = net_write_frame(
+        s.sys(),
+        s.tls_out_chan,
+        net_proto::CMD_SEND,
+        payload.as_ptr(),
+        total,
+        scratch.as_mut_ptr(),
+        NET_BUF_SIZE,
+    );
+    if wrote == 0 {
+        return false;
+    }
+    s.dot_sent = s.dot_sent.wrapping_add(1);
+    true
+}
+
+/// Take whole length-prefixed messages out of the stream accumulator and
+/// answer each as an upstream response.
+///
+/// A UDP answer is matched against the source address it claims; a stream
+/// answer has none, and the connection it arrived on stands in its place —
+/// a stronger statement exactly as far as the `tls` leg authenticated that
+/// connection, and no further. The configured `upstream_ip` / `upstream_port`
+/// are passed through so the pending-slot tuple matches as it always does;
+/// in this mode that half of the check compares a value with itself.
+unsafe fn dot_drain_messages(s: &mut DnsState) {
+    loop {
+        let have = s.dot_rx_len as usize;
+        if have < 2 {
+            return;
+        }
+        let want = ((s.dot_rx[0] as usize) << 8) | (s.dot_rx[1] as usize);
+        if want == 0 || want > DNS_MAX_PACKET {
+            // A length this stream cannot carry — zero, or above the 512
+            // bytes `DNS_MAX_PACKET` holds, which is the UDP ceiling and
+            // below what RFC 7858 allows a TCP answer. Either way the
+            // framing can no longer be followed, so the connection is
+            // abandoned (locally: no `CMD_CLOSE`) rather than guessing
+            // where the next message starts, and the next dial replaces
+            // it.
+            s.dot_rx_len = 0;
+            s.dot_present = 0;
+            s.dot_conn_id = 0;
+            let msg: &[u8] = b"[dns] upstream framing lost; reconnecting";
+            dev_log(s.sys(), 1, msg.as_ptr(), msg.len());
+            return;
+        }
+        if have < 2 + want {
+            return;
+        }
+        let ip = s.upstream_ip;
+        let port = s.upstream_port;
+        let mut message = [0u8; DNS_MAX_PACKET];
+        core::ptr::copy_nonoverlapping(s.dot_rx.as_ptr().add(2), message.as_mut_ptr(), want);
+        // Consume before dispatch: the handler may send, and it must never
+        // see a buffer that still holds what it is being given.
+        let consumed = 2 + want;
+        let left = have - consumed;
+        if left > 0 {
+            core::ptr::copy(s.dot_rx.as_ptr().add(consumed), s.dot_rx.as_mut_ptr(), left);
+        }
+        s.dot_rx_len = left as u16;
+        s.dot_received = s.dot_received.wrapping_add(1);
+        handle_upstream_response(s, ip, port, message.as_ptr(), want);
+    }
+}
+
+/// Send a DNS query to the configured upstream resolver: over the stream
+/// leg under `upstream_tls`, otherwise from the upstream datagram endpoint
+/// to `upstream_ip:upstream_port`. There is no crossing between the two —
+/// a TLS forward that cannot go is refused, never retried in the clear.
 unsafe fn send_upstream_query(state: *mut DnsState, dns_data: *const u8, dns_len: usize) -> bool {
+    if (*state).upstream_tls != 0 {
+        return send_upstream_query_tls(&mut *state, dns_data, dns_len);
+    }
     let upstream_ip = (*state).upstream_ip;
     let upstream_port = (*state).upstream_port;
     dg_send_from(
@@ -4190,6 +4550,10 @@ pub extern "C" fn module_new(
         // Net channels: in[0] = net_in (from IP), out[0] = net_out (to IP)
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
+        // in[1] / out[1] = the stream leg for DNS over TLS. Negative when a
+        // graph did not wire them, which is what `upstream_tls` checks.
+        s.tls_in_chan = dev_channel_port(s.sys(), 0, 1);
+        s.tls_out_chan = dev_channel_port(s.sys(), 1, 1);
 
         // Parse TLV params
         let is_tlv =
@@ -4263,6 +4627,29 @@ pub extern "C" fn module_new(
             return -1;
         }
 
+        // DNS over TLS needs somewhere to dial and a leg to dial it on.
+        // With either missing the module would never connect and every
+        // forward would be refused, while the configuration says the
+        // forwards are private — refused here rather than discovered at
+        // the first query. What this cannot check is the far end of the
+        // leg: an instance that verifies no peer satisfies both tests.
+        if s.upstream_tls != 0 {
+            if s.upstream_authority_len == 0 {
+                log_info(
+                    s,
+                    b"[dns] refusing to construct: upstream_tls needs upstream_authority (the host[:port] to dial)",
+                );
+                return -1;
+            }
+            if s.tls_in_chan < 0 || s.tls_out_chan < 0 {
+                log_info(
+                    s,
+                    b"[dns] refusing to construct: upstream_tls needs tls_in / tls_out wired to a client-mode tls",
+                );
+                return -1;
+            }
+        }
+
         log_info(s, b"[dns] init");
 
         0
@@ -4318,6 +4705,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let net_out = s.net_out_chan;
         let net_in = s.net_in_chan;
         let buf = s.net_buf.as_mut_ptr();
+
+        // The stream leg, when this deployment forwards over TLS: dial it,
+        // and take whatever has come back. Driven before the datagram side
+        // so a connection is up by the time a query needs it.
+        if s.upstream_tls != 0 {
+            dot_dial(s);
+            dot_pump(s);
+        }
 
         s.server_ep
             .poll_bind(sys, net_out, s.listen_port, buf, NET_BUF_SIZE);

@@ -812,11 +812,17 @@ const PROC_CONTRACT: u64 = 1u64 << 0x16;
 /// 0x1Axx op additionally requires the `platform_raw` permission (spawning
 /// isolated workloads is privileged). Ceiling only.
 const WORKLOAD_CONTRACT: u64 = 1u64 << 0x1A;
+/// TRUST (0x1D, bit 29) — the platform's certificate-chain verdict. In the
+/// service-tier ceilings so a foundation module (`tls`) can declare it; the
+/// manifest `[[resources]]` gate still grants per-module. No `platform_raw`
+/// companion: asking whether a chain is good is not a privileged act, and
+/// nothing crosses the boundary that a caller did not already hold.
+const TRUST_CONTRACT: u64 = 1u64 << 0x1D;
 pub const CAP_CONTRACT_MASK: [u64; 4] = [
-    0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD
-    0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
-    0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
-    u64::MAX,                                                         // CAP_FULL: any contract
+    0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT | TRUST_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST
+    0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT | TRUST_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
+    0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT | TRUST_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
+    u64::MAX, // CAP_FULL: any contract
 ];
 
 unsafe fn check_contract_grant(contract: u16) -> Option<i32> {

@@ -179,6 +179,7 @@ fn main() {
             http_offset,
             vars,
             ca,
+            args,
         } => (|| {
             // `-` reads the config from stdin into a scratch file, so a
             // heredoc can feed `fluxor run` (and `--replicas` templates)
@@ -211,6 +212,7 @@ fn main() {
                         list,
                         open,
                         ca,
+                        args,
                     },
                     verbose,
                 ),

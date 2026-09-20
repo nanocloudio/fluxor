@@ -119,18 +119,13 @@ pub mod contract {
 
     /// USB host controller binding — opcode class 0x15xx.
     ///
-    /// **Scaffold only.** The id and the per-side drift guards exist
-    /// so foundation modules (`usb_midi_host`, future USB HID / mass-
-    /// storage hosts) can declare `requires_contract = "usb_host"`
-    /// without bumping the manifest schema later. No syscall vtable
-    /// is registered yet — `provider_open(USB_HOST, …)` will return
-    /// `-ENOSYS` until a host-controller driver lands.
-    ///
-    /// Planned opcodes (all gated behind `platform_raw`): `BIND`
-    /// (selector → handle), `OPEN_ENDPOINT`, `BULK_READ`,
-    /// `BULK_WRITE`, `INTERRUPT_POLL`, `RELEASE`. Implementation
-    /// surface lives in `src/platform/{rp,bcm2712}/usb_host.rs`
-    /// (currently absent).
+    /// **Status: allocated, unserved.** The id and the per-side drift
+    /// guards exist so a USB-host foundation module can declare
+    /// `requires_contract = "usb_host"` and be admitted. No platform
+    /// registers a vtable for it, so `provider_open(USB_HOST, …)`
+    /// answers `-ENOSYS` on every target: a module may hold the
+    /// declaration, and gets nothing back until a host-controller
+    /// driver serves it.
     pub const USB_HOST: u16 = 0x0015;
 
     // 0x0016 reserved (host process executor — host-scoped class; semantic
@@ -153,6 +148,16 @@ pub mod contract {
     /// is a property of the active PIO stream, so no STREAM_CLOCK provider is
     /// registered and the syscall falls back to HAL_PIO's per-stream time.
     pub const STREAM_CLOCK: u16 = 0x001C;
+
+    /// The platform's verdict on a certificate chain — opcode class 0x1Dxx.
+    /// A VERIFY contract rather than an anchor-reading one: the provider
+    /// applies the platform's policy and answers yes-or-no plus what it
+    /// actually checked, so no anchor DER crosses a syscall and a consumer's
+    /// claim about provenance is one it was told. Registered by the linux
+    /// host platform; `bcm2712`, `rp` and `wasm` register nothing here, and a
+    /// graph asking for `trust = "system"` on those refuses at build.
+    /// Semantic constants live at `abi::contracts::trust`.
+    pub const TRUST: u16 = 0x001D;
 
     /// Platform-neutral isolated-workload surface — opcode class 0x1Axx. One
     /// contract for "run an isolated workload with a declared capability

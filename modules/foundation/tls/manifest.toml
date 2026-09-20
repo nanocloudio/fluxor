@@ -51,6 +51,27 @@ horizon = "exact"
 capability = "time.wall"
 when       = { peer_auth = ["ca_dns", "ca_uri"], clock_policy = "require" }
 
+# `trust = "system"` asks the platform to verify rather than verifying here,
+# so it needs a platform that answers: the `trust` contract (class 0x1D),
+# which only the Linux host registers. On bare metal and wasm there is no
+# public root set and nothing to ask, and a graph naming it is refused at
+# compose rather than at the first handshake. This gate works precisely
+# because `trust` is a declared schema parameter and not an opaque blob.
+[[requires_when]]
+capability = "trust.system"
+when       = { trust = "system" }
+
+# The `trust` contract (class 0x1D) is what `trust = "system"` asks. Declared
+# unconditionally because a manifest resource is a GRANT — permission to call
+# the class — and not a claim that a provider exists; the `[[requires_when]]`
+# above is what refuses a target where none does. A graph that never names
+# `trust = "system"` never makes the call, and the grant costs it nothing.
+[[resources]]
+requires_contract = "trust"
+# Read: a verdict is asked for and returned. Nothing is stored, and no
+# anchor material crosses in either direction.
+access = "read"
+
 # Trust anchors are the `trust` parameter (see `define_params!` in mod.rs):
 # a `${file:<path>}` source spec the build resolves to one certificate or
 # a bundle of up to MAX_ANCHORS (concatenated DER, or PEM) and embeds as
@@ -143,10 +164,10 @@ buffer_size = { default = 65536, rp2350 = 16384, bcm2712 = 65536 }
 # Module-scope observability (optional); wired to observe.telemetry.
 [observability]
 # `bytes_in` / `bytes_out` are the cipher-side (ip seam) byte counters that
-# standards/observability.md §6 requires of a data-moving module; tls carried
-# only its crypto-pool counters until 2026-07-27. APPENDED, not prepended —
-# metric ids are positional and 0..2 are already interned in every collector
-# and id-table built against this manifest.
+# standards/observability.md §6 requires of a data-moving module, and they
+# sit at the END of the list: metric ids are positional, and 0..2 are
+# interned in every collector and id-table built against this manifest, so a
+# new counter is appended and never inserted.
 metrics = [
     "ecdh_pool_hit",
     "ecdh_fallback_keygen",

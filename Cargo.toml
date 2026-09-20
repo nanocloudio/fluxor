@@ -87,6 +87,15 @@ pollster = { version = "0.4", optional = true }
 # runtime, so it links no token library and costs nothing until one is
 # configured — which is why the published runtime carries it.
 cryptoki = { version = "0.12", optional = true }
+# The trust contract's Linux provider. On Linux there is no OS verification
+# API to call -- `rustls-platform-verifier` itself falls back to webpki over
+# the system roots there -- so this IS the platform path, not a substitute
+# for it: full path building, name constraints, EKU and expiry, which is
+# precisely what `tls`'s own verifier does not do and why the contract
+# refuses to hand anchors back instead.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 # ── host-image: host_image_codec (JPEG/PNG/BMP → RGB565) ───────────────
 # `image` brings every default decoder; trimmed to JPEG/PNG/BMP/GIF
@@ -216,7 +225,11 @@ test_tier2_sgi = []
 
 # Linux hosted (aarch64 userspace). Uses std.
 # Loads real PIC .fmod modules and runs the same scheduler/graph model.
-host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault", "rsa-vault"]
+host-linux = ["portable-atomic", "env_logger", "libc", "multitenant", "pq-vault", "rsa-vault", "trust-system"]
+# The `trust` contract's Linux provider. Separable from host-linux so a build
+# that does not want the verifier's dependency tree can drop it and have
+# `trust = "system"` refuse at compose instead of at runtime.
+trust-system = ["rustls", "rustls-pki-types", "rustls-pemfile"]
 
 # WASM target. Builds the kernel as a wasm32-unknown-unknown library.
 # A small bootstrap shim (browser, wasmtime, edge) provides the host

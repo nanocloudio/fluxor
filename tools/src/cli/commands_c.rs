@@ -220,6 +220,8 @@ struct RunFlags {
     /// `--ca <PEM>`: operator anchors for client-mode tls/quic instances.
     /// A linux graph or a bundle only.
     ca: Option<PathBuf>,
+    /// Program argv after `--`, forwarded to the graph's `cli_in`.
+    args: Vec<String>,
 }
 
 impl RunFlags {
@@ -301,7 +303,7 @@ fn cmd_run_dispatch(config_path: Option<&PathBuf>, flags: RunFlags, verbose: boo
         )));
     }
 
-    cmd_run(config_path, flags.ca.as_deref(), verbose)
+    cmd_run(config_path, flags.ca.as_deref(), &flags.args, verbose)
 }
 
 /// Scenario flow for an in-memory `Scenario` synthesised from a graph
@@ -1046,7 +1048,12 @@ mod scenario_readiness_probe {
     }
 }
 
-fn cmd_run(config_path: &PathBuf, ca: Option<&Path>, verbose: bool) -> Result<()> {
+fn cmd_run(
+    config_path: &PathBuf,
+    ca: Option<&Path>,
+    app_args: &[String],
+    verbose: bool,
+) -> Result<()> {
     const QEMU_CONFIG_BLOB_ADDR: u64 = 0x6100_0000;
     const QEMU_MODULES_BLOB_ADDR: u64 = 0x6200_0000;
 
@@ -1100,6 +1107,16 @@ fn cmd_run(config_path: &PathBuf, ca: Option<&Path>, verbose: bool) -> Result<()
                 .arg(&config_bin)
                 .arg("--modules")
                 .arg(&modules_bin);
+            // Everything after `--` is the program's, passed on exactly as
+            // `fluxor exec` passes an applet's. Without this a graph that
+            // takes arguments could only be run once installed, which made
+            // the source tree the awkward way to try one.
+            if !app_args.is_empty() {
+                cmd.arg("--");
+                for a in app_args {
+                    cmd.arg(a);
+                }
+            }
             let status = tie_to_parent(&mut cmd).status()?;
 
             if !status.success() {

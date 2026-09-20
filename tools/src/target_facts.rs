@@ -120,6 +120,12 @@ pub struct TargetFacts {
     /// `TRUSTED` for, or `None` when the target has no calendar clock the
     /// kernel would ever vouch for.
     pub time_wall_source: Option<&'static str>,
+    /// Whether a `trust` provider is registered on this target — the
+    /// platform's own verifier, which `trust = "system"` asks. Only the
+    /// Linux host carries one; bare metal and wasm hold no public root set
+    /// and a graph asking for one there is refused at compose rather than
+    /// discovering it at the first handshake.
+    pub trust_system: bool,
     /// Key suites the kernel vault holds on this target.
     pub vault_suites: &'static [u16],
     /// The highest custody tier the kernel vault can report here: the tier
@@ -150,6 +156,7 @@ impl TargetFacts {
             // `adjtimex(2)` says whether the clock is disciplined.
             "linux" => Self {
                 time_wall_source: Some("network_sync"),
+                trust_system: true,
                 vault_suites: SUITES_PQ,
                 vault_tier_ceiling: vault_tier::SOFTWARE,
                 net: NET_HOST,
@@ -161,6 +168,7 @@ impl TargetFacts {
             // driver owns the transmit ring and reports it drained.
             "bcm2712" => Self {
                 time_wall_source: None,
+                trust_system: false,
                 vault_suites: SUITES_PQ,
                 vault_tier_ceiling: vault_tier::DEVICE_HW,
                 net: NET_HOST,
@@ -170,6 +178,7 @@ impl TargetFacts {
             // No RTC, no room for the ML-DSA scratch, no sealing.
             "rp2040" | "rp2350" => Self {
                 time_wall_source: None,
+                trust_system: false,
                 vault_suites: SUITES_BASE,
                 vault_tier_ceiling: vault_tier::SOFTWARE,
                 net: NET_EMBEDDED,
@@ -179,6 +188,7 @@ impl TargetFacts {
             // The browser host offers no synchronisation evidence.
             "wasm" => Self {
                 time_wall_source: None,
+                trust_system: false,
                 vault_suites: SUITES_PQ,
                 vault_tier_ceiling: vault_tier::SOFTWARE,
                 net: NET_WASM,
@@ -187,6 +197,7 @@ impl TargetFacts {
             },
             _ => Self {
                 time_wall_source: None,
+                trust_system: false,
                 vault_suites: SUITES_BASE,
                 vault_tier_ceiling: vault_tier::SOFTWARE,
                 net: NET_EMBEDDED,
@@ -228,6 +239,13 @@ impl TargetFacts {
     /// Whether this target provides `capability` at all: a target-provided
     /// capability is present exactly when its defining fact has a value.
     pub fn provides(&self, capability: &str) -> bool {
+        // `trust.system` carries no facts: a platform verifier either
+        // answers or it does not, and there is nothing further to describe
+        // about one. It is therefore a bare boolean rather than a
+        // fact-defined capability.
+        if capability == "trust.system" {
+            return self.trust_system;
+        }
         let defining_fact = match capability {
             "time.wall" => "source",
             _ => return false,

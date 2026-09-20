@@ -306,6 +306,21 @@ pub fn param_is_one_of(
     wanted: &[String],
 ) -> Option<bool> {
     let def = schema.find(param)?;
+    // A string parameter is compared as a string. Coercing one to a number
+    // first — which is all this did — meant a `[[requires_when]]` could
+    // never gate on a textual posture, and the clause read as "the schema
+    // does not declare that value" when the schema declared the parameter
+    // perfectly well. `trust = "system"` is the case that wants it.
+    if matches!(def.ptype, ParamType::Str | ParamType::StrChunked) {
+        let set = module
+            .get(param)
+            .or_else(|| module.get("params").and_then(|p| p.get(param)))
+            .and_then(|v| v.as_str());
+        // A string parameter with no value set is the empty string, which
+        // is a value a clause may legitimately name.
+        let actual = set.unwrap_or("");
+        return Some(wanted.iter().any(|w| w == actual));
+    }
     let value = effective_param_value(module, schema, param)?;
     let mut hit = false;
     for w in wanted {

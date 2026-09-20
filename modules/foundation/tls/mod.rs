@@ -845,7 +845,9 @@ struct TlsState {
     ecdh_fallback_keygen: u32,
     /// `tls_write_frame` failures across cipher_out / clear_out;
     /// non-zero in steady state means a downstream consumer is
-    /// back-pressuring TLS. Emitted on the `[tls] hb` line.
+    /// back-pressuring TLS. On the decrypted-record path the write is
+    /// resumed on a later step, so a count there is pressure and not lost
+    /// bytes. Emitted on the `[tls] hb` line.
     frame_write_dropped: u32,
     /// Inbound handshake records held back because the handshake queue
     /// could not take their plaintext. The record stays at the head of
@@ -941,6 +943,22 @@ struct TlsState {
     anchors: [[u8; MAX_CERT_LEN]; MAX_ANCHORS],
     anchor_lens: [u16; MAX_ANCHORS],
     anchor_count: u8,
+    /// `trust: "system"`: verification is the platform's to answer, through
+    /// the `trust` contract, and this instance holds no anchors of its own.
+    trust_system: bool,
+    /// Plaintext decrypted but not yet handed to the clear consumer, held in
+    /// `record_scratch` until it has all gone. Non-zero `clear_pending_len`
+    /// means no other record may be decrypted, in ANY session: the scratch is
+    /// one module-wide buffer and overwriting it would lose bytes the peer
+    /// believes were delivered. So the hold is at most one record — under
+    /// `RECV_BUF_SIZE` bytes — and everything behind it waits as ciphertext,
+    /// first in the session's `recv_buf` and then in the `cipher_in` channel.
+    /// Nothing is dropped or truncated on this path and nothing is sent
+    /// twice: `clear_pending_off` is the byte the consumer stopped at.
+    clear_pending_off: usize,
+    clear_pending_len: usize,
+    clear_pending_conn: u16,
+    clear_pending_idx: u16,
     /// How many of `anchors`, counted from the tail, the operator
     /// appended. Reported with every accepted chain so a log reader can
     /// tell a deployment's trust from a launch-time widening.
@@ -1281,6 +1299,9 @@ pub unsafe extern "C" fn module_new(
     s.cert_len = 0;
     s.key_len = 0;
     s.anchor_count = 0;
+    s.trust_system = false;
+    s.clear_pending_off = 0;
+    s.clear_pending_len = 0;
     s.anchor_operator = 0;
     s.anchor_refused = false;
     s.expected_dns_len = 0;
@@ -1597,7 +1618,8 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
     // Search for extended TLV pattern: tag + 0x00 + len_hi + len_lo
     while pos + 4 <= end {
         let tag = data[pos];
-        let ext_tags = tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 15 || tag == 16;
+        let ext_tags =
+            tag == 10 || tag == 11 || tag == 12 || tag == 13 || tag == 15 || tag == 16 || tag == 17;
         if ext_tags && pos + 1 < end && data[pos + 1] == 0x00 && pos + 4 <= end {
             let len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
             let data_start = pos + 4;
@@ -1636,6 +1658,13 @@ unsafe fn parse_extended_params(s: &mut TlsState, params: *const u8, params_len:
                     // count differs.
                     let bundle = core::slice::from_raw_parts(data.as_ptr().add(data_start), len);
                     push_anchor_bundle(s, bundle, tag == 16);
+                }
+                17 => {
+                    // `trust: "system"`. No anchors travel with it: the
+                    // platform holds them and answers about them, so this
+                    // instance verifies by asking rather than by walking a
+                    // table of its own.
+                    s.trust_system = len > 0 && *data.as_ptr().add(data_start) == 1;
                 }
                 13 => {
                     // `verify_hostname`, the expected-identity override.
@@ -1960,6 +1989,40 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             s.sessions[i].reset();
         }
         i += 1;
+    }
+
+    // A record held back because the clear consumer had no room is retried
+    // every step, not only when more ciphertext arrives. The peer may have
+    // sent everything it intends to; what unblocks this is the CONSUMER
+    // reading, which produces no event here at all. Nothing bounds how long
+    // a record may be held: a consumer that never reads holds this one
+    // record, and the ciphertext behind it, for as long as its session
+    // lives.
+    if s.clear_pending_len > 0 {
+        // The hold is remembered by SLOT, and the slot is all that is
+        // checked here — a slot freed and taken by another connection that
+        // has reached Ready resumes this record under `clear_pending_conn`,
+        // the id of the connection it was decrypted for.
+        let idx = s.clear_pending_idx as usize;
+        if idx < s.sessions.len() && s.sessions[idx].state == SessionState::Ready {
+            let mut off = s.clear_pending_off;
+            let pt_len = s.clear_pending_len;
+            let conn_id = s.clear_pending_conn;
+            if drain_clear_record(s, idx, conn_id, &mut off, pt_len) {
+                s.clear_pending_len = 0;
+                s.clear_pending_off = 0;
+                note_delivered(&mut s.sessions[idx]);
+                did_work = true;
+            } else {
+                s.clear_pending_off = off;
+            }
+        } else {
+            // Not a Ready session any more — closed, failed, or never
+            // allocated — so the bytes have nowhere to go and are dropped
+            // with the session they belonged to.
+            s.clear_pending_len = 0;
+            s.clear_pending_off = 0;
+        }
     }
 
     let t1 = if diag_on { dev_micros(sys) } else { 0 };
@@ -3112,16 +3175,23 @@ fn peer_auth_admissible(s: &TlsState) -> bool {
     if !authenticates {
         return true;
     }
+    // `trust: "system"` is a complete trust source that happens to hold no
+    // anchors HERE: the platform holds them and answers about them. Counting
+    // this instance's empty table would refuse the one configuration that
+    // most certainly has trust material behind it.
+    let has_trust = s.anchor_count > 0 || s.trust_system;
     match s.peer_auth {
+        // Pinning is a statement about a specific key, which is this
+        // module's to hold and not the platform's to answer.
         PROFILE_PINNED => s.anchor_count > 0,
         // `ca_uri` demands the name on BOTH sides, unlike `ca_dns`: a
         // server under `ca_dns` legitimately has no name to expect of a
         // client, whereas under `ca_uri` the URI is the whole
         // authorisation and a policy that names none authorises everyone
         // the CA ever signed.
-        PROFILE_CA_URI => s.anchor_count > 0 && s.expected_uri_len > 0,
+        PROFILE_CA_URI => has_trust && s.expected_uri_len > 0,
         PROFILE_CA_DNS => {
-            if s.anchor_count == 0 {
+            if !has_trust {
                 return false;
             }
             // The mTLS server has no name to expect of a client. A client
@@ -3264,12 +3334,133 @@ unsafe fn peer_cert_reason(
         EKU_SERVER_AUTH
     };
     let now = trusted_now_secs(&*s.syscalls);
+    if s.trust_system {
+        // The platform decides. Nothing below is consulted: this instance
+        // holds no anchors, and second-guessing an answer it did not compute
+        // is how a weaker verifier gets to overrule a stronger one.
+        return platform_cert_reason(s, is_server, expected, expected_is_ip, hs_body, now);
+    }
     verify_chain_with(
         hs_body,
         &chain_policy(s, expected, expected_is_ip, require_eku, now),
         deferred,
     )
 }
+
+/// Ask the `trust` contract whether this chain is good.
+///
+/// The request is built flat, answered in place, and translated back into
+/// this module's reason vocabulary so every caller and every log line reads
+/// the same whichever verifier decided. A transport failure is NOT a
+/// refusal: it becomes `CERT_ERR_NO_ANCHOR`, because a consumer that could
+/// not ask must not behave as though it asked and was told yes.
+unsafe fn platform_cert_reason(
+    s: &TlsState,
+    is_server: bool,
+    expected: &[u8],
+    expected_is_ip: bool,
+    hs_body: &[u8],
+    now: u64,
+) -> u32 {
+    use abi::contracts::trust as tw;
+    // An IP literal has no name to give the platform, and a server checking
+    // a client certificate is not what this provider is wired for; both are
+    // the local verifier's job and reaching here with one is a compose bug.
+    if is_server || expected_is_ip {
+        return CERT_ERR_NO_ANCHOR;
+    }
+    let mut chain: [&[u8]; MAX_CHAIN_LEN] = [&[]; MAX_CHAIN_LEN];
+    let count = match parse_cert_chain(hs_body, &mut chain) {
+        Ok(n) if n > 0 => n,
+        Ok(_) => return CERT_ERR_NO_ANCHOR,
+        Err(e) => return e,
+    };
+    let name_len = expected.len().min(tw::MAX_NAME);
+    let mut arg = [0u8; TRUST_ARG_BYTES];
+    let mut at = tw::offset::NAME;
+    arg[tw::offset::PURPOSE] = tw::purpose::SERVER;
+    arg[tw::offset::NAME_LEN] = name_len as u8;
+    arg[tw::offset::CERT_COUNT] = count as u8;
+    arg[tw::offset::UNIX_SECONDS..tw::offset::UNIX_SECONDS + 8].copy_from_slice(&now.to_le_bytes());
+    if at + name_len > arg.len() {
+        return CERT_ERR_NO_ANCHOR;
+    }
+    arg[at..at + name_len].copy_from_slice(expected.get(..name_len).unwrap_or(&[]));
+    at += name_len;
+    let mut i = 0usize;
+    while i < count {
+        let der = chain[i];
+        if at + 2 + der.len() + tw::OUT_LEN > arg.len() {
+            // A chain this instance cannot carry to the provider is one it
+            // cannot have an answer about.
+            return CERT_ERR_NO_ANCHOR;
+        }
+        let len = der.len() as u16;
+        arg[at..at + 2].copy_from_slice(&len.to_le_bytes());
+        at += 2;
+        arg[at..at + der.len()].copy_from_slice(der);
+        at += der.len();
+        i += 1;
+    }
+    let out_at = at;
+    let total = out_at + tw::OUT_LEN;
+    let sys = &*s.syscalls;
+    let rc = (sys.provider_call)(-1, tw::VERIFY, arg.as_mut_ptr(), total);
+    if rc < 0 {
+        let msg: &[u8] = b"[tls] the trust provider could not answer; chain refused";
+        dev_log(sys, 1, msg.as_ptr(), msg.len());
+        return CERT_ERR_NO_ANCHOR;
+    }
+    let result = arg[out_at];
+    let checks = arg[out_at + 1];
+    let reason = arg[out_at + 2];
+    if result == tw::result::TRUSTED {
+        return CERT_OK;
+    }
+    // Say who refused and what they checked. Without this a platform refusal
+    // is indistinguishable from any other handshake failure, and an operator
+    // has nowhere to look: the verdict was formed somewhere this module
+    // cannot show them.
+    {
+        let mut buf = [0u8; 96];
+        let mut pos = put_text(&mut buf, 0, b"[tls] the platform refused the chain: ");
+        let text: &[u8] = match reason {
+            tw::reason::UNKNOWN_CA => b"unknown-ca",
+            tw::reason::NAME_MISMATCH => b"name-mismatch",
+            tw::reason::EXPIRED => b"expired",
+            tw::reason::REVOKED => b"revoked",
+            tw::reason::MALFORMED => b"malformed",
+            tw::reason::BAD_PURPOSE => b"bad-purpose",
+            tw::reason::NO_TIME => b"no-trusted-time",
+            _ => b"unstated",
+        };
+        pos = put_text(&mut buf, pos, text);
+        pos = put_text(&mut buf, pos, b" checks=0x");
+        let hi = (checks >> 4) & 0xF;
+        let lo = checks & 0xF;
+        let hex = |n: u8| if n < 10 { b'0' + n } else { b'a' + (n - 10) };
+        if pos + 2 <= buf.len() {
+            buf[pos] = hex(hi);
+            buf[pos + 1] = hex(lo);
+            pos += 2;
+        }
+        dev_log(sys, 1, buf.as_ptr(), pos);
+    }
+    match reason {
+        tw::reason::NAME_MISMATCH => CERT_ERR_NAME_MISMATCH,
+        tw::reason::EXPIRED => CERT_ERR_EXPIRED,
+        tw::reason::MALFORMED => CERT_ERR_MSG_MALFORMED,
+        tw::reason::BAD_PURPOSE => CERT_ERR_LEAF_EKU,
+        _ => CERT_ERR_NO_ANCHOR,
+    }
+}
+
+/// Room for one VERIFY request: the header, a full-length name, the longest
+/// chain this module will carry, and the answer block.
+const TRUST_ARG_BYTES: usize = abi::contracts::trust::offset::NAME
+    + abi::contracts::trust::MAX_NAME
+    + MAX_CHAIN_LEN * (2 + MAX_CERT_LEN)
+    + abi::contracts::trust::OUT_LEN;
 
 /// The calendar time a certificate lifetime may be checked against, or 0
 /// when there is none worth checking against.
@@ -3477,6 +3668,16 @@ unsafe fn log_chain_verified(s: &mut TlsState, idx: usize, suite: u16) {
     let links = d.deferred_links.len as u32;
     let steps = d.verify_steps as u32;
     s.sessions[idx].driver.verify_steps = 0;
+    if s.trust_system {
+        // The platform decided, so this module counted no links, took no
+        // steps and holds no anchors. Printing those zeros beside an empty
+        // source reads as "nothing verified this", which is the opposite of
+        // what happened — one line that says who decided instead.
+        let sys = &*s.syscalls;
+        let msg: &[u8] = b"[tls] chain verified by the platform (trust=system)";
+        dev_log(sys, 3, msg.as_ptr(), msg.len());
+        return;
+    }
     if suite == suite::RSA_PKCS1_SHA256 || suite == suite::RSA_PKCS1_SHA384 {
         log_chain_verified_line(s, b"[tls] chain verified suite=rsa_pkcs1", links, steps);
     } else if suite == suite::RSA_PSS {
@@ -5479,8 +5680,8 @@ unsafe fn emit_peer_identity(s: &mut TlsState, idx: usize) {
 
 /// Attempt one write of any pending peer-identity envelope. Used
 /// both at handshake completion (via `emit_peer_identity`) and
-/// from the module-step sweep when the channel was previously
-/// full.
+/// from the module-step sweep after a step on which the channel
+/// was full.
 unsafe fn try_drain_pending_peer_identity(s: &mut TlsState, idx: usize) {
     if s.peer_identity < 0 {
         return;
@@ -6161,10 +6362,11 @@ unsafe fn tls_discard(sys: &SyscallTable, chan: i32, mut count: usize) {
 /// session's `recv_buf`, decrypting and forwarding records as they complete so
 /// buffer space frees mid-frame. Answers how many bytes it actually consumed.
 ///
-/// More bytes than the remaining space are NOT silently truncated (the old
-/// behaviour, which desynced the record stream and lost bytes) — the loop
-/// drains them through repeated decrypt passes; only a single record that can
-/// never fit (> `RECV_BUF_SIZE`) fails the session, loudly.
+/// More bytes than the remaining space are NOT silently truncated — that
+/// desyncs the record stream and loses bytes. The loop drains them through
+/// repeated decrypt passes; a buffer held full by a record waiting on the
+/// clear consumer parks the rest in the channel, and only a single record
+/// that can never fit (> `RECV_BUF_SIZE`) fails the session, loudly.
 ///
 /// A byte FIFO returns what is available, up to what was asked for, so a
 /// producer caught mid-write yields a short read. The caller parks the
@@ -6214,9 +6416,19 @@ unsafe fn ready_feed_from_channel(s: &mut TlsState, idx: usize, len: usize) -> u
             break;
         }
         if s.sessions[idx].recv_len == RECV_BUF_SIZE {
-            // No space freed: the buffered record exceeds RECV_BUF_SIZE and
-            // can never decrypt. Fail the session rather than corrupt the
-            // stream.
+            // Full, but WHY it is full decides what this is.
+            if s.clear_pending_len > 0 {
+                // A record is waiting on the clear consumer, so nothing
+                // could be drained and the buffer filled behind it. That is
+                // back pressure: leave the rest of the frame in the channel
+                // as the pending tail and come back when the consumer has
+                // read. Failing here would kill a connection for the
+                // ordinary reason that a big response outran its reader.
+                break;
+            }
+            // Nothing is holding the buffer and still no space freed: the
+            // record at its head exceeds RECV_BUF_SIZE and can never
+            // decrypt. Fail the session rather than corrupt the stream.
             let msg: &[u8] = b"[tls] record exceeds recv_buf; session->Error";
             dev_log(sys, 1, msg.as_ptr(), msg.len());
             tls_discard(sys, s.cipher_in, remaining);
@@ -6229,9 +6441,74 @@ unsafe fn ready_feed_from_channel(s: &mut TlsState, idx: usize, len: usize) -> u
     len - remaining
 }
 
+/// Push what is left of the decrypted record in `record_scratch` to the
+/// clear side, from `*off`, in `NET_CMD_RECORD_CAPACITY` chunks. Answers
+/// whether it all went.
+///
+/// Advances `*off` by what was taken, so a caller that is held can resume at
+/// exactly the byte the consumer stopped at. A chunk the channel will not
+/// take stops the loop with `*off` on that chunk's first byte: the chunk is
+/// neither partially written nor written twice, because `tls_write_frame`
+/// writes a frame whole or not at all.
+unsafe fn drain_clear_record(
+    s: &mut TlsState,
+    idx: usize,
+    conn_id: u16,
+    off: &mut usize,
+    pt_len: usize,
+) -> bool {
+    let sys = &*s.syscalls;
+    let ct_ptr = core::ptr::addr_of_mut!(s.record_scratch) as *mut u8;
+    const CLEAR_FWD_CHUNK: usize = NET_CMD_RECORD_CAPACITY;
+    while *off < pt_len {
+        let chunk = (pt_len - *off).min(CLEAR_FWD_CHUNK);
+        let sent = tls_write_frame(
+            sys,
+            s.clear_out,
+            NET_MSG_DATA,
+            conn_id,
+            ct_ptr.add(*off),
+            chunk as u16,
+            &mut s.net_scratch,
+        );
+        if !sent {
+            // The consumer has no room this step. Counted so a heartbeat
+            // shows the pressure; the session is untouched.
+            s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
+            let _ = idx;
+            return false;
+        }
+        *off += chunk;
+        // Decrypted bytes handed to the clear consumer. Comparable with
+        // `[http] tlm rx` across the edge.
+        s.clear_out_bytes = s.clear_out_bytes.wrapping_add(4 + chunk as u32);
+    }
+    true
+}
+
 /// Try to decrypt a complete TLS record from a Ready session's recv_buf
 /// and forward the plaintext as MSG_DATA to clear_out.
 unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
+    // A record still going out owns `record_scratch`, which is module-wide.
+    // Finish it before anything else is decrypted — and leave another
+    // session's buffer alone entirely while it is held, so that session
+    // stops decrypting too and its ciphertext accumulates instead.
+    if s.clear_pending_len > 0 {
+        if s.clear_pending_idx as usize != idx {
+            return;
+        }
+        let mut off = s.clear_pending_off;
+        let pt_len = s.clear_pending_len;
+        let conn_id = s.clear_pending_conn;
+        if drain_clear_record(s, idx, conn_id, &mut off, pt_len) {
+            s.clear_pending_len = 0;
+            s.clear_pending_off = 0;
+            note_delivered(&mut s.sessions[idx]);
+        } else {
+            s.clear_pending_off = off;
+            return;
+        }
+    }
     let sys = &*s.syscalls;
     // Raw pointer to the decrypt scratch, taken before the session
     // borrow: `record_scratch` and `sessions` are disjoint fields.
@@ -6361,43 +6638,30 @@ unsafe fn try_decrypt_forward(s: &mut TlsState, idx: usize) {
             }
             if inner_type == CT_APPLICATION_DATA && pt_len > 0 {
                 // Forward decrypted bytes as MSG_DATA, chunked to the
-                // per-write scratch (a 16 KiB record spans several
-                // frames — MSG_DATA is a byte stream to the consumer).
-                // The plaintext isn't retained — a dropped write would
-                // silently lose bytes the peer thinks were delivered,
-                // so any failed chunk fails the session.
+                // per-write scratch (a 16 KiB record spans several frames —
+                // MSG_DATA is a byte stream to the consumer).
+                //
+                // A consumer that is not reading fast enough is BACK
+                // PRESSURE, not an error: a response arriving faster than
+                // the program reads it is the ordinary case, and failing the
+                // session on the first chunk `clear_out` will not take kills
+                // the connection over it. The plaintext stays in
+                // `record_scratch` and the offset is remembered instead, so
+                // the rest goes out on a later step; no bytes are lost and
+                // none are sent twice.
                 let conn_id = sess.conn_id;
-                const CLEAR_FWD_CHUNK: usize = NET_CMD_RECORD_CAPACITY;
                 let mut off = 0usize;
-                let mut ok = true;
-                while off < pt_len {
-                    let chunk = (pt_len - off).min(CLEAR_FWD_CHUNK);
-                    let sent = tls_write_frame(
-                        sys,
-                        s.clear_out,
-                        NET_MSG_DATA,
-                        conn_id,
-                        ct.as_ptr().add(off),
-                        chunk as u16,
-                        &mut s.net_scratch,
-                    );
-                    if !sent {
-                        ok = false;
-                        break;
-                    }
-                    off += chunk;
-                    // Decrypted bytes handed to the clear consumer.
-                    // Comparable with `[http] tlm rx` across the edge.
-                    s.clear_out_bytes = s.clear_out_bytes.wrapping_add(4 + chunk as u32);
-                }
-                if !ok {
-                    s.frame_write_dropped = s.frame_write_dropped.wrapping_add(1);
-                    let msg: &[u8] = b"[tls] clear_out full mid-record; session->Error";
-                    dev_log(sys, 1, msg.as_ptr(), msg.len());
-                    s.sessions[idx].state = SessionState::Error;
-                    s.last_err_site = 48;
-                } else {
+                let done = drain_clear_record(s, idx, conn_id, &mut off, pt_len);
+                if done {
                     note_delivered(&mut s.sessions[idx]);
+                } else {
+                    // Held, not dropped. Nothing else may decrypt until this
+                    // record has left, or `record_scratch` would be
+                    // overwritten under it.
+                    s.clear_pending_off = off;
+                    s.clear_pending_len = pt_len;
+                    s.clear_pending_conn = conn_id;
+                    s.clear_pending_idx = idx as u16;
                 }
             }
         }

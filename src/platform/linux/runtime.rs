@@ -306,9 +306,10 @@ fn linux_apply_code_bit(addr: usize) -> usize {
     addr
 }
 fn linux_validate_fn_addr(addr: usize) -> bool {
-    // Non-null + 4-byte aligned. mmap-region bounds tracking would
-    // require the platform main to publish the mmap base+len to a
-    // static; for now alignment is a cheap catch for ABI corruption.
+    // Non-null + 4-byte aligned. Checking the address against the
+    // mmap region would need the platform main to publish that base and
+    // length to a static; alignment alone is the cheap catch, and it
+    // catches the ABI corruption that matters — a garbage pointer.
     addr != 0 && (addr & 0x3) == 0
 }
 fn linux_validate_module_base(addr: usize) -> bool {
@@ -381,6 +382,12 @@ fn linux_init_providers() {
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::FS, linux_fs_dispatch);
     provider::register(dev_class::STREAM_CLOCK, linux_stream_time_dispatch);
+    // The platform's verdict on a certificate chain. Registered only where
+    // the verifier is built in; without it nothing answers class 0x1D and a
+    // graph naming `trust = "system"` is refused at compose rather than
+    // quietly composing against some other trust source.
+    #[cfg(feature = "trust-system")]
+    provider::register(dev_class::TRUST, trust_provider::dispatch);
     // storage.object over HTTP `Range:` — wasm peer in
     // `src/platform/wasm/object.rs`; shared windowing in
     // `abi::contracts::storage::object::range`.
@@ -463,9 +470,17 @@ fn linux_release_module_handles(_module_idx: u8) {
     // covers event/timer/provider resources; Linux mmap mappings
     // live for the process.
 }
-fn linux_boot_scan() {}
-fn linux_merge_runtime_overrides(_module_id: u16, _buf: *mut u8, len: usize, _max: usize) -> usize {
-    len
+fn linux_boot_scan() {
+    param_store::boot_scan();
+}
+
+/// # Safety
+/// The HAL hook promises `buf` covers `max` writable bytes whose first `len`
+/// are the module's compiled parameters.
+fn linux_merge_runtime_overrides(module_id: u16, buf: *mut u8, len: usize, max: usize) -> usize {
+    // SAFETY: the contract above, which is the same one the RP
+    // implementation is written against.
+    unsafe { param_store::merge_runtime_overrides(module_id, buf, len, max) }
 }
 
 
