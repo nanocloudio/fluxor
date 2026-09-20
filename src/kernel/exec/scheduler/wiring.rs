@@ -584,34 +584,18 @@ pub fn instantiate_one_module(
         }
     }
 
-    // Check for optional module_arena_size export and allocate if present
-    // SAFETY: scheduler-thread context; arena_size_fn is the validated
-    // export address resolved from the module header.
+    // Clear the arena slot. A module has ONE arena and the loader allocates
+    // it, because only the loader knows whether the module asked for
+    // isolation — an isolated module's arena has to come from the
+    // page-aligned region, and a second allocation here would hand
+    // `arena_get` a different region from the one `heap_alloc` draws on,
+    // at the cost of a second copy of it. The loader publishes what it
+    // allocated through `set_module_arena`.
+    // SAFETY: scheduler-thread context; sole mutator during instantiation.
     unsafe {
         let p = &raw mut SCHED;
         let sched = &mut *p;
-        let arenas = &mut sched.arenas;
-        arenas[instantiated] = ArenaInfo::empty();
-        if let Ok(addr) = found_module
-            .get_export_addr(crate::kernel::module::loader::export_hashes::MODULE_ARENA_SIZE)
-        {
-            let arena_size_fn: unsafe extern "C" fn() -> u32 = core::mem::transmute(addr);
-            let requested = arena_size_fn() as usize;
-            if requested > 0 {
-                match crate::kernel::module::loader::alloc_state(requested) {
-                    Ok(ptr) => {
-                        arenas[instantiated] = ArenaInfo {
-                            ptr,
-                            size: requested as u32,
-                        };
-                    }
-                    Err(e) => {
-                        e.log("arena");
-                        return InstantiateResult::Error(-1);
-                    }
-                }
-            }
-        }
+        sched.arenas[instantiated] = ArenaInfo::empty();
     }
 
     // Copy params to static buffer and merge runtime overrides

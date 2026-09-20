@@ -529,7 +529,18 @@ mod profile_embedded {
         pub const MAX_VARS: usize = 16;
         pub const MAX_VAR_VALUE: usize = 16;
         pub const MAX_CACHE: usize = 4;
-        pub const DEFAULT_BODY_POOL_SIZE: usize = 48 * 1024;
+        /// In-RAM body staging: inline route bodies copied out of the config
+        /// blob, template renders, and the content cache a `source`-fed route
+        /// fills. `fs_path` routes stream and never land here, so this bounds
+        /// what is HELD, not what can be served.
+        ///
+        /// Sixteen KiB, and the arena reserves twice that against
+        /// `heap_realloc` growth. The figure is set by what is left rather
+        /// than by what a body might want: the wireless stack takes 105 KiB
+        /// of this die's 240 KiB state arena, and the four connection slots
+        /// and the module's own state take 53 KiB more, so the pool is the
+        /// remainder that leaves the arena room to breathe.
+        pub const DEFAULT_BODY_POOL_SIZE: usize = 16 * 1024;
     }
 
     pub mod ip {

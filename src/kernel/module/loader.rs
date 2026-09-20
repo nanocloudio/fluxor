@@ -2438,6 +2438,15 @@ impl DynamicModule {
                         crate::kernel::mem::heap::init_module_heap(
                             module_idx, arena_ptr, arena_size,
                         );
+                        // Publish the same range to the scheduler: it backs the
+                        // `arena_get` syscall and is the range teardown reclaims.
+                        // SAFETY: instantiation context; this is the allocation
+                        // just returned for `module_idx`.
+                        crate::kernel::exec::scheduler::set_module_arena(
+                            module_idx,
+                            arena_ptr,
+                            arena_size as u32,
+                        );
                         iso_heap_ptr = arena_ptr;
                         iso_heap_size = arena_size;
                         iso_heap_map_size = arena_map;

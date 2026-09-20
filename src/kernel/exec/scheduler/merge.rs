@@ -834,6 +834,22 @@ pub fn module_index_on_core(core: usize) -> usize {
     CURRENT_MODULE_PER_CORE[core].load(portable_atomic::Ordering::Relaxed) as usize
 }
 
+/// Record the arena the loader allocated for `idx`, so `arena_get` hands
+/// the module the same region its `heap_alloc` draws from and teardown has
+/// one range to reclaim. The loader is the allocator because it is the half
+/// that knows whether the module asked for isolation, and an isolated
+/// module's arena has to come from the page-aligned region.
+///
+/// # Safety
+/// Scheduler-thread context during instantiation; `ptr`/`size` must be the
+/// range `loader::alloc_state` returned for this module.
+pub unsafe fn set_module_arena(idx: usize, ptr: *mut u8, size: u32) {
+    let sched = &mut *(&raw mut SCHED);
+    if idx < sched.arenas.len() {
+        sched.arenas[idx] = ArenaInfo { ptr, size };
+    }
+}
+
 /// Set the current module index. Used by provider dispatch for context switching.
 pub fn set_current_module(idx: usize) {
     let core = crate::kernel::sys::hal::core_id();
