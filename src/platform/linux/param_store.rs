@@ -223,31 +223,3 @@ pub fn write_store(path: &std::path::Path, entries: &[(u8, u8, Vec<u8>)]) -> std
     }
     std::fs::write(path, out)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_store_round_trips() {
-        let entries = vec![(3u8, 7u8, b"nanocloud.io".to_vec())];
-        let dir = std::env::temp_dir().join("fluxor-param-store-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("params.bin");
-        write_store(&path, &entries).expect("write");
-        let bytes = std::fs::read(&path).expect("read");
-        let parsed = parse(&bytes).expect("parse");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].module_id, 3);
-        assert_eq!(parsed[0].tag, 7);
-        assert_eq!(parsed[0].value, b"nanocloud.io");
-    }
-
-    #[test]
-    fn a_corrupt_store_is_ignored_rather_than_fatal() {
-        assert!(parse(b"nope").is_none());
-        assert!(parse(b"FXPS\x02\x00").is_none(), "wrong version");
-        // A count that overruns the buffer.
-        assert!(parse(b"FXPS\x01\x05").is_none());
-    }
-}

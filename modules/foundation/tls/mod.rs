@@ -868,6 +868,9 @@ struct TlsState {
     // `ecdh_bits_per_step` ladder bits per tick, so the slot's heavy work
     // is spread across ticks exactly like the handshake's own ECDH and the
     // pool replenishes far faster than the fresh-handshake rate consumes it.
+    /// How many pool slots were minted at construction; the rest start
+    /// empty and are filled by the background refill.
+    ecdh_pool_warm: u16,
     /// True while a slot is mid-regeneration (`refill_state` is in flight).
     refill_active: bool,
     /// Pool index being regenerated; only meaningful when `refill_active`.
@@ -1202,6 +1205,33 @@ define_params! {
             s.ecdh_bits_per_step = if v == 0 { 1 } else if v > 256 { 256 } else { v };
         };
 
+    // How many ephemeral ECDH keys to mint before this module is ready.
+    //
+    // The pool exists to keep a synchronous keygen off a SERVER's hot accept
+    // path. Minting all of it at `module_new` made every deployment pay a
+    // busy server's warm-up: 64 keys at ~7.6 ms each is roughly half a
+    // second, before a line of anything else runs, and a CLI client that
+    // opens one connection threw 63 of them away. That was the whole of the
+    // phasor applet's startup time.
+    //
+    // A few are minted here so the first handshakes are instant, and
+    // `pump_ecdh_refill` fills the rest in the background at
+    // `ecdh_bits_per_step` a tick. A deployment that accepts many
+    // simultaneous handshakes from cold sets this higher and pays for what
+    // it asked for; one that does not is not charged for it. Beyond the
+    // warm count a handshake takes the `fallback_keygen` path, which is the
+    // same path the pool has always fallen back to and is counted in the
+    // heartbeat.
+    18, ecdh_pool_warm, u16, 4
+        => |s, d, len| {
+            let v = p_u16(d, len, 0, 4);
+            s.ecdh_pool_warm = if v as usize > MAX_SESSIONS {
+                MAX_SESSIONS as u16
+            } else {
+                v
+            };
+        };
+
     4, transport, u8, 0
         => |s, d, len| { s.transport = p_u8(d, len, 0, 0); };
 
@@ -1441,8 +1471,17 @@ pub unsafe extern "C" fn module_new(
     // Pre-compute ephemeral ECDH key pairs (one per session) during module_new.
     // This runs on the full kernel stack, avoiding PIC stack overflow.
     {
+        let warm = (s.ecdh_pool_warm as usize).min(MAX_SESSIONS);
         let mut i = 0;
         while i < MAX_SESSIONS {
+            if i >= warm {
+                // Not minted: marked consumed so nothing hands it out, and
+                // so `pump_ecdh_refill` treats it as a slot to fill. There is
+                // no key material here to leak — the arrays are zeroed state.
+                s.eph_used[i] = true;
+                i += 1;
+                continue;
+            }
             let mut random = [0u8; 32];
             let rc = dev_csprng_fill(sys, random.as_mut_ptr(), 32);
             if rc < 0 {

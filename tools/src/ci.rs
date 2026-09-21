@@ -614,7 +614,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         } else {
             run_step(label, verbose, || {
                 let argv: Vec<&str> = args.clone();
-                cargo_in(&dir, &argv)
+                cargo_test_in(&dir, &argv)
             })
         });
     }
@@ -2421,8 +2421,69 @@ fn vacuity(
 /// enumeration (not a parse of pass/fail prose), and integration-test
 /// targets come from `cargo metadata` — so "the tree has tests but this
 /// phase ran none" is a structural comparison of two machine surfaces.
+/// `cargo test` for a phase, echoing output as it arrives and remembering
+/// which cases failed.
+///
+/// A phase that reports only an exit code sends the reader back to the log
+/// to find out what broke, and on a run that took ten minutes that is a
+/// second ten minutes. libtest names every failure on stdout, so the names
+/// are already there to be kept. Only stdout is piped — cargo's build
+/// diagnostics go to stderr, which is inherited and so reaches the terminal
+/// untouched and in order.
+fn cargo_test_in(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let mut child = Command::new("cargo")
+        .current_dir(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("cargo: spawn failed: {e}"))?;
+    let mut failed: Vec<String> = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+            // libtest's per-case line: `test some::name ... FAILED`.
+            if let Some(name) = line.strip_prefix("test ") {
+                if let Some(name) = name.strip_suffix(" ... FAILED") {
+                    failed.push(name.trim().to_string());
+                }
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("cargo: wait failed: {e}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let code = status.code().unwrap_or(-1);
+    if failed.is_empty() {
+        // Non-zero with no named case: the build failed, or the binary died
+        // before libtest reported. Say which, rather than implying a test.
+        return Err(format!(
+            "cargo {} exited {code} without naming a failing case — the test \
+             binary failed to build or died before reporting; the compiler \
+             output above is the diagnostic",
+            args.join(" ")
+        ));
+    }
+    Err(format!(
+        "cargo {} exited {code}; {} case(s) failed: {}",
+        args.join(" "),
+        failed.len(),
+        failed.join(", ")
+    ))
+}
+
 fn cargo_test_phase(dir: &Path, args: &[&str]) -> std::result::Result<(), String> {
-    cargo_in(dir, args)?;
+    cargo_test_in(dir, args)?;
     let executed = libtest_case_count(dir, args);
     if executed > 0 {
         return Ok(());

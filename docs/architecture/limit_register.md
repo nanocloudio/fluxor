@@ -25,7 +25,7 @@ means editing its row here in the same change.
 | resolver cache entry (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_CACHE` | modules/sdk/abi/config.rs | 32 | Names held with their address until the answer's TTL runs out; a full table replaces the entry nearest its expiry. One entry is a 64-byte name plus address and expiry (~76 B). 32 on wasm, 4 on embedded |
 | resolver pending dial (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_PENDING` | modules/sdk/abi/config.rs | 8 | Dials parked on a name lookup in flight; two dials of one name share one entry's query. One past the table is refused `EAGAIN` until an answer or timeout frees an entry. 8 on wasm, 4 on embedded |
 | contract class (`required_caps` bitmask, fmod header) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the header's `required_caps`. Registration past the ceiling is refused EINVAL, and a dispatch id at or past it is refused ENOSYS by `check_contract_grant` before either capability gate |
-| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 28 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `STREAM_CLOCK` = 0x1C, leaving 0x1D–0x3F (35 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
+| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 29 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `TRUST` = 0x1D, leaving 0x1E–0x3F (34 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
 | module index (exec_order, fault ids) | u8 | 256 | `MAX_MODULES` | modules/sdk/abi/config.rs | 192 | Deliberate keep at u8; the aarch64 profile sits at 192 of the 256 the width admits. Dual asserts: `src/kernel/boot/config.rs`, `src/kernel/exec/scheduler/mod.rs` |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | 256 | The buffer arena binds first by orders of magnitude |
@@ -87,6 +87,11 @@ means editing its row here in the same change.
 | QUIC resumption tickets | `MAX_TICKETS` | modules/foundation/quic/mod.rs | 4 | Policy: the client-side ticket cache. Each entry is bound to the authority that issued it, so the table holds a handful of recently dialled peers and the oldest is displaced rather than grown |
 | DNS pending forwarded queries | `MAX_PENDING` | modules/foundation/dns/mod.rs | 8 | Policy: with every slot live and unexpired, a new query is answered SERVFAIL rather than displacing accepted work |
 | DNS configured host entries | `MAX_HOSTS` | modules/foundation/dns/mod.rs | 16 | Policy: `host=` parameters past the table are ignored at parse |
+| DNS upstream authority length | `UPSTREAM_AUTHORITY_MAX` | modules/foundation/dns/mod.rs | 64 | Policy: the `host[:port]` an encrypted upstream is dialled at; a longer value refuses construction rather than dialling a truncated authority |
+| DoH endpoint path length | `UPSTREAM_PATH_MAX` | modules/foundation/dns/mod.rs | 64 | Policy: RFC 8484 makes the path server-specific, so it is configured; a longer one refuses construction |
+| DNSSEC signed-form buffer | `DNSSEC_SIGNED_MAX` | modules/foundation/dns/mod.rs | 4096 | Derived: the RRSIG RDATA without its signature, plus the RRset in canonical form. An answer whose signed form exceeds it cannot be checked and is not claimed as checked |
+| DNSSEC trust anchors | `MAX_ANCHORS` | modules/foundation/dns/mod.rs | 4 | Policy: `dnssec_anchor` entries past the table are dropped at parse. Only the first anchor for a zone is consulted, so the table sizes distinct zones, not keys per zone |
+| DNSSEC anchor RDATA | `MAX_ANCHOR_RDATA` | modules/foundation/dns/mod.rs | 1028 | Policy: flags, protocol and algorithm plus the key itself — wide enough for the RSA moduli in use; a longer anchor is dropped at parse |
 | DNS domain name length | `MAX_NAME_LEN` | modules/sdk/contracts/net/dns_wire.rs | 255 | The RFC 1035 full-name ceiling; a longer QNAME is refused at parse. Distinct from the 63-byte per-label ceiling (`MAX_LABEL_LEN`) |
 | DNS compression-pointer hops per name | `MAX_NAME_PTR_HOPS` | modules/sdk/contracts/net/dns_wire.rs | 16 | Sanity: pointers must also point backwards, so a cycle is refused by direction first; the hop bound is the second line. A name past it is malformed |
 | DNS records examined per section | `MAX_SECTION_RRS` | modules/sdk/contracts/net/dns_wire.rs | 32 | Sanity: an upstream answer or UPDATE section claiming more is refused rather than walked |
@@ -151,7 +156,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Dynamic routes | `MAX_DYN_ROUTES` | modules/sdk/abi/config.rs | 64 | Policy: the dynamic-route arena an ingress fills at runtime; a route past the ceiling is refused and counted in `http.routes.dropped` 8 on wasm and embedded. |
 | Backends per route | `MAX_ROUTE_BACKENDS` | modules/sdk/abi/config.rs | 8 | Policy: an oversized backend set is truncated by weight order and the overflow is counted, so the route keeps serving from its heaviest members 4 on wasm and embedded. |
 | Route filesystem path | `MAX_FS_PATH` | modules/sdk/abi/config.rs | 256 | Policy: host routes point into deep on-disk trees; embedded and wasm routes are short on-flash paths like `/web/INDEX.HTM`, and a longer path is refused at compose time 64 on wasm and embedded. |
-| Body pool default | `DEFAULT_BODY_POOL_SIZE` | modules/sdk/abi/config.rs | 262144 | Policy: the request-body pool an http module gets when its config names none; a body that does not fit is refused 413 32 KiB on wasm, 48 KiB on embedded. |
+| Body pool default | `DEFAULT_BODY_POOL_SIZE` | modules/sdk/abi/config.rs | 262144 | Policy: the request-body pool an http module gets when its config names none; a body that does not fit is refused 413. 32 KiB on wasm, 16 KiB on embedded, where the pool is charged against the same SRAM the state arena is. |
 | Fan-in/fan-out buffer | `FAN_BUF_SIZE` | src/kernel/exec/scheduler/module_types.rs | 32768 | Sized per target family (aarch64 / RP / other): the ring behind each expanded fan edge, taken from the channel arena; a frame larger than it cannot cross a fan edge 2048 on RP, 8192 on other families. |
 | Config graph edges | `MAX_GRAPH_EDGES` | src/kernel/boot/config.rs | 128 | Id width: the edge index is a byte in the packed graph section, and every channel table (`MAX_CHANNELS`) is sized from it. A graph with more edges is refused by the tools before it is packed |
 | Channels | `MAX_CHANNELS` | src/kernel/ipc/channel.rs | — | Derived, not chosen: one channel per edge, fan expansion included, so the two move together Not value-checked here: the gate evaluates a const against its own file and this one is written in terms of a symbol from another, so the row on `MAX_GRAPH_EDGES` is what holds the pair. |
@@ -229,7 +234,7 @@ MAX_DNS_CACHE | modules/sdk/abi/config.rs | 4
 MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8
 MAX_DNS_PENDING | modules/sdk/abi/config.rs | 4
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64
-CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 28
+CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 29
 MAX_MODULES | modules/sdk/abi/config.rs | 192
 MAX_MODULES | modules/sdk/abi/config.rs | 48
 MAX_MODULES | modules/sdk/abi/config.rs | 32
@@ -305,6 +310,11 @@ MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024
 MAX_ALPN_CFG | modules/foundation/quic/mod.rs | 64
 MAX_TICKETS | modules/foundation/quic/mod.rs | 4
 MAX_PENDING | modules/foundation/dns/mod.rs | 8
+UPSTREAM_AUTHORITY_MAX | modules/foundation/dns/mod.rs | 64
+UPSTREAM_PATH_MAX | modules/foundation/dns/mod.rs | 64
+DNSSEC_SIGNED_MAX | modules/foundation/dns/mod.rs | 4096
+MAX_ANCHORS | modules/foundation/dns/mod.rs | 4
+MAX_ANCHOR_RDATA | modules/foundation/dns/mod.rs | 1028
 MAX_HOSTS | modules/foundation/dns/mod.rs | 16
 MAX_NAME_LEN | modules/sdk/contracts/net/dns_wire.rs | 255
 MAX_NAME_PTR_HOPS | modules/sdk/contracts/net/dns_wire.rs | 16
@@ -389,7 +399,7 @@ MAX_FS_PATH | modules/sdk/abi/config.rs | 256
 MAX_FS_PATH | modules/sdk/abi/config.rs | 64
 DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 256 * 1024
 DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 32 * 1024
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 48 * 1024
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 16 * 1024
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 32768
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 2048
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 8192

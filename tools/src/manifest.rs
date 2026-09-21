@@ -125,7 +125,7 @@ pub const CONTRACT_ID_SPACE: usize = 64;
 /// Positions consumed in the `required_caps` space, counting the four
 /// reserved ids and excluding the kernel-internal dispatch bucket (0x0C).
 /// Registered in `docs/architecture/limit_register.md`.
-pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 28;
+pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 29;
 
 /// Parse a contract name from `[[resources]].requires_contract`. Only
 /// public contract names are accepted here — `"internal"` and specific

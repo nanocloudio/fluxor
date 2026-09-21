@@ -844,7 +844,10 @@ pub fn module_index_on_core(core: usize) -> usize {
 /// Scheduler-thread context during instantiation; `ptr`/`size` must be the
 /// range `loader::alloc_state` returned for this module.
 pub unsafe fn set_module_arena(idx: usize, ptr: *mut u8, size: u32) {
-    let sched = &mut *(&raw mut SCHED);
+    // A raw pointer taken first, then dereferenced: a `&mut SCHED` would be a
+    // reference to a `static mut`, which is what the raw form exists to avoid.
+    let p = &raw mut SCHED;
+    let sched = &mut *p;
     if idx < sched.arenas.len() {
         sched.arenas[idx] = ArenaInfo { ptr, size };
     }

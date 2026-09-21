@@ -888,6 +888,7 @@ dependencies = [
  "fluxor-contracts",
  "futures-util",
  "libc",
+ "log",
  "proc-macro2",
  "regex",
  "rustls",

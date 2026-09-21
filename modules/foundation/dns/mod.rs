@@ -2104,8 +2104,7 @@ fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
     let mut i = 0usize;
     while i <= last {
         let mut j = 0usize;
-        while j < needle.len() && hay[i + j].to_ascii_lowercase() == needle[j].to_ascii_lowercase()
-        {
+        while j < needle.len() && hay[i + j].eq_ignore_ascii_case(&needle[j]) {
             j += 1;
         }
         if j == needle.len() {

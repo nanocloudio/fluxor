@@ -127,6 +127,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 # tooling.
 tempfile = "3"
 
+# `tests/param_store.rs` mounts `src/platform/linux/param_store.rs` the
+# way the platform does, with `include!`, so it needs the crates that
+# source uses. The store logs what it read and what it refused.
+log = "0.4.29"
+
 # Inherit the workspace lint configuration. The tools CLI and
 # telemetry monitor are user-facing binaries that print to stdout,
 # so they relax `clippy::print_stdout` / `clippy::print_stderr` at
