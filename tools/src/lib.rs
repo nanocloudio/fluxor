@@ -26,6 +26,7 @@ pub mod collect;
 // `fluxor.toml`'s schema, gated by `fluxor ci`'s `fluxor-toml-schema`
 // phase: which keys a project must carry, which its shape forbids, and
 // the one meaning each key has.
+pub mod b64;
 pub mod capacity;
 pub mod ci_schema;
 pub mod compose;

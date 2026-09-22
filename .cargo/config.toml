@@ -10,6 +10,21 @@ rustflags = [
 # The linker script is emitted by build.rs, which knows the target; this
 # file cannot see Cargo features.
 
+# Every cargo invocation for the host triple agrees on these flags, which is
+# why they are declared here rather than on a command line. RUSTFLAGS is part
+# of every non-build-script unit's fingerprint, so a flag set for one
+# invocation and not another splits the build cache in two and compiles the
+# shared units — `ring` and `rustls` among them — once per variant.
+#
+# The requirement is the platform's (targets/host/linux.toml): the host CPU
+# must carry FEAT_AES and FEAT_SHA256, because the bcm2712 modules it loads
+# and its own kernel binary need them. Declaring them here extends that to the
+# CLI and the launcher, which ship alongside that runtime.
+#
+# An environment RUSTFLAGS REPLACES this list rather than adding to it.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+aes,+sha2,+neon"]
+
 [build]
 target = "thumbv8m.main-none-eabihf"
 

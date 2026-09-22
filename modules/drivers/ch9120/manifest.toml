@@ -1,5 +1,5 @@
 version = "1.0.0"
-hardware_targets = ["rp2350"]
+hardware_targets = ["rp2040", "rp2350"]
 
 [[ports]]
 name = "net_tx"

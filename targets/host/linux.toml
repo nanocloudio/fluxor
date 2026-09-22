@@ -3,8 +3,13 @@
 # No real hardware peripherals; modules communicate via kernel channels.
 #
 # The host CPU must carry the ARMv8 Cryptography Extension (FEAT_AES,
-# FEAT_SHA256): the bcm2712 modules this host loads and its own kernel
-# binary are compiled with `+aes,+sha2,+neon`.
+# FEAT_SHA256). Everything fluxor builds for this triple is compiled with
+# `+aes,+sha2,+neon` — the bcm2712 modules this host loads, its own kernel
+# binary, and the `fluxor` CLI and launcher, which are published artefacts
+# that ship alongside that runtime. The flags are declared once, in
+# `.cargo/config.toml`, so that every invocation agrees: a host that cannot
+# run the runtime cannot run the CLI either. The extensions are optional in
+# ARMv8-A, and the Pi 4's BCM2711 is one part that omits them.
 
 [target]
 id = "linux"

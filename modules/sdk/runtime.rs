@@ -26,6 +26,7 @@ pub static FLUXOR_ABI_SURFACE: [u8; 32] = abi::abi_surface::ABI_SURFACE_DIGEST;
 include!("wire/wire.rs");
 
 // ── Runtime split into responsibility files (F8) ──
+include!("runtime/state.rs");
 include!("runtime/intrinsics.rs");
 include!("runtime/consts.rs");
 include!("runtime/format.rs");

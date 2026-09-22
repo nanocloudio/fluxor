@@ -115,6 +115,41 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
             max_endpoints: 64,              // agent admission policy
             max_domains: 4,                 // scheduler MAX_DOMAINS
         }),
+        // MCU silicon. Without a capacity row here, composition has no model
+        // for an RP target: a graph is admitted blind and discovers its
+        // sizing as a boot-time clamp-and-log (`capacity::kernel_pool_static_cap`
+        // says so outright for the RP arenas). On a die whose whole state
+        // arena is 64 KiB that is the difference between a build error and a
+        // board that boots with modules missing.
+        //
+        // The arena figures come from `targets/silicon/<id>.toml` and are
+        // mirrored here rather than read, because this function is pure and has
+        // no repo path. `capacity_mirrors_silicon_tomls` (below) extracts them
+        // textually and fails on drift — the same mitigation the host row uses
+        // against the kernel constants.
+        //
+        // `max_owners: 1` is the system slot alone: multitenancy is an aarch64
+        // feature, so there are no workload slots to hand out. `max_modules`
+        // comes from `kernel_max_modules`, which already answers 32 for every
+        // non-host target.
+        "rp2040" | "pico" | "picow" => Some(NodeCapacity {
+            max_owners: 1,
+            max_modules: crate::capacity::kernel_max_modules(profile) as u16,
+            max_edges: 128,
+            state_bytes: 64 * 1024,  // rp2040.toml state_arena_kb
+            buffer_bytes: 16 * 1024, // rp2040.toml buffer_arena_kb
+            max_endpoints: 4,
+            max_domains: 4,
+        }),
+        "rp2350" | "pico2w" | "waveshare-lcd4" => Some(NodeCapacity {
+            max_owners: 1,
+            max_modules: crate::capacity::kernel_max_modules(profile) as u16,
+            max_edges: 128,
+            state_bytes: 240 * 1024, // rp2350.toml state_arena_kb
+            buffer_bytes: 64 * 1024, // rp2350.toml buffer_arena_kb
+            max_endpoints: 8,
+            max_domains: 4,
+        }),
         _ => None,
     }
 }
@@ -1638,6 +1673,47 @@ mod tests {
         );
     }
 
+    /// The MCU rows of `capacity_for_profile` mirror the silicon TOMLs. Those
+    /// arena sizes are the kernel's actual budget on those dies, so a composer
+    /// that admits against a stale copy admits graphs the arena cannot hold —
+    /// and on a 64 KiB die the margin for that error is nil.
+    #[test]
+    fn capacity_mirrors_silicon_tomls() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for (silicon, expect_state_kb, expect_buffer_kb) in
+            [("rp2040", 64u64, 16u64), ("rp2350", 240, 64)]
+        {
+            let toml =
+                std::fs::read_to_string(repo.join(format!("targets/silicon/{silicon}.toml")))
+                    .unwrap_or_else(|_| panic!("{silicon}: no silicon toml"));
+            let kb = |key: &str| -> u64 {
+                toml.lines()
+                    .find(|l| l.trim_start().starts_with(key))
+                    .unwrap_or_else(|| panic!("{silicon}: no {key}"))
+                    .split('=')
+                    .nth(1)
+                    .expect("value")
+                    .trim()
+                    .parse()
+                    .expect("integer")
+            };
+            assert_eq!(
+                kb("state_arena_kb"),
+                expect_state_kb,
+                "{silicon} state_arena_kb moved; update capacity_for_profile"
+            );
+            assert_eq!(
+                kb("buffer_arena_kb"),
+                expect_buffer_kb,
+                "{silicon} buffer_arena_kb moved; update capacity_for_profile"
+            );
+            let cap = capacity_for_profile(silicon)
+                .unwrap_or_else(|| panic!("{silicon}: no composer capacity row"));
+            assert_eq!(cap.state_bytes as u64, expect_state_kb * 1024);
+            assert_eq!(cap.buffer_bytes as u64, expect_buffer_kb * 1024);
+        }
+    }
+
     /// Drift guard: `capacity_for_profile` mirrors kernel constants it cannot
     /// import (they live behind target cfgs). Textual extraction is the
     /// accepted pattern for cross-cfg drift guards in this repo (see the ABI
@@ -1695,10 +1771,21 @@ mod tests {
             assert_eq!(c.max_modules, cap.max_modules);
             assert_eq!(c.max_owners, cap.max_owners);
         }
-        assert!(
-            capacity_for_profile("rp2350").is_none(),
-            "single-tenant target has no agent profile"
-        );
+        // The MCU rows exist but hand out no workload owner slots:
+        // multitenancy is an aarch64 feature, so `max_owners` is the system
+        // slot alone. Their arena figures are pinned against the silicon
+        // TOMLs by `capacity_mirrors_silicon_tomls`; what belongs here is the
+        // half that mirrors a kernel source — the embedded module ceiling
+        // both dies share.
+        for mcu in ["rp2040", "rp2350"] {
+            let c = capacity_for_profile(mcu).unwrap_or_else(|| panic!("{mcu}: no capacity row"));
+            assert_eq!(c.max_owners, 1, "{mcu} is single-tenant");
+            assert_eq!(
+                c.max_modules as u64,
+                extract_nth(&sdk, "MAX_MODULES", 3),
+                "{mcu} uses profile_embedded's module ceiling"
+            );
+        }
     }
 
     /// The `n`th (1-based) `pub const <name>: usize = …;` in `src`, its

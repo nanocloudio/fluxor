@@ -8,10 +8,6 @@
 // Everything routes through `SyscallTable::provider_call`.
 
 /// Monotonic time in milliseconds (TIMER::MILLIS 0x0602).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
@@ -21,10 +17,6 @@ unsafe fn dev_millis(sys: &SyscallTable) -> u64 {
 
 /// Monotonic time in microseconds (TIMER::MICROS 0x0603). Useful for
 /// per-phase profiling at sub-millisecond granularity.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
@@ -40,10 +32,6 @@ unsafe fn dev_micros(sys: &SyscallTable) -> u64 {
 /// still valid: a bare `u64` cannot say whether it is worth trusting, and on
 /// a board with no RTC it is zero — which every current caller silently
 /// treats as "1970", i.e. as an expiry that has not happened yet.
-#[allow(
-    dead_code,
-    reason = "used by credential-validation consumers; not every module reads it"
-)]
 #[inline(always)]
 unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
     // 36 is `trusted_time::LEN`, reserved word included: the syscall refuses
@@ -62,10 +50,6 @@ unsafe fn dev_trusted_unix(sys: &SyscallTable) -> [u8; 36] {
 /// boot, shared by every module. `None` until the kernel's entropy source
 /// has answered — a consumer minting a token waits rather than minting
 /// against zeros.
-#[allow(
-    dead_code,
-    reason = "used by modules that mint boot-bound tokens; not every module reads it"
-)]
 #[inline(always)]
 unsafe fn dev_boot_incarnation(sys: &SyscallTable) -> Option<[u8; 16]> {
     let mut buf = [0u8; 16];
@@ -80,10 +64,6 @@ unsafe fn dev_boot_incarnation(sys: &SyscallTable) -> Option<[u8; 16]> {
 /// Wall-clock milliseconds since the Unix epoch (TIMER::UNIX_MILLIS 0x0608), or 0 on a
 /// platform with no real-time clock. Distinct from `dev_millis` (monotonic uptime); use for
 /// absolute-time checks (certificate validity, JWT `exp`). See docs/surface-auth.md.
-#[allow(
-    dead_code,
-    reason = "used by absolute-time consumers (surface auth); not every module reads it"
-)]
 #[inline(always)]
 unsafe fn dev_unix_millis(sys: &SyscallTable) -> u64 {
     let mut buf = [0u8; 8];
@@ -95,10 +75,6 @@ unsafe fn dev_unix_millis(sys: &SyscallTable) -> u64 {
 /// (MODULE_FLOW_BUDGET 0x0C46). Returns 0 when the wired edge
 /// carries no streaming rate class; callers keep their own
 /// unit-per-step pacing in that case.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_flow_budget(sys: &SyscallTable, port_index: u8) -> u32 {
     let arg = [port_index];
@@ -112,7 +88,6 @@ unsafe fn dev_flow_budget(sys: &SyscallTable, port_index: u8) -> u32 {
 
 /// Per-step consumption budget for one of this module's input ports. Uses the
 /// same class and live domain period as [`dev_flow_budget`].
-#[allow(dead_code, reason = "only bounded consumer pumps use input budgets")]
 #[inline(always)]
 unsafe fn dev_input_flow_budget(sys: &SyscallTable, input_chan: i32, input_port_index: u8) -> u32 {
     let channel = input_chan.to_le_bytes();
@@ -133,20 +108,12 @@ unsafe fn dev_input_flow_budget(sys: &SyscallTable, input_chan: i32, input_port_
 }
 
 /// Log a message (kernel primitive LOG_WRITE, opcode 0x0C40). Level encoded as handle.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_log(sys: &SyscallTable, level: u8, msg: *const u8, len: usize) {
     (sys.provider_call)(level as i32, 0x0C40, msg as *mut u8, len);
 }
 
 /// Poll any fd via provider_call (kernel primitive HANDLE_POLL, opcode 0x0C41).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u32) -> i32 {
     let mut buf = [events as u8];
@@ -154,20 +121,12 @@ unsafe fn dev_fd_poll(sys: &SyscallTable, fd: i32, events: u32) -> i32 {
 }
 
 /// Create an event via provider_call (EVENT::CREATE 0x0B00).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_event_create(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0B00, core::ptr::null_mut(), 0)
 }
 
 /// Poll an event via provider_call (EVENT::POLL 0x0B02). Returns 1 if signaled (clears it), 0 if not.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_event_poll(sys: &SyscallTable, handle: i32) -> i32 {
     (sys.provider_call)(handle, 0x0B02, core::ptr::null_mut(), 0)
@@ -175,10 +134,6 @@ unsafe fn dev_event_poll(sys: &SyscallTable, handle: i32) -> i32 {
 
 /// Bind an event to a hardware IRQ (kernel primitive BIND_IRQ, opcode 0x0C51).
 /// `irq`: GIC interrupt number. `mmio_base`: virtio-mmio base for auto-ACK (0 = none).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_base: usize) -> i32 {
     let mut buf = [0u8; 12];
     let bp = buf.as_mut_ptr();
@@ -198,10 +153,6 @@ unsafe fn dev_irq_bind(sys: &SyscallTable, event_handle: i32, irq: u32, mmio_bas
 
 /// Query graph-level sample rate (kernel primitive GRAPH_SAMPLE_RATE, opcode 0x0C31).
 /// Returns 0 if not configured.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
@@ -215,10 +166,6 @@ unsafe fn dev_graph_sample_rate(sys: &SyscallTable) -> u32 {
 
 /// Query system clock frequency (kernel primitive SYS_CLOCK_HZ, opcode 0x0C3B).
 /// Returns 0 on error (should not happen in practice).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_sys_clock_hz(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
@@ -233,10 +180,6 @@ unsafe fn dev_sys_clock_hz(sys: &SyscallTable) -> u32 {
 /// Query stream time via `provider_query(-1, kernel_abi::STREAM_TIME)`.
 /// Returns the first active PIO stream's (consumed_units, queued_units,
 /// units_per_sec_q16, t0_micros), or zeros if no stream is active.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
     let mut buf = [0u8; 24]; // StreamTime is 24 bytes
@@ -257,10 +200,6 @@ unsafe fn dev_stream_time(sys: &SyscallTable) -> (u64, u32, u32, u64) {
 
 /// Query downstream latency (kernel primitive DOWNSTREAM_LATENCY, opcode 0x0C33).
 /// Returns frames of latency downstream from the calling module, or 0.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_downstream_latency(sys: &SyscallTable) -> u32 {
     let mut buf = [0u8; 4];
@@ -273,10 +212,6 @@ unsafe fn dev_downstream_latency(sys: &SyscallTable) -> u32 {
 }
 
 /// Report module's processing latency (kernel primitive REPORT_LATENCY, opcode 0x0C50).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_report_latency(sys: &SyscallTable, frames: u32) {
     let mut buf = frames.to_le_bytes();
@@ -302,10 +237,6 @@ mod step_effect {
 /// keep the adaptive pacer hot without an immediate same-module re-step; the
 /// re-step decision stays with the `StepOutcome::Burst` return value. A module
 /// that never calls this is treated as `Idle`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_report_step_effect(sys: &SyscallTable, effect: u8) {
     let mut buf = [effect];
@@ -313,10 +244,6 @@ unsafe fn dev_report_step_effect(sys: &SyscallTable, effect: u8) {
 }
 
 /// Discover channel port via provider_call (CHANNEL::PORT 0x050C).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 {
     let mut buf = [0u8; 2];
@@ -341,10 +268,6 @@ unsafe fn dev_channel_port(sys: &SyscallTable, port_type: u8, index: u8) -> i32 
 /// background reclamation, a heartbeat — and a provider MUST NOT fall back to
 /// the last caller it saw there, which would charge its own housekeeping to
 /// whoever happened to call it most recently.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_caller_owner(sys: &SyscallTable) -> Option<(u16, u32)> {
     let mut buf = [0u8; 8];
@@ -369,10 +292,6 @@ unsafe fn dev_caller_owner(sys: &SyscallTable) -> Option<(u16, u32)> {
 ///
 /// On return the first `arg_len` bytes of `arg` carry the handler's
 /// response. Pass `arg = null` and `arg_len = 0` for arg-less cmds.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_channel_ioctl(
     sys: &SyscallTable,
@@ -407,10 +326,6 @@ unsafe fn dev_channel_ioctl(
 ///
 /// Registration is one-shot per channel; the last call wins. The
 /// `state` pointer is typically `&mut MyState as *mut c_void`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_channel_register_ioctl(
     sys: &SyscallTable,
@@ -432,10 +347,6 @@ unsafe fn dev_channel_register_ioctl(
 
 /// Acquire write access to mailbox buffer via provider_call (BUFFER::ACQUIRE_WRITE 0x0A00).
 /// Returns pointer (as *mut u8) or null. capacity_out receives buffer capacity.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_write(
     sys: &SyscallTable,
@@ -446,10 +357,6 @@ unsafe fn dev_buffer_acquire_write(
 }
 
 /// Release write buffer via provider_call (BUFFER::RELEASE_WRITE 0x0A01).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_buffer_release_write(sys: &SyscallTable, chan: i32, len: u32) -> i32 {
     let mut buf = len.to_le_bytes();
@@ -458,10 +365,6 @@ unsafe fn dev_buffer_release_write(sys: &SyscallTable, chan: i32, len: u32) -> i
 
 /// Acquire in-place buffer access via provider_call (BUFFER::ACQUIRE_INPLACE 0x0A04).
 /// Returns pointer to existing data or null. len_out receives data length.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_inplace(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *mut u8 {
     (sys.provider_call)(chan, 0x0A04, len_out as *mut u8, 4) as *mut u8
@@ -469,20 +372,12 @@ unsafe fn dev_buffer_acquire_inplace(sys: &SyscallTable, chan: i32, len_out: *mu
 
 /// Acquire read access to buffer via provider_call (BUFFER::ACQUIRE_READ 0x0A02).
 /// Returns pointer to data or null. len_out receives data length.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_buffer_acquire_read(sys: &SyscallTable, chan: i32, len_out: *mut u32) -> *const u8 {
     (sys.provider_call)(chan, 0x0A02, len_out as *mut u8, 4) as *const u8
 }
 
 /// Release read buffer via provider_call (BUFFER::RELEASE_READ 0x0A03).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
     (sys.provider_call)(chan, 0x0A03, core::ptr::null_mut(), 0)
@@ -494,10 +389,6 @@ unsafe fn dev_buffer_release_read(sys: &SyscallTable, chan: i32) -> i32 {
 /// the op's OWN handle (`-1` for open-style ops, or a provider-local slot);
 /// `sel` is purely routing. Returns the provider's result, or negative
 /// errno (`EINVAL` / `ENODEV` when no layer carries that selector).
-#[allow(
-    dead_code,
-    reason = "consumed by the mount policy module; not every module routes by selector"
-)]
 #[inline(always)]
 unsafe fn dev_provider_call_sel(
     sys: &SyscallTable,

@@ -327,7 +327,7 @@ fn rp_sleep_until(deadline_us: u64) -> u32 {
 }
 
 // Flash bounds come from linker symbols declared in
-// `memory-rp2350.x` / `memory-rp2040.x` (`__flash_start__` /
+// `linker/memory-rp2350.x` / `linker/memory-rp2040.x` (`__flash_start__` /
 // `__flash_end__`) rather than being hardcoded. The linker's view is
 // the authoritative one — RP2350 ships with a 4 MiB flash region and
 // RP2040 with 2 MiB, so any constant baked into the kernel would

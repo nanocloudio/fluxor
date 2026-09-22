@@ -43,6 +43,7 @@ pub enum Rule {
     SdkMount,
     RepoFiles,
     ConsumerNaming,
+    CrateRootAllow,
 }
 
 impl Rule {
@@ -50,6 +51,7 @@ impl Rule {
         match self {
             Rule::InlineTests => "inline-tests",
             Rule::AllowWithoutReason => "allow-without-reason",
+            Rule::CrateRootAllow => "crate-root-allow",
             Rule::ModuleStructure => "module-structure",
             Rule::ShadowGuard => "shadow-guard",
             Rule::SdkMount => "sdk-mount",
@@ -85,6 +87,19 @@ struct HygieneTable {
     forbid_inline_tests: Vec<String>,
     #[serde(default)]
     max_inline_lines: Option<usize>,
+    /// `[[ci.hygiene.allow_crate_root]]` rows: a path prefix and the reason
+    /// a crate-root allow is permitted under it.
+    #[serde(default)]
+    allow_crate_root: Vec<AllowCrateRootRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AllowCrateRootRow {
+    /// Repo-relative path prefix, `/`-separated.
+    prefix: String,
+    /// Why a crate-root allow is permitted there. Required: an exemption
+    /// without a reason is a conformance failure, not an escape hatch.
+    reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +107,16 @@ pub struct Config {
     pub mode: Mode,
     pub forbid_inline_tests: Vec<String>,
     pub max_inline_lines: usize,
+    /// Path prefixes where a crate-root `#![allow(...)]` is permitted, each
+    /// with the reason it is permitted there.
+    ///
+    /// `standards/lints.md` §4 bans crate-root allows outright, which a tree
+    /// with a structural cause for them cannot satisfy. The escape is the one
+    /// the ecosystem's other gates take: a structured row carrying its own
+    /// reason, per `standards/rfc-process.md` §6 — *"Plain path lists are not
+    /// allowed; an exemption without a reason is a conformance failure, not
+    /// an escape hatch"*.
+    pub allow_crate_root: Vec<(String, String)>,
 }
 
 impl Default for Config {
@@ -103,6 +128,9 @@ impl Default for Config {
             mode: Mode::Strict,
             forbid_inline_tests: vec!["modules".to_string(), "src".to_string()],
             max_inline_lines: 80,
+            // Empty: a project that declares no exemption gets the standard's
+            // flat ban, which is the right default for a single-target tree.
+            allow_crate_root: Vec::new(),
         }
     }
 }
@@ -154,6 +182,11 @@ impl Config {
                 h.forbid_inline_tests
             },
             max_inline_lines: h.max_inline_lines.unwrap_or(80),
+            allow_crate_root: h
+                .allow_crate_root
+                .into_iter()
+                .map(|e| (e.prefix, e.reason))
+                .collect(),
         })
     }
 }
@@ -1032,6 +1065,7 @@ fn scan_file(rel: &Path, src: &str, tier: Tier, config: &Config) -> Vec<Violatio
         max_inline_lines: config.max_inline_lines,
         permitted_trailing: permitted_trailing_id,
         in_permitted_depth: 0,
+        allow_crate_root: &config.allow_crate_root,
     };
     visitor.visit_file(&parsed);
     out
@@ -1061,6 +1095,8 @@ struct HygieneVisitor<'a> {
     /// Recursion depth currently inside the permitted trailing block;
     /// while > 0, inline-test attrs/items are suppressed.
     in_permitted_depth: usize,
+    /// Path prefixes where a crate-root `#![allow]` is declared permitted.
+    allow_crate_root: &'a [(String, String)],
 }
 
 impl<'a> HygieneVisitor<'a> {
@@ -1081,6 +1117,30 @@ impl<'a> HygieneVisitor<'a> {
                 "`#{}[allow(...)]` missing `reason = \"...\"`",
                 if is_inner { "!" } else { "" }
             ),
+        });
+    }
+
+    /// `standards/lints.md` §4: a crate-root `#![allow(...)]` in a
+    /// non-generated file is not permitted. Permitted only where the project
+    /// has declared a prefix and said why.
+    fn check_crate_root_allow(&mut self, attr: &Attribute, exempt: &[(String, String)]) {
+        // `exempt` is passed in rather than read from `self` so the borrow
+        // checker can see it does not alias `self.violations`.
+        if !attr_is_allow(attr) || !matches!(attr.style, syn::AttrStyle::Inner(_)) {
+            return;
+        }
+        let rel = self.rel.to_string_lossy().replace('\\', "/");
+        if exempt.iter().any(|(prefix, _)| rel.starts_with(prefix)) {
+            return;
+        }
+        self.violations.push(Violation {
+            path: self.rel.to_path_buf(),
+            line: attr.pound_token.span.start().line,
+            rule: Rule::CrateRootAllow,
+            message: "crate-root `#![allow(...)]` (lints.md §4). Fix it at the call site \
+                      with `#[expect]`, or declare a `[[ci.hygiene.allow_crate_root]]` \
+                      prefix with a reason"
+                .to_string(),
         });
     }
 
@@ -1119,6 +1179,8 @@ impl<'a, 'ast> Visit<'ast> for HygieneVisitor<'a> {
         // permitted trailing block, where we still want to catch
         // `#[allow(dead_code)]` without a reason.
         self.check_allow(attr);
+        let exempt = self.allow_crate_root;
+        self.check_crate_root_allow(attr, exempt);
         self.check_inline_test_attr(attr);
     }
 
@@ -1328,6 +1390,7 @@ mod tests {
             mode: Mode::Strict,
             forbid_inline_tests: vec!["modules".into(), "src".into()],
             max_inline_lines: 80,
+            allow_crate_root: Vec::new(),
         }
     }
 
@@ -1336,6 +1399,7 @@ mod tests {
             mode: Mode::Permissive,
             forbid_inline_tests: vec!["modules".into(), "src".into()],
             max_inline_lines: cap,
+            allow_crate_root: Vec::new(),
         }
     }
 
@@ -1456,8 +1520,30 @@ fn f() {}
     fn inner_allow_without_reason_is_flagged() {
         let src = "#![allow(dead_code)]\n";
         let v = scan_str(src, Tier::Tests, &strict());
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].rule, Rule::AllowWithoutReason);
+        // Two rules fire, and both are right: the attribute carries no
+        // reason, AND it is a crate-root allow with no declared prefix.
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v.iter().any(|x| x.rule == Rule::AllowWithoutReason));
+        assert!(v.iter().any(|x| x.rule == Rule::CrateRootAllow));
+    }
+
+    /// A crate-root allow is permitted only where a prefix says so, and the
+    /// prefix must carry a reason — a bare list is what `rfc-process.md` §6
+    /// and `tests.md` §3 refuse.
+    #[test]
+    fn a_declared_prefix_permits_a_crate_root_allow() {
+        let src = "#![allow(dead_code, reason = \"mounted SDK surface\")]\n";
+        let mut cfg = strict();
+        assert_eq!(
+            scan_str(src, Tier::Modules, &cfg).len(),
+            1,
+            "undeclared: the crate-root rule fires"
+        );
+        cfg.allow_crate_root = vec![("dummy.rs".into(), "the test's own file".into())];
+        assert!(
+            scan_str(src, Tier::Modules, &cfg).is_empty(),
+            "declared: nothing fires"
+        );
     }
 
     #[test]

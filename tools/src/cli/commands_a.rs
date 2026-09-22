@@ -578,6 +578,83 @@ fn cmd_generate(
     Ok(())
 }
 
+/// Charge a graph's modules against the target's state arena and REFUSE an
+/// over-budget image.
+///
+/// Each `.fmod` carries the resident-state figure `pack` read from the SDK's
+/// `declare_module_state_bytes!` static, so this is a sum of measurements rather
+/// than of estimates. The kernel refuses arena exhaustion at module load; that
+/// is correct but late — it presents as a board that boots with modules missing,
+/// on a die with no console guarantee. Doing the arithmetic here turns it into a
+/// build error with the numbers shown.
+///
+/// Modules that publish no figure are counted and named: a partial sum is
+/// reported as partial rather than passed off as a total, and the budget is not
+/// enforced when any module is unknown — refusing on an incomplete sum would be
+/// worse than not refusing.
+fn check_state_budget(
+    modules: &[modules::ModuleInfo],
+    target: &crate::target::TargetDescriptor,
+) -> Result<()> {
+    if modules.is_empty() {
+        return Ok(());
+    }
+    let arena = target.state_arena_kb as u64 * 1024;
+    let mut total = 0u64;
+    let mut unknown: Vec<&str> = Vec::new();
+    let mut rows: Vec<(String, u64)> = Vec::new();
+    for m in modules {
+        let bytes = m.manifest.state_bytes_64 as u64 * 64;
+        if bytes == 0 {
+            unknown.push(m.name.as_str());
+        } else {
+            total += bytes;
+        }
+        rows.push((m.name.clone(), bytes));
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("State arena ({}): {} B", target.id, arena);
+    for (name, bytes) in &rows {
+        if *bytes == 0 {
+            println!("  {name:<20} unknown");
+        } else {
+            println!("  {name:<20} {bytes:>9}");
+        }
+    }
+    let pct = if arena > 0 { total * 100 / arena } else { 0 };
+    if total > arena {
+        println!("  {:<20} {total:>9}  OVER by {}", "total", total - arena);
+    } else {
+        println!(
+            "  {:<20} {total:>9}  {pct}% of {arena}, slack {}",
+            "total",
+            arena - total
+        );
+    }
+
+    if !unknown.is_empty() {
+        println!(
+            "  note: {} module(s) publish no state size ({}), so this is a PARTIAL sum \
+             and the budget is not enforced",
+            unknown.len(),
+            unknown.join(", ")
+        );
+        return Ok(());
+    }
+    if total > arena {
+        return Err(Error::Config(format!(
+            "graph needs {total} B of module state but {}'s arena is {arena} B — over by {} B. \
+             Drop a module, select a smaller variant, or raise state_arena_kb in \
+             targets/silicon/{}.toml (which costs the buffer arena and the stack).",
+            target.id,
+            total - arena,
+            target.id,
+        )));
+    }
+    Ok(())
+}
+
 fn cmd_combine(
     firmware_path: &PathBuf,
     config_path: &PathBuf,
@@ -737,6 +814,8 @@ fn cmd_combine(
         Some(&target_desc.id),
         &crate::project::root_for_config(config_path),
     )?;
+
+    check_state_budget(&modules, &target_desc)?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {
@@ -1032,6 +1111,8 @@ fn build_packaged_blobs(
         Some(&target_desc.id),
         project_root,
     )?;
+
+    check_state_budget(&modules, &target_desc)?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {

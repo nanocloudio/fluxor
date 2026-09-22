@@ -91,6 +91,12 @@ pub enum Endpoint {
     /// Direct-API only: the FLXA v1 wire has no channel-endpoint kind,
     /// mirroring `AddEdge::wake_on_write`'s direct-only status.
     ExistingChannel(i32),
+    /// A **tap** on a live module's output port (global slot index), valid
+    /// only as an edge `from`. The edge gets a fresh channel that the kernel
+    /// fills with a copy of every write to that port's channel — lossy, never
+    /// back-pressuring the producer — and the tapped module's own wiring is
+    /// untouched. FLXA endpoint kind 2. One tap per channel.
+    Tap(u16),
 }
 
 /// One edge of the added subgraph. `from`/`to` are subgraph-local for new
@@ -328,7 +334,7 @@ pub fn apply_add(
     let resolve = |ep: Endpoint| -> Option<usize> {
         match ep {
             Endpoint::New(l) => local_to_global.get(l as usize).copied(),
-            Endpoint::Existing(g) => {
+            Endpoint::Existing(g) | Endpoint::Tap(g) => {
                 let g = g as usize;
                 if g < MAX_MODULES && !matches!(sched().modules[g], ModuleSlot::Empty) {
                     Some(g)
@@ -392,8 +398,27 @@ pub fn apply_add(
                 return Err(AddError::BadEndpoint);
             }
         };
+        let tap_source = if let Endpoint::Tap(_) = ae.from {
+            // The tapped port must be one the module already writes.
+            let ports = &sched().ports[from];
+            let p = ae.from_port_index as usize;
+            let ch = if p < ports.out_count as usize {
+                ports.out_chans[p]
+            } else {
+                -1
+            };
+            if ch < 0 || matches!(ae.to, Endpoint::Tap(_)) {
+                sched().owners.free(handle);
+                return Err(AddError::BadEndpoint);
+            }
+            ch
+        } else {
+            -1
+        };
         let mut edge =
             Edge::new_indexed(from, "out", ae.from_port_index, to, "in", ae.to_port_index);
+        edge.tap = tap_source >= 0;
+        edge.tap_source = tap_source;
         edge.buffer_bytes = ae.buffer_bytes;
         edge.wake_on_write = ae.wake_on_write;
         sched().edges[edge_base + i] = edge;
@@ -408,6 +433,21 @@ pub fn apply_add(
             clear_edge_range(edge_base, e);
             sched().owners.free(handle);
             return Err(AddError::ChannelOpenFailed);
+        }
+    }
+    // Attach each tap: its fresh channel becomes the mirror of the tapped
+    // port's channel. A channel already tapped refuses the add (one mirror
+    // per channel); nothing is committed yet, so the rollback is local.
+    for i in edge_base..edge_base + e {
+        let edge = sched().edges[i];
+        if edge.tap
+            && !crate::kernel::ipc::channel::channel_set_mirror(edge.tap_source, edge.channel)
+        {
+            detach_taps(edge_base, i - edge_base);
+            super::close_channels(&sched().edges[edge_base..edge_base + e]);
+            clear_edge_range(edge_base, e);
+            sched().owners.free(handle);
+            return Err(AddError::BadEndpoint);
         }
     }
     sched().edge_count = edge_base + e;
@@ -605,6 +645,7 @@ fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize
         super::set_module_owner(slot, OWNER_SYSTEM);
     }
     if e > 0 {
+        detach_taps(edge_base, e);
         super::close_channels(&s.edges[edge_base..edge_base + e]);
     }
     clear_edge_range(edge_base, e);
@@ -667,6 +708,17 @@ fn topo_order_new(slots: &[usize], edges: &[AddEdge]) -> [usize; MAX_ADD_MODULES
         }
     }
     out
+}
+
+/// Stop mirroring into every tap edge in `edges[base..base+count]`.
+fn detach_taps(base: usize, count: usize) {
+    let s = sched();
+    for i in base..base + count {
+        let edge = s.edges[i];
+        if edge.tap && edge.tap_source >= 0 {
+            crate::kernel::ipc::channel::channel_set_mirror(edge.tap_source, -1);
+        }
+    }
 }
 
 /// Reset `edges[base..base+count]` to the empty default (channel = -1).
@@ -782,6 +834,22 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
             let edge = s.edges[r];
             let from_owned = edge.from_module < MAX_MODULES && owned[edge.from_module];
             let to_owned = edge.to_module < MAX_MODULES && owned[edge.to_module];
+            if edge.tap && edge.tap_source >= 0 && (from_owned || to_owned) {
+                // Either end going stops the mirror.
+                crate::kernel::ipc::channel::channel_set_mirror(edge.tap_source, -1);
+            }
+            if edge.tap && from_owned && !to_owned {
+                // The TAPPED module went; its observer lives on. End the tap's
+                // stream (the observer completes by EOF) and keep the edge —
+                // and its channel, which the observer still reads — until the
+                // observer's own owner is freed.
+                crate::kernel::ipc::channel::channel_mark_hup(edge.channel);
+                let mut kept = edge;
+                kept.tap_source = -1;
+                s.edges[w] = kept;
+                w += 1;
+                continue;
+            }
             if from_owned || to_owned {
                 // A shared spare-lane edge (attachable-lane merge) is
                 // removed with the owner but its channel is NEVER closed — the
@@ -999,6 +1067,7 @@ fn decode_endpoint(kind: u8, idx: u16) -> Option<Endpoint> {
     match kind {
         0 => Some(Endpoint::New(idx as u8)),
         1 => Some(Endpoint::Existing(idx)),
+        2 => Some(Endpoint::Tap(idx)),
         _ => None,
     }
 }

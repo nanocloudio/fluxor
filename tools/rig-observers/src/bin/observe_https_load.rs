@@ -1041,13 +1041,12 @@ const DIAG_SAMPLE_COUNT: u64 = 30;
 async fn run_diag_phase(target: &TargetUrl, tls_config: Arc<ClientConfig>, sample_count: u64) {
     let mut samples: Vec<StageTimings> = Vec::with_capacity(sample_count as usize);
     for sample_idx in 0..sample_count {
-        // Wrap each sample in `PER_REQUEST_TIMEOUT` — phases 0/1/2/3
-        // do this via `manual_request_with_timeout`; diag used to
-        // call `timed_request` raw, so a single stalled DUT
-        // mid-response would prevent the diag summary + every
-        // subsequent phase from ever emitting (the matcher then
-        // saw nothing and would mark the run TimedOut without
-        // ever showing which sample hung).
+        // Every sample is wrapped in `PER_REQUEST_TIMEOUT`, as phases 0/1/2/3
+        // are via `manual_request_with_timeout`. Calling
+        // `timed_request` raw would let one DUT that stalls mid-response
+        // hold back the diag summary and every phase after it, so the
+        // matcher would see nothing, mark the run TimedOut, and never
+        // show which sample hung.
         let fut = timed_request(&target.host, target.port, &target.path, tls_config.clone());
         let attempt = tokio::time::timeout(PER_REQUEST_TIMEOUT, fut).await;
         let result: Result<StageTimings, String> = match attempt {

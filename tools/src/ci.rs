@@ -102,7 +102,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     let has_cargo = project_root.join("Cargo.toml").is_file();
     let has_modules = project_root.join("modules").is_dir();
 
-    // ───── Phase 1.1: fmt-check ─────────────────────────────────────
+    // ───── fmt-check ─────────────────────────────────────────────────────
     // Two phases, because they cover disjoint trees: `cargo fmt --all`
     // reaches the workspace's members, and PIC module sources are not
     // members of it. A project with both gets both, or the modules are
@@ -130,7 +130,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 1.2: clippy ────────────────────────────────────────
+    // ───── clippy ────────────────────────────────────────────────────────
     // The fluxor workspace mixes a host CLI with no_std embedded
     // crates that don't compile under the workspace's default-feature
     // path, so clippy runs per-target like the kernel build matrix.
@@ -164,7 +164,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         })
     });
 
-    // ───── Phase 1.3: workspace [lints] opt-in audit ────────────────
+    // ───── workspace [lints] opt-in audit ────────────────────────────────
     // Audits the workspace `Cargo.toml` for `[lints] workspace = true`;
     // a crate-less fmod-only project has no such manifest, so the phase
     // is not part of its pipeline (omitted rather than listed skipped).
@@ -178,14 +178,14 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 1.4: hygiene ───────────────────────────────────────
+    // ───── hygiene ───────────────────────────────────────────────────────
     results.push(if skip.hygiene {
         skipped("hygiene")
     } else {
         run_step("hygiene", verbose, || run_hygiene(project_root))
     });
 
-    // ───── Phase 1.45: observability instrumentation contract ───────
+    // ───── observability instrumentation contract ────────────────────────
     //
     // Enforce standards/observability.md §6: every data-moving module
     // either declares `[observability]` metrics/spans or carries an
@@ -197,7 +197,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("observability", verbose, || run_observability(project_root))
     });
 
-    // ───── Phase 1.46: presentation placement ───────────────────────
+    // ───── presentation placement ────────────────────────────────────────
     //
     // Run the placement resolver
     // over every config's `presentation.shell` against the surface it
@@ -210,7 +210,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("presentation", verbose, || run_presentation(project_root))
     });
 
-    // ───── Phase 1.47: tracked examples build-check ─────────────────
+    // ───── tracked examples build-check ──────────────────────────────────
     //
     // `examples/` is the front door, and a graph naming a module the repo does
     // not contain still *reads* fine — it only fails when someone runs it.
@@ -226,7 +226,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("examples", verbose, || run_examples(project_root))
     });
 
-    // ───── Phase 1.48: Makefile standard ────────────────────────────
+    // ───── Makefile standard ─────────────────────────────────────────────
     //
     // Holds this project's Makefile to `standards/make.md`. A CLI verb that
     // moves strands the help text and the scripts naming it across every
@@ -238,7 +238,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("makefile", verbose, || run_makefile(project_root))
     });
 
-    // ───── Phase 1.49: fluxor.toml schema ───────────────────────────
+    // ───── fluxor.toml schema ────────────────────────────────────────────
     //
     // The config every other phase reads is itself checked: a key
     // naming a directory that does not exist, or a table at a placement
@@ -251,19 +251,19 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         }));
     }
 
-    // ───── Phase 1.5: template render ───────────────────────────────
+    // ───── template render ───────────────────────────────────────────────
     results.push(if skip.templates {
         skipped("template-render")
     } else {
         run_step("template-render", verbose, || check_templates(project_root))
     });
 
-    // ───── Phase 1.6: version-skew ──────────────────────────────────
+    // ───── version-skew ──────────────────────────────────────────────────
     results.push(run_step("version-skew", verbose, || {
         check_version_skew(project_root)
     }));
 
-    // ───── Phase 1.7: lockfile consistency ──────────────────────────
+    // ───── lockfile consistency ──────────────────────────────────────────
     //
     // When the project declares `[dependencies]`, the committed
     // `fluxor.lock` must be present, parse in the uniform
@@ -274,7 +274,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         check_lockfile_consistency(project_root)
     }));
 
-    // ───── Phase 1.71: catalog drift ────────────────────────────────
+    // ───── catalog drift ─────────────────────────────────────────────────
     //
     // `stacks/` and `targets/` are the one build input nothing pinned.
     // They are read live from the fluxor checkout while the modules they
@@ -315,7 +315,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 1.72: SDK materialisation ──────────────────────────
+    // ───── SDK materialisation ───────────────────────────────────────────
     //
     // The lockfile NAMES the SDK revision a project compiles against, but
     // the compiler reads the materialised tree under `target/fluxor/`, and
@@ -366,7 +366,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 1.75: live staleness ───────────────────────────────
+    // ───── live staleness ────────────────────────────────────────────────
     //
     // Reports when a workspace-member DEPENDENCY has work it has not
     // published, so a reader knows the pinned artefacts this build
@@ -404,7 +404,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 1.78: limit register ───────────────────────────────
+    // ───── limit register ────────────────────────────────────────────────
     //
     // The register of deliberate ceilings, checked against the source it
     // describes. Fluxor's register states "an id-shaped ceiling found in
@@ -479,7 +479,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 1.8: ABI-surface pin ───────────────────────────────
+    // ───── ABI-surface pin ───────────────────────────────────────────────
     //
     // The checked-in ABI-surface pin (source hash + digest, mirrored in
     // three files) must match what the current `modules/sdk` sources
@@ -492,7 +492,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         }));
     }
 
-    // ───── Phase 2: cargo unit + library tests ──────────────────────
+    // ───── cargo unit + library tests ────────────────────────────────────
     //
     // For fluxor itself, run from `tools/` rather than workspace
     // root: the kernel's default features pull in embedded crates
@@ -524,7 +524,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 2.5: wasm host-shim behaviour (node) ───────────────
+    // ───── wasm host-shim behaviour (node) ───────────────────────────────
     //
     // The browser host's import shims are JavaScript, so the only thing
     // cargo can hold about them is that every extern has one (the parity
@@ -540,7 +540,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         });
     }
 
-    // ───── Phase 3: modules build ───────────────────────────────────
+    // ───── modules build ─────────────────────────────────────────────────
     results.push(if skip.modules {
         skipped("modules-build (strict)")
     } else {
@@ -549,7 +549,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         })
     });
 
-    // ───── Phase 3.2: kernel link + static-RAM budget ───────────────
+    // ───── kernel link + static-RAM budget ───────────────────────────────
     //
     // Clippy type-checks the rp kernels but stops before the linker, and
     // a static-RAM overflow is invisible to a type-check. So this links
@@ -571,7 +571,7 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         },
     );
 
-    // ───── Phase 3.5: project test scripts (E2E gate) ───────────────
+    // ───── project test scripts (E2E gate) ───────────────────────────────
     //
     // A fmod-only project has no cargo tests — its behaviour is proven by
     // graph E2Es that boot the built `.fmod` artefacts. `[ci.test] scripts
@@ -593,15 +593,15 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         Err(e) => results.push(run_step("project-e2e", verbose, move || Err(e))),
     }
 
-    // ───── Phase 4: cargo integration tests ─────────────────────────
+    // ───── cargo integration tests ───────────────────────────────────────
     //
     // Two sites, either of which may be absent: the `tests/harness/`
     // sub-workspace, and the root package's own `tests/`. A project with
     // neither omits the phase entirely (its runtime gate is `[ci.test]`
-    // scripts, phase 3.5) rather than carrying a perpetual skip line that
-    // reads as an unmet obligation.
+    // scripts, run by the project-e2e phase) rather than carrying a perpetual
+    // skip line that reads as an unmet obligation.
     //
-    // The root site matters because phase 2 selects target kinds
+    // The root site matters because the unit-test phase selects target kinds
     // (`--lib --bins`), and naming any target kind turns cargo's default
     // selection off — so integration tests are excluded there by
     // construction. Without this sweep a root `tests/*.rs` is run by
@@ -622,29 +622,74 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     Ok(results)
 }
 
+/// Phases completed so far, for the live `[n]` index.
+static PHASE_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A phase that has produced no output of its own for this long is reported
+/// as still running, so a long quiet stretch reads as work rather than as a
+/// hang. The module phases can run for minutes without a line of their own.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Render a duration the way an operator reads it.
+fn dur(ms: u128) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
+/// Announce a phase, run it, and report the outcome as soon as it lands.
+///
+/// The elapsed time was always measured and then held back until the summary,
+/// so an operator who cancelled at minute twenty learned nothing. The index
+/// carries no total: the phase list is built by the conditionals in `run()`,
+/// and a second count of them would be a second source of truth that drifts
+/// from the first the moment either changes.
 fn run_step<F>(name: &'static str, verbose: bool, f: F) -> PhaseResult
 where
     F: FnOnce() -> std::result::Result<(), String>,
 {
+    let n = PHASE_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!("[{n:>2}] {name} ...");
     if verbose {
         eprintln!("[ci] running phase: {name}");
     }
     let start = Instant::now();
+
+    // Heartbeat. Parked on a channel rather than sleeping in a loop, so the
+    // thread ends the moment the phase does instead of outliving it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let beat = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        // Only a TIMEOUT means "still going". `recv_timeout` also returns
+        // Err on Disconnected, which is precisely the signal that the phase
+        // has finished — treating the two alike spins the thread forever.
+        while matches!(
+            done_rx.recv_timeout(HEARTBEAT),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            eprintln!("     … still running ({})", dur(t0.elapsed().as_millis()));
+        }
+    });
+
     let outcome = f();
     let elapsed_ms = start.elapsed().as_millis();
-    match outcome {
-        Ok(()) => PhaseResult {
-            name,
-            status: PhaseStatus::Ok,
-            elapsed_ms,
-            message: String::new(),
-        },
-        Err(msg) => PhaseResult {
-            name,
-            status: PhaseStatus::Failed,
-            elapsed_ms,
-            message: msg,
-        },
+    drop(done_tx);
+    let _ = beat.join();
+
+    let (status, message) = match outcome {
+        Ok(()) => (PhaseStatus::Ok, String::new()),
+        Err(msg) => (PhaseStatus::Failed, msg),
+    };
+    eprintln!("[{n:>2}] {name} {} ({})", status.label(), dur(elapsed_ms));
+    PhaseResult {
+        name,
+        status,
+        elapsed_ms,
+        message,
     }
 }
 
@@ -778,6 +823,25 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: None,
             package_gate: None,
         },
+        // Rig observer backends. A crate of their own because they carry an
+        // async runtime the CLI does not (see `tools/rig-observers/`), which
+        // also puts them outside the `tools` job above: a cargo invocation in
+        // `tools/` selects the package rooted there and nothing beside it.
+        // These are shipped binaries, so they are linted like any other.
+        ClippyJob {
+            label: "rig-observers",
+            cwd: "tools/rig-observers",
+            args: &[
+                "clippy",
+                "--all-targets",
+                "--all-features",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            feature_gate: None,
+            package_gate: Some("fluxor-rig-observers"),
+        },
         // Linux host kernel binary.
         ClippyJob {
             label: "kernel host-linux",
@@ -801,13 +865,13 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             feature_gate: Some("host-linux"),
             package_gate: None,
         },
-        // RP firmware, once per silicon per runtime.
+        // RP firmware, once per silicon.
         //
         // A chip feature alone names silicon, not a firmware: it selects
-        // register bases and nothing that boots. The binary needs a runtime
-        // for its reset vector and panic handler, and there are two: the
-        // Both RP chips, so a construct that is fine on ARMv8-M and not on
-        // ARMv6-M is caught here rather than on a board.
+        // register bases and nothing that boots, so each job builds the
+        // binary that carries the reset vector and panic handler with it.
+        // Both RP chips are covered, so a construct that is fine on ARMv8-M
+        // and not on ARMv6-M is caught here rather than on a board.
         //
         // Neither job sets `FLUXOR_BOARD`, so both are silicon-level: board
         // facts (console pins, crystal) are absent and the code that reads
@@ -964,15 +1028,17 @@ fn clippy_matrix(project_root: &Path) -> std::result::Result<(), String> {
             // reaching here means detection drifted; defend in depth.
             continue;
         }
-        // Each clippy invocation in this matrix touches src/lib.rs to
-        // invalidate the incremental cache — otherwise sibling-target
-        // runs see "no source changed since last lint" and skip,
-        // hiding any cross-feature breakage.
-        let _ = std::fs::OpenOptions::new()
-            .append(true)
-            .open(project_root.join("src/lib.rs"))
-            .and_then(|f| f.set_len(f.metadata()?.len()));
-
+        // Nothing here invalidates the tree between jobs, and nothing should.
+        //
+        // Each job names a distinct package, `--target` or `--features`, so
+        // each is a separate cargo unit with its own fingerprint: no job can
+        // be satisfied by another's cache. The one case cargo skips is an
+        // unchanged tree, where skipping is correct — it replays the cached
+        // diagnostics with the outcome preserved, so a failure still fails.
+        //
+        // Forcing a rebuild here would not be free. `tests/harness` reaches
+        // this crate by path, so touching it makes the integration-test phase
+        // rebuild the kernel and relink every integration-test binary.
         if let Err(e) = cargo_in(&cwd, job.args) {
             failures.push(format!("{}: {e}", job.label));
         }
@@ -1180,7 +1246,7 @@ pub(crate) fn cargo_host_tools_dir(project_root: &Path) -> Option<PathBuf> {
 
 /// The UNIT-test invocation: `(directory, args)`, or `None` with no cargo tree.
 ///
-/// One definition, read by `fluxor ci`'s phase 2 and by the `fluxor test`
+/// One definition, read by `fluxor ci`'s unit-test phase and by the `fluxor test`
 /// verb, so the gate and the verb cannot drift into running different
 /// commands over the same tree.
 /// Taking the facts as arguments rather than reading them keeps the rule
@@ -1889,6 +1955,20 @@ fn check_abi_pin(project_root: &Path) -> std::result::Result<(), String> {
 /// Skips cleanly with no lockfile, no stamp (a lock written before the
 /// stamp existed), or no resolvable install root — none of those are a
 /// drift, and failing on them would only teach people to ignore this.
+/// Whether a catalog digest that differs from its stamp is worth reporting.
+///
+/// A skew needs two sides. The hazard is that a module resolved from a pinned
+/// digest meets a stack file read live, so a graph expands onto a parameter or
+/// an edge that pinned module does not have. With nothing pinned there is no
+/// second side: the live catalog is the only catalog, and a project in that
+/// state is either the catalog's owner or has resolved nothing yet.
+///
+/// Reporting it anyway warns the owner of a catalog on every edit to it, and a
+/// signal that fires on correct work is one people learn to scroll past.
+fn catalog_drift_matters(pinned: usize, stamped: &str, live: &str) -> bool {
+    pinned > 0 && stamped != live
+}
+
 fn check_catalog_drift(project_root: &Path) -> std::result::Result<(), String> {
     let lock = match crate::store_resolve::read_store_lock(project_root) {
         Ok(Some(l)) => l,
@@ -1904,7 +1984,7 @@ fn check_catalog_drift(project_root: &Path) -> std::result::Result<(), String> {
     let Some(live) = crate::store_resolve::catalog_digest(&root.path) else {
         return Ok(());
     };
-    if live == stamped.digest {
+    if !catalog_drift_matters(lock.artifacts.len(), &stamped.digest, &live) {
         return Ok(());
     }
     Err(format!(
@@ -2038,6 +2118,13 @@ fn modules_fmt_check(project_root: &Path, verbose: bool) -> std::result::Result<
     let report =
         modules_build::fmt_check_modules(project_root, verbose).map_err(|e| e.to_string())?;
     if report.ok() {
+        // A 7 ms sweep must not read as a sweep that did not run.
+        eprintln!(
+            "     {} source(s): {} checked, {} unchanged since last pass",
+            report.checked,
+            report.checked - report.cached,
+            report.cached
+        );
         Ok(())
     } else {
         Err(format!(
@@ -2055,6 +2142,12 @@ fn modules_clippy_check(project_root: &Path, verbose: bool) -> std::result::Resu
     let report =
         modules_build::clippy_check_modules(project_root, verbose).map_err(|e| e.to_string())?;
     if report.ok() {
+        eprintln!(
+            "     {} module(s): {} linted, {} unchanged since last pass",
+            report.checked,
+            report.checked - report.cached,
+            report.cached
+        );
         Ok(())
     } else {
         Err(format!(
@@ -2561,10 +2654,10 @@ pub fn format_summary(results: &[PhaseResult]) -> String {
     out.push_str("\n=================== ci summary ===================\n");
     for r in results {
         out.push_str(&format!(
-            "{label:>7}  {name:30}  {ms:>5} ms\n",
+            "{label:>7}  {name:30}  {ms:>8}\n",
             label = r.status.label(),
             name = r.name,
-            ms = r.elapsed_ms,
+            ms = dur(r.elapsed_ms),
         ));
         if matches!(r.status, PhaseStatus::Failed | PhaseStatus::Warned) && !r.message.is_empty() {
             for line in r.message.lines() {
@@ -2720,6 +2813,31 @@ mod tests {
         assert!(s.lint);
         assert!(!s.hygiene);
         assert!(!s.templates);
+    }
+
+    /// The catalog owner edits `stacks/` and `targets/` as ordinary work and
+    /// pins nothing, so drift there says nothing on its own. It means something
+    /// only where a pinned module could meet a live stack file.
+    #[test]
+    fn catalog_drift_needs_something_pinned_to_skew_against() {
+        let (a, b) = ("sha256:9b84f1bf934f", "sha256:c4eae6fa67d6");
+
+        assert!(
+            !catalog_drift_matters(0, a, b),
+            "nothing pinned: the live catalog is the only catalog"
+        );
+        assert!(
+            catalog_drift_matters(1, a, b),
+            "one pin is enough for a graph to expand past what it pins"
+        );
+        assert!(
+            !catalog_drift_matters(42, a, a),
+            "pins that agree with the catalog they were resolved against"
+        );
+        assert!(
+            !catalog_drift_matters(0, a, a),
+            "neither pinned nor drifted"
+        );
     }
 
     #[test]

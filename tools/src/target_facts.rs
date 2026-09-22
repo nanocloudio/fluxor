@@ -96,8 +96,8 @@ const NET_WASM: NetCeilings = NetCeilings {
 };
 /// The embedded (RP-class) profile.
 const NET_EMBEDDED: NetCeilings = NetCeilings {
-    tcp_connections: 16,
-    datagram_endpoints: 16,
+    tcp_connections: 8,
+    datagram_endpoints: 8,
     local_addresses: 8,
     packet_hold: 4,
 };

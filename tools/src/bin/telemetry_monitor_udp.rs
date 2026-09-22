@@ -36,8 +36,6 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use serde_json::{json, Value};
 
 use fluxor_tools::monitor::bind_udp_listener;
@@ -138,7 +136,7 @@ fn attach(invocation: &Value) -> Result<(), u8> {
                 }
                 emit(&json!({
                     "kind": "bytes",
-                    "data": BASE64_STANDARD.encode(&buf[..n]),
+                    "data": fluxor_tools::b64::encode(&buf[..n]),
                 }));
             }
             Err(ref e)

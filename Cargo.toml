@@ -46,8 +46,8 @@ log = "0.4.29"
 # default-features off drops jiff (timestamps — we format our own via
 # `now_unix_ms`), anstream/anstyle (color), and the regex RUST_LOG tree;
 # `env_filter` still does level + exact-module filtering.
-env_logger = { version = "0.11", default-features = false, optional = true }
-libc = { version = "0.2", optional = true }
+env_logger = { version = "0.11.10", default-features = false, optional = true }
+libc = { version = "0.2.186", optional = true }
 # Portable atomics with CAS emulation for thumbv6m (RP2040 Cortex-M0+).
 # On thumbv8m (RP2350) this is a zero-cost pass-through.
 portable-atomic = { version = "1.13.1", default-features = false, optional = true }
@@ -61,14 +61,14 @@ critical-section = { version = "1.2.0", optional = true }
 # Pure-Rust window stack: winit owns the OS surface, softbuffer blits a
 # CPU framebuffer into it. Both gated behind the `host-window` feature
 # so the default `host-linux` build doesn't pull them in.
-winit = { version = "0.30", optional = true }
-softbuffer = { version = "0.4", optional = true }
+winit = { version = "0.30.13", optional = true }
+softbuffer = { version = "0.4.8", optional = true }
 
 # ── host-playback: linux_audio interactive backend ─────────────────────
 # CPAL is the cross-platform audio dep — Linux uses ALSA under the
 # hood. Gated behind `host-playback` so file-mode capture builds stay
 # dep-free.
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.15.3", optional = true }
 
 # ── host-gpu: linux_gpu native compute backend ─────────────────────────
 # wgpu on Vulkan, compute only. `default-features = false` drops every
@@ -77,8 +77,8 @@ cpal = { version = "0.15", optional = true }
 # support in would be weight behind a door it keeps shut. `pollster`
 # blocks the dedicated GPU thread on wgpu's async calls — never the
 # cooperative step, which is the whole reason that thread exists.
-wgpu = { version = "26", default-features = false, features = ["vulkan", "wgsl"], optional = true }
-pollster = { version = "0.4", optional = true }
+wgpu = { version = "26.0.1", default-features = false, features = ["vulkan", "wgsl"], optional = true }
+pollster = { version = "0.4.0", optional = true }
 
 # ── host-hsm: PKCS#11 key_vault backend ────────────────────────────────
 # Hardware binding for the key_vault contract: the cryptoki dependency
@@ -86,21 +86,21 @@ pollster = { version = "0.4", optional = true }
 # never in a consumer. It resolves its PKCS#11 module by path at
 # runtime, so it links no token library and costs nothing until one is
 # configured — which is why the published runtime carries it.
-cryptoki = { version = "0.12", optional = true }
+cryptoki = { version = "0.12.0", optional = true }
 # The trust contract's Linux provider. On Linux there is no OS verification
 # API to call -- `rustls-platform-verifier` itself falls back to webpki over
 # the system roots there -- so this IS the platform path, not a substitute
 # for it: full path building, name constraints, EKU and expiry, which is
 # precisely what `tls`'s own verifier does not do and why the contract
 # refuses to hand anchors back instead.
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
-rustls-pki-types = { version = "1", optional = true }
-rustls-pemfile = { version = "2", optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+rustls-pki-types = { version = "1.14.1", optional = true }
+rustls-pemfile = { version = "2.2.0", optional = true }
 
 # ── host-image: host_image_codec (JPEG/PNG/BMP → RGB565) ───────────────
 # `image` brings every default decoder; trimmed to JPEG/PNG/BMP/GIF
 # below since fluxor's display sinks consume RGB565 from any of them.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif"], optional = true }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "bmp", "gif"], optional = true }
 
 [features]
 default = ["chip-rp2350b"]
@@ -289,17 +289,40 @@ serde = { version = "1.0.228", features = ["derive"] }
 [lints]
 workspace = true
 
+# The release CLI is a published artefact: `fluxor publish` reads, hashes and
+# writes the whole binary into the OCI store on every publish, so DWARF in it
+# is paid for on every publish and pull, and DWARF dominates the binary by an
+# order of magnitude over the code it describes.
+#
+# `strip = "debuginfo"`, NOT `"symbols"`. `tools/firmware.sh` runs
+# `arm-none-eabi-nm` over the linked image and fails the build (exit 3) if
+# `flash_erase_sector` / `flash_program_page` / `read_bootsel_io_qspi` are
+# absent or resolve below 0x20000000 — code that must not run from flash.
+# That `nm` call is a gate, not a debug aid: `.symtab` has to survive.
+#
+# `line-tables-only` in the dev profile keeps file:line in every panic and
+# backtrace at a fraction of the size. Reach for `--profile release-dbg` when
+# a debugger needs expression-level detail.
 [profile.release]
-debug = 2
+debug = 0
+strip = "debuginfo"
 lto = false
 opt-level = 2
 
+# Opt-in, for when expression-level debugger inspection is genuinely wanted.
+[profile.release-dbg]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+split-debuginfo = "unpacked"
+
 [profile.dev]
-debug = 2
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
 opt-level = 1
 
 [workspace]
-members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/fluxor-sdk", "tools"]
+members = ["contracts", "crates/fluxor-abi", "crates/fluxor-launcher", "crates/fluxor-sdk", "tools", "tools/rig-observers"]
 # `tests/harness` is a self-contained sub-workspace (its Cargo.toml
 # declares its own `[workspace]`) that depends on the crates above
 # via path. It is intentionally not a member here — host integration
@@ -335,10 +358,17 @@ pedantic = { level = "warn",  priority = -1 }
 
 # Every `#[allow(...)]` must carry a `reason = "..."` clause; the
 # hygiene scanner enforces the same on module trees outside the
-# cargo workspace. `allow_attributes` is permissive because the
-# kernel matrix uses many target-conditional allows on cfg-gated
-# items, and `#[expect]` fails the build for configurations where
-# the lint doesn't fire.
+# cargo workspace.
+#
+# `allow_attributes = "allow"` is the setting standards/lints.md §1 prescribes
+# for a multi-target project, and this is a multi-target project: the
+# target-conditional shim of §3.3 is unavoidable across the kernel's silicon
+# and host configurations, and `#[expect]` is not the alternative, because it
+# fails the build in the configurations where the lint does not fire.
+#
+# `allow_attributes_without_reason` below carries §3's actual requirement and
+# stays denied. Crate-root `#![allow]` is held separately, by `fluxor ci`'s
+# `crate-root-allow` rule, against the prefixes declared in `fluxor.toml`.
 allow_attributes                = "allow"
 allow_attributes_without_reason = "deny"
 

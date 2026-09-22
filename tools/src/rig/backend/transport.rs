@@ -21,9 +21,6 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
-
 use crate::error::{Error, Result};
 use crate::rig::backend::discover::BackendRef;
 use crate::rig::backend::protocol::{BackendInvocation, TransportEvent};
@@ -241,8 +238,8 @@ fn translate(
     slug: &str,
 ) -> Option<RunEvent> {
     match event {
-        TransportEvent::Bytes { data } => match BASE64_STANDARD.decode(data.as_bytes()) {
-            Ok(bytes) => {
+        TransportEvent::Bytes { data } => match crate::b64::decode(&data) {
+            Some(bytes) => {
                 let source = match byte_source {
                     Some(s) => s,
                     None => {
@@ -255,7 +252,7 @@ fn translate(
                 };
                 Some(RunEvent::ConsoleBytes { source, bytes })
             }
-            Err(_) => None, // skip malformed base64 silently; stderr logged by the backend
+            None => None, // skip malformed base64 silently; stderr logged by the backend
         },
         TransportEvent::Fetch {
             filename,
@@ -339,7 +336,7 @@ mod tests {
     fn streams_bytes_then_closes() {
         // Backend emits one bytes event then exits. The matcher channel
         // should receive ConsoleBytes + TransportClosed.
-        let data = BASE64_STANDARD.encode(b"hello");
+        let data = crate::b64::encode(b"hello");
         let script = format!(
             "#!/bin/sh\nread _input\nprintf '{{\"kind\":\"bytes\",\"data\":\"{data}\"}}\\n'\nexit 0\n"
         );

@@ -440,6 +440,12 @@ pub fn publish_project_with_mode(
                 continue;
             }
             let bytes = std::fs::read(&bin).map_err(Error::Io)?;
+            // Reading and hashing a runtime is the one step of a publish that
+            // takes real time, so it says what it is doing while it does it.
+            println!(
+                "  runtime {name} ({:.1} MB) — hashing",
+                bytes.len() as f64 / 1_048_576.0
+            );
             let meta = ArtifactMeta {
                 project: &identity.name,
                 provenance: "local-build",
@@ -457,6 +463,18 @@ pub fn publish_project_with_mode(
                 &bytes,
                 &meta,
             )?);
+        }
+    }
+
+    // What the store is holding, said out loud once per publish.
+    //
+    // Quarantined blobs accumulate unbounded otherwise: `gc` runs only when
+    // someone types it, and nobody types it for a number they have never
+    // seen. Reporting is not collecting — `gc` stays the only verb that
+    // deletes, for the reason its own doc gives.
+    if let Ok(root) = crate::oci_store::store_root() {
+        if let Some(line) = crate::store_maint::usage(&root).report(5.0) {
+            println!("  {line}");
         }
     }
 

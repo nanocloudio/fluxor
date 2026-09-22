@@ -34,23 +34,6 @@ path = "src/bin/telemetry_monitor_udp.rs"
 name = "observe-udp_capture"
 path = "src/bin/observe_udp_capture.rs"
 
-# HTTPS load-probe observer: drives concurrent TLS clients against the
-# rig's HTTPS endpoint and emits NDJSON bytes per phase so the matcher
-# can pin throughput, concurrency, and handshake-rate floors.
-# Built unconditionally: no feature gates on shipped artefacts
-# (standards/dependencies.md §9a). A `required-features` gate here
-# makes a plain `cargo build`/`test`/`install` silently omit the
-# binary, leaving the rig's backend symlink dangling — the rig then
-# reports "backend not found on any search path", which reads as a
-# missing install rather than a side effect of an unrelated build.
-[[bin]]
-name = "observe-https_load"
-path = "src/bin/observe_https_load.rs"
-
-[[bin]]
-name = "observe-tls_load"
-path = "src/bin/observe_tls_load.rs"
-
 [features]
 default = ["host-test"]
 
@@ -72,7 +55,6 @@ name = "fluxor_tools"
 path = "src/lib.rs"
 
 [dependencies]
-base64 = "0.22"
 clap = { version = "4.6.0", features = ["derive"] }
 # The wire-ABI surface the config compiler bakes values FROM. A compiled
 # config carries route handler ids, contract opcodes and content-type bytes
@@ -80,43 +62,36 @@ clap = { version = "4.6.0", features = ["derive"] }
 # one definition — re-declaring them here is how the two silently diverge.
 fluxor-abi = { path = "../crates/fluxor-abi" }
 fluxor-contracts = { path = "../contracts" }
-libc = "0.2"
-regex = "1.10"
+libc = "0.2.186"
+regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"  # deprecated upstream but functional
-semver = "1.0"
+semver = "1.0.28"
 sha2 = "0.11.0"
 # `proc-macro2` is a transitive dep of syn; pulling it in directly lets
 # us enable the `span-locations` feature so `Span::start()` yields
 # stable line numbers (otherwise the API is nightly-only).
-proc-macro2 = { version = "1", features = ["span-locations"] }
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 # `full` enables the items/attrs/tokens needed by the hygiene scanner;
 # `extra-traits` exposes Debug/Eq for tests asserting on parsed nodes.
-syn = { version = "2.0", features = ["full", "extra-traits", "parsing", "visit"] }
+syn = { version = "2.0.117", features = ["full", "extra-traits", "parsing", "visit"] }
 thiserror = "2.0.18"
 toml = "1.1.2"
 # Recursive directory walk for the hygiene scanner. The std-only path
 # (`fs::read_dir` recursion) reimplements its filter/skip logic; this
 # keeps the scanner focused on AST work.
-walkdir = "2.5"
+walkdir = "2.5.0"
 
-# Deps for the `observe-https_load` rig backend. Not optional: the
-# binary is built unconditionally (standards/dependencies.md §9a), so
-# gating these would only reintroduce the missing-artefact failure
-# described above. The probe drives raw TCP + TLS so we
-# get clean per-stage timing — no client library between us and the
-# rig hiding overhead in `Client::new()` or connection-pool
-# bookkeeping. We accept invalid certs (the rig fixture's self-signed
-# cert is part of the test setup).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal", "net"] }
-futures-util = { version = "0.3" }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# The rig load probes are a crate of their own, `tools/rig-observers/`, so the
+# async runtime they need stays out of the CLI's dependency closure. Splitting
+# the crate is what standards/dependencies.md §10a asks for in place of gating
+# a shipped binary behind a feature.
+rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12", "ring"] }
 # Web-PKI trust anchors for `fluxor store push`/`pull` against public
 # registries; a deployment CA (e.g. the nanocloud registry's) is added
 # per-invocation with `--ca <pem>`.
-webpki-roots = "0.26"
-tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
+webpki-roots = "0.26.11"
 
 [dev-dependencies]
 # Used by test-side `#[cfg(test)]` helpers to construct auto-cleaning
@@ -125,7 +100,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 # `/tmp` (rig record artefacts, lock files) stay on the raw API
 # deliberately — those paths are part of the contract with downstream
 # tooling.
-tempfile = "3"
+tempfile = "3.27.0"
 
 # `tests/param_store.rs` mounts `src/platform/linux/param_store.rs` the
 # way the platform does, with `include!`, so it needs the crates that

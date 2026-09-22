@@ -22,14 +22,12 @@ SHELL       := /bin/bash
 HOST_TRIPLE := $(shell rustc -vV | sed -n 's/^host: //p')
 HOST_DIR    := target/$(HOST_TRIPLE)/release
 LAUNCHER    ?= $(HOST_DIR)/fluxor-launcher
-# The aarch64 host kernel is compiled with the same ARMv8 crypto
-# extensions as the bcm2712 modules it loads (targets/host/linux.toml).
-# RUSTFLAGS reaches the kernel library crate as well as the binary, and
-# cargo keys the artefact set on it, so the tools build is undisturbed.
-# Set only on aarch64 hosts: an empty RUSTFLAGS would replace the
-# per-target flags in `.cargo/config.toml`.
-comma := ,
-KERNEL_RUSTFLAGS := $(if $(findstring aarch64,$(HOST_TRIPLE)),RUSTFLAGS="-C target-feature=+aes$(comma)+sha2$(comma)+neon",)
+# The ARMv8 crypto extensions the aarch64 host kernel needs are declared in
+# `.cargo/config.toml` under `[target.aarch64-unknown-linux-gnu]`, so that they
+# reach every cargo invocation for that triple. Setting them on one of the
+# lines below and not the other would make the two disagree on RUSTFLAGS —
+# part of every unit's fingerprint — and each would build the shared units for
+# itself.
 BINDIR      ?= $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)/bin
 # A BOARD id from targets/boards/, or a host token. Firmware is built per
 # board — a board fixes the link origin, the pin map and the rig contract,
@@ -92,8 +90,8 @@ clean:
 # always installs them). They point at the build outputs, so a later
 # rebuild is picked up with no re-install.
 install:
-	cargo build --release -p fluxor-tools -p fluxor-launcher --target $(HOST_TRIPLE)
-	$(KERNEL_RUSTFLAGS) cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback,host-hsm --target $(HOST_TRIPLE)
+	cargo build --release -p fluxor-tools -p fluxor-launcher -p fluxor-rig-observers --target $(HOST_TRIPLE)
+	cargo build --release --bin fluxor-linux --no-default-features --features host-linux,host-playback,host-hsm --target $(HOST_TRIPLE)
 	$(HOST_DIR)/fluxor publish --only runtime
 	install -D -m755 $(LAUNCHER) $(BINDIR)/fluxor
 	@mkdir -p $(RIG_BACKEND_DIR)

@@ -620,8 +620,7 @@ mod tests {
     #[test]
     fn pem_extraction_handles_bundles() {
         let der1 = vec![1u8, 2, 3, 4];
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&der1);
+        let b64 = crate::b64::encode(&der1);
         let pem = format!(
             "junk\n-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\ntrailer\n-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n"
         );

@@ -7,10 +7,6 @@
 /// success, negative errno on failure (e.g. called outside step). Used
 /// by anchors / workers / directories to render the `mod=` field of
 /// `MON_SESSION` telemetry lines.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
     (sys.provider_call)(-1, 0x0C42, core::ptr::null_mut(), 0)
@@ -25,10 +21,6 @@ unsafe fn dev_self_index(sys: &SyscallTable) -> i32 {
 /// path binds host-wildcard. Used by a
 /// bind-emitting module (http, a DG binder) to append the trailing `owner_tag`
 /// on its `NET_CMD_BIND` / `DG_CMD_BIND`.
-#[allow(
-    dead_code,
-    reason = "owner-scoped bind stamping; used only by net-facing binders (http, DG)"
-)]
 #[inline(always)]
 unsafe fn dev_owner_tag(sys: &SyscallTable) -> u16 {
     let rc = (sys.provider_call)(-1, 0x0C4B, core::ptr::null_mut(), 0);
@@ -44,10 +36,6 @@ unsafe fn dev_owner_tag(sys: &SyscallTable) -> u16 {
 /// zero-based module index. Saturates at `u8::MAX`. Used to tag `CMD_CONNECT_TO`
 /// and to recognise the matching `MSG_CONNECTED` when `ip.net_out` is fanned to
 /// several stream consumers. Returns 0 only if the index is unavailable.
-#[allow(
-    dead_code,
-    reason = "stream-surface routing; used by instrumented connectors"
-)]
 unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
     let idx = dev_self_index(sys);
     if idx < 0 {
@@ -64,10 +52,6 @@ unsafe fn dev_requester_tag(sys: &SyscallTable) -> u8 {
 /// word (the wasm host, an isolated module whose protection domain does not
 /// map kernel memory) emits unconditionally and the ring drops when no
 /// consumer is active.
-#[allow(
-    dead_code,
-    reason = "emit-side helper; invoked only by instrumented modules"
-)]
 #[inline(always)]
 unsafe fn dev_telemetry_enabled(sys: &SyscallTable) -> bool {
     sys.telemetry_enabled.is_null() || *sys.telemetry_enabled != 0
@@ -80,10 +64,6 @@ unsafe fn dev_telemetry_enabled(sys: &SyscallTable) -> bool {
 /// host collector applies receive time). `_chan` is accepted so instrumented
 /// call sites keep one shape across signals; emission is ring-based and reaches
 /// every consumer without a wired port.
-#[allow(
-    dead_code,
-    reason = "emit-side helper; invoked only by instrumented modules"
-)]
 #[inline]
 unsafe fn dev_telemetry_metric(
     sys: &SyscallTable,
@@ -109,10 +89,6 @@ unsafe fn dev_telemetry_metric(
 /// row-major index over the instrument's declared dimension domains.
 /// `DIM_OTHER` folds an out-of-domain tuple; the undimensioned path is
 /// [`dev_telemetry_metric`]. Gated like every other emit helper.
-#[allow(
-    dead_code,
-    reason = "emit-side helper; invoked only by instrumented modules"
-)]
 #[allow(
     clippy::too_many_arguments,
     reason = "flat args keep the emit path allocation-free and one shape across signals"
@@ -141,10 +117,6 @@ unsafe fn dev_telemetry_metric_dim(
 
 /// Emit a histogram metric (`HIST_BUCKETS` log2-spaced counts) to the kernel
 /// telemetry ring. Gated by [`dev_telemetry_enabled`], like the scalar path.
-#[allow(
-    dead_code,
-    reason = "emit-side helper; invoked only by instrumented modules"
-)]
 #[inline]
 unsafe fn dev_telemetry_histogram(
     sys: &SyscallTable,
@@ -169,10 +141,6 @@ unsafe fn dev_telemetry_histogram(
 /// against the instrument's 15 manifest-declared bounds plus `+Inf`, with a
 /// composite dimension index (`DIM_NONE` when undimensioned). Bounds are
 /// id-table metadata and never ride the record. Gated like the scalar path.
-#[allow(
-    dead_code,
-    reason = "emit-side helper; invoked only by instrumented modules"
-)]
 #[inline]
 unsafe fn dev_telemetry_histogram16(
     sys: &SyscallTable,
@@ -199,10 +167,6 @@ unsafe fn dev_telemetry_histogram16(
 /// trace context (trace/span/parent ids); `start_micros`/`end_micros` come from
 /// [`dev_micros`]. The header stamp is the span end. See
 /// `modules/sdk/contracts/telemetry.rs` and `standards/observability.md`.
-#[allow(
-    dead_code,
-    reason = "emit-side helper; invoked only by instrumented modules"
-)]
 #[allow(
     clippy::too_many_arguments,
     reason = "a span carries the full W3C context plus timing as flat args to stay allocation-free on the emit path"
@@ -240,10 +204,6 @@ unsafe fn dev_telemetry_span(
 
 /// Render `bytes` as lowercase hex into `out`. Caller must ensure
 /// `out.len() >= bytes.len() * 2`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn hex_render(bytes: *const u8, n: usize, out: *mut u8) {
     let h = b"0123456789abcdef";
@@ -259,10 +219,6 @@ unsafe fn hex_render(bytes: *const u8, n: usize, out: *mut u8) {
 /// Render a `mod=<n>` decimal field. `n` is the module's own scheduler
 /// index (from `dev_self_index`); we cap at three digits since the
 /// scheduler's `MAX_MODULES` is well under 1000. Returns bytes written.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 unsafe fn fmt_u32_dec(mut n: u32, out: *mut u8) -> usize {
     if n == 0 {
         *out = b'0';
@@ -290,129 +246,33 @@ const MON_SESSION_BUF_SIZE: usize = 192;
 /// `MON_SESSION` event tag codes for `dev_mon_session`. Strings live in
 /// the helper to keep call sites short. Wire format remains the
 /// human-readable name from `monitor-protocol.md`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_ATTACH_REQ: u8 = 1;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_ATTACHED: u8 = 2;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_ATTACH_FAILED: u8 = 3;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_DRAINED: u8 = 4;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_EXPORTED: u8 = 5;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_IMPORTED: u8 = 6;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_RESUMED: u8 = 7;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_DETACH_REQ: u8 = 8;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_DETACHED: u8 = 9;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_RELOCATED: u8 = 10;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_REJECTED: u8 = 11;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_ERROR: u8 = 12;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_EPOCH_BUMP: u8 = 13;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_EXPORT_REQ: u8 = 14;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_RESUME_REQ: u8 = 15;
 // Failover records for platform-replicated-state transport_migratable
 // sessions (monitor-protocol.md §MON_SESSION Failover records).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_FENCE_INITIATED: u8 = 16;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_FENCE_CONFIRMED: u8 = 17;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_VIP_MOVED: u8 = 18;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_RESERVATION_GRANTED: u8 = 19;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_RESERVATION_EXHAUSTED_STALL: u8 = 20;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_RPO_LOSS: u8 = 21;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_UNSAFE_RECOVERY_EPOCH_VOID: u8 = 22;
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const MON_EV_CLASS_REPORT: u8 = 23;
 
 /// Map an event code to its on-the-wire string. Empty for unknown codes.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 fn mon_event_name(ev: u8) -> &'static [u8] {
     match ev {
         MON_EV_ATTACH_REQ => b"attach_req",
@@ -444,10 +304,6 @@ fn mon_event_name(ev: u8) -> &'static [u8] {
 
 /// Map a `CC_*` continuity-class wire constant (see
 /// `contracts/net/session_ctrl.rs`) to its `MON_SESSION` class name.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub fn mon_class_name(cc: u8) -> &'static [u8] {
     match cc {
         1 => b"reroutable",
@@ -474,10 +330,6 @@ pub fn mon_class_name(cc: u8) -> &'static [u8] {
 ///
 /// See `docs/architecture/monitor-protocol.md` §`MON_SESSION` for the
 /// authoritative line-format spec.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "MON_SESSION line-format: signature mirrors the documented monitor-protocol fields"
@@ -562,10 +414,6 @@ unsafe fn dev_mon_session(
 /// `declared_cc` / `achieved_cc` are `CC_*` wire constants from
 /// `contracts/net/session_ctrl.rs`.
 #[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
-#[allow(
     clippy::too_many_arguments,
     reason = "MON_SESSION_CLASS line-format: signature mirrors the documented monitor-protocol fields"
 )]
@@ -637,20 +485,12 @@ unsafe fn dev_mon_session_class(
 
 /// One-line emit budget for a `[<mod>] tlm …` line. Caller-allocated
 /// scratch must be at least this long.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub const TLM_LINE_BUF_SIZE: usize = 128;
 
 /// Per-module hot-path counters. Modules embed this in state and bump
 /// individual fields at data-flow points. `last_emit_step` tracks the
 /// step count at which the previous line was emitted so the helper can
 /// compute the delta. Initialise with `TlmCounters::new()`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 pub struct TlmCounters {
     pub bytes_in: u32,
     pub bytes_out: u32,
@@ -659,10 +499,6 @@ pub struct TlmCounters {
     pub last_emit_step: u32,
 }
 
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 impl TlmCounters {
     pub const fn new() -> Self {
         Self {
@@ -675,10 +511,6 @@ impl TlmCounters {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 impl Default for TlmCounters {
     fn default() -> Self {
         Self::new()
@@ -692,10 +524,6 @@ impl Default for TlmCounters {
 /// this, a step that polled a full downstream channel was
 /// double-counted as both back-pressured and idle (idle_steps and
 /// bp_steps each → period_steps for a steady-state stalled module).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 fn tlm_idle_if_unchanged(tlm: &mut TlmCounters, rx_pre: u32, tx_pre: u32, bp_pre: u32) {
     if tlm.bytes_in == rx_pre && tlm.bytes_out == tx_pre && tlm.bp_steps == bp_pre {
@@ -714,10 +542,6 @@ fn tlm_idle_if_unchanged(tlm: &mut TlmCounters, rx_pre: u32, tx_pre: u32, bp_pre
 /// monotonic counter (any module that already increments one for
 /// existing periodic logs can reuse it). `scratch` must point to at
 /// least `TLM_LINE_BUF_SIZE` writable bytes.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 unsafe fn dev_tlm_maybe_emit(
     sys: &SyscallTable,
     prefix: &[u8],
@@ -774,10 +598,6 @@ unsafe fn dev_tlm_maybe_emit(
 /// loaded and have registered its `backing_provider_dispatch` via
 /// `BACKING_PROVIDER_ENABLE` — otherwise later read/write calls
 /// return ENODEV.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_backing_arena_register(
     sys: &SyscallTable,
@@ -805,10 +625,6 @@ unsafe fn dev_backing_arena_register(
 
 /// Write one 4 KB page from `buf` to a registered backing arena.
 /// `buf` must point to at least 4096 bytes of readable memory.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_backing_arena_write(
     sys: &SyscallTable,
@@ -839,10 +655,6 @@ unsafe fn dev_backing_arena_write(
 
 /// Read one 4 KB page from a registered backing arena into `buf`.
 /// `buf` must point to at least 4096 bytes of writable memory.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_backing_arena_read(
     sys: &SyscallTable,
@@ -872,10 +684,6 @@ unsafe fn dev_backing_arena_read(
 }
 
 /// Flush any pending writes for a backing arena.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
     let mut a = [arena_id];
@@ -887,10 +695,6 @@ unsafe fn dev_backing_arena_flush(sys: &SyscallTable, arena_id: u8) -> i32 {
 /// Drivers that support multi-block transfers (NVMe with PRP-lists)
 /// translate this to a single device command — far higher sustained
 /// throughput than per-page writes.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_backing_arena_write_pages(
     sys: &SyscallTable,
@@ -904,10 +708,6 @@ unsafe fn dev_backing_arena_write_pages(
 
 /// Read `count` contiguous 4 KB pages from a registered backing arena
 /// into `buf`. `buf` must point to `count * 4096` writable bytes.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_backing_arena_read_pages(
     sys: &SyscallTable,

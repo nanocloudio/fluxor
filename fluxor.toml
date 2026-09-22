@@ -28,6 +28,14 @@ targets = ["bcm2712", "rp2350", "rp2040", "wasm"]
 # or an exemption; the list is empty, so a new one fails the gate.
 limit_register_coverage = "fail"
 
+[ci.test]
+# The project's runtime gate. `tools/ci/deps_budget.sh` holds each build
+# configuration to a declared package ceiling, so that the external dependency
+# count moves when someone decides it should rather than drifting. It is not a
+# limit-register family; the script's header says why, against
+# `standards/limit-register.md` §1/§3/§6.
+scripts = ["tools/ci/deps_budget.sh"]
+
 [ci.cargo]
 # Where the cargo phase runs. fluxor's workspace root is the bare-metal
 # kernel and cannot build on the host under default features, so the
@@ -47,6 +55,59 @@ dir = "examples"
 # Workspace-lints opt-in exemptions. New workspace members must
 # declare `[lints] workspace = true` or list themselves here with a
 # reason.
+
+# Crate-root `#![allow(...)]` is banned by `standards/lints.md` §4. Each row
+# below declares a prefix where it is permitted and the reason it is. A file
+# outside these prefixes fails the gate.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """PIC modules mount the whole of modules/sdk/* via include!, so every \
+module's compile sees the entire ABI surface while using a subset, and the \
+unreachable_patterns arms are deliberate defensive branches guarding against a \
+new variant slipping past the error path. The first is the SDK's textual \
+mounting showing through: it is a property of how a PIC module is built, not of \
+any one module."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "crates/fluxor-sdk/"
+reason = """The cargo-shaped façade over modules/sdk/*: it mounts the whole tree \
+so every #[path] consumer agrees on one surface, and consumers use a subset. \
+Same cause as modules/, same fix."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "src/"
+reason = """The kernel relaxes unsafe_code and print_* at the crate root: it is a \
+no_std kernel whose every platform layer is unsafe by construction, and \
+per-call-site attributes on several thousand blocks would say less than one \
+statement of what this crate is. lints.md §2's call-site rule assumes a crate \
+where unsafe is the exception."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tools/"
+reason = """The CLI is a user-facing binary, so it relaxes clippy::print_stdout \
+and print_stderr at the crate root — lints.md §2 names exactly this case and \
+prefers a call-site #[expect], but the CLI prints from hundreds of sites and the \
+crate-level statement is the honest one."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "crates/fluxor-abi/"
+reason = """The ABI surface is raw register addresses, pointer-based syscall types \
+and chip-specific BAR maps: unsafe_code is what the crate IS, not an exception \
+within it. It also mounts modules/sdk/* and so carries the same dead_code cause \
+as modules/."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "crates/fluxor-launcher/"
+reason = """A single-purpose binary whose whole job is one fexecve — exec of an \
+open descriptor has no safe wrapper — and which prints its own diagnostics. Two \
+crate-level facts about a crate of one function."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/"
+reason = """Test drivers: unwrap/expect are how a failed expectation becomes a test \
+failure, and the harness mounts 21 module cores so it inherits modules/'s \
+dead_code cause. Shadow-tracked (test-tracking.md §1), so these files are not \
+in the main repo's history."""
 
 [ci.hygiene]
 # `permissive` allows bottom-of-file `#[cfg(test)] mod tests` blocks

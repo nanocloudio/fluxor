@@ -2094,6 +2094,9 @@ pub struct DynamicModule {
     /// hardware IRQ dispatches into the module's ISR entry rather than
     /// its cooperative `module_step`.
     isr_entry_fn: Option<ModuleIsrEntryFn>,
+    /// The module's own name, interned at instantiation — what logs and the
+    /// monitor report for this slot.
+    name: &'static str,
 }
 /// Partially initialized module waiting for async operations to complete.
 ///
@@ -2210,6 +2213,7 @@ impl DynamicModulePending {
                         self.module_idx as usize,
                     ),
                     isr_entry_fn: self.isr_entry_fn,
+                    name: self.name,
                 }))
             }
             NewStatus::Pending => Ok(None),
@@ -2269,6 +2273,7 @@ impl DynamicModule {
             drain_fn: None,
             isolated: false,
             isr_entry_fn: None,
+            name: "dynamic",
         }
     }
     /// Like `from_parts`, but injects a Tier 2 `module_isr_entry`
@@ -2291,6 +2296,7 @@ impl DynamicModule {
             drain_fn: None,
             isolated: false,
             isr_entry_fn,
+            name: "dynamic",
         }
     }
     /// Release this module's state buffer back to the pool. Consumes the
@@ -2555,6 +2561,7 @@ impl DynamicModule {
                     drain_fn,
                     isolated: crate::kernel::exec::scheduler::module_is_isolated(inst_idx),
                     isr_entry_fn: exports.isr_entry_fn,
+                    name,
                 }))
             }
             NewStatus::Pending => {
@@ -2653,7 +2660,10 @@ impl Module for DynamicModule {
         }
     }
     fn name(&self) -> &'static str {
-        "dynamic"
+        // The loaded module's own name (interned at instantiation), so logs
+        // and the monitor's MODULE_STATE_QUERY name what is running rather
+        // than how it was loaded.
+        self.name
     }
 }
 // ============================================================================

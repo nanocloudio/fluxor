@@ -53,8 +53,17 @@ const ALLOWED: &[(&str, &[&str])] = &[
     ("ci.cargo", &["host_tools_crate"]),
     (
         "ci.hygiene",
-        &["mode", "forbid_inline_tests", "max_inline_lines"],
+        &[
+            "mode",
+            "forbid_inline_tests",
+            "max_inline_lines",
+            "allow_crate_root",
+        ],
     ),
+    // Declared prefixes where a crate-root `#![allow(...)]` is permitted, per
+    // `standards/lints.md` §4. Both keys are required: an exemption without a
+    // reason is a conformance failure, not an escape hatch.
+    ("ci.hygiene.allow_crate_root", &["prefix", "reason"]),
     ("ci.lints", &["exemption"]),
     ("ci.lints.exemption", &["crate", "reason"]),
     ("ci.templates", &["dir", "vars", "template"]),

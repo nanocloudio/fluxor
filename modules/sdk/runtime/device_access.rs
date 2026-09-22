@@ -17,10 +17,6 @@
 /// `src/platform/bcm2712.rs` `init_page_tables()` (MAIR attr2 = 0x44).
 ///
 /// Bump-only for v1 — there is no matching `dev_dma_free`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     let mut buf = [0u8; 16];
@@ -58,10 +54,6 @@ unsafe fn dev_dma_alloc(sys: &SyscallTable, size: u32, align: u32) -> u64 {
 /// Streaming buffers must be paired with explicit cache maintenance at
 /// handoff — see `dev_dma_flush` (before device-reads) and
 /// `dev_dma_invalidate` (before CPU-reads of device-written regions).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> u64 {
     let mut buf = [0u8; 16];
@@ -95,10 +87,6 @@ unsafe fn dev_dma_alloc_streaming(sys: &SyscallTable, size: u32, align: u32) -> 
 /// Clean a VA range from the data cache (`dc cvac` + `dsb sy`). Call
 /// after writing into a streaming DMA buffer and before handing it to
 /// a device that will read it — ensures the device sees the CPU's writes.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     let mut buf = [0u8; 12];
@@ -124,10 +112,6 @@ unsafe fn dev_dma_flush(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
 /// Call before reading from a streaming DMA buffer that a device has
 /// just written — drops any stale CPU cache lines so the next load
 /// returns the device-written data.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
     let mut buf = [0u8; 12];
@@ -156,10 +140,6 @@ unsafe fn dev_dma_invalidate(sys: &SyscallTable, addr: u64, size: u32) -> i32 {
 /// resolve to exactly one device. Returns the device handle on
 /// success; on EAGAIN/ENODEV the caller should retry (the PCIe link
 /// may still be training).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie_device_open(sys: &SyscallTable, selector: &[u8]) -> i32 {
     (sys.provider_open)(
@@ -172,10 +152,6 @@ unsafe fn dev_pcie_device_open(sys: &SyscallTable, selector: &[u8]) -> i32 {
 
 /// PCIE_DEVICE contract: read 32-bit config-space word for the bound
 /// handle. Returns 0xFFFFFFFF on any failure (matches real-PCIe sentinel).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie_device_cfg_read32(sys: &SyscallTable, handle: i32, offset: u16) -> u32 {
     let mut buf = [0u8; 8];
@@ -192,10 +168,6 @@ unsafe fn dev_pcie_device_cfg_read32(sys: &SyscallTable, handle: i32, offset: u1
 
 /// PCIE_DEVICE contract: write 32-bit config-space word for the bound
 /// handle. Returns 0 on success, negative errno otherwise.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie_device_cfg_write32(
     sys: &SyscallTable,
@@ -219,10 +191,6 @@ unsafe fn dev_pcie_device_cfg_write32(
 
 /// PCIE_DEVICE contract: map BAR `bar_idx` for the bound handle,
 /// returning the kernel-visible virt address (or 0 on failure).
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie_device_bar_map(sys: &SyscallTable, handle: i32, bar_idx: u8) -> u64 {
     let mut buf = [0u8; 10];
@@ -249,10 +217,6 @@ unsafe fn dev_pcie_device_bar_map(sys: &SyscallTable, handle: i32, bar_idx: u8) 
 /// device's root complex, routing fires to `event_handle`. The
 /// kernel brings up the MSI controller lazily on first call.
 /// Returns `Some((vector_idx, target_addr, data))` on success.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie_device_msi_alloc(
     sys: &SyscallTable,
@@ -292,10 +256,6 @@ unsafe fn dev_pcie_device_msi_alloc(
 /// `offset` is the byte offset within config space, 4-byte aligned
 /// (low 2 bits ignored). Returns 0xFFFFFFFF when the device index
 /// is out of range or the target function did not respond.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u32 {
     let mut buf = [0u8; 8];
@@ -314,10 +274,6 @@ unsafe fn dev_pcie_cfg_read32(sys: &SyscallTable, dev_idx: u8, offset: u16) -> u
 
 /// Write a 32-bit value into a discovered device's PCI configuration
 /// space. Returns 0 on success, negative errno on failure.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val: u32) -> i32 {
     let mut buf = [0u8; 8];
@@ -337,10 +293,6 @@ unsafe fn dev_pcie_cfg_write32(sys: &SyscallTable, dev_idx: u8, offset: u16, val
 
 /// Initialise the brcmstb PCIe1 MSI controller behind GIC SPI
 /// `spi_irq`. Idempotent. Returns 0 on success, negative errno otherwise.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie1_msi_init(sys: &SyscallTable, spi_irq: u32) -> i32 {
     let mut buf = spi_irq.to_le_bytes();
@@ -355,10 +307,6 @@ unsafe fn dev_pcie1_msi_init(sys: &SyscallTable, spi_irq: u32) -> i32 {
 /// Allocate an MSI vector for `event_handle` and retrieve the
 /// (target_addr, data) the caller writes into its MSI-X table entry.
 /// Returns `Some((vector, target_addr, data))` on success.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_pcie1_msi_alloc_vector(
     sys: &SyscallTable,

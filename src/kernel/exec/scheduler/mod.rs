@@ -235,6 +235,13 @@ pub struct Edge {
     /// disturbing the merge. `false` for every normal edge, so the whole graph
     /// is byte-identical when no lane is attached.
     pub shared_channel: bool,
+    /// A **tap** (live mirror) edge: `channel` receives a copy of every write
+    /// to `tap_source`, the output channel of `from_module`'s port. The
+    /// tapped module does not write it — so it is never collected as that
+    /// module's output — and the copy is lossy (see `channel_set_mirror`).
+    /// `tap_source` is -1 once the tapped side has gone.
+    pub tap: bool,
+    pub tap_source: i32,
 }
 
 impl Edge {
@@ -261,6 +268,8 @@ impl Edge {
             bridge_slot: -1,
             wake_on_write: false,
             shared_channel: false,
+            tap: false,
+            tap_source: -1,
         }
     }
 
@@ -289,6 +298,8 @@ impl Edge {
             bridge_slot: -1,
             wake_on_write: false,
             shared_channel: false,
+            tap: false,
+            tap_source: -1,
         }
     }
 

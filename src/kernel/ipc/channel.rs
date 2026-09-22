@@ -67,7 +67,7 @@
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use portable_atomic::{AtomicBool, AtomicI16, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use portable_atomic::{AtomicBool, AtomicI16, AtomicI32, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 use crate::kernel::boot::config::MAX_GRAPH_EDGES;
 use crate::kernel::ipc::buffer_pool::{self, BUFFER_SIZE};
@@ -242,6 +242,11 @@ struct ChannelSlot {
     /// module unload / restart / finalisation and point into freed
     /// memory.
     ioctl_owner: AtomicU8,
+    /// A tap: the channel every successful write here is also copied into,
+    /// or -1. Lossy by design — a copy that does not fit whole is dropped,
+    /// so an observer can never back-pressure or stall the producer. Set by
+    /// `apply_add` for a tap edge, cleared when the tap's owner is freed.
+    mirror: AtomicI32,
 }
 
 // SAFETY: `ChannelSlot` interior is split between the atomics
@@ -269,6 +274,7 @@ impl ChannelSlot {
             ioctl_handler: AtomicPtr::new(core::ptr::null_mut()),
             ioctl_state: AtomicPtr::new(core::ptr::null_mut()),
             ioctl_owner: AtomicU8::new(u8::MAX),
+            mirror: AtomicI32::new(-1),
         }
     }
 
@@ -329,6 +335,7 @@ impl ChannelSlot {
         self.ioctl_owner.store(u8::MAX, Ordering::Release);
         self.ioctl_state
             .store(core::ptr::null_mut(), Ordering::Release);
+        self.mirror.store(-1, Ordering::Release);
         // SAFETY: `reset()` runs under the slot's free-transition; no
         // active references to `self.fifo` are live at this point.
         unsafe {
@@ -780,6 +787,7 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
         buffer_pool::mailbox_release_write(buf_slot, len as u32);
         slot.ever_written.store(true, Ordering::Release);
         wake_consumer_if_flagged(slot);
+        mirror_write(slot, core::slice::from_raw_parts(data, len));
         trace!("chan_write h={handle} mailbox len={len}");
         return len as i32;
     }
@@ -796,7 +804,63 @@ pub unsafe fn channel_write(handle: i32, data: *const u8, len: usize) -> i32 {
     } else {
         slot.ever_written.store(true, Ordering::Release);
         wake_consumer_if_flagged(slot);
+        mirror_write(slot, &input[..written as usize]);
         written
+    }
+}
+
+/// Copy what was just written to `slot` into its tap, if it has one: whole or
+/// not at all. A partial copy would split the producer's write — a line, a
+/// record — into bytes the observer cannot parse, so a copy that does not fit
+/// is dropped; the observer sees a gap, never a torn unit, and the producer
+/// never waits on it.
+fn mirror_write(slot: &ChannelSlot, bytes: &[u8]) {
+    let m = slot.mirror.load(Ordering::Acquire);
+    if m < 0 || (m as usize) >= MAX_CHANNELS || bytes.is_empty() {
+        return;
+    }
+    let tap = &CHANNELS[m as usize];
+    if !tap.is_pipe() || tap.mailbox.load(Ordering::Acquire) {
+        return;
+    }
+    let copied = tap.with_lock(|fifo, storage| {
+        let Some(storage) = storage else { return false };
+        if fifo.space() < bytes.len() {
+            return false;
+        }
+        fifo.write(storage, bytes) == bytes.len()
+    });
+    if copied {
+        tap.ever_written.store(true, Ordering::Release);
+        wake_consumer_if_flagged(tap);
+    }
+}
+
+/// Make `tap` receive a copy of every write to `source` (`tap < 0` clears).
+/// Refuses a second tap on one channel, and a tap that is not a pipe.
+pub fn channel_set_mirror(source: i32, tap: i32) -> bool {
+    if source < 0 || (source as usize) >= MAX_CHANNELS {
+        return false;
+    }
+    let slot = &CHANNELS[source as usize];
+    if tap < 0 {
+        slot.mirror.store(-1, Ordering::Release);
+        return true;
+    }
+    if (tap as usize) >= MAX_CHANNELS || !CHANNELS[tap as usize].is_pipe() || !slot.is_pipe() {
+        return false;
+    }
+    slot.mirror
+        .compare_exchange(-1, tap, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Mark `handle` ended (HUP), as a producer's end-of-stream does.
+pub fn channel_mark_hup(handle: i32) {
+    if handle >= 0 && (handle as usize) < MAX_CHANNELS {
+        CHANNELS[handle as usize]
+            .hup_flag
+            .store(true, Ordering::Release);
     }
 }
 
@@ -975,8 +1039,11 @@ pub fn channel_ioctl(handle: i32, cmd: u32, arg: *mut u8) -> i32 {
             CHAN_OK
         }
         IOCTL_SET_HUP => {
-            // Set HUP flag (producer signals completion / end-of-stream)
+            // Set HUP flag (producer signals completion / end-of-stream). A
+            // tap sees the end too, so a pipeline observing a finite stream
+            // completes by EOF rather than waiting to be interrupted.
             slot.hup_flag.store(true, Ordering::Release);
+            channel_mark_hup(slot.mirror.load(Ordering::Acquire));
             debug!("chan_ioctl h={handle} SET_HUP");
             CHAN_OK
         }

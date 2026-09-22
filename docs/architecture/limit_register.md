@@ -18,7 +18,7 @@ means editing its row here in the same change.
 
 | Id | Width | Ceiling | Symbol | Source | Value | Binds instead / notes |
 |---|---|---|---|---|---|---|
-| TCP/HTTP `conn_id` (net-proto wire) | u16 LE | 65535 | `MAX_TCP_CONNS` | modules/sdk/abi/config.rs | 65536 | The host table is exactly the id space (ids 0..65535); 256 on wasm, 16 on embedded. A record is ~2.2 KiB, most of it the bounded reorder buffer, so the host table is ~137 MiB and is the term `STATE_ARENA_SIZE` is sized around. Lookup is by hash index (`ip/index.rs`) whose removals close their holes and whose hash is seeded per instance, so a packet pays for the cluster it lands in rather than for the table — a miss included — and the timer sweep is sliced across its 50 ms window |
+| TCP/HTTP `conn_id` (net-proto wire) | u16 LE | 65535 | `MAX_TCP_CONNS` | modules/sdk/abi/config.rs | 65536 | The host table is exactly the id space (ids 0..65535); 256 on wasm, 8 on embedded. A record is ~2.2 KiB, most of it the bounded reorder buffer, so the host table is ~137 MiB and is the term `STATE_ARENA_SIZE` is sized around. Lookup is by hash index (`ip/index.rs`) whose removals close their holes and whose hash is seeded per instance, so a packet pays for the cluster it lands in rather than for the table — a miss included — and the timer sweep is sliced across its 50 ms window |
 | datagram/packet `ep_id` (DG/PKT wire) | u8 | 256 | `MAX_DG_ENDPOINTS` | modules/sdk/abi/config.rs | 256 | Endpoints are allocated only from the first `MAX_DG_ENDPOINTS` connection slots, so the u8 id binds the endpoint count, not the table. TCP prefers the slots beyond that window and takes it only when the rest is full |
 | local-address slot (`TcpConn::local_slot`) | u16 | 65535 | `MAX_LOCAL_ADDRS` | modules/sdk/abi/config.rs | 4096 | `0xFFFF` is the wildcard slot. Demux is by hash index; 8 on wasm and embedded |
 | decision-seam hold (`pkt_id` slot) | u16 | 65535 | `MAX_PACKET_HOLD` | modules/sdk/abi/config.rs | 32 | One full frame per slot; an arrival past it is refused and counted, never displaces a held packet. 8 on wasm, 4 on embedded |
@@ -150,7 +150,7 @@ cannot be evaluated from its own file reads `—` and says why.
 | Config arena | `CONFIG_ARENA_SIZE` | modules/sdk/abi/config.rs | 262144 | Sized against the largest per-module params section (~95 KiB for an http module on the host) with headroom for the rest of the graph. A packed config larger than this is refused at boot 32 KiB on wasm, 16 KiB on embedded. |
 | One module's params section | `MAX_MODULE_CONFIG_SIZE` | modules/sdk/abi/config.rs | 262144 | Sanity bound on one module's slice of the config arena; kept in lockstep with the kernel's `MAX_MODULE_SECTION` and the CLI's params cap so the three refuse the same blob 16 KiB on wasm, 4 KiB on embedded. |
 | Kernel module-section bound | `MAX_MODULE_SECTION` | src/kernel/boot/config.rs | 262144 | The kernel-side twin of `MAX_MODULE_CONFIG_SIZE` (linux + wasm / bare metal): a section past it is refused while parsing, before any module is instantiated. Registered separately so the pair cannot drift apart unnoticed 32 KiB on bare metal. |
-| HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 16-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
+| HTTP concurrent connections | `MAX_CONCURRENT_CONNS` | modules/sdk/abi/config.rs | 256 | Policy: the http module's own table, below `MAX_TCP_CONNS`; an accept past it is closed before any request is read. The embedded 4 is sized against the 8-slot TCP table in that profile; the one-session TLS table beneath it bounds HTTPS. 4 on embedded. |
 | HTTP per-connection receive buffer | `RECV_BUF_SIZE` | modules/sdk/abi/config.rs | 8192 | Policy: a whole request line, headers and a small body in one read; a request that does not fit is refused 431, not spilled 4096 on wasm, 2048 on embedded. |
 | HTTP per-connection send buffer | `SEND_BUF_SIZE` | modules/sdk/abi/config.rs | 4100 | Policy, deliberately 4 KiB + 4: a WebSocket frame of exactly 4096 bytes of payload plus its header fits in one write, so the RFC 6455 fragmentation path is taken only by frames that genuinely exceed it |
 | Dynamic routes | `MAX_DYN_ROUTES` | modules/sdk/abi/config.rs | 64 | Policy: the dynamic-route arena an ingress fills at runtime; a route past the ceiling is refused and counted in `http.routes.dropped` 8 on wasm and embedded. |
@@ -221,9 +221,11 @@ LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 16384
 LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 4096
 MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536
 MAX_TCP_CONNS | modules/sdk/abi/config.rs | 256
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 16
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 8
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 2
 MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 256
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 16
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 8
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 2
 MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 4096
 MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8
 MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 32
@@ -264,6 +266,7 @@ STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024
 STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024 * 1024
 STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 96 * 1024 * 1024
 STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024
 MAX_CHAN_BYTES | src/kernel/ipc/channel.rs | 4 * 1024 * 1024
 MAX_CONNS | modules/sdk/abi/config.rs | 64
 MAX_CONNS | modules/sdk/abi/config.rs | 8
@@ -374,12 +377,14 @@ CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16
 CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8
 BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 * 1024
 BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024
 ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 16 * 1024 * 1024
 ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 2 * 1024 * 1024
 ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 0
 CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024
 CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 32 * 1024
 CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024
 MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 256 * 1024
 MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 16 * 1024
 MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 4 * 1024
@@ -387,6 +392,7 @@ MAX_MODULE_SECTION | src/kernel/boot/config.rs | 256 * 1024
 MAX_MODULE_SECTION | src/kernel/boot/config.rs | 32 * 1024
 MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256
 MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 4
+MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 1
 RECV_BUF_SIZE | modules/sdk/abi/config.rs | 8192
 RECV_BUF_SIZE | modules/sdk/abi/config.rs | 4096
 RECV_BUF_SIZE | modules/sdk/abi/config.rs | 2048
@@ -400,6 +406,7 @@ MAX_FS_PATH | modules/sdk/abi/config.rs | 64
 DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 256 * 1024
 DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 32 * 1024
 DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 16 * 1024
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 4 * 1024
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 32768
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 2048
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 8192

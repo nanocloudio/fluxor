@@ -1,9 +1,5 @@
 //! Scheduler responsibility module (real module boundary; parent statics and
 //! helpers reach us via `super`).
-#![allow(
-    unused_imports,
-    reason = "the flat scheduler namespace is glob-imported; each module uses a subset"
-)]
 use super::*;
 
 // ============================================================================

@@ -23,6 +23,14 @@ mod abi_pin;
 mod add_subgraph;
 mod agent_cli;
 mod asset_bank;
+// The binary reaches for the decode half only (PEM trust anchors); the lib
+// uses both. One source, two crates, so the unused half is dead here and
+// not there.
+#[allow(
+    dead_code,
+    reason = "consumer-conditional: this crate uses decode only, the lib uses both"
+)]
+mod b64;
 mod board;
 mod capacity;
 mod ci;

@@ -85,9 +85,21 @@
 #![deny(clippy::unwrap_used)]
 #![allow(
     dead_code,
+    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
+              module's compile sees the entire ABI surface while using a subset. This \
+              allow is the SDK's textual mounting showing through"
+)]
+#![allow(
     unused_imports,
+    reason = "same cause: the mounted SDK brings names this module does not reach for"
+)]
+#![allow(
     unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+    reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
+              exhaustive, which is why the lint fires; the arm exists so that adding a \
+              variant cannot silently bypass the error path. #[expect] is not the \
+              alternative — it fails the build in the configurations where the lint \
+              does not fire"
 )]
 
 use core::ffi::c_void;
@@ -151,6 +163,22 @@ mod udp;
 
 /// Maximum ethernet frame size
 const MAX_FRAME_SIZE: usize = 1536;
+
+/// A receive buffer smaller than the MSS this stack advertises is a stack that
+/// told its peer to send segments it cannot hold.
+///
+/// The two constants are coupled in fact and live in different files, so the
+/// relation is asserted rather than remembered: 14 bytes of Ethernet header,
+/// 20 of IPv4 and 20 of TCP sit in front of the payload, and `tcp::MSS` is what
+/// a SYN promises. Shrinking `MAX_FRAME_SIZE` for a constrained target — the
+/// obvious lever, worth ~6 KiB of module state on RP2040 — therefore requires
+/// clamping `MSS` in the same change. IPv4 guarantees a 576-byte path MTU, so
+/// an MSS of 536 is always legal and always deliverable; a 640-byte frame
+/// buffer with MSS 536 is standards-clean rather than a compromise.
+///
+/// Without this, the failure is a stack that completes a handshake and then
+/// drops every full-size segment — which presents as a stall, not an error.
+const _: () = assert!(tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE);
 
 /// Largest transmit frame `send_frame` will accept. It stages
 /// `[len:u16 LE][frame…]` inside a single buffer, so two bytes of the
@@ -2906,6 +2934,12 @@ pub extern "C" fn module_deferred_ready() -> u32 {
 pub extern "C" fn module_state_size() -> usize {
     core::mem::size_of::<IpState>()
 }
+
+// The same figure as data, so `pack` records this module's resident footprint in
+// its manifest and a graph's state-arena demand can be summed host-side. `ip` is
+// the module that most needs it: at the embedded profile's 16-entry TCP table it
+// measures 59,400 bytes, which is 90% of an RP2040's whole 64 KiB state arena.
+declare_module_state_bytes!(IpState);
 
 /// PIC module ABI entry: one-time initialisation. The kernel calls this
 /// once during loader bring-up before any `module_new` invocation.

@@ -11,10 +11,6 @@ const NET_FRAME_HDR: usize = 3;
 /// frame; returns 0 on backpressure (channel ring full or atomic
 /// FIFO write rejected) so callers can retry rather than treat a
 /// dropped frame as committed.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 unsafe fn net_write_frame(
     sys: &SyscallTable,
     chan: i32,
@@ -49,10 +45,6 @@ unsafe fn net_write_frame(
 ///
 /// Two-step read: first the 3-byte TLV header, then exactly payload_len bytes.
 /// This prevents consuming multiple frames from the byte-stream FIFO in one call.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 unsafe fn net_read_frame(
     sys: &SyscallTable,
     chan: i32,
@@ -91,10 +83,6 @@ unsafe fn net_read_frame(
 /// `(msg_type, copied_len, payload_len)` — `copied_len < payload_len` signals the
 /// frame was truncated into `buf` (the tail was dropped, not left to desync the
 /// FIFO). A consumer that must not lose bytes can compare the two and reconnect.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 unsafe fn net_read_frame_aligned(
     sys: &SyscallTable,
     chan: i32,
@@ -143,10 +131,6 @@ unsafe fn net_read_frame_aligned(
 
 /// Fill buffer with cryptographically secure random bytes.
 /// Returns 0 on success, negative errno on failure.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
     (sys.provider_call)(-1, 0x0C3C, buf, len)
@@ -158,10 +142,6 @@ unsafe fn dev_csprng_fill(sys: &SyscallTable, buf: *mut u8, len: usize) -> i32 {
 /// `[conn_id][trace_id 16][parent_span_id 8][trace_flags 1]`. `flags` is the
 /// W3C trace-flags byte (low bit = `sampled`). Returns true if the frame was
 /// written. See `contracts/net/net_proto.rs`.
-#[allow(
-    dead_code,
-    reason = "observability propagation; invoked only by instrumented stream stages"
-)]
 #[allow(
     clippy::too_many_arguments,
     reason = "flat trace-context args (conn id, trace/span ids, flags) plus the caller's scratch buffer — a struct would just move the list"
@@ -197,10 +177,6 @@ unsafe fn dev_net_send_trace_ctx(
 /// (including the 3-byte net_proto header); `payload_len` is from
 /// `net_read_frame`. Returns `(conn_id, trace_id, parent_span_id, trace_flags)`
 /// or `None`.
-#[allow(
-    dead_code,
-    reason = "observability propagation; invoked only by instrumented stream stages"
-)]
 unsafe fn parse_trace_ctx(
     frame_buf: *const u8,
     payload_len: usize,
@@ -227,70 +203,18 @@ unsafe fn parse_trace_ctx(
 // the single source of truth. Re-exported here under the `DG_` prefix that the
 // runtime helpers and the datagram modules use, so there is one definition of
 // each value, not two.
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_V4_PREFIX: usize = abi::contracts::net::datagram::V4_ADDR_PREFIX;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_CMD_BIND: u8 = abi::contracts::net::datagram::CMD_DG_BIND;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_CMD_SEND_TO: u8 = abi::contracts::net::datagram::CMD_DG_SEND_TO;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_CMD_CLOSE: u8 = abi::contracts::net::datagram::CMD_DG_CLOSE;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_MSG_BOUND: u8 = abi::contracts::net::datagram::MSG_DG_BOUND;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_MSG_RX_FROM: u8 = abi::contracts::net::datagram::MSG_DG_RX_FROM;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_MSG_CLOSED: u8 = abi::contracts::net::datagram::MSG_DG_CLOSED;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_MSG_ERROR: u8 = abi::contracts::net::datagram::MSG_DG_ERROR;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_AF_INET: u8 = abi::contracts::net::datagram::AF_INET;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_AF_INET6: u8 = abi::contracts::net::datagram::AF_INET6;
-#[allow(
-    dead_code,
-    reason = "shared SDK helper; each including module uses a subset"
-)]
 const DG_AF_NAME: u8 = abi::contracts::net::datagram::AF_NAME;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_OWNER_TAG_MARK: u8 = abi::contracts::net::datagram::OWNER_TAG_MARK;
-#[allow(
-    dead_code,
-    reason = "re-exported datagram surface; each consumer uses a subset"
-)]
 const DG_OWNER_TAG_FIELD: usize = abi::contracts::net::datagram::OWNER_TAG_FIELD;
 
 /// Build and emit a `CMD_DG_SEND_TO` frame for an IPv4 destination.
@@ -309,10 +233,6 @@ const DG_OWNER_TAG_FIELD: usize = abi::contracts::net::datagram::OWNER_TAG_FIELD
 /// retain the payload.
 ///
 /// See `modules/sdk/contracts/net/datagram.rs` for the wire spec.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "datagram send wire-shape: signature mirrors the on-wire datagram envelope fields"
@@ -348,10 +268,6 @@ unsafe fn dev_dg_send_to_v4(
 /// lookup and drops this datagram, so callers retransmit as on loss.
 /// Returns the frame length written, or `0` when the name is not one the
 /// surface carries, the scratch is too small, or the channel refused.
-#[allow(
-    dead_code,
-    reason = "shared SDK helper; each including module uses a subset"
-)]
 #[allow(
     clippy::too_many_arguments,
     reason = "an addressed datagram send is destination plus payload plus scratch"
@@ -424,10 +340,6 @@ unsafe fn dev_dg_send_to_name_owned(
 /// The marker sits where `af` sits and is no defined address family, so the two
 /// shapes separate at a fixed offset rather than by a length rule over the
 /// variable-length tail.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "datagram send wire-shape: signature mirrors the on-wire datagram envelope fields"
@@ -505,10 +417,6 @@ unsafe fn dev_dg_send_to_v4_owned(
 /// first byte of the inner datagram payload. Returns `None` if the
 /// frame is too short, has the wrong `af`, or `payload_len` underflows
 /// the prefix.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline]
 unsafe fn parse_dg_rx_from_v4(
     frame_buf: *const u8,

@@ -35,7 +35,7 @@ pub struct Shape {
     /// `[ci.cargo] host_tools_crate` — or the conventional `tools/`
     /// crate — resolved to a directory that exists. The kernel-rooted
     /// workspaces (fluxor itself) can't build at the root under default
-    /// features, so cargo runs here instead; `fluxor ci`'s phase 2 uses
+    /// features, so cargo runs here instead; `fluxor ci`'s unit-test phase uses
     /// the same resolution.
     pub host_tools: Option<PathBuf>,
     /// `modules/` exists and `[ci].targets` names at least one target,
@@ -48,14 +48,14 @@ pub struct Shape {
     /// `[ci.test] scripts` globs — the project's runtime gate.
     pub test_scripts: Vec<String>,
     /// A root `tests/` directory exists, so the root package may carry
-    /// integration tests. Phase 2 selects target kinds and therefore cannot
-    /// reach them; the integration lane is what does.
+    /// integration tests. The unit-test phase selects target kinds and so
+    /// cannot reach them; the integration lane is what does.
     pub has_root_tests: bool,
     /// `tests/harness/` exists — a sub-workspace holding the project's
-    /// integration suites, which `fluxor ci`'s phase 4 runs. Tracked here so
-    /// the `test` VERB runs it too: a lane the gate covers and the verb skips
-    /// makes `make test` quietly weaker than `make ci`, which is the one thing
-    /// a lifecycle verb must never be.
+    /// integration suites, which `fluxor ci`'s integration-test phase runs.
+    /// Tracked here so the `test` VERB runs it too: a lane the gate covers and
+    /// the verb skips makes `make test` quietly weaker than `make ci`, which
+    /// is the one thing a lifecycle verb must never be.
     pub has_harness_crate: bool,
 }
 
@@ -93,6 +93,79 @@ impl Shape {
             self.has_root_tests,
         )
     }
+
+    /// Every distinct cargo workspace root the lifecycle verbs build in.
+    ///
+    /// `clean` is the inverse of `build` / `test` / `ci`: it reaches exactly
+    /// the build state those verbs create, and nothing else. What makes that
+    /// more than one directory is that a `cargo clean` removes the target dir
+    /// of the workspace it runs in, and a sub-workspace declaring its own
+    /// `[workspace]` is NOT reachable from the root — `tests/harness/` is
+    /// excluded by the root manifest and owns a target dir the root clean
+    /// cannot see. A site missed here is build state no verb removes.
+    ///
+    /// Deliberately not included: a `target/` under a directory no verb
+    /// builds in (residue from running cargo by hand there), the OCI store
+    /// (shared across projects — `store gc`'s business, and sweeping it would
+    /// destroy sibling projects' pins), and deploy staging.
+    fn cargo_clean_sites(&self) -> Vec<PathBuf> {
+        let mut sites: Vec<PathBuf> = Vec::new();
+        let add = |sites: &mut Vec<PathBuf>, dir: PathBuf| {
+            if dir.join("Cargo.toml").is_file() && !sites.contains(&dir) {
+                sites.push(dir);
+            }
+        };
+
+        if self.has_cargo {
+            add(&mut sites, self.project_root.clone());
+        }
+
+        // A host-tools crate that is a member of the root workspace shares the
+        // root's target dir and is already covered; one that stands alone (no
+        // root manifest, or its own `[workspace]`) owns a target dir of its own.
+        if let Some(tools) = &self.host_tools {
+            if !self.has_cargo || declares_own_workspace(tools) {
+                add(&mut sites, tools.clone());
+            }
+        }
+
+        // Standalone host crates one level under `tools/` — the shape quantum
+        // and wave have, where there is no root workspace and each crate is
+        // its own. `[ci.test] scripts` build these, so clean owes them too.
+        let tools_root = self.project_root.join("tools");
+        if tools_root.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(&tools_root)
+                .into_iter()
+                .flatten()
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.join("Cargo.toml").is_file())
+                .collect();
+            entries.sort();
+            for dir in entries {
+                if !self.has_cargo || declares_own_workspace(&dir) {
+                    add(&mut sites, dir);
+                }
+            }
+        }
+
+        // The integration sub-workspace. Its `[workspace]` is why the root
+        // clean cannot reach it, and it is the largest target dir in the tree.
+        if self.has_harness_crate {
+            add(&mut sites, self.project_root.join("tests/harness"));
+        }
+
+        sites
+    }
+}
+
+/// Whether `dir`'s manifest declares its own `[workspace]`, making it a
+/// workspace root rather than a member of an enclosing one.
+fn declares_own_workspace(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Value>().ok())
+        .is_some_and(|v| v.get("workspace").is_some())
 }
 
 /// Read the project's shape off disk.
@@ -255,6 +328,12 @@ pub fn build(project_root: &Path, verbose: bool) -> Result<()> {
     }
 
     if let Some((dir, workspace)) = s.cargo_site() {
+        // `--all-targets`: the build verb compiles the test and bench targets
+        // too. Narrowing it would not save the work, only move it — the
+        // unit-test phase of `fluxor ci` builds the same targets over the same
+        // site, so in the `make && make ci` sequence the cost is paid either
+        // way. Paying it here is what lets `make` alone notice that a test
+        // stopped compiling.
         let args: &[&str] = if workspace {
             &["build", "--workspace", "--all-targets"]
         } else {
@@ -384,9 +463,20 @@ pub fn clean(project_root: &Path) -> Result<()> {
         })?;
         println!("  removed {removed} artefact file(s)");
     }
-    if s.has_cargo {
-        step("cargo clean");
-        ci::cargo_in(&s.project_root, &["clean"]).map_err(Error::Config)?;
+    // Every cargo workspace root the other verbs build in, not just this
+    // one. `tests/harness/` declares its own `[workspace]` and is excluded
+    // by the root manifest, so a root `cargo clean` cannot reach it — and it
+    // is the largest target dir in the tree. A verb that leaves most of the
+    // build state behind cannot be used to reach a cold build, which is what
+    // clean is for.
+    for site in s.cargo_clean_sites() {
+        let label = match site.strip_prefix(&s.project_root) {
+            Ok(rel) if rel.as_os_str().is_empty() => "cargo clean".to_string(),
+            Ok(rel) => format!("cd {} && cargo clean", rel.display()),
+            Err(_) => format!("cd {} && cargo clean", site.display()),
+        };
+        step(&label);
+        ci::cargo_in(&site, &["clean"]).map_err(Error::Config)?;
     }
 
     // `fluxor modules test` generates disposable crates here. `cargo
@@ -790,9 +880,9 @@ mod tests {
     /// Every lane `fluxor test` runs, `fluxor ci` runs too.
     ///
     /// The two read one definition, so this holds by construction rather than
-    /// by both being edited together. It is asserted over the shapes the
-    /// fleet actually has, because the pairing used to differ per shape and
-    /// the differences were invisible from either side alone.
+    /// by both being edited together. It is asserted over the shapes the fleet
+    /// actually has, because a divergence between the two is invisible from
+    /// either side alone.
     #[test]
     fn the_test_verb_never_runs_a_lane_the_gate_skips() {
         let root = PathBuf::from("/p");
@@ -874,6 +964,90 @@ mod tests {
         );
     }
 
+    /// A sub-workspace that declares its own `[workspace]` is invisible to the
+    /// root `cargo clean`, so `clean` has to name it. `tests/harness/` is that
+    /// shape and holds the largest target dir in the tree.
+    #[test]
+    fn clean_reaches_the_harness_sub_workspace_and_the_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxor-clean-sites-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tests/harness")).unwrap();
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        // A member crate: shares the root target dir, so it is NOT a site.
+        std::fs::write(dir.join("tools/Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
+        // A sub-workspace: owns its own target dir, so it IS a site.
+        std::fs::write(
+            dir.join("tests/harness/Cargo.toml"),
+            "[workspace]\n[package]\nname = \"h\"\n",
+        )
+        .unwrap();
+
+        let s = Shape {
+            project_root: dir.clone(),
+            name: "p".into(),
+            has_cargo: true,
+            host_tools: Some(dir.join("tools")),
+            has_modules: false,
+            mounts_staged: false,
+            test_scripts: Vec::new(),
+            has_root_tests: true,
+            has_harness_crate: true,
+        };
+
+        let sites = s.cargo_clean_sites();
+        assert_eq!(
+            sites,
+            vec![dir.clone(), dir.join("tests/harness")],
+            "the root and the sub-workspace, and not the member crate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crate-less project (quantum's shape: no root manifest, standalone
+    /// host crates under `tools/`) still has build state, and clean still owes
+    /// it, even though no cargo site sits above those crates.
+    #[test]
+    fn clean_reaches_standalone_tools_crates_without_a_root_workspace() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxor-clean-sites-standalone-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for c in ["ci", "wire_lint"] {
+            std::fs::create_dir_all(dir.join("tools").join(c)).unwrap();
+            std::fs::write(
+                dir.join("tools").join(c).join("Cargo.toml"),
+                format!("[package]\nname = \"{c}\"\n"),
+            )
+            .unwrap();
+        }
+
+        let s = Shape {
+            project_root: dir.clone(),
+            name: "q".into(),
+            has_cargo: false,
+            host_tools: None,
+            has_modules: true,
+            mounts_staged: false,
+            test_scripts: vec!["tools/ci/host_crates.sh".into()],
+            has_root_tests: false,
+            has_harness_crate: false,
+        };
+
+        assert_eq!(
+            s.cargo_clean_sites(),
+            vec![dir.join("tools/ci"), dir.join("tools/wire_lint")],
+            "each standalone host crate owns a target dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cargo_site_prefers_the_host_tools_crate_over_the_root() {
         let root = PathBuf::from("/p");
@@ -931,7 +1105,7 @@ mod tests {
     ///
     /// This is wave's shape: no root manifest, host crates each declaring
     /// their own `[workspace]`, so `cargo_site()` is `None` and the harness is
-    /// invisible to every other lane. `fluxor ci` phase 4 runs it regardless,
+    /// invisible to every other lane. `fluxor ci` runs it regardless,
     /// and a verb that skipped what the gate covers would make `make test`
     /// green over hundreds of unrun integration tests — which is the one thing
     /// a lifecycle verb must never be.

@@ -73,7 +73,6 @@ pub fn file_source(spec: &str) -> Option<&str> {
 /// `BEGIN/END CERTIFICATE` markers is ignored; a block whose base64 does
 /// not decode is skipped.
 pub fn pem_certificates(pem: &str) -> Vec<Vec<u8>> {
-    use base64::Engine;
     let mut out = Vec::new();
     let mut in_cert = false;
     let mut b64 = String::new();
@@ -83,7 +82,7 @@ pub fn pem_certificates(pem: &str) -> Vec<Vec<u8>> {
             in_cert = true;
             b64.clear();
         } else if line == "-----END CERTIFICATE-----" {
-            if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(&b64) {
+            if let Some(der) = crate::b64::decode(&b64) {
                 out.push(der);
             }
             in_cert = false;
@@ -461,9 +460,8 @@ mod tests {
 
     #[test]
     fn pem_bundle_is_recognised_and_limits_apply() {
-        use base64::Engine;
         let der = seq(4, 9);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+        let b64 = crate::b64::encode(&der);
         let block = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
         let two = format!("{block}{block}");
         assert_eq!(parse_bundle(two.as_bytes()).unwrap().len(), 2);

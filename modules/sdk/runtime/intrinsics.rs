@@ -103,6 +103,52 @@ mod _pic_intrinsics {
         __aeabi_memclr(dest, n);
     }
 
+    // Count leading zeros, 32-bit.
+    //
+    // ARMv6-M (RP2040, Cortex-M0+) has no `CLZ` instruction, so LLVM lowers
+    // `u32::leading_zeros()` — and the normalisation step of any bignum
+    // division — into a call to this compiler-rt symbol. A PIC module links
+    // no `compiler_builtins`, so without this definition any module carrying
+    // bignum arithmetic fails at link with "undefined reference to
+    // `__clzsi2`" — RSA's modulus load and signature verify both normalise.
+    //
+    // Implemented by explicit bit test, NOT by `leading_zeros()`, for exactly
+    // the reason the memclr family uses `write_volatile` above: on this
+    // target `leading_zeros()` compiles back into a call to `__clzsi2`, so
+    // the obvious one-liner is infinite recursion.
+    //
+    // ARMv7-M and ARMv8-M have `CLZ` and never emit the call; the symbol is
+    // dead there and `--gc-sections` drops it.
+    #[cfg(target_arch = "arm")]
+    #[no_mangle]
+    pub extern "C" fn __clzsi2(x: u32) -> i32 {
+        if x == 0 {
+            return 32;
+        }
+        let mut x = x;
+        let mut n = 0i32;
+        if x & 0xFFFF_0000 == 0 {
+            n += 16;
+            x <<= 16;
+        }
+        if x & 0xFF00_0000 == 0 {
+            n += 8;
+            x <<= 8;
+        }
+        if x & 0xF000_0000 == 0 {
+            n += 4;
+            x <<= 4;
+        }
+        if x & 0xC000_0000 == 0 {
+            n += 2;
+            x <<= 2;
+        }
+        if x & 0x8000_0000 == 0 {
+            n += 1;
+        }
+        n
+    }
+
     #[no_mangle]
     #[link_section = ".text.aeabi_memset"]
     pub unsafe extern "C" fn __aeabi_memset(dest: *mut u8, n: usize, val: i32) {
@@ -404,6 +450,82 @@ mod _pic_intrinsics {
         let lo = (v_lo >> shift) | (v_hi << (32 - shift));
         let hi = v_hi >> shift;
         (lo as u64) | ((hi as u64) << 32)
+    }
+
+    /// Unsigned 64-bit division-and-remainder.
+    ///
+    /// AAPCS returns the quotient in `r0:r1` and the remainder in `r2:r3`,
+    /// which is exactly how a `u128` return lowers — the same trick
+    /// `__aeabi_uidivmod` uses one size down with `u64`. Writing it as two
+    /// out-params would need an ABI the compiler does not emit calls for.
+    ///
+    /// Cortex-M33 and above have `UDIV` but still call this for 64-bit
+    /// operands; Cortex-M0+ has no divide at all, so on RP2040 every `u64 /`
+    /// and `u64 %` in module code lands here. Pure bit-shift long division:
+    /// no further intrinsic calls, no recursion, 64 iterations worst case.
+    ///
+    /// Division by zero returns zero rather than trapping, matching the
+    /// 32-bit helpers above — a PIC module has no unwinder and no handler to
+    /// trap into, so a fault here is a silent lockup rather than a diagnosis.
+    #[cfg(target_arch = "arm")]
+    #[no_mangle]
+    pub unsafe extern "C" fn __aeabi_uldivmod(n: u64, d: u64) -> u128 {
+        if d == 0 {
+            return 0;
+        }
+        let mut quotient = 0u64;
+        let mut remainder = 0u64;
+        let mut i = 64u32;
+        while i > 0 {
+            i -= 1;
+            remainder = (remainder << 1) | ((n >> i) & 1);
+            if remainder >= d {
+                remainder -= d;
+                quotient |= 1u64 << i;
+            }
+        }
+        (quotient as u128) | ((remainder as u128) << 64)
+    }
+
+    /// Signed 64-bit division-and-remainder.
+    ///
+    /// Quotient truncates toward zero and the remainder takes the DIVIDEND's
+    /// sign, which is what C and the EABI both require and what Rust's `%`
+    /// expects: `(-7) % 2` is `-1`, not `1`. Getting that wrong produces
+    /// arithmetic that is correct for positive inputs and silently wrong for
+    /// negative ones — and chronicle's expression VM evaluates `int` as `i64`,
+    /// so a negative sensor reading is an ordinary input, not an edge case.
+    #[cfg(target_arch = "arm")]
+    #[no_mangle]
+    pub unsafe extern "C" fn __aeabi_ldivmod(n: i64, d: i64) -> u128 {
+        if d == 0 {
+            return 0;
+        }
+        let neg_quotient = (n < 0) != (d < 0);
+        let un = if n < 0 {
+            (n as u64).wrapping_neg()
+        } else {
+            n as u64
+        };
+        let ud = if d < 0 {
+            (d as u64).wrapping_neg()
+        } else {
+            d as u64
+        };
+        let qr = __aeabi_uldivmod(un, ud);
+        let q = qr as u64;
+        let r = (qr >> 64) as u64;
+        let q = if neg_quotient {
+            (q as i64).wrapping_neg()
+        } else {
+            q as i64
+        };
+        let r = if n < 0 {
+            (r as i64).wrapping_neg()
+        } else {
+            r as i64
+        };
+        (q as u64 as u128) | ((r as u64 as u128) << 64)
     }
 } // mod _pic_intrinsics — end of PIC-only block
 

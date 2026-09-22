@@ -53,7 +53,7 @@ pub const MANIFEST_MAGIC: u32 = 0x464D5846;
 /// layout is:
 ///
 /// - 16-byte header (magic, version, port/resource/dependency
-///   counts, module_version, hardware_targets, state_size_hint,
+///   counts, module_version, hardware_targets, state_bytes_64,
 ///   flags, fine-grained permissions byte).
 /// - Port records (4 bytes each): `[direction, content_type, flags,
 ///   index]`. Byte 3 is the resolved per-direction `PortSpec.index`,
@@ -977,7 +977,20 @@ pub struct ExecutionEnvelope {
 pub struct Manifest {
     pub module_version: u16,
     pub hardware_targets: u16,
-    pub state_size_hint: u16,
+    /// Resident module state, in units of 64 BYTES, rounded up.
+    ///
+    /// Filled by `pack` from the `FLUXOR_MODULE_STATE_BYTES` static the SDK's
+    /// `declare_module_state!` emits — a measurement of the built artefact, not
+    /// a declaration an author can get wrong. `0` means the module has not
+    /// adopted the macro and its state cost is unknown.
+    ///
+    /// The unit is 64 bytes because the field is `u16` and resident state is
+    /// not: `aggregation` measures 312,376 bytes, which a byte-valued `u16`
+    /// cannot express. Sixty-four-byte units reach ~4 MiB, above every module in
+    /// the tree, and rounding UP means the recorded figure is never an
+    /// understatement of what the arena must provide. (Elastic arena demand is
+    /// `module_arena_size`, a separate question from resident state.)
+    pub state_bytes_64: u16,
     pub ports: Vec<PortSpec>,
     pub resources: Vec<ResourceClaim>,
     pub permissions: ManifestPermissions,
@@ -1130,7 +1143,7 @@ impl Default for Manifest {
         Self {
             module_version: encode_semver(0, 1, 0),
             hardware_targets: 0x01, // RP2350 by default
-            state_size_hint: 0,
+            state_bytes_64: 0,
             ports: Vec::new(),
             resources: Vec::new(),
             permissions: ManifestPermissions::default(),
@@ -1782,7 +1795,7 @@ impl Manifest {
             hardware_targets_from_list(&hardware_target_names)
         };
 
-        let state_size_hint = toml_val.state_size_hint.unwrap_or(0);
+        let state_bytes_64 = toml_val.state_bytes_64.unwrap_or(0);
 
         let mut ports = Vec::new();
         let mut port_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2248,7 +2261,7 @@ impl Manifest {
         Ok(Manifest {
             module_version,
             hardware_targets,
-            state_size_hint,
+            state_bytes_64,
             ports,
             resources,
             permissions,
@@ -2323,7 +2336,7 @@ impl Manifest {
         buf.push(self.dependencies.len() as u8);
         buf.extend_from_slice(&self.module_version.to_le_bytes());
         buf.extend_from_slice(&self.hardware_targets.to_le_bytes());
-        buf.extend_from_slice(&self.state_size_hint.to_le_bytes());
+        buf.extend_from_slice(&self.state_bytes_64.to_le_bytes());
         // byte 14: bit 0 = has_integrity, bit 1 = has_signature,
         //          bit 2 = isr_safe (author attestation; the
         //                  **build-time** `validate_isr_tier_admission`
@@ -2448,7 +2461,7 @@ impl Manifest {
         let dependency_count = data[7] as usize;
         let module_version = u16::from_le_bytes([data[8], data[9]]);
         let hardware_targets = u16::from_le_bytes([data[10], data[11]]);
-        let state_size_hint = u16::from_le_bytes([data[12], data[13]]);
+        let state_bytes_64 = u16::from_le_bytes([data[12], data[13]]);
         let flags = data[14];
         let has_integrity = (flags & 0x01) != 0;
         let has_signature = (flags & 0x02) != 0;
@@ -2580,7 +2593,7 @@ impl Manifest {
         Ok(Manifest {
             module_version,
             hardware_targets,
-            state_size_hint,
+            state_bytes_64,
             ports,
             resources,
             permissions: ManifestPermissions {
@@ -2637,8 +2650,12 @@ impl Manifest {
                 Err(e) => format!("  required_caps: <error: {e}>"),
             },
         ];
-        if self.state_size_hint > 0 {
-            lines.push(format!("  state_size_hint: {} bytes", self.state_size_hint));
+        if self.state_bytes_64 > 0 {
+            lines.push(format!(
+                "  state: {} bytes ({} × 64 B)",
+                self.state_bytes_64 as usize * 64,
+                self.state_bytes_64
+            ));
         }
         if !self.ports.is_empty() {
             lines.push("  ports:".into());
@@ -2783,7 +2800,7 @@ struct TomlDimension {
 struct TomlManifest {
     version: String,
     hardware_targets: Option<Vec<String>>,
-    state_size_hint: Option<u16>,
+    state_bytes_64: Option<u16>,
     ports: Option<Vec<TomlPort>>,
     resources: Option<Vec<TomlResource>>,
     /// Top-level `permissions = ["reconfigure", "flash_raw", …]` list —

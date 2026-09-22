@@ -11,10 +11,6 @@
 const MSG_HDR_SIZE: usize = 6;
 
 /// FNV-1a 32-bit hash. Const-evaluable for compile-time message type IDs.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 const fn fnv1a(s: &[u8]) -> u32 {
     let mut h: u32 = 0x811c9dc5;
     let mut i = 0;
@@ -36,10 +32,6 @@ const fn fnv1a(s: &[u8]) -> u32 {
 /// bytes from another producer. The buffer is sized to
 /// `CHANNEL_BUFFER_SIZE` — messages above that cap cannot fit in the
 /// channel anyway.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn msg_write(
     sys: &SyscallTable,
@@ -80,10 +72,6 @@ unsafe fn msg_write(
 }
 
 /// Write a typed message with no payload.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn msg_write_empty(sys: &SyscallTable, chan: i32, msg_type: u32) -> i32 {
     msg_write(sys, chan, msg_type, core::ptr::null(), 0)
@@ -93,10 +81,6 @@ unsafe fn msg_write_empty(sys: &SyscallTable, chan: i32, msg_type: u32) -> i32 {
 /// Returns (msg_type, payload_len). (0, 0) if no complete header available.
 /// Payload bytes are written to buf[0..payload_len.min(buf_cap)].
 /// Excess payload bytes (beyond buf_cap) are consumed and discarded.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 unsafe fn msg_read(sys: &SyscallTable, chan: i32, buf: *mut u8, buf_cap: usize) -> (u32, u16) {
     let mut hdr = [0u8; MSG_HDR_SIZE];

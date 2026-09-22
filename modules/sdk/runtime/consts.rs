@@ -265,7 +265,6 @@ pub enum StreamStatus {
 ///
 /// `sys` must be the module's syscall table and `chan` one of its
 /// channel handles.
-#[allow(dead_code, reason = "SDK surface; most modules stage no streams")]
 pub unsafe fn stream_status(sys: &SyscallTable, chan: i32) -> StreamStatus {
     let ready = (sys.channel_poll)(chan, POLL_HUP | POLL_WROTE);
     if ready < 0 {

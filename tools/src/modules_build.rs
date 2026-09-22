@@ -365,7 +365,7 @@ fn discover_all(project_root: &Path) -> Result<Vec<Candidate>> {
                         .iter()
                         .flat_map(|v| v.features.iter().cloned())
                         .collect();
-                    all.push("host-test".to_string());
+                    all.push(HOST_TEST_FEATURE.to_string());
                     all.sort();
                     all.dedup();
                     for v in &variants {
@@ -424,20 +424,78 @@ fn discover(project_root: &Path) -> Result<Vec<Candidate>> {
         .collect())
 }
 
-/// `--cfg feature="…"` + `--check-cfg` arguments for a variant
-/// candidate. Empty for non-variant modules — their rustc /
-/// clippy-driver invocations carry no feature cfgs at all.
+/// The feature the SDK dual-build gates on: set when module sources are
+/// compiled into the host test harness, absent in a PIC build. Every module
+/// may name it, so it is always an accepted `--check-cfg` value.
+const HOST_TEST_FEATURE: &str = "host-test";
+
+/// `--cfg fluxor_silicon="<id>"` plus its accepted-value list.
+///
+/// Emitted for EVERY module, unlike `cfg_feature_args` which is empty for
+/// non-variant candidates. Without it a module cannot discover which silicon it
+/// is being compiled for, so capacity constants that differ per die have to be
+/// keyed on `target_arch` — and that makes thumbv6m indistinguishable from
+/// thumbv8m, handing RP2040 the RP2350 table sizes. The two parts' state arenas
+/// differ by 3.75x (64 KiB against 240 KiB), so that is not a rounding error:
+/// `profile_embedded` currently sizes `ip`'s connection table, http's
+/// connection slots and the body pool for the larger die and the smaller one
+/// pays it.
+///
+/// A distinct cfg from the kernel's `fluxor_platform` rather than a reuse of
+/// the name: the kernel's value set separates `host-linux` from `host-wasm`,
+/// while modules are compiled per silicon shelf. One name admitting two
+/// different value sets would be worse than two accurate names.
+///
+/// Because this changes every module's rustc invocation, the first build after
+/// it lands recompiles everything once.
+///
+/// `cfg(test)` is declared here because passing any `--check-cfg` turns cfg
+/// checking on for every name in the compilation, and these are raw `rustc`
+/// invocations: cargo declares `test` for its own builds, nothing declares it
+/// for ours. Modules carry `#[cfg(test)]` blocks that the host harness
+/// compiles, so without this line every one of them is an unexpected-cfg
+/// error under `--strict`.
+fn cfg_silicon_args(spec: &SiliconSpec) -> Vec<String> {
+    let values = SILICON_SPECS
+        .iter()
+        .map(|s| format!("\"{}\"", s.silicon_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        "--cfg".to_string(),
+        format!("fluxor_silicon=\"{}\"", spec.silicon_id),
+        "--check-cfg".to_string(),
+        format!("cfg(fluxor_silicon, values({values}))"),
+        "--check-cfg".to_string(),
+        "cfg(test)".to_string(),
+    ]
+}
+
+/// `--cfg feature="…"` for a variant candidate's features, plus the
+/// `--check-cfg` accepted-value list every module needs.
+///
+/// Only variant candidates ENABLE a feature. Every module DECLARES the
+/// value set, because the SDK dual-build gates on `feature = "host-test"`
+/// throughout and a module that never enables a feature still names one.
+/// `host-test` is therefore the floor rather than a variant's contribution:
+/// a non-variant candidate carries an empty `check_cfg_features` and would
+/// otherwise leave `feature` undeclared while silicon checking is on.
 fn cfg_feature_args(cand: &Candidate) -> Vec<String> {
-    if cand.features.is_empty() {
-        return Vec::new();
-    }
     let mut args = Vec::new();
     for f in &cand.features {
         args.push("--cfg".to_string());
         args.push(format!("feature=\"{f}\""));
     }
-    let values = cand
+    let mut accepted: Vec<&str> = cand
         .check_cfg_features
+        .iter()
+        .map(String::as_str)
+        .chain(cand.features.iter().map(String::as_str))
+        .chain(std::iter::once(HOST_TEST_FEATURE))
+        .collect();
+    accepted.sort_unstable();
+    accepted.dedup();
+    let values = accepted
         .iter()
         .map(|f| format!("\"{f}\""))
         .collect::<Vec<_>>()
@@ -535,6 +593,10 @@ pub fn run(opts: &BuildOpts) -> Result<BuildReport> {
 pub struct ModuleLintReport {
     /// Number of module sources checked.
     pub checked: usize,
+    /// How many of `checked` were satisfied from the stamp ledger rather
+    /// than by spawning a process. Reported so an instant sweep reads as
+    /// "nothing changed" and not as "nothing ran".
+    pub cached: usize,
     /// `(source, first-diagnostic)` for each source that failed.
     pub failed: Vec<(String, String)>,
 }
@@ -575,6 +637,14 @@ pub fn fmt_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLin
     // Best-effort: a malformed manifest is the clippy/build phases'
     // diagnostic to raise, not a reason to abandon the format sweep.
     let candidates = discover(project_root).unwrap_or_default();
+
+    // The ledger records the mtime of each file that last passed, so an
+    // unchanged tree costs one read rather than a `rustfmt` process per
+    // source — there are several hundred under `modules/`.
+    let ledger_path = project_root.join("target/fluxor/fmt-check.stamp");
+    let passed = read_stamp_ledger(&ledger_path);
+
+    let mut files: Vec<(PathBuf, String, &str)> = Vec::new();
     for entry in walkdir::WalkDir::new(&modules_root)
         .into_iter()
         .filter_map(std::result::Result::ok)
@@ -584,28 +654,51 @@ pub fn fmt_check_modules(project_root: &Path, verbose: bool) -> Result<ModuleLin
             continue;
         }
         report.checked += 1;
+        if stamp_matches(&passed, path) {
+            report.cached += 1;
+            continue;
+        }
         let rel = path
             .strip_prefix(project_root)
             .unwrap_or(path)
             .display()
             .to_string();
-        if verbose {
-            eprintln!("[modules] rustfmt --check {rel}");
-        }
         let edition = candidates
             .iter()
             .find(|c| path.starts_with(&c.dir))
             .map_or("2021", |c| c.edition.as_str());
+        files.push((path.to_path_buf(), rel, edition));
+    }
+
+    let results = parallel_map(&files, |(path, rel, edition)| {
+        if verbose {
+            eprintln!("[modules] rustfmt --check {rel}");
+        }
         let out = Command::new("rustfmt")
             .arg("--check")
             .arg("--edition")
-            .arg(edition)
+            .arg(*edition)
             .arg(path)
-            .output()
-            .map_err(|e| Error::Module(format!("rustfmt: {e} (is rustfmt installed?)")))?;
-        if !out.status.success() {
+            .output();
+        (path.clone(), rel.clone(), out)
+    });
+
+    let mut fresh = passed;
+    for (path, rel, out) in results {
+        let out =
+            out.map_err(|e| Error::Module(format!("rustfmt: {e} (is rustfmt installed?)")))?;
+        if out.status.success() {
+            if let Some(m) = mtime(&path) {
+                fresh.insert(path, m);
+            }
+        } else {
             report.failed.push((rel, "formatting differs".to_string()));
         }
+    }
+    // Only a clean sweep may be recorded: a ledger written over a failing run
+    // would mark the offending file as passed and the next run would skip it.
+    if report.failed.is_empty() {
+        write_stamp_ledger(&ledger_path, &fresh);
     }
     Ok(report)
 }
@@ -628,6 +721,12 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
     let scratch = project_root.join("target/fluxor/clippy");
     std::fs::create_dir_all(&scratch)?;
     let mut report = ModuleLintReport::default();
+
+    // Pick the target for each module first, then lint only the ones whose
+    // sources have moved since their `.rmeta` was written. Without that
+    // freshness check this sweep is a second full type-check of the whole
+    // tree on every run, on top of the build.
+    let mut jobs: Vec<(&Candidate, String, &SiliconSpec, PathBuf)> = Vec::new();
     for cand in &candidates {
         // Lint against the first configured target this module builds for.
         let Some((target, spec)) = targets.iter().find_map(|t| {
@@ -651,10 +750,24 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
             continue;
         };
         report.checked += 1;
+        let rmeta = scratch.join(format!("{}.rmeta", cand.name));
+        // The `.rmeta` this sweep already emits doubles as its stamp: if it
+        // is newer than every source the module compiles from, the verdict
+        // it recorded still holds.
+        if mtime(&rmeta).is_some_and(|m| sources_older_than(cand, m, project_root)) {
+            report.cached += 1;
+            continue;
+        }
+        jobs.push((cand, target, spec, rmeta));
+    }
+
+    let results = parallel_map(&jobs, |(cand, target, spec, rmeta)| {
         if verbose {
             eprintln!("[modules] clippy-driver {} ({target})", cand.name);
         }
-        let rmeta = scratch.join(format!("{}.rmeta", cand.name));
+        // A stale `.rmeta` left behind by a failing run would look fresh to
+        // the check above on the next pass, so remove it before writing.
+        let _ = std::fs::remove_file(rmeta);
         let out = Command::new("clippy-driver")
             .arg("--crate-type=lib")
             .arg("--edition")
@@ -665,6 +778,7 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
             .arg("-C")
             .arg("relocation-model=pic")
             .args(spec.extra_rustflags)
+            .args(cfg_silicon_args(spec))
             .args(cfg_feature_args(cand))
             .arg("-A")
             .arg("clippy::empty_loop")
@@ -672,14 +786,18 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
             .arg("warnings")
             .arg("--emit=metadata")
             .arg("-o")
-            .arg(&rmeta)
+            .arg(rmeta)
             .arg(&cand.entry)
-            .output()
-            .map_err(|e| {
-                Error::Module(format!(
-                    "clippy-driver: {e} (install the clippy component: `rustup component add clippy`)"
-                ))
-            })?;
+            .output();
+        (cand.name.clone(), out)
+    });
+
+    for (name, out) in results {
+        let out = out.map_err(|e| {
+            Error::Module(format!(
+                "clippy-driver: {e} (install the clippy component: `rustup component add clippy`)"
+            ))
+        })?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let first = stderr
@@ -687,7 +805,7 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
                 .find(|l| l.starts_with("error") || l.starts_with("warning"))
                 .unwrap_or("clippy reported errors")
                 .to_string();
-            report.failed.push((cand.name.clone(), first));
+            report.failed.push((name, first));
         }
     }
     Ok(report)
@@ -747,27 +865,61 @@ fn build_one_target(
         failed: Vec::new(),
     };
 
+    // Select first, compile second. Each compile is an independent `rustc`
+    // plus a link with no shared state, so they run on a bounded pool; across
+    // the four targets there are upwards of 150 of them. Selection stays
+    // sequential and ordered, so the report reads the same however many jobs
+    // ran.
+    let mut pending: Vec<(&Candidate, PathBuf)> = Vec::new();
     for cand in candidates {
         if !matches_target(cand, target, &silicon) {
             continue;
         }
         let out_path = out_dir.join(format!("{}.fmod", cand.name));
-        if is_up_to_date(cand, &out_path, &opts.project_root) {
+        if is_up_to_date(cand, &out_path, &opts.project_root, opts.strict) {
             report.up_to_date.push(cand.name.clone());
             continue;
         }
-        let build_result = if spec.linker.is_none() {
+        pending.push((cand, out_path));
+    }
+
+    // Per-item progress, so a multi-minute build is not silent. On a terminal
+    // this redraws in place; piped to a log it emits one line per module,
+    // because a log full of carriage returns is worse than no progress.
+    let total = pending.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let results = parallel_map(&pending, |(cand, out_path)| {
+        let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if tty {
+            eprint!("\r     [{n:>3}/{total}] {target} {:<28}", cand.name);
+        } else if opts.verbose {
+            eprintln!("     [{n:>3}/{total}] {target} {}", cand.name);
+        }
+        let r = if spec.linker.is_none() {
             compile_module_wasm(cand, spec, &out_dir, opts)
         } else {
             compile_module_pic(cand, spec, &out_dir, opts)
         };
+        (cand.name.clone(), out_path.clone(), r)
+    });
+
+    if tty && total > 0 {
+        eprintln!("\r     [{total}/{total}] {target} done{:<28}", "");
+    }
+    for (name, out_path, build_result) in results {
         match build_result {
-            Ok(BuildOutcome::Built) => report.built.push(cand.name.clone()),
+            Ok(BuildOutcome::Built) => {
+                // Beside the artefact, so a later run can tell a lenient
+                // build from a strict one (they are byte-identical).
+                write_stamp(&out_path, opts.strict);
+                report.built.push(name);
+            }
             Ok(BuildOutcome::Skipped(reason)) => {
-                report.skipped.push((cand.name.clone(), reason));
+                report.skipped.push((name, reason));
             }
             Err(e) => {
-                report.failed.push((cand.name.clone(), e.to_string()));
+                report.failed.push((name, e.to_string()));
             }
         }
     }
@@ -782,49 +934,30 @@ enum BuildOutcome {
     Skipped(String),
 }
 
-fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool {
+fn is_up_to_date(
+    cand: &Candidate,
+    out_path: &Path,
+    project_root: &Path,
+    want_strict: bool,
+) -> bool {
     let out_mtime = match mtime(out_path) {
         Some(m) => m,
         None => return false,
     };
-    let inputs = [
-        cand.manifest.clone(),
-        project_root.join("modules/sdk/abi.rs"),
-        project_root.join("modules/sdk/runtime.rs"),
-        project_root.join("modules/sdk/runtime/params.rs"),
-        // Linker script. Lives under modules/sdk/ so it ships in the
-        // fluxor-abi source artifact for downstream consumers.
-        project_root.join("modules/sdk/module.ld"),
-    ];
-    for input in &inputs {
-        if let Some(im) = mtime(input) {
-            if im > out_mtime {
-                return false;
-            }
-        }
+    // Strictness is part of the cache key, because it is part of the compile:
+    // `-D warnings` and `-W warnings` produce a byte-identical artefact, so
+    // neither the mtimes below nor the embedded ABI digest can tell the two
+    // apart. Without this key, `make` (lenient) followed by `make ci`
+    // (strict) would leave every `.fmod` looking up to date and the strict
+    // gate would never run — a warning built leniently would pass the gate on
+    // the same machine and fail only where the artefact happened to be absent.
+    //
+    // Ordered, not equal: an artefact built strictly satisfies a lenient
+    // request, so only lenient-then-strict invalidates.
+    if want_strict && !stamped_strict(out_path) {
+        return false;
     }
-    // Source tree under the module dir — any .rs newer than the .fmod
-    // invalidates the cache.
-    for entry in walkdir::WalkDir::new(&cand.dir)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-    {
-        if entry.path().extension().and_then(|s| s.to_str()) != Some("rs") {
-            continue;
-        }
-        if let Some(im) = mtime(entry.path()) {
-            if im > out_mtime {
-                return false;
-            }
-        }
-    }
-    // Project-local sources pulled in by `include!` — shared cores that live
-    // OUTSIDE the module directory (the common pattern: many modules include one
-    // `modules/common/*.rs`). The walk above cannot see them, so without this a
-    // shared-core edit leaves every consumer's `.fmod` looking up to date and
-    // silently ships stale device code. The SDK's own deep includes are covered
-    // by the digest check below; this covers the project's.
-    if !includes_are_older(&cand.dir, out_mtime) {
+    if !sources_older_than(cand, out_mtime, project_root) {
         return false;
     }
     // ABI-surface freshness — the precise invalidation trigger. Mtime cannot
@@ -847,6 +980,177 @@ fn is_up_to_date(cand: &Candidate, out_path: &Path, project_root: &Path) -> bool
 
 fn mtime(p: &Path) -> Option<SystemTime> {
     p.metadata().ok()?.modified().ok()
+}
+
+/// Whether every source this candidate compiles from is older than `stamp`.
+///
+/// Shared by the build cache and by the fmt / clippy sweeps, which need the
+/// same question answered about a different artefact. Keeping one walk means
+/// a sweep cannot disagree with the build about what "unchanged" means.
+fn sources_older_than(cand: &Candidate, stamp: SystemTime, project_root: &Path) -> bool {
+    let inputs = [
+        cand.manifest.clone(),
+        project_root.join("modules/sdk/abi.rs"),
+        project_root.join("modules/sdk/runtime.rs"),
+        project_root.join("modules/sdk/runtime/params.rs"),
+        // Linker script. Lives under modules/sdk/ so it ships in the
+        // fluxor-abi source artifact for downstream consumers.
+        project_root.join("modules/sdk/module.ld"),
+    ];
+    for input in &inputs {
+        if let Some(im) = mtime(input) {
+            if im > stamp {
+                return false;
+            }
+        }
+    }
+    // Source tree under the module dir — any .rs newer than the artefact
+    // invalidates it.
+    for entry in walkdir::WalkDir::new(&cand.dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("rs") {
+            continue;
+        }
+        if let Some(im) = mtime(entry.path()) {
+            if im > stamp {
+                return false;
+            }
+        }
+    }
+    // Project-local sources pulled in by `include!` — shared cores that live
+    // OUTSIDE the module directory (the common pattern: many modules include
+    // one `modules/common/*.rs`). The walk above cannot see them, so without
+    // this a shared-core edit leaves every consumer looking up to date and
+    // silently ships stale device code.
+    includes_are_older(&cand.dir, stamp)
+}
+
+/// Run `f` over `items` on a bounded pool, returning results in input order.
+///
+/// The module pipeline is a few hundred independent `rustc` / `rustfmt` /
+/// `clippy-driver` processes with no shared state, and it ran them one at a
+/// time on a machine with four cores. This is the smallest thing that fixes
+/// that: a scoped pool over a shared cursor, no dependency added.
+///
+/// Input order is preserved because a gate that lists failures in a different
+/// order on every run is a gate people stop reading.
+fn parallel_map<T, R, F>(items: &[T], f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let jobs = job_limit().min(items.len());
+    if jobs <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let slots: Vec<std::sync::Mutex<Option<R>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(i) else { return };
+                let r = f(item);
+                *slots[i].lock().expect("slot mutex poisoned") = Some(r);
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .expect("slot mutex poisoned")
+                .expect("every index is visited exactly once")
+        })
+        .collect()
+}
+
+/// How many child processes to run at once.
+///
+/// `FLUXOR_BUILD_JOBS` / `CARGO_BUILD_JOBS` first — a shared rig host may not
+/// want every core — then the machine's parallelism, then 1.
+fn job_limit() -> usize {
+    std::env::var("FLUXOR_BUILD_JOBS")
+        .or_else(|_| std::env::var("CARGO_BUILD_JOBS"))
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(Into::into))
+        .unwrap_or(1)
+}
+
+/// Read a `mtime<TAB>path` ledger. A missing or malformed line is simply
+/// absent from the map, so the worst a damaged ledger costs is a re-check.
+fn read_stamp_ledger(path: &Path) -> std::collections::HashMap<PathBuf, SystemTime> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in body.lines() {
+        let Some((nanos, file)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(n) = nanos.parse::<u64>() else {
+            continue;
+        };
+        out.insert(
+            PathBuf::from(file),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(n),
+        );
+    }
+    out
+}
+
+/// Write the ledger, best-effort: losing it costs a re-check, never a
+/// wrong answer, so a failure here must not fail the sweep.
+fn write_stamp_ledger(path: &Path, entries: &std::collections::HashMap<PathBuf, SystemTime>) {
+    let mut rows: Vec<String> = entries
+        .iter()
+        .filter_map(|(p, t)| {
+            let n = t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_nanos();
+            Some(format!("{n}\t{}", p.display()))
+        })
+        .collect();
+    rows.sort();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, rows.join("\n"));
+}
+
+/// Whether `path`'s current mtime is the one recorded as having passed.
+fn stamp_matches(ledger: &std::collections::HashMap<PathBuf, SystemTime>, path: &Path) -> bool {
+    match (ledger.get(path), mtime(path)) {
+        (Some(recorded), Some(now)) => *recorded == now,
+        _ => false,
+    }
+}
+
+/// Path of the sidecar recording how `out_path` was built.
+fn stamp_path(out_path: &Path) -> PathBuf {
+    let mut p = out_path.as_os_str().to_os_string();
+    p.push(".stamp");
+    PathBuf::from(p)
+}
+
+/// Whether the artefact at `out_path` was built with warnings denied.
+///
+/// A missing or unreadable stamp reads as "not strict", so an artefact built
+/// before stamps existed is rebuilt once under the gate rather than trusted.
+fn stamped_strict(out_path: &Path) -> bool {
+    std::fs::read_to_string(stamp_path(out_path))
+        .map(|s| s.lines().any(|l| l.trim() == "strict=1"))
+        .unwrap_or(false)
+}
+
+/// Record how this artefact was built, beside it.
+fn write_stamp(out_path: &Path, strict: bool) {
+    let body = format!("strict={}\n", u8::from(strict));
+    let _ = std::fs::write(stamp_path(out_path), body);
 }
 
 /// Whether every file transitively reachable from `dir`'s `.rs` sources via
@@ -1041,6 +1345,7 @@ fn compile_module_pic(
         .arg("-C")
         .arg("relocation-model=pic")
         .args(spec.extra_rustflags)
+        .args(cfg_silicon_args(spec))
         .args(cfg_feature_args(cand));
     if opts.strict {
         // `-D warnings` upgrades unfulfilled `#[expect(...)]` and
@@ -1121,7 +1426,9 @@ fn compile_module_wasm(
         ))
         .arg("-C")
         .arg("strip=symbols");
-    rustc.args(cfg_feature_args(cand));
+    rustc
+        .args(cfg_silicon_args(spec))
+        .args(cfg_feature_args(cand));
     if opts.strict {
         rustc.arg("-D").arg("warnings");
     } else {
@@ -1216,14 +1523,31 @@ fn pick_linker_script(cand: &Candidate, project_root: &Path) -> PathBuf {
     project_root.join("modules/module.ld")
 }
 
+/// Run a compile or link step, capturing its diagnostics into the error.
+///
+/// Captured rather than inherited. Several of these run at a time, and a
+/// child writing to a shared stderr interleaves with — and shreds — the
+/// in-place progress line. Folding the output into the returned error
+/// attaches it to the module that produced it, which is where a reader needs
+/// it when four compiles are in flight.
 fn run_step(mut cmd: Command, name: &str) -> Result<()> {
-    let status = cmd
-        .status()
+    let out = cmd
+        .output()
         .map_err(|e| Error::Module(format!("{name}: {e}")))?;
-    if !status.success() {
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The tail, not the head: rustc and ld both put the diagnostic that
+        // matters last, after the notes leading up to it.
+        let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        let detail = if tail.is_empty() {
+            String::new()
+        } else {
+            format!("\n    {}", tail.join("\n    "))
+        };
         return Err(Error::Module(format!(
-            "{name} exited {}",
-            status.code().unwrap_or(-1)
+            "{name} exited {}{detail}",
+            out.status.code().unwrap_or(-1)
         )));
     }
     Ok(())
@@ -1263,7 +1587,7 @@ pub fn clean(opts: &BuildOpts) -> Result<usize> {
             continue;
         }
         let ext = entry.path().extension().and_then(|s| s.to_str());
-        if matches!(ext, Some("fmod" | "o" | "elf" | "wasm"))
+        if matches!(ext, Some("fmod" | "o" | "elf" | "wasm" | "stamp"))
             && std::fs::remove_file(entry.path()).is_ok()
         {
             removed += 1;
@@ -1456,6 +1780,45 @@ mod tests {
             resolve(&root, &out, "not-a-target"),
             out.join("not-a-target").join("modules")
         );
+    }
+
+    /// `-D warnings` and `-W warnings` produce a byte-identical `.fmod`, so
+    /// without the stamp nothing distinguishes a lenient build from a strict
+    /// one and `make` followed by `make ci` leaves the strict gate with
+    /// nothing to do.
+    ///
+    /// The rule is ordered, not equal: strict satisfies a lenient request,
+    /// lenient does not satisfy a strict one.
+    #[test]
+    fn strictness_is_part_of_the_module_cache_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxor-stamp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("thing.fmod");
+        std::fs::write(&out, b"artefact").unwrap();
+
+        // No stamp at all — an artefact from before stamps existed. Must not
+        // be trusted to satisfy the gate.
+        assert!(
+            !stamped_strict(&out),
+            "a missing stamp must read as not-strict, not as strict"
+        );
+
+        write_stamp(&out, false);
+        assert!(!stamped_strict(&out), "a lenient build records lenient");
+
+        write_stamp(&out, true);
+        assert!(stamped_strict(&out), "a strict build records strict");
+        assert_eq!(
+            std::fs::read_to_string(stamp_path(&out)).unwrap(),
+            "strict=1\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

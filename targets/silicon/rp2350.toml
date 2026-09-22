@@ -205,11 +205,25 @@ boot2_src = "0x400e0000"
 # The split between the two arenas is set by what a networked graph asks
 # for. Channel buffers are the scarce half: a four-module graph carrying the
 # ip stack wants sixteen of them and does not fit in 32 KiB. Module state
-# is sized by the same graph with tls on top: cyw43, wifi and ip take
-# ~104 KiB and a one-session tls instance ~125 KiB, so the arena has to
-# clear ~229 KiB. Their sum is what the die can spare, so the two move
-# against each other; `ram_static_max_kb` below binds the sum, not either
-# half.
+# is sized by the same graph with tls on top.
+#
+# MEASURED (2026-09-22), by reading `module_state_size` out of the linked
+# artefacts rather than estimating — the figures here were previously
+# "cyw43, wifi and ip take ~104 KiB", which was wrong by 58% and, being the
+# only number anyone had, was taken as proof that a networked graph could not
+# fit RP2040's 64 KiB arena at all. It can; see
+# `chronicle/.context/rfc_tiny_device.md` §13.
+#
+#   cyw43   5,616      wifi      784      ip  59,400   → 65,800  (64.3 KiB)
+#   tls   126,368  (one session)
+#
+# So the arena has to clear ~188 KiB for the wireless-plus-tls graph, not
+# ~229 KiB. The slack is real but it is not spare: `ip`'s 59,400 is dominated
+# by a 16-entry TCP table at ~2.2 KiB per connection, which is what a
+# per-silicon profile should be cutting on the small parts.
+#
+# Their sum is what the die can spare, so the two move against each other;
+# `ram_static_max_kb` below binds the sum, not either half.
 state_arena_kb = 240
 buffer_arena_kb = 64
 config_buffer_kb = 16

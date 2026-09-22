@@ -875,6 +875,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxor-rig-observers"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "futures-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "fluxor-sdk"
 version = "0.0.1"
 
@@ -882,11 +895,9 @@ version = "0.0.1"
 name = "fluxor-tools"
 version = "0.0.1"
 dependencies = [
- "base64",
  "clap",
  "fluxor-abi",
  "fluxor-contracts",
- "futures-util",
  "libc",
  "log",
  "proc-macro2",
@@ -900,8 +911,6 @@ dependencies = [
  "syn",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
  "toml",
  "walkdir",
  "webpki-roots 0.26.11",

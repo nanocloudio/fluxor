@@ -62,9 +62,21 @@
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     dead_code,
+    reason = "the PIC build mounts the whole of modules/sdk/* via include!, so every \
+              module's compile sees the entire ABI surface while using a subset. This \
+              allow is the SDK's textual mounting showing through"
+)]
+#![allow(
     unused_imports,
+    reason = "same cause: the mounted SDK brings names this module does not reach for"
+)]
+#![allow(
     unreachable_patterns,
-    reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
+    reason = "defensive `_ => Error` arms in enum state-machine matches. The match is \
+              exhaustive, which is why the lint fires; the arm exists so that adding a \
+              variant cannot silently bypass the error path. #[expect] is not the \
+              alternative — it fails the build in the configurations where the lint \
+              does not fire"
 )]
 
 use core::ffi::c_void;

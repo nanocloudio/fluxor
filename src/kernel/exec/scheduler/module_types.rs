@@ -100,7 +100,7 @@ impl ModuleSlot {
     pub fn type_name(&self) -> &'static str {
         match self {
             ModuleSlot::Empty => "empty",
-            ModuleSlot::Dynamic(_) => "dynamic",
+            ModuleSlot::Dynamic(m) => m.name(),
             ModuleSlot::Dummy(_) => "dummy",
             ModuleSlot::Tee(_) => "tee",
             ModuleSlot::Merge(_) => "merge",

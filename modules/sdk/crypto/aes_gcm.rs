@@ -189,19 +189,20 @@ impl AesKey {
         // and every Pi-class A-core ships +crypto; the gate keeps
         // QEMU-unknown / older Cortex-A53 hosts honest.
         //
-        // The feature is set for one build that compiles this file:
-        // the bcm2712 PIC module build, whose RUSTFLAGS carry `-C
-        // target-feature=+aes`. It is NOT set for the host test
-        // harness even on a Pi 5, because rustc reports only the
-        // target triple's baseline features (aarch64 baseline is
-        // `neon` alone) unless a build asks for more, and the
-        // harness does not. Host tests, wasm32, rp2040 and rp2350
-        // therefore all execute the scalar path, with the S-box
-        // cache-timing exposure documented at the top of this file.
+        // The feature is set for every build of this file on an aarch64 host:
+        // `.cargo/config.toml` carries `-C target-feature=+aes,+sha2,+neon`
+        // for `aarch64-unknown-linux-gnu`, and the bcm2712 PIC module build
+        // passes the same flags. That includes the host test harness, so the
+        // KATs cover this path — what bcm2712 ships — and not the scalar one.
+        // wasm32, rp2040 and rp2350 take the scalar path, with the S-box
+        // cache-timing exposure documented at the top of this file; nothing
+        // on an aarch64 host exercises it.
+        //
+        // No `return` here: the two arms are mutually exclusive by cfg, so
+        // the scalar block below is absent whenever this one is present.
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         unsafe {
             encrypt_block_aarch64_aes(block, &self.round_keys, self.rounds);
-            return;
         }
         // Scalar AddRoundKey + SubBytes + ShiftRows + MixColumns +
         // AddRoundKey loop. Byte-identical reference for KATs and

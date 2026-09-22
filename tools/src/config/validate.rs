@@ -655,7 +655,7 @@ pub fn validate_continuity_on(
                         }
 
                         // §12.4: the budget is declared here and PROVEN
-                        // by measurement (Phase 7 failover-latency test).
+                        // by the failover-latency measurement.
                         // A declaration that fails on its own constants
                         // can be rejected statically.
                         let budget = g

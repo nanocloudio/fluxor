@@ -1,9 +1,5 @@
 //! Scheduler responsibility module (real module boundary; parent statics and
 //! helpers reach us via `super`).
-#![allow(
-    unused_imports,
-    reason = "the flat scheduler namespace is glob-imported; each module uses a subset"
-)]
 use super::*;
 
 // ============================================================================
@@ -20,7 +16,9 @@ fn collect_channels(
     let mut count = 0;
     for edge in edges.iter() {
         let matches = match direction {
-            FanDirection::Out => edge.from_module == module_idx,
+            // A tap edge is written by the kernel's mirror, not the tapped
+            // module: it is never one of that module's outputs.
+            FanDirection::Out => edge.from_module == module_idx && !edge.tap,
             FanDirection::In => edge.to_module == module_idx && edge.is_ctrl() == ctrl_only,
         };
         // Producer reads `channel`; consumer reads `consumer_channel`

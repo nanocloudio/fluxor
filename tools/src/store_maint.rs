@@ -302,3 +302,119 @@ pub fn render(report: &FsckReport) -> String {
     }
     s
 }
+
+/// What the store is holding, by directory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StoreUsage {
+    pub live_bytes: u64,
+    pub live_count: u64,
+    pub quarantined_bytes: u64,
+    pub quarantined_count: u64,
+}
+
+impl StoreUsage {
+    /// One line, or `None` when there is nothing worth saying.
+    ///
+    /// Reported rather than collected, deliberately. `gc` is the only verb
+    /// that deletes, and its own doc calls it "a deliberate, whole-store pass
+    /// an operator runs ... rather than a reflex on a hot path" — a store
+    /// that sweeps on publish is how pins get destroyed. So this says what is
+    /// there and leaves the decision where it belongs.
+    #[must_use]
+    pub fn report(&self, quarantine_warn_gib: f64) -> Option<String> {
+        let gib = |b: u64| b as f64 / 1_073_741_824.0;
+        if self.quarantined_bytes == 0 && self.live_bytes == 0 {
+            return None;
+        }
+        let mut line = format!(
+            "store: {:.1} GiB in {} blob(s)",
+            gib(self.live_bytes),
+            self.live_count
+        );
+        if self.quarantined_count > 0 {
+            line.push_str(&format!(
+                ", {:.1} GiB quarantined in {} blob(s)",
+                gib(self.quarantined_bytes),
+                self.quarantined_count
+            ));
+            if gib(self.quarantined_bytes) >= quarantine_warn_gib {
+                line.push_str(
+                    " — nothing expires quarantined bytes but `fluxor store gc`; \
+                     run it when you are ready to lose them",
+                );
+            }
+        }
+        Some(line)
+    }
+}
+
+/// Measure the store's two byte-holding directories.
+///
+/// Cheap by construction: `read_dir` plus `metadata`, no hashing and no index
+/// parse, so it can sit on the publish path. Unreadable entries are skipped —
+/// this is a report, and a report that fails is worse than one that is a few
+/// blobs short.
+#[must_use]
+pub fn usage(store_root: &std::path::Path) -> StoreUsage {
+    let mut u = StoreUsage::default();
+    let tally = |dir: std::path::PathBuf, bytes: &mut u64, count: &mut u64| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            if let Ok(m) = e.metadata() {
+                if m.is_file() {
+                    *bytes += m.len();
+                    *count += 1;
+                }
+            }
+        }
+    };
+    tally(
+        store_root.join("blobs").join("sha256"),
+        &mut u.live_bytes,
+        &mut u.live_count,
+    );
+    tally(
+        store_root.join("quarantine"),
+        &mut u.quarantined_bytes,
+        &mut u.quarantined_count,
+    );
+    u
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn a_large_quarantine_says_what_clears_it() {
+        let u = StoreUsage {
+            live_bytes: 3_865_470_566,
+            live_count: 5877,
+            quarantined_bytes: 22_548_578_304,
+            quarantined_count: 35_334,
+        };
+        let line = u.report(1.0).expect("something to report");
+        assert!(line.contains("21.0 GiB quarantined"), "{line}");
+        assert!(line.contains("fluxor store gc"), "{line}");
+    }
+
+    #[test]
+    fn a_small_quarantine_is_stated_without_advice() {
+        let u = StoreUsage {
+            live_bytes: 1_073_741_824,
+            live_count: 10,
+            quarantined_bytes: 1024,
+            quarantined_count: 1,
+        };
+        let line = u.report(1.0).expect("something to report");
+        assert!(line.contains("quarantined"), "{line}");
+        assert!(!line.contains("store gc"), "{line}");
+    }
+
+    #[test]
+    fn an_empty_store_says_nothing() {
+        assert_eq!(StoreUsage::default().report(1.0), None);
+    }
+}

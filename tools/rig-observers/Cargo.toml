@@ -1,0 +1,43 @@
+[package]
+name              = "fluxor-rig-observers"
+version.workspace = true
+edition           = "2021"
+license           = "MIT OR Apache-2.0"
+repository        = "https://github.com/nanocloudio/fluxor"
+description       = "Rig observer backends — load probes discovered by name on the rig backend search path"
+
+# These two probes are the only thing in the tools tree that needs an async
+# runtime, and they are a crate of their own so that the `fluxor` CLI does not
+# carry tokio and its tree for code it never runs.
+#
+# A crate, not a cargo feature on `fluxor-tools`. `standards/dependencies.md`
+# §10a forbids gating a shipped artefact behind a feature — a gated binary
+# silently vanishes and leaves the rig's backend symlink dangling, which reads
+# as a broken install — and names the alternative: *"If a dependency is heavy
+# enough that someone wants it optional, that is an argument for splitting the
+# crate, not for gating the binary."* Both binaries here build
+# unconditionally.
+
+[[bin]]
+name = "observe-https_load"
+path = "src/bin/observe_https_load.rs"
+
+[[bin]]
+name = "observe-tls_load"
+path = "src/bin/observe_tls_load.rs"
+
+[dependencies]
+# The probes drive raw TCP + TLS so the timing is per-stage and honest — no
+# client library between us and the rig hiding overhead in `Client::new()` or
+# connection-pool bookkeeping. Invalid certs are accepted: the rig fixture's
+# self-signed cert is part of the test setup.
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal", "net"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12", "ring"] }
+rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12", "ring"] }
+futures-util = { version = "0.3.32" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+base64 = "0.22.1"
+
+[lints]
+workspace = true

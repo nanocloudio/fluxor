@@ -457,7 +457,7 @@ pub fn get_cross_channel(idx: usize) -> Option<&'static CrossDomainChannel> {
 /// Per-core stack size for secondary cores.
 ///
 /// Must match the primary core's stack budget (`__stack_start..__stack_end`
-/// = 1 MB in `memory-bcm2712.x`), because any module assigned to a secondary
+/// = 1 MB in `linker/memory-bcm2712.x`), because any module assigned to a secondary
 /// domain runs the same deep call chains the primary stack was sized for — in
 /// particular the P-256 primitives, which materialise curve constants on the
 /// stack per call (a TLS handshake nests several of these under the record

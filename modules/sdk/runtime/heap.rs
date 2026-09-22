@@ -17,10 +17,6 @@
 ///
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 pub unsafe fn heap_alloc(sys: &SyscallTable, size: u32) -> *mut u8 {
     (sys.heap_alloc)(size)
@@ -34,10 +30,6 @@ pub unsafe fn heap_alloc(sys: &SyscallTable, size: u32) -> *mut u8 {
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
 /// `ptr` must be null or a pointer previously returned by `heap_alloc`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 pub unsafe fn heap_free(sys: &SyscallTable, ptr: *mut u8) {
     (sys.heap_free)(ptr)
@@ -54,10 +46,6 @@ pub unsafe fn heap_free(sys: &SyscallTable, ptr: *mut u8) {
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
 /// `ptr` must be null or a pointer previously returned by `heap_alloc`.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 pub unsafe fn heap_realloc(sys: &SyscallTable, ptr: *mut u8, new_size: u32) -> *mut u8 {
     (sys.heap_realloc)(ptr, new_size)
@@ -82,10 +70,6 @@ pub unsafe fn heap_realloc(sys: &SyscallTable, ptr: *mut u8, new_size: u32) -> *
 ///
 /// # Safety
 /// Caller must ensure `sys` points to a valid SyscallTable.
-#[allow(
-    dead_code,
-    reason = "target-conditional or kept for diagnostic use; the cfg-gated build path doesn't always reach it"
-)]
 #[inline(always)]
 pub unsafe fn heap_stats(sys: &SyscallTable) -> (u32, u32, u16, u16, u32, u16, u32) {
     // Query via provider_query with HEAP_STATS key (6). Buffer

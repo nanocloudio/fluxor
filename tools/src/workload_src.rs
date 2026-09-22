@@ -154,6 +154,33 @@ struct GraphFacts {
     edges: u16,
 }
 
+/// Sum the resident state the graph's modules declare in their packed
+/// manifests. Returns `(bytes, modules_without_a_figure)`.
+///
+/// The per-module figure is recorded at pack time from the SDK's
+/// `declare_module_state_bytes!` static, in 64-byte units, so it is a
+/// measurement of the built artefact rather than an author's estimate. A module
+/// with no figure contributes nothing and is COUNTED, because a partial sum
+/// presented as a total is the failure this replaces.
+fn sum_module_state_bytes(project_root: &Path, module_types: &[String]) -> (u64, usize) {
+    let modules_dir =
+        crate::modules_build::resolve(project_root, &project_root.join("target/fluxor"), "linux");
+    let mut total = 0u64;
+    let mut unknown = 0usize;
+    for ty in module_types {
+        let fmod = modules_dir.join(format!("{ty}.fmod"));
+        match crate::modules::ModuleInfo::from_file(&fmod) {
+            Ok(info) if info.manifest.state_bytes_64 > 0 => {
+                total += info.manifest.state_bytes_64 as u64 * 64;
+            }
+            // Unreadable counts as unknown, not as zero: the module loop below
+            // reports a missing artefact with a better message than this would.
+            _ => unknown += 1,
+        }
+    }
+    (total, unknown)
+}
+
 fn graph_facts(graph_path: &Path) -> Result<GraphFacts> {
     let text = std::fs::read_to_string(graph_path)
         .map_err(|e| Error::Config(format!("read graph {}: {e}", graph_path.display())))?;
@@ -251,13 +278,42 @@ pub fn emit_bundle(manifest_path: &Path, verbose: bool) -> Result<PathBuf> {
         let graph_bytes = std::fs::read(&graph_path)?;
         std::fs::write(target_dir.join("graph.yaml"), &graph_bytes)?;
 
+        // State arena demand, DERIVED from the modules the graph names rather
+        // than defaulted. Each `.fmod` records its own resident state
+        // (`declare_module_state_bytes!`, read at pack time), so the sum is the
+        // footprint the kernel will actually carve — which is what the composer
+        // charges against `NodeCapacity.state_bytes`.
+        //
+        // This is the number that made `[resources]` call itself "the
+        // non-derivable footprint overrides": it was non-derivable only because
+        // nothing published it. The old default was 65,536, which is exactly an
+        // RP2040's entire state arena, so any bundle that omitted the key
+        // claimed the whole die.
+        //
+        // An explicit `[resources] state_bytes` still wins — a workload may
+        // reserve headroom for a module that grows under load — but it is now an
+        // override of a measurement rather than the only source. Modules that
+        // have not adopted the macro contribute 0 and are counted, so a partial
+        // sum is visible as such instead of passing for a total.
+        let (derived_state, unknown_state_modules) =
+            sum_module_state_bytes(&project_root, &facts.module_types);
+        if unknown_state_modules > 0 {
+            eprintln!(
+                "  note: {unknown_state_modules} of {} module(s) do not publish a state size; \
+                 the derived state_bytes ({derived_state}) is a partial sum",
+                facts.module_types.len()
+            );
+        }
+
         // resources.json: counts derived from the graph, capacities from the
-        // source manifest's [resources] (defaults match the hello bundle's
-        // conservative envelope).
+        // source manifest's [resources] where it states them.
         let resources = ResourceProfileDoc {
             modules: facts.modules,
             edges: facts.edges,
-            state_bytes: src.resources.state_bytes.unwrap_or(65536),
+            state_bytes: src
+                .resources
+                .state_bytes
+                .unwrap_or_else(|| derived_state.min(u32::MAX as u64) as u32),
             buffer_bytes: src.resources.buffer_bytes.unwrap_or(16384),
             endpoints: src.resources.endpoints.unwrap_or(exports.len() as u16),
             domains: src.resources.domains.unwrap_or(1),

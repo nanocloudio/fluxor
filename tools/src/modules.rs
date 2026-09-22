@@ -928,6 +928,27 @@ fn read_embedded_abi_surface(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
     Some(out)
 }
 
+/// Read the module's resident state size out of the ELF, as data.
+///
+/// Emitted by the SDK's `declare_module_state!` macro
+/// (`modules/sdk/runtime/state.rs`) as a `#[used] static u32` carrying the same
+/// `size_of::<ModuleState>()` the kernel-facing `module_state_size()` returns.
+/// Reading it here is what lets the composer sum a graph's state arena demand
+/// before a device tries to load it, instead of taking a hand-typed number.
+///
+/// `None` for a module that has not adopted the macro — recorded as "unknown"
+/// rather than guessed, so the gap is a measured number. Same mangled-symbol
+/// substring match as `read_embedded_abi_surface`, and for the same reason.
+fn read_embedded_state_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<u32> {
+    let sym = symbols
+        .iter()
+        .find(|s| s.name.contains("FLUXOR_MODULE_STATE_BYTES"))?;
+    let sec = sections.get(sym.section_idx as usize)?;
+    let start = (sym.value as usize).checked_sub(sec.addr)?;
+    let bytes = sec.data.get(start..start + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// Find a section by name
 fn find_section<'a>(sections: &'a [ElfSection], name: &str) -> Option<&'a ElfSection> {
     sections.iter().find(|s| s.name == name)
@@ -1241,6 +1262,20 @@ pub fn pack_fmod(
                 input.display(),
             )));
         }
+    }
+
+    // Resident state size, MEASURED off the artefact being packed rather than
+    // declared. Same shape as the ABI-surface attestation above: the compiler
+    // embedded the value, the packer copies it, so the manifest cannot claim a
+    // footprint the code does not have. Absent for a module that has not
+    // adopted `declare_module_state!` — left at 0 ("unknown") rather than
+    // guessed, since a wrong state size would be admitted by a composer that
+    // trusts it.
+    if let Some(bytes) = read_embedded_state_bytes(&sections, &symbols) {
+        // Round UP into 64-byte units: the recorded figure must never be an
+        // understatement of what the state arena has to provide.
+        let units = bytes.div_ceil(64);
+        module_manifest.state_bytes_64 = u16::try_from(units).unwrap_or(u16::MAX);
     }
 
     let manifest_bytes = module_manifest.to_bytes();

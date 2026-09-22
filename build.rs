@@ -1,6 +1,6 @@
 //! Build script for fluxor
 //!
-//! Provides the target-specific memory.x linker script and generates
+//! Stages the target-specific linker script from `linker/` and generates
 //! chip_generated.rs from the silicon TOML [kernel] section.
 
 use std::env;
@@ -802,12 +802,17 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     // Re-run if any platform feature toggles, so a feature change forces
     // re-detection rather than picking up a stale artifact.
-    // The RP link script. The MEMORY block comes from the per-silicon
-    // `memory-rp*.x` this script emits as `memory.x`; aarch64 has its own
-    // script below and does not use this one.
+    // The RP link script (`linker/link-rp.x`). Its MEMORY block comes from
+    // the per-silicon `linker/memory-rp*.x` that `emit_rp` stages as
+    // `memory.x` in the same directory; aarch64 has its own script below and
+    // does not use this one.
     if env::var_os("CARGO_FEATURE_RP").is_some() {
-        println!("cargo:rustc-link-arg=-Tlink-rp.x");
-        println!("cargo:rerun-if-changed=link-rp.x");
+        File::create(out.join("link-rp.x"))
+            .unwrap()
+            .write_all(include_bytes!("linker/link-rp.x"))
+            .unwrap();
+        println!("cargo:rustc-link-arg=-T{}/link-rp.x", out.display());
+        println!("cargo:rerun-if-changed=linker/link-rp.x");
     }
 
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CHIP_RP2040");
@@ -827,6 +832,31 @@ fn main() {
     };
     println!("cargo:rustc-check-cfg=cfg(fluxor_platform, values(\"host-linux\", \"host-wasm\", \"bcm2712\", \"rp2040\", \"rp2350\"))");
     println!("cargo:rustc-cfg=fluxor_platform=\"{platform_str}\"");
+
+    // The die, under the name the module build uses.
+    //
+    // `modules/sdk/abi/config.rs` is mounted by BOTH the kernel and every PIC
+    // module, and its `profile_embedded` block picks arena and connection
+    // ceilings by `fluxor_silicon`: the RP parts differ by 3.75x and
+    // `target_arch` cannot tell thumbv6m from thumbv8m. The kernel sizes its
+    // own arenas from `platform::chip` instead, so today nothing in the kernel
+    // image turns on this cfg — but shared source that resolves one way under
+    // one mount and another way under the other is a trap waiting for the
+    // first kernel-side reader of those constants, and leaving the name
+    // undeclared makes every use of it in that file an unexpected-cfg error
+    // under `-D warnings`.
+    //
+    // A separate name from `fluxor_platform` because the value sets differ:
+    // `fluxor_platform` separates `host-linux` from `host-wasm`, while this
+    // names a silicon shelf. The hosted platforms set no value — their
+    // profiles are selected by `target_arch` and never read this — but the
+    // accepted-value list is declared for every build so the name is known.
+    println!(
+        "cargo:rustc-check-cfg=cfg(fluxor_silicon, values(\"rp2040\", \"rp2350\", \"bcm2712\", \"wasm\"))"
+    );
+    if let Platform::Bcm2712 | Platform::Rp2040 | Platform::Rp2350 = platform {
+        println!("cargo:rustc-cfg=fluxor_silicon=\"{platform_str}\"");
+    }
 
     // M-profile variant. Rust has no built-in cfg distinguishing ARMv6-M
     // (Cortex-M0+, RP2040) from ARMv8-M (Cortex-M33, RP2350), and the
@@ -1023,11 +1053,11 @@ fn emit_bcm2712(out: &Path) {
     let ram_origin = if is_pi5 { "0x80000" } else { "0x40080000" };
     File::create(out.join("memory-bcm2712.x"))
         .unwrap()
-        .write_all(include_bytes!("memory-bcm2712.x"))
+        .write_all(include_bytes!("linker/memory-bcm2712.x"))
         .unwrap();
     println!("cargo:rustc-link-arg=-T{}/memory-bcm2712.x", out.display());
     println!("cargo:rustc-link-arg=--defsym=RAM_ORIGIN={ram_origin}");
-    println!("cargo:rerun-if-changed=memory-bcm2712.x");
+    println!("cargo:rerun-if-changed=linker/memory-bcm2712.x");
     println!("cargo:rerun-if-changed=targets/silicon/bcm2712.toml");
 
     // PCIe device topology is a board fact: generate the alias table from the
@@ -1083,9 +1113,9 @@ enum Rp {
 fn emit_rp(out: &Path, family: Rp) {
     let is_rp2040 = matches!(family, Rp::Rp2040);
     let linker_script = if is_rp2040 {
-        include_bytes!("memory-rp2040.x") as &[u8]
+        include_bytes!("linker/memory-rp2040.x") as &[u8]
     } else {
-        include_bytes!("memory-rp2350.x") as &[u8]
+        include_bytes!("linker/memory-rp2350.x") as &[u8]
     };
     File::create(out.join("memory.x"))
         .unwrap()
@@ -1117,8 +1147,8 @@ fn emit_rp(out: &Path, family: Rp) {
         .unwrap();
 
     println!("cargo:rustc-link-search={}", out.display());
-    println!("cargo:rerun-if-changed=memory-rp2350.x");
-    println!("cargo:rerun-if-changed=memory-rp2040.x");
+    println!("cargo:rerun-if-changed=linker/memory-rp2350.x");
+    println!("cargo:rerun-if-changed=linker/memory-rp2040.x");
     println!("cargo:rerun-if-changed=targets/silicon/rp2040.toml");
     println!("cargo:rerun-if-changed=targets/silicon/rp2350.toml");
 }
