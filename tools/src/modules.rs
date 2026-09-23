@@ -1190,6 +1190,17 @@ pub fn pack_fmod(
         // Provider auto-registration (loader reads this to get the
         // contract id and auto-registers the module as provider).
         "module_provides_contract",
+        // Instance selector for a keyed provider (a fat32 with a `volume:`).
+        // The loader resolves this by hash; without it here the symbol never
+        // reaches the fmod export table and every keyed backend silently
+        // registers at selector 0, where the second one is refused as a
+        // duplicate.
+        "module_provider_selector",
+        // Owner-release subscription marker. Absent from the export table the
+        // loader cannot see it, and a provider that holds per-consumer
+        // resources is never told its consumer went away — a failure that is
+        // invisible to host tests, which resolve exports directly.
+        "module_observes_owner_release",
         "module_flash_store_dispatch",
         // Backing-provider dispatch (resolved by BACKING_PROVIDER_ENABLE)
         "backing_provider_dispatch",

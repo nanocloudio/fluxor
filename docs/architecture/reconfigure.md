@@ -73,6 +73,50 @@ topological order), then continues calling `module_step()` normally. When
 your module has no more in-flight work, return `StepOutcome::Done` (1)
 from `module_step()`.
 
+## Releasing an Owner's Resources
+
+A provider that holds resources on a consumer's behalf — scratch objects, open
+files, staged writes — is told when that consumer's owner is torn down, so it
+can reclaim them instead of holding them until the next reset.
+
+Subscribe by exporting a marker:
+
+```rust
+#[no_mangle]
+#[link_section = ".text.module_observes_owner_release"]
+pub extern "C" fn module_observes_owner_release() -> u32 {
+    1
+}
+```
+
+The loader reads the marker after provider registration succeeds; a module that
+registers no contract has no dispatch to call and is refused. A module that does
+not export it is never notified, so a provider holding nothing per consumer pays
+nothing.
+
+The kernel then calls `module_provider_dispatch` with opcode `OWNER_RELEASED`
+(`0x0C22`) and an 8-byte argument:
+
+```
+[slot: u16 LE][reserved: u16 = 0][generation: u32 LE]
+```
+
+Those are the same bytes `query_key::CALLER_OWNER` answers, so a provider
+compares an owner it stamped against the one being released without
+reformatting either. Compare BOTH fields: slots are reused, and matching on the
+slot alone closes the live resources of whoever replaced the dead owner.
+
+The notification runs before any teardown, on the scheduler thread, inside a
+provider frame — the owner handle still resolves, the provider's state is still
+live, and a handler may make syscalls exactly as it would in a normal step. It
+is delivered from owner teardown itself rather than from the drain driver, so
+the paths that never reach the drain driver (the `KILL` and `DESTROY` workload
+verbs, and admission rollback) are covered by the same edge.
+
+Each subscriber is called once per released owner, whatever number of contracts
+it serves. The return value is ignored: a provider with nothing to release may
+answer `-ENOSYS`.
+
 ## Drain-Then-Reset Model
 
 The implemented reconfigure model is drain-then-reset:

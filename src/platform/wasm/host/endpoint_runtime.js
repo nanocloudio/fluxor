@@ -537,7 +537,7 @@
     });
   }
 
-  // ── Shared overlay renderer (RFC §6.3) ───────────────────────────────
+  // ── Shared overlay renderer ───────────────────────────────
   // Mount the SAME generic presentation-shell renderer the full-WASM
   // host uses (`browser_overlay_runtime.js` → `window.FluxorOverlay`)
   // for a DOM-only endpoint, instead of hand-building controls with the
@@ -546,9 +546,9 @@
   // normalization are then identical across both host modes; only the
   // *transport* differs — here normalized records flow to `onInput`,
   // which the endpoint profile encodes into its session wire format and
-  // sends (RFC §6.2: "Application profiles may adapt remote wire
-  // formats, but the generic DOM capture and overlay rendering code
-  // must be shared with the full-WASM host").
+  // sends. An application profile may adapt the remote wire format, but
+  // the generic DOM capture and overlay rendering code stays shared with
+  // the full-WASM host.
   //
   //   mountOverlay({ shell, browser_overlay, lists, mountEl, onInput })
   //     onInput(record) — record is `{ class:'gamepad'|'key'|'action', … }`,

@@ -2471,17 +2471,11 @@ unsafe fn kernel_query_dispatch(handle: i32, key: u32, out: *mut u8, out_len: us
                     return errno::ESRCH;
                 }
                 let owner = crate::kernel::exec::scheduler::module_owner(caller);
-                let slot = owner.slot.to_le_bytes();
-                let generation = owner.generation.to_le_bytes();
-                *out = slot[0];
-                *out.add(1) = slot[1];
-                *out.add(2) = 0;
-                *out.add(3) = 0;
-                *out.add(4) = generation[0];
-                *out.add(5) = generation[1];
-                *out.add(6) = generation[2];
-                *out.add(7) = generation[3];
-                8
+                // The same encoder the `OWNER_RELEASED` notification uses, so
+                // a provider can compare the two records directly.
+                let record = crate::kernel::module::provider::encode_owner_record(owner);
+                core::ptr::copy_nonoverlapping(record.as_ptr(), out, record.len());
+                record.len() as i32
             }
             _ => E_NOSYS,
         };

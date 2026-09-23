@@ -849,6 +849,35 @@ pub unsafe fn set_module_arena(idx: usize, ptr: *mut u8, size: u32) {
     }
 }
 
+/// State-arena bytes charged to whoever owns module `idx`: its state buffer
+/// plus the heap arena the loader allocated for it.
+///
+/// Only PIC modules carry a measured footprint. A built-in's state is a static
+/// buffer in the kernel image rather than an arena allocation, and the
+/// synthetic slots (tee, merge, dummy) hold no arena, so all of them report 0 —
+/// the figure is what the owner drew from the shared arena, not how much memory
+/// exists on its behalf.
+pub fn module_state_footprint(idx: usize) -> u32 {
+    // SAFETY: scheduler-thread read of the module table and arena table.
+    unsafe {
+        let p = &raw const SCHED;
+        let sched = &*p;
+        if idx >= sched.modules.len() {
+            return 0;
+        }
+        let state = match &sched.modules[idx] {
+            ModuleSlot::Dynamic(m) => m.state_size(),
+            _ => 0,
+        };
+        let arena = if idx < sched.arenas.len() {
+            sched.arenas[idx].size
+        } else {
+            0
+        };
+        state.saturating_add(arena)
+    }
+}
+
 /// Set the current module index. Used by provider dispatch for context switching.
 pub fn set_current_module(idx: usize) {
     let core = crate::kernel::sys::hal::core_id();

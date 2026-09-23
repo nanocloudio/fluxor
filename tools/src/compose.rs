@@ -1673,6 +1673,119 @@ mod tests {
         );
     }
 
+    /// Every per-silicon size the SDK publishes to MODULES must equal the figure
+    /// the RP kernel takes from the silicon TOML.
+    ///
+    /// On aarch64 and wasm there is one definition: `platform::chip` re-exports
+    /// `abi::config::kernel`, and `bcm2712/chip.rs` says why — "a locally-defined
+    /// copy of a size such as `STATE_ARENA_SIZE` can drift below what a module's
+    /// arena demand needs and fail silently on the board". On the RP targets there
+    /// are necessarily two: a PIC module compiles against the materialised SDK
+    /// alone and never sees `build.rs`'s output or the TOML, so the SDK restates
+    /// each number and `--cfg fluxor_silicon` selects the arm.
+    ///
+    /// That second copy is the one this pins. Nothing else did, and both
+    /// `STATE_ARENA_SIZE` (240 KiB, published as 256) and
+    /// `MAX_MODULE_CONFIG_SIZE` (16/8 KiB, published as a flat 4) were wrong in
+    /// the SDK while every behavioural test passed — the consumers use these as
+    /// coarse tier predicates, so a wrong value lands on the same side of
+    /// `<= 64 KiB` and `<= 512 KiB` and changes nothing observable.
+    #[test]
+    fn sdk_embedded_profile_mirrors_silicon_tomls() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let sdk = std::fs::read_to_string(repo.join("modules/sdk/abi/config.rs"))
+            .expect("modules/sdk/abi/config.rs");
+
+        // The embedded profile only; the host and wasm arms are the single source
+        // for their targets and have nothing to mirror.
+        let start = sdk
+            .find("mod profile_embedded {")
+            .expect("profile_embedded module");
+        let body = &sdk[start..];
+
+        // TOML key -> the constant `build.rs` generates from it for the kernel.
+        const PAIRS: [(&str, &str); 5] = [
+            ("state_arena_kb", "STATE_ARENA_SIZE"),
+            ("buffer_arena_kb", "BUFFER_ARENA_SIZE"),
+            ("config_buffer_kb", "MAX_MODULE_CONFIG_SIZE"),
+            ("config_arena_kb", "CONFIG_ARENA_SIZE"),
+            ("log_ring_kb", "LOG_RING_CAPACITY"),
+        ];
+
+        for silicon in ["rp2040", "rp2350"] {
+            let toml =
+                std::fs::read_to_string(repo.join(format!("targets/silicon/{silicon}.toml")))
+                    .unwrap_or_else(|_| panic!("{silicon}: no silicon toml"));
+            for (key, konst) in PAIRS {
+                let kb: u64 = toml
+                    .lines()
+                    .find(|l| l.trim_start().starts_with(key))
+                    .unwrap_or_else(|| panic!("{silicon}: no {key}"))
+                    .split('=')
+                    .nth(1)
+                    .expect("value")
+                    .trim()
+                    .parse()
+                    .expect("integer");
+                let want = kb * 1024;
+                let got = sdk_embedded_value(body, konst, silicon).unwrap_or_else(|| {
+                    panic!("{konst} is not declared in the SDK's embedded profile")
+                });
+                assert_eq!(
+                    got, want,
+                    "{silicon}: SDK publishes {konst} = {got} but {key} makes the \
+                     kernel's {want}. A module sized against the SDK figure and a \
+                     kernel that allocates the TOML figure disagree on the die."
+                );
+            }
+        }
+    }
+
+    /// Resolve `konst` for `silicon` out of the embedded profile's source.
+    ///
+    /// Honours the `fluxor_silicon` cfg arms: an unconditional declaration answers
+    /// for both dies, a guarded one only for the die it names. Returns `None` when
+    /// the constant is absent, which the caller reports as a missing declaration
+    /// rather than treating as agreement.
+    fn sdk_embedded_value(body: &str, konst: &str, silicon: &str) -> Option<u64> {
+        let decl = format!("pub const {konst}: usize = ");
+        let mut cfg: Option<&str> = None;
+        let mut found = None;
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with("#[cfg(") {
+                cfg = Some(t);
+                continue;
+            }
+            if let Some(rest) = t.strip_prefix(&decl) {
+                let applies = match cfg {
+                    None => true,
+                    Some(c) if c.contains("not(fluxor_silicon = \"rp2040\")") => {
+                        silicon != "rp2040"
+                    }
+                    Some(c) if c.contains("fluxor_silicon = \"rp2040\"") => silicon == "rp2040",
+                    // A cfg this test does not understand: refuse to guess.
+                    Some(_) => false,
+                };
+                if applies {
+                    let expr = rest.trim_end_matches(';').trim();
+                    // `N * 1024` or a bare integer; nothing else is used here.
+                    let v: u64 = match expr.split_once('*') {
+                        Some((a, b)) => {
+                            a.trim().parse::<u64>().ok()? * b.trim().parse::<u64>().ok()?
+                        }
+                        None => expr.parse().ok()?,
+                    };
+                    found = Some(v);
+                }
+                cfg = None;
+            } else if !t.is_empty() && !t.starts_with("//") && !t.starts_with("/*") {
+                cfg = None;
+            }
+        }
+        found
+    }
+
     /// The MCU rows of `capacity_for_profile` mirror the silicon TOMLs. Those
     /// arena sizes are the kernel's actual budget on those dies, so a composer
     /// that admits against a stale copy admits graphs the arena cannot hold —

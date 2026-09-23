@@ -486,7 +486,7 @@ bindings:
         let s = parse(&path).unwrap();
         let err = merge_bindings_for_component("decoder", &s, &path).unwrap_err();
         let msg = format!("{err}");
-        // Per RFC §7 the error must name the binding, cite the file,
+        // The error must name the binding, cite the file,
         // and suggest a `prefix:` value.
         assert!(
             msg.contains("serve: viewer"),
@@ -534,7 +534,7 @@ bindings:
         let msg = format!("{err}");
         assert!(
             msg.contains("host filesystem") && msg.contains("runtime_override"),
-            "should explain host-FS gate (RFC §16 Q9), got: {msg}"
+            "should explain the host-FS gate, got: {msg}"
         );
     }
 

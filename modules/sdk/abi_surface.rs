@@ -298,6 +298,10 @@ pub fn for_each_field(f: &mut impl FnMut(&str, i64)) {
         "reconfigure.OWNER_RESUME",
         int::reconfigure::OWNER_RESUME as i64,
     );
+    f(
+        "reconfigure.OWNER_RELEASED",
+        int::reconfigure::OWNER_RELEASED as i64,
+    );
 
     f("bridge.WRITE", int::bridge::WRITE as i64);
     f("bridge.READ", int::bridge::READ as i64);

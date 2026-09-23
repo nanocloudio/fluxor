@@ -621,7 +621,7 @@ fn arena_reset() {
 }
 
 /// Current config-arena occupancy: `(used_bytes, total_bytes)`. Read
-/// by `scheduler::log_arena_summary` so silicon-TOML sizing decisions
+/// by `scheduler::finalize_instantiation_accounting` so silicon-TOML sizing decisions
 /// can be validated against real workloads.
 pub fn config_arena_usage() -> (usize, usize) {
     // SAFETY: word-sized read of static usize.

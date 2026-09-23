@@ -532,7 +532,7 @@ fn build_graph_linux() -> (usize, usize) {
     }
 
     log::info!("[inst] {loaded_count} of {module_count} modules loaded");
-    scheduler::log_arena_summary();
+    scheduler::finalize_instantiation_accounting();
     (module_count, loaded_count)
 }
 

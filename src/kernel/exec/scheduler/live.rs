@@ -146,6 +146,10 @@ pub enum AddError {
     Instantiate,
     /// PIC instantiation returned `Pending` (async load) — out of scope here.
     WouldBlock,
+    /// The owner's admitted `state_cap` would be exceeded by this subgraph's
+    /// module state. Refused at admission rather than allowed to draw down the
+    /// shared state arena at its neighbours' expense.
+    StateCapExceeded,
 }
 
 impl AddError {
@@ -161,6 +165,7 @@ impl AddError {
             AddError::ChannelOpenFailed => -7,
             AddError::Instantiate => -8,
             AddError::WouldBlock => -11, // -EAGAIN
+            AddError::StateCapExceeded => -9,
         }
     }
 }
@@ -492,6 +497,25 @@ pub fn apply_add(
             return Err(err);
         }
         super::set_module_owner(slot, handle);
+        // Charge this module's state-arena draw against the owner's admitted
+        // `state_cap` (cap 0 = unlimited). The allocation has already happened
+        // — the loader is the only half that knows the size — so exceeding the
+        // cap rolls the whole add back rather than trimming it: a subgraph is
+        // admitted entire or not at all, and a half-admitted one would be a
+        // graph nobody described.
+        let footprint = super::module_state_footprint(slot);
+        if sched().owners.charge_state(handle, footprint).is_err() {
+            let (charged, _) = sched().owners.charged_bytes(handle);
+            log::warn!(
+                "[live] owner slot {} refused: module state {} + {} exceeds its admitted \
+                 state_cap; raise the workload's cap or shrink the graph",
+                handle.slot,
+                charged,
+                footprint,
+            );
+            rollback_add(handle, &local_to_global[..=local], edge_base, e);
+            return Err(AddError::StateCapExceeded);
+        }
         let s = sched();
         s.ready[slot] = true;
         s.finished[slot] = false;
@@ -631,6 +655,11 @@ fn instantiate_pic(slot: usize, entry: &ModuleEntry) -> Result<(), AddError> {
 /// yet, so only instantiated slots, opened channels, and appended edges need
 /// undoing, then the owner is revoked.
 fn rollback_add(handle: OwnerHandle, slots: &[usize], edge_base: usize, e: usize) {
+    // An add that failed part-way still ran `module_new` for the slots that did
+    // instantiate, and those may already have asked a provider for resources.
+    // Same edge, same ordering as `free_owner`: notify before anything is torn
+    // down and while the handle still resolves.
+    crate::kernel::module::provider::notify_owner_released(handle);
     let s = sched();
     for &slot in slots {
         let taken = core::mem::replace(&mut s.modules[slot], ModuleSlot::Empty);
@@ -748,6 +777,15 @@ pub fn free_owner(handle: OwnerHandle) -> Result<(), FreeError> {
         Some(e) => e.state,
         None => return Err(FreeError::StaleHandle),
     };
+    // Tell subscribed providers first, while the owner handle still resolves
+    // and every provider module is still live and steppable. A provider that
+    // holds resources on this owner's behalf (scratch objects, open files)
+    // reclaims them here; after this point the handle's generation moves and
+    // a provider belonging to this owner's own graph is torn down below.
+    // Delivered from here rather than from the platform drain driver so the
+    // paths that bypass it — the workload verbs (KILL/DESTROY) and admission
+    // rollback — are covered by the same edge.
+    crate::kernel::module::provider::notify_owner_released(handle);
     // Which module slots belong to this owner, and which domains they occupy —
     // captured up front (pure reads) BEFORE any mutation, because the metal
     // per-domain unsplice below needs the freed owner's domain set, and

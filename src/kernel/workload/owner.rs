@@ -414,6 +414,24 @@ impl OwnerTable {
         Ok(())
     }
 
+    /// Drop every workload owner's charged state back to zero, keeping their
+    /// caps. The resident instantiation pass re-folds the charges from the live
+    /// module table on each rebuild; without this it would add a rebuild's
+    /// modules to the previous pass's total for any slot that survived.
+    pub fn clear_state_charges(&mut self) {
+        for e in self.entries.iter_mut().skip(1) {
+            e.acct.state_bytes = 0;
+        }
+    }
+
+    /// `(charged, cap)` state bytes for `h`. Cap 0 means unlimited.
+    pub fn charged_state(&self, h: OwnerHandle) -> (u32, u32) {
+        match self.lookup(h) {
+            Some(e) => (e.acct.state_bytes, e.acct.state_cap),
+            None => (0, 0),
+        }
+    }
+
     /// Release `bytes` of previously charged module state. Saturating.
     pub fn uncharge_state(&mut self, h: OwnerHandle, bytes: u32) {
         if h.is_system() {

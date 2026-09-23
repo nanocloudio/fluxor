@@ -1694,7 +1694,7 @@ pub extern "C" fn kernel_init() -> i32 {
             " bundled modules",
             0,
         );
-        scheduler::log_arena_summary();
+        scheduler::finalize_instantiation_accounting();
     }
 
     // Smoke-test the host_instantiate_module / host_invoke_module

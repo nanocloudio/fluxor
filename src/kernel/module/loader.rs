@@ -66,6 +66,7 @@ pub mod export_hashes {
     pub const MODULE_PROVIDER_DISPATCH: u32 = 0xc7832e76; // "module_provider_dispatch"
     pub const MODULE_PROVIDES_CONTRACT: u32 = 0x671c57bb; // "module_provides_contract"
     pub const MODULE_PROVIDER_SELECTOR: u32 = 0xfd70b311; // "module_provider_selector"
+    pub const MODULE_OBSERVES_OWNER_RELEASE: u32 = 0x3dc0c8a1; // "module_observes_owner_release"
     pub const MODULE_FLASH_STORE_DISPATCH: u32 = 0x2f7172b5; // "module_flash_store_dispatch"
 }
 /// Module table magic: "FXMT"
@@ -282,6 +283,12 @@ struct ProviderAutoRegister {
     /// compute their selector hash from their own config and expose it here.
     /// Absent on ordinary single-default providers (selector 0).
     selector_fn: Option<unsafe extern "C" fn(*mut u8) -> u32>,
+    /// Present when the module exports `module_observes_owner_release`, the
+    /// marker that subscribes it to `OWNER_RELEASED` notifications. A provider
+    /// that holds per-consumer resources (scratch objects, open files) uses it
+    /// to reclaim them when the consumer's owner is torn down; one that holds
+    /// nothing per-consumer omits the export and is never called.
+    observes_owner_release: bool,
 }
 impl ProviderAutoRegister {
     /// Look for the `module_provides_contract` + `module_provider_dispatch`
@@ -302,10 +309,14 @@ impl ProviderAutoRegister {
                 // declared C ABI is `fn(*mut u8) -> u32`.
                 unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(*mut u8) -> u32>(addr) }
             });
+        let observes_owner_release = module
+            .get_export_addr(export_hashes::MODULE_OBSERVES_OWNER_RELEASE)
+            .is_ok();
         Some(Self {
             contract_fn: fn_ptr_from_addr(contract_addr),
             dispatch_fn: fn_ptr_from_addr(dispatch_addr),
             selector_fn,
+            observes_owner_release,
         })
     }
     /// Register this module as a provider. Called after module_new() Ready.
@@ -332,6 +343,16 @@ impl ProviderAutoRegister {
             log::warn!(
                 "[inst] {name} provider auto-register failed contract=0x{contract:04x} rc={rc}"
             );
+            return;
+        }
+        // Subscribe AFTER a successful registration: the observer set is keyed
+        // by module index and is only meaningful for a module that actually has
+        // a dispatch to call.
+        if self.observes_owner_release {
+            let orc = crate::kernel::module::provider::register_owner_release_observer(module_idx);
+            if orc != 0 {
+                log::warn!("[inst] {name} owner-release subscribe failed rc={orc}");
+            }
         }
     }
 }
@@ -852,7 +873,7 @@ pub fn reset_state_arena() {
 /// "used" figure is the bump high-water mark — it doesn't subtract
 /// holes the free list could re-use, so it overestimates live bytes
 /// when modules have been freed (which only happens at full
-/// `reset_state_arena`). Read by `scheduler::log_arena_summary` for
+/// `reset_state_arena`). Read by `scheduler::finalize_instantiation_accounting` for
 /// post-instantiation telemetry.
 pub fn state_arena_usage() -> (usize, usize) {
     // SAFETY: word-sized read of static usize.
@@ -2366,6 +2387,12 @@ impl DynamicModule {
     /// Returns true if this module exports module_drain.
     pub fn has_drain(&self) -> bool {
         self.drain_fn.is_some()
+    }
+    /// Bytes of state arena this module's state buffer occupies. The heap
+    /// arena is tracked separately by the scheduler (`set_module_arena`), so
+    /// the owner's footprint is this plus that.
+    pub fn state_size(&self) -> u32 {
+        self.state_size
     }
     /// Create from loaded module with configuration parameters.
     ///

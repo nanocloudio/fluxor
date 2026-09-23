@@ -1152,7 +1152,7 @@ pub extern "C" fn main(dtb_phys: u64) -> ! {
     uart_put_u32(total_mods as u32);
     uart_puts(b" modules loaded total\r\n");
 
-    fluxor::kernel::exec::scheduler::log_arena_summary();
+    fluxor::kernel::exec::scheduler::finalize_instantiation_accounting();
 
     // Admit resident workloads declared in the config's `[FXPD]` section
     // (`workloads:` / `combine <two-graph.yaml>`) as workload owners via

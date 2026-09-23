@@ -18,7 +18,7 @@ capabilities = ["video.raster", "display.scanout", "presentation.clock"]
 
 # Logical sink port `pixels` — uniform with `linux_display.pixels` and
 # `st7701s.pixels`, so `<producer>.pixels -> display.pixels` resolves on
-# every target (RFC §5.7). The kernel resolves this builtin's input by
+# every target. The kernel resolves this builtin's input by
 # port index, so the rename is a wiring-name change only.
 [[ports]]
 name = "pixels"

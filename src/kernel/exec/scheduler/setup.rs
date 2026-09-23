@@ -1009,18 +1009,60 @@ pub fn register_isr_tier_modules_from_graph() -> usize {
     registered
 }
 
-/// Emit a one-line `[arena]` summary covering each kernel arena's
-/// used/cap byte counts. Each platform calls this once after its
-/// instantiation loop completes, so STATE_ARENA reflects every
-/// `alloc_state` call (BUFFER and CONFIG arenas are filled earlier,
-/// by `open_channels` and `populate_static_state` respectively).
-pub fn log_arena_summary() {
+/// Fold per-owner state accounting for the modules a boot/rebuild pass
+/// instantiated, then emit the one-line `[arena]` summary.
+///
+/// Each platform calls this once after its instantiation loop completes, so
+/// STATE_ARENA reflects every `alloc_state` call (BUFFER and CONFIG arenas are
+/// filled earlier, by `open_channels` and `populate_static_state`
+/// respectively).
+///
+/// The accounting half runs here rather than per module because the resident
+/// path stamps owners from the composed plan BEFORE instantiation (so
+/// `module_new` sees tenant ownership), which means no single module's
+/// instantiation is the point at which its owner becomes known — the pass is.
+/// Unlike the live-admission path, a resident owner over its cap is reported
+/// rather than refused: the graph it describes is the node's own boot
+/// composition, and failing it closed would leave the node with no graph at
+/// all rather than with a cap to raise.
+pub fn finalize_instantiation_accounting() {
+    charge_resident_owner_state();
     let (state_used, state_cap) = crate::kernel::module::loader::state_arena_usage();
     let (cfg_used, cfg_cap) = crate::kernel::boot::config::config_arena_usage();
     let (buf_used, buf_cap) = crate::kernel::ipc::buffer_pool::buffer_arena_usage();
     log::info!(
         "[arena] state={state_used}/{state_cap} cfg={cfg_used}/{cfg_cap} buf={buf_used}/{buf_cap}"
     );
+}
+
+/// Charge every instantiated module's state-arena draw to the owner stamped on
+/// its slot. Idempotent against a rebuild: each pass zeroes the workload
+/// owners' charges before re-folding them, so a reconfigure that reuses a slot
+/// does not double-count it.
+fn charge_resident_owner_state() {
+    // SAFETY: post-instantiation, scheduler thread, single-threaded at this
+    // point on every platform (each calls this once after its instantiation
+    // loop, before the runner starts).
+    let s = unsafe { crate::kernel::exec::scheduler::sched_mut() };
+    s.owners.clear_state_charges();
+    for idx in 0..crate::kernel::boot::config::MAX_MODULES {
+        let owner = crate::kernel::exec::scheduler::module_owner(idx);
+        if owner.is_system() {
+            continue;
+        }
+        let bytes = crate::kernel::exec::scheduler::module_state_footprint(idx);
+        if bytes == 0 {
+            continue;
+        }
+        if s.owners.charge_state(owner, bytes).is_err() {
+            let (charged, cap) = s.owners.charged_state(owner);
+            log::warn!(
+                "[arena] owner slot {} over its admitted state_cap: {charged} charged against \
+                 {cap} (module {idx} adds {bytes}); the graph runs, the cap is the thing to fix",
+                owner.slot,
+            );
+        }
+    }
 }
 
 // Async graph setup (setup_graph_async) and run_main_loop are in

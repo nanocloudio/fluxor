@@ -60,7 +60,7 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
             (Some(_), Some(_)) => {
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` declares both `graph:` and `scenario:` \
-                     — they are mutually exclusive (see RFC §5).",
+                     — they are mutually exclusive.",
                     scenario_path.display(),
                     name
                 )));
@@ -75,8 +75,8 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
             (None, Some(_)) => {
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` uses `scenario:` (nesting). \
-                     Scenario nesting is designed-in (RFC §16 Q5) but not yet implemented — \
-                     a follow-up PR will wire the recursive runner.",
+                     Scenario nesting is not supported by the runner — flatten the \
+                     components into this scenario.",
                     scenario_path.display(),
                     name
                 )));
@@ -107,8 +107,8 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
                 "wasm" => {
                     return Err(Error::Config(format!(
                         "scenario {}: component `{}` has `runtime_override: wasm`. \
-                         Wasm bundles execute in a browser; the runtime cannot be coerced \
-                         (RFC §16 Q3).",
+                         Wasm bundles execute in a browser; the runtime cannot be \
+                         coerced.",
                         scenario_path.display(),
                         name
                     )));
@@ -128,7 +128,7 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
                 return Err(Error::Config(format!(
                     "scenario {}: component `{}` has `runtime_override:` but the underlying \
                      graph targets wasm. Wasm bundles always build for the wasm target \
-                     (RFC §16 Q3); remove the override.",
+                     remove the override.",
                     scenario_path.display(),
                     name
                 )));
@@ -220,7 +220,7 @@ pub fn validate(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
         return Err(Error::Config(format!(
             "scenario {}: declares a wasm component but neither a `host:` block \
              nor a `serve:` binding with `on:` pointing at a non-wasm component's http \
-             module — wasm cannot run without an origin (RFC §5).",
+             module — wasm cannot run without an origin.",
             scenario_path.display()
         )));
     }
@@ -341,7 +341,7 @@ fn check_binding_dag(scenario: &Scenario, scenario_path: &Path) -> Result<()> {
                 return Err(Error::Config(format!(
                     "scenario {}: cyclic binding dependency: {}. \
                      A binding's `on:` target must not (transitively) depend on the \
-                     binding's `serve:` source (RFC §14, §16).",
+                     binding's `serve:` source.",
                     scenario_path.display(),
                     cycle.join(" → ")
                 )));

@@ -494,7 +494,7 @@ mod profile_embedded {
         // thumbv8m and one arm would otherwise charge the smaller die the
         // larger one's sizes.
         #[cfg(not(fluxor_silicon = "rp2040"))]
-        pub const STATE_ARENA_SIZE: usize = 256 * 1024;
+        pub const STATE_ARENA_SIZE: usize = 240 * 1024;
         #[cfg(fluxor_silicon = "rp2040")]
         pub const STATE_ARENA_SIZE: usize = 64 * 1024;
         /// Loader sanity ceiling for a single module's code segment.
@@ -509,7 +509,14 @@ mod profile_embedded {
         /// ISR-tier bridge slots; see profile_host. Eight is the ISR edges
         /// a graph of this size has, at ~2 KiB of static RAM each.
         pub const MAX_BRIDGES: usize = 8;
-        pub const MAX_MODULE_CONFIG_SIZE: usize = 4 * 1024;
+        /// Largest packed config one module may carry. Per-silicon like the
+        /// arenas above: the RP kernel takes this from `config_buffer_kb` in the
+        /// silicon TOML, so a single value here would describe one die and
+        /// misreport the other.
+        #[cfg(not(fluxor_silicon = "rp2040"))]
+        pub const MAX_MODULE_CONFIG_SIZE: usize = 16 * 1024;
+        #[cfg(fluxor_silicon = "rp2040")]
+        pub const MAX_MODULE_CONFIG_SIZE: usize = 8 * 1024;
         #[cfg(not(fluxor_silicon = "rp2040"))]
         pub const CONFIG_ARENA_SIZE: usize = 16 * 1024;
         #[cfg(fluxor_silicon = "rp2040")]

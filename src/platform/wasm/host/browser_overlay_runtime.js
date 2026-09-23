@@ -8,7 +8,7 @@
 // obscure it, and normalizes every interaction into canonical Fluxor
 // input through a caller-supplied `sinks` object.
 //
-// Ownership boundary (RFC §5.2): this file is GENERIC. It knows control
+// Ownership boundary: this file is GENERIC. It knows control
 // *kinds* (button/dpad/stick/slider/scrubber/toggle/menu/select/
 // checkbox/keyboard/status) and how to draw + normalize them. It does
 // NOT know what any control *means* — no Spectrum keys, no "tap = next
@@ -17,7 +17,7 @@
 // "show these now" is the `ShellSelection` the launcher (Truffle)
 // publishes.
 //
-// Security (RFC §23): CSP-compatible — no eval, no inline handlers, all
+// Security: CSP-compatible — no eval, no inline handlers, all
 // text via `textContent`. Untrusted labels/options are rendered as text
 // and length-capped; list data never injects control definitions.
 //
@@ -29,7 +29,7 @@
 (function (root) {
   'use strict';
 
-  // ── Canonical gamepad bit indices (RFC §9.2 standard mapping) ──────
+  // ── Canonical gamepad bit indices (standard mapping) ──────
   const GAMEPAD_BIT = {
     south: 0, east: 1, west: 2, north: 3,
     l1: 4, r1: 5, l2: 6, r2: 7,
@@ -47,10 +47,10 @@
   for (let d = 0; d <= 9; d++) KEYCODE[String(d)] = 48 + d;
   for (let c = 0; c < 26; c++) KEYCODE[String.fromCharCode(97 + c)] = 65 + c;
 
-  const LABEL_MAX = 64; // untrusted-text cap (RFC §23.4)
+  const LABEL_MAX = 64; // untrusted-text cap
 
   // Placement group → responsive browser zone, per orientation
-  // (RFC §7.2). Persistent groups never map to `content`.
+  //. Persistent groups never map to `content`.
   const ZONE_BY_ORIENT = {
     portrait: {
       primary_start: 'below_start', primary_end: 'below_end',
@@ -63,7 +63,7 @@
       drawer: 'drawer', transient: 'transient', debug: 'debug',
     },
     desktop: {
-      // Virtual gameplay controls hide on desktop (RFC §13.4); media
+      // Virtual gameplay controls hide on desktop; media
       // and setting controls remain in the compact below/above rows.
       primary_start: 'below_start', primary_end: 'below_end',
       secondary: 'below_center', above_content: 'above',
@@ -112,7 +112,7 @@
     return { ns: 'raw', name: id };
   }
 
-  // ── Generic sink factory (RFC §6.3 shared capture). The renderer
+  // ── Generic sink factory (shared capture). The renderer
   //    calls these on every control interaction; `emit(record)` routes
   //    the *normalized* record wherever the host wants it. Both the
   //    full-WASM host (`makeHostSinks`, below) and the DOM-only endpoint
@@ -266,7 +266,7 @@
         const disp = spec.id ? layout.get(spec.id) : 'chrome';
         if (disp === 'hidden') continue;
         if (spec.overlay === true) {
-          // Superimposed mode (RFC §11.3): overlay the control translucently
+          // Superimposed mode: overlay the control translucently
           // OVER live content at an app-declared `overlay_regions`, rather than
           // packing it into a chrome zone. The "controls never obscure content"
           // invariant is deliberately waived here (virtual gamepads on a game).
@@ -294,7 +294,7 @@
     }
 
     // Ensure every rendered control exposes an accessible name + role for the
-    // a11y tree (RFC §13). Native <button>/<select>/<input> derive a name from
+    // a11y tree. Native <button>/<select>/<input> derive a name from
     // their text/options; div-based controls (dpad/stick/cluster/keyboard/status)
     // need an explicit role + aria-label so assistive tech can navigate them.
     function applyA11y(node, spec) {
@@ -308,7 +308,7 @@
       }
     }
 
-    // Named overlay regions (RFC §11.3 `overlay_regions`) → CSS placement within
+    // Named overlay regions (`overlay_regions`) → CSS placement within
     // the content zone. The validated schema is `overlay` boolean +
     // `overlay_regions` a list of region NAMES; the validator
     // (tools/src/presentation_shell.rs OVERLAY_REGIONS) accepts EXACTLY these
@@ -358,7 +358,7 @@
     }
 
     // A button emits either a raw control (binary/gamepad/key) or a
-    // semantic action, per RFC §10.2.
+    // semantic action.
     function emitPress(spec, pressed) {
       if (spec.action) {
         if (pressed) sinks.action(spec.action, spec.value);
@@ -383,7 +383,7 @@
       const up = () => {
         node.classList.remove('fx-active');
         // minimum-hold: defer the release edge for frame-sampled
-        // consumers (RFC §10.4). Best-effort; no timer in fake-DOM tests.
+        // consumers. Best-effort; no timer in fake-DOM tests.
         const release = () => emitPress(spec, false);
         if (hold > 0 && root.setTimeout) {
           const now = (root.performance && root.performance.now) ? root.performance.now() : 0;
@@ -423,7 +423,7 @@
       return { node, spec, release: () => children.forEach((c) => c.release && c.release()) };
     }
 
-    // Digital d-pad with diagonals + track-through (RFC §9.5). Active
+    // Digital d-pad with diagonals + track-through. Active
     // directions are computed from the pointer offset within the pad.
     function buildDpad(spec) {
       const node = el('div');
@@ -564,7 +564,7 @@
     }
 
     function buildScrubber(spec) {
-      // Seek on release only (RFC §16.2): suppress the slider's per-input
+      // Seek on release only: suppress the slider's per-input
       // emitter so dragging the scrubber doesn't flood/duplicate seeks,
       // then emit a single seek action on `change`.
       const built = buildSlider(spec, { emitOnInput: false });
@@ -620,7 +620,7 @@
         update: (val) => { box.checked = !!val; } };
     }
 
-    // A `select`/`menu` backed by a bounded option list (RFC §17.3 /
+    // A `select`/`menu` backed by a bounded option list (/
     // §A.3). Options come from `opts.lists[spec.list]`;
     // labels are untrusted text.
     function buildSelect(spec) {
@@ -630,7 +630,7 @@
       if (spec.a11y && spec.a11y.label) node.setAttribute('aria-label', cap(spec.a11y.label));
       // `opts.lists[name]` MUST be a *resolved* option-row array. The
       // shell descriptor's `lists:` is only a name→feed declaration
-      // (RFC §17.3); the host resolves each feed to a bounded snapshot
+      //; the host resolves each feed to a bounded snapshot
       // before mount. Guard defensively: a bare feed string (or any
       // non-array) would otherwise iterate per-character into junk
       // <option>s, so coerce anything that is not an array to empty and
@@ -657,7 +657,7 @@
     // `select` (which is a compact dropdown). Generic by construction:
     // rows are `{ id, label, sublabel?, badge?, selected?, enabled? }`
     // records carrying no domain meaning. Rows come from the resolved
-    // feed snapshot `opts.lists[spec.list]` (RFC §17.3 — the shell's
+    // feed snapshot `opts.lists[spec.list]` (— the shell's
     // `lists:` is a name→feed declaration the host resolves to a bounded
     // snapshot) with an inline `spec.options` fallback. Picking a row
     // emits the selection `action` with `{ item_id }`; the app decides
@@ -725,7 +725,7 @@
         update: (val) => { if (Array.isArray(val)) render(val); } };
     }
 
-    // Virtual keyboard show/hide drawer (RFC §11.5). A machine keyboard
+    // Virtual keyboard show/hide drawer. A machine keyboard
     // emits key identities; this builds a compact key grid that emits
     // `key.symbolic.*` transitions.
     function buildKeyboard(spec) {
@@ -811,7 +811,7 @@
     }
 
     // ── Lifecycle cleanup: release all held input on interruption
-    //    (RFC §8.4 / §14.7).
+    //    (/ §14.7).
     function releaseAll() {
       for (const c of controls) if (c.release) c.release();
     }
@@ -884,7 +884,7 @@
     // go dead. The content zone deliberately stays click-through.
     '.fx-zone{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;pointer-events:auto;}',
     '.fx-zone-content{overflow:hidden;pointer-events:none;}',
-    // Superimposed mode (RFC §11.3): a control overlaid translucently OVER live
+    // Superimposed mode: a control overlaid translucently OVER live
     // content at its app-declared region. The content zone becomes the
     // positioning context; the control re-asserts pointer-events (the zone is
     // click-through) and sits above the content.
@@ -912,7 +912,7 @@
     '.fx-zone-right_rail{grid-area:right_rail;flex-direction:column;}',
     '.fx-zone-below_start{grid-area:below_start;}.fx-zone-below_center{grid-area:below_center;}',
     '.fx-zone-below_end{grid-area:below_end;}.fx-zone-drawer{grid-area:drawer;}',
-    // Controls — min 44px touch targets (RFC §22.2), no text select.
+    // Controls — min 44px touch targets, no text select.
     '.fx-ctl{min-width:44px;min-height:44px;touch-action:none;user-select:none;pointer-events:auto;',
     '-webkit-user-select:none;-webkit-tap-highlight-color:transparent;}',
     '.fx-button,.fx-toggle,.fx-key{border-radius:8px;border:1px solid #444;background:#222;color:#eee;font:inherit;}',

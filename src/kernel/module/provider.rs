@@ -978,6 +978,9 @@ pub fn register_module_provider(
 /// Called on module finish (Done/Error) for cleanup.
 /// Compacts chains to maintain stack ordering.
 pub fn release_module_providers(module_idx: u8) {
+    // A freed slot must not stay subscribed: the slot is reused, and the next
+    // module to land in it would inherit a subscription it never asked for.
+    clear_owner_release_observer(module_idx);
     // SAFETY: called from scheduler module-finish path; scheduler thread.
     unsafe {
         let p = &raw mut PROVIDERS;
@@ -1006,6 +1009,192 @@ pub fn release_module_providers(module_idx: u8) {
             entry.depth = write as u8;
         }
     }
+}
+
+// ============================================================================
+// Owner-release notification
+// ============================================================================
+//
+// A provider that holds resources on a consumer's behalf — scratch objects,
+// open files, staged writes — needs to know when that consumer's owner goes
+// away, or it holds them until the next reset. The kernel is the only party
+// that knows, so it has to say so.
+//
+// Two platform calls (`linux_net_close_owner_conns`,
+// `linux_workload_close_owner`) cover the kernel's OWN per-owner state on the
+// drain path. This is the module-provider counterpart, delivered from
+// `free_owner` itself rather than from the drain driver, so the paths that
+// never reach the drain driver — the workload verbs (KILL, DESTROY) and
+// admission rollback — are covered too.
+//
+// Ordering is the whole point: the notification runs BEFORE any teardown, so
+// the owner handle still resolves, the provider module's state is still live,
+// and a handler may make syscalls exactly as it would in a normal frame. A
+// notification after `free_owner` would reach a provider that cannot validate
+// the owner it was handed (the generation has moved) and that may itself have
+// been torn down.
+
+/// Providers that asked to hear about owner teardown, by module index.
+/// Opt-in: set by the loader when a provider module exports
+/// `module_observes_owner_release`. Never notified otherwise, because
+/// calling every registered provider with an opcode it does not know would
+/// reach modules whose dispatch does not bounds-check its input.
+static mut OWNER_RELEASE_OBSERVERS: crate::kernel::workload::bitmask::ModuleMask =
+    crate::kernel::workload::bitmask::ModuleMask::EMPTY;
+
+/// Mark `module_idx` as an owner-release observer. Called by the loader after
+/// the module's provider registration succeeds; a module that is not a
+/// registered provider has no dispatch to notify, so it is refused.
+pub fn register_owner_release_observer(module_idx: u8) -> i32 {
+    let idx = module_idx as usize;
+    if idx >= crate::kernel::boot::config::MAX_MODULES {
+        return errno::EINVAL;
+    }
+    if !module_has_provider_layer(module_idx) {
+        log::warn!(
+            "[provider] module {module_idx} exports module_observes_owner_release but \
+             provides no contract; nothing to notify"
+        );
+        return errno::EINVAL;
+    }
+    // SAFETY: scheduler-thread-only, same access class as the provider table.
+    unsafe {
+        let p = &raw mut OWNER_RELEASE_OBSERVERS;
+        (*p).set(idx);
+    }
+    0
+}
+
+/// Drop `module_idx` from the observer set. Called alongside
+/// `release_module_providers` so a freed slot cannot be notified, and a later
+/// module reusing the slot does not inherit the subscription.
+pub fn clear_owner_release_observer(module_idx: u8) {
+    let idx = module_idx as usize;
+    if idx >= crate::kernel::boot::config::MAX_MODULES {
+        return;
+    }
+    // SAFETY: scheduler-thread-only.
+    unsafe {
+        let p = &raw mut OWNER_RELEASE_OBSERVERS;
+        (*p).clear(idx);
+    }
+}
+
+/// Whether `module_idx` holds at least one registered provider layer.
+fn module_has_provider_layer(module_idx: u8) -> bool {
+    module_dispatch_entry(module_idx).is_some()
+}
+
+/// Encode an owner handle as the 8-byte record `OWNER_RELEASED` carries.
+///
+/// The same encoder answers `query_key::CALLER_OWNER`, so a provider compares
+/// the owner it stamped against the one released to it without reformatting
+/// either. One function rather than two matching layouts: the two are only
+/// useful while they agree, and nothing but this would keep them agreeing.
+pub(crate) fn encode_owner_record(owner: crate::kernel::workload::owner::OwnerHandle) -> [u8; 8] {
+    let slot = owner.slot.to_le_bytes();
+    let generation = owner.generation.to_le_bytes();
+    [
+        slot[0],
+        slot[1],
+        0,
+        0,
+        generation[0],
+        generation[1],
+        generation[2],
+        generation[3],
+    ]
+}
+
+/// Tell every subscribed provider that `owner` is about to be freed.
+///
+/// Called from `free_owner` before it touches anything, and from the
+/// admission-rollback path. Each observer is notified once even when it
+/// provides several contracts. Return values are ignored: a provider with
+/// nothing to release answers `-ENOSYS`, which is not an error here.
+///
+/// The handler runs inline on the scheduler thread inside teardown, in a
+/// provider frame, so `caller_module_index` reports whoever is tearing down
+/// rather than leaving a stale frame behind.
+pub fn notify_owner_released(owner: crate::kernel::workload::owner::OwnerHandle) {
+    // SAFETY: scheduler-thread read of the observer set.
+    let observers = unsafe {
+        let p = &raw const OWNER_RELEASE_OBSERVERS;
+        *p
+    };
+    if observers.is_empty() {
+        return;
+    }
+
+    // Resolve which modules to call BEFORE calling any of them. A handler runs
+    // arbitrary module code and may reach `provider_open`/`provider_close`, or
+    // finish a module and compact the chain through
+    // `release_module_providers` — so no borrow of `PROVIDERS` may span a
+    // dispatch. Collecting into a mask also makes the dedup free: a module
+    // serving several contracts is one subscriber, not one per contract.
+    let mut targets = crate::kernel::workload::bitmask::ModuleMask::EMPTY;
+    // SAFETY: scheduler-thread read; no module code runs inside this loop.
+    unsafe {
+        let p = &raw const PROVIDERS;
+        for entry in (*p).iter() {
+            for i in 0..entry.depth as usize {
+                if let Some(ref layer) = entry.chain[i] {
+                    let midx = layer.module_idx as usize;
+                    if midx < crate::kernel::boot::config::MAX_MODULES && observers.test(midx) {
+                        targets.set(midx);
+                    }
+                }
+            }
+        }
+    }
+
+    for midx in 0..crate::kernel::boot::config::MAX_MODULES {
+        if !targets.test(midx) {
+            continue;
+        }
+        // Re-resolve per module, in a borrow that ends before the call. If an
+        // earlier handler tore this one's layer out, it is simply skipped —
+        // there is nothing left to notify.
+        let Some((dispatch, state)) = module_dispatch_entry(midx as u8) else {
+            continue;
+        };
+        // A fresh record per handler: one provider scribbling on the buffer
+        // must not change what the next one is told.
+        let mut record = encode_owner_record(owner);
+        in_provider_frame(midx, || {
+            // SAFETY: `dispatch` and `state` are the pair the module
+            // registered; `record` is a live 8-byte buffer owned by this frame.
+            unsafe {
+                dispatch(
+                    state,
+                    -1,
+                    crate::abi::internal::reconfigure::OWNER_RELEASED,
+                    record.as_mut_ptr(),
+                    crate::abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN,
+                )
+            }
+        });
+    }
+}
+
+/// The first registered `(dispatch, state)` pair for `module_idx`, or `None`
+/// when it holds no provider layer. The borrow of `PROVIDERS` ends with the
+/// call, so the caller may safely run module code with the result.
+fn module_dispatch_entry(module_idx: u8) -> Option<(ModuleProviderDispatchFn, *mut u8)> {
+    // SAFETY: scheduler-thread read; nothing here calls into module code.
+    unsafe {
+        let p = &raw const PROVIDERS;
+        for entry in (*p).iter() {
+            for i in 0..entry.depth as usize {
+                if let Some(ref layer) = entry.chain[i] {
+                    if layer.module_idx == module_idx {
+                        return Some((layer.dispatch, layer.state));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Dispatch an operation to the registered provider for `contract`.

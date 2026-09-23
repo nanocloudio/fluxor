@@ -1492,6 +1492,11 @@ unsafe fn parse_dir_entry(s: &mut Fat32State, entry_offset: usize) -> bool {
 // block read is fully synchronous inside the dispatch call.
 
 // FS opcodes from the layered ABI.
+/// Kernel → provider: the owner named in the 8-byte argument is being torn
+/// down. Not an FS opcode — it reaches every provider that subscribed,
+/// whatever contract it serves. See `abi::internal::reconfigure`.
+const OWNER_RELEASED: u32 = abi::internal::reconfigure::OWNER_RELEASED;
+const OWNER_RELEASED_ARG_LEN: usize = abi::internal::reconfigure::OWNER_RELEASED_ARG_LEN;
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
 const FS_SEEK: u32 = 0x0902;
@@ -2560,6 +2565,52 @@ unsafe fn fs_op_seek(s: &mut Fat32State, handle: i32, arg: *const u8, arg_len: u
         of.scratch_avail = 0;
     }
     target as i32
+}
+
+/// `OWNER_RELEASED`: close every handle this provider opened on behalf of an
+/// owner that is being torn down.
+///
+/// The table is provider-wide and shared between owners, and nothing else ever
+/// reclaims a slot a dead consumer left open: `max_open_per_owner` caps how
+/// many a workload can hold but has no way to notice it is gone. Without this,
+/// a workload that faults with files open costs those slots until the module is
+/// reinstantiated, and the operator sees `ENFILE` on a module that did nothing
+/// wrong.
+///
+/// The generation is compared along with the slot for the reason the stamp
+/// carries it: an owner slot is reused, and matching on the slot alone would
+/// close the live handles of the workload that replaced the dead one.
+///
+/// Each slot goes through `fs_op_close`, so a writable handle's tail is
+/// flushed and its directory entry written back exactly as an explicit close
+/// would do. A close that fails on media is not retried and does not stop the
+/// sweep — the slot is released either way, and the kernel ignores the return
+/// value of this opcode. Returns the number of slots released.
+unsafe fn fs_op_owner_released(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i32 {
+    if arg.is_null() || arg_len < OWNER_RELEASED_ARG_LEN {
+        return E_INVAL;
+    }
+    let rec = core::slice::from_raw_parts(arg, OWNER_RELEASED_ARG_LEN);
+    let slot = u16::from_le_bytes([rec[0], rec[1]]);
+    let generation = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]);
+    // An unstamped handle (opened outside a provider frame) belongs to nobody
+    // and is never swept by an owner release.
+    if slot == OWNER_NONE {
+        return 0;
+    }
+    let mut released = 0i32;
+    let mut k = 0usize;
+    while k < MAX_OPEN_FILES {
+        if s.open_files[k].in_use != 0
+            && s.open_files[k].owner_slot == slot
+            && s.open_files[k].owner_generation == generation
+        {
+            let _ = fs_op_close(s, k as i32);
+            released += 1;
+        }
+        k += 1;
+    }
+    released
 }
 
 /// FS_CLOSE: free the OpenFile slot.
@@ -4088,6 +4139,9 @@ const fn fs_op_mutates(opcode: u32) -> bool {
             | FS_MKDIR
             | FS_RMDIR
             | FS_TRUNCATE
+            // An owner release closes that owner's handles, and closing a
+            // writable handle writes its directory entry back.
+            | OWNER_RELEASED
     )
 }
 
@@ -5142,7 +5196,14 @@ unsafe fn fs_op_create(s: &mut Fat32State, arg: *const u8, arg_len: usize) -> i3
     // genuinely needs its capacity warmed asks for it with `PREALLOCATE`,
     // which is where the cold mutation belongs.
     let of = &mut s.open_files[slot];
+    // `fs_claim_slot` has already stamped this slot with the owner on the
+    // provider stack; carry that across the reset. Losing it would leave every
+    // FS_OPEN_CREATE handle unowned — `max_open_per_owner` silently off on the
+    // write path, and the handle unreclaimable when its owner is released.
+    let (owner_slot, owner_generation) = (of.owner_slot, of.owner_generation);
     *of = OpenFile::empty();
+    of.owner_slot = owner_slot;
+    of.owner_generation = owner_generation;
     of.in_use = 1;
     of.writable = 1;
     of.name = want.short;
@@ -7066,6 +7127,7 @@ pub unsafe extern "C" fn fat32_fs_dispatch(
         FS_RMDIR => fs_op_rmdir(s, arg as *const u8, arg_len),
         FS_TRUNCATE => fs_op_truncate(s, arg as *const u8, arg_len),
         FS_RENAME => fs_op_rename(s, arg as *const u8, arg_len),
+        OWNER_RELEASED => fs_op_owner_released(s, arg as *const u8, arg_len),
         _ => -38, // ENOSYS
     }
 }
@@ -7104,6 +7166,19 @@ pub extern "C" fn module_provider_selector(state: *mut u8) -> u32 {
     // SAFETY: the loader passes this module's own state buffer, sized for
     // `Fat32State` and initialised by `module_new`.
     unsafe { (*(state as *const Fat32State)).selector }
+}
+
+/// Marker export: subscribe this provider to `OWNER_RELEASED`. Present because
+/// the open-file table is provider-wide and stamped per owner, so a torn-down
+/// consumer's slots have to be reclaimed by somebody, and this provider is the
+/// only one that knows which slots those are.
+#[cfg_attr(not(feature = "host-test"), no_mangle)]
+#[cfg_attr(
+    not(feature = "host-test"),
+    link_section = ".text.module_observes_owner_release"
+)]
+pub extern "C" fn module_observes_owner_release() -> u32 {
+    1
 }
 
 // ============================================================================

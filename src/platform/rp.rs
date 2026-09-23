@@ -861,7 +861,7 @@ pub unsafe extern "C" fn fluxor_rp_main() -> ! {
             park_reporting("[fluxor] boot: graph setup failed\r\n");
         }
         log::info!("[boot] ready modules={module_count}");
-        scheduler::log_arena_summary();
+        scheduler::finalize_instantiation_accounting();
         // Tier 1b admission: hand any Tier 1b-domain modules to the ISR-tier
         // dispatcher. The step loop polls `isr_tier::poll_tier1b` each
         // iteration, so registration here is the platform's only ISR setup.

@@ -95,6 +95,41 @@ pub const OWNER_PAUSE: u32 = 0x0C49;
 /// negative `PauseError` otherwise.
 pub const OWNER_RESUME: u32 = 0x0C4A;
 
+// ── Owner release: the kernel's notification TO a provider ──────────────────
+// Every other opcode in this file travels module → kernel. This one travels
+// the other way: the kernel invokes a provider module's
+// `module_provider_dispatch` with `OWNER_RELEASED` just before it tears an
+// owner down, so the provider can reclaim what it holds on that owner's
+// behalf while the owner handle is still valid and the provider is still live.
+//
+// It is delivered only to providers that opted in by exporting
+// `module_observes_owner_release`; a provider that has not is never called
+// with this opcode. The kernel ignores the return value — a provider that
+// answers `-ENOSYS` is simply one with nothing to release.
+//
+// Wire number sits in the free 0x0C22..=0x0C2E run rather than beside
+// FREE_OWNER, because the 0x0C47..=0x0C4A live-mutation block is full.
+
+/// Notify a provider that `owner` is about to be freed. Delivered before any
+/// teardown: the owner's slot/generation still resolve, the provider module's
+/// state is still live, and syscalls made from the handler behave normally.
+///
+/// `handle = -1`; `arg` is the SAME 8-byte owner record that
+/// `query_key::CALLER_OWNER` hands back, so a provider that stamped its
+/// resources with the caller's owner compares the two without reformatting:
+///
+/// ```text
+///   [slot: u16 LE][reserved: u16 (0)][generation: u32 LE]
+/// ```
+///
+/// Return value is ignored. The handler MUST be bounded: it runs inline on
+/// the scheduler thread inside the teardown path, so it releases bookkeeping
+/// and hands long work to the provider's own steps.
+pub const OWNER_RELEASED: u32 = 0x0C22;
+
+/// Byte length of the `OWNER_RELEASED` argument record.
+pub const OWNER_RELEASED_ARG_LEN: usize = 8;
+
 // ── OTA RAM staging (Pi 5 / hosted Linux) ────────────────────────────────────
 // The RAM-staged counterpart of the RP flash graph-slot pair: a module
 // streams a GRAPH IMAGE (`fluxor build --emit=image`) into the kernel's
