@@ -151,6 +151,25 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     "stream.line",
     "request.http",
     "request.record",
+    // ── Sensing ────────────────────────────────────────────────────────────
+    // Produces `SensorSample` records: a measured physical quantity, one
+    // reading per record.
+    //
+    // This is what makes a sensor driver PLUGGABLE. Without it a driver
+    // publishes `OctetStream` with a private framing documented in a comment,
+    // which a consumer cannot bind without being taught that driver's format —
+    // the coupling the graph model exists to prevent, and it scales N x M.
+    // With it, a consuming rules engine whose input port requires `sensor.sample`
+    // binds a thermometer, a light sensor, a replay module or a simulator alike,
+    // and the composer refuses the mismatches.
+    //
+    // Deliberately ONE name, on the same rule the `input.*` family follows:
+    // a name is added when a module declares it. A block-per-acquisition
+    // surface for radar, microphones and spectrum sweeps is a second type to be
+    // designed against a real producer, not ahead of one, and actuation waits
+    // on a driver that drives something — home automation is not read-only, but
+    // nothing here holds a relay.
+    "sensor.sample",
 ];
 
 /// The values one fact admits: an enumerated set, or [`FACT_NUMERIC`] when
@@ -344,6 +363,46 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
         // terms. A target with none does not carry the capability at all.
         "time.wall",
         &[("source", &["rtc", "network_sync", "signed_authority"])],
+    ),
+    (
+        // The terms a sensor producer states so a consumer can be matched
+        // against it at BUILD time rather than discovering the mismatch in the
+        // data.
+        //
+        // `quantity` is the load-bearing one, and it is a fact rather than bytes
+        // in the record for the reason this registry states generally: quantities
+        // are facts, not name segments, and the enumeration is what lets the
+        // composer refuse a Celsius producer wired to a lux consumer. The list is
+        // short and grows as drivers declare values, exactly as `input.*` did —
+        // it is deliberately NOT a general unit registry.
+        //
+        // `period_ms` is 0 for an event-driven sensor (a PIR, a contact) and the
+        // nominal sampling period otherwise, so a consumer sizing a window or a
+        // debounce has a number instead of a guess. `max_payload` is validated
+        // against the consuming port's `max_record` at build, which is what turns
+        // a runtime OVERSIZE refusal into a build failure.
+        "sensor.sample",
+        &[
+            (
+                "quantity",
+                &[
+                    "temperature",
+                    "humidity",
+                    "pressure",
+                    "illuminance",
+                    "occupancy",
+                    "contact",
+                    "voltage",
+                    "current",
+                    "power",
+                    "energy",
+                    "ratio",
+                    "count",
+                ],
+            ),
+            ("period_ms", FACT_NUMERIC),
+            ("max_payload", FACT_NUMERIC),
+        ],
     ),
 ];
 

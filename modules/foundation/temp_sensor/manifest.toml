@@ -1,13 +1,29 @@
 version = "1.0.0"
-hardware_targets = ["rp2350"]
+hardware_targets = ["rp2350", "rp2040"]
+
+# Produces `SensorSample` records. Declared so a consumer can require the
+# SURFACE rather than name this driver: a chronicle engine whose input port
+# requires `sensor.sample` binds this, a light sensor, a replay module or a
+# simulator alike, and the composer refuses a producer whose declared quantity
+# or payload does not match what the consumer asked for.
+capabilities = ["sensor.sample"]
+
+[capability_facts."sensor.sample"]
+quantity = "temperature"
+# The default read interval; a graph that overrides `interval_ms` overrides this
+# with it. Zero would mean event-driven, which this sensor is not.
+period_ms = 5000
+max_payload = 24
 
 [[ports]]
 name = "reading"
 direction = "output"
-content_type = "OctetStream"
-# out[0]: temp readings (4 bytes each).
-buffer_size = 64
-max_record = 4
+content_type = "SensorSample"
+# out[0]: one 24-byte typed reading each — a `SensorSample`, so a consumer reads
+# the scale and the reading's own time out of the record rather than being told
+# in prose what the bytes mean.
+buffer_size = 240
+max_record = 24
 
 [[resources]]
 requires_contract = "adc"

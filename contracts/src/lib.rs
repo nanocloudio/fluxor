@@ -193,6 +193,23 @@ pub const CONTENT_TYPES: &[&str] = &[
     // capabilities, readback bytes, surface leases and exactly one terminal
     // outcome per accepted request.
     "GpuOutcome",
+    // A measured physical quantity — one reading per record, fixed layout:
+    // `{sensor_id u16, flags u8, scale i8, seq u32, t_micros u64, value i64}`,
+    // little-endian, value scaled by `10^scale`. The layout and the reasoning
+    // behind it live with the contract, `modules/sdk/contracts/sensor.rs`;
+    // fixed point rather than float so a reading evaluates identically on a die
+    // with no FPU and in a deterministic expression VM.
+    //
+    // WHAT the quantity is — temperature, lux, pascals — and its unit are
+    // CAPABILITY FACTS on the producing port, not bytes in the record, which is
+    // what the tables in this file already say for other families: a content
+    // type names a substitution surface, not an implementation enumeration. An
+    // enumeration of quantities would also be unbounded — UCUM alone carries
+    // some three hundred units — so the first sensor outside it would need the
+    // `OctetStream` escape hatch this type exists to close. Facts also put the
+    // check where it can act: the composer refuses a Celsius producer wired to
+    // a lux consumer at build time, which no per-record byte can do.
+    "SensorSample",
 ];
 
 // ── Rate classes ────────────────────────────────────────────────────────────
@@ -323,6 +340,11 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     // that the contract's bounded-chunk design exists to keep fast.
     Video, // GpuCommand
     Video, // GpuOutcome
+    // One small record per reading, at sensor cadence — a temperature every
+    // minute, a PIR on motion. Bursty control traffic, not a sustained stream; a
+    // high-rate sampler declares `rate:` on the edge, as `VideoRaster` and
+    // `EthernetFrame` do.
+    Control, // SensorSample
 ];
 
 const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
@@ -399,6 +421,12 @@ pub const CONTENT_FRAMING: &[Framing] = &[
     // smaller ring instead of demanding one sized for the largest record.
     Streamed, // GpuCommand
     Streamed, // GpuOutcome
+    // Framed: a reading is 24 fixed bytes with no length prefix, so a consumer
+    // handed half of one cannot tell it was truncated — it would read a
+    // plausible value from the wrong offsets and act on it. A record delivered
+    // whole or not at all is the only safe shape for a measurement a rule fires
+    // on.
+    Framed, // SensorSample
 ];
 
 const _: () = assert!(CONTENT_FRAMING.len() == CONTENT_TYPES.len());

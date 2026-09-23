@@ -209,6 +209,10 @@ pub mod contracts {
     pub mod workload {
         include!("contracts/workload.rs");
     }
+    /// Measured-quantity surface — the `SensorSample` content type's record.
+    pub mod sensor {
+        include!("contracts/sensor.rs");
+    }
     pub mod input {
         pub mod gamepad {
             include!("contracts/input/gamepad.rs");

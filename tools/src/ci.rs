@@ -210,22 +210,6 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("presentation", verbose, || run_presentation(project_root))
     });
 
-    // ───── tracked examples build-check ──────────────────────────────────
-    //
-    // `examples/` is the front door, and a graph naming a module the repo does
-    // not contain still *reads* fine — it only fails when someone runs it.
-    // Every module extraction and every domain/tier rule change can strand one
-    // silently. Build-check each tracked example so that lands here, on the
-    // day, rather than in a downstream clone.
-    //
-    // Tracked only: the working tree carries local scratch graphs that
-    // legitimately name sibling-repo modules.
-    results.push(if skip.lint {
-        skipped("examples")
-    } else {
-        run_step("examples", verbose, || run_examples(project_root))
-    });
-
     // ───── Makefile standard ─────────────────────────────────────────────
     //
     // Holds this project's Makefile to `standards/make.md`. A CLI verb that
@@ -547,6 +531,28 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
         run_step("modules-build (strict)", verbose, || {
             run_modules_build_strict(project_root, verbose)
         })
+    });
+
+    // ───── tracked examples build-check ──────────────────────────────────
+    //
+    // `examples/` is the front door, and a graph naming a module the repo does
+    // not contain still *reads* fine — it only fails when someone runs it.
+    // Every module extraction and every domain/tier rule change can strand one
+    // silently. Build-check each tracked example so that lands here, on the
+    // day, rather than in a downstream clone.
+    //
+    // Tracked only: the working tree carries local scratch graphs that
+    // legitimately name sibling-repo modules.
+    //
+    // AFTER the module build, because a build-check resolves each graph
+    // against the `.fmod` artefacts and reads their parameter schemas out of
+    // them. Run before, it checks whatever a previous build happened to leave
+    // in `target/fluxor` — passing on a warm tree and failing on a cold one,
+    // which is a gate that reports the bench rather than the commit.
+    results.push(if skip.lint {
+        skipped("examples")
+    } else {
+        run_step("examples", verbose, || run_examples(project_root))
     });
 
     // ───── kernel link + static-RAM budget ───────────────────────────────

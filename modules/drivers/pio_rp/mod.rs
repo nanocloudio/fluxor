@@ -53,12 +53,35 @@ const MAX_CMD_SLOTS: usize = 2;
 const MAX_RX_SLOTS: usize = 1;
 const TOTAL_SLOTS: usize = MAX_STREAM_SLOTS + MAX_CMD_SLOTS + MAX_RX_SLOTS;
 
-/// TX stream buffer size in u32 words (2048 words = 8KB per buffer)
-const STREAM_BUF_WORDS: usize = 2048;
-/// CMD scratch buffer size in u32 words (512 words = 2KB)
-const CMD_SCRATCH_WORDS: usize = 512;
-/// RX stream buffer size in u32 words (512 words = 2KB per buffer)
-const RX_BUF_WORDS: usize = 512;
+/// Is this a 64 KiB-arena die (RP2040)?
+///
+/// The slot buffers dominate this module's resident state, and at the large-die
+/// sizes they carry it to 41,600 B: more than the whole IP stack (20,608 B) and
+/// 63% of an RP2040 arena. The tiny-die sizes bring it to 10,880 B. A PIO driver
+/// on the die whose PIO blocks are its distinguishing feature should not be the
+/// arena's dominant term.
+///
+/// Those are the figures the arena is CHARGED, which is `size_of` rounded up to
+/// the manifest's 64-byte granule — the struct itself measures 10,840 B here.
+///
+/// The trade is real and is throughput, not correctness: a smaller TX buffer
+/// holds less ahead of the state machine, so a high-rate stream underruns
+/// sooner. It is the right trade here because the large-die sizes are set for
+/// audio-rate streaming, and a die with 64 KiB of arena cannot host a media
+/// graph at all — on RP2040 this module drives LED strips, bit-banged buses and
+/// similar, which are orders of magnitude slower.
+const TINY_ARENA: bool = abi::config::kernel::STATE_ARENA_SIZE <= 64 * 1024;
+
+/// TX stream buffer size in u32 words. Two per slot (front and back), so at
+/// 2048 words this pair is 16 KiB of every stream slot; 512 words on a 64 KiB
+/// arena.
+const STREAM_BUF_WORDS: usize = if TINY_ARENA { 512 } else { 2048 };
+/// CMD scratch buffer size in u32 words (512 words = 2 KiB; 128 = 512 B on a
+/// 64 KiB arena).
+const CMD_SCRATCH_WORDS: usize = if TINY_ARENA { 128 } else { 512 };
+/// RX stream buffer size in u32 words, also two per slot (512 words = 2 KiB
+/// each; 128 on a 64 KiB arena).
+const RX_BUF_WORDS: usize = if TINY_ARENA { 128 } else { 512 };
 
 // Slot states
 const SLOT_FREE: u8 = 0;

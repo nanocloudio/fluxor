@@ -57,6 +57,14 @@ struct TempState {
     adc_handle: i32,
     timer_fd: i32,
     interval_ms: u32,
+    /// Which sensor this is, stamped on every reading. A graph may place several
+    /// of these against different ADC channels, and a consumer folding them into
+    /// keyed lanes needs to tell them apart without inferring it from the edge.
+    sensor_id: u16,
+    /// Monotonic per-sensor sequence. A consumer detects a gap — a reading the
+    /// ring dropped — by the step, which a timestamp cannot distinguish from a
+    /// sensor that simply read late.
+    seq: u32,
     reading: bool,
     initialized: bool,
 }
@@ -75,6 +83,8 @@ mod params_def {
 
         1, interval_ms, u32, 5000
             => |s, d, len| { s.interval_ms = p_u32(d, len, 0, 5000); };
+        2, sensor_id, u32, 0
+            => |s, d, len| { s.sensor_id = p_u32(d, len, 0, 0) as u16; };
     }
 }
 
@@ -101,6 +111,10 @@ fn raw_to_milli_celsius(raw: u16) -> i32 {
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<TempState>() as u32
 }
+
+// Same figure as data, so `pack` records it and a sensor graph's arena demand is
+// summable at compose time.
+declare_module_state_bytes!(TempState);
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -133,6 +147,8 @@ pub extern "C" fn module_new(
         s.timer_fd = -1;
         s.reading = false;
         s.initialized = false;
+        s.sensor_id = 0;
+        s.seq = 0;
 
         // Parse params
         let is_tlv =
@@ -211,11 +227,35 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Got raw ADC value — convert to millidegrees Celsius
         let temp_mc = raw_to_milli_celsius(result as u16);
 
-        // Write 4 bytes (i32 LE) to output channel
+        // Emit one `SensorSample`: a TYPED measurement rather than anonymous
+        // bytes a consumer has to be told the meaning of.
+        //
+        // What the quantity IS travels as the `quantity = temperature`
+        // capability fact, which the composer checks when it binds this port;
+        // what the reading is scaled BY travels in the record, so millidegrees
+        // is `value` in units of `10^-3`. Between them a consumer needs no
+        // out-of-band knowledge of this driver, which is the coupling the graph
+        // model exists to remove.
         let poll = (sys.channel_poll)(s.out_chan, POLL_OUT);
         if poll > 0 && ((poll as u32) & POLL_OUT) != 0 {
-            let bytes = temp_mc.to_le_bytes();
-            (sys.channel_write)(s.out_chan, bytes.as_ptr(), 4);
+            let mut rec = [0u8; abi::contracts::sensor::SAMPLE_SIZE];
+            // Monotonic device time: the reading's own time, which is what an
+            // event-time window folds on. Not the delivery time.
+            let t_micros = dev_micros(sys);
+            if abi::contracts::sensor::encode(
+                &mut rec,
+                s.sensor_id,
+                0,
+                -3,
+                s.seq,
+                t_micros,
+                temp_mc as i64,
+            )
+            .is_some()
+            {
+                (sys.channel_write)(s.out_chan, rec.as_ptr(), rec.len());
+                s.seq = s.seq.wrapping_add(1);
+            }
         }
 
         // Re-arm timer for next read

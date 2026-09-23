@@ -1112,7 +1112,7 @@ fn build_packaged_blobs(
         project_root,
     )?;
 
-    check_state_budget(&modules, &target_desc)?;
+    check_state_budget(&modules, target_desc)?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {

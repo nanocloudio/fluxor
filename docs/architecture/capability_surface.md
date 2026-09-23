@@ -166,6 +166,10 @@ Source: `contracts/src/lib.rs`.
 | 32 | `PresentationLayout` | Resolved presentation-layout records (`tools/src/presentation_resolver.rs`) |
 | 33 | `HttpRequest` | HTTP fan-out request half: `{conn_id u16, stream_id u16, method u8, flags u8, path_len u16, hdr_len u16, body_len u16}` + bytes |
 | 34 | `HttpResponse` | HTTP fan-out response half, matched to its request by `(conn_id, stream_id)` |
+| 35 | `NamespaceChange` | Control-plane store change surface, one record per key mutation: `{revision u64, kind u8, key_len u16, val_len u32}` + key and value bytes, inside a mesh Event envelope |
+| 36 | `GpuCommand` | Generic GPU work — the request stream of `modules/sdk/wire/gpu_wire.rs` (query, resource, program, transfer, submission, fence, control, surface) |
+| 37 | `GpuOutcome` | Generic GPU outcomes — the reply half: acceptance, handles, capabilities, readback bytes, surface leases, and exactly one terminal outcome per accepted request |
+| 38 | `SensorSample` | A measured physical quantity, one fixed 24-byte reading per record (`modules/sdk/contracts/sensor.rs`). The quantity and its unit are capability facts on the producing port, not bytes in the record |
 
 Codec identity is deliberately not part of this table. Encoded surfaces are
 generic (`AudioEncoded` / `VideoEncoded`): a content type names a
@@ -308,6 +312,7 @@ Replication and streaming:
 | `stream.subscribe` | Substitutable subscribe surface: records delivered to a stage, with the delivery guarantee and replay support declared as facts |
 | `request.http` | Substitutable HTTP request surface |
 | `request.record` | Substitutable record-query surface (a table, a key-value store) |
+| `sensor.sample` | Produces `SensorSample` records. What a consumer requires to bind a thermometer, a light sensor, a replay module or a simulator alike; the quantity, cadence and payload ceiling are facts the composer checks against what the consumer asked for |
 
 The last four are application-EFFECT surfaces: what a graph binds when a
 stage publishes, subscribes, or calls out, as opposed to the transport it
