@@ -14,6 +14,79 @@ value is the aarch64/host profile's where a constant is per-profile.
 The register and the source are kept in lockstep: editing a constant
 means editing its row here in the same change.
 
+## Profiles
+
+The deployment classes a per-profile ceiling can belong to. Each label names the
+`cfg` predicate that selects it, and the gate derives every declaration's profile
+by mapping the predicates that actually guard it — composing an enclosing
+`mod profile_*`'s with the declaration's own — through this table.
+
+Declared here rather than built into the gate because these are the project's own
+deployment classes; a gate that invented the names would be asserting a
+vocabulary nobody agreed to. A predicate with no label FAILS, so a new silicon or
+feature split cannot arrive with its limits undescribed.
+
+A row's profile field joins labels with `+` (`embedded+rp2040`), and `*` means the
+declaration is unconditional.
+
+```limit-register-profiles
+host         | target_arch = "aarch64"
+wasm         | target_arch = "wasm32"
+embedded     | not(any(target_arch = "aarch64", target_arch = "wasm32"))
+hosted       | any(target_os = "linux", target_arch = "wasm32")
+bare         | not(any(target_os = "linux", target_arch = "wasm32"))
+rp2040       | fluxor_silicon = "rp2040"
+rp2350       | not(fluxor_silicon = "rp2040")
+multitenant  | feature = "multitenant"
+single-owner | not(feature = "multitenant")
+chip-rp2040  | feature = "chip-rp2040"
+rp           | feature = "rp"
+non-rp       | not(feature = "rp")
+rp-small     | any(feature = "chip-rp2040", feature = "chip-rp2350b")
+kernel-vm    | feature = "kernel-vm"
+no-kernel-vm | not(feature = "kernel-vm")
+rp2350-chip  | all(feature = "rp", not(feature = "chip-rp2040"))
+rsa-vault    | feature = "rsa-vault"
+off-host     | not(target_arch = "aarch64")
+rp-large     | all(not(target_arch = "aarch64"),not(feature = "chip-rp2040"),not(feature = "chip-rp2350b"),)
+```
+
+## Constraints
+
+Values are only half of a resource envelope. `MAX_SESSIONS` being 512 and
+`MAX_TCP_CONNS` being 65536 are both true, both checked above, and neither says
+that the first must not exceed the second — so a tuning pass that lowered the
+connection table below the session table would break an invariant no row covers.
+
+These relations are exactly what gets missed when sizes are retuned per silicon,
+because a retune moves many numbers at once and the constraint between two of
+them is nobody's edit. Recording them here makes the couplings a list a reviewer
+can read, and the gate checks each one is still ENFORCED — not merely still
+described.
+
+Two forms:
+
+- `relation | <source path>` — the relation must be the CONDITION of an
+  `assert!` in that file. Not its message: a coupling stated in an assert's
+  failure text reads convincingly while enforcing nothing.
+- `relation | derived` — for a relation no single compilation can see, where both
+  sides are register rows named `NAME@path`. Two PIC modules on one channel
+  cannot assert about each other's constants, so the check is that both sides
+  have the same recorded right-hand side. Identical derivation is stronger than
+  the inequality it stands in for.
+
+```limit-constraints
+tls::MAX_SESSIONS <= ip::MAX_TCP_CONNS | modules/sdk/abi/config.rs
+http::MAX_CONCURRENT_CONNS <= ip::MAX_TCP_CONNS | modules/sdk/abi/config.rs
+ip::MAX_DG_ENDPOINTS <= ip::MAX_TCP_CONNS | modules/sdk/abi/config.rs
+ip::MAX_TCP_CONNS <= 65536 | modules/sdk/abi/config.rs
+ip::MAX_LOCAL_ADDRS <= 4096 | modules/sdk/abi/config.rs
+http::ARENA_WORKING_SET_CONNS <= http::MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs
+tcp::MSS as usize + 14 + 20 + 20 <= MAX_FRAME_SIZE | modules/foundation/ip/mod.rs
+MAX_PACKET_HOLD <= (1usize << abi::contracts::net::packet::PKT_SLOT_BITS) | modules/foundation/ip/mod.rs
+CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
+```
+
 ## Identifier widths
 
 | Id | Width | Ceiling | Symbol | Source | Value | Binds instead / notes |
@@ -216,219 +289,236 @@ covers — which is what makes "an id-shaped ceiling found in source but absent
 here is a bug" a measured number rather than a sentence.
 
 ```limit-register
-LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 65536
-LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 16384
-LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 4096
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 256
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 8
-MAX_TCP_CONNS | modules/sdk/abi/config.rs | 2
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 256
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 8
-MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 2
-MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 4096
-MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8
-MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 32
-MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 8
-MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 4
-MAX_DNS_CACHE | modules/sdk/abi/config.rs | 32
-MAX_DNS_CACHE | modules/sdk/abi/config.rs | 4
-MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8
-MAX_DNS_PENDING | modules/sdk/abi/config.rs | 4
-MAX_CONTRACTS | src/kernel/module/provider.rs | 64
-CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 29
-MAX_MODULES | modules/sdk/abi/config.rs | 192
-MAX_MODULES | modules/sdk/abi/config.rs | 48
-MAX_MODULES | modules/sdk/abi/config.rs | 32
-MAX_BRIDGES | modules/sdk/abi/config.rs | 16
-MAX_BRIDGES | modules/sdk/abi/config.rs | 8
-MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | 256
-MAX_OWNERS | src/kernel/workload/owner.rs | 64
-MAX_OWNERS | src/kernel/workload/owner.rs | 1
-MAX_PATH | modules/sdk/abi/config.rs | 200
-MAX_PATH | modules/sdk/abi/config.rs | 32
-PAYLOAD_MAX | modules/sdk/contracts/exchange.rs | 8192
-KEY_MAX | modules/sdk/contracts/exchange.rs | 512
-PUBLISH_FRAME_MAX | modules/sdk/contracts/exchange.rs | PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX
-REPLY_FRAME_MAX | modules/sdk/contracts/exchange.rs | REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX
-CAPACITY | src/kernel/sys/telemetry_ring.rs | 4096
-CAPACITY | src/kernel/sys/telemetry_ring.rs | 8192
-CAPACITY | src/kernel/sys/telemetry_ring.rs | 32768
-RING_CONSUMERS | modules/sdk/contracts/telemetry.rs | 4
-TELEMETRY_MAX_RECORD | src/kernel/exec/scheduler/module_types.rs | 144
-DIM_MAX_PRODUCT | modules/sdk/contracts/telemetry.rs | 65534
-MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 1024 * 1024
-MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 384 * 1024
-MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024
-MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 256 * 1024
-MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 32 * 1024
-STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024
-STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024 * 1024
-STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 96 * 1024 * 1024
-STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024
-STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024
-MAX_CHAN_BYTES | src/kernel/ipc/channel.rs | 4 * 1024 * 1024
-MAX_CONNS | modules/sdk/abi/config.rs | 64
-MAX_CONNS | modules/sdk/abi/config.rs | 8
-MAX_CONNS | modules/sdk/abi/config.rs | 2
-MAX_SESSIONS | modules/sdk/abi/config.rs | 512
-MAX_SESSIONS | modules/sdk/abi/config.rs | 64
-MAX_SESSIONS | modules/sdk/abi/config.rs | 1
-MAX_STREAMS | modules/sdk/abi/config.rs | 4
-MAX_ROUTES | modules/sdk/abi/config.rs | 8
-MAX_ROUTES | modules/sdk/abi/config.rs | 4
-MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 3
-MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 4
-MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 8
-MAX_SLOTS | src/kernel/security/key_vault.rs | 8
-RSA_ENTRIES | src/kernel/security/key_vault.rs | 2
-RSA_MODULUS_BITS_MAX | modules/sdk/crypto/rsa.rs | 4096
-RSA_EXPONENT_BITS_MAX | modules/sdk/crypto/rsa.rs | 32
-MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 256
-MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8
-DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32
-LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64
-FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32
-MAX_FENCES | modules/foundation/fat32/mod.rs | MAX_OPEN_FILES
-DNS_NAME_CAP | modules/foundation/ip/mod.rs | 64
-MAX_AUTHORITY_LEN | modules/foundation/ota_registry/mod.rs | 128
-MAX_CERT_LEN | modules/foundation/tls/mod.rs | 2048
-MAX_CERT_CHAIN_BYTES | modules/foundation/tls/mod.rs | 3072
-MAX_KEY_LEN | modules/foundation/tls/mod.rs | 2400
-MAX_EXPECTED_DNS | modules/foundation/tls/mod.rs | 64
-MAX_EXPECTED_URI | modules/foundation/tls/mod.rs | 256
-DTLS_AUTHORITY_MAX | modules/foundation/tls/mod.rs | 64
-MAX_PEERS | modules/foundation/tls/mod.rs | 4
-MAX_PEERS | modules/foundation/tls/mod.rs | 1
-DGRAM_MAX | modules/foundation/tls/mod.rs | 1500
-MAX_FLIGHT_RECORDS | modules/foundation/tls/mod.rs | 8
-MAX_COMPAT_CCS | modules/foundation/tls/mod.rs | 2
-RECV_BUF_SIZE | modules/foundation/tls/mod.rs | 16704
-RECV_BUF_SIZE | modules/foundation/tls/mod.rs | 4096
-RETX_BUF_SIZE | modules/foundation/tls/mod.rs | 4096
-TLS_INBOUND_DRAIN_BUDGET | modules/foundation/tls/mod.rs | 8
-MAX_AUTHORITY | modules/foundation/quic/mod.rs | MAX_PEER_NAME + 6
-MAX_PEER_NAME | modules/foundation/quic/mod.rs | 64
-MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024
-MAX_ALPN_CFG | modules/foundation/quic/mod.rs | 64
-MAX_TICKETS | modules/foundation/quic/mod.rs | 4
-MAX_PENDING | modules/foundation/dns/mod.rs | 8
-UPSTREAM_AUTHORITY_MAX | modules/foundation/dns/mod.rs | 64
-UPSTREAM_PATH_MAX | modules/foundation/dns/mod.rs | 64
-DNSSEC_SIGNED_MAX | modules/foundation/dns/mod.rs | 4096
-MAX_ANCHORS | modules/foundation/dns/mod.rs | 4
-MAX_ANCHOR_RDATA | modules/foundation/dns/mod.rs | 1028
-MAX_HOSTS | modules/foundation/dns/mod.rs | 16
-MAX_NAME_LEN | modules/sdk/contracts/net/dns_wire.rs | 255
-MAX_NAME_PTR_HOPS | modules/sdk/contracts/net/dns_wire.rs | 16
-MAX_SECTION_RRS | modules/sdk/contracts/net/dns_wire.rs | 32
-MAX_CNAME_HOPS | modules/foundation/dns/mod.rs | 4
-MAX_CHAIN_BYTES | modules/foundation/dns/mod.rs | 384
-MAX_SYNTH_ADDRS | modules/foundation/dns/mod.rs | 8
-MAX_DNS64_EXCLUDES | modules/foundation/dns/mod.rs | 16
-DNS64_TTL_CAP_S | modules/foundation/dns/mod.rs | 600
-MAX_ZONE_RRS | modules/foundation/dns/mod.rs | 64
-MAX_ZONE_RRS | modules/foundation/dns/mod.rs | 16
-MAX_UPDATE_RRS | modules/foundation/dns/mod.rs | 32
-MAX_ZONE_NAME | modules/foundation/dns/mod.rs | 128
-MAX_ZONE_RDATA | modules/foundation/dns/mod.rs | 128
-MAX_UPDATE_KEYS | modules/foundation/dns/mod.rs | 4
-MAX_TSIG_FUDGE_S | modules/foundation/dns/mod.rs | 300
-MAX_TXN_CACHE | modules/foundation/dns/mod.rs | 4
-TXN_RETAIN_MS | modules/foundation/dns/mod.rs | 30000
-MAX_COMMIT_WRITES | modules/foundation/dns/mod.rs | 64
-MAX_OPEN | modules/foundation/mount/mod.rs | 64
-MAX_LAYERS | modules/foundation/ota_registry/mod.rs | 48
-MAX_DMA_MAPS | modules/foundation/smmu/mod.rs | 32
-MAX_SHADOW_SLOTS | modules/foundation/quic/continuity.rs | 2
-CHECKPOINT_RECORD_MAX | modules/foundation/quic/continuity.rs | 16384
-ARP_WAIT_MAX | modules/foundation/ip/mod.rs | 64
-RX_DESC_COUNT | modules/drivers/rp1_gem/mod.rs | 192
-FAN_FRAMES_PER_STEP | src/kernel/exec/scheduler/module_types.rs | 64
-ALLOC_SCAN_SLICE | modules/foundation/ip/mod.rs | 256
-SWEEP_SLICE_MAX | modules/foundation/ip/mod.rs | 1024
-MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 8
-MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 2
-MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 1
-FENCE_WIRE_WAIT_MS | modules/foundation/ip/mod.rs | 500
-NET_OUT_FRAME_MAX | modules/foundation/ip/mod.rs | 9
-MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 2
-MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 1
-MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 0
-TLS_CKPT_RECORD_MAX | modules/foundation/tls/continuity.rs | CKPT_FIXED_LEN + RECV_BUF_SIZE + RETX_BUF_SIZE + TLS_SEALED_LEN
-TX_HOLD_SIZE | modules/foundation/tls/continuity.rs | TX_HOLD_RECORDS * WIRE_RECORD_MAX
-LOCAL_PN_BLOCK | modules/foundation/quic/connection.rs | 4096
-STEP_BUDGET_DEFAULT_TICK_US | tools/src/target_facts.rs | 1000
-MAX_FRAME_SIZE | modules/foundation/ip/mod.rs | 1536
-MAX_LISTENERS | modules/foundation/ip/mod.rs | -
-NET_OUT_QUEUE_SLOTS | modules/foundation/ip/mod.rs | 32
-MAX_ALLOW_TYPES | modules/foundation/dns/mod.rs | 8
-MAX_FILES | modules/foundation/fat32/mod.rs | 128
-UNLINK_FREE_SLOTS | modules/foundation/fat32/mod.rs | 8
-MAX_DIR_CLUSTERS | modules/foundation/fat32/mod.rs | 65_536
-MAX_MOUNTS | modules/foundation/mount/mod.rs | 8
-MAX_UNI_STREAMS | modules/foundation/quic/connection.rs | 6
-MAX_BIDI_STREAMS | modules/foundation/quic/connection.rs | 3
-QUIC_DGRAM_MAX | modules/foundation/quic/connection.rs | 1500
-QUIC_MAX_DATAGRAM_SIZE | modules/foundation/quic/connection.rs | 1200
-MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8
-CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64
-CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16
-CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8
-BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 * 1024
-BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024
-BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024
-ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 16 * 1024 * 1024
-ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 2 * 1024 * 1024
-ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 0
-CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024
-CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 32 * 1024
-CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024
-CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024
-MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 256 * 1024
-MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 16 * 1024
-MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 4 * 1024
-MAX_MODULE_SECTION | src/kernel/boot/config.rs | 256 * 1024
-MAX_MODULE_SECTION | src/kernel/boot/config.rs | 32 * 1024
-MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256
-MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 4
-MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 1
-RECV_BUF_SIZE | modules/sdk/abi/config.rs | 8192
-RECV_BUF_SIZE | modules/sdk/abi/config.rs | 4096
-RECV_BUF_SIZE | modules/sdk/abi/config.rs | 2048
-SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100
-MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 64
-MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 8
-MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 8
-MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 4
-MAX_FS_PATH | modules/sdk/abi/config.rs | 256
-MAX_FS_PATH | modules/sdk/abi/config.rs | 64
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 256 * 1024
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 32 * 1024
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 16 * 1024
-DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 4 * 1024
-FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 32768
-FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 2048
-FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 8192
-MAX_GRAPH_EDGES | src/kernel/boot/config.rs | 128
-MAX_CHANNELS | src/kernel/ipc/channel.rs | MAX_GRAPH_EDGES
-MAX_SPI_BUSES | src/kernel/boot/config.rs | 2
-MAX_I2C_BUSES | src/kernel/boot/config.rs | 2
-MAX_UART_BUSES | src/kernel/boot/config.rs | 2
-MAX_PIO_CONFIGS | src/kernel/boot/config.rs | 3
-MAX_GPIO_CONFIGS | src/kernel/boot/config.rs | 8
-MAX_WORKLOAD_SECTION_BYTES | src/kernel/boot/config.rs | 8 * 1024
-TICK_BOUND_MAX | src/kernel/boot/config.rs | 50_000
-MAX_FREE_REGIONS | src/kernel/module/loader.rs | 32
-ISO_ARENA_SIZE | src/kernel/module/loader.rs | 2 * 1024 * 1024
-MAX_TRACKED | src/kernel/module/provider.rs | 128
-MAX_PROVIDERS | src/kernel/module/provider.rs | MAX_CONTRACTS
-MAX_DYN_TAG_ROUTES | src/kernel/module/provider.rs | 4
-MAX_KEY_BYTES | src/kernel/security/key_vault.rs | 64
-MAX_LABEL | src/kernel/security/key_vault.rs | 64
-MAX_PERSISTED | src/kernel/security/key_vault.rs | 8
-MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048
-PARAM_TAG_MAX | tools/src/manifest.rs | 0xEF
+LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 65536 | host
+LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 16384 | wasm
+LOG_RING_CAPACITY | modules/sdk/abi/config.rs | 4096 | embedded
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 65536 | host
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 256 | wasm
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 8 | embedded+rp2350
+MAX_TCP_CONNS | modules/sdk/abi/config.rs | 2 | embedded+rp2040
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 256 | host
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 256 | wasm
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 8 | embedded+rp2350
+MAX_DG_ENDPOINTS | modules/sdk/abi/config.rs | 2 | embedded+rp2040
+MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 4096 | host
+MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8 | wasm
+MAX_LOCAL_ADDRS | modules/sdk/abi/config.rs | 8 | embedded
+MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 32 | host
+MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 8 | wasm
+MAX_PACKET_HOLD | modules/sdk/abi/config.rs | 4 | embedded
+MAX_DNS_CACHE | modules/sdk/abi/config.rs | 32 | host
+MAX_DNS_CACHE | modules/sdk/abi/config.rs | 32 | wasm
+MAX_DNS_CACHE | modules/sdk/abi/config.rs | 4 | embedded
+MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8 | host
+MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8 | wasm
+MAX_DNS_PENDING | modules/sdk/abi/config.rs | 4 | embedded
+MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
+CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 29 | *
+MAX_MODULES | modules/sdk/abi/config.rs | 192 | host
+MAX_MODULES | modules/sdk/abi/config.rs | 48 | wasm
+MAX_MODULES | modules/sdk/abi/config.rs | 32 | embedded
+MAX_BRIDGES | modules/sdk/abi/config.rs | 16 | host
+MAX_BRIDGES | modules/sdk/abi/config.rs | 16 | wasm
+MAX_BRIDGES | modules/sdk/abi/config.rs | 8 | embedded
+MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | 256 | *
+MAX_OWNERS | src/kernel/workload/owner.rs | 64 | multitenant
+MAX_OWNERS | src/kernel/workload/owner.rs | 1 | single-owner
+MAX_PATH | modules/sdk/abi/config.rs | 200 | host
+MAX_PATH | modules/sdk/abi/config.rs | 32 | wasm
+MAX_PATH | modules/sdk/abi/config.rs | 32 | embedded
+PAYLOAD_MAX | modules/sdk/contracts/exchange.rs | 8192 | *
+KEY_MAX | modules/sdk/contracts/exchange.rs | 512 | *
+PUBLISH_FRAME_MAX | modules/sdk/contracts/exchange.rs | PUBLISH_OVERHEAD + KEY_MAX + PAYLOAD_MAX | *
+REPLY_FRAME_MAX | modules/sdk/contracts/exchange.rs | REPLY_OVERHEAD + KEY_MAX + PAYLOAD_MAX | *
+CAPACITY | src/kernel/sys/telemetry_ring.rs | 4096 | chip-rp2040
+CAPACITY | src/kernel/sys/telemetry_ring.rs | 8192 | rp2350-chip
+CAPACITY | src/kernel/sys/telemetry_ring.rs | 32768 | non-rp
+RING_CONSUMERS | modules/sdk/contracts/telemetry.rs | 4 | *
+TELEMETRY_MAX_RECORD | src/kernel/exec/scheduler/module_types.rs | 144 | *
+DIM_MAX_PRODUCT | modules/sdk/contracts/telemetry.rs | 65534 | *
+MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 1024 * 1024 | host
+MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 1024 * 1024 | wasm
+MAX_MODULE_CODE_SIZE | modules/sdk/abi/config.rs | 384 * 1024 | embedded
+MAX_MODULES_BLOB_SIZE | src/kernel/module/loader.rs | 8 * 1024 * 1024 | *
+MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 256 * 1024 | hosted
+MAX_CONFIG_SIZE | src/kernel/boot/config.rs | 32 * 1024 | bare
+STAGE_CAPACITY | src/kernel/module/ota_stage.rs | 8 * 1024 * 1024 | *
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024 * 1024 | host
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 96 * 1024 * 1024 | wasm
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024 | embedded+rp2350
+STATE_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024 | embedded+rp2040
+MAX_CHAN_BYTES | src/kernel/ipc/channel.rs | 4 * 1024 * 1024 | *
+MAX_CONNS | modules/sdk/abi/config.rs | 64 | host
+MAX_CONNS | modules/sdk/abi/config.rs | 8 | wasm
+MAX_CONNS | modules/sdk/abi/config.rs | 2 | embedded
+MAX_SESSIONS | modules/sdk/abi/config.rs | 512 | host
+MAX_SESSIONS | modules/sdk/abi/config.rs | 64 | wasm
+MAX_SESSIONS | modules/sdk/abi/config.rs | 1 | embedded
+MAX_STREAMS | modules/sdk/abi/config.rs | 4 | host
+MAX_STREAMS | modules/sdk/abi/config.rs | 4 | wasm
+MAX_STREAMS | modules/sdk/abi/config.rs | 4 | embedded
+MAX_ROUTES | modules/sdk/abi/config.rs | 8 | host
+MAX_ROUTES | modules/sdk/abi/config.rs | 4 | wasm
+MAX_ROUTES | modules/sdk/abi/config.rs | 4 | embedded
+MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 3 | chip-rp2040
+MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 4 | rp2350-chip
+MAX_CHAIN_DEPTH | src/kernel/module/provider.rs | 8 | non-rp
+MAX_SLOTS | src/kernel/security/key_vault.rs | 8 | *
+RSA_ENTRIES | src/kernel/security/key_vault.rs | 2 | rsa-vault
+RSA_MODULUS_BITS_MAX | modules/sdk/crypto/rsa.rs | 4096 | *
+RSA_EXPONENT_BITS_MAX | modules/sdk/crypto/rsa.rs | 32 | *
+MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 256 | host
+MAX_OPEN_FILES | modules/foundation/fat32/mod.rs | 8 | off-host
+DIR_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
+LFN_MAX_CHARS | modules/foundation/fat32/mod.rs | 64 | *
+FAT_SCAN_BUDGET_SECTORS | modules/foundation/fat32/mod.rs | 32 | *
+MAX_FENCES | modules/foundation/fat32/mod.rs | MAX_OPEN_FILES | *
+DNS_NAME_CAP | modules/foundation/ip/mod.rs | 64 | *
+MAX_AUTHORITY_LEN | modules/foundation/ota_registry/mod.rs | 128 | *
+MAX_CERT_LEN | modules/foundation/tls/mod.rs | 2048 | *
+MAX_CERT_CHAIN_BYTES | modules/foundation/tls/mod.rs | 3072 | *
+MAX_KEY_LEN | modules/foundation/tls/mod.rs | 2400 | *
+MAX_EXPECTED_DNS | modules/foundation/tls/mod.rs | 64 | *
+MAX_EXPECTED_URI | modules/foundation/tls/mod.rs | 256 | *
+DTLS_AUTHORITY_MAX | modules/foundation/tls/mod.rs | 64 | *
+MAX_PEERS | modules/foundation/tls/mod.rs | 4 | host
+MAX_PEERS | modules/foundation/tls/mod.rs | 1 | off-host
+DGRAM_MAX | modules/foundation/tls/mod.rs | 1500 | *
+MAX_FLIGHT_RECORDS | modules/foundation/tls/mod.rs | 8 | *
+MAX_COMPAT_CCS | modules/foundation/tls/mod.rs | 2 | *
+RECV_BUF_SIZE | modules/foundation/tls/mod.rs | 16704 | host
+RECV_BUF_SIZE | modules/foundation/tls/mod.rs | 4096 | off-host
+RETX_BUF_SIZE | modules/foundation/tls/mod.rs | 4096 | *
+TLS_INBOUND_DRAIN_BUDGET | modules/foundation/tls/mod.rs | 8 | *
+MAX_AUTHORITY | modules/foundation/quic/mod.rs | MAX_PEER_NAME + 6 | *
+MAX_PEER_NAME | modules/foundation/quic/mod.rs | 64 | *
+MAX_CERT_LEN | modules/foundation/quic/mod.rs | 1024 | *
+MAX_ALPN_CFG | modules/foundation/quic/mod.rs | 64 | *
+MAX_TICKETS | modules/foundation/quic/mod.rs | 4 | *
+MAX_PENDING | modules/foundation/dns/mod.rs | 8 | *
+UPSTREAM_AUTHORITY_MAX | modules/foundation/dns/mod.rs | 64 | *
+UPSTREAM_PATH_MAX | modules/foundation/dns/mod.rs | 64 | *
+DNSSEC_SIGNED_MAX | modules/foundation/dns/mod.rs | 4096 | *
+MAX_ANCHORS | modules/foundation/dns/mod.rs | 4 | *
+MAX_ANCHOR_RDATA | modules/foundation/dns/mod.rs | 1028 | *
+MAX_HOSTS | modules/foundation/dns/mod.rs | 16 | *
+MAX_NAME_LEN | modules/sdk/contracts/net/dns_wire.rs | 255 | *
+MAX_NAME_PTR_HOPS | modules/sdk/contracts/net/dns_wire.rs | 16 | *
+MAX_SECTION_RRS | modules/sdk/contracts/net/dns_wire.rs | 32 | *
+MAX_CNAME_HOPS | modules/foundation/dns/mod.rs | 4 | *
+MAX_CHAIN_BYTES | modules/foundation/dns/mod.rs | 384 | *
+MAX_SYNTH_ADDRS | modules/foundation/dns/mod.rs | 8 | *
+MAX_DNS64_EXCLUDES | modules/foundation/dns/mod.rs | 16 | *
+DNS64_TTL_CAP_S | modules/foundation/dns/mod.rs | 600 | *
+MAX_ZONE_RRS | modules/foundation/dns/mod.rs | 64 | host
+MAX_ZONE_RRS | modules/foundation/dns/mod.rs | 16 | off-host
+MAX_UPDATE_RRS | modules/foundation/dns/mod.rs | 32 | *
+MAX_ZONE_NAME | modules/foundation/dns/mod.rs | 128 | *
+MAX_ZONE_RDATA | modules/foundation/dns/mod.rs | 128 | *
+MAX_UPDATE_KEYS | modules/foundation/dns/mod.rs | 4 | *
+MAX_TSIG_FUDGE_S | modules/foundation/dns/mod.rs | 300 | *
+MAX_TXN_CACHE | modules/foundation/dns/mod.rs | 4 | *
+TXN_RETAIN_MS | modules/foundation/dns/mod.rs | 30000 | *
+MAX_COMMIT_WRITES | modules/foundation/dns/mod.rs | 64 | *
+MAX_OPEN | modules/foundation/mount/mod.rs | 64 | *
+MAX_LAYERS | modules/foundation/ota_registry/mod.rs | 48 | *
+MAX_DMA_MAPS | modules/foundation/smmu/mod.rs | 32 | *
+MAX_SHADOW_SLOTS | modules/foundation/quic/continuity.rs | 2 | *
+CHECKPOINT_RECORD_MAX | modules/foundation/quic/continuity.rs | 16384 | *
+ARP_WAIT_MAX | modules/foundation/ip/mod.rs | 64 | *
+RX_DESC_COUNT | modules/drivers/rp1_gem/mod.rs | 192 | *
+FAN_FRAMES_PER_STEP | src/kernel/exec/scheduler/module_types.rs | 64 | *
+ALLOC_SCAN_SLICE | modules/foundation/ip/mod.rs | 256 | *
+SWEEP_SLICE_MAX | modules/foundation/ip/mod.rs | 1024 | *
+MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 8 | host
+MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 2 | wasm
+MAX_TCP_SHADOWS | modules/sdk/abi/config.rs | 1 | embedded
+FENCE_WIRE_WAIT_MS | modules/foundation/ip/mod.rs | 500 | *
+NET_OUT_FRAME_MAX | modules/foundation/ip/mod.rs | 9 | *
+MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 2 | host
+MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 1 | wasm
+MAX_TLS_SHADOWS | modules/foundation/tls/continuity.rs | 0 | embedded
+TLS_CKPT_RECORD_MAX | modules/foundation/tls/continuity.rs | CKPT_FIXED_LEN + RECV_BUF_SIZE + RETX_BUF_SIZE + TLS_SEALED_LEN | *
+TX_HOLD_SIZE | modules/foundation/tls/continuity.rs | TX_HOLD_RECORDS * WIRE_RECORD_MAX | *
+LOCAL_PN_BLOCK | modules/foundation/quic/connection.rs | 4096 | *
+STEP_BUDGET_DEFAULT_TICK_US | tools/src/target_facts.rs | 1000 | *
+MAX_FRAME_SIZE | modules/foundation/ip/mod.rs | 1536 | *
+MAX_LISTENERS | modules/foundation/ip/mod.rs | if tcp::MAX_TCP_CONNS < 1024 { tcp::MAX_TCP_CONNS } else { 1024 } | *
+NET_OUT_QUEUE_SLOTS | modules/foundation/ip/mod.rs | 32 | *
+MAX_ALLOW_TYPES | modules/foundation/dns/mod.rs | 8 | *
+MAX_FILES | modules/foundation/fat32/mod.rs | 128 | *
+UNLINK_FREE_SLOTS | modules/foundation/fat32/mod.rs | 8 | *
+MAX_DIR_CLUSTERS | modules/foundation/fat32/mod.rs | 65_536 | *
+MAX_MOUNTS | modules/foundation/mount/mod.rs | 8 | *
+MAX_UNI_STREAMS | modules/foundation/quic/connection.rs | 6 | *
+MAX_BIDI_STREAMS | modules/foundation/quic/connection.rs | 3 | *
+QUIC_DGRAM_MAX | modules/foundation/quic/connection.rs | 1500 | *
+QUIC_MAX_DATAGRAM_SIZE | modules/foundation/quic/connection.rs | 1200 | *
+MAX_STREAM_IDS | modules/foundation/smmu/mod.rs | 8 | *
+CKPT_SNI_MAX | modules/foundation/tls/continuity.rs | 64 | *
+CKPT_ALPN_MAX | modules/foundation/tls/continuity.rs | 16 | *
+CONT_DRAIN_BUDGET | modules/foundation/tls/continuity.rs | 8 | *
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 * 1024 | host
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 * 1024 | wasm
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 64 * 1024 | embedded+rp2350
+BUFFER_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | embedded+rp2040
+ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 16 * 1024 * 1024 | host
+ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 2 * 1024 * 1024 | wasm
+ELASTIC_REGION_SIZE | modules/sdk/abi/config.rs | 0 | embedded
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 256 * 1024 | host
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 32 * 1024 | wasm
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | embedded+rp2350
+CONFIG_ARENA_SIZE | modules/sdk/abi/config.rs | 8 * 1024 | embedded+rp2040
+MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 256 * 1024 | host
+MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | wasm
+MAX_MODULE_CONFIG_SIZE | modules/sdk/abi/config.rs | 4 * 1024 | embedded
+MAX_MODULE_SECTION | src/kernel/boot/config.rs | 256 * 1024 | hosted
+MAX_MODULE_SECTION | src/kernel/boot/config.rs | 32 * 1024 | bare
+MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | host
+MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 256 | wasm
+MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 4 | embedded+rp2350
+MAX_CONCURRENT_CONNS | modules/sdk/abi/config.rs | 1 | embedded+rp2040
+RECV_BUF_SIZE | modules/sdk/abi/config.rs | 8192 | host
+RECV_BUF_SIZE | modules/sdk/abi/config.rs | 4096 | wasm
+RECV_BUF_SIZE | modules/sdk/abi/config.rs | 2048 | embedded
+SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100 | host
+SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100 | wasm
+SEND_BUF_SIZE | modules/sdk/abi/config.rs | 4100 | embedded
+MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 64 | host
+MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 8 | wasm
+MAX_DYN_ROUTES | modules/sdk/abi/config.rs | 8 | embedded
+MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 8 | host
+MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 4 | wasm
+MAX_ROUTE_BACKENDS | modules/sdk/abi/config.rs | 4 | embedded
+MAX_FS_PATH | modules/sdk/abi/config.rs | 256 | host
+MAX_FS_PATH | modules/sdk/abi/config.rs | 64 | wasm
+MAX_FS_PATH | modules/sdk/abi/config.rs | 64 | embedded
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 256 * 1024 | host
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 32 * 1024 | wasm
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 16 * 1024 | embedded+rp2350
+DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 4 * 1024 | embedded+rp2040
+FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 32768 | host
+FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 2048 | rp-small
+FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 8192 | rp-large
+MAX_GRAPH_EDGES | src/kernel/boot/config.rs | 128 | *
+MAX_CHANNELS | src/kernel/ipc/channel.rs | MAX_GRAPH_EDGES | *
+MAX_SPI_BUSES | src/kernel/boot/config.rs | 2 | *
+MAX_I2C_BUSES | src/kernel/boot/config.rs | 2 | *
+MAX_UART_BUSES | src/kernel/boot/config.rs | 2 | *
+MAX_PIO_CONFIGS | src/kernel/boot/config.rs | 3 | *
+MAX_GPIO_CONFIGS | src/kernel/boot/config.rs | 8 | *
+MAX_WORKLOAD_SECTION_BYTES | src/kernel/boot/config.rs | 8 * 1024 | *
+TICK_BOUND_MAX | src/kernel/boot/config.rs | 50_000 | *
+MAX_FREE_REGIONS | src/kernel/module/loader.rs | 32 | *
+ISO_ARENA_SIZE | src/kernel/module/loader.rs | 2 * 1024 * 1024 | kernel-vm
+MAX_TRACKED | src/kernel/module/provider.rs | 128 | *
+MAX_PROVIDERS | src/kernel/module/provider.rs | MAX_CONTRACTS | *
+MAX_DYN_TAG_ROUTES | src/kernel/module/provider.rs | 4 | *
+MAX_KEY_BYTES | src/kernel/security/key_vault.rs | 64 | *
+MAX_LABEL | src/kernel/security/key_vault.rs | 64 | *
+MAX_PERSISTED | src/kernel/security/key_vault.rs | 8 | *
+MAX_SEAL_BYTES | src/kernel/security/key_vault.rs | 2048 | *
+PARAM_TAG_MAX | tools/src/manifest.rs | 0xEF | *
 ```
 
 Constants in these files that are shaped like ceilings but are not

@@ -210,6 +210,21 @@ pub const CONTENT_TYPES: &[&str] = &[
     // check where it can act: the composer refuses a Celsius producer wired to
     // a lux consumer at build time, which no per-record byte can do.
     "SensorSample",
+    // A BLOCK of samples per frame, rather than one reading: a radar's chirp
+    // set, a microphone window, an IMU burst. The distinction from
+    // `SensorSample` is not size, it is whether the consumer addresses
+    // individual readings. A rule fires on a temperature; nothing useful fires
+    // on one 12-bit ADC sample of an FMCW sweep, so the block is carried whole
+    // and interpreted by something that knows the transform.
+    //
+    // The block's SHAPE — sample encoding, channel count, samples per channel —
+    // is a capability fact on the producing port (`measurement.stream`), not
+    // bytes in each frame. Same reasoning as `SensorSample`'s quantity: the
+    // shape is constant for the life of a stream, so repeating it per frame
+    // costs bandwidth to restate what the composer could have checked, and the
+    // composer refusing a 3-channel producer wired to a 1-channel consumer at
+    // build time is the check that can actually act.
+    "MeasurementStream",
 ];
 
 // ── Rate classes ────────────────────────────────────────────────────────────
@@ -345,6 +360,11 @@ pub const CONTENT_RATE_CLASS: &[RateClass] = &[
     // high-rate sampler declares `rate:` on the edge, as `VideoRaster` and
     // `EthernetFrame` do.
     Control, // SensorSample
+    // A sustained stream at frame cadence, not bursty control traffic: a radar
+    // at 10 Hz with three antennas is hundreds of kilobytes a second, and the
+    // buffer sizing that follows from `Control` would stall it. A producer with
+    // an unusual cadence still declares `rate:` on the edge.
+    Bulk, // MeasurementStream
 ];
 
 const _: () = assert!(CONTENT_RATE_CLASS.len() == CONTENT_TYPES.len());
@@ -427,6 +447,13 @@ pub const CONTENT_FRAMING: &[Framing] = &[
     // whole or not at all is the only safe shape for a measurement a rule fires
     // on.
     Framed, // SensorSample
+    // Framed, and for a second reason beyond `SensorSample`'s: the header
+    // carries the block's length, so a consumer handed a partial frame would
+    // read the next frame's header as sample data. The sequence number is also
+    // how a consumer detects a dropped frame, which only works if frames arrive
+    // whole — a torn frame would present as a sequence gap AND corrupt data,
+    // and the two are not distinguishable after the fact.
+    Framed, // MeasurementStream
 ];
 
 const _: () = assert!(CONTENT_FRAMING.len() == CONTENT_TYPES.len());

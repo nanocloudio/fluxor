@@ -649,30 +649,63 @@ pub fn alloc_state(size: usize) -> Result<*mut u8, LoaderError> {
             }
             i += 1;
         }
-        // Bump from the high-water mark. `aligned + need` is checked
-        // — a wrapped result that passes the arena-cap test would
-        // let `write_bytes(ptr, 0, size)` corrupt memory past the
-        // arena. Overflow and over-cap fold into the same guard.
+        // Bump from the high-water mark, against three separate refusals:
+        // offset overflow, the compiled arena size, and the deployment
+        // envelope. Each is kept apart from the others because each is fixed
+        // somewhere different, and a reader acting on the wrong one wastes a
+        // rebuild.
         let aligned = align_up(STATE_ARENA_OFFSET);
+        // TWO ceilings guard this arena and they are reported apart, because
+        // they are raised in different places by different people. The compiled
+        // `STATE_ARENA_SIZE` is a silicon fact, changed by editing the SDK
+        // config and rebuilding the kernel. The envelope capacity is a
+        // PACKAGING fact, computed by the composer from the graph that was
+        // packed and installed from the boot config's FXEV section — and it is
+        // usually the lower of the two, so it is usually the one that refuses.
+        // A single message naming the compiled constant sends the reader to
+        // raise a number that had nothing to do with the refusal, which is
+        // worse than no diagnostic: it looks like an answer.
+        let pool = crate::abi::contracts::resource::POOL_STATE_ARENA;
+        let envelope = crate::kernel::sys::resource_ledger::enforced(pool);
         let next = match aligned.checked_add(need) {
-            Some(n)
-                if n <= STATE_ARENA_SIZE
-                    && crate::kernel::sys::resource_ledger::enforced_allows(
-                        crate::abi::contracts::resource::POOL_STATE_ARENA,
-                        n as u32,
-                    ) =>
-            {
-                n
-            }
-            _ => {
+            Some(n) if n > STATE_ARENA_SIZE => {
                 log::error!(
-                    "[loader] STATE ARENA EXHAUSTED — need={need} used={aligned} cap={STATE_ARENA_SIZE} (raise \
-                     abi::config::kernel::STATE_ARENA_SIZE or reduce module arena demand; \
-                     modules without a heap arena will silently fail every heap_alloc call)"
+                    "[loader] STATE ARENA EXHAUSTED (compiled capacity) — need={need} \
+                     used={aligned} cap={STATE_ARENA_SIZE} (raise \
+                     abi::config::kernel::STATE_ARENA_SIZE for this silicon and rebuild the \
+                     kernel, or reduce module arena demand; modules without a heap arena will \
+                     silently fail every heap_alloc call)"
                 );
-                crate::kernel::sys::resource_ledger::deny(
-                    crate::abi::contracts::resource::POOL_STATE_ARENA,
+                crate::kernel::sys::resource_ledger::deny(pool);
+                return Err(LoaderError::StatePoolExhausted);
+            }
+            Some(n) if envelope.is_some_and(|cap| n as u32 > cap) => {
+                // Unwrap-free: the guard above only fires when `envelope` is
+                // `Some`, and the value is wanted in the message.
+                let cap = envelope.unwrap_or(0);
+                log::error!(
+                    "[loader] STATE ARENA EXHAUSTED (deployment envelope) — need={need} \
+                     used={aligned} cap={cap} compiled={STATE_ARENA_SIZE} (the packaged \
+                     capacity envelope is the binding ceiling, not the compiled arena: repack \
+                     the graph so its `capacity:` block admits this module set, or remove a \
+                     module from the graph. Raising STATE_ARENA_SIZE changes nothing here)"
                 );
+                crate::kernel::sys::resource_ledger::deny(pool);
+                return Err(LoaderError::StatePoolExhausted);
+            }
+            Some(n) => n,
+            None => {
+                // `aligned + need` wrapped. A wrapped result that passed the
+                // cap test would let `write_bytes(ptr, 0, size)` corrupt memory
+                // past the arena, so overflow is refused on its own terms
+                // rather than folded into a capacity message that would
+                // misreport the sizes involved.
+                log::error!(
+                    "[loader] STATE ARENA EXHAUSTED (offset overflow) — need={need} \
+                     used={aligned} cap={STATE_ARENA_SIZE}: the request is large enough that \
+                     `used + need` wraps, so it cannot be satisfied at any capacity"
+                );
+                crate::kernel::sys::resource_ledger::deny(pool);
                 return Err(LoaderError::StatePoolExhausted);
             }
         };

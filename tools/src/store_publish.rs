@@ -330,6 +330,19 @@ pub fn publish_project_with_mode(
             .into_iter()
             .filter_map(|m| m.manifest.parent().map(|d| (m.name, d.to_path_buf())))
             .collect();
+        // What this project DECLARES it builds, not what happens to be on
+        // disk. The two diverge, and the divergence is one-way: `modules build
+        // --all` refreshes the declared targets, while a shelf left behind by a
+        // retired target or a one-off `--target X` is refreshed by nothing. A
+        // sweep over the directory listing therefore meets artefacts that no
+        // verb in the project can bring up to date, and a stale one of those
+        // blocks every publish with advice that cannot succeed — `build --all`
+        // does not reach it.
+        //
+        // Skipped rather than failed, and reported below so it is visible
+        // rather than silent.
+        let declared = crate::modules_build::declared_shelves(&pr)?;
+        let mut orphaned: Vec<String> = Vec::new();
         let shelf_root = pr.join("target/fluxor");
         if shelf_root.is_dir() {
             for target_dir in std::fs::read_dir(&shelf_root).map_err(Error::Io)? {
@@ -340,6 +353,25 @@ pub fn publish_project_with_mode(
                     .unwrap_or_default();
                 let modules_dir = target_dir.join("modules");
                 if !modules_dir.is_dir() {
+                    continue;
+                }
+                if !declared.contains(&target) {
+                    // Only worth naming if it holds artefacts of OURS; a shelf
+                    // of synced upstream copies is not this project's concern.
+                    let ours = std::fs::read_dir(&modules_dir)
+                        .map(|rd| {
+                            rd.filter_map(std::result::Result::ok).any(|e| {
+                                let p = e.path();
+                                p.extension().is_some_and(|x| x == "fmod")
+                                    && p.file_stem()
+                                        .and_then(|n| n.to_str())
+                                        .is_some_and(|n| owned.contains_key(n))
+                            })
+                        })
+                        .unwrap_or(false);
+                    if ours {
+                        orphaned.push(target);
+                    }
                     continue;
                 }
                 let mut fmods: Vec<PathBuf> = std::fs::read_dir(&modules_dir)
@@ -388,8 +420,10 @@ pub fn publish_project_with_mode(
                                 };
                                 return Err(Error::Module(format!(
                                     "{}: built against ABI surface {} but the current surface \
-                                     is {} — run `fluxor modules clean && fluxor modules build \
-                                     --all` before publishing",
+                                     is {} — run `fluxor modules build --all` before \
+                                     publishing. The build cache keys on the embedded \
+                                     surface digest, so a moved surface rebuilds this \
+                                     artefact without a `modules clean` first",
                                     fmod.display(),
                                     short(&embedded),
                                     short(&current),
@@ -420,6 +454,20 @@ pub fn publish_project_with_mode(
                     )?);
                 }
             }
+        }
+        // Named, not swallowed. A shelf no target declares is build residue
+        // that nothing in the project refreshes, so it will sit there until
+        // someone is told it exists.
+        if !orphaned.is_empty() {
+            orphaned.sort();
+            println!(
+                "  note: {} shelf/shelves under target/fluxor/ hold artefacts of this \
+                 project but no `[ci].targets` entry builds them: {}. Not published, and \
+                 not refreshed by `fluxor modules build --all`. `fluxor modules clean` \
+                 removes them; add the target to `[ci].targets` to keep them.",
+                orphaned.len(),
+                orphaned.join(", "),
+            );
         }
     }
 

@@ -213,6 +213,12 @@ pub mod contracts {
     pub mod sensor {
         include!("contracts/sensor.rs");
     }
+    /// Block-per-acquisition surface — the `MeasurementStream` content type's
+    /// record. `sensor` carries one reading; this carries a block of samples
+    /// whose individual readings are not separately meaningful.
+    pub mod measurement {
+        include!("contracts/measurement.rs");
+    }
     pub mod input {
         pub mod gamepad {
             include!("contracts/input/gamepad.rs");

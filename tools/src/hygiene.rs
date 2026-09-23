@@ -47,6 +47,43 @@ pub enum Rule {
 }
 
 impl Rule {
+    /// Long-form guidance for a rule, printed once per report rather than
+    /// repeated on every violation.
+    ///
+    /// A rule with more than one legitimate remedy needs to say which applies
+    /// when, and saying it on every line turns the advice into the noise it
+    /// was meant to prevent.
+    pub fn guidance(self) -> Option<&'static str> {
+        match self {
+            Rule::CrateRootAllow => Some(
+                "crate-root-allow: a `#![allow(...)]` at the top of a file suppresses the \
+                 lint for everything in it, including code written later that is \
+                 accidentally dead. Two remedies, and which one applies depends on where \
+                 the cause lives.\n\
+                 \n  \
+                 The cause is code in THIS file: move the attribute onto the item, and \
+                 prefer `#[expect(..., reason = \"...\")]`. `#[expect]` fails the build \
+                 once the lint stops firing, so a suppression cannot outlive its cause; \
+                 an `#[allow]` goes on silently covering whatever arrives under it. The \
+                 exception is a suppression that is target-conditional — `#[expect]` is \
+                 an error in a configuration where the lint does NOT fire, so a lint \
+                 that fires on one target and not another stays `#[allow]` with a reason \
+                 (lints.md §3, case 3).\n\
+                 \n  \
+                 The cause is source this file only MOUNTS — an `include!`d SDK whose \
+                 whole surface every consumer sees and each uses a subset of: there is \
+                 no item to move the attribute onto, because the unused items are not \
+                 in this file. Declare the prefix once, naming that cause:\n\
+                 \n  \
+                 [[ci.hygiene.allow_crate_root]]\n  \
+                 prefix = \"modules/\"\n  \
+                 reason = \"\"\"PIC modules mount the SDK wholesale via include!, so each \
+                 compile sees the entire surface and uses a subset.\"\"\"",
+            ),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Rule::InlineTests => "inline-tests",
@@ -1137,9 +1174,8 @@ impl<'a> HygieneVisitor<'a> {
             path: self.rel.to_path_buf(),
             line: attr.pound_token.span.start().line,
             rule: Rule::CrateRootAllow,
-            message: "crate-root `#![allow(...)]` (lints.md §4). Fix it at the call site \
-                      with `#[expect]`, or declare a `[[ci.hygiene.allow_crate_root]]` \
-                      prefix with a reason"
+            message: "crate-root `#![allow(...)]` — unbounded in scope and in time \
+                      (lints.md §4)"
                 .to_string(),
         });
     }

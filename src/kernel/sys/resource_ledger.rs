@@ -130,6 +130,22 @@ pub fn enforced_allows(pool: u16, next_use: u32) -> bool {
     }
 }
 
+/// The deployment's enforced capacity for `pool`, or `None` when the boot
+/// config carried no envelope entry for it and the compiled static size rules.
+///
+/// Exists so a refusing site can report the cap that ACTUALLY bound. A pool
+/// guarded by both its compiled size and an envelope entry has two ceilings and
+/// the lower one is usually the envelope's, so a diagnostic that prints the
+/// compiled constant sends the reader to raise a number that was never the
+/// binding one — the envelope is packaging-time input, and the fix is to repack.
+pub fn enforced(pool: u16) -> Option<u32> {
+    let i = idx(pool)?;
+    match ENFORCED[i].load(Ordering::Relaxed) {
+        0 => None,
+        cap => Some(cap),
+    }
+}
+
 /// Count a capacity refusal against `pool` and push one immediate `POOL`
 /// record. The refusing site returns `errno::ENOSPC` to its caller.
 pub fn deny(pool: u16) {

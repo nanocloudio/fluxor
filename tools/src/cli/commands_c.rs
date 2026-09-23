@@ -823,14 +823,12 @@ fn spawn_one(
         .arg("--modules")
         .arg(&active.modules_bin)
         .stderr(std::process::Stdio::piped());
-    let mut child = tie_to_parent(&mut cmd)
-        .spawn()
-        .map_err(|e| {
-            Error::Config(format!(
-                "spawning fluxor-linux for `{}`: {}",
-                active.display, e
-            ))
-        })?;
+    let mut child = tie_to_parent(&mut cmd).spawn().map_err(|e| {
+        Error::Config(format!(
+            "spawning fluxor-linux for `{}`: {}",
+            active.display, e
+        ))
+    })?;
     let stderr_pipe = child.stderr.take().ok_or_else(|| {
         Error::Config(format!(
             "`{}`: fluxor-linux has no stderr pipe",
@@ -1671,6 +1669,18 @@ fn cmd_lint_hygiene(project_root_override: Option<&Path>, json: bool) -> Result<
             message = v.message,
         );
     }
+    // Guidance once per distinct rule, after the list. A rule with more than
+    // one legitimate remedy has to say which applies when, and repeating that
+    // on every line makes the advice the noise it exists to prevent.
+    let mut explained = std::collections::BTreeSet::new();
+    for v in &report.violations {
+        if explained.insert(v.rule.as_str()) {
+            if let Some(g) = v.rule.guidance() {
+                eprintln!("\n  {g}\n");
+            }
+        }
+    }
+
     let n_v = report.violations.len();
     if n_v == 0 {
         eprintln!(
@@ -1966,7 +1976,11 @@ fn cmd_modules_list(project_root: Option<&Path>, json: bool) -> Result<()> {
         } else {
             s.entry.display().to_string()
         };
-        println!("  {name:24} type={type_id} targets={targets} entry={entry}", name = s.name, type_id = s.type_id);
+        println!(
+            "  {name:24} type={type_id} targets={targets} entry={entry}",
+            name = s.name,
+            type_id = s.type_id
+        );
     }
     println!("({} modules)", summaries.len());
     Ok(())
@@ -2103,9 +2117,10 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
             true,
         ),
         Some("combined") => {
-            let firmware = flags.firmware.as_ref().ok_or_else(|| {
-                Error::Config("--emit=combined requires --firmware <UF2>".into())
-            })?;
+            let firmware = flags
+                .firmware
+                .as_ref()
+                .ok_or_else(|| Error::Config("--emit=combined requires --firmware <UF2>".into()))?;
             let output = require_output("combined")?;
             cmd_combine(firmware, path, &output, verbose)
         }
@@ -2139,11 +2154,7 @@ fn cmd_build_dispatch(path: Option<&PathBuf>, flags: BuildFlags, verbose: bool) 
 /// NOTE: extra `--modules-dir` roots change the table and therefore the
 /// digest; the build's injected digest (stack_expand) uses the project's
 /// `modules/` only, so pass extras only when the build did the same.
-fn cmd_id_table(
-    yaml_path: &Path,
-    out: Option<&Path>,
-    extra_roots: &[PathBuf],
-) -> Result<()> {
+fn cmd_id_table(yaml_path: &Path, out: Option<&Path>, extra_roots: &[PathBuf]) -> Result<()> {
     let content = substitute_env_vars(&std::fs::read_to_string(yaml_path)?)?;
     let mut config: serde_json::Value = if yaml_path
         .extension()

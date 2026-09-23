@@ -811,6 +811,36 @@ pub fn clippy_check_modules(project_root: &Path, verbose: bool) -> Result<Module
     Ok(report)
 }
 
+/// The silicon shelf directory each declared target builds into.
+///
+/// `target/fluxor/<silicon>/modules/` is keyed by SILICON, while `[ci].targets`
+/// names targets — which may be boards, several of which share one die — so the
+/// mapping is many-to-one and has to be resolved rather than assumed.
+///
+/// A consumer of the built artefacts wants exactly this set: a shelf outside it
+/// is not part of what this project declares it produces, whatever is lying in
+/// it.
+#[allow(
+    dead_code,
+    reason = "consumer-conditional: `store_publish` is the caller and reaches this through               the library, while the binary crate mounts this module directly and does not"
+)]
+pub fn declared_shelves(project_root: &Path) -> Result<std::collections::BTreeSet<String>> {
+    // Declaring no targets is a valid shape — a project with no module tree
+    // has no shelves — and the answer to "which are declared" is then the
+    // empty set, not an error. `resolve_all_targets` refuses instead, because
+    // it answers a different question: `build --all` asked to build nothing is
+    // a mistake worth naming.
+    let targets = match resolve_all_targets(project_root) {
+        Ok(t) => t,
+        Err(_) => return Ok(std::collections::BTreeSet::new()),
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for target in targets {
+        out.insert(resolve_silicon(&target, project_root)?);
+    }
+    Ok(out)
+}
+
 fn resolve_all_targets(project_root: &Path) -> Result<Vec<String>> {
     let cfg_path = project_root.join("fluxor.toml");
     if !cfg_path.exists() {

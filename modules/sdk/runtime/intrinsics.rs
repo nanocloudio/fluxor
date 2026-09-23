@@ -452,6 +452,63 @@ mod _pic_intrinsics {
         (lo as u64) | ((hi as u64) << 32)
     }
 
+    /// Unsigned 64-bit divide, quotient and remainder.
+    ///
+    /// Restoring long division with the QUOTIENT ACCUMULATED IN THE DIVIDEND'S
+    /// VACATED BITS. `n` and `r` form one 128-bit shift register: each pass
+    /// shifts the pair left, so the bit leaving the top of `n` enters `r` and
+    /// the quotient bit just decided enters the bottom of `n`. After 64 passes
+    /// `n` holds the quotient and `r` the remainder. It calls nothing, which is
+    /// what a PIC module needs: no `compiler_builtins`, no recursion.
+    ///
+    /// The point is REGISTER PRESSURE, on a Cortex-M0+ with eight usable low
+    /// registers and no divide unit. The obvious form keeps the dividend, the
+    /// divisor, a remainder and a quotient live at once: four 64-bit values,
+    /// eight registers, before any temporary. That does not fit, so it spills
+    /// and reloads every pass — around 132 instructions per pass, 54 of them
+    /// `ldr`/`str`, over a 52-byte frame, which is spill-bound rather than
+    /// arithmetic-bound. Folding the quotient into the dividend removes one of
+    /// the four: three 64-bit values and the counter, seven registers, which
+    /// fits.
+    ///
+    /// SIXTY-FOUR PASSES WHATEVER THE OPERANDS, deliberately. Aligning the
+    /// divisor to the dividend's highest set bit would cut the count to the
+    /// number of quotient bits that can exist — about 31 passes for a
+    /// microsecond timestamp divided by 1000 — and it is left out anyway,
+    /// because the pass count would then be a function of the operands and the
+    /// time this routine takes would say something about the values it was
+    /// given. The 32-bit `__aeabi_uidiv` above holds the same property, and
+    /// phasor's softfloat states it outright for its own division loop. A
+    /// side-channel property that two places in the tree maintain on purpose
+    /// is not something to trade for speed in a third without asking. Likewise
+    /// there is no `n < d` early exit: that one branch would leak the
+    /// comparison.
+    ///
+    /// The gain is therefore all spill reduction — the larger of the two terms,
+    /// and the one that costs no property.
+    #[cfg(target_arch = "arm")]
+    fn udivmod64(n: u64, d: u64) -> (u64, u64) {
+        let mut n = n;
+        let mut r = 0u64;
+        let mut i = 64u32;
+        while i > 0 {
+            i -= 1;
+            // Shift the 128-bit pair `r:n` left by one. `r` cannot lose a set
+            // bit: the loop maintains `r < d`, and `r` only reaches the top of
+            // its range once it has absorbed all 64 of `n`'s bits, by which
+            // point no further shift happens.
+            let carry = n >> 63;
+            n <<= 1;
+            r = (r << 1) | carry;
+            if r >= d {
+                r -= d;
+                // The quotient bit, into the position `n` just vacated.
+                n |= 1;
+            }
+        }
+        (n, r)
+    }
+
     /// Unsigned 64-bit division-and-remainder.
     ///
     /// AAPCS returns the quotient in `r0:r1` and the remainder in `r2:r3`,
@@ -461,8 +518,7 @@ mod _pic_intrinsics {
     ///
     /// Cortex-M33 and above have `UDIV` but still call this for 64-bit
     /// operands; Cortex-M0+ has no divide at all, so on RP2040 every `u64 /`
-    /// and `u64 %` in module code lands here. Pure bit-shift long division:
-    /// no further intrinsic calls, no recursion, 64 iterations worst case.
+    /// and `u64 %` in module code lands here.
     ///
     /// Division by zero returns zero rather than trapping, matching the
     /// 32-bit helpers above — a PIC module has no unwinder and no handler to
@@ -473,17 +529,7 @@ mod _pic_intrinsics {
         if d == 0 {
             return 0;
         }
-        let mut quotient = 0u64;
-        let mut remainder = 0u64;
-        let mut i = 64u32;
-        while i > 0 {
-            i -= 1;
-            remainder = (remainder << 1) | ((n >> i) & 1);
-            if remainder >= d {
-                remainder -= d;
-                quotient |= 1u64 << i;
-            }
-        }
+        let (quotient, remainder) = udivmod64(n, d);
         (quotient as u128) | ((remainder as u128) << 64)
     }
 

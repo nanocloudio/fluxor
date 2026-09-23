@@ -170,6 +170,7 @@ Source: `contracts/src/lib.rs`.
 | 36 | `GpuCommand` | Generic GPU work — the request stream of `modules/sdk/wire/gpu_wire.rs` (query, resource, program, transfer, submission, fence, control, surface) |
 | 37 | `GpuOutcome` | Generic GPU outcomes — the reply half: acceptance, handles, capabilities, readback bytes, surface leases, and exactly one terminal outcome per accepted request |
 | 38 | `SensorSample` | A measured physical quantity, one fixed 24-byte reading per record (`modules/sdk/contracts/sensor.rs`). The quantity and its unit are capability facts on the producing port, not bytes in the record |
+| 39 | `MeasurementStream` | A block of samples per acquisition — a radar chirp set, a microphone window, an IMU burst (`modules/sdk/contracts/measurement.rs`). Fixed 16-byte header then the block; the sample encoding, channel count and samples per channel are capability facts, while `block_len` is per-frame because a final or drained block is legitimately short |
 
 Codec identity is deliberately not part of this table. Encoded surfaces are
 generic (`AudioEncoded` / `VideoEncoded`): a content type names a
@@ -313,6 +314,7 @@ Replication and streaming:
 | `request.http` | Substitutable HTTP request surface |
 | `request.record` | Substitutable record-query surface (a table, a key-value store) |
 | `sensor.sample` | Produces `SensorSample` records. What a consumer requires to bind a thermometer, a light sensor, a replay module or a simulator alike; the quantity, cadence and payload ceiling are facts the composer checks against what the consumer asked for |
+| `measurement.stream` | Produces `MeasurementStream` records: a block per acquisition, from a producer whose individual readings are not separately meaningful. The block's shape — encoding, channels, samples per channel — are facts, so the composer refuses a consumer that would de-interleave it wrongly |
 
 The last four are application-EFFECT surfaces: what a graph binds when a
 stage publishes, subscribes, or calls out, as opposed to the transport it

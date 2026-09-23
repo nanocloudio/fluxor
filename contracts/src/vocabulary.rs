@@ -163,13 +163,25 @@ pub const CAPABILITY_NAMES: &[&str] = &[
     // binds a thermometer, a light sensor, a replay module or a simulator alike,
     // and the composer refuses the mismatches.
     //
-    // Deliberately ONE name, on the same rule the `input.*` family follows:
-    // a name is added when a module declares it. A block-per-acquisition
-    // surface for radar, microphones and spectrum sweeps is a second type to be
-    // designed against a real producer, not ahead of one, and actuation waits
-    // on a driver that drives something — home automation is not read-only, but
-    // nothing here holds a relay.
+    // Names are added when a module declares one, which is why there are two and
+    // not a family: `measurement.stream` below answers a real
+    // block-per-acquisition producer, the BGT60TR13C radar driver, rather than
+    // being designed ahead of one. Actuation waits on a driver that drives
+    // something — home automation is not read-only, but nothing here holds a
+    // relay.
     "sensor.sample",
+    // A BLOCK of samples per acquisition, from a producer whose readings are not
+    // individually meaningful: an FMCW radar's chirp set, a microphone window,
+    // an IMU burst, a spectrum sweep.
+    //
+    // This is the surface that makes such a driver pluggable WITHOUT the
+    // consumer learning the driver. Without it a streamer publishes a private
+    // `OctetStream` framing documented in a comment, which is the N x M
+    // coupling the graph model exists to prevent — and it bites harder here
+    // than for a scalar sensor, because the block's shape (how many channels,
+    // how samples are packed) is the part a consumer must get right and the
+    // part a comment cannot enforce. As facts, the composer checks it.
+    "measurement.stream",
 ];
 
 /// The values one fact admits: an enumerated set, or [`FACT_NUMERIC`] when
@@ -401,6 +413,64 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
                 ],
             ),
             ("period_ms", FACT_NUMERIC),
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
+    (
+        // A block producer's terms. `encoding`, `channels` and
+        // `samples_per_channel` together say how to read the block; they are
+        // constant for the life of a stream, so they are declared once here
+        // rather than repeated in every frame header — the same trade
+        // `sensor.sample` makes with `quantity`, and for the same two reasons:
+        // a per-frame field costs bandwidth to restate what never changes, and
+        // a declared fact is checkable by the composer while a per-frame byte
+        // is only checkable after the graph is running.
+        //
+        // `encoding` IS enumerated, unlike `sensor.sample`'s quantity. The
+        // difference is that sample packings are a small closed set fixed by
+        // what ADCs emit, where physical quantities are unbounded (UCUM alone
+        // carries some three hundred units). A packing outside this list needs a
+        // decoder written anyway, so adding the name is the smaller half of that
+        // work — whereas a unit outside an enumeration needs nothing but the
+        // name, which is what would push a producer back to `OctetStream`.
+        "measurement.stream",
+        &[
+            (
+                "encoding",
+                &[
+                    // 12-bit unsigned samples packed two per three bytes — the
+                    // BGT60TR13C's FIFO format, and the common one for
+                    // 12-bit ADCs that care about wire size.
+                    "u12le_packed2x3",
+                    "u8",
+                    "i8",
+                    "u16le",
+                    "i16le",
+                    "u32le",
+                    "i32le",
+                    // Float encodings are admitted because a HOST-side producer
+                    // (a replay of recorded floats, a simulator) legitimately
+                    // has them. A consumer on a die with no FPU refuses the
+                    // binding at build time by requiring an integer encoding —
+                    // which is the check working, not a gap.
+                    "f32le",
+                    "f64le",
+                ],
+            ),
+            // Interleaved channels per sample position; 1 for a single-channel
+            // stream. A consumer that de-interleaves needs this to be right, and
+            // getting it wrong reads as plausible data from the wrong antenna.
+            ("channels", FACT_NUMERIC),
+            // Sample positions per channel in one block. With `channels` and
+            // `encoding` this determines the block length exactly, so a consumer
+            // sizes its buffer from the facts rather than from the first frame
+            // it happens to see.
+            ("samples_per_channel", FACT_NUMERIC),
+            // Nominal acquisition period — frame cadence, not sample cadence.
+            ("period_ms", FACT_NUMERIC),
+            // The largest whole frame (header + block). Validated against the
+            // consuming port's `max_record` at build, which is what turns a
+            // runtime OVERSIZE refusal into a build failure.
             ("max_payload", FACT_NUMERIC),
         ],
     ),

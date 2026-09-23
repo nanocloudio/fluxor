@@ -441,9 +441,9 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
                     (
                         PhaseStatus::Ok,
                         format!(
-                            "{} ceiling(s) over {} row(s) match their source; no unregistered \
-                             ceiling in a register-named file",
-                            r.checked, r.rows
+                            "{} ceiling(s) over {} row(s) match their source; {} coupling(s) \
+                             enforced; no unregistered ceiling in a register-named file",
+                            r.checked, r.rows, r.constraints
                         ),
                     )
                 };
