@@ -44,6 +44,30 @@ the index rewrite cover exactly what was published.
 Only fluxor publishes runtimes; the `fluxor/run/` namespace is
 reserved. A sibling "runtime" is a graph on `fluxor-linux`.
 
+## Withholding a module
+
+A module that builds and runs but must not ship — a licence question
+still open, a provenance gate not yet cleared — declares so in its
+own manifest:
+
+```toml
+[publish]
+withheld = "AAC Huffman tables await provenance clearance"
+```
+
+`fluxor publish` then publishes every other module and leaves this
+one out on every shelf, printing the module and its reason. Any tag
+the module published earlier is **retired**: a withheld module must
+not stay resolvable at a digest the project no longer vouches for.
+Its input digest drops out of the staleness map too, so `fluxor ci`
+and `workspace publish` do not report as stale an artefact no
+publish will ever produce.
+
+The reason is required; an empty one is a manifest error. Building,
+testing, linting and local graphs are unaffected — withholding is a
+distribution decision, not a build one. Delete the table to publish
+the module again.
+
 ## What a manifest carries, and what it deliberately does not
 
 A manifest records facts **derived from the artefact**:

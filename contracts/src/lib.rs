@@ -55,11 +55,12 @@ pub mod content_type {
 // Codec identity is deliberately NOT part of this table. Encoded surfaces
 // are generic (AudioEncoded / VideoEncoded): a content type names a
 // substitution surface, not an implementation enumeration, so per-codec
-// forks are rejected at review. Codec identity travels in-band — encoded
-// access units and container formats are self-describing — or as a
-// capability fact on the wiring edge. Whole encoded images ride
-// OctetStream (magic-byte self-describing). See the vocabulary admission
-// test in `docs/architecture/abi_layers.md`.
+// forks are rejected at review. Codec identity travels in-band, in the
+// stream's `STREAM` record (`modules/sdk/contracts/encoded.rs`), drawn from
+// `vocabulary::CODECS`; a port that can carry only some codecs declares
+// which in `[ports.facts]`, and the composer checks each edge. Whole encoded
+// images ride OctetStream (magic-byte self-describing). See the vocabulary
+// admission test in `docs/architecture/abi_layers.md`.
 
 /// Content-type byte → friendly name. Single source of truth re-exported
 /// by `fluxor-tools` so manifest parsing and compiled-config decoding
@@ -413,6 +414,11 @@ pub const CONTENT_FRAMING: &[Framing] = &[
     Streamed, // FmpMessage
     Streamed, // EthernetFrame
     Streamed, // HciMessage
+    // Streamed, deliberately, like `GpuCommand`: every encoded record
+    // declares its own length and `encoded::Parser` carries a partial one, so
+    // a split is recoverable. A video access unit is far larger than any ring
+    // a small target can grant, which is why a unit may also arrive as several
+    // `UNIT` fragments rather than demanding one ring-sized write.
     Streamed, // AudioEncoded
     Streamed, // VideoEncoded
     Streamed, // VideoDraw

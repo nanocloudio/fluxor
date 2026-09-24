@@ -474,7 +474,144 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
             ("max_payload", FACT_NUMERIC),
         ],
     ),
+    (
+        // The terms of an encoded audio stream, declared on the PORT that
+        // carries it (`[ports.facts]`), never on the module: a transcoder
+        // takes AAC on one port and emits Opus on another, and one module-level
+        // set would admit wrong wirings on both sides. See
+        // `PORT_SCOPED_CAPABILITIES`.
+        //
+        // What flows is described in-band by the stream's own `STREAM` record
+        // (`modules/sdk/contracts/encoded.rs`) — a demuxer's codec is whatever
+        // the file holds. These facts are the BUILD-time half: a port that can
+        // only carry some codecs says which, and the composer refuses a
+        // producer that may send one the consumer cannot take.
+        "audio.encoded",
+        &[
+            ("codec", AUDIO_CODECS),
+            ("packing", AUDIO_PACKINGS),
+            // Ticks per second of the stream's timestamps.
+            ("clock_rate", FACT_NUMERIC),
+            ("channels", FACT_NUMERIC),
+            // The largest UNIT fragment payload, not the largest access unit:
+            // a unit larger than this arrives as several fragments.
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
+    (
+        "video.encoded",
+        &[
+            ("codec", VIDEO_CODECS),
+            ("packing", VIDEO_PACKINGS),
+            ("clock_rate", FACT_NUMERIC),
+            ("max_payload", FACT_NUMERIC),
+        ],
+    ),
 ];
+
+// ── Encoded media vocabulary ───────────────────────────────────────────────
+//
+// The codec and packing names of the encoded surfaces. Both tables are
+// POSITIONAL: an entry's index is the byte a `STREAM` record carries
+// (`modules/sdk/contracts/encoded.rs`, whose constants are pinned against
+// these tables). Appending is safe; reordering or removing is a wire break.
+//
+// A codec is admitted when an implementation in the ecosystem produces or
+// consumes it. A name with nothing behind it is a promise the vocabulary
+// cannot keep, and adding one later is a single append.
+
+/// Every codec an encoded stream may carry, in wire-byte order.
+pub const CODECS: &[&str] = &["pcmu", "aac", "mp3", "opus", "h264", "h265", "vp8"];
+
+/// The codecs `AudioEncoded` carries.
+pub const AUDIO_CODECS: FactValues = &["pcmu", "aac", "mp3", "opus"];
+
+/// The codecs `VideoEncoded` carries.
+pub const VIDEO_CODECS: FactValues = &["h264", "h265", "vp8"];
+
+/// How an access unit's bytes are laid out, in wire-byte order.
+///
+/// - `raw` — one bare access unit, no framing bytes (PCMU, Opus, AAC with an
+///   AudioSpecificConfig, VP8).
+/// - `framed` — self-delimiting frames (ADTS, MPEG audio headers).
+/// - `annexb` — NAL units behind start codes; parameter sets in band.
+/// - `length_prefixed` — NAL units behind big-endian length prefixes; the
+///   prefix width and parameter sets come from the stream's config (avcC /
+///   hvcC).
+///
+/// Declared, never converted: a consumer that wants a different packing
+/// converts, so one that wants the bytes as stored never has to convert back.
+pub const PACKINGS: &[&str] = &["raw", "framed", "annexb", "length_prefixed"];
+
+/// The packings `AudioEncoded` admits.
+pub const AUDIO_PACKINGS: FactValues = &["raw", "framed"];
+
+/// The packings `VideoEncoded` admits.
+pub const VIDEO_PACKINGS: FactValues = &["raw", "annexb", "length_prefixed"];
+
+/// The wire byte for `codec`, or `None` for a name outside [`CODECS`].
+pub fn codec_byte(codec: &str) -> Option<u8> {
+    CODECS.iter().position(|c| *c == codec).map(|i| i as u8)
+}
+
+/// The name for a codec wire byte, or `None` for an unallocated byte.
+pub fn codec_name(byte: u8) -> Option<&'static str> {
+    CODECS.get(byte as usize).copied()
+}
+
+/// The wire byte for `packing`, or `None` for a name outside [`PACKINGS`].
+pub fn packing_byte(packing: &str) -> Option<u8> {
+    PACKINGS.iter().position(|p| *p == packing).map(|i| i as u8)
+}
+
+/// Capabilities whose facts describe the stream on ONE PORT rather than a
+/// service the module provides. Their facts are declared in `[ports.facts]`
+/// on the port and refused in the module-level `[capability_facts]` table.
+pub const PORT_SCOPED_CAPABILITIES: &[&str] = &["audio.encoded", "video.encoded"];
+
+/// The service-level capability that mirrors a content type — the surface a
+/// port of that type carries. `None` for a content type with no surface
+/// capability.
+pub fn surface_capability(content_type: &str) -> Option<&'static str> {
+    const SURFACES: &[(&str, &str)] = &[
+        ("AudioSample", "audio.sample"),
+        ("AudioEncoded", "audio.encoded"),
+        ("VideoEncoded", "video.encoded"),
+        ("VideoDraw", "video.draw"),
+        ("VideoRaster", "video.raster"),
+        ("VideoScanout", "video.scanout"),
+        ("MediaMuxed", "media.muxed"),
+    ];
+    SURFACES
+        .iter()
+        .find(|(ct, _)| *ct == content_type)
+        .map(|(_, cap)| *cap)
+}
+
+/// How a fact is compared across an edge when both ends declare it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactRule {
+    /// An enumerated fact a port may declare as a set. Everything the
+    /// producer may send must be something the consumer takes: producer ⊆
+    /// consumer. Intersection would pass a demuxer declaring `{aac, mp3}`
+    /// against an AAC-only decoder and fail at runtime on the first MP3.
+    Subset,
+    /// A number both ends must agree on exactly (`clock_rate`, `channels`).
+    Exact,
+    /// A size ceiling: the producer's value must not exceed the consumer's.
+    Ceiling,
+}
+
+/// The comparison rule for `fact`, given its admitted values.
+pub fn fact_rule(fact: &str, admitted: FactValues) -> FactRule {
+    if admitted != FACT_NUMERIC {
+        FactRule::Subset
+    } else if fact == "max_payload" {
+        FactRule::Ceiling
+    } else {
+        FactRule::Exact
+    }
+}
 
 /// Capabilities a TARGET provides rather than a module: properties of the
 /// platform HAL that a manifest can require but nothing in a graph declares.

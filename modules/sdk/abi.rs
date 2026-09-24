@@ -219,6 +219,12 @@ pub mod contracts {
     pub mod measurement {
         include!("contracts/measurement.rs");
     }
+    /// Encoded media stream — the `AudioEncoded` / `VideoEncoded` record
+    /// stream: a self-describing `STREAM`, access-unit `UNIT` fragments, and
+    /// `END`.
+    pub mod encoded {
+        include!("contracts/encoded.rs");
+    }
     pub mod input {
         pub mod gamepad {
             include!("contracts/input/gamepad.rs");

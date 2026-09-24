@@ -31,9 +31,46 @@ AV pipelines move data on channels typed by `content_type`:
 Codec identity is not part of the surface family: a `content_type`
 names a substitution surface, not a codec enumeration, so there are no
 per-codec variants of the encoded surfaces. Codec identity travels
-in-band (encoded access units and container formats are
-self-describing) or as a capability fact on the wiring edge. See the
-vocabulary admission test in `abi_layers.md`.
+in-band, in the stream's own `STREAM` record (§1.1), and a port that
+can carry only some codecs declares which as a stream fact (§2.1). See
+the vocabulary admission test in `abi_layers.md`.
+
+### 1.1 The encoded record stream
+
+Source: `modules/sdk/contracts/encoded.rs` (`abi::contracts::encoded`).
+
+`AudioEncoded` and `VideoEncoded` carry one record stream:
+
+| Record | Layout (little-endian) |
+|---|---|
+| `STREAM` | `[1][codec u8][packing u8][channels u8][clock_rate u32][config_len u32][config]` |
+| `UNIT` | `[2][flags u8][len u32][pts i64][pts_minus_dts i32][payload]` |
+| `END` | `[3]` |
+
+- **The stream describes itself.** Codec, packing, clock rate, channel
+  count and codec configuration (AudioSpecificConfig, avcC/hvcC,
+  OpusHead) arrive in `STREAM` before the first unit. A `STREAM` after
+  units starts the next stream; `END` closes one and tells a decoder to
+  flush.
+- **Codec and packing bytes** are positions in
+  `contracts::vocabulary::CODECS` (`pcmu aac mp3 opus h264 h265 vp8`) and
+  `PACKINGS` (`raw framed annexb length_prefixed`). Packing is declared,
+  never converted; `stream_is_valid` states which codec takes which
+  packing and what configuration it requires.
+- **Units may be fragmented.** An access unit is one or more `UNIT`
+  records chained by `CONTINUES`, so a keyframe larger than a ring still
+  crosses it. `KEY` and `DISCONTINUITY` sit on the first fragment;
+  `TRUNCATED` on the last marks a unit that lost data and must be
+  discarded.
+- **Time** is `pts` in ticks at `clock_rate`, signed; decode time is
+  `pts - pts_minus_dts`. Units arrive in decode order. Ticks are never
+  normalised, which would cost a 64-bit division the 32-bit PIC targets
+  cannot link.
+- **Reading.** Both types are `Streamed`: a write is whole, a read is any
+  split. A consumer keeps a carry buffer, calls `parse` until it answers
+  `NeedMore`, and admits each record through `Sequence`. The composer
+  refuses fan-in onto an encoded input, since a merge interleaves two
+  record streams beyond recovery.
 
 ### Where this is enforced
 
@@ -89,6 +126,39 @@ content-type wiring matches against `video.scanout`.
 The same registry also carries the input, MIDI, and transport
 capability names; those are documented in
 `input_capability_surface.md` and `protocol_surfaces.md`.
+
+### 2.1 Stream facts on encoded ports
+
+`audio.encoded` and `video.encoded` carry facts that describe the stream
+on ONE port, so they are declared on the port, never in the module's
+`[capability_facts]` (which refuses them): a transcoder takes AAC on one
+port and emits Opus on another.
+
+```toml
+[[ports]]
+name = "audio_in"
+direction = "input"
+content_type = "AudioEncoded"
+
+[ports.facts]
+codec = ["pcmu", "opus"]
+packing = "raw"
+```
+
+| Fact | `audio.encoded` | `video.encoded` | Edge rule |
+|---|---|---|---|
+| `codec` | audio codecs | video codecs | producer ⊆ consumer |
+| `packing` | `raw`, `framed` | `raw`, `annexb`, `length_prefixed` | producer ⊆ consumer |
+| `clock_rate` | u32 | u32 | equal |
+| `channels` | u32 | — | equal |
+| `max_payload` | u32 | u32 | producer ≤ consumer |
+
+Checked by `tools/src/config/validate.rs::validate_port_facts` on every
+edge where both ends declare the fact; a fact one end leaves out is
+unconstrained there. Subset rather than intersection: a demuxer that may
+emit MP3 must not bind an AAC-only decoder. The runtime truth is still
+the `STREAM` record — a port that carries whatever a file holds declares
+no `codec` fact and validates in-band.
 
 Capability names are matched case-insensitively at parse time and
 canonicalised to lowercase in the parsed manifest. They are not
@@ -211,10 +281,11 @@ This page covers the surface family, the capability vocabulary, the
 format. The following adjacent concerns live elsewhere or are not
 surfaced through these contracts:
 
-- **Typed payload metadata** — per-buffer side-channel data (sample
-  rate, channel layout, pixel format, stride, colourspace, damage,
-  present epoch, fence) travels on whatever shape the producing module
-  defines on its channel. There is no separate metadata sideband.
+- **Typed payload metadata** — per-buffer side-channel data on decoded
+  surfaces (pixel format, stride, colourspace, damage, present epoch,
+  fence) travels on whatever shape the producing module defines on its
+  channel. There is no separate metadata sideband. Encoded streams carry
+  their description in-band (§1.1).
 - **Remote AV transport** — moving any of these surfaces across a
   remote channel is the remote-channel layer's concern; transports
   carry but do not erase these contracts.

@@ -639,9 +639,10 @@ minting a central name.
 **No implementation enumerations.** A name must identify *what the
 data is*, not *which implementation produced it*. Codec identity is
 the standing example: encoded surfaces are the generic `AudioEncoded`
-/ `VideoEncoded`, and codec identity travels in-band (access units and
-containers are self-describing) or as a capability fact on the edge —
-per-codec content types are rejected. The same reasoning bars
+/ `VideoEncoded`, and codec identity travels in-band, in the stream's
+`STREAM` record as a `vocabulary::CODECS` byte, with the codecs a port
+can carry declared as a stream fact (`av_capability_surface.md` §1.1,
+§2.1) — per-codec content types are rejected. The same reasoning bars
 per-vendor, per-chip, or per-protocol-revision forks of any existing
 surface; those are facts or in-band discriminants, not names.
 

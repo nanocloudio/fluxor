@@ -1501,6 +1501,125 @@ pub fn validate_port_capabilities(
     Ok(())
 }
 
+/// Compare the stream facts both ends of each edge declare, and refuse fan-in
+/// onto an encoded input port.
+///
+/// `[ports.facts]` is the build-time half of an encoded stream's description
+/// (the runtime half is the stream's own `STREAM` record). For every fact both
+/// ports declare, the producer's terms must fit the consumer's: a set is a
+/// subset (everything the producer may send, the consumer takes), an exact
+/// number is equal, a ceiling is not exceeded. A fact only one end declares is
+/// unconstrained on that edge — the honest reading of an undeclared fact.
+///
+/// Fan-in is refused outright. An encoded stream is a sequence of records a
+/// reader reassembles across reads; a merge interleaves two producers' bytes,
+/// and no reader can recover a record boundary from that.
+///
+/// FAILS OPEN on a module whose manifest could not be resolved, like
+/// [`validate_port_capabilities`] and for the same reason.
+pub fn validate_port_facts(config: &Value, manifests: &HashMap<String, Manifest>) -> Result<()> {
+    use fluxor_contracts::vocabulary::{
+        fact_rule, facts_for, surface_capability, FactRule, PORT_SCOPED_CAPABILITIES,
+    };
+    let wiring = match config.get("wiring").and_then(|w| w.as_array()) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+    let port_of = |spec: &str| -> Option<crate::manifest::PortSpec> {
+        let (module, port) = spec.split_once('.')?;
+        manifests
+            .get(module)?
+            .ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some(port))
+            .cloned()
+    };
+    let surface = |p: &crate::manifest::PortSpec| -> Option<&'static str> {
+        crate::manifest::CONTENT_TYPES
+            .get(p.content_type as usize)
+            .and_then(|ct| surface_capability(ct))
+            .filter(|c| PORT_SCOPED_CAPABILITIES.contains(c))
+    };
+
+    let mut producers_into: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in wiring {
+        let (Some(from), Some(to)) = (
+            entry.get("from").and_then(|v| v.as_str()),
+            entry.get("to").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let (Some(out_port), Some(in_port)) = (port_of(from), port_of(to)) else {
+            continue;
+        };
+        let Some(capability) = surface(&in_port) else {
+            continue;
+        };
+        producers_into.entry(to).or_default().push(from);
+
+        let schema = facts_for(capability).unwrap_or(&[]);
+        for (fact, sent) in &out_port.facts {
+            let Some(taken) = in_port.facts.get(fact) else {
+                continue;
+            };
+            let Some(&(_, admitted)) = schema.iter().find(|(n, _)| n == fact) else {
+                continue;
+            };
+            let refuse = |why: String| {
+                Err(Error::Config(format!(
+                    "`{from}` -> `{to}`: {why} ({capability} fact `{fact}`: producer \
+                     declares [{}], consumer declares [{}])",
+                    sent.join(", "),
+                    taken.join(", "),
+                )))
+            };
+            match fact_rule(fact, admitted) {
+                FactRule::Subset => {
+                    let missing: Vec<&str> = sent
+                        .iter()
+                        .filter(|v| !taken.contains(v))
+                        .map(String::as_str)
+                        .collect();
+                    if !missing.is_empty() {
+                        return refuse(format!(
+                            "the producer may send {} which the consumer cannot take",
+                            missing.join(", ")
+                        ));
+                    }
+                }
+                FactRule::Exact => {
+                    if sent != taken {
+                        return refuse("the two ends disagree".to_string());
+                    }
+                }
+                FactRule::Ceiling => {
+                    let n = |v: &[String]| v.first().and_then(|x| x.parse::<u32>().ok());
+                    if let (Some(s), Some(t)) = (n(sent), n(taken)) {
+                        if s > t {
+                            return refuse(format!(
+                                "the producer sends up to {s} bytes but the consumer takes {t}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (to, froms) in producers_into {
+        if froms.len() > 1 {
+            return Err(Error::Config(format!(
+                "`{to}` is an encoded-media input fed by {} producers ({}). An encoded \
+                 stream is a record sequence, and merging two interleaves their bytes \
+                 past any reader's ability to find a record boundary. Give each \
+                 producer its own consumer.",
+                froms.len(),
+                froms.join(", "),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Admit the graph's execution-envelope claim
 /// against what its modules declare. The rule is judged beside the target
 /// facts it depends on, in `target_facts::admit_execution_profile`; this is

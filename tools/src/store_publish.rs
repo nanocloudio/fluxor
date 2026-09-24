@@ -173,6 +173,11 @@ pub fn project_input_digests(pr: &Path) -> Result<BTreeMap<String, String>> {
         if m.builtin {
             continue;
         }
+        // A withheld module is outside the published set for the same
+        // reason: nothing will ever be published to clear its staleness.
+        if crate::manifest::publish_withheld(&m.manifest)?.is_some() {
+            continue;
+        }
         let Some(dir) = m.manifest.parent() else {
             continue;
         };
@@ -281,8 +286,13 @@ pub fn publish_project_with_mode(
     // Only this project's own module tags, and only when the fmod sweep
     // will actually run — a `--only source` publish has no opinion about
     // which modules exist.
+    let withheld = if want("fmod") {
+        withheld_artifacts(&pr)?
+    } else {
+        BTreeMap::new()
+    };
     if want("fmod") {
-        retire_deleted_modules(&store, &pr, &identity.name, verbose)?;
+        retire_deleted_modules(&store, &pr, &identity.name, &withheld, verbose)?;
     }
 
     let txn = store.begin_publish()?;
@@ -389,6 +399,9 @@ pub fn publish_project_with_mode(
                     let Some(src_dir) = owned.get(&name) else {
                         continue;
                     };
+                    if withheld.contains_key(&name) {
+                        continue;
+                    }
                     let bytes = std::fs::read(&fmod).map_err(Error::Io)?;
                     // The artefact must have been BUILT against the surface
                     // it is about to be labelled with.
@@ -454,6 +467,11 @@ pub fn publish_project_with_mode(
                     )?);
                 }
             }
+        }
+        // Said on every publish, so a withheld module is never mistaken for
+        // one that was forgotten.
+        for (name, reason) in &withheld {
+            println!("  withheld {name}: {reason}");
         }
         // Named, not swallowed. A shelf no target declares is build residue
         // that nothing in the project refreshes, so it will sit there until
@@ -606,14 +624,31 @@ pub fn publish_project_with_mode(
     Ok(tags)
 }
 
-/// Remove store tags for modules that are no longer in `project_root`.
+/// Artefact names whose module manifest declares `[publish] withheld`,
+/// mapped to the declared reason. Keyed by ARTEFACT name, so every variant of
+/// a withheld module is withheld with it.
+fn withheld_artifacts(project_root: &Path) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for m in crate::modules_build::list(project_root)? {
+        if let Some(reason) = crate::manifest::publish_withheld(&m.manifest)? {
+            out.insert(m.name, reason);
+        }
+    }
+    Ok(out)
+}
+
+/// Remove store tags for modules that are no longer in `project_root`, and
+/// for modules whose manifest withholds them from publication.
 ///
-/// See the call site for why this exists and why it runs before the publish
-/// transaction.
+/// A withheld module must not stay resolvable at whatever digest it was last
+/// published with: consumers would keep syncing an artefact the project has
+/// stopped vouching for. See the call site for why this runs before the
+/// publish transaction.
 fn retire_deleted_modules(
     store: &OciStore,
     project_root: &Path,
     project: &str,
+    withheld: &BTreeMap<String, String>,
     verbose: bool,
 ) -> Result<()> {
     let live: std::collections::BTreeSet<String> = crate::modules_build::list(project_root)?
@@ -655,7 +690,7 @@ fn retire_deleted_modules(
         if shelf == "src" || shelf == "run" || name == "meta" || shelf.contains('/') {
             continue;
         }
-        if !live.contains(name) {
+        if !live.contains(name) || withheld.contains_key(name) {
             stale.push(reference.clone());
         }
     }
@@ -663,7 +698,12 @@ fn retire_deleted_modules(
     stale.dedup();
     for reference in stale {
         if store.remove(&reference).is_ok() && verbose {
-            println!("retired {reference} (module no longer in the source tree)");
+            let why = reference
+                .rsplit_once(':')
+                .and_then(|(body, _)| body.rsplit_once('/'))
+                .and_then(|(_, name)| withheld.get(name))
+                .map_or("module no longer in the source tree", |_| "module withheld");
+            println!("retired {reference} ({why})");
         }
     }
     Ok(())
@@ -731,6 +771,81 @@ mod tests {
             d0, d1,
             "an edit to a #[path]-mounted file outside the module dir must move the digest"
         );
+    }
+
+    /// A withheld module is left out of the publish, its earlier tags are
+    /// retired, and its inputs drop out of the staleness map — while every
+    /// other module in the project still publishes.
+    #[test]
+    fn withheld_module_is_not_published_and_its_old_tags_retire() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pr = scratch.path().join("proj");
+        for name in ["kept", "held"] {
+            let dir = pr.join("modules/app").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.toml"), "version = \"0.1.0\"\n").unwrap();
+            std::fs::write(dir.join("mod.rs"), "pub fn v() {}\n").unwrap();
+        }
+        std::fs::write(
+            pr.join("fluxor.toml"),
+            "[project]\nname = \"heldproj\"\nversion = \"0.0.1\"\n\n[ci]\ntargets = [\"bcm2712\"]\n",
+        )
+        .unwrap();
+        let silicon = pr.join("targets/silicon");
+        std::fs::create_dir_all(&silicon).unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../targets/silicon/bcm2712.toml"),
+            silicon.join("bcm2712.toml"),
+        )
+        .unwrap();
+        let shelf = pr.join("target/fluxor/bcm2712/modules");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join("kept.fmod"), b"kept-bytes").unwrap();
+        std::fs::write(shelf.join("held.fmod"), b"held-bytes").unwrap();
+
+        let store_dir = scratch.path().join("store");
+        let _env = crate::oci_store::test_env_lock();
+        std::env::set_var("FLUXOR_STORE", &store_dir);
+        std::env::set_var("FLUXOR_WORKSPACE", scratch.path().join("no-workspace.toml"));
+
+        let first = publish_project_to_store(&pr, &[], false).unwrap();
+        assert!(first.iter().any(|t| t == "bcm2712/held:0.0.1"), "{first:?}");
+
+        std::fs::write(
+            pr.join("modules/app/held/manifest.toml"),
+            "version = \"0.1.0\"\n\n[publish]\nwithheld = \"licence provenance open\"\n",
+        )
+        .unwrap();
+        let second = publish_project_to_store(&pr, &[], false).unwrap();
+        let digests = super::project_input_digests(&pr).unwrap();
+        let store = crate::oci_store::OciStore::open(&store_dir).unwrap();
+        let held_resolves = store.resolve("bcm2712/held:0.0.1").is_ok();
+        std::env::remove_var("FLUXOR_STORE");
+        std::env::remove_var("FLUXOR_WORKSPACE");
+
+        assert!(
+            second.iter().any(|t| t == "bcm2712/kept:0.0.1"),
+            "{second:?}"
+        );
+        assert!(!second.iter().any(|t| t.contains("/held:")), "{second:?}");
+        assert!(
+            !held_resolves,
+            "a withheld module's earlier tag must be retired"
+        );
+        assert!(digests.contains_key("kept"));
+        assert!(!digests.contains_key("held"));
+    }
+
+    /// `[publish]` without a reason is refused: nobody could lift it.
+    #[test]
+    fn withheld_requires_a_reason() {
+        let err = crate::manifest::Manifest::from_toml_str_for_target(
+            "version = \"0.1.0\"\n\n[publish]\nwithheld = \"  \"\n",
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("withheld"), "{err}");
     }
 
     /// GAP: a zero-artifact project still publishes its (empty)

@@ -359,6 +359,12 @@ fn validate_capability_facts(
                  `requires_capability`."
             )));
         }
+        if fluxor_contracts::vocabulary::PORT_SCOPED_CAPABILITIES.contains(&canonical.as_str()) {
+            return Err(Error::Module(format!(
+                "`{canonical}` facts describe the stream on ONE port, so they belong in \
+                 that port's [ports.facts] table, not in [capability_facts.\"{canonical}\"]."
+            )));
+        }
         let Some(schema) = facts_for(&canonical) else {
             return Err(Error::Module(format!(
                 "capability `{canonical}` carries no facts, so \
@@ -394,6 +400,109 @@ fn validate_capability_facts(
         }
     }
     Ok(())
+}
+
+/// Parse and check a port's `[ports.facts]` table against the fact schema of
+/// the port's surface capability.
+///
+/// Only a content type whose surface capability is PORT-SCOPED takes stream
+/// facts; anywhere else the table would declare terms nothing compares. A set
+/// fact takes one admitted string or a non-empty array of them; a numeric fact
+/// takes one non-negative integer.
+fn normalise_port_facts(
+    port: Option<&str>,
+    content_type: &str,
+    raw: Option<std::collections::BTreeMap<String, toml::Value>>,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    use fluxor_contracts::vocabulary::{
+        fact_rule, facts_for, surface_capability, FactRule, PORT_SCOPED_CAPABILITIES,
+    };
+    let mut out = std::collections::BTreeMap::new();
+    let Some(raw) = raw else {
+        return Ok(out);
+    };
+    let port = port.unwrap_or("<unnamed>");
+    let Some(capability) =
+        surface_capability(content_type).filter(|c| PORT_SCOPED_CAPABILITIES.contains(c))
+    else {
+        return Err(Error::Module(format!(
+            "port `{port}` declares [ports.facts], but `{content_type}` carries no \
+             port-scoped stream facts. Stream facts describe {}.",
+            PORT_SCOPED_CAPABILITIES.join(" / "),
+        )));
+    };
+    let schema = facts_for(capability).unwrap_or(&[]);
+    for (fact, value) in raw {
+        let Some(&(_, admitted)) = schema.iter().find(|(n, _)| *n == fact) else {
+            let candidates: Vec<String> = schema.iter().map(|(n, _)| (*n).to_string()).collect();
+            let did_you_mean = crate::text_distance::closest_match(&fact, &candidates, 3)
+                .map(|s| format!(" Did you mean `{s}`?"))
+                .unwrap_or_default();
+            return Err(Error::Module(format!(
+                "port `{port}`: unknown fact `{fact}` on `{capability}`.{did_you_mean} \
+                 Expected one of: {}.",
+                candidates.join(", "),
+            )));
+        };
+        let values = match (fact_rule(&fact, admitted), value) {
+            (FactRule::Subset, toml::Value::String(v)) => vec![v],
+            (FactRule::Subset, toml::Value::Array(items)) => {
+                let mut vs = Vec::with_capacity(items.len());
+                for item in items {
+                    let toml::Value::String(v) = item else {
+                        return Err(Error::Module(format!(
+                            "port `{port}`: fact `{fact}` lists a non-string value."
+                        )));
+                    };
+                    if vs.contains(&v) {
+                        return Err(Error::Module(format!(
+                            "port `{port}`: fact `{fact}` lists `{v}` twice."
+                        )));
+                    }
+                    vs.push(v);
+                }
+                if vs.is_empty() {
+                    return Err(Error::Module(format!(
+                        "port `{port}`: fact `{fact}` is an empty set, which admits nothing; \
+                         omit the fact to leave it unconstrained."
+                    )));
+                }
+                vs
+            }
+            (FactRule::Exact | FactRule::Ceiling, toml::Value::Integer(i)) => {
+                let Ok(n) = u32::try_from(i) else {
+                    return Err(Error::Module(format!(
+                        "port `{port}`: fact `{fact}` takes a u32, got {i}."
+                    )));
+                };
+                vec![n.to_string()]
+            }
+            (FactRule::Subset, other) => {
+                return Err(Error::Module(format!(
+                    "port `{port}`: fact `{fact}` takes a string or an array of strings, \
+                     got a {}.",
+                    other.type_str()
+                )))
+            }
+            (_, other) => {
+                return Err(Error::Module(format!(
+                    "port `{port}`: fact `{fact}` takes an integer, got a {}.",
+                    other.type_str()
+                )))
+            }
+        };
+        if admitted != fluxor_contracts::vocabulary::FACT_NUMERIC {
+            if let Some(bad) = values.iter().find(|v| !admitted.contains(&v.as_str())) {
+                return Err(Error::Module(format!(
+                    "port `{port}`: value `{bad}` is not admitted for fact `{fact}` on \
+                     `{capability}`. Expected one of: {}.",
+                    admitted.join(", "),
+                )));
+            }
+        }
+        out.insert(fact, values);
+    }
+    Ok(out)
 }
 
 /// Validate `[[requires_when]]` entries: the capability must be one a
@@ -638,6 +747,13 @@ pub struct PortSpec {
     /// satisfied by a `request.http` provider but not the reverse.
     /// `None` = undeclared = unchecked.
     pub requires_capability: Option<String>,
+    /// `[ports.facts]` — the terms of the stream this port carries, keyed by
+    /// fact name, for a content type whose surface capability is port-scoped
+    /// (`vocabulary::PORT_SCOPED_CAPABILITIES`). A set-valued fact holds every
+    /// admitted value the port can carry; a numeric fact holds one value.
+    /// Tools-side only (not serialized); compared across each edge by
+    /// `config::validate::validate_port_facts`.
+    pub facts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1838,6 +1954,11 @@ impl Manifest {
                 idx
             };
 
+            let facts = normalise_port_facts(
+                p.name.as_deref(),
+                CONTENT_TYPES[content_type as usize],
+                p.facts,
+            )?;
             ports.push(PortSpec {
                 direction,
                 content_type,
@@ -1878,6 +1999,7 @@ impl Manifest {
                     Some(c) => Some(canonical_capability(c, "requires_capability")?),
                     None => None,
                 },
+                facts,
             });
         }
 
@@ -1942,6 +2064,19 @@ impl Manifest {
             .collect();
         validate_capability_facts(&capability_facts, &capabilities, &required_caps)?;
         let requires_when = validate_requires_when(toml_val.requires_when.unwrap_or_default())?;
+        // Read for publication by `publish_withheld`; checked here so a
+        // reasonless withholding fails the build, not only the publish.
+        if toml_val
+            .publish
+            .as_ref()
+            .is_some_and(|p| p.withheld.trim().is_empty())
+        {
+            return Err(Error::Module(
+                "[publish] withheld must state why the module is withheld; an empty \
+                 reason gives nobody the means to lift it."
+                    .to_string(),
+            ));
+        }
 
         let observability = match toml_val.observability {
             None => Observability::default(),
@@ -2512,6 +2647,7 @@ impl Manifest {
                 rate_class_max: None,
                 rate_class_default: None,
                 requires_capability: None,
+                facts: std::collections::BTreeMap::new(),
             });
             offset += 4;
         }
@@ -2874,6 +3010,42 @@ struct TomlManifest {
     /// `[execution]` table — step / dispatch cost facts and their profile.
     /// See `ExecutionEnvelope`.
     execution: Option<TomlExecution>,
+    /// `[publish]` table — distribution decisions about this module.
+    publish: Option<TomlPublish>,
+}
+
+/// A module's `[publish] withheld` reason, read from `path` without resolving
+/// the rest of the manifest. Publication decisions are made for every shelf at
+/// once, so they must not depend on a manifest specialised for one silicon —
+/// a per-target capacity with no default would otherwise make the question
+/// unanswerable.
+pub fn publish_withheld(path: &Path) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Only {
+        publish: Option<TomlPublish>,
+    }
+    let text = std::fs::read_to_string(path)?;
+    let only: Only =
+        toml::from_str(&text).map_err(|e| Error::Module(format!("{}: {e}", path.display())))?;
+    match only.publish {
+        None => Ok(None),
+        Some(p) if p.withheld.trim().is_empty() => Err(Error::Module(format!(
+            "{}: [publish] withheld must state why the module is withheld; an empty \
+             reason gives nobody the means to lift it.",
+            path.display()
+        ))),
+        Some(p) => Ok(Some(p.withheld)),
+    }
+}
+
+/// `[publish]` manifest table.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TomlPublish {
+    /// Why this module is kept out of `fluxor publish`. Required when the
+    /// table is present: a withholding nobody can explain is one nobody can
+    /// lift.
+    withheld: String,
 }
 
 /// `[execution]` manifest table as written. Every field is optional at the
@@ -3214,6 +3386,7 @@ impl CapacityValue {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TomlPort {
     direction: String,
     content_type: String,
@@ -3232,6 +3405,9 @@ struct TomlPort {
     /// Capability the peer wired to this port must declare. See
     /// [`PortSpec::requires_capability`].
     requires_capability: Option<String>,
+    /// `[ports.facts]` — see [`PortSpec::facts`]. Read as raw TOML so a set
+    /// may be written as one string or an array, and a number unquoted.
+    facts: Option<std::collections::BTreeMap<String, toml::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -3308,6 +3484,7 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
         });
         m.ports.push(PortSpec {
             direction: 1,
@@ -3320,6 +3497,7 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
         });
         let bytes = m.to_bytes();
         assert_eq!(bytes[14] & 0x20, 0x20, "capacity flag set");
@@ -3347,6 +3525,7 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
         });
         let pb = plain.to_bytes();
         assert_eq!(pb[14] & 0x20, 0);
@@ -3464,6 +3643,7 @@ mod tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
         });
         m.resources.push(ResourceClaim {
             device_class: 0x04,

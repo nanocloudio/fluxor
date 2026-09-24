@@ -2478,6 +2478,7 @@ mod rate_class_resolution_tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2760,6 +2761,7 @@ mod port_capability_tests {
             rate_class_max: None,
             rate_class_default: None,
             requires_capability: None,
+            facts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2908,5 +2910,153 @@ mod port_capability_tests {
         );
         m.insert("sink".to_string(), provider(&["telemetry.sink"], None));
         validate_port_capabilities(&edge(), &m).unwrap();
+    }
+}
+
+/// `[ports.facts]` on encoded ports: parsed against the surface's schema,
+/// compared across each edge, and fan-in refused.
+#[cfg(test)]
+mod port_fact_tests {
+    use super::*;
+    use crate::manifest::Manifest;
+    use std::collections::HashMap;
+
+    fn manifest(ports: &str) -> Manifest {
+        Manifest::from_toml_str_for_target(&format!("version = \"0.1.0\"\n\n{ports}"), None)
+            .expect("manifest parses")
+    }
+
+    fn out_port(facts: &str) -> Manifest {
+        manifest(&format!(
+            "[[ports]]\nname = \"media_out\"\ndirection = \"output\"\ncontent_type = \"AudioEncoded\"\n\
+             [ports.facts]\n{facts}\n"
+        ))
+    }
+
+    fn in_port(facts: &str) -> Manifest {
+        manifest(&format!(
+            "[[ports]]\nname = \"media_in\"\ndirection = \"input\"\ncontent_type = \"AudioEncoded\"\n\
+             [ports.facts]\n{facts}\n"
+        ))
+    }
+
+    fn graph(pairs: &[(&str, Manifest)], wiring: Value) -> (Value, HashMap<String, Manifest>) {
+        let m = pairs
+            .iter()
+            .map(|(n, man)| ((*n).to_string(), man.clone()))
+            .collect();
+        (json!({ "wiring": wiring }), m)
+    }
+
+    #[test]
+    fn a_producer_whose_codecs_the_consumer_takes_is_accepted() {
+        let (cfg, m) = graph(
+            &[("enc", out_port("codec = \"pcmu\"")), ("tx", in_port("codec = [\"pcmu\", \"opus\"]"))],
+            json!([{"from": "enc.media_out", "to": "tx.media_in"}]),
+        );
+        validate_port_facts(&cfg, &m).unwrap();
+    }
+
+    /// Subset, not intersection: a demuxer that MAY emit MP3 must not bind an
+    /// AAC-only decoder just because they share AAC.
+    #[test]
+    fn a_producer_that_may_send_an_untaken_codec_is_refused() {
+        let (cfg, m) = graph(
+            &[("demux", out_port("codec = [\"aac\", \"mp3\"]")), ("dec", in_port("codec = \"aac\""))],
+            json!([{"from": "demux.media_out", "to": "dec.media_in"}]),
+        );
+        let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
+        assert!(e.contains("mp3") && e.contains("demux.media_out"), "{e}");
+    }
+
+    #[test]
+    fn exact_and_ceiling_facts_are_compared() {
+        let (cfg, m) = graph(
+            &[("a", out_port("clock_rate = 8000")), ("b", in_port("clock_rate = 48000"))],
+            json!([{"from": "a.media_out", "to": "b.media_in"}]),
+        );
+        assert!(validate_port_facts(&cfg, &m).is_err());
+        let (cfg, m) = graph(
+            &[("a", out_port("max_payload = 2048")), ("b", in_port("max_payload = 1200"))],
+            json!([{"from": "a.media_out", "to": "b.media_in"}]),
+        );
+        assert!(validate_port_facts(&cfg, &m).is_err());
+        let (cfg, m) = graph(
+            &[("a", out_port("max_payload = 1000")), ("b", in_port("max_payload = 1200"))],
+            json!([{"from": "a.media_out", "to": "b.media_in"}]),
+        );
+        validate_port_facts(&cfg, &m).unwrap();
+    }
+
+    #[test]
+    fn a_fact_one_end_leaves_undeclared_is_unconstrained() {
+        let (cfg, m) = graph(
+            &[("a", out_port("codec = \"opus\"")), ("b", in_port("channels = 2"))],
+            json!([{"from": "a.media_out", "to": "b.media_in"}]),
+        );
+        validate_port_facts(&cfg, &m).unwrap();
+    }
+
+    #[test]
+    fn fan_in_onto_an_encoded_input_is_refused() {
+        let (cfg, m) = graph(
+            &[
+                ("a", out_port("codec = \"pcmu\"")),
+                ("b", out_port("codec = \"pcmu\"")),
+                ("rx", in_port("codec = \"pcmu\"")),
+            ],
+            json!([{"from": "a.media_out", "to": "rx.media_in"}, {"from": "b.media_out", "to": "rx.media_in"}]),
+        );
+        let e = validate_port_facts(&cfg, &m).unwrap_err().to_string();
+        assert!(e.contains("rx.media_in") && e.contains("2 producers"), "{e}");
+    }
+
+    #[test]
+    fn port_facts_are_checked_at_parse() {
+        let bad = |facts: &str, ct: &str| {
+            Manifest::from_toml_str_for_target(
+                &format!(
+                    "version = \"0.1.0\"\n\n[[ports]]\nname = \"p\"\ndirection = \"input\"\n\
+                     content_type = \"{ct}\"\n[ports.facts]\n{facts}\n"
+                ),
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(bad("codec = \"h264\"", "AudioEncoded").contains("not admitted"));
+        assert!(bad("packing = \"annexb\"", "AudioEncoded").contains("not admitted"));
+        assert!(bad("codec = []", "AudioEncoded").contains("empty set"));
+        assert!(bad("codec = [\"aac\", \"aac\"]", "AudioEncoded").contains("twice"));
+        assert!(bad("clock_rate = \"8000\"", "AudioEncoded").contains("integer"));
+        assert!(bad("codc = \"aac\"", "AudioEncoded").contains("Did you mean `codec`"));
+        assert!(bad("channels = 2", "VideoEncoded").contains("unknown fact"));
+        assert!(bad("codec = \"aac\"", "OctetStream").contains("port-scoped"));
+    }
+
+    /// Stream facts live on the port; the module-level table refuses them.
+    #[test]
+    fn module_level_encoded_facts_are_refused() {
+        let e = Manifest::from_toml_str_for_target(
+            "version = \"0.1.0\"\ncapabilities = [\"audio.encoded\"]\n\n\
+             [capability_facts.\"audio.encoded\"]\ncodec = \"aac\"\n",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("[ports.facts]"), "{e}");
+    }
+
+    /// A mistyped port key is an error, not a silently ignored table.
+    #[test]
+    fn unknown_port_keys_are_refused() {
+        let e = Manifest::from_toml_str_for_target(
+            "version = \"0.1.0\"\n\n[[ports]]\ndirection = \"input\"\n\
+             content_type = \"AudioEncoded\"\n[ports.stream]\ncodec = \"aac\"\n",
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("stream"), "{e}");
     }
 }
