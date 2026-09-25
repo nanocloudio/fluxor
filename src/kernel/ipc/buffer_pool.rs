@@ -69,16 +69,22 @@
 
 use portable_atomic::{AtomicI16, AtomicU32, AtomicU8, Ordering};
 
+use crate::kernel::ipc::channel::MAX_CHANNELS;
 use crate::kernel::sys::errno;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/// Maximum number of buffer registry slots.
-/// Must be >= MAX_CHANNELS plus headroom for dynamic allocations.
-/// Bumped from 56 to 256 to fit Quantum's 42-module graph (~110 channels).
-pub const MAX_BUFFER_SLOTS: usize = 256;
+/// Buffer registry slots: one per channel, derived rather than chosen.
+///
+/// `ChannelSlot.buffer_slot` holds a single id and every allocation path takes
+/// the owning channel, so a channel owns at most one buffer — a slot past the
+/// channel table is one nothing can reach, and a pool short of the table makes
+/// the table's upper range unallocatable. A literal here is free to drift from
+/// `MAX_CHANNELS`, and when it does the channel count becomes a ceiling that
+/// lies: `channel_open` starts refusing while the table still has free slots.
+pub const MAX_BUFFER_SLOTS: usize = MAX_CHANNELS;
 
 // Buffer slot ids are stored in `i16` fields on the channel side
 // (`ChannelSlot.buffer_slot`) with `-1` reserved as the unallocated

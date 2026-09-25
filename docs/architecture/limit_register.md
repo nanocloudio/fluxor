@@ -101,7 +101,7 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 30 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `NET_POLICY` = 0x1E, leaving 0x1F–0x3F (33 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
 | module index (exec_order, fault ids) | u8 | 256 | `MAX_MODULES` | modules/sdk/abi/config.rs | 255 | Deliberate keep at u8; the aarch64 profile sits at 255 — every slot the width admits except 0xFF, the no-module sentinel in the page pool, step guard and elastic allocator. Dual asserts: `src/kernel/boot/config.rs`, `src/kernel/exec/scheduler/mod.rs` |
-| channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | 256 | The buffer arena binds first by orders of magnitude |
+| channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | — | Derived, not chosen: one slot per channel (`MAX_CHANNELS`), so the two cannot drift. `ChannelSlot.buffer_slot` holds a single id and every allocation takes its owning channel, so a slot past the channel table is unreachable and a pool short of it leaves the table's upper range unallocatable — `channel_open` refusing while slots are free. The buffer arena binds first by orders of magnitude |
 | owner slot | u16 | 65535 | `MAX_OWNERS` | src/kernel/workload/owner.rs | 64 | Memory/policy binds first; const-asserted ≤ `u16::MAX` |
 | HTTP request path length | u16 | 65535 | `MAX_PATH` | modules/sdk/abi/config.rs | 200 | The wire field is u16; the 200-byte budget is pure memory policy |
 | content-type position | u8 append-only | 256 | — | contracts/src/lib.rs | — | Vocabulary discipline; parallel tables are locked together by const asserts |
@@ -322,7 +322,7 @@ MAX_MODULES | modules/sdk/abi/config.rs | 32 | embedded
 MAX_BRIDGES | modules/sdk/abi/config.rs | 16 | host
 MAX_BRIDGES | modules/sdk/abi/config.rs | 16 | wasm
 MAX_BRIDGES | modules/sdk/abi/config.rs | 8 | embedded
-MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | 256 | *
+MAX_BUFFER_SLOTS | src/kernel/ipc/buffer_pool.rs | MAX_CHANNELS | *
 MAX_OWNERS | src/kernel/workload/owner.rs | 64 | multitenant
 MAX_OWNERS | src/kernel/workload/owner.rs | 1 | single-owner
 MAX_PATH | modules/sdk/abi/config.rs | 200 | host

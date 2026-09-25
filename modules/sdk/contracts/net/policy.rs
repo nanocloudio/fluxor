@@ -279,7 +279,8 @@ pub fn validate(rules: &[u8], caps: u32) -> Result<(), i32> {
                 let Some((dir, _, _)) = isolate(body) else {
                     return Err(EINVAL);
                 };
-                if caps & caps::FILTER == 0 || (dir == rule::DIR_EGRESS && caps & caps::EGRESS == 0) {
+                if caps & caps::FILTER == 0 || (dir == rule::DIR_EGRESS && caps & caps::EGRESS == 0)
+                {
                     return Err(ENOSYS);
                 }
             }
