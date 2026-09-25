@@ -53,7 +53,7 @@ Source: `modules/sdk/contracts/encoded.rs` (`abi::contracts::encoded`).
   units starts the next stream; `END` closes one and tells a decoder to
   flush.
 - **Codec and packing bytes** are positions in
-  `contracts::vocabulary::CODECS` (`pcmu aac mp3 opus h264 h265 vp8`) and
+  `contracts::vocabulary::CODECS` (`pcmu aac mp3 opus h264 h265 vp8 pcma`) and
   `PACKINGS` (`raw framed annexb length_prefixed`). Packing is declared,
   never converted; `stream_is_valid` states which codec takes which
   packing and what configuration it requires.

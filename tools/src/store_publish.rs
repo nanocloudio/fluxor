@@ -353,6 +353,10 @@ pub fn publish_project_with_mode(
         // rather than silent.
         let declared = crate::modules_build::declared_shelves(&pr)?;
         let mut orphaned: Vec<String> = Vec::new();
+        // Every (artefact, shelf) actually prepared, checked below against
+        // every one the project declares.
+        let mut prepared_fmods: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
         let shelf_root = pr.join("target/fluxor");
         if shelf_root.is_dir() {
             for target_dir in std::fs::read_dir(&shelf_root).map_err(Error::Io)? {
@@ -465,8 +469,42 @@ pub fn publish_project_with_mode(
                         manifest_toml.as_deref(),
                         &meta,
                     )?);
+                    prepared_fmods.insert((name.clone(), target.clone()));
                 }
             }
+        }
+        // All or nothing. A module whose artefact is missing from a shelf it
+        // declares keeps its PREVIOUS tag in the store, at whatever epoch that
+        // was built against, while its siblings move on — and a consumer then
+        // refuses the whole project as a mixed-epoch set. A build that failed
+        // for one module must fail the publish, not thin it.
+        let mut missing: Vec<String> = Vec::new();
+        for m in crate::modules_build::list(&pr)? {
+            if m.builtin || withheld.contains_key(&m.name) {
+                continue;
+            }
+            for token in &m.hardware_targets {
+                let Ok(silicon) = crate::modules_build::resolve_silicon(token, &pr) else {
+                    continue;
+                };
+                if declared.contains(&silicon)
+                    && !prepared_fmods.contains(&(m.name.clone(), silicon.clone()))
+                {
+                    missing.push(format!("{silicon}/{}", m.name));
+                }
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort();
+            missing.dedup();
+            return Err(Error::Module(format!(
+                "publish refused: {} module artefact(s) are missing from shelves this \
+                 project declares: {}. Publishing without them would leave their earlier \
+                 tags in the store at a different ABI epoch, which every consumer refuses \
+                 as a mixed set — run `fluxor modules build --all` and fix what fails",
+                missing.len(),
+                missing.join(", "),
+            )));
         }
         // Said on every publish, so a withheld module is never mistaken for
         // one that was forgotten.
@@ -835,6 +873,60 @@ mod tests {
         );
         assert!(digests.contains_key("kept"));
         assert!(!digests.contains_key("held"));
+    }
+
+    /// A declared module with no artefact on a declared shelf refuses the whole
+    /// publish, naming it — the alternative is a store that mixes epochs.
+    #[test]
+    fn a_missing_declared_artefact_refuses_the_publish() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pr = scratch.path().join("proj");
+        for name in ["built", "unbuilt"] {
+            let dir = pr.join("modules/app").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("manifest.toml"),
+                "version = \"0.1.0\"\nhardware_targets = [\"bcm2712\"]\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("mod.rs"), "pub fn v() {}\n").unwrap();
+        }
+        std::fs::write(
+            pr.join("fluxor.toml"),
+            "[project]\nname = \"gapproj\"\nversion = \"0.0.1\"\n\n[ci]\ntargets = [\"bcm2712\"]\n",
+        )
+        .unwrap();
+        let silicon = pr.join("targets/silicon");
+        std::fs::create_dir_all(&silicon).unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../targets/silicon/bcm2712.toml"),
+            silicon.join("bcm2712.toml"),
+        )
+        .unwrap();
+        let shelf = pr.join("target/fluxor/bcm2712/modules");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join("built.fmod"), b"built-bytes").unwrap();
+
+        let store_dir = scratch.path().join("store");
+        let _env = crate::oci_store::test_env_lock();
+        std::env::set_var("FLUXOR_STORE", &store_dir);
+        std::env::set_var("FLUXOR_WORKSPACE", scratch.path().join("no-workspace.toml"));
+        let err = publish_project_to_store(&pr, &[], false)
+            .unwrap_err()
+            .to_string();
+        let store_exists = store_dir.join("index.json").exists()
+            && crate::oci_store::OciStore::open(&store_dir)
+                .and_then(|s| s.resolve("bcm2712/built:0.0.1"))
+                .is_ok();
+        std::env::remove_var("FLUXOR_STORE");
+        std::env::remove_var("FLUXOR_WORKSPACE");
+
+        assert!(err.contains("bcm2712/unbuilt"), "{err}");
+        assert!(
+            !store_exists,
+            "nothing may be published when one artefact is missing"
+        );
     }
 
     /// `[publish]` without a reason is refused: nobody could lift it.

@@ -521,10 +521,10 @@ pub const CAPABILITY_FACTS: &[CapabilityFacts] = &[
 // cannot keep, and adding one later is a single append.
 
 /// Every codec an encoded stream may carry, in wire-byte order.
-pub const CODECS: &[&str] = &["pcmu", "aac", "mp3", "opus", "h264", "h265", "vp8"];
+pub const CODECS: &[&str] = &["pcmu", "aac", "mp3", "opus", "h264", "h265", "vp8", "pcma"];
 
 /// The codecs `AudioEncoded` carries.
-pub const AUDIO_CODECS: FactValues = &["pcmu", "aac", "mp3", "opus"];
+pub const AUDIO_CODECS: FactValues = &["pcmu", "aac", "mp3", "opus", "pcma"];
 
 /// The codecs `VideoEncoded` carries.
 pub const VIDEO_CODECS: FactValues = &["h264", "h265", "vp8"];

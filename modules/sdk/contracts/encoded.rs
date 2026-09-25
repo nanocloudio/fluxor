@@ -82,8 +82,9 @@ pub const CODEC_OPUS: u8 = 3;
 pub const CODEC_H264: u8 = 4;
 pub const CODEC_H265: u8 = 5;
 pub const CODEC_VP8: u8 = 6;
+pub const CODEC_PCMA: u8 = 7;
 /// Number of allocated codec bytes.
-pub const CODEC_COUNT: u8 = 7;
+pub const CODEC_COUNT: u8 = 8;
 
 /// Packing wire bytes — positions in `vocabulary::PACKINGS`.
 pub const PACKING_RAW: u8 = 0;
@@ -102,7 +103,10 @@ const FLAGS_LATER_FRAGMENT: u8 = FLAG_CONTINUES | FLAG_TRUNCATED;
 
 /// Whether `codec` is an audio codec (`AudioEncoded`).
 pub const fn is_audio(codec: u8) -> bool {
-    matches!(codec, CODEC_PCMU | CODEC_AAC | CODEC_MP3 | CODEC_OPUS)
+    matches!(
+        codec,
+        CODEC_PCMU | CODEC_AAC | CODEC_MP3 | CODEC_OPUS | CODEC_PCMA
+    )
 }
 
 /// Whether `codec` is a video codec (`VideoEncoded`).
@@ -130,7 +134,7 @@ pub fn stream_is_valid(
         return false;
     }
     match (codec, packing) {
-        (CODEC_PCMU, PACKING_RAW) => config.is_empty(),
+        (CODEC_PCMU | CODEC_PCMA, PACKING_RAW) => config.is_empty(),
         // Raw AAC is undecodable without its AudioSpecificConfig (two bytes at
         // minimum); ADTS carries the same facts in every frame header.
         (CODEC_AAC, PACKING_RAW) => config.len() >= 2,
