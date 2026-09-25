@@ -531,7 +531,10 @@ const STORE_SOURCE: [u8; 16] = *b"fluxor-cp-store\0";
 /// same store look like two independent domains.
 const STORE_DEVICE_ID: u64 = 1;
 
-const STORE_MAX_SUBS: usize = 64;
+/// One subscription per watched prefix per module. Sized as bare metal's
+/// (`bcm2712/store.rs` `MAX_SUBS`): a whole control plane asks for ~95, and a
+/// graph that runs here must run there.
+const STORE_MAX_SUBS: usize = 256;
 const STORE_MAX_READS: usize = 32;
 
 #[derive(Clone, Copy)]

@@ -43,8 +43,12 @@ pub const MAX_VALUE: usize = 4096;
 /// Retained change history. A watcher that falls further behind than this is
 /// told to relist (the `Lost` sentinel) rather than handed a gap.
 pub const HISTORY: usize = 128;
-/// Concurrent subscriptions, and open read slots.
-const MAX_SUBS: usize = 64;
+/// Concurrent subscriptions, and open read slots. One subscription per watched
+/// prefix per module: a control plane of ~45 reconcilers, most watching their
+/// own collection plus the ones they depend on, asks for ~95 — so the table is
+/// sized for a whole control plane with headroom (~55 KiB of statics), not for
+/// a handful of watchers. A refused subscription answers ENOMEM.
+const MAX_SUBS: usize = 256;
 const MAX_READS: usize = 32;
 
 /// `CONTENT_TYPES` byte for `NamespaceChange` (`contracts/src/lib.rs`). A

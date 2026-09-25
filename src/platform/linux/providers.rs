@@ -813,6 +813,9 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
             let mut out_pos: usize = 2;
             let mut count: u16 = 0;
             loop {
+                // Where this entry starts, so an entry that does not fit
+                // the caller's buffer is put back for the next call.
+                let before = libc::telldir(dir);
                 // libc::readdir returns NULL on end-of-dir OR error.
                 // We don't distinguish — caller sees this as `0` for
                 // "directory drained" either way.
@@ -844,23 +847,14 @@ pub unsafe fn linux_fs_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len:
                 let is_dir = ent.d_type == libc::DT_DIR;
                 let need = 2 + nlen;
                 if out_pos + need > arg_len {
-                    // Buffer full. libc::readdir has already advanced
-                    // past this entry, so we have to spill it forward —
-                    // simplest correct behaviour is to rewind by seeking
-                    // back one entry. Portable POSIX doesn't expose a
-                    // "putback" so we use telldir/seekdir.
-                    // Note: linux harness use case is small directories
-                    // (audio/image asset folders) where one READDIR call
-                    // drains everything; this branch is the rare edge.
+                    // Buffer full: put the entry back rather than drop it, so
+                    // it opens the next batch. Unconditionally — `E2BIG` tells
+                    // the caller to retry with a larger buffer, and an entry
+                    // consumed on the way out is one the retry never sees.
+                    libc::seekdir(dir, before);
                     if count == 0 {
                         return errno::E2BIG;
                     }
-                    // We can't easily un-read the entry — best effort
-                    // is to truncate here and let the caller realise
-                    // one entry was dropped via a smaller-than-expected
-                    // total. For the bank scan use case this is fine
-                    // (16 paths max anyway). For pathological inputs
-                    // the caller should retry with a larger buffer.
                     break;
                 }
                 *arg.add(out_pos) = nlen as u8;
@@ -918,6 +912,12 @@ struct LinuxProcSlot {
     exec: Option<crate::platform::proc_executor::ProcExecutor>,
     in_use: bool,
     deadline: Option<std::time::Instant>,
+    /// Stdout is a byte stream carried in frames: a frame larger than a
+    /// caller's `PROC_READ` buffer is staged here and served across calls, so
+    /// no read size loses bytes.
+    staged: [u8; crate::platform::proc_executor::READ_CHUNK],
+    staged_len: usize,
+    staged_off: usize,
 }
 
 static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] = [const {
@@ -925,6 +925,9 @@ static mut LINUX_PROCS: [LinuxProcSlot; MAX_PROCS] = [const {
         exec: None,
         in_use: false,
         deadline: None,
+        staged: [0; crate::platform::proc_executor::READ_CHUNK],
+        staged_len: 0,
+        staged_off: 0,
     }
 }; MAX_PROCS];
 
@@ -1044,6 +1047,8 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 Ok(exec) => {
                     procs[slot].exec = Some(exec);
                     procs[slot].in_use = true;
+                    procs[slot].staged_len = 0;
+                    procs[slot].staged_off = 0;
                     procs[slot].deadline = Some(
                         std::time::Instant::now()
                             + std::time::Duration::from_millis(grant.timeout_ms),
@@ -1059,10 +1064,21 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 return errno::EINVAL;
             }
             let out = core::slice::from_raw_parts_mut(arg, arg_len);
-            match procs[slot].exec.as_ref().and_then(|e| e.poll_stdout(out)) {
-                Some(n) => n as i32,
-                None => 0, // nothing ready this step
+            let p = &mut procs[slot];
+            if p.staged_off >= p.staged_len {
+                // A whole frame into the stage, whatever the caller's size.
+                match p.exec.as_ref().and_then(|e| e.poll_stdout(&mut p.staged)) {
+                    Some(n) => {
+                        p.staged_len = n;
+                        p.staged_off = 0;
+                    }
+                    None => return 0, // nothing ready this step
+                }
             }
+            let n = (p.staged_len - p.staged_off).min(out.len());
+            out[..n].copy_from_slice(&p.staged[p.staged_off..p.staged_off + n]);
+            p.staged_off += n;
+            n as i32
         }
         PROC_STATUS => {
             let slot = slot_of(handle) as usize;
@@ -1077,6 +1093,7 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
             let timed_out = procs[slot]
                 .deadline
                 .is_some_and(|dl| std::time::Instant::now() >= dl);
+            let staged = procs[slot].staged_off < procs[slot].staged_len;
             let e = match procs[slot].exec.as_mut() {
                 Some(e) => e,
                 None => return errno::EINVAL,
@@ -1085,10 +1102,10 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 e.shutdown(std::time::Duration::from_millis(50));
             }
             // Done only when the child has exited AND both reader threads finished
-            // AND the inbound bridge is drained — otherwise a final in-flight chunk
-            // would be lost. 1 = more may come; 0 = truly done.
-            let running =
-                !timed_out && (e.alive() || !e.reader_finished() || e.stdout_pending() > 0);
+            // AND the inbound bridge and the read stage are drained — otherwise a
+            // final in-flight chunk would be lost. 1 = more may come; 0 = truly done.
+            let running = !timed_out
+                && (e.alive() || !e.reader_finished() || e.stdout_pending() > 0 || staged);
             // Every answer that says done carries how the command ended:
             // `arg` (LE i32) is its exit code, `128 + signal` when a signal
             // ended it, and -1 when the status could not be read at all. A
@@ -1108,6 +1125,11 @@ pub unsafe fn linux_proc_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_le
                 }
                 procs[slot].in_use = false;
                 procs[slot].deadline = None;
+                // The stage holds bytes the closed child wrote. Cleared with
+                // the rest of the slot's per-run state rather than left for
+                // whoever spawns into this slot next.
+                procs[slot].staged_len = 0;
+                procs[slot].staged_off = 0;
             }
             0
         }
@@ -1208,6 +1230,8 @@ pub const LINUX_NET_MAX_INBOUND: usize = 8;
 /// time a send backs up and released with the slot, so the cap is a
 /// per-connection worst case, not a resident cost.
 pub const LINUX_NET_WRITE_BUF_DEFAULT: usize = 128 * 1024;
+/// The largest command frame payload read (the command scratch).
+const LINUX_NET_CMD_MAX: usize = 49152;
 /// Listen backlog when the graph does not set `listen_backlog`. The
 /// kernel's SYN queue must absorb a whole connect burst; at 8 a
 /// 32-client burst dropped SYNs 9..=32.
@@ -1250,8 +1274,9 @@ struct LinuxNetConn {
     /// value or the command is refused with `EPERM`. Zero is the host
     /// wildcard, reachable by the untagged shape.
     dg_owner_tag: u16,
-    /// Unsent bytes. Empty until a send backs up; then sized to the
-    /// instance's `write_buf_max` and kept until the slot is released.
+    /// Unsent bytes. Empty until a send backs up; then grown as the backlog
+    /// does (to the instance's `write_buf_max`) and kept until the slot is
+    /// released.
     write_buf: Vec<u8>,
     /// `state == 4` (closed, id held): when the id is released if the
     /// consumer has not sent CMD_CLOSE by then. net_proto's release rule —
@@ -1342,7 +1367,7 @@ pub struct LinuxNetState {
     /// truncate the second `channel_read` and corrupt the next
     /// frame's header parse. Sized at 16 KiB to leave headroom for
     /// any future raise in `NET_BUF_SIZE` without re-sync.
-    cmd_buf: [u8; 49152],
+    cmd_buf: [u8; LINUX_NET_CMD_MAX],
     msg_buf: [u8; 16384],
     recv_buf: [u8; 16384],
     /// The part of `recv_buf` a full channel left un-forwarded, and the
@@ -1624,7 +1649,7 @@ impl LinuxNetState {
             epfd,
             ready,
             ready_len: 0,
-            cmd_buf: [0u8; 49152],
+            cmd_buf: [0u8; LINUX_NET_CMD_MAX],
             msg_buf: [0u8; 16384],
             recv_buf: [0u8; 16384],
             hold_slot: -1,
@@ -2779,8 +2804,16 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
         return;
     }
 
-    if conn.write_buf.len() < write_buf_max {
-        conn.write_buf.resize(write_buf_max, 0);
+    // Grown as needed (doubling, to `write_buf_max`) rather than sized to the
+    // maximum on the first short send: a large maximum is for the peer that
+    // falls far behind, not a cost every briefly-backlogged connection pays.
+    let need = already + remaining;
+    if conn.write_buf.len() < need {
+        let mut cap = conn.write_buf.len().max(64 * 1024);
+        while cap < need {
+            cap = cap.saturating_mul(2);
+        }
+        conn.write_buf.resize(cap.min(write_buf_max), 0);
     }
     let dst = &mut conn.write_buf[already..already + remaining];
     dst.copy_from_slice(&data[sent_now..]);
@@ -2788,20 +2821,31 @@ unsafe fn linux_net_cmd_send(st: &mut LinuxNetState, conn_id: u16, data: &[u8]) 
 }
 
 /// Try to drain any per-connection write backlog. Returns true if any
-/// connection still has *substantial* pending bytes after the pass
-/// (more than half its `write_buf`) — the caller uses this as a soft
-/// hint to defer further `CMD_SEND` consumption so the upstream channel
-/// applies back-pressure. Lighter backlogs don't gate, so commands like
-/// `CMD_CLOSE` for parallel/orphan connections still flow through.
+/// connection's backlog is FULL after the pass — it could not take one more
+/// command frame (`backlog_full`) — and the caller defers further command
+/// reads so the upstream channel applies back-pressure. Only then: the
+/// channel is shared by every connection, so gating on a backlog that is
+/// merely large holds up every other connection's commands behind one peer
+/// that is slow to read (a watch client busy elsewhere stalled the whole API
+/// server's answers that way). A large backlog is buffered instead, up to
+/// `write_buf_max`.
 ///
 /// Connections whose `libc::send` returns a hard error (EPIPE,
 /// ECONNRESET, EBADF, …) — i.e. the peer is gone — are torn down here
 /// rather than left pending forever. Without this the gating signal
 /// would stay true, blocking every subsequent channel read and making
 /// the server unable to handle a second connection.
+/// A backlog of `pending` bytes that could not take one more command frame
+/// (`LINUX_NET_CMD_MAX`) without passing `write_buf_max`. While one exists no
+/// command is read, so a frame that is read always fits and the overflow
+/// close in `linux_net_cmd_send` is reached only when `write_buf_max` itself
+/// is smaller than a frame.
+fn backlog_full(write_buf_max: usize, pending: usize) -> bool {
+    pending > 0 && pending + LINUX_NET_CMD_MAX > write_buf_max
+}
+
 unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
     let mut heavy_pending = false;
-    let threshold = st.write_buf_max / 2;
     for i in 0..st.conns.len() {
         let c = &mut st.conns[i];
         if c.fd < 0 || c.write_len == c.write_offset {
@@ -2829,7 +2873,7 @@ unsafe fn linux_net_drain_writes(st: &mut LinuxNetState) -> bool {
             }
         }
         let still_pending = (c.write_len - c.write_offset) as usize;
-        if still_pending > threshold {
+        if backlog_full(st.write_buf_max, still_pending) {
             heavy_pending = true;
         }
         if c.write_offset >= c.write_len {
@@ -3352,7 +3396,11 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
         }
 
         if !heavy_pending {
+            let mut gated = false;
             for lane in 0..LINUX_NET_MAX_INBOUND {
+                if gated {
+                    break;
+                }
                 let lane_ch = st.net_ins[lane];
                 if lane_ch < 0 {
                     continue;
@@ -3451,6 +3499,16 @@ pub fn linux_net_step(state: *mut u8) -> i32 {
                                 core::slice::from_raw_parts(st.cmd_buf.as_ptr().add(2), data_len);
                             linux_net_cmd_send(st, conn_id, data_slice);
                             had_work = true;
+                            // This connection's backlog can take no further
+                            // frame: stop reading until it drains, as the
+                            // pass above would have.
+                            if let Some(c) = st.conns.get(conn_id as usize) {
+                                let pending = (c.write_len - c.write_offset) as usize;
+                                if backlog_full(st.write_buf_max, pending) {
+                                    gated = true;
+                                    break;
+                                }
+                            }
                         }
                         CMD_CLOSE if payload_len >= 2 => {
                             let conn_id = u16::from_le_bytes([st.cmd_buf[0], st.cmd_buf[1]]);

@@ -3,8 +3,8 @@
 //! Owns one external-hosted process for a graph-resident proxy node: blocking
 //! spawn/read/write/wait/kill all happen on worker threads or the caller's
 //! control path — **never** in `module_step`. The proxy polls both directions
-//! through bounded [`ExtBridge`] queues (§6.8: bounded, declared overload
-//! policy, cannot block the scheduler or grow unbounded):
+//! through bounded [`ExtBridge`] queues — each with a declared overload
+//! policy, so neither can block the scheduler or grow without limit:
 //!
 //! ```text
 //!   module_step ── send_stdin ──▶ [ExtBridge] ──▶ writer thread ──▶ child stdin
@@ -14,12 +14,12 @@
 //! stdout rides the bridge as arbitrary chunks (byte-stream passthrough); a
 //! `Block`-policy inbound bridge makes backpressure real: when the graph stops
 //! draining, the reader stops reading and the pipe fills, throttling the
-//! external process (§6.8).
+//! external process.
 //!
-//! Owner scoping (§14 invariant 9): the executor records its owner handle and
-//! the child **cannot outlive revocation** — `shutdown` follows the §6.8
-//! quiesce order (stop reads → SIGTERM → bounded drain deadline → SIGKILL),
-//! and `Drop` force-kills as the last line of defence.
+//! Owner scoping: the executor records its owner handle and the child
+//! **cannot outlive revocation** — `shutdown` quiesces in order (stop reads →
+//! SIGTERM → bounded drain deadline → SIGKILL), and `Drop` force-kills as the
+//! last line of defence.
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -32,12 +32,14 @@ use crate::kernel::workload::extbridge::{ExtBridge, OverloadPolicy, PushOutcome}
 use crate::kernel::workload::owner::OwnerHandle;
 
 /// Bridge capacity per direction. 16 KiB absorbs bursty chunked output while
-/// keeping the §10.4 per-owner buffer budget honest.
+/// keeping the per-owner buffer budget honest.
 const BRIDGE_CAP: usize = 16 * 1024;
-/// Reader chunk size (also the largest frame the reader produces).
-const READ_CHUNK: usize = 1024;
+/// The reader thread's chunk size, and so the largest stdout frame it pushes.
+/// A `PROC_READ` stages one frame and serves it across as many calls as the
+/// caller's buffer size needs.
+pub(crate) const READ_CHUNK: usize = 1024;
 
-/// The host-side grant a spawn is scoped by (the `proc` policy §5): the process
+/// The host-side grant a spawn is scoped by: the process
 /// starts in `cwd` and inherits ONLY the named env vars — no ambient environment, so
 /// node secrets don't leak into `do` children. Empty `cwd` = the node's cwd.
 #[derive(Default, Clone)]
@@ -111,7 +113,7 @@ impl ProcExecutor {
             command.current_dir(dir);
         }
         // No ambient environment — inherit ONLY the allowlisted names, so node
-        // secrets never leak into a `do` child (§5 hygiene).
+        // secrets never leak into a `do` child.
         command.env_clear();
         for name in &policy.env_allow {
             if let Ok(val) = std::env::var(name) {
@@ -228,7 +230,7 @@ impl ProcExecutor {
         self.stdout_bridge.len_bytes()
     }
 
-    /// §6.8 quiesce order: stop new bridge reads, signal the process (SIGTERM),
+    /// Quiesce in order: stop new bridge reads, signal the process (SIGTERM),
     /// wait out the bounded drain deadline, then SIGKILL. Returns true if the
     /// process exited within `grace` (false = it needed the kill).
     pub fn shutdown(&mut self, grace: Duration) -> bool {
@@ -265,8 +267,8 @@ impl ProcExecutor {
 }
 
 impl Drop for ProcExecutor {
-    /// Last line of defence for §14 invariant 9: the external process cannot
-    /// outlive owner revocation. Normal teardown goes through `shutdown`.
+    /// Last line of defence: the external process cannot outlive owner
+    /// revocation. Normal teardown goes through `shutdown`.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.child.kill();

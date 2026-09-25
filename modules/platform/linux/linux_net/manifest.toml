@@ -11,9 +11,13 @@ type = "u32"
 default = 128
 range = [2, 65535]
 
-# Per-connection unsent-byte backlog cap, KiB. Allocated on first
-# back-up and released with the slot; overflowing it closes the
-# connection.
+# Per-connection unsent-byte backlog cap, KiB. Grown as a send backs up
+# and released with the slot. Commands stop being read (back-pressure on
+# the shared upstream channel) only while some backlog is FULL — one more
+# command frame would not fit — so a peer slow to read is buffered up to
+# this cap without holding up every other connection. A server whose
+# answers are large (a Kubernetes API: 1 MiB objects) sets it to hold a
+# few of them.
 [[params]]
 name = "write_buf_kib"
 tag = 11
