@@ -130,6 +130,20 @@ fn wasm_init_providers() {
     // presenter pace on ONE audio-master clock (mirrors the Linux/RP2350 audio
     // sinks registering HAL_PIO). See `stream_time.rs`.
     super::stream_time::register();
+    // net.policy (0x1E): a browser has no packet path to enforce on. Tables
+    // are accepted and recorded — a controller's output stays observable —
+    // and CAPS never claims ENFORCED.
+    {
+        use crate::kernel::module::provider;
+        use crate::kernel::module::provider::contract as dev_class;
+        provider::register(dev_class::NET_POLICY, wasm_net_policy_dispatch);
+    }
+}
+
+unsafe fn wasm_net_policy_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use crate::abi::contracts::net::policy::caps;
+    let c = caps::FILTER | caps::DNAT | caps::BALANCE | caps::EGRESS;
+    crate::kernel::net_policy::dispatch(c, None, handle, opcode, arg, arg_len)
 }
 /// Platform-specific per-module cleanup for WASM host..
 ///

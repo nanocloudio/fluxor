@@ -338,6 +338,9 @@ fn generate_config_impl(
     // (`capacity::kernel_max_modules`, drift-pinned against the kernel
     // source). Configs with no resolved target build for the host profile.
     let max_modules = crate::capacity::kernel_max_modules(resolved_target.unwrap_or("linux"));
+    // The edge ceiling follows the same profile, and the graph section is
+    // laid out for exactly that many slots (`capacity::kernel_max_edges`).
+    let max_edges = crate::capacity::kernel_max_edges(resolved_target.unwrap_or("linux"));
     let (module_entries, module_names) = parse_modules_map(
         modules_ref,
         data_section,
@@ -567,11 +570,11 @@ fn generate_config_impl(
     // block are unaffected. Lives in a standalone, unit-testable module.
     crate::presentation_shell::validate(config, &module_names).map_err(Error::Config)?;
 
-    if edges.len() > MAX_GRAPH_EDGES {
+    if edges.len() > max_edges {
         return Err(Error::Config(format!(
             "Too many graph edges: {} > {}",
             edges.len(),
-            MAX_GRAPH_EDGES
+            max_edges
         )));
     }
 
@@ -617,7 +620,8 @@ fn generate_config_impl(
 
     // Counts (8 bytes): module_count(1), edge_count(1), tick_us(2), graph_sample_rate(4)
     result.push(module_entries.len() as u8); // module_count
-    result.push(edges.len() as u8); // edge_count
+    // edge_count LOW byte; the high byte rides graph-section byte 2.
+    result.push((edges.len() & 0xFF) as u8); // edge_count
     result.extend_from_slice(&tick_us.to_le_bytes()); // tick_us (u16, bytes 10-11)
     result.extend_from_slice(&graph_sample_rate.to_le_bytes()); // graph_sample_rate (u32, bytes 12-15)
 
@@ -747,7 +751,7 @@ fn generate_config_impl(
 
     // Graph section.
     //   header (4 bytes): edge_count, flags, reserved[2]
-    //   edges  (MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE bytes)
+    //   edges  (max_edges * GRAPH_EDGE_SIZE bytes)
     //   domain metadata (DOMAIN_META_SIZE bytes)
     //
     // Edge format (GRAPH_EDGE_SIZE bytes; mirrors
@@ -774,9 +778,10 @@ fn generate_config_impl(
     // `assign_buffer_groups`.
     // Graph section header layout — must agree with the parser at
     // `src/kernel/boot/config.rs::read_config_at_into` (graph_flags read).
-    //   byte 0: edge_count
+    //   byte 0: edge_count low byte
     //   byte 1: graph_flags (bit 0 = ACCEPT_CYCLES; bits 1-7 reserved)
-    //   bytes 2-3: reserved (must be 0)
+    //   byte 2: edge_count high byte (0 up to 255 edges)
+    //   byte 3: edge-slot code — the section's size (`capacity::graph_slots_code`)
     let accept_cycles = config
         .get("scheduler")
         .and_then(|s| s.get("accept_cycles"))
@@ -784,10 +789,12 @@ fn generate_config_impl(
         .unwrap_or(false);
     let graph_flags: u8 = if accept_cycles { 0x01 } else { 0x00 };
 
-    let mut graph_section = Vec::with_capacity(GRAPH_SECTION_SIZE);
-    graph_section.push(edges.len() as u8);
+    let graph_section_size = 4 + max_edges * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
+    let mut graph_section = Vec::with_capacity(graph_section_size);
+    graph_section.push((edges.len() & 0xFF) as u8);
     graph_section.push(graph_flags);
-    graph_section.extend_from_slice(&[0u8; 2]);
+    graph_section.push((edges.len() >> 8) as u8);
+    graph_section.push(crate::capacity::graph_slots_code(max_edges));
     for (i, (from_id, to_id, to_port, from_port_index, to_port_index)) in edges.iter().enumerate() {
         let group = buffer_groups.get(i).copied().unwrap_or(0);
         let ec = edge_classes.get(i).copied().unwrap_or(0);
@@ -804,7 +811,7 @@ fn generate_config_impl(
         graph_section.extend_from_slice(&[0u8; 2]);
     }
     // Pad edge entries to fixed offset, then write domain metadata
-    while graph_section.len() < 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE {
+    while graph_section.len() < 4 + max_edges * GRAPH_EDGE_SIZE {
         graph_section.push(0);
     }
     // Domain metadata: 4 entries × DOMAIN_META_ENTRY_SIZE (4) bytes:
@@ -843,7 +850,7 @@ fn generate_config_impl(
         graph_section.push(mode);
         graph_section.push(flags); // adaptive_flags = byte 3 of the domain entry
     }
-    while graph_section.len() < GRAPH_SECTION_SIZE {
+    while graph_section.len() < graph_section_size {
         graph_section.push(0);
     }
     result.extend_from_slice(&graph_section);

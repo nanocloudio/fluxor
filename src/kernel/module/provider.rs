@@ -159,6 +159,14 @@ pub mod contract {
     /// Semantic constants live at `abi::contracts::trust`.
     pub const TRUST: u16 = 0x001D;
 
+    /// Packet policy and service NAT enforced by the platform — opcode class
+    /// 0x1Exx. Named tables of neutral rules (allow/drop/isolate/dnat) that
+    /// the linux platform realizes as nftables, bare metal as the in-graph
+    /// packet filter's table, and wasm records without enforcing — the
+    /// provider's CAPS say which. Semantic constants live at
+    /// `abi::contracts::net::policy`.
+    pub const NET_POLICY: u16 = 0x001E;
+
     /// Platform-neutral isolated-workload surface — opcode class 0x1Axx. One
     /// contract for "run an isolated workload with a declared capability
     /// envelope," realized by two placement-resolved backends: an fmod-graph

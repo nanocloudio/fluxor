@@ -614,6 +614,9 @@ pub fn run(project_root: &Path, skip: &SkipSet, verbose: bool) -> Result<Vec<Pha
     // `fluxor test` and by nothing in the gate.
     //
     // `cargo_integration_sites` is the same call `fluxor test` makes.
+    if !skip.cargo && is_fluxor_kernel_workspace(project_root) {
+        ensure_host_binary(project_root, verbose);
+    }
     for (label, dir, args) in cargo_integration_sites(project_root) {
         results.push(if skip.cargo {
             skipped(label)
@@ -1250,6 +1253,50 @@ pub(crate) fn cargo_host_tools_dir(project_root: &Path) -> Option<PathBuf> {
     (dir != root && dir.join("Cargo.toml").is_file()).then_some(dir)
 }
 
+/// The triple the Tier-2 harness suites are built and run for. One spelling,
+/// because the phase that runs them and the step that provides their binary
+/// have to agree: a binary under another triple is a binary those tests skip.
+const HARNESS_TARGET: &str = "aarch64-unknown-linux-gnu";
+
+/// Build `fluxor-linux` so the Tier-2 integration tests have the binary they
+/// drive.
+///
+/// Those tests boot the production binary and observe it as a user would. When
+/// it is absent each one prints a skip line and RETURNS — which libtest records
+/// as a pass, so the phase reports green over suites that never ran. `make ci`
+/// is `fluxor ci` alone and does not depend on `make install`, so nothing else
+/// in the gate guarantees the binary exists.
+///
+/// Only when it is missing: a present binary is left alone, because rebuilding
+/// it here would overwrite whatever the developer is testing against.
+fn ensure_host_binary(project_root: &Path, verbose: bool) {
+    let bin = project_root
+        .join("target")
+        .join(HARNESS_TARGET)
+        .join("release")
+        .join("fluxor-linux");
+    if bin.is_file() {
+        return;
+    }
+    if verbose {
+        println!("  building fluxor-linux for the integration tests");
+    }
+    let _ = cargo_in(
+        project_root,
+        &[
+            "build",
+            "--release",
+            "--bin",
+            "fluxor-linux",
+            "--no-default-features",
+            "--features",
+            "host-linux,host-playback,host-hsm",
+            "--target",
+            HARNESS_TARGET,
+        ],
+    );
+}
+
 /// The UNIT-test invocation: `(directory, args)`, or `None` with no cargo tree.
 ///
 /// One definition, read by `fluxor ci`'s unit-test phase and by the `fluxor test`
@@ -1313,12 +1360,7 @@ pub(crate) fn integration_sites_for(
         out.push((
             "cargo-test (harness)",
             root.join("tests/harness"),
-            vec![
-                "test",
-                "--target",
-                "aarch64-unknown-linux-gnu",
-                "--no-fail-fast",
-            ],
+            vec!["test", "--target", HARNESS_TARGET, "--no-fail-fast"],
         ));
     }
     if host_tools.is_none() && has_cargo && has_root_tests {

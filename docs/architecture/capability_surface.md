@@ -212,6 +212,7 @@ Hardware-facing roles:
 |------------|---------|
 | `display.scanout` | Paced display output |
 | `display.multihead` | Multiple simultaneous scanout heads |
+| `display.capture` | Produces frames of a display that exists elsewhere — a shared screen, window or tab — as opposed to *being* a display or being a camera. Declared as a role rather than left to convention, because a viewer that cannot tell a shared screen from a camera cannot tell a person what is being shared |
 | `display.scanout.protected` | Protected-content scanout path |
 | `video.decode` | Hardware video decode |
 | `video.encode` | Hardware video encode |
@@ -299,6 +300,7 @@ Target-provided:
 | Capability | Meaning |
 |------------|---------|
 | `time.wall` | Calendar time (seconds since the Unix epoch) the platform can vouch for, as `timer::TRUSTED_UNIX` reports it. Fact `source`: `rtc`, `network_sync` or `signed_authority` — the strongest class the HAL reports `TRUSTED` for |
+| `trust.system` | Whether the platform will verify a certificate chain and answer for it — the `trust` contract (class `0x001D`). Carries no facts: a verifier either answers or it does not. True of the TARGET, not of the machine — a linux host whose root bundle is missing still answers, by refusing every chain |
 
 Replication and streaming:
 
@@ -355,7 +357,8 @@ from the target-facts table, which also carries the vault's suite set and
 custody-tier ceiling for the same reason — the vault is a kernel contract
 class, per target, not a module.
 
-Today the one such capability is `time.wall`. At runtime the kernel's
+Two capabilities are answered this way: `time.wall` and `trust.system`.
+At runtime the kernel's
 `timer::TRUSTED_UNIX` record says whether a reading is `TRUSTED` (backed by
 synchronisation evidence), which epoch it belongs to, and whether the clock
 is suspected of having rolled back; a consumer making a validity decision

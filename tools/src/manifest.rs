@@ -103,13 +103,12 @@ fn content_type_from_str(s: &str) -> Result<u8> {
 // ── Contract name → u8 mapping (matches provider::contract constants) ───────
 //
 // The manifest's `requires_contract` field names a contract by its layer
-// name. Module-facing names mirror the layer boundaries documented in
-// `docs/architecture/abi_layers.md`:
-//   - HAL hardware contracts: "gpio", "spi", "i2c", "pio", "uart", "adc", "pwm"
-//   - Stable module contracts: "fs" (plus kernel-provided channel/timer/buffer/event, implicit)
-//   - Platform transport contracts: "platform_nic_ring", "platform_dma",
-//     "platform_dma_fd", "pcie_device" (raw register-level surfaces gated
-//     by `platform_raw`)
+// name, mirroring the layer boundaries documented in
+// `docs/architecture/abi_layers.md`: HAL hardware surfaces, stable module
+// contracts, and platform transport contracts (the raw register-level ones
+// gated by `platform_raw`). `contract_id_from_name` below is the accepted
+// set — one match rather than a list beside it, because a list is a second
+// place to add a name and the place nobody remembers.
 //
 // Permission names ("internal", "flash_raw", "platform_raw", etc.) are not
 // contracts and belong in the top-level `permissions = [...]` list — they
@@ -125,7 +124,7 @@ pub const CONTRACT_ID_SPACE: usize = 64;
 /// Positions consumed in the `required_caps` space, counting the four
 /// reserved ids and excluding the kernel-internal dispatch bucket (0x0C).
 /// Registered in `docs/architecture/limit_register.md`.
-pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 29;
+pub const CONTRACT_ID_POSITIONS_ASSIGNED: usize = 30;
 
 /// Parse a contract name from `[[resources]].requires_contract`. Only
 /// public contract names are accepted here — `"internal"` and specific
@@ -181,6 +180,7 @@ pub fn contract_id_from_name(s: &str) -> Result<u8> {
         // is saying it will ASK rather than verify, which is the only thing
         // this contract lets it do: no anchors cross it.
         "trust" => Ok(0x1D),
+        "net_policy" => Ok(0x1E),
         // Anything that looks like a permission name is a manifest
         // schema error — those go in `permissions = [...]`, not
         // `[[resources]]`.

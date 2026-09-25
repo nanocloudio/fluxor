@@ -109,7 +109,7 @@ pub fn capacity_for_profile(profile: &str) -> Option<NodeCapacity> {
             // copies of one kernel constant is how the composer comes to
             // admit a graph the kernel has no slots for.
             max_modules: crate::capacity::kernel_max_modules(profile) as u16,
-            max_edges: 128,                 // kernel/config.rs MAX_GRAPH_EDGES
+            max_edges: crate::capacity::kernel_max_edges(profile) as u16,
             state_bytes: 256 * 1024 * 1024, // profile_host STATE_ARENA_SIZE
             buffer_bytes: 8 * 1024 * 1024,  // profile_host BUFFER_ARENA_SIZE
             max_endpoints: 64,              // agent admission policy
@@ -1876,7 +1876,11 @@ mod tests {
         assert_eq!(cap.max_modules as u64, extract(&sdk, "MAX_MODULES"));
         assert_eq!(cap.state_bytes as u64, extract(&sdk, "STATE_ARENA_SIZE"));
         assert_eq!(cap.buffer_bytes as u64, extract(&sdk, "BUFFER_ARENA_SIZE"));
-        assert_eq!(cap.max_edges as u64, extract(&kcfg, "MAX_GRAPH_EDGES"));
+        assert_eq!(cap.max_edges as u64, extract(&kcfg, "HOST_GRAPH_EDGES"));
+        assert_eq!(
+            crate::capacity::kernel_max_edges("rp2350") as u64,
+            extract(&kcfg, "SMALL_GRAPH_EDGES")
+        );
         assert_eq!(cap.max_domains as u64, extract(&sched, "MAX_DOMAINS"));
         // pi5/bcm2712 alias the same aarch64 profile.
         for alias in ["pi5", "bcm2712"] {

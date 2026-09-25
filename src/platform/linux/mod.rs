@@ -19,6 +19,7 @@ pub mod host_backend;
 #[cfg(feature = "host-hsm")]
 pub mod hsm_key_vault;
 pub mod net_identity;
+pub mod net_policy;
 pub mod owner_drain;
 pub mod owner_status;
 pub mod providers;

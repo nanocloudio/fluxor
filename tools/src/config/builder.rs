@@ -7,8 +7,9 @@
 /// Mirrors `kernel::config::GRAPH_EDGE_SIZE`; the layout is
 /// documented there.
 const GRAPH_EDGE_SIZE: usize = 12;
-/// Maximum number of graph edges. 128 is sized to hold the Quantum
-/// graph (114 edges) with headroom.
+/// Edge slots in a LEGACY graph section (slot code 0). A generated blob sizes
+/// its section from the target's profile (`capacity::kernel_max_edges`); this
+/// is the size a reader assumes for a blob that states no slot code.
 const MAX_GRAPH_EDGES: usize = 128;
 /// Per-domain metadata: 4 domains × DOMAIN_META_ENTRY_SIZE.
 /// Entry = `tick_us:u16 | exec_mode:u8 | adaptive_flags:u8` = 4 bytes. The
@@ -18,8 +19,6 @@ const MAX_GRAPH_EDGES: usize = 128;
 /// `kernel::config::{DOMAIN_META_ENTRY_SIZE, DOMAIN_META_SIZE}`.
 const DOMAIN_META_ENTRY_SIZE: usize = 4;
 const DOMAIN_META_SIZE: usize = 4 * DOMAIN_META_ENTRY_SIZE;
-/// Graph section size (header + edges + domain metadata)
-const GRAPH_SECTION_SIZE: usize = 4 + MAX_GRAPH_EDGES * GRAPH_EDGE_SIZE + DOMAIN_META_SIZE;
 
 
 /// Module entry header size (entry_length:u32 + name_hash:u32 + id:u8 + reserved:u8).

@@ -2357,6 +2357,15 @@ fn bcm_isr_tier_poll() {
     }
 }
 
+unsafe fn bcm_net_policy_dispatch(handle: i32, opcode: u32, arg: *mut u8, arg_len: usize) -> i32 {
+    use fluxor::abi::contracts::net::policy::caps;
+    let mut c = caps::FILTER | caps::EGRESS;
+    if fluxor::kernel::net_policy::enforcer_attached() {
+        c |= caps::ENFORCED;
+    }
+    fluxor::kernel::net_policy::dispatch(c, None, handle, opcode, arg, arg_len)
+}
+
 fn bcm_init_providers() {
     // BCM2712 system extension for MMIO and NIC opcodes
     fluxor::kernel::module::syscalls::register_system_extension(bcm_system_extension_dispatch);
@@ -2369,6 +2378,11 @@ fn bcm_init_providers() {
     use fluxor::kernel::module::provider;
     use fluxor::kernel::module::provider::contract as dev_class;
     provider::register(dev_class::WORKLOAD, bcm_workload_dispatch);
+    // net.policy (0x1E): the fluxor-native construct is the in-graph packet
+    // filter, which READs the tables and ATTACHes; until one has, CAPS leaves
+    // ENFORCED clear. DNAT is not realized here — REPLACE refuses a table
+    // carrying one (ENOSYS) rather than dropping it.
+    provider::register(dev_class::NET_POLICY, bcm_net_policy_dispatch);
     // The versioned watchable key store: `storage.object` (0x14) +
     // `storage.namespace` (0x13) over a fixed-capacity RAM store. A
     // store-backed graph reaches its state through these two contracts, and a

@@ -11,11 +11,42 @@
 pub fn kernel_max_modules(target: &str) -> usize {
     match target {
         // aarch64 profile_host (linux host + bcm2712-family boards).
-        "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt" => 192,
+        "linux" | "pi5" | "bcm2712" | "cm5" | "qemu-virt" => 255,
         // wasm32 profile_wasm.
         "wasm" => 48,
         // Everything else (rp2040/rp2350 boards): profile_embedded.
         _ => 32,
+    }
+}
+
+/// Kernel `MAX_GRAPH_EDGES` for the arch profile a target compiles
+/// (`src/kernel/boot/config.rs`): 384 on the host profile, 128 elsewhere. The
+/// config blob's graph section is laid out for exactly this many edge slots.
+pub fn kernel_max_edges(target: &str) -> usize {
+    if kernel_max_modules(target) > 128 {
+        384
+    } else {
+        128
+    }
+}
+
+/// Graph-section byte 3 for a target: the edge-slot count in units of 128,
+/// with 0 meaning 128 (see `kernel::config::GRAPH_SLOTS_CODE`).
+pub fn graph_slots_code(max_edges: usize) -> u8 {
+    if max_edges == 128 {
+        0
+    } else {
+        (max_edges / 128) as u8
+    }
+}
+
+/// Edge slots a finished config blob was laid out for, from its graph-section
+/// byte 3 — so a tool re-reading a blob needs no target to find its sections.
+pub fn edges_for_slots_code(code: u8) -> usize {
+    if code == 0 {
+        128
+    } else {
+        code as usize * 128
     }
 }
 
@@ -48,7 +79,7 @@ pub fn kernel_pool_static_cap(target: &str, pool: &str) -> Option<u64> {
         // Fixed across every profile.
         "events" => Some(32),
         "timers" => Some(16),
-        "channels" => Some(128), // MAX_GRAPH_EDGES
+        "channels" => Some(kernel_max_edges(target) as u64), // MAX_GRAPH_EDGES
         "module_slots" => Some(kernel_max_modules(target) as u64),
         // Multitenant is an aarch64 feature; other targets have no
         // workload slots to enforce.

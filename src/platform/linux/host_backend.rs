@@ -123,6 +123,76 @@ pub struct SpawnPlan {
     mem_max: Option<String>,
     pids_max: Option<String>,
     cpu_max: Option<String>,
+    /// Bind mounts, resolved against the rootfs BEFORE the fork: the child
+    /// only issues syscalls, it never allocates.
+    binds: Vec<PlannedBind>,
+}
+
+/// A volume the workload sees at `dst` inside its root: the host path `src`
+/// bind-mounted there (`workload` Tier-2 option `mount`/`bind`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeBind {
+    pub src: String,
+    pub dst: String,
+    pub ro: bool,
+}
+
+/// A bind, ready for the child: the directories to create under the rootfs
+/// (outermost first), the mount target, and whether the target is a file.
+pub struct PlannedBind {
+    src: CString,
+    target: CString,
+    dirs: Vec<CString>,
+    file: bool,
+    ro: bool,
+}
+
+/// Resolve `binds` against `rootfs`. Refuses (EINVAL) a relative path, a `..`
+/// segment, or a bind without a rootfs to bind into — a volume that would land
+/// somewhere other than inside the workload's own root is not a volume.
+pub fn plan_binds(rootfs: Option<&str>, binds: &[VolumeBind]) -> Result<Vec<PlannedBind>, i32> {
+    use crate::kernel::sys::errno;
+    if binds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(root) = rootfs.filter(|r| !r.is_empty()) else {
+        return Err(errno::EINVAL);
+    };
+    let clean = |p: &str| p.starts_with('/') && !p.split('/').any(|s| s == "..");
+    let mut out = Vec::new();
+    for b in binds {
+        if !clean(&b.src) || !clean(&b.dst) || b.dst == "/" {
+            return Err(errno::EINVAL);
+        }
+        let file = std::fs::metadata(&b.src)
+            .map(|m| m.is_file())
+            .map_err(|_| errno::ENOENT)?;
+        let root = root.trim_end_matches('/');
+        let target = format!("{root}{}", b.dst);
+        // Every directory from the rootfs down to the target (or its parent,
+        // for a file), created in order by the child.
+        let mut dirs = Vec::new();
+        let mut acc = root.to_string();
+        let segs: Vec<&str> = b.dst.split('/').filter(|s| !s.is_empty()).collect();
+        let upto = if file {
+            segs.len().saturating_sub(1)
+        } else {
+            segs.len()
+        };
+        for s in &segs[..upto] {
+            acc.push('/');
+            acc.push_str(s);
+            dirs.push(CString::new(acc.clone()).map_err(|_| errno::EINVAL)?);
+        }
+        out.push(PlannedBind {
+            src: CString::new(b.src.clone()).map_err(|_| errno::EINVAL)?,
+            target: CString::new(target).map_err(|_| errno::EINVAL)?,
+            dirs,
+            file,
+            ro: b.ro,
+        });
+    }
+    Ok(out)
 }
 
 /// Build the fork-safe plan from explicit spawn parameters. The caller (the
@@ -156,6 +226,7 @@ pub fn build_plan(
         rootfs,
         isolate,
         own_netns: false,
+        binds: Vec::new(),
         mem_max: None,
         pids_max: None,
         cpu_max: None,
@@ -408,6 +479,41 @@ unsafe fn hp_container_body(plan: &SpawnPlan, start_r: i32, out_w: i32) -> ! {
             libc::_exit(124);
         }
         if let Some(rootfs) = plan.rootfs.as_ref() {
+            // Volumes, before the pivot: the host paths are only reachable
+            // from here. The mount namespace is already private, so none of
+            // this propagates back to the host.
+            for b in &plan.binds {
+                for d in &b.dirs {
+                    libc::mkdir(d.as_ptr(), 0o755);
+                }
+                if b.file {
+                    let fd = libc::open(b.target.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644);
+                    if fd >= 0 {
+                        libc::close(fd);
+                    }
+                }
+                if libc::mount(
+                    b.src.as_ptr(),
+                    b.target.as_ptr(),
+                    core::ptr::null(),
+                    libc::MS_BIND | libc::MS_REC,
+                    core::ptr::null(),
+                ) != 0
+                {
+                    libc::_exit(121);
+                }
+                if b.ro
+                    && libc::mount(
+                        core::ptr::null(),
+                        b.target.as_ptr(),
+                        core::ptr::null(),
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
+                        core::ptr::null(),
+                    ) != 0
+                {
+                    libc::_exit(121);
+                }
+            }
             if hp_pivot_into(rootfs.as_ptr()) != 0 {
                 libc::_exit(123);
             }
@@ -537,10 +643,36 @@ pub unsafe fn hp_spawn(
     own_netns: bool,
     ident: Option<&super::net_identity::NetIdentity>,
 ) -> i32 {
+    hp_spawn_with_binds(argv_tokens, rootfs, isolate, env, own_netns, ident, &[])
+}
+
+/// [`hp_spawn`] with volumes: each [`VolumeBind`] is bind-mounted into the
+/// rootfs before the pivot. A bind needs an isolated sandbox with a rootfs
+/// (EINVAL otherwise) — without its own mount namespace the mount would land
+/// on the host.
+///
+/// # Safety
+/// As [`hp_spawn`].
+pub unsafe fn hp_spawn_with_binds(
+    argv_tokens: &[&str],
+    rootfs: Option<&str>,
+    isolate: bool,
+    env: &ResourceEnvelope,
+    own_netns: bool,
+    ident: Option<&super::net_identity::NetIdentity>,
+    binds: &[VolumeBind],
+) -> i32 {
     use crate::kernel::sys::errno;
 
     let mut plan = match build_plan(argv_tokens, rootfs, isolate) {
         Ok(p) => p,
+        Err(e) => return e,
+    };
+    if !binds.is_empty() && !isolate {
+        return errno::EINVAL;
+    }
+    plan.binds = match plan_binds(rootfs, binds) {
+        Ok(b) => b,
         Err(e) => return e,
     };
     plan.own_netns = own_netns;

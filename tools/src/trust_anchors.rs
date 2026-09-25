@@ -211,10 +211,20 @@ pub fn encode_ext(tag: u8, certs: &[Vec<u8>]) -> Vec<u8> {
 
 /// Size of the FXWR header (`kernel::config::read_config_from_slice`).
 const HEADER_SIZE: usize = 16;
-/// Size of the graph section that follows the module section: a 4-byte
-/// header, `MAX_GRAPH_EDGES` (128) edges of 12 bytes, and four 4-byte
-/// domain-metadata entries (`kernel::config::GRAPH_SECTION_SIZE`).
+/// Size of a LEGACY graph section (slot code 0): a 4-byte header, 128 edges
+/// of 12 bytes, and four 4-byte domain-metadata entries. A blob states its own
+/// slot count in graph-section byte 3 — see [`graph_section_size`]. Only the
+/// test fixtures build a section from scratch, so only they need the size.
+#[cfg(test)]
 const GRAPH_SECTION_SIZE: usize = 4 + 128 * 12 + 4 * 4;
+
+/// The graph section's size as the blob lays it out: its byte 3 is the edge
+/// slot code (`kernel::config::GRAPH_SLOTS_CODE`), so a host-profile blob with
+/// 384 slots is re-sealed at the right offsets without knowing its target.
+fn graph_section_size(blob: &[u8], at: usize) -> usize {
+    let code = blob.get(at + 3).copied().unwrap_or(0);
+    4 + crate::capacity::edges_for_slots_code(code) * 12 + 4 * 4
+}
 /// Per-entry sizes of the hardware section, after its 6-byte header
 /// (spi, i2c, gpio, pio, reserved, uart counts).
 const SPI_CONFIG_BIN_SIZE: usize = 8;
@@ -325,7 +335,7 @@ pub fn append_operator_anchors(
     // module section, the graph section and the hardware section; the
     // adaptive post-body and the section chain after it are copied as
     // they were.
-    let hw_off = entries_end + GRAPH_SECTION_SIZE;
+    let hw_off = entries_end + graph_section_size(blob, entries_end);
     if blob.len() < hw_off + 6 {
         return Err("hardware section header runs past the blob".to_string());
     }

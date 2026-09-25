@@ -494,14 +494,46 @@ pub use crate::abi::config::kernel::MAX_MODULES;
 // The event-wake bitmap and scheduler readiness/upstream bitmaps are
 // `ModuleMask`-backed, so they scale with MAX_MODULES.
 // The residual ceiling is the scheduler's u8 module-index domain
-// (`exec_order: [u8; _]`, `module_idx as u8`, fault-attribution ids); 256 is
-// the boundary. See the matching assert in `kernel/scheduler`.
+// (`exec_order: [u8; _]`, `module_idx as u8`, fault-attribution ids) with 0xFF
+// reserved as the no-module sentinel; 255 is the boundary. See the matching
+// assert in `kernel/scheduler`.
 const _: () = assert!(
-    MAX_MODULES <= 256,
-    "MAX_MODULES > 256 requires widening scheduler module ids past u8"
+    MAX_MODULES <= 255,
+    "MAX_MODULES > 255 requires widening scheduler module ids past u8"
 );
 
-pub const MAX_GRAPH_EDGES: usize = 128;
+/// Edge ceiling, keyed on the module ceiling so the two cannot drift apart.
+/// The host profile (255 modules) carries 384 edges: a control plane whose
+/// controllers are PARAMS is a long chain of decision and connector nodes, one
+/// edge each, and nanocloud's all-in-one graph passes 120 edges on its own —
+/// and it cannot split across processes, because the linux store is
+/// single-writer. wasm32 and Cortex-M keep 128, so their static tables do not
+/// grow.
+///
+/// Above 255 the count no longer fits the header's `edge_count` byte, so the
+/// graph section's reserved byte 2 carries the HIGH byte. A blob that leaves
+/// that byte 0, as the "reserved, must be 0" convention has it, reads back as
+/// the same count — no format version moves.
+pub const MAX_GRAPH_EDGES: usize = if MAX_MODULES > 128 {
+    HOST_GRAPH_EDGES
+} else {
+    SMALL_GRAPH_EDGES
+};
+/// Literal halves of [`MAX_GRAPH_EDGES`], named so the tools' capacity mirror
+/// can pin them against this source text.
+pub const HOST_GRAPH_EDGES: usize = 384;
+pub const SMALL_GRAPH_EDGES: usize = 128;
+/// Graph-section byte 3: how many edge SLOTS the blob was laid out for, in
+/// units of 128, with 0 meaning 128 so that a blob stating no code reads as
+/// the small profile. The section is fixed-size, so a blob laid out for another
+/// profile would put the domain metadata and hardware section at the wrong
+/// offsets; this byte is how the loader refuses it by name instead of by a
+/// CRC mismatch nobody can read.
+pub const GRAPH_SLOTS_CODE: u8 = if MAX_GRAPH_EDGES == 128 {
+    0
+} else {
+    (MAX_GRAPH_EDGES / 128) as u8
+};
 
 /// Hard ceiling on the on-disk config blob size. Per-platform:
 /// - Embedded targets (rp/bcm) cap at 32 KiB — fits in their
@@ -509,8 +541,7 @@ pub const MAX_GRAPH_EDGES: usize = 128;
 ///   the mapped config region + trailer's `config_size` field.
 /// - Host targets (linux/wasm) cap at 256 KiB — the synthesised
 ///   wasm-scenario host inlines the canonical browser shell
-///   (runtime.html + host_shims.js, now ~110 KiB combined and growing
-///   with player-mode UX + the OPFS object tier) plus scenario.json as
+///   (runtime.html + host_shims.js, ~110 KiB combined) plus scenario.json as
 ///   `body:` routes so the orchestrator stays self-contained per the
 ///   shared-infra-in-orchestrator partition principle. Host targets have
 ///   GiBs of RAM, so the cap is a sanity bound, not a memory constraint.
@@ -785,7 +816,9 @@ pub struct Config {
     pub modules: [Option<ModuleEntry>; MAX_MODULES],
     pub graph_edges: [Option<GraphEdge>; MAX_GRAPH_EDGES],
     pub module_count: u8,
-    pub edge_count: u8,
+    /// Low byte from the header, high byte from the graph section — see
+    /// `MAX_GRAPH_EDGES`.
+    pub edge_count: u16,
     pub hardware: HardwareConfig,
     /// Per-domain tick_us (from graph section domain metadata). 0 = use global.
     pub domain_tick_us: [u16; 4],
@@ -1013,16 +1046,10 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
         );
         return false;
     }
-    if header.edge_count as usize > MAX_GRAPH_EDGES {
-        log::error!(
-            "[config] edge_count={} exceeds MAX_GRAPH_EDGES={}",
-            header.edge_count,
-            MAX_GRAPH_EDGES
-        );
-        return false;
-    }
     config.module_count = header.module_count;
-    config.edge_count = header.edge_count;
+    // The LOW byte. The high byte lives in the graph section header and is
+    // folded in (and the total bounded) once that section is located below.
+    config.edge_count = u16::from(header.edge_count);
 
     // Parse modules - variable-length entries
     // SAFETY: `blob_len >= HEADER_SIZE + 6` checked below; `flash_ptr.add(16)`
@@ -1189,17 +1216,37 @@ pub fn read_config_from_slice(blob: &[u8], config: &mut Config) -> bool {
     // (`6 + section_size + GRAPH_SECTION_SIZE` already validated above).
     let section_base = unsafe { modules_base.add(6 + section_size) };
 
-    let edge_count = config.edge_count as usize;
-
     // Graph section header layout (4 bytes, see tools/src/config.rs):
-    //   byte 0: edge_count (redundant with config.edge_count above;
-    //           tools writes both so we read the authoritative one
-    //           from the counts block)
+    //   byte 0: edge_count low byte (redundant with the counts block)
     //   byte 1: graph_flags — see `GRAPH_FLAG_*` constants
-    //   bytes 2-3: reserved (must be 0; future use)
+    //   byte 2: edge_count HIGH byte (0 in every blob of <= 255 edges, which
+    //           is what every blob written before it existed also says)
+    //   byte 3: edge-slot code — see `GRAPH_SLOTS_CODE`
     // SAFETY: graph section is `GRAPH_SECTION_SIZE` bytes from section_base;
     // 4-byte header fits.
     config.graph_flags = unsafe { *section_base.add(1) };
+    // SAFETY: bytes 2 and 3 of the same 4-byte graph header.
+    let edge_hi = unsafe { *section_base.add(2) };
+    // SAFETY: as above.
+    let slots = unsafe { *section_base.add(3) };
+    if slots != GRAPH_SLOTS_CODE {
+        log::error!(
+            "[config] graph section laid out for slot code {slots}, this kernel expects {GRAPH_SLOTS_CODE} (MAX_GRAPH_EDGES={MAX_GRAPH_EDGES}) — rebuild the config for this target"
+        );
+        return false;
+    }
+    config.edge_count |= u16::from(edge_hi) << 8;
+    // A header that promises more edges than the kernel can hold is either a
+    // tool-version mismatch or a malformed blob: refuse the load, never clamp.
+    if config.edge_count as usize > MAX_GRAPH_EDGES {
+        log::error!(
+            "[config] edge_count={} exceeds MAX_GRAPH_EDGES={}",
+            config.edge_count,
+            MAX_GRAPH_EDGES
+        );
+        return false;
+    }
+    let edge_count = config.edge_count as usize;
 
     // Edges start at offset 4 within graph section
     // SAFETY: `section_base + 4` is the start of the edge array.

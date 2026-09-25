@@ -52,8 +52,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
+#[path = "../b64.rs"]
+mod b64;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName as RustlsServerName, UnixTime};
@@ -493,7 +493,7 @@ fn emit_line(line: &str) {
     payload.push('\n');
     let event = json!({
         "kind": "bytes",
-        "data": BASE64_STANDARD.encode(payload.as_bytes()),
+        "data": b64::encode(payload.as_bytes()),
     });
     println!("{event}");
     let _ = io::Write::flush(&mut io::stdout());

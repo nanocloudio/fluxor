@@ -8,6 +8,7 @@ pub mod exec; // scheduler run loop, ISR tiers, step guard
 pub mod ipc; // channels, ring buffers, buffer pool, events, fd
 pub mod mem; // heap, page pool
 pub mod module; // loader, provider, syscalls, el0 gateway
+pub mod net_policy; // net.policy (0x1E) table store shared by every provider
 pub mod pcie; // PCIe ownership: BAR aperture claims
 pub mod security; // crypto + key vault
 pub mod sys; // HAL seam, guard, errno, log ring

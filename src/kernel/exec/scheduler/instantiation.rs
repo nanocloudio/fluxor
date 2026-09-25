@@ -54,11 +54,17 @@ pub(crate) fn is_multi_inbound(name_hash: u32) -> bool {
 ///
 /// The error code is the bare `i32` negative-errno that
 /// `prepare_graph` already propagates.
-type ModuleList = ([Option<ModuleEntry>; MAX_MODULES], usize, [i8; MAX_MODULES]);
+type ModuleList = (
+    [Option<ModuleEntry>; MAX_MODULES],
+    usize,
+    [i16; MAX_MODULES],
+);
 
 pub(crate) fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
     let mut module_list: [Option<ModuleEntry>; MAX_MODULES] = [None; MAX_MODULES];
-    let mut id_to_slot: [i8; MAX_MODULES] = [-1; MAX_MODULES];
+    // i16, not i8: a slot index reaches MAX_MODULES - 1 (191 on the host
+    // profile), and an i8 wraps the 129th module to a negative "unknown".
+    let mut id_to_slot: [i16; MAX_MODULES] = [-1; MAX_MODULES];
     let mut count = 0;
 
     for entry in config.modules.iter().flatten() {
@@ -82,7 +88,7 @@ pub(crate) fn build_module_list(config: &Config) -> Result<ModuleList, i32> {
             return Err(crate::kernel::sys::errno::EINVAL);
         }
 
-        id_to_slot[id] = count as i8;
+        id_to_slot[id] = count as i16;
         module_list[count] = Some(*entry);
         count += 1;
     }

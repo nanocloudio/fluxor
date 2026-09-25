@@ -1206,8 +1206,8 @@ pub struct GraphSnapshot {
     pub config_checksum: u16,
     /// Active module count in the compiled graph.
     pub module_count: u8,
-    /// Compiled edge count.
-    pub edge_count: u8,
+    /// Compiled edge count (past 255 on the host profile).
+    pub edge_count: u16,
     /// Tick interval in microseconds (`0` = default `DEFAULT_TICK_US`).
     pub tick_us: u32,
     /// Graph-level sample rate (`0` = not configured).
@@ -1234,7 +1234,7 @@ pub fn graph_snapshot() -> GraphSnapshot {
     GraphSnapshot {
         config_checksum: cfg.header.checksum,
         module_count: cfg.header.module_count,
-        edge_count: cfg.header.edge_count,
+        edge_count: cfg.edge_count,
         tick_us: cfg.header.tick_us as u32,
         sample_rate: sched.graph_sample_rate,
         exec_order_count: sched.exec_order_count,

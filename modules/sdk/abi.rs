@@ -128,6 +128,12 @@ pub mod contracts {
         pub mod ws_control {
             include!("contracts/net/ws_control.rs");
         }
+        /// Packet policy and service NAT, enforced by the platform: tables of
+        /// neutral rules a provider realizes as nftables, a native filter, or
+        /// nothing (and says so in its capabilities).
+        pub mod policy {
+            include!("contracts/net/policy.rs");
+        }
     }
     /// Observability telemetry envelope (metric / span signals).
     pub mod telemetry {

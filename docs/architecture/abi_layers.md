@@ -118,6 +118,8 @@ platform) implements the vtable, and consumers reach it through
 | `USB_HOST` | `0x0015` | Kernel (platform) — scaffold only | Handle-scoped USB host controller binding, reserved but not yet implemented. |
 | `WORKLOAD` | `0x001A` | Kernel (platform backends) | Platform-neutral isolated-workload surface (opcode class 0x1Axx): run an isolated workload with a declared capability envelope. |
 | `STREAM_CLOCK` | `0x001C` | Kernel (platform) | Generic stream-clock capability (opcode class 0x1Cxx) answering the `STREAM_TIME` audio-clock query independently of PIO hardware. |
+| `TRUST` | `0x001D` | Kernel (platform) | Platform certificate-chain verification (opcode class 0x1Dxx): the platform answers for a chain, or refuses every chain. Registered where a system trust store exists and absent otherwise, which is why a graph names it in `[[requires_when]]`. |
+| `NET_POLICY` | `0x001E` | Kernel (platform) | Packet policy and service NAT (opcode class 0x1Exx): a consumer states what traffic is allowed and where a virtual address leads, and the platform decides how — nftables on Linux, the in-graph packet filter on bare metal. Tables are replaced whole and atomically, each REPLACE advancing the table's generation. A provider that records a table it cannot act on leaves the `ENFORCED` capability bit clear rather than implying enforcement. |
 
 `FS` STAT output is 8 bytes, `[size:u32 LE, mtime:u32 LE]`. The
 contract serves random-access file I/O; streaming workloads use channel

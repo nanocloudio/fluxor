@@ -131,9 +131,11 @@ mod profile_host {
         // Multi-workload: the system substrate plus several workload subgraphs
         // co-resident on aarch64 (bcm2712 / linux). Every module index stays
         // within the scheduler's u8 index domain (`exec_order: [u8; _]`,
-        // `module_idx as u8`), which is what bounds this at 256 — past that the
-        // ids widen to u16. The `ModuleMask` bitmaps scale to match
-        // (MODULE_MASK_WORDS == 3 here). Edge capacity is MAX_GRAPH_EDGES.
+        // `module_idx as u8`), and 0xFF is the "no module" sentinel in the
+        // page pool, the step guard and the elastic allocator — which is what
+        // bounds this at 255 (slots 0..=254); past that the ids widen to u16.
+        // The `ModuleMask` bitmaps scale to match (MODULE_MASK_WORDS == 4
+        // here). Edge capacity is MAX_GRAPH_EDGES.
         //
         // 128 -> 192: a control plane whose controllers are PARAMS is counted
         // in decisions and connectors rather than in modules. nanocloud's
@@ -142,7 +144,11 @@ mod profile_host {
         // is deliberately single-writer with no `flock`, so one runtime owns
         // the WAL. This is per-target (wasm32 48, Cortex-M 32 below), so the
         // scheduler's static tables grow on aarch64 only.
-        pub const MAX_MODULES: usize = 192;
+        //
+        // 192 -> 255: the control plane converted its remaining controllers
+        // (IP allocation, RBAC, probes) to params and passed 192 slots; the
+        // scheduler's fan-in merges occupy slots too. 255 is the u8 ceiling.
+        pub const MAX_MODULES: usize = 255;
         /// ISR-tier bridge slots: one per edge that crosses into an
         /// ISR-tier domain, each holding its ring inline (~2 KiB).
         pub const MAX_BRIDGES: usize = 16;

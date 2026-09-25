@@ -58,8 +58,9 @@ pub const MAX_MODULES: usize = CONFIG_MAX_MODULES;
 // the validated multi-workload profile (Pi 5). Raising it further requires widening
 // those id fields.
 const _: () = assert!(
-    MAX_MODULES <= 256,
-    "MAX_MODULES > 256 requires widening fault-attribution module ids past u8."
+    MAX_MODULES <= 255,
+    "MAX_MODULES > 255 requires widening module ids past u8 (0xFF is the \
+     no-module sentinel in the page pool, step guard and elastic allocator)."
 );
 
 /// Maximum number of channels (edges) in a graph.
@@ -676,8 +677,12 @@ impl ParamBuffer {
 /// Maximum name length (including null terminator space)
 const MAX_NAME_LEN: usize = 32;
 
-/// Maximum number of interned names
-const MAX_NAMES: usize = 64;
+/// Maximum number of interned names. One per DISTINCT module name — `intern`
+/// returns the existing slot for a repeat — so a graph of many instances of a
+/// few engines (a params control plane is mostly `decision`, `store_source`
+/// and `store_effect`) uses a handful. Sized to MAX_MODULES so even a graph of
+/// all-distinct modules cannot run out.
+const MAX_NAMES: usize = MAX_MODULES;
 
 /// Static storage for interned names
 static mut NAME_STORAGE: [[u8; MAX_NAME_LEN]; MAX_NAMES] = [[0; MAX_NAME_LEN]; MAX_NAMES];
@@ -693,11 +698,22 @@ struct NameArena;
 
 impl NameArena {
     /// Intern a name, returning a &'static str.
-    /// Returns "?" if arena is exhausted (should not happen with MAX_NAMES == MAX_MODULES).
+    /// Returns "?" if the arena is exhausted — not reachable while MAX_NAMES
+    /// is MAX_MODULES, since a graph cannot hold more distinct names.
     fn intern(name: &str) -> &'static str {
         // SAFETY: NameArena is scheduler-thread owned; static name buffers
         // are accessed only from prepare_graph / instantiate paths.
         unsafe {
+            // A name already interned is returned as-is: the arena holds
+            // distinct names, not one per instance.
+            let want = &name.as_bytes()[..name.len().min(MAX_NAME_LEN - 1)];
+            let storage = &raw const NAME_STORAGE;
+            for buf in (*storage).iter().take(NEXT_NAME_SLOT) {
+                let len = buf.iter().position(|&b| b == 0).unwrap_or(MAX_NAME_LEN);
+                if &buf[..len] == want {
+                    return core::str::from_utf8_unchecked(&buf[..len]);
+                }
+            }
             if NEXT_NAME_SLOT >= MAX_NAMES {
                 log::warn!("NameArena: exhausted ({MAX_NAMES} slots), cannot intern '{name}'");
                 return "?";

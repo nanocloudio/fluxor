@@ -388,6 +388,8 @@ fn linux_init_providers() {
     // quietly composing against some other trust source.
     #[cfg(feature = "trust-system")]
     provider::register(dev_class::TRUST, trust_provider::dispatch);
+    // Packet policy and service NAT: nftables tables, applied atomically.
+    provider::register(dev_class::NET_POLICY, fluxor::platform::linux::net_policy::dispatch);
     // storage.object over HTTP `Range:` — wasm peer in
     // `src/platform/wasm/object.rs`; shared windowing in
     // `abi::contracts::storage::object::range`.

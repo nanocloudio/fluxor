@@ -15,8 +15,9 @@
 // Composes the host-process backend in the sibling `host_backend` module.
 
 use super::host_backend::{
-    hp_destroy, hp_exec, hp_pause, hp_read, hp_resume, hp_signal, hp_spawn, hp_start, hp_tty_close,
-    hp_tty_open, hp_tty_resize, hp_tty_step, hp_wait, ResourceEnvelope, MAX_SANDBOXES,
+    hp_destroy, hp_exec, hp_pause, hp_read, hp_resume, hp_signal, hp_spawn_with_binds, hp_start,
+    hp_tty_close, hp_tty_open, hp_tty_resize, hp_tty_step, hp_wait, ResourceEnvelope,
+    MAX_SANDBOXES,
 };
 use crate::abi::contracts::workload as wl;
 use crate::abi::platform::linux::host_process as hp;
@@ -79,8 +80,27 @@ fn rd_u32(b: &[u8], off: usize) -> u32 {
 fn host_backend_honors_posture(posture: u8) -> bool {
     matches!(posture, wl::POSTURE_SHARED | wl::POSTURE_ISOLATED)
 }
-fn host_backend_honors_option(_ns: &[u8], _key: &[u8]) -> bool {
-    false // no hardening options implemented yet
+/// Tier-2 options this backend realizes. `mount`/`bind` is a volume: the value
+/// is `<host path>\0<path in the workload>\0<ro: 1|0>`, bind-mounted into
+/// the rootfs before the pivot (`host_backend::hp_spawn_with_binds`).
+fn host_backend_honors_option(ns: &[u8], key: &[u8]) -> bool {
+    ns == b"mount" && key == b"bind"
+}
+
+/// A `mount`/`bind` value: `<src>\0<dst>[\0<ro>]`.
+fn parse_bind(val: &[u8]) -> Option<super::host_backend::VolumeBind> {
+    let mut parts = val.split(|b| *b == 0);
+    let src = core::str::from_utf8(parts.next()?).ok()?;
+    let dst = core::str::from_utf8(parts.next()?).ok()?;
+    let ro = matches!(parts.next(), Some(b"1"));
+    if src.is_empty() || dst.is_empty() {
+        return None;
+    }
+    Some(super::host_backend::VolumeBind {
+        src: src.into(),
+        dst: dst.into(),
+        ro,
+    })
 }
 /// Network fields the backend realizes (`net_identity.rs`): own netns and an
 /// IPv4 identity. IPv6 identity is not implemented yet, so it fails admission
@@ -107,7 +127,10 @@ fn host_backend_can_freeze() -> bool {
 /// understand are ignored; a REQUIRED entry it does not advertise fails
 /// admission. Returns `Ok(())` or a negative errno. TLV entry:
 /// `[ns_len:u8][ns][key_len:u8][key][flags:u8][val_len:u16 LE][val]`.
-unsafe fn validate_options(opts: &[u8]) -> Result<(), i32> {
+unsafe fn validate_options(
+    opts: &[u8],
+    binds: &mut std::vec::Vec<super::host_backend::VolumeBind>,
+) -> Result<(), i32> {
     use crate::kernel::sys::errno;
     let mut p = 0usize;
     while p < opts.len() {
@@ -135,7 +158,14 @@ unsafe fn validate_options(opts: &[u8]) -> Result<(), i32> {
         if p + val_len > opts.len() {
             return Err(errno::EINVAL);
         }
+        let val = &opts[p..p + val_len];
         p += val_len;
+        if ns == b"mount" && key == b"bind" {
+            match parse_bind(val) {
+                Some(b) => binds.push(b),
+                None => return Err(errno::EINVAL),
+            }
+        }
         // Fail-closed: a required entry the backend cannot honor blocks admission.
         if (flags & wl::opt::OPT_REQUIRED) != 0 && !host_backend_honors_option(ns, key) {
             return Err(errno::ENOSYS);
@@ -292,7 +322,8 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
     }
 
     // Tier-2 options: fail-closed against the backend's advertised capabilities.
-    if let Err(e) = validate_options(&buf[opt_start..opt_end]) {
+    let mut binds = std::vec::Vec::new();
+    if let Err(e) = validate_options(&buf[opt_start..opt_end], &mut binds) {
         return e;
     }
 
@@ -326,13 +357,14 @@ unsafe fn workload_create(arg: *const u8, arg_len: usize) -> i32 {
             Err(_) => return errno::EINVAL,
         }
     }
-    let backend_idx = hp_spawn(
+    let backend_idx = hp_spawn_with_binds(
         &argv,
         rootfs,
         isolate,
         &envelope,
         own_netns,
         net_ident.as_ref(),
+        &binds,
     );
     if backend_idx < 0 {
         return backend_idx;
@@ -427,8 +459,8 @@ pub unsafe fn linux_workload_dispatch(
 
 /// WORKLOAD_CAPS: write the backend discovery structure (see the contract's
 /// `CAPS` doc). Prefix `[postures:u8][source_kinds:u8][ops:u16 LE][net:u8]`
-/// then an empty namespace directory `[ns_count:u16 = 0]` (no `linux.*` keys
-/// defined).
+/// then the namespace directory: one namespace, `mount`, with one key, `bind`
+/// (a volume).
 unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     use crate::kernel::sys::errno;
     if arg.is_null() || arg_len < 7 {
@@ -448,8 +480,17 @@ unsafe fn workload_caps(arg: *mut u8, arg_len: usize) -> i32 {
     }
     out[2..4].copy_from_slice(&ops.to_le_bytes());
     out[4] = host_backend_net_caps();
-    out[5..7].copy_from_slice(&0u16.to_le_bytes()); // ns_count
-    7
+    // `[ns_count:u16][ns_len:u8]"mount"[key_count:u16][key_len:u8]"bind"`
+    const DIR: &[u8] = &[
+        1, 0, 5, b'm', b'o', b'u', b'n', b't', 1, 0, 4, b'b', b'i', b'n', b'd',
+    ];
+    if arg_len < 5 + DIR.len() {
+        // Too short for the directory: the prefix alone, and an empty one.
+        out[5..7].copy_from_slice(&0u16.to_le_bytes());
+        return 7;
+    }
+    out[5..5 + DIR.len()].copy_from_slice(DIR);
+    (5 + DIR.len()) as i32
 }
 
 /// Drain/revocation hook: destroy every workload belonging to a revoked owner.

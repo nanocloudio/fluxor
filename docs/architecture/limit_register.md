@@ -98,9 +98,9 @@ CAPACITY >= PSTATUS_ROUND | src/kernel/sys/telemetry_ring.rs
 | resolver cache entry (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_CACHE` | modules/sdk/abi/config.rs | 32 | Names held with their address until the answer's TTL runs out; a full table replaces the entry nearest its expiry. One entry is a 64-byte name plus address and expiry (~76 B). 32 on wasm, 4 on embedded |
 | resolver pending dial (`ip` stub resolver) | u8 (table index) | 255 | `MAX_DNS_PENDING` | modules/sdk/abi/config.rs | 8 | Dials parked on a name lookup in flight; two dials of one name share one entry's query. One past the table is refused `EAGAIN` until an answer or timeout frees an entry. 8 on wasm, 4 on embedded |
 | contract class (`required_caps` bitmask, fmod header) | u64 bit position | 64 | `MAX_CONTRACTS` | src/kernel/module/provider.rs | 64 | One number for three roles: vtable index, opcode class byte, and bit position in the header's `required_caps`. Registration past the ceiling is refused EINVAL, and a dispatch id at or past it is refused ENOSYS by `check_contract_grant` before either capability gate |
-| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 29 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `TRUST` = 0x1D, leaving 0x1E–0x3F (34 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
+| contract-class positions consumed | — | 64 | `CONTRACT_ID_POSITIONS_ASSIGNED` | tools/src/manifest.rs | 30 | Counts the four reserved ids, excludes the kernel-internal dispatch bucket. Highest allocated is `NET_POLICY` = 0x1E, leaving 0x1F–0x3F (33 positions) free. The tools-side mirror of the space, `CONTRACT_ID_SPACE`, holds the same width as the kernel's `MAX_CONTRACTS`: an id outside it is unrepresentable in the header mask and unregisterable as a vtable |
 | permission category (fmod header) | u16 bitfield | 16 | — | src/kernel/module/loader.rs | — | 9 of 16 bits assigned (`observe` = bit 8); widening changes the module header layout |
-| module index (exec_order, fault ids) | u8 | 256 | `MAX_MODULES` | modules/sdk/abi/config.rs | 192 | Deliberate keep at u8; the aarch64 profile sits at 192 of the 256 the width admits. Dual asserts: `src/kernel/boot/config.rs`, `src/kernel/exec/scheduler/mod.rs` |
+| module index (exec_order, fault ids) | u8 | 256 | `MAX_MODULES` | modules/sdk/abi/config.rs | 255 | Deliberate keep at u8; the aarch64 profile sits at 255 — every slot the width admits except 0xFF, the no-module sentinel in the page pool, step guard and elastic allocator. Dual asserts: `src/kernel/boot/config.rs`, `src/kernel/exec/scheduler/mod.rs` |
 | channel buffer slot | i16 (−1 sentinel) | 32768 | `MAX_BUFFER_SLOTS` | src/kernel/ipc/buffer_pool.rs | 256 | The buffer arena binds first by orders of magnitude |
 | owner slot | u16 | 65535 | `MAX_OWNERS` | src/kernel/workload/owner.rs | 64 | Memory/policy binds first; const-asserted ≤ `u16::MAX` |
 | HTTP request path length | u16 | 65535 | `MAX_PATH` | modules/sdk/abi/config.rs | 200 | The wire field is u16; the 200-byte budget is pure memory policy |
@@ -231,7 +231,9 @@ cannot be evaluated from its own file reads `—` and says why.
 | Route filesystem path | `MAX_FS_PATH` | modules/sdk/abi/config.rs | 256 | Policy: host routes point into deep on-disk trees; embedded and wasm routes are short on-flash paths like `/web/INDEX.HTM`, and a longer path is refused at compose time 64 on wasm and embedded. |
 | Body pool default | `DEFAULT_BODY_POOL_SIZE` | modules/sdk/abi/config.rs | 262144 | Policy: the request-body pool an http module gets when its config names none; a body that does not fit is refused 413. 32 KiB on wasm; on the RP parts 16 KiB (rp2350) and 4 KiB (rp2040), where the pool is charged against the same SRAM the state arena is |
 | Fan-in/fan-out buffer | `FAN_BUF_SIZE` | src/kernel/exec/scheduler/module_types.rs | 32768 | Sized per target family (aarch64 / RP / other): the ring behind each expanded fan edge, taken from the channel arena; a frame larger than it cannot cross a fan edge 2048 on RP, 8192 on other families. |
-| Config graph edges | `MAX_GRAPH_EDGES` | src/kernel/boot/config.rs | 128 | Id width: the edge index is a byte in the packed graph section, and every channel table (`MAX_CHANNELS`) is sized from it. A graph with more edges is refused by the tools before it is packed |
+| Config graph edges | `MAX_GRAPH_EDGES` | src/kernel/boot/config.rs | — | Per profile, derived from `MAX_MODULES` so the two cannot drift: `HOST_GRAPH_EDGES` where the module ceiling passes 128, `SMALL_GRAPH_EDGES` elsewhere. Every channel table (`MAX_CHANNELS`) is sized from it. A graph with more edges is refused by the tools before it is packed |
+| Host-profile graph edges | `HOST_GRAPH_EDGES` | src/kernel/boot/config.rs | 384 | Policy: a control plane whose controllers are params is a long chain of decision and connector nodes, one edge each, and cannot split across processes (the linux store is single-writer). The count passes a byte, so its HIGH byte rides graph-section byte 2, and byte 3 states the slot count the section was laid out for (`GRAPH_SLOTS_CODE`) |
+| Small-profile graph edges | `SMALL_GRAPH_EDGES` | src/kernel/boot/config.rs | 128 | wasm32 and Cortex-M: unchanged, so their static tables and config blobs do not grow |
 | Channels | `MAX_CHANNELS` | src/kernel/ipc/channel.rs | — | Derived, not chosen: one channel per edge, fan expansion included, so the two move together Not value-checked here: the gate evaluates a const against its own file and this one is written in terms of a symbol from another, so the row on `MAX_GRAPH_EDGES` is what holds the pair. |
 | Hardware sections: SPI buses | `MAX_SPI_BUSES` | src/kernel/boot/config.rs | 2 | Policy: the packed hardware section carries fixed tables; a board declaring more buses of a kind is refused by the tools |
 | Hardware sections: I2C buses | `MAX_I2C_BUSES` | src/kernel/boot/config.rs | 2 | Policy: the packed hardware section carries fixed tables; a board declaring more buses of a kind is refused by the tools |
@@ -313,8 +315,8 @@ MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8 | host
 MAX_DNS_PENDING | modules/sdk/abi/config.rs | 8 | wasm
 MAX_DNS_PENDING | modules/sdk/abi/config.rs | 4 | embedded
 MAX_CONTRACTS | src/kernel/module/provider.rs | 64 | *
-CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 29 | *
-MAX_MODULES | modules/sdk/abi/config.rs | 192 | host
+CONTRACT_ID_POSITIONS_ASSIGNED | tools/src/manifest.rs | 30 | *
+MAX_MODULES | modules/sdk/abi/config.rs | 255 | host
 MAX_MODULES | modules/sdk/abi/config.rs | 48 | wasm
 MAX_MODULES | modules/sdk/abi/config.rs | 32 | embedded
 MAX_BRIDGES | modules/sdk/abi/config.rs | 16 | host
@@ -501,7 +503,9 @@ DEFAULT_BODY_POOL_SIZE | modules/sdk/abi/config.rs | 4 * 1024 | embedded+rp2040
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 32768 | host
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 2048 | rp-small
 FAN_BUF_SIZE | src/kernel/exec/scheduler/module_types.rs | 8192 | rp-large
-MAX_GRAPH_EDGES | src/kernel/boot/config.rs | 128 | *
+MAX_GRAPH_EDGES | src/kernel/boot/config.rs | if MAX_MODULES > 128 { HOST_GRAPH_EDGES } else { SMALL_GRAPH_EDGES } | *
+HOST_GRAPH_EDGES | src/kernel/boot/config.rs | 384 | *
+SMALL_GRAPH_EDGES | src/kernel/boot/config.rs | 128 | *
 MAX_CHANNELS | src/kernel/ipc/channel.rs | MAX_GRAPH_EDGES | *
 MAX_SPI_BUSES | src/kernel/boot/config.rs | 2 | *
 MAX_I2C_BUSES | src/kernel/boot/config.rs | 2 | *
@@ -611,6 +615,7 @@ DOMAIN_META_ENTRY_SIZE | src/kernel/boot/config.rs | packed graph-section layout
 DOMAIN_META_SIZE | src/kernel/boot/config.rs | packed graph-section layout
 ADAPTIVE_POST_SIZE | src/kernel/boot/config.rs | packed graph-section layout
 GRAPH_SECTION_SIZE | src/kernel/boot/config.rs | derived from MAX_GRAPH_EDGES and the layout sizes
+GRAPH_SLOTS_CODE | src/kernel/boot/config.rs | packed graph-section layout, derived from MAX_GRAPH_EDGES
 HEADER_SIZE | src/kernel/boot/config.rs | config blob header layout
 CONFIG_ARENA_SIZE | src/kernel/boot/config.rs | mirror of the platform config's CONFIG_ARENA_SIZE
 BUFFER_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of CHANNEL_BUFFER_SIZE

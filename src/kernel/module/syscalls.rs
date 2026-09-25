@@ -818,10 +818,32 @@ const WORKLOAD_CONTRACT: u64 = 1u64 << 0x1A;
 /// companion: asking whether a chain is good is not a privileged act, and
 /// nothing crosses the boundary that a caller did not already hold.
 const TRUST_CONTRACT: u64 = 1u64 << 0x1D;
+/// NET_POLICY (0x1E, bit 30) — packet policy and service NAT. In the
+/// service-tier ceilings so an applier module can declare it; REPLACE and
+/// CLEAR additionally require `platform_raw` (see `privileged_op_permission`),
+/// because rewriting the host's packet policy is not a lesser privilege than
+/// spawning a workload. CAPS / READ / PROBE are not privileged: an in-graph
+/// enforcer reads the table it enforces.
+const NET_POLICY_CONTRACT: u64 = 1u64 << 0x1E;
 pub const CAP_CONTRACT_MASK: [u64; 4] = [
-    0x0027_1FE1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT | TRUST_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST
-    0x0027_1FF1 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT | TRUST_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
-    0x0027_1FE3 | STORAGE_FAMILY | PROC_CONTRACT | WORKLOAD_CONTRACT | TRUST_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
+    0x0027_1FE1
+        | STORAGE_FAMILY
+        | PROC_CONTRACT
+        | WORKLOAD_CONTRACT
+        | TRUST_CONTRACT
+        | NET_POLICY_CONTRACT, // CAP_SERVICE: infra + FS + storage family + KEY_VAULT + PLATFORM_NIC_RING + PLATFORM_DMA + PLATFORM_DMA_FD + PCIE_DEVICE + USB_HOST + PROC + WORKLOAD + TRUST + NET_POLICY
+    0x0027_1FF1
+        | STORAGE_FAMILY
+        | PROC_CONTRACT
+        | WORKLOAD_CONTRACT
+        | TRUST_CONTRACT
+        | NET_POLICY_CONTRACT, // CAP_SERVICE_PIO: service + HAL_PIO
+    0x0027_1FE3
+        | STORAGE_FAMILY
+        | PROC_CONTRACT
+        | WORKLOAD_CONTRACT
+        | TRUST_CONTRACT
+        | NET_POLICY_CONTRACT, // CAP_SERVICE_GPIO: service + HAL_GPIO
     u64::MAX, // CAP_FULL: any contract
 ];
 
@@ -985,6 +1007,11 @@ fn privileged_op_permission(op: u32) -> Option<u16> {
     // execution reachable with a strictly weaker declaration than workload
     // creation.
     if (0x1B00..=0x1BFF).contains(&op) {
+        return Some(PLATFORM_RAW);
+    }
+    // net.policy (0x1Exx) REPLACE / CLEAR rewrite the host's packet policy:
+    // platform_raw, like the workload ops. PROBE / CAPS / READ are reads.
+    if op == 0x1E02 || op == 0x1E03 {
         return Some(PLATFORM_RAW);
     }
     if !(0x0C00..=0x0CFF).contains(&op) {
