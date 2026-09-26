@@ -272,46 +272,64 @@ pub const MON_EV_RPO_LOSS: u8 = 21;
 pub const MON_EV_UNSAFE_RECOVERY_EPOCH_VOID: u8 = 22;
 pub const MON_EV_CLASS_REPORT: u8 = 23;
 
-/// Map an event code to its on-the-wire string. Empty for unknown codes.
+name_table!(
+    MON_EVENT_NAMES = [
+        b"unknown",
+        b"attach_req",
+        b"attached",
+        b"attach_failed",
+        b"drained",
+        b"exported",
+        b"imported",
+        b"resumed",
+        b"detach_req",
+        b"detached",
+        b"relocated",
+        b"rejected",
+        b"error",
+        b"epoch_bump",
+        b"export_req",
+        b"resume_req",
+        b"fence_initiated",
+        b"fence_confirmed",
+        b"vip_moved",
+        b"reservation_granted",
+        b"reservation_exhausted_stall",
+        b"rpo_loss",
+        b"unsafe_recovery_epoch_void",
+        b"class_report",
+    ]
+);
+
+/// A `MON_EV_*` code's name, indexed by code (`MON_EV_ATTACH_REQ` is 1).
 fn mon_event_name(ev: u8) -> &'static [u8] {
-    match ev {
-        MON_EV_ATTACH_REQ => b"attach_req",
-        MON_EV_ATTACHED => b"attached",
-        MON_EV_ATTACH_FAILED => b"attach_failed",
-        MON_EV_DRAINED => b"drained",
-        MON_EV_EXPORTED => b"exported",
-        MON_EV_IMPORTED => b"imported",
-        MON_EV_RESUMED => b"resumed",
-        MON_EV_DETACH_REQ => b"detach_req",
-        MON_EV_DETACHED => b"detached",
-        MON_EV_RELOCATED => b"relocated",
-        MON_EV_REJECTED => b"rejected",
-        MON_EV_ERROR => b"error",
-        MON_EV_EPOCH_BUMP => b"epoch_bump",
-        MON_EV_EXPORT_REQ => b"export_req",
-        MON_EV_RESUME_REQ => b"resume_req",
-        MON_EV_FENCE_INITIATED => b"fence_initiated",
-        MON_EV_FENCE_CONFIRMED => b"fence_confirmed",
-        MON_EV_VIP_MOVED => b"vip_moved",
-        MON_EV_RESERVATION_GRANTED => b"reservation_granted",
-        MON_EV_RESERVATION_EXHAUSTED_STALL => b"reservation_exhausted_stall",
-        MON_EV_RPO_LOSS => b"rpo_loss",
-        MON_EV_UNSAFE_RECOVERY_EPOCH_VOID => b"unsafe_recovery_epoch_void",
-        MON_EV_CLASS_REPORT => b"class_report",
-        _ => b"unknown",
+    let name = MON_EVENT_NAMES.get(ev as usize);
+    if name.is_empty() {
+        MON_EVENT_NAMES.get(0)
+    } else {
+        name
     }
 }
+
+name_table!(
+    MON_CLASS_NAMES = [
+        b"unknown",
+        b"reroutable",
+        b"drain_only",
+        b"resumable",
+        b"edge_anchored",
+        b"transport_migratable",
+    ]
+);
 
 /// Map a `CC_*` continuity-class wire constant (see
 /// `contracts/net/session_ctrl.rs`) to its `MON_SESSION` class name.
 pub fn mon_class_name(cc: u8) -> &'static [u8] {
-    match cc {
-        1 => b"reroutable",
-        2 => b"drain_only",
-        3 => b"resumable",
-        4 => b"edge_anchored",
-        5 => b"transport_migratable",
-        _ => b"unknown",
+    let name = MON_CLASS_NAMES.get(cc as usize);
+    if name.is_empty() {
+        MON_CLASS_NAMES.get(0)
+    } else {
+        name
     }
 }
 

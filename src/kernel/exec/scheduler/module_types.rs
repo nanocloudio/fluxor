@@ -515,6 +515,12 @@ pub struct MergeModule {
     /// Domain this merge runs in. Selects which `FAN_BUFS` entry the
     /// `step` body uses; see `TeeModule::domain`.
     domain: u8,
+    /// Raw fan-in: the input a transfer was cut short on (output or scratch
+    /// full), which is drained to empty before another input is read. A FIFO
+    /// write lands whole or not at all, so an emptied lane ends on its
+    /// producer's write boundary and no other producer's bytes land inside a
+    /// frame the cut split. -1 when no transfer is owed.
+    owed: i8,
     /// Wire format of the input frames. See `TeeModule::frame_kind`.
     frame_kind: u8,
 }
@@ -540,6 +546,7 @@ impl MergeModule {
             out_chan,
             next_idx: 0,
             domain,
+            owed: -1,
             frame_kind,
         }
     }
@@ -578,11 +585,22 @@ impl Module for MergeModule {
         // Raw byte-stream fan-in (mirror of `TeeModule::step` raw
         // path): round-robin across inputs, copy `min(in_len,
         // FAN_BUF_SIZE, out_space)` bytes from the first non-empty
-        // source into the output. Producer atomic-write boundaries
-        // can split; framed ports route through `step_framed`.
+        // source into the output. A transfer cut short leaves the input
+        // `owed`: it is drained to empty before another input is read, so a
+        // frame the cut split is finished before another producer's bytes
+        // follow it. Framed ports route through `step_framed`.
+        if self.owed >= 0 && channel::channel_readable_bytes(self.in_chans[self.owed as usize]) == 0
+        {
+            self.owed = -1;
+        }
         for _ in 0..self.in_count {
-            let idx = self.next_idx % self.in_count;
-            self.next_idx = (self.next_idx + 1) % self.in_count;
+            let idx = if self.owed >= 0 {
+                self.owed as usize
+            } else {
+                let i = self.next_idx % self.in_count;
+                self.next_idx = (self.next_idx + 1) % self.in_count;
+                i
+            };
             let chan = self.in_chans[idx];
 
             let in_len = channel::channel_readable_bytes(chan);
@@ -599,6 +617,10 @@ impl Module for MergeModule {
             let out_space = channel::channel_writable_bytes(self.out_chan);
             let read_amount = in_len.min(buf.len()).min(out_space);
             if read_amount == 0 {
+                if self.owed >= 0 {
+                    // The owed input waits for room; nothing else may go first.
+                    return Ok(StepOutcome::Continue);
+                }
                 continue;
             }
 
@@ -619,6 +641,11 @@ impl Module for MergeModule {
                 // mean the kernel's atomic-FIFO contract was broken.
                 return Err(-2);
             }
+            self.owed = if (read as usize) < in_len {
+                idx as i8
+            } else {
+                -1
+            };
 
             return Ok(StepOutcome::Continue);
         }

@@ -1527,9 +1527,13 @@ impl RsaWindowExp {
                         self.mul
                             .step(m, &self.sel[..len], &m.r2[..len], &mut self.acc, left)
                     } else {
-                        let (lo, _) = self.table.split_at(k);
-                        self.mul
-                            .step(m, &lo[k - 1][..len], &lo[1][..len], &mut self.acc, left)
+                        self.mul.step(
+                            m,
+                            &self.table[k - 1][..len],
+                            &self.table[1][..len],
+                            &mut self.acc,
+                            left,
+                        )
                     };
                     left -= u;
                     used += u;

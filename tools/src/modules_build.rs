@@ -1397,6 +1397,26 @@ fn compile_module_pic(
         eprintln!("[modules] rustc {cand_name}", cand_name = cand.name);
     }
     run_step(rustc, "rustc")?;
+    let obj = std::fs::read(&obj_path)
+        .map_err(|e| Error::Module(format!("{}: {e}", obj_path.display())))?;
+    let absolute = absolute_relocations(&obj)?;
+    if !absolute.is_empty() {
+        // A warning in a lenient build, an error in a strict one — the same
+        // rule rustc's own warnings follow here.
+        let msg = format!(
+            "{}: absolute pointers in {} — a module is loaded at an arbitrary \
+             address with no relocation applied, so each reads a wrong address \
+             at run time. Usual cause: a `match` that RETURNS `&[u8]`/`&str` \
+             literals (it lowers to a table of pointers), or a `const`/`static` \
+             holding references. Hold names in a `name_table!` instead.",
+            cand.name,
+            absolute.join(", "),
+        );
+        if opts.strict {
+            return Err(Error::Module(msg));
+        }
+        eprintln!("warning: {msg}");
+    }
 
     // 2) Link object → PIC ELF.
     let ld_script = pick_linker_script(cand, &opts.project_root);
@@ -1431,6 +1451,153 @@ fn compile_module_pic(
         cand.variant.as_deref(),
     )?;
     Ok(BuildOutcome::Built)
+}
+
+/// The sections of a relocatable object that carry an ABSOLUTE relocation:
+/// a stored address the linker fills in for a fixed load address. A module is
+/// copied to wherever the kernel places it and nothing patches such an
+/// address, so each is wrong at run time. Two kinds are never read by running
+/// code and are exempt: a retention static (`_KEEP_…`, a `#[used]` table that
+/// keeps symbols alive), and a panic location, whose one pointer is the path
+/// of a `.rs` file and is read only by a panic already under way.
+fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
+    struct Shdr {
+        name: u64,
+        ty: u64,
+        off: u64,
+        size: u64,
+        link: u64,
+        info: u64,
+        entsize: u64,
+    }
+    let bad = || Error::Module("object: malformed ELF".into());
+    let u16_at = |o: usize| -> Result<u64> {
+        let b = obj
+            .get(o..o.checked_add(2).ok_or_else(bad)?)
+            .ok_or_else(bad)?;
+        Ok(u64::from(u16::from_le_bytes([b[0], b[1]])))
+    };
+    let u32_at = |o: usize| -> Result<u64> {
+        let b = obj
+            .get(o..o.checked_add(4).ok_or_else(bad)?)
+            .ok_or_else(bad)?;
+        Ok(u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+    };
+    let u64_at = |o: usize| -> Result<u64> {
+        let b = obj
+            .get(o..o.checked_add(8).ok_or_else(bad)?)
+            .ok_or_else(bad)?;
+        Ok(u64::from_le_bytes(b.try_into().map_err(|_| bad())?))
+    };
+    let at = |base: u64, add: u64| -> Result<usize> {
+        base.checked_add(add)
+            .and_then(|o| usize::try_from(o).ok())
+            .ok_or_else(bad)
+    };
+    if obj.get(0..4) != Some(b"\x7fELF") || obj.get(5) != Some(&1) {
+        return Err(bad());
+    }
+    let elf64 = obj.get(4) == Some(&2);
+    let machine = u16_at(18)?;
+    let (shoff, shentsize, shnum, shstrndx) = if elf64 {
+        (u64_at(40)?, u16_at(58)?, u16_at(60)?, u16_at(62)?)
+    } else {
+        (u32_at(32)?, u16_at(46)?, u16_at(48)?, u16_at(50)?)
+    };
+    let header = |i: u64| -> Result<Shdr> {
+        let h = at(shoff, i.checked_mul(shentsize).ok_or_else(bad)?)?;
+        Ok(if elf64 {
+            Shdr {
+                name: u32_at(h)?,
+                ty: u32_at(h + 4)?,
+                off: u64_at(h + 24)?,
+                size: u64_at(h + 32)?,
+                link: u32_at(h + 40)?,
+                info: u32_at(h + 44)?,
+                entsize: u64_at(h + 56)?,
+            }
+        } else {
+            Shdr {
+                name: u32_at(h)?,
+                ty: u32_at(h + 4)?,
+                off: u32_at(h + 16)?,
+                size: u32_at(h + 20)?,
+                link: u32_at(h + 24)?,
+                info: u32_at(h + 28)?,
+                entsize: u32_at(h + 36)?,
+            }
+        })
+    };
+    // The bytes section `shndx` holds from `from`, up to a NUL.
+    let text = |shndx: u64, from: u64| -> Result<&[u8]> {
+        let h = header(shndx)?;
+        let s = obj.get(at(h.off, from)?..at(h.off, h.size)?).unwrap_or(&[]);
+        Ok(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())])
+    };
+    let name = |off: u64| -> Result<String> {
+        Ok(String::from_utf8_lossy(text(shstrndx, off)?).into_owned())
+    };
+    // The absolute address types, per machine.
+    let absolute = |ty: u64| match machine {
+        183 => ty == 257 || ty == 258,         // AArch64: ABS64, ABS32
+        40 => ty == 2,                         // ARM: ABS32
+        62 => ty == 1 || ty == 10 || ty == 11, // x86-64: 64, 32, 32S
+        243 => ty == 1 || ty == 2,             // RISC-V: 32, 64
+        _ => false,
+    };
+    let mut found = Vec::new();
+    for i in 0..shnum {
+        let rel = header(i)?;
+        // SHT_RELA (4) or SHT_REL (9).
+        let rela = rel.ty == 4;
+        if (!rela && rel.ty != 9) || rel.entsize == 0 {
+            continue;
+        }
+        let target = header(rel.info)?;
+        let target_name = name(target.name)?;
+        if target_name.contains("_KEEP_") {
+            continue;
+        }
+        let symtab = header(rel.link)?;
+        let (mut any, mut all_paths) = (false, true);
+        let mut e = 0u64;
+        while e.checked_add(rel.entsize).is_some_and(|n| n <= rel.size) {
+            let r = at(rel.off, e)?;
+            e += rel.entsize;
+            let (r_off, ty, sym, addend) = if elf64 {
+                let info = u64_at(r + 8)?;
+                let addend = if rela { u64_at(r + 16)? } else { 0 };
+                (u64_at(r)?, info & 0xffff_ffff, info >> 32, addend)
+            } else {
+                let info = u32_at(r + 4)?;
+                let addend = if rela { u32_at(r + 8)? } else { 0 };
+                (u32_at(r)?, info & 0xff, info >> 8, addend)
+            };
+            if !absolute(ty) {
+                continue;
+            }
+            any = true;
+            // A REL entry keeps its addend in the word it relocates.
+            let addend = if rela {
+                addend
+            } else {
+                u32_at(at(target.off, r_off)?)?
+            };
+            let s = at(symtab.off, sym.checked_mul(symtab.entsize).ok_or_else(bad)?)?;
+            let (value, shndx) = if elf64 {
+                (u64_at(s + 8)?, u16_at(s + 6)?)
+            } else {
+                (u32_at(s + 4)?, u16_at(s + 14)?)
+            };
+            if !text(shndx, value.wrapping_add(addend))?.ends_with(b".rs") {
+                all_paths = false;
+            }
+        }
+        if any && !all_paths {
+            found.push(target_name);
+        }
+    }
+    Ok(found)
 }
 
 fn compile_module_wasm(
@@ -1699,6 +1866,179 @@ pub fn resolve(project_root: &Path, out_root: &Path, target: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal little-endian relocatable object: `.shstrtab`, a string
+    /// section holding `pointee`, a symbol table whose symbol 1 names that
+    /// section, then for each `(target, reloc_type)` a data section and a
+    /// relocation section with one entry of that type, through symbol 1.
+    fn object(elf64: bool, machine: u16, relocs: &[(&str, u32)], pointee: &[u8]) -> Vec<u8> {
+        let mut names = vec![0u8];
+        let mut name = |s: &str| {
+            let at = names.len() as u32;
+            names.extend_from_slice(s.as_bytes());
+            names.push(0);
+            at
+        };
+        // (name, type, offset-in-body, size, link, info, entsize)
+        type Sh = (u32, u32, usize, usize, u32, u32, usize);
+        let mut shdrs: Vec<Sh> = vec![(0, 0, 0, 0, 0, 0, 0)];
+        let shstr = name(".shstrtab");
+        let rodata = name(".rodata.str");
+        let symtab = name(".symtab");
+        let mut body: Vec<u8> = Vec::new();
+        shdrs.push((shstr, 3, 0, 0, 0, 0, 0)); // 1: filled in below
+        let at = body.len();
+        body.extend_from_slice(pointee);
+        body.push(0);
+        shdrs.push((rodata, 1, at, pointee.len() + 1, 0, 0, 0)); // 2
+        let sym_ent = if elf64 { 24 } else { 16 };
+        let at = body.len();
+        body.extend_from_slice(&vec![0u8; sym_ent]); // symbol 0: null
+        let mut sym = vec![0u8; sym_ent];
+        if elf64 {
+            sym[6..8].copy_from_slice(&2u16.to_le_bytes());
+        } else {
+            sym[14..16].copy_from_slice(&2u16.to_le_bytes());
+        }
+        body.extend_from_slice(&sym); // symbol 1: section 2, value 0
+        shdrs.push((symtab, 2, at, 2 * sym_ent, 0, 0, sym_ent)); // 3
+        let mut pending = Vec::new();
+        for (target, ty) in relocs {
+            pending.push((name(target), name(&format!(".rela{target}")), *ty));
+        }
+        for (t, r, ty) in pending {
+            let data_idx = shdrs.len() as u32;
+            let at = body.len();
+            body.extend_from_slice(&[0u8; 8]);
+            shdrs.push((t, 1, at, 8, 0, 0, 0));
+            let at = body.len();
+            let entsize = if elf64 { 24 } else { 8 };
+            if elf64 {
+                body.extend_from_slice(&0u64.to_le_bytes());
+                body.extend_from_slice(&((1u64 << 32) | u64::from(ty)).to_le_bytes());
+                body.extend_from_slice(&0i64.to_le_bytes());
+            } else {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&((1u32 << 8) | ty).to_le_bytes());
+            }
+            let kind = if elf64 { 4 } else { 9 };
+            shdrs.push((r, kind, at, entsize, 3, data_idx, entsize));
+        }
+        let names_at = body.len();
+        body.extend_from_slice(&names);
+        shdrs[1].2 = names_at;
+        shdrs[1].3 = names.len();
+        let ehsize = if elf64 { 64 } else { 52 };
+        let shentsize = if elf64 { 64 } else { 40 };
+        let shoff = ehsize + body.len();
+        let mut out = vec![0u8; ehsize];
+        out[0..4].copy_from_slice(b"\x7fELF");
+        out[4] = if elf64 { 2 } else { 1 };
+        out[5] = 1;
+        out[18..20].copy_from_slice(&machine.to_le_bytes());
+        let n = shdrs.len() as u16;
+        if elf64 {
+            out[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+            out[58..60].copy_from_slice(&(shentsize as u16).to_le_bytes());
+            out[60..62].copy_from_slice(&n.to_le_bytes());
+            out[62..64].copy_from_slice(&1u16.to_le_bytes());
+        } else {
+            out[32..36].copy_from_slice(&(shoff as u32).to_le_bytes());
+            out[46..48].copy_from_slice(&(shentsize as u16).to_le_bytes());
+            out[48..50].copy_from_slice(&n.to_le_bytes());
+            out[50..52].copy_from_slice(&1u16.to_le_bytes());
+        }
+        out.extend_from_slice(&body);
+        for (nm, ty, off, size, link, info, ent) in shdrs {
+            let mut h = vec![0u8; shentsize];
+            let off = if ty == 0 { 0 } else { ehsize + off };
+            h[0..4].copy_from_slice(&nm.to_le_bytes());
+            h[4..8].copy_from_slice(&ty.to_le_bytes());
+            if elf64 {
+                h[24..32].copy_from_slice(&(off as u64).to_le_bytes());
+                h[32..40].copy_from_slice(&(size as u64).to_le_bytes());
+                h[40..44].copy_from_slice(&link.to_le_bytes());
+                h[44..48].copy_from_slice(&info.to_le_bytes());
+                h[56..64].copy_from_slice(&(ent as u64).to_le_bytes());
+            } else {
+                h[16..20].copy_from_slice(&(off as u32).to_le_bytes());
+                h[20..24].copy_from_slice(&(size as u32).to_le_bytes());
+                h[24..28].copy_from_slice(&link.to_le_bytes());
+                h[28..32].copy_from_slice(&info.to_le_bytes());
+                h[36..40].copy_from_slice(&(ent as u32).to_le_bytes());
+            }
+            out.extend_from_slice(&h);
+        }
+        out
+    }
+
+    #[test]
+    fn an_absolute_pointer_in_data_is_found_on_each_machine() {
+        // AArch64 ABS64 in a table of literals.
+        let o = object(true, 183, &[(".data.rel.ro.table", 257)], b"create");
+        assert_eq!(
+            absolute_relocations(&o).unwrap(),
+            vec![".data.rel.ro.table"]
+        );
+        // ARM ABS32.
+        let o = object(false, 40, &[(".data.rel.ro.table", 2)], b"create");
+        assert_eq!(
+            absolute_relocations(&o).unwrap(),
+            vec![".data.rel.ro.table"]
+        );
+    }
+
+    #[test]
+    fn position_independent_and_retention_relocations_pass() {
+        // AArch64 PREL32 (261) and ARM REL32 (3) are position independent.
+        assert!(
+            absolute_relocations(&object(true, 183, &[(".text.f", 261)], b""))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            absolute_relocations(&object(false, 40, &[(".text.f", 3)], b""))
+                .unwrap()
+                .is_empty()
+        );
+        // A `_KEEP_` retention static is never read, so its pointers are exempt.
+        let keep = object(
+            true,
+            183,
+            &[(".data.rel.ro._ZN3mod12_KEEP_MEMSET17h0E", 257)],
+            b"x",
+        );
+        assert!(absolute_relocations(&keep).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_panic_location_is_exempt_and_other_text_is_not() {
+        // A pointer to a `.rs` path is a panic location; to anything else, data.
+        for elf64 in [true, false] {
+            let (m, ty) = if elf64 { (183, 257) } else { (40, 2) };
+            let loc = object(
+                elf64,
+                m,
+                &[(".data.rel.ro..Lanon.1", ty)],
+                b"src/sdk/crypto/rsa.rs",
+            );
+            assert!(absolute_relocations(&loc).unwrap().is_empty());
+            let data = object(elf64, m, &[(".data.rel.ro..Lanon.1", ty)], b"quic-resume-0");
+            assert_eq!(
+                absolute_relocations(&data).unwrap(),
+                vec![".data.rel.ro..Lanon.1"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_object_is_an_error_not_a_panic() {
+        let o = object(true, 183, &[(".data.rel.ro.table", 257)], b"create");
+        for cut in [0, 3, 20, 63, o.len() / 2] {
+            let _ = absolute_relocations(&o[..cut]);
+        }
+        assert!(absolute_relocations(b"not an elf").is_err());
+    }
 
     fn repo_root() -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -244,6 +244,7 @@ The runtime loader enforces a concrete module binary contract:
 - Required exports are FNV-1a hash resolved: `module_state_size`,
   `module_init`, `module_new`, `module_step`
 - Optional exports: `module_channel_hints`, `module_arena_size`,
+  `module_stack_size`,
   `module_drain`, `module_deferred_ready`, `module_mailbox_safe`,
   `module_in_place_safe`, `module_pipeline_refill`,
   `module_post_tick_flush`, `module_isr_init` / `module_isr_entry`,
@@ -271,11 +272,40 @@ data is safe: a `static` or `const` table of integers or bytes lives in
 `.rodata` and is reached PC-relative (`adrp` plus page offset on
 aarch64, a PC-relative literal on thumb, a fixed linear-memory offset
 on wasm32). The packer keeps every module's code page-aligned so the
-`adrp` pair resolves at any load address. What is not safe is a table
-that *contains* addresses: a `const` array of `&[u8]` or function
-pointers materialises absolute addresses that are never fixed up, and
-LLVM's switch-table dispatch has the same shape. Return such references
-from a `fn` with a `match` instead, so the address is computed in code.
+`adrp` pair resolves at any load address. What is not safe is data
+that *contains* an address: a `const` array of `&[u8]` or function
+pointers, a `static` holding a reference, and a `match` that returns
+literals — LLVM lowers the last to a switch lookup table of pointers.
+Each reads a wrong address at run time.
+
+Hold names in a `name_table!` (`runtime/names.rs`): the strings are one run
+of bytes with integer end offsets, built at compile time, so the only
+address in play is the table's own. Otherwise act in each arm rather than
+returning the literal from it.
+
+`fluxor modules build` enforces this. It refuses (under `--strict`, as
+`fluxor ci` builds; warns otherwise) an object carrying an absolute
+relocation, naming the section. Two kinds are exempt because running code
+never reads them: a `_KEEP_…` retention static, and a panic location (its
+pointer is a `.rs` path, read only by a panic already under way).
+
+#### What a module cannot link
+
+A module links against the SDK's runtime (`runtime/intrinsics.rs`) and no
+other. It provides `memcpy`, `memmove`, `memset`, `memcmp`, and on Arm the
+`__aeabi_*` integer division, 64-bit shift and multiply, and memory helpers
+and `__clzsi2`. Anything else the compiler reaches for is an undefined symbol
+at link time:
+
+| Construct | Missing | Write instead |
+|---|---|---|
+| any `f32`/`f64` arithmetic on 32-bit Arm | the soft-float runtime | scaled integers (fixed-point) |
+| `u128`/`i128` division or remainder | `__udivti3`, `__umodti3`, `__divti3` | split into 64-bit halves |
+| `a / b`, `a % b` on signed integers the compiler cannot prove safe | the overflow panic path for `MIN / -1` | `checked_div`/`checked_rem`, or divide the magnitudes unsigned and restore the sign |
+| slice indexing, `copy_from_slice`, `split_at` with lengths it cannot prove | panic paths and their message data | `get(..)`, `zip` loops, or a bound the compiler can see |
+
+Signed division itself links (`__aeabi_idiv`, `__aeabi_ldivmod`); what does
+not is the compiler-inserted panic for the one overflowing quotient.
 
 Module sources include the SDK via the standard pattern:
 
@@ -374,9 +404,15 @@ Modules can be assigned a protection level at config time:
 - **Level 0 (None)** — direct call, no isolation.
 - **Level 1 (Guarded)** — step guard timer detects timeouts. A module
   that overruns its step deadline is marked as faulted.
-- **Level 2 (Isolated)** — hardware memory protection (MPU on RP2350,
-  MMU on Pi 5). The kernel maps only the module's state, code, channel
-  buffers, and heap; any other memory access raises a fault.
+- **Level 2 (Isolated)** — hardware memory protection, on targets whose
+  kernel isolates modules: the MMU targets (Pi 5), where a module runs at
+  EL0 under its own page table mapping only its state, code, channel
+  buffers and heap, on a 64 KiB stack (`ISOLATED_STACK_BYTES`) above an
+  unmapped guard page; any other access raises a fault. A module that needs
+  more stack exports `module_stack_size() -> u32`, and the loader refuses
+  it if the isolated stack is smaller. The kernel does not run RP2350's MPU
+  regime, so an RP target refuses an isolation request at compose and at
+  load rather than run the module without it.
 
 Faulted modules transition through `Running → Faulted → Recovering`
 (or `Terminated`) according to a per-module fault policy:

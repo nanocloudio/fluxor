@@ -76,7 +76,7 @@ const PH_CLOSE: u8 = 3;
 const PH_PUBLISH: u8 = 4;
 const PH_DONE: u8 = 5;
 
-const PHASE_NAMES: [&[u8]; 6] = [b"create", b"write", b"fsync", b"close", b"publish", b"done"];
+name_table!(PHASE_NAMES = [b"create", b"write", b"fsync", b"close", b"publish", b"done"]);
 
 /// Steps between heartbeats — roughly five seconds at a 1 ms tick, matching
 /// every other module on the lane.
@@ -183,7 +183,7 @@ unsafe fn emit_fail(s: &SeedState, phase: u8, rc: i32) {
     let prefix = b"[fat32_seed] FAIL ";
     core::ptr::copy_nonoverlapping(prefix.as_ptr(), out.as_mut_ptr(), prefix.len());
     pos += prefix.len();
-    let name = PHASE_NAMES[phase as usize];
+    let name = PHASE_NAMES.get(phase as usize);
     core::ptr::copy_nonoverlapping(name.as_ptr(), out.as_mut_ptr().add(pos), name.len());
     pos += name.len();
     let mid = b" rc=-";

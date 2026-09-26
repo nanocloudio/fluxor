@@ -104,25 +104,27 @@ const PH_VERIFY_GONE: u8 = 13;
 const PH_RMDIR_NAME: u8 = 14;
 const PH_DONE: u8 = 15;
 
-/// Phase names, for the verdict line. Indexed by phase.
-const PHASE_NAMES: [&[u8]; 16] = [
-    b"caps",
-    b"mkdir",
-    b"create",
-    b"write",
-    b"fsync",
-    b"close",
-    b"fsync_name",
-    b"verify",
-    b"rename",
-    b"verify_renamed",
-    b"truncate",
-    b"verify_truncated",
-    b"unlink",
-    b"verify_gone",
-    b"publish_removal",
-    b"done",
-];
+// Phase names, for the verdict line. Indexed by phase.
+name_table!(
+    PHASE_NAMES = [
+        b"caps",
+        b"mkdir",
+        b"create",
+        b"write",
+        b"fsync",
+        b"close",
+        b"fsync_name",
+        b"verify",
+        b"rename",
+        b"verify_renamed",
+        b"truncate",
+        b"verify_truncated",
+        b"unlink",
+        b"verify_gone",
+        b"publish_removal",
+        b"done",
+    ]
+);
 
 #[repr(C)]
 struct SelfTestState {
@@ -184,7 +186,7 @@ unsafe fn log_phase(s: &SelfTestState, tag: &[u8], phase: u8) {
     let prefix = b"[fs_selftest] ";
     core::ptr::copy_nonoverlapping(prefix.as_ptr(), out.as_mut_ptr(), prefix.len());
     pos += prefix.len();
-    let name = PHASE_NAMES[phase as usize];
+    let name = PHASE_NAMES.get(phase as usize);
     core::ptr::copy_nonoverlapping(name.as_ptr(), out.as_mut_ptr().add(pos), name.len());
     pos += name.len();
     *out.as_mut_ptr().add(pos) = b' ';
@@ -213,7 +215,7 @@ unsafe fn emit_fail(s: &SelfTestState, phase: u8, rc: i32) {
     let prefix = b"[fs_selftest] FAIL ";
     core::ptr::copy_nonoverlapping(prefix.as_ptr(), out.as_mut_ptr(), prefix.len());
     pos += prefix.len();
-    let name = PHASE_NAMES[phase as usize];
+    let name = PHASE_NAMES.get(phase as usize);
     core::ptr::copy_nonoverlapping(name.as_ptr(), out.as_mut_ptr().add(pos), name.len());
     pos += name.len();
     let mid = b" rc=-";

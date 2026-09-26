@@ -1106,6 +1106,8 @@ pub fn pack_fmod(
         "module_post_tick_flush",
         // heap arena size (per-module heap allocation)
         "module_arena_size",
+        // stack an isolated module needs (checked against the isolated stack)
+        "module_stack_size",
         // buffer capability markers
         "module_in_place_safe",
         "module_mailbox_safe",

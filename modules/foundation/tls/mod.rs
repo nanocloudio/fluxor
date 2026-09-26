@@ -3801,14 +3801,25 @@ unsafe fn log_peer_auth_failure(s: &mut TlsState, conn_id: u16, rc: u32) {
     dev_log(sys, 1, buf.as_ptr(), pos);
 }
 
+name_table!(
+    PEER_AUTH_NAMES = [
+        b"none",
+        b"pinned",
+        b"ca_dns",
+        b"ca_uri",
+        b"insecure_no_verify"
+    ]
+);
+
 fn peer_auth_text(profile: u8) -> &'static [u8] {
-    match profile {
-        PROFILE_PINNED => b"pinned",
-        PROFILE_CA_DNS => b"ca_dns",
-        PROFILE_CA_URI => b"ca_uri",
-        PROFILE_INSECURE_NO_VERIFY => b"insecure_no_verify",
-        _ => b"none",
-    }
+    let i = match profile {
+        PROFILE_PINNED => 1,
+        PROFILE_CA_DNS => 2,
+        PROFILE_CA_URI => 3,
+        PROFILE_INSECURE_NO_VERIFY => 4,
+        _ => 0,
+    };
+    PEER_AUTH_NAMES.get(i)
 }
 
 /// The most compatibility ChangeCipherSpec records one session will

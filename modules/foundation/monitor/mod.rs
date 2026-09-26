@@ -45,6 +45,10 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../sdk/runtime.rs");
+
+// A module's run state, as the verdict line names it; 3 and beyond are
+// terminated.
+name_table!(STATE_NAMES = [b"running", b"faulted", b"recovering", b"terminated"]);
 include!("../../sdk/runtime/params.rs");
 
 // Opcodes imported from the layered ABI — no hardcoded 0x0Cxx here.
@@ -223,16 +227,7 @@ unsafe fn build_mon_state(sys: &SyscallTable, mod_idx: u8, out: &mut [u8]) -> us
         );
     }
     emit_bytes(b" state=", out, &mut pos);
-    emit_bytes(
-        match st[2] {
-            0 => b"running".as_slice(),
-            1 => b"faulted".as_slice(),
-            2 => b"recovering".as_slice(),
-            _ => b"terminated".as_slice(),
-        },
-        out,
-        &mut pos,
-    );
+    emit_bytes(STATE_NAMES.get(st[2].min(3) as usize), out, &mut pos);
     emit_bytes(b" ready=", out, &mut pos);
     emit_decimal(bit(module_state_flags::READY), out, &mut pos);
     emit_bytes(b" finished=", out, &mut pos);

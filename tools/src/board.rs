@@ -601,9 +601,11 @@ fn validate_sink_pins(
 
 /// Validate isolation settings against target capabilities.
 ///
-/// Checks that `protection: isolated` is only set on targets that have
-/// an MPU (RP2350, 8 regions) or MMU (BCM2712). RP2040 (Cortex-M0+) has
-/// no MPU and cannot support hardware isolation.
+/// `protection: isolated` is admitted only where the kernel isolates a module:
+/// an MMU target, whose modules run at EL0 under their own page table with a
+/// guarded stack. An MPU is not enough on its own — the kernel does not run
+/// RP2350's MPU regime — so an RP target refuses the request here rather than
+/// load a module that asked for isolation and would not get it.
 fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut ValidationResult) {
     // Check for protection setting in config (can be at top level or in graph)
     let protection = config
@@ -611,18 +613,12 @@ fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut Va
         .or_else(|| config.get("graph").and_then(|g| g.get("protection")))
         .and_then(|v| v.as_str());
 
-    if let Some(mode) = protection {
-        if mode == "isolated" {
-            let has_isolation = target.mpu_regions >= 8 || target.has_mmu;
-            if !has_isolation {
-                result.add_error(format!(
-                    "protection: isolated requires MPU or MMU, but target '{}' has \
-                     {} MPU regions and has_mmu={}. RP2040 (Cortex-M0+) does not \
-                     support hardware isolation.",
-                    target.id, target.mpu_regions, target.has_mmu,
-                ));
-            }
-        }
+    if protection == Some("isolated") && !target.has_mmu {
+        result.add_error(format!(
+            "protection: isolated requires a target whose kernel isolates \
+             modules (an MMU target, EL0); target '{}' has none.",
+            target.id,
+        ));
     }
 
     // Per-module `trust_tier` and `protection` cross-checks.
@@ -633,7 +629,7 @@ fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut Va
     let valid_tiers = ["platform", "verified", "community", "unsigned"];
     let valid_prot = ["none", "guarded", "isolated"];
     if let Some(modules) = config.get("modules").and_then(|m| m.as_array()) {
-        let has_isolation = target.mpu_regions >= 8 || target.has_mmu;
+        let has_isolation = target.has_mmu;
         for (i, m) in modules.iter().enumerate() {
             if let Some(t) = m.get("trust_tier").and_then(|v| v.as_str()) {
                 if !valid_tiers.contains(&t) {
@@ -649,7 +645,7 @@ fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut Va
                     ));
                 } else if p == "isolated" && !has_isolation {
                     result.add_error(format!(
-                        "modules[{i}]: protection: isolated requires MPU or MMU, target '{}' lacks both",
+                        "modules[{i}]: protection: isolated requires a target whose kernel isolates modules (an MMU target, EL0); target '{}' has none",
                         target.id,
                     ));
                 }
@@ -667,8 +663,8 @@ fn validate_isolation(config: &Value, target: &TargetDescriptor, result: &mut Va
             {
                 result.add_error(format!(
                     "modules[{i}]: trust_tier '{tier}' implies protection: isolated, \
-                     but target '{}' has no MPU/MMU. Either set protection explicitly \
-                     or deploy to a target with isolation.",
+                     but target '{}' does not isolate modules. Either set protection \
+                     explicitly or deploy to an MMU target.",
                     target.id,
                 ));
             }
@@ -772,5 +768,38 @@ fn validate_paged_arenas(config: &Value, target: &TargetDescriptor, result: &mut
             "Total paged_arena resident_max across all modules is {total_resident_mb}MB. \
              Ensure pool is sized accordingly (default 1MB for testing)."
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn target(board: &str) -> TargetDescriptor {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root")
+            .to_path_buf();
+        crate::target::load_target(board, &root).expect("board")
+    }
+
+    fn isolation_errors(board: &str, config: Value) -> Vec<String> {
+        let mut result = ValidationResult::default();
+        validate_isolation(&config, &target(board), &mut result);
+        result.errors
+    }
+
+    #[test]
+    fn isolation_is_admitted_only_where_the_kernel_isolates() {
+        let graph = json!({ "protection": "isolated" });
+        let module = json!({ "modules": [{ "name": "m", "protection": "isolated" }] });
+        let tier = json!({ "modules": [{ "name": "m", "trust_tier": "community" }] });
+        for config in [&graph, &module, &tier] {
+            assert!(isolation_errors("pi5", config.clone()).is_empty());
+            // An MPU the kernel does not run is no isolation: refused.
+            assert_eq!(isolation_errors("pico2w", config.clone()).len(), 1);
+            assert_eq!(isolation_errors("pico", config.clone()).len(), 1);
+        }
     }
 }

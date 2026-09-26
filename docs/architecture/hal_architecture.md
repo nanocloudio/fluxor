@@ -418,8 +418,10 @@ else:
 1. **`HalOps`** (`src/kernel/sys/hal.rs`) — the function-pointer table each
    platform installs at boot. All platform *behaviour* the kernel invokes goes
    through it: timing, interrupts, step-guard, ISR tiers, SMP quiesce, and the module
-   protection surface (`protection_*`, `protected_step`, stack canaries — MPU
-   on Cortex-M, EL0 MMU on aarch64, direct dispatch elsewhere).
+   protection surface (`protection_*`, `protected_step`, stack canaries — EL0
+   MMU isolation on aarch64, direct dispatch elsewhere; the Cortex-M MPU
+   implementation in `src/platform/rp/mpu.rs` is not enabled, and an RP target
+   refuses an isolation request).
 2. **`platform::chip`** — the cfg-selected per-target *constants* module
    (arena sizes, capacity ceilings). These size static arrays, so they must be
    compile-time constants; a cfg-selected constants module IS the compile-time

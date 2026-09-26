@@ -27,6 +27,11 @@
 //! ASID 1..N = modules (restricted EL0 access)
 //! TTBR0_EL1 is swapped per-module with the module's page table + ASID.
 
+/// The stack an isolated module runs on at EL0, above one unmapped guard page.
+/// The loader refuses an isolated module that declares a larger need
+/// (`module_stack_size`).
+pub const ISOLATED_STACK_BYTES: usize = 64 * 1024;
+
 #[cfg(feature = "chip-bcm2712")]
 #[allow(
     dead_code,
@@ -876,14 +881,14 @@ mod bcm2712_impl {
         /// 4 KB page size.
         const PAGE: u64 = 4096;
         /// EL0 stack usable size (grows down toward the guard page).
-        const EL0_STACK_BYTES: u64 = 64 * 1024;
+        const EL0_STACK_BYTES: u64 = super::super::ISOLATED_STACK_BYTES as u64;
         /// Per-isolated-module stack slab: one guard page + the EL0 stack,
         /// 4 KB-aligned. Page 0 is left unmapped as the guard page; the stack
         /// occupies the pages immediately above it. Mapped at 4 KB granularity
         /// (`map_4k` carves it out of the kernel base), so it needs only page
         /// alignment; a 2 MB-aligned 2 MB slab would bloat firmware BSS by ~6 MB
         /// (2 slabs × 2 MB + 2 MB-alignment padding) for no benefit.
-        const STACK_SLAB_BYTES: usize = 4096 + 64 * 1024; // guard page + EL0_STACK_BYTES
+        const STACK_SLAB_BYTES: usize = 4096 + super::super::ISOLATED_STACK_BYTES; // guard page + stack
 
         // ---- Per-core EL0 control block ------------------------------------
         //

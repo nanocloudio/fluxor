@@ -114,6 +114,7 @@ Optional exports surface additional capabilities:
 | Export | Purpose |
 |--------|--------|
 | `module_arena_size` | Request a per-module heap (see [heap.md](heap.md)) |
+| `module_stack_size` | Declare the stack an isolated module needs; refused at load if the isolated stack is smaller |
 | `module_channel_hints` | Request specific channel buffer sizes per port |
 | `module_drain` | Support graceful drain during live reconfigure |
 | `module_deferred_ready` | Gate downstream modules until init completes |

@@ -515,36 +515,45 @@ pub const CERT_ERR_UNSUPPORTED_SUITE: u32 = 24;
 /// deploying the stronger key was not to have this happen.
 pub const CERT_ERR_DOWNGRADE: u32 = 25;
 
-/// Short stable token for a reason code, for the operator-facing log line.
+name_table!(
+    CERT_ERROR_NAMES = [
+        b"ok",
+        b"message-malformed",
+        b"empty-chain",
+        b"malformed",
+        b"anchor-malformed",
+        b"chain-too-long",
+        b"issuer-mismatch",
+        b"signature",
+        b"unknown-ca",
+        b"not-ca",
+        b"no-key-cert-sign",
+        b"path-len",
+        b"leaf-is-ca",
+        b"leaf-key-usage",
+        b"leaf-eku",
+        b"name-mismatch",
+        b"name-absent",
+        b"critical-ext",
+        b"expired",
+        b"not-yet-valid",
+        b"no-clock",
+        b"pin-mismatch",
+        b"bad-key",
+        b"no-profile",
+        b"unsupported-suite",
+        b"downgrade",
+    ]
+);
+
+/// Short stable token for a reason code (`CERT_*`, indexed by code), for the
+/// operator-facing log line.
 pub fn cert_error_text(code: u32) -> &'static [u8] {
-    match code {
-        CERT_OK => b"ok",
-        CERT_ERR_MSG_MALFORMED => b"message-malformed",
-        CERT_ERR_EMPTY_CHAIN => b"empty-chain",
-        CERT_ERR_MALFORMED => b"malformed",
-        CERT_ERR_ANCHOR_MALFORMED => b"anchor-malformed",
-        CERT_ERR_CHAIN_TOO_LONG => b"chain-too-long",
-        CERT_ERR_ISSUER_MISMATCH => b"issuer-mismatch",
-        CERT_ERR_SIGNATURE => b"signature",
-        CERT_ERR_NO_ANCHOR => b"unknown-ca",
-        CERT_ERR_NOT_CA => b"not-ca",
-        CERT_ERR_NO_KEY_CERT_SIGN => b"no-key-cert-sign",
-        CERT_ERR_PATH_LEN => b"path-len",
-        CERT_ERR_LEAF_IS_CA => b"leaf-is-ca",
-        CERT_ERR_LEAF_KEY_USAGE => b"leaf-key-usage",
-        CERT_ERR_LEAF_EKU => b"leaf-eku",
-        CERT_ERR_NAME_MISMATCH => b"name-mismatch",
-        CERT_ERR_NAME_ABSENT => b"name-absent",
-        CERT_ERR_CRITICAL_EXT => b"critical-ext",
-        CERT_ERR_EXPIRED => b"expired",
-        CERT_ERR_NOT_YET_VALID => b"not-yet-valid",
-        CERT_ERR_NO_CLOCK => b"no-clock",
-        CERT_ERR_PIN_MISMATCH => b"pin-mismatch",
-        CERT_ERR_BAD_KEY => b"bad-key",
-        CERT_ERR_NO_PROFILE => b"no-profile",
-        CERT_ERR_UNSUPPORTED_SUITE => b"unsupported-suite",
-        CERT_ERR_DOWNGRADE => b"downgrade",
-        _ => b"unknown",
+    let name = CERT_ERROR_NAMES.get(code as usize);
+    if name.is_empty() {
+        b"unknown"
+    } else {
+        name
     }
 }
 

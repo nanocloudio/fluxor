@@ -215,7 +215,7 @@ const MAX_TICKETS: usize = 4;
 /// survives a re-instantiation and would let the replacement re-open every
 /// ticket its predecessor had already spent (RFC 8446 §8, RFC 9001 §9.2).
 const TICKET_AAD: &[u8] = b"quic-ticket-v1";
-const TICKET_LABEL: [&[u8]; 2] = [b"quic-resume-0", b"quic-resume-1"];
+name_table!(TICKET_LABEL = [b"quic-resume-0", b"quic-resume-1"]);
 /// `TICKET_AAD` + parity + this instance's replay domain. Derived from the
 /// label rather than written out, so changing the label cannot leave a
 /// stale length behind that still compiles.
@@ -1143,8 +1143,8 @@ unsafe fn ticket_keys_open(s: &mut QuicState) {
         return;
     }
     let sys = &*s.syscalls;
-    s.ticket_key[0] = vault_open_or_generate_aead(sys, TICKET_LABEL[0]);
-    s.ticket_key[1] = vault_open_or_generate_aead(sys, TICKET_LABEL[1]);
+    s.ticket_key[0] = vault_open_or_generate_aead(sys, TICKET_LABEL.get(0));
+    s.ticket_key[1] = vault_open_or_generate_aead(sys, TICKET_LABEL.get(1));
     s.ticket_rotated_ms = dev_millis(sys);
     if s.ticket_key[0] < 0 || s.ticket_key[1] < 0 {
         s.ticket_key = [-1, -1];
@@ -1168,8 +1168,8 @@ unsafe fn ticket_rotate_if_due(s: &mut QuicState) {
         return;
     }
     let next = (s.ticket_parity ^ 1) as usize;
-    vault_destroy_by_label(sys, TICKET_LABEL[next]);
-    let h = vault_open_or_generate_aead(sys, TICKET_LABEL[next]);
+    vault_destroy_by_label(sys, TICKET_LABEL.get(next));
+    let h = vault_open_or_generate_aead(sys, TICKET_LABEL.get(next));
     if h < 0 {
         return;
     }

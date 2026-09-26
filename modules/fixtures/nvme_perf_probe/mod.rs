@@ -294,14 +294,16 @@ fn write_dec(out: *mut u8, pos: &mut usize, mut v: u32) {
     }
 }
 
-const PHASE_NAMES: [&[u8]; 6] = [
-    b"seq_w32",
-    b"seq_r32",
-    b"seq_w128",
-    b"seq_r128",
-    b"rand_w",
-    b"rand_r",
-];
+name_table!(
+    PHASE_NAMES = [
+        b"seq_w32",
+        b"seq_r32",
+        b"seq_w128",
+        b"seq_r128",
+        b"rand_w",
+        b"rand_r",
+    ]
+);
 
 unsafe fn emit_perf(s: &NppState, phase: u8, us: u32, bytes: u32, mbps: u32) {
     let mut buf = [0u8; 128];
@@ -315,7 +317,7 @@ unsafe fn emit_perf(s: &NppState, phase: u8, us: u32, bytes: u32, mbps: u32) {
     let t = b" name=";
     core::ptr::copy_nonoverlapping(t.as_ptr(), p.add(pos), t.len());
     pos += t.len();
-    let name = PHASE_NAMES[phase as usize];
+    let name = PHASE_NAMES.get(phase as usize);
     core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(pos), name.len());
     pos += name.len();
 

@@ -60,6 +60,7 @@ pub mod export_hashes {
     pub const MODULE_POST_TICK_FLUSH: u32 = 0x85d25b69; // "module_post_tick_flush"
     pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
+    pub const MODULE_STACK_SIZE: u32 = 0x6e85b5ea; // "module_stack_size"
     pub const MODULE_DRAIN: u32 = 0xc4c5636c; // "module_drain"
     pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03; // "module_isr_init"
     pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743; // "module_isr_entry"
@@ -154,6 +155,12 @@ pub enum LoaderError {
     IntegrityMismatch,
     /// Ed25519 signature invalid or missing when enforce_signatures is set.
     SignatureInvalid,
+    /// The module asked for `protection: isolated` on a target whose kernel
+    /// does not isolate modules.
+    IsolationUnavailable,
+    /// An isolated module declares (`module_stack_size`) more stack than the
+    /// isolated stack holds.
+    StackTooSmall { declared: u32, available: u32 },
 }
 impl LoaderError {
     /// Log the error with appropriate level.
@@ -177,6 +184,15 @@ impl LoaderError {
             }
             Self::IntegrityMismatch => log::error!("[loader] {context}: integrity hash mismatch"),
             Self::SignatureInvalid => log::error!("[loader] {context}: signature invalid"),
+            Self::IsolationUnavailable => {
+                log::error!("[loader] {context}: isolation requested; this target does not isolate")
+            }
+            Self::StackTooSmall {
+                declared,
+                available,
+            } => log::error!(
+                "[loader] {context}: declares {declared} B of stack; isolation gives {available} B"
+            ),
         }
     }
 }
@@ -2445,6 +2461,26 @@ impl DynamicModule {
         let iso_requested = crate::kernel::exec::scheduler::params_request_isolation(params_slice);
         #[cfg(not(feature = "kernel-vm"))]
         let iso_requested = false;
+        // Isolation this kernel cannot give is refused, never run without it.
+        #[cfg(not(feature = "kernel-vm"))]
+        if crate::kernel::exec::scheduler::params_request_isolation(params_slice) {
+            return Err(LoaderError::IsolationUnavailable);
+        }
+        // An isolated module runs on a fixed stack above a guard page; one that
+        // declares a larger need is refused here rather than faulting there.
+        #[cfg(feature = "chip-bcm2712")]
+        if iso_requested {
+            if let Ok(addr) = module.get_export_addr(export_hashes::MODULE_STACK_SIZE) {
+                let declared = call_state_size(fn_ptr_from_addr(addr));
+                let available = crate::platform::mmu::ISOLATED_STACK_BYTES;
+                if declared > available {
+                    return Err(LoaderError::StackTooSmall {
+                        declared: u32::try_from(declared).unwrap_or(u32::MAX),
+                        available: available as u32,
+                    });
+                }
+            }
+        }
         // 4. Allocate state. `state_map_size` is the footprint the MMU maps
         // (page-padded for isolated modules so it owns whole pages); the module
         // and its canary still use `required_size`.
