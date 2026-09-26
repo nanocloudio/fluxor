@@ -244,7 +244,6 @@ The runtime loader enforces a concrete module binary contract:
 - Required exports are FNV-1a hash resolved: `module_state_size`,
   `module_init`, `module_new`, `module_step`
 - Optional exports: `module_channel_hints`, `module_arena_size`,
-  `module_stack_size`,
   `module_drain`, `module_deferred_ready`, `module_mailbox_safe`,
   `module_in_place_safe`, `module_pipeline_refill`,
   `module_post_tick_flush`, `module_isr_init` / `module_isr_entry`,
@@ -274,9 +273,15 @@ aarch64, a PC-relative literal on thumb, a fixed linear-memory offset
 on wasm32). The packer keeps every module's code page-aligned so the
 `adrp` pair resolves at any load address. What is not safe is data
 that *contains* an address: a `const` array of `&[u8]` or function
-pointers, a `static` holding a reference, and a `match` that returns
-literals — LLVM lowers the last to a switch lookup table of pointers.
-Each reads a wrong address at run time.
+pointers, and a `static` holding a reference — including a single `&str`.
+Each reads a wrong address at run time, on every target.
+
+A `match` that returns literals differs by machine. On 32-bit Arm (both RP
+dies) LLVM lowers it to a switch lookup table of absolute pointers, so it
+has the same defect. On aarch64 LLVM emits a table of PC-relative offsets
+instead, which needs no relocation — so the same source is correct on
+bcm2712 and wrong on an RP die, and a module that targets both has to be
+written for the RP case.
 
 Hold names in a `name_table!` (`runtime/names.rs`): the strings are one run
 of bytes with integer end offsets, built at compile time, so the only
@@ -285,27 +290,109 @@ returning the literal from it.
 
 `fluxor modules build` enforces this. It refuses (under `--strict`, as
 `fluxor ci` builds; warns otherwise) an object carrying an absolute
-relocation, naming the section. Two kinds are exempt because running code
-never reads them: a `_KEEP_…` retention static, and a panic location (its
-pointer is a `.rs` path, read only by a panic already under way).
+relocation, naming the section. Two shapes are exempt, recognised from the
+object's structure rather than from a name, so neither can hide a table
+that code reads:
+
+- a data section nothing in the object references — a retention static,
+  kept alive by the linker script and never loaded by code;
+- a section that is exactly one `core::panic::Location` — one pointer at
+  offset 0 to a `.rs` path of the length the next word states, then the
+  line and column. Code passes it to the panic call, but its pointer is read
+  only by a panic already under way.
+
+A table code reads is reached by a relocation from that code and is never
+exactly one `Location`, whatever it is named and whatever its strings end
+in.
 
 #### What a module cannot link
 
 A module links against the SDK's runtime (`runtime/intrinsics.rs`) and no
-other. It provides `memcpy`, `memmove`, `memset`, `memcmp`, and on Arm the
-`__aeabi_*` integer division, 64-bit shift and multiply, and memory helpers
-and `__clzsi2`. Anything else the compiler reaches for is an undefined symbol
-at link time:
+other: no `core` panic machinery, no soft-float library, no
+`compiler_builtins`. The runtime provides `memcpy`, `memmove`, `memset`,
+`memcmp`; on 32-bit Arm the `__aeabi_*` integer division, 64-bit shift and
+multiply, and `__clzsi2`; on AArch64 the 128-bit division helpers
+(`__udivti3`, `__umodti3`, `__divti3`, `__modti3`); and a trap for a slice
+index out of bounds. Anything else the compiler reaches for is an undefined
+symbol, and the module does not link.
 
-| Construct | Missing | Write instead |
-|---|---|---|
-| any `f32`/`f64` arithmetic on 32-bit Arm | the soft-float runtime | scaled integers (fixed-point) |
-| `u128`/`i128` division or remainder | `__udivti3`, `__umodti3`, `__divti3` | split into 64-bit halves |
-| `a / b`, `a % b` on signed integers the compiler cannot prove safe | the overflow panic path for `MIN / -1` | `checked_div`/`checked_rem`, or divide the magnitudes unsigned and restore the sign |
-| slice indexing, `copy_from_slice`, `split_at` with lengths it cannot prove | panic paths and their message data | `get(..)`, `zip` loops, or a bound the compiler can see |
+| Construct | rp2040 | rp2350 | bcm2712 | Write instead |
+|---|---|---|---|---|
+| `f32` arithmetic | does not link (soft-float) | **links, then faults the whole node** — see below | native | scaled integers (fixed-point) |
+| `f64` arithmetic | does not link | does not link | native | scaled integers (fixed-point) |
+| `a / b`, `a % b` on any integer type, divisor not provably non-zero | does not link | does not link | does not link | a `NonZero*` divisor, or `checked_div` / `checked_rem` |
+| signed `a / b`, `a % b` with zero ruled out | does not link | does not link | does not link | `checked_div` / `checked_rem`, or divide the magnitudes unsigned and restore the sign |
+| `copy_from_slice` with lengths it cannot prove equal | does not link | does not link | does not link | a length the compiler can see, or a `zip` loop |
+| `split_at` (and other panics that format a message) | does not link | does not link | does not link | `split_at_checked`, `get(..)` |
+| slice index it cannot prove in bounds | links; a miss **hangs** | links; a miss **hangs** | links; a miss **hangs** | `get(..)`, handling the miss |
 
-Signed division itself links (`__aeabi_idiv`, `__aeabi_ldivmod`); what does
-not is the compiler-inserted panic for the one overflowing quotient.
+`u128` and `i128` arithmetic — multiply, divide, remainder — links on every
+target: 32-bit Arm expands it inline, AArch64 calls the runtime helpers. The
+divide-by-zero rule above still applies to it.
+
+Division is refused at link, and indexing is not, deliberately. Every integer
+`/` and `%` carries a divide-by-zero panic (and signed division a `MIN / -1`
+overflow panic) whose absence stops the build, so an author learns about the
+case at the desk. A slice index is too common to refuse, so the runtime
+answers its panic with a trap that spins: an out-of-bounds index does not
+fault, the step simply never returns. Use `get(..)` wherever the index is not
+provably in range.
+
+On rp2350 `f32` is a trap of a different kind, and a worse one. The target
+is `thumbv8m.main-none-eabihf`, so the compiler lowers `f32` to VFP
+instructions rather than calls, and the module links. The RP kernel does not
+grant the coprocessor, so the first such instruction is a NOCP UsageFault
+(CFSR bit 19), escalated to HardFault; the fault handler reports it and parks
+the node. One `f32` operation in any module stops every module on the board,
+not just its own. The FPU stays off by design: enabling it means lazy FP
+context stacking on every exception (72 more bytes on the kernel stack each
+time) and scrubbing the FP registers between modules, for no module that
+needs it. A rig scenario holds this on the silicon.
+
+The build holds this table true: a check builds one module per construct
+for each die and fails the moment any row stops matching, so a toolchain
+upgrade that moves a row is caught the day it lands.
+
+#### Stack depth
+
+A module steps on a stack it does not own — the kernel's on an RP part, where
+every module steps in turn on one stack; its own fixed stack when it is
+isolated on an MMU target — so the composer admits its depth before a device
+runs it. `fluxor modules build` measures it: the compile emits the assembly
+beside the object, and the build walks the call graph from every `module_*`
+entry point, summing each function's frame along the deepest path. The
+`.fmod` manifest carries the figure, and `fluxor modules build -v` prints it
+with the path that sets it.
+
+| What the walk reads | How |
+|---|---|
+| Frames | 32-bit Arm: the `.save`/`.vsave`/`.pad` unwind directives, exactly. aarch64: the stack-pointer decrements |
+| Calls, tail calls | A call stacks the callee on the caller's frame; a tail call replaces it |
+| Indirect calls | Charged the deepest function whose address the module takes, one level deep; a taken function is also an entry point, since it is usually a callback the kernel calls. The rest of an indirect call's reach is the kernel, whose frames are the stack's reserve |
+| No bound | Recursion, a frame sized at run time, a call outside the module: no figure is recorded |
+
+Where the walk has no bound, or reaches less than the author knows the module
+needs — a provider it calls that calls back, inline assembly that moves the
+stack pointer — the module declares it:
+
+```rust
+declare_module_stack_bytes!(if cfg!(fluxor_silicon = "bcm2712") { 16 * 1024 } else { 5 * 1024 });
+```
+
+A declaration is a floor: the manifest records the larger of it and the
+measurement, and a declaration below the measurement fails the build. The
+composer refuses a graph on an RP target whose deepest module does not fit
+the stack (see [The RP stack](hal_architecture.md#the-rp-stack)), or that
+carries a module with no figure; on an MMU target it refuses an isolated
+module deeper than `[isolation] isolated_stack_kb`. The scheduler fences each
+step at the admitted depth on the device and faults a module that crosses it,
+which is what catches the paths the walk does not follow.
+
+Large locals are the usual cause of a deep path, and the compiler names them:
+`rustc -C remark=stack-frame-layout -C debuginfo=2` lists every stack slot
+with the variables it holds (`-C llvm-args=-no-stack-coloring` separates
+slots that share storage). A value built by `new()` and assigned into state is
+staged on the stack first; assigning from a `const` copies it in place.
 
 Module sources include the SDK via the standard pattern:
 
@@ -408,11 +495,13 @@ Modules can be assigned a protection level at config time:
   kernel isolates modules: the MMU targets (Pi 5), where a module runs at
   EL0 under its own page table mapping only its state, code, channel
   buffers and heap, on a 64 KiB stack (`ISOLATED_STACK_BYTES`) above an
-  unmapped guard page; any other access raises a fault. A module that needs
-  more stack exports `module_stack_size() -> u32`, and the loader refuses
-  it if the isolated stack is smaller. The kernel does not run RP2350's MPU
-  regime, so an RP target refuses an isolation request at compose and at
-  load rather than run the module without it.
+  unmapped guard page; any other access raises a fault. The composer
+  refuses an isolated module whose declared stack (see
+  [Stack depth](#stack-depth)) exceeds that stack, and the loader repeats
+  the check for a blob that reached the device some other way. The kernel
+  does not isolate modules on RP2040 or RP2350, so an RP target refuses an
+  isolation request at compose and at load rather than run the module
+  without it.
 
 Faulted modules transition through `Running → Faulted → Recovering`
 (or `Terminated`) according to a per-module fault policy:

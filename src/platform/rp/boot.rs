@@ -101,11 +101,150 @@ pub unsafe extern "C" fn Reset() -> ! {
         core::arch::asm!("msr MSPLIM, {0}", in(reg) limit, options(nomem, nostack, preserves_flags));
     }
 
+    // SAFETY: nothing lives below the stack pointer yet, and no interrupt is
+    // enabled that could push a frame into the range being written.
+    unsafe { paint_stack() };
+
     unsafe extern "C" {
         fn fluxor_rp_main() -> !;
     }
     // SAFETY: statics are live; this is the kernel entry.
     unsafe { fluxor_rp_main() }
+}
+
+/// The word every free stack byte holds from reset until a frame reaches it.
+#[cfg(feature = "rp")]
+const STACK_PAINT: u32 = 0x5EED_57AC;
+
+/// Fill the stack region below the current stack pointer with
+/// [`STACK_PAINT`], so [`stack_peak`] can later tell how deep the stack has
+/// ever been. The loop keeps its state in registers; nothing it calls uses the
+/// stack it is writing.
+///
+/// # Safety
+/// Runs once from `Reset`, before any interrupt is enabled.
+#[cfg(feature = "rp")]
+#[inline(always)]
+unsafe fn paint_stack() {
+    let sp: u32;
+    // SAFETY: reads the stack pointer; no memory access.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
+    let mut word = &raw const __stack_limit as *mut u32;
+    let end = (sp & !3) as *mut u32;
+    while word < end {
+        // SAFETY: `[__stack_limit, sp)` is the unused part of the stack
+        // region the linker reserved; no static and no live frame is in it.
+        unsafe {
+            core::ptr::write_volatile(word, STACK_PAINT);
+            word = word.add(1);
+        }
+    }
+}
+
+/// The deepest the kernel stack has been since reset, and the size of the
+/// region it grows in, both in bytes. The stack is the one every module steps
+/// on, so the first figure is what the composer's stack admission is held to
+/// on the bench.
+///
+/// Scans up from the region's floor to the first overwritten word, so the
+/// cost is proportional to the unused part of the stack: a few thousand
+/// loads, which is why callers take it every few seconds, not every tick.
+#[cfg(feature = "rp")]
+pub fn stack_peak() -> (usize, usize) {
+    let floor = &raw const __stack_limit as usize;
+    let top = &raw const __stack_top as usize;
+    let mut word = floor as *const u32;
+    // SAFETY: every address in `[floor, top)` is RAM the linker assigned to
+    // the stack; reading it has no side effect.
+    unsafe {
+        while (word as usize) < top && core::ptr::read_volatile(word) == STACK_PAINT {
+            word = word.add(1);
+        }
+    }
+    (top - word as usize, top - floor)
+}
+
+/// The deepest the stack has been at the moment the scheduler called into a
+/// module, in bytes below the top: the kernel's own share of the stack under
+/// a module, which `kernel_stack_reserve_kb` must cover.
+#[cfg(feature = "rp")]
+static mut ENTRY_DEPTH: usize = 0;
+
+/// The armed fence: the lowest address the stack may reach while the module
+/// being called runs, or 0 when disarmed.
+#[cfg(feature = "rp")]
+static mut FENCE: usize = 0;
+
+/// Words the fence spans. A frame that crosses it writes at least its saved
+/// registers into the words it reserves, so a short run of painted words is
+/// enough to see one go past.
+#[cfg(feature = "rp")]
+const FENCE_WORDS: usize = 4;
+
+/// Arm the stack fence for a module call whose admitted depth is `depth`
+/// bytes (0 disarms). The fence sits `KERNEL_STACK_RESERVE + depth` below the
+/// top of the stack — the bound the composer admitted the graph against —
+/// and holds [`STACK_PAINT`], so it is invisible to [`stack_peak`].
+#[cfg(feature = "rp")]
+pub fn stack_fence_arm(depth: usize) {
+    let top = &raw const __stack_top as usize;
+    let floor = &raw const __stack_limit as usize;
+    let sp: usize;
+    // SAFETY: reads the stack pointer; no memory access.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
+    // SAFETY: single-threaded runtime; the scheduler is the only caller.
+    unsafe {
+        if top - sp > ENTRY_DEPTH {
+            ENTRY_DEPTH = top - sp;
+        }
+        FENCE = 0;
+    }
+    if depth == 0 {
+        return;
+    }
+    let Some(at) = top
+        .checked_sub(crate::platform::chip::KERNEL_STACK_RESERVE + depth + FENCE_WORDS * 4)
+        .map(|a| a & !3)
+    else {
+        return;
+    };
+    // Below the region, the stack would fault or overwrite statics first; at
+    // or above the stack pointer, the kernel is already past its reserve,
+    // which the periodic report names. Neither leaves a place to fence.
+    if at < floor || at + FENCE_WORDS * 4 > sp {
+        return;
+    }
+    for i in 0..FENCE_WORDS {
+        // SAFETY: `[at, at + FENCE_WORDS * 4)` lies below the stack pointer
+        // and above the region's floor: free stack, no live frame.
+        unsafe { core::ptr::write_volatile((at as *mut u32).add(i), STACK_PAINT) };
+    }
+    // SAFETY: single-threaded runtime.
+    unsafe { FENCE = at };
+}
+
+/// Whether the stack stayed above the armed fence since it was armed.
+#[cfg(feature = "rp")]
+pub fn stack_fence_intact() -> bool {
+    // SAFETY: single-threaded runtime.
+    let at = unsafe { FENCE };
+    if at == 0 {
+        return true;
+    }
+    // SAFETY: the words `stack_fence_arm` wrote; stack RAM.
+    (0..FENCE_WORDS)
+        .all(|i| unsafe { core::ptr::read_volatile((at as *const u32).add(i)) } == STACK_PAINT)
+}
+
+/// The deepest the stack has been at a module call, in bytes below the top.
+#[cfg(feature = "rp")]
+pub fn stack_entry_depth() -> usize {
+    // SAFETY: single-word read on the only thread.
+    unsafe { ENTRY_DEPTH }
 }
 
 /// A system exception that should never be taken.

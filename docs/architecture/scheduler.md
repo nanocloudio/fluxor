@@ -48,9 +48,8 @@ overrun is noticed.
 
 On the RP family the alarm ISR records the overrun and disables the
 alarm, then returns to the interrupted module, which keeps running
-until it returns of its own accord. The forced-return trampoline that
-rewrites the stacked return address belongs to the memory-protection
-fault path (`src/platform/rp/mpu.rs`), not to the step guard. The one
+until it returns of its own accord; nothing rewrites a stacked return
+address to force it out. The one
 place the early flag changes scheduling is a `Burst` re-step loop: the
 loop tests the flag between iterations, so a module that overruns its
 burst deadline (its declared `step_deadline_burst_us`, or

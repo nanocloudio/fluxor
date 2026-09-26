@@ -310,6 +310,8 @@ unsafe fn admit_syn(s: &mut GuardState, src_ip: u32, dst_ip: u32, now_ms: u32) -
 // Module ABI
 // ============================================================================
 
+declare_module_state_bytes!(GuardState);
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {

@@ -891,7 +891,9 @@ pub(crate) fn step_one_module(
         // something other than `Continue` produce the identical record —
         // none — and telling those two apart is the reading this
         // histogram exists to support.
+        crate::kernel::sys::hal::stack_fence_arm(m.stack_bytes());
         let outcome = m.step();
+        note_stack_fence(module_idx);
         record_step_time(
             module_idx,
             (crate::kernel::sys::hal::now_micros() - step_t0) as u32,
@@ -905,35 +907,35 @@ pub(crate) fn step_one_module(
                 // order silently dropped every over-deadline step; `post_step_check`
                 // both records the timeout AND disarms.
                 step_guard::post_step_check();
-                // A single step finalizes AT MOST ONCE. A timeout, an MPU/EL0
-                // protection fault, and a stack-canary overflow each
+                // A single step finalizes AT MOST ONCE. A timeout and a
+                // protection fault (EL0 abort or a broken stack fence) each
                 // terminate/quarantine the module and decrement `active_count`;
-                // running more than one for the same step double-counts (and can
-                // stop a healthy sibling). Clear both guard flags unconditionally
-                // (so neither lingers into the next step), then finalize once —
-                // timeout takes precedence, MPU and canary collapse into one fault.
+                // running both for the same step double-counts (and can stop a
+                // healthy sibling). Clear both guard flags unconditionally (so
+                // neither lingers into the next step), then finalize once —
+                // timeout takes precedence.
                 let timed_out = step_guard::check_and_clear_timeout();
                 let mpu = step_guard::check_and_clear_mpu_fault();
-                let canary_violated = !crate::kernel::sys::hal::stack_canary_check();
-                if canary_violated {
-                    log::error!("[mpu] module {module_idx} stack canary violated");
-                    crate::kernel::sys::hal::stack_canary_reinit();
-                }
                 if timed_out {
                     handle_step_timeout(sched, modules, module_idx, active_count);
-                } else if mpu || canary_violated {
+                } else if mpu {
                     handle_mpu_fault(sched, modules, module_idx, active_count);
                 }
             }
             Ok(StepOutcome::Ready) => {
                 step_guard::disarm();
-                if !sched.ready[module_idx] {
+                if step_guard::check_and_clear_mpu_fault() {
+                    handle_mpu_fault(sched, modules, module_idx, active_count);
+                } else if !sched.ready[module_idx] {
                     sched.ready[module_idx] = true;
                     log::info!("{}: ready", modules[module_idx].type_name());
                 }
             }
             Ok(StepOutcome::Done) => {
                 step_guard::disarm();
+                // The module is finalized either way; a protection fault on
+                // its last step must not linger into the next module's.
+                step_guard::check_and_clear_mpu_fault();
                 finalize_module(module_idx, None, modules[module_idx].type_name(), "");
                 *active_count -= 1;
             }
@@ -1020,6 +1022,7 @@ pub(crate) fn step_one_module(
                         // the scheduler performed, not passes it made.
                         let burst_t0 = crate::kernel::sys::hal::now_micros();
                         let burst_outcome = m.step();
+                        note_stack_fence(module_idx);
                         record_step_time(
                             module_idx,
                             (crate::kernel::sys::hal::now_micros() - burst_t0) as u32,
@@ -1260,5 +1263,16 @@ pub fn step_woken_modules(
         } {
             log::info!("MON_WAKE_BUDGET_DEFER count={deferred} suppressed={sup}");
         }
+    }
+}
+
+/// Check the stack fence after a module call. A broken fence means the
+/// module and the kernel under it went deeper than the composer admitted:
+/// a protection fault on the module that was running, reported once.
+fn note_stack_fence(module_idx: usize) {
+    if !crate::kernel::sys::hal::stack_fence_intact() {
+        log::error!("[stack] module {module_idx} ran past its admitted stack");
+        crate::kernel::sys::hal::stack_fence_arm(0);
+        step_guard::record_mpu_fault(module_idx);
     }
 }

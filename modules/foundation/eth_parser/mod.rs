@@ -218,6 +218,8 @@ unsafe fn parse_and_forward(s: &mut ParserState, frame: *const u8, frame_len: us
 // Module ABI
 // ============================================================================
 
+declare_module_state_bytes!([u8; STATE_SIZE]);
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {

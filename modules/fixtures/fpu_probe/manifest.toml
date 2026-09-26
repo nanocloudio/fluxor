@@ -1,0 +1,13 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+# Holds the claim that the RP kernel leaves the FPU off. On rp2350 a module is
+# built for `thumbv8m.main-none-eabihf`, so an `f32` operation compiles to a VFP
+# instruction rather than a runtime call and the module links. The kernel never
+# grants CP10/CP11 in CPACR, so the first such instruction is a NOCP
+# UsageFault, escalated to HardFault and reported by the fault park — which
+# stops the whole node, not just this module. Diagnostic only; no production
+# graph loads it.
+
+[observability]
+exempt = "FPU-state probe; its '[fpu_probe]' lines and the kernel's fault report are the observable, read by the rig scenario's rules"

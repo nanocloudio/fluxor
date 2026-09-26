@@ -181,6 +181,8 @@ unsafe fn emit_mapped(sys: &SyscallTable, out_chan: i32, msg_type: u32) {
 // Module API
 // ============================================================================
 
+declare_module_state_bytes!(GestureState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

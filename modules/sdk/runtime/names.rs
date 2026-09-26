@@ -1,9 +1,10 @@
 // Names as data a module can hold at any load address.
 //
 // A module image is placed at a load-time address and nothing relocates it, so
-// it can hold no stored address: a `const` array of `&[u8]`, a `static` that
-// holds a reference, and a `match` that RETURNS literals all become tables of
-// absolute pointers (LLVM lowers the last to a switch lookup table), and each
+// it can hold no stored address: a `const` array of `&[u8]` and a `static` that
+// holds a reference become tables of absolute pointers on every target, and a
+// `match` that RETURNS literals does too on 32-bit Arm, where LLVM lowers it to
+// a switch lookup table of pointers (aarch64 gets PC-relative offsets). Each
 // reads a wrong address at run time. `fluxor modules build` refuses an object
 // that carries one.
 //

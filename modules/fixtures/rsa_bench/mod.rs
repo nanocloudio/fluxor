@@ -389,6 +389,8 @@ unsafe fn advance(s: &mut BenchState) -> bool {
     }
 }
 
+declare_module_state_bytes!(BenchState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

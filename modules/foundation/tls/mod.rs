@@ -705,6 +705,9 @@ impl PeerAddr {
 /// gives headroom for HRR + cert-request flows.
 const MAX_FLIGHT_RECORDS: usize = 8;
 
+/// A fresh DTLS endpoint, evaluated at compile time.
+const EMPTY_DTLS_ENDPOINT: DtlsEndpoint = DtlsEndpoint::new();
+
 struct PeerSession {
     phase: DtlsPhase,
     peer: PeerAddr,
@@ -758,7 +761,10 @@ impl PeerSession {
     fn reset(&mut self) {
         self.phase = DtlsPhase::Idle;
         self.peer = PeerAddr::unset();
-        self.endpoint = DtlsEndpoint::new();
+        // From a constant, so the tens of kilobytes are copied straight into
+        // the slot; `DtlsEndpoint::new()` here stages the whole endpoint on
+        // the stack first.
+        self.endpoint = EMPTY_DTLS_ENDPOINT;
         self.inbound_len = 0;
         self.last_flight_len = 0;
         self.last_flight_record_count = 0;
@@ -1310,6 +1316,8 @@ define_params! {
 // Module ABI exports
 // ============================================================================
 
+declare_module_state_bytes!(TlsState);
+
 #[no_mangle]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<TlsState>() as u32
@@ -1765,8 +1773,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     let s = &mut *(state as *mut TlsState);
     s.step_count = s.step_count.wrapping_add(1);
     if s.transport == TRANSPORT_UDP {
-        return dtls_module_step(s);
+        dtls_module_step(s)
+    } else {
+        tcp_module_step(s)
     }
+}
+
+/// One step of TLS over a stream transport. Out of line, like
+/// `dtls_module_step`, so each transport's frame is paid only on its own path.
+#[inline(never)]
+unsafe fn tcp_module_step(s: &mut TlsState) -> i32 {
     // Retry any peer-identity envelopes that couldn't ship at
     // handshake completion because the consumer was backed up.
     // Runs every tick to bound delivery latency without busy-

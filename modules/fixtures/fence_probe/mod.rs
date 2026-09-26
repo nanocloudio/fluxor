@@ -216,6 +216,8 @@ unsafe fn service_events(s: &mut ProbeState) {
     }
 }
 
+declare_module_state_bytes!(ProbeState);
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

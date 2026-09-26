@@ -229,9 +229,13 @@ pub struct HalOps {
     /// arena). No-ops where module page tables don't exist.
     pub protection_map_page: fn(module_idx: usize, vaddr: usize, phys: usize, writable: bool),
     pub protection_unmap_page: fn(module_idx: usize, vaddr: usize),
-    /// Stack-canary check / re-arm around module steps.
-    pub stack_canary_check: fn() -> bool,
-    pub stack_canary_reinit: fn(),
+    /// Arm the stack fence for the module about to be called: `depth` is the
+    /// stack the composer admitted it, in bytes, below the kernel's own
+    /// reserve; 0 disarms. Platforms whose modules do not step on the kernel
+    /// stack install a no-op.
+    pub stack_fence_arm: fn(depth: usize),
+    /// Whether the stack stayed inside the armed fence. `true` when disarmed.
+    pub stack_fence_intact: fn() -> bool,
     /// Write raw bytes to the platform's debug serial sink (the same UART / USB
     /// CDC the log ring drains to). Binary-safe (no UTF-8 filtering, unlike the
     /// log path), so a telemetry `transport_buffer` can push framed records to a host
@@ -332,12 +336,12 @@ pub fn protection_unmap_page(module_idx: usize, vaddr: usize) {
     (ops().protection_unmap_page)(module_idx, vaddr)
 }
 #[inline]
-pub fn stack_canary_check() -> bool {
-    (ops().stack_canary_check)()
+pub fn stack_fence_intact() -> bool {
+    (ops().stack_fence_intact)()
 }
 #[inline]
-pub fn stack_canary_reinit() {
-    (ops().stack_canary_reinit)()
+pub fn stack_fence_arm(depth: usize) {
+    (ops().stack_fence_arm)(depth)
 }
 
 // `sleep_until`'s wake reason. **Bit flags, not an enumeration**: a deadline

@@ -7185,6 +7185,8 @@ pub extern "C" fn module_observes_owner_release() -> u32 {
 // Exported PIC Module Interface
 // ============================================================================
 
+declare_module_state_bytes!(Fat32State);
+
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
 pub extern "C" fn module_state_size() -> u32 {

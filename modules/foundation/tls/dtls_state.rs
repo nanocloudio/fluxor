@@ -1133,6 +1133,9 @@ unsafe fn dtls_discard_bytes(sys: &SyscallTable, ch: i32, mut count: usize) {
 // by (peer_ip, peer_port) and reads/writes datagram opcodes.
 // ---------------------------------------------------------------------
 
+// Out of line: `module_step` runs either this or `tcp_module_step`, and
+// inlined the two would share one frame holding both paths' buffers.
+#[inline(never)]
 unsafe fn dtls_module_step(s: &mut TlsState) -> i32 {
     let sys = &*s.syscalls;
 

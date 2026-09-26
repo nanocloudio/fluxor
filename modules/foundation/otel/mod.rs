@@ -804,6 +804,8 @@ fn write_frame_header(buf: &mut [u8], payload_len: usize) {
     buf[2] = len[1];
 }
 
+declare_module_state_bytes!(OtelState);
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

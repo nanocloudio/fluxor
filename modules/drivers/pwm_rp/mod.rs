@@ -380,6 +380,8 @@ pub unsafe extern "C" fn pwm_provider_dispatch(
 // Module API
 // ============================================================================
 
+declare_module_state_bytes!(PwmState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

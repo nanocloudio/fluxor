@@ -1633,78 +1633,95 @@ pub fn verify_cert_signature(
     {
         return false;
     }
+    // One function per signature family, never inlined: their working sets
+    // differ by kilobytes (an ML-DSA workspace, an RSA job), and a frame
+    // holding all of them charges every certificate for the largest.
     match cert.suite {
-        suite::ECDSA_P256_SHA256 => {
-            if cert.sig_alg != OID_ECDSA_SHA256 {
-                return false;
-            }
-            let tbs_hash = sha256(cert.tbs_raw);
-            let raw_sig = match parse_der_signature(cert.signature) {
-                Some(s) => s,
-                None => return false,
-            };
-            ecdsa_verify(issuer_pubkey, &tbs_hash, &raw_sig)
-        }
-        suite::ECDSA_P384_SHA384 => {
-            if cert.sig_alg != OID_ECDSA_SHA384 {
-                return false;
-            }
-            let tbs_hash = sha384(cert.tbs_raw);
-            let raw_sig = match parse_der_signature384(cert.signature) {
-                Some(s) => s,
-                None => return false,
-            };
-            ecdsa384_verify(issuer_pubkey, &tbs_hash, &raw_sig)
-        }
-        suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => {
-            // The signature is the BIT STRING contents, the modulus width
-            // exactly; the digest is of tbsCertificate under the hash the
-            // signature suite names. The exponentiation runs whole here:
-            // this is the host's and the vault's path, and the handshake on
-            // a budgeted target verifies through its stepped job instead.
-            let Some(key) = rsa_public_key_parse(issuer_pubkey) else {
-                return false;
-            };
-            let mut job = RsaVerifyJob::new();
-            if cert.suite == suite::RSA_PKCS1_SHA256 {
-                let tbs_hash = sha256(cert.tbs_raw);
-                rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha256, &tbs_hash, cert.signature)
-            } else {
-                let tbs_hash = sha384(cert.tbs_raw);
-                rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha384, &tbs_hash, cert.signature)
-            }
-        }
+        suite::ECDSA_P256_SHA256 => verify_ecdsa_p256(&cert, issuer_pubkey),
+        suite::ECDSA_P384_SHA384 => verify_ecdsa_p384(&cert, issuer_pubkey),
+        suite::RSA_PKCS1_SHA256 | suite::RSA_PKCS1_SHA384 => verify_rsa(&cert, issuer_pubkey),
         suite::ML_DSA_44 | suite::ML_DSA_65 | suite::ML_DSA_87 => {
-            // The signature is the BIT STRING contents as they stand: no
-            // DER wrapper, no digest step. FIPS 204's pure variant signs
-            // the tbsCertificate bytes themselves, under the empty
-            // context — a certificate is already domain-separated by
-            // everything inside it.
-            let Some(set) = ml_dsa_set_for(cert.suite) else {
-                return false;
-            };
-            if cert.signature.len() != set.params().sig_len {
-                return false;
-            }
-            // The workspace is a LOCAL: a position-independent module has
-            // no `.bss` — its state arrives as a pointer from the kernel —
-            // so a static is not available here at all. One workspace at
-            // the widest dimensions rather than one per set, because a
-            // chain may mix sets and a frame whose size does not depend on
-            // which certificate arrived is the one that can be checked
-            // against the module's stack. 13 KB, of the 64 KB it gets.
-            let mut ws: VerifyWorkspace<L_MAX> = VerifyWorkspace::new();
-            ml_dsa_verify(
-                set,
-                issuer_pubkey,
-                &[],
-                cert.tbs_raw,
-                cert.signature,
-                &mut ws,
-            )
+            verify_ml_dsa(&cert, issuer_pubkey)
         }
         _ => false,
     }
+}
+
+#[inline(never)]
+fn verify_ecdsa_p256(cert: &X509Cert<'_>, issuer_pubkey: &[u8]) -> bool {
+    if cert.sig_alg != OID_ECDSA_SHA256 {
+        return false;
+    }
+    let tbs_hash = sha256(cert.tbs_raw);
+    let raw_sig = match parse_der_signature(cert.signature) {
+        Some(s) => s,
+        None => return false,
+    };
+    ecdsa_verify(issuer_pubkey, &tbs_hash, &raw_sig)
+}
+
+#[inline(never)]
+fn verify_ecdsa_p384(cert: &X509Cert<'_>, issuer_pubkey: &[u8]) -> bool {
+    if cert.sig_alg != OID_ECDSA_SHA384 {
+        return false;
+    }
+    let tbs_hash = sha384(cert.tbs_raw);
+    let raw_sig = match parse_der_signature384(cert.signature) {
+        Some(s) => s,
+        None => return false,
+    };
+    ecdsa384_verify(issuer_pubkey, &tbs_hash, &raw_sig)
+}
+
+#[inline(never)]
+fn verify_rsa(cert: &X509Cert<'_>, issuer_pubkey: &[u8]) -> bool {
+    // The signature is the BIT STRING contents, the modulus width
+    // exactly; the digest is of tbsCertificate under the hash the
+    // signature suite names. The exponentiation runs whole here:
+    // this is the host's and the vault's path, and the handshake on
+    // a budgeted target verifies through its stepped job instead.
+    let Some(key) = rsa_public_key_parse(issuer_pubkey) else {
+        return false;
+    };
+    let mut job = RsaVerifyJob::new();
+    if cert.suite == suite::RSA_PKCS1_SHA256 {
+        let tbs_hash = sha256(cert.tbs_raw);
+        rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha256, &tbs_hash, cert.signature)
+    } else {
+        let tbs_hash = sha384(cert.tbs_raw);
+        rsa_pkcs1_v15_verify(&mut job, &key, RsaHash::Sha384, &tbs_hash, cert.signature)
+    }
+}
+
+#[inline(never)]
+fn verify_ml_dsa(cert: &X509Cert<'_>, issuer_pubkey: &[u8]) -> bool {
+    // The signature is the BIT STRING contents as they stand: no
+    // DER wrapper, no digest step. FIPS 204's pure variant signs
+    // the tbsCertificate bytes themselves, under the empty
+    // context — a certificate is already domain-separated by
+    // everything inside it.
+    let Some(set) = ml_dsa_set_for(cert.suite) else {
+        return false;
+    };
+    if cert.signature.len() != set.params().sig_len {
+        return false;
+    }
+    // The workspace is a LOCAL: a position-independent module has
+    // no `.bss` — its state arrives as a pointer from the kernel —
+    // so a static is not available here at all. One workspace at
+    // the widest dimensions rather than one per set, because a
+    // chain may mix sets and a frame whose size does not depend on
+    // which certificate arrived is the one that can be checked
+    // against the module's stack. 13 KB, of the 64 KB it gets.
+    let mut ws: VerifyWorkspace<L_MAX> = VerifyWorkspace::new();
+    ml_dsa_verify(
+        set,
+        issuer_pubkey,
+        &[],
+        cert.tbs_raw,
+        cert.signature,
+        &mut ws,
+    )
 }
 
 fn pubkey_eq(a: &[u8], b: &[u8]) -> bool {

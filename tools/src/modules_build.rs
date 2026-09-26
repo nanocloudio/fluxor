@@ -1352,6 +1352,7 @@ fn compile_module_pic(
     opts: &BuildOpts,
 ) -> Result<BuildOutcome> {
     let obj_path = out_dir.join(format!("{}.o", cand.name));
+    let asm_path = out_dir.join(format!("{}.s", cand.name));
     let elf_path = out_dir.join(format!("{}.elf", cand.name));
     let out_path = out_dir.join(format!("{}.fmod", cand.name));
 
@@ -1388,15 +1389,28 @@ fn compile_module_pic(
         // fail so `#[expect]` stays honest.
         rustc.arg("-D").arg("unfulfilled_lint_expectations");
     }
+    // The assembly comes from the same code generation as the object, and
+    // is where the module's stack depth is read (`stack_depth`). rustc stages
+    // both in its output directory under the crate's name, which every module
+    // shares, so each compile gets a directory of its own.
+    let scratch = out_dir.join(format!("{}.rustc", cand.name));
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| Error::Module(format!("{}: {e}", scratch.display())))?;
     rustc
-        .arg("--emit=obj")
-        .arg("-o")
-        .arg(&obj_path)
+        .arg("--out-dir")
+        .arg(&scratch)
+        .arg(format!(
+            "--emit=obj={},asm={}",
+            obj_path.display(),
+            asm_path.display()
+        ))
         .arg(&cand.entry);
     if opts.verbose {
         eprintln!("[modules] rustc {cand_name}", cand_name = cand.name);
     }
-    run_step(rustc, "rustc")?;
+    let compiled = run_step(rustc, "rustc");
+    let _ = std::fs::remove_dir_all(&scratch);
+    compiled?;
     let obj = std::fs::read(&obj_path)
         .map_err(|e| Error::Module(format!("{}: {e}", obj_path.display())))?;
     let absolute = absolute_relocations(&obj)?;
@@ -1417,6 +1431,33 @@ fn compile_module_pic(
         }
         eprintln!("warning: {msg}");
     }
+
+    let stack = measure_stack(&asm_path, spec.module_target);
+    // The object is what links; the assembly has been read.
+    let _ = std::fs::remove_file(&asm_path);
+    let measured_stack = match stack {
+        Ok(d) => {
+            if opts.verbose {
+                eprintln!(
+                    "[modules] stack {} {} B via {}",
+                    cand.name,
+                    d.bytes,
+                    d.path
+                        .iter()
+                        .map(|s| crate::stack_depth::demangle(s))
+                        .collect::<Vec<_>>()
+                        .join(" > ")
+                );
+            }
+            Some(d.bytes)
+        }
+        Err(why) => {
+            if opts.verbose {
+                eprintln!("[modules] stack {} unbounded: {why}", cand.name);
+            }
+            None
+        }
+    };
 
     // 2) Link object → PIC ELF.
     let ld_script = pick_linker_script(cand, &opts.project_root);
@@ -1447,23 +1488,56 @@ fn compile_module_pic(
         &cand.embed_name,
         cand.type_id,
         Some(&cand.manifest),
-        Some(spec.silicon_id),
-        cand.variant.as_deref(),
+        crate::modules::PackContext {
+            silicon: Some(spec.silicon_id),
+            variant: cand.variant.as_deref(),
+            measured_stack,
+        },
     )?;
     Ok(BuildOutcome::Built)
+}
+
+/// The module's worst-case stack depth, read from the assembly its compile
+/// wrote. `Err` says why the call graph has no bound (recursion, a frame
+/// sized at run time); such a module must declare its depth.
+fn measure_stack(
+    asm_path: &Path,
+    triple: &str,
+) -> std::result::Result<crate::stack_depth::Depth, String> {
+    let isa = crate::stack_depth::Isa::for_target(triple)
+        .ok_or_else(|| format!("no stack reading for {triple}"))?;
+    let asm =
+        std::fs::read_to_string(asm_path).map_err(|e| format!("{}: {e}", asm_path.display()))?;
+    let roots = crate::stack_depth::entry_points(&asm);
+    let roots: Vec<&str> = roots.iter().map(String::as_str).collect();
+    crate::stack_depth::worst_case(&asm, isa, &roots)
 }
 
 /// The sections of a relocatable object that carry an ABSOLUTE relocation:
 /// a stored address the linker fills in for a fixed load address. A module is
 /// copied to wherever the kernel places it and nothing patches such an
-/// address, so each is wrong at run time. Two kinds are never read by running
-/// code and are exempt: a retention static (`_KEEP_…`, a `#[used]` table that
-/// keeps symbols alive), and a panic location, whose one pointer is the path
-/// of a `.rs` file and is read only by a panic already under way.
+/// address, so each is wrong at run time.
+///
+/// Two shapes are exempt, each decided from the object's structure rather
+/// than from a name, so neither can hide a table that code reads:
+///
+/// - A data section nothing in the object references — a retention static
+///   (`#[used]`, kept alive by the linker script, never loaded by code). A
+///   table code reads is always reached by a relocation from that code, so it
+///   cannot pass this test whatever it is called.
+/// - A section that is exactly one `core::panic::Location`: `[ptr][len][line]
+///   [col]`, `2 * ptr + 8` bytes, a single absolute relocation at offset 0 to
+///   `len` bytes ending in `.rs`. Code does reference it — the panic call site
+///   passes it — but its one pointer is read only by a panic already under
+///   way. A read `[&str; N]` table is the wrong size or carries more than one
+///   pointer, so it cannot pass either.
+///
+/// An executable section is never exempt.
 fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
     struct Shdr {
         name: u64,
         ty: u64,
+        flags: u64,
         off: u64,
         size: u64,
         link: u64,
@@ -1510,6 +1584,7 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
             Shdr {
                 name: u32_at(h)?,
                 ty: u32_at(h + 4)?,
+                flags: u64_at(h + 8)?,
                 off: u64_at(h + 24)?,
                 size: u64_at(h + 32)?,
                 link: u32_at(h + 40)?,
@@ -1520,6 +1595,7 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
             Shdr {
                 name: u32_at(h)?,
                 ty: u32_at(h + 4)?,
+                flags: u32_at(h + 8)?,
                 off: u32_at(h + 16)?,
                 size: u32_at(h + 20)?,
                 link: u32_at(h + 24)?,
@@ -1545,56 +1621,118 @@ fn absolute_relocations(obj: &[u8]) -> Result<Vec<String>> {
         243 => ty == 1 || ty == 2,             // RISC-V: 32, 64
         _ => false,
     };
-    let mut found = Vec::new();
-    for i in 0..shnum {
-        let rel = header(i)?;
-        // SHT_RELA (4) or SHT_REL (9).
+    // One relocation entry: (offset in its target, type, symbol index, addend).
+    let entry = |rel: &Shdr, e: u64| -> Result<(u64, u64, u64, u64)> {
+        let r = at(rel.off, e)?;
         let rela = rel.ty == 4;
-        if (!rela && rel.ty != 9) || rel.entsize == 0 {
-            continue;
+        Ok(if elf64 {
+            let info = u64_at(r + 8)?;
+            let addend = if rela { u64_at(r + 16)? } else { 0 };
+            (u64_at(r)?, info & 0xffff_ffff, info >> 32, addend)
+        } else {
+            let info = u32_at(r + 4)?;
+            let addend = if rela { u32_at(r + 8)? } else { 0 };
+            (u32_at(r)?, info & 0xff, info >> 8, addend)
+        })
+    };
+    // The (value, section) a symbol index names.
+    let symbol = |symtab: &Shdr, sym: u64| -> Result<(u64, u64)> {
+        let s = at(symtab.off, sym.checked_mul(symtab.entsize).ok_or_else(bad)?)?;
+        Ok(if elf64 {
+            (u64_at(s + 8)?, u16_at(s + 6)?)
+        } else {
+            (u32_at(s + 4)?, u16_at(s + 14)?)
+        })
+    };
+    // Relocation sections: SHT_RELA (4) or SHT_REL (9), with a usable entry size.
+    let rel_sections = || -> Result<Vec<Shdr>> {
+        let mut v = Vec::new();
+        for i in 0..shnum {
+            let h = header(i)?;
+            if (h.ty == 4 || h.ty == 9) && h.entsize != 0 {
+                v.push(h);
+            }
         }
-        let target = header(rel.info)?;
-        let target_name = name(target.name)?;
-        if target_name.contains("_KEEP_") {
-            continue;
-        }
+        Ok(v)
+    };
+    let rels = rel_sections()?;
+
+    // Every section some OTHER section's relocation points into. A section
+    // index at or past SHN_LORESERVE (0xff00) is a special marker, not a section.
+    let mut referenced = vec![false; usize::try_from(shnum).map_err(|_| bad())?];
+    for rel in &rels {
         let symtab = header(rel.link)?;
-        let (mut any, mut all_paths) = (false, true);
         let mut e = 0u64;
         while e.checked_add(rel.entsize).is_some_and(|n| n <= rel.size) {
-            let r = at(rel.off, e)?;
+            let (_, _, sym, _) = entry(rel, e)?;
             e += rel.entsize;
-            let (r_off, ty, sym, addend) = if elf64 {
-                let info = u64_at(r + 8)?;
-                let addend = if rela { u64_at(r + 16)? } else { 0 };
-                (u64_at(r)?, info & 0xffff_ffff, info >> 32, addend)
-            } else {
-                let info = u32_at(r + 4)?;
-                let addend = if rela { u32_at(r + 8)? } else { 0 };
-                (u32_at(r)?, info & 0xff, info >> 8, addend)
-            };
+            let (_, shndx) = symbol(&symtab, sym)?;
+            if shndx != 0 && shndx < 0xff00 && shndx != rel.info {
+                if let Some(slot) = usize::try_from(shndx)
+                    .ok()
+                    .and_then(|i| referenced.get_mut(i))
+                {
+                    *slot = true;
+                }
+            }
+        }
+    }
+
+    const SHF_EXECINSTR: u64 = 0x4;
+    let ptr = if elf64 { 8u64 } else { 4 };
+    let mut found = Vec::new();
+    for rel in &rels {
+        let target = header(rel.info)?;
+        let symtab = header(rel.link)?;
+        // Every absolute relocation into this section: (offset, bytes it points at).
+        let mut absolutes: Vec<(u64, u64, u64)> = Vec::new(); // (r_off, shndx, address)
+        let mut e = 0u64;
+        while e.checked_add(rel.entsize).is_some_and(|n| n <= rel.size) {
+            let (r_off, ty, sym, addend) = entry(rel, e)?;
+            e += rel.entsize;
             if !absolute(ty) {
                 continue;
             }
-            any = true;
             // A REL entry keeps its addend in the word it relocates.
-            let addend = if rela {
+            let addend = if rel.ty == 4 {
                 addend
             } else {
                 u32_at(at(target.off, r_off)?)?
             };
-            let s = at(symtab.off, sym.checked_mul(symtab.entsize).ok_or_else(bad)?)?;
-            let (value, shndx) = if elf64 {
-                (u64_at(s + 8)?, u16_at(s + 6)?)
-            } else {
-                (u32_at(s + 4)?, u16_at(s + 14)?)
-            };
-            if !text(shndx, value.wrapping_add(addend))?.ends_with(b".rs") {
-                all_paths = false;
-            }
+            let (value, shndx) = symbol(&symtab, sym)?;
+            absolutes.push((r_off, shndx, value.wrapping_add(addend)));
         }
-        if any && !all_paths {
-            found.push(target_name);
+        if absolutes.is_empty() {
+            continue;
+        }
+        let executable = target.flags & SHF_EXECINSTR != 0;
+        let unreferenced = !referenced
+            .get(usize::try_from(rel.info).map_err(|_| bad())?)
+            .copied()
+            .unwrap_or(false);
+        // Exactly one `core::panic::Location`.
+        let location = || -> Result<bool> {
+            let [(0, shndx, addr)] = absolutes[..] else {
+                return Ok(false);
+            };
+            if target.size != 2 * ptr + 8 {
+                return Ok(false);
+            }
+            let len = if elf64 {
+                u64_at(at(target.off, ptr)?)?
+            } else {
+                u32_at(at(target.off, ptr)?)?
+            };
+            let path = header(shndx)?;
+            let from = at(path.off, addr)?;
+            let Some(to) = usize::try_from(len).ok().and_then(|l| from.checked_add(l)) else {
+                return Ok(false);
+            };
+            let inside = to <= at(path.off, path.size)?;
+            Ok(len > 0 && inside && obj.get(from..to).is_some_and(|b| b.ends_with(b".rs")))
+        };
+        if executable || !(unreferenced || location()?) {
+            found.push(name(target.name)?);
         }
     }
     Ok(found)
@@ -1972,24 +2110,98 @@ mod tests {
         out
     }
 
+    /// One source holding every shape the lint has to tell apart, compiled
+    /// the way `modules build` compiles a PIC module. Real objects, because the
+    /// question is what rustc emits — a hand-built ELF can only restate the
+    /// rule it is meant to test.
+    const LINT_CASES: &str = r#"
+#![no_std]
+#[panic_handler] fn p(_: &core::panic::PanicInfo) -> ! { loop {} }
+// A retention static: kept by the linker script, never read.
+#[used] pub static _KEEP_RETAINED: [unsafe extern "C" fn(*mut u8, u8, usize); 1] = [nop];
+unsafe extern "C" fn nop(_: *mut u8, _: u8, _: usize) {}
+// A table named like a retention static that code DOES read.
+pub static _KEEP_READ: [&[u8]; 2] = [b"alpha", b"beta"];
+#[no_mangle] pub extern "C" fn read_keep(i: usize) -> *const u8 { _KEEP_READ[i & 1].as_ptr() }
+// A read table whose every string ends in `.rs`, like a panic location's.
+pub static RS_NAMES: [&[u8]; 2] = [b"src/a.rs", b"src/b.rs"];
+#[no_mangle] pub extern "C" fn read_rs(i: usize) -> *const u8 { RS_NAMES[i & 1].as_ptr() }
+// A bounds check: its panic location is a `core::panic::Location`.
+#[no_mangle] pub extern "C" fn index(s: &[u8; 4], i: usize) -> u8 { s[i] }
+// A `match` returning literals: lowered to a table of pointers.
+#[no_mangle] pub extern "C" fn name(i: u8) -> *const u8 {
+    (match i { 0 => b"zero" as &[u8], 1 => b"one", 2 => b"two", _ => b"many" }).as_ptr()
+}
+"#;
+
+    fn compiled(target: &str) -> Vec<u8> {
+        let dir = std::env::temp_dir().join(format!("fluxor-lint-{}-{target}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let src = dir.join("cases.rs");
+        let obj = dir.join("cases.o");
+        std::fs::write(&src, LINT_CASES).expect("write source");
+        let out = std::process::Command::new("rustc")
+            .args(["--target", target, "--crate-type", "lib", "-O"])
+            .args(["-C", "relocation-model=pic", "--emit", "obj", "-o"])
+            .arg(&obj)
+            .arg(&src)
+            .output()
+            .expect("rustc runs");
+        assert!(
+            out.status.success(),
+            "rustc --target {target}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = std::fs::read(&obj).expect("object");
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes
+    }
+
+    /// Every table code reads is refused, whatever it is called and whatever
+    /// its strings end in; a retention static and a panic location pass.
+    ///
+    /// A `match` returning literals differs by machine: on 32-bit Arm LLVM
+    /// lowers it to a table of absolute pointers, on AArch64 to a table of
+    /// PC-relative offsets (`PREL32`), which needs no relocation at all. So
+    /// the hazard is the RP dies', and a `static` of references is absolute
+    /// everywhere.
     #[test]
-    fn an_absolute_pointer_in_data_is_found_on_each_machine() {
-        // AArch64 ABS64 in a table of literals.
-        let o = object(true, 183, &[(".data.rel.ro.table", 257)], b"create");
-        assert_eq!(
-            absolute_relocations(&o).unwrap(),
-            vec![".data.rel.ro.table"]
-        );
-        // ARM ABS32.
-        let o = object(false, 40, &[(".data.rel.ro.table", 2)], b"create");
-        assert_eq!(
-            absolute_relocations(&o).unwrap(),
-            vec![".data.rel.ro.table"]
-        );
+    fn the_lint_refuses_every_table_code_reads_and_nothing_else() {
+        for (target, match_table_absolute) in [
+            ("thumbv6m-none-eabi", true),
+            ("thumbv8m.main-none-eabihf", true),
+            ("aarch64-unknown-none", false),
+        ] {
+            let found = absolute_relocations(&compiled(target)).expect("parses");
+            let has = |needle: &str| found.iter().any(|s| s.contains(needle));
+            assert_eq!(
+                has("switch.table.name"),
+                match_table_absolute,
+                "{target}: match table: {found:?}"
+            );
+            assert!(
+                has("_KEEP_READ"),
+                "{target}: a read `_KEEP_` table passed: {found:?}"
+            );
+            assert!(
+                has("RS_NAMES"),
+                "{target}: a read table of `.rs` names passed: {found:?}"
+            );
+            assert!(
+                !has("_KEEP_RETAINED"),
+                "{target}: retention static refused: {found:?}"
+            );
+            assert!(
+                !has(".Lanon"),
+                "{target}: panic location refused: {found:?}"
+            );
+            let expected = 2 + usize::from(match_table_absolute);
+            assert_eq!(found.len(), expected, "{target}: {found:?}");
+        }
     }
 
     #[test]
-    fn position_independent_and_retention_relocations_pass() {
+    fn position_independent_relocations_pass() {
         // AArch64 PREL32 (261) and ARM REL32 (3) are position independent.
         assert!(
             absolute_relocations(&object(true, 183, &[(".text.f", 261)], b""))
@@ -2001,34 +2213,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        // A `_KEEP_` retention static is never read, so its pointers are exempt.
-        let keep = object(
-            true,
-            183,
-            &[(".data.rel.ro._ZN3mod12_KEEP_MEMSET17h0E", 257)],
-            b"x",
-        );
-        assert!(absolute_relocations(&keep).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_panic_location_is_exempt_and_other_text_is_not() {
-        // A pointer to a `.rs` path is a panic location; to anything else, data.
-        for elf64 in [true, false] {
-            let (m, ty) = if elf64 { (183, 257) } else { (40, 2) };
-            let loc = object(
-                elf64,
-                m,
-                &[(".data.rel.ro..Lanon.1", ty)],
-                b"src/sdk/crypto/rsa.rs",
-            );
-            assert!(absolute_relocations(&loc).unwrap().is_empty());
-            let data = object(elf64, m, &[(".data.rel.ro..Lanon.1", ty)], b"quic-resume-0");
-            assert_eq!(
-                absolute_relocations(&data).unwrap(),
-                vec![".data.rel.ro..Lanon.1"]
-            );
-        }
     }
 
     #[test]

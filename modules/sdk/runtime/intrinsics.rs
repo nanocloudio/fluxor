@@ -573,6 +573,95 @@ mod _pic_intrinsics {
         };
         (q as u64 as u128) | ((r as u64 as u128) << 64)
     }
+
+    // ---- 128-bit division, AArch64 ----
+    //
+    // LLVM lowers `u128`/`i128` division and remainder differently by target.
+    // On 32-bit Arm it expands them inline, so an RP module needs nothing here.
+    // On AArch64 it calls `__udivti3`, `__umodti3`, `__divti3` and `__modti3`,
+    // which a PIC module does not otherwise link — so without these the same
+    // source links on an RP die and fails on BCM2712.
+    //
+    // The same restoring long division as `udivmod64`, widened: 128 passes
+    // whatever the operands, the quotient accumulated in the dividend's vacated
+    // bits, and no early exit, for the fixed-pass property the narrower helpers
+    // keep. It uses only shifts, compares and subtraction on `u128`, which
+    // AArch64 performs inline, so it cannot call itself. Division by zero
+    // returns zero, matching the narrower helpers: a PIC module has no unwinder
+    // and nothing to trap into.
+
+    /// Unsigned 128-bit divide, quotient and remainder.
+    #[cfg(target_arch = "aarch64")]
+    fn udivmod128(n: u128, d: u128) -> (u128, u128) {
+        let mut n = n;
+        let mut r = 0u128;
+        let mut i = 128u32;
+        while i > 0 {
+            i -= 1;
+            // `r < d` holds at the top of every pass, and `r` reaches the top
+            // of its range only once it has absorbed all 128 of `n`'s bits,
+            // after which no further shift happens — so the shift below never
+            // loses a set bit.
+            let carry = n >> 127;
+            n <<= 1;
+            r = (r << 1) | carry;
+            if r >= d {
+                r -= d;
+                n |= 1;
+            }
+        }
+        (n, r)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[no_mangle]
+    pub extern "C" fn __udivti3(n: u128, d: u128) -> u128 {
+        if d == 0 {
+            return 0;
+        }
+        udivmod128(n, d).0
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[no_mangle]
+    pub extern "C" fn __umodti3(n: u128, d: u128) -> u128 {
+        if d == 0 {
+            return 0;
+        }
+        udivmod128(n, d).1
+    }
+
+    /// Signed 128-bit divide, truncating toward zero. `i128::MIN / -1` wraps to
+    /// `i128::MIN`, as `wrapping_div` does; the compiler's own overflow check,
+    /// where it cannot prove the case away, runs before this is reached.
+    #[cfg(target_arch = "aarch64")]
+    #[no_mangle]
+    pub extern "C" fn __divti3(n: i128, d: i128) -> i128 {
+        if d == 0 {
+            return 0;
+        }
+        let q = udivmod128(n.unsigned_abs(), d.unsigned_abs()).0 as i128;
+        if (n < 0) != (d < 0) {
+            q.wrapping_neg()
+        } else {
+            q
+        }
+    }
+
+    /// Signed 128-bit remainder, taking the dividend's sign.
+    #[cfg(target_arch = "aarch64")]
+    #[no_mangle]
+    pub extern "C" fn __modti3(n: i128, d: i128) -> i128 {
+        if d == 0 {
+            return 0;
+        }
+        let r = udivmod128(n.unsigned_abs(), d.unsigned_abs()).1 as i128;
+        if n < 0 {
+            r.wrapping_neg()
+        } else {
+            r
+        }
+    }
 } // mod _pic_intrinsics — end of PIC-only block
 
 // Re-export the PIC intrinsics at the includer's top-level scope so

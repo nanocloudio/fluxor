@@ -221,6 +221,8 @@ unsafe fn service(s: &mut SinkState) {
     }
 }
 
+declare_module_state_bytes!(SinkState);
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

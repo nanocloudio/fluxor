@@ -1557,6 +1557,12 @@ fn cmd_sign(
             manifest.ports.len() * 8
         } else {
             0
+        }
+        + if layout[14] & 0x40 != 0 {
+            // Stack block (flag bit 6), likewise before the hash.
+            2
+        } else {
+            0
         };
     let hash_offset = 17 + var_size; // = MANIFEST_HEADER_SIZE (u16 permissions)
     if hash_offset + 32 > layout.len() {

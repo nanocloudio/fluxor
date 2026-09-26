@@ -752,6 +752,8 @@ unsafe fn handle_data(s: &mut WorkerState) {
 // Module interface
 // ============================================================================
 
+declare_module_state_bytes!(WorkerState);
+
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

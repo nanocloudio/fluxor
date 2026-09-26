@@ -192,9 +192,6 @@ flash_size = "0x400000"
 ram_base = "0x20000000"
 ram_size = "0x80000"
 
-[isolation]
-mpu_regions = 8
-
 [kernel]
 watchdog_ctrl = "0x400D8000"
 # PSM watchdog-select register and the mask that puts every block but the
@@ -234,11 +231,18 @@ config_arena_kb = 16
 log_ring_kb = 4
 # Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
 # out of the linker's 512 KiB RAM region. What is left over is the
-# stack, which grows down from the top of that region.
+# stack, which grows down from the top of that region and which every
+# module steps on in turn: 48 KiB here.
 # The linker already refuses an image that cannot fit at all; this
 # binds earlier, so steady creep fails a gate instead of arriving
-# as a link error nobody can attribute.
-ram_static_max_kb = 472
+# as a link error nobody can attribute. Raising it takes the same bytes
+# from the stack, which the composer then admits modules against.
+ram_static_max_kb = 464
+# The kernel's own frames at a module call: the scheduler under the step,
+# syscalls and interrupts above it. The stack less this, 40 KiB, is the
+# deepest a module may go; the scheduler fences every step there and
+# reports the measured depths.
+kernel_stack_reserve_kb = 8
 # Clock profile. The production system clock is the datasheet default;
 # `overclock_sys_hz` is a non-production profile selected by the
 # `rp-overclock` cargo feature and is never what a shipped image runs.

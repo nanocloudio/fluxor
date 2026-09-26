@@ -39,12 +39,13 @@ struct TomlSiliconFile {
 struct TomlKernelConfig {
     state_arena_kb: Option<u32>,
     ram_static_max_kb: Option<u32>,
+    kernel_stack_reserve_kb: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
 struct TomlIsolationConfig {
-    mpu_regions: Option<u8>,
     has_mmu: Option<bool>,
+    isolated_stack_kb: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -219,10 +220,15 @@ pub struct TargetDescriptor {
     /// silicon declares none, which is every target whose image is not
     /// linked against a fixed RAM region.
     pub ram_static_max_kb: Option<u32>,
-    /// Number of MPU regions available (0 = no MPU, e.g. Cortex-M0+)
-    pub mpu_regions: u8,
+    /// The kernel's own frames at a module call on a target whose modules
+    /// step on the kernel stack, in KiB (`[kernel] kernel_stack_reserve_kb`).
+    pub kernel_stack_reserve_kb: Option<u32>,
     /// Whether the target has an MMU (for full page-table isolation)
     pub has_mmu: bool,
+    /// The stack an isolated module runs on, in KiB
+    /// (`[isolation] isolated_stack_kb`). Pinned to the kernel's
+    /// `ISOLATED_STACK_BYTES`.
+    pub isolated_stack_kb: Option<u32>,
 }
 
 /// Build configuration for targets that support kernel compilation.
@@ -257,6 +263,27 @@ pub struct MemoryConfig {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl TargetDescriptor {
+    /// The deepest stack a module on this target may declare, in bytes, and
+    /// what it is measured against. An MMU target runs an isolated module on
+    /// its own fixed stack; a target without one steps every module on the
+    /// kernel stack, which is what the RAM region leaves above the static
+    /// ceiling, less the kernel's own reserve. `None` where the target states
+    /// neither (a host, where the OS owns the stack).
+    pub fn module_stack_limit(&self) -> Option<(u64, &'static str)> {
+        if self.has_mmu {
+            return self
+                .isolated_stack_kb
+                .map(|kb| (u64::from(kb) * 1024, "the isolated module stack"));
+        }
+        let ram = self.memory.as_ref()?.ram_size as u64;
+        let statics = u64::from(self.ram_static_max_kb?) * 1024;
+        let reserve = u64::from(self.kernel_stack_reserve_kb?) * 1024;
+        Some((
+            ram.checked_sub(statics)?.checked_sub(reserve)?,
+            "the kernel stack less its reserve",
+        ))
+    }
+
     /// Check if an SPI pin combination is valid for the given bus.
     pub fn is_valid_spi_pins(&self, bus: u8, miso: u8, mosi: u8, sck: u8) -> bool {
         let table = self.spi_pins.get(bus as usize).unwrap_or(&PinTable::None);
@@ -562,16 +589,16 @@ fn load_silicon_target(path: &Path, kind: TargetKind) -> Result<TargetDescriptor
             .and_then(|k| k.state_arena_kb)
             .unwrap_or(256),
         ram_static_max_kb: silicon.kernel.as_ref().and_then(|k| k.ram_static_max_kb),
-        mpu_regions: silicon
-            .isolation
+        kernel_stack_reserve_kb: silicon
+            .kernel
             .as_ref()
-            .and_then(|i| i.mpu_regions)
-            .unwrap_or(0),
+            .and_then(|k| k.kernel_stack_reserve_kb),
         has_mmu: silicon
             .isolation
             .as_ref()
             .and_then(|i| i.has_mmu)
             .unwrap_or(false),
+        isolated_stack_kb: silicon.isolation.as_ref().and_then(|i| i.isolated_stack_kb),
     })
 }
 

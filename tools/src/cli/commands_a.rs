@@ -588,10 +588,11 @@ fn cmd_generate(
 /// on a die with no console guarantee. Doing the arithmetic here turns it into a
 /// build error with the numbers shown.
 ///
-/// Modules that publish no figure are counted and named: a partial sum is
-/// reported as partial rather than passed off as a total, and the budget is not
-/// enforced when any module is unknown — refusing on an incomplete sum would be
-/// worse than not refusing.
+/// Modules that publish no figure are counted and named. On a target without
+/// an MMU — a microcontroller, where the arena is the die's RAM and nothing
+/// traps an overrun — an unknown figure is refused: a sum with a hole in it
+/// admits nothing. Elsewhere a partial sum is reported as partial and the
+/// budget is not enforced.
 fn check_state_budget(
     modules: &[modules::ModuleInfo],
     target: &crate::target::TargetDescriptor,
@@ -634,6 +635,15 @@ fn check_state_budget(
     }
 
     if !unknown.is_empty() {
+        if !target.has_mmu {
+            return Err(Error::Config(format!(
+                "{} publish(es) no state size, and {} admits a graph only on a complete \
+                 sum. Add `declare_module_state_bytes!(<state type>)` beside each \
+                 module's `module_state_size`.",
+                unknown.join(", "),
+                target.id,
+            )));
+        }
         println!(
             "  note: {} module(s) publish no state size ({}), so this is a PARTIAL sum \
              and the budget is not enforced",
@@ -653,6 +663,118 @@ fn check_state_budget(
         )));
     }
     Ok(())
+}
+
+/// Admit each module's stack depth against the stack it will run on.
+///
+/// Every `.fmod` carries the worst-case depth its build measured from the call
+/// graph (or its author declared where the graph has no bound). Without an MMU
+/// every module steps in turn on the kernel stack, so the DEEPEST module —
+/// a maximum, not a sum — must fit what the target leaves for a module
+/// (`TargetDescriptor::module_stack_limit`); a module with no figure is
+/// refused there, since the stack is unguarded on rp2040 and shared on both
+/// RP parts. With an MMU only an isolated module has a fixed stack, and each
+/// is admitted against it.
+fn check_stack_budget(
+    modules: &[modules::ModuleInfo],
+    config: &serde_json::Value,
+    target: &crate::target::TargetDescriptor,
+) -> Result<()> {
+    let Some((limit, what)) = target.module_stack_limit() else {
+        return Ok(());
+    };
+    let admitted: Vec<&modules::ModuleInfo> = if target.has_mmu {
+        let isolated = isolated_module_types(config);
+        modules
+            .iter()
+            .filter(|m| isolated.contains(&m.name))
+            .collect()
+    } else {
+        modules.iter().collect()
+    };
+    if admitted.is_empty() {
+        return Ok(());
+    }
+
+    let mut rows: Vec<(&str, u64)> = admitted
+        .iter()
+        .map(|m| (m.name.as_str(), m.manifest.stack_bytes_64 as u64 * 64))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("Module stack ({}): {limit} B, {what}", target.id);
+    for (name, bytes) in &rows {
+        if *bytes == 0 {
+            println!("  {name:<20} unknown");
+        } else {
+            println!("  {name:<20} {bytes:>9}");
+        }
+    }
+
+    let unknown: Vec<&str> = rows.iter().filter(|r| r.1 == 0).map(|r| r.0).collect();
+    if !unknown.is_empty() && !target.has_mmu {
+        return Err(Error::Config(format!(
+            "{} carr(ies) no stack depth, and {} steps every module on one unguarded \
+             stack. Rebuild with `fluxor modules build`, which measures it, or declare \
+             it with `declare_module_stack_bytes!` where the build cannot.",
+            unknown.join(", "),
+            target.id,
+        )));
+    }
+    let over: Vec<String> = rows
+        .iter()
+        .filter(|r| r.1 > limit)
+        .map(|(name, bytes)| format!("{name} ({bytes} B)"))
+        .collect();
+    if !over.is_empty() {
+        return Err(Error::Config(format!(
+            "{} go(es) deeper than {what} on {}, {limit} B. Shorten the path \
+             (`fluxor modules build -v` names it) or run the module where the stack \
+             is larger.",
+            over.join(", "),
+            target.id,
+        )));
+    }
+    Ok(())
+}
+
+/// The module types a graph runs under `protection: isolated` — named
+/// explicitly, implied by a community or unsigned `trust_tier`, or set for the
+/// whole graph.
+fn isolated_module_types(config: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    let whole = config
+        .get("protection")
+        .or_else(|| config.get("graph").and_then(|g| g.get("protection")))
+        .and_then(|v| v.as_str())
+        == Some("isolated");
+    let entries: Vec<(String, &serde_json::Value)> = match config.get("modules") {
+        Some(serde_json::Value::Array(list)) => list
+            .iter()
+            .filter_map(|m| {
+                let name = m.as_str().or_else(|| m.get("name").and_then(|n| n.as_str()))?;
+                let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
+                Some((ty.to_string(), m))
+            })
+            .collect(),
+        Some(serde_json::Value::Object(map)) => map
+            .iter()
+            .map(|(name, m)| {
+                let ty = m.get("type").and_then(|t| t.as_str()).unwrap_or(name);
+                (ty.to_string(), m)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    entries
+        .into_iter()
+        .filter(|(_, m)| {
+            let tier = m.get("trust_tier").and_then(|v| v.as_str()).unwrap_or("platform");
+            match m.get("protection").and_then(|v| v.as_str()) {
+                Some(p) => p == "isolated",
+                None => whole || tier == "community" || tier == "unsigned",
+            }
+        })
+        .map(|(ty, _)| ty)
+        .collect()
 }
 
 fn cmd_combine(
@@ -816,6 +938,7 @@ fn cmd_combine(
     )?;
 
     check_state_budget(&modules, &target_desc)?;
+    check_stack_budget(&modules, &config, &target_desc)?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {
@@ -1113,6 +1236,7 @@ fn build_packaged_blobs(
     )?;
 
     check_state_budget(&modules, target_desc)?;
+    check_stack_budget(&modules, config, target_desc)?;
 
     let modules_data = if !modules.is_empty() {
         if verbose {
@@ -1343,8 +1467,7 @@ fn cmd_pack(
             &module_name,
             module_type,
             manifest_path,
-            None,
-            None,
+            modules::PackContext::default(),
         )?
     };
 

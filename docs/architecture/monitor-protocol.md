@@ -34,7 +34,7 @@ MON_FAULT mod=<idx> kind=<k> fault_count=<n> restart_count=<n> tick=<t>
 | Field           | Meaning                                                                 |
 |-----------------|-------------------------------------------------------------------------|
 | `mod`           | Module index (0..MAX_MODULES-1).                                        |
-| `kind`          | Fault type: `1` timeout, `2` step error, `3` hard fault, `4` MPU/MMU.   |
+| `kind`          | Fault type: `1` timeout, `2` step error, `3` hard fault, `4` protection (MMU abort, stack fence). |
 | `fault_count`   | Cumulative fault count for this module after this event.                |
 | `restart_count` | Cumulative restart count after this event.                              |
 | `tick`          | Kernel tick at which the fault was recorded.                            |

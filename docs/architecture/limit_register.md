@@ -622,7 +622,6 @@ BUFFER_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of CHANNEL_BUFFER_SIZE
 BUFFER_ARENA_SIZE | src/kernel/ipc/buffer_pool.rs | mirror of the platform config's BUFFER_ARENA_SIZE
 MODULE_STATE_SIZE | src/kernel/module/loader.rs | a parameter-name hash, not a size
 MODULE_ARENA_SIZE | src/kernel/module/loader.rs | a parameter-name hash, not a size
-MODULE_STACK_SIZE | src/kernel/module/loader.rs | a parameter-name hash, not a size
 STATE_CANARY_SIZE | src/kernel/module/loader.rs | canary layout
 IMAGE_HEADER_SIZE | src/kernel/module/ota_stage.rs | staged-image header layout
 MAX_SEALED | src/kernel/security/key_vault.rs | derived: MAX_KEY_BYTES plus the AEAD nonce and tag

@@ -56,4 +56,11 @@ pub trait Module {
     fn name(&self) -> &'static str {
         "unknown"
     }
+
+    /// The worst-case stack depth the module declared, in bytes; 0 when it
+    /// declared none. The composer admitted the graph against it, and the
+    /// scheduler fences each step at it.
+    fn stack_bytes(&self) -> usize {
+        0
+    }
 }

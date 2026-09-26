@@ -106,6 +106,45 @@ kernel code calls into the chip module rather than scattering
 `#[cfg(...)]` blocks across `syscalls.rs` or `scheduler/mod.rs`. See
 [pin_allocation.md](pin_allocation.md) for the silicon TOML schema.
 
+### The RP stack
+
+An RP part runs one stack, the kernel's, and every module steps on it in
+turn. It grows down from the top of the linker's RAM region towards the
+kernel's statics, so its size is what `[kernel] ram_static_max_kb` leaves of
+`[memory] ram_size`; the build refuses a TOML whose `ram_size` is not the
+linker's region. `kernel_stack_reserve_kb` is the kernel's own share under and
+above a module call, and the rest is the deepest a module may go. The composer
+admits a graph's deepest module against it (a maximum, not a sum, because
+modules step one at a time), from the depth each `.fmod` carries — see
+[Stack depth](module_architecture.md#stack-depth).
+
+| | rp2040 | rp2350 |
+|---|---|---|
+| Stack (`ram_size` − `ram_static_max_kb`) | 40 KiB | 48 KiB |
+| Kernel reserve | 8 KiB | 8 KiB |
+| Deepest module admitted | 32 KiB | 40 KiB |
+| Hardware limit | none — M0+ has no stack-limit register | `MSPLIM`, set at reset: an overflow faults |
+
+On the device the check is repeated two ways. Reset paints the free stack, and
+the scheduler reports the deepest it has been — `[stack] peak= entry= region=
+budget= reserve=` every few seconds, where `entry` is the kernel's own depth at
+a module call — logging an error if either figure is past its budget. Around
+each step the scheduler writes a short fence at the module's admitted depth
+and checks it afterwards; a module that crossed it is reported
+(`[stack] module N ran past its admitted stack`) and faulted as a protection
+fault. On rp2040, where nothing traps an overflow, the fence is the only thing
+that sees one.
+
+The RP kernel does not isolate modules. On rp2040 that is a design decision:
+the M0+ MPU has power-of-two regions and no stack limit, and a graph's state
+already fills most of the arena. On rp2350 the hardware can: the design, when a
+graph needs it, is PMSAv8 with the background region disabled for
+unprivileged code and regions covering only what the module may touch (its
+code, its state, its channel buffers — no region spanning all of SRAM), a
+process stack carved from the module's own state allocation and bounded by
+`PSPLIM`, and SRAM bounds taken from the silicon TOML. Until then an RP target
+refuses `protection: isolated` at compose and at load.
+
 ## Bus Primitives
 
 ### GPIO
@@ -418,10 +457,9 @@ else:
 1. **`HalOps`** (`src/kernel/sys/hal.rs`) — the function-pointer table each
    platform installs at boot. All platform *behaviour* the kernel invokes goes
    through it: timing, interrupts, step-guard, ISR tiers, SMP quiesce, and the module
-   protection surface (`protection_*`, `protected_step`, stack canaries — EL0
-   MMU isolation on aarch64, direct dispatch elsewhere; the Cortex-M MPU
-   implementation in `src/platform/rp/mpu.rs` is not enabled, and an RP target
-   refuses an isolation request).
+   protection surface (`protection_*`, `protected_step` — EL0 MMU isolation on
+   aarch64, direct dispatch elsewhere — and `stack_fence_*`, which the RP
+   platform implements and the others install as no-ops).
 2. **`platform::chip`** — the cfg-selected per-target *constants* module
    (arena sizes, capacity ceilings). These size static arrays, so they must be
    compile-time constants; a cfg-selected constants module IS the compile-time

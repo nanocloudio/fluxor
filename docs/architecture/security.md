@@ -242,8 +242,8 @@ zero words restarts the block through its soft resets, and a source that
 yields nothing but zeros is refused. A zero word is never entropy, and a
 successful return code is not either: consumers that mint identity from
 randomness (the emission token, the incarnation) refuse an all-zero
-result. The register map is pinned by `tools/tests/target_facts.rs`, and
-the fence rig scenario exercises the whole path on the silicon.
+result. A build check pins every register offset to the iproc-rng200 map,
+and the fence rig scenario exercises the whole path on the silicon.
 
 ## Network Hardening
 

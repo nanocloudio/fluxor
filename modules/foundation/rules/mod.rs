@@ -263,6 +263,8 @@ unsafe fn build_rules(s: &mut RulesState) {
 // Module API
 // ============================================================================
 
+declare_module_state_bytes!(RulesState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

@@ -427,6 +427,8 @@ fn encode_layout(s: &State, r: &Resolution, epoch: u32) -> ([u8; OUT_BUF], usize
     (buf, o)
 }
 
+declare_module_state_bytes!(State);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

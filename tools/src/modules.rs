@@ -930,7 +930,7 @@ fn read_embedded_abi_surface(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
 
 /// Read the module's resident state size out of the ELF, as data.
 ///
-/// Emitted by the SDK's `declare_module_state!` macro
+/// Emitted by the SDK's `declare_module_state_bytes!` macro
 /// (`modules/sdk/runtime/state.rs`) as a `#[used] static u32` carrying the same
 /// `size_of::<ModuleState>()` the kernel-facing `module_state_size()` returns.
 /// Reading it here is what lets the composer sum a graph's state arena demand
@@ -943,6 +943,21 @@ fn read_embedded_state_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> 
     let sym = symbols
         .iter()
         .find(|s| s.name.contains("FLUXOR_MODULE_STATE_BYTES"))?;
+    let sec = sections.get(sym.section_idx as usize)?;
+    let start = (sym.value as usize).checked_sub(sec.addr)?;
+    let bytes = sec.data.get(start..start + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// Read the module's declared worst-case stack depth out of the ELF, as data.
+///
+/// Emitted by the SDK's `declare_module_stack_bytes!` macro
+/// (`modules/sdk/runtime/state.rs`). `None` for a module that has not
+/// declared; the composer decides per target what an undeclared depth means.
+fn read_embedded_stack_bytes(sections: &[ElfSection], symbols: &[ElfSymbol]) -> Option<u32> {
+    let sym = symbols
+        .iter()
+        .find(|s| s.name.contains("FLUXOR_MODULE_STACK_BYTES"))?;
     let sec = sections.get(sym.section_idx as usize)?;
     let start = (sym.value as usize).checked_sub(sec.addr)?;
     let bytes = sec.data.get(start..start + 4)?;
@@ -999,6 +1014,17 @@ fn verify_written(path: &Path, expected: usize) -> std::io::Result<()> {
     )))
 }
 
+/// What the build knows about an artefact beyond its ELF.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PackContext<'a> {
+    /// The silicon the module was built for, when the build knows it.
+    pub silicon: Option<&'a str>,
+    /// The variant this artefact is, if it is one.
+    pub variant: Option<&'a str>,
+    /// Worst-case stack depth the build measured from the call graph.
+    pub measured_stack: Option<u32>,
+}
+
 /// Pack ELF object into .fmod format (ABI v2 with manifest)
 pub fn pack_fmod(
     input: &Path,
@@ -1006,9 +1032,13 @@ pub fn pack_fmod(
     name: &str,
     module_type: u8,
     manifest_path: Option<&Path>,
-    target_silicon: Option<&str>,
-    variant: Option<&str>,
+    ctx: PackContext<'_>,
 ) -> Result<PackResult> {
+    let PackContext {
+        silicon: target_silicon,
+        variant,
+        measured_stack,
+    } = ctx;
     let elf_data = std::fs::read(input)?;
     let (sections, symbols) = parse_elf(&elf_data)?;
 
@@ -1106,8 +1136,6 @@ pub fn pack_fmod(
         "module_post_tick_flush",
         // heap arena size (per-module heap allocation)
         "module_arena_size",
-        // stack an isolated module needs (checked against the isolated stack)
-        "module_stack_size",
         // buffer capability markers
         "module_in_place_safe",
         "module_mailbox_safe",
@@ -1212,7 +1240,7 @@ pub fn pack_fmod(
     // declared. Same shape as the ABI-surface attestation above: the compiler
     // embedded the value, the packer copies it, so the manifest cannot claim a
     // footprint the code does not have. Absent for a module that has not
-    // adopted `declare_module_state!` — left at 0 ("unknown") rather than
+    // adopted `declare_module_state_bytes!` — left at 0 ("unknown") rather than
     // guessed, since a wrong state size would be admitted by a composer that
     // trusts it.
     if let Some(bytes) = read_embedded_state_bytes(&sections, &symbols) {
@@ -1221,6 +1249,23 @@ pub fn pack_fmod(
         let units = bytes.div_ceil(64);
         module_manifest.state_bytes_64 = u16::try_from(units).unwrap_or(u16::MAX);
     }
+
+    // Stack depth: what the build measured from the call graph, or what the
+    // author declared where the graph has no bound. A declaration is a floor
+    // and never lowers a measurement — one below it is refused, since the
+    // composer would admit the module on a figure its own code exceeds.
+    let declared = read_embedded_stack_bytes(&sections, &symbols).unwrap_or(0);
+    if let Some(measured) = measured_stack {
+        if declared != 0 && declared < measured {
+            return Err(Error::Module(format!(
+                "{name}: declares {declared} B of stack but its call graph reaches \
+                 {measured} B. Raise `declare_module_stack_bytes!` or shorten the \
+                 path (`fluxor modules build -v` names it)."
+            )));
+        }
+    }
+    let stack = declared.max(measured_stack.unwrap_or(0));
+    module_manifest.stack_bytes_64 = u16::try_from(stack.div_ceil(64)).unwrap_or(u16::MAX);
 
     let manifest_bytes = module_manifest.to_bytes();
 

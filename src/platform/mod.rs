@@ -78,9 +78,6 @@ pub mod chip;
 #[path = "wasm/chip.rs"]
 pub mod chip;
 
-/// MPU region protection (rp / generic).
-#[path = "rp/mpu.rs"]
-pub mod mpu;
 /// Boot/config planner (rp flash-resident config staging).
 #[cfg(feature = "rp")]
 #[path = "rp/config.rs"]

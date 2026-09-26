@@ -129,6 +129,8 @@ struct EchoState {
     buf: [u8; BUF],
 }
 
+declare_module_state_bytes!(EchoState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

@@ -203,6 +203,8 @@ fn lfsr_next(lfsr: &mut u32) -> u32 {
 // Module API
 // ============================================================================
 
+declare_module_state_bytes!(Sequencer);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

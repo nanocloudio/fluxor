@@ -28,8 +28,8 @@
 //! TTBR0_EL1 is swapped per-module with the module's page table + ASID.
 
 /// The stack an isolated module runs on at EL0, above one unmapped guard page.
-/// The loader refuses an isolated module that declares a larger need
-/// (`module_stack_size`).
+/// The composer, and the loader behind it, refuse an isolated module whose
+/// manifest declares a larger need (`declare_module_stack_bytes!`).
 pub const ISOLATED_STACK_BYTES: usize = 64 * 1024;
 
 #[cfg(feature = "chip-bcm2712")]

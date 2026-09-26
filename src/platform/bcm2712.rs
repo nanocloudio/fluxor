@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use fluxor::kernel::boot::config::EdgeClass;
 use fluxor::kernel::module::loader;
 use fluxor::platform::multicore;
-use fluxor::platform::{mmu, mpu};
+use fluxor::platform::mmu;
 use fluxor::kernel::exec::scheduler;
 
 // ── Boot-time submodules (binary-private; not exposed via fluxor::kernel) ──
@@ -2817,10 +2817,8 @@ unsafe fn bcm_system_extension_dispatch(
 }
 
 /// Protection impls (HalOps seam). On BCM2712 module protection is the EL0
-/// MMU; the portable MPU facade is a no-op here but is kept in the enable
-/// path for exact parity with the pre-seam behavior.
+/// MMU.
 fn bcm_protection_set_enabled(enabled: bool) {
-    mpu::set_enabled(enabled);
     mmu::set_enabled(enabled);
 }
 fn bcm_protection_register_module(
@@ -2850,7 +2848,6 @@ fn bcm_protection_register_module(
 /// register instead (the isolated module's own channel I/O then faults per
 /// policy, but no peer buffer is ever exposed).
 fn bcm_protection_set_channel_region(i: usize, base: usize, size: usize) {
-    mpu::set_channel_region(i, base as u32, size as u32);
     const PAGE: usize = 4096;
     if fluxor::kernel::exec::scheduler::module_is_isolated(i) {
         let pbase = base & !(PAGE - 1);
@@ -3181,8 +3178,10 @@ static BCM2712_HAL_OPS: HalOps = HalOps {
     protected_step: mmu::protected_step,
     protection_map_page: bcm_protection_map_page,
     protection_unmap_page: bcm_protection_unmap_page,
-    stack_canary_check: mpu::check_stack_canary,
-    stack_canary_reinit: mpu::reinit_stack_canary,
+    // An isolated module's stack sits above an unmapped guard page; the
+    // composer admits every other module against that same figure.
+    stack_fence_arm: |_| {},
+    stack_fence_intact: || true,
     // Binary-safe debug-UART write (PL011) — the telemetry `transport_buffer` sink.
     serial_write: |b| uart::uart_nonblocking_write(b),
 };

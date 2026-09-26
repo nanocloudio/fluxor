@@ -1419,6 +1419,8 @@ unsafe fn init_poll(s: &mut SdState) -> i32 {
 // Exported PIC Module Interface
 // ============================================================================
 
+declare_module_state_bytes!(SdState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

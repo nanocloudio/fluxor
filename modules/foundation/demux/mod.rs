@@ -119,6 +119,8 @@ unsafe fn write_framed(sys: &SyscallTable, chan: i32, buf: *const u8, total: usi
     true
 }
 
+declare_module_state_bytes!(DemuxState);
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {

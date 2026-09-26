@@ -382,6 +382,8 @@ unsafe fn process_samples_16(s: &mut AudioFormatState, in_bytes: usize) -> usize
 // PIC Module Interface
 // ============================================================================
 
+declare_module_state_bytes!(AudioFormatState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

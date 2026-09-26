@@ -552,6 +552,8 @@ unsafe fn mount_dispatch(
 
 // ── Exported PIC module interface ───────────────────────────────────────────
 
+declare_module_state_bytes!(MountState);
+
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[cfg_attr(not(feature = "host-test"), link_section = ".text.module_state_size")]
 pub extern "C" fn module_state_size() -> usize {

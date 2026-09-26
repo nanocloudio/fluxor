@@ -411,6 +411,8 @@ unsafe fn evaluate(s: &FilterState, meta: &[u8; META_SIZE]) -> bool {
 // Module ABI
 // ============================================================================
 
+declare_module_state_bytes!(FilterState);
+
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> usize {

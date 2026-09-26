@@ -52,18 +52,21 @@ pub const MANIFEST_MAGIC: u32 = 0x464D5846;
 /// ride within v1 rather than bumping the integer. The current
 /// layout is:
 ///
-/// - 16-byte header (magic, version, port/resource/dependency
+/// - 17-byte header (magic, version, port/resource/dependency
 ///   counts, module_version, hardware_targets, state_bytes_64,
-///   flags, fine-grained permissions byte).
+///   flags, 16-bit fine-grained permissions).
 /// - Port records (4 bytes each): `[direction, content_type, flags,
 ///   index]`. Byte 3 is the resolved per-direction `PortSpec.index`,
 ///   matching what the config compiler wires against.
 /// - Resource records (4 bytes each).
 /// - Dependency records (8 bytes each).
+/// - Optional port-capacity records, 8 bytes per port (flags bit 5).
+/// - Optional 2-byte `stack_bytes_64` (flags bit 6).
 /// - Optional 32-byte SHA-256 integrity hash (flags bit 0).
 /// - Optional `[ed25519_signature: 64B][signer_pubkey_fingerprint:
 ///   32B]` block (flags bit 1). The signature covers the integrity
 ///   hash, not the full module bytes.
+/// - Optional 32-byte ABI-surface attestation, last (flags bit 4).
 pub const MANIFEST_VERSION: u8 = 1;
 
 /// Manifest header size (fixed portion before variable sections)
@@ -1096,7 +1099,7 @@ pub struct Manifest {
     /// Resident module state, in units of 64 BYTES, rounded up.
     ///
     /// Filled by `pack` from the `FLUXOR_MODULE_STATE_BYTES` static the SDK's
-    /// `declare_module_state!` emits — a measurement of the built artefact, not
+    /// `declare_module_state_bytes!` emits — a measurement of the built artefact, not
     /// a declaration an author can get wrong. `0` means the module has not
     /// adopted the macro and its state cost is unknown.
     ///
@@ -1107,6 +1110,15 @@ pub struct Manifest {
     /// understatement of what the arena must provide. (Elastic arena demand is
     /// `module_arena_size`, a separate question from resident state.)
     pub state_bytes_64: u16,
+    /// Worst-case stack depth, in units of 64 BYTES, rounded up.
+    ///
+    /// Filled by `pack` from the `FLUXOR_MODULE_STACK_BYTES` static the SDK's
+    /// `declare_module_stack_bytes!` emits. The composer admits it against the
+    /// target's stack: the per-module isolated stack where there is an MMU,
+    /// the kernel stack every module steps on where there is not. `0` means
+    /// the module has not declared. Carried in the binary as flag bit 6 plus a
+    /// 2-byte block, inside the signed envelope.
+    pub stack_bytes_64: u16,
     pub ports: Vec<PortSpec>,
     pub resources: Vec<ResourceClaim>,
     pub permissions: ManifestPermissions,
@@ -1260,6 +1272,7 @@ impl Default for Manifest {
             module_version: encode_semver(0, 1, 0),
             hardware_targets: 0x01, // RP2350 by default
             state_bytes_64: 0,
+            stack_bytes_64: 0,
             ports: Vec::new(),
             resources: Vec::new(),
             permissions: ManifestPermissions::default(),
@@ -2397,6 +2410,7 @@ impl Manifest {
             module_version,
             hardware_targets,
             state_bytes_64,
+            stack_bytes_64: 0, // set by pack from the built artefact
             ports,
             resources,
             permissions,
@@ -2443,6 +2457,9 @@ impl Manifest {
             .ports
             .iter()
             .any(|p| p.buffer_size != 0 || p.max_record != 0);
+        // Stack block (flag bit 6): 2 bytes, `stack_bytes_64` LE, directly
+        // after the port-capacity section and so inside the signed envelope.
+        let has_stack = self.stack_bytes_64 != 0;
         let var_size = self.ports.len() * 4
             + self.resources.len() * 4
             + self.dependencies.len() * 8
@@ -2451,6 +2468,7 @@ impl Manifest {
             } else {
                 0
             }
+            + if has_stack { 2 } else { 0 }
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -2494,13 +2512,17 @@ impl Manifest {
         //                  Read by `prepare_graph` to populate
         //                  `domain_pre_tick_order` and exclude the
         //                  module from `domain_exec_order`.
-        //          bits 4-7: reserved (0).
+        //          bit 4 = ABI-surface attestation block present.
+        //          bit 5 = port-capacity block present.
+        //          bit 6 = stack block present.
+        //          bit 7: reserved (0).
         let flags = (if has_integrity { 1 } else { 0 })
             | (if has_signature { 2 } else { 0 })
             | (if self.isr_safe { 4 } else { 0 })
             | (if self.pre_tick_drain { 8 } else { 0 })
             | (if has_abi_surface { 0x10 } else { 0 })
-            | (if has_port_capacity { 0x20 } else { 0 });
+            | (if has_port_capacity { 0x20 } else { 0 })
+            | (if has_stack { 0x40 } else { 0 });
         buf.push(flags);
         // byte 15: fine-grained permissions bitmap (see `permission::*`).
         // The kernel reads this byte directly at module instantiation.
@@ -2542,6 +2564,11 @@ impl Manifest {
                 buf.extend_from_slice(&p.buffer_size.to_le_bytes());
                 buf.extend_from_slice(&p.max_record.to_le_bytes());
             }
+        }
+
+        // Stack block (flag bit 6).
+        if has_stack {
+            buf.extend_from_slice(&self.stack_bytes_64.to_le_bytes());
         }
 
         // Integrity hash (32 bytes)
@@ -2604,6 +2631,7 @@ impl Manifest {
         let pre_tick_drain = (flags & 0x08) != 0;
         let has_abi_surface = (flags & 0x10) != 0;
         let has_port_capacity = (flags & 0x20) != 0;
+        let has_stack = (flags & 0x40) != 0;
         let permissions_bits = u16::from_le_bytes([data[15], data[16]]); // fine-grained permissions bitmap (bytes 15..17)
 
         let expected_size = MANIFEST_HEADER_SIZE
@@ -2611,6 +2639,7 @@ impl Manifest {
             + resource_count * 4
             + dependency_count * 8
             + if has_port_capacity { port_count * 8 } else { 0 }
+            + if has_stack { 2 } else { 0 }
             + if has_integrity { 32 } else { 0 }
             + if has_signature {
                 SIGNATURE_BLOCK_SIZE
@@ -2697,6 +2726,15 @@ impl Manifest {
             }
         }
 
+        // Stack block (flag bit 6).
+        let stack_bytes_64 = if has_stack {
+            let v = u16::from_le_bytes([data[offset], data[offset + 1]]);
+            offset += 2;
+            v
+        } else {
+            0
+        };
+
         let integrity_hash = if has_integrity {
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&data[offset..offset + 32]);
@@ -2730,6 +2768,7 @@ impl Manifest {
             module_version,
             hardware_targets,
             state_bytes_64,
+            stack_bytes_64,
             ports,
             resources,
             permissions: ManifestPermissions {
@@ -2791,6 +2830,13 @@ impl Manifest {
                 "  state: {} bytes ({} × 64 B)",
                 self.state_bytes_64 as usize * 64,
                 self.state_bytes_64
+            ));
+        }
+        if self.stack_bytes_64 > 0 {
+            lines.push(format!(
+                "  stack: {} bytes ({} × 64 B)",
+                self.stack_bytes_64 as usize * 64,
+                self.stack_bytes_64
             ));
         }
         if !self.ports.is_empty() {

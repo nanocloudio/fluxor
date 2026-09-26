@@ -36,6 +36,10 @@ dma_channels = 16
 
 [isolation]
 has_mmu = true
+# The stack an isolated module runs on at EL0, above an unmapped guard page
+# (`ISOLATED_STACK_BYTES`). The composer refuses an isolated module that
+# declares more.
+isolated_stack_kb = 64
 
 # [kernel] capacity tunables for BCM2712 live in
 # `modules/sdk/config.rs::profile_host` (selected at compile time via

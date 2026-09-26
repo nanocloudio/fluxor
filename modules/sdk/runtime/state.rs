@@ -50,3 +50,36 @@ macro_rules! declare_module_state_bytes {
         pub static FLUXOR_MODULE_STATE_BYTES: u32 = ::core::mem::size_of::<$state>() as u32;
     };
 }
+
+// Module stack depth, made readable as DATA.
+//
+// A module steps on a stack it does not own: the kernel's MSP on a
+// microcontroller, where every module steps in turn on the one stack, and a
+// per-module EL0 stack on a target with an MMU. Either way the composer must
+// know the deepest a module goes before a device runs it — on rp2040 there is
+// no hardware guard, so an overflow silently rewrites the top of the kernel's
+// statics.
+//
+// `declare_module_stack_bytes!` publishes the module's measured worst-case
+// depth, in bytes, as a `#[used]` static that `pack` records in the manifest.
+// The argument is a const expression, so it can differ per silicon from one
+// site, the way state sizes do:
+//
+//     declare_module_stack_bytes!(if cfg!(fluxor_silicon = "bcm2712") { 16 * 1024 } else { 5 * 1024 });
+//
+// Mangled for the same reason as `FLUXOR_MODULE_STATE_BYTES`. A module that has
+// not declared records 0, which the composer refuses on a target without an
+// MMU and treats as unknown elsewhere.
+
+#[allow(
+    unused_macros,
+    reason = "every module includes the SDK runtime; only those that declare a stack depth invoke it"
+)]
+macro_rules! declare_module_stack_bytes {
+    ($bytes:expr) => {
+        /// This module's worst-case stack depth in bytes, as data for `pack`
+        /// to read.
+        #[used]
+        pub static FLUXOR_MODULE_STACK_BYTES: u32 = ($bytes) as u32;
+    };
+}

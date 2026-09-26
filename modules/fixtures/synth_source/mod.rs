@@ -199,6 +199,8 @@ unsafe fn fill_pattern(dst: *mut u8, off: u32, len: usize) {
 // Module ABI
 // ============================================================================
 
+declare_module_state_bytes!(SynthState);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

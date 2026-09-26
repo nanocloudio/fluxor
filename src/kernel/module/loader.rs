@@ -60,7 +60,6 @@ pub mod export_hashes {
     pub const MODULE_POST_TICK_FLUSH: u32 = 0x85d25b69; // "module_post_tick_flush"
     pub const MODULE_CHANNEL_HINTS: u32 = 0xfcc07eec; // "module_channel_hints"
     pub const MODULE_ARENA_SIZE: u32 = 0x1b6f4183; // "module_arena_size"
-    pub const MODULE_STACK_SIZE: u32 = 0x6e85b5ea; // "module_stack_size"
     pub const MODULE_DRAIN: u32 = 0xc4c5636c; // "module_drain"
     pub const MODULE_ISR_INIT: u32 = 0x9cfb0a03; // "module_isr_init"
     pub const MODULE_ISR_ENTRY: u32 = 0x56c6a743; // "module_isr_entry"
@@ -158,8 +157,8 @@ pub enum LoaderError {
     /// The module asked for `protection: isolated` on a target whose kernel
     /// does not isolate modules.
     IsolationUnavailable,
-    /// An isolated module declares (`module_stack_size`) more stack than the
-    /// isolated stack holds.
+    /// An isolated module's manifest declares more stack than the isolated
+    /// stack holds.
     StackTooSmall { declared: u32, available: u32 },
 }
 impl LoaderError {
@@ -196,6 +195,35 @@ impl LoaderError {
         }
     }
 }
+/// Offsets of the manifest's flag-gated blocks, computed from its fixed
+/// 17-byte head. The blocks sit in the order `tools/src/manifest.rs::to_bytes`
+/// writes them — port records, resource records, dependency records, port
+/// capacities (flag bit 5), stack (flag bit 6), then the integrity hash — and
+/// every reader past the dependency records takes its offset from here.
+#[derive(Clone, Copy)]
+struct ManifestLayout {
+    /// Port-capacity block (flag bit 5).
+    capacity: usize,
+    /// Stack block (flag bit 6).
+    stack: usize,
+    /// Integrity hash (flag bit 0); the signature block follows it.
+    hash: usize,
+}
+
+impl ManifestLayout {
+    fn of(port_count: u8, resource_count: u8, dep_count: u8, flags: u8) -> Self {
+        let ports = port_count as usize;
+        let capacity = 17 + ports * 4 + resource_count as usize * 4 + dep_count as usize * 8;
+        let stack = capacity + if flags & 0x20 != 0 { ports * 8 } else { 0 };
+        let hash = stack + if flags & 0x40 != 0 { 2 } else { 0 };
+        Self {
+            capacity,
+            stack,
+            hash,
+        }
+    }
+}
+
 // ============================================================================
 // Flash memory primitives
 // ============================================================================
@@ -1194,6 +1222,40 @@ impl LoadedModule {
             None
         }
     }
+    /// The module's declared worst-case stack depth in bytes, from the
+    /// manifest's flag-bit-6 block; 0 when the module declares none or the
+    /// manifest is absent or malformed. Covered by the signing envelope.
+    pub fn manifest_stack_bytes(&self) -> u32 {
+        let manifest_size = self.header.manifest_size() as usize;
+        if manifest_size < 17 {
+            return 0;
+        }
+        let code_size = self.header.code_size as usize;
+        let data_size = self.header.data_size as usize;
+        let export_size = self.header.export_count as usize * 8;
+        let schema_size = self.header.schema_size() as usize;
+        let manifest_offset =
+            ModuleHeader::SIZE + code_size + data_size + export_size + schema_size;
+        // SAFETY: manifest_offset + manifest_size lies inside the .fmod
+        // mapping (validated at load time); the block read is bounds-checked
+        // against manifest_size first.
+        unsafe {
+            let p = offset_ptr(self.base, manifest_offset);
+            let magic = u32::from_le_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+            if magic != 0x464D5846 {
+                return 0;
+            } // "FXMF"
+            let flags = *p.add(14);
+            if flags & 0x40 == 0 {
+                return 0;
+            }
+            let at = ManifestLayout::of(*p.add(5), *p.add(6), *p.add(7), flags).stack;
+            if manifest_size < at + 2 {
+                return 0;
+            }
+            u16::from_le_bytes([*p.add(at), *p.add(at + 1)]) as u32 * 64
+        }
+    }
     /// Read the static port-capacity hints from the manifest's
     /// flag-bit-5 capacity section. Needs no module code execution,
     /// works for wasm payloads (whose packed export tables are
@@ -1235,12 +1297,7 @@ impl LoadedModule {
                 return (out, 0); // no capacity section
             }
             let port_count = *p.add(5) as usize;
-            let resource_count = *p.add(6) as usize;
-            let dep_count = *p.add(7) as usize;
-            // Capacity section sits directly after the dependency
-            // records (before the integrity hash) — see
-            // tools/src/manifest.rs::to_bytes.
-            let cap_offset = 17 + port_count * 4 + resource_count * 4 + dep_count * 8;
+            let cap_offset = ManifestLayout::of(*p.add(5), *p.add(6), *p.add(7), flags).capacity;
             if manifest_size < cap_offset + port_count * 8 {
                 return (out, 0);
             }
@@ -1820,23 +1877,13 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     // Stored hash sits after ports/resources/dependencies; its
                     // offset depends on those counts. If signature follows,
                     // the hash is still first (signature is appended after).
-                    let var_size = (manifest_data[5] as usize) * 4
-                        + (manifest_data[6] as usize) * 4
-                        + (manifest_data[7] as usize) * 8
-                        + if (manifest_data[14] & 0x20) != 0 {
-                            // Port-capacity section (flag bit 5) sits between
-                            // the dependency records and the integrity hash —
-                            // inside the signed envelope. Mirrors
-                            // tools/src/manifest.rs::to_bytes.
-                            (manifest_data[5] as usize) * 8
-                        } else {
-                            0
-                        };
-                    // 17 = MANIFEST_HEADER_SIZE (tools/src/manifest.rs):
-                    // the fixed head, ending in the u16 permissions bitmap
-                    // at bytes 15..17. Every offset here must track that
-                    // constant or integrity/signature reads shear.
-                    let hash_offset = 17 + var_size;
+                    let hash_offset = ManifestLayout::of(
+                        manifest_data[5],
+                        manifest_data[6],
+                        manifest_data[7],
+                        flags,
+                    )
+                    .hash;
                     if hash_offset + 32 > manifest_size {
                         log::error!("[loader] {name}: manifest hash out of range");
                         return Err(LoaderError::IntegrityMismatch);
@@ -1878,19 +1925,14 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                 // surface mismatches in test builds) but do not reject on
                 // missing signatures.
                 if has_signature {
-                    let var_size = (manifest_data[5] as usize) * 4
-                        + (manifest_data[6] as usize) * 4
-                        + (manifest_data[7] as usize) * 8
-                        + if (manifest_data[14] & 0x20) != 0 {
-                            // Port-capacity section (flag bit 5) sits between
-                            // the dependency records and the integrity hash —
-                            // inside the signed envelope. Mirrors
-                            // tools/src/manifest.rs::to_bytes.
-                            (manifest_data[5] as usize) * 8
-                        } else {
-                            0
-                        };
-                    let sig_offset = 17 + var_size + 32;
+                    let hash_offset = ManifestLayout::of(
+                        manifest_data[5],
+                        manifest_data[6],
+                        manifest_data[7],
+                        flags,
+                    )
+                    .hash;
+                    let sig_offset = hash_offset + 32;
                     if sig_offset + 96 > manifest_size {
                         return Err(LoaderError::SignatureInvalid);
                     }
@@ -1910,7 +1952,6 @@ pub fn validate_module(module: &LoadedModule, name: &str) -> Result<(), LoaderEr
                     //     (has_integrity/has_signature) MASKED — the only
                     //     [0..hash_offset] bytes that differ unsigned vs signed.
                     let hash = {
-                        let hash_offset = 17 + var_size;
                         use crate::kernel::security::crypto::sha256::Sha256;
                         let mut eh = Sha256::new();
                         // SAFETY: [module.base, +manifest_offset) is the
@@ -2167,6 +2208,8 @@ pub struct DynamicModule {
     /// The module's own name, interned at instantiation — what logs and the
     /// monitor report for this slot.
     name: &'static str,
+    /// Declared worst-case stack depth in bytes, from the manifest.
+    stack_bytes: u32,
 }
 /// Partially initialized module waiting for async operations to complete.
 ///
@@ -2201,6 +2244,8 @@ pub struct DynamicModulePending {
     /// `DynamicModule` exposes the Tier 2 ISR entry. See
     /// `DynamicModule::isr_entry_fn`.
     isr_entry_fn: Option<ModuleIsrEntryFn>,
+    /// Declared worst-case stack depth in bytes, from the manifest.
+    stack_bytes: u32,
 }
 impl DynamicModulePending {
     /// Get step function pointer (for force-completing a pending module).
@@ -2242,6 +2287,7 @@ impl DynamicModulePending {
             auto_register: None,
             module_idx: 0,
             isr_entry_fn: None,
+            stack_bytes: 0,
         }
     }
     /// Try to complete initialization by calling module_new again.
@@ -2284,6 +2330,7 @@ impl DynamicModulePending {
                     ),
                     isr_entry_fn: self.isr_entry_fn,
                     name: self.name,
+                    stack_bytes: self.stack_bytes,
                 }))
             }
             NewStatus::Pending => Ok(None),
@@ -2344,6 +2391,7 @@ impl DynamicModule {
             isolated: false,
             isr_entry_fn: None,
             name: "dynamic",
+            stack_bytes: 0,
         }
     }
     /// Like `from_parts`, but injects a Tier 2 `module_isr_entry`
@@ -2367,6 +2415,7 @@ impl DynamicModule {
             isolated: false,
             isr_entry_fn,
             name: "dynamic",
+            stack_bytes: 0,
         }
     }
     /// Release this module's state buffer back to the pool. Consumes the
@@ -2466,19 +2515,18 @@ impl DynamicModule {
         if crate::kernel::exec::scheduler::params_request_isolation(params_slice) {
             return Err(LoaderError::IsolationUnavailable);
         }
-        // An isolated module runs on a fixed stack above a guard page; one that
-        // declares a larger need is refused here rather than faulting there.
-        #[cfg(feature = "chip-bcm2712")]
+        // An isolated module runs on a fixed stack above a guard page. The
+        // composer admits its declared depth against that stack; this refuses a
+        // blob that reached the device without going through the composer.
+        #[cfg(feature = "kernel-vm")]
         if iso_requested {
-            if let Ok(addr) = module.get_export_addr(export_hashes::MODULE_STACK_SIZE) {
-                let declared = call_state_size(fn_ptr_from_addr(addr));
-                let available = crate::platform::mmu::ISOLATED_STACK_BYTES;
-                if declared > available {
-                    return Err(LoaderError::StackTooSmall {
-                        declared: u32::try_from(declared).unwrap_or(u32::MAX),
-                        available: available as u32,
-                    });
-                }
+            let declared = module.manifest_stack_bytes();
+            let available = crate::platform::mmu::ISOLATED_STACK_BYTES as u32;
+            if declared > available {
+                return Err(LoaderError::StackTooSmall {
+                    declared,
+                    available,
+                });
             }
         }
         // 4. Allocate state. `state_map_size` is the footprint the MMU maps
@@ -2658,6 +2706,7 @@ impl DynamicModule {
                     isolated: crate::kernel::exec::scheduler::module_is_isolated(inst_idx),
                     isr_entry_fn: exports.isr_entry_fn,
                     name,
+                    stack_bytes: module.manifest_stack_bytes(),
                 }))
             }
             NewStatus::Pending => {
@@ -2681,6 +2730,7 @@ impl DynamicModule {
                     auto_register,
                     module_idx: inst_idx as u8,
                     isr_entry_fn: exports.isr_entry_fn,
+                    stack_bytes: module.manifest_stack_bytes(),
                 };
                 log::info!("[inst] pending {name}");
                 Ok(StartNewResult::Pending(pending))
@@ -2760,6 +2810,9 @@ impl Module for DynamicModule {
         // and the monitor's MODULE_STATE_QUERY name what is running rather
         // than how it was loaded.
         self.name
+    }
+    fn stack_bytes(&self) -> usize {
+        self.stack_bytes as usize
     }
 }
 // ============================================================================

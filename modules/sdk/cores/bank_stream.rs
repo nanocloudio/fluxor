@@ -567,6 +567,8 @@ unsafe fn select_index(s: &mut BankState, flush: bool) {
 // Module API
 // ============================================================================
 
+declare_module_state_bytes!(BankState);
+
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {

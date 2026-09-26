@@ -32,7 +32,6 @@ SECTIONS
         KEEP(*(.text.module_deferred_ready*))
         KEEP(*(.text.module_drain*))
         KEEP(*(.text.module_arena_size*))
-        KEEP(*(.text.module_stack_size*))
         KEEP(*(.text.module_provider_dispatch*))
         KEEP(*(.text.module_provides_contract*))
         /* Instance selector for a keyed provider, and the owner-release

@@ -1,0 +1,12 @@
+version = "1.0.0"
+hardware_targets = ["rp2350"]
+
+# Holds the claim that the scheduler's stack fence catches a module going
+# deeper than the stack the composer admitted it. The probe moves the stack
+# pointer in inline assembly, which the build's stack measurement does not
+# read, so its recorded depth is its small prologue; one step then writes
+# sixteen kilobytes below its entry. The fence must name the module and fault
+# it. Diagnostic only; no production graph loads it.
+
+[observability]
+exempt = "stack-fence probe; its '[stack_fence_probe]' lines and the kernel's '[stack]' and fault lines are the observable, read by the rig scenario's rules"

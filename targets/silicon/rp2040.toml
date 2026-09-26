@@ -169,7 +169,9 @@ valid_pins = [[2,3], [6,7], [10,11], [14,15], [18,19], [22,23], [26,27]]
 flash_base = "0x10000000"
 flash_size = "0x200000"
 ram_base = "0x20000000"
-ram_size = "0x42000"
+# The striped 256 KiB the linker's RAM region covers, where the kernel's
+# statics and its stack live. SRAM4 and SRAM5 sit outside it.
+ram_size = "0x40000"
 
 [kernel]
 watchdog_ctrl = "0x40058000"
@@ -187,12 +189,19 @@ config_arena_kb = 8
 # fit beside the state and buffer arenas.
 log_ring_kb = 4
 # Ceiling on the kernel image's static RAM (.data + .bss + .uninit)
-# out of the linker's 256 KiB striped RAM region. What is left over is
-# the stack, which grows down from the top of that region.
+# out of the linker's 256 KiB RAM region. What is left over is the
+# stack, which grows down from the top of that region and which every
+# module steps on in turn: 40 KiB here.
 # The linker already refuses an image that cannot fit at all; this
 # binds earlier, so steady creep fails a gate instead of arriving
-# as a link error nobody can attribute.
-ram_static_max_kb = 240
+# as a link error nobody can attribute. Raising it takes the same bytes
+# from the stack, which the composer then admits modules against.
+ram_static_max_kb = 216
+# The kernel's own frames at a module call: the scheduler under the step,
+# syscalls and interrupts above it. The stack less this, 32 KiB, is the
+# deepest a module may go; the scheduler fences every step there and
+# reports the measured depths.
+kernel_stack_reserve_kb = 8
 # Clock profile. 125 MHz is the documented RP2040 default; no overclock
 # profile is offered for this die. USB needs exactly 48 MHz.
 sys_hz = 125000000

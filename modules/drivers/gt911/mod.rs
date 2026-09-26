@@ -235,6 +235,8 @@ unsafe fn timer_expired(sys: &SyscallTable, timer_fd: i32) -> bool {
 // Module exports
 // ============================================================================
 
+declare_module_state_bytes!(Gt911State);
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
